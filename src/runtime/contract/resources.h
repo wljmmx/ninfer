@@ -2,6 +2,7 @@
 
 #include "runtime/contract/request.h"
 #include "core/transfer_work.h"
+#include "core/wide_mul.h"
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -48,18 +49,25 @@ struct PrefillWork {
     PrefillWork result;
     result.chunks =
         suffix_tokens == 0 || prefill_chunk == 0 ? 0 : 1U + (suffix_tokens - 1U) / prefill_chunk;
-    result.tokens                       = suffix_tokens;
-    result.vision_items                 = vision_items;
+    result.tokens       = suffix_tokens;
+    result.vision_items = vision_items;
     result.vision_patches               = vision_patches;
-    const unsigned __int128 suffix      = suffix_tokens;
-    const unsigned __int128 linear      = static_cast<unsigned __int128>(prefix_tokens) * suffix;
-    const unsigned __int128 triangular  = suffix * (suffix + 1U) / 2U;
-    constexpr unsigned __int128 maximum = ~static_cast<unsigned __int128>(0);
-    const unsigned __int128 attention =
-        triangular > maximum - linear ? maximum : linear + triangular;
-    result.attention_pairs = attention > std::numeric_limits<std::uint64_t>::max()
-                                 ? std::numeric_limits<std::uint64_t>::max()
-                                 : static_cast<std::uint64_t>(attention);
+    constexpr std::uint64_t kU64Maximum = ~static_cast<std::uint64_t>(0);
+    const WideProduct linear_product    = wide_mul(prefix_tokens, suffix_tokens);
+    // suffix == UINT64_MAX would wrap the pair product; the exact triangular term then
+    // dominates any 64-bit budget, so saturate directly.
+    const WideProduct pair_product =
+        suffix_tokens == kU64Maximum ? WideProduct{kU64Maximum, kU64Maximum >> 1}
+                                     : wide_mul(suffix_tokens, suffix_tokens + 1U);
+    std::uint64_t attention = 0;
+    if (linear_product.high != 0 || pair_product.high >= 2U) {
+        attention = kU64Maximum;
+    } else {
+        const std::uint64_t linear     = linear_product.low;
+        const std::uint64_t triangular = (pair_product.low >> 1U) | (pair_product.high << 63U);
+        attention = triangular > kU64Maximum - linear ? kU64Maximum : linear + triangular;
+    }
+    result.attention_pairs = attention;
     return result;
 }
 

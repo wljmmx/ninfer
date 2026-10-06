@@ -562,10 +562,11 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
     validate_policy(policy);
 
     if (weight.qtype == QType::NVFP4) {
+#if defined(NINFER_ENABLE_NVFP4)
         constexpr std::int32_t kHidden     = 5120;
         constexpr std::int32_t kQueryRows  = 2048;
         constexpr std::int32_t kKeyRows    = 2048;
-        constexpr std::int32_t kValueRows  = 6144;
+        constexpr std::int32_t kValueRows   = 6144;
         constexpr std::int32_t kZRows      = 6144;
         constexpr std::int32_t kChannels   = kQueryRows + kKeyRows + kValueRows;
         constexpr std::int32_t kParentRows = kChannels + kZRows;
@@ -613,6 +614,12 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
         detail::nvfp4_gdn_record_post_launch(conv_record, conv_weight, conv_states, valid_columns,
                                              initial_state_slots, query, key, value, stream);
         return;
+#else
+        throw std::invalid_argument(
+            "gdn_input_proj_conv_record: NVFP4 weights require a Blackwell (sm_120a) build with "
+            "NVFP4 tensor cores. This engine was built for RTX 4090 (sm_89); load a "
+            "groupwise-int artifact instead.");
+#endif
     }
 
     if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16) {

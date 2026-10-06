@@ -199,9 +199,22 @@ void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
         throw std::invalid_argument("kv_cache_append: T exceeds cache capacity");
     }
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+#if defined(NINFER_ENABLE_NVFP4)
         detail::kv_cache_append_k8v4_launch(k, v, positions, cache, stream);
+#else
+        throw std::invalid_argument(
+            "kv_cache_append: K8V4 (Fp8KeyNvfp4Value) storage encodes values as NVFP4 and "
+            "requires a Blackwell (sm_120a) build; choose BF16, INT8 or FP8 KV on RTX 4090 "
+            "(sm_89).");
+#endif
     } else if (cache.storage == KvCacheStorage::Nvfp4Group16) {
+#if defined(NINFER_ENABLE_NVFP4)
         detail::kv_cache_append_nvfp4_launch(k, v, positions, cache, stream);
+#else
+        throw std::invalid_argument(
+            "kv_cache_append: Nvfp4Group16 KV storage requires a Blackwell (sm_120a) build with "
+            "NVFP4 tensor cores; choose BF16, INT8, FP8 or K8V4 KV on RTX 4090 (sm_89).");
+#endif
     } else {
         detail::kv_cache_append_launch(k, v, positions, cache, stream);
     }

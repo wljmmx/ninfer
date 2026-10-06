@@ -1,5 +1,9 @@
 #pragma once
 
+// NVFP4 tensor core paths (kind::mxf4nvf4 MMA, TMA, setmaxnreg warp specialization
+// and the E2M1 hardware codecs) require Blackwell sm_120a. This translation unit is
+// compiled out on other architectures; dispatch rejects NVFP4 weights there.
+#if defined(NINFER_ENABLE_NVFP4)
 // D256 KV-cache NVFP4 codec. Unlike weight artifacts, cache rows have no matrix-level divisor:
 // every represented value is exactly E2M1(code) * E4M3(scale) for its contiguous G16 group.
 
@@ -130,3 +134,5 @@ kv_cache_nvfp4_dequant_f16x16(const std::uint8_t* codes, std::uint8_t scale_code
 }
 
 } // namespace ninfer::ops
+
+#endif // NINFER_ENABLE_NVFP4

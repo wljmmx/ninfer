@@ -24,8 +24,13 @@ public:
 
 private:
     std::filesystem::path path_;
+#ifdef _WIN32
+    void* file_               = nullptr;  // HANDLE, buffered positional reads
+    mutable void* direct_file_ = nullptr; // HANDLE, FILE_FLAG_NO_BUFFERING positional reads
+#else
     int fd_                = -1;
     mutable int direct_fd_ = -1;
+#endif
     std::uint64_t bytes_   = 0;
 };
 

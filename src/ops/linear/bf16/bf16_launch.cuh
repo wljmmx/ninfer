@@ -31,10 +31,12 @@ void launch_bf16_sliced_k_mma(const Tensor& x, const Weight& w, Tensor& out, cud
         LinearIdentityEpilogue{}, stream);
 }
 
+#if defined(NINFER_ENABLE_TMA)
 template <class Schedule>
 void launch_bf16_tma_mma(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     launch_bf16_a16_tma_mma<Schedule>(bf16_a16_operands(x, w),
-                                      LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n},
-                                      LinearIdentityEpilogue{}, stream);
+                                       LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n},
+                                       LinearIdentityEpilogue{}, stream);
 }
+#endif
 } // namespace ninfer::ops::detail

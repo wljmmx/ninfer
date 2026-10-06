@@ -34,8 +34,9 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
 }
 
 void launch_a8(const Tensor& x, const Weight& weight, Tensor& out, Fp8A8Workspace scratch,
-               cudaStream_t stream) {
+                cudaStream_t stream) {
     const int tokens = x.ne[1];
+#if defined(NINFER_ENABLE_TMA)
     if (tokens <= 64)
         return launch_fp8_a8_tma<Geometry, Tma32x64>(x, weight, out, scratch, stream);
     if (tokens <= 128)
@@ -46,15 +47,26 @@ void launch_a8(const Tensor& x, const Weight& weight, Tensor& out, Fp8A8Workspac
     if (tokens <= 384 || (tokens > 512 && tokens <= 768))
         return launch_fp8_a8_tma<Geometry, Wide>(x, weight, out, scratch, stream);
     launch_fp8_a8_tma<Geometry, Bulk>(x, weight, out, scratch, stream);
+#else
+    // Ada fallback: no TMA and no split-K on sm_89; the plain FP8 MMA kernel tiles
+    // the same shapes.
+    if (tokens <= 64)
+        return launch_fp8_a8<Geometry, Fp8A8T32R64K128>(x, weight, out, scratch, stream);
+    launch_fp8_a8<Geometry, Fp8A8T64R128K128>(x, weight, out, scratch, stream);
+#endif
 }
 
 bool uses_a8(std::int32_t, std::int32_t max_tokens) { return max_tokens >= 17; }
 
 std::size_t partial_capacity_bytes(std::int32_t max_tokens) {
+#if defined(NINFER_ENABLE_TMA)
     if (max_tokens > 384) return Bulk::kPartialBytes;
     if (max_tokens > 256) return Wide::kPartialBytes;
     if (max_tokens > 128) return Mid::kPartialBytes;
     return max_tokens > 64 ? Small::kPartialBytes : 0;
+#else
+    return 0;
+#endif
 }
 
 } // namespace

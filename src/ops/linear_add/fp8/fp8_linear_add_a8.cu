@@ -14,6 +14,7 @@ struct Fp8ResidualAddEpilogue : LinearResidualAddEpilogue {
     }
 };
 
+#if defined(NINFER_ENABLE_TMA)
 using K6144Tma32x64  = Fp8A8TmaMmaSchedule<32, 64, 128, 1, 2, 3, 2>;
 using K6144Tma64x128 = Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 3, 1>;
 using K6144MidBulk =
@@ -28,6 +29,7 @@ using K17408Wide =
     Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<192, 128, 128, 3, 4, 2, 1>, 170, 4, 8>;
 using K17408Bulk =
     Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4, 2, 1>, 170, 4, 8>;
+#endif
 
 template <int K>
 void launch_problem(const Tensor& x, const Weight& weight, Tensor& residual,
@@ -45,26 +47,39 @@ void launch_problem(const Tensor& x, const Weight& weight, Tensor& residual,
                                    stream);
     };
     if constexpr (K == 6144) {
-        if (x.ne[1] <= 64) return launch.template operator()<K6144Tma32x64>();
+        if (x.ne[1] <= 64) return launch.template operator()<Fp8A8T32R64K128>();
         if (x.ne[1] <= 128) return launch.template operator()<Fp8A8T64R64K128>();
+#if defined(NINFER_ENABLE_TMA)
         if (x.ne[1] <= 192) return launch.template operator()<K6144Tma64x128>();
         // The narrower row tile fills the GPU before the large-tile path reaches a full wave.
         if (x.ne[1] <= 768) return launch.template operator()<K6144MidBulk>();
         launch.template operator()<K6144Bulk>();
+#else
+        // Ada fallback: no TMA and no split-K on sm_89; the plain FP8 MMA kernel tiles
+        // the same shapes.
+        launch.template operator()<Fp8A8T64R128K128>();
+#endif
     } else {
         const int tokens = x.ne[1];
-        if (tokens <= 64) return launch.template operator()<K17408Tma32x64>();
+        if (tokens <= 64) return launch.template operator()<Fp8A8T32R64K128>();
+#if defined(NINFER_ENABLE_TMA)
         if (tokens <= 128) return launch.template operator()<K17408Small>();
         if (tokens <= 256) return launch.template operator()<K17408Mid>();
         // Wider token tiles avoid an extra wave in the gaps between the bulk anchors.
         if (tokens <= 384 || (tokens > 512 && tokens <= 768))
             return launch.template operator()<K17408Wide>();
         launch.template operator()<K17408Bulk>();
+#else
+        // Ada fallback: no TMA and no split-K on sm_89; the plain FP8 MMA kernel tiles
+        // the same shapes.
+        launch.template operator()<Fp8A8T64R128K128>();
+#endif
     }
 }
 } // namespace
 
 std::size_t fp8_linear_add_partial_capacity_bytes(std::int32_t k, std::int32_t max_tokens) {
+#if defined(NINFER_ENABLE_TMA)
     if (k == 6144) {
         if (max_tokens > 768) return K6144Bulk::kPartialBytes;
         return max_tokens > 192 ? K6144MidBulk::kPartialBytes : 0;
@@ -73,6 +88,11 @@ std::size_t fp8_linear_add_partial_capacity_bytes(std::int32_t k, std::int32_t m
     if (max_tokens > 256) return K17408Wide::kPartialBytes;
     if (max_tokens > 128) return K17408Mid::kPartialBytes;
     return max_tokens > 64 ? K17408Small::kPartialBytes : 0;
+#else
+    // Ada fallback: no TMA split-K on sm_89, so no partial buffers are needed.
+    (void)k;
+    return 0;
+#endif
 }
 
 void fp8_linear_add_a8_launch(const Tensor& x, const Weight& weight, Tensor& residual,

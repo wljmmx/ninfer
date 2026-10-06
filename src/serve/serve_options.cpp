@@ -71,22 +71,28 @@ std::size_t parse_host_context_mib(const char* text) {
 
     // A whole-byte MiB value has at most 20 fractional decimal digits (1 MiB = 2^20 bytes).
     // Use exact integer arithmetic so decimal parsing cannot round the requested budget upward.
+    // With k = fraction.size(), bytes = digits * 2^20 / 10^k = (digits / 5^k) * 2^(20-k):
+    // the 2^k factor of 10^k is already covered by 2^20, and 5^20 < 2^47 fits a 64-bit word.
     while (!fraction.empty() && fraction.back() == '0') { fraction.remove_suffix(1); }
     if (fraction.size() > 20) {
         throw std::invalid_argument("--host-context-mib must resolve to a whole number of bytes");
     }
-    unsigned __int128 numerator = 0;
-    unsigned __int128 divisor   = 1;
+    std::uint64_t power_of_five = 1;
+    for (std::size_t index = 0; index < fraction.size(); ++index) { power_of_five *= 5U; }
+    std::uint64_t remainder = 0; // digit stream modulo 5^k
+    std::uint64_t quotient  = 0; // digit stream divided by 5^k
     for (const char character : fraction) {
-        numerator = numerator * 10 + static_cast<unsigned int>(character - '0');
-        divisor *= 10;
+        const std::uint64_t digit  = static_cast<std::uint64_t>(character - '0');
+        const std::uint64_t merged = remainder * 10U + digit;
+        quotient                   = quotient * 10U + merged / power_of_five;
+        remainder                  = merged % power_of_five;
     }
-    numerator *= bytes_per_mib;
-    if (numerator % divisor != 0) {
+    if (remainder != 0) {
         throw std::invalid_argument("--host-context-mib must resolve to a whole number of bytes");
     }
-    const std::size_t fractional_bytes = static_cast<std::size_t>(numerator / divisor);
-    const std::size_t whole_bytes      = whole_mib * bytes_per_mib;
+    const auto fractional_bytes =
+        static_cast<std::size_t>(quotient << (20U - static_cast<unsigned>(fraction.size())));
+    const std::size_t whole_bytes = whole_mib * bytes_per_mib;
     if (fractional_bytes > maximum - whole_bytes) {
         throw std::invalid_argument("--host-context-mib is out of range");
     }

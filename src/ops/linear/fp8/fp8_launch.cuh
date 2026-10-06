@@ -43,6 +43,7 @@ void launch_fp8_a8(const Tensor& x, const Weight& w, Tensor& out, Fp8A8Workspace
         stream);
 }
 
+#if defined(NINFER_ENABLE_TMA)
 template <class Geometry, class Schedule>
 void launch_fp8_a8_tma(const Tensor& x, const Weight& w, Tensor& out, Fp8A8Workspace scratch,
                        cudaStream_t stream) {
@@ -52,4 +53,5 @@ void launch_fp8_a8_tma(const Tensor& x, const Weight& w, Tensor& out, Fp8A8Works
         LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n}, LinearIdentityEpilogue{},
         stream, scratch.partials);
 }
+#endif
 } // namespace ninfer::ops::detail

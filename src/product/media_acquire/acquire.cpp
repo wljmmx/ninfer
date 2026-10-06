@@ -2,9 +2,14 @@
 
 #include <curl/curl.h>
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -143,6 +148,18 @@ UrlParts parse_url(std::string_view value) {
 }
 
 std::string resolve_public(const UrlParts& url, bool allow_private) {
+#ifdef _WIN32
+    // getaddrinfo/inet_ntop route through Winsock; initialize it exactly once.
+    static std::once_flag winsock_init;
+    std::call_once(winsock_init, [] {
+        WSADATA data{};
+        const int result = ::WSAStartup(MAKEWORD(2, 2), &data);
+        if (result != 0) {
+            throw Error(ErrorKind::RemoteUnavailable,
+                        "failed to initialize Winsock: " + std::to_string(result));
+        }
+    });
+#endif
     addrinfo hints{};
     hints.ai_family   = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -150,7 +167,12 @@ std::string resolve_public(const UrlParts& url, bool allow_private) {
     const int rc      = getaddrinfo(url.host.c_str(), url.port.c_str(), &hints, &raw);
     if (rc != 0) {
         throw Error(ErrorKind::RemoteUnavailable,
-                    "failed to resolve media URL host: " + std::string(gai_strerror(rc)));
+                    "failed to resolve media URL host: " +
+#ifdef _WIN32
+                        std::to_string(rc));
+#else
+                        std::string(gai_strerror(rc)));
+#endif
     }
     std::unique_ptr<addrinfo, decltype(&freeaddrinfo)> addresses(raw, freeaddrinfo);
     std::string selected;
@@ -287,7 +309,9 @@ std::vector<std::uint8_t> read_path(const Source& source, const Policy& policy) 
     if (!policy.media_root.empty()) {
         const std::filesystem::path root = std::filesystem::weakly_canonical(policy.media_root, ec);
         const auto relative              = std::filesystem::relative(path, root, ec);
-        if (ec || relative.empty() || relative.native().starts_with("..")) {
+        // generic_string() is the portable narrow form of the path: on Windows native() is a
+        // wstring and cannot be compared against narrow literals.
+        if (ec || relative.empty() || relative.generic_string().starts_with("..")) {
             throw std::invalid_argument("media path is outside configured media root");
         }
     }

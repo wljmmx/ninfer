@@ -37,9 +37,10 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
 }
 
 void launch_a8(const Tensor& x, const Weight& weight, Tensor& out, Fp8A8Workspace scratch,
-               cudaStream_t stream) {
+                cudaStream_t stream) {
     if (x.ne[1] <= 64)
         return launch_fp8_a8<Geometry, Fp8A8T64R128K256>(x, weight, out, scratch, stream);
+#if defined(NINFER_ENABLE_TMA)
     if (x.ne[1] <= 128)
         return launch_fp8_a8_tma<Geometry, Tma64x128>(x, weight, out, scratch, stream);
     if (x.ne[1] <= 192)
@@ -47,14 +48,22 @@ void launch_a8(const Tensor& x, const Weight& weight, Tensor& out, Fp8A8Workspac
     // At T <= 256 the last wave is already well filled, so Bulk uses its ordinary
     // TMA kernel and needs no partials. Keep one compiled family for this region.
     launch_fp8_a8_tma<Geometry, Bulk>(x, weight, out, scratch, stream);
+#else
+    // Ada fallback: no TMA on sm_89; the plain FP8 MMA kernel tiles the same shapes.
+    launch_fp8_a8<Geometry, Fp8A8T64R128K128>(x, weight, out, scratch, stream);
+#endif
 }
 
 bool uses_a8(std::int32_t, std::int32_t max_tokens) { return max_tokens >= 5; }
 
 std::size_t partial_capacity_bytes(std::int32_t max_tokens) {
+#if defined(NINFER_ENABLE_TMA)
     // Reserve one wave for any interval using the bulk route. The allocation is
     // independent of which calls in that interval have an underfilled last wave.
     return max_tokens > 256 ? Bulk::kPartialBytes : 0;
+#else
+    return 0;
+#endif
 }
 } // namespace
 

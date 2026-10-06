@@ -1011,9 +1011,10 @@ private:
             return left.priority.last_demand < right.priority.last_demand;
         }
         if (!left.priority.reused) {
-            const auto a = static_cast<unsigned __int128>(left.loss) * right.units;
-            const auto b = static_cast<unsigned __int128>(right.loss) * left.units;
-            if (a != b) { return a < b; }
+            // Compare loss/unit ratios through their exact cross products.
+            const int compared =
+                wide_mul_compare(left.loss, right.units, right.loss, left.units);
+            if (compared != 0) { return compared < 0; }
         }
         return left.order < right.order;
     }

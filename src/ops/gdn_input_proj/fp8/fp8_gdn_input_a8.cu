@@ -5,15 +5,22 @@
 
 namespace ninfer::ops::detail {
 namespace {
+#if defined(NINFER_ENABLE_TMA)
 using Tma64x128  = Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 2, 1>;
 using Tma192x128 = Fp8A8TmaMmaSchedule<192, 128, 128, 3, 4, 2, 1>;
 using MidBulk = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 128, 128, 2, 4, 2, 1>, 170, 4, 8>;
 using Bulk    = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4, 2, 1>, 170, 4, 8>;
+#endif
 
 } // namespace
 
 std::size_t fp8_gdn_input_partial_capacity_bytes(std::int32_t max_tokens) {
+#if defined(NINFER_ENABLE_TMA)
     return max_tokens > 256 ? Bulk::kPartialBytes : 0;
+#else
+    // Ada fallback: no TMA split-K on sm_89, so no partial buffers are needed.
+    return 0;
+#endif
 }
 
 void fp8_gdn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
@@ -32,10 +39,15 @@ void fp8_gdn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
     };
     if (x.ne[1] <= 32) return launch.template operator()<Fp8A8T32R32K128>();
     if (x.ne[1] <= 64) return launch.template operator()<Fp8A8T64R128K256>();
+#if defined(NINFER_ENABLE_TMA)
     if (x.ne[1] <= 128) return launch.template operator()<Tma64x128>();
     if (x.ne[1] <= 192) return launch.template operator()<Tma192x128>();
     // Smaller output tiles leave only two full-K tiles to split near the 512-token anchor.
     if (x.ne[1] > 384 && x.ne[1] <= 512) return launch.template operator()<MidBulk>();
     launch.template operator()<Bulk>();
+#else
+    // Ada fallback: no TMA on sm_89; the plain FP8 MMA kernel tiles the same shapes.
+    launch.template operator()<Fp8A8T64R128K128>();
+#endif
 }
 } // namespace ninfer::ops::detail

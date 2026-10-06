@@ -1092,7 +1092,9 @@ private:
         for (;;) {
             if (!*node) {
                 *node = std::make_shared<DirectoryNode>();
-            } else if (!node->unique()) {
+            } else if (node->use_count() != 1) {
+                // std::shared_ptr::unique() was removed in C++20; use_count() == 1 is the
+                // standard replacement for the single-owner copy-on-write test.
                 *node = std::make_shared<DirectoryNode>(**node);
             }
             if (width == kDirectoryChunkPages) { return (*node)->pages[page]; }
@@ -1140,7 +1142,8 @@ private:
         }
         // A shared node contains only retained prefix pages: appending a suffix made its
         // changed path private. It needs no pruning when all removed pages lived elsewhere.
-        if (!node.unique()) { return; }
+        // (use_count() == 1 replaces the C++20-removed shared_ptr::unique().)
+        if (node.use_count() != 1) { return; }
         if (width == kDirectoryChunkPages) {
             std::fill(node->pages.begin() + count, node->pages.end(), LogicalKVPageHandle{});
         } else {

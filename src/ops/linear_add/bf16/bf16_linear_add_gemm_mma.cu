@@ -26,6 +26,7 @@ void bf16_linear_add_aggregate_mma_launch(const Tensor& x, const Weight& weight,
 
 void bf16_linear_add_mma_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                 cudaStream_t stream) {
+#if defined(NINFER_ENABLE_TMA)
     auto* data     = static_cast<__nv_bfloat16*>(residual.data);
     const auto p   = bf16_a16_operands(x, weight);
     const auto tma = [&]<class S>() {
@@ -41,5 +42,10 @@ void bf16_linear_add_mma_launch(const Tensor& x, const Weight& weight, Tensor& r
         tma.template operator()<Bf16A16TmaR64T64K64S3>();
     else
         tma.template operator()<Bf16A16TmaR64T128K64S2>();
+#else
+    // Ada fallback: no TMA on sm_89; the cp.async aggregate kernels cover every token
+    // count for this shape.
+    bf16_linear_add_aggregate_mma_launch(x, weight, residual, stream);
+#endif
 }
 } // namespace ninfer::ops::detail

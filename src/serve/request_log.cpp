@@ -18,8 +18,6 @@
 #include <system_error>
 #include <utility>
 
-#include <unistd.h>
-
 namespace ninfer::serve {
 namespace {
 

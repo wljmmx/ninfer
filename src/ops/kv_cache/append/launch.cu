@@ -187,14 +187,27 @@ void kv_cache_append_batch_launch(const Tensor& k, const Tensor& v, const Tensor
                                   const Tensor& valid_columns, const Tensor& table_rows,
                                   PagedKVBatchLayerView cache, cudaStream_t stream) {
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+#if defined(NINFER_ENABLE_NVFP4)
         kv_cache_append_k8v4_batch_launch(k, v, positions, valid_columns, table_rows, cache,
                                           stream);
         return;
+#else
+        throw std::invalid_argument(
+            "kv_cache_append: K8V4 (Fp8KeyNvfp4Value) storage encodes values as NVFP4 and "
+            "requires a Blackwell (sm_120a) build; choose BF16, INT8 or FP8 KV on RTX 4090 "
+            "(sm_89).");
+#endif
     }
     if (cache.storage == KvCacheStorage::Nvfp4Group16) {
+#if defined(NINFER_ENABLE_NVFP4)
         kv_cache_append_nvfp4_batch_launch(k, v, positions, valid_columns, table_rows, cache,
                                            stream);
         return;
+#else
+        throw std::invalid_argument(
+            "kv_cache_append: Nvfp4Group16 KV storage requires a Blackwell (sm_120a) build with "
+            "NVFP4 tensor cores; choose BF16, INT8 or FP8 KV on RTX 4090 (sm_89).");
+#endif
     }
     const auto launch = [&]<bool Masked>() {
         const PagedKVBatchMetadata<Masked> metadata{

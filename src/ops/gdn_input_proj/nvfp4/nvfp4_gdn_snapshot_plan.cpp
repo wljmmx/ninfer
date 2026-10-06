@@ -9,6 +9,7 @@
 namespace ninfer::ops::detail {
 namespace {
 
+#if defined(NINFER_ENABLE_NVFP4)
 struct Nvfp4GdnProjectedWorkspace {
     Tensor projected;
     DeviceSpan projection;
@@ -23,11 +24,12 @@ Nvfp4GdnProjectedWorkspace allocate_workspace(Allocator& allocator, std::int32_t
     out.projection = allocator.alloc_bytes(projection_bytes, 256);
     return out;
 }
+#endif
 
 } // namespace
 
 Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t tokens,
-                                             std::int32_t batch_size) {
+                                              std::int32_t batch_size) {
     if (tokens <= 0 || batch_size <= 0 || batch_size > 8) {
         throw std::invalid_argument("nvfp4 gdn conv: invalid B/T domain");
     }
@@ -45,6 +47,7 @@ Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t t
     return {Nvfp4GdnConvScheduleId::Materialized};
 }
 
+#if defined(NINFER_ENABLE_NVFP4)
 std::size_t nvfp4_gdn_snapshot_workspace_capacity_bytes(LinearPolicy policy,
                                                         std::int32_t min_tokens,
                                                         std::int32_t max_tokens) {
@@ -61,11 +64,11 @@ std::size_t nvfp4_gdn_snapshot_workspace_capacity_bytes(LinearPolicy policy,
 }
 
 void nvfp4_gdn_snapshot_dispatch(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
-                                 Tensor& conv_states, const Tensor& valid_columns,
-                                 const Tensor& initial_slot, const Tensor& snapshot_base_slot,
-                                 Tensor& query, Tensor& key, Tensor& value, Tensor& z,
-                                 LinearPolicy policy, WorkspaceArena& workspace,
-                                 cudaStream_t stream) {
+                                  Tensor& conv_states, const Tensor& valid_columns,
+                                  const Tensor& initial_slot, const Tensor& snapshot_base_slot,
+                                  Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                                  LinearPolicy policy, WorkspaceArena& workspace,
+                                  cudaStream_t stream) {
     switch (nvfp4_gdn_conv_resolve_plan(policy, x.ne[1], 1).schedule) {
     case Nvfp4GdnConvScheduleId::DecodeFusedA16:
         nvfp4_gdn_snapshot_decode_launch(x, weight, conv_weight, conv_states, valid_columns,
@@ -89,5 +92,26 @@ void nvfp4_gdn_snapshot_dispatch(const Tensor& x, const Weight& weight, const Te
     nvfp4_gdn_snapshot_post_launch(scratch.projected, conv_weight, conv_states, valid_columns,
                                    initial_slot, snapshot_base_slot, query, key, value, stream);
 }
+#else
+namespace {
+[[noreturn]] void reject_nvfp4_gdn_snapshot() {
+    throw std::invalid_argument(
+        "nvfp4 gdn snapshot: NVFP4 weights require a Blackwell (sm_120a) build with NVFP4 "
+        "tensor cores. This engine was built for RTX 4090 (sm_89); load a groupwise-int "
+        "artifact instead.");
+}
+} // namespace
+
+std::size_t nvfp4_gdn_snapshot_workspace_capacity_bytes(LinearPolicy, std::int32_t,
+                                                        std::int32_t) {
+    reject_nvfp4_gdn_snapshot();
+}
+
+void nvfp4_gdn_snapshot_dispatch(const Tensor&, const Weight&, const Tensor&, Tensor&,
+                                  const Tensor&, const Tensor&, const Tensor&, Tensor&, Tensor&,
+                                  Tensor&, Tensor&, LinearPolicy, WorkspaceArena&, cudaStream_t) {
+    reject_nvfp4_gdn_snapshot();
+}
+#endif
 
 } // namespace ninfer::ops::detail

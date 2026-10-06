@@ -1,5 +1,10 @@
 #pragma once
 
+// TMA bulk tensor copies (cp.async.bulk.tensor with mbarrier completion) are an sm_90+
+// feature. This whole translation unit is compiled only for Blackwell targets; Ada builds
+// dispatch to the cp.async + ldmatrix + plain FP8 mma.sync kernels instead.
+#if defined(NINFER_ENABLE_TMA)
+
 #include "ops/common/mbarrier.cuh"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
@@ -333,3 +338,5 @@ void launch_fp8_a8_tma_mma(const Fp8A8Operands& p, Output output, Epilogue epilo
 }
 
 } // namespace ninfer::ops::detail
+
+#endif // NINFER_ENABLE_TMA

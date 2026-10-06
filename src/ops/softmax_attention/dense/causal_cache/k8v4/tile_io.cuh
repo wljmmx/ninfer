@@ -1,5 +1,9 @@
 #pragma once
 
+// K8V4 stores its value plane as NVFP4 group16 and therefore shares the Blackwell-only
+// E2M1 hardware codec (quantize pack and scaled decode). This translation unit is
+// compiled out on non-Blackwell architectures; dispatch rejects K8V4 KV there.
+#if defined(NINFER_ENABLE_NVFP4)
 #include "ops/kv_cache/nvfp4_group16_codec.cuh"
 #include "ops/softmax_attention/dense/causal_cache/k8v4/operands.h"
 
@@ -14,3 +18,5 @@ struct K8V4KvTiledValues {
     }
 };
 } // namespace ninfer::ops::detail
+
+#endif // NINFER_ENABLE_NVFP4

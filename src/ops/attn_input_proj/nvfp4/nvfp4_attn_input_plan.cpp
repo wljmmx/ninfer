@@ -11,6 +11,7 @@
 namespace ninfer::ops::detail {
 namespace {
 
+#if defined(NINFER_ENABLE_NVFP4)
 enum class Nvfp4AttnInputRoute : std::uint8_t {
     A16,
     A4,
@@ -26,12 +27,13 @@ Nvfp4AttnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     }
     return tokens >= 4 ? Nvfp4AttnInputRoute::A4 : Nvfp4AttnInputRoute::A16;
 }
-
+#endif
 
 } // namespace
 
+#if defined(NINFER_ENABLE_NVFP4)
 std::size_t nvfp4_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::int32_t min_tokens,
-                                                      std::int32_t max_tokens) {
+                                                       std::int32_t max_tokens) {
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("nvfp4 attn_input_proj workspace: invalid token interval");
     }
@@ -42,8 +44,8 @@ std::size_t nvfp4_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::
 }
 
 void nvfp4_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
-                               Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
-                               cudaStream_t stream) {
+                                Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
+                                cudaStream_t stream) {
     if (resolve_route(policy, x.ne[1]) == Nvfp4AttnInputRoute::A16) {
         nvfp4_attn_input_a16_launch(x, weight, q, gate, k, v, stream);
         return;
@@ -55,5 +57,25 @@ void nvfp4_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q,
     const Nvfp4A4Workspace scratch = allocate_nvfp4_a4_workspace(*workspace, x.ne[1], weight.k);
     nvfp4_attn_input_a4_launch(x, weight, q, gate, k, v, scratch, stream);
 }
+#else
+namespace {
+[[noreturn]] void reject_nvfp4_attn_input() {
+    throw std::invalid_argument(
+        "nvfp4 attn_input_proj: NVFP4 weights require a Blackwell (sm_120a) build with NVFP4 "
+        "tensor cores. This engine was built for RTX 4090 (sm_89); load a groupwise-int "
+        "artifact instead.");
+}
+} // namespace
+
+std::size_t nvfp4_attn_input_workspace_capacity_bytes(LinearPolicy, std::int32_t,
+                                                       std::int32_t) {
+    reject_nvfp4_attn_input();
+}
+
+void nvfp4_attn_input_dispatch(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&, Tensor&,
+                                LinearPolicy, WorkspaceArena*, cudaStream_t) {
+    reject_nvfp4_attn_input();
+}
+#endif
 
 } // namespace ninfer::ops::detail

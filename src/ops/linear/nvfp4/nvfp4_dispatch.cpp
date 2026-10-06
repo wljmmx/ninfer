@@ -5,6 +5,8 @@
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
+
+#if defined(NINFER_ENABLE_NVFP4)
 namespace {
 const std::array kShapes{&kNvfp4N14336K5120, &kNvfp4N16384K5120, &kNvfp4N34816K5120,
                          &kNvfp4N5120K6144, &kNvfp4N5120K17408};
@@ -19,8 +21,8 @@ const Nvfp4LinearShape& resolve_shape(std::int32_t n, std::int32_t k, LinearPoli
 } // namespace
 
 std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k,
-                                                  LinearPolicy policy, std::int32_t min_tokens,
-                                                  std::int32_t max_tokens) {
+                                                   LinearPolicy policy, std::int32_t min_tokens,
+                                                   std::int32_t max_tokens) {
     if (min_tokens <= 0 || max_tokens < min_tokens)
         throw std::invalid_argument("nvfp4 linear workspace: invalid token interval");
     const auto& shape = resolve_shape(n, k, policy);
@@ -42,4 +44,26 @@ void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPo
     const auto scratch = allocate_nvfp4_a4_workspace(*workspace, x.ne[1], weight.k);
     shape.a4(x, weight, out, scratch, stream);
 }
+#else
+namespace {
+[[noreturn]] void reject_nvfp4(const char* operation) {
+    throw std::invalid_argument(
+        std::string(operation) +
+        ": NVFP4 weights require a Blackwell (sm_120a) build with NVFP4 tensor cores. "
+        "This engine was built for RTX 4090 (sm_89); load a groupwise-int artifact "
+        "(qwen3_8_27b.ninfer) instead.");
+}
+} // namespace
+
+std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t, std::int32_t, LinearPolicy,
+                                                   std::int32_t, std::int32_t) {
+    reject_nvfp4("nvfp4 linear");
+}
+
+void nvfp4_dispatch(const Tensor&, const Weight&, Tensor&, LinearPolicy, WorkspaceArena*,
+                    cudaStream_t) {
+    reject_nvfp4("nvfp4 linear");
+}
+#endif
+
 } // namespace ninfer::ops::detail

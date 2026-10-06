@@ -23,6 +23,7 @@ void bf16_attn_input_mma_launch(const Tensor& x, const Weight& weight, Tensor& q
             p, output, LinearIdentityEpilogue{}, stream);
     else if (p.tokens <= 32)
         mma.template operator()<Bf16A16MmaR32T32K128S3>();
+#if defined(NINFER_ENABLE_TMA)
     else if (p.tokens <= 64)
         tma.template operator()<Bf16A16TmaR64T64K64S3>();
     else if (p.tokens <= 96)
@@ -33,5 +34,13 @@ void bf16_attn_input_mma_launch(const Tensor& x, const Weight& weight, Tensor& q
         tma.template operator()<Bf16A16TmaR64T64K64S3>();
     else
         tma.template operator()<Bf16A16TmaR64T128K64S2>();
+#else
+    else if (p.tokens <= 64)
+        mma.template operator()<Bf16A16MmaR64T32K64S3>();
+    else if (p.tokens <= 96)
+        mma.template operator()<Bf16A16MmaR64T32K64S3>();
+    else
+        mma.template operator()<Bf16A16MmaR32T32K256S3>();
+#endif
 }
 } // namespace ninfer::ops::detail

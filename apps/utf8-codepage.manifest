@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <!-- Windows 10 1903+ processes with this manifest decode command-line arguments, narrow
+       file paths and ANSI CRT interfaces as UTF-8 instead of the system code page. The
+       engine's whole text pipeline is UTF-8 (Jinja templates, JSON, tokenizer), so this is
+       required for non-ASCII prompts and model paths on Windows. -->
+  <assemblyIdentity type="win32" name="ninfer" version="3.0.0.0"/>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings xmlns:ws2019="http://schemas.microsoft.com/SMI/2019/WindowsSettings">
+      <ws2019:activeCodePage>UTF-8</ws2019:activeCodePage>
+    </windowsSettings>
+  </application>
+</assembly>

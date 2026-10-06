@@ -1,5 +1,9 @@
 #pragma once
 
+// NVFP4 tensor core paths (kind::mxf4nvf4 MMA, TMA, setmaxnreg warp specialization
+// and the E2M1 hardware codecs) require Blackwell sm_120a. This translation unit is
+// compiled out on other architectures; dispatch rejects NVFP4 weights there.
+#if defined(NINFER_ENABLE_NVFP4)
 // NVFP4 codes multiplied by their raw E4M3 G16 scales are exactly representable
 // in BF16. The global weight divisor is applied to the complete FP32 reduction.
 // Activations remain the represented public BF16 inputs.
@@ -246,3 +250,5 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
     }
 }
 } // namespace ninfer::ops::detail
+
+#endif // NINFER_ENABLE_NVFP4

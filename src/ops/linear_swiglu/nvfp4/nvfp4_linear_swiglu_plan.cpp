@@ -13,6 +13,7 @@
 namespace ninfer::ops::detail {
 namespace {
 
+#if defined(NINFER_ENABLE_NVFP4)
 enum class Nvfp4LinearSwiGluRoute {
     DecodeFusedA16,
     SmallTFusedA16,
@@ -49,11 +50,13 @@ std::size_t fused_workspace_bytes(std::int32_t tokens) {
     return layout.peak_bytes(1);
 }
 
+#endif
 } // namespace
 
+#if defined(NINFER_ENABLE_NVFP4)
 std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
-                                                         std::int32_t min_tokens,
-                                                         std::int32_t max_tokens) {
+                                                          std::int32_t min_tokens,
+                                                          std::int32_t max_tokens) {
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("nvfp4 linear_swiglu workspace: invalid token interval");
     }
@@ -67,8 +70,8 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
 }
 
 void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
-                                  LinearPolicy policy, WorkspaceArena& workspace,
-                                  cudaStream_t stream) {
+                                   LinearPolicy policy, WorkspaceArena& workspace,
+                                   cudaStream_t stream) {
     switch (resolve_route(policy, x.ne[1])) {
     case Nvfp4LinearSwiGluRoute::DecodeFusedA16:
         nvfp4_linear_swiglu_decode_launch(x, weight, out, stream);
@@ -91,4 +94,25 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
     }
     throw std::logic_error("unreachable NVFP4 SwiGLU route");
 }
+#else
+namespace {
+[[noreturn]] void reject_nvfp4_linear_swiglu() {
+    throw std::invalid_argument(
+        "nvfp4 linear_swiglu: NVFP4 weights require a Blackwell (sm_120a) build with NVFP4 "
+        "tensor cores. This engine was built for RTX 4090 (sm_89); load a groupwise-int "
+        "artifact instead.");
+}
+} // namespace
+
+std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy, std::int32_t,
+                                                          std::int32_t) {
+    reject_nvfp4_linear_swiglu();
+}
+
+void nvfp4_linear_swiglu_dispatch(const Tensor&, const Weight&, Tensor&, LinearPolicy,
+                                   WorkspaceArena&, cudaStream_t) {
+    reject_nvfp4_linear_swiglu();
+}
+#endif
+
 } // namespace ninfer::ops::detail

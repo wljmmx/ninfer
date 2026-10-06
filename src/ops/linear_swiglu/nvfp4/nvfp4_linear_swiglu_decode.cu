@@ -1,3 +1,7 @@
+// NVFP4 tensor core paths (kind::mxf4nvf4 MMA, TMA, setmaxnreg warp specialization
+// and the E2M1 hardware codecs) require Blackwell sm_120a. This translation unit is
+// compiled out on other architectures; dispatch rejects NVFP4 weights there.
+#if defined(NINFER_ENABLE_NVFP4)
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_epilogue.cuh"
 #include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
@@ -13,3 +17,5 @@ void nvfp4_linear_swiglu_decode_launch(const Tensor& x, const Weight& w, Tensor&
                              Nvfp4SwiGluEpilogue{}, stream, Nvfp4SwiGluRows<1>{});
 }
 } // namespace ninfer::ops::detail
+
+#endif // NINFER_ENABLE_NVFP4

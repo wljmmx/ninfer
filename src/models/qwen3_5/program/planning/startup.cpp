@@ -803,8 +803,15 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         }
         break;
     }
-    if (device.compute_capability() != 120) {
-        throw std::invalid_argument("Qwen3.5 family runtime requires compute capability 12.0");
+    // RTX 5090 (sm_120a) runs the full format matrix including NVFP4 weights and NVFP4 KV.
+    // RTX 4090 (sm_89) runs every groupwise-int path plus FP8 weights (plain FP8 tensor core
+    // MMA) and BF16/INT8/FP8/K8V4 KV; NVFP4 dispatch rejects those weights and KV storages
+    // with explicit errors instead.
+    const int capability = device.compute_capability();
+    if (capability != 120 && capability != 89) {
+        throw std::invalid_argument(
+            "Qwen3.5 family runtime requires an RTX 5090 (compute capability 12.0) or an "
+            "RTX 4090 (compute capability 8.9)");
     }
 }
 

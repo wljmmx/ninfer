@@ -1,3 +1,7 @@
+// NVFP4 tensor core paths (kind::mxf4nvf4 MMA, TMA, setmaxnreg warp specialization
+// and the E2M1 hardware codecs) require Blackwell sm_120a. This translation unit is
+// compiled out on other architectures; dispatch rejects NVFP4 weights there.
+#if defined(NINFER_ENABLE_NVFP4)
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_a4_tma_launch.h"
 #include "ops/linear/nvfp4/nvfp4_a4_tma.cuh"
 
@@ -21,3 +25,5 @@ void launch_nvfp4_a4_tma_linear_add(const Nvfp4A4Operands& p, __nv_bfloat16* res
         throw std::invalid_argument("NVFP4 TMA linear_add: unsupported K");
 }
 } // namespace ninfer::ops::detail
+
+#endif // NINFER_ENABLE_NVFP4

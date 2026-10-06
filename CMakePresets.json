@@ -15,9 +15,32 @@
       }
     },
     {
+      "name": "win-release",
+      "displayName": "Windows MSVC build for RTX 4090 (sm_89), vcpkg dependencies",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-win",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CUDA_ARCHITECTURES": "89",
+        "NINFER_BUILD_APPS": "ON",
+        "BUILD_TESTING": "OFF",
+        "NINFER_BUILD_BENCHMARKS": "OFF",
+        "VCPKG_TARGET_TRIPLET": "x64-windows"
+      }
+    },
+    {
       "name": "dev",
       "displayName": "Release products, tests and benchmarks",
       "inherits": "release",
+      "cacheVariables": {
+        "BUILD_TESTING": "ON",
+        "NINFER_BUILD_BENCHMARKS": "ON"
+      }
+    },
+    {
+      "name": "win-dev",
+      "displayName": "Windows MSVC build for RTX 4090 (sm_89) with tests and benchmarks",
+      "inherits": "win-release",
       "cacheVariables": {
         "BUILD_TESTING": "ON",
         "NINFER_BUILD_BENCHMARKS": "ON"
@@ -26,12 +49,19 @@
   ],
   "buildPresets": [
     { "name": "release", "configurePreset": "release" },
-    { "name": "dev", "configurePreset": "dev" }
+    { "name": "win-release", "configurePreset": "win-release" },
+    { "name": "dev", "configurePreset": "dev" },
+    { "name": "win-dev", "configurePreset": "win-dev" }
   ],
   "testPresets": [
     {
       "name": "dev",
       "configurePreset": "dev",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "win-dev",
+      "configurePreset": "win-dev",
       "output": { "outputOnFailure": true }
     }
   ]

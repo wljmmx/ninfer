@@ -3,11 +3,14 @@
 > Selected checkpoints. Maximum single-GPU inference performance.
 
 NInfer is a from-scratch C++/CUDA inference engine for Qwen3.5 Dense and MoE architectures on a
-single NVIDIA GeForce RTX 5090. It runs text, image, and video prompts through a local CLI or
-OpenAI-/Anthropic-compatible HTTP APIs. The runtime is deliberately specialized: one GPU, one
-resident model, and one to eight execution lanes fixed at startup.
+single NVIDIA GeForce RTX 5090 (Blackwell, `sm_120a`) or RTX 4090 (Ada, `sm_89`). It runs text,
+image, and video prompts through a local CLI or OpenAI-/Anthropic-compatible HTTP APIs. The
+runtime is deliberately specialized: one GPU, one resident model, and one to eight execution
+lanes fixed at startup.
 
-Five official artifacts are available. The quick-start commands use Qwen3.8-27B NVFP4.
+Five official artifacts are available. The quick-start commands use Qwen3.8-27B NVFP4; on
+RTX 4090 load the groupwise-int artifact instead (`qwen3_8_27b.ninfer`), because NVFP4 tensor
+core paths are Blackwell-only.
 
 | Model | Weights | Artifact | Download and model card |
 |---|---|---|---|
@@ -28,25 +31,57 @@ the weights again.
 
 ## Quick start
 
-NInfer requires 64-bit Linux, an NVIDIA GeForce RTX 5090, a CUDA toolkit supporting `sm_120a`,
-CMake 3.28 or newer, a C++20 host compiler, Ninja, `pkg-config`, FFmpeg development libraries
-(`libavformat`, `libavcodec`, `libavutil`, and `libswscale`), and `libcurl >= 7.85`.
-CUDA 13.1 is the validated development toolkit; CMake does not impose a CUDA version floor.
-The build rejects CUDA architectures other than `sm_120a`.
+NInfer runs on two single-GPU targets:
+
+- **RTX 5090 (Blackwell, `sm_120a`)** — 64-bit Linux (validated) and the full format matrix,
+  including NVFP4 weights and NVFP4 KV.
+- **RTX 4090 (Ada, `sm_89`)** — 64-bit Linux or Windows with MSVC 2022 or newer. Every
+  groupwise-int path runs natively, plus FP8 weights through the plain FP8 tensor core MMA and
+  BF16 / INT8 / FP8 / K8V4 KV storage. NVFP4 weights and NVFP4 KV require Blackwell tensor
+  cores and are rejected with an explicit error; load a groupwise-int artifact on RTX 4090.
+
+Both targets need a CUDA toolkit of 12.8 or newer that supports the selected architecture,
+CMake 3.28 or newer, a C++20 host compiler, Ninja, FFmpeg development libraries (`libavformat`,
+`libavcodec`, `libavutil`, and `libswscale`), and `libcurl >= 7.85`. CUDA 13.1 is the validated
+development toolkit for `sm_120a`; CUDA 13.x is validated for `sm_89`. The build accepts only
+`CMAKE_CUDA_ARCHITECTURES=89` or `120a` (default `89`).
 
 Build the product binaries:
 
 ```bash
-git clone https://github.com/Neroued/ninfer.git
+git clone https://github.com/wljmmx/ninfer.git
 cd ninfer
 
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89
 cmake --build build -j
+```
+
+On Linux the FFmpeg and libcurl development packages resolve through `pkg-config`. On Windows
+the recommended path is [vcpkg](https://vcpkg.io) in manifest mode with the `x64-windows`
+triplet; `vcpkg.json` pins the dependency set:
+
+```powershell
+cmake -S . -B build-win -G Ninja `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DCMAKE_CUDA_ARCHITECTURES=89 `
+  -DCMAKE_TOOLCHAIN_FILE=<vcpkg-root>/scripts/buildsystems/vcpkg.cmake `
+  -DVCPKG_TARGET_TRIPLET=x64-windows
+cmake --build build-win -j
+```
+
+Alternatively provide an external FFmpeg build explicitly (any shared FFmpeg with headers and
+import libraries works):
+
+```powershell
+cmake ... -DFFMPEG_INCLUDE_DIRS=<ffmpeg>/include `
+          -DFFMPEG_LIBRARY_DIRS=<ffmpeg>/lib `
+          -DFFMPEG_LIBRARIES="avformat;avcodec;avutil;swscale"
 ```
 
 Tests and benchmarks are excluded from the default build. `cmake --preset release` configures
 the same product build; `cmake --preset dev` also enables tests and benchmarks and finds a
-Python 3 interpreter. Both presets use `build/` and explicitly reset the build options.
+Python 3 interpreter. The `win-release` / `win-dev` presets select the RTX 4090 MSVC layout.
+Both presets use `build/` (or `build-win/`) and explicitly reset the build options.
 Machine-specific compiler and Python paths belong in the ignored `CMakeUserPresets.json`.
 See [build organization and configuration](docs/maintainer/build-system.md) for details.
 

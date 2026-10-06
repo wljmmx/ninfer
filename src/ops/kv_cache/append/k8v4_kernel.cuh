@@ -1,5 +1,9 @@
 #pragma once
 
+// K8V4 stores its value plane as NVFP4 group16 and therefore shares the Blackwell-only
+// E2M1 hardware codec (quantize pack and scaled decode). This translation unit is
+// compiled out on non-Blackwell architectures; dispatch rejects K8V4 KV there.
+#if defined(NINFER_ENABLE_NVFP4)
 // Asymmetric K8V4 append kernel. K uses the existing row-256 E4M3 cache codec; V uses the
 // group-16 packed E2M1 cache codec. Both operands receive the fixed FP32 D256 Hadamard rotation.
 
@@ -137,3 +141,5 @@ __launch_bounds__(256) __global__ void kv_cache_append_full_k8v4_page_kernel(
 }
 
 } // namespace ninfer::ops
+
+#endif // NINFER_ENABLE_NVFP4

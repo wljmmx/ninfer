@@ -39,13 +39,19 @@ ninfer_add_op_bench(ninfer_gdn_input_proj_conv_snapshot_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/gdn_input_proj_conv_snapshot_bench.cu")
 ninfer_add_op_bench(ninfer_attn_input_proj_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/attn_input_proj_bench.cu")
 ninfer_add_op_bench(ninfer_q8_linear_swiglu_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/q8_linear_swiglu_bench.cu")
-ninfer_add_op_bench(ninfer_nvfp4_linear_swiglu_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/nvfp4_linear_swiglu_bench.cu")
+# NVFP4 kernels exist only in Blackwell (sm_120a) builds; the sm_89 dispatch rejects
+# NVFP4 weights, so the NVFP4 benches are registered only when the kernels exist.
+if(NINFER_ENABLE_NVFP4)
+  ninfer_add_op_bench(ninfer_nvfp4_linear_swiglu_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/nvfp4_linear_swiglu_bench.cu")
+endif()
 ninfer_add_op_bench(ninfer_fp8_linear_swiglu_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/fp8_linear_swiglu_bench.cu")
 ninfer_add_op_bench(ninfer_q4_linear_swiglu_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/q4_linear_swiglu_bench.cu")
 ninfer_add_op_bench(ninfer_q8_linear_add_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/q8_linear_add_bench.cu")
 ninfer_add_op_bench(ninfer_q5_linear_add_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/q5_linear_add_bench.cu")
 ninfer_add_op_bench(ninfer_bf16_linear_add_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/bf16_linear_add_bench.cu")
-ninfer_add_op_bench(ninfer_nvfp4_linear_add_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/nvfp4_linear_add_bench.cu")
+if(NINFER_ENABLE_NVFP4)
+  ninfer_add_op_bench(ninfer_nvfp4_linear_add_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/nvfp4_linear_add_bench.cu")
+endif()
 ninfer_add_op_bench(ninfer_fp8_linear_add_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/fp8_linear_add_bench.cu")
 ninfer_add_op_bench(ninfer_causal_softmax_attention_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/causal_softmax_attention_bench.cu")

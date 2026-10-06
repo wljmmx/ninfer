@@ -10,6 +10,7 @@
 namespace ninfer::ops::detail {
 namespace {
 
+#if defined(NINFER_ENABLE_NVFP4)
 enum class Nvfp4GdnInputRoute : std::uint8_t {
     A16,
     A4,
@@ -23,12 +24,13 @@ Nvfp4GdnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (allows_a4(policy)) { return Nvfp4GdnInputRoute::A4; }
     throw std::invalid_argument("nvfp4 gdn_input_proj: unsupported policy");
 }
-
+#endif
 
 } // namespace
 
+#if defined(NINFER_ENABLE_NVFP4)
 std::size_t nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::int32_t min_tokens,
-                                                     std::int32_t max_tokens) {
+                                                      std::int32_t max_tokens) {
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("nvfp4 gdn_input_proj workspace: invalid token interval");
     }
@@ -51,5 +53,24 @@ void nvfp4_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv
     const Nvfp4A4Workspace scratch = allocate_nvfp4_a4_workspace(*workspace, x.ne[1], weight.k);
     nvfp4_gdn_input_a4_launch(x, weight, qkv, z, scratch, stream);
 }
+#else
+namespace {
+[[noreturn]] void reject_nvfp4_gdn_input() {
+    throw std::invalid_argument(
+        "nvfp4 gdn_input_proj: NVFP4 weights require a Blackwell (sm_120a) build with NVFP4 "
+        "tensor cores. This engine was built for RTX 4090 (sm_89); load a groupwise-int "
+        "artifact instead.");
+}
+} // namespace
+
+std::size_t nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy, std::int32_t, std::int32_t) {
+    reject_nvfp4_gdn_input();
+}
+
+void nvfp4_gdn_input_dispatch(const Tensor&, const Weight&, Tensor&, Tensor&, LinearPolicy,
+                              WorkspaceArena*, cudaStream_t) {
+    reject_nvfp4_gdn_input();
+}
+#endif
 
 } // namespace ninfer::ops::detail

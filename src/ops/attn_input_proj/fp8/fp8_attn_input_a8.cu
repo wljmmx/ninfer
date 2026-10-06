@@ -5,15 +5,22 @@
 
 namespace ninfer::ops::detail {
 namespace {
+#if defined(NINFER_ENABLE_TMA)
 using Tma64x128 = Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 2, 1>;
 using Tma64x256 = Fp8A8TmaMmaSchedule<64, 256, 128, 2, 4, 2, 1>;
 using Tma96x256 = Fp8A8TmaMmaSchedule<96, 256, 128, 3, 4, 2, 1>;
 using Bulk      = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4, 2, 1>, 170, 4, 8>;
+#endif
 
 } // namespace
 
 std::size_t fp8_attn_input_partial_capacity_bytes(std::int32_t max_tokens) {
+#if defined(NINFER_ENABLE_TMA)
     return max_tokens > 384 ? Bulk::kPartialBytes : 0;
+#else
+    // Ada fallback: no TMA split-K on sm_89, so no partial buffers are needed.
+    return 0;
+#endif
 }
 
 void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
@@ -34,10 +41,15 @@ void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, 
     };
     if (x.ne[1] <= 32) return launch.template operator()<Fp8A8T32R32K128>();
     if (x.ne[1] <= 96) return launch.template operator()<Fp8A8T32R128K128>();
+#if defined(NINFER_ENABLE_TMA)
     if (x.ne[1] <= 128) return launch.template operator()<Tma64x128>();
     if (x.ne[1] <= 192) return launch.template operator()<Tma64x256>();
     // Three 96-token tiles give 168 CTAs: one almost-full wave through T=288.
     if (x.ne[1] <= 288) return launch.template operator()<Tma96x256>();
     launch.template operator()<Bulk>();
+#else
+    // Ada fallback: no TMA on sm_89; the plain FP8 MMA kernel tiles the same shapes.
+    launch.template operator()<Fp8A8T64R128K128>();
+#endif
 }
 } // namespace ninfer::ops::detail
