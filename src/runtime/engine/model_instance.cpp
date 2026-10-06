@@ -59,10 +59,19 @@ void validate_options(const EngineOptions& options) {
     }
 }
 
-std::size_t current_free_device_bytes() {
+std::size_t current_free_device_bytes(bool wddm_evictable_budget = false,
+                                     std::size_t weights_bytes = 0) {
     std::size_t free_bytes  = 0;
     std::size_t total_bytes = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+#if defined(_WIN32)
+    // Allow WDDM to evict background apps down to a 512 MiB non-evictable DWM display floor.
+    constexpr std::size_t kMinDwmHeadroom = 512ULL * 1024ULL * 1024ULL;
+    if (wddm_evictable_budget && total_bytes > weights_bytes + kMinDwmHeadroom) {
+        const std::size_t evictable_free = total_bytes - weights_bytes - kMinDwmHeadroom;
+        return std::max(free_bytes, evictable_free);
+    }
+#endif
     return free_bytes;
 }
 
@@ -141,7 +150,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
         options.context_cost.preset_path);
     auto planner    = models::qwen3_5::make_sequence_planner(instance->parameters, device, options);
     auto resolution = resolve_kv_capacity(options.kv_capacity, planner.capacity_curve(),
-                                          current_free_device_bytes());
+                                          current_free_device_bytes(options.wddm_evictable_budget));
     auto sequence   = std::move(planner).finalize(resolution.main_page_groups);
     if (sequence.device_reservation_bytes() != resolution.runtime_reservation_bytes ||
         sequence.kv_capacity() != resolution.resolved_tokens) {
@@ -155,7 +164,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
                                                         device, options.startup_observer);
     device.synchronize();
     program.complete();
-    instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
+    instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes(options.wddm_evictable_budget);
     const auto& stats = instance->model->storage_stats();
     LoadSummary summary;
     summary.architecture = models::architecture_name(instance->model->config().text.architecture);

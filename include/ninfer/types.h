@@ -174,6 +174,7 @@ struct EngineOptions {
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
     bool use_cuda_graph                    = true;
+    bool wddm_evictable_budget              = false; // Windows: budget against total VRAM minus DWM floor
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     StartupObserver startup_observer;

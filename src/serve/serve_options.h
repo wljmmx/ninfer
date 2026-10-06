@@ -48,6 +48,7 @@ struct ServeOptions {
     ContextCacheOptions context_cache;
     bool enable_vision      = false;
     bool use_cuda_graph     = true;
+    bool wddm_evictable_budget = false;
     bool allow_prefix_reuse = true;
     std::optional<bool> enable_thinking;
     std::optional<bool> preserve_thinking;

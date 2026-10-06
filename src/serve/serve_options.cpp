@@ -136,7 +136,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8] [--spec mtp|dflash|dflash2 --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
-           "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
+           "[--vision] [--no-cuda-graph] [--wddm-evictable-budget] [--no-prefix-reuse] "
            "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
            "[--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
@@ -316,6 +316,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.enable_vision = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--wddm-evictable-budget") {
+            options.wddm_evictable_budget = true;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
         } else if (arg == "--lm-head-draft") {
