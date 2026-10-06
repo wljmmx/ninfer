@@ -1,9 +1,10 @@
 #pragma once
 
-// NVFP4 tensor core paths (kind::mxf4nvf4 MMA, TMA, setmaxnreg warp specialization
-// and the E2M1 hardware codecs) require Blackwell sm_120a. This translation unit is
-// compiled out on other architectures; dispatch rejects NVFP4 weights there.
-#if defined(NINFER_ENABLE_NVFP4)
+// NVFP4 weight codecs. The decode paths and the E2M1 pack run through CUDA 13's official
+// __nv_fp4 / __nv_fp8 conversion intrinsics, which lower to the native Blackwell
+// instructions on sm_100+ and to the toolkit's emulation elsewhere; the K8V4 KV cache
+// uses this codec on every supported architecture. Only the block-scaled weight decode
+// (nvfp4_scaled_pair_bf16) keeps a native-Blackwell asm path for sm_120a builds.
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 
@@ -28,7 +29,21 @@ __device__ __forceinline__ float decode_nvfp4_e4m3(std::uint8_t storage) {
 }
 
 __device__ __forceinline__ unsigned nvfp4_scaled_pair_bf16(std::uint8_t code, std::uint8_t scale) {
-#if __CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
+    // cvt.rn.bf16x2.e2m1x2 / .e4m3x2 need sm_100+. The exact FP32 expansion below is
+    // bit-identical: E2M1 times a finite E4M3 scale needs at most six significand bits,
+    // so the BF16 product is exact.
+    const float2 values    = decode_nvfp4_e2m1x2(code);
+    const float multiplier = decode_nvfp4_e4m3(scale);
+
+    union {
+        __nv_bfloat162 pair;
+        unsigned bits;
+    } result;
+
+    result.pair = __floats2bfloat162_rn(values.x * multiplier, values.y * multiplier);
+    return result.bits;
+#elif __CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)
     // PTX 9.2 exposes native pair widening. E2M1 times a finite E4M3 scale needs
     // at most six significand bits, so the BF16 multiplication is exact.
     unsigned values, multiplier, result;
@@ -77,6 +92,7 @@ static_assert(alignof(Nvfp4QuantizedK16) == 8);
 
 __device__ __forceinline__ void
 pack_nvfp4_e2m1x16(const float2 (&values)[8], std::uint32_t& codes_lo, std::uint32_t& codes_hi) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
     asm volatile("{\n"
                  ".reg .b8 b0;\n"
                  ".reg .b8 b1;\n"
@@ -102,6 +118,24 @@ pack_nvfp4_e2m1x16(const float2 (&values)[8], std::uint32_t& codes_lo, std::uint
                    "f"(values[2].x), "f"(values[2].y), "f"(values[3].x), "f"(values[3].y),
                    "f"(values[4].x), "f"(values[4].y), "f"(values[5].x), "f"(values[5].y),
                    "f"(values[6].x), "f"(values[6].y), "f"(values[7].x), "f"(values[7].y));
+#else
+    // Official CUDA 13 conversion intrinsic (cuda_fp4.h): on sm_100+ it lowers to the
+    // same cvt.rn.satfinite.e2m1x2.f32 instruction used above; on every other
+    // architecture, including the Ada (sm_89) K8V4 KV cache target, the toolkit's own
+    // emulation implements the identical round-to-nearest-even + saturate semantics.
+    // Operand order matches: values[pair].x packs into the low nibble, .y into the high.
+    std::uint8_t bytes[8];
+#pragma unroll
+    for (int pair = 0; pair < 8; ++pair) {
+        bytes[pair] = __nv_cvt_float2_to_fp4x2(values[pair], __NV_E2M1, cudaRoundNearest);
+    }
+    codes_lo = static_cast<std::uint32_t>(bytes[0]) | (static_cast<std::uint32_t>(bytes[1]) << 8U) |
+               (static_cast<std::uint32_t>(bytes[2]) << 16U) |
+               (static_cast<std::uint32_t>(bytes[3]) << 24U);
+    codes_hi = static_cast<std::uint32_t>(bytes[4]) | (static_cast<std::uint32_t>(bytes[5]) << 8U) |
+               (static_cast<std::uint32_t>(bytes[6]) << 16U) |
+               (static_cast<std::uint32_t>(bytes[7]) << 24U);
+#endif
 }
 
 __device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_k16(const __nv_bfloat16* source,
@@ -137,5 +171,3 @@ __device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_k16(const __nv_bfloa
 }
 
 } // namespace ninfer::ops::detail
-
-#endif // NINFER_ENABLE_NVFP4

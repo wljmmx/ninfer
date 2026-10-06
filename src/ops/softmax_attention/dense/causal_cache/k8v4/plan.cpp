@@ -1,7 +1,7 @@
-// K8V4 stores its value plane as NVFP4 group16 and therefore shares the Blackwell-only
-// E2M1 hardware codec (quantize pack and scaled decode). This translation unit is
-// compiled out on non-Blackwell architectures; dispatch rejects K8V4 KV there.
-#if defined(NINFER_ENABLE_NVFP4)
+// K8V4 stores its value plane as NVFP4 group16; the codec runs through official CUDA 13
+// conversion intrinsics on every architecture, so this path is available on Ada (sm_89)
+// as well as Blackwell.
+#if defined(NINFER_ENABLE_K8V4)
 #include "ops/softmax_attention/dense/causal_cache/k8v4/plan.h"
 #include "ops/softmax_attention/dense/causal_cache/k8v4/operands.h"
 #include "ops/softmax_attention/common/mxfp8_tiled_plan.h"
@@ -74,4 +74,4 @@ std::size_t k8v4_kv_workspace_bytes(int heads, int batch, int min_width, int max
 
 } // namespace ninfer::ops::detail
 
-#endif // NINFER_ENABLE_NVFP4
+#endif // NINFER_ENABLE_K8V4

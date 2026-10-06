@@ -304,14 +304,13 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
 #endif
 
     if (cache_storage == KvCacheStorage::Fp8KeyNvfp4Value)
-#if defined(NINFER_ENABLE_NVFP4)
+#if defined(NINFER_ENABLE_K8V4)
         return detail::k8v4_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
                                                execution.multiprocessor_count);
 #else
         throw std::invalid_argument(
-            "causal_softmax_attention workspace: K8V4 (Fp8KeyNvfp4Value) storage encodes values "
-            "as NVFP4 and requires a Blackwell (sm_120a) build; choose BF16, INT8 or FP8 KV on "
-            "RTX 4090 (sm_89).");
+            "causal_softmax_attention workspace: K8V4 (Fp8KeyNvfp4Value) storage is not "
+            "available in this build; choose BF16, INT8 or FP8 KV.");
 #endif
 
     throw std::invalid_argument(
@@ -373,15 +372,14 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     }
 
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
-#if defined(NINFER_ENABLE_NVFP4)
+#if defined(NINFER_ENABLE_K8V4)
         detail::k8v4_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
                                          cache, envelope, workspace, out, execution);
         return;
 #else
         throw std::invalid_argument(
-            "causal_softmax_attention: K8V4 (Fp8KeyNvfp4Value) storage encodes values as NVFP4 "
-            "and requires a Blackwell (sm_120a) build; choose BF16, INT8 or FP8 KV on RTX 4090 "
-            "(sm_89).");
+            "causal_softmax_attention: K8V4 (Fp8KeyNvfp4Value) storage is not available in "
+            "this build; choose BF16, INT8 or FP8 KV.");
 #endif
     }
 
@@ -432,15 +430,14 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
     }
 
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
-#if defined(NINFER_ENABLE_NVFP4)
+#if defined(NINFER_ENABLE_K8V4)
         detail::k8v4_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
                                          execution);
         return;
 #else
         throw std::invalid_argument(
-            "causal_softmax_attention_cached: K8V4 (Fp8KeyNvfp4Value) storage encodes values as "
-            "NVFP4 and requires a Blackwell (sm_120a) build; choose BF16, INT8 or FP8 KV on "
-            "RTX 4090 (sm_89).");
+            "causal_softmax_attention_cached: K8V4 (Fp8KeyNvfp4Value) storage is not available "
+            "in this build; choose BF16, INT8 or FP8 KV.");
 #endif
     }
 

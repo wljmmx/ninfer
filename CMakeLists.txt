@@ -18,15 +18,18 @@ project(ninfer LANGUAGES C CXX CUDA)
 # --- Architecture feature gates ------------------------------------------------
 # sm_120a adds Blackwell-only execution paths: TMA bulk tensor copies, warp-specialized
 # producer/consumer kernels built on setmaxnreg + mbarrier, block-scaled
-# kind::mxf8f6f4 / kind::mxf4nvf4 tensor core MMA, and the NVFP4 weight/KV codecs.
+# kind::mxf8f6f4 / kind::mxf4nvf4 tensor core MMA, and the NVFP4 weight codecs.
 # Ada (sm_89) implements none of those, so those paths are compiled out and dispatch
 # falls back to the cp.async + ldmatrix + mma.sync execution models that Ada supports
-# natively (including the plain E4M3 FP8 tensor core form).
+# natively (including the plain E4M3 FP8 tensor core form). The K8V4 KV cache (FP8 keys
+# + NVFP4 value plane through the official CUDA 13 conversion intrinsics) runs on both
+# architectures, so its gate is defined unconditionally.
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
-  add_compile_definitions(NINFER_ARCH_SM120=1 NINFER_ENABLE_TMA=1 NINFER_ENABLE_NVFP4=1)
+  add_compile_definitions(NINFER_ARCH_SM120=1 NINFER_ENABLE_TMA=1 NINFER_ENABLE_NVFP4=1
+    NINFER_ENABLE_K8V4=1)
   set(NINFER_ENABLE_NVFP4 ON)
 else()
-  add_compile_definitions(NINFER_ARCH_SM89=1)
+  add_compile_definitions(NINFER_ARCH_SM89=1 NINFER_ENABLE_K8V4=1)
   set(NINFER_ENABLE_NVFP4 OFF)
 endif()
 
