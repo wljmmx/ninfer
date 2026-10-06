@@ -18,8 +18,19 @@ void kv_cache_append_k8v4_launch(const Tensor& k, const Tensor& v, const Tensor&
                                  PagedKVLayerView cache, cudaStream_t stream);
 
 void kv_cache_append_k8v4_batch_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
-                                       const Tensor& valid_columns, const Tensor& table_rows,
-                                       PagedKVBatchLayerView cache, cudaStream_t stream);
+                                        const Tensor& valid_columns, const Tensor& table_rows,
+                                        PagedKVBatchLayerView cache, cudaStream_t stream);
+
+// rk PackedV append: int8 K + int4 V (rk8v4) or int4 K + int4 V (rk4v4/rk4v4-e8).
+void kv_cache_append_rk8v4_batch_launch(const Tensor& k, const Tensor& v,
+                                         const Tensor& positions, const Tensor& valid_columns,
+                                         const Tensor& table_rows, PagedKVBatchLayerView cache,
+                                         cudaStream_t stream);
+
+void kv_cache_append_rk4v4_batch_launch(const Tensor& k, const Tensor& v,
+                                         const Tensor& positions, const Tensor& valid_columns,
+                                         const Tensor& table_rows, PagedKVBatchLayerView cache,
+                                         cudaStream_t stream);
 
 void kv_cache_append_batch_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                                   const Tensor& valid_columns, const Tensor& table_rows,

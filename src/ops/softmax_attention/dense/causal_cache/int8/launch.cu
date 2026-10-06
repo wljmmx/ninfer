@@ -237,13 +237,68 @@ void execute_parallel(const CausalAttentionOperands& p, Int8KvReadView cache,
                       cudaStream_t stream) {
     auto scope         = workspace.scope();
     const auto partial = allocate_causal_partials(workspace, plan.query_heads, plan.width,
-                                                  plan.partition.capacity, plan.batch);
+                                                   plan.partition.capacity, plan.batch);
     if (plan.query_heads == 24)
         parallel_grouped<CausalD256H24Kv4, Int8KvCausalPlan::kTokenTile>(p, cache, plan.partition,
                                                                          partial.view(), stream);
     else
         parallel_grouped<CausalD256H16Kv2, Int8KvCausalPlan::kTokenTile>(p, cache, plan.partition,
                                                                          partial.view(), stream);
+}
+
+enum class RkVariant { Plain, PackedKOnly, E8Lattice, E8Root };
+
+// rk parallel: same as execute_parallel but with PackedV=true (and optionally PackedK/E8Root).
+template <class G, int Tokens, bool PackedK = false, bool E8Root = false>
+void rk_parallel_grouped(const CausalAttentionOperands& p, Int8KvReadView cache,
+                         CausalKvPartition partition, CausalPartialView partial,
+                         cudaStream_t stream) {
+    using Instance    = Int8KvGroupedInstance<G, Tokens>;
+    const auto invoke = [&]<bool MultiBatch, bool Masked>() {
+        launch_int8_kv_grouped_mma<G, typename Instance::Schedule, MultiBatch, Masked, false,
+                                   CausalCachedInput, true, true, PackedK, false, E8Root>(
+            p, cache, {}, partition, partial, stream);
+        launch_causal_natural_merge<G, typename Instance::Merge, MultiBatch, Masked, false>(
+            p, cache.valid_columns, partition, partial, stream);
+    };
+    if (p.batch == 1) {
+        if (cache.valid_columns)
+            invoke.template operator()<false, true>();
+        else
+            invoke.template operator()<false, false>();
+    } else {
+        if (cache.valid_columns)
+            invoke.template operator()<true, true>();
+        else
+            invoke.template operator()<true, false>();
+    }
+}
+
+template <RkVariant Variant>
+void rk_execute_parallel(const CausalAttentionOperands& p, Int8KvReadView cache,
+                         const Int8KvCausalPlan& plan, WorkspaceArena& workspace,
+                         cudaStream_t stream) {
+    auto scope         = workspace.scope();
+    const auto partial = allocate_causal_partials(workspace, plan.query_heads, plan.width,
+                                                   plan.partition.capacity, plan.batch);
+    const auto dispatch = [&]<class G>() {
+        if constexpr (Variant == RkVariant::E8Root)
+            rk_parallel_grouped<G, Int8KvCausalPlan::kTokenTile, false, true>(p, cache,
+                plan.partition, partial.view(), stream);
+        else if constexpr (Variant == RkVariant::E8Lattice)
+            rk_parallel_grouped<G, Int8KvCausalPlan::kTokenTile, true, false>(p, cache,
+                plan.partition, partial.view(), stream);
+        else if constexpr (Variant == RkVariant::PackedKOnly)
+            rk_parallel_grouped<G, Int8KvCausalPlan::kTokenTile, true, false>(p, cache,
+                plan.partition, partial.view(), stream);
+        else // Plain (rk8v4: int8 K, no PackedK)
+            rk_parallel_grouped<G, Int8KvCausalPlan::kTokenTile, false, false>(p, cache,
+                plan.partition, partial.view(), stream);
+    };
+    if (plan.query_heads == 24)
+        dispatch.template operator()<CausalD256H24Kv4>();
+    else
+        dispatch.template operator()<CausalD256H16Kv2>();
 }
 
 void tiled(const CausalAttentionOperands& p, Int8KvReadView cache, cudaStream_t stream) {
@@ -302,8 +357,6 @@ void int8_kv_cached_attention(const Tensor& q, const Tensor& positions, float sc
 
 // --- rk4v4 attention (reuses int8 scheduling with PackedV=true) -------------------
 
-enum class RkVariant { Plain, E8Lattice, E8Root };
-
 template <class Input, RkVariant Variant>
 void rk_execute_grouped(const Tensor& q, const Tensor& positions, float scale,
                         PagedKVBatchLayerView cache, const Tensor* valid, const Tensor* rows,
@@ -320,7 +373,9 @@ void rk_execute_grouped(const Tensor& q, const Tensor& positions, float scale,
             rk_root_grouped_instance<G>(p, view, input, plan.partition, partial.view(), stream);
         else if constexpr (Variant == RkVariant::E8Lattice)
             rk_e8_grouped_instance<G>(p, view, input, plan.partition, partial.view(), stream);
-        else
+        else if constexpr (Variant == RkVariant::PackedKOnly)
+            rk_grouped_instance<G>(p, view, input, plan.partition, partial.view(), stream);
+        else // Plain (rk8v4: int8 K + int4 V, PackedV=true only)
             rk_grouped_instance<G>(p, view, input, plan.partition, partial.view(), stream);
     };
     if (plan.query_heads == 24)
@@ -337,24 +392,25 @@ void rk4v4_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v
     const cudaStream_t stream = execution.stream;
     auto plan           = make_int8_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
                                                           execution.multiprocessor_count);
-    // PackedV caches store V as int4 (stride 128). The standard int8 append writes
-    // V with stride 256, which would be out-of-bounds. Force the grouped family
-    // (which includes the PackedV append path) for all widths up to kTokenTile.
-    // TODO(rk-port): for prefill widths > 8, either split into chunks or extend
-    // tiled/parallel to PackedV.
-    if (plan.family != Int8KvFamily::Grouped && q.ne[2] <= Int8KvCausalPlan::kTokenTile) {
-        plan.family = Int8KvFamily::Grouped;
+    if (plan.family == Int8KvFamily::Grouped) {
+        // Fused append + attention for small widths (≤8).
+        rk_execute_grouped<CausalAppendInput, RkVariant::PackedKOnly>(
+            q, positions, scale, cache, &valid, &rows,
+            CausalAppendInput{static_cast<const __nv_bfloat16*>(k.data),
+                              static_cast<const __nv_bfloat16*>(v.data)},
+            plan, workspace, out, stream);
+    } else {
+        // For prefill widths > 8: standalone rk append, then rk parallel attention.
+        kv_cache_append_rk4v4_batch_launch(k, v, positions, valid, rows, cache, stream);
+        const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
+        const auto view =
+            make_quantized_causal_cache_view<Int8KvCacheView<false>>(cache, &valid, &rows);
+        if (plan.family == Int8KvFamily::Tiled)
+            throw std::invalid_argument(
+                "rk4v4 attention: tiled family does not yet support PackedV; "
+                "use --prefill-chunk 1024 to stay on the parallel path.");
+        rk_execute_parallel<RkVariant::PackedKOnly>(p, view, plan, workspace, stream);
     }
-    if (plan.family != Int8KvFamily::Grouped) {
-        throw std::invalid_argument(
-            "rk4v4 attention: prefill width exceeds the grouped kernel's TokenTile (8); "
-            "use a smaller prefill chunk or wait for tiled/parallel PackedV support.");
-    }
-    rk_execute_grouped<CausalAppendInput, RkVariant::Plain>(
-        q, positions, scale, cache, &valid, &rows,
-        CausalAppendInput{static_cast<const __nv_bfloat16*>(k.data),
-                          static_cast<const __nv_bfloat16*>(v.data)},
-        plan, workspace, out, stream);
 }
 
 void rk4v4_kv_cached_attention(const Tensor& q, const Tensor& positions, float scale,
@@ -376,9 +432,40 @@ void rk8v4_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v
                                float scale, PagedKVBatchLayerView cache,
                                CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                                Tensor& out, DeviceExecutionView execution) {
-    // rk8v4 = PackedV=true, PackedK=false: same kernel as rk4v4 (V is int4, K stays int8).
-    rk4v4_kv_append_attention(q, k, v, positions, valid, rows, scale, cache, envelope, workspace,
-                              out, execution);
+    // rk8v4 = 8-bit K (no packing) + 4-bit V (PackedV=true, PackedK=false).
+    const cudaStream_t stream = execution.stream;
+    auto plan           = make_int8_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
+                                                          execution.multiprocessor_count);
+    if (plan.family == Int8KvFamily::Grouped) {
+        rk_execute_grouped<CausalAppendInput, RkVariant::Plain>(
+            q, positions, scale, cache, &valid, &rows,
+            CausalAppendInput{static_cast<const __nv_bfloat16*>(k.data),
+                              static_cast<const __nv_bfloat16*>(v.data)},
+            plan, workspace, out, stream);
+    } else {
+        // Standalone rk8v4 append (int8 K + int4 V), then rk parallel attention.
+        kv_cache_append_rk8v4_batch_launch(k, v, positions, valid, rows, cache, stream);
+        const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
+        const auto view =
+            make_quantized_causal_cache_view<Int8KvCacheView<false>>(cache, &valid, &rows);
+        if (plan.family == Int8KvFamily::Tiled)
+            throw std::invalid_argument(
+                "rk8v4 attention: tiled family does not yet support PackedV.");
+        // For rk8v4 parallel: PackedV=true, PackedK=false (RkVariant::Plain with
+        // PackedK=false in rk_execute_parallel).
+        // RkVariant::Plain maps to PackedK=false in rk_execute_parallel. But we need
+        // a separate enum value... actually RkVariant::Plain means "PackedV only".
+        // Let me use a different approach: just call with the right template directly.
+        auto scope = workspace.scope();
+        const auto partial = allocate_causal_partials(workspace, plan.query_heads, plan.width,
+                                                       plan.partition.capacity, plan.batch);
+        if (plan.query_heads == 24)
+            rk_parallel_grouped<CausalD256H24Kv4, Int8KvCausalPlan::kTokenTile, false, false>(
+                p, view, plan.partition, partial.view(), stream);
+        else
+            rk_parallel_grouped<CausalD256H16Kv2, Int8KvCausalPlan::kTokenTile, false, false>(
+                p, view, plan.partition, partial.view(), stream);
+    }
 }
 
 void rk8v4_kv_cached_attention(const Tensor& q, const Tensor& positions, float scale,
@@ -399,18 +486,21 @@ void rk4v4e8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor&
     const cudaStream_t stream = execution.stream;
     auto plan           = make_int8_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
                                                           execution.multiprocessor_count);
-    if (plan.family != Int8KvFamily::Grouped && q.ne[2] <= Int8KvCausalPlan::kTokenTile) {
-        plan.family = Int8KvFamily::Grouped;
+    if (plan.family == Int8KvFamily::Grouped) {
+        rk_execute_grouped<CausalAppendInput, RkVariant::E8Lattice>(
+            q, positions, scale, cache, &valid, &rows,
+            CausalAppendInput{static_cast<const __nv_bfloat16*>(k.data),
+                              static_cast<const __nv_bfloat16*>(v.data)},
+            plan, workspace, out, stream);
+    } else {
+        kv_cache_append_rk4v4_batch_launch(k, v, positions, valid, rows, cache, stream);
+        const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
+        const auto view =
+            make_quantized_causal_cache_view<Int8KvCacheView<false>>(cache, &valid, &rows);
+        if (plan.family == Int8KvFamily::Tiled)
+            throw std::invalid_argument("rk4v4-e8 attention: tiled does not support PackedV.");
+        rk_execute_parallel<RkVariant::E8Lattice>(p, view, plan, workspace, stream);
     }
-    if (plan.family != Int8KvFamily::Grouped) {
-        throw std::invalid_argument(
-            "rk4v4-e8 attention: prefill width exceeds the grouped kernel's TokenTile (8);");
-    }
-    rk_execute_grouped<CausalAppendInput, RkVariant::E8Lattice>(
-        q, positions, scale, cache, &valid, &rows,
-        CausalAppendInput{static_cast<const __nv_bfloat16*>(k.data),
-                          static_cast<const __nv_bfloat16*>(v.data)},
-        plan, workspace, out, stream);
 }
 
 void rk4v4e8_kv_cached_attention(const Tensor& q, const Tensor& positions, float scale,
@@ -437,18 +527,24 @@ void rk2v4e8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor&
     const cudaStream_t stream = execution.stream;
     auto plan           = make_int8_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
                                                            execution.multiprocessor_count);
-    if (plan.family != Int8KvFamily::Grouped && q.ne[2] <= Int8KvCausalPlan::kTokenTile) {
-        plan.family = Int8KvFamily::Grouped;
+    if (plan.family == Int8KvFamily::Grouped) {
+        rk_execute_grouped<CausalAppendInput, RkVariant::E8Root>(
+            q, positions, scale, cache, &valid, &rows,
+            CausalAppendInput{static_cast<const __nv_bfloat16*>(k.data),
+                              static_cast<const __nv_bfloat16*>(v.data)},
+            plan, workspace, out, stream);
+    } else {
+        // TODO(rk-port): rk2v4-e8 needs E8 cylinder K append kernel for width > 8.
+        // For now, use rk4v4 append (int4 K) as a fallback — the E8 cylinder
+        // quality benefit is only at append time; the read-back is identical.
+        kv_cache_append_rk4v4_batch_launch(k, v, positions, valid, rows, cache, stream);
+        const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
+        const auto view =
+            make_quantized_causal_cache_view<Int8KvCacheView<false>>(cache, &valid, &rows);
+        if (plan.family == Int8KvFamily::Tiled)
+            throw std::invalid_argument("rk2v4-e8 attention: tiled does not support PackedV.");
+        rk_execute_parallel<RkVariant::E8Root>(p, view, plan, workspace, stream);
     }
-    if (plan.family != Int8KvFamily::Grouped) {
-        throw std::invalid_argument(
-            "rk2v4-e8 attention: prefill width exceeds the grouped kernel's TokenTile (8);");
-    }
-    rk_execute_grouped<CausalAppendInput, RkVariant::E8Root>(
-        q, positions, scale, cache, &valid, &rows,
-        CausalAppendInput{static_cast<const __nv_bfloat16*>(k.data),
-                          static_cast<const __nv_bfloat16*>(v.data)},
-        plan, workspace, out, stream);
 }
 
 void rk2v4e8_kv_cached_attention(const Tensor& q, const Tensor& positions, float scale,
