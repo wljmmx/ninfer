@@ -217,13 +217,14 @@ void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
     } else {
         switch (cache.storage) {
         case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
+            detail::kv_cache_append_rk8v4_launch(k, v, positions, cache, stream);
+            return;
         case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
         case KvCacheStorage::RK4V4E8:
         case KvCacheStorage::RK2V4E8:
-            // TODO(rk-port): route to rk-aware append kernel once codec integration is complete.
             throw std::invalid_argument(
-                "kv_cache_append: rk KV layouts (rk8v4/rk4v4/rk4v4-e8/rk2v4-e8) are not yet "
-                "available; use int8 or k8v4 while the port is in progress.");
+                "kv_cache_append: rk4v4/rk4v4-e8/rk2v4-e8 single-token append not yet "
+                "available; use rk8v4 or int8.");
         default:
             detail::kv_cache_append_launch(k, v, positions, cache, stream);
         }

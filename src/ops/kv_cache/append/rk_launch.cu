@@ -132,4 +132,11 @@ void kv_cache_append_rk4v4_batch_launch(const Tensor& k, const Tensor& v,
         launch.template operator()<true>();
 }
 
+// Single-token rk8v4 append (PagedKVLayerView, used by MTP warmup / single decode).
+void kv_cache_append_rk8v4_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
+                                  PagedKVLayerView cache, cudaStream_t stream) {
+    const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data)};
+    dispatch_rk<false>(k, v, positions, cache, metadata, stream);
+}
+
 } // namespace ninfer::ops::detail

@@ -32,6 +32,9 @@ void kv_cache_append_rk4v4_batch_launch(const Tensor& k, const Tensor& v,
                                          const Tensor& table_rows, PagedKVBatchLayerView cache,
                                          cudaStream_t stream);
 
+void kv_cache_append_rk8v4_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
+                                  PagedKVLayerView cache, cudaStream_t stream);
+
 void kv_cache_append_batch_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                                   const Tensor& valid_columns, const Tensor& table_rows,
                                   PagedKVBatchLayerView cache, cudaStream_t stream);

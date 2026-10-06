@@ -171,8 +171,8 @@ __launch_bounds__(256) __global__
             ? positions[token + batch * tokens]
             : positions[token];
         if (pos < 0) continue;
-        const int page_idx = batch * metadata.table_stride + (pos >> 6);
-        const int physical_page = metadata.tables[page_idx];
+        const std::int32_t* block_table = metadata.block_table();
+        const int physical_page = block_table[pos >> 6];
         const int page_offset   = pos & 63;
 
         kv_cache_append_rk_row<Geometry, PackedK>(
