@@ -134,8 +134,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     const int split_end        = min(end_owned_tile * Bc, window);
     const int first_tile       = split_start;
     const int key_blocks       = div_up(split_end - first_tile, Bc);
+    
 
     if constexpr (CacheInput::writes_cache) {
+        
         // Decompose H256 as H4 over four independently transformed H64 groups. The existing
         // (token, group) warp schedule computes all H64 fragments in parallel; the FP32 main arena
         // is the exchange point for the final H4 stage. This retains the complete transform's
@@ -157,11 +159,13 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             k_h64_s[token * D + d1] = k_h64[1];
         }
         __syncthreads();
+        
 
         for (int pair = warp; pair < valid_tokens * Groups; pair += Wc) {
             const int token    = pair / Groups;
             const int grp      = pair - token * Groups;
             const int position = pos[token];
+            
             if (position < split_start || position >= split_end) { continue; }
             const int physical_page = block_table[position >> kPagedKVPageShift];
             const int page_offset   = position & kPagedKVPageMask;
@@ -189,6 +193,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             float vamax        = fmaxf(fabsf(vv0), fabsf(vv1));
             kamax              = warp_max(kamax, FullMask);
             vamax              = warp_max(vamax, FullMask);
+            
             const auto k_quant = kv_cache_int8_quant_params(kamax);
             // PackedV uses the 4-bit range [-7, 7]: scale = FP16-RNE(absmax/7).
             __half v_scale;
@@ -236,9 +241,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 __half k_scale_h = rk4_absmax_to_scale_h(kamax);
                 float k_inv = __half2float(k_scale_h);
                 k_inv = k_inv > 0.0f ? 1.0f / k_inv : 0.0f;
+                const float kv0_next = __shfl_xor_sync(FullMask, kv0, 1);
+                const float kv1_next = __shfl_xor_sync(FullMask, kv1, 1);
                 if ((lane & 1) == 0) {
-                    const float kv0_next = __shfl_xor_sync(FullMask, kv0, 1);
-                    const float kv1_next = __shfl_xor_sync(FullMask, kv1, 1);
                     const auto kc0 = rk4_quant_code(kv0, k_inv);
                     const auto kc1 = rk4_quant_code(kv0_next, k_inv);
                     const std::int64_t ko0 = rk4_v_code_index<Geometry>(physical_page, kv_head,
@@ -272,12 +277,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             }
             if constexpr (PackedV) {
                 // rk V plane: 4-bit codes, adjacent dims (2k, 2k+1) packed per byte.
-                // This lane holds dims (d0=grp*64+lane, d1=d0+32). Even lanes pack the
-                // (d0, d0+1) pair (shuffle from lane+1) and the (d1, d1+1) pair.
-                // Odd lanes do not write V codes (their dims are covered by even lanes).
+                // __shfl_xor_sync with FullMask requires ALL 32 lanes to participate —
+                // it must be called OUTSIDE the even-lane guard to avoid a deadlock.
+                const float vv0_next = __shfl_xor_sync(FullMask, vv0, 1);
+                const float vv1_next = __shfl_xor_sync(FullMask, vv1, 1);
                 if ((lane & 1) == 0) {
-                    const float vv0_next = __shfl_xor_sync(FullMask, vv0, 1);
-                    const float vv1_next = __shfl_xor_sync(FullMask, vv1, 1);
                     const std::int64_t vo0 = rk4_v_code_index<Geometry>(physical_page, kv_head,
                                                                        d0 >> 1, page_offset);
                     const auto c0 = rk4_quant_code(vv0, v_inv_scale);
@@ -441,8 +445,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 }
                 if constexpr (PackedV) {
                     // rk V: 4-bit codes. cp_async 8 packed bytes (16 dims) into smem at
-                    // the half-offset position (d>>1). The V dequant consumer reads 4
-                    // packed bytes from the same half-offset position.
+                    // the half-offset position (d>>1). The V cache has stride 128, so
+                    // offsets are 8-byte aligned (guaranteed by paged_kv_element_offset
+                    // with LeadingExtent=128 and dc*8 granularity).
                     const std::int64_t voff = rk4_v_code_index<Geometry>(
                         physical_page, kv_head, d >> 1, key & kPagedKVPageMask);
                     ninfer::ops::cp_async<8>(&v_i8[key_l * D + (d >> 1)], &cache_v_i8[voff]);
@@ -459,9 +464,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     };
 
     int physical_page = block_table[first_tile >> kPagedKVPageShift];
+    
     issue_kv_tile(first_tile, physical_page);
     ninfer::ops::cp_wait<0>();
     __syncthreads();
+    
 
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = first_tile + kb * Bc;
@@ -709,6 +716,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         if (has_next) { ninfer::ops::cp_wait<0>(); }
         __syncthreads();
     }
+    
 
     if (warp < RowTiles && lid == 0) {
         const int row0 = warp * 16 + gid;
@@ -759,5 +767,4 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         }
     }
 }
-
-} // namespace ninfer::ops::detail
+    } // namespace ninfer::ops::detail
