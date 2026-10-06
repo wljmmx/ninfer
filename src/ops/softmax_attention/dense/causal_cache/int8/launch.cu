@@ -369,6 +369,25 @@ void rk4v4_kv_cached_attention(const Tensor& q, const Tensor& positions, float s
                                                   CausalCachedInput{}, plan, workspace, out, stream);
 }
 
+// --- rk8v4 attention (8-bit K + int4 V, reuses rk4v4 dispatch) --------------------
+
+void rk8v4_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                               const Tensor& positions, const Tensor& valid, const Tensor& rows,
+                               float scale, PagedKVBatchLayerView cache,
+                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
+                               Tensor& out, DeviceExecutionView execution) {
+    // rk8v4 = PackedV=true, PackedK=false: same kernel as rk4v4 (V is int4, K stays int8).
+    rk4v4_kv_append_attention(q, k, v, positions, valid, rows, scale, cache, envelope, workspace,
+                              out, execution);
+}
+
+void rk8v4_kv_cached_attention(const Tensor& q, const Tensor& positions, float scale,
+                               const PagedKVLayerView& cache,
+                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
+                               Tensor& out, DeviceExecutionView execution) {
+    rk4v4_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out, execution);
+}
+
 // --- rk4v4-e8 attention (E8 lattice K + int4 V) -----------------------------------
 
 void rk4v4e8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
