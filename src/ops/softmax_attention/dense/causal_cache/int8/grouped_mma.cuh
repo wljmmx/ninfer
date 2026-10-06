@@ -5,13 +5,17 @@
 #include "ops/softmax_attention/common/causal_partition.h"
 #include "ops/softmax_attention/common/causal_epilogue.cuh"
 #include "ops/softmax_attention/common/causal_softmax.cuh"
+#include "ops/kv_cache/rk4_codec.cuh"
 
 namespace ninfer::ops::detail {
 
 // Native INT8 QK accumulates each G64 group in INT32, then applies Q/K scales in FP32.
 // PV dequantizes represented V to FP16 and accumulates in FP32.
+// When PackedV is true (rk8v4 / rk4v4 / rk4v4-e8 / rk2v4-e8), the value cache stores
+// 4-bit codes (two per byte, symmetric [-7,7] with absmax/7 FP16 scales); the append
+// path packs int4 and the V loader unpacks to int8 before the same FP16 PV MMA.
 template <class Geometry, class Schedule, bool MultiBatch, bool Masked, class CacheInput,
-          bool ParallelQueries = false>
+          bool ParallelQueries = false, bool PackedV = false>
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     void int8_kv_grouped_mma_kernel(
         const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos,
@@ -181,24 +185,55 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             kamax              = warp_max(kamax, FullMask);
             vamax              = warp_max(vamax, FullMask);
             const auto k_quant = kv_cache_int8_quant_params(kamax);
-            const auto v_quant = kv_cache_int8_quant_params(vamax);
+            // PackedV uses the 4-bit range [-7, 7]: scale = FP16-RNE(absmax/7).
+            __half v_scale;
+            float v_inv_scale;
+            if constexpr (PackedV) {
+                v_scale     = rk4_absmax_to_scale_h(vamax);
+                const float represented = __half2float(v_scale);
+                v_inv_scale = represented > 0.0f ? 1.0f / represented : 0.0f;
+            } else {
+                v_scale     = kv_cache_int8_quant_params(vamax).scale;
+                v_inv_scale = kv_cache_int8_quant_params(vamax).inverse_scale;
+            }
             cache_k_i8[kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d0,
-                                                                page_offset)] =
+                                                                 page_offset)] =
                 kv_cache_int8_quant_code(kv0, k_quant.inverse_scale);
             cache_k_i8[kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d1,
-                                                                page_offset)] =
+                                                                 page_offset)] =
                 kv_cache_int8_quant_code(kv1, k_quant.inverse_scale);
-            cache_v_i8[kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d0,
-                                                                page_offset)] =
-                kv_cache_int8_quant_code(vv0, v_quant.inverse_scale);
-            cache_v_i8[kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d1,
-                                                                page_offset)] =
-                kv_cache_int8_quant_code(vv1, v_quant.inverse_scale);
+            if constexpr (PackedV) {
+                // rk V plane: 4-bit codes, adjacent dims (2k, 2k+1) packed per byte.
+                // This lane holds dims (d0=grp*64+lane, d1=d0+32). Even lanes pack the
+                // (d0, d0+1) pair (shuffle from lane+1) and the (d1, d1+1) pair.
+                // Odd lanes do not write V codes (their dims are covered by even lanes).
+                if ((lane & 1) == 0) {
+                    const float vv0_next = __shfl_xor_sync(FullMask, vv0, 1);
+                    const float vv1_next = __shfl_xor_sync(FullMask, vv1, 1);
+                    const std::int64_t vo0 = rk4_v_code_index<Geometry>(physical_page, kv_head,
+                                                                       d0 >> 1, page_offset);
+                    const auto c0 = rk4_quant_code(vv0, v_inv_scale);
+                    const auto c1 = rk4_quant_code(vv0_next, v_inv_scale);
+                    cache_v_i8[vo0] = static_cast<std::int8_t>(rk4_pack(c0, c1));
+                    const std::int64_t vo1 = rk4_v_code_index<Geometry>(physical_page, kv_head,
+                                                                       d1 >> 1, page_offset);
+                    const auto c2 = rk4_quant_code(vv1, v_inv_scale);
+                    const auto c3 = rk4_quant_code(vv1_next, v_inv_scale);
+                    cache_v_i8[vo1] = static_cast<std::int8_t>(rk4_pack(c2, c3));
+                }
+            } else {
+                cache_v_i8[kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d0,
+                                                                    page_offset)] =
+                    kv_cache_int8_quant_code(vv0, v_inv_scale);
+                cache_v_i8[kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d1,
+                                                                    page_offset)] =
+                    kv_cache_int8_quant_code(vv1, v_inv_scale);
+            }
             if (lane == 0) {
                 const std::int64_t so = kv_cache_int8_quant_scale_index<Geometry>(
                     physical_page, kv_head, grp, page_offset);
                 cache_k_scale[so] = k_quant.scale;
-                cache_v_scale[so] = v_quant.scale;
+                cache_v_scale[so] = v_scale;
             }
         }
         __syncthreads();
@@ -301,7 +336,24 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                     physical_page, kv_head, d, key & kPagedKVPageMask);
                 std::int8_t* dst = &k_i8[key_l * D + causal_swizzle(key_l, dc * 8) * 2];
                 ninfer::ops::cp_async<16>(dst, &cache_k_i8[off]);
-                ninfer::ops::cp_async<16>(&v_i8[key_l * D + d], &cache_v_i8[off]);
+                if constexpr (PackedV) {
+                    // rk V: 4-bit codes, half the bytes. cp_async 8 packed bytes covering
+                    // 16 dimensions, then unpack into 16 int8 smem slots.
+                    const std::int64_t voff = rk4_v_code_index<Geometry>(
+                        physical_page, kv_head, d >> 1, key & kPagedKVPageMask);
+                    const std::int8_t* vsrc = &cache_v_i8[voff];
+                    // Unpack 8 bytes (16 dims) into smem v_i8.
+                    for (int byte = 0; byte < 8; ++byte) {
+                        const std::uint8_t packed =
+                            static_cast<std::uint8_t>(vsrc[byte]);
+                        v_i8[key_l * D + d + 2 * byte] =
+                            static_cast<std::int8_t>(rk4_unpack(packed, 0));
+                        v_i8[key_l * D + d + 2 * byte + 1] =
+                            static_cast<std::int8_t>(rk4_unpack(packed, 1));
+                    }
+                } else {
+                    ninfer::ops::cp_async<16>(&v_i8[key_l * D + d], &cache_v_i8[off]);
+                }
             } else {
                 std::int8_t* dst = &k_i8[key_l * D + causal_swizzle(key_l, dc * 8) * 2];
                 store_vec(dst, make_int4(0, 0, 0, 0));

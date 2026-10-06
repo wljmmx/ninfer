@@ -15,4 +15,16 @@ void int8_kv_cached_attention(const Tensor& q, const Tensor& positions, float sc
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                               Tensor& out, DeviceExecutionView execution);
 
+// rk4v4: rank-compressed 4-bit K + 4-bit V attention (same int8 kernel with PackedV=true).
+void rk4v4_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                               const Tensor& positions, const Tensor& valid, const Tensor& rows,
+                               float scale, PagedKVBatchLayerView cache,
+                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
+                               Tensor& out, DeviceExecutionView execution);
+
+void rk4v4_kv_cached_attention(const Tensor& q, const Tensor& positions, float scale,
+                               const PagedKVLayerView& cache,
+                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
+                               Tensor& out, DeviceExecutionView execution);
+
 } // namespace ninfer::ops::detail

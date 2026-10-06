@@ -21,6 +21,23 @@ inline constexpr int kKVCacheRkHeadDim  = 256;
 inline constexpr int kKVCacheRkGroup    = 64;
 inline constexpr int kKVCacheRkGroups   = kKVCacheRkHeadDim / kKVCacheRkGroup;
 
+// 4-bit packed code index: two dimensions per byte, so the byte stride per head is
+// head_dim / 2 = 128. Dimension d lives in byte d / 2 (low nibble = even d, high = odd).
+template <typename Geometry>
+__device__ __forceinline__ std::int64_t
+rk4_v_code_index(int physical_page, int kv_head, int packed_d, int page_offset) {
+    return paged_kv_element_offset<128, Geometry::KVHeads>(physical_page, kv_head, page_offset,
+                                                           packed_d);
+}
+
+// G64 scale index (same as int8: 4 groups per 256-dim head).
+template <typename Geometry>
+__device__ __forceinline__ std::int64_t
+rk4_v_scale_index(int physical_page, int kv_head, int group, int page_offset) {
+    return paged_kv_element_offset<4, Geometry::KVHeads>(physical_page, kv_head, page_offset,
+                                                          group);
+}
+
 // 4-bit symmetric quantization: range [-7, 7], scale = absmax / 7.
 __device__ __forceinline__ float rk4_absmax_to_scale(float absmax) {
     return absmax > 0.0f ? absmax / 7.0f : 0.0f;

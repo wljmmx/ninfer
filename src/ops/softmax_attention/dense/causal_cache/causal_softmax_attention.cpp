@@ -400,15 +400,21 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     // Hadamard rotation and supports s8 QK + f16 PV). The cache read-back path is the only
     // difference: it unpacks int4/E8 codes into int8 smem before the ldmatrix+mma.
     switch (cache.storage) {
-    case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
     case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
     case KvCacheStorage::RK4V4E8:
+        // rk4v4 and rk4v4-e8 share the same attention read-back path (int4 K + int4 V).
+        // The E8 lattice projection only affects the K quantization at append time.
+        // TODO(rk-port): route E8 K quantization in append for RK4V4E8.
+        detail::rk4v4_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
+                                           cache, envelope, workspace, out, execution);
+        return;
+    case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
     case KvCacheStorage::RK2V4E8:
-        // TODO(rk-port): route to rk-aware int8 attention once tile_io is extended.
+        // TODO(rk-port): rk8v4 (8-bit K + 4-bit V) and rk2v4-e8 (2-bit E8 cylinder K)
+        // need their own read-back/append paths.
         throw std::invalid_argument(
-            "causal_softmax_attention: rk KV layouts (rk8v4/rk4v4/rk4v4-e8/rk2v4-e8) are not "
-            "yet wired to the attention kernel; use int8 or k8v4 while the port is in "
-            "progress.");
+            "causal_softmax_attention: rk8v4 and rk2v4-e8 are not yet wired to the attention "
+            "kernel; use int8, k8v4, rk4v4 or rk4v4-e8.");
     default:
         break;
     }
@@ -472,14 +478,16 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
     }
 
     switch (cache.storage) {
-    case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
     case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
     case KvCacheStorage::RK4V4E8:
+        detail::rk4v4_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
+                                           execution);
+        return;
+    case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
     case KvCacheStorage::RK2V4E8:
-        // TODO(rk-port): route to rk-aware int8 cached attention once tile_io is extended.
         throw std::invalid_argument(
-            "causal_softmax_attention_cached: rk KV layouts are not yet wired to the attention "
-            "kernel; use int8 or k8v4 while the port is in progress.");
+            "causal_softmax_attention_cached: rk8v4 and rk2v4-e8 are not yet wired to the "
+            "attention kernel; use int8, k8v4, rk4v4 or rk4v4-e8.");
     default:
         break;
     }
