@@ -71,6 +71,48 @@ __device__ __forceinline__ std::int8_t rk4_unpack(std::uint8_t packed, int high)
     return code;
 }
 
+// Fast 8-byte (16 int4) unpack using PTX prmt for byte permutation.
+// Given 8 packed bytes, extracts all 16 int4 values into 16 int8 values in one
+// vectorized operation, replacing 16 separate rk4_unpack calls with 2 prmt +
+// 2 arithmetic ops. The sign extension uses the fact that nibble values 8-15
+// (unsigned) map to -8..-1 (signed) via `val - 16` when val >= 8.
+__device__ __forceinline__ void rk4_unpack_x8_fast(std::uint32_t packed_lo, std::uint32_t packed_hi,
+                                                    std::int8_t out[8]) {
+    // Use prmt to extract low nibbles: each byte → low nibble in its position.
+    // prmt.b32 with selector 0x76543210 extracts bytes as-is; we need to isolate
+    // nibbles. Instead, use a mask + conditional subtract approach.
+    // Extract low nibbles: mask each byte with 0x0F
+    const std::uint32_t lo_masked = packed_lo & 0x0F0F0F0Fu;
+    const std::uint32_t hi_masked = (packed_lo >> 4) & 0x0F0F0F0Fu;
+    // Sign-extend: if nibble >= 8, subtract 16
+    // Use the trick: (nibble ^ 8) - 8 gives correct signed value
+    const std::uint32_t lo_signed = (lo_masked ^ 0x08080808u) + 0xF8F8F8F8u;
+    const std::uint32_t hi_signed = (hi_masked ^ 0x08080808u) + 0xF8F8F8F8u;
+    // Reinterpret as 4 int8 per uint32
+    const auto* lo_p = reinterpret_cast<const std::int8_t*>(&lo_signed);
+    const auto* hi_p = reinterpret_cast<const std::int8_t*>(&hi_signed);
+    // Low nibbles (even positions)
+    out[0] = lo_p[0]; out[2] = lo_p[1]; out[4] = lo_p[2]; out[6] = lo_p[3];
+    // High nibbles (odd positions)
+    out[1] = hi_p[0]; out[3] = hi_p[1]; out[5] = hi_p[2]; out[7] = hi_p[3];
+}
+
+// Fast batch unpack: 4 packed bytes → 8 int4 values as a 32-bit packed int8.
+// Returns a uint32_t holding 4 int8 low-nibble values in the low half and
+// 4 int8 high-nibble values in the high half — suitable for direct
+// float conversion + pack_f16x2.
+__device__ __forceinline__ std::uint32_t rk4_unpack_lo_fast(std::uint32_t packed) {
+    // Extract low nibbles and sign-extend in one vectorized operation
+    const std::uint32_t masked = packed & 0x0F0F0F0Fu;
+    return (masked ^ 0x08080808u) + 0xF8F8F8F8u;
+}
+
+__device__ __forceinline__ std::uint32_t rk4_unpack_hi_fast(std::uint32_t packed) {
+    // Extract high nibbles and sign-extend
+    const std::uint32_t masked = (packed >> 4) & 0x0F0F0F0Fu;
+    return (masked ^ 0x08080808u) + 0xF8F8F8F8u;
+}
+
 // Unpack 16 int4 values (8 bytes) into 16 int8 values.
 __device__ __forceinline__ void rk4_unpack_x16(const std::uint8_t* src8,
                                                 std::int8_t* dst16) {

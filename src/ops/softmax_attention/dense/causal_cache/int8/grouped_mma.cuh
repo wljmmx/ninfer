@@ -626,29 +626,27 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                     if ((lane & 7) == 0) { vs = __half2float(v_scale_s[key_l * Groups + grp]); }
                     vs                = __shfl_sync(FullMask, vs, grp * 8);
                     if constexpr (PackedV) {
-                        // rk V dequant: read 4 packed bytes (8 int4 values) from the
-                        // half-offset position, unpack, scale, and pack to f16.
-                        const int32_t raw = *reinterpret_cast<const int32_t*>(
+                        // rk V dequant: vectorized 4-byte load + fast unpack.
+                        // Read 4 packed bytes (8 int4 values) as a single 32-bit load,
+                        // then use vectorized nibble extraction + sign extension
+                        // (3 ops vs 8 separate rk4_unpack calls = 16+ ops).
+                        const std::uint32_t raw = *reinterpret_cast<const std::uint32_t*>(
                             &v_i8[key_l * D + (d >> 1)]);
-                        const std::uint8_t* packed =
-                            reinterpret_cast<const std::uint8_t*>(&raw);
+                        // Vectorized unpack: extract low and high nibbles in parallel
+                        const std::uint32_t lo = rk4_unpack_lo_fast(raw);
+                        const std::uint32_t hi = rk4_unpack_hi_fast(raw);
+                        const auto* lo8 = reinterpret_cast<const std::int8_t*>(&lo);
+                        const auto* hi8 = reinterpret_cast<const std::int8_t*>(&hi);
+                        // Interleave low/high nibbles and convert to f16 in one pass
                         int4 values;
-                        const auto c0 = rk4_unpack(packed[0], 0);
-                        const auto c1 = rk4_unpack(packed[0], 1);
-                        const auto c2 = rk4_unpack(packed[1], 0);
-                        const auto c3 = rk4_unpack(packed[1], 1);
-                        const auto c4 = rk4_unpack(packed[2], 0);
-                        const auto c5 = rk4_unpack(packed[2], 1);
-                        const auto c6 = rk4_unpack(packed[3], 0);
-                        const auto c7 = rk4_unpack(packed[3], 1);
-                        values.x = pack_f16x2(static_cast<float>(c0) * vs,
-                                              static_cast<float>(c1) * vs);
-                        values.y = pack_f16x2(static_cast<float>(c2) * vs,
-                                              static_cast<float>(c3) * vs);
-                        values.z = pack_f16x2(static_cast<float>(c4) * vs,
-                                              static_cast<float>(c5) * vs);
-                        values.w = pack_f16x2(static_cast<float>(c6) * vs,
-                                              static_cast<float>(c7) * vs);
+                        values.x = pack_f16x2(static_cast<float>(lo8[0]) * vs,
+                                              static_cast<float>(hi8[0]) * vs);
+                        values.y = pack_f16x2(static_cast<float>(lo8[1]) * vs,
+                                              static_cast<float>(hi8[1]) * vs);
+                        values.z = pack_f16x2(static_cast<float>(lo8[2]) * vs,
+                                              static_cast<float>(hi8[2]) * vs);
+                        values.w = pack_f16x2(static_cast<float>(lo8[3]) * vs,
+                                              static_cast<float>(hi8[3]) * vs);
                         store_vec(dst, values);
                     } else {
                         const int2 raw    = load_vec<int2>(&v_i8[key_l * D + d]);
