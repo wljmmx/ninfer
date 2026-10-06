@@ -313,6 +313,19 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
             "available in this build; choose BF16, INT8 or FP8 KV.");
 #endif
 
+    // Rank-compressed layouts (rk8v4, rk4v4, rk4v4-e8, rk2v4-e8) reuse the int8 attention
+    // kernel workspace; only the cache read-back and append paths differ.
+    switch (cache_storage) {
+    case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
+    case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
+    case KvCacheStorage::RK4V4E8:
+    case KvCacheStorage::RK2V4E8:
+        return detail::int8_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
+                                               execution.multiprocessor_count);
+    default:
+        break;
+    }
+
     throw std::invalid_argument(
         "causal_softmax_attention workspace: unsupported KV cache storage");
 }
@@ -383,6 +396,23 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
 #endif
     }
 
+    // Rank-compressed layouts route to the int8 attention kernel (which already applies
+    // Hadamard rotation and supports s8 QK + f16 PV). The cache read-back path is the only
+    // difference: it unpacks int4/E8 codes into int8 smem before the ldmatrix+mma.
+    switch (cache.storage) {
+    case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
+    case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
+    case KvCacheStorage::RK4V4E8:
+    case KvCacheStorage::RK2V4E8:
+        // TODO(rk-port): route to rk-aware int8 attention once tile_io is extended.
+        throw std::invalid_argument(
+            "causal_softmax_attention: rk KV layouts (rk8v4/rk4v4/rk4v4-e8/rk2v4-e8) are not "
+            "yet wired to the attention kernel; use int8 or k8v4 while the port is in "
+            "progress.");
+    default:
+        break;
+    }
+
     throw std::invalid_argument("causal_softmax_attention: unsupported KV cache storage");
 }
 
@@ -439,6 +469,19 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
             "causal_softmax_attention_cached: K8V4 (Fp8KeyNvfp4Value) storage is not available "
             "in this build; choose BF16, INT8 or FP8 KV.");
 #endif
+    }
+
+    switch (cache.storage) {
+    case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
+    case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
+    case KvCacheStorage::RK4V4E8:
+    case KvCacheStorage::RK2V4E8:
+        // TODO(rk-port): route to rk-aware int8 cached attention once tile_io is extended.
+        throw std::invalid_argument(
+            "causal_softmax_attention_cached: rk KV layouts are not yet wired to the attention "
+            "kernel; use int8 or k8v4 while the port is in progress.");
+    default:
+        break;
     }
 
     throw std::invalid_argument("causal_softmax_attention_cached: unsupported KV cache storage");

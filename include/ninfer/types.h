@@ -32,6 +32,17 @@ enum class KvCacheStorage : std::uint8_t {
     Fp8E4M3Row256,
     Nvfp4Group16,
     Fp8KeyNvfp4Value,
+    // Rank-compressed KV layouts ported from the v2 RTX 4090 reference. All use the
+    // Hadamard-rotated group-64 quantization already present in the int8 path, with
+    // progressively lower bit widths:
+    //   RK8V4      8-bit Hadamard K + 4-bit V     (~0.39 B/elem, 99.4% cosine)
+    //   RK4V4      4-bit Hadamard K + 4-bit V     (~0.27 B/elem, 97.8% cosine)
+    //   RK4V4E8    4-bit E8-lattice K + 4-bit V   (~0.27 B/elem, 98.7% cosine)
+    //   RK2V4E8    2-bit E8-cylinder K + 4-bit V  (~0.20 B/elem, 96.2% cosine)
+    RotatedInt8KeyInt4ValueGroup64,
+    RotatedInt4KeyInt4ValueGroup64,
+    RK4V4E8,
+    RK2V4E8,
 };
 
 enum class EnginePurpose : std::uint8_t {
