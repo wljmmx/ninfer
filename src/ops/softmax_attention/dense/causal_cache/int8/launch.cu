@@ -335,26 +335,26 @@ void rk4v4_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v
                                CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                                Tensor& out, DeviceExecutionView execution) {
     const cudaStream_t stream = execution.stream;
-    const auto plan           = make_int8_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
+    auto plan           = make_int8_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
                                                           execution.multiprocessor_count);
-    if (plan.family != Int8KvFamily::Grouped) {
-        // For tiled/parallel families, fall back to int8 (append + read).
-        // TODO(rk-port): extend tiled/parallel to PackedV.
-        kv_cache_append_batch_launch(k, v, positions, valid, rows, cache, stream);
-        const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
-        const auto view =
-            make_quantized_causal_cache_view<Int8KvCacheView<false>>(cache, &valid, &rows);
-        if (plan.family == Int8KvFamily::Tiled)
-            tiled(p, view, stream);
-        else
-            execute_parallel(p, view, plan, workspace, stream);
-    } else {
-        rk_execute_grouped<CausalAppendInput, RkVariant::Plain>(
-            q, positions, scale, cache, &valid, &rows,
-            CausalAppendInput{static_cast<const __nv_bfloat16*>(k.data),
-                              static_cast<const __nv_bfloat16*>(v.data)},
-            plan, workspace, out, stream);
+    // PackedV caches store V as int4 (stride 128). The standard int8 append writes
+    // V with stride 256, which would be out-of-bounds. Force the grouped family
+    // (which includes the PackedV append path) for all widths up to kTokenTile.
+    // TODO(rk-port): for prefill widths > 8, either split into chunks or extend
+    // tiled/parallel to PackedV.
+    if (plan.family != Int8KvFamily::Grouped && q.ne[2] <= Int8KvCausalPlan::kTokenTile) {
+        plan.family = Int8KvFamily::Grouped;
     }
+    if (plan.family != Int8KvFamily::Grouped) {
+        throw std::invalid_argument(
+            "rk4v4 attention: prefill width exceeds the grouped kernel's TokenTile (8); "
+            "use a smaller prefill chunk or wait for tiled/parallel PackedV support.");
+    }
+    rk_execute_grouped<CausalAppendInput, RkVariant::Plain>(
+        q, positions, scale, cache, &valid, &rows,
+        CausalAppendInput{static_cast<const __nv_bfloat16*>(k.data),
+                          static_cast<const __nv_bfloat16*>(v.data)},
+        plan, workspace, out, stream);
 }
 
 void rk4v4_kv_cached_attention(const Tensor& q, const Tensor& positions, float scale,
@@ -397,24 +397,20 @@ void rk4v4e8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor&
                                  WorkspaceArena& workspace, Tensor& out,
                                  DeviceExecutionView execution) {
     const cudaStream_t stream = execution.stream;
-    const auto plan           = make_int8_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
+    auto plan           = make_int8_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
                                                           execution.multiprocessor_count);
-    if (plan.family != Int8KvFamily::Grouped) {
-        kv_cache_append_batch_launch(k, v, positions, valid, rows, cache, stream);
-        const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
-        const auto view =
-            make_quantized_causal_cache_view<Int8KvCacheView<false>>(cache, &valid, &rows);
-        if (plan.family == Int8KvFamily::Tiled)
-            tiled(p, view, stream);
-        else
-            execute_parallel(p, view, plan, workspace, stream);
-    } else {
-        rk_execute_grouped<CausalAppendInput, RkVariant::E8Lattice>(
-            q, positions, scale, cache, &valid, &rows,
-            CausalAppendInput{static_cast<const __nv_bfloat16*>(k.data),
-                              static_cast<const __nv_bfloat16*>(v.data)},
-            plan, workspace, out, stream);
+    if (plan.family != Int8KvFamily::Grouped && q.ne[2] <= Int8KvCausalPlan::kTokenTile) {
+        plan.family = Int8KvFamily::Grouped;
     }
+    if (plan.family != Int8KvFamily::Grouped) {
+        throw std::invalid_argument(
+            "rk4v4-e8 attention: prefill width exceeds the grouped kernel's TokenTile (8);");
+    }
+    rk_execute_grouped<CausalAppendInput, RkVariant::E8Lattice>(
+        q, positions, scale, cache, &valid, &rows,
+        CausalAppendInput{static_cast<const __nv_bfloat16*>(k.data),
+                          static_cast<const __nv_bfloat16*>(v.data)},
+        plan, workspace, out, stream);
 }
 
 void rk4v4e8_kv_cached_attention(const Tensor& q, const Tensor& positions, float scale,
@@ -439,24 +435,20 @@ void rk2v4e8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor&
                                  WorkspaceArena& workspace, Tensor& out,
                                  DeviceExecutionView execution) {
     const cudaStream_t stream = execution.stream;
-    const auto plan           = make_int8_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
-                                                          execution.multiprocessor_count);
-    if (plan.family != Int8KvFamily::Grouped) {
-        kv_cache_append_batch_launch(k, v, positions, valid, rows, cache, stream);
-        const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
-        const auto view =
-            make_quantized_causal_cache_view<Int8KvCacheView<false>>(cache, &valid, &rows);
-        if (plan.family == Int8KvFamily::Tiled)
-            tiled(p, view, stream);
-        else
-            execute_parallel(p, view, plan, workspace, stream);
-    } else {
-        rk_execute_grouped<CausalAppendInput, RkVariant::E8Root>(
-            q, positions, scale, cache, &valid, &rows,
-            CausalAppendInput{static_cast<const __nv_bfloat16*>(k.data),
-                              static_cast<const __nv_bfloat16*>(v.data)},
-            plan, workspace, out, stream);
+    auto plan           = make_int8_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
+                                                           execution.multiprocessor_count);
+    if (plan.family != Int8KvFamily::Grouped && q.ne[2] <= Int8KvCausalPlan::kTokenTile) {
+        plan.family = Int8KvFamily::Grouped;
     }
+    if (plan.family != Int8KvFamily::Grouped) {
+        throw std::invalid_argument(
+            "rk2v4-e8 attention: prefill width exceeds the grouped kernel's TokenTile (8);");
+    }
+    rk_execute_grouped<CausalAppendInput, RkVariant::E8Root>(
+        q, positions, scale, cache, &valid, &rows,
+        CausalAppendInput{static_cast<const __nv_bfloat16*>(k.data),
+                          static_cast<const __nv_bfloat16*>(v.data)},
+        plan, workspace, out, stream);
 }
 
 void rk2v4e8_kv_cached_attention(const Tensor& q, const Tensor& positions, float scale,

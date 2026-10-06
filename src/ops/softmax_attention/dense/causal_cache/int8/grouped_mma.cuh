@@ -421,36 +421,31 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                     e8_root_decode_8d_fast(root2, rad2, decoded2);
                     k_i8[key_l * D + d + 8 + sub_lane] = decoded2[sub_lane];
                 } else if constexpr (PackedK) {
-                    // rk K: 4-bit codes, half extent. Unpack 8 bytes (16 dims) into smem.
+                    // rk K: 4-bit codes, half extent. Synchronous load + unpack to int8
+                    // (ldmatrix expects int8; cp_async would require a separate unpack
+                    //  step between cp_wait and ldmatrix — TODO for performance).
                     const std::int64_t koff = rk4_v_code_index<Geometry>(
                         physical_page, kv_head, d >> 1, key & kPagedKVPageMask);
-                    const std::int8_t* ksrc = &cache_k_i8[koff];
+                    const int2 packed_k = load_vec<int2>(&cache_k_i8[koff]);
+                    const std::uint8_t* kbytes =
+                        reinterpret_cast<const std::uint8_t*>(&packed_k);
+#pragma unroll
                     for (int byte = 0; byte < 8; ++byte) {
-                        const std::uint8_t packed =
-                            static_cast<std::uint8_t>(ksrc[byte]);
                         k_i8[key_l * D + d + 2 * byte] =
-                            static_cast<std::int8_t>(rk4_unpack(packed, 0));
+                            static_cast<std::int8_t>(rk4_unpack(kbytes[byte], 0));
                         k_i8[key_l * D + d + 2 * byte + 1] =
-                            static_cast<std::int8_t>(rk4_unpack(packed, 1));
+                            static_cast<std::int8_t>(rk4_unpack(kbytes[byte], 1));
                     }
                 } else {
                     ninfer::ops::cp_async<16>(dst, &cache_k_i8[off]);
                 }
                 if constexpr (PackedV) {
-                    // rk V: 4-bit codes, half the bytes. cp_async 8 packed bytes covering
-                    // 16 dimensions, then unpack into 16 int8 smem slots.
+                    // rk V: 4-bit codes. cp_async 8 packed bytes (16 dims) into smem at
+                    // the half-offset position (d>>1). The V dequant consumer reads 4
+                    // packed bytes from the same half-offset position.
                     const std::int64_t voff = rk4_v_code_index<Geometry>(
                         physical_page, kv_head, d >> 1, key & kPagedKVPageMask);
-                    const std::int8_t* vsrc = &cache_v_i8[voff];
-                    // Unpack 8 bytes (16 dims) into smem v_i8.
-                    for (int byte = 0; byte < 8; ++byte) {
-                        const std::uint8_t packed =
-                            static_cast<std::uint8_t>(vsrc[byte]);
-                        v_i8[key_l * D + d + 2 * byte] =
-                            static_cast<std::int8_t>(rk4_unpack(packed, 0));
-                        v_i8[key_l * D + d + 2 * byte + 1] =
-                            static_cast<std::int8_t>(rk4_unpack(packed, 1));
-                    }
+                    ninfer::ops::cp_async<8>(&v_i8[key_l * D + (d >> 1)], &cache_v_i8[voff]);
                 } else {
                     ninfer::ops::cp_async<16>(&v_i8[key_l * D + d], &cache_v_i8[off]);
                 }
@@ -623,18 +618,45 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                     float vs      = 0.0f;
                     if ((lane & 7) == 0) { vs = __half2float(v_scale_s[key_l * Groups + grp]); }
                     vs                = __shfl_sync(FullMask, vs, grp * 8);
-                    const int2 raw    = load_vec<int2>(&v_i8[key_l * D + d]);
-                    const auto* codes = reinterpret_cast<const std::int8_t*>(&raw);
-                    int4 values;
-                    values.x = pack_f16x2(static_cast<float>(codes[0]) * vs,
-                                          static_cast<float>(codes[1]) * vs);
-                    values.y = pack_f16x2(static_cast<float>(codes[2]) * vs,
-                                          static_cast<float>(codes[3]) * vs);
-                    values.z = pack_f16x2(static_cast<float>(codes[4]) * vs,
-                                          static_cast<float>(codes[5]) * vs);
-                    values.w = pack_f16x2(static_cast<float>(codes[6]) * vs,
-                                          static_cast<float>(codes[7]) * vs);
-                    store_vec(dst, values);
+                    if constexpr (PackedV) {
+                        // rk V dequant: read 4 packed bytes (8 int4 values) from the
+                        // half-offset position, unpack, scale, and pack to f16.
+                        const int32_t raw = *reinterpret_cast<const int32_t*>(
+                            &v_i8[key_l * D + (d >> 1)]);
+                        const std::uint8_t* packed =
+                            reinterpret_cast<const std::uint8_t*>(&raw);
+                        int4 values;
+                        const auto c0 = rk4_unpack(packed[0], 0);
+                        const auto c1 = rk4_unpack(packed[0], 1);
+                        const auto c2 = rk4_unpack(packed[1], 0);
+                        const auto c3 = rk4_unpack(packed[1], 1);
+                        const auto c4 = rk4_unpack(packed[2], 0);
+                        const auto c5 = rk4_unpack(packed[2], 1);
+                        const auto c6 = rk4_unpack(packed[3], 0);
+                        const auto c7 = rk4_unpack(packed[3], 1);
+                        values.x = pack_f16x2(static_cast<float>(c0) * vs,
+                                              static_cast<float>(c1) * vs);
+                        values.y = pack_f16x2(static_cast<float>(c2) * vs,
+                                              static_cast<float>(c3) * vs);
+                        values.z = pack_f16x2(static_cast<float>(c4) * vs,
+                                              static_cast<float>(c5) * vs);
+                        values.w = pack_f16x2(static_cast<float>(c6) * vs,
+                                              static_cast<float>(c7) * vs);
+                        store_vec(dst, values);
+                    } else {
+                        const int2 raw    = load_vec<int2>(&v_i8[key_l * D + d]);
+                        const auto* codes = reinterpret_cast<const std::int8_t*>(&raw);
+                        int4 values;
+                        values.x = pack_f16x2(static_cast<float>(codes[0]) * vs,
+                                              static_cast<float>(codes[1]) * vs);
+                        values.y = pack_f16x2(static_cast<float>(codes[2]) * vs,
+                                              static_cast<float>(codes[3]) * vs);
+                        values.z = pack_f16x2(static_cast<float>(codes[4]) * vs,
+                                              static_cast<float>(codes[5]) * vs);
+                        values.w = pack_f16x2(static_cast<float>(codes[6]) * vs,
+                                              static_cast<float>(codes[7]) * vs);
+                        store_vec(dst, values);
+                    }
                 } else {
                     store_vec(dst, make_int4(0, 0, 0, 0));
                 }
