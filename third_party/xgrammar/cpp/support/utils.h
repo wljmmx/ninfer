@@ -360,6 +360,13 @@ class Result {
 // to raise an error. This macro manually mark them as unreachable to avoid warnings.
 #ifdef __GNUC__
 #define XGRAMMAR_UNREACHABLE() __builtin_unreachable()
+#elif defined(_MSC_VER)
+// MSVC has no __builtin_unreachable; std::abort() is [[noreturn]], so the compiler sees that
+// the marked branch does not fall through and does not flag the enclosing function for
+// "missing return value" (C4716). If a path tagged unreachable is ever reached at runtime,
+// abort terminates the process rather than running into undefined behavior.
+#include <cstdlib>
+#define XGRAMMAR_UNREACHABLE() std::abort()
 #else
 #define XGRAMMAR_UNREACHABLE()
 #endif
