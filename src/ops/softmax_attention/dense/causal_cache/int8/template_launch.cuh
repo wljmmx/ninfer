@@ -9,7 +9,8 @@
 namespace ninfer::ops::detail {
 
 template <class G, class S, bool MultiBatch, bool Masked, bool Writable, class Input,
-          bool ParallelQueries = false, bool PackedV = false>
+          bool ParallelQueries = false, bool PackedV = false, bool PackedK = false,
+          bool E8Lattice = false>
 void launch_int8_kv_grouped_mma(const CausalAttentionOperands& p, Int8KvCacheView<Writable> cache,
                                 Input input, CausalKvPartition partition, CausalPartialView partial,
                                 cudaStream_t stream) {
@@ -25,7 +26,8 @@ void launch_int8_kv_grouped_mma(const CausalAttentionOperands& p, Int8KvCacheVie
     if constexpr (Input::writes_cache)
         if (!input.k || !input.v) throw std::invalid_argument("INT8 append requires K/V");
     constexpr auto kernel =
-        int8_kv_grouped_mma_kernel<G, S, MultiBatch, Masked, Input, ParallelQueries, PackedV>;
+        int8_kv_grouped_mma_kernel<G, S, MultiBatch, Masked, Input, ParallelQueries, PackedV,
+                                   PackedK, E8Lattice>;
     constexpr int bytes = S::kDynamicArena ? S::kArenaBytes : 0;
     if constexpr (S::kDynamicArena) {
         static const auto status =

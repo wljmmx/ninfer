@@ -6,6 +6,7 @@
 #include "ops/softmax_attention/common/causal_epilogue.cuh"
 #include "ops/softmax_attention/common/causal_softmax.cuh"
 #include "ops/kv_cache/rk4_codec.cuh"
+#include "ops/kernel/e8_lattice.cuh"
 
 namespace ninfer::ops::detail {
 
@@ -14,8 +15,11 @@ namespace ninfer::ops::detail {
 // When PackedV is true (rk8v4 / rk4v4 / rk4v4-e8 / rk2v4-e8), the value cache stores
 // 4-bit codes (two per byte, symmetric [-7,7] with absmax/7 FP16 scales); the append
 // path packs int4 and the V loader unpacks to int8 before the same FP16 PV MMA.
+// When PackedK is true (rk4v4 / rk4v4-e8 / rk2v4-e8), the key cache also stores 4-bit
+// codes; E8Lattice selects E8 nearest-lattice projection vs plain RTN for K quantization.
 template <class Geometry, class Schedule, bool MultiBatch, bool Masked, class CacheInput,
-          bool ParallelQueries = false, bool PackedV = false>
+          bool ParallelQueries = false, bool PackedV = false, bool PackedK = false,
+          bool E8Lattice = false>
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     void int8_kv_grouped_mma_kernel(
         const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos,
@@ -176,8 +180,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 k_out[half]    = normalized_hadamard_d256_group_value_from_h64(x0, x1, x2, x3, grp);
             }
 
-            const float kv0    = k_out[0];
-            const float kv1    = k_out[1];
+            float kv0    = k_out[0];
+            float kv1    = k_out[1];
             const float vv0    = __bfloat162float(input.v[src0]);
             const float vv1    = __bfloat162float(input.v[src1]);
             float kamax        = fmaxf(fabsf(kv0), fabsf(kv1));
@@ -196,12 +200,55 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 v_scale     = kv_cache_int8_quant_params(vamax).scale;
                 v_inv_scale = kv_cache_int8_quant_params(vamax).inverse_scale;
             }
-            cache_k_i8[kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d0,
-                                                                 page_offset)] =
-                kv_cache_int8_quant_code(kv0, k_quant.inverse_scale);
-            cache_k_i8[kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d1,
-                                                                 page_offset)] =
-                kv_cache_int8_quant_code(kv1, k_quant.inverse_scale);
+            // K quantization: plain int8 (default), int4 RTN (PackedK, !E8Lattice),
+            // or int4 E8 lattice projection (PackedK, E8Lattice). For E8Lattice the
+            // 8D Hadamard-rotated vector is projected to the nearest E8 lattice point
+            // before clamping to [-7, 7] and packing.
+            if constexpr (PackedK) {
+                if constexpr (E8Lattice) {
+                    // E8 projection: warp-cooperative across 8 lanes per 8D subspace.
+                    float k0_mut = kv0, k1_mut = kv1;
+                    e8_project_8d_warp(k0_mut, k1_mut, lane);
+                    kv0 = k0_mut; kv1 = k1_mut;
+                }
+                // int4 K: scale = absmax/7, clamp [-7, 7], pack two adjacent dims/byte.
+                __half k_scale_h = rk4_absmax_to_scale_h(kamax);
+                float k_inv = __half2float(k_scale_h);
+                k_inv = k_inv > 0.0f ? 1.0f / k_inv : 0.0f;
+                if ((lane & 1) == 0) {
+                    const float kv0_next = __shfl_xor_sync(FullMask, kv0, 1);
+                    const float kv1_next = __shfl_xor_sync(FullMask, kv1, 1);
+                    const auto kc0 = rk4_quant_code(kv0, k_inv);
+                    const auto kc1 = rk4_quant_code(kv0_next, k_inv);
+                    const std::int64_t ko0 = rk4_v_code_index<Geometry>(physical_page, kv_head,
+                                                                       d0 >> 1, page_offset);
+                    cache_k_i8[ko0] = static_cast<std::int8_t>(rk4_pack(kc0, kc1));
+                    const auto kc2 = rk4_quant_code(kv1, k_inv);
+                    const auto kc3 = rk4_quant_code(kv1_next, k_inv);
+                    const std::int64_t ko1 = rk4_v_code_index<Geometry>(physical_page, kv_head,
+                                                                       d1 >> 1, page_offset);
+                    cache_k_i8[ko1] = static_cast<std::int8_t>(rk4_pack(kc2, kc3));
+                }
+                if (lane == 0) {
+                    const std::int64_t so = kv_cache_int8_quant_scale_index<Geometry>(
+                        physical_page, kv_head, grp, page_offset);
+                    cache_k_scale[so] = k_scale_h;
+                    cache_v_scale[so] = v_scale;
+                }
+            } else {
+                cache_k_i8[kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d0,
+                                                                     page_offset)] =
+                    kv_cache_int8_quant_code(kv0, k_quant.inverse_scale);
+                cache_k_i8[kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d1,
+                                                                     page_offset)] =
+                    kv_cache_int8_quant_code(kv1, k_quant.inverse_scale);
+                if (lane == 0) {
+                    const std::int64_t so = kv_cache_int8_quant_scale_index<Geometry>(
+                        physical_page, kv_head, grp, page_offset);
+                    cache_k_scale[so] = k_quant.scale;
+                    cache_v_scale[so] = v_scale;
+                }
+            }
             if constexpr (PackedV) {
                 // rk V plane: 4-bit codes, adjacent dims (2k, 2k+1) packed per byte.
                 // This lane holds dims (d0=grp*64+lane, d1=d0+32). Even lanes pack the
@@ -228,12 +275,6 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 cache_v_i8[kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d1,
                                                                     page_offset)] =
                     kv_cache_int8_quant_code(vv1, v_inv_scale);
-            }
-            if (lane == 0) {
-                const std::int64_t so = kv_cache_int8_quant_scale_index<Geometry>(
-                    physical_page, kv_head, grp, page_offset);
-                cache_k_scale[so] = k_quant.scale;
-                cache_v_scale[so] = v_scale;
             }
         }
         __syncthreads();
@@ -332,10 +373,25 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             const int d     = dc * 16;
             const int key   = tile_k0 + key_l;
             if (key >= split_start && key < split_end) {
+                std::int8_t* dst = &k_i8[key_l * D + causal_swizzle(key_l, dc * 8) * 2];
                 const std::int64_t off = kv_cache_int8_quant_code_index<Geometry>(
                     physical_page, kv_head, d, key & kPagedKVPageMask);
-                std::int8_t* dst = &k_i8[key_l * D + causal_swizzle(key_l, dc * 8) * 2];
-                ninfer::ops::cp_async<16>(dst, &cache_k_i8[off]);
+                if constexpr (PackedK) {
+                    // rk K: 4-bit codes, half extent. Unpack 8 bytes (16 dims) into smem.
+                    const std::int64_t koff = rk4_v_code_index<Geometry>(
+                        physical_page, kv_head, d >> 1, key & kPagedKVPageMask);
+                    const std::int8_t* ksrc = &cache_k_i8[koff];
+                    for (int byte = 0; byte < 8; ++byte) {
+                        const std::uint8_t packed =
+                            static_cast<std::uint8_t>(ksrc[byte]);
+                        k_i8[key_l * D + d + 2 * byte] =
+                            static_cast<std::int8_t>(rk4_unpack(packed, 0));
+                        k_i8[key_l * D + d + 2 * byte + 1] =
+                            static_cast<std::int8_t>(rk4_unpack(packed, 1));
+                    }
+                } else {
+                    ninfer::ops::cp_async<16>(dst, &cache_k_i8[off]);
+                }
                 if constexpr (PackedV) {
                     // rk V: 4-bit codes, half the bytes. cp_async 8 packed bytes covering
                     // 16 dimensions, then unpack into 16 int8 smem slots.
