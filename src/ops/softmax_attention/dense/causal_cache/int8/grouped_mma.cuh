@@ -7,6 +7,7 @@
 #include "ops/softmax_attention/common/causal_softmax.cuh"
 #include "ops/kv_cache/rk4_codec.cuh"
 #include "ops/kernel/e8_lattice.cuh"
+#include "ops/kernel/e8_root_codec.cuh"
 
 namespace ninfer::ops::detail {
 
@@ -19,7 +20,7 @@ namespace ninfer::ops::detail {
 // codes; E8Lattice selects E8 nearest-lattice projection vs plain RTN for K quantization.
 template <class Geometry, class Schedule, bool MultiBatch, bool Masked, class CacheInput,
           bool ParallelQueries = false, bool PackedV = false, bool PackedK = false,
-          bool E8Lattice = false>
+          bool E8Lattice = false, bool E8Root = false>
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     void int8_kv_grouped_mma_kernel(
         const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos,
@@ -204,7 +205,27 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             // or int4 E8 lattice projection (PackedK, E8Lattice). For E8Lattice the
             // 8D Hadamard-rotated vector is projected to the nearest E8 lattice point
             // before clamping to [-7, 7] and packing.
-            if constexpr (PackedK) {
+            if constexpr (E8Root) {
+                // rk2v4-e8 K append: encode 8D Hadamard-rotated subspace into root + rad_axis.
+                __half k_scale_h = k_quant.scale;
+                uint8_t root_code, rad_axis_code;
+                e8_encode_cylinder_8d_warp(kv0, __half2float(k_scale_h), root_code,
+                                           rad_axis_code, lane);
+                if ((lane & 7) == 0) {
+                    const int sub = lane >> 3;
+                    const int byte_offset = (grp * 8 + sub) * 2;
+                    const std::int64_t ko = paged_kv_element_offset<64, Geometry::KVHeads>(
+                        physical_page, kv_head, page_offset, byte_offset);
+                    cache_k_i8[ko]     = static_cast<std::int8_t>(root_code);
+                    cache_k_i8[ko + 1] = static_cast<std::int8_t>(rad_axis_code);
+                }
+                if (lane == 0) {
+                    const std::int64_t so = kv_cache_int8_quant_scale_index<Geometry>(
+                        physical_page, kv_head, grp, page_offset);
+                    cache_k_scale[so] = k_scale_h;
+                    cache_v_scale[so] = v_scale;
+                }
+            } else if constexpr (PackedK) {
                 if constexpr (E8Lattice) {
                     // E8 projection: warp-cooperative across 8 lanes per 8D subspace.
                     float k0_mut = kv0, k1_mut = kv1;
@@ -376,7 +397,30 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 std::int8_t* dst = &k_i8[key_l * D + causal_swizzle(key_l, dc * 8) * 2];
                 const std::int64_t off = kv_cache_int8_quant_code_index<Geometry>(
                     physical_page, kv_head, d, key & kPagedKVPageMask);
-                if constexpr (PackedK) {
+                if constexpr (E8Root) {
+                    // rk2v4-e8 K read-back: decode 2 bytes per 8-lane subgroup into 8 int8.
+                    const int grp_for_read = d / 64;
+                    const int sub = (d / 8) & 7;
+                    const int byte_offset = (grp_for_read * 8 + sub) * 2;
+                    const std::int64_t koff = paged_kv_element_offset<64, Geometry::KVHeads>(
+                        physical_page, kv_head, key & kPagedKVPageMask, byte_offset);
+                    const uint8_t root_code = static_cast<uint8_t>(cache_k_i8[koff]);
+                    const uint8_t rad_axis = static_cast<uint8_t>(cache_k_i8[koff + 1]);
+                    int8_t decoded[8];
+                    e8_root_decode_8d_fast(root_code, rad_axis, decoded);
+                    const int sub_lane = lane & 7;
+                    k_i8[key_l * D + d + sub_lane] = decoded[sub_lane];
+                    // Second 8-dim block in this 16-dim chunk.
+                    const int sub2 = ((d + 8) / 8) & 7;
+                    const int byte_offset2 = (grp_for_read * 8 + sub2) * 2;
+                    const std::int64_t koff2 = paged_kv_element_offset<64, Geometry::KVHeads>(
+                        physical_page, kv_head, key & kPagedKVPageMask, byte_offset2);
+                    const uint8_t root2 = static_cast<uint8_t>(cache_k_i8[koff2]);
+                    const uint8_t rad2  = static_cast<uint8_t>(cache_k_i8[koff2 + 1]);
+                    int8_t decoded2[8];
+                    e8_root_decode_8d_fast(root2, rad2, decoded2);
+                    k_i8[key_l * D + d + 8 + sub_lane] = decoded2[sub_lane];
+                } else if constexpr (PackedK) {
                     // rk K: 4-bit codes, half extent. Unpack 8 bytes (16 dims) into smem.
                     const std::int64_t koff = rk4_v_code_index<Geometry>(
                         physical_page, kv_head, d >> 1, key & kPagedKVPageMask);

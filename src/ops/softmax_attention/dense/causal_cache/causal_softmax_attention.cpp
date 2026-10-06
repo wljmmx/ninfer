@@ -410,11 +410,9 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         return;
     case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
     case KvCacheStorage::RK2V4E8:
-        // TODO(rk-port): rk8v4 (8-bit K + 4-bit V) and rk2v4-e8 (2-bit E8 cylinder K)
-        // need their own read-back/append paths.
-        throw std::invalid_argument(
-            "causal_softmax_attention: rk8v4 and rk2v4-e8 are not yet wired to the attention "
-            "kernel; use int8, k8v4, rk4v4 or rk4v4-e8.");
+        detail::rk2v4e8_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows,
+                                            scale, cache, envelope, workspace, out, execution);
+        return;
     default:
         break;
     }
@@ -488,9 +486,9 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
         return;
     case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
     case KvCacheStorage::RK2V4E8:
-        throw std::invalid_argument(
-            "causal_softmax_attention_cached: rk8v4 and rk2v4-e8 are not yet wired to the "
-            "attention kernel; use int8, k8v4, rk4v4 or rk4v4-e8.");
+        detail::rk2v4e8_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
+                                            execution);
+        return;
     default:
         break;
     }
