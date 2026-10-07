@@ -70,17 +70,14 @@ Q5Launch select_q5_v2_prefill(std::int32_t n, std::int32_t k, std::int32_t t) {
 
 Q5Launch select_q5_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     if (t <= 0) throw std::invalid_argument("q5 linear: T must be positive");
-    // For prefill (T > 128), prefer the v2 sm_89-tuned rowsplit GEMM.
-    if (t > 128) {
-        if (auto v2 = select_q5_v2_prefill(n, k, t)) return v2;
-    }
-    // For small T (decode), keep the v3 RTX 5090-tuned kernels (they were
-    // selected for decode CUDA Graph capture and may be better at T<=8).
+    // sm_89: consult the v2-tuned dispatch at EVERY T first. nsys on the MTP
+    // decode rounds showed the v3 RTX 5090 shape-table kernels (a16 sliced-k/
+    // simt) run ~10% slower per round than the v2 small_t/mma family; the v3
+    // shape table only serves shapes the v2 dispatch rejects.
+    if (auto v2 = select_q5_v2_prefill(n, k, t)) return v2;
     for (const auto& entry : kShapes) {
         if (entry.n == n && entry.k == k) return entry.select(t);
     }
-    // Last resort: try v2 dispatch for any T.
-    if (auto v2 = select_q5_v2_prefill(n, k, t)) return v2;
     throw std::invalid_argument("q5 linear: unsupported shape");
 }
 
@@ -94,3 +91,4 @@ void q5_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolic
     select_q5_launch(weight.n, weight.k, x.ne[1], policy)(x, weight, out, stream);
 }
 } // namespace ninfer::ops::detail
+

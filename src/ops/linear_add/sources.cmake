@@ -14,6 +14,9 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_add_plan.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/q4/q4_linear_add.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q5/q5_linear_add_gemm_mma.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/q5/q5_linear_add_sm89_gemv.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/q5/q5_linear_add_sm89_simt.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/q5/q5_linear_add_sm89_mma.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q5/q5_linear_add_sliced_k_mma.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q5/q5_linear_add_gemm_simt.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q5/q5_linear_add_plan.cpp"
@@ -29,3 +32,4 @@ target_sources(ninfer_ops PRIVATE
 target_sources(ninfer_nvfp4_non_rdc PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_add_a4_tma.cu"
 )
+

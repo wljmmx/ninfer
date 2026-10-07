@@ -38,6 +38,12 @@ constexpr std::array<SupportSpec, 2> kSupports{{
 }};
 
 constexpr std::array<RouteSpec, 13> kK6144Routes{{
+    // NOTE: the sm_89 (v1.2.0) decode routes (gemv / small-t atomic residual /
+    // r64.c16) were measured ~3% faster but the T==2..13 window uses an ATOMIC
+    // residual epilogue (kSplits=2) whose bf16x2 atomicAdd ordering varies run
+    // to run and made spec acc non-deterministic (0.201 -> 0.217, ±7 tok/s).
+    // The deterministic v3 sliced schedules stay routed until a non-atomic
+    // split merge is written; q5_linear_add_sm89_*.cu is parked for that.
     {{1, 4}, Q5LinearAddScheduleId::Split2ExactResidual},
     {{5, 8}, Q5LinearAddScheduleId::SlicedR16T8W4S2},
     {{9, 16}, Q5LinearAddScheduleId::SlicedR16T16W4S2},
@@ -123,6 +129,20 @@ void launch_wide_with_narrow_tail(const Tensor& x, const Weight& w, Tensor& resi
 
 const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept {
     switch (schedule) {
+    case Q5LinearAddScheduleId::GemvResidualSm89:
+        return "linear_add.q5.gemv.residual.sm89";
+    case Q5LinearAddScheduleId::Split2ExactResidualSm89:
+        return "linear_add.q5.simt.split2.exact.residual.sm89";
+    case Q5LinearAddScheduleId::MmaResidualR64C16Sm89:
+        return "linear_add.q5.mma.r64.c16.cta_collective_residual.sm89";
+    case Q5LinearAddScheduleId::MmaResidualR64C24Sm89:
+        return "linear_add.q5.mma.r64.c24.cta_collective_residual.sm89";
+    case Q5LinearAddScheduleId::MmaResidualR64C32Sm89:
+        return "linear_add.q5.mma.r64.c32.cta_collective_residual.sm89";
+    case Q5LinearAddScheduleId::MmaResidualR64C64Sm89:
+        return "linear_add.q5.mma.r64.c64.cta_collective_residual.sm89";
+    case Q5LinearAddScheduleId::MmaResidualR64C128Sm89:
+        return "linear_add.q5.mma.r64.c128.cta_collective_residual.sm89";
     case Q5LinearAddScheduleId::Split2ExactResidual:
         return "linear_add.q5.simt.split2.exact.residual";
     case Q5LinearAddScheduleId::SlicedR16T8W4S2:
@@ -193,6 +213,27 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
     (void)ws;
 
     switch (plan.schedule) {
+    case Q5LinearAddScheduleId::GemvResidualSm89:
+        q5_linear_add_gemv_residual_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::Split2ExactResidualSm89:
+        q5_linear_add_split2_exact_sm89_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::MmaResidualR64C16Sm89:
+        q5_linear_add_mma_r64_c16_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::MmaResidualR64C24Sm89:
+        q5_linear_add_mma_r64_c24_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::MmaResidualR64C32Sm89:
+        q5_linear_add_mma_r64_c32_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::MmaResidualR64C64Sm89:
+        q5_linear_add_mma_r64_c64_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::MmaResidualR64C128Sm89:
+        q5_linear_add_mma_r64_c128_launch(x, w, residual_out, stream);
+        return;
     case Q5LinearAddScheduleId::Split2ExactResidual:
         q5_linear_add_split2_exact_launch(x, w, residual_out, stream);
         return;

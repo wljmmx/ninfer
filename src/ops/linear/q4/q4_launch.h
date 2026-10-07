@@ -75,4 +75,32 @@ void launch_q4_a16_sliced_r32_t64_w2_s1(const Tensor& x, const Weight& weight, T
                                         cudaStream_t stream);
 void launch_q4_a16_sliced_r32_t8_w4_s2(const Tensor& x, const Weight& weight, Tensor& out,
                                        cudaStream_t stream);
+
+// v2 (v1.2.0) RTX 4090 tuned RowSplit family, ported for sm_89 decode rounds.
+void launch_q4_gemv_r4_w1_direct(const Tensor& x, const Weight& w, Tensor& out,
+                                 cudaStream_t stream);
+void launch_q4_gemv_r1_w8_direct(const Tensor& x, const Weight& w, Tensor& out,
+                                 cudaStream_t stream);
+void launch_q4_simt_r8_c4(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+void launch_q4_simt_r8_c8(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+void launch_q4_draft_head_small_t(const Tensor& x, const Weight& w, Tensor& out,
+                                   cudaStream_t stream);
+void launch_q4_mma_r64_c32(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+void launch_q4_mma_r64_c48(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+void launch_q4_mma_r64_c56(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+void launch_q4_mma_r64_c64(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+void launch_q4_mma_r64_c64_endpoint(const Tensor& x, const Weight& w, Tensor& out,
+                                     cudaStream_t stream);
+void launch_q4_mma_r64_c72(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+void launch_q4_mma_r64_c80(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+void launch_q4_mma_r64_c96(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+void launch_q4_mma_r64_c104_bounded(const Tensor& x, const Weight& w, Tensor& out,
+                                    cudaStream_t stream);
+void launch_q4_mma_r64_c112_partial(const Tensor& x, const Weight& w, Tensor& out,
+                                    cudaStream_t stream);
+void launch_q4_mma_r64_c112(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+void launch_q4_mma_r64_c120_partial(const Tensor& x, const Weight& w, Tensor& out,
+                                    cudaStream_t stream);
+void launch_q4_mma_r64_c120(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+void launch_q4_mma_r64_c128(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 } // namespace ninfer::ops::detail
