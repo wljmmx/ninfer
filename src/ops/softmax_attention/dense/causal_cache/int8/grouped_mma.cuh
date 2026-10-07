@@ -227,12 +227,12 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                     const int s1 = 4 + (lane >> 3);
                     const std::int64_t ko0 = paged_kv_element_offset<64, Geometry::KVHeads>(
                         physical_page, kv_head, page_offset, (grp * 8 + s0) * 2);
-                    cache_k_i8[ko0]     = static_cast<std::int8_t>(root0);
-                    cache_k_i8[ko0 + 1] = static_cast<std::int8_t>(rad0);
+                    *reinterpret_cast<std::uint16_t*>(&cache_k_i8[ko0]) =
+                        static_cast<std::uint16_t>(root0 | (rad0 << 8));
                     const std::int64_t ko1 = paged_kv_element_offset<64, Geometry::KVHeads>(
                         physical_page, kv_head, page_offset, (grp * 8 + s1) * 2);
-                    cache_k_i8[ko1]     = static_cast<std::int8_t>(root1);
-                    cache_k_i8[ko1 + 1] = static_cast<std::int8_t>(rad1);
+                    *reinterpret_cast<std::uint16_t*>(&cache_k_i8[ko1]) =
+                        static_cast<std::uint16_t>(root1 | (rad1 << 8));
                 }
                 if (lane == 0) {
                     const std::int64_t so = kv_cache_int8_quant_scale_index<Geometry>(
@@ -420,20 +420,24 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 if constexpr (E8Root) {
                     // rk2v4-e8 K read-back: this 16-dim chunk spans two consecutive
                     // 8D subspaces — 4 cache bytes (root+rad_axis each) starting at
-                    // byte offset d/4 of the 64-byte per-token K plane. One thread
-                    // decodes both subspaces and writes ALL 16 int8 codes into the
-                    // swizzled smem slot (dst) that the ldmatrix B-fragment reads —
-                    // the same slot the int8 cp_async path fills, so the write must
-                    // not bypass the swizzle and must cover the full chunk.
+                    // byte offset d/4 of the 64-byte per-token K plane. One uint32
+                    // load (the offset is always 4-aligned: sub = (d/8)&7 is even
+                    // because d is a multiple of 16); one thread decodes both
+                    // subspaces and writes ALL 16 int8 codes into the swizzled smem
+                    // slot (dst) that the ldmatrix B-fragment reads — the same slot
+                    // the int8 cp_async path fills, so the write must not bypass the
+                    // swizzle and must cover the full chunk.
                     const int grp_for_read = d / 64;
                     const int sub          = (d / 8) & 7;
                     const int byte_offset  = (grp_for_read * 8 + sub) * 2;
                     const std::int64_t koff = paged_kv_element_offset<64, Geometry::KVHeads>(
                         physical_page, kv_head, key & kPagedKVPageMask, byte_offset);
-                    const uint8_t root0 = static_cast<uint8_t>(cache_k_i8[koff]);
-                    const uint8_t rad0  = static_cast<uint8_t>(cache_k_i8[koff + 1]);
-                    const uint8_t root1 = static_cast<uint8_t>(cache_k_i8[koff + 2]);
-                    const uint8_t rad1  = static_cast<uint8_t>(cache_k_i8[koff + 3]);
+                    const std::uint32_t raw =
+                        *reinterpret_cast<const std::uint32_t*>(&cache_k_i8[koff]);
+                    const uint8_t root0 = static_cast<uint8_t>(raw);
+                    const uint8_t rad0  = static_cast<uint8_t>(raw >> 8);
+                    const uint8_t root1 = static_cast<uint8_t>(raw >> 16);
+                    const uint8_t rad1  = static_cast<uint8_t>(raw >> 24);
                     __align__(8) int8_t dec0[8];
                     __align__(8) int8_t dec1[8];
                     e8_root_decode_8d_fast(root0, rad0, dec0);
