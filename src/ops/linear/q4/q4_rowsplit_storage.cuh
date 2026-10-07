@@ -13,6 +13,12 @@ struct Q4RowSplitStorage {
     static constexpr int kGroupK             = 64;
     static constexpr int kCodeBytesPerGroup  = 32;
     static constexpr int kScaleBytesPerGroup = 2;
+
+    // A chunk is the eight codes one thread decodes, so it spans four packed bytes.
+    static constexpr int kCodeBytesPerChunk = 4;
+    static constexpr int kChunksPerGroup    = kCodeBytesPerGroup / kCodeBytesPerChunk;
+    static_assert(kChunksPerGroup * kCodeBytesPerChunk == kCodeBytesPerGroup,
+                  "a group's codes must divide evenly into chunks");
 };
 
 struct Q4SimtDecodeAtom {
@@ -42,28 +48,20 @@ struct Q4SimtDecodeAtom {
 };
 
 struct Q4MmaDecodeAtom {
-    // Eight packed codes -> four bf16 pairs, in weight order; out[i] holds the pair for
-    // lane = 4 * chunk + i. A nibble n decodes to the integer (n ^ 8) - 8, which lies in [-8, 7]
-    // and which bf16 represents exactly, so forming 128 + (n ^ 8) and subtracting 136 lands on it.
-    // The values are unscaled: callers of this overload fold the group scale into the
-    // accumulation, unlike decode_pair below.
-    static __device__ __forceinline__ void decode_eight(unsigned word, unsigned (&out)[4]) {
-        const unsigned kBias  = 0x43084308u; // bf16 136.0 in both halves
-        const unsigned kMagic = 0x43004300u; // bf16 128.0 in both halves
-        word ^= 0x88888888u;
-        const unsigned lo        = word & 0x0f0f0f0fu;
-        const unsigned hi        = (word >> 4) & 0x0f0f0f0fu;
-        const unsigned even      = __byte_perm(lo, hi, 0x5140);
-        const unsigned odd       = __byte_perm(lo, hi, 0x7362);
-        const unsigned biased[4] = {
-            __byte_perm(even, kMagic, 0x7150), __byte_perm(even, kMagic, 0x7372),
-            __byte_perm(odd, kMagic, 0x7150), __byte_perm(odd, kMagic, 0x7372)};
+    // Four packed bytes -> four bf16 pairs, in weight order; out[i] holds the pair
+    // decode_pair_with_scale produces at lane = 4 * chunk + i. A nibble n decodes to
+    // (n ^ 8) - 8, which is what bfe.s32 of a 4-bit field yields, so the sign extension, the
+    // float multiply by the group scale and the __floats2bfloat162_rn rounding are the same.
+    static __device__ __forceinline__ void decode_eight(unsigned word, float scale,
+                                                        unsigned (&out)[4]) {
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
-            const __nv_bfloat162 value =
-                __hsub2(*reinterpret_cast<const __nv_bfloat162*>(&biased[i]),
-                        *reinterpret_cast<const __nv_bfloat162*>(&kBias));
-            out[i] = *reinterpret_cast<const unsigned*>(&value);
+            const unsigned byte        = (word >> (8 * i)) & 0xffu;
+            const int q0               = (static_cast<int>(byte & 0x0fu) ^ 0x08) - 0x08;
+            const int q1               = (static_cast<int>(byte >> 4) ^ 0x08) - 0x08;
+            const __nv_bfloat162 value = __floats2bfloat162_rn(static_cast<float>(q0) * scale,
+                                                               static_cast<float>(q1) * scale);
+            out[i]                     = *reinterpret_cast<const unsigned*>(&value);
         }
     }
 
@@ -73,10 +71,17 @@ struct Q4MmaDecodeAtom {
                                                                  int lane) {
         const float scale =
             __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(scale_ptr)));
-        const std::uint8_t packed =
-            codes[group_index * Q4RowSplitStorage::kCodeBytesPerGroup + lane];
-        const int q0 = (static_cast<int>(packed & 0x0fu) ^ 0x08) - 0x08;
-        const int q1 = (static_cast<int>(packed >> 4) ^ 0x08) - 0x08;
+        return decode_pair_with_scale(codes, scale, group_index, lane);
+    }
+
+    static __device__ __forceinline__ __nv_bfloat162
+    decode_pair_with_scale(const std::uint8_t* codes, float scale, std::int64_t group_index,
+                           int lane) {
+        const std::uint32_t packed =
+            static_cast<std::uint32_t>(codes[group_index * Q4RowSplitStorage::kCodeBytesPerGroup + lane]);
+        int q0, q1;
+        asm("bfe.s32 %0, %1, 0, 4;" : "=r"(q0) : "r"(packed));
+        asm("bfe.s32 %0, %1, 4, 4;" : "=r"(q1) : "r"(packed));
         return __floats2bfloat162_rn(static_cast<float>(q0) * scale,
                                      static_cast<float>(q1) * scale);
     }

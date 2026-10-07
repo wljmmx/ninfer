@@ -47,8 +47,9 @@ void launch_slice(bool full, const Tensor& x, const Weight& qk_weight, const Wei
     const int tiles = div_up(qk.n, Schedule::BM) + div_up(value.n, Schedule::BM) +
                       div_up(output_gate.n, Schedule::BM);
     const int cols = x.ne[1];
-    const dim3 grid(static_cast<unsigned>(tiles),
-                    static_cast<unsigned>(div_up(cols, Schedule::BN)));
+    // Column-tile-major CTA order; see rowsplit_grouped_mma.cuh.
+    const dim3 grid(static_cast<unsigned>(div_up(cols, Schedule::BN)),
+                    static_cast<unsigned>(tiles));
 
     if (full) {
         rowsplit_grouped_mma_kernel<Schedule, true, RowSplitGroupedMmaCodec::Mixed, 4>

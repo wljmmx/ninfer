@@ -12,15 +12,23 @@
 namespace ninfer::ops::detail {
 namespace {
 
+// Warp tile and grid order follow the v2 RTX 4090 reference: a balanced
+// 32x32 warp tile (2x4 warp grid over the 64x128 block tile) keeps per-warp
+// register pressure even, and a column-tile-major CTA order (token tiles on
+// grid.x) lets the CTAs of one wave share each 32-row weight block in L2
+// before it is evicted. The previous 64x16 warp tile with row-major order was
+// tuned on RTX 5090 and ran the FFN ~11% slower per launch on sm_89.
 using GateUpC40Cfg  = GemmCfg<64, 40, 64, 64, 8, 2, 1, false, true, true>;
-using GateUpC128Cfg = GemmCfg<64, 128, 64, 64, 16, 2, 1, false, true, true>;
+using GateUpC128Cfg = GemmCfg<64, 128, 64, 32, 32, 2, 1, false, true, true>;
 
 template <class Cfg, bool Full>
 void launch_folded(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     constexpr int PM = Cfg::BM / 2;
     const int t      = x.ne[1];
-    const dim3 grid(static_cast<unsigned>(div_up(out.ne[0], PM)),
-                    static_cast<unsigned>(div_up(t, Cfg::BN)));
+    // Column-tile-major CTA order (token tiles on grid.x): consecutive CTAs
+    // reuse the same weight block while marching over tokens.
+    const dim3 grid(static_cast<unsigned>(div_up(t, Cfg::BN)),
+                    static_cast<unsigned>(div_up(out.ne[0], PM)));
     if constexpr (Full) {
         q4_linear_swiglu_mma_split_half_pair_kernel<Cfg, true><<<grid, Cfg::THREADS, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),

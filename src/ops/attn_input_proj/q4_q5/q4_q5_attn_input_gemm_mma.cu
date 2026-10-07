@@ -35,11 +35,12 @@ RowSplitGroupedMmaJob make_job(const Weight& weight, std::int32_t row_begin, std
 
 template <class Schedule, RowSplitGroupedMmaCodec Codec>
 void launch_pair(bool full, const Tensor& x, RowSplitGroupedMmaJob first,
-                 RowSplitGroupedMmaJob second, cudaStream_t stream) {
+                  RowSplitGroupedMmaJob second, cudaStream_t stream) {
     const int tiles = div_up(first.n, Schedule::BM) + div_up(second.n, Schedule::BM);
     const int cols  = x.ne[1];
-    const dim3 grid(static_cast<unsigned>(tiles),
-                    static_cast<unsigned>(div_up(cols, Schedule::BN)));
+    // Column-tile-major CTA order; see rowsplit_grouped_mma.cuh.
+    const dim3 grid(static_cast<unsigned>(div_up(cols, Schedule::BN)),
+                    static_cast<unsigned>(tiles));
     RowSplitGroupedMmaJob empty{};
 
     if (full) {
@@ -88,7 +89,8 @@ using MmaR32C64S4 = GemmCfg<32, 64, 64, 16, 16, 4, 1, false, true, true>;
 template <class S, bool Full>
 void mixed_slice(const Tensor& x, const Weight& w0, const Weight& w1, Tensor& q, Tensor& g,
                  Tensor& k, Tensor& v, cudaStream_t stream) {
-    const dim3 grid(14336 / S::BM, (x.ne[1] + S::BN - 1) / S::BN);
+    // Column-tile-major CTA order; see rowsplit_grouped_mma.cuh.
+    const dim3 grid((x.ne[1] + S::BN - 1) / S::BN, 14336 / S::BM);
     rowsplit_grouped_mma_kernel<S, Full, RowSplitGroupedMmaCodec::Mixed, 4>
         <<<grid, S::THREADS, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
                                           make_job(w0, 0, 6144, q), make_job(w0, 6144, 1024, k),
@@ -140,9 +142,11 @@ void q4_q5_attn_input_pair_r32_c64_s3_launch(const Tensor& x, const Weight& w0, 
 }
 
 void q4_q5_attn_input_mixed_r64_c128_s2_launch(const Tensor& x, const Weight& w0, const Weight& w1,
-                                               Tensor& q, Tensor& g, Tensor& k, Tensor& v,
-                                               cudaStream_t stream) {
-    launch_mixed<GemmCfg<64, 128, 64, 64, 16, 2, 2, false, true, true>>(x, w0, w1, q, g, k, v,
+                                                Tensor& q, Tensor& g, Tensor& k, Tensor& v,
+                                                cudaStream_t stream) {
+    // Balanced 32x32 warp tile (v2 RTX 4090 reference) — the 64x16 skew was
+    // RTX 5090-tuned and ran ~19% slower per launch on sm_89.
+    launch_mixed<GemmCfg<64, 128, 64, 32, 32, 2, 1, false, true, true>>(x, w0, w1, q, g, k, v,
                                                                         stream);
 }
 } // namespace ninfer::ops::detail
