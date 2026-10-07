@@ -238,7 +238,14 @@ __launch_bounds__(256) __global__
     extern __shared__ float warp_scratch_all[];
     float* warp_scratch = warp_scratch_all + warp_id * 256;
 
-    for (int tile = warp_id; tile < tokens * Geometry::KVHeads; tile += warps) {
+    // Grid-stride over (token, kv_head) rows: the launch sizes the grid as
+    // div_up(tokens * KVHeads, warps), so every (block, warp) pair owns exactly
+    // one row. The base offset must include blockIdx.x * warps — without it every
+    // block restarts the same tile sequence and the whole grid duplicates one
+    // block's work (512x on a 1024-token prefill chunk).
+    const int total_rows = tokens * Geometry::KVHeads;
+    const int row_base   = static_cast<int>(blockIdx.x) * warps;
+    for (int tile = row_base + warp_id; tile < total_rows; tile += gridDim.x * warps) {
         const int token  = tile / Geometry::KVHeads;
         const int kv_head = tile - token * Geometry::KVHeads;
         const int batch  = MultiBatch ? blockIdx.z : 0;
