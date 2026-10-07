@@ -94,7 +94,9 @@ void q4_q5_gdn_input_grouped_mma_launch(const Tensor& x, const Weight& qk_weight
             x, qk_weight, value_z_weight, qkv, z, stream);
         return;
     case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128S2:
-        launch_grouped<GemmCfg<64, 128, 64, 64, 16, 2, 1, false, true, true>>(
+        // Balanced 32x32 warp tile (v2 RTX 4090 reference) — the 64x16 skew was
+        // RTX 5090-tuned and ran ~19% slower per launch on sm_89.
+        launch_grouped<GemmCfg<64, 128, 64, 32, 32, 2, 1, false, true, true>>(
             x, qk_weight, value_z_weight, qkv, z, stream);
         return;
     case Q4Q5GdnInputScheduleId::IndependentDirectFixed:
