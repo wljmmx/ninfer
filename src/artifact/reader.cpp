@@ -174,4 +174,16 @@ std::size_t Reader::read_direct(std::size_t file_index, std::uint64_t file_offse
     return impl_->file(file_index).read_direct(file_offset, destination);
 }
 
+void Reader::begin_direct_read(std::size_t file_index, std::uint64_t file_offset,
+                               std::span<std::byte> destination, DirectReadState& state) const {
+    impl_->file(file_index).begin_direct_read(file_offset, destination, state);
+}
+
+std::size_t Reader::complete_direct_read(std::size_t file_index,
+                                         DirectReadState& state) const {
+    // begin and complete must address the same InputFile: the state's in-flight
+    // OVERLAPPED (Windows) or recorded fallback range (POSIX) belongs to it.
+    return impl_->file(file_index).complete_direct_read(state);
+}
+
 } // namespace ninfer::artifact

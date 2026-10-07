@@ -188,4 +188,108 @@ std::size_t InputFile::read_direct(std::uint64_t offset, std::span<std::byte> de
 #endif
 }
 
+#ifdef _WIN32
+DirectReadState::DirectReadState() {
+    op_event_ = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    op_       = ::HeapAlloc(::GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(OVERLAPPED));
+    if (op_event_ == nullptr || op_ == nullptr) { fail(std::filesystem::path(), "alloc read state"); }
+}
+
+DirectReadState::~DirectReadState() {
+    if (issued_ && file_ != nullptr) {
+        // Never abandon an in-flight read: join it (the destination buffer is
+        // guaranteed to outlive the state) so the kernel stops touching it.
+        DWORD received = 0;
+        (void)::GetOverlappedResult(static_cast<HANDLE>(file_), static_cast<OVERLAPPED*>(op_),
+                                   &received, TRUE);
+        issued_ = false;
+    }
+    if (op_ != nullptr) { ::HeapFree(::GetProcessHeap(), 0, op_); }
+    if (op_event_ != nullptr) { ::CloseHandle(static_cast<HANDLE>(op_event_)); }
+}
+#else
+DirectReadState::DirectReadState()  = default;
+DirectReadState::~DirectReadState() = default;
+#endif
+
+void InputFile::begin_direct_read(std::uint64_t offset, std::span<std::byte> destination,
+                                  DirectReadState& state) const {
+#ifdef _WIN32
+    if (offset % kPayloadAlignment || destination.size() % kPayloadAlignment ||
+        reinterpret_cast<std::uintptr_t>(destination.data()) % kPayloadAlignment) {
+        throw ArtifactError(path_.string() + ": unaligned async direct read");
+    }
+    if (destination.empty() || destination.size() > (1ULL << 30)) {
+        throw ArtifactError(path_.string() + ": invalid async direct read size");
+    }
+    if (state.issued_) { throw ArtifactError(path_.string() + ": read state already in flight"); }
+    if (direct_file_ == nullptr) {
+        HANDLE direct = ::CreateFileW(path_.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                       OPEN_EXISTING,
+                                       FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING |
+                                           FILE_FLAG_OVERLAPPED | FILE_FLAG_SEQUENTIAL_SCAN,
+                                       nullptr);
+        if (direct == INVALID_HANDLE_VALUE) { fail(path_, "open direct"); }
+        direct_file_ = direct;
+    }
+    OVERLAPPED* op   = static_cast<OVERLAPPED*>(state.op_);
+    HANDLE event     = static_cast<HANDLE>(state.op_event_);
+    *op              = OVERLAPPED{};
+    overlapped_offset(*op, offset);
+    op->hEvent       = event;
+    state.file_      = direct_file_;
+    if (!::ResetEvent(event)) { fail(path_, "reset read event"); }
+    DWORD read = 0;
+    state.inline_completed_ = false;
+    state.inline_bytes_     = 0;
+    const BOOL started      = ::ReadFile(static_cast<HANDLE>(direct_file_), destination.data(),
+                                         static_cast<DWORD>(destination.size()), &read, op);
+    if (started) {
+        // Completed synchronously (rare for NO_BUFFERING).
+        state.inline_completed_ = true;
+        state.inline_bytes_     = read;
+        return;
+    }
+    const auto error = ::GetLastError();
+    if (error == ERROR_IO_PENDING) {
+        state.issued_ = true;
+        return;
+    }
+    if (error == ERROR_HANDLE_EOF) {
+        state.inline_completed_ = true;
+        state.inline_bytes_     = 0;
+        return;
+    }
+    ::SetLastError(static_cast<DWORD>(error));
+    fail(path_, "begin direct read");
+#else
+    state.offset_     = offset;
+    state.destination_ = destination.data();
+    state.requested_  = destination.size();
+#endif
+}
+
+std::size_t InputFile::complete_direct_read(DirectReadState& state) const {
+#ifdef _WIN32
+    if (state.inline_completed_) {
+        state.inline_completed_ = false;
+        return state.inline_bytes_;
+    }
+    if (!state.issued_) { throw ArtifactError(path_.string() + ": no direct read in flight"); }
+    OVERLAPPED* op      = static_cast<OVERLAPPED*>(state.op_);
+    DWORD received      = 0;
+    const BOOL joined   = ::GetOverlappedResult(static_cast<HANDLE>(direct_file_), op, &received, TRUE);
+    state.issued_       = false;
+    if (!joined) {
+        const auto error = ::GetLastError();
+        if (error == ERROR_HANDLE_EOF) { return 0; }
+        ::SetLastError(static_cast<DWORD>(error));
+        fail(path_, "complete direct read");
+    }
+    return received;
+#else
+    return read_direct(state.offset_, {state.destination_, state.requested_});
+#endif
+}
+
 } // namespace ninfer::artifact

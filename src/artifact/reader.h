@@ -17,6 +17,8 @@ struct ReadSegment {
     std::uint64_t bytes              = 0;
 };
 
+class DirectReadState;
+
 // Owns the cold directory and lazily opened files. Runtime views borrow materialized storage,
 // never this Reader. Encodings are interpreted only for requested objects.
 class Reader {
@@ -43,6 +45,10 @@ public:
     [[nodiscard]] std::vector<std::byte> read_object(ObjectHandle handle) const;
     [[nodiscard]] std::size_t read_direct(std::size_t file_index, std::uint64_t file_offset,
                                           std::span<std::byte> destination) const;
+    void begin_direct_read(std::size_t file_index, std::uint64_t file_offset,
+                           std::span<std::byte> destination, DirectReadState& state) const;
+    [[nodiscard]] std::size_t complete_direct_read(std::size_t file_index,
+                                                  DirectReadState& state) const;
 
 private:
     struct Impl;

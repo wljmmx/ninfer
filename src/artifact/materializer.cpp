@@ -1,5 +1,6 @@
 #include "artifact/materializer.h"
 
+#include "artifact/file_io.h"
 #include "artifact/framing.h"
 #include "artifact/reader.h"
 #include "core/startup.h"
@@ -48,6 +49,7 @@ public:
     }
 
     PinnedHostBuffer buffer;
+    DirectReadState read;
     cudaEvent_t event = nullptr;
     bool pending      = false;
 };
@@ -242,46 +244,77 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     }
     pin_phase.complete();
     TransferCompletion completion{device.transfer_stream};
-    std::size_t next_slot  = 0;
-    std::size_t next_range = 0;
-    std::uint64_t copied   = 0;
-    const auto start       = std::chrono::steady_clock::now();
+    // Chunk plan for the read-ahead ring: one entry per slot-sized direct block.
+    struct Chunk {
+        std::size_t file;
+        std::uint64_t source;
+        std::size_t request;    // aligned bytes to read into the slot
+        std::uint64_t span_end; // for the short-block check
+    };
+    std::vector<Chunk> chunks;
     for (const auto& span : spans) {
         for (auto source = span.begin; source < span.end; source += slot_bytes) {
-            auto& slot = *slots[next_slot++ % slot_count];
-            slot.wait();
             const auto remaining = span.end - source;
             const auto request   = static_cast<std::size_t>(std::min<std::uint64_t>(
                 slot_bytes, align_up(remaining, kPayloadAlignment, "direct block bytes")));
-            const auto received  = reader.read_direct(
-                span.file, source, {static_cast<std::byte*>(slot.buffer.data()), request});
-            if (received < std::min<std::uint64_t>(request, remaining)) {
-                throw ArtifactError("direct read ended before the required payload");
-            }
-            out.stats_.read_bytes = checked_add(out.stats_.read_bytes, received, "read bytes");
-            const auto chunk_end  = checked_add(source, received, "read block end");
-            while (next_range < ranges.size() && ranges[next_range].file == span.file &&
-                   ranges[next_range].begin < chunk_end) {
-                const auto& range = ranges[next_range];
-                const auto begin  = std::max(source, range.begin);
-                const auto end    = std::min(chunk_end, range.end);
-                if (begin < end) {
-                    check_cuda(cudaMemcpyAsync(range.destination + (begin - range.begin),
-                                               static_cast<const std::byte*>(slot.buffer.data()) +
-                                                   (begin - source),
-                                               static_cast<std::size_t>(end - begin),
-                                               cudaMemcpyHostToDevice, device.transfer_stream),
-                               "upload weight bytes");
-                    copied = checked_add(copied, end - begin, "copied bytes");
-                }
-                if (range.end > chunk_end) { break; }
-                ++next_range;
-            }
-            check_cuda(cudaEventRecord(slot.event, device.transfer_stream),
-                       "record weight staging completion");
-            slot.pending = true;
-            phase.progress(copied, total);
+            chunks.push_back({span.file, source, request, span.end});
         }
+    }
+    // Two-cursor read-ahead ring: up to slot_count direct reads are in flight
+    // at once, giving the NVMe queue the depth it needs (a serialized read runs
+    // at single-queue depth and starves cold starts). Chunks consume in order,
+    // so range dispatch and progress reporting keep their existing semantics.
+    std::size_t next_range = 0;
+    std::uint64_t copied   = 0;
+    std::size_t issued      = 0;
+    std::size_t consumed   = 0;
+    const auto start       = std::chrono::steady_clock::now();
+    const auto begin_chunk = [&](std::size_t index) {
+        const Chunk& chunk = chunks[index];
+        Slot& slot         = *slots[index % slots.size()];
+        slot.wait();  // the H2D from chunk (index - depth) has drained the slot
+        reader.begin_direct_read(chunk.file, chunk.source,
+                                 {static_cast<std::byte*>(slot.buffer.data()), chunk.request},
+                                 slot.read);
+    };
+    const auto consume_chunk = [&](std::size_t index) {
+        const Chunk& chunk = chunks[index];
+        Slot& slot         = *slots[index % slots.size()];
+        const auto received =
+            reader.complete_direct_read(chunk.file, slot.read);
+        if (received < std::min<std::uint64_t>(chunk.request, chunk.span_end - chunk.source)) {
+            throw ArtifactError("direct read ended before the required payload");
+        }
+        out.stats_.read_bytes =
+            checked_add(out.stats_.read_bytes, received, "read bytes");
+        const auto chunk_end = checked_add(chunk.source, received, "read block end");
+        while (next_range < ranges.size() && ranges[next_range].file == chunk.file &&
+               ranges[next_range].begin < chunk_end) {
+            const auto& range = ranges[next_range];
+            const auto begin  = std::max(chunk.source, range.begin);
+            const auto end    = std::min(chunk_end, range.end);
+            if (begin < end) {
+                check_cuda(cudaMemcpyAsync(range.destination + (begin - range.begin),
+                                           static_cast<const std::byte*>(slot.buffer.data()) +
+                                               (begin - chunk.source),
+                                           static_cast<std::size_t>(end - begin),
+                                           cudaMemcpyHostToDevice, device.transfer_stream),
+                           "upload weight bytes");
+                copied = checked_add(copied, end - begin, "copied bytes");
+            }
+            if (range.end > chunk_end) { break; }
+            ++next_range;
+        }
+        check_cuda(cudaEventRecord(slot.event, device.transfer_stream),
+                   "record weight staging completion");
+        slot.pending = true;
+        phase.progress(copied, total);
+    };
+    while (consumed < chunks.size()) {
+        while (issued < chunks.size() && issued - consumed < slots.size()) {
+            begin_chunk(issued++);
+        }
+        consume_chunk(consumed++);
     }
     for (const auto& slot : slots) { slot->wait(); }
     completion.finish();
