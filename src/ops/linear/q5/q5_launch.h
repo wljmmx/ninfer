@@ -34,4 +34,17 @@ void launch_q5_a16_sliced_r32_t32_w4_s1(const Tensor&, const Weight&, Tensor&, c
 void launch_q5_a16_sliced_r32_t32_w4_s2(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_q5_a16_sliced_r32_t64_w2_s1(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_q5_a16_sliced_r32_t64_w2_s2(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+
+// v2 RTX 4090 (sm_89) tuned Q5 rowsplit GEMM kernels — faster than the
+// RTX 5090-tuned q5_a16_mma for prefill (large T) on Ada.
+void launch_q5_mma_r64_c32(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q5_mma_r64_c64(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q5_mma_r64_c128(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q5_small_t_mma(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q5_simt_r8_c4(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q5_simt_r8_c8(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q5_simt_split2_exact(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q5_simt_split4_exact(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q5_gemv_r16_s2_x(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q5_linear_add_small_t_mma(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 } // namespace ninfer::ops::detail

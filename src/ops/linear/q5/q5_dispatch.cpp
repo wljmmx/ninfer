@@ -16,13 +16,71 @@ constexpr std::array kShapes{
     ShapeEntry{5120, 17408, select_q5_n5120_k17408}, ShapeEntry{1152, 1152, select_q5_n1152_k1152},
     ShapeEntry{1152, 4304, select_q5_n1152_k4304},
 };
+
+// v2 RTX 4090 (sm_89) tuned dispatch for large-T prefill. The v3 shape
+// table was tuned on RTX 5090 and its q5_a16_mma ran 13% slower per
+// launch. For T > 128 (prefill chunk), route to the v2 rowsplit GEMM
+// kernels which use the same column-tile-major CTA order and balanced
+// warp tiles that made the FFN and attn_input ports faster.
+Q5Launch select_q5_v2_prefill(std::int32_t n, std::int32_t k, std::int32_t t) {
+    switch (k) {
+    case 5120:
+        switch (n) {
+        case 1024: case 6144: case 7168:
+            if (t <= 16) return launch_q5_small_t_mma;
+            if (t <= 64) return launch_q5_mma_r64_c32;
+            if (t <= 128) return launch_q5_mma_r64_c64;
+            return launch_q5_mma_r64_c128;
+        default: break;
+        }
+        break;
+    case 6144:
+        if (n == 5120) {
+            if (t <= 16) return launch_q5_small_t_mma;
+            if (t <= 64) return launch_q5_mma_r64_c32;
+            if (t <= 128) return launch_q5_mma_r64_c64;
+            return launch_q5_mma_r64_c128;
+        }
+        break;
+    case 17408:
+        if (n == 5120) {
+            if (t <= 16) return launch_q5_small_t_mma;
+            if (t <= 64) return launch_q5_mma_r64_c32;
+            if (t <= 128) return launch_q5_mma_r64_c64;
+            return launch_q5_mma_r64_c128;
+        }
+        break;
+    case 1152:
+        if (n == 1152 && t >= 4 && t <= 131072 && (t % 4) == 0) {
+            if (t <= 76) return launch_q5_simt_r8_c4;
+            return launch_q5_mma_r64_c128;
+        }
+        break;
+    case 4304:
+        if (n == 1152 && t >= 4 && t <= 131072 && (t % 4) == 0) {
+            if (t <= 120) return launch_q5_simt_r8_c4;
+            return launch_q5_mma_r64_c128;
+        }
+        break;
+    default: break;
+    }
+    return nullptr;  // Fall back to v3 shape table.
+}
 } // namespace
 
 Q5Launch select_q5_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     if (t <= 0) throw std::invalid_argument("q5 linear: T must be positive");
+    // For prefill (T > 128), prefer the v2 sm_89-tuned rowsplit GEMM.
+    if (t > 128) {
+        if (auto v2 = select_q5_v2_prefill(n, k, t)) return v2;
+    }
+    // For small T (decode), keep the v3 RTX 5090-tuned kernels (they were
+    // selected for decode CUDA Graph capture and may be better at T<=8).
     for (const auto& entry : kShapes) {
         if (entry.n == n && entry.k == k) return entry.select(t);
     }
+    // Last resort: try v2 dispatch for any T.
+    if (auto v2 = select_q5_v2_prefill(n, k, t)) return v2;
     throw std::invalid_argument("q5 linear: unsupported shape");
 }
 
