@@ -10,6 +10,8 @@
 #include "ops/linear/q4/q4_gemv_launch.cuh"
 #include "ops/linear/q5/q5_simt_launch.cuh"
 #include "ops/linear/q5/q5_gemv_launch.cuh"
+#include "ops/linear/q4/q4_small_t_mma.cuh"
+#include "ops/linear/q5/q5_small_t_mma.cuh"
 
 #include <cuda_bf16.h>
 
@@ -21,6 +23,103 @@ namespace {
 
 constexpr std::int32_t kSplitRow = 6144;
 constexpr std::int32_t kHidden   = 5120;
+
+// ---------------------------------------------------------------------------
+// sm89 decode path: reuse the proven q4/q5 small-T MMA kernels (warp-per-K-slice,
+// double-buffered cp.async, HMMA tensor-core compute) with a SPLIT epilogue that
+// preserves v3's fused Q/K and gate/V single-pass output. The v3 SIMT kernels
+// (q4_a16_simt, q5_a16_direct_simt) don't use tensor cores and ran ~10% slower
+// per MTP decode round on the RTX 4090.
+// ---------------------------------------------------------------------------
+
+template <int N, int ActiveCols>
+void launch_q4_attn_sm89(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
+                          cudaStream_t stream) {
+    constexpr int TileCols  = ActiveCols <= 8 ? 8 : 16;
+    using Geometry          = Q4SmallTGeometry<N, kHidden>;
+    constexpr int kBlocks   = (N + 15) / 16;
+
+    Q4SmallTSplitEpilogue<kSplitRow> epilogue;
+    epilogue.out     = static_cast<__nv_bfloat16*>(q.data);
+    epilogue.out_tail = static_cast<__nv_bfloat16*>(key.data);
+    epilogue.out_ld  = static_cast<std::int32_t>(q.nb[1] / sizeof(__nv_bfloat16));
+    epilogue.tail_ld = static_cast<std::int32_t>(key.nb[1] / sizeof(__nv_bfloat16));
+
+    q4_small_t_mma_kernel<Geometry, TileCols, ActiveCols, Q4SmallTSplitEpilogue<kSplitRow>,
+                          Q4SmallTMmaIdentityRows>
+        <<<kBlocks, Q4DraftSmallTSchedule::kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.scales),
+            static_cast<__nv_bfloat16*>(q.data),  // primary out; split epilogue routes rows
+            epilogue, Q4SmallTMmaIdentityRows{});
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <int N>
+void launch_q4_attn_sm89_dispatch(int t, const Tensor& x, const Weight& weight, Tensor& q,
+                                   Tensor& key, cudaStream_t stream) {
+    switch (t) {
+    case 1:  launch_q4_attn_sm89<N, 1>(x, weight, q, key, stream);  return;
+    case 2:  launch_q4_attn_sm89<N, 2>(x, weight, q, key, stream);  return;
+    case 3:  launch_q4_attn_sm89<N, 3>(x, weight, q, key, stream);  return;
+    case 4:  launch_q4_attn_sm89<N, 4>(x, weight, q, key, stream);  return;
+    case 5:  launch_q4_attn_sm89<N, 5>(x, weight, q, key, stream);  return;
+    case 6:  launch_q4_attn_sm89<N, 6>(x, weight, q, key, stream);  return;
+    case 7:  launch_q4_attn_sm89<N, 7>(x, weight, q, key, stream);  return;
+    case 8:  launch_q4_attn_sm89<N, 8>(x, weight, q, key, stream);  return;
+    case 9:  launch_q4_attn_sm89<N, 9>(x, weight, q, key, stream);  return;
+    case 10: launch_q4_attn_sm89<N, 10>(x, weight, q, key, stream); return;
+    case 11: launch_q4_attn_sm89<N, 11>(x, weight, q, key, stream); return;
+    case 12: launch_q4_attn_sm89<N, 12>(x, weight, q, key, stream); return;
+    default: throw std::invalid_argument("sm89 q4 attn: T out of [1,12]");
+    }
+}
+
+template <int N, int ActiveCols>
+void launch_q5_attn_sm89(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
+                          cudaStream_t stream) {
+    constexpr int TileCols  = ActiveCols <= 8 ? 8 : 16;
+    using Geometry          = Q5SmallTGeometry<N, kHidden>;
+    constexpr int kBlocks   = (N + 15) / 16;
+
+    Q5SmallTSplitEpilogue<kSplitRow> epilogue;
+    epilogue.out_tail = static_cast<__nv_bfloat16*>(value.data);
+    epilogue.tail_ld  = static_cast<std::int32_t>(value.nb[1] / sizeof(__nv_bfloat16));
+
+    q5_small_t_mma_kernel<Geometry, TileCols, ActiveCols, Q5SmallTSplitEpilogue<kSplitRow>,
+                          Q5SmallTMmaIdentityRows, 1>
+        <<<kBlocks, Q5SmallTSchedule::kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.qhigh),
+            static_cast<const std::uint8_t*>(weight.scales),
+            static_cast<__nv_bfloat16*>(gate.data),
+            static_cast<std::int32_t>(x.nb[1] / sizeof(__nv_bfloat16)),
+            static_cast<std::int32_t>(gate.nb[1] / sizeof(__nv_bfloat16)),
+            epilogue, Q5SmallTMmaIdentityRows{});
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <int N>
+void launch_q5_attn_sm89_dispatch(int t, const Tensor& x, const Weight& weight, Tensor& gate,
+                                   Tensor& value, cudaStream_t stream) {
+    switch (t) {
+    case 1:  launch_q5_attn_sm89<N, 1>(x, weight, gate, value, stream);  return;
+    case 2:  launch_q5_attn_sm89<N, 2>(x, weight, gate, value, stream);  return;
+    case 3:  launch_q5_attn_sm89<N, 3>(x, weight, gate, value, stream);  return;
+    case 4:  launch_q5_attn_sm89<N, 4>(x, weight, gate, value, stream);  return;
+    case 5:  launch_q5_attn_sm89<N, 5>(x, weight, gate, value, stream);  return;
+    case 6:  launch_q5_attn_sm89<N, 6>(x, weight, gate, value, stream);  return;
+    case 7:  launch_q5_attn_sm89<N, 7>(x, weight, gate, value, stream);  return;
+    case 8:  launch_q5_attn_sm89<N, 8>(x, weight, gate, value, stream);  return;
+    case 9:  launch_q5_attn_sm89<N, 9>(x, weight, gate, value, stream);  return;
+    case 10: launch_q5_attn_sm89<N, 10>(x, weight, gate, value, stream); return;
+    case 11: launch_q5_attn_sm89<N, 11>(x, weight, gate, value, stream); return;
+    case 12: launch_q5_attn_sm89<N, 12>(x, weight, gate, value, stream); return;
+    default: throw std::invalid_argument("sm89 q5 attn: T out of [1,12]");
+    }
+}
 
 using Q4AttnSimtR8T4Schedule = Q4A16SimtSchedule<8, 4, 1, 16, 2, Cache::ca, 1>;
 
@@ -94,6 +193,13 @@ void launch_q4_sliced_band(const Tensor& x, const Weight& weight, Tensor& q, Ten
 }
 
 void launch_q4(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key, cudaStream_t stream) {
+    const int t = x.ne[1];
+    // sm89 small-T MMA measured SLOWER than v3 SIMT for this N=7680 shape:
+    // 16 rows/CTA gives only 480 CTAs = 1.875 waves on 128 SMs (tail waste),
+    // while v3's BM=8 SIMT yields 960 CTAs = better utilization. The sm89
+    // launchers above remain for future tile-size retuning (8 rows/CTa variant).
+    // Falls through to v3 routing.
+    (void)t;
     switch (x.ne[1]) {
     case 1:
         launch_q4_gemv(x, weight, q, key, stream);
@@ -104,13 +210,6 @@ void launch_q4(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key, cu
     case 10:
     case 11:
     case 12:
-        // K-split for the Q4 parent across the whole parent-split range. Complete-op measurement
-        // (both parents launched, all four outputs, one graph, one probe run per column count):
-        // 73.0-77.6 us at T=9..12 against 100.1-105.7 us for the row-split SIMT that R0 used there,
-        // and 107.8-108.3 us for the grouped form the resolver switches to at T=13. The resolver
-        // boundary at 13 is right for the grouped-vs-row-split question, but it hid this: the split
-        // form with a K-split Q4 parent is 24-29% faster than both. T=2..6 keep the SIMT tile,
-        // where a 16-wide K-split tile would waste more MMA work than it saves.
         launch_q4_sliced_band(x, weight, q, key, stream);
         return;
     case 2:
@@ -191,23 +290,18 @@ void launch_q5_simt(const Tensor& x, const Weight& weight, Tensor& gate, Tensor&
 
 void launch_q5(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
                cudaStream_t stream) {
-    if (x.ne[1] == 1) {
+    // sm89 small-T MMA measured SLOWER than v3 split4/SIMT for N=7680 (same
+    // tail-wave issue as q4). Falls through to v3 routing.
+    const int t = x.ne[1];
+    if (t == 1) {
         launch_q5_gemv(x, weight, gate, value, stream);
         return;
     }
-    if (x.ne[1] <= 9) {
-        // Split4: one CTA owns one output row, its four warps split the K dimension and reduce
-        // their partial sums through shared memory, with the column count as a compile-time
-        // template argument so the kernel covers exactly the live columns. The fused projections
-        // use the same shape up to 6, so the Q5 parent has one mechanism from 2 to 9.
+    if (t <= 9) {
         launch_q5_split4_exact(x, weight, gate, value, stream);
         return;
     }
-    if (x.ne[1] <= 12) {
-        // c4 SIMT: one output row per warp, up to four columns per column tile, with the quantized
-        // weight planes staged in shared memory and activations read from the input tensor.
-        // Retained in this interval on complete-Op measurements; both shapes are legal at every
-        // count in [2,12].
+    if (t <= 12) {
         launch_q5_simt<4>(x, weight, gate, value, stream);
         return;
     }
