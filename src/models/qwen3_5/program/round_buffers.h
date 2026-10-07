@@ -12,7 +12,11 @@
 
 namespace ninfer::models::qwen3_5 {
 
-inline constexpr std::uint32_t kMtpDecodeMaximumDrafts    = 5;
+// Keep the MTP draft capacity in lockstep with kMaximumMtpDraftTokens (internal.h)
+// and the DFlash draft capacity: every std::array below derives its size from
+// this constant, so a mismatch silently truncates the round buffers and
+// corrupts the finalizing-target stage for wider draft windows.
+inline constexpr std::uint32_t kMtpDecodeMaximumDrafts    = 15;
 inline constexpr std::uint32_t kMtpDecodeMaximumWidth     = kMtpDecodeMaximumDrafts + 1;
 inline constexpr std::uint32_t kDFlashDecodeMaximumDrafts = 15;
 inline constexpr std::uint32_t kDFlashDecodeMaximumWidth  = kDFlashDecodeMaximumDrafts + 1;
