@@ -30,8 +30,15 @@ Int8KvCausalPlan make_int8_kv_causal_plan(int heads, int width, int batch,
             ? 2 * sms
             : sms;
     CausalKvPartition partition{1, causal_partition_target(budget, independent_tiles)};
-    // Bound partial traffic by keeping enough KV work in each split.
-    partition.key_shift = (width == 1 ? 7 : 8) - (heads == 16 ? 1 : 0);
+    // Decode (Grouped) split granularity follows the v2 small-T policy: 64-key
+    // splits up to the 64-split target keep the small decode grid
+    // (KVHeads x splits) filled at shallow contexts. The previous 128/256-key
+    // shift launched only 16 blocks for an MTP verify batch (width 6-8) at 4K
+    // context — half of one wave on 128 SMs. The wider families already have
+    // per-tile grid columns, so they keep the coarser shifts.
+    partition.key_shift = family == Int8KvFamily::Grouped
+                              ? 6
+                              : ((width == 1 ? 7 : 8) - (heads == 16 ? 1 : 0));
     partition.capacity  = partition.active(envelope.max_visible_keys);
     return {family, heads, width, batch, envelope, partition};
 }
