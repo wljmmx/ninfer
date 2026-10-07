@@ -1,13 +1,21 @@
 #pragma once
 #include "ops/softmax_attention/dense/causal_cache/int8/tile_io.cuh"
 
+#include "ops/kernel/e8_root_codec.cuh"
+#include "ops/kv_cache/rk4_codec.cuh"
 #include "ops/softmax_attention/dense/causal_cache/int8/schedule.cuh"
 #include "ops/softmax_attention/common/causal_epilogue.cuh"
 #include "ops/softmax_attention/common/causal_softmax.cuh"
 
 namespace ninfer::ops::detail {
 
-template <typename Geometry, typename Schedule, typename Metadata>
+// PackedV/PackedK/E8Root select the rk-family cache codecs for the read-back:
+// int4 V (8 packed bytes per 16 dims, unpacked by the V-worker stage), int4 K
+// (synchronous vectorized unpack into the swizzled K slot) or the 2-bit E8
+// cylinder K (synchronous root decode). E8Lattice does not affect reads and
+// is therefore not a parameter here.
+template <typename Geometry, typename Schedule, typename Metadata, bool PackedV = false,
+          bool PackedK = false, bool E8Root = false>
 __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
     const __nv_bfloat16* __restrict__ q, const std::int8_t* __restrict__ cache_k,
     const std::int8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
@@ -122,12 +130,66 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
             const int d     = dc * 16;
             const int key   = tile_k0 + key_l;
             std::int8_t* kd = &k_i8[(key_l * DB16 + causal_swizzle(key_l, dc * 8)) * 2];
-            std::int8_t* vd = &v_i8[key_l * D + d];
+            // int4 V occupies half the smem extent; the V-worker pass unpacks it
+            // into v_f16 after the barrier.
+            std::int8_t* vd = &v_i8[key_l * D + (PackedV ? (d >> 1) : d)];
             if (key <= max_query_abs) {
-                const std::int64_t off = kv_cache_int8_quant_code_index<Geometry>(
-                    physical_page, kv_head, d, key & kPagedKVPageMask);
-                cp_async<16, Cache::cg>(kd, &cache_k[off]);
-                cp_async<16, Cache::cg>(vd, &cache_v[off]);
+                if constexpr (E8Root) {
+                    // 2-bit cylinder K: 4 cache bytes cover this 16-dim chunk.
+                    // Synchronous load + root decode straight into the swizzled
+                    // slot — the tiny payload cannot be staged by cp_async
+                    // without extra shared memory.
+                    const int byte_offset = ((d / 64) * 8 + ((d / 8) & 7)) * 2;
+                    const std::int64_t koff = paged_kv_element_offset<64, Geometry::KVHeads>(
+                        physical_page, kv_head, key & kPagedKVPageMask, byte_offset);
+                    const std::uint32_t raw =
+                        *reinterpret_cast<const std::uint32_t*>(&cache_k[koff]);
+                    const uint8_t root0 = static_cast<uint8_t>(raw);
+                    const uint8_t rad0  = static_cast<uint8_t>(raw >> 8);
+                    const uint8_t root1 = static_cast<uint8_t>(raw >> 16);
+                    const uint8_t rad1  = static_cast<uint8_t>(raw >> 24);
+                    __align__(8) int8_t dec0[8];
+                    __align__(8) int8_t dec1[8];
+                    e8_root_decode_8d_fast(root0, rad0, dec0);
+                    e8_root_decode_8d_fast(root1, rad1, dec1);
+                    *reinterpret_cast<uint64_t*>(kd) =
+                        *reinterpret_cast<const uint64_t*>(dec0);
+                    *reinterpret_cast<uint64_t*>(kd + 8) =
+                        *reinterpret_cast<const uint64_t*>(dec1);
+                } else if constexpr (PackedK) {
+                    // int4 K: 8 packed bytes cover this 16-dim chunk; synchronous
+                    // load + vectorized nibble unpack into the swizzled slot
+                    // (the same proven path as the grouped kernel).
+                    const std::int64_t koff = rk4_v_code_index<Geometry>(
+                        physical_page, kv_head, d >> 1, key & kPagedKVPageMask);
+#pragma unroll
+                    for (int half4 = 0; half4 < 2; ++half4) {
+                        const std::uint32_t raw = *reinterpret_cast<const std::uint32_t*>(
+                            &cache_k[koff + 4 * half4]);
+                        const std::uint32_t lo = rk4_unpack_lo_fast(raw);
+                        const std::uint32_t hi = rk4_unpack_hi_fast(raw);
+                        const auto* lo8        = reinterpret_cast<const std::int8_t*>(&lo);
+                        const auto* hi8        = reinterpret_cast<const std::int8_t*>(&hi);
+#pragma unroll
+                        for (int b = 0; b < 4; ++b) {
+                            kd[8 * half4 + 2 * b]     = lo8[b];
+                            kd[8 * half4 + 2 * b + 1] = hi8[b];
+                        }
+                    }
+                } else {
+                    const std::int64_t off = kv_cache_int8_quant_code_index<Geometry>(
+                        physical_page, kv_head, d, key & kPagedKVPageMask);
+                    cp_async<16, Cache::cg>(kd, &cache_k[off]);
+                }
+                if constexpr (PackedV) {
+                    const std::int64_t voff = rk4_v_code_index<Geometry>(
+                        physical_page, kv_head, d >> 1, key & kPagedKVPageMask);
+                    cp_async<8>(vd, &cache_v[voff]);
+                } else {
+                    const std::int64_t voff = kv_cache_int8_quant_code_index<Geometry>(
+                        physical_page, kv_head, d, key & kPagedKVPageMask);
+                    cp_async<16, Cache::cg>(vd, &cache_v[voff]);
+                }
             } else {
                 store_vec(kd, make_int4(0, 0, 0, 0));
                 store_vec(vd, make_int4(0, 0, 0, 0));
@@ -324,7 +386,30 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
                     __half vs     = __float2half_rn(0.0f);
                     if ((lane & 7) == 0) { vs = v_scale_s[key_l * Groups + grp]; }
                     vs = __shfl_sync(FullMask, vs, grp * 8);
-                    store_vec(dst, int8_kv_dequant_f16x8(&v_i8[key_l * D + d], vs));
+                    if constexpr (PackedV) {
+                        // int4 V dequant: 4 packed bytes (8 dims) at half extent,
+                        // vectorized nibble unpack + scale, straight into the
+                        // swizzled v_f16 slot (same as the grouped kernel).
+                        const std::uint32_t raw = *reinterpret_cast<const std::uint32_t*>(
+                            &v_i8[key_l * D + (d >> 1)]);
+                        const std::uint32_t lo = rk4_unpack_lo_fast(raw);
+                        const std::uint32_t hi = rk4_unpack_hi_fast(raw);
+                        const auto* lo8        = reinterpret_cast<const std::int8_t*>(&lo);
+                        const auto* hi8        = reinterpret_cast<const std::int8_t*>(&hi);
+                        const float vsf         = __half2float(vs);
+                        int4 values;
+                        values.x = pack_f16x2(static_cast<float>(lo8[0]) * vsf,
+                                              static_cast<float>(hi8[0]) * vsf);
+                        values.y = pack_f16x2(static_cast<float>(lo8[1]) * vsf,
+                                              static_cast<float>(hi8[1]) * vsf);
+                        values.z = pack_f16x2(static_cast<float>(lo8[2]) * vsf,
+                                              static_cast<float>(hi8[2]) * vsf);
+                        values.w = pack_f16x2(static_cast<float>(lo8[3]) * vsf,
+                                              static_cast<float>(hi8[3]) * vsf);
+                        store_vec(dst, values);
+                    } else {
+                        store_vec(dst, int8_kv_dequant_f16x8(&v_i8[key_l * D + d], vs));
+                    }
                 } else {
                     store_vec(dst, make_int4(0, 0, 0, 0));
                 }

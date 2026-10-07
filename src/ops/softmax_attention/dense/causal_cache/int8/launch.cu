@@ -360,6 +360,19 @@ void tiled(const CausalAttentionOperands& p, Int8KvReadView cache, cudaStream_t 
         launch_int8_kv_tiled_mma<CausalD256H16Kv2, Int8KvTiledInstance>(p, cache, stream);
 }
 
+// rk tiled: same tiled kernel with the rk-family cache codecs selected for the
+// read-back (PackedV int4 V always; PackedK int4 K or E8Root 2-bit cylinder K).
+// E8Lattice only affects the append codec and is not a read parameter.
+template <bool PackedV, bool PackedK = false, bool E8Root = false>
+void rk_tiled(const CausalAttentionOperands& p, Int8KvReadView cache, cudaStream_t stream) {
+    if (p.query_heads == 24)
+        launch_int8_kv_tiled_mma<CausalD256H24Kv4, Int8KvTiledInstance, PackedV, PackedK,
+                                  E8Root>(p, cache, stream);
+    else
+        launch_int8_kv_tiled_mma<CausalD256H16Kv2, Int8KvTiledInstance, PackedV, PackedK,
+                                  E8Root>(p, cache, stream);
+}
+
 } // namespace
 
 void int8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
@@ -458,11 +471,9 @@ void rk4v4_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v
         const auto view =
             make_quantized_causal_cache_view<Int8KvCacheView<false>>(cache, &valid, &rows);
         if (plan.family == Int8KvFamily::Tiled)
-            throw std::invalid_argument(
-                "rk4v4 attention: tiled family does not yet support PackedV; "
-                "use --prefill-chunk 256 or smaller to stay on the parallel path "
-                "(the engine clamps rk-family prefill chunks automatically).");
-        rk_execute_parallel<RkVariant::PackedKOnly>(p, view, plan, workspace, stream);
+            rk_tiled<true, true>(p, view, stream);
+        else
+            rk_execute_parallel<RkVariant::PackedKOnly>(p, view, plan, workspace, stream);
     }
 }
 
@@ -474,8 +485,12 @@ void rk4v4_kv_cached_attention(const Tensor& q, const Tensor& positions, float s
     const auto plan =
         make_int8_kv_causal_plan(q.ne[1], q.ne[2], 1, envelope, execution.multiprocessor_count);
     const auto view = single_row_paged_kv_batch_view(cache);
-    rk_execute_grouped<CausalCachedInput, RkVariant::Plain>(q, positions, scale, view, nullptr, nullptr,
-                                                  CausalCachedInput{}, plan, workspace, out, stream);
+    // rk4v4's K plane is int4-packed: the cached read must use PackedKOnly
+    // (routing through Plain read int4 nibbles as int8 codes).
+    rk_execute_grouped<CausalCachedInput, RkVariant::PackedKOnly>(q, positions, scale, view,
+                                                                 nullptr, nullptr,
+                                                                 CausalCachedInput{}, plan,
+                                                                 workspace, out, stream);
 }
 
 // --- rk8v4 attention (8-bit K + int4 V, reuses rk4v4 dispatch) --------------------
@@ -502,22 +517,9 @@ void rk8v4_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v
         const auto view =
             make_quantized_causal_cache_view<Int8KvCacheView<false>>(cache, &valid, &rows);
         if (plan.family == Int8KvFamily::Tiled)
-            throw std::invalid_argument(
-                "rk8v4 attention: tiled family does not yet support PackedV.");
-        // For rk8v4 parallel: PackedV=true, PackedK=false (RkVariant::Plain with
-        // PackedK=false in rk_execute_parallel).
-        // RkVariant::Plain maps to PackedK=false in rk_execute_parallel. But we need
-        // a separate enum value... actually RkVariant::Plain means "PackedV only".
-        // Let me use a different approach: just call with the right template directly.
-        auto scope = workspace.scope();
-        const auto partial = allocate_causal_partials(workspace, plan.query_heads, plan.width,
-                                                       plan.partition.capacity, plan.batch);
-        if (plan.query_heads == 24)
-            rk_parallel_grouped<CausalD256H24Kv4, Int8KvCausalPlan::kTokenTile, false, false>(
-                p, view, plan.partition, partial.view(), stream);
+            rk_tiled<true>(p, view, stream);
         else
-            rk_parallel_grouped<CausalD256H16Kv2, Int8KvCausalPlan::kTokenTile, false, false>(
-                p, view, plan.partition, partial.view(), stream);
+            rk_execute_parallel<RkVariant::Plain>(p, view, plan, workspace, stream);
     }
 }
 
@@ -525,7 +527,14 @@ void rk8v4_kv_cached_attention(const Tensor& q, const Tensor& positions, float s
                                const PagedKVLayerView& cache,
                                CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                                Tensor& out, DeviceExecutionView execution) {
-    rk4v4_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out, execution);
+    const cudaStream_t stream = execution.stream;
+    const auto plan =
+        make_int8_kv_causal_plan(q.ne[1], q.ne[2], 1, envelope, execution.multiprocessor_count);
+    const auto view = single_row_paged_kv_batch_view(cache);
+    // rk8v4's K plane is plain int8: the cached read stays on Plain (PackedV only).
+    rk_execute_grouped<CausalCachedInput, RkVariant::Plain>(q, positions, scale, view, nullptr,
+                                                            nullptr, CausalCachedInput{}, plan,
+                                                            workspace, out, stream);
 }
 
 // --- rk4v4-e8 attention (E8 lattice K + int4 V) -----------------------------------
@@ -553,8 +562,9 @@ void rk4v4e8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor&
         const auto view =
             make_quantized_causal_cache_view<Int8KvCacheView<false>>(cache, &valid, &rows);
         if (plan.family == Int8KvFamily::Tiled)
-            throw std::invalid_argument("rk4v4-e8 attention: tiled does not support PackedV.");
-        rk_execute_parallel<RkVariant::E8Lattice>(p, view, plan, workspace, stream);
+            rk_tiled<true, true>(p, view, stream);
+        else
+            rk_execute_parallel<RkVariant::E8Lattice>(p, view, plan, workspace, stream);
     }
 }
 
@@ -598,8 +608,9 @@ void rk2v4e8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor&
         const auto view =
             make_quantized_causal_cache_view<Int8KvCacheView<false>>(cache, &valid, &rows);
         if (plan.family == Int8KvFamily::Tiled)
-            throw std::invalid_argument("rk2v4-e8 attention: tiled does not support PackedV.");
-        rk_execute_parallel<RkVariant::E8Root>(p, view, plan, workspace, stream);
+            rk_tiled<true, false, true>(p, view, stream);
+        else
+            rk_execute_parallel<RkVariant::E8Root>(p, view, plan, workspace, stream);
     }
 }
 
