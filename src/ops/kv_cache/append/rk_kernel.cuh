@@ -37,7 +37,6 @@ __device__ __forceinline__ void kv_cache_append_rk_row(
 
     // --- K plane ---
     float k_vals[8];
-    float k_absmax = 0.0F;
 #pragma unroll
     for (int r = 0; r < 8; ++r) {
         const int d = lane + 32 * r;
@@ -46,9 +45,6 @@ __device__ __forceinline__ void kv_cache_append_rk_row(
             static_cast<std::int64_t>(Geometry::KVHeads) * token)]);
     }
     normalized_hadamard_d256_inplace(k_vals, lane);
-#pragma unroll
-    for (float val : k_vals) k_absmax = fmaxf(k_absmax, fabsf(val));
-    k_absmax = warp_max(k_absmax, FullMask);
 
         if constexpr (E8Root) {
         // rk2v4-e8 K: 2-bit E8 cylinder codes, one (root, rad_axis) byte pair per
@@ -100,34 +96,34 @@ __device__ __forceinline__ void kv_cache_append_rk_row(
             }
         }
     } else if constexpr (PackedK) {
-        // int4 K: absmax/7 scale, pack two adjacent dims per byte at stride 128.
+        // int4 K: PER-GROUP absmax/7 FP16 scale, matching the fused append and the
+        // reference rk4v4/rk4v4-e8 codecs — a single global scale wastes 1-2 bits
+        // of the [-7,7] grid whenever a group's absmax sits below the row maximum.
         // k_vals[r] holds dim lane + 32*r, so group g's two halves live in
-        // k_vals[2g] and k_vals[2g+1]; byte index must include the group offset.
-        __half k_scale = rk4_absmax_to_scale_h(k_absmax);
-        float k_inv = __half2float(k_scale);
-        k_inv = k_inv > 0.0f ? 1.0f / k_inv : 0.0f;
-        if constexpr (E8Lattice) {
-            // E8 projection in the SCALED space (units of k_scale), matching the
-            // reference rk4v4-e8 codec; the half-integral coset collapses in the
-            // int4 round below.
-#pragma unroll
-            for (int grp = 0; grp < Groups; ++grp) {
-                float v0 = k_vals[2 * grp] * k_inv;
-                float v1 = k_vals[2 * grp + 1] * k_inv;
-                e8_project_8d_warp(v0, v1, lane);
-                k_vals[2 * grp]     = v0;
-                k_vals[2 * grp + 1] = v1;
-            }
-            k_inv = 1.0f;
-        }
-        // Vectorized int4 K pack: every lane quantizes its own dimension, even
-        // lanes build the packed byte, then writer lanes (multiples of 8) gather
-        // four consecutive bytes with three shuffles and store one uint32 —
-        // 32 uint32 stores per token-head instead of 128 byte stores. The byte
-        // offsets stay 4-aligned ((grp*64+half*32+lane)>>1 with lane=8m).
+        // k_vals[2g] and k_vals[2g+1].
         for (int grp = 0; grp < Groups; ++grp) {
+            float g_abs = fmaxf(fabsf(k_vals[2 * grp]), fabsf(k_vals[2 * grp + 1]));
+            g_abs       = warp_max(g_abs, FullMask);
+            const __half k_scale = rk4_absmax_to_scale_h(g_abs);
+            float k_inv = __half2float(k_scale);
+            k_inv = k_inv > 0.0f ? 1.0f / k_inv : 0.0f;
+            float half_vals[2] = {k_vals[2 * grp], k_vals[2 * grp + 1]};
+            if constexpr (E8Lattice) {
+                // E8 projection in the SCALED space (units of THIS group's k_scale),
+                // matching the reference rk4v4-e8 codec; the half-integral coset
+                // collapses in the int4 round below.
+                half_vals[0] *= k_inv;
+                half_vals[1] *= k_inv;
+                e8_project_8d_warp(half_vals[0], half_vals[1], lane);
+                k_inv = 1.0f;
+            }
+            // Vectorized int4 K pack: every lane quantizes its own dimension, even
+            // lanes build the packed byte, then writer lanes (multiples of 8) gather
+            // four consecutive bytes with three shuffles and store one uint32 —
+            // 32 uint32 stores per token-head instead of 128 byte stores. The byte
+            // offsets stay 4-aligned ((grp*64+half*32+lane)>>1 with lane=8m).
             for (int half = 0; half < 2; ++half) {
-                const int c_self = rk4_quant_code(k_vals[2 * grp + half], k_inv);
+                const int c_self = rk4_quant_code(half_vals[half], k_inv);
                 const int c_nbr  = __shfl_xor_sync(FullMask, c_self, 1);
                 std::uint32_t my_byte = 0;
                 if ((lane & 1) == 0) {
@@ -145,31 +141,29 @@ __device__ __forceinline__ void kv_cache_append_rk_row(
                         my_byte | (b1 << 8) | (b2 << 16) | (b3 << 24);
                 }
             }
-        }
-        if (lane < Groups) {
-            scale_k[paged_kv_element_offset<4, Geometry::KVHeads>(
-                physical_page, kv_head, page_offset, lane)] = k_scale;
+            if (lane == 0) {
+                scale_k[paged_kv_element_offset<4, Geometry::KVHeads>(
+                    physical_page, kv_head, page_offset, grp)] = k_scale;
+            }
         }
     } else {
-        // int8 K: same as the standard int8 codec (stride 256).
-        const auto k_quant = kv_cache_int8_quant_params(k_absmax);
-#pragma unroll
-        for (int r = 0; r < 8; ++r) {
-            const int d = lane + 32 * r;
+        // int8 K: PER-GROUP absmax/127 FP16 scale, identical to the standard
+        // int8-group64 codec. Group g's dims live in k_vals[2g] (lane+32*2g) and
+        // k_vals[2g+1] (lane+32*(2g+1)); each group quantizes against its own scale.
+        for (int grp = 0; grp < Groups; ++grp) {
+            float g_abs = fmaxf(fabsf(k_vals[2 * grp]), fabsf(k_vals[2 * grp + 1]));
+            g_abs       = warp_max(g_abs, FullMask);
+            const auto k_quant = kv_cache_int8_quant_params(g_abs);
             cache_k[paged_kv_element_offset<D, Geometry::KVHeads>(
-                physical_page, kv_head, page_offset, d)] =
-                kv_cache_int8_quant_code(k_vals[r], k_quant.inverse_scale);
-        }
-        // int8 K has 4 groups, each lane 0 writes the group-0 scale; all 4 groups
-        // need scales. Actually int8 K scale is per-group too: lane < Groups writes.
-        if (lane < Groups) {
-            // Each group's scale is the same (warp_max is broadcast), but the int8
-            // codec computes absmax per 64-dim group. Since warp_max gives the global
-            // max, and int8_group64 uses per-group absmax, we need per-group absmax.
-            // For simplicity in the append kernel, use the global absmax for all groups
-            // (same as the attention kernel does for Q).
-            scale_k[paged_kv_element_offset<4, Geometry::KVHeads>(
-                physical_page, kv_head, page_offset, lane)] = k_quant.scale;
+                physical_page, kv_head, page_offset, lane + 32 * (2 * grp))] =
+                kv_cache_int8_quant_code(k_vals[2 * grp], k_quant.inverse_scale);
+            cache_k[paged_kv_element_offset<D, Geometry::KVHeads>(
+                physical_page, kv_head, page_offset, lane + 32 * (2 * grp + 1))] =
+                kv_cache_int8_quant_code(k_vals[2 * grp + 1], k_quant.inverse_scale);
+            if (lane == 0) {
+                scale_k[paged_kv_element_offset<4, Geometry::KVHeads>(
+                    physical_page, kv_head, page_offset, grp)] = k_quant.scale;
+            }
         }
     }
 
@@ -179,7 +173,6 @@ __device__ __forceinline__ void kv_cache_append_rk_row(
     // MMA output goes straight to the residual stream, so the cache V must be raw.
     // Rotating V here corrupted every prefill-appended token (rk8v4 "2020" garbage).
     float v_vals[8];
-    float v_absmax = 0.0F;
 #pragma unroll
     for (int r = 0; r < 8; ++r) {
         const int d = lane + 32 * r;
@@ -187,18 +180,18 @@ __device__ __forceinline__ void kv_cache_append_rk_row(
             static_cast<std::int64_t>(D) * (static_cast<std::int64_t>(kv_head) +
             static_cast<std::int64_t>(Geometry::KVHeads) * token)]);
     }
-#pragma unroll
-    for (float val : v_vals) v_absmax = fmaxf(v_absmax, fabsf(val));
-    v_absmax = warp_max(v_absmax, FullMask);
 
-    __half v_scale = rk4_absmax_to_scale_h(v_absmax);
-    float v_inv = __half2float(v_scale);
-    v_inv = v_inv > 0.0f ? 1.0f / v_inv : 0.0f;
-
-    // Vectorized int4 V pack (same writer-gather pattern as the K pack):
-    // every lane quantizes its own dim, even lanes build the packed byte,
-    // writer lanes (multiples of 8) gather four bytes and store one uint32.
+    // PER-GROUP absmax/7 FP16 scale (matches the fused append): each 64-dim group
+    // quantizes against its own scale. Vectorized int4 V pack (same writer-gather
+    // pattern as the K pack): every lane quantizes its own dim, even lanes build
+    // the packed byte, writer lanes (multiples of 8) gather four bytes and store
+    // one uint32.
     for (int grp = 0; grp < Groups; ++grp) {
+        float g_abs = fmaxf(fabsf(v_vals[2 * grp]), fabsf(v_vals[2 * grp + 1]));
+        g_abs       = warp_max(g_abs, FullMask);
+        const __half v_scale = rk4_absmax_to_scale_h(g_abs);
+        float v_inv = __half2float(v_scale);
+        v_inv = v_inv > 0.0f ? 1.0f / v_inv : 0.0f;
         for (int half = 0; half < 2; ++half) {
             const int c_self = rk4_quant_code(v_vals[2 * grp + half], v_inv);
             const int c_nbr  = __shfl_xor_sync(FullMask, c_self, 1);
@@ -218,10 +211,10 @@ __device__ __forceinline__ void kv_cache_append_rk_row(
                     my_byte | (b1 << 8) | (b2 << 16) | (b3 << 24);
             }
         }
-    }
-    if (lane < Groups) {
-        scale_v[paged_kv_element_offset<4, Geometry::KVHeads>(
-            physical_page, kv_head, page_offset, lane)] = v_scale;
+        if (lane == 0) {
+            scale_v[paged_kv_element_offset<4, Geometry::KVHeads>(
+                physical_page, kv_head, page_offset, grp)] = v_scale;
+        }
     }
 }
 
