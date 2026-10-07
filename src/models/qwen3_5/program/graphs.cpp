@@ -455,6 +455,27 @@ void ProgramImpl::prepare_graphs() {
                                      device);
         }
 
+        // Merged Forward+Finish graph family: one cudaGraphLaunch per round (the
+        // split families submit twice and the second WDDM submission stalls the
+        // GPU ~2.5 ms/round on sm_89).
+        {
+            auto& family              = speculative_round_graphs;
+            const auto& planned_profiles = forward_profiles;
+            family.profiles.reserve(planned_profiles.size() * max_concurrency);
+            for (std::uint32_t batch = 1; batch <= max_concurrency; ++batch) {
+                for (const auto planned : planned_profiles) {
+                    family.profiles.emplace_back();
+                    auto& profile                  = family.profiles.back();
+                    profile.batch_size             = batch;
+                    profile.min_execution_frontier = planned.min;
+                    profile.max_execution_frontier = planned.max;
+                    profile.topology_class = planned.topology_class * max_concurrency + batch - 1U;
+                    capture(SpeculativePhase::Round, profile);
+                }
+            }
+            instantiate_graph_family(family, "speculative round", device);
+        }
+
         // Warm complete transactions: finish consumes persistent outputs of its paired forward.
         for (auto& topology : speculative_forward_graphs.topologies) {
             auto& forward     = speculative_forward_graphs.profiles[*topology.installed_profile];

@@ -78,7 +78,13 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         qwen3_5::MtpDecodeState& frame = state.frame;
         const std::int32_t width       = static_cast<std::int32_t>(k) + 1;
         state.execution.work.reset();
-        if (phase == SpeculativePhase::Forward) {
+        // Round merges the Forward and Finish phases into one captured graph so the
+        // engine submits one cudaGraphLaunch per decode round instead of two (each
+        // extra WDDM submission costs ~2.5 ms of GPU idle time on sm_89). The H2D
+        // ingress copy is shared; a work.reset() between the phases preserves the
+        // per-phase workspace footprint the capture was sized for.
+        const bool round = phase == SpeculativePhase::Round;
+        if (phase == SpeculativePhase::Forward || round) {
             CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
                                        sizeof(qwen3_5::MtpDecodeIngress), cudaMemcpyHostToDevice,
                                        state.execution.device.stream));
@@ -149,6 +155,18 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                            static_cast<std::uint64_t>(width) * batch_size);
             target_verify_forward(state.execution, card, verify, envelopes.target_verify);
             return;
+        }
+        if (round) {
+            ops::speculative_prepare_verify_inputs(anchors, current_drafts, frontiers,
+                                                   current_extents, verify_ids, target_positions,
+                                                   state.execution.device.stream);
+            nvtx::ScopedRange target_range(nvtx::Name::DecodeMtpTarget, nvtx::Category::Mtp,
+                                           static_cast<std::uint64_t>(width) * batch_size);
+            target_verify_forward(state.execution, card, verify, envelopes.target_verify);
+            // Forward's workspace (partial splits, attention tiles) is dead now;
+            // reset so the Finish portion reuses the same arena footprint the
+            // split-phase capture was sized for.
+            state.execution.work.reset();
         }
         target_accept(state.execution, state.continuation_hidden_store, verify);
 

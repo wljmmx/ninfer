@@ -178,7 +178,7 @@ void ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
 
 // Executes one exact-B MTP verification/alignment/proposal transaction. Each row may carry a
 // different current and next proposal extent while the model traversal remains batched.
-enum class SpeculativePhase { Forward, Finish };
+enum class SpeculativePhase { Forward, Finish, Round };
 
 void capture_mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                               MtpCausalAttentionEnvelopes envelopes,

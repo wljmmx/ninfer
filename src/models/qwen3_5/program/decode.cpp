@@ -393,16 +393,13 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
         std::optional<nvtx::ScopedRange> submit_range;
         submit_range.emplace(nvtx::Name::DecodeMtpSubmit, nvtx::Category::Mtp,
                              static_cast<std::uint64_t>(lanes.size()));
-        DecodeGraphExecutable* forward = nullptr;
-        DecodeGraphExecutable* finish  = nullptr;
+        DecodeGraphExecutable* round  = nullptr;
         execution::MtpCausalAttentionEnvelopes envelopes =
             mtp_causal_attention_envelopes(maximum_frontier, draft_window, capacity);
         if (use_cuda_graph) {
             const auto batch = static_cast<std::uint32_t>(lanes.size());
-            auto& profile    = speculative_forward_graphs.select(batch, maximum_frontier);
-            forward          = &speculative_forward_graphs.install(profile);
-            finish           = &speculative_finish_graphs.install(
-                speculative_finish_graphs.select(batch, maximum_frontier));
+            auto& profile    = speculative_round_graphs.select(batch, maximum_frontier);
+            round            = &speculative_round_graphs.install(profile);
             envelopes = mtp_causal_attention_envelopes(profile.max_execution_frontier, draft_window,
                                                        capacity);
         }
@@ -458,15 +455,13 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
 
         mark_workspace_usage(workspace_plan.mtp_round);
         const auto batch = static_cast<std::int32_t>(lanes.size());
-        execution::mtp_decode_batch(schedule_state, batch, draft_window, envelopes, forward,
-                                    execution::SpeculativePhase::Forward);
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             const auto extent = static_cast<std::size_t>(mtp_host_ingress->current_extents[row]);
             (void)fill_grammar_mask(masks, row,
                                     {active_sequence(lanes[row]).mtp_drafts.data(), extent});
         }
-        execution::mtp_decode_batch(schedule_state, batch, draft_window, envelopes, finish,
-                                    execution::SpeculativePhase::Finish);
+        execution::mtp_decode_batch(schedule_state, batch, draft_window, envelopes, round,
+                                    execution::SpeculativePhase::Round);
         submit_range.reset();
         timing.begin_wait();
         {

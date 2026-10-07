@@ -490,6 +490,10 @@ public:
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily speculative_forward_graphs;
     DecodeGraphFamily speculative_finish_graphs;
+    // Merged Forward+Finish graph family: one cudaGraphLaunch per MTP round (the
+    // split families submit twice and the second WDDM submission stalls the GPU
+    // ~2.5 ms/round on sm_89). Preferred over the split families when present.
+    DecodeGraphFamily speculative_round_graphs;
 
     [[nodiscard]] std::uint32_t initial_mtp_extent(const RequestBasePlanImpl&) const;
     [[nodiscard]] UnitDemand prefill_unit(std::uint32_t prompt, std::uint32_t cursor,
