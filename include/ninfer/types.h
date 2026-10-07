@@ -37,13 +37,23 @@ enum class KvCacheStorage : std::uint8_t {
     // progressively lower bit widths:
     //   RK8V4      8-bit Hadamard K + 4-bit V     (~0.39 B/elem, 99.4% cosine)
     //   RK4V4      4-bit Hadamard K + 4-bit V     (~0.27 B/elem, 97.8% cosine)
-    //   RK4V4E8    4-bit E8-lattice K + 4-bit V   (~0.27 B/elem, 98.7% cosine)
+    //   RK4V4E8    4-bit E8-lattice K + 4-bit V  (~0.27 B/elem, 98.7% cosine)
     //   RK2V4E8    2-bit E8-cylinder K + 4-bit V  (~0.20 B/elem, 96.2% cosine)
     RotatedInt8KeyInt4ValueGroup64,
     RotatedInt4KeyInt4ValueGroup64,
     RK4V4E8,
     RK2V4E8,
 };
+
+// True when the V plane is int4-packed (the rk family). These layouts only
+// implement the fused grouped (width <= 8) and parallel-grouped
+// (width <= kGroupedPrefillMaxWidth = 256) attention paths; the tiled family
+// has no int4/E8 unpack, so prefill chunks must stay on the parallel path.
+[[nodiscard]] inline constexpr bool kv_cache_storage_packs_v4(KvCacheStorage storage) noexcept {
+    return storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
+           storage == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64 ||
+           storage == KvCacheStorage::RK4V4E8 || storage == KvCacheStorage::RK2V4E8;
+}
 
 enum class EnginePurpose : std::uint8_t {
     Generation,

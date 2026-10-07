@@ -909,11 +909,20 @@ std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
 make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContext& device,
                            const EngineOptions& options) {
     validate_target_options(parameters, device, options);
+    // PackedV (rk-family) KV layouts only implement the grouped (width <= 8)
+    // and parallel-grouped (width <= 256) attention paths — the tiled family
+    // has no int4/E8 V unpack. Clamp the prefill chunk so every chunk stays on
+    // the supported path instead of failing at request time with a 500.
+    std::uint32_t prefill_chunk = std::min(options.prefill_chunk, options.max_context);
+    if (kv_cache_storage_packs_v4(options.kv_cache)) {
+        constexpr std::uint32_t kPackedVPrefillChunkMax = 256;
+        prefill_chunk = std::min(prefill_chunk, kPackedVPrefillChunkMax);
+    }
     SequencePlanningInputs inputs{
         .parameters           = &parameters,
         .capacity             = options.max_context,
         .max_concurrency      = options.max_concurrency,
-        .prefill_chunk        = std::min(options.prefill_chunk, options.max_context),
+        .prefill_chunk        = prefill_chunk,
         .draft_window         = options.speculative.draft_tokens,
         .speculative_backend  = options.speculative.backend,
         .kv_storage           = options.kv_cache,

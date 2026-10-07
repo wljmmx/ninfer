@@ -460,7 +460,8 @@ void rk4v4_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v
         if (plan.family == Int8KvFamily::Tiled)
             throw std::invalid_argument(
                 "rk4v4 attention: tiled family does not yet support PackedV; "
-                "use --prefill-chunk 1024 to stay on the parallel path.");
+                "use --prefill-chunk 256 or smaller to stay on the parallel path "
+                "(the engine clamps rk-family prefill chunks automatically).");
         rk_execute_parallel<RkVariant::PackedKOnly>(p, view, plan, workspace, stream);
     }
 }
