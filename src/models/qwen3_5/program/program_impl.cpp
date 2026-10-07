@@ -22,6 +22,79 @@ namespace ninfer::models::qwen3_5::detail {
 
 static_assert(std::is_nothrow_move_assignable_v<SpeculativeStats>);
 
+namespace {
+
+// Keep the KV-cache payload resident in L2 across prefill chunks and decode
+// rounds. SM89 (RTX 4090, 72 MiB L2) supports per-stream access-policy
+// windows: the KV pages are re-read by every subsequent chunk's attention
+// while the 16 GiB weight stream would otherwise evict them between chunks.
+// A partial hitRatio protects only a fraction of the window so the weight
+// stream keeps the remainder of the L2 set-aside for normal traffic; the
+// window is a performance hint, never a correctness dependency.
+void configure_kv_l2_residency(DeviceContext& device, const DecoderState& decoder) {
+    const auto apply_pool = [&](const PagedKVCache& cache) {
+        const auto& pool = cache.page_pool();
+        const std::size_t planes = pool.plane_count();
+        if (planes == 0) { return; }
+        const void* base = pool.plane(0).data;
+        if (base == nullptr) { return; }
+        // The page pool is one contiguous layout region; sum the plane spans
+        // and stop early if any plane turns out non-contiguous.
+        std::size_t bytes = 0;
+        for (std::size_t i = 0; i < planes; ++i) {
+            const Tensor& plane = pool.plane(i);
+            if (plane.data == nullptr ||
+                (i > 0 && static_cast<const std::byte*>(plane.data) !=
+                              static_cast<const std::byte*>(pool.plane(i - 1).data) +
+                                  pool.plane(i - 1).bytes())) {
+                return;  // Unexpected layout; keep the default L2 policy.
+            }
+            bytes += plane.bytes();
+        }
+        if (bytes == 0) { return; }
+
+        int max_window    = 0;
+        int max_persisting = 0;
+        if (cudaDeviceGetAttribute(&max_window, cudaDevAttrMaxAccessPolicyWindowSize,
+                                  device.device) != cudaSuccess ||
+            cudaDeviceGetAttribute(&max_persisting, cudaDevAttrMaxPersistingL2CacheSize,
+                                  device.device) != cudaSuccess) {
+            return;  // Access-policy windows unsupported; keep the default.
+        }
+        if (max_window <= 0) { return; }
+
+        bytes = std::min(bytes, static_cast<std::size_t>(max_window));
+
+        // Reserve an L2 set-aside sized to the window (bounded by the
+        // device's persisting maximum) so the policy has space to hold.
+        if (max_persisting > 0) {
+            const std::size_t set_aside =
+                std::min(bytes, static_cast<std::size_t>(max_persisting));
+            (void)cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, set_aside);
+        }
+
+        // hitRatio 0.5: the KV pool is written and read in page order, so
+        // protecting half of it statistically keeps the live pages hot
+        // without thrashing the streaming weight traffic out of L2.
+        cudaStreamAttrValue window{};
+        window.accessPolicyWindow.base_ptr  = const_cast<void*>(base);
+        window.accessPolicyWindow.num_bytes = bytes;
+        window.accessPolicyWindow.hitRatio = 0.5f;
+        window.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+        window.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+        (void)cudaStreamSetAttribute(device.stream, cudaStreamAttributeAccessPolicyWindow,
+                                    &window);
+        if (device.transfer_stream != nullptr && device.transfer_stream != device.stream) {
+            (void)cudaStreamSetAttribute(device.transfer_stream,
+                                         cudaStreamAttributeAccessPolicyWindow, &window);
+        }
+    };
+    apply_pool(decoder.text_kv);
+    if (const auto* backend = decoder.mtp_cache()) { apply_pool(*backend); }
+}
+
+} // namespace
+
 ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const SequencePlanImpl& plan,
                          DeviceContext& device_in, const StartupObserver& startup_observer)
     : parameters(parameters_in), device(device_in), capacity(plan.capacity),
@@ -73,6 +146,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
     decoder      = std::make_unique<qwen3_5::DecoderState>(backing, plan.persistent.decoder);
     state_images = std::make_unique<StateImageDevicePool>(backing, plan.persistent.state_images);
+    configure_kv_l2_residency(device_in, *decoder);
     if (plan.persistent.replay_records) {
         replay_records.emplace(backing, *plan.persistent.replay_records);
         replay_fold.emplace(*replay_records, state_images->linear().all_layers_view());
