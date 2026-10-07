@@ -21,7 +21,8 @@ void kv_cache_append_k8v4_batch_launch(const Tensor& k, const Tensor& v, const T
                                         const Tensor& valid_columns, const Tensor& table_rows,
                                         PagedKVBatchLayerView cache, cudaStream_t stream);
 
-// rk PackedV append: int8 K + int4 V (rk8v4) or int4 K + int4 V (rk4v4/rk4v4-e8).
+// rk PackedV append: int8 K + int4 V (rk8v4), int4 K + int4 V (rk4v4), int4 K with
+// E8 lattice projection (rk4v4-e8) or 2-bit E8 cylinder K (rk2v4-e8).
 void kv_cache_append_rk8v4_batch_launch(const Tensor& k, const Tensor& v,
                                          const Tensor& positions, const Tensor& valid_columns,
                                          const Tensor& table_rows, PagedKVBatchLayerView cache,
@@ -32,8 +33,27 @@ void kv_cache_append_rk4v4_batch_launch(const Tensor& k, const Tensor& v,
                                          const Tensor& table_rows, PagedKVBatchLayerView cache,
                                          cudaStream_t stream);
 
+void kv_cache_append_rk4v4e8_batch_launch(const Tensor& k, const Tensor& v,
+                                           const Tensor& positions, const Tensor& valid_columns,
+                                           const Tensor& table_rows, PagedKVBatchLayerView cache,
+                                           cudaStream_t stream);
+
+void kv_cache_append_rk2v4e8_batch_launch(const Tensor& k, const Tensor& v,
+                                           const Tensor& positions, const Tensor& valid_columns,
+                                           const Tensor& table_rows, PagedKVBatchLayerView cache,
+                                           cudaStream_t stream);
+
 void kv_cache_append_rk8v4_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                                   PagedKVLayerView cache, cudaStream_t stream);
+
+void kv_cache_append_rk4v4_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
+                                  PagedKVLayerView cache, cudaStream_t stream);
+
+void kv_cache_append_rk4v4e8_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
+                                    PagedKVLayerView cache, cudaStream_t stream);
+
+void kv_cache_append_rk2v4e8_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
+                                    PagedKVLayerView cache, cudaStream_t stream);
 
 void kv_cache_append_batch_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                                   const Tensor& valid_columns, const Tensor& table_rows,

@@ -211,18 +211,28 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             // 8D Hadamard-rotated vector is projected to the nearest E8 lattice point
             // before clamping to [-7, 7] and packing.
             if constexpr (E8Root) {
-                // rk2v4-e8 K append: encode 8D Hadamard-rotated subspace into root + rad_axis.
-                __half k_scale_h = k_quant.scale;
-                uint8_t root_code, rad_axis_code;
-                e8_encode_cylinder_8d_warp(kv0, __half2float(k_scale_h), root_code,
-                                           rad_axis_code, lane);
+                // rk2v4-e8 K append: encode BOTH 32-dim halves of this G64 group.
+                // Scale convention follows the reference cylinder codec (radius
+                // table centered on absmax/7, NOT absmax/127 — a /127 scale saturates
+                // rad_idx at 15 and collapses K magnitudes ~8x). Each 8-lane
+                // subgroup encodes one 8D subspace: kv0 covers subspaces 0-3,
+                // kv1 covers subspaces 4-7 of this group.
+                __half k_scale_h = rk4_absmax_to_scale_h(kamax);
+                const float ks   = __half2float(k_scale_h);
+                uint8_t root0, rad0, root1, rad1;
+                e8_encode_cylinder_8d_warp(kv0, ks, root0, rad0, lane);
+                e8_encode_cylinder_8d_warp(kv1, ks, root1, rad1, lane);
                 if ((lane & 7) == 0) {
-                    const int sub = lane >> 3;
-                    const int byte_offset = (grp * 8 + sub) * 2;
-                    const std::int64_t ko = paged_kv_element_offset<64, Geometry::KVHeads>(
-                        physical_page, kv_head, page_offset, byte_offset);
-                    cache_k_i8[ko]     = static_cast<std::int8_t>(root_code);
-                    cache_k_i8[ko + 1] = static_cast<std::int8_t>(rad_axis_code);
+                    const int s0 = lane >> 3;
+                    const int s1 = 4 + (lane >> 3);
+                    const std::int64_t ko0 = paged_kv_element_offset<64, Geometry::KVHeads>(
+                        physical_page, kv_head, page_offset, (grp * 8 + s0) * 2);
+                    cache_k_i8[ko0]     = static_cast<std::int8_t>(root0);
+                    cache_k_i8[ko0 + 1] = static_cast<std::int8_t>(rad0);
+                    const std::int64_t ko1 = paged_kv_element_offset<64, Geometry::KVHeads>(
+                        physical_page, kv_head, page_offset, (grp * 8 + s1) * 2);
+                    cache_k_i8[ko1]     = static_cast<std::int8_t>(root1);
+                    cache_k_i8[ko1 + 1] = static_cast<std::int8_t>(rad1);
                 }
                 if (lane == 0) {
                     const std::int64_t so = kv_cache_int8_quant_scale_index<Geometry>(
@@ -231,16 +241,22 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                     cache_v_scale[so] = v_scale;
                 }
             } else if constexpr (PackedK) {
-                if constexpr (E8Lattice) {
-                    // E8 projection: warp-cooperative across 8 lanes per 8D subspace.
-                    float k0_mut = kv0, k1_mut = kv1;
-                    e8_project_8d_warp(k0_mut, k1_mut, lane);
-                    kv0 = k0_mut; kv1 = k1_mut;
-                }
                 // int4 K: scale = absmax/7, clamp [-7, 7], pack two adjacent dims/byte.
                 __half k_scale_h = rk4_absmax_to_scale_h(kamax);
                 float k_inv = __half2float(k_scale_h);
                 k_inv = k_inv > 0.0f ? 1.0f / k_inv : 0.0f;
+                if constexpr (E8Lattice) {
+                    // E8 projection in the SCALED space (units of k_scale),
+                    // matching the reference codec: project the scaled 8D subspace
+                    // to the nearest E8 lattice point, then round back onto the
+                    // int4 grid below (the half-integral D8+0.5 coset collapses in
+                    // that round — documented approximation of the reference).
+                    float k0_mut = kv0 * k_inv, k1_mut = kv1 * k_inv;
+                    e8_project_8d_warp(k0_mut, k1_mut, lane);
+                    kv0 = k0_mut;
+                    kv1 = k1_mut;
+                    k_inv = 1.0f;
+                }
                 const float kv0_next = __shfl_xor_sync(FullMask, kv0, 1);
                 const float kv1_next = __shfl_xor_sync(FullMask, kv1, 1);
                 if ((lane & 1) == 0) {
@@ -402,43 +418,51 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 const std::int64_t off = kv_cache_int8_quant_code_index<Geometry>(
                     physical_page, kv_head, d, key & kPagedKVPageMask);
                 if constexpr (E8Root) {
-                    // rk2v4-e8 K read-back: decode 2 bytes per 8-lane subgroup into 8 int8.
+                    // rk2v4-e8 K read-back: this 16-dim chunk spans two consecutive
+                    // 8D subspaces — 4 cache bytes (root+rad_axis each) starting at
+                    // byte offset d/4 of the 64-byte per-token K plane. One thread
+                    // decodes both subspaces and writes ALL 16 int8 codes into the
+                    // swizzled smem slot (dst) that the ldmatrix B-fragment reads —
+                    // the same slot the int8 cp_async path fills, so the write must
+                    // not bypass the swizzle and must cover the full chunk.
                     const int grp_for_read = d / 64;
-                    const int sub = (d / 8) & 7;
-                    const int byte_offset = (grp_for_read * 8 + sub) * 2;
+                    const int sub          = (d / 8) & 7;
+                    const int byte_offset  = (grp_for_read * 8 + sub) * 2;
                     const std::int64_t koff = paged_kv_element_offset<64, Geometry::KVHeads>(
                         physical_page, kv_head, key & kPagedKVPageMask, byte_offset);
-                    const uint8_t root_code = static_cast<uint8_t>(cache_k_i8[koff]);
-                    const uint8_t rad_axis = static_cast<uint8_t>(cache_k_i8[koff + 1]);
-                    int8_t decoded[8];
-                    e8_root_decode_8d_fast(root_code, rad_axis, decoded);
-                    const int sub_lane = lane & 7;
-                    k_i8[key_l * D + d + sub_lane] = decoded[sub_lane];
-                    // Second 8-dim block in this 16-dim chunk.
-                    const int sub2 = ((d + 8) / 8) & 7;
-                    const int byte_offset2 = (grp_for_read * 8 + sub2) * 2;
-                    const std::int64_t koff2 = paged_kv_element_offset<64, Geometry::KVHeads>(
-                        physical_page, kv_head, key & kPagedKVPageMask, byte_offset2);
-                    const uint8_t root2 = static_cast<uint8_t>(cache_k_i8[koff2]);
-                    const uint8_t rad2  = static_cast<uint8_t>(cache_k_i8[koff2 + 1]);
-                    int8_t decoded2[8];
-                    e8_root_decode_8d_fast(root2, rad2, decoded2);
-                    k_i8[key_l * D + d + 8 + sub_lane] = decoded2[sub_lane];
+                    const uint8_t root0 = static_cast<uint8_t>(cache_k_i8[koff]);
+                    const uint8_t rad0  = static_cast<uint8_t>(cache_k_i8[koff + 1]);
+                    const uint8_t root1 = static_cast<uint8_t>(cache_k_i8[koff + 2]);
+                    const uint8_t rad1  = static_cast<uint8_t>(cache_k_i8[koff + 3]);
+                    __align__(8) int8_t dec0[8];
+                    __align__(8) int8_t dec1[8];
+                    e8_root_decode_8d_fast(root0, rad0, dec0);
+                    e8_root_decode_8d_fast(root1, rad1, dec1);
+                    *reinterpret_cast<uint64_t*>(dst) =
+                        *reinterpret_cast<const uint64_t*>(dec0);
+                    *reinterpret_cast<uint64_t*>(dst + 8) =
+                        *reinterpret_cast<const uint64_t*>(dec1);
                 } else if constexpr (PackedK) {
-                    // rk K: 4-bit codes, half extent. Synchronous load + unpack to int8
-                    // (ldmatrix expects int8; cp_async would require a separate unpack
-                    //  step between cp_wait and ldmatrix — TODO for performance).
+                    // rk K read-back: vectorized 4-byte loads + fast nibble unpack
+                    // (the same rk4_unpack_lo/hi_fast path as the V loader) straight
+                    // into the swizzled smem slot (dst) the ldmatrix B-fragment
+                    // reads — the int8 cp_async path fills the same 16-byte chunk,
+                    // so the unpack must not bypass the swizzle.
                     const std::int64_t koff = rk4_v_code_index<Geometry>(
                         physical_page, kv_head, d >> 1, key & kPagedKVPageMask);
-                    const int2 packed_k = load_vec<int2>(&cache_k_i8[koff]);
-                    const std::uint8_t* kbytes =
-                        reinterpret_cast<const std::uint8_t*>(&packed_k);
 #pragma unroll
-                    for (int byte = 0; byte < 8; ++byte) {
-                        k_i8[key_l * D + d + 2 * byte] =
-                            static_cast<std::int8_t>(rk4_unpack(kbytes[byte], 0));
-                        k_i8[key_l * D + d + 2 * byte + 1] =
-                            static_cast<std::int8_t>(rk4_unpack(kbytes[byte], 1));
+                    for (int half4 = 0; half4 < 2; ++half4) {
+                        const std::uint32_t raw = *reinterpret_cast<const std::uint32_t*>(
+                            &cache_k_i8[koff + 4 * half4]);
+                        const std::uint32_t lo = rk4_unpack_lo_fast(raw);
+                        const std::uint32_t hi = rk4_unpack_hi_fast(raw);
+                        const auto* lo8 = reinterpret_cast<const std::int8_t*>(&lo);
+                        const auto* hi8 = reinterpret_cast<const std::int8_t*>(&hi);
+#pragma unroll
+                        for (int b = 0; b < 4; ++b) {
+                            dst[8 * half4 + 2 * b]     = lo8[b];
+                            dst[8 * half4 + 2 * b + 1] = hi8[b];
+                        }
                     }
                 } else {
                     ninfer::ops::cp_async<16>(dst, &cache_k_i8[off]);

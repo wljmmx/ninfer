@@ -3,11 +3,14 @@
 // PackedV append kernel for rank-compressed KV layouts (rk8v4, rk4v4, rk4v4-e8, rk2v4-e8).
 // K and V both receive the fixed FP32 D256 Hadamard rotation. V is quantized to int4
 // (symmetric [-7,7], absmax/7 FP16 scale) and packed two adjacent dims per byte at
-// stride 128 (head_dim/2). K is either int8 (rk8v4) or int4 (rk4v4/rk4v4-e8).
+// stride 128 (head_dim/2). K is int8 (rk8v4), int4 RTN (rk4v4), int4 with E8 lattice
+// projection (rk4v4-e8), or the 2-bit E8 cylinder (rk2v4-e8, stride 64).
 
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
+#include "ops/kernel/e8_lattice.cuh"
+#include "ops/kernel/e8_root_codec.cuh"
 #include "ops/kv_cache/append/geometry.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
 #include "ops/kv_cache/int8_g64_codec.cuh"
@@ -21,7 +24,7 @@
 
 namespace ninfer::ops {
 
-template <typename Geometry, bool PackedK = false>
+template <typename Geometry, bool PackedK = false, bool E8Lattice = false, bool E8Root = false>
 __device__ __forceinline__ void kv_cache_append_rk_row(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     std::int8_t* __restrict__ cache_k, std::int8_t* __restrict__ cache_v,
@@ -47,29 +50,67 @@ __device__ __forceinline__ void kv_cache_append_rk_row(
     for (float val : k_vals) k_absmax = fmaxf(k_absmax, fabsf(val));
     k_absmax = warp_max(k_absmax, FullMask);
 
-    if constexpr (PackedK) {
+    if constexpr (E8Root) {
+        // rk2v4-e8 K: 2-bit E8 cylinder codes, one (root, rad_axis) byte pair per
+        // 8D subspace — 16 bytes per G64 group, 64 bytes per token (stride 64).
+        // Scale convention follows the reference cylinder codec: FP16-RNE(group
+        // absmax / 7). Per-group absmax (like the fused append) keeps the radius
+        // index centred in the log-radius table. k_vals[2g] holds dims g*64+lane
+        // and k_vals[2g+1] dims g*64+32+lane, so the 8-lane subgroup (lane>>3)
+        // carries one consecutive 8-dim subspace: sub = half*4 + (lane>>3).
+        for (int grp = 0; grp < Groups; ++grp) {
+            float g_abs = fmaxf(fabsf(k_vals[2 * grp]), fabsf(k_vals[2 * grp + 1]));
+            g_abs       = warp_max(g_abs, FullMask);
+            const __half k_scale = rk4_absmax_to_scale_h(g_abs);
+            const float ks       = __half2float(k_scale);
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                const float val = k_vals[2 * grp + half];
+                uint8_t root_code, rad_axis;
+                e8_encode_cylinder_8d_warp(val, ks, root_code, rad_axis, lane);
+                if ((lane & 7) == 0) {
+                    const int sub = half * 4 + (lane >> 3);
+                    const std::int64_t off = paged_kv_element_offset<64, Geometry::KVHeads>(
+                        physical_page, kv_head, page_offset, (grp * 8 + sub) * 2);
+                    cache_k[off]     = static_cast<std::int8_t>(root_code);
+                    cache_k[off + 1] = static_cast<std::int8_t>(rad_axis);
+                }
+            }
+            if (lane == 0) {
+                scale_k[paged_kv_element_offset<4, Geometry::KVHeads>(
+                    physical_page, kv_head, page_offset, grp)] = k_scale;
+            }
+        }
+    } else if constexpr (PackedK) {
         // int4 K: absmax/7 scale, pack two adjacent dims per byte at stride 128.
+        // k_vals[r] holds dim lane + 32*r, so group g's two halves live in
+        // k_vals[2g] and k_vals[2g+1]; byte index must include the group offset.
         __half k_scale = rk4_absmax_to_scale_h(k_absmax);
         float k_inv = __half2float(k_scale);
         k_inv = k_inv > 0.0f ? 1.0f / k_inv : 0.0f;
-        // Use shuffle to get adjacent lane's value for packing.
-        // After Hadamard, lane k holds dims [k, k+32, k+64, k+96, k+128, k+160, k+192, k+224].
-        // For int4 packing we need adjacent dims (0,1), (2,3), ... per byte.
-        // Lane 2k holds dim 2k, lane 2k+1 holds dim 2k+1 → shuffle to pack.
-        // Each "half" (0-31, 32-63) within each group is packed by even lanes.
+        if constexpr (E8Lattice) {
+            // E8 projection in the SCALED space (units of k_scale), matching the
+            // reference rk4v4-e8 codec; the half-integral coset collapses in the
+            // int4 round below.
+#pragma unroll
+            for (int grp = 0; grp < Groups; ++grp) {
+                float v0 = k_vals[2 * grp] * k_inv;
+                float v1 = k_vals[2 * grp + 1] * k_inv;
+                e8_project_8d_warp(v0, v1, lane);
+                k_vals[2 * grp]     = v0;
+                k_vals[2 * grp + 1] = v1;
+            }
+            k_inv = 1.0f;
+        }
         for (int grp = 0; grp < Groups; ++grp) {
-            const int base = grp * 64;
             for (int half = 0; half < 2; ++half) {
                 const int dim_in_half = lane;  // 0..31
-                const int abs_dim = base + half * 32 + dim_in_half;
-                // The Hadamard value for this dim is in k_vals[half] (since
-                // d = lane + 32*half, so k_vals[half] corresponds to dim abs_dim).
-                float val = k_vals[half];
+                float val = k_vals[2 * grp + half];
                 float neighbor = __shfl_xor_sync(FullMask, val, 1);
                 if ((dim_in_half & 1) == 0) {
                     auto c0 = rk4_quant_code(val, k_inv);
                     auto c1 = rk4_quant_code(neighbor, k_inv);
-                    const int byte_idx = (half * 32 + dim_in_half) >> 1;
+                    const int byte_idx = (grp * 64 + half * 32 + dim_in_half) >> 1;
                     const std::int64_t off = paged_kv_element_offset<128, Geometry::KVHeads>(
                         physical_page, kv_head, page_offset, byte_idx);
                     cache_k[off] = static_cast<std::int8_t>(rk4_pack(c0, c1));
@@ -103,7 +144,11 @@ __device__ __forceinline__ void kv_cache_append_rk_row(
         }
     }
 
-    // --- V plane (int4 packed, shared by all rk variants) ---
+    // --- V plane (int4, shared by all rk variants) ---
+    // NOTE: V is stored in the ORIGINAL (unrotated) coordinate frame, matching the
+    // fused append path and the int8-family merge (InverseRotation=false): the PV
+    // MMA output goes straight to the residual stream, so the cache V must be raw.
+    // Rotating V here corrupted every prefill-appended token (rk8v4 "2020" garbage).
     float v_vals[8];
     float v_absmax = 0.0F;
 #pragma unroll
@@ -113,7 +158,6 @@ __device__ __forceinline__ void kv_cache_append_rk_row(
             static_cast<std::int64_t>(D) * (static_cast<std::int64_t>(kv_head) +
             static_cast<std::int64_t>(Geometry::KVHeads) * token)]);
     }
-    normalized_hadamard_d256_inplace(v_vals, lane);
 #pragma unroll
     for (float val : v_vals) v_absmax = fmaxf(v_absmax, fabsf(val));
     v_absmax = warp_max(v_absmax, FullMask);
@@ -122,11 +166,13 @@ __device__ __forceinline__ void kv_cache_append_rk_row(
     float v_inv = __half2float(v_scale);
     v_inv = v_inv > 0.0f ? 1.0f / v_inv : 0.0f;
 
-    // Pack int4 V: two adjacent dims per byte at stride 128.
+    // Pack int4 V: two adjacent dims per byte at stride 128. v_vals[r] holds dim
+    // lane + 32*r, so group g's halves live in v_vals[2g] / v_vals[2g+1] and the
+    // byte index must include the group offset.
     for (int grp = 0; grp < Groups; ++grp) {
         for (int half = 0; half < 2; ++half) {
             const int dim_in_half = lane;
-            float val = v_vals[half];
+            float val = v_vals[2 * grp + half];
             float neighbor = __shfl_xor_sync(FullMask, val, 1);
             if ((dim_in_half & 1) == 0) {
                 auto c0 = rk4_quant_code(val, v_inv);
@@ -144,7 +190,8 @@ __device__ __forceinline__ void kv_cache_append_rk_row(
     }
 }
 
-template <typename Geometry, typename Metadata, bool PackedK = false, bool MultiBatch = false>
+template <typename Geometry, typename Metadata, bool PackedK = false, bool E8Lattice = false,
+          bool E8Root = false, bool MultiBatch = false>
 __launch_bounds__(256) __global__
     void kv_cache_append_full_rk_kernel(const __nv_bfloat16* __restrict__ k,
                                          const __nv_bfloat16* __restrict__ v,
@@ -175,7 +222,7 @@ __launch_bounds__(256) __global__
         const int physical_page = block_table[pos >> 6];
         const int page_offset   = pos & 63;
 
-        kv_cache_append_rk_row<Geometry, PackedK>(
+        kv_cache_append_rk_row<Geometry, PackedK, E8Lattice, E8Root>(
             k + (MultiBatch ? static_cast<std::int64_t>(batch) * Geometry::KVHeads * 256 * tokens : 0),
             v + (MultiBatch ? static_cast<std::int64_t>(batch) * Geometry::KVHeads * 256 * tokens : 0),
             cache_k, cache_v, scale_k, scale_v,

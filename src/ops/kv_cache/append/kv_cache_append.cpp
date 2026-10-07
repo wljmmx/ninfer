@@ -220,11 +220,18 @@ void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
             detail::kv_cache_append_rk8v4_launch(k, v, positions, cache, stream);
             return;
         case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
+            detail::kv_cache_append_rk4v4_launch(k, v, positions, cache, stream);
+            return;
         case KvCacheStorage::RK4V4E8:
+            // int4 K with E8 lattice projection + int4 V.
+            detail::kv_cache_append_rk4v4e8_launch(k, v, positions, cache, stream);
+            return;
         case KvCacheStorage::RK2V4E8:
-            throw std::invalid_argument(
-                "kv_cache_append: rk4v4/rk4v4-e8/rk2v4-e8 single-token append not yet "
-                "available; use rk8v4 or int8.");
+            // 2-bit E8 cylinder K + int4 V — must use the cylinder codec: the
+            // attention read-back decodes (root, rad_axis) byte pairs, so an
+            // int4 RTN append would corrupt every cached key.
+            detail::kv_cache_append_rk2v4e8_launch(k, v, positions, cache, stream);
+            return;
         default:
             detail::kv_cache_append_launch(k, v, positions, cache, stream);
         }

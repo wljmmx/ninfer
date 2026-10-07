@@ -56,6 +56,37 @@ void rk_grouped(const CausalAttentionOperands& p, Int8KvCacheView<Writable> cach
     }
 }
 
+// rk4v4: PackedV=true + PackedK=true (plain int4 RTN K + int4 V).
+// The grouped/fused path (width <= 8: decode rounds, small prefills) must read
+// AND append K with the SAME int4-packed codec the standalone batch append
+// writes — routing it to the int8-K kernel (PackedK=false) made every decode
+// round read int4 nibbles as int8 codes and corrupted the whole context.
+template <class G, int Tokens, class Input, bool Writable>
+void rk_packedk_grouped(const CausalAttentionOperands& p, Int8KvCacheView<Writable> cache,
+                        Input input, CausalKvPartition partition, CausalPartialView partial,
+                        cudaStream_t stream) {
+    using Instance    = Int8KvGroupedInstance<G, Tokens>;
+    const auto invoke = [&]<bool MultiBatch, bool Masked>() {
+        launch_int8_kv_grouped_mma<G, typename Instance::Schedule, MultiBatch, Masked, Writable,
+                                   Input, false, true, true, false, false>(p, cache, input,
+                                                                          partition, partial,
+                                                                          stream);
+        launch_causal_natural_merge<G, typename Instance::Merge, MultiBatch, Masked, false>(
+            p, cache.valid_columns, partition, partial, stream);
+    };
+    if (p.batch == 1) {
+        if (cache.valid_columns)
+            invoke.template operator()<false, true>();
+        else
+            invoke.template operator()<false, false>();
+    } else {
+        if (cache.valid_columns)
+            invoke.template operator()<true, true>();
+        else
+            invoke.template operator()<true, false>();
+    }
+}
+
 // rk4v4-e8: PackedV=true + PackedK=true + E8Lattice=true
 template <class G, int Tokens, class Input, bool Writable>
 void rk_e8_grouped(const CausalAttentionOperands& p, Int8KvCacheView<Writable> cache, Input input,
@@ -147,6 +178,27 @@ void rk_grouped_instance(const CausalAttentionOperands& p, Int8KvCacheView<Writa
 #undef NINFER_RK_GROUPED
     }
     throw std::logic_error("rk grouped plan exceeds the selected token tile");
+}
+
+template <class G, class Input, bool Writable>
+void rk_packedk_grouped_instance(const CausalAttentionOperands& p, Int8KvCacheView<Writable> cache,
+                                 Input input, CausalKvPartition partition, CausalPartialView partial,
+                                 cudaStream_t stream) {
+    switch (p.width) {
+#define NINFER_RK_PK_GROUPED(T)                                                                    \
+    case T:                                                                                        \
+        return rk_packedk_grouped<G, T>(p, cache, input, partition, partial, stream)
+        NINFER_RK_PK_GROUPED(1);
+        NINFER_RK_PK_GROUPED(2);
+        NINFER_RK_PK_GROUPED(3);
+        NINFER_RK_PK_GROUPED(4);
+        NINFER_RK_PK_GROUPED(5);
+        NINFER_RK_PK_GROUPED(6);
+        NINFER_RK_PK_GROUPED(7);
+        NINFER_RK_PK_GROUPED(8);
+#undef NINFER_RK_PK_GROUPED
+    }
+    throw std::logic_error("rk4v4 grouped plan exceeds the selected token tile");
 }
 
 template <class G, class Input, bool Writable>
@@ -374,7 +426,7 @@ void rk_execute_grouped(const Tensor& q, const Tensor& positions, float scale,
         else if constexpr (Variant == RkVariant::E8Lattice)
             rk_e8_grouped_instance<G>(p, view, input, plan.partition, partial.view(), stream);
         else if constexpr (Variant == RkVariant::PackedKOnly)
-            rk_grouped_instance<G>(p, view, input, plan.partition, partial.view(), stream);
+            rk_packedk_grouped_instance<G>(p, view, input, plan.partition, partial.view(), stream);
         else // Plain (rk8v4: int8 K + int4 V, PackedV=true only)
             rk_grouped_instance<G>(p, view, input, plan.partition, partial.view(), stream);
     };
@@ -493,7 +545,9 @@ void rk4v4e8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor&
                               static_cast<const __nv_bfloat16*>(v.data)},
             plan, workspace, out, stream);
     } else {
-        kv_cache_append_rk4v4_batch_launch(k, v, positions, valid, rows, cache, stream);
+        // Standalone rk4v4-e8 append (int4 K with E8 lattice projection + int4 V),
+        // then rk parallel attention — the batch codec must match the fused path.
+        kv_cache_append_rk4v4e8_batch_launch(k, v, positions, valid, rows, cache, stream);
         const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
         const auto view =
             make_quantized_causal_cache_view<Int8KvCacheView<false>>(cache, &valid, &rows);
@@ -534,10 +588,11 @@ void rk2v4e8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor&
                               static_cast<const __nv_bfloat16*>(v.data)},
             plan, workspace, out, stream);
     } else {
-        // TODO(rk-port): rk2v4-e8 needs E8 cylinder K append kernel for width > 8.
-        // For now, use rk4v4 append (int4 K) as a fallback — the E8 cylinder
-        // quality benefit is only at append time; the read-back is identical.
-        kv_cache_append_rk4v4_batch_launch(k, v, positions, valid, rows, cache, stream);
+        // rk2v4-e8 prefill (width > 8): standalone append with the SAME E8
+        // cylinder codec the attention read-back decodes — an int4 RTN append
+        // would put nibbles where the reader expects (root, rad_axis) pairs and
+        // corrupt every cached key.
+        kv_cache_append_rk2v4e8_batch_launch(k, v, positions, valid, rows, cache, stream);
         const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
         const auto view =
             make_quantized_causal_cache_view<Int8KvCacheView<false>>(cache, &valid, &rows);
