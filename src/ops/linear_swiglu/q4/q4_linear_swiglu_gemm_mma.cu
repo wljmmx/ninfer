@@ -17,6 +17,7 @@ namespace {
 // before it is evicted. The previous 64x16 warp tile with row-major order was
 // tuned on RTX 5090 and ran the FFN ~11% slower per launch on sm_89.
 using GateUpC40Cfg  = GemmCfg<64, 40, 64, 64, 8, 2, 1, false, true, true>;
+using GateUpC48Cfg  = GemmCfg<64, 48, 64, 64, 8, 2, 1, false, true, true>;
 using GateUpC128Cfg = GemmCfg<64, 128, 64, 32, 32, 2, 1, false, true, true>;
 template <class Cfg, bool Full>
 void launch_folded(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
@@ -59,11 +60,21 @@ void launch_route(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
 } // namespace
 
 void q4_linear_swiglu_mma_split_half_pair_r32_c128_launch(const Tensor& x, const Weight& weight,
-                                                          Tensor& out, cudaStream_t stream) {
+                                                           Tensor& out, cudaStream_t stream) {
     // Counterfactual experiment: env var selects the half-width BN=64 Cfg
     // (3 blocks/SM = 24 warps) instead of the production BN=128 (2 blocks = 16).
     // Same kernel body, same prefill task; only the block tile changes.
     launch_route<GateUpC128Cfg>(x, weight, out, stream);
+}
+
+void q4_linear_swiglu_mma_split_half_pair_r32_c40_launch(const Tensor& x, const Weight& weight,
+                                                          Tensor& out, cudaStream_t stream) {
+    launch_route<GateUpC40Cfg>(x, weight, out, stream);
+}
+
+void q4_linear_swiglu_mma_split_half_pair_r32_c48_launch(const Tensor& x, const Weight& weight,
+                                                          Tensor& out, cudaStream_t stream) {
+    launch_route<GateUpC48Cfg>(x, weight, out, stream);
 }
 
 void q4_linear_swiglu_mma_split_half_pair_r32_c128_tail_launch(const Tensor& x,

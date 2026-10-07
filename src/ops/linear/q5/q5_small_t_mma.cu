@@ -1,4 +1,4 @@
-#include "ops/linear/q5/q5_launch.h"
+﻿#include "ops/linear/q5/q5_launch.h"
 
 #include "core/device.h"
 #include "ops/linear/q5/q5_small_t_mma.cuh"
@@ -77,6 +77,35 @@ void launch_residual_exact(const Tensor& x, const Weight& weight, Tensor& out,
     CUDA_CHECK(cudaGetLastError());
 }
 
+// Deterministic residual: KSplits=1 (one block per output location) with the
+// non-atomic Q5SmallTMmaResidualEpilogue (__hadd read-modify-write). The atomic
+// version (KSplits=2) is faster but its bf16x2 atomicAdd ordering varies run to
+// run, making spec acc non-deterministic. KSplits=1 trades K-dimension
+// parallelism for determinism — each block processes all groups, so the
+// residual add is a single-writer __hadd.
+template <class Geometry, int TileTokens, int ActiveTokens>
+void launch_residual_deterministic(const Tensor& x, const Weight& weight, Tensor& out,
+                                    cudaStream_t stream) {
+    using Schedule = Q5SmallTSchedule;
+    constexpr int kBlocks =
+        (Geometry::kOutputRows + Schedule::kRowsPerCta - 1) / Schedule::kRowsPerCta;
+    const auto in_ld  = static_cast<std::int32_t>(x.nb[1] / sizeof(__nv_bfloat16));
+    const auto out_ld = static_cast<std::int32_t>(out.nb[1] / sizeof(__nv_bfloat16));
+    constexpr int kSplits = 1;
+    const dim3 grid(static_cast<unsigned>(kBlocks), 1u, 1u);
+    const Q5SmallTMmaResidualEpilogue epilogue{};
+
+    q5_small_t_mma_kernel<Geometry, TileTokens, ActiveTokens, Q5SmallTMmaResidualEpilogue,
+                          Q5SmallTMmaIdentityRows, kSplits>
+        <<<grid, Schedule::kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.qhigh),
+            static_cast<const std::uint8_t*>(weight.scales),
+            static_cast<__nv_bfloat16*>(out.data), in_ld, out_ld, epilogue);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 template <class Geometry, std::size_t... Offsets>
 constexpr auto make_residual_launchers(std::index_sequence<Offsets...>) {
     return std::array<Q5Launch, sizeof...(Offsets)>{
@@ -89,6 +118,20 @@ constexpr auto kResidualLaunchers5120x6144 =
     make_residual_launchers<Geom5120x6144>(std::make_index_sequence<16>{});
 constexpr auto kResidualLaunchers5120x17408 =
     make_residual_launchers<Geom5120x17408>(std::make_index_sequence<16>{});
+
+// Deterministic residual launchers (KSplits=1, non-atomic __hadd epilogue).
+template <class Geometry, std::size_t... Offsets>
+constexpr auto make_residual_deterministic_launchers(std::index_sequence<Offsets...>) {
+    return std::array<Q5Launch, sizeof...(Offsets)>{
+        &launch_residual_deterministic<Geometry,
+                               ((1 + static_cast<int>(Offsets)) <= 8 ? 8 : 16),
+                               1 + static_cast<int>(Offsets)>...};
+}
+
+constexpr auto kResidualDeterministic5120x6144 =
+    make_residual_deterministic_launchers<Geom5120x6144>(std::make_index_sequence<16>{});
+constexpr auto kResidualDeterministic5120x17408 =
+    make_residual_deterministic_launchers<Geom5120x17408>(std::make_index_sequence<16>{});
 
 } // namespace
 
@@ -144,6 +187,27 @@ void launch_q5_linear_add_small_t_mma(const Tensor& x, const Weight& weight, Ten
     }
 
     throw std::invalid_argument("q5 small-t mma linear_add: unsupported shape");
+}
+
+void launch_q5_linear_add_small_t_mma_deterministic(const Tensor& x, const Weight& weight,
+                                                     Tensor& residual_out, cudaStream_t stream) {
+    const int t = x.ne[1];
+    if (t < 1 || t > 16) {
+        throw std::invalid_argument("q5 small-t mma linear_add deterministic: unsupported token count");
+    }
+
+    const std::size_t idx = static_cast<std::size_t>(t - 1);
+
+    if (weight.n == 5120 && weight.k == 6144) {
+        kResidualDeterministic5120x6144[idx](x, weight, residual_out, stream);
+        return;
+    }
+    if (weight.n == 5120 && weight.k == 17408) {
+        kResidualDeterministic5120x17408[idx](x, weight, residual_out, stream);
+        return;
+    }
+
+    throw std::invalid_argument("q5 small-t mma linear_add deterministic: unsupported shape");
 }
 
 } // namespace ninfer::ops::detail

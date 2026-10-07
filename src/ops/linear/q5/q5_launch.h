@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #include "core/tensor.h"
 #include "core/weight.h"
 #include <cuda_runtime.h>
@@ -47,4 +47,5 @@ void launch_q5_simt_split2_exact(const Tensor&, const Weight&, Tensor&, cudaStre
 void launch_q5_simt_split4_exact(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_q5_gemv_r16_s2_x(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_q5_linear_add_small_t_mma(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q5_linear_add_small_t_mma_deterministic(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 } // namespace ninfer::ops::detail

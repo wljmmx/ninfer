@@ -38,15 +38,12 @@ constexpr std::array<SupportSpec, 2> kSupports{{
 }};
 
 constexpr std::array<RouteSpec, 13> kK6144Routes{{
-    // NOTE: the sm_89 (v1.2.0) decode routes (gemv / small-t atomic residual /
-    // r64.c16) were measured ~3% faster but the T==2..13 window uses an ATOMIC
-    // residual epilogue (kSplits=2) whose bf16x2 atomicAdd ordering varies run
-    // to run and made spec acc non-deterministic (0.201 -> 0.217, ±7 tok/s).
-    // The deterministic v3 sliced schedules stay routed until a non-atomic
-    // split merge is written; q5_linear_add_sm89_*.cu is parked for that.
-    {{1, 4}, Q5LinearAddScheduleId::Split2ExactResidual},
-    {{5, 8}, Q5LinearAddScheduleId::SlicedR16T8W4S2},
-    {{9, 16}, Q5LinearAddScheduleId::SlicedR16T16W4S2},
+    // sm_89 decode: deterministic GEMV at T==1, small-T MMA with non-atomic
+    // __hadd residual at T==2..13, r64/c16 tile at 14..16. The atomic epilogue
+    // was replaced by KSplits=1 + Q5SmallTMmaResidualEpilogue (deterministic).
+    {{1, 1}, Q5LinearAddScheduleId::GemvResidualSm89},
+    {{2, 13}, Q5LinearAddScheduleId::Split2ExactResidualSm89},
+    {{14, 16}, Q5LinearAddScheduleId::MmaResidualR64C16Sm89},
     {{17, 24}, Q5LinearAddScheduleId::SlicedR16T24W4S2},
     {{25, 32}, Q5LinearAddScheduleId::SlicedR32T32W4S2},
     {{33, 48}, Q5LinearAddScheduleId::SlicedR32T24W4S2Pairwise},
@@ -59,10 +56,9 @@ constexpr std::array<RouteSpec, 13> kK6144Routes{{
     {{513, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64T128Tail},
 }};
 
-constexpr std::array<RouteSpec, 13> kK17408Routes{{
-    {{1, 4}, Q5LinearAddScheduleId::Split2ExactResidual},
-    {{5, 8}, Q5LinearAddScheduleId::SlicedR16T8W4S2},
-    {{9, 16}, Q5LinearAddScheduleId::SlicedR16T16W4S2},
+constexpr std::array<RouteSpec, 12> kK17408Routes{{
+    {{1, 1}, Q5LinearAddScheduleId::GemvResidualSm89},
+    {{2, 16}, Q5LinearAddScheduleId::Split2ExactResidualSm89},
     {{17, 24}, Q5LinearAddScheduleId::SlicedR16T24W4S2},
     {{25, 32}, Q5LinearAddScheduleId::SlicedR32T32W4S2},
     {{33, 48}, Q5LinearAddScheduleId::SlicedR32T24W4S2Pairwise},
