@@ -199,6 +199,42 @@ linked from each model below.
 | [Qwen3.8-27B](docs/performance/qwen3.8-27b.md#single-request-speculative-decode) `groupwise-int` | 3,331.9 tok/s | 2,139.4 tok/s | 214.7 tok/s |
 | [Qwen3.8-27B](docs/performance/qwen3.8-27b.md#single-request-speculative-decode) `nvfp4` | 12,819.1 tok/s | 4,016.4 tok/s | 231.7 tok/s |
 
+### RTX 4090 (sm_89) baseline
+
+Measured on a single 24 GB RTX 4090 with the v3 artifact; kept as the reference point for 4090
+optimisation work. The [full record](docs/performance/rtx-4090-sm89-baseline.md) documents the
+`ninfer_bench` command lines, per-layout capacity/speed/precision tables, and both context-ceiling
+procedures.
+
+| `ninfer_bench` case | Configuration | Result |
+|---|---:|---:|
+| `pp512` | chunk 1024, INT8 KV | 2,386 tok/s prefill |
+| `pp2048` | chunk 1024, INT8 KV | 2,664 tok/s prefill |
+| `pp4096` | chunk 1024, INT8 KV | 2,626 tok/s prefill |
+| `pp32768+tg128` | MTP7, rk4v4-e8 | 221.9 tok/s decode (100% acceptance, 8.00 tok/round) |
+| `pp2048+tg128` | MTP7, INT8 KV | 206.8 tok/s decode (88.0% acceptance, 7.11 tok/round) |
+| `tg128` | MTP4, rk4v4-e8 | 87.0 tok/s decode (38.5% acceptance) |
+| `tg128` | MTP0, INT8 KV, CUDA Graph | 48.7 tok/s decode |
+
+Capacity and precision by KV layout. Perplexity at `context 4096 / stride 1024`; ceilings
+binary-searched, `strict` without an eviction budget:
+
+| KV layout | PPL | vs int8 | KV bytes/token | Ceiling (strict) | Ceiling (WDDM) |
+|---|---:|---:|---:|---:|---:|
+| `bf16` | 7.0035 | +0.02% | 64 KiB | 38,944 | 222,028 |
+| `int8` | 7.0024 | — | 33 KiB | 85,568 | 135,338 |
+| `fp8` | 7.0043 | +0.03% | 32 KiB | 120,288 | 261,328 |
+| `k8v4` | 7.0162 | +0.20% | 25 KiB | 108,384 | 259,016 |
+| `rk8v4` | 7.0127 | +0.15% | 25 KiB | 103,424 | 261,328 |
+| `rk4v4` | 7.0450 | +0.61% | 17 KiB | 142,112 | 261,328 |
+| `rk4v4-e8` | 7.0731 | +1.01% | 17 KiB | 168,896 | 261,328 |
+| `rk2v4-e8` | 7.6048 | +8.60% | 13 KiB | 189,728 | 261,328 |
+
+Decode is weight-bandwidth bound, so a KV layout moves it by under 7%; the layout choice is really a
+capacity-versus-accuracy trade. Under `--wddm-evictable-budget` the ceiling is bounded by the
+eviction floor and the model's 262,144-token position capacity rather than by the KV footprint, so
+the two ceiling columns must never be compared with each other.
+
 ## Evaluation
 
 Capability scores were measured through NInfer's OpenAI-compatible serving route with thinking
