@@ -3,10 +3,10 @@
 
 namespace ninfer::ops::detail::q5_instances {
 
-using MmaR64T128 = Q5A16MmaSchedule<64, 128, 64, 64, 32, 2, 1, Q5MmaFragmentPipeline::Serial,
+using MmaR64T128 = Q5A16MmaSchedule<64, 128, 64, 32, 32, 2, 2, Q5MmaFragmentPipeline::Serial,
                                     Cache::cg, Cache::cg, Q5ScaleLoad::Pair32>;
 
-using MmaR32T128 = Q5A16MmaSchedule<32, 128, 64, 32, 32, 2, 1, Q5MmaFragmentPipeline::Serial,
+using MmaR32T128 = Q5A16MmaSchedule<32, 128, 64, 32, 32, 2, 2, Q5MmaFragmentPipeline::Serial,
                                     Cache::cg, Cache::cg, Q5ScaleLoad::Pair32>;
 
 using GemvR16W1G16S2XK5120 = Q5A16GemvSchedule<16, 1, 16, 2, Cache::ca, 1, true, 5120>;

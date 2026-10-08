@@ -57,6 +57,14 @@ template <class Schedule>
 void launch_route(const Tensor& x, const Weight& w, Tensor& residual_out, cudaStream_t stream) {
     const bool full = (w.n % Schedule::kBlockRows) == 0 && (x.ne[1] % Schedule::kBlockCols) == 0 &&
                       w.k == w.padded_shape[1] && (w.k % 64) == 0;
+    // When T is a multiple of kBlockCols (prefill case), skip for_each_token_slice
+    // and launch the entire grid in ONE launch — the kernel grid already handles
+    // the token dimension via grid.x. Sequential slicing into kBlockCols-sized
+    // launches adds unnecessary host-side overhead and prevents cross-tile L2 reuse.
+    if (full && (x.ne[1] % Schedule::kBlockCols) == 0) {
+        launch_kernel<Schedule, true>(x, w, residual_out, stream);
+        return;
+    }
     for_each_token_slice(x.ne[1], Schedule::kBlockCols,
                           [&](std::int32_t offset, std::int32_t count) {
                               const Tensor x_slice  = x.slice(1, offset, count);
