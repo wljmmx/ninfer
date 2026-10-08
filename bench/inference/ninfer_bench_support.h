@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 // Host-only support for the product throughput benchmark. The benchmark itself drives only the
 // public ninfer::Engine API; this file owns its CLI, matrix, statistics, and report schema.
@@ -73,6 +73,9 @@ struct BenchOptions {
     OutputFormat output   = OutputFormat::Table;
     std::string output_file;
     bool help_requested = false;
+    float sampling_temperature = 0.0F;
+    std::int32_t sampling_top_k   = 0;
+    float sampling_top_p          = 1.0F;
 };
 
 struct RepTiming {
@@ -113,6 +116,9 @@ struct BenchEnvironment {
     KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     bool use_cuda_graph                            = true;
+    float sampling_temperature                     = 0.0F;
+    std::int32_t sampling_top_k                    = 0;
+    float sampling_top_p                            = 1.0F;
     bool decode_graph_primed                       = false;
     std::uint32_t decode_graph_prime_output_tokens = 0;
     int repetitions                                = 0;

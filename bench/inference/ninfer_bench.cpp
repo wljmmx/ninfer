@@ -1,4 +1,4 @@
-#include "ninfer_bench_support.h"
+﻿#include "ninfer_bench_support.h"
 
 #include "ninfer/engine.h"
 
@@ -17,6 +17,13 @@
 #include <vector>
 
 namespace {
+const ninfer::bench::BenchEnvironment* g_env = nullptr;
+
+// Sampling override from --sampling-preset (community: temperature 0.6, top-p 0.95, top-k 20).
+// Default remains greedy (temperature 0.0) for deterministic baseline comparisons.
+float g_sampling_temperature = 0.0F;
+std::int32_t g_sampling_top_k = 0;
+float g_sampling_top_p = 1.0F;
 
 std::string command_line(int argc, char** argv) {
     std::ostringstream out;
@@ -67,7 +74,9 @@ benchmark_request(const ninfer::bench::BenchTest& test,
     ninfer::RequestOptions options;
     options.execution.requested_output_tokens = test.requested_output_tokens();
     options.execution.allow_prefix_reuse      = false;
-    options.execution.sampling.temperature    = 0.0F;
+    options.execution.sampling.temperature    = g_env->sampling_temperature;
+    options.execution.sampling.top_k          = g_env->sampling_top_k;
+    options.execution.sampling.top_p         = g_env->sampling_top_p;
     options.stop.include_model_defaults       = false;
     options.output.raw                        = true;
     options.output.preserve_special_tokens    = true;
@@ -200,6 +209,7 @@ int main(int argc, char** argv) {
         engine_options.use_cuda_graph                    = options.use_cuda_graph;
 
         ninfer::bench::BenchEnvironment env;
+    g_env = &env;
         env.artifact_path            = options.artifact_path;
         env.artifact_file_size_bytes = ninfer::bench::file_size_or_zero(options.artifact_path);
         env.max_context              = max_context;
@@ -207,6 +217,9 @@ int main(int argc, char** argv) {
         env.kv_cache                 = options.kv_cache;
         env.speculative              = options.speculative;
         env.use_cuda_graph           = options.use_cuda_graph;
+    env.sampling_temperature      = options.sampling_temperature;
+    env.sampling_top_k             = options.sampling_top_k;
+    env.sampling_top_p             = options.sampling_top_p;
         env.repetitions              = options.repetitions;
         env.warmup                   = options.warmup;
         env.corpus_path              = options.corpus_path;

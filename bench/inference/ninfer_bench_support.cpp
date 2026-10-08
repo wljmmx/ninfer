@@ -1,4 +1,4 @@
-#include "ninfer_bench_support.h"
+﻿#include "ninfer_bench_support.h"
 #include "product/speculative_options.h"
 
 #include <algorithm>
@@ -325,6 +325,7 @@ std::string usage_text(std::string_view program) {
         << "  --max-ctx <tokens>          override auto-sized context capacity\n"
         << "  --prefill-chunk <tokens>    multiple of " << kPrefillChunkAlignment
         << " (default: " << kDefaultPrefillChunk << ")\n"
+        << "  --sampling-preset <mode>   greedy (default) or community (temp 0.6, top-p 0.95, top-k 20)\n"
         << "  --kv-dtype <bf16|int8|fp8|nvfp4|k8v4|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8>  KV cache storage "
            "(default: bf16)\n"
         << "  --spec <mtp|dflash|dflash2> speculative backend (default: none)\n"
@@ -419,6 +420,20 @@ BenchOptions parse_args(int argc, char** argv) {
             }
         } else if (arg == "--output-file") {
             options.output_file = value("--output-file");
+        } else if (arg == "--sampling-preset") {
+            const auto selected = value("--sampling-preset");
+            if (selected == "greedy") {
+                options.sampling_temperature = 0.0F;
+                options.sampling_top_k       = 0;
+                options.sampling_top_p      = 1.0F;
+            } else if (selected == "community") {
+                options.sampling_temperature = 0.6F;
+                options.sampling_top_k       = 20;
+                options.sampling_top_p      = 0.95F;
+            } else {
+                throw std::invalid_argument(
+                    "--sampling-preset must be greedy or community");
+            }
         } else {
             throw std::invalid_argument("unknown argument: " + std::string(arg));
         }
