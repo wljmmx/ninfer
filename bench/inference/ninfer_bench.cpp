@@ -77,6 +77,7 @@ benchmark_request(const ninfer::bench::BenchTest& test,
     options.execution.sampling.temperature    = g_env->sampling_temperature;
     options.execution.sampling.top_k          = g_env->sampling_top_k;
     options.execution.sampling.top_p         = g_env->sampling_top_p;
+    options.execution.sampling.min_p         = g_env->sampling_min_p;
     options.stop.include_model_defaults       = false;
     options.output.raw                        = true;
     options.output.preserve_special_tokens    = true;
@@ -220,6 +221,7 @@ int main(int argc, char** argv) {
     env.sampling_temperature      = options.sampling_temperature;
     env.sampling_top_k             = options.sampling_top_k;
     env.sampling_top_p             = options.sampling_top_p;
+    env.sampling_min_p             = options.sampling_min_p;
         env.repetitions              = options.repetitions;
         env.warmup                   = options.warmup;
         env.corpus_path              = options.corpus_path;

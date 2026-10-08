@@ -76,6 +76,7 @@ struct BenchOptions {
     float sampling_temperature = 0.0F;
     std::int32_t sampling_top_k   = 0;
     float sampling_top_p          = 1.0F;
+    float sampling_min_p          = 0.0F;
 };
 
 struct RepTiming {
@@ -119,6 +120,7 @@ struct BenchEnvironment {
     float sampling_temperature                     = 0.0F;
     std::int32_t sampling_top_k                    = 0;
     float sampling_top_p                            = 1.0F;
+    float sampling_min_p                            = 0.0F;
     bool decode_graph_primed                       = false;
     std::uint32_t decode_graph_prime_output_tokens = 0;
     int repetitions                                = 0;

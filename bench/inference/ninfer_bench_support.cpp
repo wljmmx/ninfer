@@ -426,13 +426,51 @@ BenchOptions parse_args(int argc, char** argv) {
                 options.sampling_temperature = 0.0F;
                 options.sampling_top_k       = 0;
                 options.sampling_top_p      = 1.0F;
+                options.sampling_min_p      = 0.0F;
             } else if (selected == "community") {
                 options.sampling_temperature = 0.6F;
                 options.sampling_top_k       = 20;
                 options.sampling_top_p      = 0.95F;
+                options.sampling_min_p      = 0.0F;
+            } else if (selected == "community-minp025") {
+                options.sampling_temperature = 0.6F;
+                options.sampling_top_k       = 20;
+                options.sampling_top_p      = 0.95F;
+                options.sampling_min_p      = 0.25F;
+            } else if (selected == "community-minp05") {
+                options.sampling_temperature = 0.6F;
+                options.sampling_top_k       = 20;
+                options.sampling_top_p      = 0.95F;
+                options.sampling_min_p      = 0.50F;
+            } else if (selected == "community-minp075") {
+                options.sampling_temperature = 0.6F;
+                options.sampling_top_k       = 20;
+                options.sampling_top_p      = 0.95F;
+                options.sampling_min_p      = 0.75F;
+            } else if (selected == "community-topk5") {
+                options.sampling_temperature = 0.6F;
+                options.sampling_top_k       = 5;
+                options.sampling_top_p      = 1.0F;
+                options.sampling_min_p      = 0.0F;
+            } else if (selected == "community-minp075-topk5") {
+                options.sampling_temperature = 0.6F;
+                options.sampling_top_k       = 5;
+                options.sampling_top_p      = 1.0F;
+                options.sampling_min_p      = 0.75F;
+            } else if (selected == "community-minp075-topk10") {
+                options.sampling_temperature = 0.6F;
+                options.sampling_top_k       = 10;
+                options.sampling_top_p      = 1.0F;
+                options.sampling_min_p      = 0.75F;
+            } else if (selected == "community-topk10") {
+                options.sampling_temperature = 0.6F;
+                options.sampling_top_k       = 10;
+                options.sampling_top_p      = 1.0F;
+                options.sampling_min_p      = 0.0F;
             } else {
                 throw std::invalid_argument(
-                    "--sampling-preset must be greedy or community");
+                    "--sampling-preset must be greedy|community|community-minp025|"
+                    "community-minp05|community-minp075|community-topk5|community-topk10");
             }
         } else {
             throw std::invalid_argument("unknown argument: " + std::string(arg));
