@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
@@ -25,6 +25,15 @@ struct Q4SmallTMmaStoreEpilogue {};
 
 struct Q4SmallTMmaIdentityRows {
     static constexpr int kOutputRowsPerCta = 16;
+
+    __device__ __forceinline__ int weight_row(int output_row0, int local_row) const {
+        return output_row0 + local_row;
+    }
+};
+
+// 8-row variant: pairs with Q4DraftSmallTSchedule8Row for medium-N shapes.
+struct Q4SmallTMmaIdentityRows8Row {
+    static constexpr int kOutputRowsPerCta = 8;
 
     __device__ __forceinline__ int weight_row(int output_row0, int local_row) const {
         return output_row0 + local_row;
@@ -111,6 +120,22 @@ struct Q4DraftSmallTSchedule {
     static constexpr int kGroupK            = kKWarps * kTileKPerWarp;
     static constexpr int kRowsPerCta        = 16;
     static constexpr int kRowsPerLoaderWarp = kRowsPerCta / kKWarps;
+};
+
+// sm_89 8-row CTA variant: halves kRowsPerCta to produce 2x more CTAs for the
+// same N, trading per-CTA K-slice reuse for wave alignment on medium-N shapes
+// (e.g. N=7680: 16-row gives 480 CTAs = 3.75 waves, 8-row gives 960 = 7.5
+// waves, cutting tail waste from 25% to 6.7%). Each warp loads one weight row
+// (kRowsPerLoaderWarp=1, same as the 16-row schedule's 2 rows × 8 warps = 16).
+struct Q4DraftSmallTSchedule8Row {
+    static constexpr int kKWarps            = 8;
+    static constexpr int kMinBlocksPerSm    = 6;
+    static constexpr auto kCodeCache        = Cache::cg;
+    static constexpr int kThreads           = kKWarps * 32;
+    static constexpr int kTileKPerWarp      = 64;
+    static constexpr int kGroupK            = kKWarps * kTileKPerWarp;
+    static constexpr int kRowsPerCta        = 8;
+    static constexpr int kRowsPerLoaderWarp = kRowsPerCta / kKWarps;  // 1
 };
 
 __device__ __forceinline__ int q4_small_t_swizzle_64(int row, int col) {

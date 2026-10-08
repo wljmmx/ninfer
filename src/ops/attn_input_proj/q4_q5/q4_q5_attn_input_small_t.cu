@@ -37,7 +37,8 @@ void launch_q4_attn_sm89(const Tensor& x, const Weight& weight, Tensor& q, Tenso
                           cudaStream_t stream) {
     constexpr int TileCols  = ActiveCols <= 8 ? 8 : 16;
     using Geometry          = Q4SmallTGeometry<N, kHidden>;
-    constexpr int kBlocks   = (N + 15) / 16;
+    // 8-row CTA: 960 CTAs for N=7680 (7.5 waves on 128 SMs) vs 480 for 16-row.
+    constexpr int kBlocks   = (N + 7) / 8;
 
     Q4SmallTSplitEpilogue<kSplitRow> epilogue;
     epilogue.out     = static_cast<__nv_bfloat16*>(q.data);
@@ -46,13 +47,13 @@ void launch_q4_attn_sm89(const Tensor& x, const Weight& weight, Tensor& q, Tenso
     epilogue.tail_ld = static_cast<std::int32_t>(key.nb[1] / sizeof(__nv_bfloat16));
 
     q4_small_t_mma_kernel<Geometry, TileCols, ActiveCols, Q4SmallTSplitEpilogue<kSplitRow>,
-                          Q4SmallTMmaIdentityRows>
-        <<<kBlocks, Q4DraftSmallTSchedule::kThreads, 0, stream>>>(
+                          Q4SmallTMmaIdentityRows8Row>
+        <<<kBlocks, Q4DraftSmallTSchedule8Row::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales),
-            static_cast<__nv_bfloat16*>(q.data),  // primary out; split epilogue routes rows
-            epilogue, Q4SmallTMmaIdentityRows{});
+            static_cast<__nv_bfloat16*>(q.data),
+            epilogue, Q4SmallTMmaIdentityRows8Row{});
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -194,12 +195,18 @@ void launch_q4_sliced_band(const Tensor& x, const Weight& weight, Tensor& q, Ten
 
 void launch_q4(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key, cudaStream_t stream) {
     const int t = x.ne[1];
-    // sm89 small-T MMA measured SLOWER than v3 SIMT for this N=7680 shape:
-    // 16 rows/CTA gives only 480 CTAs = 1.875 waves on 128 SMs (tail waste),
-    // while v3's BM=8 SIMT yields 960 CTAs = better utilization. The sm89
-    // launchers above remain for future tile-size retuning (8 rows/CTa variant).
-    // Falls through to v3 routing.
-    (void)t;
+    // sm89 8-row CTA: 960 CTAs for N=7680 (7.5 waves) vs v3 SIMT 960 CTAs (7.5
+    // waves). The 8-row small-T MMA uses tensor cores (HMMA) which the v3 SIMT
+    // does not; the Q4SmallTSplitEpilogue preserves the fused Q/K output.
+    if (t >= 1 && t <= 12 && weight.padded_shape[1] == kHidden && (weight.n % 8) == 0) {
+        switch (weight.n) {
+        case 7680:
+            launch_q4_attn_sm89_dispatch<7680>(t, x, weight, q, key, stream);
+            return;
+        default:
+            break;
+        }
+    }
     switch (x.ne[1]) {
     case 1:
         launch_q4_gemv(x, weight, q, key, stream);
