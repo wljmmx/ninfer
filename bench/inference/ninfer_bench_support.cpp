@@ -462,6 +462,81 @@ BenchOptions parse_args(int argc, char** argv) {
                 options.sampling_top_k       = 10;
                 options.sampling_top_p      = 1.0F;
                 options.sampling_min_p      = 0.75F;
+            } else if (selected == "community-topk4") {
+                options.sampling_temperature = 0.6F;
+                options.sampling_top_k       = 4;
+                options.sampling_top_p      = 1.0F;
+                options.sampling_min_p      = 0.0F;
+            } else if (selected == "community-topk8") {
+                options.sampling_temperature = 0.6F;
+                options.sampling_top_k       = 8;
+                options.sampling_top_p      = 1.0F;
+                options.sampling_min_p      = 0.0F;
+            } else if (selected == "community-topk12") {
+                options.sampling_temperature = 0.6F;
+                options.sampling_top_k       = 12;
+                options.sampling_top_p      = 1.0F;
+                options.sampling_min_p      = 0.0F;
+            } else if (selected == "community-topk16") {
+                options.sampling_temperature = 0.6F;
+                options.sampling_top_k       = 16;
+                options.sampling_top_p      = 1.0F;
+                options.sampling_min_p      = 0.0F;
+            } else if (selected == "community-topk24") {
+                options.sampling_temperature = 0.6F;
+                options.sampling_top_k       = 24;
+                options.sampling_top_p      = 1.0F;
+                options.sampling_min_p      = 0.0F;
+            } else if (selected == "community-topk32") {
+                options.sampling_temperature = 0.6F;
+                options.sampling_top_k       = 32;
+                options.sampling_top_p      = 1.0F;
+                options.sampling_min_p      = 0.0F;
+            } else if (selected == "community-minp075-topk4") {
+                options.sampling_temperature = 0.6F;
+                options.sampling_top_k       = 4;
+                options.sampling_top_p      = 1.0F;
+                options.sampling_min_p      = 0.75F;
+            } else if (selected == "community-minp075-topk8") {
+                options.sampling_temperature = 0.6F;
+                options.sampling_top_k       = 8;
+                options.sampling_top_p      = 1.0F;
+                options.sampling_min_p      = 0.75F;
+            } else if (selected == "community-minp075-topk12") {
+                options.sampling_temperature = 0.6F;
+                options.sampling_top_k       = 12;
+                options.sampling_top_p      = 1.0F;
+                options.sampling_min_p      = 0.75F;
+                        } else if (selected == "community-minp06") {
+                options.sampling_temperature = 0.6F;
+                options.sampling_top_k       = 20;
+                options.sampling_top_p      = 0.95F;
+                options.sampling_min_p      = 0.60F;
+            } else if (selected == "community-minp065") {
+                options.sampling_temperature = 0.6F;
+                options.sampling_top_k       = 20;
+                options.sampling_top_p      = 0.95F;
+                options.sampling_min_p      = 0.65F;
+            } else if (selected == "community-minp07") {
+                options.sampling_temperature = 0.6F;
+                options.sampling_top_k       = 20;
+                options.sampling_top_p      = 0.95F;
+                options.sampling_min_p      = 0.70F;
+            } else if (selected == "community-minp08") {
+                options.sampling_temperature = 0.6F;
+                options.sampling_top_k       = 20;
+                options.sampling_top_p      = 0.95F;
+                options.sampling_min_p      = 0.80F;
+            } else if (selected == "community-minp085") {
+                options.sampling_temperature = 0.6F;
+                options.sampling_top_k       = 20;
+                options.sampling_top_p      = 0.95F;
+                options.sampling_min_p      = 0.85F;
+            } else if (selected == "community-minp09") {
+                options.sampling_temperature = 0.6F;
+                options.sampling_top_k       = 20;
+                options.sampling_top_p      = 0.95F;
+                options.sampling_min_p      = 0.90F;
             } else if (selected == "community-topk10") {
                 options.sampling_temperature = 0.6F;
                 options.sampling_top_k       = 10;
