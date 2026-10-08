@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -37,6 +38,20 @@ inline void put_word(std::span<std::byte> bytes, std::size_t offset, std::uint64
     for (unsigned i = 0; i < size; ++i) { bytes[offset + i] = std::byte((value >> (8 * i)) & 255); }
 }
 
+// Creates a fresh uniquely named directory under the system temp root. MSVC has no
+// mkdtemp, so the name is derived from steady-clock ticks and probed with create_directory.
+inline std::filesystem::path make_unique_directory() {
+    const std::filesystem::path base = std::filesystem::temp_directory_path();
+    const auto ticks = std::chrono::steady_clock::now().time_since_epoch().count();
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        const std::filesystem::path candidate =
+            base / ("ninfer-artifact-" + std::to_string(ticks) + "-" + std::to_string(attempt));
+        std::error_code error;
+        if (std::filesystem::create_directory(candidate, error)) { return candidate; }
+    }
+    throw std::runtime_error("cannot create fixture directory");
+}
+
 // Deliberately small independent byte fixture, including non-aligned file boundaries.
 // This helper writes test files only; production writer interoperability is checked separately.
 struct Fixture {
@@ -46,12 +61,7 @@ struct Fixture {
     std::vector<std::byte> payload;
 
     Fixture() : payload(1344) {
-        auto pattern = (std::filesystem::temp_directory_path() / "ninfer-artifact-XXXXXX").string();
-        std::vector<char> buffer(pattern.begin(), pattern.end());
-        buffer.push_back('\0');
-        const char* path = ::mkdtemp(buffer.data());
-        if (!path) { throw std::runtime_error("cannot create fixture directory"); }
-        directory = path;
+        directory = make_unique_directory();
         entry     = directory / "model.ninfer";
         root      = {
             {"components",

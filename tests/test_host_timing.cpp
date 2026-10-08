@@ -5,6 +5,12 @@
 #include <cstdint>
 #include <iostream>
 
+// <windows.h>, pulled in transitively by the runtime headers, defines
+// near/far as empty function-like macros.
+#ifdef near
+#    undef near
+#endif
+
 namespace {
 
 int check(bool condition, const char* message) {

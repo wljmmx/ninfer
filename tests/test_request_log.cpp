@@ -13,7 +13,11 @@
 #include <string>
 #include <vector>
 
-#include <unistd.h>
+#ifdef _WIN32
+#    include <process.h>
+#else
+#    include <unistd.h>
+#endif
 
 namespace {
 
@@ -843,10 +847,14 @@ int main() {
             throughput_json.at("context_cache").at("selections").at("checkpoint") == 2,
         "context-cache throughput statistics missing or not interval-scoped");
 
+#ifdef _WIN32
+    const auto process_id = static_cast<long long>(::_getpid());
+#else
+    const auto process_id = static_cast<long long>(::getpid());
+#endif
     const std::filesystem::path log_path =
         std::filesystem::temp_directory_path() /
-        ("ninfer-request-log-test-" + std::to_string(static_cast<long long>(::getpid())) +
-         ".jsonl");
+        ("ninfer-request-log-test-" + std::to_string(process_id) + ".jsonl");
     std::filesystem::remove(log_path);
     {
         JsonlRequestLog writer(log_path.string());

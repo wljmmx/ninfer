@@ -7,6 +7,7 @@
 #include "core/host_kv_arena.h"
 #include "core/layout.h"
 #include "core/paged_kv_cache.h"
+#include "core/wide_mul.h"
 #include "ninfer/engine.h"
 
 #include <cuda_runtime.h>
@@ -403,12 +404,18 @@ std::vector<TextCase> text_cases(std::uint32_t chunk) {
 }
 
 std::uint64_t attention_pairs(std::uint32_t prefix, std::uint32_t suffix) {
-    const unsigned __int128 pairs = static_cast<unsigned __int128>(prefix) * suffix +
-                                    static_cast<unsigned __int128>(suffix) * (suffix + 1ULL) / 2U;
-    if (pairs > std::numeric_limits<std::uint64_t>::max()) {
+    const ninfer::WideProduct cross = ninfer::wide_mul(prefix, suffix);
+    const ninfer::WideProduct diagonal =
+        ninfer::wide_mul(suffix, static_cast<std::uint64_t>(suffix) + 1U);
+    if (cross.high != 0 || diagonal.high != 0) {
         throw std::overflow_error("prefill attention-pair count exceeds uint64");
     }
-    return static_cast<std::uint64_t>(pairs);
+    // diagonal.low == suffix * (suffix + 1) is always even, so halving first stays exact.
+    const std::uint64_t half = diagonal.low / 2U;
+    if (cross.low > std::numeric_limits<std::uint64_t>::max() - half) {
+        throw std::overflow_error("prefill attention-pair count exceeds uint64");
+    }
+    return cross.low + half;
 }
 
 std::vector<std::uint8_t> block_ppm(int width, int height, std::uint8_t value) {

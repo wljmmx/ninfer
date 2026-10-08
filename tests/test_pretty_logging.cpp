@@ -3,7 +3,15 @@
 
 #include <spdlog/logger.h>
 
-#include <unistd.h>
+#ifdef _WIN32
+#    include <fcntl.h>
+#    include <io.h>
+#    ifndef STDERR_FILENO
+#        define STDERR_FILENO 2
+#    endif
+#else
+#    include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -20,7 +28,13 @@ namespace {
 class StderrCapture {
 public:
     StderrCapture() {
+#ifdef _WIN32
+        if (::_pipe(pipe_, 4096, _O_BINARY) != 0) {
+            throw std::runtime_error(std::strerror(errno));
+        }
+#else
         if (::pipe(pipe_) != 0) { throw std::runtime_error(std::strerror(errno)); }
+#endif
         saved_ = ::dup(STDERR_FILENO);
         if (saved_ < 0 || ::dup2(pipe_[1], STDERR_FILENO) < 0) {
             throw std::runtime_error(std::strerror(errno));
@@ -46,7 +60,11 @@ public:
         std::string output;
         std::array<char, 4096> buffer{};
         for (;;) {
+#ifdef _WIN32
+            const int count = ::_read(pipe_[0], buffer.data(), static_cast<unsigned>(buffer.size()));
+#else
             const ssize_t count = ::read(pipe_[0], buffer.data(), buffer.size());
+#endif
             if (count == 0) { break; }
             if (count < 0) {
                 if (errno == EINTR) { continue; }
