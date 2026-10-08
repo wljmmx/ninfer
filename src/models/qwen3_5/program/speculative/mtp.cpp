@@ -124,6 +124,8 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         Tensor ar_rope_positions  = frame.ar_rope_positions.slice(0, 0, batch_size);
         Tensor ar_valid_columns   = frame.ar_valid_columns.slice(0, 0, batch_size);
         Tensor next_drafts        = frame.next_drafts.slice(0, 0, batch_size);
+        Tensor candidate_ids      = frame.candidate_ids.slice(2, 0, batch_size);
+        Tensor proposal_q         = frame.proposal_q.slice(2, 0, batch_size);
 
         TargetVerifyFrameView verify{
             .ids                     = verify_ids,
@@ -138,6 +140,8 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
             .target_tokens           = target_tokens,
             .drafts                  = current_drafts,
             .current_extents         = current_extents,
+            .candidate_ids           = candidate_ids,
+            .proposal_q              = proposal_q,
             .frontiers               = frontiers,
             .anchors                 = anchors,
             .licensed_tokens         = licensed_tokens,
@@ -186,7 +190,30 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
 
             Tensor proposal_logits = frame.proposal_logits.slice(1, 0, batch_size);
             Tensor draft0          = next_drafts.slice(1, 0, 1).view({batch_size});
-            card.mtp_propose_batch(ar_hidden, proposal_logits, draft0);
+
+            // Top-16 proposal: fills candidate_ids[:, step, :] and proposal_q[:, step, :]
+            // using the logits_topk_softmax kernel with column_stride = 16 * k (the
+            // [16, k, batch] tensor's batch stride). The base pointer is offset by
+            // step * 16 to write into the correct draft position.
+            constexpr std::int32_t topk_width = 16;
+            const std::int32_t candidate_stride = topk_width * static_cast<std::int32_t>(k);
+            auto step_candidate_view = [&](std::int32_t step) {
+                return Tensor(
+                    static_cast<unsigned char*>(candidate_ids.data) +
+                        static_cast<std::size_t>(step) * topk_width * sizeof(std::int32_t),
+                    DType::I32, {topk_width, batch_size});
+            };
+            auto step_proposal_view = [&](std::int32_t step) {
+                return Tensor(
+                    static_cast<unsigned char*>(proposal_q.data) +
+                        static_cast<std::size_t>(step) * topk_width * sizeof(float),
+                    DType::FP32, {topk_width, batch_size});
+            };
+
+            Tensor step0_ids   = step_candidate_view(0);
+            Tensor step0_probs = step_proposal_view(0);
+            card.mtp_propose_topk_strided(ar_hidden, proposal_logits, draft0, step0_ids,
+                                          step0_probs, topk_width, candidate_stride);
             for (std::uint32_t step = 0; step + 1 < k; ++step) {
                 Tensor previous =
                     next_drafts.slice(1, static_cast<std::int32_t>(step), 1).view({batch_size});
@@ -207,7 +234,10 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                      batch_size});
                 card.mtp_forward_decode_batch(previous_batch, hidden_batch, position, rope, valid,
                                               mtp_rows, envelopes.ar[step], next_hidden_batch);
-                card.mtp_propose_batch(next_hidden, proposal_logits, next);
+                Tensor step_ids   = step_candidate_view(static_cast<std::int32_t>(step) + 1);
+                Tensor step_probs = step_proposal_view(static_cast<std::int32_t>(step) + 1);
+                card.mtp_propose_topk_strided(next_hidden, proposal_logits, next, step_ids,
+                                              step_probs, topk_width, candidate_stride);
                 CUDA_CHECK(cudaMemcpyAsync(ar_hidden.data, next_hidden.data, ar_hidden.bytes(),
                                            cudaMemcpyDeviceToDevice,
                                            state.execution.device.stream));

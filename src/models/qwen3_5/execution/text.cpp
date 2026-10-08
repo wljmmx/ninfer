@@ -837,6 +837,63 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
     proposal_argmax(hidden, logits, draft_tokens);
 }
 
+void TextContext::mtp_propose_topk(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens,
+                                   Tensor* candidate_ids, Tensor* proposal_q,
+                                   std::int32_t top_k) {
+    const std::int32_t batch = hidden.ne[1];
+    require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), batch},
+                         "MTP propose-topk hidden");
+    if (candidate_ids == nullptr || proposal_q == nullptr) {
+        throw std::logic_error("mtp_propose_topk requires candidate_ids and proposal_q outputs");
+    }
+    require_tensor_shape(*candidate_ids, DType::I32, {top_k, batch}, "MTP topk candidate ids");
+    require_tensor_shape(*proposal_q, DType::FP32, {top_k, batch}, "MTP topk proposal q");
+
+    auto proposal_scope = work_.scope();
+    nvtx::ScopedRange proposal_range(nvtx::Name::MtpProposal, nvtx::Category::Mtp,
+                                     static_cast<std::uint64_t>(batch));
+
+    if (proposal_head_ != nullptr) {
+        Tensor proposal_logits = work_.alloc(DType::BF16, {proposal_head_n_, batch});
+        project(hidden, *proposal_head_, proposal_logits, work_, ctx_.stream);
+        ops::logits_topk_softmax(proposal_logits, *candidate_ids, *proposal_q, draft_tokens,
+                                 proposal_head_ids_, top_k, 0, ctx_.stream);
+    } else {
+        Tensor output_logits = work_.alloc(DType::BF16,
+                                           {dimension(config_.vocab_size), batch});
+        project(hidden, mtp_->output_head, output_logits, work_, ctx_.stream);
+        ops::logits_topk_softmax(output_logits, *candidate_ids, *proposal_q, draft_tokens,
+                                 nullptr, top_k, 0, ctx_.stream);
+    }
+}
+
+void TextContext::mtp_propose_topk_strided(const Tensor& hidden, Tensor& logits,
+                                           Tensor& draft_tokens, Tensor& candidate_ids,
+                                           Tensor& proposal_q, std::int32_t top_k,
+                                           std::int32_t column_stride) {
+    const std::int32_t batch = hidden.ne[1];
+    require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), batch},
+                         "MTP propose-topk hidden");
+    require_tensor_shape(draft_tokens, DType::I32, {batch}, "MTP topk draft tokens");
+
+    auto proposal_scope = work_.scope();
+    nvtx::ScopedRange proposal_range(nvtx::Name::MtpProposal, nvtx::Category::Mtp,
+                                     static_cast<std::uint64_t>(batch));
+
+    if (proposal_head_ != nullptr) {
+        Tensor proposal_logits = work_.alloc(DType::BF16, {proposal_head_n_, batch});
+        project(hidden, *proposal_head_, proposal_logits, work_, ctx_.stream);
+        ops::logits_topk_softmax(proposal_logits, candidate_ids, proposal_q, draft_tokens,
+                                 proposal_head_ids_, top_k, column_stride, ctx_.stream);
+    } else {
+        Tensor output_logits =
+            work_.alloc(DType::BF16, {dimension(config_.vocab_size), batch});
+        project(hidden, mtp_->output_head, output_logits, work_, ctx_.stream);
+        ops::logits_topk_softmax(output_logits, candidate_ids, proposal_q, draft_tokens, nullptr,
+                                 top_k, column_stride, ctx_.stream);
+    }
+}
+
 void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph) {
     const auto& p  = std::get<AttentionParameters>(w.mixer);
     cudaStream_t s = ctx_.stream;

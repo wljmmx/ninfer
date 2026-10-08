@@ -1,4 +1,4 @@
-#include "models/qwen3_5/program/round_buffers.h"
+﻿#include "models/qwen3_5/program/round_buffers.h"
 #include "models/load_options.h"
 #include <algorithm>
 #include <limits>
@@ -165,6 +165,12 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
                        "MTP decode target continuation hidden");
         decode.proposal_logits = add_tensor(builder, DType::BF16, {layout.spec.output_rows, batch},
                                             "MTP decode proposal logits");
+        decode.candidate_ids   = add_tensor(builder, DType::I32,
+                                            {16, columns - 1, batch},
+                                            "MTP top-16 candidate ids");
+        decode.proposal_q      = add_tensor(builder, DType::FP32,
+                                             {16, columns - 1, batch},
+                                             "MTP top-16 proposal q");
         decode.alignment_ids =
             add_tensor(builder, DType::I32, {columns, batch}, "MTP decode alignment ids");
         decode.alignment_hidden =
@@ -306,6 +312,8 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     target_hidden    = layout.target_hidden.bind(backing);
     target_continuation_hidden = layout.target_continuation_hidden.bind(backing);
     proposal_logits            = layout.proposal_logits.bind(backing);
+    candidate_ids              = layout.candidate_ids.bind(backing);
+    proposal_q                 = layout.proposal_q.bind(backing);
     alignment_ids              = layout.alignment_ids.bind(backing);
     alignment_hidden           = layout.alignment_hidden.bind(backing);
     ar_hidden                  = layout.ar_hidden.bind(backing);

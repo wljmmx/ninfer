@@ -142,6 +142,8 @@ struct MtpDecodeStateLayout {
     TensorRegion target_hidden;
     TensorRegion target_continuation_hidden;
     TensorRegion proposal_logits;
+    TensorRegion candidate_ids;
+    TensorRegion proposal_q;
     TensorRegion alignment_ids;
     TensorRegion alignment_hidden;
     TensorRegion ar_hidden;
@@ -263,6 +265,8 @@ struct MtpDecodeState {
     Tensor target_hidden;
     Tensor target_continuation_hidden;
     Tensor proposal_logits;
+    Tensor candidate_ids;
+    Tensor proposal_q;
     Tensor alignment_ids;
     Tensor alignment_hidden;
     Tensor ar_hidden;

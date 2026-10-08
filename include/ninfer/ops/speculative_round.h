@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "core/tensor.h"
 #include "ninfer/ops/sampling.h"
@@ -188,5 +188,28 @@ void speculative_select_accepted_hidden(const Tensor& hidden, const Tensor& sele
  */
 void proposal_remap_token_ids(Tensor& proposal_tokens, const std::int32_t* id_map,
                               std::int32_t count, cudaStream_t stream);
+
+/**
+ * Op: logits_topk_softmax
+ *
+ * Per column t of logits [V, T], extract the top-K largest (value, index) pairs,
+ * convert to softmax probabilities over the full V, and write the results.
+ * The argmax (top-1) token ID is written separately for the draft chain.
+ *
+ * Shapes / dtypes:
+ *   logits: contiguous BF16 [V, T].
+ *   top_ids: contiguous I32 [K, T].
+ *   top_probs: contiguous FP32 [K, T].
+ *   argmax_ids: contiguous I32 [T].
+ *   id_map: optional DEVICE pointer to V int32 values (indexed→global token
+ *   ID mapping); null for identity.
+ *
+ * Numeric:
+ *   top_probs[i, t] = exp(logits[top_index_i, t]) / sum_v exp(logits[v, t]).
+ *   Ties break by lower index. id_map is applied to all output IDs.
+ */
+void logits_topk_softmax(const Tensor& logits, Tensor& top_ids, Tensor& top_probs,
+                         Tensor& argmax_ids, const std::int32_t* id_map, std::int32_t top_k,
+                         std::int32_t column_stride, cudaStream_t stream);
 
 } // namespace ninfer::ops

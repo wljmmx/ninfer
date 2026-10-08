@@ -1,5 +1,6 @@
-#include "ninfer/ops/speculative_round.h"
+﻿#include "ninfer/ops/speculative_round.h"
 #include "ops/launcher/speculative_round.h"
+#include "ops/launcher/logits_topk_softmax.h"
 
 #include <algorithm>
 #include <limits>
@@ -252,4 +253,16 @@ void proposal_remap_token_ids(Tensor& proposal_tokens, const std::int32_t* id_ma
     detail::proposal_remap_token_ids_launch(proposal_tokens, id_map, n, stream);
 }
 
-} // namespace ninfer::ops
+
+void logits_topk_softmax(const Tensor& logits, Tensor& top_ids, Tensor& top_probs,
+                         Tensor& argmax_ids, const std::int32_t* id_map, std::int32_t top_k,
+                         std::int32_t column_stride, cudaStream_t stream) {
+    if (top_k <= 0 || top_k > 32) {
+        throw std::invalid_argument("logits_topk_softmax: top_k must be in [1,32]");
+    }
+    if (logits.ne[0] < 1 || logits.ne[1] < 1) {
+        throw std::invalid_argument("logits_topk_softmax: logits must have at least one row and column");
+    }
+    detail::logits_topk_softmax_launch(logits, top_ids, top_probs, argmax_ids, id_map, top_k,
+                                       column_stride, stream);
+}} // namespace ninfer::ops

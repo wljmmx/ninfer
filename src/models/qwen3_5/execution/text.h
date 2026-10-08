@@ -151,6 +151,11 @@ public:
                                   ops::CausalAttentionExecutionEnvelope envelope,
                                   Tensor& mtp_hidden);
     void mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens);
+    void mtp_propose_topk(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens,
+                          Tensor* candidate_ids, Tensor* proposal_q, std::int32_t top_k);
+    void mtp_propose_topk_strided(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens,
+                                  Tensor& candidate_ids, Tensor& proposal_q, std::int32_t top_k,
+                                  std::int32_t column_stride);
     void mtp_forward_batch(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                            ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden,
                            int logits_column, Tensor* logits, Tensor* draft_token,
