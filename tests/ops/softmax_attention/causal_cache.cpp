@@ -73,6 +73,43 @@ constexpr ReductionCriterion kAttentionK8V4Criterion{
     /*gross_absolute*/ 5.0e-3,
     /*gross_relative_to_max_reference*/ 1.1e-1,
 };
+// Rank-compressed layouts: 4-bit (or 2-bit) code planes. Budgets start from the INT8
+// profile and open up with the code width; rk4/rk2 carry a 4-bit V in every variant.
+constexpr ReductionCriterion kAttentionRk8V4Criterion{
+    /*relative_l2*/ 5.0e-2,
+    /*gross_absolute*/ 3.0e-3,
+    /*gross_relative_to_max_reference*/ 9.0e-2,
+};
+
+constexpr ReductionCriterion kAttentionRk4Criterion{
+    /*relative_l2*/ 1.3e-1,
+    /*gross_absolute*/ 7.0e-3,
+    /*gross_relative_to_max_reference*/ 2.0e-1,
+};
+
+constexpr ReductionCriterion kAttentionRk2Criterion{
+    /*relative_l2*/ 2.6e-1,
+    /*gross_absolute*/ 1.4e-2,
+    /*gross_relative_to_max_reference*/ 4.0e-1,
+};
+
+// ---------------------------------------------------------------------------
+// Rank-compressed (rk) harness support.
+//
+// The engine owns the rk encoder: the harness uploads the logical BF16 K / FP16 V
+// and lets ops::kv_cache_append write the packed code planes. The harness therefore
+// implements only the *decoder*, and takes the stored planes back from the device
+// (DeviceCache::snapshot / BatchDeviceCache::snapshot_row) before decoding them into
+// the FP64 oracle. The oracle consequently carries kernel error but no quantization
+// error, which is what makes the rk budgets below meaningful. Byte-for-byte caching
+// checks are skipped for rk because the harness deliberately holds no second encoder
+// and hence no independent byte oracle (see verify_cache).
+// ---------------------------------------------------------------------------
+constexpr bool is_rank_compressed(KvCacheStorage storage) {
+    return storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
+           storage == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64 ||
+           storage == KvCacheStorage::RK4V4E8 || storage == KvCacheStorage::RK2V4E8;
+}
 
 struct TestVectorLayout {
     DType code_dtype;
@@ -102,6 +139,20 @@ TestCacheLayout test_cache_layout(KvCacheStorage storage) {
     case KvCacheStorage::Fp8KeyNvfp4Value:
         return {{DType::FP8_E4M3FN, kHeadDim, DType::FP16, kFp8QuantGroups},
                 {DType::U8, kNvfp4CodeBytes, DType::U8, kNvfp4QuantGroups}};
+    // Rank-compressed layouts: packed 4-bit / 2-bit code planes with G64 FP16 scales,
+    // mirroring core/paged_kv_storage.h. Without these cases every width sweep in this
+    // file skipped the rk layouts entirely, which is how the tiled-family
+    // misaligned-address defect escaped.
+    case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
+        return {{DType::I8, kHeadDim, DType::FP16, kQuantGroups},
+                {DType::U8, kHeadDim / 2, DType::FP16, kQuantGroups}};
+    case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
+    case KvCacheStorage::RK4V4E8:
+        return {{DType::U8, kHeadDim / 2, DType::FP16, kQuantGroups},
+                {DType::U8, kHeadDim / 2, DType::FP16, kQuantGroups}};
+    case KvCacheStorage::RK2V4E8:
+        return {{DType::U8, kHeadDim / 4, DType::FP16, kQuantGroups},
+                {DType::U8, kHeadDim / 2, DType::FP16, kQuantGroups}};
     }
     throw std::invalid_argument("unsupported test KV storage");
 }
@@ -650,13 +701,20 @@ void encode_rotated_key_row(std::span<const float> source, std::size_t source_ba
 
 HostCache make_cache(const Geometry& geometry, KvCacheStorage storage, std::int32_t max_context,
                      std::uint32_t seed, float qk_amplitude = 0.25f) {
+
     const std::int32_t logical_capacity = align_up_page(max_context);
     const std::size_t elements          = cache_elements(geometry, logical_capacity);
     std::vector<float> logical_k = make_bf16_values(elements, seed, -qk_amplitude, qk_amplitude);
     std::vector<float> logical_v = make_bf16_values(elements, seed + 1u, -1.0f, 1.0f);
 
     HostCache cache{geometry, storage, max_context, logical_capacity};
-    if (storage == KvCacheStorage::BFloat16) {
+    // Rank-compressed layouts carry the logical BF16 K / FP16 V and let the engine own
+    // the packed encoding: DeviceCache fills the planes by calling ops::kv_cache_append,
+    // so this harness keeps no second codec implementation.
+    if (storage == KvCacheStorage::BFloat16 ||
+        storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
+        storage == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64 ||
+        storage == KvCacheStorage::RK4V4E8 || storage == KvCacheStorage::RK2V4E8) {
         cache.k_bf16 = to_bf16_bits(logical_k);
         cache.v_fp16 = to_f16_bits(logical_v);
         return cache;
@@ -834,12 +892,202 @@ void append_cache(HostCache& cache, const std::vector<float>& k, const std::vect
     }
 }
 
+// Rank-compressed layouts own no host encoder: the harness uploads only the logical BF16 K /
+// FP16 V and lets the engine write the packed code planes through the public append op. Both
+// the single-request and the batch device caches route through here, so the rk cases exercise
+// append+attention end to end with a single encoder implementation.
+void append_rk_planes(const HostCache& cache, std::int32_t capacity, PagedKVLayerView view) {
+    const std::int32_t heads = cache.geometry.kv_heads;
+    const std::size_t count  = static_cast<std::size_t>(kHeadDim) * heads * capacity;
+    std::vector<std::uint16_t> k_input(count);
+    std::vector<std::uint16_t> v_input(count);
+    for (std::int32_t head = 0; head < heads; ++head) {
+        for (std::int32_t position = 0; position < capacity; ++position) {
+            const std::size_t source = cache_index(cache.geometry, capacity, head, position, 0);
+            const std::size_t target =
+                static_cast<std::size_t>(kHeadDim) *
+                (static_cast<std::size_t>(head) +
+                 static_cast<std::size_t>(heads) * static_cast<std::size_t>(position));
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                k_input[target + static_cast<std::size_t>(d)] =
+                    cache.k_bf16[source + static_cast<std::size_t>(d)];
+                // HostCache keeps the logical V in FP16, but the append op takes BF16 K and V
+                // (its production tensor contract). Passing the FP16 bit pattern as BF16 would
+                // reinterpret it and corrupt every V code; every fixture value is
+                // BF16-representable, so this conversion is exact.
+                v_input[target + static_cast<std::size_t>(d)] =
+                    f32_to_bf16(f16_bits_to_f32(cache.v_fp16[source + static_cast<std::size_t>(d)]));
+            }
+        }
+    }
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(capacity));
+    for (std::int32_t i = 0; i < capacity; ++i) positions[static_cast<std::size_t>(i)] = i;
+
+    GuardedDeviceBuffer k_buffer(count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer v_buffer(count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer p_buffer(positions.size() * sizeof(std::int32_t));
+    k_buffer.copy_from_host(k_input.data(), k_input.size() * sizeof(std::uint16_t));
+    v_buffer.copy_from_host(v_input.data(), v_input.size() * sizeof(std::uint16_t));
+    p_buffer.copy_from_host(positions.data(), positions.size() * sizeof(std::int32_t));
+
+    ops::kv_cache_append(Tensor(k_buffer.data(), DType::BF16, {kHeadDim, heads, capacity}),
+                         Tensor(v_buffer.data(), DType::BF16, {kHeadDim, heads, capacity}),
+                         Tensor(p_buffer.data(), DType::I32, {capacity}), view, 0);
+    cuda_check(cudaDeviceSynchronize(), "rk append sync");
+}
+
+// Tables copied verbatim from ops/kernel/e8_root_codec.cuh so the harness can decode the
+// 2-bit E8-cylinder K plane independently; the engine owns the encoder.
+constexpr std::uint64_t kE8CylinderStage1[256] = {
+    0x000000000000fcfcULL, 0x00000000000004fcULL, 0x000000000000fc04ULL, 0x0000000000000404ULL,
+    0x0000000000fc00fcULL, 0x00000000000400fcULL, 0x0000000000fc0004ULL, 0x0000000000040004ULL,
+    0x00000000fc0000fcULL, 0x00000000040000fcULL, 0x00000000fc000004ULL, 0x0000000004000004ULL,
+    0x000000fc000000fcULL, 0x00000004000000fcULL, 0x000000fc00000004ULL, 0x0000000400000004ULL,
+    0x0000fc00000000fcULL, 0x00000400000000fcULL, 0x0000fc0000000004ULL, 0x0000040000000004ULL,
+    0x00fc0000000000fcULL, 0x00040000000000fcULL, 0x00fc000000000004ULL, 0x0004000000000004ULL,
+    0xfc000000000000fcULL, 0x04000000000000fcULL, 0xfc00000000000004ULL, 0x0400000000000004ULL,
+    0x0000000000fcfc00ULL, 0x000000000004fc00ULL, 0x0000000000fc0400ULL, 0x0000000000040400ULL,
+    0x00000000fc00fc00ULL, 0x000000000400fc00ULL, 0x00000000fc000400ULL, 0x0000000004000400ULL,
+    0x000000fc0000fc00ULL, 0x000000040000fc00ULL, 0x000000fc00000400ULL, 0x0000000400000400ULL,
+    0x0000fc000000fc00ULL, 0x000004000000fc00ULL, 0x0000fc0000000400ULL, 0x0000040000000400ULL,
+    0x00fc00000000fc00ULL, 0x000400000000fc00ULL, 0x00fc000000000400ULL, 0x0004000000000400ULL,
+    0xfc0000000000fc00ULL, 0x040000000000fc00ULL, 0xfc00000000000400ULL, 0x0400000000000400ULL,
+    0x00000000fcfc0000ULL, 0x0000000004fc0000ULL, 0x00000000fc040000ULL, 0x0000000004040000ULL,
+    0x000000fc00fc0000ULL, 0x0000000400fc0000ULL, 0x000000fc00040000ULL, 0x0000000400040000ULL,
+    0x0000fc0000fc0000ULL, 0x0000040000fc0000ULL, 0x0000fc0000040000ULL, 0x0000040000040000ULL,
+    0x00fc000000fc0000ULL, 0x0004000000fc0000ULL, 0x00fc000000040000ULL, 0x0004000000040000ULL,
+    0xfc00000000fc0000ULL, 0x0400000000fc0000ULL, 0xfc00000000040000ULL, 0x0400000000040000ULL,
+    0x000000fcfc000000ULL, 0x00000004fc000000ULL, 0x000000fc04000000ULL, 0x0000000404000000ULL,
+    0x0000fc00fc000000ULL, 0x00000400fc000000ULL, 0x0000fc0004000000ULL, 0x0000040004000000ULL,
+    0x00fc0000fc000000ULL, 0x00040000fc000000ULL, 0x00fc000004000000ULL, 0x0004000004000000ULL,
+    0xfc000000fc000000ULL, 0x04000000fc000000ULL, 0xfc00000004000000ULL, 0x0400000004000000ULL,
+    0x0000fcfc00000000ULL, 0x000004fc00000000ULL, 0x0000fc0400000000ULL, 0x0000040400000000ULL,
+    0x00fc00fc00000000ULL, 0x000400fc00000000ULL, 0x00fc000400000000ULL, 0x0004000400000000ULL,
+    0xfc0000fc00000000ULL, 0x040000fc00000000ULL, 0xfc00000400000000ULL, 0x0400000400000000ULL,
+    0x00fcfc0000000000ULL, 0x0004fc0000000000ULL, 0x00fc040000000000ULL, 0x0004040000000000ULL,
+    0xfc00fc0000000000ULL, 0x0400fc0000000000ULL, 0xfc00040000000000ULL, 0x0400040000000000ULL,
+    0xfcfc000000000000ULL, 0x04fc000000000000ULL, 0xfc04000000000000ULL, 0x0404000000000000ULL,
+    0xfefefefefefefefeULL, 0x02fefefefefefe02ULL, 0x02fefefefefe02feULL, 0xfefefefefefe0202ULL,
+    0x02fefefefe02fefeULL, 0xfefefefefe02fe02ULL, 0xfefefefefe0202feULL, 0x02fefefefe020202ULL,
+    0x02fefefe02fefefeULL, 0xfefefefe02fefe02ULL, 0xfefefefe02fe02feULL, 0x02fefefe02fe0202ULL,
+    0xfefefefe0202fefeULL, 0x02fefefe0202fe02ULL, 0x02fefefe020202feULL, 0xfefefefe02020202ULL,
+    0x02fefe02fefefefeULL, 0xfefefe02fefefe02ULL, 0xfefefe02fefe02feULL, 0x02fefe02fefe0202ULL,
+    0xfefefe02fe02fefeULL, 0x02fefe02fe02fe02ULL, 0x02fefe02fe0202feULL, 0xfefefe02fe020202ULL,
+    0xfefefe0202fefefeULL, 0x02fefe0202fefe02ULL, 0x02fefe0202fe02feULL, 0xfefefe0202fe0202ULL,
+    0x02fefe020202fefeULL, 0xfefefe020202fe02ULL, 0xfefefe02020202feULL, 0x02fefe0202020202ULL,
+    0x02fe02fefefefefeULL, 0xfefe02fefefefe02ULL, 0xfefe02fefefe02feULL, 0x02fe02fefefe0202ULL,
+    0xfefe02fefe02fefeULL, 0x02fe02fefe02fe02ULL, 0x02fe02fefe0202feULL, 0xfefe02fefe020202ULL,
+    0xfefe02fe02fefefeULL, 0x02fe02fe02fefe02ULL, 0x02fe02fe02fe02feULL, 0xfefe02fe02fe0202ULL,
+    0x02fe02fe0202fefeULL, 0xfefe02fe0202fe02ULL, 0xfefe02fe020202feULL, 0x02fe02fe02020202ULL,
+    0xfefe0202fefefefeULL, 0x02fe0202fefefe02ULL, 0x02fe0202fefe02feULL, 0xfefe0202fefe0202ULL,
+    0x02fe0202fe02fefeULL, 0xfefe0202fe02fe02ULL, 0xfefe0202fe0202feULL, 0x02fe0202fe020202ULL,
+    0x02fe020202fefefeULL, 0xfefe020202fefe02ULL, 0xfefe020202fe02feULL, 0x02fe020202fe0202ULL,
+    0xfefe02020202fefeULL, 0x02fe02020202fe02ULL, 0x02fe0202020202feULL, 0xfefe020202020202ULL,
+    0x0202fefefefefefeULL, 0xfe02fefefefefe02ULL, 0xfe02fefefefe02feULL, 0x0202fefefefe0202ULL,
+    0xfe02fefefe02fefeULL, 0x0202fefefe02fe02ULL, 0x0202fefefe0202feULL, 0xfe02fefefe020202ULL,
+    0xfe02fefe02fefefeULL, 0x0202fefe02fefe02ULL, 0x0202fefe02fe02feULL, 0xfe02fefe02fe0202ULL,
+    0x0202fefe0202fefeULL, 0xfe02fefe0202fe02ULL, 0xfe02fefe020202feULL, 0x0202fefe02020202ULL,
+    0xfe02fe02fefefefeULL, 0x0202fe02fefefe02ULL, 0x0202fe02fefe02feULL, 0xfe02fe02fefe0202ULL,
+    0x0202fe02fe02fefeULL, 0xfe02fe02fe02fe02ULL, 0xfe02fe02fe0202feULL, 0x0202fe02fe020202ULL,
+    0x0202fe0202fefefeULL, 0xfe02fe0202fefe02ULL, 0xfe02fe0202fe02feULL, 0x0202fe0202fe0202ULL,
+    0xfe02fe020202fefeULL, 0x0202fe020202fe02ULL, 0x0202fe02020202feULL, 0xfe02fe0202020202ULL,
+    0xfe0202fefefefefeULL, 0x020202fefefefe02ULL, 0x020202fefefe02feULL, 0xfe0202fefefe0202ULL,
+    0x020202fefe02fefeULL, 0xfe0202fefe02fe02ULL, 0xfe0202fefe0202feULL, 0x020202fefe020202ULL,
+    0x020202fe02fefefeULL, 0xfe0202fe02fefe02ULL, 0xfe0202fe02fe02feULL, 0x020202fe02fe0202ULL,
+    0xfe0202fe0202fefeULL, 0x020202fe0202fe02ULL, 0x020202fe020202feULL, 0xfe0202fe02020202ULL,
+    0x02020202fefefefeULL, 0xfe020202fefefe02ULL, 0xfe020202fefe02feULL, 0x02020202fefe0202ULL,
+    0xfe020202fe02fefeULL, 0x02020202fe02fe02ULL, 0x02020202fe0202feULL, 0xfe020202fe020202ULL,
+    0xfe02020202fefefeULL, 0x0202020202fefe02ULL, 0x0202020202fe02feULL, 0xfe02020202fe0202ULL,
+    0x020202020202fefeULL, 0xfe0202020202fe02ULL, 0xfe020202020202feULL, 0x0202020202020202ULL,
+    0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+    0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+    0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+    0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+};
+constexpr std::uint64_t kE8CylinderAxis[16] = {
+    0x0000000000000001ULL, 0x00000000000000ffULL, 0x0000000000000100ULL, 0x000000000000ff00ULL,
+    0x0000000000010000ULL, 0x0000000000ff0000ULL, 0x0000000001000000ULL, 0x00000000ff000000ULL,
+    0x0000000100000000ULL, 0x000000ff00000000ULL, 0x0000010000000000ULL, 0x0000ff0000000000ULL,
+    0x0001000000000000ULL, 0x00ff000000000000ULL, 0x0100000000000000ULL, 0xff00000000000000ULL,
+};
+constexpr float kE8CylinderRadius[16] = {
+    0.0000f, 0.0992f, 0.1250f, 0.1575f,
+    0.1984f, 0.2500f, 0.3150f, 0.3969f,
+    0.5000f, 0.6300f, 0.7937f, 1.0000f,
+    1.2599f, 1.5874f, 2.0000f, 2.5198f,
+};
+
+
+// Host port of the engine's 4-bit unpack and 2-bit E8-cylinder decode. The tables above
+// are copied verbatim from ops/kernel/e8_root_codec.cuh; the decode mirrors
+// e8_root_decode_8d_fast, with a saturating scalar add replacing the PTX vadd4 (same
+// saturation, same round-to-nearest-even).
+std::int8_t rk4_unpack_host(std::uint8_t packed, int high) {
+    std::int8_t code = high ? static_cast<std::int8_t>(packed >> 4)
+                            : static_cast<std::int8_t>(packed);
+    code &= 0xF;
+    if (code >= 8) { code -= 16; }
+    return code;
+}
+
+void e8_root_decode_8d_host(std::uint8_t root_code, std::uint8_t rad_axis_code,
+                            std::int8_t out[8]) {
+    const std::uint32_t rad_idx  = static_cast<std::uint32_t>(rad_axis_code >> 4);
+    const std::uint32_t axis_idx = static_cast<std::uint32_t>(rad_axis_code & 0x0Fu);
+    if (rad_idx == 0) {
+        std::memset(out, 0, 8);
+        return;
+    }
+    const auto* root  = reinterpret_cast<const std::int8_t*>(&kE8CylinderStage1[root_code]);
+    const auto* axis  = reinterpret_cast<const std::int8_t*>(&kE8CylinderAxis[axis_idx]);
+    const float scale = kE8CylinderRadius[rad_idx];
+    for (int i = 0; i < 8; ++i) {
+        int sum = static_cast<int>(root[i]) + static_cast<int>(axis[i]);
+        sum     = std::clamp(sum, -128, 127);
+        out[i]  = static_cast<std::int8_t>(round_even_to_i32(static_cast<float>(sum) * scale));
+    }
+}
 double cache_value(const HostCache& cache, bool key, int head, int position, int d) {
     const std::size_t row   = std::size_t(head) * cache.logical_capacity + position;
     const std::size_t index = row * kHeadDim + d;
     if (cache.storage == KvCacheStorage::BFloat16)
         return key ? double(bf16_to_f32(cache.k_bf16[index]))
                    : double(f16_bits_to_f32(cache.v_fp16[index]));
+    if (is_rank_compressed(cache.storage)) {
+        // K is Hadamard-rotated and V stays raw (ops/kv_cache/append/rk_kernel.cuh), and
+        // both planes carry per-G64 FP16 scales, so ideal_attention's rotate_q=true /
+        // rotate_v=false split already matches this decode.
+        const TestCacheLayout layout    = test_cache_layout(cache.storage);
+        const std::int32_t code_extent  = key ? layout.key.code_extent : layout.value.code_extent;
+        const std::int32_t scale_extent = key ? layout.key.scale_extent : layout.value.scale_extent;
+        const auto& codes               = key ? cache.k_i8 : cache.v_i8;
+        const auto& scales              = key ? cache.k_scale : cache.v_scale;
+        const std::size_t scale_at      = logical_plane_index(
+            scale_extent, cache.geometry, cache.logical_capacity, head, position, d / kQuantGroup);
+        const double scale = double(f16_bits_to_f32(scales[scale_at]));
+        if (key && cache.storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64) {
+            const std::size_t at = logical_plane_index(code_extent, cache.geometry,
+                                                       cache.logical_capacity, head, position, d);
+            return double(codes[at]) * scale;
+        }
+        if (key && cache.storage == KvCacheStorage::RK2V4E8) {
+            // 2-bit E8 cylinder: one (root, rad_axis) byte pair per 8-dim subspace, so
+            // 16 bytes per G64 group and 64 bytes per token.
+            const std::int32_t group = d / kQuantGroup;
+            const std::int32_t sub   = (d % kQuantGroup) / 8;
+            const std::size_t at     = logical_plane_index(code_extent, cache.geometry,
+                                                           cache.logical_capacity, head, position,
+                                                           group * 16 + sub * 2);
+            std::int8_t decoded[8];
+            e8_root_decode_8d_host(static_cast<std::uint8_t>(codes[at]),
+                                   static_cast<std::uint8_t>(codes[at + 1]), decoded);
+            return double(decoded[d % 8]) * scale;
+        }
+        // Packed int4: the K plane for rk4v4 / rk4v4-e8 and the V plane for every layout.
+        const std::size_t at = logical_plane_index(code_extent, cache.geometry,
+                                                   cache.logical_capacity, head, position, d / 2);
+        return double(rk4_unpack_host(static_cast<std::uint8_t>(codes[at]), d & 1)) * scale;
+    }
     if (cache.storage == KvCacheStorage::Int8Group64) {
         const auto& codes  = key ? cache.k_i8 : cache.v_i8;
         const auto& scales = key ? cache.k_scale : cache.v_scale;
@@ -1019,7 +1267,7 @@ public:
             v_.copy_from_host(v_physical.data(), v_physical.size());
             k_scale_.copy_from_host(ks_physical.data(), ks_physical.size() * sizeof(std::uint16_t));
             v_scale_.copy_from_host(vs_physical.data(), vs_physical.size());
-        } else {
+        } else if (storage_ == KvCacheStorage::Nvfp4Group16) {
             const auto k_physical =
                 scatter_paged(cache.k_nvfp4, kNvfp4CodeBytes, geometry_, logical_capacity_,
                               block_table_host_, physical_pages_);
@@ -1036,7 +1284,16 @@ public:
             v_.copy_from_host(v_physical.data(), v_physical.size());
             k_scale_.copy_from_host(ks_physical.data(), ks_physical.size());
             v_scale_.copy_from_host(vs_physical.data(), vs_physical.size());
+        } else {
+            fill_rk_planes(cache);
         }
+    }
+
+    // Route B for the rank-compressed layouts: the engine append op writes the packed
+    // code planes and G64 scales, so the harness never re-implements a codec and the rk
+    // cases cover append plus attention end to end.
+    void fill_rk_planes(const HostCache& cache) {
+        append_rk_planes(cache, logical_capacity_, view());
     }
 
     PagedKVLayerView view() {
@@ -1126,6 +1383,23 @@ public:
                                                         logical_capacity_, block_table_host_);
             cache.v_nvfp4_scale = gather_paged<std::uint8_t>(
                 vs_physical, kNvfp4QuantGroups, geometry_, logical_capacity_, block_table_host_);
+        } else if (is_rank_compressed(storage_)) {
+            // Read the engine-written packed planes back, in logical [extent, position, head]
+            // order, so cache_value() can decode them into the FP64 oracle.
+            const auto k_physical  = copy_from_guarded<std::int8_t>(k_, k_code_elements_);
+            const auto v_physical  = copy_from_guarded<std::int8_t>(v_, v_code_elements_);
+            const auto ks_physical = copy_from_guarded<std::uint16_t>(k_scale_, k_scale_elements_);
+            const auto vs_physical = copy_from_guarded<std::uint16_t>(v_scale_, v_scale_elements_);
+            cache.k_i8 = gather_paged<std::int8_t>(k_physical, layout_.key.code_extent, geometry_,
+                                                   logical_capacity_, block_table_host_);
+            cache.v_i8 = gather_paged<std::int8_t>(v_physical, layout_.value.code_extent, geometry_,
+                                                   logical_capacity_, block_table_host_);
+            cache.k_scale =
+                gather_paged<std::uint16_t>(ks_physical, layout_.key.scale_extent, geometry_,
+                                            logical_capacity_, block_table_host_);
+            cache.v_scale =
+                gather_paged<std::uint16_t>(vs_physical, layout_.value.scale_extent, geometry_,
+                                            logical_capacity_, block_table_host_);
         } else {
             const auto k_physical  = copy_from_guarded<std::uint8_t>(k_, k_code_elements_);
             const auto v_physical  = copy_from_guarded<std::uint8_t>(v_, v_code_elements_);
@@ -1269,6 +1543,27 @@ public:
                 copy_from_guarded<std::uint8_t>(v_scale_, v_scale_.bytes())};
     }
 
+    // Rank-compressed rows: read one pool row's engine-written packed planes back so the
+    // FP64 oracle can decode the stored representation (there is no host encoder).
+    HostCache snapshot_row(std::size_t row) const {
+        HostCache cache{geometry_, storage_, logical_capacity_, logical_capacity_};
+        if (!is_rank_compressed(storage_)) return cache;
+        const std::span<const std::int32_t> table = row_table(row);
+        const auto k_physical  = copy_from_guarded<std::int8_t>(k_, k_code_elements_);
+        const auto v_physical  = copy_from_guarded<std::int8_t>(v_, v_code_elements_);
+        const auto ks_physical = copy_from_guarded<std::uint16_t>(k_scale_, k_scale_elements_);
+        const auto vs_physical = copy_from_guarded<std::uint16_t>(v_scale_, v_scale_elements_);
+        cache.k_i8 = gather_paged<std::int8_t>(k_physical, layout_.key.code_extent, geometry_,
+                                               logical_capacity_, table);
+        cache.v_i8 = gather_paged<std::int8_t>(v_physical, layout_.value.code_extent, geometry_,
+                                               logical_capacity_, table);
+        cache.k_scale = gather_paged<std::uint16_t>(ks_physical, layout_.key.scale_extent,
+                                                    geometry_, logical_capacity_, table);
+        cache.v_scale = gather_paged<std::uint16_t>(vs_physical, layout_.value.scale_extent,
+                                                    geometry_, logical_capacity_, table);
+        return cache;
+    }
+
     void copy_from(const BatchDeviceCache& source) {
         const std::array<const GuardedDeviceBuffer*, 4> from{&source.k_, &source.v_,
                                                              &source.k_scale_, &source.v_scale_};
@@ -1340,7 +1635,13 @@ public:
             return 1;
         }
         int failures = 0;
-        if (storage_ == KvCacheStorage::BFloat16) {
+        if (is_rank_compressed(storage_)) {
+            // Engine-owned encoder: no independent byte oracle for the packed planes (see
+            // verify_cache). The decoded FP64 attention comparison in run_batch_case is the
+            // actual check for these layouts; the block-table and guard checks below still run.
+            (void)label;
+            (void)expected;
+        } else if (storage_ == KvCacheStorage::BFloat16) {
             std::vector<std::uint16_t> expected_k(k_code_elements_, 0);
             std::vector<std::uint16_t> expected_v(v_code_elements_, 0);
             scatter_bf16_rows(expected, expected_k, expected_v);
@@ -1496,6 +1797,13 @@ private:
     }
 
     void upload_rows(std::span<const HostCache> rows) {
+        if (is_rank_compressed(storage_)) {
+            // Each pool row is filled by the engine append op against its own block table.
+            for (std::size_t row = 0; row < rows_; ++row) {
+                append_rk_planes(rows[row], logical_capacity_, single_view(static_cast<int>(row)));
+            }
+            return;
+        }
         if (storage_ == KvCacheStorage::BFloat16) {
             std::vector<std::uint16_t> physical_k(k_code_elements_, 0);
             std::vector<std::uint16_t> physical_v(v_code_elements_, 0);
@@ -1612,6 +1920,14 @@ private:
 
 int verify_cache(const std::string& label, const HostCache& got, const HostCache& expected) {
     int failures = 0;
+    if (is_rank_compressed(expected.storage)) {
+        // The engine owns the rk encoder, so the harness deliberately holds no independent
+        // byte oracle for the packed planes; the decoded FP64 attention comparison is the
+        // actual check for these layouts (see run_a1_case / run_a3_case).
+        (void)got;
+        (void)label;
+        return 0;
+    }
     if (expected.storage == KvCacheStorage::BFloat16) {
         failures += verify_exact((label + " cache-k").c_str(), got.k_bf16, expected.k_bf16);
         failures += verify_exact((label + " cache-v").c_str(), got.v_fp16, expected.v_fp16);
@@ -1678,6 +1994,14 @@ const char* cache_name(KvCacheStorage storage) {
         return "nvfp4-g16";
     case KvCacheStorage::Fp8KeyNvfp4Value:
         return "k8v4";
+    case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
+        return "rk8v4";
+    case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
+        return "rk4v4";
+    case KvCacheStorage::RK4V4E8:
+        return "rk4v4-e8";
+    case KvCacheStorage::RK2V4E8:
+        return "rk2v4-e8";
     }
     return "unknown";
 }
@@ -1688,6 +2012,10 @@ ReductionCriterion attention_criterion(KvCacheStorage storage) {
     if (storage == KvCacheStorage::Fp8E4M3Row256) return kAttentionFp8Criterion;
     if (storage == KvCacheStorage::Nvfp4Group16) return kAttentionNvfp4Criterion;
     if (storage == KvCacheStorage::Fp8KeyNvfp4Value) return kAttentionK8V4Criterion;
+    if (storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64) return kAttentionRk8V4Criterion;
+    if (storage == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64) return kAttentionRk4Criterion;
+    if (storage == KvCacheStorage::RK4V4E8) return kAttentionRk4Criterion;
+    if (storage == KvCacheStorage::RK2V4E8) return kAttentionRk2Criterion;
     throw std::logic_error("unregistered causal-attention test storage");
 }
 
@@ -1772,8 +2100,7 @@ int run_a1_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
     const std::size_t q_elements = static_cast<std::size_t>(kHeadDim) *
                                    static_cast<std::size_t>(geometry.q_heads) *
                                    static_cast<std::size_t>(test_case.tokens);
-    const std::size_t kv_elements = static_cast<std::size_t>(kHeadDim) *
-                                    static_cast<std::size_t>(geometry.kv_heads) *
+    const std::size_t kv_elements = static_cast<std::size_t>(kHeadDim) *                                    static_cast<std::size_t>(geometry.kv_heads) *
                                     static_cast<std::size_t>(test_case.tokens);
     const float amplitude = test_case.qk_amplitude;
     std::vector<float> q  = make_bf16_values(q_elements, test_case.seed, -amplitude, amplitude);
@@ -1792,10 +2119,7 @@ int run_a1_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
     const HostCache initial =
         make_cache(geometry, storage, total + 3, test_case.seed + 10u, amplitude);
     HostCache expected = initial;
-    append_cache(expected, k, v, positions);
-    const std::vector<double> reference =
-        ideal_attention(select_query_columns(q, kHeadDim * geometry.q_heads, oracle_queries),
-                        expected, select_query_columns(positions, 1, oracle_queries));
+    if (!is_rank_compressed(storage)) append_cache(expected, k, v, positions);
     DeviceCache cache(initial, mapping, max_context);
 
     const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
@@ -1833,6 +2157,18 @@ int run_a1_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
                                        kAttentionScale, cache.batch_view(), envelope, workspace,
                                        tout, execution.on_stream(stream));
     };
+    // Rank-compressed layouts have no host encoder: the FP64 oracle decodes the planes the
+    // engine wrote. The fused entry appends the new tokens during its own call, so a
+    // synchronous prime (the same prime graph capture already performs) has to run before the
+    // read-back; launching twice is idempotent.
+    if (is_rank_compressed(storage)) {
+        launch(nullptr);
+        cuda_synchronize();
+        expected = cache.snapshot();
+    }
+    const std::vector<double> reference =
+        ideal_attention(select_query_columns(q, kHeadDim * geometry.q_heads, oracle_queries),
+                        expected, select_query_columns(positions, 1, oracle_queries));
     if (graph_limits.empty()) {
         launch_attention_case(launch, test_case.graph_replay);
     } else {
@@ -1912,12 +2248,13 @@ int run_a3_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
     const ops::CausalAttentionExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
                                                          test_case.envelope_max};
 
-    const HostCache cache_host =
+    HostCache cache_host =
         make_cache(geometry, storage, total + 3, test_case.seed + 10u, amplitude);
+    DeviceCache cache(cache_host, mapping, max_context);
+    if (is_rank_compressed(storage)) cache_host = cache.snapshot();
     const std::vector<double> reference =
         ideal_attention(select_query_columns(q, kHeadDim * geometry.q_heads, oracle_queries),
                         cache_host, select_query_columns(positions, 1, oracle_queries));
-    DeviceCache cache(cache_host, mapping, max_context);
 
     const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
     GuardedDeviceBuffer dq(q_bits.size() * sizeof(std::uint16_t));
@@ -2110,17 +2447,19 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
         const auto before = cache.snapshot_bytes();
         if (control) control->copy_from(cache);
         std::vector<double> reference(q.size(), 0.0);
-        for (int b = 0; b < batch; ++b)
-            if (valid[b]) {
-                const std::vector<int> row_positions(positions.begin() + b * width,
-                                                     positions.begin() + b * width + valid[b]);
-                auto row_q = extract_request_columns(q, q_column_elements, width, b, valid[b]);
-                auto row_k = extract_request_columns(k, kv_column_elements, width, b, valid[b]);
-                auto row_v = extract_request_columns(v, kv_column_elements, width, b, valid[b]);
-                append_cache(expected[lanes[b]], row_k, row_v, row_positions);
-                insert_request_columns(ideal_attention(row_q, expected[lanes[b]], row_positions),
-                                       q_column_elements, width, b, reference);
-            }
+        if (!is_rank_compressed(storage)) {
+            for (int b = 0; b < batch; ++b)
+                if (valid[b]) {
+                    const std::vector<int> row_positions(positions.begin() + b * width,
+                                                         positions.begin() + b * width + valid[b]);
+                    auto row_q = extract_request_columns(q, q_column_elements, width, b, valid[b]);
+                    auto row_k = extract_request_columns(k, kv_column_elements, width, b, valid[b]);
+                    auto row_v = extract_request_columns(v, kv_column_elements, width, b, valid[b]);
+                    append_cache(expected[lanes[b]], row_k, row_v, row_positions);
+                    insert_request_columns(ideal_attention(row_q, expected[lanes[b]], row_positions),
+                                           q_column_elements, width, b, reference);
+                }
+        }
         if (test_case.graph_replay && (phase == 0 || !graph_limits.empty())) {
             launch();
             cuda_synchronize(
@@ -2139,6 +2478,20 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
         else
             launch();
         cuda_synchronize(execution.stream);
+        if (is_rank_compressed(storage)) {
+            // The launch (or its graph) performed the append, so the packed planes are only
+            // populated now: decode each pool row back to build the FP64 oracle.
+            for (int b = 0; b < batch; ++b)
+                if (valid[b]) {
+                    const std::vector<int> row_positions(positions.begin() + b * width,
+                                                         positions.begin() + b * width + valid[b]);
+                    auto row_q = extract_request_columns(q, q_column_elements, width, b, valid[b]);
+                    const HostCache row_cache =
+                        cache.snapshot_row(static_cast<std::size_t>(lanes[b]));
+                    insert_request_columns(ideal_attention(row_q, row_cache, row_positions),
+                                           q_column_elements, width, b, reference);
+                }
+        }
         const std::string label = std::string("causal batch ") + geometry.name + " " +
                                   cache_name(storage) + " W=" + std::to_string(width) +
                                   " B=" + std::to_string(batch) + " phase=" + std::to_string(phase);
@@ -2316,7 +2669,13 @@ int run_batch_cases(DeviceExecutionView execution, KvCacheStorage storage) {
                                {16, {0}, {0}, {0}, MappingPattern::Fragmented, 1501u});
     failures += run_batch_case(execution, kGeometries[0], storage,
                                {16, {0}, {1}, {0}, MappingPattern::Fragmented, 1502u});
-    if (storage == KvCacheStorage::BFloat16) {
+    // Rank-compressed layouts carry the logical BF16 K / FP16 V and let the engine own
+    // the packed encoding: DeviceCache fills the planes by calling ops::kv_cache_append,
+    // so this harness keeps no second codec implementation.
+    if (storage == KvCacheStorage::BFloat16 ||
+        storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
+        storage == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64 ||
+        storage == KvCacheStorage::RK4V4E8 || storage == KvCacheStorage::RK2V4E8) {
         failures += run_batch_case(execution, kGeometries[0], storage,
                                    {16, {49}, {7}, {0}, MappingPattern::Identity, 500u});
         failures +=
@@ -2715,6 +3074,9 @@ int run_small_prefill_cases(DeviceExecutionView execution, KvCacheStorage storag
 }
 
 int run_storage_cases(DeviceExecutionView execution, KvCacheStorage storage) {
+    // Rank-compressed layouts run the same suite matrix: the layouts, names and tolerances
+    // are registered, the cache is filled by the engine append op (append_rk_planes), and the
+    // FP64 oracle decodes the packed planes read back from the device.
     int failures = verify_workspace_capacity_contract(execution, storage);
     if (storage == KvCacheStorage::Nvfp4Group16) {
         failures += run_nvfp4_cases(execution);
@@ -2760,7 +3122,10 @@ int run_softmax_attention_causal_cache_tests(std::optional<KvCacheStorage> selec
     int failures         = 0;
     for (const auto storage :
          {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
-          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value,
+          KvCacheStorage::RotatedInt8KeyInt4ValueGroup64,
+          KvCacheStorage::RotatedInt4KeyInt4ValueGroup64, KvCacheStorage::RK4V4E8,
+          KvCacheStorage::RK2V4E8}) {
         if (selected && storage != *selected) continue;
         const auto start = std::chrono::steady_clock::now();
         std::cout << "RUN causal_softmax_attention " << cache_name(storage) << std::endl;

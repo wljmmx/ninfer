@@ -192,7 +192,7 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
                 }
             } else {
                 store_vec(kd, make_int4(0, 0, 0, 0));
-                store_vec(vd, make_int4(0, 0, 0, 0));
+                rk4_zero_packed_v<PackedV>(&v_i8[key_l * D], d);
             }
         }
         ninfer::ops::cp_commit();

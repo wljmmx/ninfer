@@ -3,6 +3,7 @@
 
 #include "core/device.h"
 #include "ops/common/math.h"
+#include "ops/kv_cache/append/kv_dump.h"
 #include "ops/kv_cache/append/rk_kernel.cuh"
 
 #include <cstdint>
@@ -80,6 +81,7 @@ template <bool PackedK, bool E8Lattice, bool E8Root>
 void rk_batch_entry(const Tensor& k, const Tensor& v, const Tensor& positions,
                     const Tensor& valid_columns, const Tensor& table_rows,
                     PagedKVBatchLayerView cache, cudaStream_t stream) {
+    kv_dump_capture(k, v, stream); // no-op unless NINFER_KV_DUMP names a file
     const auto launch = [&]<bool Masked>() {
         const PagedKVBatchMetadata<Masked> metadata{
             .tables = static_cast<const std::int32_t*>(cache.block_tables.data),

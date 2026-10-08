@@ -485,12 +485,21 @@ void rk4v4_kv_cached_attention(const Tensor& q, const Tensor& positions, float s
     const auto plan =
         make_int8_kv_causal_plan(q.ne[1], q.ne[2], 1, envelope, execution.multiprocessor_count);
     const auto view = single_row_paged_kv_batch_view(cache);
-    // rk4v4's K plane is int4-packed: the cached read must use PackedKOnly
-    // (routing through Plain read int4 nibbles as int8 codes).
-    rk_execute_grouped<CausalCachedInput, RkVariant::PackedKOnly>(q, positions, scale, view,
-                                                                 nullptr, nullptr,
-                                                                 CausalCachedInput{}, plan,
-                                                                 workspace, out, stream);
+    if (plan.family == Int8KvFamily::Grouped) {
+        // rk4v4's K plane is int4-packed: the cached read must use PackedKOnly
+        // (routing through Plain read int4 nibbles as int8 codes).
+        rk_execute_grouped<CausalCachedInput, RkVariant::PackedKOnly>(q, positions, scale, view,
+                                                                     nullptr, nullptr,
+                                                                     CausalCachedInput{}, plan,
+                                                                     workspace, out, stream);
+        return;
+    }
+    const auto p     = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
+    const auto qview = make_quantized_causal_cache_view<Int8KvCacheView<false>>(view);
+    if (plan.family == Int8KvFamily::Tiled)
+        rk_tiled<true, true>(p, qview, stream);
+    else
+        rk_execute_parallel<RkVariant::PackedKOnly>(p, qview, plan, workspace, stream);
 }
 
 // --- rk8v4 attention (8-bit K + int4 V, reuses rk4v4 dispatch) --------------------
@@ -531,10 +540,19 @@ void rk8v4_kv_cached_attention(const Tensor& q, const Tensor& positions, float s
     const auto plan =
         make_int8_kv_causal_plan(q.ne[1], q.ne[2], 1, envelope, execution.multiprocessor_count);
     const auto view = single_row_paged_kv_batch_view(cache);
-    // rk8v4's K plane is plain int8: the cached read stays on Plain (PackedV only).
-    rk_execute_grouped<CausalCachedInput, RkVariant::Plain>(q, positions, scale, view, nullptr,
-                                                            nullptr, CausalCachedInput{}, plan,
-                                                            workspace, out, stream);
+    if (plan.family == Int8KvFamily::Grouped) {
+        // rk8v4's K plane is plain int8: the cached read stays on Plain (PackedV only).
+        rk_execute_grouped<CausalCachedInput, RkVariant::Plain>(q, positions, scale, view, nullptr,
+                                                                nullptr, CausalCachedInput{}, plan,
+                                                                workspace, out, stream);
+        return;
+    }
+    const auto p     = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
+    const auto qview = make_quantized_causal_cache_view<Int8KvCacheView<false>>(view);
+    if (plan.family == Int8KvFamily::Tiled)
+        rk_tiled<true>(p, qview, stream);
+    else
+        rk_execute_parallel<RkVariant::Plain>(p, qview, plan, workspace, stream);
 }
 
 // --- rk4v4-e8 attention (E8 lattice K + int4 V) -----------------------------------
@@ -577,8 +595,17 @@ void rk4v4e8_kv_cached_attention(const Tensor& q, const Tensor& positions, float
     const auto plan =
         make_int8_kv_causal_plan(q.ne[1], q.ne[2], 1, envelope, execution.multiprocessor_count);
     const auto view = single_row_paged_kv_batch_view(cache);
-    rk_execute_grouped<CausalCachedInput, RkVariant::E8Lattice>(q, positions, scale, view, nullptr, nullptr,
-                                                CausalCachedInput{}, plan, workspace, out, stream);
+    if (plan.family == Int8KvFamily::Grouped) {
+        rk_execute_grouped<CausalCachedInput, RkVariant::E8Lattice>(q, positions, scale, view, nullptr, nullptr,
+                                                    CausalCachedInput{}, plan, workspace, out, stream);
+        return;
+    }
+    const auto p     = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
+    const auto qview = make_quantized_causal_cache_view<Int8KvCacheView<false>>(view);
+    if (plan.family == Int8KvFamily::Tiled)
+        rk_tiled<true, true>(p, qview, stream);
+    else
+        rk_execute_parallel<RkVariant::E8Lattice>(p, qview, plan, workspace, stream);
 }
 
 // --- rk2v4-e8 attention (E8 cylinder 2-bit K + int4 V) -----------------------------
@@ -623,9 +650,18 @@ void rk2v4e8_kv_cached_attention(const Tensor& q, const Tensor& positions, float
     const auto plan =
         make_int8_kv_causal_plan(q.ne[1], q.ne[2], 1, envelope, execution.multiprocessor_count);
     const auto view = single_row_paged_kv_batch_view(cache);
-    rk_execute_grouped<CausalCachedInput, RkVariant::E8Root>(q, positions, scale, view, nullptr,
-                                                              nullptr, CausalCachedInput{}, plan,
-                                                              workspace, out, stream);
+    if (plan.family == Int8KvFamily::Grouped) {
+        rk_execute_grouped<CausalCachedInput, RkVariant::E8Root>(q, positions, scale, view, nullptr,
+                                                                  nullptr, CausalCachedInput{}, plan,
+                                                                  workspace, out, stream);
+        return;
+    }
+    const auto p     = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
+    const auto qview = make_quantized_causal_cache_view<Int8KvCacheView<false>>(view);
+    if (plan.family == Int8KvFamily::Tiled)
+        rk_tiled<true, false, true>(p, qview, stream);
+    else
+        rk_execute_parallel<RkVariant::E8Root>(p, qview, plan, workspace, stream);
 }
 
 } // namespace ninfer::ops::detail

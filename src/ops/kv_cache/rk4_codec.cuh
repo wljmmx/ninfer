@@ -71,6 +71,15 @@ __device__ __forceinline__ std::int8_t rk4_unpack(std::uint8_t packed, int high)
     return code;
 }
 
+// Sign-extend four 4-bit nibbles (one per byte) into four 8-bit signed codes without
+// cross-byte carries. The previous (nibble ^ 0x08) + 0xF8 form used a 32-bit add whose
+// carries crossed byte boundaries whenever a nibble was below 8, corrupting the adjacent
+// code; replicating bit 3 (the sign bit) into bits 4..7 cannot carry.
+__device__ __forceinline__ std::uint32_t rk4_sign_extend_nibbles(std::uint32_t masked) {
+    const std::uint32_t sign = masked & 0x08080808u;
+    return masked | ((sign << 1) | (sign << 2) | (sign << 3) | (sign << 4));
+}
+
 // Fast 8-byte (16 int4) unpack using PTX prmt for byte permutation.
 // Given 8 packed bytes, extracts all 16 int4 values into 16 int8 values in one
 // vectorized operation, replacing 16 separate rk4_unpack calls with 2 prmt +
@@ -84,10 +93,8 @@ __device__ __forceinline__ void rk4_unpack_x8_fast(std::uint32_t packed_lo, std:
     // Extract low nibbles: mask each byte with 0x0F
     const std::uint32_t lo_masked = packed_lo & 0x0F0F0F0Fu;
     const std::uint32_t hi_masked = (packed_lo >> 4) & 0x0F0F0F0Fu;
-    // Sign-extend: if nibble >= 8, subtract 16
-    // Use the trick: (nibble ^ 8) - 8 gives correct signed value
-    const std::uint32_t lo_signed = (lo_masked ^ 0x08080808u) + 0xF8F8F8F8u;
-    const std::uint32_t hi_signed = (hi_masked ^ 0x08080808u) + 0xF8F8F8F8u;
+    const std::uint32_t lo_signed = rk4_sign_extend_nibbles(lo_masked);
+    const std::uint32_t hi_signed = rk4_sign_extend_nibbles(hi_masked);
     // Reinterpret as 4 int8 per uint32
     const auto* lo_p = reinterpret_cast<const std::int8_t*>(&lo_signed);
     const auto* hi_p = reinterpret_cast<const std::int8_t*>(&hi_signed);
@@ -102,15 +109,15 @@ __device__ __forceinline__ void rk4_unpack_x8_fast(std::uint32_t packed_lo, std:
 // 4 int8 high-nibble values in the high half — suitable for direct
 // float conversion + pack_f16x2.
 __device__ __forceinline__ std::uint32_t rk4_unpack_lo_fast(std::uint32_t packed) {
-    // Extract low nibbles and sign-extend in one vectorized operation
+    // Extract low nibbles and sign-extend in one vectorized operation.
     const std::uint32_t masked = packed & 0x0F0F0F0Fu;
-    return (masked ^ 0x08080808u) + 0xF8F8F8F8u;
+    return rk4_sign_extend_nibbles(masked);
 }
 
 __device__ __forceinline__ std::uint32_t rk4_unpack_hi_fast(std::uint32_t packed) {
-    // Extract high nibbles and sign-extend
+    // Extract high nibbles and sign-extend.
     const std::uint32_t masked = (packed >> 4) & 0x0F0F0F0Fu;
-    return (masked ^ 0x08080808u) + 0xF8F8F8F8u;
+    return rk4_sign_extend_nibbles(masked);
 }
 
 // Unpack 16 int4 values (8 bytes) into 16 int8 values.
@@ -161,4 +168,18 @@ __device__ __forceinline__ int4 rk4_dequant_f16x8_from(const std::uint8_t* codes
                      static_cast<int>(packed[2]), static_cast<int>(packed[3]));
 }
 
+// Packed int4 V occupies half the smem extent: the 16 dims of one chunk live at the
+// (d >> 1) half-offset and cover exactly 8 bytes. The masked-key zero fill must use
+// that offset AND that width. A 16-byte store at the half-offset faults with
+// cudaErrorMisalignedAddress (the tiled kernel did this for width > 256); a store at
+// the full offset leaves the packed region uninitialised (the grouped kernel did this).
+// One definition, shared by both causal kernels so they cannot diverge again.
+template <bool PackedV>
+__device__ __forceinline__ void rk4_zero_packed_v(std::int8_t* v_row, std::int32_t d) {
+    if constexpr (PackedV) {
+        store_vec(&v_row[d >> 1], make_int2(0, 0));
+    } else {
+        store_vec(&v_row[d], make_int4(0, 0, 0, 0));
+    }
+}
 } // namespace ninfer::ops

@@ -485,7 +485,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             } else {
                 std::int8_t* dst = &k_i8[key_l * D + causal_swizzle(key_l, dc * 8) * 2];
                 store_vec(dst, make_int4(0, 0, 0, 0));
-                store_vec(&v_i8[key_l * D + d], make_int4(0, 0, 0, 0));
+                rk4_zero_packed_v<PackedV>(&v_i8[key_l * D], d);
             }
         }
         ninfer::ops::cp_commit();

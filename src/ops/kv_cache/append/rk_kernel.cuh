@@ -1,7 +1,8 @@
 #pragma once
 
 // PackedV append kernel for rank-compressed KV layouts (rk8v4, rk4v4, rk4v4-e8, rk2v4-e8).
-// K and V both receive the fixed FP32 D256 Hadamard rotation. V is quantized to int4
+// Only K receives the fixed FP32 D256 Hadamard rotation; the V-side rotation was
+// measured as a net loss and reverted (V is quantized directly). V is quantized to int4
 // (symmetric [-7,7], absmax/7 FP16 scale) and packed two adjacent dims per byte at
 // stride 128 (head_dim/2). K is int8 (rk8v4), int4 RTN (rk4v4), int4 with E8 lattice
 // projection (rk4v4-e8), or the 2-bit E8 cylinder (rk2v4-e8, stride 64).
@@ -243,9 +244,19 @@ __launch_bounds__(256) __global__
     // one row. The base offset must include blockIdx.x * warps — without it every
     // block restarts the same tile sequence and the whole grid duplicates one
     // block's work (512x on a 1024-token prefill chunk).
-    const int total_rows = tokens * Geometry::KVHeads;
-    const int row_base   = static_cast<int>(blockIdx.x) * warps;
-    for (int tile = row_base + warp_id; tile < total_rows; tile += gridDim.x * warps) {
+    // Batch metadata selects a row's block table and valid-column count via element [0];
+    // advance both to the current batch before the loop (matching the int8 batch kernel).
+    // Masked rows append only their valid_columns prefix; unmasked/direct rows use the full
+    // width — without this cap the loop rewrites the caller's padded tail (which repeats the
+    // last valid position), overwriting an already-written key with a later token's values.
+    if constexpr (MultiBatch) {
+        metadata.table_rows += static_cast<std::int64_t>(blockIdx.z);
+        if (metadata.valid_columns) metadata.valid_columns += blockIdx.z;
+    }
+    const int valid_tokens = metadata.valid_tokens(tokens);
+    const int rows         = valid_tokens * Geometry::KVHeads;
+    const int row_base     = static_cast<int>(blockIdx.x) * warps;
+    for (int tile = row_base + warp_id; tile < rows; tile += gridDim.x * warps) {
         const int token  = tile / Geometry::KVHeads;
         const int kv_head = tile - token * Geometry::KVHeads;
         const int batch  = MultiBatch ? blockIdx.z : 0;
