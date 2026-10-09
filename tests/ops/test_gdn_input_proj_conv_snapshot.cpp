@@ -928,6 +928,12 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
 }
 
 int run_nvfp4() {
+#if !defined(NINFER_ENABLE_NVFP4)
+    // NVFP4 kernels exist only in Blackwell (sm_120a) builds; the sm_89 dispatch rejects
+    // NVFP4 weights, so skip the case instead of letting it throw out of main().
+    std::cout << "SKIP: nvfp4 conv snapshot (sm_89 build)\n";
+    return 0;
+#endif
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kRows   = 16384;
     quantized_weight::PatternedWeightOptions options;
@@ -1168,6 +1174,7 @@ int main() {
         std::cerr << "Q8 snapshot interval did not preserve its zero/nonzero route boundary\n";
         ++failures;
     }
+#if defined(NINFER_ENABLE_NVFP4)
     const std::size_t nvfp4_a4_4 = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 4, 4);
     if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
@@ -1180,6 +1187,7 @@ int main() {
         std::cerr << "NVFP4 snapshot interval did not preserve its A16/A4 route boundary\n";
         ++failures;
     }
+#endif
     const auto fp8_snapshot_capacity = [](ops::LinearPolicy policy, std::int32_t batch,
                                           std::int32_t min_width, std::int32_t max_width) {
         return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(

@@ -295,6 +295,12 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
 }
 
 int run_nvfp4() {
+#if !defined(NINFER_ENABLE_NVFP4)
+    // NVFP4 kernels exist only in Blackwell (sm_120a) builds; the sm_89 dispatch rejects
+    // NVFP4 weights, so skip the case instead of letting it throw out of main().
+    std::cout << "SKIP: nvfp4 gdn_input_proj (sm_89 build)\n";
+    return 0;
+#endif
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kRows   = 16384;
     quantized_weight::PatternedWeightOptions options;

@@ -257,22 +257,10 @@ void require_shape35(const Weight& w, const char* name) {
     }
 }
 
-template <class Geometry, int SplitK>
-constexpr std::int32_t cooperative_resident_ctas_per_sm() noexcept {
-    static_assert(SplitK > 1);
-    if constexpr (std::is_same_v<Geometry, Bf16Gdn27Geometry>) {
-        static_assert(SplitK == 8 || SplitK == 4 || SplitK == 2);
-        // Qualified on the sm_120a build: BN128 split-8 uses 256 threads and split-4/2 use
-        // 512 threads; registers and 40-KiB shared memory admit two resident CTAs per SM.
-        return 2;
-    } else {
-        static_assert(std::is_same_v<Geometry, Bf16Gdn35Geometry>);
-        static_assert(SplitK == 32 || SplitK == 16 || SplitK == 8 || SplitK == 4 || SplitK == 2);
-        // BN64 split-32 is register-limited to two resident CTAs per SM. The remaining
-        // specializations admit four. These are kernel facts, not a device-wide SM-count policy.
-        return SplitK == 32 ? 2 : 4;
-    }
-}
+// The resident-CTA count a cooperative launch may rely on is queried from the driver at
+// the launch site (see launch_bf16_prefill_mma): it is a property of the exact kernel
+// instantiation on the actual device, and a constant qualified on one architecture
+// over-estimates the other (Ada admits one 512-thread split-4/2 CTA per SM, not two).
 
 template <class Geometry, int SplitK, int Warps = kBf16GdnWarps, bool NormalizeInput = false,
           int NormTokenCapacity = 0>
@@ -357,8 +345,25 @@ bool launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
     } else {
         constexpr std::int64_t kCtasPerTokenTile =
             static_cast<std::int64_t>(Geometry::kHeads / kBf16GdnBlockM) * SplitK;
-        constexpr std::int32_t kResidentCtasPerSm =
-            cooperative_resident_ctas_per_sm<Geometry, SplitK>();
+        // Ask the driver how many CTAs of this exact instantiation co-reside on this device.
+        // A static assumption under-counts on Ada, which makes the cooperative launch below
+        // request more blocks than can co-reside (cudaErrorCooperativeLaunchTooLarge).
+        const auto resident_blocks_per_sm = [&](auto full_tokens) -> int {
+            constexpr bool FullTokens = decltype(full_tokens)::value;
+            auto kernel = bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, FullTokens, Warps,
+                                                              NormalizeInput, NormTokenCapacity>;
+            static const cudaError_t attribute = cudaFuncSetAttribute(
+                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
+            CUDA_CHECK(attribute);
+            int blocks = 0;
+            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, block.x,
+                                                                     kSmemBytes));
+            return blocks > 0 ? blocks : 1;
+        };
+        // The chunker launches both token variants, so keep the more conservative count.
+        static const std::int32_t kResidentCtasPerSm =
+            std::min(resident_blocks_per_sm(std::true_type{}),
+                     resident_blocks_per_sm(std::false_type{}));
         const std::int64_t resident_ctas =
             static_cast<std::int64_t>(multiprocessor_count) * kResidentCtasPerSm;
         const std::int64_t max_token_tiles = resident_ctas / kCtasPerTokenTile;
