@@ -25,6 +25,7 @@ Bf16Launch select_bf16_n4304_k1152(std::int32_t tokens) {
     if (tokens > 131072 || tokens % 4 != 0)
         throw std::invalid_argument("bf16 linear: P must be a multiple of 4 in [4,131072]");
     if (tokens <= 32) return launch_bf16_mma<S0>;
+#if defined(NINFER_ENABLE_TMA)
     if (tokens <= 96) return launch_bf16_tma_mma<S1>;
     if (tokens <= 128) return launch_bf16_tma_mma<S2>;
     if (tokens <= 256) return launch_bf16_tma_mma<S3>;
@@ -32,5 +33,10 @@ Bf16Launch select_bf16_n4304_k1152(std::int32_t tokens) {
     if (tokens <= 1024) return launch_bf16_tma_mma<S2>;
     if (tokens <= 2048) return launch_bf16_tma_mma<S5>;
     return launch_bf16_tma_mma<S6>;
+#else
+    // Ada fallback: no TMA on sm_89; reuse this shape's own cp.async MMA
+    // schedule for the token ranges the TMA instances covered.
+    return launch_bf16_mma<S0>;
+#endif
 }
 } // namespace ninfer::ops::detail

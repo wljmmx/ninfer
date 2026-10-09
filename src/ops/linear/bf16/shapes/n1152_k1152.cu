@@ -31,10 +31,16 @@ Bf16Launch select_bf16_n1152_k1152(std::int32_t tokens) {
     if (tokens <= 40) return launch_bf16_sliced_k_mma<S3>;
     if (tokens <= 64) return launch_bf16_sliced_k_mma<S4>;
     if (tokens <= 128) return launch_bf16_mma<S5>;
+#if defined(NINFER_ENABLE_TMA)
     if (tokens <= 256) return launch_bf16_tma_mma<S6>;
     if (tokens <= 512) return launch_bf16_tma_mma<S7>;
     if (tokens <= 1024) return launch_bf16_tma_mma<S8>;
     if (tokens <= 2048) return launch_bf16_tma_mma<S9>;
     return launch_bf16_tma_mma<S7>;
+#else
+    // Ada fallback: no TMA on sm_89; reuse this shape's own cp.async MMA
+    // schedule for the token ranges the TMA instances covered.
+    return launch_bf16_mma<S5>;
+#endif
 }
 } // namespace ninfer::ops::detail

@@ -417,16 +417,21 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
             }
         };
 
-        auto decode_weight = [&](int stage) {
+        // Q4MmaDecodeAtom::decode_eight takes the group's fp16 scale explicitly. Sr holds
+        // every group's scale for these rows, indexed (row * GroupsPerRow + group).
+        auto decode_weight = [&](int stage, int group) {
             constexpr int CodeChunksPerRow = Q4RowSplitStorage::kCodeBytesPerGroup / 4;
             static_assert(CodeChunksPerRow * 8 == kExpertBK,
                           "a row of codes must decode to exactly the tile's k width");
             for (int item = tid; item < kExpertBM * CodeChunksPerRow; item += ExpertThreads) {
                 const int row   = item / CodeChunksPerRow;
                 const int chunk = item - row * CodeChunksPerRow;
+                const float scale = __half2float(__ushort_as_half(
+                    *reinterpret_cast<const std::uint16_t*>(&Sr[(row * GroupsPerRow + group) * 2])));
                 unsigned decoded[4];
                 Q4MmaDecodeAtom::decode_eight(
-                    *reinterpret_cast<const unsigned*>(&Cr[stage][row * 32 + chunk * 4]), decoded);
+                    *reinterpret_cast<const unsigned*>(&Cr[stage][row * 32 + chunk * 4]), scale,
+                    decoded);
                 store_vec(&As[row * kExpertBK + gemm_swz64(row, chunk * 8)],
                           make_int4(static_cast<int>(decoded[0]), static_cast<int>(decoded[1]),
                                     static_cast<int>(decoded[2]), static_cast<int>(decoded[3])));
@@ -446,7 +451,7 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
             const int stage = kt % Stages;
             cp_wait<Stages - 1>();
             __syncthreads();
-            decode_weight(stage);
+            decode_weight(stage, kt);
             __syncthreads();
 
             if (warp * WarpCols < cols) {
