@@ -339,14 +339,15 @@ public:
          bool starts_in_reasoning, ThinkingControlOptions thinking,
          std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens_,
          std::shared_ptr<const fi::ToolCallOutputContract> tool_call_output_,
-         std::unique_ptr<text::GrammarSession> grammar_)
+         std::unique_ptr<text::GrammarSession> grammar_, std::string_view continuation,
+         bool combined_)
         : tokenizer(std::move(tokenizer_)), policy(std::move(policy_)),
           thinking_control_tokens(std::move(thinking_control_tokens_)),
           preserve_special(output.raw || output.preserve_special_tokens),
           split_reasoning(starts_in_reasoning && !output.raw),
           tool_call_output(output.raw ? nullptr : std::move(tool_call_output_),
                            output.tool_name_max_length),
-          grammar(std::move(grammar_)) {
+          grammar(std::move(grammar_)), combined(combined_) {
         if (thinking.budget && *thinking.budget == 0) {
             throw std::invalid_argument("thinking budget must be positive");
         }
@@ -359,6 +360,14 @@ public:
         // semantic tracker dormant unless a cap needs it, so the default unlimited path does not
         // decode every model token twice.
         semantic.in_reasoning = starts_in_reasoning && thinking.budget.has_value();
+        if (!continuation.empty()) {
+            saw_content = true;
+            if (combined)
+                branch = continuation.front() == '<' ? ConstraintOutputBranch::Tools
+                                                     : ConstraintOutputBranch::Content;
+            if (!combined || branch == ConstraintOutputBranch::Tools)
+                tool_call_output.initialize_continuation(continuation);
+        }
     }
 
     std::shared_ptr<const fi::Tokenizer> tokenizer;
@@ -377,13 +386,17 @@ public:
     fi::ToolCallOutputDecoder tool_call_output;
     std::vector<GeneratedToolCall> tool_calls;
     ToolCallParseDiagnostics tool_call_parse;
-    bool preview_ready = false;
+    bool preview_ready                 = false;
+    FinishReason preview_finish_reason = FinishReason::None;
     std::unique_ptr<text::GrammarSession> grammar;
+    bool combined                 = false;
+    bool saw_content              = false;
+    ConstraintOutputBranch branch = ConstraintOutputBranch::Undecided;
 
     void accept_grammar(std::span<const TokenId> tokens) {
         if (!grammar) { return; }
         try {
-            for (TokenId token : tokens) { grammar->accept(token); }
+            grammar->accept(tokens);
         } catch (...) {
             grammar->discard();
             throw;
@@ -424,12 +437,33 @@ OutputSession::OutputSession(
     bool starts_in_reasoning, ThinkingControlOptions thinking,
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens,
     std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output,
-    std::unique_ptr<text::GrammarSession> grammar)
-    : impl_(std::make_unique<Impl>(
-          std::move(tokenizer), std::move(policy), output, starts_in_reasoning, thinking,
-          std::move(thinking_control_tokens), std::move(tool_call_output), std::move(grammar))) {}
+    std::unique_ptr<text::GrammarSession> grammar, std::string_view continuation, bool combined)
+    : impl_(std::make_unique<Impl>(std::move(tokenizer), std::move(policy), output,
+                                   starts_in_reasoning, thinking,
+                                   std::move(thinking_control_tokens), std::move(tool_call_output),
+                                   std::move(grammar), continuation, combined)) {}
 
 bool OutputSession::constrained() const noexcept { return impl_ && impl_->grammar != nullptr; }
+
+void OutputSession::observe_constraint(bool timings, double prepare_seconds) noexcept {
+    if (constrained()) impl_->grammar->observe(timings, prepare_seconds);
+}
+
+void OutputSession::constraint_uploaded(std::size_t bytes) noexcept {
+    if (constrained()) impl_->grammar->uploaded(bytes);
+}
+
+std::optional<ConstraintObservation> OutputSession::constraint_observation() const {
+    if (!constrained()) return {};
+    auto result = impl_->grammar->observation();
+    if (impl_->combined)
+        result.branch = impl_->branch;
+    else if (impl_->tool_call_output.in_tool_region() || !impl_->tool_calls.empty())
+        result.branch = ConstraintOutputBranch::Tools;
+    else if (impl_->saw_content || (!impl_->state.in_reasoning && result.complete))
+        result.branch = ConstraintOutputBranch::Content;
+    return result;
+}
 
 std::uint32_t OutputSession::grammar_masks(std::span<const TokenId> drafts,
                                            std::span<std::uint32_t> words) {
@@ -477,7 +511,8 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
             throw std::logic_error("prefix execution split exceeds the accepted token prefix");
         }
         impl_->accept_grammar(tokens.first(count));
-        impl_->preview_ready = true;
+        impl_->preview_finish_reason = reason;
+        impl_->preview_ready         = true;
         return runtime::OutputDecision{
             .accepted_tokens              = count,
             .finish_reason                = reason,
@@ -616,7 +651,8 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     impl_->preview_semantic.applied         = true;
     impl_->preview_semantic.injected_tokens = static_cast<std::uint32_t>(tokens.size());
     impl_->accept_grammar(tokens);
-    impl_->preview_ready = true;
+    impl_->preview_finish_reason = FinishReason::None;
+    impl_->preview_ready         = true;
     return runtime::OutputDecision{
         .accepted_tokens              = static_cast<std::uint32_t>(tokens.size()),
         .prefix_execution_split_after = impl_->preview_execution_split_after,
@@ -655,7 +691,8 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
     impl_->preview_semantic.control_pending = false;
     impl_->preview_output.clear();
     terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, 0);
-    impl_->preview_ready = true;
+    impl_->preview_finish_reason = reason;
+    impl_->preview_ready         = true;
     return runtime::OutputDecision{.accepted_tokens = 0, .finish_reason = reason};
 }
 
@@ -669,20 +706,25 @@ PublishedOutput OutputSession::commit_preview() {
     impl_->preview_output.clear();
     impl_->preview_ready = false;
 
-    if (impl_->grammar) {
-        impl_->grammar->confirm();
-        return output;
-    }
+    if (impl_->grammar) impl_->grammar->confirm();
 
     for (OutputDelta& delta : output) {
         if (delta.channel == OutputChannel::Content) {
-            delta.text = impl_->tool_call_output.feed(delta.text);
+            impl_->saw_content |= !delta.text.empty();
+            if (impl_->combined && impl_->branch == ConstraintOutputBranch::Undecided &&
+                !delta.text.empty())
+                impl_->branch = delta.text.front() == '<' ? ConstraintOutputBranch::Tools
+                                                          : ConstraintOutputBranch::Content;
+            if (!impl_->combined || impl_->branch == ConstraintOutputBranch::Tools)
+                delta.text = impl_->tool_call_output.feed(delta.text);
         }
     }
-    if (impl_->state.terminal) {
-        fi::ToolCallOutputDecoder::Terminal terminal = impl_->tool_call_output.finish();
-        impl_->tool_calls                            = std::move(terminal.tool_calls);
-        impl_->tool_call_parse                       = terminal.diagnostics;
+    if (impl_->state.terminal &&
+        (!impl_->combined || impl_->branch == ConstraintOutputBranch::Tools)) {
+        fi::ToolCallOutputDecoder::Terminal terminal =
+            impl_->tool_call_output.finish(impl_->preview_finish_reason);
+        impl_->tool_calls      = std::move(terminal.tool_calls);
+        impl_->tool_call_parse = terminal.diagnostics;
         if (!terminal.content.empty()) {
             OutputDelta* content = nullptr;
             for (OutputDelta& delta : output) {

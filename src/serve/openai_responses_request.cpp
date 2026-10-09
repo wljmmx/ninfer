@@ -671,7 +671,8 @@ struct ParsedFunctionTool {
 ParsedFunctionTool
 parse_function_tool(const Json& item, std::optional<std::string> wire_namespace,
                     std::string_view namespace_description,
-                    std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& identities) {
+                    std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& identities,
+                    std::string schema_param) {
     static const std::unordered_set<std::string> allowed_members = {
         "type",          "name",         "description", "parameters", "strict", "allowed_callers",
         "defer_loading", "output_schema"};
@@ -680,6 +681,7 @@ parse_function_tool(const Json& item, std::optional<std::string> wire_namespace,
     const OpenAIResponsesFunctionIdentity identity{.name = require_function_name(item, "tools"),
                                                    .wire_namespace = std::move(wire_namespace)};
     ParsedFunctionTool parsed;
+    parsed.definition.schema_param = std::move(schema_param);
     parsed.engine_name     = lower_function_identity(identity, identities, "tools");
     parsed.definition.name = parsed.engine_name;
 
@@ -710,10 +712,7 @@ parse_function_tool(const Json& item, std::optional<std::string> wire_namespace,
         if (!item.at("strict").is_boolean()) {
             bad_request("function strict must be a boolean", "tools");
         }
-        if (item.at("strict").get<bool>()) {
-            bad_request("strict function schema enforcement is not implemented", "tools",
-                        "strict_tools_not_supported");
-        }
+        parsed.definition.strict = item.at("strict").get<bool>();
     }
     if (item.contains("defer_loading") && !item.at("defer_loading").is_null()) {
         if (!item.at("defer_loading").is_boolean()) {
@@ -750,7 +749,7 @@ parse_function_tool(const Json& item, std::optional<std::string> wire_namespace,
     parsed.canonical                    = {{"type", "function"},
                                            {"name", identity.name},
                                            {"parameters", parameters},
-                                           {"strict", false}};
+                                           {"strict", parsed.definition.strict}};
     if (!function_description.empty()) {
         parsed.canonical["description"] = std::move(function_description);
     }
@@ -786,8 +785,9 @@ void parse_tools(const Json& body, ParsedPromptFields& out) {
         }
         const std::string type = item.at("type").get<std::string>();
         if (type == "function") {
-            out.wire_tools.push_back(
-                append_function(parse_function_tool(item, std::nullopt, {}, out.tool_identities)));
+            out.wire_tools.push_back(append_function(parse_function_tool(
+                item, std::nullopt, {}, out.tool_identities,
+                "tools/" + std::to_string(out.wire_tools.size()) + "/parameters")));
             continue;
         }
         if (type != "namespace") {
@@ -828,7 +828,9 @@ void parse_tools(const Json& body, ParsedPromptFields& out) {
                             "tools", "tool_type_not_supported");
             }
             canonical["tools"].push_back(append_function(parse_function_tool(
-                nested, namespace_name, namespace_description, out.tool_identities)));
+                nested, namespace_name, namespace_description, out.tool_identities,
+                "tools/" + std::to_string(out.wire_tools.size()) + "/tools/" +
+                    std::to_string(canonical["tools"].size()) + "/parameters")));
         }
         out.wire_tools.push_back(std::move(canonical));
     }
@@ -840,10 +842,11 @@ void filter_allowed_tools(const Json& choice, ParsedPromptFields& out) {
     if (!choice.contains("mode") || !choice.at("mode").is_string()) {
         bad_request("allowed_tools tool_choice must contain a string mode", "tool_choice");
     }
-    if (choice.at("mode").get<std::string>() != "auto") {
-        bad_request("allowed_tools mode 'required' cannot be enforced", "tool_choice",
-                    "tool_choice_not_supported");
-    }
+    const auto mode = choice.at("mode").get<std::string>();
+    if (mode != "auto" && mode != "required")
+        bad_request("allowed_tools mode must be auto or required", "tool_choice");
+    out.prompt.generation.tool_choice.mode =
+        mode == "required" ? ToolChoiceMode::Required : ToolChoiceMode::Auto;
     if (!choice.contains("tools") || !choice.at("tools").is_array()) {
         bad_request("allowed_tools tool_choice must contain a tools array", "tool_choice");
     }
@@ -872,12 +875,10 @@ void filter_allowed_tools(const Json& choice, ParsedPromptFields& out) {
         selected.insert(name);
     }
 
-    std::vector<ToolDefinition> effective;
-    effective.reserve(selected.size());
-    for (ToolDefinition& tool : out.prompt.generation.tools) {
-        if (selected.contains(tool.name)) { effective.push_back(std::move(tool)); }
-    }
-    out.prompt.generation.tools = std::move(effective);
+    out.prompt.generation.tool_choice.allowed_names.emplace();
+    for (const ToolDefinition& tool : out.prompt.generation.tools)
+        if (selected.contains(tool.name))
+            out.prompt.generation.tool_choice.allowed_names->push_back(tool.name);
 }
 
 void parse_tool_choice(const Json& body, ParsedPromptFields& out) {
@@ -893,10 +894,10 @@ void parse_tool_choice(const Json& body, ParsedPromptFields& out) {
         } else if (value == "none") {
             out.prompt.generation.tool_choice.mode = ToolChoiceMode::None;
         } else if (value == "required") {
-            bad_request("tool_choice 'required' cannot be guaranteed by the Engine", "tool_choice",
-                        "tool_choice_not_supported");
+            out.prompt.generation.tool_choice.mode = ToolChoiceMode::Required;
         } else {
-            bad_request("tool_choice must be 'auto', 'none', or a supported object", "tool_choice");
+            bad_request("tool_choice must be 'auto', 'none', 'required', or a supported object",
+                        "tool_choice");
         }
         out.wire_tool_choice = value;
         return;
@@ -904,11 +905,17 @@ void parse_tool_choice(const Json& body, ParsedPromptFields& out) {
     if (!choice.is_object() || !choice.contains("type") || !choice.at("type").is_string()) {
         bad_request("tool_choice must be a string or typed object", "tool_choice");
     }
-    if (choice.at("type").get<std::string>() != "allowed_tools") {
-        bad_request("named or hosted tool_choice cannot be enforced", "tool_choice",
-                    "tool_choice_not_supported");
-    }
-    filter_allowed_tools(choice, out);
+    const auto type = choice.at("type").get<std::string>();
+    if (type == "function") {
+        const auto identity = function_identity(choice, "tool_choice");
+        const auto name     = lower_function_identity(identity, out.tool_identities, "tool_choice");
+        out.prompt.generation.tool_choice.mode          = ToolChoiceMode::Required;
+        out.prompt.generation.tool_choice.allowed_names = std::vector<std::string>{name};
+        out.prompt.generation.tool_choice.parallel      = false;
+    } else if (type == "allowed_tools")
+        filter_allowed_tools(choice, out);
+    else
+        bad_request("unsupported tool_choice type", "tool_choice");
     out.wire_tool_choice = choice;
 }
 
@@ -1031,11 +1038,7 @@ ParsedPromptFields parse_prompt_fields(const Json& body, const RequestLimits& li
     parse_tools(body, out);
     parse_tool_choice(body, out);
     out.parallel_tool_calls = optional_bool(body, "parallel_tool_calls", true);
-    if (!out.parallel_tool_calls && out.prompt.generation.uses_tools()) {
-        bad_request("parallel_tool_calls=false cannot be guaranteed when callable tools are "
-                    "present",
-                    "parallel_tool_calls", "parallel_tool_calls_not_supported");
-    }
+    out.prompt.generation.tool_choice.parallel &= out.parallel_tool_calls;
     parse_reasoning(body, out.prompt);
     parse_text(body, out.prompt.generation);
     parse_truncation(body);
@@ -1156,7 +1159,7 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
     ParsedPromptFields parsed  = parse_prompt_fields(body, limits);
     parsed.prompt.cache_policy = cache_policy;
     OpenAIResponsesCreateRequest out;
-    out.prompt              = std::move(parsed.prompt);
+    out.prompt = std::move(parsed.prompt);
     if (body.contains("text") && body["text"].is_object() && body["text"].contains("format") &&
         !body["text"]["format"].is_null())
         out.text_format = body["text"]["format"];
