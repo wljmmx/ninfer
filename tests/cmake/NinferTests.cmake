@@ -15,7 +15,14 @@ function(ninfer_add_test name)
       NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
       NINFER_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}")
   endif()
+  ninfer_deploy_runtime_dlls(${name})
   add_test(NAME ${name} COMMAND ${name})
+  # Device configuration is read from NINFER_CUDA_SYNC, whose documented default is
+  # spin. Pin it explicitly: ctest neither restores an empty value nor reliably removes
+  # one that is already present, so the test that sets it to "" (the invalid-configuration
+  # case) would otherwise leak it into every later test and make the suite order-dependent.
+  set_tests_properties(${name} PROPERTIES
+    ENVIRONMENT_MODIFICATION "NINFER_CUDA_SYNC=set:spin")
 endfunction()
 
 # Apply these to the translation unit containing the oracle, including shared

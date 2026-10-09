@@ -27,3 +27,8 @@ if(MSVC)
     target_sources(${app} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/utf8-codepage.manifest")
   endforeach()
 endif()
+
+# The product binaries import the same shared FFmpeg/CURL, so deploy their runtime DLLs.
+foreach(app IN ITEMS ninfer ninfer-serve ninfer-perplexity)
+  ninfer_deploy_runtime_dlls(${app})
+endforeach()

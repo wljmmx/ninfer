@@ -63,16 +63,18 @@ ninfer_add_op_test(ninfer_context_kv_materialize_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_context_kv_materialize.cpp"
   LIBRARIES ninfer_ops)
 
-add_test(NAME ninfer_kv_cache_append_nvfp4_test
-  COMMAND ninfer_kv_cache_append_test --nvfp4-only)
+# NVFP4 KV storage (E2M1 code + E4M3 scales) only exists in Blackwell (sm_120a)
+# builds, so the NVFP4-only variant is registered only when the kernels exist.
+if(NINFER_ENABLE_NVFP4)
+  add_test(NAME ninfer_kv_cache_append_nvfp4_test
+    COMMAND ninfer_kv_cache_append_test --nvfp4-only)
+  set_tests_properties(ninfer_kv_cache_append_nvfp4_test PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 
 add_test(NAME ninfer_kv_cache_append_k8v4_test
   COMMAND ninfer_kv_cache_append_test --k8v4-only)
 
-set_tests_properties(
-  ninfer_kv_cache_append_nvfp4_test
-  ninfer_kv_cache_append_k8v4_test
-  PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(ninfer_kv_cache_append_k8v4_test PROPERTIES SKIP_RETURN_CODE 77)
 
 ninfer_add_op_test(ninfer_prepare_masked_block_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prepare_masked_block.cpp"

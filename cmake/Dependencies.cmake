@@ -33,6 +33,54 @@ else()
   endif()
 endif()
 
+# Windows executables import FFmpeg and CURL through their shared libraries, so the
+# runtime DLLs must sit beside every binary. The import libraries alone are not enough:
+# a process whose DLL cannot be resolved never starts, and under CTest the loader's
+# error dialog blocks, which makes an offending test look like a hang. Resolve the DLL
+# directories once here; every test/bench/app target deploys them (see
+# ninfer_deploy_runtime_dlls in cmake/NinferTargets.cmake).
+set(NINFER_RUNTIME_DLLS "")
+set(FFMPEG_RUNTIME_DIR "" CACHE PATH "Directory holding the FFmpeg runtime DLLs")
+set(CURL_RUNTIME_DIR "" CACHE PATH "Directory holding the CURL runtime DLLs")
+if(WIN32)
+  if(NOT FFMPEG_RUNTIME_DIR)
+    # The externally provided FFmpeg layout keeps import libraries in lib/ and the DLLs
+    # in the sibling bin/.
+    foreach(lib_dir IN LISTS FFMPEG_LIBRARY_DIRS)
+      if(EXISTS "${lib_dir}/../bin")
+        get_filename_component(FFMPEG_RUNTIME_DIR "${lib_dir}/../bin" ABSOLUTE)
+        break()
+      endif()
+    endforeach()
+  endif()
+  if(FFMPEG_RUNTIME_DIR AND EXISTS "${FFMPEG_RUNTIME_DIR}")
+    file(GLOB NINFER_FFMPEG_RUNTIME_DLLS CONFIGURE_DEPENDS "${FFMPEG_RUNTIME_DIR}/*.dll")
+    list(APPEND NINFER_RUNTIME_DLLS ${NINFER_FFMPEG_RUNTIME_DLLS})
+  endif()
+
+  # find_package(CURL) reports <prefix>/lib/cmake/CURL; the DLL lives in <prefix>/bin.
+  if(NOT CURL_RUNTIME_DIR AND CURL_DIR)
+    get_filename_component(NINFER_CURL_PREFIX "${CURL_DIR}/../../.." ABSOLUTE)
+    if(EXISTS "${NINFER_CURL_PREFIX}/bin")
+      set(CURL_RUNTIME_DIR "${NINFER_CURL_PREFIX}/bin")
+    endif()
+  endif()
+  if(CURL_RUNTIME_DIR AND EXISTS "${CURL_RUNTIME_DIR}")
+    file(GLOB NINFER_CURL_RUNTIME_DLLS CONFIGURE_DEPENDS "${CURL_RUNTIME_DIR}/libcurl*.dll")
+    list(APPEND NINFER_RUNTIME_DLLS ${NINFER_CURL_RUNTIME_DLLS})
+  endif()
+
+  list(REMOVE_DUPLICATES NINFER_RUNTIME_DLLS)
+  if(NINFER_RUNTIME_DLLS)
+    list(LENGTH NINFER_RUNTIME_DLLS NINFER_RUNTIME_DLL_COUNT)
+    message(STATUS "NInfer: deploying ${NINFER_RUNTIME_DLL_COUNT} runtime DLL(s) beside each executable")
+  elseif(NINFER_BUILD_PRODUCT_SUPPORT)
+    message(WARNING
+      "NInfer: shared FFmpeg/CURL were linked but no runtime DLL directory was found; "
+      "set FFMPEG_RUNTIME_DIR / CURL_RUNTIME_DIR or the product binaries will not start")
+  endif()
+endif()
+
 # Repository-pinned header dependencies. No configure-time downloads.
 add_library(ninfer::json INTERFACE IMPORTED GLOBAL)
 target_include_directories(ninfer::json INTERFACE

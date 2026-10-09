@@ -19,3 +19,16 @@ function(ninfer_cuda_non_rdc_archive target)
     CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
   target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 endfunction()
+
+# Put the shared FFmpeg/CURL runtime DLLs beside an executable. copy_if_different keeps
+# repeat builds cheap; NINFER_RUNTIME_DLLS is resolved once in Dependencies.cmake.
+function(ninfer_deploy_runtime_dlls target)
+  if(NOT WIN32 OR NOT NINFER_RUNTIME_DLLS)
+    return()
+  endif()
+  add_custom_command(TARGET ${target} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${NINFER_RUNTIME_DLLS}
+            "$<TARGET_FILE_DIR:${target}>"
+    COMMENT "Deploying runtime DLLs beside ${target}"
+    VERBATIM)
+endfunction()
