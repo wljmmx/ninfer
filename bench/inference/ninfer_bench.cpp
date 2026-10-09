@@ -1,4 +1,4 @@
-﻿#include "ninfer_bench_support.h"
+#include "ninfer_bench_support.h"
 
 #include "ninfer/engine.h"
 

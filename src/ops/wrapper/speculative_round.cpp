@@ -1,4 +1,4 @@
-﻿#include "ninfer/ops/speculative_round.h"
+#include "ninfer/ops/speculative_round.h"
 #include "ops/launcher/speculative_round.h"
 #include "ops/launcher/logits_topk_softmax.h"
 

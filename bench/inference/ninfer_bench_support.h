@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 // Host-only support for the product throughput benchmark. The benchmark itself drives only the
 // public ninfer::Engine API; this file owns its CLI, matrix, statistics, and report schema.

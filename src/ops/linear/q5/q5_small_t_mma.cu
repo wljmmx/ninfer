@@ -1,4 +1,4 @@
-﻿#include "ops/linear/q5/q5_launch.h"
+#include "ops/linear/q5/q5_launch.h"
 
 #include "core/device.h"
 #include "ops/linear/q5/q5_small_t_mma.cuh"

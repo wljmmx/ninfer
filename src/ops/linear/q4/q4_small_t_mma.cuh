@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
