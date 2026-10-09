@@ -10,6 +10,19 @@
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
+namespace {
+
+// The per-thread top-K storage must be a compile-time size or it lands in local memory.
+// Instantiate the exact K the caller asks for and dispatch on it.
+template <int K>
+void launch_fixed(const __nv_bfloat16* logits, std::int32_t* top_ids, float* top_probs,
+                  std::int32_t* argmax_ids, const std::int32_t* id_map, std::int32_t columns,
+                  std::int32_t physical_rows, std::int32_t stride, cudaStream_t stream) {
+    logits_topk_softmax_kernel<K><<<static_cast<unsigned>(columns), kLogitsTopkBlock, 0, stream>>>(
+        logits, top_ids, top_probs, argmax_ids, id_map, physical_rows, physical_rows, stride);
+}
+
+} // namespace
 
 void logits_topk_softmax_launch(const Tensor& logits, Tensor& top_ids, Tensor& top_probs,
                                 Tensor& argmax_ids, const std::int32_t* id_map,
@@ -49,11 +62,54 @@ void logits_topk_softmax_launch(const Tensor& logits, Tensor& top_ids, Tensor& t
         throw std::invalid_argument("logits_topk_softmax: argmax_ids shape mismatch");
     }
 
-    logits_topk_softmax_kernel<<<static_cast<unsigned>(columns), kLogitsTopkBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(logits.data),
-        static_cast<std::int32_t*>(top_ids.data), static_cast<float*>(top_probs.data),
-        static_cast<std::int32_t*>(argmax_ids.data), id_map, physical_rows, physical_rows, top_k,
-        stride);
+    const auto* src  = static_cast<const __nv_bfloat16*>(logits.data);
+    auto* ids        = static_cast<std::int32_t*>(top_ids.data);
+    auto* probs      = static_cast<float*>(top_probs.data);
+    auto* argmax     = static_cast<std::int32_t*>(argmax_ids.data);
+
+#define NINFER_LOGITS_TOPK_CASE(K)                                                              \
+    case K:                                                                                     \
+        launch_fixed<K>(src, ids, probs, argmax, id_map, columns, physical_rows, stride, stream); \
+        break;
+
+    switch (top_k) {
+        NINFER_LOGITS_TOPK_CASE(1)
+        NINFER_LOGITS_TOPK_CASE(2)
+        NINFER_LOGITS_TOPK_CASE(3)
+        NINFER_LOGITS_TOPK_CASE(4)
+        NINFER_LOGITS_TOPK_CASE(5)
+        NINFER_LOGITS_TOPK_CASE(6)
+        NINFER_LOGITS_TOPK_CASE(7)
+        NINFER_LOGITS_TOPK_CASE(8)
+        NINFER_LOGITS_TOPK_CASE(9)
+        NINFER_LOGITS_TOPK_CASE(10)
+        NINFER_LOGITS_TOPK_CASE(11)
+        NINFER_LOGITS_TOPK_CASE(12)
+        NINFER_LOGITS_TOPK_CASE(13)
+        NINFER_LOGITS_TOPK_CASE(14)
+        NINFER_LOGITS_TOPK_CASE(15)
+        NINFER_LOGITS_TOPK_CASE(16)
+        NINFER_LOGITS_TOPK_CASE(17)
+        NINFER_LOGITS_TOPK_CASE(18)
+        NINFER_LOGITS_TOPK_CASE(19)
+        NINFER_LOGITS_TOPK_CASE(20)
+        NINFER_LOGITS_TOPK_CASE(21)
+        NINFER_LOGITS_TOPK_CASE(22)
+        NINFER_LOGITS_TOPK_CASE(23)
+        NINFER_LOGITS_TOPK_CASE(24)
+        NINFER_LOGITS_TOPK_CASE(25)
+        NINFER_LOGITS_TOPK_CASE(26)
+        NINFER_LOGITS_TOPK_CASE(27)
+        NINFER_LOGITS_TOPK_CASE(28)
+        NINFER_LOGITS_TOPK_CASE(29)
+        NINFER_LOGITS_TOPK_CASE(30)
+        NINFER_LOGITS_TOPK_CASE(31)
+        NINFER_LOGITS_TOPK_CASE(32)
+    default:
+        throw std::invalid_argument("logits_topk_softmax: top_k must be in [1,32]");
+    }
+#undef NINFER_LOGITS_TOPK_CASE
+
     CUDA_CHECK(cudaGetLastError());
 }
 
