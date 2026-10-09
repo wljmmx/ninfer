@@ -694,8 +694,25 @@ __device__ const std::uint64_t c_e8_stage1_i8x8[256] = {
     0x0000000000000000ULL, // code 255
 };
 
+// ---------------------------------------------------------------------------
+// V-plane radius-centre calibration for the 2-bit E8-cylinder codec.
+// The raw V plane reconstructs systematically deflated: the offline harness
+// measured 100% Type-B root selection, energy(rec)/energy(x) = 0.706 and an
+// optimal radius-table centre of x1.115. Folding the factor into the radius
+// value INSIDE the round() (a table re-centring that re-rounds the int8
+// output) is strictly better than post-scaling the decoded values, and is the
+// only calibration that improved end-to-end PPL:
+//   rk4v2-e8  8.327146 -> 8.300312  (-0.32%, ctx4096/stride2048, 77365 tokens)
+// The rotated K plane keeps 1.0: every calibration direction measured there
+// made PPL worse (kv_2bit_quant_analysis.md sections 12-13). The factor is
+// Type-B-only because the raw V data never selects a Type-A root.
+inline constexpr float kE8VRadiusCentreB = 1.115f;
+
 // 1-Cycle Hardware SIMD Decode using Constant Cache, PTX vadd4, and Radius Scaling
-__device__ __forceinline__ void e8_root_decode_8d_fast(uint8_t root_code, uint8_t rad_axis_code, int8_t out[8]) {
+__device__ __forceinline__ void e8_root_decode_8d_fast_scaled(uint8_t root_code,
+                                                               uint8_t rad_axis_code,
+                                                               int8_t out[8],
+                                                               float radius_mult) {
     const uint32_t rad_idx  = rad_axis_code >> 4;
     const uint32_t axis_idx = rad_axis_code & 0x0F;
 
@@ -716,7 +733,7 @@ __device__ __forceinline__ void e8_root_decode_8d_fast(uint8_t root_code, uint8_
         : "=r"(dir_hi)
         : "r"(static_cast<uint32_t>(w_root >> 32)), "r"(static_cast<uint32_t>(w_axis >> 32)), "r"(0));
 
-    const float scale = c_radius_scale[rad_idx];
+    const float scale = c_radius_scale[rad_idx] * radius_mult;
     const int8_t* p_lo = reinterpret_cast<const int8_t*>(&dir_lo);
     const int8_t* p_hi = reinterpret_cast<const int8_t*>(&dir_hi);
 
@@ -726,7 +743,7 @@ __device__ __forceinline__ void e8_root_decode_8d_fast(uint8_t root_code, uint8_
         out[4 + i] = static_cast<int8_t>(__float2int_rn(static_cast<float>(p_hi[i]) * scale));
     }
 #else
-    const float scale = c_radius_scale[rad_idx];
+    const float scale = c_radius_scale[rad_idx] * radius_mult;
     const int8_t* r = reinterpret_cast<const int8_t*>(&w_root);
     const int8_t* a = reinterpret_cast<const int8_t*>(&w_axis);
     #pragma unroll
@@ -734,6 +751,19 @@ __device__ __forceinline__ void e8_root_decode_8d_fast(uint8_t root_code, uint8_
         out[i] = static_cast<int8_t>(__float2int_rn(static_cast<float>(r[i] + a[i]) * scale));
     }
 #endif
+}
+
+// K plane (and every stock consumer): the radius table is used unchanged.
+__device__ __forceinline__ void e8_root_decode_8d_fast(uint8_t root_code, uint8_t rad_axis_code,
+                                                       int8_t out[8]) {
+    e8_root_decode_8d_fast_scaled(root_code, rad_axis_code, out, 1.0f);
+}
+
+// V plane (rk4v2-e8 value read-back): calibrated Type-B radius centre.
+__device__ __forceinline__ void e8_root_decode_8d_fast_v(uint8_t root_code,
+                                                         uint8_t rad_axis_code, int8_t out[8]) {
+    e8_root_decode_8d_fast_scaled(root_code, rad_axis_code, out,
+                                  (root_code < 112) ? 1.0f : kE8VRadiusCentreB);
 }
 
 __device__ __forceinline__ void e8_root_decode_8d_int8(uint8_t root_code, uint8_t rad_axis_code, int8_t out[8]) {

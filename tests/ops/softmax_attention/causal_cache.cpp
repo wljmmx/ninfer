@@ -108,7 +108,8 @@ constexpr ReductionCriterion kAttentionRk2Criterion{
 constexpr bool is_rank_compressed(KvCacheStorage storage) {
     return storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
            storage == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64 ||
-           storage == KvCacheStorage::RK4V4E8 || storage == KvCacheStorage::RK2V4E8;
+           storage == KvCacheStorage::RK4V4E8 || storage == KvCacheStorage::RK2V4E8 ||
+           storage == KvCacheStorage::RK4V2E8;
 }
 
 struct TestVectorLayout {
@@ -153,6 +154,10 @@ TestCacheLayout test_cache_layout(KvCacheStorage storage) {
     case KvCacheStorage::RK2V4E8:
         return {{DType::U8, kHeadDim / 4, DType::FP16, kQuantGroups},
                 {DType::U8, kHeadDim / 2, DType::FP16, kQuantGroups}};
+    case KvCacheStorage::RK4V2E8:
+        // int4 E8-lattice K + 2-bit E8-cylinder V: the plane mirror of RK2V4E8.
+        return {{DType::U8, kHeadDim / 2, DType::FP16, kQuantGroups},
+                {DType::U8, kHeadDim / 4, DType::FP16, kQuantGroups}};
     }
     throw std::invalid_argument("unsupported test KV storage");
 }
@@ -714,7 +719,8 @@ HostCache make_cache(const Geometry& geometry, KvCacheStorage storage, std::int3
     if (storage == KvCacheStorage::BFloat16 ||
         storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
         storage == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64 ||
-        storage == KvCacheStorage::RK4V4E8 || storage == KvCacheStorage::RK2V4E8) {
+        storage == KvCacheStorage::RK4V4E8 || storage == KvCacheStorage::RK2V4E8 ||
+        storage == KvCacheStorage::RK4V2E8) {
         cache.k_bf16 = to_bf16_bits(logical_k);
         cache.v_fp16 = to_f16_bits(logical_v);
         return cache;
@@ -1030,8 +1036,12 @@ std::int8_t rk4_unpack_host(std::uint8_t packed, int high) {
     return code;
 }
 
+// Mirror of kE8VRadiusCentreB in ops/kernel/e8_root_codec.cuh: the raw V plane's
+// calibrated Type-B radius-table centre for the 2-bit E8-cylinder codec.
+constexpr float kE8VRadiusCentreB = 1.115f;
+
 void e8_root_decode_8d_host(std::uint8_t root_code, std::uint8_t rad_axis_code,
-                            std::int8_t out[8]) {
+                            std::int8_t out[8], float radius_mult = 1.0f) {
     const std::uint32_t rad_idx  = static_cast<std::uint32_t>(rad_axis_code >> 4);
     const std::uint32_t axis_idx = static_cast<std::uint32_t>(rad_axis_code & 0x0Fu);
     if (rad_idx == 0) {
@@ -1040,12 +1050,20 @@ void e8_root_decode_8d_host(std::uint8_t root_code, std::uint8_t rad_axis_code,
     }
     const auto* root  = reinterpret_cast<const std::int8_t*>(&kE8CylinderStage1[root_code]);
     const auto* axis  = reinterpret_cast<const std::int8_t*>(&kE8CylinderAxis[axis_idx]);
-    const float scale = kE8CylinderRadius[rad_idx];
+    const float scale = kE8CylinderRadius[rad_idx] * radius_mult;
     for (int i = 0; i < 8; ++i) {
         int sum = static_cast<int>(root[i]) + static_cast<int>(axis[i]);
         sum     = std::clamp(sum, -128, 127);
         out[i]  = static_cast<std::int8_t>(round_even_to_i32(static_cast<float>(sum) * scale));
     }
+}
+
+// Host mirror of e8_root_decode_8d_fast_v: the V-plane read-back with the
+// calibrated Type-B radius centre.
+void e8_root_decode_8d_host_v(std::uint8_t root_code, std::uint8_t rad_axis_code,
+                              std::int8_t out[8]) {
+    e8_root_decode_8d_host(root_code, rad_axis_code, out,
+                           (root_code < 112) ? 1.0f : kE8VRadiusCentreB);
 }
 double cache_value(const HostCache& cache, bool key, int head, int position, int d) {
     const std::size_t row   = std::size_t(head) * cache.logical_capacity + position;
@@ -1083,7 +1101,21 @@ double cache_value(const HostCache& cache, bool key, int head, int position, int
                                    static_cast<std::uint8_t>(codes[at + 1]), decoded);
             return double(decoded[d % 8]) * scale;
         }
-        // Packed int4: the K plane for rk4v4 / rk4v4-e8 and the V plane for every layout.
+        if (!key && cache.storage == KvCacheStorage::RK4V2E8) {
+            // 2-bit E8-cylinder V plane: the same (root, rad_axis) pair layout as the
+            // rk2v4-e8 K plane, decoded with the calibrated V radius centre.
+            const std::int32_t group = d / kQuantGroup;
+            const std::int32_t sub   = (d % kQuantGroup) / 8;
+            const std::size_t at     = logical_plane_index(code_extent, cache.geometry,
+                                                           cache.logical_capacity, head, position,
+                                                           group * 16 + sub * 2);
+            std::int8_t decoded[8];
+            e8_root_decode_8d_host_v(static_cast<std::uint8_t>(codes[at]),
+                                     static_cast<std::uint8_t>(codes[at + 1]), decoded);
+            return double(decoded[d % 8]) * scale;
+        }
+        // Packed int4: the K plane for rk4v4 / rk4v4-e8 / rk4v2-e8 and the V plane for
+        // the remaining layouts.
         const std::size_t at = logical_plane_index(code_extent, cache.geometry,
                                                    cache.logical_capacity, head, position, d / 2);
         return double(rk4_unpack_host(static_cast<std::uint8_t>(codes[at]), d & 1)) * scale;
@@ -2678,7 +2710,8 @@ int run_batch_cases(DeviceExecutionView execution, KvCacheStorage storage) {
     if (storage == KvCacheStorage::BFloat16 ||
         storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
         storage == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64 ||
-        storage == KvCacheStorage::RK4V4E8 || storage == KvCacheStorage::RK2V4E8) {
+        storage == KvCacheStorage::RK4V4E8 || storage == KvCacheStorage::RK2V4E8 ||
+        storage == KvCacheStorage::RK4V2E8) {
         failures += run_batch_case(execution, kGeometries[0], storage,
                                    {16, {49}, {7}, {0}, MappingPattern::Identity, 500u});
         failures +=
@@ -3127,8 +3160,8 @@ int run_softmax_attention_causal_cache_tests(std::optional<KvCacheStorage> selec
          {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
           KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value,
           KvCacheStorage::RotatedInt8KeyInt4ValueGroup64,
-          KvCacheStorage::RotatedInt4KeyInt4ValueGroup64, KvCacheStorage::RK4V4E8,
-          KvCacheStorage::RK2V4E8}) {
+           KvCacheStorage::RotatedInt4KeyInt4ValueGroup64, KvCacheStorage::RK4V4E8,
+           KvCacheStorage::RK2V4E8, KvCacheStorage::RK4V2E8}) {
         if (selected && storage != *selected) continue;
         const auto start = std::chrono::steady_clock::now();
         std::cout << "RUN causal_softmax_attention " << cache_name(storage) << std::endl;

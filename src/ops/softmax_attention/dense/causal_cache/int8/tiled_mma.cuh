@@ -195,8 +195,9 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
                     const uint8_t vra1 = static_cast<uint8_t>(raw >> 24);
                     __align__(8) int8_t vdec0[8];
                     __align__(8) int8_t vdec1[8];
-                    e8_root_decode_8d_fast(vr0, vra0, vdec0);
-                    e8_root_decode_8d_fast(vr1, vra1, vdec1);
+                    // V-plane E8-cylinder read-back uses the calibrated radius centre.
+                    e8_root_decode_8d_fast_v(vr0, vra0, vdec0);
+                    e8_root_decode_8d_fast_v(vr1, vra1, vdec1);
                     *reinterpret_cast<uint64_t*>(vd) = *reinterpret_cast<const uint64_t*>(vdec0);
                     *reinterpret_cast<uint64_t*>(vd + 8) = *reinterpret_cast<const uint64_t*>(vdec1);
                 } else if constexpr (PackedV) {
