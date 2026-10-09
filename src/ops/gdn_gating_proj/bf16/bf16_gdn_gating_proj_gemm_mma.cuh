@@ -130,6 +130,16 @@ __global__ __launch_bounds__(Warps * 32, 1) void bf16_gdn_gating_proj_gemm_mma_k
 
     float a_acc[kBf16GdnMFragments][kNFragments][4] = {};
     float b_acc[kBf16GdnMFragments][kNFragments][4] = {};
+    // The unsplit route folds all of K into a single fp32 accumulator chain
+    // (kBf16GdnHidden / 16 sequential MMA steps). At K = 5120 that chain, not the MMA
+    // work, dominates the rounding error, so accumulate it in equal segments and fold
+    // the segment totals once at the end (two-stage accumulation). One extra accumulator
+    // set covers any segment count.
+    constexpr int kAccumSegments = SplitK == 1 ? 8 : 1;
+    static_assert(kTilesPerSplit % kAccumSegments == 0, "two-stage segments must divide K");
+    constexpr int kTilesPerSegment = kTilesPerSplit / kAccumSegments;
+    float a_folded[kBf16GdnMFragments][kNFragments][4] = {};
+    float b_folded[kBf16GdnMFragments][kNFragments][4] = {};
 
     auto stage_load = [&](int stage, int kt) {
         const int k0 = kt * kBf16GdnBlockK;
@@ -247,10 +257,46 @@ __global__ __launch_bounds__(Warps * 32, 1) void bf16_gdn_gating_proj_gemm_mma_k
             }
         }
 
+        if constexpr (kAccumSegments > 1) {
+            // Close the segment: fold the running chain into the two-stage totals and
+            // restart it, so no output element accumulates more than
+            // kTilesPerSegment * kKSubtiles terms in one sequence.
+            if ((it % kTilesPerSegment) == kTilesPerSegment - 1) {
+#pragma unroll
+                for (int mi = 0; mi < kBf16GdnMFragments; ++mi) {
+#pragma unroll
+                    for (int ni = 0; ni < kNFragments; ++ni) {
+#pragma unroll
+                        for (int e = 0; e < 4; ++e) {
+                            a_folded[mi][ni][e] += a_acc[mi][ni][e];
+                            b_folded[mi][ni][e] += b_acc[mi][ni][e];
+                            a_acc[mi][ni][e] = 0.0f;
+                            b_acc[mi][ni][e] = 0.0f;
+                        }
+                    }
+                }
+            }
+        }
+
         __syncthreads();
         const int next = it + kBf16GdnStages;
         if (next < kTilesPerSplit) { stage_load(stage, kt_begin + next); }
         ninfer::ops::cp_commit();
+    }
+
+    if constexpr (kAccumSegments > 1) {
+        // The last segment closed on the final K tile, so the folded totals are complete.
+#pragma unroll
+        for (int mi = 0; mi < kBf16GdnMFragments; ++mi) {
+#pragma unroll
+            for (int ni = 0; ni < kNFragments; ++ni) {
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    a_acc[mi][ni][e] = a_folded[mi][ni][e];
+                    b_acc[mi][ni][e] = b_folded[mi][ni][e];
+                }
+            }
+        }
     }
 
 #pragma unroll
