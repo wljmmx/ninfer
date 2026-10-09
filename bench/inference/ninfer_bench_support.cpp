@@ -87,8 +87,10 @@ KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "rk4v4") { return KvCacheStorage::RotatedInt4KeyInt4ValueGroup64; }
     if (text == "rk4v4-e8") { return KvCacheStorage::RK4V4E8; }
     if (text == "rk2v4-e8") { return KvCacheStorage::RK2V4E8; }
+    if (text == "rk4v2-e8") { return KvCacheStorage::RK4V2E8; }
     throw std::invalid_argument(
-        "--kv-dtype must be bf16, int8, fp8, nvfp4, k8v4, rk8v4, rk4v4, rk4v4-e8, or rk2v4-e8");
+        "--kv-dtype must be bf16, int8, fp8, nvfp4, k8v4, rk8v4, rk4v4, rk4v4-e8, rk2v4-e8, or "
+        "rk4v2-e8");
 }
 
 std::vector<int> parse_int_list(std::string_view value, const char* label) {
@@ -343,7 +345,7 @@ std::string usage_text(std::string_view program) {
         << "  --prefill-chunk <tokens>    multiple of " << kPrefillChunkAlignment
         << " (default: " << kDefaultPrefillChunk << ")\n"
         << "  --sampling-preset <mode>   greedy (default) or community (temp 0.6, top-p 0.95, top-k 20)\n"
-        << "  --kv-dtype <bf16|int8|fp8|nvfp4|k8v4|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8>  KV cache storage "
+        << "  --kv-dtype <bf16|int8|fp8|nvfp4|k8v4|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|rk4v2-e8>  KV cache storage "
            "(default: bf16)\n"
         << "  --spec <mtp|dflash|dflash2> speculative backend (default: none)\n"
         << "  --draft-tokens <n>         MTP 1..5; DFlash/DFlash2 1..15\n"

@@ -128,6 +128,8 @@ const char* kv_cache_name(ninfer::KvCacheStorage storage) {
         return "rk4v4-e8";
     case ninfer::KvCacheStorage::RK2V4E8:
         return "rk2v4-e8";
+    case ninfer::KvCacheStorage::RK4V2E8:
+        return "rk4v2-e8";
     }
     return "unknown";
 }

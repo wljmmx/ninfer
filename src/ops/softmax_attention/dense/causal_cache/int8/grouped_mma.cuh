@@ -20,7 +20,7 @@ namespace ninfer::ops::detail {
 // codes; E8Lattice selects E8 nearest-lattice projection vs plain RTN for K quantization.
 template <class Geometry, class Schedule, bool MultiBatch, bool Masked, class CacheInput,
           bool ParallelQueries = false, bool PackedV = false, bool PackedK = false,
-          bool E8Lattice = false, bool E8Root = false>
+          bool E8Lattice = false, bool E8Root = false, bool V8Root = false>
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     void int8_kv_grouped_mma_kernel(
         const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos,
@@ -198,7 +198,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             // PackedV uses the 4-bit range [-7, 7]: scale = FP16-RNE(absmax/7).
             __half v_scale;
             float v_inv_scale;
-            if constexpr (PackedV) {
+            if constexpr (PackedV || V8Root) {
                 v_scale     = rk4_absmax_to_scale_h(vamax);
                 const float represented = __half2float(v_scale);
                 v_inv_scale = represented > 0.0f ? 1.0f / represented : 0.0f;
@@ -291,8 +291,31 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                     cache_v_scale[so] = v_scale;
                 }
             }
-            if constexpr (PackedV) {
+            if constexpr (V8Root) {
+                // EXPERIMENT rk4v2-e8 V append: 2-bit E8 cylinder codes (V is not
+                // Hadamard-rotated). One (root, rad_axis) byte pair per 8D subspace;
+                // lanes 0/8/16/24 (subgroup leaders) write the pair bytes.
+                const float vs8 = __half2float(v_scale);
+                uint8_t vr0, vra0, vr1, vra1;
+                e8_encode_cylinder_8d_warp(vv0, vs8, vr0, vra0, lane);
+                e8_encode_cylinder_8d_warp(vv1, vs8, vr1, vra1, lane);
+                if ((lane & 7) == 0) {
+                    const int s0 = lane >> 3;
+                    const int s1 = 4 + (lane >> 3);
+                    const std::int64_t vo0 = paged_kv_element_offset<64, Geometry::KVHeads>(
+                        physical_page, kv_head, page_offset, (grp * 8 + s0) * 2);
+                    *reinterpret_cast<std::uint16_t*>(&cache_v_i8[vo0]) =
+                        static_cast<std::uint16_t>(vr0 | (vra0 << 8));
+                    const std::int64_t vo1 = paged_kv_element_offset<64, Geometry::KVHeads>(
+                        physical_page, kv_head, page_offset, (grp * 8 + s1) * 2);
+                    *reinterpret_cast<std::uint16_t*>(&cache_v_i8[vo1]) =
+                        static_cast<std::uint16_t>(vr1 | (vra1 << 8));
+                }
+            } else if constexpr (PackedV) {
                 // rk V plane: 4-bit codes, adjacent dims (2k, 2k+1) packed per byte.
+                // __shfl_xor_sync with FullMask requires ALL 32 lanes to participate —
+                // it must be called OUTSIDE the even-lane guard to avoid a deadlock.
+
                 // __shfl_xor_sync with FullMask requires ALL 32 lanes to participate —
                 // it must be called OUTSIDE the even-lane guard to avoid a deadlock.
                 const float vv0_next = __shfl_xor_sync(FullMask, vv0, 1);
@@ -471,8 +494,33 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 } else {
                     ninfer::ops::cp_async<16>(dst, &cache_k_i8[off]);
                 }
-                if constexpr (PackedV) {
+                if constexpr (V8Root) {
+                    // EXPERIMENT rk4v2-e8 V read-back: this 16-dim chunk spans two
+                    // consecutive 8D subspaces (4 cache bytes at byte offset d/4 of
+                    // the 64-byte V plane). Decode straight into v_i8 at stride D
+                    // (unswizzled: the V dequant reads &v_i8[key_l*D + d]).
+                    const int grp_for_read = d / 64;
+                    const int sub          = (d / 8) & 7;
+                    const int byte_offset  = (grp_for_read * 8 + sub) * 2;
+                    const std::int64_t voff = paged_kv_element_offset<64, Geometry::KVHeads>(
+                        physical_page, kv_head, key & kPagedKVPageMask, byte_offset);
+                    const std::uint32_t raw =
+                        *reinterpret_cast<const std::uint32_t*>(&cache_v_i8[voff]);
+                    const uint8_t vr0  = static_cast<uint8_t>(raw);
+                    const uint8_t vra0 = static_cast<uint8_t>(raw >> 8);
+                    const uint8_t vr1  = static_cast<uint8_t>(raw >> 16);
+                    const uint8_t vra1 = static_cast<uint8_t>(raw >> 24);
+                    __align__(8) int8_t vdec0[8];
+                    __align__(8) int8_t vdec1[8];
+                    e8_root_decode_8d_fast(vr0, vra0, vdec0);
+                    e8_root_decode_8d_fast(vr1, vra1, vdec1);
+                    *reinterpret_cast<uint64_t*>(&v_i8[key_l * D + d]) =
+                        *reinterpret_cast<const uint64_t*>(vdec0);
+                    *reinterpret_cast<uint64_t*>(&v_i8[key_l * D + d + 8]) =
+                        *reinterpret_cast<const uint64_t*>(vdec1);
+                } else if constexpr (PackedV) {
                     // rk V: 4-bit codes. cp_async 8 packed bytes (16 dims) into smem at
+
                     // the half-offset position (d>>1). The V cache has stride 128, so
                     // offsets are 8-byte aligned (guaranteed by paged_kv_element_offset
                     // with LeadingExtent=128 and dc*8 granularity).

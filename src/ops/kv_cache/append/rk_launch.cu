@@ -15,8 +15,8 @@ constexpr int kBlock = 256;
 
 // Codec flags → kernel template. kv_cache_append_full_rk_kernel is
 // <Geometry, Metadata, PackedK, E8Lattice, E8Root, MultiBatch>.
-template <typename Geometry, bool PackedK, bool E8Lattice, bool E8Root, typename CacheView,
-          typename Metadata>
+template <typename Geometry, bool PackedK, bool E8Lattice, bool E8Root, bool V8Root,
+          typename CacheView, typename Metadata>
 void launch_rk_for(const Tensor& k, const Tensor& v, const Tensor& positions,
                     CacheView cache, Metadata metadata, cudaStream_t stream) {
     const auto tokens = static_cast<std::int32_t>(k.ne[2]);
@@ -32,7 +32,7 @@ void launch_rk_for(const Tensor& k, const Tensor& v, const Tensor& positions,
     // 256 floats of shared memory per warp for the Hadamard scratch.
     const int smem_bytes = (kBlock / 32) * 256 * sizeof(float);
 
-    kv_cache_append_full_rk_kernel<Geometry, Metadata, PackedK, E8Lattice, E8Root, false>
+    kv_cache_append_full_rk_kernel<Geometry, Metadata, PackedK, E8Lattice, E8Root, false, V8Root>
         <<<grid, kBlock, smem_bytes, stream>>>(
             static_cast<const __nv_bfloat16*>(k.data),
             static_cast<const __nv_bfloat16*>(v.data),
@@ -41,26 +41,28 @@ void launch_rk_for(const Tensor& k, const Tensor& v, const Tensor& positions,
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <bool PackedK, bool E8Lattice, bool E8Root, typename CacheView, typename Metadata>
+template <bool PackedK, bool E8Lattice, bool E8Root, bool V8Root, typename CacheView,
+          typename Metadata>
 void dispatch_rk(const Tensor& k, const Tensor& v, const Tensor& positions,
                  CacheView cache, Metadata metadata, cudaStream_t stream) {
     if (k.ne[1] == KVCacheAppendD256Kv4::KVHeads) {
-        launch_rk_for<KVCacheAppendD256Kv4, PackedK, E8Lattice, E8Root>(k, v, positions, cache,
+        launch_rk_for<KVCacheAppendD256Kv4, PackedK, E8Lattice, E8Root, V8Root>(k, v, positions, cache,
                                                                         metadata, stream);
     } else {
-        launch_rk_for<KVCacheAppendD256Kv2, PackedK, E8Lattice, E8Root>(k, v, positions, cache,
+        launch_rk_for<KVCacheAppendD256Kv2, PackedK, E8Lattice, E8Root, V8Root>(k, v, positions, cache,
                                                                         metadata, stream);
     }
 }
 
 // Batch (multi-batch) variant: k.ne[3] > 1 layers share one launch via blockIdx.z.
-template <bool PackedK, bool E8Lattice, bool E8Root, typename CacheView, typename Metadata>
+template <bool PackedK, bool E8Lattice, bool E8Root, bool V8Root, typename CacheView,
+          typename Metadata>
 void dispatch_rk_multibatch(const Tensor& k, const Tensor& v, const Tensor& positions,
                             CacheView cache, Metadata metadata, cudaStream_t stream) {
     const auto launch_geom = [&]<class G>() {
         const dim3 grid(div_up(k.ne[2] * G::KVHeads, 8), 1, k.ne[3]);
         const int smem = (kBlock / 32) * 256 * sizeof(float);
-        kv_cache_append_full_rk_kernel<G, Metadata, PackedK, E8Lattice, E8Root, true>
+        kv_cache_append_full_rk_kernel<G, Metadata, PackedK, E8Lattice, E8Root, true, V8Root>
             <<<grid, kBlock, smem, stream>>>(
                 static_cast<const __nv_bfloat16*>(k.data),
                 static_cast<const __nv_bfloat16*>(v.data),
@@ -77,7 +79,7 @@ void dispatch_rk_multibatch(const Tensor& k, const Tensor& v, const Tensor& posi
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <bool PackedK, bool E8Lattice, bool E8Root>
+template <bool PackedK, bool E8Lattice, bool E8Root, bool V8Root = false>
 void rk_batch_entry(const Tensor& k, const Tensor& v, const Tensor& positions,
                     const Tensor& valid_columns, const Tensor& table_rows,
                     PagedKVBatchLayerView cache, cudaStream_t stream) {
@@ -91,11 +93,11 @@ void rk_batch_entry(const Tensor& k, const Tensor& v, const Tensor& positions,
             .table_stride = cache.block_tables.ne[0],
         };
         if (k.ne[3] > 1) {
-            dispatch_rk_multibatch<PackedK, E8Lattice, E8Root>(k, v, positions, cache, metadata,
-                                                               stream);
+            dispatch_rk_multibatch<PackedK, E8Lattice, E8Root, V8Root>(k, v, positions, cache,
+                                                               metadata, stream);
             return;
         }
-        dispatch_rk<PackedK, E8Lattice, E8Root>(k, v, positions, cache, metadata, stream);
+        dispatch_rk<PackedK, E8Lattice, E8Root, V8Root>(k, v, positions, cache, metadata, stream);
     };
     if (valid_columns.data == nullptr)
         launch.template operator()<false>();
@@ -141,30 +143,45 @@ void kv_cache_append_rk2v4e8_batch_launch(const Tensor& k, const Tensor& v,
                                        stream);
 }
 
+void kv_cache_append_rk4v2e8_batch_launch(const Tensor& k, const Tensor& v,
+                                          const Tensor& positions, const Tensor& valid_columns,
+                                          const Tensor& table_rows, PagedKVBatchLayerView cache,
+                                          cudaStream_t stream) {
+    // 4-bit E8-lattice K + 2-bit E8-cylinder V.
+    rk_batch_entry<true, true, false, true>(k, v, positions, valid_columns, table_rows, cache,
+                                            stream);
+}
+
 // Single-token appends (PagedKVLayerView, used by MTP warmup / single decode).
 
 void kv_cache_append_rk8v4_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                                   PagedKVLayerView cache, cudaStream_t stream) {
     const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data)};
-    dispatch_rk<false, false, false>(k, v, positions, cache, metadata, stream);
+    dispatch_rk<false, false, false, false>(k, v, positions, cache, metadata, stream);
 }
 
 void kv_cache_append_rk4v4_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                                   PagedKVLayerView cache, cudaStream_t stream) {
     const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data)};
-    dispatch_rk<true, false, false>(k, v, positions, cache, metadata, stream);
+    dispatch_rk<true, false, false, false>(k, v, positions, cache, metadata, stream);
 }
 
 void kv_cache_append_rk4v4e8_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                                     PagedKVLayerView cache, cudaStream_t stream) {
     const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data)};
-    dispatch_rk<true, true, false>(k, v, positions, cache, metadata, stream);
+    dispatch_rk<true, true, false, false>(k, v, positions, cache, metadata, stream);
 }
 
 void kv_cache_append_rk2v4e8_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                                     PagedKVLayerView cache, cudaStream_t stream) {
     const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data)};
-    dispatch_rk<false, false, true>(k, v, positions, cache, metadata, stream);
+    dispatch_rk<false, false, true, false>(k, v, positions, cache, metadata, stream);
+}
+
+void kv_cache_append_rk4v2e8_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
+                                    PagedKVLayerView cache, cudaStream_t stream) {
+    const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data)};
+    dispatch_rk<true, true, false, true>(k, v, positions, cache, metadata, stream);
 }
 
 } // namespace ninfer::ops::detail

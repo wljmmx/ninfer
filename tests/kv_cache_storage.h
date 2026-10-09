@@ -17,6 +17,7 @@ inline KvCacheStorage parse_kv_cache_storage(std::string_view name) {
     if (name == "rk4v4") return KvCacheStorage::RotatedInt4KeyInt4ValueGroup64;
     if (name == "rk4v4-e8") return KvCacheStorage::RK4V4E8;
     if (name == "rk2v4-e8") return KvCacheStorage::RK2V4E8;
+    if (name == "rk4v2-e8") return KvCacheStorage::RK4V2E8;
     throw std::invalid_argument("unknown KV dtype: " + std::string(name));
 }
 

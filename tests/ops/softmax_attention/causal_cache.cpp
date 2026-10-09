@@ -2002,6 +2002,8 @@ const char* cache_name(KvCacheStorage storage) {
         return "rk4v4-e8";
     case KvCacheStorage::RK2V4E8:
         return "rk2v4-e8";
+    case KvCacheStorage::RK4V2E8:
+        return "rk4v2-e8";
     }
     return "unknown";
 }
@@ -2016,6 +2018,7 @@ ReductionCriterion attention_criterion(KvCacheStorage storage) {
     if (storage == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64) return kAttentionRk4Criterion;
     if (storage == KvCacheStorage::RK4V4E8) return kAttentionRk4Criterion;
     if (storage == KvCacheStorage::RK2V4E8) return kAttentionRk2Criterion;
+    if (storage == KvCacheStorage::RK4V2E8) return kAttentionRk2Criterion;
     throw std::logic_error("unregistered causal-attention test storage");
 }
 

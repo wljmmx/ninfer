@@ -232,6 +232,11 @@ void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
             // int4 RTN append would corrupt every cached key.
             detail::kv_cache_append_rk2v4e8_launch(k, v, positions, cache, stream);
             return;
+        case KvCacheStorage::RK4V2E8:
+            // 4-bit E8-lattice K + 2-bit E8-cylinder V — the V plane is E8 coded,
+            // so the append must use the cylinder codec on V as well.
+            detail::kv_cache_append_rk4v2e8_launch(k, v, positions, cache, stream);
+            return;
         default:
             detail::kv_cache_append_launch(k, v, positions, cache, stream);
         }

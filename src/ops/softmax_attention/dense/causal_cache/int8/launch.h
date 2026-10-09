@@ -68,4 +68,19 @@ void rk2v4e8_kv_cached_attention(const Tensor& q, const Tensor& positions, float
                                  WorkspaceArena& workspace, Tensor& out,
                                  DeviceExecutionView execution);
 
+// rk4v2-e8: 4-bit E8-lattice K + 2-bit E8-cylinder V
+// (PackedK=true, E8Lattice=true, V8Root=true).
+void rk4v2e8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                                 const Tensor& positions, const Tensor& valid, const Tensor& rows,
+                                 float scale, PagedKVBatchLayerView cache,
+                                 CausalAttentionExecutionEnvelope envelope,
+                                 WorkspaceArena& workspace, Tensor& out,
+                                 DeviceExecutionView execution);
+
+void rk4v2e8_kv_cached_attention(const Tensor& q, const Tensor& positions, float scale,
+                                 const PagedKVLayerView& cache,
+                                 CausalAttentionExecutionEnvelope envelope,
+                                 WorkspaceArena& workspace, Tensor& out,
+                                 DeviceExecutionView execution);
+
 } // namespace ninfer::ops::detail

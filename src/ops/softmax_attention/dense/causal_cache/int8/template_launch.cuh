@@ -10,7 +10,7 @@ namespace ninfer::ops::detail {
 
 template <class G, class S, bool MultiBatch, bool Masked, bool Writable, class Input,
           bool ParallelQueries = false, bool PackedV = false, bool PackedK = false,
-          bool E8Lattice = false, bool E8Root = false>
+          bool E8Lattice = false, bool E8Root = false, bool V8Root = false>
 void launch_int8_kv_grouped_mma(const CausalAttentionOperands& p, Int8KvCacheView<Writable> cache,
                                 Input input, CausalKvPartition partition, CausalPartialView partial,
                                 cudaStream_t stream) {
@@ -27,7 +27,7 @@ void launch_int8_kv_grouped_mma(const CausalAttentionOperands& p, Int8KvCacheVie
         if (!input.k || !input.v) throw std::invalid_argument("INT8 append requires K/V");
     constexpr auto kernel =
         int8_kv_grouped_mma_kernel<G, S, MultiBatch, Masked, Input, ParallelQueries, PackedV,
-                                   PackedK, E8Lattice, E8Root>;
+                                   PackedK, E8Lattice, E8Root, V8Root>;
     constexpr int bytes = S::kDynamicArena ? S::kArenaBytes : 0;
     if constexpr (S::kDynamicArena) {
         static const auto status =
@@ -43,7 +43,8 @@ void launch_int8_kv_grouped_mma(const CausalAttentionOperands& p, Int8KvCacheVie
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <class G, class S, bool PackedV = false, bool PackedK = false, bool E8Root = false>
+template <class G, class S, bool PackedV = false, bool PackedK = false, bool E8Root = false,
+          bool V8Root = false>
 void launch_int8_kv_tiled_mma(const CausalAttentionOperands& p, Int8KvReadView cache,
                               cudaStream_t stream) {
     validate_quantized_causal_operands<G>(p, cache);
@@ -51,7 +52,7 @@ void launch_int8_kv_tiled_mma(const CausalAttentionOperands& p, Int8KvReadView c
         throw std::invalid_argument("INT8 tiled attention requires a complete single query row");
     const auto invoke = [&]<class Metadata>(Metadata metadata) {
         constexpr auto kernel =
-            int8_kv_tiled_mma_kernel<G, S, Metadata, PackedV, PackedK, E8Root>;
+            int8_kv_tiled_mma_kernel<G, S, Metadata, PackedV, PackedK, E8Root, V8Root>;
         static const auto status = cudaFuncSetAttribute(
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, S::kSharedBytes);
         CUDA_CHECK(status);

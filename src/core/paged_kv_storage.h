@@ -103,6 +103,16 @@ struct PagedKVStorageLayout {
             return symmetric({DType::U8, 128, DType::FP16, 4});
         }
         break;
+    case KvCacheStorage::RK4V2E8:
+        // rk4v2-e8: 4-bit E8-lattice K (128 B) + 2-bit E8-cylinder V (64 B), G64 scales.
+        // 13 KiB/token — same footprint as rk2v4-e8 but spends the low bits on V.
+        if (head_dim == kD256KVCacheHeadDim) {
+            return {storage,
+                    head_dim,
+                    {DType::U8, 128, DType::FP16, 4},
+                    {DType::U8, 64, DType::FP16, 4}};
+        }
+        break;
     case KvCacheStorage::RK2V4E8:
         // rk2v4-e8: 2-bit E8-cylinder K (quarter extent) + 4-bit V, G64 scales.
         if (head_dim == kD256KVCacheHeadDim) {

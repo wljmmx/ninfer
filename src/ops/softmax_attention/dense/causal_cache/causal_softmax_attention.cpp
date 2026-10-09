@@ -320,6 +320,7 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
     case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
     case KvCacheStorage::RK4V4E8:
     case KvCacheStorage::RK2V4E8:
+    case KvCacheStorage::RK4V2E8:
         return detail::int8_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
                                                execution.multiprocessor_count);
     default:
@@ -416,6 +417,10 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         detail::rk2v4e8_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows,
                                             scale, cache, envelope, workspace, out, execution);
         return;
+    case KvCacheStorage::RK4V2E8:
+        detail::rk4v2e8_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows,
+                                            scale, cache, envelope, workspace, out, execution);
+        return;
     default:
         break;
     }
@@ -493,6 +498,10 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
         return;
     case KvCacheStorage::RK2V4E8:
         detail::rk2v4e8_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
+                                            execution);
+        return;
+    case KvCacheStorage::RK4V2E8:
+        detail::rk4v2e8_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
                                             execution);
         return;
     default:

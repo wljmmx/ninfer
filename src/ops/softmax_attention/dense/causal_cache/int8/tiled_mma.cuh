@@ -15,7 +15,7 @@ namespace ninfer::ops::detail {
 // cylinder K (synchronous root decode). E8Lattice does not affect reads and
 // is therefore not a parameter here.
 template <typename Geometry, typename Schedule, typename Metadata, bool PackedV = false,
-          bool PackedK = false, bool E8Root = false>
+          bool PackedK = false, bool E8Root = false, bool V8Root = false>
 __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
     const __nv_bfloat16* __restrict__ q, const std::int8_t* __restrict__ cache_k,
     const std::int8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
@@ -181,7 +181,25 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
                         physical_page, kv_head, d, key & kPagedKVPageMask);
                     cp_async<16, Cache::cg>(kd, &cache_k[off]);
                 }
-                if constexpr (PackedV) {
+                if constexpr (V8Root) {
+                    // EXPERIMENT rk4v2-e8 V read-back: 4 cache bytes cover this 16-dim
+                    // chunk (two 8D subspaces); synchronous root decode into vd.
+                    const int byte_offset = ((d / 64) * 8 + ((d / 8) & 7)) * 2;
+                    const std::int64_t voff = paged_kv_element_offset<64, Geometry::KVHeads>(
+                        physical_page, kv_head, key & kPagedKVPageMask, byte_offset);
+                    const std::uint32_t raw =
+                        *reinterpret_cast<const std::uint32_t*>(&cache_v[voff]);
+                    const uint8_t vr0  = static_cast<uint8_t>(raw);
+                    const uint8_t vra0 = static_cast<uint8_t>(raw >> 8);
+                    const uint8_t vr1  = static_cast<uint8_t>(raw >> 16);
+                    const uint8_t vra1 = static_cast<uint8_t>(raw >> 24);
+                    __align__(8) int8_t vdec0[8];
+                    __align__(8) int8_t vdec1[8];
+                    e8_root_decode_8d_fast(vr0, vra0, vdec0);
+                    e8_root_decode_8d_fast(vr1, vra1, vdec1);
+                    *reinterpret_cast<uint64_t*>(vd) = *reinterpret_cast<const uint64_t*>(vdec0);
+                    *reinterpret_cast<uint64_t*>(vd + 8) = *reinterpret_cast<const uint64_t*>(vdec1);
+                } else if constexpr (PackedV) {
                     const std::int64_t voff = rk4_v_code_index<Geometry>(
                         physical_page, kv_head, d >> 1, key & kPagedKVPageMask);
                     cp_async<8>(vd, &cache_v[voff]);
