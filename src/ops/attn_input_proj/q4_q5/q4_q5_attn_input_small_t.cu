@@ -297,9 +297,20 @@ void launch_q5_simt(const Tensor& x, const Weight& weight, Tensor& gate, Tensor&
 
 void launch_q5(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
                cudaStream_t stream) {
-    // sm89 small-T MMA measured SLOWER than v3 split4/SIMT for N=7680 (same
-    // tail-wave issue as q4). Falls through to v3 routing.
+    // sm89 decode route: for the registered attention gate/value shape the
+    // warp-per-K-slice small-T MMA (HMMA + double-buffered cp.async) is the
+    // fastest arm at the decode token counts; every other shape keeps the v3
+    // split4/SIMT arms below.
     const int t = x.ne[1];
+    if (t >= 8 && t <= 12 && weight.padded_shape[1] == kHidden && (weight.n % 16) == 0) {
+        switch (weight.n) {
+        case 7168:
+            launch_q5_attn_sm89_dispatch<7168>(t, x, weight, gate, value, stream);
+            return;
+        default:
+            break;
+        }
+    }
     if (t == 1) {
         launch_q5_gemv(x, weight, gate, value, stream);
         return;

@@ -11,6 +11,7 @@
 #include "ops/linear/q4/q4_gemv_launch.cuh"
 #include "ops/linear/q5/q5_simt_launch.cuh"
 #include "ops/linear/q5/q5_gemv_launch.cuh"
+#include "ops/linear/q5/q5_small_t_mma.cuh"
 
 #include <cuda_bf16.h>
 
@@ -183,8 +184,71 @@ void launch_q5_simt_cols(const Tensor& x, const Weight& weight, Tensor& value, T
                                  LinearIdentityEpilogue{}, stream);
 }
 
+// ---------------------------------------------------------------------------
+// sm89 decode: warp-per-K-slice small-T MMA (HMMA + double-buffered cp.async)
+// for the fused value|z projection, with the SPLIT epilogue that preserves the
+// v3 fused single-pass output (rows [0, kValueRows) -> value, the rest -> z).
+// ---------------------------------------------------------------------------
+template <int N, int ActiveCols>
+void launch_q5_gdn_sm89(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
+                         cudaStream_t stream) {
+    constexpr int TileCols = ActiveCols <= 8 ? 8 : 16;
+    using Geometry         = Q5SmallTGeometry<N, kHidden>;
+    constexpr int kBlocks  = (N + 15) / 16;
+
+    Q5SmallTSplitEpilogue<kValueRows> epilogue;
+    epilogue.out_tail = static_cast<__nv_bfloat16*>(z.data);
+    epilogue.tail_ld  = static_cast<std::int32_t>(z.nb[1] / sizeof(__nv_bfloat16));
+
+    q5_small_t_mma_kernel<Geometry, TileCols, ActiveCols, Q5SmallTSplitEpilogue<kValueRows>,
+                          Q5SmallTMmaIdentityRows, 1>
+        <<<kBlocks, Q5SmallTSchedule::kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.qhigh),
+            static_cast<const std::uint8_t*>(weight.scales),
+            static_cast<__nv_bfloat16*>(value.data),
+            static_cast<std::int32_t>(x.nb[1] / sizeof(__nv_bfloat16)),
+            static_cast<std::int32_t>(value.nb[1] / sizeof(__nv_bfloat16)), epilogue,
+            Q5SmallTMmaIdentityRows{});
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <int N>
+void launch_q5_gdn_sm89_dispatch(int t, const Tensor& x, const Weight& weight, Tensor& value,
+                                  Tensor& z, cudaStream_t stream) {
+    switch (t) {
+    case 1:  launch_q5_gdn_sm89<N, 1>(x, weight, value, z, stream);  return;
+    case 2:  launch_q5_gdn_sm89<N, 2>(x, weight, value, z, stream);  return;
+    case 3:  launch_q5_gdn_sm89<N, 3>(x, weight, value, z, stream);  return;
+    case 4:  launch_q5_gdn_sm89<N, 4>(x, weight, value, z, stream);  return;
+    case 5:  launch_q5_gdn_sm89<N, 5>(x, weight, value, z, stream);  return;
+    case 6:  launch_q5_gdn_sm89<N, 6>(x, weight, value, z, stream);  return;
+    case 7:  launch_q5_gdn_sm89<N, 7>(x, weight, value, z, stream);  return;
+    case 8:  launch_q5_gdn_sm89<N, 8>(x, weight, value, z, stream);  return;
+    case 9:  launch_q5_gdn_sm89<N, 9>(x, weight, value, z, stream);  return;
+    case 10: launch_q5_gdn_sm89<N, 10>(x, weight, value, z, stream); return;
+    case 11: launch_q5_gdn_sm89<N, 11>(x, weight, value, z, stream); return;
+    case 12: launch_q5_gdn_sm89<N, 12>(x, weight, value, z, stream); return;
+    default: throw std::invalid_argument("sm89 q5 gdn: T out of [1,12]");
+    }
+}
+
 void launch_q5(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
                cudaStream_t stream) {
+    // sm89 decode route: the registered GDN value/z shape goes through the
+    // warp-per-K-slice small-T MMA at the decode token counts; every other shape
+    // keeps the v3 split4/SIMT arms below.
+    if (x.ne[1] >= 8 && x.ne[1] <= 12 && weight.padded_shape[1] == kHidden &&
+        (weight.n % 16) == 0) {
+        switch (weight.n) {
+        case 12288:
+            launch_q5_gdn_sm89_dispatch<12288>(x.ne[1], x, weight, value, z, stream);
+            return;
+        default:
+            break;
+        }
+    }
     if (x.ne[1] == 1) {
         launch_q5_gemv(x, weight, value, z, stream);
         return;
