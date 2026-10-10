@@ -350,14 +350,15 @@ void execute_parallel(const CausalAttentionOperands& p, Int8KvReadView cache,
 enum class RkVariant { Plain, PackedKOnly, E8Lattice, E8Root, E8LatticeV2 };
 
 // rk parallel: same as execute_parallel but with PackedV=true (and optionally PackedK/E8Root).
-template <class G, int Tokens, bool PackedK = false, bool E8Root = false, bool V8Root = false>
+template <class G, int Tokens, bool PackedK = false, bool E8Lattice = false, bool E8Root = false,
+          bool V8Root = false>
 void rk_parallel_grouped(const CausalAttentionOperands& p, Int8KvReadView cache,
                          CausalKvPartition partition, CausalPartialView partial,
                          cudaStream_t stream) {
     using Instance    = Int8KvGroupedInstance<G, Tokens>;
     const auto invoke = [&]<bool MultiBatch, bool Masked>() {
         launch_int8_kv_grouped_mma<G, typename Instance::Schedule, MultiBatch, Masked, false,
-                                   CausalCachedInput, true, !V8Root, PackedK, false, E8Root,
+                                   CausalCachedInput, true, !V8Root, PackedK, E8Lattice, E8Root,
                                    V8Root>(
             p, cache, {}, partition, partial, stream);
         launch_causal_natural_merge<G, typename Instance::Merge, MultiBatch, Masked, false>(
@@ -385,19 +386,19 @@ void rk_execute_parallel(const CausalAttentionOperands& p, Int8KvReadView cache,
                                                    plan.partition.capacity, plan.batch);
     const auto dispatch = [&]<class G>() {
         if constexpr (Variant == RkVariant::E8Root)
-            rk_parallel_grouped<G, Int8KvCausalPlan::kTokenTile, false, true>(p, cache,
+            rk_parallel_grouped<G, Int8KvCausalPlan::kTokenTile, false, false, true>(p, cache,
                 plan.partition, partial.view(), stream);
         else if constexpr (Variant == RkVariant::E8Lattice)
-            rk_parallel_grouped<G, Int8KvCausalPlan::kTokenTile, true, false>(p, cache,
+            rk_parallel_grouped<G, Int8KvCausalPlan::kTokenTile, true, true, false>(p, cache,
                 plan.partition, partial.view(), stream);
         else if constexpr (Variant == RkVariant::E8LatticeV2)
-            rk_parallel_grouped<G, Int8KvCausalPlan::kTokenTile, true, false, true>(p, cache,
-                plan.partition, partial.view(), stream);
+            rk_parallel_grouped<G, Int8KvCausalPlan::kTokenTile, true, true, false, true>(p,
+                cache, plan.partition, partial.view(), stream);
         else if constexpr (Variant == RkVariant::PackedKOnly)
-            rk_parallel_grouped<G, Int8KvCausalPlan::kTokenTile, true, false>(p, cache,
+            rk_parallel_grouped<G, Int8KvCausalPlan::kTokenTile, true, false, false>(p, cache,
                 plan.partition, partial.view(), stream);
         else // Plain (rk8v4: int8 K, no PackedK)
-            rk_parallel_grouped<G, Int8KvCausalPlan::kTokenTile, false, false>(p, cache,
+            rk_parallel_grouped<G, Int8KvCausalPlan::kTokenTile, false, false, false>(p, cache,
                 plan.partition, partial.view(), stream);
     };
     if (plan.query_heads == 24)
@@ -415,15 +416,16 @@ void tiled(const CausalAttentionOperands& p, Int8KvReadView cache, cudaStream_t 
 
 // rk tiled: same tiled kernel with the rk-family cache codecs selected for the
 // read-back (PackedV int4 V always; PackedK int4 K or E8Root 2-bit cylinder K).
-// E8Lattice only affects the append codec and is not a read parameter.
-template <bool PackedV, bool PackedK = false, bool E8Root = false, bool V8Root = false>
+// E8Lattice selects the [EXPERIMENT E8+1bit] carrier read-back.
+template <bool PackedV, bool PackedK = false, bool E8Root = false, bool V8Root = false,
+          bool E8Lattice = false>
 void rk_tiled(const CausalAttentionOperands& p, Int8KvReadView cache, cudaStream_t stream) {
     if (p.query_heads == 24)
         launch_int8_kv_tiled_mma<CausalD256H24Kv4, Int8KvTiledInstance, PackedV, PackedK,
-                                  E8Root, V8Root>(p, cache, stream);
+                                  E8Root, V8Root, E8Lattice>(p, cache, stream);
     else
         launch_int8_kv_tiled_mma<CausalD256H16Kv2, Int8KvTiledInstance, PackedV, PackedK,
-                                  E8Root, V8Root>(p, cache, stream);
+                                  E8Root, V8Root, E8Lattice>(p, cache, stream);
 }
 
 } // namespace
@@ -635,7 +637,7 @@ void rk4v4e8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor&
         const auto view =
             make_quantized_causal_cache_view<Int8KvCacheView<false>>(cache, &valid, &rows);
         if (plan.family == Int8KvFamily::Tiled)
-            rk_tiled<true, true>(p, view, stream);
+            rk_tiled<true, true, false, false, true>(p, view, stream);
         else
             rk_execute_parallel<RkVariant::E8Lattice>(p, view, plan, workspace, stream);
     }
@@ -658,7 +660,7 @@ void rk4v4e8_kv_cached_attention(const Tensor& q, const Tensor& positions, float
     const auto p     = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
     const auto qview = make_quantized_causal_cache_view<Int8KvCacheView<false>>(view);
     if (plan.family == Int8KvFamily::Tiled)
-        rk_tiled<true, true>(p, qview, stream);
+        rk_tiled<true, true, false, false, true>(p, qview, stream);
     else
         rk_execute_parallel<RkVariant::E8Lattice>(p, qview, plan, workspace, stream);
 }
@@ -688,7 +690,7 @@ void rk4v2e8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor&
         const auto view =
             make_quantized_causal_cache_view<Int8KvCacheView<false>>(cache, &valid, &rows);
         if (plan.family == Int8KvFamily::Tiled)
-            rk_tiled<false, true, false, true>(p, view, stream);
+            rk_tiled<false, true, false, true, true>(p, view, stream);
         else
             rk_execute_parallel<RkVariant::E8LatticeV2>(p, view, plan, workspace, stream);
     }
@@ -711,7 +713,7 @@ void rk4v2e8_kv_cached_attention(const Tensor& q, const Tensor& positions, float
     const auto p     = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
     const auto qview = make_quantized_causal_cache_view<Int8KvCacheView<false>>(view);
     if (plan.family == Int8KvFamily::Tiled)
-        rk_tiled<false, true, false, true>(p, qview, stream);
+            rk_tiled<false, true, false, true, true>(p, qview, stream);
     else
         rk_execute_parallel<RkVariant::E8LatticeV2>(p, qview, plan, workspace, stream);
 }

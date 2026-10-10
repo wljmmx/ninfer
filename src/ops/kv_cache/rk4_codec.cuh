@@ -54,6 +54,27 @@ __device__ __forceinline__ std::int8_t rk4_quant_code(float x, float inv_scale) 
     return static_cast<std::int8_t>(q);
 }
 
+// ---------------------------------------------------------------------------
+// [EXPERIMENT E8+1bit residual] Master switch for the carrier experiment: when the
+// E8Lattice K plane carries an "E8-cylinder + per-element 1-bit residual" code, this
+// flag applies the stored sign bits (+-1 code unit) at read-back. false reproduces
+// the plain E8-cylinder behaviour (the Y control of the experiment).
+inline constexpr bool kRkE8KResidualOn = true;  // [EXPERIMENT] false = Y control
+
+// [EXPERIMENT amplitude residual] 16x-grid variant: the E8Lattice K code is stored as
+// code16 = G*code + sign*theta with theta in [0,G] per 8D subspace (one byte per
+// subspace at plane offset [96,128)) and the group scale is stored as k_scale/G.
+// G=16 gives 1/16-code-unit residual amplitude resolution (close to the exact
+// step = mean|r| offline variant). Takes precedence over kRkE8KResidualOn.
+inline constexpr bool kRkE8KAmplitudeOn = false;  // [EXPERIMENT] rejected (D4); needs a 128B plane
+inline constexpr int kRkE8KAmplitudeGrid = 16;    // G: code16 = G*code +- theta
+
+// [D3] Converged E8-lattice K plane extent (bytes per token-head): 64 B E8 code +
+// 32 B per-element 1-bit residual signs. MUST equal the RMS K data_leading_extent
+// in core/paged_kv_storage.h for RK4V4E8 / RK4V2E8. 96 is 32-aligned so the
+// per-position stride keeps uint32 code loads 4-aligned on SM89.
+inline constexpr int kRkE8KLatticeExtent = 96;
+
 // Pack two int4 codes into one byte (low nibble = first, high nibble = second).
 __device__ __forceinline__ std::uint8_t rk4_pack(std::int8_t lo, std::int8_t hi) {
     return static_cast<std::uint8_t>(

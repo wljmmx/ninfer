@@ -241,40 +241,110 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                     cache_v_scale[so] = v_scale;
                 }
             } else if constexpr (PackedK) {
-                // int4 K: scale = absmax/7, clamp [-7, 7], pack two adjacent dims/byte.
+                // int4 K plane. Plain RTN for rk4v4; for the E8Lattice carrier this
+                // EXPERIMENT writes an "E8-cylinder + 1-bit residual" key into the
+                // 128-byte plane ((root,rad) pairs in [0,64), sign bytes in [64,96)).
                 __half k_scale_h = rk4_absmax_to_scale_h(kamax);
-                float k_inv = __half2float(k_scale_h);
-                k_inv = k_inv > 0.0f ? 1.0f / k_inv : 0.0f;
                 if constexpr (E8Lattice) {
-                    // E8 projection in the SCALED space (units of k_scale),
-                    // matching the reference codec: project the scaled 8D subspace
-                    // to the nearest E8 lattice point, then round back onto the
-                    // int4 grid below (the half-integral D8+0.5 coset collapses in
-                    // that round — documented approximation of the reference).
-                    float k0_mut = kv0 * k_inv, k1_mut = kv1 * k_inv;
-                    e8_project_8d_warp(k0_mut, k1_mut, lane);
-                    kv0 = k0_mut;
-                    kv1 = k1_mut;
-                    k_inv = 1.0f;
-                }
-                const float kv0_next = __shfl_xor_sync(FullMask, kv0, 1);
-                const float kv1_next = __shfl_xor_sync(FullMask, kv1, 1);
-                if ((lane & 1) == 0) {
-                    const auto kc0 = rk4_quant_code(kv0, k_inv);
-                    const auto kc1 = rk4_quant_code(kv0_next, k_inv);
-                    const std::int64_t ko0 = rk4_v_code_index<Geometry>(physical_page, kv_head,
-                                                                       d0 >> 1, page_offset);
-                    cache_k_i8[ko0] = static_cast<std::int8_t>(rk4_pack(kc0, kc1));
-                    const auto kc2 = rk4_quant_code(kv1, k_inv);
-                    const auto kc3 = rk4_quant_code(kv1_next, k_inv);
-                    const std::int64_t ko1 = rk4_v_code_index<Geometry>(physical_page, kv_head,
-                                                                       d1 >> 1, page_offset);
-                    cache_k_i8[ko1] = static_cast<std::int8_t>(rk4_pack(kc2, kc3));
+                    // [EXPERIMENT E8+1bit]
+                    const float ks = __half2float(k_scale_h);
+                    uint8_t root0, rad0, root1, rad1;
+                    e8_encode_cylinder_8d_warp(kv0, ks, root0, rad0, lane);
+                    e8_encode_cylinder_8d_warp(kv1, ks, root1, rad1, lane);
+                    __align__(8) int8_t dec0[8];
+                    __align__(8) int8_t dec1[8];
+                    e8_root_decode_8d_fast(root0, rad0, dec0);
+                    e8_root_decode_8d_fast(root1, rad1, dec1);
+                    const bool up0 = kv0 / ks >= static_cast<float>(dec0[lane & 7]);
+                    const bool up1 = kv1 / ks >= static_cast<float>(dec1[lane & 7]);
+                    float absr0 = fabsf(kv0 / ks - static_cast<float>(dec0[lane & 7]));
+                    float absr1 = fabsf(kv1 / ks - static_cast<float>(dec1[lane & 7]));
+                    absr0 += __shfl_xor_sync(FullMask, absr0, 1);
+                    absr0 += __shfl_xor_sync(FullMask, absr0, 2);
+                    absr0 += __shfl_xor_sync(FullMask, absr0, 4);
+                    absr1 += __shfl_xor_sync(FullMask, absr1, 1);
+                    absr1 += __shfl_xor_sync(FullMask, absr1, 2);
+                    absr1 += __shfl_xor_sync(FullMask, absr1, 4);
+                    std::uint32_t theta0 = 0, theta1 = 0;
+                    if constexpr (kRkE8KAmplitudeOn) {
+                        const float kG = static_cast<float>(kRkE8KAmplitudeGrid);
+                        int t0 = __float2int_rn(absr0 * 0.125f * kG);
+                        int t1 = __float2int_rn(absr1 * 0.125f * kG);
+                        theta0 = static_cast<std::uint32_t>(t0 < 0 ? 0 : (t0 > kRkE8KAmplitudeGrid ? kRkE8KAmplitudeGrid : t0));
+                        theta1 = static_cast<std::uint32_t>(t1 < 0 ? 0 : (t1 > kRkE8KAmplitudeGrid ? kRkE8KAmplitudeGrid : t1));
+                    }
+                    const std::uint32_t ballot0 = __ballot_sync(FullMask, up0);
+                    const std::uint32_t ballot1 = __ballot_sync(FullMask, up1);
+                    if ((lane & 7) == 0) {
+                        const int s0 = lane >> 3;
+                        const int s1 = 4 + (lane >> 3);
+                        const std::int64_t ko0 = paged_kv_element_offset<kRkE8KLatticeExtent, Geometry::KVHeads>(
+                            physical_page, kv_head, page_offset, (grp * 8 + s0) * 2);
+                        *reinterpret_cast<std::uint16_t*>(&cache_k_i8[ko0]) =
+                            static_cast<std::uint16_t>(root0 | (rad0 << 8));
+                        const std::int64_t ko1 = paged_kv_element_offset<kRkE8KLatticeExtent, Geometry::KVHeads>(
+                            physical_page, kv_head, page_offset, (grp * 8 + s1) * 2);
+                        *reinterpret_cast<std::uint16_t*>(&cache_k_i8[ko1]) =
+                            static_cast<std::uint16_t>(root1 | (rad1 << 8));
+                        if constexpr (kRkE8KAmplitudeOn) {
+                            const std::int64_t tt0 = paged_kv_element_offset<128, Geometry::KVHeads>(
+                                physical_page, kv_head, page_offset, 96 + grp * 8 + s0);
+                            cache_k_i8[tt0] = static_cast<std::int8_t>(theta0);
+                            const std::int64_t tt1 = paged_kv_element_offset<128, Geometry::KVHeads>(
+                                physical_page, kv_head, page_offset, 96 + grp * 8 + s1);
+                            cache_k_i8[tt1] = static_cast<std::int8_t>(theta1);
+                        }
+                    }
+                    if (lane == 0) {
+                        const std::uint32_t sb00 = ballot0 & 0xffu;
+                        const std::uint32_t sb01 = (ballot0 >> 8) & 0xffu;
+                        const std::uint32_t sb02 =
+                            (ballot0 >> 16) & 0xffu;
+                        const std::uint32_t sb03 =
+                            (ballot0 >> 24) & 0xffu;
+                        const std::int64_t so0 = paged_kv_element_offset<kRkE8KLatticeExtent, Geometry::KVHeads>(
+                            physical_page, kv_head, page_offset, 64 + grp * 8);
+                        *reinterpret_cast<std::uint32_t*>(&cache_k_i8[so0]) =
+                            sb00 | (sb01 << 8) | (sb02 << 16) | (sb03 << 24);
+                        const std::uint32_t sb10 = ballot1 & 0xffu;
+                        const std::uint32_t sb11 = (ballot1 >> 8) & 0xffu;
+                        const std::uint32_t sb12 =
+                            (ballot1 >> 16) & 0xffu;
+                        const std::uint32_t sb13 =
+                            (ballot1 >> 24) & 0xffu;
+                        const std::int64_t so1 = paged_kv_element_offset<kRkE8KLatticeExtent, Geometry::KVHeads>(
+                            physical_page, kv_head, page_offset, 64 + grp * 8 + 4);
+                        *reinterpret_cast<std::uint32_t*>(&cache_k_i8[so1]) =
+                            sb10 | (sb11 << 8) | (sb12 << 16) | (sb13 << 24);
+                    }
+                } else {
+                    float k_inv = __half2float(k_scale_h);
+                    k_inv = k_inv > 0.0f ? 1.0f / k_inv : 0.0f;
+                    const float kv0_next = __shfl_xor_sync(FullMask, kv0, 1);
+                    const float kv1_next = __shfl_xor_sync(FullMask, kv1, 1);
+                    if ((lane & 1) == 0) {
+                        const auto kc0 = rk4_quant_code(kv0, k_inv);
+                        const auto kc1 = rk4_quant_code(kv0_next, k_inv);
+                        const std::int64_t ko0 = rk4_v_code_index<Geometry>(physical_page,
+                                                                           kv_head, d0 >> 1,
+                                                                           page_offset);
+                        cache_k_i8[ko0] = static_cast<std::int8_t>(rk4_pack(kc0, kc1));
+                        const auto kc2 = rk4_quant_code(kv1, k_inv);
+                        const auto kc3 = rk4_quant_code(kv1_next, k_inv);
+                        const std::int64_t ko1 = rk4_v_code_index<Geometry>(physical_page,
+                                                                           kv_head, d1 >> 1,
+                                                                           page_offset);
+                        cache_k_i8[ko1] = static_cast<std::int8_t>(rk4_pack(kc2, kc3));
+                    }
                 }
                 if (lane == 0) {
                     const std::int64_t so = kv_cache_int8_quant_scale_index<Geometry>(
                         physical_page, kv_head, grp, page_offset);
-                    cache_k_scale[so] = k_scale_h;
+                    cache_k_scale[so] =
+                        (E8Lattice && kRkE8KAmplitudeOn)
+                            ? __float2half_rn(__half2float(k_scale_h) /
+                                              static_cast<float>(kRkE8KAmplitudeGrid))
+                            : k_scale_h;
                     cache_v_scale[so] = v_scale;
                 }
             } else {
@@ -469,6 +539,64 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                         *reinterpret_cast<const uint64_t*>(dec0);
                     *reinterpret_cast<uint64_t*>(dst + 8) =
                         *reinterpret_cast<const uint64_t*>(dec1);
+                } else if constexpr (PackedK && E8Lattice) {
+                    // [EXPERIMENT E8+1bit] carrier read-back: E8-cylinder decode on the
+                    // 128-byte int4 plane plus the per-element +-1 residual signs.
+                    // Register-lean on purpose (this kernel runs at a hard maxreg cap):
+                    // one shared decode array, the sign row is addressed relative to the
+                    // code row (koff + 64 - subidx), and no int8 clamping is needed
+                    // because decoded E8 codes stay far below the int8 rails.
+                    const int grp_for_read = d / 64;
+                    const int subidx       = grp_for_read * 8 + ((d / 8) & 7);
+                    const std::int64_t koff = paged_kv_element_offset<kRkE8KLatticeExtent, Geometry::KVHeads>(
+                        physical_page, kv_head, key & kPagedKVPageMask, subidx * 2);
+                    const std::uint32_t raw =
+                        *reinterpret_cast<const std::uint32_t*>(&cache_k_i8[koff]);
+                    const std::uint16_t signs = *reinterpret_cast<const std::uint16_t*>(
+                        &cache_k_i8[koff + 64 - subidx]);
+                    std::uint8_t th0 = 0, th1 = 0;
+                    if constexpr (kRkE8KAmplitudeOn) {
+                        th0 = static_cast<std::uint8_t>(cache_k_i8[koff + 96 - subidx]);
+                        th1 = static_cast<std::uint8_t>(cache_k_i8[koff + 96 - subidx + 1]);
+                    }
+                    __align__(8) int8_t dec[8];
+                    e8_root_decode_8d_fast(static_cast<uint8_t>(raw),
+                                          static_cast<uint8_t>(raw >> 8), dec);
+                    if constexpr (kRkE8KAmplitudeOn) {
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            int v = kRkE8KAmplitudeGrid * static_cast<int>(dec[i]) +
+                                    (((signs >> i) & 1u) ? static_cast<int>(th0)
+                                                         : -static_cast<int>(th0));
+                            dec[i] = static_cast<std::int8_t>(v < -127 ? -127 : (v > 127 ? 127 : v));
+                        }
+                    } else if constexpr (kRkE8KResidualOn) {
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            dec[i] = static_cast<std::int8_t>(
+                                dec[i] + (((signs >> i) & 1u) ? 1 : -1));
+                        }
+                    }
+                    *reinterpret_cast<uint64_t*>(dst) = *reinterpret_cast<const uint64_t*>(dec);
+                    e8_root_decode_8d_fast(static_cast<uint8_t>(raw >> 16),
+                                          static_cast<uint8_t>(raw >> 24), dec);
+                    if constexpr (kRkE8KAmplitudeOn) {
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            int v = kRkE8KAmplitudeGrid * static_cast<int>(dec[i]) +
+                                    (((signs >> (8 + i)) & 1u) ? static_cast<int>(th1)
+                                                               : -static_cast<int>(th1));
+                            dec[i] = static_cast<std::int8_t>(v < -127 ? -127 : (v > 127 ? 127 : v));
+                        }
+                    } else if constexpr (kRkE8KResidualOn) {
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            dec[i] = static_cast<std::int8_t>(
+                                dec[i] + (((signs >> (8 + i)) & 1u) ? 1 : -1));
+                        }
+                    }
+                    *reinterpret_cast<uint64_t*>(dst + 8) =
+                        *reinterpret_cast<const uint64_t*>(dec);
                 } else if constexpr (PackedK) {
                     // rk K read-back: vectorized 4-byte loads + fast nibble unpack
                     // (the same rk4_unpack_lo/hi_fast path as the V loader) straight

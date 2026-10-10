@@ -12,10 +12,12 @@ namespace ninfer::ops::detail {
 // PackedV/PackedK/E8Root select the rk-family cache codecs for the read-back:
 // int4 V (8 packed bytes per 16 dims, unpacked by the V-worker stage), int4 K
 // (synchronous vectorized unpack into the swizzled K slot) or the 2-bit E8
-// cylinder K (synchronous root decode). E8Lattice does not affect reads and
-// is therefore not a parameter here.
+// cylinder K (synchronous root decode). E8Lattice now DOES affect reads: the
+// [EXPERIMENT E8+1bit] carrier stores an E8-cylinder + residual key inside the
+// int4 plane, so the read-back must be selected per layout.
 template <typename Geometry, typename Schedule, typename Metadata, bool PackedV = false,
-          bool PackedK = false, bool E8Root = false, bool V8Root = false>
+          bool PackedK = false, bool E8Root = false, bool V8Root = false,
+          bool E8Lattice = false>
 __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
     const __nv_bfloat16* __restrict__ q, const std::int8_t* __restrict__ cache_k,
     const std::int8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
@@ -156,6 +158,60 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
                         *reinterpret_cast<const uint64_t*>(dec0);
                     *reinterpret_cast<uint64_t*>(kd + 8) =
                         *reinterpret_cast<const uint64_t*>(dec1);
+                } else if constexpr (PackedK && E8Lattice) {
+                    // [EXPERIMENT E8+1bit] carrier read-back: E8-cylinder decode on the
+                    // 128-byte int4 plane plus the per-element +-1 residual signs.
+                    // Register-lean on purpose (this kernel runs at a hard maxreg cap).
+                    const int subidx = (d / 64) * 8 + ((d / 8) & 7);
+                    const std::int64_t koff = paged_kv_element_offset<kRkE8KLatticeExtent, Geometry::KVHeads>(
+                        physical_page, kv_head, key & kPagedKVPageMask, subidx * 2);
+                    const std::uint32_t raw =
+                        *reinterpret_cast<const std::uint32_t*>(&cache_k[koff]);
+                    const std::uint16_t signs = *reinterpret_cast<const std::uint16_t*>(
+                        &cache_k[koff + 64 - subidx]);
+                    std::uint8_t th0 = 0, th1 = 0;
+                    if constexpr (kRkE8KAmplitudeOn) {
+                        th0 = static_cast<std::uint8_t>(cache_k[koff + 96 - subidx]);
+                        th1 = static_cast<std::uint8_t>(cache_k[koff + 96 - subidx + 1]);
+                    }
+                    __align__(8) int8_t dec[8];
+                    e8_root_decode_8d_fast(static_cast<uint8_t>(raw),
+                                          static_cast<uint8_t>(raw >> 8), dec);
+                    if constexpr (kRkE8KAmplitudeOn) {
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            int v = kRkE8KAmplitudeGrid * static_cast<int>(dec[i]) +
+                                    (((signs >> i) & 1u) ? static_cast<int>(th0)
+                                                         : -static_cast<int>(th0));
+                            dec[i] = static_cast<std::int8_t>(v < -127 ? -127 : (v > 127 ? 127 : v));
+                        }
+                    } else if constexpr (kRkE8KResidualOn) {
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            dec[i] = static_cast<std::int8_t>(
+                                dec[i] + (((signs >> i) & 1u) ? 1 : -1));
+                        }
+                    }
+                    *reinterpret_cast<uint64_t*>(kd) = *reinterpret_cast<const uint64_t*>(dec);
+                    e8_root_decode_8d_fast(static_cast<uint8_t>(raw >> 16),
+                                          static_cast<uint8_t>(raw >> 24), dec);
+                    if constexpr (kRkE8KAmplitudeOn) {
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            int v = kRkE8KAmplitudeGrid * static_cast<int>(dec[i]) +
+                                    (((signs >> (8 + i)) & 1u) ? static_cast<int>(th1)
+                                                               : -static_cast<int>(th1));
+                            dec[i] = static_cast<std::int8_t>(v < -127 ? -127 : (v > 127 ? 127 : v));
+                        }
+                    } else if constexpr (kRkE8KResidualOn) {
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            dec[i] = static_cast<std::int8_t>(
+                                dec[i] + (((signs >> (8 + i)) & 1u) ? 1 : -1));
+                        }
+                    }
+                    *reinterpret_cast<uint64_t*>(kd + 8) =
+                        *reinterpret_cast<const uint64_t*>(dec);
                 } else if constexpr (PackedK) {
                     // int4 K: 8 packed bytes cover this 16-dim chunk; synchronous
                     // load + vectorized nibble unpack into the swizzled slot

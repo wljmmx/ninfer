@@ -97,19 +97,29 @@ struct PagedKVStorageLayout {
         }
         break;
     case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
-    case KvCacheStorage::RK4V4E8:
-        // rk4v4 / rk4v4-e8: 4-bit K + 4-bit V (both packed as U8, half extent), G64 scales.
+        // rk4v4: 4-bit K + 4-bit V (both packed as U8, half extent), G64 scales.
         if (head_dim == kD256KVCacheHeadDim) {
             return symmetric({DType::U8, 128, DType::FP16, 4});
         }
         break;
-    case KvCacheStorage::RK4V2E8:
-        // rk4v2-e8: 4-bit E8-lattice K (128 B) + 2-bit E8-cylinder V (64 B), G64 scales.
-        // 13 KiB/token — same footprint as rk2v4-e8 but spends the low bits on V.
+    case KvCacheStorage::RK4V4E8:
+        // rk4v4-e8 [D3]: 2-bit E8-cylinder K + per-element 1-bit residual; the K plane
+        // is 96 B (64 B E8 code [0,64) + 32 B residual signs [64,96)) — see
+        // rk4_codec.cuh::kRkE8KLatticeExtent. 4-bit V, G64 scales. ~15 KiB/token.
         if (head_dim == kD256KVCacheHeadDim) {
             return {storage,
                     head_dim,
-                    {DType::U8, 128, DType::FP16, 4},
+                    {DType::U8, 96, DType::FP16, 4},
+                    {DType::U8, 128, DType::FP16, 4}};
+        }
+        break;
+    case KvCacheStorage::RK4V2E8:
+        // rk4v2-e8: E8-cylinder K (96 B, same codec as RK4V4E8) + 2-bit E8-cylinder V
+        // (64 B), G64 scales.
+        if (head_dim == kD256KVCacheHeadDim) {
+            return {storage,
+                    head_dim,
+                    {DType::U8, 96, DType::FP16, 4},
                     {DType::U8, 64, DType::FP16, 4}};
         }
         break;

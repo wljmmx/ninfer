@@ -44,15 +44,15 @@ void launch_int8_kv_grouped_mma(const CausalAttentionOperands& p, Int8KvCacheVie
 }
 
 template <class G, class S, bool PackedV = false, bool PackedK = false, bool E8Root = false,
-          bool V8Root = false>
+          bool V8Root = false, bool E8Lattice = false>
 void launch_int8_kv_tiled_mma(const CausalAttentionOperands& p, Int8KvReadView cache,
                               cudaStream_t stream) {
     validate_quantized_causal_operands<G>(p, cache);
     if (p.batch != 1)
         throw std::invalid_argument("INT8 tiled attention requires a complete single query row");
     const auto invoke = [&]<class Metadata>(Metadata metadata) {
-        constexpr auto kernel =
-            int8_kv_tiled_mma_kernel<G, S, Metadata, PackedV, PackedK, E8Root, V8Root>;
+        constexpr auto kernel = int8_kv_tiled_mma_kernel<G, S, Metadata, PackedV, PackedK, E8Root,
+                                                         V8Root, E8Lattice>;
         static const auto status = cudaFuncSetAttribute(
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, S::kSharedBytes);
         CUDA_CHECK(status);

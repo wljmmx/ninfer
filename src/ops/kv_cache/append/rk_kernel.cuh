@@ -98,54 +98,123 @@ __device__ __forceinline__ void kv_cache_append_rk_row(
             }
         }
     } else if constexpr (PackedK) {
-        // int4 K: PER-GROUP absmax/7 FP16 scale, matching the fused append and the
-        // reference rk4v4/rk4v4-e8 codecs — a single global scale wastes 1-2 bits
-        // of the [-7,7] grid whenever a group's absmax sits below the row maximum.
-        // k_vals[r] holds dim lane + 32*r, so group g's two halves live in
-        // k_vals[2g] and k_vals[2g+1].
+        // int4 K plane, PER-GROUP absmax/7 FP16 scale. Plain RTN for rk4v4; for the
+        // E8Lattice carrier (rk4v4-e8 / rk4v2-e8) this EXPERIMENT stores an
+        // "E8-cylinder + 1-bit residual" key instead: the 128-byte int4 plane holds
+        // the (root, rad_axis) byte pairs in [0,64) and one residual sign byte per
+        // 8D subspace in [64,96). k_vals[r] holds dim lane + 32*r.
         for (int grp = 0; grp < Groups; ++grp) {
             float g_abs = fmaxf(fabsf(k_vals[2 * grp]), fabsf(k_vals[2 * grp + 1]));
             g_abs       = warp_max(g_abs, FullMask);
             const __half k_scale = rk4_absmax_to_scale_h(g_abs);
-            float k_inv = __half2float(k_scale);
-            k_inv = k_inv > 0.0f ? 1.0f / k_inv : 0.0f;
-            float half_vals[2] = {k_vals[2 * grp], k_vals[2 * grp + 1]};
             if constexpr (E8Lattice) {
-                // E8 projection in the SCALED space (units of THIS group's k_scale),
-                // matching the reference rk4v4-e8 codec; the half-integral coset
-                // collapses in the int4 round below.
-                half_vals[0] *= k_inv;
-                half_vals[1] *= k_inv;
-                e8_project_8d_warp(half_vals[0], half_vals[1], lane);
-                k_inv = 1.0f;
-            }
-            // Vectorized int4 K pack: every lane quantizes its own dimension, even
-            // lanes build the packed byte, then writer lanes (multiples of 8) gather
-            // four consecutive bytes with three shuffles and store one uint32 —
-            // 32 uint32 stores per token-head instead of 128 byte stores. The byte
-            // offsets stay 4-aligned ((grp*64+half*32+lane)>>1 with lane=8m).
-            for (int half = 0; half < 2; ++half) {
-                const int c_self = rk4_quant_code(half_vals[half], k_inv);
-                const int c_nbr  = __shfl_xor_sync(FullMask, c_self, 1);
-                std::uint32_t my_byte = 0;
-                if ((lane & 1) == 0) {
-                    my_byte = rk4_pack(static_cast<std::int8_t>(c_self),
-                                       static_cast<std::int8_t>(c_nbr));
+                // [EXPERIMENT E8+1bit] E8-cylinder encode + per-element sign of the
+                // code-unit residual (vin/ks - decoded code >= 0).
+                const float ks = __half2float(k_scale);
+                uint8_t root0, rad0, root1, rad1;
+                e8_encode_cylinder_8d_warp(k_vals[2 * grp], ks, root0, rad0, lane);
+                e8_encode_cylinder_8d_warp(k_vals[2 * grp + 1], ks, root1, rad1, lane);
+                __align__(8) int8_t dec0[8];
+                __align__(8) int8_t dec1[8];
+                e8_root_decode_8d_fast(root0, rad0, dec0);
+                e8_root_decode_8d_fast(root1, rad1, dec1);
+                const bool up0 = k_vals[2 * grp] / ks >= static_cast<float>(dec0[lane & 7]);
+                const bool up1 = k_vals[2 * grp + 1] / ks >= static_cast<float>(dec1[lane & 7]);
+                float absr0 = fabsf(k_vals[2 * grp] / ks - static_cast<float>(dec0[lane & 7]));
+                float absr1 = fabsf(k_vals[2 * grp + 1] / ks - static_cast<float>(dec1[lane & 7]));
+                absr0 += __shfl_xor_sync(FullMask, absr0, 1);
+                absr0 += __shfl_xor_sync(FullMask, absr0, 2);
+                absr0 += __shfl_xor_sync(FullMask, absr0, 4);
+                absr1 += __shfl_xor_sync(FullMask, absr1, 1);
+                absr1 += __shfl_xor_sync(FullMask, absr1, 2);
+                absr1 += __shfl_xor_sync(FullMask, absr1, 4);
+                std::uint32_t theta0 = 0, theta1 = 0;
+                if constexpr (kRkE8KAmplitudeOn) {
+                    const float kG = static_cast<float>(kRkE8KAmplitudeGrid);
+                    int t0 = __float2int_rn(absr0 * 0.125f * kG);
+                    int t1 = __float2int_rn(absr1 * 0.125f * kG);
+                    theta0 = static_cast<std::uint32_t>(t0 < 0 ? 0 : (t0 > kRkE8KAmplitudeGrid ? kRkE8KAmplitudeGrid : t0));
+                    theta1 = static_cast<std::uint32_t>(t1 < 0 ? 0 : (t1 > kRkE8KAmplitudeGrid ? kRkE8KAmplitudeGrid : t1));
                 }
-                const std::uint32_t b1 = __shfl_xor_sync(FullMask, my_byte, 2);
-                const std::uint32_t b2 = __shfl_xor_sync(FullMask, my_byte, 4);
-                const std::uint32_t b3 = __shfl_xor_sync(FullMask, my_byte, 6);
-                if ((lane & 7) == 0) {
-                    const int byte_idx = (grp * 64 + half * 32 + lane) >> 1;
-                    const std::int64_t off = paged_kv_element_offset<128, Geometry::KVHeads>(
-                        physical_page, kv_head, page_offset, byte_idx);
-                    *reinterpret_cast<std::uint32_t*>(&cache_k[off]) =
-                        my_byte | (b1 << 8) | (b2 << 16) | (b3 << 24);
+                const std::uint32_t theta0_next = __shfl_xor_sync(FullMask, theta0, 8);
+                const std::uint32_t theta1_next = __shfl_xor_sync(FullMask, theta1, 8);
+                const std::uint32_t ballot0 = __ballot_sync(FullMask, up0);
+                const std::uint32_t ballot1 = __ballot_sync(FullMask, up1);
+                const std::uint32_t pair0      = root0 | (rad0 << 8);
+                const std::uint32_t pair1      = root1 | (rad1 << 8);
+                const std::uint32_t pair0_next = __shfl_xor_sync(FullMask, pair0, 8);
+                const std::uint32_t pair1_next = __shfl_xor_sync(FullMask, pair1, 8);
+                if ((lane & 15) == 0) {
+                    const int s0 = lane >> 3;
+                    const std::int64_t off0 = paged_kv_element_offset<kRkE8KLatticeExtent, Geometry::KVHeads>(
+                        physical_page, kv_head, page_offset, (grp * 8 + s0) * 2);
+                    *reinterpret_cast<std::uint32_t*>(&cache_k[off0]) =
+                        pair0 | (pair0_next << 16);
+                    const std::int64_t off1 = paged_kv_element_offset<kRkE8KLatticeExtent, Geometry::KVHeads>(
+                        physical_page, kv_head, page_offset, (grp * 8 + s0 + 4) * 2);
+                    *reinterpret_cast<std::uint32_t*>(&cache_k[off1]) =
+                        pair1 | (pair1_next << 16);
+                    if constexpr (kRkE8KAmplitudeOn) {
+                        const std::int64_t to0 = paged_kv_element_offset<128, Geometry::KVHeads>(
+                            physical_page, kv_head, page_offset, 96 + grp * 8 + s0);
+                        *reinterpret_cast<std::uint16_t*>(&cache_k[to0]) =
+                            static_cast<std::uint16_t>(theta0 | (theta0_next << 8));
+                        const std::int64_t to1 = paged_kv_element_offset<128, Geometry::KVHeads>(
+                            physical_page, kv_head, page_offset, 96 + grp * 8 + s0 + 4);
+                        *reinterpret_cast<std::uint16_t*>(&cache_k[to1]) =
+                            static_cast<std::uint16_t>(theta1 | (theta1_next << 8));
+                    }
+                }
+                if (lane == 0) {
+                    const std::uint32_t sb00 = ballot0 & 0xffu;
+                    const std::uint32_t sb01 = (ballot0 >> 8) & 0xffu;
+                    const std::uint32_t sb02 = (ballot0 >> 16) & 0xffu;
+                    const std::uint32_t sb03 = (ballot0 >> 24) & 0xffu;
+                    const std::int64_t so0 = paged_kv_element_offset<kRkE8KLatticeExtent, Geometry::KVHeads>(
+                        physical_page, kv_head, page_offset, 64 + grp * 8);
+                    *reinterpret_cast<std::uint32_t*>(&cache_k[so0]) =
+                        sb00 | (sb01 << 8) | (sb02 << 16) | (sb03 << 24);
+                    const std::uint32_t sb10 = ballot1 & 0xffu;
+                    const std::uint32_t sb11 = (ballot1 >> 8) & 0xffu;
+                    const std::uint32_t sb12 = (ballot1 >> 16) & 0xffu;
+                    const std::uint32_t sb13 = (ballot1 >> 24) & 0xffu;
+                    const std::int64_t so1 = paged_kv_element_offset<kRkE8KLatticeExtent, Geometry::KVHeads>(
+                        physical_page, kv_head, page_offset, 64 + grp * 8 + 4);
+                    *reinterpret_cast<std::uint32_t*>(&cache_k[so1]) =
+                        sb10 | (sb11 << 8) | (sb12 << 16) | (sb13 << 24);
+                }
+            } else {
+                float k_inv = __half2float(k_scale);
+                k_inv = k_inv > 0.0f ? 1.0f / k_inv : 0.0f;
+                float half_vals[2] = {k_vals[2 * grp], k_vals[2 * grp + 1]};
+                for (int half = 0; half < 2; ++half) {
+                    const int c_self = rk4_quant_code(half_vals[half], k_inv);
+                    const int c_nbr  = __shfl_xor_sync(FullMask, c_self, 1);
+                    std::uint32_t my_byte = 0;
+                    if ((lane & 1) == 0) {
+                        my_byte = rk4_pack(static_cast<std::int8_t>(c_self),
+                                           static_cast<std::int8_t>(c_nbr));
+                    }
+                    const std::uint32_t nb1 = __shfl_xor_sync(FullMask, my_byte, 2);
+                    const std::uint32_t nb2 = __shfl_xor_sync(FullMask, my_byte, 4);
+                    const std::uint32_t nb3 = __shfl_xor_sync(FullMask, my_byte, 6);
+                    if ((lane & 7) == 0) {
+                        const int byte_idx = (grp * 64 + half * 32 + lane) >> 1;
+                        const std::int64_t off = paged_kv_element_offset<128, Geometry::KVHeads>(
+                            physical_page, kv_head, page_offset, byte_idx);
+                        *reinterpret_cast<std::uint32_t*>(&cache_k[off]) =
+                            my_byte | (nb1 << 8) | (nb2 << 16) | (nb3 << 24);
+                    }
                 }
             }
             if (lane == 0) {
+                const __half k_scale_out =
+                    (E8Lattice && kRkE8KAmplitudeOn)
+                        ? __float2half_rn(__half2float(k_scale) /
+                                          static_cast<float>(kRkE8KAmplitudeGrid))
+                        : k_scale;
                 scale_k[paged_kv_element_offset<4, Geometry::KVHeads>(
-                    physical_page, kv_head, page_offset, grp)] = k_scale;
+                    physical_page, kv_head, page_offset, grp)] = k_scale_out;
             }
         }
     } else {

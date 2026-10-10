@@ -148,15 +148,18 @@ TestCacheLayout test_cache_layout(KvCacheStorage storage) {
         return {{DType::I8, kHeadDim, DType::FP16, kQuantGroups},
                 {DType::U8, kHeadDim / 2, DType::FP16, kQuantGroups}};
     case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
-    case KvCacheStorage::RK4V4E8:
         return {{DType::U8, kHeadDim / 2, DType::FP16, kQuantGroups},
+                {DType::U8, kHeadDim / 2, DType::FP16, kQuantGroups}};
+    case KvCacheStorage::RK4V4E8:
+        // E8-cylinder K + 1-bit residual: 96 B K plane (mirrors core/paged_kv_storage.h).
+        return {{DType::U8, 3 * kHeadDim / 8, DType::FP16, kQuantGroups},
                 {DType::U8, kHeadDim / 2, DType::FP16, kQuantGroups}};
     case KvCacheStorage::RK2V4E8:
         return {{DType::U8, kHeadDim / 4, DType::FP16, kQuantGroups},
                 {DType::U8, kHeadDim / 2, DType::FP16, kQuantGroups}};
     case KvCacheStorage::RK4V2E8:
-        // int4 E8-lattice K + 2-bit E8-cylinder V: the plane mirror of RK2V4E8.
-        return {{DType::U8, kHeadDim / 2, DType::FP16, kQuantGroups},
+        // E8-cylinder K (96 B) + 2-bit E8-cylinder V: the plane mirror of RK2V4E8.
+        return {{DType::U8, 3 * kHeadDim / 8, DType::FP16, kQuantGroups},
                 {DType::U8, kHeadDim / 4, DType::FP16, kQuantGroups}};
     }
     throw std::invalid_argument("unsupported test KV storage");
@@ -1114,8 +1117,29 @@ double cache_value(const HostCache& cache, bool key, int head, int position, int
                                      static_cast<std::uint8_t>(codes[at + 1]), decoded);
             return double(decoded[d % 8]) * scale;
         }
-        // Packed int4: the K plane for rk4v4 / rk4v4-e8 / rk4v2-e8 and the V plane for
-        // the remaining layouts.
+        if (key && (cache.storage == KvCacheStorage::RK4V4E8 ||
+                    cache.storage == KvCacheStorage::RK4V2E8)) {
+            // E8-cylinder K + per-element 1-bit residual: (root, rad_axis) byte pairs in
+            // [0,64) and one residual sign byte per 8D subspace in [64,96) of the 96 B
+            // K plane — mirrors the kRkE8KResidualOn read-back in grouped_mma.cuh /
+            // tiled_mma.cuh (bit set => +1 code unit, clear => -1).
+            const std::int32_t group = d / kQuantGroup;
+            const std::int32_t sub   = (d % kQuantGroup) / 8;
+            const std::size_t at     = logical_plane_index(code_extent, cache.geometry,
+                                                           cache.logical_capacity, head, position,
+                                                           group * 16 + sub * 2);
+            std::int8_t decoded[8];
+            e8_root_decode_8d_host(static_cast<std::uint8_t>(codes[at]),
+                                   static_cast<std::uint8_t>(codes[at + 1]), decoded);
+            const std::size_t sat = logical_plane_index(code_extent, cache.geometry,
+                                                        cache.logical_capacity, head, position,
+                                                        64 + group * 8 + sub);
+            const std::uint8_t signs = static_cast<std::uint8_t>(codes[sat]);
+            const int elem = d % 8;
+            const int v = static_cast<int>(decoded[elem]) + (((signs >> elem) & 1u) ? 1 : -1);
+            return double(v) * scale;
+        }
+        // Packed int4: the K plane for rk4v4 and the V plane for the remaining layouts.
         const std::size_t at = logical_plane_index(code_extent, cache.geometry,
                                                    cache.logical_capacity, head, position, d / 2);
         return double(rk4_unpack_host(static_cast<std::uint8_t>(codes[at]), d & 1)) * scale;
