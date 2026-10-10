@@ -575,13 +575,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                             dec[i] = static_cast<std::int8_t>(v < -127 ? -127 : (v > 127 ? 127 : v));
                         }
                     } else if constexpr (kRkE8KResidualOn) {
-#pragma unroll
-                        for (int i = 0; i < 8; ++i) {
-                            const int v = kRkE8KFracGrid * static_cast<int>(dec[i]) +
-                                          (((signs >> i) & 1u) ? kRkE8KFracTheta
-                                                               : -kRkE8KFracTheta);
-                            dec[i] = static_cast<std::int8_t>(v < -127 ? -127 : (v > 127 ? 127 : v));
-                        }
+rk4_apply_e8_residual(dec, static_cast<std::uint32_t>(signs));
                     }
                     *reinterpret_cast<uint64_t*>(dst) = *reinterpret_cast<const uint64_t*>(dec);
                     e8_root_decode_8d_fast(static_cast<uint8_t>(raw >> 16),
@@ -595,13 +589,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                             dec[i] = static_cast<std::int8_t>(v < -127 ? -127 : (v > 127 ? 127 : v));
                         }
                     } else if constexpr (kRkE8KResidualOn) {
-#pragma unroll
-                        for (int i = 0; i < 8; ++i) {
-                            const int v = kRkE8KFracGrid * static_cast<int>(dec[i]) +
-                                          (((signs >> (8 + i)) & 1u) ? kRkE8KFracTheta
-                                                                     : -kRkE8KFracTheta);
-                            dec[i] = static_cast<std::int8_t>(v < -127 ? -127 : (v > 127 ? 127 : v));
-                        }
+rk4_apply_e8_residual(dec, static_cast<std::uint32_t>(signs >> 8));
                     }
                     *reinterpret_cast<uint64_t*>(dst + 8) =
                         *reinterpret_cast<const uint64_t*>(dec);
@@ -709,25 +697,13 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 e8_root_decode_8d_fast(static_cast<uint8_t>(raw),
                                        static_cast<uint8_t>(raw >> 8), dec);
                 if constexpr (kRkE8KResidualOn) {
-#pragma unroll
-                    for (int i = 0; i < 8; ++i) {
-                        const int v = kRkE8KFracGrid * static_cast<int>(dec[i]) +
-                                      (((signs >> i) & 1u) ? kRkE8KFracTheta
-                                                           : -kRkE8KFracTheta);
-                        dec[i] = static_cast<std::int8_t>(v < -127 ? -127 : (v > 127 ? 127 : v));
-                    }
+rk4_apply_e8_residual(dec, static_cast<std::uint32_t>(signs));
                 }
                 *reinterpret_cast<uint64_t*>(dst) = *reinterpret_cast<const uint64_t*>(dec);
                 e8_root_decode_8d_fast(static_cast<uint8_t>(raw >> 16),
                                        static_cast<uint8_t>(raw >> 24), dec);
                 if constexpr (kRkE8KResidualOn) {
-#pragma unroll
-                    for (int i = 0; i < 8; ++i) {
-                        const int v = kRkE8KFracGrid * static_cast<int>(dec[i]) +
-                                      (((signs >> (8 + i)) & 1u) ? kRkE8KFracTheta
-                                                                 : -kRkE8KFracTheta);
-                        dec[i] = static_cast<std::int8_t>(v < -127 ? -127 : (v > 127 ? 127 : v));
-                    }
+rk4_apply_e8_residual(dec, static_cast<std::uint32_t>(signs >> 8));
                 }
                 *reinterpret_cast<uint64_t*>(dst + 8) = *reinterpret_cast<const uint64_t*>(dec);
             }

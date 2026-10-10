@@ -85,6 +85,26 @@ inline constexpr int kRkE8KLatticeExtent = 96;
 inline constexpr int kRkE8KFracGrid  = 4;  // G
 inline constexpr int kRkE8KFracTheta = 4;  // theta0 in [0,G]; theta0=G gives +-1 (PPL-best default); theta0=G/2 gives +-0.5 (MTP-best)
 
+// Applies the E8 per-element residual (+-theta code units) to eight decoded roots.
+// For the shipped theta == G the reconstruction is exactly G*(root +- 1) with the
+// group scale stored as scale/G, so the multiply and the clamp fold into a shift:
+// G is a power of two and |root| <= 2 keeps G*(root +- 1) inside int8. The general
+// clamped form stays for a genuinely fractional theta.
+__device__ __forceinline__ void rk4_apply_e8_residual(std::int8_t* dec, std::uint32_t sbits) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int sign = static_cast<int>((sbits >> i) & 1u);
+        if constexpr (kRkE8KFracTheta == kRkE8KFracGrid) {
+            const int d = static_cast<int>(dec[i]) + (sign ? 1 : -1);
+            dec[i]      = static_cast<std::int8_t>(kRkE8KFracGrid * d);
+        } else {
+            const int v = kRkE8KFracGrid * static_cast<int>(dec[i]) +
+                          (sign ? kRkE8KFracTheta : -kRkE8KFracTheta);
+            dec[i] = static_cast<std::int8_t>(v < -127 ? -127 : (v > 127 ? 127 : v));
+        }
+    }
+}
+
 // Pack two int4 codes into one byte (low nibble = first, high nibble = second).
 __device__ __forceinline__ std::uint8_t rk4_pack(std::int8_t lo, std::int8_t hi) {
     return static_cast<std::uint8_t>(
