@@ -32,4 +32,13 @@ bool w4a8_swiglu_supported(const Weight& weight, std::int32_t tokens);
 /** out = silu(gate(x)) * up(x) with the W4A8 route. Requires w4a8_swiglu_supported(). */
 void w4a8_swiglu(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
 
+/** True when the q4/q5 attention input projection pair can use the W4A8 route. */
+bool w4a8_attn_input_supported(const Weight& query_key_weight, const Weight& gate_value_weight,
+                               std::int32_t tokens);
+
+/** Fused q/k from one weight and gate/v from the other, via the W4A8 route. */
+void w4a8_attn_input_proj(const Tensor& x, const Weight& query_key_weight,
+                          const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& key,
+                          Tensor& value, cudaStream_t stream);
+
 } // namespace ninfer::ops

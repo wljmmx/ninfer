@@ -630,6 +630,199 @@ __global__ __launch_bounds__(kSGThreads, 2) void w4a8_swiglu_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Route C: W4A8 for the grouped input projections (attention q/k/v + gate, and
+// the GDN qk/value/output-gate). Four jobs share one launch, exactly like the
+// bf16 rowsplit_grouped_mma: splitting them into four launches costs roughly a
+// wave of quantization per job, which cancels most of the int8 gain.
+// A = pre-dequantized int8 weight rows, B = pre-quantized int8 activation; both
+// are staged straight into the swizzled tiles (no in-kernel decode), the int32
+// mma result is folded into fp32 once per 64-K group with the per-(row,group)
+// weight scale and the per-token activation scale, and the epilogue overwrites
+// the job's output rows.
+// Full tiles only: tokens % kGRBN == 0 and every job's row count % kGRBM == 0.
+// ---------------------------------------------------------------------------
+constexpr int kGRBM = 64, kGRBN = 128, kGRBK = 64;
+constexpr int kGRThreads = 256;              // 8 warps: 2 row x 4 token
+constexpr int kGRMT = 2, kGRNT = 4;          // warp tile 32x32
+constexpr int kGRStages = 4;
+
+struct W4A8GroupedJob {
+    const std::int8_t* w   = nullptr; // int8 weight rows [n][k], this job's slice
+    const __half* wsc      = nullptr; // per-(row,group) fp16 scales, same slice
+    __nv_bfloat16* out     = nullptr;
+    std::int32_t out_ld    = 0;
+    std::int32_t out_row   = 0;
+    std::int32_t n         = 0;
+};
+
+// q4/q5 (groups of 64) -> int8, natural row order. q5 adds the high-bit plane.
+__global__ void dequant_q4q5_i8(const std::uint8_t* __restrict__ codes,
+                                const std::uint8_t* __restrict__ high, std::int8_t* __restrict__ out,
+                                int groups, int k, int q5) {
+    const int task = blockIdx.x * blockDim.x + threadIdx.x;
+    if (task >= groups * 4) return;
+    const long row = blockIdx.y;
+    const int group = task >> 2, q = task & 3;
+    const std::uint8_t* cw = codes + (row * groups + group) * 32;
+    const uint2 c2 = *reinterpret_cast<const uint2*>(cw + q * 8);
+    const std::uint8_t* cb = reinterpret_cast<const std::uint8_t*>(&c2);
+    alignas(16) std::int8_t vals[16];
+    if (q5) {
+        const std::uint8_t* hw = high + (row * groups + group) * 8;
+        const std::uint16_t h2 = *reinterpret_cast<const std::uint16_t*>(hw + q * 2);
+        const std::uint8_t* hb = reinterpret_cast<const std::uint8_t*>(&h2);
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const int half = j >> 1;
+            const std::uint8_t code = cb[half];
+            const std::uint8_t hi   = hb[half >> 2];
+            const int sh            = (half & 3) * 2;
+            int v = (j & 1) ? ((code >> 4) | (((hi >> (sh + 1)) & 1) << 4))
+                            : ((code & 0x0F) | (((hi >> sh) & 1) << 4));
+            if (v >= 16) v -= 32;
+            vals[j] = (std::int8_t)v;
+        }
+    } else {
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const std::uint8_t byte = cb[j >> 1];
+            const int nib = (j & 1) ? (int)(byte >> 4) : (int)(byte & 0x0F);
+            vals[j] = (std::int8_t)((nib ^ 0x08) - 0x08);
+        }
+    }
+    *reinterpret_cast<int4*>(out + row * k + (long)group * 64 + q * 16) =
+        *reinterpret_cast<const int4*>(vals);
+}
+
+template <int kK>
+__global__ __launch_bounds__(kGRThreads, 2) void w4a8_grouped_kernel(
+    const std::int8_t* __restrict__ Bq, const float* __restrict__ asc, W4A8GroupedJob job0,
+    W4A8GroupedJob job1, W4A8GroupedJob job2, W4A8GroupedJob job3) {
+    constexpr int kGroups = kK / 64, kTilesK = kK / 64, kGPK = 64 / kGRBK;
+    __shared__ __align__(16) std::int8_t As[kGRStages][kGRBM][kGRBK];
+    __shared__ __align__(16) std::int8_t Bs[kGRStages][kGRBN][kGRBK];
+
+    const int t0 = static_cast<int>(blockIdx.x) * kGRBN;
+    const int tiles0 = job0.n / kGRBM, tiles1 = job1.n / kGRBM, tiles2 = job2.n / kGRBM;
+    int tile = static_cast<int>(blockIdx.y);
+    W4A8GroupedJob job;
+    if (tile < tiles0) {
+        job = job0;
+    } else if ((tile -= tiles0) < tiles1) {
+        job = job1;
+    } else if ((tile -= tiles1) < tiles2) {
+        job = job2;
+    } else {
+        tile -= tiles2;
+        job = job3;
+    }
+    const int m0 = tile * kGRBM; // row base inside this job
+
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int wm = warp / 4, wn = warp % 4;
+    const int gid = lane >> 2, lid = lane & 3;
+
+    auto load = [&](int st, int kt) {
+        {
+            const int item = tid; // kGRBM * (kGRBK/16) == kGRThreads
+            const int r = item >> 2, c16 = item & 3;
+            cpa16(&As[st][r][(c16 ^ (r & 3)) * 16],
+                  job.w + (long)(m0 + r) * kK + kt * kGRBK + c16 * 16);
+        }
+#pragma unroll
+        for (int j = 0; j < (kGRBN * (kGRBK / 16)) / kGRThreads; ++j) {
+            const int item = tid + j * kGRThreads;
+            const int r = item >> 2, c16 = item & 3;
+            cpa16(&Bs[st][r][(c16 ^ (r & 3)) * 16],
+                  Bq + (long)(t0 + r) * kK + kt * kGRBK + c16 * 16);
+        }
+        cpc();
+    };
+
+    constexpr int kPrefetch = kGRStages - 1;
+#pragma unroll
+    for (int s = 0; s < kPrefetch; ++s) load(s, s);
+
+    float accf[kGRMT][kGRNT][4];
+    int acci[kGRMT][kGRNT][4];
+#pragma unroll
+    for (int a = 0; a < kGRMT; ++a)
+        for (int b = 0; b < kGRNT; ++b)
+            for (int r = 0; r < 4; ++r) { accf[a][b][r] = 0.0f; acci[a][b][r] = 0; }
+
+#pragma unroll 1
+    for (int kt = 0; kt < kTilesK; ++kt) {
+        const int st = kt % kGRStages;
+        if (kt + kPrefetch <= kTilesK) cpw<kPrefetch - 1>(); else cpw<0>();
+        __syncthreads();
+        if (kt + kPrefetch < kTilesK) load((kt + kPrefetch) % kGRStages, kt + kPrefetch);
+#pragma unroll
+        for (int kk = 0; kk < kGRBK / 32; ++kk) {
+            unsigned bf[kGRNT][2];
+#pragma unroll
+            for (int np = 0; np < kGRNT / 2; ++np) {
+                const int cbase = wn * 32 + np * 16;
+                const int brow  = cbase + (lane & 7) + (((lane >> 3) & 1) << 3);
+                unsigned r0, r1, r2, r3;
+                ldm_x4(r0, r1, r2, r3, su(&Bs[st][brow][swz(kk * 2 + (lane >> 4), brow) * 16]));
+                bf[np * 2][0]     = r0;
+                bf[np * 2][1]     = r2;
+                bf[np * 2 + 1][0] = r1;
+                bf[np * 2 + 1][1] = r3;
+            }
+#pragma unroll
+            for (int mt = 0; mt < kGRMT; ++mt) {
+                unsigned a0, a1, a2, a3;
+                const int row = wm * 32 + mt * 16 + (lane & 15);
+                ldm_x4(a0, a1, a2, a3, su(&As[st][row][swz(kk * 2 + (lane >> 4), row) * 16]));
+#pragma unroll
+                for (int nt = 0; nt < kGRNT; ++nt)
+                    mma_s8(acci[mt][nt][0], acci[mt][nt][1], acci[mt][nt][2], acci[mt][nt][3], a0,
+                           a1, a2, a3, bf[nt][0], bf[nt][1]);
+            }
+        }
+        if ((kt % kGPK) == (kGPK - 1)) {
+            const int g = kt / kGPK;
+#pragma unroll
+            for (int mt = 0; mt < kGRMT; ++mt) {
+                // m0 is the job-local row base of this tile: the weight scale row must be
+                // absolute (m0 + local), matching the weight rows staged into As. Omitting
+                // m0 leaves every tile past the first one reading tile 0's scales.
+                const int lrow = m0 + wm * 32 + mt * 16 + gid;
+                const float wg0 = __half2float(job.wsc[(long)lrow * kGroups + g]);
+                const float wg1 = __half2float(job.wsc[(long)(lrow + 8) * kGroups + g]);
+#pragma unroll
+                for (int nt = 0; nt < kGRNT; ++nt) {
+                    const int tk0 = t0 + wn * 32 + nt * 8 + 2 * lid;
+                    const float av0 = asc[tk0];
+                    const float av1 = asc[tk0 + 1];
+                    accf[mt][nt][0] += (float)acci[mt][nt][0] * wg0 * av0;
+                    accf[mt][nt][1] += (float)acci[mt][nt][1] * wg0 * av1;
+                    accf[mt][nt][2] += (float)acci[mt][nt][2] * wg1 * av0;
+                    accf[mt][nt][3] += (float)acci[mt][nt][3] * wg1 * av1;
+                    acci[mt][nt][0] = acci[mt][nt][1] = acci[mt][nt][2] = acci[mt][nt][3] = 0;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int mt = 0; mt < kGRMT; ++mt) {
+        const int r0 = m0 + wm * 32 + mt * 16 + gid;
+#pragma unroll
+        for (int nt = 0; nt < kGRNT; ++nt) {
+            const int c0 = t0 + wn * 32 + nt * 8 + 2 * lid;
+            auto store = [&](int col, int row, float v) {
+                job.out[(long)col * job.out_ld + job.out_row + row] = __float2bfloat16_rn(v);
+            };
+            store(c0, r0, accf[mt][nt][0]);
+            store(c0 + 1, r0, accf[mt][nt][1]);
+            store(c0, r0 + 8, accf[mt][nt][2]);
+            store(c0 + 1, r0 + 8, accf[mt][nt][3]);
+        }
+    }
+}
+
 struct W4A8Cache {
     std::int8_t* w_i8 = nullptr;   // dequantized int8 weights (path A only)
     long w_elems      = 0;
@@ -780,6 +973,87 @@ void run_swiglu(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stre
     CUDA_CHECK(cudaGetLastError());
 }
 
+struct W4A8GroupCache {
+    std::int8_t* slot[2] = {nullptr, nullptr};
+    long cap[2]         = {0, 0};
+    const void* key[2]  = {nullptr, nullptr};
+};
+W4A8GroupCache& group_cache() {
+    static W4A8GroupCache c;
+    return c;
+}
+
+// Dequantize a q4/q5 weight into a cached int8 slot (natural row order).
+template <int kK>
+const std::int8_t* group_weight_i8(int slot, const Weight& w, cudaStream_t stream) {
+    W4A8GroupCache& gc = group_cache();
+    const long elems   = (long)w.n * kK;
+    if (gc.cap[slot] < elems) {
+        if (gc.slot[slot]) cudaFree(gc.slot[slot]);
+        if (cudaMalloc(&gc.slot[slot], (size_t)elems) != cudaSuccess) {
+            gc.slot[slot] = nullptr; gc.cap[slot] = 0; return nullptr;
+        }
+        gc.cap[slot] = elems;
+        gc.key[slot] = nullptr;
+    }
+    if (gc.key[slot] != w.qdata) {
+        const int groups = kK / 64;
+        const dim3 dq((unsigned)((groups * 4 + 255) / 256), (unsigned)w.n);
+        dequant_q4q5_i8<<<dq, 256, 0, stream>>>(
+            static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.qhigh), gc.slot[slot], groups, kK,
+            w.qtype == QType::Q5_G64_FP16 ? 1 : 0);
+        CUDA_CHECK(cudaGetLastError());
+        gc.key[slot] = w.qdata;
+    }
+    return gc.slot[slot];
+}
+
+template <int kK>
+void run_grouped(const Tensor& x, const Weight& w0, const Weight& w1, Tensor* const outs[4],
+                 const std::int32_t rows[4], const std::int32_t w_index[4],
+                 const std::int32_t w_rows[4], cudaStream_t stream) {
+    const int tokens   = x.ne[1];
+    W4A8Cache& c       = cache();
+    const long a_elems = (long)tokens * kK;
+    if (c.a_cap < a_elems || c.a_tokens < tokens) {
+        if (c.a_i8) cudaFree(c.a_i8);
+        if (c.a_scale) cudaFree(c.a_scale);
+        if (cudaMalloc(&c.a_i8, (size_t)a_elems) != cudaSuccess) {
+            c.a_i8 = nullptr; c.a_cap = 0; c.a_tokens = 0; return;
+        }
+        cudaMalloc(&c.a_scale, (size_t)tokens * sizeof(float));
+        c.a_cap    = a_elems;
+        c.a_tokens = tokens;
+    }
+    quant_a8<<<tokens, 256, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data), c.a_i8,
+                                         c.a_scale, kK, tokens);
+    CUDA_CHECK(cudaGetLastError());
+
+    const std::int8_t* wi[2] = {group_weight_i8<kK>(0, w0, stream),
+                                group_weight_i8<kK>(1, w1, stream)};
+    if (wi[0] == nullptr || wi[1] == nullptr) return;
+    const Weight* ws[2] = {&w0, &w1};
+
+    constexpr int kGroups = kK / 64;
+    W4A8GroupedJob jobs[4];
+    int tiles = 0;
+    for (int i = 0; i < 4; ++i) {
+        const int src = w_index[i];
+        jobs[i].w      = wi[src] + (long)w_rows[i] * kK;
+        jobs[i].wsc    = static_cast<const __half*>(ws[src]->scales) + (long)w_rows[i] * kGroups;
+        jobs[i].out    = static_cast<__nv_bfloat16*>(outs[i]->data);
+        jobs[i].out_ld = outs[i]->ne[0];
+        jobs[i].out_row = 0;
+        jobs[i].n      = rows[i];
+        tiles += rows[i] / kGRBM;
+    }
+    const dim3 grid((unsigned)(tokens / kGRBN), (unsigned)tiles);
+    w4a8_grouped_kernel<kK><<<grid, kGRThreads, 0, stream>>>(c.a_i8, c.a_scale, jobs[0], jobs[1],
+                                                             jobs[2], jobs[3]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace
 
 bool w4a8_enabled() {
@@ -817,6 +1091,31 @@ bool w4a8_swiglu_supported(const Weight& weight, std::int32_t tokens) {
 
 void w4a8_swiglu(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     run_swiglu<17408, 5120>(x, w, out, stream);
+}
+
+bool w4a8_attn_input_supported(const Weight& query_key_weight, const Weight& gate_value_weight,
+                               std::int32_t tokens) {
+    if (!w4a8_enabled()) return false;
+    if (tokens <= 0 || (tokens % kGRBN) != 0) return false;
+    const Weight* ws[2] = {&query_key_weight, &gate_value_weight};
+    for (const Weight* w : ws) {
+        if (w->k != 5120 || w->padded_shape[1] != 5120) return false;
+        if (w->qtype != QType::Q4_G64_FP16 && w->qtype != QType::Q5_G64_FP16) return false;
+        if (w->group != 64 || (w->n % kGRBM) != 0) return false;
+        if (w->n < 7168) return false; // needs the 6144 + 1024 row split
+    }
+    return true;
+}
+
+// q[0,6144) k[0,1024) from query_key_weight; gate[0,6144) v[0,1024) from gate_value_weight.
+void w4a8_attn_input_proj(const Tensor& x, const Weight& query_key_weight,
+                          const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& key,
+                          Tensor& value, cudaStream_t stream) {
+    Tensor* outs[4]        = {&q, &key, &gate, &value};
+    const std::int32_t rows[4]    = {6144, 1024, 6144, 1024};
+    const std::int32_t w_index[4] = {0, 0, 1, 1};
+    const std::int32_t w_rows[4]  = {0, 6144, 0, 6144};
+    run_grouped<5120>(x, query_key_weight, gate_value_weight, outs, rows, w_index, w_rows, stream);
 }
 
 } // namespace ninfer::ops

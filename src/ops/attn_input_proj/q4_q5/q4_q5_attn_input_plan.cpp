@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "ninfer/ops/w4a8.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_kernels.h"
@@ -94,6 +95,11 @@ void q4_q5_attn_input_execute_plan(const Q4Q5AttnInputPlan& plan, const Tensor& 
 void q4_q5_attn_input_dispatch(const Tensor& x, const Weight& query_key_weight,
                                const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k,
                                Tensor& v, cudaStream_t stream) {
+    // int8 route (NINFER_W4A8): identical job split, one grouped launch.
+    if (w4a8_attn_input_supported(query_key_weight, gate_value_weight, x.ne[1])) {
+        w4a8_attn_input_proj(x, query_key_weight, gate_value_weight, q, gate, k, v, stream);
+        return;
+    }
     const Q4Q5AttnInputProblem problem{x.ne[0], q.ne[0], k.ne[0], query_key_weight.padded_shape[1],
                                        x.ne[1]};
     const Q4Q5AttnInputPlan plan = q4_q5_attn_input_resolve_plan(problem);
