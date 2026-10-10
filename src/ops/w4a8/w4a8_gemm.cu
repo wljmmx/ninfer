@@ -630,6 +630,84 @@ __global__ __launch_bounds__(kSGThreads, 2) void w4a8_swiglu_kernel(
     }
 }
 
+// Per-(token, 64-K-group) symmetric int8 activation quantisation for the grouped
+// route. The projection input is the residual stream, where a per-token amax is
+// set by a few outlier channels and coarsens every other channel of that token;
+// a 64-wide group keeps the outlier inside its own group. kPerGroup=false
+// reproduces the per-token scale, replicated across the token's groups, so the
+// grouped kernel's fold can index (token, group) unconditionally and the two
+// modes share one kernel.
+template <bool kPerGroup>
+__global__ void quant_a8_grouped_kernel(const __nv_bfloat16* __restrict__ x,
+                                        std::int8_t* __restrict__ out, float* __restrict__ scale,
+                                        int k, int tokens) {
+    constexpr int kG = 64;
+    const int row = blockIdx.x;
+    if (row >= tokens) return;
+    const int groups        = k / kG;
+    const __nv_bfloat16* xr = x + (long)row * k;
+    std::int8_t* orow       = out + (long)row * k;
+    float* srow             = kPerGroup ? scale : scale + (long)row * groups;
+    if constexpr (kPerGroup) {
+        // Four lanes cooperate on one 64-wide group, each reading 16 contiguous
+        // elements, so a warp covers eight groups (1 KiB) as one contiguous run.
+        // One thread per group would stride by 128 B per lane and waste sectors.
+        // The block is sized kG/16 lanes per group (see the launch), so a single
+        // pass covers every group; the loop stays for other k widths.
+        constexpr int kLanesPerGroup = kG / 16;
+        const int gpr                = blockDim.x / kLanesPerGroup;
+        for (int g0 = 0; g0 < groups; g0 += gpr) {
+            const int g        = g0 + (threadIdx.x / kLanesPerGroup);
+            const bool active  = g < groups;
+            const int gc       = active ? g : groups - 1;
+            const int base     = gc * kG + (threadIdx.x % kLanesPerGroup) * 16;
+            float amax         = 0.0f;
+            for (int i = 0; i < 16; ++i)
+                amax = fmaxf(amax, fabsf(__bfloat162float(xr[base + i])));
+            for (int o = 1; o < kLanesPerGroup; o <<= 1)
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+            if (active) {
+                const float sc  = amax > 0.0f ? amax / 127.0f : 0.0f;
+                const float inv = sc > 0.0f ? 1.0f / sc : 0.0f;
+                // Group-major grid: for a fixed group the tokens are contiguous, which is
+                // what the kernel's per-k-tile fold reads (it walks one group per tile).
+                if ((threadIdx.x % kLanesPerGroup) == 0) srow[(long)gc * tokens + row] = sc;
+                alignas(16) std::int8_t vals[16];
+                for (int i = 0; i < 16; ++i) {
+                    int q = (int)lrintf(__bfloat162float(xr[base + i]) * inv);
+                    q     = q < -127 ? -127 : (q > 127 ? 127 : q);
+                    vals[i] = (std::int8_t)q;
+                }
+                *reinterpret_cast<int4*>(orow + base) = *reinterpret_cast<const int4*>(vals);
+            }
+        }
+    } else {
+        float amax = 0.0f;
+        for (int i = threadIdx.x; i < k; i += blockDim.x)
+            amax = fmaxf(amax, fabsf(__bfloat162float(xr[i])));
+        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        __shared__ float warp_max[32];
+        __shared__ float s;
+        if ((threadIdx.x & 31) == 0) warp_max[threadIdx.x >> 5] = amax;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float m          = 0.0f;
+            const int warps  = (blockDim.x + 31) >> 5;
+            for (int i = 0; i < warps; ++i) m = fmaxf(m, warp_max[i]);
+            s = m > 0.0f ? m / 127.0f : 0.0f;
+        }
+        __syncthreads();
+        const float inv = s > 0.0f ? 1.0f / s : 0.0f;
+        for (int g = threadIdx.x; g < groups; g += blockDim.x)
+            scale[(long)g * tokens + row] = s;
+        for (int i = threadIdx.x; i < k; i += blockDim.x) {
+            int q = (int)lrintf(__bfloat162float(xr[i]) * inv);
+            q     = q < -127 ? -127 : (q > 127 ? 127 : q);
+            orow[i] = (std::int8_t)q;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Route C: W4A8 for the grouped input projections (attention q/k/v + gate, and
 // the GDN qk/value/output-gate). Four jobs share one launch, exactly like the
@@ -697,13 +775,14 @@ __global__ void dequant_q4q5_i8(const std::uint8_t* __restrict__ codes,
 
 template <int kK>
 __global__ __launch_bounds__(kGRThreads, 2) void w4a8_grouped_kernel(
-    const std::int8_t* __restrict__ Bq, const float* __restrict__ asc, W4A8GroupedJob job0,
+    const std::int8_t* __restrict__ Bq, const float* __restrict__ ascg, W4A8GroupedJob job0,
     W4A8GroupedJob job1, W4A8GroupedJob job2, W4A8GroupedJob job3) {
     constexpr int kGroups = kK / 64, kTilesK = kK / 64, kGPK = 64 / kGRBK;
     __shared__ __align__(16) std::int8_t As[kGRStages][kGRBM][kGRBK];
     __shared__ __align__(16) std::int8_t Bs[kGRStages][kGRBN][kGRBK];
 
     const int t0 = static_cast<int>(blockIdx.x) * kGRBN;
+    const int kGRTokens = static_cast<int>(gridDim.x) * kGRBN;
     const int tiles0 = job0.n / kGRBM, tiles1 = job1.n / kGRBM, tiles2 = job2.n / kGRBM;
     int tile = static_cast<int>(blockIdx.y);
     W4A8GroupedJob job;
@@ -795,8 +874,10 @@ __global__ __launch_bounds__(kGRThreads, 2) void w4a8_grouped_kernel(
 #pragma unroll
                 for (int nt = 0; nt < kGRNT; ++nt) {
                     const int tk0 = t0 + wn * 32 + nt * 8 + 2 * lid;
-                    const float av0 = asc[tk0];
-                    const float av1 = asc[tk0 + 1];
+                    // ascg is the group-major (group, token) scale grid and with kGPK == 1
+                    // the current group is kt, so the block's 128 tokens are contiguous.
+                    const float av0 = ascg[(long)g * kGRTokens + tk0];
+                    const float av1 = ascg[(long)g * kGRTokens + tk0 + 1];
                     accf[mt][nt][0] += (float)acci[mt][nt][0] * wg0 * av0;
                     accf[mt][nt][1] += (float)acci[mt][nt][1] * wg0 * av1;
                     accf[mt][nt][2] += (float)acci[mt][nt][2] * wg1 * av0;
@@ -831,6 +912,11 @@ struct W4A8Cache {
     float* a_scale    = nullptr;
     long a_cap        = 0;
     int a_tokens      = 0;         // a_scale is sized for this many tokens
+    // Grouped route: activation int8 plus a (token, 64-K group) scale grid.
+    std::int8_t* ag_i8  = nullptr;
+    float* ag_scale     = nullptr;
+    long ag_cap         = 0;
+    int ag_tokens       = 0;
 };
 W4A8Cache& cache() {
     static W4A8Cache c;
@@ -1017,18 +1103,32 @@ void run_grouped(const Tensor& x, const Weight& w0, const Weight& w1, Tensor* co
     const int tokens   = x.ne[1];
     W4A8Cache& c       = cache();
     const long a_elems = (long)tokens * kK;
-    if (c.a_cap < a_elems || c.a_tokens < tokens) {
-        if (c.a_i8) cudaFree(c.a_i8);
-        if (c.a_scale) cudaFree(c.a_scale);
-        if (cudaMalloc(&c.a_i8, (size_t)a_elems) != cudaSuccess) {
-            c.a_i8 = nullptr; c.a_cap = 0; c.a_tokens = 0; return;
+    const int sgroups  = kK / 64;
+    if (c.ag_cap < a_elems || c.ag_tokens < tokens) {
+        if (c.ag_i8) cudaFree(c.ag_i8);
+        if (c.ag_scale) cudaFree(c.ag_scale);
+        if (cudaMalloc(&c.ag_i8, (size_t)a_elems) != cudaSuccess) {
+            c.ag_i8 = nullptr; c.ag_cap = 0; c.ag_tokens = 0; return;
         }
-        cudaMalloc(&c.a_scale, (size_t)tokens * sizeof(float));
-        c.a_cap    = a_elems;
-        c.a_tokens = tokens;
+        cudaMalloc(&c.ag_scale, (size_t)tokens * sgroups * sizeof(float));
+        c.ag_cap    = a_elems;
+        c.ag_tokens = tokens;
     }
-    quant_a8<<<tokens, 256, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data), c.a_i8,
-                                         c.a_scale, kK, tokens);
+    // Per-64-K-group activation scale by default; NINFER_W4A8_A8_TOKEN restores the
+    // per-token scale (replicated) for a controlled comparison.
+    static const bool per_token_a8 = [] {
+        const char* v = std::getenv("NINFER_W4A8_A8_TOKEN");
+        return v != nullptr && v[0] != '\0';
+    }();
+    if (per_token_a8) {
+        quant_a8_grouped_kernel<false><<<tokens, 256, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), c.ag_i8, c.ag_scale, kK, tokens);
+    } else {
+        // kG/16 == 4 lanes per group, so one pass needs 4 * (kK / 64) threads.
+        constexpr int kQuantThreads = 4 * (kK / 64);
+        quant_a8_grouped_kernel<true><<<tokens, kQuantThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), c.ag_i8, c.ag_scale, kK, tokens);
+    }
     CUDA_CHECK(cudaGetLastError());
 
     const std::int8_t* wi[2] = {group_weight_i8<kK>(0, w0, stream),
@@ -1050,7 +1150,7 @@ void run_grouped(const Tensor& x, const Weight& w0, const Weight& w1, Tensor* co
         tiles += rows[i] / kGRBM;
     }
     const dim3 grid((unsigned)(tokens / kGRBN), (unsigned)tiles);
-    w4a8_grouped_kernel<kK><<<grid, kGRThreads, 0, stream>>>(c.a_i8, c.a_scale, jobs[0], jobs[1],
+    w4a8_grouped_kernel<kK><<<grid, kGRThreads, 0, stream>>>(c.ag_i8, c.ag_scale, jobs[0], jobs[1],
                                                              jobs[2], jobs[3]);
     CUDA_CHECK(cudaGetLastError());
 }
