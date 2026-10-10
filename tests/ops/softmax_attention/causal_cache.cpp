@@ -3192,6 +3192,15 @@ int run_softmax_attention_causal_cache_tests(std::optional<KvCacheStorage> selec
           KvCacheStorage::RotatedInt8KeyInt4ValueGroup64,
            KvCacheStorage::RotatedInt4KeyInt4ValueGroup64, KvCacheStorage::RK4V4E8,
            KvCacheStorage::RK2V4E8, KvCacheStorage::RK4V2E8}) {
+#if !defined(NINFER_ENABLE_NVFP4)
+        // NVFP4 cache layouts exist only in Blackwell (sm_120a) builds; the sm_89 dispatch
+        // rejects them and would throw out of main(), which has no try/catch. Skip the
+        // storage so the rest of the matrix (including every E8 layout) still runs.
+        if (storage == KvCacheStorage::Nvfp4Group16) {
+            std::cout << "SKIP causal_softmax_attention nvfp4-g16 (sm_89 build)" << std::endl;
+            continue;
+        }
+#endif
         if (selected && storage != *selected) continue;
         const auto start = std::chrono::steady_clock::now();
         std::cout << "RUN causal_softmax_attention " << cache_name(storage) << std::endl;
