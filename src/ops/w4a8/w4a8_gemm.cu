@@ -85,35 +85,6 @@ __global__ void dequant_q5_i8(const std::uint8_t* __restrict__ codes,
         *reinterpret_cast<const int4*>(vals);
 }
 
-__global__ void quant_a8(const __nv_bfloat16* __restrict__ x, std::int8_t* __restrict__ out,
-                         float* __restrict__ scale, int k, int tokens) {
-    const int row = blockIdx.x;
-    if (row >= tokens) return;
-    const __nv_bfloat16* xr = x + (long)row * k;
-    float amax = 0.0f;
-    for (int i = threadIdx.x; i < k; i += blockDim.x) amax = fmaxf(amax, fabsf(__bfloat162float(xr[i])));
-    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-    __shared__ float warp_max[32];
-    __shared__ float s;
-    if ((threadIdx.x & 31) == 0) warp_max[threadIdx.x >> 5] = amax;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        float m = 0.0f;
-        const int warps = (blockDim.x + 31) >> 5;
-        for (int i = 0; i < warps; ++i) m = fmaxf(m, warp_max[i]);
-        s = m > 0.0f ? m / 127.0f : 0.0f;
-        scale[row] = s;
-    }
-    __syncthreads();
-    const float inv = s > 0.0f ? 1.0f / s : 0.0f;
-    std::int8_t* orow = out + (long)row * k;
-    for (int i = threadIdx.x; i < k; i += blockDim.x) {
-        int q = (int)lrintf(__bfloat162float(xr[i]) * inv);
-        q = q < -127 ? -127 : (q > 127 ? 127 : q);
-        orow[i] = (std::int8_t)q;
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Path A: weights pre-dequantized to an int8 matrix by dequant_q5_i8.
 // ---------------------------------------------------------------------------
@@ -128,6 +99,9 @@ __global__ __launch_bounds__(kThreads) void w4a8_gemm_residual_kernel(
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int wt_m = warp / 4, wt_n = warp % 4;
     const int m0 = blockIdx.x * kBM, n0 = blockIdx.y * kBN;
+    // Activation scale grid is group-major (group, token); the block's token base is
+    // m0, so gridDim.x * kBM is the token count.
+    const int kTk = static_cast<int>(gridDim.x) * kBM;
 
     auto load = [&](int st, int kt) {
         const int r = (tid * 16) / kBK, c = (tid * 16) % kBK;
@@ -190,8 +164,9 @@ __global__ __launch_bounds__(kThreads) void w4a8_gemm_residual_kernel(
 #pragma unroll
             for (int mt = 0; mt < kMT; ++mt) {
                 const int row = m0 + wt_m * 32 + mt * 16 + (lane >> 2);
-                const float as0 = asc[row];
-                const float as1 = asc[row + 8];
+                // Group-major (group, token) activation scale; kGPK == 1 so the group is kt.
+                const float as0 = asc[(long)g * kTk + row];
+                const float as1 = asc[(long)g * kTk + row + 8];
 #pragma unroll
                 for (int nt = 0; nt < kNT; ++nt) {
                     const int col = n0 + wt_n * 32 + nt * 8 + (lane & 3) * 2;
@@ -245,6 +220,7 @@ __global__ __launch_bounds__(kThreadsN, 2) void w4a8_gemm_residual_narrow_kernel
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int wt_m = warp / 2, wt_n = warp % 2;
     const int m0 = blockIdx.x * kBMN, n0 = blockIdx.y * kBNN;
+    const int kTk = static_cast<int>(gridDim.x) * kBMN; // token count (see the fold)
 
     auto load = [&](int st, int kt) {
 #pragma unroll
@@ -308,8 +284,9 @@ __global__ __launch_bounds__(kThreadsN, 2) void w4a8_gemm_residual_narrow_kernel
 #pragma unroll
             for (int mt = 0; mt < kMTN; ++mt) {
                 const int row = m0 + wt_m * 32 + mt * 16 + (lane >> 2);
-                const float as0 = asc[row];
-                const float as1 = asc[row + 8];
+                // Group-major (group, token) activation scale; kGPK == 1 so the group is kt.
+                const float as0 = asc[(long)g * kTk + row];
+                const float as1 = asc[(long)g * kTk + row + 8];
 #pragma unroll
                 for (int nt = 0; nt < kNTN; ++nt) {
                     const int col = n0 + wt_n * 32 + nt * 8 + (lane & 3) * 2;
@@ -362,6 +339,9 @@ __global__ __launch_bounds__(kThreads) void w4a8_q5_gemm_residual_kernel(
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int wt_m = warp / 4, wt_n = warp % 4;
     const int m0 = blockIdx.x * kBM, n0 = blockIdx.y * kBN;
+    // Activation scale grid is group-major (group, token); the block's token base is
+    // m0, so gridDim.x * kBM is the token count.
+    const int kTk = static_cast<int>(gridDim.x) * kBM;
 
     auto load = [&](int st, int kt) {
         const int r = (tid * 16) / kBK, c = (tid * 16) % kBK;
@@ -444,8 +424,9 @@ __global__ __launch_bounds__(kThreads) void w4a8_q5_gemm_residual_kernel(
 #pragma unroll
             for (int mt = 0; mt < kMT; ++mt) {
                 const int row = m0 + wt_m * 32 + mt * 16 + (lane >> 2);
-                const float as0 = asc[row];
-                const float as1 = asc[row + 8];
+                // Group-major (group, token) activation scale; kGPK == 1 so the group is kt.
+                const float as0 = asc[(long)g * kTk + row];
+                const float as1 = asc[(long)g * kTk + row + 8];
 #pragma unroll
                 for (int nt = 0; nt < kNT; ++nt) {
                     const int col = n0 + wt_n * 32 + nt * 8 + (lane & 3) * 2;
@@ -531,6 +512,7 @@ __global__ __launch_bounds__(kSGThreads, 2) void w4a8_swiglu_kernel(
     const int gid = lane >> 2, lid = lane & 3;
     const int m0 = blockIdx.y * kSGPM; // parent base
     const int t0 = blockIdx.x * kSGBN; // token base
+    const int kTk = static_cast<int>(gridDim.x) * kSGBN; // token count (see the fold)
 
     auto grow = [&](int L) { return (L < kSGPM) ? (m0 + L) : (kParents + m0 + L - kSGPM); };
 
@@ -600,8 +582,8 @@ __global__ __launch_bounds__(kSGThreads, 2) void w4a8_swiglu_kernel(
 #pragma unroll
                 for (int nt = 0; nt < kSGNT; ++nt) {
                     const int tk = t0 + wn * 32 + nt * 8 + 2 * lid;
-                    const float av0 = asc[tk];
-                    const float av1 = asc[tk + 1];
+                    const float av0 = asc[(long)g * kTk + tk];
+                    const float av1 = asc[(long)g * kTk + tk + 1];
                     accf[mi][nt][0] += (float)acci[mi][nt][0] * wg0 * av0;
                     accf[mi][nt][1] += (float)acci[mi][nt][1] * wg0 * av1;
                     accf[mi][nt][2] += (float)acci[mi][nt][2] * wg1 * av0;
@@ -705,6 +687,33 @@ __global__ void quant_a8_grouped_kernel(const __nv_bfloat16* __restrict__ x,
             q     = q < -127 ? -127 : (q > 127 ? 127 : q);
             orow[i] = (std::int8_t)q;
         }
+    }
+}
+
+// NINFER_W4A8_A8_TOKEN restores the older per-token activation scale (replicated
+// across the token's groups) for a controlled comparison. The fold is
+// layout-identical either way, so the switch only changes the quantiser.
+bool per_token_a8_mode() {
+    static const bool per_token = [] {
+        const char* v = std::getenv("NINFER_W4A8_A8_TOKEN");
+        return v != nullptr && v[0] != '\0';
+    }();
+    return per_token;
+}
+
+// Writes the group-major (group, token) activation scale grid. kPerGroup=false
+// replicates the per-token scale across the token's groups so every consumer can
+// index (group, token) unconditionally.
+void launch_a8_quant(const Tensor& x, std::int8_t* out, float* scale, int k, int tokens,
+                     cudaStream_t stream) {
+    const auto* xp = static_cast<const __nv_bfloat16*>(x.data);
+    if (per_token_a8_mode()) {
+        quant_a8_grouped_kernel<false><<<tokens, 256, 0, stream>>>(xp, out, scale, k, tokens);
+    } else {
+        // kG/16 == 4 lanes per group; one pass needs 4 * (k / 64) threads.
+        int threads = 4 * (k / 64);
+        if (threads > 1024) threads = 1024;
+        quant_a8_grouped_kernel<true><<<tokens, threads, 0, stream>>>(xp, out, scale, k, tokens);
     }
 }
 
@@ -912,6 +921,7 @@ struct W4A8Cache {
     float* a_scale    = nullptr;
     long a_cap        = 0;
     int a_tokens      = 0;         // a_scale is sized for this many tokens
+    int a_groups      = 0;         // ... and this many 64-wide K groups
     // Grouped route: activation int8 plus a (token, 64-K group) scale grid.
     std::int8_t* ag_i8  = nullptr;
     float* ag_scale     = nullptr;
@@ -949,20 +959,21 @@ bool use_narrow_kernel() {
 template <int kN, int kK>
 void run(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t stream) {
     const int tokens   = x.ne[1];
+    const int sgroups  = kK / 64;
     W4A8Cache& c       = cache();
     const long a_elems = (long)tokens * kK;
-    if (c.a_cap < a_elems || c.a_tokens < tokens) {
+    if (c.a_cap < a_elems || c.a_tokens < tokens || c.a_groups < sgroups) {
         if (c.a_i8) cudaFree(c.a_i8);
         if (c.a_scale) cudaFree(c.a_scale);
         if (cudaMalloc(&c.a_i8, (size_t)a_elems) != cudaSuccess) {
-            c.a_i8 = nullptr; c.a_cap = 0; c.a_tokens = 0; return;
+            c.a_i8 = nullptr; c.a_cap = 0; c.a_tokens = 0; c.a_groups = 0; return;
         }
-        cudaMalloc(&c.a_scale, (size_t)tokens * sizeof(float));
+        cudaMalloc(&c.a_scale, (size_t)tokens * sgroups * sizeof(float));
         c.a_cap = a_elems;
         c.a_tokens = tokens;
+        c.a_groups = sgroups;
     }
-    quant_a8<<<tokens, 256, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data), c.a_i8,
-                                         c.a_scale, kK, tokens);
+    launch_a8_quant(x, c.a_i8, c.a_scale, kK, tokens, stream);
     CUDA_CHECK(cudaGetLastError());
     const dim3 grid(tokens / kBM, kN / kBN);
     const auto* wsc    = static_cast<const __half*>(w.scales);
@@ -1021,20 +1032,21 @@ W4A8SgCache& sg_cache() {
 template <int kParents, int kK>
 void run_swiglu(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     const int tokens   = x.ne[1];
+    const int sgroups  = kK / 64;
     W4A8Cache& c       = cache();
     const long a_elems = (long)tokens * kK;
-    if (c.a_cap < a_elems || c.a_tokens < tokens) {
+    if (c.a_cap < a_elems || c.a_tokens < tokens || c.a_groups < sgroups) {
         if (c.a_i8) cudaFree(c.a_i8);
         if (c.a_scale) cudaFree(c.a_scale);
         if (cudaMalloc(&c.a_i8, (size_t)a_elems) != cudaSuccess) {
-            c.a_i8 = nullptr; c.a_cap = 0; c.a_tokens = 0; return;
+            c.a_i8 = nullptr; c.a_cap = 0; c.a_tokens = 0; c.a_groups = 0; return;
         }
-        cudaMalloc(&c.a_scale, (size_t)tokens * sizeof(float));
+        cudaMalloc(&c.a_scale, (size_t)tokens * sgroups * sizeof(float));
         c.a_cap    = a_elems;
         c.a_tokens = tokens;
+        c.a_groups = sgroups;
     }
-    quant_a8<<<tokens, 256, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data), c.a_i8,
-                                         c.a_scale, kK, tokens);
+    launch_a8_quant(x, c.a_i8, c.a_scale, kK, tokens, stream);
     CUDA_CHECK(cudaGetLastError());
 
     W4A8SgCache& sg    = sg_cache();
@@ -1114,21 +1126,7 @@ void run_grouped(const Tensor& x, const Weight& w0, const Weight& w1, Tensor* co
         c.ag_cap    = a_elems;
         c.ag_tokens = tokens;
     }
-    // Per-64-K-group activation scale by default; NINFER_W4A8_A8_TOKEN restores the
-    // per-token scale (replicated) for a controlled comparison.
-    static const bool per_token_a8 = [] {
-        const char* v = std::getenv("NINFER_W4A8_A8_TOKEN");
-        return v != nullptr && v[0] != '\0';
-    }();
-    if (per_token_a8) {
-        quant_a8_grouped_kernel<false><<<tokens, 256, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data), c.ag_i8, c.ag_scale, kK, tokens);
-    } else {
-        // kG/16 == 4 lanes per group, so one pass needs 4 * (kK / 64) threads.
-        constexpr int kQuantThreads = 4 * (kK / 64);
-        quant_a8_grouped_kernel<true><<<tokens, kQuantThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data), c.ag_i8, c.ag_scale, kK, tokens);
-    }
+    launch_a8_quant(x, c.ag_i8, c.ag_scale, kK, tokens, stream);
     CUDA_CHECK(cudaGetLastError());
 
     const std::int8_t* wi[2] = {group_weight_i8<kK>(0, w0, stream),
