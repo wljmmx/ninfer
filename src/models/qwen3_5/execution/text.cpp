@@ -12,6 +12,7 @@
 #include "models/qwen3_5/program/vision_control.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/attn_input_proj.h"
+#include "ninfer/ops/act_quant_a8.h"
 #include "ninfer/ops/causal_conv1d_silu.h"
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/gated_delta_net.h"
@@ -20,6 +21,7 @@
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/linear.h"
+#include "ninfer/ops/w4a8.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/linear_add.h"
@@ -978,8 +980,14 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     }
     ops::sigmoid_mul(gate, a, s);
 
-    ops::linear_add(a.view({dimension(config_.attention->query_width()), T}), p.output.weight, x,
-                    p.output.policy, work_, s);
+    {
+        Tensor attn_out = a.view({dimension(config_.attention->query_width()), T});
+        if (ops::w4a8_supported(p.output.weight, T)) {
+            ops::w4a8_linear_add(attn_out, p.output.weight, x, s);
+        } else {
+            ops::linear_add(attn_out, p.output.weight, x, p.output.policy, work_, s);
+        }
+    }
 }
 
 void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph) {
@@ -1113,8 +1121,14 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                            dimension(config_.gdn->linear_num_value_heads), T});
     ops::gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, ctx_.execution_view());
 
-    ops::linear_add(on.view({dimension(config_.gdn->value_width()), T}), p.output.weight, x,
-                    p.output.policy, work_, s);
+    {
+        Tensor gdn_out = on.view({dimension(config_.gdn->value_width()), T});
+        if (ops::w4a8_supported(p.output.weight, T)) {
+            ops::w4a8_linear_add(gdn_out, p.output.weight, x, s);
+        } else {
+            ops::linear_add(gdn_out, p.output.weight, x, p.output.policy, work_, s);
+        }
+    }
 }
 
 ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
@@ -1127,6 +1141,8 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase,
                            const ops::SparseMoeHints& hints) {
     Tensor h = workspace::post_mixer_hidden(work_, config_, x.ne[1]);
     ops::rmsnorm(x, weights.post_attention_norm, config_.rms_norm_eps, true, h, ctx_.stream);
+    // [P1 probe] optional per-token int8 activation round-trip (NINFER_ACT_A8)
+    ops::act_quant_a8_roundtrip_bf16(h.data, h.ne[0], h.ne[1], ctx_.stream);
     ffn(h, weights.ffn, x, hints, work_, ctx_.execution_view());
 }
 

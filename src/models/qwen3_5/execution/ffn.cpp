@@ -2,6 +2,11 @@
 
 #include "core/layout.h"
 #include "ninfer/ops/linear.h"
+#include "ninfer/ops/act_quant_a8.h"
+#include <cstdio>
+#include <cuda_bf16.h>
+#include <vector>
+#include "ninfer/ops/w4a8.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/residual_add.h"
@@ -83,7 +88,18 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
     Tensor activation = workspace.alloc(DType::BF16, {gu.n / 2, columns});
     {
         auto call = workspace.scope();
-        ops::linear_swiglu(hidden, gu, activation, p.gate_up.policy, workspace, stream);
+        if (ops::w4a8_swiglu_supported(gu, hidden.ne[1])) {
+            ops::w4a8_swiglu(hidden, gu, activation, stream);
+        } else {
+            ops::linear_swiglu(hidden, gu, activation, p.gate_up.policy, workspace, stream);
+        }
+    }
+    // [P1 probe] A8 round-trip on the down-projection activation
+    ops::act_quant_a8_roundtrip_bf16(activation.data, activation.ne[0], activation.ne[1], stream);
+    // [P1] W4A8 route for the down projection when enabled (NINFER_W4A8)
+    if (ops::w4a8_supported(down, activation.ne[1])) {
+        ops::w4a8_linear_add(activation, down, residual, stream);
+        return;
     }
     ops::linear_add(activation, down, residual, p.down.policy, workspace, stream);
 }
