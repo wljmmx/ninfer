@@ -75,6 +75,16 @@ inline constexpr int kRkE8KAmplitudeGrid = 16;    // G: code16 = G*code +- theta
 // per-position stride keeps uint32 code loads 4-aligned on SM89.
 inline constexpr int kRkE8KLatticeExtent = 96;
 
+// [D3 tuning] Constant fractional residual (no extra storage): store the K code as
+// code' = kRkE8KFracGrid*code +- kRkE8KFracTheta and the group scale as
+// k_scale / kRkE8KFracGrid, so the reconstruction is code*k_scale +-
+// (theta0/G)*k_scale. The offline sweep (sim_theta) found theta0/G = 0.5 optimal:
+// relMSE 0.313 -> 0.188, cos 0.881 -> 0.914, and it removes the +-1 energy overshoot
+// (energy 1.39 -> 1.14, matching the exact per-subspace amplitude 1.15).
+// G=1 / theta0=1 reproduces the old +-1 code unit.
+inline constexpr int kRkE8KFracGrid  = 4;  // G
+inline constexpr int kRkE8KFracTheta = 4;  // theta0 in [0,G]; theta0=G gives +-1 (PPL-best default); theta0=G/2 gives +-0.5 (MTP-best)
+
 // Pack two int4 codes into one byte (low nibble = first, high nibble = second).
 __device__ __forceinline__ std::uint8_t rk4_pack(std::int8_t lo, std::int8_t hi) {
     return static_cast<std::uint8_t>(

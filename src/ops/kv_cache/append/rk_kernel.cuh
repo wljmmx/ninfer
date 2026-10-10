@@ -208,11 +208,14 @@ __device__ __forceinline__ void kv_cache_append_rk_row(
                 }
             }
             if (lane == 0) {
-                const __half k_scale_out =
-                    (E8Lattice && kRkE8KAmplitudeOn)
-                        ? __float2half_rn(__half2float(k_scale) /
-                                          static_cast<float>(kRkE8KAmplitudeGrid))
-                        : k_scale;
+                __half k_scale_out = k_scale;
+                if constexpr (E8Lattice && kRkE8KAmplitudeOn) {
+                    k_scale_out = __float2half_rn(__half2float(k_scale) /
+                                                  static_cast<float>(kRkE8KAmplitudeGrid));
+                } else if constexpr (E8Lattice && kRkE8KResidualOn) {
+                    k_scale_out = __float2half_rn(__half2float(k_scale) /
+                                                  static_cast<float>(kRkE8KFracGrid));
+                }
                 scale_k[paged_kv_element_offset<4, Geometry::KVHeads>(
                     physical_page, kv_head, page_offset, grp)] = k_scale_out;
             }

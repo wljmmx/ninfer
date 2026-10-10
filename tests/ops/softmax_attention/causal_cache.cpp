@@ -1043,6 +1043,11 @@ std::int8_t rk4_unpack_host(std::uint8_t packed, int high) {
 // calibrated Type-B radius-table centre for the 2-bit E8-cylinder codec.
 constexpr float kE8VRadiusCentreB = 1.115f;
 
+// Mirror of rk4_codec.cuh::kRkE8KFracGrid / kRkE8KFracTheta: the constant fractional
+// residual (code' = Grid*code +- Theta code units, group scale = k_scale/Grid).
+constexpr int kE8KResidualGrid  = 4;
+constexpr int kE8KResidualTheta = 4;
+
 void e8_root_decode_8d_host(std::uint8_t root_code, std::uint8_t rad_axis_code,
                             std::int8_t out[8], float radius_mult = 1.0f) {
     const std::uint32_t rad_idx  = static_cast<std::uint32_t>(rad_axis_code >> 4);
@@ -1136,7 +1141,8 @@ double cache_value(const HostCache& cache, bool key, int head, int position, int
                                                         64 + group * 8 + sub);
             const std::uint8_t signs = static_cast<std::uint8_t>(codes[sat]);
             const int elem = d % 8;
-            const int v = static_cast<int>(decoded[elem]) + (((signs >> elem) & 1u) ? 1 : -1);
+            const int v = kE8KResidualGrid * static_cast<int>(decoded[elem]) +
+                          (((signs >> elem) & 1u) ? kE8KResidualTheta : -kE8KResidualTheta);
             return double(v) * scale;
         }
         // Packed int4: the K plane for rk4v4 and the V plane for the remaining layouts.

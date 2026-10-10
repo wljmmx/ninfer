@@ -145,7 +145,7 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
                     const std::int64_t koff = paged_kv_element_offset<64, Geometry::KVHeads>(
                         physical_page, kv_head, key & kPagedKVPageMask, byte_offset);
                     const std::uint32_t raw =
-                        *reinterpret_cast<const std::uint32_t*>(&cache_k[koff]);
+                        load_ldg<std::uint32_t>(&cache_k[koff]);
                     const uint8_t root0 = static_cast<uint8_t>(raw);
                     const uint8_t rad0  = static_cast<uint8_t>(raw >> 8);
                     const uint8_t root1 = static_cast<uint8_t>(raw >> 16);
@@ -158,7 +158,7 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
                         *reinterpret_cast<const uint64_t*>(dec0);
                     *reinterpret_cast<uint64_t*>(kd + 8) =
                         *reinterpret_cast<const uint64_t*>(dec1);
-                } else if constexpr (PackedK && E8Lattice) {
+                } else if constexpr (PackedK && E8Lattice && kRkE8KAmplitudeOn) {
                     // [EXPERIMENT E8+1bit] carrier read-back: E8-cylinder decode on the
                     // 128-byte int4 plane plus the per-element +-1 residual signs.
                     // Register-lean on purpose (this kernel runs at a hard maxreg cap).
@@ -166,7 +166,7 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
                     const std::int64_t koff = paged_kv_element_offset<kRkE8KLatticeExtent, Geometry::KVHeads>(
                         physical_page, kv_head, key & kPagedKVPageMask, subidx * 2);
                     const std::uint32_t raw =
-                        *reinterpret_cast<const std::uint32_t*>(&cache_k[koff]);
+                        load_ldg<std::uint32_t>(&cache_k[koff]);
                     const std::uint16_t signs = *reinterpret_cast<const std::uint16_t*>(
                         &cache_k[koff + 64 - subidx]);
                     std::uint8_t th0 = 0, th1 = 0;
@@ -188,8 +188,10 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
                     } else if constexpr (kRkE8KResidualOn) {
 #pragma unroll
                         for (int i = 0; i < 8; ++i) {
-                            dec[i] = static_cast<std::int8_t>(
-                                dec[i] + (((signs >> i) & 1u) ? 1 : -1));
+                            const int v = kRkE8KFracGrid * static_cast<int>(dec[i]) +
+                                          (((signs >> i) & 1u) ? kRkE8KFracTheta
+                                                               : -kRkE8KFracTheta);
+                            dec[i] = static_cast<std::int8_t>(v < -127 ? -127 : (v > 127 ? 127 : v));
                         }
                     }
                     *reinterpret_cast<uint64_t*>(kd) = *reinterpret_cast<const uint64_t*>(dec);
@@ -206,12 +208,22 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
                     } else if constexpr (kRkE8KResidualOn) {
 #pragma unroll
                         for (int i = 0; i < 8; ++i) {
-                            dec[i] = static_cast<std::int8_t>(
-                                dec[i] + (((signs >> (8 + i)) & 1u) ? 1 : -1));
+                            const int v = kRkE8KFracGrid * static_cast<int>(dec[i]) +
+                                          (((signs >> (8 + i)) & 1u) ? kRkE8KFracTheta
+                                                                     : -kRkE8KFracTheta);
+                            dec[i] = static_cast<std::int8_t>(v < -127 ? -127 : (v > 127 ? 127 : v));
                         }
                     }
                     *reinterpret_cast<uint64_t*>(kd + 8) =
                         *reinterpret_cast<const uint64_t*>(dec);
+                } else if constexpr (PackedK && E8Lattice) {
+                    // [D5] cp.async stage (see grouped_mma.cuh): the 4-byte E8 code
+                    // and a 4-byte-aligned sign window; decode_e8_tile() finishes them.
+                    const int subidx = (d / 64) * 8 + ((d / 8) & 7);
+                    const std::int64_t koff = paged_kv_element_offset<kRkE8KLatticeExtent, Geometry::KVHeads>(
+                        physical_page, kv_head, key & kPagedKVPageMask, subidx * 2);
+                    cp_async<4>(kd, &cache_k[koff]);
+                    cp_async<4>(kd + 4, &cache_k[koff + 64 - subidx - (subidx & 3)]);
                 } else if constexpr (PackedK) {
                     // int4 K: 8 packed bytes cover this 16-dim chunk; synchronous
                     // load + vectorized nibble unpack into the swizzled slot
@@ -273,8 +285,54 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
         ninfer::ops::cp_commit();
     };
 
+    // [D5] E8Lattice read-back decode phase (mirror of grouped_mma.cuh): the raw
+    // 4-byte code and 4-byte-aligned sign window are staged by issue_kv_tile(), and
+    // the 16 int8 codes are built here after cp_wait<0>() retires the async copy.
+    auto decode_e8_tile = [&](int tile_k0) {
+#pragma unroll 1
+        for (int chunk = tid; chunk < Bc * (D / 16); chunk += Schedule::kThreads) {
+            const int key_l = chunk / (D / 16);
+            const int dc    = chunk - key_l * (D / 16);
+            const int d     = dc * 16;
+            const int key   = tile_k0 + key_l;
+            if (key <= max_query_abs) {
+                std::int8_t* kd = &k_i8[(key_l * DB16 + causal_swizzle(key_l, dc * 8)) * 2];
+                const int subidx = (d / 64) * 8 + ((d / 8) & 7);
+                const std::uint32_t raw = *reinterpret_cast<const std::uint32_t*>(kd);
+                const std::uint16_t signs = *reinterpret_cast<const std::uint16_t*>(
+                    kd + 4 + (subidx & 3));
+                __align__(8) int8_t dec[8];
+                e8_root_decode_8d_fast(static_cast<uint8_t>(raw),
+                                       static_cast<uint8_t>(raw >> 8), dec);
+                if constexpr (kRkE8KResidualOn) {
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        const int v = kRkE8KFracGrid * static_cast<int>(dec[i]) +
+                                      (((signs >> i) & 1u) ? kRkE8KFracTheta
+                                                           : -kRkE8KFracTheta);
+                        dec[i] = static_cast<std::int8_t>(v < -127 ? -127 : (v > 127 ? 127 : v));
+                    }
+                }
+                *reinterpret_cast<uint64_t*>(kd) = *reinterpret_cast<const uint64_t*>(dec);
+                e8_root_decode_8d_fast(static_cast<uint8_t>(raw >> 16),
+                                       static_cast<uint8_t>(raw >> 24), dec);
+                if constexpr (kRkE8KResidualOn) {
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        const int v = kRkE8KFracGrid * static_cast<int>(dec[i]) +
+                                      (((signs >> (8 + i)) & 1u) ? kRkE8KFracTheta
+                                                                 : -kRkE8KFracTheta);
+                        dec[i] = static_cast<std::int8_t>(v < -127 ? -127 : (v > 127 ? 127 : v));
+                    }
+                }
+                *reinterpret_cast<uint64_t*>(kd + 8) = *reinterpret_cast<const uint64_t*>(dec);
+            }
+        }
+    };
+
     issue_kv_tile(0);
     ninfer::ops::cp_wait<0>();
+    if constexpr (PackedK && E8Lattice && !kRkE8KAmplitudeOn) { decode_e8_tile(0); }
     __syncthreads();
 
     const int gid      = lane >> 2;
@@ -527,7 +585,12 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
                         vf[0], vf[1]);
             }
         }
-        if (has_next) { ninfer::ops::cp_wait<0>(); }
+        if (has_next) {
+            ninfer::ops::cp_wait<0>();
+            if constexpr (PackedK && E8Lattice && !kRkE8KAmplitudeOn) {
+                decode_e8_tile((kb + 1) * Bc);
+            }
+        }
         __syncthreads();
     }
 
