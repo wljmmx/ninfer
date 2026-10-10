@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "ninfer/ops/w4a8.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
 
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
@@ -141,6 +142,11 @@ void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
 void q4_q5_gdn_input_dispatch(const Tensor& x, const Weight& qk_weight,
                               const Weight& value_z_weight, Tensor& qkv, Tensor& z,
                               cudaStream_t stream) {
+    // int8 route (NINFER_W4A8): same three jobs, one grouped launch.
+    if (w4a8_gdn_input_supported(qk_weight, value_z_weight, x.ne[1])) {
+        w4a8_gdn_input_proj(x, qk_weight, value_z_weight, qkv, z, stream);
+        return;
+    }
     const Q4Q5GdnInputProblem problem{x.ne[0],   qk_weight.n, value_z_weight.n,
                                       qkv.ne[0], z.ne[0],     qk_weight.padded_shape[1],
                                       x.ne[1]};

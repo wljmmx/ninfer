@@ -1012,7 +1012,8 @@ const std::int8_t* group_weight_i8(int slot, const Weight& w, cudaStream_t strea
 template <int kK>
 void run_grouped(const Tensor& x, const Weight& w0, const Weight& w1, Tensor* const outs[4],
                  const std::int32_t rows[4], const std::int32_t w_index[4],
-                 const std::int32_t w_rows[4], cudaStream_t stream) {
+                 const std::int32_t w_rows[4], const std::int32_t out_rows[4],
+                 cudaStream_t stream) {
     const int tokens   = x.ne[1];
     W4A8Cache& c       = cache();
     const long a_elems = (long)tokens * kK;
@@ -1044,7 +1045,7 @@ void run_grouped(const Tensor& x, const Weight& w0, const Weight& w1, Tensor* co
         jobs[i].wsc    = static_cast<const __half*>(ws[src]->scales) + (long)w_rows[i] * kGroups;
         jobs[i].out    = static_cast<__nv_bfloat16*>(outs[i]->data);
         jobs[i].out_ld = outs[i]->ne[0];
-        jobs[i].out_row = 0;
+        jobs[i].out_row = out_rows[i];
         jobs[i].n      = rows[i];
         tiles += rows[i] / kGRBM;
     }
@@ -1111,11 +1112,41 @@ bool w4a8_attn_input_supported(const Weight& query_key_weight, const Weight& gat
 void w4a8_attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                           const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& key,
                           Tensor& value, cudaStream_t stream) {
-    Tensor* outs[4]        = {&q, &key, &gate, &value};
+    Tensor* outs[4]               = {&q, &key, &gate, &value};
     const std::int32_t rows[4]    = {6144, 1024, 6144, 1024};
     const std::int32_t w_index[4] = {0, 0, 1, 1};
     const std::int32_t w_rows[4]  = {0, 6144, 0, 6144};
-    run_grouped<5120>(x, query_key_weight, gate_value_weight, outs, rows, w_index, w_rows, stream);
+    const std::int32_t out_rows[4] = {0, 0, 0, 0};
+    run_grouped<5120>(x, query_key_weight, gate_value_weight, outs, rows, w_index, w_rows,
+                      out_rows, stream);
+}
+
+// GDN input projection: job0 = qk (qk_weight, [0,4096)) -> qkv rows [0,4096);
+// job1 = value (value_z_weight, [0,6144)) -> qkv rows [4096,10240);
+// job2 = output gate (value_z_weight, [6144,12288)) -> z rows [0,6144).
+bool w4a8_gdn_input_supported(const Weight& qk_weight, const Weight& value_z_weight,
+                              std::int32_t tokens) {
+    if (!w4a8_enabled()) return false;
+    if (tokens <= 0 || (tokens % kGRBN) != 0) return false;
+    if (qk_weight.k != 5120 || qk_weight.padded_shape[1] != 5120) return false;
+    if (qk_weight.qtype != QType::Q4_G64_FP16 || qk_weight.group != 64) return false;
+    if ((qk_weight.n % kGRBM) != 0) return false;
+    if (value_z_weight.k != 5120 || value_z_weight.padded_shape[1] != 5120) return false;
+    if (value_z_weight.qtype != QType::Q5_G64_FP16 || value_z_weight.group != 64) return false;
+    if ((value_z_weight.n % kGRBM) != 0) return false;
+    return true;
+}
+
+void w4a8_gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                         Tensor& qkv, Tensor& z, cudaStream_t stream) {
+    constexpr std::int32_t kQkRows    = 4096;
+    constexpr std::int32_t kValueRows = 6144;
+    Tensor* outs[4]                = {&qkv, &qkv, &z, &z};
+    const std::int32_t rows[4]     = {kQkRows, kValueRows, kValueRows, 0};
+    const std::int32_t w_index[4]  = {0, 1, 1, 0};
+    const std::int32_t w_rows[4]   = {0, 0, kValueRows, 0};
+    const std::int32_t out_rows[4] = {0, kQkRows, 0, 0};
+    run_grouped<5120>(x, qk_weight, value_z_weight, outs, rows, w_index, w_rows, out_rows, stream);
 }
 
 } // namespace ninfer::ops

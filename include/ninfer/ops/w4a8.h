@@ -41,4 +41,12 @@ void w4a8_attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                           const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& key,
                           Tensor& value, cudaStream_t stream);
 
+/** True when the q4/q5 GDN input projection pair can use the W4A8 route. */
+bool w4a8_gdn_input_supported(const Weight& qk_weight, const Weight& value_z_weight,
+                              std::int32_t tokens);
+
+/** Fused qk/value (into qkv) and output gate (into z), via the W4A8 route. */
+void w4a8_gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                         Tensor& qkv, Tensor& z, cudaStream_t stream);
+
 } // namespace ninfer::ops
