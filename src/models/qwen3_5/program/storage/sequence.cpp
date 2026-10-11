@@ -4,9 +4,60 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::models::qwen3_5::detail {
+
+namespace {
+
+// Optional KV eviction window, read once from the environment. A zero window leaves the block
+// table exactly as published, so the default configuration is untouched and bit-identical.
+// Sink pages are always kept; the window keeps the most recent pages.
+struct KvEvictionWindow {
+    std::uint32_t sink_pages   = 0;
+    std::uint32_t window_pages = 0;
+
+    [[nodiscard]] bool enabled() const noexcept { return window_pages != 0; }
+};
+
+const KvEvictionWindow& kv_eviction_window() {
+    static const KvEvictionWindow window = [] {
+        KvEvictionWindow result;
+        if (const char* sink = std::getenv("NINFER_KV_EVICT_SINK")) {
+            result.sink_pages = static_cast<std::uint32_t>(std::strtoul(sink, nullptr, 10));
+        }
+        if (const char* span = std::getenv("NINFER_KV_EVICT_WINDOW")) {
+            result.window_pages = static_cast<std::uint32_t>(std::strtoul(span, nullptr, 10));
+        }
+        return result;
+    }();
+    return window;
+}
+
+// Only the INT8-routed layouts (INT8-G64 and the rank-compressed family) have causal attention
+// kernels that honour the absent-page contract; other layouts address the raw block-table entry,
+// so an absent page would be an out-of-bounds read. The window is silently skipped elsewhere.
+bool kv_absent_pages_supported(KvCacheStorage storage) noexcept {
+    switch (storage) {
+    case KvCacheStorage::Int8Group64:
+    case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
+    case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
+    case KvCacheStorage::RK4V4E8:
+    case KvCacheStorage::RK2V4E8:
+    case KvCacheStorage::RK4V2E8:
+        return true;
+    default:
+        return false;
+    }
+}
+
+std::uint32_t kv_live_pages(std::uint32_t tokens) noexcept {
+    const auto page = static_cast<std::uint32_t>(kPagedKVPageSize);
+    return (tokens + page - 1) / page;
+}
+
+} // namespace
 
 SequenceHandle ProgramImpl::sequence_handle(std::uint32_t lane) const noexcept {
     return ContractAccess::make_sequence(this, runtime::LaneId{lane}, lane_epochs[lane]);
@@ -141,6 +192,21 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& state, std::uint32_t 
     if (state.kv->backend) {
         backend_kv_addresses->ensure_mapped_to_tokens(*state.kv->backend, backend, device.stream);
     }
+    // An optional eviction window (default off) marks the pages the attention may skip. It runs
+    // after the mapping is extended and before the forward reads the table; it only ever drops
+    // pages whose tokens are already committed, so the next append never targets an absent page.
+    apply_kv_eviction_window(state.kv->text);
+}
+
+void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceHandle address) {
+    const KvEvictionWindow& window = kv_eviction_window();
+    if (!window.enabled()) { return; }
+    if (!kv_absent_pages_supported(decoder->text_kv.storage())) { return; }
+    const std::uint32_t frontier = text_kv_addresses->committed_frontier(address);
+    if (frontier == 0) { return; }
+    decoder->text_kv.execution_tables().apply_absent_window(
+        text_kv_addresses->execution_row(address).handle(), kv_live_pages(frontier),
+        window.sink_pages, window.window_pages, device.stream);
 }
 
 void ProgramImpl::commit_sequence_kv(SequenceState& state, std::uint32_t main,

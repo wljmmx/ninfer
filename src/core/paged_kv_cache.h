@@ -391,6 +391,16 @@ public:
     void publish_repeated(KVExecutionRowHandle row, DeviceKVPageHandle page, std::uint32_t count,
                           cudaStream_t stream);
 
+    // Overwrite the device remap of the first `live_pages` logical pages so that only pages in
+    // [0, sink_pages) and the last `window_pages` pages stay addressed: every other entry becomes
+    // the absent sentinel that the causal attention masks out. The logical mapping and the host
+    // shadow are never modified, so the write is idempotent and appending a *new* page is
+    // unaffected. window_pages == 0 leaves the row untouched (the default), which keeps results
+    // bit-identical.
+    void apply_absent_window(KVExecutionRowHandle row, std::uint32_t live_pages,
+                             std::uint32_t sink_pages, std::uint32_t window_pages,
+                             cudaStream_t stream);
+
     [[nodiscard]] Tensor row(KVExecutionRowHandle handle) const;
 
     [[nodiscard]] const Tensor& matrix() const noexcept { return block_tables_; }

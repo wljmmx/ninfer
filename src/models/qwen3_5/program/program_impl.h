@@ -542,6 +542,10 @@ public:
     void ensure_sequence_kv_mapped(SequenceState&, std::uint32_t main, std::uint32_t backend = 0);
     void trim_sequence_kv(SequenceState&, std::uint32_t main, std::uint32_t backend = 0);
     void commit_sequence_kv(SequenceState&, std::uint32_t main, std::uint32_t backend = 0);
+    // Applies the optional NINFER_KV_EVICT_SINK / NINFER_KV_EVICT_WINDOW eviction window to the Main
+    // KV row of the tokens already committed. With no window configured the block table is untouched
+    // and every result is unchanged.
+    void apply_kv_eviction_window(KVAddressSpaceHandle address);
     [[nodiscard]] PagedKVCache* backend_kv_cache() noexcept;
     [[nodiscard]] const PagedKVCache* backend_kv_cache() const noexcept;
     [[nodiscard]] std::uint32_t backend_kv_valid(const SequenceState&) const noexcept;
