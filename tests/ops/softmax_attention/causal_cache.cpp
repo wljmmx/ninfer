@@ -190,6 +190,8 @@ struct AttentionCase {
     bool zero_q        = false;
     bool graph_replay  = false;
     float qk_amplitude = 0.25f;
+    // Logical block-table pages an eviction policy marks absent just before the launch.
+    std::vector<std::int32_t> absent_pages;
 };
 
 enum class MappingPattern { Identity, Offset, Fragmented };
@@ -1170,8 +1172,12 @@ double cache_value(const HostCache& cache, bool key, int head, int position, int
            double(decode_e4m3fn(scales[row * kNvfp4QuantGroups + d / kNvfp4QuantGroup]));
 }
 
+// page_present, when non-empty, is indexed by logical KV page and models an eviction policy
+// that marked a page absent: every key in an absent page is out of range, exactly like a key
+// beyond the causal frontier.
 std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache& cache,
-                                    const std::vector<std::int32_t>& positions) {
+                                    const std::vector<std::int32_t>& positions,
+                                    std::span<const std::uint8_t> page_present = {}) {
     const Geometry& geometry = cache.geometry;
     const int tokens = positions.size(), visible = positions.back() + 1;
     const bool rotate_q = cache.storage != KvCacheStorage::BFloat16;
@@ -1213,7 +1219,11 @@ std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache
         [&](int d, int head, int token) { return query[q_index(geometry, head, d, token)]; },
         [&](int d, int head, int pos) { return keys[index(d, head, pos)]; },
         [&](int d, int head, int pos) { return values[index(d, head, pos)]; },
-        [&](int token, int pos) { return pos <= positions[token]; },
+        [&](int token, int pos) {
+            return pos <= positions[token] &&
+                   (page_present.empty() ||
+                    page_present[static_cast<std::size_t>(pos) / kPagedKVPageSize] != 0);
+        },
         [&](int d, int head, int token, double value) {
             output[q_index(geometry, head, d, token)] = value;
         },
@@ -1266,9 +1276,10 @@ public:
           v_scale_(layout_.value.scale_extent == 0
                        ? 1
                        : v_scale_elements_ * dtype_size(layout_.value.scale_dtype)),
+          device_table_host_(block_table_host_),
           block_table_(block_table_host_.size() * sizeof(std::int32_t)) {
-        block_table_.copy_from_host(block_table_host_.data(),
-                                    block_table_host_.size() * sizeof(std::int32_t));
+        block_table_.copy_from_host(device_table_host_.data(),
+                                    device_table_host_.size() * sizeof(std::int32_t));
         if (storage_ == KvCacheStorage::BFloat16) {
             const auto k_physical =
                 scatter_paged(cache.k_bf16, kHeadDim, geometry_, logical_capacity_,
@@ -1479,6 +1490,30 @@ public:
         return cache;
     }
 
+    // Mark logical pages absent in the *device* block table, exactly as an eviction policy
+    // would. The logical (host) mapping is untouched so snapshot() / verify_cache() still read
+    // the real bytes; the caller passes page_present() to the oracle so it drops the same keys.
+    void mark_absent_pages(std::span<const std::int32_t> logical_pages) {
+        if (logical_pages.empty()) { return; }
+        for (const std::int32_t page : logical_pages) {
+            if (page < 0 || page >= logical_pages_) {
+                throw std::invalid_argument("absent KV page is outside the block table");
+            }
+            device_table_host_[static_cast<std::size_t>(page)] = -1;
+        }
+        block_table_.copy_from_host(device_table_host_.data(),
+                                    device_table_host_.size() * sizeof(std::int32_t));
+    }
+
+    [[nodiscard]] std::vector<std::uint8_t> page_present() const {
+        std::vector<std::uint8_t> present(static_cast<std::size_t>(logical_pages_), 1);
+        for (std::int32_t page = 0; page < logical_pages_; ++page) {
+            present[static_cast<std::size_t>(page)] =
+                device_table_host_[static_cast<std::size_t>(page)] >= 0 ? 1 : 0;
+        }
+        return present;
+    }
+
     int verify_guards(const std::string& label) const {
         int failures = 0;
         failures += k_.verify_guards((label + " cache-k").c_str());
@@ -1492,8 +1527,8 @@ public:
         failures += block_table_.verify_guards((label + " block-table").c_str());
         failures +=
             verify_exact((label + " block-table unchanged").c_str(),
-                         copy_from_guarded<std::int32_t>(block_table_, block_table_host_.size()),
-                         block_table_host_);
+                         copy_from_guarded<std::int32_t>(block_table_, device_table_host_.size()),
+                         device_table_host_);
         return failures;
     }
 
@@ -1506,6 +1541,10 @@ private:
     std::int32_t logical_pages_;
     std::int32_t physical_pages_;
     std::vector<std::int32_t> block_table_host_;
+    // The device block table's own truth: equal to block_table_host_ until an eviction policy
+    // marks pages absent. block_table_host_ keeps the logical mapping so snapshot() and
+    // verify_cache() still read the resident bytes.
+    std::vector<std::int32_t> device_table_host_;
     std::size_t k_code_elements_;
     std::size_t v_code_elements_;
     std::size_t k_scale_elements_;
@@ -2231,9 +2270,13 @@ int run_a1_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
         cuda_synchronize();
         expected = cache.snapshot();
     }
+    // The cache bytes are resident now; an eviction policy marks its dropped pages here, after
+    // the append brought the new tokens in, so the oracle and the kernel drop the same keys.
+    cache.mark_absent_pages(test_case.absent_pages);
+    const std::vector<std::uint8_t> present = cache.page_present();
     const std::vector<double> reference =
         ideal_attention(select_query_columns(q, kHeadDim * geometry.q_heads, oracle_queries),
-                        expected, select_query_columns(positions, 1, oracle_queries));
+                        expected, select_query_columns(positions, 1, oracle_queries), present);
     if (graph_limits.empty()) {
         launch_attention_case(launch, test_case.graph_replay);
     } else {
@@ -2317,9 +2360,11 @@ int run_a3_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
         make_cache(geometry, storage, total + 3, test_case.seed + 10u, amplitude);
     DeviceCache cache(cache_host, mapping, max_context);
     if (is_rank_compressed(storage)) cache_host = cache.snapshot();
+    cache.mark_absent_pages(test_case.absent_pages);
+    const std::vector<std::uint8_t> present = cache.page_present();
     const std::vector<double> reference =
         ideal_attention(select_query_columns(q, kHeadDim * geometry.q_heads, oracle_queries),
-                        cache_host, select_query_columns(positions, 1, oracle_queries));
+                        cache_host, select_query_columns(positions, 1, oracle_queries), present);
 
     const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
     GuardedDeviceBuffer dq(q_bits.size() * sizeof(std::uint16_t));
@@ -3139,6 +3184,55 @@ int run_small_prefill_cases(DeviceExecutionView execution, KvCacheStorage storag
     return failures;
 }
 
+// The INT8-routed layouts (INT8-G64 and the rank-compressed family) are the ones whose causal
+// attention kernels honour the absent-page contract of paged_kv_address.cuh; the other routes
+// still address the raw block-table entry, so an absent page would be an out-of-bounds read
+// there. The check below keeps the new coverage to the routes that implement the contract.
+bool storage_honours_absent_pages(KvCacheStorage storage) {
+    switch (storage) {
+    case KvCacheStorage::Int8Group64:
+    case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
+    case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
+    case KvCacheStorage::RK4V4E8:
+    case KvCacheStorage::RK2V4E8:
+    case KvCacheStorage::RK4V2E8:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Four populated pages of 64 keys (0..255); the queries sit in the last page. An eviction policy
+// writes -1 for an evicted logical page, the kernel clamps the address to page 0 and forces every
+// score in that page to -inf, so the output must equal the oracle restricted to the surviving
+// keys. These cases therefore verify the absent path end to end against the independent oracle.
+int run_absent_page_cases(DeviceExecutionView execution, KvCacheStorage storage) {
+    if (!storage_honours_absent_pages(storage)) { return 0; }
+    int failures = 0;
+    for (const auto& geometry : kGeometries) {
+        // Sink page 0 plus the newest page: drop the two interior pages.
+        failures += run_a1_case(execution, geometry, storage,
+                                {64, 192, 256, 1401u, false, false, 0.25f, {1, 2}},
+                                MappingPattern::Identity);
+        failures += run_a3_case(execution, geometry, storage,
+                                {1, 192, 193, 1402u, false, false, 0.25f, {1, 2}},
+                                MappingPattern::Identity);
+        // A single interior hole.
+        failures += run_a1_case(execution, geometry, storage,
+                                {64, 192, 256, 1403u, false, false, 0.25f, {1}},
+                                MappingPattern::Identity);
+        // Only the queries' own page survives: the sink and every older page are gone.
+        failures += run_a3_case(execution, geometry, storage,
+                                {1, 192, 193, 1404u, false, false, 0.25f, {0, 1, 2}},
+                                MappingPattern::Identity);
+        // The control: no absent page, exercised through the new visibility plumbing.
+        failures += run_a3_case(execution, geometry, storage,
+                                {1, 192, 193, 1405u, false, false, 0.25f, {}},
+                                MappingPattern::Identity);
+    }
+    return failures;
+}
+
 int run_storage_cases(DeviceExecutionView execution, KvCacheStorage storage) {
     // Rank-compressed layouts run the same suite matrix: the layouts, names and tolerances
     // are registered, the cache is filled by the engine append op (append_rk_planes), and the
@@ -3173,6 +3267,7 @@ int run_storage_cases(DeviceExecutionView execution, KvCacheStorage storage) {
     failures += run_verify_width_cases(execution, storage);
     failures += run_numerical_profile_cases(execution, storage);
     failures += run_small_prefill_cases(execution, storage);
+    failures += run_absent_page_cases(execution, storage);
     return failures;
 }
 
