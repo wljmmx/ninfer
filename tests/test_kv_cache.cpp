@@ -487,6 +487,52 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
 
 } // namespace
 
+// P3 capacity probe. A KV eviction window drops pages in the *middle* of a sequence, so the freed
+// capacity is not a trailing extent the reservation shrinks on its own: the page has to be
+// dematerialized and the reservation then shrunk for the pool to get the capacity back. This pins
+// that accounting, which is what turns a masked eviction into real capacity.
+int exercise_eviction_capacity(ninfer::DeviceContext& context) {
+    int failures = 0;
+    ninfer::KVPageGeometry geometry{
+        .planes = {{ninfer::DType::I8, 8, 2, 256}},
+    };
+    constexpr std::uint32_t kPages = 8;
+    PlannedCache plan              = plan_cache(kPages, kPages, 1, geometry);
+    ninfer::DeviceArena arena(plan.bytes);
+    ninfer::DeviceKVPagePool pool({arena.base(), arena.capacity()}, plan.pages);
+
+    std::optional<ninfer::DeviceKVPageReservation> reservation = pool.reserve(kPages);
+    failures += expect(reservation.has_value(), "eviction probe reservation failed");
+    if (!reservation) { return failures; }
+    std::vector<ninfer::DeviceKVPageLease> pages;
+    pages.reserve(kPages);
+    pool.materialize(*reservation, kPages, pages);
+    failures += expect_size(pool.allocated_pages(), kPages, "eviction probe allocated");
+    failures += expect_size(pool.available_pages(), 0, "eviction probe available");
+
+    // Evict a middle page: the sink plus recent window never drops the first or the last page.
+    constexpr std::size_t kEvicted = 3;
+    pool.dematerialize_one(*reservation, std::move(pages[kEvicted]));
+    std::cout << "eviction probe after middle dematerialize: allocated=" << pool.allocated_pages()
+              << " reserved=" << pool.reserved_pages() << " available=" << pool.available_pages()
+              << '\n';
+    failures += expect_size(pool.allocated_pages(), kPages - 1, "allocated after middle evict");
+    failures += expect_size(pool.reserved_pages(), 1, "reserved after middle evict");
+    failures += expect_size(pool.available_pages(), 0,
+                            "middle dematerialize must not by itself free pool capacity");
+
+    // The capacity only returns once the reservation is shrunk; P3 has to do that explicitly.
+    failures += expect(pool.can_resize_reservation(*reservation, 0),
+                       "shrink after middle dematerialize was refused");
+    pool.resize_reservation(*reservation, 0);
+    failures += expect_size(pool.reserved_pages(), 0, "reserved after shrink");
+    failures += expect_size(pool.available_pages(), 1, "capacity not recovered by the shrink");
+    std::optional<ninfer::DeviceKVPageReservation> refill = pool.reserve(1);
+    failures += expect(refill.has_value(), "released page was not reusable");
+    if (refill) { refill->clear(); }
+    return failures;
+}
+
 int main() {
     int device_count              = 0;
     const cudaError_t count_error = cudaGetDeviceCount(&device_count);
@@ -502,6 +548,7 @@ int main() {
     try {
         ninfer::DeviceContext context(0);
         int failures = exercise_reservation_and_mapping(context);
+        failures += exercise_eviction_capacity(context);
         failures += exercise_layout_and_transfer(
             context,
             ninfer::KVPageGeometry{
