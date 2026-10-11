@@ -491,10 +491,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F;
     float l0 = 0.0f, l1 = 0.0f;
 
-    auto issue_kv_tile = [&](int tile_k0, int physical_page) {
+    auto issue_kv_tile = [&](int tile_k0, int physical_page, bool present) {
         for (int key_l = tid; key_l < Bc; key_l += Threads) {
             const int key = tile_k0 + key_l;
-            if (key >= split_start && key < split_end) {
+            if (present && key >= split_start && key < split_end) {
                 const std::int64_t off = kv_cache_int8_quant_scale_index<Geometry>(
                     physical_page, kv_head, 0, key & kPagedKVPageMask);
                 ninfer::ops::cp_async<8>(&k_scale_s[key_l * Groups], &cache_k_scale[off]);
@@ -510,7 +510,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             const int dc    = chunk - key_l * (D / 16);
             const int d     = dc * 16;
             const int key   = tile_k0 + key_l;
-            if (key >= split_start && key < split_end) {
+            if (present && key >= split_start && key < split_end) {
                 std::int8_t* dst = &k_i8[key_l * D + causal_swizzle(key_l, dc * 8) * 2];
                 const std::int64_t off = kv_cache_int8_quant_code_index<Geometry>(
                     physical_page, kv_head, d, key & kPagedKVPageMask);
@@ -714,7 +714,7 @@ rk4_apply_e8_residual(dec, static_cast<std::uint32_t>(signs >> 8));
     bool page_present   = paged_kv_page_present(block_table, first_tile);
     int physical_page   = paged_kv_page_for_address(block_table, first_tile);
 
-    issue_kv_tile(first_tile, physical_page);
+    issue_kv_tile(first_tile, physical_page, page_present);
     ninfer::ops::cp_wait<0>();
     if constexpr (PackedK && E8Lattice && !kRkE8KAmplitudeOn) { decode_e8_tile(first_tile); }
     __syncthreads();
@@ -870,7 +870,8 @@ rk4_apply_e8_residual(dec, static_cast<std::uint32_t>(signs >> 8));
                 const int d     = dc * 8;
                 const int key   = k0 + key_l;
                 __half* dst     = &v_f16[key_l * D + causal_swizzle(key_l, d)];
-                if (key >= split_start && key < split_end) {
+                if (paged_kv_page_present(block_table, k0) && key >= split_start &&
+                    key < split_end) {
                     const int grp = d >> 6;
                     float vs      = 0.0f;
                     if ((lane & 7) == 0) { vs = __half2float(v_scale_s[key_l * Groups + grp]); }
@@ -926,7 +927,7 @@ rk4_apply_e8_residual(dec, static_cast<std::uint32_t>(signs >> 8));
                 page_present  = paged_kv_page_present(block_table, next_k0);
                 physical_page = paged_kv_page_for_address(block_table, next_k0);
             }
-            issue_kv_tile(next_k0, physical_page);
+            issue_kv_tile(next_k0, physical_page, page_present);
         }
 
         const int consumer_tile     = warp % RowTiles;
