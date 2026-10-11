@@ -5,6 +5,7 @@
 #include "ninfer/ops/act_quant_a8.h"
 #include <cstdio>
 #include <cuda_bf16.h>
+#include <algorithm>
 #include <vector>
 #include "ninfer/ops/w4a8.h"
 #include "ninfer/ops/linear_add.h"
@@ -42,13 +43,16 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
         (void)layout.alloc(DType::BF16, {gu.n / 2, last});
         {
             auto scope = layout.scope();
-            (void)layout.alloc_bytes(ops::linear_swiglu_workspace_capacity_bytes(
-                gu.qtype, gu.n, gu.k, p.gate_up.policy, first, last));
+            (void)layout.alloc_bytes(std::max(ops::linear_swiglu_workspace_capacity_bytes(gu.qtype, gu.n, gu.k,
+                                                                   p.gate_up.policy, first, last),
+                               ops::w4a8_swiglu_workspace_capacity_bytes(gu.n, gu.k, first, last)));
         }
         {
             auto scope = layout.scope();
-            (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
-                down.qtype, down.n, down.k, p.down.policy, first, last));
+            (void)layout.alloc_bytes(std::max(ops::linear_add_workspace_capacity_bytes(down.qtype, down.n, down.k,
+                                                                     p.down.policy, first, last),
+                               ops::w4a8_linear_add_workspace_capacity_bytes(down.n, down.k, first,
+                                                                            last)));
         }
     }
     return layout.peak_bytes(1);
@@ -89,7 +93,7 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
     {
         auto call = workspace.scope();
         if (ops::w4a8_swiglu_supported(gu, hidden.ne[1])) {
-            ops::w4a8_swiglu(hidden, gu, activation, stream);
+            ops::w4a8_swiglu(hidden, gu, activation, workspace, stream);
         } else {
             ops::linear_swiglu(hidden, gu, activation, p.gate_up.policy, workspace, stream);
         }
@@ -98,7 +102,7 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
     ops::act_quant_a8_roundtrip_bf16(activation.data, activation.ne[0], activation.ne[1], stream);
     // [P1] W4A8 route for the down projection when enabled (NINFER_W4A8)
     if (ops::w4a8_supported(down, activation.ne[1])) {
-        ops::w4a8_linear_add(activation, down, residual, stream);
+        ops::w4a8_linear_add(activation, down, residual, workspace, stream);
         return;
     }
     ops::linear_add(activation, down, residual, p.down.policy, workspace, stream);

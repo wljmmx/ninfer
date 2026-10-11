@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/weight.h"
+#include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
 
@@ -32,7 +33,7 @@ namespace ninfer::ops {
  */
 void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
-                     cudaStream_t stream);
+                     WorkspaceArena& ws, cudaStream_t stream);
 
 /**
  * Computes the single-parent Q/K/output-gate/V projection.

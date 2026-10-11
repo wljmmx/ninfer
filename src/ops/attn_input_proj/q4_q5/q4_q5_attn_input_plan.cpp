@@ -94,10 +94,10 @@ void q4_q5_attn_input_execute_plan(const Q4Q5AttnInputPlan& plan, const Tensor& 
 
 void q4_q5_attn_input_dispatch(const Tensor& x, const Weight& query_key_weight,
                                const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k,
-                               Tensor& v, cudaStream_t stream) {
+                               Tensor& v, WorkspaceArena& ws, cudaStream_t stream) {
     // int8 route (NINFER_W4A8): identical job split, one grouped launch.
     if (w4a8_attn_input_supported(query_key_weight, gate_value_weight, x.ne[1])) {
-        w4a8_attn_input_proj(x, query_key_weight, gate_value_weight, q, gate, k, v, stream);
+        w4a8_attn_input_proj(x, query_key_weight, gate_value_weight, q, gate, k, v, ws, stream);
         return;
     }
     const Q4Q5AttnInputProblem problem{x.ne[0], q.ne[0], k.ne[0], query_key_weight.padded_shape[1],

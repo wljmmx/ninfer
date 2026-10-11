@@ -983,7 +983,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     {
         Tensor attn_out = a.view({dimension(config_.attention->query_width()), T});
         if (ops::w4a8_supported(p.output.weight, T)) {
-            ops::w4a8_linear_add(attn_out, p.output.weight, x, s);
+            ops::w4a8_linear_add(attn_out, p.output.weight, x, work_, s);
         } else {
             ops::linear_add(attn_out, p.output.weight, x, p.output.policy, work_, s);
         }
@@ -1124,7 +1124,7 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     {
         Tensor gdn_out = on.view({dimension(config_.gdn->value_width()), T});
         if (ops::w4a8_supported(p.output.weight, T)) {
-            ops::w4a8_linear_add(gdn_out, p.output.weight, x, s);
+            ops::w4a8_linear_add(gdn_out, p.output.weight, x, work_, s);
         } else {
             ops::linear_add(gdn_out, p.output.weight, x, p.output.policy, work_, s);
         }

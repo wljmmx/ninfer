@@ -141,10 +141,10 @@ void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
 
 void q4_q5_gdn_input_dispatch(const Tensor& x, const Weight& qk_weight,
                               const Weight& value_z_weight, Tensor& qkv, Tensor& z,
-                              cudaStream_t stream) {
+                              WorkspaceArena& ws, cudaStream_t stream) {
     // int8 route (NINFER_W4A8): same three jobs, one grouped launch.
     if (w4a8_gdn_input_supported(qk_weight, value_z_weight, x.ne[1])) {
-        w4a8_gdn_input_proj(x, qk_weight, value_z_weight, qkv, z, stream);
+        w4a8_gdn_input_proj(x, qk_weight, value_z_weight, qkv, z, ws, stream);
         return;
     }
     const Q4Q5GdnInputProblem problem{x.ne[0],   qk_weight.n, value_z_weight.n,

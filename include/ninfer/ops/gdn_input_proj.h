@@ -41,7 +41,7 @@ namespace ninfer::ops {
  *   No transient bytes are required.
  */
 void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
-                    Tensor& qkv, Tensor& z, cudaStream_t stream);
+                    Tensor& qkv, Tensor& z, WorkspaceArena& ws, cudaStream_t stream);
 
 /**
  * Single-parent GDN projection. Registered parent forms are:

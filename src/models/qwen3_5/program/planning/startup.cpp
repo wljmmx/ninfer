@@ -22,6 +22,7 @@
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/speculative_round.h"
 #include <algorithm>
+#include "ninfer/ops/w4a8.h"
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -309,8 +310,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     };
     const auto add_scratch = [&](WorkspaceLayoutBuilder& layout,
                                  const execution::LinearParameters& p, int first, int last) {
-        scratch(layout, ops::linear_add_workspace_capacity_bytes(
-                            p.weight.qtype, p.weight.n, p.weight.k, p.policy, first, last));
+        scratch(layout, std::max(ops::linear_add_workspace_capacity_bytes(
+                                p.weight.qtype, p.weight.n, p.weight.k, p.policy, first, last),
+                            ops::w4a8_linear_add_workspace_capacity_bytes(p.weight.n, p.weight.k,
+                                                                          first, last)));
     };
     const auto target_body = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                  std::int32_t last, TextPhase phase, GdnWorkspacePath path,

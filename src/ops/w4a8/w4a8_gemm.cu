@@ -6,7 +6,9 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <cstdlib>
 
 namespace ninfer::ops {
@@ -942,24 +944,19 @@ __global__ __launch_bounds__(kGRThreads, 2) void w4a8_grouped_kernel(
     }
 }
 
-struct W4A8Cache {
-    std::int8_t* w_i8 = nullptr;   // dequantized int8 weights (path A only)
-    long w_elems      = 0;
-    const void* w_key = nullptr;
-    std::int8_t* a_i8 = nullptr;
-    float* a_scale    = nullptr;
-    long a_cap        = 0;
-    int a_tokens      = 0;         // a_scale is sized for this many tokens
-    int a_groups      = 0;         // ... and this many 64-wide K groups
-    // Grouped route: activation int8 plus a (token, 64-K group) scale grid.
-    std::int8_t* ag_i8  = nullptr;
-    float* ag_scale     = nullptr;
-    long ag_cap         = 0;
-    int ag_tokens       = 0;
-};
-W4A8Cache& cache() {
-    static W4A8Cache c;
-    return c;
+// Caller-owned scratch for the W4A8 routes. W4A8 only runs on prefill token counts, so every
+// buffer it needs is transient and comes out of the caller's WorkspaceArena like any other op in
+// this library. The w4a8_*_workspace_capacity_bytes() queries at the bottom of this file report
+// the same layout so the planner sizes the workspace (and the start-up admission check) for it.
+constexpr std::size_t kScratchAlign = 256;
+constexpr std::size_t align_scratch(std::size_t bytes) {
+    return (bytes + kScratchAlign - 1) / kScratchAlign * kScratchAlign;
+}
+// Reserve `bytes` at the arena's alignment and return the offset to carve it from.
+inline std::size_t take_scratch(std::size_t& cursor, std::size_t bytes) {
+    const std::size_t at = align_scratch(cursor);
+    cursor               = at + bytes;
+    return at;
 }
 
 // The separate-dequantization path is the default: at prefill chunk sizes it
@@ -986,52 +983,39 @@ bool use_narrow_kernel() {
 }
 
 template <int kN, int kK>
-void run(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t stream) {
-    const int tokens   = x.ne[1];
-    const int sgroups  = kK / 64;
-    W4A8Cache& c       = cache();
-    const long a_elems = (long)tokens * kK;
-    if (c.a_cap < a_elems || c.a_tokens < tokens || c.a_groups < sgroups) {
-        if (c.a_i8) cudaFree(c.a_i8);
-        if (c.a_scale) cudaFree(c.a_scale);
-        if (cudaMalloc(&c.a_i8, (size_t)a_elems) != cudaSuccess) {
-            c.a_i8 = nullptr; c.a_cap = 0; c.a_tokens = 0; c.a_groups = 0; return;
-        }
-        cudaMalloc(&c.a_scale, (size_t)tokens * sgroups * sizeof(float));
-        c.a_cap = a_elems;
-        c.a_tokens = tokens;
-        c.a_groups = sgroups;
-    }
-    launch_a8_quant(x, c.a_i8, c.a_scale, kK, tokens, stream);
+void run(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceArena& ws,
+         cudaStream_t stream) {
+    const int tokens      = x.ne[1];
+    constexpr int kGroups = kK / 64;
+    auto scope            = ws.scope();
+    std::size_t cursor    = 0;
+    const std::size_t a_off = take_scratch(cursor, (std::size_t)tokens * kK);
+    const std::size_t s_off = take_scratch(cursor, (std::size_t)tokens * kGroups * sizeof(float));
+    const std::size_t w_off = take_scratch(cursor, (std::size_t)kN * kK);
+    auto* const base    = static_cast<std::uint8_t*>(ws.alloc_bytes(align_scratch(cursor)).data);
+    auto* const a_i8    = reinterpret_cast<std::int8_t*>(base + a_off);
+    auto* const a_scale = reinterpret_cast<float*>(base + s_off);
+    auto* const w_i8    = reinterpret_cast<std::int8_t*>(base + w_off);
+
+    launch_a8_quant(x, a_i8, a_scale, kK, tokens, stream);
     CUDA_CHECK(cudaGetLastError());
     const dim3 grid(tokens / kBM, kN / kBN);
-    const auto* wsc    = static_cast<const __half*>(w.scales);
-    auto* out          = static_cast<__nv_bfloat16*>(residual.data);
-    const int ld       = (int)(residual.nb[1] / sizeof(__nv_bfloat16));
+    const auto* wsc = static_cast<const __half*>(w.scales);
+    auto* out       = static_cast<__nv_bfloat16*>(residual.data);
+    const int ld    = (int)(residual.nb[1] / sizeof(__nv_bfloat16));
 
     if (use_dequant_path()) {
-        const long w_elems = (long)kN * kK;
-        if (c.w_elems < w_elems) {
-            if (c.w_i8) cudaFree(c.w_i8);
-            if (cudaMalloc(&c.w_i8, (size_t)w_elems) != cudaSuccess) { c.w_i8 = nullptr; c.w_elems = 0; return; }
-            c.w_elems = w_elems;
-            c.w_key   = nullptr;
-        }
-        if (c.w_key != w.qdata) {
-            const int dq_groups = kK / 64;
-            const dim3 dq_grid((unsigned)((dq_groups * 4 + 255) / 256), (unsigned)kN);
-            dequant_q5_i8<<<dq_grid, 256, 0, stream>>>(
-                static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.qhigh),
-                c.w_i8, dq_groups, kK);
-            c.w_key = w.qdata;
-        }
+        const dim3 dq_grid((unsigned)((kGroups * 4 + 255) / 256), (unsigned)kN);
+        dequant_q5_i8<<<dq_grid, 256, 0, stream>>>(
+            static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.qhigh),
+            w_i8, kGroups, kK);
         if (use_narrow_kernel()) {
             const dim3 grid_n(tokens / kBMN, kN / kBNN);
             w4a8_gemm_residual_narrow_kernel<kN, kK><<<grid_n, kThreadsN, 0, stream>>>(
-                c.a_i8, c.w_i8, c.a_scale, wsc, out, ld);
+                a_i8, w_i8, a_scale, wsc, out, ld);
         } else {
             w4a8_gemm_residual_kernel<kN, kK><<<grid, kThreads, 0, stream>>>(
-                c.a_i8, c.w_i8, c.a_scale, wsc, out, ld);
+                a_i8, w_i8, a_scale, wsc, out, ld);
         }
     } else {
         constexpr int kSmem = (int)sizeof(W4A8Q5Smem);
@@ -1042,160 +1026,98 @@ void run(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t stream
             configured = true;
         }
         w4a8_q5_gemm_residual_kernel<kN, kK><<<grid, kThreads, kSmem, stream>>>(
-            c.a_i8, static_cast<const std::uint8_t*>(w.qdata),
-            static_cast<const std::uint8_t*>(w.qhigh), c.a_scale, wsc, out, ld);
+            a_i8, static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.qhigh), a_scale, wsc, out, ld);
     }
     CUDA_CHECK(cudaGetLastError());
-}
-
-struct W4A8SgCache {
-    std::int8_t* w_i8 = nullptr; // folded int8 gate/up weight
-    long w_elems      = 0;
-    const void* w_key = nullptr;
-    __half* wsc_gm    = nullptr; // group-major copy of the weight scales
-    long wsc_elems    = 0;
-};
-W4A8SgCache& sg_cache() {
-    static W4A8SgCache c;
-    return c;
 }
 
 template <int kParents, int kK>
-void run_swiglu(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    const int tokens   = x.ne[1];
-    const int sgroups  = kK / 64;
-    W4A8Cache& c       = cache();
-    const long a_elems = (long)tokens * kK;
-    if (c.a_cap < a_elems || c.a_tokens < tokens || c.a_groups < sgroups) {
-        if (c.a_i8) cudaFree(c.a_i8);
-        if (c.a_scale) cudaFree(c.a_scale);
-        if (cudaMalloc(&c.a_i8, (size_t)a_elems) != cudaSuccess) {
-            c.a_i8 = nullptr; c.a_cap = 0; c.a_tokens = 0; c.a_groups = 0; return;
-        }
-        cudaMalloc(&c.a_scale, (size_t)tokens * sgroups * sizeof(float));
-        c.a_cap    = a_elems;
-        c.a_tokens = tokens;
-        c.a_groups = sgroups;
-    }
-    launch_a8_quant(x, c.a_i8, c.a_scale, kK, tokens, stream);
+void run_swiglu(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+                cudaStream_t stream) {
+    constexpr int kGroupsN = kK / 64;
+    const int tokens       = x.ne[1];
+    auto scope             = ws.scope();
+    std::size_t cursor     = 0;
+    const std::size_t a_off = take_scratch(cursor, (std::size_t)tokens * kK);
+    const std::size_t s_off = take_scratch(cursor, (std::size_t)tokens * kGroupsN * sizeof(float));
+    const std::size_t w_off = take_scratch(cursor, (std::size_t)(2 * kParents) * kK);
+    const std::size_t c_off =
+        take_scratch(cursor, (std::size_t)(2 * kParents) * kGroupsN * sizeof(__half));
+    auto* const base    = static_cast<std::uint8_t*>(ws.alloc_bytes(align_scratch(cursor)).data);
+    auto* const a_i8    = reinterpret_cast<std::int8_t*>(base + a_off);
+    auto* const a_scale = reinterpret_cast<float*>(base + s_off);
+    auto* const w_i8    = reinterpret_cast<std::int8_t*>(base + w_off);
+    auto* const wsc_gm  = reinterpret_cast<__half*>(base + c_off);
+
+    launch_a8_quant(x, a_i8, a_scale, kK, tokens, stream);
     CUDA_CHECK(cudaGetLastError());
 
-    W4A8SgCache& sg    = sg_cache();
-    const long w_elems = (long)(2 * kParents) * kK;
-    if (sg.w_elems < w_elems) {
-        if (sg.w_i8) cudaFree(sg.w_i8);
-        if (cudaMalloc(&sg.w_i8, (size_t)w_elems) != cudaSuccess) { sg.w_i8 = nullptr; sg.w_elems = 0; return; }
-        sg.w_elems = w_elems;
-        sg.w_key   = nullptr;
-    }
-    constexpr int kGroupsN = kK / 64;
-    const long wsc_elems   = (long)(2 * kParents) * kGroupsN;
-    if (sg.wsc_elems < wsc_elems) {
-        if (sg.wsc_gm) cudaFree(sg.wsc_gm);
-        if (cudaMalloc(&sg.wsc_gm, (size_t)wsc_elems * sizeof(__half)) != cudaSuccess) {
-            sg.wsc_gm = nullptr; sg.wsc_elems = 0; sg.w_key = nullptr; return;
-        }
-        sg.wsc_elems = wsc_elems;
-        sg.w_key     = nullptr;
-    }
-    if (sg.w_key != w.qdata) {
-        const int groups = kK / 64;
-        const dim3 dq((unsigned)((groups * 4 + 255) / 256), (unsigned)(2 * kParents));
-        dequant_q4_i8_folded<<<dq, 256, 0, stream>>>(static_cast<const std::uint8_t*>(w.qdata),
-                                                     sg.w_i8, groups, kK, kParents);
-        const dim3 tg((unsigned)((groups + 31) / 32), (unsigned)((2 * kParents + 31) / 32));
-        transpose_wsc_group_major<32><<<tg, dim3(32, 8), 0, stream>>>(
-            static_cast<const __half*>(w.scales), sg.wsc_gm, 2 * kParents, groups);
-        sg.w_key = w.qdata;
-    }
+    const dim3 dq((unsigned)((kGroupsN * 4 + 255) / 256), (unsigned)(2 * kParents));
+    dequant_q4_i8_folded<<<dq, 256, 0, stream>>>(static_cast<const std::uint8_t*>(w.qdata), w_i8,
+                                                 kGroupsN, kK, kParents);
+    const dim3 tg((unsigned)((kGroupsN + 31) / 32), (unsigned)((2 * kParents + 31) / 32));
+    transpose_wsc_group_major<32><<<tg, dim3(32, 8), 0, stream>>>(
+        static_cast<const __half*>(w.scales), wsc_gm, 2 * kParents, kGroupsN);
+
     const dim3 grid(tokens / kSGBN, (unsigned)(kParents / kSGPM));
     w4a8_swiglu_kernel<kParents, kK><<<grid, kSGThreads, 0, stream>>>(
-        sg.w_i8, c.a_i8, c.a_scale, sg.wsc_gm,
-        static_cast<__nv_bfloat16*>(out.data), tokens);
+        w_i8, a_i8, a_scale, wsc_gm, static_cast<__nv_bfloat16*>(out.data), tokens);
     CUDA_CHECK(cudaGetLastError());
-}
-
-struct W4A8GroupCache {
-    std::int8_t* slot[2] = {nullptr, nullptr};
-    long cap[2]         = {0, 0};
-    const void* key[2]  = {nullptr, nullptr};
-};
-W4A8GroupCache& group_cache() {
-    static W4A8GroupCache c;
-    return c;
-}
-
-// Dequantize a q4/q5 weight into a cached int8 slot (natural row order).
-template <int kK>
-const std::int8_t* group_weight_i8(int slot, const Weight& w, cudaStream_t stream) {
-    W4A8GroupCache& gc = group_cache();
-    const long elems   = (long)w.n * kK;
-    if (gc.cap[slot] < elems) {
-        if (gc.slot[slot]) cudaFree(gc.slot[slot]);
-        if (cudaMalloc(&gc.slot[slot], (size_t)elems) != cudaSuccess) {
-            gc.slot[slot] = nullptr; gc.cap[slot] = 0; return nullptr;
-        }
-        gc.cap[slot] = elems;
-        gc.key[slot] = nullptr;
-    }
-    if (gc.key[slot] != w.qdata) {
-        const int groups = kK / 64;
-        const dim3 dq((unsigned)((groups * 4 + 255) / 256), (unsigned)w.n);
-        dequant_q4q5_i8<<<dq, 256, 0, stream>>>(
-            static_cast<const std::uint8_t*>(w.qdata),
-            static_cast<const std::uint8_t*>(w.qhigh), gc.slot[slot], groups, kK,
-            w.qtype == QType::Q5_G64_FP16 ? 1 : 0);
-        CUDA_CHECK(cudaGetLastError());
-        gc.key[slot] = w.qdata;
-    }
-    return gc.slot[slot];
 }
 
 template <int kK>
 void run_grouped(const Tensor& x, const Weight& w0, const Weight& w1, Tensor* const outs[4],
                  const std::int32_t rows[4], const std::int32_t w_index[4],
                  const std::int32_t w_rows[4], const std::int32_t out_rows[4],
-                 cudaStream_t stream) {
-    const int tokens   = x.ne[1];
-    W4A8Cache& c       = cache();
-    const long a_elems = (long)tokens * kK;
-    const int sgroups  = kK / 64;
-    if (c.ag_cap < a_elems || c.ag_tokens < tokens) {
-        if (c.ag_i8) cudaFree(c.ag_i8);
-        if (c.ag_scale) cudaFree(c.ag_scale);
-        if (cudaMalloc(&c.ag_i8, (size_t)a_elems) != cudaSuccess) {
-            c.ag_i8 = nullptr; c.ag_cap = 0; c.ag_tokens = 0; return;
-        }
-        cudaMalloc(&c.ag_scale, (size_t)tokens * sgroups * sizeof(float));
-        c.ag_cap    = a_elems;
-        c.ag_tokens = tokens;
-    }
-    launch_a8_quant(x, c.ag_i8, c.ag_scale, kK, tokens, stream);
+                 WorkspaceArena& ws, cudaStream_t stream) {
+    constexpr int kGroups = kK / 64;
+    const int tokens      = x.ne[1];
+    auto scope            = ws.scope();
+    std::size_t cursor    = 0;
+    const std::size_t a_off  = take_scratch(cursor, (std::size_t)tokens * kK);
+    const std::size_t s_off  = take_scratch(cursor, (std::size_t)tokens * kGroups * sizeof(float));
+    const std::size_t w0_off = take_scratch(cursor, (std::size_t)w0.n * kK);
+    const std::size_t w1_off = take_scratch(cursor, (std::size_t)w1.n * kK);
+    auto* const base    = static_cast<std::uint8_t*>(ws.alloc_bytes(align_scratch(cursor)).data);
+    auto* const a_i8    = reinterpret_cast<std::int8_t*>(base + a_off);
+    auto* const a_scale = reinterpret_cast<float*>(base + s_off);
+
+    launch_a8_quant(x, a_i8, a_scale, kK, tokens, stream);
     CUDA_CHECK(cudaGetLastError());
 
-    const std::int8_t* wi[2] = {group_weight_i8<kK>(0, w0, stream),
-                                group_weight_i8<kK>(1, w1, stream)};
-    if (wi[0] == nullptr || wi[1] == nullptr) return;
-    const Weight* ws[2] = {&w0, &w1};
+    const Weight* const src_w[2] = {&w0, &w1};
+    const std::size_t src_off[2] = {w0_off, w1_off};
+    const std::int8_t* wi[2]     = {nullptr, nullptr};
+    for (int slot = 0; slot < 2; ++slot) {
+        const Weight& w = *src_w[slot];
+        auto* buffer    = reinterpret_cast<std::int8_t*>(base + src_off[slot]);
+        const dim3 dq((unsigned)((kGroups * 4 + 255) / 256), (unsigned)w.n);
+        dequant_q4q5_i8<<<dq, 256, 0, stream>>>(
+            static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.qhigh),
+            buffer, kGroups, kK, w.qtype == QType::Q5_G64_FP16 ? 1 : 0);
+        CUDA_CHECK(cudaGetLastError());
+        wi[slot] = buffer;
+    }
 
-    constexpr int kGroups = kK / 64;
     W4A8GroupedJob jobs[4];
     int tiles = 0;
     for (int i = 0; i < 4; ++i) {
-        const int src = w_index[i];
-        jobs[i].w      = wi[src] + (long)w_rows[i] * kK;
-        jobs[i].wsc    = static_cast<const __half*>(ws[src]->scales) + (long)w_rows[i] * kGroups;
-        jobs[i].out    = static_cast<__nv_bfloat16*>(outs[i]->data);
-        jobs[i].out_ld = outs[i]->ne[0];
+        const int slot  = w_index[i];
+        jobs[i].w       = wi[slot] + (long)w_rows[i] * kK;
+        jobs[i].wsc     = static_cast<const __half*>(src_w[slot]->scales) + (long)w_rows[i] * kGroups;
+        jobs[i].out     = static_cast<__nv_bfloat16*>(outs[i]->data);
+        jobs[i].out_ld  = outs[i]->ne[0];
         jobs[i].out_row = out_rows[i];
-        jobs[i].n      = rows[i];
+        jobs[i].n       = rows[i];
         tiles += rows[i] / kGRBM;
     }
     const dim3 grid((unsigned)(tokens / kGRBN), (unsigned)tiles);
-    w4a8_grouped_kernel<kK><<<grid, kGRThreads, 0, stream>>>(c.ag_i8, c.ag_scale, jobs[0], jobs[1],
+    w4a8_grouped_kernel<kK><<<grid, kGRThreads, 0, stream>>>(a_i8, a_scale, jobs[0], jobs[1],
                                                              jobs[2], jobs[3]);
     CUDA_CHECK(cudaGetLastError());
 }
+
 
 } // namespace
 
@@ -1230,12 +1152,13 @@ bool w4a8_supported(const Weight& weight, std::int32_t tokens) {
     return weight.k == 17408 || weight.k == 6144;
 }
 
-void w4a8_linear_add(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t stream) {
+void w4a8_linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceArena& ws,
+                     cudaStream_t stream) {
     if (w.k == 6144) {
-        run<5120, 6144>(x, w, residual, stream);
+        run<5120, 6144>(x, w, residual, ws, stream);
         return;
     }
-    run<5120, 17408>(x, w, residual, stream);
+    run<5120, 17408>(x, w, residual, ws, stream);
 }
 
 bool w4a8_swiglu_supported(const Weight& weight, std::int32_t tokens) {
@@ -1245,8 +1168,9 @@ bool w4a8_swiglu_supported(const Weight& weight, std::int32_t tokens) {
            weight.k == 5120 && weight.padded_shape[1] == 5120;
 }
 
-void w4a8_swiglu(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    run_swiglu<17408, 5120>(x, w, out, stream);
+void w4a8_swiglu(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+                 cudaStream_t stream) {
+    run_swiglu<17408, 5120>(x, w, out, ws, stream);
 }
 
 bool w4a8_attn_input_supported(const Weight& query_key_weight, const Weight& gate_value_weight,
@@ -1266,14 +1190,14 @@ bool w4a8_attn_input_supported(const Weight& query_key_weight, const Weight& gat
 // q[0,6144) k[0,1024) from query_key_weight; gate[0,6144) v[0,1024) from gate_value_weight.
 void w4a8_attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                           const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& key,
-                          Tensor& value, cudaStream_t stream) {
+                          Tensor& value, WorkspaceArena& ws, cudaStream_t stream) {
     Tensor* outs[4]               = {&q, &key, &gate, &value};
     const std::int32_t rows[4]    = {6144, 1024, 6144, 1024};
     const std::int32_t w_index[4] = {0, 0, 1, 1};
     const std::int32_t w_rows[4]  = {0, 6144, 0, 6144};
     const std::int32_t out_rows[4] = {0, 0, 0, 0};
     run_grouped<5120>(x, query_key_weight, gate_value_weight, outs, rows, w_index, w_rows,
-                      out_rows, stream);
+                      out_rows, ws, stream);
 }
 
 // GDN input projection: job0 = qk (qk_weight, [0,4096)) -> qkv rows [0,4096);
@@ -1293,7 +1217,7 @@ bool w4a8_gdn_input_supported(const Weight& qk_weight, const Weight& value_z_wei
 }
 
 void w4a8_gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
-                         Tensor& qkv, Tensor& z, cudaStream_t stream) {
+                         Tensor& qkv, Tensor& z, WorkspaceArena& ws, cudaStream_t stream) {
     constexpr std::int32_t kQkRows    = 4096;
     constexpr std::int32_t kValueRows = 6144;
     Tensor* outs[4]                = {&qkv, &qkv, &z, &z};
@@ -1301,7 +1225,75 @@ void w4a8_gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight&
     const std::int32_t w_index[4]  = {0, 1, 1, 0};
     const std::int32_t w_rows[4]   = {0, 0, kValueRows, 0};
     const std::int32_t out_rows[4] = {0, kQkRows, 0, 0};
-    run_grouped<5120>(x, qk_weight, value_z_weight, outs, rows, w_index, w_rows, out_rows, stream);
+    run_grouped<5120>(x, qk_weight, value_z_weight, outs, rows, w_index, w_rows, out_rows, ws,
+                      stream);
+}
+
+std::size_t w4a8_linear_add_workspace_capacity_bytes(std::int32_t n, std::int32_t k,
+                                                     std::int32_t min_tokens,
+                                                     std::int32_t max_tokens) {
+    if (min_tokens <= 0 || max_tokens < min_tokens) {
+        throw std::invalid_argument("w4a8 linear_add workspace: invalid token interval");
+    }
+    if (n != 5120 || (k != 17408 && k != 6144)) { return 0; }
+    std::size_t cursor = 0;
+    (void)take_scratch(cursor, (std::size_t)max_tokens * k);
+    (void)take_scratch(cursor, (std::size_t)max_tokens * (k / 64) * sizeof(float));
+    (void)take_scratch(cursor, (std::size_t)n * k);
+    return align_scratch(cursor);
+}
+
+std::size_t w4a8_swiglu_workspace_capacity_bytes(std::int32_t gate_up_rows,
+                                                 std::int32_t input_rows, std::int32_t min_tokens,
+                                                 std::int32_t max_tokens) {
+    if (min_tokens <= 0 || max_tokens < min_tokens) {
+        throw std::invalid_argument("w4a8 swiglu workspace: invalid token interval");
+    }
+    if (input_rows != 5120 || gate_up_rows != 2 * 17408) { return 0; }
+    constexpr std::int32_t kK       = 5120;
+    constexpr std::int32_t kGroupsN = kK / 64;
+    constexpr std::int32_t kFolded  = 2 * 17408;
+    std::size_t cursor              = 0;
+    (void)take_scratch(cursor, (std::size_t)max_tokens * kK);
+    (void)take_scratch(cursor, (std::size_t)max_tokens * kGroupsN * sizeof(float));
+    (void)take_scratch(cursor, (std::size_t)kFolded * kK);
+    (void)take_scratch(cursor, (std::size_t)kFolded * kGroupsN * sizeof(__half));
+    return align_scratch(cursor);
+}
+
+std::size_t w4a8_attn_input_workspace_capacity_bytes(std::int32_t query_key_rows,
+                                                     std::int32_t gate_value_rows,
+                                                     std::int32_t input_rows,
+                                                     std::int32_t min_tokens,
+                                                     std::int32_t max_tokens) {
+    if (min_tokens <= 0 || max_tokens < min_tokens) {
+        throw std::invalid_argument("w4a8 attention input workspace: invalid token interval");
+    }
+    // The route splits both weights into their 6144 + 1024 row pair.
+    if (input_rows != 5120 || query_key_rows < 7168 || gate_value_rows < 7168) { return 0; }
+    std::size_t cursor = 0;
+    (void)take_scratch(cursor, (std::size_t)max_tokens * input_rows);
+    (void)take_scratch(cursor, (std::size_t)max_tokens * (input_rows / 64) * sizeof(float));
+    (void)take_scratch(cursor, (std::size_t)query_key_rows * input_rows);
+    (void)take_scratch(cursor, (std::size_t)gate_value_rows * input_rows);
+    return align_scratch(cursor);
+}
+
+std::size_t w4a8_gdn_input_workspace_capacity_bytes(std::int32_t qk_rows,
+                                                    std::int32_t value_z_rows,
+                                                    std::int32_t input_rows,
+                                                    std::int32_t min_tokens,
+                                                    std::int32_t max_tokens) {
+    if (min_tokens <= 0 || max_tokens < min_tokens) {
+        throw std::invalid_argument("w4a8 GDN input workspace: invalid token interval");
+    }
+    if (input_rows != 5120 || qk_rows <= 0 || value_z_rows <= 0) { return 0; }
+    std::size_t cursor = 0;
+    (void)take_scratch(cursor, (std::size_t)max_tokens * input_rows);
+    (void)take_scratch(cursor, (std::size_t)max_tokens * (input_rows / 64) * sizeof(float));
+    (void)take_scratch(cursor, (std::size_t)qk_rows * input_rows);
+    (void)take_scratch(cursor, (std::size_t)value_z_rows * input_rows);
+    return align_scratch(cursor);
 }
 
 } // namespace ninfer::ops
