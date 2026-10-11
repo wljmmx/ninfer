@@ -3184,13 +3184,16 @@ int run_small_prefill_cases(DeviceExecutionView execution, KvCacheStorage storag
     return failures;
 }
 
-// The INT8-routed layouts (INT8-G64 and the rank-compressed family) are the ones whose causal
-// attention kernels honour the absent-page contract of paged_kv_address.cuh; the other routes
-// still address the raw block-table entry, so an absent page would be an out-of-bounds read
-// there. The check below keeps the new coverage to the routes that implement the contract.
+// Every causal-cache layout whose attention kernels honour the absent-page contract of
+// paged_kv_address.cuh. NVFP4 remains outside it: it is Blackwell-only and its kernel still
+// addresses the raw block-table entry. The check below keeps the coverage to the routes that
+// implement the contract.
 bool storage_honours_absent_pages(KvCacheStorage storage) {
     switch (storage) {
+    case KvCacheStorage::BFloat16:
     case KvCacheStorage::Int8Group64:
+    case KvCacheStorage::Fp8E4M3Row256:
+    case KvCacheStorage::Fp8KeyNvfp4Value:
     case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
     case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
     case KvCacheStorage::RK4V4E8:
@@ -3229,6 +3232,16 @@ int run_absent_page_cases(DeviceExecutionView execution, KvCacheStorage storage)
         failures += run_a3_case(execution, geometry, storage,
                                 {1, 192, 193, 1405u, false, false, 0.25f, {}},
                                 MappingPattern::Identity);
+        // A wide (Tiled-family) prefill with a four-page interior hole below the queries. The
+        // narrow cases above only reach the grouped/parallel-grouped families, so this is the one
+        // that exercises the tiled schedule with absent pages.
+        const std::array<int, 3> wide_queries{0, 512, 1023};
+        failures += run_a1_case(execution, geometry, storage,
+                                {1024, 8192, 9216, 1406u, false, false, 0.25f, {2, 3, 4, 5}},
+                                MappingPattern::Fragmented, wide_queries);
+        failures += run_a1_case(execution, geometry, storage,
+                                {1024, 8192, 9216, 1407u, false, false, 0.25f, {2}},
+                                MappingPattern::Fragmented, wide_queries);
     }
     return failures;
 }

@@ -22,12 +22,22 @@ __device__ __forceinline__ std::int64_t bf16_kv_cache_index(int page, int head, 
 template <typename Geometry, class Schedule, typename Element>
 __device__ __forceinline__ void bf16_kv_stage_tile(Element* dst, const Element* cache, int kv_head,
                                                    int k0, int max_query_abs, int physical_page,
-                                                   int tid) {
+                                                   bool present, int tid) {
     constexpr int D         = Geometry::kHeadDim;
     constexpr int Bc        = Schedule::kKeyRows;
     constexpr int Threads   = Schedule::kThreads;
     constexpr int VecPerRow = D / 8; // 8 two-byte elements per 16B cp.async
     const bool full_tile    = (k0 + Bc - 1) <= max_query_abs;
+    if (!present) {
+        // An absent page holds no live key/value: zero the tile rather than read page 0's bytes,
+        // and let the score mask drop every column.
+        for (int chunk = tid; chunk < Bc * VecPerRow; chunk += Threads) {
+            const int row = chunk / VecPerRow;
+            const int d   = (chunk % VecPerRow) * 8;
+            store_vec(&dst[row * D + causal_swizzle(row, d)], make_int4(0, 0, 0, 0));
+        }
+        return;
+    }
     // Block base pointer computed once (int64); per-element offsets stay 32-bit.
     const Element* cache_block =
         cache + paged_kv_element_offset<Geometry::kHeadDim, Geometry::KVHeads>(

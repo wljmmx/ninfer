@@ -35,12 +35,15 @@ const KvEvictionWindow& kv_eviction_window() {
     return window;
 }
 
-// Only the INT8-routed layouts (INT8-G64 and the rank-compressed family) have causal attention
-// kernels that honour the absent-page contract; other layouts address the raw block-table entry,
-// so an absent page would be an out-of-bounds read. The window is silently skipped elsewhere.
+// The causal attention kernels that honour the absent-page contract: BF16, FP8 and K8V4 plus the
+// INT8-routed INT8-G64 and rank-compressed family. NVFP4 is Blackwell-only and still addresses the
+// raw block-table entry, so the window is silently skipped for it.
 bool kv_absent_pages_supported(KvCacheStorage storage) noexcept {
     switch (storage) {
+    case KvCacheStorage::BFloat16:
     case KvCacheStorage::Int8Group64:
+    case KvCacheStorage::Fp8E4M3Row256:
+    case KvCacheStorage::Fp8KeyNvfp4Value:
     case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
     case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
     case KvCacheStorage::RK4V4E8:
@@ -195,18 +198,25 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& state, std::uint32_t 
     // An optional eviction window (default off) marks the pages the attention may skip. It runs
     // after the mapping is extended and before the forward reads the table; it only ever drops
     // pages whose tokens are already committed, so the next append never targets an absent page.
-    apply_kv_eviction_window(state.kv->text);
+    // Both the Main and the backend (MTP / DFlash) growing caches are windowed.
+    apply_kv_eviction_window(*text_kv_addresses, decoder->text_kv, state.kv->text);
+    if (state.kv->backend) {
+        if (PagedKVCache* cache = backend_kv_cache(); cache != nullptr) {
+            apply_kv_eviction_window(*backend_kv_addresses, *cache, *state.kv->backend);
+        }
+    }
 }
 
-void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceHandle address) {
+void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, PagedKVCache& cache,
+                                           KVAddressSpaceHandle address) {
     const KvEvictionWindow& window = kv_eviction_window();
     if (!window.enabled()) { return; }
-    if (!kv_absent_pages_supported(decoder->text_kv.storage())) { return; }
-    const std::uint32_t frontier = text_kv_addresses->committed_frontier(address);
+    if (!kv_absent_pages_supported(cache.storage())) { return; }
+    const std::uint32_t frontier = addresses.committed_frontier(address);
     if (frontier == 0) { return; }
-    decoder->text_kv.execution_tables().apply_absent_window(
-        text_kv_addresses->execution_row(address).handle(), kv_live_pages(frontier),
-        window.sink_pages, window.window_pages, device.stream);
+    cache.execution_tables().apply_absent_window(addresses.execution_row(address).handle(),
+                                                 kv_live_pages(frontier), window.sink_pages,
+                                                 window.window_pages, device.stream);
 }
 
 void ProgramImpl::commit_sequence_kv(SequenceState& state, std::uint32_t main,

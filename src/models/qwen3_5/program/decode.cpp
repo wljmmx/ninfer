@@ -172,6 +172,11 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
         if (sequence.kv->backend) {
             backend_kv_addresses->ensure_mapped_to_tokens(*sequence.kv->backend, end,
                                                           device.stream);
+            // This site maps the backend KV directly; window it here too so the DFlash context
+            // append follows the same eviction policy as the pooled rounds.
+            if (PagedKVCache* cache = backend_kv_cache(); cache != nullptr) {
+                apply_kv_eviction_window(*backend_kv_addresses, *cache, *sequence.kv->backend);
+            }
         }
         minimum_count = std::min(minimum_count, counts[row]);
         maximum_count = std::max(maximum_count, counts[row]);

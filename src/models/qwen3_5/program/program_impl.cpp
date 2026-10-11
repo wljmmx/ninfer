@@ -428,7 +428,7 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             const std::uint32_t chunk_begin = cursor;
             cursor += result.processed_tokens;
             text_kv_addresses->commit_frontier(*address, cursor);
-            apply_kv_eviction_window(*address);
+            apply_kv_eviction_window(*text_kv_addresses, decoder->text_kv, *address);
 
             std::uint32_t selected = std::max(chunk_begin, scored_predictor_begin);
             while (selected < cursor) {

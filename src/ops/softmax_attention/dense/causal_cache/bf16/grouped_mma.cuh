@@ -9,10 +9,20 @@ namespace ninfer::ops::detail {
 template <class G, class S, class Input>
 __device__ __forceinline__ void
 bf16_kv_load_grouped_tile(__nv_bfloat16* key_tile, __half* value_tile, const __nv_bfloat16* keys,
-                          const __half* values, Input input, int page, int head, int begin, int end,
-                          int first_position, int tid) {
+                          const __half* values, Input input, int page, bool present,
+                          int head, int begin, int end, int first_position, int tid) {
     constexpr int D       = G::kHeadDim;
     const auto cache_base = bf16_kv_cache_index<G>(page, head, 0, begin & kPagedKVPageMask);
+    if (!present) {
+        // Absent page: zero the tile instead of reading page 0's bytes; the score mask drops it.
+        for (int i = tid; i < S::kKeyRows * (D / 8); i += S::kThreads) {
+            const int row     = i / (D / 8), d = i % (D / 8) * 8;
+            const auto offset = row * D + causal_swizzle(row, d);
+            store_vec(key_tile + offset, make_int4(0, 0, 0, 0));
+            store_vec(value_tile + offset, make_int4(0, 0, 0, 0));
+        }
+        return;
+    }
     // Small query tiles need enough outstanding loads to hide memory latency.
 #pragma unroll 1
     for (int i = tid; i < S::kKeyRows * (D / 8); i += S::kThreads) {
@@ -165,9 +175,11 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
                 storage->pages[i] = table[page_window + i];
             __syncthreads();
         }
+        const int page_entry    = storage->pages[logical_page - page_window];
+        const bool tile_present = page_entry >= 0;
         bf16_kv_load_grouped_tile<G, S>(k_s, v_s, cache_k, cache_v, input,
-                                        storage->pages[logical_page - page_window], head, k0, end,
-                                        first, tid);
+                                        page_entry < 0 ? 0 : page_entry, tile_present, head, k0,
+                                        end, first, tid);
         cp_commit();
         cp_wait<0>();
         __syncthreads();
@@ -192,7 +204,9 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const int key = k0 + warp_kv * NK + n * 8 + 2 * lid + (j & 1);
-                if (key >= end || key > qabs[j / 2]) score[n][j] = -CUDART_INF_F;
+                if (!tile_present || key >= end || key > qabs[j / 2]) {
+                    score[n][j] = -CUDART_INF_F;
+                }
                 maximum[j / 2] = fmaxf(maximum[j / 2], score[n][j]);
             }
         }

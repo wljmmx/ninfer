@@ -243,12 +243,12 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     float l0 = 0.0F;
     float l1 = 0.0F;
 
-    auto issue_kv_tile = [&](int tile_k0, int physical_page) {
+    auto issue_kv_tile = [&](int tile_k0, int physical_page, bool present) {
         if constexpr (TokenTile == 1 && Bc == 32) {
             for (int chunk = tid; chunk < Bc / 8; chunk += Threads) {
                 const int key_l                 = chunk * 8;
                 const int key                   = tile_k0 + key_l;
-                const int valid_keys            = max(0, min(8, split_end - key));
+                const int valid_keys = present ? max(0, min(8, split_end - key)) : 0;
                 const std::int64_t scale_offset = kv_cache_fp8_scale_index<Geometry>(
                     physical_page, kv_head, key & kPagedKVPageMask);
                 cp_async_zfill<16, Cache::cg>(&k_scale_s[key_l], &cache_k_scale[scale_offset],
@@ -259,7 +259,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         } else {
             for (int key_l = tid; key_l < Bc; key_l += Threads) {
                 const int key = tile_k0 + key_l;
-                if (key >= split_start && key < split_end) {
+                if (present && key >= split_start && key < split_end) {
                     const std::int64_t scale_offset = kv_cache_fp8_scale_index<Geometry>(
                         physical_page, kv_head, key & kPagedKVPageMask);
                     k_scale_s[key_l] = cache_k_scale[scale_offset];
@@ -277,7 +277,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             const int d         = dc * 16;
             const int key       = tile_k0 + key_l;
             std::uint8_t* k_dst = &k_fp8[(key_l * DB16 + causal_swizzle(key_l, dc * 8)) * 2];
-            if (key >= split_start && key < split_end) {
+            if (present && key >= split_start && key < split_end) {
                 const std::int64_t code_offset = kv_cache_fp8_code_index<Geometry>(
                     physical_page, kv_head, d, key & kPagedKVPageMask);
                 cp_async<16, Cache::cg>(k_dst, &cache_k[code_offset]);
@@ -290,8 +290,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         ninfer::ops::cp_commit();
     };
 
-    int physical_page = block_table[first_page];
-    issue_kv_tile(first_tile, physical_page);
+    bool page_present = paged_kv_page_present(block_table, first_tile);
+    int physical_page = paged_kv_page_for_address(block_table, first_tile);
+    issue_kv_tile(first_tile, physical_page, page_present);
     ninfer::ops::cp_wait<0>();
     __syncthreads();
 
@@ -354,19 +355,19 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                     const int key0 = k0 + col0;
                     const int key1 = key0 + 1;
                     score[nt][0] =
-                        row0 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs0
+                        row0 < RowCount && page_present && key0 >= split_start && key0 < split_end && key0 <= qabs0
                             ? score[nt][0] * attention_scale
                             : -CUDART_INF_F;
                     score[nt][1] =
-                        row0 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs0
+                        row0 < RowCount && page_present && key1 >= split_start && key1 < split_end && key1 <= qabs0
                             ? score[nt][1] * attention_scale
                             : -CUDART_INF_F;
                     score[nt][2] =
-                        row1 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs1
+                        row1 < RowCount && page_present && key0 >= split_start && key0 < split_end && key0 <= qabs1
                             ? score[nt][2] * attention_scale
                             : -CUDART_INF_F;
                     score[nt][3] =
-                        row1 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs1
+                        row1 < RowCount && page_present && key1 >= split_start && key1 < split_end && key1 <= qabs1
                             ? score[nt][3] * attention_scale
                             : -CUDART_INF_F;
                     bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
@@ -425,7 +426,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 const int d     = dc * 8;
                 const int key   = k0 + key_l;
                 __half* dst     = &v_f16[key_l * D + causal_swizzle(key_l, d)];
-                if (key >= split_start && key < split_end) {
+                if (page_present && key >= split_start && key < split_end) {
                     store_vec(dst, fp8_kv_dequant_f16x8(&v_fp8[key_l * D + d], v_scale_s[key_l]));
                 } else {
                     store_vec(dst, make_int4(0, 0, 0, 0));
@@ -438,9 +439,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         if (has_next) {
             const int next_k0 = k0 + Bc;
             if ((next_k0 & kPagedKVPageMask) == 0) {
-                physical_page = block_table[next_k0 >> kPagedKVPageShift];
+                page_present  = paged_kv_page_present(block_table, next_k0);
+                physical_page = paged_kv_page_for_address(block_table, next_k0);
             }
-            issue_kv_tile(next_k0, physical_page);
+            issue_kv_tile(next_k0, physical_page, page_present);
         }
 
         const int consumer_tile     = warp % RowTiles;

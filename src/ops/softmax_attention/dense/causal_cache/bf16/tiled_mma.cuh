@@ -126,26 +126,35 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     // Fold softmax_scale into the exp2 (FA-style): scores stay raw, so the
     // per-element "* scale" multiply drops out of the QK epilogue entirely.
     const float scale_l2 = scale * kLog2E;
-    int physical_page    = block_table[0];
+    // An absent page is addressed as page 0 (kept in bounds) and masked out. Bc divides the
+    // 64-token page, so every tile's keys fall inside one page and presence is uniform per tile.
+    bool page_present    = paged_kv_page_present(block_table, 0);
+    int physical_page    = paged_kv_page_for_address(block_table, 0);
 
     // Prologue: commit Q, then kick off K(0). The loop's wait<0> below drains both.
     ninfer::ops::cp_commit();
     bf16_kv_stage_tile<Geometry, Schedule>(k_s, cache_k, kv_head, 0, max_query_abs, physical_page,
-                                           tid);
+                                           page_present, tid);
     ninfer::ops::cp_commit();
 
     const auto step = [&]<bool FullTile>(int kb) {
         const int k0                 = kb * Bc;
-        const int next_physical_page = (kb + 1 < n_block_max)
-                                           ? block_table[((kb + 1) * Bc) >> kPagedKVPageShift]
-                                           : physical_page;
+        // The prefetch below advances page_present to tile kb+1 before the score mask runs, so the
+        // current tile's presence has to be captured here.
+        const bool tile_present      = page_present;
+        const bool next_page_present = (kb + 1 < n_block_max)
+                                           ? paged_kv_page_present(block_table, (kb + 1) * Bc)
+                                           : page_present;
+        const int next_physical_page =
+            (kb + 1 < n_block_max) ? paged_kv_page_for_address(block_table, (kb + 1) * Bc)
+                                   : physical_page;
 
         ninfer::ops::cp_wait<0>(); // K(kb) landed (also publishes q_s / prev PV done)
         __syncthreads();
 
         // Preserve the global FP16 V load/QK overlap.
         bf16_kv_stage_tile<Geometry, Schedule>(v_s, cache_v, kv_head, k0, max_query_abs,
-                                               physical_page, tid);
+                                               physical_page, tile_present, tid);
         ninfer::ops::cp_commit();
 
         // S = Q Kᵀ for this warp's 16 rows over all Bc keys, in registers.
@@ -199,9 +208,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
 
         // Prefetch K(kb+1) into the (now-free) K buffer, overlapping the PV MMA.
         if (kb + 1 < n_block_max) {
+            page_present  = next_page_present;
             physical_page = next_physical_page;
             bf16_kv_stage_tile<Geometry, Schedule>(k_s, cache_k, kv_head, (kb + 1) * Bc,
-                                                   max_query_abs, physical_page, tid);
+                                                   max_query_abs, physical_page, page_present, tid);
             ninfer::ops::cp_commit();
         }
 
@@ -225,10 +235,14 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             for (int nt = 0; nt < QKNt; ++nt) {
                 const int key0 = k0 + nt * 8 + 2 * lid;
                 const int key1 = key0 + 1;
-                score[nt][0]   = (qrow0 < tokens && key0 <= qabs0) ? score[nt][0] : -CUDART_INF_F;
-                score[nt][1]   = (qrow0 < tokens && key1 <= qabs0) ? score[nt][1] : -CUDART_INF_F;
-                score[nt][2]   = (qrow1 < tokens && key0 <= qabs1) ? score[nt][2] : -CUDART_INF_F;
-                score[nt][3]   = (qrow1 < tokens && key1 <= qabs1) ? score[nt][3] : -CUDART_INF_F;
+                const bool vis0 = tile_present && qrow0 < tokens && key0 <= qabs0;
+                const bool vis1 = tile_present && qrow0 < tokens && key1 <= qabs0;
+                const bool vis2 = tile_present && qrow1 < tokens && key0 <= qabs1;
+                const bool vis3 = tile_present && qrow1 < tokens && key1 <= qabs1;
+                score[nt][0]    = vis0 ? score[nt][0] : -CUDART_INF_F;
+                score[nt][1]    = vis1 ? score[nt][1] : -CUDART_INF_F;
+                score[nt][2]    = vis2 ? score[nt][2] : -CUDART_INF_F;
+                score[nt][3]    = vis3 ? score[nt][3] : -CUDART_INF_F;
                 bm0            = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
                 bm1            = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
             }
@@ -335,7 +349,15 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                     p_frag[k][1], p_frag[k][2], p_frag[k][3], vf[cur][2], vf[cur][3]);
         }
     };
-    const int full_blocks = q0 + Br <= tokens ? min(n_block_max, (base_pos + q0 + 1) / Bc) : 0;
+    int full_blocks = q0 + Br <= tokens ? min(n_block_max, (base_pos + q0 + 1) / Bc) : 0;
+    // The unmasked score path may only cover present pages; stop it at the first absent one so the
+    // masked path applies the page predicate from there on.
+    for (int kb = 0; kb < full_blocks; ++kb) {
+        if (!paged_kv_page_present(block_table, kb * Bc)) {
+            full_blocks = kb;
+            break;
+        }
+    }
     for (int kb = 0; kb < full_blocks; ++kb) step.template operator()<true>(kb);
     for (int kb = full_blocks; kb < n_block_max; ++kb) step.template operator()<false>(kb);
 

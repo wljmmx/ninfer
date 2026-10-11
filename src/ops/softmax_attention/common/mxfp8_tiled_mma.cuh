@@ -110,12 +110,15 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
     const unsigned v_lane_base = smem_addr(v_f16) + (((lane >> 3) & 1) * 8 + b_rin) * D * 2;
     const unsigned v_as        = (lane >> 4) << 4;
     const unsigned v_r         = b_rin << 4;
-    auto issue_kv_scales       = [&](int tile_k0, int cooperative_tid, int cooperative_threads) {
-        const int physical_page = block_table[tile_k0 >> kPagedKVPageShift];
+    // `present` is the tile's page presence. An absent page is addressed as page 0 (kept in
+    // bounds) and its loads are skipped, which zeroes the staging; the score mask then drops it.
+    auto issue_kv_scales       = [&](int tile_k0, int cooperative_tid, int cooperative_threads,
+                               bool present) {
+        const int physical_page = paged_kv_page_for_address(block_table, tile_k0);
         const int page_offset0  = tile_k0 & (kPagedKVPageSize - 1);
         for (int key_l = cooperative_tid; key_l < Bc; key_l += cooperative_threads) {
             const int key = tile_k0 + key_l;
-            if (key <= max_query_abs) {
+            if (present && key <= max_query_abs) {
                 const std::int64_t off = kv_cache_fp8_scale_index<Geometry>(physical_page, kv_head,
                                                                                   page_offset0 + key_l);
                 k_scale_s[key_l]       = cache_k_scale[off];
@@ -137,8 +140,9 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
         }
     };
 
-    auto issue_kv_codes = [&](int tile_k0, int cooperative_tid, int cooperative_threads) {
-        const int physical_page = block_table[tile_k0 >> kPagedKVPageShift];
+    auto issue_kv_codes = [&](int tile_k0, int cooperative_tid, int cooperative_threads,
+                              bool present) {
+        const int physical_page = paged_kv_page_for_address(block_table, tile_k0);
         const int page_offset0  = tile_k0 & (kPagedKVPageSize - 1);
 #pragma unroll 1
         for (int chunk = cooperative_tid; chunk < Bc * (D / 16); chunk += cooperative_threads) {
@@ -147,7 +151,7 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
             const int d      = dc * 16;
             const int key    = tile_k0 + key_l;
             std::uint8_t* kd = &k_fp8[(key_l * DB16 + causal_swizzle(key_l, dc * 8)) * 2];
-            if (key <= max_query_abs) {
+            if (present && key <= max_query_abs) {
                 const std::int64_t off = kv_cache_fp8_code_index<Geometry>(physical_page, kv_head,
                                                                            d, page_offset0 + key_l);
                 cp_async<16, Cache::cg>(kd, &cache_k[off]);
@@ -166,7 +170,7 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
                 const int row = chunk / (Values::kCodeBytes / 16);
                 const int col = (chunk % (Values::kCodeBytes / 16)) * 16;
                 auto* dst     = v_codes + row * Values::kCodeBytes + col;
-                if (tile_k0 + row <= max_query_abs) {
+                if (present && tile_k0 + row <= max_query_abs) {
                     const auto off = paged_kv_element_offset<Values::kCodeBytes, Geometry::KVHeads>(
                         physical_page, kv_head, page_offset0 + row, col);
                     cp_async<16, Cache::cg>(dst, cache_v + off);
@@ -178,12 +182,17 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
         ninfer::ops::cp_commit();
     };
 
-    auto issue_kv_tile = [&](int tile_k0, int cooperative_tid, int cooperative_threads) {
-        issue_kv_scales(tile_k0, cooperative_tid, cooperative_threads);
-        issue_kv_codes(tile_k0, cooperative_tid, cooperative_threads);
+    auto issue_kv_tile = [&](int tile_k0, int cooperative_tid, int cooperative_threads,
+                             bool present) {
+        issue_kv_scales(tile_k0, cooperative_tid, cooperative_threads, present);
+        issue_kv_codes(tile_k0, cooperative_tid, cooperative_threads, present);
     };
 
-    if (key_blocks > 0) issue_kv_tile(first_owned_tile * Bc, tid, Schedule::kThreads);
+    bool tile_present = true;
+    if (key_blocks > 0) {
+        tile_present = paged_kv_page_present(block_table, first_owned_tile * Bc);
+        issue_kv_tile(first_owned_tile * Bc, tid, Schedule::kThreads, tile_present);
+    }
     ninfer::ops::cp_wait<0>();
     __syncthreads();
 
@@ -200,6 +209,9 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
     };
     const auto step = [&]<bool FullTile>(int kb) {
         const int k0 = (first_owned_tile + kb) * Bc;
+        // The prefetch below advances tile_present to tile kb+1 before the score mask runs, so the
+        // current tile's presence has to be captured here.
+        const bool current_tile_present = tile_present;
         // Conversion runs while all query warps retain their row state in registers.
 #pragma unroll 1
         for (int chunk = tid; chunk < Bc * (D / 8); chunk += Schedule::kThreads) {
@@ -267,7 +279,10 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
         }
         // QK is finished with the codes; V has been decoded into its own arena.
         __syncthreads();
-        if (kb + 1 < key_blocks) issue_kv_tile(k0 + Bc, tid, Schedule::kThreads);
+        if (kb + 1 < key_blocks) {
+            tile_present = paged_kv_page_present(block_table, k0 + Bc);
+            issue_kv_tile(k0 + Bc, tid, Schedule::kThreads, tile_present);
+        }
         const int row0  = warp_row0 + gid;
         const int row1  = warp_row0 + gid + 8;
         const int qrow0 = q0 + row0;
@@ -288,10 +303,18 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
             for (int nt = 0; nt < QKNt; ++nt) {
                 const int key0 = k0 + nt * 8 + 2 * lid;
                 const int key1 = key0 + 1;
-                score[nt][0]   = (qrow0 < tokens && key0 <= qabs0) ? score[nt][0] : -CUDART_INF_F;
-                score[nt][1]   = (qrow0 < tokens && key1 <= qabs0) ? score[nt][1] : -CUDART_INF_F;
-                score[nt][2]   = (qrow1 < tokens && key0 <= qabs1) ? score[nt][2] : -CUDART_INF_F;
-                score[nt][3]   = (qrow1 < tokens && key1 <= qabs1) ? score[nt][3] : -CUDART_INF_F;
+                score[nt][0] = (current_tile_present && qrow0 < tokens && key0 <= qabs0)
+                                   ? score[nt][0]
+                                   : -CUDART_INF_F;
+                score[nt][1] = (current_tile_present && qrow0 < tokens && key1 <= qabs0)
+                                   ? score[nt][1]
+                                   : -CUDART_INF_F;
+                score[nt][2] = (current_tile_present && qrow1 < tokens && key0 <= qabs1)
+                                   ? score[nt][2]
+                                   : -CUDART_INF_F;
+                score[nt][3] = (current_tile_present && qrow1 < tokens && key1 <= qabs1)
+                                   ? score[nt][3]
+                                   : -CUDART_INF_F;
                 bm0            = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
                 bm1            = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
             }
@@ -401,9 +424,16 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
         if (kb + 1 < key_blocks) ninfer::ops::cp_wait<0>();
         __syncthreads();
     };
-    const int full_blocks =
+    int full_blocks =
         q0 + Br <= tokens ? min(key_blocks, max(0, (base_pos + q0 + 1) / Bc - first_owned_tile))
                           : 0;
+    // The unmasked score path may only cover present pages; stop it at the first absent one.
+    for (int kb = 0; kb < full_blocks; ++kb) {
+        if (!paged_kv_page_present(block_table, (first_owned_tile + kb) * Bc)) {
+            full_blocks = kb;
+            break;
+        }
+    }
     for (int kb = 0; kb < full_blocks; ++kb) step.template operator()<true>(kb);
     for (int kb = full_blocks; kb < key_blocks; ++kb) step.template operator()<false>(kb);
     l0             = warp_sum<4>(l0, FullMask);
