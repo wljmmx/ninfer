@@ -1199,10 +1199,23 @@ void run_grouped(const Tensor& x, const Weight& w0, const Weight& w1, Tensor* co
 
 } // namespace
 
+// W4A8 is the engine default for the Q4/Q5 matmuls it covers. Set NINFER_W4A8
+// to 0 / off / false / no (any case) to fall back to the bf16 and q4/q5 kernels;
+// that is the rollback and A/B comparison switch.
 bool w4a8_enabled() {
     static const bool on = [] {
         const char* v = std::getenv("NINFER_W4A8");
-        return v != nullptr && v[0] != '\0';
+        if (v == nullptr || v[0] == '\0') return true;
+        auto eq_ci = [&](const char* lit) {
+            int i = 0;
+            for (; v[i] != '\0' && lit[i] != '\0'; ++i) {
+                char a = v[i];
+                if (a >= 'A' && a <= 'Z') a = static_cast<char>(a - 'A' + 'a');
+                if (a != lit[i]) return false;
+            }
+            return v[i] == '\0' && lit[i] == '\0';
+        };
+        return !(eq_ci("0") || eq_ci("off") || eq_ci("false") || eq_ci("no"));
     }();
     return on;
 }
