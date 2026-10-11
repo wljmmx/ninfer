@@ -28,7 +28,10 @@ std::string prefill_signature(const Model& model) {
     }
     if (t.rope_parameters) {
         const auto& r = *t.rope_parameters;
-        facts["rope"] = {r.rope_theta, r.rotary_dim, r.pair_axes};
+        // The scaling parameters change the prefill arithmetic, so they belong in the signature:
+        // a cost preset measured without them must not match a scaled run.
+        facts["rope"] = {r.rope_theta, r.rotary_dim, r.pair_axes, r.yarn, r.yarn_factor,
+                         r.yarn_original_max_position_embeddings, r.yarn_attention_factor};
     }
     if (t.gdn) {
         const auto& g = *t.gdn;

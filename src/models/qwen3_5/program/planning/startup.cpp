@@ -752,8 +752,12 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         options.max_context > parameters.model.config().draft->max_position_embeddings) {
         throw std::invalid_argument("max_context exceeds the selected draft position capacity");
     }
-    if (options.max_context == 0 ||
-        options.max_context > parameters.model.config().text.max_position_embeddings) {
+    const std::uint64_t position_capacity =
+        parameters.model.config().text.rope_parameters
+            ? parameters.model.config().text.rope_parameters->scaled_position_capacity(
+                  parameters.model.config().text.max_position_embeddings)
+            : parameters.model.config().text.max_position_embeddings;
+    if (options.max_context == 0 || options.max_context > position_capacity) {
         throw std::invalid_argument("max_context exceeds the configured position capacity");
     }
     if (options.prefill_chunk == 0 || options.prefill_chunk % kPrefillChunkAlignment != 0) {

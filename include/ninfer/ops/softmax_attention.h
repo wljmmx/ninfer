@@ -14,7 +14,9 @@
 
 namespace ninfer::ops {
 
-inline constexpr std::uint32_t kCausalAttentionMaximumVisibleKeys = 262144;
+// Position capacity of the built model family. YaRN scaling extends the trained 262144 by its
+// factor; the guard below tracks the extended capacity, not the trained one.
+inline constexpr std::uint32_t kCausalAttentionMaximumVisibleKeys = 1048576;
 
 struct CausalAttentionExecutionEnvelope {
     std::uint32_t min_visible_keys = 0;

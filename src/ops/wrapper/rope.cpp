@@ -59,6 +59,16 @@ void require_tensor_layout(const Tensor& tensor, const char* label, std::int32_t
     }
 }
 
+void require_scaling(const RopeScaling& scaling, int rotary_dim) {
+    if (!scaling.yarn) { return; }
+    if (!(scaling.attention_factor > 0.0f) || !std::isfinite(scaling.attention_factor)) {
+        throw std::invalid_argument("rope: attention factor must be positive and finite");
+    }
+    if (rotary_dim / 2 > kRopeMaximumPairs) {
+        throw std::invalid_argument("rope: scaled rotary width exceeds the frequency table");
+    }
+}
+
 void require_common(const Tensor& positions, int rotary_dim, float theta,
                     DeviceExecutionView execution) {
     if (execution.multiprocessor_count <= 0) {
@@ -103,8 +113,9 @@ void require_model_mode(int axes, int rotary_dim, std::int32_t head_dim) {
 } // namespace
 
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
-          DeviceExecutionView execution) {
+          DeviceExecutionView execution, const RopeScaling& scaling) {
     require_common(positions, rotary_dim, theta, execution);
+    require_scaling(scaling, rotary_dim);
     if (q.dtype != DType::BF16 || k.dtype != DType::BF16) {
         throw std::invalid_argument("rope: q/k must be BF16");
     }
@@ -124,12 +135,13 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tenso
     if (q.data == nullptr || k.data == nullptr) {
         throw std::invalid_argument("rope: q/k data must be non-null");
     }
-    detail::rope_launch(positions, rotary_dim, theta, q, k, execution);
+    detail::rope_launch(positions, rotary_dim, theta, q, k, execution, scaling);
 }
 
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
-          DeviceExecutionView execution) {
+          DeviceExecutionView execution, const RopeScaling& scaling) {
     require_common(positions, rotary_dim, theta, execution);
+    require_scaling(scaling, rotary_dim);
     if (x.dtype != DType::BF16) { throw std::invalid_argument("rope: tensor must be BF16"); }
     (void)numel_allow_zero(positions, "positions");
     const std::int64_t x_numel  = numel_allow_zero(x, "tensor");
@@ -142,7 +154,7 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
     if (x_numel == 0) { return; }
     require_positions_storage(positions);
     if (x.data == nullptr) { throw std::invalid_argument("rope: tensor data must be non-null"); }
-    detail::rope_single_launch(positions, rotary_dim, theta, x, execution);
+    detail::rope_single_launch(positions, rotary_dim, theta, x, execution, scaling);
 }
 
 } // namespace ninfer::ops

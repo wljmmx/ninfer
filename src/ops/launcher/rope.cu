@@ -32,17 +32,18 @@ bool bf16x2_aligned(const Tensor& tensor) {
 
 template <RopeKernelMode Mode, int QHeads, int KHeads>
 void launch_fixed_block(const Tensor& positions, Tensor* q, Tensor* k, int block,
-                        cudaStream_t stream) {
+                        const RopeScaling& scaling, cudaStream_t stream) {
     const int tokens = positions.ne[0];
     rope_fixed_kernel<Mode, QHeads, KHeads><<<tokens, block, 0, stream>>>(
         static_cast<const std::int32_t*>(positions.data),
         q == nullptr ? nullptr : static_cast<__nv_bfloat16*>(q->data),
         k == nullptr ? nullptr : static_cast<__nv_bfloat16*>(k->data), tokens, token_stride(q),
-        token_stride(k));
+        token_stride(k), scaling);
 }
 
 template <RopeKernelMode Mode, int QHeads, int KHeads>
-void launch_fixed(const Tensor& positions, Tensor* q, Tensor* k, DeviceExecutionView execution) {
+void launch_fixed(const Tensor& positions, Tensor* q, Tensor* k, const RopeScaling& scaling,
+                  DeviceExecutionView execution) {
     const int tokens = positions.ne[0];
     int block        = kSmallBlock;
     if constexpr (kTextMode<Mode>) {
@@ -58,11 +59,12 @@ void launch_fixed(const Tensor& positions, Tensor* q, Tensor* k, DeviceExecution
         if (block > head_warps) { block = head_warps; }
         if (block > 1024) { block = 1024; }
     }
-    launch_fixed_block<Mode, QHeads, KHeads>(positions, q, k, block, execution.stream);
+    launch_fixed_block<Mode, QHeads, KHeads>(positions, q, k, block, scaling, execution.stream);
 }
 
 template <int HeadsPerBlock, int QHeads, int KHeads>
-void launch_dflash_split(const Tensor& positions, Tensor* q, Tensor* k, cudaStream_t stream) {
+void launch_dflash_split(const Tensor& positions, Tensor* q, Tensor* k, const RopeScaling& scaling,
+                         cudaStream_t stream) {
     constexpr int kGroups = (QHeads + KHeads + HeadsPerBlock - 1) / HeadsPerBlock;
     constexpr int kBlock  = HeadsPerBlock <= 2 ? 64 : HeadsPerBlock * 32;
     const int tokens      = positions.ne[0];
@@ -71,11 +73,11 @@ void launch_dflash_split(const Tensor& positions, Tensor* q, Tensor* k, cudaStre
             static_cast<const std::int32_t*>(positions.data),
             q == nullptr ? nullptr : static_cast<__nv_bfloat16*>(q->data),
             k == nullptr ? nullptr : static_cast<__nv_bfloat16*>(k->data), tokens, token_stride(q),
-            token_stride(k));
+            token_stride(k), scaling);
 }
 
 bool launch_fixed_pair(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
-                       DeviceExecutionView execution) {
+                       const RopeScaling& scaling, DeviceExecutionView execution) {
     const auto stream = execution.stream;
     if (!bf16x2_aligned(q) || !bf16x2_aligned(k)) { return false; }
     const int axes = positions.ne[1];
@@ -83,94 +85,98 @@ bool launch_fixed_pair(const Tensor& positions, int rotary_dim, float theta, Ten
         k.ne[1] == 8) {
         const int tokens = positions.ne[0];
         if (tokens <= 16) {
-            launch_dflash_split<5, 32, 8>(positions, &q, &k, stream);
+            launch_dflash_split<5, 32, 8>(positions, &q, &k, scaling, stream);
         } else if (tokens <= 400) {
-            launch_dflash_split<8, 32, 8>(positions, &q, &k, stream);
+            launch_dflash_split<8, 32, 8>(positions, &q, &k, scaling, stream);
         } else {
-            launch_fixed_block<RopeKernelMode::DflashText1D, 32, 8>(positions, &q, &k, 160, stream);
+            launch_fixed_block<RopeKernelMode::DflashText1D, 32, 8>(positions, &q, &k, 160,
+                                                                    scaling, stream);
         }
         return true;
     }
     if (rotary_dim == 64 && theta == 1.0e7F) {
         if (q.ne[1] == 24 && k.ne[1] == 4) {
             if (axes == 1) {
-                launch_fixed<RopeKernelMode::Text1D, 24, 4>(positions, &q, &k, execution);
+                launch_fixed<RopeKernelMode::Text1D, 24, 4>(positions, &q, &k, scaling, execution);
                 return true;
             }
             if (axes == 3) {
-                launch_fixed<RopeKernelMode::TextMrope, 24, 4>(positions, &q, &k, execution);
+                launch_fixed<RopeKernelMode::TextMrope, 24, 4>(positions, &q, &k, scaling,
+                                                               execution);
                 return true;
             }
         }
         if (q.ne[1] == 16 && k.ne[1] == 2) {
             if (axes == 1) {
-                launch_fixed<RopeKernelMode::Text1D, 16, 2>(positions, &q, &k, execution);
+                launch_fixed<RopeKernelMode::Text1D, 16, 2>(positions, &q, &k, scaling, execution);
                 return true;
             }
             if (axes == 3) {
-                launch_fixed<RopeKernelMode::TextMrope, 16, 2>(positions, &q, &k, execution);
+                launch_fixed<RopeKernelMode::TextMrope, 16, 2>(positions, &q, &k, scaling,
+                                                               execution);
                 return true;
             }
         }
     }
     if (axes == 2 && rotary_dim == 72 && theta == 10'000.0F && q.ne[1] == 16 && k.ne[1] == 16) {
-        launch_fixed<RopeKernelMode::Vision2D, 16, 16>(positions, &q, &k, execution);
+        launch_fixed<RopeKernelMode::Vision2D, 16, 16>(positions, &q, &k, scaling, execution);
         return true;
     }
     return false;
 }
 
 template <RopeKernelMode Mode, int Heads>
-void launch_fixed_single(const Tensor& positions, Tensor& x, DeviceExecutionView execution) {
-    launch_fixed<Mode, Heads, 0>(positions, &x, nullptr, execution);
+void launch_fixed_single(const Tensor& positions, Tensor& x, const RopeScaling& scaling,
+                         DeviceExecutionView execution) {
+    launch_fixed<Mode, Heads, 0>(positions, &x, nullptr, scaling, execution);
 }
 
 template <int Heads>
-bool launch_text_single(const Tensor& positions, int axes, Tensor& x,
+bool launch_text_single(const Tensor& positions, int axes, Tensor& x, const RopeScaling& scaling,
                         DeviceExecutionView execution) {
     if (x.ne[1] != Heads) { return false; }
     if (axes == 1) {
-        launch_fixed_single<RopeKernelMode::Text1D, Heads>(positions, x, execution);
+        launch_fixed_single<RopeKernelMode::Text1D, Heads>(positions, x, scaling, execution);
         return true;
     }
     if (axes == 3) {
-        launch_fixed_single<RopeKernelMode::TextMrope, Heads>(positions, x, execution);
+        launch_fixed_single<RopeKernelMode::TextMrope, Heads>(positions, x, scaling, execution);
         return true;
     }
     return false;
 }
 
 bool launch_fixed_single_dispatch(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
-                                  DeviceExecutionView execution) {
+                                  const RopeScaling& scaling, DeviceExecutionView execution) {
     if (!bf16x2_aligned(x)) { return false; }
     const int axes = positions.ne[1];
     if (axes == 1 && x.ne[0] == 128 && rotary_dim == 128 && theta == 1.0e7F) {
         if (x.ne[1] == 32) {
-            launch_fixed_single<RopeKernelMode::DflashText1D, 32>(positions, x, execution);
+            launch_fixed_single<RopeKernelMode::DflashText1D, 32>(positions, x, scaling, execution);
             return true;
         }
         if (x.ne[1] == 8) {
-            launch_fixed_single<RopeKernelMode::DflashText1D, 8>(positions, x, execution);
+            launch_fixed_single<RopeKernelMode::DflashText1D, 8>(positions, x, scaling, execution);
             return true;
         }
     }
     if (rotary_dim == 64 && theta == 1.0e7F) {
-        if (launch_text_single<24>(positions, axes, x, execution) ||
-            launch_text_single<4>(positions, axes, x, execution) ||
-            launch_text_single<16>(positions, axes, x, execution) ||
-            launch_text_single<2>(positions, axes, x, execution)) {
+        if (launch_text_single<24>(positions, axes, x, scaling, execution) ||
+            launch_text_single<4>(positions, axes, x, scaling, execution) ||
+            launch_text_single<16>(positions, axes, x, scaling, execution) ||
+            launch_text_single<2>(positions, axes, x, scaling, execution)) {
             return true;
         }
     }
     if (axes == 2 && rotary_dim == 72 && theta == 10'000.0F && x.ne[1] == 16) {
-        launch_fixed_single<RopeKernelMode::Vision2D, 16>(positions, x, execution);
+        launch_fixed_single<RopeKernelMode::Vision2D, 16>(positions, x, scaling, execution);
         return true;
     }
     return false;
 }
 
 void launch_generic(const Tensor& positions, int rotary_dim, float theta, Tensor* q, Tensor* k,
-                    cudaStream_t stream) {
+                    const RopeScaling& scaling, cudaStream_t stream) {
     constexpr int block = 128;
     Tensor& sample      = q != nullptr ? *q : *k;
     const int tokens    = sample.ne[2];
@@ -179,23 +185,23 @@ void launch_generic(const Tensor& positions, int rotary_dim, float theta, Tensor
         q == nullptr ? nullptr : static_cast<__nv_bfloat16*>(q->data),
         k == nullptr ? nullptr : static_cast<__nv_bfloat16*>(k->data), sample.ne[0], rotary_dim,
         theta, q == nullptr ? 0 : q->ne[1], k == nullptr ? 0 : k->ne[1], tokens, token_stride(q),
-        token_stride(k));
+        token_stride(k), scaling);
 }
 
 } // namespace
 
 void rope_launch(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
-                 DeviceExecutionView execution) {
-    if (!launch_fixed_pair(positions, rotary_dim, theta, q, k, execution)) {
-        launch_generic(positions, rotary_dim, theta, &q, &k, execution.stream);
+                 DeviceExecutionView execution, const RopeScaling& scaling) {
+    if (!launch_fixed_pair(positions, rotary_dim, theta, q, k, scaling, execution)) {
+        launch_generic(positions, rotary_dim, theta, &q, &k, scaling, execution.stream);
     }
     CUDA_CHECK(cudaGetLastError());
 }
 
 void rope_single_launch(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
-                        DeviceExecutionView execution) {
-    if (!launch_fixed_single_dispatch(positions, rotary_dim, theta, x, execution)) {
-        launch_generic(positions, rotary_dim, theta, &x, nullptr, execution.stream);
+                        DeviceExecutionView execution, const RopeScaling& scaling) {
+    if (!launch_fixed_single_dispatch(positions, rotary_dim, theta, x, scaling, execution)) {
+        launch_generic(positions, rotary_dim, theta, &x, nullptr, scaling, execution.stream);
     }
     CUDA_CHECK(cudaGetLastError());
 }

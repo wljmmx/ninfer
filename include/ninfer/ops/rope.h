@@ -3,7 +3,40 @@
 #include "core/device.h"
 #include "core/tensor.h"
 
+#include <array>
+
 namespace ninfer::ops {
+
+// The scaled frequencies are evaluated in FP32 at the angle, so long-context accuracy degrades
+// gradually rather than at a capacity boundary.
+inline constexpr int kRopeMaximumPairs = 128;
+
+/**
+ * Optional frequency scaling. The default (yarn=false) reproduces the unscaled
+ * theta^(-2*i/rotary_dim) frequencies exactly, so existing callers are unaffected.
+ *
+ * YaRN (Peng et al., "YaRN: Efficient Context Window Extension of Large Language Models")
+ * replaces the per-pair inverse frequency with a ramp blend of the extrapolated frequency and
+ * the 1/factor interpolated one, and rescales the rotary sine/cosine by an attention factor.
+ * The ramp window is derived from the original trained position capacity:
+ *
+ *   correction(n) = rotary_dim * ln(original_max_position_embeddings / (n * 2 * pi))
+ *                            / (2 * ln(theta))
+ *   low  = floor(correction(beta_fast)),  high = ceil(correction(beta_slow))
+ *   ramp(i) = clamp((i - low) / (high - low), 0, 1)
+ *   inv_frequency[i] = (extrapolated * (1 - ramp(i))) + (extrapolated / factor) * ramp(i)
+ *
+ * Pairs at or below low keep the trained extrapolation; pairs at or above high are fully
+ * interpolated; the window between them is linear. inv_frequency is only read when yarn is set
+ * and must hold rotary_dim/2 entries. attention_factor multiplies both sine and cosine.
+ */
+struct RopeScaling {
+    // A plain array rather than std::array: this struct is passed by value into device code, and
+    // std::array::operator[] is not a device function without --expt-relaxed-constexpr.
+    bool yarn              = false;
+    float attention_factor = 1.0f;
+    float inv_frequency[kRopeMaximumPairs] = {};
+};
 
 /**
  * Applies split-half NeoX RoPE in place. For pair i in [0,rotary_dim/2), angle phi(i,t), and
@@ -32,13 +65,15 @@ namespace ninfer::ops {
  * dimensions remain bit-exact. Private kernel arithmetic is implementation-defined. The Op uses no
  * workspace or persistent state. `execution` supplies the stream and the selected device's
  * positive physical SM count; the count selects launch geometry, not the transformation.
+ * scaling replaces the per-pair inverse frequency and the sine/cosine amplitude; the default is
+ * the identity scaling.
  */
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
-          DeviceExecutionView execution);
+          DeviceExecutionView execution, const RopeScaling& scaling = RopeScaling{});
 
 // Single-tensor form with the same formula and storage contract. The head count comes directly
 // from x; Q versus K role does not change the transformation.
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
-          DeviceExecutionView execution);
+          DeviceExecutionView execution, const RopeScaling& scaling = RopeScaling{});
 
 } // namespace ninfer::ops
