@@ -15,27 +15,33 @@
 // local memory and dominate the scan; with K known the arrays stay in registers.
 //
 // Algorithm: single-pass per-thread bounded insertion (each thread keeps its local
-// top-K in registers), then a shared-memory merge selects the block top-K. Each thread
-// still visits the identical index sequence (tid, tid+Block, tid+2*Block, ...), so the
-// result is bit-identical to the previous runtime-K implementation.
+// top-K in registers through a constant-index bubble insert), then a shared-memory
+// merge selects the block top-K. Each thread visits its own indices in strictly
+// increasing order, the insert compares values exactly and breaks ties by lower index,
+// and the merge is order-independent, so the selected set, its order and argmax do not
+// depend on how the scan is tiled: the scalar and vector scans agree bit-for-bit.
+// The vector scan reads kLogitsTopkVec bf16 lanes per 16-byte load and needs a 16-byte
+// aligned column base; otherwise every column uses the scalar strided scan.
 //
 // Output layout: column-major with caller-supplied column_stride.
 // Pass column_stride=0 for the natural contiguous stride (top_k).
 // id_map is a DEVICE pointer to V int32 values, or null for identity.
 
 #include <cuda_bf16.h>
+#include <cuda_runtime.h>
 #include <cstdint>
 #include <climits>
 #include <math_constants.h>
 
 namespace ninfer::ops {
 
-inline constexpr int kLogitsTopkBlock = 256;
+inline constexpr int kLogitsTopkBlock = 512;
 inline constexpr int kLogitsTopkMax   = 32;
 
-// Number of independent column loads issued back-to-back before the dependent
-// expf/insert work, so the scan does not serialise on one load latency at a time.
-inline constexpr int kLogitsTopkScanBatch = 8;
+// Vector scan: kLogitsTopkVec bf16 lanes per 16-byte load, kLogitsTopkScanBatch loads
+// issued back-to-back per thread before the dependent expf/insert work.
+inline constexpr int kLogitsTopkVec       = 8;
+inline constexpr int kLogitsTopkScanBatch = 4;
 
 __device__ __forceinline__ bool topk_better(float value, std::int32_t index, float best_value,
                                             std::int32_t best_index) {
@@ -44,18 +50,24 @@ __device__ __forceinline__ bool topk_better(float value, std::int32_t index, flo
 
 // Insert (value, index) into a descending-sorted register array of size K.
 // Precondition: value > arr[K-1] (caller checks).
+//
+// Bubble form: every array access uses a compile-time constant index, so the arrays stay
+// in registers. A shift form has to index with a runtime position, which makes the arrays
+// dynamically indexed (local-memory backed) and dominates the kernel.
 template <int K>
 __device__ __forceinline__ void topk_insert(float* val, std::int32_t* idx, float value,
                                             std::int32_t index) {
-    int pos = K - 1;
-    for (int i = K - 2; i >= 0; --i) {
-        if (value <= val[i]) { break; }
-        val[i + 1] = val[i];
-        idx[i + 1] = idx[i];
-        pos        = i;
+#pragma unroll
+    for (int i = 0; i < K; ++i) {
+        if (value > val[i]) {
+            const float displaced = val[i];
+            const std::int32_t at = idx[i];
+            val[i]                = value;
+            idx[i]                = index;
+            value                 = displaced;
+            index                 = at;
+        }
     }
-    val[pos] = value;
-    idx[pos] = index;
 }
 
 template <int K>
@@ -84,28 +96,61 @@ __launch_bounds__(kLogitsTopkBlock) __global__ void logits_topk_softmax_kernel(
         lidx[i] = INT32_MAX;
     }
 
-    std::int32_t v = tid;
-    for (; v + (kLogitsTopkScanBatch - 1) * kLogitsTopkBlock < valid_rows;
-         v += kLogitsTopkScanBatch * kLogitsTopkBlock) {
-        float w[kLogitsTopkScanBatch];
+    // vec_end stays 0 when the vector scan does not apply, so the scalar loop below then
+    // covers the whole column exactly as before.
+    std::int32_t vec_end            = 0;
+    constexpr std::int32_t kVec     = kLogitsTopkVec;
+    constexpr std::int32_t kVecStep = kLogitsTopkBlock * kVec;
+    if (((base & static_cast<std::int64_t>(kVec - 1)) == 0) && valid_rows >= kVecStep) {
+        vec_end = valid_rows & ~(kVec - 1);
+        std::int32_t v = tid * kVec;
+        for (; v + (kLogitsTopkScanBatch - 1) * kVecStep + kVec <= vec_end;
+             v += kLogitsTopkScanBatch * kVecStep) {
+            uint4 w[kLogitsTopkScanBatch];
 #pragma unroll
-        for (int j = 0; j < kLogitsTopkScanBatch; ++j) {
-            w[j] = __bfloat162float(col[v + j * kLogitsTopkBlock]);
+            for (int j = 0; j < kLogitsTopkScanBatch; ++j) {
+                w[j] = *reinterpret_cast<const uint4*>(col + v + j * kVecStep);
+            }
+#pragma unroll
+            for (int j = 0; j < kLogitsTopkScanBatch; ++j) {
+                const __nv_bfloat162* pair = reinterpret_cast<const __nv_bfloat162*>(&w[j]);
+                const std::int32_t at      = v + j * kVecStep;
+#pragma unroll
+                for (int e = 0; e < kVec / 2; ++e) {
+                    const float2 f = __bfloat1622float2(pair[e]);
+                    sum_exp += __expf(f.x);
+                    if (f.x > lval[K - 1]) {
+                        topk_insert<K>(lval, lidx, f.x, at + 2 * e);
+                    }
+                    sum_exp += __expf(f.y);
+                    if (f.y > lval[K - 1]) {
+                        topk_insert<K>(lval, lidx, f.y, at + 2 * e + 1);
+                    }
+                }
+            }
         }
+        for (; v + kVec <= vec_end; v += kVecStep) {
+            const uint4 w              = *reinterpret_cast<const uint4*>(col + v);
+            const __nv_bfloat162* pair = reinterpret_cast<const __nv_bfloat162*>(&w);
 #pragma unroll
-        for (int j = 0; j < kLogitsTopkScanBatch; ++j) {
-            const float val = w[j];
-            sum_exp += __expf(val);
-            if (val > lval[K - 1]) {
-                topk_insert<K>(lval, lidx, val, v + j * kLogitsTopkBlock);
+            for (int e = 0; e < kVec / 2; ++e) {
+                const float2 f = __bfloat1622float2(pair[e]);
+                sum_exp += __expf(f.x);
+                if (f.x > lval[K - 1]) {
+                    topk_insert<K>(lval, lidx, f.x, v + 2 * e);
+                }
+                sum_exp += __expf(f.y);
+                if (f.y > lval[K - 1]) {
+                    topk_insert<K>(lval, lidx, f.y, v + 2 * e + 1);
+                }
             }
         }
     }
-    for (; v < valid_rows; v += kLogitsTopkBlock) {
-        const float val = __bfloat162float(col[v]);
+    for (std::int32_t u = vec_end + tid; u < valid_rows; u += kLogitsTopkBlock) {
+        const float val = __bfloat162float(col[u]);
         sum_exp += __expf(val);
         if (val > lval[K - 1]) {
-            topk_insert<K>(lval, lidx, val, v);
+            topk_insert<K>(lval, lidx, val, u);
         }
     }
 
