@@ -1137,6 +1137,17 @@ struct LoadSummary {
     std::size_t device_object_count    = 0;
     std::size_t host_object_count      = 0;
     ContextCostSummary context_cost;
+    // Resolved KV page capacity (see runtime/engine/kv_capacity.cpp): how many 64-token pages the
+    // pool got, how many the curve would allow, and how much device memory is left. Without these
+    // an operator cannot tell how many KV pages were allocated or how much slack remains.
+    std::uint32_t kv_main_page_groups                = 0;
+    std::uint32_t kv_max_main_page_groups            = 0;
+    std::uint32_t kv_resolved_tokens                 = 0;
+    std::uint64_t kv_runtime_reservation_bytes       = 0;
+    std::uint64_t kv_planned_slack_bytes             = 0;
+    std::uint64_t kv_available_after_weights_bytes   = 0;
+    std::uint64_t kv_available_after_startup_bytes   = 0;
+    std::uint64_t kv_bytes_per_additional_page_group = 0;
 };
 
 } // namespace ninfer

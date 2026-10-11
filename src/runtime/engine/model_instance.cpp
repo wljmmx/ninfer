@@ -185,6 +185,15 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     summary.device_object_count  = stats.device_object_count;
     summary.host_object_count    = stats.host_object_count;
     summary.context_cost         = std::move(context_cost.summary);
+    summary.kv_main_page_groups                = resolution.main_page_groups;
+    summary.kv_max_main_page_groups            = resolution.maximum_main_page_groups;
+    summary.kv_resolved_tokens                 = resolution.resolved_tokens;
+    summary.kv_runtime_reservation_bytes       = resolution.runtime_reservation_bytes;
+    summary.kv_planned_slack_bytes             = resolution.planned_slack_bytes;
+    summary.kv_available_after_weights_bytes   = resolution.available_after_weights_bytes;
+    summary.kv_available_after_startup_bytes =
+        instance->kv_capacity_resolution.available_after_startup_bytes;
+    summary.kv_bytes_per_additional_page_group = resolution.bytes_per_additional_main_page_group;
     return {std::move(instance), std::move(summary), std::move(context_cost.model)};
 }
 

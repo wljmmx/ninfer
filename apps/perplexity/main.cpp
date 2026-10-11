@@ -251,6 +251,11 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     ninfer::Engine engine(std::move(engine_options));
     const ninfer::LoadSummary load = engine.load_summary();
     startup_log.engine_ready(load);
+    logger->info("kv capacity | pages {} of {} max | tokens {} | reservation {} B | slack after "
+                 "startup {} B | bytes per extra page {}",
+                 load.kv_main_page_groups, load.kv_max_main_page_groups, load.kv_resolved_tokens,
+                 load.kv_runtime_reservation_bytes, load.kv_available_after_startup_bytes,
+                 load.kv_bytes_per_additional_page_group);
 
     const Clock::time_point preflight_started = Clock::now();
     logger->info("preparing corpus");
@@ -435,6 +440,16 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"prefill_chunk_tokens", 1024},
           {"score_tile_tokens", 1024},
           {"kv_dtype", kv_name(options.kv)}}},
+        {"kv_capacity",
+         {{"page_tokens", 64},
+          {"main_page_groups", load.kv_main_page_groups},
+          {"maximum_main_page_groups", load.kv_max_main_page_groups},
+          {"resolved_tokens", load.kv_resolved_tokens},
+          {"runtime_reservation_bytes", load.kv_runtime_reservation_bytes},
+          {"planned_slack_bytes", load.kv_planned_slack_bytes},
+          {"available_after_weights_bytes", load.kv_available_after_weights_bytes},
+          {"available_after_startup_bytes", load.kv_available_after_startup_bytes},
+          {"bytes_per_additional_page_group", load.kv_bytes_per_additional_page_group}}},
         {"timing",
          {{"load_seconds", load.load_seconds},
           {"read_and_tokenize_seconds", preflight_seconds},
