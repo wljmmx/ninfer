@@ -473,6 +473,32 @@ constexpr int kSGStages  = 4;
 constexpr int kSGPM      = kSGBM / 2;        // 32 parents per block
 
 // q4 (int4 nibble + per-64-group fp16 scale) -> int8, written in folded row order.
+// The swiglu fold needs, for one 64-K group, the scales of a whole 64-row parent tile.
+// In the stored [row][group] layout those reads are strided by kGroups*2; transposing to
+// [group][row] makes them contiguous. Tiled through shared memory so both the read and
+// the write stay coalesced.
+template <int kTile>
+__global__ void transpose_wsc_group_major(const __half* __restrict__ src,
+                                          __half* __restrict__ dst, int rows, int groups) {
+    __shared__ __half tile[kTile][kTile + 1];
+    const int g0 = blockIdx.x * kTile;
+    const int r0 = blockIdx.y * kTile;
+    const int tx = threadIdx.x, ty = threadIdx.y;
+#pragma unroll
+    for (int j = ty; j < kTile; j += 8) {
+        const int r = r0 + j;
+        const int g = g0 + tx;
+        if (r < rows && g < groups) { tile[j][tx] = src[(long)r * groups + g]; }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int j = ty; j < kTile; j += 8) {
+        const int g = g0 + j;
+        const int r = r0 + tx;
+        if (r < rows && g < groups) { dst[(long)g * rows + r] = tile[tx][j]; }
+    }
+}
+
 __global__ void dequant_q4_i8_folded(const std::uint8_t* __restrict__ codes,
                                      std::int8_t* __restrict__ out, int groups, int k,
                                      int parents) {
@@ -577,8 +603,11 @@ __global__ __launch_bounds__(kSGThreads, 2) void w4a8_swiglu_kernel(
             for (int mi = 0; mi < kSGMT; ++mi) {
                 const int base =
                     (mi >= kSGMT / 2 ? kSGPM : 0) + (half_tile + (mi % (kSGMT / 2))) * 16;
-                const float wg0 = __half2float(wsc[(long)grow(base + gid) * kGroups + g]);
-                const float wg1 = __half2float(wsc[(long)grow(base + gid + 8) * kGroups + g]);
+                // wsc is group-major (see transpose_wsc_group_major): one group's rows
+                // are contiguous, so a warp's sparsely-lane reads land in a couple of lines.
+                constexpr int kRows = 2 * kParents;
+                const float wg0 = __half2float(wsc[(long)g * kRows + grow(base + gid)]);
+                const float wg1 = __half2float(wsc[(long)g * kRows + grow(base + gid + 8)]);
 #pragma unroll
                 for (int nt = 0; nt < kSGNT; ++nt) {
                     const int tk = t0 + wn * 32 + nt * 8 + 2 * lid;
@@ -1023,6 +1052,8 @@ struct W4A8SgCache {
     std::int8_t* w_i8 = nullptr; // folded int8 gate/up weight
     long w_elems      = 0;
     const void* w_key = nullptr;
+    __half* wsc_gm    = nullptr; // group-major copy of the weight scales
+    long wsc_elems    = 0;
 };
 W4A8SgCache& sg_cache() {
     static W4A8SgCache c;
@@ -1057,16 +1088,29 @@ void run_swiglu(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stre
         sg.w_elems = w_elems;
         sg.w_key   = nullptr;
     }
+    constexpr int kGroupsN = kK / 64;
+    const long wsc_elems   = (long)(2 * kParents) * kGroupsN;
+    if (sg.wsc_elems < wsc_elems) {
+        if (sg.wsc_gm) cudaFree(sg.wsc_gm);
+        if (cudaMalloc(&sg.wsc_gm, (size_t)wsc_elems * sizeof(__half)) != cudaSuccess) {
+            sg.wsc_gm = nullptr; sg.wsc_elems = 0; sg.w_key = nullptr; return;
+        }
+        sg.wsc_elems = wsc_elems;
+        sg.w_key     = nullptr;
+    }
     if (sg.w_key != w.qdata) {
         const int groups = kK / 64;
         const dim3 dq((unsigned)((groups * 4 + 255) / 256), (unsigned)(2 * kParents));
         dequant_q4_i8_folded<<<dq, 256, 0, stream>>>(static_cast<const std::uint8_t*>(w.qdata),
                                                      sg.w_i8, groups, kK, kParents);
+        const dim3 tg((unsigned)((groups + 31) / 32), (unsigned)((2 * kParents + 31) / 32));
+        transpose_wsc_group_major<32><<<tg, dim3(32, 8), 0, stream>>>(
+            static_cast<const __half*>(w.scales), sg.wsc_gm, 2 * kParents, groups);
         sg.w_key = w.qdata;
     }
     const dim3 grid(tokens / kSGBN, (unsigned)(kParents / kSGPM));
     w4a8_swiglu_kernel<kParents, kK><<<grid, kSGThreads, 0, stream>>>(
-        sg.w_i8, c.a_i8, c.a_scale, static_cast<const __half*>(w.scales),
+        sg.w_i8, c.a_i8, c.a_scale, sg.wsc_gm,
         static_cast<__nv_bfloat16*>(out.data), tokens);
     CUDA_CHECK(cudaGetLastError());
 }
