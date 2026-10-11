@@ -399,7 +399,7 @@ public:
     // bit-identical.
     void apply_absent_window(KVExecutionRowHandle row, std::uint32_t live_pages,
                              std::uint32_t sink_pages, std::uint32_t window_pages,
-                             cudaStream_t stream);
+                             std::span<const std::uint32_t> keep_pages, cudaStream_t stream);
 
     [[nodiscard]] Tensor row(KVExecutionRowHandle handle) const;
 

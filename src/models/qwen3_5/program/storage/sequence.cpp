@@ -17,8 +17,13 @@ namespace {
 struct KvEvictionWindow {
     std::uint32_t sink_pages   = 0;
     std::uint32_t window_pages = 0;
+    // Explicit logical pages to keep as well: stands in for a query-aware keep set until a
+    // relevance scorer exists, so the mechanism and the keep budget can be measured first.
+    std::vector<std::uint32_t> keep_pages;
 
-    [[nodiscard]] bool enabled() const noexcept { return window_pages != 0; }
+    [[nodiscard]] bool enabled() const noexcept {
+        return window_pages != 0 || !keep_pages.empty();
+    }
 };
 
 const KvEvictionWindow& kv_eviction_window() {
@@ -29,6 +34,16 @@ const KvEvictionWindow& kv_eviction_window() {
         }
         if (const char* span = std::getenv("NINFER_KV_EVICT_WINDOW")) {
             result.window_pages = static_cast<std::uint32_t>(std::strtoul(span, nullptr, 10));
+        }
+        if (const char* list = std::getenv("NINFER_KV_EVICT_KEEP_PAGES")) {
+            const char* cursor = list;
+            while (*cursor != '\0') {
+                char* end = nullptr;
+                const unsigned long value = std::strtoul(cursor, &end, 10);
+                if (end == cursor) { break; }
+                result.keep_pages.push_back(static_cast<std::uint32_t>(value));
+                cursor = *end == ',' ? end + 1 : end;
+            }
         }
         return result;
     }();
@@ -216,7 +231,8 @@ void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, Paged
     if (frontier == 0) { return; }
     cache.execution_tables().apply_absent_window(addresses.execution_row(address).handle(),
                                                  kv_live_pages(frontier), window.sink_pages,
-                                                 window.window_pages, device.stream);
+                                                 window.window_pages, window.keep_pages,
+                                                 device.stream);
 }
 
 void ProgramImpl::commit_sequence_kv(SequenceState& state, std::uint32_t main,

@@ -945,7 +945,9 @@ void KVExecutionTablePool::publish_repeated(KVExecutionRowHandle row_handle,
 
 void KVExecutionTablePool::apply_absent_window(KVExecutionRowHandle row_handle,
                                                std::uint32_t live_pages, std::uint32_t sink_pages,
-                                               std::uint32_t window_pages, cudaStream_t stream) {
+                                               std::uint32_t window_pages,
+                                               std::span<const std::uint32_t> keep_pages,
+                                               cudaStream_t stream) {
     // The absent sentinel of the paged KV address contract (see ops/kernel/paged_kv_address.cuh):
     // a negative block-table entry marks a logical page whose keys must be masked out.
     constexpr std::int32_t kAbsentPage = -1;
@@ -955,14 +957,20 @@ void KVExecutionTablePool::apply_absent_window(KVExecutionRowHandle row_handle,
     if (live_pages > logical_page_capacity()) {
         throw std::invalid_argument("Paged KV eviction window exceeds the execution row");
     }
-    if (window_pages == 0 || live_pages == 0) { return; }
+    if ((window_pages == 0 && keep_pages.empty()) || live_pages == 0) { return; }
     const auto* published = static_cast<const std::int32_t*>(host_shadow_.data()) +
                             static_cast<std::size_t>(row_handle.row_) * logical_page_capacity();
     const std::uint32_t keep_begin = live_pages > window_pages ? live_pages - window_pages : 0;
     std::vector<std::int32_t> mapping(live_pages);
     for (std::uint32_t page = 0; page < live_pages; ++page) {
-        const bool keep = page < sink_pages || page >= keep_begin;
-        mapping[page]   = keep ? published[page] : kAbsentPage;
+        bool keep = page < sink_pages || page >= keep_begin;
+        for (const std::uint32_t wanted : keep_pages) {
+            if (wanted == page) {
+                keep = true;
+                break;
+            }
+        }
+        mapping[page] = keep ? published[page] : kAbsentPage;
     }
     auto* destination = static_cast<std::int32_t*>(row(row_handle).data);
     CUDA_CHECK(cudaMemcpyAsync(destination, mapping.data(), mapping.size() * sizeof(std::int32_t),
