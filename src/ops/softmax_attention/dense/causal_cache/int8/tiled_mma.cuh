@@ -276,9 +276,8 @@ rk4_apply_e8_residual(dec, static_cast<std::uint32_t>(signs >> 8));
     // [D5] E8Lattice read-back decode phase (mirror of grouped_mma.cuh): the raw
     // 4-byte code and 4-byte-aligned sign window are staged by issue_kv_tile(), and
     // the 16 int8 codes are built here after cp_wait<0>() retires the async copy.
-    auto decode_e8_tile = [&](int tile_k0) {
-#pragma unroll 1
-        for (int chunk = tid; chunk < Bc * (D / 16); chunk += Schedule::kThreads) {
+    auto decode_e8_chunk = [&](int tile_k0, int chunk) {
+        {
             const int key_l = chunk / (D / 16);
             const int dc    = chunk - key_l * (D / 16);
             const int d     = dc * 16;
@@ -303,6 +302,12 @@ rk4_apply_e8_residual(dec, static_cast<std::uint32_t>(signs >> 8));
                 }
                 *reinterpret_cast<uint64_t*>(kd + 8) = *reinterpret_cast<const uint64_t*>(dec);
             }
+        }
+    };
+    auto decode_e8_tile = [&](int tile_k0) {
+#pragma unroll 1
+        for (int chunk = tid; chunk < Bc * (D / 16); chunk += Schedule::kThreads) {
+            decode_e8_chunk(tile_k0, chunk);
         }
     };
 
@@ -529,6 +534,10 @@ rk4_apply_e8_residual(dec, static_cast<std::uint32_t>(signs >> 8));
         const bool has_next = kb + 1 < key_blocks;
         if (has_next) { issue_kv_tile((kb + 1) * Bc); }
 
+        // Retire the next tile's async copies before PV so the decode slices below can
+        // read them. The transfer had the whole QK phase to land.
+        if (has_next) { ninfer::ops::cp_wait<0>(); }
+
         const int row_tile = warp % Schedule::kRowTiles;
         const int d_slice  = warp / Schedule::kRowTiles;
         const int row_base = row_tile * 16;
@@ -560,11 +569,14 @@ rk4_apply_e8_residual(dec, static_cast<std::uint32_t>(signs >> 8));
                 mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2], pf[3],
                         vf[0], vf[1]);
             }
-        }
-        if (has_next) {
-            ninfer::ops::cp_wait<0>();
+            // One slice of the next tile's E8 decode rides along with this PV stage. The
+            // decode is latency-bound (unroll 1, no other work to fill it); issuing it
+            // between mma groups lets the tensor-core work cover its stalls.
             if constexpr (PackedK && E8Lattice && !kRkE8KAmplitudeOn) {
-                decode_e8_tile((kb + 1) * Bc);
+                if (has_next) {
+                    const int dchunk = tid + k * Schedule::kThreads;
+                    if (dchunk < Bc * (D / 16)) { decode_e8_chunk((kb + 1) * Bc, dchunk); }
+                }
             }
         }
         __syncthreads();
