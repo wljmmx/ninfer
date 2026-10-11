@@ -23,7 +23,11 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
     const std::int8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
     const __half* __restrict__ cache_v_scale, Metadata metadata,
     const std::int32_t* __restrict__ positions, float scale, __nv_bfloat16* __restrict__ out,
-    std::int32_t width) {
+    unsigned* __restrict__ page_score, std::int32_t width) {
+    // P6 2c hook site (appendix BL.2): per-page relevance counter. One CTA covers exactly one
+    // 64-token page here, so the CTA-wide hit reduction feeds page_score[k0 >> page_shift].
+    // Unused until the write hook lands in step 1.2.
+    (void)page_score;
     constexpr int D             = 256;
     constexpr int Br            = Schedule::kQueryRows;
     constexpr int Bc            = Schedule::kKeyRows;

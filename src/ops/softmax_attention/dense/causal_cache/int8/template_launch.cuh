@@ -57,9 +57,11 @@ void launch_int8_kv_tiled_mma(const CausalAttentionOperands& p, Int8KvReadView c
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, S::kSharedBytes);
         CUDA_CHECK(status);
         const dim3 grid(div_up(p.width, S::kQueryRows), G::QHeads);
+        // page_score is the P6 2c relevance counter; nullptr until the score hook is wired
+        // (appendix BL/BM step 1.1/1.2).
         kernel<<<grid, S::kThreads, S::kSharedBytes, stream>>>(
             p.q, cache.keys, cache.values, cache.key_scales, cache.value_scales, metadata,
-            p.positions, p.scale, p.out, p.width);
+            p.positions, p.scale, p.out, nullptr, p.width);
         CUDA_CHECK(cudaGetLastError());
     };
     if (!cache.table_rows)
