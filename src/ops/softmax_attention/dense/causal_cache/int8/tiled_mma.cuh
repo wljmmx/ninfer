@@ -110,12 +110,14 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
     __syncthreads();
 
     auto issue_kv_tile = [&](int tile_k0) {
-        const int physical_page = block_table[tile_k0 >> kPagedKVPageShift];
+        // An absent page is addressed as page 0 (kept in bounds) and skipped by the score mask.
+        const bool page_present = paged_kv_page_present(block_table, tile_k0);
+        const int physical_page = paged_kv_page_for_address(block_table, tile_k0);
         for (int key_l = tid; key_l < Bc; key_l += Schedule::kThreads) {
             const int key = tile_k0 + key_l;
             __half* kd    = &k_scale_s[key_l * Groups];
             __half* vd    = &v_scale_s[key_l * Groups];
-            if (key <= max_query_abs) {
+            if (key <= max_query_abs && page_present) {
                 const std::int64_t off = kv_cache_int8_quant_scale_index<Geometry>(
                     physical_page, kv_head, 0, key & kPagedKVPageMask);
                 ninfer::ops::cp_async<8>(kd, &cache_k_scale[off]);
@@ -135,7 +137,7 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
             // int4 V occupies half the smem extent; the V-worker pass unpacks it
             // into v_f16 after the barrier.
             std::int8_t* vd = &v_i8[key_l * D + (PackedV ? (d >> 1) : d)];
-            if (key <= max_query_abs) {
+            if (key <= max_query_abs && page_present) {
                 if constexpr (E8Root) {
                     // 2-bit cylinder K: 4 cache bytes cover this 16-dim chunk.
                     // Synchronous load + root decode straight into the swizzled
@@ -282,7 +284,7 @@ rk4_apply_e8_residual(dec, static_cast<std::uint32_t>(signs >> 8));
             const int dc    = chunk - key_l * (D / 16);
             const int d     = dc * 16;
             const int key   = tile_k0 + key_l;
-            if (key <= max_query_abs) {
+            if (key <= max_query_abs && paged_kv_page_present(block_table, tile_k0)) {
                 std::int8_t* kd = &k_i8[(key_l * DB16 + causal_swizzle(key_l, dc * 8)) * 2];
                 const int subidx = (d / 64) * 8 + ((d / 8) & 7);
                 const std::uint32_t raw = *reinterpret_cast<const std::uint32_t*>(kd);
@@ -422,7 +424,11 @@ rk4_apply_e8_residual(dec, static_cast<std::uint32_t>(signs >> 8));
             const int row1             = row0 + 8;
             const int qabs0            = row0 < tile_rows ? base_pos + q0 + row0 : -1;
             const int qabs1            = row1 < tile_rows ? base_pos + q0 + row1 : -1;
-            const bool full_score_tile = q0 + Br <= tokens && k0 + Bc - 1 <= base_pos + q0;
+            // Bc == one 64-token page, so presence is uniform across this tile.
+            const bool page_present =
+                paged_kv_page_present(block_table, k0);
+            const bool full_score_tile = page_present && q0 + Br <= tokens &&
+                                         k0 + Bc - 1 <= base_pos + q0;
             float bm0                  = -CUDART_INF_F;
             float bm1                  = -CUDART_INF_F;
 #pragma unroll
@@ -430,10 +436,14 @@ rk4_apply_e8_residual(dec, static_cast<std::uint32_t>(signs >> 8));
                 const int key0 = k0 + nt * 8 + 2 * lid;
                 const int key1 = key0 + 1;
                 if (!full_score_tile) {
-                    score[nt][0] = key0 <= qabs0 ? score[nt][0] : -CUDART_INF_F;
-                    score[nt][1] = key1 <= qabs0 ? score[nt][1] : -CUDART_INF_F;
-                    score[nt][2] = key0 <= qabs1 ? score[nt][2] : -CUDART_INF_F;
-                    score[nt][3] = key1 <= qabs1 ? score[nt][3] : -CUDART_INF_F;
+                    const bool vis0 = page_present && key0 <= qabs0;
+                    const bool vis1 = page_present && key1 <= qabs0;
+                    const bool vis2 = page_present && key0 <= qabs1;
+                    const bool vis3 = page_present && key1 <= qabs1;
+                    score[nt][0] = vis0 ? score[nt][0] : -CUDART_INF_F;
+                    score[nt][1] = vis1 ? score[nt][1] : -CUDART_INF_F;
+                    score[nt][2] = vis2 ? score[nt][2] : -CUDART_INF_F;
+                    score[nt][3] = vis3 ? score[nt][3] : -CUDART_INF_F;
                 }
                 bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
                 bm1 = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
@@ -495,7 +505,7 @@ rk4_apply_e8_residual(dec, static_cast<std::uint32_t>(signs >> 8));
                 const int d     = dc * 8;
                 const int key   = k0 + key_l;
                 __half* dst     = &v_f16[key_l * D + causal_swizzle(key_l, d)];
-                if (key <= max_query_abs) {
+                if (key <= max_query_abs && paged_kv_page_present(block_table, k0)) {
                     const int grp = d >> 6;
                     __half vs     = __float2half_rn(0.0f);
                     if ((lane & 7) == 0) { vs = v_scale_s[key_l * Groups + grp]; }

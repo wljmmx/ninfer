@@ -710,8 +710,10 @@ rk4_apply_e8_residual(dec, static_cast<std::uint32_t>(signs >> 8));
         }
     };
 
-    int physical_page = block_table[first_tile >> kPagedKVPageShift];
-    
+    // An absent page is addressed as page 0 (kept in bounds); the score mask drops it.
+    bool page_present   = paged_kv_page_present(block_table, first_tile);
+    int physical_page   = paged_kv_page_for_address(block_table, first_tile);
+
     issue_kv_tile(first_tile, physical_page);
     ninfer::ops::cp_wait<0>();
     if constexpr (PackedK && E8Lattice && !kRkE8KAmplitudeOn) { decode_e8_tile(first_tile); }
@@ -793,20 +795,20 @@ rk4_apply_e8_residual(dec, static_cast<std::uint32_t>(signs >> 8));
                 const int col1 = col0 + 1;
                 const int key0 = k0 + col0;
                 const int key1 = k0 + col1;
-                score[nt][0]   = (row0 < tile_tokens * Geometry::GroupSize && key0 >= split_start &&
-                                key0 < split_end && key0 <= qabs0)
+                score[nt][0]   = (page_present && row0 < tile_tokens * Geometry::GroupSize &&
+                                key0 >= split_start && key0 < split_end && key0 <= qabs0)
                                      ? score[nt][0] * scale
                                      : -CUDART_INF_F;
-                score[nt][1]   = (row0 < tile_tokens * Geometry::GroupSize && key1 >= split_start &&
-                                key1 < split_end && key1 <= qabs0)
+                score[nt][1]   = (page_present && row0 < tile_tokens * Geometry::GroupSize &&
+                                key1 >= split_start && key1 < split_end && key1 <= qabs0)
                                      ? score[nt][1] * scale
                                      : -CUDART_INF_F;
-                score[nt][2]   = (row1 < tile_tokens * Geometry::GroupSize && key0 >= split_start &&
-                                key0 < split_end && key0 <= qabs1)
+                score[nt][2]   = (page_present && row1 < tile_tokens * Geometry::GroupSize &&
+                                key0 >= split_start && key0 < split_end && key0 <= qabs1)
                                      ? score[nt][2] * scale
                                      : -CUDART_INF_F;
-                score[nt][3]   = (row1 < tile_tokens * Geometry::GroupSize && key1 >= split_start &&
-                                key1 < split_end && key1 <= qabs1)
+                score[nt][3]   = (page_present && row1 < tile_tokens * Geometry::GroupSize &&
+                                key1 >= split_start && key1 < split_end && key1 <= qabs1)
                                      ? score[nt][3] * scale
                                      : -CUDART_INF_F;
                 bm0            = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
@@ -921,7 +923,8 @@ rk4_apply_e8_residual(dec, static_cast<std::uint32_t>(signs >> 8));
         if (has_next) {
             const int next_k0 = k0 + Bc;
             if ((next_k0 & kPagedKVPageMask) == 0) {
-                physical_page = block_table[next_k0 >> kPagedKVPageShift];
+                page_present  = paged_kv_page_present(block_table, next_k0);
+                physical_page = paged_kv_page_for_address(block_table, next_k0);
             }
             issue_kv_tile(next_k0, physical_page);
         }

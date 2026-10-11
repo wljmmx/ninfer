@@ -44,6 +44,30 @@ __device__ __forceinline__ std::int32_t paged_kv_physical_page(const std::int32_
     return block_table[position >> kPagedKVPageShift];
 }
 
+// A negative block-table entry marks a logical page as *absent*: the page holds no live
+// key/value data, so every score that would read it must be forced to -inf exactly like a key
+// that is causally out of range. Producing an absent entry is a policy decision (KV eviction,
+// host tiering); the value must be negative and must not collide with a physical page id.
+//
+// Addressing stays in bounds: consumers clamp an absent entry to page 0 before computing
+// offsets (see paged_kv_page_for_address), so a kernel never dereferences the sentinel. With no
+// absent entry the predicate is constant true and results are unchanged.
+inline constexpr std::int32_t kPagedKVPageAbsent = -1;
+
+__device__ __forceinline__ bool paged_kv_page_present(const std::int32_t* block_table,
+                                                      std::int32_t position) {
+    return paged_kv_physical_page(block_table, position) >= 0;
+}
+
+// Physical page to address for a logical position: absent pages are redirected to page 0 so the
+// load stays in bounds. The value read there is masked out of the attention by
+// paged_kv_page_present().
+__device__ __forceinline__ std::int32_t paged_kv_page_for_address(const std::int32_t* block_table,
+                                                                 std::int32_t position) {
+    const std::int32_t page = paged_kv_physical_page(block_table, position);
+    return page < 0 ? 0 : page;
+}
+
 template <int LeadingExtent, int HeadExtent>
 __device__ __forceinline__ std::int64_t paged_kv_page_head_offset(std::int32_t physical_page,
                                                                   std::int32_t head) {
