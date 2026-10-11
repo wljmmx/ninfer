@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <fstream>
 #include <stdexcept>
+#include <utility>
 
 namespace ninfer::models::qwen3_5::detail {
 
@@ -34,6 +36,25 @@ const KvEvictionWindow& kv_eviction_window() {
         }
         if (const char* span = std::getenv("NINFER_KV_EVICT_WINDOW")) {
             result.window_pages = static_cast<std::uint32_t>(std::strtoul(span, nullptr, 10));
+        }
+        if (const char* path = std::getenv("NINFER_KV_EVICT_SCORES")) {
+            // Query-aware selection: pick the pages the scorer ranks highest. A later kernel hook
+            // only has to fill this file so the decision path is already exercised.
+            std::ifstream scores(path);
+            std::vector<std::pair<double, std::uint32_t>> ranked;
+            std::uint32_t page  = 0;
+            double score        = 0.0;
+            while (scores >> page >> score) { ranked.emplace_back(score, page); }
+            std::sort(ranked.begin(), ranked.end(), [](const auto& lhs, const auto& rhs) {
+                return lhs.first != rhs.first ? lhs.first > rhs.first : lhs.second < rhs.second;
+            });
+            std::uint32_t top = 4;
+            if (const char* count = std::getenv("NINFER_KV_EVICT_KEEP_TOP")) {
+                top = static_cast<std::uint32_t>(std::strtoul(count, nullptr, 10));
+            }
+            for (std::uint32_t index = 0; index < top && index < ranked.size(); ++index) {
+                if (ranked[index].first > 0.0) { result.keep_pages.push_back(ranked[index].second); }
+            }
         }
         if (const char* list = std::getenv("NINFER_KV_EVICT_KEEP_PAGES")) {
             const char* cursor = list;
