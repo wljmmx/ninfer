@@ -44,6 +44,9 @@ struct Options {
     std::optional<std::filesystem::path> corpus;
     std::optional<std::filesystem::path> text;
     std::optional<std::filesystem::path> output;
+    // Optional TSV of per-scored-token logprobs: index, token id, logprob. A needle probe reads the
+    // answer's NLL from here; the aggregate PPL is dominated by filler and hides it (appendix AZ).
+    std::optional<std::filesystem::path> token_logprobs;
     std::uint32_t context               = 4096;
     std::uint32_t stride                = 2048;
     int device                          = 0;
@@ -57,7 +60,7 @@ std::string usage_text() {
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
            "       [--context N] [--stride N] [--device N]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|rk4v2-e8] "
-           "[--output <directory>]\n"
+           "[--output <directory>] [--token-logprobs <tsv>]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n";
 }
 
@@ -102,6 +105,8 @@ Options parse_options(int argc, char** argv) {
             out.stride = parse_integer<std::uint32_t>(value("--stride"), "stride");
         } else if (option == "--device") {
             out.device = parse_integer<int>(value("--device"), "device");
+        } else if (option == "--token-logprobs") {
+            out.token_logprobs = std::filesystem::path(value("--token-logprobs"));
         } else if (option == "--kv-dtype") {
             const std::string_view dtype = value("--kv-dtype");
             if (dtype == "bf16") {
@@ -280,6 +285,14 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                  ninfer::product::format_pretty_duration(preflight_seconds));
 
     const std::filesystem::path output_directory = prepare_output_directory(options, load, corpus);
+    std::ofstream token_logprob_file;
+    if (options.token_logprobs) {
+        token_logprob_file.open(*options.token_logprobs, std::ios::binary | std::ios::trunc);
+        if (!token_logprob_file) {
+            throw std::runtime_error("cannot open --token-logprobs output");
+        }
+        token_logprob_file << "# index\ttoken\tlogprob\n";
+    }
     const Clock::time_point scoring_started      = Clock::now();
     logger->info("scoring | {} streams | {} tokens | {} windows",
                  ninfer::product::format_pretty_count(streams.size()),
@@ -323,6 +336,13 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
             if (logprobs.size() != expected) {
                 throw std::runtime_error("scoring returned an invalid target count for " +
                                          stream.source.id);
+            }
+            if (token_logprob_file) {
+                for (std::size_t index = 0; index < expected; ++index) {
+                    const std::size_t position = window.target_begin + index;
+                    token_logprob_file << position << '\t' << stream.tokens[position] << '\t'
+                                       << std::setprecision(9) << logprobs[index] << '\n';
+                }
             }
             ScoreAggregate window_score;
             window_score.add(logprobs);
