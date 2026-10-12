@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdlib>
 #include <fstream>
+#include <map>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -305,10 +306,15 @@ void ProgramImpl::dump_page_scores(KVAddressSpaceStore& addresses, PagedKVCache&
     // that is easy to misread as "no page is important". Say it outright, and carry a run-level flag
     // so the last block answers "did any call ever record anything". Lines beginning with '#' are
     // markers, so this stays out of the page table.
-    static bool ever_nonzero = false;
-    ever_nonzero             = ever_nonzero || maximum != 0u;
+    // N3: key the run-level flag on this row's counter block rather than on the process - a batched
+    // run dumps several execution rows, and a single process-wide flag would let a row whose counters
+    // did fire make a silent row look healthy. The slice handed out by page_score_row() is stable and
+    // distinct per row, so its data pointer identifies the row without touching the pool's internals.
+    static std::map<const void*, bool> row_recorded;
+    bool& recorded = row_recorded[scores.data];
+    recorded       = recorded || maximum != 0u;
     out << "# stats max=" << maximum << " nonzero=" << nonzero
-        << " ever_nonzero=" << (ever_nonzero ? 1 : 0) << '\n';
+        << " ever_nonzero=" << (recorded ? 1 : 0) << '\n';
     if (!kv_page_scores_cumulative_enabled()) {
         // Per call is the semantics the counters are designed around (appendix CO): clearing here -
         // the dump runs before the forward - means the next dump reads exactly one call's
