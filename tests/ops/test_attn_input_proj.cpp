@@ -1,5 +1,6 @@
 #include "core/weight.h"
 #include "ninfer/ops/attn_input_proj.h"
+#include "ninfer/ops/w4a8.h"
 #include "ninfer/ops/weight_input.h"
 
 #include "core/device.h"
@@ -75,12 +76,6 @@ int run_target_projection_case(DevicePackedWeight& parent, DevicePackedWeight* g
         value(kvrows, tokens);
     Tensor x(input.p, DType::BF16, {hidden, tokens}), q = query.tensor(), g = gate.tensor(),
                                                       k = key.tensor(), v = value.tensor();
-    const auto capacity =
-        dual ? 0
-             : ops::attn_input_proj_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16, 14336,
-                                                             hidden, policy, tokens, tokens);
-    GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
-    DeviceArena workspace(DeviceSpan{scratch.data(), std::max<std::size_t>(capacity, 1)});
     DeviceContext device;
     const auto first    = physical_parent(parent.view());
     const auto second   = gate_value ? physical_parent(gate_value->view()) : first;
@@ -89,9 +84,22 @@ int run_target_projection_case(DevicePackedWeight& parent, DevicePackedWeight* g
     const auto v_weight = rows(dual ? second : first, dual ? 6144 : 13312, kvrows);
     const auto prepared = ops::prepare_attn_input_proj_weights(
         {q_weight, policy}, {k_weight, policy}, {g_weight, policy}, {v_weight, policy});
+    // The paired route takes its transient scratch from the caller workspace; the single-parent
+    // route still resolves its own. Both sizes come from the same resolvers production uses.
+    const auto capacity = [&] {
+        if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&prepared)) {
+            return ops::w4a8_attn_input_workspace_capacity_bytes(pair->first.n, pair->second.n,
+                                                                 pair->first.k, tokens, tokens);
+        }
+        return ops::attn_input_proj_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16, 14336,
+                                                             hidden, policy, tokens, tokens);
+    }();
+    GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
+    DeviceArena workspace(DeviceSpan{scratch.data(), std::max<std::size_t>(capacity, 1)});
     const auto launch = [&] {
         if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&prepared)) {
-            ops::attn_input_proj(x, pair->first, pair->second, q, g, k, v, device.stream);
+            ops::attn_input_proj(x, pair->first, pair->second, q, g, k, v, workspace,
+                                 device.stream);
         } else {
             const auto& single = std::get<ops::SingleProjectionWeight>(prepared);
             ops::attn_input_proj(x, single.weight, q, g, k, v, single.policy, workspace,

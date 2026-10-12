@@ -141,7 +141,9 @@ rope_payload_control_kernel(const std::int32_t* positions, __nv_bfloat16* q, __n
     if (threadIdx.x < half) {
         const int pair = static_cast<int>(threadIdx.x);
         float sine, cosine;
-        ops::fixed_sincos<Mode>(positions, tokens, token, pair, &sine, &cosine);
+        // The payload-control kernels only reuse the sin/cos values; YaRN is not exercised here.
+        const ops::RopeScaling scaling{};
+        ops::fixed_sincos<Mode>(positions, tokens, token, pair, scaling, &sine, &cosine);
         cos_cache[pair] = cosine;
         sin_cache[pair] = sine;
     }
@@ -184,7 +186,9 @@ __global__ void rope_split_payload_control_kernel(const std::int32_t* positions,
     if (threadIdx.x < kHalf) {
         const int pair = static_cast<int>(threadIdx.x);
         float sine, cosine;
-        ops::fixed_sincos<Mode>(positions, tokens, token, pair, &sine, &cosine);
+        // The payload-control kernels only reuse the sin/cos values; YaRN is not exercised here.
+        const ops::RopeScaling scaling{};
+        ops::fixed_sincos<Mode>(positions, tokens, token, pair, scaling, &sine, &cosine);
         cos_cache[pair] = cosine;
         sin_cache[pair] = sine;
     }
@@ -256,11 +260,12 @@ template <ops::RopeKernelMode Mode, int QHeads, int KHeads>
 void launch_text_candidate_mode(const Tensor& positions, Tensor& q, Tensor& k, int block,
                                 cudaStream_t stream) {
     const int tokens = q.ne[2];
+    // The benchmark measures the unscaled route; YaRN is exercised by the model, not here.
     ops::rope_fixed_kernel<Mode, QHeads, KHeads><<<tokens, block, 0, stream>>>(
         static_cast<const std::int32_t*>(positions.data), static_cast<__nv_bfloat16*>(q.data),
         static_cast<__nv_bfloat16*>(k.data), tokens,
         q.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)),
-        k.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)));
+        k.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)), ops::RopeScaling{});
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -335,7 +340,7 @@ void launch_dflash_split_candidate(const Tensor& positions, Tensor& q, Tensor& k
         static_cast<const std::int32_t*>(positions.data), static_cast<__nv_bfloat16*>(q.data),
         static_cast<__nv_bfloat16*>(k.data), q.ne[2],
         q.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)),
-        k.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)));
+        k.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)), ops::RopeScaling{});
     CUDA_CHECK(cudaGetLastError());
 }
 

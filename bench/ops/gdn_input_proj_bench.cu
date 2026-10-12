@@ -3,6 +3,7 @@
 
 #include "core/weight.h"
 #include "ninfer/ops/gdn_input_proj.h"
+#include "ninfer/ops/w4a8.h"
 
 #include "core/device.h"
 #include "ninfer_bench_common.h"
@@ -319,18 +320,28 @@ void run_q4q5(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t 
     DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_tokens, 101U);
     DeviceBuffer qkv(static_cast<std::size_t>(kQkRows + kValueRows) * max_tokens * 2);
     DeviceBuffer z(static_cast<std::size_t>(kZRows) * max_tokens * 2);
+    // The two-parent route takes its transient scratch from the caller workspace.
+    const std::int32_t min_tokens =
+        *std::min_element(options.tokens.begin(), options.tokens.end());
+    const std::size_t public_workspace = ops::w4a8_gdn_input_workspace_capacity_bytes(
+        kQkRows, kValueRows + kZRows, kHidden, min_tokens, max_tokens);
+    WorkspaceArena workspace(std::max<std::size_t>(public_workspace, 256));
     const auto make_launch = [&](std::int32_t tokens) {
         return [&, tokens](cudaStream_t launch_stream) {
             Tensor x(input.p, DType::BF16, {kHidden, tokens});
             Tensor tqkv(qkv.p, DType::BF16, {kQkRows + kValueRows, tokens});
             Tensor tz(z.p, DType::BF16, {kZRows, tokens});
-            ops::gdn_input_proj(x, qk.weight, value_z.weight, tqkv, tz, launch_stream);
+            ops::gdn_input_proj(x, qk.weight, value_z.weight, tqkv, tz, workspace, launch_stream);
         };
     };
     measure_points(
         options, "q4q5", "a16", kHidden, kOutputRows,
         qk.model_weight_bytes() + value_z.model_weight_bytes(),
-        [](std::int32_t) { return std::size_t{0}; }, make_launch, flush, stream, results);
+        [](std::int32_t tokens) {
+            return ops::w4a8_gdn_input_workspace_capacity_bytes(kQkRows, kValueRows + kZRows,
+                                                                kHidden, tokens, tokens);
+        },
+        make_launch, flush, stream, results);
 }
 
 void run_q8(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t stream,

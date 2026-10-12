@@ -3,6 +3,7 @@
 
 #include "core/weight.h"
 #include "ninfer/ops/attn_input_proj.h"
+#include "ninfer/ops/w4a8.h"
 
 #include "core/device.h"
 #include "direct_bf16_weight.cuh"
@@ -300,19 +301,26 @@ void run_q4q5(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t 
         bench::make_row_split_weight(QType::Q4_G64_FP16, parent_rows, hidden, hidden, 501U);
     bench::PackedQuantizedWeight gv =
         bench::make_row_split_weight(QType::Q5_G64_FP16, parent_rows, hidden, hidden, 503U);
+    const std::int32_t min_tokens = *std::min_element(options.tokens.begin(), options.tokens.end());
     DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(hidden) * max_tokens, 199U);
     DeviceBuffer q(static_cast<std::size_t>(q_rows) * max_tokens * 2);
     DeviceBuffer gate(static_cast<std::size_t>(q_rows) * max_tokens * 2);
     DeviceBuffer k(static_cast<std::size_t>(kv_rows) * max_tokens * 2);
     DeviceBuffer v(static_cast<std::size_t>(kv_rows) * max_tokens * 2);
+    // The two-parent route takes its transient scratch from the caller workspace.
+    const std::size_t public_workspace = ops::w4a8_attn_input_workspace_capacity_bytes(
+        parent_rows, parent_rows, hidden, min_tokens, max_tokens);
+    WorkspaceArena workspace(std::max<std::size_t>(public_workspace, 256));
     for (const std::int32_t tokens : options.tokens) {
         Tensor x(input.p, DType::BF16, {hidden, tokens});
         Tensor tq(q.p, DType::BF16, {q_rows, tokens});
         Tensor tg(gate.p, DType::BF16, {q_rows, tokens});
         Tensor tk(k.p, DType::BF16, {kv_rows, tokens});
         Tensor tv(v.p, DType::BF16, {kv_rows, tokens});
+        const std::size_t exact_workspace = ops::w4a8_attn_input_workspace_capacity_bytes(
+            parent_rows, parent_rows, hidden, tokens, tokens);
         const auto launch = [&](cudaStream_t launch_stream) {
-            ops::attn_input_proj(x, qk.weight, gv.weight, tq, tg, tk, tv, launch_stream);
+            ops::attn_input_proj(x, qk.weight, gv.weight, tq, tg, tk, tv, workspace, launch_stream);
         };
         const CacheState profile_cache =
             options.cache == CacheMode::Cold ? CacheState::Cold : CacheState::Warm;
@@ -329,7 +337,7 @@ void run_q4q5(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t 
             if ((options.cache == CacheMode::Cold && cache != CacheState::Cold) ||
                 (options.cache == CacheMode::Warm && cache != CacheState::Warm))
                 continue;
-            append_result(results, "q4q5", "a16", tokens, cache, 0, logical, flops,
+            append_result(results, "q4q5", "a16", tokens, cache, exact_workspace, logical, flops,
                           measure_public(launch, cache, flush, stream, options.warmup,
                                          options.repeat, options.graph));
         }

@@ -2,6 +2,7 @@
 #include "core/device.h"
 #include "core/decode_graph.h"
 #include "ninfer/ops/gdn_input_proj.h"
+#include "ninfer/ops/w4a8.h"
 
 #include "ops/input_projection_test_common.h"
 
@@ -53,7 +54,13 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
     Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
     Tensor output   = qkv.tensor();
     Tensor z_output = z.tensor();
-    ops::gdn_input_proj(x, query_key.view(), value_z_weight.view(), output, z_output, nullptr);
+    // The two-parent route takes its transient scratch from the caller workspace.
+    const Weight qk_weight = query_key.view();
+    const Weight vz_weight = value_z_weight.view();
+    const std::size_t capacity = ops::w4a8_gdn_input_workspace_capacity_bytes(
+        qk_weight.n, vz_weight.n, qk_weight.k, tokens, tokens);
+    WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
+    ops::gdn_input_proj(x, qk_weight, vz_weight, output, z_output, workspace, nullptr);
     cuda_synchronize();
 
     const std::string suffix = " Q4/Q5 A16 T=" + std::to_string(tokens);
@@ -90,11 +97,15 @@ int run_q4_q5_graph_case(DevicePackedWeight& query_key, DevicePackedWeight& valu
     GuardedBf16Tensor qkv(kRows, tokens);
     GuardedBf16Tensor z(kZRows, tokens);
     Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
-    Tensor output     = qkv.tensor();
-    Tensor z_output   = z.tensor();
+    Tensor output          = qkv.tensor();
+    Tensor z_output        = z.tensor();
+    const Weight qk_weight = query_key.view();
+    const Weight vz_weight = value_z_weight.view();
+    const std::size_t capacity = ops::w4a8_gdn_input_workspace_capacity_bytes(
+        qk_weight.n, vz_weight.n, qk_weight.k, tokens, tokens);
+    WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
     const auto launch = [&](cudaStream_t launch_stream) {
-        ops::gdn_input_proj(x, query_key.view(), value_z_weight.view(), output, z_output,
-                            launch_stream);
+        ops::gdn_input_proj(x, qk_weight, vz_weight, output, z_output, workspace, launch_stream);
     };
     launch(stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
