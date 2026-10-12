@@ -1,5 +1,6 @@
 #include "core/weight.h"
 #include "ninfer/ops/gdn_input_proj.h"
+#include "ninfer/ops/w4a8.h"
 
 #include "core/layout.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.h"
@@ -777,6 +778,8 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
 std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
+    // The registered q4/q5 pair has K = 5120; the geometry overload carries no hidden size.
+    constexpr std::int32_t kInputRows = 5120;
     const bool q4_q5 = query_rows == 2048 && key_rows == 2048 && value_rows == 6144;
     const bool q8    = query_rows == 2048 && key_rows == 2048 && value_rows == 4096;
     if (!q4_q5 && !q8) {
@@ -792,7 +795,14 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
             (void)resolve_q8_conv_plan(min_width, batch_size);
             (void)resolve_q8_conv_plan(max_width, batch_size);
         }
-        return composed_snapshot_capacity(channels, batch_size * max_width, 0);
+        // The projection's own scratch is live next to the materialized projection; the hook
+        // composed_snapshot_capacity() already provides for it was passed 0 until now (appendix CT).
+        return composed_snapshot_capacity(
+            channels, batch_size * max_width,
+            q4_q5 ? w4a8_gdn_input_workspace_capacity_bytes(
+                        query_rows + key_rows, value_rows + value_rows, kInputRows,
+                        batch_size * min_width, batch_size * max_width)
+                  : 0);
     }
 
     std::int32_t largest_materialized_width = 0;
@@ -810,9 +820,12 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         if (max_width >= 17) { largest_materialized_width = max_width; }
     }
     if (largest_materialized_width == 0) { return 0; }
-    WorkspaceLayoutBuilder layout;
-    (void)allocate_projected_workspace(layout, channels, largest_materialized_width);
-    return layout.peak_bytes(1);
+    return composed_snapshot_capacity(
+        channels, largest_materialized_width,
+        q4_q5 ? w4a8_gdn_input_workspace_capacity_bytes(
+                    query_rows + key_rows, value_rows + value_rows, kInputRows,
+                    largest_materialized_width, max_width)
+              : 0);
 }
 
 std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
@@ -848,20 +861,37 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
 std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
+    // The registered q4/q5 pair has K = 5120 and a value/z parent of 2 * value_rows rows; the
+    // geometry overload carries neither the hidden size nor the z row count.
+    constexpr std::int32_t kInputRows = 5120;
     const bool q4_q5 = query_rows == 2048 && key_rows == 2048 && value_rows == 6144;
     const bool q8    = query_rows == 2048 && key_rows == 2048 && value_rows == 4096;
     if (!q4_q5 && !q8) {
         throw std::invalid_argument("gdn_input_proj_conv_record workspace: unregistered shape");
     }
     require_record_capacity_domain(batch_size, min_width, max_width);
-    if (q4_q5) {
-        (void)resolve_q4_q5_conv_plan(min_width, batch_size);
-        (void)resolve_q4_q5_conv_plan(max_width, batch_size);
-    } else {
+    if (!q4_q5) {
         (void)resolve_q8_conv_plan(min_width, batch_size);
         (void)resolve_q8_conv_plan(max_width, batch_size);
+        return 0;
     }
-    return 0;
+    // The record path materializes nothing itself - its outputs are the caller's tensors - so the
+    // only arena user is the two-parent projection, and only on the composed (non-fused) widths
+    // where the int8 route actually runs. 4d43905f moved that scratch into the caller arena without
+    // accounting for it here, which overran the arena (appendices C7/CT).
+    // require_record_capacity_domain() bounds the domain to T <= 16, so walking it is cheap.
+    std::size_t bytes = 0;
+    for (std::int32_t width = min_width; width <= max_width; ++width) {
+        const detail::Q4Q5GdnInputConvPlan plan = resolve_q4_q5_conv_plan(width, batch_size);
+        if (plan.schedule == detail::Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused) {
+            continue;
+        }
+        const std::int32_t tokens = batch_size * width;
+        bytes = std::max(bytes, w4a8_gdn_input_workspace_capacity_bytes(
+                                    query_rows + key_rows, value_rows + value_rows, kInputRows,
+                                    tokens, tokens));
+    }
+    return bytes;
 }
 
 std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(

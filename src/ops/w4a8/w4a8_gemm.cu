@@ -1271,9 +1271,17 @@ std::size_t w4a8_attn_input_workspace_capacity_bytes(std::int32_t query_key_rows
     }
     // The route splits both weights into their 6144 + 1024 row pair.
     if (input_rows != 5120 || query_key_rows < 7168 || gate_value_rows < 7168) { return 0; }
+    // Exact, not planner-grade (appendix CT): the grouped route only runs while it is enabled and
+    // only on whole grouped tiles. A caller that mirrors this arena into its own capacity function
+    // must be told zero whenever the route cannot run anywhere in the interval; otherwise its
+    // reserved bytes and the bytes the route actually takes disagree. The scratch grows with the
+    // token count, so the interval maximum is the largest whole tile inside it.
+    if (!w4a8_enabled()) { return 0; }
+    const std::int32_t tokens = (max_tokens / kGRBN) * kGRBN;
+    if (tokens < min_tokens) { return 0; }
     std::size_t cursor = 0;
-    (void)take_scratch(cursor, (std::size_t)max_tokens * input_rows);
-    (void)take_scratch(cursor, (std::size_t)max_tokens * (input_rows / 64) * sizeof(float));
+    (void)take_scratch(cursor, (std::size_t)tokens * input_rows);
+    (void)take_scratch(cursor, (std::size_t)tokens * (input_rows / 64) * sizeof(float));
     (void)take_scratch(cursor, (std::size_t)query_key_rows * input_rows);
     (void)take_scratch(cursor, (std::size_t)gate_value_rows * input_rows);
     return align_scratch(cursor);
@@ -1288,9 +1296,13 @@ std::size_t w4a8_gdn_input_workspace_capacity_bytes(std::int32_t qk_rows,
         throw std::invalid_argument("w4a8 GDN input workspace: invalid token interval");
     }
     if (input_rows != 5120 || qk_rows <= 0 || value_z_rows <= 0) { return 0; }
+    // Exact, not planner-grade: see the attention helper above (appendix CT).
+    if (!w4a8_enabled()) { return 0; }
+    const std::int32_t tokens = (max_tokens / kGRBN) * kGRBN;
+    if (tokens < min_tokens) { return 0; }
     std::size_t cursor = 0;
-    (void)take_scratch(cursor, (std::size_t)max_tokens * input_rows);
-    (void)take_scratch(cursor, (std::size_t)max_tokens * (input_rows / 64) * sizeof(float));
+    (void)take_scratch(cursor, (std::size_t)tokens * input_rows);
+    (void)take_scratch(cursor, (std::size_t)tokens * (input_rows / 64) * sizeof(float));
     (void)take_scratch(cursor, (std::size_t)qk_rows * input_rows);
     (void)take_scratch(cursor, (std::size_t)value_z_rows * input_rows);
     return align_scratch(cursor);
