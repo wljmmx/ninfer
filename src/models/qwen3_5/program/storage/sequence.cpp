@@ -8,6 +8,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace ninfer::models::qwen3_5::detail {
 
@@ -27,6 +28,15 @@ struct KvEvictionWindow {
         return window_pages != 0 || !keep_pages.empty();
     }
 };
+
+// P6 2c: the page counters are per-call by default (appendix CO). They are a marginal over the
+// streams of one call, and the prefill and decode shapes store different units, so an accumulating
+// buffer would conflate calls and mix units. NINFER_KV_EVICT_SCORES_CUMULATIVE restores the old
+// accumulating profile for A/B against the archives in .temp/kv.
+bool kv_page_scores_cumulative_enabled() {
+    static const bool enabled = std::getenv("NINFER_KV_EVICT_SCORES_CUMULATIVE") != nullptr;
+    return enabled;
+}
 
 const KvEvictionWindow& kv_eviction_window() {
     static const KvEvictionWindow window = [] {
@@ -254,6 +264,58 @@ void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, Paged
                                                  kv_live_pages(frontier), window.sink_pages,
                                                  window.window_pages, window.keep_pages,
                                                  device.stream);
+    dump_page_scores(addresses, cache, address);
+}
+
+void ProgramImpl::dump_page_scores(KVAddressSpaceStore& addresses, PagedKVCache& cache,
+                                   KVAddressSpaceHandle address) {
+    const char* path = std::getenv("NINFER_KV_EVICT_SCORES_DUMP");
+    if (path == nullptr || *path == '\0') { return; }
+    const std::uint32_t frontier = addresses.committed_frontier(address);
+    if (frontier == 0) { return; }
+    const Tensor scores =
+        cache.execution_tables().page_score_row(addresses.execution_row(address).handle());
+    const std::uint32_t pages = static_cast<std::uint32_t>(scores.ne[0]);
+    const std::uint32_t live  = kv_live_pages(frontier);
+    const std::uint32_t rows  = live < pages ? live : pages;
+    std::vector<std::uint32_t> host(static_cast<std::size_t>(rows), 0u);
+    if (rows != 0) {
+        CUDA_CHECK(cudaMemcpyAsync(host.data(), scores.data,
+                                   static_cast<std::size_t>(rows) * sizeof(std::uint32_t),
+                                   cudaMemcpyDeviceToHost, device.stream));
+        CUDA_CHECK(cudaStreamSynchronize(device.stream));
+    }
+    // Append with a call marker: the number of markers says how often the decision point ran, and
+    // consecutive blocks say whether the question tail ever reaches a dumped call (appendix CD.5.1).
+    // The raw counter is written, because its unit depends on the shape that produced it (appendix
+    // CO.4): a prefill shape stores a running-best hit count, a decode shape an order-preserving peak
+    // logit (recover it with paged_kv_page_score_decode). 0 means "nothing recorded".
+    std::ofstream out(path, std::ios::app);
+    if (!out) { return; }
+    out << "# call\n";
+    std::uint32_t maximum = 0;
+    std::uint32_t nonzero = 0;
+    for (std::uint32_t page = 0; page < rows; ++page) {
+        out << page << '\t' << host[page] << '\n';
+        if (host[page] > maximum) { maximum = host[page]; }
+        nonzero += host[page] != 0u ? 1u : 0u;
+    }
+    // C4: a silently all-zero dump is ambiguous - most KV storages (bf16, fp8, nvfp4, k8v4) have no
+    // P6 2c scoring hook at all, so the counters stay zero no matter how important a page is - and
+    // that is easy to misread as "no page is important". Say it outright, and carry a run-level flag
+    // so the last block answers "did any call ever record anything". Lines beginning with '#' are
+    // markers, so this stays out of the page table.
+    static bool ever_nonzero = false;
+    ever_nonzero             = ever_nonzero || maximum != 0u;
+    out << "# stats max=" << maximum << " nonzero=" << nonzero
+        << " ever_nonzero=" << (ever_nonzero ? 1 : 0) << '\n';
+    if (!kv_page_scores_cumulative_enabled()) {
+        // Per call is the semantics the counters are designed around (appendix CO): clearing here -
+        // the dump runs before the forward - means the next dump reads exactly one call's
+        // contribution, whatever shape produced it.
+        cache.execution_tables().reset_page_scores(addresses.execution_row(address).handle(),
+                                                   device.stream);
+    }
 }
 
 void ProgramImpl::commit_sequence_kv(SequenceState& state, std::uint32_t main,

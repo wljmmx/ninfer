@@ -13,10 +13,16 @@ static_assert(kPagedKVPageSize == (1 << kPagedKVPageShift));
 
 struct PagedKVDirectMetadata {
     const std::int32_t* table;
+    // P6 2c: relevance counters of the one row this metadata binds. The caller already resolved
+    // the row, exactly like `table`. Null when no counter buffer is bound.
+    unsigned* page_scores = nullptr;
 
     __device__ __forceinline__ std::int32_t valid_tokens(std::int32_t width) const { return width; }
 
     __device__ __forceinline__ const std::int32_t* block_table() const { return table; }
+
+    /// The counter row for this CTA, resolved the same way as block_table().
+    __device__ __forceinline__ unsigned* counters() const { return page_scores; }
 };
 
 template <bool Masked>
@@ -25,6 +31,8 @@ struct PagedKVBatchMetadata {
     const std::int32_t* valid_columns;
     const std::int32_t* table_rows;
     std::int32_t table_stride;
+    // P6 2c: page-score matrix base. Null when no counter buffer is bound.
+    unsigned* page_scores = nullptr;
 
     __device__ __forceinline__ std::int32_t valid_tokens(std::int32_t width) const {
         if constexpr (Masked) {
@@ -36,6 +44,14 @@ struct PagedKVBatchMetadata {
 
     __device__ __forceinline__ const std::int32_t* block_table() const {
         return tables + static_cast<std::int64_t>(table_rows[0]) * table_stride;
+    }
+
+    /// The counter row for this CTA, resolved the same way as block_table(): the matrix is indexed
+    /// by this batch element's execution row.
+    __device__ __forceinline__ unsigned* counters() const {
+        return page_scores == nullptr
+                   ? nullptr
+                   : page_scores + static_cast<std::int64_t>(table_rows[0]) * table_stride;
     }
 };
 

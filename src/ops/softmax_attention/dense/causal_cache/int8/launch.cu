@@ -1,3 +1,7 @@
+// P6 2c C3: this is the one translation unit allowed to pull in the INT8 KV scoring kernels; see the
+// guard in int8/template_launch.cuh.
+#define NINFER_INT8_KV_SCORING_OWNER 1
+
 #include "ops/softmax_attention/dense/causal_cache/int8/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/int8/instances.h"
 #include "ops/softmax_attention/dense/causal_cache/int8/plan.h"

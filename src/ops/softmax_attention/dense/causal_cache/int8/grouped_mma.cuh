@@ -1,4 +1,13 @@
 #pragma once
+
+// P6 2c C3: this header can launch the INT8 KV attention that writes the page-score counters, so
+// the scoring path is kept to a single translation unit. Only int8/launch.cu defines
+// NINFER_INT8_KV_SCORING_OWNER; any new include from another TU fails to compile instead of silently
+// adding a second scoring launch point that the counters cannot see (appendices CJ.1/C3).
+#ifndef NINFER_INT8_KV_SCORING_OWNER
+#error "int8 KV scoring kernels: include via int8/template_launch.cuh, from int8/launch.cu (P6 2c C3)"
+#endif
+
 #include "ops/softmax_attention/dense/causal_cache/int8/tile_io.cuh"
 
 #include "ops/softmax_attention/dense/causal_cache/int8/schedule.cuh"
@@ -8,6 +17,7 @@
 #include "ops/kv_cache/rk4_codec.cuh"
 #include "ops/kernel/e8_lattice.cuh"
 #include "ops/kernel/e8_root_codec.cuh"
+#include "ops/kernel/page_score_codec.cuh"
 
 namespace ninfer::ops::detail {
 
@@ -31,7 +41,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t logical_capacity, CausalKvPartition partition, float scale, float* partial_acc,
-        float* partial_m, float* partial_l) {
+        float* partial_m, float* partial_l, unsigned* page_scores) {
     constexpr int TokenTile            = Schedule::kTokenTile;
     constexpr int WarpsPerCta          = Schedule::kWarps;
     constexpr int KeyBlock             = Schedule::kKeyRows;
@@ -113,6 +123,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     const int table_row = table_rows == nullptr ? 0 : table_rows[batch];
     const std::int32_t* block_table =
         block_tables + static_cast<std::int64_t>(table_row) * table_stride;
+    // P6 2c: relevance counters for this row, resolved exactly like block_table.
+    unsigned* const counters = page_scores == nullptr
+                                   ? nullptr
+                                   : page_scores + static_cast<std::int64_t>(table_row) * table_stride;
     if constexpr (MultiBatch) {
         partial_acc +=
             static_cast<std::int64_t>(batch) * 256 * Geometry::QHeads * partial_width * split_count;
@@ -816,6 +830,35 @@ rk4_apply_e8_residual(dec, static_cast<std::uint32_t>(signs >> 8));
             }
             bm0 = warp_max<4>(bm0, FullMask);
             bm1 = warp_max<4>(bm1, FullMask);
+
+            // P6 2c score hook. One kernel, two shapes, two statistics (appendix CO.4):
+            //  - ParallelQueries is the *prefill* shape (9..256 keys wide, including the short
+            //    question tail). Its fan-out is only 2..9 and, within a call, every sample shares the
+            //    same geometry, so the running-best hit count is the statistic to keep - it is the one
+            //    that carries the query signal (CO.3). A row's first page is not evidence (CD.4).
+            //  - otherwise this is the *decode* shape (<= 8 keys, in practice one token) with fan-out
+            //    64, where partition restarts would inflate the count; and with a single query row
+            //    there is no body-versus-question competition for a maximum to be dominated by. So
+            //    take the order-preserving peak logit: idempotent, and exact (no quantisation).
+            // bm0/bm1 are segment-reduced, so exactly one lane per segment reports; nothing reads the
+            // counters yet, so the attention numerics are untouched.
+            if (counters != nullptr && page_present && lid == 0) {
+                if constexpr (ParallelQueries) {
+                    if (m0 != -CUDART_INF_F && m1 != -CUDART_INF_F) {
+                        const int records = (bm0 > m0 ? 1 : 0) + (bm1 > m1 ? 1 : 0);
+                        if (records > 0) {
+                            atomicAdd(counters + (k0 >> kPagedKVPageShift),
+                                      static_cast<unsigned>(records));
+                        }
+                    }
+                } else {
+                    const float page_best = fmaxf(bm0, bm1);
+                    if (page_best > -CUDART_INF_F) {
+                        atomicMax(counters + (k0 >> kPagedKVPageShift),
+                                  paged_kv_page_score_encode(page_best));
+                    }
+                }
+            }
 
             const float nm0 = fmaxf(m0, bm0);
             const float nm1 = fmaxf(m1, bm1);

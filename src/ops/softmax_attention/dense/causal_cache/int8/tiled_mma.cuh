@@ -1,4 +1,13 @@
 #pragma once
+
+// P6 2c C3: this header can launch the INT8 KV attention that writes the page-score counters, so
+// the scoring path is kept to a single translation unit. Only int8/launch.cu defines
+// NINFER_INT8_KV_SCORING_OWNER; any new include from another TU fails to compile instead of silently
+// adding a second scoring launch point that the counters cannot see (appendices CJ.1/C3).
+#ifndef NINFER_INT8_KV_SCORING_OWNER
+#error "int8 KV scoring kernels: include via int8/template_launch.cuh, from int8/launch.cu (P6 2c C3)"
+#endif
+
 #include "ops/softmax_attention/dense/causal_cache/int8/tile_io.cuh"
 
 #include "ops/kernel/e8_root_codec.cuh"
@@ -24,10 +33,9 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
     const __half* __restrict__ cache_v_scale, Metadata metadata,
     const std::int32_t* __restrict__ positions, float scale, __nv_bfloat16* __restrict__ out,
     unsigned* __restrict__ page_score, std::int32_t width) {
-    // P6 2c hook site (appendix BL.2): per-page relevance counter. One CTA covers exactly one
-    // 64-token page here, so the CTA-wide hit reduction feeds page_score[k0 >> page_shift].
-    // Unused until the write hook lands in step 1.2.
-    (void)page_score;
+    // P6 2c hook site (appendix BL.2/BM.1 step 1.2). One CTA covers exactly one 64-token page
+    // here, so the CTA-wide hit reduction feeds counters[k0 >> kPagedKVPageShift]. `page_score` is
+    // the caller's already-resolved override; the metadata path is resolved below.
     constexpr int D             = 256;
     constexpr int Br            = Schedule::kQueryRows;
     constexpr int Bc            = Schedule::kKeyRows;
@@ -78,6 +86,8 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
     }
     const int base_pos              = positions[0];
     const std::int32_t* block_table = metadata.block_table();
+    // The relevance-counter row of this CTA, resolved exactly like block_table (appendix CA.2/CA.3).
+    unsigned* const counters = page_score != nullptr ? page_score : metadata.counters();
 
     const int tile_rows     = min(Br, tokens - q0);
     const int max_query_abs = base_pos + q0 + tile_rows - 1;
@@ -454,6 +464,25 @@ rk4_apply_e8_residual(dec, static_cast<std::uint32_t>(signs >> 8));
             }
             bm0 = warp_max<4>(bm0, FullMask);
             bm1 = warp_max<4>(bm1, FullMask);
+
+            // P6 2c score hook, criterion (i) "record page" (appendices CC.5/CO.4). This path keeps
+            // the running-best hit count because Tiled is the long-prefill shape and has no key
+            // partitioning at all - one CTA sweeps every key block - so the count is already
+            // deterministic here, and it is the statistic that actually carries the query signal: a
+            // page's own peak logit saturates on whichever stream is most extreme and collapses the
+            // profiles together (measured in CO.3). The counters are cleared per call (see
+            // sequence.cpp), so nothing accumulates across calls.
+            // A row's first page is not evidence - running_m starts at -inf and would record
+            // unconditionally (appendix CD.4). bm0/bm1 are already segment-reduced, so exactly one
+            // lane per segment reports, and nothing reads the counters yet.
+            if (counters != nullptr && page_present && lid == 0 &&
+                running_m0 != -CUDART_INF_F && running_m1 != -CUDART_INF_F) {
+                const int records = (bm0 > running_m0 ? 1 : 0) + (bm1 > running_m1 ? 1 : 0);
+                if (records > 0) {
+                    atomicAdd(counters + (k0 >> kPagedKVPageShift),
+                              static_cast<unsigned>(records));
+                }
+            }
 
             const float nm0        = fmaxf(running_m0, bm0);
             const float nm1        = fmaxf(running_m1, bm1);
