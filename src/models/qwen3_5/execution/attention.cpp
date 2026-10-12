@@ -40,8 +40,8 @@ void attention_projection(const Tensor& hidden, const AttentionParameters& param
                           Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
                           WorkspaceArena& workspace, cudaStream_t stream) {
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
-        ops::attn_input_proj(hidden, pair->first, pair->second, query, gate, key, value, workspace,
-                         stream);
+        ops::attn_input_proj(hidden, pair->first, pair->second, query, gate, key, value,
+                             ops::LinearPolicy::AllowA8, workspace, stream);
     } else {
         const auto& single = std::get<LinearParameters>(parameters.projection);
         ops::attn_input_proj(hidden, single.weight, query, gate, key, value, single.policy,

@@ -43,6 +43,7 @@ void q4_q5_attn_input_execute_plan(const Q4Q5AttnInputPlan& plan, const Tensor& 
                                    cudaStream_t stream);
 void q4_q5_attn_input_dispatch(const Tensor& x, const Weight& query_key_weight,
                                const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k,
-                               Tensor& v, WorkspaceArena& ws, cudaStream_t stream);
+                               Tensor& v, bool allow_int8_route, WorkspaceArena& ws,
+                               cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

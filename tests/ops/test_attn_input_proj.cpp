@@ -98,7 +98,7 @@ int run_target_projection_case(DevicePackedWeight& parent, DevicePackedWeight* g
     DeviceArena workspace(DeviceSpan{scratch.data(), std::max<std::size_t>(capacity, 1)});
     const auto launch = [&] {
         if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&prepared)) {
-            ops::attn_input_proj(x, pair->first, pair->second, q, g, k, v, workspace,
+            ops::attn_input_proj(x, pair->first, pair->second, q, g, k, v, policy, workspace,
                                  device.stream);
         } else {
             const auto& single = std::get<ops::SingleProjectionWeight>(prepared);

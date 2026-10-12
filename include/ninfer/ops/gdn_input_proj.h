@@ -38,7 +38,19 @@ namespace ninfer::ops {
  *   Writes the full qkv and z outputs; inputs and outputs must not alias.
  *
  * Workspace:
- *   No transient bytes are required.
+ *   The int8 route may use caller-owned transient bytes from `ws`.
+ *
+ * `policy` selects the admitted compute profiles exactly as it does for the single-parent overload
+ * below. The no-policy form means A16Only: the int8 route became the engine default, and before the
+ * policy reached this overload that default silently produced A8 for callers who read the bare form
+ * as the plain A16 projection. Ask for LinearPolicy::AllowA8 explicitly to admit the int8 route.
+ */
+void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                    Tensor& qkv, Tensor& z, LinearPolicy policy, WorkspaceArena& ws,
+                    cudaStream_t stream);
+
+/**
+ * Applies the A16-only two-parent GDN projection.
  */
 void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                     Tensor& qkv, Tensor& z, WorkspaceArena& ws, cudaStream_t stream);

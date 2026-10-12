@@ -65,7 +65,8 @@ std::size_t gdn_record_workspace_bytes(const GdnParameters& parameters, const Gd
 void gdn_projection(const Tensor& hidden, const GdnParameters& parameters, Tensor& qkv, Tensor& z,
                     WorkspaceArena& workspace, cudaStream_t stream) {
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
-        ops::gdn_input_proj(hidden, pair->first, pair->second, qkv, z, workspace, stream);
+        ops::gdn_input_proj(hidden, pair->first, pair->second, qkv, z,
+                            ops::LinearPolicy::AllowA8, workspace, stream);
     } else {
         const auto& single = std::get<LinearParameters>(parameters.projection);
         ops::gdn_input_proj(hidden, single.weight, qkv, z, single.policy, workspace, stream);

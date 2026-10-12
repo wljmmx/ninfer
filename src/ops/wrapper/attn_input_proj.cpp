@@ -210,7 +210,8 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
-                     WorkspaceArena& ws, cudaStream_t stream) {
+                     LinearPolicy policy, WorkspaceArena& ws, cudaStream_t stream) {
+    validate_policy(policy);
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kQRows  = 6144;
     constexpr std::int32_t kKvRows = 1024;
@@ -223,8 +224,18 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
     require_rowsplit(query_key_weight, QType::Q4_G64_FP16, kQRows + kKvRows, "query/key weight");
     require_rowsplit(gate_value_weight, QType::Q5_G64_FP16, kQRows + kKvRows, "gate/value weight");
 
-    detail::q4_q5_attn_input_dispatch(x, query_key_weight, gate_value_weight, q, gate, k, v, ws,
-                                      stream);
+    detail::q4_q5_attn_input_dispatch(x, query_key_weight, gate_value_weight, q, gate, k, v,
+                                      policy != LinearPolicy::A16Only, ws, stream);
+}
+
+/**
+ * Applies the A16-only two-parent Q/K/output-gate/V projection.
+ */
+void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
+                     const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
+                     WorkspaceArena& ws, cudaStream_t stream) {
+    attn_input_proj(x, query_key_weight, gate_value_weight, q, gate, k, v, LinearPolicy::A16Only,
+                    ws, stream);
 }
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,

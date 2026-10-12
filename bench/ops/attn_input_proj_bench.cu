@@ -320,7 +320,8 @@ void run_q4q5(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t 
         const std::size_t exact_workspace = ops::w4a8_attn_input_workspace_capacity_bytes(
             parent_rows, parent_rows, hidden, tokens, tokens);
         const auto launch = [&](cudaStream_t launch_stream) {
-            ops::attn_input_proj(x, qk.weight, gv.weight, tq, tg, tk, tv, workspace, launch_stream);
+            ops::attn_input_proj(x, qk.weight, gv.weight, tq, tg, tk, tv,
+                                 ops::LinearPolicy::AllowA8, workspace, launch_stream);
         };
         const CacheState profile_cache =
             options.cache == CacheMode::Cold ? CacheState::Cold : CacheState::Warm;

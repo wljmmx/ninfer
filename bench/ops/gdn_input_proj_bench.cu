@@ -331,7 +331,8 @@ void run_q4q5(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t 
             Tensor x(input.p, DType::BF16, {kHidden, tokens});
             Tensor tqkv(qkv.p, DType::BF16, {kQkRows + kValueRows, tokens});
             Tensor tz(z.p, DType::BF16, {kZRows, tokens});
-            ops::gdn_input_proj(x, qk.weight, value_z.weight, tqkv, tz, workspace, launch_stream);
+            ops::gdn_input_proj(x, qk.weight, value_z.weight, tqkv, tz,
+                                ops::LinearPolicy::AllowA8, workspace, launch_stream);
         };
     };
     measure_points(

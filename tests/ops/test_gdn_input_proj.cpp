@@ -60,7 +60,8 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
     const std::size_t capacity = ops::w4a8_gdn_input_workspace_capacity_bytes(
         qk_weight.n, vz_weight.n, qk_weight.k, tokens, tokens);
     WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
-    ops::gdn_input_proj(x, qk_weight, vz_weight, output, z_output, workspace, nullptr);
+    ops::gdn_input_proj(x, qk_weight, vz_weight, output, z_output,
+                        ops::LinearPolicy::A16Only, workspace, nullptr);
     cuda_synchronize();
 
     const std::string suffix = " Q4/Q5 A16 T=" + std::to_string(tokens);
@@ -105,7 +106,8 @@ int run_q4_q5_graph_case(DevicePackedWeight& query_key, DevicePackedWeight& valu
         qk_weight.n, vz_weight.n, qk_weight.k, tokens, tokens);
     WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
     const auto launch = [&](cudaStream_t launch_stream) {
-        ops::gdn_input_proj(x, qk_weight, vz_weight, output, z_output, workspace, launch_stream);
+        ops::gdn_input_proj(x, qk_weight, vz_weight, output, z_output,
+                            ops::LinearPolicy::A16Only, workspace, launch_stream);
     };
     launch(stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));

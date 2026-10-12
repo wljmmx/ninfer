@@ -141,9 +141,10 @@ void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
 
 void q4_q5_gdn_input_dispatch(const Tensor& x, const Weight& qk_weight,
                               const Weight& value_z_weight, Tensor& qkv, Tensor& z,
-                              WorkspaceArena& ws, cudaStream_t stream) {
-    // int8 route (NINFER_W4A8): same three jobs, one grouped launch.
-    if (w4a8_gdn_input_supported(qk_weight, value_z_weight, x.ne[1])) {
+                              bool allow_int8_route, WorkspaceArena& ws, cudaStream_t stream) {
+    // int8 route (NINFER_W4A8): same three jobs, one grouped launch. It is the engine default, so
+    // the caller's policy is what decides whether it may run (appendix CR).
+    if (allow_int8_route && w4a8_gdn_input_supported(qk_weight, value_z_weight, x.ne[1])) {
         w4a8_gdn_input_proj(x, qk_weight, value_z_weight, qkv, z, ws, stream);
         return;
     }
