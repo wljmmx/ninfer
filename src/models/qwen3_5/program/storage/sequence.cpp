@@ -1,11 +1,13 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "core/device.h"
+#include "ops/kernel/page_score_codec.cuh"
 
 #include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <fstream>
+#include <cmath>
 #include <map>
 #include <stdexcept>
 #include <utility>
@@ -296,10 +298,21 @@ void ProgramImpl::dump_page_scores(KVAddressSpaceStore& addresses, PagedKVCache&
     out << "# call\n";
     std::uint32_t maximum = 0;
     std::uint32_t nonzero = 0;
+    std::uint32_t codes = 0;
+    std::uint32_t counts = 0;
     for (std::uint32_t page = 0; page < rows; ++page) {
         out << page << '\t' << host[page] << '\n';
         if (host[page] > maximum) { maximum = host[page]; }
         nonzero += host[page] != 0u ? 1u : 0u;
+        // Only an encoded (a) value decodes to a finite float; a raw (i) count lands on a NaN or
+        // an infinity. See the mixed= field below.
+        if (host[page] != 0u) {
+            if (std::isfinite(ninfer::ops::paged_kv_page_score_decode(host[page]))) {
+                ++codes;
+            } else {
+                ++counts;
+            }
+        }
     }
     // C4: a silently all-zero dump is ambiguous - most KV storages (bf16, fp8, nvfp4, k8v4) have no
     // P6 2c scoring hook at all, so the counters stay zero no matter how important a page is - and
@@ -314,7 +327,11 @@ void ProgramImpl::dump_page_scores(KVAddressSpaceStore& addresses, PagedKVCache&
     bool& recorded = row_recorded[scores.data];
     recorded       = recorded || maximum != 0u;
     out << "# stats max=" << maximum << " nonzero=" << nonzero
-        << " ever_nonzero=" << (recorded ? 1 : 0) << '\n';
+        << " ever_nonzero=" << (recorded ? 1 : 0)
+        // A step can mix both statistics in one row (appendices DD/DE), so a reader must be told
+        // rather than left to decode counts as if they were encoded logits.
+        << " mixed=" << ((codes != 0u && counts != 0u) ? 1 : 0) << " codes=" << codes
+        << " counts=" << counts << '\n';
     if (!kv_page_scores_cumulative_enabled()) {
         // Per call is the semantics the counters are designed around (appendix CO): clearing here -
         // the dump runs before the forward - means the next dump reads exactly one call's
