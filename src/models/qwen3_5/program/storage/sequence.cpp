@@ -288,6 +288,15 @@ void ProgramImpl::set_device_i32(Tensor& tensor, std::int32_t value) {
 
 void ProgramImpl::ordered_reset(SequenceState& state) {
     refresh_state_views(state);
+    // P6 2c: the relevance counters accumulate, so a reused execution row must start from zero.
+    decoder->text_kv.execution_tables().reset_page_scores(
+        text_kv_addresses->execution_row(state.kv->text).handle(), device.stream);
+    if (state.kv->backend) {
+        if (PagedKVCache* cache = backend_kv_cache(); cache != nullptr) {
+            cache->execution_tables().reset_page_scores(
+                backend_kv_addresses->execution_row(*state.kv->backend).handle(), device.stream);
+        }
+    }
     state.text_kv_valid = state.mtp_kv_valid = state.dflash_context_frontier = 0;
     work.reset();
 }

@@ -49,10 +49,11 @@ public:
 
 private:
     friend class PagedKVCache;
-    PagedKVCacheView(const PagedKVCache& cache, Tensor block_table) noexcept;
+    PagedKVCacheView(const PagedKVCache& cache, Tensor block_table, Tensor page_score) noexcept;
 
     const PagedKVCache* cache_ = nullptr;
     Tensor block_table_;
+    Tensor page_score_;
 };
 
 class PagedKVCache {
@@ -86,7 +87,8 @@ public:
 
 private:
     friend class PagedKVCacheView;
-    [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer, Tensor block_table) const;
+    [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer, Tensor block_table,
+                                              Tensor page_score = Tensor{}) const;
 
     DeviceKVPagePool pages_;
     KVExecutionTablePool execution_tables_;

@@ -46,7 +46,7 @@ void launch_int8_kv_grouped_mma(const CausalAttentionOperands& p, Int8KvCacheVie
 template <class G, class S, bool PackedV = false, bool PackedK = false, bool E8Root = false,
           bool V8Root = false, bool E8Lattice = false>
 void launch_int8_kv_tiled_mma(const CausalAttentionOperands& p, Int8KvReadView cache,
-                              cudaStream_t stream) {
+                              Tensor* page_score, cudaStream_t stream) {
     validate_quantized_causal_operands<G>(p, cache);
     if (p.batch != 1)
         throw std::invalid_argument("INT8 tiled attention requires a complete single query row");
@@ -57,11 +57,13 @@ void launch_int8_kv_tiled_mma(const CausalAttentionOperands& p, Int8KvReadView c
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, S::kSharedBytes);
         CUDA_CHECK(status);
         const dim3 grid(div_up(p.width, S::kQueryRows), G::QHeads);
-        // page_score is the P6 2c relevance counter; nullptr until the score hook is wired
-        // (appendix BL/BM step 1.1/1.2).
+        // page_score is the P6 2c relevance counter. It is forwarded but still unused by the
+        // kernel body until the score hook lands (appendix BL/BM step 1.2).
+        unsigned* const counters =
+            page_score != nullptr ? static_cast<unsigned*>(page_score->data) : cache.page_scores;
         kernel<<<grid, S::kThreads, S::kSharedBytes, stream>>>(
             p.q, cache.keys, cache.values, cache.key_scales, cache.value_scales, metadata,
-            p.positions, p.scale, p.out, nullptr, p.width);
+            p.positions, p.scale, p.out, counters, p.width);
         CUDA_CHECK(cudaGetLastError());
     };
     if (!cache.table_rows)

@@ -139,13 +139,18 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * allocation, frontier, request identity, or commit authority. `execution` supplies the stream and
  * positive physical SM count used for launch and workspace planning; capacity queries must use the
  * same count as execution.
+ *
+ * `page_score` is optional. When non-null it must be a contiguous device I32 tensor covering every
+ * logical page addressable by the cache. The INT8 rank-compressed tiled route accumulates a
+ * per-page relevance counter into it (appendix BL/BM step 1.1); other cache storages ignore it.
  */
 void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& positions, const Tensor& valid_columns,
                               const Tensor& kv_table_rows, AttentionHeadGeometry geometry,
                               float scale, PagedKVBatchLayerView cache,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-                              Tensor& out, DeviceExecutionView execution);
+                              Tensor& out, DeviceExecutionView execution,
+                              Tensor* page_score = nullptr);
 
 /**
  * Read-only single-sequence causal attention over an already populated cache.
@@ -153,14 +158,15 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * q/out are contiguous BF16 [256,24|16,T], positions is contiguous sequential device I32 [T],
  * and cache geometry, visible rows, scale, numerical oracle, envelope, alias, and workspace rules
  * are the same as causal_softmax_attention. The Op accepts no new K/V and leaves every cache byte
- * unchanged; out is completely overwritten.
+ * unchanged; out is completely overwritten. `page_score` is optional and behaves as in
+ * causal_softmax_attention.
  */
 void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
                                      AttentionHeadGeometry geometry, float scale,
                                      const PagedKVLayerView& cache,
                                      CausalAttentionExecutionEnvelope envelope,
                                      WorkspaceArena& workspace, Tensor& out,
-                                     DeviceExecutionView execution);
+                                     DeviceExecutionView execution, Tensor* page_score = nullptr);
 
 /**
  * Return transient capacity for every W in the inclusive interval at one exact batch size. The

@@ -81,6 +81,9 @@ struct QuantizedCausalCacheView {
     const std::int32_t* valid_columns;
     const std::int32_t* table_rows;
     int table_stride, kv_heads;
+    // P6 2c relevance counters: the row for a single-row view, the matrix for a batched view.
+    // Null until step 1.2 starts writing into it.
+    unsigned* page_scores;
 };
 
 template <class View>
@@ -94,7 +97,8 @@ View make_quantized_causal_cache_view(const PagedKVBatchLayerView& cache,
             valid ? static_cast<const std::int32_t*>(valid->data) : nullptr,
             rows ? static_cast<const std::int32_t*>(rows->data) : nullptr,
             cache.block_tables.ne[0],
-            cache.num_kv_heads};
+            cache.num_kv_heads,
+            static_cast<unsigned*>(cache.page_scores.data)};
 }
 
 template <class G, class View>

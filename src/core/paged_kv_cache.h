@@ -26,6 +26,9 @@ struct PagedKVLayerView {
     Tensor k_scale_pages;
     Tensor v_scale_pages;
     Tensor block_table;
+    // P6 2c relevance counters of the one row this view binds, addressed exactly like block_table
+    // (same logical-page index space). Empty when the caller supplies no counter buffer.
+    Tensor page_score;
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
     KvCacheStorage storage    = KvCacheStorage::BFloat16;
@@ -38,6 +41,9 @@ struct PagedKVBatchLayerView {
     Tensor k_scale_pages;
     Tensor v_scale_pages;
     Tensor block_tables;
+    // P6 2c relevance-counter matrix, one row per execution row, addressed with the same stride as
+    // block_tables. Empty when the caller supplies no counter buffer.
+    Tensor page_scores;
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
     KvCacheStorage storage    = KvCacheStorage::BFloat16;
@@ -94,6 +100,10 @@ struct DeviceKVPagePoolLayout {
 struct KVExecutionTableLayout {
     KVExecutionTableSpec spec;
     TensorRegion block_tables;
+    // P6 2c relevance counters: one row per execution row, one column per logical page. This is
+    // sequence-lifetime state, so it lives with the tables rather than in the per-phase workspace
+    // scratch that `work.reset()` clears (appendix BO/BQ/BS).
+    TensorRegion page_score;
 
     [[nodiscard]] std::size_t metadata_bytes() const noexcept;
 };
@@ -405,6 +415,18 @@ public:
 
     [[nodiscard]] const Tensor& matrix() const noexcept { return block_tables_; }
 
+    // P6 2c: the counter matrix of the whole pool, addressed with the block-table stride.
+    [[nodiscard]] const Tensor& page_score_matrix() const noexcept { return page_score_; }
+
+    // P6 2c: the relevance-counter row bound to this execution row. Zero-initialised when the pool
+    // is constructed; the INT8 tiled attention accumulates into it once the score hook lands
+    // (appendix BL/BM step 1.2).
+    [[nodiscard]] Tensor page_score_row(KVExecutionRowHandle handle) const;
+
+    // P6 2c: zero the relevance counters of one execution row. Called when a sequence (re)starts,
+    // because the counters accumulate and a reused row must not inherit the previous sequence.
+    void reset_page_scores(KVExecutionRowHandle handle, cudaStream_t stream);
+
 private:
     friend class KVExecutionRowLease;
 
@@ -416,6 +438,7 @@ private:
     KVExecutionTableSpec spec_;
     const DeviceKVPagePool* pages_ = nullptr;
     Tensor block_tables_;
+    Tensor page_score_;
     PinnedHostBuffer host_shadow_;
     std::vector<bool> row_in_use_;
     std::vector<std::uint32_t> row_generations_;

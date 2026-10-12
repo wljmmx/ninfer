@@ -336,7 +336,7 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& kv_table_rows, AttentionHeadGeometry geometry,
                               float scale, PagedKVBatchLayerView cache,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-                              Tensor& out, DeviceExecutionView execution) {
+                              Tensor& out, DeviceExecutionView execution, Tensor* page_score) {
     constexpr const char* op = "causal_softmax_attention";
     if (execution.multiprocessor_count <= 0) {
         throw std::invalid_argument(std::string(op) + ": SM count must be positive");
@@ -353,6 +353,13 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     require_shape(v, kHeadDim, kv_heads, width, batch, op, "v");
     require_contiguous_nonnull(k, op, "k");
     require_contiguous_nonnull(v, op, "v");
+    // P6 2c relevance counter (appendix BL/BM step 1.1). Optional, and inert until step 1.2.
+    if (page_score != nullptr) {
+        if (page_score->dtype != DType::I32) {
+            throw std::invalid_argument(std::string(op) + ": page_score must be device I32");
+        }
+        require_contiguous_nonnull(*page_score, op, "page_score");
+    }
 
     if (cache.storage == KvCacheStorage::BFloat16) {
         detail::bf16_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
@@ -368,7 +375,7 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
 
     if (cache.storage == KvCacheStorage::Int8Group64) {
         detail::int8_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                         cache, envelope, workspace, out, execution);
+                                         cache, envelope, workspace, out, execution, page_score);
         return;
     }
 
@@ -403,23 +410,23 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     switch (cache.storage) {
     case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
         detail::rk4v4_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                          cache, envelope, workspace, out, execution);
+                                          cache, envelope, workspace, out, execution, page_score);
         return;
     case KvCacheStorage::RK4V4E8:
         detail::rk4v4e8_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows,
-                                            scale, cache, envelope, workspace, out, execution);
+                                            scale, cache, envelope, workspace, out, execution, page_score);
         return;
     case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
         detail::rk8v4_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows,
-                                          scale, cache, envelope, workspace, out, execution);
+                                          scale, cache, envelope, workspace, out, execution, page_score);
         return;
     case KvCacheStorage::RK2V4E8:
         detail::rk2v4e8_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows,
-                                            scale, cache, envelope, workspace, out, execution);
+                                            scale, cache, envelope, workspace, out, execution, page_score);
         return;
     case KvCacheStorage::RK4V2E8:
         detail::rk4v2e8_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows,
-                                            scale, cache, envelope, workspace, out, execution);
+                                            scale, cache, envelope, workspace, out, execution, page_score);
         return;
     default:
         break;
@@ -433,12 +440,19 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
                                      const PagedKVLayerView& cache,
                                      CausalAttentionExecutionEnvelope envelope,
                                      WorkspaceArena& workspace, Tensor& out,
-                                     DeviceExecutionView execution) {
+                                     DeviceExecutionView execution, Tensor* page_score) {
     constexpr const char* op = "causal_softmax_attention_cached";
     if (execution.multiprocessor_count <= 0) {
         throw std::invalid_argument(std::string(op) + ": SM count must be positive");
     }
     validate_attention_tensors(q, positions, out, geometry, cache, envelope, scale, op);
+    // P6 2c relevance counter (appendix BL/BM step 1.1). Optional, and inert until step 1.2.
+    if (page_score != nullptr) {
+        if (page_score->dtype != DType::I32) {
+            throw std::invalid_argument(std::string(op) + ": page_score must be device I32");
+        }
+        require_contiguous_nonnull(*page_score, op, "page_score");
+    }
 
     if (cache.storage == KvCacheStorage::BFloat16) {
         detail::bf16_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
@@ -454,7 +468,7 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
 
     if (cache.storage == KvCacheStorage::Int8Group64) {
         detail::int8_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
-                                         execution);
+                                         execution, page_score);
         return;
     }
 
@@ -486,23 +500,23 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
     switch (cache.storage) {
     case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
         detail::rk4v4_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
-                                          execution);
+                                          execution, page_score);
         return;
     case KvCacheStorage::RK4V4E8:
         detail::rk4v4e8_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
-                                            execution);
+                                            execution, page_score);
         return;
     case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
         detail::rk8v4_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
-                                          execution);
+                                          execution, page_score);
         return;
     case KvCacheStorage::RK2V4E8:
         detail::rk2v4e8_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
-                                            execution);
+                                            execution, page_score);
         return;
     case KvCacheStorage::RK4V2E8:
         detail::rk4v2e8_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
-                                            execution);
+                                            execution, page_score);
         return;
     default:
         break;
