@@ -45,6 +45,27 @@ std::uint32_t explicit_page_groups(const KvCapacityPolicy& policy,
     return static_cast<std::uint32_t>(pages);
 }
 
+bool residency_configured(const KvResidencyStrides& strides) {
+    return strides.payload_bytes_per_resident_page_group != 0 ||
+           strides.ledger_bytes_per_logical_page_group != 0;
+}
+
+// Anchor + payload per resident page + ledger per logical page. Both page counts are expressed
+// relative to the curve minimum, where the anchor reservation is exact.
+std::size_t residency_reservation_bytes(const SequenceCapacityCurve& curve,
+                                        const KvResidencyStrides& strides, std::uint32_t logical,
+                                        std::uint32_t resident) {
+    const std::size_t payload = checked_mul(
+        static_cast<std::size_t>(resident - curve.minimum_main_page_groups),
+        strides.payload_bytes_per_resident_page_group, "KV residency payload overflows size_t");
+    const std::size_t ledger = checked_mul(
+        static_cast<std::size_t>(logical - curve.minimum_main_page_groups),
+        strides.ledger_bytes_per_logical_page_group, "KV residency ledger overflows size_t");
+    return checked_add(checked_add(curve.minimum_device_reservation_bytes, payload,
+                                   "KV residency reservation overflows size_t"),
+                       ledger, "KV residency reservation overflows size_t");
+}
+
 } // namespace
 
 std::size_t SequenceCapacityCurve::reservation_bytes(std::uint32_t main_page_groups) const {
@@ -138,6 +159,80 @@ KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
         .automatic_headroom_bytes             = policy.automatic_headroom_bytes,
         .planned_slack_bytes                  = available_runtime_bytes - reservation,
     };
+}
+
+KvResidencyResolution resolve_kv_capacity_with_residency(const KvCapacityPolicy& policy,
+                                                        const SequenceCapacityCurve& curve,
+                                                        const KvResidencyStrides& strides,
+                                                        std::size_t available_runtime_bytes) {
+    validate_curve(curve);
+
+    KvResidencyResolution resolution;
+    if (!residency_configured(strides)) {
+        // Residency model inactive: report exactly what the fully resident resolution does.
+        const auto base = resolve_kv_capacity(policy, curve, available_runtime_bytes);
+        resolution.logical_page_groups               = base.main_page_groups;
+        resolution.resident_page_groups              = base.main_page_groups;
+        resolution.device_reservation_bytes          = base.runtime_reservation_bytes;
+        resolution.fully_resident_reservation_bytes  = base.runtime_reservation_bytes;
+        return resolution;
+    }
+
+    if (checked_add(strides.payload_bytes_per_resident_page_group,
+                    strides.ledger_bytes_per_logical_page_group,
+                    "KV residency strides overflow size_t") !=
+        curve.bytes_per_additional_main_page_group) {
+        throw std::invalid_argument(
+            "KV residency strides do not add up to the capacity curve stride");
+    }
+    if (policy.mode != KvCapacityMode::Explicit) {
+        throw std::invalid_argument(
+            "KV residency resolution requires an explicit logical capacity");
+    }
+    if (policy.automatic_headroom_bytes != 0) {
+        throw std::invalid_argument("explicit KV capacity must not carry automatic headroom");
+    }
+
+    const std::uint32_t logical = explicit_page_groups(policy, curve);
+    if (logical < curve.minimum_main_page_groups || logical > curve.maximum_main_page_groups) {
+        throw std::invalid_argument("Explicit KV capacity is outside the target capacity curve");
+    }
+    resolution.residency_active                 = true;
+    resolution.logical_page_groups              = logical;
+    resolution.fully_resident_reservation_bytes = curve.reservation_bytes(logical);
+
+    // Ledger for every logical page exists regardless of residency; the largest residency that
+    // fits the budget then follows from the payload stride.
+    const std::size_t with_ledger =
+        checked_add(curve.minimum_device_reservation_bytes,
+                    checked_mul(static_cast<std::size_t>(logical - curve.minimum_main_page_groups),
+                                strides.ledger_bytes_per_logical_page_group,
+                                "KV residency ledger overflows size_t"),
+                    "KV residency reservation overflows size_t");
+    if (available_runtime_bytes < with_ledger) {
+        throw std::invalid_argument(
+            "minimum Engine runtime reservation requires " + std::to_string(with_ledger) +
+            " bytes for " + std::to_string(logical) +
+            " logical pages, but only " + std::to_string(available_runtime_bytes) +
+            " bytes are available for runtime capacity");
+    }
+
+    std::uint32_t resident = logical;
+    if (strides.payload_bytes_per_resident_page_group != 0) {
+        const std::size_t affordable =
+            (available_runtime_bytes - with_ledger) / strides.payload_bytes_per_resident_page_group;
+        const std::uint64_t candidate =
+            static_cast<std::uint64_t>(curve.minimum_main_page_groups) + affordable;
+        resident = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(candidate, static_cast<std::uint64_t>(logical)));
+    }
+
+    resolution.resident_page_groups      = resident;
+    resolution.device_reservation_bytes  = residency_reservation_bytes(curve, strides, logical, resident);
+    resolution.host_payload_bytes        = checked_mul(
+        static_cast<std::size_t>(logical - resident),
+        strides.payload_bytes_per_resident_page_group, "KV residency host payload overflows size_t");
+    return resolution;
 }
 
 } // namespace ninfer::runtime
