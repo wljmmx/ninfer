@@ -549,8 +549,10 @@ public:
     void apply_kv_eviction_window(KVAddressSpaceStore& addresses, PagedKVCache& cache,
                                   KVAddressSpaceHandle address);
     // P6 2c verification aid, default off: when NINFER_KV_EVICT_SCORES_DUMP names a file, write
-    // this row's relevance counters as "page<TAB>hits" lines. Nothing consumes the counters yet,
-    // so this is the only way to check that step 1.2 counts what it should.
+    // both of this row's score planes: the hit counts as "page<TAB>hits" lines (the original format,
+    // kept so dumps stay comparable to the archives) and then the peak scores as
+    // "p<TAB>page<TAB>code" lines, each table followed by its own "# stats" line. Nothing consumes
+    // the planes yet, so this is the only way to check that step 1.2 scores what it should.
     void dump_page_scores(KVAddressSpaceStore& addresses, PagedKVCache& cache,
                           KVAddressSpaceHandle address);
     [[nodiscard]] PagedKVCache* backend_kv_cache() noexcept;

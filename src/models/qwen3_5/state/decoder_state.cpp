@@ -83,8 +83,9 @@ PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
 }
 
 PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, Tensor block_table,
-                                 Tensor page_score) noexcept
-    : cache_(&cache), block_table_(block_table), page_score_(page_score) {}
+                                 Tensor page_score, Tensor page_score_peak) noexcept
+    : cache_(&cache), block_table_(block_table), page_score_(page_score),
+      page_score_peak_(page_score_peak) {}
 
 std::uint32_t PagedKVCacheView::max_context() const noexcept {
     return cache_ == nullptr ? 0 : cache_->max_context();
@@ -92,7 +93,7 @@ std::uint32_t PagedKVCacheView::max_context() const noexcept {
 
 PagedKVLayerView PagedKVCacheView::layer_view(std::uint32_t layer) const {
     if (cache_ == nullptr) { throw std::logic_error("Paged KV execution view is empty"); }
-    return cache_->layer_view(layer, block_table_, page_score_);
+    return cache_->layer_view(layer, block_table_, page_score_, page_score_peak_);
 }
 
 PagedKVCacheView PagedKVCache::execution_view(const KVExecutionRowLease& row) const {
@@ -100,11 +101,12 @@ PagedKVCacheView PagedKVCache::execution_view(const KVExecutionRowLease& row) co
         throw std::invalid_argument("Paged KV execution row belongs to another cache");
     }
     return PagedKVCacheView(*this, execution_tables_.row(row.handle()),
-                            execution_tables_.page_score_row(row.handle()));
+                            execution_tables_.page_score_row(row.handle()),
+                            execution_tables_.page_score_peak_row(row.handle()));
 }
 
 PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_table,
-                                         Tensor page_score) const {
+                                         Tensor page_score, Tensor page_score_peak) const {
     if (layer >= layers_) { throw std::out_of_range("Paged KV layer is out of range"); }
     const std::size_t stride        = layer_storage_.planes_per_layer();
     const std::size_t base          = static_cast<std::size_t>(layer) * stride;
@@ -112,30 +114,32 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
     const std::size_t v_scale_index =
         k_scale_index + static_cast<std::size_t>(layer_storage_.key.has_scale());
     return PagedKVLayerView{
-        .k_pages       = pages_.plane(base),
-        .v_pages       = pages_.plane(base + 1),
-        .k_scale_pages = layer_storage_.key.has_scale() ? pages_.plane(k_scale_index) : Tensor(),
-        .v_scale_pages = layer_storage_.value.has_scale() ? pages_.plane(v_scale_index) : Tensor(),
-        .block_table   = block_table,
-        .page_score    = page_score,
-        .head_dim      = layer_storage_.head_dim,
-        .num_kv_heads  = kv_heads_,
-        .storage       = layer_storage_.storage,
+        .k_pages         = pages_.plane(base),
+        .v_pages         = pages_.plane(base + 1),
+        .k_scale_pages   = layer_storage_.key.has_scale() ? pages_.plane(k_scale_index) : Tensor(),
+        .v_scale_pages   = layer_storage_.value.has_scale() ? pages_.plane(v_scale_index) : Tensor(),
+        .block_table     = block_table,
+        .page_score      = page_score,
+        .page_score_peak = page_score_peak,
+        .head_dim        = layer_storage_.head_dim,
+        .num_kv_heads    = kv_heads_,
+        .storage         = layer_storage_.storage,
     };
 }
 
 PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const {
     const PagedKVLayerView direct = layer_view(layer, Tensor());
     return PagedKVBatchLayerView{
-        .k_pages       = direct.k_pages,
-        .v_pages       = direct.v_pages,
-        .k_scale_pages = direct.k_scale_pages,
-        .v_scale_pages = direct.v_scale_pages,
-        .block_tables  = execution_tables_.matrix(),
-        .page_scores   = execution_tables_.page_score_matrix(),
-        .head_dim      = direct.head_dim,
-        .num_kv_heads  = direct.num_kv_heads,
-        .storage       = direct.storage,
+        .k_pages          = direct.k_pages,
+        .v_pages          = direct.v_pages,
+        .k_scale_pages    = direct.k_scale_pages,
+        .v_scale_pages    = direct.v_scale_pages,
+        .block_tables     = execution_tables_.matrix(),
+        .page_scores      = execution_tables_.page_score_matrix(),
+        .page_scores_peak = execution_tables_.page_score_peak_matrix(),
+        .head_dim         = direct.head_dim,
+        .num_kv_heads     = direct.num_kv_heads,
+        .storage          = direct.storage,
     };
 }
 

@@ -41,7 +41,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t logical_capacity, CausalKvPartition partition, float scale, float* partial_acc,
-        float* partial_m, float* partial_l, unsigned* page_scores) {
+        float* partial_m, float* partial_l, unsigned* page_scores,
+        unsigned* page_scores_peak) {
     constexpr int TokenTile            = Schedule::kTokenTile;
     constexpr int WarpsPerCta          = Schedule::kWarps;
     constexpr int KeyBlock             = Schedule::kKeyRows;
@@ -123,10 +124,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     const int table_row = table_rows == nullptr ? 0 : table_rows[batch];
     const std::int32_t* block_table =
         block_tables + static_cast<std::int64_t>(table_row) * table_stride;
-    // P6 2c: relevance counters for this row, resolved exactly like block_table.
-    unsigned* const counters = page_scores == nullptr
+    // P6 2c: the score plane for this row, resolved exactly like block_table. Which plane it is -
+    // and therefore which unit gets written - is a compile-time property of the shape (CO.4): the
+    // prefill shape (ParallelQueries) records running-best hit counts in `page_scores`, the decode
+    // shape records order-preserving peak logits in `page_scores_peak`. Separate planes are what stop
+    // a step that runs both shapes from writing counts and codes into the same cells (appendices
+    // DD/DE). Selecting the plane here also keeps one pointer live instead of two.
+    unsigned* const plane    = ParallelQueries ? page_scores : page_scores_peak;
+    unsigned* const counters = plane == nullptr
                                    ? nullptr
-                                   : page_scores + static_cast<std::int64_t>(table_row) * table_stride;
+                                   : plane + static_cast<std::int64_t>(table_row) * table_stride;
     if constexpr (MultiBatch) {
         partial_acc +=
             static_cast<std::int64_t>(batch) * 256 * Geometry::QHeads * partial_width * split_count;
@@ -840,6 +847,8 @@ rk4_apply_e8_residual(dec, static_cast<std::uint32_t>(signs >> 8));
             //    64, where partition restarts would inflate the count; and with a single query row
             //    there is no body-versus-question competition for a maximum to be dominated by. So
             //    take the order-preserving peak logit: idempotent, and exact (no quantisation).
+            //  Each statistic owns its own plane, so `counters` above already names the right one and
+            //  the add-versus-max choice below agrees with the plane choice by construction.
             // bm0/bm1 are segment-reduced, so exactly one lane per segment reports; nothing reads the
             // counters yet, so the attention numerics are untouched.
             if (counters != nullptr && page_present && lid == 0) {

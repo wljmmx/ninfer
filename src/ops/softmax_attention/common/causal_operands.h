@@ -84,6 +84,10 @@ struct QuantizedCausalCacheView {
     // P6 2c relevance counters: the row for a single-row view, the matrix for a batched view.
     // Null until step 1.2 starts writing into it.
     unsigned* page_scores;
+    // P6 2c peak scores: the second statistic's plane, the same shape and the same addressing as
+    // `page_scores`. Two planes, because one step can run both shapes against the same execution row
+    // and the two units must not be conflated (appendices DD/DE).
+    unsigned* page_scores_peak;
 };
 
 template <class View>
@@ -98,7 +102,8 @@ View make_quantized_causal_cache_view(const PagedKVBatchLayerView& cache,
             rows ? static_cast<const std::int32_t*>(rows->data) : nullptr,
             cache.block_tables.ne[0],
             cache.num_kv_heads,
-            static_cast<unsigned*>(cache.page_scores.data)};
+            static_cast<unsigned*>(cache.page_scores.data),
+            static_cast<unsigned*>(cache.page_scores_peak.data)};
 }
 
 template <class G, class View>

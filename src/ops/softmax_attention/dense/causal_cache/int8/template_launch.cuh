@@ -48,7 +48,7 @@ void launch_int8_kv_grouped_mma(const CausalAttentionOperands& p, Int8KvCacheVie
         p.q, input, p.positions, cache.keys, cache.values, cache.key_scales, cache.value_scales,
         cache.tables, cache.valid_columns, cache.table_rows, cache.table_stride, p.width,
         p.visible_capacity, partition, p.scale, partial.acc, partial.maximum, partial.sum,
-        cache.page_scores);
+        cache.page_scores, cache.page_scores_peak);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -75,14 +75,20 @@ void launch_int8_kv_tiled_mma(const CausalAttentionOperands& p, Int8KvReadView c
             p.positions, p.scale, p.out, override_scores, p.width);
         CUDA_CHECK(cudaGetLastError());
     };
+    // The tiled path records hit counts only, so it resolves `page_scores`, the count plane. The
+    // peak plane is bound as well: a metadata should be a complete description of the row rather
+    // than a record of "the planes this particular caller needed", which is exactly how a stale call
+    // site would hide (appendices DD/DE).
     if (!cache.table_rows)
-        invoke(PagedKVDirectMetadata{cache.tables, cache.page_scores});
+        invoke(PagedKVDirectMetadata{cache.tables, cache.page_scores, cache.page_scores_peak});
     else if (cache.valid_columns)
         invoke(PagedKVBatchMetadata<true>{cache.tables, cache.valid_columns, cache.table_rows,
-                                          cache.table_stride, cache.page_scores});
+                                          cache.table_stride, cache.page_scores,
+                                          cache.page_scores_peak});
     else
         invoke(PagedKVBatchMetadata<false>{cache.tables, nullptr, cache.table_rows,
-                                           cache.table_stride, cache.page_scores});
+                                           cache.table_stride, cache.page_scores,
+                                           cache.page_scores_peak});
 }
 
 } // namespace ninfer::ops::detail

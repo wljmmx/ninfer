@@ -29,6 +29,10 @@ struct PagedKVLayerView {
     // P6 2c relevance counters of the one row this view binds, addressed exactly like block_table
     // (same logical-page index space). Empty when the caller supplies no counter buffer.
     Tensor page_score;
+    // P6 2c peak scores of the same row: the second statistic's plane (see page_score_codec.cuh).
+    // The two statistics carry different units and one execution step can produce both, so they must
+    // not share cells (appendices DD/DE). Empty when the caller supplies no counter buffer.
+    Tensor page_score_peak;
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
     KvCacheStorage storage    = KvCacheStorage::BFloat16;
@@ -44,6 +48,8 @@ struct PagedKVBatchLayerView {
     // P6 2c relevance-counter matrix, one row per execution row, addressed with the same stride as
     // block_tables. Empty when the caller supplies no counter buffer.
     Tensor page_scores;
+    // P6 2c peak-score matrix: the twin of `page_scores`, same shape and addressing.
+    Tensor page_scores_peak;
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
     KvCacheStorage storage    = KvCacheStorage::BFloat16;
@@ -104,6 +110,10 @@ struct KVExecutionTableLayout {
     // sequence-lifetime state, so it lives with the tables rather than in the per-phase workspace
     // scratch that `work.reset()` clears (appendix BO/BQ/BS).
     TensorRegion page_score;
+    // P6 2c peak scores: the twin of `page_score` for the second statistic. Two planes, because one
+    // step can run a prefill call (hit counts) and a decode call (peak logits) against the same
+    // execution row, and conflating the two units is what appendix DE.2 caught.
+    TensorRegion page_score_peak;
 
     [[nodiscard]] std::size_t metadata_bytes() const noexcept;
 };
@@ -423,8 +433,14 @@ public:
     // (appendix BL/BM step 1.2).
     [[nodiscard]] Tensor page_score_row(KVExecutionRowHandle handle) const;
 
-    // P6 2c: zero the relevance counters of one execution row. Called when a sequence (re)starts,
-    // because the counters accumulate and a reused row must not inherit the previous sequence.
+    // P6 2c: the peak-score matrix / row, the twin of page_score_matrix() / page_score_row().
+    [[nodiscard]] const Tensor& page_score_peak_matrix() const noexcept { return page_score_peak_; }
+    [[nodiscard]] Tensor page_score_peak_row(KVExecutionRowHandle handle) const;
+
+    // P6 2c: zero BOTH score planes of one execution row. Called when a sequence (re)starts and
+    // after every dump, because the planes accumulate and a reused row must not inherit the previous
+    // sequence. The two planes are cleared together so a per-call reader can never see one statistic
+    // from this call sitting beside the other statistic from the last call.
     void reset_page_scores(KVExecutionRowHandle handle, cudaStream_t stream);
 
 private:
@@ -439,6 +455,7 @@ private:
     const DeviceKVPagePool* pages_ = nullptr;
     Tensor block_tables_;
     Tensor page_score_;
+    Tensor page_score_peak_;
     PinnedHostBuffer host_shadow_;
     std::vector<bool> row_in_use_;
     std::vector<std::uint32_t> row_generations_;

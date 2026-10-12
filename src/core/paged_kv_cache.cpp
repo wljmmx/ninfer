@@ -56,17 +56,20 @@ void increment_generation(std::uint32_t& generation) noexcept {
 
 PagedKVBatchLayerView single_row_paged_kv_batch_view(const PagedKVLayerView& cache) {
     return {
-        .k_pages       = cache.k_pages,
-        .v_pages       = cache.v_pages,
-        .k_scale_pages = cache.k_scale_pages,
-        .v_scale_pages = cache.v_scale_pages,
-        .block_tables  = cache.block_table.view({cache.block_table.ne[0], 1}),
-        .page_scores   = cache.page_score.data != nullptr
-                             ? cache.page_score.view({cache.page_score.ne[0], 1})
-                             : Tensor(),
-        .head_dim      = cache.head_dim,
-        .num_kv_heads  = cache.num_kv_heads,
-        .storage       = cache.storage,
+        .k_pages          = cache.k_pages,
+        .v_pages          = cache.v_pages,
+        .k_scale_pages    = cache.k_scale_pages,
+        .v_scale_pages    = cache.v_scale_pages,
+        .block_tables     = cache.block_table.view({cache.block_table.ne[0], 1}),
+        .page_scores      = cache.page_score.data != nullptr
+                                ? cache.page_score.view({cache.page_score.ne[0], 1})
+                                : Tensor(),
+        .page_scores_peak = cache.page_score_peak.data != nullptr
+                                ? cache.page_score_peak.view({cache.page_score_peak.ne[0], 1})
+                                : Tensor(),
+        .head_dim         = cache.head_dim,
+        .num_kv_heads     = cache.num_kv_heads,
+        .storage          = cache.storage,
     };
 }
 
@@ -115,6 +118,13 @@ KVExecutionTableLayout plan_kv_execution_tables(LayoutBuilder& builder,
         {checked_i32(spec.logical_page_capacity, "Paged KV logical page capacity"),
          spec.table_rows},
         256, "P6 2c page scores");
+    // P6 2c peak scores: the same geometry as the counter plane, because both are indexed by
+    // (execution row, logical page) and are resolved through the same stride (appendices DD/DE).
+    layout.page_score_peak = builder.add_tensor(
+        DType::I32,
+        {checked_i32(spec.logical_page_capacity, "Paged KV logical page capacity"),
+         spec.table_rows},
+        256, "P6 2c peak scores");
     return layout;
 }
 
@@ -860,6 +870,7 @@ KVExecutionTablePool::KVExecutionTablePool(DeviceSpan backing, const KVExecution
                                            const DeviceKVPagePool& pages)
     : spec_(layout.spec), pages_(&pages), block_tables_(layout.block_tables.bind(backing)),
       page_score_(layout.page_score.bind(backing)),
+      page_score_peak_(layout.page_score_peak.bind(backing)),
       host_shadow_(checked_table_bytes(layout.spec)),
       row_in_use_(static_cast<std::size_t>(layout.spec.table_rows), false),
       row_generations_(static_cast<std::size_t>(layout.spec.table_rows), 1) {
@@ -873,10 +884,18 @@ KVExecutionTablePool::KVExecutionTablePool(DeviceSpan backing, const KVExecution
         page_score_.ne[1] != block_tables_.ne[1]) {
         throw std::logic_error("P6 2c page-score layout is inconsistent");
     }
+    if (page_score_peak_.dtype != DType::I32 || page_score_peak_.ne[0] != block_tables_.ne[0] ||
+        page_score_peak_.ne[1] != block_tables_.ne[1]) {
+        throw std::logic_error("P6 2c peak-score layout is inconsistent");
+    }
     // The counters are cumulative, so their starting state has to be deterministic.
     CUDA_CHECK(cudaMemset(page_score_.data,
                          0, static_cast<std::size_t>(page_score_.ne[0]) *
                                 static_cast<std::size_t>(page_score_.ne[1]) *
+                                sizeof(std::int32_t)));
+    CUDA_CHECK(cudaMemset(page_score_peak_.data,
+                         0, static_cast<std::size_t>(page_score_peak_.ne[0]) *
+                                static_cast<std::size_t>(page_score_peak_.ne[1]) *
                                 sizeof(std::int32_t)));
 }
 
@@ -1018,14 +1037,24 @@ Tensor KVExecutionTablePool::page_score_row(KVExecutionRowHandle handle) const {
         .view({static_cast<std::int32_t>(logical_page_capacity())});
 }
 
+Tensor KVExecutionTablePool::page_score_peak_row(KVExecutionRowHandle handle) const {
+    if (!valid_handle(handle)) { throw std::invalid_argument("Paged KV execution row is stale"); }
+    return page_score_peak_.slice(1, handle.row_, 1)
+        .view({static_cast<std::int32_t>(logical_page_capacity())});
+}
+
 void KVExecutionTablePool::reset_page_scores(KVExecutionRowHandle handle, cudaStream_t stream) {
     if (!valid_handle(handle)) {
         throw std::invalid_argument("P6 2c page-score reset names a stale execution row");
     }
-    const Tensor scores = page_score_row(handle);
-    CUDA_CHECK(cudaMemsetAsync(scores.data, 0,
-                               static_cast<std::size_t>(scores.ne[0]) * sizeof(std::int32_t),
-                               stream));
+    // Both planes: a per-call reader must never see one statistic from this call beside the other
+    // statistic from the previous one (appendices CO/DD/DE).
+    const Tensor planes[2] = {page_score_row(handle), page_score_peak_row(handle)};
+    for (const Tensor& plane : planes) {
+        CUDA_CHECK(cudaMemsetAsync(plane.data, 0,
+                                   static_cast<std::size_t>(plane.ne[0]) * sizeof(std::int32_t),
+                                   stream));
+    }
 }
 
 } // namespace ninfer

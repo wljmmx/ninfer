@@ -1,13 +1,11 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "core/device.h"
-#include "ops/kernel/page_score_codec.cuh"
 
 #include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <fstream>
-#include <cmath>
 #include <map>
 #include <stdexcept>
 #include <utility>
@@ -32,13 +30,27 @@ struct KvEvictionWindow {
     }
 };
 
-// P6 2c: the page counters are per-call by default (appendix CO). They are a marginal over the
-// streams of one call, and the prefill and decode shapes store different units, so an accumulating
-// buffer would conflate calls and mix units. NINFER_KV_EVICT_SCORES_CUMULATIVE restores the old
-// accumulating profile for A/B against the archives in .temp/kv.
+// P6 2c: the page scores are per-call by default (appendix CO). They are a marginal over the streams
+// of one call, so an accumulating buffer would conflate calls. The two statistics also live in two
+// separate planes - `page_score` carries the prefill hit count, `page_score_peak` the decode peak
+// logit - precisely so that a step running both shapes cannot mix units in one row (appendices
+// DD/DE). NINFER_KV_EVICT_SCORES_CUMULATIVE restores the old accumulating profile for A/B against
+// the archives in .temp/kv.
 bool kv_page_scores_cumulative_enabled() {
     static const bool enabled = std::getenv("NINFER_KV_EVICT_SCORES_CUMULATIVE") != nullptr;
     return enabled;
+}
+
+// N3/DE: the run-level "did this row ever record anything" flag is keyed on the plane's own block -
+// the slice handed out per execution row is stable and distinct - rather than on the process, so a
+// batched run cannot let one row's traffic make a silent row look healthy. Each plane keeps its own
+// flag: after the split a plane carries exactly one unit, so "this plane recorded something" and
+// "this statistic was measured" are the same statement (appendix C4/CW).
+bool record_plane_activity(const void* plane, std::uint32_t maximum) {
+    static std::map<const void*, bool> recorded;
+    bool& flag = recorded[plane];
+    flag       = flag || maximum != 0u;
+    return flag;
 }
 
 const KvEvictionWindow& kv_eviction_window() {
@@ -276,68 +288,66 @@ void ProgramImpl::dump_page_scores(KVAddressSpaceStore& addresses, PagedKVCache&
     if (path == nullptr || *path == '\0') { return; }
     const std::uint32_t frontier = addresses.committed_frontier(address);
     if (frontier == 0) { return; }
-    const Tensor scores =
-        cache.execution_tables().page_score_row(addresses.execution_row(address).handle());
-    const std::uint32_t pages = static_cast<std::uint32_t>(scores.ne[0]);
+    const KVExecutionRowHandle row = addresses.execution_row(address).handle();
+    const Tensor counts = cache.execution_tables().page_score_row(row);
+    const Tensor peaks  = cache.execution_tables().page_score_peak_row(row);
+    const std::uint32_t pages = static_cast<std::uint32_t>(counts.ne[0]);
     const std::uint32_t live  = kv_live_pages(frontier);
     const std::uint32_t rows  = live < pages ? live : pages;
-    std::vector<std::uint32_t> host(static_cast<std::size_t>(rows), 0u);
+    std::vector<std::uint32_t> host_counts(static_cast<std::size_t>(rows), 0u);
+    std::vector<std::uint32_t> host_peaks(static_cast<std::size_t>(rows), 0u);
     if (rows != 0) {
-        CUDA_CHECK(cudaMemcpyAsync(host.data(), scores.data,
-                                   static_cast<std::size_t>(rows) * sizeof(std::uint32_t),
+        const std::size_t bytes = static_cast<std::size_t>(rows) * sizeof(std::uint32_t);
+        CUDA_CHECK(cudaMemcpyAsync(host_counts.data(), counts.data, bytes,
+                                   cudaMemcpyDeviceToHost, device.stream));
+        CUDA_CHECK(cudaMemcpyAsync(host_peaks.data(), peaks.data, bytes,
                                    cudaMemcpyDeviceToHost, device.stream));
         CUDA_CHECK(cudaStreamSynchronize(device.stream));
     }
     // Append with a call marker: the number of markers says how often the decision point ran, and
     // consecutive blocks say whether the question tail ever reaches a dumped call (appendix CD.5.1).
-    // The raw counter is written, because its unit depends on the shape that produced it (appendix
-    // CO.4): a prefill shape stores a running-best hit count, a decode shape an order-preserving peak
-    // logit (recover it with paged_kv_page_score_decode). 0 means "nothing recorded".
+    // Each statistic is written raw into its own table, because its unit is fixed by the plane and
+    // not by the shape that happened to run (appendices CO.4/DD/DE): the count plane stores a
+    // running-best hit count, the peak plane an order-preserving peak logit (recover it with
+    // paged_kv_page_score_decode). 0 means "nothing recorded".
+    //
+    // The count table keeps the original "page<TAB>raw" lines so a dump still lines up with the
+    // archives written before the split. The peak rows are prefixed with 'p' on purpose: a reader
+    // that only understands the old format then fails loudly on them instead of silently merging the
+    // two units back into one table - which is exactly how appendix DE.1 read counts as logits and
+    // reported phantom NaNs.
     std::ofstream out(path, std::ios::app);
     if (!out) { return; }
     out << "# call\n";
-    std::uint32_t maximum = 0;
-    std::uint32_t nonzero = 0;
-    std::uint32_t codes = 0;
-    std::uint32_t counts = 0;
+    std::uint32_t count_max     = 0;
+    std::uint32_t count_nonzero = 0;
     for (std::uint32_t page = 0; page < rows; ++page) {
-        out << page << '\t' << host[page] << '\n';
-        if (host[page] > maximum) { maximum = host[page]; }
-        nonzero += host[page] != 0u ? 1u : 0u;
-        // Only an encoded (a) value decodes to a finite float; a raw (i) count lands on a NaN or
-        // an infinity. See the mixed= field below.
-        if (host[page] != 0u) {
-            if (std::isfinite(ninfer::ops::paged_kv_page_score_decode(host[page]))) {
-                ++codes;
-            } else {
-                ++counts;
-            }
-        }
+        out << page << '\t' << host_counts[page] << '\n';
+        if (host_counts[page] > count_max) { count_max = host_counts[page]; }
+        count_nonzero += host_counts[page] != 0u ? 1u : 0u;
     }
     // C4: a silently all-zero dump is ambiguous - most KV storages (bf16, fp8, nvfp4, k8v4) have no
-    // P6 2c scoring hook at all, so the counters stay zero no matter how important a page is - and
-    // that is easy to misread as "no page is important". Say it outright, and carry a run-level flag
-    // so the last block answers "did any call ever record anything". Lines beginning with '#' are
-    // markers, so this stays out of the page table.
-    // N3: key the run-level flag on this row's counter block rather than on the process - a batched
-    // run dumps several execution rows, and a single process-wide flag would let a row whose counters
-    // did fire make a silent row look healthy. The slice handed out by page_score_row() is stable and
-    // distinct per row, so its data pointer identifies the row without touching the pool's internals.
-    static std::map<const void*, bool> row_recorded;
-    bool& recorded = row_recorded[scores.data];
-    recorded       = recorded || maximum != 0u;
-    out << "# stats max=" << maximum << " nonzero=" << nonzero
-        << " ever_nonzero=" << (recorded ? 1 : 0)
-        // A step can mix both statistics in one row (appendices DD/DE), so a reader must be told
-        // rather than left to decode counts as if they were encoded logits.
-        << " mixed=" << ((codes != 0u && counts != 0u) ? 1 : 0) << " codes=" << codes
-        << " counts=" << counts << '\n';
+    // P6 2c scoring hook at all, so a plane stays zero no matter how important a page is - and that
+    // is easy to misread as "no page is important". Each plane therefore states its own maximum, its
+    // own nonzero count, and whether any call of this run ever recorded anything on it. Lines
+    // beginning with '#' are markers, so this stays out of the page tables.
+    out << "# stats max=" << count_max << " nonzero=" << count_nonzero
+        << " ever_nonzero=" << (record_plane_activity(counts.data, count_max) ? 1 : 0) << '\n';
+    std::uint32_t peak_max     = 0;
+    std::uint32_t peak_nonzero = 0;
+    out << "# peak\n";
+    for (std::uint32_t page = 0; page < rows; ++page) {
+        out << "p\t" << page << '\t' << host_peaks[page] << '\n';
+        if (host_peaks[page] > peak_max) { peak_max = host_peaks[page]; }
+        peak_nonzero += host_peaks[page] != 0u ? 1u : 0u;
+    }
+    out << "# stats_peak max=" << peak_max << " nonzero=" << peak_nonzero
+        << " ever_nonzero=" << (record_plane_activity(peaks.data, peak_max) ? 1 : 0) << '\n';
     if (!kv_page_scores_cumulative_enabled()) {
-        // Per call is the semantics the counters are designed around (appendix CO): clearing here -
+        // Per call is the semantics the planes are designed around (appendix CO): clearing here -
         // the dump runs before the forward - means the next dump reads exactly one call's
-        // contribution, whatever shape produced it.
-        cache.execution_tables().reset_page_scores(addresses.execution_row(address).handle(),
-                                                   device.stream);
+        // contribution, whatever shape produced it. Both planes are cleared together.
+        cache.execution_tables().reset_page_scores(row, device.stream);
     }
 }
 

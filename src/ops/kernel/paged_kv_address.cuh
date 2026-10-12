@@ -16,6 +16,9 @@ struct PagedKVDirectMetadata {
     // P6 2c: relevance counters of the one row this metadata binds. The caller already resolved
     // the row, exactly like `table`. Null when no counter buffer is bound.
     unsigned* page_scores = nullptr;
+    // P6 2c: peak scores of the same row - the second statistic, an order-preserving logit code (see
+    // page_score_codec.cuh). Null when no peak buffer is bound.
+    unsigned* page_score_peaks = nullptr;
 
     __device__ __forceinline__ std::int32_t valid_tokens(std::int32_t width) const { return width; }
 
@@ -23,6 +26,9 @@ struct PagedKVDirectMetadata {
 
     /// The counter row for this CTA, resolved the same way as block_table().
     __device__ __forceinline__ unsigned* counters() const { return page_scores; }
+
+    /// The peak-score row for this CTA, resolved the same way as block_table().
+    __device__ __forceinline__ unsigned* peaks() const { return page_score_peaks; }
 };
 
 template <bool Masked>
@@ -33,6 +39,8 @@ struct PagedKVBatchMetadata {
     std::int32_t table_stride;
     // P6 2c: page-score matrix base. Null when no counter buffer is bound.
     unsigned* page_scores = nullptr;
+    // P6 2c: peak-score matrix base, same stride and row resolution as `page_scores`.
+    unsigned* page_score_peaks = nullptr;
 
     __device__ __forceinline__ std::int32_t valid_tokens(std::int32_t width) const {
         if constexpr (Masked) {
@@ -52,6 +60,13 @@ struct PagedKVBatchMetadata {
         return page_scores == nullptr
                    ? nullptr
                    : page_scores + static_cast<std::int64_t>(table_rows[0]) * table_stride;
+    }
+
+    /// The peak-score row for this CTA, resolved exactly like counters().
+    __device__ __forceinline__ unsigned* peaks() const {
+        return page_score_peaks == nullptr
+                   ? nullptr
+                   : page_score_peaks + static_cast<std::int64_t>(table_rows[0]) * table_stride;
     }
 };
 
