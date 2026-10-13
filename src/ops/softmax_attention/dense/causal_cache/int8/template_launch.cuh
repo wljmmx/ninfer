@@ -23,7 +23,13 @@ namespace ninfer::ops::detail {
 inline std::int32_t kv_page_score_row_span() {
     static const std::int32_t span = [] {
         const char* value = std::getenv("NINFER_KV_PAGE_SCORE_ROW_SPAN");
-        if (value == nullptr) { return std::int32_t{0}; }
+        if (value == nullptr) {
+            // P6 2c (appendix EU): the preset (see the table in sequence.cpp) always wants the
+            // newest-rows plane. The kernel is a separate translation unit, so it reads the profile
+            // variable directly rather than sharing the struct.
+            if (std::getenv("NINFER_KV_EVICT_PROFILE") != nullptr) { return std::int32_t{8}; }
+            return std::int32_t{0};
+        }
         const long parsed = std::strtol(value, nullptr, 10);
         return parsed > 0 ? static_cast<std::int32_t>(parsed) : std::int32_t{0};
     }();

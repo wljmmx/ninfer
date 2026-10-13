@@ -6,6 +6,8 @@
 #include <array>
 #include <cstdlib>
 #include <numeric>
+#include <optional>
+#include <string>
 #include <fstream>
 #include <map>
 #include <stdexcept>
@@ -30,6 +32,31 @@ struct KvEvictionWindow {
         return window_pages != 0 || !keep_pages.empty();
     }
 };
+
+// P6 2c (appendix EU): a named preset for the configurations this work verified. Every knob is
+// opt-in and independent, so using the feature meant knowing four variables whose values only existed in
+// the appendices. The table is the measured design rule - budget-first, small guaranteed window, sink = 1
+// (EO/ER/EP/ET) - and an explicit per-variable environment always overrides it, so the default (unset)
+// path is byte-identical to before.
+struct KvEvictionPreset {
+    std::uint32_t sink_pages;
+    std::uint32_t window_pages;
+    std::uint32_t budget;
+};
+
+std::optional<KvEvictionPreset> kv_eviction_preset() {
+    static const std::optional<KvEvictionPreset> preset = []() -> std::optional<KvEvictionPreset> {
+        const char* value = std::getenv("NINFER_KV_EVICT_PROFILE");
+        if (value == nullptr) { return std::nullopt; }
+        const std::string name(value);
+        if (name.empty() || name == "off") { return std::nullopt; }
+        if (name == "sparse") { return KvEvictionPreset{1u, 4u, 2u}; }
+        if (name == "bal") { return KvEvictionPreset{1u, 4u, 8u}; }
+        throw std::invalid_argument(
+            "NINFER_KV_EVICT_PROFILE must be sparse, bal or off (see the P6 2c appendices)");
+    }();
+    return preset;
+}
 
 // P6 2c: the page scores are per-call by default (appendix CO). They are a marginal over the streams
 // of one call, so an accumulating buffer would conflate calls. The two statistics also live in two
@@ -56,7 +83,10 @@ bool kv_page_scores_cumulative_enabled() {
 std::uint32_t keep_from_scores_budget() {
     static const std::uint32_t budget = [] {
         const char* value = std::getenv("NINFER_KV_EVICT_KEEP_FROM_SCORES");
-        if (value == nullptr) { return std::uint32_t{0}; }
+        if (value == nullptr) {
+            const auto preset = kv_eviction_preset();
+            return preset ? preset->budget : std::uint32_t{0};
+        }
         const unsigned long parsed = std::strtoul(value, nullptr, 10);
         return parsed > 0 ? static_cast<std::uint32_t>(parsed) : std::uint32_t{0};
     }();
@@ -96,7 +126,10 @@ KeepMode keep_mode() {
 std::int32_t score_row_span() {
     static const std::int32_t span = [] {
         const char* value = std::getenv("NINFER_KV_PAGE_SCORE_ROW_SPAN");
-        if (value == nullptr) { return std::int32_t{0}; }
+        if (value == nullptr) {
+            // The preset always wants the newest-rows plane; 8 was the value every measurement used.
+            return kv_eviction_preset() ? std::int32_t{8} : std::int32_t{0};
+        }
         const long parsed = std::strtol(value, nullptr, 10);
         return parsed > 0 ? static_cast<std::int32_t>(parsed) : std::int32_t{0};
     }();
@@ -219,6 +252,11 @@ bool record_plane_activity(const void* plane, std::uint32_t maximum) {
 const KvEvictionWindow& kv_eviction_window() {
     static const KvEvictionWindow window = [] {
         KvEvictionWindow result;
+        // The preset only fills what the caller left unset; explicit variables win below.
+        if (const auto preset = kv_eviction_preset()) {
+            result.sink_pages   = preset->sink_pages;
+            result.window_pages = preset->window_pages;
+        }
         if (const char* sink = std::getenv("NINFER_KV_EVICT_SINK")) {
             result.sink_pages = static_cast<std::uint32_t>(std::strtoul(sink, nullptr, 10));
         }
