@@ -582,10 +582,20 @@ __global__ __launch_bounds__(kSGThreads, 2) void w4a8_swiglu_kernel(
         for (int kk = 0; kk < kSGBK / 32; ++kk) {
             unsigned bf[kSGNT][2];
 #pragma unroll
-            for (int nt = 0; nt < kSGNT; ++nt) {
-                const int cn = wn * 32 + nt * 8 + (lane & 7);
-                ldm_x2(bf[nt][0], bf[nt][1],
-                       su(&Bs[st][cn][swz(kk * 2 + ((lane >> 3) & 1), cn) * 16]));
+            for (int np = 0; np < kSGNT / 2; ++np) {
+                // Applicability of appendix N.1 (2): one ldmatrix.x4 fetches two
+                // adjacent 8-wide token tiles (r0/r2 -> np*2, r1/r3 -> np*2+1), with
+                // lane>>4 selecting the 16-byte K block. The lane -> (row, K block)
+                // convention is copied verbatim from w4a8_gemm_residual_narrow_kernel;
+                // the K reduction order is untouched so results must stay bit exact.
+                const int brow = wn * 32 + np * 16 + (lane & 7) + (((lane >> 3) & 1) << 3);
+                unsigned r0, r1, r2, r3;
+                ldm_x4(r0, r1, r2, r3,
+                       su(&Bs[st][brow][swz(kk * 2 + (lane >> 4), brow) * 16]));
+                bf[np * 2][0]     = r0;
+                bf[np * 2][1]     = r2;
+                bf[np * 2 + 1][0] = r1;
+                bf[np * 2 + 1][1] = r3;
             }
 #pragma unroll
             for (int mi = 0; mi < kSGMT; ++mi) {
