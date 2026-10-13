@@ -327,6 +327,29 @@ public:
         return true;
     }
 
+    // appendix FE (M3 step 3.1): may an ACTIVE address demote this page's Device replica to Host? This
+    // is the relaxation of AW.3's third hard constraint - `active_references == 0` is gone, because a
+    // live sequence holds every one of its pages and that is exactly what blocked route A. It is safe
+    // because the demotion below only resets the Device lease: the reference counts are untouched, so
+    // release_descriptor() - the one place that std::terminate()s on `active_references != 0` - is
+    // never reached with a live address. A current Host replica is still required (it is what makes the
+    // move reversible), and in-flight transfers, write ownership and checkpoint coverage still veto.
+    [[nodiscard]] bool can_demote_device_replica(LogicalKVPageHandle handle) const noexcept {
+        if (!valid(handle)) { return false; }
+        const Page& page = pages_[handle.index_];
+        return page.device_replica.has_value() && host_replica_current(handle) &&
+               !page.pending_device_replica && page.writer_references == 0 && page.source_pins == 0 &&
+               !page.destination_pinned && page.protected_columns == 0;
+    }
+
+    // Move the Device replica out (3.1). `false` means "not eligible", which a caller treats as
+    // "nothing to do" rather than an error.
+    [[nodiscard]] bool demote_device_replica(LogicalKVPageHandle handle) noexcept {
+        if (!can_demote_device_replica(handle)) { return false; }
+        pages_[handle.index_].device_replica.reset();
+        return true;
+    }
+
     [[nodiscard]] bool host_replica_current(LogicalKVPageHandle handle) const noexcept {
         if (!valid(handle)) { return false; }
         const Page& page = pages_[handle.index_];
