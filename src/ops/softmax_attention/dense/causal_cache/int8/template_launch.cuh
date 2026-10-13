@@ -27,7 +27,10 @@ inline std::int32_t kv_page_score_row_span() {
             // P6 2c (appendix EU): the preset (see the table in sequence.cpp) always wants the
             // newest-rows plane. The kernel is a separate translation unit, so it reads the profile
             // variable directly rather than sharing the struct.
-            if (std::getenv("NINFER_KV_EVICT_PROFILE") != nullptr) { return std::int32_t{8}; }
+            if (std::getenv("NINFER_KV_EVICT_PROFILE") != nullptr ||
+                std::getenv("NINFER_KV_EVICT_KEEP_RATIO") != nullptr) {
+                return std::int32_t{8};
+            }
             return std::int32_t{0};
         }
         const long parsed = std::strtol(value, nullptr, 10);

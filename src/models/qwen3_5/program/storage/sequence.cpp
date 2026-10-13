@@ -93,6 +93,37 @@ std::uint32_t keep_from_scores_budget() {
     return budget;
 }
 
+// P6 2c (appendix EX): a target RETENTION ratio, so the knob stops depending on how long the document is.
+// The budget above is a page count, and its meaning collapses as documents grow - measured on a real
+// 106-page document the preset `bal` (k=8) retained only 17% and answered 1/8, while restoring the
+// fraction recovered 7/8 (appendix EW). With this set the budget is derived from `live` and the keep set
+// is capped to the same number, so the fraction is what the caller asked for.
+std::uint32_t keep_from_scores_ratio() {
+    static const std::uint32_t ratio = [] {
+        const char* value = std::getenv("NINFER_KV_EVICT_KEEP_RATIO");
+        if (value == nullptr) { return std::uint32_t{0}; }
+        const long parsed = std::strtol(value, nullptr, 10);
+        if (parsed <= 0 || parsed >= 100) {
+            throw std::invalid_argument(
+                "NINFER_KV_EVICT_KEEP_RATIO must be a percentage in 1..99 (0 or unset disables it;"
+                " 100% would mean no eviction at all)");
+        }
+        return static_cast<std::uint32_t>(parsed);
+    }();
+    return ratio;
+}
+
+// Pages the selector may add so that sink + window + selection reaches the requested fraction.
+std::uint32_t keep_from_scores_target(std::uint32_t live, std::uint32_t sink_pages,
+                                      std::uint32_t window_pages) {
+    const std::uint32_t ratio = keep_from_scores_ratio();
+    if (ratio == 0 || live == 0) { return 0; }
+    const std::uint64_t wanted = (static_cast<std::uint64_t>(live) * ratio + 99u) / 100u;
+    const std::uint32_t fixed  = sink_pages + window_pages;
+    if (wanted <= fixed) { return 1u; }
+    return static_cast<std::uint32_t>(wanted - fixed);
+}
+
 // P6 2c (appendix DW.3): delay the eviction until the prompt has been read. The scorer measures the
 // model's attention under the visibility in force, so evicting during prefill sparsifies its own input
 // and can push a marginal page under the threshold (measured on n4-q2: D=+16.25 fully visible, -1.66
@@ -127,8 +158,13 @@ std::int32_t score_row_span() {
     static const std::int32_t span = [] {
         const char* value = std::getenv("NINFER_KV_PAGE_SCORE_ROW_SPAN");
         if (value == nullptr) {
-            // The preset always wants the newest-rows plane; 8 was the value every measurement used.
-            return kv_eviction_preset() ? std::int32_t{8} : std::int32_t{0};
+            // The preset and the retention ratio both need the newest-rows plane; 8 is the value
+            // every measurement used.
+            if (kv_eviction_preset().has_value() ||
+                std::getenv("NINFER_KV_EVICT_KEEP_RATIO") != nullptr) {
+                return std::int32_t{8};
+            }
+            return std::int32_t{0};
         }
         const long parsed = std::strtol(value, nullptr, 10);
         return parsed > 0 ? static_cast<std::int32_t>(parsed) : std::int32_t{0};
@@ -160,7 +196,8 @@ std::uint32_t effective_window_pages(std::uint32_t requested, std::uint32_t live
 std::vector<std::uint32_t> keep_pages_from_scores(const KVExecutionTablePool& tables,
                                                  KVExecutionRowHandle row, std::uint32_t live,
                                                  std::uint32_t sink_pages, std::uint32_t window_pages,
-                                                 std::uint32_t budget, cudaStream_t stream) {
+                                                 std::uint32_t budget, std::uint32_t cap,
+                                                 cudaStream_t stream) {
     const Tensor counts  = tables.page_score_row(row);
     const Tensor recents = tables.page_score_recent_row(row);
     const Tensor peaks   = tables.page_score_peak_row(row);
@@ -234,6 +271,10 @@ std::vector<std::uint32_t> keep_pages_from_scores(const KVExecutionTablePool& ta
             if (std::find(keep.begin(), keep.end(), page) == keep.end()) { keep.push_back(page); }
         }
     }
+    // P6 2c (appendix EX): a ratio caller wants an exact page count, so trim the union to it. The order
+    // is the existing list priority (contrast, then every-row, then peak), so the query-aware list spends
+    // the budget first. cap == 0 leaves the union exactly as the page-count path always produced it.
+    if (cap != 0 && keep.size() > cap) { keep.resize(cap); }
     return keep;
 }
 
@@ -478,16 +519,18 @@ void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, Paged
                                            KVAddressSpaceHandle address) {
     const KvEvictionWindow& window = kv_eviction_window();
     const std::uint32_t scored_budget = keep_from_scores_budget();
-    if (!window.enabled() && scored_budget == 0) { return; }
+    const std::uint32_t ratio_percent = keep_from_scores_ratio();
+    const bool selector_requested     = scored_budget != 0 || ratio_percent != 0;
+    if (!window.enabled() && !selector_requested) { return; }
     if (!kv_absent_pages_supported(cache.storage())) { return; }
-    if (scored_budget != 0 && window.window_pages == 0) {
+    if (selector_requested && window.window_pages == 0) {
         // Without a window there is nothing to evict against, and apply_absent_window() would leave
         // the row untouched - so the knob would silently do nothing. Say so instead (appendix DN).
         throw std::invalid_argument(
             "NINFER_KV_EVICT_KEEP_FROM_SCORES needs NINFER_KV_EVICT_WINDOW to define what is kept"
             " unconditionally; otherwise the row is left untouched and the selector has no effect");
     }
-    if (scored_budget != 0 && score_row_span() <= 0) {
+    if (selector_requested && score_row_span() <= 0) {
         // With no newest-rows span the second count plane stays zero, and the contrast degenerates to
         // the negated every-row profile - i.e. it would rank the WORST pages first. Fail loudly.
         throw std::invalid_argument(
@@ -499,13 +542,18 @@ void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, Paged
     const KVExecutionRowHandle row = addresses.execution_row(address).handle();
     const std::uint32_t live       = kv_live_pages(frontier);
     const std::uint32_t eff_window = effective_window_pages(window.window_pages, live);
+    // The ratio supersedes the page-count budget: setting it expresses an intent about the fraction,
+    // and the union is capped to the same number so the fraction is actually met (appendix EX).
+    const std::uint32_t ratio_cap =
+        keep_from_scores_target(live, window.sink_pages, eff_window);
+    const std::uint32_t effective_budget = ratio_cap != 0 ? ratio_cap : scored_budget;
     std::vector<std::uint32_t> keep       = window.keep_pages;
     bool defer_apply                      = false;
-    if (scored_budget != 0) {
+    if (effective_budget != 0) {
         const void* const key = cache.execution_tables().page_score_row(row).data;
         const auto selected = keep_pages_from_scores(cache.execution_tables(), row, live,
                                                      window.sink_pages, eff_window,
-                                                     scored_budget, device.stream);
+                                                     effective_budget, ratio_cap, device.stream);
         if (!selected.empty()) {
             g_scored_keep_by_row[key] = selected;
             // Counts were recorded, so the prompt is still being read: keep the cache whole and let the
