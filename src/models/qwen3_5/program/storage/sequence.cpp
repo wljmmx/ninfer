@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <numeric>
 #include <fstream>
 #include <map>
 #include <stdexcept>
@@ -39,6 +40,168 @@ struct KvEvictionWindow {
 bool kv_page_scores_cumulative_enabled() {
     static const bool enabled = std::getenv("NINFER_KV_EVICT_SCORES_CUMULATIVE") != nullptr;
     return enabled;
+}
+
+// P6 2c B4 (appendices DN/DM): the keep set the selector derives from the page-score planes.
+//
+// NINFER_KV_EVICT_KEEP_FROM_SCORES=<k> asks for up to 2k pages on top of the sink/window pages the
+// eviction window keeps anyway. The choice is the UNION of two top-k lists over the candidate pages the
+// window does not keep:
+//   * the contrast D[p] = recent[p]/K - (all[p] - recent[p])/(W' - K) - what the newest rows prefer
+//     over and above the body rows, which DM validated 11/11 on the fixture set;
+//   * the every-row profile itself, because a needle that sits on a structurally hot page is exactly
+//     what D cancels (DM.4/DM.5, reproduced twice) while the raw profile still sees it.
+// K is the same newest-rows span the scoring hooks read, and W' is nominal: D survives W' anywhere in
+// [128, 1024] for the spans in use (DO.3), so the selector never needs the call's true row count.
+std::uint32_t keep_from_scores_budget() {
+    static const std::uint32_t budget = [] {
+        const char* value = std::getenv("NINFER_KV_EVICT_KEEP_FROM_SCORES");
+        if (value == nullptr) { return std::uint32_t{0}; }
+        const unsigned long parsed = std::strtoul(value, nullptr, 10);
+        return parsed > 0 ? static_cast<std::uint32_t>(parsed) : std::uint32_t{0};
+    }();
+    return budget;
+}
+
+// P6 2c (appendix DW.3): delay the eviction until the prompt has been read. The scorer measures the
+// model's attention under the visibility in force, so evicting during prefill sparsifies its own input
+// and can push a marginal page under the threshold (measured on n4-q2: D=+16.25 fully visible, -1.66
+// after eviction). With this on, a prefill-shaped call only REMEMBERS the selection; the window is
+// applied from the first decision after the prompt is complete. Off by default.
+bool defer_eviction_enabled() {
+    static const bool enabled = std::getenv("NINFER_KV_EVICT_DEFER") != nullptr;
+    return enabled;
+}
+
+// Which list(s) the keep set is built from (appendix DS.4). `union` is the validated default; the two
+// single-list modes exist to find out whether half the budget does the same job.
+enum class KeepMode { Union, Duo, Contrast, Raw, Peak };
+
+KeepMode keep_mode() {
+    static const KeepMode mode = [] {
+        const char* value = std::getenv("NINFER_KV_EVICT_KEEP_MODE");
+        if (value == nullptr) { return KeepMode::Union; }
+        const std::string_view text(value);
+        if (text == "duo") { return KeepMode::Duo; }
+        if (text == "contrast") { return KeepMode::Contrast; }
+        if (text == "raw") { return KeepMode::Raw; }
+        if (text == "peak") { return KeepMode::Peak; }
+        return KeepMode::Union;
+    }();
+    return mode;
+}
+
+// The same knob the INT8 scoring hooks read (int8/template_launch.cuh); both read it once, and the
+// scoring header is deliberately not includable from here (appendix C3 keeps the scoring path to one TU).
+std::int32_t score_row_span() {
+    static const std::int32_t span = [] {
+        const char* value = std::getenv("NINFER_KV_PAGE_SCORE_ROW_SPAN");
+        if (value == nullptr) { return std::int32_t{0}; }
+        const long parsed = std::strtol(value, nullptr, 10);
+        return parsed > 0 ? static_cast<std::int32_t>(parsed) : std::int32_t{0};
+    }();
+    return span;
+}
+
+// Nominal row count for the contrast's normalisation (DO.3 measured that anything in [128, 1024]
+// keeps the ranking for the spans in use).
+constexpr std::int32_t kNominalScoreRows = 1024;
+
+// P6 2c (appendix EB): let the window be a fraction of the context rather than a fixed page count. The
+// window is unconditional retention, so a fixed count is a fixed fraction that hurts short corpora
+// hardest - 4 pages is 8% of a 52-page context but 13% of a 31-page one, which is the whole of the
+// short-corpus overhead measured in EA.4. With NINFER_KV_EVICT_WINDOW_PCT set the window becomes
+// min(requested, ceil(live * pct / 100)), never below one page; it only ever shrinks the absolute knob,
+// so leaving the variable unset keeps the old behaviour exactly.
+std::uint32_t effective_window_pages(std::uint32_t requested, std::uint32_t live) {
+    const char* value = std::getenv("NINFER_KV_EVICT_WINDOW_PCT");
+    if (value == nullptr || *value == '\0' || live == 0) { return requested; }
+    const long pct = std::strtol(value, nullptr, 10);
+    if (pct <= 0) { return requested; }
+    const std::uint64_t scaled =
+        (static_cast<std::uint64_t>(live) * static_cast<std::uint64_t>(pct) + 99u) / 100u;
+    const std::uint32_t pages = scaled == 0 ? 1u : static_cast<std::uint32_t>(scaled);
+    return pages < requested ? pages : requested;
+}
+
+std::vector<std::uint32_t> keep_pages_from_scores(const KVExecutionTablePool& tables,
+                                                 KVExecutionRowHandle row, std::uint32_t live,
+                                                 std::uint32_t sink_pages, std::uint32_t window_pages,
+                                                 std::uint32_t budget, cudaStream_t stream) {
+    const Tensor counts  = tables.page_score_row(row);
+    const Tensor recents = tables.page_score_recent_row(row);
+    const Tensor peaks   = tables.page_score_peak_row(row);
+    const std::uint32_t pages = static_cast<std::uint32_t>(counts.ne[0]);
+    const std::uint32_t rows  = live < pages ? live : pages;
+    if (rows == 0) { return {}; }
+    std::vector<std::uint32_t> host_counts(static_cast<std::size_t>(rows), 0u);
+    std::vector<std::uint32_t> host_recents(static_cast<std::size_t>(rows), 0u);
+    std::vector<std::uint32_t> host_peaks(static_cast<std::size_t>(rows), 0u);
+    const std::size_t bytes = static_cast<std::size_t>(rows) * sizeof(std::uint32_t);
+    CUDA_CHECK(cudaMemcpyAsync(host_counts.data(), counts.data, bytes, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(host_recents.data(), recents.data, bytes, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(host_peaks.data(), peaks.data, bytes, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // Candidates: pages the window does not already keep. Sink pages and the newest `window_pages`
+    // are addressed regardless, so selecting them would spend the budget for nothing.
+    // Only a call that actually recorded counts may move the keep set. A decode-shaped call writes the
+    // PEAK plane instead, leaving both count planes zero; without this guard the contrast ties at 0
+    // everywhere and the top-k degenerates to the first candidates in index order, silently evicting
+    // whatever the last prefill chose (appendix DQ). The guard deliberately stays on the COUNT planes
+    // even though the peak plane is now one of the ranked lists, so a decode step still cannot move the
+    // keep set - and at the informative call the peak plane holds exactly that call's peaks.
+    const std::uint64_t recorded = std::accumulate(host_counts.begin(), host_counts.end(),
+                                                   std::uint64_t{0});
+    if (recorded == 0) { return {}; }
+
+    const std::uint32_t last_kept = rows > window_pages ? rows - window_pages : 0;
+    std::vector<std::uint32_t> candidates;
+    for (std::uint32_t page = sink_pages; page < last_kept; ++page) { candidates.push_back(page); }
+    if (candidates.empty()) { return {}; }
+
+    const double span = static_cast<double>(score_row_span());
+    const double denom = static_cast<double>(kNominalScoreRows) > span
+                             ? static_cast<double>(kNominalScoreRows) - span
+                             : 1.0;
+    // Three ranked lists, each of a different nature. The contrast rewards pages the query rows prefer,
+    // the every-row count rewards pages the body returns to, and the peak rewards pages some row attended
+    // to hardest - it is an order-preserving encoding, so its raw code already ranks correctly and needs
+    // no decode. The default is the union of all three (appendix DV.4(b), DT.1).
+    const auto top_k = [&](int kind) {
+        std::vector<std::pair<double, std::uint32_t>> scored;
+        scored.reserve(candidates.size());
+        for (std::uint32_t page : candidates) {
+            const double all    = static_cast<double>(host_counts[page]);
+            const double recent = static_cast<double>(host_recents[page]);
+            const double value  = kind == 0 ? recent / span - (all - recent) / denom
+                                : kind == 1 ? all
+                                            : static_cast<double>(host_peaks[page]);
+            scored.emplace_back(value, page);
+        }
+        // Ties are broken by the evidence itself (the every-row count), not by page index: an
+        // all-zero page must not outrank one that was actually recorded (appendix DQ).
+        std::sort(scored.begin(), scored.end(), [](const auto& a, const auto& b) {
+            if (a.first != b.first) { return a.first > b.first; }
+            return a.second > b.second;
+        });
+        return scored;
+    };
+    const KeepMode mode = keep_mode();
+    std::vector<std::uint32_t> keep;
+    for (const int kind : {0, 1, 2}) {
+        // `duo` is the union as it stood before the peak list existed - the control that isolates it.
+        if (mode == KeepMode::Duo && kind == 2) { continue; }
+        if (mode == KeepMode::Contrast && kind != 0) { break; }
+        if (mode == KeepMode::Raw && kind != 1) { continue; }
+        if (mode == KeepMode::Peak && kind != 2) { continue; }
+        const auto scored = top_k(kind);
+        for (std::uint32_t i = 0; i < budget && i < scored.size(); ++i) {
+            const std::uint32_t page = scored[i].second;
+            if (std::find(keep.begin(), keep.end(), page) == keep.end()) { keep.push_back(page); }
+        }
+    }
+    return keep;
 }
 
 // N3/DE: the run-level "did this row ever record anything" flag is keyed on the plane's own block -
@@ -268,22 +431,70 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& state, std::uint32_t 
     }
 }
 
+// The last informative selection per execution row, keyed on the plane row's data pointer (stable and
+// distinct per row, exactly as the N3 flag is keyed). Without it a decode-step decision - which sees no
+// counts at all - would replace a good prefill selection with a degenerate one (appendix DQ).
+static std::map<const void*, std::vector<std::uint32_t>> g_scored_keep_by_row;
+
 void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, PagedKVCache& cache,
                                            KVAddressSpaceHandle address) {
     const KvEvictionWindow& window = kv_eviction_window();
-    if (!window.enabled()) { return; }
+    const std::uint32_t scored_budget = keep_from_scores_budget();
+    if (!window.enabled() && scored_budget == 0) { return; }
     if (!kv_absent_pages_supported(cache.storage())) { return; }
+    if (scored_budget != 0 && window.window_pages == 0) {
+        // Without a window there is nothing to evict against, and apply_absent_window() would leave
+        // the row untouched - so the knob would silently do nothing. Say so instead (appendix DN).
+        throw std::invalid_argument(
+            "NINFER_KV_EVICT_KEEP_FROM_SCORES needs NINFER_KV_EVICT_WINDOW to define what is kept"
+            " unconditionally; otherwise the row is left untouched and the selector has no effect");
+    }
+    if (scored_budget != 0 && score_row_span() <= 0) {
+        // With no newest-rows span the second count plane stays zero, and the contrast degenerates to
+        // the negated every-row profile - i.e. it would rank the WORST pages first. Fail loudly.
+        throw std::invalid_argument(
+            "NINFER_KV_EVICT_KEEP_FROM_SCORES needs NINFER_KV_PAGE_SCORE_ROW_SPAN > 0: without the"
+            " newest-rows plane the contrast is not defined and would invert the ranking");
+    }
     const std::uint32_t frontier = addresses.committed_frontier(address);
     if (frontier == 0) { return; }
-    cache.execution_tables().apply_absent_window(addresses.execution_row(address).handle(),
-                                                 kv_live_pages(frontier), window.sink_pages,
-                                                 window.window_pages, window.keep_pages,
-                                                 device.stream);
-    dump_page_scores(addresses, cache, address);
+    const KVExecutionRowHandle row = addresses.execution_row(address).handle();
+    const std::uint32_t live       = kv_live_pages(frontier);
+    const std::uint32_t eff_window = effective_window_pages(window.window_pages, live);
+    std::vector<std::uint32_t> keep       = window.keep_pages;
+    bool defer_apply                      = false;
+    if (scored_budget != 0) {
+        const void* const key = cache.execution_tables().page_score_row(row).data;
+        const auto selected = keep_pages_from_scores(cache.execution_tables(), row, live,
+                                                     window.sink_pages, eff_window,
+                                                     scored_budget, device.stream);
+        if (!selected.empty()) {
+            g_scored_keep_by_row[key] = selected;
+            // Counts were recorded, so the prompt is still being read: keep the cache whole and let the
+            // next decision - whose statistics are therefore still un-sparsified - decide for real.
+            if (defer_eviction_enabled()) { defer_apply = true; }
+        }
+        const std::vector<std::uint32_t>& effective = g_scored_keep_by_row[key];
+        keep.insert(keep.end(), effective.begin(), effective.end());
+    }
+    if (!defer_apply) {
+        cache.execution_tables().apply_absent_window(row, live, window.sink_pages, eff_window,
+                                                     keep, device.stream);
+    }
+    dump_page_scores(addresses, cache, address, keep);
+    // P6 2c (appendix DU): the page scores are per-call whether or not a dump is being written. The
+    // reset used to live inside dump_page_scores, which made the statistic - and now the keep set the
+    // selector derives from it - depend on whether a diagnostic was enabled. Consuming the planes and
+    // clearing them belong to the decision point; the dump only reports. Clearing after the dump keeps
+    // the dump-on sequence byte-identical to before.
+    if (!kv_page_scores_cumulative_enabled()) {
+        cache.execution_tables().reset_page_scores(row, device.stream);
+    }
 }
 
 void ProgramImpl::dump_page_scores(KVAddressSpaceStore& addresses, PagedKVCache& cache,
-                                   KVAddressSpaceHandle address) {
+                                   KVAddressSpaceHandle address,
+                                   const std::vector<std::uint32_t>& keep_pages) {
     const char* path = std::getenv("NINFER_KV_EVICT_SCORES_DUMP");
     if (path == nullptr || *path == '\0') { return; }
     const std::uint32_t frontier = addresses.committed_frontier(address);
@@ -291,16 +502,20 @@ void ProgramImpl::dump_page_scores(KVAddressSpaceStore& addresses, PagedKVCache&
     const KVExecutionRowHandle row = addresses.execution_row(address).handle();
     const Tensor counts = cache.execution_tables().page_score_row(row);
     const Tensor peaks  = cache.execution_tables().page_score_peak_row(row);
+    const Tensor recents = cache.execution_tables().page_score_recent_row(row);
     const std::uint32_t pages = static_cast<std::uint32_t>(counts.ne[0]);
     const std::uint32_t live  = kv_live_pages(frontier);
     const std::uint32_t rows  = live < pages ? live : pages;
     std::vector<std::uint32_t> host_counts(static_cast<std::size_t>(rows), 0u);
     std::vector<std::uint32_t> host_peaks(static_cast<std::size_t>(rows), 0u);
+    std::vector<std::uint32_t> host_recents(static_cast<std::size_t>(rows), 0u);
     if (rows != 0) {
         const std::size_t bytes = static_cast<std::size_t>(rows) * sizeof(std::uint32_t);
         CUDA_CHECK(cudaMemcpyAsync(host_counts.data(), counts.data, bytes,
                                    cudaMemcpyDeviceToHost, device.stream));
         CUDA_CHECK(cudaMemcpyAsync(host_peaks.data(), peaks.data, bytes,
+                                   cudaMemcpyDeviceToHost, device.stream));
+        CUDA_CHECK(cudaMemcpyAsync(host_recents.data(), recents.data, bytes,
                                    cudaMemcpyDeviceToHost, device.stream));
         CUDA_CHECK(cudaStreamSynchronize(device.stream));
     }
@@ -319,6 +534,13 @@ void ProgramImpl::dump_page_scores(KVAddressSpaceStore& addresses, PagedKVCache&
     std::ofstream out(path, std::ios::app);
     if (!out) { return; }
     out << "# call\n";
+    // The keep set the selector just handed to apply_absent_window(), as a marker line so the page
+    // tables stay machine-readable (appendix DN: the selection has to be observable to be verifiable).
+    if (!keep_pages.empty()) {
+        out << "# keep";
+        for (const std::uint32_t page : keep_pages) { out << ' ' << page; }
+        out << '\n';
+    }
     std::uint32_t count_max     = 0;
     std::uint32_t count_nonzero = 0;
     for (std::uint32_t page = 0; page < rows; ++page) {
@@ -343,12 +565,20 @@ void ProgramImpl::dump_page_scores(KVAddressSpaceStore& addresses, PagedKVCache&
     }
     out << "# stats_peak max=" << peak_max << " nonzero=" << peak_nonzero
         << " ever_nonzero=" << (record_plane_activity(peaks.data, peak_max) ? 1 : 0) << '\n';
-    if (!kv_page_scores_cumulative_enabled()) {
-        // Per call is the semantics the planes are designed around (appendix CO): clearing here -
-        // the dump runs before the forward - means the next dump reads exactly one call's
-        // contribution, whatever shape produced it. Both planes are cleared together.
-        cache.execution_tables().reset_page_scores(row, device.stream);
+    // The newest-rows count table (appendix DN). It is all zero unless a row span was requested, and
+    // the selector needs it beside the every-row table above to form D = A - B for the SAME call.
+    std::uint32_t recent_max     = 0;
+    std::uint32_t recent_nonzero = 0;
+    out << "# recent\n";
+    for (std::uint32_t page = 0; page < rows; ++page) {
+        out << "r\t" << page << '\t' << host_recents[page] << '\n';
+        if (host_recents[page] > recent_max) { recent_max = host_recents[page]; }
+        recent_nonzero += host_recents[page] != 0u ? 1u : 0u;
     }
+    out << "# stats_recent max=" << recent_max << " nonzero=" << recent_nonzero
+        << " ever_nonzero=" << (record_plane_activity(recents.data, recent_max) ? 1 : 0) << '\n';
+    // The per-call reset lives in apply_kv_eviction_window(), not here: it belongs to the decision
+    // point, which is also where the selector consumes the planes (appendix DU).
 }
 
 void ProgramImpl::commit_sequence_kv(SequenceState& state, std::uint32_t main,

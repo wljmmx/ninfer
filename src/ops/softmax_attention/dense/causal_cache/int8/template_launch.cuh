@@ -12,9 +12,53 @@
 #include "ops/softmax_attention/dense/causal_cache/int8/grouped_mma.cuh"
 #include "ops/softmax_attention/dense/causal_cache/int8/tiled_mma.cuh"
 #include "ops/softmax_attention/common/causal_merge.cuh"
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
+
+// P6 2c B4 (appendix DH): how many of a call's newest query rows may vote on a page's score. Read once;
+// 0 - the default - lets every row vote, which is the behaviour every dump in .temp/kv was produced
+// with, so the default path stays bit-identical.
+inline std::int32_t kv_page_score_row_span() {
+    static const std::int32_t span = [] {
+        const char* value = std::getenv("NINFER_KV_PAGE_SCORE_ROW_SPAN");
+        if (value == nullptr) { return std::int32_t{0}; }
+        const long parsed = std::strtol(value, nullptr, 10);
+        return parsed > 0 ? static_cast<std::int32_t>(parsed) : std::int32_t{0};
+    }();
+    return span;
+}
+
+// P6 2c (appendix EE.6): tolerance on the "is this page the row's best" test. A tile also counts when its
+// maximum is within `tolerance` of the row's running maximum, turning the hard argmax count into a soft
+// competition count - a cheap stand-in for the page's attention mass (mass sums exp(logit - max), so a
+// page whose logits sit near the maximum on many rows accumulates far more of it than a page that wins
+// outright exactly once). 0 - the default - is the exact comparison, so the default path stays
+// bit-identical to every archived run.
+inline float kv_page_score_tolerance() {
+    static const float tolerance = [] {
+        const char* value = std::getenv("NINFER_KV_PAGE_SCORE_TOL");
+        if (value == nullptr) { return 0.0f; }
+        const float parsed = std::strtof(value, nullptr);
+        return parsed > 0.0f ? parsed : 0.0f;
+    }();
+    return tolerance;
+}
+
+// P6 2c (appendix EH): probe for the attention-mass statistic. When set - and a row span is active -
+// the two kernels write the page's fixed-point attention mass into the newest-rows plane INSTEAD of the
+// hit count, so the existing dump exposes it as the `r` table and the ranking hypothesis can be tested
+// before a fourth plane is wired in. 0 - the default - leaves both kernels byte-identical.
+inline std::int32_t kv_page_score_mass() {
+    static const std::int32_t on = [] {
+        const char* value = std::getenv("NINFER_KV_PAGE_SCORE_MASS");
+        if (value == nullptr) { return std::int32_t{0}; }
+        const long parsed = std::strtol(value, nullptr, 10);
+        return parsed > 0 ? std::int32_t{1} : std::int32_t{0};
+    }();
+    return on;
+}
 
 template <class G, class S, bool MultiBatch, bool Masked, bool Writable, class Input,
           bool ParallelQueries = false, bool PackedV = false, bool PackedK = false,
@@ -48,7 +92,8 @@ void launch_int8_kv_grouped_mma(const CausalAttentionOperands& p, Int8KvCacheVie
         p.q, input, p.positions, cache.keys, cache.values, cache.key_scales, cache.value_scales,
         cache.tables, cache.valid_columns, cache.table_rows, cache.table_stride, p.width,
         p.visible_capacity, partition, p.scale, partial.acc, partial.maximum, partial.sum,
-        cache.page_scores, cache.page_scores_peak);
+        cache.page_scores, cache.page_scores_peak, cache.page_scores_recent,
+        kv_page_score_row_span(), kv_page_score_tolerance(), kv_page_score_mass());
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -72,7 +117,8 @@ void launch_int8_kv_tiled_mma(const CausalAttentionOperands& p, Int8KvReadView c
             page_score != nullptr ? static_cast<unsigned*>(page_score->data) : nullptr;
         kernel<<<grid, S::kThreads, S::kSharedBytes, stream>>>(
             p.q, cache.keys, cache.values, cache.key_scales, cache.value_scales, metadata,
-            p.positions, p.scale, p.out, override_scores, p.width);
+            p.positions, p.scale, p.out, override_scores, p.width, cache.page_scores_recent,
+            kv_page_score_row_span(), kv_page_score_tolerance(), kv_page_score_mass());
         CUDA_CHECK(cudaGetLastError());
     };
     // The tiled path records hit counts only, so it resolves `page_scores`, the count plane. The
@@ -80,15 +126,16 @@ void launch_int8_kv_tiled_mma(const CausalAttentionOperands& p, Int8KvReadView c
     // than a record of "the planes this particular caller needed", which is exactly how a stale call
     // site would hide (appendices DD/DE).
     if (!cache.table_rows)
-        invoke(PagedKVDirectMetadata{cache.tables, cache.page_scores, cache.page_scores_peak});
+        invoke(PagedKVDirectMetadata{cache.tables, cache.page_scores, cache.page_scores_peak,
+                                     cache.page_scores_recent});
     else if (cache.valid_columns)
         invoke(PagedKVBatchMetadata<true>{cache.tables, cache.valid_columns, cache.table_rows,
                                           cache.table_stride, cache.page_scores,
-                                          cache.page_scores_peak});
+                                          cache.page_scores_peak, cache.page_scores_recent});
     else
         invoke(PagedKVBatchMetadata<false>{cache.tables, nullptr, cache.table_rows,
                                            cache.table_stride, cache.page_scores,
-                                           cache.page_scores_peak});
+                                           cache.page_scores_peak, cache.page_scores_recent});
 }
 
 } // namespace ninfer::ops::detail

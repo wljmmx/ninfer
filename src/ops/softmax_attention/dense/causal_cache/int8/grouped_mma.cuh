@@ -41,8 +41,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t logical_capacity, CausalKvPartition partition, float scale, float* partial_acc,
-        float* partial_m, float* partial_l, unsigned* page_scores,
-        unsigned* page_scores_peak) {
+        float* partial_m, float* partial_l, unsigned* page_scores, unsigned* page_scores_peak,
+        unsigned* page_scores_recent, std::int32_t score_row_span, float score_tolerance,
+        std::int32_t score_mass) {
     constexpr int TokenTile            = Schedule::kTokenTile;
     constexpr int WarpsPerCta          = Schedule::kWarps;
     constexpr int KeyBlock             = Schedule::kKeyRows;
@@ -134,6 +135,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     unsigned* const counters = plane == nullptr
                                    ? nullptr
                                    : plane + static_cast<std::int64_t>(table_row) * table_stride;
+    // P6 2c B4 (appendix DN): the oldest query row allowed to vote, from this call's last token
+    // position. It only applies to the count statistic below: the decode branch's peak is a maximum
+    // over an already-tiny row set, and filtering it would change a verified statistic for no gain.
+    const int score_row_begin =
+        ninfer::ops::paged_kv_page_score_row_begin(last_pos, score_row_span);
+    // The newest-rows count plane, resolved exactly like `counters` (appendix DN).
+    unsigned* const recent = page_scores_recent == nullptr
+                                 ? nullptr
+                                 : page_scores_recent +
+                                       static_cast<std::int64_t>(table_row) * table_stride;
     if constexpr (MultiBatch) {
         partial_acc +=
             static_cast<std::int64_t>(batch) * 256 * Geometry::QHeads * partial_width * split_count;
@@ -851,13 +862,27 @@ rk4_apply_e8_residual(dec, static_cast<std::uint32_t>(signs >> 8));
             //  the add-versus-max choice below agrees with the plane choice by construction.
             // bm0/bm1 are segment-reduced, so exactly one lane per segment reports; nothing reads the
             // counters yet, so the attention numerics are untouched.
-            if (counters != nullptr && page_present && lid == 0) {
+            if ((counters != nullptr || recent != nullptr) && page_present && lid == 0) {
                 if constexpr (ParallelQueries) {
                     if (m0 != -CUDART_INF_F && m1 != -CUDART_INF_F) {
-                        const int records = (bm0 > m0 ? 1 : 0) + (bm1 > m1 ? 1 : 0);
-                        if (records > 0) {
+                        // Two count planes from one pass (appendices DN/DM): `counters` takes every row,
+                        // `recent` only the call's newest rows - the two halves of D = A - B. qabs is -1
+                        // outside the tile, so the vote also drops those rows.
+                        const int every = (bm0 > m0 - score_tolerance ? 1 : 0) +
+                                          (bm1 > m1 - score_tolerance ? 1 : 0);
+                        if (every > 0 && counters != nullptr) {
                             atomicAdd(counters + (k0 >> kPagedKVPageShift),
-                                      static_cast<unsigned>(records));
+                                      static_cast<unsigned>(every));
+                        }
+                        if (score_row_span > 0 && recent != nullptr && score_mass == 0) {
+                            const bool vote0 = qabs0 >= score_row_begin;
+                            const bool vote1 = qabs1 >= score_row_begin;
+                            const int newest = (vote0 && bm0 > m0 - score_tolerance ? 1 : 0) +
+                                               (vote1 && bm1 > m1 - score_tolerance ? 1 : 0);
+                            if (newest > 0) {
+                                atomicAdd(recent + (k0 >> kPagedKVPageShift),
+                                          static_cast<unsigned>(newest));
+                            }
                         }
                     }
                 } else {
@@ -904,6 +929,22 @@ rk4_apply_e8_residual(dec, static_cast<std::uint32_t>(signs >> 8));
             }
             bl0 = warp_sum<4>(bl0, FullMask);
             bl1 = warp_sum<4>(bl1, FullMask);
+
+            // P6 2c (appendix EH): the attention-mass probe. bl0/bl1 are this row's probabilities over the
+            // whole tile and a tile never spans two pages (KeyTile <= 64 == the page), so the tile's mass
+            // is their sum over the rows - no extra exp, no extra FMA. Fixed point, because the plane is an
+            // integer accumulator. Only the span's newest rows vote, exactly like the count it replaces.
+            if (score_mass != 0 && recent != nullptr && page_present) {
+                float total = (qabs0 >= score_row_begin ? bl0 : 0.0f) +
+                              (qabs1 >= score_row_begin ? bl1 : 0.0f);
+                total += __shfl_down_sync(FullMask, total, 16);
+                total += __shfl_down_sync(FullMask, total, 8);
+                total += __shfl_down_sync(FullMask, total, 4);
+                if (lane == 0) {
+                    atomicAdd(recent + (k0 >> kPagedKVPageShift),
+                              static_cast<unsigned>(total * kPagedKVPageScoreMassScale + 0.5f));
+                }
+            }
 
             l0 = l0 * alpha0 + bl0;
             l1 = l1 * alpha1 + bl1;

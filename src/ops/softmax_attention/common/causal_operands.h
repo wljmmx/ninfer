@@ -88,6 +88,9 @@ struct QuantizedCausalCacheView {
     // `page_scores`. Two planes, because one step can run both shapes against the same execution row
     // and the two units must not be conflated (appendices DD/DE).
     unsigned* page_scores_peak;
+    // P6 2c newest-rows counts: the third plane, again the same shape and addressing. Recorded in the
+    // same pass as `page_scores` so the selector can subtract one from the other (appendix DN).
+    unsigned* page_scores_recent;
 };
 
 template <class View>
@@ -103,7 +106,8 @@ View make_quantized_causal_cache_view(const PagedKVBatchLayerView& cache,
             cache.block_tables.ne[0],
             cache.num_kv_heads,
             static_cast<unsigned*>(cache.page_scores.data),
-            static_cast<unsigned*>(cache.page_scores_peak.data)};
+            static_cast<unsigned*>(cache.page_scores_peak.data),
+            static_cast<unsigned*>(cache.page_scores_recent.data)};
 }
 
 template <class G, class View>

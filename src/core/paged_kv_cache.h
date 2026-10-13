@@ -33,6 +33,10 @@ struct PagedKVLayerView {
     // The two statistics carry different units and one execution step can produce both, so they must
     // not share cells (appendices DD/DE). Empty when the caller supplies no counter buffer.
     Tensor page_score_peak;
+    // P6 2c the same count statistic restricted to the call's newest rows (appendix DN). Together with
+    // `page_score` (every row) it gives the contrast D = A - B that the selector ranks distant pages
+    // by. Empty - and untouched - unless a row span is requested.
+    Tensor page_score_recent;
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
     KvCacheStorage storage    = KvCacheStorage::BFloat16;
@@ -50,6 +54,8 @@ struct PagedKVBatchLayerView {
     Tensor page_scores;
     // P6 2c peak-score matrix: the twin of `page_scores`, same shape and addressing.
     Tensor page_scores_peak;
+    // P6 2c newest-rows count matrix: the twin of `page_scores`, same shape and addressing.
+    Tensor page_scores_recent;
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
     KvCacheStorage storage    = KvCacheStorage::BFloat16;
@@ -114,6 +120,9 @@ struct KVExecutionTableLayout {
     // step can run a prefill call (hit counts) and a decode call (peak logits) against the same
     // execution row, and conflating the two units is what appendix DE.2 caught.
     TensorRegion page_score_peak;
+    // P6 2c newest-rows counts: the third plane, same geometry again. The selector needs the every-row
+    // and the newest-row counts of the SAME call, so they have to be recorded in one pass (appendix DN).
+    TensorRegion page_score_recent;
 
     [[nodiscard]] std::size_t metadata_bytes() const noexcept;
 };
@@ -437,7 +446,13 @@ public:
     [[nodiscard]] const Tensor& page_score_peak_matrix() const noexcept { return page_score_peak_; }
     [[nodiscard]] Tensor page_score_peak_row(KVExecutionRowHandle handle) const;
 
-    // P6 2c: zero BOTH score planes of one execution row. Called when a sequence (re)starts and
+    // P6 2c: the newest-rows count matrix / row.
+    [[nodiscard]] const Tensor& page_score_recent_matrix() const noexcept {
+        return page_score_recent_;
+    }
+    [[nodiscard]] Tensor page_score_recent_row(KVExecutionRowHandle handle) const;
+
+    // P6 2c: zero ALL THREE score planes of one execution row. Called when a sequence (re)starts and
     // after every dump, because the planes accumulate and a reused row must not inherit the previous
     // sequence. The two planes are cleared together so a per-call reader can never see one statistic
     // from this call sitting beside the other statistic from the last call.
@@ -456,6 +471,7 @@ private:
     Tensor block_tables_;
     Tensor page_score_;
     Tensor page_score_peak_;
+    Tensor page_score_recent_;
     PinnedHostBuffer host_shadow_;
     std::vector<bool> row_in_use_;
     std::vector<std::uint32_t> row_generations_;

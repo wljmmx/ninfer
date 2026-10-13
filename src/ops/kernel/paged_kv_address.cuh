@@ -19,6 +19,8 @@ struct PagedKVDirectMetadata {
     // P6 2c: peak scores of the same row - the second statistic, an order-preserving logit code (see
     // page_score_codec.cuh). Null when no peak buffer is bound.
     unsigned* page_score_peaks = nullptr;
+    // P6 2c: the count statistic restricted to the newest rows, same row. Null when not bound.
+    unsigned* page_score_recents = nullptr;
 
     __device__ __forceinline__ std::int32_t valid_tokens(std::int32_t width) const { return width; }
 
@@ -29,6 +31,9 @@ struct PagedKVDirectMetadata {
 
     /// The peak-score row for this CTA, resolved the same way as block_table().
     __device__ __forceinline__ unsigned* peaks() const { return page_score_peaks; }
+
+    /// The newest-rows count row for this CTA, resolved the same way as block_table().
+    __device__ __forceinline__ unsigned* recents() const { return page_score_recents; }
 };
 
 template <bool Masked>
@@ -41,6 +46,8 @@ struct PagedKVBatchMetadata {
     unsigned* page_scores = nullptr;
     // P6 2c: peak-score matrix base, same stride and row resolution as `page_scores`.
     unsigned* page_score_peaks = nullptr;
+    // P6 2c: newest-rows count matrix base, same stride and row resolution as `page_scores`.
+    unsigned* page_score_recents = nullptr;
 
     __device__ __forceinline__ std::int32_t valid_tokens(std::int32_t width) const {
         if constexpr (Masked) {
@@ -67,6 +74,13 @@ struct PagedKVBatchMetadata {
         return page_score_peaks == nullptr
                    ? nullptr
                    : page_score_peaks + static_cast<std::int64_t>(table_rows[0]) * table_stride;
+    }
+
+    /// The newest-rows count row for this CTA, resolved exactly like counters().
+    __device__ __forceinline__ unsigned* recents() const {
+        return page_score_recents == nullptr
+                   ? nullptr
+                   : page_score_recents + static_cast<std::int64_t>(table_rows[0]) * table_stride;
     }
 };
 

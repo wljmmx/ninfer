@@ -548,13 +548,18 @@ public:
     // every result is unchanged.
     void apply_kv_eviction_window(KVAddressSpaceStore& addresses, PagedKVCache& cache,
                                   KVAddressSpaceHandle address);
-    // P6 2c verification aid, default off: when NINFER_KV_EVICT_SCORES_DUMP names a file, write
-    // both of this row's score planes: the hit counts as "page<TAB>hits" lines (the original format,
-    // kept so dumps stay comparable to the archives) and then the peak scores as
-    // "p<TAB>page<TAB>code" lines, each table followed by its own "# stats" line. Nothing consumes
-    // the planes yet, so this is the only way to check that step 1.2 scores what it should.
+    // P6 2c verification aid, default off: when NINFER_KV_EVICT_SCORES_DUMP names a file, write all
+    // three of this row's score planes: the hit counts as "page<TAB>hits" lines (the original format,
+    // kept so dumps stay comparable to the archives), the peak scores as "p<TAB>page<TAB>code" lines,
+    // and the newest-rows counts as "r<TAB>page<TAB>hits" lines, each table followed by its own
+    // "# stats" line. When the selector ran, its choice is written first as a "# keep ..." marker.
     void dump_page_scores(KVAddressSpaceStore& addresses, PagedKVCache& cache,
-                          KVAddressSpaceHandle address);
+                          KVAddressSpaceHandle address,
+                          const std::vector<std::uint32_t>& keep_pages);
+
+    // P6 2c B4 (appendices DN/DM), default off: NINFER_KV_EVICT_KEEP_FROM_SCORES=<k> turns the page-score
+    // planes into the keep set (union of the contrast's and the every-row profile's top-k over the pages
+    // the window does not keep). Requires NINFER_KV_EVICT_WINDOW and NINFER_KV_PAGE_SCORE_ROW_SPAN.
     [[nodiscard]] PagedKVCache* backend_kv_cache() noexcept;
     [[nodiscard]] const PagedKVCache* backend_kv_cache() const noexcept;
     [[nodiscard]] std::uint32_t backend_kv_valid(const SequenceState&) const noexcept;

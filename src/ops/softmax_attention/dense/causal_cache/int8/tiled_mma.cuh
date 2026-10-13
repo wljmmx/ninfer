@@ -32,7 +32,8 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
     const std::int8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
     const __half* __restrict__ cache_v_scale, Metadata metadata,
     const std::int32_t* __restrict__ positions, float scale, __nv_bfloat16* __restrict__ out,
-    unsigned* __restrict__ page_score, std::int32_t width) {
+    unsigned* __restrict__ page_score, std::int32_t width, unsigned* __restrict__ page_score_recent,
+    std::int32_t score_row_span, float score_tolerance, std::int32_t score_mass) {
     // P6 2c hook site (appendix BL.2/BM.1 step 1.2). One CTA covers exactly one 64-token page
     // here, so the CTA-wide hit reduction feeds counters[k0 >> kPagedKVPageShift]. `page_score` is
     // the caller's already-resolved override; the metadata path is resolved below.
@@ -88,6 +89,13 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
     const std::int32_t* block_table = metadata.block_table();
     // The relevance-counter row of this CTA, resolved exactly like block_table (appendix CA.2/CA.3).
     unsigned* const counters = page_score != nullptr ? page_score : metadata.counters();
+    // P6 2c B4 (appendix DN): the oldest query row allowed to vote. `width` is this call's token count,
+    // so `base_pos + width - 1` is its last token; span 0 - the default - admits every row.
+    const int score_row_begin =
+        ninfer::ops::paged_kv_page_score_row_begin(base_pos + width - 1, score_row_span);
+    // The newest-rows count plane, resolved from the metadata only: the op-level override exists for
+    // the (already resolved) every-row plane and has no counterpart for this one.
+    unsigned* const recent = metadata.recents();
 
     const int tile_rows     = min(Br, tokens - q0);
     const int max_query_abs = base_pos + q0 + tile_rows - 1;
@@ -475,12 +483,31 @@ rk4_apply_e8_residual(dec, static_cast<std::uint32_t>(signs >> 8));
             // A row's first page is not evidence - running_m starts at -inf and would record
             // unconditionally (appendix CD.4). bm0/bm1 are already segment-reduced, so exactly one
             // lane per segment reports, and nothing reads the counters yet.
-            if (counters != nullptr && page_present && lid == 0 &&
+            // P6 2c B4 (appendices DN/DM): the count statistic is recorded twice, because the selector
+            // needs both halves of the contrast D = A - B that appendix DM validated offline:
+            //   `counters` - every row votes; the statistic's original, structural profile.
+            //   `recent`   - only the call's newest `score_row_span` rows vote; the query side. Written
+            //                only when a span is requested, so the default path pays nothing and stays
+            //                bit-identical to the committed build.
+            // The gate sits at the report site, where the code already ties bm0 to row0's running_m0 -
+            // the same per-row assumption CD.4's guard relies on.
+            const bool vote0 = qabs0 >= score_row_begin;
+            const bool vote1 = qabs1 >= score_row_begin;
+            if ((counters != nullptr || recent != nullptr) && page_present && lid == 0 &&
                 running_m0 != -CUDART_INF_F && running_m1 != -CUDART_INF_F) {
-                const int records = (bm0 > running_m0 ? 1 : 0) + (bm1 > running_m1 ? 1 : 0);
-                if (records > 0) {
+                const int every = (bm0 > running_m0 - score_tolerance ? 1 : 0) +
+                                  (bm1 > running_m1 - score_tolerance ? 1 : 0);
+                if (every > 0 && counters != nullptr) {
                     atomicAdd(counters + (k0 >> kPagedKVPageShift),
-                              static_cast<unsigned>(records));
+                              static_cast<unsigned>(every));
+                }
+                if (score_row_span > 0 && recent != nullptr && score_mass == 0) {
+                    const int newest = (vote0 && bm0 > running_m0 - score_tolerance ? 1 : 0) +
+                                       (vote1 && bm1 > running_m1 - score_tolerance ? 1 : 0);
+                    if (newest > 0) {
+                        atomicAdd(recent + (k0 >> kPagedKVPageShift),
+                                  static_cast<unsigned>(newest));
+                    }
                 }
             }
 
@@ -521,6 +548,17 @@ rk4_apply_e8_residual(dec, static_cast<std::uint32_t>(signs >> 8));
             }
             bl0        = warp_sum<4>(bl0, FullMask);
             bl1        = warp_sum<4>(bl1, FullMask);
+            // P6 2c (appendix EH): the attention-mass probe, same shape as the grouped kernel - see there.
+            if (score_mass != 0 && recent != nullptr && page_present) {
+                float total = (vote0 ? bl0 : 0.0f) + (vote1 ? bl1 : 0.0f);
+                total += __shfl_down_sync(FullMask, total, 16);
+                total += __shfl_down_sync(FullMask, total, 8);
+                total += __shfl_down_sync(FullMask, total, 4);
+                if (lane == 0) {
+                    atomicAdd(recent + (k0 >> kPagedKVPageShift),
+                              static_cast<unsigned>(total * kPagedKVPageScoreMassScale + 0.5f));
+                }
+            }
             running_l0 = __fmaf_rn(running_l0, alpha0, bl0);
             running_l1 = __fmaf_rn(running_l1, alpha1, bl1);
             running_m0 = nm0;

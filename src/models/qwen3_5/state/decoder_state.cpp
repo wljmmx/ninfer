@@ -83,9 +83,10 @@ PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
 }
 
 PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, Tensor block_table,
-                                 Tensor page_score, Tensor page_score_peak) noexcept
+                                 Tensor page_score, Tensor page_score_peak,
+                                 Tensor page_score_recent) noexcept
     : cache_(&cache), block_table_(block_table), page_score_(page_score),
-      page_score_peak_(page_score_peak) {}
+      page_score_peak_(page_score_peak), page_score_recent_(page_score_recent) {}
 
 std::uint32_t PagedKVCacheView::max_context() const noexcept {
     return cache_ == nullptr ? 0 : cache_->max_context();
@@ -93,7 +94,8 @@ std::uint32_t PagedKVCacheView::max_context() const noexcept {
 
 PagedKVLayerView PagedKVCacheView::layer_view(std::uint32_t layer) const {
     if (cache_ == nullptr) { throw std::logic_error("Paged KV execution view is empty"); }
-    return cache_->layer_view(layer, block_table_, page_score_, page_score_peak_);
+    return cache_->layer_view(layer, block_table_, page_score_, page_score_peak_,
+                              page_score_recent_);
 }
 
 PagedKVCacheView PagedKVCache::execution_view(const KVExecutionRowLease& row) const {
@@ -102,11 +104,13 @@ PagedKVCacheView PagedKVCache::execution_view(const KVExecutionRowLease& row) co
     }
     return PagedKVCacheView(*this, execution_tables_.row(row.handle()),
                             execution_tables_.page_score_row(row.handle()),
-                            execution_tables_.page_score_peak_row(row.handle()));
+                            execution_tables_.page_score_peak_row(row.handle()),
+                            execution_tables_.page_score_recent_row(row.handle()));
 }
 
 PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_table,
-                                         Tensor page_score, Tensor page_score_peak) const {
+                                         Tensor page_score, Tensor page_score_peak,
+                                         Tensor page_score_recent) const {
     if (layer >= layers_) { throw std::out_of_range("Paged KV layer is out of range"); }
     const std::size_t stride        = layer_storage_.planes_per_layer();
     const std::size_t base          = static_cast<std::size_t>(layer) * stride;
@@ -121,6 +125,7 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
         .block_table     = block_table,
         .page_score      = page_score,
         .page_score_peak = page_score_peak,
+        .page_score_recent = page_score_recent,
         .head_dim        = layer_storage_.head_dim,
         .num_kv_heads    = kv_heads_,
         .storage         = layer_storage_.storage,
@@ -137,6 +142,7 @@ PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const 
         .block_tables     = execution_tables_.matrix(),
         .page_scores      = execution_tables_.page_score_matrix(),
         .page_scores_peak = execution_tables_.page_score_peak_matrix(),
+        .page_scores_recent = execution_tables_.page_score_recent_matrix(),
         .head_dim         = direct.head_dim,
         .num_kv_heads     = direct.num_kv_heads,
         .storage          = direct.storage,
