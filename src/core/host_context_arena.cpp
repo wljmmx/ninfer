@@ -37,7 +37,7 @@ void HostContextAllocation::publish() noexcept {
 
 bool HostContextAllocation::release() noexcept {
     if (!valid()) { return false; }
-    owner_->release(offset_, bytes_, reserved_);
+    owner_->release(offset_, bytes_, reserved_, consumer_);
     disarm();
     return true;
 }
@@ -47,6 +47,7 @@ void HostContextAllocation::disarm() noexcept {
     offset_   = 0;
     bytes_    = 0;
     reserved_ = false;
+    consumer_ = HostConsumer::Live;
 }
 
 HostContextArena::HostContextArena(std::size_t capacity_bytes, std::size_t minimum_allocation_bytes)
@@ -79,14 +80,24 @@ std::optional<std::size_t> HostContextArena::find_free_extent(std::size_t bytes)
     return std::nullopt;
 }
 
-bool HostContextArena::can_allocate(std::size_t bytes) const noexcept {
+bool HostContextArena::can_allocate(std::size_t bytes, HostConsumer consumer) const noexcept {
     const std::size_t rounded = allocation_bytes(bytes);
-    return rounded != 0 && find_free_extent(rounded).has_value();
+    if (rounded == 0 || !find_free_extent(rounded).has_value()) { return false; }
+    // appendix FF: the checkpoint consumer must leave the live floor free. With a zero floor this is
+    // already implied by find_free_extent, so the untagged form keeps its exact behaviour.
+    return consumer != HostConsumer::Checkpoint ||
+           occupied_bytes_ + rounded + live_floor_bytes_ <= capacity_bytes_;
 }
 
-std::optional<HostContextAllocation> HostContextArena::allocate(std::size_t bytes) noexcept {
+std::optional<HostContextAllocation> HostContextArena::allocate(std::size_t bytes,
+                                                                HostConsumer consumer) noexcept {
     const std::size_t rounded = allocation_bytes(bytes);
     if (rounded == 0) { return std::nullopt; }
+    // appendix FF: same floor rule as can_allocate, so the two can never disagree.
+    if (consumer == HostConsumer::Checkpoint &&
+        occupied_bytes_ + rounded + live_floor_bytes_ > capacity_bytes_) {
+        return std::nullopt;
+    }
     const auto free_index = find_free_extent(rounded);
     if (!free_index) { return std::nullopt; }
     FreeExtent& free         = free_extents_[*free_index];
@@ -98,9 +109,14 @@ std::optional<HostContextAllocation> HostContextArena::allocate(std::size_t byte
     }
     occupied_bytes_ += rounded;
     reserved_bytes_ += rounded;
+    if (consumer == HostConsumer::Checkpoint) {
+        checkpoint_bytes_ += rounded;
+    } else {
+        live_kv_bytes_ += rounded;
+    }
     peak_occupied_bytes_ = std::max(peak_occupied_bytes_, occupied_bytes_);
     ++allocation_count_;
-    return HostContextAllocation(*this, offset, rounded);
+    return HostContextAllocation(*this, offset, rounded, true, consumer);
 }
 
 std::pair<HostContextAllocation, HostContextAllocation>
@@ -120,9 +136,16 @@ HostContextArena::split(HostContextAllocation&& allocation, std::size_t byte_off
     return {std::move(left), std::move(right)};
 }
 
-void HostContextArena::release(std::size_t offset, std::size_t bytes, bool reserved) noexcept {
+void HostContextArena::release(std::size_t offset, std::size_t bytes, bool reserved,
+                               HostConsumer consumer) noexcept {
     occupied_bytes_ -= bytes;
     if (reserved) { reserved_bytes_ -= bytes; }
+    // appendix FF: the per-consumer counters must come back down here, or they would only ever grow.
+    if (consumer == HostConsumer::Checkpoint) {
+        checkpoint_bytes_ -= bytes;
+    } else {
+        live_kv_bytes_ -= bytes;
+    }
     --allocation_count_;
     insert_free_extent({offset, bytes});
 }
