@@ -553,6 +553,7 @@ public:
     // kept so dumps stay comparable to the archives), the peak scores as "p<TAB>page<TAB>code" lines,
     // and the newest-rows counts as "r<TAB>page<TAB>hits" lines, each table followed by its own
     // "# stats" line. When the selector ran, its choice is written first as a "# keep ..." marker.
+    void dump_pool_account(PagedKVCache& cache);
     void dump_page_scores(KVAddressSpaceStore& addresses, PagedKVCache& cache,
                           KVAddressSpaceHandle address,
                           const std::vector<std::uint32_t>& keep_pages);

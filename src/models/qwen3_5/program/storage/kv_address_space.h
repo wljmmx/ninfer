@@ -715,7 +715,15 @@ public:
         const std::uint32_t target = pages_for_tokens(frontier);
         if (frontier == address.committed_frontier && target == address.page_count) { return; }
         for (std::uint32_t page = target; page < address.page_count; ++page) {
-            if (!pages_->can_dematerialize(membership(address, page))) {
+            const LogicalKVPageHandle logical = membership(address, page);
+            // appendix EY (P3a): the eviction policy may already have returned this page's Device
+            // replica to the pool. Then only its descriptor and references still have to retire, which
+            // needs the after-active-reference predicate rather than the dematerialization one.
+            if (pages_->has_device_replica(logical)) {
+                if (!pages_->can_dematerialize(logical)) {
+                    throw std::logic_error("KV truncate would partially release a protected page");
+                }
+            } else if (!pages_->can_release_reference_after_active_reference(logical)) {
                 throw std::logic_error("KV truncate would partially release a protected page");
             }
         }
@@ -731,7 +739,14 @@ public:
             const std::uint32_t index = --address.page_count;
             LogicalKVPageHandle page  = membership(address, index);
             pages_->release_active_reference(page);
-            pages_->dematerialize(page, address.reservation);
+            if (pages_->has_device_replica(page)) {
+                pages_->dematerialize(page, address.reservation);
+            } else if (!pages_->release_reference(page, true)) {
+                // appendix EY (P3a): an eviction-released page has nothing left to dematerialize, so
+                // its descriptor retires through the ordinary reference release. The precheck above
+                // used the same predicate, so this cannot fail.
+                std::terminate();
+            }
         }
         if (target != 0) {
             const std::uint32_t columns =
@@ -861,6 +876,32 @@ public:
         address.committed_frontier  = frontier;
         address.checkpoint_frontier = std::min(address.checkpoint_frontier, frontier);
         rebuild_checkpoint_protection();
+    }
+
+    // P6 2c (appendix EY, P3a): give back the Device replicas of the pages apply_absent_window()
+    // has just masked, so the Device footprint follows the resident set (sink + newest window +
+    // selector keep set) instead of the whole context. The survival rule mirrors that function page
+    // for page - a page survives inside the sink, inside the newest window, or when the selector
+    // names it - so only pages the kernel skips are released. Returning capacity cannot change a
+    // result; the gate is a bit-identical PPL. Returns how many replicas were actually released.
+    [[nodiscard]] std::uint32_t
+    release_absent_device_pages(KVAddressSpaceHandle handle, std::uint32_t live_pages,
+                                std::uint32_t sink_pages, std::uint32_t window_pages,
+                                std::span<const std::uint32_t> keep_pages) noexcept {
+        if (!valid(handle) || live_pages == 0) { return 0; }
+        Address& address             = addresses_[handle.index_];
+        const std::uint32_t end      = std::min(live_pages, address.page_count);
+        const std::uint32_t keep_begin = end > window_pages ? end - window_pages : 0;
+        std::uint32_t released       = 0;
+        for (std::uint32_t page = std::min(sink_pages, keep_begin); page < keep_begin; ++page) {
+            if (std::find(keep_pages.begin(), keep_pages.end(), page) != keep_pages.end()) {
+                continue;
+            }
+            if (pages_->release_device_replica_for_eviction(membership(address, page))) {
+                ++released;
+            }
+        }
+        return released;
     }
 
     [[nodiscard]] std::uint32_t mapped_pages(KVAddressSpaceHandle handle) const {

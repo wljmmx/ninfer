@@ -487,6 +487,31 @@ public:
         page.protected_columns = std::min(page.protected_columns, columns);
     }
 
+    [[nodiscard]] bool has_device_replica(LogicalKVPageHandle handle) const noexcept {
+        return valid(handle) && pages_[handle.index_].device_replica.has_value();
+    }
+
+    // P6 2c (appendix EY, P3a): may this page give its Device replica back to the pool while its
+    // logical descriptor and address entry stay alive? The window policy has already masked the page,
+    // so the kernel never reads it again (sink + newest window only move forward). One owner, write
+    // ownership, no in-flight transfer, no Host replica yet, and no checkpoint coverage depending on
+    // it - the same conditions can_dematerialize() checks, minus the active-reference requirement that
+    // a live address always fails.
+    [[nodiscard]] bool
+    can_release_device_replica_for_eviction(LogicalKVPageHandle handle) const noexcept {
+        if (!valid(handle)) { return false; }
+        const Page& page = pages_[handle.index_];
+        return page.device_replica.has_value() && !page.pending_device_replica && !page.host_replica &&
+               page.references == 1 && page.writer_references == 1 && page.source_pins == 0 &&
+               page.protected_columns == 0 && !page.destination_pinned;
+    }
+
+    [[nodiscard]] bool release_device_replica_for_eviction(LogicalKVPageHandle handle) noexcept {
+        if (!can_release_device_replica_for_eviction(handle)) { return false; }
+        pages_[handle.index_].device_replica.reset();
+        return true;
+    }
+
     [[nodiscard]] bool can_dematerialize(LogicalKVPageHandle handle) const noexcept {
         if (!valid(handle)) { return false; }
         const Page& page = pages_[handle.index_];

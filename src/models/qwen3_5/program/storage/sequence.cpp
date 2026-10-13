@@ -182,6 +182,14 @@ constexpr std::int32_t kNominalScoreRows = 1024;
 // short-corpus overhead measured in EA.4. With NINFER_KV_EVICT_WINDOW_PCT set the window becomes
 // min(requested, ceil(live * pct / 100)), never below one page; it only ever shrinks the absolute knob,
 // so leaving the variable unset keeps the old behaviour exactly.
+// P6 2c (appendix EY, P3a): release the Device replicas of the pages the window just masked. The
+// kernel never reads an absent page, so this can only return capacity, never change a result - the
+// gate is a bit-identical PPL. Default off, like every other knob on this path.
+bool kv_eviction_release_enabled() {
+    const char* value = std::getenv("NINFER_KV_EVICT_RELEASE");
+    return value != nullptr && *value != '\0' && std::strtol(value, nullptr, 10) != 0;
+}
+
 std::uint32_t effective_window_pages(std::uint32_t requested, std::uint32_t live) {
     const char* value = std::getenv("NINFER_KV_EVICT_WINDOW_PCT");
     if (value == nullptr || *value == '\0' || live == 0) { return requested; }
@@ -566,6 +574,13 @@ void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, Paged
     if (!defer_apply) {
         cache.execution_tables().apply_absent_window(row, live, window.sink_pages, eff_window,
                                                      keep, device.stream);
+        // appendix EY (P3a): hand the masked pages' Device replicas back to the pool. Deferred rounds
+        // never reach here, so a release always follows the mask it was derived from.
+        if (kv_eviction_release_enabled()) {
+            (void)addresses.release_absent_device_pages(address, live, window.sink_pages, eff_window,
+                                                        keep);
+        }
+        dump_pool_account(cache);
     }
     dump_page_scores(addresses, cache, address, keep);
     // P6 2c (appendix DU): the page scores are per-call whether or not a dump is being written. The
@@ -576,6 +591,21 @@ void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, Paged
     if (!kv_page_scores_cumulative_enabled()) {
         cache.execution_tables().reset_page_scores(row, device.stream);
     }
+}
+
+// appendix EY (P3a): the Device page pool's own account - allocated / reserved / available /
+// capacity, one line per decision point. It lives in its own file, and not in the score dump, because
+// a diagnostic must not move the bytes a frozen regression gate watches. Off unless
+// NINFER_KV_EVICT_POOL_DUMP names a path; written whether or not the release is enabled, so the
+// disabled run is a control rather than a separate experiment.
+void ProgramImpl::dump_pool_account(PagedKVCache& cache) {
+    const char* path = std::getenv("NINFER_KV_EVICT_POOL_DUMP");
+    if (path == nullptr || *path == '\0') { return; }
+    const DeviceKVPagePool& pool = cache.page_pool();
+    std::ofstream out(path, std::ios::app);
+    if (!out) { return; }
+    out << pool.allocated_pages() << '\t' << pool.reserved_pages() << '\t' << pool.available_pages()
+        << '\t' << pool.capacity_pages() << '\n';
 }
 
 void ProgramImpl::dump_page_scores(KVAddressSpaceStore& addresses, PagedKVCache& cache,
