@@ -12,6 +12,29 @@ std::uint32_t page_count(std::uint32_t capacity) {
     return 1U + (capacity - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
 }
 
+namespace {
+
+bool env_number_is_set(const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr && *value != '\0' && std::strtol(value, nullptr, 10) != 0;
+}
+
+// appendix FD (P3c): a Device arena smaller than the logical capacity is only legal when an eviction
+// policy is in force, because the release path is the only thing that gives Device pages back to the
+// pool. Masking without releasing would leave every masked page materialized, so the arena would
+// still have to hold the whole context. Without a contract the loud startup error stays: refusing to
+// turn a start-time rejection into a mid-flight crash is the whole point of BP.4.
+bool kv_residency_contract_active() {
+    const bool releases = env_number_is_set("NINFER_KV_EVICT_RELEASE");
+    const bool retains = env_number_is_set("NINFER_KV_EVICT_WINDOW") ||
+                         env_number_is_set("NINFER_KV_EVICT_KEEP_FROM_SCORES") ||
+                         env_number_is_set("NINFER_KV_EVICT_KEEP_RATIO") ||
+                         env_number_is_set("NINFER_KV_EVICT_PROFILE");
+    return releases && retains;
+}
+
+} // namespace
+
 PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std::uint32_t capacity,
                               std::int32_t kv_heads, std::int32_t head_dim, KvCacheStorage storage,
                               std::int32_t table_rows, std::uint32_t physical_page_groups) {
@@ -23,8 +46,11 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     const PagedKVStorageLayout layer_storage = paged_kv_storage_layout(storage, head_dim);
 
     const std::uint32_t logical_pages = page_count(capacity);
-    if (physical_page_groups < logical_pages) {
-        throw std::invalid_argument("Paged KV physical pages are below logical capacity");
+    if (physical_page_groups < logical_pages && !kv_residency_contract_active()) {
+        throw std::invalid_argument(
+            "Paged KV physical pages are below logical capacity without an eviction contract: set "
+            "NINFER_KV_EVICT_RELEASE with a retention knob (NINFER_KV_EVICT_WINDOW / KEEP_FROM_SCORES "
+            "/ KEEP_RATIO / PROFILE), or size the arena for the whole context");
     }
 
     KVPageGeometry geometry;

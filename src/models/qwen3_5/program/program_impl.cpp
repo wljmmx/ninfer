@@ -198,18 +198,27 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     }
     state_store =
         std::make_unique<StateImageStore>(*state_images, host_state_images.get(), logical_states);
-    const auto logical_pages = [&](const DeviceKVPagePool& pool) {
+    // appendix FD (P3c): the descriptor table must hold one entry per LOGICAL page - the number the
+    // execution tables and the block table are sized by - not the (possibly much smaller) Device pool
+    // capacity. Tying it to the pool is what made a capped arena die with
+    // "logical KV batch materialization exceeds descriptor capacity". Without the cap the two numbers
+    // are already equal, so nothing moves by default.
+    const auto logical_pages = [&](const DeviceKVPagePool& pool, std::uint32_t execution_pages) {
         const auto stride = plan_host_kv_page_layout(pool.geometry()).page_stride;
-        return checked_count(pool.capacity_pages() + host_bytes / stride);
+        return checked_count(std::max(pool.capacity_pages(), execution_pages) + host_bytes / stride);
     };
     text_kv_pages = std::make_unique<LogicalKVPageStore>(
-        decoder->text_kv.page_pool(), logical_pages(decoder->text_kv.page_pool()));
+        decoder->text_kv.page_pool(),
+        logical_pages(decoder->text_kv.page_pool(),
+                      decoder->text_kv.execution_tables().logical_page_capacity()));
     text_kv_addresses = std::make_unique<KVAddressSpaceStore>(
         *text_kv_pages, decoder->text_kv.execution_tables(), address_capacity,
         decoder->text_kv.execution_tables().logical_page_capacity());
     if (auto* backend = backend_kv_cache()) {
         backend_kv_pages = std::make_unique<LogicalKVPageStore>(
-            backend->page_pool(), logical_pages(backend->page_pool()));
+            backend->page_pool(),
+            logical_pages(backend->page_pool(),
+                          backend->execution_tables().logical_page_capacity()));
         backend_kv_addresses = std::make_unique<KVAddressSpaceStore>(
             *backend_kv_pages, backend->execution_tables(), address_capacity,
             backend->execution_tables().logical_page_capacity());

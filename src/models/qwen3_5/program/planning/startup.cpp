@@ -112,7 +112,21 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     const auto effective_prefill_chunk =
         static_cast<std::int32_t>(std::min(plan.prefill_chunk, plan.capacity));
     const std::uint32_t logical_pages  = page_count(plan.capacity);
-    const std::uint32_t physical_pages = plan.main_page_groups;
+    // appendix FD (P3c): with an eviction contract the Device arena only has to hold the resident set
+    // (sink + newest window + the selector's keep set) - the release path hands the masked pages back
+    // for the next append. NINFER_KV_EVICT_CAPACITY declares that resident budget in pages. Nothing
+    // here knows about the contract on purpose: capping below the logical capacity without one is
+    // caught loudly by plan_cache()'s guard instead of degrading silently.
+    const std::uint32_t fitted_pages = plan.main_page_groups;
+    const std::uint32_t physical_pages = [fitted_pages]() {
+        const char* value = std::getenv("NINFER_KV_EVICT_CAPACITY");
+        if (value == nullptr || *value == '\0') { return fitted_pages; }
+        const long requested = std::strtol(value, nullptr, 10);
+        if (requested <= 0 || static_cast<unsigned long>(requested) >= fitted_pages) {
+            return fitted_pages;
+        }
+        return static_cast<std::uint32_t>(requested);
+    }();
     const std::uint64_t mtp_extra_pages =
         plan.features.mtp()
             ? static_cast<std::uint64_t>(plan.max_concurrency) *
