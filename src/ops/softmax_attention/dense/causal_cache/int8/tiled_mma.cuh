@@ -49,6 +49,12 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
     constexpr int ProducerWarps = Schedule::kRowTiles;
     constexpr int VWorkerWarps  = Schedule::kWarps - ProducerWarps;
     constexpr int WorkerThreads = VWorkerWarps * 32;
+    // PackedV stores 8 bytes per 16 dims, so its int4 V slot needs only half the row
+    // stride the schedule reserves for a full int8 layout. Tighten it and let the f16
+    // staging follow immediately; the launcher collects the freed bytes through
+    // Int8KvTiledSmemBytes<S, PackedV>.
+    constexpr int VRowBytes = PackedV ? (D / 2) : D;
+    constexpr int kVSpan    = Bc * VRowBytes;
     constexpr float Log2E       = kLog2E;
     constexpr unsigned FullMask = 0xffffffffu;
 
@@ -61,7 +67,7 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
     std::int8_t* k_i8 = reinterpret_cast<std::int8_t*>(reinterpret_cast<unsigned char*>(q_scale) +
                                                        Schedule::kQScaleBytes);
     std::int8_t* v_i8 = k_i8 + Schedule::kKBytes;
-    __half* v_f16     = reinterpret_cast<__half*>(v_i8 + Schedule::kVBytes);
+    __half* v_f16     = reinterpret_cast<__half*>(v_i8 + kVSpan);
     __half* p_s =
         reinterpret_cast<__half*>(reinterpret_cast<unsigned char*>(v_f16) + Schedule::kVStageBytes);
     __half* k_scale_s =
@@ -158,7 +164,7 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
             std::int8_t* kd = &k_i8[(key_l * DB16 + causal_swizzle(key_l, dc * 8)) * 2];
             // int4 V occupies half the smem extent; the V-worker pass unpacks it
             // into v_f16 after the barrier.
-            std::int8_t* vd = &v_i8[key_l * D + (PackedV ? (d >> 1) : d)];
+            std::int8_t* vd = &v_i8[key_l * VRowBytes + (PackedV ? (d >> 1) : d)];
             if (key <= max_query_abs && page_present) {
                 if constexpr (E8Root) {
                     // 2-bit cylinder K: 4 cache bytes cover this 16-dim chunk.
@@ -291,7 +297,7 @@ rk4_apply_e8_residual(dec, static_cast<std::uint32_t>(signs >> 8));
                 }
             } else {
                 store_vec(kd, make_int4(0, 0, 0, 0));
-                rk4_zero_packed_v<PackedV>(&v_i8[key_l * D], d);
+                rk4_zero_packed_v<PackedV>(&v_i8[key_l * VRowBytes], d);
             }
         }
         ninfer::ops::cp_commit();
@@ -586,7 +592,7 @@ rk4_apply_e8_residual(dec, static_cast<std::uint32_t>(signs >> 8));
                         // vectorized nibble unpack + scale, straight into the
                         // swizzled v_f16 slot (same as the grouped kernel).
                         const std::uint32_t raw = *reinterpret_cast<const std::uint32_t*>(
-                            &v_i8[key_l * D + (d >> 1)]);
+                            &v_i8[key_l * VRowBytes + (d >> 1)]);
                         const std::uint32_t lo = rk4_unpack_lo_fast(raw);
                         const std::uint32_t hi = rk4_unpack_hi_fast(raw);
                         const auto* lo8        = reinterpret_cast<const std::int8_t*>(&lo);
@@ -603,7 +609,7 @@ rk4_apply_e8_residual(dec, static_cast<std::uint32_t>(signs >> 8));
                                               static_cast<float>(hi8[3]) * vsf);
                         store_vec(dst, values);
                     } else {
-                        store_vec(dst, int8_kv_dequant_f16x8(&v_i8[key_l * D + d], vs));
+                        store_vec(dst, int8_kv_dequant_f16x8(&v_i8[key_l * VRowBytes + d], vs));
                     }
                 } else {
                     store_vec(dst, make_int4(0, 0, 0, 0));

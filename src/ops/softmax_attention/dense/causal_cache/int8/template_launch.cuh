@@ -108,14 +108,15 @@ void launch_int8_kv_tiled_mma(const CausalAttentionOperands& p, Int8KvReadView c
         constexpr auto kernel = int8_kv_tiled_mma_kernel<G, S, Metadata, PackedV, PackedK, E8Root,
                                                          V8Root, E8Lattice>;
         static const auto status = cudaFuncSetAttribute(
-            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, S::kSharedBytes);
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            Int8KvTiledSmemBytes<S, PackedV>::kBytes);
         CUDA_CHECK(status);
         const dim3 grid(div_up(p.width, S::kQueryRows), G::QHeads);
         // P6 2c: the op-level argument is an already-resolved counter row and overrides the view;
         // the view's buffer is a base that the metadata resolves per row (appendix CA.3).
         unsigned* const override_scores =
             page_score != nullptr ? static_cast<unsigned*>(page_score->data) : nullptr;
-        kernel<<<grid, S::kThreads, S::kSharedBytes, stream>>>(
+        kernel<<<grid, S::kThreads, Int8KvTiledSmemBytes<S, PackedV>::kBytes, stream>>>(
             p.q, cache.keys, cache.values, cache.key_scales, cache.value_scales, metadata,
             p.positions, p.scale, p.out, override_scores, p.width, cache.page_scores_recent,
             kv_page_score_row_span(), kv_page_score_tolerance(), kv_page_score_mass());

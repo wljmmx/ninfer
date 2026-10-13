@@ -45,6 +45,20 @@ struct Int8KvTiledMmaSchedule {
     static_assert(kSharedBytes <= 99 * 1024);
 };
 
+// Effective dynamic-smem request for a tiled launch. The PackedV int4 V slot stores 8 bytes
+// per 16 dims, so it only uses half of each kVBytes row; that half is reclaimed instead of
+// reserved (see the layout note in tiled_mma.cuh) and the f16 staging moves down by the same
+// amount. PackedV=false reproduces the original layout exactly.
+template <class Schedule, bool PackedV>
+struct Int8KvTiledSmemBytes {
+    static constexpr int kVRowBytes = PackedV ? 128 : 256;
+    static constexpr int kVBufBytes = Schedule::kKeyRows * kVRowBytes;
+    static constexpr int kBytes = Schedule::kQBytes + Schedule::kQScaleBytes +
+                                  Schedule::kKBytes + kVBufBytes + Schedule::kVStageBytes +
+                                  Schedule::kPBytes + Schedule::kScaleBytes +
+                                  Schedule::kStatsBytes;
+};
+
 template <int DChunk>
 struct Int8KvMergeSchedule {
     static_assert(DChunk > 0 && DChunk <= 256);
