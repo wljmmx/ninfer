@@ -90,10 +90,31 @@ std::optional<CheckpointHandle> ProgramImpl::reserve_checkpoint() {
         auto& slot = checkpoints[i];
         if (!slot.value && !slot.reserved) {
             slot.reserved = true;
+            slot.last_used = ++checkpoint_clock_;  // appendix FF: the recency the retention rule needs
             return CheckpointHandle{this, i, slot.generation};
         }
     }
     return std::nullopt;
+}
+
+// appendix FF (M3 3.2c): give up the least recent checkpoints, keeping `keep` of them. Their Host
+// KV goes back through KVHistory's destructor, so this is the only lever that can free Host room while
+// a live sequence still holds its demoted pages (those extents cannot be released at all).
+std::uint32_t ProgramImpl::release_stale_checkpoints(std::uint32_t keep) noexcept {
+    std::vector<std::pair<std::uint64_t, CheckpointHandle>> live;
+    for (std::uint32_t i = 0; i < checkpoints.size(); ++i) {
+        const CheckpointSlot& slot = checkpoints[i];
+        if (!slot.value) { continue; }
+        live.emplace_back(slot.last_used, CheckpointHandle{this, i, slot.generation});
+    }
+    if (live.size() <= keep) { return 0; }
+    std::sort(live.begin(), live.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });  // newest first
+    std::uint32_t released = 0;
+    for (std::size_t index = keep; index < live.size(); ++index) {
+        if (release_checkpoint(live[index].second)) { ++released; }
+    }
+    return released;
 }
 
 bool ProgramImpl::release_checkpoint(CheckpointHandle handle) noexcept {

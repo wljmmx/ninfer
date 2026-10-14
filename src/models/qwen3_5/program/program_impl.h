@@ -240,6 +240,9 @@ struct CheckpointSlot {
     std::uint64_t generation = 1;
     std::uint32_t pins       = 0;
     bool reserved            = false;
+    // appendix FF (M3 3.2c): when this checkpoint was last touched. Without it "keep the most recent N"
+    // cannot be decided - reserve_checkpoint() only takes the first free slot.
+    std::uint64_t last_used  = 0;
 };
 
 struct ResumeStateImpl {
@@ -567,6 +570,10 @@ public:
     // appendix FF (M3 3.2c): how many recent checkpoints may keep their Host room (default 8, the same
     // count the Host default is written with).
     std::uint32_t host_keep_snapshots_ = 8;
+    std::uint64_t checkpoint_clock_    = 0;
+    // Checkpoints the last out-of-room demotion gave up (their Host KB returns to the arena).
+    std::uint32_t last_stale_checkpoints_ = 0;
+    [[nodiscard]] std::uint32_t release_stale_checkpoints(std::uint32_t keep) noexcept;
     // appendix FF (M3 3.2c): Host extents the demotion created, per execution row, so they can be given
     // back when the address is released. Nothing else owns them: a demoted page's descriptor is kept
     // alive by its Host replica on purpose, and only releasing the extent frees it.

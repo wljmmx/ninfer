@@ -732,6 +732,16 @@ std::uint32_t ProgramImpl::demote_absent_pages_to_host(KVAddressSpaceStore& addr
         if (auto retry = host_kv_extents->prepare(*pages, membership)) {
             reservation.emplace(std::move(*retry));
         }
+        if (!reservation) {
+            // appendix FF (M3 3.2c): prioritisation. A checkpoint CAN give its Host room back (its
+            // extents become unreferenced and release_unreferenced frees them); a live demoted extent
+            // cannot be released at all. So give up the least recent checkpoints, keeping the configured
+            // number, and try once more - this is the lever, not evicting live pages.
+            last_stale_checkpoints_ += release_stale_checkpoints(host_keep_snapshots_);
+            if (auto retry = host_kv_extents->prepare(*pages, membership)) {
+                reservation.emplace(std::move(*retry));
+            }
+        }
         if (!reservation) { last_demote_stage_ = 4; return 0; }
     }
     (void)cache.page_pool().copy_to_host(host_kv_extents->device_sources(*reservation),
@@ -781,7 +791,8 @@ void ProgramImpl::dump_pool_account(PagedKVCache& cache) {
         << " candidates=" << last_demote_candidates_ << " block=0x" << std::hex
         << last_demote_block_mask_ << std::dec << " keep_snapshots=" << host_keep_snapshots_
         << " live_floor=" << (host_context_arena ? host_context_arena->live_floor_bytes() : 0U)
-        << " evicted_pages=" << last_host_evicted_pages_ << '\n';
+        << " evicted_pages=" << last_host_evicted_pages_
+        << " stale_checkpoints=" << last_stale_checkpoints_ << '\n';
 }
 
 void ProgramImpl::dump_page_scores(KVAddressSpaceStore& addresses, PagedKVCache& cache,
