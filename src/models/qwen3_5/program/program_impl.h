@@ -560,7 +560,8 @@ public:
     std::uint32_t demote_absent_pages_to_host(KVAddressSpaceStore& addresses, PagedKVCache& cache,
                                               KVAddressSpaceHandle address, std::uint32_t live,
                                               std::uint32_t sink_pages, std::uint32_t window_pages,
-                                              const std::vector<std::uint32_t>& keep_pages);
+                                              const std::vector<std::uint32_t>& keep_pages,
+                                              std::uint32_t first_page);
     // appendix FJ (M3 3.3): put back the Device replica of every page the mask is about to address
     // but whose replica the eviction already gave away (appendix FI measured the set). Room is what
     // the demotion/release just returned; whatever is left unfetched is counted, never assumed away.

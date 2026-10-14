@@ -135,6 +135,18 @@ bool defer_eviction_enabled() {
     return enabled;
 }
 
+// appendix GC (FZ layer 0, O1): start the per-round eviction scans at the frontier the previous
+// round already retired instead of re-walking [sink, live - window) from the sink every round. The
+// evicted prefix never comes back, so the walk is pure overhead - FW.5 measured 4.4 us per dropped
+// page per round for exactly this. Off by default, and only used on rounds whose keep set is
+// EMPTY: the selector recomputes keep every call (appendix FI), and a page it may name again has to
+// stay reachable, so a selector round falls back to the original full walk and the contract's
+// capacity is unchanged.
+bool kv_eviction_frontier_enabled() {
+    const char* value = std::getenv("NINFER_KV_EVICT_FRONTIER");
+    return value != nullptr && *value != '\0' && std::strtol(value, nullptr, 10) != 0;
+}
+
 // Which list(s) the keep set is built from (appendix DS.4). `union` is the validated default; the two
 // single-list modes exist to find out whether half the budget does the same job.
 enum class KeepMode { Union, Duo, Contrast, Raw, Peak };
@@ -626,10 +638,21 @@ void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, Paged
         // Demote keeps their bytes on Host, so a later query can still reach them; release throws them
         // away. Both return the Device page, so the capacity effect is identical - only reversibility
         // differs. Demote wins when both switches are set, because release would destroy what it saved.
+        // appendix GC (FZ layer 0): recompute the scans' own left edge so the frontier can be
+        // clamped the same way in all three of them, then advance it once they have all run.
+        const bool frontier_on = kv_eviction_frontier_enabled() && keep.empty();
+        std::uint32_t window_begin   = 0;
+        std::uint32_t frontier_start = 0;
+        if (frontier_on) {
+            const std::uint32_t frontier_end = std::min(live, addresses.mapped_pages(address));
+            window_begin   = frontier_end > eff_window ? frontier_end - eff_window : 0;
+            frontier_start = std::min(addresses.eviction_frontier(address), window_begin);
+            kv_tier_stats().frontier_rounds += 1;
+        }
         std::uint32_t demoted = 0;
         if (kv_host_demote_enabled()) {
             demoted = demote_absent_pages_to_host(addresses, cache, address, live, window.sink_pages,
-                                                  eff_window, keep);
+                                                  eff_window, keep, frontier_start);
         }
         if (kv_eviction_release_enabled() && demoted == 0) {
             // Also the fallback when the demotion demoted nothing - most importantly when no Host
@@ -637,7 +660,7 @@ void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, Paged
             // leave every masked page materialized with nothing saying so.
             // Deferred rounds never reach here, so the fate always follows the mask it came from.
             (void)addresses.release_absent_device_pages(address, live, window.sink_pages, eff_window,
-                                                        keep);
+                                                        keep, frontier_start);
         }
         // appendix FL (M3 3.3, option (c)): retire the pages whose Device replica the demotion or
         // the release just gave back. The shadow is what publish() wrote and what
@@ -651,7 +674,9 @@ void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, Paged
                 const std::uint32_t retire_begin =
                     retire_end > eff_window ? retire_end - eff_window : 0;
                 std::vector<std::uint32_t> retired;
-                for (std::uint32_t page = std::min(window.sink_pages, retire_begin);
+                for (std::uint32_t page =
+                         std::max(std::min(window.sink_pages, retire_begin),
+                                  std::min(frontier_start, retire_begin));
                      page < retire_begin; ++page) {
                     if (std::find(keep.begin(), keep.end(), page) != keep.end()) { continue; }
                     if (retired_pages->device_resident(addresses.logical_page(address, page))) {
@@ -663,6 +688,13 @@ void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, Paged
                     cache.execution_tables().mark_absent(row, retired, device.stream);
                 }
             }
+        }
+        // appendix GC (FZ layer 0): everything in [sink, window_begin) has now been given back by
+        // exactly one of the three paths above, so the next round may start there. Only advanced on
+        // a frontier round, so a selector round leaves the bound untouched and the full walk runs.
+        if (frontier_on && window_begin != 0) {
+            addresses.advance_eviction_frontier(address, window_begin);
+            kv_tier_stats().frontier_advanced_to = window_begin;
         }
         // appendix FJ (M3 3.3): the pages the new mask drops have now given their replicas back,
         // which is exactly the room this needs - so the fetch runs after the demotion/release, and
@@ -752,7 +784,8 @@ std::uint32_t ProgramImpl::demote_absent_pages_to_host(KVAddressSpaceStore& addr
                                                        KVAddressSpaceHandle address,
                                                        std::uint32_t live, std::uint32_t sink_pages,
                                                        std::uint32_t window_pages,
-                                                       const std::vector<std::uint32_t>& keep_pages) {
+                                                       const std::vector<std::uint32_t>& keep_pages,
+                                                       std::uint32_t first_page) {
     last_demote_stage_      = 0;
     last_demote_candidates_ = 0;
     if (host_kv_extents == nullptr) { last_demote_stage_ = 1; return 0; }
@@ -765,7 +798,10 @@ std::uint32_t ProgramImpl::demote_absent_pages_to_host(KVAddressSpaceStore& addr
     membership.reserve(keep_begin);
     std::uint32_t candidates_begin = 0;  // logical page span, recorded with the extent (appendix FF)
     std::uint32_t candidates_end   = 0;
-    for (std::uint32_t page = std::min(sink_pages, keep_begin); page < keep_begin; ++page) {
+    // appendix GC (FZ layer 0): start where the last round stopped, clamped to keep_begin.
+    const std::uint32_t demote_start =
+        std::max(std::min(sink_pages, keep_begin), std::min(first_page, keep_begin));
+    for (std::uint32_t page = demote_start; page < keep_begin; ++page) {
         if (std::find(keep_pages.begin(), keep_pages.end(), page) != keep_pages.end()) { continue; }
         // logical_page() already exists on the address space; the loop bound keeps it in range.
         const LogicalKVPageHandle candidate = addresses.logical_page(address, page);
@@ -929,6 +965,8 @@ void ProgramImpl::dump_pool_account(PagedKVCache& cache) {
         << " addressed_absent=" << last_addressed_absent_
         << " addressed_absent_host=" << last_addressed_absent_host_
         << " stale_checkpoints=" << last_stale_checkpoints_ << '\n';
+    out << "# frontier rounds=" << kv_tier_stats().frontier_rounds
+        << " advanced_to=" << kv_tier_stats().frontier_advanced_to << '\n';
     // appendix FH (M3 3.2d): `kv tiers`, in Strata's "expert tiers" style - the two tiers as they
     // stand now, then, since the start, what has moved between them. "spilled" is the demotion's
     // Device -> Host payload (reversible: the matrix says whether `--host-kv-mib` is doing work);

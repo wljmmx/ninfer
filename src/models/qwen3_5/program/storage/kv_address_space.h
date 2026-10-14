@@ -305,6 +305,8 @@ public:
         address.reservation = std::move(activation.page_reservation_);
         address.row.emplace(std::move(*activation.row_));
         activation.row_.reset();
+        // appendix GC (FZ layer 0): a new sequence starts with nothing retired.
+        address.eviction_frontier = 0;
         address.active    = true;
         activation.owner_ = nullptr;
         for (std::uint32_t page = 0; page < address.page_count; ++page) {
@@ -915,13 +917,19 @@ public:
     [[nodiscard]] std::uint32_t
     release_absent_device_pages(KVAddressSpaceHandle handle, std::uint32_t live_pages,
                                 std::uint32_t sink_pages, std::uint32_t window_pages,
-                                std::span<const std::uint32_t> keep_pages) noexcept {
+                                std::span<const std::uint32_t> keep_pages,
+                                std::uint32_t first_page) noexcept {
         if (!valid(handle) || live_pages == 0) { return 0; }
         Address& address             = addresses_[handle.index_];
         const std::uint32_t end      = std::min(live_pages, address.page_count);
         const std::uint32_t keep_begin = end > window_pages ? end - window_pages : 0;
+        // appendix GC (FZ layer 0): `first_page` is the caller's already-retired frontier. It is
+        // clamped to `keep_begin`, so a page that is inside the window is never skipped - which is
+        // what keeps the capacity contract bit-identical.
+        const std::uint32_t start =
+            std::max(std::min(sink_pages, keep_begin), std::min(first_page, keep_begin));
         std::uint32_t released       = 0;
-        for (std::uint32_t page = std::min(sink_pages, keep_begin); page < keep_begin; ++page) {
+        for (std::uint32_t page = start; page < keep_begin; ++page) {
             if (std::find(keep_pages.begin(), keep_pages.end(), page) != keep_pages.end()) {
                 continue;
             }
@@ -934,6 +942,21 @@ public:
 
     [[nodiscard]] std::uint32_t mapped_pages(KVAddressSpaceHandle handle) const {
         return require(handle).page_count;
+    }
+
+    // appendix GC (FZ layer 0): the eviction window's retired frontier, clamped to the address's
+    // own extent so a truncation can never leave it naming a page that no longer exists.
+    [[nodiscard]] std::uint32_t eviction_frontier(KVAddressSpaceHandle handle) const noexcept {
+        if (!valid(handle)) { return 0; }
+        const Address& address = addresses_[handle.index_];
+        return std::min(address.eviction_frontier, address.page_count);
+    }
+
+    // Monotone by construction: the window's right edge only grows, and every caller clamps what
+    // it reports to the range it actually walked.
+    void advance_eviction_frontier(KVAddressSpaceHandle handle, std::uint32_t upto) {
+        Address& address = require(handle);
+        if (upto > address.eviction_frontier) { address.eviction_frontier = upto; }
     }
 
     [[nodiscard]] std::uint32_t reserved_growth_pages(KVAddressSpaceHandle handle) const {
@@ -1061,6 +1084,11 @@ private:
         std::uint32_t page_count          = 0;
         std::uint32_t committed_frontier  = 0;
         std::uint32_t checkpoint_frontier = 0;
+        // appendix GC (FZ layer 0): pages below this index have already been given back by the
+        // eviction window. Its right edge only moves forward, so the three per-round scans may
+        // start here instead of at the sink; activation clears it, because a new sequence owes
+        // nothing to the previous one.
+        std::uint32_t eviction_frontier = 0;
         DeviceKVPageReservation reservation;
         std::optional<KVExecutionRowLease> row;
         bool occupied = false;
