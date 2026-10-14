@@ -374,8 +374,13 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
     const auto cleanup = [&] {
         bool released = true;
         if (address) {
+            const std::int32_t row = text_kv_addresses->bound_row(*address);
             if (text_kv_addresses->active(*address)) { text_kv_addresses->deactivate(*address); }
             released = text_kv_addresses->release(*address) && released;
+            // appendix FF (M3 3.2c): give back every Host extent this address's demotion created, or the
+            // Host bytes stay occupied for the life of the process (the page descriptors are kept alive
+            // by their Host replicas until the extent goes).
+            release_live_host_extents(row);
             address.reset();
         }
         if (state) {

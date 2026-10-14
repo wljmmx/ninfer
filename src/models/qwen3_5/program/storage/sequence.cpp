@@ -615,6 +615,29 @@ void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, Paged
 // keep onto Host, then drop its Device lease. The Host extent store already attaches the replica and
 // unpins the source inside publish(), so this is: collect the pages, prepare, copy, publish, demote.
 // Returns the number of pages actually demoted; 0 means "nothing eligible, nothing changed".
+// appendix FF (M3 3.2c): release the Host extents recorded for one execution row. release() detaches
+// each page's replica and, through it, retires the descriptors that were kept alive for the extent -
+// which is why nothing else can do this job.
+void ProgramImpl::release_live_host_extents(std::int32_t row) noexcept {
+    if (host_kv_extents == nullptr) { return; }
+    const auto found = live_host_extents_.find(row);
+    if (found == live_host_extents_.end()) { return; }
+    const std::size_t extent_count = found->second.size();  // before erase: the iterator dies with it
+    std::uint32_t released         = 0;
+    for (const HostKVExtentCapability capability : found->second) {
+        if (host_kv_extents->release(capability)) { ++released; }
+    }
+    live_host_extents_.erase(found);
+    if (const char* path = std::getenv("NINFER_KV_EVICT_POOL_DUMP"); path != nullptr && *path != '\0') {
+        std::ofstream out(path, std::ios::app);
+        if (out) {
+            out << "# reclaim row=" << row << " extents=" << extent_count
+                << " released=" << released << " host_occupied=" << host_kv_extents->occupied()
+                << '\n';
+        }
+    }
+}
+
 std::uint32_t ProgramImpl::demote_absent_pages_to_host(KVAddressSpaceStore& addresses,
                                                        PagedKVCache& cache,
                                                        KVAddressSpaceHandle address,
@@ -646,7 +669,10 @@ std::uint32_t ProgramImpl::demote_absent_pages_to_host(KVAddressSpaceStore& addr
     if (!reservation) { last_demote_stage_ = 4; return 0; }  // no Host room / page not pinnable
     (void)cache.page_pool().copy_to_host(host_kv_extents->device_sources(*reservation),
                                          host_kv_extents->writable_view(*reservation), device.stream);
-    (void)host_kv_extents->publish(std::move(*reservation));
+    const HostKVExtentCapability capability = host_kv_extents->publish(std::move(*reservation));
+    if (const std::int32_t row = addresses.bound_row(address); row >= 0) {
+        live_host_extents_[row].push_back(capability);
+    }
     std::uint32_t demoted = 0;
     std::uint32_t block_mask = 0;
     for (const LogicalKVPageHandle page : membership) {

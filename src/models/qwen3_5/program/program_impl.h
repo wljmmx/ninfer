@@ -567,6 +567,11 @@ public:
     // appendix FF (M3 3.2c): how many recent checkpoints may keep their Host room (default 8, the same
     // count the Host default is written with).
     std::uint32_t host_keep_snapshots_ = 8;
+    // appendix FF (M3 3.2c): Host extents the demotion created, per execution row, so they can be given
+    // back when the address is released. Nothing else owns them: a demoted page's descriptor is kept
+    // alive by its Host replica on purpose, and only releasing the extent frees it.
+    std::map<std::int32_t, std::vector<HostKVExtentCapability>> live_host_extents_;
+    void release_live_host_extents(std::int32_t row) noexcept;
     void dump_pool_account(PagedKVCache& cache);
     void dump_page_scores(KVAddressSpaceStore& addresses, PagedKVCache& cache,
                           KVAddressSpaceHandle address,
