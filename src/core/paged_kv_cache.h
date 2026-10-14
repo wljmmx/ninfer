@@ -420,6 +420,16 @@ public:
     void publish_repeated(KVExecutionRowHandle row, DeviceKVPageHandle page, std::uint32_t count,
                           cudaStream_t stream);
 
+    // appendix FL (M3 3.3, option (c)): retire logical pages from the address. Sets their host
+    // shadow entry AND the device row entry to the absent sentinel. Needed because the shadow is
+    // the published mapping (written by publish() from a page handle) and dropping a Device replica
+    // does not touch it - so without this an address whose replica the release took away is still
+    // named by apply_absent_window(), and the kernel reads a physical page the pool has handed on.
+    // Distinct from apply_absent_window(): that re-derives a whole row from the keep rule and never
+    // touches the shadow, so it cannot express "this page's replica is gone for good".
+    void mark_absent(KVExecutionRowHandle row, std::span<const std::uint32_t> logical_pages,
+                     cudaStream_t stream);
+
     // Overwrite the device remap of the first `live_pages` logical pages so that only pages in
     // [0, sink_pages) and the last `window_pages` pages stay addressed: every other entry becomes
     // the absent sentinel that the causal attention masks out. The logical mapping and the host

@@ -639,6 +639,31 @@ void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, Paged
             (void)addresses.release_absent_device_pages(address, live, window.sink_pages, eff_window,
                                                         keep);
         }
+        // appendix FL (M3 3.3, option (c)): retire the pages whose Device replica the demotion or
+        // the release just gave back. The shadow is what publish() wrote and what
+        // apply_absent_window() reads, so leaving it naming a returned page is exactly how a
+        // released page could be re-addressed and read from a page the pool already handed on.
+        {
+            LogicalKVPageStore* const retired_pages =
+                &addresses == text_kv_addresses.get() ? text_kv_pages.get() : backend_kv_pages.get();
+            if (retired_pages != nullptr) {
+                const std::uint32_t retire_end = std::min(live, addresses.mapped_pages(address));
+                const std::uint32_t retire_begin =
+                    retire_end > eff_window ? retire_end - eff_window : 0;
+                std::vector<std::uint32_t> retired;
+                for (std::uint32_t page = std::min(window.sink_pages, retire_begin);
+                     page < retire_begin; ++page) {
+                    if (std::find(keep.begin(), keep.end(), page) != keep.end()) { continue; }
+                    if (retired_pages->device_resident(addresses.logical_page(address, page))) {
+                        continue;
+                    }
+                    retired.push_back(page);
+                }
+                if (!retired.empty()) {
+                    cache.execution_tables().mark_absent(row, retired, device.stream);
+                }
+            }
+        }
         // appendix FJ (M3 3.3): the pages the new mask drops have now given their replicas back,
         // which is exactly the room this needs - so the fetch runs after the demotion/release, and
         // a page dropped this round can never be demanded back this round. Both directions are on
@@ -861,6 +886,15 @@ std::uint32_t ProgramImpl::restore_addressed_host_pages(KVAddressSpaceStore& add
         const std::span<const DeviceKVPageHandle> one(&destination, 1);
         const TransferWork work = pages->physical_pool().copy_from_host(host, one, device.stream);
         pages->publish_device_replica(handle);
+        // appendix FL (M3 3.3): and publish it back into the ADDRESS. reserve/publish only touch
+        // the descriptor, while apply_absent_window() rebuilds the device row from the shadow - so
+        // without this the restore was invisible and the kernel kept reading the page the demotion
+        // gave back. This is the half that makes the fetch actually mean something.
+        {
+            const KVExecutionRowHandle fetch_row = addresses.execution_row(address).handle();
+            const std::span<const DeviceKVPageHandle> restored(&destination, 1);
+            cache.execution_tables().publish(fetch_row, page, restored, device.stream);
+        }
         ++last_fetched_pages_;
         kv_tier_stats().fetched_pages += 1;
         kv_tier_stats().fetched_bytes += work.payload_bytes;

@@ -562,9 +562,15 @@ public:
         // The Host replica must EXIST AND BE CURRENT - that is the whole point of the move, and the copy
         // was just published. (P3a's release predicate says `!host_replica` because it drops the page for
         // good; copying that here made every demotion a no-op.)
-        return page.device_replica.has_value() && !page.pending_device_replica &&
-               host_replica_current(handle) && page.references == 1 && page.writer_references == 1 &&
-               page.source_pins == 0 && page.protected_columns == 0 && !page.destination_pinned;
+        // appendix FL (M3 3.3): P3a's own condition - a page with NO Host copy, dropped for good.
+        // The 3.1 relaxation replaced it with the DEMOTION's condition (`host_replica_current`)
+        // inside the one predicate both fates share, which silently made the release a no-op
+        // wherever no Host copy exists - every CLI scoring flow - and P3a's gate ("off == on",
+        // number-neutral by construction) could not see it. Split back apart: the release drops
+        // what cannot be recovered, the demotion (can_demote_device_replica) keeps what can.
+        return page.device_replica.has_value() && !page.pending_device_replica && !page.host_replica &&
+               page.references == 1 && page.writer_references == 1 && page.source_pins == 0 &&
+               page.protected_columns == 0 && !page.destination_pinned;
     }
 
     [[nodiscard]] bool release_device_replica_for_eviction(LogicalKVPageHandle handle) noexcept {

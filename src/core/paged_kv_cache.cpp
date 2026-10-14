@@ -999,6 +999,26 @@ void KVExecutionTablePool::publish_repeated(KVExecutionRowHandle row_handle,
     publish_indices(row_handle, 0, std::span<const std::int32_t>(shadow, count), stream);
 }
 
+void KVExecutionTablePool::mark_absent(KVExecutionRowHandle row_handle,
+                                       std::span<const std::uint32_t> logical_pages,
+                                       cudaStream_t stream) {
+    constexpr std::int32_t kAbsentPage = -1;
+    if (!valid_handle(row_handle)) {
+        throw std::invalid_argument("Paged KV absent marking names a stale execution row");
+    }
+    auto* shadow = static_cast<std::int32_t*>(host_shadow_.data()) +
+                   static_cast<std::size_t>(row_handle.row_) * logical_page_capacity();
+    auto* destination = static_cast<std::int32_t*>(row(row_handle).data);
+    for (const std::uint32_t page : logical_pages) {
+        if (page >= logical_page_capacity()) {
+            throw std::invalid_argument("Paged KV absent marking is outside its execution row");
+        }
+        shadow[page] = kAbsentPage;
+        CUDA_CHECK(cudaMemcpyAsync(destination + page, shadow + page, sizeof(std::int32_t),
+                                   cudaMemcpyHostToDevice, stream));
+    }
+}
+
 void KVExecutionTablePool::apply_absent_window(KVExecutionRowHandle row_handle,
                                                std::uint32_t live_pages, std::uint32_t sink_pages,
                                                std::uint32_t window_pages,
