@@ -93,7 +93,14 @@ public:
             return std::nullopt;
         }
         for (const LogicalKVPageHandle page : membership) {
-            if (!pages.can_pin_source(page) || pages.host_resident(page)) { return std::nullopt; }
+            // appendix FF (M3 3.2b): accept a LIVE page. can_pin_source() wants writer_references == 0
+            // (a finished source - the checkpoint case); a live sequence's page still holds its writer
+            // reference and satisfies can_pin_active_source() instead. kv_address_space.h:505-518 uses
+            // exactly this either/or form for the same reason. Pin below is unchanged for both.
+            if ((!pages.can_pin_source(page) && !pages.can_pin_active_source(page)) ||
+                pages.host_resident(page)) {
+                return std::nullopt;
+            }
         }
 
         const HostKVPageLayout& layout = page_layout(pages);

@@ -51,6 +51,8 @@ struct Options {
     std::uint32_t stride                = 2048;
     int device                          = 0;
     ninfer::KvCacheStorage kv           = ninfer::KvCacheStorage::Fp8E4M3Row256;
+    // appendix FF (M3 3.2b): Host KV capacity in MiB. 0 = no Host arena, i.e. today's behaviour.
+    std::uint32_t host_kv_mib           = 0;
     bool quick                          = false;
     ninfer::product::LogLevel log_level = ninfer::product::LogLevel::Info;
 };
@@ -58,7 +60,7 @@ struct Options {
 std::string usage_text() {
     return "usage: ninfer-perplexity <model.ninfer> "
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
-           "       [--context N] [--stride N] [--device N]\n"
+           "       [--context N] [--stride N] [--device N] [--host-kv-mib N]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|rk4v2-e8] "
            "[--output <directory>] [--token-logprobs <tsv>]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n";
@@ -103,6 +105,8 @@ Options parse_options(int argc, char** argv) {
             out.context = parse_integer<std::uint32_t>(value("--context"), "context");
         } else if (option == "--stride") {
             out.stride = parse_integer<std::uint32_t>(value("--stride"), "stride");
+        } else if (option == "--host-kv-mib") {
+            out.host_kv_mib = parse_integer<std::uint32_t>(value("--host-kv-mib"), "host-kv-mib");
         } else if (option == "--device") {
             out.device = parse_integer<int>(value("--device"), "device");
         } else if (option == "--token-logprobs") {
@@ -247,6 +251,12 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.device           = options.device;
     engine_options.max_context      = options.context;
     engine_options.kv_cache         = options.kv;
+    // appendix FF (M3 3.2b): engage the Host KV arena so the demotion path can be exercised. Left
+    // untouched when the switch is absent, so the default path keeps its exact behaviour.
+    if (options.host_kv_mib != 0) {
+        engine_options.context_cache.host_capacity_bytes =
+            static_cast<std::size_t>(options.host_kv_mib) * 1024ULL * 1024ULL;
+    }
     engine_options.startup_observer = startup_log.observer();
     ninfer::Engine engine(std::move(engine_options));
     const ninfer::LoadSummary load = engine.load_summary();

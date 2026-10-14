@@ -190,6 +190,13 @@ bool kv_eviction_release_enabled() {
     return value != nullptr && *value != '\0' && std::strtol(value, nullptr, 10) != 0;
 }
 
+// appendix FF (M3 3.2b): demote the masked pages to Host instead of dropping them. Off by default,
+// and mutually exclusive with the release switch - see demote_absent_pages_to_host().
+bool kv_host_demote_enabled() {
+    const char* value = std::getenv("NINFER_KV_EVICT_HOST_DEMOTE");
+    return value != nullptr && *value != '\0' && std::strtol(value, nullptr, 10) != 0;
+}
+
 std::uint32_t effective_window_pages(std::uint32_t requested, std::uint32_t live) {
     const char* value = std::getenv("NINFER_KV_EVICT_WINDOW_PCT");
     if (value == nullptr || *value == '\0' || live == 0) { return requested; }
@@ -574,9 +581,20 @@ void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, Paged
     if (!defer_apply) {
         cache.execution_tables().apply_absent_window(row, live, window.sink_pages, eff_window,
                                                      keep, device.stream);
-        // appendix EY (P3a): hand the masked pages' Device replicas back to the pool. Deferred rounds
-        // never reach here, so a release always follows the mask it was derived from.
-        if (kv_eviction_release_enabled()) {
+        // appendix FF (M3 3.2b) vs appendix EY (P3a): the same masked pages, two different fates.
+        // Demote keeps their bytes on Host, so a later query can still reach them; release throws them
+        // away. Both return the Device page, so the capacity effect is identical - only reversibility
+        // differs. Demote wins when both switches are set, because release would destroy what it saved.
+        std::uint32_t demoted = 0;
+        if (kv_host_demote_enabled()) {
+            demoted = demote_absent_pages_to_host(addresses, cache, address, live, window.sink_pages,
+                                                  eff_window, keep);
+        }
+        if (kv_eviction_release_enabled() && demoted == 0) {
+            // Also the fallback when the demotion demoted nothing - most importantly when no Host
+            // arena is configured. Otherwise the demote switch would win the fork, do nothing, and
+            // leave every masked page materialized with nothing saying so.
+            // Deferred rounds never reach here, so the fate always follows the mask it came from.
             (void)addresses.release_absent_device_pages(address, live, window.sink_pages, eff_window,
                                                         keep);
         }
@@ -593,6 +611,57 @@ void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, Paged
     }
 }
 
+// appendix FF (M3 3.2b): move every masked page in [sink, live - window) that the selector did not
+// keep onto Host, then drop its Device lease. The Host extent store already attaches the replica and
+// unpins the source inside publish(), so this is: collect the pages, prepare, copy, publish, demote.
+// Returns the number of pages actually demoted; 0 means "nothing eligible, nothing changed".
+std::uint32_t ProgramImpl::demote_absent_pages_to_host(KVAddressSpaceStore& addresses,
+                                                       PagedKVCache& cache,
+                                                       KVAddressSpaceHandle address,
+                                                       std::uint32_t live, std::uint32_t sink_pages,
+                                                       std::uint32_t window_pages,
+                                                       const std::vector<std::uint32_t>& keep_pages) {
+    last_demote_stage_      = 0;
+    last_demote_candidates_ = 0;
+    if (host_kv_extents == nullptr) { last_demote_stage_ = 1; return 0; }
+    LogicalKVPageStore* pages = &addresses == text_kv_addresses.get() ? text_kv_pages.get()
+                                                                     : backend_kv_pages.get();
+    if (pages == nullptr) { last_demote_stage_ = 2; return 0; }
+    const std::uint32_t end        = std::min(live, addresses.mapped_pages(address));
+    const std::uint32_t keep_begin = end > window_pages ? end - window_pages : 0;
+    std::vector<LogicalKVPageHandle> membership;
+    membership.reserve(keep_begin);
+    for (std::uint32_t page = std::min(sink_pages, keep_begin); page < keep_begin; ++page) {
+        if (std::find(keep_pages.begin(), keep_pages.end(), page) != keep_pages.end()) { continue; }
+        // logical_page() already exists on the address space; the loop bound keeps it in range.
+        const LogicalKVPageHandle candidate = addresses.logical_page(address, page);
+        // Already on Host (moved by an earlier round, or by a checkpoint): offering it again would make
+        // prepare() reject the WHOLE batch, so every later round would do nothing.
+        if (pages->host_resident(candidate)) { continue; }
+        membership.push_back(candidate);
+    }
+    last_demote_candidates_ = static_cast<std::uint32_t>(membership.size());
+    if (membership.empty()) { last_demote_stage_ = 3; return 0; }
+    auto reservation = host_kv_extents->prepare(*pages, membership);
+    if (!reservation) { last_demote_stage_ = 4; return 0; }  // no Host room / page not pinnable
+    (void)cache.page_pool().copy_to_host(host_kv_extents->device_sources(*reservation),
+                                         host_kv_extents->writable_view(*reservation), device.stream);
+    (void)host_kv_extents->publish(std::move(*reservation));
+    std::uint32_t demoted = 0;
+    std::uint32_t block_mask = 0;
+    for (const LogicalKVPageHandle page : membership) {
+        if (pages->demote_device_replica(page)) {
+            ++demoted;
+        } else {
+            block_mask |= pages->demote_block_mask(page);
+        }
+    }
+    last_demote_block_mask_ = block_mask;
+    last_demoted_pages_ = demoted;
+    last_demote_stage_  = 5;
+    return demoted;
+}
+
 // appendix EY (P3a): the Device page pool's own account - allocated / reserved / available /
 // capacity, one line per decision point. It lives in its own file, and not in the score dump, because
 // a diagnostic must not move the bytes a frozen regression gate watches. Off unless
@@ -606,6 +675,14 @@ void ProgramImpl::dump_pool_account(PagedKVCache& cache) {
     if (!out) { return; }
     out << pool.allocated_pages() << '\t' << pool.reserved_pages() << '\t' << pool.available_pages()
         << '\t' << pool.capacity_pages() << '\n';
+    // appendix FF (M3 3.2b): Host occupancy and how many pages the last demotion moved there. A '#'
+    // marker, so the numeric columns above keep their meaning for existing readers.
+    out << "# demote host_occupied="
+        << (host_kv_extents ? host_kv_extents->occupied() : 0U)
+        << " host_capacity=" << (host_kv_extents ? host_kv_extents->capacity() : 0U)
+        << " last=" << last_demoted_pages_ << " stage=" << last_demote_stage_
+        << " candidates=" << last_demote_candidates_ << " block=0x" << std::hex
+        << last_demote_block_mask_ << std::dec << '\n';
 }
 
 void ProgramImpl::dump_page_scores(KVAddressSpaceStore& addresses, PagedKVCache& cache,

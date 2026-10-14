@@ -334,11 +334,32 @@ public:
     // release_descriptor() - the one place that std::terminate()s on `active_references != 0` - is
     // never reached with a live address. A current Host replica is still required (it is what makes the
     // move reversible), and in-flight transfers, write ownership and checkpoint coverage still veto.
+    // appendix FF: why a demotion is refused, as a bitmask (see sequence.cpp's dump). Diagnostics
+    // only - can_demote_device_replica() remains the single authority for the decision.
+    [[nodiscard]] std::uint32_t demote_block_mask(LogicalKVPageHandle handle) const noexcept {
+        if (!valid(handle)) { return 0xFFu; }
+        const Page& page = pages_[handle.index_];
+        std::uint32_t mask = 0;
+        if (!page.device_replica.has_value()) { mask |= 1u << 0; }
+        if (page.pending_device_replica) { mask |= 1u << 1; }
+        if (!host_replica_current(handle)) { mask |= 1u << 2; }
+        if (page.references != 1) { mask |= 1u << 3; }
+        // bit4 negative: the demotion needs a HELD writer reference, so a missing one is the blocker.
+        if (page.writer_references != 1) { mask |= 1u << 4; }
+        if (page.source_pins != 0) { mask |= 1u << 5; }
+        if (page.protected_columns != 0) { mask |= 1u << 6; }
+        if (page.destination_pinned) { mask |= 1u << 7; }
+        return mask;
+    }
+
     [[nodiscard]] bool can_demote_device_replica(LogicalKVPageHandle handle) const noexcept {
         if (!valid(handle)) { return false; }
         const Page& page = pages_[handle.index_];
+        // appendix FF (M3 3.1): a LIVE page HOLDS its writer reference (1), so the checkpoint-flavoured
+        // `writer_references == 0` refused every page and made the demotion a silent no-op. This is the
+        // condition 3.1 exists to relax, alongside the active-reference requirement it already dropped.
         return page.device_replica.has_value() && host_replica_current(handle) &&
-               !page.pending_device_replica && page.writer_references == 0 && page.source_pins == 0 &&
+               !page.pending_device_replica && page.writer_references == 1 && page.source_pins == 0 &&
                !page.destination_pinned && page.protected_columns == 0;
     }
 
@@ -524,9 +545,16 @@ public:
     can_release_device_replica_for_eviction(LogicalKVPageHandle handle) const noexcept {
         if (!valid(handle)) { return false; }
         const Page& page = pages_[handle.index_];
-        return page.device_replica.has_value() && !page.pending_device_replica && !page.host_replica &&
-               page.references == 1 && page.writer_references == 1 && page.source_pins == 0 &&
-               page.protected_columns == 0 && !page.destination_pinned;
+        // appendix FF (M3 3.1): a LIVE page is the case this exists for, so the writer reference must
+        // be HELD (1), not released - the checkpoint-flavoured `writer_references == 0` rejected every
+        // live page and left the demotion a no-op. This matches can_pin_active_source(): one owner,
+        // one writer, nothing shared, nothing protected.
+        // The Host replica must EXIST AND BE CURRENT - that is the whole point of the move, and the copy
+        // was just published. (P3a's release predicate says `!host_replica` because it drops the page for
+        // good; copying that here made every demotion a no-op.)
+        return page.device_replica.has_value() && !page.pending_device_replica &&
+               host_replica_current(handle) && page.references == 1 && page.writer_references == 1 &&
+               page.source_pins == 0 && page.protected_columns == 0 && !page.destination_pinned;
     }
 
     [[nodiscard]] bool release_device_replica_for_eviction(LogicalKVPageHandle handle) noexcept {

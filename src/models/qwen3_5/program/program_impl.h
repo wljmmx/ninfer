@@ -553,6 +553,17 @@ public:
     // kept so dumps stay comparable to the archives), the peak scores as "p<TAB>page<TAB>code" lines,
     // and the newest-rows counts as "r<TAB>page<TAB>hits" lines, each table followed by its own
     // "# stats" line. When the selector ran, its choice is written first as a "# keep ..." marker.
+    // appendix FF (M3 3.2b): demote masked pages to Host instead of releasing them.
+    std::uint32_t demote_absent_pages_to_host(KVAddressSpaceStore& addresses, PagedKVCache& cache,
+                                              KVAddressSpaceHandle address, std::uint32_t live,
+                                              std::uint32_t sink_pages, std::uint32_t window_pages,
+                                              const std::vector<std::uint32_t>& keep_pages);
+    // Pages the last demotion actually moved to Host, reported in the pool-account file so "the switch
+    // did something" is measured instead of assumed (appendix FF).
+    std::uint32_t last_demoted_pages_     = 0;
+    std::uint32_t last_demote_stage_     = 0;  // where the last demotion attempt stopped (appendix FF)
+    std::uint32_t last_demote_candidates_ = 0;  // masked pages it tried to move
+    std::uint32_t last_demote_block_mask_ = 0;  // OR of the refused pages' condition masks
     void dump_pool_account(PagedKVCache& cache);
     void dump_page_scores(KVAddressSpaceStore& addresses, PagedKVCache& cache,
                           KVAddressSpaceHandle address,

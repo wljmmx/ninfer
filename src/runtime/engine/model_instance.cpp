@@ -89,8 +89,14 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         options.speculative          = {};
         options.enable_vision        = false;
         options.use_cuda_graph       = false;
-        options.context_cache        = ContextCacheOptions{
-                   .enabled = false, .device_state_slots = 0, .host_capacity_bytes = 0};
+        // appendix FF (M3 3.2b): everything here is forced for CausalScoring except the Host KV
+        // capacity, which a caller may legitimately ask for (that is how the demotion path is
+        // exercised). Zero - what every existing caller leaves it at - keeps the old behaviour.
+        // The field is read while the temporary is built, so no local (and no default: jump) is needed.
+        options.context_cache = ContextCacheOptions{
+            .enabled             = false,
+            .device_state_slots  = 0,
+            .host_capacity_bytes = options.context_cache.host_capacity_bytes.value_or(0)};
         break;
     default:
         throw std::invalid_argument("Engine purpose is invalid");
