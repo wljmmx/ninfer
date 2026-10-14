@@ -775,8 +775,20 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         throw std::invalid_argument(
             "loaded components do not match the requested execution options");
     }
+    // appendix FR: the draft's trained position capacity. Verified before touching this: it is read
+    // NOWHERE else in the tree (no buffer, profile or kernel is sized by it) and the draft's RoPE
+    // angle is computed from the position, so exceeding it is mathematically well defined - the
+    // guard is a POLICY check whose only stake is the draft's proposal quality. The text model is
+    // allowed past ITS trained capacity through YaRN (scaled_position_capacity below); the draft has
+    // no scaling, so it is the binding constraint and caps the engine at 256K whenever dflash2 is on.
+    // NINFER_DRAFT_ALLOW_POSITION_OVERRUN=<nonzero> requests the overrun explicitly, so its real
+    // consequence (acceptance rate beyond the trained range) can be measured instead of assumed.
+    const char* draft_overrun            = std::getenv("NINFER_DRAFT_ALLOW_POSITION_OVERRUN");
+    const bool allow_draft_position_ov      = draft_overrun != nullptr &&
+                                         draft_overrun[0] != '\0' && draft_overrun[0] != '0';
     if (parameters.draft &&
-        options.max_context > parameters.model.config().draft->max_position_embeddings) {
+        options.max_context > parameters.model.config().draft->max_position_embeddings &&
+        !allow_draft_position_ov) {
         throw std::invalid_argument("max_context exceeds the selected draft position capacity");
     }
     const std::uint64_t position_capacity =
