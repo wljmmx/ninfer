@@ -189,6 +189,25 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         host_context_arena = std::make_unique<HostContextArena>(host_bytes, minimum_stride);
         host_state_images =
             std::make_unique<HostStatePool>(*host_context_arena, state_images->host_layout());
+        // appendix FF (M3 3.2c): the policy numbers, aligned with the Host default ("8 GiB of KV bytes
+        // plus eight complete StateImages"). The retention count cannot be derived as
+        // host_bytes / image_bytes - host_bytes already contains those images on top of the 8 GiB - so
+        // it is declared, with the same default. The floor keeps the checkpoint side from starving the
+        // live side; 0 (the default) leaves every existing decision identical.
+        host_keep_snapshots_ = 8;
+        if (const char* keep = std::getenv("NINFER_KV_HOST_KEEP_SNAPSHOTS");
+            keep != nullptr && *keep != '\0') {
+            const long wanted = std::strtol(keep, nullptr, 10);
+            if (wanted > 0) { host_keep_snapshots_ = static_cast<std::uint32_t>(wanted); }
+        }
+        if (const char* pct = std::getenv("NINFER_KV_HOST_LIVE_FLOOR_PCT");
+            pct != nullptr && *pct != '\0') {
+            const long share = std::strtol(pct, nullptr, 10);
+            if (share > 0 && share < 100) {
+                host_context_arena->set_live_floor_bytes(
+                    host_bytes / 100ULL * static_cast<unsigned long>(share));
+            }
+        }
         host_kv_arena      = std::make_unique<HostKVArena>(*host_context_arena, layouts);
         const auto extents = checked_count(host_bytes / minimum_kv_stride);
         if (extents) {

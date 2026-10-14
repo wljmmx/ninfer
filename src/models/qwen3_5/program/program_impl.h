@@ -564,6 +564,9 @@ public:
     std::uint32_t last_demote_stage_     = 0;  // where the last demotion attempt stopped (appendix FF)
     std::uint32_t last_demote_candidates_ = 0;  // masked pages it tried to move
     std::uint32_t last_demote_block_mask_ = 0;  // OR of the refused pages' condition masks
+    // appendix FF (M3 3.2c): how many recent checkpoints may keep their Host room (default 8, the same
+    // count the Host default is written with).
+    std::uint32_t host_keep_snapshots_ = 8;
     void dump_pool_account(PagedKVCache& cache);
     void dump_page_scores(KVAddressSpaceStore& addresses, PagedKVCache& cache,
                           KVAddressSpaceHandle address,

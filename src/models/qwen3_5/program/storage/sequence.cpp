@@ -682,7 +682,8 @@ void ProgramImpl::dump_pool_account(PagedKVCache& cache) {
         << " host_capacity=" << (host_kv_extents ? host_kv_extents->capacity() : 0U)
         << " last=" << last_demoted_pages_ << " stage=" << last_demote_stage_
         << " candidates=" << last_demote_candidates_ << " block=0x" << std::hex
-        << last_demote_block_mask_ << std::dec << '\n';
+        << last_demote_block_mask_ << std::dec << " keep_snapshots=" << host_keep_snapshots_
+        << " live_floor=" << (host_context_arena ? host_context_arena->live_floor_bytes() : 0U) << '\n';
 }
 
 void ProgramImpl::dump_page_scores(KVAddressSpaceStore& addresses, PagedKVCache& cache,
