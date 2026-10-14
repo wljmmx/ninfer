@@ -1,5 +1,6 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
+#include "models/qwen3_5/program/kv_tier_stats.h"
 #include "core/device.h"
 
 #include <algorithm>
@@ -146,6 +147,15 @@ ContextProgress ProgramImpl::poll_context(runtime::CancellationFlagView cancella
     for (std::uint32_t phase = 0; phase < 2; ++phase) {
         if (tx.submitted && !context_completion_.ready()) { return out; }
         for (const auto& transfer : tx.transfers) {
+            // appendix FH (M3 3.2d): the `kv tiers` counter for the Host -> Device direction.
+            // Every restore passes through here (the planner's scan builds these transfers, and
+            // poll_context is the single place they are consumed and cleared), so the cumulative
+            // fetched count can neither miss a payload nor count one twice.
+            if (transfer.direction == runtime::ContextTransferDirection::HostToDevice &&
+                transfer.resource != runtime::ContextResourceClass::State) {
+                kv_tier_stats().fetched_pages += transfer.page_count;
+                kv_tier_stats().fetched_bytes += transfer.work.payload_bytes;
+            }
             tx.observations.push_back(context_transfer_observation(
                 transfer.resource, transfer.direction, transfer.work, transfer.page_count,
                 transfer.resource == runtime::ContextResourceClass::State ? transfer.units : 0));

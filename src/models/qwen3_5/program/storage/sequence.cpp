@@ -1,5 +1,6 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
+#include "models/qwen3_5/program/kv_tier_stats.h"
 #include "core/device.h"
 
 #include <algorithm>
@@ -737,15 +738,22 @@ std::uint32_t ProgramImpl::demote_absent_pages_to_host(KVAddressSpaceStore& addr
             // extents become unreferenced and release_unreferenced frees them); a live demoted extent
             // cannot be released at all. So give up the least recent checkpoints, keeping the configured
             // number, and try once more - this is the lever, not evicting live pages.
-            last_stale_checkpoints_ += release_stale_checkpoints(host_keep_snapshots_);
+            const std::uint32_t stale = release_stale_checkpoints(host_keep_snapshots_);
+            last_stale_checkpoints_ += stale;
+            // appendix FH (M3 3.2d): count them where they happen. FE.3 requires the preemption
+            // to be reported, so a silent multi-turn regression cannot hide behind a number that
+            // is only ever read once.
+            kv_tier_stats().preempted_checkpoints += stale;
             if (auto retry = host_kv_extents->prepare(*pages, membership)) {
                 reservation.emplace(std::move(*retry));
             }
         }
         if (!reservation) { last_demote_stage_ = 4; return 0; }
     }
-    (void)cache.page_pool().copy_to_host(host_kv_extents->device_sources(*reservation),
-                                         host_kv_extents->writable_view(*reservation), device.stream);
+    const auto tier_copy =
+        cache.page_pool().copy_to_host(host_kv_extents->device_sources(*reservation),
+                                       host_kv_extents->writable_view(*reservation),
+                                       device.stream);
     const HostKVExtentCapability capability = host_kv_extents->publish(std::move(*reservation));
     if (const std::int32_t row = addresses.bound_row(address); row >= 0) {
         live_host_extents_[row].push_back(
@@ -766,6 +774,11 @@ std::uint32_t ProgramImpl::demote_absent_pages_to_host(KVAddressSpaceStore& addr
     last_demote_block_mask_ = block_mask;
     last_demoted_pages_ = demoted;
     last_demote_stage_  = 5;
+    // appendix FH (M3 3.2d): the `kv tiers` counters for the Device -> Host direction. Pages are
+    // what actually reached Host; the bytes are the batch's payload - the whole reservation was
+    // copied, so this is the transfer's real cost, not just the surviving subset's.
+    kv_tier_stats().spilled_pages += demoted;
+    kv_tier_stats().spilled_bytes += tier_copy.payload_bytes;
     return demoted;
 }
 
@@ -793,6 +806,24 @@ void ProgramImpl::dump_pool_account(PagedKVCache& cache) {
         << " live_floor=" << (host_context_arena ? host_context_arena->live_floor_bytes() : 0U)
         << " evicted_pages=" << last_host_evicted_pages_
         << " stale_checkpoints=" << last_stale_checkpoints_ << '\n';
+    // appendix FH (M3 3.2d): `kv tiers`, in Strata's "expert tiers" style - the two tiers as they
+    // stand now, then, since the start, what has moved between them. "spilled" is the demotion's
+    // Device -> Host payload (reversible: the matrix says whether `--host-kv-mib` is doing work);
+    // "fetched" is the planner's Host -> Device restore payload (the pages whose Device replica the
+    // demotion gave up and a later plan asked back); "preempted_checkpoints" is FE.3's rule
+    // actually firing. A '#' marker, so the numeric columns above keep their meaning for existing
+    // readers.
+    out << "# kv tiers device=" << pool.allocated_pages() << '/' << pool.capacity_pages()
+        << " host=" << (host_kv_extents ? host_kv_extents->occupied() : 0U) << '/'
+        << (host_kv_extents ? host_kv_extents->capacity() : 0U)
+        << " host_live=" << (host_context_arena ? host_context_arena->live_kv_bytes_held() : 0U)
+        << " host_checkpoint="
+        << (host_context_arena ? host_context_arena->checkpoint_bytes_held() : 0U)
+        << " spilled_pages=" << kv_tier_stats().spilled_pages
+        << " spilled_bytes=" << kv_tier_stats().spilled_bytes
+        << " fetched_pages=" << kv_tier_stats().fetched_pages
+        << " fetched_bytes=" << kv_tier_stats().fetched_bytes
+        << " preempted_checkpoints=" << kv_tier_stats().preempted_checkpoints << '\n';
 }
 
 void ProgramImpl::dump_page_scores(KVAddressSpaceStore& addresses, PagedKVCache& cache,
