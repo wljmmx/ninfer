@@ -128,9 +128,14 @@ HostContextArena::split(HostContextAllocation&& allocation, std::size_t byte_off
         byte_offset > allocation.bytes_ || allocation.bytes_ - byte_offset < minimum_bytes_) {
         throw std::out_of_range("Host context split must retain two aligned complete geometries");
     }
-    HostContextAllocation left(*this, allocation.offset_, byte_offset, allocation.reserved_);
+    // appendix FF (M3 3.2d): both halves keep the original's consumer tag. Without it they defaulted to
+    // Live, so releasing a split allocation decremented live_kv_bytes_ and left checkpoint_bytes_
+    // inflated - the mis-attribution FF.2 recorded. The arena total is untouched either way.
+    HostContextAllocation left(*this, allocation.offset_, byte_offset, allocation.reserved_,
+                               allocation.consumer_);
     HostContextAllocation right(*this, allocation.offset_ + byte_offset,
-                                allocation.bytes_ - byte_offset, allocation.reserved_);
+                                allocation.bytes_ - byte_offset, allocation.reserved_,
+                                allocation.consumer_);
     allocation.disarm();
     ++allocation_count_;
     return {std::move(left), std::move(right)};
