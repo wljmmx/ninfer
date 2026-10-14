@@ -570,8 +570,18 @@ public:
     // appendix FF (M3 3.2c): Host extents the demotion created, per execution row, so they can be given
     // back when the address is released. Nothing else owns them: a demoted page's descriptor is kept
     // alive by its Host replica on purpose, and only releasing the extent frees it.
-    std::map<std::int32_t, std::vector<HostKVExtentCapability>> live_host_extents_;
+    struct LiveHostExtent {
+        HostKVExtentCapability capability;
+        std::uint64_t age        = 0;  // demotion order; lower = older = evicted first
+        std::uint32_t page_begin = 0;  // logical page span, ready for score-based victim selection
+        std::uint32_t page_end   = 0;
+    };
+    std::map<std::int32_t, std::vector<LiveHostExtent>> live_host_extents_;
+    std::uint64_t host_extent_age_ = 0;
+    // Pages whose reversibility the last pressure eviction cost (they can only return by re-prefill).
+    std::uint32_t last_host_evicted_pages_ = 0;
     void release_live_host_extents(std::int32_t row) noexcept;
+    [[nodiscard]] std::uint32_t evict_oldest_host_extent() noexcept;
     void dump_pool_account(PagedKVCache& cache);
     void dump_page_scores(KVAddressSpaceStore& addresses, PagedKVCache& cache,
                           KVAddressSpaceHandle address,

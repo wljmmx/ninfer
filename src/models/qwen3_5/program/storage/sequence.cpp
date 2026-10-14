@@ -618,14 +618,51 @@ void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, Paged
 // appendix FF (M3 3.2c): release the Host extents recorded for one execution row. release() detaches
 // each page's replica and, through it, retires the descriptors that were kept alive for the extent -
 // which is why nothing else can do this job.
+// appendix FF (M3 3.2c): release the globally OLDEST demoted extent, whatever its owner, and report
+// how many pages that gave up. Recency is the agreed rule ("keep the most recent N"); a score-based
+// ranking would need the page-index mapping the record is only now starting to carry.
+// Kept although it can only ever report 0: release() refuses a live demoted extent, so this can
+// only give up extents that are already unreferenced - which release_unreferenced() covers. Left as
+// the documented hook for a future contract that allows evicting live demoted pages.
+std::uint32_t ProgramImpl::evict_oldest_host_extent() noexcept {
+    if (host_kv_extents == nullptr) { return 0; }
+    std::int32_t victim_row = -1;
+    std::size_t victim_index = 0;
+    std::uint64_t oldest     = std::numeric_limits<std::uint64_t>::max();
+    for (const auto& [row, extents] : live_host_extents_) {
+        for (std::size_t index = 0; index < extents.size(); ++index) {
+            if (extents[index].age < oldest) {
+                oldest       = extents[index].age;
+                victim_row   = row;
+                victim_index = index;
+            }
+        }
+    }
+    if (victim_row < 0) { return 0; }
+    auto& extents               = live_host_extents_[victim_row];
+    const LiveHostExtent victim = extents[victim_index];
+    const std::uint32_t pages   = victim.page_end > victim.page_begin
+                                    ? victim.page_end - victim.page_begin
+                                    : 0U;
+    if (!host_kv_extents->release(victim.capability)) {
+        // The bytes are still occupied, so the record must survive: erasing it would lose the only
+        // handle to them and leak exactly what this function exists to avoid. Report no progress so the
+        // caller stops instead of pretending room was made.
+        return 0;
+    }
+    extents.erase(extents.begin() + static_cast<std::ptrdiff_t>(victim_index));
+    if (extents.empty()) { live_host_extents_.erase(victim_row); }
+    return pages;
+}
+
 void ProgramImpl::release_live_host_extents(std::int32_t row) noexcept {
     if (host_kv_extents == nullptr) { return; }
     const auto found = live_host_extents_.find(row);
     if (found == live_host_extents_.end()) { return; }
     const std::size_t extent_count = found->second.size();  // before erase: the iterator dies with it
     std::uint32_t released         = 0;
-    for (const HostKVExtentCapability capability : found->second) {
-        if (host_kv_extents->release(capability)) { ++released; }
+    for (const LiveHostExtent& extent : found->second) {
+        if (host_kv_extents->release(extent.capability)) { ++released; }
     }
     live_host_extents_.erase(found);
     if (const char* path = std::getenv("NINFER_KV_EVICT_POOL_DUMP"); path != nullptr && *path != '\0') {
@@ -654,6 +691,8 @@ std::uint32_t ProgramImpl::demote_absent_pages_to_host(KVAddressSpaceStore& addr
     const std::uint32_t keep_begin = end > window_pages ? end - window_pages : 0;
     std::vector<LogicalKVPageHandle> membership;
     membership.reserve(keep_begin);
+    std::uint32_t candidates_begin = 0;  // logical page span, recorded with the extent (appendix FF)
+    std::uint32_t candidates_end   = 0;
     for (std::uint32_t page = std::min(sink_pages, keep_begin); page < keep_begin; ++page) {
         if (std::find(keep_pages.begin(), keep_pages.end(), page) != keep_pages.end()) { continue; }
         // logical_page() already exists on the address space; the loop bound keeps it in range.
@@ -661,17 +700,40 @@ std::uint32_t ProgramImpl::demote_absent_pages_to_host(KVAddressSpaceStore& addr
         // Already on Host (moved by an earlier round, or by a checkpoint): offering it again would make
         // prepare() reject the WHOLE batch, so every later round would do nothing.
         if (pages->host_resident(candidate)) { continue; }
+        if (membership.empty()) { candidates_begin = page; }
+        candidates_end = page + 1U;
         membership.push_back(candidate);
     }
     last_demote_candidates_ = static_cast<std::uint32_t>(membership.size());
     if (membership.empty()) { last_demote_stage_ = 3; return 0; }
     auto reservation = host_kv_extents->prepare(*pages, membership);
-    if (!reservation) { last_demote_stage_ = 4; return 0; }  // no Host room / page not pinnable
+    if (!reservation) {
+        // appendix FF (M3 3.2c): the arena is full while the owner is still alive, so this is NOT the
+        // "owner is gone" case - do not release by owner. Give back whatever is already unreferenced,
+        // then make room by evicting the least valuable (oldest) demoted extents, and only then retry.
+        // HostKVExtentReservation is move-only WITHOUT move-assignment, so each retry constructs the
+        // optional in place rather than assigning to it.
+        // Only already-unreferenced extents can be given back here. An extent whose pages are still
+        // address-referenced cannot be released at all (host_kv_store.h:264-265 refuses the demoted
+        // state on purpose), so "evict the least valuable live demoted extent" is not implementable
+        // without first dropping those pages - which is P3a's lossy release, the fallback below. The
+        // pressure valve therefore already exists; what is missing is only PRIORITISATION, so that a
+        // checkpoint gives up its room before a live page gives up reversibility.
+        (void)host_kv_extents->release_unreferenced();
+        if (auto retry = host_kv_extents->prepare(*pages, membership)) {
+            reservation.emplace(std::move(*retry));
+        }
+        if (!reservation) { last_demote_stage_ = 4; return 0; }
+    }
     (void)cache.page_pool().copy_to_host(host_kv_extents->device_sources(*reservation),
                                          host_kv_extents->writable_view(*reservation), device.stream);
     const HostKVExtentCapability capability = host_kv_extents->publish(std::move(*reservation));
     if (const std::int32_t row = addresses.bound_row(address); row >= 0) {
-        live_host_extents_[row].push_back(capability);
+        live_host_extents_[row].push_back(
+            LiveHostExtent{.capability = capability,
+                           .age        = host_extent_age_++,
+                           .page_begin = candidates_begin,
+                           .page_end   = candidates_end});
     }
     std::uint32_t demoted = 0;
     std::uint32_t block_mask = 0;
@@ -709,7 +771,8 @@ void ProgramImpl::dump_pool_account(PagedKVCache& cache) {
         << " last=" << last_demoted_pages_ << " stage=" << last_demote_stage_
         << " candidates=" << last_demote_candidates_ << " block=0x" << std::hex
         << last_demote_block_mask_ << std::dec << " keep_snapshots=" << host_keep_snapshots_
-        << " live_floor=" << (host_context_arena ? host_context_arena->live_floor_bytes() : 0U) << '\n';
+        << " live_floor=" << (host_context_arena ? host_context_arena->live_floor_bytes() : 0U)
+        << " evicted_pages=" << last_host_evicted_pages_ << '\n';
 }
 
 void ProgramImpl::dump_page_scores(KVAddressSpaceStore& addresses, PagedKVCache& cache,
