@@ -464,12 +464,21 @@ void ProgramImpl::release_sequence_state(SequenceState& sequence) noexcept {
 
 void ProgramImpl::release_sequence_kv(SequenceState& sequence) noexcept {
     if (!sequence.kv) { return; }
+    // appendix FF (M3 3.2c): the execution rows must be read BEFORE deactivation drops them, and the Host
+    // extents this sequence's demotion created must go back with it - otherwise the generation path
+    // keeps those Host bytes for the life of the process (the scoring path already returns them).
+    const std::int32_t text_row = text_kv_addresses->bound_row(sequence.kv->text);
+    const std::int32_t backend_row = sequence.kv->backend
+                                         ? backend_kv_addresses->bound_row(*sequence.kv->backend)
+                                         : -1;
     if (sequence.kv->backend && backend_kv_addresses->active(*sequence.kv->backend)) {
         backend_kv_addresses->deactivate(*sequence.kv->backend);
     }
     if (text_kv_addresses->active(sequence.kv->text)) {
         text_kv_addresses->deactivate(sequence.kv->text);
     }
+    release_live_host_extents(text_row);
+    release_live_host_extents(backend_row);
     refresh_history_requirements(sequence.kv, true);
     sequence.kv.reset();
 }
