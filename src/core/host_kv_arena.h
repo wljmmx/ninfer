@@ -162,10 +162,15 @@ public:
 
     [[nodiscard]] const HostKVPageLayout* layout_for(const KVPageGeometry& geometry) const noexcept;
 
-    [[nodiscard]] bool can_allocate(const HostKVPageLayout& layout,
-                                    std::uint32_t pages) const noexcept;
-    [[nodiscard]] std::optional<HostKVAllocation> allocate(const HostKVPageLayout& layout,
-                                                           std::uint32_t pages) noexcept;
+    // appendix FF (M3 3.2b): the consumer is declared by the caller and forwarded to the shared
+    // HostContextArena. Without it every allocation would be tagged Live - checkpoints would count as
+    // live and the live floor would never constrain anything. Defaulted, so existing callers keep
+    // their exact behaviour.
+    [[nodiscard]] bool can_allocate(const HostKVPageLayout& layout, std::uint32_t pages,
+                                    HostConsumer consumer = HostConsumer::Live) const noexcept;
+    [[nodiscard]] std::optional<HostKVAllocation>
+    allocate(const HostKVPageLayout& layout, std::uint32_t pages,
+             HostConsumer consumer = HostConsumer::Live) noexcept;
 
     [[nodiscard]] std::pair<HostKVAllocation, HostKVAllocation> split(HostKVAllocation&& allocation,
                                                                       std::uint32_t page_offset);

@@ -211,23 +211,25 @@ const HostKVPageLayout* HostKVArena::layout_for(const KVPageGeometry& geometry) 
     return layout == layouts_.end() ? nullptr : &*layout;
 }
 
-bool HostKVArena::can_allocate(const HostKVPageLayout& layout, std::uint32_t pages) const noexcept {
+bool HostKVArena::can_allocate(const HostKVPageLayout& layout, std::uint32_t pages,
+                               HostConsumer consumer) const noexcept {
     if (pages == 0 || free_descriptors_.empty() || !find_layout(layout) ||
         layout.page_stride > std::numeric_limits<std::size_t>::max() / pages) {
         return false;
     }
-    return arena_->can_allocate(layout.page_stride * static_cast<std::size_t>(pages));
+    return arena_->can_allocate(layout.page_stride * static_cast<std::size_t>(pages), consumer);
 }
 
 std::optional<HostKVAllocation> HostKVArena::allocate(const HostKVPageLayout& layout,
-                                                      std::uint32_t pages) noexcept {
+                                                      std::uint32_t pages,
+                                                      HostConsumer consumer) noexcept {
     const std::optional<std::uint32_t> layout_index = find_layout(layout);
     if (!layout_index || pages == 0 || free_descriptors_.empty() ||
         layout.page_stride > std::numeric_limits<std::size_t>::max() / pages) {
         return std::nullopt;
     }
     const std::size_t bytes = layout.page_stride * static_cast<std::size_t>(pages);
-    auto storage            = arena_->allocate(bytes);
+    auto storage            = arena_->allocate(bytes, consumer);
     if (!storage) { return std::nullopt; }
     const std::uint32_t descriptor_index = take_descriptor();
     Descriptor& descriptor               = descriptors_[descriptor_index];
