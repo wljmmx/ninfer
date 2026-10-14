@@ -25,6 +25,8 @@
 #include "ninfer/ops/w4a8.h"
 #include <initializer_list>
 #include <limits>
+#include <cstdlib>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -94,6 +96,24 @@ std::size_t graph_topology_allowance(const std::vector<GraphExecutionProfile>& p
     return total;
 }
 
+namespace {
+
+// appendix FN: the declared resident Device budget (the eviction contract's
+// NINFER_KV_EVICT_CAPACITY), in pages - or nullopt when the arena is to follow the logical page
+// count. Shared by the layout builder and the planner's capacity-stride guard so the two cannot
+// disagree about whether a budget is in force.
+std::optional<std::uint32_t> declared_resident_pages(std::uint32_t fitted_pages) {
+    const char* value = std::getenv("NINFER_KV_EVICT_CAPACITY");
+    if (value == nullptr || *value == '\0') { return std::nullopt; }
+    const long requested = std::strtol(value, nullptr, 10);
+    if (requested <= 0 || static_cast<unsigned long>(requested) >= fitted_pages) {
+        return std::nullopt;
+    }
+    return static_cast<std::uint32_t>(requested);
+}
+
+} // namespace
+
 TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
                         std::initializer_list<std::int32_t> shape, const char* label) {
     return builder.add_tensor(dtype, shape, kArenaAlign, label);
@@ -118,15 +138,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     // here knows about the contract on purpose: capping below the logical capacity without one is
     // caught loudly by plan_cache()'s guard instead of degrading silently.
     const std::uint32_t fitted_pages = plan.main_page_groups;
-    const std::uint32_t physical_pages = [fitted_pages]() {
-        const char* value = std::getenv("NINFER_KV_EVICT_CAPACITY");
-        if (value == nullptr || *value == '\0') { return fitted_pages; }
-        const long requested = std::strtol(value, nullptr, 10);
-        if (requested <= 0 || static_cast<unsigned long>(requested) >= fitted_pages) {
-            return fitted_pages;
-        }
-        return static_cast<std::uint32_t>(requested);
-    }();
+    const std::uint32_t physical_pages =
+        declared_resident_pages(fitted_pages).value_or(fitted_pages);
     const std::uint64_t mtp_extra_pages =
         plan.features.mtp()
             ? static_cast<std::uint64_t>(plan.max_concurrency) *
@@ -953,7 +966,16 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
     if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("maximum Main KV page count exceeds uint32");
     }
-    const auto maximum_pages = static_cast<std::uint32_t>(maximum_pages64);
+    // appendix FN: with a declared resident budget (the eviction contract's
+    // NINFER_KV_EVICT_CAPACITY) the Device reservation does NOT grow with the logical page count,
+    // so the curve is flat BY CONSTRUCTION: the arena is the budget, every lane still gets its full
+    // logical capacity, and the overflow is handled by the eviction contract. An "expandable"
+    // curve over a pinned arena is what the runtime validator rejects - and it is genuinely
+    // meaningless here, because that growth is paid for by eviction, not by bytes.
+    const std::uint32_t maximum_pages =
+        declared_resident_pages(minimum_pages).has_value()
+            ? minimum_pages
+            : static_cast<std::uint32_t>(maximum_pages64);
 
     auto planner     = std::make_unique<qwen3_5::detail::SequencePlannerImpl>();
     planner->inputs  = inputs;
@@ -965,7 +987,12 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
           .minimum_device_reservation_bytes     = planner->minimum->device_reservation_bytes,
           .bytes_per_additional_main_page_group = 0,
     };
-    if (minimum_pages < maximum_pages) {
+    // appendix FN: a declared resident budget pins the Device arena, so two adjacent logical
+    // candidates reserve exactly the same bytes and the stride IS zero - by design, not by a layout
+    // bug. The guard can only mean something when the arena follows the logical page count; with a
+    // budget in force, requiring a positive stride made every max_concurrency > 1 fail at startup
+    // ("nonpositive KV capacity stride"), which is precisely the multi-lane 1M case.
+    if (!declared_resident_pages(minimum_pages).has_value() && minimum_pages < maximum_pages) {
         auto adjacent = build_sequence_candidate(inputs, minimum_pages + 1U);
         if (adjacent->device_reservation_bytes <= planner->minimum->device_reservation_bytes) {
             throw std::logic_error("Qwen3.5 sequence layout has a nonpositive KV capacity stride");
