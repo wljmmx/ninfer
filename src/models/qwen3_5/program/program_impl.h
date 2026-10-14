@@ -587,6 +587,13 @@ public:
     std::uint64_t host_extent_age_ = 0;
     // Pages whose reversibility the last pressure eviction cost (they can only return by re-prefill).
     std::uint32_t last_host_evicted_pages_ = 0;
+    // appendix FI (M3 3.3): pages the mask about to be applied ADDRESSES while their Device replica
+    // is already gone - and, of those, how many still have a current Host replica (i.e. could be
+    // fetched back). The eviction contract assumes this set is empty; the selector's per-call keep
+    // set is the only way it could stop being empty. Diagnostics only, computed when the pool dump
+    // is on, never read back.
+    std::uint32_t last_addressed_absent_      = 0;
+    std::uint32_t last_addressed_absent_host_ = 0;
     void release_live_host_extents(std::int32_t row) noexcept;
     [[nodiscard]] std::uint32_t evict_oldest_host_extent() noexcept;
     void dump_pool_account(PagedKVCache& cache);

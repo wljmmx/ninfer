@@ -588,6 +588,30 @@ void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, Paged
         const std::vector<std::uint32_t>& effective = g_scored_keep_by_row[key];
         keep.insert(keep.end(), effective.begin(), effective.end());
     }
+    // appendix FI (M3 3.3): is the contract's invariant ('sink + newest window only move forward,
+    // so the kernel never reads a dropped page again') still true once the selector recomputes the
+    // keep set every call? Walk the addressed set and count the pages whose Device replica is gone.
+    // Gated on the dump: a default run computes nothing, so no frozen gate can move.
+    if (const char* tier_path = std::getenv("NINFER_KV_EVICT_POOL_DUMP");
+        tier_path != nullptr && *tier_path != '\0') {
+        LogicalKVPageStore* const tier_pages =
+            &addresses == text_kv_addresses.get() ? text_kv_pages.get() : backend_kv_pages.get();
+        last_addressed_absent_      = 0;
+        last_addressed_absent_host_ = 0;
+        if (tier_pages != nullptr) {
+            const std::uint32_t absent_begin = live > eff_window ? live - eff_window : 0;
+            for (std::uint32_t page = 0; page < live; ++page) {
+                const bool addressed =
+                    page < window.sink_pages || page >= absent_begin ||
+                    std::find(keep.begin(), keep.end(), page) != keep.end();
+                if (!addressed) { continue; }
+                const LogicalKVPageHandle handle = addresses.logical_page(address, page);
+                if (tier_pages->device_resident(handle)) { continue; }
+                ++last_addressed_absent_;
+                if (tier_pages->host_resident(handle)) { ++last_addressed_absent_host_; }
+            }
+        }
+    }
     if (!defer_apply) {
         cache.execution_tables().apply_absent_window(row, live, window.sink_pages, eff_window,
                                                      keep, device.stream);
@@ -805,6 +829,8 @@ void ProgramImpl::dump_pool_account(PagedKVCache& cache) {
         << last_demote_block_mask_ << std::dec << " keep_snapshots=" << host_keep_snapshots_
         << " live_floor=" << (host_context_arena ? host_context_arena->live_floor_bytes() : 0U)
         << " evicted_pages=" << last_host_evicted_pages_
+        << " addressed_absent=" << last_addressed_absent_
+        << " addressed_absent_host=" << last_addressed_absent_host_
         << " stale_checkpoints=" << last_stale_checkpoints_ << '\n';
     // appendix FH (M3 3.2d): `kv tiers`, in Strata's "expert tiers" style - the two tiers as they
     // stand now, then, since the start, what has moved between them. "spilled" is the demotion's
