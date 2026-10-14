@@ -202,6 +202,21 @@ bool ProgramImpl::start_capture(SequenceHandle handle) {
     if (state.state.fork_pending || state.state.read != state.state.write) { return false; }
     const auto frontier = request.capture_groups[request.next_capture].frontier;
     if (frontier != state.text_kv_valid || !state.tail_hidden_valid) { return false; }
+    // appendix FO: a SharedPrefix checkpoint is made by forking the WHOLE prompt into a fresh
+    // address, so it needs every prefix page resident. On a long prompt the eviction contract has
+    // already given those pages back, so the capture cannot be made at all: decline it through the
+    // engine's own path instead of letting the view guard throw and fail the request. The request
+    // keeps its own KV, and a later request that extends it re-prefills - the contract's cost, paid
+    // per request, not an error. Checked BEFORE anything is reserved, so the decline is clean.
+    if (has_role(request.capture_groups[request.next_capture],
+                 runtime::CheckpointRole::SharedPrefix) &&
+        (!text_kv_addresses->active_prefix_view_available(state.kv->text, frontier) ||
+         (state.kv->backend && backend_kv_valid(state) != 0 &&
+          !backend_kv_addresses->active_prefix_view_available(*state.kv->backend,
+                                                             backend_kv_valid(state))))) {
+        skip_capture(handle);
+        return false;
+    }
     if (!reserve_capture_destination(lane, frontier)) { return false; }
     auto ticket = std::move(request.capture_reservation);
     ContextTransaction tx;

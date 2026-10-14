@@ -483,6 +483,34 @@ public:
         fork.owner_ = nullptr;
     }
 
+    // appendix FO: can prepare_active_prefix_view() succeed? The SAME conditions as its guard, as
+    // a predicate, so a caller can decline the work instead of unwinding the request. A long prompt
+    // under the eviction contract has had its early pages given back, and the fork needs EVERY
+    // prefix page resident - so the capture is impossible, not an error. The guard keeps its throw
+    // for genuine contract violations.
+    [[nodiscard]] bool active_prefix_view_available(KVAddressSpaceHandle source_handle,
+                                                   std::uint32_t frontier) const {
+        if (!valid(source_handle) || !active(source_handle) || frontier == 0) { return false; }
+        const Address& source = require_active(source_handle);
+        if (frontier > source.checkpoint_frontier || frontier > source.committed_frontier) {
+            return false;
+        }
+        const auto page_size    = static_cast<std::uint32_t>(kPagedKVPageSize);
+        const auto full_pages   = frontier / page_size;
+        const auto tail_columns = frontier % page_size;
+        const auto count        = pages_for_tokens(frontier);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            const auto page     = membership(source, i);
+            const auto required = i < full_pages ? page_size : tail_columns;
+            if (!pages_->device_resident(page) || pages_->committed_columns(page) < required ||
+                (!pages_->can_pin_source(page) && !pages_->can_pin_active_source(page)) ||
+                (i < full_pages && !pages_->can_retain_reference(page, false))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     [[nodiscard]] KVActivePrefixViewReservation
     prepare_active_prefix_view(KVAddressSpaceHandle source_handle,
                                KVAddressSpaceHandle destination_handle, std::uint32_t frontier) {
