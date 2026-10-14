@@ -194,7 +194,12 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         // host_bytes / image_bytes - host_bytes already contains those images on top of the 8 GiB - so
         // it is declared, with the same default. The floor keeps the checkpoint side from starving the
         // live side; 0 (the default) leaves every existing decision identical.
-        host_keep_snapshots_ = 8;
+        // The retention count extends the StateImage derivation rather than inventing a number: the
+        // context cache's device_state_slots is normalized to the concurrency by planning time, and the
+        // Host default is written for exactly that many StateImages ("8 GiB of KV bytes plus eight
+        // complete StateImages" at the default concurrency of 8). Same source, so it tracks the
+        // concurrency and --device-state-slots instead of drifting from them.
+        host_keep_snapshots_ = plan.context_cache.device_state_slots.value_or(plan.max_concurrency);
         if (const char* keep = std::getenv("NINFER_KV_HOST_KEEP_SNAPSHOTS");
             keep != nullptr && *keep != '\0') {
             const long wanted = std::strtol(keep, nullptr, 10);
