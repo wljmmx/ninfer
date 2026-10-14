@@ -284,13 +284,23 @@ public:
                page.source_pins != std::numeric_limits<std::uint32_t>::max();
     }
 
+    // appendix FJ (M3 3.3): the same condition the unchecked reserve below throws on, as a
+    // predicate. The bind path wants the throw - its reservation was made for exactly these pages -
+    // but the eviction decision scans for candidates and must skip an ineligible page instead of
+    // unwinding the whole call. Keeping the two in one place so they cannot drift.
+    [[nodiscard]] bool can_reserve_device_replica(LogicalKVPageHandle handle) const noexcept {
+        if (!valid(handle)) { return false; }
+        const Page& page = pages_[handle.index_];
+        return !page.device_replica && !page.pending_device_replica && page.host_replica &&
+               !page.destination_pinned && page.source_pins == 0 &&
+               page.host_replica->content_epoch == page.content_epoch &&
+               page.host_replica->committed_columns == page.committed_columns;
+    }
+
     [[nodiscard]] DeviceKVPageHandle reserve_device_replica(LogicalKVPageHandle handle,
                                                             DeviceKVPageReservation& reservation) {
         Page& page = require(handle);
-        if (page.device_replica || page.pending_device_replica || !page.host_replica ||
-            page.destination_pinned || page.source_pins != 0 ||
-            page.host_replica->content_epoch != page.content_epoch ||
-            page.host_replica->committed_columns != page.committed_columns) {
+        if (!can_reserve_device_replica(handle)) {
             throw std::logic_error("logical KV Device restore is not reservable");
         }
         page.pending_device_replica.emplace(physical_->materialize_one(reservation));

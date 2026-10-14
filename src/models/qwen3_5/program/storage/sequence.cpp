@@ -632,6 +632,12 @@ void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, Paged
             (void)addresses.release_absent_device_pages(address, live, window.sink_pages, eff_window,
                                                         keep);
         }
+        // appendix FJ (M3 3.3): the pages the new mask drops have now given their replicas back,
+        // which is exactly the room this needs - so the fetch runs after the demotion/release, and
+        // a page dropped this round can never be demanded back this round. Both directions are on
+        // device.stream, so the read that follows is ordered after both.
+        (void)restore_addressed_host_pages(addresses, cache, address, live, window.sink_pages,
+                                           eff_window, keep);
         dump_pool_account(cache);
     }
     dump_page_scores(addresses, cache, address, keep);
@@ -806,6 +812,56 @@ std::uint32_t ProgramImpl::demote_absent_pages_to_host(KVAddressSpaceStore& addr
     return demoted;
 }
 
+// appendix FJ (M3 3.3): fetch back the pages the mask is about to address whose Device replica the
+// eviction already gave away. Appendix FI measured the set (with the selector on, 17 of 20 decision
+// points address a page with no Device replica); the address came from a block table that still names
+// the old, recycled page. Restoring the replica before the read makes the row name the right page
+// again, and since the bytes are the same bytes, no number may move - which is the gate.
+std::uint32_t ProgramImpl::restore_addressed_host_pages(KVAddressSpaceStore& addresses,
+                                                        PagedKVCache& cache,
+                                                        KVAddressSpaceHandle address,
+                                                        std::uint32_t live,
+                                                        std::uint32_t sink_pages,
+                                                        std::uint32_t window_pages,
+                                                        const std::vector<std::uint32_t>& keep_pages) {
+    last_fetch_candidates_ = 0;
+    last_fetched_pages_    = 0;
+    last_fetch_shortfall_  = 0;
+    if (host_kv_extents == nullptr) { return 0; }
+    LogicalKVPageStore* const pages =
+        &addresses == text_kv_addresses.get() ? text_kv_pages.get() : backend_kv_pages.get();
+    if (pages == nullptr) { return 0; }
+    const std::uint32_t end        = std::min(live, addresses.mapped_pages(address));
+    const std::uint32_t keep_begin = end > window_pages ? end - window_pages : 0;
+    std::vector<LogicalKVPageHandle> wanted;
+    for (std::uint32_t page = 0; page < end; ++page) {
+        const bool addressed = page < sink_pages || page >= keep_begin ||
+                               std::find(keep_pages.begin(), keep_pages.end(), page) !=
+                                   keep_pages.end();
+        if (!addressed) { continue; }
+        const LogicalKVPageHandle handle = addresses.logical_page(address, page);
+        if (pages->device_resident(handle)) { continue; }
+        ++last_fetch_candidates_;
+        // One page at a time, and only when the pool hands back a page for it: the alternative -
+        // one big reservation - either fails whole or succeeds whole, and a partial fetch is what
+        // this call is for. Eligibility is re-checked because reserve_device_replica() throws.
+        if (!pages->can_reserve_device_replica(handle)) { continue; }
+        auto slot = pages->physical_pool().reserve(1);
+        if (!slot) { continue; }
+        const DeviceKVPageHandle destination = pages->reserve_device_replica(handle, *slot);
+        const HostKVPageReplica replica       = pages->host_replica(handle);
+        const auto host = host_kv_extents->view(replica.extent).subview(replica.page_offset, 1);
+        const std::span<const DeviceKVPageHandle> one(&destination, 1);
+        const TransferWork work = pages->physical_pool().copy_from_host(host, one, device.stream);
+        pages->publish_device_replica(handle);
+        ++last_fetched_pages_;
+        kv_tier_stats().fetched_pages += 1;
+        kv_tier_stats().fetched_bytes += work.payload_bytes;
+    }
+    last_fetch_shortfall_ = last_fetch_candidates_ - last_fetched_pages_;
+    return last_fetched_pages_;
+}
+
 // appendix EY (P3a): the Device page pool's own account - allocated / reserved / available /
 // capacity, one line per decision point. It lives in its own file, and not in the score dump, because
 // a diagnostic must not move the bytes a frozen regression gate watches. Off unless
@@ -845,6 +901,9 @@ void ProgramImpl::dump_pool_account(PagedKVCache& cache) {
         << " host_live=" << (host_context_arena ? host_context_arena->live_kv_bytes_held() : 0U)
         << " host_checkpoint="
         << (host_context_arena ? host_context_arena->checkpoint_bytes_held() : 0U)
+        << " fetch_candidates=" << last_fetch_candidates_
+        << " fetched_now=" << last_fetched_pages_
+        << " fetch_shortfall=" << last_fetch_shortfall_
         << " spilled_pages=" << kv_tier_stats().spilled_pages
         << " spilled_bytes=" << kv_tier_stats().spilled_bytes
         << " fetched_pages=" << kv_tier_stats().fetched_pages

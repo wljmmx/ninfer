@@ -561,6 +561,13 @@ public:
                                               KVAddressSpaceHandle address, std::uint32_t live,
                                               std::uint32_t sink_pages, std::uint32_t window_pages,
                                               const std::vector<std::uint32_t>& keep_pages);
+    // appendix FJ (M3 3.3): put back the Device replica of every page the mask is about to address
+    // but whose replica the eviction already gave away (appendix FI measured the set). Room is what
+    // the demotion/release just returned; whatever is left unfetched is counted, never assumed away.
+    std::uint32_t restore_addressed_host_pages(KVAddressSpaceStore& addresses, PagedKVCache& cache,
+                                               KVAddressSpaceHandle address, std::uint32_t live,
+                                               std::uint32_t sink_pages, std::uint32_t window_pages,
+                                               const std::vector<std::uint32_t>& keep_pages);
     // Pages the last demotion actually moved to Host, reported in the pool-account file so "the switch
     // did something" is measured instead of assumed (appendix FF).
     std::uint32_t last_demoted_pages_     = 0;
@@ -594,6 +601,13 @@ public:
     // is on, never read back.
     std::uint32_t last_addressed_absent_      = 0;
     std::uint32_t last_addressed_absent_host_ = 0;
+    // appendix FJ (M3 3.3): the fetch half. `candidates` is every addressed page with no Device
+    // replica; `fetched` is how many of them the restore actually put back; `shortfall` is the rest -
+    // the number the CLOCK victim rule has to aim at. Diagnostics, but read on every decision (the
+    // restore itself is not optional), so they are not gated on the dump.
+    std::uint32_t last_fetch_candidates_ = 0;
+    std::uint32_t last_fetched_pages_    = 0;
+    std::uint32_t last_fetch_shortfall_  = 0;
     void release_live_host_extents(std::int32_t row) noexcept;
     [[nodiscard]] std::uint32_t evict_oldest_host_extent() noexcept;
     void dump_pool_account(PagedKVCache& cache);
