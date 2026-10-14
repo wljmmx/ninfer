@@ -316,7 +316,12 @@ void ProgramImpl::prepare_graphs() {
                                         proposal_head};
     };
 
-    if (speculative_backend == SpeculativeBackend::None) {
+    // appendix FS: the ordinary family is built for the ordinary backend, and ALSO when the masked
+    // draft cannot cover the capacity - those batches are served by the ordinary round, and without
+    // this build they would have no graphs to run. Mtp is not such a case: config().draft is empty
+    // for it, so its family is built exactly as before.
+    if (speculative_backend == SpeculativeBackend::None ||
+        draft_needs_ordinary_fallback(parameters, capacity)) {
         const auto ordinary_profiles = ordinary_graph_profiles(capacity);
         validate_graph_profiles(ordinary_profiles, capacity - 1, "ordinary");
         const std::uint32_t ordinary_batch_limit = max_concurrency;

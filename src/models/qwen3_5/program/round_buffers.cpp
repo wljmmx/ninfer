@@ -55,7 +55,11 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
     validate_spec(spec);
     RoundStateLayout layout;
     layout.spec = spec;
-    if (!spec.causal_scoring && spec.backend == SpeculativeBackend::None) {
+    // appendix FS (S-A): the ordinary frame must exist whenever the ordinary round can be submitted -
+    // for the ordinary backend, and also for a masked draft whose trained range cannot cover the
+    // capacity (decode_raw routes those batches to the ordinary round).
+    if (!spec.causal_scoring &&
+        (spec.backend == SpeculativeBackend::None || spec.ordinary_fallback)) {
         OrdinaryDecodeStateLayout& ordinary = layout.ordinary.emplace();
         ordinary.ingress =
             builder.add(sizeof(OrdinaryDecodeIngress), 256, "ordinary decode ingress");

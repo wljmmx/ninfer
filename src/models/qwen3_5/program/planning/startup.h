@@ -13,6 +13,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 
@@ -115,6 +116,33 @@ struct SequencePlannerImpl {
     runtime::SequenceCapacityCurve curve;
     std::unique_ptr<SequencePlanImpl> minimum;
 };
+
+// appendix FR/FS (S-A): the masked draft has no positional SCALING - DraftConfig carries a
+// rope_theta but no factor, and the draft's RoPE angle is computed from the absolute position, with
+// the fused materialization contract pinning theta at 1e7 - while the text model is allowed past
+// its trained range through YaRN. So a context longer than the draft's max_position_embeddings
+// cannot be served by the draft. Measured past that range (one lane, max_tokens=32): acceptance
+// 72.4% -> 54.3% and decode 43.6 tok/s, i.e. the no-speculation baseline (43.5-46.4) - the draft's
+// work is simply wasted there, which is why such a batch is served by the ordinary round.
+// NINFER_DRAFT_ALLOW_POSITION_OVERRUN=<nonzero> forces the draft past its range anyway (FR.3's
+// measurement mode) and thereby disables this fallback.
+[[nodiscard]] inline bool draft_position_overrun_allowed() noexcept {
+    const char* value = std::getenv("NINFER_DRAFT_ALLOW_POSITION_OVERRUN");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+// True when the configured draft cannot serve a context of `capacity` tokens, so that batches
+// which reach past the draft's range take the ordinary round. Engaged exactly for a masked draft:
+// config.cpp parses Config::draft only for DFlash/DFlash2 and load.cpp binds the draft weights off
+// that same member, so `!draft` also excludes Mtp - the backend the original hard guard never fired
+// for.
+[[nodiscard]] inline bool draft_needs_ordinary_fallback(const execution::Parameters& parameters,
+                                                       std::uint32_t capacity) noexcept {
+    const auto& draft = parameters.model.config().draft;
+    if (!draft) { return false; }
+    if (draft_position_overrun_allowed()) { return false; }
+    return capacity > draft->max_position_embeddings;
+}
 
 [[nodiscard]] std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
 make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContext& device,

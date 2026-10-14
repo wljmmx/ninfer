@@ -28,6 +28,10 @@ struct RoundStateSpec {
     std::uint32_t draft_window   = 0;
     SpeculativeBackend backend   = SpeculativeBackend::None;
     bool causal_scoring          = false;
+    // appendix FS (S-A): the ordinary decode frame is also needed by an engine whose backend is not
+    // None - past the draft's trained range decode_raw submits those batches to the ordinary round.
+    // Set from the same predicate the router and graphs.cpp use, so the three agree by construction.
+    bool ordinary_fallback       = false;
 };
 
 struct PrefillRoundHost {

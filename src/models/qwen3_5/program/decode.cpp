@@ -226,7 +226,11 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
     nvtx::ScopedRange round_range(nvtx::Name::DecodeOrdinaryRound, nvtx::Category::Decode,
                                   static_cast<std::uint64_t>(lanes.size()));
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
-    if (speculative_backend != SpeculativeBackend::None) {
+    // appendix FS: the ordinary round also serves a draft backend whose positions have left the
+    // draft's trained range (decode_raw routes those batches here), so only refuse when the engine
+    // as a whole was planned around the draft.
+    if (speculative_backend != SpeculativeBackend::None &&
+        !draft_needs_ordinary_fallback(parameters, capacity)) {
         throw std::logic_error("ordinary batch execution requires the ordinary backend");
     }
     if (lanes.empty() || lanes.size() > max_concurrency || budgets.size() != lanes.size()) {
@@ -766,6 +770,39 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_raw(
     runtime::ExecutionTiming* failed_timing, runtime::TokenMaskProvider* masks) {
     if (speculative_backend == SpeculativeBackend::None) {
         return decode_ordinary_batch(lanes, budgets, failed_timing, masks);
+    }
+    // appendix FS (S-A): the masked draft is worth running only while the positions it would touch
+    // stay inside its trained range - past that it produces the no-speculation rate (FR.3) - so such
+    // a batch takes the ordinary round instead of paying for worthless drafts. Per batch, because a
+    // request can cross the boundary mid-generation.
+    //
+    // The test below MIRRORS the draft round's own precondition (decode_dflash_batch) rather than
+    // approximating it, because the two must agree: a lane the draft round would refuse has to have
+    // been routed here. That is why the lag on the draft's context is part of it - the ordinary round
+    // never advances dflash_context_frontier, so a lane batched with an out-of-range lane drifts, and
+    // handing such a lane back to the draft once the drift passed its width would be a hard error.
+    if (draft_needs_ordinary_fallback(parameters, capacity) && budgets.size() == lanes.size()) {
+        const auto& draft             = parameters.model.config().draft;
+        const std::uint32_t lag_limit = draft_window + 1U;
+        bool ordinary                 = false;
+        for (std::size_t row = 0; row < lanes.size() && !ordinary; ++row) {
+            const std::uint32_t lane = lanes[row];
+            if (lane >= max_concurrency) { continue; }
+            const SequenceState& sequence = sequences[lane];
+            if (sequence.execution_frontier >= capacity ||
+                sequence.dflash_context_frontier > sequence.execution_frontier) {
+                continue;  // the draft round rejects these itself, and reports why
+            }
+            const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
+                                                    ? budgets[row].generated_tokens_remaining - 1U
+                                                    : 0U;
+            const std::uint32_t extent =
+                std::min({draft_window, max_by_budget, capacity - sequence.execution_frontier - 1U});
+            ordinary = static_cast<std::uint64_t>(sequence.execution_frontier) + extent >=
+                           draft->max_position_embeddings ||
+                       sequence.execution_frontier - sequence.dflash_context_frontier > lag_limit;
+        }
+        if (ordinary) { return decode_ordinary_batch(lanes, budgets, failed_timing, masks); }
     }
     if (speculative_backend == SpeculativeBackend::Mtp) {
         return decode_mtp_batch(lanes, budgets, failed_timing, masks);

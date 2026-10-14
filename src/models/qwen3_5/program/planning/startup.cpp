@@ -267,7 +267,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                          .batch_capacity = plan.max_concurrency,
                                          .draft_window   = plan.draft_window,
                                          .backend        = plan.speculative_backend,
-                                         .causal_scoring = plan.causal_scoring});
+                                         .causal_scoring = plan.causal_scoring,
+                                         .ordinary_fallback =
+                                             draft_needs_ordinary_fallback(parameters,
+                                                                           plan.capacity)});
     out.prefill_hidden =
         add_tensor(builder, DType::BF16, {dimension(config.hidden_size), effective_prefill_chunk},
                    "step prefill hidden");
@@ -783,14 +786,12 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     // no scaling, so it is the binding constraint and caps the engine at 256K whenever dflash2 is on.
     // NINFER_DRAFT_ALLOW_POSITION_OVERRUN=<nonzero> requests the overrun explicitly, so its real
     // consequence (acceptance rate beyond the trained range) can be measured instead of assumed.
-    const char* draft_overrun            = std::getenv("NINFER_DRAFT_ALLOW_POSITION_OVERRUN");
-    const bool allow_draft_position_ov      = draft_overrun != nullptr &&
-                                         draft_overrun[0] != '\0' && draft_overrun[0] != '0';
-    if (parameters.draft &&
-        options.max_context > parameters.model.config().draft->max_position_embeddings &&
-        !allow_draft_position_ov) {
-        throw std::invalid_argument("max_context exceeds the selected draft position capacity");
-    }
+    // appendix FS (S-A): this used to REFUSE the whole engine when max_context exceeded the draft's
+    // trained range. It no longer does. The policy now lives in draft_needs_ordinary_fallback, which
+    // marks such work for the ordinary round: decode.cpp routes those batches there, graphs.cpp
+    // builds that family alongside the draft's, and the sequence planner pays its allowance. So the
+    // draft's range stops being a deployment limit while the draft itself still never runs outside
+    // it (unless NINFER_DRAFT_ALLOW_POSITION_OVERRUN asks for exactly that).
     const std::uint64_t position_capacity =
         parameters.model.config().text.rope_parameters
             ? parameters.model.config().text.rope_parameters->scaled_position_capacity(
@@ -940,6 +941,16 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             impl->graph_allowance_bytes =
                 checked_mul(per_batch_allowance + 8ULL * kMiB, impl->max_concurrency,
                             "DFlash exact-b graph allowance");
+        }
+        // appendix FS: when the draft cannot cover the capacity, graphs.cpp builds the ordinary family
+        // AS WELL to serve those rounds, so its allowance is paid on top of the backend's - the same
+        // 12 MiB per exact B that an ordinary-backend engine pays above (line 909).
+        if (draft_needs_ordinary_fallback(*impl->parameters, impl->capacity)) {
+            impl->graph_allowance_bytes = checked_add(
+                impl->graph_allowance_bytes,
+                checked_mul(12ULL * kMiB, impl->max_concurrency,
+                            "ordinary fallback graph allowance"),
+                "sequence graph allowance");
         }
     }
 

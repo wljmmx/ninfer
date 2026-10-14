@@ -113,11 +113,12 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       score_logprobs_host(plan.causal_scoring ? std::make_optional<PinnedHostBuffer>(
                                                     kCausalScoreTile * sizeof(float))
                                               : std::nullopt),
-      ordinary_host(
-          !plan.causal_scoring && plan.speculative_backend == SpeculativeBackend::None
-              ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_5::OrdinaryDecodeIngress) +
-                                                     sizeof(qwen3_5::OrdinaryDecodeEgress))
-              : std::nullopt),
+      ordinary_host(!plan.causal_scoring && (plan.speculative_backend == SpeculativeBackend::None ||
+                                             plan.persistent.round.spec.ordinary_fallback)
+                        ? std::make_optional<PinnedHostBuffer>(
+                              sizeof(qwen3_5::OrdinaryDecodeIngress) +
+                              sizeof(qwen3_5::OrdinaryDecodeEgress))
+                        : std::nullopt),
       mtp_host(plan.speculative_backend == SpeculativeBackend::Mtp
                    ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_5::MtpDecodeIngress) +
                                                           sizeof(qwen3_5::MtpDecodeEgress))
@@ -255,8 +256,12 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (io.mtp_decode.has_value() != (speculative_backend == SpeculativeBackend::Mtp)) {
         throw std::logic_error("MTP decode frame does not match the sequence plan");
     }
+    // appendix FS (S-A): the frame's own spec decides, exactly as round_buffers.cpp laid it out - a
+    // masked draft that cannot cover the capacity carries the ordinary round's frame as well.
     if (io.ordinary.has_value() !=
-        (!causal_scoring && speculative_backend == SpeculativeBackend::None)) {
+        (!causal_scoring &&
+         (speculative_backend == SpeculativeBackend::None ||
+          plan.persistent.round.spec.ordinary_fallback))) {
         throw std::logic_error("ordinary decode frame does not match the sequence plan");
     }
     if (io.dflash_prefill.has_value() != is_masked_draft_backend(speculative_backend)) {

@@ -272,7 +272,20 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
         return timing.finish();
     }
 
-    if (speculative_backend == SpeculativeBackend::None) {
+    // appendix FS (S-A): the dispatch follows the batch's pending KIND, not the engine's backend.
+    // Past the draft's trained range decode_raw submits an ordinary round even under a masked draft,
+    // and such a round is a complete single-token target step: PendingKind::Ordinary already means the
+    // state advance is committed by the graph, so there is no draft prefix for the speculative replay
+    // fold to accept. A batch never mixes the two kinds - the round type is per batch, and every lane
+    // is resolved by the round that produced it - so "every row is ordinary" is the whole test, and
+    // the loop below still rejects a row whose kind or lifecycle disagrees.
+    const bool ordinary_batch =
+        speculative_backend == SpeculativeBackend::None ||
+        std::all_of(lanes.begin(), lanes.end(), [&](std::uint32_t lane) {
+            return lane < max_concurrency && requests[lane].lifecycle == Lifecycle::Pending &&
+                   requests[lane].pending.kind == PendingKind::Ordinary;
+        });
+    if (ordinary_batch) {
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             const std::uint32_t lane = lanes[row];
             if (lane >= max_concurrency || requests[lane].lifecycle != Lifecycle::Pending ||
