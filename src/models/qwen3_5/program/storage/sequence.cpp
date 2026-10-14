@@ -599,8 +599,15 @@ void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, Paged
         last_addressed_absent_      = 0;
         last_addressed_absent_host_ = 0;
         if (tier_pages != nullptr) {
-            const std::uint32_t absent_begin = live > eff_window ? live - eff_window : 0;
-            for (std::uint32_t page = 0; page < live; ++page) {
+            // Clamp exactly as demote_absent_pages_to_host() and release_absent_device_pages() do:
+            // `live` is the COMMITTED live page count, which can exceed what this address has
+            // mapped (the defer path and every non-PPL caller reach that state). Walking to `live`
+            // reads logical_page() past the mapping, which corrupted the heap in the preemption
+            // real test - the PPL path never sees it, which is why the byte gates stayed green.
+            const std::uint32_t absent_end = std::min(live, addresses.mapped_pages(address));
+            const std::uint32_t absent_begin =
+                absent_end > eff_window ? absent_end - eff_window : 0;
+            for (std::uint32_t page = 0; page < absent_end; ++page) {
                 const bool addressed =
                     page < window.sink_pages || page >= absent_begin ||
                     std::find(keep.begin(), keep.end(), page) != keep.end();
