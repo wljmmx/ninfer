@@ -495,16 +495,51 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
             // The advice has to fit the mode: with automatic sizing the arena is already as large
             // as the free memory allows, so the lever is a SMALLER headroom, not `auto`.
             const bool automatic = memory.kv_capacity_mode == KvCapacityMode::Automatic;
+            const char* const mode_advice =
+                automatic ? "The arena is already memory-sized: free device memory with a smaller "
+                            "--kv-capacity-headroom-mib, or enable the eviction contract so "
+                            "residency can be smaller than the context"
+                          : "Raise it with --kv-capacity auto (tune with "
+                            "--kv-capacity-headroom-mib), or enable the eviction contract so "
+                            "residency can be smaller than the context";
+            // appendix GY: spell the trade-off out instead of assuming the memory can be found. The
+            // degradation bands are MEASURED on the gate corpus (appendices GV/GW): reaching 77%
+            // retention already reproduces the untouched perplexity bit for bit, 70% costs 0.15%,
+            // 64% 0.92%, 58% 1.78%, 52% 2.02%, 27% 8.6%. The user's requirement is <2%, i.e. >=58%.
+            const std::uint32_t retained_pages =
+                memory.kv_capacity_page_groups / engine.max_concurrency;
+            const std::uint32_t retained_percent = 100U * retained_pages / per_lane_pages;
+            const char* const measured =
+                retained_percent >= 77   ? "no measurable loss (bit-identical perplexity)"
+                : retained_percent >= 70 ? "+0.15%"
+                : retained_percent >= 64 ? "+0.92%"
+                : retained_percent >= 58 ? "+1.78%"
+                : retained_percent >= 52 ? "+2.02%"
+                : retained_percent >= 27 ? "+8.6%"
+                                         : "more than +15%";
+            std::string retention_note =
+                " Running all " + std::to_string(engine.max_concurrency) +
+                " together would need each lane to retain " +
+                std::to_string(retained_percent) + "% of its context, measured at " + measured;
+            if (retained_percent >= 58) {
+                retention_note += " - inside the <2% band.";
+            } else {
+                const std::uint64_t need_pages =
+                    static_cast<std::uint64_t>(58U * per_lane_pages + 99U) / 100U *
+                    engine.max_concurrency;
+                const std::uint64_t deficit = need_pages > memory.kv_capacity_page_groups
+                                                  ? need_pages - memory.kv_capacity_page_groups
+                                                  : 0;
+                retention_note += " - outside the <2% band; reaching 58% needs " +
+                                  product::format_pretty_bytes(
+                                      deficit * memory.kv_capacity_increment_bytes) +
+                                  " more arena, i.e. that much more free device memory " +
+                                  "(other GPU applications) or a lower --max-concurrency.";
+            }
             logger_->warn(
                 "concurrency | the arena holds {} full-length {}-token lane(s) but "
-                "--max-concurrency is {}: further requests are queued, not run together. {}",
-                lanes, memory.max_context, engine.max_concurrency, automatic
-                    ? "The arena is already memory-sized: free pages with a smaller "
-                      "--kv-capacity-headroom-mib, or enable the eviction contract so "
-                      "residency can be smaller than the context"
-                    : "Raise it with --kv-capacity auto (tune with "
-                      "--kv-capacity-headroom-mib), or enable the eviction contract so "
-                      "residency can be smaller than the context");
+                "--max-concurrency is {}: further requests are queued, not run together.{}{}",
+                lanes, memory.max_context, engine.max_concurrency, retention_note, mode_advice);
         }
     }
     // appendix GR: a Host arena below one full preemption's spill turns the MANDATORY recovery
