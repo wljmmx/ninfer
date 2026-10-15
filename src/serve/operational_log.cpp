@@ -538,7 +538,7 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
             }
             logger_->warn(
                 "concurrency | the arena holds {} full-length {}-token lane(s) but "
-                "--max-concurrency is {}: further requests are queued, not run together.{}{}",
+                "--max-concurrency is {}: further requests are queued, not run together.{} {}",
                 lanes, memory.max_context, engine.max_concurrency, retention_note, mode_advice);
         }
     }

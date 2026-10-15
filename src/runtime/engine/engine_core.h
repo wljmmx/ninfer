@@ -1571,13 +1571,29 @@ private:
                 *bytes > usage.capacity.host_bytes - usage.occupied.host_bytes) {
                 (void)instance_.program->release_redundant_host({}, request->sequence);
             }
-            std::vector<Checkpoint> later;
+            // appendix HB (plan item 5): order the sacrificed paused snapshots by RECOMPUTE COST rather
+            // than by arrival. Revoking a snapshot forces its context to be replayed, whose cost is
+            // linear in the tokens involved (appendix GQ measured 181 us/token), so picking the wrong
+            // victim is ~300x worse than picking the right one. `later`'s index IS the snapshot_order
+            // tie-break that resource_manager.h ranks by, so ordering here is the whole change.
+            // ResumeState::frontier() (program.h:244) is the monotone cost proxy: a higher committed
+            // frontier means more to replay. stable_sort keeps the previous youngest-first order among
+            // equal costs, which also preserves its fairness property.
+            std::vector<std::pair<std::uint32_t, Checkpoint>> later_by_cost;
             for (auto it = paused_.rbegin(); it != paused_.rend(); ++it) {
                 if ((*it)->id > request->id && (*it)->suspended &&
                     (*it)->suspended->has_snapshot()) {
-                    later.push_back(*(*it)->suspended->snapshot_handle());
+                    later_by_cost.emplace_back((*it)->suspended->frontier(),
+                                               *(*it)->suspended->snapshot_handle());
                 }
             }
+            std::stable_sort(later_by_cost.begin(), later_by_cost.end(),
+                             [](const auto& left, const auto& right) {
+                                 return left.first < right.first;
+                             });
+            std::vector<Checkpoint> later;
+            later.reserve(later_by_cost.size());
+            for (const auto& entry : later_by_cost) { later.push_back(entry.second); }
             if (const auto victims =
                     resources_.host_victims(*instance_.program, *bytes, std::nullopt, later)) {
                 for (const auto handle : *victims) {
