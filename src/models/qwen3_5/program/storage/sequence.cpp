@@ -791,7 +791,16 @@ void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, Paged
         // away. Both return the Device page, so the capacity effect is identical - only reversibility
         // differs. Demote wins when both switches are set, because release would destroy what it saved.
         std::uint32_t demoted = 0;
-        if (kv_host_demote_enabled()) {
+        // appendix GS (item 1): prefer KEEPING the bytes. When the caller named no fate for the
+        // masked pages, DEMOTE instead of leaving them resident: appendices GP/GQ measured 4-5x the
+        // aggregate decode throughput for window-sized residency over one full-length lane, demotion
+        // costs one spill (5,784 pages, fetched back 0 times) as cheap as discarding, and the bytes
+        // survive so a later, better decision can still fetch them. Output-neutral by construction -
+        // what attention reads is decided by the mask, not by the replica's fate, and the contract's
+        // gate is a bit-identical PPL. Inert when the contract is off, so no frozen gate can move.
+        const bool demote_unasked = !kv_host_demote_enabled() &&
+                                    !kv_eviction_release_enabled() && host_context_arena != nullptr;
+        if (kv_host_demote_enabled() || demote_unasked) {
             demoted = demote_absent_pages_to_host(addresses, cache, address, live, window.sink_pages,
                                                   eff_window, keep, frontier_start);
         }
