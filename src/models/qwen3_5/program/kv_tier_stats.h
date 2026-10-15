@@ -27,6 +27,12 @@ struct KvTierStats {
     // whether the contract's multi-lane cost is synchronous host blocking or device work.
     std::uint64_t host_eviction_ns      = 0;
     std::uint64_t host_eviction_calls   = 0;
+    // appendix GJ: the same measurement for the WHOLE per-lane KV management call, which also
+    // covers the append path (ensure_mapped_to_tokens -> publish -> pool reserve) that the window
+    // timer above cannot see. The release penalty grows with the lane count, so this is where the
+    // unattributed part has to be looked for.
+    std::uint64_t host_kv_mgmt_ns        = 0;
+    std::uint64_t host_kv_mgmt_calls     = 0;
 };
 
 // One instance per program: the inline function's local static is shared across translation

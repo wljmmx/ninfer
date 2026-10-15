@@ -539,8 +539,50 @@ std::uint32_t ProgramImpl::backend_kv_valid(const SequenceState& state) const no
     return speculative_backend == SpeculativeBackend::DFlash ? state.dflash_context_frontier : 0;
 }
 
+// appendix GF.6: accumulate the host time the eviction decision costs, on destruction, so every
+// early return is covered. Disabled unless the timing switch is set - read once, like every other
+// switch on this path, so the default path pays neither a getenv nor a clock read.
+namespace {
+bool kv_host_timing_enabled() {
+    static const bool enabled = std::getenv("NINFER_KV_EVICT_HOST_TIMING") != nullptr;
+    return enabled;
+}
+
+struct HostEvictionTimer {
+    std::chrono::steady_clock::time_point begin;
+    bool enabled = false;
+    explicit HostEvictionTimer(bool on) : enabled(on) {
+        if (enabled) { begin = std::chrono::steady_clock::now(); }
+    }
+    ~HostEvictionTimer() {
+        if (!enabled) { return; }
+        const auto end = std::chrono::steady_clock::now();
+        kv_tier_stats().host_eviction_ns += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count());
+        kv_tier_stats().host_eviction_calls += 1;
+    }
+};
+
+// appendix GJ: the whole per-lane KV management call, so the append path is included this time.
+struct HostKvMgmtTimer {
+    std::chrono::steady_clock::time_point begin;
+    bool enabled = false;
+    explicit HostKvMgmtTimer(bool on) : enabled(on) {
+        if (enabled) { begin = std::chrono::steady_clock::now(); }
+    }
+    ~HostKvMgmtTimer() {
+        if (!enabled) { return; }
+        const auto end = std::chrono::steady_clock::now();
+        kv_tier_stats().host_kv_mgmt_ns += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count());
+        kv_tier_stats().host_kv_mgmt_calls += 1;
+    }
+};
+} // namespace
+
 void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& state, std::uint32_t main,
                                             std::uint32_t backend) {
+    const HostKvMgmtTimer kv_mgmt_timer(kv_host_timing_enabled());
     text_kv_addresses->ensure_mapped_to_tokens(state.kv->text, main, device.stream);
     if (state.kv->backend) {
         backend_kv_addresses->ensure_mapped_to_tokens(*state.kv->backend, backend, device.stream);
@@ -561,29 +603,6 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& state, std::uint32_t 
 // distinct per row, exactly as the N3 flag is keyed). Without it a decode-step decision - which sees no
 // counts at all - would replace a good prefill selection with a degenerate one (appendix DQ).
 static std::map<const void*, std::vector<std::uint32_t>> g_scored_keep_by_row;
-
-// appendix GF.6: accumulate the host time the eviction decision costs, on destruction, so every
-// early return is covered. Disabled unless the timing switch is set - read once, like every other
-// switch on this path, so the default path pays neither a getenv nor a clock read.
-namespace {
-bool kv_host_timing_enabled() {
-    static const bool enabled = std::getenv("NINFER_KV_EVICT_HOST_TIMING") != nullptr;
-    return enabled;
-}
-
-struct HostEvictionTimer {
-    std::chrono::steady_clock::time_point begin;
-    bool enabled = false;
-    explicit HostEvictionTimer(bool on) : begin(std::chrono::steady_clock::now()), enabled(on) {}
-    ~HostEvictionTimer() {
-        if (!enabled) { return; }
-        const auto end = std::chrono::steady_clock::now();
-        kv_tier_stats().host_eviction_ns += static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count());
-        kv_tier_stats().host_eviction_calls += 1;
-    }
-};
-} // namespace
 
 void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, PagedKVCache& cache,
                                            KVAddressSpaceHandle address) {
@@ -1023,6 +1042,12 @@ void ProgramImpl::dump_pool_account(PagedKVCache& cache) {
         << " total_ms=" << (kv_tier_stats().host_eviction_ns / 1000000ULL)
         << " us_per_call="
         << (host_calls == 0 ? 0ULL : kv_tier_stats().host_eviction_ns / host_calls / 1000ULL)
+        << '\n';
+    const std::uint64_t mgmt_calls = kv_tier_stats().host_kv_mgmt_calls;
+    out << "# host_kv_mgmt calls=" << mgmt_calls
+        << " total_ms=" << (kv_tier_stats().host_kv_mgmt_ns / 1000000ULL)
+        << " us_per_call="
+        << (mgmt_calls == 0 ? 0ULL : kv_tier_stats().host_kv_mgmt_ns / mgmt_calls / 1000ULL)
         << '\n';
     // appendix FH (M3 3.2d): `kv tiers`, in Strata's "expert tiers" style - the two tiers as they
     // stand now, then, since the start, what has moved between them. "spilled" is the demotion's
