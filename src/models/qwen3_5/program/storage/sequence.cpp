@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <numeric>
 #include <optional>
@@ -561,8 +562,32 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& state, std::uint32_t 
 // counts at all - would replace a good prefill selection with a degenerate one (appendix DQ).
 static std::map<const void*, std::vector<std::uint32_t>> g_scored_keep_by_row;
 
+// appendix GF.6: accumulate the host time the eviction decision costs, on destruction, so every
+// early return is covered. Disabled unless the timing switch is set - read once, like every other
+// switch on this path, so the default path pays neither a getenv nor a clock read.
+namespace {
+bool kv_host_timing_enabled() {
+    static const bool enabled = std::getenv("NINFER_KV_EVICT_HOST_TIMING") != nullptr;
+    return enabled;
+}
+
+struct HostEvictionTimer {
+    std::chrono::steady_clock::time_point begin;
+    bool enabled = false;
+    explicit HostEvictionTimer(bool on) : begin(std::chrono::steady_clock::now()), enabled(on) {}
+    ~HostEvictionTimer() {
+        if (!enabled) { return; }
+        const auto end = std::chrono::steady_clock::now();
+        kv_tier_stats().host_eviction_ns += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count());
+        kv_tier_stats().host_eviction_calls += 1;
+    }
+};
+} // namespace
+
 void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, PagedKVCache& cache,
                                            KVAddressSpaceHandle address) {
+    const HostEvictionTimer host_timer(kv_host_timing_enabled());
     const KvEvictionWindow& window = kv_eviction_window();
     const std::uint32_t scored_budget = keep_from_scores_budget();
     const std::uint32_t ratio_percent = keep_from_scores_ratio();
@@ -991,6 +1016,14 @@ void ProgramImpl::dump_pool_account(PagedKVCache& cache) {
         << " stale_checkpoints=" << last_stale_checkpoints_ << '\n';
     out << "# frontier rounds=" << kv_tier_stats().frontier_rounds
         << " advanced_to=" << kv_tier_stats().frontier_advanced_to << '\n';
+    // appendix GF.6: host time inside the eviction decision. us_per_call is the per-lane per-round
+    // host cost; compare it against the round wall time to see whether this is the C=8 cost.
+    const std::uint64_t host_calls = kv_tier_stats().host_eviction_calls;
+    out << "# host_eviction calls=" << host_calls
+        << " total_ms=" << (kv_tier_stats().host_eviction_ns / 1000000ULL)
+        << " us_per_call="
+        << (host_calls == 0 ? 0ULL : kv_tier_stats().host_eviction_ns / host_calls / 1000ULL)
+        << '\n';
     // appendix FH (M3 3.2d): `kv tiers`, in Strata's "expert tiers" style - the two tiers as they
     // stand now, then, since the start, what has moved between them. "spilled" is the demotion's
     // Device -> Host payload (reversible: the matrix says whether `--host-kv-mib` is doing work);

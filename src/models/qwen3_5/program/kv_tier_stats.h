@@ -21,6 +21,12 @@ struct KvTierStats {
     // and where the last one left it. Diagnostics only, like the rest of this struct.
     std::uint64_t frontier_rounds       = 0;
     std::uint32_t frontier_advanced_to  = 0;
+    // appendix GF.6: host-side time spent inside the eviction decision itself, accumulated only
+    // when NINFER_KV_EVICT_HOST_TIMING is set. `calls` is the number of "lane x round" decisions,
+    // so host_eviction_ns / calls is the per-lane per-round host cost - the number that decides
+    // whether the contract's multi-lane cost is synchronous host blocking or device work.
+    std::uint64_t host_eviction_ns      = 0;
+    std::uint64_t host_eviction_calls   = 0;
 };
 
 // One instance per program: the inline function's local static is shared across translation
