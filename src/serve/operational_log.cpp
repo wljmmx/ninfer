@@ -373,6 +373,16 @@ OperationalRecord render_throughput(const ThroughputReport& report) {
     if (report.current.replaying_requests != 0) {
         out << " | replaying " << report.current.replaying_requests;
     }
+    // appendix GT: recomputed tokens are the price of degrading a recovery to Replay, and this line
+    // used to show only the LIVE gauge above - the cumulative cost was reachable only through
+    // /metrics or the JSON request log. appendix GQ priced one 46,290-token recompute at ~8.4 s of
+    // wall, so the number belongs where the other interval statistics are.
+    if (report.current.replayed_tokens > report.previous.replayed_tokens) {
+        out << " | recomputed "
+            << product::format_pretty_count(report.current.replayed_tokens -
+                                            report.previous.replayed_tokens)
+            << " tok";
+    }
     if (report.current.materializing_requests != 0) {
         out << " | materializing " << report.current.materializing_requests;
     }
