@@ -147,6 +147,15 @@ bool kv_eviction_frontier_enabled() {
     return value != nullptr && *value != '\0' && std::strtol(value, nullptr, 10) != 0;
 }
 
+// appendix GE (O2): write only the newly evicted interval of the execution row instead of
+// rebuilding the whole row from the keep rule on every round. Equivalent on a frontier round
+// (see the caller for the three conditions), and a separate knob from the frontier so the two
+// changes can be attributed instead of landing as one lump. Off by default.
+bool kv_eviction_interval_enabled() {
+    const char* value = std::getenv("NINFER_KV_EVICT_INTERVAL");
+    return value != nullptr && *value != '\0' && std::strtol(value, nullptr, 10) != 0;
+}
+
 // Which list(s) the keep set is built from (appendix DS.4). `union` is the validated default; the two
 // single-list modes exist to find out whether half the budget does the same job.
 enum class KeepMode { Union, Duo, Contrast, Raw, Peak };
@@ -632,14 +641,9 @@ void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, Paged
         }
     }
     if (!defer_apply) {
-        cache.execution_tables().apply_absent_window(row, live, window.sink_pages, eff_window,
-                                                     keep, device.stream);
-        // appendix FF (M3 3.2b) vs appendix EY (P3a): the same masked pages, two different fates.
-        // Demote keeps their bytes on Host, so a later query can still reach them; release throws them
-        // away. Both return the Device page, so the capacity effect is identical - only reversibility
-        // differs. Demote wins when both switches are set, because release would destroy what it saved.
-        // appendix GC (FZ layer 0): recompute the scans' own left edge so the frontier can be
-        // clamped the same way in all three of them, then advance it once they have all run.
+        // appendix GC (FZ layer 0): the scans' own left edge, computed once so the row write
+        // and all three scans clamp the frontier the same way. The frontier is advanced once
+        // they have all run.
         const bool frontier_on = kv_eviction_frontier_enabled() && keep.empty();
         std::uint32_t window_begin   = 0;
         std::uint32_t frontier_start = 0;
@@ -649,6 +653,26 @@ void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, Paged
             frontier_start = std::min(addresses.eviction_frontier(address), window_begin);
             kv_tier_stats().frontier_rounds += 1;
         }
+        // appendix GE (O2): the interval write is equivalent to the whole-row rebuild only when
+        // the scans' own edge and the rebuild's edge agree, i.e. when the whole committed frontier
+        // is mapped. Otherwise the rebuild masks up to live - window, which is past what is mapped,
+        // and an interval that stopped at the mapped edge would leave those pages addressed. So it
+        // is used only on a frontier round with live == mapped; the rebuild runs everywhere else.
+        const bool interval_ok =
+            kv_eviction_interval_enabled() && frontier_on && window_begin != 0 &&
+            live == addresses.mapped_pages(address);
+        if (interval_ok) {
+            const std::uint32_t interval_begin = std::max(window.sink_pages, frontier_start);
+            cache.execution_tables().apply_absent_interval(row, interval_begin, window_begin,
+                                                           device.stream);
+        } else {
+            cache.execution_tables().apply_absent_window(row, live, window.sink_pages, eff_window,
+                                                         keep, device.stream);
+        }
+        // appendix FF (M3 3.2b) vs appendix EY (P3a): the same masked pages, two different fates.
+        // Demote keeps their bytes on Host, so a later query can still reach them; release throws them
+        // away. Both return the Device page, so the capacity effect is identical - only reversibility
+        // differs. Demote wins when both switches are set, because release would destroy what it saved.
         std::uint32_t demoted = 0;
         if (kv_host_demote_enabled()) {
             demoted = demote_absent_pages_to_host(addresses, cache, address, live, window.sink_pages,

@@ -440,6 +440,15 @@ public:
                              std::uint32_t sink_pages, std::uint32_t window_pages,
                              std::span<const std::uint32_t> keep_pages, cudaStream_t stream);
 
+    // appendix GE (O2): the interval form. The evicted prefix is monotone, so between two
+    // decisions the only entries that can change are the pages that just fell out of the window,
+    // and every one of them becomes the sentinel. Writing [first_page, end_page) therefore
+    // produces the same row as the whole-row rebuild above, without re-deriving and uploading
+    // live_pages entries. Only valid where the caller knows the prefix below first_page is
+    // already correct (the O1 frontier round).
+    void apply_absent_interval(KVExecutionRowHandle row, std::uint32_t first_page,
+                               std::uint32_t end_page, cudaStream_t stream);
+
     [[nodiscard]] Tensor row(KVExecutionRowHandle handle) const;
 
     [[nodiscard]] const Tensor& matrix() const noexcept { return block_tables_; }

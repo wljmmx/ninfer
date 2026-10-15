@@ -4,6 +4,7 @@
 #include "core/host_kv_arena.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -696,14 +697,55 @@ TransferWork DeviceKVPagePool::copy_page(DeviceKVPageHandle source, DeviceKVPage
     return device_copy_work(1);
 }
 
+namespace {
+
+// appendix GE (O5b): submit one run's per-page copies as a single cudaMemcpy3DBatchAsync instead of
+// one cudaMemcpy2DAsync per page. GB.2 measured 9.61 us per 128 KiB copy in the loop form against
+// 5.48 us batched (-43%, recovering the single-copy bandwidth); the batch API requires the copies in
+// one batch to be independent, which these are (distinct sources, distinct destinations, one
+// direction). CUDA 13.4 requires a valid srcAccessOrder per op and a non-default stream. Off by
+// default, like every other knob on this path.
+bool kv_batch_dma_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_KV_BATCH_DMA");
+        return value != nullptr && *value != '\0' && std::strtol(value, nullptr, 10) != 0;
+    }();
+    return enabled;
+}
+
+} // namespace
+
 template <bool ToHost>
 TransferWork
 DeviceKVPagePool::copy_host_pages(std::span<const DeviceKVPageHandle> pages,
                                   std::conditional_t<ToHost, std::byte*, const std::byte*> host,
                                   cudaStream_t stream) const {
     TransferWork work;
+    const bool use_batch = kv_batch_dma_enabled();
+    std::vector<cudaMemcpy3DBatchOp> batch_ops;
+    const auto flush_batch = [&]() {
+        if (batch_ops.empty()) { return; }
+        CUDA_CHECK(cudaMemcpy3DBatchAsync(batch_ops.size(), batch_ops.data(), 0, stream));
+        batch_ops.clear();
+    };
     const auto copy = [&](unsigned char* device_base, std::size_t device_pitch, auto* host_base,
                           std::size_t host_pitch, std::size_t width, std::size_t height) {
+        if (use_batch) {
+            cudaMemcpy3DBatchOp op{};
+            op.src.type             = cudaMemcpyOperandTypePointer;
+            op.src.op.ptr.ptr       = device_base;
+            op.src.op.ptr.rowLength = device_pitch;
+            op.dst.type             = cudaMemcpyOperandTypePointer;
+            op.dst.op.ptr.ptr = const_cast<void*>(static_cast<const void*>(host_base));
+            op.dst.op.ptr.rowLength = host_pitch;
+            op.extent               = make_cudaExtent(width, height, 1);
+            op.srcAccessOrder       = cudaMemcpySrcAccessOrderStream;
+            op.flags                = 0;
+            batch_ops.push_back(op);
+            ++work.copy_operations;
+            if (batch_ops.size() >= 256) { flush_batch(); }
+            return;
+        }
         if constexpr (ToHost) {
             CUDA_CHECK(cudaMemcpy2DAsync(host_base, host_pitch, device_base, device_pitch, width,
                                          height, cudaMemcpyDeviceToHost, stream));
@@ -784,6 +826,7 @@ DeviceKVPagePool::copy_host_pages(std::span<const DeviceKVPageHandle> pages,
         work.payload_bytes += run_work.payload_bytes;
         begin = end;
     }
+    flush_batch();
     return work;
 }
 
@@ -1009,14 +1052,47 @@ void KVExecutionTablePool::mark_absent(KVExecutionRowHandle row_handle,
     auto* shadow = static_cast<std::int32_t*>(host_shadow_.data()) +
                    static_cast<std::size_t>(row_handle.row_) * logical_page_capacity();
     auto* destination = static_cast<std::int32_t*>(row(row_handle).data);
-    for (const std::uint32_t page : logical_pages) {
+    // appendix GE (O5a): NINFER_KV_ABSENT_PAGE_UPLOADS restores the pre-GE form - one 4-byte
+    // upload per page - so the cost that form paid is measurable in this same binary rather than
+    // inferred from a different build. A pageable source makes cudaMemcpyAsync synchronous, and
+    // the retired set can be the whole evicted prefix, so this is not a micro-difference.
+    if (const char* page_uploads = std::getenv("NINFER_KV_ABSENT_PAGE_UPLOADS");
+        page_uploads != nullptr && *page_uploads != '\0' &&
+        std::strtol(page_uploads, nullptr, 10) != 0) {
+        for (const std::uint32_t page : logical_pages) {
+            if (page >= logical_page_capacity()) {
+                throw std::invalid_argument(
+                    "Paged KV absent marking is outside its execution row");
+            }
+            shadow[page] = kAbsentPage;
+            CUDA_CHECK(cudaMemcpyAsync(destination + page, shadow + page, sizeof(std::int32_t),
+                                       cudaMemcpyHostToDevice, stream));
+        }
+        return;
+    }
+    // appendix GE (O5a): the retired pages arrive from an interval scan, so they come in runs. One
+    // upload per run instead of one 4-byte upload per page: the same bytes reach the same entries,
+    // while N host submissions per round become one per run (GB.2 measured the per-copy cost of the
+    // loop form at 4-5 us, and this function used to pay it once per page). The shadow is filled in
+    // first, so a run's slice is already final when it is flushed.
+    std::size_t run_begin = 0;
+    const auto flush_run  = [&](std::size_t run_end) {
+        if (run_end <= run_begin) { return; }
+        const std::size_t count   = run_end - run_begin;
+        const std::uint32_t first = logical_pages[run_begin];
+        CUDA_CHECK(cudaMemcpyAsync(destination + first, shadow + first,
+                                   count * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
+        run_begin = run_end;
+    };
+    for (std::size_t index = 0; index < logical_pages.size(); ++index) {
+        const std::uint32_t page = logical_pages[index];
         if (page >= logical_page_capacity()) {
             throw std::invalid_argument("Paged KV absent marking is outside its execution row");
         }
         shadow[page] = kAbsentPage;
-        CUDA_CHECK(cudaMemcpyAsync(destination + page, shadow + page, sizeof(std::int32_t),
-                                   cudaMemcpyHostToDevice, stream));
+        if (index > run_begin && page != logical_pages[index - 1] + 1U) { flush_run(index); }
     }
+    flush_run(logical_pages.size());
 }
 
 void KVExecutionTablePool::apply_absent_window(KVExecutionRowHandle row_handle,
@@ -1051,6 +1127,28 @@ void KVExecutionTablePool::apply_absent_window(KVExecutionRowHandle row_handle,
     auto* destination = static_cast<std::int32_t*>(row(row_handle).data);
     CUDA_CHECK(cudaMemcpyAsync(destination, mapping.data(), mapping.size() * sizeof(std::int32_t),
                                cudaMemcpyHostToDevice, stream));
+}
+
+void KVExecutionTablePool::apply_absent_interval(KVExecutionRowHandle row_handle,
+                                                 std::uint32_t first_page, std::uint32_t end_page,
+                                                 cudaStream_t stream) {
+    // appendix GE (O2): see the declaration. The caller guarantees three things, all of which the O1
+    // frontier round establishes: the pages below first_page were written by an earlier call and have
+    // not changed (the window only moves forward), no page in the interval is kept, and the interval
+    // is exactly the newly evicted range whose entries are all the sentinel.
+    constexpr std::int32_t kAbsentPage = -1;
+    if (!valid_handle(row_handle)) {
+        throw std::invalid_argument("Paged KV absent interval names a stale execution row");
+    }
+    if (end_page > logical_page_capacity()) {
+        throw std::invalid_argument("Paged KV absent interval exceeds the execution row");
+    }
+    if (end_page <= first_page) { return; }
+    auto* destination         = static_cast<std::int32_t*>(row(row_handle).data);
+    const std::uint32_t count = end_page - first_page;
+    std::vector<std::int32_t> sentinel(count, kAbsentPage);
+    CUDA_CHECK(cudaMemcpyAsync(destination + first_page, sentinel.data(),
+                               count * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
 }
 
 void KVExecutionTablePool::publish_indices(KVExecutionRowHandle row_handle,
