@@ -213,11 +213,24 @@ bool kv_eviction_release_enabled() {
     return value != nullptr && *value != '\0' && std::strtol(value, nullptr, 10) != 0;
 }
 
-// appendix FF (M3 3.2b): demote the masked pages to Host instead of dropping them. Off by default,
-// and mutually exclusive with the release switch - see demote_absent_pages_to_host().
-bool kv_host_demote_enabled() {
+// appendix FF (M3 3.2b): demote the masked pages to Host instead of dropping them - mutually
+// exclusive with the release switch, see demote_absent_pages_to_host().
+//
+// appendix GU (item 1b): read as a TRI-state. The enable predicate alone cannot express
+// "explicitly off", because a numeric 0 is indistinguishable from unset - so once item 1 made
+// demote the default when the contract names no fate, the pre-item-1 behaviour (masked pages stay
+// resident) had no reachable switch combination left, which would have made its historical
+// numbers unreproducible.
+enum class DemoteRequest : std::uint8_t { Unset, Off, On };
+
+DemoteRequest kv_host_demote_request() {
     const char* value = std::getenv("NINFER_KV_EVICT_HOST_DEMOTE");
-    return value != nullptr && *value != '\0' && std::strtol(value, nullptr, 10) != 0;
+    if (value == nullptr || *value == '\0') { return DemoteRequest::Unset; }
+    return std::strtol(value, nullptr, 10) != 0 ? DemoteRequest::On : DemoteRequest::Off;
+}
+
+bool kv_host_demote_enabled() {
+    return kv_host_demote_request() == DemoteRequest::On;
 }
 
 std::uint32_t effective_window_pages(std::uint32_t requested, std::uint32_t live) {
@@ -798,9 +811,12 @@ void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, Paged
         // survive so a later, better decision can still fetch them. Output-neutral by construction -
         // what attention reads is decided by the mask, not by the replica's fate, and the contract's
         // gate is a bit-identical PPL. Inert when the contract is off, so no frozen gate can move.
-        const bool demote_unasked = !kv_host_demote_enabled() &&
+        // appendix GU: only an UNSET switch falls through to the default; an explicit 0 keeps the
+        // masked pages resident, which is the pre-item-1 behaviour.
+        const DemoteRequest demote_request = kv_host_demote_request();
+        const bool demote_unasked = demote_request == DemoteRequest::Unset &&
                                     !kv_eviction_release_enabled() && host_context_arena != nullptr;
-        if (kv_host_demote_enabled() || demote_unasked) {
+        if (demote_request == DemoteRequest::On || demote_unasked) {
             demoted = demote_absent_pages_to_host(addresses, cache, address, live, window.sink_pages,
                                                   eff_window, keep, frontier_start);
         }
