@@ -604,6 +604,79 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& state, std::uint32_t 
 // counts at all - would replace a good prefill selection with a degenerate one (appendix DQ).
 static std::map<const void*, std::vector<std::uint32_t>> g_scored_keep_by_row;
 
+// appendix GL: WHERE the addressed KV pages physically live, read from the very block table the
+// decode kernel reads. The release-cost work (GI/GJ/GK) leaves one hypothesis standing - that
+// releasing the evicted prefix changes the physical placement of the pages still read every
+// round - and this is its cheapest falsifiable test: no profile capture (GK.1 could not make one
+// self-consistent) and no pool-policy change (which would need a header edit). The addressed set
+// is sink + newest window + keep, identical in both arms by construction, so the arms compare
+// exactly the thing the hypothesis is about. The ids are printed in the ORDER THE KERNEL WALKS
+// them, so a burst of jumps is visible directly rather than as a summary statistic.
+// Read-only, and gated on its own path: a default run computes nothing, so no frozen gate moves.
+static std::uint64_t placement_every() {
+    const char* text = std::getenv("NINFER_KV_EVICT_PLACEMENT_EVERY");
+    if (text == nullptr || *text == '\0') { return 1; }
+    const long value = std::strtol(text, nullptr, 10);
+    return value > 0 ? static_cast<std::uint64_t>(value) : 1;
+}
+
+static void dump_page_placement(PagedKVCache& cache, KVAddressSpaceStore& addresses,
+                                KVAddressSpaceHandle address, cudaStream_t stream,
+                                std::uint32_t live, std::uint32_t sink_pages,
+                                std::uint32_t window_pages,
+                                const std::vector<std::uint32_t>& keep_pages) {
+    const char* path = std::getenv("NINFER_KV_EVICT_PLACEMENT_DUMP");
+    if (path == nullptr || *path == '\0') { return; }
+    // Sampling is not cosmetic: the copy below synchronises the stream, so an every-round dump
+    // would perturb the very decode rate it is meant to explain. every=1 (the default) dumps all.
+    static std::uint64_t placement_calls = 0;
+    const std::uint64_t every = placement_every();
+    if (every > 1 && (placement_calls++ % every) != 0) { return; }
+    const std::uint32_t capacity = cache.execution_tables().logical_page_capacity();
+    const std::uint32_t end = std::min(live, capacity);
+    if (end == 0) { return; }
+    std::vector<std::int32_t> table(static_cast<std::size_t>(end), -1);
+    const Tensor row = cache.execution_tables().row(addresses.execution_row(address).handle());
+    CUDA_CHECK(cudaMemcpyAsync(table.data(), row.data,
+                               static_cast<std::size_t>(end) * sizeof(std::int32_t),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const std::uint32_t window_begin = end > window_pages ? end - window_pages : 0;
+    std::vector<std::int32_t> ids;
+    ids.reserve(static_cast<std::size_t>(sink_pages) + window_pages + keep_pages.size());
+    for (std::uint32_t page = 0; page < end; ++page) {
+        const bool addressed =
+            page < sink_pages || page >= window_begin ||
+            std::find(keep_pages.begin(), keep_pages.end(), page) != keep_pages.end();
+        if (!addressed || table[page] < 0) { continue; }
+        ids.push_back(table[page]);
+    }
+    std::vector<std::int32_t> sorted = ids;
+    std::sort(sorted.begin(), sorted.end());
+    std::uint32_t runs = 0;
+    std::int32_t max_gap = 0;
+    for (std::size_t index = 0; index < sorted.size(); ++index) {
+        if (index == 0 || sorted[index] != sorted[index - 1] + 1) { ++runs; }
+        if (index != 0) {
+            const std::int32_t gap = sorted[index] - sorted[index - 1];
+            if (gap > max_gap) { max_gap = gap; }
+        }
+    }
+    const DeviceKVPagePool& pool = cache.page_pool();
+    std::ofstream out(path, std::ios::app);
+    if (!out) { return; }
+    out << "# placement live=" << end << " sink=" << sink_pages << " window=" << window_pages
+        << " keep=" << keep_pages.size() << " resident=" << ids.size() << " runs=" << runs
+        << " min=" << (sorted.empty() ? -1 : sorted.front())
+        << " max=" << (sorted.empty() ? -1 : sorted.back())
+        << " span=" << (sorted.empty() ? 0 : sorted.back() - sorted.front())
+        << " maxgap=" << max_gap << " pool_allocated=" << pool.allocated_pages()
+        << " pool_capacity=" << pool.capacity_pages() << '\n';
+    out << "# placement_ids";
+    for (const std::int32_t id : ids) { out << ' ' << id; }
+    out << '\n';
+}
+
 void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, PagedKVCache& cache,
                                            KVAddressSpaceHandle address) {
     const HostEvictionTimer host_timer(kv_host_timing_enabled());
@@ -771,6 +844,8 @@ void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, Paged
         (void)restore_addressed_host_pages(addresses, cache, address, live, window.sink_pages,
                                            eff_window, keep);
         dump_pool_account(cache);
+        dump_page_placement(cache, addresses, address, device.stream, live, window.sink_pages,
+                            eff_window, keep);
     }
     dump_page_scores(addresses, cache, address, keep);
     // P6 2c (appendix DU): the page scores are per-call whether or not a dump is being written. The
