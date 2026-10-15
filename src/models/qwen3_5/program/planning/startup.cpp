@@ -106,8 +106,19 @@ std::optional<std::uint32_t> declared_resident_pages(std::uint32_t fitted_pages)
     const char* value = std::getenv("NINFER_KV_EVICT_CAPACITY");
     if (value == nullptr || *value == '\0') { return std::nullopt; }
     const long requested = std::strtol(value, nullptr, 10);
+    // appendix GN: this switch only ever SHRINKS the arena, and a value that cannot shrink it
+    // used to be ignored in silence - which is how a run labelled "CAPACITY=6000" came to
+    // describe a 750-page arena. Grow the arena through the capacity policy instead: the size
+    // is contractually tied to the resolved reservation (model_instance.cpp:161 asserts the two
+    // agree), so an arena override here would desync them.
     if (requested <= 0 || static_cast<unsigned long>(requested) >= fitted_pages) {
-        return std::nullopt;
+        throw std::invalid_argument(
+            "NINFER_KV_EVICT_CAPACITY declares a resident budget and can only make the KV "
+            "arena SMALLER than the planned " + std::to_string(fitted_pages) +
+            " pages; " + std::to_string(requested) +
+            " would do nothing. To make the arena larger, size it from device memory with "
+            "--kv-capacity auto (optionally with --kv-capacity-headroom-mib), which keeps the "
+            "arena consistent with the resolved capacity reservation.");
     }
     return static_cast<std::uint32_t>(requested);
 }
