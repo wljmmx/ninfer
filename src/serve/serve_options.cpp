@@ -367,7 +367,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
     }
     if (!kv_capacity_explicit) {
-        options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+        // appendix GO: an arena of max_context pages holds exactly ONE full-length sequence
+        // (750 pages at 48,000 tokens, appendix GM.2), so residency collapses the number of
+        // lanes that can run together to one and the engine queues the rest WITHOUT SAYING SO.
+        // With more than one lane, size the arena from device memory instead - the same policy
+        // --kv-capacity auto selects. It cannot change any result (nothing is masked); it only
+        // decides how much of the device the arena claims. One lane keeps the fixed arena, so
+        // the frozen parser expectations do not move.
+        options.kv_capacity = options.max_concurrency > 1
+                                  ? KvCapacityPolicy::automatic()
+                                  : KvCapacityPolicy::explicit_capacity(options.max_context);
     }
     if (kv_capacity_headroom_bytes) {
         if (options.kv_capacity.mode != KvCapacityMode::Automatic) {

@@ -469,6 +469,50 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
     logger_->info("context | history {} | {} active + {} extra device states | host {}",
                   cache.enabled ? "on" : "off", engine.max_concurrency, *cache.device_state_slots,
                   product::format_pretty_bytes(*cache.host_capacity_bytes));
+    // appendix GO: say what the arena can actually hold at once. Silence here is what let an
+    // "8-way" run measure one lane at a time for two days (appendices GM and GL.6).
+    const std::uint32_t page_tokens =
+        memory.kv_capacity_page_groups != 0
+            ? memory.kv_capacity / memory.kv_capacity_page_groups
+            : 0;
+    if (page_tokens != 0 && memory.max_context != 0) {
+        const std::uint32_t per_lane_pages =
+            (memory.max_context + page_tokens - 1U) / page_tokens;
+        const std::uint32_t lanes =
+            per_lane_pages != 0 ? memory.kv_capacity_page_groups / per_lane_pages : 0;
+        if (lanes < engine.max_concurrency) {
+            // The advice has to fit the mode: with automatic sizing the arena is already as large
+            // as the free memory allows, so the lever is a SMALLER headroom, not `auto`.
+            const bool automatic = memory.kv_capacity_mode == KvCapacityMode::Automatic;
+            logger_->warn(
+                "concurrency | the arena holds {} full-length {}-token lane(s) but "
+                "--max-concurrency is {}: further requests are queued, not run together. {}",
+                lanes, memory.max_context, engine.max_concurrency, automatic
+                    ? "The arena is already memory-sized: free pages with a smaller "
+                      "--kv-capacity-headroom-mib, or enable the eviction contract so "
+                      "residency can be smaller than the context"
+                    : "Raise it with --kv-capacity auto (tune with "
+                      "--kv-capacity-headroom-mib), or enable the eviction contract so "
+                      "residency can be smaller than the context");
+        }
+    }
+    // appendix GO: the arena was sized from the free memory measured at planning time; compare
+    // that plan with what is left now. A shortfall means the device had less free memory a few
+    // seconds later - on this machine ~2.2 GiB is held by graphics applications that WDDM does
+    // not attribute per process, and their footprint moves - so the arena may have eaten the
+    // slack the caller asked for (appendix GO.3).
+    const std::size_t slack_shortfall =
+        memory.planned_slack_bytes > memory.available_after_startup_bytes
+            ? memory.planned_slack_bytes - memory.available_after_startup_bytes
+            : 0;
+    if (slack_shortfall > (256U * 1024U * 1024U)) {
+        logger_->warn(
+            "memory | {} free after startup against {} planned: the device lost {} of free "
+            "memory between planning and startup. Use a larger --kv-capacity-headroom-mib",
+            product::format_pretty_bytes(memory.available_after_startup_bytes),
+            product::format_pretty_bytes(memory.planned_slack_bytes),
+            product::format_pretty_bytes(slack_shortfall));
+    }
 
     if (service.options().enable_vision) {
         const ninfer::MediaCacheSummary media = service.media_cache_summary();
