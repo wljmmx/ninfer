@@ -120,9 +120,18 @@ public:
                      std::span<LogicalKVPageHandle> destinations,
                      std::optional<LogicalKVPageHandle> preferred_predecessor = std::nullopt) {
         if (destinations.empty()) { return; }
-        if (destinations.size() > free_count_ ||
-            destinations.size() > materialization_scratch_.capacity()) {
-            throw std::logic_error("logical KV batch materialization exceeds descriptor capacity");
+        // appendix GI: the two conditions have different owners and different fixes, so they are
+        // reported separately - the old single message could not tell "the descriptor table is too
+        // small for this batch" (a sizing fact, see program_impl.cpp) from "the transfer scratch is
+        // too small" (sized from the Device pool's capacity).
+        if (destinations.size() > free_count_) {
+            throw std::logic_error(
+                "logical KV batch materialization has no free descriptor: the descriptor table is"
+                " smaller than the pages this batch wants to hold at once");
+        }
+        if (destinations.size() > materialization_scratch_.capacity()) {
+            throw std::logic_error(
+                "logical KV batch materialization exceeds the transfer scratch capacity");
         }
         for (const LogicalKVPageHandle destination : destinations) {
             if (destination.valid()) {

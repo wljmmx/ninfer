@@ -228,9 +228,19 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     // capacity. Tying it to the pool is what made a capped arena die with
     // "logical KV batch materialization exceeds descriptor capacity". Without the cap the two numbers
     // are already equal, so nothing moves by default.
+    // appendix GI: one lane's worth of descriptors is not enough. Up to max_concurrency addresses
+    // are materialized at once and each may hold execution_pages descriptors, so the table has to
+    // cover their sum. Sizing it by a single lane is what made long contexts die at high concurrency
+    // with "logical KV batch materialization exceeds descriptor capacity": measured on this machine,
+    // C=4 x 123K passes (7,700 of 11,863 descriptors) while C=8 x 123K needs 15,400 and fails, and
+    // the eight lanes fail in the same millisecond because they exhaust the table at the same point
+    // in the prefill. The host term is unchanged: it is the Host tier's own room.
     const auto logical_pages = [&](const DeviceKVPagePool& pool, std::uint32_t execution_pages) {
         const auto stride = plan_host_kv_page_layout(pool.geometry()).page_stride;
-        return checked_count(std::max(pool.capacity_pages(), execution_pages) + host_bytes / stride);
+        const std::uint64_t concurrent = static_cast<std::uint64_t>(execution_pages) *
+                                         static_cast<std::uint64_t>(plan.max_concurrency);
+        return checked_count(
+            std::max<std::uint64_t>(pool.capacity_pages(), concurrent) + host_bytes / stride);
     };
     text_kv_pages = std::make_unique<LogicalKVPageStore>(
         decoder->text_kv.page_pool(),

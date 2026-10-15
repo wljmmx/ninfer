@@ -166,6 +166,23 @@ void append_failure_fields(std::ostringstream& out, const RequestFailure& failur
     } else {
         append_clause(out, classification_name(failure.classification));
     }
+    // appendix GH: the Internal class is the one whose rendering said nothing about the CAUSE, and
+    // the record has carried it all along (machine_message, filled from the exception's what()).
+    // Render a bounded single-line form of it, so an unexplained 500 is diagnosable from the log
+    // instead of only from a re-run under a debugger. Every other class keeps its exact old line.
+    if (failure.classification == RequestFailureClass::Internal &&
+        !failure.machine_message.empty()) {
+        std::string detail = failure.machine_message;
+        for (char& character : detail) {
+            if (character == '\n' || character == '\r' || character == '\t') { character = ' '; }
+        }
+        constexpr std::size_t kMaximumDetail = 240;
+        if (detail.size() > kMaximumDetail) {
+            detail.resize(kMaximumDetail);
+            detail += "...";
+        }
+        append_clause(out, "detail " + detail);
+    }
 }
 
 } // namespace
