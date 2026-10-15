@@ -475,11 +475,12 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
         memory.kv_capacity_page_groups != 0
             ? memory.kv_capacity / memory.kv_capacity_page_groups
             : 0;
-    if (page_tokens != 0 && memory.max_context != 0) {
-        const std::uint32_t per_lane_pages =
-            (memory.max_context + page_tokens - 1U) / page_tokens;
-        const std::uint32_t lanes =
-            per_lane_pages != 0 ? memory.kv_capacity_page_groups / per_lane_pages : 0;
+    const std::uint32_t per_lane_pages =
+        (page_tokens != 0 && memory.max_context != 0)
+            ? (memory.max_context + page_tokens - 1U) / page_tokens
+            : 0;
+    if (per_lane_pages != 0) {
+        const std::uint32_t lanes = memory.kv_capacity_page_groups / per_lane_pages;
         if (lanes < engine.max_concurrency) {
             // The advice has to fit the mode: with automatic sizing the arena is already as large
             // as the free memory allows, so the lever is a SMALLER headroom, not `auto`.
@@ -494,6 +495,28 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                     : "Raise it with --kv-capacity auto (tune with "
                       "--kv-capacity-headroom-mib), or enable the eviction contract so "
                       "residency can be smaller than the context");
+        }
+    }
+    // appendix GR: a Host arena below one full preemption's spill turns the MANDATORY recovery
+    // into a recompute. Measured (appendix GQ): 1 GiB of Host against 8 x 0.66 GiB of spill cost
+    // +22% wall time with 202,752 tokens recomputed, 512 MiB cost +33%, while fetching the same
+    // bytes back costs ~28 ms - a factor of ~300. The default arena (8 GiB plus eight
+    // StateImages, startup.cpp:907-914) is above the line, so this only fires when one was set
+    // explicitly, which is the mistake it exists to catch.
+    if (per_lane_pages != 0 && memory.kv_capacity_increment_bytes != 0 &&
+        cache.host_capacity_bytes) {
+        const std::size_t per_lane_bytes =
+            static_cast<std::size_t>(per_lane_pages) * memory.kv_capacity_increment_bytes;
+        const std::size_t needed = per_lane_bytes * engine.max_concurrency;
+        if (*cache.host_capacity_bytes < needed) {
+            logger_->warn(
+                "preemption | the Host context arena holds {} but one full preemption of every "
+                "lane needs {} ({} lanes x {}): a pause that cannot keep its snapshot is "
+                "recovered by RECOMPUTING the context, measured at +22..33% wall time. Raise "
+                "--host-context-mib",
+                product::format_pretty_bytes(*cache.host_capacity_bytes),
+                product::format_pretty_bytes(needed), engine.max_concurrency,
+                product::format_pretty_bytes(per_lane_bytes));
         }
     }
     // appendix GO: the arena was sized from the free memory measured at planning time; compare
