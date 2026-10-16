@@ -5,8 +5,12 @@
 
 #include <spdlog/logger.h>
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <sys/ioctl.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -77,9 +81,18 @@ PhasePresentation phase_presentation(StartupPhase phase) noexcept {
 }
 
 std::size_t terminal_columns() noexcept {
+#if defined(_WIN32)
+    // port: the console API replaces ioctl(TIOCGWINSZ); a redirected stderr keeps the 120 default.
+    CONSOLE_SCREEN_BUFFER_INFO info{};
+    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_ERROR_HANDLE), &info) &&
+        info.srWindow.Right >= info.srWindow.Left)
+        return static_cast<std::size_t>(info.srWindow.Right - info.srWindow.Left + 1);
+    return 120;
+#else
     winsize size{};
     if (::ioctl(STDERR_FILENO, TIOCGWINSZ, &size) == 0 && size.ws_col != 0) { return size.ws_col; }
     return 120;
+#endif
 }
 
 std::string progress_bar(double ratio, std::size_t width) {

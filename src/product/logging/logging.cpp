@@ -5,7 +5,12 @@
 #include <spdlog/sinks/sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
+#if defined(_WIN32)
+#include <io.h>
+#include <stdio.h>
+#else
 #include <unistd.h>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -148,10 +153,21 @@ void report_logging_error(const std::string& message) noexcept {
     std::fflush(stderr);
 }
 
+namespace {
+// port: a color-capable terminal is _isatty(_fileno(stderr)) on Windows, isatty(STDERR_FILENO) elsewhere.
+bool stderr_is_interactive() noexcept {
+#if defined(_WIN32)
+    return ::_isatty(::_fileno(stderr)) == 1;
+#else
+    return ::isatty(STDERR_FILENO) == 1;
+#endif
+}
+} // namespace
+
 class ProgressAwareStderrSink final : public spdlog::sinks::sink {
 public:
     explicit ProgressAwareStderrSink(spdlog::color_mode color)
-        : sink_(color), interactive_(::isatty(STDERR_FILENO) == 1) {}
+        : sink_(color), interactive_(stderr_is_interactive()) {}
 
     ~ProgressAwareStderrSink() override { clear(); }
 

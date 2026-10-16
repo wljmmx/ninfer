@@ -15,6 +15,30 @@ endif()
 
 project(ninfer LANGUAGES C CXX CUDA)
 
+# port: one place for the Windows toolchain spellings the CPU kernels rely on.
+#  * NOMINMAX    - <windows.h> otherwise defines min/max macros and breaks std::min/std::max and
+#                  std::numeric_limits<...>::max() (error C2589/C2059/C2760).
+#  * __builtin_unreachable - GCC/Clang builtin used by the CPU MoE kernels; MSVC spells it
+#                  __assume(0). Defined as a function-like macro so the call sites stay untouched.
+if(MSVC)
+  add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+  add_compile_options(
+    # /Zc:preprocessor is required by CUDA 13's CCCL; /utf-8 keeps the vendored fmt/spdlog and the
+    # UTF-8 literals intact; /arch:AVX2 provides the F16C intrinsics the CPU kernels call.
+    $<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>
+    $<$<COMPILE_LANGUAGE:C,CXX>:/Zc:preprocessor>
+    $<$<COMPILE_LANGUAGE:C,CXX>:/EHsc>
+    $<$<COMPILE_LANGUAGE:C,CXX>:/arch:AVX2>
+    $<$<COMPILE_LANGUAGE:C,CXX>:/FI${CMAKE_SOURCE_DIR}/src/core/portability.h>
+
+    # NVCC host pass-through
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/arch:AVX2>
+  )
+endif()
+
 # --- Global settings ---------------------------------------------------------
 option(NINFER_BUILD_APPS "Build the NInfer CLI, server and perplexity evaluator" ON)
 option(BUILD_TESTING "Build NInfer tests" OFF)

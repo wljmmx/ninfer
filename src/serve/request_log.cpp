@@ -19,7 +19,9 @@
 #include <system_error>
 #include <utility>
 
+#if !defined(_WIN32)
 #include <unistd.h>
+#endif
 
 namespace ninfer::serve {
 namespace {

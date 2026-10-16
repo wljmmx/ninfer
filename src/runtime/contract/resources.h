@@ -102,6 +102,24 @@ struct PrefillWork {
     result.tokens                       = suffix_tokens;
     result.vision_items                 = vision_items;
     result.vision_patches               = vision_patches;
+#if defined(_MSC_VER)
+    // port: MSVC has no unsigned __int128. The result is clamped to uint64 either way, so the same
+    // saturation is expressed in uint64 with explicit overflow tests (identical values, no UB).
+    const std::uint64_t suffix = suffix_tokens;
+    const std::uint64_t prefix = prefix_tokens;
+    const std::uint64_t limit  = std::numeric_limits<std::uint64_t>::max();
+    const std::uint64_t linear = (suffix != 0 && prefix > limit / suffix) ? limit : prefix * suffix;
+    std::uint64_t triangular = 0;
+    if (suffix == limit) {
+        triangular = limit;
+    } else if (suffix != 0) {
+        const std::uint64_t half = (suffix % 2U == 0) ? suffix / 2U : (suffix + 1U) / 2U;
+        const std::uint64_t rest = (suffix % 2U == 0) ? suffix + 1U : suffix;
+        triangular               = (half != 0 && rest > limit / half) ? limit : half * rest;
+    }
+    result.attention_pairs =
+        triangular > limit - linear ? limit : static_cast<std::uint64_t>(linear + triangular);
+#else
     const unsigned __int128 suffix      = suffix_tokens;
     const unsigned __int128 linear      = static_cast<unsigned __int128>(prefix_tokens) * suffix;
     const unsigned __int128 triangular  = suffix * (suffix + 1U) / 2U;
@@ -111,6 +129,7 @@ struct PrefillWork {
     result.attention_pairs = attention > std::numeric_limits<std::uint64_t>::max()
                                  ? std::numeric_limits<std::uint64_t>::max()
                                  : static_cast<std::uint64_t>(attention);
+#endif
     return result;
 }
 
