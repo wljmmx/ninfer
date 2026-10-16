@@ -32,8 +32,8 @@ cd /d %~dp0
 
 if not exist ".\ninfer-serve.exe" (
   echo.
-  echo This launcher has to sit next to ninfer-serve.exe: it ships inside the release folder,
-  echo which also holds the executable and, one level up, the model artifact.
+  echo This launcher has to sit next to ninfer-serve.exe: it ships inside the release
+  echo folder, which also holds the executable and, one level up, the model artifact.
   echo Copy it back there ^(or run it from there^) and start it again.
   echo.
   pause

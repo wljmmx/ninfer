@@ -16,7 +16,6 @@ rem    --wddm-evictable-budget    size the arena against total VRAM - 512 MB
 rem                               instead of currently-free VRAM
 rem  The draft's trained range is 262,144 tokens and this row stays inside it,
 rem  so the draft runs on every generated round.
-rem
 
 rem
 rem  --kv-capacity auto keeps the 1 GiB sizing headroom and lets the engine take
@@ -28,8 +27,8 @@ cd /d %~dp0
 
 if not exist ".\ninfer-serve.exe" (
   echo.
-  echo This launcher has to sit next to ninfer-serve.exe: it ships inside the release folder,
-  echo which also holds the executable and, one level up, the model artifact.
+  echo This launcher has to sit next to ninfer-serve.exe: it ships inside the release
+  echo folder, which also holds the executable and, one level up, the model artifact.
   echo Copy it back there ^(or run it from there^) and start it again.
   echo.
   pause
