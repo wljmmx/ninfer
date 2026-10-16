@@ -37,7 +37,9 @@ NInfer runs on two single-GPU targets:
   including NVFP4 weights and NVFP4 KV.
 - **RTX 4090 (Ada, `sm_89`)** — 64-bit Linux or Windows with MSVC 2022 or newer. Every
   groupwise-int path runs natively, plus FP8 weights through the plain FP8 tensor core MMA and
-  BF16 / INT8 / FP8 / K8V4 KV storage. NVFP4 weights and NVFP4 KV require Blackwell tensor
+  the full groupwise KV set: BF16 / INT8 / FP8 / K8V4 plus the rank-compressed family
+  (rk8v4, rk4v4, rk4v4-e8, rk2v4-e8, rk4v2-e8). The measured per-layout table is in
+  docs/zh-CN/kv-cache-and-eviction.md. NVFP4 weights and NVFP4 KV require Blackwell tensor
   cores and are rejected with an explicit error; load a groupwise-int artifact on RTX 4090.
 
 Both targets need a CUDA toolkit of 12.8 or newer that supports the selected architecture,

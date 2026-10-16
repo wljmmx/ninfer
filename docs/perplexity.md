@@ -20,7 +20,10 @@ English reference text, English long-form text, Chinese reference text, and NInf
 
 The default evaluation uses a 4,096-token context and a 2,048-token stride. Use `--context` and
 `--stride` to change that protocol, or score one UTF-8 file with `--text FILE`. The available Main
-KV representations are `bf16`, `int8`, `fp8`, `nvfp4`, and `k8v4`.
+KV representations are `bf16`, `int8`, `fp8`, `nvfp4`, `k8v4`, `rk8v4`, `rk4v4`,
+`rk4v4-e8`, `rk2v4-e8` and `rk4v2-e8`; `nvfp4` requires a Blackwell (sm_120a) build and is
+rejected on RTX 4090. The measured per-layout table lives in
+docs/zh-CN/kv-cache-and-eviction.md.
 
 ```bash
 ./build/apps/ninfer-perplexity models/qwen3_8_27b.ninfer \
