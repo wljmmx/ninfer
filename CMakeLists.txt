@@ -20,6 +20,17 @@ project(ninfer LANGUAGES C CXX CUDA)
 #                  std::numeric_limits<...>::max() (error C2589/C2059/C2760).
 #  * __builtin_unreachable - GCC/Clang builtin used by the CPU MoE kernels; MSVC spells it
 #                  __assume(0). Defined as a function-like macro so the call sites stay untouched.
+# port: TMA / mbarrier / cluster are sm_90+ instructions, so the warp-specialized NVFP4 kernels
+# cannot exist on Ada. Their routes are selected at RUN TIME on the host, so the dispatch sites must
+# ask whether the build target can execute them instead of silently referencing a missing symbol.
+if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(90|100|103|110|12[01])")
+  set(NINFER_CUDA_HAS_TMA 1)
+else()
+  set(NINFER_CUDA_HAS_TMA 0)
+endif()
+add_compile_definitions(NINFER_CUDA_HAS_TMA=${NINFER_CUDA_HAS_TMA})
+message(STATUS "NInfer: TMA-capable build = ${NINFER_CUDA_HAS_TMA} (CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES})")
+
 if(MSVC)
   add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
   add_compile_options(
