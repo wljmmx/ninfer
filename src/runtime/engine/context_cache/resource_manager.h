@@ -459,17 +459,23 @@ public:
 
     // What a demotion has to cover: whatever the MODEL reports as evictable for those checkpoints.
     // Asking the model instead of inventing a number keeps this consistent with every other reclaim.
+    //
+    // appendix IA: ONE KV class per request, and never `state_slots`. `quote_demotion` routes on
+    // `state_slots ? State : main ? MainKV : BackendKV`, so a non-zero `state_slots` sends the quote
+    // down the State path and no KV page is ever considered; and `DemotionBatch` (reclaim.cpp:836-847)
+    // rejects any batch carrying `state_slots` or `host_bytes` outright. Main KV is asked for first
+    // because it is the footprint that matters; the backend draft KV is the fallback.
     [[nodiscard]] ContextResourceUsage idle_shortage(Program& program,
                                                      std::span<const Handle> handles) const {
-        ContextResourceUsage total;
+        ContextResourceUsage main;
+        ContextResourceUsage backend;
         for (const auto handle : handles) {
             if (!program.valid_checkpoint(handle)) { continue; }
             const auto summary = program.checkpoint_summary(handle);
-            total.state_slots += summary.evictable_resources.state_slots;
-            total.main_kv_pages += summary.evictable_resources.main_kv_pages;
-            total.backend_kv_pages += summary.evictable_resources.backend_kv_pages;
+            main.main_kv_pages += summary.evictable_resources.main_kv_pages;
+            backend.backend_kv_pages += summary.evictable_resources.backend_kv_pages;
         }
-        return total;
+        return main.main_kv_pages != 0 ? main : backend;
     }
 
     enum class IdleDemotion : std::uint8_t { Nothing, Started, Blocked };
