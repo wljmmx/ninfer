@@ -2292,11 +2292,14 @@ private:
                 // them for NINFER_KV_IDLE_RECLAIM_MS, KEEPING the bytes in the Host arena, so a later
                 // request still reuses the prefix by fetching (appendix HW: h2d 49 pages,
                 // `cache 46,283 (100.0%)`, TTFT 119 ms against 19.9 s to re-prefill).
-                // Two guards, both deliberate: the sweep is skipped while the capacity path is
-                // already active (a non-empty `paused_` means it had to pause someone), so it never
-                // competes with it (criterion 5); and it runs at most once per threshold window, so
-                // a refusal is counted per sweep instead of once per round - the mistake appendix HM
-                // had to fix for the lane trigger. Off by default: no switch, no change at all.
+                // Three guards, all deliberate: the sweep is skipped while the capacity path is
+                // already active (a non-empty `paused_` means it had to pause someone) AND while the
+                // device arena is under capacity pressure (appendix IE: the pool cannot already
+                // spare the footprint the demotion would free - appendix ID measured the pressure
+                // state this missed), so it never competes with it (criterion 5); and it runs at
+                // most once per threshold window, so a refusal is counted per sweep instead of once
+                // per round - the mistake appendix HM had to fix for the lane trigger. Off by
+                // default: no switch, no change at all.
                 if (idle_reclaim_ms_ != 0 && paused_.empty() &&
                     !instance_.program->has_context_transaction()) {
                     const std::uint64_t now_ms = monotonic_ms();
@@ -2315,6 +2318,12 @@ private:
                                 // (appendix HC.1.3 guard 1), which is why this counts refusals rather
                                 // than failing anything.
                                 ++cumulative_stats_.idle_reclaims_refused;
+                                break;
+                            case ResourceManagement::IdleDemotion::Deferred:
+                                // appendix IE (criterion 5): the arena is under capacity pressure,
+                                // so the capacity path keeps the decision. Counted separately so
+                                // that "stood down" is distinguishable from "had no candidate".
+                                ++cumulative_stats_.idle_reclaims_deferred;
                                 break;
                             case ResourceManagement::IdleDemotion::Nothing:
                                 break;

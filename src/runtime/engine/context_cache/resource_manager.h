@@ -479,7 +479,7 @@ public:
         return main.main_kv_pages != 0 ? main : backend;
     }
 
-    enum class IdleDemotion : std::uint8_t { Nothing, Started, Blocked };
+    enum class IdleDemotion : std::uint8_t { Nothing, Started, Blocked, Deferred };
 
     // appendix HX (plan item 9b): demote the evictable device replicas of specific idle retentions.
     // The demotion itself is the existing mechanism, unchanged - plan_reclaim -> begin_kv_batch ->
@@ -518,6 +518,32 @@ public:
             shortage.backend_kv_pages == 0) {
             return IdleDemotion::Nothing;  // nothing evictable is not a refusal
         }
+        // appendix IE (criterion 5): stand down while the arena is under capacity pressure.
+        // Pressure is read off the arena itself, never off a scheduler ledger: `paused_` only
+        // records a PAUSE, and the tight-arena arm of appendix ID (occupancy pinned at
+        // capacity, pages being recycled) never paused anyone, so the sweep still fired there.
+        // The magnitude compared against the free space is the IDLE set's own footprint, never
+        // the co-holder-augmented demand: one capture publishes InputReplay AND SharedPrefix over
+        // the SAME history (HS: roles=2), and `checkpoint_summary` counts the pages of a single
+        // checkpoint's own address space (checkpoints.cpp:262-280), so the augmented sum reports
+        // those pages twice. Not academic: with it every sweep in the roomy arm deferred
+        // (measured 1448 against a real footprint of 724, with exactly 1448 device pages free).
+        // The test then needs no magic number: compare the free space of the class the model
+        // actually quoted (appendix IA) with the footprint this demotion would free. If the
+        // device pool cannot already spare what the demotion would give back, the retained
+        // prefix is load-bearing for the capacity path - which would pick exactly this prefix -
+        // so the capacity path keeps the decision and the sweep defers. Measured: free 226 < 724
+        // in the tight arm (defer), free 1448 >= 724 in the roomy one (act).
+        const auto footprint = idle_shortage(program, idle);
+        const auto& measure  = footprint.main_kv_pages != 0 ? footprint : shortage;
+        const bool by_main   = measure.main_kv_pages != 0;
+        const std::uint32_t needed = by_main ? measure.main_kv_pages : measure.backend_kv_pages;
+        const auto usage = program.physical_usage();
+        const std::uint32_t held =
+            by_main ? usage.occupied.main_kv_pages : usage.occupied.backend_kv_pages;
+        const std::uint32_t total =
+            by_main ? usage.capacity.main_kv_pages : usage.capacity.backend_kv_pages;
+        if (held >= total || total - held < needed) { return IdleDemotion::Deferred; }
         auto cursor = reclaim_order(program);
         std::erase_if(cursor.victims, [&](const auto& victim) {
             return !contains(allowed, victim.handle);

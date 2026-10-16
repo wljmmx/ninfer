@@ -1042,14 +1042,19 @@ struct RuntimeStats {
     std::uint64_t snapshot_restores         = 0;
     std::uint64_t replay_restores           = 0;
     std::uint64_t replayed_tokens           = 0;
-    // appendix HJ (plan item 4): the idle trigger is a SEPARATE trigger from the capacity path, so it
-    // gets its own counters. `spilled_pages` cannot serve here: it counts the demote path and stays 0
-    // while residency is kept (appendix HH.2). `idle_reclaims` counts pauses made because a resident
-    // request had been idle past NINFER_KV_IDLE_RECLAIM_MS; `idle_reclaims_refused` counts the pauses
-    // NOT made because the Host arena could not hold the snapshot - refusing rather than degrading to a
-    // recompute is the designed behaviour there (appendix HC.1.3, ~8.4 s vs ~28 ms).
-    std::uint64_t idle_reclaims         = 0;
-    std::uint64_t idle_reclaims_refused = 0;
+    // appendix HX (plan item 9b; the counter itself dates from appendix HJ plan item 4): the idle
+    // trigger is a SEPARATE trigger from the capacity path, so it gets its own counters.
+    // `spilled_pages` cannot serve here: it counts the demote path and stays 0 while residency is kept
+    // (appendix HH.2). `idle_reclaims` counts demotions of idle retained SharedPrefix checkpoints past
+    // NINFER_KV_IDLE_RECLAIM_MS - the bytes stay in the Host arena, so a later request still reuses the
+    // prefix by fetching (appendix HW); `idle_reclaims_refused` counts the demotions NOT made because
+    // the Host arena could not hold the bytes - refusing rather than degrading to a recompute is the
+    // designed behaviour there (appendix HC.1.3, ~8.4 s vs ~28 ms); `idle_reclaims_deferred` counts the
+    // sweeps that stood down because the device arena was under capacity pressure (appendix IE,
+    // criterion 5). One sweep produces at most one of the three.
+    std::uint64_t idle_reclaims          = 0;
+    std::uint64_t idle_reclaims_refused  = 0;
+    std::uint64_t idle_reclaims_deferred = 0;
 
     std::uint64_t root_selections               = 0;
     std::uint64_t checkpoint_selections         = 0;

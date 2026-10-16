@@ -392,12 +392,17 @@ OperationalRecord render_throughput(const ThroughputReport& report) {
     // `spilled_pages` (appendix HH.2: that counts the demote path and stays 0 while residency is
     // kept), which is why criteria #2/#4/#5 had no number to be judged by. Cumulative and printed
     // only when it moves, so a default run (counter 0) logs exactly as before. `idle-refused` counts
-    // LANES refused, not rounds - a refusal concludes the idle period just as a reclaim does.
+    // the demotions refused because the Host arena could not take the bytes, and `idle-deferred`
+    // (appendix IE) the sweeps that stood down under capacity pressure. The three outcomes of one
+    // sweep are mutually exclusive, so at most one clause moves per sweep.
     if (report.current.idle_reclaims > report.previous.idle_reclaims) {
         out << " | idle-reclaims " << report.current.idle_reclaims;
     }
     if (report.current.idle_reclaims_refused > report.previous.idle_reclaims_refused) {
         out << " | idle-refused " << report.current.idle_reclaims_refused;
+    }
+    if (report.current.idle_reclaims_deferred > report.previous.idle_reclaims_deferred) {
+        out << " | idle-deferred " << report.current.idle_reclaims_deferred;
     }
     if (report.current.materializing_requests != 0) {
         out << " | materializing " << report.current.materializing_requests;

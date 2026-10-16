@@ -72,6 +72,10 @@ bool report_has_activity(const ThroughputReport& report) {
            // successful reclaim is already covered above by `preemptions` moving.
            report.current.idle_reclaims != report.previous.idle_reclaims ||
            report.current.idle_reclaims_refused != report.previous.idle_reclaims_refused ||
+           // appendix IE: a DEFERRED sweep moves nothing else either, so it needs the same
+           // treatment as a refused one - without the clause the `idle-deferred` readout is
+           // suppressed in exactly the case the guard acted.
+           report.current.idle_reclaims_deferred != report.previous.idle_reclaims_deferred ||
            report.current.snapshot_restores != report.previous.snapshot_restores ||
            report.current.replay_restores != report.previous.replay_restores ||
            report.current.replayed_tokens != report.previous.replayed_tokens ||

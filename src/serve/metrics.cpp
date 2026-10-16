@@ -185,9 +185,12 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
     COUNTER(decode_row_rounds, "decode_row_rounds_total", "Sum of decode batch sizes.");
     COUNTER(preemptions, "preemptions_total", "Resource-pressure pauses.");
     COUNTER(idle_reclaims, "kv_idle_reclaims_total",
-            "Idle-trigger pauses of resident lanes (appendix HM; plan item 4).");
+            "Demotions of idle retained SharedPrefix checkpoints (appendix HX, plan item 9b).");
     COUNTER(idle_reclaims_refused, "kv_idle_reclaims_refused_total",
-            "Idle reclaims refused because the Host arena could not hold the snapshot.");
+            "Idle demotions refused because the Host arena could not hold the bytes.");
+    COUNTER(idle_reclaims_deferred, "kv_idle_reclaims_deferred_total",
+            "Idle demotions deferred because the device arena is under capacity pressure "
+            "(appendix IE, criterion 5).");
     COUNTER(snapshot_restores, "snapshot_restores_total",
             "Restores from complete paused snapshots.");
     COUNTER(replay_restores, "replay_restores_total", "Recovery operations that rebuild history.");
