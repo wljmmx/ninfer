@@ -34,7 +34,11 @@ Nvfp4LinearSwiGluRoute select_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 4) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
     // This route dispatches its own fused kernel rather than a Linear shape's, so it carries its
     // own condition; the call site below forces the matching scale layout.
-    if (tokens >= 256) { return Nvfp4LinearSwiGluRoute::TmaFusedA4; }
+    // port (sm_89): the TMA kernels need sm_90+ instructions; without them the same token count
+    // falls through to the non-TMA A4 route below, so the op still runs on Ada.
+    if (tokens >= 256 && NINFER_CUDA_HAS_TMA) {
+        return Nvfp4LinearSwiGluRoute::TmaFusedA4;
+    }
     return Nvfp4LinearSwiGluRoute::FusedA4;
 }
 
