@@ -500,6 +500,19 @@ private:
 
 [[nodiscard]] SequencePlanner make_sequence_planner(const execution::Parameters&, DeviceContext&,
                                                     const EngineOptions&);
+// appendix IK/IL: the eviction contract is decided once at startup; this installs that decision
+// so the per-round application reads it instead of re-reading the environment (the environment
+// still wins, which keeps every recorded experiment reproducible). The per-dtype capability
+// predicate is exported too, because the decision must respect it: NVFP4 has no absent-page
+// path, so a window there would be a silent no-op (sequence.cpp:392-410).
+void install_kv_eviction_window(std::uint32_t sink_pages, std::uint32_t window_pages);
+[[nodiscard]] bool kv_absent_pages_supported_for(KvCacheStorage storage) noexcept;
+
+// True when the environment already names a window. The startup decision must know this: with
+// the CLI at off, an environment-named contract still wins, and reporting it as off would be
+// exactly the silent skip this work removes.
+[[nodiscard]] bool kv_eviction_window_from_environment_enabled() noexcept;
+
 [[nodiscard]] std::unique_ptr<Program> create_program(const execution::Parameters&, SequencePlan&&,
                                                       DeviceContext&, const StartupObserver&);
 } // namespace ninfer::models::qwen3_5

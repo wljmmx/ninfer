@@ -134,6 +134,11 @@ struct KvCapacityResolution {
     std::size_t available_after_startup_bytes        = 0;
     std::size_t automatic_headroom_bytes             = 0;
     std::size_t planned_slack_bytes                  = 0;
+    // appendix IK: the eviction-contract decision taken at startup (0 off, 1 on) and the reason
+    // bits that produced it (see MemorySummary). Stored here because this is the one struct the
+    // engine already forwards to the server's startup log.
+    std::uint8_t  evict_contract_effective = 0;
+    std::uint32_t evict_contract_reasons   = 0;
 };
 
 } // namespace ninfer::runtime

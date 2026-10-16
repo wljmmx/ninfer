@@ -127,6 +127,7 @@ std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--kv-capacity-headroom-mib N] [--max-concurrency N] "
+           "[--kv-evict off|on|auto] [--kv-evict-window N] [--kv-evict-sink N] [--kv-idle-reclaim-ms N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
            "[--context-cost-presets FILE] "
@@ -222,6 +223,30 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(require_value("--kv-capacity"));
             kv_capacity_explicit = true;
+        } else if (arg == "--kv-evict") {
+            const std::string value(require_value("--kv-evict"));
+            if (value == "off") {
+                options.evict_contract = EvictionContract::Off;
+            } else if (value == "on") {
+                options.evict_contract = EvictionContract::On;
+            } else if (value == "auto") {
+                options.evict_contract = EvictionContract::Auto;
+            } else {
+                throw std::invalid_argument("--kv-evict must be off, on or auto");
+            }
+        } else if (arg == "--kv-evict-window") {
+            options.evict_window_pages = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--kv-evict-window"), "kv-evict-window"));
+            if (options.evict_window_pages == 0) {
+                throw std::invalid_argument("--kv-evict-window must be positive");
+            }
+        } else if (arg == "--kv-evict-sink") {
+            options.evict_sink_pages = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--kv-evict-sink"), "kv-evict-sink"));
+        } else if (arg == "--kv-idle-reclaim-ms") {
+            options.idle_reclaim_ms = static_cast<std::uint64_t>(
+                parse_nonnegative_int(require_value("--kv-idle-reclaim-ms"),
+                                      "kv-idle-reclaim-ms"));
         } else if (arg == "--kv-capacity-headroom-mib") {
             kv_capacity_headroom_bytes =
                 parse_host_context_mib(require_value("--kv-capacity-headroom-mib"));

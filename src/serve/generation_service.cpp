@@ -319,11 +319,24 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.wddm_evictable_budget     = options_.wddm_evictable_budget;
     engine_options.speculative              = options_.speculative;
     engine_options.context_cache            = options_.context_cache;
+    engine_options.evict_contract           = options_.evict_contract;
+    engine_options.evict_window_pages       = options_.evict_window_pages;
+    engine_options.evict_sink_pages         = options_.evict_sink_pages;
     engine_options.context_cost.preset_path = options_.context_cost_presets;
     engine_options.media_cache_bytes        = options_.media_cache_bytes;
     engine_options.media_live_bytes         = options_.media_live_bytes;
     engine_options.media_preprocess_threads = options_.media_preprocess_threads;
     engine_options.startup_observer         = std::move(startup_observer);
+    // appendix IL: the idle demotion (9b) is ON by default through the CLI; the environment still
+    // wins when it is set, so the recorded experiments stay reproducible.
+    if (options_.idle_reclaim_ms != 0 && std::getenv("NINFER_KV_IDLE_RECLAIM_MS") == nullptr) {
+        const std::string text = std::to_string(options_.idle_reclaim_ms);
+#ifdef _WIN32
+        (void)_putenv_s("NINFER_KV_IDLE_RECLAIM_MS", text.c_str());
+#else
+        (void)setenv("NINFER_KV_IDLE_RECLAIM_MS", text.c_str(), 1);
+#endif
+    }
     engine_           = std::make_unique<ninfer::Engine>(std::move(engine_options));
     request_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);

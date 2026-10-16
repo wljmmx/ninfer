@@ -30,6 +30,13 @@ struct ServeOptions {
     std::string request_log_jsonl;                // empty => structured request logging disabled
     std::uint32_t max_context          = 8192;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);
+    // appendix IK/IL: the eviction contract as a real option, plus the idle demotion (9b)
+    // defaulted ON - it only ever demotes IDLE retained prefixes, keeping the bytes in the Host
+    // arena and fetching them back on reuse (measured byte-identical generation). 0 switches off.
+    EvictionContract evict_contract    = EvictionContract::Off;
+    std::uint32_t evict_window_pages   = 4;
+    std::uint32_t evict_sink_pages     = 1;
+    std::uint64_t idle_reclaim_ms      = 60000;
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;

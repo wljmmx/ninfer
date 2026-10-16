@@ -510,8 +510,34 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
         (page_tokens != 0 && memory.max_context != 0)
             ? (memory.max_context + page_tokens - 1U) / page_tokens
             : 0;
+    // appendix IK/IL: say what the eviction contract did, and why - a window that silently does
+    // nothing (NVFP4 has no absent-page path) is exactly the failure mode this line exists for.
+    if (memory.evict_contract_effective == EvictionContract::On) {
+        logger_->info("eviction | contract on | window {} sink {} pages | host demotion by default",
+                      engine.evict_window_pages, engine.evict_sink_pages);
+    } else if ((memory.evict_contract_reasons & 8U) == 0) {
+        logger_->warn("eviction | the KV dtype has no absent-page path (NVFP4): an eviction "
+                      "window would be silently skipped here, so it is not installed");
+    }
+    // appendix IK: is the queue timeout reachable? With `lanes` full-length lanes and C lanes
+    // wanted, up to ceil((C-lanes)/lanes) rounds of queued work precede a request, and one round
+    // costs about max_context / prefill_rate (measured 2.5-2.9k tok/s single lane; concurrency
+    // does not raise the aggregate - appendix FO.5). Conservative on purpose.
     if (per_lane_pages != 0) {
         const std::uint32_t lanes = memory.kv_capacity_page_groups / per_lane_pages;
+        if (lanes != 0 && engine.max_concurrency > lanes) {
+            const std::uint32_t rounds = (engine.max_concurrency - lanes + lanes - 1U) / lanes;
+            const std::uint64_t service_ms =
+                1000ULL * memory.max_context / 2600ULL;   // measured prefill rate, single lane
+            const std::uint64_t worst_ms = static_cast<std::uint64_t>(rounds) * service_ms;
+            if (worst_ms > engine.pending_timeout_ms) {
+                logger_->warn("queue | a queued request can wait up to about {} ms at this "
+                              "arena/concurrency, which is beyond --pending-timeout-ms ({} ms): "
+                              "those requests are REJECTED with QueueTimeout. Raise the "
+                              "timeout, lower --max-concurrency, or give the arena more room",
+                              worst_ms, engine.pending_timeout_ms);
+            }
+        }
         if (lanes < engine.max_concurrency) {
             // The advice has to fit the mode: with automatic sizing the arena is already as large
             // as the free memory allows, so the lever is a SMALLER headroom, not `auto`.

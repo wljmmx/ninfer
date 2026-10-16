@@ -341,7 +341,17 @@ bool record_plane_activity(const void* plane, std::uint32_t maximum) {
     return flag;
 }
 
+// appendix IK: an explicit install that overrides the environment, so a caller that only learns
+// the geometry after the plan is resolved (the startup contract decision) can still reach the
+// per-round application. Unset means "use the environment", which is what every recorded
+// experiment used.
+std::optional<KvEvictionWindow>& installed_eviction_window() {
+    static std::optional<KvEvictionWindow> window;
+    return window;
+}
+
 const KvEvictionWindow& kv_eviction_window() {
+    if (const auto& installed = installed_eviction_window(); installed) { return *installed; }
     static const KvEvictionWindow window = [] {
         KvEvictionWindow result;
         // The preset only fills what the caller left unset; explicit variables win below.
@@ -1307,3 +1317,23 @@ void ProgramImpl::ordered_reset(SequenceState& state) {
 }
 
 } // namespace ninfer::models::qwen3_5::detail
+
+namespace ninfer::models::qwen3_5 {
+
+// appendix IK/IL: see the declarations in program.h.
+void install_kv_eviction_window(std::uint32_t sink_pages, std::uint32_t window_pages) {
+    detail::KvEvictionWindow window;
+    window.sink_pages   = sink_pages;
+    window.window_pages = window_pages;
+    detail::installed_eviction_window() = std::move(window);
+}
+
+bool kv_absent_pages_supported_for(KvCacheStorage storage) noexcept {
+    return detail::kv_absent_pages_supported(storage);
+}
+
+bool kv_eviction_window_from_environment_enabled() noexcept {
+    return detail::kv_eviction_window().enabled();
+}
+
+} // namespace ninfer::models::qwen3_5

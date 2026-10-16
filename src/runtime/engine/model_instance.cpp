@@ -155,6 +155,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
             .prefill_signature = signature},
         options.context_cost.preset_path);
     auto planner    = models::qwen3_5::make_sequence_planner(instance->parameters, device, options);
+    const auto capacity_curve = planner.capacity_curve();
     auto resolution = resolve_kv_capacity(options.kv_capacity, planner.capacity_curve(),
                                           current_free_device_bytes(options.wddm_evictable_budget));
     auto sequence   = std::move(planner).finalize(resolution.main_page_groups);
@@ -163,6 +164,45 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
         throw std::logic_error("resolved KV capacity does not match the finalized Program plan");
     }
     options.context_cache.host_capacity_bytes = sequence.host_capacity_bytes();
+    // appendix IK: decide the eviction contract here - the only place where the resolved arena,
+    // the host budget, the per-lane requirement and the KV dtype are all known. The environment
+    // still wins when it names the contract, so every recorded experiment is reproducible.
+    {
+        const bool env_named = models::qwen3_5::kv_eviction_window_from_environment_enabled();
+        const std::uint32_t page_tokens = capacity_curve.main_page_tokens;
+        const std::uint32_t per_lane_pages =
+            (page_tokens != 0 && options.max_context != 0)
+                ? (options.max_context + page_tokens - 1U) / page_tokens
+                : 0U;
+        const std::uint32_t lanes = per_lane_pages != 0
+                                        ? resolution.main_page_groups / per_lane_pages
+                                        : 0U;
+        const std::uint64_t retained_percent =
+            (per_lane_pages != 0 && options.max_concurrency != 0)
+                ? 100ULL * (resolution.main_page_groups / options.max_concurrency) /
+                      per_lane_pages
+                : 0ULL;
+        const std::uint64_t host_needed =
+            static_cast<std::uint64_t>(per_lane_pages) * options.max_concurrency *
+            capacity_curve.bytes_per_additional_main_page_group;
+        std::uint32_t reasons = 0;
+        if (lanes < options.max_concurrency) { reasons |= 1U; }
+        // The <2% band starts at 58% retention (appendices GV/GW/GX).
+        if (retained_percent >= 58ULL) { reasons |= 2U; }
+        if (sequence.host_capacity_bytes() >= host_needed) { reasons |= 4U; }
+        if (models::qwen3_5::kv_absent_pages_supported_for(options.kv_cache)) { reasons |= 8U; }
+        const bool supported = (reasons & 8U) != 0;
+        const bool wanted = env_named || options.evict_contract == EvictionContract::On ||
+                            (options.evict_contract == EvictionContract::Auto &&
+                             (reasons & 7U) == 7U);
+        const bool effective = wanted && supported;
+        if (effective && !env_named) {
+            models::qwen3_5::install_kv_eviction_window(options.evict_sink_pages,
+                                                        options.evict_window_pages);
+        }
+        resolution.evict_contract_effective = effective ? 1U : 0U;
+        resolution.evict_contract_reasons   = reasons;
+    }
     instance->kv_capacity_resolution          = resolution;
     planning.complete();
     StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);

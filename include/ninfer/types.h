@@ -67,6 +67,14 @@ enum class KvCapacityMode : std::uint8_t {
     Automatic,
 };
 
+// appendix IK: the eviction contract as a first-class option. `Auto` is decided once at
+// startup, where the resolved geometry, the host budget and the KV dtype are all known.
+enum class EvictionContract : std::uint8_t {
+    Off,
+    On,
+    Auto,
+};
+
 inline constexpr std::size_t kDefaultKvCapacityHeadroomBytes = 1024ULL * 1024ULL * 1024ULL;
 
 struct KvCapacityPolicy {
@@ -179,6 +187,11 @@ struct EngineOptions {
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+    // appendix IK: resolved once at startup; `On`/`Auto` only ever install a window when the KV
+    // dtype has an absent-page path (nvfp4 does not).
+    EvictionContract evict_contract    = EvictionContract::Off;
+    std::uint32_t    evict_sink_pages  = 1;
+    std::uint32_t    evict_window_pages = 4;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
@@ -967,6 +980,11 @@ struct MemorySummary {
     std::size_t runtime_reservation_bytes         = 0;
     std::size_t available_after_weights_bytes     = 0;
     std::size_t available_after_startup_bytes     = 0;
+    // appendix IK: what the startup contract decision actually did, and why (bit 1 capacity
+    // short, bit 2 retention inside the measured <2% band, bit 4 host budget sufficient,
+    // bit 8 the KV dtype has an absent-page path). Reported so a skip is never silent.
+    EvictionContract evict_contract_effective = EvictionContract::Off;
+    std::uint32_t    evict_contract_reasons   = 0;
     std::size_t kv_capacity_headroom_bytes        = 0;
     std::size_t planned_slack_bytes               = 0;
     std::size_t workspace_logical_peak_bytes      = 0;
