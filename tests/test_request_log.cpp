@@ -681,9 +681,15 @@ int main() {
     const OperationalRecord internal_failure = render_request_failure(
         context,
         make_internal_request_failure(RequestFailurePhase::Generation, "sentinel-internal-detail"));
+    // appendix HM: e580fd98 (appendix GH) deliberately started rendering a bounded single-line form
+    // of an Internal failure's machine_message, so an unexplained 500 is diagnosable from the log.
+    // This assertion still required that detail to be ABSENT - it asserted the behaviour the commit
+    // replaced - and had been red since. It now checks the intended contract: Error severity, and a
+    // detail clause carrying the cause.
     failures +=
         check(internal_failure.severity == OperationalSeverity::Error &&
-                  internal_failure.message.find("sentinel-internal-detail") == std::string::npos,
+                  internal_failure.message.find("detail sentinel-internal-detail") !=
+                      std::string::npos,
               "operational internal failure severity or data policy mismatch");
     const OperationalRecord disconnected = render_request_failure(
         context, make_client_disconnected_failure(RequestFailurePhase::Transport));
@@ -753,6 +759,9 @@ int main() {
         check(pretty_throughput ==
                   "throughput | 2.0s | prefill 50.0 tok/s (100 tok) | decode 20.0 tok/s (40 tok) | "
                   "running 2 (prefill 1, decode-ready 1) | waiting 3 | paused 2 | replaying 1 | "
+                  // appendix HM: f4a859f2 (appendix GT) inserted this clause between `replaying` and
+                  // `materializing`; replayed_tokens moves 128 -> 896 in this fixture, so it renders.
+                  "recomputed 768 tok | "
                   "materializing 1 | "
                   "capture-pending 1 | terminal-pending 1 | batch 1.80 | host 0.8% (15.0 ms)",
               "pretty throughput record mismatch");
