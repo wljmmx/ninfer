@@ -2282,11 +2282,24 @@ private:
                             // - criterion #3 (fully busy must not fire at all) caught exactly that.
                             // A lane is a candidate only once it has produced output and is neither
                             // prefilling nor recovering.
-                            // Hysteresis (appendix HC.1.3 guard 2) comes from existing state rather than
-                            // a new field: after a reclaim `paused_at` is set, which excludes the lane
-                            // until it is restored, and a restored lane refreshes `last_token` by
-                            // generating - so it cannot be reclaimed straight back.
+                            // appendix HL also claimed hysteresis could come from existing state alone
+                            // - "after a reclaim `paused_at` is set ... and a restored lane refreshes
+                            // `last_token` by generating, so it cannot be reclaimed straight back".
+                            // That holds only for a lane that RESUMES GENERATING: one restored while
+                            // still idle refreshes nothing, so the claim did not hold and criterion #4
+                            // had no mechanism behind it. Corrected by `idle_decision_tokens` below.
                             if (!candidate->first_token || candidate->recovery_pending) { continue; }
+                            // appendix HM (plan item 4, guard 2 - hysteresis): a lane whose last idle
+                            // ruling still covers its current progress is not ruled on again. Only new
+                            // output re-opens the question, which is what bounds the mechanism to one
+                            // spill per idle period - the capacity path WILL restore a lane that is
+                            // still idle (a completion sets `restoration_event_`), and without this the
+                            // trigger reclaimed it straight back, round after round.
+                            if (candidate->idle_decision_tokens &&
+                                candidate->committed_decode_tokens <=
+                                    *candidate->idle_decision_tokens) {
+                                continue;
+                            }
                             const Clock::time_point progress = *candidate->last_token;
                             if (progress > threshold) { continue; }
                             if (!idlest || progress < idlest_progress) {
@@ -2295,15 +2308,29 @@ private:
                             }
                         }
                         if (idlest) {
+                            const auto request = slots_[*idlest];
+                            const auto tokens  = request->committed_decode_tokens;
                             const auto bytes =
-                                instance_.program->pause_host_bytes(*slots_[*idlest]->sequence);
+                                instance_.program->pause_host_bytes(*request->sequence);
                             const auto usage = instance_.program->physical_usage();
-                            const bool fits =
-                                bytes && *bytes <=
-                                             usage.capacity.host_bytes - usage.occupied.host_bytes;
-                            if (fits) {
-                                if (pause_resident(*idlest)) { ++cumulative_stats_.idle_reclaims; }
-                            } else {
+                            // appendix HM: BOTH outcomes conclude this idle period for the lane, so
+                            // both latch `idle_decision_tokens`. A reclaim is the action; a refusal is
+                            // guard 1 - and re-deciding either one every round would re-run the guard
+                            // for the rest of the idle period and turn the counters into per-round
+                            // numbers instead of per-lane ones. A `pause_resident` that reports failure
+                            // reached no decision and stays eligible, so a transient failure is retried.
+                            if (bytes &&
+                                *bytes <= usage.capacity.host_bytes - usage.occupied.host_bytes) {
+                                if (pause_resident(*idlest)) {
+                                    request->idle_decision_tokens = tokens;
+                                    ++cumulative_stats_.idle_reclaims;
+                                }
+                            } else if (bytes) {
+                                // guard 1: REFUSE rather than degrade to a recompute. Appendix GQ came
+                                // within a factor of 300 of pricing this: a recompute is seconds, a
+                                // fetch is tens of milliseconds, and this path has no capacity
+                                // emergency to justify the seconds.
+                                request->idle_decision_tokens = tokens;
                                 ++cumulative_stats_.idle_reclaims_refused;
                             }
                         }

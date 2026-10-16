@@ -66,6 +66,12 @@ bool report_has_activity(const ThroughputReport& report) {
            report.current.active_captures_completed != report.previous.active_captures_completed ||
            report.current.active_captures_aborted != report.previous.active_captures_aborted ||
            report.current.preemptions != report.previous.preemptions ||
+           // appendix HM: a REFUSED idle reclaim moves nothing else - refusing IS the decision not to
+           // act - so without these clauses the interval looks inactive and the `idle-refused` readout
+           // is suppressed, which would report guard 1 as untested in the one case it refused. A
+           // successful reclaim is already covered above by `preemptions` moving.
+           report.current.idle_reclaims != report.previous.idle_reclaims ||
+           report.current.idle_reclaims_refused != report.previous.idle_reclaims_refused ||
            report.current.snapshot_restores != report.previous.snapshot_restores ||
            report.current.replay_restores != report.previous.replay_restores ||
            report.current.replayed_tokens != report.previous.replayed_tokens ||

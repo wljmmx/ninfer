@@ -211,6 +211,16 @@ struct RequestRecord {
     std::uint64_t replayed_tokens          = 0;
     std::uint64_t paused_ns                = 0;
     std::optional<Clock::time_point> paused_at;
+    // appendix HM (plan item 4, guard 2 - hysteresis): the committed-decode count this session had
+    // reached when the IDLE trigger last ruled on it - either reclaiming it or refusing to, since
+    // both conclude the same idle period. HC.1.3 guard 2 promises at most ONE spill per idle period,
+    // and that is not automatic: a completion sets the scheduler's `restoration_event_`, so a lane
+    // that is still idle is restored by the ordinary capacity path, looks idle again (its
+    // `last_token` is stale by construction) and was reclaimed straight back - one spill/restore pair
+    // per round instead of one per idle period (appendix HK.2 read the symptom). Requiring real
+    // progress since the mark is what opens a NEW idle period, so a restored lane that generated
+    // nothing can never be reclaimed twice. Unset means the idle trigger has never ruled on it.
+    std::optional<std::uint64_t> idle_decision_tokens;
     std::uint32_t computed_prompt_tokens = 0;
     GenerationTimings generation_timings;
     RequestHostTiming host_timing;

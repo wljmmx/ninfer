@@ -383,6 +383,18 @@ OperationalRecord render_throughput(const ThroughputReport& report) {
                                             report.previous.replayed_tokens)
             << " tok";
     }
+    // appendix HM (plan item 4): the idle trigger is an independent reason a lane leaves the device,
+    // so it gets its own readout. It is invisible in `paused` (a live gauge) and in the `kv tiers`
+    // `spilled_pages` (appendix HH.2: that counts the demote path and stays 0 while residency is
+    // kept), which is why criteria #2/#4/#5 had no number to be judged by. Cumulative and printed
+    // only when it moves, so a default run (counter 0) logs exactly as before. `idle-refused` counts
+    // LANES refused, not rounds - a refusal concludes the idle period just as a reclaim does.
+    if (report.current.idle_reclaims > report.previous.idle_reclaims) {
+        out << " | idle-reclaims " << report.current.idle_reclaims;
+    }
+    if (report.current.idle_reclaims_refused > report.previous.idle_reclaims_refused) {
+        out << " | idle-refused " << report.current.idle_reclaims_refused;
+    }
     if (report.current.materializing_requests != 0) {
         out << " | materializing " << report.current.materializing_requests;
     }
