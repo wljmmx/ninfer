@@ -2276,8 +2276,18 @@ private:
                                 candidate->capture_pending || !candidate->is_decode_ready()) {
                                 continue;
                             }
-                            const Clock::time_point progress =
-                                candidate->last_token ? *candidate->last_token : candidate->submitted;
+                            // appendix HL (fix for appendix HK.1): `last_token` only moves when a token
+                            // is EMITTED, so a lane in the middle of a 46,290-token prefill (~17 s, far
+                            // past any sane threshold) looked idle and the trigger fired during prefill
+                            // - criterion #3 (fully busy must not fire at all) caught exactly that.
+                            // A lane is a candidate only once it has produced output and is neither
+                            // prefilling nor recovering.
+                            // Hysteresis (appendix HC.1.3 guard 2) comes from existing state rather than
+                            // a new field: after a reclaim `paused_at` is set, which excludes the lane
+                            // until it is restored, and a restored lane refreshes `last_token` by
+                            // generating - so it cannot be reclaimed straight back.
+                            if (!candidate->first_token || candidate->recovery_pending) { continue; }
+                            const Clock::time_point progress = *candidate->last_token;
                             if (progress > threshold) { continue; }
                             if (!idlest || progress < idlest_progress) {
                                 idlest          = lane;
