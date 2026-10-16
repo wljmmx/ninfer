@@ -208,12 +208,20 @@ bool ProgramImpl::start_capture(SequenceHandle handle) {
     // engine's own path instead of letting the view guard throw and fail the request. The request
     // keeps its own KV, and a later request that extends it re-prefills - the contract's cost, paid
     // per request, not an error. Checked BEFORE anything is reserved, so the decline is clean.
-    if (has_role(request.capture_groups[request.next_capture],
-                 runtime::CheckpointRole::SharedPrefix) &&
-        (!text_kv_addresses->active_prefix_view_available(state.kv->text, frontier) ||
-         (state.kv->backend && backend_kv_valid(state) != 0 &&
-          !backend_kv_addresses->active_prefix_view_available(*state.kv->backend,
-                                                             backend_kv_valid(state))))) {
+    // appendix HT: decided BEFORE the protection exists (it is established at :261/266, immediately
+    // before the view is exported), so the checkpoint requirement cannot be part of this test -
+    // requiring it here declined every first SharedPrefix capture (appendix HS). `forkable` keeps the
+    // committed frontier and every per-page condition, so a prefix whose pages the contract gave back
+    // still declines cleanly, which is the behaviour appendix FO asks for.
+    const bool shared_prefix = has_role(request.capture_groups[request.next_capture],
+                                        runtime::CheckpointRole::SharedPrefix);
+    const bool text_forkable =
+        text_kv_addresses->active_prefix_view_forkable(state.kv->text, frontier);
+    const bool backend_forkable =
+        !state.kv->backend || backend_kv_valid(state) == 0 ||
+        backend_kv_addresses->active_prefix_view_forkable(*state.kv->backend,
+                                                          backend_kv_valid(state));
+    if (shared_prefix && (!text_forkable || !backend_forkable)) {
         skip_capture(handle);
         return false;
     }
