@@ -352,7 +352,8 @@ public:
                      .ordinal  = ++ordinal_,
                      .priority = demand_priority(program.checkpoint_key(handle, summary.frontier)),
                      .retained_at = ++clock_,
-                     .last_touch_ms = now_ms});
+                     .last_touch_ms = now_ms,
+                     .publisher = token});
                 index_.insert(program, handle, summary.frontier);
             }
         } else {
@@ -495,7 +496,21 @@ public:
         prune(program);
         std::vector<Handle> allowed;
         for (const auto handle : idle) {
-            if (references(handle) && program.valid_checkpoint(handle)) { allowed.push_back(handle); }
+            if (!references(handle) || !program.valid_checkpoint(handle)) { continue; }
+            if (!contains(allowed, handle)) { allowed.push_back(handle); }
+            // appendix IC: the points the SAME owner published alongside this one. Without them the
+            // model rejects every page group that they co-cover (reclaim.cpp:247-250), which cost all
+            // but one page of the prefix in appendix IB.
+            if (const auto* shared = find_shared_by_handle(handle)) {
+                if (const auto* owner = find_owner(shared->publisher)) {
+                    for (const auto& point : owner->points) {
+                        if (references(point.handle) && program.valid_checkpoint(point.handle) &&
+                            !contains(allowed, point.handle)) {
+                            allowed.push_back(point.handle);
+                        }
+                    }
+                }
+            }
         }
         if (allowed.empty()) { return IdleDemotion::Nothing; }
         const auto shortage = idle_shortage(program, allowed);
@@ -912,6 +927,10 @@ private:
         // a logical tick (appendix HN.1) and cannot express "idle for N milliseconds" - so the
         // value is supplied by the caller, which also keeps this unit testable without a clock.
         std::uint64_t last_touch_ms = 0;
+        // appendix IC: the owner that published this entry. One capture publishes several points
+        // (InputReplay + SharedPrefix) over one history, and the model only permits a page group
+        // when EVERY checkpoint covering it is allowed - so the co-holders must be allowed too.
+        OwnerToken publisher = 0;
     };
 
     static bool contains(std::span<const Handle> handles, Handle handle) {
@@ -933,6 +952,13 @@ private:
     Shared* find_shared(std::uint64_t ordinal) {
         const auto it = std::find_if(shared_.begin(), shared_.end(),
                                      [&](const auto& entry) { return entry.ordinal == ordinal; });
+        return it == shared_.end() ? nullptr : &*it;
+    }
+
+    // appendix IC: `find_shared` is keyed by the entry ordinal; the idle sweep works from handles.
+    Shared* find_shared_by_handle(Handle handle) {
+        const auto it = std::find_if(shared_.begin(), shared_.end(),
+                                     [&](const auto& entry) { return entry.handle == handle; });
         return it == shared_.end() ? nullptr : &*it;
     }
 
