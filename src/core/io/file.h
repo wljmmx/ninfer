@@ -10,7 +10,7 @@ namespace ninfer::io {
 enum class ReadMode { Buffered, Direct };
 
 struct FileView {
-    int descriptor               = -1;
+    std::intptr_t descriptor     = -1; // POSIX descriptor, or a Win32 HANDLE
     std::uint64_t bytes          = 0;
     ReadMode mode                = ReadMode::Buffered;
     std::size_t memory_alignment = 1;

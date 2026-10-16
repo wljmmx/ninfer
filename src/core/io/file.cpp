@@ -33,9 +33,10 @@ off_t position(std::uint64_t value) {
 ReadOnlyFile::ReadOnlyFile(const std::filesystem::path& path, ReadMode mode) : path_(path) {
     if (mode != ReadMode::Buffered && mode != ReadMode::Direct)
         throw std::invalid_argument("invalid file read mode");
-    view_.descriptor =
+    const int handle =
         ::open(path.c_str(), O_RDONLY | O_CLOEXEC | (mode == ReadMode::Direct ? O_DIRECT : 0));
-    if (view_.descriptor < 0) fail(path, "open");
+    if (handle < 0) fail(path, "open");
+    view_.descriptor = handle;
     view_.mode = mode;
     try {
         struct stat status {};

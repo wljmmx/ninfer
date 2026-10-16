@@ -6,7 +6,8 @@ cmake_minimum_required(VERSION 3.28)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 120a CACHE STRING "CUDA architectures to build")
 endif()
-if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
+# port: the RTX 4090 (sm_89) line is supported alongside upstream's sm_120a target.
+if(NOT (CMAKE_CUDA_ARCHITECTURES STREQUAL "120a" OR CMAKE_CUDA_ARCHITECTURES STREQUAL "89"))
   message(FATAL_ERROR
     "NInfer supports only CMAKE_CUDA_ARCHITECTURES=120a; got "
     "'${CMAKE_CUDA_ARCHITECTURES}'")
