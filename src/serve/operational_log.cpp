@@ -383,8 +383,12 @@ OperationalRecord render_throughput(const ThroughputReport& report) {
                                             report.previous.replayed_tokens)
             << " tok";
     }
-    // appendix HM (plan item 4): the idle trigger is an independent reason a lane leaves the device,
-    // so it gets its own readout. It is invisible in `paused` (a live gauge) and in the `kv tiers`
+    // appendix HX (plan item 9b): the idle trigger now DEMOTES an idle retained SharedPrefix
+    // checkpoint instead of pausing a live lane (item 4's lane trigger was measured unreachable in
+    // every workload and has been removed), so the counter now counts demotions of cache entries.
+    // The readout is unchanged on purpose: same switch, same clause, same cumulative-and-only-on-
+    // change behaviour, so a default run's log is byte-identical.
+    // It is invisible in `paused` (a live gauge) and in the `kv tiers`
     // `spilled_pages` (appendix HH.2: that counts the demote path and stays 0 while residency is
     // kept), which is why criteria #2/#4/#5 had no number to be judged by. Cumulative and printed
     // only when it moves, so a default run (counter 0) logs exactly as before. `idle-refused` counts

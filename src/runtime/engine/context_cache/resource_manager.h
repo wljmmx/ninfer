@@ -281,7 +281,7 @@ public:
     // Called exactly once after Native's irreversible bind commit. The choice preserves logical
     // ownership even when Native consumed its original checkpoint handle during that commit.
     [[nodiscard]] OwnerToken adopt(Program& program, const SourceChoice& choice, const Base& base,
-                                   std::uint64_t publication_order,
+                                   std::uint64_t publication_order, std::uint64_t now_ms,
                                    std::span<const Handle> carried = {},
                                    std::span<const Handle> retired = {}) {
         for (const auto handle : retired) { forget(handle); }
@@ -314,6 +314,10 @@ public:
                     if (choice.take_over) { token = owner->token; }
                 } else if (auto* shared = find_shared(choice.shared_entry)) {
                     shared->priority = {.reused = true, .last_demand = used_at};
+                    // appendix HX (9b): being asked for is exactly what makes an entry not idle, so
+                    // this refresh IS the hysteresis: an entry that is used cannot be swept, and a
+                    // swept entry that gets fetched back is refreshed by this same line.
+                    shared->last_touch_ms = now_ms;
                 }
             }
             if (!token) {
@@ -333,7 +337,7 @@ public:
         return token;
     }
 
-    void publish(Program& program, OwnerToken token, Handle handle) {
+    void publish(Program& program, OwnerToken token, Handle handle, std::uint64_t now_ms) {
         if (!program.valid_checkpoint(handle)) { return; }
         const auto summary = program.checkpoint_metadata(handle);
         if (!enabled_ || !token) {
@@ -347,7 +351,8 @@ public:
                     {.handle   = handle,
                      .ordinal  = ++ordinal_,
                      .priority = demand_priority(program.checkpoint_key(handle, summary.frontier)),
-                     .retained_at = ++clock_});
+                     .retained_at = ++clock_,
+                     .last_touch_ms = now_ms});
                 index_.insert(program, handle, summary.frontier);
             }
         } else {
@@ -433,6 +438,73 @@ public:
     [[nodiscard]] CacheRetentionPriority retention(OwnerToken token) const {
         const auto* owner = find_owner(token);
         return owner ? owner->priority : CacheRetentionPriority{};
+    }
+
+    // appendix HX (plan item 9b): the retained entries nobody has asked for within `threshold_ms`.
+    // Only `shared_` is considered, by decision: those are the SharedPrefix retentions a later
+    // request can actually reuse (appendix HU.1), so demoting one keeps a capability while freeing
+    // the device. Private continuations and paused snapshots are deliberately out of scope.
+    [[nodiscard]] std::vector<Handle> idle_shared(std::uint64_t now_ms,
+                                                  std::uint64_t threshold_ms) const {
+        std::vector<Handle> out;
+        if (threshold_ms == 0) { return out; }
+        for (const auto& shared : shared_) {
+            if (now_ms >= shared.last_touch_ms &&
+                now_ms - shared.last_touch_ms >= threshold_ms) {
+                out.push_back(shared.handle);
+            }
+        }
+        return out;
+    }
+
+    // What a demotion has to cover: whatever the MODEL reports as evictable for those checkpoints.
+    // Asking the model instead of inventing a number keeps this consistent with every other reclaim.
+    [[nodiscard]] ContextResourceUsage idle_shortage(Program& program,
+                                                     std::span<const Handle> handles) const {
+        ContextResourceUsage total;
+        for (const auto handle : handles) {
+            if (!program.valid_checkpoint(handle)) { continue; }
+            const auto summary = program.checkpoint_summary(handle);
+            total.state_slots += summary.evictable_resources.state_slots;
+            total.main_kv_pages += summary.evictable_resources.main_kv_pages;
+            total.backend_kv_pages += summary.evictable_resources.backend_kv_pages;
+        }
+        return total;
+    }
+
+    enum class IdleDemotion : std::uint8_t { Nothing, Started, Blocked };
+
+    // appendix HX (plan item 9b): demote the evictable device replicas of specific idle retentions.
+    // The demotion itself is the existing mechanism, unchanged - plan_reclaim -> begin_kv_batch ->
+    // start_demote; only the SELECTION is new, which is the whole point of the item. `Execution`
+    // rights with no admission are what make it legal with no request driving it: `may_revoke` then
+    // refuses only when an in-flight *binding* holds one of the handles, i.e. "do not disturb a
+    // transfer already in progress". Nothing here releases a checkpoint: a demotion keeps the bytes
+    // in the Host arena (`ContextDemotion::host_bytes`), so the prefix is still reusable by fetching
+    // - measured in appendix HW (h2d 49 pages, `cache 46,283 (100.0%)`, TTFT 119 ms vs 19.9 s).
+    [[nodiscard]] IdleDemotion demote_idle(Program& program, std::span<const Handle> idle) {
+        if (!enabled_ || idle.empty() || program.has_context_transaction()) {
+            return IdleDemotion::Nothing;
+        }
+        prune(program);
+        std::vector<Handle> allowed;
+        for (const auto handle : idle) {
+            if (references(handle) && program.valid_checkpoint(handle)) { allowed.push_back(handle); }
+        }
+        if (allowed.empty()) { return IdleDemotion::Nothing; }
+        const auto shortage = idle_shortage(program, allowed);
+        if (shortage.state_slots == 0 && shortage.main_kv_pages == 0 &&
+            shortage.backend_kv_pages == 0) {
+            return IdleDemotion::Nothing;  // nothing evictable is not a refusal
+        }
+        auto cursor = reclaim_order(program);
+        std::erase_if(cursor.victims, [&](const auto& victim) {
+            return !contains(allowed, victim.handle);
+        });
+        cursor.rights = ReclaimRights{.purpose = ReclaimPurpose::Execution};
+        return reclaim(program, shortage, {}, cursor) == ReclaimProgress::Blocked
+                   ? IdleDemotion::Blocked
+                   : IdleDemotion::Started;
     }
 
     bool recycle_input(Program& program, OwnerToken token) {
@@ -829,6 +901,11 @@ private:
         std::uint64_t ordinal;
         CacheRetentionPriority priority;
         std::uint64_t retained_at;
+        // appendix HX (plan item 9b): when this retained entry was last touched, on the ENGINE's
+        // monotonic millisecond clock. The policy layer has no clock of its own - `last_demand` is
+        // a logical tick (appendix HN.1) and cannot express "idle for N milliseconds" - so the
+        // value is supplied by the caller, which also keeps this unit testable without a clock.
+        std::uint64_t last_touch_ms = 0;
     };
 
     static bool contains(std::span<const Handle> handles, Handle handle) {

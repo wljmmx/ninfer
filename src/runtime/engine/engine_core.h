@@ -17,6 +17,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -273,6 +274,23 @@ public:
     [[nodiscard]] bool is_available() const {
         std::lock_guard lock(queue_mutex_);
         return !stopping_ && !failed_;
+    }
+
+    // appendix HX (plan item 9b): the engine's monotonic clock in milliseconds, for the policy
+    // layer, which has no clock of its own (appendix HN.1).
+    [[nodiscard]] static std::uint64_t monotonic_ms() {
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch())
+                .count());
+    }
+
+    // appendix HX (9b): 0 or absent means the sweep is off, and then nothing about the engine's
+    // behaviour changes at all (criterion 4).
+    [[nodiscard]] static std::uint64_t read_idle_reclaim_ms() {
+        const char* text = std::getenv("NINFER_KV_IDLE_RECLAIM_MS");
+        if (text == nullptr || *text == '\0') { return 0; }
+        const long value = std::strtol(text, nullptr, 10);
+        return value > 0 ? static_cast<std::uint64_t>(value) : 0;
     }
 
     void reset_memory_peaks() noexcept {
@@ -872,7 +890,7 @@ private:
             }
             if (finished.checkpoint) {
                 resources_.publish(*instance_.program, request->continuation_owner,
-                                   *finished.checkpoint);
+                                   *finished.checkpoint, monotonic_ms());
             }
             resources_.finish(*instance_.program, request->continuation_owner, *request->base_plan,
                               request->publication_order);
@@ -1417,7 +1435,8 @@ private:
             }
             request->continuation_owner =
                 resources_.adopt(*instance_.program, control.source, *request->base_plan,
-                                 request->publication_order, carried, progress.retired_checkpoints);
+                                 request->publication_order, monotonic_ms(), carried,
+                                 progress.retired_checkpoints);
             resources_.release_source(*instance_.program, request->id);
             request->lane     = control.destination;
             request->sequence = progress.sequence;
@@ -1499,7 +1518,8 @@ private:
                 request->capture_pending = false;
                 request->model_state     = request->post_capture_state;
                 for (const auto point : progress.captured_checkpoints) {
-                    resources_.publish(*instance_.program, request->continuation_owner, point);
+                    resources_.publish(*instance_.program, request->continuation_owner, point,
+                                       monotonic_ms());
                 }
             }
             context_owner_.reset();
@@ -2262,76 +2282,42 @@ private:
                 //     recompute for (appendix GQ: ~8.4 s to replay against ~28 ms to fetch);
                 //   * demote semantics: pause_resident keeps the bytes, so a resumed session fetches.
                 // Off by default: no switch means no behavioural change whatsoever.
-                if (const char* idle_text = std::getenv("NINFER_KV_IDLE_RECLAIM_MS");
-                    idle_text != nullptr && *idle_text != '\0') {
-                    const long idle_ms = std::strtol(idle_text, nullptr, 10);
-                    if (idle_ms > 0 && !instance_.program->has_context_transaction()) {
-                        const Clock::time_point threshold =
-                            Clock::now() - std::chrono::milliseconds(idle_ms);
-                        std::optional<std::uint32_t> idlest;
-                        Clock::time_point idlest_progress{};
-                        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-                            const auto& candidate = slots_[lane];
-                            if (!candidate || !candidate->sequence || candidate->paused_at ||
-                                candidate->capture_pending || !candidate->is_decode_ready()) {
-                                continue;
-                            }
-                            // appendix HL (fix for appendix HK.1): `last_token` only moves when a token
-                            // is EMITTED, so a lane in the middle of a 46,290-token prefill (~17 s, far
-                            // past any sane threshold) looked idle and the trigger fired during prefill
-                            // - criterion #3 (fully busy must not fire at all) caught exactly that.
-                            // A lane is a candidate only once it has produced output and is neither
-                            // prefilling nor recovering.
-                            // appendix HL also claimed hysteresis could come from existing state alone
-                            // - "after a reclaim `paused_at` is set ... and a restored lane refreshes
-                            // `last_token` by generating, so it cannot be reclaimed straight back".
-                            // That holds only for a lane that RESUMES GENERATING: one restored while
-                            // still idle refreshes nothing, so the claim did not hold and criterion #4
-                            // had no mechanism behind it. Corrected by `idle_decision_tokens` below.
-                            if (!candidate->first_token || candidate->recovery_pending) { continue; }
-                            // appendix HM (plan item 4, guard 2 - hysteresis): a lane whose last idle
-                            // ruling still covers its current progress is not ruled on again. Only new
-                            // output re-opens the question, which is what bounds the mechanism to one
-                            // spill per idle period - the capacity path WILL restore a lane that is
-                            // still idle (a completion sets `restoration_event_`), and without this the
-                            // trigger reclaimed it straight back, round after round.
-                            if (candidate->idle_decision_tokens &&
-                                candidate->committed_decode_tokens <=
-                                    *candidate->idle_decision_tokens) {
-                                continue;
-                            }
-                            const Clock::time_point progress = *candidate->last_token;
-                            if (progress > threshold) { continue; }
-                            if (!idlest || progress < idlest_progress) {
-                                idlest          = lane;
-                                idlest_progress = progress;
-                            }
-                        }
-                        if (idlest) {
-                            const auto request = slots_[*idlest];
-                            const auto tokens  = request->committed_decode_tokens;
-                            const auto bytes =
-                                instance_.program->pause_host_bytes(*request->sequence);
-                            const auto usage = instance_.program->physical_usage();
-                            // appendix HM: BOTH outcomes conclude this idle period for the lane, so
-                            // both latch `idle_decision_tokens`. A reclaim is the action; a refusal is
-                            // guard 1 - and re-deciding either one every round would re-run the guard
-                            // for the rest of the idle period and turn the counters into per-round
-                            // numbers instead of per-lane ones. A `pause_resident` that reports failure
-                            // reached no decision and stays eligible, so a transient failure is retried.
-                            if (bytes &&
-                                *bytes <= usage.capacity.host_bytes - usage.occupied.host_bytes) {
-                                if (pause_resident(*idlest)) {
-                                    request->idle_decision_tokens = tokens;
-                                    ++cumulative_stats_.idle_reclaims;
-                                }
-                            } else if (bytes) {
-                                // guard 1: REFUSE rather than degrade to a recompute. Appendix GQ came
-                                // within a factor of 300 of pricing this: a recompute is seconds, a
-                                // fetch is tens of milliseconds, and this path has no capacity
-                                // emergency to justify the seconds.
-                                request->idle_decision_tokens = tokens;
+                // appendix HX (plan item 9b): the idle trigger, aimed at the object that actually
+                // holds residency. Item 4 fired at a live LANE and was measured unreachable in every
+                // workload (appendix HO/HP: a decode-ready lane always has work, a finished request
+                // releases its lane, and the output path has no back-pressure, so nothing could
+                // idle) - but a COMPLETED session does keep its KV: 9a made it a reusable
+                // SharedPrefix checkpoint (appendix HU.1) whose pages stay on the device until
+                // capacity pressure takes them. This gives those pages up when nobody has asked for
+                // them for NINFER_KV_IDLE_RECLAIM_MS, KEEPING the bytes in the Host arena, so a later
+                // request still reuses the prefix by fetching (appendix HW: h2d 49 pages,
+                // `cache 46,283 (100.0%)`, TTFT 119 ms against 19.9 s to re-prefill).
+                // Two guards, both deliberate: the sweep is skipped while the capacity path is
+                // already active (a non-empty `paused_` means it had to pause someone), so it never
+                // competes with it (criterion 5); and it runs at most once per threshold window, so
+                // a refusal is counted per sweep instead of once per round - the mistake appendix HM
+                // had to fix for the lane trigger. Off by default: no switch, no change at all.
+                if (idle_reclaim_ms_ != 0 && paused_.empty() &&
+                    !instance_.program->has_context_transaction()) {
+                    const std::uint64_t now_ms = monotonic_ms();
+                    if (now_ms >= last_idle_sweep_ms_ &&
+                        now_ms - last_idle_sweep_ms_ >= idle_reclaim_ms_) {
+                        last_idle_sweep_ms_ = now_ms;
+                        const auto idle = resources_.idle_shared(now_ms, idle_reclaim_ms_);
+                        if (!idle.empty()) {
+                            switch (resources_.demote_idle(*instance_.program, idle)) {
+                            case ResourceManagement::IdleDemotion::Started:
+                                ++cumulative_stats_.idle_reclaims;
+                                break;
+                            case ResourceManagement::IdleDemotion::Blocked:
+                                // No capacity emergency here, so REFUSE rather than degrade: if the
+                                // Host arena cannot take the bytes the demotion is simply not made
+                                // (appendix HC.1.3 guard 1), which is why this counts refusals rather
+                                // than failing anything.
                                 ++cumulative_stats_.idle_reclaims_refused;
+                                break;
+                            case ResourceManagement::IdleDemotion::Nothing:
+                                break;
                             }
                         }
                     }
@@ -2482,6 +2468,11 @@ private:
     std::uint64_t admission_generation_ = 1;
     std::array<std::optional<CaptureDecision>, kMaximumConcurrency> capture_decisions_;
     std::shared_ptr<Request> context_owner_;
+    // appendix HX (plan item 9b): the idle trigger's state. The threshold is read ONCE (not per
+    // round, as item 4 did) and the sweep runs at most once per threshold window, so a refusal
+    // cannot be counted once per round - the mistake appendix HM had to fix for the lane trigger.
+    std::uint64_t idle_reclaim_ms_ = read_idle_reclaim_ms();
+    std::uint64_t last_idle_sweep_ms_ = 0;
     std::vector<std::shared_ptr<Request>> paused_;
     Scheduling scheduler_;
     std::array<bool, kMaximumConcurrency> runnable_units_{};

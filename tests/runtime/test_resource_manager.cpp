@@ -12,6 +12,11 @@
 
 namespace {
 
+// appendix HX: the ResourceManager now takes the caller's monotonic clock, so the policy layer can
+// express "idle for N milliseconds" (appendix HN.1: `last_demand` is a logical tick and cannot).
+// These tests never exercise idleness, so one fixed instant keeps every existing expectation exact.
+constexpr std::uint64_t kTestNowMs = 1000;
+
 using Usage = ninfer::runtime::ContextResourceUsage;
 using Key   = std::vector<std::uint32_t>;
 using Role  = ninfer::runtime::CheckpointRole;
@@ -551,14 +556,14 @@ struct Fixture {
 
     Token begin(const Base& base, std::optional<Handle> desired = {},
                 std::span<const Handle> carried = {}, std::optional<Token> resume = {}) {
-        return cache.adopt(program, source(base, desired, resume), base, ++next_order, carried);
+        return cache.adopt(program, source(base, desired, resume), base, ++next_order, kTestNowMs, carried);
     }
 
     Token publish(Handle handle, std::optional<std::uint64_t> session = {}) {
         const Base base{.tokens = program.contents[handle.index].tokens,
                         .advice = {.session_key = session}};
         const auto token = begin(base);
-        cache.publish(program, token, handle);
+        cache.publish(program, token, handle, kTestNowMs);
         cache.finish(program, token, base, next_order);
         return token;
     }
@@ -646,17 +651,17 @@ void test_private_continuation_advances_with_adoption_heat() {
     require(choice.take_over && choice.owner == old_owner && choice.source.consume_source,
             "anonymous private continuation cannot transfer its writer");
     require(f.program.release_checkpoint(old), "fixture consume failed");
-    const auto owner = f.cache.adopt(f.program, choice, next, 20, {}, {&old, 1});
+    const auto owner = f.cache.adopt(f.program, choice, next, 20, kTestNowMs, {}, {&old, 1});
     require(owner == old_owner && f.cache.retention(owner).reused,
             "consumed handle retirement lost the adopted continuation relationship");
     const auto advanced =
         f.program.add({1, 2, 3, 4}, {f.program.host_block(16)}, Role::Continuation);
-    f.cache.publish(f.program, owner, advanced);
+    f.cache.publish(f.program, owner, advanced, kTestNowMs);
     f.cache.finish(f.program, owner, next, 20);
     require(!f.cache.host_victims(f.program, 32, entrant),
             "new endpoint lost actual private continuation reuse protection");
     const auto replay = f.program.add({1, 2, 3}, {f.program.host_block(16)}, Role::InputReplay);
-    f.cache.publish(f.program, owner, replay);
+    f.cache.publish(f.program, owner, replay, kTestNowMs);
     require(f.cache.retention(owner).reused && !f.cache.host_victims(f.program, 32, entrant),
             "input replay and endpoint did not share their owner's retention priority");
 }
@@ -670,17 +675,17 @@ void test_branch_adoption_time_is_independent_of_finish_order() {
     const auto first_choice = f.source(branch, parent);
     require(!first_choice.take_over && !first_choice.source.consume_source,
             "branch disabling session publication consumed its named predecessor");
-    const auto first       = f.cache.adopt(f.program, first_choice, branch, 10);
+    const auto first       = f.cache.adopt(f.program, first_choice, branch, 10, kTestNowMs);
     const auto first_used  = f.cache.retention(first).last_demand;
-    const auto second      = f.cache.adopt(f.program, f.source(branch, parent), branch, 11);
+    const auto second      = f.cache.adopt(f.program, f.source(branch, parent), branch, 11, kTestNowMs);
     const auto second_used = f.cache.retention(second).last_demand;
     require(first != original && second != original && first != second && first_used < second_used,
             "independent branches did not acquire distinct real adoption times");
     const auto a = f.program.add({1, 2, 3}, {f.program.host_block(16)}, Role::Continuation);
     const auto b = f.program.add({1, 2, 4}, {f.program.host_block(16)}, Role::Continuation);
-    f.cache.publish(f.program, second, b);
+    f.cache.publish(f.program, second, b, kTestNowMs);
     f.cache.finish(f.program, second, branch, 11);
-    f.cache.publish(f.program, first, a);
+    f.cache.publish(f.program, first, a, kTestNowMs);
     f.cache.finish(f.program, first, branch, 10);
     require(f.cache.retention(first).last_demand == first_used &&
                 f.cache.retention(second).last_demand == second_used &&
@@ -701,7 +706,7 @@ void test_shared_source_does_not_inherit_private_heat() {
     const auto owner = f.begin(base, shared);
     require(!f.cache.retention(owner).reused, "shared-prefix adoption heated a new private suffix");
     const auto endpoint = f.program.add({1, 2, 3}, {f.program.host_block(16)}, Role::Continuation);
-    f.cache.publish(f.program, owner, endpoint);
+    f.cache.publish(f.program, owner, endpoint, kTestNowMs);
     f.cache.finish(f.program, owner, base, 20);
     const auto incoming = f.program.add({9, 8});
     f.publish(incoming);
@@ -731,18 +736,18 @@ void test_resume_preserves_owner_and_does_not_create_a_hit() {
     const Base base{.tokens = {1, 2, 3}};
     const auto owner  = f.begin(base);
     const auto replay = f.program.add({1, 2}, {f.program.host_block(16)}, Role::InputReplay);
-    f.cache.publish(f.program, owner, replay);
+    f.cache.publish(f.program, owner, replay, kTestNowMs);
     const auto choice  = f.source(base, replay, owner);
-    const auto resumed = f.cache.adopt(f.program, choice, base, 1, {&replay, 1});
+    const auto resumed = f.cache.adopt(f.program, choice, base, 1, kTestNowMs, {&replay, 1});
     require(resumed == owner && !f.cache.retention(owner).reused &&
                 f.cache.points(owner) == std::vector<Handle>{replay},
             "own pause/replay changed continuation identity or counted as cross-request reuse");
     require(f.cache.erase(f.program, replay), "active relation pinned all optional input history");
     const auto root = f.source(base, {}, owner);
-    require(f.cache.adopt(f.program, root, base, 1) == owner,
+    require(f.cache.adopt(f.program, root, base, 1, kTestNowMs) == owner,
             "evicting all optional checkpoints destroyed an active continuation token");
     const auto shared = f.program.add({8});
-    f.cache.publish(f.program, owner, shared);
+    f.cache.publish(f.program, owner, shared, kTestNowMs);
     f.cache.abandon(f.program, owner);
     require(f.program.valid_checkpoint(shared), "cancellation removed an independent public entry");
 }
@@ -757,12 +762,12 @@ void test_rewind_evaluation_preserves_sources_until_binding() {
     const auto deeper   = f.program.add({1, 2, 3, 4}, {}, Role::LongAnchor);
     const auto leased   = f.program.add({1, 2, 3, 4, 5}, {}, Role::LongAnchor);
     const auto shared   = f.program.add({1, 2, 3});
-    f.cache.publish(f.program, owner, replay);
-    f.cache.publish(f.program, owner, endpoint);
-    f.cache.publish(f.program, owner, anchor);
-    f.cache.publish(f.program, owner, deeper);
-    f.cache.publish(f.program, owner, leased);
-    f.cache.publish(f.program, owner, shared);
+    f.cache.publish(f.program, owner, replay, kTestNowMs);
+    f.cache.publish(f.program, owner, endpoint, kTestNowMs);
+    f.cache.publish(f.program, owner, anchor, kTestNowMs);
+    f.cache.publish(f.program, owner, deeper, kTestNowMs);
+    f.cache.publish(f.program, owner, leased, kTestNowMs);
+    f.cache.publish(f.program, owner, shared, kTestNowMs);
     f.cache.finish(f.program, owner, base, 1);
     f.program.contents[leased.index].leased = true;
     const Base rewritten{.tokens = {1, 2, 5}};
@@ -910,14 +915,14 @@ void test_waiting_owner_cannot_take_over_an_advanced_session() {
     const auto owner = f.publish(point, 42);
     auto choice      = f.source(base, point);
     f.cache.retain_source(f.program, 10, choice);
-    const auto child = f.cache.adopt(f.program, choice, base, 20);
+    const auto child = f.cache.adopt(f.program, choice, base, 20, kTestNowMs);
     const auto next  = f.program.add({1, 2, 3, 4}, {}, Role::Continuation);
-    f.cache.publish(f.program, child, next);
+    f.cache.publish(f.program, child, next, kTestNowMs);
     f.cache.finish(f.program, child, base, 20);
     require(f.cache.prepare_source(f.program, base, choice, 10) && !choice.take_over &&
                 choice.source.consume_source && f.program.valid_checkpoint(point),
             "waiting source overwrote the newer session or lost its own independent contents");
-    const auto branch = f.cache.adopt(f.program, choice, base, 10);
+    const auto branch = f.cache.adopt(f.program, choice, base, 10, kTestNowMs);
     require(branch != owner && f.program.valid_checkpoint(next),
             "a stale continuation alias replaced the advanced owner's recovery points");
     f.cache.release_source(f.program, 10);
@@ -931,10 +936,10 @@ void test_older_waiter_does_not_take_over_a_newer_catalog_version() {
     auto old         = f.source(base, input);
     f.cache.retain_source(f.program, 10, old);
     const std::array carried{input};
-    require(f.cache.adopt(f.program, old, base, 20, carried) == owner,
+    require(f.cache.adopt(f.program, old, base, 20, kTestNowMs, carried) == owner,
             "newer session could not preserve its existing input point");
     const auto endpoint = f.program.add({1, 2, 3, 4}, {}, Role::Continuation);
-    f.cache.publish(f.program, owner, endpoint);
+    f.cache.publish(f.program, owner, endpoint, kTestNowMs);
     f.cache.finish(f.program, owner, base, 20);
     const auto choices = f.cache.candidates(f.program, base, UINT32_MAX, std::nullopt, 10, 10);
     const auto found   = std::find_if(choices.begin(), choices.end(),
@@ -942,7 +947,7 @@ void test_older_waiter_does_not_take_over_a_newer_catalog_version() {
     require(found != choices.end() && !found->take_over && !found->source.consume_source &&
                 found->source.retired_points.empty(),
             "re-querying a newer catalog bypassed the waiting request's publication order");
-    const auto branch = f.cache.adopt(f.program, *found, base, 10);
+    const auto branch = f.cache.adopt(f.program, *found, base, 10, kTestNowMs);
     f.cache.finish(f.program, branch, base, 10);
     require(branch != owner && f.program.valid_checkpoint(endpoint),
             "older completion overwrote a newer session's recovery point");
@@ -956,9 +961,9 @@ void test_session_submission_order_controls_only_the_named_hint() {
     const auto new_owner = f.begin(base);
     const auto old       = f.program.add({1, 2}, {}, Role::Continuation);
     const auto newer     = f.program.add({1, 2}, {}, Role::Continuation);
-    f.cache.publish(f.program, new_owner, newer);
+    f.cache.publish(f.program, new_owner, newer, kTestNowMs);
     f.cache.finish(f.program, new_owner, base, 20);
-    f.cache.publish(f.program, old_owner, old);
+    f.cache.publish(f.program, old_owner, old, kTestNowMs);
     f.cache.finish(f.program, old_owner, base, 10);
     const auto candidates = f.cache.candidates(f.program, base);
     require(candidates.front().source.checkpoint == newer && candidates.front().session_hint &&
@@ -1010,30 +1015,30 @@ void test_explicit_anchor_updates_remain_bounded_across_requests() {
     for (std::uint32_t end = 1; end <= 4; ++end) {
         anchors.push_back(f.program.add(Key(base.tokens.begin(), base.tokens.begin() + end), {},
                                         Role::LongAnchor));
-        f.cache.publish(f.program, owner, anchors.back());
+        f.cache.publish(f.program, owner, anchors.back(), kTestNowMs);
     }
     const auto replay   = f.program.add({1, 2}, {}, Role::InputReplay);
     const auto endpoint = f.program.add({1, 2, 3, 4}, {}, Role::Continuation);
     const auto shared   = f.program.add({1, 2});
-    f.cache.publish(f.program, owner, replay);
-    f.cache.publish(f.program, owner, endpoint);
-    f.cache.publish(f.program, owner, shared);
+    f.cache.publish(f.program, owner, replay, kTestNowMs);
+    f.cache.publish(f.program, owner, endpoint, kTestNowMs);
+    f.cache.publish(f.program, owner, shared, kTestNowMs);
     f.cache.finish(f.program, owner, base, 1);
     const auto carried    = f.cache.points(owner);
     const auto next_owner = f.begin(base, endpoint, carried);
     const auto next       = f.program.add({1, 2, 3, 4, 5}, {}, Role::LongAnchor);
-    f.cache.publish(f.program, next_owner, next);
+    f.cache.publish(f.program, next_owner, next, kTestNowMs);
     require(!f.program.valid_checkpoint(anchors[0]) && f.program.valid_checkpoint(next) &&
                 f.program.valid_checkpoint(replay) && f.program.valid_checkpoint(shared),
             "fifth cross-request anchor failed to replace only the oldest explicit anchor");
     const auto updated = f.program.add({1, 2, 3}, {}, Role::LongAnchor);
-    f.cache.publish(f.program, next_owner, updated);
+    f.cache.publish(f.program, next_owner, updated, kTestNowMs);
     require(!f.program.valid_checkpoint(anchors[2]) && f.program.valid_checkpoint(anchors[1]) &&
                 f.program.valid_checkpoint(updated),
             "same-frontier anchor update retired a different explicit position");
     f.program.contents[anchors[1].index].evictable = false;
     const auto blocked = f.program.add({1, 2, 3, 4, 5, 6}, {}, Role::LongAnchor);
-    f.cache.publish(f.program, next_owner, blocked);
+    f.cache.publish(f.program, next_owner, blocked, kTestNowMs);
     require(!f.program.valid_checkpoint(blocked) && f.program.valid_checkpoint(anchors[1]) &&
                 f.program.valid_checkpoint(anchors[3]) && f.program.valid_checkpoint(next),
             "leased oldest anchor caused a request failure or a search for a different victim");
@@ -1051,7 +1056,7 @@ void test_forked_hot_records_do_not_bypass_the_soft_capacity_target() {
     const auto owner = f.begin(branch, parent);
     const auto child = f.program.add({1, 2, 3}, {f.program.host_block(16)}, Role::Continuation);
     f.program.contents[child.index].main_pages = 40;
-    f.cache.publish(f.program, owner, child);
+    f.cache.publish(f.program, owner, child, kTestNowMs);
     f.cache.finish(f.program, owner, branch, 2);
     const auto entrant = f.program.add({9, 8, 7});
     f.publish(entrant);
@@ -1102,7 +1107,7 @@ void test_one_off_fanout_competes_with_repeated_continuation() {
         const auto owner = f.begin(next, previous);
         require(owner == dialogue_owner, "dialogue continuation unexpectedly forked its owner");
         const auto endpoint = f.program.add(next.tokens, {dialogue_prefix}, Role::Continuation);
-        f.cache.publish(f.program, owner, endpoint);
+        f.cache.publish(f.program, owner, endpoint, kTestNowMs);
         f.cache.finish(f.program, owner, next, f.next_order);
         return endpoint;
     };
@@ -1110,13 +1115,13 @@ void test_one_off_fanout_competes_with_repeated_continuation() {
     const auto fast_owner     = f.begin(branch, parent);
     const auto fast =
         f.program.add({1, 2, 3, 4}, {shared_prefix, f.program.host_block(16)}, Role::Continuation);
-    f.cache.publish(f.program, fast_owner, fast);
+    f.cache.publish(f.program, fast_owner, fast, kTestNowMs);
     f.cache.finish(f.program, fast_owner, branch, f.next_order);
     const auto recent_dialogue = continue_dialogue(first_dialogue, {9, 8, 1, 2});
     const auto recent_used     = f.cache.retention(dialogue_owner).last_demand;
     const auto slow =
         f.program.add({1, 2, 3, 5}, {shared_prefix, f.program.host_block(16)}, Role::Continuation);
-    f.cache.publish(f.program, slow_owner, slow);
+    f.cache.publish(f.program, slow_owner, slow, kTestNowMs);
     f.cache.finish(f.program, slow_owner, branch, slow_order);
 
     const std::array<Handle, 4> all{parent, fast, recent_dialogue, slow};
@@ -1317,8 +1322,8 @@ void test_necessary_execution_preserves_long_recovery_across_one_off_requests() 
     const auto owner    = f.begin(original);
     const auto input    = f.program.add(tokens(100), {}, Role::InputReplay);
     const auto endpoint = f.program.add(tokens(101), {}, Role::Continuation);
-    f.cache.publish(f.program, owner, input);
-    f.cache.publish(f.program, owner, endpoint);
+    f.cache.publish(f.program, owner, input, kTestNowMs);
+    f.cache.publish(f.program, owner, endpoint, kTestNowMs);
     f.cache.finish(f.program, owner, original, 1);
     auto short_history = f.program.add(tokens(3, 1000));
     f.publish(short_history);
@@ -1679,7 +1684,7 @@ void test_kv_demotion_batch_preserves_host_and_outer_permission_limits() {
     require(protected_owner.begin(continued, replay, {&replay, 1}) == owner,
             "fixture failed to establish adopted private progress");
     const auto anchor = protected_owner.program.add(tokens(100), {}, Role::LongAnchor);
-    protected_owner.cache.publish(protected_owner.program, owner, anchor);
+    protected_owner.cache.publish(protected_owner.program, owner, anchor, kTestNowMs);
     protected_owner.cache.finish(protected_owner.program, owner, continued,
                                  protected_owner.next_order);
     for (const auto handle : {replay, anchor}) {
@@ -1767,8 +1772,8 @@ void test_unproven_suffix_can_retreat_without_losing_a_new_dialogue() {
     require(f.begin(next, predecessor) == owner, "fixture did not continue its owner");
     const auto replay   = f.program.add(tokens(2091), {}, Role::InputReplay);
     const auto endpoint = f.program.add(tokens(2131), {}, Role::Continuation);
-    f.cache.publish(f.program, owner, replay);
-    f.cache.publish(f.program, owner, endpoint);
+    f.cache.publish(f.program, owner, replay, kTestNowMs);
+    f.cache.publish(f.program, owner, endpoint, kTestNowMs);
     f.cache.finish(f.program, owner, next, f.next_order);
     const auto newcomer = f.program.add(tokens(2079, 10000), {}, Role::Continuation);
     f.publish(newcomer);
@@ -1788,8 +1793,8 @@ void test_free_host_preserves_an_unproven_suffix_instead_of_deleting_it() {
     const auto replay   = f.program.add(tokens(110), {}, Role::InputReplay);
     const auto endpoint = f.program.add(tokens(150), {}, Role::Continuation);
     f.program.contents[endpoint.index].demotion_bytes = 32;
-    f.cache.publish(f.program, owner, replay);
-    f.cache.publish(f.program, owner, endpoint);
+    f.cache.publish(f.program, owner, replay, kTestNowMs);
+    f.cache.publish(f.program, owner, endpoint, kTestNowMs);
     f.cache.finish(f.program, owner, next, f.next_order);
     const auto newcomer = f.program.add(tokens(1000, 10000), {}, Role::Continuation);
     f.publish(newcomer);
@@ -1808,14 +1813,14 @@ void test_proven_deep_progress_survives_a_shallow_fallback_and_fork() {
     const auto owner       = f.begin(original);
     const auto replay      = f.program.add(tokens(32), {}, Role::InputReplay);
     const auto predecessor = f.program.add(tokens(4000), {}, Role::Continuation);
-    f.cache.publish(f.program, owner, replay);
-    f.cache.publish(f.program, owner, predecessor);
+    f.cache.publish(f.program, owner, replay, kTestNowMs);
+    f.cache.publish(f.program, owner, predecessor, kTestNowMs);
     f.cache.finish(f.program, owner, original, f.next_order);
     const Base next{.tokens = tokens(4100), .advice = {.session_key = 42}};
     require(f.begin(next, predecessor, {&replay, 1}) == owner,
             "fixture did not continue deep progress");
     const auto endpoint = f.program.add(tokens(4100), {}, Role::Continuation);
-    f.cache.publish(f.program, owner, endpoint);
+    f.cache.publish(f.program, owner, endpoint, kTestNowMs);
     f.cache.finish(f.program, owner, next, f.next_order);
     const auto cold = f.program.add(tokens(55000, 10000));
     f.publish(cold);
@@ -1850,21 +1855,21 @@ void test_consuming_rewind_resets_proven_progress_to_the_adopted_prefix() {
     const auto owner       = f.begin(original);
     const auto replay      = f.program.add(tokens(32), {}, Role::InputReplay);
     const auto predecessor = f.program.add(tokens(4000), {}, Role::Continuation);
-    f.cache.publish(f.program, owner, replay);
-    f.cache.publish(f.program, owner, predecessor);
+    f.cache.publish(f.program, owner, replay, kTestNowMs);
+    f.cache.publish(f.program, owner, predecessor, kTestNowMs);
     f.cache.finish(f.program, owner, original, f.next_order);
     const Base deep{.tokens = tokens(4100)};
     require(f.begin(deep, predecessor, {&replay, 1}) == owner,
             "fixture failed to prove deep adoption");
     const auto deep_endpoint = f.program.add(tokens(4100), {}, Role::Continuation);
-    f.cache.publish(f.program, owner, deep_endpoint);
+    f.cache.publish(f.program, owner, deep_endpoint, kTestNowMs);
     f.cache.finish(f.program, owner, deep, f.next_order);
     const Base rewind{.tokens = tokens(64)};
     require(f.begin(rewind, replay) == owner, "rewind did not consume its existing owner");
     const auto new_replay = f.program.add(tokens(48), {}, Role::InputReplay);
     const auto endpoint   = f.program.add(tokens(64), {}, Role::Continuation);
-    f.cache.publish(f.program, owner, new_replay);
-    f.cache.publish(f.program, owner, endpoint);
+    f.cache.publish(f.program, owner, new_replay, kTestNowMs);
+    f.cache.publish(f.program, owner, endpoint, kTestNowMs);
     f.cache.finish(f.program, owner, rewind, f.next_order);
     const auto other = f.program.add(tokens(1000, 10000));
     f.publish(other);
