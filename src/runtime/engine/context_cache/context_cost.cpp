@@ -40,7 +40,67 @@ const std::vector<ContextCostMachinePreset>& compiled_context_cost_defaults();
 namespace {
 
 using Json = nlohmann::json;
+#if defined(_MSC_VER)
+// port: MSVC has no unsigned __int128. Only these operations are used by the cost arithmetic, so a
+// two-word type with identical semantics replaces it without touching the formulas.
+#include <intrin.h>
+
+struct U128 {
+    std::uint64_t lo = 0;
+    std::uint64_t hi = 0;
+
+    constexpr U128() noexcept = default;
+    constexpr U128(std::uint64_t value) noexcept : lo(value) {}
+
+    static constexpr U128 make(std::uint64_t low, std::uint64_t high) noexcept {
+        U128 value;
+        value.lo = low;
+        value.hi = high;
+        return value;
+    }
+
+    // Every call site multiplies a zero-high value by a 64-bit value; the high term is kept for
+    // completeness.
+    friend U128 operator*(U128 left, std::uint64_t right) noexcept {
+        unsigned __int64 high = 0;
+        const auto low        = _umul128(left.lo, right, &high);
+        return U128::make(low, high + left.hi * right);
+    }
+
+    friend U128 operator+(U128 left, std::uint64_t right) noexcept {
+        const auto low  = left.lo + right;
+        const auto high = left.hi + (low < left.lo ? 1U : 0U);
+        return U128::make(low, high);
+    }
+
+    friend U128 operator-(U128 left, std::uint64_t right) noexcept {
+        const auto low  = left.lo - right;
+        const auto high = left.hi - (left.lo < right ? 1U : 0U);
+        return U128::make(low, high);
+    }
+
+    friend U128 operator<<(U128 value, unsigned shift) noexcept {
+        return U128::make(value.lo << shift, (value.hi << shift) | (value.lo >> (64U - shift)));
+    }
+
+    friend U128 operator>>(U128 value, unsigned shift) noexcept {
+        if (shift == 0) return value;
+        return U128::make((value.lo >> shift) | (value.hi << (64U - shift)), value.hi >> shift);
+    }
+
+    friend bool operator>(U128 left, std::uint64_t right) noexcept {
+        return left.hi != 0 || left.lo > right;
+    }
+
+    friend bool operator>=(U128 left, U128 right) noexcept {
+        return left.hi != right.hi ? left.hi > right.hi : left.lo >= right.lo;
+    }
+
+    explicit operator std::uint64_t() const noexcept { return lo; }
+};
+#else
 using U128 = unsigned __int128;
+#endif
 
 constexpr std::size_t direction_index(ContextTransferDirection direction) noexcept {
     return static_cast<std::size_t>(direction);

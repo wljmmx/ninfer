@@ -310,7 +310,13 @@ std::vector<std::uint8_t> read_path(const Source& source, const Policy& policy) 
     if (!policy.media_root.empty()) {
         const std::filesystem::path root = std::filesystem::weakly_canonical(policy.media_root, ec);
         const auto relative              = std::filesystem::relative(path, root, ec);
-        if (ec || relative.empty() || relative.native().starts_with("..")) {
+        #if defined(_WIN32)
+        // port: native() is a std::wstring on Windows, so the prefix literal must be wide.
+        const bool escapes_root = relative.native().starts_with(L"..");
+#else
+        const bool escapes_root = relative.native().starts_with("..");
+#endif
+        if (ec || relative.empty() || escapes_root) {
             throw std::invalid_argument("media path is outside configured media root");
         }
     }
