@@ -12,7 +12,24 @@
 #include <system_error>
 #include <utility>
 
+#if defined(_WIN32)
+#include <process.h>
+#else
 #include <unistd.h>
+#endif
+
+namespace {
+
+// port: Windows exposes the process id as _getpid() through <process.h>.
+long long process_id() noexcept {
+#if defined(_WIN32)
+    return static_cast<long long>(::_getpid());
+#else
+    return static_cast<long long>(::getpid());
+#endif
+}
+
+} // namespace
 
 namespace ninfer::runtime {
 
@@ -294,7 +311,7 @@ void write_document_atomic(const std::filesystem::path& path, const Json& docume
     if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
 
     std::filesystem::path temporary = path;
-    temporary += ".tmp." + std::to_string(static_cast<long long>(::getpid())) + "." +
+    temporary += ".tmp." + std::to_string(process_id()) + "." +
                  std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     try {
         {

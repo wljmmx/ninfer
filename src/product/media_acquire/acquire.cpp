@@ -2,9 +2,18 @@
 
 #include <curl/curl.h>
 
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
+#endif
+#if !defined(_WIN32)
 #include <netdb.h>
+#endif
+#if !defined(_WIN32)
 #include <sys/socket.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -21,6 +30,20 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+namespace {
+
+// port: Winsock spells the same call InetNtopA; the parameters line up one for one. Winsock itself is
+// initialised by the product's HTTP stack (libcurl), which owns this acquisition path.
+bool format_address(int family, const void* bytes, char* text, std::size_t size) {
+#if defined(_WIN32)
+    return InetNtopA(family, const_cast<PVOID>(bytes), text, static_cast<DWORD>(size)) != nullptr;
+#else
+    return ::inet_ntop(family, bytes, text, size) != nullptr;
+#endif
+}
+
+} // namespace
 
 namespace ninfer::product::media_acquire {
 namespace {
@@ -163,7 +186,7 @@ std::string resolve_public(const UrlParts& url, bool allow_private) {
                       &reinterpret_cast<const sockaddr_in*>(it->ai_addr)->sin_addr)
                 : static_cast<const void*>(
                       &reinterpret_cast<const sockaddr_in6*>(it->ai_addr)->sin6_addr);
-        if (inet_ntop(it->ai_family, bytes, text.data(), text.size()) != nullptr) {
+        if (format_address(it->ai_family, bytes, text.data(), text.size())) {
             selected = text.data();
             if (it->ai_family == AF_INET) { break; }
         }
