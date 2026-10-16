@@ -2252,6 +2252,53 @@ private:
                     executed |= progress_context_transaction(boundary);
                 }
                 reserve_resident_units();
+                // appendix HJ (plan item 4): the idle trigger - a SUPPLEMENT to the capacity-driven path
+                // above, for the workload where sessions sit idle between turns while holding device
+                // pages (chat / meeting style). Guards, all three required (appendix HC.1.3):
+                //   * reachability: this is inert unless residency is actually kept high - the item-1
+                //     demote default collapses a lane to its window, so the arena never fills;
+                //   * REFUSE rather than degrade: if the Host arena cannot hold the snapshot, skip the
+                //     pause entirely. Unlike the capacity path there is no emergency to pay seconds of
+                //     recompute for (appendix GQ: ~8.4 s to replay against ~28 ms to fetch);
+                //   * demote semantics: pause_resident keeps the bytes, so a resumed session fetches.
+                // Off by default: no switch means no behavioural change whatsoever.
+                if (const char* idle_text = std::getenv("NINFER_KV_IDLE_RECLAIM_MS");
+                    idle_text != nullptr && *idle_text != '\0') {
+                    const long idle_ms = std::strtol(idle_text, nullptr, 10);
+                    if (idle_ms > 0 && !instance_.program->has_context_transaction()) {
+                        const Clock::time_point threshold =
+                            Clock::now() - std::chrono::milliseconds(idle_ms);
+                        std::optional<std::uint32_t> idlest;
+                        Clock::time_point idlest_progress{};
+                        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                            const auto& candidate = slots_[lane];
+                            if (!candidate || !candidate->sequence || candidate->paused_at ||
+                                candidate->capture_pending || !candidate->is_decode_ready()) {
+                                continue;
+                            }
+                            const Clock::time_point progress =
+                                candidate->last_token ? *candidate->last_token : candidate->submitted;
+                            if (progress > threshold) { continue; }
+                            if (!idlest || progress < idlest_progress) {
+                                idlest          = lane;
+                                idlest_progress = progress;
+                            }
+                        }
+                        if (idlest) {
+                            const auto bytes =
+                                instance_.program->pause_host_bytes(*slots_[*idlest]->sequence);
+                            const auto usage = instance_.program->physical_usage();
+                            const bool fits =
+                                bytes && *bytes <=
+                                             usage.capacity.host_bytes - usage.occupied.host_bytes;
+                            if (fits) {
+                                if (pause_resident(*idlest)) { ++cumulative_stats_.idle_reclaims; }
+                            } else {
+                                ++cumulative_stats_.idle_reclaims_refused;
+                            }
+                        }
+                    }
+                }
                 // A failed restore leaves spare resources available to fresh requests.
                 // An in-flight restoration/reclaim keeps its own candidate until settled.
                 if (!admission_decision_ || !admission_decision_->restoring) {

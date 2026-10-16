@@ -1042,6 +1042,14 @@ struct RuntimeStats {
     std::uint64_t snapshot_restores         = 0;
     std::uint64_t replay_restores           = 0;
     std::uint64_t replayed_tokens           = 0;
+    // appendix HJ (plan item 4): the idle trigger is a SEPARATE trigger from the capacity path, so it
+    // gets its own counters. `spilled_pages` cannot serve here: it counts the demote path and stays 0
+    // while residency is kept (appendix HH.2). `idle_reclaims` counts pauses made because a resident
+    // request had been idle past NINFER_KV_IDLE_RECLAIM_MS; `idle_reclaims_refused` counts the pauses
+    // NOT made because the Host arena could not hold the snapshot - refusing rather than degrading to a
+    // recompute is the designed behaviour there (appendix HC.1.3, ~8.4 s vs ~28 ms).
+    std::uint64_t idle_reclaims         = 0;
+    std::uint64_t idle_reclaims_refused = 0;
 
     std::uint64_t root_selections               = 0;
     std::uint64_t checkpoint_selections         = 0;
