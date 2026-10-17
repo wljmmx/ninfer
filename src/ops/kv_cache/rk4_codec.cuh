@@ -6,13 +6,9 @@
 // convention that the 4-bit symmetric [-7, 7] range requires.
 
 // port (sm_89): include re-point only - the bodies below are the earlier implementation, unchanged.
-//   common/math.cuh             -> common/numeric/convert.cuh      (pack_bf16x2)
-//   common/memory.cuh           -> common/cuda/memory.cuh          (load_vec / store_vec)
-//   kernel/paged_kv_address.cuh -> kv_cache/kernels/layout.cuh     (page_major_offset, same formula)
-//   kv_cache/hadamard_d256.cuh  -> dropped: this header never used it
-#include "ops/common/cuda/memory.cuh"
-#include "ops/common/numeric/convert.cuh"
-#include "ops/kv_cache/kernels/layout.cuh"
+// The names this file expects (load_vec / store_vec / pack_bf16x2 / paged_kv_element_offset) are
+// translated in one place; kv_cache/hadamard_d256.cuh is dropped because this file never used it.
+#include "ops/kv_cache/kernels/paged_offset_compat.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -21,22 +17,8 @@
 
 namespace ninfer::ops {
 
-// port (sm_89): the three helpers this file uses now live in ninfer::ops::common, and the paged offset
-// helper in ninfer::ops::detail::kv. These bring them into scope so the bodies keep their original
-// spelling; page_major_offset is the very same formula as the earlier paged_kv_element_offset.
-using common::load_vec;
-using common::pack_bf16x2;
-using common::store_vec;
-
-template <int LeadingExtent, int HeadExtent>
-__device__ __forceinline__ std::int64_t paged_kv_element_offset(std::int32_t physical_page,
-                                                                std::int32_t head,
-                                                                std::int32_t page_offset,
-                                                                std::int32_t leading) {
-    return detail::kv::page_major_offset<LeadingExtent, HeadExtent>(physical_page, head, page_offset,
-                                                                    leading);
-}
-
+// port (sm_89): the shared translations live in paged_offset_compat.cuh, so the bodies keep their
+// original spelling without defining anything twice.
 inline constexpr int kKVCacheRkHeadDim  = 256;
 inline constexpr int kKVCacheRkGroup    = 64;
 inline constexpr int kKVCacheRkGroups   = kKVCacheRkHeadDim / kKVCacheRkGroup;
