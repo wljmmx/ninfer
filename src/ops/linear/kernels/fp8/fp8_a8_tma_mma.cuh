@@ -87,6 +87,12 @@ inline constexpr int fp8_tma_scratch_bytes = [] {
     return (bytes + 127) / 128 * 128;
 }();
 
+// port (sm_89): this TMA implementation needs sm_90 (setmaxnreg, mbarrier,
+// cp.async.bulk.tensor) and its kernels take an over-aligned __grid_constant__ descriptor
+// by value, which MSVC rejects outright (C2719) - upstream builds on Linux where that is
+// accepted. The TMA routes are compiled out on Ada, so the kernels are only declared for
+// builds that can execute them. The descriptor types above stay available either way.
+#if NINFER_CUDA_HAS_TMA
 template <class Schedule, bool FullTokens, class Output, class Epilogue, bool SplitK = false,
           class RowPolicy = Fp8IdentityRows>
 __global__
@@ -323,5 +329,7 @@ void launch_fp8_a8_tma_mma(const Fp8A8Operands& p, Output output, Epilogue epilo
             launch.template operator()<false, false>();
     });
 }
+
+#endif // NINFER_CUDA_HAS_TMA
 
 } // namespace ninfer::ops::detail
