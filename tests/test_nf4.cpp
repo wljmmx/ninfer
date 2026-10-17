@@ -3,6 +3,13 @@
 #include <algorithm>
 #include <bit>
 #include <iostream>
+
+// port (sm_89): the table protocol below is raw binary. Windows opens stdin/stdout in text mode,
+// which would strip CR / stop at 0x1A on input and expand 0x0A on output.
+#if defined(_WIN32)
+#    include <fcntl.h>
+#    include <io.h>
+#endif
 #include <stdexcept>
 #include <vector>
 
@@ -52,6 +59,10 @@ int main(int argc, char**) {
             return 0;
         }
         // Binary test protocol: divisor word -> success word and LUT, or zero on rejection.
+#if defined(_WIN32)
+        (void)_setmode(_fileno(stdin), _O_BINARY);
+        (void)_setmode(_fileno(stdout), _O_BINARY);
+#endif
         std::uint32_t divisor;
         while (std::cin.read(reinterpret_cast<char*>(&divisor), sizeof(divisor))) {
             ninfer::Nf4Bf16Lut lut;

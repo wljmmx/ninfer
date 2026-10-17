@@ -15,6 +15,7 @@
 #include <array>
 #include <cstdint>
 #include <iostream>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -408,6 +409,7 @@ int run_nvfp4() {
     int failures = 0;
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A16Only);
     failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::AllowA8);
+#if NINFER_CUDA_HAS_BLOCK_SCALE_MMA
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_case(parent, 2, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4);
@@ -417,6 +419,11 @@ int run_nvfp4() {
     failures += run_nvfp4_case(parent, 1023, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_case(parent, 1024, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_case(parent, 1025, ops::LinearPolicy::AllowA4);
+#else
+    // port (sm_89): the A4 activation route needs the block-scaled MMA target (sm_100+); the
+    // A16 and A8 legs above still run.
+    std::cout << "skipped: NVFP4 A4 legs need sm_100+\n";
+#endif
     return failures;
 }
 
@@ -555,7 +562,7 @@ int run_fp8() {
 
 } // namespace
 
-int main() {
+int run_all() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
@@ -569,4 +576,20 @@ int main() {
     failures += run_fp8();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " linear_split two-output\n";
     return failures == 0 ? 0 : 1;
+}
+
+
+// port (sm_89): a thrown exception used to become std::terminate -> abort with the message lost in
+// a buffered stream (0xC0000409 in ucrtbase, no output). Make the failure legible.
+int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    try {
+        return run_all();
+    } catch (const std::exception& error) {
+        std::cerr << "uncaught exception: " << error.what() << '\n';
+        return 1;
+    } catch (...) {
+        std::cerr << "uncaught non-standard exception\n";
+        return 1;
+    }
 }

@@ -72,8 +72,17 @@ int run_profile(const Profile& profile) {
     const auto exact_48     = capacity(ops::LinearPolicy::AllowA8, 48, 48);
     const auto through_1024 = capacity(ops::LinearPolicy::AllowA8, 1, 1024);
     const auto exact_1024   = capacity(ops::LinearPolicy::AllowA8, 1024, 1024);
-    if (a16_interval != 0 || pre_boundary != 0 || hot_interval != exact_48 ||
-        through_1024 != exact_1024 || exact_1024 <= exact_48) {
+    // port (sm_89): the AllowA8 interval growth belongs to the A8 route, which needs
+    // warp-specialised TMA (sm_90+). Without it every A8 capacity is zero, so only the A16 half of
+    // the invariant is meaningful here.
+    bool interval_violation = a16_interval != 0 || pre_boundary != 0;
+#if NINFER_CUDA_HAS_TMA
+    interval_violation = interval_violation || hot_interval != exact_48 ||
+                         through_1024 != exact_1024 || exact_1024 <= exact_48;
+#else
+    std::cout << "skipped: FP8 A8 interval growth needs TMA (sm_90+)\n";
+#endif
+    if (interval_violation) {
         std::cerr << "FP8 linear_add [" << profile.n << ',' << profile.k
                   << "]: workspace interval contract mismatch\n";
         ++failures;

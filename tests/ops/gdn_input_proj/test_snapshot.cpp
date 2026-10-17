@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <cstdio>
 #include <span>
 #include <string>
 #include <vector>
@@ -1040,10 +1041,15 @@ int run_nvfp4() {
 
     int failures = 0;
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A16Only, 2);
+#if NINFER_CUDA_HAS_BLOCK_SCALE_MMA
     failures += run_nvfp4_case(parent, 3, ops::LinearPolicy::AllowA4, 4);
     failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::AllowA4, 5);
     failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4, 0);
     failures += run_nvfp4_case(parent, 1024, ops::LinearPolicy::AllowA4, 1025);
+#else
+    // port (sm_89): A4 needs the block-scaled MMA target (sm_100+); the A16 case above still runs.
+    std::cout << "skipped: NVFP4 A4 snapshot cases need sm_100+\n";
+#endif
     constexpr std::int32_t kValueRows = 6144;
     constexpr std::int32_t kZRows     = 6144;
     constexpr std::int32_t kChannels  = 10240;
@@ -1054,6 +1060,7 @@ int run_nvfp4() {
     const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         ops::SingleProjectionWeight{parent.view(), ops::LinearPolicy::AllowA4}, kBatch, kWidth,
         kWidth);
+#if NINFER_CUDA_HAS_BLOCK_SCALE_MMA
     failures += run_batched_case(
         "NVFP4 A4 B=3 W=6 masked", kHidden, kValueRows, kZRows, kWidth, kBatch, valid_columns,
         conv_weight, workspace_bytes, kGdnInputProjConvSnapshotA4Tolerance,
@@ -1075,6 +1082,10 @@ int run_nvfp4() {
                 {state, initial, snapshot_base}, valid, {q, k, v, z}, workspace,
                 ninfer::test::cuda_environment().default_execution);
         });
+#else
+    // port (sm_89): this case executes the A4 route, i.e. the block-scaled MMA target.
+    std::cout << "skipped: NVFP4 A4 batched snapshot case needs sm_100+\n";
+#endif
     failures += parent.verify_preserved("batched NVFP4 parent weight");
     return failures;
 }
@@ -1082,6 +1093,14 @@ int run_nvfp4() {
 int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPolicy policy,
                  std::int32_t initial_slot, bool convenience = false,
                  bool shared_state_selectors = false) {
+#if !NINFER_CUDA_HAS_TMA
+    // port (sm_89): the fp8 A8 route needs warp-specialised TMA (sm_90+). Skip here so every call
+    // site stays honest without listing them.
+    if (policy == ops::LinearPolicy::AllowA8) {
+        std::cout << "skipped: fp8 A8 route needs TMA\n";
+        return 0;
+    }
+#endif
     constexpr std::int32_t kHidden               = 5120;
     constexpr std::int32_t kValueRows            = 6144;
     constexpr std::int32_t kZRows                = 6144;
@@ -1206,8 +1225,13 @@ int run_fp8() {
     failures += run_fp8_case(parent, 4, ops::LinearPolicy::A16Only, 5);
     failures += run_fp8_case(parent, 6, ops::LinearPolicy::A16Only, 7);
     failures += run_fp8_case(parent, 7, ops::LinearPolicy::A16Only, 8);
+#if NINFER_CUDA_HAS_TMA
     failures += run_fp8_case(parent, 9, ops::LinearPolicy::AllowA8, 10);
     failures += run_fp8_case(parent, 10, ops::LinearPolicy::AllowA8, 11);
+#else
+    // port (sm_89): the fp8 A8 route needs warp-specialised TMA (sm_90+).
+    std::cout << "skipped: fp8 A8 snapshot cases need TMA\n";
+#endif
     failures += run_fp8_case(parent, 10, ops::LinearPolicy::A16Only, 11);
     failures += run_fp8_case(parent, 11, ops::LinearPolicy::A16Only, 12);
     failures += run_fp8_case(parent, 16, ops::LinearPolicy::AllowA8, 17);
@@ -1224,6 +1248,7 @@ int run_fp8() {
             ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
                 ops::SingleProjectionWeight{parent.view(), ops::LinearPolicy::AllowA8}, batch,
                 width, width);
+#if NINFER_CUDA_HAS_TMA
         return run_batched_case(
             "FP8 AllowA8 B=" + std::to_string(batch) + " W=" + std::to_string(width), kHidden,
             kValueRows, kZRows, width, batch, std::move(valid_columns), conv_weight,
@@ -1248,6 +1273,9 @@ int run_fp8() {
                     {state, initial, snapshot_base}, valid, {q, k, v, z}, workspace,
                     ninfer::test::cuda_environment().default_execution);
             });
+#else
+        return 0; // port (sm_89): fp8 A8 needs TMA (sm_90+)
+#endif
     };
     failures += run_batched(4, 2, {4, 2}, 937U);
     failures += run_batched(16, 8, {16, 13, 11, 7, 5, 3, 2, 1}, 941U);
@@ -1257,7 +1285,7 @@ int run_fp8() {
 
 } // namespace
 
-int main() {
+int run_all() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
@@ -1335,6 +1363,10 @@ int main() {
             batch, min_width, max_width);
     };
     for (auto policy : {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8}) {
+#if !NINFER_CUDA_HAS_TMA
+        // port (sm_89): the A8 interval contract belongs to the TMA route (sm_90+).
+        if (policy == ops::LinearPolicy::AllowA8) { continue; }
+#endif
         for (int batch : {1, 2, 8}) {
             std::size_t peak = 0;
             for (int width = 1; width <= 16; ++width) {
@@ -1353,4 +1385,20 @@ int main() {
     failures += run_fp8();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_snapshot\n";
     return failures == 0 ? 0 : 1;
+}
+
+
+// port (sm_89): a thrown exception used to become std::terminate -> abort with the message lost in
+// a buffered stream (0xC0000409 in ucrtbase, no output). Make the failure legible.
+int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    try {
+        return run_all();
+    } catch (const std::exception& error) {
+        std::cerr << "uncaught exception: " << error.what() << '\n';
+        return 1;
+    } catch (...) {
+        std::cerr << "uncaught non-standard exception\n";
+        return 1;
+    }
 }

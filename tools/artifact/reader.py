@@ -7,6 +7,10 @@ import os
 from pathlib import Path
 from typing import Iterator
 
+# port (sm_89): on Windows os.open defaults to text mode, where os.read stops at the first 0x1A and
+# drops CR bytes. Artifacts are binary.
+_BINARY = getattr(os, "O_BINARY", 0)
+
 from .framing import HEADER, MAGIC, PART_MAGIC, PAYLOAD_ALIGNMENT
 from .layouts import align_up
 from .file_io import discard_cached_pages, IO_CHUNK_BYTES
@@ -41,7 +45,7 @@ class Artifact:
         self._fds: dict[int, int] = {}
         self._validated: set[str] = set()
         try:
-            fd = os.open(self.path, os.O_RDONLY)
+            fd = os.open(self.path, os.O_RDONLY | _BINARY)
             self._fds[0] = fd
             entry_bytes = os.fstat(fd).st_size
             raw = _pread(fd, HEADER.size, 0)
@@ -107,7 +111,7 @@ class Artifact:
             return self._fds[index]
         file = self.directory.files[index]
         path = self.path.parent / file.path
-        fd = os.open(path, os.O_RDONLY)
+        fd = os.open(path, os.O_RDONLY | _BINARY)
         try:
             raw = _pread(fd, HEADER.size, 0)
             if len(raw) != HEADER.size:

@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <optional>
 #include <iostream>
+#include <cstdio>
 #include <span>
 #include <string>
 #include <thread>
@@ -454,6 +455,7 @@ int run_nvfp4_target() {
     }
     failures += run_nvfp4_target_case(parent, 4, ops::LinearPolicy::AllowA8);
     failures += run_nvfp4_target_case(parent, 4, ops::LinearPolicy::AllowA8, true);
+#if NINFER_CUDA_HAS_BLOCK_SCALE_MMA
     failures += run_nvfp4_target_case(parent, 4, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_target_case(parent, 17, ops::LinearPolicy::AllowA4);
     // 1023, 1024 and 1025 straddle this route's floor. 1024 was the narrowest width it
@@ -462,6 +464,10 @@ int run_nvfp4_target() {
     failures += run_nvfp4_target_case(parent, 1023, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_target_case(parent, 1024, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_target_case(parent, 1025, ops::LinearPolicy::AllowA4);
+#else
+    // port (sm_89): A4 activation routes need the block-scaled MMA target (sm_100+).
+    std::cout << "skipped: NVFP4 A4 legs need sm_100+\n";
+#endif
     return failures;
 }
 
@@ -658,7 +664,7 @@ int run_weight_inputs() {
 
 } // namespace
 
-int main(int argc, char** argv) {
+int run_all(int argc, char** argv) {
     const bool dflash2_only = argc == 2 && std::string(argv[1]) == "--dflash2-only";
     const bool inputs_only  = argc == 2 && std::string(argv[1]) == "--weight-inputs-only";
     if (argc != 1 && !dflash2_only && !inputs_only) {
@@ -684,4 +690,20 @@ int main(int argc, char** argv) {
     failures += run_q8_dflash2();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " linear_split multi-output\n";
     return failures == 0 ? 0 : 1;
+}
+
+
+// port (sm_89): a thrown exception used to become std::terminate -> abort with the message lost in
+// a buffered stream (0xC0000409 in ucrtbase, no output). Make the failure legible.
+int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    try {
+        return run_all(argc, argv);
+    } catch (const std::exception& error) {
+        std::cerr << "uncaught exception: " << error.what() << '\n';
+        return 1;
+    } catch (...) {
+        std::cerr << "uncaught non-standard exception\n";
+        return 1;
+    }
 }

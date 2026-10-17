@@ -9,6 +9,12 @@
 #include <atomic>
 #include <chrono>
 #include <iostream>
+
+// port (sm_89): these tests speak raw binary over stdin/stdout; Windows defaults both to text mode.
+#if defined(_WIN32)
+#    include <fcntl.h>
+#    include <io.h>
+#endif
 #include <thread>
 
 namespace {
@@ -407,6 +413,10 @@ extern "C" cudaError_t __wrap_cudaEventRecord(cudaEvent_t event, cudaStream_t st
 }
 
 int main(int argc, char** argv) {
+#if defined(_WIN32)
+    (void)_setmode(_fileno(stdin), _O_BINARY);
+    (void)_setmode(_fileno(stdout), _O_BINARY);
+#endif
     try {
         if (argc != 3) throw std::invalid_argument("expected ARTIFACT --host|--gpu|--failure");
         const std::string_view mode = argv[2];

@@ -4,6 +4,12 @@
 
 #include <cstring>
 #include <iostream>
+
+// port (sm_89): these tests speak raw binary over stdin/stdout; Windows defaults both to text mode.
+#if defined(_WIN32)
+#    include <fcntl.h>
+#    include <io.h>
+#endif
 #include <memory>
 
 namespace {
@@ -93,6 +99,10 @@ void run(const char* path) {
 } // namespace
 
 int main(int argc, char** argv) {
+#if defined(_WIN32)
+    (void)_setmode(_fileno(stdin), _O_BINARY);
+    (void)_setmode(_fileno(stdout), _O_BINARY);
+#endif
     if (argc != 2) return 1;
     try {
         run(argv[1]);
