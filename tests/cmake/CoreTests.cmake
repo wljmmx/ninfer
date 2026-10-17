@@ -55,6 +55,14 @@ if(NOT WIN32)
     LIBRARIES ninfer_core ${NINFER_URING_TARGET})
   target_link_options(ninfer_read_queue_test PRIVATE "LINKER:--wrap=io_uring_submit")
   set_tests_properties(ninfer_read_queue_test PROPERTIES TIMEOUT 30)
+else()
+  # The IOCP build has no io_uring_submit to wrap, so this test pins the contract instead: window
+  # arithmetic, byte-exact reads at unaligned offsets, draining, buffer reuse across rounds (the
+  # release-in-poll regression) and the EOF tail.
+  ninfer_add_test(ninfer_read_queue_windows_test
+    SOURCES "${CMAKE_CURRENT_LIST_DIR}/../io/test_read_queue_windows.cpp"
+    LIBRARIES ninfer_core)
+  set_tests_properties(ninfer_read_queue_windows_test PROPERTIES TIMEOUT 30)
 endif()
 
 ninfer_add_test(ninfer_arena_test        SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_arena.cpp"
