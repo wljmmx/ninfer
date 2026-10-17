@@ -43,7 +43,14 @@ enum class KvCacheStorage : std::uint8_t {
     RK4V4E8,
     // E8-cylinder key carrier (64 B plane) + packed int4 V
     RK2V4E8,
-    // E8-lattice key carrier (96 B plane) + E8-cylinder V (64 B plane)
+    // E8-lattice key carrier (96 B plane) + E8-cylinder V (64 B plane).
+    // EXPERIMENTAL, NOT USABLE YET: the V plane is 2 bit/dim, and a measured round trip
+    // (verify_e8_v_roundtrip.cu, 8192x64 normal vectors) gives 50.3% relative L2 error on V --
+    // the same order as the 47.6% the 2-bit K carrier already has. A 50% error on V goes straight
+    // into the residual stream, so overall PPL lands at 167.98 versus 13.47 for bf16 on the MoE
+    // model (12x worse), and the release line reproduces 140.44 on the same artifact. The K plane
+    // tolerates 2 bits because softmax normalisation absorbs part of the error; V has no such
+    // buffer. Use rk4v4 / rk4v4-e8 (+0.44% / +3.28%) instead, or give V a >=4-bit carrier.
     RK4V2E8,
 };
 
