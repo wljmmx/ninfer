@@ -4,10 +4,7 @@
 #include "ops/softmax_attention/kernels/causal/fp8/template_launch.cuh"
 #include "ops/softmax_attention/dense/causal_cache/fp8/tiled_launch.h"
 
-#include <stdexcept>
-
 namespace ninfer::ops::detail {
-#if NINFER_CUDA_HAS_BLOCK_SCALE_MMA
 namespace {
 
 template <class G, int Tokens, class Input, bool Writable>
@@ -157,24 +154,4 @@ void fp8_kv_cached_attention(const Tensor& q, const Tensor& positions, float sca
                         workspace, out, stream);
 }
 
-#else
-// port (sm_89): the FP8 KV cache attention needs a block-scaled MMA target (sm_100+). This route is only selected when the caller asks for that
-// storage format or expert format, so an Ada build fails loudly here rather than silently
-// computing something else. See nvfp4_a4.cu for the same treatment on the linear side.
-
-void fp8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
-                             const Tensor& positions, const Tensor& valid, const Tensor& rows,
-                             float scale, PagedKVBatchLayerView cache,
-                             CausalAttentionExecutionEnvelope envelope, MemoryArena& workspace,
-                             Tensor& out, CudaExecutionView execution) {
-    throw std::logic_error("the FP8 KV cache attention needs a block-scaled MMA target (sm_100+)");
-}
-
-void fp8_kv_cached_attention(const Tensor& q, const Tensor& positions, float scale,
-                             const PagedKVLayerView& cache,
-                             CausalAttentionExecutionEnvelope envelope, MemoryArena& workspace,
-                             Tensor& out, CudaExecutionView execution) {
-    throw std::logic_error("the FP8 KV cache attention needs a block-scaled MMA target (sm_100+)");
-}
-#endif
 } // namespace ninfer::ops::detail

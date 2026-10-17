@@ -59,9 +59,15 @@ __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsig
 // On RTX 5090, block-scaled FP8 avoids the plain form's half-rate FP32 accumulation.
 // UE8M0 0x7f is exactly 1: preserve the raw E4M3 dot product and keep the callers'
 // existing row scales in FP32 after the MMA. No operand repacking is needed.
+// The kind::mxf8f6f4 block-scaled form needs sm_100 or newer. Ada (sm_89) has FP8
+// tensor cores with the plain m16n8k32 form only; since the scale factor below is
+// exactly 1.0, the plain form produces bit-identical results.
+// port (sm_89): this guard is the earlier implementation's, restored - upstream dropped it when it
+// started building only for sm_120a, which left every FP8 route unable to compile on Ada.
 __device__ __forceinline__ void mma_fp8_e4m3(float& c0, float& c1, float& c2, float& c3,
                                              unsigned a0, unsigned a1, unsigned a2, unsigned a3,
                                              unsigned b0, unsigned b1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
     constexpr unsigned kUnitScale8          = 0x7Fu;
     constexpr unsigned short kScaleBlockId  = 0;
     constexpr unsigned short kScaleThreadId = 0;
@@ -73,6 +79,12 @@ __device__ __forceinline__ void mma_fp8_e4m3(float& c0, float& c1, float& c2, fl
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(kUnitScale8),
                    "h"(kScaleBlockId), "h"(kScaleThreadId), "r"(kUnitScale8), "h"(kScaleBlockId),
                    "h"(kScaleThreadId));
+#else
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
 }
 
 __device__ __forceinline__ void mma_tf32_bits(float& c0, float& c1, float& c2, float& c3,
