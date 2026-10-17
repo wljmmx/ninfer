@@ -234,6 +234,18 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
         return detail::nvfp4_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
                                                 multiprocessor_count);
 
+    // port (sm_89): the rank-compressed layouts run the int8 plan with Tiled rewritten to
+    // ParallelGrouped, so their partials region grows with width. Falling through to the k8v4
+    // table (which stops at its own grouped limit) under-sizes the arena and the prefill dies
+    // with std::bad_alloc from MemoryArena::alloc_bytes.
+    if (cache_storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
+        cache_storage == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64 ||
+        cache_storage == KvCacheStorage::RK4V4E8 ||
+        cache_storage == KvCacheStorage::RK2V4E8 ||
+        cache_storage == KvCacheStorage::RK4V2E8)
+        return detail::rk_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
+                                             multiprocessor_count);
+
     return detail::k8v4_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
                                            multiprocessor_count);
 }

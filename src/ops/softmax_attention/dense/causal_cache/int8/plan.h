@@ -22,6 +22,11 @@ Int8KvCausalPlan select_int8_kv_causal_plan(int heads, int width, int batch,
 std::size_t int8_kv_workspace_bytes(int heads, int batch, int min_width, int max_width,
                                     CausalAttentionExecutionEnvelope envelope,
                                     int multiprocessor_count);
+// port (sm_89): the rank-compressed layouts reuse the int8 plan but rewrite Tiled to
+// ParallelGrouped, so they need the split-partials region across the whole width range.
+std::size_t rk_kv_workspace_bytes(int heads, int batch, int min_width, int max_width,
+                                  CausalAttentionExecutionEnvelope envelope,
+                                  int multiprocessor_count);
 
 kv::PagedWriteInstance select_int8_kv_write(int heads, int width, int batch);
 

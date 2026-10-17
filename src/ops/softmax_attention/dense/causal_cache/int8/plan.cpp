@@ -61,6 +61,26 @@ std::size_t int8_kv_workspace_bytes(int heads, int batch, int min_width, int max
     return maximum;
 }
 
+std::size_t rk_kv_workspace_bytes(int heads, int batch, int min_width, int max_width,
+                                  CausalAttentionExecutionEnvelope envelope,
+                                  int multiprocessor_count) {
+    // port (sm_89): the rk layouts (launch.cu) never run the tiled family -- they rewrite
+    // Tiled to ParallelGrouped, so the split-partials region stays live at every width and its
+    // size grows with it. Sizing these layouts from the k8v4 table (which stops at its own grouped
+    // limit and then falls back to a tiled constant) leaves the arena short by an amount that
+    // grows with width: a 511-column prefill still fits, a 4095-column one dies inside
+    // MemoryArena::alloc_bytes with std::bad_alloc.
+    std::size_t maximum = 0;
+    for (int width = min_width; width <= max_width; ++width) {
+        const auto plan =
+            select_int8_kv_causal_plan(heads, width, batch, envelope, multiprocessor_count);
+        WorkspaceLayoutBuilder layout;
+        (void)allocate_causal_partials(layout, heads, width, plan.partition.capacity, batch);
+        maximum = std::max(maximum, layout.peak_bytes(1));
+    }
+    return maximum;
+}
+
 kv::PagedWriteInstance select_int8_kv_write(int heads, int width, int batch) {
     using Instance = kv::PagedWriteInstance;
     if (batch > 1) return Instance::BatchRows256;
