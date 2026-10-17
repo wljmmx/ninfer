@@ -319,4 +319,95 @@ void rk4v4_e8_kv_cached_attention(const Tensor& q, const Tensor& positions, floa
                                                              workspace, out, stream);
 }
 
+
+// port (sm_89): rk2v4-e8 - E8-cylinder key plane (64 B) + packed int4 V.
+void rk2v4_e8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                                  const Tensor& positions, const Tensor& valid,
+                                  const Tensor& rows, float scale, PagedKVBatchLayerView cache,
+                                  CausalAttentionExecutionEnvelope envelope, MemoryArena& workspace,
+                                  Tensor& out, CudaExecutionView execution) {
+    const cudaStream_t stream = execution.stream();
+    auto plan                 = select_int8_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
+                                                           execution.multiprocessor_count());
+    if (plan.family == Int8KvFamily::Tiled) plan.family = Int8KvFamily::ParallelGrouped;
+    if (plan.family != Int8KvFamily::Grouped) {
+        kv::launch_paged_write(select_int8_kv_write(k.ne[1], k.ne[2], k.ne[3]), k, v, positions,
+                               valid, rows, cache, stream);
+        const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
+        const auto view =
+            make_quantized_causal_cache_view<Int8KvCacheView<false>>(cache, &valid, &rows);
+        execute_parallel<true, false, false, true, false>(p, view, plan, workspace, stream);
+    } else {
+        execute_grouped<CausalAppendInput, true, false, false, true, false>(
+            q, positions, scale, cache, &valid, &rows,
+            CausalAppendInput{static_cast<const __nv_bfloat16*>(k.data),
+                              static_cast<const __nv_bfloat16*>(v.data)},
+            plan, workspace, out, stream);
+    }
+}
+
+void rk2v4_e8_kv_cached_attention(const Tensor& q, const Tensor& positions, float scale,
+                                  const PagedKVLayerView& cache,
+                                  CausalAttentionExecutionEnvelope envelope,
+                                  MemoryArena& workspace, Tensor& out, CudaExecutionView execution) {
+    const cudaStream_t stream = execution.stream();
+    auto plan = select_int8_kv_causal_plan(q.ne[1], q.ne[2], 1, envelope,
+                                           execution.multiprocessor_count());
+    if (plan.family == Int8KvFamily::Tiled) plan.family = Int8KvFamily::ParallelGrouped;
+    const auto view = single_row_paged_kv_batch_view(cache);
+    if (plan.family == Int8KvFamily::ParallelGrouped)
+        execute_parallel<true, false, false, true, false>(
+            make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),
+            make_quantized_causal_cache_view<Int8KvCacheView<false>>(view), plan, workspace, stream);
+    else
+        execute_grouped<CausalCachedInput, true, false, false, true, false>(q, positions, scale, view, nullptr, nullptr,
+                                                     CausalCachedInput{}, plan, workspace, out,
+                                                     stream);
+}
+
+// port (sm_89): rk4v2-e8 - E8-lattice key plane (96 B) + E8-cylinder V (64 B).
+void rk4v2_e8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                                  const Tensor& positions, const Tensor& valid,
+                                  const Tensor& rows, float scale, PagedKVBatchLayerView cache,
+                                  CausalAttentionExecutionEnvelope envelope, MemoryArena& workspace,
+                                  Tensor& out, CudaExecutionView execution) {
+    const cudaStream_t stream = execution.stream();
+    auto plan                 = select_int8_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
+                                                           execution.multiprocessor_count());
+    if (plan.family == Int8KvFamily::Tiled) plan.family = Int8KvFamily::ParallelGrouped;
+    if (plan.family != Int8KvFamily::Grouped) {
+        kv::launch_paged_write(select_int8_kv_write(k.ne[1], k.ne[2], k.ne[3]), k, v, positions,
+                               valid, rows, cache, stream);
+        const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
+        const auto view =
+            make_quantized_causal_cache_view<Int8KvCacheView<false>>(cache, &valid, &rows);
+        execute_parallel<true, true, true, false, true>(p, view, plan, workspace, stream);
+    } else {
+        execute_grouped<CausalAppendInput, true, true, true, false, true>(
+            q, positions, scale, cache, &valid, &rows,
+            CausalAppendInput{static_cast<const __nv_bfloat16*>(k.data),
+                              static_cast<const __nv_bfloat16*>(v.data)},
+            plan, workspace, out, stream);
+    }
+}
+
+void rk4v2_e8_kv_cached_attention(const Tensor& q, const Tensor& positions, float scale,
+                                  const PagedKVLayerView& cache,
+                                  CausalAttentionExecutionEnvelope envelope,
+                                  MemoryArena& workspace, Tensor& out, CudaExecutionView execution) {
+    const cudaStream_t stream = execution.stream();
+    auto plan = select_int8_kv_causal_plan(q.ne[1], q.ne[2], 1, envelope,
+                                           execution.multiprocessor_count());
+    if (plan.family == Int8KvFamily::Tiled) plan.family = Int8KvFamily::ParallelGrouped;
+    const auto view = single_row_paged_kv_batch_view(cache);
+    if (plan.family == Int8KvFamily::ParallelGrouped)
+        execute_parallel<true, true, true, false, true>(
+            make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),
+            make_quantized_causal_cache_view<Int8KvCacheView<false>>(view), plan, workspace, stream);
+    else
+        execute_grouped<CausalCachedInput, true, true, true, false, true>(q, positions, scale, view, nullptr, nullptr,
+                                                     CausalCachedInput{}, plan, workspace, out,
+                                                     stream);
+}
+
 } // namespace ninfer::ops::detail

@@ -54,4 +54,29 @@ void rk4v4_e8_kv_cached_attention(const Tensor& q, const Tensor& positions, floa
                                   CausalAttentionExecutionEnvelope envelope,
                                   MemoryArena& workspace, Tensor& out, CudaExecutionView execution);
 
+
+// port (sm_89): rk2v4-e8 = E8-cylinder key plane (64 B) + packed int4 value plane.
+void rk2v4_e8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                                  const Tensor& positions, const Tensor& valid,
+                                  const Tensor& rows, float scale, PagedKVBatchLayerView cache,
+                                  CausalAttentionExecutionEnvelope envelope, MemoryArena& workspace,
+                                  Tensor& out, CudaExecutionView execution);
+
+void rk2v4_e8_kv_cached_attention(const Tensor& q, const Tensor& positions, float scale,
+                                  const PagedKVLayerView& cache,
+                                  CausalAttentionExecutionEnvelope envelope,
+                                  MemoryArena& workspace, Tensor& out, CudaExecutionView execution);
+
+// port (sm_89): rk4v2-e8 = E8-lattice key plane (96 B) + E8-cylinder value plane (64 B).
+void rk4v2_e8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                                  const Tensor& positions, const Tensor& valid,
+                                  const Tensor& rows, float scale, PagedKVBatchLayerView cache,
+                                  CausalAttentionExecutionEnvelope envelope, MemoryArena& workspace,
+                                  Tensor& out, CudaExecutionView execution);
+
+void rk4v2_e8_kv_cached_attention(const Tensor& q, const Tensor& positions, float scale,
+                                  const PagedKVLayerView& cache,
+                                  CausalAttentionExecutionEnvelope envelope,
+                                  MemoryArena& workspace, Tensor& out, CudaExecutionView execution);
+
 } // namespace ninfer::ops::detail

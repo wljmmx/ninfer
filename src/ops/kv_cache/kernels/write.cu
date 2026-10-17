@@ -112,6 +112,12 @@ void launch_instance(PagedWriteInstance instance, const WriteArguments& a, Metad
     } else if constexpr (Storage == KvCacheStorage::RK4V4E8) {
         // rk4v4-e8: E8-lattice key carrier (96 B plane) + packed int4 V.
         return launch_rk_storage<G, true, true, false, false>(a, metadata, stream);
+    } else if constexpr (Storage == KvCacheStorage::RK2V4E8) {
+        // rk2v4-e8: E8-cylinder key carrier (64 B plane) + packed int4 V.
+        return launch_rk_storage<G, false, false, true, false>(a, metadata, stream);
+    } else if constexpr (Storage == KvCacheStorage::RK4V2E8) {
+        // rk4v2-e8: E8-lattice key carrier + E8-cylinder V.
+        return launch_rk_storage<G, true, true, false, true>(a, metadata, stream);
     } else if constexpr (Storage == KvCacheStorage::BFloat16) {
         if (a.batch != 1 ||
             (instance != PagedWriteInstance::Copy96 && instance != PagedWriteInstance::Copy128))
@@ -162,6 +168,10 @@ void storage_dispatch(KvCacheStorage storage, PagedWriteInstance instance, const
                                                                                  metadata, stream);
     case KvCacheStorage::RK4V4E8:
         return launch_instance<KvCacheStorage::RK4V4E8, G>(instance, a, metadata, stream);
+    case KvCacheStorage::RK2V4E8:
+        return launch_instance<KvCacheStorage::RK2V4E8, G>(instance, a, metadata, stream);
+    case KvCacheStorage::RK4V2E8:
+        return launch_instance<KvCacheStorage::RK4V2E8, G>(instance, a, metadata, stream);
     case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
         return launch_instance<KvCacheStorage::RotatedInt4KeyInt4ValueGroup64, G>(instance, a,
                                                                                  metadata, stream);

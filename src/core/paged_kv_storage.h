@@ -107,6 +107,26 @@ struct PagedKVStorageLayout {
                     {DType::U8, 128, DType::FP16, 4}};
         }
         break;
+    case KvCacheStorage::RK2V4E8:
+        // rk2v4-e8: 64 B key plane - one E8 cylinder byte pair per 8D subspace, no
+        // residual; packed int4 V. G64 FP16 scales.
+        if (head_dim == kD256KVCacheHeadDim) {
+            return {storage,
+                    head_dim,
+                    {DType::U8, 64, DType::FP16, 4},
+                    {DType::U8, 128, DType::FP16, 4}};
+        }
+        break;
+    case KvCacheStorage::RK4V2E8:
+        // rk4v2-e8: the rk4v4-e8 key carrier (96 B) with both planes reduced to E8
+        // cylinders: the value plane is 64 B, same pair layout as the key.
+        if (head_dim == kD256KVCacheHeadDim) {
+            return {storage,
+                    head_dim,
+                    {DType::U8, 96, DType::FP16, 4},
+                    {DType::U8, 64, DType::FP16, 4}};
+        }
+        break;
     case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
         // rk4v4: both planes packed 4-bit (two dims per byte), G64 FP16 scales.
         if (head_dim == kD256KVCacheHeadDim) {
