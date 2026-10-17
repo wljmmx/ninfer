@@ -109,8 +109,19 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     const auto start   = Clock::now();
     const auto initial = device_memory_snapshot(device.device());
     const auto limit   = device_budget(initial.free_bytes);
+    // port (sm_89): the 1024 MiB default headroom exists so that *automatic* KV sizing has slack
+    // to grow into. An explicit request already states the whole capacity, and validate_options()
+    // rejects an explicit policy that carries automatic headroom, so charging the default here just
+    // removes 1 GiB from every budget for no reason.
+    //
+    // On this machine that 1 GiB is the difference between resident and offloaded weights: the
+    // 19.6 GiB MoE artifact fits the 4090 with ~700 MiB to spare, but with the headroom charged the
+    // first resident candidate is rejected, build_model() falls back to CPU expert offload, and
+    // decode drops from 175.3 tok/s (release line, resident) to 66.3 tok/s (offload).
     const auto headroom =
-        std::max(kDefaultKvCapacityHeadroomBytes, options.kv_capacity.automatic_headroom_bytes);
+        options.kv_capacity.mode == KvCapacityMode::Automatic
+            ? std::max(kDefaultKvCapacityHeadroomBytes, options.kv_capacity.automatic_headroom_bytes)
+            : std::size_t{0};
     StartupMemoryBudget budget(initial, limit, headroom);
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     artifact::Reader reader(options.artifact_path);
