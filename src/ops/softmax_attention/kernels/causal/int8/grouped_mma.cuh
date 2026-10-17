@@ -1,5 +1,8 @@
 #pragma once
 #include "ops/common/quant/integer.cuh"
+// port (sm_89): the packed intent4 value plane (rk8v4/rk4v4/rk4v4-e8/rk2v4-e8) reuses the
+// int4 pack/unpack helpers carried over from the earlier implementation.
+#include "ops/kv_cache/rk4_codec.cuh"
 #include "ops/kv_cache/kernels/hadamard.cuh"
 #include "ops/kv_cache/kernels/layout.cuh"
 #include "ops/softmax_attention/kernels/causal/tile_io.cuh"
@@ -14,7 +17,7 @@ namespace ninfer::ops::detail {
 // Native INT8 QK accumulates each G64 group in INT32, then applies Q/K scales in FP32.
 // PV dequantizes represented V to FP16 and accumulates in FP32.
 template <class Geometry, class Schedule, bool MultiBatch, bool Masked, class CacheInput,
-          bool ParallelQueries = false>
+          bool ParallelQueries = false, bool PackedV = false>
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     void int8_kv_grouped_mma_kernel(
         const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos,
@@ -186,23 +189,50 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             vamax              = common::warp_max(vamax, FullMask);
             const auto k_quant = common::int8_fp16_scale(kamax);
             const auto v_quant = common::int8_fp16_scale(vamax);
+            // port (sm_89): the int4 plane holds [-7, 7], so its scale is absmax/7 rather than the
+            // int8 absmax/127; the same __half slot carries it.
+            __half v_scale    = v_quant.scale;
+            float v_inv_scale = v_quant.inverse_scale;
+            if constexpr (PackedV) {
+                v_scale             = rk4_absmax_to_scale_h(vamax);
+                const float carried = __half2float(v_scale);
+                v_inv_scale         = carried > 0.0f ? 1.0f / carried : 0.0f;
+            }
             cache_k_i8[kv::Int8G64Layout<Geometry::KVHeads>::code_offset(physical_page, kv_head, d0,
                                                                          page_offset)] =
                 common::int8_quant_code(kv0, k_quant.inverse_scale);
             cache_k_i8[kv::Int8G64Layout<Geometry::KVHeads>::code_offset(physical_page, kv_head, d1,
                                                                          page_offset)] =
                 common::int8_quant_code(kv1, k_quant.inverse_scale);
-            cache_v_i8[kv::Int8G64Layout<Geometry::KVHeads>::code_offset(physical_page, kv_head, d0,
-                                                                         page_offset)] =
-                common::int8_quant_code(vv0, v_quant.inverse_scale);
-            cache_v_i8[kv::Int8G64Layout<Geometry::KVHeads>::code_offset(physical_page, kv_head, d1,
-                                                                         page_offset)] =
-                common::int8_quant_code(vv1, v_quant.inverse_scale);
+            if constexpr (PackedV) {
+                // One byte carries dims (d, d+1), so an even lane needs its odd neighbour's value.
+                // The shuffles must run on every lane - they sit outside the even-lane guard on purpose.
+                const float vv0_next = __shfl_xor_sync(FullMask, vv0, 1);
+                const float vv1_next = __shfl_xor_sync(FullMask, vv1, 1);
+                if ((lane & 1) == 0) {
+                    cache_v_i8[rk4_v_code_index<Geometry>(physical_page, kv_head, d0 >> 1,
+                                                          page_offset)] =
+                        static_cast<std::int8_t>(rk4_pack(rk4_quant_code(vv0, v_inv_scale),
+                                                          rk4_quant_code(vv0_next, v_inv_scale)));
+                    cache_v_i8[rk4_v_code_index<Geometry>(physical_page, kv_head, d1 >> 1,
+                                                          page_offset)] =
+                        static_cast<std::int8_t>(rk4_pack(rk4_quant_code(vv1, v_inv_scale),
+                                                          rk4_quant_code(vv1_next, v_inv_scale)));
+                }
+            } else {
+                cache_v_i8[kv::Int8G64Layout<Geometry::KVHeads>::code_offset(physical_page, kv_head,
+                                                                             d0, page_offset)] =
+                    common::int8_quant_code(vv0, v_quant.inverse_scale);
+                cache_v_i8[kv::Int8G64Layout<Geometry::KVHeads>::code_offset(physical_page, kv_head,
+                                                                             d1, page_offset)] =
+                    common::int8_quant_code(vv1, v_quant.inverse_scale);
+            }
             if (lane == 0) {
                 const std::int64_t so = kv::Int8G64Layout<Geometry::KVHeads>::scale_offset(
                     physical_page, kv_head, grp, page_offset);
                 cache_k_scale[so] = k_quant.scale;
-                cache_v_scale[so] = v_quant.scale;
+                // port (sm_89): v_scale is v_quant.scale unless PackedV, where it is the int4 absmax/7.
+                cache_v_scale[so] = v_scale;
             }
         }
         __syncthreads();
@@ -305,11 +335,22 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                     physical_page, kv_head, d, key & kv::kPageMask);
                 std::int8_t* dst = &k_i8[key_l * D + common::swizzle_xor_64(key_l, dc * 8) * 2];
                 common::cp_async<16>(dst, &cache_k_i8[off]);
-                common::cp_async<16>(&v_i8[key_l * D + d], &cache_v_i8[off]);
+                if constexpr (PackedV) {
+                    // 16 dims occupy 8 packed bytes at the half offset.
+                    const std::int64_t voff = rk4_v_code_index<Geometry>(
+                        physical_page, kv_head, d >> 1, key & kv::kPageMask);
+                    common::cp_async<8>(&v_i8[key_l * D + (d >> 1)], &cache_v_i8[voff]);
+                } else {
+                    common::cp_async<16>(&v_i8[key_l * D + d], &cache_v_i8[off]);
+                }
             } else {
                 std::int8_t* dst = &k_i8[key_l * D + common::swizzle_xor_64(key_l, dc * 8) * 2];
                 common::store_vec(dst, make_int4(0, 0, 0, 0));
-                common::store_vec(&v_i8[key_l * D + d], make_int4(0, 0, 0, 0));
+                if constexpr (PackedV) {
+                    common::store_vec(&v_i8[key_l * D + (d >> 1)], make_int2(0, 0));
+                } else {
+                    common::store_vec(&v_i8[key_l * D + d], make_int4(0, 0, 0, 0));
+                }
             }
         }
         common::cp_commit();
@@ -478,17 +519,36 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                     float vs      = 0.0f;
                     if ((lane & 7) == 0) { vs = __half2float(v_scale_s[key_l * Groups + grp]); }
                     vs                = __shfl_sync(FullMask, vs, grp * 8);
-                    const int2 raw    = common::load_vec<int2>(&v_i8[key_l * D + d]);
-                    const auto* codes = reinterpret_cast<const std::int8_t*>(&raw);
                     int4 values;
-                    values.x = common::pack_f16x2(static_cast<float>(codes[0]) * vs,
-                                                  static_cast<float>(codes[1]) * vs);
-                    values.y = common::pack_f16x2(static_cast<float>(codes[2]) * vs,
-                                                  static_cast<float>(codes[3]) * vs);
-                    values.z = common::pack_f16x2(static_cast<float>(codes[4]) * vs,
-                                                  static_cast<float>(codes[5]) * vs);
-                    values.w = common::pack_f16x2(static_cast<float>(codes[6]) * vs,
-                                                  static_cast<float>(codes[7]) * vs);
+                    if constexpr (PackedV) {
+                        // One 32-bit read covers 8 dims as 4 packed bytes; unpack both nibble planes
+                        // in parallel and interleave (byte k holds dims 2k, 2k+1).
+                        const std::uint32_t packed =
+                            *reinterpret_cast<const std::uint32_t*>(&v_i8[key_l * D + (d >> 1)]);
+                        const std::uint32_t lo    = rk4_unpack_lo_fast(packed);
+                        const std::uint32_t hi    = rk4_unpack_hi_fast(packed);
+                        const auto* lo8           = reinterpret_cast<const std::int8_t*>(&lo);
+                        const auto* hi8           = reinterpret_cast<const std::int8_t*>(&hi);
+                        values.x                  = common::pack_f16x2(
+                            static_cast<float>(lo8[0]) * vs, static_cast<float>(hi8[0]) * vs);
+                        values.y = common::pack_f16x2(static_cast<float>(lo8[1]) * vs,
+                                                     static_cast<float>(hi8[1]) * vs);
+                        values.z = common::pack_f16x2(static_cast<float>(lo8[2]) * vs,
+                                                     static_cast<float>(hi8[2]) * vs);
+                        values.w = common::pack_f16x2(static_cast<float>(lo8[3]) * vs,
+                                                     static_cast<float>(hi8[3]) * vs);
+                    } else {
+                        const int2 raw    = common::load_vec<int2>(&v_i8[key_l * D + d]);
+                        const auto* codes = reinterpret_cast<const std::int8_t*>(&raw);
+                        values.x = common::pack_f16x2(static_cast<float>(codes[0]) * vs,
+                                                      static_cast<float>(codes[1]) * vs);
+                        values.y = common::pack_f16x2(static_cast<float>(codes[2]) * vs,
+                                                      static_cast<float>(codes[3]) * vs);
+                        values.z = common::pack_f16x2(static_cast<float>(codes[4]) * vs,
+                                                      static_cast<float>(codes[5]) * vs);
+                        values.w = common::pack_f16x2(static_cast<float>(codes[6]) * vs,
+                                                      static_cast<float>(codes[7]) * vs);
+                    }
                     common::store_vec(dst, values);
                 } else {
                     common::store_vec(dst, make_int4(0, 0, 0, 0));
