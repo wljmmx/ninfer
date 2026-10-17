@@ -14,6 +14,7 @@ target_include_directories(ninfer_bench_fixtures_test PRIVATE ${PROJECT_SOURCE_D
 add_executable(ninfer_context_cost_measure_test
   "${CMAKE_CURRENT_LIST_DIR}/../test_context_cost_measure.cpp"
   ${PROJECT_SOURCE_DIR}/bench/context_cost/context_cost_measure.cpp)
+ninfer_deploy_runtime_dlls(ninfer_context_cost_measure_test)
 
 target_include_directories(ninfer_context_cost_measure_test PRIVATE
   ${PROJECT_SOURCE_DIR}/bench/context_cost)

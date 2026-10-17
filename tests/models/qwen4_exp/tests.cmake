@@ -1,4 +1,5 @@
 add_executable(ninfer_ple_disk_table_test "${CMAKE_CURRENT_LIST_DIR}/ple/disk/test_table.cpp")
+ninfer_deploy_runtime_dlls(ninfer_ple_disk_table_test)
 ninfer_test_includes(ninfer_ple_disk_table_test)
 target_link_libraries(ninfer_ple_disk_table_test PRIVATE ninfer_model_loading)
 add_test(NAME ninfer_ple_disk_table_test
@@ -7,6 +8,7 @@ add_test(NAME ninfer_ple_disk_table_test
 set_tests_properties(ninfer_ple_disk_table_test PROPERTIES TIMEOUT 30)
 
 add_executable(ninfer_ple_disk_prepare_test "${CMAKE_CURRENT_LIST_DIR}/ple/disk/test_prepare.cpp")
+ninfer_deploy_runtime_dlls(ninfer_ple_disk_prepare_test)
 ninfer_test_includes(ninfer_ple_disk_prepare_test)
 target_link_libraries(ninfer_ple_disk_prepare_test PRIVATE ninfer_model_runtime)
 target_link_options(ninfer_ple_disk_prepare_test PRIVATE "LINKER:--wrap=cudaEventRecord")

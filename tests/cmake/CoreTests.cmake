@@ -1,6 +1,7 @@
 # This target deliberately receives no src/, CUDA, artifact, kernel, or target
 # include root. It proves that the public product headers stand alone.
 add_executable(ninfer_public_api_test "${CMAKE_CURRENT_LIST_DIR}/../test_public_api.cpp")
+ninfer_deploy_runtime_dlls(ninfer_public_api_test)
 target_include_directories(ninfer_public_api_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
 add_test(NAME ninfer_public_api_test COMMAND ninfer_public_api_test)
 

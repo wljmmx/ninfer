@@ -1,3 +1,4 @@
 add_executable(ninfer_ple_disk_prepare_bench "${CMAKE_CURRENT_LIST_DIR}/ple/disk_prepare.cpp")
+ninfer_deploy_runtime_dlls(ninfer_ple_disk_prepare_bench)
 ninfer_internal_includes(ninfer_ple_disk_prepare_bench)
 target_link_libraries(ninfer_ple_disk_prepare_bench PRIVATE ninfer_model_runtime)

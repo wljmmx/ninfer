@@ -5,6 +5,7 @@ add_executable(ninfer_context_cost_bench
   "${CMAKE_CURRENT_LIST_DIR}/context_cost_bench.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/context_cost_measure.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/model_context_fixture.cpp")
+ninfer_deploy_runtime_dlls(ninfer_context_cost_bench)
 ninfer_internal_includes(ninfer_context_cost_bench)
 target_include_directories(ninfer_context_cost_bench PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}
