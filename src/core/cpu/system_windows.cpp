@@ -2,8 +2,9 @@
 // upstream implements with hwloc + <cpuid.h>. Same header, same semantics; upstream's Linux file is
 // left untouched so merges stay mechanical. The Windows side uses:
 //   * hwloc discovery      -> GetLogicalProcessorInformationEx (RelationProcessorCore/RelationCache)
-//   * hwloc allowed cpuset -> GetProcessAffinityMask
-//   * hwloc_set_cpubind    -> SetThreadAffinityMask
+//   * hwloc allowed cpuset -> GetThreadGroupAffinity  (per-thread, like sched_getaffinity(0);
+//                             the process mask is a superset and would hide a bind)
+//   * hwloc_set_cpubind    -> SetThreadGroupAffinity
 //   * __get_cpuid/xgetbv   -> MSVC __cpuid/__cpuidex + _xgetbv
 // The shared parts (worker startup, feature decoding, ordering helpers) are intentionally identical
 // to the Linux implementation so the two cannot drift.
@@ -33,14 +34,15 @@ namespace {
     throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), operation);
 }
 
-// A snapshot limited to this process's affinity mask, like hwloc's allowed cpuset.
-CpuAffinity process_affinity() {
-    DWORD_PTR process_mask = 0, system_mask = 0;
-    if (!GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask))
-        fail("read process affinity");
+// The calling thread's CPU set, the Windows analogue of sched_getaffinity(0). A thread's affinity
+// is one processor group plus a mask, so global CPU ids are group * 64 + bit.
+CpuAffinity thread_affinity() {
+    GROUP_AFFINITY affinity{};
+    if (!GetThreadGroupAffinity(GetCurrentThread(), &affinity)) fail("read thread affinity");
     CpuAffinity result;
-    for (unsigned cpu = 0; cpu < sizeof(DWORD_PTR) * 8; ++cpu)
-        if (process_mask & (static_cast<DWORD_PTR>(1) << cpu)) result.push_back(cpu);
+    for (unsigned bit = 0; bit < sizeof(KAFFINITY) * 8; ++bit)
+        if (affinity.Mask & (static_cast<KAFFINITY>(1) << bit))
+            result.push_back(static_cast<std::uint32_t>(affinity.Group) * 64U + bit);
     return result;
 }
 
@@ -52,7 +54,7 @@ struct CpuTopology::Impl {
 
 CpuTopology::CpuTopology() : impl_(std::make_unique<Impl>()) {
     auto& info         = impl_->info;
-    const auto allowed = process_affinity();
+    const auto allowed = thread_affinity();
     if (allowed.empty()) throw std::runtime_error("no available CPUs");
 
     DWORD length = 0;
@@ -93,16 +95,20 @@ CpuTopology::CpuTopology() : impl_(std::make_unique<Impl>()) {
         const auto* entry =
             reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + offset);
         if (entry->Relationship == RelationProcessorCore) {
-            const KAFFINITY mask = entry->Processor.GroupMask[0].Mask;
-            for (unsigned cpu = 0; cpu < sizeof(KAFFINITY) * 8; ++cpu) {
-                if (!(mask & (static_cast<KAFFINITY>(1) << cpu))) continue;
-                if (std::find(allowed.begin(), allowed.end(), cpu) == allowed.end()) continue;
-                if (!seen.insert(cpu).second) continue;
-                CpuProcessor processor{.cpu = cpu};
-                processor.core = core_index;
-                // Like hwloc's deepest data cache: the last-level cache this processor belongs to.
-                if (!info.caches.empty()) processor.cache = deepest;
-                info.processors.push_back(processor);
+            for (WORD group_index = 0; group_index < entry->Processor.GroupCount; ++group_index) {
+                const auto group    = entry->Processor.GroupMask[group_index].Group;
+                const KAFFINITY mask = entry->Processor.GroupMask[group_index].Mask;
+                for (unsigned bit = 0; bit < sizeof(KAFFINITY) * 8; ++bit) {
+                    if (!(mask & (static_cast<KAFFINITY>(1) << bit))) continue;
+                    const auto cpu = static_cast<std::uint32_t>(group) * 64U + bit;
+                    if (std::find(allowed.begin(), allowed.end(), cpu) == allowed.end()) continue;
+                    if (!seen.insert(cpu).second) continue;
+                    CpuProcessor processor{.cpu = cpu};
+                    processor.core = core_index;
+                    // Like hwloc's deepest data cache: the last-level cache this processor is in.
+                    if (!info.caches.empty()) processor.cache = deepest;
+                    info.processors.push_back(processor);
+                }
             }
             ++core_index;
         }
@@ -117,7 +123,7 @@ CpuTopology::~CpuTopology() = default;
 
 const CpuTopologyInfo& CpuTopology::info() const noexcept { return impl_->info; }
 
-CpuAffinity current_thread_affinity(const CpuTopology&) { return process_affinity(); }
+CpuAffinity current_thread_affinity(const CpuTopology&) { return thread_affinity(); }
 
 void validate_cpu_affinity(const CpuTopologyInfo& topology, std::span<const std::uint32_t> cpus) {
     if (cpus.empty()) throw std::invalid_argument("CPU affinity must not be empty");
@@ -134,10 +140,15 @@ void bind_current_thread(const CpuTopology& topology, std::span<const std::uint3
     validate_cpu_affinity(topology.info(), cpus);
     if (cpus.size() > sizeof(DWORD_PTR) * 8)
         throw std::invalid_argument("CPU affinity set is too large");
-    DWORD_PTR mask = 0;
-    for (const auto cpu : cpus) mask |= static_cast<DWORD_PTR>(1) << cpu;
-    // Windows grants a thread mask only within the process mask, which is what discovery captured.
-    if (!SetThreadAffinityMask(GetCurrentThread(), mask)) fail("bind CPU thread");
+    // A thread belongs to one processor group, so an affinity set may not straddle groups.
+    GROUP_AFFINITY affinity{};
+    affinity.Group = cpus.front() / 64U;
+    for (const auto cpu : cpus) {
+        if (cpu / 64U != affinity.Group)
+            throw std::invalid_argument("CPU affinity must stay within one processor group");
+        affinity.Mask |= static_cast<KAFFINITY>(1) << (cpu % 64U);
+    }
+    if (!SetThreadGroupAffinity(GetCurrentThread(), &affinity, nullptr)) fail("bind CPU thread");
 }
 
 CpuAffinity cpu_worker_order(const CpuTopologyInfo& topology, bool use_smt) {
