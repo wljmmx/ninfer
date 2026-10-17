@@ -3,6 +3,10 @@
 // port (sm_89): the packed intent4 value plane (rk8v4/rk4v4/rk4v4-e8/rk2v4-e8) reuses the
 // int4 pack/unpack helpers carried over from the earlier implementation.
 #include "ops/kv_cache/rk4_codec.cuh"
+// port (sm_89): the E8 carriers (rk4v4-e8 / rk2v4-e8 / rk4v2-e8) use the same codec the append
+// kernel already carries; only the fused attention kernel was missing it.
+#include "ops/kernel/e8_lattice.cuh"
+#include "ops/kernel/e8_root_codec.cuh"
 #include "ops/kv_cache/kernels/hadamard.cuh"
 #include "ops/kv_cache/kernels/layout.cuh"
 #include "ops/softmax_attention/kernels/causal/tile_io.cuh"
@@ -17,7 +21,8 @@ namespace ninfer::ops::detail {
 // Native INT8 QK accumulates each G64 group in INT32, then applies Q/K scales in FP32.
 // PV dequantizes represented V to FP16 and accumulates in FP32.
 template <class Geometry, class Schedule, bool MultiBatch, bool Masked, class CacheInput,
-          bool ParallelQueries = false, bool PackedV = false, bool PackedK = false>
+          bool ParallelQueries = false, bool PackedV = false, bool PackedK = false,
+          bool E8Lattice = false, bool E8Root = false, bool V8Root = false>
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     void int8_kv_grouped_mma_kernel(
         const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos,
@@ -59,6 +64,13 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     static_assert(Wc % RowTiles == 0);
     static_assert(PVNtPerWarp == 2 || PVNtPerWarp == 4 || PVNtPerWarp == 8 || PVNtPerWarp == 16);
     static_assert(QKKs == Groups * GroupKc);
+    // port (sm_89): the E8 carriers are mutually exclusive where they overlap, and the lattice
+    // carrier always rides on the packed int4 key plane (that is what its 96-byte extent and the
+    // [64,96) residual-sign window assume).
+    static_assert(!(E8Lattice && E8Root), "E8 key carriers are exclusive");
+    static_assert(!E8Lattice || PackedK, "the E8-lattice key rides on the packed int4 plane");
+    static_assert(!(E8Lattice && kRkE8KAmplitudeOn),
+                  "the amplitude carrier needs a 128-byte key plane; no layout provides one");
 
     // Keep Q in a compact dedicated tile so the producer can reload one
     // 64-dimension group at a time instead of carrying all eight fragments in
@@ -193,7 +205,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             // int8 absmax/127; the same __half slot carries it.
             __half v_scale    = v_quant.scale;
             float v_inv_scale = v_quant.inverse_scale;
-            if constexpr (PackedV) {
+            if constexpr (PackedV || V8Root) {
                 v_scale             = rk4_absmax_to_scale_h(vamax);
                 const float carried = __half2float(v_scale);
                 v_inv_scale         = carried > 0.0f ? 1.0f / carried : 0.0f;
@@ -201,24 +213,104 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             // port (sm_89): same convention for the packed key plane.
             __half k_scale    = k_quant.scale;
             float k_inv_scale = k_quant.inverse_scale;
-            if constexpr (PackedK) {
+            if constexpr (PackedK || E8Root) {
                 k_scale             = rk4_absmax_to_scale_h(kamax);
                 const float carried = __half2float(k_scale);
                 k_inv_scale         = carried > 0.0f ? 1.0f / carried : 0.0f;
             }
-            if constexpr (PackedK) {
-                // One byte carries dims (d, d+1); the shuffles must run on every lane.
-                const float kv0_next = __shfl_xor_sync(FullMask, kv0, 1);
-                const float kv1_next = __shfl_xor_sync(FullMask, kv1, 1);
-                if ((lane & 1) == 0) {
-                    cache_k_i8[rk4_v_code_index<Geometry>(physical_page, kv_head, d0 >> 1,
-                                                          page_offset)] =
-                        static_cast<std::int8_t>(rk4_pack(rk4_quant_code(kv0, k_inv_scale),
-                                                          rk4_quant_code(kv0_next, k_inv_scale)));
-                    cache_k_i8[rk4_v_code_index<Geometry>(physical_page, kv_head, d1 >> 1,
-                                                          page_offset)] =
-                        static_cast<std::int8_t>(rk4_pack(rk4_quant_code(kv1, k_inv_scale),
-                                                          rk4_quant_code(kv1_next, k_inv_scale)));
+            // port (sm_89): the lattice carrier stores its group scale divided by the residual grid
+            // (see rk4_codec.cuh), because the decoded code unit is already scaled by that grid.
+            __half k_scale_out = k_scale;
+            if constexpr (E8Lattice && kRkE8KResidualOn) {
+                k_scale_out = __float2half_rn(__half2float(k_scale) /
+                                              static_cast<float>(kRkE8KFracGrid));
+            }
+            if constexpr (E8Root) {
+                // rk2v4-e8 key: one (root, rad_axis) byte pair per 8D subspace, 16 B per G64 group
+                // (a 64 B plane per token-head). The group scale is absmax/7, which keeps the radius
+                // index centred in the codec's log-radius table instead of saturating it.
+                const float ks = __half2float(k_scale);
+                uint8_t root0, rad0, root1, rad1;
+                e8_encode_cylinder_8d_warp(kv0, ks, root0, rad0, lane);
+                e8_encode_cylinder_8d_warp(kv1, ks, root1, rad1, lane);
+                if ((lane & 7) == 0) {
+                    const int s0 = lane >> 3;
+                    const int s1 = 4 + (lane >> 3);
+                    const std::int64_t ko0 = paged_kv_element_offset<64, Geometry::KVHeads>(
+                        physical_page, kv_head, page_offset, (grp * 8 + s0) * 2);
+                    *reinterpret_cast<std::uint16_t*>(&cache_k_i8[ko0]) =
+                        static_cast<std::uint16_t>(root0 | (rad0 << 8));
+                    const std::int64_t ko1 = paged_kv_element_offset<64, Geometry::KVHeads>(
+                        physical_page, kv_head, page_offset, (grp * 8 + s1) * 2);
+                    *reinterpret_cast<std::uint16_t*>(&cache_k_i8[ko1]) =
+                        static_cast<std::uint16_t>(root1 | (rad1 << 8));
+                }
+            } else if constexpr (PackedK) {
+                if constexpr (E8Lattice) {
+                    // rk4v4-e8 / rk4v2-e8 key: E8-cylinder byte pair in [0,64) plus one residual
+                    // sign byte per 8D subspace in [64,96). The sign is the direction of the
+                    // code-unit residual, so read-back is exactly grid*code +- theta.
+                    const float ks = __half2float(k_scale);
+                    uint8_t root0, rad0, root1, rad1;
+                    e8_encode_cylinder_8d_warp(kv0, ks, root0, rad0, lane);
+                    e8_encode_cylinder_8d_warp(kv1, ks, root1, rad1, lane);
+                    __align__(8) int8_t dec0[8];
+                    __align__(8) int8_t dec1[8];
+                    e8_root_decode_8d_fast(root0, rad0, dec0);
+                    e8_root_decode_8d_fast(root1, rad1, dec1);
+                    const bool up0 = kv0 / ks >= static_cast<float>(dec0[lane & 7]);
+                    const bool up1 = kv1 / ks >= static_cast<float>(dec1[lane & 7]);
+                    const std::uint32_t ballot0 = __ballot_sync(FullMask, up0);
+                    const std::uint32_t ballot1 = __ballot_sync(FullMask, up1);
+                    if ((lane & 7) == 0) {
+                        const int s0 = lane >> 3;
+                        const int s1 = 4 + (lane >> 3);
+                        const std::int64_t ko0 =
+                            paged_kv_element_offset<kRkE8KLatticeExtent, Geometry::KVHeads>(
+                                physical_page, kv_head, page_offset, (grp * 8 + s0) * 2);
+                        *reinterpret_cast<std::uint16_t*>(&cache_k_i8[ko0]) =
+                            static_cast<std::uint16_t>(root0 | (rad0 << 8));
+                        const std::int64_t ko1 =
+                            paged_kv_element_offset<kRkE8KLatticeExtent, Geometry::KVHeads>(
+                                physical_page, kv_head, page_offset, (grp * 8 + s1) * 2);
+                        *reinterpret_cast<std::uint16_t*>(&cache_k_i8[ko1]) =
+                            static_cast<std::uint16_t>(root1 | (rad1 << 8));
+                    }
+                    if (lane == 0) {
+                        // One byte per subspace: subspace s of the group sits at 64 + grp*8 + s.
+                        const std::uint32_t sb00 = ballot0 & 0xffu;
+                        const std::uint32_t sb01 = (ballot0 >> 8) & 0xffu;
+                        const std::uint32_t sb02 = (ballot0 >> 16) & 0xffu;
+                        const std::uint32_t sb03 = (ballot0 >> 24) & 0xffu;
+                        const std::int64_t so0 =
+                            paged_kv_element_offset<kRkE8KLatticeExtent, Geometry::KVHeads>(
+                                physical_page, kv_head, page_offset, 64 + grp * 8);
+                        *reinterpret_cast<std::uint32_t*>(&cache_k_i8[so0]) =
+                            sb00 | (sb01 << 8) | (sb02 << 16) | (sb03 << 24);
+                        const std::uint32_t sb10 = ballot1 & 0xffu;
+                        const std::uint32_t sb11 = (ballot1 >> 8) & 0xffu;
+                        const std::uint32_t sb12 = (ballot1 >> 16) & 0xffu;
+                        const std::uint32_t sb13 = (ballot1 >> 24) & 0xffu;
+                        const std::int64_t so1 =
+                            paged_kv_element_offset<kRkE8KLatticeExtent, Geometry::KVHeads>(
+                                physical_page, kv_head, page_offset, 64 + grp * 8 + 4);
+                        *reinterpret_cast<std::uint32_t*>(&cache_k_i8[so1]) =
+                            sb10 | (sb11 << 8) | (sb12 << 16) | (sb13 << 24);
+                    }
+                } else {
+                    // One byte carries dims (d, d+1); the shuffles must run on every lane.
+                    const float kv0_next = __shfl_xor_sync(FullMask, kv0, 1);
+                    const float kv1_next = __shfl_xor_sync(FullMask, kv1, 1);
+                    if ((lane & 1) == 0) {
+                        cache_k_i8[rk4_v_code_index<Geometry>(physical_page, kv_head, d0 >> 1,
+                                                              page_offset)] =
+                            static_cast<std::int8_t>(rk4_pack(rk4_quant_code(kv0, k_inv_scale),
+                                                              rk4_quant_code(kv0_next, k_inv_scale)));
+                        cache_k_i8[rk4_v_code_index<Geometry>(physical_page, kv_head, d1 >> 1,
+                                                              page_offset)] =
+                            static_cast<std::int8_t>(rk4_pack(rk4_quant_code(kv1, k_inv_scale),
+                                                              rk4_quant_code(kv1_next, k_inv_scale)));
+                    }
                 }
             } else {
                 cache_k_i8[kv::Int8G64Layout<Geometry::KVHeads>::code_offset(physical_page, kv_head,
@@ -228,7 +320,26 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                                                                              d1, page_offset)] =
                     common::int8_quant_code(kv1, k_quant.inverse_scale);
             }
-            if constexpr (PackedV) {
+            if constexpr (V8Root) {
+                // rk4v2-e8 value: the same 2-bit E8 cylinder as the rk2v4-e8 key, but V is NOT
+                // Hadamard-rotated (the PV MMA output goes straight to the residual stream).
+                const float vs = __half2float(v_scale);
+                uint8_t vr0, vra0, vr1, vra1;
+                e8_encode_cylinder_8d_warp(vv0, vs, vr0, vra0, lane);
+                e8_encode_cylinder_8d_warp(vv1, vs, vr1, vra1, lane);
+                if ((lane & 7) == 0) {
+                    const int s0 = lane >> 3;
+                    const int s1 = 4 + (lane >> 3);
+                    const std::int64_t vo0 = paged_kv_element_offset<64, Geometry::KVHeads>(
+                        physical_page, kv_head, page_offset, (grp * 8 + s0) * 2);
+                    *reinterpret_cast<std::uint16_t*>(&cache_v_i8[vo0]) =
+                        static_cast<std::uint16_t>(vr0 | (vra0 << 8));
+                    const std::int64_t vo1 = paged_kv_element_offset<64, Geometry::KVHeads>(
+                        physical_page, kv_head, page_offset, (grp * 8 + s1) * 2);
+                    *reinterpret_cast<std::uint16_t*>(&cache_v_i8[vo1]) =
+                        static_cast<std::uint16_t>(vr1 | (vra1 << 8));
+                }
+            } else if constexpr (PackedV) {
                 // One byte carries dims (d, d+1), so an even lane needs its odd neighbour's value.
                 // The shuffles must run on every lane - they sit outside the even-lane guard on purpose.
                 const float vv0_next = __shfl_xor_sync(FullMask, vv0, 1);
@@ -254,8 +365,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             if (lane == 0) {
                 const std::int64_t so = kv::Int8G64Layout<Geometry::KVHeads>::scale_offset(
                     physical_page, kv_head, grp, page_offset);
-                // port (sm_89): k_scale is k_quant.scale unless PackedK (int4 absmax/7).
-                cache_k_scale[so] = k_scale;
+                // port (sm_89): k_scale is k_quant.scale unless PackedK/E8Root (absmax/7), and the
+                // lattice carrier further divides by its residual grid (k_scale_out).
+                cache_k_scale[so] = k_scale_out;
                 // port (sm_89): v_scale is v_quant.scale unless PackedV, where it is the int4 absmax/7.
                 cache_v_scale[so] = v_scale;
             }
@@ -359,7 +471,56 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 const std::int64_t off = kv::Int8G64Layout<Geometry::KVHeads>::code_offset(
                     physical_page, kv_head, d, key & kv::kPageMask);
                 std::int8_t* dst = &k_i8[key_l * D + common::swizzle_xor_64(key_l, dc * 8) * 2];
-                if constexpr (PackedK) {
+                if constexpr (E8Root) {
+                    // rk2v4-e8 key read-back: this 16-dim chunk spans two consecutive 8D subspaces,
+                    // i.e. 4 plane bytes at byte offset (grp*8 + sub)*2. One 32-bit load, two E8
+                    // decodes, and all 16 int8 codes land in the swizzled smem slot the ldmatrix
+                    // B-fragment reads (the same slot the int8 cp_async path fills).
+                    const int sub         = (d / 8) & 7;
+                    const int byte_offset = ((d / 64) * 8 + sub) * 2;
+                    const std::int64_t koff = paged_kv_element_offset<64, Geometry::KVHeads>(
+                        physical_page, kv_head, key & kv::kPageMask, byte_offset);
+                    const std::uint32_t raw =
+                        *reinterpret_cast<const std::uint32_t*>(&cache_k_i8[koff]);
+                    __align__(8) int8_t dec0[8];
+                    __align__(8) int8_t dec1[8];
+                    e8_root_decode_8d_fast(static_cast<uint8_t>(raw), static_cast<uint8_t>(raw >> 8),
+                                           dec0);
+                    e8_root_decode_8d_fast(static_cast<uint8_t>(raw >> 16),
+                                           static_cast<uint8_t>(raw >> 24), dec1);
+                    *reinterpret_cast<std::uint64_t*>(dst) =
+                        *reinterpret_cast<const std::uint64_t*>(dec0);
+                    *reinterpret_cast<std::uint64_t*>(dst + 8) =
+                        *reinterpret_cast<const std::uint64_t*>(dec1);
+                } else if constexpr (PackedK && E8Lattice) {
+                    // rk4v4-e8 / rk4v2-e8 key read-back: 4 code bytes at (grp*8 + sub)*2 plus the
+                    // residual sign byte of each of the two subspaces, at plane offset 64 + sub.
+                    // The signs of subspace sub and sub+1 are adjacent bytes, so one 16-bit load
+                    // covers the whole chunk (sub is even because d is a multiple of 16).
+                    const int subidx = (d / 64) * 8 + ((d / 8) & 7);
+                    const std::int64_t koff =
+                        paged_kv_element_offset<kRkE8KLatticeExtent, Geometry::KVHeads>(
+                            physical_page, kv_head, key & kv::kPageMask, subidx * 2);
+                    const std::uint32_t raw =
+                        *reinterpret_cast<const std::uint32_t*>(&cache_k_i8[koff]);
+                    const std::uint16_t signs =
+                        *reinterpret_cast<const std::uint16_t*>(&cache_k_i8[koff + 64 - subidx]);
+                    __align__(8) int8_t dec[8];
+                    e8_root_decode_8d_fast(static_cast<uint8_t>(raw), static_cast<uint8_t>(raw >> 8),
+                                           dec);
+                    if constexpr (kRkE8KResidualOn) {
+                        rk4_apply_e8_residual(dec, static_cast<std::uint32_t>(signs & 0xffu));
+                    }
+                    *reinterpret_cast<std::uint64_t*>(dst) =
+                        *reinterpret_cast<const std::uint64_t*>(dec);
+                    e8_root_decode_8d_fast(static_cast<uint8_t>(raw >> 16),
+                                           static_cast<uint8_t>(raw >> 24), dec);
+                    if constexpr (kRkE8KResidualOn) {
+                        rk4_apply_e8_residual(dec, static_cast<std::uint32_t>(signs >> 8));
+                    }
+                    *reinterpret_cast<std::uint64_t*>(dst + 8) =
+                        *reinterpret_cast<const std::uint64_t*>(dec);
+                } else if constexpr (PackedK) {
                     // The QK MMA consumes int8, so the packed key is expanded here, straight into the
                     // swizzled slot the ldmatrix B-fragment reads (the int8 cp_async path fills the
                     // same 16-byte chunk, so the unpack must not bypass the swizzle).
@@ -382,7 +543,27 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 } else {
                     common::cp_async<16>(dst, &cache_k_i8[off]);
                 }
-                if constexpr (PackedV) {
+                if constexpr (V8Root) {
+                    // rk4v2-e8 value read-back: same two-subspace chunk, 4 plane bytes. The V
+                    // dequant reads codes UNswizzled at v_i8[key_l*D + d], so decode straight there.
+                    const int sub         = (d / 8) & 7;
+                    const int byte_offset = ((d / 64) * 8 + sub) * 2;
+                    const std::int64_t voff = paged_kv_element_offset<64, Geometry::KVHeads>(
+                        physical_page, kv_head, key & kv::kPageMask, byte_offset);
+                    const std::uint32_t raw =
+                        *reinterpret_cast<const std::uint32_t*>(&cache_v_i8[voff]);
+                    __align__(8) int8_t vdec0[8];
+                    __align__(8) int8_t vdec1[8];
+                    // The V plane uses the codec's calibrated radius centre.
+                    e8_root_decode_8d_fast_v(static_cast<uint8_t>(raw),
+                                             static_cast<uint8_t>(raw >> 8), vdec0);
+                    e8_root_decode_8d_fast_v(static_cast<uint8_t>(raw >> 16),
+                                             static_cast<uint8_t>(raw >> 24), vdec1);
+                    *reinterpret_cast<std::uint64_t*>(&v_i8[key_l * D + d]) =
+                        *reinterpret_cast<const std::uint64_t*>(vdec0);
+                    *reinterpret_cast<std::uint64_t*>(&v_i8[key_l * D + d + 8]) =
+                        *reinterpret_cast<const std::uint64_t*>(vdec1);
+                } else if constexpr (PackedV) {
                     // 16 dims occupy 8 packed bytes at the half offset.
                     const std::int64_t voff = rk4_v_code_index<Geometry>(
                         physical_page, kv_head, d >> 1, key & kv::kPageMask);

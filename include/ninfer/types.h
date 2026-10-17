@@ -38,6 +38,8 @@ enum class KvCacheStorage : std::uint8_t {
     RotatedInt8KeyInt4ValueGroup64,
     // packed int4 K + packed int4 V
     RotatedInt4KeyInt4ValueGroup64,
+    // E8-lattice key carrier (96 B plane) + packed int4 V
+    RK4V4E8,
 };
 
 enum class EnginePurpose : std::uint8_t {

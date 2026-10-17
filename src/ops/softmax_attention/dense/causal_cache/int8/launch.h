@@ -41,4 +41,17 @@ void rk4v4_kv_cached_attention(const Tensor& q, const Tensor& positions, float s
                                CausalAttentionExecutionEnvelope envelope, MemoryArena& workspace,
                                Tensor& out, CudaExecutionView execution);
 
+
+// port (sm_89): rk4v4-e8 = E8-lattice key carrier (96 B plane) + packed int4 value plane.
+void rk4v4_e8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                                  const Tensor& positions, const Tensor& valid,
+                                  const Tensor& rows, float scale, PagedKVBatchLayerView cache,
+                                  CausalAttentionExecutionEnvelope envelope, MemoryArena& workspace,
+                                  Tensor& out, CudaExecutionView execution);
+
+void rk4v4_e8_kv_cached_attention(const Tensor& q, const Tensor& positions, float scale,
+                                  const PagedKVLayerView& cache,
+                                  CausalAttentionExecutionEnvelope envelope,
+                                  MemoryArena& workspace, Tensor& out, CudaExecutionView execution);
+
 } // namespace ninfer::ops::detail

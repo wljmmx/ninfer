@@ -292,6 +292,13 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         return;
     }
 
+    if (cache.storage == KvCacheStorage::RK4V4E8) {
+        detail::rk4v4_e8_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows,
+                                             scale, cache, envelope, workspace, out,
+                                             execution);
+        return;
+    }
+
     if (cache.storage == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64) {
         detail::rk4v4_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
                                           cache, envelope, workspace, out, execution);
@@ -343,6 +350,12 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
     if (cache.storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64) {
         detail::rk8v4_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
                                           execution);
+        return;
+    }
+
+    if (cache.storage == KvCacheStorage::RK4V4E8) {
+        detail::rk4v4_e8_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
+                                             execution);
         return;
     }
 
