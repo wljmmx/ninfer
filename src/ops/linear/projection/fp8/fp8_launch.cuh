@@ -33,6 +33,7 @@ void fp8_linear_a16_sliced_k(const Tensor& x, const Weight& w, Tensor& out, cuda
         LinearIdentityEpilogue{}, stream);
 }
 
+#if NINFER_CUDA_HAS_BLOCK_SCALE_MMA
 template <class Geometry, class Schedule>
 void launch_fp8_a8(const Tensor& x, const Weight& w, Tensor& out, Fp8A8Workspace scratch,
                    cudaStream_t stream) {
@@ -42,7 +43,18 @@ void launch_fp8_a8(const Tensor& x, const Weight& w, Tensor& out, Fp8A8Workspace
         LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n}, LinearIdentityEpilogue{},
         stream);
 }
+#else
+// port (sm_89): the fp8 A8 kernels use the block-scaled fp8 MMA (.kind::mxf8f6f4), which Ada lacks, so
+// this route cannot exist here. The shapes forward to their A16 selector before reaching it.
+#include <stdexcept>
 
+template <class Geometry, class Schedule>
+void launch_fp8_a8(const Tensor&, const Weight&, Tensor&, Fp8A8Workspace, cudaStream_t) {
+    throw std::logic_error("fp8 A8 requires a block-scaled MMA target (sm_100+)");
+}
+#endif
+
+#if NINFER_CUDA_HAS_TMA
 template <class Geometry, class Schedule>
 void launch_fp8_a8_tma(const Tensor& x, const Weight& w, Tensor& out, Fp8A8Workspace scratch,
                        cudaStream_t stream) {
@@ -52,4 +64,15 @@ void launch_fp8_a8_tma(const Tensor& x, const Weight& w, Tensor& out, Fp8A8Works
         LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n}, LinearIdentityEpilogue{},
         stream, scratch.partials);
 }
+#else
+// port (sm_89): the TMA kernels need sm_90, so this route cannot exist on Ada. Every shape's launch_a8
+// forwards to its A16 selector before this point, and the shapes that still name the route only need
+// it to be defined.
+#include <stdexcept>
+
+template <class Geometry, class Schedule>
+void launch_fp8_a8_tma(const Tensor&, const Weight&, Tensor&, Fp8A8Workspace, cudaStream_t) {
+    throw std::logic_error("fp8 A8 TMA requires sm_90+; this build uses the A16 path");
+}
+#endif
 } // namespace ninfer::ops::detail

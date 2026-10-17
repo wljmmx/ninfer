@@ -36,6 +36,14 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
 
 void launch_a8(const Tensor& x, const Weight& weight, Tensor& out, Fp8A8Workspace scratch,
                cudaStream_t stream) {
+#if !NINFER_CUDA_HAS_TMA
+    // port (sm_89): the A8 path is TMA-based (only the 65..128 range has a non-TMA variant), and TMA
+    // needs sm_90. The A16 selector above covers every token count, so on Ada the same call runs the
+    // fp8 weights through the bf16 MMA path - the op stays available without the A8 TMA acceleration.
+    launch_a16(x, weight, out, stream);
+    return;
+#endif
+
     if (x.ne[1] <= 32)
         return launch_fp8_a8<Geometry, Fp8A8T32R32K128>(x, weight, out, scratch, stream);
     if (x.ne[1] <= 64)

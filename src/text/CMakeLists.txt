@@ -2,6 +2,14 @@ add_library(ninfer_text STATIC
   unicode.cpp
   ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c
 )
+# port: utf8proc is vendored as a plain source file here, so its header must not decorate the
+# definitions with __declspec(dllimport) (MSVC: error C2491). UTF8PROC_STATIC selects that mode.
+if(WIN32)
+  set_source_files_properties(
+    ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c
+    PROPERTIES COMPILE_DEFINITIONS "UTF8PROC_STATIC")
+endif()
+
 ninfer_internal_includes(ninfer_text)
 target_include_directories(ninfer_text PRIVATE ${PROJECT_SOURCE_DIR}/third_party)
 
