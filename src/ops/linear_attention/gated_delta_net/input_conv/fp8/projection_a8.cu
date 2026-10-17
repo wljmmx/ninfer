@@ -2,8 +2,23 @@
 #include "ops/linear/common/output.cuh"
 #include "ops/linear/kernels/fp8/fp8_template_launch.cuh"
 #include "ops/linear/kernels/fp8/fp8_instances.cuh"
+#if !NINFER_CUDA_HAS_BLOCK_SCALE_MMA
+#include <stdexcept>
+#endif
 
 namespace ninfer::ops::detail {
+#if !NINFER_CUDA_HAS_BLOCK_SCALE_MMA
+// port (sm_89): the fp8 A8 kernels use the block-scaled fp8 MMA (.kind::mxf8f6f4), which Ada does not
+// have, so this route cannot exist in an Ada build - the same rule the fp8 linear routes follow in
+// fp8_launch.cuh. projection_a16.cu is the route an Ada build selects; these definitions exist so the
+// route stays declared and fails loudly if it is ever reached.
+std::size_t fp8_gdn_input_partial_capacity_bytes(std::int32_t) { return 0; }
+
+void launch_fp8_gdn_input_a8(const Tensor&, const Weight&, Tensor&, Tensor&, Fp8A8Workspace,
+                             cudaStream_t) {
+    throw std::logic_error("fp8 GDN input A8 requires a block-scaled MMA target (sm_100+)");
+}
+#else
 namespace {
 using Tma64x128  = Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 2, 1>;
 using Tma192x128 = Fp8A8TmaMmaSchedule<192, 128, 128, 3, 4, 2, 1>;
@@ -51,4 +66,5 @@ void launch_fp8_gdn_input_a8(const Tensor& x, const Weight& weight, Tensor& qkv,
     const Output output{static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)};
     plan.launch(fp8_a8_operands(weight, workspace, x.ne[1]), output, workspace.partials, stream);
 }
+#endif // NINFER_CUDA_HAS_BLOCK_SCALE_MMA
 } // namespace ninfer::ops::detail
