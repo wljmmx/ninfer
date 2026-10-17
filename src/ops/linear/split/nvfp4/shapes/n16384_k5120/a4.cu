@@ -18,7 +18,7 @@ using M128N128Pipelined = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
 using M128N128Resident  = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
 
 // The quantizer and contraction must select the same activation scale layout.
-constexpr bool uses_tma(std::int32_t tokens) { return tokens >= 512; }
+constexpr bool uses_tma(std::int32_t tokens) { return NINFER_CUDA_HAS_TMA && tokens >= 512; }
 
 template <class Schedule>
 void launch_gemm(const Weight& weight, std::span<const Tensor> outputs, Nvfp4A4Workspace workspace,

@@ -29,6 +29,17 @@ else()
   set(NINFER_CUDA_HAS_TMA 0)
 endif()
 add_compile_definitions(NINFER_CUDA_HAS_TMA=${NINFER_CUDA_HAS_TMA})
+
+# port: "mma with block scale" (.kind::mxf4nvf4, .block_scale) is a Blackwell instruction, so the
+# NVFP4 A4 routes - TMA or plain - cannot be built for Ada at all. The A16 path (dequantise the NVFP4
+# weights, then a bf16 MMA) is what an sm_89 build must select instead.
+if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(100|103|110|12[01])")
+  set(NINFER_CUDA_HAS_BLOCK_SCALE_MMA 1)
+else()
+  set(NINFER_CUDA_HAS_BLOCK_SCALE_MMA 0)
+endif()
+add_compile_definitions(NINFER_CUDA_HAS_BLOCK_SCALE_MMA=${NINFER_CUDA_HAS_BLOCK_SCALE_MMA})
+message(STATUS "NInfer: block-scaled MMA capable build = ${NINFER_CUDA_HAS_BLOCK_SCALE_MMA}")
 message(STATUS "NInfer: TMA-capable build = ${NINFER_CUDA_HAS_TMA} (CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES})")
 
 if(MSVC)

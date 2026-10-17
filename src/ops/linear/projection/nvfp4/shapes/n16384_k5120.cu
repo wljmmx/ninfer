@@ -35,7 +35,7 @@ void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream
 }
 
 Nvfp4A4Route select_a4(std::int32_t tokens) {
-    if (tokens >= 512) return nvfp4_a4_tma_route<Nvfp4GeometryId::N16384K5120>();
+    if (NINFER_CUDA_HAS_TMA && tokens >= 512) return nvfp4_a4_tma_route<Nvfp4GeometryId::N16384K5120>();
     if (tokens <= 32) return nvfp4_a4_mma_route<Geometry, T32R64>();
     if (tokens <= 64) return nvfp4_a4_mma_route<Geometry, T32R128>();
     if (tokens <= 96) return nvfp4_a4_mma_route<Geometry, T32R128>();
@@ -44,7 +44,7 @@ Nvfp4A4Route select_a4(std::int32_t tokens) {
     return nvfp4_a4_mma_route<Geometry, T128R128Resident>();
 }
 
-bool uses_a4(std::int32_t, std::int32_t) { return true; }
+bool uses_a4(std::int32_t, std::int32_t) { return NINFER_CUDA_HAS_BLOCK_SCALE_MMA != 0; }
 } // namespace
 
 const Nvfp4LinearShape kNvfp4N16384K5120{16384, 5120, launch_a16, launch_nvfp4_a4<select_a4>,

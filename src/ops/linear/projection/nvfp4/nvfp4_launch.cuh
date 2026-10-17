@@ -49,6 +49,7 @@ void nvfp4_linear_a16_sliced_k(const Tensor& x, const Weight& w, Tensor& y, cuda
         LinearIdentityEpilogue{}, stream);
 }
 
+#if NINFER_CUDA_HAS_BLOCK_SCALE_MMA
 template <class Geometry, class Schedule>
 void nvfp4_linear_a4_mma(const Weight& w, Tensor& y, Nvfp4A4Workspace workspace, int tokens,
                          cudaStream_t stream) {
@@ -82,4 +83,29 @@ void launch_nvfp4_a4(const Tensor& x, const Weight& weight, Tensor& out, Nvfp4A4
     launch_nvfp4_a4_quantize(x, weight, scratch, route.scales, stream);
     route.launch(weight, out, scratch, x.ne[1], stream);
 }
+#else
+// port (sm_89): "mma with block scale" (.kind::mxf4nvf4) is a Blackwell instruction, so every A4
+// route here is a Blackwell-only path. The same shape files also carry an A16 implementation that
+// dequantises the NVFP4 weights and runs a bf16 MMA, and their uses_a4 predicate is false in this
+// build, so these entry points exist to keep the shape tables linkable and are never reached.
+inline void nvfp4_a4_unavailable(const char* what) {
+    throw std::logic_error(std::string("nvfp4 A4 (") + what +
+                           ") requires a block-scaled MMA target (sm_100+); this build uses the A16 path");
+}
+
+template <class Geometry, class Schedule>
+constexpr Nvfp4A4Route nvfp4_a4_mma_route() {
+    return {nullptr, Nvfp4ScaleLayout::RowMajor};
+}
+
+template <Nvfp4GeometryId Geometry, Nvfp4ScaleLayout Layout = Nvfp4ScaleLayout::Tiled256>
+constexpr Nvfp4A4Route nvfp4_a4_tma_route() {
+    return {nullptr, Layout};
+}
+
+template <Nvfp4A4Route (*Select)(std::int32_t)>
+void launch_nvfp4_a4(const Tensor&, const Weight&, Tensor&, Nvfp4A4Workspace, cudaStream_t) {
+    nvfp4_a4_unavailable("linear");
+}
+#endif
 } // namespace ninfer::ops::detail

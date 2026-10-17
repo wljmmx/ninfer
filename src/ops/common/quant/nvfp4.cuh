@@ -17,8 +17,10 @@ __device__ __forceinline__ float2 decode_nvfp4_e2m1x2(std::uint8_t storage) {
 }
 
 __device__ __forceinline__ unsigned nvfp4_scaled_pair_bf16(std::uint8_t code, std::uint8_t scale) {
-#if __CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)
-    // PTX 9.2 exposes native pair widening. E2M1 times a finite E4M3 scale needs
+#if (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)) && \
+    defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    // cvt.rn.bf16x2.e2m1x2 and mul.rn.bf16x2 are sm_90+; on Ada the exact FP32 expansion below runs
+    // instead. E2M1 times a finite E4M3 scale needs
     // at most six significand bits, so the BF16 multiplication is exact.
     unsigned values, multiplier, result;
     asm("{\n"
