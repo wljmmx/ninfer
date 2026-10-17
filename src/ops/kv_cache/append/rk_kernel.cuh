@@ -98,6 +98,10 @@ __device__ __forceinline__ void kv_cache_append_rk_row(
                     pair1 | (pair1_next << 16);
             }
             if (lane == 0) {
+                // Reverted: the E8 cylinder decode is scale-relative, not absolute. rad_idx encodes
+                // norm/(ks*2.828) against the fixed table, so the decoded vector has unit-ish norm
+                // and the per-group ks has to be applied by the MMA. Storing unity here made both
+                // E8 layouts drastically worse (rk2v4-e8 14.73 -> 32.64, rk4v2-e8 168 -> 1754).
                 scale_k[paged_kv_element_offset<4, Geometry::KVHeads>(
                     physical_page, kv_head, page_offset, grp)] = k_scale;
             }
@@ -293,6 +297,7 @@ __device__ __forceinline__ void kv_cache_append_rk_row(
                 *reinterpret_cast<std::uint32_t*>(&cache_v[off1]) = pair1 | (pair1_next << 16);
             }
             if (lane == 0) {
+                // Reverted together with the key plane: this scale is required, not redundant.
                 scale_v[paged_kv_element_offset<4, Geometry::KVHeads>(
                     physical_page, kv_head, page_offset, grp)] = v_scale;
             }

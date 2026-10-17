@@ -759,7 +759,15 @@ __device__ __forceinline__ void e8_root_decode_8d_fast(uint8_t root_code, uint8_
     e8_root_decode_8d_fast_scaled(root_code, rad_axis_code, out, 1.0f);
 }
 
-// V plane (rk4v2-e8 value read-back): calibrated Type-B radius centre.
+// V plane (rk4v2-e8 value read-back).
+//
+// Audit note: this branch scales the radius by `(root_code < 112) ? 1.0f : kE8VRadiusCentreB`,
+// i.e. it branches a *radius* multiplier on the *direction* index. That has no basis in the codec
+// (the radius is carried by rad_idx / c_radius_scale, and the encoder never consults the direction
+// code for magnitude). Removing the branch was measured and did NOT fix the layout -- rk4v2-e8 went
+// from PPL 167.98 to 163.48, still far from the ~13.5 every other layout reaches -- so it is left
+// exactly as found rather than swapped for an equally unexplained constant. The layout is recorded
+// as broken in IT.26 and needs a round-trip codec test before anything here is changed again.
 __device__ __forceinline__ void e8_root_decode_8d_fast_v(uint8_t root_code,
                                                          uint8_t rad_axis_code, int8_t out[8]) {
     e8_root_decode_8d_fast_scaled(root_code, rad_axis_code, out,
