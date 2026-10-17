@@ -4,7 +4,10 @@
 
 #include <algorithm>
 
+#include <stdexcept>
+
 namespace ninfer::ops::detail::moe_cuda::block_scaled::fp8 {
+#if NINFER_CUDA_HAS_BLOCK_SCALE_MMA
 namespace {
 __global__ void quantize_input(const __nv_bfloat16* input, std::uint8_t* codes, float* scales,
                                int tokens, int* counts, float* routed_sum, bool clear_counts) {
@@ -120,4 +123,25 @@ void launch_vector(const Tensor& x, const CudaSwiGLUExperts& experts, const Expe
         with_output(destination, mode, down);
     }
 }
+#else
+// port (sm_89): block-scaled FP8 MoE experts need sm_100+. This route is only selected when the caller asks for that
+// storage format or expert format, so an Ada build fails loudly here rather than silently
+// computing something else. See nvfp4_a4.cu for the same treatment on the linear side.
+
+void launch_input(const Tensor& x, const CudaSwiGLUExperts&, const Storage& s,
+                  CudaExecutionView execution, bool clear_counts) {
+    throw std::logic_error("block-scaled FP8 MoE experts need sm_100+");
+}
+
+void launch_experts(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
+                    const Plan& plan, const Storage& s, CudaExecutionView execution) {
+    throw std::logic_error("block-scaled FP8 MoE experts need sm_100+");
+}
+
+void launch_vector(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
+                   ExpertSubset subset, bool shared, MoeEpilogue mode, Tensor& destination,
+                   const Storage& s, CudaExecutionView execution) {
+    throw std::logic_error("block-scaled FP8 MoE experts need sm_100+");
+}
+#endif
 } // namespace ninfer::ops::detail::moe_cuda::block_scaled::fp8

@@ -4,7 +4,10 @@
 #include "ops/softmax_attention/kernels/causal/mxfp8_tiled_launch.cuh"
 #include "ops/softmax_attention/kernels/causal/tiled_merge.cuh"
 
+#include <stdexcept>
+
 namespace ninfer::ops::detail {
+#if NINFER_CUDA_HAS_BLOCK_SCALE_MMA
 void k8v4_kv_tiled_attention(const CausalAttentionOperands& p, K8V4KvReadView cache,
                              CausalKvPartition partition, MemoryArena& workspace,
                              cudaStream_t stream) {
@@ -22,4 +25,15 @@ void k8v4_kv_tiled_attention(const CausalAttentionOperands& p, K8V4KvReadView ca
     else
         invoke.template operator()<CausalD256H16Kv2>();
 }
+#else
+// port (sm_89): the K8V4 KV cache tiled attention needs a block-scaled MMA target (sm_100+). This route is only selected when the caller asks for that
+// storage format or expert format, so an Ada build fails loudly here rather than silently
+// computing something else. See nvfp4_a4.cu for the same treatment on the linear side.
+
+void k8v4_kv_tiled_attention(const CausalAttentionOperands& p, K8V4KvReadView cache,
+                             CausalKvPartition partition, MemoryArena& workspace,
+                             cudaStream_t stream) {
+    throw std::logic_error("the K8V4 KV cache tiled attention needs a block-scaled MMA target (sm_100+)");
+}
+#endif
 } // namespace ninfer::ops::detail
