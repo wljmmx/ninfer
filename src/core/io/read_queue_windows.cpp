@@ -107,6 +107,11 @@ DirectReadQueue::DirectReadQueue(std::span<const FileView> files,
     if (!p.port) fail("create direct read completion port");
     for (const auto file : files) {
         const auto handle = reinterpret_cast<HANDLE>(file.descriptor);
+        // port (sm_89): Win32 associates a *file object* with one completion port, so a second queue
+        // over the same artifact cannot associate and this throws. That case needs a per-queue
+        // handle opened from the path (the queue only sees a borrowed HANDLE), so it is a known
+        // limitation rather than a silent fallback -- a fallback that polled its own OVERLAPPEDs
+        // deadlocked the concurrent PLE row reader.
         if (!CreateIoCompletionPort(handle, p.port, 0, 0))
             fail("associate direct read file with the completion port");
     }
@@ -160,11 +165,11 @@ void DirectReadQueue::submit() {
             // ERROR_IO_PENDING is the normal asynchronous path; anything else never starts, so it
             // is reported as that request's completion instead of throwing.
             if (error != ERROR_IO_PENDING) {
-                --p.pending;
-                slot.busy = false;
                 p.ready.push_back({slot.request.tag, index, 0, static_cast<int>(error)});
+                continue;
             }
         }
+
     }
     p.queued.clear();
 }
@@ -172,9 +177,16 @@ void DirectReadQueue::submit() {
 std::size_t DirectReadQueue::poll(std::span<ReadCompletion> output) {
     auto& p           = *impl_;
     std::size_t count = 0;
+
     while (count < output.size() && !p.ready.empty()) {
-        output[count++] = p.ready.front();
+        const auto staged = p.ready.front();
         p.ready.erase(p.ready.begin());
+        output[count++] = staged;
+        // port (sm_89) fix: a completion is only released here, so this is where the slot becomes
+        // reusable and the in-flight count drops. wait() stages completions without releasing them,
+        // otherwise a caller loop of `while (outstanding()) poll/wait` can exit before the copy.
+        p.slots[staged.buffer_index].busy = false;
+        --p.pending;
     }
     while (count < output.size()) {
         DWORD bytes       = 0;
@@ -215,14 +227,15 @@ ReadWake DirectReadQueue::wait() {
         p.ready.push_back({p.slots[index].request.tag, index,
                            ok ? static_cast<std::uint32_t>(bytes) : 0u,
                            ok ? 0 : static_cast<int>(GetLastError())});
-        p.slots[index].busy = false;
-        --p.pending;
+        // The slot stays busy and `pending` unchanged: the completion is released by the next
+        // poll(), which is the call the consumer's loop is waiting to make.
         return ReadWake::Completion;
     }
 }
 
 void DirectReadQueue::wake() {
-    if (!PostQueuedCompletionStatus(impl_->port, 0, kWakeCompletionKey, nullptr))
+    auto& p = *impl_;
+    if (!PostQueuedCompletionStatus(p.port, 0, kWakeCompletionKey, nullptr))
         fail("wake direct read queue");
 }
 
