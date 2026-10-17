@@ -47,10 +47,15 @@ add_test(NAME ninfer_nf4_exact_test
   COMMAND ${Python3_EXECUTABLE} -B "${CMAKE_CURRENT_LIST_DIR}/../test_nf4_exact.py"
     $<TARGET_FILE:ninfer_nf4_test>)
 
-ninfer_add_test(ninfer_read_queue_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../io/test_read_queue.cpp"
-  LIBRARIES ninfer_core ${NINFER_URING_TARGET})
-target_link_options(ninfer_read_queue_test PRIVATE "LINKER:--wrap=io_uring_submit")
-set_tests_properties(ninfer_read_queue_test PROPERTIES TIMEOUT 30)
+# port (sm_89): the io_uring read queue does not exist on Windows (the port ships an IOCP
+# implementation in core/io/read_queue_windows.cpp) and the oracle needs GNU ld --wrap=io_uring_submit,
+# which MSVC cannot express. Windows read-queue coverage is a known gap; the source stays in the tree.
+if(NOT WIN32)
+  ninfer_add_test(ninfer_read_queue_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../io/test_read_queue.cpp"
+    LIBRARIES ninfer_core ${NINFER_URING_TARGET})
+  target_link_options(ninfer_read_queue_test PRIVATE "LINKER:--wrap=io_uring_submit")
+  set_tests_properties(ninfer_read_queue_test PROPERTIES TIMEOUT 30)
+endif()
 
 ninfer_add_test(ninfer_arena_test        SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_arena.cpp"
   LIBRARIES ninfer_core)
@@ -95,14 +100,25 @@ add_test(NAME ninfer_chat_templates_test
 ninfer_add_test(ninfer_weight_bank_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_weight_bank.cpp"
   LIBRARIES ninfer_core)
 
+# port (sm_89): the failure oracle replaces cuda* at link time with __wrap_/__real_ pairs. Only
+# GNU ld can interpose a symbol that arrives through an import library, so on Windows the oracle TU
+# is left out and the test skips its injection section (NINFER_HAS_CUDA_FAULT_WRAP). Everything else
+# in this test runs unmodified.
+set(NINFER_EXPERT_CACHE_TEST_SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_expert_cache.cu")
+if(NOT WIN32)
+  list(APPEND NINFER_EXPERT_CACHE_TEST_SOURCES
+       "${CMAKE_CURRENT_LIST_DIR}/../expert_cache_cuda_errors.cpp")
+endif()
 ninfer_add_test(ninfer_expert_cache_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_expert_cache.cu"
-          "${CMAKE_CURRENT_LIST_DIR}/../expert_cache_cuda_errors.cpp"
+  SOURCES ${NINFER_EXPERT_CACHE_TEST_SOURCES}
   LIBRARIES ninfer_core)
 set_tests_properties(ninfer_expert_cache_test PROPERTIES TIMEOUT 60)
 
-foreach(symbol IN ITEMS
-    cudaEventRecord cudaMemcpyAsync cudaMemcpyBatchAsync cudaStreamSynchronize cudaStreamWaitEvent
-    cudaFree cudaFreeHost)
-  target_link_options(ninfer_expert_cache_test PRIVATE "LINKER:--wrap=${symbol}")
-endforeach()
+if(NOT WIN32)
+  foreach(symbol IN ITEMS
+      cudaEventRecord cudaMemcpyAsync cudaMemcpyBatchAsync cudaStreamSynchronize cudaStreamWaitEvent
+      cudaFree cudaFreeHost)
+    target_link_options(ninfer_expert_cache_test PRIVATE "LINKER:--wrap=${symbol}")
+  endforeach()
+  target_compile_definitions(ninfer_expert_cache_test PRIVATE NINFER_HAS_CUDA_FAULT_WRAP=1)
+endif()

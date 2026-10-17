@@ -103,7 +103,7 @@ int gate_rounding(DeviceContext& device, KvCacheStorage storage = KvCacheStorage
     const int page = f.tables[f.selectors[0] * f.table_stride];
     for (int h = 0; h < 2; ++h)
         for (int d = 0; d < 256; ++d)
-            f.values.host[f.values.offset(d, h, 0, page)] = half(1.00390625f);
+            f.values.host[f.values.offset(d, h, 0, page)] = fp16_bits(1.00390625f);
     f.upload();
     if (f.encoded_value) {
         auto& v = *f.encoded_value;
@@ -125,7 +125,7 @@ int gate_rounding(DeviceContext& device, KvCacheStorage storage = KvCacheStorage
                                      : cache_reference::encode_minifloat(1.0f, false);
                 std::fill_n(v.data.host.begin() + db, 256, one);
                 for (int g = 0; g < v.format.scale_extent; ++g)
-                    cache_reference::write_u16(v.scales.host, sb + 2 * g, half(1.00390625f));
+                    cache_reference::write_u16(v.scales.host, sb + 2 * g, fp16_bits(1.00390625f));
             }
         }
         v.data.upload();

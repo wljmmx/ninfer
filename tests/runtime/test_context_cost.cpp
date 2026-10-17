@@ -11,7 +11,31 @@
 #include <stdexcept>
 #include <string>
 
-#include <unistd.h>
+// port (sm_89): the POSIX calls this test needs exist on Windows under the CRT's underscore
+// names; the shim keeps the POSIX spelling in the body below.
+#if defined(_WIN32)
+#    include <fcntl.h>
+#    include <io.h>
+#    include <process.h>
+#    define NINFER_TEST_PIPE(fds) _pipe((fds), 65536, _O_TEXT)
+#    define NINFER_TEST_DUP(fd) _dup(fd)
+#    define NINFER_TEST_DUP2(src, dst) _dup2((src), (dst))
+#    define NINFER_TEST_CLOSE(fd) _close(fd)
+#    define NINFER_TEST_READ(fd, buf, n) _read((fd), (buf), static_cast<unsigned>(n))
+#    define NINFER_TEST_STDERR 2
+#    define NINFER_TEST_GETPID _getpid
+using test_ssize_t = int;
+#else
+#    include <unistd.h>
+#    define NINFER_TEST_PIPE(fds) ::pipe(fds)
+#    define NINFER_TEST_DUP(fd) ::dup(fd)
+#    define NINFER_TEST_DUP2(src, dst) ::dup2((src), (dst))
+#    define NINFER_TEST_CLOSE(fd) ::close(fd)
+#    define NINFER_TEST_READ(fd, buf, n) ::read((fd), (buf), (n))
+#    define NINFER_TEST_STDERR STDERR_FILENO
+#    define NINFER_TEST_GETPID ::getpid
+using test_ssize_t = ssize_t;
+#endif
 
 namespace {
 
@@ -192,7 +216,7 @@ void test_schema_validation() {
 void test_resolution_and_atomic_upserts() {
     const std::filesystem::path directory =
         std::filesystem::temp_directory_path() /
-        ("ninfer-context-cost-test-" + std::to_string(static_cast<long long>(::getpid())));
+        ("ninfer-context-cost-test-" + std::to_string(static_cast<long long>(NINFER_TEST_GETPID())));
     std::filesystem::create_directories(directory);
     const std::filesystem::path path = directory / "presets.json";
     try {

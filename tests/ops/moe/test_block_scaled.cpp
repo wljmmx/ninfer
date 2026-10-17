@@ -530,6 +530,12 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (cuda_unavailable()) { return 77; }
+#if !NINFER_CUDA_HAS_BLOCK_SCALE_MMA
+    // port (sm_89): every case here drives mxf8f6f4 / mxf4nvf4 experts, a sm_100+ capability that
+    // this build fences on purpose. Skip rather than report a false failure.
+    std::cout << "skipped: block-scaled MoE experts need sm_100+\n";
+    return 77;
+#endif
     try {
         cudaStream_t stream;
         cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");

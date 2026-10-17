@@ -4,6 +4,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -13,7 +14,10 @@
 #include <thread>
 
 namespace ninfer::test {
+// port (sm_89): only present where the link-time cuda* interposition exists (GNU ld --wrap).
+#if defined(NINFER_HAS_CUDA_FAULT_WRAP)
 void expert_cache_cuda_errors(const ExpertBankSource&, const DeviceContext&);
+#endif
 }
 
 namespace {
@@ -573,8 +577,13 @@ int main() {
         complete_bank(device);
         fixed_regions_and_windows(device);
         promote_partial_upload(device);
+#if defined(NINFER_HAS_CUDA_FAULT_WRAP)
         Bank failure_source(QType::NVFP4, QType::NVFP4);
         ninfer::test::expert_cache_cuda_errors(failure_source.source(device.device()), device);
+#else
+        std::cout << "expert cache cuda failure injection skipped: no link-time wrap on this "
+                     "toolchain\n";
+#endif
         std::cout << "expert cache bytes, lifetimes, Graph and resident access passed\n";
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';

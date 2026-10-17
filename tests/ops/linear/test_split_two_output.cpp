@@ -10,7 +10,9 @@
 
 #include <cuda_runtime.h>
 
+// port (sm_89): <array> arrived only through libstdc++'s transitive includes; MSVC needs it.
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -23,7 +25,8 @@ using namespace ninfer::test::input_projection;
 namespace {
 std::size_t workspace_capacity(const ops::SingleProjectionWeight& weights, int first, int last) {
     const int tail = (weights.weight.n - 4096) / 2;
-    const std::array rows{4096 + tail, tail};
+    const std::array<std::int32_t, 2> rows{static_cast<std::int32_t>(4096 + tail),
+                                           static_cast<std::int32_t>(tail)};
     return ops::linear_split_workspace_capacity_bytes(weights, rows, first, last);
 }
 
@@ -204,7 +207,8 @@ int run_q8_case(DevicePackedWeight& parent, std::int32_t tokens, bool graph = fa
     const std::int32_t kHidden  = raw.k;
     const std::int32_t kZRows   = raw.n == 16384 ? 6144 : 4096;
     const std::int32_t kQkvRows = raw.n - kZRows;
-    const std::array shape{static_cast<std::uint64_t>(raw.n), static_cast<std::uint64_t>(raw.k)};
+    const std::array<std::uint64_t, 2> shape{static_cast<std::uint64_t>(raw.n),
+                                             static_cast<std::uint64_t>(raw.k)};
     const WeightParent backing{weight_geometry(QType::Q8_G32_FP16, QuantLayout::RowSplit, shape),
                                parent.device.device(),
                                static_cast<const std::byte*>(parent.device.data())};

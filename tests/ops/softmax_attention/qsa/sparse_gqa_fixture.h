@@ -7,6 +7,10 @@
 
 #include <bit>
 #include <memory>
+#if defined(_WIN32)
+#    include <cuda_runtime.h> // __half: the CUDA host headers need the runtime types
+#    include <cuda_fp16.h>
+#endif
 #include <numeric>
 
 namespace ninfer::test::qsa::sparse {
@@ -21,9 +25,21 @@ inline std::uint32_t hash(std::uint32_t x) {
 
 inline float sample(std::uint32_t i) { return (int(hash(i) % 10001) - 5000) / 3000.0F; }
 
-inline std::uint16_t half(float x) { return std::bit_cast<std::uint16_t>(_Float16(x)); }
+// port (sm_89): _Float16 is a GCC extension; __half is the same IEEE binary16 type and its
+// conversions round to nearest-even, so the fixture bits are unchanged.
+#if defined(_WIN32)
 
-inline float unhalf(std::uint16_t x) { return float(std::bit_cast<_Float16>(x)); }
+inline std::uint16_t fp16_bits(float x) {
+    const __half h = __float2half_rn(x);
+    return std::bit_cast<std::uint16_t>(h);
+}
+
+inline float fp16_from_bits(std::uint16_t x) { return __half2float(std::bit_cast<__half>(x)); }
+#else
+inline std::uint16_t fp16_bits(float x) { return std::bit_cast<std::uint16_t>(_Float16(x)); }
+
+inline float fp16_from_bits(std::uint16_t x) { return float(std::bit_cast<_Float16>(x)); }
+#endif
 
 struct Plane {
     int leading;
@@ -160,7 +176,7 @@ struct Fixture {
                             keys.host[keys.offset(d, h, j % 64, page)] =
                                 f32_to_bf16(sample(seed + 701) * magnitude);
                             values.host[values.offset(d, h, j % 64, page)] =
-                                half(sample(seed + 1311));
+                                fp16_bits(sample(seed + 1311));
                         }
                 }
             }
@@ -203,7 +219,7 @@ struct Fixture {
                     ->decode(d, h, token % 64, physical);
             const auto word = plane.host[plane.offset(d, h, token % 64, physical)];
             return plane.view.dtype == DType::BF16 ? double(bf16_to_f32(word))
-                                                   : double(unhalf(word));
+                                                   : double(fp16_from_bits(word));
         };
         const auto run = [&](int first, int last) {
             for (int m = first; m < last; ++m) {

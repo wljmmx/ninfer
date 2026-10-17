@@ -7,9 +7,20 @@
 #include <cstring>
 #include <iostream>
 #include <thread>
-#include <sys/resource.h>
 
 namespace {
+
+// port (sm_89): getrusage has no Windows equivalent. The value is printed, never asserted, so
+// report 0 instead of pulling in psapi for a diagnostic field.
+#if defined(_WIN32)
+inline long test_peak_rss_kib() { return 0; }
+#else
+inline long test_peak_rss_kib() {
+    struct rusage usage {};
+    getrusage(RUSAGE_SELF, &usage);
+    return static_cast<long>(usage.ru_maxrss);
+}
+#endif
 using namespace ninfer;
 namespace q4 = models::qwen4_exp;
 using test::artifact_fixture::require;
@@ -216,14 +227,11 @@ int main(int argc, char** argv) {
             q4::Resources resources(parameters, std::move(*selected), device);
             ple_window(resources, *model, device);
 
-            struct rusage usage {};
-
-            getrusage(RUSAGE_SELF, &usage);
             const auto& s = model->storage_stats();
             std::cout << "loaded host=" << s.host_capacity_bytes
                       << " registered=" << s.registered_host_bytes
                       << " gpu=" << s.device_capacity_bytes << " staging=" << s.peak_staging_bytes
-                      << " read=" << s.read_bytes << " rss_kib=" << usage.ru_maxrss << '\n';
+                      << " read=" << s.read_bytes << " rss_kib=" << test_peak_rss_kib() << '\n';
         }
         std::cout << "PASS\n";
         return 0;

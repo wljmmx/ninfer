@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <chrono>
 #include <fstream>
 #include <span>
 #include <stdexcept>
@@ -49,9 +50,23 @@ struct Fixture {
         auto pattern = (std::filesystem::temp_directory_path() / "ninfer-artifact-XXXXXX").string();
         std::vector<char> buffer(pattern.begin(), pattern.end());
         buffer.push_back('\0');
+#if defined(_WIN32)
+        // port (sm_89): mkdtemp is POSIX and MSVC's <cstdlib> does not expose _mktemp_s, so build
+        // a unique name from the steady clock and let create_directory be the atomic claim.
+        const auto base = std::filesystem::temp_directory_path() / "ninfer-artifact";
+        for (int attempt = 0; attempt < 64 && directory.empty(); ++attempt) {
+            const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+            auto candidate   = base.string() + "-" + std::to_string(static_cast<long long>(stamp)) +
+                              "-" + std::to_string(attempt);
+            std::error_code ec;
+            if (std::filesystem::create_directory(candidate, ec)) { directory = candidate; }
+        }
+        if (directory.empty()) { throw std::runtime_error("cannot create fixture directory"); }
+#else
         const char* path = ::mkdtemp(buffer.data());
         if (!path) { throw std::runtime_error("cannot create fixture directory"); }
         directory = path;
+#endif
         entry     = directory / "model.ninfer";
         root      = {
             {"components",

@@ -11,7 +11,9 @@
 
 #include <cuda_runtime.h>
 
+// port (sm_89): <array> arrived only through libstdc++'s transitive includes; MSVC needs it.
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <iostream>
@@ -33,7 +35,7 @@ std::size_t workspace_capacity(QType format, int rows, int columns, ops::LinearP
     weight.qtype = format;
     weight.n     = rows;
     weight.k     = columns;
-    const std::array segments{6144, 1024, 6144, 1024};
+    const std::array<std::int32_t, 4> segments{6144, 1024, 6144, 1024};
     return ops::linear_split_workspace_capacity_bytes(ops::SingleProjectionWeight{weight, policy},
                                                       segments, first, last);
 }
@@ -66,7 +68,7 @@ int verify_output(std::string_view label, const GuardedBf16Tensor& output,
 
 WeightParent physical_parent(const DevicePackedWeight& source) {
     const auto weight = source.view();
-    const std::array shape{static_cast<std::uint64_t>(weight.n),
+    const std::array<std::uint64_t, 2> shape{static_cast<std::uint64_t>(weight.n),
                            static_cast<std::uint64_t>(weight.k)};
     auto geometry       = weight_geometry(weight.qtype, weight.layout, shape);
     const auto divisors = weight.qtype == QType::NVFP4

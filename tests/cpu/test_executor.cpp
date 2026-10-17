@@ -1,7 +1,16 @@
 #include "core/cpu/executor.h"
 
 #include <immintrin.h>
-#include <sched.h>
+
+// port (sm_89): sched_getcpu is POSIX; Windows reports the same thing through
+// GetCurrentProcessorNumber. Both return the logical CPU the thread is running on.
+#if defined(_WIN32)
+#    include <windows.h>
+inline int test_current_cpu() { return static_cast<int>(GetCurrentProcessorNumber()); }
+#else
+#    include <sched.h>
+inline int test_current_cpu() { return sched_getcpu(); }
+#endif
 
 #include <algorithm>
 #include <array>
@@ -41,7 +50,7 @@ void compute(void* pointer, const CpuWorkerContext& worker) noexcept {
     const auto check = [&](bool value) {
         if (!value) work.failed.store(true, std::memory_order_relaxed);
     };
-    check(static_cast<unsigned>(sched_getcpu()) == work.plan->worker_cpus[worker.rank()]);
+    check(static_cast<unsigned>(test_current_cpu()) == work.plan->worker_cpus[worker.rank()]);
     check((_mm_getcsr() & 0xffc0U) == 0x1f80U && std::fegetround() == FE_TONEAREST);
     work.features[worker.rank()] = current_cpu_features();
     const auto range             = worker.range(work.items);

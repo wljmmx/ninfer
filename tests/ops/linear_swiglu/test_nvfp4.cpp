@@ -50,13 +50,27 @@ int main() {
         // Exercise both sides of the native MMA/TMA boundary, including the partial TMA tile.
         constexpr std::array<std::int32_t, 17> kA4Cases{2,   4,   5,   16,  56,  64,  65,  96,  97,
                                                         112, 128, 129, 255, 256, 257, 512, 1024};
+#if NINFER_CUDA_HAS_BLOCK_SCALE_MMA
         int failures = check_negative_gate();
+#else
+        // port (sm_89): the negative gate drives the A4 activation leg, i.e. the block-scaled MMA
+        // target (sm_100+). The A16 profile below still runs.
+        (void)check_negative_gate;
+        int failures = 0;
+        std::cout << "skipped: NVFP4 A4 negative gate needs sm_100+\n";
+#endif
         failures += run_profile("LinearSwiGLU NVFP4_A16",
                                 {QType::NVFP4, 34816, 5120, 17408, 1801U, ActivationCompute::A16},
                                 kA16Cases);
+#if NINFER_CUDA_HAS_BLOCK_SCALE_MMA
         failures += run_profile("LinearSwiGLU NVFP4_A4",
                                 {QType::NVFP4, 34816, 5120, 17408, 1803U, ActivationCompute::A4},
                                 kA4Cases, std::array<std::int32_t, 4>{65, 97, 128, 129});
+#else
+        // port (sm_89): the A4 activation leg needs the block-scaled MMA target (sm_100+).
+        (void)kA4Cases;
+        std::cout << "skipped: NVFP4 A4 leg needs sm_100+; the A16 leg above still ran\n";
+#endif
         return failures;
     });
 }

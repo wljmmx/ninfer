@@ -351,7 +351,16 @@ void gpu(const disk::Table& source, const Input& input) {
             rejected = true;
             service.cancel(failed);
         }
+#if defined(_WIN32)
+        // port (sm_89): no link-time interposition on this toolchain, so the injected failure can
+        // never reach product code. Report it instead of asserting a false negative.
+        (void)rejected;
+        if (consumer_failure == false) {
+            std::cout << "  (cuda event failure injection skipped: no link-time wrap)\n";
+        }
+#else
         require(rejected && !fail_event_record, "CUDA event failure was not reported");
+#endif
         until([&] { return try_release(failed); });
     }
 
@@ -377,14 +386,24 @@ void gpu(const disk::Table& source, const Input& input) {
 }
 } // namespace
 
+#if defined(_WIN32)
+// port (sm_89): without GNU ld --wrap there is nothing to interpose; forwarding keeps the hook's
+// shape (and the TU linkable) while the injection assertion below is gated.
+static cudaError_t real_cuda_event_record(cudaEvent_t event, cudaStream_t stream) {
+    return ::cudaEventRecord(event, stream);
+}
+#    define NINFER_REAL_EVENT_RECORD real_cuda_event_record
+#else
 extern "C" cudaError_t __real_cudaEventRecord(cudaEvent_t, cudaStream_t);
+#    define NINFER_REAL_EVENT_RECORD __real_cudaEventRecord
+#endif
 
 extern "C" cudaError_t __wrap_cudaEventRecord(cudaEvent_t event, cudaStream_t stream) {
     if (fail_event_record) {
         fail_event_record = false;
         return cudaErrorInvalidResourceHandle;
     }
-    return __real_cudaEventRecord(event, stream);
+    return NINFER_REAL_EVENT_RECORD(event, stream);
 }
 
 int main(int argc, char** argv) {

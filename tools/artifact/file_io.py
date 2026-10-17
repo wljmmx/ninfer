@@ -6,10 +6,16 @@ import os
 
 IO_CHUNK_BYTES = 8 * 1024 * 1024
 WRITEBACK_BYTES = 64 * 1024 * 1024
-_PAGE_BYTES = os.sysconf("SC_PAGE_SIZE")
+# port (sm_89): os.sysconf is POSIX-only. The page size only affects the alignment of the
+# cache-discard range below, which is a Linux transfer optimisation.
+_PAGE_BYTES = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
 
 
 def discard_cached_pages(fd: int, offset: int = 0, count: int | None = None) -> None:
+    # port (sm_89): Windows has no page-cache advice; the caller only wants the pages gone from
+    # the read cache, which the OS does on its own there.
+    if not hasattr(os, "posix_fadvise"):
+        return
     if count is None:
         os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
     elif count > 0:
@@ -33,7 +39,9 @@ class Writeback:
 
     def flush(self) -> None:
         for fd in self._fds:
-            os.fdatasync(fd)
+            # port (sm_89): fdatasync is POSIX; fsync is the Windows equivalent (it also
+            # flushes metadata, which is fine for an artifact about to be closed).
+            (getattr(os, "fdatasync", None) or os.fsync)(fd)
             discard_cached_pages(fd)
         self._fds.clear()
         self._bytes = 0

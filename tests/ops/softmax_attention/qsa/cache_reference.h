@@ -6,6 +6,10 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#if defined(_WIN32)
+#    include <cuda_runtime.h> // __half: the CUDA host headers need the runtime types
+#    include <cuda_fp16.h>
+#endif
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -64,11 +68,23 @@ inline void write_u16(std::vector<std::uint8_t>& bytes, std::size_t offset, std:
     std::memcpy(bytes.data() + offset, &word, sizeof(word));
 }
 
+// port (sm_89): _Float16 is a GCC/Clang extension. CUDA's __half is the same IEEE binary16
+// type and its conversions round to nearest-even, so the reference values are unchanged.
+#if defined(_WIN32)
+
+inline std::uint16_t fp16_encode(float x) {
+    const __half h = __float2half_rn(x);
+    return std::bit_cast<std::uint16_t>(h);
+}
+
+inline float fp16_decode(std::uint16_t x) { return __half2float(std::bit_cast<__half>(x)); }
+#else
 inline std::uint16_t fp16_encode(float x) {
     return std::bit_cast<std::uint16_t>(static_cast<_Float16>(x));
 }
 
 inline float fp16_decode(std::uint16_t x) { return float(std::bit_cast<_Float16>(x)); }
+#endif
 
 inline double positive_fp8(int code) {
     const int exponent = code >> 3, fraction = code & 7;

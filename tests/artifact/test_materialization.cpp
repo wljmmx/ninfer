@@ -14,7 +14,10 @@
 #include <optional>
 
 namespace ninfer::test {
+// port (sm_89): present only where the link-time cuda* interposition exists (GNU ld --wrap).
+#if defined(NINFER_HAS_CUDA_FAULT_WRAP)
 void materialization_cuda_errors(DeviceContext& device);
+#endif
 }
 
 namespace {
@@ -373,7 +376,12 @@ int main(int argc, char** argv) {
         materialization(device);
         registered_materialization(device);
         failure_and_host_only(device);
+#if defined(NINFER_HAS_CUDA_FAULT_WRAP)
         ninfer::test::materialization_cuda_errors(device);
+#else
+        std::cout << "artifact cuda failure injection skipped: no link-time wrap on this "
+                     "toolchain\n";
+#endif
         staging_reuse(device);
         std::cout << "artifact materialization checks passed\n";
         return 0;

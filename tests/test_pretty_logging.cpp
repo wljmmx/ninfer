@@ -3,7 +3,31 @@
 
 #include <spdlog/logger.h>
 
-#include <unistd.h>
+// port (sm_89): the POSIX calls this test needs exist on Windows under the CRT's underscore
+// names; the shim keeps the POSIX spelling in the body below.
+#if defined(_WIN32)
+#    include <fcntl.h>
+#    include <io.h>
+#    include <process.h>
+#    define NINFER_TEST_PIPE(fds) _pipe((fds), 65536, _O_TEXT)
+#    define NINFER_TEST_DUP(fd) _dup(fd)
+#    define NINFER_TEST_DUP2(src, dst) _dup2((src), (dst))
+#    define NINFER_TEST_CLOSE(fd) _close(fd)
+#    define NINFER_TEST_READ(fd, buf, n) _read((fd), (buf), static_cast<unsigned>(n))
+#    define NINFER_TEST_STDERR 2
+#    define NINFER_TEST_GETPID _getpid
+using test_ssize_t = int;
+#else
+#    include <unistd.h>
+#    define NINFER_TEST_PIPE(fds) ::pipe(fds)
+#    define NINFER_TEST_DUP(fd) ::dup(fd)
+#    define NINFER_TEST_DUP2(src, dst) ::dup2((src), (dst))
+#    define NINFER_TEST_CLOSE(fd) ::close(fd)
+#    define NINFER_TEST_READ(fd, buf, n) ::read((fd), (buf), (n))
+#    define NINFER_TEST_STDERR STDERR_FILENO
+#    define NINFER_TEST_GETPID ::getpid
+using test_ssize_t = ssize_t;
+#endif
 
 #include <algorithm>
 #include <array>
@@ -20,33 +44,34 @@ namespace {
 class StderrCapture {
 public:
     StderrCapture() {
-        if (::pipe(pipe_) != 0) { throw std::runtime_error(std::strerror(errno)); }
-        saved_ = ::dup(STDERR_FILENO);
-        if (saved_ < 0 || ::dup2(pipe_[1], STDERR_FILENO) < 0) {
+        if (NINFER_TEST_PIPE(pipe_) != 0) { throw std::runtime_error(std::strerror(errno)); }
+        saved_ = NINFER_TEST_DUP(NINFER_TEST_STDERR);
+        if (saved_ < 0 || NINFER_TEST_DUP2(pipe_[1], NINFER_TEST_STDERR) < 0) {
             throw std::runtime_error(std::strerror(errno));
         }
-        ::close(pipe_[1]);
+        NINFER_TEST_CLOSE(pipe_[1]);
         pipe_[1] = -1;
     }
 
     ~StderrCapture() {
         if (saved_ >= 0) {
-            (void)::dup2(saved_, STDERR_FILENO);
-            ::close(saved_);
+            (void)NINFER_TEST_DUP2(saved_, NINFER_TEST_STDERR);
+            NINFER_TEST_CLOSE(saved_);
         }
-        if (pipe_[0] >= 0) { ::close(pipe_[0]); }
+        if (pipe_[0] >= 0) { NINFER_TEST_CLOSE(pipe_[0]); }
     }
 
     std::string finish() {
         std::fflush(stderr);
-        if (::dup2(saved_, STDERR_FILENO) < 0) { throw std::runtime_error(std::strerror(errno)); }
-        ::close(saved_);
+        if (NINFER_TEST_DUP2(saved_, NINFER_TEST_STDERR) < 0) { throw std::runtime_error(std::strerror(errno)); }
+        NINFER_TEST_CLOSE(saved_);
         saved_ = -1;
 
         std::string output;
         std::array<char, 4096> buffer{};
         for (;;) {
-            const ssize_t count = ::read(pipe_[0], buffer.data(), buffer.size());
+            const test_ssize_t count =
+                NINFER_TEST_READ(pipe_[0], buffer.data(), buffer.size());
             if (count == 0) { break; }
             if (count < 0) {
                 if (errno == EINTR) { continue; }
@@ -54,7 +79,7 @@ public:
             }
             output.append(buffer.data(), static_cast<std::size_t>(count));
         }
-        ::close(pipe_[0]);
+        NINFER_TEST_CLOSE(pipe_[0]);
         pipe_[0] = -1;
         return output;
     }

@@ -18,9 +18,20 @@
 #include <set>
 #include <string>
 
-#include <sys/resource.h>
 
 namespace {
+
+// port (sm_89): getrusage has no Windows equivalent. The value is printed, never asserted, so
+// report 0 instead of pulling in psapi for a diagnostic field.
+#if defined(_WIN32)
+inline long test_peak_rss_kib() { return 0; }
+#else
+inline long test_peak_rss_kib() {
+    struct rusage usage {};
+    getrusage(RUSAGE_SELF, &usage);
+    return static_cast<long>(usage.ru_maxrss);
+}
+#endif
 
 using namespace ninfer;
 using namespace ninfer::models;
@@ -356,15 +367,13 @@ int main(int argc, char** argv) {
                 "tokenizer did not survive Reader destruction");
         require(!model->resources().chat_template_jinja.empty(),
                 "template bytes were lost after loading");
-        rusage usage{};
-        getrusage(RUSAGE_SELF, &usage);
         std::cout << path.filename().string()
                   << ": loading and native inputs passed, parents=" << visited.size()
                   << " device_bytes=" << model->storage_stats().device_capacity_bytes
                   << " host_bytes=" << model->storage_stats().host_capacity_bytes
                   << " h2d_bytes=" << model->storage_stats().h2d_bytes
                   << " materialization_seconds=" << model->storage_stats().upload_seconds
-                  << " peak_rss_kib=" << usage.ru_maxrss
+                  << " peak_rss_kib=" << test_peak_rss_kib()
                   << " V=" << model->resources().public_token_count << '\n';
         model.reset();
         device->synchronize();

@@ -58,6 +58,11 @@ int check_bank(Operation operation, int n, int k) {
     }
     int failures = 0;
     for (const auto policy : {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA4}) {
+#if !NINFER_CUDA_HAS_BLOCK_SCALE_MMA
+        // port (sm_89): AllowA4 requires the block-scaled MMA target (sm_100+). The A16 leg is the
+        // one this hardware supports, so it still runs.
+        if (policy == ops::LinearPolicy::AllowA4) { continue; }
+#endif
         for (const int tokens :
              {1, policy == ops::LinearPolicy::A16Only ? (swiglu ? 16 : 129) : 257}) {
             // +/-6 is exact in the A4 activation representation with divisor 1.

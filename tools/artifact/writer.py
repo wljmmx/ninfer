@@ -182,7 +182,13 @@ class ArtifactWriter:
     def _write_file(self, fd: int, offset: int, data: bytes | memoryview) -> None:
         view = memoryview(data).cast("B")
         while view:
-            count = os.pwrite(fd, view[:IO_CHUNK_BYTES], offset)
+            # port (sm_89): os.pwrite is POSIX-only; seek+write is equivalent here because the
+            # artifact writer owns the descriptor and writes it single-threaded.
+            if hasattr(os, "pwrite"):
+                count = os.pwrite(fd, view[:IO_CHUNK_BYTES], offset)
+            else:
+                os.lseek(fd, offset, os.SEEK_SET)
+                count = os.write(fd, view[:IO_CHUNK_BYTES])
             if count <= 0:
                 raise OSError(f"short write at file offset {offset}")
             view = view[count:]

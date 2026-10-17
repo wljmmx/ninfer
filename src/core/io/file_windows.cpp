@@ -47,12 +47,19 @@ std::size_t read_at(std::intptr_t descriptor, std::uint64_t offset, std::byte* d
                              &overlapped);
     if (!ok) {
         const auto error = GetLastError();
-        if (error != ERROR_IO_PENDING && !GetOverlappedResult(handle_of(descriptor), &overlapped,
-                                                              &transferred, TRUE))
+        // port (sm_89) fix: with FILE_FLAG_OVERLAPPED, ReadFile reports ERROR_IO_PENDING for almost
+        // every read. The earlier version returned early in that case, leaving transferred == 0, so
+        // read_exact saw an EOF on every call ("unexpected EOF"). Always collect the result now.
+        if (error != ERROR_IO_PENDING)
             throw std::system_error(static_cast<int>(error), std::system_category(),
                                     "overlapped read");
-    } else if (!GetOverlappedResult(handle_of(descriptor), &overlapped, &transferred, TRUE)) {
-        throw std::system_error(static_cast<int>(GetLastError()), std::system_category(),
+    }
+    if (!GetOverlappedResult(handle_of(descriptor), &overlapped, &transferred, TRUE)) {
+        const auto error = GetLastError();
+        // A read that starts at or past the end of the file surfaces as EOF; report it as a
+        // zero-length read so the caller's own EOF handling stays in charge.
+        if (error == ERROR_HANDLE_EOF) return 0;
+        throw std::system_error(static_cast<int>(error), std::system_category(),
                                 "overlapped read result");
     }
     return static_cast<std::size_t>(transferred);
