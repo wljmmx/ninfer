@@ -404,12 +404,25 @@ std::vector<TextCase> text_cases(std::uint32_t chunk) {
 }
 
 std::uint64_t attention_pairs(std::uint32_t prefix, std::uint32_t suffix) {
+#if defined(_MSC_VER)
+    // port: MSVC has no unsigned __int128. Both operands are 32-bit, so prefix*suffix < 2^64 and
+    // suffix*(suffix+1)/2 < 2^63 fit a uint64 exactly, and only the sum can overflow - which is what
+    // this function reports. Same values, same error.
+    const std::uint64_t linear = static_cast<std::uint64_t>(prefix) * suffix;
+    const std::uint64_t triangular =
+        static_cast<std::uint64_t>(suffix) * (suffix + 1ULL) / 2ULL;
+    if (triangular > std::numeric_limits<std::uint64_t>::max() - linear) {
+        throw std::overflow_error("prefill attention-pair count exceeds uint64");
+    }
+    return linear + triangular;
+#else
     const unsigned __int128 pairs = static_cast<unsigned __int128>(prefix) * suffix +
                                     static_cast<unsigned __int128>(suffix) * (suffix + 1ULL) / 2U;
     if (pairs > std::numeric_limits<std::uint64_t>::max()) {
         throw std::overflow_error("prefill attention-pair count exceeds uint64");
     }
     return static_cast<std::uint64_t>(pairs);
+#endif
 }
 
 std::vector<std::uint8_t> block_ppm(int width, int height, std::uint8_t value) {

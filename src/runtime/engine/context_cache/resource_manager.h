@@ -1,5 +1,9 @@
 #pragma once
 
+#if defined(_MSC_VER)
+#include <intrin.h> // _umul128 for the exact cross-product comparison below
+#endif
+
 #include "runtime/contract/resources.h"
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/context_cache/prefix_index.h"
@@ -1174,6 +1178,19 @@ private:
                 .waiting  = preserving ? 0 : waiting_ticket(sources)};
     }
 
+#if defined(_MSC_VER)
+    // port: -1, 0 or +1 for (a*b) vs (c*d), exactly, without a 128-bit integer type.
+    static int compare_product(std::uint64_t a, std::uint64_t b, std::uint64_t c,
+                               std::uint64_t d) noexcept {
+        unsigned __int64 a_high = 0, c_high = 0;
+        const auto a_low = _umul128(a, b, &a_high);
+        const auto c_low = _umul128(c, d, &c_high);
+        if (a_high != c_high) { return a_high < c_high ? -1 : 1; }
+        if (a_low != c_low) { return a_low < c_low ? -1 : 1; }
+        return 0;
+    }
+#endif
+
     static bool less_rank(const ActionRank& left, const ActionRank& right) {
         if (bool(left.waiting) != bool(right.waiting)) { return !left.waiting; }
         if (left.waiting != right.waiting) { return left.waiting > right.waiting; }
@@ -1182,9 +1199,16 @@ private:
             return left.priority.last_demand < right.priority.last_demand;
         }
         if (!left.priority.reused) {
+#if defined(_MSC_VER)
+            // port: MSVC has no unsigned __int128, so the two 64x64 cross products are compared as
+            // two-word values - the same exact ordering as the 128-bit comparison.
+            const int order = compare_product(left.loss, right.units, right.loss, left.units);
+            if (order != 0) { return order < 0; }
+#else
             const auto a = static_cast<unsigned __int128>(left.loss) * right.units;
             const auto b = static_cast<unsigned __int128>(right.loss) * left.units;
             if (a != b) { return a < b; }
+#endif
         }
         return left.order < right.order;
     }

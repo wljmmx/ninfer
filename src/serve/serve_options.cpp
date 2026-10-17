@@ -2,6 +2,10 @@
 #include "product/speculative_options.h"
 
 #include <cerrno>
+
+#if defined(_MSC_VER)
+#include <intrin.h> // _umul128, for the two-word 128-bit fallback below
+#endif
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
@@ -75,6 +79,77 @@ std::size_t parse_host_context_mib(const char* text) {
     if (fraction.size() > 20) {
         throw std::invalid_argument("--host-context-mib must resolve to a whole number of bytes");
     }
+#if defined(_MSC_VER)
+    // port: MSVC has no unsigned __int128. Twenty fractional digits times 2^20 needs 87 bits and the
+    // divisor itself can pass 64 bits, so a two-word value with bitwise long division reproduces the
+    // exact arithmetic (128 iterations, once per option parse).
+    struct U128 {
+        std::uint64_t lo = 0, hi = 0;
+
+        [[nodiscard]] bool is_zero() const noexcept { return lo == 0 && hi == 0; }
+
+        [[nodiscard]] U128 mul(std::uint64_t factor) const noexcept {
+            unsigned __int64 high = 0;
+            const auto low        = _umul128(lo, factor, &high);
+            return {low, high + hi * factor};
+        }
+
+        [[nodiscard]] U128 add(std::uint64_t value) const noexcept {
+            const auto low = lo + value;
+            return {low, hi + (low < lo ? 1U : 0U)};
+        }
+
+        [[nodiscard]] U128 sub(U128 other) const noexcept {
+            const auto low = lo - other.lo;
+            return {low, hi - other.hi - (lo < other.lo ? 1U : 0U)};
+        }
+
+        [[nodiscard]] bool less(U128 other) const noexcept {
+            return hi != other.hi ? hi < other.hi : lo < other.lo;
+        }
+
+        [[nodiscard]] U128 shl1() const noexcept { return {lo << 1, (hi << 1) | (lo >> 63)}; }
+
+        static void divmod(U128 value, U128 by, U128& quotient, U128& remainder) noexcept {
+            quotient  = {};
+            remainder = {};
+            for (int bit = 127; bit >= 0; --bit) {
+                remainder = remainder.shl1();
+                if (((bit >= 64 ? value.hi : value.lo) >> (bit % 64)) & 1ULL) {
+                    remainder.lo |= 1ULL;
+                }
+                quotient = quotient.shl1();
+                if (!remainder.less(by)) {
+                    remainder = remainder.sub(by);
+                    quotient.lo |= 1ULL;
+                }
+            }
+        }
+
+        [[nodiscard]] U128 remainder_of(U128 by) const noexcept {
+            U128 quotient{}, remainder{};
+            divmod(*this, by, quotient, remainder);
+            return remainder;
+        }
+
+        [[nodiscard]] U128 divide_by(U128 by) const noexcept {
+            U128 quotient{}, remainder{};
+            divmod(*this, by, quotient, remainder);
+            return quotient;
+        }
+
+        [[nodiscard]] std::uint64_t to_u64() const noexcept { return lo; }
+    };
+
+    U128 numerator = U128{0, 0};
+    U128 divisor   = U128{1, 0};
+    for (const char character : fraction) {
+        numerator = numerator.mul(10).add(static_cast<std::uint64_t>(character - '0'));
+        divisor   = divisor.mul(10);
+    }
+    numerator = numerator.mul(bytes_per_mib);
+    if (!numerator.remainder_of(divisor).is_zero()) {
+#else
     unsigned __int128 numerator = 0;
     unsigned __int128 divisor   = 1;
     for (const char character : fraction) {
@@ -83,9 +158,15 @@ std::size_t parse_host_context_mib(const char* text) {
     }
     numerator *= bytes_per_mib;
     if (numerator % divisor != 0) {
+#endif
         throw std::invalid_argument("--host-context-mib must resolve to a whole number of bytes");
     }
+#if defined(_MSC_VER)
+    const std::size_t fractional_bytes =
+        static_cast<std::size_t>(numerator.divide_by(divisor).to_u64());
+#else
     const std::size_t fractional_bytes = static_cast<std::size_t>(numerator / divisor);
+#endif
     const std::size_t whole_bytes      = whole_mib * bytes_per_mib;
     if (fractional_bytes > maximum - whole_bytes) {
         throw std::invalid_argument("--host-context-mib is out of range");
