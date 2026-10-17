@@ -26,9 +26,17 @@ Nvfp4KvCausalPlan select_nvfp4_kv_causal_plan(int heads, int width, int batch,
         envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys)
         throw std::invalid_argument("NVFP4 attention: invalid plan inputs");
     constexpr int grouped_limit = Nvfp4KvCausalPlan::kTokenTile;
+#if NINFER_CUDA_HAS_TMA
     const auto family           = width <= grouped_limit ? Nvfp4KvFamily::Grouped
                                   : width <= kGroupedPrefillMaxWidth ? Nvfp4KvFamily::ParallelGrouped
                                                                      : Nvfp4KvFamily::Tiled;
+#else
+    // port (sm_89): Tiled is the warp-specialised TMA kernel, which Ada cannot run. ParallelGrouped
+    // slices the query into token tiles and so covers every width; same mma_f16 arithmetic, different
+    // tiling. The earlier line's Tiled kernel was the plain mma_f16 variant.
+    const auto family           = width <= grouped_limit ? Nvfp4KvFamily::Grouped
+                                  : Nvfp4KvFamily::ParallelGrouped;
+#endif
     const int tiles =
         family == Nvfp4KvFamily::ParallelGrouped ? (width + grouped_limit - 1) / grouped_limit : 1;
     const int independent_tiles = batch * (heads == 24 ? 4 : 2) * tiles;
@@ -52,7 +60,13 @@ std::size_t nvfp4_kv_workspace_bytes(int heads, int batch, int min_width, int ma
                                      CausalAttentionExecutionEnvelope envelope,
                                      int multiprocessor_count) {
     std::size_t maximum = 0;
+#if NINFER_CUDA_HAS_TMA
     for (int width = min_width; width <= std::min(max_width, kGroupedPrefillMaxWidth); ++width) {
+#else
+    // port (sm_89): Tiled is never selected above, so the grouped layouts have to cover every width -
+    // the previous bound relied on the tiled family sizing the wide end and would under-allocate.
+    for (int width = min_width; width <= max_width; ++width) {
+#endif
         const auto plan =
             select_nvfp4_kv_causal_plan(heads, width, batch, envelope, multiprocessor_count);
         if (plan.family == Nvfp4KvFamily::Tiled) continue;
