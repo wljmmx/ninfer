@@ -360,6 +360,10 @@ class Result {
 // to raise an error. This macro manually mark them as unreachable to avoid warnings.
 #ifdef __GNUC__
 #define XGRAMMAR_UNREACHABLE() __builtin_unreachable()
+#elif defined(_MSC_VER)
+// port: an empty expansion let control reach the end of lambda bodies, which MSVC rejects as C4716.
+// __assume(0) is MSVC's spelling of __builtin_unreachable(); no change on other compilers.
+#define XGRAMMAR_UNREACHABLE() __assume(0)
 #else
 #define XGRAMMAR_UNREACHABLE()
 #endif
