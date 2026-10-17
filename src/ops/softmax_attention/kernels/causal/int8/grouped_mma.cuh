@@ -17,7 +17,7 @@ namespace ninfer::ops::detail {
 // Native INT8 QK accumulates each G64 group in INT32, then applies Q/K scales in FP32.
 // PV dequantizes represented V to FP16 and accumulates in FP32.
 template <class Geometry, class Schedule, bool MultiBatch, bool Masked, class CacheInput,
-          bool ParallelQueries = false, bool PackedV = false>
+          bool ParallelQueries = false, bool PackedV = false, bool PackedK = false>
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     void int8_kv_grouped_mma_kernel(
         const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos,
@@ -198,12 +198,36 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 const float carried = __half2float(v_scale);
                 v_inv_scale         = carried > 0.0f ? 1.0f / carried : 0.0f;
             }
-            cache_k_i8[kv::Int8G64Layout<Geometry::KVHeads>::code_offset(physical_page, kv_head, d0,
-                                                                         page_offset)] =
-                common::int8_quant_code(kv0, k_quant.inverse_scale);
-            cache_k_i8[kv::Int8G64Layout<Geometry::KVHeads>::code_offset(physical_page, kv_head, d1,
-                                                                         page_offset)] =
-                common::int8_quant_code(kv1, k_quant.inverse_scale);
+            // port (sm_89): same convention for the packed key plane.
+            __half k_scale    = k_quant.scale;
+            float k_inv_scale = k_quant.inverse_scale;
+            if constexpr (PackedK) {
+                k_scale             = rk4_absmax_to_scale_h(kamax);
+                const float carried = __half2float(k_scale);
+                k_inv_scale         = carried > 0.0f ? 1.0f / carried : 0.0f;
+            }
+            if constexpr (PackedK) {
+                // One byte carries dims (d, d+1); the shuffles must run on every lane.
+                const float kv0_next = __shfl_xor_sync(FullMask, kv0, 1);
+                const float kv1_next = __shfl_xor_sync(FullMask, kv1, 1);
+                if ((lane & 1) == 0) {
+                    cache_k_i8[rk4_v_code_index<Geometry>(physical_page, kv_head, d0 >> 1,
+                                                          page_offset)] =
+                        static_cast<std::int8_t>(rk4_pack(rk4_quant_code(kv0, k_inv_scale),
+                                                          rk4_quant_code(kv0_next, k_inv_scale)));
+                    cache_k_i8[rk4_v_code_index<Geometry>(physical_page, kv_head, d1 >> 1,
+                                                          page_offset)] =
+                        static_cast<std::int8_t>(rk4_pack(rk4_quant_code(kv1, k_inv_scale),
+                                                          rk4_quant_code(kv1_next, k_inv_scale)));
+                }
+            } else {
+                cache_k_i8[kv::Int8G64Layout<Geometry::KVHeads>::code_offset(physical_page, kv_head,
+                                                                             d0, page_offset)] =
+                    common::int8_quant_code(kv0, k_quant.inverse_scale);
+                cache_k_i8[kv::Int8G64Layout<Geometry::KVHeads>::code_offset(physical_page, kv_head,
+                                                                             d1, page_offset)] =
+                    common::int8_quant_code(kv1, k_quant.inverse_scale);
+            }
             if constexpr (PackedV) {
                 // One byte carries dims (d, d+1), so an even lane needs its odd neighbour's value.
                 // The shuffles must run on every lane - they sit outside the even-lane guard on purpose.
@@ -230,7 +254,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             if (lane == 0) {
                 const std::int64_t so = kv::Int8G64Layout<Geometry::KVHeads>::scale_offset(
                     physical_page, kv_head, grp, page_offset);
-                cache_k_scale[so] = k_quant.scale;
+                // port (sm_89): k_scale is k_quant.scale unless PackedK (int4 absmax/7).
+                cache_k_scale[so] = k_scale;
                 // port (sm_89): v_scale is v_quant.scale unless PackedV, where it is the int4 absmax/7.
                 cache_v_scale[so] = v_scale;
             }
@@ -334,7 +359,29 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 const std::int64_t off = kv::Int8G64Layout<Geometry::KVHeads>::code_offset(
                     physical_page, kv_head, d, key & kv::kPageMask);
                 std::int8_t* dst = &k_i8[key_l * D + common::swizzle_xor_64(key_l, dc * 8) * 2];
-                common::cp_async<16>(dst, &cache_k_i8[off]);
+                if constexpr (PackedK) {
+                    // The QK MMA consumes int8, so the packed key is expanded here, straight into the
+                    // swizzled slot the ldmatrix B-fragment reads (the int8 cp_async path fills the
+                    // same 16-byte chunk, so the unpack must not bypass the swizzle).
+                    const std::int64_t koff = rk4_v_code_index<Geometry>(
+                        physical_page, kv_head, d >> 1, key & kv::kPageMask);
+#pragma unroll
+                    for (int half4 = 0; half4 < 2; ++half4) {
+                        const std::uint32_t raw = *reinterpret_cast<const std::uint32_t*>(
+                            &cache_k_i8[koff + 4 * half4]);
+                        const std::uint32_t lo = rk4_unpack_lo_fast(raw);
+                        const std::uint32_t hi = rk4_unpack_hi_fast(raw);
+                        const auto* lo8        = reinterpret_cast<const std::int8_t*>(&lo);
+                        const auto* hi8        = reinterpret_cast<const std::int8_t*>(&hi);
+#pragma unroll
+                        for (int b = 0; b < 4; ++b) {
+                            dst[8 * half4 + 2 * b]     = lo8[b];
+                            dst[8 * half4 + 2 * b + 1] = hi8[b];
+                        }
+                    }
+                } else {
+                    common::cp_async<16>(dst, &cache_k_i8[off]);
+                }
                 if constexpr (PackedV) {
                     // 16 dims occupy 8 packed bytes at the half offset.
                     const std::int64_t voff = rk4_v_code_index<Geometry>(
