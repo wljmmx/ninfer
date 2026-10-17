@@ -6,6 +6,8 @@
 #include "ops/kv_cache/kernels/write/int8.cuh"
 #include "ops/kv_cache/kernels/write/k8v4.cuh"
 #include "ops/kv_cache/kernels/write/nvfp4.cuh"
+// port (sm_89): the rk (rank-compressed) layouts reuse the earlier append kernel.
+#include "ops/kv_cache/kernels/write/rk.cuh"
 
 #include <stdexcept>
 #include <type_traits>
@@ -85,7 +87,22 @@ void launch_quantized(const WriteArguments& a, Metadata metadata, cudaStream_t s
 template <KvCacheStorage Storage, class G, class Metadata>
 void launch_instance(PagedWriteInstance instance, const WriteArguments& a, Metadata metadata,
                      cudaStream_t stream) {
-    if constexpr (Storage == KvCacheStorage::BFloat16) {
+    if constexpr (Storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64) {
+        // port (sm_89): rk writes one warp per (token, kv_head) row, so the instance only selects
+        // whether the batch metadata is the masked variant. rk8v4 is PackedV only (no packed K, no E8).
+        if constexpr (requires { Metadata::masked; }) {
+            launch_rk_write<Metadata::masked, G, false, false, false, false, Metadata>(
+                a.k, a.v, a.positions, metadata, static_cast<std::int8_t*>(a.keys),
+                static_cast<std::int8_t*>(a.values), static_cast<__half*>(a.key_scales),
+                static_cast<__half*>(a.value_scales), a.width, a.batch, stream);
+        } else {
+            launch_rk_write<false, G, false, false, false, false, Metadata>(
+                a.k, a.v, a.positions, metadata, static_cast<std::int8_t*>(a.keys),
+                static_cast<std::int8_t*>(a.values), static_cast<__half*>(a.key_scales),
+                static_cast<__half*>(a.value_scales), a.width, 1, stream);
+        }
+        return;
+    } else if constexpr (Storage == KvCacheStorage::BFloat16) {
         if (a.batch != 1 ||
             (instance != PagedWriteInstance::Copy96 && instance != PagedWriteInstance::Copy128))
             throw std::logic_error("KV write: invalid BF16 instance");
@@ -130,6 +147,9 @@ void storage_dispatch(KvCacheStorage storage, PagedWriteInstance instance, const
         return launch_instance<KvCacheStorage::Nvfp4Group16, G>(instance, a, metadata, stream);
     case KvCacheStorage::Fp8KeyNvfp4Value:
         return launch_instance<KvCacheStorage::Fp8KeyNvfp4Value, G>(instance, a, metadata, stream);
+    case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
+        return launch_instance<KvCacheStorage::RotatedInt8KeyInt4ValueGroup64, G>(instance, a,
+                                                                                 metadata, stream);
     }
     throw std::logic_error("KV write: unsupported storage");
 }

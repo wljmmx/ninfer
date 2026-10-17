@@ -32,6 +32,10 @@ enum class KvCacheStorage : std::uint8_t {
     Fp8E4M3Row256,
     Nvfp4Group16,
     Fp8KeyNvfp4Value,
+    // port (sm_89): the rank-compressed layouts carried over from the earlier implementation. rk8v4
+    // (int8 Hadamard K + packed int4 V) is wired first; rk4v4, rk4v4-e8, rk2v4-e8 and rk4v2-e8 need
+    // the PackedK and E8 codecs on the read side and stay unreachable until then.
+    RotatedInt8KeyInt4ValueGroup64,
 };
 
 enum class EnginePurpose : std::uint8_t {
