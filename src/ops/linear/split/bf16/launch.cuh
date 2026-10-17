@@ -28,7 +28,13 @@ struct Bf16SplitRoutes {
 
     template <class S>
     void tma() const {
+#if NINFER_CUDA_HAS_TMA
         launch_bf16_a16_tma_mma<S>(operands, output, LinearIdentityEpilogue{}, stream);
+#else
+        // port (sm_89): TMA needs sm_90, so this route runs the same-schedule non-TMA A16 MMA. The
+        // callers keep using tma<S>() unchanged.
+        launch_bf16_a16_mma<S>(operands, output, LinearIdentityEpilogue{}, stream);
+#endif
     }
 };
 

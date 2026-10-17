@@ -57,6 +57,17 @@ void launch_quantize_exact(const Tensor& x, const Weight& weight, Nvfp4A4Workspa
 
 void launch_nvfp4_a4_quantize(const Tensor& x, const Weight& weight, Nvfp4A4Workspace workspace,
                               Nvfp4ScaleLayout layout, cudaStream_t stream) {
+#if !NINFER_CUDA_HAS_BLOCK_SCALE_MMA
+    // port (sm_89): the activation packing below uses cvt.e2m1x2.f32, which needs sm_90, so the A4
+    // activation path cannot run here. No A4 route is selected on Ada (the shapes run their A16
+    // selectors), so this entry point only has to exist and fail loudly if it is ever reached.
+    (void)x;
+    (void)weight;
+    (void)workspace;
+    (void)layout;
+    (void)stream;
+    throw std::logic_error("nvfp4 A4 activation quantization requires sm_90+");
+#else
     if (workspace.codes == nullptr || workspace.scales == nullptr) {
         throw std::invalid_argument("nvfp4 A4 requires caller workspace");
     }
@@ -85,6 +96,7 @@ void launch_nvfp4_a4_quantize(const Tensor& x, const Weight& weight, Nvfp4A4Work
     default:
         throw std::invalid_argument("nvfp4 A4 quantize: unsupported K");
     }
+#endif
 }
 
 } // namespace ninfer::ops::detail

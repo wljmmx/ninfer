@@ -40,6 +40,7 @@ using Bulk      = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4
 
 Fp8LinearAddPlan select_fp8_add_n5120_k6144(LinearPolicy policy, std::int32_t tokens) {
     if (!allows_a8(policy) || tokens < 17) return {select_a16(tokens)};
+#if NINFER_CUDA_HAS_BLOCK_SCALE_MMA
     const std::size_t partial_bytes = tokens > 768   ? Bulk::kPartialBytes
                                       : tokens > 192 ? MidBulk::kPartialBytes
                                                      : 0;
@@ -49,5 +50,10 @@ Fp8LinearAddPlan select_fp8_add_n5120_k6144(LinearPolicy policy, std::int32_t to
     if (tokens <= 192) return {nullptr, launch_fp8_add_a8<Instance<MidTile>>, partial_bytes};
     if (tokens <= 768) return {nullptr, launch_fp8_add_a8<Instance<MidBulk>>, partial_bytes};
     return {nullptr, launch_fp8_add_a8<Instance<Bulk>>, partial_bytes};
+#else
+    // port (sm_89): no fp8 A8 kernel exists on Ada (TMA needs sm_90 and the plain A8
+    // uses the block-scaled fp8 MMA); select_a16 above covers every token count.
+    return {select_a16(tokens)};
+#endif
 }
 } // namespace ninfer::ops::detail

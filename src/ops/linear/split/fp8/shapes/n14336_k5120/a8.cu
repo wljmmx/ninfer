@@ -19,17 +19,33 @@ std::size_t partial_capacity(std::int32_t max_tokens) {
 void launch_a8(const Tensor& x, const Weight& weight, std::span<const Tensor> outputs,
                Fp8A8Workspace workspace, cudaStream_t stream) {
     launch_fp8_a8_quantize(x, weight, workspace, stream);
+#if !NINFER_CUDA_HAS_TMA
+    // port (sm_89): the fp8 A8 path cannot exist on Ada, and this file's A16 selector covers every
+    // token count, so the same call runs the fp8 weights through the bf16 MMA instead.
+    (void)workspace;
+    launch_a16(x, weight, outputs, stream);
+    return;
+#endif
+
     const LinearBf16SegmentedOutput<6144, 1024, 6144, 1024> output{
         static_cast<__nv_bfloat16*>(outputs[0].data), static_cast<__nv_bfloat16*>(outputs[1].data),
         static_cast<__nv_bfloat16*>(outputs[2].data), static_cast<__nv_bfloat16*>(outputs[3].data)};
     const auto operands = fp8_a8_operands(weight, workspace, x.ne[1]);
     const auto launch   = [&]<class Schedule>() {
+#if NINFER_CUDA_HAS_TMA
         using S = Fp8ScheduleInstance<Schedule, 5120>;
         if constexpr (S::kTmaSwizzle)
             launch_fp8_a8_tma_mma<S>(operands, output, LinearIdentityEpilogue{}, stream,
                                        workspace.partials);
         else
             launch_fp8_a8_mma<S>(operands, output, LinearIdentityEpilogue{}, stream);
+#else
+        // port (sm_89): no fp8 A8 kernel exists here - the TMA variant needs sm_90 and the plain one
+        // uses the block-scaled fp8 MMA. launch_a8 returns through launch_a16 before any of these
+        // instantiations would run, so the body is empty and the call sites stay unchanged.
+        (void)operands;
+        (void)output;
+#endif
     };
     if (x.ne[1] <= 32) return launch.template operator()<Fp8A8T32R32K128>();
     if (x.ne[1] <= 96) return launch.template operator()<Fp8A8T32R128K128>();

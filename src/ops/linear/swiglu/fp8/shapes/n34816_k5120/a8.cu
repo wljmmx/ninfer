@@ -16,6 +16,16 @@ std::size_t fp8_linear_swiglu_partial_capacity_bytes(std::int32_t max_tokens) {
 
 void launch_fp8_swiglu_a8(const Tensor& x, const Weight& weight, Tensor& out,
                           MemoryArena& workspace, cudaStream_t stream) {
+#if !NINFER_CUDA_HAS_BLOCK_SCALE_MMA
+    // port (sm_89): no fp8 A8 SwiGLU kernel exists here; the dispatcher returns the A16 route for
+    // every token count on this build, so this entry point only has to exist and fail loudly.
+    (void)x;
+    (void)weight;
+    (void)out;
+    (void)workspace;
+    (void)stream;
+    throw std::logic_error("fp8 SwiGLU A8 requires a block-scaled MMA target (sm_100+)");
+#else
     auto scope         = workspace.scope();
     const auto scratch = allocate_fp8_a8_workspace(
         workspace, x.ne[1], weight.k, fp8_linear_swiglu_partial_capacity_bytes(x.ne[1]));
@@ -37,5 +47,6 @@ void launch_fp8_swiglu_a8(const Tensor& x, const Weight& weight, Tensor& out,
     if (x.ne[1] <= 128) return launch.template operator()<Tma64x128>();
     if (x.ne[1] <= 192) return launch.template operator()<Tma64x256>();
     launch.template operator()<Bulk>();
+#endif
 }
 } // namespace ninfer::ops::detail
