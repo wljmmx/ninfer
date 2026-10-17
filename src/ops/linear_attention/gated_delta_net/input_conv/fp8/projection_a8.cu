@@ -8,15 +8,14 @@
 
 namespace ninfer::ops::detail {
 #if !NINFER_CUDA_HAS_BLOCK_SCALE_MMA
-// port (sm_89): the fp8 A8 kernels use the block-scaled fp8 MMA (.kind::mxf8f6f4), which Ada does not
-// have, so this route cannot exist in an Ada build - the same rule the fp8 linear routes follow in
-// fp8_launch.cuh. projection_a16.cu is the route an Ada build selects; these definitions exist so the
-// route stays declared and fails loudly if it is ever reached.
+// port (sm_89): every schedule this file selects is a TMA one (Tma64x128, Tma192x128, MidBulk, Bulk),
+// and TMA needs sm_90, so this route cannot exist in an Ada build. projection_a16.cu is the route an
+// Ada build selects; these definitions exist so the route stays declared and fails loudly if reached.
 std::size_t fp8_gdn_input_partial_capacity_bytes(std::int32_t) { return 0; }
 
 void launch_fp8_gdn_input_a8(const Tensor&, const Weight&, Tensor&, Tensor&, Fp8A8Workspace,
                              cudaStream_t) {
-    throw std::logic_error("fp8 GDN input A8 requires a block-scaled MMA target (sm_100+)");
+    throw std::logic_error("fp8 GDN input A8 requires warp-specialised TMA (sm_90+)");
 }
 #else
 namespace {
