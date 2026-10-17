@@ -42,6 +42,18 @@ add_compile_definitions(NINFER_CUDA_HAS_BLOCK_SCALE_MMA=${NINFER_CUDA_HAS_BLOCK_
 message(STATUS "NInfer: block-scaled MMA capable build = ${NINFER_CUDA_HAS_BLOCK_SCALE_MMA}")
 message(STATUS "NInfer: TMA-capable build = ${NINFER_CUDA_HAS_TMA} (CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES})")
 
+# port: programmatic dependent launch (PTX griddepcontrol, i.e. cudaTriggerProgrammaticLaunchCompletion
+# and cudaGridDependencySynchronize) is sm_90+. On Ada the consumer is launched without the PDL
+# attribute - the stream's own ordering already serialises it behind the producer, which is the same
+# guarantee - and the device-side trigger and wait compile out.
+if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(90|100|103|110|12[01])")
+  set(NINFER_CUDA_HAS_PDL 1)
+else()
+  set(NINFER_CUDA_HAS_PDL 0)
+endif()
+add_compile_definitions(NINFER_CUDA_HAS_PDL=${NINFER_CUDA_HAS_PDL})
+message(STATUS "NInfer: PDL-capable build = ${NINFER_CUDA_HAS_PDL}")
+
 if(MSVC)
   add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
   add_compile_options(
