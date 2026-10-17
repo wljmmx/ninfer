@@ -24,8 +24,20 @@ Bf16Launch select_bf16_n10240_k320(std::int32_t tokens) {
     if (tokens <= 1) return launch_bf16_gemv<S0>;
     if (tokens <= 16) return launch_bf16_mma<S1>;
     if (tokens <= 48) return launch_bf16_mma<S2>;
+    #if NINFER_CUDA_HAS_TMA
     if (tokens <= 64) return launch_bf16_tma_mma<S3>;
+    #else
+    // port (sm_89): TMA needs sm_90; this selector's largest non-TMA schedule
+    // takes the same branch until the Ada schedule is measured.
+    if (tokens <= 64) return launch_bf16_mma<S4>;
+    #endif
     if (tokens <= 128) return launch_bf16_mma<S4>;
+    #if NINFER_CUDA_HAS_TMA
     return launch_bf16_tma_mma<S5>;
+    #else
+    // port (sm_89): TMA needs sm_90; this selector's largest non-TMA schedule
+    // takes the same branch until the Ada schedule is measured.
+    return launch_bf16_mma<S4>;
+    #endif
 }
 } // namespace ninfer::ops::detail

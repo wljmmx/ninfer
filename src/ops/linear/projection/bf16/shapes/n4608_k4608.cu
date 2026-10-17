@@ -36,11 +36,47 @@ Bf16Launch select_bf16_n4608_k4608(std::int32_t tokens) {
     if (tokens <= 4) return launch_bf16_sliced_k_mma<S3>;
     if (tokens <= 16) return launch_bf16_sliced_k_mma<S4>;
     if (tokens <= 32) return launch_bf16_mma<S5>;
+    #if NINFER_CUDA_HAS_TMA
     if (tokens <= 64) return launch_bf16_tma_mma<S6>;
+    #else
+    // port (sm_89): TMA needs sm_90; this selector's largest non-TMA schedule
+    // takes the same branch until the Ada schedule is measured.
+    if (tokens <= 64) return launch_bf16_mma<S5>;
+    #endif
+    #if NINFER_CUDA_HAS_TMA
     if (tokens <= 96) return launch_bf16_tma_mma<S7>;
+    #else
+    // port (sm_89): TMA needs sm_90; this selector's largest non-TMA schedule
+    // takes the same branch until the Ada schedule is measured.
+    if (tokens <= 96) return launch_bf16_mma<S5>;
+    #endif
+    #if NINFER_CUDA_HAS_TMA
     if (tokens <= 128) return launch_bf16_tma_mma<S8>;
+    #else
+    // port (sm_89): TMA needs sm_90; this selector's largest non-TMA schedule
+    // takes the same branch until the Ada schedule is measured.
+    if (tokens <= 128) return launch_bf16_mma<S5>;
+    #endif
+    #if NINFER_CUDA_HAS_TMA
     if (tokens <= 256) return launch_bf16_tma_mma<S9>;
+    #else
+    // port (sm_89): TMA needs sm_90; this selector's largest non-TMA schedule
+    // takes the same branch until the Ada schedule is measured.
+    if (tokens <= 256) return launch_bf16_mma<S5>;
+    #endif
+    #if NINFER_CUDA_HAS_TMA
     if (tokens <= 512) return launch_bf16_tma_mma<S10>;
+    #else
+    // port (sm_89): TMA needs sm_90; this selector's largest non-TMA schedule
+    // takes the same branch until the Ada schedule is measured.
+    if (tokens <= 512) return launch_bf16_mma<S5>;
+    #endif
+    #if NINFER_CUDA_HAS_TMA
     return launch_bf16_tma_mma<S11>;
+    #else
+    // port (sm_89): TMA needs sm_90; this selector's largest non-TMA schedule
+    // takes the same branch until the Ada schedule is measured.
+    return launch_bf16_mma<S5>;
+    #endif
 }
 } // namespace ninfer::ops::detail

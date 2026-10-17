@@ -53,9 +53,33 @@ LinearAddLaunch select_bf16_linear_add(std::int32_t rows, std::int32_t k, std::i
     if (tokens == 4) return launch_exact<4>;
     if (tokens <= 32) return launch_mma<Bf16A16MmaR32T32K256S3>;
     if (tokens <= 64) return launch_mma<Bf16A16MmaR32T32K192S2>;
+    #if NINFER_CUDA_HAS_TMA
     if (tokens <= 96) return launch_tma<Bf16A16TmaR64T32K64S3>;
+    #else
+    // port (sm_89): TMA needs sm_90; this selector's largest non-TMA schedule
+    // takes the same branch until the Ada schedule is measured.
+    if (tokens <= 96) return launch_mma<Bf16A16MmaR32T32K192S2>;
+    #endif
+    #if NINFER_CUDA_HAS_TMA
     if (tokens <= 128) return launch_tma<Bf16A16TmaR64T64K128S2>;
+    #else
+    // port (sm_89): TMA needs sm_90; this selector's largest non-TMA schedule
+    // takes the same branch until the Ada schedule is measured.
+    if (tokens <= 128) return launch_mma<Bf16A16MmaR32T32K192S2>;
+    #endif
+    #if NINFER_CUDA_HAS_TMA
     if (tokens <= 256) return launch_tma<Bf16A16TmaR64T64K64S3>;
+    #else
+    // port (sm_89): TMA needs sm_90; this selector's largest non-TMA schedule
+    // takes the same branch until the Ada schedule is measured.
+    if (tokens <= 256) return launch_mma<Bf16A16MmaR32T32K192S2>;
+    #endif
+    #if NINFER_CUDA_HAS_TMA
     return launch_tma<Bf16A16TmaR64T128K64S2>;
+    #else
+    // port (sm_89): TMA needs sm_90; this selector's largest non-TMA schedule
+    // takes the same branch until the Ada schedule is measured.
+    return launch_mma<Bf16A16MmaR32T32K192S2>;
+    #endif
 }
 } // namespace ninfer::ops::detail
