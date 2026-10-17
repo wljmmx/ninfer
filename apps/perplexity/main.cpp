@@ -158,6 +158,19 @@ std::string kv_name(ninfer::KvCacheStorage value) {
         return "nvfp4";
     case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
         return "k8v4";
+    // port (sm_89): the rank-compressed layouts are selectable on this build, so the name table has
+    // to cover them too -- `--kv-dtype rk8v4` used to die here with a bare "unknown KV dtype"
+    // after the model had already been loaded and planned.
+    case ninfer::KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
+        return "rk8v4";
+    case ninfer::KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
+        return "rk4v4";
+    case ninfer::KvCacheStorage::RK4V4E8:
+        return "rk4v4-e8";
+    case ninfer::KvCacheStorage::RK2V4E8:
+        return "rk2v4-e8";
+    case ninfer::KvCacheStorage::RK4V2E8:
+        return "rk4v2-e8";
     }
     throw std::logic_error("unknown KV dtype");
 }

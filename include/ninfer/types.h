@@ -32,9 +32,10 @@ enum class KvCacheStorage : std::uint8_t {
     Fp8E4M3Row256,
     Nvfp4Group16,
     Fp8KeyNvfp4Value,
-    // port (sm_89): the rank-compressed layouts carried over from the earlier implementation. rk8v4
-    // (int8 Hadamard K + packed int4 V) is wired first; rk4v4, rk4v4-e8, rk2v4-e8 and rk4v2-e8 need
-    // the PackedK and E8 codecs on the read side and stay unreachable until then.
+    // port (sm_89): the rank-compressed layouts carried over from the earlier implementation.
+    // All five are wired end to end on this build: rk8v4 (int8 Hadamard K + packed int4 V),
+    // rk4v4 (packed int4 K + packed int4 V), and the E8 key carriers rk4v4-e8 / rk2v4-e8 /
+    // rk4v2-e8.
     RotatedInt8KeyInt4ValueGroup64,
     // packed int4 K + packed int4 V
     RotatedInt4KeyInt4ValueGroup64,

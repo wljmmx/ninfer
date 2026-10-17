@@ -24,6 +24,8 @@
 #include <algorithm>
 #include <initializer_list>
 #include <limits>
+#include <cstdlib>
+#include <string_view>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -797,7 +799,16 @@ void validate_target_options(const execution::ModelProfile& profile, DeviceConte
         }
         break;
     }
-    if (device.compute_capability() != 120) {
+    // port (sm_89): upstream only ever ran this family on sm_120 and refuses every other device
+    // with this single check. That is a validation policy, not a measured requirement -- the port's
+    // Ada fallbacks (TMA -> cp.async, block-scaled MMA fences) live below this layer. The override
+    // is explicit and named so a port run can discover what actually breaks, and the default stays
+    // exactly as upstream.
+    const bool family_capability_override = [] {
+        const char* value = std::getenv("NINFER_ALLOW_SM89_FAMILY");
+        return value && *value && std::string_view(value) != "0";
+    }();
+    if (device.compute_capability() != 120 && !family_capability_override) {
         throw std::invalid_argument("Qwen3.5 family runtime requires compute capability 12.0");
     }
 }

@@ -123,6 +123,17 @@ const char* kv_cache_name(ninfer::KvCacheStorage storage) noexcept {
         return "nvfp4";
     case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
         return "k8v4";
+    // port (sm_89): same reason as request_log.cpp -- keep the rk layouts from logging as "unknown".
+    case ninfer::KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
+        return "rk8v4";
+    case ninfer::KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
+        return "rk4v4";
+    case ninfer::KvCacheStorage::RK4V4E8:
+        return "rk4v4-e8";
+    case ninfer::KvCacheStorage::RK2V4E8:
+        return "rk2v4-e8";
+    case ninfer::KvCacheStorage::RK4V2E8:
+        return "rk4v2-e8";
     }
     return "unknown";
 }
