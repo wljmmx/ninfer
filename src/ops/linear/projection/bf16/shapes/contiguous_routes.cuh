@@ -22,13 +22,7 @@ struct Bf16ContiguousRoutes {
 
     template <class S>
     static Bf16Launch tma() {
-        #if NINFER_CUDA_HAS_TMA
         return launch_bf16_tma_mma<S>;
-        #else
-        // port (sm_89): TMA needs sm_90; this selector's largest non-TMA schedule
-        // takes the same branch until the Ada schedule is measured.
-        return launch_bf16_mma<S>;
-        #endif
     }
 };
 

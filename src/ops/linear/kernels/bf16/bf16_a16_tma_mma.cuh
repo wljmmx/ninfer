@@ -7,6 +7,10 @@
 
 #include "ops/linear/kernels/bf16/bf16_mma_common.cuh"
 #include "ops/linear/kernels/bf16/bf16_operands.h"
+#if !NINFER_CUDA_HAS_TMA
+// port (sm_89): on Ada the TMA entry points below run the cp.async MMA kernel of the same tile.
+#include "ops/linear/kernels/bf16/bf16_template_launch.cuh"
+#endif
 #include <cuda.h>
 #include <stdexcept>
 #include <string>
@@ -98,8 +102,9 @@ inline constexpr int bf16_tma_scratch_bytes =
 // port (sm_89): this TMA implementation needs sm_90 (setmaxnreg, mbarrier,
 // cp.async.bulk.tensor) and its kernels take an over-aligned __grid_constant__ descriptor
 // by value, which MSVC rejects outright (C2719) - upstream builds on Linux where that is
-// accepted. The TMA routes are compiled out on Ada, so the kernels are only declared for
-// builds that can execute them. The descriptor types above stay available either way.
+// accepted. The kernel itself is therefore only declared for builds that can execute it; on Ada
+// the same entry points further down run the same tile through the cp.async MMA kernel. The
+// descriptor types above stay available either way.
 #if NINFER_CUDA_HAS_TMA
 template <class Schedule, bool FullTokens, class Output, class Epilogue, int Splits = 1,
           class WeightAccess = Bf16ContiguousTmaWeightAccess>
@@ -208,6 +213,24 @@ void launch_bf16_a16_tma_mma(const Bf16A16Operands& p, Output output, Epilogue e
     });
 }
 
+#else
+// port (sm_89): an Ada build cannot run the TMA kernel, but the tile it describes is the tile the
+// cp.async MMA kernel runs. Bf16A16TmaMmaSchedule derives from Bf16A16MmaSchedule with the same tile
+// geometry, warp counts, stage count, min-blocks hint, raster and swizzle - bf16_mma_shared_col
+// already handles Tma128, and the cp.async loader writes through the very helper the consumer reads
+// with - so the only member that is actually TMA-specific is the 32-thread producer warp folded into
+// kThreads. Dropping it lets the TMA entry points stay defined here and every caller keep its code.
+template <class Schedule>
+struct Bf16CpAsyncSchedule : Schedule {
+    static constexpr int kThreads = Schedule::kWarps * 32;
+};
+
+template <class Schedule, int Splits = 1, class Output, class Epilogue,
+          class WeightAccess = Bf16ContiguousTmaWeightAccess>
+void launch_bf16_a16_tma_mma(const Bf16A16Operands& p, Output output, Epilogue epilogue,
+                             cudaStream_t stream) {
+    launch_bf16_mma_partitions<Bf16CpAsyncSchedule<Schedule>, Splits>(p, output, epilogue, stream);
+}
 #endif // NINFER_CUDA_HAS_TMA
 
 } // namespace ninfer::ops::detail

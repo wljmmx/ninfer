@@ -94,6 +94,11 @@ void folded_up(Operands o, Scratch scratch, cudaStream_t stream) {
     });
 }
 
+#if NINFER_CUDA_HAS_TMA
+// port (sm_89): this route needs TMA to gather the striped native Up weight - StripedTmaWeightAccess
+// builds a 4-D tensor map over kStreams interleaved matrices - so it cannot go through the cp.async
+// fallback. On Ada the Up cases in launch() run the same work through the non-TMA kernel, which
+// gathers the same native rows itself (up_mma_mix.cuh).
 template <int Features>
 void tma_folded_up(Operands o, Scratch scratch, cudaStream_t stream) {
     using S = Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<kStreams * Features, 64, 64, 32, 16, 2, 1>,
@@ -105,6 +110,7 @@ void tma_folded_up(Operands o, Scratch scratch, cudaStream_t stream) {
         p, {static_cast<__nv_bfloat16*>(o.output), kWidth},
         {static_cast<const __nv_bfloat16*>(o.normalized)}, stream);
 }
+#endif
 
 } // namespace
 
@@ -121,10 +127,21 @@ void launch(Kind kind, Operands o, Plan p, Scratch scratch, CudaExecutionView ex
         folded_up<32, 32>(o, scratch, execution.stream());
         break;
     case Up::TmaFolded16x64:
+#if NINFER_CUDA_HAS_TMA
         tma_folded_up<16>(o, scratch, execution.stream());
+#else
+        // port (sm_89): the non-TMA folded kernel reads the same native rows itself. Its token tile is
+        // the widest that feature count supports - 64 would need 2048 threads - so the token block
+        // differs from the TMA route while the result does not.
+        folded_up<16, 16>(o, scratch, execution.stream());
+#endif
         break;
     case Up::TmaFolded32x64:
+#if NINFER_CUDA_HAS_TMA
         tma_folded_up<32>(o, scratch, execution.stream());
+#else
+        folded_up<32, 32>(o, scratch, execution.stream());
+#endif
         break;
     }
 }

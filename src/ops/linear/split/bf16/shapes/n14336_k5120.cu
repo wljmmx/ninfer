@@ -68,14 +68,8 @@ void launch_matrix(const Tensor& x, const Weight& weight, std::span<const Tensor
                                                            stream);
     };
     const auto tma = [&]<class S>() {
-#if NINFER_CUDA_HAS_TMA
         launch_bf16_a16_tma_mma<Bf16ScheduleInstance<S, 5120>>(p, output, LinearIdentityEpilogue{},
                                                                stream);
-#else
-        // port (sm_89): TMA needs sm_90; the same A16 MMA runs with the same schedule instead.
-        launch_bf16_a16_mma<Bf16ScheduleInstance<S, 5120>>(p, output, LinearIdentityEpilogue{},
-                                                           stream);
-#endif
     };
     if (p.tokens <= 16)
         launch_bf16_a16_sliced_k_mma<Bf16ScheduleInstance<Bf16A16SlicedR32T16W4, 5120>>(
