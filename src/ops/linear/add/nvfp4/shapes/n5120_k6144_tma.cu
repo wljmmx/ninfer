@@ -1,4 +1,5 @@
 #include "ops/linear/add/nvfp4/dispatch.h"
+#if NINFER_CUDA_HAS_TMA
 #include "ops/linear/kernels/nvfp4/nvfp4_a4_tma.cuh"
 
 namespace ninfer::ops::detail {
@@ -11,3 +12,16 @@ void launch_nvfp4_add_n5120_k6144_tma(const Tensor& x, const Weight& w, Tensor& 
                                stream);
 }
 } // namespace ninfer::ops::detail
+
+#else
+// port (sm_89): this implementation needs TMA, setmaxnreg and mbarrier (sm_90+). The same
+// shape has a non-TMA implementation, and the dispatch sites test NINFER_CUDA_HAS_TMA, so this
+// entry point exists only to keep the symbol defined for the shape's tables.
+#include <stdexcept>
+
+namespace ninfer::ops::detail {
+void launch_nvfp4_add_n5120_k6144_tma(const Tensor&, const Weight&, Tensor&, Nvfp4A4Workspace, cudaStream_t) {
+    throw std::logic_error("launch_nvfp4_add_n5120_k6144_tma requires TMA (sm_90+), which this build cannot execute");
+}
+} // namespace ninfer::ops::detail
+#endif

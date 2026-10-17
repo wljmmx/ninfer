@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#if NINFER_CUDA_HAS_BLOCK_SCALE_MMA
 #include "ops/linear/swiglu/nvfp4/dispatch.h"
 
 #include "core/device.h"
@@ -60,3 +61,17 @@ void launch_nvfp4_swiglu_a4(const Tensor& x, const Weight& weight, Tensor& out,
 }
 
 } // namespace ninfer::ops::detail
+
+#else
+// port (sm_89): the A4 path needs the block-scaled MMA (.kind::mxf4nvf4), which Ada does not
+// have. The dispatch sites test NINFER_CUDA_HAS_BLOCK_SCALE_MMA, so this entry point is not
+// reached here; it exists so the callers still link.
+#include <stdexcept>
+#include "ops/linear/swiglu/nvfp4/dispatch.h"
+
+namespace ninfer::ops::detail {
+void launch_nvfp4_swiglu_a4(const Tensor&, const Weight&, Tensor&, MemoryArena&, cudaStream_t) {
+    throw std::logic_error("launch_nvfp4_swiglu_a4 requires a block-scaled MMA target (sm_100+)");
+}
+} // namespace ninfer::ops::detail
+#endif

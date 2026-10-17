@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#if NINFER_CUDA_HAS_BLOCK_SCALE_MMA
 #include "ops/linear_attention/gated_delta_net/input_conv/nvfp4/launch.h"
 #include "core/device.h"
 #include "ops/linear/common/output.cuh"
@@ -59,3 +60,17 @@ void launch_nvfp4_gdn_input_a4(const Tensor& x, const Weight& weight, Tensor& qk
     plan.launch(weight, qkv, z, workspace, x.ne[1], stream);
 }
 } // namespace ninfer::ops::detail
+
+#else
+// port (sm_89): the A4 path needs the block-scaled MMA (.kind::mxf4nvf4), which Ada does not
+// have. The dispatch sites test NINFER_CUDA_HAS_BLOCK_SCALE_MMA, so this entry point is not
+// reached here; it exists so the callers still link.
+#include <stdexcept>
+#include "ops/linear_attention/gated_delta_net/input_conv/nvfp4/launch.h"
+
+namespace ninfer::ops::detail {
+void launch_nvfp4_gdn_input_a4(const Tensor&, const Weight&, Tensor&, Tensor&, Nvfp4A4Workspace, cudaStream_t) {
+    throw std::logic_error("launch_nvfp4_gdn_input_a4 requires a block-scaled MMA target (sm_100+)");
+}
+} // namespace ninfer::ops::detail
+#endif

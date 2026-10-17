@@ -39,7 +39,15 @@ Nvfp4LinearSwiGluRoute select_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens >= 256 && NINFER_CUDA_HAS_TMA) {
         return Nvfp4LinearSwiGluRoute::TmaFusedA4;
     }
+#if NINFER_CUDA_HAS_BLOCK_SCALE_MMA
     return Nvfp4LinearSwiGluRoute::FusedA4;
+#else
+    // port (sm_89): the fused A4 SwiGLU needs the block-scaled MMA and this shape registers its A16
+    // implementations only through T=16, so a larger prefill has no implementation on Ada. Say so
+    // instead of selecting a route that cannot exist here.
+    throw std::invalid_argument("nvfp4 linear_swiglu: T > 16 requires a block-scaled MMA target "
+                                "(sm_100+); this build registers the A16 routes only up to T=16");
+#endif
 }
 
 template <class Allocator>

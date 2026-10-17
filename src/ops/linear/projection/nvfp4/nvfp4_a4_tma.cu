@@ -1,4 +1,5 @@
 #include "ops/linear/projection/nvfp4/nvfp4_a4_tma_launch.h"
+#if NINFER_CUDA_HAS_TMA
 #include "ops/linear/kernels/nvfp4/nvfp4_a4_tma.cuh"
 
 namespace ninfer::ops::detail {
@@ -39,3 +40,16 @@ void launch_nvfp4_a4_tma_linear(Nvfp4GeometryId problem, const Nvfp4A4Operands& 
     throw std::invalid_argument("NVFP4 TMA linear: unsupported geometry");
 }
 } // namespace ninfer::ops::detail
+
+#else
+// port (sm_89): this implementation needs TMA, setmaxnreg and mbarrier (sm_90+). The same
+// shape has a non-TMA implementation, and the dispatch sites test NINFER_CUDA_HAS_TMA, so this
+// entry point exists only to keep the symbol defined for the shape's tables.
+#include <stdexcept>
+
+namespace ninfer::ops::detail {
+void launch_nvfp4_a4_tma_linear(Nvfp4GeometryId, const Nvfp4A4Operands&, __nv_bfloat16*, cudaStream_t) {
+    throw std::logic_error("launch_nvfp4_a4_tma_linear requires TMA (sm_90+), which this build cannot execute");
+}
+} // namespace ninfer::ops::detail
+#endif

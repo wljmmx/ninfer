@@ -29,6 +29,7 @@ LinearAddLaunch select_a16(int tokens) {
 
 Nvfp4LinearAddPlan select_nvfp4_add_n5120_k6144(LinearPolicy policy, std::int32_t tokens) {
     if (!allows_a4(policy) || tokens < 17) return {select_a16(tokens)};
+#if NINFER_CUDA_HAS_BLOCK_SCALE_MMA
     if (tokens >= 1024)
         return {nullptr, launch_nvfp4_add_n5120_k6144_tma, Nvfp4ScaleLayout::Tiled256};
     if (tokens <= 64)
@@ -47,5 +48,10 @@ Nvfp4LinearAddPlan select_nvfp4_add_n5120_k6144(LinearPolicy policy, std::int32_
         return {nullptr,
                 launch_nvfp4_add_a4<Instance<Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 2, 1>>>};
     return {nullptr, launch_nvfp4_add_a4<Instance<Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 1, 2>>>};
+#else
+    // port (sm_89): the A4 routes need the block-scaled MMA (.kind::mxf4nvf4), which Ada does not
+    // have. select_a16 above covers every token count, so the same call runs the A16 path here.
+    return {select_a16(tokens)};
+#endif
 }
 } // namespace ninfer::ops::detail

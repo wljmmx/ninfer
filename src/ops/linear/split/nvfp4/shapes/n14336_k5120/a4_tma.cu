@@ -1,4 +1,5 @@
 #include "ops/linear/split/nvfp4/shapes/n14336_k5120/launch.h"
+#if NINFER_CUDA_HAS_TMA
 #include "ops/linear/kernels/nvfp4/nvfp4_a4_tma.cuh"
 
 namespace ninfer::ops::detail::linear_split::nvfp4_n14336_k5120 {
@@ -16,3 +17,16 @@ void launch_a4_tma(const Nvfp4A4Operands& p, std::span<const Tensor> outputs, cu
 }
 
 } // namespace ninfer::ops::detail::linear_split::nvfp4_n14336_k5120
+
+#else
+// port (sm_89): this implementation needs TMA, setmaxnreg and mbarrier (sm_90+). The same
+// shape has a non-TMA implementation, and the dispatch sites test NINFER_CUDA_HAS_TMA, so this
+// entry point exists only to keep the symbol defined for the shape's tables.
+#include <stdexcept>
+
+namespace ninfer::ops::detail::linear_split::nvfp4_n14336_k5120 {
+void launch_a4_tma(const Nvfp4A4Operands&, std::span<const Tensor>, cudaStream_t) {
+    throw std::logic_error("launch_a4_tma requires TMA (sm_90+), which this build cannot execute");
+}
+} // namespace ninfer::ops::detail::linear_split::nvfp4_n14336_k5120
+#endif
