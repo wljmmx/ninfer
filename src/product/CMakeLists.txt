@@ -3,6 +3,11 @@ add_library(ninfer_media_acquire STATIC
 )
 ninfer_internal_includes(ninfer_media_acquire)
 target_link_libraries(ninfer_media_acquire PRIVATE ${NINFER_CURL_TARGET})
+if(WIN32)
+  # port: host-name resolution and address formatting (getaddrinfo, freeaddrinfo, ntohl, InetNtopA ->
+  # inet_ntop) live in ws2_32 on Windows; libcurl does not pull the import library in for us.
+  target_link_libraries(ninfer_media_acquire PRIVATE Ws2_32)
+endif()
 
 add_library(ninfer_product_prompt_input STATIC
   prompt_input/prompt_input.cpp
