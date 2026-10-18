@@ -35,6 +35,10 @@ set_tests_properties(ninfer_device_sync_empty_test PROPERTIES
 ninfer_add_test(ninfer_decode_graph_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_decode_graph.cpp"
   LIBRARIES ninfer_core)
 
+ninfer_add_test(ninfer_vmm_pool_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_vmm_pool.cpp"
+  LIBRARIES ninfer_core)
+set_tests_properties(ninfer_vmm_pool_test PROPERTIES SKIP_RETURN_CODE 77)
+
 ninfer_add_test(ninfer_tensor_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_tensor.cpp"
   LIBRARIES ninfer_core)
 

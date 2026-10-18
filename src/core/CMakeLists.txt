@@ -48,11 +48,14 @@ add_library(ninfer_core STATIC
   weight_view.cpp
   weight_bank.cpp
   expert_cache.cpp
+  vmm_pool.cpp
   decode_graph.cpp
 )
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
 target_link_libraries(ninfer_core PUBLIC ninfer_cpu CUDA::cudart CUDA::nvtx3 Threads::Threads)
+# port (sm_89): VmmPool uses the driver VMM entry points.
+target_link_libraries(ninfer_core PUBLIC CUDA::cuda_driver)
 if(NOT WIN32)
   target_link_libraries(ninfer_core PRIVATE ${NINFER_URING_TARGET})
 endif()
