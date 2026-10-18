@@ -45,7 +45,7 @@ static __device__ unsigned long long kv_v8_groups = 0;
 static __device__ double kv_v8_absmax_sum = 0.0;
 
 template <typename Geometry, bool PackedK = false, bool E8Lattice = false, bool E8Root = false,
-          bool V8Root = false>
+          bool V8Root = false, bool V8Lattice = false>
 __device__ __forceinline__ void kv_cache_append_rk_row(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     std::int8_t* __restrict__ cache_k, std::int8_t* __restrict__ cache_v,
@@ -325,6 +325,61 @@ __device__ __forceinline__ void kv_cache_append_rk_row(
             }
         }
         return;
+    } else if constexpr (V8Lattice) {
+        // rk4v3-e8 V plane: 64 B of (root, rad_axis) pairs in [0,64) plus one residual bit per
+        // element packed into [64,96). Mirrors the E8Lattice key branch; V is not rotated.
+        for (int grp = 0; grp < Groups; ++grp) {
+            float g_abs = fmaxf(fabsf(v_vals[2 * grp]), fabsf(v_vals[2 * grp + 1]));
+            g_abs       = warp_max(g_abs, FullMask);
+            const __half v_scale = rk4_absmax_to_scale_h(g_abs);
+            const float vs       = __half2float(v_scale);
+            uint8_t root0, rad0, root1, rad1;
+            e8_encode_cylinder_8d_warp(v_vals[2 * grp], vs, root0, rad0, lane);
+            e8_encode_cylinder_8d_warp(v_vals[2 * grp + 1], vs, root1, rad1, lane);
+            __align__(8) int8_t dec0[8];
+            __align__(8) int8_t dec1[8];
+            e8_root_decode_8d_fast(root0, rad0, dec0);
+            e8_root_decode_8d_fast(root1, rad1, dec1);
+            const bool up0 = v_vals[2 * grp] / vs >= static_cast<float>(dec0[lane & 7]);
+            const bool up1 = v_vals[2 * grp + 1] / vs >= static_cast<float>(dec1[lane & 7]);
+            const std::uint32_t ballot0 = __ballot_sync(FullMask, up0);
+            const std::uint32_t ballot1 = __ballot_sync(FullMask, up1);
+            const std::uint32_t pair0      = root0 | (rad0 << 8);
+            const std::uint32_t pair1      = root1 | (rad1 << 8);
+            const std::uint32_t pair0_next = __shfl_xor_sync(FullMask, pair0, 8);
+            const std::uint32_t pair1_next = __shfl_xor_sync(FullMask, pair1, 8);
+            if ((lane & 15) == 0) {
+                const int s0 = lane >> 3;
+                const std::int64_t off0 = paged_kv_element_offset<kRkE8KLatticeExtent, Geometry::KVHeads>(
+                    physical_page, kv_head, page_offset, (grp * 8 + s0) * 2);
+                *reinterpret_cast<std::uint32_t*>(&cache_v[off0]) = pair0 | (pair0_next << 16);
+                const std::int64_t off1 = paged_kv_element_offset<kRkE8KLatticeExtent, Geometry::KVHeads>(
+                    physical_page, kv_head, page_offset, (grp * 8 + s0 + 4) * 2);
+                *reinterpret_cast<std::uint32_t*>(&cache_v[off1]) = pair1 | (pair1_next << 16);
+            }
+            if (lane == 0) {
+                const std::uint32_t sb00 = ballot0 & 0xffu;
+                const std::uint32_t sb01 = (ballot0 >> 8) & 0xffu;
+                const std::uint32_t sb02 = (ballot0 >> 16) & 0xffu;
+                const std::uint32_t sb03 = (ballot0 >> 24) & 0xffu;
+                const std::int64_t so0 = paged_kv_element_offset<kRkE8KLatticeExtent, Geometry::KVHeads>(
+                    physical_page, kv_head, page_offset, 64 + grp * 8);
+                *reinterpret_cast<std::uint32_t*>(&cache_v[so0]) =
+                    sb00 | (sb01 << 8) | (sb02 << 16) | (sb03 << 24);
+                const std::uint32_t sb10 = ballot1 & 0xffu;
+                const std::uint32_t sb11 = (ballot1 >> 8) & 0xffu;
+                const std::uint32_t sb12 = (ballot1 >> 16) & 0xffu;
+                const std::uint32_t sb13 = (ballot1 >> 24) & 0xffu;
+                const std::int64_t so1 = paged_kv_element_offset<kRkE8KLatticeExtent, Geometry::KVHeads>(
+                    physical_page, kv_head, page_offset, 64 + grp * 8 + 4);
+                *reinterpret_cast<std::uint32_t*>(&cache_v[so1]) =
+                    sb10 | (sb11 << 8) | (sb12 << 16) | (sb13 << 24);
+                scale_v[paged_kv_element_offset<4, Geometry::KVHeads>(
+                    physical_page, kv_head, page_offset, grp)] =
+                    __float2half_rn(__half2float(v_scale) / static_cast<float>(kRkE8KFracGrid));
+            }
+        }
+        return;
     }
     for (int grp = 0; grp < Groups; ++grp) {
         float g_abs = fmaxf(fabsf(v_vals[2 * grp]), fabsf(v_vals[2 * grp + 1]));
@@ -359,7 +414,7 @@ __device__ __forceinline__ void kv_cache_append_rk_row(
 }
 
 template <typename Geometry, typename Metadata, bool PackedK = false, bool E8Lattice = false,
-          bool E8Root = false, bool MultiBatch = false, bool V8Root = false>
+          bool E8Root = false, bool MultiBatch = false, bool V8Root = false, bool V8Lattice = false>
 __launch_bounds__(256) __global__
     void kv_cache_append_full_rk_kernel(const __nv_bfloat16* __restrict__ k,
                                          const __nv_bfloat16* __restrict__ v,
@@ -407,7 +462,7 @@ __launch_bounds__(256) __global__
         const int physical_page = block_table[pos >> 6];
         const int page_offset   = pos & 63;
 
-        kv_cache_append_rk_row<Geometry, PackedK, E8Lattice, E8Root, V8Root>(
+        kv_cache_append_rk_row<Geometry, PackedK, E8Lattice, E8Root, V8Root, V8Lattice>(
             k + (MultiBatch ? static_cast<std::int64_t>(batch) * Geometry::KVHeads * 256 * tokens : 0),
             v + (MultiBatch ? static_cast<std::int64_t>(batch) * Geometry::KVHeads * 256 * tokens : 0),
             cache_k, cache_v, scale_k, scale_v,
@@ -416,3 +471,13 @@ __launch_bounds__(256) __global__
 }
 
 } // namespace ninfer::ops
+
+
+
+
+
+
+
+
+
+

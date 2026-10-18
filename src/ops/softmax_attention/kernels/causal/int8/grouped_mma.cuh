@@ -18,11 +18,14 @@
 
 namespace ninfer::ops::detail {
 
+
+
+
 // Native INT8 QK accumulates each G64 group in INT32, then applies Q/K scales in FP32.
 // PV dequantizes represented V to FP16 and accumulates in FP32.
 template <class Geometry, class Schedule, bool MultiBatch, bool Masked, class CacheInput,
           bool ParallelQueries = false, bool PackedV = false, bool PackedK = false,
-          bool E8Lattice = false, bool E8Root = false, bool V8Root = false>
+          bool E8Lattice = false, bool E8Root = false, bool V8Root = false, bool V8Lattice = false>
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     void int8_kv_grouped_mma_kernel(
         const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos,
@@ -563,6 +566,32 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                         *reinterpret_cast<const std::uint64_t*>(vdec0);
                     *reinterpret_cast<std::uint64_t*>(&v_i8[key_l * D + d + 8]) =
                         *reinterpret_cast<const std::uint64_t*>(vdec1);
+                } else if constexpr (V8Lattice) {
+                    // rk4v3-e8 value read-back: same 96 B carrier as the E8 lattice key, V not
+                    // rotated. 4 code bytes at (subidx * 2), residual sign bytes at 64 + subidx.
+                    const int subidx = (d / 64) * 8 + ((d / 8) & 7);
+                    const std::int64_t voff =
+                        paged_kv_element_offset<kRkE8KLatticeExtent, Geometry::KVHeads>(
+                            physical_page, kv_head, key & kv::kPageMask, subidx * 2);
+                    const std::uint32_t raw =
+                        *reinterpret_cast<const std::uint32_t*>(&cache_v_i8[voff]);
+                    const std::uint16_t signs =
+                        *reinterpret_cast<const std::uint16_t*>(&cache_v_i8[voff + 64 - subidx]);
+                    __align__(8) int8_t vdec[8];
+                    e8_root_decode_8d_fast(static_cast<uint8_t>(raw), static_cast<uint8_t>(raw >> 8),
+                                           vdec);
+                    if constexpr (kRkE8KResidualOn) {
+                        rk4_apply_e8_residual(vdec, static_cast<std::uint32_t>(signs & 0xffu));
+                    }
+                    *reinterpret_cast<std::uint64_t*>(&v_i8[key_l * D + d]) =
+                        *reinterpret_cast<const std::uint64_t*>(vdec);
+                    e8_root_decode_8d_fast(static_cast<uint8_t>(raw >> 16),
+                                           static_cast<uint8_t>(raw >> 24), vdec);
+                    if constexpr (kRkE8KResidualOn) {
+                        rk4_apply_e8_residual(vdec, static_cast<std::uint32_t>(signs >> 8));
+                    }
+                    *reinterpret_cast<std::uint64_t*>(&v_i8[key_l * D + d + 8]) =
+                        *reinterpret_cast<const std::uint64_t*>(vdec);
                 } else if constexpr (PackedV) {
                     // 16 dims occupy 8 packed bytes at the half offset.
                     const std::int64_t voff = rk4_v_code_index<Geometry>(
@@ -574,7 +603,12 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             } else {
                 std::int8_t* dst = &k_i8[key_l * D + common::swizzle_xor_64(key_l, dc * 8) * 2];
                 common::store_vec(dst, make_int4(0, 0, 0, 0));
-                if constexpr (PackedV) {
+                if constexpr (V8Lattice) {
+                    // rk4v3-e8: the decoded V is written linearly at d..d+15, so the idle tile must
+                    // be cleared over the same 16 bytes. Falling through to the PackedV path below
+                    // would zero 8 bytes at d/2 and leave the rest as stale shared memory.
+                    common::store_vec(&v_i8[key_l * D + d], make_int4(0, 0, 0, 0));
+                } else if constexpr (PackedV) {
                     common::store_vec(&v_i8[key_l * D + (d >> 1)], make_int2(0, 0));
                 } else {
                     common::store_vec(&v_i8[key_l * D + d], make_int4(0, 0, 0, 0));
@@ -884,3 +918,15 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
 }
 
 } // namespace ninfer::ops::detail
+
+
+
+
+
+
+
+
+
+
+
+

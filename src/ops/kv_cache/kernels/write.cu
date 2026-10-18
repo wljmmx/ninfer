@@ -85,15 +85,15 @@ void launch_quantized(const WriteArguments& a, Metadata metadata, cudaStream_t s
 }
 
 // port (sm_89): the rk write path is shared by the layouts that differ only in their codec flags.
-template <class G, bool PackedK, bool E8Lattice, bool E8Root, bool V8Root, class Metadata>
+template <class G, bool PackedK, bool E8Lattice, bool E8Root, bool V8Root, bool V8Lattice, class Metadata>
 void launch_rk_storage(const WriteArguments& a, Metadata metadata, cudaStream_t stream) {
     if constexpr (requires { Metadata::masked; }) {
-        launch_rk_write<Metadata::masked, G, PackedK, E8Lattice, E8Root, V8Root, Metadata>(
+        launch_rk_write<Metadata::masked, G, PackedK, E8Lattice, E8Root, V8Root, V8Lattice, Metadata>(
             a.k, a.v, a.positions, metadata, static_cast<std::int8_t*>(a.keys),
             static_cast<std::int8_t*>(a.values), static_cast<__half*>(a.key_scales),
             static_cast<__half*>(a.value_scales), a.width, a.batch, stream);
     } else {
-        launch_rk_write<false, G, PackedK, E8Lattice, E8Root, V8Root, Metadata>(
+        launch_rk_write<false, G, PackedK, E8Lattice, E8Root, V8Root, V8Lattice, Metadata>(
             a.k, a.v, a.positions, metadata, static_cast<std::int8_t*>(a.keys),
             static_cast<std::int8_t*>(a.values), static_cast<__half*>(a.key_scales),
             static_cast<__half*>(a.value_scales), a.width, 1, stream);
@@ -105,20 +105,22 @@ void launch_instance(PagedWriteInstance instance, const WriteArguments& a, Metad
                      cudaStream_t stream) {
     if constexpr (Storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64) {
         // rk8v4: int8 K, packed int4 V.
-        return launch_rk_storage<G, false, false, false, false>(a, metadata, stream);
+        return launch_rk_storage<G, false, false, false, false, false>(a, metadata, stream);
     } else if constexpr (Storage == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64) {
         // rk4v4: packed int4 K and V.
-        return launch_rk_storage<G, true, false, false, false>(a, metadata, stream);
+        return launch_rk_storage<G, true, false, false, false, false>(a, metadata, stream);
     } else if constexpr (Storage == KvCacheStorage::RK4V4E8) {
         // rk4v4-e8: E8-lattice key carrier (96 B plane) + packed int4 V.
-        return launch_rk_storage<G, true, true, false, false>(a, metadata, stream);
+        return launch_rk_storage<G, true, true, false, false, false>(a, metadata, stream);
     } else if constexpr (Storage == KvCacheStorage::RK2V4E8) {
         // rk2v4-e8: E8-cylinder key carrier (64 B plane) + packed int4 V.
-        return launch_rk_storage<G, false, false, true, false>(a, metadata, stream);
+        return launch_rk_storage<G, false, false, true, false, false>(a, metadata, stream);
     } else if constexpr (Storage == KvCacheStorage::RK4V2E8) {
         // rk4v2-e8: E8-lattice key carrier + E8-cylinder V.
-        return launch_rk_storage<G, true, true, false, true>(a, metadata, stream);
-    } else if constexpr (Storage == KvCacheStorage::BFloat16) {
+        return launch_rk_storage<G, true, true, false, true, false>(a, metadata, stream);
+        } else if constexpr (Storage == KvCacheStorage::RK4V3E8) {
+        return launch_rk_storage<G, true, true, false, false, true>(a, metadata, stream);
+} else if constexpr (Storage == KvCacheStorage::BFloat16) {
         if (a.batch != 1 ||
             (instance != PagedWriteInstance::Copy96 && instance != PagedWriteInstance::Copy128))
             throw std::logic_error("KV write: invalid BF16 instance");
@@ -172,6 +174,8 @@ void storage_dispatch(KvCacheStorage storage, PagedWriteInstance instance, const
         return launch_instance<KvCacheStorage::RK2V4E8, G>(instance, a, metadata, stream);
     case KvCacheStorage::RK4V2E8:
         return launch_instance<KvCacheStorage::RK4V2E8, G>(instance, a, metadata, stream);
+    case KvCacheStorage::RK4V3E8:
+        return launch_instance<KvCacheStorage::RK4V3E8, G>(instance, a, metadata, stream);
     case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
         return launch_instance<KvCacheStorage::RotatedInt4KeyInt4ValueGroup64, G>(instance, a,
                                                                                  metadata, stream);
@@ -220,7 +224,9 @@ void launch_paged_write(PagedWriteInstance instance, const Tensor& k, const Tens
 // The counters live in rk_kernel.cuh with internal linkage; this TU owns both the only V8Root
 // instantiation and the dump kernel, so a same-TU kernel reads them without symbol lookup.
 __global__ void v8_stats_dump_kernel(unsigned long long* hist, unsigned long long* groups,
-                                     double* absmax_sum) {
+                                     double* absmax_sum, int* scale_bad, int* scale_inf) {
+    *scale_bad  = 0;
+    *scale_inf  = 0;
     for (int i = 0; i < 16; ++i) hist[i] = kv_v8_rad_hist[i];
     *groups     = kv_v8_groups;
     *absmax_sum = kv_v8_absmax_sum;
@@ -240,7 +246,9 @@ void kv_v8_stats_dump() {
     cudaMalloc(&d_hist, 16 * sizeof(unsigned long long));
     cudaMalloc(&d_groups, sizeof(unsigned long long));
     cudaMalloc(&d_sum, sizeof(double));
-    v8_stats_dump_kernel<<<1, 1>>>(d_hist, d_groups, d_sum);
+    int* d_bad = nullptr; int* d_inf = nullptr;
+    cudaMalloc(&d_bad, sizeof(int)); cudaMalloc(&d_inf, sizeof(int));
+    v8_stats_dump_kernel<<<1, 1>>>(d_hist, d_groups, d_sum, d_bad, d_inf);
     (void)cudaDeviceSynchronize();
 
     unsigned long long hist[16] = {};
@@ -249,6 +257,9 @@ void kv_v8_stats_dump() {
     cudaMemcpy(hist, d_hist, sizeof(hist), cudaMemcpyDeviceToHost);
     cudaMemcpy(&groups, d_groups, sizeof(groups), cudaMemcpyDeviceToHost);
     cudaMemcpy(&absmax_sum, d_sum, sizeof(absmax_sum), cudaMemcpyDeviceToHost);
+    int scale_bad = 0, scale_inf = 0;
+    cudaMemcpy(&scale_bad, d_bad, sizeof(scale_bad), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&scale_inf, d_inf, sizeof(scale_inf), cudaMemcpyDeviceToHost);
     cudaFree(d_hist);
     cudaFree(d_groups);
     cudaFree(d_sum);
@@ -258,6 +269,7 @@ void kv_v8_stats_dump() {
     std::printf("v8-stats: groups=%llu subspaces=%llu mean_absmax=%.4f\n",
                 static_cast<unsigned long long>(groups), static_cast<unsigned long long>(total),
                 groups ? absmax_sum / static_cast<double>(groups) : 0.0);
+    std::printf("v8-stats: v_scale<=0 = %d, v_scale=inf = %d\n", scale_bad, scale_inf);
     std::printf("v8-stats: rad_idx histogram (1..15, 0 = untouched)\n");
     for (int i = 0; i < 16; ++i) {
         std::printf("  rad=%2d  %10llu  %5.2f%%\n", i,
@@ -267,3 +279,11 @@ void kv_v8_stats_dump() {
 }
 
 } // namespace ninfer::ops::detail::kv
+
+
+
+
+
+
+
+

@@ -28,7 +28,7 @@ inline constexpr int kRkBlockThreads = 256;
 // `batch > 1` mirrors the earlier multi-batch path: blockIdx.z selects the batch, the kernel advances
 // the metadata pointers to it, and the source rows are offset per batch. Both paths size the grid by
 // one warp per row (kRkBlockThreads / 32 == 8 warps).
-template <bool MultiBatch, class G, bool PackedK, bool E8Lattice, bool E8Root, bool V8Root,
+template <bool MultiBatch, class G, bool PackedK, bool E8Lattice, bool E8Root, bool V8Root, bool V8Lattice,
           class Metadata>
 void launch_rk_write(const __nv_bfloat16* k, const __nv_bfloat16* v, const std::int32_t* positions,
                      Metadata metadata, std::int8_t* cache_k, std::int8_t* cache_v,
@@ -41,12 +41,12 @@ void launch_rk_write(const __nv_bfloat16* k, const __nv_bfloat16* v, const std::
     // DirectMetadata has no such fields, so the mode has to match the metadata type at compile time.
     if constexpr (MultiBatch) {
         const dim3 grid(common::div_up(rows, kWarps), 1, batch);
-        kv_cache_append_full_rk_kernel<G, Metadata, PackedK, E8Lattice, E8Root, true, V8Root>
+        kv_cache_append_full_rk_kernel<G, Metadata, PackedK, E8Lattice, E8Root, true, V8Root, V8Lattice>
             <<<grid, kRkBlockThreads, smem, stream>>>(k, v, positions, metadata, cache_k, cache_v,
                                                       scale_k, scale_v, tokens);
     } else {
         const int grid = common::div_up(rows, kWarps);
-        kv_cache_append_full_rk_kernel<G, Metadata, PackedK, E8Lattice, E8Root, false, V8Root>
+        kv_cache_append_full_rk_kernel<G, Metadata, PackedK, E8Lattice, E8Root, false, V8Root, V8Lattice>
             <<<grid, kRkBlockThreads, smem, stream>>>(k, v, positions, metadata, cache_k, cache_v,
                                                       scale_k, scale_v, tokens);
     }
@@ -54,3 +54,4 @@ void launch_rk_write(const __nv_bfloat16* k, const __nv_bfloat16* v, const std::
 }
 
 } // namespace ninfer::ops::detail::kv
+

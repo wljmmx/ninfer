@@ -45,6 +45,15 @@ calibrate_plan(const Setup& setup, ModelInstance<typename Setup::Types>& instanc
             .calibration_retained_bytes  = found->retained_increment_bytes,
         };
         const auto available = budget.available(device_memory_snapshot(device.device()));
+        // port (sm_89): the fallback costs a full 19.6 GiB reload, so make the decision point and
+        // its numbers observable (default off).
+        if (std::getenv("NINFER_TRACE_PLAN") != nullptr) {
+            std::fprintf(stderr,
+                         "[plan] host_experts=%d chunk=%u graph=%zu available=%zu fits=%d\n",
+                         candidate.host_experts ? 1 : 0, candidate.chunk, graph_bytes, available,
+                         graph_bytes <= available ? 1 : 0);
+            std::fflush(stderr);
+        }
         if (graph_bytes > available) return std::nullopt;
         auto next = setup.plan(device, options, candidate.host_experts, available - graph_bytes);
         if (!next) return std::nullopt;
@@ -218,8 +227,11 @@ build_model(const artifact::Reader& reader, EngineOptions& options, DeviceContex
     Setup setup(reader, options, device.device());
     const auto& weights          = setup.weights;
     const auto initial_available = budget.available(device_memory_snapshot(device.device()));
+    // port (sm_89): an explicit Host request skips the resident attempt, so the CPU-expert
+    // (streaming) path can be measured without starving the device first.
     auto candidate =
-        weights.resident_bytes && *weights.resident_bytes <= initial_available
+        options.expert_residency == ExpertResidency::Auto && weights.resident_bytes &&
+                *weights.resident_bytes <= initial_available
             ? setup.plan(device, options, false, initial_available - *weights.resident_bytes)
             : std::nullopt;
     bool host_experts = !candidate.has_value();
@@ -229,6 +241,14 @@ build_model(const artifact::Reader& reader, EngineOptions& options, DeviceContex
         throw std::invalid_argument(
             "Device budget cannot hold model weights and required execution resources");
     binding.complete();
+    if (std::getenv("NINFER_TRACE_PLAN") != nullptr) {
+        std::fprintf(stderr, "[plan] initial_avail=%zu resident=%zu projected=%zu host_experts=%d\n",
+                     initial_available,
+                     weights.resident_bytes ? *weights.resident_bytes : 0,
+                     weights.resident_bytes ? initial_available - *weights.resident_bytes : 0,
+                     host_experts ? 1 : 0);
+        std::fflush(stderr);
+    }
     std::unique_ptr<ModelInstance<typename Setup::Types>> instance;
     std::optional<CalibratedPlan<typename Setup::ExecutionPlan>> calibrated;
     unsigned preparation_attempts       = 0;

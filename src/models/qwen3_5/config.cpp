@@ -62,8 +62,47 @@ AttentionConfig attention(const Json& value) {
     return out;
 }
 
+constexpr double kYarnPi = 3.14159265358979323846;
+
+// port (sm_89): YaRN (Peng et al. 2023) per-pair inverse frequencies -- a linear ramp between the
+// trained extrapolated frequency and the 1/factor interpolated one, bounded by the two correction
+// dimensions derived from the trained position capacity. Same maths as the release line.
+void compute_yarn_frequencies(RopeConfig& out, double beta_fast, double beta_slow) {
+    const std::uint32_t pairs = out.rotary_dim / 2;
+    if (pairs == 0 || pairs > out.yarn_inv_frequency.size()) {
+        throw ArtifactError("rotary width exceeds the YaRN frequency table");
+    }
+    const double base     = out.rope_theta;
+    const double max_pos  = out.yarn_original_max_position_embeddings;
+    const double factor   = out.yarn_factor;
+    const auto correction = [&](double rotations) {
+        return (static_cast<double>(out.rotary_dim) *
+                std::log(max_pos / (rotations * 2.0 * kYarnPi))) /
+               (2.0 * std::log(base));
+    };
+    const double low_raw  = std::floor(correction(beta_fast));
+    const double high_raw = std::ceil(correction(beta_slow));
+    const double low      = std::max(low_raw, 0.0);
+    const double high     = std::min(high_raw, static_cast<double>(out.rotary_dim) - 1.0);
+    for (std::uint32_t i = 0; i < pairs; ++i) {
+        const double extrapolated =
+            1.0 / std::pow(base, 2.0 * static_cast<double>(i) / static_cast<double>(out.rotary_dim));
+        const double interpolated = extrapolated / factor;
+        double ramp               = 0.0;
+        if (high > low) {
+            ramp = (static_cast<double>(i) - low) / (high - low);
+            ramp = std::min(std::max(ramp, 0.0), 1.0);
+        }
+        out.yarn_inv_frequency[i] =
+            static_cast<float>(interpolated * ramp + extrapolated * (1.0 - ramp));
+    }
+    out.yarn_pair_count = pairs;
+}
+
 RopeConfig rope(const Json& value, std::uint32_t head_dim) {
-    require_members(value, {"rope_theta", "partial_rotary_factor", "mrope_section"}, {},
+    require_members(value, {"rope_theta", "partial_rotary_factor", "mrope_section"},
+                    {"rope_type", "factor", "original_max_position_embeddings", "beta_fast",
+                     "beta_slow", "attention_factor"},
                     "text RoPE");
     RopeConfig out;
     out.rope_theta            = positive_float(value, "rope_theta");
@@ -95,6 +134,28 @@ RopeConfig rope(const Json& value, std::uint32_t head_dim) {
     }
     if (counts != out.mrope_section) {
         throw ArtifactError("MRoPE sections exceed interleaved axis ranges");
+    }
+    if (value.contains("rope_type")) {
+        if (artifact::require_id(value.at("rope_type"), "rope_type") != "yarn") {
+            throw ArtifactError("unsupported rope_type; only yarn is implemented");
+        }
+        if (!value.contains("factor") || !value.contains("original_max_position_embeddings")) {
+            throw ArtifactError("yarn requires factor and original_max_position_embeddings");
+        }
+        out.yarn = true;
+        out.yarn_factor = positive_float(value, "factor");
+        out.yarn_original_max_position_embeddings =
+            integer(value.at("original_max_position_embeddings"),
+                    "original_max_position_embeddings");
+        const double beta_fast =
+            value.contains("beta_fast") ? positive_float(value, "beta_fast") : 32.0;
+        const double beta_slow =
+            value.contains("beta_slow") ? positive_float(value, "beta_slow") : 1.0;
+        out.yarn_attention_factor =
+            value.contains("attention_factor")
+                ? positive_float(value, "attention_factor")
+                : static_cast<float>(0.1 * std::log(static_cast<double>(out.yarn_factor)) + 1.0);
+        compute_yarn_frequencies(out, beta_fast, beta_slow);
     }
     return out;
 }

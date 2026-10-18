@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ninfer/ops/rope.h"
+
 #include "ops/rope/kernels/phase.cuh"
 
 #include <cuda_bf16.h>
@@ -177,7 +179,7 @@ static __global__ void rope_generic_kernel(const std::int32_t* positions, std::i
                                            std::int32_t head_dim, std::int32_t rotary_dim,
                                            float theta, std::int32_t q_heads, std::int32_t k_heads,
                                            std::int32_t tokens, std::int64_t q_token_stride,
-                                           std::int64_t k_token_stride) {
+                                           std::int64_t k_token_stride, RopeScaling scaling) {
     const int token = static_cast<int>(blockIdx.x);
     if (token >= tokens) { return; }
     const int half = rotary_dim / 2;
@@ -192,11 +194,22 @@ static __global__ void rope_generic_kernel(const std::int32_t* positions, std::i
             int axis       = 0;
             float exponent = 0.0F;
             generic_axis_frequency(axes, head_dim, rotary_dim, pair, &axis, &exponent);
-            const float frequency = powf(theta, exponent);
+            // port (sm_89): YaRN swaps the trained frequency for the ramped one and folds the
+            // attention factor into sin/cos, exactly as the release line does.
+            const float frequency =
+                scaling.yarn ? scaling.inv_frequency[pair] : powf(theta, exponent);
             const float angle =
                 static_cast<float>(positions[static_cast<std::int64_t>(axis) * tokens + token]) *
                 frequency;
-            sincosf(angle, &sin_cache[pair], &cos_cache[pair]);
+            float sine   = 0.0F;
+            float cosine = 0.0F;
+            sincosf(angle, &sine, &cosine);
+            if (scaling.yarn) {
+                sine *= scaling.attention_factor;
+                cosine *= scaling.attention_factor;
+            }
+            sin_cache[pair] = sine;
+            cos_cache[pair] = cosine;
         }
     }
     __syncthreads();

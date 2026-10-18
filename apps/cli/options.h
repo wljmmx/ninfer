@@ -27,6 +27,8 @@ struct Options {
     std::uint32_t max_new        = 128;
     std::uint32_t max_context    = 2048;
     KvCapacityPolicy kv_capacity = KvCapacityPolicy::explicit_capacity(2048);
+    bool expert_host = false; // port (sm_89): force the CPU-expert (streaming) plan.
+    std::uint32_t vram_reserve_mib = 0; // port (sm_89): keep this much VRAM free of the expert cache.
     std::uint32_t prefill_chunk  = 0;
     int device                   = 0;
 

@@ -28,12 +28,24 @@ namespace ninfer::ops {
  * extents perform no device work. The Op uses no workspace or persistent state. `execution`
  * supplies the stream and the selected device's positive physical SM count.
  */
+// port (sm_89): YaRN frequency scaling (Peng et al. 2023). When `yarn` is false every field below
+// is inert and the frequencies are the trained theta^(-2*i/rotary_dim) ones.
+inline constexpr int kRopeMaximumPairs = 128;
+
+struct RopeScaling {
+    // A plain array rather than std::array: this struct is passed by value into device code, and
+    // std::array::operator[] is not a device function without --expt-relaxed-constexpr.
+    bool yarn              = false;
+    float attention_factor = 1.0f;
+    float inv_frequency[kRopeMaximumPairs] = {};
+};
+
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
-          CudaExecutionView execution);
+          CudaExecutionView execution, const RopeScaling& scaling = RopeScaling{});
 
 // Single-tensor form with the same formula and storage contract. The head count comes directly
 // from x; Q versus K role does not change the transformation.
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
-          CudaExecutionView execution);
+          CudaExecutionView execution, const RopeScaling& scaling = RopeScaling{});
 
 } // namespace ninfer::ops

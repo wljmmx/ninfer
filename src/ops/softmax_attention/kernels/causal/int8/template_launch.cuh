@@ -12,7 +12,7 @@ namespace ninfer::ops::detail {
 
 template <class G, class S, bool MultiBatch, bool Masked, bool Writable, class Input,
           bool ParallelQueries = false, bool PackedV = false, bool PackedK = false,
-          bool E8Lattice = false, bool E8Root = false, bool V8Root = false>
+          bool E8Lattice = false, bool E8Root = false, bool V8Root = false, bool V8Lattice = false>
 void launch_int8_kv_grouped_mma(const CausalAttentionOperands& p, Int8KvCacheView<Writable> cache,
                                 Input input, CausalKvPartition partition, CausalPartialView partial,
                                 cudaStream_t stream) {
@@ -29,7 +29,7 @@ void launch_int8_kv_grouped_mma(const CausalAttentionOperands& p, Int8KvCacheVie
         if (!input.k || !input.v) throw std::invalid_argument("INT8 append requires K/V");
     constexpr auto kernel =
         int8_kv_grouped_mma_kernel<G, S, MultiBatch, Masked, Input, ParallelQueries, PackedV,
-                                   PackedK, E8Lattice, E8Root, V8Root>;
+                                   PackedK, E8Lattice, E8Root, V8Root, V8Lattice>;
     constexpr int bytes = S::kDynamicArena ? S::kArenaBytes : 0;
     (void)common::prepare_shared<bytes, kernel, true>();
     const dim3 grid(G::KVHeads * (ParallelQueries ? common::div_up(p.width, S::kTokenTile) : 1),
@@ -67,3 +67,5 @@ void launch_int8_kv_tiled_mma(const CausalAttentionOperands& p, Int8KvReadView c
 }
 
 } // namespace ninfer::ops::detail
+
+

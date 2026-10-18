@@ -3,6 +3,8 @@
 #include "models/qwen3_5/program/planning/moe.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 
 namespace ninfer::models::qwen3_5 {
 namespace {
@@ -46,7 +48,18 @@ std::optional<Startup::ExecutionPlan> Startup::plan(DeviceContext& device,
                                                          curve.primary_page_tokens - 1) /
                                                         curve.primary_page_tokens)
                            : curve.minimum_primary_page_groups;
-    if (curve.reservation_bytes(pages) > available) return std::nullopt;
+    if (curve.reservation_bytes(pages) > available) {
+        // port (sm_89): the minimum capacity is the requested context, so this is the "context does
+        // not fit beside resident weights" branch -- silent failure used to cost a full reload.
+        if (std::getenv("NINFER_TRACE_PLAN") != nullptr) {
+            std::fprintf(stderr,
+                         "[plan] infeasible host_experts=%d ctx=%u min_reservation=%zu available=%zu\n",
+                         host_experts ? 1 : 0, options.max_context, curve.reservation_bytes(pages),
+                         available);
+            std::fflush(stderr);
+        }
+        return std::nullopt;
+    }
     if (!host_experts) {
         auto resolution = resolve_kv_capacity(policy, curve, available);
         return ExecutionPlan{std::move(planner).finalize(resolution.primary_page_groups),
@@ -63,7 +76,8 @@ std::optional<Startup::ExecutionPlan> Startup::plan(DeviceContext& device,
     CpuTopology topology;
     auto placement = moe::resolve_plan(*weights.offload, weights.banks,
                                        available - base.runtime_reservation_bytes, max_tokens,
-                                       topology, options.moe.cpu_workers);
+                                       topology, options.moe.cpu_workers,
+                                       options.moe.vram_reserve_bytes);
     if (!placement) return std::nullopt;
     auto moe   = std::make_shared<moe::Plan>(std::move(*placement));
     auto final = make_sequence_planner(profile, device, trial, moe);

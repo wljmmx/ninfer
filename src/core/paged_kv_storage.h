@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer {
 
@@ -136,8 +137,20 @@ struct PagedKVStorageLayout {
                     {DType::U8, 128, DType::FP16, 4}};
         }
         break;
+    case KvCacheStorage::RK4V3E8:
+        // rk4v3-e8: E8-lattice carriers on both planes -- 64 B of (root, rad_axis) pairs in
+        // [0,64) plus a 32 B per-element residual in [64,96).
+        if (head_dim == kD256KVCacheHeadDim) {
+            return {storage,
+                    head_dim,
+                    {DType::U8, 96, DType::FP16, 4},
+                    {DType::U8, 96, DType::FP16, 4}};
+        }
+        break;
     }
-    throw std::invalid_argument("unsupported paged KV-cache storage geometry");
+    throw std::invalid_argument("unsupported paged KV-cache storage geometry: storage=" + std::to_string(static_cast<int>(storage)) + " head_dim=" + std::to_string(head_dim));
 }
 
 } // namespace ninfer
+
+

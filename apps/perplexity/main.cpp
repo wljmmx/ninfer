@@ -57,6 +57,11 @@ struct Options {
     std::uint32_t stride                = 2048;
     int device                          = 0;
     ninfer::KvCacheStorage kv           = ninfer::KvCacheStorage::Fp8E4M3Row256;
+    // port (sm_89): expose the capacity policy so an offloaded plan can be measured without
+    // having to starve the resident plan first.
+    ninfer::KvCapacityPolicy kv_capacity = ninfer::KvCapacityPolicy::automatic();
+    bool expert_host = false;
+    std::uint32_t vram_reserve_mib = 0;
     bool quick                          = false;
     ninfer::product::LogLevel log_level = ninfer::product::LogLevel::Info;
 };
@@ -64,8 +69,9 @@ struct Options {
 std::string usage_text() {
     return "usage: ninfer-perplexity <model.ninfer> "
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
-           "       [--context N] [--stride N] [--device N]\n"
-           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|rk4v2-e8] [--output <directory>]\n"
+           "       [--context N] [--stride N] [--device N] [--kv-capacity N|auto]\n"
+           "       [--expert-host]\n"
+           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|rk4v2-e8|rk4v3-e8] [--output <directory>]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n";
 }
 
@@ -104,6 +110,17 @@ Options parse_options(int argc, char** argv) {
             out.text = std::filesystem::path(value("--text"));
         } else if (option == "--quick") {
             out.quick = true;
+        } else if (option == "--vram-reserve-mib") {
+            out.vram_reserve_mib = parse_integer<std::uint32_t>(value("--vram-reserve-mib"),
+                                                                "vram-reserve-mib");
+        } else if (option == "--expert-host") {
+            out.expert_host = true;
+        } else if (option == "--kv-capacity") {
+            const std::string_view capacity = value("--kv-capacity");
+            out.kv_capacity = capacity == "auto"
+                                  ? ninfer::KvCapacityPolicy::automatic()
+                                  : ninfer::KvCapacityPolicy::explicit_capacity(
+                                        parse_integer<std::uint32_t>(capacity, "kv-capacity"));
         } else if (option == "--context") {
             out.context = parse_integer<std::uint32_t>(value("--context"), "context");
         } else if (option == "--stride") {
@@ -130,12 +147,14 @@ Options parse_options(int argc, char** argv) {
                 out.kv = ninfer::KvCacheStorage::RK4V4E8;
             } else if (dtype == "rk2v4-e8") {
                 out.kv = ninfer::KvCacheStorage::RK2V4E8;
+            } else if (dtype == "rk4v3-e8") {
+                out.kv = ninfer::KvCacheStorage::RK4V3E8;
             } else if (dtype == "rk4v2-e8") {
                 out.kv = ninfer::KvCacheStorage::RK4V2E8;
             } else {
                 usage_error(
                     "--kv-dtype must be bf16, int8, fp8, nvfp4, k8v4, rk8v4, rk4v4, "
-                    "rk4v4-e8, rk2v4-e8, or rk4v2-e8");
+                    "rk4v4-e8, rk2v4-e8, rk4v2-e8, or rk4v3-e8");
             }
         } else if (option == "--output") {
             out.output = std::filesystem::path(value("--output"));
@@ -180,6 +199,8 @@ std::string kv_name(ninfer::KvCacheStorage value) {
         return "rk2v4-e8";
     case ninfer::KvCacheStorage::RK4V2E8:
         return "rk4v2-e8";
+    case ninfer::KvCacheStorage::RK4V3E8:
+        return "rk4v3-e8";
     }
     throw std::logic_error("unknown KV dtype");
 }
@@ -252,6 +273,11 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.purpose          = ninfer::EnginePurpose::CausalScoring;
     engine_options.device           = options.device;
     engine_options.max_context      = options.context;
+    engine_options.kv_capacity      = options.kv_capacity;
+    engine_options.moe.vram_reserve_bytes =
+        static_cast<std::size_t>(options.vram_reserve_mib) * 1024ULL * 1024ULL;
+    engine_options.expert_residency = options.expert_host ? ninfer::ExpertResidency::Host
+                                                          : ninfer::ExpertResidency::Auto;
     engine_options.kv_cache         = options.kv;
     engine_options.startup_observer = startup_log.observer();
     ninfer::Engine engine(std::move(engine_options));
@@ -506,3 +532,5 @@ int main(int argc, char** argv) {
         return 1;
     }
 }
+
+

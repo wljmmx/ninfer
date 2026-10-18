@@ -41,6 +41,22 @@ struct RopeConfig {
     std::array<std::uint32_t, 3> mrope_section{};
     std::uint32_t rotary_dim = 0;
     std::vector<std::uint8_t> pair_axes;
+
+    // port (sm_89): YaRN frequency scaling. When yarn is false every field below is inert and the
+    // frequencies are the trained theta^(-2*i/rotary_dim) ones.
+    bool yarn                                           = false;
+    float yarn_factor                                   = 1.0f;
+    std::uint32_t yarn_original_max_position_embeddings = 0;
+    float yarn_attention_factor                         = 1.0f;
+    std::uint32_t yarn_pair_count                       = 0;
+    std::array<float, 128> yarn_inv_frequency{};
+
+    // Position capacity implied by the scaling: trained capacity times the factor.
+    [[nodiscard]] std::uint64_t scaled_position_capacity(std::uint32_t trained) const noexcept {
+        if (!yarn) { return trained; }
+        return static_cast<std::uint64_t>(trained) *
+               static_cast<std::uint64_t>(yarn_factor + 0.5f);
+    }
 };
 
 struct GdnConfig {

@@ -52,6 +52,8 @@ enum class KvCacheStorage : std::uint8_t {
     // tolerates 2 bits because softmax normalisation absorbs part of the error; V has no such
     // buffer. Use rk4v4 / rk4v4-e8 (+0.44% / +3.28%) instead, or give V a >=4-bit carrier.
     RK4V2E8,
+    // rk4v3-e8 (IT.30/31 measurement vehicle): E8-lattice carriers on both planes (96 B each).
+    RK4V3E8,
 };
 
 enum class EnginePurpose : std::uint8_t {
@@ -171,7 +173,14 @@ struct MoeOptions {
     std::optional<std::vector<std::vector<std::uint32_t>>> expert_priority;
     // Zero selects physical cores while reserving a control-thread core when available.
     std::uint32_t cpu_workers = 0;
+    // port (sm_89): keep this much device memory free instead of handing it to the expert cache,
+    // so a CPU-expert (streaming) run can coexist with another program.
+    std::size_t vram_reserve_bytes = 0;
 };
+
+// port (sm_89): where routed experts live. Auto = resident when the plan fits, otherwise the
+// existing memory-pressure fallback; Host = always take the CPU-expert (streaming) plan.
+enum class ExpertResidency : std::uint8_t { Auto, Host };
 
 struct EngineOptions {
     std::filesystem::path artifact_path;
@@ -187,6 +196,7 @@ struct EngineOptions {
     // Zero uses 1024 tokens, or 4096 with CPU expert offload.
     std::uint32_t prefill_chunk = 0;
     MoeOptions moe;
+    ExpertResidency expert_residency = ExpertResidency::Auto;
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
@@ -1174,3 +1184,4 @@ struct LoadSummary {
 };
 
 } // namespace ninfer
+

@@ -32,16 +32,31 @@ void attention_projection(const Tensor& hidden, const AttentionParameters& param
     ops::linear_split(hidden, parameters.projection, outputs, workspace, execution);
 }
 
+// port (sm_89): pack the parsed YaRN tables into the op-side scaling struct.
+ops::RopeScaling rope_scaling(const RopeConfig& config) {
+    ops::RopeScaling scaling;
+    scaling.yarn             = config.yarn;
+    scaling.attention_factor = config.yarn_attention_factor;
+    if (config.yarn) {
+        for (std::uint32_t i = 0; i < config.yarn_pair_count; ++i) {
+            scaling.inv_frequency[i] = config.yarn_inv_frequency[i];
+        }
+    }
+    return scaling;
+}
+
 void text_rope(const Tensor& positions, const RopeConfig& config, Tensor& query,
                CudaExecutionView execution) {
     require_rope_axes(positions, config);
-    ops::rope(positions, dimension(config.rotary_dim), config.rope_theta, query, execution);
+    ops::rope(positions, dimension(config.rotary_dim), config.rope_theta, query, execution,
+              rope_scaling(config));
 }
 
 void text_rope(const Tensor& positions, const RopeConfig& config, Tensor& query, Tensor& key,
                CudaExecutionView execution) {
     require_rope_axes(positions, config);
-    ops::rope(positions, dimension(config.rotary_dim), config.rope_theta, query, key, execution);
+    ops::rope(positions, dimension(config.rotary_dim), config.rope_theta, query, key,
+              execution, rope_scaling(config));
 }
 
 } // namespace ninfer::models::qwen3_5::execution

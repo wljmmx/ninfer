@@ -40,6 +40,9 @@ Selection select_r64(int axes, int tokens, int multiprocessors) {
 
 Selection select_rope(const RopeArguments& a, int multiprocessors) {
     const Selection generic{launch_rope_generic, 128};
+    // port (sm_89): the fixed tables bake theta into compile-time frequencies, so a scaled (YaRN)
+    // run must take the generic kernel.
+    if (a.scaling.yarn) return generic;
     if (!pair_aligned(a.first) || (a.second && !pair_aligned(*a.second))) return generic;
     const int axes         = a.positions.ne[1];
     const int tokens       = a.positions.ne[0];
@@ -96,13 +99,13 @@ void apply(const RopeArguments& arguments, CudaExecutionView execution) {
 } // namespace
 
 void rope_dispatch(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
-                   CudaExecutionView execution) {
-    apply({positions, q, &k, rotary_dim, theta}, execution);
+                   CudaExecutionView execution, const RopeScaling& scaling) {
+    apply({positions, q, &k, rotary_dim, theta, scaling}, execution);
 }
 
 void rope_dispatch(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
-                   CudaExecutionView execution) {
-    apply({positions, x, nullptr, rotary_dim, theta}, execution);
+                   CudaExecutionView execution, const RopeScaling& scaling) {
+    apply({positions, x, nullptr, rotary_dim, theta, scaling}, execution);
 }
 
 } // namespace ninfer::ops::detail

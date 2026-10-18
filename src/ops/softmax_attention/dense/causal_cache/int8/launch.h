@@ -79,4 +79,14 @@ void rk4v2_e8_kv_cached_attention(const Tensor& q, const Tensor& positions, floa
                                   CausalAttentionExecutionEnvelope envelope,
                                   MemoryArena& workspace, Tensor& out, CudaExecutionView execution);
 
+void rk4v3_e8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                                  const Tensor& positions, const Tensor& valid,
+                                  const Tensor& rows, float scale, PagedKVBatchLayerView cache,
+                                  CausalAttentionExecutionEnvelope envelope,
+                                  MemoryArena& workspace, Tensor& out, CudaExecutionView execution);
+void rk4v3_e8_kv_cached_attention(const Tensor& q, const Tensor& positions, float scale,
+                                  const PagedKVLayerView& cache,
+                                  CausalAttentionExecutionEnvelope envelope,
+                                  MemoryArena& workspace, Tensor& out, CudaExecutionView execution);
+
 } // namespace ninfer::ops::detail

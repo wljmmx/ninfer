@@ -242,6 +242,8 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
         cache_storage == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64 ||
         cache_storage == KvCacheStorage::RK4V4E8 ||
         cache_storage == KvCacheStorage::RK2V4E8 ||
+        // port (sm_89): rk4v3-e8 runs the same parallel-grouped plan as its siblings.
+        cache_storage == KvCacheStorage::RK4V3E8 ||
         cache_storage == KvCacheStorage::RK4V2E8)
         return detail::rk_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
                                              multiprocessor_count);
@@ -310,9 +312,15 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         return;
     }
 
+    if (cache.storage == KvCacheStorage::RK4V3E8) {
+        detail::rk4v3_e8_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows,
+                                             scale, cache, envelope, workspace, out, execution);
+        return;
+    }
+
     if (cache.storage == KvCacheStorage::RK4V2E8) {
         detail::rk4v2_e8_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                          cache, envelope, workspace, out, execution);
+                                             cache, envelope, workspace, out, execution);
         return;
     }
 
@@ -383,9 +391,15 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
         return;
     }
 
+    if (cache.storage == KvCacheStorage::RK4V3E8) {
+        detail::rk4v3_e8_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
+                                             execution);
+        return;
+    }
+
     if (cache.storage == KvCacheStorage::RK4V2E8) {
         detail::rk4v2_e8_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
-                                          execution);
+                                             execution);
         return;
     }
 
@@ -406,3 +420,4 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
 }
 
 } // namespace ninfer::ops
+

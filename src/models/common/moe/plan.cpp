@@ -248,7 +248,8 @@ const LayerPlan& Plan::layer(ExpertBankId bank) const { return layers[layer_inde
 
 std::optional<Plan> resolve_plan(Plan out, std::span<const ExpertBankCacheSpec> specs,
                                  std::size_t available, std::int32_t max_tokens,
-                                 const CpuTopology& topology, std::uint32_t requested_workers) {
+                                 const CpuTopology& topology, std::uint32_t requested_workers,
+                                 std::size_t reserve_bytes) {
     const auto order = cpu_worker_order(topology.info());
     if (order.empty()) throw std::runtime_error("no CPU available for MoE execution");
     const auto workers       = requested_workers ? requested_workers
@@ -266,7 +267,12 @@ std::optional<Plan> resolve_plan(Plan out, std::span<const ExpertBankCacheSpec> 
         available - out.device_bytes < largest_bank)
         return std::nullopt;
     ExpertCacheConfig config;
-    config.capacity_bytes = (available - out.device_bytes) / 256 * 256;
+    // port (sm_89): the cache would otherwise take every remaining byte. Honour the caller's
+    // reserve but always keep one streaming window so the plan stays executable.
+    const auto usable = available - out.device_bytes;
+    const auto keep   = usable > largest_bank ? std::min(reserve_bytes, usable - largest_bank)
+                                              : std::size_t{0};
+    config.capacity_bytes = (usable - keep) / 256 * 256;
     config.upload_slots   = std::max<std::uint32_t>(
         3, static_cast<std::uint32_t>((2 * largest_bank + config.max_batch_bytes - 1) /
                                         config.max_batch_bytes) +
