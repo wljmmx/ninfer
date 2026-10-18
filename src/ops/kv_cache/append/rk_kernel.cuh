@@ -30,6 +30,20 @@
 
 namespace ninfer::ops {
 
+// port (sm_89) diagnostic: optional V-plane distribution counters (IT.30).
+//
+// The 2-bit E8 cylinder V carrier is fine on the dense 27B (+7.70% PPL) and catastrophic on the MoE
+// 35B-A3B (+1147%). A synthetic round trip shows the reconstruction error is nearly the same on
+// both (47.6% vs 50.3%), so the difference has to be in how the *real* V is distributed inside a
+// 64-dim group. These counters are off unless enabled, and only the V8Root path touches them.
+//
+// `static` keeps one copy per translation unit. write.cu is the only TU that instantiates the
+// V8Root path and it also owns the dump kernel, so a host-side symbol lookup is never needed.
+static __device__ int kv_v8_stats_on = 0;
+static __device__ unsigned long long kv_v8_rad_hist[16] = {};
+static __device__ unsigned long long kv_v8_groups = 0;
+static __device__ double kv_v8_absmax_sum = 0.0;
+
 template <typename Geometry, bool PackedK = false, bool E8Lattice = false, bool E8Root = false,
           bool V8Root = false>
 __device__ __forceinline__ void kv_cache_append_rk_row(
@@ -281,6 +295,14 @@ __device__ __forceinline__ void kv_cache_append_rk_row(
             uint8_t root0, rad0, root1, rad1;
             e8_encode_cylinder_8d_warp(v_vals[2 * grp], vs, root0, rad0, lane);
             e8_encode_cylinder_8d_warp(v_vals[2 * grp + 1], vs, root1, rad1, lane);
+            if (kv_v8_stats_on && lane == 0) {
+                // rad_axis_code carries the log-radius index in its high nibble; 15 means the group's
+                // magnitude ran off the end of the table.
+                atomicAdd(&kv_v8_rad_hist[rad0 >> 4], 1ULL);
+                atomicAdd(&kv_v8_rad_hist[rad1 >> 4], 1ULL);
+                atomicAdd(&kv_v8_groups, 1ULL);
+                atomicAdd(&kv_v8_absmax_sum, static_cast<double>(g_abs));
+            }
             const std::uint32_t pair0 = root0 | (rad0 << 8);
             const std::uint32_t pair1 = root1 | (rad1 << 8);
             const std::uint32_t pair0_next = __shfl_xor_sync(FullMask, pair0, 8);

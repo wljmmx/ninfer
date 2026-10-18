@@ -6,10 +6,19 @@
 #include "product/logging/pretty_format.h"
 #include "product/logging/startup_log.h"
 
+// port (sm_89) diagnostic (IT.30). Declared here rather than including
+// ops/kv_cache/kernels/write.h, which pulls in cuda_runtime_api.h and this app is compiled by the
+// host C++ compiler without CUDA include paths.
+namespace ninfer::ops::detail::kv {
+void kv_v8_stats_enable(int on);
+void kv_v8_stats_dump();
+} // namespace ninfer::ops::detail::kv
+
 #include <nlohmann/json.hpp>
 #include <spdlog/logger.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <charconv>
 #include <chrono>
 #include <cctype>
@@ -483,11 +492,17 @@ int main(int argc, char** argv) {
          .presentation = ninfer::product::LogPresentation::Tool});
     const std::shared_ptr<spdlog::logger> logger = logging.logger();
     ninfer::product::StartupLogRenderer startup_log(logging);
+    // port (sm_89) diagnostic (IT.30): dump the 2-bit E8 V-plane distribution when asked to.
+    const bool v8_stats = std::getenv("NINFER_V8_STATS") != nullptr;
+    if (v8_stats) ninfer::ops::detail::kv::kv_v8_stats_enable(1);
     try {
-        return run(options, logger, startup_log, logging.terminal_progress());
+        const int result = run(options, logger, startup_log, logging.terminal_progress());
+        if (v8_stats) ninfer::ops::detail::kv::kv_v8_stats_dump();
+        return result;
     } catch (const std::exception& error) {
         logging.terminal_progress()->clear();
         logger->error("{}", ninfer::product::format_pretty_text(error.what()));
+        if (v8_stats) ninfer::ops::detail::kv::kv_v8_stats_dump();
         return 1;
     }
 }

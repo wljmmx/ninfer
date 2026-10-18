@@ -12,6 +12,11 @@ enum class PagedWriteInstance {
     BatchRows256,
 };
 
+// port (sm_89) diagnostic (IT.30): V-plane distribution counters for the 2-bit E8 cylinder carrier.
+// Disabled by default; enabling costs one atomicAdd per 8-dim subspace on the rk4v2-e8 write path.
+void kv_v8_stats_enable(int on);
+void kv_v8_stats_dump();
+
 // D256 page-major writes from validated BF16 operands. The owning Op selects the instance;
 // these bindings perform no tuning selection. Copy instances require batch size one.
 void launch_paged_write(PagedWriteInstance instance, const Tensor& k, const Tensor& v,

@@ -216,4 +216,54 @@ void launch_paged_write(PagedWriteInstance instance, const Tensor& k, const Tens
         launch.template operator()<false>();
 }
 
+// port (sm_89) diagnostic (IT.30): V-plane distribution counters for the 2-bit E8 cylinder carrier.
+// The counters live in rk_kernel.cuh with internal linkage; this TU owns both the only V8Root
+// instantiation and the dump kernel, so a same-TU kernel reads them without symbol lookup.
+__global__ void v8_stats_dump_kernel(unsigned long long* hist, unsigned long long* groups,
+                                     double* absmax_sum) {
+    for (int i = 0; i < 16; ++i) hist[i] = kv_v8_rad_hist[i];
+    *groups     = kv_v8_groups;
+    *absmax_sum = kv_v8_absmax_sum;
+}
+
+__global__ void v8_stats_enable_kernel(int on) { kv_v8_stats_on = on; }
+
+void kv_v8_stats_enable(int on) {
+    v8_stats_enable_kernel<<<1, 1>>>(on ? 1 : 0);
+    (void)cudaDeviceSynchronize();
+}
+
+void kv_v8_stats_dump() {
+    unsigned long long* d_hist   = nullptr;
+    unsigned long long* d_groups = nullptr;
+    double* d_sum                = nullptr;
+    cudaMalloc(&d_hist, 16 * sizeof(unsigned long long));
+    cudaMalloc(&d_groups, sizeof(unsigned long long));
+    cudaMalloc(&d_sum, sizeof(double));
+    v8_stats_dump_kernel<<<1, 1>>>(d_hist, d_groups, d_sum);
+    (void)cudaDeviceSynchronize();
+
+    unsigned long long hist[16] = {};
+    unsigned long long groups   = 0;
+    double absmax_sum           = 0.0;
+    cudaMemcpy(hist, d_hist, sizeof(hist), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&groups, d_groups, sizeof(groups), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&absmax_sum, d_sum, sizeof(absmax_sum), cudaMemcpyDeviceToHost);
+    cudaFree(d_hist);
+    cudaFree(d_groups);
+    cudaFree(d_sum);
+
+    unsigned long long total = 0;
+    for (auto h : hist) total += h;
+    std::printf("v8-stats: groups=%llu subspaces=%llu mean_absmax=%.4f\n",
+                static_cast<unsigned long long>(groups), static_cast<unsigned long long>(total),
+                groups ? absmax_sum / static_cast<double>(groups) : 0.0);
+    std::printf("v8-stats: rad_idx histogram (1..15, 0 = untouched)\n");
+    for (int i = 0; i < 16; ++i) {
+        std::printf("  rad=%2d  %10llu  %5.2f%%\n", i,
+                    static_cast<unsigned long long>(hist[i]),
+                    total ? 100.0 * static_cast<double>(hist[i]) / static_cast<double>(total) : 0.0);
+    }
+}
+
 } // namespace ninfer::ops::detail::kv
