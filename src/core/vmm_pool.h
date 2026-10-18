@@ -30,6 +30,7 @@ public:
     // Physically backed bytes right now (always a multiple of segment_bytes()).
     [[nodiscard]] std::size_t mapped() const noexcept { return mapped_; }
     [[nodiscard]] std::size_t segment_bytes() const noexcept { return segment_; }
+    [[nodiscard]] MemorySpan span() const noexcept { return {data(), mapped_, device_, false}; }
 
     // Unmaps whole segments from the top so that up to `wanted_bytes` are returned, never dropping
     // below `keep_mapped_bytes` and never below one segment. Returns the bytes actually released.
