@@ -76,8 +76,7 @@ std::optional<Startup::ExecutionPlan> Startup::plan(DeviceContext& device,
     CpuTopology topology;
     auto placement = moe::resolve_plan(*weights.offload, weights.banks,
                                        available - base.runtime_reservation_bytes, max_tokens,
-                                       topology, options.moe.cpu_workers,
-                                       options.moe.vram_reserve_bytes);
+                                       topology, options.moe.cpu_workers);
     if (!placement) return std::nullopt;
     auto moe   = std::make_shared<moe::Plan>(std::move(*placement));
     auto final = make_sequence_planner(profile, device, trial, moe);

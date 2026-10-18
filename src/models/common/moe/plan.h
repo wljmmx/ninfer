@@ -64,7 +64,6 @@ private:
 [[nodiscard]] bool plan_cache(Plan&);
 [[nodiscard]] std::optional<Plan> resolve_plan(Plan, std::span<const ExpertBankCacheSpec> banks,
                                                std::size_t available_bytes, std::int32_t max_tokens,
-                                               const CpuTopology&, std::uint32_t workers,
-                                               std::size_t reserve_bytes = 0);
+                                               const CpuTopology&, std::uint32_t workers);
 
 } // namespace ninfer::models::moe

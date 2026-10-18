@@ -122,7 +122,11 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
         options.kv_capacity.mode == KvCapacityMode::Automatic
             ? std::max(kDefaultKvCapacityHeadroomBytes, options.kv_capacity.automatic_headroom_bytes)
             : std::size_t{0};
-    StartupMemoryBudget budget(initial, limit, headroom);
+    // port (sm_89): keep the caller's reserve out of the whole budget so both resident and
+    // CPU-expert plans leave that much device memory free for other programs.
+    const auto reserve = std::min(options.moe.vram_reserve_bytes,
+                                  limit > headroom ? limit - headroom - 1 : std::size_t{0});
+    StartupMemoryBudget budget(initial, limit, headroom, reserve);
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     artifact::Reader reader(options.artifact_path);
     inspect.complete();
