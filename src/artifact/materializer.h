@@ -46,6 +46,9 @@ public:
     [[nodiscard]] bool has_device(ObjectHandle handle) const noexcept;
     // port (sm_89): false for an object owned by another tier (host expert file tier).
     [[nodiscard]] bool has_host(ObjectHandle handle) const noexcept;
+    // port (sm_89): frees the device backing early so a Host replica can replace it without
+    // holding both allocations. Device parents become invalid.
+    void release_device();
     // Empty for an ordinary Host parent. Registration uses materialize's execution device.
     [[nodiscard]] CudaHostView host_transfer_view(ObjectHandle handle) const;
 

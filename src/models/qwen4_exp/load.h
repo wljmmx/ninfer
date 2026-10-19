@@ -31,7 +31,8 @@ private:
     friend LoadPlan plan_load(const artifact::Reader&, LoadOptions);
     friend ResolvedLoadPlan resolve_load(LoadPlan&&, Device);
     friend std::unique_ptr<Model> materialize_model(ResolvedLoadPlan&&, DeviceContext&,
-                                                    const StartupObserver*);
+                                                    const StartupObserver*,
+                                                    artifact::MaterializedArtifact*);
 };
 
 class ResolvedLoadPlan {
@@ -42,7 +43,8 @@ public:
 private:
     friend ResolvedLoadPlan resolve_load(LoadPlan&&, Device);
     friend std::unique_ptr<Model> materialize_model(ResolvedLoadPlan&&, DeviceContext&,
-                                                    const StartupObserver*);
+                                                    const StartupObserver*,
+                                                    artifact::MaterializedArtifact*);
     ResolvedLoadPlan(LoadPlan&&, artifact::MaterializationPlan, std::vector<Device>,
                      std::vector<Device>);
     LoadPlan logical_;
@@ -55,3 +57,7 @@ private:
 [[nodiscard]] std::unique_ptr<Model> materialize_model(ResolvedLoadPlan&&, DeviceContext&,
                                                        const StartupObserver* = nullptr);
 } // namespace ninfer::models::qwen4_exp
+
+
+
+

@@ -1,8 +1,10 @@
 #pragma once
 
 #include "artifact/schema.h"
+#include "core/buffer.h"
 #include "core/layout.h"
 
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -57,6 +59,11 @@ struct MaterializationPlan {
     std::vector<TensorPlacement> ordinary_host_objects;
     std::vector<TensorPlacement> registered_host_objects;
     PreparedResources resources;
+    // port (sm_89): a Host backing already filled from a device replica. When set, materialize
+    // keeps it instead of allocating and reading from the artifact.
+    std::optional<HostBuffer> prefilled_host;
+    // port (sm_89): device payload parked in Host during a demotion; uploaded instead of read.
+    std::optional<HostBuffer> prefilled_device;
 };
 
 // Preserve the source page offset so aligned interiors can be read directly into Host backing.

@@ -224,6 +224,13 @@ bool MaterializedArtifact::has_host(ObjectHandle handle) const noexcept {
     return object.host.has_value() || !object.host_data.empty();
 }
 
+void MaterializedArtifact::release_device() {
+    device_storage_ = DeviceBuffer{};
+    for (auto& object : objects_) { object.device.reset(); }
+    stats_.device_capacity_bytes = 0;
+    stats_.device_object_count   = 0;
+}
+
 MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& plan,
                                  std::optional<CudaExecutionView> execution,
                                  const StartupObserver* startup_observer) {
@@ -242,11 +249,20 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     const auto stream = cuda ? execution->stream() : nullptr;
     const StartupObserver no_observer;
     const auto& observer = startup_observer ? *startup_observer : no_observer;
-    std::uint64_t total  = 0;
-    for (const auto* placements :
-         {&plan.device_objects, &plan.ordinary_host_objects, &plan.registered_host_objects}) {
-        for (const auto& placement : *placements) {
+    // port (sm_89): a prefilled Host backing skips allocation and every host-destination read.
+    const bool prefilled = plan.prefilled_host.has_value();
+    std::uint64_t total = 0;
+    if (!plan.prefilled_device) {
+        for (const auto& placement : plan.device_objects) {
             total = checked_add(total, placement.region.bytes, "materialized payload bytes");
+        }
+    }
+    if (!prefilled) {
+        for (const auto* placements :
+             {&plan.ordinary_host_objects, &plan.registered_host_objects}) {
+            for (const auto& placement : *placements) {
+                total = checked_add(total, placement.region.bytes, "materialized payload bytes");
+            }
         }
     }
     StartupPhaseScope phase(observer, StartupPhase::WeightsMaterialize, StartupProgressUnit::Bytes,
@@ -262,7 +278,9 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     out.stats_.host_object_count     = plan.ordinary_host_objects.size() +
                                    plan.registered_host_objects.size() +
                                    plan.resources.objects.size();
-    out.host_storage_ = HostBuffer(plan.host_capacity_bytes, plan.host_alignment);
+    // port (sm_89): a prefilled Host backing skips allocation and every host-destination read.
+    out.host_storage_ = plan.prefilled_host ? std::move(*plan.prefilled_host)
+                                            : HostBuffer(plan.host_capacity_bytes, plan.host_alignment);
     if (cuda) { out.device_storage_ = DeviceBuffer(plan.device, plan.device_capacity_bytes); }
     populate_host_pages(out.host_storage_.span());
     if (plan.registered_host_bytes) {
@@ -316,6 +334,19 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     place(plan.ordinary_host_objects, out.host_storage_.span().subspan(plan.registered_host_bytes),
           false);
     place(plan.device_objects, out.device_storage_.span(), true);
+    // port (sm_89): device payload carried over from a demoted model, uploaded instead of read.
+    if (plan.prefilled_device) {
+        for (const auto& placement : plan.device_objects) {
+            auto& parent = out.objects_.at(placement.object.index).device;
+            if (!parent) { continue; }
+            const auto status = cudaMemcpy(
+                const_cast<std::byte*>(parent->data),
+                static_cast<const std::byte*>(plan.prefilled_device->data()) +
+                    placement.region.offset,
+                placement.region.bytes, cudaMemcpyHostToDevice);
+            if (status != cudaSuccess) { throw ArtifactError(cudaGetErrorString(status)); }
+        }
+    }
     std::vector<CopyRange> ranges;
     for (std::size_t i = 0; i < out.objects_.size(); ++i) {
         auto& object = out.objects_[i];
@@ -331,7 +362,8 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             };
             ranges.push_back({segment.file_index, segment.file_offset,
                               checked_add(segment.file_offset, segment.bytes, "copy range"),
-                              address(object.host), address(object.device),
+                              prefilled ? nullptr : address(object.host),
+                              plan.prefilled_device ? nullptr : address(object.device),
                               segment.destination_offset, geometry.divisor_offset, divisors});
         }
     }

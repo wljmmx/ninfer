@@ -88,12 +88,13 @@ std::optional<Startup::ExecutionPlan> Startup::plan(DeviceContext& device,
 }
 
 std::unique_ptr<Model> Startup::materialize(DeviceContext& device, bool host_experts,
-                                            const StartupObserver& observer) {
+                                            const StartupObserver& observer,
+                                            artifact::MaterializedArtifact* device_source) {
     if (!source_) source_.emplace(plan_load(reader_, selection_));
     auto resolved = resolve_load(std::move(*source_), device.device(),
                                  host_experts ? Device::cpu() : device.device());
     source_.reset();
-    return materialize_model(std::move(resolved), device, &observer);
+    return materialize_model(std::move(resolved), device, &observer, device_source);
 }
 
 qwen::Frontend Startup::frontend(const Model& model, const EngineOptions& options) const {
@@ -120,3 +121,4 @@ Startup::Calibration Startup::calibrate(const execution::Parameters& parameters,
 }
 
 } // namespace ninfer::models::qwen3_5
+

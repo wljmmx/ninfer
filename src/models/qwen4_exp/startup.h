@@ -22,7 +22,8 @@ public:
     [[nodiscard]] std::optional<ExecutionPlan> plan(DeviceContext&, const EngineOptions&,
                                                     bool host_experts, std::size_t available) const;
     [[nodiscard]] std::unique_ptr<Model> materialize(DeviceContext&, bool host_experts,
-                                                     const StartupObserver&);
+                                                     const StartupObserver&,
+                                                     artifact::MaterializedArtifact* device_source = nullptr);
     [[nodiscard]] qwen::Frontend frontend(const Model&, const EngineOptions&) const;
     [[nodiscard]] GraphPreparationPlan graph_plan(const EngineOptions&, const moe::Plan*) const;
     [[nodiscard]] Calibration calibrate(const execution::Parameters&, DeviceContext&,
@@ -40,3 +41,4 @@ private:
 [[nodiscard]] std::string prefill_signature(const Model&, const moe::Plan*, std::uint32_t chunk);
 
 } // namespace ninfer::models::qwen4_exp
+

@@ -25,10 +25,11 @@ std::optional<Startup::ExecutionPlan> Startup::plan(DeviceContext& device,
 }
 
 std::unique_ptr<Model> Startup::materialize(DeviceContext& device, bool host,
-                                            const StartupObserver& observer) {
+                                            const StartupObserver& observer,
+                                            artifact::MaterializedArtifact* device_source) {
     if (!host) throw std::logic_error("Qwen4Exp Main experts require Host backing");
-    auto model =
-        materialize_model(resolve_load(std::move(source_), device.device()), device, &observer);
+    auto model = materialize_model(resolve_load(std::move(source_), device.device()), device,
+                                   &observer, device_source);
     table_ = &model->ple_table();
     return model;
 }
@@ -111,3 +112,4 @@ std::string prefill_signature(const Model& model, const moe::Plan* moe, std::uin
 }
 
 } // namespace ninfer::models::qwen4_exp
+

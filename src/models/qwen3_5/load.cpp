@@ -221,8 +221,37 @@ ResolvedLoadPlan resolve_load(LoadPlan&& plan, Device cuda, std::optional<Device
 }
 
 std::unique_ptr<Model> materialize_model(ResolvedLoadPlan&& plan, DeviceContext& device,
-                                         const StartupObserver* observer) {
+                                         const StartupObserver* observer,
+                                         artifact::MaterializedArtifact* device_source) {
     if (!plan.logical_.impl_) { throw artifact::ArtifactError("load plan was already consumed"); }
+    if (device_source) {
+        auto& mplan = plan.materialization_;
+        HostBuffer host(mplan.host_capacity_bytes, mplan.host_alignment);
+        HostBuffer parked(mplan.device_capacity_bytes, 256);
+        for (auto* list : {&mplan.registered_host_objects, &mplan.ordinary_host_objects}) {
+            for (auto& placement : *list) {
+                if (!device_source->has_device(placement.object)) { continue; }
+                const auto& source = device_source->device_parent(placement.object);
+                const auto status = cudaMemcpy(static_cast<std::byte*>(host.data()) + placement.region.offset, source.data,
+                                               placement.region.bytes, cudaMemcpyDeviceToHost);
+                if (status != cudaSuccess) {
+                    throw artifact::ArtifactError(cudaGetErrorString(status));
+                }
+            }
+        }
+        for (auto& placement : mplan.device_objects) {
+            if (!device_source->has_device(placement.object)) { continue; }
+            const auto& source = device_source->device_parent(placement.object);
+            const auto status = cudaMemcpy(static_cast<std::byte*>(parked.data()) +
+                                           placement.region.offset,
+                                       source.data, placement.region.bytes,
+                                       cudaMemcpyDeviceToHost);
+            if (status != cudaSuccess) { throw artifact::ArtifactError(cudaGetErrorString(status)); }
+        }
+        mplan.prefilled_host   = std::move(host);
+        mplan.prefilled_device = std::move(parked);
+        device_source->release_device();
+    }
     auto data    = std::move(plan.logical_.impl_);
     auto backing = artifact::materialize(*data->reader, std::move(plan.materialization_),
                                          device.transfer_view(), observer);
@@ -267,3 +296,6 @@ std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions
 }
 
 } // namespace ninfer::models::qwen3_5
+
+
+

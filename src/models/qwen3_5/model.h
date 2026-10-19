@@ -44,6 +44,7 @@ public:
 
     [[nodiscard]] std::span<const BoundWeight> weight_data() const noexcept { return bound_; }
 
+    [[nodiscard]] artifact::MaterializedArtifact& backing() noexcept { return backing_; }
     [[nodiscard]] std::span<const ExpertBankSource> expert_banks() const noexcept { return banks_; }
 
     // port (sm_89): empty unless the file tier is enabled; the reader outlives every cache use.
@@ -66,7 +67,8 @@ public:
 
 private:
     friend std::unique_ptr<Model> materialize_model(ResolvedLoadPlan&&, DeviceContext&,
-                                                    const StartupObserver*);
+                                                    const StartupObserver*,
+                                                    artifact::MaterializedArtifact*);
     Model(Config config, LoadOptions options, ModelWeights weights, std::vector<BoundWeight> bound,
           std::vector<ExpertBankSource> banks, qwen::FrontendResources resources, InstanceInfo info,
           artifact::MaterializedArtifact backing, std::vector<ExpertFileBank> file_banks = {},
@@ -88,3 +90,6 @@ private:
 };
 
 } // namespace ninfer::models::qwen3_5
+
+
+

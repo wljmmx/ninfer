@@ -45,7 +45,8 @@ private:
     friend LoadPlan plan_load(const artifact::Reader&, LoadOptions);
     friend ResolvedLoadPlan resolve_load(LoadPlan&&, Device, std::optional<Device>);
     friend std::unique_ptr<Model> materialize_model(ResolvedLoadPlan&&, DeviceContext&,
-                                                    const StartupObserver*);
+                                                    const StartupObserver*,
+                                                    artifact::MaterializedArtifact*);
 };
 
 class ResolvedLoadPlan {
@@ -59,7 +60,8 @@ public:
 private:
     friend ResolvedLoadPlan resolve_load(LoadPlan&&, Device, std::optional<Device>);
     friend std::unique_ptr<Model> materialize_model(ResolvedLoadPlan&&, DeviceContext&,
-                                                    const StartupObserver*);
+                                                    const StartupObserver*,
+                                                    artifact::MaterializedArtifact*);
     ResolvedLoadPlan(LoadPlan&& logical, artifact::MaterializationPlan&& materialization,
                      std::vector<Device>&& devices, std::vector<Device>&& bank_devices);
     artifact::MaterializationPlan materialization_;
@@ -73,9 +75,12 @@ private:
                                             std::optional<Device> main_experts = {});
 [[nodiscard]] std::unique_ptr<Model> materialize_model(ResolvedLoadPlan&& plan,
                                                        DeviceContext& device,
-                                                       const StartupObserver* observer = nullptr);
+                                                       const StartupObserver* observer = nullptr,
+                                                       artifact::MaterializedArtifact* device_source = nullptr);
 [[nodiscard]] std::unique_ptr<Model> load_model(const std::filesystem::path& path,
                                                 LoadOptions options, DeviceContext& device,
                                                 const StartupObserver* observer = nullptr);
 
 } // namespace ninfer::models::qwen3_5
+
+

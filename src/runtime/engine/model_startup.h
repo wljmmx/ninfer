@@ -283,6 +283,33 @@ build_model(const artifact::Reader& reader, EngineOptions& options, DeviceContex
             calibrated.reset();
         }
         if (calibrated) break;
+        // port (sm_89): a resident attempt that only misses the KV budget does not have to
+        // re-read the artifact. Copy the weights back over PCIe (19.6 GiB in about a second)
+        // and continue with Host experts.
+        if (!host_experts && weights.offload) {
+            try {
+                if (instance->program) { instance->program.reset(); }
+                device.synchronize();
+                auto demoted = setup.materialize(device, true, options.startup_observer,
+                                                 &instance->model->backing());
+                auto frontend = setup.frontend(*demoted, options);
+                instance = std::make_unique<ModelInstance<typename Setup::Types>>(
+                    std::move(demoted), std::move(frontend), setup.profile);
+                host_experts = true;
+                const auto available = budget.available(device_memory_snapshot(device.device()));
+                if (weights.fixed_bytes > available) { throw std::runtime_error("demote needs more device memory"); }
+                auto replanned = setup.plan(device, options, true, available - weights.fixed_bytes);
+                if (!replanned) { throw std::runtime_error("demote needs more device memory"); }
+                candidate = std::move(replanned);
+                calibrated = initialize_program(setup, *instance, device, options, budget,
+                                                std::move(*candidate), preparation_attempts);
+                if (calibrated) { break; }
+            } catch (const std::exception& error) {
+                // Fall through to the reload path below.
+                std::fprintf(stderr, "[demote] failed: %s\n", error.what());
+                std::fflush(stderr);
+            }
+        }
         instance.reset();
         device.synchronize();
         if (host_experts || !weights.offload || preparation_attempts == 2)
@@ -326,3 +353,5 @@ build_model(const artifact::Reader& reader, EngineOptions& options, DeviceContex
 }
 
 } // namespace ninfer::runtime::detail
+
+
