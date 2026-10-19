@@ -6,6 +6,8 @@
 
 #include <memory>
 #include <optional>
+#include <span>
+#include <vector>
 
 namespace ninfer {
 
@@ -15,6 +17,60 @@ struct ExpertMatrixEntryLayout {
     friend bool operator==(const ExpertMatrixEntryLayout&,
                            const ExpertMatrixEntryLayout&) = default;
 };
+
+// One expert image inside the upload staging buffer. The image uses exactly the
+// destination slot layout, so a fetched entry uploads with one contiguous copy.
+struct ExpertEntryImage {
+    ExpertMatrixEntryLayout gate_up, down;
+    std::uint64_t bytes = 0;
+
+    friend bool operator==(const ExpertEntryImage&, const ExpertEntryImage&) = default;
+};
+
+// One contiguous run in the artifact's file set (see artifact::ReadSegment).
+struct ExpertFileSpan {
+    std::uint32_t file_index  = 0;
+    std::uint64_t file_offset = 0;
+    std::uint64_t bytes       = 0;
+
+    friend bool operator==(const ExpertFileSpan&, const ExpertFileSpan&) = default;
+};
+
+// Where one image chunk goes, and the file runs that fill it.
+struct ExpertFileChunk {
+    std::uint64_t image_offset = 0;
+    std::vector<ExpertFileSpan> spans;
+};
+
+struct ExpertFileEntry {
+    std::uint64_t image_bytes = 0;
+    std::vector<ExpertFileChunk> chunks;
+};
+
+struct ExpertFileBank {
+    std::vector<ExpertFileEntry> experts;
+};
+
+// Synchronous artifact reader used by the file tier. Implementations block the uploading
+// host thread; they never run inside capture.
+class ExpertBlobReader {
+public:
+    virtual ~ExpertBlobReader() = default;
+    // `destination` is exactly entry.image_bytes. Unwritten bytes stay zero.
+    virtual void read_entry(const ExpertFileEntry& entry, std::span<std::byte> destination) const = 0;
+};
+
+// Empty banks (or a null reader) keep the in-memory upload path.
+struct ExpertFileTier {
+    const ExpertBlobReader* reader = nullptr;
+    std::span<const ExpertFileBank> banks;
+
+    [[nodiscard]] bool enabled() const noexcept { return reader != nullptr && !banks.empty(); }
+};
+
+// Shared by the cache planner and the file-tier builder so both agree on image offsets.
+[[nodiscard]] ExpertEntryImage describe_expert_entry_image(const WeightBankLayout& gate_up,
+                                                          const WeightBankLayout& down);
 
 struct ExpertBankCacheLayout {
     ExpertMatrixEntryLayout gate_up, down;
@@ -46,6 +102,7 @@ struct ExpertCacheRequirements {
     std::size_t offset_bytes  = 0;
     std::size_t divisor_bytes = 0;
     std::size_t pinned_bytes  = 0;
+    std::size_t max_entry_bytes = 0; // Largest single expert image; sizes file-tier staging.
 
     friend bool operator==(const ExpertCacheRequirements&,
                            const ExpertCacheRequirements&) = default;
@@ -118,7 +175,8 @@ class ExpertCache {
 public:
     ExpertCache(std::span<const ExpertBankSource> sources,
                 const ExpertCacheRequirements& requirements, const DeviceContext& device,
-                CudaExecutionView upload, std::span<const ExpertPlacement> fixed = {});
+                CudaExecutionView upload, std::span<const ExpertPlacement> fixed = {},
+                ExpertFileTier files = {});
     ~ExpertCache();
     ExpertCache(const ExpertCache&)            = delete;
     ExpertCache& operator=(const ExpertCache&) = delete;

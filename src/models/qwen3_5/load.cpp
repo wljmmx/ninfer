@@ -3,9 +3,21 @@
 #include "artifact/reader.h"
 #include "models/qwen3_5/load/bindings.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <utility>
 
 namespace ninfer::models::qwen3_5 {
+namespace {
+
+// port (sm_89): opt-in file tier. Unset or "0" keeps the in-memory upload path.
+bool expert_file_tier_enabled() {
+    const char* value = std::getenv("NINFER_EXPERT_FILE_TIER");
+    return value && *value && std::strcmp(value, "0") != 0;
+}
+
+} // namespace
 
 struct LoadPlan::Impl {
     Config config;
@@ -162,11 +174,15 @@ Placement describe_placement(const Data& data, Device cuda, Device expert_device
     for (const auto& layer : data.weights.text.layers) place(layer);
     if (data.weights.mtp) place(data.weights.mtp->layer);
     std::vector<artifact::PlacementRequest> requests;
+    // port (sm_89): with the file tier on, CPU expert banks upload from the artifact and keep
+    // ordinary pageable Host memory instead of a pinned replica.
+    const bool file_tier = expert_file_tier_enabled();
     for (std::size_t i = 0; i < data.pending.size(); ++i) {
         for (const auto& part : data.pending[i].reference.binding.parts) {
+            const bool pinned = out.weights[i] == Device::cpu() && !file_tier;
             requests.push_back({part.object, out.weights[i],
-                                out.weights[i] == Device::cpu() ? artifact::HostAccess::CudaTransfer
-                                                                : artifact::HostAccess::CpuOnly});
+                                pinned ? artifact::HostAccess::CudaTransfer
+                                       : artifact::HostAccess::CpuOnly});
         }
     }
     out.storage = artifact::plan_materialization(*data.reader, requests);
@@ -194,9 +210,20 @@ std::unique_ptr<Model> materialize_model(ResolvedLoadPlan&& plan, DeviceContext&
                                          device.transfer_view(), observer);
     auto bound   = resolve_weights(std::move(data->pending), backing, plan.devices_);
     auto banks   = moe::bind_banks(data->expert_banks, backing, plan.bank_devices_);
+    // port (sm_89): the file tier opens its own handles, so it survives the load-time Reader.
+    std::unique_ptr<moe::ExpertFileReader> file_reader;
+    std::vector<ExpertFileBank> file_banks;
+    if (expert_file_tier_enabled()) {
+        file_banks  = moe::describe_expert_files(*data->reader, data->expert_banks);
+        file_reader = std::make_unique<moe::ExpertFileReader>(*data->reader);
+        std::fprintf(stderr, "expert file tier: %zu banks, %zu files, %zu B per largest image\n",
+                     file_banks.size(), data->reader->directory().files.size(),
+                     file_banks.empty() ? std::size_t{0} : file_banks.front().experts.front().image_bytes);
+    }
     return std::unique_ptr<Model>(new Model(
         std::move(data->config), data->options, std::move(data->weights), std::move(bound),
-        std::move(banks), std::move(data->resources), std::move(data->info), std::move(backing)));
+        std::move(banks), std::move(data->resources), std::move(data->info), std::move(backing),
+        std::move(file_banks), std::move(file_reader)));
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,

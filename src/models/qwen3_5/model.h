@@ -1,6 +1,7 @@
 #pragma once
 
 #include "artifact/materializer.h"
+#include "models/common/moe/weights.h"
 #include "models/qwen3_5/config.h"
 #include "models/common/qwen/frontend/resources.h"
 #include "models/qwen3_5/weights.h"
@@ -41,6 +42,13 @@ public:
 
     [[nodiscard]] std::span<const ExpertBankSource> expert_banks() const noexcept { return banks_; }
 
+    // port (sm_89): empty unless the file tier is enabled; the reader outlives every cache use.
+    [[nodiscard]] ExpertFileTier expert_file_tier() const noexcept {
+        return file_reader_ ? ExpertFileTier{file_reader_.get(), file_banks_} : ExpertFileTier{};
+    }
+
+    [[nodiscard]] bool file_tier_enabled() const noexcept { return file_reader_ != nullptr; }
+
     [[nodiscard]] const qwen::FrontendResources& resources() const noexcept { return resources_; }
 
     [[nodiscard]] const InstanceInfo& info() const noexcept { return info_; }
@@ -54,7 +62,8 @@ private:
                                                     const StartupObserver*);
     Model(Config config, LoadOptions options, ModelWeights weights, std::vector<BoundWeight> bound,
           std::vector<ExpertBankSource> banks, qwen::FrontendResources resources, InstanceInfo info,
-          artifact::MaterializedArtifact backing);
+          artifact::MaterializedArtifact backing, std::vector<ExpertFileBank> file_banks = {},
+          std::unique_ptr<moe::ExpertFileReader> file_reader = {});
 
     // Destroy all borrowers before backing. The caller keeps DeviceContext alive through cleanup.
     artifact::MaterializedArtifact backing_;
@@ -63,6 +72,8 @@ private:
     ModelWeights weights_;
     std::vector<BoundWeight> bound_;
     std::vector<ExpertBankSource> banks_;
+    std::vector<ExpertFileBank> file_banks_;
+    std::unique_ptr<moe::ExpertFileReader> file_reader_;
     qwen::FrontendResources resources_;
     InstanceInfo info_;
 };

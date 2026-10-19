@@ -238,7 +238,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         moe = std::make_unique<moe::Resources>(
             plan.moe, layers, parameters.model.expert_banks(), device,
             plan.graph_probe ? moe::ResourcePurpose::GraphCalibration
-                             : moe::ResourcePurpose::Execution);
+                             : moe::ResourcePurpose::Execution,
+            parameters.model.expert_file_tier());
     }
     device.synchronize();
 

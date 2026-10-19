@@ -38,6 +38,16 @@ ExpertMatrixEntryLayout add_matrix(LayoutBuilder& builder, const WeightBankLayou
 
 } // namespace
 
+ExpertEntryImage describe_expert_entry_image(const WeightBankLayout& gate_up,
+                                             const WeightBankLayout& down) {
+    ExpertEntryImage out;
+    LayoutBuilder entry;
+    out.gate_up = add_matrix(entry, gate_up);
+    out.down    = add_matrix(entry, down);
+    out.bytes   = entry.finish(256, "expert entry");
+    return out;
+}
+
 ExpertCacheRequirements describe_expert_cache(std::span<const ExpertBankCacheSpec> sources,
                                               const ExpertCacheConfig& config) {
     if (!config.max_batch_bytes || !config.max_batch_copies || !config.upload_slots ||
@@ -56,10 +66,11 @@ ExpertCacheRequirements describe_expert_cache(std::span<const ExpertBankCacheSpe
         ExpertBankCacheLayout layout;
         layout.count    = bank.gate_up.region.count;
         layout.resident = bank.resident;
-        LayoutBuilder entry;
-        layout.gate_up     = add_matrix(entry, bank.gate_up);
-        layout.down        = add_matrix(entry, bank.down);
-        layout.entry_bytes = entry.finish(256, "expert entry");
+        const auto image = describe_expert_entry_image(bank.gate_up, bank.down);
+        layout.gate_up      = image.gate_up;
+        layout.down         = image.down;
+        layout.entry_bytes  = image.bytes;
+        out.max_entry_bytes = std::max(out.max_entry_bytes, static_cast<std::size_t>(image.bytes));
         for (const auto* matrix : {&bank.gate_up, &bank.down}) {
             layout.payload_bytes += matrix->codes.expert_bytes + matrix->high.expert_bytes +
                                     matrix->scales.expert_bytes;
@@ -108,7 +119,10 @@ ExpertCacheRequirements describe_expert_cache(std::span<const ExpertBankSource> 
             throw std::invalid_argument("expert matrices must share count and source device");
         }
         if (bank.gate_up.parent->device == Device::cpu()) {
+            // port (sm_89): an empty mapping means the bank is file-backed; the cache validates
+            // that at construction, where the file tier is known.
             const auto validate_upload = [](const WeightBankView& matrix, CudaHostView upload) {
+                if (!upload.host.data) { return; }
                 validate_memory(upload.host);
                 if (upload.host.data != matrix.parent->data ||
                     upload.host.bytes < matrix.parent->geometry.bytes || !upload.host.host_pinned ||
@@ -120,7 +134,8 @@ ExpertCacheRequirements describe_expert_cache(std::span<const ExpertBankSource> 
             };
             validate_upload(bank.gate_up, bank.gate_up_upload);
             validate_upload(bank.down, bank.down_upload);
-            if (bank.gate_up_upload.cuda_device != bank.down_upload.cuda_device) {
+            if (bank.gate_up_upload.host.data && bank.down_upload.host.data &&
+                bank.gate_up_upload.cuda_device != bank.down_upload.cuda_device) {
                 throw std::invalid_argument("expert upload mappings belong to different devices");
             }
         }
@@ -149,6 +164,9 @@ struct ExpertCache::Impl {
     struct Slot {
         PinnedHostBuffer index_snapshot;
         CudaHostView index_source;
+        // File-tier staging: one expert image, laid out exactly like its destination slot.
+        PinnedHostBuffer staging;
+        CudaHostView staging_view;
         CudaHostCopyBatch data_copies, index_copies;
         CudaCompletionEvent done;
         std::size_t payload_bytes = 0;
@@ -158,6 +176,8 @@ struct ExpertCache::Impl {
         Slot(const ExpertCacheRequirements& req, const DeviceContext& ctx)
             : index_snapshot(req.offset_bytes),
               index_source(index_snapshot.cuda_view(ctx.device())),
+              staging(req.max_entry_bytes),
+              staging_view(req.max_entry_bytes ? staging.cuda_view(ctx.device()) : CudaHostView{}),
               data_copies(ctx.device(), req.config.max_batch_copies),
               index_copies(ctx.device(), req.entry_count), done(ctx) {}
     };
@@ -178,6 +198,7 @@ struct ExpertCache::Impl {
     };
 
     std::vector<ExpertBankSource> sources;
+    ExpertFileTier files;
     ExpertCacheRequirements requirements;
     CudaExecutionView transfer;
     DeviceBuffer pool, offsets, divisors;
@@ -192,8 +213,9 @@ struct ExpertCache::Impl {
     bool failed = false;
 
     Impl(std::span<const ExpertBankSource> input, const ExpertCacheRequirements& req,
-         const DeviceContext& ctx, CudaExecutionView upload, std::span<const ExpertPlacement> fixed)
-        : sources(input.begin(), input.end()),
+         const DeviceContext& ctx, CudaExecutionView upload, std::span<const ExpertPlacement> fixed,
+         ExpertFileTier file_tier)
+        : sources(input.begin(), input.end()), files(file_tier),
           requirements(describe_expert_cache(input, req.config)), transfer(upload),
           pool(ctx.device(), requirements.config.capacity_bytes),
           offsets(ctx.device(), requirements.offset_bytes),
@@ -201,6 +223,9 @@ struct ExpertCache::Impl {
         // The description is a capacity promise; execution recomputes it from the actual sources.
         if (req != requirements) {
             throw std::invalid_argument("expert cache requirements differ from sources");
+        }
+        if (files.enabled() && files.banks.size() != sources.size()) {
+            throw std::invalid_argument("expert file tier banks differ from their sources");
         }
         if (transfer.device() != ctx.device()) {
             throw std::invalid_argument("expert upload device differs from its backing");
@@ -214,7 +239,11 @@ struct ExpertCache::Impl {
         for (std::size_t b = 0; b < sources.size(); ++b) {
             const auto& source = sources[b];
             const auto& layout = requirements.banks[b];
-            if (!layout.resident && source.gate_up_upload.cuda_device != ctx.device()) {
+            // port (sm_89): a file-backed bank reads from the artifact, so it needs no pinned
+            // Host copy and may leave its upload view empty.
+            const bool file_backed =
+                files.enabled() && b < files.banks.size() && !files.banks[b].experts.empty();
+            if (!layout.resident && !file_backed && source.gate_up_upload.cuda_device != ctx.device()) {
                 throw std::invalid_argument("expert upload mapping belongs to another GPU");
             }
             const auto bind = [&](const WeightBankView& matrix,
@@ -479,8 +508,19 @@ struct ExpertCache::Impl {
         });
     }
 
+    // Returns the artifact-backed image for this entry, or null when it uploads from memory.
+    const ExpertFileEntry* file_entry(std::size_t i) const {
+        if (!files.enabled()) return nullptr;
+        const auto& key  = entries[i].key;
+        const auto& bank = files.banks[key.bank.index];
+        if (key.expert >= bank.experts.size()) return nullptr;
+        const auto& entry = bank.experts[key.expert];
+        return entry.image_bytes ? &entry : nullptr;
+    }
+
     bool affine_batch() const {
         if (completed.size() < 64) { return false; }
+        if (file_entry(completed.front())) { return false; }
         const auto& first = entries[completed.front()];
         for (std::size_t n = 0; n < completed.size(); ++n) {
             const auto& entry = entries[completed[n]];
@@ -579,6 +619,26 @@ struct ExpertCache::Impl {
             const auto append  = [&](std::size_t i, bool speculative) {
                 auto& entry = entries[i];
                 if (entry.state != State::Reserved || entry.copied == payload_size(i)) return true;
+                // port (sm_89): the file tier fetches one whole expert into pinned staging and
+                // uploads it as a single copy. One staging buffer per slot means one per batch:
+                // returning false here stops the batch before the image can be overwritten.
+                if (const auto* file = file_entry(i)) {
+                    if (slot.payload_bytes &&
+                        file->image_bytes > limit - slot.payload_bytes)
+                        return false;
+                    files.reader->read_entry(
+                        *file, {static_cast<std::byte*>(slot.staging.data()),
+                                static_cast<std::size_t>(file->image_bytes)});
+                    slot.data_copies.append(
+                        pool.span().subspan(entry.offset, file->image_bytes),
+                        slot.staging_view.subspan(0, file->image_bytes));
+                    if (speculative)
+                        counters.prefetched_bytes += file->image_bytes;
+                    slot.payload_bytes += file->image_bytes;
+                    entry.copied = payload_size(i);
+                    completed.push_back(i);
+                    return false;
+                }
                 if (slot.payload_bytes &&
                     payload_size(i) - entry.copied > limit - slot.payload_bytes)
                     return false;
@@ -635,8 +695,9 @@ struct ExpertCache::Impl {
 
 ExpertCache::ExpertCache(std::span<const ExpertBankSource> sources,
                          const ExpertCacheRequirements& requirements, const DeviceContext& device,
-                         CudaExecutionView upload, std::span<const ExpertPlacement> fixed)
-    : impl_(std::make_unique<Impl>(sources, requirements, device, upload, fixed)) {}
+                         CudaExecutionView upload, std::span<const ExpertPlacement> fixed,
+                         ExpertFileTier files)
+    : impl_(std::make_unique<Impl>(sources, requirements, device, upload, fixed, files)) {}
 
 ExpertCache::~ExpertCache() = default;
 

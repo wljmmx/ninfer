@@ -188,7 +188,7 @@ struct Resources::Impl {
 
     Impl(std::shared_ptr<const Plan> plan, std::span<const Parameters* const> parameters,
          std::span<const ExpertBankSource> sources, const DeviceContext& device,
-         ResourcePurpose purpose)
+         ResourcePurpose purpose, ExpertFileTier files)
         : plan(std::move(plan)), parameters(parameters.begin(), parameters.end()), sources(sources),
           device(device), cuda(device.execution_view()), upload_stream(device),
           upload(device.execution_view(upload_stream.stream())), purpose(purpose),
@@ -196,7 +196,8 @@ struct Resources::Impl {
           cache(sources, storage, device, upload,
                 purpose == ResourcePurpose::Execution
                     ? std::span<const ExpertPlacement>(this->plan->fixed_layout)
-                    : std::span<const ExpertPlacement>{}),
+                    : std::span<const ExpertPlacement>{},
+                files),
           bridge(this->plan->bridge, topology, this->plan->team, device),
           layers(parameters.size()) {
         if (parameters.size() != this->plan->layers.size())
@@ -325,8 +326,8 @@ struct Resources::Impl {
 Resources::Resources(std::shared_ptr<const Plan> plan,
                      std::span<const Parameters* const> parameters,
                      std::span<const ExpertBankSource> sources, const DeviceContext& device,
-                     ResourcePurpose purpose)
-    : impl_(std::make_unique<Impl>(std::move(plan), parameters, sources, device, purpose)) {}
+                     ResourcePurpose purpose, ExpertFileTier files)
+    : impl_(std::make_unique<Impl>(std::move(plan), parameters, sources, device, purpose, files)) {}
 
 Resources::~Resources() = default;
 

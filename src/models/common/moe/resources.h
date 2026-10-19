@@ -76,7 +76,7 @@ public:
 
     Resources(std::shared_ptr<const Plan>, std::span<const Parameters* const> layers,
               std::span<const ExpertBankSource> sources, const DeviceContext&,
-              ResourcePurpose = ResourcePurpose::Execution);
+              ResourcePurpose = ResourcePurpose::Execution, ExpertFileTier files = {});
     ~Resources();
     Resources(const Resources&)            = delete;
     Resources& operator=(const Resources&) = delete;

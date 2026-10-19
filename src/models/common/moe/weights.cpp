@@ -1,5 +1,8 @@
 #include "models/common/moe/weights.h"
 
+#include <array>
+#include <utility>
+
 namespace ninfer::models::moe {
 namespace {
 
@@ -124,6 +127,78 @@ std::vector<ExpertBankSource> bind_banks(std::span<const BankDescription> banks,
             {bind(bank.gate_up), bind(bank.down), upload(bank.gate_up), upload(bank.down)});
     }
     return out;
+}
+
+std::vector<ExpertFileBank> describe_expert_files(const artifact::Reader& reader,
+                                                  std::span<const BankDescription> banks) {
+    std::vector<ExpertFileBank> out;
+    out.reserve(banks.size());
+    for (const auto& bank : banks) {
+        const auto image   = describe_expert_entry_image(bank.gate_up.layout, bank.down.layout);
+        const auto base_of = [&](const MatrixSource& source) {
+            return reader.directory().tensor(source.object).offset;
+        };
+        const auto gu_base = base_of(bank.gate_up), down_base = base_of(bank.down);
+        const auto append  = [&](ExpertFileEntry& entry, const WeightBankLayout& matrix,
+                                const ExpertMatrixEntryLayout& layout, std::uint64_t base,
+                                std::uint32_t expert) {
+            const std::array<std::pair<const WeightBankPlane*, const LayoutRegion*>, 3> planes{{
+                {&matrix.codes, &layout.codes},
+                {&matrix.high, &layout.high},
+                {&matrix.scales, &layout.scales},
+            }};
+            for (const auto& [plane, region] : planes) {
+                if (!plane->expert_bytes) { continue; }
+                const auto logical = base + plane->offset + expert * plane->expert_stride;
+                ExpertFileChunk chunk;
+                chunk.image_offset = region->offset;
+                for (const auto& segment : reader.segments(logical, plane->expert_bytes)) {
+                    chunk.spans.push_back({static_cast<std::uint32_t>(segment.file_index),
+                                           segment.file_offset, segment.bytes});
+                }
+                entry.chunks.push_back(std::move(chunk));
+            }
+        };
+        ExpertFileBank files;
+        files.experts.reserve(bank.gate_up.layout.region.count);
+        for (std::uint32_t e = 0; e < bank.gate_up.layout.region.count; ++e) {
+            ExpertFileEntry entry;
+            entry.image_bytes = image.bytes;
+            append(entry, bank.gate_up.layout, image.gate_up, gu_base, e);
+            append(entry, bank.down.layout, image.down, down_base, e);
+            files.experts.push_back(std::move(entry));
+        }
+        out.push_back(std::move(files));
+    }
+    return out;
+}
+
+ExpertFileReader::ExpertFileReader(const artifact::Reader& reader) {
+    files_.reserve(reader.directory().files.size());
+    for (std::size_t i = 0; i < reader.directory().files.size(); ++i) {
+        files_.push_back(std::make_unique<io::ReadOnlyFile>(reader.open_file(i, io::ReadMode::Buffered)));
+    }
+}
+
+void ExpertFileReader::read_entry(const ExpertFileEntry& entry,
+                                  std::span<std::byte> destination) const {
+    if (destination.size() < entry.image_bytes) {
+        throw artifact::ArtifactError("expert file image exceeds its staging buffer");
+    }
+    for (const auto& chunk : entry.chunks) {
+        auto cursor = destination.subspan(static_cast<std::size_t>(chunk.image_offset));
+        for (const auto& span : chunk.spans) {
+            if (span.file_index >= files_.size()) {
+                throw artifact::ArtifactError("expert file span names an unknown file");
+            }
+            if (span.bytes > cursor.size()) {
+                throw artifact::ArtifactError("expert file span exceeds its image chunk");
+            }
+            files_[span.file_index]->read_exact(span.file_offset,
+                                                cursor.subspan(0, static_cast<std::size_t>(span.bytes)));
+            cursor = cursor.subspan(static_cast<std::size_t>(span.bytes));
+        }
+    }
 }
 
 } // namespace ninfer::models::moe
