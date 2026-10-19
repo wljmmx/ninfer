@@ -74,6 +74,9 @@ struct ExpertCache::Impl {
     ExpertCacheConfig config;
     std::vector<ExpertBankLayout> banks;
     std::vector<ExpertBankPair> views;
+    std::vector<ExpertFileBank> files;
+    const ExpertBlobReader* file_reader = nullptr;
+    std::unique_ptr<PinnedHostBuffer> staging;
     DeviceBuffer pool;
     std::vector<std::size_t> first; // flat entry index of each bank's expert 0
     std::vector<Entry> entries;
@@ -81,8 +84,14 @@ struct ExpertCache::Impl {
     std::uint64_t used = 0, uploads = 0, evictions = 0, epoch = 0;
 
     Impl(std::span<const ExpertBankSpec> specs, const ExpertCacheRequirements& req,
-         const DeviceContext& device, std::span<const ExpertBankPair> bank_views)
+         const DeviceContext& device, std::span<const ExpertBankPair> bank_views,
+         std::span<const ExpertFileBank> file_banks, const ExpertBlobReader* reader)
         : config(req.config), banks(req.banks), views(bank_views.begin(), bank_views.end()),
+          files(file_banks.begin(), file_banks.end()), file_reader(reader),
+          staging(req.max_entry_bytes
+                      ? std::make_unique<PinnedHostBuffer>(
+                            static_cast<std::size_t>(req.max_entry_bytes))
+                      : nullptr),
           pool(static_cast<std::size_t>(req.config.capacity_bytes)) {
         if (req != describe_expert_cache(specs, req.config)) {
             throw std::invalid_argument("expert cache requirements differ from their sources");
@@ -130,25 +139,46 @@ struct ExpertCache::Impl {
         const auto& bank = banks[key.bank];
         auto& entry      = entries[index(key)];
         if (entry.offset == kAbsent) { entry.offset = allocate(bank.entry_bytes); }
-        const auto& view = views[key.bank];
-        auto* base       = static_cast<std::byte*>(pool.p) + entry.offset;
-        const auto copy  = [&](ExpertPlaneKind kind, LayoutRegion region, bool down = false) {
-            if (!region.bytes) { return; }
-            const auto span = down ? view.down.plane(kind, key.expert)
-                                      : view.gate_up.plane(kind, key.expert);
-            if (span.device != Device::cpu() || span.bytes != region.bytes) {
-                throw std::runtime_error("expert cache source is not a matching Host plane");
+        auto* base = static_cast<std::byte*>(pool.p) + entry.offset;
+
+        const ExpertFileEntry* file = nullptr;
+        if (file_reader && key.bank < files.size() &&
+            key.expert < files[key.bank].experts.size()) {
+            const auto& candidate = files[key.bank].experts[key.expert];
+            if (candidate.image_bytes) { file = &candidate; }
+        }
+        if (file) {
+            // The artifact is the source: one fetch into pinned staging, one copy to the pool.
+            if (!staging || file->image_bytes > staging->size()) {
+                throw std::runtime_error("expert file image exceeds the staging buffer");
             }
-            const auto status = cudaMemcpy(base + region.offset, span.data, region.bytes,
+            file_reader->read_entry(
+                *file, {static_cast<std::byte*>(staging->data()),
+                        static_cast<std::size_t>(file->image_bytes)});
+            const auto status = cudaMemcpy(base, staging->data(),
+                                           static_cast<std::size_t>(file->image_bytes),
                                            cudaMemcpyHostToDevice);
             if (status != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(status)); }
-        };
-        copy(ExpertPlaneKind::Codes, bank.codes);
-        copy(ExpertPlaneKind::High, bank.high);
-        copy(ExpertPlaneKind::Scales, bank.scales);
-        // The down matrix planes follow the gate_up planes in the same entry image.
-        const auto& down = banks[key.bank];
-        (void)down;
+        } else {
+            const auto& view = views[key.bank];
+            const auto copy  = [&](ExpertPlaneKind kind, LayoutRegion region, bool down) {
+                if (!region.bytes) { return; }
+                const auto span = down ? view.down.plane(kind, key.expert)
+                                       : view.gate_up.plane(kind, key.expert);
+                if (span.device != Device::cpu() || span.bytes != region.bytes) {
+                    throw std::runtime_error("expert cache source is not a matching Host plane");
+                }
+                const auto status = cudaMemcpy(base + region.offset, span.data, region.bytes,
+                                               cudaMemcpyHostToDevice);
+                if (status != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(status)); }
+            };
+            copy(ExpertPlaneKind::Codes, bank.codes, false);
+            copy(ExpertPlaneKind::High, bank.high, false);
+            copy(ExpertPlaneKind::Scales, bank.scales, false);
+            copy(ExpertPlaneKind::Codes, bank.down_codes, true);
+            copy(ExpertPlaneKind::High, bank.down_high, true);
+            copy(ExpertPlaneKind::Scales, bank.down_scales, true);
+        }
         entry.ready    = true;
         entry.last_use = ++epoch;
         ++uploads;
@@ -157,8 +187,9 @@ struct ExpertCache::Impl {
 
 ExpertCache::ExpertCache(std::span<const ExpertBankSpec> specs,
                          const ExpertCacheRequirements& requirements, const DeviceContext& device,
-                         std::span<const ExpertBankPair> views)
-    : impl_(std::make_unique<Impl>(specs, requirements, device, views)) {}
+                         std::span<const ExpertBankPair> views,
+                         std::span<const ExpertFileBank> files, const ExpertBlobReader* reader)
+    : impl_(std::make_unique<Impl>(specs, requirements, device, views, files, reader)) {}
 
 ExpertCache::~ExpertCache() = default;
 
@@ -196,6 +227,8 @@ std::uint64_t ExpertCache::uploads() const noexcept { return impl_->uploads; }
 std::uint64_t ExpertCache::evictions() const noexcept { return impl_->evictions; }
 
 } // namespace ninfer
+
+
 
 
 

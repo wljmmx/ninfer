@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/expert_bank.h"
+#include "core/expert_file.h"
 #include "core/device.h"
 #include "core/layout.h"
 #include "core/weight_view.h"
@@ -86,8 +87,12 @@ struct ExpertCacheProgress {
 
 class ExpertCache {
 public:
+    // port (sm_89): when a file source is given, streaming experts are fetched from the
+    // artifact into pinned staging instead of being read from a resident Host replica.
     ExpertCache(std::span<const ExpertBankSpec>, const ExpertCacheRequirements&,
-                const DeviceContext&, std::span<const ExpertBankPair> views);
+                const DeviceContext&, std::span<const ExpertBankPair> views,
+                std::span<const ExpertFileBank> files = {},
+                const ExpertBlobReader* reader        = nullptr);
     ~ExpertCache();
     ExpertCache(const ExpertCache&)            = delete;
     ExpertCache& operator=(const ExpertCache&) = delete;
