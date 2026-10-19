@@ -278,11 +278,25 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     out.stats_.host_object_count     = plan.ordinary_host_objects.size() +
                                    plan.registered_host_objects.size() +
                                    plan.resources.objects.size();
+    // port (sm_89): stage timing for the demotion path.
+    const auto stage_clock = [] { return std::chrono::steady_clock::now(); };
+    const auto stage_since = [](auto start) {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    };
+    auto stage_mark = stage_clock();
     // port (sm_89): a prefilled Host backing skips allocation and every host-destination read.
     out.host_storage_ = plan.prefilled_host ? std::move(*plan.prefilled_host)
                                             : HostBuffer(plan.host_capacity_bytes, plan.host_alignment);
     if (cuda) { out.device_storage_ = DeviceBuffer(plan.device, plan.device_capacity_bytes); }
+    const auto alloc_seconds = stage_since(stage_mark);
+    stage_mark = stage_clock();
     populate_host_pages(out.host_storage_.span());
+    const auto populate_seconds = stage_since(stage_mark);
+    if (plan.prefilled_host || plan.prefilled_device) {
+        std::fprintf(stderr, "[materialize] alloc=%.2fs populate=%.2fs\n", alloc_seconds,
+                     populate_seconds);
+        std::fflush(stderr);
+    }
     if (plan.registered_host_bytes) {
         // Pin the populated destination before direct I/O, keeping page faults out of reads.
         const auto registration_start = std::chrono::steady_clock::now();
@@ -336,6 +350,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     place(plan.device_objects, out.device_storage_.span(), true);
     // port (sm_89): device payload carried over from a demoted model, uploaded instead of read.
     if (plan.prefilled_device) {
+        stage_mark = stage_clock();
         for (const auto& placement : plan.device_objects) {
             auto& parent = out.objects_.at(placement.object.index).device;
             if (!parent) { continue; }
@@ -346,9 +361,13 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                 placement.region.bytes, cudaMemcpyHostToDevice);
             if (status != cudaSuccess) { throw ArtifactError(cudaGetErrorString(status)); }
         }
+        std::fprintf(stderr, "[materialize] h2d=%.2fs\n", stage_since(stage_mark));
+        std::fflush(stderr);
     }
     std::vector<CopyRange> ranges;
-    for (std::size_t i = 0; i < out.objects_.size(); ++i) {
+    // port (sm_89): Host and device payloads are both carried over, so there is nothing to read.
+    const bool fully_prefilled = prefilled && plan.prefilled_device.has_value();
+    for (std::size_t i = 0; !fully_prefilled && i < out.objects_.size(); ++i) {
         auto& object = out.objects_[i];
         if (!object.host && !object.device) { continue; }
         const auto& descriptor = reader.directory().tensor({i});

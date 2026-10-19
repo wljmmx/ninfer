@@ -225,9 +225,17 @@ std::unique_ptr<Model> materialize_model(ResolvedLoadPlan&& plan, DeviceContext&
                                          artifact::MaterializedArtifact* device_source) {
     if (!plan.logical_.impl_) { throw artifact::ArtifactError("load plan was already consumed"); }
     if (device_source) {
+        // port (sm_89): stage timing for the demotion path.
+        const auto clock = [] { return std::chrono::steady_clock::now(); };
+        const auto since = [](auto start) {
+            return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        };
+        auto mark = clock();
         auto& mplan = plan.materialization_;
         HostBuffer host(mplan.host_capacity_bytes, mplan.host_alignment);
         HostBuffer parked(mplan.device_capacity_bytes, 256);
+        std::fprintf(stderr, "[demote] alloc host=%.2fs parked=%.2fs\n", since(mark), since(mark));
+        mark = clock();
         for (auto* list : {&mplan.registered_host_objects, &mplan.ordinary_host_objects}) {
             for (auto& placement : *list) {
                 if (!device_source->has_device(placement.object)) { continue; }
@@ -239,6 +247,8 @@ std::unique_ptr<Model> materialize_model(ResolvedLoadPlan&& plan, DeviceContext&
                 }
             }
         }
+        std::fprintf(stderr, "[demote] d2h host=%.2fs\n", since(mark));
+        mark = clock();
         for (auto& placement : mplan.device_objects) {
             if (!device_source->has_device(placement.object)) { continue; }
             const auto& source = device_source->device_parent(placement.object);
@@ -248,15 +258,26 @@ std::unique_ptr<Model> materialize_model(ResolvedLoadPlan&& plan, DeviceContext&
                                        cudaMemcpyDeviceToHost);
             if (status != cudaSuccess) { throw artifact::ArtifactError(cudaGetErrorString(status)); }
         }
+        std::fprintf(stderr, "[demote] d2h parked=%.2fs\n", since(mark));
+        mark = clock();
         mplan.prefilled_host   = std::move(host);
         mplan.prefilled_device = std::move(parked);
         device_source->release_device();
+        std::fprintf(stderr, "[demote] move+release=%.2fs\n", since(mark));
     }
     auto data    = std::move(plan.logical_.impl_);
+    const auto load_clock = [] { return std::chrono::steady_clock::now(); };
+    const auto load_since = [](auto start) {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    };
+    auto lm  = load_clock();
     auto backing = artifact::materialize(*data->reader, std::move(plan.materialization_),
                                          device.transfer_view(), observer);
+    if (device_source) { std::fprintf(stderr, "[load] materialize=%.2fs\n", load_since(lm)); }
+    lm = load_clock();
     auto bound   = resolve_weights(std::move(data->pending), backing, plan.devices_);
-    // port (sm_89): the host tier owns the CPU expert backing, so it must exist before binding.
+    if (device_source) { std::fprintf(stderr, "[load] resolve=%.2fs\n", load_since(lm)); }
+    lm = load_clock();
     std::unique_ptr<moe::ExpertHostTier> host_tier;
     if (expert_host_tier_enabled()) {
         host_tier = std::make_unique<moe::ExpertHostTier>(*data->reader, data->expert_banks,
@@ -272,12 +293,17 @@ std::unique_ptr<Model> materialize_model(ResolvedLoadPlan&& plan, DeviceContext&
     }
     auto banks   = moe::bind_banks(data->expert_banks, backing, plan.bank_devices_,
                                    host_tier.get());
+    if (device_source) { std::fprintf(stderr, "[load] bind=%.2fs\n", load_since(lm)); }
+    lm = load_clock();
     // port (sm_89): the file tier opens its own handles, so it survives the load-time Reader.
     std::unique_ptr<moe::ExpertFileReader> file_reader;
     std::vector<ExpertFileBank> file_banks;
     if (expert_file_tier_enabled() || expert_host_tier_enabled()) {
         file_banks  = moe::describe_expert_files(*data->reader, data->expert_banks);
+        if (device_source) { std::fprintf(stderr, "[load] describe_files=%.2fs\n", load_since(lm)); }
+        lm = load_clock();
         file_reader = std::make_unique<moe::ExpertFileReader>(*data->reader);
+        if (device_source) { std::fprintf(stderr, "[load] open_files=%.2fs\n", load_since(lm)); }
         std::fprintf(stderr, "expert file tier: %zu banks, %zu files, %zu B per largest image\n",
                      file_banks.size(), data->reader->directory().files.size(),
                      file_banks.empty() ? std::size_t{0} : file_banks.front().experts.front().image_bytes);
@@ -296,6 +322,7 @@ std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions
 }
 
 } // namespace ninfer::models::qwen3_5
+
 
 
 
