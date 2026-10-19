@@ -2,6 +2,7 @@ add_library(ninfer_core STATIC
   arena.cu
 cuda_host.cpp
 memory.cpp
+expert_cache.cpp
   device.cu
   dtype.cpp
   host_worker_pool.cpp

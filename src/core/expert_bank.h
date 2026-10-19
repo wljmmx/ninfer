@@ -54,4 +54,11 @@ struct ExpertBankView {
     }
 };
 
+// port (sm_89): the two matrices of one expert bank.
+struct ExpertBankPair {
+    ExpertBankView gate_up;
+    ExpertBankView down;
+};
+
 } // namespace ninfer
+
