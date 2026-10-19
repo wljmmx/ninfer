@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/memory.h"
 #include "core/tensor.h"
 #include "core/weight.h"
 
@@ -57,6 +58,9 @@ struct WeightParent {
     WeightGeometry geometry;
     const std::byte* data      = nullptr;
     float weight_scale_divisor = 0.0F;
+    // port (sm_89): bench-compatible residency and per-expert divisor metadata.
+    Device device = Device{};
+    std::span<const float> weight_divisors;
 };
 
 struct WeightRegion {
@@ -98,3 +102,4 @@ struct WeightRowPlanes {
 [[nodiscard]] Weight native_weight(const WeightView& view, float input_divisor = 0.0F);
 
 } // namespace ninfer
+

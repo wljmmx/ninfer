@@ -19,8 +19,9 @@ void check(cudaError_t status, const char* what) {
 
 CudaHostRegistration::CudaHostRegistration(void* host, std::size_t bytes, int cuda_ordinal) {
     if (host == nullptr || bytes == 0 || cuda_ordinal < 0) {
-        throw std::invalid_argument("pinned registration requires a Host range and a CUDA device");
+        throw std::invalid_argument("pinned registration requires a Host range and a CUDA ordinal");
     }
+    const auto device = Device::cuda(cuda_ordinal);
     check(cudaSetDevice(cuda_ordinal), "cudaSetDevice");
     check(cudaHostRegister(host, bytes, cudaHostRegisterPortable), "cudaHostRegister");
     void* device_address = nullptr;
@@ -29,7 +30,7 @@ CudaHostRegistration::CudaHostRegistration(void* host, std::size_t bytes, int cu
         (void)cudaHostUnregister(host);
         check(status, "cudaHostGetDevicePointer");
     }
-    view_ = {host, bytes, device_address, cuda_ordinal};
+    view_ = CudaHostView{ConstMemorySpan{host, bytes, Device::cpu()}, device_address, device};
 }
 
 CudaHostRegistration::~CudaHostRegistration() { release(); }
@@ -46,9 +47,8 @@ CudaHostRegistration& CudaHostRegistration::operator=(CudaHostRegistration&& oth
 }
 
 void CudaHostRegistration::release() noexcept {
-    if (view_.host != nullptr) { (void)cudaHostUnregister(view_.host); }
+    if (view_.host.data != nullptr) { (void)cudaHostUnregister(const_cast<void*>(view_.host.data)); }
     view_ = CudaHostView{};
 }
 
 } // namespace ninfer
-
