@@ -1,5 +1,6 @@
 add_library(ninfer_core STATIC
   arena.cu
+cuda_host.cpp
   device.cu
   dtype.cpp
   host_worker_pool.cpp
@@ -17,3 +18,4 @@ add_library(ninfer_core STATIC
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
 target_link_libraries(ninfer_core PUBLIC CUDA::cudart CUDA::nvtx3 Threads::Threads)
+
