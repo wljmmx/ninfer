@@ -41,6 +41,7 @@ VmmPool::VmmPool(Device device, std::size_t capacity_bytes, std::size_t segment_
     // Callers size their pool from free memory, which is never segment aligned; round up so every
     // segment can be mapped and returned on its own.
     capacity_bytes = (capacity_bytes + segment_bytes - 1) / segment_bytes * segment_bytes;
+    capacity_      = capacity_bytes;
     if (capacity_bytes % 256 != 0) {
         throw std::invalid_argument("vmm_pool capacity must be 256-byte aligned");
     }
