@@ -150,6 +150,35 @@ std::size_t VmmPool::acquire(std::size_t wanted_bytes) {
     return added;
 }
 
+bool VmmPool::is_mapped_range(std::size_t offset, std::size_t bytes) const noexcept {
+    if (base_ == nullptr || bytes == 0 || offset + bytes > capacity_) { return false; }
+    for (std::size_t done = 0; done < bytes; done += std::min(segment_, bytes - done)) {
+        const auto index = (offset + done) / segment_;
+        if (index >= handles_.size() || handles_[index] == nullptr) { return false; }
+    }
+    return true;
+}
+
+std::size_t VmmPool::unmap_at(std::size_t offset, std::size_t bytes) {
+    if (base_ == nullptr || bytes == 0) { return 0; }
+    if (offset % segment_ != 0 || bytes % segment_ != 0 || offset + bytes > mapped_) {
+        throw std::out_of_range("vmm_pool: unmap_at needs an aligned mapped range");
+    }
+    unmap_range(offset, bytes);
+    mapped_ -= bytes;
+    return bytes;
+}
+
+std::size_t VmmPool::map_at(std::size_t offset, std::size_t bytes) {
+    if (base_ == nullptr || bytes == 0) { return 0; }
+    if (offset % segment_ != 0 || bytes % segment_ != 0 || offset + bytes > capacity_) {
+        throw std::out_of_range("vmm_pool: map_at needs an aligned reserved range");
+    }
+    map_range(offset, bytes);
+    mapped_ += bytes;
+    return bytes;
+}
+
 void VmmPool::fill(int byte_value) {
     CudaDeviceScope scope(device_);
     if (cudaMemset(base_, byte_value, mapped_) != cudaSuccess) {
@@ -158,8 +187,8 @@ void VmmPool::fill(int byte_value) {
 }
 
 void VmmPool::copy_from_host(const void* source, std::size_t count, std::size_t offset) {
-    if (count > mapped_ || offset > mapped_ - count) {
-        throw std::out_of_range("vmm_pool: copy exceeds the mapped range");
+    if (!is_mapped_range(offset, count)) {
+        throw std::out_of_range("vmm_pool: copy touches an unmapped segment");
     }
     CudaDeviceScope scope(device_);
     if (cudaMemcpy(static_cast<std::byte*>(base_) + offset, source, count,
@@ -169,8 +198,8 @@ void VmmPool::copy_from_host(const void* source, std::size_t count, std::size_t 
 }
 
 void VmmPool::copy_to_host(void* destination, std::size_t count, std::size_t offset) const {
-    if (count > mapped_ || offset > mapped_ - count) {
-        throw std::out_of_range("vmm_pool: copy exceeds the mapped range");
+    if (!is_mapped_range(offset, count)) {
+        throw std::out_of_range("vmm_pool: copy touches an unmapped segment");
     }
     CudaDeviceScope scope(device_);
     if (cudaMemcpy(destination, static_cast<const std::byte*>(base_) + offset, count,

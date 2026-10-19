@@ -27,10 +27,12 @@ public:
     [[nodiscard]] void* data() const noexcept { return base_; }
     // Address-space capacity: stable for the lifetime of the pool.
     [[nodiscard]] std::size_t size() const noexcept { return capacity_; }
-    // Physically backed bytes right now (always a multiple of segment_bytes()).
+    // Physically backed bytes right now (a multiple of segment_bytes; holes are allowed).
     [[nodiscard]] std::size_t mapped() const noexcept { return mapped_; }
     [[nodiscard]] std::size_t segment_bytes() const noexcept { return segment_; }
-    [[nodiscard]] MemorySpan span() const noexcept { return {data(), mapped_, device_, false}; }
+    // The whole reserved range: expert offsets index into it, and segments may be unmapped in the
+    // middle without invalidating the descriptor.
+    [[nodiscard]] MemorySpan span() const noexcept { return {data(), capacity_, device_, false}; }
 
     // Unmaps whole segments from the top so that up to `wanted_bytes` are returned, never dropping
     // below `keep_mapped_bytes` and never below one segment. Returns the bytes actually released.
@@ -39,12 +41,19 @@ public:
     // Maps segments back, up to `wanted_bytes` or the reserved capacity. Returns the bytes added.
     std::size_t acquire(std::size_t wanted_bytes);
 
+    // Releases or restores one aligned range in the middle of the pool, leaving the segments around
+    // it mapped. Used to hand back a slice of pinned expert memory while streaming windows above it
+    // keep working.
+    std::size_t unmap_at(std::size_t offset, std::size_t bytes);
+    std::size_t map_at(std::size_t offset, std::size_t bytes);
+
     // Both require the whole range to be mapped.
     void fill(int byte_value = 0);
     void copy_from_host(const void* source, std::size_t count, std::size_t offset = 0);
     void copy_to_host(void* destination, std::size_t count, std::size_t offset = 0) const;
 
 private:
+    [[nodiscard]] bool is_mapped_range(std::size_t offset, std::size_t bytes) const noexcept;
     void map_range(std::size_t offset, std::size_t bytes);
     void unmap_range(std::size_t offset, std::size_t bytes);
     void destroy() noexcept;
