@@ -203,4 +203,6 @@ io::ReadOnlyFile Reader::open_file(std::size_t file_index, io::ReadMode mode) co
     } catch (const std::system_error& e) { throw ArtifactError(e.what()); }
 }
 
+const std::filesystem::path& Reader::path() const noexcept { return impl_->entry; }
+
 } // namespace ninfer::artifact

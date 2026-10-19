@@ -45,6 +45,9 @@ public:
     // Opens an independently owned file and checks its framing/length against this directory.
     [[nodiscard]] io::ReadOnlyFile open_file(std::size_t file_index, io::ReadMode mode) const;
 
+    // port (sm_89): entry path, for media-dependent read modes.
+    [[nodiscard]] const std::filesystem::path& path() const noexcept;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

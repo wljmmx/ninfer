@@ -1,5 +1,7 @@
 #include "models/common/moe/weights.h"
 
+#include "core/io/device_traits.h"
+#include "core/io/direct_read.h"
 #include "models/common/moe/expert_host.h"
 
 #include <array>
@@ -193,8 +195,9 @@ std::vector<ExpertFileBank> describe_expert_files(const artifact::Reader& reader
 
 ExpertFileReader::ExpertFileReader(const artifact::Reader& reader) {
     files_.reserve(reader.directory().files.size());
+    const auto mode = io::expert_read_mode(reader.path());
     for (std::size_t i = 0; i < reader.directory().files.size(); ++i) {
-        files_.push_back(std::make_unique<io::ReadOnlyFile>(reader.open_file(i, io::ReadMode::Buffered)));
+        files_.push_back(std::make_unique<io::ReadOnlyFile>(reader.open_file(i, mode)));
     }
 }
 
@@ -212,7 +215,7 @@ void ExpertFileReader::read_entry(const ExpertFileEntry& entry,
             if (span.bytes > cursor.size()) {
                 throw artifact::ArtifactError("expert file span exceeds its image chunk");
             }
-            files_[span.file_index]->read_exact(span.file_offset,
+            io::read_range(*files_[span.file_index], span.file_offset,
                                                 cursor.subspan(0, static_cast<std::size_t>(span.bytes)));
             cursor = cursor.subspan(static_cast<std::size_t>(span.bytes));
         }
@@ -220,3 +223,7 @@ void ExpertFileReader::read_entry(const ExpertFileEntry& entry,
 }
 
 } // namespace ninfer::models::moe
+
+
+
+

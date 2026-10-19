@@ -20,9 +20,9 @@ target_link_libraries(ninfer_cpu PRIVATE ${NINFER_CPU_PLATFORM_LIBRARIES})
 
 # port: Win32 IO sources replace upstream's io_uring implementation on Windows.
 if(WIN32)
-  set(NINFER_IO_PLATFORM_SOURCES io/file_windows.cpp io/read_queue_windows.cpp)
+  set(NINFER_IO_PLATFORM_SOURCES io/file_windows.cpp io/read_queue_windows.cpp io/device_traits.cpp)
 else()
-  set(NINFER_IO_PLATFORM_SOURCES io/file.cpp io/read_queue.cpp)
+  set(NINFER_IO_PLATFORM_SOURCES io/file.cpp io/read_queue.cpp io/device_traits.cpp)
 endif()
 
 add_library(ninfer_core STATIC

@@ -1,5 +1,7 @@
 #include "models/common/moe/expert_host.h"
 
+#include "core/io/device_traits.h"
+#include "core/io/direct_read.h"
 #include "core/io/file.h"
 
 #include <algorithm>
@@ -64,9 +66,9 @@ ExpertHostTier::ExpertHostTier(const artifact::Reader& reader,
     }
 
     files_.reserve(reader.directory().files.size());
+    const auto mode = io::expert_read_mode(reader.path());
     for (std::size_t index = 0; index < reader.directory().files.size(); ++index) {
-        files_.push_back(
-            std::make_unique<io::ReadOnlyFile>(reader.open_file(index, io::ReadMode::Buffered)));
+        files_.push_back(std::make_unique<io::ReadOnlyFile>(reader.open_file(index, mode)));
     }
 
     for (const auto& entry : order) {
@@ -86,11 +88,10 @@ ExpertHostTier::ExpertHostTier(const artifact::Reader& reader,
             std::vector<std::byte> bytes(matrix.parent.geometry.divisor_count * sizeof(float));
             for (const auto& segment :
                  reader.segments(object + matrix.parent.geometry.divisor_offset, bytes.size())) {
-                files_[segment.file_index]->read_exact(
-                    segment.file_offset,
-                    std::span<std::byte>(bytes).subspan(
-                        static_cast<std::size_t>(segment.destination_offset),
-                        static_cast<std::size_t>(segment.bytes)));
+                io::read_range(*files_[segment.file_index], segment.file_offset,
+                               std::span<std::byte>(bytes).subspan(
+                                   static_cast<std::size_t>(segment.destination_offset),
+                                   static_cast<std::size_t>(segment.bytes)));
             }
             std::memcpy(matrix.divisors.data(), bytes.data(), bytes.size());
         }
@@ -164,8 +165,8 @@ void ExpertHostTier::load(Matrix& matrix, std::uint32_t expert) {
             if (span.file_index >= files_.size() || span.bytes > cursor.size()) {
                 throw std::runtime_error("expert host tier span exceeds its segment");
             }
-            files_[span.file_index]->read_exact(
-                span.file_offset, cursor.subspan(0, static_cast<std::size_t>(span.bytes)));
+            io::read_range(*files_[span.file_index], span.file_offset,
+                                                cursor.subspan(0, static_cast<std::size_t>(span.bytes)));
             cursor = cursor.subspan(static_cast<std::size_t>(span.bytes));
         }
     }
@@ -221,3 +222,6 @@ void ExpertHostTier::ensure(ExpertBankId bank, std::span<const std::int32_t> exp
 }
 
 } // namespace ninfer::models::moe
+
+
+
