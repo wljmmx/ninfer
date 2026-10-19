@@ -19,11 +19,18 @@ ninfer_internal_includes(ninfer-perplexity)
 target_link_libraries(ninfer-perplexity PRIVATE
   ninfer_engine ninfer_product_logging ninfer::json)
 
+# port (sm_89): offline MoE kernel diagnostic. Compares the shipped sparse op with the imported
+# routed op on one layer's device bank; never part of the product binaries.
+add_executable(diag-moe diag-moe/main.cpp)
+ninfer_internal_includes(diag-moe)
+target_link_libraries(diag-moe PRIVATE ninfer_engine ninfer_product_logging CUDA::cudart
+                                         ninfer::json)
+
 # Windows product binaries decode argv and narrow file paths as UTF-8 (the engine's whole
 # text pipeline is UTF-8); the activeCodePage manifest makes the process ANSI code page
 # UTF-8 system-wide on Windows 10 1903 and newer.
 if(MSVC)
-  foreach(app IN ITEMS ninfer ninfer-serve ninfer-perplexity)
+  foreach(app IN ITEMS ninfer ninfer-serve ninfer-perplexity diag-moe)
     target_sources(${app} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/utf8-codepage.manifest")
   endforeach()
 endif()
