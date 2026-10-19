@@ -190,9 +190,9 @@ Placement describe_placement(const Data& data, Device cuda, Device expert_device
     for (const auto& layer : data.weights.text.layers) place(layer);
     if (data.weights.mtp) place(data.weights.mtp->layer);
     std::vector<artifact::PlacementRequest> requests;
-    // port (sm_89): with the host tier on, CPU expert banks upload from the artifact and keep
-    // ordinary pageable Host memory instead of a pinned replica.
+    // port (sm_89): the host tier uploads through the file tier, so it implies it.
     const bool host_tier = expert_host_tier_enabled();
+    const bool file_tier = expert_file_tier_enabled() || host_tier;
     for (std::size_t i = 0; i < data.pending.size(); ++i) {
         for (const auto& part : data.pending[i].reference.binding.parts) {
             const bool cpu    = out.weights[i] == Device::cpu();
@@ -246,7 +246,7 @@ std::unique_ptr<Model> materialize_model(ResolvedLoadPlan&& plan, DeviceContext&
     // port (sm_89): the file tier opens its own handles, so it survives the load-time Reader.
     std::unique_ptr<moe::ExpertFileReader> file_reader;
     std::vector<ExpertFileBank> file_banks;
-    if (expert_file_tier_enabled()) {
+    if (expert_file_tier_enabled() || expert_host_tier_enabled()) {
         file_banks  = moe::describe_expert_files(*data->reader, data->expert_banks);
         file_reader = std::make_unique<moe::ExpertFileReader>(*data->reader);
         std::fprintf(stderr, "expert file tier: %zu banks, %zu files, %zu B per largest image\n",
