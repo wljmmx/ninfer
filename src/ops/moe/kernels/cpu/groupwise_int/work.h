@@ -2,6 +2,9 @@
 
 #include "ops/moe/kernels/cpu/invocation.h"
 
+#include <cstdio>
+#include <cstdlib>
+
 namespace ninfer::ops::detail::moe_cpu::groupwise_int {
 
 inline constexpr int hidden = 2048, intermediate = 512, experts = 256, top_k = 8;
