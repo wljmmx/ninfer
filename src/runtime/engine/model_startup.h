@@ -89,7 +89,7 @@ prepare_program(const Setup& setup, ModelInstance<typename Setup::Types>& instan
                 DeviceContext& device, EngineOptions& options, const StartupMemoryBudget& budget,
                 CalibratedPlan<typename Setup::ExecutionPlan> plan,
                 std::vector<typename Setup::Calibration>& measured, unsigned& attempts) {
-    while (attempts < 2) {
+    while (attempts < 3) {
         ++attempts;
         auto& startup             = plan.startup;
         const auto explicit_bytes = startup.sequence.device_reservation_bytes();
@@ -132,7 +132,7 @@ prepare_program(const Setup& setup, ModelInstance<typename Setup::Types>& instan
         }
         instance.program.reset();
         device.synchronize();
-        if (attempts == 2) return std::nullopt;
+        if (attempts == 3) return std::nullopt;
         const auto after_cleanup = device_memory_snapshot(device.device());
         const auto available     = budget.available(after_cleanup);
         const auto recovered     = ready ? device_memory_growth(after_cleanup, *ready) -
@@ -141,8 +141,13 @@ prepare_program(const Setup& setup, ModelInstance<typename Setup::Types>& instan
         const auto reserve =
             std::max(plan.graph.rebuild_estimate_bytes,
                      static_cast<std::size_t>(std::max<std::int64_t>(0, recovered)));
-        if (reserve > available) return std::nullopt;
-        auto candidate = setup.plan(device, options, startup.host_experts, available - reserve);
+        // port (sm_89): degrade the automatic KV capacity instead of switching to CPU experts.
+        // A retry that only subtracts the measured growth can still hand every byte to KV and
+        // fail again; shrinking by an eighth per attempt leaves room for the program workspace.
+        const auto shrink = attempts > 1 ? available / 8 : 0;
+        if (reserve > available || shrink > available - reserve) return std::nullopt;
+        auto candidate =
+            setup.plan(device, options, startup.host_experts, available - reserve - shrink);
         if (!candidate) return std::nullopt;
         auto corrected = calibrate_plan(setup, instance, device, options, budget,
                                         std::move(*candidate), measured, reserve);
