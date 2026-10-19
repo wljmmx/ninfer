@@ -166,6 +166,41 @@ static int run(int argc, char** argv) {
     check(cudaMalloc(&out_sparse, hidden * max_tokens * sizeof(__nv_bfloat16)), "sparse output");
     check(cudaMalloc(&out_routed, hidden * max_tokens * sizeof(__nv_bfloat16)), "routed output");
 
+    // Isolation: point both sides' shared experts at a zeroed buffer, which removes the shared
+    // contribution from both ops without changing any geometry. If the two sides then agree, the
+    // divergence lives in the shared path rather than in the routed experts.
+    const auto zero_gu_bytes = sparse.shared_gate_up.payload_bytes;
+    const auto zero_dn_bytes = sparse.shared_down.payload_bytes;
+    void* zero_gu            = nullptr;
+    void* zero_dn            = nullptr;
+    check(cudaMalloc(&zero_gu, zero_gu_bytes ? zero_gu_bytes : 1), "alloc zero gate_up");
+    check(cudaMalloc(&zero_dn, zero_dn_bytes ? zero_dn_bytes : 1), "alloc zero down");
+    check(cudaMemset(zero_gu, 0, zero_gu_bytes ? zero_gu_bytes : 1), "clear zero gate_up");
+    check(cudaMemset(zero_dn, 0, zero_dn_bytes ? zero_dn_bytes : 1), "clear zero down");
+    const auto blank = [](const Weight& source, void* buffer) {
+        // Zeroing the codes alone is enough: every dot product then reads zero, while the
+        // geometry and the high/scale planes stay exactly as the ops expect them.
+        Weight out  = source;
+        out.payload = buffer;
+        out.qdata   = buffer;
+        return out;
+    };
+    auto sparse_blank           = sparse;
+    sparse_blank.shared_gate_up = blank(sparse.shared_gate_up, zero_gu);
+    sparse_blank.shared_down    = blank(sparse.shared_down, zero_dn);
+    auto shared_blank           = shared;
+    shared_blank.gate_up.weight = blank(shared.gate_up.weight, zero_gu);
+    shared_blank.down.weight    = blank(shared.down.weight, zero_dn);
+
+    struct Case {
+        const char* label;
+        ops::SparseMoeWeights sparse;
+        ops::MoeWeights routed;
+    };
+    const std::vector<Case> cases{
+        {"full", sparse, ops::MoeWeights{control, routed, shared}},
+        {"no-shared", sparse_blank, ops::MoeWeights{control, routed, shared_blank}}};
+
     int failures = 0;
     for (const int tokens : {1, 2, 3, 16, 17, 32, 47, 64, 128, 768, 1024, 1560}) {
         const auto x = Tensor(x_device, execution.device(), DType::BF16,
@@ -180,54 +215,59 @@ static int run(int argc, char** argv) {
         check(cudaMemsetAsync(out_routed, 0, elements * sizeof(__nv_bfloat16), stream),
               "clear routed");
 
-        const auto sparse_bytes = ops::sparse_moe_workspace_capacity_bytes(
-            sparse.routed_gate_up.qtype, sparse.routed_down.qtype, tokens, tokens);
         const auto routed_bytes = ops::topk_softmax_swiglu_moe_workspace_capacity_bytes(
             profile, ops::MoeEpilogue::AddResidual, tokens, tokens);
-
-        {
-            WorkspaceArena arena(sparse_bytes);
-            ops::sparse_moe(x, sparse, ops::SparseMoeEpilogue::AddResidual, sparse_out,
-                            ops::SparseMoeHints{}, arena, execution);
-        }
-        {
-            void* buffer = nullptr;
-            check(cudaMalloc(&buffer, routed_bytes), "alloc routed workspace");
-            MemoryArena arena(MemorySpan{buffer, routed_bytes, execution.device()});
-            ops::topk_softmax_swiglu_moe(x, profile, ops::MoeWeights{control, routed, shared},
-                                         ops::MoeEpilogue::AddResidual, routed_out, arena,
-                                         execution);
-            check(cudaStreamSynchronize(stream), "routed sync");
-            check(cudaFree(buffer), "free routed workspace");
-        }
-        check(cudaStreamSynchronize(stream), "sparse sync");
-
-        std::vector<__nv_bfloat16> host_sparse(elements), host_routed(elements);
-        check(cudaMemcpy(host_sparse.data(), out_sparse, elements * sizeof(__nv_bfloat16),
-                         cudaMemcpyDeviceToHost),
-              "read sparse");
-        check(cudaMemcpy(host_routed.data(), out_routed, elements * sizeof(__nv_bfloat16),
-                         cudaMemcpyDeviceToHost),
-              "read routed");
-
-        float max_difference  = 0.0F;
-        double sum_difference = 0.0;
-        std::size_t worst     = 0;
-        for (std::size_t i = 0; i < elements; ++i) {
-            const auto a = __bfloat162float(host_sparse[i]);
-            const auto b = __bfloat162float(host_routed[i]);
-            const auto d = std::fabs(a - b);
-            if (d > max_difference) {
-                max_difference = d;
-                worst          = i;
+        for (const auto& item : cases) {
+            check(cudaMemsetAsync(out_sparse, 0, elements * sizeof(__nv_bfloat16), stream),
+                  "clear sparse");
+            check(cudaMemsetAsync(out_routed, 0, elements * sizeof(__nv_bfloat16), stream),
+                  "clear routed");
+            const auto sparse_bytes = ops::sparse_moe_workspace_capacity_bytes(
+                item.sparse.routed_gate_up.qtype, item.sparse.routed_down.qtype, tokens, tokens);
+            {
+                WorkspaceArena arena(sparse_bytes);
+                ops::sparse_moe(x, item.sparse, ops::SparseMoeEpilogue::AddResidual, sparse_out,
+                                ops::SparseMoeHints{}, arena, execution);
             }
-            sum_difference += d;
+            {
+                void* buffer = nullptr;
+                check(cudaMalloc(&buffer, routed_bytes), "alloc routed workspace");
+                MemoryArena arena(MemorySpan{buffer, routed_bytes, execution.device()});
+                ops::topk_softmax_swiglu_moe(x, profile, item.routed,
+                                             ops::MoeEpilogue::AddResidual, routed_out, arena,
+                                             execution);
+                check(cudaStreamSynchronize(stream), "routed sync");
+                check(cudaFree(buffer), "free routed workspace");
+            }
+            check(cudaStreamSynchronize(stream), "sparse sync");
+
+            std::vector<__nv_bfloat16> host_sparse(elements), host_routed(elements);
+            check(cudaMemcpy(host_sparse.data(), out_sparse, elements * sizeof(__nv_bfloat16),
+                             cudaMemcpyDeviceToHost),
+                  "read sparse");
+            check(cudaMemcpy(host_routed.data(), out_routed, elements * sizeof(__nv_bfloat16),
+                             cudaMemcpyDeviceToHost),
+                  "read routed");
+
+            float max_difference  = 0.0F;
+            double sum_difference = 0.0;
+            std::size_t worst     = 0;
+            for (std::size_t i = 0; i < elements; ++i) {
+                const auto a = __bfloat162float(host_sparse[i]);
+                const auto b = __bfloat162float(host_routed[i]);
+                const auto d = std::fabs(a - b);
+                if (d > max_difference) {
+                    max_difference = d;
+                    worst          = i;
+                }
+                sum_difference += d;
+            }
+            std::printf("T=%-4d [%-9s] max|d|=%.6f mean|d|=%.8f (%.6f vs %.6f)\n", tokens,
+                        item.label, max_difference, sum_difference / elements,
+                        __bfloat162float(host_sparse[worst]),
+                        __bfloat162float(host_routed[worst]));
+            if (max_difference > 1e-2F) { ++failures; }
         }
-        std::printf("T=%-4d max|d|=%.6f mean|d|=%.8f worst@%zu (%.6f vs %.6f)\n", tokens,
-                    max_difference, sum_difference / elements, worst,
-                    __bfloat162float(host_sparse[worst]),
-                    __bfloat162float(host_routed[worst]));
-        if (max_difference > 1e-2F) { ++failures; }
     }
 
     check(cudaFree(out_sparse), "free sparse output");
