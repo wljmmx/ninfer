@@ -166,11 +166,14 @@ struct ExpertCache::Impl {
     };
 
     struct Slot {
+        // port (sm_89): several pinned images per slot, so one batch can carry several
+        // file-tier experts instead of a single one.
+        static constexpr std::size_t kFileStagingSlots = 4;
         PinnedHostBuffer index_snapshot;
         CudaHostView index_source;
-        // File-tier staging: one expert image, laid out exactly like its destination slot.
         PinnedHostBuffer staging;
         CudaHostView staging_view;
+        std::size_t next_staging = 0;
         CudaHostCopyBatch data_copies, index_copies;
         CudaCompletionEvent done;
         std::size_t payload_bytes = 0;
@@ -180,8 +183,10 @@ struct ExpertCache::Impl {
         Slot(const ExpertCacheRequirements& req, const DeviceContext& ctx)
             : index_snapshot(req.offset_bytes),
               index_source(index_snapshot.cuda_view(ctx.device())),
-              staging(req.max_entry_bytes),
-              staging_view(req.max_entry_bytes ? staging.cuda_view(ctx.device()) : CudaHostView{}),
+              staging(req.max_entry_bytes * kFileStagingSlots),
+              staging_view(req.max_entry_bytes
+                               ? staging.cuda_view(ctx.device())
+                               : CudaHostView{}),
               data_copies(ctx.device(), req.config.max_batch_copies),
               index_copies(ctx.device(), req.entry_count), done(ctx) {}
     };
@@ -619,29 +624,34 @@ struct ExpertCache::Impl {
                                           budget.max_bytes - result.submitted_bytes);
             slot.payload_bytes = 0;
             slot.data_copies.clear();
+    slot.next_staging = 0;
             bool whole_experts = true;
             const auto append  = [&](std::size_t i, bool speculative) {
                 auto& entry = entries[i];
                 if (entry.state != State::Reserved || entry.copied == payload_size(i)) return true;
-                // port (sm_89): the file tier fetches one whole expert into pinned staging and
-                // uploads it as a single copy. One staging buffer per slot means one per batch:
-                // returning false here stops the batch before the image can be overwritten.
+                // port (sm_89): the file tier fetches whole experts into pinned staging and
+                // uploads each as one copy. Several images per slot let a batch carry more than
+                // one expert; the slot's pending handshake keeps them alive until completion.
                 if (const auto* file = file_entry(i)) {
                     if (slot.payload_bytes &&
                         file->image_bytes > limit - slot.payload_bytes)
                         return false;
+                    if (slot.next_staging == Slot::kFileStagingSlots) { return false; }
+                    const auto block_bytes = requirements.max_entry_bytes;
+                    const auto index       = slot.next_staging++;
+                    auto* host_base        = static_cast<std::byte*>(slot.staging.data()) +
+                                      index * block_bytes;
                     files.reader->read_entry(
-                        *file, {static_cast<std::byte*>(slot.staging.data()),
-                                static_cast<std::size_t>(file->image_bytes)});
+                        *file, {host_base, static_cast<std::size_t>(file->image_bytes)});
                     slot.data_copies.append(
                         pool.span().subspan(entry.offset, file->image_bytes),
-                        slot.staging_view.subspan(0, file->image_bytes));
+                        slot.staging_view.subspan(index * block_bytes, file->image_bytes));
                     if (speculative)
                         counters.prefetched_bytes += file->image_bytes;
                     slot.payload_bytes += file->image_bytes;
                     entry.copied = payload_size(i);
                     completed.push_back(i);
-                    return false;
+                    return slot.next_staging < Slot::kFileStagingSlots;
                 }
                 if (slot.payload_bytes &&
                     payload_size(i) - entry.copied > limit - slot.payload_bytes)
