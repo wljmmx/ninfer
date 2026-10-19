@@ -1,0 +1,56 @@
+#include "artifact/expert_files.h"
+
+#include <stdexcept>
+
+namespace ninfer::artifact {
+namespace {
+
+void append_plane(ExpertFileEntry& entry, const Reader& reader, ObjectHandle object,
+                  std::uint64_t plane_offset, std::uint64_t plane_bytes,
+                  std::uint64_t image_offset) {
+    if (!plane_bytes) { return; }
+    const auto& descriptor = reader.directory().tensor(object);
+    const auto logical     = descriptor.offset + plane_offset;
+    for (const auto& segment : reader.segments(logical, plane_bytes)) {
+        ExpertFileChunk chunk;
+        chunk.file_index   = static_cast<std::uint32_t>(segment.file_index);
+        chunk.file_offset  = segment.file_offset;
+        chunk.bytes        = segment.bytes;
+        chunk.image_offset = image_offset + segment.destination_offset;
+        entry.chunks.push_back(chunk);
+    }
+}
+
+} // namespace
+
+ExpertFileBank describe_expert_files(const Reader& reader,
+                                     std::span<const ObjectHandle> gate_up_objects,
+                                     std::span<const ObjectHandle> down_objects,
+                                     const WeightGeometry& gate_up, const WeightGeometry& down,
+                                     const ExpertBankLayout& layout) {
+    if (gate_up_objects.size() != down_objects.size() || gate_up_objects.size() != layout.count) {
+        throw std::invalid_argument("expert file plan disagrees on the expert count");
+    }
+    ExpertFileBank bank;
+    bank.experts.reserve(gate_up_objects.size());
+    for (std::size_t expert = 0; expert < gate_up_objects.size(); ++expert) {
+        ExpertFileEntry entry;
+        entry.image_bytes = layout.entry_bytes;
+        append_plane(entry, reader, gate_up_objects[expert], 0, gate_up.code_bytes,
+                     layout.codes.offset);
+        append_plane(entry, reader, gate_up_objects[expert], gate_up.high_offset,
+                     gate_up.high_bytes, layout.high.offset);
+        append_plane(entry, reader, gate_up_objects[expert], gate_up.scale_offset,
+                     gate_up.scale_bytes, layout.scales.offset);
+        append_plane(entry, reader, down_objects[expert], 0, down.code_bytes,
+                     layout.down_codes.offset);
+        append_plane(entry, reader, down_objects[expert], down.high_offset, down.high_bytes,
+                     layout.down_high.offset);
+        append_plane(entry, reader, down_objects[expert], down.scale_offset, down.scale_bytes,
+                     layout.down_scales.offset);
+        bank.experts.push_back(std::move(entry));
+    }
+    return bank;
+}
+
+} // namespace ninfer::artifact

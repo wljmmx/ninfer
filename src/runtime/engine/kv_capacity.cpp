@@ -139,12 +139,40 @@ KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
         throw std::invalid_argument("unknown KV capacity policy");
     }
 
-    const std::size_t reservation = curve.reservation_bytes(pages);
+    // port (sm_89): a request that misses the budget degrades to the largest feasible page
+    // count instead of aborting startup. Only the minimum device reservation is a hard floor;
+    // when even that does not fit the configuration is physically infeasible.
+    std::size_t reservation = curve.reservation_bytes(pages);
     if (reservation > capacity_budget) {
-        throw std::invalid_argument("requested Engine runtime reservation requires " +
-                                    std::to_string(reservation) + " bytes, but only " +
-                                    std::to_string(capacity_budget) +
-                                    " bytes are available for runtime capacity");
+        if (curve.minimum_device_reservation_bytes > capacity_budget) {
+            throw std::invalid_argument("minimum Engine runtime reservation requires " +
+                                        std::to_string(curve.minimum_device_reservation_bytes) +
+                                        " bytes, but only " + std::to_string(capacity_budget) +
+                                        " bytes are available for runtime capacity");
+        }
+        const auto per_group = curve.bytes_per_additional_main_page_group;
+        const auto excess    = reservation - capacity_budget;
+        const auto drop      = (excess + per_group - 1) / per_group;
+        const auto floor     = curve.minimum_main_page_groups;
+        std::uint32_t degraded =
+            drop >= pages - floor ? floor : static_cast<std::uint32_t>(pages - drop);
+        while (degraded > floor && curve.reservation_bytes(degraded) > capacity_budget) {
+            --degraded;
+        }
+        reservation = curve.reservation_bytes(degraded);
+        if (reservation > capacity_budget) {
+            throw std::invalid_argument("requested Engine runtime reservation requires " +
+                                        std::to_string(reservation) + " bytes, but only " +
+                                        std::to_string(capacity_budget) +
+                                        " bytes are available for runtime capacity");
+        }
+        std::fprintf(stderr,
+                     "[kv] capacity degraded: %u -> %u page groups (%zu -> %zu bytes, "
+                     "%zu bytes available)\n",
+                     pages, degraded, curve.reservation_bytes(pages), reservation,
+                     capacity_budget);
+        std::fflush(stderr);
+        pages = degraded;
     }
 
     return KvCapacityResolution{
