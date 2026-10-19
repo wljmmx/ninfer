@@ -75,7 +75,12 @@ WeightBankView bind_weight_bank(const WeightParent& parent, const WeightBankLayo
 ConstMemorySpan WeightBankView::plane(const WeightBankPlane& plane, std::uint32_t expert) const {
     check_expert(*this, expert);
     if (!plane.expert_bytes) { return {nullptr, 0, parent->device}; }
-    const auto offset = plane.offset + expert * plane.expert_stride;
+    // port (sm_89): a per-plane table wins over the linear stride, so experts may sit in
+    // separately committed segments that are released and reloaded independently.
+    const std::uint64_t* table = &plane == &layout.codes    ? expert_offsets.codes
+                                 : &plane == &layout.high   ? expert_offsets.high
+                                                            : expert_offsets.scales;
+    const auto offset = plane.offset + (table ? table[expert] : expert * plane.expert_stride);
     if (offset > parent->geometry.bytes || plane.expert_bytes > parent->geometry.bytes - offset) {
         throw std::out_of_range("weight bank plane exceeds its backing");
     }

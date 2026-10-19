@@ -20,8 +20,14 @@ Scratch allocate(Arena& arena, int tokens, int token_block) {
 Matrix matrix(const WeightBankView& bank, int expert) noexcept {
     const auto& layout = bank.layout;
     const auto* base   = reinterpret_cast<const std::uint8_t*>(bank.parent->data);
-    return {base + layout.codes.offset + expert * layout.codes.expert_stride,
-            base + layout.scales.offset + expert * layout.scales.expert_stride,
+    // port (sm_89): per-expert offsets replace the linear stride when present.
+    const auto code_offset  = bank.expert_offsets.codes
+                                  ? static_cast<std::size_t>(bank.expert_offsets.codes[expert])
+                                  : static_cast<std::size_t>(expert) * layout.codes.expert_stride;
+    const auto scale_offset = bank.expert_offsets.scales
+                                  ? static_cast<std::size_t>(bank.expert_offsets.scales[expert])
+                                  : static_cast<std::size_t>(expert) * layout.scales.expert_stride;
+    return {base + layout.codes.offset + code_offset, base + layout.scales.offset + scale_offset,
             bank.parent->weight_divisors[layout.divisor_begin + expert * layout.divisor_stride]};
 }
 } // namespace

@@ -48,6 +48,7 @@ add_library(ninfer_core STATIC
   weight_view.cpp
   weight_bank.cpp
   expert_cache.cpp
+  host_reserve.cpp
   vmm_pool.cpp
   decode_graph.cpp
 )

@@ -50,10 +50,19 @@ struct WeightBankLayout {
     friend bool operator==(const WeightBankLayout&, const WeightBankLayout&) = default;
 };
 
+// port (sm_89): per-expert byte offsets added to each plane's own offset. Set when experts live
+// in separately committed segments (host file tier); a plane keeps its stride when null.
+struct ExpertOffsetTable {
+    const std::uint64_t* codes  = nullptr;
+    const std::uint64_t* high   = nullptr;
+    const std::uint64_t* scales = nullptr;
+};
+
 // Borrows immutable backing and Host divisor metadata from the model.
 struct WeightBankView {
     const WeightParent* parent = nullptr;
     WeightBankLayout layout;
+    ExpertOffsetTable expert_offsets;
 
     [[nodiscard]] ConstMemorySpan plane(const WeightBankPlane& plane, std::uint32_t expert) const;
     // Returns the multiplicative identity when the representation has no matrix divisor.

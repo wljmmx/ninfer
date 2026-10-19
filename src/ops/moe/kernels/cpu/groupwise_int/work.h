@@ -32,12 +32,25 @@ struct MatrixBank {
     std::size_t code_stride;
     std::size_t high_stride;
     std::size_t scale_stride;
+    // port (sm_89): per-expert offsets replace expert * stride when experts live in
+    // separately committed segments. The base already points at each plane's origin.
+    const std::uint64_t* code_offsets  = nullptr;
+    const std::uint64_t* high_offsets  = nullptr;
+    const std::uint64_t* scale_offsets = nullptr;
+
+    [[nodiscard]] std::size_t offset(const std::uint64_t* table, int expert,
+                                     std::size_t stride) const noexcept {
+        return table ? static_cast<std::size_t>(table[expert])
+                     : static_cast<std::size_t>(expert) * stride;
+    }
 
     [[nodiscard]] Matrix matrix(int expert) const noexcept {
-        return {base.codes + expert * code_stride,
-                base.high ? base.high + expert * high_stride : nullptr,
-                reinterpret_cast<const std::uint16_t*>(
-                    reinterpret_cast<const std::byte*>(base.scales) + expert * scale_stride)};
+        return {base.codes ? base.codes + offset(code_offsets, expert, code_stride) : nullptr,
+                base.high ? base.high + offset(high_offsets, expert, high_stride) : nullptr,
+                base.scales ? reinterpret_cast<const std::uint16_t*>(
+                                  reinterpret_cast<const std::byte*>(base.scales) +
+                                  offset(scale_offsets, expert, scale_stride))
+                            : nullptr};
     }
 };
 
