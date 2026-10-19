@@ -71,7 +71,8 @@ Resources::Resources(const execution::Parameters& p, ExecutionPlan input, Device
     experts =
         std::make_unique<moe::Resources>(plan.moe, layers, p.model.expert_banks(), device,
                                          plan.graph_probe ? moe::ResourcePurpose::GraphCalibration
-                                                          : moe::ResourcePurpose::Execution);
+                                                          : moe::ResourcePurpose::Execution,
+                                         p.model.expert_file_tier());
     ple_upload  = std::make_unique<ple::UploadSlots>(device, plan.ple.max_positions, 2);
     ple_prepare = std::make_unique<ple::disk::PrepareService>(
         p.model.ple_table(), p.model.config().text.ple.eos, plan.ple, ple_upload->host_slots());

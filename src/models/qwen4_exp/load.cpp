@@ -1,7 +1,20 @@
 #include "models/qwen4_exp/load.h"
 #include "models/qwen4_exp/load/bindings.h"
 
+#include <cstdlib>
+#include <cstring>
+
 namespace ninfer::models::qwen4_exp {
+namespace {
+
+// port (sm_89): opt-in file tier, same switch as the qwen3_5 path.
+bool expert_file_tier_enabled() {
+    const char* value = std::getenv("NINFER_EXPERT_FILE_TIER");
+    return value && *value && std::strcmp(value, "0") != 0;
+}
+
+} // namespace
+
 struct LoadPlan::Impl {
     const artifact::Reader* reader;
     Config config;
@@ -111,11 +124,14 @@ Placement placement(const Data& data, Device device) {
         out.banks[w.bank.index] = Device::cpu();
     }
     std::vector<artifact::PlacementRequest> requests;
+    // port (sm_89): opt-in file tier; CPU expert objects then keep no pinned Host replica.
+    const bool file_tier = expert_file_tier_enabled();
     for (std::size_t i = 0; i < data.pending.size(); ++i)
         for (const auto& part : data.pending[i].reference.binding.parts)
             requests.push_back({part.object, out.weights[i],
-                                out.weights[i] == Device::cpu() ? artifact::HostAccess::CudaTransfer
-                                                                : artifact::HostAccess::CpuOnly});
+                                out.weights[i] == Device::cpu() && !file_tier
+                                    ? artifact::HostAccess::CudaTransfer
+                                    : artifact::HostAccess::CpuOnly});
     out.storage = artifact::plan_materialization(*data.reader, requests);
     return out;
 }
@@ -146,9 +162,16 @@ std::unique_ptr<Model> materialize_model(ResolvedLoadPlan&& plan, DeviceContext&
                                          device.transfer_view(), observer);
     auto bound   = resolve_weights(std::move(data->pending), backing, plan.weights_);
     auto banks   = moe::bind_banks(data->banks, backing, plan.banks_);
-    return std::unique_ptr<Model>(
-        new Model(std::move(data->config), data->options, std::move(data->weights),
-                  std::move(bound), std::move(banks), std::move(data->resources),
-                  std::move(data->name), std::move(backing), std::move(data->ple)));
+    // port (sm_89): the file tier opens its own handles and outlives the load-time Reader.
+    std::unique_ptr<moe::ExpertFileReader> file_reader;
+    std::vector<ExpertFileBank> file_banks;
+    if (expert_file_tier_enabled()) {
+        file_banks  = moe::describe_expert_files(*data->reader, data->banks);
+        file_reader = std::make_unique<moe::ExpertFileReader>(*data->reader);
+    }
+    return std::unique_ptr<Model>(new Model(
+        std::move(data->config), data->options, std::move(data->weights), std::move(bound),
+        std::move(banks), std::move(data->resources), std::move(data->name), std::move(backing),
+        std::move(data->ple), std::move(file_banks), std::move(file_reader)));
 }
 } // namespace ninfer::models::qwen4_exp

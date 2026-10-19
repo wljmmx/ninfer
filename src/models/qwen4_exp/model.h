@@ -1,6 +1,7 @@
 #pragma once
 
 #include "artifact/materializer.h"
+#include "models/common/moe/weights.h"
 #include "models/common/qwen/frontend/resources.h"
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/weights.h"
@@ -32,6 +33,11 @@ public:
 
     [[nodiscard]] std::span<const ExpertBankSource> expert_banks() const { return banks_; }
 
+    // port (sm_89): expert uploads read from the artifact when the file tier is on.
+    [[nodiscard]] ExpertFileTier expert_file_tier() const noexcept {
+        return file_reader_ ? ExpertFileTier{file_reader_.get(), file_banks_} : ExpertFileTier{};
+    }
+
     [[nodiscard]] const qwen::FrontendResources& resources() const { return resources_; }
 
     [[nodiscard]] const ple::disk::Table& ple_table() const { return *ple_; }
@@ -47,7 +53,8 @@ private:
                                                     const StartupObserver*);
     Model(Config, LoadOptions, ModelWeights, std::vector<BoundWeight>,
           std::vector<ExpertBankSource>, qwen::FrontendResources, std::string,
-          artifact::MaterializedArtifact, std::unique_ptr<ple::disk::Table>);
+          artifact::MaterializedArtifact, std::unique_ptr<ple::disk::Table>,
+          std::vector<ExpertFileBank> = {}, std::unique_ptr<moe::ExpertFileReader> = {});
 
     artifact::MaterializedArtifact backing_;
     std::unique_ptr<ple::disk::Table> ple_;
@@ -56,6 +63,8 @@ private:
     ModelWeights weights_;
     std::vector<BoundWeight> bound_;
     std::vector<ExpertBankSource> banks_;
+    std::vector<ExpertFileBank> file_banks_;
+    std::unique_ptr<moe::ExpertFileReader> file_reader_;
     qwen::FrontendResources resources_;
     InstanceInfo info_;
 };
