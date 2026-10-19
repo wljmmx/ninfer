@@ -2,6 +2,7 @@
 
 #include "artifact/schema.h"
 #include "core/arena.h"
+#include "core/cuda_host.h"
 #include "core/device.h"
 #include "core/weight_view.h"
 #include "ninfer/types.h"
@@ -64,6 +65,10 @@ public:
     [[nodiscard]] std::span<const std::byte> host_bytes(ObjectHandle handle) const;
     [[nodiscard]] bool has_device(ObjectHandle handle) const noexcept;
 
+    // port (sm_89): pinned Host view of a Host-resident object, for expert uploads. The
+    // registration is created on first use and kept for the artifact's lifetime.
+    [[nodiscard]] CudaHostView host_transfer_view(ObjectHandle handle) const;
+
     [[nodiscard]] const MaterializationStats& stats() const noexcept { return stats_; }
 
 private:
@@ -79,6 +84,9 @@ private:
     std::unique_ptr<DeviceArena> arena_;
     std::vector<ObjectStorage> objects_;
     MaterializationStats stats_;
+    // port (sm_89): CUDA ordinal of the backing, and one lazy pin per Host object.
+    int cuda_ordinal_ = -1;
+    mutable std::vector<std::unique_ptr<CudaHostRegistration>> host_registrations_;
 };
 
 [[nodiscard]] MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& plan,
@@ -86,3 +94,4 @@ private:
                                                const StartupObserver* startup_observer = nullptr);
 
 } // namespace ninfer::artifact
+

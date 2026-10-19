@@ -142,6 +142,8 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                             total);
     MaterializedArtifact out;
     out.objects_.resize(plan.object_count);
+    out.cuda_ordinal_ = device.device;
+    out.host_registrations_.resize(plan.object_count);
     out.stats_.file_bytes            = reader.file_bytes();
     out.stats_.read_bytes            = plan.prior_read_bytes;
     out.stats_.owned_value_bytes     = plan.owned_value_bytes;
@@ -176,6 +178,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             const auto divisor =
                 read_divisor(reader, placement.object, geometry, storage.host_data, out.stats_);
             storage.host = WeightParent{geometry, storage.host_data.data(), divisor};
+        storage.host->device = Device::cpu();
         }
     }
     std::vector<CopyRange> ranges;
@@ -197,6 +200,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                                  : read_divisor(reader, placement.object, geometry, {}, out.stats_);
         object.device =
             WeightParent{geometry, static_cast<const std::byte*>(storage.data), divisor};
+        object.device->device = Device::cuda(device.device);
         const auto& descriptor = reader.directory().tensor(placement.object);
         for (const auto& segment : reader.segments(descriptor.offset, descriptor.bytes)) {
             ranges.push_back({segment.file_index, segment.file_offset,
@@ -329,4 +333,21 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     return out;
 }
 
+CudaHostView MaterializedArtifact::host_transfer_view(ObjectHandle handle) const {
+    if (handle.index >= objects_.size()) {
+        throw ArtifactError("object handle is outside the materialized artifact");
+    }
+    const auto& object = objects_[handle.index];
+    if (!object.host) { throw ArtifactError("object has no Host backing"); }
+    if (cuda_ordinal_ < 0) { throw ArtifactError("artifact was materialized without a CUDA device"); }
+    auto& registration = host_registrations_[handle.index];
+    if (!registration) {
+        registration = std::make_unique<CudaHostRegistration>(
+            const_cast<std::byte*>(object.host->data),
+            static_cast<std::size_t>(object.host->geometry.bytes), cuda_ordinal_);
+    }
+    return registration->view();
+}
+
 } // namespace ninfer::artifact
+
