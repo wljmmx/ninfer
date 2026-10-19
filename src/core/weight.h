@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/dtype.h"
+#include "core/memory.h"
 
 #include <cstdint>
 
@@ -16,6 +17,9 @@ enum class QType : std::uint16_t {
     INT32               = 6,
     NVFP4               = 7,
     FP8_E4M3FN_ROW_BF16 = 8,
+    // port (sm_89): formats the bench expert path already encodes.
+    NF4_G16_E4M3FN               = 9,
+    FP8_E4M3FN_BLOCK128X128_BF16 = 10,
 };
 
 enum class QuantLayout : std::uint16_t {
@@ -23,6 +27,10 @@ enum class QuantLayout : std::uint16_t {
     Contiguous          = 1,
     BlockScaleK16M128x4 = 2,
     RowScale            = 3,
+    // port (sm_89): bench layouts, kept appended so existing dense numbering is stable.
+    RowPagedG16_4K             = 4,
+    BatchedBlockScaleK16M128x4 = 5,
+    BlockScaleM128K128         = 6,
 };
 
 struct Weight {
@@ -47,6 +55,8 @@ struct Weight {
     std::int64_t scale_nb[4]   = {0, 0, 0, 0};
     float weight_scale_divisor = 0.0F;
     float input_scale_divisor  = 0.0F;
+    // port (sm_89): residency tag the bench Ops validate their operands against.
+    Device device;
 };
 
 } // namespace ninfer

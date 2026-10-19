@@ -95,6 +95,26 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
     const auto n       = shape[0];
     const auto k       = shape[1];
     out.padded_columns = k;
+    if (layout == QuantLayout::RowPagedG16_4K) {
+        // port (sm_89): bench's 4 KiB paged NF4 expert bank.
+        if (format != QType::NF4_G16_E4M3FN || k % 16) {
+            throw std::invalid_argument("paged NF4 requires K%16=0");
+        }
+        out.alignment          = 4096;
+        out.group_size         = 16;
+        out.code_bytes_per_row = k / 2;
+        out.scale_bytes_per_row = k / 16;
+        out.row_bytes          = add(k / 2, k / 16);
+        out.rows_per_page      = 4096 / out.row_bytes;
+        if (!out.rows_per_page) { throw std::invalid_argument("NF4 row exceeds page"); }
+        out.page_count      = add(n, out.rows_per_page - 1) / out.rows_per_page;
+        out.code_bytes      = mul(n, out.code_bytes_per_row);
+        out.scale_bytes     = mul(n, out.scale_bytes_per_row);
+        out.divisor_offset  = mul(out.page_count, 4096);
+        out.divisor_count   = 1;
+        out.bytes           = add(out.divisor_offset, 4);
+        return out;
+    }
     if (layout == QuantLayout::RowSplit) {
         std::uint64_t high_per_group = 0;
         switch (format) {
@@ -142,13 +162,25 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         out.scale_bytes_per_row = k / 16;
         out.code_bytes          = out.elements / 2;
         out.scale_offset        = aligned(out.code_bytes, 256);
+    } else if (layout == QuantLayout::BlockScaleM128K128) {
+        // port (sm_89): bench's 128x128 block-scaled FP8, one scale per tile row block.
+        if (format != QType::FP8_E4M3FN_BLOCK128X128_BF16 || n % 128 || k % 128) {
+            throw std::invalid_argument("block-scaled FP8 requires N%128=0 and K%128=0");
+        }
+        out.group_size          = 128;
+        out.scale_block_rows    = 128;
+        out.code_bytes_per_row  = k;
+        out.scale_bytes_per_row = mul(k / 128, 2);
+        out.code_bytes          = out.elements;
+        out.scale_offset        = aligned(out.code_bytes, 256);
     } else {
         throw std::invalid_argument("unknown quantized weight layout");
     }
-    out.scale_bytes = mul(n, out.scale_bytes_per_row);
+    out.scale_bytes = mul(n / out.scale_block_rows, out.scale_bytes_per_row);
     out.bytes       = add(out.scale_offset, out.scale_bytes);
     if (format == QType::NVFP4) {
         out.divisor_offset = out.bytes;
+        out.divisor_count  = 1;
         out.bytes          = add(out.bytes, 4);
     }
     return out;
@@ -249,6 +281,7 @@ Weight native_weight(const WeightView& view, float input_divisor) {
     out.payload          = region.parent->data;
     out.payload_bytes    = g.bytes;
     out.high_plane_bytes = g.high_bytes;
+    out.device           = region.parent->device;
     out.qtype            = g.format;
     out.layout           = g.layout;
     out.ndim             = 2;

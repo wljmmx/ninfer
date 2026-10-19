@@ -152,7 +152,9 @@ int DeviceContext::compute_capability() const noexcept { return props.major * 10
 int DeviceContext::multiprocessor_count() const noexcept { return props.multiProcessorCount; }
 
 DeviceExecutionView DeviceContext::execution_view() const noexcept {
-    return {.stream = stream, .multiprocessor_count = multiprocessor_count()};
+    return {.stream              = stream,
+            .multiprocessor_count = multiprocessor_count(),
+            .resident            = Device::cuda(device)};
 }
 
 std::size_t DeviceContext::total_vram() const noexcept { return props.totalGlobalMem; }

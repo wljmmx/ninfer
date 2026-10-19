@@ -6,10 +6,14 @@ import os
 
 IO_CHUNK_BYTES = 8 * 1024 * 1024
 WRITEBACK_BYTES = 64 * 1024 * 1024
-_PAGE_BYTES = os.sysconf("SC_PAGE_SIZE")
+# port (sm_89): sysconf/posix_fadvise/fdatasync are Unix-only. Windows keeps the same API
+# surface as a no-op so the offline tools still run there.
+_PAGE_BYTES = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
 
 
 def discard_cached_pages(fd: int, offset: int = 0, count: int | None = None) -> None:
+    if not hasattr(os, "posix_fadvise"):
+        return
     if count is None:
         os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
     elif count > 0:
@@ -33,7 +37,10 @@ class Writeback:
 
     def flush(self) -> None:
         for fd in self._fds:
-            os.fdatasync(fd)
+            if hasattr(os, "fdatasync"):
+                os.fdatasync(fd)
+            else:
+                os.fsync(fd)
             discard_cached_pages(fd)
         self._fds.clear()
         self._bytes = 0

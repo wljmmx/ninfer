@@ -7,3 +7,5 @@ schema describes the directory; framing, reader, and writer own the file set.
 The file and directory modules use the standard library. Tensor dependencies
 are confined to explicitly imported codecs and tensor_output.
 """
+
+from . import win_compat as _win_compat  # noqa: F401  (patches os on Windows)

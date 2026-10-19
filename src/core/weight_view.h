@@ -48,6 +48,13 @@ struct WeightGeometry {
     std::uint64_t scale_offset        = 0;
     std::uint64_t scale_bytes         = 0;
     std::uint64_t divisor_offset      = 0;
+    // port (sm_89): bench-compatible geometry the expert bank needs. Appended, and named after
+    // the existing scale_bytes_per_row so one plane keeps one name.
+    std::uint64_t scale_block_rows = 1;
+    std::uint64_t divisor_count    = 0;
+    std::uint64_t row_bytes        = 0;
+    std::uint64_t rows_per_page    = 0;
+    std::uint64_t page_count       = 0;
 };
 
 [[nodiscard]] WeightGeometry weight_geometry(QType format, QuantLayout layout,

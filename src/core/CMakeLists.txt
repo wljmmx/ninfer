@@ -1,8 +1,21 @@
+# port (sm_89): the bench CPU execution layer. Upstream implements the topology and affinity
+# API with hwloc; the Win32 implementation keeps the same header and semantics, which is the
+# only platform this tree ships. Linux support is left to the bench tree.
+add_library(ninfer_cpu STATIC
+  cpu/system_windows.cpp
+  cpu/task_pool.cpp
+  cpu/executor.cpp
+)
+ninfer_internal_includes(ninfer_cpu)
+target_link_libraries(ninfer_cpu PRIVATE Threads::Threads)
+
 add_library(ninfer_core STATIC
   arena.cu
 cuda_host.cpp
 memory.cpp
+memory_arena.cpp
 expert_cache.cpp
+weight_bank.cpp
   device.cu
   dtype.cpp
   host_worker_pool.cpp
@@ -19,5 +32,5 @@ expert_cache.cpp
 )
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
-target_link_libraries(ninfer_core PUBLIC CUDA::cudart CUDA::nvtx3 Threads::Threads)
+target_link_libraries(ninfer_core PUBLIC ninfer_cpu CUDA::cudart CUDA::nvtx3 Threads::Threads)
 

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/memory.h"
+
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -16,12 +18,20 @@ void cuda_check(cudaError_t err, const char* expr, const char* file, int line);
 struct DeviceExecutionView {
     cudaStream_t stream               = nullptr;
     std::int32_t multiprocessor_count = 0;
+    // port (sm_89): the bench Ops tag operands with the resident device, so carry it here.
+    // Aggregate initialisation that omits it keeps the previous behaviour.
+    Device resident = Device{};
 
     [[nodiscard]] constexpr DeviceExecutionView
     on_stream(cudaStream_t target_stream) const noexcept {
-        return {target_stream, multiprocessor_count};
+        return {target_stream, multiprocessor_count, resident};
     }
+
+    [[nodiscard]] Device device() const noexcept { return resident; }
 };
+
+// port (sm_89): the bench Ops name the same view CudaExecutionView.
+using CudaExecutionView = DeviceExecutionView;
 
 struct DeviceContext {
     int device                   = 0;
