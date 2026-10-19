@@ -37,6 +37,8 @@ public:
 
     [[nodiscard]] std::size_t reserved_bytes() const noexcept { return reserve_.size(); }
 
+    [[nodiscard]] const std::byte* base() const noexcept { return reserve_.data(); }
+
     [[nodiscard]] std::size_t committed_bytes() const noexcept {
         return reserve_.committed_bytes();
     }

@@ -21,3 +21,8 @@ ninfer_deploy_runtime_dlls(ninfer-perplexity)
 ninfer_internal_includes(ninfer-perplexity)
 target_link_libraries(ninfer-perplexity PRIVATE
   ninfer_engine ninfer_product_logging ninfer::json)
+
+# port (sm_89): temporary AddressSanitizer link for the fault hunt.
+if(NINFER_ASAN AND WIN32)
+  target_link_options(ninfer PRIVATE /fsanitize=address /DEBUG)
+endif()

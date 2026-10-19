@@ -30,3 +30,10 @@ include("${CMAKE_CURRENT_LIST_DIR}/normalization/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/rope/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/softmax_attention/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/moe/sources.cmake")
+
+# port (sm_89): temporary AddressSanitizer switch for the host-tier fault hunt.
+option(NINFER_ASAN "Instrument CPU ops with AddressSanitizer" OFF)
+if(NINFER_ASAN AND WIN32)
+  target_compile_options(ninfer_ops PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/fsanitize=address /Zi>)
+endif()
+

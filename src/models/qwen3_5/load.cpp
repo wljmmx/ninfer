@@ -233,11 +233,13 @@ std::unique_ptr<Model> materialize_model(ResolvedLoadPlan&& plan, DeviceContext&
         host_tier = std::make_unique<moe::ExpertHostTier>(*data->reader, data->expert_banks,
                                                           expert_host_quota_bytes());
         std::fprintf(stderr,
-                     "expert host tier: %zu banks, reserved %.2f GiB, quota %s, committed %.2f GiB\n",
+                     "expert host tier: %zu banks, reserved %.2f GiB, quota %s, committed %.2f GiB, "
+                     "base=%p\n",
                      data->expert_banks.size(),
                      static_cast<double>(host_tier->reserved_bytes()) / (1024.0 * 1024 * 1024),
                      host_tier->quota_bytes() ? "limited" : "none",
-                     static_cast<double>(host_tier->committed_bytes()) / (1024.0 * 1024 * 1024));
+                     static_cast<double>(host_tier->committed_bytes()) / (1024.0 * 1024 * 1024),
+                     static_cast<const void*>(host_tier->base()));
     }
     auto banks   = moe::bind_banks(data->expert_banks, backing, plan.bank_devices_,
                                    host_tier.get());

@@ -7,6 +7,8 @@
 
 #include "ninfer/engine.h"
 
+#include "core/fault_trace.h"
+
 #include <cstdint>
 #include <exception>
 #include <fstream>
@@ -266,6 +268,8 @@ void print_generation_summary(const ninfer::GenerationResult& result,
 } // namespace
 
 int main(int argc, char** argv) {
+    // port (sm_89): optional fault diagnostics (NINFER_FAULT_TRACE=1).
+    ninfer::install_fault_trace();
     ninfer::cli::Options cli;
     try {
         cli = ninfer::cli::parse_options(argc, argv);
