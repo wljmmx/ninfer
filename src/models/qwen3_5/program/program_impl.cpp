@@ -239,7 +239,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             plan.moe, layers, parameters.model.expert_banks(), device,
             plan.graph_probe ? moe::ResourcePurpose::GraphCalibration
                              : moe::ResourcePurpose::Execution,
-            parameters.model.expert_file_tier());
+            parameters.model.expert_file_tier(), parameters.model.host_residency());
     }
     device.synchronize();
 

@@ -11,6 +11,10 @@
 #include <span>
 #include <string>
 
+namespace ninfer::models::moe {
+class ExpertHostTier;
+}
+
 namespace ninfer::models::qwen3_5 {
 
 struct InstanceInfo {
@@ -49,6 +53,9 @@ public:
 
     [[nodiscard]] bool file_tier_enabled() const noexcept { return file_reader_ != nullptr; }
 
+    // port (sm_89): null unless the host tier is active; CPU layers call ensure() before use.
+    [[nodiscard]] HostResidency* host_residency() const noexcept;
+
     [[nodiscard]] const qwen::FrontendResources& resources() const noexcept { return resources_; }
 
     [[nodiscard]] const InstanceInfo& info() const noexcept { return info_; }
@@ -63,7 +70,8 @@ private:
     Model(Config config, LoadOptions options, ModelWeights weights, std::vector<BoundWeight> bound,
           std::vector<ExpertBankSource> banks, qwen::FrontendResources resources, InstanceInfo info,
           artifact::MaterializedArtifact backing, std::vector<ExpertFileBank> file_banks = {},
-          std::unique_ptr<moe::ExpertFileReader> file_reader = {});
+          std::unique_ptr<moe::ExpertFileReader> file_reader = {},
+          std::unique_ptr<moe::ExpertHostTier> host_tier = {});
 
     // Destroy all borrowers before backing. The caller keeps DeviceContext alive through cleanup.
     artifact::MaterializedArtifact backing_;
@@ -74,6 +82,7 @@ private:
     std::vector<ExpertBankSource> banks_;
     std::vector<ExpertFileBank> file_banks_;
     std::unique_ptr<moe::ExpertFileReader> file_reader_;
+    std::unique_ptr<moe::ExpertHostTier> host_tier_;
     qwen::FrontendResources resources_;
     InstanceInfo info_;
 };

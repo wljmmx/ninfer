@@ -218,6 +218,12 @@ bool MaterializedArtifact::has_device(ObjectHandle handle) const noexcept {
     return handle.index < objects_.size() && objects_[handle.index].device.has_value();
 }
 
+bool MaterializedArtifact::has_host(ObjectHandle handle) const noexcept {
+    if (handle.index >= objects_.size()) { return false; }
+    const auto& object = objects_[handle.index];
+    return object.host.has_value() || !object.host_data.empty();
+}
+
 MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& plan,
                                  std::optional<CudaExecutionView> execution,
                                  const StartupObserver* startup_observer) {

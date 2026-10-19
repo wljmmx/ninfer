@@ -2,6 +2,7 @@
 
 #include "artifact/views.h"
 
+#include <algorithm>
 #include <cmath>
 
 namespace ninfer::models {
@@ -74,7 +75,21 @@ std::vector<BoundWeight> resolve_weights(std::vector<PendingWeight>&& pending,
     out.reserve(pending.size());
     for (std::size_t i = 0; i < pending.size(); ++i) {
         auto& item = pending[i];
-        auto view  = artifact::bind_view(item.reference, materialized, devices[i]);
+        // port (sm_89): objects owned by the host expert tier have no artifact backing. They are
+        // not read through BoundWeight, so an empty view keeps the id space intact.
+        const bool materialized_here =
+            std::all_of(item.reference.binding.parts.begin(),
+                        item.reference.binding.parts.end(),
+                        [&](const auto& part) {
+                            return materialized.has_host(part.object) ||
+                                   materialized.has_device(part.object);
+                        });
+        if (!materialized_here) {
+            out.push_back({std::move(item.reference.name), std::move(item.source_objects), {},
+                           std::move(item.uses)});
+            continue;
+        }
+        auto view = artifact::bind_view(item.reference, materialized, devices[i]);
         out.push_back({std::move(item.reference.name), std::move(item.source_objects),
                        std::move(view), std::move(item.uses)});
     }

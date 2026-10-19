@@ -17,7 +17,8 @@ Scratch allocate(Arena& arena, int tokens, int token_block) {
 
 MatrixBank matrix_bank(const WeightBankView& bank) {
     const auto& layout = bank.layout;
-    // port (sm_89): bases are the plane origins; per-expert offsets are added in matrix().
+    // port (sm_89): bases are the plane origins (already rebased by the host tier); the
+    // per-expert table is added in matrix().
     const auto* data = bank.parent->data;
     return {{layout.codes.expert_bytes
                  ? reinterpret_cast<const std::uint8_t*>(data + layout.codes.offset)
@@ -31,9 +32,7 @@ MatrixBank matrix_bank(const WeightBankView& bank) {
             layout.codes.expert_stride,
             layout.high.expert_stride,
             layout.scales.expert_stride,
-            bank.expert_offsets.codes,
-            bank.expert_offsets.high,
-            bank.expert_offsets.scales};
+            bank.expert_offsets};
 }
 } // namespace
 

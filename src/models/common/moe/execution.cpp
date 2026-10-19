@@ -183,7 +183,8 @@ ExecutionRequirements describe_execution(const ops::MoeProfile& profile, Subset 
 PreparedExecution prepare_execution(const Parameters& parameters, PartitionView partition,
                                     const ExpertBankSource& source,
                                     const ExpertBankDeviceView& bank, ops::MoeEpilogue epilogue,
-                                    std::int32_t tokens, ExecutionView execution) {
+                                    std::int32_t tokens, ExecutionView execution,
+                                    HostResidency* residency) {
     const auto& profile = parameters.profile;
     if (partition.bank != parameters.bank || partition.experts != profile.routed.experts)
         throw std::invalid_argument("MoE partition/source does not match the layer bank");
@@ -207,7 +208,8 @@ PreparedExecution prepare_execution(const Parameters& parameters, PartitionView 
             throw std::invalid_argument("mixed MoE requires native CPU expert sources");
         frame = FrameLayout(profile, tokens).bind(host.device_frame, host.host_frame);
     }
-    return {parameters, partition, source, bank, epilogue, tokens, execution, frame, requirements};
+    return {parameters, partition, source, bank, epilogue, tokens, execution, frame, requirements,
+            residency};
 }
 
 void enqueue_gpu(const Tensor& hidden, const PreparedExecution& call, Tensor& output,
@@ -262,6 +264,11 @@ bool compute_cpu(const PreparedExecution& call) {
             ? assignments
             : std::count_if(ids, ids + assignments, [&](auto id) { return mask[id] == 0; });
     if (!cpu_assignments) return false;
+    // port (sm_89): bring the routed experts back before the CPU kernels read them. The mask
+    // skips experts the GPU already served.
+    if (call.residency) {
+        call.residency->ensure(call.partition.bank, {ids, assignments}, mask);
+    }
     const auto& host = *call.execution.host;
     auto scope       = host.workspace.scope();
     MemoryArena scratch(host.workspace.alloc_bytes(call.requirements.cpu_workspace_bytes));

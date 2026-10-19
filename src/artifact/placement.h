@@ -35,6 +35,8 @@ struct PlacementRequest {
     ObjectHandle object;
     Device device;
     HostAccess host_access = HostAccess::CpuOnly;
+    // port (sm_89): leave these objects out of Host storage; the host tier reads them on demand.
+    bool file_backed = false;
 };
 
 struct TensorPlacement {

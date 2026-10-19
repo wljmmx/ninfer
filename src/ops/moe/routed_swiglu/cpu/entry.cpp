@@ -68,10 +68,18 @@ public:
                     geometry.padded_columns == unsigned(columns) &&
                     geometry.scale_block_rows == 1 && layout.has_divisors == nvfp4,
                 "routed_swiglu CPU: invalid weight geometry");
+        // port (sm_89): a host-tier bank packs each expert into one segment, so the expected
+        // layout has rebased plane offsets instead of the shared-array ones.
+        auto expected = describe_weight_bank(geometry, layout.region);
+        if (bank.expert_offsets) {
+            expected.codes.offset  = 0;
+            expected.high.offset   = layout.codes.expert_bytes;
+            expected.scales.offset = layout.codes.expert_bytes + layout.high.expert_bytes;
+        }
         require(layout.codes.expert_bytes == elements / 2 &&
                     layout.high.expert_bytes == high_bytes &&
                     layout.scales.expert_bytes == elements / (nvfp4 ? 16 : 32) &&
-                    layout == describe_weight_bank(geometry, layout.region),
+                    layout == expected,
                 "routed_swiglu CPU: invalid native weight planes");
         require(bank.parent->weight_divisors.size() == geometry.divisor_count,
                 "routed_swiglu CPU: invalid divisor storage");

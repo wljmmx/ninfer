@@ -50,19 +50,13 @@ struct WeightBankLayout {
     friend bool operator==(const WeightBankLayout&, const WeightBankLayout&) = default;
 };
 
-// port (sm_89): per-expert byte offsets added to each plane's own offset. Set when experts live
-// in separately committed segments (host file tier); a plane keeps its stride when null.
-struct ExpertOffsetTable {
-    const std::uint64_t* codes  = nullptr;
-    const std::uint64_t* high   = nullptr;
-    const std::uint64_t* scales = nullptr;
-};
-
-// Borrows immutable backing and Host divisor metadata from the model.
+// port (sm_89): per-expert byte offsets added to each plane's own (already rebased) offset.
+// Set when experts live in separately committed segments (host file tier); a plane keeps its
+// stride when null. Borrows immutable backing and Host divisor metadata from the model.
 struct WeightBankView {
     const WeightParent* parent = nullptr;
     WeightBankLayout layout;
-    ExpertOffsetTable expert_offsets;
+    const std::uint64_t* expert_offsets = nullptr;
 
     [[nodiscard]] ConstMemorySpan plane(const WeightBankPlane& plane, std::uint32_t expert) const;
     // Returns the multiplicative identity when the representation has no matrix divisor.
@@ -75,6 +69,15 @@ struct ExpertBankSource {
     // Optional for CPU-only math; GPU replicas require registered views of both parents.
     CudaHostView gate_up_upload;
     CudaHostView down_upload;
+};
+
+// port (sm_89): a CPU expert bank whose pages are committed on demand. Called with the routed
+// ids of the next CPU layer; implementations are synchronous and host side.
+class HostResidency {
+public:
+    virtual ~HostResidency() = default;
+    virtual void ensure(ExpertBankId bank, std::span<const std::int32_t> experts,
+                        const std::int32_t* resident_mask) = 0;
 };
 
 // Affine planes use base + expert * stride. Indexed planes use base + offsets[expert].

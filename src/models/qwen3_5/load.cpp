@@ -1,6 +1,7 @@
 #include "models/qwen3_5/load.h"
 
 #include "artifact/reader.h"
+#include "models/common/moe/expert_host.h"
 #include "models/qwen3_5/load/bindings.h"
 
 #include <cstdio>
@@ -14,6 +15,21 @@ namespace {
 // port (sm_89): opt-in file tier. Unset or "0" keeps the in-memory upload path.
 bool expert_file_tier_enabled() {
     const char* value = std::getenv("NINFER_EXPERT_FILE_TIER");
+    return value && *value && std::strcmp(value, "0") != 0;
+}
+
+// Residency quota for the host expert tier; 0 means "keep everything resident".
+std::size_t expert_host_quota_bytes() {
+    const char* value = std::getenv("NINFER_EXPERT_HOST_MIB");
+    if (!value || !*value) { return 0; }
+    const auto mib = std::strtoull(value, nullptr, 10);
+    return static_cast<std::size_t>(mib) * 1024U * 1024U;
+}
+
+// port (sm_89): the host tier owns CPU expert backing. Kept behind its own switch while the
+// CPU-kernel path is still being validated.
+bool expert_host_tier_enabled() {
+    const char* value = std::getenv("NINFER_EXPERT_HOST_TIER");
     return value && *value && std::strcmp(value, "0") != 0;
 }
 
@@ -174,15 +190,17 @@ Placement describe_placement(const Data& data, Device cuda, Device expert_device
     for (const auto& layer : data.weights.text.layers) place(layer);
     if (data.weights.mtp) place(data.weights.mtp->layer);
     std::vector<artifact::PlacementRequest> requests;
-    // port (sm_89): with the file tier on, CPU expert banks upload from the artifact and keep
+    // port (sm_89): with the host tier on, CPU expert banks upload from the artifact and keep
     // ordinary pageable Host memory instead of a pinned replica.
-    const bool file_tier = expert_file_tier_enabled();
+    const bool host_tier = expert_host_tier_enabled();
     for (std::size_t i = 0; i < data.pending.size(); ++i) {
         for (const auto& part : data.pending[i].reference.binding.parts) {
-            const bool pinned = out.weights[i] == Device::cpu() && !file_tier;
+            const bool cpu    = out.weights[i] == Device::cpu();
+            const bool pinned = cpu && !host_tier;
             requests.push_back({part.object, out.weights[i],
                                 pinned ? artifact::HostAccess::CudaTransfer
-                                       : artifact::HostAccess::CpuOnly});
+                                       : artifact::HostAccess::CpuOnly,
+                                cpu && host_tier});
         }
     }
     out.storage = artifact::plan_materialization(*data.reader, requests);
@@ -209,7 +227,20 @@ std::unique_ptr<Model> materialize_model(ResolvedLoadPlan&& plan, DeviceContext&
     auto backing = artifact::materialize(*data->reader, std::move(plan.materialization_),
                                          device.transfer_view(), observer);
     auto bound   = resolve_weights(std::move(data->pending), backing, plan.devices_);
-    auto banks   = moe::bind_banks(data->expert_banks, backing, plan.bank_devices_);
+    // port (sm_89): the host tier owns the CPU expert backing, so it must exist before binding.
+    std::unique_ptr<moe::ExpertHostTier> host_tier;
+    if (expert_host_tier_enabled()) {
+        host_tier = std::make_unique<moe::ExpertHostTier>(*data->reader, data->expert_banks,
+                                                          expert_host_quota_bytes());
+        std::fprintf(stderr,
+                     "expert host tier: %zu banks, reserved %.2f GiB, quota %s, committed %.2f GiB\n",
+                     data->expert_banks.size(),
+                     static_cast<double>(host_tier->reserved_bytes()) / (1024.0 * 1024 * 1024),
+                     host_tier->quota_bytes() ? "limited" : "none",
+                     static_cast<double>(host_tier->committed_bytes()) / (1024.0 * 1024 * 1024));
+    }
+    auto banks   = moe::bind_banks(data->expert_banks, backing, plan.bank_devices_,
+                                   host_tier.get());
     // port (sm_89): the file tier opens its own handles, so it survives the load-time Reader.
     std::unique_ptr<moe::ExpertFileReader> file_reader;
     std::vector<ExpertFileBank> file_banks;
@@ -223,7 +254,7 @@ std::unique_ptr<Model> materialize_model(ResolvedLoadPlan&& plan, DeviceContext&
     return std::unique_ptr<Model>(new Model(
         std::move(data->config), data->options, std::move(data->weights), std::move(bound),
         std::move(banks), std::move(data->resources), std::move(data->info), std::move(backing),
-        std::move(file_banks), std::move(file_reader)));
+        std::move(file_banks), std::move(file_reader), std::move(host_tier)));
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,

@@ -112,7 +112,11 @@ ExpertCacheRequirements describe_expert_cache(std::span<const ExpertBankSource> 
     for (const auto& bank : sources) {
         for (const auto* matrix : {&bank.gate_up, &bank.down}) {
             if (!matrix->parent) { throw std::invalid_argument("expert bank has no source"); }
-            (void)bind_weight_bank(*matrix->parent, matrix->layout);
+            // port (sm_89): a host-tier view rebases its plane offsets onto the packed segment,
+            // so re-deriving the layout from geometry would reject it.
+            if (!matrix->expert_offsets) {
+                (void)bind_weight_bank(*matrix->parent, matrix->layout);
+            }
         }
         if (bank.gate_up.parent->device != bank.down.parent->device ||
             bank.gate_up.layout.region.count != bank.down.layout.region.count) {

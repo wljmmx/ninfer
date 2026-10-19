@@ -80,12 +80,15 @@ struct PreparedExecution {
     ExecutionView execution;
     Frame frame;
     ExecutionRequirements requirements;
+    // port (sm_89): host expert tier; CPU work commits the routed experts before reading them.
+    HostResidency* residency = nullptr;
 };
 
 [[nodiscard]] PreparedExecution prepare_execution(const Parameters&, PartitionView,
                                                   const ExpertBankSource&,
                                                   const ExpertBankDeviceView&, ops::MoeEpilogue,
-                                                  std::int32_t tokens, ExecutionView);
+                                                  std::int32_t tokens, ExecutionView,
+                                                  HostResidency* residency = nullptr);
 
 // Capture orders input D2H before GPU experts and records a Host-observable input event.
 enum class GpuSubmission { Eager, Capture };

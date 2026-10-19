@@ -1,5 +1,7 @@
 #include "models/common/moe/weights.h"
 
+#include "models/common/moe/expert_host.h"
+
 #include <array>
 #include <utility>
 
@@ -101,7 +103,8 @@ BankDescription describe_bank(const artifact::Reader& reader, const ExpertBindin
 
 std::vector<ExpertBankSource> bind_banks(std::span<const BankDescription> banks,
                                          const artifact::MaterializedArtifact& backing,
-                                         std::span<const Device> devices) {
+                                         std::span<const Device> devices,
+                                         const ExpertHostTier* host) {
     std::vector<ExpertBankSource> out;
     out.reserve(banks.size());
     if (devices.size() != banks.size()) {
@@ -110,21 +113,36 @@ std::vector<ExpertBankSource> bind_banks(std::span<const BankDescription> banks,
     for (std::size_t i = 0; i < banks.size(); ++i) {
         const auto& bank  = banks[i];
         const auto device = devices[i];
-        const auto bind   = [&](const MatrixSource& source) {
+        // port (sm_89): the host tier supplies the parent and the per-expert offsets; the
+        // artifact holds no Host copy of these banks.
+        const bool tiered = host != nullptr && device == Device::cpu();
+        const auto bind   = [&](const MatrixSource& source, bool gate_up) {
+            if (tiered) {
+                const auto* parent = host->parent(static_cast<std::uint32_t>(i), gate_up);
+                if (!parent) { throw artifact::ArtifactError("expert host tier has no parent"); }
+                auto view = bind_weight_bank(*parent, source.layout);
+                // Rebase the plane offsets onto the packed segment: codes, high, scales.
+                view.layout.codes.offset  = 0;
+                view.layout.high.offset   = view.layout.codes.expert_bytes;
+                view.layout.scales.offset = view.layout.codes.expert_bytes +
+                                            view.layout.high.expert_bytes;
+                view.expert_offsets = host->offsets(static_cast<std::uint32_t>(i), gate_up);
+                return view;
+            }
             const auto& parent = device.type() == DeviceType::CPU
-                                       ? backing.host_parent(source.object)
-                                       : backing.device_parent(source.object);
+                                     ? backing.host_parent(source.object)
+                                     : backing.device_parent(source.object);
             if (parent.device != device) {
                 throw artifact::ArtifactError("expert source device differs");
             }
             return bind_weight_bank(parent, source.layout);
         };
         const auto upload = [&](const MatrixSource& source) {
-            return device == Device::cpu() ? backing.host_transfer_view(source.object)
-                                           : CudaHostView{};
+            if (tiered || device != Device::cpu()) { return CudaHostView{}; }
+            return backing.host_transfer_view(source.object);
         };
-        out.push_back(
-            {bind(bank.gate_up), bind(bank.down), upload(bank.gate_up), upload(bank.down)});
+        out.push_back({bind(bank.gate_up, true), bind(bank.down, false), upload(bank.gate_up),
+                       upload(bank.down)});
     }
     return out;
 }

@@ -22,7 +22,7 @@ target_include_directories(ninfer_model_runtime PRIVATE
 target_include_directories(ninfer_model_runtime SYSTEM PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/xgrammar/3rdparty/picojson)
 
-target_sources(ninfer_model_loading PRIVATE common/moe/weights.cpp)
+target_sources(ninfer_model_loading PRIVATE common/moe/weights.cpp common/moe/expert_host.cpp)
 target_sources(ninfer_model_runtime PRIVATE
   common/context/state_store.cpp
   common/context/logical_kv_store.cpp

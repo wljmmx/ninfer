@@ -40,6 +40,8 @@ MaterializationPlan plan_materialization(const Reader& reader,
     bool has_device = false;
     for (const auto& request : requests) {
         (void)reader.geometry(request.object);
+        // port (sm_89): the host tier owns this object's backing; neither storage nor I/O.
+        if (request.file_backed) { continue; }
         if (request.device.type() == DeviceType::CPU) {
             host.at(request.object.index) = true;
             if (request.host_access == HostAccess::CudaTransfer) {

@@ -160,6 +160,7 @@ struct Resources::Impl {
     };
 
     std::shared_ptr<const Plan> plan;
+    HostResidency* residency = nullptr;
     std::vector<const Parameters*> parameters;
     std::span<const ExpertBankSource> sources;
     const DeviceContext& device;
@@ -188,8 +189,9 @@ struct Resources::Impl {
 
     Impl(std::shared_ptr<const Plan> plan, std::span<const Parameters* const> parameters,
          std::span<const ExpertBankSource> sources, const DeviceContext& device,
-         ResourcePurpose purpose, ExpertFileTier files)
-        : plan(std::move(plan)), parameters(parameters.begin(), parameters.end()), sources(sources),
+         ResourcePurpose purpose, ExpertFileTier files, HostResidency* residency)
+        : plan(std::move(plan)), residency(residency),
+          parameters(parameters.begin(), parameters.end()), sources(sources),
           device(device), cuda(device.execution_view()), upload_stream(device),
           upload(device.execution_view(upload_stream.stream())), purpose(purpose),
           storage(storage_requirements(*this->plan, sources, purpose)),
@@ -326,8 +328,9 @@ struct Resources::Impl {
 Resources::Resources(std::shared_ptr<const Plan> plan,
                      std::span<const Parameters* const> parameters,
                      std::span<const ExpertBankSource> sources, const DeviceContext& device,
-                     ResourcePurpose purpose, ExpertFileTier files)
-    : impl_(std::make_unique<Impl>(std::move(plan), parameters, sources, device, purpose, files)) {}
+                     ResourcePurpose purpose, ExpertFileTier files, HostResidency* residency)
+    : impl_(std::make_unique<Impl>(std::move(plan), parameters, sources, device, purpose, files,
+                                   residency)) {}
 
 Resources::~Resources() = default;
 
@@ -415,7 +418,7 @@ PreparedExecution Resources::describe_layer(ExpertBankId bank, std::int32_t toke
     partition.gpu_kind = kind;
     return prepare_execution(*state.parameters[index], partition, state.sources[bank.index],
                              state.cache.view(bank), state.plan->layers[index].spec.epilogue,
-                             tokens, state.bridge.execution_view());
+                             tokens, state.bridge.execution_view(), state.residency);
 }
 
 PreparedExecution Resources::prepare_layer(ExpertBankId bank) {

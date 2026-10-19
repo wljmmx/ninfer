@@ -44,6 +44,8 @@ public:
     [[nodiscard]] const WeightParent& host_parent(ObjectHandle handle) const;
     [[nodiscard]] std::span<const std::byte> host_bytes(ObjectHandle handle) const;
     [[nodiscard]] bool has_device(ObjectHandle handle) const noexcept;
+    // port (sm_89): false for an object owned by another tier (host expert file tier).
+    [[nodiscard]] bool has_host(ObjectHandle handle) const noexcept;
     // Empty for an ordinary Host parent. Registration uses materialize's execution device.
     [[nodiscard]] CudaHostView host_transfer_view(ObjectHandle handle) const;
 

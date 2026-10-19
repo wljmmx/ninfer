@@ -7,6 +7,8 @@
 
 namespace ninfer::models::moe {
 
+class ExpertHostTier;
+
 struct ExpertBinding {
     const artifact::ParameterReference& gate;
     const artifact::ParameterReference& up;
@@ -29,7 +31,8 @@ struct BankDescription {
 [[nodiscard]] BankDescription describe_bank(const artifact::Reader&, const ExpertBinding&);
 [[nodiscard]] std::vector<ExpertBankSource> bind_banks(std::span<const BankDescription>,
                                                        const artifact::MaterializedArtifact&,
-                                                       std::span<const Device>);
+                                                       std::span<const Device>,
+                                                       const ExpertHostTier* host = nullptr);
 // port (sm_89): one upload image per expert, addressed directly in the artifact payload.
 // Images follow the cache's own entry layout, so a fetched expert uploads with one copy.
 [[nodiscard]] std::vector<ExpertFileBank> describe_expert_files(
