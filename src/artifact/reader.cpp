@@ -186,4 +186,13 @@ std::size_t Reader::complete_direct_read(std::size_t file_index,
     return impl_->file(file_index).complete_direct_read(state);
 }
 
+const std::filesystem::path& Reader::path() const noexcept { return impl_->entry; }
+
+std::unique_ptr<InputFile> Reader::open_file(std::size_t file_index) const {
+    if (file_index >= impl_->files.size()) {
+        throw ArtifactError("file index is outside the artifact file set");
+    }
+    return std::make_unique<InputFile>(impl_->entry);
+}
+
 } // namespace ninfer::artifact

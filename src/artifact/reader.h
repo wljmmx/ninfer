@@ -18,6 +18,7 @@ struct ReadSegment {
 };
 
 class DirectReadState;
+class InputFile;
 
 // Owns the cold directory and lazily opened files. Runtime views borrow materialized storage,
 // never this Reader. Encodings are interpreted only for requested objects.
@@ -49,6 +50,11 @@ public:
                            std::span<std::byte> destination, DirectReadState& state) const;
     [[nodiscard]] std::size_t complete_direct_read(std::size_t file_index,
                                                   DirectReadState& state) const;
+
+    // port (sm_89): entry path and an independently owned read handle, so a tier can keep
+    // reading after the load-time Reader is gone.
+    [[nodiscard]] const std::filesystem::path& path() const noexcept;
+    [[nodiscard]] std::unique_ptr<InputFile> open_file(std::size_t file_index) const;
 
 private:
     struct Impl;
