@@ -206,6 +206,16 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void grouped_q4_gate_up(
                         acc[mi][ni][2] = fmaf(partial[mi][ni][2], scale1, acc[mi][ni][2]);
                         acc[mi][ni][3] = fmaf(partial[mi][ni][3], scale1, acc[mi][ni][3]);
                     }
+                    // port (sm_89): offline probe. With kt == 0 the accumulator holds exactly one
+                    // term, so acc must equal partial * scale and every lane of a group must see
+                    // the same scale for its row.
+                    // port (sm_89): offline probe, kept disabled. Enable the condition to print
+                    // partial/scale/acc for one routed job; with kt == 0 the accumulator holds a
+                    // single term, so acc must equal partial * scale.
+                    if (false && kt == 0 && mi < 2 && blockIdx.x == 0 && work == 0 && row0 < 2) {
+                        ::printf("PROBE row=%d lid=%d part=%.6f scale=%.6f acc=%.6f\n", row0, lid,
+                                 partial[mi][0][0], scale0, acc[mi][0][0]);
+                    }
                 }
             }
 
