@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <map>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -268,6 +269,9 @@ static int run(int argc, char** argv) {
         {"no-shared", sparse_blank, ops::MoeWeights{control, routed, shared_blank}}};
 
     int failures = 0;
+    // Captured no-shared outputs per length, so the token path (T=32) and the grouped path
+    // (T=64) can be compared on the same leading columns.
+    std::map<int, std::vector<__nv_bfloat16>> routed_by_tokens;
     for (const int tokens : {1, 2, 3, 16, 17, 32, 47, 64, 128, 768, 1024, 1560}) {
         const auto x = Tensor(x_device, execution.device(), DType::BF16,
                               {static_cast<std::int32_t>(hidden), tokens});
@@ -373,6 +377,7 @@ static int run(int argc, char** argv) {
                         __bfloat162float(host_sparse[worst]),
                         __bfloat162float(host_routed[worst]));
             if (max_difference > 1e-2F) { ++failures; }
+            if (std::string(item.label) == "no-shared") { routed_by_tokens[tokens] = host_routed; }
 
             if (tokens == 128 && std::string(item.label) == "no-shared" &&
                 !captured_ids.empty()) {
@@ -412,6 +417,25 @@ static int run(int argc, char** argv) {
                 std::printf("CPU reference vs GPU no-shared (T=128): max|d| = %.6f\n", cpu_max);
             }
         }
+    }
+
+    // Internal consistency: the leading 32 columns must not depend on how many columns follow.
+    // T=32 takes the token kernel, T=64 takes the grouped kernel.
+    if (routed_by_tokens.count(32) && routed_by_tokens.count(64)) {
+        const auto& small = routed_by_tokens[32];
+        const auto& large = routed_by_tokens[64];
+        float max_lead = 0.0F;
+        double mean_lead = 0.0;
+        for (std::size_t i = 0; i < small.size(); ++i) {
+            const auto row = i % static_cast<std::size_t>(hidden);
+            const auto column = i / static_cast<std::size_t>(hidden);
+            const auto other = large[row + column * static_cast<std::size_t>(64)];
+            const auto d = std::fabs(__bfloat162float(small[i]) - __bfloat162float(other));
+            max_lead = std::max(max_lead, d);
+            mean_lead += d;
+        }
+        std::printf("token(T=32) vs grouped(T=64) on the same columns: max|d|=%.6f mean|d|=%.8f\n",
+                    max_lead, mean_lead / small.size());
     }
 
     check(cudaFree(out_sparse), "free sparse output");
