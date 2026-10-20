@@ -79,6 +79,11 @@ __global__ void token_gate_up(const __nv_bfloat16* __restrict__ input, const int
             if (!lane) {
                 activation[(std::int64_t(token) * Contributions + path) * I + row] =
                     common::silu(gate) * up;
+                // port (sm_89): activation-level A/B probe, kept disabled after use.
+                if (false && token == 0 && row == 0 && path < K) {
+                    ::printf("TPROBE expert=%d tok=%d act=%.6f\n", ids[path],
+                             float(common::silu(gate) * up));
+                }
             }
         }
         if constexpr (Adaptive) {
