@@ -7,6 +7,7 @@
 //
 // usage: diag-moe <model.ninfer> [layer]
 #include "core/device.h"
+#include "core/moe_probe.h"
 #include "core/tensor.h"
 #include "core/weight_bank.h"
 #include "core/weight_view.h"
@@ -23,6 +24,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -218,6 +220,9 @@ static int run(int argc, char** argv) {
         const auto routed_bytes = ops::topk_softmax_swiglu_moe_workspace_capacity_bytes(
             profile, ops::MoeEpilogue::AddResidual, tokens, tokens);
         for (const auto& item : cases) {
+            ops::probe::MoeRouteProbe probe;
+            const bool capture = tokens == 64 && std::string(item.label) == "full";
+            if (capture) { ops::probe::route_probe = &probe; }
             check(cudaMemsetAsync(out_sparse, 0, elements * sizeof(__nv_bfloat16), stream),
                   "clear sparse");
             check(cudaMemsetAsync(out_routed, 0, elements * sizeof(__nv_bfloat16), stream),
@@ -237,6 +242,40 @@ static int run(int argc, char** argv) {
                                              ops::MoeEpilogue::AddResidual, routed_out, arena,
                                              execution);
                 check(cudaStreamSynchronize(stream), "routed sync");
+                if (capture && probe.ids && probe.coefficients) {
+                    ops::probe::route_probe = nullptr;
+                    const auto routes = std::size_t(probe.top_k) * probe.tokens;
+                    std::vector<std::int32_t> ids(routes);
+                    std::vector<float> coefficients(routes), beta(probe.tokens);
+                    check(cudaMemcpy(ids.data(), probe.ids, routes * 4, cudaMemcpyDeviceToHost),
+                          "probe ids");
+                    check(cudaMemcpy(coefficients.data(), probe.coefficients, routes * 4,
+                                     cudaMemcpyDeviceToHost),
+                          "probe coefficients");
+                    if (probe.shared_coefficients) {
+                        check(cudaMemcpy(beta.data(), probe.shared_coefficients,
+                                         probe.tokens * 4, cudaMemcpyDeviceToHost),
+                              "probe beta");
+                    }
+                    std::vector<__nv_bfloat16> probe_input(hidden * probe.tokens);
+                    check(cudaMemcpy(probe_input.data(), x_device, probe_input.size() * 2,
+                                     cudaMemcpyDeviceToHost),
+                          "probe input");
+                    std::ofstream dump("H:/TeleAgentWorks/.temp/kv/it81_probe.bin",
+                                       std::ios::binary);
+                    const std::int32_t shape[3] = {static_cast<std::int32_t>(hidden),
+                                                   probe.tokens, probe.top_k};
+                    dump.write(reinterpret_cast<const char*>(shape), sizeof(shape));
+                    dump.write(reinterpret_cast<const char*>(probe_input.data()),
+                               static_cast<std::streamsize>(probe_input.size() * 2));
+                    dump.write(reinterpret_cast<const char*>(ids.data()),
+                               static_cast<std::streamsize>(routes * 4));
+                    dump.write(reinterpret_cast<const char*>(coefficients.data()),
+                               static_cast<std::streamsize>(routes * 4));
+                    dump.write(reinterpret_cast<const char*>(beta.data()),
+                               static_cast<std::streamsize>(probe.tokens * 4));
+                    std::printf("probe dumped: T=%d K=%d\n", probe.tokens, probe.top_k);
+                }
                 check(cudaFree(buffer), "free routed workspace");
             }
             check(cudaStreamSynchronize(stream), "sparse sync");
