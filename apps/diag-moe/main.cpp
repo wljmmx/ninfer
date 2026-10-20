@@ -272,7 +272,7 @@ static int run(int argc, char** argv) {
     // Captured no-shared outputs per length, so the token path (T=32) and the grouped path
     // (T=64) can be compared on the same leading columns.
     std::map<int, std::vector<__nv_bfloat16>> routed_by_tokens;
-    for (const int tokens : {1, 2, 3, 16, 17, 32, 47, 64, 128, 768, 1024, 1560}) {
+    for (const int tokens : {1, 2, 3, 16, 17, 32, 47, 51, 52, 64, 128, 768, 1024, 1560}) {
         const auto x = Tensor(x_device, execution.device(), DType::BF16,
                               {static_cast<std::int32_t>(hidden), tokens});
         auto sparse_out = Tensor(out_sparse, execution.device(), DType::BF16,
@@ -421,22 +421,33 @@ static int run(int argc, char** argv) {
 
     // Internal consistency: the leading 32 columns must not depend on how many columns follow.
     // T=32 takes the token kernel, T=64 takes the grouped kernel.
-    if (routed_by_tokens.count(32) && routed_by_tokens.count(64)) {
-        const auto& small = routed_by_tokens[32];
-        const auto& large = routed_by_tokens[64];
+    // Internal consistency: the same leading columns must not depend on the length. The cleanest
+    // pair is T=51 (adaptive, still the token sub-path) against T=52 (first pure grouped call),
+    // because their inputs differ by one column only. T=32 vs T=64 is kept as the coarse check.
+    const auto compare_prefix = [&](int a, int b) {
+        if (!routed_by_tokens.count(a) || !routed_by_tokens.count(b)) { return; }
+        const int prefix = std::min(a, b);
+        const auto& small = routed_by_tokens[a];
+        const auto& large = routed_by_tokens[b];
         float max_lead = 0.0F;
         double mean_lead = 0.0;
-        for (std::size_t i = 0; i < small.size(); ++i) {
-            const auto row = i % static_cast<std::size_t>(hidden);
-            const auto column = i / static_cast<std::size_t>(hidden);
-            const auto other = large[row + column * static_cast<std::size_t>(64)];
-            const auto d = std::fabs(__bfloat162float(small[i]) - __bfloat162float(other));
-            max_lead = std::max(max_lead, d);
-            mean_lead += d;
+        std::size_t seen = 0;
+        for (int column = 0; column < prefix; ++column) {
+            for (std::size_t row = 0; row < hidden; ++row) {
+                const auto lhs = small[row + static_cast<std::size_t>(column) * a];
+                const auto rhs = large[row + static_cast<std::size_t>(column) * b];
+                const auto d = std::fabs(__bfloat162float(lhs) - __bfloat162float(rhs));
+                max_lead = std::max(max_lead, d);
+                mean_lead += d;
+                ++seen;
+            }
         }
-        std::printf("token(T=32) vs grouped(T=64) on the same columns: max|d|=%.6f mean|d|=%.8f\n",
-                    max_lead, mean_lead / small.size());
-    }
+        std::printf("T=%d vs T=%d on %d shared columns: max|d|=%.6f mean|d|=%.8f\n", a, b,
+                    prefix, max_lead, mean_lead / seen);
+    };
+    compare_prefix(51, 52);
+    compare_prefix(32, 64);
+
 
     check(cudaFree(out_sparse), "free sparse output");
     check(cudaFree(out_routed), "free routed output");
