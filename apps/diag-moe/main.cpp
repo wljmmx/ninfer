@@ -269,7 +269,7 @@ static int run(int argc, char** argv) {
             profile, ops::MoeEpilogue::AddResidual, tokens, tokens);
         for (const auto& item : cases) {
             ops::probe::MoeRouteProbe probe;
-            const bool capture = tokens == 64 && std::string(item.label) == "full";
+            const bool capture = tokens == 1560 && std::string(item.label) == "full";
             if (capture) { ops::probe::route_probe = &probe; }
             check(cudaMemsetAsync(out_sparse, 0, elements * sizeof(__nv_bfloat16), stream),
                   "clear sparse");
@@ -358,24 +358,24 @@ static int run(int argc, char** argv) {
                         __bfloat162float(host_routed[worst]));
             if (max_difference > 1e-2F) { ++failures; }
 
-            if (tokens == 64 && std::string(item.label) == "no-shared" &&
+            if (tokens == 1560 && std::string(item.label) == "no-shared" &&
                 !captured_ids.empty()) {
-                const auto k = static_cast<std::int32_t>(captured_ids.size() / 64);
+                const auto k = static_cast<std::int32_t>(captured_ids.size() / 1560);
                 Tensor x_host(MemorySpan{captured_x.data(), captured_x.size() * 2, Device::cpu()},
-                              DType::BF16, {static_cast<std::int32_t>(hidden), 64});
+                              DType::BF16, {static_cast<std::int32_t>(hidden), 1560});
                 Tensor ids_host(
                     MemorySpan{captured_ids.data(), captured_ids.size() * 4, Device::cpu()},
-                    DType::I32, {k, 64});
+                    DType::I32, {k, 1560});
                 Tensor coefficients_host(
                     MemorySpan{captured_coefficients.data(), captured_coefficients.size() * 4,
                                Device::cpu()},
-                    DType::FP32, {k, 64});
-                std::vector<float> cpu_out(static_cast<std::size_t>(hidden) * 64);
+                    DType::FP32, {k, 1560});
+                std::vector<float> cpu_out(static_cast<std::size_t>(hidden) * 1560);
                 Tensor destination_host(
                     MemorySpan{cpu_out.data(), cpu_out.size() * 4, Device::cpu()}, DType::FP32,
-                    {static_cast<std::int32_t>(hidden), 64});
+                    {static_cast<std::int32_t>(hidden), 1560});
                 const auto cpu_bytes = ops::routed_swiglu_workspace_capacity_bytes(
-                    profile.routed, ops::ExpertSubsetKind::All, 64, 64);
+                    profile.routed, ops::ExpertSubsetKind::All, 1560, 1560);
                 // The CPU kernels require a 256-byte aligned cursor, which a vector does not
                 // guarantee, so round the base up inside an over-allocated buffer.
                 std::vector<std::byte> raw_workspace(cpu_bytes + 512);
@@ -393,7 +393,7 @@ static int run(int argc, char** argv) {
                     cpu_max = std::max(cpu_max,
                                        std::fabs(__bfloat162float(host_routed[i]) - cpu_out[i]));
                 }
-                std::printf("CPU reference vs GPU no-shared (T=64): max|d| = %.6f\n", cpu_max);
+                std::printf("CPU reference vs GPU no-shared (T=1560): max|d| = %.6f\n", cpu_max);
             }
         }
     }
