@@ -10,14 +10,6 @@
 
 namespace ninfer::models::qwen3_5::execution {
 namespace {
-// port (sm_89): the groupwise-int routed path is the default. The shipped sparse path still
-// exists behind NINFER_MOE_ROUTED=0 for comparison, but it drops the routed experts entirely
-// in its prefill kernel, so it is not a valid reference.
-bool routed_moe_enabled() {
-    const char* value = std::getenv("NINFER_MOE_ROUTED");
-    return value == nullptr || value[0] == '\0' || (value[0] != '0' && value[0] != 'n');
-}
-
 template <class Function>
 auto with_context(const std::string& context, Function&& function) {
     try {
@@ -141,33 +133,18 @@ public:
         return out;
     }
 
-    ops::SparseMoeWeights sparse_moe(const MoeWeights& moe) const {
-        std::vector<ops::WeightInput> gate_up, down;
-        gate_up.reserve(2 * moe.experts.size());
-        down.reserve(moe.experts.size());
-        for (const auto& expert : moe.experts) {
-            gate_up.push_back(model_.input(expert.gate));
-            gate_up.push_back(model_.input(expert.up));
-            down.push_back(model_.input(expert.down));
-        }
-        return with_context(model_.weight(moe.router).name, [&] {
-            return ops::prepare_sparse_moe_weights(
-                model_.input(moe.router), model_.input(moe.shared_score), gate_up, down,
-                model_.input(moe.shared.gate), model_.input(moe.shared.up),
-                model_.input(moe.shared.down));
-        });
-    }
-
     FfnParameters ffn(const BlockWeights& w) const {
         if (const auto* d = std::get_if<DenseWeights>(&w.ffn)) { return dense(*d); }
         const auto& moe = std::get<MoeWeights>(w.ffn);
         if (std::get<MoeConfig>(model_.config().text.ffn).num_experts_per_tok != 8) {
-            throw std::invalid_argument("SparseMoe implements top-8 routing");
+            throw std::invalid_argument("MoE implements top-8 routing");
         }
-        if (!routed_moe_enabled()) { return sparse_moe(moe); }
-        auto out   = routed_moe(moe);
-        out.sparse = sparse_moe(moe);
-        return out;
+        // port (sm_89): the shipped sparse MoE prefill kernel cannot index this artifact's expert
+        // bank - it hardcodes 1024 rows per expert and stages no usable scales, so it writes a
+        // zero routed term and the layer silently degenerates to the shared expert alone
+        // (perplexity ~1.2e3 on ordinary text). The groupwise-int path is the only implementation
+        // wired for this model.
+        return routed_moe(moe);
     }
 
     BlockParameters block(const BlockWeights& w) const {

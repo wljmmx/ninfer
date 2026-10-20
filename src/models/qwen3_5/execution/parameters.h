@@ -36,8 +36,6 @@ struct RoutedMoeParameters {
     Weight control;            // BF16 [E+1,H]: router rows, then the shared logit
     ops::SwiGLUWeights shared; // fused gate_up [2I,H] plus down [H,I]
     ops::CudaSwiGLUExperts routed;
-    // The shipped sparse operands over the same tensors, kept for the A/B switch.
-    ops::SparseMoeWeights sparse;
 };
 
 using FfnParameters =
