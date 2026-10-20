@@ -7,8 +7,12 @@
 //
 // usage: diag-moe <model.ninfer> [layer]
 #include "core/device.h"
+#include "core/cpu/executor.h"
+#include "core/cpu/system.h"
 #include "core/moe_probe.h"
 #include "core/tensor.h"
+#include "artifact/materializer.h"
+#include "artifact/reader.h"
 #include "core/weight_bank.h"
 #include "core/weight_view.h"
 #include "models/qwen3_5/load.h"
@@ -22,6 +26,7 @@
 #include <cuda_runtime.h>
 
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -151,6 +156,49 @@ static int run(int argc, char** argv) {
     const auto stream        = execution.stream;
     constexpr int max_tokens = 2048;
 
+    // Host copy of this layer's weights for the CPU reference. Only these five objects are
+    // materialized, and only in host memory, so the device residency is untouched.
+    artifact::Reader reader(argv[1]);
+    const auto& directory = reader.directory();
+    const auto handle_of  = [&](const std::string& name) {
+        const auto found = directory.bindings.find(name);
+        if (found == directory.bindings.end() || found->second.parts.empty()) {
+            throw std::runtime_error("missing binding " + name);
+        }
+        return found->second.parts.front().object;
+    };
+    const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
+    const auto gu_handle     = handle_of(prefix + "moe/experts/0/gate");
+    const auto dn_handle     = handle_of(prefix + "moe/experts/0/down");
+    artifact::MaterializationPlan host_plan;
+    host_plan.source       = &reader;
+    host_plan.object_count = directory.objects.size();
+    for (const auto handle : {gu_handle, dn_handle}) {
+        artifact::HostPlacement placement;
+        placement.object = handle;
+        host_plan.host_objects.push_back(placement);
+    }
+    auto host_backing = artifact::materialize(reader, std::move(host_plan), device);
+    const auto& host_gu_parent = host_backing.host_parent(gu_handle);
+    const auto& host_dn_parent = host_backing.host_parent(dn_handle);
+    const auto host_gu = bind_weight_bank(
+        host_gu_parent,
+        describe_weight_bank(host_gu_parent.geometry,
+                             {gate.parts[0].begin / hidden, count, 2 * intermediate,
+                              2 * intermediate}));
+    const auto host_dn = bind_weight_bank(
+        host_dn_parent,
+        describe_weight_bank(host_dn_parent.geometry,
+                             {down.parts[0].begin / down.shape.at(1), count, down.shape.at(0),
+                              down.shape.at(0)}));
+    CpuTopology topology;
+    CpuExecutor cpu_executor(topology, plan_cpu_team(topology.info(), 8));
+    std::printf("host bank ready for the CPU reference\n");
+
+    std::vector<__nv_bfloat16> captured_x;
+    std::vector<std::int32_t> captured_ids;
+    std::vector<float> captured_coefficients;
+
     __nv_bfloat16* x_device = nullptr;
     check(cudaMalloc(&x_device, hidden * max_tokens * sizeof(__nv_bfloat16)), "alloc input");
     {
@@ -275,6 +323,9 @@ static int run(int argc, char** argv) {
                     dump.write(reinterpret_cast<const char*>(beta.data()),
                                static_cast<std::streamsize>(probe.tokens * 4));
                     std::printf("probe dumped: T=%d K=%d\n", probe.tokens, probe.top_k);
+                    captured_x            = probe_input;
+                    captured_ids          = ids;
+                    captured_coefficients = coefficients;
                 }
                 check(cudaFree(buffer), "free routed workspace");
             }
@@ -306,6 +357,44 @@ static int run(int argc, char** argv) {
                         __bfloat162float(host_sparse[worst]),
                         __bfloat162float(host_routed[worst]));
             if (max_difference > 1e-2F) { ++failures; }
+
+            if (tokens == 64 && std::string(item.label) == "no-shared" &&
+                !captured_ids.empty()) {
+                const auto k = static_cast<std::int32_t>(captured_ids.size() / 64);
+                Tensor x_host(MemorySpan{captured_x.data(), captured_x.size() * 2, Device::cpu()},
+                              DType::BF16, {static_cast<std::int32_t>(hidden), 64});
+                Tensor ids_host(
+                    MemorySpan{captured_ids.data(), captured_ids.size() * 4, Device::cpu()},
+                    DType::I32, {k, 64});
+                Tensor coefficients_host(
+                    MemorySpan{captured_coefficients.data(), captured_coefficients.size() * 4,
+                               Device::cpu()},
+                    DType::FP32, {k, 64});
+                std::vector<float> cpu_out(static_cast<std::size_t>(hidden) * 64);
+                Tensor destination_host(
+                    MemorySpan{cpu_out.data(), cpu_out.size() * 4, Device::cpu()}, DType::FP32,
+                    {static_cast<std::int32_t>(hidden), 64});
+                const auto cpu_bytes = ops::routed_swiglu_workspace_capacity_bytes(
+                    profile.routed, ops::ExpertSubsetKind::All, 64, 64);
+                // The CPU kernels require a 256-byte aligned cursor, which a vector does not
+                // guarantee, so round the base up inside an over-allocated buffer.
+                std::vector<std::byte> raw_workspace(cpu_bytes + 512);
+                auto* cursor = reinterpret_cast<std::byte*>(
+                    (reinterpret_cast<std::uintptr_t>(raw_workspace.data()) + 255) &
+                    ~static_cast<std::uintptr_t>(255));
+                MemoryArena arena(MemorySpan{cursor, cpu_bytes, Device::cpu()});
+                ops::routed_swiglu(x_host, profile.routed,
+                                   ops::CpuSwiGLUExperts{host_gu, host_dn},
+                                   ops::ExpertRoutes{ids_host, coefficients_host},
+                                   ops::ExpertSubset{ops::ExpertSubsetKind::All, {}},
+                                   destination_host, arena, cpu_executor.execution_view());
+                float cpu_max = 0.0F;
+                for (std::size_t i = 0; i < cpu_out.size(); ++i) {
+                    cpu_max = std::max(cpu_max,
+                                       std::fabs(__bfloat162float(host_routed[i]) - cpu_out[i]));
+                }
+                std::printf("CPU reference vs GPU no-shared (T=64): max|d| = %.6f\n", cpu_max);
+            }
         }
     }
 
