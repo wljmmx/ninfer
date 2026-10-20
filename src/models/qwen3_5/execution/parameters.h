@@ -27,7 +27,15 @@ struct DenseParameters {
     LinearParameters down;
 };
 
-using FfnParameters = std::variant<DenseParameters, ops::SparseMoeWeights>;
+// port (sm_89): diagnostic placeholder. Adding a third alternative to FfnParameters is being
+// tested in isolation: this type carries one integer and nothing else, so any crash it produces
+// cannot come from a real member.
+struct RoutedMoeParametersPlaceholder {
+    std::int32_t placeholder = 0;
+};
+
+using FfnParameters =
+    std::variant<DenseParameters, ops::SparseMoeWeights, RoutedMoeParametersPlaceholder>;
 
 struct AttentionParameters {
     ops::ProjectionWeights projection;
