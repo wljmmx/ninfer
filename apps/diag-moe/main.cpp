@@ -381,7 +381,25 @@ static int run(int argc, char** argv) {
                         __bfloat162float(host_sparse[worst]),
                         __bfloat162float(host_routed[worst]));
             if (max_difference > 1e-2F) { ++failures; }
-            if (std::string(item.label) == "no-shared") { routed_by_tokens[tokens] = host_routed; }
+            if (std::string(item.label) == "no-shared") {
+                routed_by_tokens[tokens] = host_routed;
+                // port (sm_89): dump one length's routed output so two paths can be compared
+                // element by element offline.
+                if (const char* sparse_path = std::getenv("NINFER_DIAG_DUMP_SPARSE")) {
+                    std::ofstream out(sparse_path, std::ios::binary);
+                    const std::int32_t shape[2] = {static_cast<std::int32_t>(hidden), tokens};
+                    out.write(reinterpret_cast<const char*>(shape), sizeof(shape));
+                    out.write(reinterpret_cast<const char*>(host_sparse.data()),
+                              static_cast<std::streamsize>(host_sparse.size() * 2));
+                }
+                if (const char* dump_path = std::getenv("NINFER_DIAG_DUMP")) {
+                    std::ofstream out(dump_path, std::ios::binary);
+                    const std::int32_t shape[2] = {static_cast<std::int32_t>(hidden), tokens};
+                    out.write(reinterpret_cast<const char*>(shape), sizeof(shape));
+                    out.write(reinterpret_cast<const char*>(host_routed.data()),
+                              static_cast<std::streamsize>(host_routed.size() * 2));
+                }
+            }
 
             if (tokens == 128 && std::string(item.label) == "no-shared" &&
                 !captured_ids.empty()) {
