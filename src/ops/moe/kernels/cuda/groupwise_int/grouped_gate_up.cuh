@@ -243,7 +243,7 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void grouped_q4_gate_up(
                         activation[static_cast<std::int64_t>(col0) * Shape::intermediate + row0] =
                             __float2bfloat16_rn(silu(acc[mi][ni][0]) * acc[mi + 2][ni][0]);
                         // port (sm_89): activation-level A/B probe, enabled for one run.
-                        if (false && row0 == 0 && blockIdx.x == 0 && work == 0 && lid == 0 && warp == 0) {
+                        if (false && expert == 191 && row0 == 0 && lid == 0 && warp == 0) {
                             ::printf("GPROBE expert=%d tok=%d direct=%d cols=%d act=%.6f\n",
                                      expert, packed_token[col0], int(info->direct), cols,
                                      float(__bfloat162float(

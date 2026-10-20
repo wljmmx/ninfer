@@ -272,7 +272,11 @@ static int run(int argc, char** argv) {
     // Captured no-shared outputs per length, so the token path (T=32) and the grouped path
     // (T=64) can be compared on the same leading columns.
     std::map<int, std::vector<__nv_bfloat16>> routed_by_tokens;
-    for (const int tokens : {1, 2, 3, 16, 17, 32, 47, 51, 52, 64, 128, 768, 1024, 1560}) {
+    std::vector<int> lengths{1, 2, 3, 16, 17, 32, 47, 51, 52, 64, 128, 768, 1024, 1560};
+    if (const char* single = std::getenv("NINFER_DIAG_T")) {
+        lengths.assign(1, std::atoi(single));
+    }
+    for (const int tokens : lengths) {
         const auto x = Tensor(x_device, execution.device(), DType::BF16,
                               {static_cast<std::int32_t>(hidden), tokens});
         auto sparse_out = Tensor(out_sparse, execution.device(), DType::BF16,
