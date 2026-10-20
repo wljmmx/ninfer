@@ -10,10 +10,12 @@
 
 namespace ninfer::models::qwen3_5::execution {
 namespace {
-// port (sm_89): opt-in while the routed path is compared against the shipped sparse one.
+// port (sm_89): the groupwise-int routed path is the default. The shipped sparse path still
+// exists behind NINFER_MOE_ROUTED=0 for comparison, but it drops the routed experts entirely
+// in its prefill kernel, so it is not a valid reference.
 bool routed_moe_enabled() {
     const char* value = std::getenv("NINFER_MOE_ROUTED");
-    return value != nullptr && value[0] != '\0' && value[0] != '0';
+    return value == nullptr || value[0] == '\0' || (value[0] != '0' && value[0] != 'n');
 }
 
 template <class Function>
