@@ -45,6 +45,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -1144,6 +1145,27 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase,
     ops::rmsnorm(x, weights.post_attention_norm, config_.rms_norm_eps, true, h, ctx_.stream);
     // [P1 probe] optional per-token int8 activation round-trip (NINFER_ACT_A8)
     ops::act_quant_a8_roundtrip_bf16(h.data, h.ne[0], h.ne[1], ctx_.stream);
+    // port (sm_89): offline diagnostic hook. Dumps the first prefill layer's real FFN input so the
+    // CPU reference can be checked against actual hidden states instead of synthetic ones.
+    if (const char* dump_path = std::getenv("NINFER_MOE_DUMP_HIDDEN")) {
+        static bool dumped = false;
+        if (!dumped && h.ne[1] >= 128) {
+            dumped = true;
+            const auto rows = static_cast<std::size_t>(h.ne[0]);
+            std::vector<std::uint16_t> raw(rows * 128);
+            const auto copy = cudaMemcpy(raw.data(), h.data, raw.size() * 2,
+                                         cudaMemcpyDeviceToHost);
+            if (copy == cudaSuccess) {
+                std::FILE* file = std::fopen(dump_path, "wb");
+                if (file) {
+                    const std::int32_t shape[2] = {h.ne[0], 128};
+                    std::fwrite(shape, sizeof(shape), 1, file);
+                    std::fwrite(raw.data(), 2, raw.size(), file);
+                    std::fclose(file);
+                }
+            }
+        }
+    }
     ffn(h, weights.ffn, x, hints, work_, ctx_.execution_view());
 }
 

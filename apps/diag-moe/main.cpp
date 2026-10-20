@@ -203,9 +203,25 @@ static int run(int argc, char** argv) {
     check(cudaMalloc(&x_device, hidden * max_tokens * sizeof(__nv_bfloat16)), "alloc input");
     {
         std::vector<__nv_bfloat16> host(hidden * max_tokens);
-        std::mt19937 rng(12345);
-        std::normal_distribution<float> normal(0.0F, 1.0F);
-        for (auto& value : host) { value = __float2bfloat16_rn(normal(rng) * 1.0F); }
+        bool loaded = false;
+        std::ifstream dump("H:/TeleAgentWorks/.temp/kv/it98_hidden.bin", std::ios::binary);
+        if (dump) {
+            std::int32_t shape[2] = {0, 0};
+            dump.read(reinterpret_cast<char*>(shape), sizeof(shape));
+            if (shape[0] == static_cast<std::int32_t>(hidden) && shape[1] == 128) {
+                dump.read(reinterpret_cast<char*>(host.data()),
+                          static_cast<std::streamsize>(hidden * 128 * 2));
+                loaded = dump.good();
+            }
+        }
+        if (loaded) {
+            std::printf("input: real hidden states from the engine dump\n");
+        } else {
+            std::printf("input: synthetic N(0,1)\n");
+            std::mt19937 rng(12345);
+            std::normal_distribution<float> normal(0.0F, 1.0F);
+            for (auto& value : host) { value = __float2bfloat16_rn(normal(rng) * 1.0F); }
+        }
         check(cudaMemcpy(x_device, host.data(), host.size() * sizeof(__nv_bfloat16),
                          cudaMemcpyHostToDevice),
               "upload input");
@@ -269,7 +285,7 @@ static int run(int argc, char** argv) {
             profile, ops::MoeEpilogue::AddResidual, tokens, tokens);
         for (const auto& item : cases) {
             ops::probe::MoeRouteProbe probe;
-            const bool capture = tokens == 1560 && std::string(item.label) == "full";
+            const bool capture = tokens == 128 && std::string(item.label) == "full";
             if (capture) { ops::probe::route_probe = &probe; }
             check(cudaMemsetAsync(out_sparse, 0, elements * sizeof(__nv_bfloat16), stream),
                   "clear sparse");
@@ -358,24 +374,24 @@ static int run(int argc, char** argv) {
                         __bfloat162float(host_routed[worst]));
             if (max_difference > 1e-2F) { ++failures; }
 
-            if (tokens == 1560 && std::string(item.label) == "no-shared" &&
+            if (tokens == 128 && std::string(item.label) == "no-shared" &&
                 !captured_ids.empty()) {
-                const auto k = static_cast<std::int32_t>(captured_ids.size() / 1560);
+                const auto k = static_cast<std::int32_t>(captured_ids.size() / 128);
                 Tensor x_host(MemorySpan{captured_x.data(), captured_x.size() * 2, Device::cpu()},
-                              DType::BF16, {static_cast<std::int32_t>(hidden), 1560});
+                              DType::BF16, {static_cast<std::int32_t>(hidden), 128});
                 Tensor ids_host(
                     MemorySpan{captured_ids.data(), captured_ids.size() * 4, Device::cpu()},
-                    DType::I32, {k, 1560});
+                    DType::I32, {k, 128});
                 Tensor coefficients_host(
                     MemorySpan{captured_coefficients.data(), captured_coefficients.size() * 4,
                                Device::cpu()},
-                    DType::FP32, {k, 1560});
-                std::vector<float> cpu_out(static_cast<std::size_t>(hidden) * 1560);
+                    DType::FP32, {k, 128});
+                std::vector<float> cpu_out(static_cast<std::size_t>(hidden) * 128);
                 Tensor destination_host(
                     MemorySpan{cpu_out.data(), cpu_out.size() * 4, Device::cpu()}, DType::FP32,
-                    {static_cast<std::int32_t>(hidden), 1560});
+                    {static_cast<std::int32_t>(hidden), 128});
                 const auto cpu_bytes = ops::routed_swiglu_workspace_capacity_bytes(
-                    profile.routed, ops::ExpertSubsetKind::All, 1560, 1560);
+                    profile.routed, ops::ExpertSubsetKind::All, 128, 128);
                 // The CPU kernels require a 256-byte aligned cursor, which a vector does not
                 // guarantee, so round the base up inside an over-allocated buffer.
                 std::vector<std::byte> raw_workspace(cpu_bytes + 512);
@@ -393,7 +409,7 @@ static int run(int argc, char** argv) {
                     cpu_max = std::max(cpu_max,
                                        std::fabs(__bfloat162float(host_routed[i]) - cpu_out[i]));
                 }
-                std::printf("CPU reference vs GPU no-shared (T=1560): max|d| = %.6f\n", cpu_max);
+                std::printf("CPU reference vs GPU no-shared (T=128): max|d| = %.6f\n", cpu_max);
             }
         }
     }
