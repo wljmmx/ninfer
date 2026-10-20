@@ -212,9 +212,10 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void grouped_q4_gate_up(
                     // port (sm_89): offline probe, kept disabled. Enable the condition to print
                     // partial/scale/acc for one routed job; with kt == 0 the accumulator holds a
                     // single term, so acc must equal partial * scale.
-                    if (false && kt == 0 && mi < 2 && blockIdx.x == 0 && work == 0 && row0 < 2) {
-                        ::printf("PROBE row=%d lid=%d part=%.6f scale=%.6f acc=%.6f\n", row0, lid,
-                                 partial[mi][0][0], scale0, acc[mi][0][0]);
+                    if (false && kt == 0 && mi == 0 && row0 == 0 && lid == 0 &&
+                        blockIdx.x == 0 && work == 0) {
+                        ::printf("PROBE expert=%d tok=%d part=%.6f scale=%.6f\n", expert,
+                                 packed_token[0], partial[0][0][0], scale0);
                     }
                 }
             }
