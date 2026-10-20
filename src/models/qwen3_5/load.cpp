@@ -1,8 +1,8 @@
 #include "models/qwen3_5/load.h"
-
 #include "artifact/reader.h"
 #include "models/qwen3_5/load/bindings.h"
 
+#include <cstdio>
 #include <utility>
 
 namespace ninfer::models::qwen3_5 {
@@ -107,9 +107,10 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     auto backing = artifact::materialize(*data->materialization.source,
                                          std::move(data->materialization), device, observer);
     auto bound   = loading::resolve_weights(std::move(data->pending), backing);
-    return std::unique_ptr<Model>(new Model(
+    auto model = std::unique_ptr<Model>(new Model(
         std::move(data->config), data->options, std::move(data->weights), std::move(bound),
         std::move(data->resources), std::move(data->info), std::move(backing)));
+    return model;
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,

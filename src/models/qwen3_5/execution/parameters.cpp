@@ -2,6 +2,7 @@
 
 #include "core/weight_view.h"
 
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -9,6 +10,11 @@
 
 namespace ninfer::models::qwen3_5::execution {
 namespace {
+// port (sm_89): opt-in while the routed path is compared against the shipped sparse one.
+bool routed_moe_enabled() {
+    const char* value = std::getenv("NINFER_MOE_ROUTED");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
 
 template <class Function>
 auto with_context(const std::string& context, Function&& function) {
@@ -61,12 +67,79 @@ public:
                 linear(w.down)};
     }
 
-    FfnParameters ffn(const BlockWeights& w) const {
-        if (const auto* d = std::get_if<DenseWeights>(&w.ffn)) { return dense(*d); }
-        const auto& moe = std::get<MoeWeights>(w.ffn);
-        if (std::get<MoeConfig>(model_.config().text.ffn).num_experts_per_tok != 8) {
-            throw std::invalid_argument("SparseMoe implements top-8 routing");
+    WeightBankView expert_bank(const WeightView& first, std::uint32_t count,
+                               std::uint64_t rows, std::uint64_t columns) const {
+        if (first.parts.size() != 1 || !first.parts[0].parent) {
+            throw std::invalid_argument("expert bank requires one parent matrix");
         }
+        const auto& part = first.parts[0];
+        if (part.begin % columns) { throw std::invalid_argument("expert bank splits a row"); }
+        return bind_weight_bank(
+            *part.parent,
+            describe_weight_bank(part.parent->geometry, {part.begin / columns, count, rows, rows}));
+    }
+
+    Weight control_weight(const MoeWeights& moe) const {
+        const auto& router = model_.weight(moe.router).view;
+        const auto& score  = model_.weight(moe.shared_score).view;
+        if (router.parts.size() != 1 || score.parts.size() != 1 ||
+            router.parts[0].parent != score.parts[0].parent ||
+            router.parts[0].end != score.parts[0].begin) {
+            throw std::invalid_argument("MoE control rows are not contiguous");
+        }
+        const auto rows = router.shape.at(0) + 1;
+        return native_weight({{rows, router.shape.at(1)},
+                              {{router.parts[0].parent, router.parts[0].begin,
+                                score.parts[0].end}}});
+    }
+
+    ops::SwiGLUWeights shared_weights(const MoeWeights& moe) const {
+        const auto& gate = model_.weight(moe.shared.gate).view;
+        const auto& up   = model_.weight(moe.shared.up).view;
+        if (gate.shape.size() != 2 || up.shape != gate.shape || gate.parts.size() != 1 ||
+            up.parts.size() != 1 || gate.parts[0].parent != up.parts[0].parent ||
+            gate.parts[0].end != up.parts[0].begin) {
+            throw std::invalid_argument("shared gate/up are not interleaved");
+        }
+        const auto rows  = gate.shape.at(0) * 2;
+        const auto fused = native_weight({{rows, gate.shape.at(1)},
+                                          {{gate.parts[0].parent, gate.parts[0].begin,
+                                            up.parts[0].end}}});
+        const auto& down = model_.weight(moe.shared.down).view;
+        return {ops::SingleProjectionWeight{fused, ops::LinearPolicy::A16Only},
+                ops::SingleProjectionWeight{native_weight(down), ops::LinearPolicy::A16Only}};
+    }
+
+    RoutedMoeParameters routed_moe(const MoeWeights& moe) const {
+        const auto count = static_cast<std::uint32_t>(moe.experts.size());
+        if (count == 0) { throw std::invalid_argument("MoE has no experts"); }
+        constexpr std::int32_t top_k = 8;
+        const auto& gate = model_.weight(moe.experts.front().gate).view;
+        const auto& up   = model_.weight(moe.experts.front().up).view;
+        const auto& down = model_.weight(moe.experts.front().down).view;
+        if (gate.shape.size() != 2 || down.shape.size() != 2 || up.shape != gate.shape) {
+            throw std::invalid_argument("MoE expert matrices must be 2D");
+        }
+        const auto intermediate = gate.shape.at(0);
+        if (down.shape.at(1) != intermediate) {
+            throw std::invalid_argument("MoE expert down differs in I");
+        }
+        const auto gate_up   = expert_bank(gate, count, 2 * intermediate, gate.shape.at(1));
+        const auto down_bank = expert_bank(down, count, down.shape.at(0), down.shape.at(1));
+        RoutedMoeParameters out;
+        out.control = with_context(model_.weight(moe.router).name, [&] {
+            return control_weight(moe);
+        });
+        out.shared  = shared_weights(moe);
+        out.routed  = {device_expert_bank(gate_up, down_bank), {}};
+        out.profile = {ops::routed_swiglu_profile(gate_up, down_bank, top_k,
+                                                  ops::LinearPolicy::A16Only,
+                                                  ops::LinearPolicy::A16Only),
+                       ops::swiglu_profile(out.shared)};
+        return out;
+    }
+
+    ops::SparseMoeWeights sparse_moe(const MoeWeights& moe) const {
         std::vector<ops::WeightInput> gate_up, down;
         gate_up.reserve(2 * moe.experts.size());
         down.reserve(moe.experts.size());
@@ -81,6 +154,18 @@ public:
                 model_.input(moe.shared.gate), model_.input(moe.shared.up),
                 model_.input(moe.shared.down));
         });
+    }
+
+    FfnParameters ffn(const BlockWeights& w) const {
+        if (const auto* d = std::get_if<DenseWeights>(&w.ffn)) { return dense(*d); }
+        const auto& moe = std::get<MoeWeights>(w.ffn);
+        if (std::get<MoeConfig>(model_.config().text.ffn).num_experts_per_tok != 8) {
+            throw std::invalid_argument("SparseMoe implements top-8 routing");
+        }
+        if (!routed_moe_enabled()) { return sparse_moe(moe); }
+        auto out   = routed_moe(moe);
+        out.sparse = sparse_moe(moe);
+        return out;
     }
 
     BlockParameters block(const BlockWeights& w) const {

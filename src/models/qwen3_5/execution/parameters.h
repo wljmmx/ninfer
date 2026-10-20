@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/qwen3_5/model.h"
+#include "ninfer/ops/moe.h"
 #include "ninfer/ops/weight_input.h"
 
 #include <array>
@@ -27,15 +28,20 @@ struct DenseParameters {
     LinearParameters down;
 };
 
-// port (sm_89): diagnostic placeholder. Adding a third alternative to FfnParameters is being
-// tested in isolation: this type carries one integer and nothing else, so any crash it produces
-// cannot come from a real member.
-struct RoutedMoeParametersPlaceholder {
-    std::int32_t placeholder = 0;
+// port (sm_89): the bench routed-MoE view of the same artifact tensors. Experts form one affine
+// bank per layer (experts/e/gate, experts/e/up interleaved), so the routed kernel reads them
+// through a WeightBankView instead of one parent per expert.
+struct RoutedMoeParameters {
+    ops::MoeProfile profile;
+    Weight control;            // BF16 [E+1,H]: router rows, then the shared logit
+    ops::SwiGLUWeights shared; // fused gate_up [2I,H] plus down [H,I]
+    ops::CudaSwiGLUExperts routed;
+    // The shipped sparse operands over the same tensors, kept for the A/B switch.
+    ops::SparseMoeWeights sparse;
 };
 
 using FfnParameters =
-    std::variant<DenseParameters, ops::SparseMoeWeights, RoutedMoeParametersPlaceholder>;
+    std::variant<DenseParameters, ops::SparseMoeWeights, RoutedMoeParameters>;
 
 struct AttentionParameters {
     ops::ProjectionWeights projection;

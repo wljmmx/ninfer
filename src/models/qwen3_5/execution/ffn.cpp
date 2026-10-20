@@ -24,6 +24,13 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
         return ops::sparse_moe_workspace_capacity_bytes(moe->routed_gate_up.qtype,
                                                         moe->routed_down.qtype, first, last);
     }
+    if (const auto* moe = std::get_if<RoutedMoeParameters>(&parameters)) {
+        return std::max(ops::topk_softmax_swiglu_moe_workspace_capacity_bytes(
+                            moe->profile, ops::MoeEpilogue::AddResidual, first, last),
+                        ops::sparse_moe_workspace_capacity_bytes(
+                            moe->sparse.routed_gate_up.qtype, moe->sparse.routed_down.qtype, first,
+                            last));
+    }
     const auto& p    = std::get<DenseParameters>(parameters);
     const auto& gu   = p.gate_up.weight;
     const auto& down = p.down.weight;
@@ -70,6 +77,15 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
         WorkspaceArena scratch(storage);
         ops::sparse_moe(hidden, *moe, ops::SparseMoeEpilogue::AddResidual, residual, hints, scratch,
                         execution);
+        return;
+    }
+    if (const auto* moe = std::get_if<RoutedMoeParameters>(&parameters)) {
+        const auto storage =
+            workspace.alloc_bytes(ffn_workspace_bytes(parameters, columns, columns));
+        MemoryArena scratch(MemorySpan{storage.data, storage.bytes, execution.device()});
+        ops::topk_softmax_swiglu_moe(hidden, moe->profile,
+                                     ops::MoeWeights{moe->control, moe->routed, moe->shared},
+                                     ops::MoeEpilogue::AddResidual, residual, scratch, execution);
         return;
     }
     const auto& p    = std::get<DenseParameters>(parameters);
