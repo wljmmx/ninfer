@@ -206,17 +206,6 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void grouped_q4_gate_up(
                         acc[mi][ni][2] = fmaf(partial[mi][ni][2], scale1, acc[mi][ni][2]);
                         acc[mi][ni][3] = fmaf(partial[mi][ni][3], scale1, acc[mi][ni][3]);
                     }
-                    // port (sm_89): offline probe. With kt == 0 the accumulator holds exactly one
-                    // term, so acc must equal partial * scale and every lane of a group must see
-                    // the same scale for its row.
-                    // port (sm_89): offline probe, kept disabled. Enable the condition to print
-                    // partial/scale/acc for one routed job; with kt == 0 the accumulator holds a
-                    // single term, so acc must equal partial * scale.
-                    if (false && kt == 0 && mi == 0 && row0 == 0 && lid == 0 &&
-                        blockIdx.x == 0 && work == 0) {
-                        ::printf("PROBE expert=%d tok=%d part=%.6f scale=%.6f\n", expert,
-                                 packed_token[0], partial[0][0][0], scale0);
-                    }
                 }
             }
 
@@ -242,15 +231,6 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void grouped_q4_gate_up(
                     if (local_col0 < cols) {
                         activation[static_cast<std::int64_t>(col0) * Shape::intermediate + row0] =
                             __float2bfloat16_rn(silu(acc[mi][ni][0]) * acc[mi + 2][ni][0]);
-                        // port (sm_89): activation-level A/B probe, enabled for one run.
-                        if (false && expert == 191 && row0 == 0 && lid == 0 && warp == 0) {
-                            ::printf("GPROBE expert=%d tok=%d direct=%d cols=%d act=%.6f\n",
-                                     expert, packed_token[col0], int(info->direct), cols,
-                                     float(__bfloat162float(
-                                         activation[static_cast<std::int64_t>(col0) *
-                                                        Shape::intermediate +
-                                                    row0])));
-                        }
                         activation[static_cast<std::int64_t>(col0) * Shape::intermediate + row1] =
                             __float2bfloat16_rn(silu(acc[mi][ni][2]) * acc[mi + 2][ni][2]);
                     }

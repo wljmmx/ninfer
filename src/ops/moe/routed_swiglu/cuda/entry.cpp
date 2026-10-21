@@ -1,5 +1,4 @@
 #include "core/nvtx.h"
-#include "core/moe_probe.h"
 #include "ninfer/ops/moe.h"
 #include "ops/moe/operands.h"
 #include "ops/moe/routed_swiglu/cuda/dispatch.h"
@@ -62,9 +61,6 @@ void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiG
     const auto& shape = impl::shape_dispatch(profile);
     detail::MoeOperands operands("routed_swiglu", execution);
     const int tokens = operands.input(x, profile.ffn.hidden);
-    // port (sm_89): observation only; null unless the offline diagnostic installed a probe.
-    probe::publish_routes(routes.ids.data, routes.coefficients.data,
-                          shared ? shared->coefficients.data : nullptr, tokens, profile.top_k);
     operands.output(destination, profile.ffn.hidden, tokens, mode);
     operands.subset(subset, profile.experts);
     if (subset.kind != ExpertSubsetKind::None) {

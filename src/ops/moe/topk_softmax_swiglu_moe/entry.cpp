@@ -1,5 +1,4 @@
 #include "core/nvtx.h"
-#include "core/moe_probe.h"
 #include "ninfer/ops/moe.h"
 #include "ops/moe/operands.h"
 #include "ops/moe/topk_softmax_swiglu_moe/dispatch.h"
@@ -107,9 +106,6 @@ void topk_softmax_swiglu_moe(const Tensor& x, const MoeProfile& profile, const M
         routing::launch_route(input, weights.control, storage.routes, storage.shared, plan.router,
                               storage.route, count == 1 ? shared_prefetch : MoeExecutionHints{},
                               execution);
-        // port (sm_89): observation only; null unless the offline diagnostic installed a probe.
-        probe::publish_routes(storage.routes.ids.data, storage.routes.coefficients.data,
-                              storage.shared.data, tokens, p.top_k);
         if (plan.integer.grouped) {
             if (!plan.router.count_assignments) {
                 integer::launch_group_count(storage.routes, {}, storage.experts.groups, execution);
