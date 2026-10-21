@@ -139,19 +139,24 @@ static int run(int argc, char** argv) {
                                    ops::LinearPolicy::A16Only),
         ops::swiglu_profile(shared)};
 
-    // Shipped sparse operands over the same artifact tensors.
-    std::vector<ops::WeightInput> gate_up_in, down_in;
-    gate_up_in.reserve(2 * count);
-    down_in.reserve(count);
-    for (const auto& expert : moe->experts) {
-        gate_up_in.push_back(model->input(expert.gate));
-        gate_up_in.push_back(model->input(expert.up));
-        down_in.push_back(model->input(expert.down));
+    // Shipped sparse operands over the same artifact tensors. The builder rejects row-split
+    // artifacts, so timing mode (which never runs the sparse path) skips it entirely.
+    const bool bench_only = std::getenv("NINFER_DIAG_BENCH") != nullptr;
+    ops::SparseMoeWeights sparse{};
+    if (!bench_only) {
+        std::vector<ops::WeightInput> gate_up_in, down_in;
+        gate_up_in.reserve(2 * count);
+        down_in.reserve(count);
+        for (const auto& expert : moe->experts) {
+            gate_up_in.push_back(model->input(expert.gate));
+            gate_up_in.push_back(model->input(expert.up));
+            down_in.push_back(model->input(expert.down));
+        }
+        sparse = ops::prepare_sparse_moe_weights(
+            model->input(moe->router), model->input(moe->shared_score), gate_up_in, down_in,
+            model->input(moe->shared.gate), model->input(moe->shared.up),
+            model->input(moe->shared.down));
     }
-    const auto sparse = ops::prepare_sparse_moe_weights(
-        model->input(moe->router), model->input(moe->shared_score), gate_up_in, down_in,
-        model->input(moe->shared.gate), model->input(moe->shared.up),
-        model->input(moe->shared.down));
 
     const auto execution     = device.execution_view();
     const auto stream        = execution.stream;
@@ -276,6 +281,20 @@ static int run(int argc, char** argv) {
     if (const char* single = std::getenv("NINFER_DIAG_T")) {
         lengths.assign(1, std::atoi(single));
     }
+    // port (sm_89): comma-separated length list so one load can time a whole sweep.
+    if (const char* list = std::getenv("NINFER_DIAG_TS")) {
+        lengths.clear();
+        const std::string text(list);
+        std::size_t start = 0;
+        while (start < text.size()) {
+            const auto comma = text.find(',', start);
+            const auto piece = text.substr(start, comma == std::string::npos
+                                                      ? std::string::npos : comma - start);
+            if (!piece.empty()) { lengths.push_back(std::atoi(piece.c_str())); }
+            if (comma == std::string::npos) { break; }
+            start = comma + 1;
+        }
+    }
     for (const int tokens : lengths) {
         const auto x = Tensor(x_device, execution.device(), DType::BF16,
                               {static_cast<std::int32_t>(hidden), tokens});
@@ -291,6 +310,36 @@ static int run(int argc, char** argv) {
 
         const auto routed_bytes = ops::topk_softmax_swiglu_moe_workspace_capacity_bytes(
             profile, ops::MoeEpilogue::AddResidual, tokens, tokens);
+        // port (sm_89): timing mode. Measures the routed op alone on this length so a kernel
+        // variant can be compared in seconds instead of a full model load per run.
+        if (const char* bench_env = std::getenv("NINFER_DIAG_BENCH")) {
+            const int iters = std::max(1, std::atoi(bench_env));
+            void* buffer    = nullptr;
+            check(cudaMalloc(&buffer, routed_bytes), "alloc bench workspace");
+            const auto& weights = cases.front().routed;
+            const auto run_once = [&] {
+                MemoryArena arena(MemorySpan{buffer, routed_bytes, execution.device()});
+                ops::topk_softmax_swiglu_moe(x, profile, weights, ops::MoeEpilogue::AddResidual,
+                                             routed_out, arena, execution);
+            };
+            for (int warmup = 0; warmup < 3; ++warmup) { run_once(); }
+            check(cudaStreamSynchronize(stream), "bench warmup");
+            cudaEvent_t begin = nullptr, end = nullptr;
+            check(cudaEventCreate(&begin), "bench event");
+            check(cudaEventCreate(&end), "bench event");
+            check(cudaEventRecord(begin, stream), "bench record");
+            for (int iteration = 0; iteration < iters; ++iteration) { run_once(); }
+            check(cudaEventRecord(end, stream), "bench record");
+            check(cudaEventSynchronize(end), "bench sync");
+            float elapsed = 0.0F;
+            check(cudaEventElapsedTime(&elapsed, begin, end), "bench elapsed");
+            std::printf("BENCH tokens=%-5d iters=%-4d avg_us=%.2f\n", tokens, iters,
+                        elapsed * 1000.0F / static_cast<float>(iters));
+            check(cudaEventDestroy(begin), "bench event");
+            check(cudaEventDestroy(end), "bench event");
+            check(cudaFree(buffer), "free bench workspace");
+            continue;
+        }
         for (const auto& item : cases) {
             ops::probe::MoeRouteProbe probe;
             const bool capture = tokens == 128 && std::string(item.label) == "full";
