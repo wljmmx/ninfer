@@ -67,6 +67,14 @@ struct SparseMoeHints {
  * shared banks are Q8. Expert e directly selects its stored row spans; no selected-weight gather
  * or repack occurs.
  *
+ * port (sm_89): "row spans" is a real constraint, not a description. The kernels read one code
+ * plane and one scale plane with a fixed per-row stride, so the parents must be plane-separated
+ * (QuantLayout::Contiguous). A row-split parent such as row_split_k128_v1 keeps the scales inside
+ * each row; the kernels then read misaligned codes and zero scales, and the whole layer silently
+ * degenerates to the shared expert (observed as a 1253.99 perplexity model). The builder now
+ * rejects that layout; artifacts stored that way must use topk_softmax_swiglu_moe, which reads
+ * the same tensors through the weight bank and supports both layouts.
+ *
  * Every positive T is supported.
  *
  * x, destination, all weight planes, and live workspace must be pairwise non-overlapping.
