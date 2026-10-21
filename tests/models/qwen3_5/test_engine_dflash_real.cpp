@@ -377,8 +377,29 @@ int main() {
         248045, 846,    198, 109266, 3709,  96220, 117443, 97913,
         1710,   248046, 198, 248045, 74455, 198,   248068, 198,
     };
-    if (const int result = exercise_vision_dflash(artifact, prompt); result != 0) { return result; }
+    // port (sm_89): a missing device-memory budget must report itself. Without this the fixture
+    // terminates through the reservation check's exception, which Windows surfaces as 0xC0000409
+    // and no diagnostic at all.
+    const auto guard = [](auto&& body) -> int {
+        try {
+            return body();
+        } catch (const std::exception& error) {
+            const std::string message = error.what();
+            if (message.find("reservation") != std::string::npos ||
+                message.find("runtime capacity") != std::string::npos) {
+                std::cerr << "skip: " << message << std::endl;
+                return 77;
+            }
+            std::cerr << "dflash real test failed: " << message << std::endl;
+            return 1;
+        }
+    };
+    {
+        const int result = guard([&] { return exercise_vision_dflash(artifact, prompt); });
+        if (result != 0) { return result; }
+    }
 
+    const int remaining = guard([&]() -> int {
     {
         ninfer::EngineOptions options =
             dflash_engine_options(artifact, ninfer::ProposalHead::Full, 128);
@@ -428,6 +449,9 @@ int main() {
         return result;
     }
     if (const int result = exercise_long_boundary_restore(engine); result != 0) { return result; }
+        return 0;
+    });
+    if (remaining != 0) { return remaining; }
 
     std::cout << "ok\n";
     return 0;
