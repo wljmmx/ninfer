@@ -6,6 +6,8 @@
 #include "core/layout.h"
 #include "core/weight_view.h"
 
+#include <cuda_runtime.h>
+
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -104,7 +106,9 @@ public:
     [[nodiscard]] ExpertCacheProgress progress();
 
     // Waits for every in-flight batch. Used at startup and before a required miss.
-    void wait_for_progress();
+    // port (sm_89): when a stream is given the uploads are ordered on it, so the caller does
+    // not need a device-wide sync between a layer's copies and its kernel.
+    void wait_for_progress(cudaStream_t stream = nullptr);
 
     // Pool offset of a published expert, or nullopt when it is not resident.
     [[nodiscard]] std::optional<std::uint64_t> offset(ExpertCacheKey key) const;

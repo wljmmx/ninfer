@@ -86,6 +86,7 @@ struct ExpertCache::Impl {
     std::uint64_t slot_bytes = 0;
     std::vector<std::uint64_t> window_of;
     std::vector<std::uint64_t> last_window_use;
+    std::vector<std::uint64_t> window_hits;
     int ordinal = 0;
 
     Impl(std::span<const ExpertBankSpec> specs, const ExpertCacheRequirements& req,
@@ -117,6 +118,7 @@ struct ExpertCache::Impl {
         slot_bytes = (req.max_entry_bytes + block - 1) / block * block;
         window_of.assign(banks.size(), kAbsent);
         last_window_use.assign(banks.size(), 0);
+        window_hits.assign(banks.size(), 0);
         ordinal    = device.device;
     }
 
@@ -148,7 +150,7 @@ struct ExpertCache::Impl {
     // matrix. Windows are replaced whole: addressing stays affine and no per-expert offset
     // table can go stale while a kernel reads it.
     void ensure_window(std::uint32_t bank) {
-        if (window_of[bank] != kAbsent) { last_window_use[bank] = ++epoch; return; }
+        if (window_of[bank] != kAbsent) { last_window_use[bank] = ++epoch; ++window_hits[bank]; return; }
         const auto windows = window_count();
         if (windows == 0) { throw std::runtime_error("expert cache holds no complete window"); }
         std::vector<bool> used(windows, false);
@@ -161,10 +163,12 @@ struct ExpertCache::Impl {
         }
         if (chosen == kAbsent) {
             std::uint32_t victim = static_cast<std::uint32_t>(banks.size());
-            std::uint64_t oldest = std::numeric_limits<std::uint64_t>::max();
+            // port (sm_89): layers are visited in a fixed cycle, so plain recency evicts exactly
+            // the layer needed next. Keep the most used windows and stream the rest.
+            std::uint64_t coldest = std::numeric_limits<std::uint64_t>::max();
             for (std::uint32_t b = 0; b < banks.size(); ++b) {
-                if (window_of[b] != kAbsent && last_window_use[b] < oldest) {
-                    oldest = last_window_use[b];
+                if (window_of[b] != kAbsent && window_hits[b] < coldest) {
+                    coldest = window_hits[b];
                     victim = b;
                 }
             }
@@ -183,7 +187,7 @@ struct ExpertCache::Impl {
     }
 
 
-    void upload_one(ExpertCacheKey key) {
+    void upload_one(ExpertCacheKey key, cudaStream_t stream) {
         const auto& bank = banks[key.bank];
         ensure_window(key.bank);
         auto& entry = entries[index(key)];
@@ -214,9 +218,10 @@ struct ExpertCache::Impl {
             file_reader->read_entry(
                 *file, {static_cast<std::byte*>(staging->data()),
                         static_cast<std::size_t>(file->image_bytes)});
-            const auto status = cudaMemcpy(base, staging->data(),
+            const auto status = cudaMemcpyAsync(base, staging->data(),
                                            static_cast<std::size_t>(file->image_bytes),
-                                           cudaMemcpyHostToDevice);
+                                           cudaMemcpyHostToDevice, stream);
+            if (status == cudaSuccess) { (void)cudaStreamSynchronize(stream); }
             if (status != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(status)); }
         } else {
             const auto& view = views[key.bank];
@@ -263,13 +268,14 @@ ExpertCacheProgress ExpertCache::progress() {
     for (const auto& key : impl_->required) {
         const auto& entry = impl_->entries[impl_->index(key)];
         if (entry.ready) { continue; }
-        impl_->upload_one(key);
+        impl_->upload_one(key, nullptr);
         return {1, false};
     }
     return {0, true};
 }
 
-void ExpertCache::wait_for_progress() {
+void ExpertCache::wait_for_progress(cudaStream_t stream) {
+    (void)stream;
     while (!progress().required_published) {}
 }
 
