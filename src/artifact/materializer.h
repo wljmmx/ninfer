@@ -28,6 +28,13 @@ struct HostPlacement {
     std::vector<std::byte> data;
 };
 
+// port (sm_89): an object the load plan deliberately does not read. The tier that owns it reads
+// the bytes later, so only its description survives materialization.
+struct StreamedPlacement {
+    ObjectHandle object;
+    WeightGeometry geometry;
+};
+
 struct MaterializationPlan {
     const Reader* source                = nullptr;
     std::size_t object_count            = 0;
@@ -36,6 +43,8 @@ struct MaterializationPlan {
     std::uint64_t owned_value_bytes     = 0;
     std::vector<DevicePlacement> device_objects;
     std::vector<HostPlacement> host_objects;
+    // port (sm_89): described but not read. Only the geometry survives.
+    std::vector<StreamedPlacement> streamed_objects;
 };
 
 struct MaterializationStats {
@@ -62,6 +71,8 @@ public:
 
     [[nodiscard]] const WeightParent& device_parent(ObjectHandle handle) const;
     [[nodiscard]] const WeightParent& host_parent(ObjectHandle handle) const;
+    // port (sm_89): description of an object the plan left in the artifact.
+    [[nodiscard]] const WeightParent& streamed_parent(ObjectHandle handle) const;
     [[nodiscard]] std::span<const std::byte> host_bytes(ObjectHandle handle) const;
     [[nodiscard]] bool has_device(ObjectHandle handle) const noexcept;
 
@@ -83,6 +94,7 @@ private:
 
     std::unique_ptr<DeviceArena> arena_;
     std::vector<ObjectStorage> objects_;
+    std::vector<std::optional<WeightParent>> streamed_;
     MaterializationStats stats_;
     // port (sm_89): CUDA ordinal of the backing, and one lazy pin per Host object.
     int cuda_ordinal_ = -1;

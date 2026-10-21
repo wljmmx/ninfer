@@ -28,6 +28,8 @@ struct DenseParameters {
     LinearParameters down;
 };
 
+class ExpertStream;
+
 // port (sm_89): the bench routed-MoE view of the same artifact tensors. Experts form one affine
 // bank per layer (experts/e/gate, experts/e/up interleaved), so the routed kernel reads them
 // through a WeightBankView instead of one parent per expert.
@@ -36,6 +38,8 @@ struct RoutedMoeParameters {
     Weight control;            // BF16 [E+1,H]: router rows, then the shared logit
     ops::SwiGLUWeights shared; // fused gate_up [2I,H] plus down [H,I]
     ops::CudaSwiGLUExperts routed;
+    // port (sm_89): non-null when the experts stream from the artifact instead of being resident.
+    std::shared_ptr<ExpertStream> stream;
 };
 
 using FfnParameters =

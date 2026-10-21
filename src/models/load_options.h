@@ -11,6 +11,8 @@ struct LoadOptions {
     bool vision                    = false;
     SpeculativeBackend speculative = SpeculativeBackend::None;
     ProposalHead proposal_head     = ProposalHead::Full;
+    // port (sm_89): routed experts are not materialized; they stream from the artifact.
+    bool stream_experts            = false;
 
     bool operator==(const LoadOptions&) const = default;
 
@@ -56,7 +58,8 @@ struct LoadOptions {
     return {.purpose       = options.purpose,
             .vision        = options.enable_vision,
             .speculative   = options.speculative.backend,
-            .proposal_head = options.speculative.proposal_head};
+            .proposal_head = options.speculative.proposal_head,
+            .stream_experts = options.expert_cache_bytes != 0};
 }
 
 } // namespace ninfer::models

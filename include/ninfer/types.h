@@ -200,6 +200,9 @@ struct EngineOptions {
     bool enable_vision                     = false;
     bool use_cuda_graph                    = true;
     bool wddm_evictable_budget              = false; // Windows: budget against total VRAM minus DWM floor
+    // port (sm_89): routed expert weights live in the artifact and stream into a Device pool of
+    // this many bytes instead of staying resident. Zero keeps every expert resident.
+    std::size_t expert_cache_bytes          = 0;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     StartupObserver startup_observer;

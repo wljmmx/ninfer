@@ -8,6 +8,13 @@
 
 #include <memory>
 
+namespace ninfer::artifact {
+class ArtifactExpertReader;
+}
+namespace ninfer {
+class ExpertCache;
+}
+
 namespace ninfer::runtime {
 
 [[nodiscard]] EngineOptions normalize_engine_options(EngineOptions options);
@@ -21,6 +28,9 @@ struct ModelInstance {
     KvCapacityResolution kv_capacity_resolution;
     const std::uint32_t capacity;
     std::unique_ptr<models::qwen3_5::Program> program;
+    // port (sm_89): routed experts stream from the artifact into this shared pool.
+    std::unique_ptr<artifact::ArtifactExpertReader> expert_source;
+    std::unique_ptr<ExpertCache> expert_cache;
 
     ModelInstance(std::unique_ptr<models::qwen3_5::Model> model, const EngineOptions& options);
     ~ModelInstance();

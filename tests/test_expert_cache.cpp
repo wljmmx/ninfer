@@ -54,7 +54,7 @@ int main() {
                       std::span<const ExpertBankPair>(&pair, 1));
     if (cache.capacity_bytes() != config.capacity_bytes) { return fail("capacity mismatch"); }
 
-    const ExpertKey keys[] = {{0, 0}, {0, 1}};
+    const ExpertCacheKey keys[] = {{0, 0}, {0, 1}};
     cache.prepare(keys);
     cache.wait_for_progress();
 

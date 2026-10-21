@@ -226,9 +226,13 @@ void MoeOperands::experts(const CudaSwiGLUExperts& w, const RoutedSwiGLUProfile&
                             size <= view.indexed_storage.bytes - (address - begin),
                         "MoE: indexed plane lies outside its storage");
             } else {
-                require(stride >= size && stride % alignment == 0 &&
-                            stride <= (SIZE_MAX - size) / std::size_t(p.experts - 1),
-                        "MoE: invalid expert stride");
+                if (!(stride >= size && stride % alignment == 0 &&
+                      stride <= (SIZE_MAX - size) / std::size_t(p.experts - 1))) {
+                    throw std::invalid_argument("MoE: invalid expert stride size=" +
+                                                std::to_string(size) + " stride=" +
+                                                std::to_string(stride) + " align=" +
+                                                std::to_string(alignment));
+                }
                 read(base, (p.experts - 1) * stride + size);
             }
         };

@@ -1,5 +1,7 @@
 #include "artifact/expert_files.h"
 
+#include "core/weight_bank.h"
+
 #include <stdexcept>
 
 namespace ninfer::artifact {
@@ -47,6 +49,47 @@ ExpertFileBank describe_expert_files(const Reader& reader,
         append_plane(entry, reader, down_objects[expert], down.high_offset, down.high_bytes,
                      layout.down_high.offset);
         append_plane(entry, reader, down_objects[expert], down.scale_offset, down.scale_bytes,
+                     layout.down_scales.offset);
+        bank.experts.push_back(std::move(entry));
+    }
+    return bank;
+}
+
+ExpertFileBank describe_fused_expert_files(const Reader& reader, ObjectHandle gate_up_object,
+                                           ObjectHandle down_object,
+                                           const WeightGeometry& gate_up_parent,
+                                           const WeightGeometry& down_parent, std::uint32_t count,
+                                           std::uint32_t gate_up_rows, std::uint32_t down_rows,
+                                           const ExpertBankLayout& layout) {
+    if (!count || count != layout.count || !gate_up_rows || !down_rows) {
+        throw std::invalid_argument("fused expert plan disagrees on the expert count");
+    }
+    if (gate_up_parent.shape.empty() || down_parent.shape.empty()) {
+        throw std::invalid_argument("fused expert parent has no column axis");
+    }
+    ExpertFileBank bank;
+    bank.experts.reserve(count);
+    for (std::uint32_t expert = 0; expert < count; ++expert) {
+        // Per-expert plane origins come from the same affine description the resident bank uses,
+        // so the cache image and the CUDA bank cannot disagree about where a plane begins.
+        const auto gu = describe_weight_bank(
+            gate_up_parent, {static_cast<std::uint64_t>(expert) * gate_up_rows, 1, gate_up_rows,
+                             gate_up_rows});
+        const auto dn = describe_weight_bank(
+            down_parent, {static_cast<std::uint64_t>(expert) * down_rows, 1, down_rows, down_rows});
+        ExpertFileEntry entry;
+        entry.image_bytes = layout.entry_bytes;
+        append_plane(entry, reader, gate_up_object, gu.codes.offset, gu.codes.expert_bytes,
+                     layout.codes.offset);
+        append_plane(entry, reader, gate_up_object, gu.high.offset, gu.high.expert_bytes,
+                     layout.high.offset);
+        append_plane(entry, reader, gate_up_object, gu.scales.offset, gu.scales.expert_bytes,
+                     layout.scales.offset);
+        append_plane(entry, reader, down_object, dn.codes.offset, dn.codes.expert_bytes,
+                     layout.down_codes.offset);
+        append_plane(entry, reader, down_object, dn.high.offset, dn.high.expert_bytes,
+                     layout.down_high.offset);
+        append_plane(entry, reader, down_object, dn.scales.offset, dn.scales.expert_bytes,
                      layout.down_scales.offset);
         bank.experts.push_back(std::move(entry));
     }

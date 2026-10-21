@@ -65,11 +65,15 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& config, const std::string& pr
     out.router       = b.parameter(p + "router", {moe.num_experts, h}, {input});
     out.shared_score = b.parameter(p + "shared_score", {1, h}, {input});
     out.experts.reserve(moe.num_experts);
+    // port (sm_89): when experts stream, they are declared without being read or uploaded.
+    const auto residency =
+        b.stream_experts ? artifact::Residency::Streamed : artifact::Residency::Device;
     for (std::uint32_t e = 0; e < moe.num_experts; ++e) {
         const auto ep = p + "experts/" + std::to_string(e) + "/";
-        out.experts.push_back({b.parameter(ep + "gate", {ir, h}, {input}),
-                               b.parameter(ep + "up", {ir, h}, {input}),
-                               b.parameter(ep + "down", {h, ir}, {ep + "product"})});
+        out.experts.push_back({b.parameter(ep + "gate", {ir, h}, {input}, std::nullopt, residency),
+                               b.parameter(ep + "up", {ir, h}, {input}, std::nullopt, residency),
+                               b.parameter(ep + "down", {h, ir}, {ep + "product"}, std::nullopt,
+                                           residency)});
     }
     out.shared = {b.parameter(p + "shared/gate", {shared, h}, {input}),
                   b.parameter(p + "shared/up", {shared, h}, {input}),

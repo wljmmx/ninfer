@@ -58,6 +58,10 @@ ParameterReference Binder::binding(std::string name, const Binding& binding, Sha
             require_device(part.object);
         } else if (residency == Residency::Host) {
             (void)host_object(part.object);
+        } else if (residency == Residency::Streamed) {
+            // port (sm_89): the plan describes the object but neither reads nor uploads it; the
+            // streaming tier fetches its bytes on demand.
+            demands_.at(part.object.index).streamed = true;
         }
     }
     return {std::move(name), std::move(shape), binding, residency};
@@ -172,6 +176,10 @@ MaterializationPlan Binder::finish() && {
         }
         if (demand.host) {
             plan.host_objects.push_back({ObjectHandle{i}, std::move(demand.host_data)});
+        }
+        if (demand.streamed) {
+            const ObjectHandle handle{i};
+            plan.streamed_objects.push_back({handle, reader_.geometry(handle)});
         }
     }
     return plan;

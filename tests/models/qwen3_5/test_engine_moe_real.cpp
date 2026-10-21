@@ -20,7 +20,7 @@ ninfer::EngineOptions engine_options(const char* artifact) {
     options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens  = 3;
     options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
-    options.enable_vision             = true;
+    options.enable_vision             = false;
     options.use_cuda_graph            = true;
     return options;
 }

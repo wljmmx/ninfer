@@ -66,16 +66,16 @@ struct ExpertCacheRequirements {
 [[nodiscard]] ExpertCacheRequirements describe_expert_cache(std::span<const ExpertBankSpec>,
                                                            const ExpertCacheConfig&);
 
-struct ExpertKey {
+struct ExpertCacheKey {
     std::uint32_t bank   = 0;
     std::uint32_t expert = 0;
 
-    friend bool operator==(const ExpertKey&, const ExpertKey&) = default;
+    friend bool operator==(const ExpertCacheKey&, const ExpertCacheKey&) = default;
 };
 
 // Where one expert currently lives in the pool.
 struct ExpertSlot {
-    ExpertKey key;
+    ExpertCacheKey key;
     std::uint64_t offset = 0;
     bool ready           = false;
 };
@@ -98,7 +98,7 @@ public:
     ExpertCache& operator=(const ExpertCache&) = delete;
 
     // Declares the experts the next layer needs; they are uploaded by progress().
-    void prepare(std::span<const ExpertKey> required);
+    void prepare(std::span<const ExpertCacheKey> required);
 
     // Uploads one batch if a slot is free. Never blocks.
     [[nodiscard]] ExpertCacheProgress progress();
@@ -107,10 +107,18 @@ public:
     void wait_for_progress();
 
     // Pool offset of a published expert, or nullopt when it is not resident.
-    [[nodiscard]] std::optional<std::uint64_t> offset(ExpertKey key) const;
+    [[nodiscard]] std::optional<std::uint64_t> offset(ExpertCacheKey key) const;
 
     [[nodiscard]] std::uint64_t used_bytes() const noexcept;
     [[nodiscard]] std::uint64_t capacity_bytes() const noexcept;
+    // port (sm_89): the Device pool every published entry lives in. An indexed expert bank points
+    // its plane bases into this span and adds `offset(key)` per expert.
+    [[nodiscard]] ConstMemorySpan pool() const;
+    // port (sm_89): bytes between two experts of the same bank inside the pool. Banks own a
+    // contiguous run of slots, so a bank is a strided matrix and needs no offset table.
+    [[nodiscard]] std::uint64_t slot_bytes() const;
+    // port (sm_89): byte origin of a bank window, so a strided bank view can rebase onto it.
+    [[nodiscard]] std::uint64_t window_origin(std::uint32_t bank) const;
     [[nodiscard]] std::uint64_t uploads() const noexcept;
     [[nodiscard]] std::uint64_t evictions() const noexcept;
 

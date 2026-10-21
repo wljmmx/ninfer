@@ -48,6 +48,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     artifact::Binder binder(reader);
     out->resources = loading::bind_resources(binder, out->config);
     loading::Bindings bindings(binder);
+    bindings.stream_experts = options.stream_experts;
     const auto& text  = out->config.text;
     out->weights.text = loading::bind_text(bindings, text, options);
     if (out->config.vision) {

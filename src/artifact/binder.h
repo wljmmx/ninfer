@@ -10,7 +10,7 @@
 
 namespace ninfer::artifact {
 
-enum class Residency { Device, Host, Values };
+enum class Residency { Device, Host, Values, Streamed };
 
 struct ParameterReference {
     std::string name;
@@ -55,6 +55,7 @@ private:
     struct Demand {
         bool device             = false;
         bool host               = false;
+        bool streamed           = false;
         std::uint64_t alignment = 256;
         std::vector<std::byte> host_data;
     };

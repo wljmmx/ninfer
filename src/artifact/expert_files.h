@@ -21,4 +21,12 @@ namespace ninfer::artifact {
     std::span<const ObjectHandle> down_objects, const WeightGeometry& gate_up,
     const WeightGeometry& down, const ExpertBankLayout& layout);
 
+// port (sm_89): the artifact this model ships stores one fused matrix per (layer, matrix) with the
+// experts in consecutive row blocks, rather than one object per expert. Map expert e's six planes
+// onto the cache's entry image from the row block it occupies.
+[[nodiscard]] ExpertFileBank describe_fused_expert_files(
+    const Reader& reader, ObjectHandle gate_up_object, ObjectHandle down_object,
+    const WeightGeometry& gate_up_parent, const WeightGeometry& down_parent, std::uint32_t count,
+    std::uint32_t gate_up_rows, std::uint32_t down_rows, const ExpertBankLayout& layout);
+
 } // namespace ninfer::artifact

@@ -68,6 +68,9 @@ struct WeightParent {
     // port (sm_89): bench-compatible residency and per-expert divisor metadata.
     Device device = Device{};
     std::span<const float> weight_divisors;
+    // port (sm_89): artifact object this parent describes, so a streamed tier can map it back to
+    // its byte ranges without re-deriving the load plan.
+    std::uint64_t source_object = 0;
 };
 
 struct WeightRegion {

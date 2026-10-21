@@ -1,5 +1,7 @@
 #include "models/qwen3_5/execution/ffn.h"
 
+#include "models/qwen3_5/execution/expert_stream.h"
+
 #include "core/layout.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/act_quant_a8.h"
@@ -16,6 +18,68 @@
 #include <stdexcept>
 
 namespace ninfer::models::qwen3_5::execution {
+namespace {
+
+// port (sm_89): the streamed routed path runs routing, a host round trip and the expert call as
+// three steps, so its scratch is the route tensors plus the larger of the two Op capacities.
+std::size_t stream_route_bytes(const RoutedMoeParameters& moe, std::int32_t first,
+                               std::int32_t last) {
+    const auto& routed = moe.profile.routed;
+    return ops::topk_softmax_route_workspace_capacity_bytes(
+        {routed.ffn.hidden, routed.experts, routed.top_k}, first, last);
+}
+
+std::size_t stream_expert_bytes(const RoutedMoeParameters& moe, std::int32_t first,
+                                std::int32_t last) {
+    return ops::routed_swiglu_workspace_capacity_bytes(
+        moe.profile.routed, moe.profile.shared, ops::ExpertSubsetKind::All, DType::BF16,
+        ops::MoeEpilogue::AddResidual, first, last);
+}
+
+std::size_t stream_route_tensor_bytes(const RoutedMoeParameters& moe, std::int32_t last) {
+    const auto top_k  = static_cast<std::size_t>(moe.profile.routed.top_k);
+    const auto tokens = static_cast<std::size_t>(last);
+    return top_k * tokens * sizeof(std::int32_t) + top_k * tokens * sizeof(float) +
+           tokens * sizeof(float) + 512;
+}
+
+void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& residual,
+                  WorkspaceArena& workspace, DeviceExecutionView execution) {
+    const auto columns       = hidden.ne[1];
+    const auto& routed       = moe.profile.routed;
+    auto ids                 = workspace.alloc(DType::I32, {routed.top_k, columns});
+    auto coefficients        = workspace.alloc(DType::FP32, {routed.top_k, columns});
+    auto shared_coefficients = workspace.alloc(DType::FP32, {columns});
+    const auto scratch = workspace.alloc_bytes(std::max(stream_route_bytes(moe, columns, columns),
+                                                        stream_expert_bytes(moe, columns, columns)));
+    const ops::RouteProfile route_profile{routed.ffn.hidden, routed.experts, routed.top_k};
+    ops::ExpertRoutes routes{ids, coefficients};
+    try {
+        MemoryArena arena(MemorySpan{scratch.data, scratch.bytes, execution.device()});
+        ops::topk_softmax_route(hidden, route_profile, moe.control, routes, shared_coefficients,
+                                arena, execution);
+    } catch (const std::exception& error) {
+        throw std::invalid_argument(std::string("expert stream route: ") + error.what());
+    }
+    try {
+        moe.stream->ensure(ids.data, routed.top_k, columns, execution.stream);
+    } catch (const std::exception& error) {
+        throw std::invalid_argument(std::string("expert stream upload: ") + error.what());
+    }
+    try {
+        // streamed bank reproduces for this artifact.
+        MemoryArena arena(MemorySpan{scratch.data, scratch.bytes, execution.device()});
+        // port (sm_89): routed and shared run in one combined plan - measured closest to the
+        // resident path (7.094349 vs 7.096182 for two additive passes).
+        ops::routed_swiglu(hidden, routed, moe.stream->experts(), routes, {},
+                           ops::ScaledSwiGLUTerm{moe.shared, shared_coefficients},
+                           ops::MoeEpilogue::AddResidual, residual, arena, execution);
+    } catch (const std::exception& error) {
+        throw std::invalid_argument(std::string("expert stream run: ") + error.what());
+    }
+}
+
+} // namespace
 
 std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t first,
                                 std::int32_t last, bool mtp) {
@@ -25,6 +89,11 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
                                                         moe->routed_down.qtype, first, last);
     }
     if (const auto* moe = std::get_if<RoutedMoeParameters>(&parameters)) {
+        if (moe->stream) {
+            return stream_route_tensor_bytes(*moe, last) +
+                   std::max(stream_route_bytes(*moe, first, last),
+                            stream_expert_bytes(*moe, first, last));
+        }
         return ops::topk_softmax_swiglu_moe_workspace_capacity_bytes(
             moe->profile, ops::MoeEpilogue::AddResidual, first, last);
     }
@@ -77,6 +146,10 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
         return;
     }
     if (const auto* moe = std::get_if<RoutedMoeParameters>(&parameters)) {
+        if (moe->stream) {
+            streamed_ffn(hidden, *moe, residual, workspace, execution);
+            return;
+        }
         const auto storage =
             workspace.alloc_bytes(ffn_workspace_bytes(parameters, columns, columns));
         MemoryArena scratch(MemorySpan{storage.data, storage.bytes, execution.device()});

@@ -127,6 +127,13 @@ bool MaterializedArtifact::has_device(ObjectHandle handle) const noexcept {
     return handle.index < objects_.size() && objects_[handle.index].device.has_value();
 }
 
+const WeightParent& MaterializedArtifact::streamed_parent(ObjectHandle handle) const {
+    if (handle.index >= streamed_.size() || !streamed_[handle.index]) {
+        throw ArtifactError("object has no streamed weight description");
+    }
+    return *streamed_[handle.index];
+}
+
 MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& plan,
                                  DeviceContext& device, const StartupObserver* startup_observer) {
     if (plan.source != &reader || plan.object_count != reader.directory().objects.size()) {
@@ -144,6 +151,12 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     out.objects_.resize(plan.object_count);
     out.cuda_ordinal_ = device.device;
     out.host_registrations_.resize(plan.object_count);
+    out.streamed_.resize(plan.object_count);
+    for (const auto& placement : plan.streamed_objects) {
+        out.streamed_[placement.object.index] =
+            WeightParent{placement.geometry, nullptr, 0.0F, Device::cpu(), {},
+                         placement.object.index};
+    }
     out.stats_.file_bytes            = reader.file_bytes();
     out.stats_.read_bytes            = plan.prior_read_bytes;
     out.stats_.owned_value_bytes     = plan.owned_value_bytes;

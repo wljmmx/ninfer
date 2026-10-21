@@ -1,5 +1,7 @@
 #include "models/qwen3_5/execution/parameters.h"
 
+#include "models/qwen3_5/execution/expert_stream.h"
+
 #include "core/weight_view.h"
 
 #include <cstdlib>
@@ -117,6 +119,36 @@ public:
         const auto intermediate = gate.shape.at(0);
         if (down.shape.at(1) != intermediate) {
             throw std::invalid_argument("MoE expert down differs in I");
+        }
+        // port (sm_89): a streamed bank has no bytes at load time, so its layout and profile come
+        // from the artifact description instead of a bound parent.
+        if (gate.parts.at(0).parent == nullptr || gate.parts.at(0).parent->data == nullptr) {
+            const auto& gate_parent = *gate.parts.at(0).parent;
+            const auto& down_parent = *down.parts.at(0).parent;
+            const auto columns      = gate_parent.geometry.shape.back();
+            const auto gate_up_layout = describe_weight_bank(
+                gate_parent.geometry,
+                {gate.parts.at(0).begin / columns, count,
+                 static_cast<std::uint64_t>(2 * intermediate),
+                 static_cast<std::uint64_t>(2 * intermediate)});
+            const auto down_columns = down_parent.geometry.shape.back();
+            const auto down_layout  = describe_weight_bank(
+                down_parent.geometry, {down.parts.at(0).begin / down_columns, count,
+                                       static_cast<std::uint64_t>(down.shape.at(0)),
+                                       static_cast<std::uint64_t>(down.shape.at(0))});
+            RoutedMoeParameters streamed;
+            streamed.control = with_context(model_.weight(moe.router).name, [&] {
+                return control_weight(moe);
+            });
+            streamed.shared = shared_weights(moe);
+            streamed.stream = std::make_shared<ExpertStream>(
+                count, gate_up_layout, down_layout, gate_parent.geometry, down_parent.geometry,
+                gate_parent.source_object, down_parent.source_object);
+            streamed.profile = {
+                ops::routed_swiglu_profile(gate_up_layout, down_layout, top_k,
+                                           ops::LinearPolicy::A16Only, ops::LinearPolicy::A16Only),
+                ops::swiglu_profile(streamed.shared)};
+            return streamed;
         }
         const auto gate_up   = expert_bank(gate, count, 2 * intermediate, gate.shape.at(1));
         const auto down_bank = expert_bank(down, count, down.shape.at(0), down.shape.at(1));
