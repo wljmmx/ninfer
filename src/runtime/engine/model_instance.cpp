@@ -39,7 +39,8 @@ void attach_expert_cache(ModelInstance& instance, const EngineOptions& options,
         collect_streams(instance.parameters.mtp->ffn, streams);
     }
     if (streams.empty()) {
-        throw std::invalid_argument("expert cache was requested but no bank streams");
+        // A dense model has no routed bank; the switch then simply does nothing.
+        return;
     }
     instance.expert_source = std::make_unique<artifact::ArtifactExpertReader>(options.artifact_path);
 
