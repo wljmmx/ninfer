@@ -240,6 +240,19 @@ prepare_sparse_moe_weights(const WeightInput& router, const WeightInput& shared_
     const auto down_bank    = single(expert_down);
     const auto shared       = prepare_linear_swiglu_weight(shared_gate, shared_up);
     const auto down         = prepare_linear_weight(shared_down);
+    // The sparse kernels address expert e as rows [e * rows, (e + 1) * rows) of a code plane and
+    // read one scale plane with a fixed per-row stride; they never consult the parent's row
+    // geometry. That only holds for plane-separated storage. A row-split parent (codes and scales
+    // interleaved per row, e.g. the shipped 35B-A3B artifact at 1088 bytes per row) silently read
+    // misaligned codes and zero scales, which turned every MoE layer into a shared-expert-only
+    // layer with no error anywhere. Refuse the layout instead; topk_softmax_swiglu_moe implements
+    // both layouts through the weight bank.
+    for (const auto& backed : {&gate_up_bank.weight, &down_bank.weight, &shared.weight,
+                               &down.weight}) {
+        require(backed->layout != QuantLayout::RowSplit,
+                "sparse MoE requires plane-separated expert weights; a row-split artifact must use "
+                "the grouped implementation");
+    }
     const auto gate_format  = gate_up_bank.weight.qtype;
     const auto down_format  = down_bank.weight.qtype;
     require(router_bank.weight.qtype == QType::BF16 && shared.weight.qtype == QType::Q8_G32_FP16 &&
