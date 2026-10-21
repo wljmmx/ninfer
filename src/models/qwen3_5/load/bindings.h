@@ -39,6 +39,7 @@ public:
     std::vector<PendingWeight> weights;
     // port (sm_89): routed experts are declared without materializing them.
     bool stream_experts = false;
+    bool expert_host_copy = false;
 
 private:
     std::map<std::string, WeightId, std::less<>> parameters_;

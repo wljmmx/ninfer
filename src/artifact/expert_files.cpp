@@ -96,4 +96,39 @@ ExpertFileBank describe_fused_expert_files(const Reader& reader, ObjectHandle ga
     return bank;
 }
 
+ExpertFileBank describe_fused_expert_host(ObjectHandle gate_up_object,
+                                          ObjectHandle down_object,
+                                          const WeightGeometry& gate_up_parent,
+                                          const WeightGeometry& down_parent, std::uint32_t count,
+                                          std::uint32_t gate_up_rows, std::uint32_t down_rows,
+                                          const ExpertBankLayout& layout) {
+    if (!count || count != layout.count || !gate_up_rows || !down_rows) {
+        throw std::invalid_argument("fused expert plan disagrees on the expert count");
+    }
+    ExpertFileBank bank;
+    bank.experts.reserve(count);
+    for (std::uint32_t expert = 0; expert < count; ++expert) {
+        const auto gu = describe_weight_bank(
+            gate_up_parent, {static_cast<std::uint64_t>(expert) * gate_up_rows, 1, gate_up_rows,
+                             gate_up_rows});
+        const auto dn = describe_weight_bank(
+            down_parent, {static_cast<std::uint64_t>(expert) * down_rows, 1, down_rows, down_rows});
+        ExpertFileEntry entry;
+        entry.image_bytes = layout.entry_bytes;
+        const auto chunk = [](ExpertFileEntry& target, const WeightBankPlane& plane,
+                              std::uint32_t object, std::uint64_t image_offset) {
+            if (!plane.expert_bytes) { return; }
+            target.chunks.push_back({object, plane.offset, plane.expert_bytes, image_offset});
+        };
+        chunk(entry, gu.codes, gate_up_object.index, layout.codes.offset);
+        chunk(entry, gu.high, gate_up_object.index, layout.high.offset);
+        chunk(entry, gu.scales, gate_up_object.index, layout.scales.offset);
+        chunk(entry, dn.codes, down_object.index, layout.down_codes.offset);
+        chunk(entry, dn.high, down_object.index, layout.down_high.offset);
+        chunk(entry, dn.scales, down_object.index, layout.down_scales.offset);
+        bank.experts.push_back(std::move(entry));
+    }
+    return bank;
+}
+
 } // namespace ninfer::artifact

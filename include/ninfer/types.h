@@ -203,6 +203,8 @@ struct EngineOptions {
     // port (sm_89): routed expert weights live in the artifact and stream into a Device pool of
     // this many bytes instead of staying resident. Zero keeps every expert resident.
     std::size_t expert_cache_bytes          = 0;
+    // port (sm_89): stream from a retained Host replica instead of the artifact file.
+    bool expert_host_copy                   = false;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     StartupObserver startup_observer;

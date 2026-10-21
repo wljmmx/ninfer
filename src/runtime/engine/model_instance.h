@@ -4,6 +4,7 @@
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/program/runtime_types.h"
 #include "runtime/engine/context_cache/context_cost.h"
+#include "core/expert_file.h"
 #include "runtime/engine/kv_capacity.h"
 
 #include <memory>
@@ -31,6 +32,7 @@ struct ModelInstance {
     // port (sm_89): routed experts stream from the artifact into this shared pool.
     std::unique_ptr<artifact::ArtifactExpertReader> expert_source;
     std::unique_ptr<ExpertCache> expert_cache;
+    std::unique_ptr<ExpertBlobReader> expert_host_source;
 
     ModelInstance(std::unique_ptr<models::qwen3_5::Model> model, const EngineOptions& options);
     ~ModelInstance();

@@ -41,7 +41,7 @@ void ExpertStream::attach(ExpertCache& cache, std::uint32_t bank, const ExpertBa
     }
     cache_ = &cache;
     bank_  = bank;
-    entry_ = &entry;
+    entry_ = entry;
     for (auto& key : keys_) { key.bank = bank; }
     
 
@@ -112,12 +112,12 @@ void ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     {
         const auto origin = cache_->window_origin(bank_);
         const auto base   = static_cast<const std::byte*>(cache_->pool().data) + origin;
-        experts_.bank.gate_up.codes  = base + entry_->codes.offset;
-        experts_.bank.gate_up.high   = entry_->high.bytes ? base + entry_->high.offset : nullptr;
-        experts_.bank.gate_up.scales = base + entry_->scales.offset;
-        experts_.bank.down.codes  = base + entry_->down_codes.offset;
-        experts_.bank.down.high   = entry_->down_high.bytes ? base + entry_->down_high.offset : nullptr;
-        experts_.bank.down.scales = base + entry_->down_scales.offset;
+        experts_.bank.gate_up.codes  = base + entry_.codes.offset;
+        experts_.bank.gate_up.high   = entry_.high.bytes ? base + entry_.high.offset : nullptr;
+        experts_.bank.gate_up.scales = base + entry_.scales.offset;
+        experts_.bank.down.codes  = base + entry_.down_codes.offset;
+        experts_.bank.down.high   = entry_.down_high.bytes ? base + entry_.down_high.offset : nullptr;
+        experts_.bank.down.scales = base + entry_.down_scales.offset;
     }
     // port (sm_89): uploads go through the legacy stream while the compute stream is
     // non-blocking; without settling here nothing orders the next kernel after the copies.

@@ -43,6 +43,11 @@ public:
 
     [[nodiscard]] std::span<const BoundWeight> weight_data() const noexcept { return bound_; }
 
+    // port (sm_89): payload of a Host-resident object, used as the expert cache source.
+    [[nodiscard]] std::span<const std::byte> host_bytes(artifact::ObjectHandle handle) const {
+        return backing_.host_bytes(handle);
+    }
+
     [[nodiscard]] const FrontendResources& resources() const noexcept { return resources_; }
 
     [[nodiscard]] const InstanceInfo& info() const noexcept { return info_; }

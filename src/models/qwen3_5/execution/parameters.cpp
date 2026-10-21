@@ -122,7 +122,8 @@ public:
         }
         // port (sm_89): a streamed bank has no bytes at load time, so its layout and profile come
         // from the artifact description instead of a bound parent.
-        if (gate.parts.at(0).parent == nullptr || gate.parts.at(0).parent->data == nullptr) {
+        if (gate.parts.at(0).parent == nullptr || gate.parts.at(0).parent->data == nullptr ||
+            gate.parts.at(0).parent->device.type() != DeviceType::CUDA) {
             const auto& gate_parent = *gate.parts.at(0).parent;
             const auto& down_parent = *down.parts.at(0).parent;
             const auto columns      = gate_parent.geometry.shape.back();

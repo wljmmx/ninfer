@@ -13,6 +13,8 @@ struct LoadOptions {
     ProposalHead proposal_head     = ProposalHead::Full;
     // port (sm_89): routed experts are not materialized; they stream from the artifact.
     bool stream_experts            = false;
+    // port (sm_89): keep a Host replica as the streamed tier's source.
+    bool expert_host_copy          = false;
 
     bool operator==(const LoadOptions&) const = default;
 
@@ -59,7 +61,8 @@ struct LoadOptions {
             .vision        = options.enable_vision,
             .speculative   = options.speculative.backend,
             .proposal_head = options.speculative.proposal_head,
-            .stream_experts = options.expert_cache_bytes != 0};
+            .stream_experts   = options.expert_cache_bytes != 0,
+            .expert_host_copy = options.expert_host_copy};
 }
 
 } // namespace ninfer::models

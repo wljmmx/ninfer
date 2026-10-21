@@ -57,7 +57,7 @@ private:
 
     ExpertCache* cache_ = nullptr;
     std::uint32_t bank_ = 0;
-    const ExpertBankLayout* entry_ = nullptr;
+    ExpertBankLayout entry_{};
     std::vector<ExpertCacheKey> keys_;
     std::vector<ExpertCacheKey> required_;
     std::unique_ptr<PinnedHostBuffer> route_staging_;

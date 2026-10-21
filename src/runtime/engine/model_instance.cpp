@@ -6,6 +6,7 @@
 #include "core/expert_cache.h"
 #include "core/startup.h"
 #include "models/qwen3_5/execution/expert_stream.h"
+#include "models/qwen3_5/execution/host_expert_reader.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/measurement.h"
 
@@ -42,7 +43,18 @@ void attach_expert_cache(ModelInstance& instance, const EngineOptions& options,
         // A dense model has no routed bank; the switch then simply does nothing.
         return;
     }
-    instance.expert_source = std::make_unique<artifact::ArtifactExpertReader>(options.artifact_path);
+    // port (sm_89): the streamed tier reads either the artifact or a retained Host replica.
+    // port (sm_89): the cache keeps a raw pointer, so the source must outlive it - it lives on
+    // the instance, never on this stack frame.
+    if (options.expert_host_copy) {
+        instance.expert_host_source =
+            std::make_unique<models::qwen3_5::execution::HostExpertReader>(*instance.model);
+    } else {
+        instance.expert_source = std::make_unique<artifact::ArtifactExpertReader>(options.artifact_path);
+    }
+    const auto* source = options.expert_host_copy
+                             ? static_cast<const ExpertBlobReader*>(instance.expert_host_source.get())
+                             : static_cast<const ExpertBlobReader*>(instance.expert_source.get());
 
     std::vector<ExpertBankSpec> specs;
     specs.reserve(streams.size());
@@ -78,7 +90,7 @@ void attach_expert_cache(ModelInstance& instance, const EngineOptions& options,
     }
     instance.expert_cache = std::make_unique<ExpertCache>(
         specs, requirements, device, std::span<const ExpertBankPair>{}, files,
-        instance.expert_source.get());
+        source);
     for (std::size_t i = 0; i < streams.size(); ++i) {
         streams[i]->attach(*instance.expert_cache, static_cast<std::uint32_t>(i),
                            requirements.banks[i]);
@@ -150,6 +162,9 @@ std::size_t current_free_device_bytes(bool wddm_evictable_budget = false,
 EngineOptions normalize_engine_options(EngineOptions options) {
     // port (sm_89): a streamed expert bank uploads and synchronizes inside each layer, which a
     // captured graph cannot contain. The environment names the pool for command-line tools.
+    if (const char* host = std::getenv("NINFER_EXPERT_HOST"); host != nullptr && *host && *host != 0x30) {
+        options.expert_host_copy = true;
+    }
     if (options.expert_cache_bytes == 0) {
         if (const char* value = std::getenv("NINFER_EXPERT_CACHE_MB"); value != nullptr && *value) {
             const auto mib = std::strtoull(value, nullptr, 10);

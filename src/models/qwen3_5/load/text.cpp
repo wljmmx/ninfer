@@ -67,7 +67,9 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& config, const std::string& pr
     out.experts.reserve(moe.num_experts);
     // port (sm_89): when experts stream, they are declared without being read or uploaded.
     const auto residency =
-        b.stream_experts ? artifact::Residency::Streamed : artifact::Residency::Device;
+        b.stream_experts ? (b.expert_host_copy ? artifact::Residency::Host
+                                               : artifact::Residency::Streamed)
+                         : artifact::Residency::Device;
     for (std::uint32_t e = 0; e < moe.num_experts; ++e) {
         const auto ep = p + "experts/" + std::to_string(e) + "/";
         out.experts.push_back({b.parameter(ep + "gate", {ir, h}, {input}, std::nullopt, residency),
