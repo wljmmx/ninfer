@@ -32,6 +32,7 @@ public:
                 cudaStream_t stream);
 
     [[nodiscard]] const ops::CudaSwiGLUExperts& experts() const noexcept { return experts_; }
+    [[nodiscard]] std::uint32_t bank_index() const noexcept { return bank_; }
     // Device-side int32 array, one entry per expert: 1 when the pool holds it.
     [[nodiscard]] const void* resident_mask() const noexcept {
         return mask_device_ ? mask_device_->p : nullptr;

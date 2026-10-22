@@ -65,10 +65,14 @@ public:
             s.gate_up_offsets.assign(banks_[i].entry.count, 0);
             s.down_offsets.assign(banks_[i].entry.count, 0);
 
-            s.gate_up_parent.geometry = banks_[i].gate_up_geometry;
-            s.gate_up_parent.device   = Device::cpu();
-            s.down_parent.geometry    = banks_[i].down_geometry;
-            s.down_parent.device      = Device::cpu();
+            // The arena, not the artifact parent, is the backing these views address: the offset
+            // table runs over the whole slot range, so the span check has to see the arena size.
+            s.gate_up_parent.geometry       = banks_[i].gate_up_geometry;
+            s.gate_up_parent.geometry.bytes = arena_bytes_;
+            s.gate_up_parent.device         = Device::cpu();
+            s.down_parent.geometry          = banks_[i].down_geometry;
+            s.down_parent.geometry.bytes    = arena_bytes_;
+            s.down_parent.device            = Device::cpu();
 
             s.gate_up.parent         = &s.gate_up_parent;
             s.gate_up.layout         = with_packed_planes(banks_[i].gate_up_layout);

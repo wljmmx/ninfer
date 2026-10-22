@@ -87,7 +87,7 @@ void host_routed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe,
     // Publish every expert of this bank into the host arena before the CPU kernels read it.
     std::vector<std::int32_t> all(static_cast<std::size_t>(moe.stream->count()));
     for (std::size_t i = 0; i < all.size(); ++i) { all[i] = static_cast<std::int32_t>(i); }
-    host->ensure(ExpertBankId{0}, all, nullptr);
+    host->ensure(ExpertBankId{moe.stream->bank_index()}, all, nullptr);
 
     const auto bytes = ops::routed_swiglu_workspace_capacity_bytes(
         moe.profile.routed, ops::ExpertSubsetKind::All, tokens, tokens);
@@ -97,7 +97,7 @@ void host_routed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe,
     const auto aligned = (256 - (base & 255)) & 255;
     MemoryArena arena(
         MemorySpan{scratch.data() + aligned, bytes, Device::cpu()});
-    ops::routed_swiglu(x_cpu, moe.profile.routed, host->experts(ExpertBankId{0}), routes_cpu,
+    ops::routed_swiglu(x_cpu, moe.profile.routed, host->experts(ExpertBankId{moe.stream->bank_index()}), routes_cpu,
                        ops::ExpertSubset{ops::ExpertSubsetKind::All, {}}, out_cpu, arena, cpu);
 
     auto delta = workspace.alloc(DType::BF16, {cols, tokens});
