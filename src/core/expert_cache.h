@@ -125,6 +125,8 @@ public:
     [[nodiscard]] std::uint64_t window_origin(std::uint32_t bank) const;
     [[nodiscard]] std::uint64_t uploads() const noexcept;
     [[nodiscard]] std::uint64_t evictions() const noexcept;
+    [[nodiscard]] std::uint64_t hits() const noexcept;
+    [[nodiscard]] std::uint64_t windows() const noexcept;
 
 private:
     struct Impl;

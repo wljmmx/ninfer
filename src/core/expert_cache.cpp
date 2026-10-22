@@ -82,7 +82,7 @@ struct ExpertCache::Impl {
     std::vector<std::size_t> first; // flat entry index of each bank's expert 0
     std::vector<Entry> entries;
     std::vector<ExpertCacheKey> required;
-    std::uint64_t used = 0, uploads = 0, evictions = 0, epoch = 0;
+    std::uint64_t used = 0, uploads = 0, evictions = 0, epoch = 0, hits = 0;
     std::uint64_t slot_bytes = 0;
     std::vector<std::uint64_t> window_of;
     std::vector<std::uint64_t> last_window_use;
@@ -150,7 +150,7 @@ struct ExpertCache::Impl {
     // matrix. Windows are replaced whole: addressing stays affine and no per-expert offset
     // table can go stale while a kernel reads it.
     void ensure_window(std::uint32_t bank) {
-        if (window_of[bank] != kAbsent) { last_window_use[bank] = ++epoch; ++window_hits[bank]; return; }
+        if (window_of[bank] != kAbsent) { last_window_use[bank] = ++epoch; ++window_hits[bank]; ++hits; return; }
         const auto windows = window_count();
         if (windows == 0) { throw std::runtime_error("expert cache holds no complete window"); }
         std::vector<bool> used(windows, false);
@@ -309,6 +309,8 @@ ConstMemorySpan ExpertCache::pool() const {
 }
 std::uint64_t ExpertCache::uploads() const noexcept { return impl_->uploads; }
 std::uint64_t ExpertCache::evictions() const noexcept { return impl_->evictions; }
+std::uint64_t ExpertCache::hits() const noexcept { return impl_->hits; }
+std::uint64_t ExpertCache::windows() const noexcept { return impl_->window_count(); }
 
 } // namespace ninfer
 

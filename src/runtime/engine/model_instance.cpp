@@ -11,6 +11,7 @@
 #include "models/qwen3_5/measurement.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <chrono>
 #include <set>
@@ -103,6 +104,13 @@ void attach_expert_cache(ModelInstance& instance, const EngineOptions& options,
         streams[i]->attach(*instance.expert_cache, static_cast<std::uint32_t>(i),
                            requirements.banks[i]);
     }
+    // port (sm_89): one line that makes the expert tier observable without a debugger.
+    std::fprintf(stderr, "[experts] banks=%zu slot=%llu windows=%llu pool=%lluMiB host=%d\n",
+                 streams.size(),
+                 static_cast<unsigned long long>(instance.expert_cache->slot_bytes()),
+                 static_cast<unsigned long long>(instance.expert_cache->windows()),
+                 static_cast<unsigned long long>(instance.expert_cache->capacity_bytes() >> 20),
+                 int(instance.expert_host_source != nullptr));
 }
 
 void validate_options(const EngineOptions& options) {
