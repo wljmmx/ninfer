@@ -332,6 +332,11 @@ std::uint64_t ExpertCache::uploads() const noexcept { return impl_->uploads; }
 std::uint64_t ExpertCache::evictions() const noexcept { return impl_->evictions; }
 std::uint64_t ExpertCache::hits() const noexcept { return impl_->hits; }
 std::uint64_t ExpertCache::windows() const noexcept { return impl_->window_count(); }
+std::uint32_t ExpertCache::resident_capacity() const noexcept {
+    const auto slots = impl_->config.capacity_bytes / impl_->slot_bytes;
+    const auto widest = impl_->window_slots();
+    return static_cast<std::uint32_t>(std::min<std::uint64_t>(slots, widest));
+}
 
 } // namespace ninfer
 

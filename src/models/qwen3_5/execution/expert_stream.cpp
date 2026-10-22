@@ -92,9 +92,9 @@ void ExpertStream::attach(ExpertCache& cache, std::uint32_t bank, const ExpertBa
 bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32_t tokens,
                           cudaStream_t stream) {
     if (cache_ == nullptr) { throw std::logic_error("expert stream is not attached"); }
-    // One window holds a whole layer, so a pool that cannot hold even one window cannot serve
-    // this bank. Report that instead of letting ensure_window throw from deep inside the upload.
-    if (cache_->windows() == 0) { return false; }
+    // One window holds a whole layer, so a pool that cannot hold every expert of this bank cannot
+    // serve it. Report that instead of letting ensure_window throw from deep inside the upload.
+    if (cache_->resident_capacity() < count_) { return false; }
     const auto values = static_cast<std::size_t>(top_k) * static_cast<std::size_t>(tokens);
     const auto bytes  = values * sizeof(std::int32_t);
     // port (sm_89): the host must know the routed experts before it can publish them, so one

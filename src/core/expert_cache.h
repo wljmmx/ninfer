@@ -118,8 +118,8 @@ public:
     // port (sm_89): the Device pool every published entry lives in. An indexed expert bank points
     // its plane bases into this span and adds `offset(key)` per expert.
     [[nodiscard]] ConstMemorySpan pool() const;
-    // port (sm_89): bytes between two experts of the same bank inside the pool. Banks own a
-    // contiguous run of slots, so a bank is a strided matrix and needs no offset table.
+    // port (sm_89): bytes between two experts of the same bank inside the pool. Banks address
+    // through a per-expert offset table, so this is only the slot alignment unit.
     [[nodiscard]] std::uint64_t slot_bytes() const;
     // port (sm_89): byte origin of a bank window, so a strided bank view can rebase onto it.
     [[nodiscard]] std::uint64_t window_origin(std::uint32_t bank) const;
@@ -127,6 +127,10 @@ public:
     [[nodiscard]] std::uint64_t evictions() const noexcept;
     [[nodiscard]] std::uint64_t hits() const noexcept;
     [[nodiscard]] std::uint64_t windows() const noexcept;
+
+    // Experts of one bank the pool can hold at once. Equals the widest bank when a whole layer
+    // fits; smaller when the pool only holds part of one, which is the case a host tier covers.
+    [[nodiscard]] std::uint32_t resident_capacity() const noexcept;
 
 private:
     struct Impl;
