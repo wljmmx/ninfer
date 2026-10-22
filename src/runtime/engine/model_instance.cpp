@@ -19,8 +19,17 @@
 #include <stdexcept>
 #include <utility>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 namespace ninfer::runtime {
 namespace {
+
+std::uint64_t host_expert_arena_bytes();
 using Clock = std::chrono::steady_clock;
 
 // port (sm_89): a sentinel that asks the engine to size the expert pool from free device memory.
@@ -123,12 +132,13 @@ void attach_expert_cache(ModelInstance& instance, const EngineOptions& options,
                            requirements.banks[i]);
     }
     // port (sm_89): one line that makes the expert tier observable without a debugger.
-    std::fprintf(stderr, "[experts] banks=%zu slot=%llu windows=%llu pool=%lluMiB host=%d\n",
+    std::fprintf(stderr, "[experts] banks=%zu slot=%llu windows=%llu pool=%lluMiB host=%d arena=%lluMiB\n",
                  streams.size(),
                  static_cast<unsigned long long>(instance.expert_cache->slot_bytes()),
                  static_cast<unsigned long long>(instance.expert_cache->windows()),
                  static_cast<unsigned long long>(instance.expert_cache->capacity_bytes() >> 20),
-                 int(instance.expert_host_source != nullptr));
+                 int(instance.expert_host_source != nullptr),
+                 static_cast<unsigned long long>(host_expert_arena_bytes() >> 20));
 }
 
 void validate_options(const EngineOptions& options) {
@@ -175,9 +185,32 @@ void validate_options(const EngineOptions& options) {
     }
 }
 
+std::uint64_t current_free_host_bytes() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status) != 0) { return status.ullAvailPhys; }
+#endif
+    return 0;
+}
+
+// Host-side arena for experts the Device pool cannot hold. Sized from free RAM so a larger machine
+// gets a larger tier, capped so one process cannot claim the whole box; the cap is the knob
+// (NINFER_EXPERT_HOST_ARENA_MB) and anything past the arena streams in from the artifact.
+std::uint64_t host_expert_arena_bytes() {
+    constexpr std::uint64_t kDefaultCap = 8ULL << 30;
+    std::uint64_t cap                   = kDefaultCap;
+    if (const char* value = std::getenv("NINFER_EXPERT_HOST_ARENA_MB"); value != nullptr && *value) {
+        const auto mib = std::strtoull(value, nullptr, 10);
+        if (mib != 0) { cap = mib << 20; }
+    }
+    const auto free_bytes = current_free_host_bytes();
+    if (free_bytes == 0) { return cap; }
+    return std::min<std::uint64_t>(cap, free_bytes / 4);
+}
+
 std::size_t current_free_device_bytes(bool wddm_evictable_budget = false,
-                                     std::size_t weights_bytes = 0) {
-    std::size_t free_bytes  = 0;
+                                     std::size_t weights_bytes = 0) {    std::size_t free_bytes  = 0;
     std::size_t total_bytes = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
 #if defined(_WIN32)
