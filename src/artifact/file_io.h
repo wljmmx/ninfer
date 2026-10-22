@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <mutex>
 #include <span>
 
 namespace ninfer::artifact {
@@ -61,6 +62,9 @@ public:
 
 private:
     std::filesystem::path path_;
+    // Buffered positional reads move the kernel file pointer, so concurrent read_exact callers
+    // must not interleave their seek/read pairs.
+    mutable std::mutex read_mutex_;
 #ifdef _WIN32
     void* file_               = nullptr;  // HANDLE, buffered positional reads
     mutable void* direct_file_ = nullptr; // HANDLE, FILE_FLAG_NO_BUFFERING positional reads

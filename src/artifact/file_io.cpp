@@ -102,6 +102,11 @@ void InputFile::read_exact(std::uint64_t offset, std::span<std::byte> destinatio
         throw ArtifactError(path_.string() + ": read exceeds file length");
     }
 #ifdef _WIN32
+    // The buffered handle is shared by every caller, and SetFilePointerEx followed by ReadFile
+    // is not atomic: without this guard two threads interleave and read each other's offsets,
+    // which shows up as randomly corrupted payloads (a tokenizer that fails to parse at a
+    // different line every run).
+    const std::lock_guard<std::mutex> guard(read_mutex_);
     std::size_t total = 0;
     while (total < destination.size()) {
         const auto amount = static_cast<DWORD>(
