@@ -146,6 +146,9 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
         return;
     }
     if (const auto* moe = std::get_if<RoutedMoeParameters>(&parameters)) {
+        // [probe] W4A8 quantises the routed A operand to int8 per token. Round-trip the MoE input
+        // through that scale so the perplexity cost can be measured before any kernel changes.
+        ops::act_quant_a8_roundtrip_bf16(hidden.data, hidden.ne[0], columns, stream);
         if (moe->stream) {
             streamed_ffn(hidden, *moe, residual, workspace, execution);
             return;
