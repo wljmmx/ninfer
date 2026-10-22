@@ -2,6 +2,8 @@
 
 #include "artifact/file_io.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <utility>
 
@@ -12,6 +14,12 @@ ArtifactExpertReader::ArtifactExpertReader(std::filesystem::path path)
 
 void ArtifactExpertReader::read_entry(const ExpertFileEntry& entry,
                                       std::span<std::byte> destination) const {
+    if (std::getenv("NINFER_HOST_DEBUG")) {
+        std::fprintf(stderr, "[reader] image=%llu dest=%zu at=%p chunks=%zu first_file=%u\n",
+                     static_cast<unsigned long long>(entry.image_bytes), destination.size(),
+                     static_cast<const void*>(destination.data()), entry.chunks.size(),
+                     entry.chunks.empty() ? 0u : entry.chunks.front().file_index);
+    }
     if (destination.size() < entry.image_bytes) {
         throw std::invalid_argument("expert entry image exceeds its destination");
     }
