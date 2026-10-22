@@ -1,6 +1,10 @@
 #include "models/qwen3_5/execution/ffn.h"
 
 #include "models/qwen3_5/execution/expert_stream.h"
+#include "models/qwen3_5/execution/host_expert_residency.h"
+#include "core/cpu/executor.h"
+#include "core/cpu/system.h"
+#include <cstring>
 
 #include "core/layout.h"
 #include "ninfer/ops/linear.h"
@@ -43,6 +47,71 @@ std::size_t stream_route_tensor_bytes(const RoutedMoeParameters& moe, std::int32
            tokens * sizeof(float) + 512;
 }
 
+// Whole-layer host fallback, used when the Device pool cannot hold the layer's expert set at all.
+// The routed term is computed on the CPU over the host tier's experts and added to the residual;
+// the CPU form deliberately excludes residual addition, so that happens here.
+void host_routed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe,
+                     const ops::ExpertRoutes& routes, Tensor& residual, WorkspaceArena& workspace,
+                     DeviceExecutionView execution) {
+    auto* host = moe.stream->host();
+    if (host == nullptr) { throw std::runtime_error("host routed ffn: no host tier"); }
+    const auto cols   = hidden.ne[0];
+    const auto tokens = hidden.ne[1];
+    const auto top_k  = moe.profile.routed.top_k;
+    const auto stream = execution.stream;
+
+    static CpuTopology topology;
+    static CpuExecutor executor(topology, plan_cpu_team(topology.info(), 8));
+    const auto cpu = executor.execution_view();
+
+    std::vector<std::uint16_t> host_x(static_cast<std::size_t>(cols) * tokens);
+    std::vector<std::int32_t> host_ids(static_cast<std::size_t>(top_k) * tokens);
+    std::vector<float> host_coefficients(static_cast<std::size_t>(top_k) * tokens);
+    std::vector<float> host_out(static_cast<std::size_t>(cols) * tokens);
+
+    CUDA_CHECK(cudaMemcpyAsync(host_x.data(), hidden.data, host_x.size() * sizeof(std::uint16_t),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(host_ids.data(), routes.ids.data,
+                               host_ids.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost,
+                               stream));
+    CUDA_CHECK(cudaMemcpyAsync(host_coefficients.data(), routes.coefficients.data,
+                               host_coefficients.size() * sizeof(float), cudaMemcpyDeviceToHost,
+                               stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    Tensor x_cpu(host_x.data(), Device::cpu(), DType::BF16, {cols, tokens});
+    Tensor out_cpu(host_out.data(), Device::cpu(), DType::FP32, {cols, tokens});
+    ops::ExpertRoutes routes_cpu{Tensor(host_ids.data(), Device::cpu(), DType::I32, {top_k, tokens}),
+                            Tensor(host_coefficients.data(), Device::cpu(), DType::FP32, {top_k, tokens})};
+
+    // Publish every expert of this bank into the host arena before the CPU kernels read it.
+    std::vector<std::int32_t> all(static_cast<std::size_t>(moe.stream->count()));
+    for (std::size_t i = 0; i < all.size(); ++i) { all[i] = static_cast<std::int32_t>(i); }
+    host->ensure(ExpertBankId{0}, all, nullptr);
+
+    const auto bytes = ops::routed_swiglu_workspace_capacity_bytes(
+        moe.profile.routed, ops::ExpertSubsetKind::All, tokens, tokens);
+    // The CPU kernels want a 256-byte aligned cursor; a plain vector only guarantees 16.
+    std::vector<std::byte> scratch(bytes + 256);
+    const auto base    = reinterpret_cast<std::uintptr_t>(scratch.data());
+    const auto aligned = (256 - (base & 255)) & 255;
+    MemoryArena arena(
+        MemorySpan{scratch.data() + aligned, bytes, Device::cpu()});
+    ops::routed_swiglu(x_cpu, moe.profile.routed, host->experts(ExpertBankId{0}), routes_cpu,
+                       ops::ExpertSubset{ops::ExpertSubsetKind::All, {}}, out_cpu, arena, cpu);
+
+    auto delta = workspace.alloc(DType::BF16, {cols, tokens});
+    std::vector<std::uint16_t> packed(host_out.size());
+    for (std::size_t i = 0; i < host_out.size(); ++i) {
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &host_out[i], sizeof(bits));
+        packed[i] = static_cast<std::uint16_t>(bits >> 16);
+    }
+    CUDA_CHECK(cudaMemcpyAsync(delta.data, packed.data(), packed.size() * sizeof(std::uint16_t),
+                               cudaMemcpyHostToDevice, stream));
+    ops::residual_add(delta, residual, stream);
+}
+
 void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& residual,
                   WorkspaceArena& workspace, DeviceExecutionView execution) {
     const auto columns       = hidden.ne[1];
@@ -63,8 +132,8 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
     }
     try {
         if (!moe.stream->ensure(ids.data, routed.top_k, columns, execution.stream)) {
-            throw std::invalid_argument(
-                "expert pool cannot hold one layer; raise NINFER_EXPERT_CACHE_MB");
+            host_routed_ffn(hidden, moe, routes, residual, workspace, execution);
+            return;
         }
     } catch (const std::exception& error) {
         throw std::invalid_argument(std::string("expert stream upload: ") + error.what());

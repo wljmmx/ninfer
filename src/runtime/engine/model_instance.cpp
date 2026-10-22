@@ -98,7 +98,11 @@ void attach_expert_cache(ModelInstance& instance, const EngineOptions& options,
     std::uint64_t widest = 0;
     for (const auto& spec : specs) { widest = std::max<std::uint64_t>(widest, spec.count); }
     auto capacity = requested / entry * entry;
-    if (widest != 0) { capacity = capacity / (entry * widest) * (entry * widest); }
+    // A pool that cannot hold a whole layer keeps whatever slots fit and the host tier covers the
+    // rest of the layer; rounding to zero here would refuse a pool that is perfectly usable.
+    if (widest != 0 && capacity / entry >= widest) {
+        capacity = capacity / (entry * widest) * (entry * widest);
+    }
     if (capacity == 0) {
         throw std::invalid_argument("expert cache holds less than one expert window (" +
                                     std::to_string(entry * widest) + " bytes)");
