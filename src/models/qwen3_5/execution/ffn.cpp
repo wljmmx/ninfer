@@ -99,6 +99,21 @@ void host_routed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe,
         MemorySpan{scratch.data() + aligned, bytes, Device::cpu()});
     ops::routed_swiglu(x_cpu, moe.profile.routed, host->experts(ExpertBankId{moe.stream->bank_index()}), routes_cpu,
                        ops::ExpertSubset{ops::ExpertSubsetKind::All, {}}, out_cpu, arena, cpu);
+    if (std::getenv("NINFER_HOST_DEBUG")) {
+        const auto& gu = host->experts(ExpertBankId{moe.stream->bank_index()}).gate_up;
+        const auto probe = gu.plane(gu.layout.codes, static_cast<std::uint32_t>(host_ids[0]));
+        const auto* bytes = static_cast<const std::uint8_t*>(probe.data);
+        std::fprintf(stderr,
+                     "[host] bank=%u expert=%d off=%llu bytes=%llu first8=%02x %02x %02x %02x "
+                     "%02x %02x %02x %02x\n",
+                     moe.stream->bank_index(), host_ids[0],
+                     static_cast<unsigned long long>(gu.expert_offsets[host_ids[0]]),
+                     static_cast<unsigned long long>(probe.bytes),
+                     probe.data ? bytes[0] : 0, probe.data ? bytes[1] : 0,
+                     probe.data ? bytes[2] : 0, probe.data ? bytes[3] : 0,
+                     probe.data ? bytes[4] : 0, probe.data ? bytes[5] : 0,
+                     probe.data ? bytes[6] : 0, probe.data ? bytes[7] : 0);
+    }
 
     auto delta = workspace.alloc(DType::BF16, {cols, tokens});
     std::vector<std::uint16_t> packed(host_out.size());
