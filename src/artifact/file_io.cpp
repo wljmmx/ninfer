@@ -52,7 +52,8 @@ off_t file_offset(std::uint64_t offset) {
 InputFile::InputFile(std::filesystem::path path) : path_(std::move(path)) {
 #ifdef _WIN32
     HANDLE file = ::CreateFileW(path_.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+                                nullptr);
     if (file == INVALID_HANDLE_VALUE) { fail(path_, "open"); }
     file_ = file;
 
@@ -112,8 +113,16 @@ void InputFile::read_exact(std::uint64_t offset, std::span<std::byte> destinatio
         if (!::ReadFile(static_cast<HANDLE>(file_), destination.data() + total, amount, &read,
                         &operation)) {
             const auto error = static_cast<int>(::GetLastError());
-            ::SetLastError(static_cast<DWORD>(error));
-            fail(path_, "read");
+            if (error == ERROR_IO_PENDING) {
+                // An overlapped handle answers pending instead of completing inline; wait for it
+                // rather than treating the submission as a failure.
+                if (!::GetOverlappedResult(static_cast<HANDLE>(file_), &operation, &read, TRUE)) {
+                    fail(path_, "read");
+                }
+            } else {
+                ::SetLastError(static_cast<DWORD>(error));
+                fail(path_, "read");
+            }
         }
         if (read == 0) { throw ArtifactError(path_.string() + ": unexpected EOF"); }
         total += read;
