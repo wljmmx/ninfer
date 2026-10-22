@@ -120,6 +120,10 @@ void host_routed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe,
     for (std::size_t i = 0; i < host_out.size(); ++i) {
         std::uint32_t bits = 0;
         std::memcpy(&bits, &host_out[i], sizeof(bits));
+        // Round to nearest even, the same rule __float2bfloat16_rn applies; truncating biases
+        // every layer downward and compounds over the stack.
+        const std::uint32_t lsb = (bits >> 16) & 1u;
+        bits += 0x7fffu + lsb;
         packed[i] = static_cast<std::uint16_t>(bits >> 16);
     }
     CUDA_CHECK(cudaMemcpyAsync(delta.data, packed.data(), packed.size() * sizeof(std::uint16_t),
