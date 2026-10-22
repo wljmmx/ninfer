@@ -37,6 +37,22 @@ struct Q4SimtDecodeAtom {
         }
     }
 
+    // Eight packed codes -> the eight exact integers (n ^ 8) - 8 as floats, without the group
+    // scale: callers that accumulate a whole quant group let the scale multiply the group's dot
+    // product instead of every weight.
+    __device__ static __forceinline__ void decode_eight(std::uint32_t packed, float (&weights)[8]) {
+        const std::uint32_t word = packed ^ 0x88888888u;
+        const __half2 bias       = __half2half2(__ushort_as_half(0x6408)); // 1032.0
+#pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+            const std::uint32_t bits = ((word >> (4 * pair)) & 0x000f000fu) | 0x64006400u;
+            const __half2 decoded    = __hsub2(half2_from_bits(bits), bias);
+            const float2 values      = __half22float2(decoded);
+            weights[pair]            = values.x;
+            weights[pair + 4]        = values.y;
+        }
+    }
+
     __device__ static __forceinline__ void
     decode_pair(std::uint8_t packed, std::uint16_t scale_bits, float& w0, float& w1) {
         const float scale = __half2float(__ushort_as_half(scale_bits));
@@ -62,6 +78,29 @@ struct Q4MmaDecodeAtom {
             const __nv_bfloat162 value = __floats2bfloat162_rn(static_cast<float>(q0) * scale,
                                                                static_cast<float>(q1) * scale);
             out[i]                     = *reinterpret_cast<const unsigned*>(&value);
+        }
+    }
+
+    // Eight packed codes -> four bf16 pairs holding the exact integers (n ^ 8) - 8; the
+    // caller folds the group scale into the accumulation afterwards. Mirrors
+    // ops::common::Q4MmaDecodeAtom::decode_eight, which this translation unit cannot include.
+    static __device__ __forceinline__ void decode_eight(unsigned word, unsigned (&out)[4]) {
+        const unsigned kBias  = 0x43084308u; // bf16 136.0 in both halves
+        const unsigned kMagic = 0x43004300u; // bf16 128.0 in both halves
+        word ^= 0x88888888u;
+        const unsigned lo        = word & 0x0f0f0f0fu;
+        const unsigned hi        = (word >> 4) & 0x0f0f0f0fu;
+        const unsigned even      = __byte_perm(lo, hi, 0x5140);
+        const unsigned odd       = __byte_perm(lo, hi, 0x7362);
+        const unsigned biased[4] = {
+            __byte_perm(even, kMagic, 0x7150), __byte_perm(even, kMagic, 0x7372),
+            __byte_perm(odd, kMagic, 0x7150), __byte_perm(odd, kMagic, 0x7372)};
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const __nv_bfloat162 value =
+                __hsub2(*reinterpret_cast<const __nv_bfloat162*>(&biased[i]),
+                        *reinterpret_cast<const __nv_bfloat162*>(&kBias));
+            out[i] = *reinterpret_cast<const unsigned*>(&value);
         }
     }
 

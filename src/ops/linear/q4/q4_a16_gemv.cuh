@@ -74,11 +74,14 @@ q4_gemv_consume_word_tile(const uint4* __restrict__ shared_codes,
         if (local_group < active_groups) {
             const std::uint32_t packed     = packed_words[group_base * 8 + lane];
             const std::uint32_t scale_pair = shared_scale_pairs[local_group >> 1];
-            const std::uint16_t scale_bits =
-                static_cast<std::uint16_t>(scale_pair >> ((local_group & 1) * 16));
+            const float scale              = __half2float(__ushort_as_half(
+                static_cast<std::uint16_t>(scale_pair >> ((local_group & 1) * 16))));
 
+            // Every lane of a group shares the group scale, so the weights stay exact integers
+            // and the scale multiplies this lane's group dot product once: eight fma plus one
+            // more fma, instead of eight multiplies plus eight fma.
             float weights[8];
-            Q4SimtDecodeAtom::decode_eight(packed, scale_bits, weights);
+            Q4SimtDecodeAtom::decode_eight(packed, weights);
 
             const int k_begin =
                 (group_begin + local_group) * Q4RowSplitStorage::kGroupK + lane_in_group * 8;
@@ -88,14 +91,16 @@ q4_gemv_consume_word_tile(const uint4* __restrict__ shared_codes,
             const float2 x2             = bf16x2_bits_to_float2(activation_bits.z);
             const float2 x3             = bf16x2_bits_to_float2(activation_bits.w);
 
-            accumulator = fmaf(weights[0], x0.x, accumulator);
-            accumulator = fmaf(weights[1], x0.y, accumulator);
-            accumulator = fmaf(weights[2], x1.x, accumulator);
-            accumulator = fmaf(weights[3], x1.y, accumulator);
-            accumulator = fmaf(weights[4], x2.x, accumulator);
-            accumulator = fmaf(weights[5], x2.y, accumulator);
-            accumulator = fmaf(weights[6], x3.x, accumulator);
-            accumulator = fmaf(weights[7], x3.y, accumulator);
+            float partial = 0.0f;
+            partial = fmaf(weights[0], x0.x, partial);
+            partial = fmaf(weights[1], x0.y, partial);
+            partial = fmaf(weights[2], x1.x, partial);
+            partial = fmaf(weights[3], x1.y, partial);
+            partial = fmaf(weights[4], x2.x, partial);
+            partial = fmaf(weights[5], x2.y, partial);
+            partial = fmaf(weights[6], x3.x, partial);
+            partial = fmaf(weights[7], x3.y, partial);
+            accumulator = fmaf(partial, scale, accumulator);
         }
     }
     return accumulator;

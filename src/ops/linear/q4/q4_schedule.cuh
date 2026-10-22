@@ -48,9 +48,20 @@ enum class Q4ScaleLoad {
     Pair32,
 };
 
+// Where the per-group weight scale is applied. Decode folds it into the bf16 weights as they
+// are materialised. PostMma keeps the decoded weights as exact integers and multiplies the
+// tile's MMA result by the group scale instead: one multiply per output element rather than
+// one per weight, and no bf16 rounding of the product. It costs a second accumulator for
+// the tile and changes the rounding of the result, so it is opt-in per schedule.
+enum class Q4ScaleApply {
+    Decode,
+    PostMma,
+};
+
 template <int BlockRows, int BlockTokens, int BlockK, int WarpRows, int WarpTokens, int Stages,
           int MinBlocksPerSm, Q4MmaFragmentPipeline FragmentPipeline, Cache WeightCache,
-          Cache ActivationCache, Q4ScaleLoad ScaleLoadMode, int ActivationStages = Stages>
+          Cache ActivationCache, Q4ScaleLoad ScaleLoadMode, int ActivationStages = Stages,
+          Q4ScaleApply ScaleApply = Q4ScaleApply::Decode>
 struct Q4A16MmaSchedule {
     static constexpr int kBlockRows   = BlockRows;
     static constexpr int kBlockTokens = BlockTokens;
@@ -65,6 +76,7 @@ struct Q4A16MmaSchedule {
     static constexpr Cache kActivationCache                  = ActivationCache;
     static constexpr Q4ScaleLoad kScaleLoadMode              = ScaleLoadMode;
     static constexpr int kActivationStages                   = ActivationStages;
+    static constexpr Q4ScaleApply kScaleApply                = ScaleApply;
 
     static constexpr int kWarpGridRows   = kBlockRows / kWarpRows;
     static constexpr int kWarpGridTokens = kBlockTokens / kWarpTokens;
@@ -95,6 +107,11 @@ struct Q4A16MmaSchedule {
                   "Q4 MMA activation staging is single-buffered or follows the quant pipeline");
     static_assert(kActivationStages == kStages || kStages < 8,
                   "Q4 single-buffered activations need a separate async group");
+    static_assert(kScaleApply == Q4ScaleApply::Decode || kGroupsPerK == 1,
+                  "post-MMA scaling assumes the whole K tile shares one quant group");
+    static_assert(kScaleApply == Q4ScaleApply::Decode || kActivationStages == kStages,
+                  "post-MMA scaling reads the staged scales after the tile's MMA, so the "
+                  "scale stage must not be refilled while the tile is in flight");
     static_assert(kMinBlocksPerSm >= 1);
     static_assert(kWarps >= 1 && kThreads <= 1024);
     static_assert(kSharedBytes <= 48 * 1024,

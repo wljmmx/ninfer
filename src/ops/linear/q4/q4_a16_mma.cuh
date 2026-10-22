@@ -40,6 +40,11 @@ void q4_a16_mma_kernel(
     constexpr int BS     = Schedule::kActivationStages;
     constexpr int GPB    = Schedule::kGroupsPerK;
     constexpr int SB     = Schedule::kScaleBytes;
+    constexpr bool kPostScale = Schedule::kScaleApply == Q4ScaleApply::PostMma;
+    static_assert(!kPostScale || GPB == 1,
+                  "post-MMA scaling needs exactly one quantisation group per K tile");
+    static_assert(!kPostScale || BS == S,
+                  "post-MMA scaling reads the staged scales after the tile's MMA");
 
     __shared__ __align__(16) __nv_bfloat16 As[BM * BK];
     __shared__ __align__(16) __nv_bfloat16 Bs[BS][BN * BK];
@@ -198,24 +203,44 @@ void q4_a16_mma_kernel(
         stage_quant(stage, k_tile);
     };
 
-    auto decode_weight = [&](int stage, int k_tile) {
+    // One thread decodes a whole eight-code chunk and stores it with a single 16-byte write.
+    // q4_mma_swizzle_k64 permutes whole eight-element runs, so a chunk stays contiguous in As,
+    // and a chunk never straddles a quantisation group. Folding the group scale into the
+    // weights keeps this bit-identical to the per-lane decode it replaces.
+    constexpr int kChunksPerGroup = Q4RowSplitStorage::kChunksPerGroup;
+    static_assert(GPB * kChunksPerGroup * 8 == BK,
+                  "the tile's quant groups must decode to exactly its K width");
+
+    auto scale_offset = [&](int k_tile, int group) {
         const int scale_group = (k_tile * BK) / Q4RowSplitStorage::kGroupK;
-        for (int local_row = warp; local_row < BM; local_row += Schedule::kWarps) {
-            auto* dst = &As[local_row * BK];
-#pragma unroll
-            for (int group = 0; group < GPB; ++group) {
-                const int staged_group = local_row * GPB + group;
-                const std::uint8_t* scale_ptr =
-                    &Sr[stage][staged_group * SB + (Schedule::kScaleLoadMode == Q4ScaleLoad::Pair32
-                                                        ? ((scale_group + group) & 1) *
-                                                              Q4RowSplitStorage::kScaleBytesPerGroup
-                                                        : 0)];
-                const __nv_bfloat162 weights =
-                    Q4MmaDecodeAtom::decode_pair(Cr[stage], scale_ptr, staged_group, lane);
-                const int shared_col =
-                    q4_mma_swizzle_k64(local_row, group * Q4RowSplitStorage::kGroupK + 2 * lane);
-                store_vec(&dst[shared_col], weights);
+        return Schedule::kScaleLoadMode == Q4ScaleLoad::Pair32
+                   ? ((scale_group + group) & 1) * Q4RowSplitStorage::kScaleBytesPerGroup
+                   : 0;
+    };
+
+    auto decode_weight = [&](int stage, int k_tile) {
+        for (int item = tid; item < BM * GPB * kChunksPerGroup; item += Schedule::kThreads) {
+            const int staged_group = item / kChunksPerGroup;
+            const int chunk        = item - staged_group * kChunksPerGroup;
+            const int local_row    = staged_group / GPB;
+            const int group        = staged_group - local_row * GPB;
+            const unsigned word    = *reinterpret_cast<const unsigned*>(
+                &Cr[stage][staged_group * Q4RowSplitStorage::kCodeBytesPerGroup +
+                           chunk * Q4RowSplitStorage::kCodeBytesPerChunk]);
+            unsigned decoded[4];
+            if constexpr (kPostScale) {
+                Q4MmaDecodeAtom::decode_eight(word, decoded);
+            } else {
+                const float scale = __half2float(__ushort_as_half(
+                    *reinterpret_cast<const std::uint16_t*>(
+                        &Sr[stage][staged_group * SB + scale_offset(k_tile, group)])));
+                Q4MmaDecodeAtom::decode_eight(word, scale, decoded);
             }
+            store_vec(&As[local_row * BK +
+                          q4_mma_swizzle_k64(local_row, group * Q4RowSplitStorage::kGroupK +
+                                             chunk * 8)],
+                      make_int4(static_cast<int>(decoded[0]), static_cast<int>(decoded[1]),
+                                static_cast<int>(decoded[2]), static_cast<int>(decoded[3])));
         }
     };
 
@@ -271,6 +296,11 @@ void q4_a16_mma_kernel(
             }
         };
 
+        // Post-Mma scaling keeps the tile's products in `partial` and folds the group scale
+        // into `accum` once per output element; the decode path accumulates straight into
+        // `accum` and leaves `partial` dead.
+        float partial[MT][NT][4] = {};
+        auto& tile_acc           = kPostScale ? partial : accum;
         if constexpr (Schedule::kFragmentPipeline == Q4MmaFragmentPipeline::PingPong) {
             unsigned a_frag[2][MT][4];
             unsigned b_frag[2][NT][2];
@@ -284,10 +314,11 @@ void q4_a16_mma_kernel(
                 for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
                     for (int ni = 0; ni < NT; ++ni) {
-                        mma_bf16(accum[mi][ni][0], accum[mi][ni][1], accum[mi][ni][2],
-                                 accum[mi][ni][3], a_frag[current][mi][0], a_frag[current][mi][1],
-                                 a_frag[current][mi][2], a_frag[current][mi][3],
-                                 b_frag[current][ni][0], b_frag[current][ni][1]);
+                        mma_bf16(tile_acc[mi][ni][0], tile_acc[mi][ni][1], tile_acc[mi][ni][2],
+                                 tile_acc[mi][ni][3], a_frag[current][mi][0],
+                                 a_frag[current][mi][1], a_frag[current][mi][2],
+                                 a_frag[current][mi][3], b_frag[current][ni][0],
+                                 b_frag[current][ni][1]);
                     }
                 }
             }
@@ -301,10 +332,33 @@ void q4_a16_mma_kernel(
                 for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
                     for (int ni = 0; ni < NT; ++ni) {
-                        mma_bf16(accum[mi][ni][0], accum[mi][ni][1], accum[mi][ni][2],
-                                 accum[mi][ni][3], a_frag[mi][0], a_frag[mi][1], a_frag[mi][2],
-                                 a_frag[mi][3], b_frag[ni][0], b_frag[ni][1]);
+                        mma_bf16(tile_acc[mi][ni][0], tile_acc[mi][ni][1], tile_acc[mi][ni][2],
+                                 tile_acc[mi][ni][3], a_frag[mi][0], a_frag[mi][1],
+                                 a_frag[mi][2], a_frag[mi][3], b_frag[ni][0],
+                                 b_frag[ni][1]);
                     }
+                }
+            }
+        }
+
+        if constexpr (kPostScale) {
+            const int off = scale_offset(k_tile, 0);
+#pragma unroll
+            for (int mi = 0; mi < MT; ++mi) {
+                const int row0 = warp_row * WM + mi * 16 + mma_row;
+                const int row1 = row0 + 8;
+                const float scale0 = __half2float(__ushort_as_half(
+                    *reinterpret_cast<const std::uint16_t*>(
+                        &Sr[stage][(row0 * GPB + 0) * SB + off])));
+                const float scale1 = __half2float(__ushort_as_half(
+                    *reinterpret_cast<const std::uint16_t*>(
+                        &Sr[stage][(row1 * GPB + 0) * SB + off])));
+#pragma unroll
+                for (int ni = 0; ni < NT; ++ni) {
+                    accum[mi][ni][0] = fmaf(partial[mi][ni][0], scale0, accum[mi][ni][0]);
+                    accum[mi][ni][1] = fmaf(partial[mi][ni][1], scale0, accum[mi][ni][1]);
+                    accum[mi][ni][2] = fmaf(partial[mi][ni][2], scale1, accum[mi][ni][2]);
+                    accum[mi][ni][3] = fmaf(partial[mi][ni][3], scale1, accum[mi][ni][3]);
                 }
             }
         }

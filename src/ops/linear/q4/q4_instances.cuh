@@ -25,9 +25,9 @@ using MmaR32T64K64Wr16Wt32S3A3B2 =
     Q4A16MmaSchedule<32, 64, 64, 16, 32, 3, 2, Q4MmaFragmentPipeline::Serial, Cache::cg, Cache::cg,
                      Q4ScaleLoad::Pair32>;
 
-using MmaR64T64K64Wr32Wt16S2A2B2 =
-    Q4A16MmaSchedule<64, 64, 64, 32, 16, 2, 2, Q4MmaFragmentPipeline::Serial, Cache::cg, Cache::cg,
-                     Q4ScaleLoad::Pair32>;
+// Every 64-token tile runs the 128-wide K tile: the barrier count per unit of K halves,
+// which is worth 40% once the weights stream from HBM and 5% while they stay in L2. The
+// instance lives with the other K128 schedules below (MmaR64T64K128S2A1).
 
 using SlicedK5120T16 = Q4A16SlicedKMmaSchedule<16, 16, 8, 1, Cache::cg, Cache::ca, 6, 5120, 16>;
 using SlicedK5120T24 = Q4A16SlicedKMmaSchedule<16, 24, 8, 1, Cache::cg, Cache::ca, 6, 5120, 24>;
@@ -35,9 +35,12 @@ using SlicedK2048T4  = Q4A16SlicedKMmaSchedule<16, 8, 8, 1, Cache::cg, Cache::ca
 
 using SlicedK5120T4 = Q4A16SlicedKMmaSchedule<16, 8, 8, 1, Cache::cg, Cache::ca, 6, 5120, 4>;
 
+// The 48-token tile is narrow enough that folding the group scale into the tile's MMA result,
+// rather than into every weight, is a measured win (-5.5% warm L2, level cold); wider tiles keep
+// the decode fold because their accumulator would cost more than the decode there.
 using MmaR64T48K64Wr16Wt16S2A2B2 =
     Q4A16MmaSchedule<64, 48, 64, 16, 16, 2, 2, Q4MmaFragmentPipeline::Serial, Cache::cg, Cache::cg,
-                     Q4ScaleLoad::Pair32>;
+                     Q4ScaleLoad::Pair32, 2, Q4ScaleApply::PostMma>;
 
 using MmaR64T72K64Wr32Wt24S2A2B2 =
     Q4A16MmaSchedule<64, 72, 64, 32, 24, 2, 2, Q4MmaFragmentPipeline::Serial, Cache::cg, Cache::cg,
@@ -45,9 +48,11 @@ using MmaR64T72K64Wr32Wt24S2A2B2 =
 using MmaR64T80K64Wr16Wt40S2A2B1 =
     Q4A16MmaSchedule<64, 80, 64, 16, 40, 2, 1, Q4MmaFragmentPipeline::Serial, Cache::cg, Cache::cg,
                      Q4ScaleLoad::Pair32>;
-using MmaR64T96K64Wr32Wt16S2A2B1 =
-    Q4A16MmaSchedule<64, 96, 64, 32, 16, 2, 1, Q4MmaFragmentPipeline::Serial, Cache::cg, Cache::cg,
-                     Q4ScaleLoad::Pair32>;
+// 96 tokens is the widest tile that still fits the 48 KiB static budget with a 128-wide K
+// tile, and that only at 32 rows: -13% once the weights stream, -5% while they sit in L2.
+using MmaR32T96K128Wr16Wt16S2A1B2 =
+    Q4A16MmaSchedule<32, 96, 128, 16, 16, 2, 2, Q4MmaFragmentPipeline::Serial, Cache::cg,
+                     Cache::cg, Q4ScaleLoad::Pair32, 1>;
 using MmaR64T112K64Wr32Wt16S2A2B1 =
     Q4A16MmaSchedule<64, 112, 64, 32, 16, 2, 1, Q4MmaFragmentPipeline::Serial, Cache::cg, Cache::cg,
                      Q4ScaleLoad::Pair32>;
@@ -60,8 +65,11 @@ using MmaR64T120K64Wr32Wt24S2A2B1 =
 using MmaR64T120K64Wr16Wt120S2A2B1 =
     Q4A16MmaSchedule<64, 120, 64, 16, 120, 2, 1, Q4MmaFragmentPipeline::Serial, Cache::cg,
                      Cache::cg, Q4ScaleLoad::Pair32>;
-using MmaR64T128K64Wr64Wt32S2A2B1 =
-    Q4A16MmaSchedule<64, 128, 64, 64, 32, 2, 1, Q4MmaFragmentPipeline::Serial, Cache::cg, Cache::cg,
+// A 128-wide K tile does not fit beside a 128-token activation stage, so this tile splits
+// the block into eight warps instead of four: two more warps per SM schedule the same work,
+// worth -7% streaming and -3% in L2.
+using MmaR64T128K64Wr32Wt32S2A2B1 =
+    Q4A16MmaSchedule<64, 128, 64, 32, 32, 2, 1, Q4MmaFragmentPipeline::Serial, Cache::cg, Cache::cg,
                      Q4ScaleLoad::Pair32>;
 
 using SlicedR16T8W4S2      = Q4A16SlicedKMmaSchedule<16, 8, 4, 2, Cache::cg, Cache::ca, 2>;
