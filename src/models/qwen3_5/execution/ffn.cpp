@@ -100,6 +100,14 @@ void host_routed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe,
     ops::routed_swiglu(x_cpu, moe.profile.routed, host->experts(ExpertBankId{moe.stream->bank_index()}), routes_cpu,
                        ops::ExpertSubset{ops::ExpertSubsetKind::All, {}}, out_cpu, arena, cpu);
     if (std::getenv("NINFER_HOST_DEBUG")) {
+        std::fprintf(stderr, "[host-x] bank=%u x0..3=%.6f %.6f %.6f %.6f\n",
+                     moe.stream->bank_index(),
+                     __bfloat162float(__ushort_as_bfloat16(host_x[0])),
+                     __bfloat162float(__ushort_as_bfloat16(host_x[1])),
+                     __bfloat162float(__ushort_as_bfloat16(host_x[2])),
+                     __bfloat162float(__ushort_as_bfloat16(host_x[3])));
+    }
+    if (std::getenv("NINFER_HOST_DEBUG")) {
         const auto& gu = host->experts(ExpertBankId{moe.stream->bank_index()}).gate_up;
         const auto probe = gu.plane(gu.layout.codes, static_cast<std::uint32_t>(host_ids[0]));
         std::fprintf(stderr, "[host] bank=%u base=%p plane=%p off=%llu delta=%lld first4=%02x %02x %02x %02x\n",
@@ -129,6 +137,13 @@ void host_routed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe,
     CUDA_CHECK(cudaMemcpyAsync(delta.data, packed.data(), packed.size() * sizeof(std::uint16_t),
                                cudaMemcpyHostToDevice, stream));
     ops::residual_add(delta, residual, stream);
+    if (std::getenv("NINFER_HOST_DEBUG")) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        float probe[4] = {};
+        CUDA_CHECK(cudaMemcpy(probe, residual.data, sizeof(probe), cudaMemcpyDeviceToHost));
+        std::fprintf(stderr, "[host-residual] bank=%u r0..3=%.6f %.6f %.6f %.6f\n",
+                     moe.stream->bank_index(), probe[0], probe[1], probe[2], probe[3]);
+    }
 }
 
 void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& residual,
@@ -174,6 +189,21 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
                            ops::MoeEpilogue::AddResidual, residual, arena, execution);
     } catch (const std::exception& error) {
         throw std::invalid_argument(std::string("expert stream run: ") + error.what());
+    }
+    if (std::getenv("NINFER_HOST_DEBUG")) {
+        std::uint16_t host_hidden[4] = {};
+        CUDA_CHECK(cudaMemcpy(host_hidden, hidden.data, sizeof(host_hidden),
+                              cudaMemcpyDeviceToHost));
+        std::fprintf(stderr, "[hidden] bank=%u x0..3=%.6f %.6f %.6f %.6f\n",
+                     moe.stream->bank_index(),
+                     __bfloat162float(__ushort_as_bfloat16(host_hidden[0])),
+                     __bfloat162float(__ushort_as_bfloat16(host_hidden[1])),
+                     __bfloat162float(__ushort_as_bfloat16(host_hidden[2])),
+                     __bfloat162float(__ushort_as_bfloat16(host_hidden[3])));
+        float probe[4] = {};
+        CUDA_CHECK(cudaMemcpy(probe, residual.data, sizeof(probe), cudaMemcpyDeviceToHost));
+        std::fprintf(stderr, "[residual] bank=%u r0..3=%.6f %.6f %.6f %.6f\n",
+                     moe.stream->bank_index(), probe[0], probe[1], probe[2], probe[3]);
     }
 }
 
