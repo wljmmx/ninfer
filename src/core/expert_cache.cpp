@@ -211,18 +211,39 @@ struct ExpertCache::Impl {
             if (candidate.image_bytes) { file = &candidate; }
         }
         if (file) {
-            // The artifact is the source: one fetch into pinned staging, one copy to the pool.
-            if (!staging || file->image_bytes > staging->size()) {
-                throw std::runtime_error("expert file image exceeds the staging buffer");
+            // port (sm_89): a source that already holds the bytes in place (the Host replica)
+            // names the slices, so the transfer goes straight from host memory to the pool.
+            std::vector<ExpertBlobSpan> direct;
+            if (file_reader->spans(*file, direct) && !direct.empty()) {
+                for (const auto& span : direct) {
+                    if (span.image_offset > file->image_bytes ||
+                        span.bytes > file->image_bytes - span.image_offset) {
+                        throw std::runtime_error("expert span lies outside its entry image");
+                    }
+                    const auto copied =
+                        cudaMemcpyAsync(base + span.image_offset, span.source,
+                                        static_cast<std::size_t>(span.bytes),
+                                        cudaMemcpyHostToDevice, stream);
+                    if (copied != cudaSuccess) {
+                        throw std::runtime_error(cudaGetErrorString(copied));
+                    }
+                }
+                const auto settled = cudaStreamSynchronize(stream);
+                if (settled != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(settled)); }
+            } else {
+                // The artifact is the source: one fetch into staging, one copy to the pool.
+                if (!staging || file->image_bytes > staging->size()) {
+                    throw std::runtime_error("expert file image exceeds the staging buffer");
+                }
+                file_reader->read_entry(
+                    *file, {static_cast<std::byte*>(staging->data()),
+                            static_cast<std::size_t>(file->image_bytes)});
+                const auto status = cudaMemcpyAsync(base, staging->data(),
+                                                    static_cast<std::size_t>(file->image_bytes),
+                                                    cudaMemcpyHostToDevice, stream);
+                if (status == cudaSuccess) { (void)cudaStreamSynchronize(stream); }
+                if (status != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(status)); }
             }
-            file_reader->read_entry(
-                *file, {static_cast<std::byte*>(staging->data()),
-                        static_cast<std::size_t>(file->image_bytes)});
-            const auto status = cudaMemcpyAsync(base, staging->data(),
-                                           static_cast<std::size_t>(file->image_bytes),
-                                           cudaMemcpyHostToDevice, stream);
-            if (status == cudaSuccess) { (void)cudaStreamSynchronize(stream); }
-            if (status != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(status)); }
         } else {
             const auto& view = views[key.bank];
             if (!view.gate_up.valid() || !view.down.valid()) {

@@ -34,6 +34,20 @@ public:
         }
     }
 
+    // port (sm_89): name the payload slices so the uploader can DMA them without a staging copy.
+    bool spans(const ExpertFileEntry& entry, std::vector<ExpertBlobSpan>& out) const override {
+        out.clear();
+        out.reserve(entry.chunks.size());
+        for (const auto& chunk : entry.chunks) {
+            const auto bytes = model_.host_bytes(artifact::ObjectHandle{chunk.file_index});
+            if (chunk.file_offset > bytes.size() || chunk.bytes > bytes.size() - chunk.file_offset) {
+                return false;
+            }
+            out.push_back({bytes.data() + chunk.file_offset, chunk.bytes, chunk.image_offset});
+        }
+        return true;
+    }
+
 private:
     const Model& model_;
 };

@@ -29,6 +29,13 @@ struct ExpertFileBank {
     std::vector<ExpertFileEntry> experts;
 };
 
+// port (sm_89): one slice of an entry image that a reader can point at in place.
+struct ExpertBlobSpan {
+    const void* source     = nullptr;
+    std::uint64_t bytes    = 0;
+    std::uint64_t image_offset = 0;
+};
+
 // Synchronous artifact reader used by the file tier. Implementations block the uploading
 // host thread; they never run inside capture.
 class ExpertBlobReader {
@@ -36,6 +43,13 @@ public:
     virtual ~ExpertBlobReader() = default;
     // `destination` is exactly entry.image_bytes.
     virtual void read_entry(const ExpertFileEntry& entry, std::span<std::byte> destination) const = 0;
+    // port (sm_89): a source that already holds the bytes in place (the Host replica) can name
+    // them instead of copying through a staging buffer.
+    virtual bool spans(const ExpertFileEntry& entry, std::vector<ExpertBlobSpan>& out) const {
+        (void)entry;
+        (void)out;
+        return false;
+    }
 };
 
 } // namespace ninfer
