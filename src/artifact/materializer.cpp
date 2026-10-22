@@ -192,6 +192,9 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                 read_divisor(reader, placement.object, geometry, storage.host_data, out.stats_);
             storage.host = WeightParent{geometry, storage.host_data.data(), divisor};
         storage.host->device = Device::cpu();
+        // port (sm_89): a Host-resident object names itself, so a host-backed tier can map a
+        // bank chunk back to this payload instead of assuming object 0.
+        storage.host->source_object = placement.object.index;
         }
     }
     std::vector<CopyRange> ranges;

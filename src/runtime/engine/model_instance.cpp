@@ -78,15 +78,23 @@ void attach_expert_cache(ModelInstance& instance, const EngineOptions& options,
 
     std::vector<ExpertFileBank> files;
     files.reserve(streams.size());
+    // port (sm_89): the bank description must match the reader that was created above. A host
+    // tier has no artifact reader at all, so asking it for one dereferences a null pointer.
+    const bool host_tier = instance.expert_host_source != nullptr;
     for (std::size_t i = 0; i < streams.size(); ++i) {
         const auto* stream = streams[i];
-        files.push_back(artifact::describe_fused_expert_files(
-            instance.expert_source->reader(), artifact::ObjectHandle{stream->gate_up_object()},
-            artifact::ObjectHandle{stream->down_object()}, stream->gate_up_parent(),
-            stream->down_parent(), stream->count(),
-            static_cast<std::uint32_t>(stream->gate_up_layout().region.rows),
-            static_cast<std::uint32_t>(stream->down_layout().region.rows),
-            requirements.banks[i]));
+        const auto gate_up = artifact::ObjectHandle{stream->gate_up_object()};
+        const auto down    = artifact::ObjectHandle{stream->down_object()};
+        const auto gu_rows = static_cast<std::uint32_t>(stream->gate_up_layout().region.rows);
+        const auto dn_rows = static_cast<std::uint32_t>(stream->down_layout().region.rows);
+        files.push_back(host_tier
+                            ? artifact::describe_fused_expert_host(
+                                  gate_up, down, stream->gate_up_parent(), stream->down_parent(),
+                                  stream->count(), gu_rows, dn_rows, requirements.banks[i])
+                            : artifact::describe_fused_expert_files(
+                                  instance.expert_source->reader(), gate_up, down,
+                                  stream->gate_up_parent(), stream->down_parent(), stream->count(),
+                                  gu_rows, dn_rows, requirements.banks[i]));
     }
     instance.expert_cache = std::make_unique<ExpertCache>(
         specs, requirements, device, std::span<const ExpertBankPair>{}, files,

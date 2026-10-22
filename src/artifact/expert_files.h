@@ -29,4 +29,11 @@ namespace ninfer::artifact {
     const WeightGeometry& gate_up_parent, const WeightGeometry& down_parent, std::uint32_t count,
     std::uint32_t gate_up_rows, std::uint32_t down_rows, const ExpertBankLayout& layout);
 
+// port (sm_89): the same mapping over a retained Host replica. Chunks carry the object index and
+// the payload offset, so one reader serves a host-backed tier.
+[[nodiscard]] ExpertFileBank describe_fused_expert_host(
+    ObjectHandle gate_up_object, ObjectHandle down_object, const WeightGeometry& gate_up_parent,
+    const WeightGeometry& down_parent, std::uint32_t count, std::uint32_t gate_up_rows,
+    std::uint32_t down_rows, const ExpertBankLayout& layout);
+
 } // namespace ninfer::artifact
