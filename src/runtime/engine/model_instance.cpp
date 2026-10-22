@@ -7,6 +7,7 @@
 #include "core/startup.h"
 #include "models/qwen3_5/execution/expert_stream.h"
 #include "models/qwen3_5/execution/host_expert_reader.h"
+#include "models/qwen3_5/execution/host_expert_residency.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/measurement.h"
 

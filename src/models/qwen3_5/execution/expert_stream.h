@@ -11,6 +11,8 @@
 
 namespace ninfer::models::qwen3_5::execution {
 
+class HostExpertResidency;
+
 // port (sm_89): one routed-expert bank whose weights stay in the artifact and stream into a
 // shared Device pool. The bank description is fixed at startup; only the per-expert offset table
 // is republished as the resident set changes.
@@ -36,6 +38,9 @@ public:
     }
     [[nodiscard]] bool fully_resident() const noexcept;
     [[nodiscard]] bool attached() const noexcept { return cache_ != nullptr; }
+    // Host half of a split tier; null when the Device pool holds every expert.
+    void attach_host(HostExpertResidency& host) noexcept { host_ = &host; }
+    [[nodiscard]] HostExpertResidency* host() const noexcept { return host_; }
 
     [[nodiscard]] std::uint32_t count() const noexcept { return count_; }
     [[nodiscard]] std::uint64_t gate_up_object() const noexcept { return gate_up_object_; }
@@ -63,6 +68,7 @@ private:
     std::uint64_t down_object_    = 0;
 
     ExpertCache* cache_ = nullptr;
+    HostExpertResidency* host_ = nullptr;
     std::uint32_t bank_ = 0;
     ExpertBankLayout entry_{};
     std::vector<ExpertCacheKey> keys_;
