@@ -484,26 +484,15 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
                 }
 #pragma unroll
                 for (int mi = 0; mi < 4; ++mi) {
-                    const int row0 = mi * 16 + gid;
-                    const int row1 = row0 + 8;
-                    float scale0 =
-                        lid == 0
-                            ? __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(
-                                  &Sr[(row0 * GroupsPerRow + kt) * 2])))
-                            : 0.0f;
-                    float scale1 =
-                        lid == 0
-                            ? __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(
-                                  &Sr[(row1 * GroupsPerRow + kt) * 2])))
-                            : 0.0f;
-                    scale0 = __shfl_sync(0xffffffffu, scale0, gid * 4);
-                    scale1 = __shfl_sync(0xffffffffu, scale1, gid * 4);
+                    // decode_weight already folded this group's scale into the decoded values, so
+                    // partial is scaled. Applying the scale a second time here squared it and left
+                    // the routed term wrong by a factor of scale^2 on every prefill tile.
 #pragma unroll
                     for (int ni = 0; ni < WarpNT; ++ni) {
-                        acc[mi][ni][0] = fmaf(partial[mi][ni][0], scale0, acc[mi][ni][0]);
-                        acc[mi][ni][1] = fmaf(partial[mi][ni][1], scale0, acc[mi][ni][1]);
-                        acc[mi][ni][2] = fmaf(partial[mi][ni][2], scale1, acc[mi][ni][2]);
-                        acc[mi][ni][3] = fmaf(partial[mi][ni][3], scale1, acc[mi][ni][3]);
+                        acc[mi][ni][0] += partial[mi][ni][0];
+                        acc[mi][ni][1] += partial[mi][ni][1];
+                        acc[mi][ni][2] += partial[mi][ni][2];
+                        acc[mi][ni][3] += partial[mi][ni][3];
                     }
                 }
             }
