@@ -150,6 +150,32 @@ void attach_expert_cache(ModelInstance& instance, const EngineOptions& options,
                  int(instance.expert_host_source != nullptr),
                  static_cast<unsigned long long>(host_expert_arena_bytes(host_want) >> 20),
                  static_cast<unsigned long long>(host_want >> 20));
+    // A pool that cannot hold a layer hands the remainder to the host tier: one arena, the same
+    // uniform slot images the Device pool uses, filled on demand.
+    bool short_pool = false;
+    for (const auto& bank : requirements.banks) {
+        if (!bank.resident && instance.expert_cache->resident_capacity() < bank.count) {
+            short_pool = true;
+        }
+    }
+    if (short_pool && !streams.empty()) {
+        std::vector<models::qwen3_5::execution::HostExpertBankDesc> descs;
+        descs.reserve(streams.size());
+        for (std::size_t i = 0; i < streams.size(); ++i) {
+            descs.push_back({requirements.banks[i], streams[i]->gate_up_layout(),
+                             streams[i]->down_layout(), streams[i]->gate_up_parent(),
+                             streams[i]->down_parent()});
+        }
+        auto residency = std::make_unique<models::qwen3_5::execution::HostExpertResidency>(
+            descs, files, source, host_want);
+        for (std::size_t i = 0; i < streams.size(); ++i) {
+            streams[i]->attach_host(*residency);
+        }
+        std::fprintf(stderr, "[experts] host tier slots=%u slot_bytes=%llu\n",
+                     residency->slot_capacity(),
+                     static_cast<unsigned long long>(residency->slot_bytes()));
+        instance.expert_host_residency = std::move(residency);
+    }
 }
 
 void validate_options(const EngineOptions& options) {

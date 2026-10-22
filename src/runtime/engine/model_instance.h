@@ -16,6 +16,8 @@ namespace ninfer {
 class ExpertCache;
 }
 
+namespace ninfer::models::qwen3_5::execution { class HostExpertResidency; }
+
 namespace ninfer::runtime {
 
 [[nodiscard]] EngineOptions normalize_engine_options(EngineOptions options);
@@ -33,6 +35,8 @@ struct ModelInstance {
     std::unique_ptr<artifact::ArtifactExpertReader> expert_source;
     std::unique_ptr<ExpertCache> expert_cache;
     std::unique_ptr<ExpertBlobReader> expert_host_source;
+    // Host half of a split expert tier; only created when the Device pool cannot hold a layer.
+    std::unique_ptr<models::qwen3_5::execution::HostExpertResidency> expert_host_residency;
 
     ModelInstance(std::unique_ptr<models::qwen3_5::Model> model, const EngineOptions& options);
     ~ModelInstance();
