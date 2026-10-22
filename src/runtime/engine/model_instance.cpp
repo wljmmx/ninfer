@@ -247,7 +247,9 @@ std::uint64_t host_expert_arena_bytes(std::uint64_t want_bytes) {
     std::uint64_t budget = std::min<std::uint64_t>(want_bytes, share);
     if (const char* value = std::getenv("NINFER_EXPERT_HOST_ARENA_MB"); value != nullptr && *value) {
         const auto mib = std::strtoull(value, nullptr, 10);
-        if (mib != 0) { budget = std::min<std::uint64_t>(budget, mib << 20); }
+        // An explicit budget replaces the RAM share rather than tightening it, so a run can ask
+        // for the whole model when the machine has room.
+        if (mib != 0) { budget = std::min<std::uint64_t>(want_bytes, mib << 20); }
     }
     return budget;
 }
