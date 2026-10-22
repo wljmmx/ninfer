@@ -67,6 +67,26 @@ void ExpertStream::attach(ExpertCache& cache, std::uint32_t bank, const ExpertBa
     down_view.scale_stride = cache.slot_bytes();
     experts_.bank.count  = count_;
     experts_.bank.device = pool.device;
+
+    // Publish the per-expert offset table. Every entry is expert * slot for now; the kernel reads
+    // its plane base through this table, so a partial resident set only rewrites the entries.
+    offsets_.resize(count_);
+    for (std::uint32_t expert = 0; expert < count_; ++expert) {
+        offsets_[expert] = std::uint64_t{expert} * cache.slot_bytes();
+    }
+    const auto table_bytes = offsets_.size() * sizeof(std::uint64_t);
+    offsets_device_        = std::make_unique<DeviceBuffer>(table_bytes);
+    const auto copied      = cudaMemcpy(offsets_device_->p, offsets_.data(), table_bytes,
+                                        cudaMemcpyHostToDevice);
+    if (copied != cudaSuccess) {
+        throw std::runtime_error(std::string("expert offset table: ") + cudaGetErrorString(copied));
+    }
+    const auto* table = static_cast<const std::uint64_t*>(offsets_device_->p);
+    gate_up_view.offsets = table;
+    down_view.offsets    = table;
+    // Indexed addressing names its backing store, so the pool has to travel with the table.
+    gate_up_view.indexed_storage = pool;
+    down_view.indexed_storage    = pool;
 }
 
 bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32_t tokens,

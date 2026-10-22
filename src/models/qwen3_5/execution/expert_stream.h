@@ -62,6 +62,10 @@ private:
     ExpertBankLayout entry_{};
     std::vector<ExpertCacheKey> keys_;
     std::vector<ExpertCacheKey> required_;
+    // Per-expert byte offsets the kernel adds to each plane base. Uniform today, but the kernel
+    // already addresses through this table, so a partial resident set only has to rewrite entries.
+    std::vector<std::uint64_t> offsets_;
+    std::unique_ptr<DeviceBuffer> offsets_device_;
     std::unique_ptr<PinnedHostBuffer> route_staging_;
     ops::CudaSwiGLUExperts experts_{};
 };
