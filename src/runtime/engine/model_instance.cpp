@@ -29,7 +29,7 @@
 namespace ninfer::runtime {
 namespace {
 
-std::uint64_t host_expert_arena_bytes();
+std::uint64_t host_expert_arena_bytes(std::uint64_t want_bytes);
 using Clock = std::chrono::steady_clock;
 
 // port (sm_89): a sentinel that asks the engine to size the expert pool from free device memory.
@@ -132,13 +132,23 @@ void attach_expert_cache(ModelInstance& instance, const EngineOptions& options,
                            requirements.banks[i]);
     }
     // port (sm_89): one line that makes the expert tier observable without a debugger.
-    std::fprintf(stderr, "[experts] banks=%zu slot=%llu windows=%llu pool=%lluMiB host=%d arena=%lluMiB\n",
+    // How much the host tier could usefully hold: every expert the Device pool does not keep
+    // resident. The arena then takes the smaller of that and a quarter of free RAM, so RAM is used
+    // up to what the model needs and only the remainder falls through to the artifact.
+    std::uint64_t host_want = 0;
+    for (const auto& bank : requirements.banks) {
+        if (!bank.resident) {
+            host_want += static_cast<std::uint64_t>(bank.count) * instance.expert_cache->slot_bytes();
+        }
+    }
+    std::fprintf(stderr, "[experts] banks=%zu slot=%llu windows=%llu pool=%lluMiB host=%d arena=%lluMiB want=%lluMiB\n",
                  streams.size(),
                  static_cast<unsigned long long>(instance.expert_cache->slot_bytes()),
                  static_cast<unsigned long long>(instance.expert_cache->windows()),
                  static_cast<unsigned long long>(instance.expert_cache->capacity_bytes() >> 20),
                  int(instance.expert_host_source != nullptr),
-                 static_cast<unsigned long long>(host_expert_arena_bytes() >> 20));
+                 static_cast<unsigned long long>(host_expert_arena_bytes(host_want) >> 20),
+                 static_cast<unsigned long long>(host_want >> 20));
 }
 
 void validate_options(const EngineOptions& options) {
@@ -194,19 +204,21 @@ std::uint64_t current_free_host_bytes() {
     return 0;
 }
 
-// Host-side arena for experts the Device pool cannot hold. Sized from free RAM so a larger machine
-// gets a larger tier, capped so one process cannot claim the whole box; the cap is the knob
-// (NINFER_EXPERT_HOST_ARENA_MB) and anything past the arena streams in from the artifact.
-std::uint64_t host_expert_arena_bytes() {
-    constexpr std::uint64_t kDefaultCap = 8ULL << 30;
-    std::uint64_t cap                   = kDefaultCap;
+// Host-side arena for experts the Device pool cannot hold. It takes what the caller says the host
+// tier could usefully hold, capped by a share of free RAM so one process cannot claim the box.
+// Anything past that streams in from the artifact: RAM first, SSD only when it does not fit.
+// NINFER_EXPERT_HOST_ARENA_MB overrides the result when a fixed budget is wanted.
+std::uint64_t host_expert_arena_bytes(std::uint64_t want_bytes) {
+    const auto share = [&] {
+        const auto free_bytes = current_free_host_bytes();
+        return free_bytes == 0 ? want_bytes : free_bytes / 4;
+    }();
+    std::uint64_t budget = std::min<std::uint64_t>(want_bytes, share);
     if (const char* value = std::getenv("NINFER_EXPERT_HOST_ARENA_MB"); value != nullptr && *value) {
         const auto mib = std::strtoull(value, nullptr, 10);
-        if (mib != 0) { cap = mib << 20; }
+        if (mib != 0) { budget = std::min<std::uint64_t>(budget, mib << 20); }
     }
-    const auto free_bytes = current_free_host_bytes();
-    if (free_bytes == 0) { return cap; }
-    return std::min<std::uint64_t>(cap, free_bytes / 4);
+    return budget;
 }
 
 std::size_t current_free_device_bytes(bool wddm_evictable_budget = false,
