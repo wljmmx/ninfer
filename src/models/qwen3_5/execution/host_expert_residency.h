@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <span>
 #include <stdexcept>
@@ -185,7 +187,21 @@ private:
         commit(slot);
         auto* destination = base + std::uint64_t{slot} * slot_bytes_;
         const auto& entry = files_[bank].experts[expert];
-        reader_->read_entry(entry, {destination, static_cast<std::size_t>(slot_bytes_)});
+        // The Device path uploads through spans() and only falls back to read_entry; use the same
+        // proven route so both tiers build identical slot images.
+        std::vector<ExpertBlobSpan> slices;
+        if (reader_->spans(entry, slices) && !slices.empty()) {
+            for (const auto& slice : slices) {
+                if (slice.image_offset > slot_bytes_ ||
+                    slice.bytes > slot_bytes_ - slice.image_offset) {
+                    throw std::runtime_error("host expert slice lies outside its slot");
+                }
+                std::memcpy(destination + slice.image_offset, slice.source,
+                            static_cast<std::size_t>(slice.bytes));
+            }
+        } else {
+            reader_->read_entry(entry, {destination, static_cast<std::size_t>(slot_bytes_)});
+        }
         // One arena base for every bank; the per-plane tables carry the slot origin.
         state_[bank].gate_up_parent.data = base;
         state_[bank].down_parent.data    = base;
