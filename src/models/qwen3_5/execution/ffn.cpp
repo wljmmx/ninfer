@@ -102,17 +102,17 @@ void host_routed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe,
     if (std::getenv("NINFER_HOST_DEBUG")) {
         const auto& gu = host->experts(ExpertBankId{moe.stream->bank_index()}).gate_up;
         const auto probe = gu.plane(gu.layout.codes, static_cast<std::uint32_t>(host_ids[0]));
-        const auto* bytes = static_cast<const std::uint8_t*>(probe.data);
-        std::fprintf(stderr,
-                     "[host] bank=%u expert=%d off=%llu bytes=%llu first8=%02x %02x %02x %02x "
-                     "%02x %02x %02x %02x\n",
-                     moe.stream->bank_index(), host_ids[0],
+        std::fprintf(stderr, "[host] bank=%u base=%p plane=%p off=%llu delta=%lld first4=%02x %02x %02x %02x\n",
+                     moe.stream->bank_index(), static_cast<const void*>(gu.parent->data),
+                     probe.data,
                      static_cast<unsigned long long>(gu.expert_offsets[host_ids[0]]),
-                     static_cast<unsigned long long>(probe.bytes),
-                     probe.data ? bytes[0] : 0, probe.data ? bytes[1] : 0,
-                     probe.data ? bytes[2] : 0, probe.data ? bytes[3] : 0,
-                     probe.data ? bytes[4] : 0, probe.data ? bytes[5] : 0,
-                     probe.data ? bytes[6] : 0, probe.data ? bytes[7] : 0);
+                     static_cast<long long>(
+                         reinterpret_cast<std::intptr_t>(probe.data) -
+                         reinterpret_cast<std::intptr_t>(gu.parent->data)),
+                     probe.data ? static_cast<const std::uint8_t*>(probe.data)[0] : 0,
+                     probe.data ? static_cast<const std::uint8_t*>(probe.data)[1] : 0,
+                     probe.data ? static_cast<const std::uint8_t*>(probe.data)[2] : 0,
+                     probe.data ? static_cast<const std::uint8_t*>(probe.data)[3] : 0);
     }
 
     auto delta = workspace.alloc(DType::BF16, {cols, tokens});

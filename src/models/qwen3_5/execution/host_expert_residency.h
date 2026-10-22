@@ -187,6 +187,18 @@ private:
         commit(slot);
         auto* destination = base + std::uint64_t{slot} * slot_bytes_;
         const auto& entry = files_[bank].experts[expert];
+        if (std::getenv("NINFER_HOST_DEBUG") && expert < 2) {
+            std::fprintf(stderr, "[host-chunk] bank=%u expert=%u n=%zu", bank, expert,
+                         entry.chunks.size());
+            for (std::size_t i = 0; i < entry.chunks.size() && i < 6; ++i) {
+                std::fprintf(stderr, " [%zu:file=%u off=%llu bytes=%llu image=%llu]", i,
+                             entry.chunks[i].file_index,
+                             static_cast<unsigned long long>(entry.chunks[i].file_offset),
+                             static_cast<unsigned long long>(entry.chunks[i].bytes),
+                             static_cast<unsigned long long>(entry.chunks[i].image_offset));
+            }
+            std::fprintf(stderr, "\n");
+        }
         // The Device path uploads through spans() and only falls back to read_entry; use the same
         // proven route so both tiers build identical slot images.
         std::vector<ExpertBlobSpan> slices;
