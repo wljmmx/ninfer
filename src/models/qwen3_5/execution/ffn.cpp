@@ -62,7 +62,10 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
         throw std::invalid_argument(std::string("expert stream route: ") + error.what());
     }
     try {
-        moe.stream->ensure(ids.data, routed.top_k, columns, execution.stream);
+        if (!moe.stream->ensure(ids.data, routed.top_k, columns, execution.stream)) {
+            throw std::invalid_argument(
+                "expert pool cannot hold one layer; raise NINFER_EXPERT_CACHE_MB");
+        }
     } catch (const std::exception& error) {
         throw std::invalid_argument(std::string("expert stream upload: ") + error.what());
     }

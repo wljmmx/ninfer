@@ -23,8 +23,10 @@ public:
     // Startup-only. `entry` is the cache's per-entry plane layout for this bank.
     void attach(ExpertCache& cache, std::uint32_t bank, const ExpertBankLayout& entry);
 
-    // Publishes the experts the next call routes to, then republishes the offset table.
-    void ensure(const void* device_ids, std::int32_t top_k, std::int32_t tokens,
+    // Publishes the experts the next call routes to, then republishes the offset table. Returns
+    // false when the pool cannot hold one whole layer at all; the caller then owns the decision
+    // (today it raises, later it can fall back to the host tier).
+    bool ensure(const void* device_ids, std::int32_t top_k, std::int32_t tokens,
                 cudaStream_t stream);
 
     [[nodiscard]] const ops::CudaSwiGLUExperts& experts() const noexcept { return experts_; }
