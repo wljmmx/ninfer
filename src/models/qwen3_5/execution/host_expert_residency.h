@@ -35,6 +35,10 @@ struct HostExpertBankDesc {
 // and holds one uniform slot per expert using the same entry image the Device pool stores. A slot
 // is evicted coldest-first when the arena fills, so RAM holds what fits and everything else keeps
 // streaming in from the artifact.
+//
+// The CPU op validates a host-packed bank: planes start at 0, at codes_bytes and at
+// codes_bytes + high_bytes, and expert_offsets name each expert's segment. Gate/up and down begin
+// at different byte origins inside that segment, so each plane view carries its own table.
 class HostExpertResidency final : public HostResidency {
 public:
     HostExpertResidency(std::span<const HostExpertBankDesc> banks,
@@ -47,8 +51,8 @@ public:
             widest = std::max(widest, bank.entry.entry_bytes);
         }
         constexpr std::uint64_t kBlock = 128 * 1024;
-        slot_bytes_   = (widest + kBlock - 1) / kBlock * kBlock;
-        arena_bytes_  = std::max(arena_bytes_, slot_bytes_);
+        slot_bytes_    = (widest + kBlock - 1) / kBlock * kBlock;
+        arena_bytes_   = std::max(arena_bytes_, slot_bytes_);
         slot_capacity_ = static_cast<std::uint32_t>(arena_bytes_ / slot_bytes_);
         slot_bank_.assign(slot_capacity_, kNone);
         slot_expert_.assign(slot_capacity_, kNone);
@@ -58,28 +62,21 @@ public:
         for (std::size_t i = 0; i < banks_.size(); ++i) {
             auto& s = state_[i];
             s.slot_of.assign(banks_[i].entry.count, kNone);
-            s.offsets.assign(banks_[i].entry.count, 0);
+            s.gate_up_offsets.assign(banks_[i].entry.count, 0);
+            s.down_offsets.assign(banks_[i].entry.count, 0);
 
-            // The CPU views address a slot, not the whole parent: plane offsets come from the
-            // entry image, so the same bytes the Device pool holds line up here unchanged.
             s.gate_up_parent.geometry = banks_[i].gate_up_geometry;
             s.gate_up_parent.device   = Device::cpu();
             s.down_parent.geometry    = banks_[i].down_geometry;
             s.down_parent.device      = Device::cpu();
 
-            s.gate_up.parent = &s.gate_up_parent;
-            s.gate_up.layout = banks_[i].gate_up_layout;
-            s.gate_up.layout.codes.offset  = banks_[i].entry.codes.offset;
-            s.gate_up.layout.high.offset   = banks_[i].entry.high.offset;
-            s.gate_up.layout.scales.offset = banks_[i].entry.scales.offset;
-            s.gate_up.expert_offsets       = s.offsets.data();
+            s.gate_up.parent         = &s.gate_up_parent;
+            s.gate_up.layout         = with_packed_planes(banks_[i].gate_up_layout);
+            s.gate_up.expert_offsets = s.gate_up_offsets.data();
 
-            s.down.parent = &s.down_parent;
-            s.down.layout = banks_[i].down_layout;
-            s.down.layout.codes.offset  = banks_[i].entry.down_codes.offset;
-            s.down.layout.high.offset   = banks_[i].entry.down_high.offset;
-            s.down.layout.scales.offset = banks_[i].entry.down_scales.offset;
-            s.down.expert_offsets       = s.offsets.data();
+            s.down.parent         = &s.down_parent;
+            s.down.layout         = with_packed_planes(banks_[i].down_layout);
+            s.down.expert_offsets = s.down_offsets.data();
 
             s.view.gate_up = s.gate_up;
             s.view.down    = s.down;
@@ -98,7 +95,9 @@ public:
                 load(bank.index, expert, slot);
             }
             slot_last_use_[slot] = ++epoch_;
-            s.offsets[expert]    = std::uint64_t{slot} * slot_bytes_;
+            const auto base      = std::uint64_t{slot} * slot_bytes_;
+            s.gate_up_offsets[expert] = base + banks_[bank.index].entry.codes.offset;
+            s.down_offsets[expert]    = base + banks_[bank.index].entry.down_codes.offset;
         }
     }
 
@@ -111,9 +110,19 @@ public:
 private:
     static constexpr std::uint32_t kNone = 0xffffffffu;
 
+    // Rewrite the plane offsets into the packed form the CPU op validates for host banks.
+    static WeightBankLayout with_packed_planes(const WeightBankLayout& layout) {
+        WeightBankLayout out = layout;
+        out.codes.offset     = 0;
+        out.high.offset      = out.codes.expert_bytes;
+        out.scales.offset    = out.codes.expert_bytes + out.high.expert_bytes;
+        return out;
+    }
+
     struct State {
         std::vector<std::uint32_t> slot_of;
-        std::vector<std::uint64_t> offsets;
+        std::vector<std::uint64_t> gate_up_offsets;
+        std::vector<std::uint64_t> down_offsets;
         WeightParent gate_up_parent;
         WeightParent down_parent;
         WeightBankView gate_up;
@@ -140,17 +149,19 @@ private:
                          PAGE_READWRITE) == nullptr) {
             throw std::runtime_error("host expert arena: commit failed");
         }
+#else
+        (void)slot;
 #endif
     }
 
     std::uint32_t claim(std::uint32_t bank, std::uint32_t expert) {
         if (used_ < slot_capacity_) {
-            const auto slot   = used_++;
-            slot_bank_[slot]  = bank;
+            const auto slot    = used_++;
+            slot_bank_[slot]   = bank;
             slot_expert_[slot] = expert;
             return slot;
         }
-        std::uint32_t victim = 0;
+        std::uint32_t victim  = 0;
         std::uint64_t coldest = ~std::uint64_t{0};
         for (std::uint32_t s = 0; s < slot_capacity_; ++s) {
             if (slot_last_use_[s] < coldest) {
@@ -171,7 +182,7 @@ private:
         auto* destination = base + std::uint64_t{slot} * slot_bytes_;
         const auto& entry = files_[bank].experts[expert];
         reader_->read_entry(entry, {destination, static_cast<std::size_t>(slot_bytes_)});
-        // One arena base for every bank; a slot offset is what distinguishes them.
+        // One arena base for every bank; the per-plane tables carry the slot origin.
         state_[bank].gate_up_parent.data = base;
         state_[bank].down_parent.data    = base;
     }
@@ -180,9 +191,9 @@ private:
     std::vector<ExpertFileBank> files_;
     const ExpertBlobReader* reader_ = nullptr;
     std::vector<State> state_;
-    std::uint64_t slot_bytes_   = 0;
-    std::uint64_t arena_bytes_  = 0;
-    std::byte* arena_           = nullptr;
+    std::uint64_t slot_bytes_    = 0;
+    std::uint64_t arena_bytes_   = 0;
+    std::byte* arena_            = nullptr;
     std::uint32_t slot_capacity_ = 0;
     std::uint32_t used_          = 0;
     std::vector<std::uint32_t> slot_bank_, slot_expert_;
@@ -191,4 +202,3 @@ private:
 };
 
 } // namespace ninfer::models::qwen3_5::execution
-
