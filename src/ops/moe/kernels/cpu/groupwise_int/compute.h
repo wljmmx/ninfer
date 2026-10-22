@@ -91,8 +91,12 @@ inline void gate_up(Work& work, const Group& group, int first, int channel, int 
         }
         for (int r = 0; r < rows / 2; ++r) {
             for (int c = 0; c < Columns; ++c) {
+                // The device kernels store this plane as BF16 and feed the down projection from
+                // it, so round here too; otherwise the host fallback is more precise than the
+                // path it is standing in for and the two diverge over the layer stack.
                 work.scratch.activation[group.slots[first + c] * intermediate + i + r] =
-                    common::silu_stable(values[2 * r][c]) * values[2 * r + 1][c];
+                    common::bf16_round(common::silu_stable(values[2 * r][c]) *
+                                       values[2 * r + 1][c]);
             }
         }
     }

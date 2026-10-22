@@ -49,9 +49,11 @@ std::size_t stream_route_tensor_bytes(const RoutedMoeParameters& moe, std::int32
 
 // Whole-layer host fallback, used when the Device pool cannot hold the layer's expert set at all.
 // The routed term is computed on the CPU over the host tier's experts and added to the residual;
-// the CPU form deliberately excludes residual addition, so that happens here.
+// the CPU form deliberately excludes residual addition, so that happens here. The shared term
+// arrives as FP32 from the device, and the three contributions are summed before a single BF16
+// rounding, which is what the device epilogue does on the resident path.
 void host_routed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe,
-                     const ops::ExpertRoutes& routes, Tensor& residual, WorkspaceArena& workspace,
+                     const ops::ExpertRoutes& routes, const Tensor& shared_f32, Tensor& residual,
                      DeviceExecutionView execution) {
     auto* host = moe.stream->host();
     if (host == nullptr) { throw std::runtime_error("host routed ffn: no host tier"); }
@@ -68,7 +70,15 @@ void host_routed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe,
     std::vector<std::int32_t> host_ids(static_cast<std::size_t>(top_k) * tokens);
     std::vector<float> host_coefficients(static_cast<std::size_t>(top_k) * tokens);
     std::vector<float> host_out(static_cast<std::size_t>(cols) * tokens);
+    std::vector<std::uint16_t> host_residual(static_cast<std::size_t>(cols) * tokens);
+    std::vector<float> host_shared(static_cast<std::size_t>(cols) * tokens);
 
+    CUDA_CHECK(cudaMemcpyAsync(host_residual.data(), residual.data,
+                               host_residual.size() * sizeof(std::uint16_t),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(host_shared.data(), shared_f32.data,
+                               host_shared.size() * sizeof(float), cudaMemcpyDeviceToHost,
+                               stream));
     CUDA_CHECK(cudaMemcpyAsync(host_x.data(), hidden.data, host_x.size() * sizeof(std::uint16_t),
                                cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaMemcpyAsync(host_ids.data(), routes.ids.data,
@@ -107,42 +117,37 @@ void host_routed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe,
                      __bfloat162float(__ushort_as_bfloat16(host_x[2])),
                      __bfloat162float(__ushort_as_bfloat16(host_x[3])));
     }
-    if (std::getenv("NINFER_HOST_DEBUG")) {
-        const auto& gu = host->experts(ExpertBankId{moe.stream->bank_index()}).gate_up;
-        const auto probe = gu.plane(gu.layout.codes, static_cast<std::uint32_t>(host_ids[0]));
-        std::fprintf(stderr, "[host] bank=%u base=%p plane=%p off=%llu delta=%lld first4=%02x %02x %02x %02x\n",
-                     moe.stream->bank_index(), static_cast<const void*>(gu.parent->data),
-                     probe.data,
-                     static_cast<unsigned long long>(gu.expert_offsets[host_ids[0]]),
-                     static_cast<long long>(
-                         reinterpret_cast<std::intptr_t>(probe.data) -
-                         reinterpret_cast<std::intptr_t>(gu.parent->data)),
-                     probe.data ? static_cast<const std::uint8_t*>(probe.data)[0] : 0,
-                     probe.data ? static_cast<const std::uint8_t*>(probe.data)[1] : 0,
-                     probe.data ? static_cast<const std::uint8_t*>(probe.data)[2] : 0,
-                     probe.data ? static_cast<const std::uint8_t*>(probe.data)[3] : 0);
-    }
-
-    auto delta = workspace.alloc(DType::BF16, {cols, tokens});
     std::vector<std::uint16_t> packed(host_out.size());
     for (std::size_t i = 0; i < host_out.size(); ++i) {
+        // The device epilogue starts from the BF16 residual and folds the routed and shared
+        // contributions into that FP32 accumulator, so keep the same order here.
+        const float sum = (__bfloat162float(__ushort_as_bfloat16(host_residual[i])) + host_out[i]) +
+                          host_shared[i];
         std::uint32_t bits = 0;
-        std::memcpy(&bits, &host_out[i], sizeof(bits));
+        std::memcpy(&bits, &sum, sizeof(bits));
         // Round to nearest even, the same rule __float2bfloat16_rn applies; truncating biases
         // every layer downward and compounds over the stack.
         const std::uint32_t lsb = (bits >> 16) & 1u;
         bits += 0x7fffu + lsb;
         packed[i] = static_cast<std::uint16_t>(bits >> 16);
     }
-    CUDA_CHECK(cudaMemcpyAsync(delta.data, packed.data(), packed.size() * sizeof(std::uint16_t),
+    CUDA_CHECK(cudaMemcpyAsync(residual.data, packed.data(), packed.size() * sizeof(std::uint16_t),
                                cudaMemcpyHostToDevice, stream));
-    ops::residual_add(delta, residual, stream);
     if (std::getenv("NINFER_HOST_DEBUG")) {
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        float probe[4] = {};
-        CUDA_CHECK(cudaMemcpy(probe, residual.data, sizeof(probe), cudaMemcpyDeviceToHost));
-        std::fprintf(stderr, "[host-residual] bank=%u r0..3=%.6f %.6f %.6f %.6f\n",
-                     moe.stream->bank_index(), probe[0], probe[1], probe[2], probe[3]);
+        // residual is BF16, so print the packed words rather than reinterpreting them as FP32.
+        double sum = 0.0, square = 0.0;
+        for (const auto word : packed) {
+            const double value = __bfloat162float(__ushort_as_bfloat16(word));
+            sum += value;
+            square += value * value;
+        }
+        std::fprintf(stderr, "[host-residual] bank=%u r0..3=%.6f %.6f %.6f %.6f sum=%.9f sq=%.9f\n",
+                     moe.stream->bank_index(),
+                     __bfloat162float(__ushort_as_bfloat16(packed[0])),
+                     __bfloat162float(__ushort_as_bfloat16(packed[1])),
+                     __bfloat162float(__ushort_as_bfloat16(packed[2])),
+                     __bfloat162float(__ushort_as_bfloat16(packed[3])), sum, square);
     }
 }
 
@@ -168,12 +173,15 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
         if (!moe.stream->ensure(ids.data, routed.top_k, columns, execution.stream)) {
             // The pool cannot hold this layer: the shared expert still runs on the device (subset
             // None touches only the shared term), and the routed term moves to the host tier.
+            // Keep the shared term in FP32 so that the host fallback can fold it into the same
+            // residual rounding the device epilogue performs once per layer.
+            auto shared_f32 = workspace.alloc(DType::FP32, {hidden.ne[0], columns});
             MemoryArena shared_arena(MemorySpan{scratch.data, scratch.bytes, execution.device()});
             ops::routed_swiglu(hidden, routed, moe.stream->experts(), routes,
                                ops::ExpertSubset{ops::ExpertSubsetKind::None, {}},
                                ops::ScaledSwiGLUTerm{moe.shared, shared_coefficients},
-                               ops::MoeEpilogue::AddResidual, residual, shared_arena, execution);
-            host_routed_ffn(hidden, moe, routes, residual, workspace, execution);
+                               ops::MoeEpilogue::Write, shared_f32, shared_arena, execution);
+            host_routed_ffn(hidden, moe, routes, shared_f32, residual, execution);
             return;
         }
     } catch (const std::exception& error) {
@@ -200,10 +208,22 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
                      __bfloat162float(__ushort_as_bfloat16(host_hidden[1])),
                      __bfloat162float(__ushort_as_bfloat16(host_hidden[2])),
                      __bfloat162float(__ushort_as_bfloat16(host_hidden[3])));
-        float probe[4] = {};
-        CUDA_CHECK(cudaMemcpy(probe, residual.data, sizeof(probe), cudaMemcpyDeviceToHost));
-        std::fprintf(stderr, "[residual] bank=%u r0..3=%.6f %.6f %.6f %.6f\n",
-                     moe.stream->bank_index(), probe[0], probe[1], probe[2], probe[3]);
+        const auto count = static_cast<std::size_t>(hidden.ne[0]) * hidden.ne[1];
+        std::vector<std::uint16_t> all(count);
+        CUDA_CHECK(cudaMemcpy(all.data(), residual.data, count * sizeof(std::uint16_t),
+                              cudaMemcpyDeviceToHost));
+        double sum = 0.0, square = 0.0;
+        for (const auto word : all) {
+            const double value = __bfloat162float(__ushort_as_bfloat16(word));
+            sum += value;
+            square += value * value;
+        }
+        std::fprintf(stderr, "[residual] bank=%u r0..3=%.6f %.6f %.6f %.6f sum=%.9f sq=%.9f\n",
+                     moe.stream->bank_index(),
+                     __bfloat162float(__ushort_as_bfloat16(all[0])),
+                     __bfloat162float(__ushort_as_bfloat16(all[1])),
+                     __bfloat162float(__ushort_as_bfloat16(all[2])),
+                     __bfloat162float(__ushort_as_bfloat16(all[3])), sum, square);
     }
 }
 
@@ -218,7 +238,11 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
     }
     if (const auto* moe = std::get_if<RoutedMoeParameters>(&parameters)) {
         if (moe->stream) {
-            return stream_route_tensor_bytes(*moe, last) +
+            // port (sm_89): the host fallback keeps the shared term in FP32 so that a layer
+            // rounds the residual once, exactly like the device epilogue.
+            const auto shared_f32 = static_cast<std::size_t>(moe->profile.routed.ffn.hidden) *
+                                    static_cast<std::size_t>(last) * sizeof(float);
+            return stream_route_tensor_bytes(*moe, last) + shared_f32 +
                    std::max(stream_route_bytes(*moe, first, last),
                             stream_expert_bytes(*moe, first, last));
         }

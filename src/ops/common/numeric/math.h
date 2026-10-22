@@ -2,6 +2,8 @@
 
 #include <type_traits>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 
 #if defined(__CUDACC__)
 #    define NINFER_KERNEL_HD __host__ __device__
@@ -11,13 +13,27 @@
 
 namespace ninfer::ops::common {
 
-// Host FP32 SiLU without exp overflow for large negative finite inputs.
+// Host FP32 SiLU without exp overflow for large negative finite inputs. Keeping the negative
+// branch on exp(-|x|) measured closer to the device form than `x / (1 + exp(-x))` does, because
+// the CUDA expf and the host libm exp round differently.
 inline float silu_stable(float value) noexcept {
     const float exponential = std::exp(-std::abs(value));
     return value >= 0 ? value / (1.0F + exponential) : (value * exponential) / (1.0F + exponential);
 }
 
 inline constexpr float kLog2E = 1.4426950408889634F;
+
+// Round to the nearest BF16 value and return it as FP32. The host MoE kernels consume the same
+// BF16 activation plane the device kernels write, so they must round where that plane is stored.
+inline float bf16_round(float value) noexcept {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    bits += 0x7fffu + ((bits >> 16) & 1u);
+    bits &= 0xffff0000u;
+    float out = 0.0F;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
+}
 
 template <class T>
 NINFER_KERNEL_HD constexpr T div_up(T x, T d) {
