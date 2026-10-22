@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <chrono>
 #include <set>
 #include <stdexcept>
@@ -21,6 +22,9 @@
 namespace ninfer::runtime {
 namespace {
 using Clock = std::chrono::steady_clock;
+
+// port (sm_89): a sentinel that asks the engine to size the expert pool from free device memory.
+constexpr std::size_t kExpertCacheAuto = std::numeric_limits<std::size_t>::max();
 
 using models::qwen3_5::execution::ExpertStream;
 using models::qwen3_5::execution::RoutedMoeParameters;
@@ -66,14 +70,28 @@ void attach_expert_cache(ModelInstance& instance, const EngineOptions& options,
     const auto probe = describe_expert_cache(specs, {.capacity_bytes = 256});
     // port (sm_89): the pool holds a whole number of slots, one per expert regardless of bank,
     // because an evicted slot is handed to whichever bank needs it next.
-    const auto entry    = probe.max_entry_bytes;
-    const auto capacity = options.expert_cache_bytes / entry * entry;
-    if (capacity == 0) {
-        throw std::invalid_argument("expert cache holds less than one expert entry (" +
-                                    std::to_string(entry) + " bytes)");
+    const auto entry = probe.max_entry_bytes;
+    auto requested   = options.expert_cache_bytes;
+    if (requested == kExpertCacheAuto) {
+        // Take what is free now and leave room for the KV arena, workspace and graphs; the
+        // planner runs after this, so the pool has to hold back on its behalf.
+        std::size_t free_bytes = 0, total_bytes = 0;
+        if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess || free_bytes == 0) {
+            throw std::runtime_error("expert cache auto sizing cannot read device memory");
+        }
+        // Leave room for the KV arena, workspaces and graphs; taking all free memory makes the
+        // planner fail later, after a long allocation.
+        const auto reserve = std::size_t{6} << 30;
+        requested = free_bytes > reserve ? free_bytes - reserve : 0;
     }
-    if (capacity % 256 != 0) {
-        throw std::invalid_argument("expert cache capacity must be 256-byte aligned");
+    // Whole windows only: a partial window is dead space and would make the slot count odd.
+    std::uint64_t widest = 0;
+    for (const auto& spec : specs) { widest = std::max<std::uint64_t>(widest, spec.count); }
+    auto capacity = requested / entry * entry;
+    if (widest != 0) { capacity = capacity / (entry * widest) * (entry * widest); }
+    if (capacity == 0) {
+        throw std::invalid_argument("expert cache holds less than one expert window (" +
+                                    std::to_string(entry * widest) + " bytes)");
     }
     const auto requirements = describe_expert_cache(specs, {.capacity_bytes = capacity});
 
@@ -183,8 +201,12 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     }
     if (options.expert_cache_bytes == 0) {
         if (const char* value = std::getenv("NINFER_EXPERT_CACHE_MB"); value != nullptr && *value) {
-            const auto mib = std::strtoull(value, nullptr, 10);
-            options.expert_cache_bytes = static_cast<std::size_t>(mib) << 20;
+            if (std::strcmp(value, "auto") == 0) {
+                options.expert_cache_bytes = kExpertCacheAuto;
+            } else {
+                const auto mib = std::strtoull(value, nullptr, 10);
+                options.expert_cache_bytes = static_cast<std::size_t>(mib) << 20;
+            }
         }
     }
     if (options.expert_cache_bytes != 0) { options.use_cuda_graph = false; }
