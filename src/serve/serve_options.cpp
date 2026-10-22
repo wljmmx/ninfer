@@ -430,6 +430,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.pending_timeout_ms == 0) {
         throw std::invalid_argument("--pending-timeout-ms must be positive");
     }
+    // port (sm_89): the queue deadline is computed from this struct, not from the engine's
+    // normalized copy, so a streamed expert tier has to scale it here as well.
+    if (const char* experts = std::getenv("NINFER_EXPERT_CACHE_MB");
+        experts != nullptr && *experts && options.max_concurrency > 1) {
+        options.pending_timeout_ms *= options.max_concurrency;
+    }
     if (options.max_request_bytes == 0) {
         throw std::invalid_argument("--max-request-mib must be positive");
     }
