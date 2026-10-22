@@ -147,6 +147,13 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
     }
     try {
         if (!moe.stream->ensure(ids.data, routed.top_k, columns, execution.stream)) {
+            // The pool cannot hold this layer: the shared expert still runs on the device (subset
+            // None touches only the shared term), and the routed term moves to the host tier.
+            MemoryArena shared_arena(MemorySpan{scratch.data, scratch.bytes, execution.device()});
+            ops::routed_swiglu(hidden, routed, moe.stream->experts(), routes,
+                               ops::ExpertSubset{ops::ExpertSubsetKind::None, {}},
+                               ops::ScaledSwiGLUTerm{moe.shared, shared_coefficients},
+                               ops::MoeEpilogue::AddResidual, residual, shared_arena, execution);
             host_routed_ffn(hidden, moe, routes, residual, workspace, execution);
             return;
         }
