@@ -116,8 +116,9 @@ void ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         static double seconds = 0.0;
         seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - upload_begin).count();
         if (++calls % 40 == 0) {
-            std::fprintf(stderr, "[experts] calls=%llu upload=%.3fs avg=%.2fms\\n",
-                         (unsigned long long)calls, seconds, seconds * 1000.0 / 40.0);
+            std::fprintf(stderr, "[experts] calls=%llu upload=%.3fs avg=%.2fms hits=%llu\n",
+                         (unsigned long long)calls, seconds, seconds * 1000.0 / 40.0,
+                         (unsigned long long)cache_->hits());
             seconds = 0.0;
         }
     }
