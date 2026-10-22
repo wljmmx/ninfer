@@ -3,6 +3,9 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <array>
 #include <limits>
 #include <stdexcept>
@@ -101,11 +104,22 @@ void ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                                     return a.expert == b.expert;
                                 }),
                     required_.end());
+    const auto upload_begin = std::chrono::steady_clock::now();
     cache_->prepare(required_);
     try {
         cache_->wait_for_progress();
     } catch (const std::exception& error) {
         throw std::runtime_error(std::string("pool: ") + error.what());
+    }
+    if (std::getenv("NINFER_EXPERT_TIMING")) {
+        static std::uint64_t calls = 0;
+        static double seconds = 0.0;
+        seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - upload_begin).count();
+        if (++calls % 40 == 0) {
+            std::fprintf(stderr, "[experts] calls=%llu upload=%.3fs avg=%.2fms\\n",
+                         (unsigned long long)calls, seconds, seconds * 1000.0 / 40.0);
+            seconds = 0.0;
+        }
     }
     // port (sm_89): the bank's window can move between layers, so the plane bases are
     // rebased onto the window that is resident now. A fixed base would address window 0.
