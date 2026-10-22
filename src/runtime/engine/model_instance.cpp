@@ -210,6 +210,12 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         }
     }
     if (options.expert_cache_bytes != 0) { options.use_cuda_graph = false; }
+    // port (sm_89): a streamed expert tier makes every request wait for its window to load, so
+    // the queue drains at a fraction of the resident rate. Scale the pending deadline with the
+    // number of requests instead of failing them at the resident-speed timeout.
+    if (options.expert_cache_bytes != 0 && options.max_concurrency > 1) {
+        options.pending_timeout_ms *= options.max_concurrency;
+    }
     switch (options.purpose) {
     case EnginePurpose::Generation:
         break;
