@@ -30,6 +30,11 @@ public:
                 cudaStream_t stream);
 
     [[nodiscard]] const ops::CudaSwiGLUExperts& experts() const noexcept { return experts_; }
+    // Device-side int32 array, one entry per expert: 1 when the pool holds it.
+    [[nodiscard]] const void* resident_mask() const noexcept {
+        return mask_device_ ? mask_device_->p : nullptr;
+    }
+    [[nodiscard]] bool fully_resident() const noexcept;
     [[nodiscard]] bool attached() const noexcept { return cache_ != nullptr; }
 
     [[nodiscard]] std::uint32_t count() const noexcept { return count_; }
@@ -66,6 +71,9 @@ private:
     // already addresses through this table, so a partial resident set only has to rewrite entries.
     std::vector<std::uint64_t> offsets_;
     std::unique_ptr<DeviceBuffer> offsets_device_;
+    // One entry per expert: 1 when the pool holds it. A partial resident set drives the GPU
+    // through ExpertSubsetKind::MaskOnes and leaves the rest to the host tier.
+    std::unique_ptr<DeviceBuffer> mask_device_;
     std::unique_ptr<PinnedHostBuffer> route_staging_;
     ops::CudaSwiGLUExperts experts_{};
 };

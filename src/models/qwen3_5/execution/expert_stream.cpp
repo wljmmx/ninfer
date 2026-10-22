@@ -87,6 +87,26 @@ void ExpertStream::attach(ExpertCache& cache, std::uint32_t bank, const ExpertBa
     // Indexed addressing names its backing store, so the pool has to travel with the table.
     gate_up_view.indexed_storage = pool;
     down_view.indexed_storage    = pool;
+
+    // Publish which experts the pool will hold. With room for the whole layer every entry is set;
+    // otherwise only the leading resident_capacity() experts are, and the caller masks the rest
+    // out of the GPU job list.
+    const auto resident = cache.resident_capacity();
+    std::vector<std::int32_t> mask(count_, 0);
+    for (std::uint32_t expert = 0; expert < std::min(count_, resident); ++expert) {
+        mask[expert] = 1;
+    }
+    mask_device_ = std::make_unique<DeviceBuffer>(mask.size() * sizeof(std::int32_t));
+    const auto mask_bytes = mask.size() * sizeof(std::int32_t);
+    const auto mask_copy  = cudaMemcpy(mask_device_->p, mask.data(), mask_bytes,
+                                       cudaMemcpyHostToDevice);
+    if (mask_copy != cudaSuccess) {
+        throw std::runtime_error(std::string("expert residency mask: ") + cudaGetErrorString(mask_copy));
+    }
+}
+
+bool ExpertStream::fully_resident() const noexcept {
+    return cache_ != nullptr && cache_->resident_capacity() >= count_;
 }
 
 bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32_t tokens,

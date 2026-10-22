@@ -138,7 +138,10 @@ struct ExpertCache::Impl {
         for (const auto& bank : banks) {
             if (!bank.resident) { widest = std::max(widest, std::uint64_t{bank.count}); }
         }
-        return widest;
+        // A pool smaller than one layer still serves it, one expert short of a whole window: the
+        // window shrinks to the pool and the host tier is expected to cover the remainder.
+        const std::uint64_t slots = config.capacity_bytes / slot_bytes;
+        return std::min(widest, slots);
     }
 
     std::uint64_t window_count() const {
