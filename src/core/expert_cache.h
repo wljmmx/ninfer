@@ -121,6 +121,12 @@ public:
 
     [[nodiscard]] std::uint64_t used_bytes() const noexcept;
     [[nodiscard]] std::uint64_t capacity_bytes() const noexcept;
+    // port (sm_89): hands device memory back to (or takes it from) the driver without moving a
+    // published offset. The reservation stays where it is, so bank views and offset tables stay
+    // valid; only the backing segments of the highest windows come and go. Experts of a dropped
+    // window report nullopt again and stream in on their next use, which is why the caller must
+    // be at a layer boundary. Returns the capacity in effect afterwards.
+    [[nodiscard]] std::uint64_t resize(std::uint64_t target_bytes);
     // port (sm_89): the Device pool every published entry lives in. An indexed expert bank points
     // its plane bases into this span and adds `offset(key)` per expert.
     [[nodiscard]] ConstMemorySpan pool() const;

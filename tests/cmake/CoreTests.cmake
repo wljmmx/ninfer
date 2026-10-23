@@ -49,6 +49,14 @@ ninfer_add_test(ninfer_kv_spill_file_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_kv_spill_file.cpp"
   LIBRARIES ninfer_core)
 
+ninfer_add_test(ninfer_vmm_pool_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_vmm_pool.cpp"
+  LIBRARIES ninfer_core)
+
+ninfer_add_test(ninfer_expert_pool_resize_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_expert_pool_resize.cpp"
+  LIBRARIES ninfer_core)
+
 ninfer_add_test(ninfer_state_store_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_state_store.cpp"
   LIBRARIES ninfer_core)
@@ -63,6 +71,8 @@ set_tests_properties(
   ninfer_arena_test
   ninfer_kv_cache_test
   ninfer_host_context_arena_test
+  ninfer_vmm_pool_test
+  ninfer_expert_pool_resize_test
   ninfer_state_store_test
   PROPERTIES SKIP_RETURN_CODE 77)
 

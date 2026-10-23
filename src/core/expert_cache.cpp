@@ -2,7 +2,11 @@
 
 #include <cuda_runtime.h>
 
+#include "core/vmm_pool.h"
+#include "core/device_scope.h"
+
 #include <algorithm>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -84,7 +88,16 @@ struct ExpertCache::Impl {
     static constexpr std::size_t kUploadBatch = 4;
     std::size_t max_entry_bytes               = 0;
     std::unique_ptr<PinnedHostBuffer> staging;
-    DeviceBuffer pool;
+    // port (sm_89): the pool is a VMM reservation rather than one cudaMalloc, so whole segments can
+    // be handed back to the driver while the pool is alive. Every expert offset indexes into this
+    // reservation, so shrinking the pool never moves a published entry.
+    static constexpr std::size_t kSegmentBytes = 8u << 20;
+    std::unique_ptr<VmmPool> pool;
+    // Bytes between two bank windows. Expert offsets inside a window stay `slot * slot_bytes`.
+    std::uint64_t window_stride = 0;
+    // Windows the reservation can hold, and windows currently backed by device memory.
+    std::uint64_t windows_max  = 0;
+    std::uint64_t windows_live = 0;
     std::vector<std::size_t> first; // flat entry index of each bank's expert 0
     std::vector<Entry> entries;
     std::vector<ExpertCacheKey> required;
@@ -112,8 +125,7 @@ struct ExpertCache::Impl {
           staging(req.max_entry_bytes
                       ? std::make_unique<PinnedHostBuffer>(
                             static_cast<std::size_t>(req.max_entry_bytes) * kUploadBatch)
-                      : nullptr),
-          pool(static_cast<std::size_t>(req.config.capacity_bytes)) {
+                      : nullptr) {
         if (req != describe_expert_cache(specs, req.config)) {
             throw std::invalid_argument("expert cache requirements differ from their sources");
         }
@@ -157,6 +169,16 @@ struct ExpertCache::Impl {
             for (std::uint32_t e = 0; e < banks[b].count; ++e) { slot_of[b][e] = e; }
         }
         ordinal    = device.device;
+        // port (sm_89): reserve one contiguous address range and back every window with its own
+        // segments. A window keeps its offset for the pool's lifetime; only its backing pages can
+        // be returned to the driver by resize().
+        window_stride = window_slots() * slot_bytes;
+        if (window_stride == 0) { throw std::invalid_argument("expert cache holds no window"); }
+        const auto reserved = static_cast<std::size_t>(
+            (req.config.capacity_bytes + kSegmentBytes - 1) / kSegmentBytes * kSegmentBytes);
+        pool = std::make_unique<VmmPool>(Device::cuda(ordinal), reserved, kSegmentBytes);
+        windows_max  = reserved / window_stride;
+        windows_live = windows_max;
     }
 
     // Keeps the first `experts` entries that fit in one window and marks every other expert of the
@@ -213,8 +235,44 @@ struct ExpertCache::Impl {
     }
 
     std::uint64_t window_count() const {
-        const auto slots = config.capacity_bytes / slot_bytes;
-        return window_slots() == 0 ? 0 : slots / window_slots();
+        return windows_live;
+    }
+
+    // Bytes the pool is allowed to use right now.
+    std::uint64_t live_bytes() const { return windows_live * window_stride; }
+
+    // Hands device memory back to (or takes it from) the driver. Windows above the new count are
+    // dropped, so their experts stream again; the caller must be at a layer boundary because an
+    // unmapped window that a kernel still reads is a use-after-free.
+    std::uint64_t resize(std::uint64_t target_bytes) {
+        if (!pool) { return 0; }
+        auto wanted = target_bytes / window_stride;
+        wanted      = std::max<std::uint64_t>(wanted, 1);
+        wanted      = std::min<std::uint64_t>(wanted, windows_max);
+        if (wanted == windows_live) { return live_bytes(); }
+        DeviceScope scope(Device::cuda(ordinal));
+        const auto settled = cudaDeviceSynchronize();
+        if (settled != cudaSuccess) {
+            throw std::runtime_error(std::string("expert pool resize: ") +
+                                     cudaGetErrorString(settled));
+        }
+        // Segments are fixed size, so the backing range is the window bytes rounded up.
+        const auto keep = static_cast<std::size_t>(
+            (wanted * window_stride + kSegmentBytes - 1) / kSegmentBytes * kSegmentBytes);
+        if (wanted < windows_live) {
+            for (std::uint32_t b = 0; b < banks.size(); ++b) {
+                if (window_of[b] == kAbsent || window_of[b] < wanted) { continue; }
+                window_of[b] = kAbsent;
+                for (std::uint32_t e = 0; e < banks[b].count; ++e) {
+                    entries[first[b] + e].ready = false;
+                }
+            }
+            pool->release(pool->mapped() - keep, keep);
+        } else {
+            pool->acquire(keep - pool->mapped());
+        }
+        windows_live = wanted;
+        return live_bytes();
     }
 
     // port (sm_89): a bank owns one contiguous run of slots, so its experts form a strided
@@ -265,19 +323,22 @@ struct ExpertCache::Impl {
         auto& entry = entries[index(key)];
         const auto slot = slot_of[key.bank][key.expert];
         if (slot == kAbsentSlot) { return; }
-        entry.offset = window_of[key.bank] * window_slots() * slot_bytes +
+        entry.offset = window_of[key.bank] * window_stride +
                        std::uint64_t(slot) * slot_bytes;
-        if (pool.p == nullptr) { throw std::runtime_error("expert pool has no Device storage"); }
-        if (entry.offset == kAbsent || entry.offset > pool.bytes ||
-            bank.entry_bytes > pool.bytes - entry.offset) {
+        if (!pool || pool->mapped() == 0) {
+            throw std::runtime_error("expert pool has no Device storage");
+        }
+        const auto limit = pool->mapped();
+        if (entry.offset == kAbsent || entry.offset > limit ||
+            bank.entry_bytes > limit - entry.offset) {
             throw std::runtime_error("expert slot is inconsistent: offset=" +
                                      std::to_string(entry.offset) + " entry=" +
                                      std::to_string(bank.entry_bytes) + " pool=" +
-                                     std::to_string(pool.bytes) + " bank=" +
+                                     std::to_string(limit) + " bank=" +
                                      std::to_string(key.bank) + " expert=" +
                                      std::to_string(key.expert));
         }
-        auto* base = static_cast<std::byte*>(pool.p) + entry.offset;
+        auto* base = static_cast<std::byte*>(pool->data()) + entry.offset;
 
         const ExpertFileEntry* file = nullptr;
         if (file_reader && key.bank < files.size() &&
@@ -419,23 +480,26 @@ std::uint64_t ExpertCache::used_bytes() const noexcept {
     }
     return windows * impl_->window_slots() * impl_->slot_bytes;
 }
-std::uint64_t ExpertCache::capacity_bytes() const noexcept { return impl_->config.capacity_bytes; }
+std::uint64_t ExpertCache::capacity_bytes() const noexcept { return impl_->live_bytes(); }
 std::uint64_t ExpertCache::slot_bytes() const { return impl_->slot_bytes; }
+std::uint64_t ExpertCache::resize(std::uint64_t target_bytes) { return impl_->resize(target_bytes); }
 std::uint64_t ExpertCache::window_origin(std::uint32_t bank) const {
     if (bank >= impl_->window_of.size() || impl_->window_of[bank] == kAbsent) {
         throw std::out_of_range("expert bank has no resident window");
     }
-    return impl_->window_of[bank] * impl_->window_slots() * impl_->slot_bytes;
+    return impl_->window_of[bank] * impl_->window_stride;
 }
 ConstMemorySpan ExpertCache::pool() const {
-    return {impl_->pool.p, impl_->pool.bytes, Device::cuda(impl_->ordinal)};
+    // The whole reserved range: a caller may address any window the pool can still provide, and an
+    // offset is only ever valid while resize() keeps that window mapped.
+    return {impl_->pool->data(), impl_->pool->size(), Device::cuda(impl_->ordinal)};
 }
 std::uint64_t ExpertCache::uploads() const noexcept { return impl_->uploads; }
 std::uint64_t ExpertCache::evictions() const noexcept { return impl_->evictions; }
 std::uint64_t ExpertCache::hits() const noexcept { return impl_->hits; }
 std::uint64_t ExpertCache::windows() const noexcept { return impl_->window_count(); }
 std::uint32_t ExpertCache::resident_capacity() const noexcept {
-    const auto slots = impl_->config.capacity_bytes / impl_->slot_bytes;
+    const auto slots = impl_->live_bytes() / impl_->slot_bytes;
     const auto widest = impl_->window_slots();
     return static_cast<std::uint32_t>(std::min<std::uint64_t>(slots, widest));
 }
