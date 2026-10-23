@@ -14,7 +14,8 @@ add_library(ninfer_core STATIC
 cuda_host.cpp
 memory.cpp
 memory_arena.cpp
-expert_cache.cpp
+  expert_cache.cpp
+  vmm_pool.cpp
 weight_bank.cpp
   device.cu
   dtype.cpp
@@ -34,4 +35,6 @@ weight_bank.cpp
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
 target_link_libraries(ninfer_core PUBLIC ninfer_cpu CUDA::cudart CUDA::nvtx3 Threads::Threads)
+# port (sm_89): VmmPool drives the driver VMM entry points directly.
+target_link_libraries(ninfer_core PUBLIC CUDA::cuda_driver)
 
