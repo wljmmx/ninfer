@@ -218,6 +218,21 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         const auto extents = checked_count(host_bytes / minimum_kv_stride);
         if (extents) {
             host_kv_extents = std::make_unique<HostKVExtentStore>(*host_kv_arena, extents);
+            // Optional third tier: with a spill file attached, a Host extent that does not fit
+            // first gives back redundant copies (Device still holds the bytes) and retries.
+            if (const char* spill_mb = std::getenv("NINFER_KV_SPILL_MB");
+                spill_mb != nullptr && *spill_mb != '\0') {
+                const long long mib = std::strtoll(spill_mb, nullptr, 10);
+                if (mib > 0) {
+                    const char* dir = std::getenv("NINFER_KV_SPILL_DIR");
+                    const auto root = (dir != nullptr && *dir != '\0')
+                                          ? std::filesystem::path(dir)
+                                          : std::filesystem::temp_directory_path();
+                    host_kv_extents->attach_spill_file(std::make_unique<KVSpillFile>(
+                        root / "ninfer-kv-spill.bin", static_cast<std::size_t>(mib) << 20,
+                        minimum_kv_stride));
+                }
+            }
         }
         phase.complete(host_bytes, host_bytes);
     }

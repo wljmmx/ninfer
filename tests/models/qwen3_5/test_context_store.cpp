@@ -1340,6 +1340,82 @@ void test_kv_spill_round_trip(ninfer::DeviceContext& device) {
     expect(host_backing.live_bytes() == live_before, "restore: the arena accounting returns");
 }
 
+// With a spill file attached, a Host extent that does not fit the arena first gives back a
+// redundant copy (one whose pages still have a Device replica) and retries. Nothing is lost: the
+// spilled pages keep a valid Host replica, and the Device replica was still authoritative.
+void test_kv_spill_reclaim(ninfer::DeviceContext& device) {
+    ninfer::LayoutBuilder builder;
+    ninfer::DeviceKVPagePoolSpec page_spec{
+        .page_group_count = 8,
+        .geometry =
+            {
+                .page_tokens        = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize),
+                .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}},
+            },
+    };
+    const ninfer::DeviceKVPagePoolLayout page_layout =
+        ninfer::plan_device_kv_page_pool(builder, page_spec);
+    const ninfer::KVExecutionTableLayout table_layout =
+        ninfer::plan_kv_execution_tables(builder, {.logical_page_capacity = 4, .table_rows = 2});
+    ninfer::DeviceArena arena(builder.finish(256));
+    const ninfer::DeviceSpan backing{arena.base(), arena.capacity()};
+    ninfer::DeviceKVPagePool physical_pages(backing, page_layout);
+    ninfer::KVExecutionTablePool physical_tables(backing, table_layout, physical_pages);
+    const ninfer::HostKVPageLayout host_layout =
+        ninfer::plan_host_kv_page_layout(physical_pages.geometry());
+    const std::array host_layouts{host_layout};
+    // Exactly one two-page extent fits, so the second reservation can only succeed by spilling.
+    ninfer::HostContextArena host_backing(host_layout.page_stride * 2, host_layout.page_stride);
+    ninfer::HostKVArena host_arena(host_backing, host_layouts);
+    store::LogicalKVPageStore pages(physical_pages, physical_pages.capacity_pages() + 8U);
+    store::HostKVExtentStore extents(host_arena, 8);
+    store::KVAddressSpaceStore addresses(pages, physical_tables, 4, 4);
+
+    const auto path = std::filesystem::temp_directory_path() / "ninfer-spill-reclaim.bin";
+    std::filesystem::remove(path);
+    extents.attach_spill_file(
+        std::make_unique<ninfer::KVSpillFile>(path, host_layout.page_stride * 8,
+                                              host_layout.page_stride));
+    expect(extents.spill_file() != nullptr, "reclaim fixture: a spill file is attached");
+
+    const auto publish_pair = [&](std::uint32_t row) {
+        const auto address = addresses.create_active(3, row, device.stream);
+        expect(address.has_value(), "reclaim fixture: active KV address");
+        addresses.ensure_mapped_to_tokens(*address, 65, device.stream);
+        addresses.commit_frontier(*address, 65);
+        device.synchronize();
+        const std::array pages_of{addresses.logical_page(*address, 0),
+                                  addresses.logical_page(*address, 1)};
+        auto backup = extents.prepare(pages, pages_of);
+        expect(backup.has_value(), "reclaim fixture: Host extent reservation");
+        if (!backup) { return std::array<store::LogicalKVPageHandle, 2>{}; }
+        const std::vector<ninfer::DeviceKVPageHandle> sources = extents.device_sources(*backup);
+        physical_pages.copy_to_host(sources, extents.writable_view(*backup),
+                                    device.transfer_stream);
+        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+        (void)extents.publish(std::move(*backup));
+        return pages_of;
+    };
+
+    const auto first = publish_pair(0);
+    expect(pages.host_resident(first[0]) && !pages.spilled(first[0]),
+           "reclaim fixture: the first pair is a plain Host replica");
+    expect(host_backing.free_bytes() == 0, "reclaim fixture: the arena is full");
+
+    const auto second = publish_pair(1);
+    expect(pages.host_resident(second[0]),
+           "reclaim: the second pair reserves a Host extent after the spill");
+    expect(pages.spilled(first[0]) && pages.spilled(first[1]),
+           "reclaim: the redundant copy moved to the file instead of being dropped");
+    expect(pages.host_replica_current(first[0]),
+           "reclaim: the spilled copy is still a valid Host replica");
+    expect(extents.spill_file()->resident_extents() >= 2,
+           "reclaim: the file holds the spilled images");
+    expect(extents.spill_file()->spilled_bytes() > 0, "reclaim: spill accounting is live");
+    // The file stays attached to the store, so KVSpillFile removes it when the store goes away.
+}
+
 } // namespace
 
 int main() {
@@ -1356,6 +1432,7 @@ int main() {
         test_state_store(device);
         test_kv_store(device);
         test_kv_spill_round_trip(device);
+        test_kv_spill_reclaim(device);
         test_cancel_alias_during_prefix_fork(device);
         test_shared_kv_directory(device);
         test_history_prefix_view(device, ninfer::PagedKVPlaneOrder::PageMajor);

@@ -107,6 +107,13 @@ public:
         const HostKVPageLayout& layout = page_layout(pages);
         std::optional<HostKVAllocation> allocation =
             arena_->allocate(layout, static_cast<std::uint32_t>(membership.size()));
+        if (!allocation && spill_file_) {
+            // The arena is full and a file tier is configured: give back redundant Host copies and
+            // try once more. A spill that frees nothing leaves the answer as it was.
+            (void)spill_redundant(
+                pages, layout.page_stride * static_cast<std::size_t>(membership.size()));
+            allocation = arena_->allocate(layout, static_cast<std::uint32_t>(membership.size()));
+        }
         if (!allocation) { return std::nullopt; }
 
         const std::uint32_t descriptor = free_[--free_count_];
@@ -176,6 +183,68 @@ public:
     [[nodiscard]] std::uint32_t page_count(const HostKVExtentReservation& reservation) const {
         validate(reservation);
         return extents_[reservation.descriptor_].page_count;
+    }
+
+    // Optional third tier. With a file attached, an extent reservation that does not fit the Host
+    // arena first gives back Host copies that are redundant (the Device replica still holds the
+    // bytes) and writes them to the file, then tries again.
+    void attach_spill_file(std::unique_ptr<KVSpillFile> file) noexcept {
+        spill_file_ = std::move(file);
+    }
+
+    [[nodiscard]] KVSpillFile* spill_file() const noexcept { return spill_file_.get(); }
+
+    // Spills redundant Host extents until at least `needed_bytes` have been given back, coldest
+    // first. Only extents whose every page still has a Device replica are eligible: the Host copy
+    // is then a backup, so moving it to the file cannot lose data or break a reader.
+    std::size_t spill_redundant(LogicalKVPageStore& pages, std::size_t needed_bytes) {
+        if (!spill_file_ || needed_bytes == 0) { return 0; }
+        struct Candidate {
+            std::uint32_t index;
+            std::uint64_t coldest;
+            std::size_t bytes;
+        };
+        std::vector<Candidate> candidates;
+        for (std::uint32_t index = 0; index < extents_.size(); ++index) {
+            const Extent& extent = extents_[index];
+            if (extent.state != ExtentState::Published || extent.page_store != &pages ||
+                !extent.allocation || extent.page_count == 0) {
+                continue;
+            }
+            bool redundant     = true;
+            std::uint64_t cold = std::numeric_limits<std::uint64_t>::max();
+            std::uint32_t node = extent.head;
+            for (std::uint32_t offset = 0; offset < extent.page_count; ++offset) {
+                if (node == kInvalidIndex) {
+                    redundant = false;
+                    break;
+                }
+                const LogicalKVPageHandle page = memberships_[node].page;
+                if (!pages.valid(page) || !pages.device_resident(page) ||
+                    pages.source_pins(page) != 0 || pages.spilled(page)) {
+                    redundant = false;
+                    break;
+                }
+                cold = std::min(cold, pages.content_epoch(page));
+                node = memberships_[node].next;
+            }
+            if (!redundant) { continue; }
+            candidates.push_back({index, cold,
+                                  static_cast<std::size_t>(extent.page_count) *
+                                      page_layout(pages).page_stride});
+        }
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const Candidate& a, const Candidate& b) { return a.coldest < b.coldest; });
+        std::size_t freed = 0;
+        for (const Candidate& candidate : candidates) {
+            if (freed >= needed_bytes) { break; }
+            const HostKVExtentCapability capability(this, candidate.index,
+                                                    extents_[candidate.index].generation);
+            if (spill(capability, *spill_file_, ++spill_epoch_).has_value()) {
+                freed += candidate.bytes;
+            }
+        }
+        return freed;
     }
 
     [[nodiscard]] HostKVExtentCapability publish(HostKVExtentReservation&& reservation) noexcept {
@@ -774,6 +843,8 @@ private:
     mutable std::uint32_t release_stamp_ = 0;
     std::vector<std::uint32_t> extent_scan_scratch_;
     std::vector<PartitionRun> partition_runs_;
+    std::unique_ptr<KVSpillFile> spill_file_;
+    std::uint64_t spill_epoch_ = 0;
 };
 
 inline HostKVExtentReservation::~HostKVExtentReservation() {
