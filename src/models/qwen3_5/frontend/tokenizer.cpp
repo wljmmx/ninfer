@@ -78,8 +78,13 @@ struct VocabMetadata {
 };
 
 Json read_json_asset(std::string_view contents, std::string_view label) {
+    // Parse a private copy: the borrowed view points into the artifact's host backing, and giving
+    // the parser its own buffer also keeps it from reading past the end of the object.
+    // These units are built for SSE2 because the nlohmann lexer faults under /arch:AVX2; see
+    // NINFER_JSON_UNITS in the top-level CMakeLists.
+    const std::string owned(contents);
     try {
-        return Json::parse(contents);
+        return Json::parse(owned);
     } catch (const nlohmann::json::exception& ex) {
         throw std::invalid_argument("malformed " + std::string(label) + ": " + ex.what());
     }

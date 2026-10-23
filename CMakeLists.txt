@@ -118,3 +118,80 @@ endif()
 if(NINFER_BUILD_BENCHMARKS)
   add_subdirectory(bench)
 endif()
+
+# --- nlohmann JSON analysis on SSE2 ------------------------------------------
+# The nlohmann lexer is unreliable when compiled with /arch:AVX2: parsing the 12 MB
+# tokenizer.json intermittently reports a corrupt error position and occasionally faults
+# inside std::string::push_back from lexer::scan_number. std::string and std::vector survive
+# the same AVX2 stress, and nlohmann 3.11.3 shows the same behaviour, so the exposure is the
+# library's lexer under that instruction set rather than the STL or a version regression.
+# JSON work here is cold (one startup parse, small request bodies), so these units build for
+# SSE2. The file-level option must come after the global /arch:AVX2 to take effect on MSVC.
+if(MSVC)
+  # Source-file properties live in a directory scope, so each unit has to be annotated in the
+  # directory whose CMakeLists owns its target (not the unit's own subdirectory).
+  set_source_files_properties(
+    "${PROJECT_SOURCE_DIR}/src/artifact/file_io.cpp"
+    "${PROJECT_SOURCE_DIR}/src/artifact/formats.cpp"
+    "${PROJECT_SOURCE_DIR}/src/artifact/layouts.cpp"
+    "${PROJECT_SOURCE_DIR}/src/artifact/schema.cpp"
+    DIRECTORY "${PROJECT_SOURCE_DIR}/src/artifact"
+    PROPERTIES COMPILE_OPTIONS "/arch:SSE2")
+
+  set_source_files_properties(
+    "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/config.cpp"
+    "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/measurement.cpp"
+    "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/frontend/chat_template.cpp"
+    "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/frontend/frontend.cpp"
+    "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/frontend/output_session.cpp"
+    "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/frontend/resources.cpp"
+    "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/frontend/tokenizer.cpp"
+    "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/frontend/tool_call_parser.cpp"
+    "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/frontend/tool_contract.cpp"
+    "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/frontend/tool_grammar.cpp"
+    DIRECTORY "${PROJECT_SOURCE_DIR}/src/models"
+    PROPERTIES COMPILE_OPTIONS "/arch:SSE2")
+
+  set_source_files_properties(
+    "${PROJECT_SOURCE_DIR}/src/product/prompt_input/prompt_input.cpp"
+    DIRECTORY "${PROJECT_SOURCE_DIR}/src/product"
+    PROPERTIES COMPILE_OPTIONS "/arch:SSE2")
+
+  set_source_files_properties(
+    "${PROJECT_SOURCE_DIR}/src/runtime/engine/context_cache/context_cost.cpp"
+    DIRECTORY "${PROJECT_SOURCE_DIR}/src/runtime"
+    PROPERTIES COMPILE_OPTIONS "/arch:SSE2")
+
+  set_source_files_properties(
+    "${PROJECT_SOURCE_DIR}/src/serve/anthropic_messages_response.cpp"
+    "${PROJECT_SOURCE_DIR}/src/serve/http_server.cpp"
+    "${PROJECT_SOURCE_DIR}/src/serve/http_transport.cpp"
+    "${PROJECT_SOURCE_DIR}/src/serve/openai_chat_http.cpp"
+    "${PROJECT_SOURCE_DIR}/src/serve/openai_chat_request.cpp"
+    "${PROJECT_SOURCE_DIR}/src/serve/openai_chat_response.cpp"
+    "${PROJECT_SOURCE_DIR}/src/serve/openai_common.cpp"
+    "${PROJECT_SOURCE_DIR}/src/serve/openai_responses_http.cpp"
+    "${PROJECT_SOURCE_DIR}/src/serve/openai_responses_request.cpp"
+    "${PROJECT_SOURCE_DIR}/src/serve/openai_responses_response.cpp"
+    "${PROJECT_SOURCE_DIR}/src/serve/openai_responses_state.cpp"
+    "${PROJECT_SOURCE_DIR}/src/serve/openai_responses_store.cpp"
+    "${PROJECT_SOURCE_DIR}/src/serve/request_log.cpp"
+    "${PROJECT_SOURCE_DIR}/src/serve/request_validation.cpp"
+    "${PROJECT_SOURCE_DIR}/src/serve/translate.cpp"
+    DIRECTORY "${PROJECT_SOURCE_DIR}/src/serve"
+    PROPERTIES COMPILE_OPTIONS "/arch:SSE2")
+
+  set_source_files_properties(
+    "${PROJECT_SOURCE_DIR}/src/text/grammar.cpp"
+    "${PROJECT_SOURCE_DIR}/src/text/json_input.cpp"
+    "${PROJECT_SOURCE_DIR}/src/text/json_schema.cpp"
+    "${PROJECT_SOURCE_DIR}/src/text/schema_composition.cpp"
+    DIRECTORY "${PROJECT_SOURCE_DIR}/src/text"
+    PROPERTIES COMPILE_OPTIONS "/arch:SSE2")
+
+  # jinja.cpp is owned by the ninfer_jinja target declared under third_party/llama-jinja.
+  set_source_files_properties(
+    "${PROJECT_SOURCE_DIR}/src/text/jinja.cpp"
+    DIRECTORY "${PROJECT_SOURCE_DIR}/third_party/llama-jinja"
+    PROPERTIES COMPILE_OPTIONS "/arch:SSE2")
+endif()
