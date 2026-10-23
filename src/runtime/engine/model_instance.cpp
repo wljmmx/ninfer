@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
+#include <filesystem>
 #include <set>
 #include <stdexcept>
 #include <utility>
@@ -498,16 +499,30 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
             !kv_capacity_shortage(error) || std::getenv("NINFER_NO_EXPERT_FALLBACK") != nullptr) {
             throw;
         }
-        EngineOptions fallback            = options;
-        fallback.expert_host_copy         = true;
-        fallback.expert_cache_bytes       = kExpertCacheAuto;
+        // The routed experts can live in host RAM or be read from the artifact on demand. RAM is
+        // the faster tier (~15 against ~9 tok/s here), but the retained replica needs the whole
+        // expert payload resident, so the file tier takes over when RAM cannot hold it. The
+        // payload is about three quarters of the artifact (the dense part is the rest), and a
+        // quarter of the free RAM stays with the rest of the system.
+        std::error_code size_error;
+        const auto artifact_bytes   = std::filesystem::file_size(options.artifact_path, size_error);
+        const auto free_host_bytes  = current_free_host_bytes();
+        const auto expert_estimate  = artifact_bytes / 4 * 3;
+        bool ram_fits = !size_error && artifact_bytes != 0 &&
+                        (free_host_bytes == 0 || free_host_bytes / 4 * 3 >= expert_estimate);
+        if (const char* forced = std::getenv("NINFER_EXPERT_FALLBACK"); forced != nullptr && *forced) {
+            ram_fits = std::strcmp(forced, "file") != 0;
+        }
+        EngineOptions fallback      = options;
+        fallback.expert_host_copy   = ram_fits;
+        fallback.expert_cache_bytes = kExpertCacheAuto;
         // The routed banks upload and synchronize inside each layer, which a captured graph
         // cannot contain (normalize_engine_options sets the same constraint for the switch).
-        fallback.use_cuda_graph           = false;
+        fallback.use_cuda_graph     = false;
         std::fprintf(stderr,
                      "[fallback] resident weights leave no room for the requested KV capacity "
-                     "(%s); retrying with the routed experts on the host - decode will be slower\n",
-                     error.what());
+                     "(%s); retrying with the routed experts in %s - decode will be slower\n",
+                     error.what(), ram_fits ? "host RAM" : "the artifact, no RAM replica fits");
         std::fflush(stderr);
         auto constructed = construct_model_once(fallback, device);
         // The engine reads the flags back when it runs, so it has to see the mode that is
