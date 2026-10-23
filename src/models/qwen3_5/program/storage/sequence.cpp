@@ -1048,8 +1048,15 @@ std::uint32_t ProgramImpl::demote_absent_pages_to_host(KVAddressSpaceStore& addr
         }
     }
     last_demote_block_mask_ = block_mask;
-    last_demoted_pages_ = demoted;
-    last_demote_stage_  = 5;
+    last_demoted_pages_     = demoted;
+    last_demote_stage_      = 5;
+    if (demoted == 0 && std::getenv("NINFER_KV_DEMOTE_DEBUG") != nullptr) {
+        std::fprintf(stderr,
+                     "[demote] nothing demoted: candidates=%zu block_mask=0x%x live=%u "
+                     "window=%u sink=%u keep=%zu\n",
+                     membership.size(), block_mask, live, window_pages, sink_pages, keep_pages.size());
+        std::fflush(stderr);
+    }
     // appendix FH (M3 3.2d): the `kv tiers` counters for the Device -> Host direction. Pages are
     // what actually reached Host; the bytes are the batch's payload - the whole reservation was
     // copied, so this is the transfer's real cost, not just the surviving subset's.
