@@ -212,8 +212,11 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
 
             Tensor step0_ids   = step_candidate_view(0);
             Tensor step0_probs = step_proposal_view(0);
+            // Position 0 must be masked with bitmap column 0, or the first draft is drawn from the
+            // unconstrained head and the verifier rejects it every round.
             card.mtp_propose_topk_strided(ar_hidden, proposal_logits, draft0, step0_ids,
-                                          step0_probs, topk_width, candidate_stride);
+                                          step0_probs, topk_width, candidate_stride,
+                                          state.host_ingress.sampling[0].mask);
             for (std::uint32_t step = 0; step + 1 < k; ++step) {
                 Tensor previous =
                     next_drafts.slice(1, static_cast<std::int32_t>(step), 1).view({batch_size});
@@ -236,23 +239,10 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                               mtp_rows, envelopes.ar[step], next_hidden_batch);
                 Tensor step_ids   = step_candidate_view(static_cast<std::int32_t>(step) + 1);
                 Tensor step_probs = step_proposal_view(static_cast<std::int32_t>(step) + 1);
-                {
-                    if (std::getenv("NINFER_MTP_DEBUG") != nullptr) {
-                        static bool reported = false;
-                        if (!reported) {
-                            reported = true;
-                            const auto& probe = state.host_ingress.sampling[0].mask;
-                            std::fprintf(stderr,
-                                         "[mtp-mask] row0 words=%p stride=%d constrained=%d\n",
-                                         static_cast<const void*>(probe.words),
-                                         static_cast<int>(probe.stride),
-                                         probe.words != nullptr ? 1 : 0);
-                        }
-                    }
-                }
                 card.mtp_propose_topk_strided(next_hidden, proposal_logits, next, step_ids,
                                               step_probs, topk_width, candidate_stride,
-                                              state.host_ingress.sampling[0].mask);
+                                              state.host_ingress.sampling[0].mask,
+                                              static_cast<std::int32_t>(step) + 1);
                 CUDA_CHECK(cudaMemcpyAsync(ar_hidden.data, next_hidden.data, ar_hidden.bytes(),
                                            cudaMemcpyDeviceToDevice,
                                            state.execution.device.stream));

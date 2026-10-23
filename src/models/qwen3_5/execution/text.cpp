@@ -584,7 +584,7 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
         // here because its ids live in a reduced domain and the bitmap is over the public
         // vocabulary.
         Tensor output_logits = matrix_window(logits, T);
-        project(hidden, mtp_->output_head, output_logits, work_, ctx_.stream);
+        project(hidden, *lm_head_, output_logits, work_, ctx_.stream);
         std::vector<ops::SamplingConfig> configs(static_cast<std::size_t>(T));
         for (int t = 0; t < T; ++t) {
             configs[static_cast<std::size_t>(t)].temperature = 0.0f; // greedy
@@ -893,7 +893,7 @@ void TextContext::mtp_propose_topk(const Tensor& hidden, Tensor& logits, Tensor&
         auto proposal_scope  = work_.scope();
         const auto domain    = dimension(config_.vocab_size);
         Tensor output_logits = work_.alloc(DType::BF16, {domain, batch});
-        project(hidden, mtp_->output_head, output_logits, work_, ctx_.stream);
+        project(hidden, *lm_head_, output_logits, work_, ctx_.stream);
         Tensor masked = work_.alloc(DType::BF16, {domain, batch});
         ops::apply_sampling_mask(output_logits, masked, mask, ctx_.stream);
         ops::logits_topk_softmax(masked, *candidate_ids, *proposal_q, draft_tokens, nullptr, top_k,
@@ -922,11 +922,15 @@ void TextContext::mtp_propose_topk(const Tensor& hidden, Tensor& logits, Tensor&
 void TextContext::mtp_propose_topk_strided(const Tensor& hidden, Tensor& logits,
                                            Tensor& draft_tokens, Tensor& candidate_ids,
                                            Tensor& proposal_q, std::int32_t top_k,
-                                           std::int32_t column_stride, ops::SamplingMask mask) {
+                                           std::int32_t column_stride, ops::SamplingMask mask,
+                                           std::int32_t mask_column) {
     const std::int32_t batch = hidden.ne[1];
     require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), batch},
                          "MTP propose-topk hidden");
     require_tensor_shape(draft_tokens, DType::I32, {batch}, "MTP topk draft tokens");
+    if (mask.words != nullptr && mask_column > 0 && batch == 1) {
+        mask.words = mask.words + static_cast<std::ptrdiff_t>(mask_column) * mask.stride;
+    }
 
     auto proposal_scope = work_.scope();
     nvtx::ScopedRange proposal_range(nvtx::Name::MtpProposal, nvtx::Category::Mtp,
@@ -943,7 +947,7 @@ void TextContext::mtp_propose_topk_strided(const Tensor& hidden, Tensor& logits,
         }
         Tensor output_logits =
             work_.alloc(DType::BF16, {dimension(config_.vocab_size), batch});
-        project(hidden, mtp_->output_head, output_logits, work_, ctx_.stream);
+        project(hidden, *lm_head_, output_logits, work_, ctx_.stream);
         Tensor masked = work_.alloc(DType::BF16, {dimension(config_.vocab_size), batch});
         ops::apply_sampling_mask(output_logits, masked, mask, ctx_.stream);
         ops::logits_topk_softmax(masked, candidate_ids, proposal_q, draft_tokens, nullptr, top_k,
