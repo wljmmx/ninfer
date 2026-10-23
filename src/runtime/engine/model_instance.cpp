@@ -58,7 +58,7 @@ void expert_debug(const char* stage, std::uint64_t first = 0, std::uint64_t seco
 }
 
 void attach_expert_cache(ModelInstance& instance, const EngineOptions& options,
-                         DeviceContext& device) {
+                         DeviceContext& device, std::size_t kv_reserve_bytes) {
     std::vector<ExpertStream*> streams;
     for (const auto& layer : instance.parameters.text.layers) { collect_streams(layer.ffn, streams); }
     if (instance.parameters.mtp) {
@@ -94,16 +94,17 @@ void attach_expert_cache(ModelInstance& instance, const EngineOptions& options,
     const auto entry = probe.max_entry_bytes;
     auto requested   = options.expert_cache_bytes;
     if (requested == kExpertCacheAuto) {
-        // Take what is free now and leave room for the KV arena, workspace and graphs; the
-        // planner runs after this, so the pool has to hold back on its behalf.
+        // The KV arena is planned first and already knows its exact reservation, so the pool takes
+        // everything above it instead of guessing a fixed 6 GiB: on a 256K/k8v4 run that guess
+        // left 3.8 GiB idle while 28% of the experts still streamed from the host.
         std::size_t free_bytes = 0, total_bytes = 0;
         if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess || free_bytes == 0) {
             throw std::runtime_error("expert cache auto sizing cannot read device memory");
         }
-        // Leave room for the KV arena, workspaces and graphs; taking all free memory makes the
-        // planner fail later, after a long allocation.
-        const auto reserve = std::size_t{6} << 30;
-        requested = free_bytes > reserve ? free_bytes - reserve : 0;
+        // Graph capture and the staging buffers still need room after the pool takes its share.
+        constexpr std::size_t kPoolSafetyBytes = 1ULL << 30;
+        const auto pledged = kv_reserve_bytes + kPoolSafetyBytes;
+        requested          = free_bytes > pledged ? free_bytes - pledged : 0;
     }
     // Whole windows only: a partial window is dead space and would make the slot count odd.
     std::uint64_t widest = 0;
@@ -380,10 +381,6 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
     StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
     auto instance = std::make_unique<ModelInstance>(std::move(model), options);
     frontend.complete();
-    if (options.expert_cache_bytes != 0) {
-        attach_expert_cache(*instance, options, device);
-        device.synchronize();
-    }
     StartupPhaseScope planning(options.startup_observer, StartupPhase::TargetFinalize);
     const auto signature = models::qwen3_5::prefill_signature(*instance->model);
     auto context_cost    = resolve_context_machine_cost(
@@ -395,7 +392,14 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
     const auto capacity_curve = planner.capacity_curve();
     auto resolution = resolve_kv_capacity(options.kv_capacity, planner.capacity_curve(),
                                           current_free_device_bytes(options.wddm_evictable_budget));
-    auto sequence   = std::move(planner).finalize(resolution.main_page_groups);
+    // The KV plan is settled before the expert pool is sized, so the pool can take everything the
+    // arena does not need instead of holding back a fixed amount.
+    if (options.expert_cache_bytes != 0) {
+        attach_expert_cache(*instance, options, device,
+                            resolution.runtime_reservation_bytes);
+        device.synchronize();
+    }
+    auto sequence = std::move(planner).finalize(resolution.main_page_groups);
     if (sequence.device_reservation_bytes() != resolution.runtime_reservation_bytes ||
         sequence.kv_capacity() != resolution.resolved_tokens) {
         throw std::logic_error("resolved KV capacity does not match the finalized Program plan");
