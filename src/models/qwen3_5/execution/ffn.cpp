@@ -53,8 +53,8 @@ std::size_t stream_route_tensor_bytes(const RoutedMoeParameters& moe, std::int32
 // arrives as FP32 from the device, and the three contributions are summed before a single BF16
 // rounding, which is what the device epilogue does on the resident path.
 void host_routed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe,
-                     const ops::ExpertRoutes& routes, const Tensor& shared_f32, Tensor& residual,
-                     DeviceExecutionView execution) {
+                     const ops::ExpertRoutes& routes, const ops::ExpertSubset& subset,
+                     const Tensor& shared_f32, Tensor& residual, DeviceExecutionView execution) {
     auto* host = moe.stream->host();
     if (host == nullptr) { throw std::runtime_error("host routed ffn: no host tier"); }
     const auto cols   = hidden.ne[0];
@@ -108,7 +108,7 @@ void host_routed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe,
     MemoryArena arena(
         MemorySpan{scratch.data() + aligned, bytes, Device::cpu()});
     ops::routed_swiglu(x_cpu, moe.profile.routed, host->experts(ExpertBankId{moe.stream->bank_index()}), routes_cpu,
-                       ops::ExpertSubset{ops::ExpertSubsetKind::All, {}}, out_cpu, arena, cpu);
+                       subset, out_cpu, arena, cpu);
     if (std::getenv("NINFER_HOST_DEBUG")) {
         std::fprintf(stderr, "[host-x] bank=%u x0..3=%.6f %.6f %.6f %.6f\n",
                      moe.stream->bank_index(),
@@ -181,11 +181,33 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
                                ops::ExpertSubset{ops::ExpertSubsetKind::None, {}},
                                ops::ScaledSwiGLUTerm{moe.shared, shared_coefficients},
                                ops::MoeEpilogue::Write, shared_f32, shared_arena, execution);
-            host_routed_ffn(hidden, moe, routes, shared_f32, residual, execution);
+            host_routed_ffn(hidden, moe, routes, ops::ExpertSubset{ops::ExpertSubsetKind::All, {}},
+                            shared_f32, residual, execution);
             return;
         }
     } catch (const std::exception& error) {
         throw std::invalid_argument(std::string("expert stream upload: ") + error.what());
+    }
+    if (!moe.stream->fully_resident()) {
+        // Split layer: the pool holds the experts this layer routes to most, the host tier covers
+        // the rest. Both halves land in FP32 and are folded into the residual once, so a split
+        // layer rounds exactly like a resident or a fully hosted one.
+        auto mixed_f32 = workspace.alloc(DType::FP32, {hidden.ne[0], columns});
+        MemoryArena mixed_arena(MemorySpan{scratch.data, scratch.bytes, execution.device()});
+        const auto mask_host = moe.stream->resident_mask_host();
+        const auto mask_size = static_cast<std::int32_t>(mask_host.size());
+        Tensor device_mask(const_cast<void*>(moe.stream->resident_mask()), execution.device(),
+                           DType::I32, {mask_size});
+        ops::routed_swiglu(hidden, routed, moe.stream->experts(), routes,
+                           ops::ExpertSubset{ops::ExpertSubsetKind::MaskOnes, device_mask},
+                           ops::ScaledSwiGLUTerm{moe.shared, shared_coefficients},
+                           ops::MoeEpilogue::Write, mixed_f32, mixed_arena, execution);
+        Tensor host_mask(const_cast<std::int32_t*>(mask_host.data()), Device::cpu(), DType::I32,
+                         {mask_size});
+        host_routed_ffn(hidden, moe, routes,
+                        ops::ExpertSubset{ops::ExpertSubsetKind::MaskZeros, host_mask}, mixed_f32,
+                        residual, execution);
+        return;
     }
     try {
         // streamed bank reproduces for this artifact.

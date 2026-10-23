@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <numeric>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -97,6 +98,7 @@ void ExpertStream::attach(ExpertCache& cache, std::uint32_t bank, const ExpertBa
         mask[expert] = 1;
     }
     mask_device_ = std::make_unique<DeviceBuffer>(mask.size() * sizeof(std::int32_t));
+    mask_host_   = mask;
     const auto mask_bytes = mask.size() * sizeof(std::int32_t);
     const auto mask_copy  = cudaMemcpy(mask_device_->p, mask.data(), mask_bytes,
                                        cudaMemcpyHostToDevice);
@@ -112,9 +114,11 @@ bool ExpertStream::fully_resident() const noexcept {
 bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32_t tokens,
                           cudaStream_t stream) {
     if (cache_ == nullptr) { throw std::logic_error("expert stream is not attached"); }
-    // One window holds a whole layer, so a pool that cannot hold every expert of this bank cannot
-    // serve it. Report that instead of letting ensure_window throw from deep inside the upload.
-    if (cache_->resident_capacity() < count_) { return false; }
+    // One window holds a whole layer when the pool is large enough; otherwise the window shrinks to
+    // the pool and the caller splits the layer between the Device pool and the host tier.
+    const auto capacity = cache_->resident_capacity();
+    if (capacity == 0) { return false; }
+    const bool fully = capacity >= count_;
     const auto values = static_cast<std::size_t>(top_k) * static_cast<std::size_t>(tokens);
     const auto bytes  = values * sizeof(std::int32_t);
     // port (sm_89): the host must know the routed experts before it can publish them, so one
@@ -131,12 +135,41 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
 
     // Port (sm_89): every routed expert must be resident before the consumer runs, so the
     // required set is deduplicated and published in one batch.
-    required_.clear();
     for (std::size_t i = 0; i < values; ++i) {
         const auto expert = route_ids[i];
         if (expert < 0 || static_cast<std::uint32_t>(expert) >= count_) {
             throw std::out_of_range("expert stream received a route outside its bank");
         }
+    }
+    // A pool smaller than one bank keeps the experts this layer actually routes to, most used
+    // first. The rest stay out of the window and are masked off for the host tier.
+    if (!fully) {
+        std::vector<std::uint32_t> frequency(count_, 0);
+        for (std::size_t i = 0; i < values; ++i) {
+            ++frequency[static_cast<std::size_t>(route_ids[i])];
+        }
+        std::vector<std::uint32_t> order(count_);
+        std::iota(order.begin(), order.end(), 0U);
+        std::stable_sort(order.begin(), order.end(), [&](std::uint32_t a, std::uint32_t b) {
+            return frequency[a] > frequency[b];
+        });
+        order.resize(capacity);
+        cache_->set_resident_experts(bank_, order);
+        std::fill(offsets_.begin(), offsets_.end(), 0);
+        std::vector<std::int32_t> mask(count_, 0);
+        for (std::uint32_t slot = 0; slot < order.size(); ++slot) {
+            offsets_[order[slot]] = static_cast<std::uint64_t>(slot) * cache_->slot_bytes();
+            mask[order[slot]]      = 1;
+        }
+        mask_host_ = mask;
+        const auto table_bytes = offsets_.size() * sizeof(std::uint64_t);
+        (void)cudaMemcpy(offsets_device_->p, offsets_.data(), table_bytes, cudaMemcpyHostToDevice);
+        (void)cudaMemcpy(mask_device_->p, mask.data(), mask.size() * sizeof(std::int32_t),
+                         cudaMemcpyHostToDevice);
+    }
+    required_.clear();
+    for (std::size_t i = 0; i < values; ++i) {
+        const auto expert = route_ids[i];
         required_.push_back(keys_[static_cast<std::size_t>(expert)]);
     }
     std::sort(required_.begin(), required_.end(), [](const ExpertCacheKey& a, const ExpertCacheKey& b) {
@@ -189,3 +222,4 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
 }
 
 } // namespace ninfer::models::qwen3_5::execution
+

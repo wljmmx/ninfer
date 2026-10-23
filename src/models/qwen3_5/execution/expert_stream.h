@@ -37,6 +37,10 @@ public:
     [[nodiscard]] const void* resident_mask() const noexcept {
         return mask_device_ ? mask_device_->p : nullptr;
     }
+    // Host copy of the same mask, for the CPU half of a split layer.
+    [[nodiscard]] std::span<const std::int32_t> resident_mask_host() const noexcept {
+        return mask_host_;
+    }
     [[nodiscard]] bool fully_resident() const noexcept;
     [[nodiscard]] bool attached() const noexcept { return cache_ != nullptr; }
     // Host half of a split tier; null when the Device pool holds every expert.
@@ -81,6 +85,7 @@ private:
     // One entry per expert: 1 when the pool holds it. A partial resident set drives the GPU
     // through ExpertSubsetKind::MaskOnes and leaves the rest to the host tier.
     std::unique_ptr<DeviceBuffer> mask_device_;
+    std::vector<std::int32_t> mask_host_;
     std::unique_ptr<PinnedHostBuffer> route_staging_;
     ops::CudaSwiGLUExperts experts_{};
 };

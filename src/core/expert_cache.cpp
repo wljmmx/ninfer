@@ -11,6 +11,7 @@ namespace ninfer {
 namespace {
 
 constexpr std::uint64_t kAbsent = std::numeric_limits<std::uint64_t>::max();
+constexpr std::uint32_t kAbsentSlot = std::numeric_limits<std::uint32_t>::max();
 
 std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
     return (value + alignment - 1) / alignment * alignment;
@@ -87,6 +88,9 @@ struct ExpertCache::Impl {
     std::vector<std::uint64_t> window_of;
     std::vector<std::uint64_t> last_window_use;
     std::vector<std::uint64_t> window_hits;
+    // Slot index of each expert inside its bank window, or kAbsentSlot when the pool does not hold
+    // it. The default is the identity, so a fully resident bank keeps addressing expert i at slot i.
+    std::vector<std::vector<std::uint32_t>> slot_of;
     int ordinal = 0;
 
     Impl(std::span<const ExpertBankSpec> specs, const ExpertCacheRequirements& req,
@@ -119,7 +123,41 @@ struct ExpertCache::Impl {
         window_of.assign(banks.size(), kAbsent);
         last_window_use.assign(banks.size(), 0);
         window_hits.assign(banks.size(), 0);
+        slot_of.resize(banks.size());
+        for (std::size_t b = 0; b < banks.size(); ++b) {
+            slot_of[b].resize(banks[b].count);
+            for (std::uint32_t e = 0; e < banks[b].count; ++e) { slot_of[b][e] = e; }
+        }
         ordinal    = device.device;
+    }
+
+    // Keeps the first `experts` entries that fit in one window and marks every other expert of the
+    // bank absent. The caller recomputes and republishes its offset table afterwards.
+    void set_resident(std::uint32_t bank, std::span<const std::uint32_t> experts) {
+        if (bank >= banks.size()) { throw std::out_of_range("expert cache bank"); }
+        auto& slots = slot_of[bank];
+        std::vector<std::uint32_t> next(slots.size(), kAbsentSlot);
+        const auto limit = window_slots();
+        std::uint32_t next_slot = 0;
+        for (const std::uint32_t expert : experts) {
+            if (expert >= next.size()) { throw std::out_of_range("expert cache expert"); }
+            if (next_slot >= limit) { break; }
+            next[expert] = next_slot++;
+        }
+        // Consecutive layers of the same bank usually route to the same experts. Keeping the window
+        // when the set is unchanged turns a per-token reupload into a hit.
+        if (next == slots) { return; }
+        slots = std::move(next);
+        for (std::uint32_t e = 0; e < banks[bank].count; ++e) {
+            entries[first[bank] + e].ready = false;
+        }
+        window_of[bank] = kAbsent;
+        required.erase(std::remove_if(required.begin(), required.end(),
+                                      [&](const ExpertCacheKey& key) {
+                                          return key.bank == bank &&
+                                                 slot_of[bank][key.expert] == kAbsentSlot;
+                                      }),
+                       required.end());
     }
 
     std::size_t index(ExpertCacheKey key) const {
@@ -194,7 +232,10 @@ struct ExpertCache::Impl {
         const auto& bank = banks[key.bank];
         ensure_window(key.bank);
         auto& entry = entries[index(key)];
-        entry.offset = window_of[key.bank] * window_slots() * slot_bytes + std::uint64_t(key.expert) * slot_bytes;
+        const auto slot = slot_of[key.bank][key.expert];
+        if (slot == kAbsentSlot) { return; }
+        entry.offset = window_of[key.bank] * window_slots() * slot_bytes +
+                       std::uint64_t(slot) * slot_bytes;
         if (pool.p == nullptr) { throw std::runtime_error("expert pool has no Device storage"); }
         if (entry.offset == kAbsent || entry.offset > pool.bytes ||
             bank.entry_bytes > pool.bytes - entry.offset) {
@@ -285,7 +326,20 @@ ExpertCache::ExpertCache(std::span<const ExpertBankSpec> specs,
 ExpertCache::~ExpertCache() = default;
 
 void ExpertCache::prepare(std::span<const ExpertCacheKey> required) {
-    impl_->required.assign(required.begin(), required.end());
+    // Experts the pool does not hold are dropped here: the caller masks them out of the GPU job and
+    // serves them from the host tier, so uploading them would only evict a resident expert.
+    impl_->required.clear();
+    for (const auto& key : required) {
+        if (key.bank < impl_->slot_of.size() && key.expert < impl_->slot_of[key.bank].size() &&
+            impl_->slot_of[key.bank][key.expert] != kAbsentSlot) {
+            impl_->required.push_back(key);
+        }
+    }
+}
+
+void ExpertCache::set_resident_experts(std::uint32_t bank,
+                                       std::span<const std::uint32_t> experts) {
+    impl_->set_resident(bank, experts);
 }
 
 ExpertCacheProgress ExpertCache::progress() {
@@ -308,6 +362,7 @@ std::optional<std::uint64_t> ExpertCache::offset(ExpertCacheKey key) const {
         key.expert >= impl_->banks[key.bank].count) {
         return std::nullopt;
     }
+    if (impl_->slot_of[key.bank][key.expert] == kAbsentSlot) { return std::nullopt; }
     const auto& entry = impl_->entries[impl_->index(key)];
     if (!entry.ready) { return std::nullopt; }
     return entry.offset;

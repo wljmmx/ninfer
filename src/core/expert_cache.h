@@ -102,6 +102,12 @@ public:
     // Declares the experts the next layer needs; they are uploaded by progress().
     void prepare(std::span<const ExpertCacheKey> required);
 
+    // Names the experts of one bank the pool should hold. Experts not listed are treated as
+    // absent: prepare() skips them and offset() reports nullopt, which lets the caller mask them
+    // out of the GPU job and hand them to the host tier. At most resident_capacity() experts are
+    // honoured; the rest are dropped from the end of the list.
+    void set_resident_experts(std::uint32_t bank, std::span<const std::uint32_t> experts);
+
     // Uploads one batch if a slot is free. Never blocks.
     [[nodiscard]] ExpertCacheProgress progress();
 
