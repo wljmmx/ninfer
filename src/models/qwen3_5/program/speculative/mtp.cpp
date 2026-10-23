@@ -236,6 +236,20 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                               mtp_rows, envelopes.ar[step], next_hidden_batch);
                 Tensor step_ids   = step_candidate_view(static_cast<std::int32_t>(step) + 1);
                 Tensor step_probs = step_proposal_view(static_cast<std::int32_t>(step) + 1);
+                {
+                    if (std::getenv("NINFER_MTP_DEBUG") != nullptr) {
+                        static bool reported = false;
+                        if (!reported) {
+                            reported = true;
+                            const auto& probe = state.host_ingress.sampling[0].mask;
+                            std::fprintf(stderr,
+                                         "[mtp-mask] row0 words=%p stride=%d constrained=%d\n",
+                                         static_cast<const void*>(probe.words),
+                                         static_cast<int>(probe.stride),
+                                         probe.words != nullptr ? 1 : 0);
+                        }
+                    }
+                }
                 card.mtp_propose_topk_strided(next_hidden, proposal_logits, next, step_ids,
                                               step_probs, topk_width, candidate_stride,
                                               state.host_ingress.sampling[0].mask);

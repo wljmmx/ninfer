@@ -933,6 +933,14 @@ void TextContext::mtp_propose_topk_strided(const Tensor& hidden, Tensor& logits,
                                      static_cast<std::uint64_t>(batch));
 
     if (mask.words != nullptr) {
+        if (std::getenv("NINFER_MTP_DEBUG") != nullptr) {
+            static bool reported = false;
+            if (!reported) {
+                reported = true;
+                std::fprintf(stderr, "[mtp-mask] strided reached with bitmap stride=%d\n",
+                             mask.stride);
+            }
+        }
         Tensor output_logits =
             work_.alloc(DType::BF16, {dimension(config_.vocab_size), batch});
         project(hidden, mtp_->output_head, output_logits, work_, ctx_.stream);
