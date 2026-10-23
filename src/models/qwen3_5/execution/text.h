@@ -163,7 +163,8 @@ public:
                            const Tensor* input_embeddings        = nullptr);
     void mtp_forward_ar_step(const Tensor& token, const Tensor& previous_hidden,
                              const Tensor& position, ops::CausalAttentionExecutionEnvelope envelope,
-                             Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token);
+                             Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token,
+                             ops::SamplingMask mask = {});
 private:
     [[nodiscard]] bool mtp_enabled() const noexcept {
         return mtp_kv_.valid() || batch_mtp_kv_ != nullptr;
@@ -198,7 +199,12 @@ private:
                            const Tensor& positions, const Tensor& rope_positions,
                            ops::CausalAttentionExecutionEnvelope envelope, bool final_chunk,
                            Tensor* final_hidden, Tensor* logits, Tensor* draft_token);
-    void proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens);
+    // `mask` carries one constraint bitmap per proposal position (stride apart). When it is null the
+    // proposal is a plain argmax; when it is set the proposal is drawn greedily through the sampling
+    // op, which excludes forbidden vocabulary rows, so a constrained request does not propose
+    // tokens the verifier must always reject.
+    void proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens,
+                         ops::SamplingMask mask = {});
 
     struct MultimodalPrefill {
         std::span<const int> token_ids;

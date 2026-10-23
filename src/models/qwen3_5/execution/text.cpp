@@ -565,7 +565,8 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
     }
 }
 
-void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens) {
+void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens,
+                                  ops::SamplingMask mask) {
     auto proposal_scope = work_.scope();
     const int T         = hidden.ne[1];
     require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), T},
@@ -574,6 +575,38 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
     require_tensor_window(logits, DType::BF16, dimension(config_.vocab_size), T, "proposal logits");
     nvtx::ScopedRange proposal_range(nvtx::Name::MtpProposal, nvtx::Category::Mtp,
                                      static_cast<std::uint64_t>(T));
+    const auto token_domain = dimension(parameters_.model.resources().public_token_count);
+    if (mask.words != nullptr) {
+        // Constrained request: the proposal must respect the same bitmap the verifier applies, or
+        // every draft is rejected and the speculative round only costs time. The sampling op
+        // excludes forbidden rows before its greedy argmax, and it is fed one config per proposal
+        // position so each position uses its own bitmap. The remapped proposal head is not used
+        // here because its ids live in a reduced domain and the bitmap is over the public
+        // vocabulary.
+        Tensor output_logits = matrix_window(logits, T);
+        project(hidden, mtp_->output_head, output_logits, work_, ctx_.stream);
+        std::vector<ops::SamplingConfig> configs(static_cast<std::size_t>(T));
+        for (int t = 0; t < T; ++t) {
+            configs[static_cast<std::size_t>(t)].temperature = 0.0f; // greedy
+            configs[static_cast<std::size_t>(t)].mask =
+                ops::SamplingMask{mask.words + static_cast<std::ptrdiff_t>(t) * mask.stride,
+                                  mask.stride};
+        }
+        const auto config_bytes = sizeof(ops::SamplingConfig) * static_cast<std::size_t>(T);
+        auto config_span        = work_.alloc_bytes(config_bytes);
+        CUDA_CHECK(cudaMemcpyAsync(config_span.data, configs.data(), config_bytes,
+                                   cudaMemcpyHostToDevice, ctx_.stream));
+        std::vector<std::int32_t> positions(static_cast<std::size_t>(T));
+        for (int t = 0; t < T; ++t) { positions[static_cast<std::size_t>(t)] = t; }
+        Tensor position_tensor = work_.alloc(DType::I32, {T});
+        CUDA_CHECK(cudaMemcpyAsync(position_tensor.data, positions.data(),
+                                   sizeof(std::int32_t) * static_cast<std::size_t>(T),
+                                   cudaMemcpyHostToDevice, ctx_.stream));
+        ops::sample(output_logits, proposal_tokens, token_domain,
+                    static_cast<const ops::SamplingConfig*>(config_span.data), position_tensor,
+                    ops::kSamplePurposeDecode, work_, ctx_.stream);
+        return;
+    }
     if (proposal_head_ != nullptr) {
         Tensor proposal_logits = work_.alloc(DType::BF16, {proposal_head_n_, T});
         project(hidden, *proposal_head_, proposal_logits, work_, ctx_.stream);
@@ -646,7 +679,8 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
 void TextContext::mtp_forward_ar_step(const Tensor& token, const Tensor& previous_hidden,
                                       const Tensor& position,
                                       ops::CausalAttentionExecutionEnvelope envelope,
-                                      Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token) {
+                                      Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token,
+                                      ops::SamplingMask mask) {
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
     require_tensor_shape(token, DType::I32, {1}, "MTP AR token");
     require_tensor_shape(position, DType::I32, {1}, "MTP AR position");
@@ -663,7 +697,7 @@ void TextContext::mtp_forward_ar_step(const Tensor& token, const Tensor& previou
     mtp_forward_core(token, previous_hidden, position, rope_position, envelope, mtp_hidden,
                      nullptr);
     auto logits_scope = work_.scope();
-    proposal_argmax(mtp_hidden, logits, draft_token);
+    proposal_argmax(mtp_hidden, logits, draft_token, mask);
 }
 
 void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
