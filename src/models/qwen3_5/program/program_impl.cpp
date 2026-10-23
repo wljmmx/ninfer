@@ -237,6 +237,13 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                     host_kv_extents->attach_spill_file(std::make_unique<KVSpillFile>(
                         root / "ninfer-kv-spill.bin", static_cast<std::size_t>(mib) << 20,
                         minimum_kv_stride));
+                    if (std::getenv("NINFER_KV_SPILL_DEBUG") != nullptr) {
+                        std::fprintf(stderr, "[spill] file=%s slots=%u extent=%zu\n",
+                                     (root / "ninfer-kv-spill.bin").string().c_str(),
+                                     host_kv_extents->spill_file()->capacity_extents(),
+                                     host_kv_extents->spill_file()->extent_bytes());
+                        std::fflush(stderr);
+                    }
                 }
             }
         }
