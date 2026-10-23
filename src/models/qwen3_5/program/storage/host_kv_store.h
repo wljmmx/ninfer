@@ -299,12 +299,31 @@ public:
             node = entry.next;
         }
         const HostKVAllocationConstView view = arena_->view(*extent.allocation);
-        const auto bytes = std::span<const std::byte>(
-            view.data(), view.layout().page_stride * static_cast<std::size_t>(view.page_count()));
-        const std::uint32_t slot = file.write(bytes, use_epoch);
+        const auto stride                    = view.layout().page_stride;
+
+        // One file slot per page: a Host extent can hold any number of pages, while a slot is a
+        // fixed extent of the file. Per-page slots also match the replica, which is per page.
+        struct Spilled {
+            LogicalKVPageHandle page;
+            std::uint32_t slot;
+            std::uint64_t epoch;
+            std::uint32_t coverage;
+        };
+        std::vector<Spilled> spilled;
+        spilled.reserve(extent.page_count);
+        node = extent.head;
+        for (std::uint32_t index = 0; index < extent.page_count; ++index) {
+            if (node == kInvalidIndex) { std::terminate(); }
+            const Membership& entry = memberships_[node];
+            const auto page_bytes   = std::span<const std::byte>(
+                view.data() + static_cast<std::size_t>(index) * stride, stride);
+            const std::uint32_t slot = file.write(page_bytes, use_epoch);
+            spilled.push_back({entry.page, slot, entry.epoch, entry.coverage});
+            node = entry.next;
+        }
 
         // A page cannot hold two Host replicas, so the extent's membership is replaced by the
-        // spilled marker one page at a time. A failure here means the extent and the page store
+        // spilled markers one page at a time. A failure here means the extent and the page store
         // disagree about who owns the bytes, which is not recoverable.
         node = extent.head;
         for (std::uint32_t index = 0; index < extent.page_count; ++index) {
@@ -315,18 +334,15 @@ public:
             }
             node = next;
         }
-        node = extent.head;
-        for (std::uint32_t index = 0; index < extent.page_count; ++index) {
-            if (node == kInvalidIndex) { std::terminate(); }
-            const Membership& entry = memberships_[node];
-            if (!extent.page_store->attach_spilled_replica(entry.page, slot, entry.epoch,
+        for (const Spilled& entry : spilled) {
+            if (!extent.page_store->attach_spilled_replica(entry.page, entry.slot, entry.epoch,
                                                            entry.coverage)) {
                 std::terminate();
             }
-            node = entry.next;
         }
         release_descriptor(capability.index_, extent);
-        return slot;
+        return spilled.empty() ? std::nullopt
+                               : std::optional<std::uint32_t>{spilled.front().slot};
     }
 
     // Lays a spilled extent back into a fresh Host extent. Epoch and coverage are unchanged, so
@@ -336,11 +352,11 @@ public:
     // If the arena cannot take the pages back, their spilled markers are restored, so a failed
     // restore leaves the store exactly as it was rather than dropping the Host replica.
     [[nodiscard]] bool restore(LogicalKVPageStore& pages,
-                               std::span<const LogicalKVPageHandle> membership, KVSpillFile& file,
-                               std::uint32_t slot) {
+                               std::span<const LogicalKVPageHandle> membership, KVSpillFile& file) {
         if (membership.empty()) { return false; }
         struct Marker {
             LogicalKVPageHandle page;
+            std::uint32_t slot;
             std::uint64_t epoch;
             std::uint32_t coverage;
         };
@@ -351,27 +367,29 @@ public:
                 return false;
             }
             const HostKVPageReplica replica = pages.host_replica(page);
-            if (!replica.spill_slot.has_value() || *replica.spill_slot != slot) { return false; }
-            markers.push_back({page, pages.content_epoch(page), pages.committed_columns(page)});
+            markers.push_back({page, *replica.spill_slot, pages.content_epoch(page),
+                               pages.committed_columns(page)});
         }
         for (const Marker& marker : markers) {
-            if (!pages.detach_spilled_replica(marker.page, slot)) { return false; }
+            if (!pages.detach_spilled_replica(marker.page, marker.slot)) { return false; }
         }
         std::optional<HostKVExtentReservation> reservation = prepare(pages, membership);
         if (!reservation) {
             // Put the markers back: without them the Host replica would be gone from both tiers.
             for (const Marker& marker : markers) {
-                (void)pages.attach_spilled_replica(marker.page, slot, marker.epoch,
+                (void)pages.attach_spilled_replica(marker.page, marker.slot, marker.epoch,
                                                    marker.coverage);
             }
             return false;
         }
         const HostKVAllocationView view = writable_view(*reservation);
-        file.read(slot, std::span<std::byte>(view.data(), view.layout().page_stride *
-                                                              static_cast<std::size_t>(
-                                                                  view.page_count())));
+        const auto stride               = view.layout().page_stride;
+        for (std::size_t index = 0; index < markers.size(); ++index) {
+            file.read(markers[index].slot,
+                      std::span<std::byte>(view.data() + index * stride, stride));
+        }
         (void)publish(std::move(*reservation));
-        file.release(slot);
+        for (const Marker& marker : markers) { file.release(marker.slot); }
         return true;
     }
 

@@ -1250,6 +1250,96 @@ void test_history_prefix_view(ninfer::DeviceContext& context, ninfer::PagedKVPla
            "retiring the final history and views leaked KV storage");
 }
 
+// The Host tier's third level: a published extent is written to the spill file, its arena bytes
+// are given back, and the same pages are laid out again from the file. Every reader-visible
+// property (content epoch, committed coverage) has to survive the round trip, and the bytes have
+// to come back identical.
+void test_kv_spill_round_trip(ninfer::DeviceContext& device) {
+    ninfer::LayoutBuilder builder;
+    ninfer::DeviceKVPagePoolSpec page_spec{
+        .page_group_count = 8,
+        .geometry =
+            {
+                .page_tokens        = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize),
+                .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}},
+            },
+    };
+    const ninfer::DeviceKVPagePoolLayout page_layout =
+        ninfer::plan_device_kv_page_pool(builder, page_spec);
+    const ninfer::KVExecutionTableLayout table_layout =
+        ninfer::plan_kv_execution_tables(builder, {.logical_page_capacity = 4, .table_rows = 2});
+    ninfer::DeviceArena arena(builder.finish(256));
+    const ninfer::DeviceSpan backing{arena.base(), arena.capacity()};
+    ninfer::DeviceKVPagePool physical_pages(backing, page_layout);
+    ninfer::KVExecutionTablePool physical_tables(backing, table_layout, physical_pages);
+    const ninfer::HostKVPageLayout host_layout =
+        ninfer::plan_host_kv_page_layout(physical_pages.geometry());
+    const std::array host_layouts{host_layout};
+    ninfer::HostContextArena host_backing(host_layout.page_stride * 8, host_layout.page_stride);
+    ninfer::HostKVArena host_arena(host_backing, host_layouts);
+    store::LogicalKVPageStore pages(physical_pages, physical_pages.capacity_pages() + 8U);
+    store::HostKVExtentStore extents(host_arena, 8);
+    store::KVAddressSpaceStore addresses(pages, physical_tables, 4, 4);
+
+    const auto address = addresses.create_active(3, 0, device.stream);
+    expect(address.has_value(), "spill fixture: active KV address");
+    addresses.ensure_mapped_to_tokens(*address, 65, device.stream);
+    addresses.commit_frontier(*address, 65);
+    device.synchronize();
+    const std::array logical_pages{addresses.logical_page(*address, 0),
+                                   addresses.logical_page(*address, 1)};
+
+    auto backup = extents.prepare(pages, logical_pages);
+    expect(backup.has_value(), "spill fixture: Host extent reservation");
+    const std::vector<ninfer::DeviceKVPageHandle> sources = extents.device_sources(*backup);
+    physical_pages.copy_to_host(sources, extents.writable_view(*backup), device.transfer_stream);
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    const store::HostKVExtentCapability extent = extents.publish(std::move(*backup));
+    expect(pages.host_resident(logical_pages[0]) && pages.host_resident(logical_pages[1]),
+           "spill fixture: published Host replicas");
+
+    const auto snapshot = [&] {
+        std::vector<std::byte> out(host_layout.page_stride * logical_pages.size());
+        const auto view = extents.view(extent);
+        std::memcpy(out.data(), view.data(), out.size());
+        return out;
+    }();
+    const std::uint64_t epoch = pages.content_epoch(logical_pages[0]);
+    const std::size_t live_before = host_backing.live_bytes();
+
+    const auto path = std::filesystem::temp_directory_path() / "ninfer-spill-round-trip.bin";
+    std::filesystem::remove(path);
+    {
+        ninfer::KVSpillFile file(path, host_layout.page_stride * logical_pages.size(),
+                                 host_layout.page_stride);
+        const auto slot = extents.spill(extent, file, 1);
+        expect(slot.has_value(), "spill: a published extent is spillable");
+        expect(!extents.valid(extent), "spill: the Host extent capability is retired");
+        expect(host_backing.live_bytes() < live_before, "spill: the arena bytes go back");
+        expect(pages.host_resident(logical_pages[0]) && pages.host_resident(logical_pages[1]) &&
+                   pages.spilled(logical_pages[0]) && pages.spilled(logical_pages[1]),
+               "spill: every page keeps a spilled Host replica");
+        expect(pages.host_replica_current(logical_pages[0]) &&
+                   pages.host_replica_current(logical_pages[1]) &&
+                   pages.content_epoch(logical_pages[0]) == epoch,
+               "spill: epoch and coverage survive, so readers stay valid");
+
+        expect(extents.restore(pages, logical_pages, file), "restore: the pages come back");
+        expect(!pages.spilled(logical_pages[0]) && !pages.spilled(logical_pages[1]),
+               "restore: the spilled marker is gone");
+        expect(pages.host_resident(logical_pages[0]) && pages.host_resident(logical_pages[1]) &&
+                   pages.host_replica_current(logical_pages[0]),
+               "restore: the page is a live Host replica again");
+
+        const auto restored_view = extents.view(pages.host_replica(logical_pages[0]).extent);
+        expect(std::memcmp(restored_view.data(), snapshot.data(), snapshot.size()) == 0,
+               "restore: the bytes are identical to the spilled image");
+    }
+    std::filesystem::remove(path);
+    expect(host_backing.live_bytes() == live_before, "restore: the arena accounting returns");
+}
+
 } // namespace
 
 int main() {
@@ -1265,6 +1355,7 @@ int main() {
         ninfer::DeviceContext device(0);
         test_state_store(device);
         test_kv_store(device);
+        test_kv_spill_round_trip(device);
         test_cancel_alias_during_prefix_fork(device);
         test_shared_kv_directory(device);
         test_history_prefix_view(device, ninfer::PagedKVPlaneOrder::PageMajor);
