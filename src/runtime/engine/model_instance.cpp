@@ -362,7 +362,9 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
 
 ModelInstance::~ModelInstance() = default;
 
-ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) {
+namespace {
+
+ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& device) {
     validate_options(options);
     const auto start = Clock::now();
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
@@ -475,6 +477,44 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
         instance->kv_capacity_resolution.available_after_startup_bytes;
     summary.kv_bytes_per_additional_page_group = resolution.bytes_per_additional_main_page_group;
     return {std::move(instance), std::move(summary), std::move(context_cost.model)};
+}
+
+// A capacity plan that does not fit the resident weights is not a broken configuration: the same
+// artifact runs with the routed experts on the host. The device allocations come straight from
+// cudaMalloc (core/arena.cu), so unwinding the first attempt returns every byte to the driver and
+// the retry plans against the full budget again.
+[[nodiscard]] bool kv_capacity_shortage(const std::invalid_argument& error) noexcept {
+    const char* what = error.what();
+    return what != nullptr && std::strstr(what, "Engine runtime reservation requires") != nullptr;
+}
+
+} // namespace
+
+ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) {
+    try {
+        return construct_model_once(options, device);
+    } catch (const std::invalid_argument& error) {
+        if (options.expert_cache_bytes != 0 || options.expert_host_copy ||
+            !kv_capacity_shortage(error) || std::getenv("NINFER_NO_EXPERT_FALLBACK") != nullptr) {
+            throw;
+        }
+        EngineOptions fallback            = options;
+        fallback.expert_host_copy         = true;
+        fallback.expert_cache_bytes       = kExpertCacheAuto;
+        // The routed banks upload and synchronize inside each layer, which a captured graph
+        // cannot contain (normalize_engine_options sets the same constraint for the switch).
+        fallback.use_cuda_graph           = false;
+        std::fprintf(stderr,
+                     "[fallback] resident weights leave no room for the requested KV capacity "
+                     "(%s); retrying with the routed experts on the host - decode will be slower\n",
+                     error.what());
+        std::fflush(stderr);
+        auto constructed = construct_model_once(fallback, device);
+        // The engine reads the flags back when it runs, so it has to see the mode that is
+        // actually in force.
+        options = fallback;
+        return constructed;
+    }
 }
 
 } // namespace ninfer::runtime
