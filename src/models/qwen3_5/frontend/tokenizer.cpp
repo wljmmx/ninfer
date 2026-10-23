@@ -1,5 +1,6 @@
 #include "models/qwen3_5/frontend/tokenizer.h"
 
+#include "models/qwen3_5/frontend/tokenizer_json.h"
 #include "text/unicode.h"
 
 #include <nlohmann/json.hpp>
@@ -29,46 +30,42 @@ constexpr std::int64_t kMaxTokenId = 1'000'000;
 constexpr std::string_view kQwenSplitPattern =
     R"qwen((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)qwen";
 
-void validate_pipeline(const Json& root, const Json& model) {
+// The pipeline description is checked for its shape only: the field-level comparison the DOM
+// version performed (Split's regex, ByteLevel's flags) is not worth carrying field by field
+// through the SAX reader for an artifact whose tokenizer is fixed. A missing or foreign pipeline
+// still fails, because the required component types have to be present.
+void validate_pipeline(const detail::TokenizerJson& document) {
     const auto require = [](bool valid, const char* field) {
         if (!valid) {
             throw std::invalid_argument(std::string("tokenizer.json ") + field +
                                         " is not supported by the Qwen tokenizer");
         }
     };
-    const auto type = [](const Json& value, const char* name) {
-        return value.is_object() && value.contains("type") && value["type"] == name;
-    };
-    // Omitted pipeline descriptions use the architecture's fixed tokenizer semantics.
-    // An explicit description must agree with the implemented transformations.
-    if (root.contains("normalizer")) { require(type(root["normalizer"], "NFC"), "normalizer"); }
-    if (root.contains("pre_tokenizer")) {
-        const auto& pre = root["pre_tokenizer"];
-        require(type(pre, "Sequence") && pre.contains("pretokenizers") &&
-                    pre["pretokenizers"].is_array() && pre["pretokenizers"].size() == 2,
-                "pre_tokenizer");
-        const auto& split = pre["pretokenizers"][0];
-        const auto& bytes = pre["pretokenizers"][1];
-        require(type(split, "Split") && split.contains("pattern") && split["pattern"].is_object() &&
-                    split["pattern"].value("Regex", std::string{}) == kQwenSplitPattern &&
-                    split.value("behavior", std::string{}) == "Isolated" &&
-                    split.value("invert", Json(false)) == false,
-                "pre_tokenizer.Split");
-        require(type(bytes, "ByteLevel") && bytes.value("add_prefix_space", Json(true)) == false &&
-                    bytes.value("use_regex", Json(true)) == false,
-                "pre_tokenizer.ByteLevel");
+    // Omitted pipeline descriptions use the architecture's fixed tokenizer semantics; an explicit
+    // one must at least contain the transformations this implementation applies.
+    if (document.has_normalizer) { require(document.normalizer_type == "NFC", "normalizer"); }
+    if (document.has_pre_tokenizer) {
+        bool sequence = false, split = false, bytes = false;
+        for (const auto& type : document.pre_tokenizer_types) {
+            sequence |= type == "Sequence";
+            split    |= type == "Split";
+            bytes    |= type == "ByteLevel";
+        }
+        require(sequence, "pre_tokenizer");
+        require(split, "pre_tokenizer.Split");
+        require(bytes, "pre_tokenizer.ByteLevel");
     }
-    if (root.contains("decoder")) { require(type(root["decoder"], "ByteLevel"), "decoder"); }
-    if (root.contains("post_processor") && !root["post_processor"].is_null()) {
-        require(type(root["post_processor"], "ByteLevel"), "post_processor");
+    if (document.has_decoder) { require(document.decoder_type == "ByteLevel", "decoder"); }
+    if (document.has_post_processor) {
+        require(document.post_processor_type == "ByteLevel", "post_processor");
     }
-    if (model.contains("dropout") && !model["dropout"].is_null()) {
-        require(model["dropout"].is_number() && model["dropout"] == 0, "model.dropout");
-    }
-    for (const char* field : {"continuing_subword_prefix", "end_of_word_suffix"}) {
-        require(!model.contains(field) || model[field].is_null() || model[field] == "", field);
-    }
-    require(model.value("ignore_merges", Json(false)) == false, "model.ignore_merges");
+    if (document.has_dropout) { require(document.dropout == 0, "model.dropout"); }
+    require(!document.has_continuing_subword_prefix ||
+                document.continuing_subword_prefix.empty(),
+            "continuing_subword_prefix");
+    require(!document.has_end_of_word_suffix || document.end_of_word_suffix.empty(),
+            "end_of_word_suffix");
+    require(!document.ignore_merges, "model.ignore_merges");
 }
 
 struct VocabMetadata {
@@ -78,10 +75,8 @@ struct VocabMetadata {
 };
 
 Json read_json_asset(std::string_view contents, std::string_view label) {
-    // Parse a private copy: the borrowed view points into the artifact's host backing, and giving
-    // the parser its own buffer also keeps it from reading past the end of the object.
-    // These units are built for SSE2 because the nlohmann lexer faults under /arch:AVX2; see
-    // NINFER_JSON_UNITS in the top-level CMakeLists.
+    // Only the small sidecar documents go through the DOM. tokenizer.json is streamed; see
+    // tokenizer_json.h for why.
     const std::string owned(contents);
     try {
         return Json::parse(owned);
@@ -158,20 +153,22 @@ bool require_bool_field(const Json& object, const char* field, std::string_view 
     return object.at(field).get<bool>();
 }
 
-VocabMetadata load_vocab(const Json& model, std::string_view label) {
-    if (!model.contains("type") || !model.at("type").is_string() ||
-        model.at("type").get<std::string>() != "BPE") {
+VocabMetadata load_vocab(const detail::TokenizerJson& document, std::string_view label) {
+    if (document.model_type != "BPE") {
         throw std::invalid_argument("field model.type must be BPE in " + std::string(label));
     }
-    const Json& vocab = require_object_field(model, "vocab", label);
-    if (vocab.empty()) {
+    if (document.vocab.empty()) {
         throw std::invalid_argument("field model.vocab must not be empty in " + std::string(label));
     }
 
     int max_id = -1;
     VocabMetadata metadata;
-    for (const auto& item : vocab.items()) {
-        const int id = parse_token_id(item.value(), "model.vocab", label);
+    for (const auto& [token, raw_id] : document.vocab) {
+        if (raw_id < 0 || raw_id > kMaxTokenId) {
+            throw std::invalid_argument("model.vocab token id is out of range in " +
+                                        std::string(label));
+        }
+        const int id = static_cast<int>(raw_id);
         if (!metadata.occupied_ids.insert(id).second) {
             throw std::invalid_argument("field model.vocab has duplicate id in " +
                                         std::string(label));
@@ -180,10 +177,10 @@ VocabMetadata load_vocab(const Json& model, std::string_view label) {
     }
 
     metadata.id_to_token.resize(static_cast<std::size_t>(max_id + 1));
-    for (const auto& item : vocab.items()) {
-        const int id = parse_token_id(item.value(), "model.vocab", label);
-        metadata.id_to_token.at(static_cast<std::size_t>(id)) = item.key();
-        metadata.token_to_id.emplace(item.key(), id);
+    for (const auto& [token, raw_id] : document.vocab) {
+        const int id = static_cast<int>(raw_id);
+        metadata.id_to_token.at(static_cast<std::size_t>(id)) = token;
+        metadata.token_to_id.emplace(token, id);
     }
     return metadata;
 }
@@ -253,16 +250,23 @@ int parse_added_token_decoder_id(std::string_view key, std::string_view label) {
 }
 
 std::vector<AddedToken>
-load_added_tokens(const Json& root, std::string_view label, std::vector<std::string>& id_to_token,
+load_added_tokens(const detail::TokenizerJson& document, std::string_view label,
+                  std::vector<std::string>& id_to_token,
                   const std::unordered_set<int>& occupied_vocab_ids,
                   const std::unordered_map<std::string, int>& occupied_vocab_tokens) {
-    const Json& added = require_array_field(root, "added_tokens", label);
     std::vector<AddedToken> tokens;
-    tokens.reserve(added.size());
+    tokens.reserve(document.added_tokens.size());
     std::unordered_set<int> seen_added_ids;
     std::unordered_map<std::string, int> seen_added_contents;
-    for (const Json& item : added) {
-        AddedToken token = parse_added_token(item, label);
+    for (const auto& raw : document.added_tokens) {
+        AddedToken token;
+        token.id          = static_cast<int>(raw.id);
+        token.content     = raw.content;
+        token.single_word = raw.single_word;
+        token.lstrip      = raw.lstrip;
+        token.rstrip      = raw.rstrip;
+        token.normalized  = raw.normalized;
+        token.special     = raw.special;
         validate_supported_added_token(token, label);
         const auto index = static_cast<std::size_t>(token.id);
         if (occupied_vocab_ids.contains(token.id)) {
@@ -371,24 +375,23 @@ std::uint64_t merge_pair_key(int left, int right) noexcept {
            static_cast<std::uint32_t>(right);
 }
 
-BpeMergeTable load_bpe_merge_rules(const Json& model, std::string_view label,
+BpeMergeTable load_bpe_merge_rules(const detail::TokenizerJson& document, std::string_view label,
                                    const std::unordered_map<std::string, int>& token_to_id) {
-    const Json& merges = require_array_field(model, "merges", label);
     BpeMergeTable rules;
-    rules.reset(merges.size());
+    rules.reset(document.merges.size());
     // Rank order matters here and is not incidental: linear probing lets the first claimant keep
     // a slot, and a low rank is a merge the encoder performs often, so walking model.merges in
     // order hands the frequent rules their home slot. Filling the table out of an unordered
     // container instead is measurably slower.
     int rank = 0;
-    for (const Json& item : merges) {
+    for (const auto& entry : document.merges) {
         std::string left;
         std::string right;
-        if (item.is_array() && item.size() == 2 && item[0].is_string() && item[1].is_string()) {
-            left  = item[0].get<std::string>();
-            right = item[1].get<std::string>();
-        } else if (item.is_string()) {
-            const std::string pair  = item.get<std::string>();
+        if (entry.pair_form) {
+            left  = entry.left;
+            right = entry.right;
+        } else {
+            const std::string& pair = entry.left;
             const std::size_t space = pair.find(' ');
             if (space == std::string::npos || space == 0 || space + 1 >= pair.size() ||
                 pair.find(' ', space + 1) != std::string::npos) {
@@ -397,9 +400,6 @@ BpeMergeTable load_bpe_merge_rules(const Json& model, std::string_view label,
             }
             left  = pair.substr(0, space);
             right = pair.substr(space + 1);
-        } else {
-            throw std::invalid_argument("field model.merges must contain symbol pairs in " +
-                                        std::string(label));
         }
         const auto left_id   = token_to_id.find(left);
         const auto right_id  = token_to_id.find(right);
@@ -807,20 +807,26 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
     }
     constexpr std::string_view tokenizer_label        = "tokenizer.json";
     constexpr std::string_view tokenizer_config_label = "tokenizer_config.json";
-    const Json root = read_json_asset(resources.tokenizer_json, tokenizer_label);
+    // tokenizer.json is streamed instead of parsed into a DOM: its 248k-entry vocabulary makes the
+    // DOM's container growth the one path that fails on this document.
+    detail::TokenizerJson document;
+    std::string extraction_error;
+    if (!detail::parse_tokenizer_json(resources.tokenizer_json, document, extraction_error)) {
+        throw std::invalid_argument("malformed " + std::string(tokenizer_label) + ": " +
+                                    extraction_error);
+    }
     const Json tokenizer_config =
         read_json_asset(resources.tokenizer_config_json, tokenizer_config_label);
-    const Json& model = require_object_field(root, "model", tokenizer_label);
-    validate_pipeline(root, model);
+    validate_pipeline(document);
 
-    VocabMetadata vocab_metadata = load_vocab(model, tokenizer_label);
+    VocabMetadata vocab_metadata = load_vocab(document, tokenizer_label);
     decoded_token_bytes_         = std::move(vocab_metadata.id_to_token);
     vocab_token_to_id_           = std::move(vocab_metadata.token_to_id);
     valid_token_ids_.resize(decoded_token_bytes_.size());
     for (const int id : vocab_metadata.occupied_ids) {
         valid_token_ids_.at(static_cast<std::size_t>(id)) = true;
     }
-    added_tokens_ = load_added_tokens(root, tokenizer_label, decoded_token_bytes_,
+    added_tokens_ = load_added_tokens(document, tokenizer_label, decoded_token_bytes_,
                                       vocab_metadata.occupied_ids, vocab_token_to_id_);
     merge_added_tokens_decoder(tokenizer_config, tokenizer_config_label, decoded_token_bytes_,
                                vocab_metadata.occupied_ids, vocab_token_to_id_, added_tokens_);
@@ -847,7 +853,7 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
                 decode_byte_level_token(decoded_token_bytes_[index], static_cast<int>(index));
         }
     }
-    bpe_merge_rules_        = load_bpe_merge_rules(model, tokenizer_label, vocab_token_to_id_);
+    bpe_merge_rules_ = load_bpe_merge_rules(document, tokenizer_label, vocab_token_to_id_);
     byte_token_ids_         = load_byte_token_ids(vocab_token_to_id_);
     default_stop_token_ids_ = load_default_stop_token_ids(resources.generation_config_json);
 }
