@@ -977,6 +977,25 @@ std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
 make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContext& device,
                            const EngineOptions& options) {
     validate_target_options(parameters, device, options);
+    // A KV arena smaller than the logical context is only sound when attention never needs a
+    // demoted page. That holds for a model whose mixers are all linear or windowed - their history
+    // is a state, not a page run. It does not hold here: this family keeps full-attention mixers,
+    // and those read the whole history on every step, so every demoted page is a page attention
+    // can no longer see. Measured on the 35B-A3B artifact: a 16-page arena for an 8192-token
+    // request changes the greedy output of a fixed prompt.
+    //
+    // The two tiers are not interchangeable: the experts are read top-k per step, so moving them
+    // out costs bytes, while the KV is read in full, so moving it out costs correctness. Shrink
+    // the expert side instead.
+    if (std::getenv("NINFER_KV_EVICT_CAPACITY") != nullptr &&
+        parameters.model.config().text.full_attention_layers != 0) {
+        throw std::invalid_argument(
+            "NINFER_KV_EVICT_CAPACITY cannot be used with this model: it keeps " +
+            std::to_string(parameters.model.config().text.full_attention_layers) +
+            " full-attention layers, and those read the whole history every step, so a KV arena "
+            "smaller than the context changes the output. Keep the KV resident and layer the MoE "
+            "experts instead (NINFER_EXPERT_CACHE_MB).");
+    }
     // The eviction window is a decode-side idea: it releases the pages a moving attention window
     // has left behind. Scoring prefills a whole window in one pass and needs every page of it
     // mapped at once, so the two cannot be combined. Say so instead of failing later inside the
