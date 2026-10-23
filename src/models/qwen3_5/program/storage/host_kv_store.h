@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/host_kv_arena.h"
+#include "core/kv_spill_file.h"
 #include "models/qwen3_5/program/storage/logical_kv_store.h"
 
 #include <algorithm>
@@ -276,6 +277,56 @@ public:
         }
         release_descriptor(capability.index_, extent);
         return true;
+    }
+
+    // Moves a published extent's bytes into the spill file and gives its Host arena back. Every
+    // page keeps its content epoch and committed coverage, so each one remains a valid Host
+    // replica for its readers; only the address of the bytes changes. Returns the file slot, or
+    // nullopt when the extent is not spillable (stale, or a page has a source pinned mid-transfer).
+    [[nodiscard]] std::optional<std::uint32_t> spill(HostKVExtentCapability capability,
+                                                     KVSpillFile& file, std::uint64_t use_epoch) {
+        if (!valid(capability)) { return std::nullopt; }
+        Extent& extent = extents_[capability.index_];
+        if (extent.page_store == nullptr || !extent.allocation) { return std::nullopt; }
+        std::uint32_t node = extent.head;
+        for (std::uint32_t index = 0; index < extent.page_count; ++index) {
+            if (node == kInvalidIndex) { return std::nullopt; }
+            const Membership& entry = memberships_[node];
+            if (!extent.page_store->valid(entry.page) ||
+                extent.page_store->source_pins(entry.page) != 0) {
+                return std::nullopt;
+            }
+            node = entry.next;
+        }
+        const HostKVAllocationConstView view = arena_->view(*extent.allocation);
+        const auto bytes = std::span<const std::byte>(
+            view.data(), view.layout().page_stride * static_cast<std::size_t>(view.page_count()));
+        const std::uint32_t slot = file.write(bytes, use_epoch);
+
+        // A page cannot hold two Host replicas, so the extent's membership is replaced by the
+        // spilled marker one page at a time. A failure here means the extent and the page store
+        // disagree about who owns the bytes, which is not recoverable.
+        node = extent.head;
+        for (std::uint32_t index = 0; index < extent.page_count; ++index) {
+            if (node == kInvalidIndex) { std::terminate(); }
+            const std::uint32_t next = memberships_[node].next;
+            if (!extent.page_store->detach_host_replica(memberships_[node].page, capability)) {
+                std::terminate();
+            }
+            node = next;
+        }
+        node = extent.head;
+        for (std::uint32_t index = 0; index < extent.page_count; ++index) {
+            if (node == kInvalidIndex) { std::terminate(); }
+            const Membership& entry = memberships_[node];
+            if (!extent.page_store->attach_spilled_replica(entry.page, slot, entry.epoch,
+                                                           entry.coverage)) {
+                std::terminate();
+            }
+            node = entry.next;
+        }
+        release_descriptor(capability.index_, extent);
+        return slot;
     }
 
     [[nodiscard]] bool can_release_page_replica(LogicalKVPageStore& pages,

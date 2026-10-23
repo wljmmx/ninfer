@@ -45,6 +45,10 @@ struct HostKVPageReplica {
     std::uint32_t membership_node   = std::numeric_limits<std::uint32_t>::max();
     std::uint64_t content_epoch     = 0;
     std::uint32_t committed_columns = 0;
+    // Set when the bytes live in the spill file instead of a Host extent. The epoch and coverage
+    // above stay authoritative: they are what host_replica_current() compares, so a spilled
+    // replica can be restored without invalidating any reader.
+    std::optional<std::uint32_t> spill_slot;
 };
 
 class LogicalKVPageHandle {
@@ -648,6 +652,45 @@ public:
             throw std::logic_error("logical KV Host replica is not publishable");
         }
         page.host_replica = replica;
+    }
+
+    // A spilled replica has no Host extent any more: its bytes sit in the spill file, addressed by
+    // slot. Epoch and coverage are unchanged, so host_replica_current() keeps treating it as a
+    // valid Host replica and every reader stays usable; only the data's address moved.
+    [[nodiscard]] bool attach_spilled_replica(LogicalKVPageHandle handle, std::uint32_t slot,
+                                              std::uint64_t epoch,
+                                              std::uint32_t coverage) noexcept {
+        if (!valid(handle)) { return false; }
+        Page& page = pages_[handle.index_];
+        if (page.host_replica || epoch != page.content_epoch || coverage != page.committed_columns) {
+            return false;
+        }
+        page.host_replica = HostKVPageReplica{.extent            = {},
+                                              .page_offset       = 0,
+                                              .membership_node   = std::numeric_limits<std::uint32_t>::max(),
+                                              .content_epoch     = epoch,
+                                              .committed_columns = coverage,
+                                              .spill_slot        = slot};
+        return true;
+    }
+
+    // Removes the spilled marker so the page can be laid out into a fresh Host extent.
+    [[nodiscard]] bool detach_spilled_replica(LogicalKVPageHandle handle,
+                                              std::uint32_t slot) noexcept {
+        if (!valid(handle)) { return false; }
+        Page& page = pages_[handle.index_];
+        if (!page.host_replica || !page.host_replica->spill_slot.has_value() ||
+            *page.host_replica->spill_slot != slot || page.source_pins != 0) {
+            return false;
+        }
+        page.host_replica.reset();
+        if (page.references == 0 && !page.device_replica) { release_descriptor(handle, page); }
+        return true;
+    }
+
+    [[nodiscard]] bool spilled(LogicalKVPageHandle handle) const noexcept {
+        return valid(handle) && pages_[handle.index_].host_replica.has_value() &&
+               pages_[handle.index_].host_replica->spill_slot.has_value();
     }
 
     void rebind_host_replica(LogicalKVPageHandle handle, HostKVPageReplica expected,
