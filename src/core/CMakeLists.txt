@@ -23,6 +23,7 @@ weight_bank.cpp
   cyclic_kv_cache.cpp
   host_context_arena.cpp
   host_kv_arena.cpp
+  kv_spill_file.cpp
   paged_kv_cache.cpp
   linear_attention_state.cpp
   layout.cpp
