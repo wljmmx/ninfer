@@ -1416,6 +1416,81 @@ void test_kv_spill_reclaim(ninfer::DeviceContext& device) {
     // The file stays attached to the store, so KVSpillFile removes it when the store goes away.
 }
 
+// The fallback rung: when no redundant copy is left, the coldest extent whose Host copy is the
+// only copy goes to the file. Its bytes must still be reachable through ensure_host_resident().
+void test_kv_spill_last_copy(ninfer::DeviceContext& device) {
+    ninfer::LayoutBuilder builder;
+    ninfer::DeviceKVPagePoolSpec page_spec{
+        .page_group_count = 8,
+        .geometry =
+            {
+                .page_tokens        = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize),
+                .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}},
+            },
+    };
+    const ninfer::DeviceKVPagePoolLayout page_layout =
+        ninfer::plan_device_kv_page_pool(builder, page_spec);
+    const ninfer::KVExecutionTableLayout table_layout =
+        ninfer::plan_kv_execution_tables(builder, {.logical_page_capacity = 4, .table_rows = 2});
+    ninfer::DeviceArena arena(builder.finish(256));
+    const ninfer::DeviceSpan backing{arena.base(), arena.capacity()};
+    ninfer::DeviceKVPagePool physical_pages(backing, page_layout);
+    ninfer::KVExecutionTablePool physical_tables(backing, table_layout, physical_pages);
+    const ninfer::HostKVPageLayout host_layout =
+        ninfer::plan_host_kv_page_layout(physical_pages.geometry());
+    const std::array host_layouts{host_layout};
+    ninfer::HostContextArena host_backing(host_layout.page_stride * 2, host_layout.page_stride);
+    ninfer::HostKVArena host_arena(host_backing, host_layouts);
+    store::LogicalKVPageStore pages(physical_pages, physical_pages.capacity_pages() + 8U);
+    store::HostKVExtentStore extents(host_arena, 8);
+    store::KVAddressSpaceStore addresses(pages, physical_tables, 4, 4);
+
+    const auto path = std::filesystem::temp_directory_path() / "ninfer-spill-last-copy.bin";
+    std::filesystem::remove(path);
+    extents.attach_spill_file(
+        std::make_unique<ninfer::KVSpillFile>(path, host_layout.page_stride * 8,
+                                              host_layout.page_stride));
+
+    const auto publish_pair = [&](std::uint32_t row) {
+        const auto address = addresses.create_active(3, row, device.stream);
+        expect(address.has_value(), "last-copy fixture: active KV address");
+        addresses.ensure_mapped_to_tokens(*address, 65, device.stream);
+        addresses.commit_frontier(*address, 65);
+        device.synchronize();
+        const std::array pages_of{addresses.logical_page(*address, 0),
+                                  addresses.logical_page(*address, 1)};
+        auto backup = extents.prepare(pages, pages_of);
+        expect(backup.has_value(), "last-copy fixture: Host extent reservation");
+        if (!backup) { return std::array<store::LogicalKVPageHandle, 2>{}; }
+        const std::vector<ninfer::DeviceKVPageHandle> sources = extents.device_sources(*backup);
+        physical_pages.copy_to_host(sources, extents.writable_view(*backup),
+                                    device.transfer_stream);
+        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+        (void)extents.publish(std::move(*backup));
+        return pages_of;
+    };
+
+    const auto first = publish_pair(0);
+    // Drop the Device replica: from here the Host copy is the only copy of those pages.
+    for (const auto page : first) {
+        if (pages.can_demote_device_replica(page)) { (void)pages.demote_device_replica(page); }
+    }
+    expect(!pages.device_resident(first[0]), "last-copy fixture: the Device replica is gone");
+
+    (void)publish_pair(1);
+    expect(pages.spilled(first[0]) && pages.spilled(first[1]),
+           "last-copy: the only copy moves to the file when nothing redundant is left");
+    expect(!pages.device_resident(first[0]), "last-copy: the page is file-only at this point");
+
+    expect(extents.ensure_host_resident(pages, first[0]),
+           "last-copy: the page comes back when a reader asks for it");
+    expect(!pages.spilled(first[0]) && pages.host_resident(first[0]),
+           "last-copy: the restored page is a plain Host replica again");
+    expect(pages.host_replica_current(first[0]),
+           "last-copy: epoch and coverage survive the fallback round trip");
+}
+
 } // namespace
 
 int main() {
@@ -1433,6 +1508,7 @@ int main() {
         test_kv_store(device);
         test_kv_spill_round_trip(device);
         test_kv_spill_reclaim(device);
+        test_kv_spill_last_copy(device);
         test_cancel_alias_during_prefix_fork(device);
         test_shared_kv_directory(device);
         test_history_prefix_view(device, ninfer::PagedKVPlaneOrder::PageMajor);

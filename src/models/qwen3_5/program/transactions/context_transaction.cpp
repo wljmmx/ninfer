@@ -63,6 +63,13 @@ void ProgramImpl::enqueue_context_transfers(ContextTransaction& tx) {
             }
             TransferWork work;
             if (transfer.restore) {
+                // Spilled pages have to be back in the arena before the grouping below reads their
+                // extents; a page that cannot come back leaves its bytes in the file.
+                for (const auto page : transfer.logical) {
+                    if (!host_kv_extents->ensure_host_resident(*transfer.pages, page)) {
+                        throw std::logic_error("KV restore source is not host resident");
+                    }
+                }
                 std::size_t begin = 0;
                 while (begin < transfer.logical.size()) {
                     const auto first = transfer.pages->host_replica(transfer.logical[begin]);

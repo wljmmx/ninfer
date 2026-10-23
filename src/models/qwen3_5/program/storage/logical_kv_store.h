@@ -711,6 +711,19 @@ public:
         page.host_replica = replacement;
     }
 
+    // The spill path's detach. The ordinary one refuses a page that has no Device replica but
+    // still has references, because dropping its Host copy there would lose the data. A spill does
+    // not drop it: the caller re-attaches a spilled marker in the same transaction, so the bytes
+    // stay reachable through the file.
+    [[nodiscard]] bool detach_host_replica_for_spill(LogicalKVPageHandle handle,
+                                                      HostKVExtentCapability extent) noexcept {
+        if (!valid(handle)) { return false; }
+        Page& page = pages_[handle.index_];
+        if (!page.host_replica || page.host_replica->extent != extent) { return false; }
+        page.host_replica.reset();
+        return true;
+    }
+
     [[nodiscard]] bool detach_host_replica(LogicalKVPageHandle handle,
                                            HostKVExtentCapability extent) noexcept {
         if (!valid(handle)) { return false; }

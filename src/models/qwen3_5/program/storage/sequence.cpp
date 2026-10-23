@@ -1092,6 +1092,10 @@ std::uint32_t ProgramImpl::restore_addressed_host_pages(KVAddressSpaceStore& add
         // one big reservation - either fails whole or succeeds whole, and a partial fetch is what
         // this call is for. Eligibility is re-checked because reserve_device_replica() throws.
         if (!pages->can_reserve_device_replica(handle)) { continue; }
+        // A page whose Host copy was spilled has to be back in the arena before the copy can read
+        // it. Done before the Device reservation so a skip leaks nothing; the bytes stay in the
+        // file, so a later attempt can still take them.
+        if (!host_kv_extents->ensure_host_resident(*pages, handle)) { continue; }
         auto slot = pages->physical_pool().reserve(1);
         if (!slot) { continue; }
         const DeviceKVPageHandle destination = pages->reserve_device_replica(handle, *slot);

@@ -5,6 +5,7 @@
 #include "models/qwen3_5/program/storage/logical_kv_store.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -86,6 +87,61 @@ public:
             throw std::invalid_argument("Host KV page store has no arena layout");
         }
         return *layout;
+    }
+
+    [[nodiscard]] std::optional<HostKVExtentReservation>
+    prepare_for_restore(LogicalKVPageStore& pages,
+                        std::span<const LogicalKVPageHandle> membership) {
+        if (membership.empty() || free_count_ == 0 || membership.size() > free_membership_count_) {
+            return std::nullopt;
+        }
+        for (const LogicalKVPageHandle page : membership) {
+            // The source of a restore is the spill file, not a Device replica, so the pin rules
+            // that protect a D2H source do not apply: nothing can change those bytes mid-copy.
+            if (!pages.valid(page) || pages.host_resident(page) || pages.source_pins(page) != 0) {
+                return std::nullopt;
+            }
+        }
+        const HostKVPageLayout& layout = page_layout(pages);
+        std::optional<HostKVAllocation> allocation =
+            arena_->allocate(layout, static_cast<std::uint32_t>(membership.size()));
+        if (!allocation && spill_file_) {
+            (void)spill_redundant(
+                pages, layout.page_stride * static_cast<std::size_t>(membership.size()));
+            allocation = arena_->allocate(layout, static_cast<std::uint32_t>(membership.size()));
+        }
+        if (!allocation) { return std::nullopt; }
+
+        const std::uint32_t descriptor = free_[--free_count_];
+        Extent& extent                 = extents_[descriptor];
+        if (extent.state != ExtentState::Free) { std::terminate(); }
+        extent.state      = ExtentState::Reserved;
+        extent.page_store = &pages;
+        extent.allocation = std::move(allocation);
+        for (const LogicalKVPageHandle page : membership) {
+            const std::uint32_t node = take_membership();
+            if (node == kInvalidIndex) { std::terminate(); }
+            Membership& entry = memberships_[node];
+            entry.page        = page;
+            entry.epoch       = pages.content_epoch(page);
+            entry.coverage    = pages.committed_columns(page);
+            entry.extent      = descriptor;
+            entry.offset      = extent.page_count;
+            entry.next        = kInvalidIndex;
+            if (extent.tail == kInvalidIndex) {
+                extent.head = node;
+            } else {
+                memberships_[extent.tail].next = node;
+            }
+            extent.tail = node;
+            ++extent.page_count;
+        }
+        HostKVExtentReservation reservation;
+        reservation.owner_      = this;
+        reservation.descriptor_ = descriptor;
+        reservation.generation_ = extent.generation;
+        reservation.page_store_ = &pages;
+        return reservation;
     }
 
     [[nodiscard]] std::optional<HostKVExtentReservation>
@@ -194,15 +250,18 @@ public:
 
     [[nodiscard]] KVSpillFile* spill_file() const noexcept { return spill_file_.get(); }
 
-    // Spills redundant Host extents until at least `needed_bytes` have been given back, coldest
-    // first. Only extents whose every page still has a Device replica are eligible: the Host copy
-    // is then a backup, so moving it to the file cannot lose data or break a reader.
+    // Spills Host extents until at least `needed_bytes` have been given back, coldest first.
+    // Extents whose pages all still hold a Device replica go first: moving that Host copy out
+    // cannot lose anything. Only when they are not enough does the pass fall through to extents
+    // whose Host copy is the only copy left; those bytes stay in the file and come back through
+    // ensure_host_resident() when a reader needs them.
     std::size_t spill_redundant(LogicalKVPageStore& pages, std::size_t needed_bytes) {
         if (!spill_file_ || needed_bytes == 0) { return 0; }
         struct Candidate {
             std::uint32_t index;
             std::uint64_t coldest;
             std::size_t bytes;
+            bool redundant;
         };
         std::vector<Candidate> candidates;
         for (std::uint32_t index = 0; index < extents_.size(); ++index) {
@@ -211,30 +270,36 @@ public:
                 !extent.allocation || extent.page_count == 0) {
                 continue;
             }
-            bool redundant     = true;
+            bool spillable    = true;
+            bool redundant    = true;
             std::uint64_t cold = std::numeric_limits<std::uint64_t>::max();
             std::uint32_t node = extent.head;
             for (std::uint32_t offset = 0; offset < extent.page_count; ++offset) {
                 if (node == kInvalidIndex) {
-                    redundant = false;
+                    spillable = false;
                     break;
                 }
                 const LogicalKVPageHandle page = memberships_[node].page;
-                if (!pages.valid(page) || !pages.device_resident(page) ||
-                    pages.source_pins(page) != 0 || pages.spilled(page)) {
-                    redundant = false;
+                if (!pages.valid(page) || pages.source_pins(page) != 0 || pages.spilled(page) ||
+                    !pages.host_resident(page)) {
+                    spillable = false;
                     break;
                 }
+                if (!pages.device_resident(page)) { redundant = false; }
                 cold = std::min(cold, pages.content_epoch(page));
                 node = memberships_[node].next;
             }
-            if (!redundant) { continue; }
+            if (!spillable) { continue; }
             candidates.push_back({index, cold,
                                   static_cast<std::size_t>(extent.page_count) *
-                                      page_layout(pages).page_stride});
+                                      page_layout(pages).page_stride,
+                                  redundant});
         }
         std::sort(candidates.begin(), candidates.end(),
-                  [](const Candidate& a, const Candidate& b) { return a.coldest < b.coldest; });
+                  [](const Candidate& a, const Candidate& b) {
+                      if (a.redundant != b.redundant) { return a.redundant; }
+                      return a.coldest < b.coldest;
+                  });
         std::size_t freed = 0;
         for (const Candidate& candidate : candidates) {
             if (freed >= needed_bytes) { break; }
@@ -244,10 +309,16 @@ public:
                 freed += candidate.bytes;
             }
         }
+        if (std::getenv("NINFER_KV_SPILL_DEBUG") != nullptr) {
+            std::fprintf(stderr, "[spill] need=%zu freed=%zu candidates=%zu\n", needed_bytes,
+                         freed, candidates.size());
+            std::fflush(stderr);
+        }
         return freed;
     }
 
-    [[nodiscard]] HostKVExtentCapability publish(HostKVExtentReservation&& reservation) noexcept {
+    [[nodiscard]] HostKVExtentCapability publish(HostKVExtentReservation&& reservation,
+                                                 bool unpin_sources = true) noexcept {
         if (!valid(reservation)) { std::terminate(); }
         Extent& extent     = extents_[reservation.descriptor_];
         std::uint32_t node = extent.head;
@@ -275,7 +346,7 @@ public:
                                                   .content_epoch     = entry.epoch,
                                                   .committed_columns = entry.coverage});
             } catch (...) { std::terminate(); }
-            extent.page_store->unpin_source(entry.page);
+            if (unpin_sources) { extent.page_store->unpin_source(entry.page); }
             node = entry.next;
         }
         consume(reservation);
@@ -398,7 +469,8 @@ public:
         for (std::uint32_t index = 0; index < extent.page_count; ++index) {
             if (node == kInvalidIndex) { std::terminate(); }
             const std::uint32_t next = memberships_[node].next;
-            if (!extent.page_store->detach_host_replica(memberships_[node].page, capability)) {
+            if (!extent.page_store->detach_host_replica_for_spill(memberships_[node].page,
+                                                                  capability)) {
                 std::terminate();
             }
             node = next;
@@ -420,6 +492,17 @@ public:
     //
     // If the arena cannot take the pages back, their spilled markers are restored, so a failed
     // restore leaves the store exactly as it was rather than dropping the Host replica.
+    // Brings a spilled page back into the arena before a reader touches it. Returns false when the
+    // page has no Host replica at all, or when the arena cannot take it back - the bytes stay in
+    // the file in that case, so a later attempt can still succeed.
+    [[nodiscard]] bool ensure_host_resident(LogicalKVPageStore& pages, LogicalKVPageHandle page) {
+        if (!pages.valid(page) || !pages.host_resident(page)) { return false; }
+        if (!pages.spilled(page)) { return true; }
+        if (!spill_file_) { return false; }
+        const std::array<LogicalKVPageHandle, 1> one{page};
+        return restore(pages, one, *spill_file_);
+    }
+
     [[nodiscard]] bool restore(LogicalKVPageStore& pages,
                                std::span<const LogicalKVPageHandle> membership, KVSpillFile& file) {
         if (membership.empty()) { return false; }
@@ -442,7 +525,7 @@ public:
         for (const Marker& marker : markers) {
             if (!pages.detach_spilled_replica(marker.page, marker.slot)) { return false; }
         }
-        std::optional<HostKVExtentReservation> reservation = prepare(pages, membership);
+        std::optional<HostKVExtentReservation> reservation = prepare_for_restore(pages, membership);
         if (!reservation) {
             // Put the markers back: without them the Host replica would be gone from both tiers.
             for (const Marker& marker : markers) {
@@ -457,7 +540,8 @@ public:
             file.read(markers[index].slot,
                       std::span<std::byte>(view.data() + index * stride, stride));
         }
-        (void)publish(std::move(*reservation));
+        // The restore never pinned a source, so publication must not unpin one.
+        (void)publish(std::move(*reservation), false);
         for (const Marker& marker : markers) { file.release(marker.slot); }
         return true;
     }
