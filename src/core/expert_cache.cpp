@@ -241,6 +241,43 @@ struct ExpertCache::Impl {
     // Bytes the pool is allowed to use right now.
     std::uint64_t live_bytes() const { return windows_live * window_stride; }
 
+    // Every bank's whole layer fits at once: one window per bank, never evicted.
+    bool holds_every_layer() const noexcept {
+        std::uint64_t needed = 0;
+        std::uint64_t widest = 0;
+        for (const auto& bank : banks) {
+            if (bank.resident) { continue; }
+            ++needed;
+            widest = std::max<std::uint64_t>(widest, bank.count);
+        }
+        return needed != 0 && widest <= window_slots() && needed <= windows_live;
+    }
+
+    // Uploads the whole resident set once. A captured graph freezes the expert addresses, so every
+    // expert the decode may route to has to be present before the capture runs; afterwards the
+    // steady state touches no upload path at all.
+    void preload_every_layer() {
+        if (!pool || !holds_every_layer()) { return; }
+        DeviceScope scope(Device::cuda(ordinal));
+        std::size_t staged = 0;
+        for (std::uint32_t b = 0; b < banks.size(); ++b) {
+            if (banks[b].resident) { continue; }
+            for (std::uint32_t e = 0; e < banks[b].count; ++e) {
+                if (entries[first[b] + e].ready) { continue; }
+                upload_one({b, e}, nullptr, false, staged);
+                if (++staged == kUploadBatch) {
+                    const auto settled = cudaStreamSynchronize(nullptr);
+                    if (settled != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(settled)); }
+                    staged = 0;
+                }
+            }
+        }
+        if (staged != 0) {
+            const auto settled = cudaStreamSynchronize(nullptr);
+            if (settled != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(settled)); }
+        }
+    }
+
     // Hands device memory back to (or takes it from) the driver. Windows above the new count are
     // dropped, so their experts stream again; the caller must be at a layer boundary because an
     // unmapped window that a kernel still reads is a use-after-free.
@@ -503,6 +540,14 @@ std::uint32_t ExpertCache::resident_capacity() const noexcept {
     const auto widest = impl_->window_slots();
     return static_cast<std::uint32_t>(std::min<std::uint64_t>(slots, widest));
 }
+
+bool ExpertCache::can_hold_every_layer() const noexcept { return impl_->holds_every_layer(); }
+
+bool ExpertCache::window_resident(std::uint32_t bank) const noexcept {
+    return bank < impl_->window_of.size() && impl_->window_of[bank] != kAbsent;
+}
+
+void ExpertCache::preload_all() { impl_->preload_every_layer(); }
 
 } // namespace ninfer
 

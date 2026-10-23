@@ -76,6 +76,10 @@ private:
     HostExpertResidency* host_ = nullptr;
     std::uint32_t bank_ = 0;
     ExpertBankLayout entry_{};
+    // port (sm_89): the pool holds every layer at once, so this bank's window is fixed and no
+    // per-step routing decision - and therefore no host round trip - is needed.
+    bool pinned_ = false;
+    void rebase_window();
     std::vector<ExpertCacheKey> keys_;
     std::vector<ExpertCacheKey> required_;
     // Per-expert byte offsets the kernel adds to each plane base. Uniform today, but the kernel

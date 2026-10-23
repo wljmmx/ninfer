@@ -86,6 +86,9 @@ public:
     SequencePlanner& operator=(const SequencePlanner&) = delete;
 
     [[nodiscard]] const runtime::SequenceCapacityCurve& capacity_curve() const noexcept;
+    // port (sm_89): a captured decode graph is only valid while the expert resident set is fixed,
+    // and that is known only after the pool is attached. Must be called before finalize().
+    void set_use_cuda_graph(bool enabled) noexcept;
     [[nodiscard]] SequencePlan finalize(std::uint32_t main_page_groups) &&;
 
 private:

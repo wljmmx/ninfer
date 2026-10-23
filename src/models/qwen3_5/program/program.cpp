@@ -55,6 +55,12 @@ const runtime::SequenceCapacityCurve& SequencePlanner::capacity_curve() const no
     return impl_ != nullptr ? impl_->curve : empty;
 }
 
+void SequencePlanner::set_use_cuda_graph(bool enabled) noexcept {
+    if (impl_ == nullptr || impl_->minimum == nullptr) { return; }
+    impl_->inputs.use_cuda_graph   = enabled;
+    impl_->minimum->use_cuda_graph = enabled;
+}
+
 SequencePlan SequencePlanner::finalize(std::uint32_t main_page_groups) && {
     if (impl_ == nullptr) { throw std::logic_error("sequence planner is empty"); }
     return SequencePlan(detail::finalize_sequence_plan_impl(std::move(impl_), main_page_groups));

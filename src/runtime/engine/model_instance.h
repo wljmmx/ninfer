@@ -37,6 +37,9 @@ struct ModelInstance {
     std::unique_ptr<ExpertBlobReader> expert_host_source;
     // Host half of a split expert tier; only created when the Device pool cannot hold a layer.
     std::unique_ptr<models::qwen3_5::execution::HostExpertResidency> expert_host_residency;
+    // port (sm_89): true when the whole resident set fits at once, so a captured decode graph may
+    // already point into it and the pool must not change size underneath that graph.
+    bool expert_pool_pinned = false;
 
     ModelInstance(std::unique_ptr<models::qwen3_5::Model> model, const EngineOptions& options);
     ~ModelInstance();

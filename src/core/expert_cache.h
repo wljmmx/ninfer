@@ -144,6 +144,20 @@ public:
     // fits; smaller when the pool only holds part of one, which is the case a host tier covers.
     [[nodiscard]] std::uint32_t resident_capacity() const noexcept;
 
+    // port (sm_89): true when the pool can hold every bank's whole layer at the same time, so no
+    // layer ever evicts another and the resident set is fixed for the pool's lifetime. That is the
+    // only configuration a captured decode graph can use: replay does not run the host code that
+    // would otherwise pick and upload experts.
+    [[nodiscard]] bool can_hold_every_layer() const noexcept;
+
+    // port (sm_89): true when this bank already owns a window. A resize drops windows, so a
+    // pinned stream checks this before trusting a cached offset.
+    [[nodiscard]] bool window_resident(std::uint32_t bank) const noexcept;
+
+    // port (sm_89): uploads every expert of every bank so a capture never records an upload.
+    // Requires can_hold_every_layer(); does nothing otherwise.
+    void preload_all();
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -105,6 +105,20 @@ void ExpertStream::attach(ExpertCache& cache, std::uint32_t bank, const ExpertBa
     if (mask_copy != cudaSuccess) {
         throw std::runtime_error(std::string("expert residency mask: ") + cudaGetErrorString(mask_copy));
     }
+    // port (sm_89): with one window per bank the resident set never changes, so this stream can
+    // skip the routing round trip entirely and a captured graph stays valid.
+    pinned_ = cache.can_hold_every_layer();
+}
+
+void ExpertStream::rebase_window() {
+    const auto origin = cache_->window_origin(bank_);
+    const auto base   = static_cast<const std::byte*>(cache_->pool().data) + origin;
+    experts_.bank.gate_up.codes  = base + entry_.codes.offset;
+    experts_.bank.gate_up.high   = entry_.high.bytes ? base + entry_.high.offset : nullptr;
+    experts_.bank.gate_up.scales = base + entry_.scales.offset;
+    experts_.bank.down.codes     = base + entry_.down_codes.offset;
+    experts_.bank.down.high      = entry_.down_high.bytes ? base + entry_.down_high.offset : nullptr;
+    experts_.bank.down.scales    = base + entry_.down_scales.offset;
 }
 
 bool ExpertStream::fully_resident() const noexcept {
@@ -114,6 +128,16 @@ bool ExpertStream::fully_resident() const noexcept {
 bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32_t tokens,
                           cudaStream_t stream) {
     if (cache_ == nullptr) { throw std::logic_error("expert stream is not attached"); }
+    // port (sm_89): every layer is resident, so the window cannot move and the routers do not need
+    // to be read back. Rebasing is the whole per-layer work, and it happens during capture so the
+    // frozen kernel arguments already point at the right window.
+    if (pinned_) {
+        if (cache_->window_resident(bank_)) {
+            rebase_window();
+            return true;
+        }
+        // A resize dropped this window; fall through so the normal path allocates a new one.
+    }
     // One window holds a whole layer when the pool is large enough; otherwise the window shrinks to
     // the pool and the caller splits the layer between the Device pool and the host tier.
     const auto capacity = cache_->resident_capacity();
@@ -200,16 +224,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     }
     // port (sm_89): the bank's window can move between layers, so the plane bases are
     // rebased onto the window that is resident now. A fixed base would address window 0.
-    {
-        const auto origin = cache_->window_origin(bank_);
-        const auto base   = static_cast<const std::byte*>(cache_->pool().data) + origin;
-        experts_.bank.gate_up.codes  = base + entry_.codes.offset;
-        experts_.bank.gate_up.high   = entry_.high.bytes ? base + entry_.high.offset : nullptr;
-        experts_.bank.gate_up.scales = base + entry_.scales.offset;
-        experts_.bank.down.codes  = base + entry_.down_codes.offset;
-        experts_.bank.down.high   = entry_.down_high.bytes ? base + entry_.down_high.offset : nullptr;
-        experts_.bank.down.scales = base + entry_.down_scales.offset;
-    }
+    rebase_window();
     // port (sm_89): uploads go through the legacy stream while the compute stream is
     // non-blocking; without settling here nothing orders the next kernel after the copies.
     {

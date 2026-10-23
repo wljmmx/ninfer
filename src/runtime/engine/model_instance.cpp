@@ -347,7 +347,9 @@ EngineOptions normalize_engine_options(EngineOptions options) {
             }
         }
     }
-    if (options.expert_cache_bytes != 0) { options.use_cuda_graph = false; }
+    // port (sm_89): whether a streamed expert tier can keep its captured graph depends on the pool
+    // layout, which is not known until attach_expert_cache() has sized it. construct_model_once()
+    // clears the flag only when the pool has to stream between layers.
     // port (sm_89): a streamed expert tier makes every request wait for its window to load, so
     // the queue drains at a fraction of the resident rate. Scale the pending deadline with the
     // number of requests instead of failing them at the resident-speed timeout.
@@ -410,6 +412,12 @@ ModelInstance::~ModelInstance() = default;
 
 std::uint64_t ModelInstance::resize_expert_pool(std::uint64_t target_bytes) {
     if (!expert_cache) { return 0; }
+    if (expert_pool_pinned) {
+        // A captured graph froze the window offsets; unmapping a window it reads is a
+        // use-after-free. Dropping the graph is P12.4 work, so refuse instead of corrupting.
+        throw std::invalid_argument(
+            "expert pool cannot resize once a decode graph captured its offsets");
+    }
     const auto before = expert_cache->capacity_bytes();
     const auto after  = expert_cache->resize(target_bytes);
     if (const char* debug = std::getenv("NINFER_EXPERT_DEBUG"); debug != nullptr && *debug) {
@@ -433,6 +441,9 @@ namespace {
 
 ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& device) {
     validate_options(options);
+    // port (sm_89): the pool layout decides whether a captured decode graph is valid, so the
+    // caller's intent is kept here and applied after attach_expert_cache().
+    const bool graph_requested = options.use_cuda_graph;
     const auto start = Clock::now();
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     artifact::Reader reader(options.artifact_path);
@@ -488,6 +499,20 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
     if (options.expert_cache_bytes != 0) {
         const auto placement = attach_expert_cache(*instance, options, device,
                                                    resolution.runtime_reservation_bytes);
+        // One window per bank means no layer ever evicts another, so the resident set is fixed and
+        // the decode graph may be captured. Uploading the whole set first keeps the capture from
+        // recording an upload that a later step would then repeat with the wrong experts.
+        const bool every_layer = instance->expert_cache->can_hold_every_layer();
+        if (every_layer) { instance->expert_cache->preload_all(); }
+        // The pool cycle knob unmaps windows across rounds, which a captured graph cannot survive.
+        const bool graph_ok = graph_requested && every_layer &&
+                              std::getenv("NINFER_EXPERT_POOL_CYCLE") == nullptr;
+        // Only a captured graph freezes the offsets, so only then is the pool off-limits to resize.
+        instance->expert_pool_pinned = graph_ok;
+        options.use_cuda_graph = graph_ok;
+        // The plan was built before the pool existed, so its graph decision has to be revisited
+        // now that the resident set is known.
+        planner.set_use_cuda_graph(graph_ok);
         device.synchronize();
         if (placement.total_experts != 0) {
             constexpr double kMib = 1024.0 * 1024.0;
