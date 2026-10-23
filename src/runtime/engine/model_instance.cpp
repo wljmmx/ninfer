@@ -57,8 +57,35 @@ void expert_debug(const char* stage, std::uint64_t first = 0, std::uint64_t seco
     std::fflush(stderr);
 }
 
-void attach_expert_cache(ModelInstance& instance, const EngineOptions& options,
-                         DeviceContext& device, std::size_t kv_reserve_bytes) {
+// Where the routed experts ended up. Reported once at startup so a run can be read without a
+// debugger, and reused by the placement policy once it starts tuning at runtime.
+struct ExpertPlacement {
+    std::uint64_t total_experts = 0;
+    std::uint64_t gpu_experts   = 0;
+    std::uint64_t host_experts  = 0;
+    std::uint64_t file_experts  = 0;
+    std::uint64_t slot_bytes    = 0;
+};
+
+// Placement policy: split the free device budget between the KV arena and the expert pool.
+// The arena is satisfied first because every decode step touches the whole active context, while
+// the pool only serves the routed top-k; the pool then takes what is left. P12.4 replaces this
+// with a measured cost model - keeping the split in one place makes that swap local.
+struct DeviceSplit {
+    std::size_t pool_bytes   = 0;
+    std::size_t safety_bytes = 0;
+};
+
+[[nodiscard]] DeviceSplit split_device_budget(std::size_t free_bytes,
+                                              std::size_t kv_reservation_bytes) {
+    constexpr std::size_t kPoolSafetyBytes = 1ULL << 30;
+    const auto pledged = kv_reservation_bytes + kPoolSafetyBytes;
+    return {free_bytes > pledged ? free_bytes - pledged : std::size_t{0}, kPoolSafetyBytes};
+}
+
+ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions& options,
+                                    DeviceContext& device, std::size_t kv_reserve_bytes) {
+    ExpertPlacement placement;
     std::vector<ExpertStream*> streams;
     for (const auto& layer : instance.parameters.text.layers) { collect_streams(layer.ffn, streams); }
     if (instance.parameters.mtp) {
@@ -66,7 +93,7 @@ void attach_expert_cache(ModelInstance& instance, const EngineOptions& options,
     }
     if (streams.empty()) {
         // A dense model has no routed bank; the switch then simply does nothing.
-        return;
+        return {};
     }
     expert_debug("streams", streams.size());
     // port (sm_89): the streamed tier reads either the artifact or a retained Host replica.
@@ -102,9 +129,8 @@ void attach_expert_cache(ModelInstance& instance, const EngineOptions& options,
             throw std::runtime_error("expert cache auto sizing cannot read device memory");
         }
         // Graph capture and the staging buffers still need room after the pool takes its share.
-        constexpr std::size_t kPoolSafetyBytes = 1ULL << 30;
-        const auto pledged = kv_reserve_bytes + kPoolSafetyBytes;
-        requested          = free_bytes > pledged ? free_bytes - pledged : 0;
+        const auto split = split_device_budget(free_bytes, kv_reserve_bytes);
+        requested        = split.pool_bytes;
     }
     // Whole windows only: a partial window is dead space and would make the slot count odd.
     std::uint64_t widest = 0;
@@ -194,8 +220,24 @@ void attach_expert_cache(ModelInstance& instance, const EngineOptions& options,
         std::fprintf(stderr, "[experts] host tier slots=%u slot_bytes=%llu\n",
                      residency->slot_capacity(),
                      static_cast<unsigned long long>(residency->slot_bytes()));
+        placement.host_experts =
+            static_cast<std::uint64_t>(residency->slot_capacity());
         instance.expert_host_residency = std::move(residency);
     }
+    placement.slot_bytes = instance.expert_cache->slot_bytes();
+    placement.gpu_experts =
+        placement.slot_bytes != 0 ? instance.expert_cache->capacity_bytes() / placement.slot_bytes
+                                  : 0;
+    for (const auto& bank : requirements.banks) { placement.total_experts += bank.count; }
+    // Whatever the pool does not keep is served by the cache's source: the retained Host replica
+    // when one exists, the artifact otherwise. The residency arena above is an extra cache in
+    // front of that source, not a separate tier.
+    const auto streamed = placement.total_experts > placement.gpu_experts
+                              ? placement.total_experts - placement.gpu_experts
+                              : 0;
+    placement.host_experts = instance.expert_host_source != nullptr ? streamed : 0;
+    placement.file_experts = instance.expert_host_source != nullptr ? 0 : streamed;
+    return placement;
 }
 
 void validate_options(const EngineOptions& options) {
@@ -395,9 +437,25 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
     // The KV plan is settled before the expert pool is sized, so the pool can take everything the
     // arena does not need instead of holding back a fixed amount.
     if (options.expert_cache_bytes != 0) {
-        attach_expert_cache(*instance, options, device,
-                            resolution.runtime_reservation_bytes);
+        const auto placement = attach_expert_cache(*instance, options, device,
+                                                   resolution.runtime_reservation_bytes);
         device.synchronize();
+        if (placement.total_experts != 0) {
+            constexpr double kMib = 1024.0 * 1024.0;
+            std::fprintf(stderr,
+                         "[budget] experts: gpu=%llu (%.0f MiB) host=%llu (%.0f MiB) "
+                         "file=%llu of %llu, slot %.0f KiB; kv: %u pages, %.0f MiB reserved\n",
+                         static_cast<unsigned long long>(placement.gpu_experts),
+                         static_cast<double>(placement.gpu_experts * placement.slot_bytes) / kMib,
+                         static_cast<unsigned long long>(placement.host_experts),
+                         static_cast<double>(placement.host_experts * placement.slot_bytes) / kMib,
+                         static_cast<unsigned long long>(placement.file_experts),
+                         static_cast<unsigned long long>(placement.total_experts),
+                         static_cast<double>(placement.slot_bytes) / 1024.0,
+                         resolution.main_page_groups,
+                         static_cast<double>(resolution.runtime_reservation_bytes) / kMib);
+            std::fflush(stderr);
+        }
     }
     auto sequence = std::move(planner).finalize(resolution.main_page_groups);
     if (sequence.device_reservation_bytes() != resolution.runtime_reservation_bytes ||
