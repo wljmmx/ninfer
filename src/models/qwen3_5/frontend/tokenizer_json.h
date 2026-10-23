@@ -8,6 +8,15 @@
 
 namespace ninfer::models::qwen3_5::frontend::detail {
 
+// Maintenance note: keep large documents off the nlohmann DOM. The DOM builds one basic_json per
+// value, and on this artifact the growth of that container is what faulted at startup (an AV
+// inside std::vector<basic_json>'s reallocation guard, or a bogus bad_alloc, depending on where it
+// landed). Any new reader for a document of this size should follow this file's shape:
+//   * stream with nlohmann::json_sax and keep only the fields the caller needs;
+//   * retry the read a few times - the lexer itself occasionally mis-reads a large document at a
+//     valid byte offset, which is recoverable through this interface but fatal through the DOM;
+//   * small sidecar documents (a few KiB) can stay on the DOM; they do not exhibit the growth.
+
 // One entry of model.merges. The file may spell an entry as "left right" or as ["left", "right"];
 // both forms are kept distinct so the rank order and the pair boundaries survive unchanged.
 struct MergeEntry {
