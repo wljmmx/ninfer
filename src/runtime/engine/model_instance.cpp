@@ -47,6 +47,15 @@ void collect_streams(const models::qwen3_5::execution::FfnParameters& ffn,
     }
 }
 
+// Set NINFER_EXPERT_DEBUG to trace how far expert-tier construction gets before a startup fault.
+// The line is flushed so the last stage survives an access violation.
+void expert_debug(const char* stage, std::uint64_t first = 0, std::uint64_t second = 0) {
+    if (std::getenv("NINFER_EXPERT_DEBUG") == nullptr) { return; }
+    std::fprintf(stderr, "[expert-debug] %s %llu %llu\n", stage,
+                 static_cast<unsigned long long>(first), static_cast<unsigned long long>(second));
+    std::fflush(stderr);
+}
+
 void attach_expert_cache(ModelInstance& instance, const EngineOptions& options,
                          DeviceContext& device) {
     std::vector<ExpertStream*> streams;
@@ -58,6 +67,7 @@ void attach_expert_cache(ModelInstance& instance, const EngineOptions& options,
         // A dense model has no routed bank; the switch then simply does nothing.
         return;
     }
+    expert_debug("streams", streams.size());
     // port (sm_89): the streamed tier reads either the artifact or a retained Host replica.
     // port (sm_89): the cache keeps a raw pointer, so the source must outlive it - it lives on
     // the instance, never on this stack frame.
@@ -107,6 +117,7 @@ void attach_expert_cache(ModelInstance& instance, const EngineOptions& options,
         throw std::invalid_argument("expert cache holds less than one expert window (" +
                                     std::to_string(entry * widest) + " bytes)");
     }
+    expert_debug("capacity", capacity, entry);
     const auto requirements = describe_expert_cache(specs, {.capacity_bytes = capacity});
 
     std::vector<ExpertFileBank> files;
@@ -129,6 +140,7 @@ void attach_expert_cache(ModelInstance& instance, const EngineOptions& options,
                                   stream->gate_up_parent(), stream->down_parent(), stream->count(),
                                   gu_rows, dn_rows, requirements.banks[i]));
     }
+    expert_debug("files", files.size(), requirements.banks.size());
     instance.expert_cache = std::make_unique<ExpertCache>(
         specs, requirements, device, std::span<const ExpertBankPair>{}, files,
         source);
@@ -136,6 +148,8 @@ void attach_expert_cache(ModelInstance& instance, const EngineOptions& options,
         streams[i]->attach(*instance.expert_cache, static_cast<std::uint32_t>(i),
                            requirements.banks[i]);
     }
+    expert_debug("attached", instance.expert_cache->capacity_bytes(),
+                 instance.expert_cache->windows());
     // port (sm_89): one line that makes the expert tier observable without a debugger.
     // How much the host tier could usefully hold: every expert the Device pool does not keep
     // resident. The arena then takes the smaller of that and a quarter of free RAM, so RAM is used

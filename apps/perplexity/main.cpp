@@ -14,6 +14,8 @@
 #include <chrono>
 #include <cctype>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -29,6 +31,12 @@
 #include <system_error>
 #include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+#endif
 
 namespace {
 
@@ -506,7 +514,38 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
 
 } // namespace
 
+#ifdef _WIN32
+// NINFER_CRASH_DUMP=<path> writes a minidump when the process faults. The startup crash is
+// intermittent and does not reproduce under a debugger, so the dump is the only reliable way to
+// see the faulting stack.
+LONG WINAPI write_crash_dump(EXCEPTION_POINTERS* info) {
+    const char* path = std::getenv("NINFER_CRASH_DUMP");
+    if (path == nullptr) { return EXCEPTION_CONTINUE_SEARCH; }
+    HANDLE file = ::CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file != INVALID_HANDLE_VALUE) {
+        MINIDUMP_EXCEPTION_INFORMATION where{};
+        where.ThreadId          = ::GetCurrentThreadId();
+        where.ExceptionPointers = info;
+        where.ClientPointers    = FALSE;
+        (void)::MiniDumpWriteDump(::GetCurrentProcess(), ::GetCurrentProcessId(), file,
+                                  MiniDumpNormal, &where, nullptr, nullptr);
+        ::CloseHandle(file);
+    }
+    std::fprintf(stderr, "[crash] dump written to %s\n", path);
+    std::fflush(stderr);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+#endif
+
 int main(int argc, char** argv) {
+    // Unbuffered diagnostics: a startup fault would otherwise take the last buffered lines with it.
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+#ifdef _WIN32
+    if (std::getenv("NINFER_CRASH_DUMP") != nullptr) {
+        ::SetUnhandledExceptionFilter(write_crash_dump);
+    }
+#endif
     Options options;
     try {
         options = parse_options(argc, argv);
