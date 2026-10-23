@@ -18,6 +18,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <cstdio>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -2066,6 +2067,33 @@ private:
         }
     }
 
+    // port (sm_89): NINFER_EXPERT_POOL_CYCLE="<round>,<percent>" hands part of the expert pool
+    // back to the driver at a round boundary and restores it on the next round. This is a
+    // measurement knob: dropping a window only costs that layer a re-upload, because every bank
+    // keeps `window_slots` slots whatever the window count is.
+    void maybe_cycle_expert_pool() {
+        if (!expert_pool_cycle_parsed_) {
+            expert_pool_cycle_parsed_ = true;
+            if (const char* value = std::getenv("NINFER_EXPERT_POOL_CYCLE")) {
+                unsigned long long step = 0;
+                int percent             = 0;
+                if (std::sscanf(value, "%llu,%d", &step, &percent) == 2 && percent > 0 &&
+                    percent < 100) {
+                    expert_pool_step_    = step;
+                    expert_pool_percent_ = percent;
+                    expert_pool_full_    = instance_.expert_pool_capacity();
+                }
+            }
+        }
+        const auto round = ++expert_pool_rounds_;
+        if (expert_pool_percent_ == 0 || expert_pool_full_ == 0) { return; }
+        if (round == expert_pool_step_) {
+            (void)instance_.resize_expert_pool(expert_pool_full_ / 100 * expert_pool_percent_);
+        } else if (round == expert_pool_step_ + 1) {
+            (void)instance_.resize_expert_pool(expert_pool_full_);
+        }
+    }
+
     void run_decode_round(const RoundMembership& membership,
                           const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
         nvtx::ScopedRange decode_range(nvtx::Name::Decode, nvtx::Category::Decode,
@@ -2391,6 +2419,7 @@ private:
                     decode = selected;
                 }
                 if (!decode.empty()) {
+                    maybe_cycle_expert_pool();
                     set_host_work_class(HostWorkClass::Decode, decode.lane_span());
                     run_decode_round(decode, cancelled);
                     executed = true;
@@ -2485,6 +2514,15 @@ private:
     // cannot be counted once per round - the mistake appendix HM had to fix for the lane trigger.
     std::uint64_t idle_reclaim_ms_ = read_idle_reclaim_ms();
     std::uint64_t last_idle_sweep_ms_ = 0;
+    // port (sm_89): one-shot validation of the elastic expert pool. NINFER_EXPERT_POOL_CYCLE
+    // carries "step,percent": at that decode round the pool is handed back down to `percent` of
+    // its capacity and restored on the next round. The knob exists to measure what the elastic
+    // reservation costs and saves; nothing chooses it automatically yet.
+    bool expert_pool_cycle_parsed_  = false;
+    std::uint64_t expert_pool_step_ = 0;
+    std::uint64_t expert_pool_full_ = 0;
+    int expert_pool_percent_        = 0;
+    std::uint64_t expert_pool_rounds_ = 0;
     std::vector<std::shared_ptr<Request>> paused_;
     Scheduling scheduler_;
     std::array<bool, kMaximumConcurrency> runnable_units_{};

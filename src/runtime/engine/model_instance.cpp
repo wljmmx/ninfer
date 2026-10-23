@@ -408,6 +408,27 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
 
 ModelInstance::~ModelInstance() = default;
 
+std::uint64_t ModelInstance::resize_expert_pool(std::uint64_t target_bytes) {
+    if (!expert_cache) { return 0; }
+    const auto before = expert_cache->capacity_bytes();
+    const auto after  = expert_cache->resize(target_bytes);
+    if (const char* debug = std::getenv("NINFER_EXPERT_DEBUG"); debug != nullptr && *debug) {
+        std::size_t free_bytes = 0, total_bytes = 0;
+        (void)cudaMemGetInfo(&free_bytes, &total_bytes);
+        std::fprintf(stderr,
+                     "[expert-pool] capacity %.1f -> %.1f MiB windows=%llu free=%.1f MiB\n",
+                     static_cast<double>(before) / 1048576.0,
+                     static_cast<double>(after) / 1048576.0,
+                     static_cast<unsigned long long>(expert_cache->windows()),
+                     static_cast<double>(free_bytes) / 1048576.0);
+    }
+    return after;
+}
+
+std::uint64_t ModelInstance::expert_pool_capacity() const noexcept {
+    return expert_cache ? expert_cache->capacity_bytes() : 0;
+}
+
 namespace {
 
 ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& device) {

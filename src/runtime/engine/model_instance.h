@@ -42,6 +42,12 @@ struct ModelInstance {
     ~ModelInstance();
     ModelInstance(const ModelInstance&)            = delete;
     ModelInstance& operator=(const ModelInstance&) = delete;
+
+    // port (sm_89): grows or shrinks the elastic expert pool while the model is loaded. The caller
+    // must be at a step boundary; returns the capacity in effect afterwards, or zero when the model
+    // has no expert pool. Experts of a dropped window stream in again on their next use.
+    std::uint64_t resize_expert_pool(std::uint64_t target_bytes);
+    [[nodiscard]] std::uint64_t expert_pool_capacity() const noexcept;
 };
 
 struct ConstructedModel {
