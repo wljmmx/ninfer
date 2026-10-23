@@ -329,6 +329,52 @@ public:
         return slot;
     }
 
+    // Lays a spilled extent back into a fresh Host extent. Epoch and coverage are unchanged, so
+    // nothing that read the page has to be invalidated; the slot is returned to the file only
+    // after the new extent is published.
+    //
+    // If the arena cannot take the pages back, their spilled markers are restored, so a failed
+    // restore leaves the store exactly as it was rather than dropping the Host replica.
+    [[nodiscard]] bool restore(LogicalKVPageStore& pages,
+                               std::span<const LogicalKVPageHandle> membership, KVSpillFile& file,
+                               std::uint32_t slot) {
+        if (membership.empty()) { return false; }
+        struct Marker {
+            LogicalKVPageHandle page;
+            std::uint64_t epoch;
+            std::uint32_t coverage;
+        };
+        std::vector<Marker> markers;
+        markers.reserve(membership.size());
+        for (const LogicalKVPageHandle page : membership) {
+            if (!pages.valid(page) || !pages.spilled(page) || pages.source_pins(page) != 0) {
+                return false;
+            }
+            const HostKVPageReplica replica = pages.host_replica(page);
+            if (!replica.spill_slot.has_value() || *replica.spill_slot != slot) { return false; }
+            markers.push_back({page, pages.content_epoch(page), pages.committed_columns(page)});
+        }
+        for (const Marker& marker : markers) {
+            if (!pages.detach_spilled_replica(marker.page, slot)) { return false; }
+        }
+        std::optional<HostKVExtentReservation> reservation = prepare(pages, membership);
+        if (!reservation) {
+            // Put the markers back: without them the Host replica would be gone from both tiers.
+            for (const Marker& marker : markers) {
+                (void)pages.attach_spilled_replica(marker.page, slot, marker.epoch,
+                                                   marker.coverage);
+            }
+            return false;
+        }
+        const HostKVAllocationView view = writable_view(*reservation);
+        file.read(slot, std::span<std::byte>(view.data(), view.layout().page_stride *
+                                                              static_cast<std::size_t>(
+                                                                  view.page_count())));
+        (void)publish(std::move(*reservation));
+        file.release(slot);
+        return true;
+    }
+
     [[nodiscard]] bool can_release_page_replica(LogicalKVPageStore& pages,
                                                 LogicalKVPageHandle page) const noexcept {
         if (!pages.valid(page) || !pages.host_resident(page) || pages.source_pins(page) != 0 ||
