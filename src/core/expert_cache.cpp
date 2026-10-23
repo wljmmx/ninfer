@@ -78,6 +78,11 @@ struct ExpertCache::Impl {
     std::vector<ExpertBankPair> views;
     std::vector<ExpertFileBank> files;
     const ExpertBlobReader* file_reader = nullptr;
+    // One upload turn carries several experts: the file read is serialised per image anyway, but
+    // each image would otherwise pay its own cudaStreamSynchronize (~2.5 ms of WDDM submission on
+    // sm_89). The staging buffer therefore holds one slot image per batch position.
+    static constexpr std::size_t kUploadBatch = 4;
+    std::size_t max_entry_bytes               = 0;
     std::unique_ptr<PinnedHostBuffer> staging;
     DeviceBuffer pool;
     std::vector<std::size_t> first; // flat entry index of each bank's expert 0
@@ -103,9 +108,10 @@ struct ExpertCache::Impl {
          std::span<const ExpertFileBank> file_banks, const ExpertBlobReader* reader)
         : config(req.config), banks(req.banks), views(bank_views.begin(), bank_views.end()),
           files(file_banks.begin(), file_banks.end()), file_reader(reader),
+          max_entry_bytes(req.max_entry_bytes),
           staging(req.max_entry_bytes
                       ? std::make_unique<PinnedHostBuffer>(
-                            static_cast<std::size_t>(req.max_entry_bytes))
+                            static_cast<std::size_t>(req.max_entry_bytes) * kUploadBatch)
                       : nullptr),
           pool(static_cast<std::size_t>(req.config.capacity_bytes)) {
         if (req != describe_expert_cache(specs, req.config)) {
@@ -252,7 +258,8 @@ struct ExpertCache::Impl {
     }
 
 
-    void upload_one(ExpertCacheKey key, cudaStream_t stream) {
+    void upload_one(ExpertCacheKey key, cudaStream_t stream, bool settle = true,
+                    std::size_t staging_slot = 0) {
         const auto& bank = banks[key.bank];
         ensure_window(key.bank);
         auto& entry = entries[index(key)];
@@ -296,21 +303,27 @@ struct ExpertCache::Impl {
                         throw std::runtime_error(cudaGetErrorString(copied));
                     }
                 }
-                const auto settled = cudaStreamSynchronize(stream);
-                if (settled != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(settled)); }
+                if (settle) {
+                    const auto settled = cudaStreamSynchronize(stream);
+                    if (settled != cudaSuccess) {
+                        throw std::runtime_error(cudaGetErrorString(settled));
+                    }
+                }
             } else {
                 // The artifact is the source: one fetch into staging, one copy to the pool.
-                if (!staging || file->image_bytes > staging->size()) {
+                if (!staging || file->image_bytes > max_entry_bytes ||
+                    staging->size() < (staging_slot + 1) * max_entry_bytes) {
                     throw std::runtime_error("expert file image exceeds the staging buffer");
                 }
+                auto* host_base = static_cast<std::byte*>(staging->data()) +
+                                  staging_slot * max_entry_bytes;
                 file_reader->read_entry(
-                    *file, {static_cast<std::byte*>(staging->data()),
-                            static_cast<std::size_t>(file->image_bytes)});
-                const auto status = cudaMemcpyAsync(base, staging->data(),
-                                                    static_cast<std::size_t>(file->image_bytes),
-                                                    cudaMemcpyHostToDevice, stream);
-                if (status == cudaSuccess) { (void)cudaStreamSynchronize(stream); }
+                    *file, {host_base, static_cast<std::size_t>(file->image_bytes)});
+                const auto status =
+                    cudaMemcpyAsync(base, host_base, static_cast<std::size_t>(file->image_bytes),
+                                    cudaMemcpyHostToDevice, stream);
                 if (status != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(status)); }
+                if (settle) { (void)cudaStreamSynchronize(stream); }
             }
         } else {
             const auto& view = views[key.bank];
@@ -324,8 +337,8 @@ struct ExpertCache::Impl {
                 if (span.device != Device::cpu() || span.bytes != region.bytes) {
                     throw std::runtime_error("expert cache source is not a matching Host plane");
                 }
-                const auto status = cudaMemcpy(base + region.offset, span.data, region.bytes,
-                                               cudaMemcpyHostToDevice);
+                const auto status = cudaMemcpyAsync(base + region.offset, span.data, region.bytes,
+                                                    cudaMemcpyHostToDevice, stream);
                 if (status != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(status)); }
             };
             copy(ExpertPlaneKind::Codes, bank.codes, false);
@@ -334,6 +347,7 @@ struct ExpertCache::Impl {
             copy(ExpertPlaneKind::Codes, bank.down_codes, true);
             copy(ExpertPlaneKind::High, bank.down_high, true);
             copy(ExpertPlaneKind::Scales, bank.down_scales, true);
+            if (settle) { (void)cudaStreamSynchronize(stream); }
         }
         entry.ready    = true;
         entry.last_use = ++epoch;
@@ -367,13 +381,19 @@ void ExpertCache::set_resident_experts(std::uint32_t bank,
 }
 
 ExpertCacheProgress ExpertCache::progress() {
+    std::size_t staged = 0;
     for (const auto& key : impl_->required) {
         const auto& entry = impl_->entries[impl_->index(key)];
         if (entry.ready) { continue; }
-        impl_->upload_one(key, nullptr);
-        return {1, false};
+        if (staged == Impl::kUploadBatch) { break; }
+        impl_->upload_one(key, nullptr, false, staged);
+        ++staged;
     }
-    return {0, true};
+    if (staged == 0) { return {0, true}; }
+    // One settle for the whole turn: the copies were queued back to back on the same stream.
+    const auto settled = cudaStreamSynchronize(nullptr);
+    if (settled != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(settled)); }
+    return {staged, false};
 }
 
 void ExpertCache::wait_for_progress(cudaStream_t stream) {
