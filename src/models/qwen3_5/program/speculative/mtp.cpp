@@ -216,7 +216,9 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
             // unconstrained head and the verifier rejects it every round.
             card.mtp_propose_topk_strided(ar_hidden, proposal_logits, draft0, step0_ids,
                                           step0_probs, topk_width, candidate_stride,
-                                          state.host_ingress.sampling[0].mask);
+                                          state.host_ingress.sampling[0].mask, 0,
+                                          static_cast<std::int32_t>(k + 1) *
+                                              state.host_ingress.sampling[0].mask.stride);
             for (std::uint32_t step = 0; step + 1 < k; ++step) {
                 Tensor previous =
                     next_drafts.slice(1, static_cast<std::int32_t>(step), 1).view({batch_size});
@@ -242,7 +244,9 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                 card.mtp_propose_topk_strided(next_hidden, proposal_logits, next, step_ids,
                                               step_probs, topk_width, candidate_stride,
                                               state.host_ingress.sampling[0].mask,
-                                              static_cast<std::int32_t>(step) + 1);
+                                              static_cast<std::int32_t>(step) + 1,
+                                              static_cast<std::int32_t>(k + 1) *
+                                                  state.host_ingress.sampling[0].mask.stride);
                 CUDA_CHECK(cudaMemcpyAsync(ar_hidden.data, next_hidden.data, ar_hidden.bytes(),
                                            cudaMemcpyDeviceToDevice,
                                            state.execution.device.stream));

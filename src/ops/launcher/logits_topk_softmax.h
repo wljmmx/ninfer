@@ -11,8 +11,12 @@ namespace ninfer::ops::detail {
 
 // Launcher for apply_sampling_mask: copies BF16 [V, T] logits, writing -inf for every row the
 // column's bitmap forbids. A null bitmap makes it an exact device copy.
+// `column_stride_words` is the distance between two columns' bitmaps. Zero means "packed", i.e.
+// mask.stride; a speculative bitmap laid out per (batch row, draft position) passes the whole
+// window so column b lands on its own row's column 0.
 void apply_sampling_mask(const void* source, void* destination, std::int32_t rows,
-                         std::int32_t columns, SamplingMask mask, cudaStream_t stream);
+                         std::int32_t columns, SamplingMask mask,
+                         std::int32_t column_stride_words, cudaStream_t stream);
 
 // Launcher for logits_topk_softmax: per column of logits [V, T], extract
 // top-K (id, softmax_probability) pairs and the argmax token ID.

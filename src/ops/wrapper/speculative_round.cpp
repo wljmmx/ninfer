@@ -268,14 +268,15 @@ void logits_topk_softmax(const Tensor& logits, Tensor& top_ids, Tensor& top_prob
 }
 
 void apply_sampling_mask(const Tensor& logits, Tensor& masked, SamplingMask mask,
-                         cudaStream_t stream) {
+                         cudaStream_t stream, std::int32_t column_stride_words) {
     if (logits.ne[0] < 1 || logits.ne[1] < 1 || masked.ne[0] != logits.ne[0] ||
         masked.ne[1] != logits.ne[1]) {
         throw std::invalid_argument("apply_sampling_mask: logits and masked must match");
     }
     detail::apply_sampling_mask(logits.data, masked.data,
                                 static_cast<std::int32_t>(logits.ne[0]),
-                                static_cast<std::int32_t>(logits.ne[1]), mask, stream);
+                                static_cast<std::int32_t>(logits.ne[1]), mask,
+                                column_stride_words, stream);
 }
 
 } // namespace ninfer::ops

@@ -157,15 +157,15 @@ public:
     void mtp_propose_topk(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens,
                           Tensor* candidate_ids, Tensor* proposal_q, std::int32_t top_k,
                           ops::SamplingMask mask = {});
-    // `mask_column` selects the draft-position column of a per-position constraint bitmap. A
-    // proposal window carries one bitmap column per draft position, so the token proposed at
-    // position i must be masked with column i or it is rejected by the verifier. The bitmap is
-    // laid out row-major over (batch, window); the offset is only applied for a single draft row,
-    // because a multi-row bitmap cannot be re-based with a constant column step.
+    // `mask_column` selects the draft-position column of a per-position constraint bitmap, and
+    // `mask_window_words` is the distance between two batch rows' windows. The bitmap is laid out
+    // per (row, position), so a single draft row is addressed by stepping one window; without it a
+    // multi-row batch would mask row b with row b-1's later column.
     void mtp_propose_topk_strided(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens,
                                   Tensor& candidate_ids, Tensor& proposal_q, std::int32_t top_k,
                                   std::int32_t column_stride, ops::SamplingMask mask = {},
-                                  std::int32_t mask_column = 0);
+                                  std::int32_t mask_column = 0,
+                                  std::int32_t mask_window_words = 0);
     void mtp_forward_batch(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                            ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden,
                            int logits_column, Tensor* logits, Tensor* draft_token,

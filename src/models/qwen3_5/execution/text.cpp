@@ -923,12 +923,14 @@ void TextContext::mtp_propose_topk_strided(const Tensor& hidden, Tensor& logits,
                                            Tensor& draft_tokens, Tensor& candidate_ids,
                                            Tensor& proposal_q, std::int32_t top_k,
                                            std::int32_t column_stride, ops::SamplingMask mask,
-                                           std::int32_t mask_column) {
+                                           std::int32_t mask_column,
+                                           std::int32_t mask_window_words) {
     const std::int32_t batch = hidden.ne[1];
     require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), batch},
                          "MTP propose-topk hidden");
     require_tensor_shape(draft_tokens, DType::I32, {batch}, "MTP topk draft tokens");
-    if (mask.words != nullptr && mask_column > 0 && batch == 1) {
+    if (mask.words != nullptr && mask_column > 0) {
+        // Move inside the row: every batch row then sits one window further along.
         mask.words = mask.words + static_cast<std::ptrdiff_t>(mask_column) * mask.stride;
     }
 
@@ -949,7 +951,7 @@ void TextContext::mtp_propose_topk_strided(const Tensor& hidden, Tensor& logits,
             work_.alloc(DType::BF16, {dimension(config_.vocab_size), batch});
         project(hidden, *lm_head_, output_logits, work_, ctx_.stream);
         Tensor masked = work_.alloc(DType::BF16, {dimension(config_.vocab_size), batch});
-        ops::apply_sampling_mask(output_logits, masked, mask, ctx_.stream);
+        ops::apply_sampling_mask(output_logits, masked, mask, ctx_.stream, mask_window_words);
         ops::logits_topk_softmax(masked, candidate_ids, proposal_q, draft_tokens, nullptr, top_k,
                                  column_stride, ctx_.stream);
         return;
