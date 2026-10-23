@@ -1472,13 +1472,21 @@ void test_kv_spill_last_copy(ninfer::DeviceContext& device) {
     };
 
     const auto first = publish_pair(0);
+    // Snapshot what a reader would see before any of this moves, so the round trip can be checked
+    // byte for byte rather than by state alone.
+    const std::vector<std::byte> snapshot = [&] {
+        std::vector<std::byte> out(host_layout.page_stride);
+        const auto view = extents.view(pages.host_replica(first[0]).extent);
+        std::memcpy(out.data(), view.data(), out.size());
+        return out;
+    }();
     // Drop the Device replica: from here the Host copy is the only copy of those pages.
     for (const auto page : first) {
         if (pages.can_demote_device_replica(page)) { (void)pages.demote_device_replica(page); }
     }
     expect(!pages.device_resident(first[0]), "last-copy fixture: the Device replica is gone");
 
-    (void)publish_pair(1);
+    const auto second = publish_pair(1);
     expect(pages.spilled(first[0]) && pages.spilled(first[1]),
            "last-copy: the only copy moves to the file when nothing redundant is left");
     expect(!pages.device_resident(first[0]), "last-copy: the page is file-only at this point");
@@ -1489,6 +1497,15 @@ void test_kv_spill_last_copy(ninfer::DeviceContext& device) {
            "last-copy: the restored page is a plain Host replica again");
     expect(pages.host_replica_current(first[0]),
            "last-copy: epoch and coverage survive the fallback round trip");
+
+    // The fetch had to push something else out to make room: the redundant extent, not the page
+    // that was asked for. That is the chain a real reader would trigger.
+    expect(pages.spilled(second[0]), "last-copy: the redundant extent is what the fetch pushes out");
+    expect(!pages.spilled(first[0]), "last-copy: the requested page keeps the space");
+
+    const auto restored_view = extents.view(pages.host_replica(first[0]).extent);
+    expect(std::memcmp(restored_view.data(), snapshot.data(), snapshot.size()) == 0,
+           "last-copy: the fetched bytes match what the reader saw before the spill");
 }
 
 } // namespace
