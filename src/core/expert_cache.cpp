@@ -91,6 +91,11 @@ struct ExpertCache::Impl {
     // Slot index of each expert inside its bank window, or kAbsentSlot when the pool does not hold
     // it. The default is the identity, so a fully resident bank keeps addressing expert i at slot i.
     std::vector<std::vector<std::uint32_t>> slot_of;
+    // Upper bound on how many experts one bank window may hold. Zero means "no bound", which makes
+    // window_slots() take the whole pool and leaves room for exactly one bank: every layer then
+    // reuploads the entire window. A cap trades resident experts per bank for more coexisting
+    // windows, which is what keeps a split pool from reuploading hundreds of megabytes per layer.
+    std::uint64_t window_cap = 0;
     int ordinal = 0;
 
     Impl(std::span<const ExpertBankSpec> specs, const ExpertCacheRequirements& req,
@@ -120,6 +125,23 @@ struct ExpertCache::Impl {
         // row_split_k128 codes at 1024 bytes/row, so one block is 128 KiB.
         constexpr std::uint64_t block = 128 * 1024;
         slot_bytes = (req.max_entry_bytes + block - 1) / block * block;
+        // One window per bank means every layer evicts the previous bank and reuploads a whole
+        // window. Splitting the pool into two windows halves that traffic, but it also halves the
+        // experts a bank can keep, so it only pays when the pool is nearly large enough for a whole
+        // layer: there the reupload is the dominant cost (measured 82 -> 92 tok/s at 251 slots),
+        // while at half a layer the lost Device work outweighs it (92 -> 88 at 135 slots).
+        const auto pool_slots = req.config.capacity_bytes / slot_bytes;
+        std::uint64_t widest_bank = 0;
+        for (const auto& bank : req.banks) {
+            if (!bank.resident) { widest_bank = std::max(widest_bank, std::uint64_t{bank.count}); }
+        }
+        if (widest_bank != 0 && pool_slots * 10 >= widest_bank * 8) {
+            window_cap = std::max<std::uint64_t>(32, pool_slots / 2);
+        }
+        if (const char* cap = std::getenv("NINFER_EXPERT_WINDOW_SLOTS")) {
+            const auto requested = std::strtoull(cap, nullptr, 10);
+            if (requested > 0) { window_cap = requested; }
+        }
         window_of.assign(banks.size(), kAbsent);
         last_window_use.assign(banks.size(), 0);
         window_hits.assign(banks.size(), 0);
@@ -179,7 +201,9 @@ struct ExpertCache::Impl {
         // A pool smaller than one layer still serves it, one expert short of a whole window: the
         // window shrinks to the pool and the host tier is expected to cover the remainder.
         const std::uint64_t slots = config.capacity_bytes / slot_bytes;
-        return std::min(widest, slots);
+        auto limit = std::min(widest, slots);
+        if (window_cap != 0) { limit = std::min(limit, window_cap); }
+        return limit;
     }
 
     std::uint64_t window_count() const {
