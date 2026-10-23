@@ -864,7 +864,14 @@ reserve_device_kv_page_bundle(std::span<const DeviceKVPageReservationRequest> re
                 throw std::invalid_argument("Paged KV bundle names the same pool twice");
             }
         }
-        if (request.pages > request.pool->available_pages()) { throw std::bad_alloc(); }
+        if (request.pages > request.pool->available_pages()) {
+            if (std::getenv("NINFER_ALLOC_DEBUG") != nullptr) {
+                std::fprintf(stderr, "[alloc] kv reserve wants %u pages, %u available\n",
+                             request.pages, request.pool->available_pages());
+                std::fflush(stderr);
+            }
+            throw std::bad_alloc();
+        }
     }
 
     std::vector<DeviceKVPageReservation> reservations;

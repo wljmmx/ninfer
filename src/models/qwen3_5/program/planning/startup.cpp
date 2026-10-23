@@ -977,6 +977,19 @@ std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
 make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContext& device,
                            const EngineOptions& options) {
     validate_target_options(parameters, device, options);
+    // The eviction window is a decode-side idea: it releases the pages a moving attention window
+    // has left behind. Scoring prefills a whole window in one pass and needs every page of it
+    // mapped at once, so the two cannot be combined. Say so instead of failing later inside the
+    // scoring job with a bare "bad allocation".
+    if (options.purpose == EnginePurpose::CausalScoring) {
+        if (const char* resident = std::getenv("NINFER_KV_EVICT_CAPACITY");
+            resident != nullptr && *resident != '\0') {
+            throw std::invalid_argument(
+                "NINFER_KV_EVICT_CAPACITY is a decode-side window and cannot be combined with "
+                "causal scoring: scoring maps a whole window at once. Drop the variable, or score "
+                "with the full arena.");
+        }
+    }
     SequencePlanningInputs inputs{
         .parameters           = &parameters,
         .capacity             = options.max_context,

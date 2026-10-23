@@ -34,7 +34,15 @@ MemorySpan MemoryArena::alloc_bytes(std::size_t bytes, std::size_t alignment) {
         throw std::overflow_error("arena address arithmetic overflow");
     }
     const auto start = ((base + offset_ + alignment - 1) & ~(alignment - 1)) - base;
-    if (start > storage_.bytes || bytes > storage_.bytes - start) { throw std::bad_alloc(); }
+    if (start > storage_.bytes || bytes > storage_.bytes - start) {
+        if (std::getenv("NINFER_ALLOC_DEBUG") != nullptr) {
+            std::fprintf(stderr,
+                         "[alloc] workspace wants %zu bytes at offset %zu, arena holds %zu\n", bytes,
+                         start, storage_.bytes);
+            std::fflush(stderr);
+        }
+        throw std::bad_alloc();
+    }
     const auto result = storage_.subspan(start, bytes);
     offset_           = start + bytes;
     peak_             = std::max(peak_, offset_);
