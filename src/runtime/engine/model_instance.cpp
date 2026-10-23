@@ -83,6 +83,8 @@ struct DeviceSplit {
     return {free_bytes > pledged ? free_bytes - pledged : std::size_t{0}, kPoolSafetyBytes};
 }
 
+[[nodiscard]] bool kv_capacity_shortage(const std::invalid_argument& error) noexcept;
+
 ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions& options,
                                     DeviceContext& device, std::size_t kv_reserve_bytes) {
     ExpertPlacement placement;
@@ -432,8 +434,34 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
         options.context_cost.preset_path);
     auto planner    = models::qwen3_5::make_sequence_planner(instance->parameters, device, options);
     const auto capacity_curve = planner.capacity_curve();
-    auto resolution = resolve_kv_capacity(options.kv_capacity, planner.capacity_curve(),
-                                          current_free_device_bytes(options.wddm_evictable_budget));
+    auto resolution =
+        [&]() -> KvCapacityResolution {
+        const auto weights_bytes = instance->model->storage_stats().device_capacity_bytes;
+        const auto conservative = current_free_device_bytes(
+            options.wddm_evictable_budget, weights_bytes);
+        try {
+            return resolve_kv_capacity(options.kv_capacity, planner.capacity_curve(),
+                                       conservative);
+        } catch (const std::invalid_argument& error) {
+            // The instantaneous free count is not what the driver can actually give back. When
+            // the plan misses it, fall back once to the WDDM evictable budget (total minus the
+            // weights this process must keep, minus a display floor). That starts the run, but
+            // the pages it forces the driver to evict do cost decode throughput, so it is a
+            // second attempt rather than the default.
+            if (!kv_capacity_shortage(error) ||
+                std::getenv("NINFER_NO_WDDM_EVICTABLE") != nullptr) {
+                throw;
+            }
+            const auto optimistic = current_free_device_bytes(true, weights_bytes);
+            if (optimistic <= conservative) { throw; }
+            std::fprintf(stderr,
+                         "[budget] device memory is tight (%zu bytes free); planning against the "
+                         "WDDM evictable budget (%zu bytes) - paging may slow decode\n",
+                         conservative, optimistic);
+            std::fflush(stderr);
+            return resolve_kv_capacity(options.kv_capacity, planner.capacity_curve(), optimistic);
+        }
+    }();
     // The KV plan is settled before the expert pool is sized, so the pool can take everything the
     // arena does not need instead of holding back a fixed amount.
     if (options.expert_cache_bytes != 0) {
