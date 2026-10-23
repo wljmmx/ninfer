@@ -111,10 +111,24 @@ void host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParameters& mo
         Tensor(const_cast<float*>(fetch.coefficients.data()), Device::cpu(), DType::FP32,
                {top_k, tokens})};
 
-    // Publish every expert of this bank into the host arena before the CPU kernels read it.
-    std::vector<std::int32_t> all(static_cast<std::size_t>(moe.stream->count()));
-    for (std::size_t i = 0; i < all.size(); ++i) { all[i] = static_cast<std::int32_t>(i); }
-    host->ensure(ExpertBankId{moe.stream->bank_index()}, all, nullptr);
+    // Publish only the experts this half actually reads. Publishing the whole bank made a split
+    // layer stream all 256 images from the artifact even though the CPU half routes to a subset.
+    std::vector<std::int32_t> wanted;
+    {
+        const auto* mask = subset.kind == ops::ExpertSubsetKind::MaskZeros && subset.mask.data
+                               ? static_cast<const std::int32_t*>(subset.mask.data)
+                               : nullptr;
+        std::vector<bool> seen(static_cast<std::size_t>(moe.stream->count()), false);
+        for (std::size_t i = 0; i < fetch.ids.size(); ++i) {
+            const auto expert = fetch.ids[i];
+            if (expert < 0 || static_cast<std::size_t>(expert) >= seen.size()) { continue; }
+            if (mask != nullptr && mask[expert] != 0) { continue; }
+            if (seen[static_cast<std::size_t>(expert)]) { continue; }
+            seen[static_cast<std::size_t>(expert)] = true;
+            wanted.push_back(expert);
+        }
+    }
+    host->ensure(ExpertBankId{moe.stream->bank_index()}, wanted, nullptr);
 
     const auto bytes = ops::routed_swiglu_workspace_capacity_bytes(
         moe.profile.routed, ops::ExpertSubsetKind::All, tokens, tokens);
