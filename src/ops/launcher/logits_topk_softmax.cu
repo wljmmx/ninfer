@@ -113,4 +113,37 @@ void logits_topk_softmax_launch(const Tensor& logits, Tensor& top_ids, Tensor& t
     CUDA_CHECK(cudaGetLastError());
 }
 
+// One thread per (vocabulary, column). The vocabulary is 248k at most and a speculative window is a
+// handful of columns, so a plain elementwise pass costs far less than the scan it feeds.
+__global__ void apply_sampling_mask_kernel(const __nv_bfloat16* source, __nv_bfloat16* destination,
+                                           int rows, int columns, int stride_words,
+                                           const std::uint32_t* words) {
+    const int total = rows * columns;
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < total;
+         index += blockDim.x * gridDim.x) {
+        const int row    = index / columns;
+        const int column = index - row * columns;
+        const std::uint32_t* bits = words + column * stride_words;
+        const bool allowed        = ((bits[row >> 5] >> (row & 31)) & 1U) != 0U;
+        destination[index]        = allowed ? source[index] : __float2bfloat16(-INFINITY);
+    }
+}
+
+void apply_sampling_mask(const void* source, void* destination, std::int32_t rows,
+                         std::int32_t columns, SamplingMask mask, cudaStream_t stream) {
+    const auto total_bytes = static_cast<std::size_t>(rows) * columns * sizeof(__nv_bfloat16);
+    if (mask.words == nullptr) {
+        CUDA_CHECK(cudaMemcpyAsync(destination, source, total_bytes, cudaMemcpyDeviceToDevice,
+                                   stream));
+        return;
+    }
+    constexpr int block = 256;
+    const int total     = rows * columns;
+    const int grid      = (total + block - 1) / block;
+    apply_sampling_mask_kernel<<<grid, block, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(source), static_cast<__nv_bfloat16*>(destination), rows,
+        columns, mask.stride, mask.words);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail

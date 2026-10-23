@@ -212,4 +212,16 @@ void logits_topk_softmax(const Tensor& logits, Tensor& top_ids, Tensor& top_prob
                          Tensor& argmax_ids, const std::int32_t* id_map, std::int32_t top_k,
                          std::int32_t column_stride, cudaStream_t stream);
 
+/**
+ * Op: apply_sampling_mask
+ *
+ * Copies logits [V, T] into `masked`, replacing every forbidden row with -inf. Column t uses the
+ * bitmap at words + t * mask.stride, so one call masks a whole speculative window. A null bitmap
+ * makes this an exact copy, which lets callers use it unconditionally.
+ *
+ * Shapes / dtypes: logits and masked are contiguous BF16 [V, T] with the same shape.
+ */
+void apply_sampling_mask(const Tensor& logits, Tensor& masked, SamplingMask mask,
+                         cudaStream_t stream);
+
 } // namespace ninfer::ops

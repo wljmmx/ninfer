@@ -237,7 +237,8 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                 Tensor step_ids   = step_candidate_view(static_cast<std::int32_t>(step) + 1);
                 Tensor step_probs = step_proposal_view(static_cast<std::int32_t>(step) + 1);
                 card.mtp_propose_topk_strided(next_hidden, proposal_logits, next, step_ids,
-                                              step_probs, topk_width, candidate_stride);
+                                              step_probs, topk_width, candidate_stride,
+                                              state.host_ingress.sampling[0].mask);
                 CUDA_CHECK(cudaMemcpyAsync(ar_hidden.data, next_hidden.data, ar_hidden.bytes(),
                                            cudaMemcpyDeviceToDevice,
                                            state.execution.device.stream));

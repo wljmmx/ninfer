@@ -1,12 +1,18 @@
 #pragma once
 
 #include "core/tensor.h"
+#include "ninfer/ops/sampling.h"
 
 #include <cuda_runtime.h>
 
 #include <cstdint>
 
 namespace ninfer::ops::detail {
+
+// Launcher for apply_sampling_mask: copies BF16 [V, T] logits, writing -inf for every row the
+// column's bitmap forbids. A null bitmap makes it an exact device copy.
+void apply_sampling_mask(const void* source, void* destination, std::int32_t rows,
+                         std::int32_t columns, SamplingMask mask, cudaStream_t stream);
 
 // Launcher for logits_topk_softmax: per column of logits [V, T], extract
 // top-K (id, softmax_probability) pairs and the argmax token ID.

@@ -151,11 +151,15 @@ public:
                                   ops::CausalAttentionExecutionEnvelope envelope,
                                   Tensor& mtp_hidden);
     void mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens);
+    // `mask` carries one constraint bitmap per proposal column. When set, the top-k candidates are
+    // taken from a masked copy of the logits so a constrained request never proposes a token the
+    // verifier is bound to reject.
     void mtp_propose_topk(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens,
-                          Tensor* candidate_ids, Tensor* proposal_q, std::int32_t top_k);
+                          Tensor* candidate_ids, Tensor* proposal_q, std::int32_t top_k,
+                          ops::SamplingMask mask = {});
     void mtp_propose_topk_strided(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens,
                                   Tensor& candidate_ids, Tensor& proposal_q, std::int32_t top_k,
-                                  std::int32_t column_stride);
+                                  std::int32_t column_stride, ops::SamplingMask mask = {});
     void mtp_forward_batch(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                            ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden,
                            int logits_column, Tensor* logits, Tensor* draft_token,
