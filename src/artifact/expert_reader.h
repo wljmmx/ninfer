@@ -26,6 +26,8 @@ public:
 private:
     Reader reader_;
     mutable std::vector<std::unique_ptr<InputFile>> files_;
+    // port (sm_89): chosen once from the volume; see expert_read_mode.
+    ReadMode mode_ = ReadMode::Buffered;
 };
 
 } // namespace ninfer::artifact

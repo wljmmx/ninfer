@@ -8,6 +8,21 @@
 
 namespace ninfer::artifact {
 
+// port (sm_89): the artifact is plane-major, so one expert's codes and scales are hundreds of MiB
+// apart and reading a single expert costs several seeks. Buffered I/O lets the OS read-ahead hide
+// that on a disk; unbuffered I/O only wins where seeks are cheap. Measured on this host: HDD 2.3
+// tok/s unbuffered against 61.4 buffered, NVMe 55.8 against 39.3.
+enum class ReadMode : std::uint8_t { Buffered, Direct };
+
+// True when the volume behind `path` reports a seek penalty (rotating media). A failed query is
+// treated as "no penalty" only for a path without a local volume name; otherwise the conservative
+// buffered default wins.
+[[nodiscard]] bool volume_incurs_seek_penalty(const std::filesystem::path& path);
+
+// NINFER_EXPERT_IO=buffered|direct overrides; "direct" is still demoted to buffered on a volume
+// with a seek penalty, because unbuffered I/O cannot benefit from read-ahead there.
+[[nodiscard]] ReadMode expert_read_mode(const std::filesystem::path& path);
+
 // State for one in-flight aligned direct read. Windows keeps a OVERLAPPED op
 // with its own manual-reset event so several reads can be issued concurrently
 // on the same FILE_FLAG_OVERLAPPED handle (NVMe queue depth); POSIX has no

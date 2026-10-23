@@ -1,7 +1,9 @@
 #include "artifact/expert_reader.h"
 
 #include "artifact/file_io.h"
+#include "artifact/framing.h"
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -10,7 +12,8 @@
 namespace ninfer::artifact {
 
 ArtifactExpertReader::ArtifactExpertReader(std::filesystem::path path)
-    : reader_(std::move(path)), files_(reader_.directory().files.size()) {}
+    : reader_(std::move(path)), files_(reader_.directory().files.size()),
+      mode_(expert_read_mode(reader_.path())) {}
 
 void ArtifactExpertReader::read_entry(const ExpertFileEntry& entry,
                                       std::span<std::byte> destination) const {
@@ -33,10 +36,19 @@ void ArtifactExpertReader::read_entry(const ExpertFileEntry& entry,
         }
         auto& file = files_[chunk.file_index];
         if (!file) { file = reader_.open_file(chunk.file_index); }
-        file->read_exact(
-            chunk.file_offset,
-            destination.subspan(static_cast<std::size_t>(chunk.image_offset),
-                                static_cast<std::size_t>(chunk.bytes)));
+        auto span = destination.subspan(static_cast<std::size_t>(chunk.image_offset),
+                                        static_cast<std::size_t>(chunk.bytes));
+        // Direct reads need aligned offsets, lengths and buffers; artifact chunks are page sized in
+        // practice, and anything that is not falls back to the buffered path for that chunk.
+        const bool aligned =
+            mode_ == ReadMode::Direct && chunk.file_offset % kPayloadAlignment == 0 &&
+            span.size() % kPayloadAlignment == 0 &&
+            reinterpret_cast<std::uintptr_t>(span.data()) % kPayloadAlignment == 0;
+        if (aligned) {
+            (void)file->read_direct(chunk.file_offset, span);
+        } else {
+            file->read_exact(chunk.file_offset, span);
+        }
     }
 }
 

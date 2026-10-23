@@ -5,12 +5,14 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <utility>
 
 #ifdef _WIN32
 #include <windows.h>
+#include <winioctl.h>
 #else
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -48,6 +50,41 @@ off_t file_offset(std::uint64_t offset) {
 #endif
 
 } // namespace
+
+bool volume_incurs_seek_penalty(const std::filesystem::path& path) {
+#ifdef _WIN32
+    const auto root = path.root_name();
+    if (root.empty()) { return true; }
+    const std::wstring volume = L"\\\\.\\" + root.wstring();
+    HANDLE handle = ::CreateFileW(volume.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                  OPEN_EXISTING, 0, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) { return true; }
+    STORAGE_PROPERTY_QUERY query{};
+    query.PropertyId = StorageDeviceSeekPenaltyProperty;
+    query.QueryType  = PropertyStandardQuery;
+    DEVICE_SEEK_PENALTY_DESCRIPTOR descriptor{};
+    DWORD returned = 0;
+    const BOOL ok  = ::DeviceIoControl(handle, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query),
+                                       &descriptor, sizeof(descriptor), &returned, nullptr);
+    ::CloseHandle(handle);
+    if (!ok) { return true; }
+    return descriptor.IncursSeekPenalty != FALSE;
+#else
+    (void)path;
+    return false;
+#endif
+}
+
+ReadMode expert_read_mode(const std::filesystem::path& path) {
+    const bool seeks = volume_incurs_seek_penalty(path);
+    if (const char* value = std::getenv("NINFER_EXPERT_IO")) {
+        if (std::strcmp(value, "buffered") == 0) { return ReadMode::Buffered; }
+        if (std::strcmp(value, "direct") == 0) {
+            return seeks ? ReadMode::Buffered : ReadMode::Direct;
+        }
+    }
+    return seeks ? ReadMode::Buffered : ReadMode::Direct;
+}
 
 InputFile::InputFile(std::filesystem::path path) : path_(std::move(path)) {
 #ifdef _WIN32
