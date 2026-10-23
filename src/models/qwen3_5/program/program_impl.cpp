@@ -157,7 +157,13 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         if (!local) { throw std::logic_error("DFlash StateImage has no local state"); }
         dflash.emplace(backing, *plan.persistent.dflash, *local);
     }
-    const auto host_bytes = plan.context_cache.host_capacity_bytes.value();
+    auto host_bytes = plan.context_cache.host_capacity_bytes.value();
+    // Measurement knob for the spill tier: a smaller Host arena is what makes the file tier
+    // actually take traffic, and the tier is off unless NINFER_KV_SPILL_MB is set.
+    if (const char* host_mb = std::getenv("NINFER_KV_HOST_MB"); host_mb != nullptr && *host_mb) {
+        const auto mib = std::strtoull(host_mb, nullptr, 10);
+        if (mib != 0) { host_bytes = static_cast<std::size_t>(mib) << 20; }
+    }
     std::vector<HostKVPageLayout> layouts{
         plan_host_kv_page_layout(decoder->text_kv.page_pool().geometry())};
     text_host_kv_page_stride = layouts.front().page_stride;
