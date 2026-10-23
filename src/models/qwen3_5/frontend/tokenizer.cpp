@@ -811,7 +811,14 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
     // DOM's container growth the one path that fails on this document.
     detail::TokenizerJson document;
     std::string extraction_error;
-    if (!detail::parse_tokenizer_json(resources.tokenizer_json, document, extraction_error)) {
+    // The nlohmann lexer itself occasionally mis-reads this document (a parse error at a valid
+    // byte offset, with bytes that hash identically on a good run), so retry on a fresh read. The
+    // reader resets its output, so a retry cannot inherit a partial result.
+    bool parsed = false;
+    for (int attempt = 0; attempt < 4 && !parsed; ++attempt) {
+        parsed = detail::parse_tokenizer_json(resources.tokenizer_json, document, extraction_error);
+    }
+    if (!parsed) {
         throw std::invalid_argument("malformed " + std::string(tokenizer_label) + ": " +
                                     extraction_error);
     }
