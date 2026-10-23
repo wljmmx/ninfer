@@ -26,11 +26,19 @@ bool env_number_is_set(const char* name) {
 // turn a start-time rejection into a mid-flight crash is the whole point of BP.4.
 bool kv_residency_contract_active() {
     const bool releases = env_number_is_set("NINFER_KV_EVICT_RELEASE");
+    // A demotion is a contract in the same sense the release switch is: it copies the bytes to the
+    // Host tier first and then hands the Device page back, so the pool really does get the page
+    // while a later query can still reach the data. Without this, an arena smaller than the logical
+    // context could only be legal in the lossy mode - which is exactly the mode that cannot serve a
+    // later read - so layering KV onto host memory was unreachable.
+    const char* demote   = std::getenv("NINFER_KV_EVICT_HOST_DEMOTE");
+    const bool demotes   = demote == nullptr || *demote == '\0' ||
+                         std::strtol(demote, nullptr, 10) != 0;
     const bool retains = env_number_is_set("NINFER_KV_EVICT_WINDOW") ||
                          env_number_is_set("NINFER_KV_EVICT_KEEP_FROM_SCORES") ||
                          env_number_is_set("NINFER_KV_EVICT_KEEP_RATIO") ||
                          env_number_is_set("NINFER_KV_EVICT_PROFILE");
-    return releases && retains;
+    return (releases || demotes) && retains;
 }
 
 } // namespace
