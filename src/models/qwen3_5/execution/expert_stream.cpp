@@ -21,6 +21,13 @@ std::uint64_t rows_of(const WeightGeometry& parent, std::uint64_t elements) {
     return elements / parent.shape.back();
 }
 
+// port (sm_89): how the hot set of a bank follows the router. Only small batches train it, so a
+// prefill chunk (which touches most experts anyway) cannot wash the ranking out; the score decays
+// so the set follows the conversation instead of remembering the first prompt forever.
+constexpr std::int32_t kHotSetUpdateTokens  = 4;
+constexpr std::uint32_t kHotSetDecayPeriod  = 32;
+constexpr std::uint32_t kHotSetReorderPeriod = 32;
+
 } // namespace
 
 ExpertStream::ExpertStream(std::uint32_t count, WeightBankLayout gate_up, WeightBankLayout down,
@@ -37,6 +44,7 @@ ExpertStream::ExpertStream(std::uint32_t count, WeightBankLayout gate_up, Weight
     for (std::uint32_t expert = 0; expert < count_; ++expert) {
         keys_.push_back(ExpertCacheKey{0, expert});
     }
+    hot_score_.assign(count_, 0.0F);
 }
 
 void ExpertStream::attach(ExpertCache& cache, std::uint32_t bank, const ExpertBankLayout& entry) {
@@ -165,31 +173,59 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             throw std::out_of_range("expert stream received a route outside its bank");
         }
     }
-    // A pool smaller than one bank keeps the experts this layer actually routes to, most used
-    // first. The rest stay out of the window and are masked off for the host tier.
+    // port (sm_89): a pool that cannot hold a whole layer keeps a hot set per bank. This step's
+    // routes are placed first - they must run on the Device - and the remaining slots go to the
+    // experts with the highest decayed score, so the next step has a chance to hit. The cache only
+    // uploads the experts that actually changed, and experts that stay keep their slot.
     if (!fully) {
-        std::vector<std::uint32_t> frequency(count_, 0);
-        for (std::size_t i = 0; i < values; ++i) {
-            ++frequency[static_cast<std::size_t>(route_ids[i])];
+        if (tokens <= kHotSetUpdateTokens) {
+            for (std::size_t i = 0; i < values; ++i) {
+                hot_score_[static_cast<std::size_t>(route_ids[i])] += 1.0F;
+            }
+            if (++since_decay_ >= kHotSetDecayPeriod) {
+                for (auto& score : hot_score_) { score *= 0.5F; }
+                since_decay_ = 0;
+            }
         }
-        std::vector<std::uint32_t> order(count_);
-        std::iota(order.begin(), order.end(), 0U);
-        std::stable_sort(order.begin(), order.end(), [&](std::uint32_t a, std::uint32_t b) {
-            return frequency[a] > frequency[b];
-        });
-        order.resize(capacity);
-        cache_->set_resident_experts(bank_, order);
-        std::fill(offsets_.begin(), offsets_.end(), 0);
-        std::vector<std::int32_t> mask(count_, 0);
-        for (std::uint32_t slot = 0; slot < order.size(); ++slot) {
-            offsets_[order[slot]] = static_cast<std::uint64_t>(slot) * cache_->slot_bytes();
-            mask[order[slot]]      = 1;
+        std::vector<std::uint32_t> wanted;
+        std::vector<bool> chosen(count_, false);
+        wanted.reserve(capacity);
+        for (std::size_t i = 0; i < values && wanted.size() < capacity; ++i) {
+            const auto expert = static_cast<std::uint32_t>(route_ids[i]);
+            if (chosen[expert]) { continue; }
+            chosen[expert] = true;
+            wanted.push_back(expert);
         }
-        mask_host_ = mask;
-        const auto table_bytes = offsets_.size() * sizeof(std::uint64_t);
-        (void)cudaMemcpy(offsets_device_->p, offsets_.data(), table_bytes, cudaMemcpyHostToDevice);
-        (void)cudaMemcpy(mask_device_->p, mask.data(), mask.size() * sizeof(std::int32_t),
-                         cudaMemcpyHostToDevice);
+        if (wanted.size() < capacity) {
+            std::vector<std::uint32_t> ranked(count_);
+            std::iota(ranked.begin(), ranked.end(), 0U);
+            std::stable_sort(ranked.begin(), ranked.end(),
+                             [&](std::uint32_t a, std::uint32_t b) {
+                                 return hot_score_[a] > hot_score_[b];
+                             });
+            for (const auto expert : ranked) {
+                if (wanted.size() >= capacity) { break; }
+                if (chosen[expert]) { continue; }
+                chosen[expert] = true;
+                wanted.push_back(expert);
+            }
+        }
+        if (cache_->set_resident_experts(bank_, wanted)) {
+            std::fill(offsets_.begin(), offsets_.end(), 0);
+            std::vector<std::int32_t> mask(count_, 0);
+            for (std::uint32_t expert = 0; expert < count_; ++expert) {
+                const auto slot = cache_->expert_slot(bank_, expert);
+                if (!slot) { continue; }
+                offsets_[expert] = static_cast<std::uint64_t>(*slot) * cache_->slot_bytes();
+                mask[expert]     = 1;
+            }
+            mask_host_ = mask;
+            const auto table_bytes = offsets_.size() * sizeof(std::uint64_t);
+            (void)cudaMemcpy(offsets_device_->p, offsets_.data(), table_bytes,
+                             cudaMemcpyHostToDevice);
+            (void)cudaMemcpy(mask_device_->p, mask.data(), mask.size() * sizeof(std::int32_t),
+                             cudaMemcpyHostToDevice);
+        }
     }
     required_.clear();
     for (std::size_t i = 0; i < values; ++i) {

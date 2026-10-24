@@ -106,7 +106,10 @@ public:
     // absent: prepare() skips them and offset() reports nullopt, which lets the caller mask them
     // out of the GPU job and hand them to the host tier. At most resident_capacity() experts are
     // honoured; the rest are dropped from the end of the list.
-    void set_resident_experts(std::uint32_t bank, std::span<const std::uint32_t> experts);
+    // port (sm_89): restricts a bank to `experts` and returns whether that changed the set. Experts
+    // that stay resident keep their slot, so a caller only republishes its offset table when this
+    // returns true. The rest of the bank streams in again on their next use.
+    bool set_resident_experts(std::uint32_t bank, std::span<const std::uint32_t> experts);
 
     // Uploads one batch if a slot is free. Never blocks.
     [[nodiscard]] ExpertCacheProgress progress();
@@ -143,6 +146,12 @@ public:
     // Experts of one bank the pool can hold at once. Equals the widest bank when a whole layer
     // fits; smaller when the pool only holds part of one, which is the case a host tier covers.
     [[nodiscard]] std::uint32_t resident_capacity() const noexcept;
+
+    // port (sm_89): slot of an expert inside its bank window, or nullopt when the bank does not
+    // hold it. The slot is stable across set_resident_experts() calls for experts that stay, which
+    // is what lets a caller rebuild its offset table without reuploading anything.
+    [[nodiscard]] std::optional<std::uint32_t> expert_slot(std::uint32_t bank,
+                                                           std::uint32_t expert) const noexcept;
 
     // port (sm_89): true when the pool can hold every bank's whole layer at the same time, so no
     // layer ever evicts another and the resident set is fixed for the pool's lifetime. That is the

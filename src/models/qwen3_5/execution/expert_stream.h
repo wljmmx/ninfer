@@ -80,6 +80,13 @@ private:
     // per-step routing decision - and therefore no host round trip - is needed.
     bool pinned_ = false;
     void rebase_window();
+    // port (sm_89): decayed per-expert route counts. A pool that cannot hold a whole layer keeps
+    // the top entries of this instead of whatever the current step happened to route to, which
+    // used to replace all eight experts on every token and make the hot set useless.
+    std::vector<float> hot_score_;
+    std::vector<std::uint32_t> resident_order_;
+    std::uint32_t since_decay_   = 0;
+    std::uint32_t since_reorder_ = 0;
     std::vector<ExpertCacheKey> keys_;
     std::vector<ExpertCacheKey> required_;
     // Per-expert byte offsets the kernel adds to each plane base. Uniform today, but the kernel

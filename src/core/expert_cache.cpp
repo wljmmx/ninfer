@@ -86,6 +86,10 @@ struct ExpertCache::Impl {
     // each image would otherwise pay its own cudaStreamSynchronize (~2.5 ms of WDDM submission on
     // sm_89). The staging buffer therefore holds one slot image per batch position.
     static constexpr std::size_t kUploadBatch = 4;
+    // port (sm_89): smallest hot set a bank keeps when the pool cannot hold whole layers. One
+    // decode step routes top_k=8 experts, so 8 lets every layer coexist even in a tiny pool; a
+    // narrower window than that cannot hold one step's route and would thrash.
+    static constexpr std::uint64_t kMinimumHotSet = 8;
     std::size_t max_entry_bytes               = 0;
     std::unique_ptr<PinnedHostBuffer> staging;
     // port (sm_89): the pool is a VMM reservation rather than one cudaMalloc, so whole segments can
@@ -150,11 +154,29 @@ struct ExpertCache::Impl {
         // while at half a layer the lost Device work outweighs it (92 -> 88 at 135 slots).
         const auto pool_slots = req.config.capacity_bytes / slot_bytes;
         std::uint64_t widest_bank = 0;
+        std::uint64_t layer_count = 0;
         for (const auto& bank : req.banks) {
-            if (!bank.resident) { widest_bank = std::max(widest_bank, std::uint64_t{bank.count}); }
+            if (bank.resident) { continue; }
+            widest_bank = std::max(widest_bank, std::uint64_t{bank.count});
+            ++layer_count;
         }
-        if (widest_bank != 0 && pool_slots * 10 >= widest_bank * 8) {
-            window_cap = std::max<std::uint64_t>(32, pool_slots / 2);
+        // port (sm_89): a window holds one bank's resident set, and eviction happens per window. As
+        // long as a window can hold a whole layer, a pool that misses even one layer pays a full
+        // layer reupload every step: 39 windows over 40 layers measured 20.1 tok/s against 203.9
+        // when every layer fit. Divide the slots rather than the windows, so each bank keeps a
+        // smaller permanent set and no layer is ever evicted. A bank that cannot hold its whole
+        // layer then reports capacity < count, which sends the rest of the layer down the existing
+        // split path: resident experts run on the Device, the others on the host tier.
+        //
+        // That is the shape a model larger than the card needs: keep a per-layer hot set, leave
+        // every other expert in host memory, and never spill VRAM to a window swap.
+        const auto whole_layers = widest_bank * layer_count;
+        if (widest_bank != 0 && layer_count != 0) {
+            if (pool_slots >= whole_layers) {
+                window_cap = widest_bank;
+            } else {
+                window_cap = std::max<std::uint64_t>(kMinimumHotSet, pool_slots / layer_count);
+            }
         }
         if (const char* cap = std::getenv("NINFER_EXPERT_WINDOW_SLOTS")) {
             const auto requested = std::strtoull(cap, nullptr, 10);
@@ -164,9 +186,15 @@ struct ExpertCache::Impl {
         last_window_use.assign(banks.size(), 0);
         window_hits.assign(banks.size(), 0);
         slot_of.resize(banks.size());
+        // port (sm_89): only the experts that fit the window start resident. The identity mapping
+        // is right when the window holds the whole layer; a smaller window must start with the rest
+        // absent, or a stale slot index would point past the window.
+        const auto initial_slots = window_slots();
         for (std::size_t b = 0; b < banks.size(); ++b) {
             slot_of[b].resize(banks[b].count);
-            for (std::uint32_t e = 0; e < banks[b].count; ++e) { slot_of[b][e] = e; }
+            for (std::uint32_t e = 0; e < banks[b].count; ++e) {
+                slot_of[b][e] = e < initial_slots ? e : kAbsentSlot;
+            }
         }
         ordinal    = device.device;
         // port (sm_89): reserve one contiguous address range and back every window with its own
@@ -182,32 +210,63 @@ struct ExpertCache::Impl {
     }
 
     // Keeps the first `experts` entries that fit in one window and marks every other expert of the
-    // bank absent. The caller recomputes and republishes its offset table afterwards.
-    void set_resident(std::uint32_t bank, std::span<const std::uint32_t> experts) {
+    // bank absent. The caller recomputes and republishes its offset table afterwards. Returns true
+    // when the resident set changed. Experts that stay resident keep their slot, so a step that
+    // routes to experts already present uploads nothing and the window is never discarded.
+    bool set_resident(std::uint32_t bank, std::span<const std::uint32_t> experts) {
         if (bank >= banks.size()) { throw std::out_of_range("expert cache bank"); }
         auto& slots = slot_of[bank];
-        std::vector<std::uint32_t> next(slots.size(), kAbsentSlot);
         const auto limit = window_slots();
-        std::uint32_t next_slot = 0;
+        std::vector<std::uint32_t> wanted;
+        wanted.reserve(std::min<std::size_t>(experts.size(), limit));
+        std::vector<bool> keep(slots.size(), false);
         for (const std::uint32_t expert : experts) {
-            if (expert >= next.size()) { throw std::out_of_range("expert cache expert"); }
-            if (next_slot >= limit) { break; }
-            next[expert] = next_slot++;
+            if (expert >= slots.size()) { throw std::out_of_range("expert cache expert"); }
+            if (wanted.size() >= limit) { break; }
+            if (keep[expert]) { continue; }
+            keep[expert] = true;
+            wanted.push_back(expert);
         }
-        // Consecutive layers of the same bank usually route to the same experts. Keeping the window
-        // when the set is unchanged turns a per-token reupload into a hit.
-        if (next == slots) { return; }
+        bool changed = false;
+        for (std::size_t expert = 0; expert < slots.size(); ++expert) {
+            if ((slots[expert] != kAbsentSlot) != keep[expert]) {
+                changed = true;
+                break;
+            }
+        }
+        // Consecutive steps usually route to the same experts. Keeping the window when the set is
+        // unchanged turns a per-token reupload into a hit.
+        if (!changed) { return false; }
+        // An expert that stays keeps its slot: only those leaving release their slot and only the
+        // arrivals lose their cached image.
+        std::vector<std::uint32_t> next(slots.size(), kAbsentSlot);
+        std::vector<bool> taken(limit, false);
+        for (std::size_t expert = 0; expert < slots.size(); ++expert) {
+            if (slots[expert] == kAbsentSlot || !keep[expert]) { continue; }
+            next[expert]         = slots[expert];
+            taken[slots[expert]] = true;
+        }
+        std::uint32_t free_slot = 0;
+        for (const std::uint32_t expert : wanted) {
+            if (next[expert] != kAbsentSlot) { continue; }
+            while (free_slot < limit && taken[free_slot]) { ++free_slot; }
+            if (free_slot >= limit) { break; }
+            next[expert]              = free_slot;
+            taken[free_slot]          = true;
+            entries[first[bank] + expert].ready = false;
+        }
+        for (std::size_t expert = 0; expert < slots.size(); ++expert) {
+            if (slots[expert] == kAbsentSlot || keep[expert]) { continue; }
+            entries[first[bank] + expert].ready = false;
+        }
         slots = std::move(next);
-        for (std::uint32_t e = 0; e < banks[bank].count; ++e) {
-            entries[first[bank] + e].ready = false;
-        }
-        window_of[bank] = kAbsent;
         required.erase(std::remove_if(required.begin(), required.end(),
                                       [&](const ExpertCacheKey& key) {
                                           return key.bank == bank &&
                                                  slot_of[bank][key.expert] == kAbsentSlot;
                                       }),
                        required.end());
+        return true;
     }
 
     std::size_t index(ExpertCacheKey key) const {
@@ -473,9 +532,19 @@ void ExpertCache::prepare(std::span<const ExpertCacheKey> required) {
     }
 }
 
-void ExpertCache::set_resident_experts(std::uint32_t bank,
+bool ExpertCache::set_resident_experts(std::uint32_t bank,
                                        std::span<const std::uint32_t> experts) {
-    impl_->set_resident(bank, experts);
+    return impl_->set_resident(bank, experts);
+}
+
+std::optional<std::uint32_t> ExpertCache::expert_slot(std::uint32_t bank,
+                                                      std::uint32_t expert) const noexcept {
+    if (bank >= impl_->slot_of.size() || expert >= impl_->slot_of[bank].size()) {
+        return std::nullopt;
+    }
+    const auto slot = impl_->slot_of[bank][expert];
+    if (slot == kAbsentSlot) { return std::nullopt; }
+    return slot;
 }
 
 ExpertCacheProgress ExpertCache::progress() {
