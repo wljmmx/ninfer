@@ -33,9 +33,27 @@ constexpr std::uint32_t kHotSetReorderPeriod = 32;
 ExpertStream::ExpertStream(std::uint32_t count, WeightBankLayout gate_up, WeightBankLayout down,
                            WeightGeometry gate_up_parent, WeightGeometry down_parent,
                            std::uint64_t gate_up_object, std::uint64_t down_object)
+    : ExpertStream(count, gate_up, down, std::move(gate_up_parent), std::move(down_parent),
+                   std::vector<std::uint64_t>(count, gate_up_object),
+                   std::vector<std::uint64_t>(count, down_object)) {}
+
+ExpertStream::ExpertStream(std::uint32_t count, WeightBankLayout gate_up, WeightBankLayout down,
+                           WeightGeometry gate_up_parent, WeightGeometry down_parent,
+                           std::vector<std::uint64_t> gate_up_objects,
+                           std::vector<std::uint64_t> down_objects)
     : count_(count), gate_up_(gate_up), down_(down), gate_up_parent_(std::move(gate_up_parent)),
-      down_parent_(std::move(down_parent)),
-      gate_up_object_(gate_up_object), down_object_(down_object) {
+      down_parent_(std::move(down_parent)), gate_up_objects_(std::move(gate_up_objects)),
+      down_objects_(std::move(down_objects)) {
+    if (gate_up_objects_.size() != count_ || down_objects_.size() != count_) {
+        throw std::invalid_argument("expert stream needs one object per expert");
+    }
+    // A bank whose experts all live in one object is the fused layout: the loader describes that
+    // object once and addresses experts by row range.
+    per_expert_objects_ =
+        std::any_of(gate_up_objects_.begin(), gate_up_objects_.end(),
+                    [&](std::uint64_t object) { return object != gate_up_objects_.front(); }) ||
+        std::any_of(down_objects_.begin(), down_objects_.end(),
+                    [&](std::uint64_t object) { return object != down_objects_.front(); });
     const std::array<std::uint64_t, 2> gate_up_shape{gate_up_.region.rows, gate_up_.columns};
     const std::array<std::uint64_t, 2> down_shape{down_.region.rows, down_.columns};
     gate_up_expert_ = weight_geometry(gate_up_.format, gate_up_.layout, gate_up_shape);

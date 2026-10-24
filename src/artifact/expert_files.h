@@ -36,4 +36,11 @@ namespace ninfer::artifact {
     const WeightGeometry& down_parent, std::uint32_t count, std::uint32_t gate_up_rows,
     std::uint32_t down_rows, const ExpertBankLayout& layout);
 
+// port (sm_89): one object per expert, described without a reader. A host tier has no artifact
+// reader, so the per-expert form needs a mapping that names objects and offsets directly; the
+// chunks it produces are the same entry image the reader-backed form builds.
+[[nodiscard]] ExpertFileBank describe_expert_objects(
+    std::span<const ObjectHandle> gate_up_objects, std::span<const ObjectHandle> down_objects,
+    const WeightGeometry& gate_up, const WeightGeometry& down, const ExpertBankLayout& layout);
+
 } // namespace ninfer::artifact

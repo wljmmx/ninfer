@@ -653,7 +653,6 @@ class _Builder:
             inputs=(prefix + "ffn_input",),
         )
         self.group(p + "router", p + "shared_score")
-        gate_up, downs = [], []
         for expert in range(e):
             ep = p + f"experts/{expert}/"
             for role, half in (("gate", 0), ("up", 1)):
@@ -666,7 +665,6 @@ class _Builder:
                     offset=(expert * 2 + half) * ir * h,
                     inputs=(prefix + "ffn_input",),
                 )
-                gate_up.append(ep + role)
             self.add(
                 ep + "down",
                 store,
@@ -676,9 +674,14 @@ class _Builder:
                 offset=expert * h * ir,
                 inputs=(ep + "product",),
             )
-            downs.append(ep + "down")
-        self.group(*gate_up)
-        self.group(*downs)
+            # port (sm_89): pack each expert into its own objects instead of one object per bank.
+            # A layer then loads an expert with one contiguous range per matrix rather than six
+            # plane ranges scattered across the bank, which is three times fewer Device
+            # submissions per token and works for any tier (Device pool, RAM, SSD). gate and up
+            # share a parent because both are (ir, h) with h columns; down has ir columns and has
+            # to stand alone - a single composite object would need a new artifact object kind.
+            self.group(ep + "gate", ep + "up")
+            self.group(ep + "down")
         for role in ("gate", "up"):
             self.add(
                 p + "shared/" + role,

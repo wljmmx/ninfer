@@ -161,6 +161,32 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
         const auto down    = artifact::ObjectHandle{stream->down_object()};
         const auto gu_rows = static_cast<std::uint32_t>(stream->gate_up_layout().region.rows);
         const auto dn_rows = static_cast<std::uint32_t>(stream->down_layout().region.rows);
+        // port (sm_89): an artifact that gives every expert its own object is described expert by
+        // expert, which turns the six plane ranges of each expert into one contiguous copy per
+        // matrix. A fused artifact repeats one object for the whole bank and keeps the row-range
+        // mapping, so both forms stay readable.
+        if (stream->per_expert_objects()) {
+            std::vector<artifact::ObjectHandle> gate_up_objects;
+            std::vector<artifact::ObjectHandle> down_objects;
+            gate_up_objects.reserve(stream->count());
+            down_objects.reserve(stream->count());
+            for (const auto object : stream->gate_up_objects()) {
+                gate_up_objects.push_back(artifact::ObjectHandle{object});
+            }
+            for (const auto object : stream->down_objects()) {
+                down_objects.push_back(artifact::ObjectHandle{object});
+            }
+            files.push_back(host_tier
+                                ? artifact::describe_expert_objects(
+                                      gate_up_objects, down_objects,
+                                      stream->gate_up_expert_geometry(),
+                                      stream->down_expert_geometry(), requirements.banks[i])
+                                : artifact::describe_expert_files(
+                                      instance.expert_source->reader(), gate_up_objects,
+                                      down_objects, stream->gate_up_expert_geometry(),
+                                      stream->down_expert_geometry(), requirements.banks[i]));
+            continue;
+        }
         files.push_back(host_tier
                             ? artifact::describe_fused_expert_host(
                                   gate_up, down, stream->gate_up_parent(), stream->down_parent(),

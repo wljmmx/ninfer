@@ -142,9 +142,22 @@ public:
                 return control_weight(moe);
             });
             streamed.shared = shared_weights(moe);
+            // port (sm_89): an artifact may hold one object per expert, which lets the loader copy a
+            // whole expert with one range instead of six. Collect the handle per expert; a fused
+            // artifact repeats the same value here and the stream stays on the single-object path.
+            std::vector<std::uint64_t> gate_up_objects;
+            std::vector<std::uint64_t> down_objects;
+            gate_up_objects.reserve(count);
+            down_objects.reserve(count);
+            for (const auto& expert : moe.experts) {
+                gate_up_objects.push_back(
+                    model_.weight(expert.gate).view.parts.at(0).parent->source_object);
+                down_objects.push_back(
+                    model_.weight(expert.down).view.parts.at(0).parent->source_object);
+            }
             streamed.stream = std::make_shared<ExpertStream>(
                 count, gate_up_layout, down_layout, gate_parent.geometry, down_parent.geometry,
-                gate_parent.source_object, down_parent.source_object);
+                std::move(gate_up_objects), std::move(down_objects));
             streamed.profile = {
                 ops::routed_swiglu_profile(gate_up_layout, down_layout, top_k,
                                            ops::LinearPolicy::A16Only, ops::LinearPolicy::A16Only),

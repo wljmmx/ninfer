@@ -21,6 +21,12 @@ public:
     ExpertStream(std::uint32_t count, WeightBankLayout gate_up, WeightBankLayout down,
                  WeightGeometry gate_up_parent, WeightGeometry down_parent,
                  std::uint64_t gate_up_object, std::uint64_t down_object);
+    // port (sm_89): an artifact may store one object per expert instead of one object per bank. The
+    // loader then needs a handle per expert, not just the bank's first. Both forms are described by
+    // the same per-bank layout, so nothing below changes shape - only how many objects it spans.
+    ExpertStream(std::uint32_t count, WeightBankLayout gate_up, WeightBankLayout down,
+                 WeightGeometry gate_up_parent, WeightGeometry down_parent,
+                 std::vector<std::uint64_t> gate_up_objects, std::vector<std::uint64_t> down_objects);
 
     // Startup-only. `entry` is the cache's per-entry plane layout for this bank.
     void attach(ExpertCache& cache, std::uint32_t bank, const ExpertBankLayout& entry);
@@ -48,8 +54,17 @@ public:
     [[nodiscard]] HostExpertResidency* host() const noexcept { return host_; }
 
     [[nodiscard]] std::uint32_t count() const noexcept { return count_; }
-    [[nodiscard]] std::uint64_t gate_up_object() const noexcept { return gate_up_object_; }
-    [[nodiscard]] std::uint64_t down_object() const noexcept { return down_object_; }
+    [[nodiscard]] std::uint64_t gate_up_object() const noexcept { return gate_up_objects_.front(); }
+    [[nodiscard]] std::uint64_t down_object() const noexcept { return down_objects_.front(); }
+    // True when the artifact gives every expert its own object. The bank is then described expert
+    // by expert; the fused form describes one object and addresses experts by row range.
+    [[nodiscard]] bool per_expert_objects() const noexcept { return per_expert_objects_; }
+    [[nodiscard]] std::span<const std::uint64_t> gate_up_objects() const noexcept {
+        return gate_up_objects_;
+    }
+    [[nodiscard]] std::span<const std::uint64_t> down_objects() const noexcept {
+        return down_objects_;
+    }
     [[nodiscard]] const WeightGeometry& gate_up_parent() const noexcept { return gate_up_parent_; }
     [[nodiscard]] const WeightGeometry& down_parent() const noexcept { return down_parent_; }
     [[nodiscard]] const WeightBankLayout& gate_up_layout() const noexcept { return gate_up_; }
@@ -69,8 +84,9 @@ private:
     WeightGeometry down_parent_;
     WeightGeometry gate_up_expert_;
     WeightGeometry down_expert_;
-    std::uint64_t gate_up_object_ = 0;
-    std::uint64_t down_object_    = 0;
+    std::vector<std::uint64_t> gate_up_objects_;
+    std::vector<std::uint64_t> down_objects_;
+    bool per_expert_objects_ = false;
 
     ExpertCache* cache_ = nullptr;
     HostExpertResidency* host_ = nullptr;
