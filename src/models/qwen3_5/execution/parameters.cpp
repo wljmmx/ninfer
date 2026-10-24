@@ -70,6 +70,15 @@ public:
         }
         const auto& part = first.parts[0];
         if (part.begin % columns) { throw std::invalid_argument("expert bank splits a row"); }
+        if (std::getenv("NINFER_BANK_DEBUG")) {
+            std::fprintf(stderr, "[bank] parent_rows=%llu cols=%llu count=%u rows=%llu begin=%llu\n",
+                         static_cast<unsigned long long>(part.parent->geometry.shape.empty()
+                                                             ? 0
+                                                             : part.parent->geometry.shape.front()),
+                         static_cast<unsigned long long>(columns), count,
+                         static_cast<unsigned long long>(rows),
+                         static_cast<unsigned long long>(part.begin));
+        }
         return bind_weight_bank(
             *part.parent,
             describe_weight_bank(part.parent->geometry, {part.begin / columns, count, rows, rows}));
