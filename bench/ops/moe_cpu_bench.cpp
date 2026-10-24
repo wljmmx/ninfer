@@ -151,22 +151,31 @@ int main(int argc, char** argv) {
         MemoryArena arena(MemorySpan{scratch.data() + aligned, capacity, Device::cpu()});
 
         // Warm the caches and the team before timing.
-        for (int i = 0; i < 8; ++i) {
+        for (int i = 0; i < 16; ++i) {
             arena.reset();
             ops::routed_swiglu(x_tensor, profile, experts, routes, subset, out_tensor, arena,
                                execution);
         }
-        const auto begin = std::chrono::steady_clock::now();
+        // Time each call on its own and report the minimum. The mean on this box moves by 3x
+        // between runs because a hybrid P/E machine schedules the team differently, and a change
+        // measured against it is indistinguishable from noise; the fastest call is the one where
+        // the team got out of its own way, which is the number a kernel change should move.
+        std::vector<double> samples;
+        samples.reserve(static_cast<std::size_t>(iterations));
         for (int i = 0; i < iterations; ++i) {
             arena.reset();
+            const auto call_begin = std::chrono::steady_clock::now();
             ops::routed_swiglu(x_tensor, profile, experts, routes, subset, out_tensor, arena,
                                execution);
+            samples.push_back(std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - call_begin)
+                                  .count());
         }
-        const auto ms = std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() - begin)
-                            .count() / iterations;
-        std::printf("  misses=%d  %.3f ms/call  %.3f ms/expert  %.1f GMAC/s\n", misses, ms,
-                    ms / misses, 3.146 * misses / ms);
+        std::sort(samples.begin(), samples.end());
+        const auto best   = samples.front();
+        const auto median = samples[samples.size() / 2];
+        std::printf("  misses=%d  min %.3f ms  median %.3f ms  %.3f ms/expert  %.1f GMAC/s\n",
+                    misses, best, median, best / misses, 3.146 * misses / best);
     }
     return 0;
 }
