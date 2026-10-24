@@ -145,13 +145,29 @@ int main(int argc, char** argv) {
                 kIntermediate, kExperts, kTopK, execution.worker_count());
 
     for (const int misses : {1, 2, 4, 8}) {
-        std::fill(mask.begin(), mask.end(), 1);
-        for (int j = 0; j < misses; ++j) { mask[ids[j]] = 0; }
-        const ops::ExpertSubset subset{ops::ExpertSubsetKind::MaskZeros, mask_tensor};
+        const auto subset = ops::ExpertSubset{ops::ExpertSubsetKind::MaskOnes, mask_tensor};
         MemoryArena arena(MemorySpan{scratch.data() + aligned, capacity, Device::cpu()});
+
+        // port (sm_89): rotate the routed experts every call. Repeating one set kept its 15 MB of
+        // weights in L2/L3, so the bench measured instruction throughput while the real layer reads
+        // a different expert every step out of a 4 GiB tier - 0.046 ms per expert against 0.077 to
+        // 0.16 in the engine. Stepping through the bank with a stride coprime to the count makes
+        // every call cold, which is what the engine actually pays.
+        const auto route = [&](int iteration) {
+            const auto base = static_cast<std::uint32_t>(iteration * kTopK) % kExperts;
+            std::fill(mask.begin(), mask.end(), 0);
+            // The op rejects duplicate route IDs, so every one of the top_k entries is filled with
+            // a distinct expert; the mask alone decides how many of them are computed.
+            for (int j = 0; j < kTopK; ++j) {
+                const auto expert = static_cast<std::int32_t>((base + j * 37U) % kExperts);
+                ids[j]            = expert;
+                if (j < misses) { mask[expert] = 1; }
+            }
+        };
 
         // Warm the caches and the team before timing.
         for (int i = 0; i < 16; ++i) {
+            route(i);
             arena.reset();
             ops::routed_swiglu(x_tensor, profile, experts, routes, subset, out_tensor, arena,
                                execution);
@@ -163,6 +179,7 @@ int main(int argc, char** argv) {
         std::vector<double> samples;
         samples.reserve(static_cast<std::size_t>(iterations));
         for (int i = 0; i < iterations; ++i) {
+            route(i + 16);
             arena.reset();
             const auto call_begin = std::chrono::steady_clock::now();
             ops::routed_swiglu(x_tensor, profile, experts, routes, subset, out_tensor, arena,

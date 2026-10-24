@@ -23,6 +23,7 @@
 
 #include <stdexcept>
 #include <cstdlib>
+#include <optional>
 
 namespace ninfer::models::qwen3_5::execution {
 namespace {
@@ -108,6 +109,14 @@ void host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParameters& mo
     static CpuExecutor executor(topology,
                                 plan_cpu_team(topology.info(), static_cast<std::uint32_t>(cpu_team)));
     const auto cpu = executor.execution_view();
+    // port (sm_89): the split path calls this collective once per layer, and a parked team costs a
+    // wake plus two barrier turns each time. The bench that runs the same collective back to back
+    // measures 0.05 ms per expert while the engine pays 0.15-0.3, and the difference is the wake,
+    // not the arithmetic. NINFER_CPU_TEAM_ACTIVE keeps the workers polling across layers.
+    static std::optional<CpuExecutionView::ActiveScope> sticky_team;
+    if (std::getenv("NINFER_CPU_TEAM_ACTIVE") != nullptr && !sticky_team) {
+        sticky_team.emplace(cpu.keep_active());
+    }
 
     std::vector<float> host_out(static_cast<std::size_t>(cols) * tokens);
     std::vector<float> host_gpu(static_cast<std::size_t>(cols) * tokens);
@@ -456,3 +465,4 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
 }
 
 } // namespace ninfer::models::qwen3_5::execution
+
