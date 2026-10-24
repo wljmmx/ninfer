@@ -531,7 +531,8 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
         if (placement.total_experts != 0) {
             constexpr double kMib = 1024.0 * 1024.0;
             std::fprintf(stderr,
-                         "[budget] experts: gpu=%llu (%.0f MiB) host=%llu (%.0f MiB) "
+                         "[budget] experts: gpu=%llu (%.0f MiB) host_claim=%llu (%.0f MiB of "
+                         "artifact, arena is smaller) "
                          "file=%llu of %llu, slot %.0f KiB; kv: %u pages, %.0f MiB reserved\n",
                          static_cast<unsigned long long>(placement.gpu_experts),
                          static_cast<double>(placement.gpu_experts * placement.slot_bytes) / kMib,
