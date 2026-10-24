@@ -61,11 +61,55 @@ public:
         slot_last_use_.assign(slot_capacity_, 0);
 
         state_.resize(banks_.size());
+        direct_.assign(banks_.size(), false);
         for (std::size_t i = 0; i < banks_.size(); ++i) {
             auto& s = state_[i];
             s.slot_of.assign(banks_[i].entry.count, kNone);
             s.gate_up_offsets.assign(banks_[i].entry.count, 0);
             s.down_offsets.assign(banks_[i].entry.count, 0);
+
+            // port (sm_89): a bank that lives in one object can be addressed where it already is.
+            // The artifact parent then holds every expert's rows, so the CPU op addresses expert e
+            // by row range and nothing has to be copied. Only the fused layout qualifies: the
+            // per-expert layout spreads the bank over one object per expert, which a single parent
+            // cannot describe, so it keeps the arena path.
+            const auto& bank_files = i < files_.size() ? files_[i] : ExpertFileBank{};
+            const bool one_object =
+                !bank_files.experts.empty() && !bank_files.experts.front().chunks.empty() &&
+                std::all_of(bank_files.experts.begin(), bank_files.experts.end(),
+                            [&](const ExpertFileEntry& entry) {
+                                return !entry.chunks.empty() &&
+                                       entry.chunks.front().file_index ==
+                                           bank_files.experts.front().chunks.front().file_index;
+                            });
+            const auto gate_up_base =
+                one_object && reader_ != nullptr
+                    ? reader_->object_base(bank_files.experts.front().chunks.front().file_index)
+                    : nullptr;
+            const auto down_base =
+                one_object && reader_ != nullptr
+                    ? reader_->object_base(bank_files.experts.front().chunks.back().file_index)
+                    : nullptr;
+            if (gate_up_base != nullptr && down_base != nullptr &&
+                banks_[i].gate_up_layout.region.count == banks_[i].entry.count &&
+                banks_[i].down_layout.region.count == banks_[i].entry.count) {
+                direct_[i] = true;
+                s.gate_up_parent.geometry = banks_[i].gate_up_geometry;
+                s.gate_up_parent.device = Device::cpu();
+                s.gate_up_parent.data   = gate_up_base;
+                s.down_parent.geometry = banks_[i].down_geometry;
+                s.down_parent.device = Device::cpu();
+                s.down_parent.data   = down_base;
+                s.gate_up.parent = &s.gate_up_parent;
+                s.gate_up.layout = banks_[i].gate_up_layout; // plane offsets stay as stored
+                s.gate_up.expert_offsets = nullptr;         // expert * stride
+                s.down.parent = &s.down_parent;
+                s.down.layout = banks_[i].down_layout;
+                s.down.expert_offsets = nullptr;
+                s.view.gate_up = s.gate_up;
+                s.view.down    = s.down;
+                continue;
+            }
 
             // The arena, not the artifact parent, is the backing these views address: the offset
             // table runs over the whole slot range, so the span check has to see the arena size.
@@ -91,6 +135,8 @@ public:
 
     void ensure(ExpertBankId bank, std::span<const std::int32_t> experts,
                 const std::int32_t* resident_mask) override {
+        // Addressed in place: the weights are already where the kernels read them.
+        if (bank.index < direct_.size() && direct_[bank.index]) { return; }
         auto& s = state_[bank.index];
         for (const auto value : experts) {
             if (resident_mask != nullptr && resident_mask[value] == 0) { continue; }
@@ -266,10 +312,13 @@ private:
     bool pinned_                 = false;
     std::uint32_t slot_capacity_ = 0;
     std::uint32_t used_          = 0;
+    std::vector<bool> direct_; // bank addressed in place, no arena copy
     std::vector<std::uint32_t> slot_bank_, slot_expert_;
     std::vector<std::uint64_t> slot_last_use_;
     std::uint64_t epoch_ = 0;
 };
 
 } // namespace ninfer::models::qwen3_5::execution
+
+
 

@@ -50,6 +50,12 @@ public:
         (void)out;
         return false;
     }
+    // port (sm_89): base of a whole object, so a bank that lives in one object can be addressed in
+    // place. Null when the source cannot name it, which keeps the copying path as the fallback.
+    virtual const std::byte* object_base(std::uint32_t object_index) const {
+        (void)object_index;
+        return nullptr;
+    }
 };
 
 } // namespace ninfer

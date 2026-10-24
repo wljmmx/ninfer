@@ -63,6 +63,17 @@ public:
         return true;
     }
 
+    // port (sm_89): name the object's bytes so a bank that occupies one object can be read in
+    // place. Without this the host tier copies every expert it needs into its arena.
+    const std::byte* object_base(std::uint32_t object_index) const override {
+        try {
+            const auto bytes = model_.host_bytes(artifact::ObjectHandle{object_index});
+            return bytes.empty() ? nullptr : bytes.data();
+        } catch (const std::exception&) {
+            return nullptr;
+        }
+    }
+
 private:
     const Model& model_;
 };
