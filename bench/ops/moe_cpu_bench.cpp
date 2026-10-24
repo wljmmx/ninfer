@@ -172,8 +172,14 @@ int main(int argc, char** argv) {
         // a different expert every step out of a 4 GiB tier - 0.046 ms per expert against 0.077 to
         // 0.16 in the engine. Stepping through the bank with a stride coprime to the count makes
         // every call cold, which is what the engine actually pays.
+        //
+        // NINFER_BENCH_STATIC pins the set instead, which is the other half of that comparison:
+        // the same weights stay resident, so the difference against the rotating run is what the
+        // memory path costs per call - address translation included.
+        static const bool fixed_set = std::getenv("NINFER_BENCH_STATIC") != nullptr;
         const auto route = [&](int iteration) {
-            const auto base = static_cast<std::uint32_t>(iteration * kTopK) % kExperts;
+            const auto base = fixed_set ? 0U
+                                        : static_cast<std::uint32_t>(iteration * kTopK) % kExperts;
             std::fill(mask.begin(), mask.end(), 0);
             // The op rejects duplicate route IDs, so every one of the top_k entries is filled with
             // a distinct expert; the mask alone decides how many of them are computed.
