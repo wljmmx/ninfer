@@ -78,6 +78,10 @@ struct Scratch {
     Task* tasks;
     float* input;
     float* activation;
+    // port (sm_89): the input row quantised to int8 alongside its per-64-group scale, so the q4 dot
+    // product can run on 32 weights per instruction pair instead of decoding eight at a time.
+    std::int8_t* input_q8;
+    float* input_scale;
 };
 
 struct Work {

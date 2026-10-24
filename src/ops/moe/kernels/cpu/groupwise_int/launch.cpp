@@ -9,10 +9,14 @@ namespace {
 template <class Arena>
 Scratch allocate(Arena& arena, int tokens, int token_block) {
     const int columns = std::min(token_block, tokens);
+    // One weight scale covers 64 values, so one activation scale does too.
+    const int groups = hidden / 64;
     return {static_cast<Group*>(arena.alloc_bytes(sizeof(Group) * top_k * columns).data),
             static_cast<Task*>(arena.alloc_bytes(sizeof(Task) * top_k * columns).data),
             static_cast<float*>(arena.alloc(DType::FP32, {hidden, columns}).data),
-            static_cast<float*>(arena.alloc(DType::FP32, {intermediate, top_k * columns}).data)};
+            static_cast<float*>(arena.alloc(DType::FP32, {intermediate, top_k * columns}).data),
+            static_cast<std::int8_t*>(arena.alloc_bytes(sizeof(std::int8_t) * hidden * columns).data),
+            static_cast<float*>(arena.alloc_bytes(sizeof(float) * groups * columns).data)};
 }
 
 MatrixBank matrix_bank(const WeightBankView& bank) {
