@@ -104,10 +104,11 @@ struct ExpertCache::Impl {
     static constexpr std::size_t kSegmentBytes = 8u << 20;
     std::unique_ptr<VmmPool> pool;
     // port (sm_89): the pool is one flat slot space. Every expert lives at `slot * slot_bytes`
-    // measured from the reservation's base, so no address is derived from a window number: a bank
-    // only knows the first slot of its range. Reassigning slots therefore never moves a plane base,
-    // which is what lets a global slot allocator replace the per-bank ranges below.
-    std::uint64_t slot_cap   = 0; // slots one bank may hold
+    // measured from the reservation's base, so no address is derived from a window number. Slots
+    // are handed out from one shared free list rather than to fixed per-bank ranges: a bank's
+    // resident set can then grow or shrink on demand instead of being pinned to a share of the
+    // pool that another layer may be short of.
+    std::uint64_t slot_cap   = 0; // slots one bank is expected to hold (the split hint)
     std::uint64_t slots_max  = 0; // slots the reservation can back
     std::uint64_t slots_live = 0; // slots backed by device memory right now
     std::vector<std::size_t> first; // flat entry index of each bank's expert 0
@@ -115,13 +116,14 @@ struct ExpertCache::Impl {
     std::vector<ExpertCacheKey> required;
     std::uint64_t used = 0, uploads = 0, evictions = 0, epoch = 0, hits = 0;
     std::uint64_t slot_bytes = 0;
-    // First slot of each bank's range. Consecutive banks are laid out back to back, so the slots a
-    // bank owns are [slot_base, slot_base + slot_cap).
-    std::vector<std::uint64_t> slot_base;
-    // Global slot of each expert, or kAbsentSlot when the pool does not hold it. The default is the
-    // identity offset by the bank's base, so a fully resident bank keeps addressing expert i at
-    // slot_base + i.
+    // Global slot of each expert, or kAbsentSlot when the pool does not hold it. A fully resident
+    // bank keeps the identity, which is what lets a captured graph address expert i directly.
     std::vector<std::vector<std::uint32_t>> slot_of;
+    // Every slot not owned by an expert. Free slots are shared: a bank that drops experts releases
+    // them here and another bank's next resident set may take them.
+    std::vector<std::uint32_t> free_slots;
+    // How many experts of each bank own a slot right now.
+    std::vector<std::uint32_t> resident_count;
     int ordinal = 0;
 
     Impl(std::span<const ExpertBankSpec> specs, const ExpertCacheRequirements& req,
@@ -218,47 +220,51 @@ struct ExpertCache::Impl {
             cap = std::min(cap, per_bank);
         }
         slot_cap = cap;
-        slot_base.assign(banks.size(), 0);
-        std::uint64_t next_slot = 0;
-        for (std::size_t b = 0; b < banks.size(); ++b) {
-            slot_base[b] = next_slot;
-            if (!banks[b].resident) { next_slot += slot_cap; }
-        }
-        if (next_slot > slots_max) {
-            throw std::invalid_argument("expert pool cannot hold every bank's slot run");
+        free_slots.clear();
+        free_slots.reserve(static_cast<std::size_t>(slots_live));
+        // Pushed high to low so the first pop hands out slot 0: a fresh bank then keeps the identity
+        // mapping it needs for a graph, exactly as the per-bank runs used to lay it out.
+        for (std::uint64_t slot = slots_live; slot > 0; --slot) {
+            free_slots.push_back(static_cast<std::uint32_t>(slot - 1));
         }
         slot_of.resize(banks.size());
-        // port (sm_89): only the experts that fit one bank's run start resident. The identity
-        // mapping is right when the run holds the whole layer; a smaller run must start with the
-        // rest absent, or a stale slot index would point past the run.
+        resident_count.assign(banks.size(), 0);
+        // port (sm_89): only the experts that fit the per-bank hint start resident. The identity
+        // mapping is right when the hint holds the whole layer; a smaller hint must start with the
+        // rest absent, or a stale slot index would point at another bank's expert.
         for (std::size_t b = 0; b < banks.size(); ++b) {
-            slot_of[b].resize(banks[b].count);
-            for (std::uint32_t e = 0; e < banks[b].count; ++e) {
-                slot_of[b][e] =
-                    e < slot_cap ? static_cast<std::uint32_t>(slot_base[b] + e) : kAbsentSlot;
+            slot_of[b].assign(banks[b].count, kAbsentSlot);
+            if (banks[b].resident) { continue; }
+            for (std::uint32_t e = 0; e < banks[b].count && e < slot_cap; ++e) {
+                if (free_slots.empty()) {
+                    throw std::invalid_argument("expert pool cannot seed every bank's hot set");
+                }
+                slot_of[b][e] = free_slots.back();
+                free_slots.pop_back();
+                ++resident_count[b];
             }
         }
     }
 
-    // Keeps the first `experts` entries that fit in one bank's slot run and marks every other expert
-    // of the bank absent. The caller recomputes and republishes its offset table afterwards.
-    // Returns true when the resident set changed. Experts that stay resident keep their slot, so a
-    // step that routes to experts already present uploads nothing and the run is never discarded.
+    // Makes `experts` the bank's resident set, in list order. The caller recomputes and republishes
+    // its offset table afterwards. Returns true when the resident set changed. Experts that stay
+    // resident keep their slot, so a step that routes to experts already present uploads nothing
+    // and never discards them; slots of the ones leaving go back to the shared free list, and
+    // arrivals take whatever the list has left.
     bool set_resident(std::uint32_t bank, std::span<const std::uint32_t> experts) {
         if (bank >= banks.size()) { throw std::out_of_range("expert cache bank"); }
         auto& slots = slot_of[bank];
-        const auto base  = slot_base[bank];
-        const auto limit = slot_cap;
         std::vector<std::uint32_t> wanted;
-        wanted.reserve(std::min<std::size_t>(experts.size(), limit));
+        wanted.reserve(experts.size());
         std::vector<bool> keep(slots.size(), false);
         for (const std::uint32_t expert : experts) {
             if (expert >= slots.size()) { throw std::out_of_range("expert cache expert"); }
-            if (wanted.size() >= limit) { break; }
             if (keep[expert]) { continue; }
             keep[expert] = true;
             wanted.push_back(expert);
         }
+        // A bank may ask for more slots than the pool has left; the shared free list decides how
+        // many it actually gets, and the caller reads the result back off the offset table.
         bool changed = false;
         for (std::size_t expert = 0; expert < slots.size(); ++expert) {
             if ((slots[expert] != kAbsentSlot) != keep[expert]) {
@@ -266,32 +272,33 @@ struct ExpertCache::Impl {
                 break;
             }
         }
-        // Consecutive steps usually route to the same experts. Keeping the run when the set is
-        // unchanged turns a per-token reupload into a hit.
+        // Consecutive steps usually route to the same experts. Keeping the set when it is unchanged
+        // turns a per-token reupload into a hit.
         if (!changed) { return false; }
-        // An expert that stays keeps its slot: only those leaving release their slot and only the
-        // arrivals lose their cached image.
-        std::vector<std::uint32_t> next(slots.size(), kAbsentSlot);
-        std::vector<bool> taken(limit, false);
+        std::uint32_t held = 0;
         for (std::size_t expert = 0; expert < slots.size(); ++expert) {
-            if (slots[expert] == kAbsentSlot || !keep[expert]) { continue; }
-            next[expert]                       = slots[expert];
-            taken[slots[expert] - base]        = true;
+            if (slots[expert] == kAbsentSlot) { continue; }
+            if (keep[expert]) {
+                ++held;
+                continue;
+            }
+            // Leaving: hand the slot to whoever needs it next. This happens before the arrivals are
+            // placed, so a swap of equal size always has the slots it is about to need.
+            free_slots.push_back(slots[expert]);
+            slots[expert]                       = kAbsentSlot;
+            entries[first[bank] + expert].ready = false;
         }
-        std::uint32_t free_slot = 0;
+        std::uint32_t taken = 0;
         for (const std::uint32_t expert : wanted) {
-            if (next[expert] != kAbsentSlot) { continue; }
-            while (free_slot < limit && taken[free_slot]) { ++free_slot; }
-            if (free_slot >= limit) { break; }
-            next[expert]                        = static_cast<std::uint32_t>(base + free_slot);
-            taken[free_slot]                    = true;
+            if (held + taken >= wanted.size()) { break; }
+            if (slots[expert] != kAbsentSlot) { continue; }
+            if (free_slots.empty()) { break; }
+            slots[expert]                       = free_slots.back();
+            free_slots.pop_back();
             entries[first[bank] + expert].ready = false;
+            ++taken;
         }
-        for (std::size_t expert = 0; expert < slots.size(); ++expert) {
-            if (slots[expert] == kAbsentSlot || keep[expert]) { continue; }
-            entries[first[bank] + expert].ready = false;
-        }
-        slots = std::move(next);
+        resident_count[bank] = held + taken;
         required.erase(std::remove_if(required.begin(), required.end(),
                                       [&](const ExpertCacheKey& key) {
                                           return key.bank == bank &&
@@ -300,6 +307,7 @@ struct ExpertCache::Impl {
                        required.end());
         return true;
     }
+
 
     std::size_t index(ExpertCacheKey key) const {
         if (key.bank >= banks.size() || banks[key.bank].resident ||
@@ -317,21 +325,15 @@ struct ExpertCache::Impl {
     // Bytes the pool is allowed to use right now.
     std::uint64_t live_bytes() const { return slots_live * slot_bytes; }
 
-    // Every bank's whole layer fits at once: no bank's run is ever shortened.
+    // Every bank's whole layer fits at once. Slots are shared, so what matters is the total: with
+    // room for the sum of every bank, no bank is ever shortened.
     bool holds_every_layer() const noexcept {
         std::uint64_t needed = 0;
-        std::uint64_t widest = 0;
         for (const auto& bank : banks) {
             if (bank.resident) { continue; }
-            ++needed;
-            widest = std::max<std::uint64_t>(widest, bank.count);
+            needed += bank.count;
         }
-        if (needed == 0 || widest > slot_cap) { return false; }
-        for (std::size_t b = 0; b < banks.size(); ++b) {
-            if (banks[b].resident) { continue; }
-            if (slot_base[b] + banks[b].count > slots_live) { return false; }
-        }
-        return true;
+        return needed != 0 && needed <= slots_live;
     }
 
     // Uploads the whole resident set once. A captured graph freezes the expert addresses, so every
@@ -378,17 +380,26 @@ struct ExpertCache::Impl {
         const auto keep = static_cast<std::size_t>(
             (wanted * slot_bytes + kSegmentBytes - 1) / kSegmentBytes * kSegmentBytes);
         if (wanted < slots_live) {
-            // A bank whose run no longer fits loses its images, but keeps its slots: the reserved
-            // addresses stay put, so a grow later streams the same experts back into place.
+            // Experts above the new limit lose their slot; the reservation still owns those
+            // addresses, so a grow later hands them out again from the free list.
             for (std::uint32_t b = 0; b < banks.size(); ++b) {
                 if (banks[b].resident) { continue; }
-                if (slot_base[b] + slot_cap <= wanted) { continue; }
                 for (std::uint32_t e = 0; e < banks[b].count; ++e) {
-                    entries[first[b] + e].ready = false;
+                    const auto slot = slot_of[b][e];
+                    if (slot == kAbsentSlot || slot < wanted) { continue; }
+                    slot_of[b][e]                        = kAbsentSlot;
+                    entries[first[b] + e].ready          = false;
+                    --resident_count[b];
                 }
             }
+            free_slots.erase(std::remove_if(free_slots.begin(), free_slots.end(),
+                                            [&](std::uint32_t slot) { return slot >= wanted; }),
+                             free_slots.end());
             pool->release(pool->mapped() - keep, keep);
         } else {
+            for (std::uint64_t slot = slots_live; slot < wanted; ++slot) {
+                free_slots.push_back(static_cast<std::uint32_t>(slot));
+            }
             pool->acquire(keep - pool->mapped());
         }
         slots_live = wanted;
@@ -586,7 +597,7 @@ std::uint64_t ExpertCache::resize(std::uint64_t target_bytes) { return impl_->re
 std::uint64_t ExpertCache::window_origin(std::uint32_t bank) const {
     // port (sm_89): the pool is a flat slot space, so a bank's plane bases are already absolute and
     // nothing is offset per bank. Kept so a caller that rebases a strided view keeps compiling.
-    if (bank >= impl_->slot_base.size()) { throw std::out_of_range("expert cache bank"); }
+    if (bank >= impl_->banks.size()) { throw std::out_of_range("expert cache bank"); }
     return 0;
 }
 ConstMemorySpan ExpertCache::pool() const {
@@ -608,8 +619,8 @@ std::uint32_t ExpertCache::resident_capacity() const noexcept {
 bool ExpertCache::can_hold_every_layer() const noexcept { return impl_->holds_every_layer(); }
 
 bool ExpertCache::window_resident(std::uint32_t bank) const noexcept {
-    return bank < impl_->slot_base.size() && impl_->slot_base[bank] + impl_->slot_capacity() <=
-                                                 impl_->slots_live;
+    return bank < impl_->resident_count.size() &&
+           impl_->resident_count[bank] == impl_->banks[bank].count;
 }
 
 void ExpertCache::preload_all() { impl_->preload_every_layer(); }

@@ -87,8 +87,11 @@ int main() {
     expect("a kept run still answers", cache.window_resident(1) && cache.offset({1, 0}).has_value());
 
     // Growing back must make the reservation usable again, and the data that was dropped has to
-    // come back through the normal upload path with its original bytes.
+    // come back through the normal upload path with its original bytes. Slots are shared, so the
+    // bank asks for one instead of assuming its old address is still there.
     expect("grow restores the reservation", cache.resize(kCapacity) == kCapacity);
+    const std::uint32_t expert_zero = 0;
+    cache.set_resident_experts(3, std::span<const std::uint32_t>(&expert_zero, 1));
     cache.prepare(std::span<const ExpertCacheKey>(&keys[3], 1));
     cache.wait_for_progress();
     const auto restored = cache.offset({3, 0});
