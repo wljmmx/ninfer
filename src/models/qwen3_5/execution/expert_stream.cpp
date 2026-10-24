@@ -210,6 +210,10 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 wanted.push_back(expert);
             }
         }
+        // port (sm_89): the router does not repeat a step, so the set is refreshed every step. A
+        // periodic refresh looked cheaper on paper (two device copies saved) but measured 11.1
+        // against 24.3 tok/s: a stale set sends far more experts down the host tier than the two
+        // copies ever cost.
         if (cache_->set_resident_experts(bank_, wanted)) {
             std::fill(offsets_.begin(), offsets_.end(), 0);
             std::vector<std::int32_t> mask(count_, 0);
@@ -219,7 +223,8 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 offsets_[expert] = static_cast<std::uint64_t>(*slot) * cache_->slot_bytes();
                 mask[expert]     = 1;
             }
-            mask_host_ = mask;
+            mask_host_      = mask;
+            resident_order_ = wanted;
             const auto table_bytes = offsets_.size() * sizeof(std::uint64_t);
             // Async on the consumer stream: the kernels that read these tables are queued behind
             // them there, while a blocking copy would stall the host twice per layer.

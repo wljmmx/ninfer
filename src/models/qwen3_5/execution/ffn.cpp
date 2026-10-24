@@ -19,6 +19,8 @@
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/silu_mul.h"
 
+#include <thread>
+
 #include <stdexcept>
 
 namespace ninfer::models::qwen3_5::execution {
@@ -97,7 +99,13 @@ void host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParameters& mo
     const auto stream = execution.stream;
 
     static CpuTopology topology;
-    static CpuExecutor executor(topology, plan_cpu_team(topology.info(), 8));
+    // port (sm_89): the CPU half is the whole cost of a split layer, so give it every physical
+    // core the machine has instead of a fixed team of eight. A 24-core part was leaving two
+    // thirds of its throughput unused.
+    static const auto cpu_team = std::max<std::size_t>(
+        1, cpu_worker_order(topology.info(), false).size());
+    static CpuExecutor executor(topology,
+                                plan_cpu_team(topology.info(), static_cast<std::uint32_t>(cpu_team)));
     const auto cpu = executor.execution_view();
 
     std::vector<float> host_out(static_cast<std::size_t>(cols) * tokens);
@@ -149,8 +157,9 @@ void host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParameters& mo
                      __bfloat162float(__ushort_as_bfloat16(fetch.x[3])));
     }
     // The Device half was launched before this call and ran while the CPU kernels above worked.
-    // Join it now and fetch its contribution; only then can the two be combined.
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    // The copy below is queued on the same stream, so it cannot start before that kernel finishes:
+    // waiting for the copy alone is enough, and a separate stream-wide synchronise here would only
+    // pay the WDDM round trip twice per layer.
     CUDA_CHECK(cudaMemcpyAsync(host_gpu.data(), gpu_term.data, host_gpu.size() * sizeof(float),
                                cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
