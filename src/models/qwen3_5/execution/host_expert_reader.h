@@ -35,6 +35,12 @@ public:
     }
 
     // port (sm_89): name the payload slices so the uploader can DMA them without a staging copy.
+    // Adjacent slices are merged, which is the reader half of the expert-major artefact layout: an
+    // artefact that stores one segment per expert turns six per-expert planes into one contiguous
+    // 1.875 MiB copy, which is the shape the pool already takes. Against the current plane-major
+    // artefact the planes of one expert are adjacent in neither the object nor the slot image, so
+    // this merges nothing and costs nothing; it is here so the layout change only has to touch the
+    // artefact and the writer, not the loader.
     bool spans(const ExpertFileEntry& entry, std::vector<ExpertBlobSpan>& out) const override {
         out.clear();
         out.reserve(entry.chunks.size());
@@ -43,7 +49,16 @@ public:
             if (chunk.file_offset > bytes.size() || chunk.bytes > bytes.size() - chunk.file_offset) {
                 return false;
             }
-            out.push_back({bytes.data() + chunk.file_offset, chunk.bytes, chunk.image_offset});
+            const auto* source = bytes.data() + chunk.file_offset;
+            if (!out.empty()) {
+                auto& last = out.back();
+                if (static_cast<const std::byte*>(last.source) + last.bytes == source &&
+                    last.image_offset + last.bytes == chunk.image_offset) {
+                    last.bytes += chunk.bytes;
+                    continue;
+                }
+            }
+            out.push_back({source, chunk.bytes, chunk.image_offset});
         }
         return true;
     }
