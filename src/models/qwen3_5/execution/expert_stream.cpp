@@ -187,14 +187,27 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 since_decay_ = 0;
             }
         }
+        // port (sm_89): two policies, because they disagree on what the set is for.
+        //
+        // Streaming (default): this step's routes are placed first, so the Device computes them
+        // and the host only sees the experts that did not fit. The set follows the router, which
+        // keeps hits high while the pool can hold a useful fraction of a layer.
+        //
+        // Static (NINFER_EXPERT_STATIC=1): the set is the top-N of the decayed route score alone,
+        // which is what Strata's profile does (h = 0.6447 over 4,105 of 24,576 slots against 0.4864
+        // for compulsory fill). It never chases a single step, so the layout changes rarely, but it
+        // only pays when the pool holds enough slots for the popular experts to cover most routes.
+        static const bool static_set = std::getenv("NINFER_EXPERT_STATIC") != nullptr;
         std::vector<std::uint32_t> wanted;
         std::vector<bool> chosen(count_, false);
         wanted.reserve(capacity);
-        for (std::size_t i = 0; i < values && wanted.size() < capacity; ++i) {
-            const auto expert = static_cast<std::uint32_t>(route_ids[i]);
-            if (chosen[expert]) { continue; }
-            chosen[expert] = true;
-            wanted.push_back(expert);
+        if (!static_set) {
+            for (std::size_t i = 0; i < values && wanted.size() < capacity; ++i) {
+                const auto expert = static_cast<std::uint32_t>(route_ids[i]);
+                if (chosen[expert]) { continue; }
+                chosen[expert] = true;
+                wanted.push_back(expert);
+            }
         }
         if (wanted.size() < capacity) {
             std::vector<std::uint32_t> ranked(count_);
