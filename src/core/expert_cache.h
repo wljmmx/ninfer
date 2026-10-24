@@ -99,8 +99,10 @@ public:
     ExpertCache(const ExpertCache&)            = delete;
     ExpertCache& operator=(const ExpertCache&) = delete;
 
-    // Declares the experts the next layer needs; they are uploaded by progress().
-    void prepare(std::span<const ExpertCacheKey> required);
+// Declares the experts the next layer needs; they are uploaded by progress(). `stream` is the
+// stream the consumer runs on: uploads queued there are ordered before the kernels that read them,
+// so no device-wide synchronisation is needed.
+void prepare(std::span<const ExpertCacheKey> required, cudaStream_t stream = nullptr);
 
     // Names the experts of one bank the pool should hold. Experts not listed are treated as
     // absent: prepare() skips them and offset() reports nullopt, which lets the caller mask them
@@ -112,7 +114,7 @@ public:
     bool set_resident_experts(std::uint32_t bank, std::span<const std::uint32_t> experts);
 
     // Uploads one batch if a slot is free. Never blocks.
-    [[nodiscard]] ExpertCacheProgress progress();
+    [[nodiscard]] ExpertCacheProgress progress(cudaStream_t stream = nullptr);
 
     // Waits for every in-flight batch. Used at startup and before a required miss.
     // port (sm_89): when a stream is given the uploads are ordered on it, so the caller does

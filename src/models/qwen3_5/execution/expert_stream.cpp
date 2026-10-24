@@ -221,10 +221,12 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             }
             mask_host_ = mask;
             const auto table_bytes = offsets_.size() * sizeof(std::uint64_t);
-            (void)cudaMemcpy(offsets_device_->p, offsets_.data(), table_bytes,
-                             cudaMemcpyHostToDevice);
-            (void)cudaMemcpy(mask_device_->p, mask.data(), mask.size() * sizeof(std::int32_t),
-                             cudaMemcpyHostToDevice);
+            // Async on the consumer stream: the kernels that read these tables are queued behind
+            // them there, while a blocking copy would stall the host twice per layer.
+            (void)cudaMemcpyAsync(offsets_device_->p, offsets_.data(), table_bytes,
+                                  cudaMemcpyHostToDevice, stream);
+            (void)cudaMemcpyAsync(mask_device_->p, mask.data(), mask.size() * sizeof(std::int32_t),
+                                  cudaMemcpyHostToDevice, stream);
         }
     }
     required_.clear();
@@ -241,9 +243,9 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                                 }),
                     required_.end());
     const auto upload_begin = std::chrono::steady_clock::now();
-    cache_->prepare(required_);
+    cache_->prepare(required_, stream);
     try {
-        cache_->wait_for_progress();
+        cache_->wait_for_progress(stream);
     } catch (const std::exception& error) {
         throw std::runtime_error(std::string("pool: ") + error.what());
     }
@@ -261,14 +263,9 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     // port (sm_89): the bank's window can move between layers, so the plane bases are
     // rebased onto the window that is resident now. A fixed base would address window 0.
     rebase_window();
-    // port (sm_89): uploads go through the legacy stream while the compute stream is
-    // non-blocking; without settling here nothing orders the next kernel after the copies.
-    {
-        const auto settled = cudaDeviceSynchronize();
-        if (settled != cudaSuccess) {
-            throw std::runtime_error(std::string("upload settle: ") + cudaGetErrorString(settled));
-        }
-    }
+    // The uploads were queued on the consumer stream, so the kernels that read them are already
+    // ordered after the copies; only the artifact path had to wait, and it did so inside
+    // progress(). A device-wide synchronise here used to cost most of the layer's time.
     return true;
 }
 

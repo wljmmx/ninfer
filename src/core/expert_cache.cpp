@@ -92,6 +92,12 @@ struct ExpertCache::Impl {
     static constexpr std::uint64_t kMinimumHotSet = 8;
     std::size_t max_entry_bytes               = 0;
     std::unique_ptr<PinnedHostBuffer> staging;
+    // port (sm_89): the stream the consumer runs on. Uploads queued there are ordered before the
+    // kernels that read them, so a Host-replica upload needs no barrier at all.
+    cudaStream_t upload_stream = nullptr;
+    // True when experts come from the artifact and therefore pass through the shared staging
+    // buffer, whose slots cannot be reused until their copy has landed.
+    bool staging_needed = false;
     // port (sm_89): the pool is a VMM reservation rather than one cudaMalloc, so whole segments can
     // be handed back to the driver while the pool is alive. Every expert offset indexes into this
     // reservation, so shrinking the pool never moves a published entry.
@@ -197,6 +203,15 @@ struct ExpertCache::Impl {
             }
         }
         ordinal    = device.device;
+        for (const auto& bank : files) {
+            for (const auto& expert : bank.experts) {
+                if (expert.image_bytes) {
+                    staging_needed = true;
+                    break;
+                }
+            }
+            if (staging_needed) { break; }
+        }
         // port (sm_89): reserve one contiguous address range and back every window with its own
         // segments. A window keeps its offset for the pool's lifetime; only its backing pages can
         // be returned to the driver by resize().
@@ -520,9 +535,10 @@ ExpertCache::ExpertCache(std::span<const ExpertBankSpec> specs,
 
 ExpertCache::~ExpertCache() = default;
 
-void ExpertCache::prepare(std::span<const ExpertCacheKey> required) {
+void ExpertCache::prepare(std::span<const ExpertCacheKey> required, cudaStream_t stream) {
     // Experts the pool does not hold are dropped here: the caller masks them out of the GPU job and
     // serves them from the host tier, so uploading them would only evict a resident expert.
+    impl_->upload_stream = stream;
     impl_->required.clear();
     for (const auto& key : required) {
         if (key.bank < impl_->slot_of.size() && key.expert < impl_->slot_of[key.bank].size() &&
@@ -547,25 +563,30 @@ std::optional<std::uint32_t> ExpertCache::expert_slot(std::uint32_t bank,
     return slot;
 }
 
-ExpertCacheProgress ExpertCache::progress() {
+ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
+    if (stream == nullptr) { stream = impl_->upload_stream; }
     std::size_t staged = 0;
     for (const auto& key : impl_->required) {
         const auto& entry = impl_->entries[impl_->index(key)];
         if (entry.ready) { continue; }
         if (staged == Impl::kUploadBatch) { break; }
-        impl_->upload_one(key, nullptr, false, staged);
+        impl_->upload_one(key, stream, false, staged);
         ++staged;
     }
     if (staged == 0) { return {0, true}; }
-    // One settle for the whole turn: the copies were queued back to back on the same stream.
-    const auto settled = cudaStreamSynchronize(nullptr);
-    if (settled != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(settled)); }
+    // port (sm_89): the artifact path stages through one pinned buffer per batch position, so the
+    // next batch would overwrite an image that is still being copied. The Host-replica path copies
+    // straight out of the arena and needs no barrier; its copies are ordered by the consumer stream
+    // and the kernel that reads them, so nothing has to be waited for at all.
+    if (impl_->staging_needed) {
+        const auto settled = cudaStreamSynchronize(stream);
+        if (settled != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(settled)); }
+    }
     return {staged, false};
 }
 
 void ExpertCache::wait_for_progress(cudaStream_t stream) {
-    (void)stream;
-    while (!progress().required_published) {}
+    while (!progress(stream).required_published) {}
 }
 
 std::optional<std::uint64_t> ExpertCache::offset(ExpertCacheKey key) const {
