@@ -100,9 +100,19 @@ int main(int argc, char** argv) {
     const int workers    = argc > 2 ? std::atoi(argv[2]) : 0;
 
     static CpuTopology topology;
-    const auto team = workers > 0 ? static_cast<std::uint32_t>(workers)
-                                  : static_cast<std::uint32_t>(
-                                        std::max<std::size_t>(1, cpu_worker_order(topology.info(), false).size()));
+    // plan_cpu_team() rejects a team wider than the processors it selected, and an exception
+    // escaping main() aborts with 0xC0000409 - which reads as a memory bug. Report the ceiling
+    // instead: the bench is the tool that tells people how wide the team may be.
+    const auto selectable = cpu_worker_order(topology.info(), false).size();
+    const auto team       = workers > 0 ? static_cast<std::uint32_t>(workers)
+                                        : static_cast<std::uint32_t>(std::max<std::size_t>(1, selectable));
+    if (team > selectable) {
+        std::fprintf(stderr,
+                     "moe cpu bench: %u workers requested but only %zu cores are selectable "
+                     "without SMT\n",
+                     team, selectable);
+        return 2;
+    }
     static CpuExecutor executor(topology, plan_cpu_team(topology.info(), team));
     const auto execution = executor.execution_view();
 
