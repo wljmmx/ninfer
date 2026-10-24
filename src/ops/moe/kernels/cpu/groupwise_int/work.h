@@ -9,6 +9,10 @@ namespace ninfer::ops::detail::moe_cpu::groupwise_int {
 
 inline constexpr int hidden = 2048, intermediate = 512, experts = 256, top_k = 8;
 inline constexpr int max_token_block = 8;
+// One ownership unit is a run of output channels. 16 keeps a cache line of FP32 per unit, but it
+// leaves only 32 units per expert, so a layer with one or two missing experts cannot fill a wide
+// team; the launch halves it when there is not enough work (see `block` in Work).
+inline constexpr int channel_block = 16;
 
 enum class FirstChunkPreparation { Caller, Worker };
 
@@ -84,6 +88,11 @@ struct Work {
     Scratch scratch;
     int group_count       = 0;
     int task_count        = 0;
+    // Channels per ownership unit and the team size. Chosen per chunk from the amount of work: a
+    // split layer with one or two missing experts otherwise hands each worker a single unit and
+    // pays the barrier for nothing.
+    int block             = channel_block;
+    int workers           = 1;
     bool has_four_columns = false;
 };
 

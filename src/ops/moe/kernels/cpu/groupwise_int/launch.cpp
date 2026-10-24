@@ -49,6 +49,7 @@ void launch(const Invocation& args, const Plan& plan, MemoryArena& arena,
               .gate_up = matrix_bank(args.experts.gate_up),
               .down    = matrix_bank(args.experts.down),
               .scratch = allocate(arena, args.tokens, plan.token_block)};
+    work.workers = static_cast<int>(execution.worker_count());
     if (plan.kernel->first_chunk == FirstChunkPreparation::Caller) {
         prepare_chunk(work, 0, std::min(args.tokens, plan.token_block));
     }
@@ -95,3 +96,4 @@ void prepare_chunk(Work& work, int token_begin, int columns) noexcept {
 }
 
 } // namespace ninfer::ops::detail::moe_cpu::groupwise_int
+

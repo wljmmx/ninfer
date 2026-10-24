@@ -56,7 +56,7 @@ inline void dot(const Matrix& matrix, const int (&rows)[Rows], const Input* cons
     }
 }
 
-inline constexpr int channel_block = 16; // One cache line of FP32 output per ownership unit.
+// channel_block (the maximum unit width) lives in work.h.
 
 template <class Simd, int Columns>
 inline void gate_up(Work& work, const Group& group, int first, int channel, int begin,
@@ -71,7 +71,7 @@ inline void gate_up(Work& work, const Group& group, int first, int channel, int 
             input[c] = work.scratch.input + group.tokens[first + c] * hidden;
         }
     }
-    for (int i = channel; i < channel + channel_block; i += rows / 2) {
+    for (int i = channel; i < channel + work.block; i += rows / 2) {
         int indices[rows];
         for (int r = 0; r < rows / 2; ++r) {
             indices[2 * r]     = i + r;
@@ -110,7 +110,7 @@ inline void down(Work& work, const Group& group, int first, int channel,
     for (int c = 0; c < Columns; ++c) {
         input[c] = work.scratch.activation + group.slots[first + c] * intermediate;
     }
-    for (int i = 0; i < channel_block; i += rows) {
+    for (int i = 0; i < work.block; i += rows) {
         int indices[rows];
         for (int r = 0; r < rows; ++r) { indices[r] = channel + i + r; }
         float values[rows][Columns];
@@ -128,12 +128,12 @@ template <class Simd, int DownBits, bool FourColumns>
 [[gnu::always_inline]] inline void compute_chunk(Work& work, const CpuWorkerContext& worker,
                                                  int begin, int columns,
                                                  unsigned bf16_columns) noexcept {
-    constexpr int blocks = intermediate / channel_block;
+    const int blocks = intermediate / work.block;
     const auto tasks     = worker.range(work.task_count * blocks);
     for (auto index = tasks.begin; index < tasks.end; ++index) {
         const auto& task  = work.scratch.tasks[index / blocks];
         const auto& group = work.scratch.groups[task.group_index];
-        const int channel = (index % blocks) * channel_block;
+        const int channel = (index % blocks) * work.block;
         if constexpr (FourColumns) {
             if (task.columns == 4) {
                 gate_up<Simd, 4>(work, group, task.first_column, channel, begin, bf16_columns);
@@ -147,9 +147,9 @@ template <class Simd, int DownBits, bool FourColumns>
         }
     }
     worker.barrier();
-    const auto outputs = worker.range(hidden / channel_block);
+    const auto outputs = worker.range(hidden / work.block);
     for (auto block = outputs.begin; block < outputs.end; ++block) {
-        const int channel = block * channel_block;
+        const int channel = block * work.block;
         float accumulated[max_token_block][channel_block]{};
         if constexpr (FourColumns) {
             for (int index = 0; index < work.task_count; ++index) {
@@ -180,7 +180,7 @@ template <class Simd, int DownBits, bool FourColumns>
         for (int t = 0; t < columns; ++t) {
             auto* output =
                 work.args.output + static_cast<std::size_t>(begin + t) * hidden + channel;
-            for (int i = 0; i < channel_block; ++i) { output[i] = accumulated[t][i]; }
+            for (int i = 0; i < work.block; ++i) { output[i] = accumulated[t][i]; }
         }
     }
 }
@@ -212,6 +212,13 @@ void compute(void* argument, const CpuWorkerContext& worker) noexcept {
             }
         }
         if (begin != 0 || !Simd::bf16_gate) { worker.barrier(); }
+        // port (sm_89): a split layer routes to a handful of experts, so at 16 channels per unit
+        // the team gets 32 units per expert - one or two each, with a barrier on both sides.
+        // Halving the unit doubles the units and lets the same team work; with eight experts the
+        // wider unit wins instead. Sizes measured with bench/ops/moe_cpu_bench.
+        const int units = work.task_count * (intermediate / channel_block);
+        work.block = (work.workers > 1 && units < work.workers * 8) ? channel_block / 2
+                                                                   : channel_block;
         unsigned bf16_columns = 0;
         if constexpr (Simd::bf16_gate) {
             bf16_columns = Simd::safe_columns(
@@ -248,3 +255,5 @@ constexpr Kernel make_kernel() {
 }
 
 } // namespace ninfer::ops::detail::moe_cpu::groupwise_int
+
+
