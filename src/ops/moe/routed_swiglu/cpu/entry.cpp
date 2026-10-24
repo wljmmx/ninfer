@@ -3,7 +3,10 @@
 #include "ops/moe/routed_swiglu/cpu/dispatch.h"
 
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -130,6 +133,11 @@ void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
     const int tokens  = x.ne[1];
     impl::validate_capacity(subset.kind, tokens, tokens);
     const auto capacity = subset.kind == ExpertSubsetKind::None ? 0 : shape.capacity(tokens);
+    // port (sm_89): NINFER_CPU_TIMING separates the per-call setup (operand validation, route
+    // bookkeeping, the scratch cursor) from the kernels. At a split layer's granularity the setup is
+    // paid once per layer per token, so it competes with the arithmetic.
+    const bool timing  = std::getenv("NINFER_CPU_TIMING") != nullptr;
+    const auto started = std::chrono::steady_clock::now();
     const Operands operands(x, destination, workspace, capacity, profile.ffn.hidden);
     if (subset.kind == ExpertSubsetKind::None) {
         std::memset(destination.data, 0, destination.bytes());
@@ -183,7 +191,24 @@ void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
                                   .mask         = mask,
                                   .output       = static_cast<float*>(destination.data),
                                   .tokens       = tokens};
+    const auto setup_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started)
+            .count();
+    const auto launch_begin = std::chrono::steady_clock::now();
     shape.launch(args, workspace, execution);
+    if (timing) {
+        const auto launch_ms = std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - launch_begin).count();
+        static std::uint64_t calls = 0;
+        static double acc[2]       = {0.0, 0.0};
+        acc[0] += setup_ms;
+        acc[1] += launch_ms;
+        if (++calls % 40 == 0) {
+            std::fprintf(stderr, "[cpu] setup=%.3fms kernel=%.3fms per layer\n", acc[0] / 40.0,
+                         acc[1] / 40.0);
+            for (double& value : acc) { value = 0.0; }
+        }
+    }
 }
 
 } // namespace ninfer::ops

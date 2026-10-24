@@ -22,6 +22,7 @@
 #include <thread>
 
 #include <stdexcept>
+#include <cstdlib>
 
 namespace ninfer::models::qwen3_5::execution {
 namespace {
@@ -136,8 +137,10 @@ void host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParameters& mo
             wanted.push_back(expert);
         }
     }
+    const auto ensure_begin = std::chrono::steady_clock::now();
     host->ensure(ExpertBankId{moe.stream->bank_index()}, wanted, nullptr);
-
+    const auto ensure_ms = std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - ensure_begin).count();
     const auto bytes = ops::routed_swiglu_workspace_capacity_bytes(
         moe.profile.routed, ops::ExpertSubsetKind::All, tokens, tokens);
     // The CPU kernels want a 256-byte aligned cursor; a plain vector only guarantees 16.
@@ -195,16 +198,18 @@ void host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParameters& mo
                                cudaMemcpyHostToDevice, stream));
     if (timing) {
         static std::uint64_t calls = 0;
-        static double acc[4]       = {0.0, 0.0, 0.0, 0.0};
+        static double acc[5]       = {0.0, 0.0, 0.0, 0.0, 0.0};
         acc[0] += cpu_ms;
         acc[1] += join_ms;
         acc[2] += merge_ms;
         acc[3] += std::chrono::duration<double, std::milli>(
                       std::chrono::steady_clock::now() - write_begin).count();
+        acc[4] += ensure_ms;
         if (++calls % 40 == 0) {
             std::fprintf(stderr,
-                         "[host] cpu=%.2fms join=%.2fms merge=%.2fms write=%.2fms per token\n",
-                         acc[0], acc[1], acc[2], acc[3]);
+                         "[host] cpu=%.2fms join=%.2fms merge=%.2fms write=%.2fms ensure=%.2fms "
+                         "per token\n",
+                         acc[0], acc[1], acc[2], acc[3], acc[4]);
             for (double& value : acc) { value = 0.0; }
         }
     }
