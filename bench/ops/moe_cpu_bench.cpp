@@ -1,0 +1,173 @@
+// Times the CPU routed-SwiGLU expert kernel on the 35B-A3B shape (hidden 2048, intermediate 512,
+// 256 experts, top_k 8). A split layer pays this per expert that misses the Device pool, so the
+// number to drive down is milliseconds per expert at one token, not tokens per second of a whole
+// decode - the decode also pays uploads, arena loads and the Device half.
+#include "core/cpu/executor.h"
+#include "core/cpu/system.h"
+#include "core/device.h"
+#include "core/tensor.h"
+#include "core/weight_bank.h"
+#include "ninfer/ops/moe.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <span>
+#include <vector>
+
+using namespace ninfer;
+
+namespace {
+
+constexpr int kHidden       = 2048;
+constexpr int kIntermediate = 512;
+constexpr int kExperts      = 256;
+constexpr int kTopK         = 8;
+constexpr int kGateUpRows   = 2 * kIntermediate;
+
+struct Bank {
+    std::vector<std::byte> storage;
+    std::vector<std::uint64_t> offsets;
+    WeightParent parent;
+    WeightBankView view;
+};
+
+void fill(std::span<std::byte> slot, const WeightBankLayout& layout, const WeightParent& parent,
+          std::uint32_t seed) {
+    // Codes are what the kernel actually decodes; scales stay at one so the arithmetic cannot
+    // overflow into a slower path, and the high planes stay zero for the same reason.
+    auto* codes = slot.data() + layout.codes.offset;
+    std::uint32_t state = seed * 2654435761u + 1u;
+    for (std::uint64_t i = 0; i < layout.codes.expert_bytes; ++i) {
+        state      = state * 1664525u + 1013904223u;
+        codes[i]   = static_cast<std::byte>(state >> 24);
+    }
+    if (layout.high.expert_bytes) {
+        std::memset(slot.data() + layout.high.offset, 0,
+                    static_cast<std::size_t>(layout.high.expert_bytes));
+    }
+    auto* scales = reinterpret_cast<std::uint16_t*>(slot.data() + layout.scales.offset);
+    for (std::uint64_t i = 0; i < layout.scales.expert_bytes / 2; ++i) {
+        scales[i] = 0x3c00; // fp16 1.0
+    }
+    (void)parent;
+}
+
+Bank make_bank(QType type, QuantLayout quant, std::uint64_t rows, std::uint64_t columns) {
+    Bank bank;
+    const std::uint64_t shape[] = {std::uint64_t{kExperts} * rows, columns};
+    bank.parent.geometry        = weight_geometry(type, quant, shape);
+    bank.parent.data            = nullptr;
+    bank.parent.device          = Device::cpu();
+    bank.parent.weight_divisors = {};
+
+    bank.view.parent = &bank.parent;
+    bank.view.layout = describe_weight_bank(bank.parent.geometry,
+                                            WeightBankRegion{0, kExperts, rows, rows});
+    // Mirrors the host tier: every expert is one packed segment, so the plane offsets are the
+    // per-expert ones and the table carries the segment origin.
+    const auto& layout = bank.view.layout;
+    bank.view.layout.codes.offset  = 0;
+    bank.view.layout.high.offset   = layout.codes.expert_bytes;
+    bank.view.layout.scales.offset = layout.codes.expert_bytes + layout.high.expert_bytes;
+
+    std::uint64_t slot = bank.view.layout.codes.expert_bytes +
+                         bank.view.layout.high.expert_bytes +
+                         bank.view.layout.scales.expert_bytes;
+    slot = (slot + 131071) / 131072 * 131072;
+    bank.storage.assign(static_cast<std::size_t>(slot) * kExperts, std::byte{0});
+    bank.offsets.resize(kExperts);
+    for (int expert = 0; expert < kExperts; ++expert) {
+        bank.offsets[expert] = static_cast<std::uint64_t>(expert) * slot;
+    }
+    bank.parent.data           = bank.storage.data();
+    bank.parent.geometry.bytes = bank.storage.size();
+    bank.view.expert_offsets   = bank.offsets.data();
+    for (int expert = 0; expert < kExperts; ++expert) {
+        fill(std::span<std::byte>(bank.storage.data() + bank.offsets[expert], slot),
+             bank.view.layout, bank.parent, static_cast<std::uint32_t>(expert));
+    }
+    return bank;
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    const int iterations = argc > 1 ? std::atoi(argv[1]) : 200;
+    const int workers    = argc > 2 ? std::atoi(argv[2]) : 0;
+
+    static CpuTopology topology;
+    const auto team = workers > 0 ? static_cast<std::uint32_t>(workers)
+                                  : static_cast<std::uint32_t>(
+                                        std::max<std::size_t>(1, cpu_worker_order(topology.info(), false).size()));
+    static CpuExecutor executor(topology, plan_cpu_team(topology.info(), team));
+    const auto execution = executor.execution_view();
+
+    auto gate_up = make_bank(QType::Q4_G64_FP16, QuantLayout::RowSplit, kGateUpRows, kHidden);
+    auto down    = make_bank(QType::Q6_G64_FP16, QuantLayout::RowSplit, kHidden, kIntermediate);
+
+    ops::RoutedSwiGLUProfile profile{};
+    profile.ffn.hidden         = kHidden;
+    profile.ffn.intermediate   = kIntermediate;
+    profile.ffn.gate_up_type   = QType::Q4_G64_FP16;
+    profile.ffn.gate_up_layout = QuantLayout::RowSplit;
+    profile.ffn.down_type      = QType::Q6_G64_FP16;
+    profile.ffn.down_layout    = QuantLayout::RowSplit;
+    profile.ffn.gate_up_policy = ops::LinearPolicy::A16Only;
+    profile.ffn.down_policy    = ops::LinearPolicy::A16Only;
+    profile.experts            = kExperts;
+    profile.top_k              = kTopK;
+
+    ops::CpuSwiGLUExperts experts{gate_up.view, down.view};
+
+    std::vector<std::uint16_t> x(static_cast<std::size_t>(kHidden), 0x3f80);
+    std::vector<float> out(static_cast<std::size_t>(kHidden), 0.0F);
+    std::vector<std::int32_t> ids(kTopK);
+    std::vector<float> coefficients(kTopK, 0.125F);
+    std::vector<std::int32_t> mask(kExperts, 1);
+    for (int j = 0; j < kTopK; ++j) { ids[j] = 40 + j * 7; }
+
+    Tensor x_tensor(x.data(), Device::cpu(), DType::BF16, {kHidden, 1});
+    Tensor out_tensor(out.data(), Device::cpu(), DType::FP32, {kHidden, 1});
+    ops::ExpertRoutes routes{Tensor(ids.data(), Device::cpu(), DType::I32, {kTopK, 1}),
+                             Tensor(coefficients.data(), Device::cpu(), DType::FP32, {kTopK, 1})};
+    Tensor mask_tensor(mask.data(), Device::cpu(), DType::I32, {kExperts});
+
+    const auto capacity =
+        ops::routed_swiglu_workspace_capacity_bytes(profile, ops::ExpertSubsetKind::All, 1, 1);
+    std::vector<std::byte> scratch(capacity + 256);
+    const auto base    = reinterpret_cast<std::uintptr_t>(scratch.data());
+    const auto aligned = (256 - (base & 255)) & 255;
+
+    std::printf("moe cpu bench: hidden=%d intermediate=%d experts=%d top_k=%d workers=%u\n", kHidden,
+                kIntermediate, kExperts, kTopK, execution.worker_count());
+
+    for (const int misses : {1, 2, 4, 8}) {
+        std::fill(mask.begin(), mask.end(), 1);
+        for (int j = 0; j < misses; ++j) { mask[ids[j]] = 0; }
+        const ops::ExpertSubset subset{ops::ExpertSubsetKind::MaskZeros, mask_tensor};
+        MemoryArena arena(MemorySpan{scratch.data() + aligned, capacity, Device::cpu()});
+
+        // Warm the caches and the team before timing.
+        for (int i = 0; i < 8; ++i) {
+            arena.reset();
+            ops::routed_swiglu(x_tensor, profile, experts, routes, subset, out_tensor, arena,
+                               execution);
+        }
+        const auto begin = std::chrono::steady_clock::now();
+        for (int i = 0; i < iterations; ++i) {
+            arena.reset();
+            ops::routed_swiglu(x_tensor, profile, experts, routes, subset, out_tensor, arena,
+                               execution);
+        }
+        const auto ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - begin)
+                            .count() / iterations;
+        std::printf("  misses=%d  %.3f ms/call  %.3f ms/expert  %.1f GMAC/s\n", misses, ms,
+                    ms / misses, 3.146 * misses / ms);
+    }
+    return 0;
+}
+
