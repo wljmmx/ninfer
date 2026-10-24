@@ -215,7 +215,7 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
                              streams[i]->down_parent()});
         }
         auto residency = std::make_unique<models::qwen3_5::execution::HostExpertResidency>(
-            descs, files, source, host_want);
+            descs, files, source, host_expert_arena_bytes(host_want));
         for (std::size_t i = 0; i < streams.size(); ++i) {
             streams[i]->attach_host(*residency);
         }
@@ -304,7 +304,14 @@ std::uint64_t host_expert_arena_bytes(std::uint64_t want_bytes) {
         const auto free_bytes = current_free_host_bytes();
         return free_bytes == 0 ? want_bytes : free_bytes / 4;
     }();
-    std::uint64_t budget = std::min<std::uint64_t>(want_bytes, share);
+    // port (sm_89): a working-set bound, not just a RAM-share bound. A split layer touches a few
+    // experts per layer and the same ones come back within the next tokens, so a few GiB hold every
+    // byte the CPU half reads. Sizing the arena to a quarter of RAM instead (14.5 GiB here) spreads
+    // that working set over four times the pages, and the split path then measures 0.43 ms per
+    // expert against 0.041 ms for the same kernel on a warm one - 10.6 tok/s against 28.7 on the
+    // same pool. Anything colder than the working set belongs to the artifact, not to more arena.
+    constexpr std::uint64_t kWorkingSetCap = 4ull << 30;
+    std::uint64_t budget = std::min<std::uint64_t>({want_bytes, share, kWorkingSetCap});
     if (const char* value = std::getenv("NINFER_EXPERT_HOST_ARENA_MB"); value != nullptr && *value) {
         const auto mib = std::strtoull(value, nullptr, 10);
         // An explicit budget replaces the RAM share rather than tightening it, so a run can ask
