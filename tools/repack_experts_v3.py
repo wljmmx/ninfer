@@ -123,7 +123,7 @@ def main() -> int:
             new_id = f"weight/expert/{object_id.rsplit('/', 1)[-1]}/{expert:03d}/{suffix}"
             specs.append(TensorSpec(new_id, shape, source["format"], source["layout"]))
             splits[new_id] = [
-                (offset + expert * per_expert_rows * row_bytes, size)
+                (source["offset"] + offset + expert * per_expert_rows * row_bytes, size)
                 for (offset, _, row_bytes), (_, size, _) in zip(planes, sizes)
             ]
             for role, (begin, end, name) in experts[expert].items():

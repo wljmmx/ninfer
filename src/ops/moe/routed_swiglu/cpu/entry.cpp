@@ -162,6 +162,16 @@ void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
         const auto offset = std::size_t(t) * profile.top_k;
         for (int j = 0; j < profile.top_k; ++j) {
             const int expert = ids[offset + j];
+            if (!(expert >= 0 && expert < profile.experts &&
+                  std::isfinite(coefficients[offset + j]))) {
+                // port (sm_89): report the offending values. The two causes need different fixes:
+                // an out-of-range id means the router or its input is already wrong, a non-finite
+                // coefficient means the layer produced NaN.
+                std::fprintf(stderr,
+                             "[cpu-route] t=%d j=%d id=%d experts=%d coef=%.9g finite=%d tokens=%d\n",
+                             t, j, expert, profile.experts, static_cast<double>(coefficients[offset + j]),
+                             int(std::isfinite(coefficients[offset + j])), tokens);
+            }
             require(expert >= 0 && expert < profile.experts &&
                         std::isfinite(coefficients[offset + j]),
                     "routed_swiglu CPU: invalid route ID or coefficient");

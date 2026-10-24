@@ -1,0 +1,15 @@
+starting engine
+loading weights | 19.6 GiB
+  loading weights 10.2% | 2.00 GiB/19.6 GiB | 243.0 MiB/s | ETA 1m 14.1s
+  loading weights 18.8% | 3.69 GiB/19.6 GiB | 155.7 MiB/s | ETA 1m 44.6s
+  loading weights 27.1% | 5.31 GiB/19.6 GiB | 210.9 MiB/s | ETA 1m 9.3s
+  loading weights 35.1% | 6.87 GiB/19.6 GiB | 226.4 MiB/s | ETA 57.5s
+  loading weights 43.7% | 8.56 GiB/19.6 GiB | 181.6 MiB/s | ETA 1m 2.2s
+  loading weights 51.7% | 10.1 GiB/19.6 GiB | 179.0 MiB/s | ETA 54.2s
+  loading weights 60.0% | 11.7 GiB/19.6 GiB | 200.1 MiB/s | ETA 40.1s
+  loading weights 66.7% | 13.1 GiB/19.6 GiB | 93.7 MiB/s | ETA 1m 11.4s
+  loading weights 77.8% | 15.2 GiB/19.6 GiB | 234.7 MiB/s | ETA 19.0s
+  loading weights 89.0% | 17.4 GiB/19.6 GiB | 230.4 MiB/s | ETA 9.6s
+weights ready | 19.6 GiB | 1m 53.2s | 177.3 MiB/s
+error: startup failed | initializing frontend | 81.1 ms
+error: text/layers/0: weight bank exceeds its parent or native matrix domain

@@ -230,6 +230,30 @@ private:
         // One arena base for every bank; the per-plane tables carry the slot origin.
         state_[bank].gate_up_parent.data = base;
         state_[bank].down_parent.data    = base;
+        if (std::getenv("NINFER_HOST_VERIFY")) {
+            static std::uint32_t verified = 0;
+            if (verified++ < 4) {
+                // One-shot check of the slot image: the same slices read back must match what was
+                // copied. A mismatch means the description and the reader disagree about offsets,
+                // which is invisible until a miss actually runs on the CPU.
+                std::vector<ExpertBlobSpan> again;
+                std::size_t compared = 0, different = 0;
+                if (reader_->spans(entry, again)) {
+                    for (const auto& slice : again) {
+                        const auto* written = destination + slice.image_offset;
+                        const auto* expected_source = static_cast<const std::byte*>(slice.source);
+                        for (std::uint64_t i = 0; i < slice.bytes; ++i) {
+                            ++compared;
+                            if (written[i] != expected_source[i]) { ++different; }
+                        }
+                    }
+                }
+                std::fprintf(
+                    stderr, "[host-verify] bank=%u expert=%u chunks=%zu slices=%zu diff=%zu\n", bank,
+                    expert, entry.chunks.size(), again.size(),
+                    static_cast<std::size_t>(different));
+            }
+        }
     }
 
     std::vector<HostExpertBankDesc> banks_;
