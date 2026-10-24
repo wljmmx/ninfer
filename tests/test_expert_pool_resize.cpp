@@ -27,8 +27,8 @@ int main() {
     constexpr std::uint32_t kBankCount  = 4;
     constexpr std::uint32_t kExpertCount = 2;
 
-    // 1024x1024 bf16 is 2 MiB per matrix, so one expert entry is 4 MiB and one bank window (two
-    // experts) is exactly one 8 MiB VMM segment.
+    // 1024x1024 bf16 is 2 MiB per matrix, so one expert entry is 4 MiB and two slots of one bank
+    // are exactly one 8 MiB VMM segment.
     const std::uint64_t shape[] = {1024, 1024};
     const auto geometry = weight_geometry(QType::BF16, QuantLayout::Contiguous, shape);
 
@@ -62,7 +62,7 @@ int main() {
     ExpertCache cache(specs, requirements, device, pairs);
     const auto full = cache.capacity_bytes();
     expect("the whole reservation is usable", full == kCapacity);
-    expect("the reservation holds eight bank windows", cache.windows() == 8);
+    expect("the reservation holds eight bank runs", cache.windows() == 8);
 
     const auto free_bytes = [] {
         std::size_t free_now = 0, total = 0;
@@ -81,16 +81,10 @@ int main() {
     const auto before = free_bytes();
     const auto shrunk = cache.resize(16ull << 20);
     const auto after = free_bytes();
-    expect("shrink keeps two windows", shrunk == (16ull << 20) && cache.windows() == 2);
+    expect("shrink keeps two bank runs", shrunk == (16ull << 20) && cache.windows() == 2);
     expect("shrunk bytes reach the driver", after >= before + (40ull << 20));
-    bool dropped = false;
-    try {
-        (void)cache.window_origin(3);
-    } catch (const std::out_of_range&) {
-        dropped = true;
-    }
-    expect("a dropped window is gone", dropped && !cache.offset({3, 0}).has_value());
-    expect("a kept window still answers", cache.offset({1, 0}).has_value());
+    expect("a dropped run is gone", !cache.window_resident(3) && !cache.offset({3, 0}).has_value());
+    expect("a kept run still answers", cache.window_resident(1) && cache.offset({1, 0}).has_value());
 
     // Growing back must make the reservation usable again, and the data that was dropped has to
     // come back through the normal upload path with its original bytes.

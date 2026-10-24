@@ -77,11 +77,16 @@ void ExpertStream::attach(ExpertCache& cache, std::uint32_t bank, const ExpertBa
     experts_.bank.count  = count_;
     experts_.bank.device = pool.device;
 
-    // Publish the per-expert offset table. Every entry is expert * slot for now; the kernel reads
-    // its plane base through this table, so a partial resident set only rewrites the entries.
-    offsets_.resize(count_);
+    // Publish the per-expert offset table. port (sm_89): the pool is a flat slot space, so an entry
+    // is its global slot times the slot stride; the kernel reads its plane base through this table,
+    // so a partial resident set only rewrites the entries.
+    offsets_.assign(count_, 0);
+    std::vector<std::int32_t> mask(count_, 0);
     for (std::uint32_t expert = 0; expert < count_; ++expert) {
-        offsets_[expert] = std::uint64_t{expert} * cache.slot_bytes();
+        const auto slot = cache.expert_slot(bank, expert);
+        if (!slot) { continue; }
+        offsets_[expert] = static_cast<std::uint64_t>(*slot) * cache.slot_bytes();
+        mask[expert]     = 1;
     }
     const auto table_bytes = offsets_.size() * sizeof(std::uint64_t);
     offsets_device_        = std::make_unique<DeviceBuffer>(table_bytes);
@@ -98,13 +103,8 @@ void ExpertStream::attach(ExpertCache& cache, std::uint32_t bank, const ExpertBa
     down_view.indexed_storage    = pool;
 
     // Publish which experts the pool will hold. With room for the whole layer every entry is set;
-    // otherwise only the leading resident_capacity() experts are, and the caller masks the rest
-    // out of the GPU job list.
-    const auto resident = cache.resident_capacity();
-    std::vector<std::int32_t> mask(count_, 0);
-    for (std::uint32_t expert = 0; expert < std::min(count_, resident); ++expert) {
-        mask[expert] = 1;
-    }
+    // otherwise only the experts that own a slot are, and the caller masks the rest out of the GPU
+    // job list.
     mask_device_ = std::make_unique<DeviceBuffer>(mask.size() * sizeof(std::int32_t));
     mask_host_   = mask;
     const auto mask_bytes = mask.size() * sizeof(std::int32_t);
@@ -113,14 +113,15 @@ void ExpertStream::attach(ExpertCache& cache, std::uint32_t bank, const ExpertBa
     if (mask_copy != cudaSuccess) {
         throw std::runtime_error(std::string("expert residency mask: ") + cudaGetErrorString(mask_copy));
     }
-    // port (sm_89): with one window per bank the resident set never changes, so this stream can
-    // skip the routing round trip entirely and a captured graph stays valid.
+    // port (sm_89): with a fixed slot run per bank the resident set never changes, so this stream
+    // can skip the routing round trip entirely and a captured graph stays valid.
     pinned_ = cache.can_hold_every_layer();
 }
 
 void ExpertStream::rebase_window() {
-    const auto origin = cache_->window_origin(bank_);
-    const auto base   = static_cast<const std::byte*>(cache_->pool().data) + origin;
+    // port (sm_89): the pool is a flat slot space, so a bank has no per-bank origin to add; only
+    // the pool base and the entry's plane offsets matter, and both are fixed for the pool's life.
+    const auto base = static_cast<const std::byte*>(cache_->pool().data);
     experts_.bank.gate_up.codes  = base + entry_.codes.offset;
     experts_.bank.gate_up.high   = entry_.high.bytes ? base + entry_.high.offset : nullptr;
     experts_.bank.gate_up.scales = base + entry_.scales.offset;

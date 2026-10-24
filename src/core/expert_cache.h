@@ -128,9 +128,9 @@ void prepare(std::span<const ExpertCacheKey> required, cudaStream_t stream = nul
     [[nodiscard]] std::uint64_t capacity_bytes() const noexcept;
     // port (sm_89): hands device memory back to (or takes it from) the driver without moving a
     // published offset. The reservation stays where it is, so bank views and offset tables stay
-    // valid; only the backing segments of the highest windows come and go. Experts of a dropped
-    // window report nullopt again and stream in on their next use, which is why the caller must
-    // be at a layer boundary. Returns the capacity in effect afterwards.
+    // valid; only the backing segments of the highest slots come and go. Experts of a dropped slot
+    // run report nullopt again and stream in on their next use, which is why the caller must be at
+    // a layer boundary. Returns the capacity in effect afterwards.
     [[nodiscard]] std::uint64_t resize(std::uint64_t target_bytes);
     // port (sm_89): the Device pool every published entry lives in. An indexed expert bank points
     // its plane bases into this span and adds `offset(key)` per expert.
@@ -138,20 +138,23 @@ void prepare(std::span<const ExpertCacheKey> required, cudaStream_t stream = nul
     // port (sm_89): bytes between two experts of the same bank inside the pool. Banks address
     // through a per-expert offset table, so this is only the slot alignment unit.
     [[nodiscard]] std::uint64_t slot_bytes() const;
-    // port (sm_89): byte origin of a bank window, so a strided bank view can rebase onto it.
+    // port (sm_89): byte origin of a bank window, so a strided bank view can rebase onto it. The
+    // pool is a flat slot space, so this is always 0; it stays so such a view keeps compiling.
     [[nodiscard]] std::uint64_t window_origin(std::uint32_t bank) const;
     [[nodiscard]] std::uint64_t uploads() const noexcept;
     [[nodiscard]] std::uint64_t evictions() const noexcept;
     [[nodiscard]] std::uint64_t hits() const noexcept;
+    // port (sm_89): how many banks' worth of slots the pool currently backs. Kept as the reported
+    // pool size unit; the pool itself is one flat slot space.
     [[nodiscard]] std::uint64_t windows() const noexcept;
 
     // Experts of one bank the pool can hold at once. Equals the widest bank when a whole layer
     // fits; smaller when the pool only holds part of one, which is the case a host tier covers.
     [[nodiscard]] std::uint32_t resident_capacity() const noexcept;
 
-    // port (sm_89): slot of an expert inside its bank window, or nullopt when the bank does not
-    // hold it. The slot is stable across set_resident_experts() calls for experts that stay, which
-    // is what lets a caller rebuild its offset table without reuploading anything.
+    // port (sm_89): global slot of an expert, or nullopt when the pool does not hold it. The slot
+    // is stable across set_resident_experts() calls for experts that stay, which is what lets a
+    // caller rebuild its offset table without reuploading anything.
     [[nodiscard]] std::optional<std::uint32_t> expert_slot(std::uint32_t bank,
                                                            std::uint32_t expert) const noexcept;
 
@@ -161,8 +164,8 @@ void prepare(std::span<const ExpertCacheKey> required, cudaStream_t stream = nul
     // would otherwise pick and upload experts.
     [[nodiscard]] bool can_hold_every_layer() const noexcept;
 
-    // port (sm_89): true when this bank already owns a window. A resize drops windows, so a
-    // pinned stream checks this before trusting a cached offset.
+    // port (sm_89): true when every slot of this bank's run is backed by device memory. A resize
+    // can drop the highest runs, so a pinned stream checks this before trusting a cached offset.
     [[nodiscard]] bool window_resident(std::uint32_t bank) const noexcept;
 
     // port (sm_89): uploads every expert of every bank so a capture never records an upload.

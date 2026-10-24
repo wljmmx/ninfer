@@ -19,7 +19,9 @@ int fail(const char* message) {
 
 int main() {
     DeviceContext device(0);
-    const std::uint64_t shape[] = {8, 8};
+    // 256x256 bf16 is 128 KiB per matrix, so one entry is 256 KiB and a slot is one whole block:
+    // the pool below holds four slots, two per bank run.
+    const std::uint64_t shape[] = {256, 256};
     const auto geometry = weight_geometry(QType::BF16, QuantLayout::Contiguous, shape);
 
     std::vector<std::vector<std::byte>> storage(2, std::vector<std::byte>(geometry.bytes));
@@ -41,7 +43,7 @@ int main() {
     config.capacity_bytes = 0;
 
     // Size the pool from the planned entry image: both experts fit, so nothing is evicted.
-    config.capacity_bytes = 4096;
+    config.capacity_bytes = 1u << 20;
     const auto requirements = describe_expert_cache(std::span<const ExpertBankSpec>(&spec, 1), config);
     if (requirements.banks.size() != 1 || requirements.banks[0].count != 2) {
         return fail("bank plan is wrong");
