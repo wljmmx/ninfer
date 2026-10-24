@@ -149,7 +149,11 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     // One window holds a whole layer when the pool is large enough; otherwise the window shrinks to
     // the pool and the caller splits the layer between the Device pool and the host tier.
     const auto capacity = cache_->resident_capacity();
-    if (capacity == 0) { return false; }
+    // With only a couple of slots per bank the split path costs more than it saves: it still pays
+    // the routing read-back, the per-expert mask and the merge, while almost every expert lands on
+    // the host anyway. Below this floor the whole layer goes to the host tier instead - measured
+    // 14.4 tok/s on the split path against a host-only layer at the same pool size.
+    if (capacity < 4) { return false; }
     const bool fully = capacity >= count_;
     const auto values = static_cast<std::size_t>(top_k) * static_cast<std::size_t>(tokens);
     const auto bytes  = values * sizeof(std::int32_t);
@@ -288,4 +292,5 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
 }
 
 } // namespace ninfer::models::qwen3_5::execution
+
 
