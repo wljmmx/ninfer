@@ -229,29 +229,48 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         // for compulsory fill). It never chases a single step, so the layout changes rarely, but it
         // only pays when the pool holds enough slots for the popular experts to cover most routes.
         static const bool static_set = std::getenv("NINFER_EXPERT_STATIC") != nullptr;
+        // port (sm_89): a static set only pays once it stops moving. Ranking by decayed score on
+        // every step keeps reshuffling the tail while the scores are still being learned, so the
+        // set is frozen after a warm-up window: the first N tokens decide it and the rest of the
+        // request keeps it, sending a miss to the host tier instead of triggering an upload.
+        // NINFER_EXPERT_FREEZE=0 keeps the always-rerank behaviour.
+        static const int freeze_after = [] {
+            const char* value = std::getenv("NINFER_EXPERT_FREEZE");
+            return value != nullptr && *value ? std::atoi(value) : 0;
+        }();
         std::vector<std::uint32_t> wanted;
         std::vector<bool> chosen(count_, false);
         wanted.reserve(capacity);
-        if (!static_set) {
-            for (std::size_t i = 0; i < values && wanted.size() < capacity; ++i) {
-                const auto expert = static_cast<std::uint32_t>(route_ids[i]);
-                if (chosen[expert]) { continue; }
-                chosen[expert] = true;
-                wanted.push_back(expert);
+        if (frozen_) {
+            wanted = frozen_wanted_;
+            for (const auto expert : wanted) { chosen[expert] = true; }
+        } else {
+            if (!static_set) {
+                for (std::size_t i = 0; i < values && wanted.size() < capacity; ++i) {
+                    const auto expert = static_cast<std::uint32_t>(route_ids[i]);
+                    if (chosen[expert]) { continue; }
+                    chosen[expert] = true;
+                    wanted.push_back(expert);
+                }
             }
-        }
-        if (wanted.size() < capacity) {
-            std::vector<std::uint32_t> ranked(count_);
-            std::iota(ranked.begin(), ranked.end(), 0U);
-            std::stable_sort(ranked.begin(), ranked.end(),
-                             [&](std::uint32_t a, std::uint32_t b) {
-                                 return hot_score_[a] > hot_score_[b];
-                             });
-            for (const auto expert : ranked) {
-                if (wanted.size() >= capacity) { break; }
-                if (chosen[expert]) { continue; }
-                chosen[expert] = true;
-                wanted.push_back(expert);
+            if (wanted.size() < capacity) {
+                std::vector<std::uint32_t> ranked(count_);
+                std::iota(ranked.begin(), ranked.end(), 0U);
+                std::stable_sort(ranked.begin(), ranked.end(),
+                                 [&](std::uint32_t a, std::uint32_t b) {
+                                     return hot_score_[a] > hot_score_[b];
+                                 });
+                for (const auto expert : ranked) {
+                    if (wanted.size() >= capacity) { break; }
+                    if (chosen[expert]) { continue; }
+                    chosen[expert] = true;
+                    wanted.push_back(expert);
+                }
+            }
+            if (static_set && freeze_after > 0 &&
+                ++steps_ >= static_cast<std::uint64_t>(freeze_after)) {
+                frozen_        = true;
+                frozen_wanted_ = wanted;
             }
         }
         // port (sm_89): the router does not repeat a step, so the set is refreshed every step. A

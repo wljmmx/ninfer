@@ -103,6 +103,10 @@ private:
     std::vector<std::uint32_t> resident_order_;
     std::uint32_t since_decay_   = 0;
     std::uint32_t since_reorder_ = 0;
+    // port (sm_89): a warm-up then a frozen set, so a static policy stops re-ranking per step.
+    bool frozen_ = false;
+    std::uint64_t steps_ = 0;
+    std::vector<std::uint32_t> frozen_wanted_;
     std::vector<ExpertCacheKey> keys_;
     std::vector<ExpertCacheKey> required_;
     // Per-expert byte offsets the kernel adds to each plane base. Uniform today, but the kernel
@@ -118,3 +122,4 @@ private:
 };
 
 } // namespace ninfer::models::qwen3_5::execution
+
