@@ -293,6 +293,17 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             route_total = 0.0;
             layout_total = 0.0;
         }
+        // How many distinct experts this bank has ever routed to: the number a pool has to hold
+        // before a whole step can run on the Device with no host tier at all.
+        std::size_t touched = 0;
+        for (const auto score : hot_score_) {
+            if (score > 0.0F) { ++touched; }
+        }
+        static std::size_t touched_max = 0;
+        if (touched > touched_max) {
+            touched_max = touched;
+            std::fprintf(stderr, "[reach] bank=%u distinct=%zu of %u\n", bank_, touched, count_);
+        }
     }
     if (std::getenv("NINFER_EXPERT_TIMING")) {
         static std::uint64_t calls = 0;

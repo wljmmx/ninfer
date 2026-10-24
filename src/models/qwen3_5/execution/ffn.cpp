@@ -146,8 +146,15 @@ void host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParameters& mo
     const auto aligned = (256 - (base & 255)) & 255;
     MemoryArena arena(
         MemorySpan{scratch.data() + aligned, bytes, Device::cpu()});
+    const bool timing = std::getenv("NINFER_SPLIT_TIMING") != nullptr;
+    // port (sm_89): NINFER_SPLIT_TIMING splits the host half into what it actually spends: the
+    // CPU expert kernels, the wait for the Device term, the elementwise merge and the write-back.
+    // The split path's cost is what decides whether holding experts at all beats host-only.
+    const auto cpu_begin = std::chrono::steady_clock::now();
     ops::routed_swiglu(x_cpu, moe.profile.routed, host->experts(ExpertBankId{moe.stream->bank_index()}), routes_cpu,
                        subset, out_cpu, arena, cpu);
+    const auto cpu_ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - cpu_begin).count();
     if (std::getenv("NINFER_HOST_DEBUG")) {
         std::fprintf(stderr, "[host-x] bank=%u x0..3=%.6f %.6f %.6f %.6f\n",
                      moe.stream->bank_index(),
@@ -160,9 +167,13 @@ void host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParameters& mo
     // The copy below is queued on the same stream, so it cannot start before that kernel finishes:
     // waiting for the copy alone is enough, and a separate stream-wide synchronise here would only
     // pay the WDDM round trip twice per layer.
+    const auto join_begin = std::chrono::steady_clock::now();
     CUDA_CHECK(cudaMemcpyAsync(host_gpu.data(), gpu_term.data, host_gpu.size() * sizeof(float),
                                cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    const auto join_ms = std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - join_begin).count();
+    const auto merge_begin = std::chrono::steady_clock::now();
     std::vector<std::uint16_t> packed(host_out.size());
     for (std::size_t i = 0; i < host_out.size(); ++i) {
         // The device epilogue starts from the BF16 residual and folds the routed and shared
@@ -177,8 +188,26 @@ void host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParameters& mo
         bits += 0x7fffu + lsb;
         packed[i] = static_cast<std::uint16_t>(bits >> 16);
     }
+    const auto merge_ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - merge_begin).count();
+    const auto write_begin = std::chrono::steady_clock::now();
     CUDA_CHECK(cudaMemcpyAsync(residual.data, packed.data(), packed.size() * sizeof(std::uint16_t),
                                cudaMemcpyHostToDevice, stream));
+    if (timing) {
+        static std::uint64_t calls = 0;
+        static double acc[4]       = {0.0, 0.0, 0.0, 0.0};
+        acc[0] += cpu_ms;
+        acc[1] += join_ms;
+        acc[2] += merge_ms;
+        acc[3] += std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - write_begin).count();
+        if (++calls % 40 == 0) {
+            std::fprintf(stderr,
+                         "[host] cpu=%.2fms join=%.2fms merge=%.2fms write=%.2fms per token\n",
+                         acc[0], acc[1], acc[2], acc[3]);
+            for (double& value : acc) { value = 0.0; }
+        }
+    }
     if (std::getenv("NINFER_HOST_DEBUG")) {
         CUDA_CHECK(cudaStreamSynchronize(stream));
         // residual is BF16, so print the packed words rather than reinterpreting them as FP32.
