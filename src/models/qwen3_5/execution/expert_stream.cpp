@@ -162,12 +162,20 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     if (!route_staging_ || route_staging_->size() < bytes) {
         route_staging_ = std::make_unique<PinnedHostBuffer>(bytes);
     }
+    // port (sm_89): NINFER_SPLIT_TIMING separates the per-layer cost into the routing read-back,
+    // the layout update (resident set + mask/offset tables) and the upload, because the split
+    // path's fixed cost is what decides whether holding experts at all pays.
+    const bool timing = std::getenv("NINFER_SPLIT_TIMING") != nullptr;
+    const auto stage_begin = std::chrono::steady_clock::now();
     const auto status =
         cudaMemcpyAsync(route_staging_->data(), device_ids, bytes, cudaMemcpyDeviceToHost, stream);
     if (status != cudaSuccess) { throw std::runtime_error(std::string("route copy: ") + cudaGetErrorString(status)); }
     const auto sync = cudaStreamSynchronize(stream);
     if (sync != cudaSuccess) { throw std::runtime_error(std::string("route sync: ") + cudaGetErrorString(sync)); }
+    const auto route_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage_begin).count();
     const auto* route_ids = static_cast<const std::int32_t*>(route_staging_->data());
+    const auto layout_begin = std::chrono::steady_clock::now();
 
     // Port (sm_89): every routed expert must be resident before the consumer runs, so the
     // required set is deduplicated and published in one batch.
@@ -251,6 +259,8 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                                   cudaMemcpyHostToDevice, stream);
         }
     }
+    const auto layout_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - layout_begin).count();
     required_.clear();
     for (std::size_t i = 0; i < values; ++i) {
         const auto expert = route_ids[i];
@@ -270,6 +280,19 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         cache_->wait_for_progress(stream);
     } catch (const std::exception& error) {
         throw std::runtime_error(std::string("pool: ") + error.what());
+    }
+    if (timing) {
+        static std::uint64_t calls = 0;
+        static double route_total = 0.0, layout_total = 0.0;
+        route_total += route_ms;
+        layout_total += layout_ms;
+        if (++calls % 40 == 0) {
+            std::fprintf(stderr,
+                         "[split] per-layer route=%.3fms layout=%.3fms (of 40 layers)\n",
+                         route_total / 40.0, layout_total / 40.0);
+            route_total = 0.0;
+            layout_total = 0.0;
+        }
     }
     if (std::getenv("NINFER_EXPERT_TIMING")) {
         static std::uint64_t calls = 0;
