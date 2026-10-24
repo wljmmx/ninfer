@@ -243,9 +243,21 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
         std::vector<models::qwen3_5::execution::HostExpertBankDesc> descs;
         descs.reserve(streams.size());
         for (std::size_t i = 0; i < streams.size(); ++i) {
+            // port (sm_89): the host arena describes a whole bank, but a per-expert artifact gives
+            // the weight a parent of exactly one expert's rows. Scale that geometry back up to the
+            // bank so the CPU op's bank-validation sees the same domain either way; a fused
+            // artifact already has this shape and the call is a no-op there.
+            const auto bank_geometry = [](const WeightGeometry& expert, std::uint32_t count) {
+                const std::uint64_t shape[2] = {
+                    static_cast<std::uint64_t>(count) * expert.shape.front(), expert.shape.back()};
+                return weight_geometry(expert.format, expert.layout, shape);
+            };
             descs.push_back({requirements.banks[i], streams[i]->gate_up_layout(),
-                             streams[i]->down_layout(), streams[i]->gate_up_parent(),
-                             streams[i]->down_parent()});
+                             streams[i]->down_layout(),
+                             bank_geometry(streams[i]->gate_up_expert_geometry(),
+                                           streams[i]->count()),
+                             bank_geometry(streams[i]->down_expert_geometry(),
+                                           streams[i]->count())});
         }
         auto residency = std::make_unique<models::qwen3_5::execution::HostExpertResidency>(
             descs, files, source, host_expert_arena_bytes(host_want));

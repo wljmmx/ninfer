@@ -127,16 +127,31 @@ public:
             const auto& gate_parent = *gate.parts.at(0).parent;
             const auto& down_parent = *down.parts.at(0).parent;
             const auto columns      = gate_parent.geometry.shape.back();
-            const auto gate_up_layout = describe_weight_bank(
-                gate_parent.geometry,
-                {gate.parts.at(0).begin / columns, count,
-                 static_cast<std::uint64_t>(2 * intermediate),
-                 static_cast<std::uint64_t>(2 * intermediate)});
+            // port (sm_89): an artifact that keeps one object per expert gives this weight a parent
+            // of exactly one expert's rows, so a bank-wide region would run past it. The bank keeps
+            // the same per-expert shape either way; only where the row block starts differs.
+            const auto gate_up_rows = static_cast<std::uint64_t>(2 * intermediate);
+            const auto down_rows    = static_cast<std::uint64_t>(down.shape.at(0));
+            const bool per_expert_artifact = gate_parent.geometry.shape.front() == gate_up_rows &&
+                                             down_parent.geometry.shape.front() == down_rows;
+            auto gate_up_layout =
+                per_expert_artifact
+                    ? describe_weight_bank(gate_parent.geometry, {0, 1, gate_up_rows, gate_up_rows})
+                    : describe_weight_bank(gate_parent.geometry,
+                                           {gate.parts.at(0).begin / columns, count, gate_up_rows,
+                                            gate_up_rows});
             const auto down_columns = down_parent.geometry.shape.back();
-            const auto down_layout  = describe_weight_bank(
-                down_parent.geometry, {down.parts.at(0).begin / down_columns, count,
-                                       static_cast<std::uint64_t>(down.shape.at(0)),
-                                       static_cast<std::uint64_t>(down.shape.at(0))});
+            auto down_layout =
+                per_expert_artifact
+                    ? describe_weight_bank(down_parent.geometry, {0, 1, down_rows, down_rows})
+                    : describe_weight_bank(down_parent.geometry,
+                                           {down.parts.at(0).begin / down_columns, count, down_rows,
+                                            down_rows});
+            if (per_expert_artifact) {
+                // The bank still holds `count` experts; only its object layout is per expert.
+                gate_up_layout.region.count = count;
+                down_layout.region.count    = count;
+            }
             RoutedMoeParameters streamed;
             streamed.control = with_context(model_.weight(moe.router).name, [&] {
                 return control_weight(moe);
