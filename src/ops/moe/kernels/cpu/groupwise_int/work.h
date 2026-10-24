@@ -97,6 +97,9 @@ struct Work {
     // pays the barrier for nothing.
     int block             = channel_block;
     int workers           = 1;
+    // Decided once per launch, not inside the hot function: a getenv and a branch there cost 17%
+    // with the path disabled, because it changed how the compiler laid out the vector loop.
+    bool int8_path        = false;
     bool has_four_columns = false;
 };
 
@@ -108,3 +111,4 @@ std::size_t capacity(int tokens, int token_block);
 void launch(const Invocation&, const Plan&, MemoryArena&, CpuExecutionView);
 
 } // namespace ninfer::ops::detail::moe_cpu::groupwise_int
+

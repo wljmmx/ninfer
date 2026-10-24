@@ -192,6 +192,33 @@ template <class Simd, int DownBits, bool FourColumns>
     compute_chunk<Simd, DownBits, FourColumns>(work, worker, begin, columns, bf16_columns);
 }
 
+// port (sm_89): quantise the input row to int8 in 64-value groups - the width the weight scales
+// already use - so the q4 dot product can multiply 32 weights per instruction pair instead of
+// decoding eight at a time. Decode is 44% of this kernel, which is what makes the rounding error
+// (~0.1-0.5%, inside the split gate's 1% tolerance) worth paying. Out of line so it cannot change
+// the layout of the vector loop that runs when the path is disabled.
+template <class Simd>
+[[gnu::noinline]] void quantise_input(Work& work, const CpuWorkerContext& worker,
+                                      int columns) noexcept {
+    constexpr int kGroups = hidden / 64;
+    const auto range      = worker.range(kGroups * columns);
+    for (auto g = range.begin; g < range.end; ++g) {
+        const int column    = static_cast<int>(g) / kGroups;
+        const int group     = static_cast<int>(g) % kGroups;
+        const float* source = work.scratch.input + column * hidden + group * 64;
+        float peak          = 0.0F;
+        for (int i = 0; i < 64; ++i) { peak = std::max(peak, std::fabs(source[i])); }
+        const float scale   = peak > 0.0F ? peak / 127.0F : 0.0F;
+        const float inverse = scale > 0.0F ? 1.0F / scale : 0.0F;
+        work.scratch.input_scale[column * kGroups + group] = scale;
+        auto* out = work.scratch.input_q8 + column * hidden + group * 64;
+        for (int i = 0; i < 64; ++i) {
+            out[i] = static_cast<std::int8_t>(
+                std::clamp(static_cast<int>(std::lrint(source[i] * inverse)), -127, 127));
+        }
+    }
+}
+
 template <class Simd, int DownBits>
 void compute(void* argument, const CpuWorkerContext& worker) noexcept {
     auto& work = *static_cast<Work*>(argument);
@@ -212,6 +239,10 @@ void compute(void* argument, const CpuWorkerContext& worker) noexcept {
             }
         }
         if (begin != 0 || !Simd::bf16_gate) { worker.barrier(); }
+        if (work.int8_path) {
+            quantise_input<Simd>(work, worker, columns);
+            worker.barrier();
+        }
         // port (sm_89): a split layer routes to a handful of experts, so at 16 channels per unit
         // the team gets 32 units per expert - one or two each, with a barrier on both sides.
         // Halving the unit doubles the units and lets the same team work; with eight experts the
@@ -255,5 +286,6 @@ constexpr Kernel make_kernel() {
 }
 
 } // namespace ninfer::ops::detail::moe_cpu::groupwise_int
+
 
 

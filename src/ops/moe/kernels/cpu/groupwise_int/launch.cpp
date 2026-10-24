@@ -54,6 +54,7 @@ void launch(const Invocation& args, const Plan& plan, MemoryArena& arena,
               .down    = matrix_bank(args.experts.down),
               .scratch = allocate(arena, args.tokens, plan.token_block)};
     work.workers = static_cast<int>(execution.worker_count());
+    work.int8_path = std::getenv("NINFER_MOE_CPU_INT8") != nullptr;
     if (plan.kernel->first_chunk == FirstChunkPreparation::Caller) {
         prepare_chunk(work, 0, std::min(args.tokens, plan.token_block));
     }
@@ -100,4 +101,5 @@ void prepare_chunk(Work& work, int token_begin, int columns) noexcept {
 }
 
 } // namespace ninfer::ops::detail::moe_cpu::groupwise_int
+
 
