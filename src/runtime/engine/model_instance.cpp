@@ -181,14 +181,21 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     expert_debug("attached", instance.expert_cache->capacity_bytes(),
                  instance.expert_cache->windows());
     // port (sm_89): one line that makes the expert tier observable without a debugger.
-    // How much the host tier could usefully hold: every expert the Device pool does not keep
-    // resident. The arena then takes the smaller of that and a quarter of free RAM, so RAM is used
-    // up to what the model needs and only the remainder falls through to the artifact.
+    // Size the host tier from the working set, not from the model. What the CPU half can usefully
+    // hold is the experts the Device pool does not keep resident, multiplied by how many tokens of
+    // them are worth caching: a layer revisits the same experts within the next few tokens, and a
+    // working set that outgrows that only spreads the same accesses over more pages (see the arena
+    // note below). Everything colder belongs to the artifact. This keeps the number honest for a
+    // 118 GB model too, where one token's working set is several GB and "all missing experts" is
+    // over a hundred.
+    constexpr std::uint64_t kWorkingSetTokens = 4;
     std::uint64_t host_want = 0;
     for (const auto& bank : requirements.banks) {
-        if (!bank.resident) {
-            host_want += static_cast<std::uint64_t>(bank.count) * instance.expert_cache->slot_bytes();
-        }
+        if (bank.resident) { continue; }
+        const auto resident = std::min<std::uint64_t>(instance.expert_cache->resident_capacity(),
+                                                      bank.count);
+        host_want += (static_cast<std::uint64_t>(bank.count) - resident) *
+                     instance.expert_cache->slot_bytes() * kWorkingSetTokens;
     }
     std::fprintf(stderr, "[experts] banks=%zu slot=%llu windows=%llu pool=%lluMiB host=%d arena=%lluMiB want=%lluMiB\n",
                  streams.size(),
