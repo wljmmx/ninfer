@@ -70,6 +70,11 @@ struct F32 {
 template <int Bits>
 inline __m256 decode_signed_q(const std::uint8_t* code, const std::uint8_t* high) noexcept {
     static_assert(Bits >= 4 && Bits <= 6);
+    // port (sm_89): measurement switch. NINFER_MOE_CPU_NODECODE replaces the decode with a
+    // constant so the bench reports what the decode itself costs. The values are wrong on purpose;
+    // only the timing is read, and it decides whether an int8 dot product is worth building.
+    static const bool skip_decode = std::getenv("NINFER_MOE_CPU_NODECODE") != nullptr;
+    if (skip_decode) { return _mm256_set1_ps(1.0F); }
     std::uint32_t packed;
     std::memcpy(&packed, code, sizeof(packed));
     const auto words = _mm_cvtepu8_epi16(_mm_cvtsi32_si128(packed));
