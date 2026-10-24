@@ -82,6 +82,9 @@ struct Scratch {
     // product can run on 32 weights per instruction pair instead of decoding eight at a time.
     std::int8_t* input_q8;
     float* input_scale;
+    // Integer sum of each group's quantised values, so the offset-by-8 nibble product can undo its
+    // bias once per group: sum(b * x) = sum(w * x) + 8 * sum(x).
+    std::int32_t* input_sum;
 };
 
 struct Work {
@@ -111,4 +114,3 @@ std::size_t capacity(int tokens, int token_block);
 void launch(const Invocation&, const Plan&, MemoryArena&, CpuExecutionView);
 
 } // namespace ninfer::ops::detail::moe_cpu::groupwise_int
-

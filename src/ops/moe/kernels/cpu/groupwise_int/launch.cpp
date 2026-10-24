@@ -16,7 +16,9 @@ Scratch allocate(Arena& arena, int tokens, int token_block) {
             static_cast<float*>(arena.alloc(DType::FP32, {hidden, columns}).data),
             static_cast<float*>(arena.alloc(DType::FP32, {intermediate, top_k * columns}).data),
             static_cast<std::int8_t*>(arena.alloc_bytes(sizeof(std::int8_t) * hidden * columns).data),
-            static_cast<float*>(arena.alloc_bytes(sizeof(float) * groups * columns).data)};
+            static_cast<float*>(arena.alloc_bytes(sizeof(float) * groups * columns).data),
+            static_cast<std::int32_t*>(
+                arena.alloc_bytes(sizeof(std::int32_t) * groups * columns).data)};
 }
 
 MatrixBank matrix_bank(const WeightBankView& bank) {
@@ -101,5 +103,3 @@ void prepare_chunk(Work& work, int token_begin, int columns) noexcept {
 }
 
 } // namespace ninfer::ops::detail::moe_cpu::groupwise_int
-
-

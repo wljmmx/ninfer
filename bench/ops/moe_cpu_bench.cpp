@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -122,7 +123,15 @@ int main(int argc, char** argv) {
 
     ops::CpuSwiGLUExperts experts{gate_up.view, down.view};
 
-    std::vector<std::uint16_t> x(static_cast<std::size_t>(kHidden), 0x3f80);
+    // 2^-10 with a small spread: with unit-scale weights and a 2048-wide dot product the gate
+    // pre-activation would reach a few thousand at full scale, and silu saturates there - the
+    // activation plane comes out exactly zero and the check below cannot tell a correct kernel
+    // from a broken one. The spread matters too: a constant row quantises losslessly, which would
+    // hide the int8 path's rounding instead of measuring it.
+    std::vector<std::uint16_t> x(static_cast<std::size_t>(kHidden));
+    for (std::size_t i = 0; i < x.size(); ++i) {
+        x[i] = static_cast<std::uint16_t>(0x3a80 + (i % 4) * 0x08);
+    }
     std::vector<float> out(static_cast<std::size_t>(kHidden), 0.0F);
     std::vector<std::int32_t> ids(kTopK);
     std::vector<float> coefficients(kTopK, 0.125F);
@@ -193,6 +202,25 @@ int main(int argc, char** argv) {
         const auto median = samples[samples.size() / 2];
         std::printf("  misses=%d  min %.3f ms  median %.3f ms  %.3f ms/expert  %.1f GMAC/s\n",
                     misses, best, median, best / misses, 3.146 * misses / best);
+    }
+
+    // Numerical check: one fixed call over all eight experts, printed so the int8 path can be
+    // compared against the float one. The split gate allows 1%, and the int8 activation rounding
+    // is meant to stay well inside that.
+    {
+        std::fill(mask.begin(), mask.end(), 1);
+        for (int j = 0; j < kTopK; ++j) { ids[j] = 40 + j * 7; }
+        const auto subset = ops::ExpertSubset{ops::ExpertSubsetKind::MaskOnes, mask_tensor};
+        MemoryArena arena(MemorySpan{scratch.data() + aligned, capacity, Device::cpu()});
+        std::fill(out.begin(), out.end(), 0.0F);
+        ops::routed_swiglu(x_tensor, profile, experts, routes, subset, out_tensor, arena, execution);
+        double sum = 0.0, norm = 0.0;
+        for (const float value : out) {
+            sum += value;
+            norm += static_cast<double>(value) * value;
+        }
+        std::printf("  check  sum %.9g  l2 %.9g  first %.9g %.9g %.9g\n", sum, std::sqrt(norm),
+                    out[0], out[1], out[2]);
     }
     return 0;
 }

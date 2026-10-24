@@ -4,6 +4,8 @@
 #include "ops/common/numeric/math.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <type_traits>
 
 namespace ninfer::ops::detail::moe_cpu::groupwise_int {
@@ -56,6 +58,77 @@ inline void dot(const Matrix& matrix, const int (&rows)[Rows], const Input* cons
     }
 }
 
+// port (sm_89): int8 dot product for 4-bit weights.
+//
+// The packed weights hold weight 2b in the low nibble of byte b and 2b+1 in the high nibble, and
+// each nibble is two's complement - `decode_signed_q<4>` maps u to (u ^ 8) - 8. Flipping bit 3
+// turns it into the offset-by-8 form b = u ^ 8, so w = b - 8 and maddubs' unsigned x signed
+// product needs one correction per 64-value group: sum(b * x) = sum(w * x) + 8 * sum(x), with
+// sum(x) accumulated over the quantised values while the row is quantised. The activations are
+// stored even-first and odd-second, so each nibble half meets its own half of the row with no
+// unpacking at all. One weight load, one xor, two masks, two maddubs, two madds and two adds
+// cover 64 weights, against roughly a hundred instructions per eight weights on the float path.
+// Out of line: this only runs when the path is enabled, and inlining it would let it change the
+// layout of the vector loop that runs when it is not.
+template <class Simd, int K, int Rows, int Columns>
+[[gnu::noinline]] void dot_q4_q8(Work& work, const Matrix& matrix, const int (&rows)[Rows],
+                                 const int* columns, float (&out)[Rows][Columns]) noexcept {
+    static_assert(std::is_base_of_v<common::cpu::avx2::F32, Simd>,
+                  "the int8 path is written against AVX2 registers");
+    constexpr int kGroups = K / 64;
+    const auto ones       = _mm256_set1_epi16(1);
+    const auto nibble     = _mm256_set1_epi8(0x0F);
+    // Bit 3 of each nibble is its sign, so flipping it in both nibbles at once turns the two's
+    // complement nibble u into the offset-by-8 value u ^ 8 (0x88 is bit 3 of the low nibble and
+    // bit 3 of the high one).
+    const auto bias = _mm256_set1_epi8(static_cast<char>(0x88));
+    // One vector accumulator per output and one reduction at the end: a horizontal sum per group
+    // would cost more than the products it is summing.
+    __m256 total[Rows][Columns];
+    for (int r = 0; r < Rows; ++r) {
+        for (int c = 0; c < Columns; ++c) { total[r][c] = _mm256_setzero_ps(); }
+    }
+    for (int group = 0; group < kGroups; ++group) {
+        // The activation rows depend only on the group, so hoist them out of the row loop.
+        __m256i even[Columns];
+        __m256i odd[Columns];
+        __m256i correction[Columns];
+        float scale[Columns];
+        for (int c = 0; c < Columns; ++c) {
+            const auto* row = work.scratch.input_q8 + columns[c] * K + group * 64;
+            even[c]       = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row));
+            odd[c]        = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row + 32));
+            // One lane carries the whole offset: the group's 8 * sum(x) is subtracted once, not
+            // once per lane, because the lanes are summed at the end of the group.
+            correction[c] = _mm256_setr_epi32(
+                8 * work.scratch.input_sum[columns[c] * kGroups + group], 0, 0, 0, 0, 0, 0, 0);
+            scale[c] = work.scratch.input_scale[columns[c] * kGroups + group];
+        }
+        for (int r = 0; r < Rows; ++r) {
+            const auto* codes  = matrix.codes + std::size_t(rows[r]) * (K / 2) + group * 32;
+            const auto flipped = _mm256_xor_si256(
+                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(codes)), bias);
+            const auto low  = _mm256_and_si256(flipped, nibble);
+            const auto high = _mm256_and_si256(_mm256_srli_epi16(flipped, 4), nibble);
+            // The weight scale is per row and group, so it folds into the same broadcast.
+            const float weight = common::cpu::avx2::fp16_to_f32(
+                matrix.scales[std::size_t(rows[r]) * kGroups + group]);
+            for (int c = 0; c < Columns; ++c) {
+                const auto pairs = _mm256_sub_epi32(
+                    _mm256_add_epi32(
+                        _mm256_madd_epi16(_mm256_maddubs_epi16(low, even[c]), ones),
+                        _mm256_madd_epi16(_mm256_maddubs_epi16(high, odd[c]), ones)),
+                    correction[c]);
+                total[r][c] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(pairs),
+                                              _mm256_set1_ps(scale[c] * weight), total[r][c]);
+            }
+        }
+    }
+    for (int r = 0; r < Rows; ++r) {
+        for (int c = 0; c < Columns; ++c) { out[r][c] = common::cpu::avx2::reduce_sum(total[r][c]); }
+    }
+}
+
 // channel_block (the maximum unit width) lives in work.h.
 
 template <class Simd, int Columns>
@@ -78,16 +151,28 @@ inline void gate_up(Work& work, const Group& group, int first, int channel, int 
             indices[2 * r + 1] = intermediate + i + r;
         }
         float values[rows][Columns];
-        if constexpr (Simd::bf16_gate) {
-            unsigned mask = 0;
-            for (int c = 0; c < Columns; ++c) { mask |= 1U << group.tokens[first + c]; }
-            if ((bf16_columns & mask) == mask) {
-                Simd::gate_dot(group.gate_up, indices, input, values);
+        // The bf16 gate path only covers whole columns, so it is tried first and everything else
+        // falls through to the int4 dot product.
+        const auto run_default = [&]() noexcept {
+            if constexpr (Simd::bf16_gate) {
+                unsigned mask = 0;
+                for (int c = 0; c < Columns; ++c) { mask |= 1U << group.tokens[first + c]; }
+                if ((bf16_columns & mask) == mask) {
+                    Simd::gate_dot(group.gate_up, indices, input, values);
+                    return;
+                }
+            }
+            dot<Simd, 4, hidden>(group.gate_up, indices, input, values);
+        };
+        if constexpr (std::is_base_of_v<common::cpu::avx2::F32, Simd>) {
+            if (work.int8_path) {
+                dot_q4_q8<Simd, hidden, rows, Columns>(work, group.gate_up, indices,
+                                                       group.tokens + first, values);
             } else {
-                dot<Simd, 4, hidden>(group.gate_up, indices, input, values);
+                run_default();
             }
         } else {
-            dot<Simd, 4, hidden>(group.gate_up, indices, input, values);
+            run_default();
         }
         for (int r = 0; r < rows / 2; ++r) {
             for (int c = 0; c < Columns; ++c) {
@@ -212,10 +297,18 @@ template <class Simd>
         const float inverse = scale > 0.0F ? 1.0F / scale : 0.0F;
         work.scratch.input_scale[column * kGroups + group] = scale;
         auto* out = work.scratch.input_q8 + column * hidden + group * 64;
-        for (int i = 0; i < 64; ++i) {
-            out[i] = static_cast<std::int8_t>(
-                std::clamp(static_cast<int>(std::lrint(source[i] * inverse)), -127, 127));
+        // The packed weights give weight 2b in the low nibble of byte b and 2b+1 in the high
+        // one, so the activations are stored even-first and odd-second: the two nibble halves
+        // then multiply straight against the two halves of the row, with no shuffle at all.
+        int sum = 0;
+        for (int i = 0; i < 32; ++i) {
+            const int even = std::clamp(static_cast<int>(std::lrint(source[2 * i] * inverse)), -127, 127);
+            const int odd  = std::clamp(static_cast<int>(std::lrint(source[2 * i + 1] * inverse)), -127, 127);
+            out[i]      = static_cast<std::int8_t>(even);
+            out[32 + i] = static_cast<std::int8_t>(odd);
+            sum += even + odd;
         }
+        work.scratch.input_sum[column * kGroups + group] = sum;
     }
 }
 
@@ -286,6 +379,3 @@ constexpr Kernel make_kernel() {
 }
 
 } // namespace ninfer::ops::detail::moe_cpu::groupwise_int
-
-
-
