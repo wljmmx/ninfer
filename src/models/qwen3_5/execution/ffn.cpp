@@ -641,6 +641,21 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
             mix(reinterpret_cast<std::uintptr_t>(routes.coefficients.data));
             mix(reinterpret_cast<std::uintptr_t>(moe.stream->resident_mask()));
             mix(reinterpret_cast<std::uintptr_t>(shared_coefficients.data));
+            if (std::getenv("NINFER_LAYER_GRAPH_DEBUG") != nullptr) {
+                static std::size_t shown = 0;
+                if (shown++ < 160) {
+                    std::fprintf(stderr,
+                                 "[graph-key] bank=%u cols=%d key=%016llx h=%p res=%p mix=%p ids=%p "
+                                 "coef=%p sh=%p\n",
+                                 moe.stream->bank_index(), columns, (unsigned long long)key,
+                                 static_cast<const void*>(hidden.data),
+                                 static_cast<const void*>(residual.data),
+                                 static_cast<const void*>(mixed_f32.data),
+                                 static_cast<const void*>(routes.ids.data),
+                                 static_cast<const void*>(routes.coefficients.data),
+                                 static_cast<const void*>(shared_coefficients.data));
+                }
+            }
             graphs.run(moe.stream->bank_index(), key, execution.stream, moe_run);
             if (std::getenv("NINFER_LAYER_GRAPH_REPORT") != nullptr) {
                 static std::uint64_t calls = 0;

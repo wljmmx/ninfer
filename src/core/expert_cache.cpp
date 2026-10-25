@@ -6,7 +6,9 @@
 #include "core/device_scope.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -573,6 +575,7 @@ std::optional<std::uint32_t> ExpertCache::expert_slot(std::uint32_t bank,
 
 ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
     if (stream == nullptr) { stream = impl_->upload_stream; }
+    const auto timing_begin = std::chrono::steady_clock::now();
     std::size_t staged = 0;
     std::vector<Impl::UploadOp> batch;
     batch.reserve(Impl::kUploadBatch * 6);
@@ -583,6 +586,7 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
         impl_->upload_one(key, stream, false, staged, &batch);
         ++staged;
     }
+    const auto collect_begin = std::chrono::steady_clock::now();
     if (staged == 0) { return {0, true}; }
     // port (sm_89): the batch these were collected into is one submission instead of one per
     // slice. The copies are independent by construction - a slot, a source and a direction each -
@@ -630,6 +634,29 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
     if (impl_->staging_needed) {
         const auto settled = cudaStreamSynchronize(stream);
         if (settled != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(settled)); }
+    }
+    // The upload budget was one number and it did not say what it was spent on. Split it: the
+    // collect phase is host work (slot reads, and the artifact read when a staged image is needed),
+    // the submit phase is the API call plus, on the staged path, the barrier that pins it down.
+    // Operations per layer is what decides whether the batch form can help at all.
+    if (std::getenv("NINFER_UPLOAD_TIMING") != nullptr) {
+        const auto timing_end = std::chrono::steady_clock::now();
+        static std::uint64_t calls = 0;
+        static double acc[3]       = {0.0, 0.0, 0.0};
+        const auto elapsed = [](auto from, auto to) {
+            return std::chrono::duration<double, std::milli>(to - from).count();
+        };
+        acc[0] += elapsed(timing_begin, collect_begin);
+        acc[1] += elapsed(collect_begin, timing_end);
+        acc[2] += static_cast<double>(batch.size());
+        if (++calls % 40 == 0) {
+            std::fprintf(stderr,
+                         "[upload] collect=%.3fms submit=%.3fms ops=%.1f per layer "
+                         "(staged=%d)\n",
+                         acc[0] / 40.0, acc[1] / 40.0, acc[2] / 40.0,
+                         impl_->staging_needed ? 1 : 0);
+            acc[0] = acc[1] = acc[2] = 0.0;
+        }
     }
     return {staged, false};
 }
