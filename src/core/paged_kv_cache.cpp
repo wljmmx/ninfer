@@ -753,12 +753,13 @@ namespace {
 // one cudaMemcpy2DAsync per page. GB.2 measured 9.61 us per 128 KiB copy in the loop form against
 // 5.48 us batched (-43%, recovering the single-copy bandwidth); the batch API requires the copies in
 // one batch to be independent, which these are (distinct sources, distinct destinations, one
-// direction). CUDA 13.4 requires a valid srcAccessOrder per op and a non-default stream. Off by
-// default, like every other knob on this path.
+// direction). CUDA 13.4 requires a valid srcAccessOrder per op and a non-default stream.
+// port (sm_89): on by default. It only changes how many submissions carry the same bytes in the
+// same direction; NINFER_KV_BATCH_DMA=0 keeps the per-page form for A/B.
 bool kv_batch_dma_enabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("NINFER_KV_BATCH_DMA");
-        return value != nullptr && *value != '\0' && std::strtol(value, nullptr, 10) != 0;
+        return value == nullptr || *value == '\0' || std::strtol(value, nullptr, 10) != 0;
     }();
     return enabled;
 }

@@ -618,14 +618,22 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
         };
         auto& graphs = LayerGraphs::instance();
         if (graphs.enabled()) {
-            // Everything the capture baked in: the mask bytes, the offset table version (the mask
-            // changes whenever the resident set does) and the addresses the kernels read and write.
+            // What the capture baked in is the argument list, so the key is the set of buffer
+            // addresses the kernels read and write. A moved buffer changes an argument the capture
+            // recorded and the graph has to be rebuilt.
+            //
+            // port (sm_89): the mask bytes are deliberately NOT part of the key. The kernels read
+            // the resident mask through one fixed device pointer that `ensure` rewrites every
+            // layer, so a capture stays valid whatever the mask holds; the contents are not an
+            // argument, only the pointer is. Mixing in all 256 bits is what made the key change on
+            // every layer and sent the graph down its rebuild branch every time - measured
+            // captures=40 replays=0, i.e. the graph never ran from a cached instantiation at all,
+            // which is why it was slower than plain launches instead of faster.
             std::uint64_t key = 1469598103934665603ULL;
             const auto mix    = [&key](std::uint64_t value) {
                 key ^= value;
                 key *= 1099511628211ULL;
             };
-            for (const auto bit : mask_host) { mix(static_cast<std::uint64_t>(bit)); }
             mix(reinterpret_cast<std::uintptr_t>(hidden.data));
             mix(reinterpret_cast<std::uintptr_t>(residual.data));
             mix(reinterpret_cast<std::uintptr_t>(mixed_f32.data));
