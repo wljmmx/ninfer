@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <numeric>
 #include <chrono>
+#include <map>
+#include <mutex>
 #include <cstdio>
 #include <cstdlib>
 #include <array>
@@ -25,8 +27,108 @@ std::uint64_t rows_of(const WeightGeometry& parent, std::uint64_t elements) {
 // prefill chunk (which touches most experts anyway) cannot wash the ranking out; the score decays
 // so the set follows the conversation instead of remembering the first prompt forever.
 constexpr std::int32_t kHotSetUpdateTokens  = 4;
-constexpr std::uint32_t kHotSetDecayPeriod  = 32;
 constexpr std::uint32_t kHotSetReorderPeriod = 32;
+
+// port (sm_89): how long the ranking remembers. The 32-step half-life is ~64 tokens of memory, which
+// is too short for a fixed hot set to mean anything: the plan asked for a long window or an offline
+// profile (section 6, item 3). NINFER_EXPERT_DECAY_STEPS overrides it, 0 keeps the scores forever.
+std::uint32_t hot_decay_period() {
+    static const std::uint32_t period = [] {
+        const char* value = std::getenv("NINFER_EXPERT_DECAY_STEPS");
+        if (value == nullptr || *value == '\0') { return std::uint32_t{32}; }
+        return static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
+    }();
+    return period;
+}
+
+// port (sm_89): an offline hot-set profile. One float32 row per bank, `count` experts each, in bank
+// order - what NINFER_EXPERT_PROFILE_DUMP writes at exit. A later run starts with the set already
+// known instead of learning it from the first 64 tokens, which is the difference between "the fixed
+// set covers the routes" and "the fixed set is a guess" (section 6, item 3).
+const std::vector<float>& profile_rows() {
+    static const std::vector<float> rows = [] {
+        std::vector<float> out;
+        const char* path = std::getenv("NINFER_EXPERT_PROFILE");
+        if (path == nullptr || *path == '\0') { return out; }
+        std::FILE* file = std::fopen(path, "rb");
+        if (file == nullptr) {
+            std::fprintf(stderr, "[experts] profile %s cannot be read, learning the set instead\n",
+                         path);
+            return out;
+        }
+        std::fseek(file, 0, SEEK_END);
+        const auto bytes = static_cast<std::size_t>(std::ftell(file));
+        std::fseek(file, 0, SEEK_SET);
+        out.resize(bytes / sizeof(float));
+        if (!out.empty() && std::fread(out.data(), sizeof(float), out.size(), file) != out.size()) {
+            out.clear();
+        }
+        std::fclose(file);
+        std::fprintf(stderr, "[experts] profile %s: %zu floats\n", path, out.size());
+        return out;
+    }();
+    return rows;
+}
+
+// The frozen set a profile asks for: its top `capacity` experts for this bank, or empty when the
+// profile does not cover it.
+std::vector<std::uint32_t> profile_top_experts(std::uint32_t bank, std::uint32_t count,
+                                               std::uint32_t capacity) {
+    const auto& rows = profile_rows();
+    if (rows.empty() || count == 0) { return {}; }
+    const auto stride = static_cast<std::size_t>(count);
+    if ((static_cast<std::size_t>(bank) + 1) * stride > rows.size()) { return {}; }
+    const auto* row = rows.data() + static_cast<std::size_t>(bank) * stride;
+    std::vector<std::uint32_t> order(count);
+    std::iota(order.begin(), order.end(), 0U);
+    std::stable_sort(order.begin(), order.end(),
+                     [row](std::uint32_t a, std::uint32_t b) { return row[a] > row[b]; });
+    order.resize(std::min<std::size_t>(capacity, order.size()));
+    return order;
+}
+
+// Dump support: every bank registers its scores, one file at exit.
+std::mutex& profile_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+std::map<std::uint32_t, const std::vector<float>*>& profile_registry() {
+    static std::map<std::uint32_t, const std::vector<float>*> registry;
+    return registry;
+}
+void dump_profiles() {
+    const char* path = std::getenv("NINFER_EXPERT_PROFILE_DUMP");
+    if (path == nullptr || *path == '\0') { return; }
+    std::lock_guard<std::mutex> lock(profile_mutex());
+    auto& registry = profile_registry();
+    // Rows are borrowed from the live streams, so a dump only happens while they exist. Writing
+    // only the rows that are still owned keeps an empty registry from truncating a good snapshot.
+    std::size_t rows = 0, width = 0;
+    for (const auto& [bank, scores] : registry) {
+        (void)bank;
+        if (!scores->empty()) {
+            ++rows;
+            width = scores->size();
+        }
+    }
+    if (rows == 0) { return; }
+    std::FILE* file = std::fopen(path, "wb");
+    if (file == nullptr) { return; }
+    for (const auto& [bank, scores] : registry) {
+        (void)bank;
+        if (scores->size() == width) {
+            std::fwrite(scores->data(), sizeof(float), scores->size(), file);
+        }
+    }
+    std::fclose(file);
+}
+
+void register_profile_dump(std::uint32_t bank, const std::vector<float>* scores) {
+    const char* path = std::getenv("NINFER_EXPERT_PROFILE_DUMP");
+    if (path == nullptr || *path == '\0') { return; }
+    std::lock_guard<std::mutex> lock(profile_mutex());
+    profile_registry()[bank] = scores;
+}
 
 } // namespace
 
@@ -66,6 +168,7 @@ ExpertStream::ExpertStream(std::uint32_t count, WeightBankLayout gate_up, Weight
 }
 
 void ExpertStream::attach(ExpertCache& cache, std::uint32_t bank, const ExpertBankLayout& entry) {
+    register_profile_dump(bank, &hot_score_);
     if (bank > 0xffffU || cache.capacity_bytes() < entry.entry_bytes) {
         throw std::invalid_argument("expert stream cannot attach to this cache");
     }
@@ -213,7 +316,8 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             for (std::size_t i = 0; i < values; ++i) {
                 hot_score_[static_cast<std::size_t>(route_ids[i])] += 1.0F;
             }
-            if (++since_decay_ >= kHotSetDecayPeriod) {
+            const auto decay = hot_decay_period();
+            if (decay != 0 && ++since_decay_ >= decay) {
                 for (auto& score : hot_score_) { score *= 0.5F; }
                 since_decay_ = 0;
             }
@@ -241,6 +345,16 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         std::vector<std::uint32_t> wanted;
         std::vector<bool> chosen(count_, false);
         wanted.reserve(capacity);
+        if (!frozen_) {
+            // A profile names the set before the first token, so a run can be repeatable: the same
+            // pool gives the same experts in the same slots instead of whatever the first prompt
+            // happened to route to.
+            auto profiled = profile_top_experts(bank_, count_, capacity);
+            if (!profiled.empty()) {
+                frozen_wanted_ = std::move(profiled);
+                frozen_        = true;
+            }
+        }
         if (frozen_) {
             wanted = frozen_wanted_;
             for (const auto expert : wanted) { chosen[expert] = true; }
@@ -277,6 +391,32 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         // periodic refresh looked cheaper on paper (two device copies saved) but measured 11.1
         // against 24.3 tok/s: a stale set sends far more experts down the host tier than the two
         // copies ever cost.
+        // Coverage of the fixed set: how many of this step's routes the pool already holds. A
+        // captured decode graph is only correct when this is 100%, so it is the number the graph
+        // work has to reach before the gate may open.
+        {
+            std::uint64_t inside = 0;
+            for (std::size_t i = 0; i < values; ++i) {
+                if (chosen[static_cast<std::size_t>(route_ids[i])]) { ++inside; }
+            }
+            static std::uint64_t coverage_routes = 0, coverage_inside = 0, coverage_calls = 0, coverage_dumps = 0;
+            // The profile is written from here rather than at exit: the streams are already gone by
+            // the time an atexit handler runs, and a snapshot every few steps is enough to rank a
+            // bank. 40 banks x 256 floats is 40 KiB.
+            if (std::getenv("NINFER_EXPERT_PROFILE_DUMP") != nullptr && ++coverage_dumps % 8 == 0) {
+                dump_profiles();
+            }
+            coverage_routes += values;
+            coverage_inside += inside;
+            if (std::getenv("NINFER_SPLIT_TIMING") != nullptr && ++coverage_calls % 40 == 0) {
+                std::fprintf(stderr, "[set] bank=%u coverage=%llu/%llu (%.1f%%) slots=%u\n",
+                             bank_, static_cast<unsigned long long>(coverage_inside),
+                             static_cast<unsigned long long>(coverage_routes),
+                             100.0 * static_cast<double>(coverage_inside) /
+                                 static_cast<double>(coverage_routes == 0 ? 1 : coverage_routes),
+                             capacity);
+            }
+        }
         if (cache_->set_resident_experts(bank_, wanted)) {
             std::fill(offsets_.begin(), offsets_.end(), 0);
             std::vector<std::int32_t> mask(count_, 0);
