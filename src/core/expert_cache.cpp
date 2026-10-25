@@ -114,6 +114,9 @@ struct ExpertCache::Impl {
     std::uint64_t stat_direct = 0;
     std::uint64_t stat_staged = 0;
     std::uint64_t stat_views  = 0;
+    // Counted at the one place every upload passes through, so the figure cannot disagree with the
+    // batch it describes the way the per-branch counters did.
+    std::uint64_t stat_push = 0;
     // Reused across layers. Allocating these per call looked free and was not: a split layer pays
     // the upload turn forty times a token, and on this allocator seventy-two entries of scratch is
     // most of the collect budget on a layer that only has one expert to move.
@@ -473,6 +476,7 @@ struct ExpertCache::Impl {
                         throw std::runtime_error("expert span lies outside its entry image");
                     }
                     if (batch != nullptr) {
+                        ++stat_push;
                         batch->push_back({base + span.image_offset, span.source, span.bytes});
                         continue;
                     }
@@ -502,6 +506,7 @@ struct ExpertCache::Impl {
                     *file, {host_base, static_cast<std::size_t>(file->image_bytes)});
                 ++stat_staged;
                 if (batch != nullptr) {
+                    ++stat_push;
                     batch->push_back({base, host_base, static_cast<std::size_t>(file->image_bytes)});
                     entry.ready    = true;
                     entry.last_use = ++epoch;
@@ -528,6 +533,7 @@ struct ExpertCache::Impl {
                     throw std::runtime_error("expert cache source is not a matching Host plane");
                 }
                 if (batch != nullptr) {
+                    ++stat_push;
                     batch->push_back({base + region.offset, span.data, region.bytes});
                     return;
                 }
@@ -677,6 +683,9 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
         seen_direct = direct_now;
         seen_staged = staged_now;
         seen_views  = views_now;
+        static std::uint64_t seen_push = 0;
+        const auto push_delta = impl_->stat_push - seen_push;
+        seen_push             = impl_->stat_push;
         if (++calls % 40 == 0) {
             std::fprintf(stderr,
                          "[upload] collect=%.3fms submit=%.3fms ops=%.1f mb=%.2f per layer "
@@ -685,6 +694,8 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
                          static_cast<double>(direct_delta) / 40.0,
                          static_cast<double>(staged_delta) / 40.0,
                          static_cast<double>(views_delta) / 40.0);
+            std::fprintf(stderr, "[upload] pushed=%.1f ops per layer (cross-check)\n",
+                         static_cast<double>(push_delta) / 40.0);
             acc[0] = acc[1] = acc[2] = acc[3] = 0.0;
         }
         (void)direct_delta;

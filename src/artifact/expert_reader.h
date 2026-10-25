@@ -30,6 +30,14 @@ public:
     // needs into its arena, which measured 20 ms per layer against 0.5 ms of CPU work.
     [[nodiscard]] const std::byte* object_base(std::uint32_t object_index) const override;
 
+    // port (sm_89): name the payload slices so the uploader can DMA straight out of the mapped
+    // artifact instead of copying each expert image into the staging buffer first. Against the e2
+    // per-expert layout a layer that misses 2.8 experts pays 0.5 ms of CPU memcpy it does not need;
+    // the bytes are already in the page cache, so the copy only exists because the reader could not
+    // name them. Returns false when a file is not mapped or a chunk lies outside it, and the caller
+    // falls back to read_entry.
+    bool spans(const ExpertFileEntry& entry, std::vector<ExpertBlobSpan>& out) const override;
+
     [[nodiscard]] const Reader& reader() const noexcept { return reader_; }
 
 private:

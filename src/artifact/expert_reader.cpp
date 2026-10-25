@@ -88,4 +88,45 @@ const std::byte* ArtifactExpertReader::object_base(std::uint32_t object_index) c
     return file ? file->map_view() : nullptr;
 }
 
+bool ArtifactExpertReader::spans(const ExpertFileEntry& entry,
+                                 std::vector<ExpertBlobSpan>& out) const {
+    out.clear();
+    out.reserve(entry.chunks.size());
+    // Only name slices that are already mapped. A file that cannot be mapped here falls back to
+    // read_entry, which is the path this replaces rather than the one it depends on.
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_EXPERT_SPANS");
+        return value == nullptr || *value == '\0' || std::strtol(value, nullptr, 10) != 0;
+    }();
+    if (!enabled) { return false; }
+    for (const auto& chunk : entry.chunks) {
+        if (chunk.file_index >= files_.size()) { return false; }
+        auto& file = files_[chunk.file_index];
+        if (!file) {
+            try {
+                file = reader_.open_file(chunk.file_index);
+            } catch (const std::exception&) {
+                return false;
+            }
+        }
+        if (!file) { return false; }
+        const auto* base = file->map_view();
+        if (base == nullptr) { return false; }
+        if (chunk.file_offset > file->bytes() || chunk.bytes > file->bytes() - chunk.file_offset) {
+            return false;
+        }
+        const auto* source = base + chunk.file_offset;
+        if (!out.empty()) {
+            auto& last = out.back();
+            if (static_cast<const std::byte*>(last.source) + last.bytes == source &&
+                last.image_offset + last.bytes == chunk.image_offset) {
+                last.bytes += chunk.bytes;
+                continue;
+            }
+        }
+        out.push_back({source, chunk.bytes, chunk.image_offset});
+    }
+    return !out.empty();
+}
+
 } // namespace ninfer::artifact
