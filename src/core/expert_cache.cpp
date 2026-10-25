@@ -84,6 +84,8 @@ struct ExpertCache::Impl {
     std::vector<ExpertBankPair> views;
     std::vector<ExpertFileBank> files;
     const ExpertBlobReader* file_reader = nullptr;
+    // Pinned RAM tier to prefer over the artifact mapping, when one is attached and holds the expert.
+    const ExpertArenaSource* arena_source = nullptr;
     // One upload turn carries several experts: the file read is serialised per image anyway, but
     // each image would otherwise pay its own cudaStreamSynchronize (~2.5 ms of WDDM submission on
     // sm_89). The staging buffer therefore holds one slot image per batch position.
@@ -114,6 +116,7 @@ struct ExpertCache::Impl {
     std::uint64_t stat_direct = 0;
     std::uint64_t stat_staged = 0;
     std::uint64_t stat_views  = 0;
+    std::uint64_t stat_arena  = 0;
     // Counted at the one place every upload passes through, so the figure cannot disagree with the
     // batch it describes the way the per-branch counters did.
     std::uint64_t stat_push = 0;
@@ -465,6 +468,33 @@ struct ExpertCache::Impl {
             if (candidate.image_bytes) { file = &candidate; }
         }
         if (file) {
+            // port (sm_89): the pinned host tier is the best source when it holds this expert. It is
+            // the same working set the CPU half reads, already locked, so the copy is a straight DMA
+            // out of pinned memory - and the whole image goes as one operation instead of one per
+            // plane. Falls through to the mapped artifact when the arena does not have it.
+            if (arena_source != nullptr) {
+                std::uint64_t arena_bytes = 0;
+                const auto* arena_image =
+                    arena_source->arena_image(key.bank, key.expert, arena_bytes);
+                if (arena_image != nullptr && arena_bytes != 0) {
+                    if (batch != nullptr) {
+                        ++stat_push;
+                        batch->push_back({base, arena_image, static_cast<std::size_t>(arena_bytes)});
+                        entry.ready    = true;
+                        entry.last_use = ++epoch;
+                        ++uploads;
+                        ++stat_arena;
+                        return;
+                    }
+                    const auto status =
+                        cudaMemcpyAsync(base, arena_image, static_cast<std::size_t>(arena_bytes),
+                                        cudaMemcpyHostToDevice, stream);
+                    if (status != cudaSuccess) {
+                        throw std::runtime_error(cudaGetErrorString(status));
+                    }
+                    if (settle) { (void)cudaStreamSynchronize(stream); }
+                }
+            }
             // port (sm_89): a source that already holds the bytes in place (the Host replica)
             // names the slices, so the transfer goes straight from host memory to the pool.
             std::vector<ExpertBlobSpan> direct;
@@ -664,6 +694,7 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
         const auto timing_end = std::chrono::steady_clock::now();
         static std::uint64_t calls = 0;
         static double acc[7] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+        static double acc_arena = 0.0;
         // acc: collect, submit, bytes, direct, staged, views, pushes. Every per-call delta has to
         // be accumulated here first; dividing a single call's delta by 40 was what made the
         // operation count read 0.1 while the byte total said five megabytes.
@@ -674,16 +705,19 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
         acc[1] += elapsed(collect_begin, timing_end);
         double layer_bytes = 0.0;
         for (const auto& op : batch) { layer_bytes += static_cast<double>(op.bytes); }
-        acc[2] += layer_bytes;        static std::uint64_t seen_direct = 0, seen_staged = 0, seen_views = 0;
+        acc[2] += layer_bytes;        static std::uint64_t seen_direct = 0, seen_staged = 0, seen_views = 0, seen_arena = 0;
         const auto direct_now = impl_->stat_direct;
         const auto staged_now = impl_->stat_staged;
         const auto views_now  = impl_->stat_views;
+        const auto arena_hits = impl_->stat_arena;
         const auto direct_delta = direct_now - seen_direct;
         const auto staged_delta = staged_now - seen_staged;
         const auto views_delta  = views_now - seen_views;
+        const auto arena_delta  = arena_hits - seen_arena;
         seen_direct = direct_now;
         seen_staged = staged_now;
         seen_views  = views_now;
+        seen_arena  = arena_hits;
         static std::uint64_t seen_push = 0;
         const auto push_delta = impl_->stat_push - seen_push;
         seen_push             = impl_->stat_push;
@@ -691,12 +725,14 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
         acc[4] += static_cast<double>(staged_delta);
         acc[5] += static_cast<double>(views_delta);
         acc[6] += static_cast<double>(push_delta);
+        acc_arena += static_cast<double>(arena_delta);
         if (++calls % 40 == 0) {
             std::fprintf(stderr,
                          "[upload] collect=%.3fms submit=%.3fms ops=%.1f mb=%.2f per layer "
                          "direct=%.1f staged=%.1f views=%.1f\n",
                          acc[0] / 40.0, acc[1] / 40.0, acc[6] / 40.0,
                          acc[2] / 40.0 / 1048576.0, acc[3] / 40.0, acc[4] / 40.0, acc[5] / 40.0);
+            std::fprintf(stderr, "[upload] arena=%.1f experts per layer\n", acc_arena / 40.0);
             // Raw values for the call being reported: if these two disagree while the averages
             // above do, the disagreement is in the accumulation and not in the upload itself.
             std::fprintf(stderr,
@@ -704,6 +740,7 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
                          batch.size(), static_cast<unsigned long long>(impl_->stat_push),
                          layer_bytes / 1048576.0, staged);
             acc[0] = acc[1] = acc[2] = acc[3] = acc[4] = acc[5] = acc[6] = 0.0;
+            acc_arena = 0.0;
         }
         (void)direct_delta;
         (void)staged_delta;
@@ -713,6 +750,18 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
 
 void ExpertCache::wait_for_progress(cudaStream_t stream) {
     while (!progress(stream).required_published) {}
+}
+
+void ExpertCache::attach_arena(const ExpertArenaSource* arena) noexcept {
+    // port (sm_89): off by default until the data path is proven. Reading a miss out of the pinned
+    // tier measured 24.2 -> 30.6 tok/s, but the generated text came back empty at 32 tokens, so the
+    // bytes the arena hands over are not always the image the pool expects. The likely cause is
+    // ordering: the upload runs before the host tier's ensure for the same layer, so a slot can be
+    // answered from the previous step's contents, or from a slot the evictor has since handed to
+    // another expert. NINFER_ARENA_UPLOAD=1 re-enables it for that investigation.
+    const char* enable = std::getenv("NINFER_ARENA_UPLOAD");
+    if (enable == nullptr || *enable == '\0' || std::strtol(enable, nullptr, 10) == 0) { return; }
+    impl_->arena_source = arena;
 }
 
 std::optional<std::uint64_t> ExpertCache::offset(ExpertCacheKey key) const {

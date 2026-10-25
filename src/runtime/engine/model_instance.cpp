@@ -290,6 +290,10 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
         std::fprintf(stderr, "[experts] host tier slots=%u slot_bytes=%llu\n",
                      residency->slot_capacity(),
                      static_cast<unsigned long long>(residency->slot_bytes()));
+        // port (sm_89): the Device uploader may read a miss out of this pinned tier instead of the
+        // pageable artifact mapping. Only experts the host tier actually keeps are answered; the rest
+        // still stream from the artifact.
+        instance.expert_cache->attach_arena(residency.get());
         placement.host_experts =
             static_cast<std::uint64_t>(residency->slot_capacity());
         instance.expert_host_residency = std::move(residency);

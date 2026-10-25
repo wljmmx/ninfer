@@ -66,4 +66,18 @@ public:
     }
 };
 
+// port (sm_89): a pinned RAM tier the Device uploader can read from, when one exists. The host tier
+// already holds the working set in locked memory for the CPU half; an upload that reaches the same
+// expert should take it from there rather than from the pageable artifact mapping, which forces the
+// driver through its bounce buffer. Queried per expert because the two tiers see the same experts at
+// different moments.
+class ExpertArenaSource {
+public:
+    virtual ~ExpertArenaSource() = default;
+    // Pointer to the start of one expert's image inside the arena, or null when the arena does not
+    // hold it (or is not the backing for that bank). `bytes` receives the image length.
+    virtual const std::byte* arena_image(std::uint32_t bank, std::uint32_t expert,
+                                         std::uint64_t& bytes) const = 0;
+};
+
 } // namespace ninfer

@@ -46,7 +46,7 @@ struct HostExpertBankDesc {
 // The CPU op validates a host-packed bank: planes start at 0, at codes_bytes and at
 // codes_bytes + high_bytes, and expert_offsets name each expert's segment. Gate/up and down begin
 // at different byte origins inside that segment, so each plane view carries its own table.
-class HostExpertResidency final : public HostResidency {
+class HostExpertResidency final : public HostResidency, public ExpertArenaSource {
 public:
     HostExpertResidency(std::span<const HostExpertBankDesc> banks,
                         std::span<const ExpertFileBank> files, const ExpertBlobReader* reader,
@@ -300,6 +300,28 @@ public:
 
     [[nodiscard]] const ops::CpuSwiGLUExperts& experts(ExpertBankId bank) const {
         return state_[bank.index].view;
+    }
+
+    // port (sm_89): the Device uploader takes a pinned copy from here instead of reading the
+    // pageable artifact mapping again. Only banks backed by the arena can answer: a bank addressed
+    // in place has no arena slot, and answering anyway would hand back bytes nobody wrote.
+    const std::byte* arena_image(std::uint32_t bank, std::uint32_t expert,
+                                 std::uint64_t& bytes) const override {
+        bytes = 0;
+        if (bank >= state_.size()) { return nullptr; }
+        if (bank < direct_.size() && direct_[bank]) { return nullptr; }
+        const auto& s = state_[bank];
+        if (expert >= s.slot_of.size()) { return nullptr; }
+        const auto slot = s.slot_of[expert];
+        if (slot == kNone) { return nullptr; }
+        if (arena_ == nullptr) { return nullptr; }
+        if (bank >= files_.size()) { return nullptr; }
+        const auto& bank_files = files_[bank];
+        if (expert >= bank_files.experts.size()) { return nullptr; }
+        const auto image = bank_files.experts[expert].image_bytes;
+        if (image == 0 || image > slot_bytes_) { return nullptr; }
+        bytes = image;
+        return arena_ + std::uint64_t{slot} * slot_bytes_;
     }
     [[nodiscard]] std::uint64_t slot_bytes() const noexcept { return slot_bytes_; }
     [[nodiscard]] std::uint32_t slot_capacity() const noexcept { return slot_capacity_; }

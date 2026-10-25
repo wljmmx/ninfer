@@ -113,6 +113,13 @@ void prepare(std::span<const ExpertCacheKey> required, cudaStream_t stream = nul
     // returns true. The rest of the bank streams in again on their next use.
     bool set_resident_experts(std::uint32_t bank, std::span<const std::uint32_t> experts);
 
+    // port (sm_89): the pinned RAM tier the host half keeps its working set in. When set, an upload
+    // of an expert that tier already holds copies from locked memory instead of the pageable artifact
+    // mapping, which is worth ~0.34 ms a layer: the driver can DMA straight out of a pinned buffer
+    // but has to bounce through its own staging for a mapped one. Attach after both exist; before
+    // that, uploads fall back to the artifact reader.
+    void attach_arena(const ExpertArenaSource* arena) noexcept;
+
     // Uploads one batch if a slot is free. Never blocks.
     [[nodiscard]] ExpertCacheProgress progress(cudaStream_t stream = nullptr);
 
