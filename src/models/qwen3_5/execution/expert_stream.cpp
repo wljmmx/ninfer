@@ -401,8 +401,27 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             }
         }
         if (frozen_) {
-            wanted = frozen_wanted_;
+            // port (sm_89): a frozen set used to take every slot, so a route outside it had nowhere
+            // to go and was forced onto the CPU - measured 121 ms of CPU per token at a 4096 MiB
+            // pool against 0.00 ms of upload, for about 3.2 experts a layer. Hold the set back to
+            // `capacity - spill` and let this step's outside routes take the rest, where an upload
+            // costs 0.12 ms against the CPU's 0.5.
+            static const std::uint32_t spill_percent = [] {
+                const char* value = std::getenv("NINFER_EXPERT_SPILL_PCT");
+                const auto percent = value != nullptr ? std::strtoul(value, nullptr, 10) : 15UL;
+                return static_cast<std::uint32_t>(std::min<std::uint64_t>(percent, 90));
+            }();
+            const auto spill = static_cast<std::size_t>(capacity) * spill_percent / 100;
+            const auto pinned = capacity > spill ? capacity - spill : capacity;
+            const auto keep   = std::min<std::size_t>(pinned, frozen_wanted_.size());
+            wanted.assign(frozen_wanted_.begin(), frozen_wanted_.begin() + keep);
             for (const auto expert : wanted) { chosen[expert] = true; }
+            for (std::size_t i = 0; i < values && wanted.size() < capacity; ++i) {
+                const auto expert = static_cast<std::uint32_t>(route_ids[i]);
+                if (chosen[expert]) { continue; }
+                chosen[expert] = true;
+                wanted.push_back(expert);
+            }
         } else {
             if (!static_set && !generation_mode) {
                 for (std::size_t i = 0; i < values && wanted.size() < capacity; ++i) {
