@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <thread>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -166,8 +167,17 @@ int main(int argc, char** argv) {
     const auto base    = reinterpret_cast<std::uintptr_t>(scratch.data());
     const auto aligned = (256 - (base & 255)) & 255;
 
+    // The engine allocates this per layer, so its size is the cost of the per-layer scratch.
+    std::printf("moe cpu bench: workspace=%.1f KiB per call (engine allocates it per layer)\n",
+                capacity / 1024.0);
     std::printf("moe cpu bench: hidden=%d intermediate=%d experts=%d top_k=%d workers=%u\n", kHidden,
                 kIntermediate, kExperts, kTopK, execution.worker_count());
+
+    // port (sm_89): NINFER_BENCH_ACTIVE keeps the team spinning between calls, the same thing
+    // NINFER_CPU_TEAM_ACTIVE does in the engine. Combined with NINFER_BENCH_GAP_US it separates
+    // "the team is parked" from "the call is expensive".
+    static std::optional<CpuExecutionView::ActiveScope> bench_active;
+    if (std::getenv("NINFER_BENCH_ACTIVE") != nullptr) { bench_active.emplace(execution.keep_active()); }
 
     for (const int misses : {1, 2, 4, 8}) {
         const auto subset = ops::ExpertSubset{ops::ExpertSubsetKind::MaskOnes, mask_tensor};
@@ -207,11 +217,20 @@ int main(int argc, char** argv) {
         // between runs because a hybrid P/E machine schedules the team differently, and a change
         // measured against it is indistinguishable from noise; the fastest call is the one where
         // the team got out of its own way, which is the number a kernel change should move.
+        // port (sm_89): the engine calls this once per layer, with a GPU half in between, so the
+        // team is idle every time it is asked to run. A tight loop never pays that. This knob puts
+        // a gap in front of each timed call so the bench can measure the wake, which is the差
+        // between 0.08 ms here and 0.5-0.9 ms in the engine.
+        static const auto gap_us = [] {
+            const char* value = std::getenv("NINFER_BENCH_GAP_US");
+            return value != nullptr ? std::atoi(value) : 0;
+        }();
         std::vector<double> samples;
         samples.reserve(static_cast<std::size_t>(iterations));
         for (int i = 0; i < iterations; ++i) {
             route(i + 16);
             arena.reset();
+            if (gap_us > 0) { std::this_thread::sleep_for(std::chrono::microseconds(gap_us)); }
             const auto call_begin = std::chrono::steady_clock::now();
             ops::routed_swiglu(x_tensor, profile, experts, routes, subset, out_tensor, arena,
                                execution);
