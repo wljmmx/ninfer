@@ -79,6 +79,68 @@ __global__ void scan_assignments(GroupedStorage out, int tiles, GroupedPlan plan
     }
 }
 
+// port (sm_89): count and scan are back to back with a kernel boundary between them, and for a
+// decode step the whole of both is eight route ids and a 256-wide prefix sum. Fusing them removes a
+// launch and a boundary per layer - 40 of each per token - and the work is identical: the same
+// per-expert counts, the same offsets, tile bases and job list.
+template <class Shape, bool Masked>
+__global__ void fuse_count_scan(const int* ids, const int* mask, int member, int assignments,
+                                GroupedStorage out, GroupedPlan plan) {
+    constexpr int E = Shape::experts;
+    __shared__ int counts[E];
+    __shared__ int scan[E];
+    const int e   = threadIdx.x;
+    const int tid = threadIdx.x;
+    for (int i = tid; i < E; i += blockDim.x) { counts[i] = 0; }
+    __syncthreads();
+    for (int a = tid; a < assignments; a += blockDim.x) {
+        const int expert = ids[a];
+        bool selected    = true;
+        if constexpr (Masked) { selected = mask[expert] == member; }
+        out.local_ranks[a] = selected ? atomicAdd(counts + expert, 1) : -1;
+    }
+    __syncthreads();
+    const int count    = counts[e];
+    out.tile_counts[e] = count; // one tile
+    scan[e]            = count;
+    __syncthreads();
+#pragma unroll
+    for (int d = 1; d < E; d <<= 1) {
+        const int value = e >= d ? scan[e - d] : 0;
+        __syncthreads();
+        scan[e] += value;
+        __syncthreads();
+    }
+    const int begin     = e ? scan[e - 1] : 0;
+    const int total     = scan[E - 1];
+    out.offsets[e]      = begin;
+    out.tile_bases[e]   = begin;
+    if (e == E - 1) { out.offsets[E] = total; }
+    const int active = __syncthreads_count(count > 0);
+    if (e == E - 1) {
+        *out.info = {total,
+                     int(plan.adaptive &&
+                         total * plan.direct_denominator > plan.direct_numerator * assignments),
+                     int(total * plan.spread_denominator < plan.spread_numerator * active)};
+    }
+    __syncthreads();
+    const int jobs = plan.columns > 0 ? (count + plan.columns - 1) / plan.columns : 0;
+    scan[e]        = jobs;
+    __syncthreads();
+#pragma unroll
+    for (int d = 1; d < E; d <<= 1) {
+        const int value = e >= d ? scan[e - d] : 0;
+        __syncthreads();
+        scan[e] += value;
+        __syncthreads();
+    }
+    const int first = e ? scan[e - 1] : 0;
+    for (int job = 0; job < jobs; ++job) {
+        out.job_experts[first + job] = e;
+        out.job_columns[first + job] = job * plan.columns;
+    }
+}
+
 template <class Shape>
 __global__ void index_assignments(const int* ids, GroupedStorage out, int assignments) {
     if (out.info->direct) { return; }
@@ -120,6 +182,31 @@ void launch_group_scan(const ExpertRoutes& routes, const GroupedPlan& plan,
     using S = SwiGLUH2048I512E256K8;
     scan_assignments<S>
         <<<1, S::experts, 0, execution.stream>>>(storage, (routes.ids.ne[1] + 7) / 8, plan);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_group_count_scan(const ExpertRoutes& routes, ExpertSubset subset,
+                              const GroupedPlan& plan, const GroupedStorage& storage,
+                              CudaExecutionView execution) {
+    using S         = SwiGLUH2048I512E256K8;
+    const int count = routes.ids.ne[1] * S::top_k;
+    const int tiles = (count + 8 * S::top_k - 1) / (8 * S::top_k);
+    if (tiles > 1) {
+        // A prefill chunk spreads over several tiles; the fused kernel only covers one, so the
+        // three-kernel chain stays for it.
+        launch_group_count(routes, subset, storage, execution);
+        launch_group_scan(routes, plan, storage, execution);
+        return;
+    }
+    const auto* ids  = static_cast<const int*>(routes.ids.data);
+    const auto* mask = static_cast<const int*>(subset.mask.data);
+    if (subset.kind == ExpertSubsetKind::All) {
+        fuse_count_scan<S, false>
+            <<<1, S::experts, 0, execution.stream>>>(ids, nullptr, 0, count, storage, plan);
+    } else {
+        fuse_count_scan<S, true><<<1, S::experts, 0, execution.stream>>>(
+            ids, mask, subset.kind == ExpertSubsetKind::MaskOnes ? 1 : 0, count, storage, plan);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

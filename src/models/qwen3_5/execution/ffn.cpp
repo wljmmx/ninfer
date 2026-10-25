@@ -122,17 +122,43 @@ HostRoutedFetch fetch_host_routed(const Tensor& hidden, const ops::ExpertRoutes&
     // cudaMemcpyFlagPreferOverlapWithCompute hint) merges them into one submission and measured
     // 5.77/5.83 ms per token against 5.66/5.73 for the four calls: the cost is the synchronise at
     // the end, not the submission count, so the batch form was reverted rather than kept.
-    CUDA_CHECK(cudaMemcpyAsync(fetch.x.data(), hidden.data, fetch.x.size() * sizeof(std::uint16_t),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpyAsync(fetch.residual.data(), residual.data,
-                               fetch.residual.size() * sizeof(std::uint16_t),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpyAsync(fetch.ids.data(), routes.ids.data,
-                               fetch.ids.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost,
-                               stream));
-    CUDA_CHECK(cudaMemcpyAsync(fetch.coefficients.data(), routes.coefficients.data,
-                               fetch.coefficients.size() * sizeof(float), cudaMemcpyDeviceToHost,
-                               stream));
+    // port (sm_89): four independent transfers, one submission. cudaMemcpyBatchAsync (CUDA 13)
+    // takes the whole list at once, which removes three WDDM submissions per layer - and a split
+    // token makes forty of them. The copies are independent, so the batch's unspecified internal
+    // order does not matter. NINFER_DMA_BATCH=0 keeps the per-copy form for A/B.
+    static const bool batched = std::getenv("NINFER_DMA_BATCH") == nullptr;
+    if (batched) {
+        void* destinations[4] = {fetch.x.data(), fetch.residual.data(), fetch.ids.data(),
+                                 fetch.coefficients.data()};
+        const void* sources[4] = {hidden.data, residual.data, routes.ids.data,
+                                  routes.coefficients.data};
+        const std::size_t sizes[4] = {fetch.x.size() * sizeof(std::uint16_t),
+                                      fetch.residual.size() * sizeof(std::uint16_t),
+                                      fetch.ids.size() * sizeof(std::int32_t),
+                                      fetch.coefficients.size() * sizeof(float)};
+        // Every copy must name a source access order - the sources are device buffers the kernels
+        // above wrote on this stream, so they are read in stream order - and the 13.4 flag asks the
+        // driver to overlap the transfers with compute.
+        cudaMemcpyAttributes attributes{};
+        attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+        attributes.flags          = cudaMemcpyFlagPreferOverlapWithCompute;
+        std::size_t attribute_index = 0;
+        CUDA_CHECK(cudaMemcpyBatchAsync(destinations, sources, sizes, 4, &attributes,
+                                        &attribute_index, 1, stream));
+    } else {
+        CUDA_CHECK(cudaMemcpyAsync(fetch.x.data(), hidden.data,
+                                   fetch.x.size() * sizeof(std::uint16_t),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(fetch.residual.data(), residual.data,
+                                   fetch.residual.size() * sizeof(std::uint16_t),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(fetch.ids.data(), routes.ids.data,
+                                   fetch.ids.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost,
+                                   stream));
+        CUDA_CHECK(cudaMemcpyAsync(fetch.coefficients.data(), routes.coefficients.data,
+                                   fetch.coefficients.size() * sizeof(float),
+                                   cudaMemcpyDeviceToHost, stream));
+    }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     if (std::getenv("NINFER_SPLIT_TIMING") != nullptr) {
         static double accumulated = 0.0;
@@ -456,7 +482,12 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
     auto host_term_span = workspace.alloc_bytes(handoff_term * sizeof(float));
     // port (sm_89): the merged read-back measured 4.66/4.88 ms per token against 4.05 for the four
     // copies, so it stays behind a switch; the device merge replaces join+merge+write and is on.
-    void* pack_device = std::getenv("NINFER_DMA_PACK") != nullptr ? pack_span.data : nullptr;
+    // port (sm_89): on by default. It trades three submissions for one pack kernel plus one
+    // transfer, which is less work even where the wall clock is inside this box's noise.
+    // NINFER_DMA_PACK=0 keeps the four copies for A/B.
+    static const bool pack_read_back = std::getenv("NINFER_DMA_PACK") == nullptr ||
+                                       std::getenv("NINFER_DMA_PACK")[0] != '0';
+    void* pack_device = pack_read_back ? pack_span.data : nullptr;
     void* host_term_device = std::getenv("NINFER_HOST_MERGE_CPU") != nullptr ? nullptr
                                                                            : host_term_span.data;
     std::optional<HostRoutedFetch> early;

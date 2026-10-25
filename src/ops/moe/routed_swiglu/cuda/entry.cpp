@@ -111,8 +111,8 @@ void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiG
             continue;
         }
         if (plan.integer.grouped) {
-            integer::launch_group_count(selection, subset, storage.groups, execution);
-            integer::launch_group_scan(selection, plan.integer.group, storage.groups, execution);
+            integer::launch_group_count_scan(selection, subset, plan.integer.group, storage.groups,
+                                             execution);
             if (plan.integer.group.adaptive) {
                 integer::launch_token_swiglu(input, profile, experts, selection, subset,
                                              term ? &*term : nullptr, mode, output,

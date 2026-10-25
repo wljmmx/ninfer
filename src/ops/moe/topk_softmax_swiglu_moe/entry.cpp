@@ -108,10 +108,12 @@ void topk_softmax_swiglu_moe(const Tensor& x, const MoeProfile& profile, const M
                               execution);
         if (plan.integer.grouped) {
             if (!plan.router.count_assignments) {
-                integer::launch_group_count(storage.routes, {}, storage.experts.groups, execution);
+                integer::launch_group_count_scan(storage.routes, {}, plan.integer.group,
+                                                 storage.experts.groups, execution);
+            } else {
+                integer::launch_group_scan(storage.routes, plan.integer.group, storage.experts.groups,
+                                           execution);
             }
-            integer::launch_group_scan(storage.routes, plan.integer.group, storage.experts.groups,
-                                       execution);
             if (plan.integer.group.adaptive) {
                 integer::launch_token_swiglu(input, p, weights.routed, storage.routes, {}, &shared,
                                              mode, output, plan.integer.token, storage.experts, {},

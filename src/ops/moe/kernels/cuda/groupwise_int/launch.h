@@ -68,6 +68,9 @@ void launch_group_scan(const ExpertRoutes& routes, const GroupedPlan& plan,
 void launch_group_index(const ExpertRoutes& routes, const GroupedStorage& storage,
                         CudaExecutionView execution);
 
+// port (sm_89): count and scan in one launch for a single-tile grouping (a decode step).
+void launch_group_count_scan(const ExpertRoutes& routes, ExpertSubset subset, const GroupedPlan& plan,
+                             const GroupedStorage& storage, CudaExecutionView execution);
 void launch_token_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
                          const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
                          ExpertSubset subset, const ScaledSwiGLUTerm* shared, MoeEpilogue epilogue,
