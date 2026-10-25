@@ -406,10 +406,18 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             // pool against 0.00 ms of upload, for about 3.2 experts a layer. Hold the set back to
             // `capacity - spill` and let this step's outside routes take the rest, where an upload
             // costs 0.12 ms against the CPU's 0.5.
-            static const std::uint32_t spill_percent = [] {
-                const char* value = std::getenv("NINFER_EXPERT_SPILL_PCT");
-                const auto percent = value != nullptr ? std::strtoul(value, nullptr, 10) : 15UL;
-                return static_cast<std::uint32_t>(std::min<std::uint64_t>(percent, 90));
+            // Measured across 4-12 GiB: holding 15% back is worth 5.4x at 4 GiB (a frozen set that
+            // takes every slot has nowhere to put the routes outside it, so they fall to the CPU at
+            // 0.5 ms each - 121 ms per token measured), and it is still the best policy up to 10 GiB.
+            // At 12 GiB the set covers 95.7% and the outside routes cost only 0.8 ms on the CPU, so
+            // filling the pool wins there (100.5 against 94.6 tok/s) - and a full, static table is
+            // what a per-layer graph needs anyway.
+            const std::uint32_t spill_percent = [&] {
+                if (const char* value = std::getenv("NINFER_EXPERT_SPILL_PCT")) {
+                    return static_cast<std::uint32_t>(
+                        std::min<std::uint64_t>(std::strtoul(value, nullptr, 10), 90));
+                }
+                return capacity >= 150 ? 0U : 15U;
             }();
             const auto spill = static_cast<std::size_t>(capacity) * spill_percent / 100;
             const auto pinned = capacity > spill ? capacity - spill : capacity;
