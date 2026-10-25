@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 
 namespace ninfer::ops::detail::moe_cpu::groupwise_int {
 namespace {
@@ -56,7 +57,11 @@ void launch(const Invocation& args, const Plan& plan, MemoryArena& arena,
               .down    = matrix_bank(args.experts.down),
               .scratch = allocate(arena, args.tokens, plan.token_block)};
     work.workers = static_cast<int>(execution.worker_count());
-    work.int8_path = std::getenv("NINFER_MOE_CPU_INT8") != nullptr;
+    // port (sm_89): the int8 row path is the default. It measured 1.70x on gate_up (0.491 -> 0.289
+    // ms/expert) for 0.145% of perplexity error against a 1% gate, and 18% off the CPU half of a
+    // split token. NINFER_MOE_CPU_INT8=0 keeps the float reference for the gate that compares both.
+    const char* int8_switch = std::getenv("NINFER_MOE_CPU_INT8");
+    work.int8_path = int8_switch == nullptr || std::strcmp(int8_switch, "0") != 0;
     if (plan.kernel->first_chunk == FirstChunkPreparation::Caller) {
         prepare_chunk(work, 0, std::min(args.tokens, plan.token_block));
     }
