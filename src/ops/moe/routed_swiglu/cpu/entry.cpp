@@ -150,9 +150,15 @@ void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
     if (subset.kind == ExpertSubsetKind::MaskOnes || subset.kind == ExpertSubsetKind::MaskZeros) {
         operands.tensor(subset.mask, DType::I32, {profile.experts}, "mask");
         mask = static_cast<const std::int32_t*>(subset.mask.data);
+        // port (sm_89): one pass over the words instead of one branch per expert. The mask is
+        // validated on every call - 40 times per split token - and a branch per entry was pure
+        // per-call overhead: the same check as a branchless or of `value & ~1` costs a few cycles
+        // per word and never mispredicts.
+        std::uint32_t non_binary = 0;
         for (int e = 0; e < profile.experts; ++e) {
-            require(mask[e] == 0 || mask[e] == 1, "routed_swiglu CPU: mask must be binary");
+            non_binary |= static_cast<std::uint32_t>(mask[e]) & ~std::uint32_t{1};
         }
+        require(non_binary == 0, "routed_swiglu CPU: mask must be binary");
     }
     const auto* ids          = static_cast<const std::int32_t*>(routes.ids.data);
     const auto* coefficients = static_cast<const float*>(routes.coefficients.data);
