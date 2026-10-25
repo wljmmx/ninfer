@@ -67,7 +67,9 @@ template <class Simd, int Bits, int K, int Rows, int Columns, class Input>
 inline void dot(const Matrix& matrix, const int (&rows)[Rows], const Input* const (&x)[Columns],
                 float (&out)[Rows][Columns]) noexcept {
     if constexpr (Bits == 5 && std::is_base_of_v<common::cpu::avx2::F32, Simd>) {
-        if (std::getenv("NINFER_MOE_CPU_Q5_NARROW") == nullptr) {
+        // Read once: getenv in the dispatch would run per expert, and this is an A/B knob.
+        static const bool narrow_q5 = std::getenv("NINFER_MOE_CPU_Q5_NARROW") != nullptr;
+        if (!narrow_q5) {
             dot_wide32<Simd, K, Rows, Columns, Input>(matrix, rows, x, out);
             return;
         }

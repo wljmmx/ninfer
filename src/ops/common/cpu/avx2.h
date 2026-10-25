@@ -135,19 +135,6 @@ inline void decode_signed_q32_q5(const std::uint8_t* code, const std::uint8_t* h
         out[2 * h]     = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(halves[h]));
         out[2 * h + 1] = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(halves[h], 8)));
     }
-    static const bool dump_decode = std::getenv("NINFER_MOE_CPU_DECODE_DUMP") != nullptr;
-    if (dump_decode) {
-        float wide[32], narrow[32];
-        for (int v = 0; v < 4; ++v) { _mm256_storeu_ps(wide + 8 * v, out[v]); }
-        for (int v = 0; v < 4; ++v) {
-            const auto one = decode_signed_q<5>(code + 4 * v, high + v);
-            _mm256_storeu_ps(narrow + 8 * v, one);
-        }
-        int bad = 0;
-        for (int i = 0; i < 32; ++i) { if (wide[i] != narrow[i]) { ++bad; } }
-        std::fprintf(stderr, "[decode] mismatch=%d wide0=%.0f narrow0=%.0f\n", bad, wide[0], narrow[0]);
-        for (int i = 0; i < 32 && bad != 0; ++i) { std::fprintf(stderr, "  i=%d wide=%.0f narrow=%.0f\n", i, wide[i], narrow[i]); }
-    }
 }
 
 } // namespace ninfer::ops::common::cpu::avx2
