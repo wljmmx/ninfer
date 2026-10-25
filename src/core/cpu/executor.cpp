@@ -3,6 +3,7 @@
 #include <immintrin.h>
 
 #include <algorithm>
+#include <chrono>
 #include <atomic>
 #include <cfenv>
 #include <limits>
@@ -13,20 +14,48 @@ namespace ninfer {
 namespace cpu_detail {
 namespace {
 
-constexpr std::uint32_t work_spin = 32768;
-// A cold team wakes unevenly. Keep early arrivals active while the other members wake,
-// instead of paying another park/wakeup cycle at each dependent computation stage.
+// Kept for the call sites: wait_changed() reads its budget from NINFER_CPU_SPIN_US now, and these
+// only record what the fixed counts were worth (about 0.35 ms of pauses).
+constexpr std::uint32_t work_spin    = 32768;
 constexpr std::uint32_t barrier_spin = 32768;
+
+// port (sm_89): the spin is a time budget, not an iteration count. A fixed 32768 pauses is ~0.35 ms
+// on this part, and a split layer hands the team work every 0.5-2 ms with the GPU half in between,
+// so the team parked on every layer and paid a futex wake on each one: the bench measures 0.084 ms
+// for a call back to back and 0.306 ms for the same call after a 250 us gap. Strata's pool spins
+// for 20 ms before it sleeps, which is why its workers never notice the gap; a budget in
+// microseconds keeps that idea tunable instead of hard-coding a cycle count.
+std::chrono::microseconds spin_budget() {
+    static const std::chrono::microseconds budget = [] {
+        const char* value = std::getenv("NINFER_CPU_SPIN_US");
+        // 20 ms is the value Strata ships (kSpinBeforeSleep); NINFER_CPU_SPIN_US=2000 is the
+        // low-power choice that still covers a decode layer.
+        const auto us     = value != nullptr ? std::atoll(value) : 20000;
+        return std::chrono::microseconds(std::max<std::int64_t>(0, us));
+    }();
+    return budget;
+}
 
 void wait_changed(const std::atomic<std::uint32_t>& value, std::uint32_t previous,
                   std::uint32_t spins, bool active_epoch = false) noexcept {
-    while (value.load(std::memory_order_acquire) == previous) {
-        for (std::uint32_t i = 0; i < spins; ++i) {
-            if (value.load(std::memory_order_acquire) != previous) return;
+    (void)spins;
+    const auto budget = spin_budget();
+    if (budget.count() > 0) {
+        const auto begin = std::chrono::steady_clock::now();
+        std::uint32_t pauses = 0;
+        while (value.load(std::memory_order_acquire) == previous) {
             _mm_pause();
+            // Reading the clock every 1024 pauses keeps the spin itself unchanged: one pause is
+            // tens of cycles, a clock read is a few dozen more.
+            if ((++pauses & 1023U) == 0 && std::chrono::steady_clock::now() - begin >= budget) {
+                break;
+            }
         }
-        if (!active_epoch || !(previous & 1U)) value.wait(previous, std::memory_order_acquire);
     }
+    while (value.load(std::memory_order_acquire) == previous) {
+        value.wait(previous, std::memory_order_acquire);
+    }
+    (void)active_epoch;
 }
 
 } // namespace
