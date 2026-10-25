@@ -107,6 +107,13 @@ private:
     bool frozen_ = false;
     std::uint64_t steps_ = 0;
     std::vector<std::uint32_t> frozen_wanted_;
+    // port (sm_89): a generation is a run of steps that shares one resident set. The set is rebuilt
+    // at a boundary (NINFER_EXPERT_GEN_STEPS, default 64) and held in between, which is what keeps
+    // the offset table still enough for a captured graph; coverage and churn are reported per
+    // generation so the steady state can be measured instead of assumed.
+    std::uint32_t steps_in_gen_ = 0;
+    std::uint32_t generation_   = 0;
+    std::vector<std::uint32_t> previous_wanted_;
     std::vector<ExpertCacheKey> keys_;
     std::vector<ExpertCacheKey> required_;
     // Per-expert byte offsets the kernel adds to each plane base. Uniform today, but the kernel

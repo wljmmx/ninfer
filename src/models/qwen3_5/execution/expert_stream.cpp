@@ -35,7 +35,9 @@ constexpr std::uint32_t kHotSetReorderPeriod = 32;
 std::uint32_t hot_decay_period() {
     static const std::uint32_t period = [] {
         const char* value = std::getenv("NINFER_EXPERT_DECAY_STEPS");
-        if (value == nullptr || *value == '\0') { return std::uint32_t{32}; }
+        // 256 steps is ~8x the old 32 (~64 tokens of memory): a conversation's hot set is stable
+        // over hundreds of tokens, and a short half-life chased the last few dozen instead.
+        if (value == nullptr || *value == '\0') { return std::uint32_t{256}; }
         return static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
     }();
     return period;
@@ -344,7 +346,38 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         // which is what Strata's profile does (h = 0.6447 over 4,105 of 24,576 slots against 0.4864
         // for compulsory fill). It never chases a single step, so the layout changes rarely, but it
         // only pays when the pool holds enough slots for the popular experts to cover most routes.
+        // port (sm_89): the set is rebuilt once per generation and held in between. 0 restores the
+        // old per-step behaviour.
+        static const std::int32_t generation_steps = [] {
+            const char* value = std::getenv("NINFER_EXPERT_GEN_STEPS");
+            // Measured worse at both 8 and 12 GiB: rebuilding from a 64-step window churns half the
+            // set per generation and lands at 49% coverage against 78.5% for a converged profile, so
+            // the per-step streaming policy stays the default until the histogram is converged by
+            // other means. Set it to a step count to experiment.
+            return value != nullptr && *value != '\0' ? std::atoi(value) : 0;
+        }();
+        const bool generation_mode = generation_steps > 0;
         static const bool static_set = std::getenv("NINFER_EXPERT_STATIC") != nullptr;
+        if (generation_mode) {
+            if (steps_in_gen_ >= static_cast<std::uint32_t>(generation_steps)) {
+                if (generation_ > 0) {
+                    std::fprintf(stderr, "[gen] n=%u set=%zu churn=%zu\n", generation_,
+                                 previous_wanted_.size(),
+                                 static_cast<std::size_t>(std::count_if(
+                                     frozen_wanted_.begin(), frozen_wanted_.end(),
+                                     [&](std::uint32_t expert) {
+                                         return std::find(previous_wanted_.begin(),
+                                                          previous_wanted_.end(),
+                                                          expert) == previous_wanted_.end();
+                                     })));
+                }
+                previous_wanted_ = frozen_wanted_;
+                frozen_          = false;
+                steps_in_gen_    = 0;
+                ++generation_;
+            }
+            ++steps_in_gen_;
+        }
         // port (sm_89): a static set only pays once it stops moving. Ranking by decayed score on
         // every step keeps reshuffling the tail while the scores are still being learned, so the
         // set is frozen after a warm-up window: the first N tokens decide it and the rest of the
@@ -371,7 +404,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             wanted = frozen_wanted_;
             for (const auto expert : wanted) { chosen[expert] = true; }
         } else {
-            if (!static_set) {
+            if (!static_set && !generation_mode) {
                 for (std::size_t i = 0; i < values && wanted.size() < capacity; ++i) {
                     const auto expert = static_cast<std::uint32_t>(route_ids[i]);
                     if (chosen[expert]) { continue; }
@@ -392,6 +425,12 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                     chosen[expert] = true;
                     wanted.push_back(expert);
                 }
+            }
+            if (generation_mode) {
+                // Hold it for the generation: a set that changes per step cannot back a graph and
+                // makes every layer republish its offset table.
+                frozen_        = true;
+                frozen_wanted_ = wanted;
             }
             if (static_set && freeze_after > 0 &&
                 ++steps_ >= static_cast<std::uint64_t>(freeze_after)) {
