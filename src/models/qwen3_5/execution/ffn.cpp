@@ -104,8 +104,20 @@ void host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParameters& mo
     // port (sm_89): the CPU half is the whole cost of a split layer, so give it every physical
     // core the machine has instead of a fixed team of eight. A 24-core part was leaving two
     // thirds of its throughput unused.
-    static const auto cpu_team = std::max<std::size_t>(
-        1, cpu_worker_order(topology.info(), false).size());
+    // port (sm_89): Strata sizes its expert pool as `p_cores - 1` and lets the host thread keep the
+    // last core, because the thread that drives the GPU has to run somewhere. We hand the team every
+    // physical core and leave the driver to fight the spinners for the last one, which is a
+    // plausible reason the per-layer cost has a 5 ms tail on a 23 ms median. NINFER_CPU_TEAM_SIZE
+    // makes the trade measurable instead of a guess.
+    static const auto cpu_team = [] {
+        const auto selectable = cpu_worker_order(topology.info(), false).size();
+        const char* value = std::getenv("NINFER_CPU_TEAM_SIZE");
+        if (value != nullptr && *value != '\0') {
+            const auto wanted = static_cast<std::size_t>(std::strtoul(value, nullptr, 10));
+            return std::max<std::size_t>(1, std::min(wanted, selectable));
+        }
+        return std::max<std::size_t>(1, selectable);
+    }();
     static CpuExecutor executor(topology,
                                 plan_cpu_team(topology.info(), static_cast<std::uint32_t>(cpu_team)));
     const auto cpu = executor.execution_view();
