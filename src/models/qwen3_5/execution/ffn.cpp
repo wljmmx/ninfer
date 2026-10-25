@@ -137,7 +137,17 @@ void host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParameters& mo
     }();
     static CpuExecutor executor(topology,
                                 plan_cpu_team(topology.info(), static_cast<std::uint32_t>(cpu_team)));
-    const auto cpu = executor.execution_view();
+    // port (sm_89): the team is the cost of a split layer, not the kernel. With one or two experts
+    // a layer, 24 workers spend more time waking each other than computing: measured per token at a
+    // 480 MiB pool, 24 workers 38.9 ms of `cpu` against 13.0 ms for a team of four, and decode 9.7
+    // against 17.6 tok/s. So small work runs on a small team, wide work keeps the full one.
+    static constexpr std::size_t kSmallTeam    = 4;
+    static constexpr std::size_t kSmallExperts = 4;
+    static CpuExecutor small_executor(
+        topology, plan_cpu_team(topology.info(),
+                                static_cast<std::uint32_t>(std::min(kSmallTeam, cpu_team))));
+    const auto cpu       = executor.execution_view();
+    const auto cpu_small = small_executor.execution_view();
     // port (sm_89): the split path calls this collective once per layer, and a parked team costs a
     // wake plus two barrier turns each time. The bench that runs the same collective back to back
     // measures 0.05 ms per expert while the engine pays 0.15-0.3, and the difference is the wake,
@@ -192,8 +202,11 @@ void host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParameters& mo
     // CPU expert kernels, the wait for the Device term, the elementwise merge and the write-back.
     // The split path's cost is what decides whether holding experts at all beats host-only.
     const auto cpu_begin = std::chrono::steady_clock::now();
-    ops::routed_swiglu(x_cpu, moe.profile.routed, host->experts(ExpertBankId{moe.stream->bank_index()}), routes_cpu,
-                       subset, out_cpu, arena, cpu);
+    // A layer that hands the CPU a handful of experts runs on the small team; anything wider keeps
+    // every core, which is what prefill and the host-only path need.
+    const auto& cpu_view = wanted.size() <= kSmallExperts ? cpu_small : cpu;
+    ops::routed_swiglu(x_cpu, moe.profile.routed, host->experts(ExpertBankId{moe.stream->bank_index()}),
+                       routes_cpu, subset, out_cpu, arena, cpu_view);
     const auto cpu_ms = std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - cpu_begin).count();
     if (std::getenv("NINFER_HOST_DEBUG")) {
