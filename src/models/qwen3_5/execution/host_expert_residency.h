@@ -110,7 +110,13 @@ public:
             // expert * expert_stride inside it. Off by default: the addressing is only correct if
             // the bank is plane-major with a stride matching its own plane, so it stays behind a
             // switch until that has been verified against the PPL gate.
-            static const bool allow_direct = std::getenv("NINFER_HOST_DIRECT") != nullptr;
+            // port (sm_89): in-place addressing is the default now that both layouts resolve. The
+            // branch picks itself per bank - a fused bank has one object for the whole bank, a
+            // per-expert bank has one object per expert - and each one verifies its own layout
+            // before it is used, falling back to the copying path when the check fails.
+            // NINFER_HOST_COPY=1 forces the copying path, which is what the split gate compares
+            // against.
+            static const bool allow_direct = std::getenv("NINFER_HOST_COPY") == nullptr;
             if (allow_direct && gate_up_base != nullptr && down_base != nullptr &&
                 banks_[i].entry.count > 0) {
                 if (std::getenv("NINFER_HOST_DEBUG") != nullptr && i < 2) {
