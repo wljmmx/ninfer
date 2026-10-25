@@ -75,6 +75,12 @@ public:
                            DirectReadState& state) const;
     [[nodiscard]] std::size_t complete_direct_read(DirectReadState& state) const;
 
+    // port (sm_89): read-only view of the whole object, created on first use. A bank that lives in
+    // one object can then be addressed where it already is instead of being copied into an arena
+    // slot - the copy is what made the host tier pay 20 ms per layer. Null when the mapping fails,
+    // which keeps the copying path as the fallback.
+    [[nodiscard]] const std::byte* map_view() const;
+
 private:
     std::filesystem::path path_;
     // Buffered positional reads move the kernel file pointer, so concurrent read_exact callers
@@ -88,6 +94,8 @@ private:
     mutable int direct_fd_ = -1;
 #endif
     std::uint64_t bytes_   = 0;
+    mutable void* mapping_      = nullptr; // HANDLE, read-only file mapping
+    mutable const std::byte* view_ = nullptr; // MapViewOfFile base
 };
 
 } // namespace ninfer::artifact

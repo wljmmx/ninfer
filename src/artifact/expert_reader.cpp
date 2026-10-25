@@ -52,4 +52,17 @@ void ArtifactExpertReader::read_entry(const ExpertFileEntry& entry,
     }
 }
 
+const std::byte* ArtifactExpertReader::object_base(std::uint32_t object_index) const {
+    if (object_index >= files_.size()) { return nullptr; }
+    auto& file = files_[object_index];
+    if (!file) {
+        try {
+            file = reader_.open_file(object_index);
+        } catch (const std::exception&) {
+            return nullptr;
+        }
+    }
+    return file ? file->map_view() : nullptr;
+}
+
 } // namespace ninfer::artifact

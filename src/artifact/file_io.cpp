@@ -126,11 +126,31 @@ InputFile::InputFile(std::filesystem::path path) : path_(std::move(path)) {
 
 InputFile::~InputFile() {
 #ifdef _WIN32
+    if (view_ != nullptr) { ::UnmapViewOfFile(view_); }
+    if (mapping_ != nullptr) { ::CloseHandle(static_cast<HANDLE>(mapping_)); }
     if (direct_file_ != nullptr) { ::CloseHandle(static_cast<HANDLE>(direct_file_)); }
     if (file_ != nullptr) { ::CloseHandle(static_cast<HANDLE>(file_)); }
 #else
     if (direct_fd_ >= 0) { ::close(direct_fd_); }
     if (fd_ >= 0) { ::close(fd_); }
+#endif
+}
+
+const std::byte* InputFile::map_view() const {
+#ifdef _WIN32
+    if (view_ == nullptr && mapping_ == nullptr && file_ != nullptr && bytes_ > 0) {
+        // Read-only, whole file, demand-paged: nothing is read until a slot is actually touched,
+        // which is what makes this cheap next to copying every expert into the arena.
+        mapping_ = ::CreateFileMappingW(static_cast<HANDLE>(file_), nullptr, PAGE_READONLY, 0, 0,
+                                        nullptr);
+        if (mapping_ != nullptr) {
+            view_ = static_cast<const std::byte*>(
+                ::MapViewOfFile(static_cast<HANDLE>(mapping_), FILE_MAP_READ, 0, 0, 0));
+        }
+    }
+    return view_;
+#else
+    return nullptr;
 #endif
 }
 

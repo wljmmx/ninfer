@@ -68,8 +68,15 @@ public:
     const std::byte* object_base(std::uint32_t object_index) const override {
         try {
             const auto bytes = model_.host_bytes(artifact::ObjectHandle{object_index});
+            if (std::getenv("NINFER_HOST_DEBUG") != nullptr) {
+                std::fprintf(stderr, "[obj] index=%u empty=%d size=%zu\n", object_index,
+                             int(bytes.empty()), bytes.size());
+            }
             return bytes.empty() ? nullptr : bytes.data();
-        } catch (const std::exception&) {
+        } catch (const std::exception& error) {
+            if (std::getenv("NINFER_HOST_DEBUG") != nullptr) {
+                std::fprintf(stderr, "[obj] index=%u threw %s\n", object_index, error.what());
+            }
             return nullptr;
         }
     }

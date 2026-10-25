@@ -21,6 +21,11 @@ public:
 
     void read_entry(const ExpertFileEntry& entry, std::span<std::byte> destination) const override;
 
+    // port (sm_89): map the object on demand and hand back its base, so a bank that occupies one
+    // object can be read where it already is. Without this the host tier copies every expert it
+    // needs into its arena, which measured 20 ms per layer against 0.5 ms of CPU work.
+    [[nodiscard]] const std::byte* object_base(std::uint32_t object_index) const override;
+
     [[nodiscard]] const Reader& reader() const noexcept { return reader_; }
 
 private:

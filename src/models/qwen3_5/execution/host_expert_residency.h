@@ -90,9 +90,38 @@ public:
                 one_object && reader_ != nullptr
                     ? reader_->object_base(bank_files.experts.front().chunks.back().file_index)
                     : nullptr;
-            if (gate_up_base != nullptr && down_base != nullptr &&
-                banks_[i].gate_up_layout.region.count == banks_[i].entry.count &&
-                banks_[i].down_layout.region.count == banks_[i].entry.count) {
+            if (std::getenv("NINFER_HOST_DEBUG") != nullptr && i < 2) {
+                std::fprintf(stderr,
+                             "[direct] bank=%zu one=%d count=%zu base=%p/%p\n", i, int(one_object),
+                             banks_[i].entry.count, static_cast<const void*>(gate_up_base),
+                             static_cast<const void*>(down_base));
+            }
+            // A bank that fits in one object can be addressed in place. The gate is the pair of
+            // bases: a non-null base means the object was mapped, and the bank's experts sit at
+            // expert * expert_stride inside it. Off by default: the addressing is only correct if
+            // the bank is plane-major with a stride matching its own plane, so it stays behind a
+            // switch until that has been verified against the PPL gate.
+            static const bool allow_direct = std::getenv("NINFER_HOST_DIRECT") != nullptr;
+            if (allow_direct && gate_up_base != nullptr && down_base != nullptr &&
+                banks_[i].entry.count > 0) {
+                if (std::getenv("NINFER_HOST_DEBUG") != nullptr && i < 2) {
+                    const auto& gl = banks_[i].gate_up_layout;
+                    const auto& dl = banks_[i].down_layout;
+                    std::fprintf(stderr,
+                                 "[direct-layout] gu off=%llu stride=%llu plane=%llu | dn off=%llu "
+                                 "stride=%llu plane=%llu | entry=%llu bytes=%llu/%llu geom=%llu/%llu\n",
+                                 (unsigned long long)gl.codes.offset,
+                                 (unsigned long long)gl.codes.expert_stride,
+                                 (unsigned long long)gl.codes.expert_bytes,
+                                 (unsigned long long)dl.codes.offset,
+                                 (unsigned long long)dl.codes.expert_stride,
+                                 (unsigned long long)dl.codes.expert_bytes,
+                                 (unsigned long long)banks_[i].entry.entry_bytes,
+                                 (unsigned long long)banks_[i].entry.codes.offset,
+                                 (unsigned long long)banks_[i].entry.down_codes.offset,
+                                 (unsigned long long)banks_[i].gate_up_geometry.bytes,
+                                 (unsigned long long)banks_[i].down_geometry.bytes);
+                }
                 direct_[i] = true;
                 s.gate_up_parent.geometry = banks_[i].gate_up_geometry;
                 s.gate_up_parent.device = Device::cpu();
