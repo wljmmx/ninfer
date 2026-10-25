@@ -20,6 +20,10 @@ public:
     explicit ArtifactExpertReader(std::filesystem::path path);
 
     void read_entry(const ExpertFileEntry& entry, std::span<std::byte> destination) const override;
+    // port (sm_89): the host tier reads the same expert again and again across steps, so it goes
+    // through the buffered handle and lets the OS keep the artifact hot.
+    void read_entry_cached(const ExpertFileEntry& entry,
+                           std::span<std::byte> destination) const override;
 
     // port (sm_89): map the object on demand and hand back its base, so a bank that occupies one
     // object can be read where it already is. Without this the host tier copies every expert it

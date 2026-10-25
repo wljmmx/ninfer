@@ -13,7 +13,7 @@ namespace ninfer::artifact {
 
 ArtifactExpertReader::ArtifactExpertReader(std::filesystem::path path)
     : reader_(std::move(path)), files_(reader_.directory().files.size()),
-      mode_(expert_read_mode(reader_.path())) {}
+      mode_(expert_read_mode(reader_.path(), reader_.file_bytes())) {}
 
 void ArtifactExpertReader::read_entry(const ExpertFileEntry& entry,
                                       std::span<std::byte> destination) const {
@@ -49,6 +49,29 @@ void ArtifactExpertReader::read_entry(const ExpertFileEntry& entry,
         } else {
             file->read_exact(chunk.file_offset, span);
         }
+    }
+}
+
+void ArtifactExpertReader::read_entry_cached(const ExpertFileEntry& entry,
+                                            std::span<std::byte> destination) const {
+    if (destination.size() < entry.image_bytes) {
+        throw std::invalid_argument("expert entry image exceeds its destination");
+    }
+    for (const auto& chunk : entry.chunks) {
+        if (chunk.file_index >= files_.size()) {
+            throw std::invalid_argument("expert chunk names an absent artifact file");
+        }
+        if (chunk.image_offset > entry.image_bytes ||
+            chunk.bytes > entry.image_bytes - chunk.image_offset) {
+            throw std::invalid_argument("expert chunk lies outside its entry image");
+        }
+        auto& file = files_[chunk.file_index];
+        if (!file) { file = reader_.open_file(chunk.file_index); }
+        // read_exact always goes through the buffered handle, whatever NINFER_EXPERT_IO selected
+        // for the streaming tier. A hit is a memcpy out of the standby list.
+        file->read_exact(chunk.file_offset,
+                         destination.subspan(static_cast<std::size_t>(chunk.image_offset),
+                                             static_cast<std::size_t>(chunk.bytes)));
     }
 }
 

@@ -56,6 +56,14 @@ public:
         (void)object_index;
         return nullptr;
     }
+    // port (sm_89): read through the OS page cache instead of around it. The Device uploader reads
+    // an expert once and drops it, so bypassing the cache is right there; a tier that reads the same
+    // expert again on the next step wants the opposite, and on this machine the difference is 8.6 ms
+    // against 0.2 ms for the same 1.8 MiB. Sources that have no second path keep the plain read.
+    virtual void read_entry_cached(const ExpertFileEntry& entry,
+                                   std::span<std::byte> destination) const {
+        read_entry(entry, destination);
+    }
 };
 
 } // namespace ninfer

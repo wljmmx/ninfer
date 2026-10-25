@@ -75,7 +75,21 @@ bool volume_incurs_seek_penalty(const std::filesystem::path& path) {
 #endif
 }
 
-ReadMode expert_read_mode(const std::filesystem::path& path) {
+bool artifact_fits_in_page_cache(std::uint64_t bytes) {
+#ifdef _WIN32
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    if (bytes == 0 || ::GlobalMemoryStatusEx(&status) == 0) { return false; }
+    // Leave half the machine to the process itself: weights, KV, the pinned host arena and whatever
+    // else is running. 22.8 GB of 64 GB qualifies; a 118 GB model on the same box does not.
+    return bytes <= status.ullTotalPhys / 2;
+#else
+    (void)bytes;
+    return false;
+#endif
+}
+
+ReadMode expert_read_mode(const std::filesystem::path& path, std::uint64_t artifact_bytes) {
     const bool seeks = volume_incurs_seek_penalty(path);
     if (const char* value = std::getenv("NINFER_EXPERT_IO")) {
         if (std::strcmp(value, "buffered") == 0) { return ReadMode::Buffered; }
@@ -83,7 +97,14 @@ ReadMode expert_read_mode(const std::filesystem::path& path) {
             return seeks ? ReadMode::Buffered : ReadMode::Direct;
         }
     }
-    return seeks ? ReadMode::Buffered : ReadMode::Direct;
+    if (seeks) { return ReadMode::Buffered; }
+    // port (sm_89): a model that fits in RAM should be read through the page cache. An expert the
+    // split path reads again on the next step then costs a memcpy (0.2 ms per 1.8 MiB) instead of a
+    // physical read (8.6 ms) - measured 14 ms against 560-830 ms of ensure per token on the 35B
+    // artifact. Reading around the cache only pays when the working set cannot be held, which is the
+    // 118 GB model on a 64 GB box; that case keeps the uncached path.
+    if (artifact_fits_in_page_cache(artifact_bytes)) { return ReadMode::Buffered; }
+    return ReadMode::Direct;
 }
 
 InputFile::InputFile(std::filesystem::path path) : path_(std::move(path)) {

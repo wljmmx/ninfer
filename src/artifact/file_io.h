@@ -21,7 +21,10 @@ enum class ReadMode : std::uint8_t { Buffered, Direct };
 
 // NINFER_EXPERT_IO=buffered|direct overrides; "direct" is still demoted to buffered on a volume
 // with a seek penalty, because unbuffered I/O cannot benefit from read-ahead there.
-[[nodiscard]] ReadMode expert_read_mode(const std::filesystem::path& path);
+// `artifact_bytes` is the whole model: a model that fits in RAM is worth caching, one that does not
+// gains nothing from the page cache and would evict everything else.
+[[nodiscard]] ReadMode expert_read_mode(const std::filesystem::path& path,
+                                        std::uint64_t artifact_bytes = 0);
 
 // State for one in-flight aligned direct read. Windows keeps a OVERLAPPED op
 // with its own manual-reset event so several reads can be issued concurrently
