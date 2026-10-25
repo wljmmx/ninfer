@@ -101,6 +101,10 @@ private:
     // used to replace all eight experts on every token and make the hot set useless.
     std::vector<float> hot_score_;
     std::vector<std::uint32_t> resident_order_;
+    // port (sm_26): whether this bank's resident set has ever been built. A prefill is not allowed to
+    // choose the set, but the first call has to, or a cold start would route everything to the host
+    // tier and never establish one.
+    bool set_initialised_ = false;
     std::uint32_t since_decay_   = 0;
     std::uint32_t since_reorder_ = 0;
     // port (sm_89): a warm-up then a frozen set, so a static policy stops re-ranking per step.

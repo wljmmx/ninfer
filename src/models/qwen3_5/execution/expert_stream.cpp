@@ -495,7 +495,27 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                              capacity);
             }
         }
-        if (cache_->set_resident_experts(bank_, wanted)) {
+        // port (sm_26): a prefill routes (nearly) every expert of a layer, so letting it choose the
+        // resident set evicts exactly the hot set decode needs. llama.cpp's MoE cache draws the same
+        // line for the same reason - large batches only read the cache, never fill it. Above the
+        // decode batch size the set stays as decode left it, and routes outside it take the host
+        // tier, which prefill would pay to read either way.
+        //
+        // The first call still builds the set: with nothing resident every route would fall to the
+        // host tier and a cold prefill would never establish one.
+        //
+        // A pool that cannot hold a layer's prefill routes gains nothing from protecting the set:
+        // the prefill fills what little there is with experts decode will not ask for, and decode
+        // then pays a host read for the one or two it misses. Measured at a 512 MiB pool: 32.1 ->
+        // 24.3 tok/s and prefill 3.4 -> 5.0 s. Above roughly a hundred slots a layer the prefill
+        // set is broad enough to be a good decode set, and the same change measured 59-62 -> 72.5
+        // at 12 GiB.
+        constexpr std::int32_t kSetUpdateTokens   = 8;
+        constexpr std::uint32_t kPrefillProtectMin = 96;
+        const bool refresh = !set_initialised_ || tokens <= kSetUpdateTokens ||
+                             capacity < kPrefillProtectMin;
+        if (refresh && cache_->set_resident_experts(bank_, wanted)) {
+            set_initialised_ = true;
             std::fill(offsets_.begin(), offsets_.end(), 0);
             mask_host_.assign(count_, 0);
             for (std::uint32_t expert = 0; expert < count_; ++expert) {
