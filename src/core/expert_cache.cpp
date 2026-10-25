@@ -109,6 +109,17 @@ struct ExpertCache::Impl {
     // True when experts come from the artifact and therefore pass through the shared staging
     // buffer, whose slots cannot be reused until their copy has landed.
     bool staging_needed = false;
+    // Which path each upload actually took, so the timing can say what the collect phase was
+    // doing instead of inferring it from a constructor flag.
+    std::uint64_t stat_direct = 0;
+    std::uint64_t stat_staged = 0;
+    // Reused across layers. Allocating these per call looked free and was not: a split layer pays
+    // the upload turn forty times a token, and on this allocator seventy-two entries of scratch is
+    // most of the collect budget on a layer that only has one expert to move.
+    std::vector<UploadOp> upload_ops;
+    std::vector<void*> upload_destinations;
+    std::vector<const void*> upload_sources;
+    std::vector<std::size_t> upload_sizes;
     // port (sm_89): the pool is a VMM reservation rather than one cudaMalloc, so whole segments can
     // be handed back to the driver while the pool is alive. Every expert offset indexes into this
     // reservation, so shrinking the pool never moves a published entry.
@@ -454,6 +465,7 @@ struct ExpertCache::Impl {
             // names the slices, so the transfer goes straight from host memory to the pool.
             std::vector<ExpertBlobSpan> direct;
             if (file_reader->spans(*file, direct) && !direct.empty()) {
+                ++stat_direct;
                 for (const auto& span : direct) {
                     if (span.image_offset > file->image_bytes ||
                         span.bytes > file->image_bytes - span.image_offset) {
@@ -487,6 +499,7 @@ struct ExpertCache::Impl {
                                   staging_slot * max_entry_bytes;
                 file_reader->read_entry(
                     *file, {host_base, static_cast<std::size_t>(file->image_bytes)});
+                ++stat_staged;
                 if (batch != nullptr) {
                     batch->push_back({base, host_base, static_cast<std::size_t>(file->image_bytes)});
                     entry.ready    = true;
@@ -577,8 +590,8 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
     if (stream == nullptr) { stream = impl_->upload_stream; }
     const auto timing_begin = std::chrono::steady_clock::now();
     std::size_t staged = 0;
-    std::vector<Impl::UploadOp> batch;
-    batch.reserve(Impl::kUploadBatch * 6);
+    auto& batch = impl_->upload_ops;
+    batch.clear();
     for (const auto& key : impl_->required) {
         const auto& entry = impl_->entries[impl_->index(key)];
         if (entry.ready) { continue; }
@@ -595,12 +608,12 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
     if (!batch.empty()) {
         bool submitted = false;
         if (stream != nullptr && batch.size() > 1) {
-            std::vector<void*> destinations;
-            std::vector<const void*> sources;
-            std::vector<std::size_t> sizes;
-            destinations.reserve(batch.size());
-            sources.reserve(batch.size());
-            sizes.reserve(batch.size());
+            auto& destinations = impl_->upload_destinations;
+            auto& sources      = impl_->upload_sources;
+            auto& sizes        = impl_->upload_sizes;
+            destinations.clear();
+            sources.clear();
+            sizes.clear();
             for (const auto& op : batch) {
                 destinations.push_back(op.destination);
                 sources.push_back(op.source);
@@ -649,14 +662,24 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
         acc[0] += elapsed(timing_begin, collect_begin);
         acc[1] += elapsed(collect_begin, timing_end);
         acc[2] += static_cast<double>(batch.size());
+        static std::uint64_t seen_direct = 0, seen_staged = 0;
+        const auto direct_now = impl_->stat_direct;
+        const auto staged_now = impl_->stat_staged;
+        const auto direct_delta = direct_now - seen_direct;
+        const auto staged_delta = staged_now - seen_staged;
+        seen_direct = direct_now;
+        seen_staged = staged_now;
         if (++calls % 40 == 0) {
             std::fprintf(stderr,
                          "[upload] collect=%.3fms submit=%.3fms ops=%.1f per layer "
-                         "(staged=%d)\n",
+                         "direct=%.1f staged=%.1f\n",
                          acc[0] / 40.0, acc[1] / 40.0, acc[2] / 40.0,
-                         impl_->staging_needed ? 1 : 0);
+                         static_cast<double>(direct_delta) / 40.0,
+                         static_cast<double>(staged_delta) / 40.0);
             acc[0] = acc[1] = acc[2] = 0.0;
         }
+        (void)direct_delta;
+        (void)staged_delta;
     }
     return {staged, false};
 }
