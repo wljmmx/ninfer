@@ -113,6 +113,7 @@ struct ExpertCache::Impl {
     // doing instead of inferring it from a constructor flag.
     std::uint64_t stat_direct = 0;
     std::uint64_t stat_staged = 0;
+    std::uint64_t stat_views  = 0;
     // Reused across layers. Allocating these per call looked free and was not: a split layer pays
     // the upload turn forty times a token, and on this allocator seventy-two entries of scratch is
     // most of the collect budget on a layer that only has one expert to move.
@@ -515,6 +516,7 @@ struct ExpertCache::Impl {
             }
         } else {
             const auto& view = views[key.bank];
+            ++stat_views;
             if (!view.gate_up.valid() || !view.down.valid()) {
                 throw std::runtime_error("expert has neither an artifact entry nor a Host replica");
             }
@@ -665,20 +667,24 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
         double layer_bytes = 0.0;
         for (const auto& op : batch) { layer_bytes += static_cast<double>(op.bytes); }
         acc[3] += layer_bytes;
-        static std::uint64_t seen_direct = 0, seen_staged = 0;
+        static std::uint64_t seen_direct = 0, seen_staged = 0, seen_views = 0;
         const auto direct_now = impl_->stat_direct;
         const auto staged_now = impl_->stat_staged;
+        const auto views_now  = impl_->stat_views;
         const auto direct_delta = direct_now - seen_direct;
         const auto staged_delta = staged_now - seen_staged;
+        const auto views_delta  = views_now - seen_views;
         seen_direct = direct_now;
         seen_staged = staged_now;
+        seen_views  = views_now;
         if (++calls % 40 == 0) {
             std::fprintf(stderr,
                          "[upload] collect=%.3fms submit=%.3fms ops=%.1f mb=%.2f per layer "
-                         "direct=%.1f staged=%.1f\n",
+                         "direct=%.1f staged=%.1f views=%.1f\n",
                          acc[0] / 40.0, acc[1] / 40.0, acc[2] / 40.0, acc[3] / 40.0 / 1048576.0,
                          static_cast<double>(direct_delta) / 40.0,
-                         static_cast<double>(staged_delta) / 40.0);
+                         static_cast<double>(staged_delta) / 40.0,
+                         static_cast<double>(views_delta) / 40.0);
             acc[0] = acc[1] = acc[2] = acc[3] = 0.0;
         }
         (void)direct_delta;

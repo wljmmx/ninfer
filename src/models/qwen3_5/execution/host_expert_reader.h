@@ -18,7 +18,7 @@ public:
         for (const auto& chunk : entry.chunks) {
             const auto bytes = model_.host_bytes(artifact::ObjectHandle{chunk.file_index});
             if (std::getenv("NINFER_EXPERT_TRACE")) {
-                std::fprintf(stderr, "host chunk obj=%u off=%llu bytes=%llu image=%llu host=%zu\\n",
+                std::fprintf(stderr, "host chunk obj=%u off=%llu bytes=%llu image=%llu host=%zu\n",
                              chunk.file_index, static_cast<unsigned long long>(chunk.file_offset),
                              static_cast<unsigned long long>(chunk.bytes),
                              static_cast<unsigned long long>(chunk.image_offset), bytes.size());
