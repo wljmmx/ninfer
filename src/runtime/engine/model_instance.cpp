@@ -42,9 +42,13 @@ using models::qwen3_5::execution::RoutedMoeParameters;
 
 // port (sm_89): collect the routed banks that were declared as streamed.
 void collect_streams(const models::qwen3_5::execution::FfnParameters& ffn,
-                     std::vector<ExpertStream*>& out) {
+                     std::vector<ExpertStream*>& out, std::uint32_t& routed_top_k) {
     if (const auto* moe = std::get_if<RoutedMoeParameters>(&ffn); moe != nullptr && moe->stream) {
         out.push_back(moe->stream.get());
+        // How many experts one token routes inside one bank. The host budget below is a working-set
+        // bound, and the routed count is what makes it one.
+        routed_top_k = std::max(routed_top_k,
+                                static_cast<std::uint32_t>(moe->profile.routed.top_k));
     }
 }
 
@@ -89,9 +93,12 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
                                     DeviceContext& device, std::size_t kv_reserve_bytes) {
     ExpertPlacement placement;
     std::vector<ExpertStream*> streams;
-    for (const auto& layer : instance.parameters.text.layers) { collect_streams(layer.ffn, streams); }
+    std::uint32_t routed_top_k = 0;
+    for (const auto& layer : instance.parameters.text.layers) {
+        collect_streams(layer.ffn, streams, routed_top_k);
+    }
     if (instance.parameters.mtp) {
-        collect_streams(instance.parameters.mtp->ffn, streams);
+        collect_streams(instance.parameters.mtp->ffn, streams, routed_top_k);
     }
     if (streams.empty()) {
         // A dense model has no routed bank; the switch then simply does nothing.
@@ -207,30 +214,45 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     expert_debug("attached", instance.expert_cache->capacity_bytes(),
                  instance.expert_cache->windows());
     // port (sm_89): one line that makes the expert tier observable without a debugger.
-    // Size the host tier from the working set, not from the model. What the CPU half can usefully
-    // hold is the experts the Device pool does not keep resident, multiplied by how many tokens of
-    // them are worth caching: a layer revisits the same experts within the next few tokens, and a
-    // working set that outgrows that only spreads the same accesses over more pages (see the arena
-    // note below). Everything colder belongs to the artifact. This keeps the number honest for a
-    // 118 GB model too, where one token's working set is several GB and "all missing experts" is
-    // over a hundred.
-    constexpr std::uint64_t kWorkingSetTokens = 4;
+    // Size the host tier from what one pass actually reads. The CPU half of a split layer computes
+    // every routed expert the pool does not keep, and a prefill of many tokens routes (nearly) every
+    // expert of the layer, so one layer can touch the whole non-resident part of a bank - not just
+    // the top-k of a decode step. Two layers of that is the floor the arena needs: one call must
+    // never evict its own slots, and a second layer of headroom keeps the next call from throwing
+    // away what the previous one still points at.
+    //
+    // Everything colder than that is served by the artifact, and on a machine where the model fits
+    // in RAM the OS page cache absorbs it - which is why the arena no longer has to be sized to the
+    // model. Measured: 600 MiB of arena and 4 GiB of arena give the same 14 ms of ensure per token
+    // once the reads go through the cache.
+    //
+    // The routed top-k is printed beside it because it is the decode-side working set: at one token
+    // the CPU reads top_k - kept per layer, which is why the same arena is mostly idle in decode and
+    // full in prefill.
     std::uint64_t host_want = 0;
+    std::uint64_t host_kept = 0;
+    std::uint64_t host_layer = 0;
     for (const auto& bank : requirements.banks) {
         if (bank.resident) { continue; }
-        const auto resident = std::min<std::uint64_t>(instance.expert_cache->resident_capacity(),
-                                                      bank.count);
-        host_want += (static_cast<std::uint64_t>(bank.count) - resident) *
-                     instance.expert_cache->slot_bytes() * kWorkingSetTokens;
+        const auto kept = std::min<std::uint64_t>(
+            instance.expert_cache->resident_capacity(), static_cast<std::uint64_t>(routed_top_k));
+        host_kept += kept;
+        host_layer = std::max<std::uint64_t>(host_layer, std::uint64_t{bank.count} - kept);
     }
-    std::fprintf(stderr, "[experts] banks=%zu slot=%llu windows=%llu pool=%lluMiB host=%d arena=%lluMiB want=%lluMiB\n",
+    constexpr std::uint64_t kLayerHeadroom = 2;
+    host_want = host_layer * kLayerHeadroom * instance.expert_cache->slot_bytes();
+    std::fprintf(stderr,
+                 "[experts] banks=%zu slot=%llu windows=%llu pool=%lluMiB host=%d arena=%lluMiB "
+                 "want=%lluMiB top_k=%u kept=%llu layer=%llu\n",
                  streams.size(),
                  static_cast<unsigned long long>(instance.expert_cache->slot_bytes()),
                  static_cast<unsigned long long>(instance.expert_cache->windows()),
                  static_cast<unsigned long long>(instance.expert_cache->capacity_bytes() >> 20),
                  int(instance.expert_host_source != nullptr),
                  static_cast<unsigned long long>(host_expert_arena_bytes(host_want) >> 20),
-                 static_cast<unsigned long long>(host_want >> 20));
+                 static_cast<unsigned long long>(host_want >> 20), routed_top_k,
+                 static_cast<unsigned long long>(host_kept),
+                 static_cast<unsigned long long>(host_layer));
     // A pool that cannot hold a layer hands the remainder to the host tier: one arena, the same
     // uniform slot images the Device pool uses, filled on demand.
     bool short_pool = false;
@@ -257,7 +279,8 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
                              bank_geometry(streams[i]->gate_up_expert_geometry(),
                                            streams[i]->count()),
                              bank_geometry(streams[i]->down_expert_geometry(),
-                                           streams[i]->count())});
+                                           streams[i]->count()),
+                             streams[i]->per_expert_objects()});
         }
         auto residency = std::make_unique<models::qwen3_5::execution::HostExpertResidency>(
             descs, files, source, host_expert_arena_bytes(host_want));
@@ -282,8 +305,15 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     const auto streamed = placement.total_experts > placement.gpu_experts
                               ? placement.total_experts - placement.gpu_experts
                               : 0;
-    placement.host_experts = instance.expert_host_source != nullptr ? streamed : 0;
-    placement.file_experts = instance.expert_host_source != nullptr ? 0 : streamed;
+    // port (sm_89): these two numbers describe different things and used to overwrite each other.
+    // host_experts is the RAM cache in front of the source (set where the residency is built);
+    // file_experts is how many experts of the model the pool has no slot for. Reporting the second
+    // as the first made a healthy 4 GiB host tier read as `host_claim=0 (arena is smaller)`.
+    placement.file_experts = streamed;
+    if (instance.expert_host_residency) {
+        placement.host_experts =
+            static_cast<std::uint64_t>(instance.expert_host_residency->slot_capacity());
+    }
     return placement;
 }
 
@@ -569,9 +599,8 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
         if (placement.total_experts != 0) {
             constexpr double kMib = 1024.0 * 1024.0;
             std::fprintf(stderr,
-                         "[budget] experts: gpu=%llu (%.0f MiB) host_claim=%llu (%.0f MiB of "
-                         "artifact, arena is smaller) "
-                         "file=%llu of %llu, slot %.0f KiB; kv: %u pages, %.0f MiB reserved\n",
+                         "[budget] experts: gpu=%llu (%.0f MiB) host_cache=%llu slots (%.0f MiB) "
+                         "unslotted=%llu of %llu, slot %.0f KiB; kv: %u pages, %.0f MiB reserved\n",
                          static_cast<unsigned long long>(placement.gpu_experts),
                          static_cast<double>(placement.gpu_experts * placement.slot_bytes) / kMib,
                          static_cast<unsigned long long>(placement.host_experts),

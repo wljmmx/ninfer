@@ -31,6 +31,11 @@ struct HostExpertBankDesc {
     WeightBankLayout down_layout;
     WeightGeometry gate_up_geometry;
     WeightGeometry down_geometry;
+    // port (sm_89): true when the artifact gives every expert its own object. It has to be carried
+    // here: a per-expert artifact may still pack all those objects into one container file, so the
+    // chunk's file index cannot tell the two layouts apart. Keying on it made an e2 bank report
+    // `one=1` and would have addressed expert e as `base + e * stride` - the wrong image entirely.
+    bool per_expert = false;
 };
 
 // The host half of a split expert tier. It reserves one arena up front, commits it slot by slot,
@@ -74,8 +79,11 @@ public:
             // per-expert layout spreads the bank over one object per expert, which a single parent
             // cannot describe, so it keeps the arena path.
             const auto& bank_files = i < files_.size() ? files_[i] : ExpertFileBank{};
+            // A per-expert bank never qualifies, whatever its container looks like: its experts are
+            // separate objects, and one parent can only describe one of them.
             const bool one_object =
-                !bank_files.experts.empty() && !bank_files.experts.front().chunks.empty() &&
+                !banks_[i].per_expert && !bank_files.experts.empty() &&
+                !bank_files.experts.front().chunks.empty() &&
                 std::all_of(bank_files.experts.begin(), bank_files.experts.end(),
                             [&](const ExpertFileEntry& entry) {
                                 return !entry.chunks.empty() &&
@@ -92,7 +100,8 @@ public:
                     : nullptr;
             if (std::getenv("NINFER_HOST_DEBUG") != nullptr && i < 2) {
                 std::fprintf(stderr,
-                             "[direct] bank=%zu one=%d count=%zu base=%p/%p\n", i, int(one_object),
+                             "[direct] bank=%zu one=%d per_expert=%d count=%u base=%p/%p\n", i,
+                             int(one_object), int(banks_[i].per_expert),
                              banks_[i].entry.count, static_cast<const void*>(gate_up_base),
                              static_cast<const void*>(down_base));
             }
@@ -167,13 +176,26 @@ public:
         // Addressed in place: the weights are already where the kernels read them.
         if (bank.index < direct_.size() && direct_[bank.index]) { return; }
         auto& s = state_[bank.index];
+        // port (sm_89): a call that wants more experts than the arena has slots would evict the
+        // slots it just filled, and the offsets handed back would name another expert's bytes. That
+        // is silent corruption, not a slowdown, so it fails here instead. A 1-slot arena turned a
+        // split PPL of 7.766 into 1131 before this check existed.
+        if (experts.size() > slot_capacity_) {
+            throw std::runtime_error("host expert arena: one layer needs " +
+                                     std::to_string(experts.size()) + " slots but the arena holds " +
+                                     std::to_string(slot_capacity_) +
+                                     "; raise NINFER_EXPERT_HOST_ARENA_MB");
+        }
         for (const auto value : experts) {
             if (resident_mask != nullptr && resident_mask[value] == 0) { continue; }
             const auto expert = static_cast<std::uint32_t>(value);
             auto& slot        = s.slot_of[expert];
             if (slot == kNone) {
+                ++stats_.misses;
                 slot = claim(bank.index, expert);
                 load(bank.index, expert, slot);
+            } else {
+                ++stats_.hits;
             }
             slot_last_use_[slot] = ++epoch_;
             const auto base      = std::uint64_t{slot} * slot_bytes_;
@@ -187,6 +209,17 @@ public:
     }
     [[nodiscard]] std::uint64_t slot_bytes() const noexcept { return slot_bytes_; }
     [[nodiscard]] std::uint32_t slot_capacity() const noexcept { return slot_capacity_; }
+
+    // port (sm_89): what the arena actually did. A split run is only cheap when `miss` stops
+    // growing: a miss is an artifact read, a hit is a byte range that was already in RAM. Reported
+    // from the split timing line so "experts are not resident, so there is no cache" is a number
+    // rather than an inference.
+    struct Stats {
+        std::uint64_t hits      = 0;
+        std::uint64_t misses    = 0;
+        std::uint64_t evictions = 0;
+    };
+    [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
 
 private:
     static constexpr std::uint32_t kNone = 0xffffffffu;
@@ -264,6 +297,7 @@ private:
             }
         }
         if (coldest == 0) { throw std::runtime_error("host expert arena: nothing to evict"); }
+        ++stats_.evictions;
         state_[slot_bank_[victim]].slot_of[slot_expert_[victim]] = kNone;
         slot_bank_[victim]   = bank;
         slot_expert_[victim] = expert;
@@ -300,7 +334,11 @@ private:
                             static_cast<std::size_t>(slice.bytes));
             }
         } else {
-            reader_->read_entry(entry, {destination, static_cast<std::size_t>(slot_bytes_)});
+            // port (sm_89): the arena is the first-level cache and the OS page cache is the second.
+            // Reading around the cache made every miss a physical read (8.6 ms per 1.8 MiB slot),
+            // which was the whole cost of a split decode step; through the cache the same miss is a
+            // memcpy out of RAM (0.2 ms). Measured 14 ms per token of ensure against 560-830 ms.
+            reader_->read_entry_cached(entry, {destination, static_cast<std::size_t>(slot_bytes_)});
         }
         // One arena base for every bank; the per-plane tables carry the slot origin.
         state_[bank].gate_up_parent.data = base;
@@ -345,6 +383,7 @@ private:
     std::vector<std::uint32_t> slot_bank_, slot_expert_;
     std::vector<std::uint64_t> slot_last_use_;
     std::uint64_t epoch_ = 0;
+    Stats stats_{};
 };
 
 } // namespace ninfer::models::qwen3_5::execution

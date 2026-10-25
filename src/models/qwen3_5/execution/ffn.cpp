@@ -215,10 +215,15 @@ void host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParameters& mo
                       std::chrono::steady_clock::now() - write_begin).count();
         acc[4] += ensure_ms;
         if (++calls % 40 == 0) {
+            const auto& stats = host->stats();
             std::fprintf(stderr,
                          "[host] cpu=%.2fms join=%.2fms merge=%.2fms write=%.2fms ensure=%.2fms "
-                         "per token\n",
-                         acc[0], acc[1], acc[2], acc[3], acc[4]);
+                         "per token; arena=%u slots %lluKiB hit=%llu miss=%llu evict=%llu\n",
+                         acc[0], acc[1], acc[2], acc[3], acc[4], host->slot_capacity(),
+                         static_cast<unsigned long long>(host->slot_bytes() >> 10),
+                         static_cast<unsigned long long>(stats.hits),
+                         static_cast<unsigned long long>(stats.misses),
+                         static_cast<unsigned long long>(stats.evictions));
             for (double& value : acc) { value = 0.0; }
         }
     }
