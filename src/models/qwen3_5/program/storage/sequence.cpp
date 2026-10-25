@@ -259,9 +259,29 @@ std::vector<std::uint32_t> keep_pages_from_scores(const KVExecutionTablePool& ta
     std::vector<std::uint32_t> host_recents(static_cast<std::size_t>(rows), 0u);
     std::vector<std::uint32_t> host_peaks(static_cast<std::size_t>(rows), 0u);
     const std::size_t bytes = static_cast<std::size_t>(rows) * sizeof(std::uint32_t);
-    CUDA_CHECK(cudaMemcpyAsync(host_counts.data(), counts.data, bytes, cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpyAsync(host_recents.data(), recents.data, bytes, cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpyAsync(host_peaks.data(), peaks.data, bytes, cudaMemcpyDeviceToHost, stream));
+    // port (sm_89): three independent slices on one stream, so one batch submission replaces three.
+    // The caller synchronises immediately after, which is what makes the batch the right shape: the
+    // whole cost here is submission, not transfer.
+    {
+        void* const       destinations[3] = {host_counts.data(), host_recents.data(),
+                                             host_peaks.data()};
+        const void* const sources[3]      = {counts.data, recents.data, peaks.data};
+        const std::size_t sizes[3]        = {bytes, bytes, bytes};
+        cudaMemcpyAttributes attributes{};
+        attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+        attributes.flags          = 0;
+        std::size_t attribute_index = 0;
+        const auto submitted        = cudaMemcpyBatchAsync(destinations, sources, sizes, 3,
+                                                           &attributes, &attribute_index, 1, stream);
+        if (submitted != cudaSuccess) {
+            CUDA_CHECK(
+                cudaMemcpyAsync(host_counts.data(), counts.data, bytes, cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(host_recents.data(), recents.data, bytes,
+                                       cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(
+                cudaMemcpyAsync(host_peaks.data(), peaks.data, bytes, cudaMemcpyDeviceToHost, stream));
+        }
+    }
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Candidates: pages the window does not already keep. Sink pages and the newest `window_pages`

@@ -86,6 +86,15 @@ struct ExpertCache::Impl {
     // each image would otherwise pay its own cudaStreamSynchronize (~2.5 ms of WDDM submission on
     // sm_89). The staging buffer therefore holds one slot image per batch position.
     static constexpr std::size_t kUploadBatch = 4;
+    // port (sm_89): one layer's uploads are independent copies - distinct slots, distinct sources,
+    // one direction - so the batch API can submit them as one. A submission costs ~10 us on this
+    // driver whatever its size, and a split layer makes up to a dozen of them; the batch form also
+    // lets the driver order them against each other instead of the host ordering them in turn.
+    struct UploadOp {
+        void* destination  = nullptr;
+        const void* source = nullptr;
+        std::size_t bytes  = 0;
+    };
     // port (sm_89): smallest hot set a bank keeps when the pool cannot hold whole layers. One
     // decode step routes top_k=8 experts, so 8 lets every layer coexist even in a tiny pool; a
     // narrower window than that cannot hold one step's route and would thrash.
@@ -407,7 +416,7 @@ struct ExpertCache::Impl {
     }
 
     void upload_one(ExpertCacheKey key, cudaStream_t stream, bool settle = true,
-                    std::size_t staging_slot = 0) {
+                    std::size_t staging_slot = 0, std::vector<UploadOp>* batch = nullptr) {
         const auto& bank = banks[key.bank];
         auto& entry = entries[index(key)];
         const auto slot = slot_of[key.bank][key.expert];
@@ -448,6 +457,10 @@ struct ExpertCache::Impl {
                         span.bytes > file->image_bytes - span.image_offset) {
                         throw std::runtime_error("expert span lies outside its entry image");
                     }
+                    if (batch != nullptr) {
+                        batch->push_back({base + span.image_offset, span.source, span.bytes});
+                        continue;
+                    }
                     const auto copied =
                         cudaMemcpyAsync(base + span.image_offset, span.source,
                                         static_cast<std::size_t>(span.bytes),
@@ -456,7 +469,7 @@ struct ExpertCache::Impl {
                         throw std::runtime_error(cudaGetErrorString(copied));
                     }
                 }
-                if (settle) {
+                if (batch == nullptr && settle) {
                     const auto settled = cudaStreamSynchronize(stream);
                     if (settled != cudaSuccess) {
                         throw std::runtime_error(cudaGetErrorString(settled));
@@ -472,6 +485,13 @@ struct ExpertCache::Impl {
                                   staging_slot * max_entry_bytes;
                 file_reader->read_entry(
                     *file, {host_base, static_cast<std::size_t>(file->image_bytes)});
+                if (batch != nullptr) {
+                    batch->push_back({base, host_base, static_cast<std::size_t>(file->image_bytes)});
+                    entry.ready    = true;
+                    entry.last_use = ++epoch;
+                    ++uploads;
+                    return;
+                }
                 const auto status =
                     cudaMemcpyAsync(base, host_base, static_cast<std::size_t>(file->image_bytes),
                                     cudaMemcpyHostToDevice, stream);
@@ -490,6 +510,10 @@ struct ExpertCache::Impl {
                 if (span.device != Device::cpu() || span.bytes != region.bytes) {
                     throw std::runtime_error("expert cache source is not a matching Host plane");
                 }
+                if (batch != nullptr) {
+                    batch->push_back({base + region.offset, span.data, region.bytes});
+                    return;
+                }
                 const auto status = cudaMemcpyAsync(base + region.offset, span.data, region.bytes,
                                                     cudaMemcpyHostToDevice, stream);
                 if (status != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(status)); }
@@ -500,7 +524,7 @@ struct ExpertCache::Impl {
             copy(ExpertPlaneKind::Codes, bank.down_codes, true);
             copy(ExpertPlaneKind::High, bank.down_high, true);
             copy(ExpertPlaneKind::Scales, bank.down_scales, true);
-            if (settle) { (void)cudaStreamSynchronize(stream); }
+            if (batch == nullptr && settle) { (void)cudaStreamSynchronize(stream); }
         }
         entry.ready    = true;
         entry.last_use = ++epoch;
@@ -550,14 +574,55 @@ std::optional<std::uint32_t> ExpertCache::expert_slot(std::uint32_t bank,
 ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
     if (stream == nullptr) { stream = impl_->upload_stream; }
     std::size_t staged = 0;
+    std::vector<Impl::UploadOp> batch;
+    batch.reserve(Impl::kUploadBatch * 6);
     for (const auto& key : impl_->required) {
         const auto& entry = impl_->entries[impl_->index(key)];
         if (entry.ready) { continue; }
         if (staged == Impl::kUploadBatch) { break; }
-        impl_->upload_one(key, stream, false, staged);
+        impl_->upload_one(key, stream, false, staged, &batch);
         ++staged;
     }
     if (staged == 0) { return {0, true}; }
+    // port (sm_89): the batch these were collected into is one submission instead of one per
+    // slice. The copies are independent by construction - a slot, a source and a direction each -
+    // so the batch's unspecified internal order changes nothing, and the kernel that reads them is
+    // queued behind the whole batch on this stream.
+    if (!batch.empty()) {
+        bool submitted = false;
+        if (stream != nullptr && batch.size() > 1) {
+            std::vector<void*> destinations;
+            std::vector<const void*> sources;
+            std::vector<std::size_t> sizes;
+            destinations.reserve(batch.size());
+            sources.reserve(batch.size());
+            sizes.reserve(batch.size());
+            for (const auto& op : batch) {
+                destinations.push_back(op.destination);
+                sources.push_back(op.source);
+                sizes.push_back(op.bytes);
+            }
+            cudaMemcpyAttributes attributes{};
+            attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+            attributes.flags          = cudaMemcpyFlagPreferOverlapWithCompute;
+            std::size_t attribute_index = 0;
+            const auto status           = cudaMemcpyBatchAsync(
+                destinations.data(), sources.data(), sizes.data(), batch.size(), &attributes,
+                &attribute_index, 1, stream);
+            submitted = status == cudaSuccess;
+            if (!submitted && status != cudaErrorNotSupported && status != cudaErrorInvalidValue) {
+                throw std::runtime_error(cudaGetErrorString(status));
+            }
+        }
+        if (!submitted) {
+            for (const auto& op : batch) {
+                const auto status =
+                    cudaMemcpyAsync(op.destination, op.source, op.bytes, cudaMemcpyHostToDevice,
+                                    stream);
+                if (status != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(status)); }
+            }
+        }
+    }
     // port (sm_89): the artifact path stages through one pinned buffer per batch position, so the
     // next batch would overwrite an image that is still being copied. The Host-replica path copies
     // straight out of the arena and needs no barrier; its copies are ordered by the consumer stream

@@ -497,22 +497,45 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         }
         if (cache_->set_resident_experts(bank_, wanted)) {
             std::fill(offsets_.begin(), offsets_.end(), 0);
-            std::vector<std::int32_t> mask(count_, 0);
+            mask_host_.assign(count_, 0);
             for (std::uint32_t expert = 0; expert < count_; ++expert) {
                 const auto slot = cache_->expert_slot(bank_, expert);
                 if (!slot) { continue; }
-                offsets_[expert] = static_cast<std::uint64_t>(*slot) * cache_->slot_bytes();
-                mask[expert]     = 1;
+                offsets_[expert]         = static_cast<std::uint64_t>(*slot) * cache_->slot_bytes();
+                mask_host_[expert]       = 1;
             }
-            mask_host_      = mask;
             resident_order_ = wanted;
             const auto table_bytes = offsets_.size() * sizeof(std::uint64_t);
+            const auto mask_bytes  = mask_host_.size() * sizeof(std::int32_t);
             // Async on the consumer stream: the kernels that read these tables are queued behind
             // them there, while a blocking copy would stall the host twice per layer.
-            (void)cudaMemcpyAsync(offsets_device_->p, offsets_.data(), table_bytes,
-                                  cudaMemcpyHostToDevice, stream);
-            (void)cudaMemcpyAsync(mask_device_->p, mask.data(), mask.size() * sizeof(std::int32_t),
-                                  cudaMemcpyHostToDevice, stream);
+            // port (sm_89): both tables change together and neither is ordered against the other,
+            // so one batch submission replaces two. At 2 KiB and 1 KiB the copies are entirely
+            // submission-bound (a 4-slice batch of this size measured 2.1x the loop form), and a
+            // layer pays for them forty times a token. The sources are host vectors rewritten on
+            // the next layer, so they keep stream ordering: the driver must not read them later.
+            // The mask must be the member buffer, not a local: an async copy out of a local vector
+            // outlives the scope that owns it, which is a use-after-free that only shows up as a
+            // resident set that is occasionally one layer stale.
+            if (table_bytes != 0 && mask_bytes != 0) {
+                void* const       destinations[2] = {offsets_device_->p, mask_device_->p};
+                const void* const sources[2]      = {offsets_.data(), mask_host_.data()};
+                const std::size_t sizes[2]        = {table_bytes, mask_bytes};
+                cudaMemcpyAttributes attributes{};
+                attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+                attributes.flags          = 0;
+                std::size_t attribute_index = 0;
+                const auto submitted        = cudaMemcpyBatchAsync(
+                    destinations, sources, sizes, 2, &attributes, &attribute_index, 1, stream);
+                // A driver that rejects the batch still has to get the tables across: fall back to
+                // the two copies rather than leaving the layer with a stale resident set.
+                if (submitted != cudaSuccess) {
+                    (void)cudaMemcpyAsync(offsets_device_->p, offsets_.data(), table_bytes,
+                                          cudaMemcpyHostToDevice, stream);
+                    (void)cudaMemcpyAsync(mask_device_->p, mask_host_.data(), mask_bytes,
+                                          cudaMemcpyHostToDevice, stream);
+                }
+            }
         }
     }
     const auto layout_ms =

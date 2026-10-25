@@ -679,9 +679,59 @@ TransferWork DeviceKVPagePool::copy_page(DeviceKVPageHandle source, DeviceKVPage
     const std::int32_t source_index      = physical_index(source);
     const std::int32_t destination_index = physical_index(destination);
     if (source_index == destination_index) { return {}; }
+    // port (sm_89): the per-plane copies are independent (distinct plane, one direction), so they
+    // go out as one submission. A page copy is small enough that the submission dominates it, and
+    // the same reasoning the host-transfer path already uses (one 3D batch instead of a 2D copy per
+    // page) applies one level down.
+    const bool page_major = spec_.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor;
+    std::vector<void*>       destinations;
+    std::vector<const void*> sources;
+    std::vector<std::size_t> sizes;
+    std::vector<cudaMemcpy3DBatchOp> ops;
+    destinations.reserve(planes_.size());
+    sources.reserve(planes_.size());
+    sizes.reserve(planes_.size());
+    ops.reserve(planes_.size());
     for (const Tensor& plane : planes_) {
         auto* base = static_cast<unsigned char*>(plane.data);
-        if (spec_.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor) {
+        if (page_major) {
+            destinations.push_back(base + static_cast<std::int64_t>(destination_index) * plane.nb[3]);
+            sources.push_back(base + static_cast<std::int64_t>(source_index) * plane.nb[3]);
+            sizes.push_back(static_cast<std::size_t>(plane.nb[3]));
+            continue;
+        }
+        cudaMemcpy3DBatchOp op{};
+        op.src.type             = cudaMemcpyOperandTypePointer;
+        op.src.op.ptr.ptr       = base + static_cast<std::int64_t>(source_index) * plane.nb[2];
+        op.src.op.ptr.rowLength = static_cast<std::size_t>(plane.nb[3]);
+        op.dst.type             = cudaMemcpyOperandTypePointer;
+        op.dst.op.ptr.ptr = base + static_cast<std::int64_t>(destination_index) * plane.nb[2];
+        op.dst.op.ptr.rowLength = static_cast<std::size_t>(plane.nb[3]);
+        op.extent               = make_cudaExtent(static_cast<std::size_t>(plane.nb[2]),
+                                                 static_cast<std::size_t>(plane.ne[3]), 1);
+        op.srcAccessOrder       = cudaMemcpySrcAccessOrderStream;
+        op.flags                = 0;
+        ops.push_back(op);
+    }
+    bool submitted = false;
+    if (page_major && sizes.size() > 1) {
+        cudaMemcpyAttributes attributes{};
+        attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+        attributes.flags          = 0;
+        std::size_t attribute_index = 0;
+        submitted                   = cudaMemcpyBatchAsync(destinations.data(), sources.data(),
+                                                           sizes.data(), sizes.size(), &attributes,
+                                                           &attribute_index, 1,
+                                                           stream) == cudaSuccess;
+    } else if (!page_major && ops.size() > 1) {
+        submitted = cudaMemcpy3DBatchAsync(ops.size(), ops.data(), 0, stream) == cudaSuccess;
+    }
+    if (submitted) { return device_copy_work(1); }
+    // The batch is an optimisation over these; a driver that declines it still has to move the
+    // page, so fall back to the per-plane form.
+    for (const Tensor& plane : planes_) {
+        auto* base = static_cast<unsigned char*>(plane.data);
+        if (page_major) {
             CUDA_CHECK(
                 cudaMemcpyAsync(base + static_cast<std::int64_t>(destination_index) * plane.nb[3],
                                 base + static_cast<std::int64_t>(source_index) * plane.nb[3],

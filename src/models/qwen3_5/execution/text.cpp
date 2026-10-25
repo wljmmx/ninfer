@@ -501,10 +501,24 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
                                 static_cast<std::size_t>(T - 1) * column_bytes;
             const auto* ah_src = static_cast<const unsigned char*>(ah.data) +
                                  static_cast<std::size_t>(T - 1) * column_bytes;
-            CUDA_CHECK(
-                cudaMemcpyAsync(x_last.data, x_src, column_bytes, cudaMemcpyDeviceToDevice, s));
-            CUDA_CHECK(
-                cudaMemcpyAsync(ah_last.data, ah_src, column_bytes, cudaMemcpyDeviceToDevice, s));
+            // port (sm_89): the two slices are independent and share a stream, so one batch
+            // submission replaces two. Both are sub-megabyte, which is where the submission cost
+            // dominates the transfer.
+            void* const       destinations[2] = {x_last.data, ah_last.data};
+            const void* const sources[2]      = {x_src, ah_src};
+            const std::size_t sizes[2]        = {column_bytes, column_bytes};
+            cudaMemcpyAttributes attributes{};
+            attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+            attributes.flags          = 0;
+            std::size_t attribute_index = 0;
+            const auto submitted        = cudaMemcpyBatchAsync(destinations, sources, sizes, 2,
+                                                               &attributes, &attribute_index, 1, s);
+            if (submitted != cudaSuccess) {
+                CUDA_CHECK(
+                    cudaMemcpyAsync(x_last.data, x_src, column_bytes, cudaMemcpyDeviceToDevice, s));
+                CUDA_CHECK(
+                    cudaMemcpyAsync(ah_last.data, ah_src, column_bytes, cudaMemcpyDeviceToDevice, s));
+            }
         }
     }
 
@@ -528,13 +542,13 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
             last_rope_position = rope_positions.slice(0, T - 1, 1);
         } else {
             last_rope_position = work_.alloc(DType::I32, {1, 3});
-            for (int axis = 0; axis < 3; ++axis) {
-                const auto* src = static_cast<const std::int32_t*>(rope_positions.data) +
-                                  static_cast<std::size_t>(axis) * T + (T - 1);
-                auto* dst = static_cast<std::int32_t*>(last_rope_position.data) + axis;
-                CUDA_CHECK(
-                    cudaMemcpyAsync(dst, src, sizeof(std::int32_t), cudaMemcpyDeviceToDevice, s));
-            }
+            // port (sm_89): the three axes are one column of the [3, T] position tensor, so this is
+            // a single pitched copy instead of three four-byte submissions.
+            const auto* axes_base =
+                static_cast<const std::int32_t*>(rope_positions.data) + (T - 1);
+            CUDA_CHECK(cudaMemcpy2DAsync(last_rope_position.data, sizeof(std::int32_t), axes_base,
+                                         static_cast<std::size_t>(T) * sizeof(std::int32_t),
+                                         sizeof(std::int32_t), 3, cudaMemcpyDeviceToDevice, s));
         }
         text_rope(last_rope_position, *config_.rope_parameters, qn, ctx_.execution_view());
 
