@@ -75,6 +75,13 @@ HostRoutedFetch fetch_host_routed(const Tensor& hidden, const ops::ExpertRoutes&
     fetch.residual.resize(static_cast<std::size_t>(cols) * tokens);
     fetch.ids.resize(static_cast<std::size_t>(top_k) * tokens);
     fetch.coefficients.resize(static_cast<std::size_t>(top_k) * tokens);
+    // The transfer itself, per token: decode speed is too noisy on this box to resolve a few
+    // tenths of a millisecond, and this line is what a change here has to move.
+    const auto fetch_begin = std::chrono::steady_clock::now();
+    // port (sm_89): four independent transfers. cudaMemcpyBatchAsync (CUDA 13, with the 13.4
+    // cudaMemcpyFlagPreferOverlapWithCompute hint) merges them into one submission and measured
+    // 5.77/5.83 ms per token against 5.66/5.73 for the four calls: the cost is the synchronise at
+    // the end, not the submission count, so the batch form was reverted rather than kept.
     CUDA_CHECK(cudaMemcpyAsync(fetch.x.data(), hidden.data, fetch.x.size() * sizeof(std::uint16_t),
                                cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaMemcpyAsync(fetch.residual.data(), residual.data,
@@ -87,6 +94,16 @@ HostRoutedFetch fetch_host_routed(const Tensor& hidden, const ops::ExpertRoutes&
                                fetch.coefficients.size() * sizeof(float), cudaMemcpyDeviceToHost,
                                stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (std::getenv("NINFER_SPLIT_TIMING") != nullptr) {
+        static double accumulated = 0.0;
+        static std::uint64_t calls = 0;
+        accumulated += std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - fetch_begin).count();
+        if (++calls % 40 == 0) {
+            std::fprintf(stderr, "[fetch] %.2fms per token\n", accumulated);
+            accumulated = 0.0;
+        }
+    }
     return fetch;
 }
 
