@@ -256,7 +256,7 @@ bool ExpertStream::fully_resident() const noexcept {
 }
 
 bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32_t tokens,
-                          cudaStream_t stream) {
+                          cudaStream_t stream, const std::int32_t* host_ids) {
     if (cache_ == nullptr) { throw std::logic_error("expert stream is not attached"); }
     // port (sm_89): every layer is resident, so the window cannot move and the routers do not need
     // to be read back. Rebasing is the whole per-layer work, and it happens during capture so the
@@ -281,22 +281,34 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     const auto bytes  = values * sizeof(std::int32_t);
     // port (sm_89): the host must know the routed experts before it can publish them, so one
     // pinned staging buffer carries the route IDs back and the caller then waits on the stream.
-    if (!route_staging_ || route_staging_->size() < bytes) {
+    // port (sm_89): the caller may already have the routes on the host - the split path reads back
+    // the layer's inputs in one batch, and the 32 route ids are part of it. Taking them from there
+    // drops one full stream synchronise and one duplicate copy per layer, which was 40 x ~0.3 ms of
+    // the split token.
+    if (host_ids == nullptr && (!route_staging_ || route_staging_->size() < bytes)) {
         route_staging_ = std::make_unique<PinnedHostBuffer>(bytes);
     }
     // port (sm_89): NINFER_SPLIT_TIMING separates the per-layer cost into the routing read-back,
     // the layout update (resident set + mask/offset tables) and the upload, because the split
     // path's fixed cost is what decides whether holding experts at all pays.
     const bool timing = std::getenv("NINFER_SPLIT_TIMING") != nullptr;
-    const auto stage_begin = std::chrono::steady_clock::now();
-    const auto status =
-        cudaMemcpyAsync(route_staging_->data(), device_ids, bytes, cudaMemcpyDeviceToHost, stream);
-    if (status != cudaSuccess) { throw std::runtime_error(std::string("route copy: ") + cudaGetErrorString(status)); }
-    const auto sync = cudaStreamSynchronize(stream);
-    if (sync != cudaSuccess) { throw std::runtime_error(std::string("route sync: ") + cudaGetErrorString(sync)); }
-    const auto route_ms =
-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage_begin).count();
-    const auto* route_ids = static_cast<const std::int32_t*>(route_staging_->data());
+    double route_ms   = 0.0;
+    const std::int32_t* route_ids = host_ids;
+    if (route_ids == nullptr) {
+        const auto stage_begin = std::chrono::steady_clock::now();
+        const auto status     = cudaMemcpyAsync(route_staging_->data(), device_ids, bytes,
+                                                cudaMemcpyDeviceToHost, stream);
+        if (status != cudaSuccess) {
+            throw std::runtime_error(std::string("route copy: ") + cudaGetErrorString(status));
+        }
+        const auto sync = cudaStreamSynchronize(stream);
+        if (sync != cudaSuccess) {
+            throw std::runtime_error(std::string("route sync: ") + cudaGetErrorString(sync));
+        }
+        route_ms  = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                             stage_begin).count();
+        route_ids = static_cast<const std::int32_t*>(route_staging_->data());
+    }
     const auto layout_begin = std::chrono::steady_clock::now();
 
     // Port (sm_89): every routed expert must be resident before the consumer runs, so the

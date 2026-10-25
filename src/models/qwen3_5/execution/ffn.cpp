@@ -275,15 +275,25 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
     } catch (const std::exception& error) {
         throw std::invalid_argument(std::string("expert stream route: ") + error.what());
     }
+    // port (sm_89): one read-back per layer. The residency decision needs the 32 route ids and the
+    // CPU half needs the layer inputs; they come down in the same batch with one stream synchronise.
+    // The split path used to pay two - a 32-byte copy inside ensure and the inputs here - and that
+    // was 40 x ~0.3 ms of the token on this driver.
+    std::optional<HostRoutedFetch> early;
+    if (!moe.stream->fully_resident()) {
+        early.emplace(fetch_host_routed(hidden, routes, residual, execution.stream));
+    }
     try {
-        if (!moe.stream->ensure(ids.data, routed.top_k, columns, execution.stream)) {
+        if (!moe.stream->ensure(ids.data, routed.top_k, columns, execution.stream,
+                                early ? early->ids.data() : nullptr)) {
             // The pool cannot hold this layer: the shared expert still runs on the device (subset
             // None touches only the shared term), and the routed term moves to the host tier.
             // Keep the shared term in FP32 so that the host fallback can fold it into the same
             // residual rounding the device epilogue performs once per layer.
             // Take the inputs the CPU half needs before the Device half is launched, so the two
             // can then run concurrently.
-            auto fetch       = fetch_host_routed(hidden, routes, residual, execution.stream);
+            auto fetch = early ? std::move(*early)
+                               : fetch_host_routed(hidden, routes, residual, execution.stream);
             auto shared_f32 = workspace.alloc(DType::FP32, {hidden.ne[0], columns});
             MemoryArena shared_arena(MemorySpan{scratch.data, scratch.bytes, execution.device()});
             ops::routed_swiglu(hidden, routed, moe.stream->experts(), routes,
@@ -301,7 +311,7 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
         // Split layer: the pool holds the experts this layer routes to most, the host tier covers
         // the rest. Both halves land in FP32 and are folded into the residual once, so a split
         // layer rounds exactly like a resident or a fully hosted one.
-        auto fetch      = fetch_host_routed(hidden, routes, residual, execution.stream);
+        auto fetch      = std::move(*early);
         auto mixed_f32 = workspace.alloc(DType::FP32, {hidden.ne[0], columns});
         MemoryArena mixed_arena(MemorySpan{scratch.data, scratch.bytes, execution.device()});
         const auto mask_host = moe.stream->resident_mask_host();

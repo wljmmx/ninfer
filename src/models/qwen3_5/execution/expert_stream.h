@@ -35,7 +35,7 @@ public:
     // false when the pool cannot hold one whole layer at all; the caller then owns the decision
     // (today it raises, later it can fall back to the host tier).
     bool ensure(const void* device_ids, std::int32_t top_k, std::int32_t tokens,
-                cudaStream_t stream);
+                cudaStream_t stream, const std::int32_t* host_ids = nullptr);
 
     [[nodiscard]] const ops::CudaSwiGLUExperts& experts() const noexcept { return experts_; }
     [[nodiscard]] std::uint32_t bank_index() const noexcept { return bank_; }
