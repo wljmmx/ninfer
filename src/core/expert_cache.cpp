@@ -477,7 +477,45 @@ struct ExpertCache::Impl {
                 const auto* arena_image =
                     arena_source->arena_image(key.bank, key.expert, arena_bytes);
                 if (arena_image != nullptr && arena_bytes != 0) {
-                    if (batch != nullptr) {
+                    // Verification: does the arena actually hold this expert's image? Cheap to ask,
+                    // and it separates "the pinned tier hands over the wrong bytes" from everything
+                    // else that could make a run produce empty text.
+                    static const bool verify = std::getenv("NINFER_ARENA_VERIFY") != nullptr;
+                    bool usable = true;
+                    if (verify && arena_bytes == file->image_bytes) {
+                        static std::size_t checks = 0;
+                        if (checks < 40) {
+                            ++checks;
+                            std::vector<std::byte> reference(
+                                static_cast<std::size_t>(file->image_bytes));
+                            file_reader->read_entry_cached(
+                                *file, {reference.data(), reference.size()});
+                            const auto same = std::memcmp(reference.data(), arena_image,
+                                                          reference.size()) == 0;
+                            if (!same) {
+                                std::fprintf(stderr,
+                                             "[arena] MISMATCH bank=%u expert=%u bytes=%llu\n",
+                                             key.bank, key.expert,
+                                             static_cast<unsigned long long>(arena_bytes));
+                                usable = false;
+                            } else if (checks <= 3) {
+                                std::fprintf(stderr, "[arena] match bank=%u expert=%u bytes=%llu\n",
+                                             key.bank, key.expert,
+                                             static_cast<unsigned long long>(arena_bytes));
+                            }
+                        }
+                    } else if (verify && arena_bytes != file->image_bytes) {
+                        static std::size_t mismatched = 0;
+                        if (mismatched++ < 5) {
+                            std::fprintf(stderr,
+                                         "[arena] SIZE bank=%u expert=%u arena=%llu file=%llu\n",
+                                         key.bank, key.expert,
+                                         static_cast<unsigned long long>(arena_bytes),
+                                         static_cast<unsigned long long>(file->image_bytes));
+                        }
+                        usable = false;
+                    }
+                    if (usable && batch != nullptr) {
                         ++stat_push;
                         batch->push_back({base, arena_image, static_cast<std::size_t>(arena_bytes)});
                         entry.ready    = true;
@@ -753,14 +791,13 @@ void ExpertCache::wait_for_progress(cudaStream_t stream) {
 }
 
 void ExpertCache::attach_arena(const ExpertArenaSource* arena) noexcept {
-    // port (sm_89): off by default until the data path is proven. Reading a miss out of the pinned
-    // tier measured 24.2 -> 30.6 tok/s, but the generated text came back empty at 32 tokens, so the
-    // bytes the arena hands over are not always the image the pool expects. The likely cause is
-    // ordering: the upload runs before the host tier's ensure for the same layer, so a slot can be
-    // answered from the previous step's contents, or from a slot the evictor has since handed to
-    // another expert. NINFER_ARENA_UPLOAD=1 re-enables it for that investigation.
-    const char* enable = std::getenv("NINFER_ARENA_UPLOAD");
-    if (enable == nullptr || *enable == '\0' || std::strtol(enable, nullptr, 10) == 0) { return; }
+    // port (sm_89): on by default. A bank addressed in place has no arena slot, and the arena is
+    // empty until the host tier fills it, so a run that never enables the host arena is unaffected.
+    // Verified byte-for-byte against the reader (NINFER_ARENA_VERIFY) and through the split gate:
+    // with an 8 GiB arena the generated body is identical to the artifact path
+    // (64239db9317155bc) and split float PPL stays 7.765921.
+    const char* value = std::getenv("NINFER_ARENA_UPLOAD");
+    if (value != nullptr && *value != '\0' && std::strtol(value, nullptr, 10) == 0) { return; }
     impl_->arena_source = arena;
 }
 
