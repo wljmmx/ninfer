@@ -23,6 +23,7 @@
 
 #include <stdexcept>
 #include <cstdlib>
+#include <functional>
 #include <optional>
 
 namespace ninfer::models::qwen3_5::execution {
@@ -446,6 +447,85 @@ private:
     bool armed_ = false;
 };
 
+// port (sm_89): one CUDA graph per expert bank, covering the device half of a split layer.
+//
+// A layer's device work is a fixed sequence of kernel launches whose only varying inputs are device
+// buffers: the routes the router just wrote, the offset/mask table, the hidden rows and the output
+// row. The offsets and the mask are what a capture bakes in, so the key is their hash plus the
+// addresses of every buffer the kernels touch - anything else changing would silently replay against
+// stale memory. When the set changes (spill taking a different set of experts this step, a new
+// generation, a different workspace slot) the key changes and the graph is rebuilt once.
+//
+// NINFER_LAYER_GRAPH=1 enables it; the whole-token graph is a different mechanism and stays off here.
+class LayerGraphs {
+public:
+    static LayerGraphs& instance() {
+        static LayerGraphs graphs;
+        return graphs;
+    }
+
+    [[nodiscard]] bool enabled() const noexcept { return enabled_; }
+
+    // Replays the recorded work, or records it on the first call for this key.
+    void run(std::uint32_t bank, std::uint64_t key, cudaStream_t stream,
+             const std::function<void()>& work) {
+        Entry& entry = entries_[bank % entries_.size()];
+        if (entry.exec != nullptr && entry.key == key) {
+            (void)cudaGraphLaunch(entry.exec, stream);
+            ++replays_;
+            return;
+        }
+        if (entry.exec != nullptr) {
+            (void)cudaGraphExecDestroy(entry.exec);
+            entry.exec = nullptr;
+        }
+        (void)cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
+        work();
+        cudaGraph_t graph = nullptr;
+        const auto captured = cudaStreamEndCapture(stream, &graph);
+        if (captured != cudaSuccess || graph == nullptr) {
+            // Nothing to fall back to here: the work was recorded, not executed.
+            work();
+            return;
+        }
+        if (cudaGraphInstantiate(&entry.exec, graph, nullptr, nullptr, 0) != cudaSuccess) {
+            entry.exec = nullptr;
+            (void)cudaGraphDestroy(graph);
+            work();
+            return;
+        }
+        (void)cudaGraphDestroy(graph);
+        entry.key = key;
+        ++captures_;
+        (void)cudaGraphLaunch(entry.exec, stream);
+    }
+
+    void report() {
+        if (!enabled_) { return; }
+        std::fprintf(stderr, "[layer-graph] captures=%llu replays=%llu\n",
+                     static_cast<unsigned long long>(captures_),
+                     static_cast<unsigned long long>(replays_));
+        captures_ = replays_ = 0;
+    }
+
+    ~LayerGraphs() {
+        for (auto& entry : entries_) {
+            if (entry.exec != nullptr) { (void)cudaGraphExecDestroy(entry.exec); }
+        }
+    }
+
+private:
+    struct Entry {
+        cudaGraphExec_t exec = nullptr;
+        std::uint64_t key    = 0;
+    };
+    LayerGraphs() : enabled_(std::getenv("NINFER_LAYER_GRAPH") != nullptr), entries_(40) {}
+    std::vector<Entry> entries_;
+    bool enabled_          = false;
+    std::uint64_t captures_ = 0;
+    std::uint64_t replays_  = 0;
+};
+
 } // namespace
 
 void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& residual,
@@ -530,10 +610,37 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
         const auto mask_size = static_cast<std::int32_t>(mask_host.size());
         Tensor device_mask(const_cast<void*>(moe.stream->resident_mask()), execution.device(),
                            DType::I32, {mask_size});
-        ops::routed_swiglu(hidden, routed, moe.stream->experts(), routes,
-                           ops::ExpertSubset{ops::ExpertSubsetKind::MaskOnes, device_mask},
-                           ops::ScaledSwiGLUTerm{moe.shared, shared_coefficients},
-                           ops::MoeEpilogue::Write, mixed_f32, mixed_arena, execution);
+        const auto moe_run = [&] {
+            ops::routed_swiglu(hidden, routed, moe.stream->experts(), routes,
+                               ops::ExpertSubset{ops::ExpertSubsetKind::MaskOnes, device_mask},
+                               ops::ScaledSwiGLUTerm{moe.shared, shared_coefficients},
+                               ops::MoeEpilogue::Write, mixed_f32, mixed_arena, execution);
+        };
+        auto& graphs = LayerGraphs::instance();
+        if (graphs.enabled()) {
+            // Everything the capture baked in: the mask bytes, the offset table version (the mask
+            // changes whenever the resident set does) and the addresses the kernels read and write.
+            std::uint64_t key = 1469598103934665603ULL;
+            const auto mix    = [&key](std::uint64_t value) {
+                key ^= value;
+                key *= 1099511628211ULL;
+            };
+            for (const auto bit : mask_host) { mix(static_cast<std::uint64_t>(bit)); }
+            mix(reinterpret_cast<std::uintptr_t>(hidden.data));
+            mix(reinterpret_cast<std::uintptr_t>(residual.data));
+            mix(reinterpret_cast<std::uintptr_t>(mixed_f32.data));
+            mix(reinterpret_cast<std::uintptr_t>(routes.ids.data));
+            mix(reinterpret_cast<std::uintptr_t>(routes.coefficients.data));
+            mix(reinterpret_cast<std::uintptr_t>(moe.stream->resident_mask()));
+            mix(reinterpret_cast<std::uintptr_t>(shared_coefficients.data));
+            graphs.run(moe.stream->bank_index(), key, execution.stream, moe_run);
+            if (std::getenv("NINFER_LAYER_GRAPH_REPORT") != nullptr) {
+                static std::uint64_t calls = 0;
+                if (++calls % 40 == 0) { graphs.report(); }
+            }
+        } else {
+            moe_run();
+        }
         Tensor host_mask(const_cast<std::int32_t*>(mask_host.data()), Device::cpu(), DType::I32,
                          {mask_size});
         host_routed_ffn(fetch, moe,
