@@ -359,8 +359,73 @@ void host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParameters& mo
     }
 }
 
+namespace {
+
+// port (sm_89): one layer in forty carries a pair of events, so the layer budget can be split into
+// "the expert tier" and "everything else" (attention, norms, head) without paying a synchronise per
+// layer. NINFER_STAGE_TIMING prints the sampled layer's device time once per token.
+class StageSample {
+public:
+    explicit StageSample(cudaStream_t stream) : stream_(stream) {
+        auto& s = state();
+        if (!s.enabled) { return; }
+        if (!s.created) {
+            (void)cudaEventCreate(&s.begin);
+            (void)cudaEventCreate(&s.end);
+            s.created = true;
+        }
+        if (s.calls % 40 != 20) { return; }
+        // Read the previous sample here: it completed long ago, so this costs no synchronise. The
+        // alternative - waiting inside the destructor - blocks the host for a layer and inflated the
+        // sampled layer by ~40% when it was tried.
+        if (s.pending) {
+            float ms = 0.0F;
+            (void)cudaEventElapsedTime(&ms, s.begin, s.end);
+            s.sum += ms;
+            s.pending = false;
+            if (++s.samples % 16 == 0) {
+                const double per_layer = s.sum / static_cast<double>(s.samples);
+                std::fprintf(stderr,
+                             "[stage] expert tier %.3f ms/layer  (x40 = %.2f ms/token)\n", per_layer,
+                             per_layer * 40.0);
+                s.sum     = 0.0;
+                s.samples = 0;
+            }
+        }
+        (void)cudaEventRecord(s.begin, stream_);
+        armed_ = true;
+    }
+    ~StageSample() {
+        if (!armed_) { return; }
+        (void)cudaEventRecord(state().end, stream_);
+        state().pending = true;
+    }
+
+    // `state()` and the name counter are used by the caller, so they stay public.
+    struct State {
+        bool enabled = std::getenv("NINFER_STAGE_TIMING") != nullptr;
+        bool created = false;
+        bool pending = false;
+        cudaEvent_t begin{}, end{};
+        double sum          = 0.0;
+        std::uint64_t calls = 0, samples = 0;
+    };
+    static State& state() {
+        static State s;
+        return s;
+    }
+
+private:
+    cudaStream_t stream_;
+    bool armed_ = false;
+};
+
+} // namespace
+
 void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& residual,
                   WorkspaceArena& workspace, DeviceExecutionView execution) {
+    StageSample stage_sample(execution.stream);
+    StageSample::state().calls++;
     const auto columns       = hidden.ne[1];
     const auto& routed       = moe.profile.routed;
     auto ids                 = workspace.alloc(DType::I32, {routed.top_k, columns});
