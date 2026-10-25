@@ -707,12 +707,38 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
     return what != nullptr && std::strstr(what, "Engine runtime reservation requires") != nullptr;
 }
 
+// port (sm_89): an artifact that gives every expert its own object cannot be loaded as resident
+// weights - a bank-wide row region runs past a parent that holds one expert. The loader says so,
+// and the same artifact runs fine as a streamed tier, so treat it as a request to stream instead of
+// a broken artifact. Only when the caller asked for resident weights (pool = 0): with a pool the
+// message means what it says.
+[[nodiscard]] bool resident_moe_needs_streaming(const std::invalid_argument& error) noexcept {
+    const char* what = error.what();
+    return what != nullptr &&
+           std::strstr(what, "weight bank exceeds its parent or native matrix domain") != nullptr;
+}
+
 } // namespace
 
 ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) {
     try {
         return construct_model_once(options, device);
     } catch (const std::invalid_argument& error) {
+        // A per-expert artifact cannot be loaded as resident weights. Ask for the streamed tier and
+        // retry before anything else: the request was "no pool", not "this artifact is broken".
+        if (options.expert_cache_bytes == 0 && !options.expert_host_copy &&
+            resident_moe_needs_streaming(error) &&
+            std::getenv("NINFER_NO_EXPERT_FALLBACK") == nullptr) {
+            EngineOptions streamed      = options;
+            streamed.expert_cache_bytes = kExpertCacheAuto;
+            std::fprintf(stderr,
+                         "[fallback] %s; retrying with the routed experts streamed from the "
+                         "artifact\n", error.what());
+            std::fflush(stderr);
+            auto constructed = construct_model_once(streamed, device);
+            options          = streamed;
+            return constructed;
+        }
         if (options.expert_cache_bytes != 0 || options.expert_host_copy ||
             !kv_capacity_shortage(error) || std::getenv("NINFER_NO_EXPERT_FALLBACK") != nullptr) {
             throw;
