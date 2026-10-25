@@ -116,15 +116,21 @@ int main(int argc, char** argv) {
     static CpuExecutor executor(topology, plan_cpu_team(topology.info(), team));
     const auto execution = executor.execution_view();
 
+    // port (sm_89): the shipped artifact stores the down projection as Q5 (one high bit per
+    // weight), not Q6, so the bench has to be able to time the shape it will actually meet.
+    // NINFER_BENCH_DOWN_Q5=1 switches the down bank; Q6 stays the default for the older numbers.
+    static const bool down_q5 = std::getenv("NINFER_BENCH_DOWN_Q5") != nullptr;
+    const auto down_type      = down_q5 ? QType::Q5_G64_FP16 : QType::Q6_G64_FP16;
+
     auto gate_up = make_bank(QType::Q4_G64_FP16, QuantLayout::RowSplit, kGateUpRows, kHidden);
-    auto down    = make_bank(QType::Q6_G64_FP16, QuantLayout::RowSplit, kHidden, kIntermediate);
+    auto down    = make_bank(down_type, QuantLayout::RowSplit, kHidden, kIntermediate);
 
     ops::RoutedSwiGLUProfile profile{};
     profile.ffn.hidden         = kHidden;
     profile.ffn.intermediate   = kIntermediate;
     profile.ffn.gate_up_type   = QType::Q4_G64_FP16;
     profile.ffn.gate_up_layout = QuantLayout::RowSplit;
-    profile.ffn.down_type      = QType::Q6_G64_FP16;
+    profile.ffn.down_type      = down_type;
     profile.ffn.down_layout    = QuantLayout::RowSplit;
     profile.ffn.gate_up_policy = ops::LinearPolicy::A16Only;
     profile.ffn.down_policy    = ops::LinearPolicy::A16Only;
