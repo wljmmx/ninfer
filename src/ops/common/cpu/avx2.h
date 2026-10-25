@@ -101,4 +101,53 @@ inline __m256 decode_signed_q(const std::uint8_t* code, const std::uint8_t* high
     return _mm256_cvtepi32_ps(values);
 }
 
+// port (sm_89): expand 32 five-bit codes in one pass. The float path decodes 8 weights per
+// iteration - four 32-bit lanes for the nibble, four for the fifth bit - and repeats that eight
+// times per 64-value group. The same 16 bytes of codes hold 32 weights, so one pass can build all of
+// them as int8 and widen once. A 5-bit code is `nibble - 16 * bit`, so the bit plane is subtracted
+// rather than sign-extended; the spread/compare trick that turns 32 bits into 32 bytes comes from
+// ggml's AVX2 q5_1 path and yields one byte per weight in natural order.
+inline void decode_signed_q32_q5(const std::uint8_t* code, const std::uint8_t* high,
+                                 __m256 out[4]) noexcept {
+    static const bool skip_decode = std::getenv("NINFER_MOE_CPU_NODECODE") != nullptr;
+    if (skip_decode) {
+        for (int i = 0; i < 4; ++i) { out[i] = _mm256_set1_ps(1.0F); }
+        return;
+    }
+    // weight 2b is the low nibble of byte b and weight 2b+1 the high one, so interleaving the two
+    // nibble planes rebuilds weight order.
+    const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(code));
+    const __m128i nibble = _mm_set1_epi8(0x0F);
+    const __m128i low    = _mm_and_si128(packed, nibble);
+    const __m128i high_n = _mm_and_si128(_mm_srli_epi16(packed, 4), nibble);
+    __m256i values =
+        _mm256_set_m128i(_mm_unpackhi_epi8(low, high_n), _mm_unpacklo_epi8(low, high_n));
+    std::uint32_t bits;
+    std::memcpy(&bits, high, sizeof(bits));
+    const __m256i spread = _mm256_set_epi64x(0x0303030303030303LL, 0x0202020202020202LL,
+                                             0x0101010101010101LL, 0x0000000000000000LL);
+    __m256i plane = _mm256_shuffle_epi8(_mm256_set1_epi32(static_cast<int>(bits)), spread);
+    plane = _mm256_or_si256(plane, _mm256_set1_epi64x(0x7fbfdfeff7fbfdfeLL));
+    const __m256i set = _mm256_cmpeq_epi8(plane, _mm256_set1_epi8(-1));
+    values = _mm256_sub_epi8(values, _mm256_and_si256(set, _mm256_set1_epi8(0x10)));
+    const __m128i halves[2] = {_mm256_castsi256_si128(values), _mm256_extracti128_si256(values, 1)};
+    for (int h = 0; h < 2; ++h) {
+        out[2 * h]     = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(halves[h]));
+        out[2 * h + 1] = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(halves[h], 8)));
+    }
+    static const bool dump_decode = std::getenv("NINFER_MOE_CPU_DECODE_DUMP") != nullptr;
+    if (dump_decode) {
+        float wide[32], narrow[32];
+        for (int v = 0; v < 4; ++v) { _mm256_storeu_ps(wide + 8 * v, out[v]); }
+        for (int v = 0; v < 4; ++v) {
+            const auto one = decode_signed_q<5>(code + 4 * v, high + v);
+            _mm256_storeu_ps(narrow + 8 * v, one);
+        }
+        int bad = 0;
+        for (int i = 0; i < 32; ++i) { if (wide[i] != narrow[i]) { ++bad; } }
+        std::fprintf(stderr, "[decode] mismatch=%d wide0=%.0f narrow0=%.0f\n", bad, wide[0], narrow[0]);
+        for (int i = 0; i < 32 && bad != 0; ++i) { std::fprintf(stderr, "  i=%d wide=%.0f narrow=%.0f\n", i, wide[i], narrow[i]); }
+    }
+}
+
 } // namespace ninfer::ops::common::cpu::avx2

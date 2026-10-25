@@ -12,9 +12,66 @@ namespace ninfer::ops::detail::moe_cpu::groupwise_int {
 
 // Instantiated only in an ISA-specific C++ object. A decode feeds up to four columns;
 // group scales are applied to vector partials, with one horizontal reduction per output.
+// port (sm_89): five-bit codes through the 32-wide decoder. Same arithmetic as dot(), one pass per
+// 32 weights instead of four passes of eight. NINFER_MOE_CPU_NODECODE puts the decode at 32% of this
+// kernel, and this is the only cut available without changing the activation precision - int8
+// activations for this projection were rejected at 12.3% PPL, so the dot stays in float.
+template <class Simd, int K, int Rows, int Columns, class Input>
+inline void dot_wide32(const Matrix& matrix, const int (&rows)[Rows],
+                       const Input* const (&x)[Columns], float (&out)[Rows][Columns]) noexcept {
+    static_assert(Simd::lanes == 8, "the 32-wide decoder feeds four 8-lane vectors");
+    using V = typename Simd::Float;
+    V total[Rows][Columns];
+    for (int r = 0; r < Rows; ++r) {
+        for (int c = 0; c < Columns; ++c) { total[r][c] = Simd::zero(); }
+    }
+    for (int group = 0; group < K / 64; ++group) {
+        V partial[Rows][Columns];
+        for (int r = 0; r < Rows; ++r) {
+            for (int c = 0; c < Columns; ++c) { partial[r][c] = Simd::zero(); }
+        }
+        for (int k = 0; k < 64; k += 32) {
+            for (int r = 0; r < Rows; ++r) {
+                const auto* codes =
+                    matrix.codes + std::size_t(rows[r]) * (K / 2) + group * 32 + k / 2;
+                const auto* high = matrix.high + std::size_t(rows[r]) * (K / 8) + group * 8 + k / 8;
+                V values[4];
+                common::cpu::avx2::decode_signed_q32_q5(codes, high, values);
+                for (int c = 0; c < Columns; ++c) {
+                    for (int q = 0; q < 4; ++q) {
+                        const int offset = group * 64 + k + q * Simd::lanes;
+                        V in;
+                        if constexpr (std::is_same_v<Input, float>) {
+                            in = Simd::load(x[c] + offset);
+                        } else {
+                            in = Simd::bf16(x[c] + offset);
+                        }
+                        partial[r][c] = Simd::fma(values[q], in, partial[r][c]);
+                    }
+                }
+            }
+        }
+        for (int r = 0; r < Rows; ++r) {
+            const auto scale = Simd::scale(matrix.scales[std::size_t(rows[r]) * (K / 64) + group]);
+            for (int c = 0; c < Columns; ++c) {
+                total[r][c] = Simd::fma(partial[r][c], scale, total[r][c]);
+            }
+        }
+    }
+    for (int r = 0; r < Rows; ++r) {
+        for (int c = 0; c < Columns; ++c) { out[r][c] = Simd::sum(total[r][c]); }
+    }
+}
+
 template <class Simd, int Bits, int K, int Rows, int Columns, class Input>
 inline void dot(const Matrix& matrix, const int (&rows)[Rows], const Input* const (&x)[Columns],
                 float (&out)[Rows][Columns]) noexcept {
+    if constexpr (Bits == 5 && std::is_base_of_v<common::cpu::avx2::F32, Simd>) {
+        if (std::getenv("NINFER_MOE_CPU_Q5_NARROW") == nullptr) {
+            dot_wide32<Simd, K, Rows, Columns, Input>(matrix, rows, x, out);
+            return;
+        }
+    }
     using V = typename Simd::Float;
     V total[Rows][Columns];
     for (int r = 0; r < Rows; ++r) {
