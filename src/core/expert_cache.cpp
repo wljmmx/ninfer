@@ -655,13 +655,16 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
     if (std::getenv("NINFER_UPLOAD_TIMING") != nullptr) {
         const auto timing_end = std::chrono::steady_clock::now();
         static std::uint64_t calls = 0;
-        static double acc[3]       = {0.0, 0.0, 0.0};
+        static double acc[4]       = {0.0, 0.0, 0.0, 0.0};
         const auto elapsed = [](auto from, auto to) {
             return std::chrono::duration<double, std::milli>(to - from).count();
         };
         acc[0] += elapsed(timing_begin, collect_begin);
         acc[1] += elapsed(collect_begin, timing_end);
         acc[2] += static_cast<double>(batch.size());
+        double layer_bytes = 0.0;
+        for (const auto& op : batch) { layer_bytes += static_cast<double>(op.bytes); }
+        acc[3] += layer_bytes;
         static std::uint64_t seen_direct = 0, seen_staged = 0;
         const auto direct_now = impl_->stat_direct;
         const auto staged_now = impl_->stat_staged;
@@ -671,12 +674,12 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
         seen_staged = staged_now;
         if (++calls % 40 == 0) {
             std::fprintf(stderr,
-                         "[upload] collect=%.3fms submit=%.3fms ops=%.1f per layer "
+                         "[upload] collect=%.3fms submit=%.3fms ops=%.1f mb=%.2f per layer "
                          "direct=%.1f staged=%.1f\n",
-                         acc[0] / 40.0, acc[1] / 40.0, acc[2] / 40.0,
+                         acc[0] / 40.0, acc[1] / 40.0, acc[2] / 40.0, acc[3] / 40.0 / 1048576.0,
                          static_cast<double>(direct_delta) / 40.0,
                          static_cast<double>(staged_delta) / 40.0);
-            acc[0] = acc[1] = acc[2] = 0.0;
+            acc[0] = acc[1] = acc[2] = acc[3] = 0.0;
         }
         (void)direct_delta;
         (void)staged_delta;
