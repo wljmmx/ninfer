@@ -663,17 +663,18 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
     if (std::getenv("NINFER_UPLOAD_TIMING") != nullptr) {
         const auto timing_end = std::chrono::steady_clock::now();
         static std::uint64_t calls = 0;
-        static double acc[4]       = {0.0, 0.0, 0.0, 0.0};
+        static double acc[7] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+        // acc: collect, submit, bytes, direct, staged, views, pushes. Every per-call delta has to
+        // be accumulated here first; dividing a single call's delta by 40 was what made the
+        // operation count read 0.1 while the byte total said five megabytes.
         const auto elapsed = [](auto from, auto to) {
             return std::chrono::duration<double, std::milli>(to - from).count();
         };
         acc[0] += elapsed(timing_begin, collect_begin);
         acc[1] += elapsed(collect_begin, timing_end);
-        acc[2] += static_cast<double>(batch.size());
         double layer_bytes = 0.0;
         for (const auto& op : batch) { layer_bytes += static_cast<double>(op.bytes); }
-        acc[3] += layer_bytes;
-        static std::uint64_t seen_direct = 0, seen_staged = 0, seen_views = 0;
+        acc[2] += layer_bytes;        static std::uint64_t seen_direct = 0, seen_staged = 0, seen_views = 0;
         const auto direct_now = impl_->stat_direct;
         const auto staged_now = impl_->stat_staged;
         const auto views_now  = impl_->stat_views;
@@ -686,17 +687,23 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
         static std::uint64_t seen_push = 0;
         const auto push_delta = impl_->stat_push - seen_push;
         seen_push             = impl_->stat_push;
+        acc[3] += static_cast<double>(direct_delta);
+        acc[4] += static_cast<double>(staged_delta);
+        acc[5] += static_cast<double>(views_delta);
+        acc[6] += static_cast<double>(push_delta);
         if (++calls % 40 == 0) {
             std::fprintf(stderr,
                          "[upload] collect=%.3fms submit=%.3fms ops=%.1f mb=%.2f per layer "
                          "direct=%.1f staged=%.1f views=%.1f\n",
-                         acc[0] / 40.0, acc[1] / 40.0, acc[2] / 40.0, acc[3] / 40.0 / 1048576.0,
-                         static_cast<double>(direct_delta) / 40.0,
-                         static_cast<double>(staged_delta) / 40.0,
-                         static_cast<double>(views_delta) / 40.0);
-            std::fprintf(stderr, "[upload] pushed=%.1f ops per layer (cross-check)\n",
-                         static_cast<double>(push_delta) / 40.0);
-            acc[0] = acc[1] = acc[2] = acc[3] = 0.0;
+                         acc[0] / 40.0, acc[1] / 40.0, acc[6] / 40.0,
+                         acc[2] / 40.0 / 1048576.0, acc[3] / 40.0, acc[4] / 40.0, acc[5] / 40.0);
+            // Raw values for the call being reported: if these two disagree while the averages
+            // above do, the disagreement is in the accumulation and not in the upload itself.
+            std::fprintf(stderr,
+                         "[upload] raw this-call: batch=%zu push_total=%llu mb=%.2f staged=%zu\n",
+                         batch.size(), static_cast<unsigned long long>(impl_->stat_push),
+                         layer_bytes / 1048576.0, staged);
+            acc[0] = acc[1] = acc[2] = acc[3] = acc[4] = acc[5] = acc[6] = 0.0;
         }
         (void)direct_delta;
         (void)staged_delta;
