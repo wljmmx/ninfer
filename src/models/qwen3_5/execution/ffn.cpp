@@ -256,26 +256,37 @@ void host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParameters& mo
     host->ensure(ExpertBankId{moe.stream->bank_index()}, wanted, nullptr);
     const auto ensure_ms = std::chrono::duration<double, std::milli>(
                                std::chrono::steady_clock::now() - ensure_begin).count();
-    const auto bytes = ops::routed_swiglu_workspace_capacity_bytes(
-        moe.profile.routed, ops::ExpertSubsetKind::All, tokens, tokens);
-    // The CPU kernels want a 256-byte aligned cursor; a plain vector only guarantees 16.
-    std::vector<std::byte> scratch(bytes + 256);
-    const auto base    = reinterpret_cast<std::uintptr_t>(scratch.data());
-    const auto aligned = (256 - (base & 255)) & 255;
-    MemoryArena arena(
-        MemorySpan{scratch.data() + aligned, bytes, Device::cpu()});
     const bool timing = std::getenv("NINFER_SPLIT_TIMING") != nullptr;
     // port (sm_89): NINFER_SPLIT_TIMING splits the host half into what it actually spends: the
     // CPU expert kernels, the wait for the Device term, the elementwise merge and the write-back.
     // The split path's cost is what decides whether holding experts at all beats host-only.
-    const auto cpu_begin = std::chrono::steady_clock::now();
-    // A layer that hands the CPU a handful of experts runs on the small team; anything wider keeps
-    // every core, which is what prefill and the host-only path need.
-    const auto& cpu_view = wanted.size() <= kSmallExperts ? cpu_small : cpu;
-    ops::routed_swiglu(x_cpu, moe.profile.routed, host->experts(ExpertBankId{moe.stream->bank_index()}),
-                       routes_cpu, subset, out_cpu, arena, cpu_view);
-    const auto cpu_ms = std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() - cpu_begin).count();
+    //
+    // port (sm_89): a split layer whose Device half covers every routed expert has nothing for this
+    // half to do - `wanted` is empty and the CPU term is zero by construction. The collective still
+    // used to run, and walking the mask over 256 experts per bank cost 5.7-6.5 ms a token with
+    // hit=0 miss=0 in the arena statistics to show for it. Skip the workspace and the kernels when
+    // there is no expert to compute; the merge below adds a zero term and rounds exactly as before.
+    double cpu_ms = 0.0;
+    if (!wanted.empty()) {
+        const auto bytes = ops::routed_swiglu_workspace_capacity_bytes(
+            moe.profile.routed, ops::ExpertSubsetKind::All, tokens, tokens);
+        // The CPU kernels want a 256-byte aligned cursor; a plain vector only guarantees 16.
+        std::vector<std::byte> scratch(bytes + 256);
+        const auto base    = reinterpret_cast<std::uintptr_t>(scratch.data());
+        const auto aligned = (256 - (base & 255)) & 255;
+        MemoryArena arena(
+            MemorySpan{scratch.data() + aligned, bytes, Device::cpu()});
+        const auto cpu_begin = std::chrono::steady_clock::now();
+        // A layer that hands the CPU a handful of experts runs on the small team; anything wider
+        // keeps every core, which is what prefill and the host-only path need.
+        const auto& cpu_view = wanted.size() <= kSmallExperts ? cpu_small : cpu;
+        ops::routed_swiglu(x_cpu, moe.profile.routed,
+                           host->experts(ExpertBankId{moe.stream->bank_index()}), routes_cpu, subset,
+                           out_cpu, arena, cpu_view);
+        cpu_ms = std::chrono::duration<double, std::milli>(
+                     std::chrono::steady_clock::now() - cpu_begin)
+                     .count();
+    }
     if (std::getenv("NINFER_HOST_DEBUG")) {
         std::fprintf(stderr, "[host-x] bank=%u x0..3=%.6f %.6f %.6f %.6f\n",
                      moe.stream->bank_index(),
