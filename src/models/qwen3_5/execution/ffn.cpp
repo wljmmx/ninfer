@@ -65,8 +65,12 @@ struct HostRoutedFetch {
     std::vector<float> coefficients;
 };
 
+// port (sm_89): `packed_device`, when the caller provides it, is a device block big enough for
+// the four buffers below. The pack kernel copies them into it on the stream and one transfer brings
+// the whole block down, which is what turns four submissions into one.
 HostRoutedFetch fetch_host_routed(const Tensor& hidden, const ops::ExpertRoutes& routes,
-                                  const Tensor& residual, cudaStream_t stream) {
+                                  const Tensor& residual, cudaStream_t stream,
+                                  void* packed_device) {
     const auto cols   = hidden.ne[0];
     const auto tokens = hidden.ne[1];
     const auto top_k  = routes.ids.ne[0];
@@ -78,6 +82,42 @@ HostRoutedFetch fetch_host_routed(const Tensor& hidden, const ops::ExpertRoutes&
     // The transfer itself, per token: decode speed is too noisy on this box to resolve a few
     // tenths of a millisecond, and this line is what a change here has to move.
     const auto fetch_begin = std::chrono::steady_clock::now();
+    if (packed_device != nullptr) {
+        const auto x_bytes    = fetch.x.size() * sizeof(std::uint16_t);
+        const auto res_bytes  = fetch.residual.size() * sizeof(std::uint16_t);
+        const auto ids_bytes  = fetch.ids.size() * sizeof(std::int32_t);
+        const auto coef_bytes = fetch.coefficients.size() * sizeof(float);
+        ops::moe_pack_host_fetch(hidden.data, residual.data, routes.ids.data,
+                                 routes.coefficients.data, static_cast<int>(fetch.x.size()),
+                                 static_cast<int>(fetch.ids.size()), packed_device, stream);
+        const auto total = ops::moe_pack_host_fetch_bytes(x_bytes, res_bytes, ids_bytes, coef_bytes);
+        // One host block, sliced back into the fields the rest of the path already uses. Same
+        // alignment the pack kernel uses (16 bytes), so the slices land where it wrote them.
+        static thread_local std::vector<std::byte> staging;
+        staging.resize(total);
+        CUDA_CHECK(cudaMemcpyAsync(staging.data(), packed_device, total, cudaMemcpyDeviceToHost,
+                                   stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        const auto align16 = [](std::size_t value) { return (value + 15U) & ~std::size_t{15}; };
+        const auto off_res  = align16(x_bytes);
+        const auto off_ids  = align16(off_res + res_bytes);
+        const auto off_coef = align16(off_ids + ids_bytes);
+        std::memcpy(fetch.x.data(), staging.data(), x_bytes);
+        std::memcpy(fetch.residual.data(), staging.data() + off_res, res_bytes);
+        std::memcpy(fetch.ids.data(), staging.data() + off_ids, ids_bytes);
+        std::memcpy(fetch.coefficients.data(), staging.data() + off_coef, coef_bytes);
+        if (std::getenv("NINFER_SPLIT_TIMING") != nullptr) {
+            static double accumulated_ms = 0.0;
+            static std::uint64_t calls   = 0;
+            accumulated_ms += std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - fetch_begin).count();
+            if (++calls % 40 == 0) {
+                std::fprintf(stderr, "[fetch] %.2fms per token\n", accumulated_ms);
+                accumulated_ms = 0.0;
+            }
+        }
+        return fetch;
+    }
     // port (sm_89): four independent transfers. cudaMemcpyBatchAsync (CUDA 13, with the 13.4
     // cudaMemcpyFlagPreferOverlapWithCompute hint) merges them into one submission and measured
     // 5.77/5.83 ms per token against 5.66/5.73 for the four calls: the cost is the synchronise at
@@ -109,7 +149,7 @@ HostRoutedFetch fetch_host_routed(const Tensor& hidden, const ops::ExpertRoutes&
 
 void host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParameters& moe,
                      const ops::ExpertSubset& subset, const Tensor& gpu_term, Tensor& residual,
-                     DeviceExecutionView execution) {
+                     DeviceExecutionView execution, void* host_term_device) {
     auto* host = moe.stream->host();
     if (host == nullptr) { throw std::runtime_error("host routed ffn: no host tier"); }
     const auto cols   = residual.ne[0];
@@ -221,6 +261,38 @@ void host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParameters& mo
     // The copy below is queued on the same stream, so it cannot start before that kernel finishes:
     // waiting for the copy alone is enough, and a separate stream-wide synchronise here would only
     // pay the WDDM round trip twice per layer.
+    if (host_term_device != nullptr) {
+        // port (sm_89): the device merges. Upload the CPU term and let one kernel write
+        // `RNE_bf16(residual + host + gpu)` in place - the same accumulation order and rounding the
+        // loop below uses, so the result is the same value without a read-back of the device term
+        // and without a second synchronise: the next layer's read-back waits on this stream anyway.
+        const auto write_begin = std::chrono::steady_clock::now();
+        CUDA_CHECK(cudaMemcpyAsync(host_term_device, host_out.data(),
+                                   host_out.size() * sizeof(float), cudaMemcpyHostToDevice,
+                                   stream));
+        ops::moe_merge_host_term(host_term_device, gpu_term.data, residual.data,
+                                 static_cast<int>(host_out.size()), stream);
+        if (timing) {
+            static std::uint64_t calls = 0;
+            static double acc[2]       = {0.0, 0.0};
+            acc[0] += cpu_ms;
+            acc[1] += std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - write_begin).count();
+            if (++calls % 40 == 0) {
+                const auto& stats = host->stats();
+                std::fprintf(stderr,
+                             "[host] cpu=%.2fms write=%.2fms (device merge) per token; arena=%u "
+                             "slots %lluKiB hit=%llu miss=%llu evict=%llu\n",
+                             acc[0], acc[1], host->slot_capacity(),
+                             static_cast<unsigned long long>(host->slot_bytes() >> 10),
+                             static_cast<unsigned long long>(stats.hits),
+                             static_cast<unsigned long long>(stats.misses),
+                             static_cast<unsigned long long>(stats.evictions));
+                acc[0] = acc[1] = 0.0;
+            }
+        }
+        return;
+    }
     const auto join_begin = std::chrono::steady_clock::now();
     CUDA_CHECK(cudaMemcpyAsync(host_gpu.data(), gpu_term.data, host_gpu.size() * sizeof(float),
                                cudaMemcpyDeviceToHost, stream));
@@ -309,9 +381,22 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
     // CPU half needs the layer inputs; they come down in the same batch with one stream synchronise.
     // The split path used to pay two - a 32-byte copy inside ensure and the inputs here - and that
     // was 40 x ~0.3 ms of the token on this driver.
+    // One device block for the read-back and one for the CPU term, so the split path pays one
+    // transfer per layer and the merge needs no read-back at all.
+    const std::size_t handoff_x    = static_cast<std::size_t>(hidden.ne[0]) * columns;
+    const std::size_t handoff_ids  = static_cast<std::size_t>(routed.top_k) * columns;
+    const std::size_t handoff_term = handoff_x;
+    auto pack_span      = workspace.alloc_bytes(ops::moe_pack_host_fetch_bytes(
+        handoff_x * 2, handoff_x * 2, handoff_ids * 4, handoff_ids * 4));
+    auto host_term_span = workspace.alloc_bytes(handoff_term * sizeof(float));
+    // port (sm_89): the merged read-back measured 4.66/4.88 ms per token against 4.05 for the four
+    // copies, so it stays behind a switch; the device merge replaces join+merge+write and is on.
+    void* pack_device = std::getenv("NINFER_DMA_PACK") != nullptr ? pack_span.data : nullptr;
+    void* host_term_device = std::getenv("NINFER_HOST_MERGE_CPU") != nullptr ? nullptr
+                                                                           : host_term_span.data;
     std::optional<HostRoutedFetch> early;
     if (!moe.stream->fully_resident()) {
-        early.emplace(fetch_host_routed(hidden, routes, residual, execution.stream));
+        early.emplace(fetch_host_routed(hidden, routes, residual, execution.stream, pack_device));
     }
     try {
         if (!moe.stream->ensure(ids.data, routed.top_k, columns, execution.stream,
@@ -323,7 +408,8 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
             // Take the inputs the CPU half needs before the Device half is launched, so the two
             // can then run concurrently.
             auto fetch = early ? std::move(*early)
-                               : fetch_host_routed(hidden, routes, residual, execution.stream);
+                               : fetch_host_routed(hidden, routes, residual, execution.stream,
+                                                    pack_device);
             auto shared_f32 = workspace.alloc(DType::FP32, {hidden.ne[0], columns});
             MemoryArena shared_arena(MemorySpan{scratch.data, scratch.bytes, execution.device()});
             ops::routed_swiglu(hidden, routed, moe.stream->experts(), routes,
@@ -331,7 +417,7 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
                                ops::ScaledSwiGLUTerm{moe.shared, shared_coefficients},
                                ops::MoeEpilogue::Write, shared_f32, shared_arena, execution);
             host_routed_ffn(fetch, moe, ops::ExpertSubset{ops::ExpertSubsetKind::All, {}},
-                            shared_f32, residual, execution);
+                            shared_f32, residual, execution, host_term_device);
             return;
         }
     } catch (const std::exception& error) {
@@ -356,7 +442,7 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
                          {mask_size});
         host_routed_ffn(fetch, moe,
                         ops::ExpertSubset{ops::ExpertSubsetKind::MaskZeros, host_mask}, mixed_f32,
-                        residual, execution);
+                        residual, execution, host_term_device);
         return;
     }
     try {

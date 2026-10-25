@@ -184,4 +184,17 @@ void topk_softmax_swiglu_moe(const Tensor& x, const MoeProfile& profile, const M
                              MoeEpilogue epilogue, Tensor& destination, MemoryArena& workspace,
                              CudaExecutionView execution, const MoeExecutionHints& hints = {});
 
+// port (sm_89): the split layer's host hand-off (kernels/cuda/host_handoff.cu).
+//
+// The four buffers a split layer reads back are packed into one block so the layer pays one
+// submission instead of four, and the merge the host used to do is done on the device with the same
+// accumulation order and rounding, so no read-back and no extra synchronise are needed.
+std::size_t moe_pack_host_fetch_bytes(std::size_t x_bytes, std::size_t residual_bytes,
+                                      std::size_t ids_bytes, std::size_t coefficient_bytes);
+void moe_pack_host_fetch(const void* x, const void* residual, const void* ids,
+                         const void* coefficients, int x_count, int ids_count, void* packed,
+                         cudaStream_t stream);
+void moe_merge_host_term(const void* host_term, const void* gpu_term, void* residual, int count,
+                         cudaStream_t stream);
+
 } // namespace ninfer::ops
