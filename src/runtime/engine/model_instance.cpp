@@ -389,9 +389,12 @@ std::uint64_t host_expert_arena_bytes(std::uint64_t want_bytes) {
     std::uint64_t budget = std::min<std::uint64_t>({want_bytes, share, kWorkingSetCap});
     if (const char* value = std::getenv("NINFER_EXPERT_HOST_ARENA_MB"); value != nullptr && *value) {
         const auto mib = std::strtoull(value, nullptr, 10);
-        // An explicit budget replaces the RAM share rather than tightening it, so a run can ask
-        // for the whole model when the machine has room.
-        if (mib != 0) { budget = std::min<std::uint64_t>(want_bytes, mib << 20); }
+        // An explicit budget replaces the RAM share rather than tightening it, so a run can ask for
+        // the whole model when the machine has room. It has to replace the working-set estimate too:
+        // clamping to `want_bytes` made every request above the estimate (~937 MiB on this model) a
+        // silent no-op, which is why earlier sweeps measured 600 MiB and 4 GiB as identical and
+        // concluded the arena size did not matter.
+        if (mib != 0) { budget = mib << 20; }
     }
     return budget;
 }
