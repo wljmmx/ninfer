@@ -1,5 +1,5 @@
 #include "core/weight_bank.h"
-
+#include <string>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -84,7 +84,16 @@ ConstMemorySpan WeightBankView::plane(const WeightBankPlane& plane, std::uint32_
                                        : expert_offsets      ? expert_offsets[expert]
                                                              : expert * plane.expert_stride);
     if (offset > parent->geometry.bytes || plane.expert_bytes > parent->geometry.bytes - offset) {
-        throw std::out_of_range("weight bank plane exceeds its backing");
+        std::string detail = "weight bank plane exceeds its backing";
+        detail += " offset=";
+        detail += std::to_string(offset);
+        detail += " bytes=";
+        detail += std::to_string(plane.expert_bytes);
+        detail += " geometry=";
+        detail += std::to_string(parent->geometry.bytes);
+        detail += " expert=";
+        detail += std::to_string(expert);
+        throw std::out_of_range(detail);
     }
     return {parent->data + offset, static_cast<std::size_t>(plane.expert_bytes), parent->device};
 }
