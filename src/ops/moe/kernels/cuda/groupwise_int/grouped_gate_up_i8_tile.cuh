@@ -205,6 +205,13 @@ __device__ __forceinline__ void ldm_x2(unsigned& r0, unsigned& r1, const void* p
                  : "r"(a));
 }
 
+// A staged row is 64 bytes, so the eight rows of an ldmatrix block would all start on the same bank
+// group and read four-way conflicted. Xor-ing the 16-byte chunk index with the row's low bits spreads
+// them; writers and readers must use the same mapping, which the bitwise test checks.
+__device__ __forceinline__ int swz(const int row, const int kbyte) {
+    return row * 64 + ((((kbyte >> 4) ^ (row & 3)) & 3) << 4) + (kbyte & 15);
+}
+
 // Double-buffered tile: the next 64-wide k group is copied in with cp.async while the current one is
 // being multiplied, its weights are decoded into a second activation buffer before they are needed,
 // and RowTiles 16-row groups share one staging pass. One row group per block made the staging and the
@@ -278,7 +285,7 @@ __global__ __launch_bounds__(Cols * 4) void grouped_gate_up_i8_tile_ldm(
             const int quad  = t & 3;
             const int slot  = begin + column_base + (col < cols ? col : 0);
             const auto* src = act_i8 + std::int64_t(order[slot]) * K + g * 64 + quad * 16;
-            cp_async_16(&Bs[buf][col][quad * 16], src);
+            cp_async_16(reinterpret_cast<std::int8_t*>(&Bs[buf][0][0]) + swz(col, quad * 16), src);
         }
         cp_async_commit();
     };
@@ -298,8 +305,9 @@ __global__ __launch_bounds__(Cols * 4) void grouped_gate_up_i8_tile_ldm(
                 __vsubss4(static_cast<int>((w & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
             const std::uint32_t hi =
                 __vsubss4(static_cast<int>(((w >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
-            *reinterpret_cast<std::uint32_t*>(&As[buf][row][k0]) = __byte_perm(lo, hi, 0x5140);
-            *reinterpret_cast<std::uint32_t*>(&As[buf][row][k0 + 4]) = __byte_perm(lo, hi, 0x7362);
+            auto* dst = reinterpret_cast<std::int8_t*>(&As[buf][0][0]);
+            *reinterpret_cast<std::uint32_t*>(dst + swz(row, k0)) = __byte_perm(lo, hi, 0x5140);
+            *reinterpret_cast<std::uint32_t*>(dst + swz(row, k0 + 4)) = __byte_perm(lo, hi, 0x7362);
         }
     };
 
@@ -340,9 +348,13 @@ __global__ __launch_bounds__(Cols * 4) void grouped_gate_up_i8_tile_ldm(
             for (int sub = 0; sub < 2; ++sub) {
                 const int kk = sub * 32;
                 unsigned ga0, ga1, ga2, ga3, ua0, ua1, ua2, ua3, bb0, bb1;
-                ldm_x4(ga0, ga1, ga2, ga3, &As[cur][t4 * kHalf + a_row][kk + a_kt]);
-                ldm_x4(ua0, ua1, ua2, ua3, &As[cur][kGateSpan + t4 * kHalf + a_row][kk + a_kt]);
-                ldm_x2(bb0, bb1, &Bs[cur][col0 + b_row][kk + b_mat * 16]);
+                const auto* as_base = reinterpret_cast<const std::int8_t*>(&As[cur][0][0]);
+                ldm_x4(ga0, ga1, ga2, ga3, as_base + swz(t4 * kHalf + a_row, kk + a_kt));
+                ldm_x4(ua0, ua1, ua2, ua3,
+                       as_base + swz(kGateSpan + t4 * kHalf + a_row, kk + a_kt));
+                ldm_x2(bb0, bb1,
+                       reinterpret_cast<const std::int8_t*>(&Bs[cur][0][0]) +
+                           swz(col0 + b_row, kk + b_mat * 16));
                 mma_s8(acc_g[0], acc_g[1], acc_g[2], acc_g[3], ga0, ga1, ga2, ga3, bb0, bb1);
                 mma_s8(acc_u[0], acc_u[1], acc_u[2], acc_u[3], ua0, ua1, ua2, ua3, bb0, bb1);
             }
