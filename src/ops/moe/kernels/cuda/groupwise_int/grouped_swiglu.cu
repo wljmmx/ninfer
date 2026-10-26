@@ -1,4 +1,6 @@
 #include "ops/moe/kernels/cuda/groupwise_int/grouped_gate_up.cuh"
+#include "ops/moe/kernels/cuda/groupwise_int/grouped_gate_up_i8.cuh"
+#include "ops/moe/kernels/cuda/groupwise_int/quantize_a8.cuh"
 #include "ops/moe/kernels/cuda/groupwise_int/grouped_down.cuh"
 
 #include <algorithm>
@@ -106,7 +108,23 @@ void launch_grouped_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
     const int down_blocks = std::min(jobs * (S::hidden / 64), limit);
     with_expert_addresses(experts, profile, [&](auto gate_up, auto down) {
         using Access = decltype(gate_up);
-        if (profile.ffn.gate_up_type == QType::Q4_G64_FP16) {
+        // port (sm_89): int8 mma route for the decode shape. Off by default; the split PPL gate
+        // has to pass against the bf16 route before this can become the default.
+        static const bool int8_mma = [] {
+            const char* v = std::getenv("NINFER_MOE_INT8_MMA");
+            return v != nullptr && *v != '\0' && std::strtol(v, nullptr, 10) != 0;
+        }();
+        if (int8_mma && plan.columns == 1 && profile.ffn.gate_up_type == QType::Q4_G64_FP16) {
+            launch_quantize_a8(input, storage.activation_i8, storage.activation_scale, S::hidden,
+                               x.ne[1], stream);
+            CUDA_CHECK(cudaGetLastError());
+            const int slot_stride = S::top_k * x.ne[1];
+            grouped_gate_up_i8<S::hidden, 2 * S::intermediate, Access>
+                <<<dim3(2 * S::intermediate / 16, S::experts), 32>>>(storage.activation_i8,
+                    storage.activation_scale, gate_up, group.offsets, group.tokens, S::experts,
+                    slot_stride, activation);
+            CUDA_CHECK(cudaGetLastError());
+        } else if (profile.ffn.gate_up_type == QType::Q4_G64_FP16) {
             if (plan.columns == 64) {
                 grouped_q4_gate_up<S, Access, 8, 64, 2, GateUpDensity::Any>
                     <<<gate_blocks, 256, 0, stream>>>(input, group.tokens, group.offsets,

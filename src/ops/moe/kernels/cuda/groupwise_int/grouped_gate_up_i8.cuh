@@ -48,7 +48,7 @@ __device__ __forceinline__ unsigned i8_pack4(const std::uint8_t* row_codes, int 
 //           scales and row offset, so each bank layout decides its own addressing
 // offsets:  int [experts + 1]           token range of each expert
 // order:    int [total]                 which token row each routed slot came from
-// out:      bf16 [2*intermediate][tokens]  gate rows then up rows, token-major columns
+// out:      bf16 [2*intermediate][stride]  gate rows then up rows; column = routed slot
 //
 // The bf16 route writes two planes (gate at offset 0, up at offset intermediate*tokens); this
 // writes the same two planes through a single [row][token] index so the layouts match exactly.
@@ -56,7 +56,7 @@ template <int K, int Rows, class Access>
 __global__ void grouped_gate_up_i8(const std::int8_t* __restrict__ act_i8,
                                    const float* __restrict__ act_scale, Access weights,
                                    const int* __restrict__ offsets, const int* __restrict__ order,
-                                   int experts, int tokens, __nv_bfloat16* __restrict__ out) {
+                                   int experts, int stride, __nv_bfloat16* __restrict__ out) {
     constexpr int kG = K / 64;
     const int t      = threadIdx.x;   // one warp
     const int expert = blockIdx.y;
@@ -109,9 +109,10 @@ __global__ void grouped_gate_up_i8(const std::int8_t* __restrict__ act_i8,
         accf[3] += (float)acc[3] * s_hi;
     }
     if ((t % 4) == 0) {
-        const std::int64_t stride = tokens;
-        out[(std::int64_t)(row0 + r) * stride + tok]     = __float2bfloat16_rn(accf[0]);
-        out[(std::int64_t)(row0 + r + 8) * stride + tok] = __float2bfloat16_rn(accf[2]);
+        // Column is the routed slot, not the token: the activation planes are indexed by slot, so
+        // two tokens routed to the same expert write two different columns.
+        out[(std::int64_t)(row0 + r) * stride + begin]     = __float2bfloat16_rn(accf[0]);
+        out[(std::int64_t)(row0 + r + 8) * stride + begin] = __float2bfloat16_rn(accf[2]);
     }
 }
 
