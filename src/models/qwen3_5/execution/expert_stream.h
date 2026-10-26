@@ -139,6 +139,13 @@ private:
     std::vector<std::uint8_t> prev_spill_;
     std::vector<std::uint8_t> spill_hits_;
     std::vector<std::uint32_t> warm_journal_;
+    // Expected next-step demand per expert: an EWMA of "needed this step" (decay 0.9, about ten
+    // steps of memory). Promotion and demotion are decided by comparing these numbers, so an
+    // expert is hot because it keeps being needed, not because it happened to be needed twice in
+    // a row.
+    std::vector<float> demand_;
+    bool hot_seeded_ = false;
+    std::uint32_t slru_filled_ = 0;
     std::vector<std::int32_t> slru_prev_, slru_next_;
     std::int32_t slru_head_[2]{-1, -1};
     std::int32_t slru_tail_[2]{-1, -1};

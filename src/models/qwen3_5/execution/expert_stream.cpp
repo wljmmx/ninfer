@@ -586,13 +586,41 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 slru_of_expert_[expert] = slot;
                 push_back(slot, protect);
             };
-            // Promotion: an expert that missed twice in a row is not a one-off, so it takes a hot
-            // slot and the coldest hot entry leaves for the warm tier.
+            // Demand is an EWMA of "this expert was needed", so an expert that is needed in three
+            // steps out of ten reads the same as one needed twice in a row - which is the point:
+            // what matters is the probability it is needed again, not the streak.
+            if (demand_.size() != count_) { demand_.assign(count_, 0.0F); }
+            for (auto& value : demand_) { value *= 0.9F; }
+            for (const auto expert : need) { demand_[expert] += 1.0F; }
+            if (!hot_seeded_) {
+                // Seed from the first step's routes: the hot region then starts where the routing
+                // is, instead of where an un-converged score says it should be.
+                for (const auto expert : need) {
+                    if (slru_filled_ >= hot_cap) { break; }
+                    // an empty slot first: every slot starts at score zero, so picking by score
+                    // here would keep overwriting the expert just installed
+                    std::int32_t slot = -1;
+                    for (std::size_t s = 0; s < n_slots; ++s) {
+                        if (slru_expert_[s] == kEmpty) { slot = static_cast<std::int32_t>(s); break; }
+                    }
+                    if (slot < 0) { slot = coldest(false); }
+                    if (slot < 0) { break; }
+                    install(slot, expert, true);
+                    ++slru_filled_;
+                }
+                hot_seeded_ = slru_filled_ >= hot_cap;
+                hot_seeded_ = hot_seeded_ || slru_filled_ >= hot_cap;
+            }
+            // Promotion: expected demand above the cheap threshold, and above the coldest hot entry
+            // by a margin - a swap that does not beat what it displaces is churn.
             for (const auto expert : need) {
                 if (slru_of_expert_[expert] >= 0) { continue; }
-                if (expert >= spill_hits_.size() || spill_hits_[expert] < 2) { continue; }
                 const auto slot = coldest(true);
                 if (slot < 0) { break; }
+                const auto held = slru_expert_[slot];
+                const auto incoming = demand_[expert];
+                const auto displaced = held == kEmpty ? 0.0F : demand_[held];
+                if (incoming < 0.25F || incoming < displaced + 0.1F) { continue; }
                 install(slot, expert, false);
             }
             for (const auto expert : need) {
@@ -616,19 +644,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 chosen[expert] = true;
                 wanted.push_back(expert);
             }
-            // Book-keeping for the promotion above: consecutive misses in the spill ring, and
-            // which experts sat in it last step.
-            if (prev_spill_.size() != count_) {
-                prev_spill_.assign(count_, 0);
-                spill_hits_.assign(count_, 0);
-            }
-            std::fill(prev_spill_.begin(), prev_spill_.end(), 0);
-            for (std::size_t i = 0; i < wanted.size(); ++i) {
-                if (chosen[wanted[i]] && i >= n_slots) { prev_spill_[wanted[i]] = 1; }
-            }
-            for (std::size_t e = 0; e < count_; ++e) {
-                spill_hits_[e] = prev_spill_[e] ? static_cast<std::uint8_t>(spill_hits_[e] + 1) : 0;
-            }
+
         } else if (!regions_) {
             // Until the region split is measured against it, the proven streaming policy stays the
             // default: this step's routes take slots first, the decayed score fills the rest. That
