@@ -354,7 +354,7 @@ int check_grouped() {
 
     namespace gi = ninfer::ops::detail::moe_cuda::groupwise_int;
     gi::grouped_gate_up_i8<kK, kRows><<<dim3(kRows / 16, kExperts), 32>>>(
-        dAct, dAsc, dCodes, dWsc, dOff, dOrd, kExperts, dOut);
+        dAct, dAsc, dCodes, dWsc, dOff, dOrd, kExperts, kExperts, dOut);
     cudaDeviceSynchronize();
 
     std::vector<__nv_bfloat16> got((std::size_t)kExperts * kRows);
@@ -386,7 +386,8 @@ int check_grouped() {
                        (double)asc[(std::size_t)e * kG + g];
             }
             const double ref = sum;
-            const double got_v = __bfloat162float(got[(std::size_t)e * kRows + i]);
+            // out is [2*intermediate][tokens]: row stride is the token count.
+            const double got_v = __bfloat162float(got[(std::size_t)i * kExperts + e]);
             const double absd  = std::fabs(got_v - ref);
             const double rel   = ref != 0.0 ? absd / std::fabs(ref) : absd;
             if (rel > worst_rel) { worst_rel = rel; }

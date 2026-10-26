@@ -46,17 +46,17 @@ __device__ __forceinline__ unsigned i8_pack4(const std::uint8_t* row_codes, int 
 // wscales:  __half [experts][rows][k/64] per-(row, group) weight scale
 // offsets:  int [experts + 1]       token range of each expert
 // order:    int [total]             which token row each routed slot came from
-// out:      bf16 [total][rows]      gate/up result, scaled
+// out:      bf16 [2*intermediate][tokens]  gate rows then up rows, token-major columns
 //
-// Row order inside `out` matches the bf16 kernel: the first half of the rows is `gate`, the
-// second half `up`, both indexed by the routed slot.
+// The bf16 route writes two planes (gate at offset 0, up at offset intermediate*tokens); this
+// writes the same two planes through a single [row][token] index so the layouts match exactly.
 template <int K, int Rows>
 __global__ void grouped_gate_up_i8(const std::int8_t* __restrict__ act_i8,
                                    const float* __restrict__ act_scale,
                                    const std::uint8_t* __restrict__ codes,
                                    const __half* __restrict__ wscales,
                                    const int* __restrict__ offsets, const int* __restrict__ order,
-                                   int experts, __nv_bfloat16* __restrict__ out) {
+                                   int experts, int tokens, __nv_bfloat16* __restrict__ out) {
     constexpr int kG = K / 64;
     const int t      = threadIdx.x;   // one warp
     const int expert = blockIdx.y;
@@ -72,7 +72,6 @@ __global__ void grouped_gate_up_i8(const std::int8_t* __restrict__ act_i8,
     const auto* asc     = act_scale + (std::int64_t)tok * kG;
     const auto* w_base  = codes + (std::int64_t)expert * Rows * (K / 2);
     const auto* s_base  = wscales + (std::int64_t)expert * Rows * kG;
-    auto* dst           = out + (std::int64_t)begin * Rows;
 
     const int r  = t / 4;
     const int c4 = (t % 4) * 4;
@@ -106,8 +105,9 @@ __global__ void grouped_gate_up_i8(const std::int8_t* __restrict__ act_i8,
         accf[3] += (float)acc[3] * s_hi;
     }
     if ((t % 4) == 0) {
-        dst[(std::int64_t)(row0 + r) * 1 + 0]           = __float2bfloat16_rn(accf[0]);
-        dst[(std::int64_t)(row0 + r + 8) * 1 + 0]       = __float2bfloat16_rn(accf[2]);
+        const std::int64_t stride = tokens;
+        out[(std::int64_t)(row0 + r) * stride + tok]     = __float2bfloat16_rn(accf[0]);
+        out[(std::int64_t)(row0 + r + 8) * stride + tok] = __float2bfloat16_rn(accf[2]);
     }
 }
 
