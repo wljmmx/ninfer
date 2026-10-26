@@ -129,18 +129,38 @@ void launch_grouped_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
                                x.ne[1], stream);
             CUDA_CHECK(cudaGetLastError());
             const dim3 grid(S::intermediate / 16, jobs);
+            static const bool int8_ldm = [] {
+                const char* v = std::getenv("NINFER_MOE_INT8_LDM");
+                return v != nullptr && *v != '\0' && std::strtol(v, nullptr, 10) != 0;
+            }();
             if (plan.columns == 64) {
-                grouped_gate_up_i8_tile<S::hidden, 2 * S::intermediate, 64, Access>
-                    <<<grid, 256, 0, stream>>>(storage.activation_i8, storage.activation_scale,
-                                               gate_up, group.offsets, group.tokens,
-                                               group.job_experts, group.job_columns, group.info,
-                                               S::intermediate, activation);
+                if (int8_ldm) {
+                    grouped_gate_up_i8_tile_ldm<S::hidden, 2 * S::intermediate, 64, Access>
+                        <<<grid, 256, 0, stream>>>(storage.activation_i8, storage.activation_scale,
+                                                   gate_up, group.offsets, group.tokens,
+                                                   group.job_experts, group.job_columns,
+                                                   group.info, S::intermediate, activation);
+                } else {
+                    grouped_gate_up_i8_tile<S::hidden, 2 * S::intermediate, 64, Access>
+                        <<<grid, 256, 0, stream>>>(storage.activation_i8, storage.activation_scale,
+                                                   gate_up, group.offsets, group.tokens,
+                                                   group.job_experts, group.job_columns,
+                                                   group.info, S::intermediate, activation);
+                }
             } else {
-                grouped_gate_up_i8_tile<S::hidden, 2 * S::intermediate, 32, Access>
-                    <<<grid, 128, 0, stream>>>(storage.activation_i8, storage.activation_scale,
-                                               gate_up, group.offsets, group.tokens,
-                                               group.job_experts, group.job_columns, group.info,
-                                               S::intermediate, activation);
+                if (int8_ldm) {
+                    grouped_gate_up_i8_tile_ldm<S::hidden, 2 * S::intermediate, 32, Access>
+                        <<<grid, 128, 0, stream>>>(storage.activation_i8, storage.activation_scale,
+                                                   gate_up, group.offsets, group.tokens,
+                                                   group.job_experts, group.job_columns,
+                                                   group.info, S::intermediate, activation);
+                } else {
+                    grouped_gate_up_i8_tile<S::hidden, 2 * S::intermediate, 32, Access>
+                        <<<grid, 128, 0, stream>>>(storage.activation_i8, storage.activation_scale,
+                                                   gate_up, group.offsets, group.tokens,
+                                                   group.job_experts, group.job_columns,
+                                                   group.info, S::intermediate, activation);
+                }
             }
             CUDA_CHECK(cudaGetLastError());
         } else if (profile.ffn.gate_up_type == QType::Q4_G64_FP16) {

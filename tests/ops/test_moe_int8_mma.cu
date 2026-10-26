@@ -320,11 +320,13 @@ int check_quantize() {
 
 template <int Cols>
 int check_tile(const char* label) {
-    // Two experts, one Cols-column job each, the real gate_up shape. Checks grouping, the per-column
-    // activation scale, the swiglu product and the [slot][row] store, at both tile widths the shape
-    // policies use (32 below 768 tokens, 64 at or above).
-    constexpr int kExperts = 2;
-    constexpr int kSlotsPerExpert = Cols;
+    // Two experts, a full Cols-column job and a partial one each: the real gate_up shape, and the
+    // tail job an expert leaves when its slot count is not a multiple of the tile width. Checks
+    // grouping, the per-column activation scale, the swiglu product and the [slot][row] store, at
+    // both tile widths the shape policies use (32 below 768 tokens, 64 at or above).
+    constexpr int kExperts        = 2;
+    constexpr int kTail           = 5;
+    constexpr int kSlotsPerExpert = Cols + kTail;
     constexpr int kSlots          = kExperts * kSlotsPerExpert;
     constexpr int kTokens         = 20;
 
@@ -344,8 +346,8 @@ int check_tile(const char* label) {
     for (int e = 0; e < kExperts; ++e) { offsets[e + 1] = offsets[e] + kSlotsPerExpert; }
     std::vector<int> order(kSlots);
     for (int s = 0; s < kSlots; ++s) { order[s] = (s * 7 + 3) % kTokens; }
-    std::vector<int> job_experts{0, 1};
-    std::vector<int> job_columns{0, 0};
+    std::vector<int> job_experts{0, 0, 1, 1};
+    std::vector<int> job_columns{0, Cols, 0, Cols};
 
     __nv_bfloat16* dOut = nullptr;
     std::int8_t* dAct   = nullptr;
@@ -396,6 +398,31 @@ int check_tile(const char* label) {
 
     std::vector<__nv_bfloat16> got((std::size_t)kSlots * kGate);
     cudaMemcpy(got.data(), dOut, got.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+
+    // The ldmatrix tile only changes how the fragments are assembled, so it has to land on the same
+    // bytes; any difference is a staging or fragment-layout bug rather than arithmetic.
+    __nv_bfloat16* dOut2 = nullptr;
+    int ldm_bad          = 0;
+    if (cudaMalloc(&dOut2, got.size() * sizeof(__nv_bfloat16)) != cudaSuccess) {
+        std::printf("FAIL int8 tile ldm: cudaMalloc\n");
+        return 1;
+    }
+    gi::grouped_gate_up_i8_tile_ldm<kK, kRows, Cols>
+        <<<dim3(kGate / 16, (int)job_experts.size()), Cols * 4>>>(
+            dAct, dAsc, access, dOff, dOrd, dJobE, dJobC, dInfo, kGate, dOut2);
+    if (const auto err = cudaDeviceSynchronize(); err != cudaSuccess) {
+        std::printf("FAIL int8 tile ldm (%s): %s\n", label, cudaGetErrorString(err));
+        cudaFree(dOut2);
+        return 1;
+    }
+    std::vector<__nv_bfloat16> got2(got.size());
+    cudaMemcpy(got2.data(), dOut2, got.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+    cudaFree(dOut2);
+    for (std::size_t i = 0; i < got2.size(); ++i) {
+        if (__bfloat162float(got[i]) != __bfloat162float(got2[i])) { ++ldm_bad; }
+    }
+    std::printf("int8 tile ldmatrix vs naive (%s): %d / %d elements identical\n", label,
+                (int)got2.size() - ldm_bad, (int)got2.size());
 
     cudaFree(dOut);
     cudaFree(dAct);
@@ -465,7 +492,7 @@ int check_tile(const char* label) {
     }
     std::printf("int8 tile swiglu (%s): %d / %d values within bf16 rounding (worst rel %.2e)\n",
                 label, checked - bad, checked, worst_rel);
-    return bad;
+    return bad + ldm_bad;
 }
 
 } // namespace
@@ -480,4 +507,5 @@ int main() {
     else { std::printf("FAIL moe int8 mma: %d\n", failures); }
     return failures == 0 ? 0 : 1;
 }
+
 
