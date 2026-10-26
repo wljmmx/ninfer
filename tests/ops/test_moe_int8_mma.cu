@@ -1,16 +1,19 @@
-// Regression guards for the int8 route the MoE gate_up would need, kept as a test so the two
-// things that are easy to get wrong cannot silently rot:
+// Regression guards for the int8 route the MoE gate_up uses, kept as a test so the things that are
+// easy to get wrong cannot silently rot:
 //
 //   1. the m16n8k32 s8 mma fragment layout (A 16x32, B 32x8, C 16x8)
 //   2. the whole chain - int4 nibble decode, int8 activation, int8 mma, per-64-group scale -
 //      against a double reference
+//   3. the activation quantiser's row-per-token layout
+//   4. the prefill tile kernel: grouping, per-column activation scales, the swiglu product and the
+//      [slot][row] store the down kernel reads
 //
-// Both were verified before any product code was written against them. If either fails, an int8
-// gate_up built on top is wrong, so this is the cheapest place to find out.
+// (4) matters most: an earlier version of this kernel wrote two uncombined planes in a transposed
+// layout and nothing in the tree could consume them. The reference here is the product's contract,
+// not the kernel's own convention.
 #include "ops/op_check.h"
 #include "ops/moe/kernels/cuda/groupwise_int/expert.cuh"
-#include "ops/moe/kernels/cuda/groupwise_int/grouped_gate_up_i8.cuh"
-#include "ops/moe/kernels/cuda/groupwise_int/grouped_gate_up_i8_smem.cuh"
+#include "ops/moe/kernels/cuda/groupwise_int/grouped_gate_up_i8_tile.cuh"
 #include "ops/moe/kernels/cuda/groupwise_int/quantize_a8.cuh"
 
 #include <cuda_fp16.h>
@@ -57,17 +60,18 @@ __global__ void layout_probe(const std::int8_t* A, const std::int8_t* B, int* C)
     int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
     mma_s8(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
 
-    const int cc             = (t % 4) * 2;
-    C[r * 8 + cc]            = c0;
-    C[r * 8 + cc + 1]        = c1;
-    C[(r + 8) * 8 + cc]      = c2;
-    C[(r + 8) * 8 + cc + 1]  = c3;
+    const int cc            = (t % 4) * 2;
+    C[r * 8 + cc]           = c0;
+    C[r * 8 + cc + 1]       = c1;
+    C[(r + 8) * 8 + cc]     = c2;
+    C[(r + 8) * 8 + cc + 1] = c3;
 }
 
 // --- part 2: the whole chain on one expert, one token -------------------------------------
-constexpr int kRows = 1024;
+constexpr int kRows = 1024;   // 2 * intermediate: gate rows then up rows
 constexpr int kK    = 2048;
 constexpr int kG    = kK / 64;
+constexpr int kGate = kRows / 2;
 
 // One nibble in [0,15] -> the signed value the quantiser meant: (n ^ 8) - 8, range [-8, 7].
 __device__ __forceinline__ int nib_to_i8(const std::uint8_t* row_codes, int k) {
@@ -96,9 +100,9 @@ __global__ void gemv_probe(const std::uint8_t* __restrict__ codes, const __half*
     for (int g = 0; g < kG; ++g) {
         int acc[4] = {0, 0, 0, 0};
         for (int sub = 0; sub < 2; ++sub) {
-            const int k0     = g * 64 + sub * 32;
-            const auto* c_lo = codes + (std::int64_t)(row0 + r) * (kK / 2);
-            const auto* c_hi = codes + (std::int64_t)(row0 + r + 8) * (kK / 2);
+            const int k0      = g * 64 + sub * 32;
+            const auto* c_lo  = codes + (std::int64_t)(row0 + r) * (kK / 2);
+            const auto* c_hi  = codes + (std::int64_t)(row0 + r + 8) * (kK / 2);
             const unsigned a0 = pack4_nib(c_lo, k0 + c4);
             const unsigned a1 = pack4_nib(c_hi, k0 + c4);
             const unsigned a2 = pack4_nib(c_lo, k0 + c4 + 16);
@@ -209,12 +213,11 @@ int check_gemv() {
     __half* dWsc         = nullptr;
     float* dAsc          = nullptr;
     float* dOut          = nullptr;
-    const bool alloc_ok =
-        cudaMalloc(&dCodes, codes.size()) == cudaSuccess &&
-        cudaMalloc(&dAct, act.size()) == cudaSuccess &&
-        cudaMalloc(&dWsc, wsc.size() * sizeof(__half)) == cudaSuccess &&
-        cudaMalloc(&dAsc, asc.size() * sizeof(float)) == cudaSuccess &&
-        cudaMalloc(&dOut, kRows * sizeof(float)) == cudaSuccess;
+    const bool alloc_ok  = cudaMalloc(&dCodes, codes.size()) == cudaSuccess &&
+                          cudaMalloc(&dAct, act.size()) == cudaSuccess &&
+                          cudaMalloc(&dWsc, wsc.size() * sizeof(__half)) == cudaSuccess &&
+                          cudaMalloc(&dAsc, asc.size() * sizeof(float)) == cudaSuccess &&
+                          cudaMalloc(&dOut, kRows * sizeof(float)) == cudaSuccess;
     if (!alloc_ok) {
         std::printf("FAIL int8 gemv: cudaMalloc\n");
         return 1;
@@ -249,8 +252,9 @@ int check_gemv() {
 }
 
 int check_quantize() {
-    // One token, kK values: bf16 in, int8 out, one float scale per 64.
-    std::vector<__nv_bfloat16> x(kK);
+    // Three tokens, kK values each: bf16 in, int8 out, one float scale per 64, one row per token.
+    constexpr int kTokens = 3;
+    std::vector<__nv_bfloat16> x((std::size_t)kTokens * kK);
     unsigned seed = 777;
     auto next     = [&]() { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
     for (auto& v : x) {
@@ -259,77 +263,87 @@ int check_quantize() {
     }
 
     std::int8_t* dQ    = nullptr;
-    float* dS         = nullptr;
-    __nv_bfloat16* dX = nullptr;
-    const bool ok = cudaMalloc(&dX, kK * sizeof(__nv_bfloat16)) == cudaSuccess &&
-                    cudaMalloc(&dQ, kK) == cudaSuccess &&
-                    cudaMalloc(&dS, kG * sizeof(float)) == cudaSuccess;
+    float* dS          = nullptr;
+    __nv_bfloat16* dX  = nullptr;
+    const bool ok      = cudaMalloc(&dX, x.size() * sizeof(__nv_bfloat16)) == cudaSuccess &&
+                    cudaMalloc(&dQ, x.size()) == cudaSuccess &&
+                    cudaMalloc(&dS, (std::size_t)kTokens * kG * sizeof(float)) == cudaSuccess;
     if (!ok) {
         std::printf("FAIL int8 quantize: cudaMalloc\n");
         return 1;
     }
-    cudaMemcpy(dX, x.data(), kK * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+    cudaMemcpy(dX, x.data(), x.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
     namespace gi = ninfer::ops::detail::moe_cuda::groupwise_int;
-    gi::launch_quantize_a8(dX, dQ, dS, kK, 1, nullptr);
+    gi::launch_quantize_a8(dX, dQ, dS, kK, kTokens, nullptr);
     cudaDeviceSynchronize();
 
-    std::vector<std::int8_t> got_q(kK);
-    std::vector<float> got_s(kG);
-    cudaMemcpy(got_q.data(), dQ, kK, cudaMemcpyDeviceToHost);
-    cudaMemcpy(got_s.data(), dS, kG * sizeof(float), cudaMemcpyDeviceToHost);
+    std::vector<std::int8_t> got_q(x.size());
+    std::vector<float> got_s((std::size_t)kTokens * kG);
+    cudaMemcpy(got_q.data(), dQ, x.size(), cudaMemcpyDeviceToHost);
+    cudaMemcpy(got_s.data(), dS, got_s.size() * sizeof(float), cudaMemcpyDeviceToHost);
     cudaFree(dX);
     cudaFree(dQ);
     cudaFree(dS);
 
     int bad = 0;
-    for (int g = 0; g < kG; ++g) {
-        float maxv = 0.f;
-        for (int i = 0; i < 64; ++i) { maxv = fmaxf(maxv, std::fabs(__bfloat162float(x[g * 64 + i]))); }
-        const float scale = maxv > 0.f ? maxv / 127.0f : 1.0f;
-        if (std::fabs(scale - got_s[g]) > 1e-7f * std::max(1.f, std::fabs(scale))) {
-            if (bad < 3) { std::printf("  scale[%d] gpu=%.8f ref=%.8f\n", g, got_s[g], scale); }
-            ++bad;
-        }
-        const float inv = 1.0f / scale;
-        for (int i = 0; i < 64; ++i) {
-            // __float2int_rn is round-to-nearest-even; lrintf under the default rounding mode is
-            // the host-side equivalent (it lives in <cmath>, already included).
-            const int ref = (int)lrintf(__bfloat162float(x[g * 64 + i]) * inv);
-            if (ref != (int)got_q[g * 64 + i]) {
+    for (int tok = 0; tok < kTokens; ++tok) {
+        for (int g = 0; g < kG; ++g) {
+            const auto* row = &x[(std::size_t)tok * kK + g * 64];
+            float maxv      = 0.f;
+            for (int i = 0; i < 64; ++i) { maxv = fmaxf(maxv, std::fabs(__bfloat162float(row[i]))); }
+            const float scale = maxv > 0.f ? maxv / 127.0f : 1.0f;
+            const float got   = got_s[(std::size_t)tok * kG + g];
+            if (std::fabs(scale - got) > 1e-7f * std::max(1.f, std::fabs(scale))) {
                 if (bad < 3) {
-                    std::printf("  q[%d] gpu=%d ref=%d\n", g * 64 + i, (int)got_q[g * 64 + i], ref);
+                    std::printf("  scale[tok %d][%d] gpu=%.8f ref=%.8f\n", tok, g, got, scale);
                 }
                 ++bad;
             }
+            const float inv = 1.0f / scale;
+            for (int i = 0; i < 64; ++i) {
+                // __float2int_rn is round-to-nearest-even; lrintf is the host equivalent.
+                const int ref = (int)lrintf(__bfloat162float(row[i]) * inv);
+                const int val = (int)got_q[(std::size_t)tok * kK + g * 64 + i];
+                if (ref != val) {
+                    if (bad < 3) {
+                        std::printf("  q[tok %d][%d] gpu=%d ref=%d\n", tok, g * 64 + i, val, ref);
+                    }
+                    ++bad;
+                }
+            }
         }
     }
-    std::printf("int8 quantize: %d / %d values exact (%d groups)\n", kK - bad, kK, kG);
+    const int total = (int)x.size();
+    std::printf("int8 quantize: %d / %d values exact, %d tokens\n", total - bad, total, kTokens);
     return bad;
 }
 
 int check_grouped() {
-    // Two experts, one token each, the real gate_up shape. Checks that the grouping (expert -> its
-    // own weight bank and its own token) and the per-row weight scale reach the right place.
+    // Two experts, one 32-column job each, the real gate_up shape. Checks grouping, the per-column
+    // activation scale, the swiglu product and the [slot][row] store.
     constexpr int kExperts = 2;
+    constexpr int kSlotsPerExpert = 32;
+    constexpr int kSlots          = kExperts * kSlotsPerExpert;
+    constexpr int kTokens         = 20;
+
     std::vector<std::uint8_t> codes((std::size_t)kExperts * kRows * (kK / 2));
     std::vector<__half> wsc((std::size_t)kExperts * kRows * kG);
-    std::vector<std::int8_t> act((std::size_t)kExperts * kK);
-    std::vector<float> asc((std::size_t)kExperts * kG);
+    std::vector<std::int8_t> act((std::size_t)kTokens * kK);
+    std::vector<float> asc((std::size_t)kTokens * kG);
 
     unsigned seed = 999;
     auto next     = [&]() { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
     for (auto& c : codes) { c = (std::uint8_t)(next() & 0xff); }
     for (auto& s : wsc) { s = __float2half(0.001f + 0.0005f * (float)(next() % 8)); }
-    for (auto& a : act) { a = (std::int8_t)((int)(next() % 255) - 127); }
+    for (auto& a : act) { a = (std::int8_t)((int)(next() % 25) - 12); }
     for (auto& s : asc) { s = 0.01f + 0.002f * (float)(next() % 5); }
 
     std::vector<int> offsets(kExperts + 1, 0);
-    for (int e = 0; e < kExperts; ++e) { offsets[e + 1] = offsets[e] + 1; }
-    std::vector<int> order(kExperts);
-    for (int e = 0; e < kExperts; ++e) { order[e] = e; }
-    // One shared bank: expert e starts kRows rows into it, which is what Access::row reports.
-    std::vector<int> row_base(kExperts);
-    for (int e = 0; e < kExperts; ++e) { row_base[e] = e * kRows; }
+    for (int e = 0; e < kExperts; ++e) { offsets[e + 1] = offsets[e] + kSlotsPerExpert; }
+    std::vector<int> order(kSlots);
+    for (int s = 0; s < kSlots; ++s) { order[s] = (s * 7 + 3) % kTokens; }
+    std::vector<int> job_experts{0, 1};
+    std::vector<int> job_columns{0, 0};
 
     __nv_bfloat16* dOut = nullptr;
     std::int8_t* dAct   = nullptr;
@@ -338,59 +352,47 @@ int check_grouped() {
     __half* dWsc        = nullptr;
     int* dOff           = nullptr;
     int* dOrd           = nullptr;
-    int* dRow           = nullptr;
+    int* dJobE          = nullptr;
+    int* dJobC          = nullptr;
+    ninfer::ops::detail::moe_cuda::groupwise_int::GroupedInfo* dInfo = nullptr;
     const bool ok =
-        cudaMalloc(&dOut, kExperts * kRows * sizeof(__nv_bfloat16)) == cudaSuccess &&
+        cudaMalloc(&dOut, (std::size_t)kSlots * kGate * sizeof(__nv_bfloat16)) == cudaSuccess &&
         cudaMalloc(&dAct, act.size()) == cudaSuccess &&
         cudaMalloc(&dAsc, asc.size() * sizeof(float)) == cudaSuccess &&
         cudaMalloc(&dCodes, codes.size()) == cudaSuccess &&
         cudaMalloc(&dWsc, wsc.size() * sizeof(__half)) == cudaSuccess &&
         cudaMalloc(&dOff, offsets.size() * sizeof(int)) == cudaSuccess &&
         cudaMalloc(&dOrd, order.size() * sizeof(int)) == cudaSuccess &&
-        cudaMalloc(&dRow, row_base.size() * sizeof(int)) == cudaSuccess;
+        cudaMalloc(&dJobE, job_experts.size() * sizeof(int)) == cudaSuccess &&
+        cudaMalloc(&dJobC, job_columns.size() * sizeof(int)) == cudaSuccess &&
+        cudaMalloc(&dInfo, sizeof(*dInfo)) == cudaSuccess;
     if (!ok) {
-        std::printf("FAIL int8 grouped: cudaMalloc\n");
+        std::printf("FAIL int8 tile: cudaMalloc\n");
         return 1;
     }
+    const ninfer::ops::detail::moe_cuda::groupwise_int::GroupedInfo info{
+        (int)job_experts.size(), 0, 0};
     cudaMemcpy(dAct, act.data(), act.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(dAsc, asc.data(), asc.size() * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(dCodes, codes.data(), codes.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(dWsc, wsc.data(), wsc.size() * sizeof(__half), cudaMemcpyHostToDevice);
     cudaMemcpy(dOff, offsets.data(), offsets.size() * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(dOrd, order.data(), order.size() * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(dRow, row_base.data(), row_base.size() * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(dJobE, job_experts.data(), job_experts.size() * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(dJobC, job_columns.data(), job_columns.size() * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(dInfo, &info, sizeof(info), cudaMemcpyHostToDevice);
 
     namespace gi = ninfer::ops::detail::moe_cuda::groupwise_int;
     // PackedExpertMatrix is the bank layout the product uses for a per-expert artifact: a shared
     // base plus a row offset of expert * Rows.
     const gi::PackedExpertMatrix access{dCodes, nullptr,
                                         reinterpret_cast<const std::uint8_t*>(dWsc)};
-    gi::grouped_gate_up_i8<kK, kRows><<<dim3(kRows / 16, kExperts), 32>>>(
-        dAct, dAsc, access, dOff, dOrd, kExperts, kExperts, dOut);
+    gi::grouped_gate_up_i8_tile<kK, kRows><<<dim3(kGate / 16, (int)job_experts.size()), 128>>>(
+        dAct, dAsc, access, dOff, dOrd, dJobE, dJobC, dInfo, kGate, dOut);
     cudaDeviceSynchronize();
 
-    std::vector<__nv_bfloat16> got((std::size_t)kExperts * kRows);
+    std::vector<__nv_bfloat16> got((std::size_t)kSlots * kGate);
     cudaMemcpy(got.data(), dOut, got.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
-
-    // Same inputs through the shared-memory staging kernel; the two must agree exactly.
-    __nv_bfloat16* dOut2 = nullptr;
-    if (cudaMalloc(&dOut2, kExperts * kRows * sizeof(__nv_bfloat16)) != cudaSuccess) {
-        std::printf("FAIL int8 smem: cudaMalloc\n");
-        return 1;
-    }
-    gi::grouped_gate_up_i8_smem<kK, kRows><<<dim3(kRows / 16, kExperts), 32>>>(
-        dAct, dAsc, access, dOff, dOrd, kExperts, kExperts, dOut2);
-    cudaDeviceSynchronize();
-
-    std::vector<__nv_bfloat16> got2((std::size_t)kExperts * kRows);
-    cudaMemcpy(got2.data(), dOut2, got2.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
-    cudaFree(dOut2);
-    int smem_bad = 0;
-    for (std::size_t i = 0; i < got2.size(); ++i) {
-        if (__bfloat162float(got[i]) != __bfloat162float(got2[i])) { ++smem_bad; }
-    }
-    std::printf("int8 smem vs naive: %d / %d elements identical\n",
-                (int)got2.size() - smem_bad, (int)got2.size());
 
     cudaFree(dOut);
     cudaFree(dAct);
@@ -399,38 +401,68 @@ int check_grouped() {
     cudaFree(dWsc);
     cudaFree(dOff);
     cudaFree(dOrd);
-    cudaFree(dRow);
+    cudaFree(dJobE);
+    cudaFree(dJobC);
+    cudaFree(dInfo);
 
-    // Reference: decode every weight, dot against the expert's own activation, scale per group.
-    int bad = 0;
-    double worst_rel = 0.0;
-    for (int e = 0; e < kExperts; ++e) {
-        for (int i = 0; i < kRows; ++i) {
-            double sum = 0.0;
-            for (int g = 0; g < kG; ++g) {
-                int acc_i = 0;
-                for (int k = g * 64; k < (g + 1) * 64; ++k) {
-                    const int byte = codes[(std::size_t)e * kRows * (kK / 2) + (std::size_t)i * (kK / 2) + (k >> 1)];
-                    const int n    = (k & 1) ? (byte >> 4) : (byte & 0x0f);
-                    const int w    = (n ^ 8) - 8;
-                    acc_i += w * (int)act[(std::size_t)e * kK + k];
-                }
-                sum += (double)acc_i *
-                       (double)__half2float(wsc[(std::size_t)e * kRows * kG + (std::size_t)i * kG + g]) *
-                       (double)asc[(std::size_t)e * kG + g];
+    // Reference: decode both weight rows (gate at row, up at kGate + row), dot each against the
+    // slot's own token, scale per group, then form the swiglu product.
+    const auto w_at = [&](int e, int row, int k) {
+        const int byte = codes[((std::size_t)e * kRows + row) * (kK / 2) + (k >> 1)];
+        const int n    = (k & 1) ? (byte >> 4) : (byte & 0x0f);
+        return (n ^ 8) - 8;
+    };
+    const auto ref_at = [&](int slot, int row) {
+        const int e   = slot / kSlotsPerExpert;
+        const int tok = order[slot];
+        double gsum = 0.0, usum = 0.0;
+        for (int g = 0; g < kG; ++g) {
+            int ag = 0, au = 0;
+            for (int k = g * 64; k < (g + 1) * 64; ++k) {
+                const int a = (int)act[(std::size_t)tok * kK + k];
+                ag += w_at(e, row, k) * a;
+                au += w_at(e, kGate + row, k) * a;
             }
-            const double ref = sum;
-            // out is [2*intermediate][tokens]: row stride is the token count.
-            const double got_v = __bfloat162float(got[(std::size_t)i * kExperts + e]);
-            const double absd  = std::fabs(got_v - ref);
-            const double rel   = ref != 0.0 ? absd / std::fabs(ref) : absd;
+            const float sa = asc[(std::size_t)tok * kG + g];
+            gsum += (double)ag * (double)__half2float(wsc[((std::size_t)e * kRows + row) * kG + g]) *
+                    (double)sa;
+            usum += (double)au *
+                    (double)__half2float(wsc[((std::size_t)e * kRows + kGate + row) * kG + g]) *
+                    (double)sa;
+        }
+        const double silu = gsum / (1.0 + std::exp(-gsum));
+        return silu * usum;
+    };
+
+    double worst_rel = 0.0;
+    int bad = 0, checked = 0;
+    // Every slot at rows that land in different 16-row tiles, plus two slots row by row.
+    const int probe_rows[] = {0, 8, 255, 256, 511};
+    for (int slot = 0; slot < kSlots; ++slot) {
+        for (int row : probe_rows) {
+            const double ref = ref_at(slot, row);
+            const double val = __bfloat162float(got[(std::size_t)slot * kGate + row]);
+            const double absd = std::fabs(val - ref);
+            const double rel  = ref != 0.0 ? absd / std::fabs(ref) : absd;
             if (rel > worst_rel) { worst_rel = rel; }
-            if (rel > 2e-2 && absd > 1e-2) { ++bad; }  // bf16 output rounding is ~1e-2 relative
+            if (rel > 2e-2 && absd > 1e-2) { ++bad; }
+            ++checked;
         }
     }
-    std::printf("int8 grouped: %d / %d rows within bf16 rounding (worst rel %.2e)\n",
-                kExperts * kRows - bad, kExperts * kRows, worst_rel);
-    return bad + smem_bad;
+    for (int slot : {0, 33}) {
+        for (int row = 0; row < kGate; ++row) {
+            const double ref = ref_at(slot, row);
+            const double val = __bfloat162float(got[(std::size_t)slot * kGate + row]);
+            const double absd = std::fabs(val - ref);
+            const double rel  = ref != 0.0 ? absd / std::fabs(ref) : absd;
+            if (rel > worst_rel) { worst_rel = rel; }
+            if (rel > 2e-2 && absd > 1e-2) { ++bad; }
+            ++checked;
+        }
+    }
+    std::printf("int8 tile swiglu: %d / %d values within bf16 rounding (worst rel %.2e)\n",
+                checked - bad, checked, worst_rel);
+    return bad;
 }
 
 } // namespace

@@ -1,6 +1,5 @@
 #include "ops/moe/kernels/cuda/groupwise_int/grouped_gate_up.cuh"
-#include "ops/moe/kernels/cuda/groupwise_int/grouped_gate_up_i8.cuh"
-#include "ops/moe/kernels/cuda/groupwise_int/grouped_gate_up_i8_smem.cuh"
+#include "ops/moe/kernels/cuda/groupwise_int/grouped_gate_up_i8_tile.cuh"
 #include "ops/moe/kernels/cuda/groupwise_int/quantize_a8.cuh"
 #include "ops/moe/kernels/cuda/groupwise_int/grouped_down.cuh"
 
@@ -109,21 +108,21 @@ void launch_grouped_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
     const int down_blocks = std::min(jobs * (S::hidden / 64), limit);
     with_expert_addresses(experts, profile, [&](auto gate_up, auto down) {
         using Access = decltype(gate_up);
-        // port (sm_89): int8 mma route for the decode shape. Off by default; the split PPL gate
-        // has to pass against the bf16 route before this can become the default.
+        // port (sm_89): int8 mma route for the 32-column prefill tile. Off by default; the split PPL
+        // gate has to pass against the bf16 route before this can become the default.
         static const bool int8_mma = [] {
             const char* v = std::getenv("NINFER_MOE_INT8_MMA");
             return v != nullptr && *v != '\0' && std::strtol(v, nullptr, 10) != 0;
         }();
-        if (int8_mma && plan.columns == 1 && profile.ffn.gate_up_type == QType::Q4_G64_FP16) {
+        if (int8_mma && plan.columns == 32 && profile.ffn.gate_up_type == QType::Q4_G64_FP16) {
             launch_quantize_a8(input, storage.activation_i8, storage.activation_scale, S::hidden,
                                x.ne[1], stream);
             CUDA_CHECK(cudaGetLastError());
-            const int slot_stride = S::top_k * x.ne[1];
-            grouped_gate_up_i8_smem<S::hidden, 2 * S::intermediate, Access>
-                <<<dim3(2 * S::intermediate / 16, S::experts), 32>>>(storage.activation_i8,
-                    storage.activation_scale, gate_up, group.offsets, group.tokens, S::experts,
-                    slot_stride, activation);
+            grouped_gate_up_i8_tile<S::hidden, 2 * S::intermediate, Access>
+                <<<dim3(S::intermediate / 16, jobs), 128, 0, stream>>>(
+                    storage.activation_i8, storage.activation_scale, gate_up, group.offsets,
+                    group.tokens, group.job_experts, group.job_columns, group.info,
+                    S::intermediate, activation);
             CUDA_CHECK(cudaGetLastError());
         } else if (profile.ffn.gate_up_type == QType::Q4_G64_FP16) {
             if (plan.columns == 64) {
