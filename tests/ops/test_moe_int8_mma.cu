@@ -8,6 +8,7 @@
 // Both were verified before any product code was written against them. If either fails, an int8
 // gate_up built on top is wrong, so this is the cheapest place to find out.
 #include "ops/op_check.h"
+#include "ops/moe/kernels/cuda/groupwise_int/quantize_a8.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -244,12 +245,72 @@ int check_gemv() {
     return bad;
 }
 
+int check_quantize() {
+    // One token, kK values: bf16 in, int8 out, one float scale per 64.
+    std::vector<__nv_bfloat16> x(kK);
+    unsigned seed = 777;
+    auto next     = [&]() { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+    for (auto& v : x) {
+        const float f = ((float)(next() % 20001) / 10000.0f) - 1.0f;  // [-1, 1)
+        v             = __float2bfloat16_rn(f);
+    }
+
+    std::int8_t* dQ    = nullptr;
+    float* dS         = nullptr;
+    __nv_bfloat16* dX = nullptr;
+    const bool ok = cudaMalloc(&dX, kK * sizeof(__nv_bfloat16)) == cudaSuccess &&
+                    cudaMalloc(&dQ, kK) == cudaSuccess &&
+                    cudaMalloc(&dS, kG * sizeof(float)) == cudaSuccess;
+    if (!ok) {
+        std::printf("FAIL int8 quantize: cudaMalloc\n");
+        return 1;
+    }
+    cudaMemcpy(dX, x.data(), kK * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+    namespace gi = ninfer::ops::detail::moe_cuda::groupwise_int;
+    gi::launch_quantize_a8(dX, dQ, dS, kK, 1, nullptr);
+    cudaDeviceSynchronize();
+
+    std::vector<std::int8_t> got_q(kK);
+    std::vector<float> got_s(kG);
+    cudaMemcpy(got_q.data(), dQ, kK, cudaMemcpyDeviceToHost);
+    cudaMemcpy(got_s.data(), dS, kG * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(dX);
+    cudaFree(dQ);
+    cudaFree(dS);
+
+    int bad = 0;
+    for (int g = 0; g < kG; ++g) {
+        float maxv = 0.f;
+        for (int i = 0; i < 64; ++i) { maxv = fmaxf(maxv, std::fabs(__bfloat162float(x[g * 64 + i]))); }
+        const float scale = maxv > 0.f ? maxv / 127.0f : 1.0f;
+        if (std::fabs(scale - got_s[g]) > 1e-7f * std::max(1.f, std::fabs(scale))) {
+            if (bad < 3) { std::printf("  scale[%d] gpu=%.8f ref=%.8f\n", g, got_s[g], scale); }
+            ++bad;
+        }
+        const float inv = 1.0f / scale;
+        for (int i = 0; i < 64; ++i) {
+            // __float2int_rn is round-to-nearest-even; lrintf under the default rounding mode is
+            // the host-side equivalent (it lives in <cmath>, already included).
+            const int ref = (int)lrintf(__bfloat162float(x[g * 64 + i]) * inv);
+            if (ref != (int)got_q[g * 64 + i]) {
+                if (bad < 3) {
+                    std::printf("  q[%d] gpu=%d ref=%d\n", g * 64 + i, (int)got_q[g * 64 + i], ref);
+                }
+                ++bad;
+            }
+        }
+    }
+    std::printf("int8 quantize: %d / %d values exact (%d groups)\n", kK - bad, kK, kG);
+    return bad;
+}
+
 } // namespace
 
 int main() {
-    const int layout_bad = check_layout();
-    const int gemv_bad   = check_gemv();
-    const int failures   = layout_bad + gemv_bad;
+    const int layout_bad  = check_layout();
+    const int gemv_bad    = check_gemv();
+    const int quant_bad   = check_quantize();
+    const int failures    = layout_bad + gemv_bad + quant_bad;
     if (failures == 0) { std::printf("PASS moe int8 mma\n"); }
     else { std::printf("FAIL moe int8 mma: %d\n", failures); }
     return failures == 0 ? 0 : 1;
