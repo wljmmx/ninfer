@@ -274,13 +274,25 @@ __global__ __launch_bounds__(Cols * 4) void grouped_gate_up_i8_tile_ldm(
         }
         cp_async_commit();
     };
+    // Eight nibbles at a time: one 32-bit read of the packed row, per-byte xor/subtract to turn each
+    // nibble into (n ^ 8) - 8, then two byte permutes to interleave the low and high nibbles into
+    // the k order the tile stores. The scalar form spent eight iterations here.
     const auto decode = [&](int buf) {
 #pragma unroll
-        for (int i = 0; i < kTileRows * 64 / kThreads; ++i) {
+        for (int i = 0; i < kTileRows * 8 / kThreads; ++i) {
             const int e   = t + i * kThreads;
-            const int row = e >> 6;
-            const int k   = e & 63;
-            As[buf][row][k] = static_cast<std::int8_t>(i8_nib(&Cr[buf][row][0], k));
+            const int row = e >> 3;
+            const int k0  = (e & 7) * 8;
+            const std::uint32_t w =
+                *reinterpret_cast<const std::uint32_t*>(&Cr[buf][row][k0 >> 1]);
+            const std::uint32_t lo =
+                __vsubss4(static_cast<int>((w & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
+            const std::uint32_t hi =
+                __vsubss4(static_cast<int>(((w >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
+            *reinterpret_cast<std::uint32_t*>(&As[buf][row][k0]) =
+                __byte_perm(lo, hi, 0x5140); // low0 high0 low1 high1
+            *reinterpret_cast<std::uint32_t*>(&As[buf][row][k0 + 4]) =
+                __byte_perm(lo, hi, 0x7362); // low2 high2 low3 high3
         }
     };
 

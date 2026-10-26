@@ -399,6 +399,52 @@ int check_tile(const char* label) {
     std::vector<__nv_bfloat16> got((std::size_t)kSlots * kGate);
     cudaMemcpy(got.data(), dOut, got.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
 
+    // Deterministic timing of the two forms on the same launch shape. The product-level rate is
+    // useless here: it mixes prefill and decode calls and drifts by factors between sessions, while
+    // this runs the identical grid in a loop with the clock already warm.
+    {
+        const auto time_form = [&](bool use_ldm, int iters) {
+            for (int i = 0; i < 8; ++i) { // warm the clocks on this shape
+                if (use_ldm) {
+                    gi::grouped_gate_up_i8_tile_ldm<kK, kRows, Cols>
+                        <<<dim3(kGate / 16, (int)job_experts.size()), Cols * 4>>>(
+                            dAct, dAsc, access, dOff, dOrd, dJobE, dJobC, dInfo, kGate, dOut);
+                } else {
+                    gi::grouped_gate_up_i8_tile<kK, kRows, Cols>
+                        <<<dim3(kGate / 16, (int)job_experts.size()), Cols * 4>>>(
+                            dAct, dAsc, access, dOff, dOrd, dJobE, dJobC, dInfo, kGate, dOut);
+                }
+            }
+            cudaDeviceSynchronize();
+            cudaEvent_t a{}, b{};
+            cudaEventCreate(&a);
+            cudaEventCreate(&b);
+            cudaEventRecord(a);
+            for (int i = 0; i < iters; ++i) {
+                if (use_ldm) {
+                    gi::grouped_gate_up_i8_tile_ldm<kK, kRows, Cols>
+                        <<<dim3(kGate / 16, (int)job_experts.size()), Cols * 4>>>(
+                            dAct, dAsc, access, dOff, dOrd, dJobE, dJobC, dInfo, kGate, dOut);
+                } else {
+                    gi::grouped_gate_up_i8_tile<kK, kRows, Cols>
+                        <<<dim3(kGate / 16, (int)job_experts.size()), Cols * 4>>>(
+                            dAct, dAsc, access, dOff, dOrd, dJobE, dJobC, dInfo, kGate, dOut);
+                }
+            }
+            cudaEventRecord(b);
+            cudaEventSynchronize(b);
+            float ms = 0.0F;
+            cudaEventElapsedTime(&ms, a, b);
+            cudaEventDestroy(a);
+            cudaEventDestroy(b);
+            return ms / float(iters);
+        };
+        const float naive_ms = time_form(false, 200);
+        const float ldm_ms   = time_form(true, 200);
+        std::printf("int8 tile timing (%s): naive %.3f ms  ldmatrix %.3f ms  (%.2fx)\n", label,
+                    naive_ms, ldm_ms, naive_ms / ldm_ms);
+    }
+
     // The ldmatrix tile only changes how the fragments are assembled, so it has to land on the same
     // bytes; any difference is a staging or fragment-layout bug rather than arithmetic.
     __nv_bfloat16* dOut2 = nullptr;
