@@ -557,25 +557,49 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 const auto slot = slru_of_expert_[expert];
                 if (slot >= 0) { touch(slot); }
             }
+            // Demotion order: the hot entry with the lowest decayed score goes first, not the one
+            // that was touched longest ago. A score that decays is what makes "hot to warm" a
+            // decision about the workload rather than about the clock, and it is the same number
+            // the RAM tier's journal uses to decide what to keep.
+            const auto coldest = [&](bool protect_need) -> std::int32_t {
+                std::int32_t victim = -1;
+                float best = 0.0F;
+                for (std::size_t s = 0; s < n_slots; ++s) {
+                    const auto held = slru_expert_[s];
+                    if (held != kEmpty && protect_need && in_need[held]) { continue; }
+                    const auto score = held == kEmpty ? -1.0F : hot_score_[held];
+                    if (victim < 0 || score < best) { victim = static_cast<std::int32_t>(s); best = score; }
+                }
+                return victim;
+            };
+            const auto install = [&](std::int32_t slot, std::uint32_t expert, bool protect) {
+                const auto held = slru_expert_[slot];
+                if (held != kEmpty) {
+                    slru_of_expert_[held] = -1;
+                    warm_journal_.push_back(held);
+                    if (warm_journal_.size() > 512) { warm_journal_.erase(warm_journal_.begin()); }
+                }
+                const bool was = slru_protected_[slot] != 0;
+                unlink(slot);
+                if (was) { --slru_n_protected_; }
+                slru_expert_[slot] = expert;
+                slru_of_expert_[expert] = slot;
+                push_back(slot, protect);
+            };
+            // Promotion: an expert that missed twice in a row is not a one-off, so it takes a hot
+            // slot and the coldest hot entry leaves for the warm tier.
             for (const auto expert : need) {
                 if (slru_of_expert_[expert] >= 0) { continue; }
-                // victim: probation head first, never a slot this step still needs
-                std::int32_t victim = -1;
-                for (int seg = 0; seg < 2 && victim < 0; ++seg) {
-                    for (auto s = slru_head_[seg]; s >= 0; s = slru_next_[s]) {
-                        const auto held = slru_expert_[s];
-                        if (held == kEmpty || !in_need[held]) { victim = s; break; }
-                    }
-                }
-                if (victim < 0) { break; }
-                const auto held = slru_expert_[victim];
-                if (held != kEmpty) { slru_of_expert_[held] = -1; }
-                const bool was = slru_protected_[victim] != 0;
-                unlink(victim);
-                if (was) { --slru_n_protected_; }
-                slru_expert_[victim] = expert;
-                slru_of_expert_[expert] = victim;
-                push_back(victim, false);
+                if (expert >= spill_hits_.size() || spill_hits_[expert] < 2) { continue; }
+                const auto slot = coldest(true);
+                if (slot < 0) { break; }
+                install(slot, expert, false);
+            }
+            for (const auto expert : need) {
+                if (slru_of_expert_[expert] >= 0) { continue; }
+                const auto slot = coldest(true);
+                if (slot < 0) { break; }
+                install(slot, expert, false);
             }
             wanted.clear();
             wanted.reserve(capacity);
@@ -591,6 +615,19 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 if (chosen[expert]) { continue; }
                 chosen[expert] = true;
                 wanted.push_back(expert);
+            }
+            // Book-keeping for the promotion above: consecutive misses in the spill ring, and
+            // which experts sat in it last step.
+            if (prev_spill_.size() != count_) {
+                prev_spill_.assign(count_, 0);
+                spill_hits_.assign(count_, 0);
+            }
+            std::fill(prev_spill_.begin(), prev_spill_.end(), 0);
+            for (std::size_t i = 0; i < wanted.size(); ++i) {
+                if (chosen[wanted[i]] && i >= n_slots) { prev_spill_[wanted[i]] = 1; }
+            }
+            for (std::size_t e = 0; e < count_; ++e) {
+                spill_hits_[e] = prev_spill_[e] ? static_cast<std::uint8_t>(spill_hits_[e] + 1) : 0;
             }
         } else if (!regions_) {
             // Until the region split is measured against it, the proven streaming policy stays the

@@ -133,6 +133,12 @@ private:
     std::vector<std::int32_t> slru_of_expert_; // count_, -1 when not resident
     std::vector<std::uint8_t> slru_protected_;
     std::uint32_t slru_n_protected_ = 0;
+    // Promotion and demotion between the regions: an expert that misses twice in a row is
+    // promoted into the hot region; the hot entry with the lowest decayed score leaves for the
+    // warm tier, and its id is kept in a short journal the RAM side and the prefetch read.
+    std::vector<std::uint8_t> prev_spill_;
+    std::vector<std::uint8_t> spill_hits_;
+    std::vector<std::uint32_t> warm_journal_;
     std::vector<std::int32_t> slru_prev_, slru_next_;
     std::int32_t slru_head_[2]{-1, -1};
     std::int32_t slru_tail_[2]{-1, -1};
