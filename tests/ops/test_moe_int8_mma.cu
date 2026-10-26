@@ -8,6 +8,7 @@
 // Both were verified before any product code was written against them. If either fails, an int8
 // gate_up built on top is wrong, so this is the cheapest place to find out.
 #include "ops/op_check.h"
+#include "ops/moe/kernels/cuda/groupwise_int/expert.cuh"
 #include "ops/moe/kernels/cuda/groupwise_int/grouped_gate_up_i8.cuh"
 #include "ops/moe/kernels/cuda/groupwise_int/quantize_a8.cuh"
 
@@ -359,8 +360,12 @@ int check_grouped() {
     cudaMemcpy(dRow, row_base.data(), row_base.size() * sizeof(int), cudaMemcpyHostToDevice);
 
     namespace gi = ninfer::ops::detail::moe_cuda::groupwise_int;
+    // PackedExpertMatrix is the bank layout the product uses for a per-expert artifact: a shared
+    // base plus a row offset of expert * Rows.
+    const gi::PackedExpertMatrix access{dCodes, nullptr,
+                                        reinterpret_cast<const std::uint8_t*>(dWsc)};
     gi::grouped_gate_up_i8<kK, kRows><<<dim3(kRows / 16, kExperts), 32>>>(
-        dAct, dAsc, dCodes, dWsc, dRow, dOff, dOrd, kExperts, kExperts, dOut);
+        dAct, dAsc, access, dOff, dOrd, kExperts, kExperts, dOut);
     cudaDeviceSynchronize();
 
     std::vector<__nv_bfloat16> got((std::size_t)kExperts * kRows);

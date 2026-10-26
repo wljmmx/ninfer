@@ -44,19 +44,17 @@ __device__ __forceinline__ unsigned i8_pack4(const std::uint8_t* row_codes, int 
 // act_scale: float [tokens][k/64]   one scale per 64-wide k group
 // codes:    uint8 [rows][k/2]          packed 4-bit weights of the whole bank
 // wscales:  __half [rows][k/64]         per-(row, group) weight scale of the whole bank
-// row_base: int [experts]               row of `codes` where each expert starts (Access::row)
+// weights:  Access (Packed / Strided / Indexed) - resolve(expert) yields that expert's codes,
+//           scales and row offset, so each bank layout decides its own addressing
 // offsets:  int [experts + 1]           token range of each expert
 // order:    int [total]                 which token row each routed slot came from
 // out:      bf16 [2*intermediate][tokens]  gate rows then up rows, token-major columns
 //
 // The bf16 route writes two planes (gate at offset 0, up at offset intermediate*tokens); this
 // writes the same two planes through a single [row][token] index so the layouts match exactly.
-template <int K, int Rows>
+template <int K, int Rows, class Access>
 __global__ void grouped_gate_up_i8(const std::int8_t* __restrict__ act_i8,
-                                   const float* __restrict__ act_scale,
-                                   const std::uint8_t* __restrict__ codes,
-                                   const __half* __restrict__ wscales,
-                                   const int* __restrict__ row_base,
+                                   const float* __restrict__ act_scale, Access weights,
                                    const int* __restrict__ offsets, const int* __restrict__ order,
                                    int experts, int tokens, __nv_bfloat16* __restrict__ out) {
     constexpr int kG = K / 64;
@@ -72,10 +70,12 @@ __global__ void grouped_gate_up_i8(const std::int8_t* __restrict__ act_i8,
     const int tok       = order[begin];
     const auto* a8      = act_i8 + (std::int64_t)tok * K;
     const auto* asc     = act_scale + (std::int64_t)tok * kG;
-    // The bank is shared across experts; each one starts at its own row.
-    const int rb        = row_base[expert];
-    const auto* w_base  = codes + (std::int64_t)rb * (K / 2);
-    const auto* s_base  = wscales + (std::int64_t)rb * kG;
+    // The bank layout decides where this expert starts: Packed keeps a shared base and puts the
+    // offset in `row`; Strided and Indexed have already moved codes/scales and report row 0.
+    const auto matrix  = weights.template resolve<Rows>(expert);
+    const auto* w_base = matrix.codes;
+    const auto* s_base = reinterpret_cast<const __half*>(matrix.scales);
+    const int rb       = matrix.row;
 
     const int r  = t / 4;
     const int c4 = (t % 4) * 4;
