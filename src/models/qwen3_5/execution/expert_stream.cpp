@@ -477,26 +477,37 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         // captured decode graph is only correct when this is 100%, so it is the number the graph
         // work has to reach before the gate may open.
         {
+            // The tally is per stream and readable from outside: a set decision, a prefetch target
+            // and (once a table is baked into a capture) a capture gate all need this number, and
+            // computing it here is free - the routes are already on the host.
             std::uint64_t inside = 0;
             for (std::size_t i = 0; i < values; ++i) {
                 if (chosen[static_cast<std::size_t>(route_ids[i])]) { ++inside; }
             }
-            static std::uint64_t coverage_routes = 0, coverage_inside = 0, coverage_calls = 0, coverage_dumps = 0;
             // The profile is written from here rather than at exit: the streams are already gone by
             // the time an atexit handler runs, and a snapshot every few steps is enough to rank a
             // bank. 40 banks x 256 floats is 40 KiB.
-            if (std::getenv("NINFER_EXPERT_PROFILE_DUMP") != nullptr && ++coverage_dumps % 8 == 0) {
+            if (std::getenv("NINFER_EXPERT_PROFILE_DUMP") != nullptr && ++coverage_dumps_ % 8 == 0) {
                 dump_profiles();
             }
-            coverage_routes += values;
-            coverage_inside += inside;
-            if (std::getenv("NINFER_SPLIT_TIMING") != nullptr && ++coverage_calls % 40 == 0) {
-                std::fprintf(stderr, "[set] bank=%u coverage=%llu/%llu (%.1f%%) slots=%u\n",
-                             bank_, static_cast<unsigned long long>(coverage_inside),
-                             static_cast<unsigned long long>(coverage_routes),
-                             100.0 * static_cast<double>(coverage_inside) /
-                                 static_cast<double>(coverage_routes == 0 ? 1 : coverage_routes),
-                             capacity);
+            coverage_.routes += values;
+            coverage_.inside += inside;
+            if ((std::getenv("NINFER_SPLIT_TIMING") != nullptr ||
+                 std::getenv("NINFER_EXPERT_TIMING") != nullptr) &&
+                ++coverage_calls_ % 40 == 0) {
+                const auto routes = static_cast<double>(coverage_.routes == 0 ? 1 : coverage_.routes);
+                const auto covered = 100.0 * static_cast<double>(coverage_.inside) / routes;
+                // One token publishes top_k entries per layer, so the miss rate scales back to a
+                // per-token count without knowing how many layers this stream has seen.
+                const auto misses_per_token =
+                    top_k == 0 ? 0.0
+                               : static_cast<double>(coverage_.routes - coverage_.inside) *
+                                     static_cast<double>(top_k) / routes;
+                std::fprintf(stderr,
+                             "[set] bank=%u coverage=%llu/%llu (%.1f%%) misses/token=%.2f slots=%u\n",
+                             bank_, static_cast<unsigned long long>(coverage_.inside),
+                             static_cast<unsigned long long>(coverage_.routes), covered,
+                             misses_per_token, capacity);
             }
         }
         // port (sm_26): a prefill routes (nearly) every expert of a layer, so letting it choose the

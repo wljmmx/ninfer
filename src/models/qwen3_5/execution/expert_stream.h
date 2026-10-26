@@ -76,6 +76,20 @@ public:
         return down_expert_;
     }
 
+    // port (sm_89): how many of the routed entries this bank published were already resident.
+    // Observation only - nothing schedules on it yet - but it is the number a set, a prefetch
+    // target and any future capture gate has to be judged by. It costs a handful of comparisons per
+    // layer: the routes are already on the host for the residency decision.
+    struct Coverage {
+        std::uint64_t routes = 0;
+        std::uint64_t inside = 0;
+    };
+    [[nodiscard]] Coverage coverage() const noexcept { return coverage_; }
+    void reset_coverage() noexcept { coverage_ = Coverage{}; }
+    // Reserved for a captured expert table: a capture cannot read a host tally, so that design has
+    // to count its misses on the device. Null until such a capture exists.
+    [[nodiscard]] const std::uint32_t* device_miss_counter() const noexcept { return nullptr; }
+
 private:
     std::uint32_t count_          = 0;
     WeightBankLayout gate_up_;
@@ -110,6 +124,10 @@ private:
     // port (sm_89): a warm-up then a frozen set, so a static policy stops re-ranking per step.
     bool frozen_ = false;
     std::uint64_t steps_ = 0;
+    // Routed entries published so far and how many were already resident (see Coverage).
+    Coverage coverage_{};
+    std::uint64_t coverage_calls_ = 0;
+    std::uint64_t coverage_dumps_ = 0;
     std::vector<std::uint32_t> frozen_wanted_;
     // port (sm_89): a generation is a run of steps that shares one resident set. The set is rebuilt
     // at a boundary (NINFER_EXPERT_GEN_STEPS, default 64) and held in between, which is what keeps
