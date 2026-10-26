@@ -65,15 +65,18 @@ __device__ __forceinline__ unsigned a8_pack4(const std::int8_t* row, int k) {
 // offsets:   int [experts + 1]       routed-slot range of each expert
 // order:     int [total]             which token row each routed slot came from
 // out:       bf16 [slots][intermediate]  silu(gate) * up, one plane, slot-major
-template <int K, int Rows, class Access>
-__global__ __launch_bounds__(128) void grouped_gate_up_i8_tile(
+//
+// Cols is the job's token-column tile width, the same 32/64 split the shape policies use: one warp
+// covers eight columns, so the block is Cols/8 warps. The body below does not care which it is.
+template <int K, int Rows, int Cols, class Access>
+__global__ __launch_bounds__(Cols * 4) void grouped_gate_up_i8_tile(
     const std::int8_t* __restrict__ act_i8, const float* __restrict__ act_scale, Access weights,
     const int* __restrict__ offsets, const int* __restrict__ order,
     const int* __restrict__ job_experts, const int* __restrict__ job_columns,
     const GroupedInfo* __restrict__ info, int stride, __nv_bfloat16* __restrict__ out) {
     constexpr int kGateRows = Rows / 2;   // rows of gate (and of up)
     constexpr int kG        = K / 64;
-    constexpr int kCols     = 32;         // token columns a job covers
+    constexpr int kCols     = Cols;       // token columns a job covers
 
     if (info->direct) { return; }
     const int job = blockIdx.y;
@@ -174,3 +177,4 @@ __global__ __launch_bounds__(128) void grouped_gate_up_i8_tile(
 }
 
 } // namespace ninfer::ops::detail::moe_cuda::groupwise_int
+

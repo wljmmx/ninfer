@@ -318,11 +318,13 @@ int check_quantize() {
     return bad;
 }
 
-int check_grouped() {
-    // Two experts, one 32-column job each, the real gate_up shape. Checks grouping, the per-column
-    // activation scale, the swiglu product and the [slot][row] store.
+template <int Cols>
+int check_tile(const char* label) {
+    // Two experts, one Cols-column job each, the real gate_up shape. Checks grouping, the per-column
+    // activation scale, the swiglu product and the [slot][row] store, at both tile widths the shape
+    // policies use (32 below 768 tokens, 64 at or above).
     constexpr int kExperts = 2;
-    constexpr int kSlotsPerExpert = 32;
+    constexpr int kSlotsPerExpert = Cols;
     constexpr int kSlots          = kExperts * kSlotsPerExpert;
     constexpr int kTokens         = 20;
 
@@ -387,8 +389,9 @@ int check_grouped() {
     // base plus a row offset of expert * Rows.
     const gi::PackedExpertMatrix access{dCodes, nullptr,
                                         reinterpret_cast<const std::uint8_t*>(dWsc)};
-    gi::grouped_gate_up_i8_tile<kK, kRows><<<dim3(kGate / 16, (int)job_experts.size()), 128>>>(
-        dAct, dAsc, access, dOff, dOrd, dJobE, dJobC, dInfo, kGate, dOut);
+    gi::grouped_gate_up_i8_tile<kK, kRows, Cols>
+        <<<dim3(kGate / 16, (int)job_experts.size()), Cols * 4>>>(
+            dAct, dAsc, access, dOff, dOrd, dJobE, dJobC, dInfo, kGate, dOut);
     cudaDeviceSynchronize();
 
     std::vector<__nv_bfloat16> got((std::size_t)kSlots * kGate);
@@ -460,8 +463,8 @@ int check_grouped() {
             ++checked;
         }
     }
-    std::printf("int8 tile swiglu: %d / %d values within bf16 rounding (worst rel %.2e)\n",
-                checked - bad, checked, worst_rel);
+    std::printf("int8 tile swiglu (%s): %d / %d values within bf16 rounding (worst rel %.2e)\n",
+                label, checked - bad, checked, worst_rel);
     return bad;
 }
 
@@ -471,9 +474,10 @@ int main() {
     const int layout_bad  = check_layout();
     const int gemv_bad    = check_gemv();
     const int quant_bad   = check_quantize();
-    const int grouped_bad = check_grouped();
+    const int grouped_bad = check_tile<32>("32 columns") + check_tile<64>("64 columns");
     const int failures    = layout_bad + gemv_bad + quant_bad + grouped_bad;
     if (failures == 0) { std::printf("PASS moe int8 mma\n"); }
     else { std::printf("FAIL moe int8 mma: %d\n", failures); }
     return failures == 0 ? 0 : 1;
 }
+

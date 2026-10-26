@@ -260,6 +260,10 @@ bool ExpertStream::fully_resident() const noexcept {
 bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32_t tokens,
                           cudaStream_t stream, const std::int32_t* host_ids) {
     if (cache_ == nullptr) { throw std::logic_error("expert stream is not attached"); }
+    // port (sm_89): measurement switch. Claiming the layer cannot be held makes the caller take the
+    // host tier for the whole routed term, which is the CPU reference the device kernels are scored
+    // against. Nothing else changes: same fetch, same FP32 fold, same shared expert.
+    if (std::getenv("NINFER_MOE_HOST_ONLY")) { return false; }
     // port (sm_89): every layer is resident, so the window cannot move and the routers do not need
     // to be read back. Rebasing is the whole per-layer work, and it happens during capture so the
     // frozen kernel arguments already point at the right window.

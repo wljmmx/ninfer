@@ -108,21 +108,40 @@ void launch_grouped_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
     const int down_blocks = std::min(jobs * (S::hidden / 64), limit);
     with_expert_addresses(experts, profile, [&](auto gate_up, auto down) {
         using Access = decltype(gate_up);
-        // port (sm_89): int8 mma route for the 32-column prefill tile. Off by default; the split PPL
-        // gate has to pass against the bf16 route before this can become the default.
+        // Temporary probe: how the prefill MoE time splits between the two halves. Synchronising per
+        // call perturbs the absolute numbers but keeps the ratio honest, which is all it is for.
+        static const bool split_timing = std::getenv("NINFER_MOE_SPLIT_TIMING") != nullptr;
+        static cudaEvent_t s_ev[3]     = {nullptr, nullptr, nullptr};
+        static double s_gu = 0.0, s_dn = 0.0;
+        static long s_calls = 0;
+        if (split_timing && s_ev[0] == nullptr) {
+            for (auto& ev : s_ev) { (void)cudaEventCreate(&ev); }
+        }
+        if (split_timing) { (void)cudaEventRecord(s_ev[0], stream); }
+        // port (sm_89): int8 mma route for both prefill tiles (32 columns below 768 tokens, 64 at or
+        // above). Off by default; the split PPL gate has to pass against bf16 before it can default.
         static const bool int8_mma = [] {
             const char* v = std::getenv("NINFER_MOE_INT8_MMA");
             return v != nullptr && *v != '\0' && std::strtol(v, nullptr, 10) != 0;
         }();
-        if (int8_mma && plan.columns == 32 && profile.ffn.gate_up_type == QType::Q4_G64_FP16) {
+        if (int8_mma && plan.columns <= 64 && profile.ffn.gate_up_type == QType::Q4_G64_FP16) {
             launch_quantize_a8(input, storage.activation_i8, storage.activation_scale, S::hidden,
                                x.ne[1], stream);
             CUDA_CHECK(cudaGetLastError());
-            grouped_gate_up_i8_tile<S::hidden, 2 * S::intermediate, Access>
-                <<<dim3(S::intermediate / 16, jobs), 128, 0, stream>>>(
-                    storage.activation_i8, storage.activation_scale, gate_up, group.offsets,
-                    group.tokens, group.job_experts, group.job_columns, group.info,
-                    S::intermediate, activation);
+            const dim3 grid(S::intermediate / 16, jobs);
+            if (plan.columns == 64) {
+                grouped_gate_up_i8_tile<S::hidden, 2 * S::intermediate, 64, Access>
+                    <<<grid, 256, 0, stream>>>(storage.activation_i8, storage.activation_scale,
+                                               gate_up, group.offsets, group.tokens,
+                                               group.job_experts, group.job_columns, group.info,
+                                               S::intermediate, activation);
+            } else {
+                grouped_gate_up_i8_tile<S::hidden, 2 * S::intermediate, 32, Access>
+                    <<<grid, 128, 0, stream>>>(storage.activation_i8, storage.activation_scale,
+                                               gate_up, group.offsets, group.tokens,
+                                               group.job_experts, group.job_columns, group.info,
+                                               S::intermediate, activation);
+            }
             CUDA_CHECK(cudaGetLastError());
         } else if (profile.ffn.gate_up_type == QType::Q4_G64_FP16) {
             if (plan.columns == 64) {
@@ -150,6 +169,7 @@ void launch_grouped_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
             });
         }
         CUDA_CHECK(cudaGetLastError());
+        if (split_timing) { (void)cudaEventRecord(s_ev[1], stream); }
         if (shared) {
             shared_gate_up(x, *shared, storage, group.info, plan.shared_columns, stream);
         }
@@ -182,6 +202,19 @@ void launch_grouped_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
             break;
         }
         CUDA_CHECK(cudaGetLastError());
+        if (split_timing) {
+            (void)cudaEventRecord(s_ev[2], stream);
+            (void)cudaEventSynchronize(s_ev[2]);
+            float gu = 0.0F, dn = 0.0F;
+            (void)cudaEventElapsedTime(&gu, s_ev[0], s_ev[1]);
+            (void)cudaEventElapsedTime(&dn, s_ev[1], s_ev[2]);
+            s_gu += gu;
+            s_dn += dn;
+            if (++s_calls % 40 == 0) {
+                std::fprintf(stderr, "[split] columns=%d gate_up %.3f ms  down %.3f ms (per call)\n",
+                             plan.columns, s_gu / double(s_calls), s_dn / double(s_calls));
+            }
+        }
     });
     const auto reduce = [&](auto output) {
         reduce_assignments<S><<<x.ne[1], 256, 0, stream>>>(
