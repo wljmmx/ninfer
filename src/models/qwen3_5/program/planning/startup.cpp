@@ -1076,15 +1076,47 @@ finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl
         throw std::invalid_argument("Qwen3.5 sequence planner is empty");
     }
     const std::size_t expected = planner->curve.reservation_bytes(main_page_groups);
+    // Read the minimum's numbers before it may be moved out below; the diagnostic must not touch a
+    // plan it no longer owns.
+    const std::size_t min_persistent = planner->minimum->persistent.bytes;
+    const std::size_t min_workspace  = planner->minimum->workspace.capacity;
+    const std::size_t min_graph      = planner->minimum->graph_allowance_bytes;
+    const std::size_t min_actual     = planner->minimum->device_reservation_bytes;
     std::unique_ptr<SequencePlanImpl> plan;
     if (main_page_groups == planner->curve.minimum_main_page_groups) {
         plan = std::move(planner->minimum);
     } else {
-        plan = build_sequence_candidate(planner->inputs, main_page_groups);
+        // port (sm_89): the curve was sized before the expert pool existed, so its allowance is the
+        // one the minimum plan carries. The graph decision may have been revisited since - a pool
+        // that streams cannot keep a captured graph - and building the candidate with the new
+        // decision would cost less than the curve predicts, which is a stale basis rather than a
+        // layout bug. Build on the basis the curve used, then record the live decision on the plan.
+        auto basis           = planner->inputs;
+        // The flag itself may already have been revisited; what the curve was computed with is
+        // the allowance the minimum plan actually carries.
+        basis.use_cuda_graph = planner->minimum->graph_allowance_bytes != 0 ||
+                               planner->minimum->use_cuda_graph;
+        plan                 = build_sequence_candidate(basis, main_page_groups);
+        plan->use_cuda_graph = planner->inputs.use_cuda_graph;
     }
     if (plan->device_reservation_bytes != expected) {
+        // port (sm_89): the curve predicts the reservation from a two-point step, so any component
+        // that rounds with the page count lands here. Name the numbers: otherwise a caller only
+        // learns that concurrency is unavailable, with no way to tell which term moved.
         throw std::logic_error(
-            "Qwen3.5 physical sequence layout is not affine in Main KV page capacity");
+            std::string("Qwen3.5 physical sequence layout is not affine in Main KV page capacity:") +
+            " groups=" + std::to_string(main_page_groups) +
+            " min_groups=" + std::to_string(planner->curve.minimum_main_page_groups) +
+            " actual=" + std::to_string(plan->device_reservation_bytes) +
+            " expected=" + std::to_string(expected) +
+            " stride=" + std::to_string(planner->curve.bytes_per_additional_main_page_group) +
+            " persistent=" + std::to_string(plan->persistent.bytes) +
+            " workspace=" + std::to_string(plan->workspace.capacity) +
+            " graph=" + std::to_string(plan->graph_allowance_bytes) +
+            " min_persistent=" + std::to_string(min_persistent) +
+            " min_workspace=" + std::to_string(min_workspace) +
+            " min_graph=" + std::to_string(min_graph) +
+            " min_actual=" + std::to_string(min_actual));
     }
     return plan;
 }
