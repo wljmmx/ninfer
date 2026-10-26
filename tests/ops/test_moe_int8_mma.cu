@@ -8,6 +8,7 @@
 // Both were verified before any product code was written against them. If either fails, an int8
 // gate_up built on top is wrong, so this is the cheapest place to find out.
 #include "ops/op_check.h"
+#include "ops/moe/kernels/cuda/groupwise_int/grouped_gate_up_i8.cuh"
 #include "ops/moe/kernels/cuda/groupwise_int/quantize_a8.cuh"
 
 #include <cuda_fp16.h>
@@ -304,13 +305,107 @@ int check_quantize() {
     return bad;
 }
 
+int check_grouped() {
+    // Two experts, one token each, the real gate_up shape. Checks that the grouping (expert -> its
+    // own weight bank and its own token) and the per-row weight scale reach the right place.
+    constexpr int kExperts = 2;
+    std::vector<std::uint8_t> codes((std::size_t)kExperts * kRows * (kK / 2));
+    std::vector<__half> wsc((std::size_t)kExperts * kRows * kG);
+    std::vector<std::int8_t> act((std::size_t)kExperts * kK);
+    std::vector<float> asc((std::size_t)kExperts * kG);
+
+    unsigned seed = 999;
+    auto next     = [&]() { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+    for (auto& c : codes) { c = (std::uint8_t)(next() & 0xff); }
+    for (auto& s : wsc) { s = __float2half(0.001f + 0.0005f * (float)(next() % 8)); }
+    for (auto& a : act) { a = (std::int8_t)((int)(next() % 255) - 127); }
+    for (auto& s : asc) { s = 0.01f + 0.002f * (float)(next() % 5); }
+
+    std::vector<int> offsets(kExperts + 1, 0);
+    for (int e = 0; e < kExperts; ++e) { offsets[e + 1] = offsets[e] + 1; }
+    std::vector<int> order(kExperts);
+    for (int e = 0; e < kExperts; ++e) { order[e] = e; }
+
+    __nv_bfloat16* dOut = nullptr;
+    std::int8_t* dAct   = nullptr;
+    float* dAsc         = nullptr;
+    std::uint8_t* dCodes = nullptr;
+    __half* dWsc        = nullptr;
+    int* dOff           = nullptr;
+    int* dOrd           = nullptr;
+    const bool ok =
+        cudaMalloc(&dOut, kExperts * kRows * sizeof(__nv_bfloat16)) == cudaSuccess &&
+        cudaMalloc(&dAct, act.size()) == cudaSuccess &&
+        cudaMalloc(&dAsc, asc.size() * sizeof(float)) == cudaSuccess &&
+        cudaMalloc(&dCodes, codes.size()) == cudaSuccess &&
+        cudaMalloc(&dWsc, wsc.size() * sizeof(__half)) == cudaSuccess &&
+        cudaMalloc(&dOff, offsets.size() * sizeof(int)) == cudaSuccess &&
+        cudaMalloc(&dOrd, order.size() * sizeof(int)) == cudaSuccess;
+    if (!ok) {
+        std::printf("FAIL int8 grouped: cudaMalloc\n");
+        return 1;
+    }
+    cudaMemcpy(dAct, act.data(), act.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(dAsc, asc.data(), asc.size() * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(dCodes, codes.data(), codes.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(dWsc, wsc.data(), wsc.size() * sizeof(__half), cudaMemcpyHostToDevice);
+    cudaMemcpy(dOff, offsets.data(), offsets.size() * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(dOrd, order.data(), order.size() * sizeof(int), cudaMemcpyHostToDevice);
+
+    namespace gi = ninfer::ops::detail::moe_cuda::groupwise_int;
+    gi::grouped_gate_up_i8<kK, kRows><<<dim3(kRows / 16, kExperts), 32>>>(
+        dAct, dAsc, dCodes, dWsc, dOff, dOrd, kExperts, dOut);
+    cudaDeviceSynchronize();
+
+    std::vector<__nv_bfloat16> got((std::size_t)kExperts * kRows);
+    cudaMemcpy(got.data(), dOut, got.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+    cudaFree(dOut);
+    cudaFree(dAct);
+    cudaFree(dAsc);
+    cudaFree(dCodes);
+    cudaFree(dWsc);
+    cudaFree(dOff);
+    cudaFree(dOrd);
+
+    // Reference: decode every weight, dot against the expert's own activation, scale per group.
+    int bad = 0;
+    double worst_rel = 0.0;
+    for (int e = 0; e < kExperts; ++e) {
+        for (int i = 0; i < kRows; ++i) {
+            double sum = 0.0;
+            for (int g = 0; g < kG; ++g) {
+                int acc_i = 0;
+                for (int k = g * 64; k < (g + 1) * 64; ++k) {
+                    const int byte = codes[(std::size_t)e * kRows * (kK / 2) + (std::size_t)i * (kK / 2) + (k >> 1)];
+                    const int n    = (k & 1) ? (byte >> 4) : (byte & 0x0f);
+                    const int w    = (n ^ 8) - 8;
+                    acc_i += w * (int)act[(std::size_t)e * kK + k];
+                }
+                sum += (double)acc_i *
+                       (double)__half2float(wsc[(std::size_t)e * kRows * kG + (std::size_t)i * kG + g]) *
+                       (double)asc[(std::size_t)e * kG + g];
+            }
+            const double ref = sum;
+            const double got_v = __bfloat162float(got[(std::size_t)e * kRows + i]);
+            const double absd  = std::fabs(got_v - ref);
+            const double rel   = ref != 0.0 ? absd / std::fabs(ref) : absd;
+            if (rel > worst_rel) { worst_rel = rel; }
+            if (rel > 2e-2 && absd > 1e-2) { ++bad; }  // bf16 output rounding is ~1e-2 relative
+        }
+    }
+    std::printf("int8 grouped: %d / %d rows within bf16 rounding (worst rel %.2e)\n",
+                kExperts * kRows - bad, kExperts * kRows, worst_rel);
+    return bad;
+}
+
 } // namespace
 
 int main() {
     const int layout_bad  = check_layout();
     const int gemv_bad    = check_gemv();
     const int quant_bad   = check_quantize();
-    const int failures    = layout_bad + gemv_bad + quant_bad;
+    const int grouped_bad = check_grouped();
+    const int failures    = layout_bad + gemv_bad + quant_bad + grouped_bad;
     if (failures == 0) { std::printf("PASS moe int8 mma\n"); }
     else { std::printf("FAIL moe int8 mma: %d\n", failures); }
     return failures == 0 ? 0 : 1;
