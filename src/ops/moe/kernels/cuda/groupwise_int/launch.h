@@ -58,6 +58,11 @@ struct ExpertStorage {
     void* grouped_io         = nullptr;
     void* shared_activation  = nullptr;
     float* routed_sum        = nullptr;
+    // int8 route: quantised activations for the layer (one per token, not per routed slot) and the
+    // float scale of each 64-wide group. Only the decode shape uses them; they are allocated
+    // unconditionally because the cost is hidden * tokens bytes against megabyte-class buffers.
+    std::int8_t* activation_i8 = nullptr;
+    float* activation_scale    = nullptr;
     GroupedStorage groups;
 };
 

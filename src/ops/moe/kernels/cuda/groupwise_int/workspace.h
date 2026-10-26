@@ -56,6 +56,10 @@ ExpertStorage allocate_grouped(Arena& arena, int tokens, const GroupedPlan& plan
     out.grouped_activation = arena.alloc_bytes(std::max(activation_bytes, sum_bytes)).data;
     out.routed_sum         = shared ? static_cast<float*>(out.grouped_activation) : nullptr;
     out.token_activation   = static_cast<float*>(out.grouped_io);
+    // One quantised activation per token (not per routed slot) plus its per-64-group scales.
+    out.activation_i8    = static_cast<std::int8_t*>(arena.alloc_bytes(std::size_t(S::hidden) * tokens).data);
+    out.activation_scale = static_cast<float*>(
+        arena.alloc_bytes(std::size_t(S::hidden / 64) * tokens * sizeof(float)).data);
     if (shared) {
         out.shared_activation = arena.alloc(DType::BF16, {S::intermediate, tokens, 2}).data;
     }
