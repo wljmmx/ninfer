@@ -167,6 +167,17 @@ ExpertStream::ExpertStream(std::uint32_t count, WeightBankLayout gate_up, Weight
         keys_.push_back(ExpertCacheKey{0, expert});
     }
     hot_score_.assign(count_, 0.0F);
+    // The policy is chosen per process: NINFER_EXPERT_POLICY=slru switches the streaming path to the
+    // 50/50 segmented LRU. Everything measured so far was taken with the score fill, so the default
+    // stays there until this one is measured against it.
+    regions_ = [] {
+        const char* value = std::getenv("NINFER_EXPERT_REGIONS");
+        return value != nullptr && value[0] != '0';
+    }();
+    slru_policy_ = [] {
+        const char* value = std::getenv("NINFER_EXPERT_POLICY");
+        return value != nullptr && std::strcmp(value, "slru") == 0;
+    }();
 }
 
 void ExpertStream::attach(ExpertCache& cache, std::uint32_t bank, const ExpertBankLayout& entry) {
@@ -414,6 +425,49 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 frozen_        = true;
             }
         }
+        // The pool is two regions, and they never trade places. The hot region keeps the experts
+        // worth holding across steps; the spill region is a small ring that only ever holds the
+        // experts the current step misses, so a hot decision can never push a spill entry out and a
+        // miss can never shrink the hot set. Measured: eight spill slots turn four concurrent lanes
+        // from 32-35 tok/s into 82-86 at twelve gigabytes (plan section forty-one).
+        // The ring has to hold one step, not one token: eight lanes miss eight times as many
+        // experts at once, and a ring sized for a single lane sends the rest to the host tier -
+        // measured 5.2 tok/s at eight lanes against 50 for the same structure with the lanes
+        // counted. It is sized from the widest step seen so far, so it does not resize per step
+        // (a region that changes size republishes the table, see section forty-one).
+        if (tokens > 0) {
+            lanes_seen_ = std::max<std::uint32_t>(lanes_seen_, static_cast<std::uint32_t>(tokens));
+        }
+        const auto spill_cap = [&]() -> std::size_t {
+            if (!regions_) {
+                // default policy: the eight fixed slots the report measured
+                if (const char* value = std::getenv("NINFER_EXPERT_SPILL_PCT")) {
+                    return static_cast<std::size_t>(capacity) *
+                           std::min<std::uint64_t>(std::strtoul(value, nullptr, 10), 90) / 100;
+                }
+                if (const char* value = std::getenv("NINFER_EXPERT_SPILL_SLOTS")) {
+                    return std::min<std::size_t>(std::strtoul(value, nullptr, 10),
+                                                 static_cast<std::size_t>(capacity) / 2);
+                }
+                return std::min<std::size_t>(spill_slots(capacity),
+                                             static_cast<std::size_t>(capacity) / 2);
+            }
+            if (const char* value = std::getenv("NINFER_EXPERT_SPILL_PCT")) {
+                return static_cast<std::size_t>(capacity) *
+                       std::min<std::uint64_t>(std::strtoul(value, nullptr, 10), 90) / 100;
+            }
+            if (const char* value = std::getenv("NINFER_EXPERT_SPILL_SLOTS")) {
+                return std::min<std::size_t>(std::strtoul(value, nullptr, 10),
+                                             static_cast<std::size_t>(capacity) / 2);
+            }
+            const auto wanted_slots = std::min<std::size_t>(
+                static_cast<std::size_t>(8) * std::max<std::uint32_t>(1U, lanes_seen_),
+                static_cast<std::size_t>(capacity) / 3);
+            return std::min<std::size_t>(std::max<std::size_t>(spill_slots(capacity), wanted_slots),
+                                         static_cast<std::size_t>(capacity) / 3);
+        }();
+        const auto hot_cap = static_cast<std::size_t>(capacity) - spill_cap;
+
         if (frozen_) {
             // port (sm_89): a frozen set used to take every slot, so a route outside it had nowhere
             // to go and was forced onto the CPU - measured 121 ms of CPU per token at a 4096 MiB
@@ -426,26 +480,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             // At 12 GiB the set covers 95.7% and the outside routes cost only 0.8 ms on the CPU, so
             // filling the pool wins there (100.5 against 94.6 tok/s) - and a full, static table is
             // what a per-layer graph needs anyway.
-            // port (sm_89): the size of the spill region is the number of experts this layer's
-            // tokens actually miss, not a percentage of the pool. Measured on 13k tokens of real
-            // conversation: 0.57 misses a token at 163 slots a layer (p99 = 3, max = 4), 0.91 at
-            // 109 (p99 = 4), 2.17 at 54 (p99 = 5). Leaving 15% free is right at 54 slots (8) and
-            // six times too generous at 163 (24 for a p99 of 3), so the slots the hot set loses
-            // buy nothing. NINFER_EXPERT_SPILL_PCT keeps the old rule, NINFER_EXPERT_SPILL_SLOTS
-            // pins a count, and both exist to A/B against the estimate.
-            const auto spill = [&]() -> std::size_t {
-                if (const char* value = std::getenv("NINFER_EXPERT_SPILL_PCT")) {
-                    return static_cast<std::size_t>(capacity) *
-                           std::min<std::uint64_t>(std::strtoul(value, nullptr, 10), 90) / 100;
-                }
-                if (const char* value = std::getenv("NINFER_EXPERT_SPILL_SLOTS")) {
-                    return std::min<std::size_t>(std::strtoul(value, nullptr, 10),
-                                                 static_cast<std::size_t>(capacity) / 2);
-                }
-                return std::min<std::size_t>(spill_slots(capacity), static_cast<std::size_t>(capacity) / 2);
-            }();
-            const auto pinned = capacity > spill ? capacity - spill : capacity;
-            const auto keep   = std::min<std::size_t>(pinned, frozen_wanted_.size());
+            const auto keep = std::min<std::size_t>(hot_cap, frozen_wanted_.size());
             wanted.assign(frozen_wanted_.begin(), frozen_wanted_.begin() + keep);
             for (const auto expert : wanted) { chosen[expert] = true; }
             for (std::size_t i = 0; i < values && wanted.size() < capacity; ++i) {
@@ -454,14 +489,118 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 chosen[expert] = true;
                 wanted.push_back(expert);
             }
-        } else {
-            if (!static_set && !generation_mode) {
-                for (std::size_t i = 0; i < values && wanted.size() < capacity; ++i) {
-                    const auto expert = static_cast<std::uint32_t>(route_ids[i]);
-                    if (chosen[expert]) { continue; }
-                    chosen[expert] = true;
-                    wanted.push_back(expert);
+        } else if (slru_policy_) {
+            // llama.cpp's 50/50 SLRU (src/llama-moe-cache.cpp:16-121), over slot ids so a slot that
+            // keeps its expert keeps its number: hits are promoted to the protected half, misses
+            // take the probation head while skipping the experts this step needs, and a full set
+            // that holds them all sends the rest to the host tier. The scoring fill below is not
+            // consulted - that is the point of the comparison.
+            constexpr std::uint32_t kEmpty = 0xFFFFFFFFU;
+            // SLRU owns the hot region only: the spill ring below is not its to evict.
+            const auto n_slots = hot_cap;
+            if (slru_expert_.size() != n_slots) {
+                slru_expert_.assign(n_slots, kEmpty);
+                slru_of_expert_.assign(count_, -1);
+                slru_prev_.assign(n_slots, -1);
+                slru_next_.assign(n_slots, -1);
+                slru_protected_.assign(n_slots, 0);
+                slru_head_[0] = slru_head_[1] = 0;
+                slru_tail_[0] = static_cast<std::int32_t>(n_slots) - 1;
+                for (std::size_t s = 0; s < n_slots; ++s) {
+                    slru_prev_[s] = static_cast<std::int32_t>(s) - 1;
+                    slru_next_[s] = (s + 1 < n_slots) ? static_cast<std::int32_t>(s + 1) : -1;
                 }
+                slru_head_[1] = slru_tail_[1] = -1;
+                slru_n_protected_ = 0;
+            }
+            const auto unlink = [&](std::int32_t s) {
+                const auto seg = slru_protected_[s] ? 1 : 0;
+                if (slru_prev_[s] >= 0) { slru_next_[slru_prev_[s]] = slru_next_[s]; }
+                else { slru_head_[seg] = slru_next_[s]; }
+                if (slru_next_[s] >= 0) { slru_prev_[slru_next_[s]] = slru_prev_[s]; }
+                else { slru_tail_[seg] = slru_prev_[s]; }
+            };
+            const auto push_back = [&](std::int32_t s, bool protect) {
+                const auto seg = protect ? 1 : 0;
+                slru_protected_[s] = protect ? 1 : 0;
+                slru_prev_[s] = slru_tail_[seg];
+                slru_next_[s] = -1;
+                if (slru_tail_[seg] >= 0) { slru_next_[slru_tail_[seg]] = s; }
+                else { slru_head_[seg] = s; }
+                slru_tail_[seg] = s;
+            };
+            const auto touch = [&](std::int32_t s) {
+                const bool was = slru_protected_[s] != 0;
+                unlink(s);
+                push_back(s, true);
+                if (!was) { ++slru_n_protected_; }
+                if (slru_n_protected_ > n_slots / 2) {
+                    const auto demote = slru_head_[1];
+                    if (demote >= 0) {
+                        unlink(demote);
+                        push_back(demote, false);
+                        --slru_n_protected_;
+                    }
+                }
+            };
+            // this step's distinct experts, in route order
+            std::vector<std::uint32_t> need;
+            need.reserve(values);
+            std::vector<bool> in_need(count_, false);
+            for (std::size_t i = 0; i < values; ++i) {
+                const auto expert = static_cast<std::uint32_t>(route_ids[i]);
+                if (in_need[expert]) { continue; }
+                in_need[expert] = true;
+                need.push_back(expert);
+            }
+            for (const auto expert : need) {
+                const auto slot = slru_of_expert_[expert];
+                if (slot >= 0) { touch(slot); }
+            }
+            for (const auto expert : need) {
+                if (slru_of_expert_[expert] >= 0) { continue; }
+                // victim: probation head first, never a slot this step still needs
+                std::int32_t victim = -1;
+                for (int seg = 0; seg < 2 && victim < 0; ++seg) {
+                    for (auto s = slru_head_[seg]; s >= 0; s = slru_next_[s]) {
+                        const auto held = slru_expert_[s];
+                        if (held == kEmpty || !in_need[held]) { victim = s; break; }
+                    }
+                }
+                if (victim < 0) { break; }
+                const auto held = slru_expert_[victim];
+                if (held != kEmpty) { slru_of_expert_[held] = -1; }
+                const bool was = slru_protected_[victim] != 0;
+                unlink(victim);
+                if (was) { --slru_n_protected_; }
+                slru_expert_[victim] = expert;
+                slru_of_expert_[expert] = victim;
+                push_back(victim, false);
+            }
+            wanted.clear();
+            wanted.reserve(capacity);
+            for (std::size_t s = 0; s < n_slots; ++s) {
+                if (slru_expert_[s] == kEmpty) { break; }   // dense: never a hole
+                wanted.push_back(slru_expert_[s]);
+                chosen[slru_expert_[s]] = true;
+            }
+            // the spill ring: this step's misses, appended after the hot region so they take the
+            // slots the hot set does not own and cannot displace it
+            for (std::size_t i = 0; i < values && wanted.size() < capacity; ++i) {
+                const auto expert = static_cast<std::uint32_t>(route_ids[i]);
+                if (chosen[expert]) { continue; }
+                chosen[expert] = true;
+                wanted.push_back(expert);
+            }
+        } else if (!regions_) {
+            // Until the region split is measured against it, the proven streaming policy stays the
+            // default: this step's routes take slots first, the decayed score fills the rest. That
+            // is what every number in the report was taken with.
+            for (std::size_t i = 0; i < values && wanted.size() < capacity; ++i) {
+                const auto expert = static_cast<std::uint32_t>(route_ids[i]);
+                if (chosen[expert]) { continue; }
+                chosen[expert] = true;
+                wanted.push_back(expert);
             }
             if (wanted.size() < capacity) {
                 std::vector<std::uint32_t> ranked(count_);
@@ -472,6 +611,38 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                                  });
                 for (const auto expert : ranked) {
                     if (wanted.size() >= capacity) { break; }
+                    if (chosen[expert]) { continue; }
+                    chosen[expert] = true;
+                    wanted.push_back(expert);
+                }
+            }
+            if (generation_mode) { frozen_ = true; frozen_wanted_ = wanted; }
+            if (static_set && freeze_after > 0 && ++steps_ >= static_cast<std::uint64_t>(freeze_after)) {
+                frozen_ = true; frozen_wanted_ = wanted;
+            }
+        } else {
+            // Region split (NINFER_EXPERT_REGIONS=1): the hot region is the top of the decayed
+            // score, the spill ring is this step's misses, and the two never trade places.
+            // is this step's misses. The routes no longer choose the hot set - that was the
+            // streaming policy, and it made the hot region a per-step artefact with no slot that
+            // survived a change of routing.
+            if (!static_set && !generation_mode) {
+                if (wanted.size() < hot_cap) {
+                    std::vector<std::uint32_t> ranked(count_);
+                    std::iota(ranked.begin(), ranked.end(), 0U);
+                    std::stable_sort(ranked.begin(), ranked.end(),
+                                     [&](std::uint32_t a, std::uint32_t b) {
+                                         return hot_score_[a] > hot_score_[b];
+                                     });
+                    for (const auto expert : ranked) {
+                        if (wanted.size() >= hot_cap) { break; }
+                        if (chosen[expert]) { continue; }
+                        chosen[expert] = true;
+                        wanted.push_back(expert);
+                    }
+                }
+                for (std::size_t i = 0; i < values && wanted.size() < capacity; ++i) {
+                    const auto expert = static_cast<std::uint32_t>(route_ids[i]);
                     if (chosen[expert]) { continue; }
                     chosen[expert] = true;
                     wanted.push_back(expert);

@@ -120,6 +120,22 @@ private:
     // the top entries of this instead of whatever the current step happened to route to, which
     // used to replace all eight experts on every token and make the hot set useless.
     std::vector<float> hot_score_;
+    // llama.cpp-style SLRU over slot ids (src/llama-moe-cache.cpp:16-121): a probation list and a
+    // protected half. A hit promotes the slot, a miss takes the probation head while skipping the
+    // experts this step needs, and a slot that keeps its expert keeps its number, so republishing
+    // the table does not move it. The policy is opt-in (NINFER_EXPERT_POLICY=slru) because the
+    // score fill it replaces is what the measured streaming numbers were taken with.
+    bool slru_policy_ = false;
+    // opt-in region split (hot + dedicated spill ring); the default policy is unchanged until it
+    // is measured against the report's numbers
+    bool regions_ = false;
+    std::vector<std::uint32_t> slru_expert_;   // hot region, kEmpty when free
+    std::vector<std::int32_t> slru_of_expert_; // count_, -1 when not resident
+    std::vector<std::uint8_t> slru_protected_;
+    std::uint32_t slru_n_protected_ = 0;
+    std::vector<std::int32_t> slru_prev_, slru_next_;
+    std::int32_t slru_head_[2]{-1, -1};
+    std::int32_t slru_tail_[2]{-1, -1};
     std::vector<std::uint32_t> resident_order_;
     // port (sm_26): whether this bank's resident set has ever been built. A prefill is not allowed to
     // choose the set, but the first call has to, or a cold start would route everything to the host
@@ -138,6 +154,8 @@ private:
     std::uint32_t miss_samples_ = 0;
     std::vector<std::uint32_t> miss_scratch_;
     std::uint32_t miss_generation_ = 0;
+    // widest step this stream has served, so the spill ring can hold one of them
+    std::uint32_t lanes_seen_ = 0;
     std::uint64_t coverage_calls_ = 0;
     std::uint64_t coverage_dumps_ = 0;
     std::vector<std::uint32_t> frozen_wanted_;
