@@ -194,14 +194,14 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
                                       stream->down_expert_geometry(), requirements.banks[i]));
             continue;
         }
-        files.push_back(host_tier
-                            ? artifact::describe_fused_expert_host(
-                                  gate_up, down, stream->gate_up_parent(), stream->down_parent(),
-                                  stream->count(), gu_rows, dn_rows, requirements.banks[i])
-                            : artifact::describe_fused_expert_files(
-                                  instance.expert_source->reader(), gate_up, down,
-                                  stream->gate_up_parent(), stream->down_parent(), stream->count(),
-                                  gu_rows, dn_rows, requirements.banks[i]));
+        // port (sm_89): the host tier takes the same plan as the device tier. describe_fused_expert_host
+        // skipped the object's own offset and the reader's segment walk, so its chunks carried
+        // object-relative offsets while every consumer (spans, read_entry) reads them as file
+        // absolute - which is why the fused artifact only scored correctly through the copying path
+        // that happened to re-read by image offset. The per-expert plan was never affected.
+        files.push_back(artifact::describe_fused_expert_files(
+            instance.expert_source->reader(), gate_up, down, stream->gate_up_parent(),
+            stream->down_parent(), stream->count(), gu_rows, dn_rows, requirements.banks[i]));
     }
     expert_debug("files", files.size(), requirements.banks.size());
     instance.expert_cache = std::make_unique<ExpertCache>(
