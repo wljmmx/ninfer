@@ -490,6 +490,25 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             if (std::getenv("NINFER_EXPERT_PROFILE_DUMP") != nullptr && ++coverage_dumps_ % 8 == 0) {
                 dump_profiles();
             }
+            // port (sm_89): route trace for offline analysis (NINFER_EXPERT_ROUTE_DUMP=<path>). One
+            // line per (layer, token): the experts that token routed to. Nothing reads it at run
+            // time; it exists because every cache decision - layer-to-layer reuse, step-to-step
+            // reuse, how far a prediction is worth trusting - is a claim about this data, and the
+            // numbers quoted for those claims have to come from a run rather than an estimate.
+            if (const char* dump = std::getenv("NINFER_EXPERT_ROUTE_DUMP")) {
+                static std::FILE* trace = std::fopen(dump, "wb");
+                if (trace != nullptr) {
+                    const auto top = static_cast<std::size_t>(top_k <= 0 ? 1 : top_k);
+                    for (std::size_t token = 0; token < static_cast<std::size_t>(tokens); ++token) {
+                        std::fprintf(trace, "%u %zu", bank_, token);
+                        for (std::size_t k = 0; k < top; ++k) {
+                            std::fprintf(trace, " %d", route_ids[k * static_cast<std::size_t>(tokens) + token]);
+                        }
+                        std::fputc('\n', trace);
+                    }
+                    std::fflush(trace);
+                }
+            }
             coverage_.routes += values;
             coverage_.inside += inside;
             if ((std::getenv("NINFER_SPLIT_TIMING") != nullptr ||
