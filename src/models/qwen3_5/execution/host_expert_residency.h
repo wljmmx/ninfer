@@ -117,8 +117,19 @@ public:
             // NINFER_HOST_COPY=1 forces the copying path, which is what the split gate compares
             // against.
             static const bool allow_direct = std::getenv("NINFER_HOST_COPY") == nullptr;
-            if (allow_direct && gate_up_base != nullptr && down_base != nullptr &&
-                banks_[i].entry.count > 0) {
+            // port (sm_89): the fused in-place branch is off. A fused bank keeps codes, high and
+            // scales in three plane runs inside one object, and the addressing below assumes each
+            // expert sits at expert * expert_stride inside a plane whose offset is already the
+            // object-relative one. On the 35B fused artifact that is not what the stored layout
+            // says (gate_up geometry 285,212,672 = 256 x 1 MiB codes + 256 x 64 KiB high, but the
+            // plane offsets do not land there), so the branch read the wrong plane and the split
+            // PPL came out as 159,099 against 7.776858 on the copying path. Keep the copying path
+            // until the plane offsets are resolved against the object; NINFER_HOST_FUSED_DIRECT=1
+            // re-enables the branch for whoever finishes that check.
+            static const bool allow_fused_direct =
+                std::getenv("NINFER_HOST_FUSED_DIRECT") != nullptr;
+            if (allow_fused_direct && allow_direct && gate_up_base != nullptr &&
+                down_base != nullptr && banks_[i].entry.count > 0) {
                 if (std::getenv("NINFER_HOST_DEBUG") != nullptr && i < 2) {
                     const auto& gl = banks_[i].gate_up_layout;
                     const auto& dl = banks_[i].down_layout;
