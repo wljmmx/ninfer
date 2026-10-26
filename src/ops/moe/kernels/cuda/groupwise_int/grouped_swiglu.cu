@@ -1,5 +1,6 @@
 #include "ops/moe/kernels/cuda/groupwise_int/grouped_gate_up.cuh"
 #include "ops/moe/kernels/cuda/groupwise_int/grouped_gate_up_i8.cuh"
+#include "ops/moe/kernels/cuda/groupwise_int/grouped_gate_up_i8_smem.cuh"
 #include "ops/moe/kernels/cuda/groupwise_int/quantize_a8.cuh"
 #include "ops/moe/kernels/cuda/groupwise_int/grouped_down.cuh"
 
@@ -119,7 +120,7 @@ void launch_grouped_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
                                x.ne[1], stream);
             CUDA_CHECK(cudaGetLastError());
             const int slot_stride = S::top_k * x.ne[1];
-            grouped_gate_up_i8<S::hidden, 2 * S::intermediate, Access>
+            grouped_gate_up_i8_smem<S::hidden, 2 * S::intermediate, Access>
                 <<<dim3(2 * S::intermediate / 16, S::experts), 32>>>(storage.activation_i8,
                     storage.activation_scale, gate_up, group.offsets, group.tokens, S::experts,
                     slot_stride, activation);
