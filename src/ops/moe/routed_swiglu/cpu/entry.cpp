@@ -72,17 +72,31 @@ public:
                     geometry.scale_block_rows == 1 && layout.has_divisors == nvfp4,
                 "routed_swiglu CPU: invalid weight geometry");
         // port (sm_89): a host-tier bank packs each expert into one segment, so the expected
-        // layout has rebased plane offsets instead of the shared-array ones.
+        // layout has rebased plane offsets instead of the shared-array ones. A fused bank cannot be
+        // packed that way - its three plane runs sit hundreds of MB apart - and names each plane's
+        // origin through its own per-plane table instead, so the offsets are not comparable and only
+        // the plane sizes and the region are checked.
         auto expected = describe_weight_bank(geometry, layout.region);
         if (bank.expert_offsets) {
             expected.codes.offset  = 0;
             expected.high.offset   = layout.codes.expert_bytes;
             expected.scales.offset = layout.codes.expert_bytes + layout.high.expert_bytes;
         }
+        const bool per_plane = bank.codes_offsets != nullptr || bank.high_offsets != nullptr ||
+                               bank.scales_offsets != nullptr;
+        const bool planes_agree =
+            per_plane
+                ? layout.region == expected.region && layout.format == expected.format &&
+                      layout.layout == expected.layout && layout.columns == expected.columns &&
+                      layout.codes.expert_stride == expected.codes.expert_stride &&
+                      layout.high.expert_stride == expected.high.expert_stride &&
+                      layout.scales.expert_stride == expected.scales.expert_stride &&
+                      layout.has_divisors == expected.has_divisors
+                : layout == expected;
         require(layout.codes.expert_bytes == elements / 2 &&
                     layout.high.expert_bytes == high_bytes &&
                     layout.scales.expert_bytes == elements / (nvfp4 ? 16 : 32) &&
-                    layout == expected,
+                    planes_agree,
                 "routed_swiglu CPU: invalid native weight planes");
         require(bank.parent->weight_divisors.size() == geometry.divisor_count,
                 "routed_swiglu CPU: invalid divisor storage");

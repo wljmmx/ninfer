@@ -57,6 +57,13 @@ struct WeightBankView {
     const WeightParent* parent = nullptr;
     WeightBankLayout layout;
     const std::uint64_t* expert_offsets = nullptr;
+    // port (sm_89): a fused bank keeps its codes, high and scales runs far apart inside one object,
+    // so a single per-expert offset cannot name all three. These carry one offset per plane when set;
+    // the single table above keeps serving the per-expert layout, whose experts are one contiguous
+    // image each.
+    const std::uint64_t* codes_offsets  = nullptr;
+    const std::uint64_t* high_offsets   = nullptr;
+    const std::uint64_t* scales_offsets = nullptr;
 
     [[nodiscard]] ConstMemorySpan plane(const WeightBankPlane& plane, std::uint32_t expert) const;
     // Returns the multiplicative identity when the representation has no matrix divisor.
