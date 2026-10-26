@@ -790,11 +790,16 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                     top_k == 0 ? 0.0
                                : static_cast<double>(coverage_.routes - coverage_.inside) *
                                      static_cast<double>(top_k) / routes;
+                const auto bytes_per_step =
+                    publish_calls_ == 0 ? 0.0
+                                        : static_cast<double>(publish_bytes_) /
+                                              static_cast<double>(publish_calls_);
                 std::fprintf(stderr,
-                             "[set] bank=%u coverage=%llu/%llu (%.1f%%) misses/token=%.2f slots=%u\n",
+                             "[set] bank=%u coverage=%llu/%llu (%.1f%%) misses/token=%.2f slots=%u "
+                             "publish=%.0fB/step\n",
                              bank_, static_cast<unsigned long long>(coverage_.inside),
                              static_cast<unsigned long long>(coverage_.routes), covered,
-                             misses_per_token, capacity);
+                             misses_per_token, capacity, bytes_per_step);
             }
         }
         // port (sm_26): a prefill routes (nearly) every expert of a layer, so letting it choose the
@@ -829,6 +834,25 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             resident_order_ = wanted;
             const auto table_bytes = offsets_.size() * sizeof(std::uint64_t);
             const auto mask_bytes  = mask_host_.size() * sizeof(std::int32_t);
+            // Only the rows that moved are copied. A step usually changes a handful of experts
+            // (one lane misses well under one expert a layer at 163 slots), while the full table is
+            // 2 KiB of offsets plus 1 KiB of mask copied forty times a token, every step, whether
+            // anything changed or not. The full copy stays as the fallback when most rows move.
+            if (prev_slot_.size() != count_) { prev_slot_.assign(count_, -1); }
+            std::vector<std::uint32_t> moved;
+            moved.reserve(count_);
+            for (std::uint32_t expert = 0; expert < count_; ++expert) {
+                const auto slot = cache_->expert_slot(bank_, expert);
+                const auto now  = slot ? static_cast<std::int32_t>(*slot) : -1;
+                if (now != prev_slot_[expert]) { moved.push_back(expert); }
+            }
+            const auto delta_bytes = moved.size() * (sizeof(std::uint64_t) + sizeof(std::int32_t));
+            static const bool delta_enabled = [] {
+                const char* value = std::getenv("NINFER_PUBLISH_DELTA");
+                return value == nullptr || value[0] != '0';
+            }();
+            const bool delta = delta_enabled && !moved.empty() &&
+                               delta_bytes * 2 < table_bytes + mask_bytes;
             // Async on the consumer stream: the kernels that read these tables are queued behind
             // them there, while a blocking copy would stall the host twice per layer.
             // port (sm_89): both tables change together and neither is ordered against the other,
@@ -840,23 +864,55 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             // outlives the scope that owns it, which is a use-after-free that only shows up as a
             // resident set that is occasionally one layer stale.
             if (table_bytes != 0 && mask_bytes != 0) {
-                void* const       destinations[2] = {offsets_device_->p, mask_device_->p};
-                const void* const sources[2]      = {offsets_.data(), mask_host_.data()};
-                const std::size_t sizes[2]        = {table_bytes, mask_bytes};
                 cudaMemcpyAttributes attributes{};
                 attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
                 attributes.flags          = 0;
                 std::size_t attribute_index = 0;
-                const auto submitted        = cudaMemcpyBatchAsync(
-                    destinations, sources, sizes, 2, &attributes, &attribute_index, 1, stream);
-                // A driver that rejects the batch still has to get the tables across: fall back to
-                // the two copies rather than leaving the layer with a stale resident set.
-                if (submitted != cudaSuccess) {
-                    (void)cudaMemcpyAsync(offsets_device_->p, offsets_.data(), table_bytes,
-                                          cudaMemcpyHostToDevice, stream);
-                    (void)cudaMemcpyAsync(mask_device_->p, mask_host_.data(), mask_bytes,
-                                          cudaMemcpyHostToDevice, stream);
+                cudaError_t submitted       = cudaErrorInvalidValue;
+                if (delta) {
+                    // Two slices per moved expert: its offset row and its mask word.
+                    std::vector<void*>       dsts;
+                    std::vector<const void*> srcs;
+                    std::vector<std::size_t> sizes;
+                    dsts.reserve(moved.size() * 2);
+                    srcs.reserve(moved.size() * 2);
+                    sizes.reserve(moved.size() * 2);
+                    for (const auto expert : moved) {
+                        dsts.push_back(static_cast<char*>(offsets_device_->p) +
+                                       static_cast<std::size_t>(expert) * sizeof(std::uint64_t));
+                        srcs.push_back(offsets_.data() + expert);
+                        sizes.push_back(sizeof(std::uint64_t));
+                        dsts.push_back(static_cast<char*>(mask_device_->p) +
+                                       static_cast<std::size_t>(expert) * sizeof(std::int32_t));
+                        srcs.push_back(mask_host_.data() + expert);
+                        sizes.push_back(sizeof(std::int32_t));
+                    }
+                    submitted = cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(),
+                                                     sizes.size(), &attributes, &attribute_index, 1,
+                                                     stream);
+                    if (submitted == cudaSuccess) { publish_bytes_ += delta_bytes; }
                 }
+                if (!delta || submitted != cudaSuccess) {
+                    void* const       destinations[2] = {offsets_device_->p, mask_device_->p};
+                    const void* const sources[2]      = {offsets_.data(), mask_host_.data()};
+                    const std::size_t sizes[2]        = {table_bytes, mask_bytes};
+                    submitted = cudaMemcpyBatchAsync(
+                        destinations, sources, sizes, 2, &attributes, &attribute_index, 1, stream);
+                    // A driver that rejects the batch still has to get the tables across: fall back
+                    // to the two copies rather than leaving the layer with a stale resident set.
+                    if (submitted != cudaSuccess) {
+                        (void)cudaMemcpyAsync(offsets_device_->p, offsets_.data(), table_bytes,
+                                              cudaMemcpyHostToDevice, stream);
+                        (void)cudaMemcpyAsync(mask_device_->p, mask_host_.data(), mask_bytes,
+                                              cudaMemcpyHostToDevice, stream);
+                    }
+                    publish_bytes_ += static_cast<std::uint64_t>(table_bytes + mask_bytes);
+                }
+                ++publish_calls_;
+            }
+            for (const auto expert : moved) {
+                const auto slot = cache_->expert_slot(bank_, expert);
+                prev_slot_[expert] = slot ? static_cast<std::int32_t>(*slot) : -1;
             }
         }
     }

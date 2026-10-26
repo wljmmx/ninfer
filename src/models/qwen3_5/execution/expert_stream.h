@@ -150,6 +150,10 @@ private:
     std::int32_t slru_head_[2]{-1, -1};
     std::int32_t slru_tail_[2]{-1, -1};
     std::vector<std::uint32_t> resident_order_;
+    // Last published slot per expert, so a step only copies the rows that actually moved.
+    std::vector<std::int32_t> prev_slot_;
+    std::uint64_t publish_bytes_ = 0;
+    std::uint64_t publish_calls_ = 0;
     // port (sm_26): whether this bank's resident set has ever been built. A prefill is not allowed to
     // choose the set, but the first call has to, or a cold start would route everything to the host
     // tier and never establish one.
