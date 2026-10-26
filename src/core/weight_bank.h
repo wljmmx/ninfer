@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/memory.h"
+#include "core/expert_bank.h"`r`n#include "core/memory.h"
 #include "core/weight_view.h"
 
 namespace ninfer {
@@ -65,7 +65,10 @@ struct WeightBankView {
     const std::uint64_t* high_offsets   = nullptr;
     const std::uint64_t* scales_offsets = nullptr;
 
-    [[nodiscard]] ConstMemorySpan plane(const WeightBankPlane& plane, std::uint32_t expert) const;
+    // port (sm_89): the plane is named by role, not by reference. Callers hand in copies of the
+    // layout's planes (an initializer list is the natural way to walk all three), so comparing
+    // addresses inside plane() silently fell through to the scales table.
+    [[nodiscard]] ConstMemorySpan plane(ExpertPlaneKind role, std::uint32_t expert) const;
     // Returns the multiplicative identity when the representation has no matrix divisor.
     [[nodiscard]] float divisor(std::uint32_t expert) const;
 };

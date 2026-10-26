@@ -72,6 +72,12 @@ public:
             s.slot_of.assign(banks_[i].entry.count, kNone);
             s.gate_up_offsets.assign(banks_[i].entry.count, 0);
             s.down_offsets.assign(banks_[i].entry.count, 0);
+            s.gu_codes.assign(banks_[i].entry.count, 0);
+            s.gu_high.assign(banks_[i].entry.count, 0);
+            s.gu_scales.assign(banks_[i].entry.count, 0);
+            s.dn_codes.assign(banks_[i].entry.count, 0);
+            s.dn_high.assign(banks_[i].entry.count, 0);
+            s.dn_scales.assign(banks_[i].entry.count, 0);
 
             // port (sm_89): a bank that lives in one object can be addressed where it already is.
             // The artifact parent then holds every expert's rows, so the CPU op addresses expert e
@@ -117,53 +123,119 @@ public:
             // NINFER_HOST_COPY=1 forces the copying path, which is what the split gate compares
             // against.
             static const bool allow_direct = std::getenv("NINFER_HOST_COPY") == nullptr;
-            // port (sm_89): the fused in-place branch is off. A fused bank keeps codes, high and
-            // scales in three plane runs inside one object, and the addressing below assumes each
-            // expert sits at expert * expert_stride inside a plane whose offset is already the
-            // object-relative one. On the 35B fused artifact that is not what the stored layout
-            // says (gate_up geometry 285,212,672 = 256 x 1 MiB codes + 256 x 64 KiB high, but the
-            // plane offsets do not land there), so the branch read the wrong plane and the split
-            // PPL came out as 159,099 against 7.776858 on the copying path. Keep the copying path
-            // until the plane offsets are resolved against the object; NINFER_HOST_FUSED_DIRECT=1
-            // re-enables the branch for whoever finishes that check.
-            static const bool allow_fused_direct =
-                std::getenv("NINFER_HOST_FUSED_DIRECT") != nullptr;
-            if (allow_fused_direct && allow_direct && gate_up_base != nullptr &&
-                down_base != nullptr && banks_[i].entry.count > 0) {
-                if (std::getenv("NINFER_HOST_DEBUG") != nullptr && i < 2) {
-                    const auto& gl = banks_[i].gate_up_layout;
-                    const auto& dl = banks_[i].down_layout;
-                    std::fprintf(stderr,
-                                 "[direct-layout] gu off=%llu stride=%llu plane=%llu | dn off=%llu "
-                                 "stride=%llu plane=%llu | entry=%llu bytes=%llu/%llu geom=%llu/%llu\n",
-                                 (unsigned long long)gl.codes.offset,
-                                 (unsigned long long)gl.codes.expert_stride,
-                                 (unsigned long long)gl.codes.expert_bytes,
-                                 (unsigned long long)dl.codes.offset,
-                                 (unsigned long long)dl.codes.expert_stride,
-                                 (unsigned long long)dl.codes.expert_bytes,
-                                 (unsigned long long)banks_[i].entry.entry_bytes,
-                                 (unsigned long long)banks_[i].entry.codes.offset,
-                                 (unsigned long long)banks_[i].entry.down_codes.offset,
-                                 (unsigned long long)banks_[i].gate_up_geometry.bytes,
-                                 (unsigned long long)banks_[i].down_geometry.bytes);
+            // port (sm_89): a fused bank keeps codes, high and scales in three runs per matrix, far
+            // apart inside one object, so one per-expert offset cannot name all three. Each plane
+            // gets its own table (WeightBankView::codes_offsets and friends), filled from the chunk
+            // table - which is the authority on where a run starts, and is file absolute, the same
+            // convention the per-expert plan below uses.
+            if (allow_direct && !banks_[i].per_expert && reader_ != nullptr &&
+                !bank_files.experts.empty() && banks_[i].entry.count > 0) {
+                const auto& entry     = banks_[i].entry;
+                const auto& gu_layout = banks_[i].gate_up_layout;
+                const auto& dn_layout = banks_[i].down_layout;
+                const auto count      = static_cast<std::uint32_t>(entry.count);
+                bool usable           = !bank_files.experts.front().chunks.empty();
+                const std::uint32_t file_index =
+                    usable ? bank_files.experts.front().chunks.front().file_index : 0;
+                // widest chunk seen per plane: the layout and the artifact do not agree on it.
+                std::uint64_t plane_bytes[6] = {};
+                for (std::uint32_t e = 0; e < count && usable; ++e) {
+                    const auto& ex = bank_files.experts[e];
+                    if (ex.chunks.empty()) {
+                        usable = false;
+                        break;
+                    }
+                    for (const auto& chunk : ex.chunks) {
+                        if (chunk.file_index != file_index) {
+                            usable = false;
+                            break;
+                        }
+                        // Sort by the plane's image range, not by "before the next plane": a q4
+                        // gate_up has no high plane, so its high offset equals its scales offset.
+                        const struct {
+                            std::uint64_t begin, bytes;
+                            std::vector<std::uint64_t>* target;
+                        } planes[] = {
+                            {entry.codes.offset, entry.codes.bytes, &s.gu_codes},
+                            {entry.high.offset, entry.high.bytes, &s.gu_high},
+                            {entry.scales.offset, entry.scales.bytes, &s.gu_scales},
+                            {entry.down_codes.offset, entry.down_codes.bytes, &s.dn_codes},
+                            {entry.down_high.offset, entry.down_high.bytes, &s.dn_high},
+                            {entry.down_scales.offset, entry.down_scales.bytes, &s.dn_scales},
+                        };
+                        int index = -1;
+                        for (int pi = 0; pi < 6; ++pi) {
+                            const auto& plane = planes[pi];
+                            if (!plane.bytes) { continue; }
+                            if (chunk.image_offset >= plane.begin &&
+                                chunk.image_offset < plane.begin + plane.bytes) {
+                                index = pi;
+                                break;
+                            }
+                        }
+                        if (index < 0) {
+                            usable = false;
+                            break;
+                        }
+                        plane_bytes[index] = std::max(plane_bytes[index], chunk.bytes);
+                        // Only a plane's first segment names its origin; the rest continue it.
+                        if (chunk.image_offset == planes[index].begin) {
+                            (*planes[index].target)[e] = chunk.file_offset;
+                        }
+                    }
                 }
-                direct_[i] = true;
-                s.gate_up_parent.geometry = banks_[i].gate_up_geometry;
-                s.gate_up_parent.device = Device::cpu();
-                s.gate_up_parent.data   = gate_up_base;
-                s.down_parent.geometry = banks_[i].down_geometry;
-                s.down_parent.device = Device::cpu();
-                s.down_parent.data   = down_base;
-                s.gate_up.parent = &s.gate_up_parent;
-                s.gate_up.layout = banks_[i].gate_up_layout; // plane offsets stay as stored
-                s.gate_up.expert_offsets = nullptr;         // expert * stride
-                s.down.parent = &s.down_parent;
-                s.down.layout = banks_[i].down_layout;
-                s.down.expert_offsets = nullptr;
-                s.view.gate_up = s.gate_up;
-                s.view.down    = s.down;
-                continue;
+                // The backing has to cover what plane() checks: every origin plus that plane's size.
+                std::uint64_t extent = 0;
+                const auto reach     = [&](const std::vector<std::uint64_t>& table,
+                                       std::uint64_t bytes) {
+                    if (!bytes) { return; }
+                    for (const auto origin : table) { extent = std::max(extent, origin + bytes); }
+                };
+                reach(s.gu_codes, std::max<std::uint64_t>(gu_layout.codes.expert_bytes, plane_bytes[0]));
+                reach(s.gu_high, std::max<std::uint64_t>(gu_layout.high.expert_bytes, plane_bytes[1]));
+                reach(s.gu_scales,
+                      std::max<std::uint64_t>(gu_layout.scales.expert_bytes, plane_bytes[2]));
+                reach(s.dn_codes, std::max<std::uint64_t>(dn_layout.codes.expert_bytes, plane_bytes[3]));
+                reach(s.dn_high, std::max<std::uint64_t>(dn_layout.high.expert_bytes, plane_bytes[4]));
+                reach(s.dn_scales,
+                      std::max<std::uint64_t>(dn_layout.scales.expert_bytes, plane_bytes[5]));
+                const auto* mapped = usable ? reader_->object_base(file_index) : nullptr;
+                if (mapped != nullptr) {
+                    s.gate_up_parent.geometry       = banks_[i].gate_up_geometry;
+                    s.gate_up_parent.geometry.bytes = extent;
+                    s.gate_up_parent.device         = Device::cpu();
+                    s.gate_up_parent.data           = mapped;
+                    s.down_parent.geometry          = banks_[i].down_geometry;
+                    s.down_parent.geometry.bytes    = extent;
+                    s.down_parent.device            = Device::cpu();
+                    s.down_parent.data              = mapped;
+                    s.gate_up.parent         = &s.gate_up_parent;
+                    s.gate_up.layout         = with_zero_planes(gu_layout);
+                    s.gate_up.codes_offsets  = s.gu_codes.data();
+                    s.gate_up.high_offsets   = s.gu_high.data();
+                    s.gate_up.scales_offsets = s.gu_scales.data();
+                    s.gate_up.expert_offsets = nullptr;
+                    s.down.parent         = &s.down_parent;
+                    s.down.layout         = with_zero_planes(dn_layout);
+                    s.down.codes_offsets  = s.dn_codes.data();
+                    s.down.high_offsets   = s.dn_high.data();
+                    s.down.scales_offsets = s.dn_scales.data();
+                    s.down.expert_offsets = nullptr;
+                    s.view.gate_up        = s.gate_up;
+                    s.view.down           = s.down;
+                    direct_[i]            = true;
+                    if (std::getenv("NINFER_HOST_DEBUG") != nullptr && i < 2) {
+                        std::fprintf(stderr,
+                                     "[fused-in-place] bank=%zu experts=%u gu_codes=%llu "
+                                     "gu_scales=%llu dn_codes=%llu dn_scales=%llu extent=%llu\n",
+                                     i, count, (unsigned long long)s.gu_codes.front(),
+                                     (unsigned long long)s.gu_scales.front(),
+                                     (unsigned long long)s.dn_codes.front(),
+                                     (unsigned long long)s.dn_scales.front(),
+                                     (unsigned long long)extent);
+                    }
+                    continue;
+                }
             }
 
             // port (sm_89): a per-expert bank is addressable in place. Its experts are one object
@@ -360,10 +432,20 @@ private:
         return out;
     }
 
+    static WeightBankLayout with_zero_planes(const WeightBankLayout& layout) {
+        WeightBankLayout out = layout;
+        out.codes.offset     = 0;
+        out.high.offset      = 0;
+        out.scales.offset    = 0;
+        return out;
+    }
+
     struct State {
         std::vector<std::uint32_t> slot_of;
         std::vector<std::uint64_t> gate_up_offsets;
         std::vector<std::uint64_t> down_offsets;
+        std::vector<std::uint64_t> gu_codes, gu_high, gu_scales;
+        std::vector<std::uint64_t> dn_codes, dn_high, dn_scales;
         WeightParent gate_up_parent;
         WeightParent down_parent;
         WeightBankView gate_up;

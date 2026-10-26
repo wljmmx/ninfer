@@ -39,7 +39,10 @@ MatrixBank matrix_bank(const WeightBankView& bank) {
             layout.codes.expert_stride,
             layout.high.expert_stride,
             layout.scales.expert_stride,
-            bank.expert_offsets};
+            bank.expert_offsets,
+            bank.codes_offsets,
+            bank.high_offsets,
+            bank.scales_offsets};
 }
 } // namespace
 

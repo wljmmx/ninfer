@@ -102,9 +102,13 @@ public:
                 "routed_swiglu CPU: invalid divisor storage");
         for (int expert = 0; expert < count; ++expert) {
             if (!selected[expert]) { continue; }
-            for (const auto& plane : {layout.codes, layout.high, layout.scales}) {
+            for (const auto role : {ExpertPlaneKind::Codes, ExpertPlaneKind::High,
+                                   ExpertPlaneKind::Scales}) {
+                const auto& plane = role == ExpertPlaneKind::Codes  ? layout.codes
+                                    : role == ExpertPlaneKind::High ? layout.high
+                                                                    : layout.scales;
                 if (!plane.expert_bytes) { continue; }
-                const auto memory = bank.plane(plane, expert);
+                const auto memory = bank.plane(role, expert);
                 require(operand::aligned(memory.data, 16),
                         "routed_swiglu CPU: weight plane must be 16-byte aligned");
                 read(memory.data, memory.bytes);

@@ -42,18 +42,26 @@ struct MatrixBank {
     // port (sm_89): per-expert offsets replace expert * stride when experts live in
     // separately committed segments.
     const std::uint64_t* offsets = nullptr;
+    // port (sm_89): a fused bank keeps its three plane runs far apart inside one object, so each
+    // plane carries its own table; when these are set the base pointers already point at the mapped
+    // file and the entry is that plane's origin.
+    const std::uint64_t* codes_offsets  = nullptr;
+    const std::uint64_t* high_offsets   = nullptr;
+    const std::uint64_t* scales_offsets = nullptr;
 
-    [[nodiscard]] std::size_t offset(int expert, std::size_t stride) const noexcept {
-        return offsets ? static_cast<std::size_t>(offsets[expert])
-                       : static_cast<std::size_t>(expert) * stride;
+    [[nodiscard]] std::size_t offset_of(const std::uint64_t* table, int expert,
+                                        std::size_t stride) const noexcept {
+        return table     ? static_cast<std::size_t>(table[expert])
+               : offsets ? static_cast<std::size_t>(offsets[expert])
+                         : static_cast<std::size_t>(expert) * stride;
     }
 
     [[nodiscard]] Matrix matrix(int expert) const noexcept {
-        return {base.codes ? base.codes + offset(expert, code_stride) : nullptr,
-                base.high ? base.high + offset(expert, high_stride) : nullptr,
+        return {base.codes ? base.codes + offset_of(codes_offsets, expert, code_stride) : nullptr,
+                base.high ? base.high + offset_of(high_offsets, expert, high_stride) : nullptr,
                 base.scales ? reinterpret_cast<const std::uint16_t*>(
                                   reinterpret_cast<const std::byte*>(base.scales) +
-                                  offset(expert, scale_stride))
+                                  offset_of(scales_offsets, expert, scale_stride))
                             : nullptr};
     }
 };

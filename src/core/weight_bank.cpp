@@ -72,19 +72,26 @@ WeightBankView bind_weight_bank(const WeightParent& parent, const WeightBankLayo
     return {&parent, layout};
 }
 
-ConstMemorySpan WeightBankView::plane(const WeightBankPlane& plane, std::uint32_t expert) const {
+ConstMemorySpan WeightBankView::plane(ExpertPlaneKind role, std::uint32_t expert) const {
     check_expert(*this, expert);
+    const WeightBankPlane& plane = role == ExpertPlaneKind::Codes   ? layout.codes
+                                   : role == ExpertPlaneKind::High  ? layout.high
+                                                                    : layout.scales;
     if (!plane.expert_bytes) { return {nullptr, 0, parent->device}; }
     // port (sm_89): a per-plane table (fused banks) wins over the per-expert one (contiguous expert
     // images); both name the plane origin, and the plane's own offset is zero when a table is set.
-    const std::uint64_t* table = &plane == &layout.codes    ? codes_offsets
-                                 : &plane == &layout.high   ? high_offsets
-                                                            : scales_offsets;
+    const std::uint64_t* table = role == ExpertPlaneKind::Codes  ? codes_offsets
+                                 : role == ExpertPlaneKind::High ? high_offsets
+                                                                 : scales_offsets;
     const auto offset = plane.offset + (table                ? table[expert]
                                        : expert_offsets      ? expert_offsets[expert]
                                                              : expert * plane.expert_stride);
     if (offset > parent->geometry.bytes || plane.expert_bytes > parent->geometry.bytes - offset) {
         std::string detail = "weight bank plane exceeds its backing";
+        detail += " kind=";
+        detail += table ? "per-plane" : expert_offsets ? "per-expert" : "stride";
+        detail += " plane=";
+        detail += role == ExpertPlaneKind::Codes ? "codes" : role == ExpertPlaneKind::High ? "high" : "scales";
         detail += " offset=";
         detail += std::to_string(offset);
         detail += " bytes=";
@@ -118,9 +125,9 @@ ExpertMatrixDeviceView device_weight_bank(const WeightBankView& bank) {
     }
     const auto& layout = bank.layout;
     ExpertMatrixDeviceView out;
-    out.codes        = static_cast<const std::byte*>(bank.plane(layout.codes, 0).data);
-    out.high         = static_cast<const std::byte*>(bank.plane(layout.high, 0).data);
-    out.scales       = static_cast<const std::byte*>(bank.plane(layout.scales, 0).data);
+    out.codes        = static_cast<const std::byte*>(bank.plane(ExpertPlaneKind::Codes, 0).data);
+    out.high         = static_cast<const std::byte*>(bank.plane(ExpertPlaneKind::High, 0).data);
+    out.scales       = static_cast<const std::byte*>(bank.plane(ExpertPlaneKind::Scales, 0).data);
     out.code_stride  = layout.codes.expert_stride;
     out.high_stride  = layout.high.expert_stride;
     out.scale_stride = layout.scales.expert_stride;
