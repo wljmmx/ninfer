@@ -132,3 +132,7 @@ include("${CMAKE_CURRENT_LIST_DIR}/linear/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_add/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_pair/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_swiglu/tests.cmake")
+
+ninfer_add_op_test(ninfer_moe_int8_mma_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_moe_int8_mma.cu"
+  LIBRARIES ninfer_ops)
