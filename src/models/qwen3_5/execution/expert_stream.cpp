@@ -170,6 +170,10 @@ ExpertStream::ExpertStream(std::uint32_t count, WeightBankLayout gate_up, Weight
     // The policy is chosen per process: NINFER_EXPERT_POLICY=slru switches the streaming path to the
     // 50/50 segmented LRU. Everything measured so far was taken with the score fill, so the default
     // stays there until this one is measured against it.
+    epoch_steps_ = [] {
+        const char* value = std::getenv("NINFER_EXPERT_EPOCH");
+        return value != nullptr ? static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10)) : 0U;
+    }();
     regions_ = [] {
         const char* value = std::getenv("NINFER_EXPERT_REGIONS");
         return value != nullptr && value[0] != '0';
@@ -672,6 +676,44 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             if (generation_mode) { frozen_ = true; frozen_wanted_ = wanted; }
             if (static_set && freeze_after > 0 && ++steps_ >= static_cast<std::uint64_t>(freeze_after)) {
                 frozen_ = true; frozen_wanted_ = wanted;
+            }
+        } else if (epoch_steps_ > 0) {
+            // Epoch-static hot region. The hot list is rebuilt only at an epoch boundary from the
+            // load window, so within an epoch the hot rows of the table never move; the spill ring
+            // absorbs whatever the epoch misses. Routing every step, placement every N steps, and
+            // nothing in between - the arrangement vLLM (eplb_state.py:647-693) and DeepInfer
+            // (eplb/__init__.py:146-165) both use.
+            if (load_window_.size() != count_) { load_window_.assign(count_, 0.0F); }
+            if (hot_list_.empty()) {
+                std::vector<bool> seen(count_, false);
+                for (std::size_t i = 0; i < values && hot_list_.size() < hot_cap; ++i) {
+                    const auto expert = static_cast<std::uint32_t>(route_ids[i]);
+                    if (seen[expert]) { continue; }
+                    seen[expert] = true;
+                    hot_list_.push_back(expert);
+                }
+            }
+            for (std::size_t i = 0; i < values; ++i) {
+                load_window_[static_cast<std::size_t>(route_ids[i])] += 1.0F;
+            }
+            if (++step_in_epoch_ >= epoch_steps_) {
+                std::vector<std::uint32_t> ranked(count_);
+                std::iota(ranked.begin(), ranked.end(), 0U);
+                std::stable_sort(ranked.begin(), ranked.end(), [&](std::uint32_t a, std::uint32_t b) {
+                    return load_window_[a] > load_window_[b];
+                });
+                hot_list_.assign(ranked.begin(), ranked.begin() + std::min<std::size_t>(hot_cap, ranked.size()));
+                std::fill(load_window_.begin(), load_window_.end(), 0.0F);
+                step_in_epoch_ = 0;
+                ++epochs_;
+            }
+            wanted.assign(hot_list_.begin(), hot_list_.end());
+            for (const auto expert : wanted) { chosen[expert] = true; }
+            for (std::size_t i = 0; i < values && wanted.size() < capacity; ++i) {
+                const auto expert = static_cast<std::uint32_t>(route_ids[i]);
+                if (chosen[expert]) { continue; }
+                chosen[expert] = true;
+                wanted.push_back(expert);
             }
         } else {
             // Region split (NINFER_EXPERT_REGIONS=1): the hot region is the top of the decayed

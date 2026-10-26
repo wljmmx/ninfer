@@ -129,6 +129,13 @@ private:
     // opt-in region split (hot + dedicated spill ring); the default policy is unchanged until it
     // is measured against the report's numbers
     bool regions_ = false;
+    // Epoch-static hot region (NINFER_EXPERT_EPOCH=<steps>): the hot list is rebuilt only at an
+    // epoch boundary from the load window, so the table cannot churn per step.
+    std::uint32_t epoch_steps_ = 0;
+    std::uint32_t step_in_epoch_ = 0;
+    std::uint64_t epochs_ = 0;
+    std::vector<float> load_window_;
+    std::vector<std::uint32_t> hot_list_;
     std::vector<std::uint32_t> slru_expert_;   // hot region, kEmpty when free
     std::vector<std::int32_t> slru_of_expert_; // count_, -1 when not resident
     std::vector<std::uint8_t> slru_protected_;
