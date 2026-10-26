@@ -253,6 +253,16 @@ void ExpertStream::rebase_window() {
     experts_.bank.down.scales    = base + entry_.down_scales.offset;
 }
 
+std::uint32_t ExpertStream::spill_slots(std::uint32_t capacity) const noexcept {
+    // A fixed eight, not a measured p99. Under four concurrent lanes the measured p99 of a step's
+    // misses is six at 163 slots, and sizing to that measured 63-68 tok/s against 82-86 for eight:
+    // a region that changes size moves the resident set every step, which republishes the offset
+    // table and re-uploads slots the previous size had just placed. Eight is also one full token's
+    // routing, which is the granularity the tail actually arrives in.
+    // The miss histogram is still sampled: it is reported as diagnostics, and it is what a future
+    // per-generation (not per-step) decision would read.
+    return std::min<std::uint32_t>(8U, std::max<std::uint32_t>(2U, capacity / 3));
+}
 bool ExpertStream::fully_resident() const noexcept {
     return cache_ != nullptr && cache_->resident_capacity() >= count_;
 }
@@ -416,14 +426,24 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             // At 12 GiB the set covers 95.7% and the outside routes cost only 0.8 ms on the CPU, so
             // filling the pool wins there (100.5 against 94.6 tok/s) - and a full, static table is
             // what a per-layer graph needs anyway.
-            const std::uint32_t spill_percent = [&] {
+            // port (sm_89): the size of the spill region is the number of experts this layer's
+            // tokens actually miss, not a percentage of the pool. Measured on 13k tokens of real
+            // conversation: 0.57 misses a token at 163 slots a layer (p99 = 3, max = 4), 0.91 at
+            // 109 (p99 = 4), 2.17 at 54 (p99 = 5). Leaving 15% free is right at 54 slots (8) and
+            // six times too generous at 163 (24 for a p99 of 3), so the slots the hot set loses
+            // buy nothing. NINFER_EXPERT_SPILL_PCT keeps the old rule, NINFER_EXPERT_SPILL_SLOTS
+            // pins a count, and both exist to A/B against the estimate.
+            const auto spill = [&]() -> std::size_t {
                 if (const char* value = std::getenv("NINFER_EXPERT_SPILL_PCT")) {
-                    return static_cast<std::uint32_t>(
-                        std::min<std::uint64_t>(std::strtoul(value, nullptr, 10), 90));
+                    return static_cast<std::size_t>(capacity) *
+                           std::min<std::uint64_t>(std::strtoul(value, nullptr, 10), 90) / 100;
                 }
-                return capacity >= 150 ? 0U : 15U;
+                if (const char* value = std::getenv("NINFER_EXPERT_SPILL_SLOTS")) {
+                    return std::min<std::size_t>(std::strtoul(value, nullptr, 10),
+                                                 static_cast<std::size_t>(capacity) / 2);
+                }
+                return std::min<std::size_t>(spill_slots(capacity), static_cast<std::size_t>(capacity) / 2);
             }();
-            const auto spill = static_cast<std::size_t>(capacity) * spill_percent / 100;
             const auto pinned = capacity > spill ? capacity - spill : capacity;
             const auto keep   = std::min<std::size_t>(pinned, frozen_wanted_.size());
             wanted.assign(frozen_wanted_.begin(), frozen_wanted_.begin() + keep);
@@ -507,6 +527,30 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                         std::fputc('\n', trace);
                     }
                     std::fflush(trace);
+                }
+            }
+            // One sample per decode token: the spill region has to hold what a token misses, so
+            // the tail of this distribution - not its mean - is the number of slots it needs.
+            if (tokens <= 8 && capacity < count_) {
+                if (miss_scratch_.size() != count_) { miss_scratch_.assign(count_, 0); }
+                if (++miss_generation_ == 0) {
+                    std::fill(miss_scratch_.begin(), miss_scratch_.end(), 0);
+                    miss_generation_ = 1;
+                }
+                // Distinct experts this step needs that the set does not hold. Counted per step,
+                // not per lane: the spill region has to serve every lane at once, so a four-lane
+                // step misses about twice as many experts as a single one (measured).
+                std::uint32_t miss = 0;
+                for (std::size_t i = 0; i < values; ++i) {
+                    const auto expert = static_cast<std::size_t>(route_ids[i]);
+                    if (chosen[expert] || miss_scratch_[expert] == miss_generation_) { continue; }
+                    miss_scratch_[expert] = miss_generation_;
+                    ++miss;
+                }
+                miss_hist_[std::min<std::uint32_t>(miss, 32)] += 1;
+                if (++miss_samples_ >= 256) {
+                    for (auto& bucket : miss_hist_) { bucket /= 2; }
+                    miss_samples_ = 0;
                 }
             }
             coverage_.routes += values;
