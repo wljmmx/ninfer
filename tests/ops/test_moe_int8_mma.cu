@@ -325,6 +325,9 @@ int check_grouped() {
     for (int e = 0; e < kExperts; ++e) { offsets[e + 1] = offsets[e] + 1; }
     std::vector<int> order(kExperts);
     for (int e = 0; e < kExperts; ++e) { order[e] = e; }
+    // One shared bank: expert e starts kRows rows into it, which is what Access::row reports.
+    std::vector<int> row_base(kExperts);
+    for (int e = 0; e < kExperts; ++e) { row_base[e] = e * kRows; }
 
     __nv_bfloat16* dOut = nullptr;
     std::int8_t* dAct   = nullptr;
@@ -333,6 +336,7 @@ int check_grouped() {
     __half* dWsc        = nullptr;
     int* dOff           = nullptr;
     int* dOrd           = nullptr;
+    int* dRow           = nullptr;
     const bool ok =
         cudaMalloc(&dOut, kExperts * kRows * sizeof(__nv_bfloat16)) == cudaSuccess &&
         cudaMalloc(&dAct, act.size()) == cudaSuccess &&
@@ -340,7 +344,8 @@ int check_grouped() {
         cudaMalloc(&dCodes, codes.size()) == cudaSuccess &&
         cudaMalloc(&dWsc, wsc.size() * sizeof(__half)) == cudaSuccess &&
         cudaMalloc(&dOff, offsets.size() * sizeof(int)) == cudaSuccess &&
-        cudaMalloc(&dOrd, order.size() * sizeof(int)) == cudaSuccess;
+        cudaMalloc(&dOrd, order.size() * sizeof(int)) == cudaSuccess &&
+        cudaMalloc(&dRow, row_base.size() * sizeof(int)) == cudaSuccess;
     if (!ok) {
         std::printf("FAIL int8 grouped: cudaMalloc\n");
         return 1;
@@ -351,10 +356,11 @@ int check_grouped() {
     cudaMemcpy(dWsc, wsc.data(), wsc.size() * sizeof(__half), cudaMemcpyHostToDevice);
     cudaMemcpy(dOff, offsets.data(), offsets.size() * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(dOrd, order.data(), order.size() * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(dRow, row_base.data(), row_base.size() * sizeof(int), cudaMemcpyHostToDevice);
 
     namespace gi = ninfer::ops::detail::moe_cuda::groupwise_int;
     gi::grouped_gate_up_i8<kK, kRows><<<dim3(kRows / 16, kExperts), 32>>>(
-        dAct, dAsc, dCodes, dWsc, dOff, dOrd, kExperts, kExperts, dOut);
+        dAct, dAsc, dCodes, dWsc, dRow, dOff, dOrd, kExperts, kExperts, dOut);
     cudaDeviceSynchronize();
 
     std::vector<__nv_bfloat16> got((std::size_t)kExperts * kRows);
@@ -366,6 +372,7 @@ int check_grouped() {
     cudaFree(dWsc);
     cudaFree(dOff);
     cudaFree(dOrd);
+    cudaFree(dRow);
 
     // Reference: decode every weight, dot against the expert's own activation, scale per group.
     int bad = 0;
