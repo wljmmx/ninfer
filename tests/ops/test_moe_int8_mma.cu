@@ -10,6 +10,7 @@
 #include "ops/op_check.h"
 #include "ops/moe/kernels/cuda/groupwise_int/expert.cuh"
 #include "ops/moe/kernels/cuda/groupwise_int/grouped_gate_up_i8.cuh"
+#include "ops/moe/kernels/cuda/groupwise_int/grouped_gate_up_i8_smem.cuh"
 #include "ops/moe/kernels/cuda/groupwise_int/quantize_a8.cuh"
 
 #include <cuda_fp16.h>
@@ -370,6 +371,27 @@ int check_grouped() {
 
     std::vector<__nv_bfloat16> got((std::size_t)kExperts * kRows);
     cudaMemcpy(got.data(), dOut, got.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+
+    // Same inputs through the shared-memory staging kernel; the two must agree exactly.
+    __nv_bfloat16* dOut2 = nullptr;
+    if (cudaMalloc(&dOut2, kExperts * kRows * sizeof(__nv_bfloat16)) != cudaSuccess) {
+        std::printf("FAIL int8 smem: cudaMalloc\n");
+        return 1;
+    }
+    gi::grouped_gate_up_i8_smem<kK, kRows><<<dim3(kRows / 16, kExperts), 32>>>(
+        dAct, dAsc, access, dOff, dOrd, kExperts, kExperts, dOut2);
+    cudaDeviceSynchronize();
+
+    std::vector<__nv_bfloat16> got2((std::size_t)kExperts * kRows);
+    cudaMemcpy(got2.data(), dOut2, got2.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+    cudaFree(dOut2);
+    int smem_bad = 0;
+    for (std::size_t i = 0; i < got2.size(); ++i) {
+        if (__bfloat162float(got[i]) != __bfloat162float(got2[i])) { ++smem_bad; }
+    }
+    std::printf("int8 smem vs naive: %d / %d elements identical\n",
+                (int)got2.size() - smem_bad, (int)got2.size());
+
     cudaFree(dOut);
     cudaFree(dAct);
     cudaFree(dAsc);
@@ -408,7 +430,7 @@ int check_grouped() {
     }
     std::printf("int8 grouped: %d / %d rows within bf16 rounding (worst rel %.2e)\n",
                 kExperts * kRows - bad, kExperts * kRows, worst_rel);
-    return bad;
+    return bad + smem_bad;
 }
 
 } // namespace
