@@ -206,10 +206,11 @@ __device__ __forceinline__ void ldm_x2(unsigned& r0, unsigned& r1, const void* p
 }
 
 // Double-buffered tile: the next 64-wide k group is copied in with cp.async while the current one is
-// being multiplied, and its weights are decoded into a second activation buffer before they are
-// needed. Rows are 64 bytes (one k group), so an 8x8 ldmatrix block is rows x 16 bytes and the four
-// blocks of the x4 load are (gate low, gate high, up low, up high) rows of the same k half.
-template <int K, int Rows, int Cols, class Access>
+// being multiplied, its weights are decoded into a second activation buffer before they are needed,
+// and RowTiles 16-row groups share one staging pass. One row group per block made the staging and the
+// two barriers per k group cover only 32 rows; four make them cover 128, which is the shape the bf16
+// route uses.
+template <int K, int Rows, int Cols, int RowTiles, class Access>
 __global__ __launch_bounds__(Cols * 4) void grouped_gate_up_i8_tile_ldm(
     const std::int8_t* __restrict__ act_i8, const float* __restrict__ act_scale, Access weights,
     const int* __restrict__ offsets, const int* __restrict__ order,
@@ -219,7 +220,9 @@ __global__ __launch_bounds__(Cols * 4) void grouped_gate_up_i8_tile_ldm(
     constexpr int kG        = K / 64;
     constexpr int kThreads  = Cols * 4;
     constexpr int kHalf     = 16;
-    constexpr int kTileRows = 2 * kHalf;
+    constexpr int kGateSpan = kHalf * RowTiles;   // gate rows this block covers
+    constexpr int kTileRows = 2 * kGateSpan;      // gate rows first, then up rows
+    constexpr int kDecodeIt = (kTileRows * 8 + kThreads - 1) / kThreads;
 
     if (info->direct) { return; }
     const int job = blockIdx.y;
@@ -244,7 +247,7 @@ __global__ __launch_bounds__(Cols * 4) void grouped_gate_up_i8_tile_ldm(
     const int c1   = c0 + 1;
     const int col0 = warp * 8;
 
-    const int r0 = blockIdx.x * 16;
+    const int r0 = blockIdx.x * kGateSpan;
     if (r0 >= kGateRows) { return; }
 
     const auto matrix = weights.template resolve<Rows>(expert);
@@ -258,10 +261,15 @@ __global__ __launch_bounds__(Cols * 4) void grouped_gate_up_i8_tile_ldm(
     const auto* asc1 = act_scale + std::int64_t(tok1) * kG;
 
     const auto stage = [&](int g, int buf) {
-        if (t < kTileRows * 2) {
-            const int row   = t >> 1;
-            const int half  = t & 1;
-            const int grow  = row < kHalf ? (r0 + row) : (kGateRows + r0 + row - kHalf);
+        // One weight row per thread only holds while the block covers kTileRows x 2; with 32 columns
+        // and four row groups the block is 128 threads for 256 copies, so this loops.
+#pragma unroll
+        for (int i = 0; i < (kTileRows * 2 + kThreads - 1) / kThreads; ++i) {
+            const int e = t + i * kThreads;
+            if (e >= kTileRows * 2) { break; }
+            const int row   = e >> 1;
+            const int half  = e & 1;
+            const int grow  = row < kGateSpan ? (r0 + row) : (kGateRows + r0 + row - kGateSpan);
             const auto* src = codes + std::int64_t(rb + grow) * (K / 2) + g * 32 + half * 16;
             cp_async_16(&Cr[buf][row][half * 16], src);
         }
@@ -275,12 +283,13 @@ __global__ __launch_bounds__(Cols * 4) void grouped_gate_up_i8_tile_ldm(
         cp_async_commit();
     };
     // Eight nibbles at a time: one 32-bit read of the packed row, per-byte xor/subtract to turn each
-    // nibble into (n ^ 8) - 8, then two byte permutes to interleave the low and high nibbles into
-    // the k order the tile stores. The scalar form spent eight iterations here.
+    // nibble into (n ^ 8) - 8, then two byte permutes to interleave the low and high nibbles into the
+    // k order the tile stores.
     const auto decode = [&](int buf) {
 #pragma unroll
-        for (int i = 0; i < kTileRows * 8 / kThreads; ++i) {
-            const int e   = t + i * kThreads;
+        for (int i = 0; i < kDecodeIt; ++i) {
+            const int e = t + i * kThreads;
+            if (e >= kTileRows * 8) { break; }
             const int row = e >> 3;
             const int k0  = (e & 7) * 8;
             const std::uint32_t w =
@@ -289,15 +298,21 @@ __global__ __launch_bounds__(Cols * 4) void grouped_gate_up_i8_tile_ldm(
                 __vsubss4(static_cast<int>((w & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
             const std::uint32_t hi =
                 __vsubss4(static_cast<int>(((w >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
-            *reinterpret_cast<std::uint32_t*>(&As[buf][row][k0]) =
-                __byte_perm(lo, hi, 0x5140); // low0 high0 low1 high1
-            *reinterpret_cast<std::uint32_t*>(&As[buf][row][k0 + 4]) =
-                __byte_perm(lo, hi, 0x7362); // low2 high2 low3 high3
+            *reinterpret_cast<std::uint32_t*>(&As[buf][row][k0]) = __byte_perm(lo, hi, 0x5140);
+            *reinterpret_cast<std::uint32_t*>(&As[buf][row][k0 + 4]) = __byte_perm(lo, hi, 0x7362);
         }
     };
 
-    float gate[4] = {0.f, 0.f, 0.f, 0.f};
-    float up[4]   = {0.f, 0.f, 0.f, 0.f};
+    float gate[RowTiles][4];
+    float up[RowTiles][4];
+#pragma unroll
+    for (int i = 0; i < RowTiles; ++i) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            gate[i][j] = 0.f;
+            up[i][j]   = 0.f;
+        }
+    }
 
     // The four 8x8 blocks of the x4 load, and the two of the x2 load, are addressed by lane group.
     const int a_mat = lane >> 3;                      // 0..3
@@ -317,37 +332,35 @@ __global__ __launch_bounds__(Cols * 4) void grouped_gate_up_i8_tile_ldm(
         const int nxt = cur ^ 1;
         if (g + 1 < kG) { stage(g + 1, nxt); }
 
-        int acc_g[4] = {0, 0, 0, 0};
-        int acc_u[4] = {0, 0, 0, 0};
 #pragma unroll
-        for (int sub = 0; sub < 2; ++sub) {
-            const int kk = sub * 32;
-            unsigned ga0, ga1, ga2, ga3, ua0, ua1, ua2, ua3, bb0, bb1;
-            ldm_x4(ga0, ga1, ga2, ga3, &As[cur][a_row][kk + a_kt]);
-            ldm_x4(ua0, ua1, ua2, ua3, &As[cur][a_row + kHalf][kk + a_kt]);
-            ldm_x2(bb0, bb1, &Bs[cur][col0 + b_row][kk + b_mat * 16]);
-
-            mma_s8(acc_g[0], acc_g[1], acc_g[2], acc_g[3], ga0, ga1, ga2, ga3, bb0, bb1);
-            mma_s8(acc_u[0], acc_u[1], acc_u[2], acc_u[3], ua0, ua1, ua2, ua3, bb0, bb1);
+        for (int t4 = 0; t4 < RowTiles; ++t4) {
+            int acc_g[4] = {0, 0, 0, 0};
+            int acc_u[4] = {0, 0, 0, 0};
+#pragma unroll
+            for (int sub = 0; sub < 2; ++sub) {
+                const int kk = sub * 32;
+                unsigned ga0, ga1, ga2, ga3, ua0, ua1, ua2, ua3, bb0, bb1;
+                ldm_x4(ga0, ga1, ga2, ga3, &As[cur][t4 * kHalf + a_row][kk + a_kt]);
+                ldm_x4(ua0, ua1, ua2, ua3, &As[cur][kGateSpan + t4 * kHalf + a_row][kk + a_kt]);
+                ldm_x2(bb0, bb1, &Bs[cur][col0 + b_row][kk + b_mat * 16]);
+                mma_s8(acc_g[0], acc_g[1], acc_g[2], acc_g[3], ga0, ga1, ga2, ga3, bb0, bb1);
+                mma_s8(acc_u[0], acc_u[1], acc_u[2], acc_u[3], ua0, ua1, ua2, ua3, bb0, bb1);
+            }
+            const int gr = r0 + t4 * kHalf + r;
+            const float sg_lo = __half2float(wsc[(std::int64_t)gr * kG + g]);
+            const float sg_hi = __half2float(wsc[(std::int64_t)(gr + 8) * kG + g]);
+            const float su_lo = __half2float(wsc[(std::int64_t)(kGateRows + gr) * kG + g]);
+            const float su_hi = __half2float(wsc[(std::int64_t)(kGateRows + gr + 8) * kG + g]);
+            const float a0 = asc0[g], a1 = asc1[g];
+            gate[t4][0] += (float)acc_g[0] * sg_lo * a0;
+            gate[t4][1] += (float)acc_g[1] * sg_lo * a1;
+            gate[t4][2] += (float)acc_g[2] * sg_hi * a0;
+            gate[t4][3] += (float)acc_g[3] * sg_hi * a1;
+            up[t4][0] += (float)acc_u[0] * su_lo * a0;
+            up[t4][1] += (float)acc_u[1] * su_lo * a1;
+            up[t4][2] += (float)acc_u[2] * su_hi * a0;
+            up[t4][3] += (float)acc_u[3] * su_hi * a1;
         }
-
-        // Both k chunks share the group's scales, so they accumulate as integers first and the scale
-        // is applied once, exactly as the naive form does. Scaling per chunk instead shifts the last
-        // bits of every accumulator.
-        const float sg_lo = __half2float(wsc[(std::int64_t)(r0 + r) * kG + g]);
-        const float sg_hi = __half2float(wsc[(std::int64_t)(r0 + r + 8) * kG + g]);
-        const float su_lo = __half2float(wsc[(std::int64_t)(kGateRows + r0 + r) * kG + g]);
-        const float su_hi = __half2float(wsc[(std::int64_t)(kGateRows + r0 + r + 8) * kG + g]);
-        const float a0 = asc0[g], a1 = asc1[g];
-
-        gate[0] += (float)acc_g[0] * sg_lo * a0;
-        gate[1] += (float)acc_g[1] * sg_lo * a1;
-        gate[2] += (float)acc_g[2] * sg_hi * a0;
-        gate[3] += (float)acc_g[3] * sg_hi * a1;
-        up[0] += (float)acc_u[0] * su_lo * a0;
-        up[1] += (float)acc_u[1] * su_lo * a1;
-        up[2] += (float)acc_u[2] * su_hi * a0;
-        up[3] += (float)acc_u[3] * su_hi * a1;
 
         if (g + 1 < kG) {
             cp_async_wait<0>();
@@ -357,19 +370,21 @@ __global__ __launch_bounds__(Cols * 4) void grouped_gate_up_i8_tile_ldm(
         }
     }
 
-    const int row0 = r0 + r;
-    const int row1 = row0 + 8;
-    if (c0 < cols) {
-        const std::int64_t s = std::int64_t(begin + column_base + c0) * stride;
-        out[s + row0] = __float2bfloat16_rn(common::silu(gate[0]) * up[0]);
-        out[s + row1] = __float2bfloat16_rn(common::silu(gate[2]) * up[2]);
-    }
-    if (c1 < cols) {
-        const std::int64_t s = std::int64_t(begin + column_base + c1) * stride;
-        out[s + row0] = __float2bfloat16_rn(common::silu(gate[1]) * up[1]);
-        out[s + row1] = __float2bfloat16_rn(common::silu(gate[3]) * up[3]);
+#pragma unroll
+    for (int t4 = 0; t4 < RowTiles; ++t4) {
+        const int row0 = r0 + t4 * kHalf + r;
+        const int row1 = row0 + 8;
+        if (c0 < cols) {
+            const std::int64_t s = std::int64_t(begin + column_base + c0) * stride;
+            out[s + row0] = __float2bfloat16_rn(common::silu(gate[t4][0]) * up[t4][0]);
+            out[s + row1] = __float2bfloat16_rn(common::silu(gate[t4][2]) * up[t4][2]);
+        }
+        if (c1 < cols) {
+            const std::int64_t s = std::int64_t(begin + column_base + c1) * stride;
+            out[s + row0] = __float2bfloat16_rn(common::silu(gate[t4][1]) * up[t4][1]);
+            out[s + row1] = __float2bfloat16_rn(common::silu(gate[t4][3]) * up[t4][3]);
+        }
     }
 }
 
 } // namespace ninfer::ops::detail::moe_cuda::groupwise_int
-

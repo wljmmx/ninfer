@@ -406,8 +406,8 @@ int check_tile(const char* label) {
         const auto time_form = [&](bool use_ldm, int iters) {
             for (int i = 0; i < 8; ++i) { // warm the clocks on this shape
                 if (use_ldm) {
-                    gi::grouped_gate_up_i8_tile_ldm<kK, kRows, Cols>
-                        <<<dim3(kGate / 16, (int)job_experts.size()), Cols * 4>>>(
+                    gi::grouped_gate_up_i8_tile_ldm<kK, kRows, Cols, 4>
+                        <<<dim3(kGate / 64, (int)job_experts.size()), Cols * 4>>>(
                             dAct, dAsc, access, dOff, dOrd, dJobE, dJobC, dInfo, kGate, dOut);
                 } else {
                     gi::grouped_gate_up_i8_tile<kK, kRows, Cols>
@@ -422,8 +422,8 @@ int check_tile(const char* label) {
             cudaEventRecord(a);
             for (int i = 0; i < iters; ++i) {
                 if (use_ldm) {
-                    gi::grouped_gate_up_i8_tile_ldm<kK, kRows, Cols>
-                        <<<dim3(kGate / 16, (int)job_experts.size()), Cols * 4>>>(
+                    gi::grouped_gate_up_i8_tile_ldm<kK, kRows, Cols, 4>
+                        <<<dim3(kGate / 64, (int)job_experts.size()), Cols * 4>>>(
                             dAct, dAsc, access, dOff, dOrd, dJobE, dJobC, dInfo, kGate, dOut);
                 } else {
                     gi::grouped_gate_up_i8_tile<kK, kRows, Cols>
@@ -453,8 +453,8 @@ int check_tile(const char* label) {
         std::printf("FAIL int8 tile ldm: cudaMalloc\n");
         return 1;
     }
-    gi::grouped_gate_up_i8_tile_ldm<kK, kRows, Cols>
-        <<<dim3(kGate / 16, (int)job_experts.size()), Cols * 4>>>(
+    gi::grouped_gate_up_i8_tile_ldm<kK, kRows, Cols, 4>
+        <<<dim3(kGate / 64, (int)job_experts.size()), Cols * 4>>>(
             dAct, dAsc, access, dOff, dOrd, dJobE, dJobC, dInfo, kGate, dOut2);
     if (const auto err = cudaDeviceSynchronize(); err != cudaSuccess) {
         std::printf("FAIL int8 tile ldm (%s): %s\n", label, cudaGetErrorString(err));
