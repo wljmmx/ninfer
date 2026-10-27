@@ -235,6 +235,17 @@ struct CheckpointState {
     bool tail_hidden_valid         = false;
 };
 
+// What a checkpoint export hands back: the Host bytes of its KV prefix, page by page, with the
+// per-page content epoch so a caller can tell whether a page changed under it. State images are not
+// included yet -- they live behind a different store and the import side does not exist.
+struct CheckpointExport {
+    std::uint32_t frontier   = 0;
+    std::uint32_t page_count = 0;
+    std::size_t page_bytes   = 0;
+    std::vector<std::uint32_t> epochs;
+    std::vector<std::byte> kv_bytes;
+};
+
 struct CheckpointSlot {
     std::optional<CheckpointState> value;
     std::uint64_t generation = 1;
@@ -271,6 +282,9 @@ public:
         checkpoint_footprint(std::span<const CheckpointHandle>) const;
     [[nodiscard]] CheckpointSummary checkpoint_summary(CheckpointHandle) const;
     [[nodiscard]] CheckpointMetadata checkpoint_metadata(CheckpointHandle) const;
+    // Copies a checkpoint's KV prefix out of the Host arena. The pages must already be host
+    // resident; this does not demote them, because a demote is a transfer the caller schedules.
+    [[nodiscard]] std::optional<CheckpointExport> export_checkpoint(CheckpointHandle);
     [[nodiscard]] bool checkpoint_matches(CheckpointHandle, const RequestBasePlan&) const;
     [[nodiscard]] std::uint32_t checkpoint_recovery_frontier(CheckpointHandle,
                                                              const RequestBasePlan&,
@@ -681,3 +695,4 @@ public:
                         runtime::ExecutionTiming* failed_timing, runtime::TokenMaskProvider* masks);
 };
 } // namespace ninfer::models::qwen3_5::detail
+

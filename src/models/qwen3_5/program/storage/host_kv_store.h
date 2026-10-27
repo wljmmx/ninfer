@@ -386,6 +386,21 @@ public:
         return arena_->view(*extent.allocation);
     }
 
+    // The Host bytes of ONE page, for the checkpoint export. The extent is shared by several pages,
+    // so this subviews the page instead of handing back the whole allocation -- a caller that read
+    // the whole extent would copy its neighbours' pages as if they were this prefix.
+    [[nodiscard]] std::optional<HostKVAllocationConstView>
+    page_view(LogicalKVPageStore& pages, LogicalKVPageHandle page) const {
+        if (!pages.valid(page) || !pages.host_resident(page)) { return std::nullopt; }
+        const HostKVPageReplica replica = pages.host_replica(page);
+        if (!valid(replica.extent)) { return std::nullopt; }
+        const Extent& extent = require(replica.extent);
+        if (!extent.allocation) { return std::nullopt; }
+        const HostKVAllocationConstView whole = arena_->view(*extent.allocation);
+        if (!whole.valid() || replica.page_offset >= whole.page_count()) { return std::nullopt; }
+        return whole.subview(replica.page_offset, 1);
+    }
+
     [[nodiscard]] bool release(HostKVExtentCapability capability) noexcept {
         if (!valid(capability)) { return false; }
         Extent& extent     = extents_[capability.index_];
