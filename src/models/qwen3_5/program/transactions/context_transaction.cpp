@@ -125,15 +125,17 @@ namespace {
 // Diagnostic dump for the KV tier work: after a capture commits, write the checkpoint's prefix as
 // header + bytes so it can be compared against a second demote of the same checkpoint. Gated by
 // NINFER_CKPT_DUMP so the default path is untouched.
-void dump_exported_checkpoint(ProgramImpl& program, CheckpointHandle handle, const char* directory) {
+std::vector<CheckpointHandle> g_dumped_checkpoints;
+void dump_exported_checkpoint(ProgramImpl& program, CheckpointHandle handle, const char* directory,
+                              const char* tag) {
     const auto out = program.export_checkpoint(handle);
     if (!out) {
         std::fprintf(stderr, "[ckpt] export refused for checkpoint %u\n", handle.index);
         return;
     }
     char path[512];
-    std::snprintf(path, sizeof path, "%s/ckpt-%u-%u.bin", directory,
-                  static_cast<unsigned>(out->frontier), static_cast<unsigned>(handle.index));
+    std::snprintf(path, sizeof path, "%s/ckpt-%u-%u%s.bin", directory,
+                  static_cast<unsigned>(out->frontier), static_cast<unsigned>(handle.index), tag);
     std::FILE* file = std::fopen(path, "wb");
     if (file == nullptr) {
         std::fprintf(stderr, "[ckpt] cannot open %s\n", path);
@@ -229,7 +231,8 @@ ContextProgress ProgramImpl::poll_context(runtime::CancellationFlagView cancella
             if (const char* dump_dir = std::getenv("NINFER_CKPT_DUMP");
                 dump_dir != nullptr && *dump_dir != 0) {
                 for (const auto& [handle, role] : tx.capture_points) {
-                    dump_exported_checkpoint(*this, handle, dump_dir);
+                    g_dumped_checkpoints.push_back(handle);
+                    dump_exported_checkpoint(*this, handle, dump_dir, "");
                 }
             }
             for (const auto& [handle, role] : tx.capture_points) {
@@ -343,5 +346,7 @@ void ProgramImpl::abort_context() noexcept {
 }
 
 } // namespace ninfer::models::qwen3_5::detail
+
+
 
 
