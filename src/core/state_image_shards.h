@@ -55,7 +55,7 @@ struct Plan {
     std::uint32_t layer_count{0};
 };
 
-std::uint64_t image_bytes(const RegionSizes& sizes) {
+inline std::uint64_t image_bytes(const RegionSizes& sizes) {
     return sizes.conv_bytes + sizes.layer_bytes * sizes.layers + sizes.tail_bytes;
 }
 
@@ -68,7 +68,7 @@ std::uint64_t image_bytes(const RegionSizes& sizes) {
 // large conv block, or a layer whose recurrent matrix exceeds the frame budget). Refusing to plan
 // those cases -- as the first version did -- would make the format work for one model and fail on
 // the next one, which is the opposite of what a transfer format is for.
-std::vector<Plan> plan_shards(const RegionSizes& sizes, std::uint64_t max_payload) {
+inline std::vector<Plan> plan_shards(const RegionSizes& sizes, std::uint64_t max_payload) {
     std::vector<Plan> plan;
     if (max_payload == 0 || max_payload > 0xFFFFFFFFull) { return plan; }
     const std::uint64_t total = image_bytes(sizes);

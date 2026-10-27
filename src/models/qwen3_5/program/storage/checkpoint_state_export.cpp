@@ -59,4 +59,14 @@ std::optional<CheckpointStateExport> ProgramImpl::export_state(CheckpointHandle 
     return out;
 }
 
+bool ProgramImpl::state_bytes(StateImageHandle state, std::vector<std::byte>& out) const {
+    out.clear();
+    if (!state_store || !host_state_images) { return false; }
+    if (!state_store->valid(state) || !state_store->host_resident(state)) { return false; }
+    const qwen3_5::HostStateSlotHandle slot = state_store->host_slot(state);
+    const qwen3_5::HostStateImageConstView view = host_state_images->view(slot);
+    if (view.data == nullptr || view.layout == nullptr) { return false; }
+    out.assign(view.data, view.data + view.layout->image_bytes);
+    return true;
+}
 } // namespace ninfer::models::qwen3_5::detail

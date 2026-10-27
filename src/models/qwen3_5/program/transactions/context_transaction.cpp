@@ -1,5 +1,6 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "core/checkpoint_fingerprint.h"
+#include "core/state_image_shards.h"
 #include "core/checkpoint_tier.h"
 #include <memory>
 #include <mutex>
@@ -216,6 +217,38 @@ void dump_exported_checkpoint(ProgramImpl& program, CheckpointHandle handle, con
                      static_cast<unsigned long long>(print.state_layer_bytes),
                      static_cast<unsigned long long>(print.state_conv_bytes),
                      print.state_layers, print.features.dflash_local ? 1 : 0);
+    }
+    // Round-trip the shard format and the import path against the bytes just exported. This does not
+    // prove a cross-process restore -- that needs import_checkpoint -- but it does exercise split,
+    // fingerprint check, allocate, memcpy, publish and adopt as one chain.
+    if (const auto round = program.export_state(handle)) {
+        ninfer::core::fingerprint::CheckpointFingerprint print;
+        program.host_state_fingerprint(print);
+        ninfer::core::state_shards::RegionSizes sizes;
+        sizes.conv_bytes  = print.state_conv_bytes;
+        sizes.layer_bytes = print.state_layer_bytes;
+        sizes.layers      = print.state_layers;
+        const std::uint64_t covered = sizes.conv_bytes + sizes.layer_bytes * sizes.layers;
+        sizes.tail_bytes = print.state_image_bytes > covered ? print.state_image_bytes - covered : 0;
+
+        const std::string image(reinterpret_cast<const char*>(round->bytes.data()), round->bytes.size());
+        const auto split = ninfer::core::state_shards::split(image, sizes, 6ull * 1024 * 1024);
+        if (!split.ok) {
+            std::fprintf(stderr, "[ckpt] state import: split failed: %s\n", split.error.c_str());
+        } else {
+            std::string why;
+            const auto imported = program.import_state(split.shards, print, why);
+            if (!imported) {
+                std::fprintf(stderr, "[ckpt] state import: REFUSED %s\n", why.c_str());
+            } else {
+                std::vector<std::byte> back;
+                const bool read = program.state_bytes(*imported, back);
+                const bool same = read && back.size() == round->bytes.size() &&
+                                  std::memcmp(back.data(), round->bytes.data(), back.size()) == 0;
+                std::fprintf(stderr, "[ckpt] state import: %s (%zu shards, %zu B back)\n",
+                             same ? "round-trip OK" : "MISMATCH", split.shards.size(), back.size());
+            }
+        }
     }
     } else {
         std::fprintf(stderr, "[ckpt] state export refused for checkpoint %u\n",

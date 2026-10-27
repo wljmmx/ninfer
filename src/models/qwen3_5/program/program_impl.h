@@ -295,6 +295,9 @@ public:
         const ninfer::core::fingerprint::CheckpointFingerprint& want, std::string& error);
     // Fills the state-side fields of a fingerprint from the live layout.
     void host_state_fingerprint(ninfer::core::fingerprint::CheckpointFingerprint& out) const;
+    // Copies a state image that is already Host-resident. Used to check an import by reading it
+    // back through the same path the export uses, rather than trusting the write.
+    [[nodiscard]] bool state_bytes(StateImageHandle state, std::vector<std::byte>& out) const;
     [[nodiscard]] bool checkpoint_matches(CheckpointHandle, const RequestBasePlan&) const;
     [[nodiscard]] std::uint32_t checkpoint_recovery_frontier(CheckpointHandle,
                                                              const RequestBasePlan&,
