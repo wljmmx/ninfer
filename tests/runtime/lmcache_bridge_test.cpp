@@ -68,6 +68,107 @@ BridgeConfig profile_b() {
     return config;
 }
 
+// Profile C: rk4v4, the symmetric rotated-int4 format. Its paged layout is {U8 data 128 B, FP16
+// scales 4 B} per plane per layer per token -- 132 B, not a plain 4-bit halving. LMCache has no such
+// dtype, so the object travels as an opaque uint8 view whose shape still has to describe the bytes:
+// 2 planes x 40 layers x 128 tokens x 132 B = 1,351,680 B per chunk, i.e. two 675,840 B pages.
+BridgeConfig profile_rk4v4() {
+    BridgeConfig config;
+    config.model_name      = "bridge-rk4v4";
+    config.page_tokens     = 64;
+    config.pages_per_chunk = 2;
+    config.page_bytes      = 675840;
+    config.kv.dtype        = "uint8";
+    config.kv.shape        = {2, 40, 128, 132};
+    config.kv.kv_size      = 2;
+    config.state.dtype     = "bfloat16";
+    config.state.shape     = {8, 1, 1048576};
+    config.state.kv_size   = 1;
+    config.state.window_chunks = 1;
+    config.state.recurrent = true;
+    return config;
+}
+
+// Profile D: rk4v2-e8, where K is 96 B + 4 B and V is 64 B + 4 B. The planes are UNEQUAL (100 vs
+// 68), so a two-plane shape cannot describe them at all; the object has to go as one plane with the
+// planes laid end to end: 40 layers x 128 tokens x 168 B = 860,160 B per chunk, 430,080 B per page.
+BridgeConfig profile_rk4v2() {
+    BridgeConfig config;
+    config.model_name      = "bridge-rk4v2";
+    config.page_tokens     = 64;
+    config.pages_per_chunk = 2;
+    config.page_bytes      = 430080;
+    config.kv.dtype        = "uint8";
+    config.kv.shape        = {40, 128, 168};
+    config.kv.kv_size      = 1;
+    config.state.dtype     = "bfloat16";
+    config.state.shape     = {8, 1, 1048576};
+    config.state.kv_size   = 1;
+    config.state.window_chunks = 1;
+    config.state.recurrent = true;
+    return config;
+}
+
+BridgeKey make_key(std::int64_t instance, std::size_t pages, std::int64_t page_tokens) {
+    BridgeKey key;
+    key.tokens.reserve(pages * static_cast<std::size_t>(page_tokens));
+    for (std::size_t i = 0; i < pages * static_cast<std::size_t>(page_tokens); ++i) {
+        key.tokens.push_back(
+            static_cast<std::int64_t>((instance % 1000) * 1000 + (i * 7 + 11) % 1000));
+    }
+    key.request_id = "bridge-" + std::to_string(instance);
+    return key;
+}
+
+// What happens when two different KV formats share a token sequence. The cache key is the tokens
+// alone -- no dtype, no geometry -- so this is expected to HIT, and the hit is silent: the payload
+// comes back with the other format's byte count. This is why the fingerprint has to travel in
+// cache_salt; the transport itself offers no protection.
+void collision_check(const ClientOptions& options, std::int64_t instance, std::size_t pages) {
+    const BridgeConfig a = profile_a();
+    BridgeConfig rk = profile_rk4v4();
+    // The realistic case: one model, whose KV format was changed between runs. model_name is part of
+    // the object key, so leaving it different would hide the very collision being tested.
+    rk.model_name = a.model_name;
+    Bridge writer;
+    Bridge reader;
+    if (!writer.open(options, 1, a, instance)) {
+        std::printf("FAIL collision setup (a): %s\n", writer.error().c_str());
+        return;
+    }
+    if (!reader.open(options, 1, rk, instance + 500)) {
+        std::printf("FAIL collision setup (rk): %s\n", reader.error().c_str());
+        return;
+    }
+    const std::string kv = make_payload(pages * a.page_bytes, 0x31);
+    const std::string state = make_payload(a.state.object_bytes(), 0x41);
+    const auto as_bytes = [](const std::string& text) {
+        return std::span<const std::byte>(reinterpret_cast<const std::byte*>(text.data()),
+                                          text.size());
+    };
+    const BridgeKey key = make_key(instance, pages, a.page_tokens);
+    if (!writer.publish(key, as_bytes(kv), as_bytes(state))) {
+        std::printf("FAIL collision publish: %s\n", writer.error().c_str());
+        return;
+    }
+
+    // Same tokens, different format, different expected size.
+    std::vector<std::byte> got_kv;
+    std::vector<std::byte> got_state;
+    const bool hit = reader.restore(key, &got_kv, &got_state);
+    const std::size_t expected = pages * rk.page_bytes;
+    std::printf("[collision] rk4v4 lookup on a bf16 entry: hit=%s, got %zu B, expected %zu B\n",
+                hit ? "yes" : "no", got_kv.size(), expected);
+    if (hit && got_kv.size() != expected) {
+        std::printf("[collision] CONFIRMED: a format-blind hit returns the other format's bytes "
+                    "(ratio %.2fx)\n",
+                    static_cast<double>(got_kv.size()) / static_cast<double>(expected));
+    } else if (!hit) {
+        std::printf("[collision] no hit -- the key did include the geometry this time\n");
+    }
+}
+
+
 bool run(const ClientOptions& options, const BridgeConfig& config, std::int64_t instance,
          std::size_t pages) {
     Bridge bridge;
@@ -88,12 +189,7 @@ bool run(const ClientOptions& options, const BridgeConfig& config, std::int64_t 
                 (static_cast<double>(kv_bytes) + static_cast<double>(config.state.object_bytes())) /
                     1048576.0);
 
-    BridgeKey key;
-    key.tokens.reserve(pages * static_cast<std::size_t>(config.page_tokens));
-    for (std::size_t i = 0; i < pages * static_cast<std::size_t>(config.page_tokens); ++i) {
-        key.tokens.push_back(static_cast<std::int64_t>((instance % 1000) * 1000 + (i * 7 + 11) % 1000));
-    }
-    key.request_id = "bridge-" + std::to_string(instance);
+    BridgeKey key = make_key(instance, pages, config.page_tokens);
 
     const auto start = std::chrono::steady_clock::now();
     if (!bridge.publish(key, as_bytes(kv), as_bytes(state))) {
@@ -153,6 +249,11 @@ int main(int argc, char** argv) {
     int failures = 0;
     if (!run(options, profile_a(), instance, pages)) { ++failures; }
     if (!run(options, profile_b(), instance + 1, pages)) { ++failures; }
+    if (!run(options, profile_rk4v4(), instance + 2, pages)) { ++failures; }
+    if (!run(options, profile_rk4v2(), instance + 3, pages)) { ++failures; }
+    // Far from the run() range: a smaller offset collided with the next invocation's base instance,
+    // and the collision then showed up as "same size, different bytes" in an unrelated profile.
+    collision_check(options, instance + 500, pages);
 
     std::printf("\n%d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
