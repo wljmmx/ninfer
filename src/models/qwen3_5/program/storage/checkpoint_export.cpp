@@ -43,7 +43,19 @@ std::optional<CheckpointExport> ProgramImpl::export_checkpoint(CheckpointHandle 
         std::byte* slot = destination + static_cast<std::size_t>(index) * stride;
         bool copied = false;
 
-        if (text_kv_pages->device_resident(page)) {
+        // A page can hold both replicas -- an imported checkpoint does, because it was written from
+        // a Host extent and then copied down. Prefer the Host copy when it exists: the Device path
+        // borrows a temporary extent, and prepare() refuses a page that is already Host-resident,
+        // so taking the Device branch first would fail on a page that has perfectly good bytes.
+        if (text_kv_pages->host_resident(page)) {
+            const auto view = host_kv_extents->page_view(*text_kv_pages, page);
+            if (!view || !view->valid() || view->page_count() != 1 ||
+                view->layout().page_stride != stride) {
+                return std::nullopt;
+            }
+            std::memcpy(slot, view->data(), stride);
+            copied = true;
+        } else if (text_kv_pages->device_resident(page)) {
             const std::array<LogicalKVPageHandle, 1> one{page};
             const std::array<DeviceKVPageHandle, 1> device_page{text_kv_pages->physical(page)};
             auto reservation = host_kv_extents->prepare(*text_kv_pages, one);
@@ -57,14 +69,6 @@ std::optional<CheckpointExport> ProgramImpl::export_checkpoint(CheckpointHandle 
             }
             std::memcpy(slot, host.data(), stride);
             host_kv_extents->abort(*reservation);
-            copied = true;
-        } else if (text_kv_pages->host_resident(page)) {
-            const auto view = host_kv_extents->page_view(*text_kv_pages, page);
-            if (!view || !view->valid() || view->page_count() != 1 ||
-                view->layout().page_stride != stride) {
-                return std::nullopt;
-            }
-            std::memcpy(slot, view->data(), stride);
             copied = true;
         } else if (text_kv_pages->spilled(page)) {
             const auto replica = text_kv_pages->host_replica(page);

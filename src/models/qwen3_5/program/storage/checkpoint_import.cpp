@@ -163,6 +163,41 @@ void ProgramImpl::verify_import_round_trip(CheckpointHandle handle) {
         return;
     }
     const auto again = export_checkpoint(*imported);
+    if (!again) {
+        // One of two things refuses the export; say which rather than guessing.
+        const bool slot_valid = valid_checkpoint(*imported);
+        std::uint32_t pages = 0;
+        bool address_valid = false;
+        if (slot_valid) {
+            const CheckpointState& record = checkpoint(*imported);
+            if (record.kv && text_kv_addresses->valid(record.kv->text)) {
+                address_valid = true;
+                pages = text_kv_addresses->page_count(record.kv->text);
+            }
+        }
+        std::fprintf(stderr,
+                     "[ckpt] import check: export refused (slot_valid=%d, address_valid=%d, "
+                     "pages=%u)\n",
+                     slot_valid ? 1 : 0, address_valid ? 1 : 0, pages);
+        if (address_valid) {
+            const CheckpointState& record = checkpoint(*imported);
+            const std::size_t stride =
+                host_kv_extents->page_layout(*text_kv_pages).page_stride;
+            std::size_t dev = 0;
+            std::size_t host = 0;
+            std::size_t spilled = 0;
+            for (std::uint32_t i = 0; i < pages; ++i) {
+                const LogicalKVPageHandle page =
+                    text_kv_addresses->logical_page(record.kv->text, i);
+                if (text_kv_pages->device_resident(page)) { ++dev; }
+                if (text_kv_pages->host_resident(page)) { ++host; }
+                if (text_kv_pages->spilled(page)) { ++spilled; }
+            }
+            std::fprintf(stderr,
+                         "[ckpt] import check: stride=%zu device=%zu host=%zu spilled=%zu of %u\n",
+                         stride, dev, host, spilled, pages);
+        }
+    }
     const bool same = again.has_value() && again->kv_bytes == source->kv_bytes &&
                       again->frontier == source->frontier;
     std::fprintf(stderr, "[ckpt] import check: %s (%u pages, %zu B)\n",
