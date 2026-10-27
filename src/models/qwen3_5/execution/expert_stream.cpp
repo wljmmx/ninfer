@@ -835,6 +835,8 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                     miss_samples_ = 0;
                 }
             }
+            ++gh1_steps_;
+            if (inside == values) { ++gh1_no_miss_steps_; }
             coverage_.routes += values;
             coverage_.inside += inside;
             if (bank_ == 0 && (std::getenv("NINFER_SPLIT_TIMING") != nullptr ||
@@ -861,7 +863,21 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 const auto entered_per_step = entered_steps_ == 0
                     ? 0.0
                     : static_cast<double>(entered_) / static_cast<double>(entered_steps_);
-                if (bank_ == 0) { std::fprintf(stderr, "[set] bank=0 entered=%.2f/step\n", entered_per_step); }
+                if (bank_ == 0) {
+                    std::fprintf(stderr, "[set] bank=0 entered=%.2f/step\n", entered_per_step);
+                    if (gh1_steps_ % 50 == 0) {
+                        const auto pct = [](std::uint64_t part, std::uint64_t all) {
+                            return all == 0 ? 0.0
+                                            : 100.0 * static_cast<double>(part) /
+                                                  static_cast<double>(all);
+                        };
+                        std::fprintf(stderr,
+                                     "[gh1] steps=%llu static=%.1f%% no_miss=%.1f%%\n",
+                                     static_cast<unsigned long long>(gh1_steps_),
+                                     pct(gh1_static_steps_, gh1_steps_),
+                                     pct(gh1_no_miss_steps_, gh1_steps_));
+                    }
+                }
             }
         }
         // port (sm_26): a prefill routes (nearly) every expert of a layer, so letting it choose the
@@ -978,6 +994,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 }
                 ++publish_calls_;
             }
+            if (moved.empty()) { ++gh1_static_steps_; }
             entered_ += entered_this_step;
             ++entered_steps_;
             for (const auto expert : moved) {

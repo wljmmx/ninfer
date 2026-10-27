@@ -89,3 +89,8 @@ add_test(NAME ninfer_chat_templates_test
           $<TARGET_FILE:ninfer_jinja_test>)
 
 ninfer_add_test(ninfer_expert_cache_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_expert_cache.cpp" LIBRARIES ninfer_core)
+
+# The KV tier protocol and the prefetch queue: both are header-only seams with no GPU dependency.
+ninfer_add_test(ninfer_kv_seam_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/kv_seam_test.cpp"
+  LIBRARIES ninfer_core)
