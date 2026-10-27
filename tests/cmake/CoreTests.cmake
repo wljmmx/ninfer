@@ -107,3 +107,8 @@ ninfer_add_test(ninfer_kv_tier_redis_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/kv_tier_redis_test.cpp"
   LIBRARIES ninfer_core $<$<PLATFORM_ID:Windows>:ws2_32>)
 set_tests_properties(ninfer_kv_tier_redis_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# P1-b: chunk hashing (ours, chained) and the contiguous-prefix skip length.
+ninfer_add_test(ninfer_kv_reuse_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/kv_reuse_test.cpp"
+  LIBRARIES ninfer_core)
