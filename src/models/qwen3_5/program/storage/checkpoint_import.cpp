@@ -16,6 +16,7 @@
 #include "core/state_image_shards.h"
 #include "models/qwen3_5/program/program_impl.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -193,7 +194,14 @@ void ProgramImpl::verify_import_round_trip(CheckpointHandle handle) {
     }
 
     std::string why;
+    const auto started = std::chrono::steady_clock::now();
     const auto imported = import_checkpoint(*source, split.shards, print, why);
+    const double import_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    if (imported) {
+        std::fprintf(stderr, "[ckpt] import check: import took %.2f ms for %u pages + %zu B state\n",
+                     import_ms, source->page_count, source_state->bytes.size());
+    }
     if (!imported) {
         std::fprintf(stderr, "[ckpt] import check: REFUSED %s\n", why.c_str());
         return;
