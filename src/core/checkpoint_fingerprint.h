@@ -238,6 +238,32 @@ inline bool matches(const CheckpointFingerprint& have, const CheckpointFingerpri
     return true;
 }
 
+// The state half only. A state image can be verified on its own terms -- its size, its per-layer
+// size, the presence of draft-local regions -- while the KV half (page bytes, dtype, granularity)
+// belongs to whoever holds the KV pool. Splitting the check keeps each caller able to verify what it
+// can actually see, instead of one side pretending to know the other's geometry.
+inline bool matches_state(const CheckpointFingerprint& have, const CheckpointFingerprint& want,
+                          std::string& difference) {
+    difference.clear();
+    const auto check = [&difference](bool equal, const char* field) {
+        if (equal) { return true; }
+        difference = field;
+        return false;
+    };
+    if (!check(have.state_image_bytes == want.state_image_bytes, "state_image_bytes")) {
+        return false;
+    }
+    if (!check(have.state_layer_bytes == want.state_layer_bytes, "state_layer_bytes")) {
+        return false;
+    }
+    if (!check(have.state_conv_bytes == want.state_conv_bytes, "state_conv_bytes")) { return false; }
+    if (!check(have.state_layers == want.state_layers, "state_layers")) { return false; }
+    if (!check(have.features.dflash_local == want.features.dflash_local,
+               "features.dflash_local")) {
+        return false;
+    }
+    return true;
+}
 }  // namespace ninfer::core::fingerprint
 
 #endif  // NINFER_CORE_CHECKPOINT_FINGERPRINT_H

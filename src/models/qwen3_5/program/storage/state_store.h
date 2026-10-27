@@ -274,6 +274,25 @@ public:
         }
         return *object.host_slot;
     }
+    // The import-side mirror of host_slot(): it hands an already-filled Host slot to a freshly
+    // reserved object, so a restored image has somewhere to live. Without this, import could fill a
+    // Host slot but never attach it to anything the rest of the program can name.
+    //
+    // Only a ReservationDestination with no replicas may adopt: adopting into a live object would
+    // orphan whatever it already held.
+    [[nodiscard]] bool adopt_host_replica(StateImageHandle handle,
+                                          qwen3_5::HostStateSlotHandle slot) noexcept {
+        if (!valid(handle) || host_ == nullptr || slot.owner != host_) { return false; }
+        Object& object = objects_[handle.index_];
+        if (object.role != StateImageRole::ReservedDestination || object.device_slot ||
+            object.host_slot || has_pending_replica(object) || object.source_pins != 0 ||
+            object.destination_pinned) {
+            return false;
+        }
+        object.host_slot     = slot;
+        object.content_epoch = next_epoch();
+        return true;
+    }
     void move_checkpoint_to_active(StateImageHandle handle) {
         Object& object = require(handle);
         if (object.role != StateImageRole::CheckpointImmutable || !object.device_slot ||

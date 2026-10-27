@@ -287,6 +287,13 @@ public:
     [[nodiscard]] std::optional<CheckpointExport> export_checkpoint(CheckpointHandle);
     // The other half of export_checkpoint: KV pages alone do not resume this model.
     [[nodiscard]] std::optional<CheckpointStateExport> export_state(CheckpointHandle);
+    // Restores a state image from its shards. Verifies the state half of the fingerprint first;
+    // the caller is responsible for the KV half, which this cannot see.
+    [[nodiscard]] std::optional<StateImageHandle> import_state(
+        const std::vector<std::string>& shards,
+        const core::fingerprint::CheckpointFingerprint& want, std::string& error);
+    // Fills the state-side fields of a fingerprint from the live layout.
+    void host_state_fingerprint(core::fingerprint::CheckpointFingerprint& out) const;
     [[nodiscard]] bool checkpoint_matches(CheckpointHandle, const RequestBasePlan&) const;
     [[nodiscard]] std::uint32_t checkpoint_recovery_frontier(CheckpointHandle,
                                                              const RequestBasePlan&,
