@@ -52,6 +52,11 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
     //    given a Host extent. Restoring straight into Host memory is not a path this store has.
     auto device_pages = text_kv_pages->physical_pool().reserve(kv.page_count);
     if (!device_pages) {
+        // The state image was adopted first, so it is the one thing to give back here. Dropping its
+        // checkpoint reference and releasing it returns the Host slot; leaving it behind would make
+        // the state pool shrink by one image per failed import.
+        state_store->release_checkpoint_reference(*state);
+        (void)state_store->release(*state);
         error = "no free Device pages for the restored checkpoint";
         return std::nullopt;
     }
@@ -110,6 +115,9 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
     const auto rollback = [&]() {
         if (published) { (void)host_kv_extents->release(*published); }
         for (const LogicalKVPageHandle page : pages) { (void)text_kv_pages->release(page); }
+        // The state image is the other half of the record and is still ours at this point.
+        state_store->release_checkpoint_reference(*state);
+        (void)state_store->release(*state);
     };
 
     // 4. Map them into a fresh inactive address.
