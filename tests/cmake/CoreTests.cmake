@@ -112,3 +112,8 @@ set_tests_properties(ninfer_kv_tier_redis_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_kv_reuse_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/kv_reuse_test.cpp"
   LIBRARIES ninfer_core)
+
+# P1-b-2d: the checkpoint payload (KV spans + state spans) the KV tier has to carry.
+ninfer_add_test(ninfer_kv_checkpoint_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/kv_checkpoint_test.cpp"
+  LIBRARIES ninfer_core)
