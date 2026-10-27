@@ -12,7 +12,38 @@
 #include <string>
 #include <vector>
 
-int main() {
+// Cross-check mode: read a block that LMCache's own client wrote, and verify every byte of the
+// pattern it used. Run as: resp_test --probe <key> <bytes> with NINFER_RESP_PORT set.
+static int probe_block(const char* key, std::size_t bytes) {
+    const char* port_text = std::getenv("NINFER_RESP_PORT");
+    if (port_text == nullptr || *port_text == '\0') {
+        std::printf("FAIL probe needs NINFER_RESP_PORT\n");
+        return 1;
+    }
+    ninfer::core::RespClient client;
+    if (!client.connect_to("127.0.0.1", static_cast<std::uint16_t>(std::atoi(port_text)))) {
+        std::printf("FAIL connect: %s\n", client.error().c_str());
+        return 1;
+    }
+    std::vector<std::byte> block(bytes);
+    if (!client.get(key, block).has_value()) {
+        std::printf("FAIL get %s: %s\n", key, client.error().c_str());
+        return 1;
+    }
+    for (std::size_t i = 0; i < bytes; ++i) {
+        if (block[i] != static_cast<std::byte>((i * 7 + 3) & 0xFFu)) {
+            std::printf("FAIL byte %zu differs\n", i);
+            return 1;
+        }
+    }
+    std::printf("ok   read %zu bytes from %s, pattern intact\n", bytes, key);
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    if (argc == 4 && std::string_view(argv[1]) == "--probe") {
+        return probe_block(argv[2], static_cast<std::size_t>(std::strtoull(argv[3], nullptr, 10)));
+    }
     int failures = 0;
     const auto expect = [&](bool condition, const char* what) {
         std::printf("%s %s\n", condition ? "ok  " : "FAIL", what);
@@ -80,3 +111,4 @@ int main() {
     std::printf("%s\n", failures == 0 ? "ALL OK" : "FAILURES");
     return failures == 0 ? 0 : 1;
 }
+
