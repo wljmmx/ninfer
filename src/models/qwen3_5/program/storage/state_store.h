@@ -125,6 +125,12 @@ public:
         return static_cast<std::uint32_t>(objects_.size());
     }
 
+    // One slot's byte size, straight from the device pool's layout. The transport needs it before any
+    // image exists, so it has to come from the layout and not from an export.
+    [[nodiscard]] std::size_t image_bytes() const noexcept {
+        return device_->host_layout().image_bytes;
+    }
+
     [[nodiscard]] std::uint32_t occupied() const noexcept {
         return capacity() - free_object_count_;
     }

@@ -93,4 +93,15 @@ std::optional<CheckpointExport> ProgramImpl::export_checkpoint(CheckpointHandle 
     return out;
 }
 
+CheckpointTierGeometry ProgramImpl::checkpoint_geometry() const {
+    CheckpointTierGeometry out;
+    // Same stride export_checkpoint reports per page. Asking the layout rather than a model constant
+    // is what keeps the transport and the pages from disagreeing.
+    if (text_kv_pages && host_kv_extents) {
+        out.page_bytes = host_kv_extents->page_layout(*text_kv_pages).page_stride;
+    }
+    if (state_store) { out.state_image_bytes = state_store->image_bytes(); }
+    return out;
+}
+
 } // namespace ninfer::models::qwen3_5::detail

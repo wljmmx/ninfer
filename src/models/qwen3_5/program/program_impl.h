@@ -288,6 +288,9 @@ public:
     [[nodiscard]] std::optional<CheckpointExport> export_checkpoint(CheckpointHandle);
     // The other half of export_checkpoint: KV pages alone do not resume this model.
     [[nodiscard]] std::optional<CheckpointStateExport> export_state(CheckpointHandle);
+    // What the transport has to be registered with before any store or retrieve. Zero fields mean
+    // the corresponding pool is not up yet, which is a caller error, not a valid geometry.
+    [[nodiscard]] CheckpointTierGeometry checkpoint_geometry() const;
     // Restores a state image from its shards. Verifies the state half of the fingerprint first;
     // the caller is responsible for the KV half, which this cannot see.
     // Restores KV pages and a state image into one checkpoint record. State first: it refuses on a

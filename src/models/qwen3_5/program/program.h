@@ -184,6 +184,14 @@ struct CheckpointExport {
     std::vector<std::byte> kv_bytes;
 };
 
+// The sizes LMCache has to be told before anything can be stored, read from the live layout rather
+// than from a model constant: the KV page stride and the state image size are what the transport
+// validates every payload against, and they are only known once the pools exist.
+struct CheckpointTierGeometry {
+    std::size_t page_bytes         = 0;
+    std::size_t state_image_bytes  = 0;
+};
+
 struct SourceCandidate {
     std::optional<CheckpointHandle> checkpoint;
     std::uint32_t reused_tokens = 0;
@@ -446,6 +454,7 @@ public:
     [[nodiscard]] CheckpointSummary checkpoint_summary(CheckpointHandle checkpoint) const;
     [[nodiscard]] std::optional<CheckpointExport> export_checkpoint(CheckpointHandle checkpoint);
     [[nodiscard]] std::optional<CheckpointStateExport> export_state(CheckpointHandle checkpoint);
+    [[nodiscard]] CheckpointTierGeometry checkpoint_geometry() const;
     [[nodiscard]] CheckpointMetadata checkpoint_metadata(CheckpointHandle checkpoint) const;
     [[nodiscard]] bool checkpoint_matches(CheckpointHandle checkpoint,
                                           const RequestBasePlan& base) const;

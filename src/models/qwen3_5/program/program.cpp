@@ -166,6 +166,8 @@ std::optional<CheckpointExport> Program::export_checkpoint(CheckpointHandle h) {
     return out;
 }
 
+CheckpointTierGeometry Program::checkpoint_geometry() const { return impl_->checkpoint_geometry(); }
+
 CheckpointMetadata Program::checkpoint_metadata(CheckpointHandle h) const {
     return impl_->checkpoint_metadata(h);
 }
