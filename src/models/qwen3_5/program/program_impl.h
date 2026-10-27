@@ -290,7 +290,11 @@ public:
     [[nodiscard]] std::optional<CheckpointStateExport> export_state(CheckpointHandle);
     // Restores a state image from its shards. Verifies the state half of the fingerprint first;
     // the caller is responsible for the KV half, which this cannot see.
-    [[nodiscard]] std::optional<StateImageHandle> import_state(
+    // Restores KV pages and a state image into one checkpoint record. State first: it refuses on a
+    // fingerprint mismatch before any page is allocated.
+    [[nodiscard]] std::optional<CheckpointHandle> import_checkpoint(
+        const CheckpointExport& kv, const std::vector<std::string>& state_shards,
+        const ninfer::core::fingerprint::CheckpointFingerprint& want, std::string& error);    [[nodiscard]] std::optional<StateImageHandle> import_state(
         const std::vector<std::string>& shards,
         const ninfer::core::fingerprint::CheckpointFingerprint& want, std::string& error);
     // Fills the state-side fields of a fingerprint from the live layout.
