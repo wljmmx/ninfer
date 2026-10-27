@@ -59,47 +59,58 @@ std::uint64_t image_bytes(const RegionSizes& sizes) {
     return sizes.conv_bytes + sizes.layer_bytes * sizes.layers + sizes.tail_bytes;
 }
 
-// Chooses the shard ranges. Returns an empty plan when the inputs cannot describe an image, so a
-// caller never silently gets a half-described split.
+// Chooses the shard ranges. Returns an empty plan only when the inputs cannot describe an image at
+// all, so a caller never silently gets a half-described split.
+//
+// Every size here comes from the layout, so a different model simply produces different numbers.
+// What must not depend on the model is the *policy*, and that is: cut on layer boundaries while a
+// whole layer fits, and fall back to byte-cutting only for a unit that cannot fit at all (a very
+// large conv block, or a layer whose recurrent matrix exceeds the frame budget). Refusing to plan
+// those cases -- as the first version did -- would make the format work for one model and fail on
+// the next one, which is the opposite of what a transfer format is for.
 std::vector<Plan> plan_shards(const RegionSizes& sizes, std::uint64_t max_payload) {
     std::vector<Plan> plan;
-    if (max_payload == 0) { return plan; }
+    if (max_payload == 0 || max_payload > 0xFFFFFFFFull) { return plan; }
     const std::uint64_t total = image_bytes(sizes);
     if (total == 0) { return plan; }
 
     std::uint64_t cursor = 0;
-    if (sizes.conv_bytes > 0) {
-        if (sizes.conv_bytes > max_payload) { return {}; }  // a single region that cannot be split
-        plan.push_back(Plan{cursor, static_cast<std::uint32_t>(sizes.conv_bytes), Region::Conv, 0, 0});
-        cursor += sizes.conv_bytes;
-    }
+    // Appends shards for `bytes`, splitting further only when `bytes` alone exceeds the budget.
+    // The layer counters go on the first piece of a unit, so summing them still counts each layer once.
+    const auto emit = [&](std::uint64_t bytes, Region region, std::uint32_t first_layer,
+                          std::uint32_t layer_count) {
+        std::uint64_t done = 0;
+        bool first_piece = true;
+        while (done < bytes) {
+            const std::uint64_t piece = std::min<std::uint64_t>(max_payload, bytes - done);
+            plan.push_back(Plan{cursor + done, static_cast<std::uint32_t>(piece), region,
+                                first_piece ? first_layer : 0, first_piece ? layer_count : 0});
+            done += piece;
+            first_piece = false;
+        }
+        cursor += bytes;
+    };
+
+    if (sizes.conv_bytes > 0) { emit(sizes.conv_bytes, Region::Conv, 0, 0); }
 
     if (sizes.layers > 0) {
-        if (sizes.layer_bytes == 0 || sizes.layer_bytes > max_payload) { return {}; }
-        const auto per_shard = static_cast<std::uint32_t>(max_payload / sizes.layer_bytes);
-        std::uint32_t layer = 0;
-        while (layer < sizes.layers) {
-            const std::uint32_t count = std::min(per_shard, sizes.layers - layer);
-            const std::uint64_t length = sizes.layer_bytes * count;
-            plan.push_back(Plan{cursor, static_cast<std::uint32_t>(length), Region::Recurrent, layer,
-                                count});
-            cursor += length;
-            layer += count;
+        if (sizes.layer_bytes == 0) { return {}; }
+        if (sizes.layer_bytes <= max_payload) {
+            const auto per_shard = static_cast<std::uint32_t>(max_payload / sizes.layer_bytes);
+            std::uint32_t layer = 0;
+            while (layer < sizes.layers) {
+                const std::uint32_t count = std::min(per_shard, sizes.layers - layer);
+                emit(sizes.layer_bytes * count, Region::Recurrent, layer, count);
+                layer += count;
+            }
+        } else {
+            for (std::uint32_t layer = 0; layer < sizes.layers; ++layer) {
+                emit(sizes.layer_bytes, Region::Recurrent, layer, 1);
+            }
         }
     }
 
-    if (sizes.tail_bytes > 0) {
-        // Ride on the last shard when it fits; otherwise the tail needs its own.
-        if (!plan.empty() && plan.back().region == Region::Recurrent &&
-            plan.back().length + sizes.tail_bytes <= max_payload) {
-            plan.back().length += static_cast<std::uint32_t>(sizes.tail_bytes);
-        } else {
-            if (sizes.tail_bytes > max_payload) { return {}; }
-            plan.push_back(Plan{cursor, static_cast<std::uint32_t>(sizes.tail_bytes), Region::Tail,
-                                0, 0});
-        }
-        cursor += sizes.tail_bytes;
-    }
+    if (sizes.tail_bytes > 0) { emit(sizes.tail_bytes, Region::Tail, 0, 0); }
 
     // The plan must tile the image exactly: no gap, no overlap, nothing left over.
     if (cursor != total) { return {}; }
