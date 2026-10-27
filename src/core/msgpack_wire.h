@@ -18,6 +18,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -102,6 +103,16 @@ public:
     }
 
     void binary(std::string_view data) { binary(data.data(), data.size()); }
+
+    // float64. Only needed for the one place the protocol takes a float (a prefetch timeout), but
+    // trying to pass an integer there fails validation, so it is worth having right.
+    void real(double value) {
+        std::uint64_t bits = 0;
+        static_assert(sizeof(bits) == sizeof(value), "double is not 64 bit");
+        std::memcpy(&bits, &value, sizeof(bits));
+        put(0xCB);
+        put_be(bits, 8);
+    }
 
     void array_header(std::size_t count) {
         if (count < 16) {
