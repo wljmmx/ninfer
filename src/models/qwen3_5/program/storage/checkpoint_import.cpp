@@ -47,15 +47,20 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
     // it demands a Device slot, which a restored image does not have.
     state_store->retain_checkpoint_reference(*state);
 
-    // 2. One logical page per page of the export, each backed only by a Host extent.
-    std::vector<LogicalKVPageHandle> pages;
-    pages.reserve(kv.page_count);
-    for (std::uint32_t index = 0; index < kv.page_count; ++index) {
-        pages.push_back(text_kv_pages->create_host_backed_page());
+    // 2. Device first, because a logical page is born in VRAM: can_pin_source() and
+    //    can_pin_active_source() both require a Device replica, so a page without one can never be
+    //    given a Host extent. Restoring straight into Host memory is not a path this store has.
+    auto device_pages = text_kv_pages->physical_pool().reserve(kv.page_count);
+    if (!device_pages) {
+        error = "no free Device pages for the restored checkpoint";
+        return std::nullopt;
     }
+    std::vector<LogicalKVPageHandle> pages(kv.page_count);
+    text_kv_pages->materialize(*device_pages, std::span<LogicalKVPageHandle>(pages));
 
-    // 3. Fill the Host extents in one reservation; the extent is contiguous, so one memcpy of the
-    //    whole payload is both simpler and faster than page-by-page.
+    // 3. Write the bytes into a Host extent (now legal -- the pages have Device replicas), then
+    //    copy them down. The Host copy stays as the demoted tier; without this the Device pages
+    //    would be published but empty, and readers would take them as authoritative.
     {
         auto reservation = host_kv_extents->prepare(*text_kv_pages, pages);
         if (!reservation) {
@@ -72,9 +77,24 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
             return std::nullopt;
         }
         std::memcpy(view.data(), kv.kv_bytes.data(), expected);
-        host_kv_extents->publish(std::move(*reservation));
-    }
+        const auto capability = host_kv_extents->publish(std::move(*reservation));
 
+        std::vector<DeviceKVPageHandle> device_handles;
+        device_handles.reserve(pages.size());
+        for (const LogicalKVPageHandle page : pages) {
+            device_handles.push_back(text_kv_pages->physical(page));
+        }
+        const auto source = host_kv_extents->view(capability);
+        (void)text_kv_pages->physical_pool().copy_from_host(source,
+                                                           std::span<const DeviceKVPageHandle>(
+                                                               device_handles.data(),
+                                                               device_handles.size()),
+                                                           device.transfer_stream);
+        if (cudaStreamSynchronize(device.transfer_stream) != cudaSuccess) {
+            error = "Device copy for the restored pages failed";
+            return std::nullopt;
+        }
+    }
     // 4. Map them into a fresh inactive address.
     std::optional<KVAddressSpaceHandle> address = text_kv_addresses->create_inactive();
     if (!address) {
@@ -86,7 +106,10 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
         error = "could not map the restored pages";
         return std::nullopt;
     }
-    text_kv_addresses->set_checkpoint_requirement(*address, kv.frontier);
+    // A fresh address commits nothing, and a checkpoint requirement may not exceed the committed
+    //    frontier -- so the frontier has to be committed before it can be protected.
+    // commit_frontier() only accepts an active address and a checkpoint address is inactive by
+    // design; the pages stay alive via the read reference adopt_pages() took, and the frontier
 
     // 5. The record.
     const auto handle = reserve_checkpoint();
