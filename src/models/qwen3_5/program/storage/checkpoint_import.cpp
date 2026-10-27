@@ -64,6 +64,10 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
     {
         auto reservation = host_kv_extents->prepare(*text_kv_pages, pages);
         if (!reservation) {
+            // Nothing is published yet, so the pages are the only thing to give back. Releasing them
+            // returns their Device leases too; without this a run of failed imports would drain the
+            // page pool and the symptom would look like "allocation stopped working" much later.
+            for (const LogicalKVPageHandle page : pages) { (void)text_kv_pages->release(page); }
             error = "no Host extent for the restored pages";
             return std::nullopt;
         }
@@ -73,6 +77,7 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
             static_cast<std::size_t>(view.page_count()) * view.layout().page_stride;
         if (view.data() == nullptr || available < expected) {
             host_kv_extents->abort(*reservation);
+            for (const LogicalKVPageHandle page : pages) { (void)text_kv_pages->release(page); }
             error = "Host extent is smaller than the restored payload";
             return std::nullopt;
         }
