@@ -61,6 +61,10 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
     // 3. Write the bytes into a Host extent (now legal -- the pages have Device replicas), then
     //    copy them down. The Host copy stays as the demoted tier; without this the Device pages
     //    would be published but empty, and readers would take them as authoritative.
+    // Declared out here so every later failure can give the extent back. Publishing is the point of
+    // no return: after it the pages hold real bytes and both the extent and the page descriptors are
+    // ours to release.
+    std::optional<HostKVExtentCapability> published;
     {
         auto reservation = host_kv_extents->prepare(*text_kv_pages, pages);
         if (!reservation) {
@@ -85,7 +89,7 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
         std::fprintf(stderr, "[ckpt] import: after memcpy, view[0]=0x%02X want=0x%02X\n",
                      static_cast<unsigned>(view.data()[0]),
                      static_cast<unsigned>(kv.kv_bytes[0]));
-        const auto capability = host_kv_extents->publish(std::move(*reservation));
+        published = host_kv_extents->publish(std::move(*reservation));
         {
             const auto check = host_kv_extents->page_view(*text_kv_pages, pages[0]);
             if (check && check->valid()) {
@@ -101,26 +105,35 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
         // promotes what it needs at use time. Copying down eagerly duplicated that work and, measured,
         // left the Host extent reading back as zeros afterwards.
     }
+    // From here on, a failure has to give back the published extent and the pages behind it. The
+    // pages come with their Device leases, so one release per page covers both tiers.
+    const auto rollback = [&]() {
+        if (published) { (void)host_kv_extents->release(*published); }
+        for (const LogicalKVPageHandle page : pages) { (void)text_kv_pages->release(page); }
+    };
+
     // 4. Map them into a fresh inactive address.
     std::optional<KVAddressSpaceHandle> address = text_kv_addresses->create_inactive();
     if (!address) {
+        rollback();
         error = "no free KV address space";
         return std::nullopt;
     }
     if (!text_kv_addresses->adopt_pages(*address, pages)) {
         (void)text_kv_addresses->release(*address);
+        rollback();
         error = "could not map the restored pages";
         return std::nullopt;
     }
-    // A fresh address commits nothing, and a checkpoint requirement may not exceed the committed
-    //    frontier -- so the frontier has to be committed before it can be protected.
-    // commit_frontier() only accepts an active address and a checkpoint address is inactive by
-    // design; the pages stay alive via the read reference adopt_pages() took, and the frontier
+    // No frontier bookkeeping on the address: commit_frontier() only accepts an active address and a
+    // checkpoint address is inactive by design. The pages stay alive through the read reference
+    // adopt_pages() took, and the frontier lives on the record, which is what export reads.
 
     // 5. The record.
     const auto handle = reserve_checkpoint();
     if (!handle) {
         (void)text_kv_addresses->release(*address);
+        rollback();
         error = "no free checkpoint slot";
         return std::nullopt;
     }
