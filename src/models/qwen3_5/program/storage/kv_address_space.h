@@ -224,6 +224,12 @@ public:
                addresses_[handle.index_].generation == handle.generation_;
     }
 
+    // Pages currently mapped for this address space. A checkpoint's prefix is
+    // ceil(frontier / page_tokens) pages, so the caller compares this against what it needs.
+    [[nodiscard]] std::uint32_t page_count(KVAddressSpaceHandle handle) const {
+        return require(handle).page_count;
+    }
+
     void activate(KVAddressSpaceHandle handle, std::uint32_t growth_pages,
                   std::int32_t execution_row, cudaStream_t stream) {
         auto reservation = prepare_activation(handle, growth_pages, execution_row);
