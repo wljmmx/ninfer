@@ -225,22 +225,62 @@ bool read_bool(const ninfer::core::msgpack::Value& body, bool& value) {
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     const char* endpoint = "tcp://127.0.0.1:6555";
+
+    // Geometry is an argument, not a constant. The real numbers have to come from the engine's KV
+    // layout: an engine page holds 64 tokens (kPagedKVPageSize), so a 256-token LMCache chunk is
+    // four pages, not one. Anything typed in here is a hypothesis for exercising the protocol.
+    std::int64_t layers = 40;
+    std::int64_t kv_heads = 2;
+    std::int64_t head_dim = 64;
+    std::int64_t chunk_slots = 256;
+    std::int64_t page_tokens = 64;
+
     for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--server") == 0 && i + 1 < argc) {
+        const std::string_view flag = argv[i];
+        const auto next = [&](std::int64_t& target) {
+            if (i + 1 < argc) {
+                target = std::strtoll(argv[++i], nullptr, 10);
+            }
+        };
+        if (flag == "--server" && i + 1 < argc) {
             endpoint = argv[++i];
+        } else if (flag == "--layers") {
+            next(layers);
+        } else if (flag == "--kv-heads") {
+            next(kv_heads);
+        } else if (flag == "--head-dim") {
+            next(head_dim);
+        } else if (flag == "--chunk-slots") {
+            next(chunk_slots);
+        } else if (flag == "--page-tokens") {
+            next(page_tokens);
+        } else if (flag == "--help") {
+            std::printf(
+                "usage: lmcache_ops [--server URL] [--layers N] [--kv-heads N] [--head-dim N]\n"
+                "                   [--chunk-slots N] [--page-tokens N]\n"
+                "\nGeometry defaults are a hypothesis for exercising the protocol, not the\n"
+                "model's real layout.\n");
+            return 0;
         } else {
-            std::printf("usage: lmcache_ops [--server tcp://127.0.0.1:6555]\n");
+            std::printf("unknown argument: %s\n", argv[i]);
             return 2;
         }
     }
 
-    // Geometry here is the placeholder used for the encoding tests: one 256-token chunk of
-    // attention KV (two planes) plus a state plane. Real numbers have to come from the engine's KV
-    // layout; what this verifies is the protocol, not that these sizes are the right ones.
-    const std::int64_t kLayers = 40;
-    const std::int64_t kSlots = 256;
-    const std::int64_t kHidden = 32;
-    const std::int64_t kChunkTokens = 256;
+    const std::int64_t kLayers = layers;
+    const std::int64_t kSlots = chunk_slots;
+    const std::int64_t kHidden = kv_heads * head_dim;
+    const std::int64_t kChunkTokens = chunk_slots;
+
+    std::printf("geometry (arguments, NOT the model): layers %lld kv_heads %lld head_dim %lld"
+                " -> hidden %lld; chunk %lld slots / page %lld tokens = %.2f pages\n",
+                static_cast<long long>(layers), static_cast<long long>(kv_heads),
+                static_cast<long long>(head_dim), static_cast<long long>(kHidden),
+                static_cast<long long>(chunk_slots), static_cast<long long>(page_tokens),
+                page_tokens > 0 ? static_cast<double>(chunk_slots) /
+                                      static_cast<double>(page_tokens)
+                                : 0.0);
+    std::printf("\n");
 
     std::vector<std::int64_t> tokens(kChunkTokens);
     for (std::size_t i = 0; i < tokens.size(); ++i) {
