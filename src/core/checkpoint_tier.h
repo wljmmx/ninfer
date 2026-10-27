@@ -16,6 +16,7 @@
 #include "core/resp.h"
 
 #include <algorithm>
+#include <cstring>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -80,6 +81,7 @@ private:
 };
 
 } // namespace ninfer::core
+
 
 
 
