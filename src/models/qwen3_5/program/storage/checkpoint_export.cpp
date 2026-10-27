@@ -6,14 +6,16 @@
 
 namespace ninfer::models::qwen3_5::detail {
 
-// Export copies a checkpoint's KV prefix out. The Device replica is the authoritative one: the Host
-// copy is optional (a demotion may never have happened, and after a spill the Host extent is gone).
-// So the Device path is tried first and the Host path is the fallback, not the other way round --
-// requiring a Host copy would make export depend on the demotion policy, which is not its business.
+// Export copies a checkpoint's KV prefix out, page by page, from whichever replica still holds it.
+// The three cases are all real:
+//   Device  the authoritative bytes; a Host copy may never have been made.
+//   Host    the page was demoted; its Device replica may be gone.
+//   Spill   the Host extent was given back to the file tier; both other copies are gone.
+// Refusing the Spill case (as the first version did) makes export depend on eviction luck.
 //
-// The Device path borrows a Host extent for the copy and then aborts it: the extent is scratch, and
-// leaving it published would attach a Host replica to every page just because someone asked for a
-// dump, quietly growing the arena on a read-only operation.
+// The Device case borrows a Host extent for the copy and aborts it: copy_to_host only writes into a
+// HostKVAllocationView, and leaving the extent published would attach a Host replica to every page
+// on what is meant to be a read-only operation.
 std::optional<CheckpointExport> ProgramImpl::export_checkpoint(CheckpointHandle handle) {
     if (!valid_checkpoint(handle)) { return std::nullopt; }
     const CheckpointState& record = checkpoint(handle);
@@ -35,50 +37,46 @@ std::optional<CheckpointExport> ProgramImpl::export_checkpoint(CheckpointHandle 
     out.epochs.reserve(pages);
     out.kv_bytes.resize(stride * static_cast<std::size_t>(pages));
 
-    std::vector<LogicalKVPageHandle> logical;
-    std::vector<DeviceKVPageHandle> devices;
-    logical.reserve(pages);
-    devices.reserve(pages);
-    bool all_device = true;
+    std::byte* destination = out.kv_bytes.data();
     for (std::uint32_t index = 0; index < pages; ++index) {
         const LogicalKVPageHandle page = text_kv_addresses->logical_page(address, index);
-        logical.push_back(page);
+        std::byte* slot = destination + static_cast<std::size_t>(index) * stride;
+        bool copied = false;
+
         if (text_kv_pages->device_resident(page)) {
-            devices.push_back(text_kv_pages->physical(page));
-        } else {
-            all_device = false;
-        }
-    }
-
-    if (all_device) {
-        auto reservation = host_kv_extents->prepare(*text_kv_pages, logical);
-        if (!reservation) { return std::nullopt; }
-        const auto host = host_kv_extents->writable_view(*reservation);
-        const auto work = text_kv_pages->physical_pool().copy_to_host(devices, host,
-                                                                      device.transfer_stream);
-        (void)work;
-        if (cudaStreamSynchronize(device.transfer_stream) != cudaSuccess) {
+            const std::array<LogicalKVPageHandle, 1> one{page};
+            const std::array<DeviceKVPageHandle, 1> device_page{text_kv_pages->physical(page)};
+            auto reservation = host_kv_extents->prepare(*text_kv_pages, one);
+            if (!reservation) { return std::nullopt; }
+            const auto host = host_kv_extents->writable_view(*reservation);
+            (void)text_kv_pages->physical_pool().copy_to_host(
+                std::span<const DeviceKVPageHandle>(device_page), host, device.transfer_stream);
+            if (cudaStreamSynchronize(device.transfer_stream) != cudaSuccess) {
+                host_kv_extents->abort(*reservation);
+                return std::nullopt;
+            }
+            std::memcpy(slot, host.data(), stride);
             host_kv_extents->abort(*reservation);
-            return std::nullopt;
+            copied = true;
+        } else if (text_kv_pages->host_resident(page)) {
+            const auto view = host_kv_extents->page_view(*text_kv_pages, page);
+            if (!view || !view->valid() || view->page_count() != 1 ||
+                view->layout().page_stride != stride) {
+                return std::nullopt;
+            }
+            std::memcpy(slot, view->data(), stride);
+            copied = true;
+        } else if (text_kv_pages->spilled(page)) {
+            const auto replica = text_kv_pages->host_replica(page);
+            KVSpillFile* file  = host_kv_extents->spill_file();
+            if (!file || !replica.spill_slot.has_value() || file->extent_bytes() != stride) {
+                return std::nullopt;
+            }
+            file->read(*replica.spill_slot, std::span<std::byte>(slot, stride));
+            copied = true;
         }
-        for (std::uint32_t index = 0; index < pages; ++index) {
-            std::memcpy(out.kv_bytes.data() + static_cast<std::size_t>(index) * stride,
-                        host.data() + static_cast<std::size_t>(index) * stride, stride);
-            out.epochs.push_back(text_kv_pages->content_epoch(logical[index]));
-        }
-        host_kv_extents->abort(*reservation);
-        return out;
-    }
 
-    // Host fallback: the page no longer has a Device replica, so the Host one is all there is.
-    for (std::uint32_t index = 0; index < pages; ++index) {
-        const LogicalKVPageHandle page = logical[index];
-        if (!host_kv_extents->ensure_host_resident(*text_kv_pages, page)) { return std::nullopt; }
-        const auto view = host_kv_extents->page_view(*text_kv_pages, page);
-        if (!view || !view->valid() || view->page_count() != 1) { return std::nullopt; }
-        if (view->layout().page_stride != stride) { return std::nullopt; }
-        std::memcpy(out.kv_bytes.data() + static_cast<std::size_t>(index) * stride, view->data(),
-                    stride);
+        if (!copied) { return std::nullopt; }  // no replica at all: refuse rather than emit a hole
         out.epochs.push_back(text_kv_pages->content_epoch(page));
     }
     return out;
