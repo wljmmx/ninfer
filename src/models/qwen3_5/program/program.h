@@ -165,7 +165,7 @@ struct CheckpointSummary {
 // restore that memcpy'd one model's state into another would not fail, it would just produce wrong
 // output, so the import side has to be able to refuse on numbers rather than on faith.
 struct CheckpointStateExport {
-    std::uint32_t image_bytes    = 0;
+    std::uint64_t image_bytes    = 0;  // u64: a u32 would cap the image at 4 GiB
     std::uint32_t layers         = 0;   // linear-attention layers that own this image
     std::int32_t  conv_channels  = 0;
     std::int32_t  value_heads    = 0;

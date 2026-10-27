@@ -192,7 +192,7 @@ void dump_exported_checkpoint(ProgramImpl& program, CheckpointHandle handle, con
             std::fprintf(stderr, "[ckpt] cannot open %s\n", path);
             return;
         }
-        const std::uint32_t header[6]{state->image_bytes, state->layers,
+        const std::uint32_t header[6]{static_cast<std::uint32_t>(state->image_bytes), state->layers,
                                       static_cast<std::uint32_t>(state->conv_channels),
                                       static_cast<std::uint32_t>(state->value_heads),
                                       static_cast<std::uint32_t>(state->hidden),

@@ -46,7 +46,7 @@ std::optional<CheckpointStateExport> ProgramImpl::export_state(CheckpointHandle 
     const qwen3_5::StateImageHostLayout& layout = *view.layout;
     if (layout.image_bytes == 0) { return std::nullopt; }
 
-    out.image_bytes = static_cast<std::uint32_t>(layout.image_bytes);
+    out.image_bytes = layout.image_bytes;
     out.layers      = layout.spec.linear.layers;
     out.conv_channels  = layout.spec.linear.conv_channels;
     out.value_heads    = layout.spec.linear.value_heads;
