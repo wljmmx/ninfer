@@ -32,12 +32,21 @@ inline constexpr std::uint16_t kVersion = 1;
 inline constexpr std::size_t kEncodedBytes = 74;  // 2+4+8+4+4+1+1+2 + 16 + 24 + 4 + 4
 
 // KV plane dtype, as a wire tag rather than a torch/engine enum: the number is part of the format.
+// Values mirror KvCacheStorage in the engine exactly (same order, same numbers), so this is a
+// wire image of that enum rather than a second taxonomy that can drift from it. An incomplete
+// enum here would not fail loudly: two unrepresentable layouts would both decode as Unknown, and
+// a checkpoint produced under one would be accepted by a process running the other.
 enum class KVDtype : std::uint8_t {
-    BF16 = 0,
-    INT8 = 1,
-    FP8 = 2,
-    K8V4 = 3,
-    RK4V4 = 4,
+    BF16 = 0,          // KvCacheStorage::BFloat16
+    INT8 = 1,          // Int8Group64
+    FP8 = 2,           // Fp8E4M3Row256
+    NVFP4 = 3,         // Nvfp4Group16
+    K8V4 = 4,          // Fp8KeyNvfp4Value  (8-bit key, 4-bit value)
+    RK8V4 = 5,         // RotatedInt8KeyInt4ValueGroup64
+    RK4V4 = 6,         // RotatedInt4KeyInt4ValueGroup64
+    RK4V4E8 = 7,       // 4-bit E8-lattice key, 4-bit value
+    RK2V4E8 = 8,       // 2-bit E8-cylinder key, 4-bit value
+    RK4V2E8 = 9,       // 4-bit E8-lattice key, 2-bit E8-cylinder value
     Unknown = 255,
 };
 
