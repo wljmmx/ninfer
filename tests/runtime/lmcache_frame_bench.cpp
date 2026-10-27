@@ -31,12 +31,17 @@ constexpr int kWaitPrefetch = 0x0A;
 constexpr int kPrepareRetrieve = 0x12;
 constexpr int kCommitRetrieve = 0x13;
 
-constexpr std::int64_t kInstance = 5150;
+// A fresh id per run: re-registering an existing instance does not replace its layout, so reusing
+// the id kept the shape from an earlier attempt and every frame failed validation against it.
+constexpr std::int64_t kInstance = 6152;
 constexpr std::int64_t kSlots = 128;
 constexpr std::int64_t kLayers = 1;
 constexpr std::int64_t kHidden = 12288;  // 2 * 1 * 128 * 12288 * 2 = 6,291,456
+// The single-group path validates against the TOP-LEVEL layout_desc, which is
+// [2, num_layers, num_physical_slots, hidden] when use_mla is false -- the leading 2 is the K/V
+// plane count. Forgetting it was the last failure: shape right, byte count half of what was expected.
 constexpr std::size_t kFrameBytes =
-    static_cast<std::size_t>(kSlots * kLayers * kHidden) * sizeof(std::uint16_t);
+    static_cast<std::size_t>(2 * kSlots * kLayers * kHidden) * sizeof(std::uint16_t);
 
 struct Session {
     void* context{nullptr};
@@ -146,7 +151,8 @@ std::string envelope(const std::string& bytes) {
     writer.string("bfloat16");
     writer.key("shape");
     writer.array_header(4);
-    writer.integer(1);
+    writer.integer(2);  // the K/V plane count: the server sizes a non-MLA layout as
+                        // [2, layers, slots, hidden], and a leading 1 fails that check
     writer.integer(kLayers);
     writer.integer(kSlots);
     writer.integer(kHidden);
@@ -178,10 +184,12 @@ int main(int argc, char** argv) {
         return 1;
     }
     // Warm up, so the first call's cost does not land in the measurement.
-    if (!session.call(kRegister, {register_payload()})) {
-        std::printf("FAIL register\n");
+    std::string register_body;
+    if (!session.call(kRegister, {register_payload()}, &register_body)) {
+        std::printf("FAIL register (no reply)\n");
         return 1;
     }
+    std::printf("register reply: %zu B\n", register_body.size());
 
     std::vector<std::string> payloads;
     for (int i = 0; i < frames; ++i) {
@@ -201,10 +209,15 @@ int main(int argc, char** argv) {
         }
         ninfer::core::msgpack::Writer payload_writer;
         payload_writer.integer(kInstance);
-        ninfer::core::msgpack::Writer envelope_writer;
         const std::string body = envelope(payloads[i]);
         std::string commit_body;
-        if (!session.call(kCommitStore, {key_payload(i), payload_writer.take(), body}, &commit_body)) {
+        // cpu_data is declared `bytes`, so the envelope must arrive as a msgpack bin, not as the
+        // map it is made of. Sending the envelope directly put a map where a bytes was expected, and
+        // the server said so: Expected `bytes`, got `object`.
+        ninfer::core::msgpack::Writer data_writer;
+        data_writer.binary(body);
+        if (!session.call(kCommitStore, {key_payload(i), payload_writer.take(), data_writer.take()},
+                          &commit_body)) {
             std::printf("FAIL commit_store %d (prep %zu B, commit %zu B)\n", i, prep_body.size(), commit_body.size());
             return 1;
         }
