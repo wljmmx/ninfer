@@ -154,6 +154,18 @@ CheckpointSummary Program::checkpoint_summary(CheckpointHandle h) const {
     return impl_->checkpoint_summary(h);
 }
 
+std::optional<CheckpointExport> Program::export_checkpoint(CheckpointHandle h) {
+    const auto raw = impl_->export_checkpoint(h);
+    if (!raw) { return std::nullopt; }
+    CheckpointExport out;
+    out.frontier   = raw->frontier;
+    out.page_count = raw->page_count;
+    out.page_bytes = raw->page_bytes;
+    out.epochs     = raw->epochs;
+    out.kv_bytes   = raw->kv_bytes;
+    return out;
+}
+
 CheckpointMetadata Program::checkpoint_metadata(CheckpointHandle h) const {
     return impl_->checkpoint_metadata(h);
 }
@@ -326,3 +338,4 @@ std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
 }
 
 } // namespace ninfer::models::qwen3_5
+

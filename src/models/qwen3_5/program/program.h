@@ -159,6 +159,16 @@ struct CheckpointSummary {
     runtime::ContextResourceUsage evictable_resources;
 };
 
+// A checkpoint's KV prefix as raw Host bytes, page by page. State images are not part of it yet:
+// restoring KV without the recurrent state would resume from a state that never saw the prefix.
+struct CheckpointExport {
+    std::uint32_t frontier   = 0;
+    std::uint32_t page_count = 0;
+    std::size_t page_bytes   = 0;
+    std::vector<std::uint32_t> epochs;
+    std::vector<std::byte> kv_bytes;
+};
+
 struct SourceCandidate {
     std::optional<CheckpointHandle> checkpoint;
     std::uint32_t reused_tokens = 0;
@@ -419,6 +429,7 @@ public:
     [[nodiscard]] runtime::ContextResourceUsage
         checkpoint_footprint(std::span<const CheckpointHandle>) const;
     [[nodiscard]] CheckpointSummary checkpoint_summary(CheckpointHandle checkpoint) const;
+    [[nodiscard]] std::optional<CheckpointExport> export_checkpoint(CheckpointHandle checkpoint);
     [[nodiscard]] CheckpointMetadata checkpoint_metadata(CheckpointHandle checkpoint) const;
     [[nodiscard]] bool checkpoint_matches(CheckpointHandle checkpoint,
                                           const RequestBasePlan& base) const;
@@ -519,3 +530,4 @@ void install_kv_eviction_window(std::uint32_t sink_pages, std::uint32_t window_p
 [[nodiscard]] std::unique_ptr<Program> create_program(const execution::Parameters&, SequencePlan&&,
                                                       DeviceContext&, const StartupObserver&);
 } // namespace ninfer::models::qwen3_5
+
