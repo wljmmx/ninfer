@@ -101,3 +101,9 @@ ninfer_add_test(ninfer_resp_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/resp_test.cpp"
   LIBRARIES ninfer_core $<$<PLATFORM_ID:Windows>:ws2_32>)
 set_tests_properties(ninfer_resp_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# P1-b: the LMCache key format, the consecutive-prefix rule, and the Redis-backed KV tier.
+ninfer_add_test(ninfer_kv_tier_redis_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/kv_tier_redis_test.cpp"
+  LIBRARIES ninfer_core $<$<PLATFORM_ID:Windows>:ws2_32>)
+set_tests_properties(ninfer_kv_tier_redis_test PROPERTIES SKIP_RETURN_CODE 77)
