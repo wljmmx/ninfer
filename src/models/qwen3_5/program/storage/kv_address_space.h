@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -246,6 +247,15 @@ public:
             pages_->retain_reference(pages[index], false);
         }
         address.page_count = static_cast<std::uint32_t>(pages.size());
+        // Does the address hand back the pages it was given? Compare content epochs, which are
+        // per-page and readable: equal means same page, different means the directory write and the
+        // directory read are not looking at the same place.
+        {
+            const LogicalKVPageHandle back = membership(address, 0);
+            std::fprintf(stderr, "[ckpt] adopt: written epoch=%llu read-back epoch=%llu\n",
+                         static_cast<unsigned long long>(pages_->content_epoch(pages[0])),
+                         static_cast<unsigned long long>(pages_->content_epoch(back)));
+        }
         return true;
     }
     [[nodiscard]] bool valid(KVAddressSpaceHandle handle) const noexcept {

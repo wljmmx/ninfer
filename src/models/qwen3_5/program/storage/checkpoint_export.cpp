@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/program_impl.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -47,6 +48,12 @@ std::optional<CheckpointExport> ProgramImpl::export_checkpoint(CheckpointHandle 
         // a Host extent and then copied down. Prefer the Host copy when it exists: the Device path
         // borrows a temporary extent, and prepare() refuses a page that is already Host-resident,
         // so taking the Device branch first would fail on a page that has perfectly good bytes.
+        if (index == 0) {
+            std::fprintf(stderr, "[ckpt] export page0: host=%d device=%d spilled=%d\n",
+                         text_kv_pages->host_resident(page) ? 1 : 0,
+                         text_kv_pages->device_resident(page) ? 1 : 0,
+                         text_kv_pages->spilled(page) ? 1 : 0);
+        }
         if (text_kv_pages->host_resident(page)) {
             const auto view = host_kv_extents->page_view(*text_kv_pages, page);
             if (!view || !view->valid() || view->page_count() != 1 ||
