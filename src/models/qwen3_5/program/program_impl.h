@@ -294,6 +294,8 @@ public:
     // fingerprint mismatch before any page is allocated.
     // Diagnostic: import this checkpoint's own export into a new record and compare the bytes back.
     void verify_import_round_trip(CheckpointHandle handle);
+    // Diagnostic: force the failure path and check that nothing was left allocated.
+    void verify_import_rollback(CheckpointHandle handle);
     [[nodiscard]] std::optional<CheckpointHandle> import_checkpoint(
         const CheckpointExport& kv, const std::vector<std::string>& state_shards,
         const ninfer::core::fingerprint::CheckpointFingerprint& want, std::string& error,

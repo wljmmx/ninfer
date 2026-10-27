@@ -251,7 +251,7 @@ void dump_exported_checkpoint(ProgramImpl& program, CheckpointHandle handle, con
         }
     }
     // A diagnostic must never fail the request that triggered it.
-    try { program.verify_import_round_trip(handle); } catch (const std::exception& error) {
+    try { program.verify_import_round_trip(handle); program.verify_import_rollback(handle); } catch (const std::exception& error) {
         std::fprintf(stderr, "[ckpt] import check threw: %s\n", error.what());
     }
     } else {

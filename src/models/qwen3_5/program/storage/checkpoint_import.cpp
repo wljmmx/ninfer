@@ -273,4 +273,58 @@ void ProgramImpl::verify_import_round_trip(CheckpointHandle handle) {
                  again ? again->page_count : 0u,
                  again ? again->kv_bytes.size() : 0);
 }
+
+// Forces the one failure that is easy to provoke and expensive to leak: the state image imports,
+// then the Device reservation cannot be satisfied. A payload asking for the whole page pool is the
+// cheapest way to guarantee that -- the pool always has something in use by the time a checkpoint
+// exists.
+void ProgramImpl::verify_import_rollback(CheckpointHandle handle) {
+    const auto source = export_checkpoint(handle);
+    const auto source_state = export_state(handle);
+    if (!source || !source_state) {
+        std::fprintf(stderr, "[ckpt] rollback check: nothing to export\n");
+        return;
+    }
+
+    ninfer::core::fingerprint::CheckpointFingerprint print;
+    host_state_fingerprint(print);
+    ninfer::core::state_shards::RegionSizes sizes;
+    sizes.conv_bytes  = print.state_conv_bytes;
+    sizes.layer_bytes = print.state_layer_bytes;
+    sizes.layers      = print.state_layers;
+    const std::uint64_t covered = sizes.conv_bytes + sizes.layer_bytes * sizes.layers;
+    sizes.tail_bytes = print.state_image_bytes > covered ? print.state_image_bytes - covered : 0;
+
+    const std::string image(reinterpret_cast<const char*>(source_state->bytes.data()),
+                            source_state->bytes.size());
+    const auto split = ninfer::core::state_shards::split(image, sizes, 6ull * 1024 * 1024);
+    if (!split.ok) {
+        std::fprintf(stderr, "[ckpt] rollback check: split failed: %s\n", split.error.c_str());
+        return;
+    }
+
+    CheckpointExport oversize;
+    oversize.frontier   = source->frontier;
+    oversize.page_bytes = source->page_bytes;
+    oversize.page_count = text_kv_pages->physical_pool().capacity_pages();
+    oversize.kv_bytes.assign(oversize.page_bytes * oversize.page_count, std::byte{0});
+
+    const std::uint32_t state_before = host_state_images ? host_state_images->occupied() : 0;
+    const std::uint32_t pages_before = text_kv_pages->occupied();
+    const std::uint32_t devices_before =
+        text_kv_pages->physical_pool().capacity_pages() - pages_before;
+
+    std::string why;
+    const auto refused = import_checkpoint(oversize, split.shards, print, why);
+
+    const std::uint32_t state_after = host_state_images ? host_state_images->occupied() : 0;
+    const std::uint32_t pages_after = text_kv_pages->occupied();
+    const bool clean = refused == std::nullopt && state_after == state_before &&
+                       pages_after == pages_before;
+    std::fprintf(stderr,
+                 "[ckpt] rollback check: %s (refused=%d: %s; state %u->%u, pages %u->%u, "
+                 "free device before=%u)\n",
+                 clean ? "CLEAN" : "LEAKED", refused ? 0 : 1, why.c_str(), state_before, state_after,
+                 pages_before, pages_after, devices_before);
+}
 } // namespace ninfer::models::qwen3_5::detail
