@@ -161,6 +161,21 @@ struct CheckpointSummary {
 
 // A checkpoint's KV prefix as raw Host bytes, page by page. State images are not part of it yet:
 // restoring KV without the recurrent state would resume from a state that never saw the prefix.
+// What a state image export hands back. The layout numbers travel with the bytes on purpose: a
+// restore that memcpy'd one model's state into another would not fail, it would just produce wrong
+// output, so the import side has to be able to refuse on numbers rather than on faith.
+struct CheckpointStateExport {
+    std::uint32_t image_bytes    = 0;
+    std::uint32_t layers         = 0;   // linear-attention layers that own this image
+    std::int32_t  conv_channels  = 0;
+    std::int32_t  value_heads    = 0;
+    std::int32_t  value_head_dim = 0;
+    std::int32_t  key_head_dim   = 0;
+    std::int32_t  hidden         = 0;
+    bool has_dflash_local        = false;  // speculative draft regions present
+    bool materialised_host_copy  = false;  // false = a Host replica already existed
+    std::vector<std::byte> bytes;
+};
 struct CheckpointExport {
     std::uint32_t frontier   = 0;
     std::uint32_t page_count = 0;
@@ -430,6 +445,7 @@ public:
         checkpoint_footprint(std::span<const CheckpointHandle>) const;
     [[nodiscard]] CheckpointSummary checkpoint_summary(CheckpointHandle checkpoint) const;
     [[nodiscard]] std::optional<CheckpointExport> export_checkpoint(CheckpointHandle checkpoint);
+    [[nodiscard]] std::optional<CheckpointStateExport> export_state(CheckpointHandle checkpoint);
     [[nodiscard]] CheckpointMetadata checkpoint_metadata(CheckpointHandle checkpoint) const;
     [[nodiscard]] bool checkpoint_matches(CheckpointHandle checkpoint,
                                           const RequestBasePlan& base) const;

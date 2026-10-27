@@ -263,6 +263,17 @@ public:
         return *object.device_slot;
     }
 
+    // The Host-side mirror of physical_slot: it names the Host replica so a caller outside this
+    // class can reach the bytes. Everything needed to export a state image already existed --
+    // HostStatePool::view() has been there all along -- but nothing could hand out the slot, which
+    // is why the image looked unexportable.
+    [[nodiscard]] qwen3_5::HostStateSlotHandle host_slot(StateImageHandle handle) const {
+        const Object& object = require(handle);
+        if (!object.host_slot.has_value()) {
+            throw std::logic_error("StateImage has no published Host replica");
+        }
+        return *object.host_slot;
+    }
     void move_checkpoint_to_active(StateImageHandle handle) {
         Object& object = require(handle);
         if (object.role != StateImageRole::CheckpointImmutable || !object.device_slot ||

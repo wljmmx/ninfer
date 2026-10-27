@@ -285,6 +285,8 @@ public:
     // Copies a checkpoint's KV prefix out of the Host arena. The pages must already be host
     // resident; this does not demote them, because a demote is a transfer the caller schedules.
     [[nodiscard]] std::optional<CheckpointExport> export_checkpoint(CheckpointHandle);
+    // The other half of export_checkpoint: KV pages alone do not resume this model.
+    [[nodiscard]] std::optional<CheckpointStateExport> export_state(CheckpointHandle);
     [[nodiscard]] bool checkpoint_matches(CheckpointHandle, const RequestBasePlan&) const;
     [[nodiscard]] std::uint32_t checkpoint_recovery_frontier(CheckpointHandle,
                                                              const RequestBasePlan&,
