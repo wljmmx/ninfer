@@ -46,7 +46,7 @@ if /i "%~1"=="quick" goto :done
 if defined NINFER_GATE_MODEL (set "MODEL=%NINFER_GATE_MODEL%") else (set "MODEL=D:\ninfer-rtx4090\models\qwen3_6_35b_a3b_e2.ninfer")
 if defined NINFER_GATE_CORPUS (set "CORPUS=%NINFER_GATE_CORPUS%") else (
   set "CORPUS=%REPO%\.temp\kv\moe_corpus_varied.txt"
-  if not exist "!CORPUS!" set "CORPUS=%REPO%\..\.temp\kv\moe_corpus_varied.txt"
+  if not exist "!CORPUS!" set "CORPUS=%REPO%\..\..\.temp\kv\moe_corpus_varied.txt"
 )
 if not exist "%MODEL%" (
   echo FAIL: model not visible: %MODEL%
@@ -91,5 +91,6 @@ echo   PASS
 :done
 echo GATE OK  (elapsed %START% -^> %TIME%)
 exit /b 0
+
 
 
