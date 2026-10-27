@@ -1,5 +1,6 @@
 #pragma once
 #include "models/qwen3_5/program/internal.h"
+#include "core/checkpoint_fingerprint.h"
 
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
@@ -291,9 +292,9 @@ public:
     // the caller is responsible for the KV half, which this cannot see.
     [[nodiscard]] std::optional<StateImageHandle> import_state(
         const std::vector<std::string>& shards,
-        const core::fingerprint::CheckpointFingerprint& want, std::string& error);
+        const ninfer::core::fingerprint::CheckpointFingerprint& want, std::string& error);
     // Fills the state-side fields of a fingerprint from the live layout.
-    void host_state_fingerprint(core::fingerprint::CheckpointFingerprint& out) const;
+    void host_state_fingerprint(ninfer::core::fingerprint::CheckpointFingerprint& out) const;
     [[nodiscard]] bool checkpoint_matches(CheckpointHandle, const RequestBasePlan&) const;
     [[nodiscard]] std::uint32_t checkpoint_recovery_frontier(CheckpointHandle,
                                                              const RequestBasePlan&,

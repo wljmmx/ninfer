@@ -1,4 +1,5 @@
 #include "models/qwen3_5/program/program_impl.h"
+#include "core/checkpoint_fingerprint.h"
 #include "core/checkpoint_tier.h"
 #include <memory>
 #include <mutex>
@@ -204,6 +205,18 @@ void dump_exported_checkpoint(ProgramImpl& program, CheckpointHandle handle, con
                      "[ckpt] state %s (%u B, layers=%u hidden=%d, host_copy_materialised=%d)\n",
                      path, state->image_bytes, static_cast<unsigned>(state->layers), state->hidden,
                      state->materialised_host_copy ? 1 : 0);
+    {
+        // The state half of the fingerprint, read from the live layout. Printed so the region sizes
+        // can be checked against what the image total implied instead of assumed to agree with it.
+        core::fingerprint::CheckpointFingerprint print;
+        program.host_state_fingerprint(print);
+        std::fprintf(stderr,
+                     "[ckpt] fp: image=%llu layer=%llu conv_total=%llu layers=%u dflash=%d\n",
+                     static_cast<unsigned long long>(print.state_image_bytes),
+                     static_cast<unsigned long long>(print.state_layer_bytes),
+                     static_cast<unsigned long long>(print.state_conv_bytes),
+                     print.state_layers, print.features.dflash_local ? 1 : 0);
+    }
     } else {
         std::fprintf(stderr, "[ckpt] state export refused for checkpoint %u\n",
                      static_cast<unsigned>(handle.index));

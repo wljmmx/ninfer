@@ -19,7 +19,7 @@
 namespace ninfer::models::qwen3_5::detail {
 
 std::optional<StateImageHandle> ProgramImpl::import_state(
-    const std::vector<std::string>& shards, const core::fingerprint::CheckpointFingerprint& want,
+    const std::vector<std::string>& shards, const ninfer::core::fingerprint::CheckpointFingerprint& want,
     std::string& error) {
     error.clear();
     if (!state_store || !host_state_images) {
@@ -28,7 +28,7 @@ std::optional<StateImageHandle> ProgramImpl::import_state(
     }
 
     // 1. Would this payload even belong here?
-    core::fingerprint::CheckpointFingerprint have;
+    ninfer::core::fingerprint::CheckpointFingerprint have;
     host_state_fingerprint(have);
     if (!core::fingerprint::matches_state(have, want, error)) {
         error = "checkpoint fingerprint does not match this process: " + error;
@@ -38,7 +38,7 @@ std::optional<StateImageHandle> ProgramImpl::import_state(
     // 2. Reassemble. The join already refuses gaps, overlaps and short payloads, so a failure here
     //    is a corrupt transfer rather than a configuration problem.
     std::string image;
-    if (!core::state_shards::join(shards, image, error)) {
+    if (!ninfer::core::state_shards::join(shards, image, error)) {
         error = "state shards: " + error;
         return std::nullopt;
     }
@@ -84,7 +84,7 @@ std::optional<StateImageHandle> ProgramImpl::import_state(
     return handle;
 }
 
-void ProgramImpl::host_state_fingerprint(core::fingerprint::CheckpointFingerprint& out) const {
+void ProgramImpl::host_state_fingerprint(ninfer::core::fingerprint::CheckpointFingerprint& out) const {
     out = {};
     if (!host_state_images) { return; }
     const qwen3_5::StateImageHostLayout& layout = host_state_images->layout();
