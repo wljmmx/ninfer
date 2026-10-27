@@ -136,6 +136,17 @@ public:
     }
 
     [[nodiscard]] const std::string& error() const { return error_; }
+    // Timeouts sized per call: a 12 MiB checkpoint needs far longer than the 2 s that suits a small
+    // block, and the socket timeout is otherwise fixed at connect.
+    void set_timeout(int timeout_ms) {
+        timeout_ms_ = timeout_ms;
+        if (!valid()) { return; }
+        timeval tv{};
+        tv.tv_sec  = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
+        ::setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof tv);
+        ::setsockopt(socket_, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof tv);
+    }
 
     bool command(std::span<const std::string_view> args, RespReply& reply) {
         if (!send_command(args, reply)) {
@@ -335,6 +346,7 @@ private:
 };
 
 } // namespace ninfer::core
+
 
 
 

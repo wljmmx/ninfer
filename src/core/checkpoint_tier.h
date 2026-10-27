@@ -15,6 +15,7 @@
 #include "core/kv_checkpoint_blob.h"
 #include "core/resp.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -37,6 +38,8 @@ public:
     [[nodiscard]] std::optional<std::uint64_t> store(std::uint32_t frontier,
                                                      std::span<const CheckpointSpan> spans) {
         const auto blob = encode_checkpoint(frontier, spans);
+        // 12 MiB takes far longer than the default; scale so a big blob is not mistaken for a dead link.
+        client_.set_timeout(std::max(5000, static_cast<int>(blob.size() / 1024)));
         const auto view = decode_checkpoint(blob);
         if (!view) { return std::nullopt; }  // never store something we cannot read back
         const std::string key = checkpoint_key(view->digest);
@@ -77,4 +80,6 @@ private:
 };
 
 } // namespace ninfer::core
+
+
 
