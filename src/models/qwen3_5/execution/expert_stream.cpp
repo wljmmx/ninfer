@@ -174,6 +174,10 @@ ExpertStream::ExpertStream(std::uint32_t count, WeightBankLayout gate_up, Weight
         const char* value = std::getenv("NINFER_EXPERT_EPOCH");
         return value != nullptr ? static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10)) : 0U;
     }();
+    auto_slru_ = [] {
+        const char* value = std::getenv("NINFER_EXPERT_AUTO_SLRU");
+        return value == nullptr || value[0] != 0;
+    }();
     regions_ = [] {
         const char* value = std::getenv("NINFER_EXPERT_REGIONS");
         return value != nullptr && value[0] != '0';
@@ -442,7 +446,12 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         if (tokens > 0) {
             lanes_seen_ = std::max<std::uint32_t>(lanes_seen_, static_cast<std::uint32_t>(tokens));
         }
+        // Width-based policy: from six lanes up the whole-pool 50/50 SLRU measured 52 tok/s at
+        // twelve gigabytes against 36 for the route-first default, and below that the default wins
+        // (105/86 at one/four lanes). The switch is therefore made on the widest step seen.
+        const bool slru_active = slru_policy_ || (auto_slru_ && lanes_seen_ >= 6);
         const auto spill_cap = [&]() -> std::size_t {
+            if (slru_active) { return 0; }
             if (!regions_) {
                 // default policy: the eight fixed slots the report measured
                 if (const char* value = std::getenv("NINFER_EXPERT_SPILL_PCT")) {
@@ -493,7 +502,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 chosen[expert] = true;
                 wanted.push_back(expert);
             }
-        } else if (slru_policy_) {
+        } else if (slru_active) {
             // llama.cpp's 50/50 SLRU (src/llama-moe-cache.cpp:16-121), over slot ids so a slot that
             // keeps its expert keeps its number: hits are promoted to the protected half, misses
             // take the probation head while skipping the experts this step needs, and a full set
@@ -821,7 +830,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             }
             coverage_.routes += values;
             coverage_.inside += inside;
-            if ((std::getenv("NINFER_SPLIT_TIMING") != nullptr ||
+            if (bank_ == 0 && (std::getenv("NINFER_SPLIT_TIMING") != nullptr ||
                  std::getenv("NINFER_EXPERT_TIMING") != nullptr) &&
                 ++coverage_calls_ % 40 == 0) {
                 const auto routes = static_cast<double>(coverage_.routes == 0 ? 1 : coverage_.routes);
@@ -842,6 +851,10 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                              bank_, static_cast<unsigned long long>(coverage_.inside),
                              static_cast<unsigned long long>(coverage_.routes), covered,
                              misses_per_token, capacity, bytes_per_step);
+                const auto entered_per_step = entered_steps_ == 0
+                    ? 0.0
+                    : static_cast<double>(entered_) / static_cast<double>(entered_steps_);
+                if (bank_ == 0) { std::fprintf(stderr, "[set] bank=0 entered=%.2f/step\n", entered_per_step); }
             }
         }
         // port (sm_26): a prefill routes (nearly) every expert of a layer, so letting it choose the
@@ -881,12 +894,18 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             // 2 KiB of offsets plus 1 KiB of mask copied forty times a token, every step, whether
             // anything changed or not. The full copy stays as the fallback when most rows move.
             if (prev_slot_.size() != count_) { prev_slot_.assign(count_, -1); }
+            std::uint32_t entered_this_step = 0;
             std::vector<std::uint32_t> moved;
             moved.reserve(count_);
             for (std::uint32_t expert = 0; expert < count_; ++expert) {
                 const auto slot = cache_->expert_slot(bank_, expert);
                 const auto now  = slot ? static_cast<std::int32_t>(*slot) : -1;
-                if (now != prev_slot_[expert]) { moved.push_back(expert); }
+                if (now != prev_slot_[expert]) {
+                    moved.push_back(expert);
+                    // An expert that was not resident at all is a row that has to be uploaded, not
+                    // just a table entry that moved: that is the number the transfer cost follows.
+                    if (prev_slot_[expert] < 0 && now >= 0) { ++entered_this_step; }
+                }
             }
             const auto delta_bytes = moved.size() * (sizeof(std::uint64_t) + sizeof(std::int32_t));
             static const bool delta_enabled = [] {
@@ -952,6 +971,8 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 }
                 ++publish_calls_;
             }
+            entered_ += entered_this_step;
+            ++entered_steps_;
             for (const auto expert : moved) {
                 const auto slot = cache_->expert_slot(bank_, expert);
                 prev_slot_[expert] = slot ? static_cast<std::int32_t>(*slot) : -1;

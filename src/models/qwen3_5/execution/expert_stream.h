@@ -126,6 +126,9 @@ private:
     // the table does not move it. The policy is opt-in (NINFER_EXPERT_POLICY=slru) because the
     // score fill it replaces is what the measured streaming numbers were taken with.
     bool slru_policy_ = false;
+    // switch to the whole-pool SLRU once a step is six lanes wide; NINFER_EXPERT_AUTO_SLRU=0 pins
+    // the default policy at every width
+    bool auto_slru_ = false;
     // opt-in region split (hot + dedicated spill ring); the default policy is unchanged until it
     // is measured against the report's numbers
     bool regions_ = false;
@@ -161,6 +164,8 @@ private:
     std::vector<std::int32_t> prev_slot_;
     std::uint64_t publish_bytes_ = 0;
     std::uint64_t publish_calls_ = 0;
+    std::uint64_t entered_ = 0;
+    std::uint64_t entered_steps_ = 0;
     // port (sm_26): whether this bank's resident set has ever been built. A prefill is not allowed to
     // choose the set, but the first call has to, or a cold start would route everything to the host
     // tier and never establish one.
