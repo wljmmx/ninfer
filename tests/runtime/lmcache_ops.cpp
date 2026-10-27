@@ -42,7 +42,7 @@ constexpr int kCommitRetrieve = 0x13;
 constexpr int kLookup = 0x08;
 constexpr int kWaitPrefetchStatus = 0x0A;
 
-constexpr std::int64_t kInstanceId = 4242;
+std::int64_t g_instance_id = 4242;
 
 struct Reply {
     bool received{false};
@@ -234,6 +234,7 @@ int main(int argc, char** argv) {
     std::int64_t head_dim = 64;
     std::int64_t chunk_slots = 256;
     std::int64_t page_tokens = 64;
+    std::int64_t chunks = 1;
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view flag = argv[i];
@@ -254,10 +255,14 @@ int main(int argc, char** argv) {
             next(chunk_slots);
         } else if (flag == "--page-tokens") {
             next(page_tokens);
+        } else if (flag == "--instance") {
+            next(g_instance_id);
+        } else if (flag == "--chunks") {
+            next(chunks);
         } else if (flag == "--help") {
             std::printf(
                 "usage: lmcache_ops [--server URL] [--layers N] [--kv-heads N] [--head-dim N]\n"
-                "                   [--chunk-slots N] [--page-tokens N]\n"
+                "                   [--chunk-slots N] [--page-tokens N] [--instance N] [--chunks N]\n"
                 "\nGeometry defaults are a hypothesis for exercising the protocol, not the\n"
                 "model's real layout.\n");
             return 0;
@@ -282,9 +287,13 @@ int main(int argc, char** argv) {
                                 : 0.0);
     std::printf("\n");
 
-    std::vector<std::int64_t> tokens(kChunkTokens);
+    std::vector<std::int64_t> tokens(kChunkTokens * chunks);
+    // The cache identity is the token sequence alone: every run with the same tokens hits the entry
+    // an earlier run stored, and a shape mismatch then shows up as "wrong byte count" rather than an
+    // error. Offset by instance so each run stores and reads its own object.
+    const std::int64_t token_base = (g_instance_id % 1000) * 1000;
     for (std::size_t i = 0; i < tokens.size(); ++i) {
-        tokens[i] = static_cast<std::int64_t>(i * 7 + 3);
+        tokens[i] = token_base + static_cast<std::int64_t>(i * 7 + 3);
     }
 
     ninfer::core::lmcache::CacheKey key;
@@ -293,12 +302,12 @@ int main(int argc, char** argv) {
     key.worker_id = 0;
     key.token_bytes = ninfer::core::lmcache::pack_tokens(tokens);
     key.start = 0;
-    key.end = kChunkTokens;
-    key.request_id = "req-ops-0001";
+    key.end = kChunkTokens * chunks;
+    key.request_id = "req-ops-" + std::to_string(g_instance_id);
     key.num_kv_readers = 1;
 
     ninfer::core::lmcache::RegisterContext registration;
-    registration.instance_id = kInstanceId;
+    registration.instance_id = g_instance_id;
     registration.model_name = key.model_name;
     registration.world_size = 1;
     registration.block_size = kChunkTokens;
@@ -323,6 +332,10 @@ int main(int argc, char** argv) {
         state.tokens_per_block = kChunkTokens;
         state.kv_size = 1;
         state.recurrent = true;
+        // A recurrent snapshot describes the whole prefix, so it is stored once, under the trailing
+        // chunk. A retrieve is a miss unless every group covers its in-window suffix, so the group
+        // has to declare a one-chunk window; without it the server looks for five state chunks.
+        state.window_chunks = 1;
         registration.group_layouts.push_back(state);
     }
 
@@ -335,18 +348,24 @@ int main(int argc, char** argv) {
     const std::string state_payload = make_payload(state_bytes, 0x5C);
 
     std::vector<ninfer::core::lmcache::TensorGroupWire> groups(2);
-    groups[0].chunk_indices = {0};
-    groups[0].tensors.push_back({"bfloat16", {2, kLayers, kSlots, kHidden}, kv_payload});
-    groups[1].chunk_indices = {0};
+    // The KV group covers every chunk. The state group carries a single chunk at the tail: its
+    // object is the whole snapshot for the prefix, and `_check_chunk_indices` only requires indices
+    // to be strictly increasing and below the chunk count, not to cover it.
+    for (std::int64_t chunk = 0; chunk < chunks; ++chunk) {
+        groups[0].chunk_indices.push_back(chunk);
+        groups[0].tensors.push_back({"bfloat16", {2, kLayers, kSlots, kHidden}, kv_payload});
+    }
+    groups[1].chunk_indices = {chunks - 1};
     groups[1].tensors.push_back({"float32", {kLayers, kSlots, kHidden}, state_payload});
     const std::string envelope =
         ninfer::core::lmcache::encode_grouped_tensor_envelope(groups);
 
     std::printf("endpoint   : %s\n", endpoint);
-    std::printf("key        : %s, tokens %lld..%lld (1 chunk)\n", key.model_name.c_str(),
-                static_cast<long long>(key.start), static_cast<long long>(key.end));
-    std::printf("groups     : KV %zu B + state %zu B, envelope %zu B\n", kv_bytes, state_bytes,
-                envelope.size());
+    std::printf("key        : %s, tokens %lld..%lld (%lld chunk(s))\n", key.model_name.c_str(),
+                static_cast<long long>(key.start), static_cast<long long>(key.end),
+                static_cast<long long>(chunks));
+    std::printf("groups     : KV %zu B x %lld + state %zu B, envelope %zu B\n", kv_bytes,
+                static_cast<long long>(chunks), state_bytes, envelope.size());
     std::printf("\n");
 
     Session session;
@@ -382,7 +401,7 @@ int main(int argc, char** argv) {
     {
         std::string key_bytes = ninfer::core::lmcache::encode_cache_key(key);
         ninfer::core::msgpack::Writer instance_writer;
-        instance_writer.integer(kInstanceId);
+        instance_writer.integer(g_instance_id);
         ninfer::core::msgpack::Writer skipped_writer;
         skipped_writer.array_header(0);
 
@@ -407,7 +426,7 @@ int main(int argc, char** argv) {
     {
         std::string key_bytes = ninfer::core::lmcache::encode_cache_key(key);
         ninfer::core::msgpack::Writer instance_writer;
-        instance_writer.integer(kInstanceId);
+        instance_writer.integer(g_instance_id);
         ninfer::core::msgpack::Writer payload_writer;
         payload_writer.binary(envelope);
 
@@ -455,7 +474,7 @@ int main(int argc, char** argv) {
         const bool has_count = body.kind == ninfer::core::msgpack::Value::Kind::Int;
         const std::int64_t count = has_count ? body.integer : -1;
         std::printf("   prefetch chunks: %lld\n", static_cast<long long>(count));
-        expect(!has_count || count == 1, "the prefetch reports the one chunk that was stored");
+        expect(!has_count || count == chunks, "the prefetch reports every stored chunk");
     }
 
     // 6. prepare_retrieve ----------------------------------------------------
@@ -463,7 +482,7 @@ int main(int argc, char** argv) {
     {
         std::string key_bytes = ninfer::core::lmcache::encode_cache_key(key);
         ninfer::core::msgpack::Writer instance_writer;
-        instance_writer.integer(kInstanceId);
+        instance_writer.integer(g_instance_id);
 
         if (!session.call("prepare_retrieve", kPrepareRetrieve,
                           {key_bytes, instance_writer.take()}, body)) {
@@ -486,7 +505,7 @@ int main(int argc, char** argv) {
     {
         std::string key_bytes = ninfer::core::lmcache::encode_cache_key(key);
         ninfer::core::msgpack::Writer instance_writer;
-        instance_writer.integer(kInstanceId);
+        instance_writer.integer(g_instance_id);
         if (!session.call("commit_retrieve", kCommitRetrieve,
                           {key_bytes, instance_writer.take()}, body)) {
             std::printf("FAIL commit_retrieve: %s\n", session.error().c_str());
@@ -508,15 +527,27 @@ int main(int argc, char** argv) {
     } else {
         expect(decoded.size() == 2, "the returned envelope carries both groups");
         if (decoded.size() == 2) {
-            expect(decoded[0].tensors.size() == 1 && decoded[1].tensors.size() == 1,
-                   "each group carries exactly one chunk");
-            if (decoded[0].tensors.size() == 1 && decoded[1].tensors.size() == 1) {
-                const auto& got_kv = decoded[0].tensors[0];
+            const auto expected_kv = static_cast<std::size_t>(chunks);
+            expect(decoded[0].tensors.size() == expected_kv,
+                   "the KV group carries one tensor per chunk");
+            expect(decoded[1].tensors.size() == 1,
+                   "the state group carries exactly one tensor");
+            if (decoded[0].tensors.size() == expected_kv && decoded[1].tensors.size() == 1) {
                 const auto& got_state = decoded[1].tensors[0];
-                expect(got_kv.dtype == "bfloat16" && got_state.dtype == "float32",
+                expect(decoded[1].chunk_indices.size() == 1 && decoded[1].chunk_indices[0] == chunks - 1,
+                       "the state tensor is addressed to the trailing chunk");
+                expect(decoded[0].tensors[0].dtype == "bfloat16" && got_state.dtype == "float32",
                        "dtypes come back as sent, so the groups did not get crossed");
-                const bool kv_same = same_bytes(got_kv.data, kv_payload, "KV payload");
-                expect(kv_same, "KV payload is byte-identical after the round trip");
+                for (const auto& tensor : {decoded[0].tensors[0], got_state}) {
+                    std::printf("   returned shape");
+                    for (const auto dimension : tensor.shape) { std::printf(" %lld", (long long)dimension); }
+                    std::printf(" (%s)\n", tensor.dtype.c_str());
+                }
+                bool kv_same = true;
+                for (const auto& tensor : decoded[0].tensors) {
+                    kv_same = same_bytes(tensor.data, kv_payload, "KV payload") && kv_same;
+                }
+                expect(kv_same, "every KV chunk is byte-identical after the round trip");
                 const bool state_same = same_bytes(got_state.data, state_payload, "state payload");
                 expect(state_same, "state payload is byte-identical after the round trip");
             }

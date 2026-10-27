@@ -33,15 +33,18 @@ constexpr int kCommitRetrieve = 0x13;
 
 // A fresh id per run: re-registering an existing instance does not replace its layout, so reusing
 // the id kept the shape from an earlier attempt and every frame failed validation against it.
-constexpr std::int64_t kInstance = 6152;
+// Both the instance id and the element count are settable, because the open question is whether one
+// frame can carry a whole 64 MiB state image or whether that has to be split.
 constexpr std::int64_t kSlots = 128;
 constexpr std::int64_t kLayers = 1;
-constexpr std::int64_t kHidden = 12288;  // 2 * 1 * 128 * 12288 * 2 = 6,291,456
+std::int64_t g_instance = 6152;
+std::int64_t g_hidden    = 12288;  // 2 * 1 * 128 * 12288 * 2 = 6,291,456
 // The single-group path validates against the TOP-LEVEL layout_desc, which is
 // [2, num_layers, num_physical_slots, hidden] when use_mla is false -- the leading 2 is the K/V
 // plane count. Forgetting it was the last failure: shape right, byte count half of what was expected.
-constexpr std::size_t kFrameBytes =
-    static_cast<std::size_t>(2 * kSlots * kLayers * kHidden) * sizeof(std::uint16_t);
+std::size_t frame_bytes() {
+    return static_cast<std::size_t>(2 * kSlots * kLayers * g_hidden) * sizeof(std::uint16_t);
+}
 
 struct Session {
     void* context{nullptr};
@@ -101,23 +104,30 @@ struct Session {
 
 std::string register_payload() {
     ninfer::core::lmcache::RegisterContext context;
-    context.instance_id        = kInstance;
+    context.instance_id        = g_instance;
     context.model_name         = "frame-bench";
     context.world_size         = 1;
     context.block_size         = kSlots;
     context.num_layers         = kLayers;
-    context.hidden_dim_size    = kHidden;
+    context.hidden_dim_size    = g_hidden;
     context.dtype_str          = "bfloat16";
     context.use_mla            = false;
     context.num_physical_slots = kSlots;
     ninfer::core::lmcache::GroupLayout group;
     group.num_layers      = kLayers;
-    group.hidden_dim_size = kHidden;
+    group.hidden_dim_size = g_hidden;
     group.dtype_str       = "bfloat16";
     group.tokens_per_block = kSlots;
     group.kv_size          = 2;
     context.group_layouts.push_back(group);
     return ninfer::core::lmcache::encode_register_context(context);
+}
+
+// The server keys its token session by request_id and `set_tokens` replaces the buffer without
+// resetting the rolling hash state, so a reused request_id keeps hashing against the tokens of the
+// first request that used it. Every store/lookup call therefore needs a request_id unique per run.
+std::string request_id(int index) {
+    return "frame-" + std::to_string(g_instance) + "-" + std::to_string(index);
 }
 
 std::string key_payload(int index) {
@@ -127,12 +137,18 @@ std::string key_payload(int index) {
     key.worker_id  = 0;
     std::vector<std::int64_t> tokens(static_cast<std::size_t>(kSlots));
     for (std::size_t i = 0; i < tokens.size(); ++i) {
-        tokens[i] = static_cast<std::int64_t>(index * 1000 + static_cast<int>(i));
+        // The key is derived from the tokens alone, so two runs that reuse the same token sequence
+        // hit each other's entries: a 16 MiB store then "succeeded" while retrieve handed back the
+        // 6 MiB image an earlier run had stored under the same key. Offset by instance to keep runs
+        // independent, but keep the ids inside int32 range: a 7.2e9 token was accepted by store and
+        // then unreadable ("key exists but cannot be read").
+        const std::int64_t base = (g_instance % 1000) * 100000;
+        tokens[i]            = static_cast<std::int64_t>(base + index * 1000 + static_cast<int>(i));
     }
     key.token_bytes = ninfer::core::lmcache::pack_tokens(tokens);
     key.start       = 0;
     key.end         = kSlots;
-    key.request_id  = "frame-" + std::to_string(index);
+    key.request_id  = request_id(index);
     return ninfer::core::lmcache::encode_cache_key(key);
 }
 
@@ -155,7 +171,7 @@ std::string envelope(const std::string& bytes) {
                         // [2, layers, slots, hidden], and a leading 1 fails that check
     writer.integer(kLayers);
     writer.integer(kSlots);
-    writer.integer(kHidden);
+    writer.integer(g_hidden);
     writer.key("data");
     writer.binary(bytes);
     return writer.take();
@@ -172,11 +188,16 @@ int main(int argc, char** argv) {
             endpoint = argv[++i];
         } else if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
             frames = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--hidden") == 0 && i + 1 < argc) {
+            g_hidden = std::atoll(argv[++i]);
+        } else if (std::strcmp(argv[i], "--instance") == 0 && i + 1 < argc) {
+            g_instance = std::atoll(argv[++i]);
         }
     }
 
-    std::printf("frame bytes: %zu  frames: %d  total: %.1f MB\n", kFrameBytes, frames,
-                static_cast<double>(kFrameBytes) * frames / 1048576.0);
+    std::printf("frame bytes: %zu  frames: %d  total: %.1f MB  instance: %lld\n", frame_bytes(),
+                frames, static_cast<double>(frame_bytes()) * frames / 1048576.0,
+                static_cast<long long>(g_instance));
 
     Session session;
     if (!session.open(endpoint)) {
@@ -193,13 +214,13 @@ int main(int argc, char** argv) {
 
     std::vector<std::string> payloads;
     for (int i = 0; i < frames; ++i) {
-        payloads.push_back(std::string(kFrameBytes, static_cast<char>(0xA7)));
+        payloads.push_back(std::string(frame_bytes(), static_cast<char>(0xA7)));
     }
 
     const auto store_start = std::chrono::steady_clock::now();
     for (int i = 0; i < frames; ++i) {
         ninfer::core::msgpack::Writer instance_writer;
-        instance_writer.integer(kInstance);
+        instance_writer.integer(g_instance);
         ninfer::core::msgpack::Writer skipped_writer;
         skipped_writer.array_header(0);
         std::string prep_body;
@@ -208,7 +229,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         ninfer::core::msgpack::Writer payload_writer;
-        payload_writer.integer(kInstance);
+        payload_writer.integer(g_instance);
         const std::string body = envelope(payloads[i]);
         std::string commit_body;
         // cpu_data is declared `bytes`, so the envelope must arrive as a msgpack bin, not as the
@@ -234,7 +255,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         ninfer::core::msgpack::Writer request_writer;
-        request_writer.string("frame-" + std::to_string(i));
+        request_writer.string(request_id(i));
         ninfer::core::msgpack::Writer timeout_writer;
         timeout_writer.real(20.0);
         if (!session.call(kWaitPrefetch, {request_writer.take(), timeout_writer.take()})) {
@@ -242,7 +263,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         ninfer::core::msgpack::Writer instance_writer;
-        instance_writer.integer(kInstance);
+        instance_writer.integer(g_instance);
         std::string body;
         if (!session.call(kPrepareRetrieve, {key_payload(i), instance_writer.take()}, &body)) {
             std::printf("FAIL prepare_retrieve %d\n", i);
@@ -257,7 +278,7 @@ int main(int argc, char** argv) {
         const auto* data = value.find("data");
         if (data != nullptr) { bytes_back += data->bytes.size(); }
         ninfer::core::msgpack::Writer commit_writer;
-        commit_writer.integer(kInstance);
+        commit_writer.integer(g_instance);
         if (!session.call(kCommitRetrieve, {key_payload(i), commit_writer.take()})) {
             std::printf("FAIL commit_retrieve %d\n", i);
             return 1;
@@ -271,7 +292,7 @@ int main(int argc, char** argv) {
     };
     const double store_ms = ms(store_start, store_end);
     const double retrieve_ms = ms(retrieve_start, retrieve_end);
-    const double total_mb = static_cast<double>(kFrameBytes) * frames / 1048576.0;
+    const double total_mb = static_cast<double>(frame_bytes()) * frames / 1048576.0;
 
     std::printf("\nstore    %8.1f ms   (%.1f MB -> %.1f MB/s)\n", store_ms, total_mb,
                 total_mb / (store_ms / 1000.0));
