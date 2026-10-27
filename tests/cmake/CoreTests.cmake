@@ -117,3 +117,9 @@ ninfer_add_test(ninfer_kv_reuse_test
 ninfer_add_test(ninfer_kv_checkpoint_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/kv_checkpoint_test.cpp"
   LIBRARIES ninfer_core)
+
+# P1-b-2d: checkpoint blobs through the tier, keyed by content digest.
+ninfer_add_test(ninfer_checkpoint_tier_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/checkpoint_tier_test.cpp"
+  LIBRARIES ninfer_core $<$<PLATFORM_ID:Windows>:ws2_32>)
+set_tests_properties(ninfer_checkpoint_tier_test PROPERTIES SKIP_RETURN_CODE 77)

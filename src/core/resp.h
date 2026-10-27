@@ -21,6 +21,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -108,6 +109,10 @@ public:
             close();
             return false;
         }
+        host_       = std::move(host);
+        port_       = port;
+        timeout_ms_ = timeout_ms;
+        io_failed_  = false;
         int one = 1;
         ::setsockopt(socket_, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof one);
         return true;
@@ -133,6 +138,18 @@ public:
     [[nodiscard]] const std::string& error() const { return error_; }
 
     bool command(std::span<const std::string_view> args, RespReply& reply) {
+        if (!send_command(args, reply)) {
+            // A dropped connection is not an answer. Reconnect once and ask again; a real server
+            // error comes back as a complete reply and is never retried here.
+            if (!io_failed_ || host_.empty()) { return false; }
+            if (!connect_to(host_, port_, timeout_ms_)) { return false; }
+            io_failed_ = false;
+            return send_command(args, reply);
+        }
+        return true;
+    }
+
+    bool send_command(std::span<const std::string_view> args, RespReply& reply) {
         const auto frame = resp_encode(args);
         if (!send_all(frame)) { return false; }
         return read_reply(reply);
@@ -176,6 +193,15 @@ public:
         return destination.size();
     }
 
+    // Size of a stored value without transferring it: a checkpoint blob is read back into a
+    // buffer of exactly this size, so a short buffer never has to be guessed at.
+    std::optional<std::size_t> length(std::string_view key) {
+        RespReply reply;
+        const std::string_view args[]{"STRLEN", key};
+        if (!command(args, reply) || reply.type != ':') { return std::nullopt; }
+        return static_cast<std::size_t>(reply.number);
+    }
+
     // The lookup stage of the tier protocol: never transfers the payload.
     std::optional<bool> exists(std::string_view key) {
         RespReply reply;
@@ -209,6 +235,7 @@ private:
                                       static_cast<int>(bytes.size() - sent), 0);
             if (chunk <= 0) {
                 error_ = "send failed";
+                io_failed_ = true;
                 return false;
             }
             sent += static_cast<std::size_t>(chunk);
@@ -221,6 +248,7 @@ private:
         const auto got = ::recv(socket_, buffer_, sizeof buffer_, 0);
         if (got <= 0) {
             error_ = got == 0 ? "connection closed" : "recv failed";
+            io_failed_ = true;
             return false;
         }
         begin_ = 0;
@@ -297,9 +325,16 @@ private:
     bool wsa_started_ = false;
 #endif
     std::string error_;
+    std::string host_;
+    std::uint16_t port_ = 0;
+    int timeout_ms_     = 0;
+    bool io_failed_     = false;
     char buffer_[64 * 1024]{};
     std::size_t begin_ = 0;
     std::size_t end_   = 0;
 };
 
 } // namespace ninfer::core
+
+
+
