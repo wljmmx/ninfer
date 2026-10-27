@@ -1,4 +1,8 @@
 #include "models/qwen3_5/program/program_impl.h"
+#include "core/checkpoint_tier.h"
+#include <memory>
+#include <mutex>
+#include <string>
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/kv_tier_stats.h"
 #include "core/device.h"
@@ -125,6 +129,33 @@ namespace {
 // Diagnostic dump for the KV tier work: after a capture commits, write the checkpoint's prefix as
 // header + bytes so it can be compared against a second demote of the same checkpoint. Gated by
 // NINFER_CKPT_DUMP so the default path is untouched.
+namespace {
+
+// P1: hand a checkpoint to the KV tier. Synchronous for now -- the asynchronous move onto the
+// prefetcher thread is the next step, and it changes where the cost lands (request path vs worker),
+// not what is stored.
+void store_checkpoint_in_tier(ProgramImpl& program, CheckpointHandle handle, const char* address) {
+    const auto out = program.export_checkpoint(handle);
+    if (!out) { return; }
+    static std::mutex mutex;
+    static std::unique_ptr<core::CheckpointTier> tier;
+    const std::lock_guard lock(mutex);
+    if (!tier) {
+        const std::string spec(address);
+        const auto colon = spec.rfind(':');
+        if (colon == std::string::npos) { return; }
+        const auto port = static_cast<std::uint16_t>(std::atoi(spec.substr(colon + 1).c_str()));
+        auto created = std::make_unique<core::CheckpointTier>(spec.substr(0, colon), port);
+        if (!created->connect()) { return; }
+        tier = std::move(created);
+    }
+    const core::CheckpointSpan spans[]{{core::CheckpointSpanTag::KvPages, out->kv_bytes}};
+    const auto digest = tier->store(out->frontier, spans);
+    std::fprintf(stderr, "[ckpt] tier %s frontier %u (%zu B)\n",
+                 digest ? "stored" : "REFUSED", out->frontier, out->kv_bytes.size());
+}
+
+} // namespace
 std::vector<CheckpointHandle> g_dumped_checkpoints;
 void dump_exported_checkpoint(ProgramImpl& program, CheckpointHandle handle, const char* directory,
                               const char* tag) {
@@ -232,6 +263,10 @@ ContextProgress ProgramImpl::poll_context(runtime::CancellationFlagView cancella
                 dump_dir != nullptr && *dump_dir != 0) {
                 for (const auto& [handle, role] : tx.capture_points) {
                     g_dumped_checkpoints.push_back(handle);
+                    if (const char* tier_addr = std::getenv("NINFER_CKPT_TIER");
+                        tier_addr != nullptr && *tier_addr != 0) {
+                        store_checkpoint_in_tier(*this, handle, tier_addr);
+                    }
                     dump_exported_checkpoint(*this, handle, dump_dir, "");
                 }
             }
@@ -346,6 +381,9 @@ void ProgramImpl::abort_context() noexcept {
 }
 
 } // namespace ninfer::models::qwen3_5::detail
+
+
+
 
 
 
