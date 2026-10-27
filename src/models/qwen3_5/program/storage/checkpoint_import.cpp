@@ -91,21 +91,10 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
             }
         }
 
-        std::vector<DeviceKVPageHandle> device_handles;
-        device_handles.reserve(pages.size());
-        for (const LogicalKVPageHandle page : pages) {
-            device_handles.push_back(text_kv_pages->physical(page));
-        }
-        const auto source = host_kv_extents->view(capability);
-        (void)text_kv_pages->physical_pool().copy_from_host(source,
-                                                           std::span<const DeviceKVPageHandle>(
-                                                               device_handles.data(),
-                                                               device_handles.size()),
-                                                           device.transfer_stream);
-        if (cudaStreamSynchronize(device.transfer_stream) != cudaSuccess) {
-            error = "Device copy for the restored pages failed";
-            return std::nullopt;
-        }
+        // The Device copy is deliberately not made here. A restored checkpoint is a Host-only
+        // artifact, exactly like one that was captured and demoted, and restore_addressed_host_pages()
+        // promotes what it needs at use time. Copying down eagerly duplicated that work and, measured,
+        // left the Host extent reading back as zeros afterwards.
     }
     // 4. Map them into a fresh inactive address.
     std::optional<KVAddressSpaceHandle> address = text_kv_addresses->create_inactive();
