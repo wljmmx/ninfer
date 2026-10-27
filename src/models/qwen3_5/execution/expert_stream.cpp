@@ -450,9 +450,13 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         // twelve gigabytes against 36 for the route-first default, and below that the default wins
         // (105/86 at one/four lanes). The switch is therefore made on the widest step seen.
         const bool slru_active = slru_policy_ || (auto_slru_ && lanes_seen_ >= 6);
+        if (bank_ == 0 && std::getenv("NINFER_LANES_DEBUG") != nullptr) {
+            static int shown = 0;
+            if (shown++ < 6) { std::fprintf(stderr, "[lanes] tokens=%d seen=%u auto=%d slru=%d\n", tokens, lanes_seen_, (int)auto_slru_, (int)slru_active); }
+        }
         // A pure SLRU run owns the whole pool: the ring, the seeding and the promotion below are
         // for the region split, and mixing them into the same path is what left it half converted.
-        const bool pure_slru = slru_policy_ && !regions_ && epoch_steps_ == 0;
+        const bool pure_slru = slru_active && !regions_ && epoch_steps_ == 0;
         const auto spill_cap = [&]() -> std::size_t {
             if (slru_active) { return 0; }
             if (!regions_) {
