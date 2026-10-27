@@ -120,6 +120,35 @@ void ProgramImpl::enqueue_context_transfers(ContextTransaction& tx) {
     if (tx.submitted) { context_completion_.record(device.transfer_stream); }
 }
 
+namespace {
+
+// Diagnostic dump for the KV tier work: after a capture commits, write the checkpoint's prefix as
+// header + bytes so it can be compared against a second demote of the same checkpoint. Gated by
+// NINFER_CKPT_DUMP so the default path is untouched.
+void dump_exported_checkpoint(ProgramImpl& program, CheckpointHandle handle, const char* directory) {
+    const auto out = program.export_checkpoint(handle);
+    if (!out) {
+        std::fprintf(stderr, "[ckpt] export refused for checkpoint %u\n", handle.index);
+        return;
+    }
+    char path[512];
+    std::snprintf(path, sizeof path, "%s/ckpt-%u-%u.bin", directory,
+                  static_cast<unsigned>(out->frontier), static_cast<unsigned>(handle.index));
+    std::FILE* file = std::fopen(path, "wb");
+    if (file == nullptr) {
+        std::fprintf(stderr, "[ckpt] cannot open %s\n", path);
+        return;
+    }
+    std::fwrite(&out->frontier, sizeof out->frontier, 1, file);
+    std::fwrite(&out->page_count, sizeof out->page_count, 1, file);
+    std::fwrite(&out->page_bytes, sizeof out->page_bytes, 1, file);
+    std::fwrite(out->kv_bytes.data(), 1, out->kv_bytes.size(), file);
+    std::fclose(file);
+    std::fprintf(stderr, "[ckpt] dumped %s (%u pages x %zu B)\n", path,
+                 static_cast<unsigned>(out->page_count), out->page_bytes);
+}
+
+} // namespace
 void ProgramImpl::publish_context_transfers(ContextTransaction& tx) {
     if (tx.state_transfer) {
         state_store->publish_transfer(std::move(*tx.state_transfer), tx.preserve_state_device);
@@ -195,6 +224,14 @@ ContextProgress ProgramImpl::poll_context(runtime::CancellationFlagView cancella
             // capture.cpp.
             out.captured_checkpoints.reserve(tx.capture_points.size());
             publish_capture(tx);
+            // After publish_capture the handles are live and the prefix is committed, which is the
+            // only point where an export can name the checkpoint the engine will reuse.
+            if (const char* dump_dir = std::getenv("NINFER_CKPT_DUMP");
+                dump_dir != nullptr && *dump_dir != 0) {
+                for (const auto& [handle, role] : tx.capture_points) {
+                    dump_exported_checkpoint(*this, handle, dump_dir);
+                }
+            }
             for (const auto& [handle, role] : tx.capture_points) {
                 out.captured_checkpoints.push_back(handle);
             }
@@ -306,3 +343,5 @@ void ProgramImpl::abort_context() noexcept {
 }
 
 } // namespace ninfer::models::qwen3_5::detail
+
+
