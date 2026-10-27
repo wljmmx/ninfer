@@ -56,6 +56,10 @@ struct ClientOptions {
 struct RestorePayload {
     std::vector<std::string> kv_chunks;
     std::string state;
+    // The shapes the server sized the objects to. They come from the registration, so a mismatch
+    // here means the layout the server used is not the layout that was sent.
+    std::vector<std::int64_t> kv_shape;
+    std::vector<std::int64_t> state_shape;
 };
 
 class Connection {
@@ -242,7 +246,9 @@ public:
             for (const DecodedTensor& tensor : groups[0].tensors) {
                 out->kv_chunks.push_back(tensor.data);
             }
-            out->state = groups[1].tensors[0].data;
+            out->state       = groups[1].tensors[0].data;
+            out->kv_shape    = groups[0].tensors[0].shape;
+            out->state_shape = groups[1].tensors[0].shape;
         }
 
         msgpack::Writer instance;

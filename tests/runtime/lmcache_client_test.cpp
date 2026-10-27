@@ -9,6 +9,8 @@
 #include "core/lmcache_client.h"
 
 #include <chrono>
+#include <cstdlib>
+#include <fstream>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -34,7 +36,8 @@ std::string make_payload(std::size_t size, unsigned char seed) {
 }
 
 RegisterContext make_registration(std::int64_t layers, std::int64_t chunk_tokens,
-                                  std::int64_t kv_hidden, std::int64_t state_hidden) {
+                                  std::int64_t kv_hidden, std::int64_t state_layers,
+                                  std::int64_t state_hidden) {
     RegisterContext context;
     context.instance_id        = g_instance;
     context.model_name         = "client-test";
@@ -56,7 +59,7 @@ RegisterContext make_registration(std::int64_t layers, std::int64_t chunk_tokens
     context.group_layouts.push_back(kv);
 
     GroupLayout state;
-    state.num_layers       = layers;
+    state.num_layers       = state_layers;
     state.hidden_dim_size  = state_hidden;
     state.dtype_str        = "float32";
     state.tokens_per_block = chunk_tokens;
@@ -98,6 +101,10 @@ struct Case {
     std::int64_t layers{40};
     std::int64_t chunk_tokens{128};
     std::int64_t kv_hidden{128};
+    // The state image is an opaque blob, not a per-layer structure, so its shape is only a way to
+    // declare a byte count. Defaulting it to one "layer" lets a caller pin an exact image size
+    // without having to make it divide by the KV layer count.
+    std::int64_t state_layers{1};
     std::int64_t state_hidden{1600};
 };
 
@@ -114,7 +121,7 @@ bool round_trip(Connection& connection, const Case& c, int index) {
     const std::string state = make_payload(state_bytes, 0x77);
 
     const std::vector<std::int64_t> kv_shape{2, c.layers, c.chunk_tokens, c.kv_hidden};
-    const std::vector<std::int64_t> state_shape{c.layers, 1, c.state_hidden};
+    const std::vector<std::int64_t> state_shape{c.state_layers, 1, c.state_hidden};
 
     const CacheKey key = make_key(index, c.chunks, c.chunk_tokens);
     if (!connection.store(key, kv, kv_shape, state, state_shape)) {
@@ -142,8 +149,12 @@ bool round_trip(Connection& connection, const Case& c, int index) {
         }
     }
     if (got.state != state) {
-        std::printf("FAIL state of %d differs (%zu vs %zu B)\n", index, got.state.size(),
-                    state.size());
+        std::printf("FAIL state of %d differs (%zu vs %zu B); server shape:", index,
+                    got.state.size(), state.size());
+        for (const auto dimension : got.state_shape) {
+            std::printf(" %lld", static_cast<long long>(dimension));
+        }
+        std::printf("\n");
         return false;
     }
     return true;
@@ -182,6 +193,8 @@ int main(int argc, char** argv) {
             next(c.kv_hidden);
         } else if (flag == "--state-hidden") {
             next(c.state_hidden);
+        } else if (flag == "--state-layers") {
+            next(c.state_layers);
         } else if (flag == "--help") {
             std::printf("usage: lmcache_client_test [--server URL] [--instance N] [--connections N]\n"
                         "                           [--chunks N] [--layers N] [--chunk-tokens N]\n"
@@ -196,7 +209,7 @@ int main(int argc, char** argv) {
     const std::size_t kv_bytes = static_cast<std::size_t>(2 * c.layers * c.chunk_tokens * c.kv_hidden) *
                                  sizeof(std::uint16_t);
     const std::size_t state_bytes =
-        static_cast<std::size_t>(c.layers * c.state_hidden) * sizeof(std::uint32_t);
+        static_cast<std::size_t>(c.state_layers * c.state_hidden) * sizeof(std::uint32_t);
     std::printf("geometry: %d chunk(s) x %zu B KV + %zu B state = %.1f MB per store, %d connection(s)\n",
                 c.chunks, kv_bytes, state_bytes,
                 (static_cast<double>(kv_bytes) * c.chunks + static_cast<double>(state_bytes)) / 1048576.0,
@@ -207,8 +220,27 @@ int main(int argc, char** argv) {
         std::printf("FAIL open: %s\n", pool.error().c_str());
         return 1;
     }
-    if (!pool.register_context(make_registration(c.layers, c.chunk_tokens, c.kv_hidden,
-                                                 c.state_hidden))) {
+    const RegisterContext registration =
+        make_registration(c.layers, c.chunk_tokens, c.kv_hidden, c.state_layers, c.state_hidden);
+    if (const char* dump = std::getenv("LMCACHE_DUMP_REG")) {
+        const std::string payload = ninfer::core::lmcache::encode_register_context(registration);
+        std::ofstream out(dump, std::ios::binary);
+        out.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+        std::printf("dumped registration payload (%zu B) to %s\n", payload.size(), dump);
+    }
+    {
+        const GroupLayout& kv = registration.group_layouts[0];
+        const GroupLayout& state = registration.group_layouts[1];
+        std::printf("register: kv [2,%lld,%lld,%lld] -> %zu B, state [%lld,1,%lld] -> %zu B\n",
+                    static_cast<long long>(kv.num_layers),
+                    static_cast<long long>(c.chunk_tokens),
+                    static_cast<long long>(kv.hidden_dim_size),
+                    static_cast<std::size_t>(2 * kv.num_layers * c.chunk_tokens * kv.hidden_dim_size) * 2,
+                    static_cast<long long>(state.num_layers),
+                    static_cast<long long>(state.hidden_dim_size),
+                    static_cast<std::size_t>(state.num_layers * state.hidden_dim_size) * 4);
+    }
+    if (!pool.register_context(registration)) {
         std::printf("FAIL register: %s\n", pool.error().c_str());
         return 1;
     }
