@@ -292,6 +292,8 @@ public:
     // the caller is responsible for the KV half, which this cannot see.
     // Restores KV pages and a state image into one checkpoint record. State first: it refuses on a
     // fingerprint mismatch before any page is allocated.
+    // Diagnostic: import this checkpoint's own export into a new record and compare the bytes back.
+    void verify_import_round_trip(CheckpointHandle handle);
     [[nodiscard]] std::optional<CheckpointHandle> import_checkpoint(
         const CheckpointExport& kv, const std::vector<std::string>& state_shards,
         const ninfer::core::fingerprint::CheckpointFingerprint& want, std::string& error);    [[nodiscard]] std::optional<StateImageHandle> import_state(

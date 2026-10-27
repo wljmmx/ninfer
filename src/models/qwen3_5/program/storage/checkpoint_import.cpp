@@ -13,8 +13,10 @@
 // the bytes. Stated here rather than left as a surprise later.
 
 #include "core/checkpoint_fingerprint.h"
+#include "core/state_image_shards.h"
 #include "models/qwen3_5/program/program_impl.h"
 
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -41,7 +43,8 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
     // 1. State first: it validates the fingerprint and refuses before anything is allocated.
     const auto state = import_state(state_shards, want, error);
     if (!state) { return std::nullopt; }
-    if (state_store->role(*state) == StateImageRole::ActiveMutable) { state_store->freeze(*state); }
+    // adopt_host_replica already left it CheckpointImmutable, and freeze() cannot help here:
+    // it demands a Device slot, which a restored image does not have.
     state_store->retain_checkpoint_reference(*state);
 
     // 2. One logical page per page of the export, each backed only by a Host extent.
@@ -102,4 +105,46 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
     return handle;
 }
 
+// Diagnostic entry point, kept out of the dump hook so that hook stays one call long. Importing a
+// checkpoint's own export and comparing the bytes back is the cheapest way to prove that
+// create_host_backed_page, adopt_pages, import_state and import_checkpoint agree with the export.
+void ProgramImpl::verify_import_round_trip(CheckpointHandle handle) {
+    const auto source = export_checkpoint(handle);
+    const auto source_state = export_state(handle);
+    if (!source || !source_state) {
+        std::fprintf(stderr, "[ckpt] import check: nothing to export\n");
+        return;
+    }
+
+    ninfer::core::fingerprint::CheckpointFingerprint print;
+    host_state_fingerprint(print);
+    ninfer::core::state_shards::RegionSizes sizes;
+    sizes.conv_bytes  = print.state_conv_bytes;
+    sizes.layer_bytes = print.state_layer_bytes;
+    sizes.layers      = print.state_layers;
+    const std::uint64_t covered = sizes.conv_bytes + sizes.layer_bytes * sizes.layers;
+    sizes.tail_bytes = print.state_image_bytes > covered ? print.state_image_bytes - covered : 0;
+
+    const std::string image(reinterpret_cast<const char*>(source_state->bytes.data()),
+                            source_state->bytes.size());
+    const auto split = ninfer::core::state_shards::split(image, sizes, 6ull * 1024 * 1024);
+    if (!split.ok) {
+        std::fprintf(stderr, "[ckpt] import check: split failed: %s\n", split.error.c_str());
+        return;
+    }
+
+    std::string why;
+    const auto imported = import_checkpoint(*source, split.shards, print, why);
+    if (!imported) {
+        std::fprintf(stderr, "[ckpt] import check: REFUSED %s\n", why.c_str());
+        return;
+    }
+    const auto again = export_checkpoint(*imported);
+    const bool same = again.has_value() && again->kv_bytes == source->kv_bytes &&
+                      again->frontier == source->frontier;
+    std::fprintf(stderr, "[ckpt] import check: %s (%u pages, %zu B)\n",
+                 same ? "KV round-trip OK" : "KV MISMATCH",
+                 again ? again->page_count : 0u,
+                 again ? again->kv_bytes.size() : 0);
+}
 } // namespace ninfer::models::qwen3_5::detail

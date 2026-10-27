@@ -291,6 +291,10 @@ public:
         }
         object.host_slot     = slot;
         object.content_epoch = next_epoch();
+        // A restored image is a checkpoint by construction: freeze() cannot be used afterwards
+        // because it demands a Device slot, and a checkpoint reference cannot be taken unless the
+        // role is already CheckpointImmutable.
+        object.role = StateImageRole::CheckpointImmutable;
         return true;
     }
     void move_checkpoint_to_active(StateImageHandle handle) {
