@@ -133,9 +133,12 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
         error = "could not map the restored pages";
         return std::nullopt;
     }
-    // No frontier bookkeeping on the address: commit_frontier() only accepts an active address and a
-    // checkpoint address is inactive by design. The pages stay alive through the read reference
-    // adopt_pages() took, and the frontier lives on the record, which is what export reads.
+    // Commit the frontier and protect it. commit_frontier() is for active addresses only, so the
+    // inactive twin does the same work here: it also fills each page's committed_columns, which
+    // materialize() left at 0 -- without that the pages look empty to anything reading coverage, and
+    // the protection below would refuse a frontier above zero.
+    text_kv_addresses->commit_inactive_frontier(*address, kv.frontier);
+    text_kv_addresses->set_checkpoint_requirement(*address, kv.frontier);
 
     // 5. The record.
     const auto handle = reserve_checkpoint();

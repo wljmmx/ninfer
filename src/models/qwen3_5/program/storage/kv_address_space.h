@@ -805,6 +805,37 @@ public:
         address.committed_frontier = frontier;
     }
 
+    // Commits a frontier on an INACTIVE address, which is what a restored checkpoint is.
+    //
+    // commit_frontier() does the same work but demands an active address, because on the live path
+    // the frontier only advances through decode. A restored checkpoint has no active phase to hide
+    // in, so without this its committed frontier stays 0 -- with two consequences: the pages carry
+    // committed_columns = 0 (materialize() zeroes them), so anything reading coverage sees empty
+    // pages, and set_checkpoint_requirement() refuses to protect a frontier above 0, leaving the
+    // checkpoint open to eviction.
+    //
+    // Refuses an active address: the live path must keep using commit_frontier(), which also keeps
+    // the invariants only an active sequence has.
+    void commit_inactive_frontier(KVAddressSpaceHandle handle, std::uint32_t frontier) {
+        Address& address = require(handle);
+        if (address.active || address.row || frontier < address.committed_frontier ||
+            pages_for_tokens(frontier) > address.page_count) {
+            throw std::invalid_argument("KV inactive frontier is invalid");
+        }
+        if (frontier == address.committed_frontier) { return; }
+        const std::uint32_t page_size          = static_cast<std::uint32_t>(kPagedKVPageSize);
+        const std::uint32_t first_changed_page = address.committed_frontier / page_size;
+        const std::uint32_t final_changed_page = (frontier - 1U) / page_size;
+        for (std::uint32_t page = first_changed_page; page <= final_changed_page; ++page) {
+            const std::uint32_t begin   = page * static_cast<std::uint32_t>(kPagedKVPageSize);
+            const std::uint32_t columns = std::min(page_size, frontier - begin);
+            if (columns > pages_->committed_columns(membership(address, page))) {
+                pages_->commit_coverage(membership(address, page), columns);
+            }
+        }
+        address.committed_frontier = frontier;
+    }
+
     void destructive_truncate(KVAddressSpaceHandle handle, std::uint32_t frontier) {
         Address& address = require_active(handle);
         if (frontier > address.committed_frontier) {
