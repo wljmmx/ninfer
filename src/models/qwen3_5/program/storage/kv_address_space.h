@@ -218,6 +218,36 @@ public:
         return KVAddressSpaceHandle(this, index, address.generation);
     }
 
+    // Maps existing logical pages into a fresh, inactive address without allocating anything.
+    //
+    // Import needs this. create_inactive() yields an address with no membership; prepare_activation()
+    // would allocate Device pages and commit_activation() refuses any page that is not Device
+    // resident; prepare_prefix_fork() copies membership from another address rather than from bytes.
+    // So a restored checkpoint had no way to become an address at all.
+    //
+    // These are checkpoint pages: read-only, so no writer reference, no execution row, no active
+    // flag. Whatever replicas they already have are left alone -- promoting them to Device stays the
+    // job of restore_addressed_host_pages(), which also republishes into the execution row.
+    [[nodiscard]] bool adopt_pages(KVAddressSpaceHandle handle,
+                                   std::span<const LogicalKVPageHandle> pages) {
+        if (!valid(handle) || pages.empty()) { return false; }
+        Address& address = require(handle);
+        if (address.active || address.row || address.reservation.valid() ||
+            address.page_count != 0) {
+            return false;  // only a brand-new address may be given membership
+        }
+        if (pages.size() > page_capacity_) { return false; }
+        // Check every page before writing any: a half-adopted address would be worse than a refusal.
+        for (const LogicalKVPageHandle page : pages) {
+            if (!pages_->valid(page) || !pages_->can_retain_reference(page, false)) { return false; }
+        }
+        for (std::size_t index = 0; index < pages.size(); ++index) {
+            directory_slot(address.directory, static_cast<std::uint32_t>(index)) = pages[index];
+            pages_->retain_reference(pages[index], false);
+        }
+        address.page_count = static_cast<std::uint32_t>(pages.size());
+        return true;
+    }
     [[nodiscard]] bool valid(KVAddressSpaceHandle handle) const noexcept {
         return handle.owner_ == this && handle.index_ < addresses_.size() &&
                addresses_[handle.index_].occupied &&
