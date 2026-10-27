@@ -120,6 +120,30 @@ public:
         return LogicalKVPageHandle(this, index, page.generation);
     }
 
+    // Creates a logical page that owns no Device replica. The restore path needs this and nothing
+    // else in the store offers it: every other entry point takes a DeviceKVPageReservation first,
+    // because the live path is Device-first -- reserve, materialize, demote when short. A restored
+    // checkpoint arrives the other way round, host bytes looking for a page, and forcing it through
+    // a Device reservation would allocate a full page only to hand it straight back.
+    //
+    // writer_references stays 0: these pages are read-only until something promotes them. Attaching
+    // the Host extent is the caller's job (HostKVExtents::prepare/publish), which is also where the
+    // extent's attachment rules are enforced.
+    [[nodiscard]] LogicalKVPageHandle create_host_backed_page() {
+        if (free_count_ == 0) {
+            throw std::logic_error("logical KV descriptors exhausted creating a host-backed page");
+        }
+        const std::uint32_t index = free_[--free_count_];
+        Page& page                = pages_[index];
+        page.content_epoch     = next_epoch(page.content_epoch);
+        page.committed_columns = 0;
+        page.references        = 1;
+        page.active_references = 0;
+        page.writer_references = 0;
+        page.protected_columns = 0;
+        page.occupied          = true;
+        return LogicalKVPageHandle(this, index, page.generation);
+    }
     void materialize(DeviceKVPageReservation& reservation,
                      std::span<LogicalKVPageHandle> destinations,
                      std::optional<LogicalKVPageHandle> preferred_predecessor = std::nullopt) {
