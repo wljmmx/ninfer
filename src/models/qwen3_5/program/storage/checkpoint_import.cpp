@@ -77,7 +77,19 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
             return std::nullopt;
         }
         std::memcpy(view.data(), kv.kv_bytes.data(), expected);
+        std::fprintf(stderr, "[ckpt] import: after memcpy, view[0]=0x%02X want=0x%02X\n",
+                     static_cast<unsigned>(view.data()[0]),
+                     static_cast<unsigned>(kv.kv_bytes[0]));
         const auto capability = host_kv_extents->publish(std::move(*reservation));
+        {
+            const auto check = host_kv_extents->page_view(*text_kv_pages, pages[0]);
+            if (check && check->valid()) {
+                std::fprintf(stderr, "[ckpt] import: after publish, page0[0]=0x%02X\n",
+                             static_cast<unsigned>(check->data()[0]));
+            } else {
+                std::fprintf(stderr, "[ckpt] import: after publish, page0 view invalid\n");
+            }
+        }
 
         std::vector<DeviceKVPageHandle> device_handles;
         device_handles.reserve(pages.size());
@@ -198,8 +210,32 @@ void ProgramImpl::verify_import_round_trip(CheckpointHandle handle) {
                          stride, dev, host, spilled, pages);
         }
     }
-    const bool same = again.has_value() && again->kv_bytes == source->kv_bytes &&
-                      again->frontier == source->frontier;
+    // Page by page, then byte by byte: "the bytes differ" is not actionable, but "page 0 differs at
+    // byte 0" points at the copy, and "page 3 differs at byte 0" points at ordering or offsets.
+    bool same = again.has_value() && again->kv_bytes.size() == source->kv_bytes.size() &&
+                again->frontier == source->frontier;
+    if (same) {
+        for (std::uint32_t page = 0; page < source->page_count; ++page) {
+            const std::size_t base = static_cast<std::size_t>(page) * source->page_bytes;
+            if (std::memcmp(again->kv_bytes.data() + base, source->kv_bytes.data() + base,
+                            source->page_bytes) == 0) {
+                continue;
+            }
+            std::size_t offset = 0;
+            while (offset < source->page_bytes &&
+                   again->kv_bytes[base + offset] == source->kv_bytes[base + offset]) {
+                ++offset;
+            }
+            std::fprintf(stderr,
+                         "[ckpt] import check: first difference page %u, byte %zu of %zu "
+                         "(0x%02X vs 0x%02X)\n",
+                         page, offset, source->page_bytes,
+                         static_cast<unsigned>(again->kv_bytes[base + offset]),
+                         static_cast<unsigned>(source->kv_bytes[base + offset]));
+            same = false;
+            break;
+        }
+    }
     std::fprintf(stderr, "[ckpt] import check: %s (%u pages, %zu B)\n",
                  same ? "KV round-trip OK" : "KV MISMATCH",
                  again ? again->page_count : 0u,
