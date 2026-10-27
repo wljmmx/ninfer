@@ -450,6 +450,9 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         // twelve gigabytes against 36 for the route-first default, and below that the default wins
         // (105/86 at one/four lanes). The switch is therefore made on the widest step seen.
         const bool slru_active = slru_policy_ || (auto_slru_ && lanes_seen_ >= 6);
+        // A pure SLRU run owns the whole pool: the ring, the seeding and the promotion below are
+        // for the region split, and mixing them into the same path is what left it half converted.
+        const bool pure_slru = slru_policy_ && !regions_ && epoch_steps_ == 0;
         const auto spill_cap = [&]() -> std::size_t {
             if (slru_active) { return 0; }
             if (!regions_) {
@@ -510,7 +513,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             // consulted - that is the point of the comparison.
             constexpr std::uint32_t kEmpty = 0xFFFFFFFFU;
             // SLRU owns the hot region only: the spill ring below is not its to evict.
-            const auto n_slots = hot_cap;
+            const auto n_slots = pure_slru ? static_cast<std::size_t>(capacity) : hot_cap;
             if (slru_expert_.size() != n_slots) {
                 slru_expert_.assign(n_slots, kEmpty);
                 slru_of_expert_.assign(count_, -1);
@@ -605,7 +608,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             if (demand_.size() != count_) { demand_.assign(count_, 0.0F); }
             for (auto& value : demand_) { value *= 0.9F; }
             for (const auto expert : need) { demand_[expert] += 1.0F; }
-            if (!hot_seeded_) {
+            if (!pure_slru && !hot_seeded_) {
                 // Seed from the first step's routes: the hot region then starts where the routing
                 // is, instead of where an un-converged score says it should be.
                 for (const auto expert : need) {
