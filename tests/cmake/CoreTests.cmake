@@ -94,3 +94,10 @@ ninfer_add_test(ninfer_expert_cache_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../t
 ninfer_add_test(ninfer_kv_seam_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/kv_seam_test.cpp"
   LIBRARIES ninfer_core)
+
+# The RESP transport for the LMCache remote tier: encoding always runs, the round trip runs only
+# when NINFER_RESP_PORT points at a Redis (77 = skipped otherwise).
+ninfer_add_test(ninfer_resp_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/resp_test.cpp"
+  LIBRARIES ninfer_core $<$<PLATFORM_ID:Windows>:ws2_32>)
+set_tests_properties(ninfer_resp_test PROPERTIES SKIP_RETURN_CODE 77)
