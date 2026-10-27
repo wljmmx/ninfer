@@ -120,6 +120,13 @@ public:
         return LogicalKVPageHandle(this, index, page.generation);
     }
 
+    // DO NOT USE. Measured 2026-10-27: a page without a Device replica is not a legal page in this
+    // store. can_pin_source() and can_pin_active_source() both require device_replica.has_value(),
+    // and HostKVExtents::prepare() refuses every unpinnable page, so a host-backed page can never
+    // be given a Host extent. The three tiers are strictly Device -> Host arena -> spill file; the
+    // memory tier is reached by demotion, never by construction. Kept only until the import path is
+    // rewritten Device-first, then deleted.
+    //
     // Creates a logical page that owns no Device replica. The restore path needs this and nothing
     // else in the store offers it: every other entry point takes a DeviceKVPageReservation first,
     // because the live path is Device-first -- reserve, materialize, demote when short. A restored
