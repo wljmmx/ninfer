@@ -296,7 +296,10 @@ public:
     void verify_import_round_trip(CheckpointHandle handle);
     [[nodiscard]] std::optional<CheckpointHandle> import_checkpoint(
         const CheckpointExport& kv, const std::vector<std::string>& state_shards,
-        const ninfer::core::fingerprint::CheckpointFingerprint& want, std::string& error);    [[nodiscard]] std::optional<StateImageHandle> import_state(
+        const ninfer::core::fingerprint::CheckpointFingerprint& want, std::string& error,
+        std::shared_ptr<const PreparedCaptureBacking> identity = nullptr,
+        const PrefixShortlistKey* key = nullptr);
+    [[nodiscard]] std::optional<StateImageHandle> import_state(
         const std::vector<std::string>& shards,
         const ninfer::core::fingerprint::CheckpointFingerprint& want, std::string& error);
     // Fills the state-side fields of a fingerprint from the live layout.

@@ -25,7 +25,8 @@ namespace ninfer::models::qwen3_5::detail {
 
 std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
     const CheckpointExport& kv, const std::vector<std::string>& state_shards,
-    const ninfer::core::fingerprint::CheckpointFingerprint& want, std::string& error) {
+    const ninfer::core::fingerprint::CheckpointFingerprint& want, std::string& error,
+    std::shared_ptr<const PreparedCaptureBacking> identity, const PrefixShortlistKey* key) {
     error.clear();
     if (!text_kv_pages || !text_kv_addresses || !host_kv_extents) {
         error = "no KV storage in this program";
@@ -150,9 +151,14 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
     }
     auto history  = std::make_shared<KVHistory>();
     history->text = *address;
+    // Identity and key come from the request that is restoring this prefix. Without them the record
+    // is readable but checkpoint_matches() will never accept it -- the comparison is on token
+    // content, not on bytes, so nothing about the payload can substitute for them.
     checkpoints[handle->index].value =
         CheckpointState{.kv       = std::move(history),
                         .state    = *state,
+                        .identity = std::move(identity),
+                        .key      = key != nullptr ? *key : PrefixShortlistKey{},
                         .frontier = kv.frontier};
     checkpoints[handle->index].reserved = false;
     return handle;
