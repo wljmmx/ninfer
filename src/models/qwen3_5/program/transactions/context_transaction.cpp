@@ -179,6 +179,35 @@ void dump_exported_checkpoint(ProgramImpl& program, CheckpointHandle handle, con
     std::fclose(file);
     std::fprintf(stderr, "[ckpt] dumped %s (%u pages x %zu B)\n", path,
                  static_cast<unsigned>(out->page_count), out->page_bytes);
+
+    // The state image is the other half of a checkpoint, so it goes beside the KV under the same
+    // frontier/index/tag. Hashing is deliberately left to the caller: the bytes are compared outside
+    // the process, the same way the KV dump was checked.
+    if (const auto state = program.export_state(handle)) {
+        std::snprintf(path, sizeof path, "%s/ckpt-%u-%u%s.state", directory,
+                      static_cast<unsigned>(out->frontier),
+                      static_cast<unsigned>(handle.index), tag);
+        std::FILE* state_file = std::fopen(path, "wb");
+        if (state_file == nullptr) {
+            std::fprintf(stderr, "[ckpt] cannot open %s\n", path);
+            return;
+        }
+        const std::uint32_t header[6]{state->image_bytes, state->layers,
+                                      static_cast<std::uint32_t>(state->conv_channels),
+                                      static_cast<std::uint32_t>(state->value_heads),
+                                      static_cast<std::uint32_t>(state->hidden),
+                                      state->has_dflash_local ? 1u : 0u};
+        std::fwrite(header, sizeof header, 1, state_file);
+        std::fwrite(state->bytes.data(), 1, state->bytes.size(), state_file);
+        std::fclose(state_file);
+        std::fprintf(stderr,
+                     "[ckpt] state %s (%u B, layers=%u hidden=%d, host_copy_materialised=%d)\n",
+                     path, state->image_bytes, static_cast<unsigned>(state->layers), state->hidden,
+                     state->materialised_host_copy ? 1 : 0);
+    } else {
+        std::fprintf(stderr, "[ckpt] state export refused for checkpoint %u\n",
+                     static_cast<unsigned>(handle.index));
+    }
 }
 
 } // namespace
