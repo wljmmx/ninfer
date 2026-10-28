@@ -120,37 +120,12 @@ public:
         return LogicalKVPageHandle(this, index, page.generation);
     }
 
-    // DO NOT USE. Measured 2026-10-27: a page without a Device replica is not a legal page in this
-    // store. can_pin_source() and can_pin_active_source() both require device_replica.has_value(),
-    // and HostKVExtents::prepare() refuses every unpinnable page, so a host-backed page can never
-    // be given a Host extent. The three tiers are strictly Device -> Host arena -> spill file; the
-    // memory tier is reached by demotion, never by construction. Kept only until the import path is
-    // rewritten Device-first, then deleted.
-    //
-    // Creates a logical page that owns no Device replica. The restore path needs this and nothing
-    // else in the store offers it: every other entry point takes a DeviceKVPageReservation first,
-    // because the live path is Device-first -- reserve, materialize, demote when short. A restored
-    // checkpoint arrives the other way round, host bytes looking for a page, and forcing it through
-    // a Device reservation would allocate a full page only to hand it straight back.
-    //
-    // writer_references stays 0: these pages are read-only until something promotes them. Attaching
-    // the Host extent is the caller's job (HostKVExtents::prepare/publish), which is also where the
-    // extent's attachment rules are enforced.
-    [[nodiscard]] LogicalKVPageHandle create_host_backed_page() {
-        if (free_count_ == 0) {
-            throw std::logic_error("logical KV descriptors exhausted creating a host-backed page");
-        }
-        const std::uint32_t index = free_[--free_count_];
-        Page& page                = pages_[index];
-        page.content_epoch     = next_epoch(page.content_epoch);
-        page.committed_columns = 0;
-        page.references        = 1;
-        page.active_references = 0;
-        page.writer_references = 0;
-        page.protected_columns = 0;
-        page.occupied          = true;
-        return LogicalKVPageHandle(this, index, page.generation);
-    }
+    // A page without a Device replica used to be constructible here (create_host_backed_page). It is
+    // gone: can_pin_source() and can_pin_active_source() both require a Device replica, HostKVExtents
+    // ::prepare() refuses every unpinnable page, and the import path now reserves Device pages first
+    // and copies the payload down. The three tiers are strictly Device -> Host arena -> spill file;
+    // the memory tier is reached by demotion, never by construction. Deleting it is the point: a
+    // constructor that produces a page no other component accepts is a trap, not an option.
     void materialize(DeviceKVPageReservation& reservation,
                      std::span<LogicalKVPageHandle> destinations,
                      std::optional<LogicalKVPageHandle> preferred_predecessor = std::nullopt) {
