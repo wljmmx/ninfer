@@ -31,6 +31,20 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint_current_layout(
     ninfer::core::fingerprint::CheckpointFingerprint want;
     host_state_fingerprint(want);
 
+    // Coverage and pages have to describe the same amount of text. A record whose frontier says 384
+    // while its payload holds 8 pages would commit an address whose pages and coverage disagree --
+    // that is wrong KV, not a miss, and nothing downstream would notice.
+    const auto geometry = checkpoint_geometry();
+    if (geometry.page_tokens > 0 &&
+        static_cast<std::uint64_t>(kv.page_count) * geometry.page_tokens != kv.frontier) {
+        if (error != nullptr) {
+            *error = "frontier " + std::to_string(kv.frontier) + " does not match " +
+                     std::to_string(kv.page_count) + " page(s) x " +
+                     std::to_string(geometry.page_tokens);
+        }
+        return std::nullopt;
+    }
+
     // A cache stores the image as one blob (it has no reason to shard it), while the import path
     // joins self-describing shards and refuses anything without a header. Splitting here keeps that
     // requirement local: the caller hands over what it has, and the format it has to be in stays a
