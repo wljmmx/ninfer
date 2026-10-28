@@ -62,6 +62,10 @@ struct GroupSpec {
 
 struct BridgeConfig {
     std::string model_name;
+    // Part of the object key. Two entries that differ only in KV format share nothing else -- model
+    // name and tokens are the same -- so a format fingerprint belongs here. Empty means "no
+    // isolation", which is only safe while one format is ever used for a given model.
+    std::string cache_salt;
     // Tokens in one engine page, and how many pages go into one cache chunk. Both come from the
     // caller: the page size is a property of the engine, the chunk size a choice made against it.
     std::int64_t page_tokens{64};
@@ -289,6 +293,7 @@ private:
         out.start       = 0;
         out.end         = static_cast<std::int64_t>(key.tokens.size());
         out.request_id  = key.request_id;
+        out.cache_salt  = config_.cache_salt;
         return out;
     }
 

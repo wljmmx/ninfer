@@ -166,6 +166,21 @@ void collision_check(const ClientOptions& options, std::int64_t instance, std::s
     } else if (!hit) {
         std::printf("[collision] no hit -- the key did include the geometry this time\n");
     }
+
+    // Now the defence: the same lookup with the format named in cache_salt. If this still hit, the
+    // salt is not doing its job and a format change would silently serve the old bytes.
+    BridgeConfig salted = rk;
+    salted.cache_salt = "rk4v4";
+    Bridge guarded;
+    if (!guarded.open(options, 1, salted, instance + 501)) {
+        std::printf("FAIL collision setup (salted): %s\n", guarded.error().c_str());
+        return;
+    }
+    std::vector<std::byte> guarded_kv;
+    std::vector<std::byte> guarded_state;
+    const bool guarded_hit = guarded.restore(key, &guarded_kv, &guarded_state);
+    std::printf("[collision] with the format in cache_salt: hit=%s%s\n", guarded_hit ? "yes" : "no",
+                guarded_hit ? " -- THE SALT IS NOT ISOLATING" : " (isolated, as intended)");
 }
 
 
