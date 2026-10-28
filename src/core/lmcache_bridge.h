@@ -136,6 +136,13 @@ public:
             error_ = "unknown dtype in a group layout";
             return false;
         }
+        // '@' separates the fields of LMCache's own cache key, so a salt containing one is rejected
+        // server-side by raising -- which produces no reply frame, and the client sees only a receive
+        // timeout. Refusing here turns a two-minute stall into a startup error.
+        if (config_.cache_salt.find('@') != std::string::npos) {
+            error_ = "cache_salt must not contain '@' (it is the server's key separator)";
+            return false;
+        }
         if (config_.kv.kv_size != 1 && config_.kv.kv_size != 2) {
             error_ = "kv_size must be 1 (single plane) or 2 (separate K/V)";
             return false;
@@ -308,12 +315,19 @@ private:
 
     [[nodiscard]] CacheKey make_key(const BridgeKey& key) const {
         CacheKey out;
-        out.model_name  = config_.model_name;
-        out.world_size  = 1;
-        out.worker_id   = 0;
-        out.token_bytes = pack_tokens(key.tokens);
+        out.model_name = config_.model_name;
+        out.world_size = 1;
+        out.worker_id  = 0;
+        // Only complete chunks exist as far as the server is concerned: get_hashes() asserts that
+        // the range ends on a chunk boundary, and a request that trips the assert produces no reply
+        // frame at all. Truncating here is the difference between a miss and a stall.
+        const std::size_t chunk = static_cast<std::size_t>(config_.chunk_tokens());
+        const std::size_t complete = chunk == 0 ? 0 : key.tokens.size() / chunk * chunk;
+        std::vector<std::int64_t> kept(key.tokens.begin(),
+                                       key.tokens.begin() + static_cast<std::ptrdiff_t>(complete));
+        out.token_bytes = pack_tokens(kept);
         out.start       = 0;
-        out.end         = static_cast<std::int64_t>(key.tokens.size());
+        out.end         = static_cast<std::int64_t>(complete);
         out.request_id  = key.request_id;
         out.cache_salt  = config_.cache_salt;
         return out;

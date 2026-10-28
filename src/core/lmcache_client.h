@@ -200,8 +200,12 @@ public:
         std::string body;
         msgpack::Writer request;
         request.string(key.request_id);
+        // Short on purpose. This waits for a prefetch to finish, and on a miss there is no prefetch
+        // to finish -- the request then sits here until the timeout expires, which on a best-effort
+        // path is indistinguishable from a hang. A healthy prefetch of one chunk completes in
+        // milliseconds; the retrieve below is what actually carries the payload.
         msgpack::Writer timeout;
-        timeout.real(30.0);
+        timeout.real(0.5);
         return call(kWaitPrefetch, {request.take(), timeout.take()}, &body);
     }
 

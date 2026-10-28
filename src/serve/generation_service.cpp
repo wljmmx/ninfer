@@ -23,8 +23,117 @@
 namespace ninfer::serve {
 
 #if NINFER_HAVE_LMCACHE
+namespace {
+
+// The engine's whole view of the cache: one lookup, no transport types. Kept separate from Bridge so
+// the engine side never sees a key, a connection or a chunk.
+class LmcacheBackend final : public ninfer::CheckpointCacheBackend {
+public:
+    // Second step of a two-step handoff. The backend has to exist before the engine because the
+    // engine takes it in its options; it cannot be configured until the pools exist, because it
+    // needs page_bytes and the image size. fetch() stays silent until this succeeds, so nothing is
+    // ever registered against a zero-size layout.
+    bool configure(const ninfer::CacheGeometry& geometry, const std::string& model_name,
+                   int connections) {
+        if (geometry.page_bytes == 0 || geometry.page_tokens <= 0 ||
+            geometry.state_image_bytes == 0) {
+            error_ = "geometry is not ready";
+            return false;
+        }
+        ninfer::core::lmcache::BridgeConfig config;
+        config.model_name      = model_name;
+        config.page_tokens     = geometry.page_tokens;
+        config.pages_per_chunk = 2;
+        config.page_bytes      = geometry.page_bytes;
+        // Opaque bytes, one plane (v6 1p): a quantized format has four physical planes per layer and
+        // the server can express two, so the shape states the byte count and nothing else.
+        config.kv =
+            ninfer::core::lmcache::GroupSpec::exact("uint8", 2 * geometry.page_bytes);
+        config.state =
+            ninfer::core::lmcache::GroupSpec::exact("uint8", geometry.state_image_bytes);
+        config.state.window_chunks = 1;
+        config.state.recurrent     = true;
+        // The key is the model and the tokens; the sizes are what change when the format or the page
+        // geometry does, so they are what isolates one from the other.
+        // ':' and not '@': LMCache forbids '@' in a salt because it separates the fields of its own
+        // cache key, and it answers a violating request by raising -- no reply frame at all, so the
+        // client's only symptom is a receive timeout. Measured: a two-minute stall.
+        config.cache_salt = model_name + ":" + std::to_string(geometry.page_bytes) + ":" +
+                            std::to_string(geometry.page_tokens) + ":" +
+                            std::to_string(geometry.state_image_bytes);
+        page_bytes_ = geometry.page_bytes;
+        // A lookup resolves complete chunks only. Below one chunk there is nothing to ask about --
+        // and the server answers such a request with no frames at all, so the client sits on its
+        // receive timeout. Measured: a 22-token prompt held a request for two minutes.
+        chunk_tokens_ =
+            static_cast<std::size_t>(geometry.page_tokens) * static_cast<std::size_t>(2);
+
+        ninfer::core::lmcache::ClientOptions client;
+        if (const char* endpoint = std::getenv("NINFER_LMCACHE_ENDPOINT");
+            endpoint != nullptr && *endpoint != '\0') {
+            client.endpoint = endpoint;
+        }
+        // Restore is best-effort: a healthy round trip is about 1.3 s, so a much longer wait only
+        // means the server is not answering -- and there it answers with silence, not an error. The
+        // default 120 s would turn one bad payload into a two-minute request.
+        client.receive_timeout_ms = 5000;
+        // A fresh id per process start: the server does not replace the layout of an id it already
+        // knows.
+        const std::int64_t instance =
+            static_cast<std::int64_t>(std::chrono::system_clock::now().time_since_epoch().count());
+        bridge_ = std::make_unique<ninfer::core::lmcache::Bridge>();
+        if (!bridge_->open(client, connections, config, instance)) {
+            error_ = bridge_->error();
+            bridge_.reset();
+            return false;
+        }
+        ready_.store(true);
+        return true;
+    }
+
+    [[nodiscard]] const std::string& error() const { return error_; }
+
+    [[nodiscard]] std::optional<ninfer::CachedCheckpoint>
+    fetch(std::span<const TokenId> prompt_tokens) override {
+        if (!ready_.load() || bridge_ == nullptr || prompt_tokens.empty()) { return std::nullopt; }
+        // Fewer tokens than one chunk means no complete chunk to look up. The server replies to such
+        // a lookup with nothing at all, so asking costs a full receive timeout.
+        if (chunk_tokens_ != 0 && prompt_tokens.size() < chunk_tokens_) { return std::nullopt; }
+        ninfer::core::lmcache::BridgeKey key;
+        key.tokens.assign(prompt_tokens.begin(), prompt_tokens.end());
+        // The server keys its token session by request_id and does not reset the rolling hash when
+        // the token buffer is replaced, so this has to be unique per call, not per process.
+        key.request_id = "svc-" + std::to_string(instance_tag_) + "-" + std::to_string(++sequence_);
+
+        std::vector<std::byte> kv;
+        std::vector<std::byte> state;
+        if (!bridge_->restore(key, &kv, &state)) { return std::nullopt; }
+        if (page_bytes_ == 0 || kv.size() % page_bytes_ != 0) { return std::nullopt; }
+
+        ninfer::CachedCheckpoint out;
+        out.page_bytes = page_bytes_;
+        out.kv_bytes   = std::move(kv);
+        // One element: the image travels whole (v6 1n). The sharded layout exists for transport
+        // sizing, not for import.
+        out.state_shards.emplace_back(reinterpret_cast<const char*>(state.data()), state.size());
+        return out;
+    }
+
+private:
+    std::unique_ptr<ninfer::core::lmcache::Bridge> bridge_;
+    std::atomic<bool> ready_{false};
+    std::atomic<std::uint64_t> sequence_{0};
+    std::size_t page_bytes_ = 0;
+    std::size_t chunk_tokens_ = 0;
+    std::int64_t instance_tag_ =
+        static_cast<std::int64_t>(std::chrono::system_clock::now().time_since_epoch().count());
+    std::string error_;
+};
+
+}  // namespace
+
 struct GenerationService::CheckpointCache {
-    ninfer::core::lmcache::Bridge bridge;
+    std::shared_ptr<LmcacheBackend> backend;
 };
 #else
 struct GenerationService::CheckpointCache {};
@@ -36,64 +145,27 @@ bool GenerationService::attach_checkpoint_cache() {
 #if !NINFER_HAVE_LMCACHE
     return false;
 #else
-    const char* enabled = std::getenv("NINFER_LMCACHE_RESTORE");
-    if (enabled == nullptr || *enabled == '\0' || std::strcmp(enabled, "0") == 0) { return false; }
+    // The switch was read at construction, where the backend had to exist so the engine could take
+    // it in its options. No holder means it was off then.
+    if (!checkpoint_cache_ || !checkpoint_cache_->backend) { return false; }
 
     const ninfer::CacheGeometry geometry = cache_geometry();
-    if (geometry.page_bytes == 0 || geometry.page_tokens <= 0 || geometry.state_image_bytes == 0) {
-        // The pools are not up. Registering now would fix a zero-byte layout in place, and the
-        // server would then reject every payload; refusing here keeps the failure visible.
-        std::fprintf(stderr, "[lmcache] geometry is not ready; the cache stays off\n");
-        return false;
-    }
-
-    ninfer::core::lmcache::BridgeConfig config;
-    config.model_name      = load_summary().model_name;
-    config.page_tokens     = geometry.page_tokens;
-    // Two pages per chunk: a whole number of pages, and the unit the restore was measured at.
-    config.pages_per_chunk = 2;
-    config.page_bytes      = geometry.page_bytes;
-    // Opaque bytes, one plane: a quantized format has four physical planes per layer while the
-    // server can express two, so the shape states the byte count and nothing else (v6 1p).
-    config.kv = ninfer::core::lmcache::GroupSpec::exact("uint8", 2 * geometry.page_bytes);
-    config.state =
-        ninfer::core::lmcache::GroupSpec::exact("uint8", geometry.state_image_bytes);
-    config.state.window_chunks = 1;
-    config.state.recurrent     = true;
-    // The key is the model name and the token sequence. Two runs that differ only in KV format or
-    // page geometry share both, so the sizes -- which change with the format -- go in the salt.
-    config.cache_salt = config.model_name + "@" + std::to_string(geometry.page_bytes) + "@" +
-                        std::to_string(geometry.page_tokens) + "@" +
-                        std::to_string(geometry.state_image_bytes);
-
-    ninfer::core::lmcache::ClientOptions client;
-    if (const char* endpoint = std::getenv("NINFER_LMCACHE_ENDPOINT");
-        endpoint != nullptr && *endpoint != '\0') {
-        client.endpoint = endpoint;
-    }
     int connections = 4;
     if (const char* value = std::getenv("NINFER_LMCACHE_CONNECTIONS")) {
         const int parsed = std::atoi(value);
         if (parsed > 0) { connections = parsed; }
     }
-
-    // A fresh id per process start: the server does not replace the layout of an id it already
-    // knows, so a recycled id would keep the shapes from an earlier run.
-    const std::int64_t instance =
-        static_cast<std::int64_t>(std::chrono::system_clock::now().time_since_epoch().count());
-
-    auto holder = std::make_unique<CheckpointCache>();
-    if (!holder->bridge.open(client, connections, config, instance)) {
+    if (!checkpoint_cache_->backend->configure(geometry, load_summary().model_name, connections)) {
         std::fprintf(stderr, "[lmcache] could not attach (%s); the cache stays off\n",
-                     holder->bridge.error().c_str());
+                     checkpoint_cache_->backend->error().c_str());
+        checkpoint_cache_.reset();
         return false;
     }
     std::fprintf(stderr,
                  "[lmcache] attached | page %zu B, %lld token(s), state image %zu B, %d connection(s)"
-                 ", instance %lld\n",
+                 "\n",
                  geometry.page_bytes, static_cast<long long>(geometry.page_tokens),
-                 geometry.state_image_bytes, connections, static_cast<long long>(instance));
-    checkpoint_cache_ = std::move(holder);
+                 geometry.state_image_bytes, connections);
     return true;
 #endif
 }
@@ -420,6 +492,18 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
         (void)setenv("NINFER_KV_IDLE_RECLAIM_MS", text.c_str(), 1);
 #endif
     }
+    // Two-step handoff. The engine takes the backend through its options, so it has to exist before
+    // the engine is built; but it cannot be configured until the pools exist, because it needs the
+    // page size and the image size. Hand over an empty one now, fill it in at attach time.
+    if (const char* enabled = std::getenv("NINFER_LMCACHE_RESTORE");
+        enabled != nullptr && *enabled != '\0' && std::strcmp(enabled, "0") != 0) {
+#if NINFER_HAVE_LMCACHE
+        auto backend                   = std::make_shared<LmcacheBackend>();
+        checkpoint_cache_              = std::make_unique<CheckpointCache>();
+        checkpoint_cache_->backend     = backend;
+        engine_options.checkpoint_cache = backend;
+#endif
+    }
     engine_           = std::make_unique<ninfer::Engine>(std::move(engine_options));
     request_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
@@ -660,3 +744,4 @@ void GenerationService::warmup() {
 }
 
 } // namespace ninfer::serve
+
