@@ -72,6 +72,10 @@ int main(int argc, char** argv) {
                          geometry.page_bytes, geometry.page_tokens,
                          geometry.state_image_bytes);
         }
+        // Off unless NINFER_LMCACHE_RESTORE asks for it, and never fatal: the cache is an
+        // accelerator, so a server without it serves every request the same way.
+        logger->info("checkpoint cache | {}",
+                     service.attach_checkpoint_cache() ? "attached" : "off");
 
         using Clock                            = std::chrono::steady_clock;
         const Clock::time_point warmup_started = Clock::now();

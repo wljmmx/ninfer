@@ -116,6 +116,9 @@ struct PreparedRequest {
 class GenerationService {
 public:
     explicit GenerationService(ServeOptions options, StartupObserver startup_observer = {});
+    // Out of line: the checkpoint-cache holder is defined in the .cpp so that its type -- and the
+    // libzmq dependency behind it -- stays out of this header.
+    ~GenerationService();
 
     [[nodiscard]] const ServeOptions& options() const noexcept { return options_; }
 
@@ -156,6 +159,12 @@ public:
 
     void warmup();
 
+    // Attaches the LMCache checkpoint cache when NINFER_LMCACHE_RESTORE is set and the library was
+    // built in. Returns false when it is off, not configured, or failed to connect -- the server runs
+    // either way, because the cache is an accelerator and not a dependency.
+    bool attach_checkpoint_cache();
+    [[nodiscard]] bool has_checkpoint_cache() const noexcept { return checkpoint_cache_ != nullptr; }
+
 private:
     enum class CacheParticipation : std::uint8_t {
         Disabled,
@@ -178,6 +187,10 @@ private:
     ServeOptions options_;
     std::unique_ptr<ninfer::Engine> engine_;
     std::shared_ptr<RequestCapacity> request_capacity_;
+    // Defined in the .cpp and only when libzmq was found. Kept as an unconditional pointer so the
+    // class layout does not depend on a compile definition that other translation units may not see.
+    struct CheckpointCache;
+    std::unique_ptr<CheckpointCache> checkpoint_cache_;
 };
 
 } // namespace ninfer::serve

@@ -4,9 +4,16 @@
 #include "product/media_acquire/acquire.h"
 #include "serve/translate.h"
 
+#if NINFER_HAVE_LMCACHE
+#include "core/lmcache_bridge.h"
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <iterator>
 #include <mutex>
 #include <stdexcept>
@@ -14,6 +21,82 @@
 #include <utility>
 
 namespace ninfer::serve {
+
+#if NINFER_HAVE_LMCACHE
+struct GenerationService::CheckpointCache {
+    ninfer::core::lmcache::Bridge bridge;
+};
+#else
+struct GenerationService::CheckpointCache {};
+#endif
+
+GenerationService::~GenerationService() = default;
+
+bool GenerationService::attach_checkpoint_cache() {
+#if !NINFER_HAVE_LMCACHE
+    return false;
+#else
+    const char* enabled = std::getenv("NINFER_LMCACHE_RESTORE");
+    if (enabled == nullptr || *enabled == '\0' || std::strcmp(enabled, "0") == 0) { return false; }
+
+    const ninfer::CacheGeometry geometry = cache_geometry();
+    if (geometry.page_bytes == 0 || geometry.page_tokens <= 0 || geometry.state_image_bytes == 0) {
+        // The pools are not up. Registering now would fix a zero-byte layout in place, and the
+        // server would then reject every payload; refusing here keeps the failure visible.
+        std::fprintf(stderr, "[lmcache] geometry is not ready; the cache stays off\n");
+        return false;
+    }
+
+    ninfer::core::lmcache::BridgeConfig config;
+    config.model_name      = load_summary().model_name;
+    config.page_tokens     = geometry.page_tokens;
+    // Two pages per chunk: a whole number of pages, and the unit the restore was measured at.
+    config.pages_per_chunk = 2;
+    config.page_bytes      = geometry.page_bytes;
+    // Opaque bytes, one plane: a quantized format has four physical planes per layer while the
+    // server can express two, so the shape states the byte count and nothing else (v6 1p).
+    config.kv = ninfer::core::lmcache::GroupSpec::exact("uint8", 2 * geometry.page_bytes);
+    config.state =
+        ninfer::core::lmcache::GroupSpec::exact("uint8", geometry.state_image_bytes);
+    config.state.window_chunks = 1;
+    config.state.recurrent     = true;
+    // The key is the model name and the token sequence. Two runs that differ only in KV format or
+    // page geometry share both, so the sizes -- which change with the format -- go in the salt.
+    config.cache_salt = config.model_name + "@" + std::to_string(geometry.page_bytes) + "@" +
+                        std::to_string(geometry.page_tokens) + "@" +
+                        std::to_string(geometry.state_image_bytes);
+
+    ninfer::core::lmcache::ClientOptions client;
+    if (const char* endpoint = std::getenv("NINFER_LMCACHE_ENDPOINT");
+        endpoint != nullptr && *endpoint != '\0') {
+        client.endpoint = endpoint;
+    }
+    int connections = 4;
+    if (const char* value = std::getenv("NINFER_LMCACHE_CONNECTIONS")) {
+        const int parsed = std::atoi(value);
+        if (parsed > 0) { connections = parsed; }
+    }
+
+    // A fresh id per process start: the server does not replace the layout of an id it already
+    // knows, so a recycled id would keep the shapes from an earlier run.
+    const std::int64_t instance =
+        static_cast<std::int64_t>(std::chrono::system_clock::now().time_since_epoch().count());
+
+    auto holder = std::make_unique<CheckpointCache>();
+    if (!holder->bridge.open(client, connections, config, instance)) {
+        std::fprintf(stderr, "[lmcache] could not attach (%s); the cache stays off\n",
+                     holder->bridge.error().c_str());
+        return false;
+    }
+    std::fprintf(stderr,
+                 "[lmcache] attached | page %zu B, %lld token(s), state image %zu B, %d connection(s)"
+                 ", instance %lld\n",
+                 geometry.page_bytes, static_cast<long long>(geometry.page_tokens),
+                 geometry.state_image_bytes, connections, static_cast<long long>(instance));
+    checkpoint_cache_ = std::move(holder);
+    return true;
+#endif
+}
 
 struct RequestCapacity {
     explicit RequestCapacity(std::size_t limit) : maximum(limit) {}
