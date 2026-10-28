@@ -179,6 +179,13 @@ public:
 
     [[nodiscard]] virtual std::optional<CachedCheckpoint>
     fetch(std::span<const TokenId> prompt_tokens) = 0;
+
+    // Optional. Called when a checkpoint is worth keeping; the default keeps nothing, so a
+    // restore-only backend stays valid. Takes the same struct fetch returns, because the two are the
+    // same shape and a backend that stores what it can serve is the only kind that stays consistent
+    // with itself.
+    virtual void store(std::span<const TokenId> /*prompt_tokens*/,
+                       const CachedCheckpoint& /*checkpoint*/) {}
 };
 
 struct ContextCacheOptions {

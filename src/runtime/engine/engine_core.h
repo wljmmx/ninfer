@@ -1544,6 +1544,11 @@ private:
                 for (const auto point : progress.captured_checkpoints) {
                     resources_.publish(*instance_.program, request->continuation_owner, point,
                                        monotonic_ms());
+                    // Only after the record exists and is owned: publishing an unowned checkpoint
+                    // would hand the cache bytes that a later prune() is about to release.
+                    if (request->base_plan) {
+                        resources_.publish_to_cache(*instance_.program, *request->base_plan, point);
+                    }
                 }
             }
             context_owner_.reset();

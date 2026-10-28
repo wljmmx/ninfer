@@ -176,6 +176,12 @@ std::optional<CheckpointExport> Program::export_checkpoint(CheckpointHandle h) {
     return out;
 }
 
+// Unlike CheckpointExport there is only one CheckpointStateExport, so this forwards instead of
+// copying field by field.
+std::optional<CheckpointStateExport> Program::export_state(CheckpointHandle h) {
+    return impl_->export_state(h);
+}
+
 CheckpointTierGeometry Program::checkpoint_geometry() const { return impl_->checkpoint_geometry(); }
 
 std::optional<CheckpointHandle> Program::import_checkpoint_current_layout(

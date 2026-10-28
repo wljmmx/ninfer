@@ -133,6 +133,35 @@ public:
         return out;
     }
 
+    // Publishing is best effort and silent by design: it runs on the request path, and a cache that
+    // cannot be written must not turn a good request into a bad one.
+    void store(std::span<const TokenId> prompt_tokens,
+               const ninfer::CachedCheckpoint& checkpoint) override {
+        if (!ready_.load() || bridge_ == nullptr || prompt_tokens.empty()) { return; }
+        if (checkpoint.page_bytes == 0 || checkpoint.kv_bytes.empty()) { return; }
+
+        // Only whole chunks can be addressed, so a partial trailing chunk is not stored. Storing it
+        // would mean making up a range end that the server rejects anyway.
+        const std::size_t chunk_bytes_total = bridge_->chunk_bytes();
+        if (chunk_bytes_total == 0) { return; }
+        const std::size_t complete =
+            checkpoint.kv_bytes.size() / chunk_bytes_total * chunk_bytes_total;
+        if (complete == 0) { return; }
+
+        ninfer::core::lmcache::BridgeKey key;
+        key.tokens.assign(prompt_tokens.begin(), prompt_tokens.end());
+        key.request_id =
+            "put-" + std::to_string(instance_tag_) + "-" + std::to_string(++sequence_);
+
+        std::string state;
+        for (const std::string& shard : checkpoint.state_shards) { state += shard; }
+
+        (void)bridge_->publish(
+            key, std::span<const std::byte>(checkpoint.kv_bytes.data(), complete),
+            std::span<const std::byte>(reinterpret_cast<const std::byte*>(state.data()),
+                                       state.size()));
+    }
+
 private:
     std::unique_ptr<ninfer::core::lmcache::Bridge> bridge_;
     std::atomic<bool> ready_{false};

@@ -271,6 +271,40 @@ public:
         return true;
     }
 
+    // Two chunks at the default 128 tokens: below that the cache cannot address the prefix at all,
+    // so an export would cost 77 MB and buy nothing.
+    static constexpr std::uint32_t kMinimumCacheableFrontier = 256;
+
+    // Hands a freshly captured checkpoint to the external cache.
+    //
+    // Synchronous, and that is a cost: exporting costs a full copy of the prefix plus the state
+    // image (77 MB at 640 tokens) and the transport adds about 1.5 s, on the path that just finished
+    // capturing. Two guards keep it off the common case: nothing happens without a backend, and
+    // nothing happens below two chunks -- a prefix the cache cannot even address is not worth a
+    // 77 MB export.
+    void publish_to_cache(Program& program, const Base& base, Handle handle) {
+        if (checkpoint_cache_ == nullptr) { return; }
+        if (!program.valid_checkpoint(handle)) { return; }
+        const auto summary = program.checkpoint_metadata(handle);
+        if (summary.frontier < kMinimumCacheableFrontier) { return; }
+        const auto tokens = base.prompt_tokens();
+        if (tokens.empty()) { return; }
+
+        auto kv = program.export_checkpoint(handle);
+        if (!kv || kv->page_count == 0 || kv->page_bytes == 0) { return; }
+        auto state = program.export_state(handle);
+        if (!state || state->bytes.empty()) { return; }
+
+        CachedCheckpoint out;
+        out.frontier   = kv->frontier;
+        out.page_bytes = kv->page_bytes;
+        out.kv_bytes   = std::move(kv->kv_bytes);
+        // One element: the image travels whole (v6 1n).
+        out.state_shards.emplace_back(reinterpret_cast<const char*>(state->bytes.data()),
+                                      state->bytes.size());
+        checkpoint_cache_->store(tokens, out);
+    }
+
     void retain_source(Program& program, std::uint64_t request, const SourceChoice& choice) {
         std::vector<Handle> held;
         if (choice.source.checkpoint) { held.push_back(*choice.source.checkpoint); }
