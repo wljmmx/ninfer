@@ -15,8 +15,10 @@
 #include "core/lmcache_client.h"
 #include "core/lmcache_wire.h"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <span>
 #include <string>
 #include <vector>
@@ -240,6 +242,11 @@ public:
     }
 
     // Rebuilds the flat page run the engine's import expects.
+    //
+    // MATCH and TRANSFER are timed separately and always printed, because they answer different
+    // questions and only one of them is a prefetch target: a match is a hash lookup and should be
+    // milliseconds, a transfer is the payload and is proportional to bytes. Reporting the sum (as
+    // fetch() used to) hides which one a change moved.
     bool restore(const BridgeKey& key, std::vector<std::byte>* kv, std::vector<std::byte>* state) {
         auto lease = pool_.acquire();
         if (!lease) {
@@ -248,10 +255,20 @@ public:
         }
         RestorePayload got;
         const CacheKey cache_key = make_key(key);
-        if (!lease->has(cache_key) || !lease->fetch(cache_key, &got)) {
+        const auto matched_at      = std::chrono::steady_clock::now();
+        const bool matched         = lease->has(cache_key);
+        const auto transferred_at  = std::chrono::steady_clock::now();
+        if (!matched || !lease->fetch(cache_key, &got)) {
             error_ = lease->error().empty() ? "not cached" : lease->error();
             return false;
         }
+        const auto done_at = std::chrono::steady_clock::now();
+        const double match_seconds =
+            std::chrono::duration<double>(transferred_at - matched_at).count();
+        const double transfer_seconds =
+            std::chrono::duration<double>(done_at - transferred_at).count();
+        std::fprintf(stderr, "[lmcache] restore: match %.3f s, transfer %.3f s\n", match_seconds,
+                     transfer_seconds);
         if (kv != nullptr) {
             kv->clear();
             for (const std::string& chunk : got.kv_chunks) {
