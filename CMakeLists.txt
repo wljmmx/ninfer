@@ -40,12 +40,13 @@ option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-# Device code stays at 20 on purpose. nvcc 13.4 lists c++23 in --std but gates it on the host
-# compiler supporting it officially; MSVC only offers /std:c++latest and /std:c++23preview, so nvcc
-# answers "The -std=c++23 flag is not supported with the configured host compiler. Flag will be
-# ignored" and then compiles .cu as an older standard. Forwarding the spelling through -Xcompiler
-# does not lift the gate (tried: /std:c++latest and /std:c++23preview both end in cudafe++ dying).
-# On MSVC the 23 above becomes /std:c++latest; there is no /std:c++23.
+# Device code stays at 20 on purpose. nvcc 13.4 lists c++23 in --std and the help says it "also
+# turns on the corresponding dialect flag for the host compiler", but the implementation does not
+# follow: with -std=c++23 it still drives cudafe++ as "--ms_c++14" (verified with nvcc -v) and warns
+# that the flag is being ignored. That is why .cu code then fails on std::string_view -- a C++17
+# facility, absent from the C++14 mode it actually used. Forwarding the host spelling through
+# -Xcompiler does not help (/std:c++latest and /std:c++23preview both end in cudafe++ dying).
+# On MSVC the CXX standard above becomes /std:c++latest; there is no /std:c++23.
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)        # clangd / IDE tooling
