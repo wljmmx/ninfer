@@ -184,6 +184,10 @@ std::optional<CheckpointStateExport> Program::export_state(CheckpointHandle h) {
 
 CheckpointTierGeometry Program::checkpoint_geometry() const { return impl_->checkpoint_geometry(); }
 
+CheckpointPoolHeadroom Program::checkpoint_pool_headroom() const {
+    return impl_->checkpoint_pool_headroom();
+}
+
 std::optional<CheckpointHandle> Program::import_checkpoint_current_layout(
     const CheckpointExport& kv, const std::vector<std::string>& state_shards,
     std::shared_ptr<const detail::PreparedCaptureBacking> identity, const PrefixShortlistKey* key,

@@ -63,6 +63,11 @@ struct CacheGeometry {
     std::size_t page_bytes        = 0;
     std::int64_t page_tokens      = 0;
     std::size_t state_image_bytes = 0;
+    // The KV format, as the wire tag of KvCacheStorage, and how many vectors a page carries. Sizes
+    // alone do not identify a format: a 4-bit layout at one head width and an 8-bit one at half of
+    // it can both give 136 B per vector, and then a key made of sizes would collide.
+    std::uint32_t kv_dtype_tag    = 0;
+    std::uint32_t kv_planes       = 0;
 };
 
 class Engine {

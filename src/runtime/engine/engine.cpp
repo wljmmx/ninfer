@@ -381,6 +381,8 @@ CacheGeometry Engine::cache_geometry() const {
                 out.page_bytes        = core->cache_page_bytes();
                 out.page_tokens       = core->cache_page_tokens();
                 out.state_image_bytes = core->cache_state_image_bytes();
+                out.kv_dtype_tag      = core->cache_kv_dtype_tag();
+                out.kv_planes         = core->cache_kv_planes();
                 return out;
             }
         },

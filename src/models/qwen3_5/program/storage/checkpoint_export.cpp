@@ -102,8 +102,23 @@ CheckpointTierGeometry ProgramImpl::checkpoint_geometry() const {
         out.page_bytes  = layout.page_stride;
         out.page_tokens = static_cast<std::int64_t>(layout.geometry.page_tokens);
     }
+    // The format tag travels with the sizes so a cache key can name it. KVDtype is declared to mirror
+    // KvCacheStorage number for number (checkpoint_fingerprint.h), which is the only reason the cast
+    // below is a translation rather than a guess; unknown values stay unknown at the far end.
+    out.kv_dtype_tag = static_cast<std::uint32_t>(kv_storage);
+    // The paged layout always carries a K and a V vector; a fused layout would report 1 here when one
+    // exists.
+    out.kv_planes = 2;
     if (state_store) { out.state_image_bytes = state_store->image_bytes(); }
     return out;
+}
+
+CheckpointPoolHeadroom ProgramImpl::checkpoint_pool_headroom() const {
+    if (!text_kv_pages) { return {}; }
+    // Read, never cached: the point of the number is that it changes with every request.
+    const DeviceKVPagePool& pool = text_kv_pages->physical_pool();
+    return CheckpointPoolHeadroom{.capacity_pages  = pool.capacity_pages(),
+                                  .available_pages = pool.available_pages()};
 }
 
 } // namespace ninfer::models::qwen3_5::detail

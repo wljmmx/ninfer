@@ -114,6 +114,16 @@ public:
                    ? 0U
                    : instance_.program->checkpoint_geometry().state_image_bytes;
     }
+    [[nodiscard]] std::uint32_t cache_kv_dtype_tag() const {
+        return instance_.program == nullptr
+                   ? 0U
+                   : instance_.program->checkpoint_geometry().kv_dtype_tag;
+    }
+    [[nodiscard]] std::uint32_t cache_kv_planes() const {
+        return instance_.program == nullptr
+                   ? 0U
+                   : instance_.program->checkpoint_geometry().kv_planes;
+    }
 
     [[nodiscard]] RuntimeStats runtime_stats() const noexcept { return {}; }
 

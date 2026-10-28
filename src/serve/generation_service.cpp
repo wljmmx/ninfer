@@ -24,6 +24,23 @@ namespace ninfer::serve {
 
 #if NINFER_HAVE_LMCACHE
 namespace {
+// The tag the program publishes is the KvCacheStorage numbering. Naming it in the log is what makes
+// "which format was this entry stored under" answerable without decoding the key.
+[[nodiscard]] std::string_view kv_format_name(std::uint32_t tag) {
+    switch (tag) {
+    case 0: return "bf16";
+    case 1: return "int8-g64";
+    case 2: return "fp8-e4m3";
+    case 3: return "nvfp4";
+    case 4: return "fp8k-nvfp4v";
+    case 5: return "rk8v4";
+    case 6: return "rk4v4";
+    case 7: return "rk4v4-e8";
+    case 8: return "rk2v4-e8";
+    case 9: return "rk4v2-e8";
+    default: return "unknown";
+    }
+}
 
 // The engine's whole view of the cache: one lookup, no transport types. Kept separate from Bridge so
 // the engine side never sees a key, a connection or a chunk.
@@ -38,6 +55,12 @@ public:
         if (geometry.page_bytes == 0 || geometry.page_tokens <= 0 ||
             geometry.state_image_bytes == 0) {
             error_ = "geometry is not ready";
+            return false;
+        }
+        // A page count is meaningless without saying what a page holds. Refusing here is the
+        // difference between a startup line that names the format and a key that cannot.
+        if (geometry.kv_planes == 0) {
+            error_ = "KV plane count is not known";
             return false;
         }
         ninfer::core::lmcache::BridgeConfig config;
@@ -67,14 +90,19 @@ public:
             ninfer::core::lmcache::GroupSpec::exact("uint8", geometry.state_image_bytes);
         config.state.window_chunks = 1;
         config.state.recurrent     = true;
-        // The key is the model and the tokens; the sizes are what change when the format or the page
-        // geometry does, so they are what isolates one from the other.
+        // The key is the model and the tokens; the geometry is what changes when the format or the
+        // page layout does, so it is what isolates one from the other. Sizes alone are not enough:
+        // a 4-bit layout at one head width and an 8-bit one at half of it can both describe 136 B
+        // per vector, and then two formats would share a key and one would answer for the other.
+        // The tag and the plane count close that; both are read from the live layout.
         // ':' and not '@': LMCache forbids '@' in a salt because it separates the fields of its own
         // cache key, and it answers a violating request by raising -- no reply frame at all, so the
         // client's only symptom is a receive timeout. Measured: a two-minute stall.
         config.cache_salt = model_name + ":" + std::to_string(geometry.page_bytes) + ":" +
                             std::to_string(geometry.page_tokens) + ":" +
-                            std::to_string(geometry.state_image_bytes);
+                            std::to_string(geometry.state_image_bytes) + ":k" +
+                            std::to_string(geometry.kv_dtype_tag) + "p" +
+                            std::to_string(geometry.kv_planes);
         page_bytes_ = geometry.page_bytes;
         // A lookup resolves complete chunks only. Below one chunk there is nothing to ask about --
         // and the server answers such a request with no frames at all, so the client sits on its
@@ -150,11 +178,29 @@ public:
 
         // Only whole chunks can be addressed, so a partial trailing chunk is not stored. Storing it
         // would mean making up a range end that the server rejects anyway.
+        //
+        // Two counts decide the payload, and they are not the same number: how many chunks the export
+        // holds, and how many the prompt can address. The key is truncated from the prompt, so the
+        // payload has to be cut to the same count -- otherwise the envelope carries more tensors than
+        // the key has chunks and the server refuses the whole store. Measured on a 474-token prompt:
+        // the checkpoint covered 467 tokens (8 pages, 4 chunks) while the key ended at 384 (3), and
+        // the server answered "Inline tensor group 0 chunk index out of range (chunks=3)". The
+        // publish was lost silently; only a cross-process retrieve would have shown it.
         const std::size_t chunk_bytes_total = bridge_->chunk_bytes();
-        if (chunk_bytes_total == 0) { return; }
-        const std::size_t complete =
-            checkpoint.kv_bytes.size() / chunk_bytes_total * chunk_bytes_total;
-        if (complete == 0) { return; }
+        if (chunk_bytes_total == 0 || chunk_tokens_ == 0) { return; }
+        const std::size_t payload_chunks = checkpoint.kv_bytes.size() / chunk_bytes_total;
+        const std::size_t addressable    = prompt_tokens.size() / chunk_tokens_;
+        const std::size_t chunks         = std::min(payload_chunks, addressable);
+        if (chunks == 0) { return; }
+        // Not silent: a prefix whose tail is dropped is a real loss of coverage, and the honest place
+        // to say so is here rather than in a retrieve that later misses.
+        if (addressable < payload_chunks) {
+            std::fprintf(stderr,
+                         "[lmcache] publish covers %zu of %zu token(s) (%zu of %zu chunk(s)); "
+                         "the tail is prefilled\n",
+                         chunks * chunk_tokens_, prompt_tokens.size(), chunks, payload_chunks);
+        }
+        const std::size_t complete = chunks * chunk_bytes_total;
 
         ninfer::core::lmcache::BridgeKey key;
         key.tokens.assign(prompt_tokens.begin(), prompt_tokens.end());
@@ -216,10 +262,11 @@ bool GenerationService::attach_checkpoint_cache() {
     std::fprintf(stderr,
                  "[lmcache] attached | page %zu B, %lld token(s), chunk %zu token(s) "
                  "(= %zu page(s)) -- the server must run --chunk-size %zu;\n"
-                 "          state image %zu B, %d connection(s)\n",
-                 geometry.page_bytes, static_cast<long long>(geometry.page_tokens), chunk,
-                 chunk / static_cast<std::size_t>(geometry.page_tokens), chunk,
-                 geometry.state_image_bytes, connections);
+                 "          kv %s (tag %u, %u plane(s)), state image %zu B, %d connection(s)\n",
+            geometry.page_bytes, static_cast<long long>(geometry.page_tokens), chunk,
+            chunk / static_cast<std::size_t>(geometry.page_tokens), chunk,
+            kv_format_name(geometry.kv_dtype_tag).data(), geometry.kv_dtype_tag,
+            geometry.kv_planes, geometry.state_image_bytes, connections);
     return true;
 #endif
 }

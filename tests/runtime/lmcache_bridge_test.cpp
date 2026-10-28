@@ -28,8 +28,10 @@ std::string make_payload(std::size_t size, unsigned char seed) {
     return out;
 }
 
-// Profile A is the model on this box: 40 layers, separate K/V, 128 wide, 64-token pages, and a
-// float32 state image of 64 M B.
+// Profile A is synthetic geometry shaped like the model on this box (separate K/V, 64-token pages,
+// float32 state image). The page size is a PROFILE CONSTANT, not a measurement: on this box the live
+// layout reports 1,310,720 B for bf16, but the point of the test is the byte plumbing, and a profile
+// that hard-codes the engine's number would stop testing the arithmetic the moment the model changes.
 BridgeConfig profile_a() {
     BridgeConfig config;
     config.model_name      = "bridge-a";
@@ -68,10 +70,12 @@ BridgeConfig profile_b() {
     return config;
 }
 
-// Profile C: rk4v4, the symmetric rotated-int4 format. Its paged layout is {U8 data 128 B, FP16
-// scales 4 B} per plane per layer per token -- 132 B, not a plain 4-bit halving. LMCache has no such
-// dtype, so the object travels as an opaque uint8 view whose shape still has to describe the bytes:
-// 2 planes x 40 layers x 128 tokens x 132 B = 1,351,680 B per chunk, i.e. two 675,840 B pages.
+// Profile C: rk4v4, the symmetric rotated-int4 format. Per plane per layer per token the layout is
+// {U8 data 128 B, FP16 scales 4 elements = 8 B} = 136 B, not a plain 4-bit halving. LMCache has no
+// such dtype, so the object travels as an opaque uint8 view whose shape still has to describe the
+// bytes. The numbers below are SYNTHETIC and do not match this box: the live rk4v4 page here is
+// 348,160 B (20 layer-kv_head groups x 2 planes x 64 tokens x 136 B), which this profile does not
+// reproduce. Treat a pass here as evidence about the chunking, never as evidence about the format.
 BridgeConfig profile_rk4v4() {
     BridgeConfig config;
     config.model_name      = "bridge-rk4v4";
@@ -89,9 +93,9 @@ BridgeConfig profile_rk4v4() {
     return config;
 }
 
-// Profile D: rk4v2-e8, where K is 96 B + 4 B and V is 64 B + 4 B. The planes are UNEQUAL (100 vs
-// 68), so a two-plane shape cannot describe them at all; the object has to go as one plane with the
-// planes laid end to end: 40 layers x 128 tokens x 168 B = 860,160 B per chunk, 430,080 B per page.
+// Profile D: rk4v2-e8, where the K and V planes are UNEQUAL, so a two-plane shape cannot describe
+// them at all and the object has to go as one plane with the planes laid end to end. Synthetic, like
+// profile C: the extents are hand-written, not read from the engine's layout.
 BridgeConfig profile_rk4v2() {
     BridgeConfig config;
     config.model_name      = "bridge-rk4v2";

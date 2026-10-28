@@ -86,6 +86,21 @@ std::optional<StateImageHandle> ProgramImpl::import_state(
 
 void ProgramImpl::host_state_fingerprint(ninfer::core::fingerprint::CheckpointFingerprint& out) const {
     out = {};
+    // The KV half, from the same live layout the export and the transport use. Without this the
+    // fields stayed 0 on BOTH sides of every comparison, so `matches()` reported agreement between
+    // two zeroes: a guard that could never fire. It still cannot see inside a cache payload (those
+    // are opaque bytes, and the cache validates exact sizes), which is why the format also travels in
+    // the cache key -- but a dump or a transaction that carries a fingerprint now carries these.
+    if (text_kv_pages && host_kv_extents) {
+        const HostKVPageLayout& page = host_kv_extents->page_layout(*text_kv_pages);
+        out.kv_page_bytes      = static_cast<std::uint32_t>(page.page_stride);
+        out.kv_tokens_per_page = static_cast<std::uint32_t>(page.geometry.page_tokens);
+        // KVDtype mirrors KvCacheStorage number for number (checkpoint_fingerprint.h).
+        out.kv_dtype = static_cast<ninfer::core::fingerprint::KVDtype>(
+            static_cast<std::uint8_t>(kv_storage));
+        // The paged layout holds a K and a V vector per layer; a fused layout would say 1.
+        out.kv_planes = 2;
+    }
     if (!host_state_images) { return; }
     const qwen3_5::StateImageHostLayout& layout = host_state_images->layout();
     out.state_image_bytes = layout.image_bytes;

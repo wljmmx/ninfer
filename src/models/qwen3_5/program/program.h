@@ -201,6 +201,24 @@ struct CheckpointTierGeometry {
     // page size is hard-coding this engine's, and the cache chunk is expressed in pages.
     std::int64_t page_tokens       = 0;
     std::size_t state_image_bytes  = 0;
+    // The KV format itself, not just how big a page is. Two layouts can land on the same page byte
+    // count -- a 4-bit format at one head width and an 8-bit one at half of it both give 136 B per
+    // vector -- so a cache keyed only on sizes would let one answer for the other. The tag is the
+    // wire image of KvCacheStorage (same numbering), 0 meaning BFloat16.
+    std::uint32_t kv_dtype_tag     = 0;
+    // 2 = K and V occupy separate vectors, 1 = fused (MLA / indexer).
+    std::uint32_t kv_planes        = 0;
+};
+
+// How much room the KV page pool has right now. A restore takes Device pages for the whole life of
+// the checkpoint it creates, so "there is room" is not the same question as "it fits": a restore
+// that takes the last free page leaves the next request with nowhere to put its prompt.
+//
+// Deliberately not part of CheckpointTierGeometry: that describes the format, this describes the
+// moment. Mixing them would make a snapshot look like a fact about the layout.
+struct CheckpointPoolHeadroom {
+    std::uint32_t capacity_pages  = 0;
+    std::uint32_t available_pages = 0;
 };
 
 struct SourceCandidate {
@@ -466,6 +484,9 @@ public:
     [[nodiscard]] std::optional<CheckpointExport> export_checkpoint(CheckpointHandle checkpoint);
     [[nodiscard]] std::optional<CheckpointStateExport> export_state(CheckpointHandle checkpoint);
     [[nodiscard]] CheckpointTierGeometry checkpoint_geometry() const;
+    // Live room in the Device page pool. A caller that is about to import a checkpoint asks this
+    // first: taking the last free page turns the next request's allocation into a failure.
+    [[nodiscard]] CheckpointPoolHeadroom checkpoint_pool_headroom() const;
     // Restores a checkpoint from bytes an external cache handed back, pricing the fingerprint from
     // the live layout. Returns nullopt when the bytes do not fit this program; error says why.
     [[nodiscard]] std::optional<CheckpointHandle> import_checkpoint_current_layout(

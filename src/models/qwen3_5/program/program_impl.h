@@ -291,6 +291,9 @@ public:
     // What the transport has to be registered with before any store or retrieve. Zero fields mean
     // the corresponding pool is not up yet, which is a caller error, not a valid geometry.
     [[nodiscard]] CheckpointTierGeometry checkpoint_geometry() const;
+    // Live occupancy of the Device page pool. Read per restore, not cached: what matters is whether
+    // the pages are free at the moment the restore wants them.
+    [[nodiscard]] CheckpointPoolHeadroom checkpoint_pool_headroom() const;
     // Restores a state image from its shards. Verifies the state half of the fingerprint first;
     // the caller is responsible for the KV half, which this cannot see.
     // Restores KV pages and a state image into one checkpoint record. State first: it refuses on a
