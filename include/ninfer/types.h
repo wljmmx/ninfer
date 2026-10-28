@@ -984,7 +984,12 @@ struct MemorySummary {
     std::size_t kv_capacity_increment_bytes       = 0;
     std::size_t runtime_reservation_bytes         = 0;
     std::size_t available_after_weights_bytes     = 0;
+    // Free device memory when the capacity plan was made (after weights, before our own pools):
+    // the same instant as kv_planned_slack_bytes, so a shortfall means the device really changed.
     std::size_t available_after_startup_bytes     = 0;
+    // Free device memory after every pool exists. Small here is expected and not a leak: the
+    // expert cache, KV pages and state slots are this process's own allocations.
+    std::size_t free_after_startup_bytes          = 0;
     // appendix IK: what the startup contract decision actually did, and why (bit 1 capacity
     // short, bit 2 retention inside the measured <2% band, bit 4 host budget sufficient,
     // bit 8 the KV dtype has an absent-page path). Reported so a skip is never silent.

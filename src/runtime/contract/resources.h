@@ -131,7 +131,12 @@ struct KvCapacityResolution {
     std::size_t bytes_per_additional_main_page_group = 0;
     std::size_t runtime_reservation_bytes            = 0;
     std::size_t available_after_weights_bytes        = 0;
+    // Free device memory at the moment the capacity plan was made: after the weights, before this
+    // process's own pools. Same instant as planned_slack_bytes, so the two can be compared.
     std::size_t available_after_startup_bytes        = 0;
+    // Free device memory once every pool exists. What is left for anything not planned here, which
+    // is a different question from "did the device lose memory since planning".
+    std::size_t free_after_startup_bytes             = 0;
     std::size_t automatic_headroom_bytes             = 0;
     std::size_t planned_slack_bytes                  = 0;
     // appendix IK: the eviction-contract decision taken at startup (0 off, 1 on) and the reason

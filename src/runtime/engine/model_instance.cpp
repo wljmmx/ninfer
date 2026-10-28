@@ -583,6 +583,11 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
             return resolve_kv_capacity(options.kv_capacity, planner.capacity_curve(), optimistic);
         }
     }();
+    // The same instant the plan was priced against: after the weights, before the expert pool and
+    // the KV/state pools exist. Comparing this against free_after_startup_bytes is what tells
+    // "the device changed under us" apart from "we spent it ourselves".
+    resolution.available_after_startup_bytes = current_free_device_bytes(
+        options.wddm_evictable_budget, instance->model->storage_stats().device_capacity_bytes);
     // The KV plan is settled before the expert pool is sized, so the pool can take everything the
     // arena does not need instead of holding back a fixed amount.
     if (options.expert_cache_bytes != 0) {
@@ -672,7 +677,7 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
                                                         device, options.startup_observer);
     device.synchronize();
     program.complete();
-    instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes(options.wddm_evictable_budget);
+    instance->kv_capacity_resolution.free_after_startup_bytes = current_free_device_bytes(options.wddm_evictable_budget);
     const auto& stats = instance->model->storage_stats();
     LoadSummary summary;
     summary.architecture = models::architecture_name(instance->model->config().text.architecture);

@@ -629,6 +629,17 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
             product::format_pretty_bytes(slack_shortfall));
     }
 
+    // A different question from the shortfall above: how much is left once the expert cache, the KV
+    // pages and the state slots exist. Reporting it separately matters because those are this
+    // process's own allocations -- a small number here used to be reported as the device losing
+    // memory, which sent the reader looking for a leak that was not there.
+    if (memory.free_after_startup_bytes < (512U * 1024U * 1024U)) {
+        logger_->warn(
+            "memory | {} free once the expert cache, KV pages and state slots were sized: the rest "
+            "is this process's own allocation. Allocations outside the plan may fail",
+            product::format_pretty_bytes(memory.free_after_startup_bytes));
+    }
+
     if (service.options().enable_vision) {
         const ninfer::MediaCacheSummary media = service.media_cache_summary();
         logger_->info("media | {} preprocess workers | cache {} | live {}",
