@@ -85,6 +85,11 @@ const PreparedContextCache& RequestBasePlan::context_cache() const noexcept {
     return impl_ != nullptr ? impl_->context_cache : empty;
 }
 
+std::span<const TokenId> RequestBasePlan::prompt_tokens() const noexcept {
+    if (impl_ == nullptr || impl_->prompt == nullptr) { return {}; }
+    return impl_->prompt->token_ids;
+}
+
 std::vector<std::uint32_t> RequestBasePlan::capture_frontiers() const {
     std::vector<std::uint32_t> frontiers;
     if (impl_) {
