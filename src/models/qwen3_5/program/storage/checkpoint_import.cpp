@@ -34,15 +34,23 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint_current_layout(
     // Coverage and pages have to describe the same amount of text. A record whose frontier says 384
     // while its payload holds 8 pages would commit an address whose pages and coverage disagree --
     // that is wrong KV, not a miss, and nothing downstream would notice.
+    //
+    // The rule is "exactly enough pages for the coverage", not "pages x tokens == coverage": the
+    // engine's own export is routinely NOT page aligned (a capture at 467 tokens holds 8 pages, the
+    // last one partly filled), so demanding an exact product refuses records this engine produced.
     const auto geometry = checkpoint_geometry();
-    if (geometry.page_tokens > 0 &&
-        static_cast<std::uint64_t>(kv.page_count) * geometry.page_tokens != kv.frontier) {
-        if (error != nullptr) {
-            *error = "frontier " + std::to_string(kv.frontier) + " does not match " +
-                     std::to_string(kv.page_count) + " page(s) x " +
-                     std::to_string(geometry.page_tokens);
+    const auto page_tokens = static_cast<std::uint64_t>(geometry.page_tokens);
+    if (page_tokens > 0) {
+        const std::uint64_t needed =
+            (static_cast<std::uint64_t>(kv.frontier) + page_tokens - 1) / page_tokens;
+        if (needed != kv.page_count) {
+            if (error != nullptr) {
+                *error = "frontier " + std::to_string(kv.frontier) + " needs " +
+                         std::to_string(needed) + " page(s) of " + std::to_string(page_tokens) +
+                         " token(s); the payload holds " + std::to_string(kv.page_count);
+            }
+            return std::nullopt;
         }
-        return std::nullopt;
     }
 
     // A cache stores the image as one blob (it has no reason to shard it), while the import path
@@ -145,10 +153,45 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
         // investigation, not to every restore, and they printed payload bytes into the server log.
         published = host_kv_extents->publish(std::move(*reservation));
 
-        // The Device copy is deliberately not made here. A restored checkpoint is a Host-only
-        // artifact, exactly like one that was captured and demoted, and restore_addressed_host_pages()
-        // promotes what it needs at use time. Copying down eagerly duplicated that work and, measured,
-        // left the Host extent reading back as zeros afterwards.
+        // The Device replicas reserved in step 2 exist but hold nothing: every byte went into the Host
+        // extent. Two consequences, and they have to be fixed together:
+        //
+        //   * a request that extends this prefix forks it Device -> Device, so an empty replica keeps
+        //     the copy and hands zeros forward, with nothing downstream noticing;
+        //   * prepare_prefix_fork() also refuses the page, because materialize() leaves it a writer
+        //     (writer_references == 1) and can_pin_source() requires 0.
+        //
+        // So the bytes are copied down here and the pages are then marked read-only. This is NOT the
+        // eager copy that was tried before and left the Host extent reading as zeros: that one went
+        // through the writable view, this one reads the published extent and only writes to Device.
+        bool rollback_pending = false;
+        for (const LogicalKVPageHandle page : pages) {
+            const auto page_host = host_kv_extents->page_view(*text_kv_pages, page);
+            if (!page_host || !page_host->valid()) {
+                rollback_pending = true;
+                break;
+            }
+            const std::array<DeviceKVPageHandle, 1> destination{text_kv_pages->physical(page)};
+            (void)text_kv_pages->physical_pool().copy_from_host(*page_host, destination,
+                                                                device.transfer_stream);
+        }
+        if (!rollback_pending &&
+            cudaStreamSynchronize(device.transfer_stream) != cudaSuccess) {
+            rollback_pending = true;
+        }
+        if (rollback_pending) {
+            if (published) { (void)host_kv_extents->release(*published); }
+            for (const LogicalKVPageHandle page : pages) { (void)text_kv_pages->release(page); }
+            state_store->release_checkpoint_reference(*state);
+            (void)state_store->release(*state);
+            error = "could not fill the Device copies of the restored pages";
+            return std::nullopt;
+        }
+        for (const LogicalKVPageHandle page : pages) {
+            if (text_kv_pages->writer_references(page) != 0) {
+                text_kv_pages->set_writer(page, false);
+            }
+        }
     }
     // From here on, a failure has to give back the published extent and the pages behind it. The
     // pages come with their Device leases, so one release per page covers both tiers.

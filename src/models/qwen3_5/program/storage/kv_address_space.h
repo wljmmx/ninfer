@@ -407,10 +407,27 @@ public:
         for (std::uint32_t page = 0; page < required_pages; ++page) {
             const LogicalKVPageHandle logical = membership(source, page);
             const std::uint32_t required      = page < full_pages ? page_size : tail_columns;
-            if (!pages_->device_resident(logical) ||
-                pages_->committed_columns(logical) < required || !pages_->can_pin_source(logical) ||
-                (page < full_pages && !pages_->can_retain_reference(logical, false))) {
-                throw std::logic_error("KV retained-prefix source is not stable");
+            // Four different facts, four different fixes. One message for all of them costs an
+            // afternoon: "not stable" reads the same whether the page has no Device replica, was
+            // never committed to this coverage, cannot be pinned, or cannot be retained.
+            const auto where = [page](std::string_view what) {
+                return std::string("KV retained-prefix source is not stable: page ") +
+                       std::to_string(page) + " " + std::string(what);
+            };
+            if (!pages_->device_resident(logical)) {
+                throw std::logic_error(where("has no Device replica"));
+            }
+            if (pages_->committed_columns(logical) < required) {
+                throw std::logic_error(where("is committed for " +
+                                             std::to_string(pages_->committed_columns(logical)) +
+                                             " column(s), " + std::to_string(required) +
+                                             " needed"));
+            }
+            if (!pages_->can_pin_source(logical)) {
+                throw std::logic_error(where("cannot be pinned as a source"));
+            }
+            if (page < full_pages && !pages_->can_retain_reference(logical, false)) {
+                throw std::logic_error(where("cannot retain a reference"));
             }
         }
 
