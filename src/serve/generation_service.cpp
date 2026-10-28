@@ -41,9 +41,23 @@ public:
             return false;
         }
         ninfer::core::lmcache::BridgeConfig config;
-        config.model_name      = model_name;
-        config.page_tokens     = geometry.page_tokens;
-        config.pages_per_chunk = 2;
+        config.model_name = model_name;
+        config.page_tokens = geometry.page_tokens;
+        // The chunk is the cache's addressing unit, and it is a SERVER setting (--chunk-size). The
+        // server does not expose it on any endpoint (its chunk_size_provider only feeds coordinator
+        // registration), so the two have to be configured to agree. Two pages is the default the
+        // restore path was measured at; NINFER_LMCACHE_CHUNK_TOKENS overrides it, and the value is
+        // logged so a mismatch is visible without reading the code.
+        std::int64_t chunk_tokens = geometry.page_tokens * 2;
+        if (const char* value = std::getenv("NINFER_LMCACHE_CHUNK_TOKENS")) {
+            const auto parsed = std::strtoll(value, nullptr, 10);
+            if (parsed > 0) { chunk_tokens = parsed; }
+        }
+        if (chunk_tokens <= 0 || chunk_tokens % geometry.page_tokens != 0) {
+            error_ = "chunk tokens must be a whole number of pages";
+            return false;
+        }
+        config.pages_per_chunk = chunk_tokens / geometry.page_tokens;
         config.page_bytes      = geometry.page_bytes;
         // Opaque bytes, one plane (v6 1p): a quantized format has four physical planes per layer and
         // the server can express two, so the shape states the byte count and nothing else.
@@ -65,8 +79,7 @@ public:
         // A lookup resolves complete chunks only. Below one chunk there is nothing to ask about --
         // and the server answers such a request with no frames at all, so the client sits on its
         // receive timeout. Measured: a 22-token prompt held a request for two minutes.
-        chunk_tokens_ =
-            static_cast<std::size_t>(geometry.page_tokens) * static_cast<std::size_t>(2);
+        chunk_tokens_ = static_cast<std::size_t>(chunk_tokens);
 
         ninfer::core::lmcache::ClientOptions client;
         if (const char* endpoint = std::getenv("NINFER_LMCACHE_ENDPOINT");
@@ -92,6 +105,7 @@ public:
     }
 
     [[nodiscard]] const std::string& error() const { return error_; }
+    [[nodiscard]] std::size_t chunk_tokens() const { return chunk_tokens_; }
 
     [[nodiscard]] std::optional<ninfer::CachedCheckpoint>
     fetch(std::span<const TokenId> prompt_tokens) override {
@@ -161,10 +175,13 @@ bool GenerationService::attach_checkpoint_cache() {
         checkpoint_cache_.reset();
         return false;
     }
+    const std::size_t chunk = checkpoint_cache_->backend->chunk_tokens();
     std::fprintf(stderr,
-                 "[lmcache] attached | page %zu B, %lld token(s), state image %zu B, %d connection(s)"
-                 "\n",
-                 geometry.page_bytes, static_cast<long long>(geometry.page_tokens),
+                 "[lmcache] attached | page %zu B, %lld token(s), chunk %zu token(s) "
+                 "(= %zu page(s)) -- the server must run --chunk-size %zu;\n"
+                 "          state image %zu B, %d connection(s)\n",
+                 geometry.page_bytes, static_cast<long long>(geometry.page_tokens), chunk,
+                 chunk / static_cast<std::size_t>(geometry.page_tokens), chunk,
                  geometry.state_image_bytes, connections);
     return true;
 #endif
