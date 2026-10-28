@@ -215,8 +215,14 @@ public:
         kv.frontier = static_cast<std::uint32_t>(tokens.size());
 
         std::string error;
+        // Without this key the record is readable and never matchable: checkpoint_matches compares
+        // identity_tag and digests against it, and an empty key fails both. That failure is silent --
+        // the restore works once (as this candidate) and then the prefix index never returns it
+        // again, which reads as "the cache stopped working".
+        const auto shortlist = base.prefix_shortlist_key(kv.frontier);
         const auto handle = program.import_checkpoint_current_layout(
-            kv, cached->state_shards, base.capture_backing(), nullptr, &error);
+            kv, cached->state_shards, base.capture_backing(),
+            shortlist ? &*shortlist : nullptr, &error);
         if (!handle) {
             std::fprintf(stderr, "[lmcache] restore failed: %s\n", error.c_str());
             return std::nullopt;
