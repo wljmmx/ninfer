@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -205,6 +206,24 @@ public:
         kv.page_bytes = cached->page_bytes;
         kv.page_count = static_cast<std::uint32_t>(cached->kv_bytes.size() / cached->page_bytes);
         if (kv.page_count == 0) { return std::nullopt; }
+        // A restored checkpoint holds Device pages for as long as it exists (import reserves them and
+        // the Host-only copy is promoted lazily), so a restore that takes the last free page does not
+        // fail here -- it fails later, in a request that then has nowhere to put its prompt, and that
+        // request has no fallback. A miss is free; a starved request is not. So the restore declines
+        // when it would eat into the reserve.
+        const auto headroom = program.checkpoint_pool_headroom();
+        if (headroom.capacity_pages != 0) {
+            const std::uint32_t reserve = restore_reserve_pages(headroom.capacity_pages);
+            const std::uint32_t need    = kv.page_count + reserve;
+            if (headroom.available_pages < need) {
+                std::fprintf(stderr,
+                             "[lmcache] restore declined: %u page(s) + %u reserved, %u of %u free "
+                             "(NINFER_LMCACHE_RESTORE_RESERVE_PAGES)\n",
+                             kv.page_count, reserve, headroom.available_pages,
+                             headroom.capacity_pages);
+                return std::nullopt;
+            }
+        }
         kv.kv_bytes = std::move(cached->kv_bytes);
         // The cache stores bytes and the page count, not coverage history. A restored page has no
         // local content epoch, so zero is the honest value; it only feeds the "did this page change
@@ -292,6 +311,22 @@ public:
     // Two chunks at the default 128 tokens: below that the cache cannot address the prefix at all,
     // so an export would cost 77 MB and buy nothing.
     static constexpr std::uint32_t kMinimumCacheableFrontier = 256;
+
+    // Pages a restore must leave behind. A restored checkpoint holds its Device pages for its whole
+    // life, and the pool is shared with live requests, so a burst of restores that ignores this can
+    // consume the working set -- after which a request fails to allocate with nothing to fall back
+    // on. The default is an eighth of the pool, at least four pages: at 128 pages that is 16, more
+    // than two 410-token prompts. NINFER_LMCACHE_RESTORE_RESERVE_PAGES overrides it, and 0 restores
+    // the previous behaviour, which is what an A/B needs.
+    [[nodiscard]] static std::uint32_t restore_reserve_pages(std::uint32_t capacity) {
+        if (const char* value = std::getenv("NINFER_LMCACHE_RESTORE_RESERVE_PAGES")) {
+            const long parsed = std::strtol(value, nullptr, 10);
+            if (parsed >= 0) {
+                return std::min(capacity, static_cast<std::uint32_t>(parsed));
+            }
+        }
+        return std::min(capacity, std::max<std::uint32_t>(4, capacity / 8));
+    }
 
     // Hands a freshly captured checkpoint to the external cache.
     //
