@@ -189,6 +189,9 @@ struct CheckpointExport {
 // validates every payload against, and they are only known once the pools exist.
 struct CheckpointTierGeometry {
     std::size_t page_bytes         = 0;
+    // Tokens per page, from the live geometry. Not kPagedKVPageSize: a caller that hard-codes the
+    // page size is hard-coding this engine's, and the cache chunk is expressed in pages.
+    std::int64_t page_tokens       = 0;
     std::size_t state_image_bytes  = 0;
 };
 
