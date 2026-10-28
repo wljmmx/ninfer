@@ -98,3 +98,42 @@ if(NINFER_BUILD_PRODUCT_SUPPORT)
     ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
   add_subdirectory(third_party/spdlog)
 endif()
+
+# libzmq carries the LMCache checkpoint cache. It is vendored under third_party/libzmq (headers,
+# import library, runtime DLL) because it is a shared library with its own ABI and every other
+# dependency here is in-repo. The external prefix is only a fallback, for a machine whose vendored
+# copy is incomplete; NINFER_ZMQ_ROOT overrides both.
+set(NINFER_ZMQ_ROOT "$ENV{NINFER_ZMQ_ROOT}" CACHE PATH
+    "Fallback prefix containing zmq.h and libzmq; third_party/libzmq is preferred")
+find_path(NINFER_ZMQ_INCLUDE_DIR zmq.h
+  HINTS
+    "${PROJECT_SOURCE_DIR}/third_party/libzmq/include"
+    "${NINFER_ZMQ_ROOT}/include"
+    "$ENV{CONDA_PREFIX}/Library/include"
+    "$ENV{CONDA_PREFIX}/include"
+    "H:/Anaconda3/Library/include"
+)
+find_library(NINFER_ZMQ_LIBRARY
+  NAMES libzmq-mt-4_3_5 libzmq-mt libzmq
+  HINTS
+    "${PROJECT_SOURCE_DIR}/third_party/libzmq/lib"
+    "${NINFER_ZMQ_ROOT}/lib"
+    "$ENV{CONDA_PREFIX}/Library/lib"
+    "$ENV{CONDA_PREFIX}/lib"
+    "H:/Anaconda3/Library/lib"
+)
+if(NINFER_ZMQ_INCLUDE_DIR AND NINFER_ZMQ_LIBRARY)
+  add_library(ninfer::zmq UNKNOWN IMPORTED GLOBAL)
+  set_target_properties(ninfer::zmq PROPERTIES
+    IMPORTED_LOCATION "${NINFER_ZMQ_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${NINFER_ZMQ_INCLUDE_DIR}")
+  message(STATUS "NInfer: libzmq at ${NINFER_ZMQ_LIBRARY}; the checkpoint cache is available")
+  # The DLL has to sit beside the executable, like every other shared runtime here.
+  set(NINFER_ZMQ_RUNTIME_DLL "${PROJECT_SOURCE_DIR}/third_party/libzmq/bin/libzmq-mt-4_3_5.dll")
+  if(EXISTS "${NINFER_ZMQ_RUNTIME_DLL}")
+    list(APPEND NINFER_RUNTIME_DLLS "${NINFER_ZMQ_RUNTIME_DLL}")
+    list(REMOVE_DUPLICATES NINFER_RUNTIME_DLLS)
+  endif()
+else()
+  message(STATUS "NInfer: libzmq not found; the checkpoint cache stays disabled (set NINFER_ZMQ_ROOT)")
+endif()
