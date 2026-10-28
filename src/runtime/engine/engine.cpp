@@ -369,6 +369,24 @@ LoadSummary Engine::load_summary() const {
     return impl_->load;
 }
 
+CacheGeometry Engine::cache_geometry() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [](const auto& core) -> CacheGeometry {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+                return {};
+            } else {
+                CacheGeometry out;
+                out.page_bytes        = core->cache_page_bytes();
+                out.page_tokens       = core->cache_page_tokens();
+                out.state_image_bytes = core->cache_state_image_bytes();
+                return out;
+            }
+        },
+        impl_->core);
+}
+
 MemorySummary Engine::memory_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit(

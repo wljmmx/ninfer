@@ -56,6 +56,15 @@ private:
     friend class Engine;
 };
 
+// The sizes an external cache has to be told before it can store anything. They come from the live
+// KV page layout and the state pool, not from model constants, because every model differs in layer
+// count, head width, plane count and state dtype.
+struct CacheGeometry {
+    std::size_t page_bytes        = 0;
+    std::int64_t page_tokens      = 0;
+    std::size_t state_image_bytes = 0;
+};
+
 class Engine {
 public:
     explicit Engine(EngineOptions options);
@@ -103,6 +112,7 @@ public:
 
     [[nodiscard]] const EngineOptions& options() const;
     [[nodiscard]] LoadSummary load_summary() const;
+    [[nodiscard]] CacheGeometry cache_geometry() const;
     [[nodiscard]] MemorySummary memory_summary() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;

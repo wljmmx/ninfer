@@ -125,6 +125,9 @@ public:
 
     [[nodiscard]] ninfer::LoadSummary load_summary() const { return engine_->load_summary(); }
 
+    // Sizes an external cache needs, from the live layout. Zero fields mean the pools are not up.
+    [[nodiscard]] ninfer::CacheGeometry cache_geometry() const { return engine_->cache_geometry(); }
+
     [[nodiscard]] ninfer::MemorySummary memory_summary() const { return engine_->memory_summary(); }
 
     [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }

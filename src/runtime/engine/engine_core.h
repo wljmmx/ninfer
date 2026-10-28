@@ -57,6 +57,24 @@ public:
     using ResourceManagement = ResourceManager<ModelContract>;
     using Clock              = std::chrono::steady_clock;
 
+    // What an external cache must be registered with, from the live layout rather than a constant:
+    // layer count, head width, plane count and state dtype all differ per model.
+    [[nodiscard]] std::size_t cache_page_bytes() const {
+        return instance_.program == nullptr
+                   ? 0U
+                   : instance_.program->checkpoint_geometry().page_bytes;
+    }
+    [[nodiscard]] std::int64_t cache_page_tokens() const {
+        return instance_.program == nullptr
+                   ? 0
+                   : instance_.program->checkpoint_geometry().page_tokens;
+    }
+    [[nodiscard]] std::size_t cache_state_image_bytes() const {
+        return instance_.program == nullptr
+                   ? 0U
+                   : instance_.program->checkpoint_geometry().state_image_bytes;
+    }
+
     class RoundMasks final : public TokenMaskProvider {
     public:
         std::array<decltype(&std::declval<Request&>().output), kMaximumConcurrency> outputs{};

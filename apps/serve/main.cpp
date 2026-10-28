@@ -64,6 +64,15 @@ int main(int argc, char** argv) {
         startup_log.engine_ready(service.load_summary());
         operational_log.engine_capacity(service);
 
+        // Printed rather than assumed: these are the numbers an external cache is registered with,
+        // and they come from the live page layout and state pool. A zero means a pool is not up.
+        {
+            const ninfer::CacheGeometry geometry = service.cache_geometry();
+            logger->info("cache geometry: page {} B, {} token(s) per page, state image {} B",
+                         geometry.page_bytes, geometry.page_tokens,
+                         geometry.state_image_bytes);
+        }
+
         using Clock                            = std::chrono::steady_clock;
         const Clock::time_point warmup_started = Clock::now();
         operational_log.warmup_started();

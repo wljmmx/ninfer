@@ -95,6 +95,25 @@ public:
         return out;
     }
 
+    // What an external cache must be registered with. Read from the live layout, not from a model
+    // constant: layer count, head width, plane count and state dtype all differ per model, and a
+    // cache sized from a constant would reject every payload of the next one.
+    [[nodiscard]] std::size_t cache_page_bytes() const {
+        return instance_.program == nullptr
+                   ? 0U
+                   : instance_.program->checkpoint_geometry().page_bytes;
+    }
+    [[nodiscard]] std::int64_t cache_page_tokens() const {
+        return instance_.program == nullptr
+                   ? 0
+                   : instance_.program->checkpoint_geometry().page_tokens;
+    }
+    [[nodiscard]] std::size_t cache_state_image_bytes() const {
+        return instance_.program == nullptr
+                   ? 0U
+                   : instance_.program->checkpoint_geometry().state_image_bytes;
+    }
+
     [[nodiscard]] RuntimeStats runtime_stats() const noexcept { return {}; }
 
     [[nodiscard]] bool is_available() const {
