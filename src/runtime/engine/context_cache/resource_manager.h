@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/prefetch.h"
 #include "runtime/contract/resources.h"
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/context_cache/prefix_index.h"
@@ -81,7 +82,15 @@ public:
     explicit ResourceManager(bool enabled, ContextMachineCostModel costs,
                              std::shared_ptr<CheckpointCacheBackend> checkpoint_cache = nullptr)
         : enabled_(enabled), costs_(std::move(costs)),
-          checkpoint_cache_(std::move(checkpoint_cache)) {}
+          checkpoint_cache_(std::move(checkpoint_cache)) {
+        // Publishing costs about 1.5 s of transport for a 640-token prefix, on the path that just
+        // finished capturing. Exporting stays on the calling thread (it touches Program), the
+        // transfer does not. Three prefixes in flight is the budget: beyond that enqueue() refuses
+        // and the caller publishes synchronously rather than dropping the checkpoint.
+        if (checkpoint_cache_ != nullptr) {
+            publish_worker_ = std::make_unique<core::Prefetcher>(256ULL * 1024 * 1024);
+        }
+    }
 
     [[nodiscard]] std::vector<SourceChoice>
     candidates(Program& program, const Base& base, std::uint32_t maximum_frontier = UINT32_MAX,
@@ -302,7 +311,25 @@ public:
         // One element: the image travels whole (v6 1n).
         out.state_shards.emplace_back(reinterpret_cast<const char*>(state->bytes.data()),
                                       state->bytes.size());
-        checkpoint_cache_->store(tokens, out);
+
+        // Exporting above touches Program and has to stay on this thread. The transfer does not, and
+        // it is the expensive part (~1.5 s for 640 tokens), so it goes to the worker. If the budget
+        // is full the call falls through to a synchronous transfer: losing the checkpoint would be
+        // worse than a slow request.
+        const std::size_t bytes = out.kv_bytes.size() + state->bytes.size();
+        auto payload            = std::make_shared<CachedCheckpoint>(std::move(out));
+        std::vector<TokenId> kept(tokens.begin(), tokens.end());
+        auto backend = checkpoint_cache_;
+        if (publish_worker_ != nullptr &&
+            publish_worker_->enqueue(
+                [backend, kept = std::move(kept), payload]() {
+                    backend->store(kept, *payload);
+                    return true;
+                },
+                bytes, /*due=*/1, /*now=*/0)) {
+            return;
+        }
+        backend->store(kept, *payload);
     }
 
     void retain_source(Program& program, std::uint64_t request, const SourceChoice& choice) {
@@ -1678,6 +1705,7 @@ private:
     bool enabled_;
     ContextMachineCostModel costs_;
     std::shared_ptr<CheckpointCacheBackend> checkpoint_cache_;
+    std::unique_ptr<core::Prefetcher> publish_worker_;
     PrefixIndex<Model> index_;
     std::vector<Owner> owners_;
     std::vector<Shared> shared_;
