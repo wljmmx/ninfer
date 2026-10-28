@@ -32,6 +32,8 @@ struct ReclaimPlan;
 struct DemotionBatch;
 class ProgramImpl;
 struct ContractAccess;
+// Only ever held by shared_ptr in this header (restore identity); defined in the implementation.
+struct PreparedCaptureBacking;
 } // namespace detail
 class SequencePlanner;
 class Program;
@@ -458,6 +460,12 @@ public:
     [[nodiscard]] std::optional<CheckpointExport> export_checkpoint(CheckpointHandle checkpoint);
     [[nodiscard]] std::optional<CheckpointStateExport> export_state(CheckpointHandle checkpoint);
     [[nodiscard]] CheckpointTierGeometry checkpoint_geometry() const;
+    // Restores a checkpoint from bytes an external cache handed back, pricing the fingerprint from
+    // the live layout. Returns nullopt when the bytes do not fit this program; error says why.
+    [[nodiscard]] std::optional<CheckpointHandle> import_checkpoint_current_layout(
+        const CheckpointExport& kv, const std::vector<std::string>& state_shards,
+        std::shared_ptr<const detail::PreparedCaptureBacking> identity = nullptr,
+        const PrefixShortlistKey* key = nullptr, std::string* error = nullptr);
     [[nodiscard]] CheckpointMetadata checkpoint_metadata(CheckpointHandle checkpoint) const;
     [[nodiscard]] bool checkpoint_matches(CheckpointHandle checkpoint,
                                           const RequestBasePlan& base) const;

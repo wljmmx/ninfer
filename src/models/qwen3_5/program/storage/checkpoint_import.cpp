@@ -24,6 +24,18 @@
 
 namespace ninfer::models::qwen3_5::detail {
 
+std::optional<CheckpointHandle> ProgramImpl::import_checkpoint_current_layout(
+    const CheckpointExport& kv, const std::vector<std::string>& state_shards,
+    std::shared_ptr<const PreparedCaptureBacking> identity, const PrefixShortlistKey* key,
+    std::string* error) {
+    ninfer::core::fingerprint::CheckpointFingerprint want;
+    host_state_fingerprint(want);
+    std::string local;
+    auto handle = import_checkpoint(kv, state_shards, want, local, std::move(identity), key);
+    if (!handle && error != nullptr) { *error = std::move(local); }
+    return handle;
+}
+
 std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
     const CheckpointExport& kv, const std::vector<std::string>& state_shards,
     const ninfer::core::fingerprint::CheckpointFingerprint& want, std::string& error,
