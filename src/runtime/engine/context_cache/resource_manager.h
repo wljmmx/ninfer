@@ -128,6 +128,16 @@ public:
             contains(waiting->held, *waiting->choice.source.checkpoint)) {
             result.push_back(waiting->choice);
         }
+        // Only when the local pool has nothing reusable. candidates() always appends an empty source
+        // (the prefill choice) just above, so "no candidates" is never the question -- the question
+        // is whether any candidate actually carries a checkpoint.
+        if (enabled_ && checkpoint_cache_ != nullptr &&
+            std::none_of(result.begin(), result.end(),
+                         [](const SourceChoice& c) { return c.source.checkpoint.has_value(); })) {
+            if (auto restored = restore_from_cache(program, base)) {
+                result.push_back(std::move(*restored));
+            }
+        }
         std::erase_if(
             result, [&](auto& choice) { return !prepare_source(program, base, choice, request); });
         const auto cost = [&](const Source& source) {
@@ -171,6 +181,50 @@ public:
             if (!duplicate) { unique.push_back(std::move(choice)); }
         }
         return unique;
+    }
+
+    // Fetches a checkpoint from the external cache and imports it as a candidate. Called only when
+    // the local pool has nothing; a miss, a malformed payload or an import that the layout refuses
+    // all mean the same thing to the caller -- prefill as before.
+    [[nodiscard]] std::optional<SourceChoice> restore_from_cache(Program& program, const Base& base) {
+        const auto tokens = base.prompt_tokens();
+        if (tokens.empty()) { return std::nullopt; }
+        auto cached = checkpoint_cache_->fetch(tokens);
+        if (!cached || cached->page_bytes == 0 || cached->kv_bytes.empty()) { return std::nullopt; }
+
+        typename Model::CheckpointExport kv;
+        kv.page_bytes = cached->page_bytes;
+        kv.page_count = static_cast<std::uint32_t>(cached->kv_bytes.size() / cached->page_bytes);
+        if (kv.page_count == 0) { return std::nullopt; }
+        kv.kv_bytes = std::move(cached->kv_bytes);
+        // The cache stores bytes and the page count, not coverage history. A restored page has no
+        // local content epoch, so zero is the honest value; it only feeds the "did this page change
+        // under me" check, which cannot apply to bytes that were just written.
+        kv.epochs.assign(kv.page_count, 0);
+        // The frontier is a property of the request, not of the payload: it is the token prefix the
+        // checkpoint covers. A wrong value would import fine and then never match.
+        kv.frontier = static_cast<std::uint32_t>(tokens.size());
+
+        std::string error;
+        const auto handle = program.import_checkpoint_current_layout(
+            kv, cached->state_shards, base.capture_backing(), nullptr, &error);
+        if (!handle) {
+            std::fprintf(stderr, "[lmcache] restore failed: %s\n", error.c_str());
+            return std::nullopt;
+        }
+
+        SourceChoice choice;
+        choice.source.checkpoint = *handle;
+        // Both of these are required, and neither is obvious from the candidate's shape:
+        //   * private_points is what actually holds the record. Without it the new owner has no
+        //     points and prune() reclaims a freshly restored checkpoint out from under the request.
+        //   * reused_tokens is what tells adopt() this candidate carries evidence; at zero it skips
+        //     the branch that registers the owner at all.
+        choice.source.private_points.push_back(*handle);
+        choice.source.reused_tokens = kv.frontier;
+        choice.owner                = 0;
+        choice.ordinal              = ++ordinal_;
+        return choice;
     }
 
     // Evaluation grants consumption rights but does not retire anything. Native checks the

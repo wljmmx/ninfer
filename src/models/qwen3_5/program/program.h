@@ -115,6 +115,9 @@ public:
     // The prompt as the model will see it. Read-only, and the only identity an external cache can be
     // keyed by: a checkpoint is addressed by its token sequence, nothing else.
     [[nodiscard]] std::span<const TokenId> prompt_tokens() const noexcept;
+    // What a restored checkpoint must carry to be findable later. Without it the record is readable
+    // and checkpoint_matches() never accepts it -- the comparison is on identity, not on bytes.
+    [[nodiscard]] std::shared_ptr<const detail::PreparedCaptureBacking> capture_backing() const noexcept;
     [[nodiscard]] std::vector<std::uint32_t> capture_frontiers() const;
     [[nodiscard]] std::optional<PrefixShortlistKey>
     prefix_shortlist_key(std::uint32_t frontier) const noexcept;

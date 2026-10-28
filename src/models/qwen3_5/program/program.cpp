@@ -90,6 +90,11 @@ std::span<const TokenId> RequestBasePlan::prompt_tokens() const noexcept {
     return impl_->prompt->token_ids;
 }
 
+std::shared_ptr<const detail::PreparedCaptureBacking> RequestBasePlan::capture_backing() const
+    noexcept {
+    return impl_ != nullptr ? impl_->capture_backing : nullptr;
+}
+
 std::vector<std::uint32_t> RequestBasePlan::capture_frontiers() const {
     std::vector<std::uint32_t> frontiers;
     if (impl_) {

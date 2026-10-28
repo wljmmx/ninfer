@@ -27,6 +27,9 @@ struct RuntimeTypes {
     using FinishResult      = qwen3_5::FinishResult;
     using AbortResult       = qwen3_5::AbortResult;
     using Program           = qwen3_5::Program;
+    // Namespace-level, not nested in Program, so the runtime layer needs it named here to build the
+    // payload an external cache hands back.
+    using CheckpointExport  = qwen3_5::CheckpointExport;
     using CacheSessionKey   = qwen3_5::PreparedSessionKey;
 };
 } // namespace ninfer::models::qwen3_5
