@@ -126,7 +126,12 @@ public:
 
         ninfer::CachedCheckpoint out;
         out.page_bytes = page_bytes_;
-        out.kv_bytes   = std::move(kv);
+        // The coverage, not the prompt length: a lookup addresses whole chunks, so 410 tokens may
+        // only ever resolve to 384. Reporting 410 would claim a prefix the record does not have,
+        // and every later check compares against the record's real frontier.
+        out.frontier = static_cast<std::uint32_t>(prompt_tokens.size() / chunk_tokens_ *
+                                                  chunk_tokens_);
+        out.kv_bytes = std::move(kv);
         // One element: the image travels whole (v6 1n). The sharded layout exists for transport
         // sizing, not for import.
         out.state_shards.emplace_back(reinterpret_cast<const char*>(state.data()), state.size());

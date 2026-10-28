@@ -30,8 +30,29 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint_current_layout(
     std::string* error) {
     ninfer::core::fingerprint::CheckpointFingerprint want;
     host_state_fingerprint(want);
+
+    // A cache stores the image as one blob (it has no reason to shard it), while the import path
+    // joins self-describing shards and refuses anything without a header. Splitting here keeps that
+    // requirement local: the caller hands over what it has, and the format it has to be in stays a
+    // property of this path rather than something every producer must know.
+    std::vector<std::string> shards = state_shards;
+    if (shards.size() == 1 && !shards[0].empty()) {
+        ninfer::core::state_shards::RegionSizes sizes;
+        sizes.conv_bytes  = want.state_conv_bytes;
+        sizes.layer_bytes = want.state_layer_bytes;
+        sizes.layers      = want.state_layers;
+        const std::uint64_t covered = sizes.conv_bytes + sizes.layer_bytes * sizes.layers;
+        sizes.tail_bytes =
+            want.state_image_bytes > covered ? want.state_image_bytes - covered : 0;
+        const auto split =
+            ninfer::core::state_shards::split(shards[0], sizes, 6ull * 1024 * 1024);
+        // A shard that already carries a header also arrives as one element; split() refusing it is
+        // the signal to pass it through untouched rather than a failure.
+        if (split.ok) { shards = split.shards; }
+    }
+
     std::string local;
-    auto handle = import_checkpoint(kv, state_shards, want, local, std::move(identity), key);
+    auto handle = import_checkpoint(kv, shards, want, local, std::move(identity), key);
     if (!handle && error != nullptr) { *error = std::move(local); }
     return handle;
 }

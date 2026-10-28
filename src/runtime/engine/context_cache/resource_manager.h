@@ -210,9 +210,12 @@ public:
         // local content epoch, so zero is the honest value; it only feeds the "did this page change
         // under me" check, which cannot apply to bytes that were just written.
         kv.epochs.assign(kv.page_count, 0);
-        // The frontier is a property of the request, not of the payload: it is the token prefix the
-        // checkpoint covers. A wrong value would import fine and then never match.
-        kv.frontier = static_cast<std::uint32_t>(tokens.size());
+        // The frontier is what the record actually covers, reported by the cache: a lookup addresses
+        // whole chunks, so a 410-token prompt resolves to 384. Filling in the prompt length here
+        // would describe a prefix that does not exist, and inspect_source re-checks
+        // checkpoint_matches -- the candidate would simply be filtered out and the request would
+        // prefill as if nothing had been restored.
+        kv.frontier = cached->frontier;
 
         std::string error;
         // Without this key the record is readable and never matchable: checkpoint_matches compares
