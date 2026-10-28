@@ -76,8 +76,12 @@ public:
         std::uint64_t ordinal           = 0;
     };
 
-    explicit ResourceManager(bool enabled, ContextMachineCostModel costs)
-        : enabled_(enabled), costs_(std::move(costs)) {}
+    // The backend is optional and only consulted when the local pool yields no candidate; an
+    // empty one keeps every existing path byte-identical.
+    explicit ResourceManager(bool enabled, ContextMachineCostModel costs,
+                             std::shared_ptr<CheckpointCacheBackend> checkpoint_cache = nullptr)
+        : enabled_(enabled), costs_(std::move(costs)),
+          checkpoint_cache_(std::move(checkpoint_cache)) {}
 
     [[nodiscard]] std::vector<SourceChoice>
     candidates(Program& program, const Base& base, std::uint32_t maximum_frontier = UINT32_MAX,
@@ -1585,6 +1589,7 @@ private:
 
     bool enabled_;
     ContextMachineCostModel costs_;
+    std::shared_ptr<CheckpointCacheBackend> checkpoint_cache_;
     PrefixIndex<Model> index_;
     std::vector<Owner> owners_;
     std::vector<Shared> shared_;

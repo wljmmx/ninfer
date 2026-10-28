@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -154,6 +155,32 @@ struct StartupObserver {
     std::function<void(const StartupEvent& event)> callback;
 };
 
+// What an external cache hands back: the raw checkpoint, in the shape the import path already
+// takes. The transport lives outside the engine, so nothing here names a protocol.
+struct CachedCheckpoint {
+    // Tokens the checkpoint covers. The caller derives it from the request, because the cache only
+    // stores bytes and a wrong frontier silently makes the record unmatchable.
+    std::uint32_t frontier   = 0;
+    std::size_t page_bytes   = 0;
+    std::vector<std::byte> kv_bytes;
+    // One entry for a whole state image. The sharded layout exists for transport sizing, not for
+    // import, so a cache that sends the image whole passes a single element.
+    std::vector<std::string> state_shards;
+};
+
+// A checkpoint cache the engine does not own. Deliberately narrow: a lookup either yields an
+// importable checkpoint or nothing, and a miss is not an error -- the request prefills as before.
+class CheckpointCacheBackend {
+public:
+    CheckpointCacheBackend()                                     = default;
+    virtual ~CheckpointCacheBackend()                            = default;
+    CheckpointCacheBackend(const CheckpointCacheBackend&)            = delete;
+    CheckpointCacheBackend& operator=(const CheckpointCacheBackend&) = delete;
+
+    [[nodiscard]] virtual std::optional<CachedCheckpoint>
+    fetch(std::span<const TokenId> prompt_tokens) = 0;
+};
+
 struct ContextCacheOptions {
     // Controls cross-request history reads and writes. Request pause/replay resources remain
     // available when history is disabled.
@@ -208,6 +235,11 @@ struct EngineOptions {
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     StartupObserver startup_observer;
+    // Optional. When set, the request path asks it for a checkpoint once the local pool has no
+    // candidate, and prefills as usual if it has nothing. Empty means the engine never looks
+    // outside itself. It lives here for the same reason startup_observer does: options already
+    // carry the runtime pieces the engine calls back into, and this is one more.
+    std::shared_ptr<CheckpointCacheBackend> checkpoint_cache;
 };
 
 enum class SamplingMode : std::uint8_t {
