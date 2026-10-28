@@ -1,6 +1,11 @@
 #pragma once
 #include "ninfer/types.h"
 #include "runtime/contract/request.h"
+// Complete, not forward-declared: the constructor below takes unique_ptr<GrammarSession>, so every
+// translation unit that constructs or destroys an OutputSession instantiates default_delete for it.
+// With only a forward declaration that instantiation is ill-formed -- C++20 tolerated it, the
+// standard library's current completeness check does not.
+#include "text/grammar.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -9,10 +14,6 @@
 #include <span>
 #include <string>
 #include <vector>
-
-namespace ninfer::text {
-class GrammarSession;
-}
 
 namespace ninfer::models::qwen3_5 {
 namespace frontend {
