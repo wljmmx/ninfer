@@ -184,6 +184,23 @@ void collision_check(const ClientOptions& options, std::int64_t instance, std::s
 }
 
 
+// Profile E: the same rk4v4 bytes, but expressed the only way that generalises -- one plane, one
+// token, N elements. The engine's Host page layout is plane-major and carries four planes for a
+// quantized format (K data, K scales, V data, V scales); the server can express two at most, so any
+// shape naming planes is a shape that fits one format only. This states the byte count instead.
+BridgeConfig profile_exact_rk4v4() {
+    BridgeConfig config;
+    config.model_name      = "bridge-rk4v4-exact";
+    config.page_tokens     = 64;
+    config.pages_per_chunk = 2;
+    config.page_bytes      = 675840;
+    config.kv              = GroupSpec::exact("uint8", 2 * config.page_bytes);
+    config.state           = GroupSpec::exact("bfloat16", 16777216);
+    config.state.window_chunks = 1;
+    config.state.recurrent     = true;
+    return config;
+}
+
 bool run(const ClientOptions& options, const BridgeConfig& config, std::int64_t instance,
          std::size_t pages) {
     Bridge bridge;
@@ -266,6 +283,7 @@ int main(int argc, char** argv) {
     if (!run(options, profile_b(), instance + 1, pages)) { ++failures; }
     if (!run(options, profile_rk4v4(), instance + 2, pages)) { ++failures; }
     if (!run(options, profile_rk4v2(), instance + 3, pages)) { ++failures; }
+    if (!run(options, profile_exact_rk4v4(), instance + 4, pages)) { ++failures; }
     // Far from the run() range: a smaller offset collided with the next invocation's base instance,
     // and the collision then showed up as "same size, different bytes" in an unrelated profile.
     collision_check(options, instance + 500, pages);

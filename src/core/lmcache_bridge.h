@@ -58,6 +58,28 @@ struct GroupSpec {
     [[nodiscard]] std::size_t object_bytes() const {
         return shape_bytes(shape) * dtype_itemsize(dtype);
     }
+
+    // The only shape that fits every case: one plane, one token, N elements. The engine's Host page
+    // layout is plane-major and a quantized format has FOUR planes per layer (K data, K scales, V
+    // data, V scales), while the server can only express one or two -- so any shape that names the
+    // planes is a shape that will not fit the next format. Bytes are the invariant; this states them
+    // and nothing else.
+    //
+    // uint8 is used when the byte count is not a whole number of the natural element, because the
+    // server only checks prod(shape) x itemsize and an arbitrary stride (page records are aligned,
+    // not sized to an element) is not always evenly divisible.
+    [[nodiscard]] static GroupSpec exact(std::string dtype, std::size_t bytes) {
+        std::size_t itemsize = dtype_itemsize(dtype);
+        if (itemsize == 0 || bytes == 0 || bytes % itemsize != 0) {
+            dtype = "uint8";
+            itemsize = 1;
+        }
+        GroupSpec spec;
+        spec.dtype    = std::move(dtype);
+        spec.shape    = {1, 1, static_cast<std::int64_t>(bytes / itemsize)};
+        spec.kv_size  = 1;
+        return spec;
+    }
 };
 
 struct BridgeConfig {
