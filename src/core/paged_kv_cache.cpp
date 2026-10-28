@@ -403,7 +403,20 @@ bool DeviceKVPagePool::can_resize_reservation(const DeviceKVPageReservation& res
 
 void DeviceKVPagePool::resize_reservation(DeviceKVPageReservation& reservation,
                                           std::uint32_t new_reserved_pages) {
-    if (!can_resize_reservation(reservation, new_reserved_pages)) { throw std::bad_alloc(); }
+    if (!can_resize_reservation(reservation, new_reserved_pages)) {
+        // The same diagnostic reserve() has, for the same reason: a bare bad_alloc becomes
+        // "bad allocation" three frames up and cannot be attributed to anything. This path had no
+        // print, which is why a 1024-column prefill failure looked like a mystery.
+        if (std::getenv("NINFER_ALLOC_DEBUG") != nullptr) {
+            std::fprintf(stderr,
+                         "[alloc] kv resize wants %u page(s) (had %u): %u allocated + %u reserved "
+                         "of %u\n",
+                         new_reserved_pages, reservation.pages_, allocated_pages_, reserved_pages_,
+                         capacity_pages());
+            std::fflush(stderr);
+        }
+        throw std::bad_alloc();
+    }
     reserved_pages_    = reserved_pages_ - reservation.pages_ + new_reserved_pages;
     reservation.pages_ = new_reserved_pages;
 }
