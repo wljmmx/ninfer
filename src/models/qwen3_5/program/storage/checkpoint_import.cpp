@@ -187,11 +187,6 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
             error = "could not fill the Device copies of the restored pages";
             return std::nullopt;
         }
-        for (const LogicalKVPageHandle page : pages) {
-            if (text_kv_pages->writer_references(page) != 0) {
-                text_kv_pages->set_writer(page, false);
-            }
-        }
     }
     // From here on, a failure has to give back the published extent and the pages behind it. The
     // pages come with their Device leases, so one release per page covers both tiers.
@@ -222,6 +217,18 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
     // the protection below would refuse a frontier above zero.
     text_kv_addresses->commit_inactive_frontier(*address, kv.frontier);
     text_kv_addresses->set_checkpoint_requirement(*address, kv.frontier);
+
+    // Only now are the pages made read-only, and the order is not cosmetic: commit_coverage() above
+    // requires writer_references == 1, while can_pin_source() -- what a later fork needs -- requires
+    // 0. Clearing the flag before the commit made the import itself throw "committed coverage is not
+    // monotonic"; clearing it after leaves these pages in the state a captured-then-demoted record
+    // has, which is what the fork path expects.
+
+    for (const LogicalKVPageHandle page : pages) {
+        if (text_kv_pages->writer_references(page) != 0) {
+            text_kv_pages->set_writer(page, false);
+        }
+    }
 
     // 5. The record.
     const auto handle = reserve_checkpoint();
