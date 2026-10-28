@@ -149,7 +149,15 @@ public:
 
         std::vector<std::byte> kv;
         std::vector<std::byte> state;
+        // Timed, because "the cache took 0.9 s" and "the cache took 0.2 s" lead to different next
+        // steps, and the serve log's queue_wait_seconds covers the whole admission path (fetch, import,
+        // Device copies) without saying how much of it is the cache.
+        const auto fetch_started = std::chrono::steady_clock::now();
         if (!bridge_->restore(key, &kv, &state)) { return std::nullopt; }
+        const double fetch_seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - fetch_started).count();
+        std::fprintf(stderr, "[lmcache] fetch %zu KV byte(s) + %zu state byte(s) in %.3f s\n",
+                     kv.size(), state.size(), fetch_seconds);
         if (page_bytes_ == 0 || kv.size() % page_bytes_ != 0) { return std::nullopt; }
 
         ninfer::CachedCheckpoint out;
