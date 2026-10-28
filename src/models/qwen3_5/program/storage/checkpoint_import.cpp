@@ -105,19 +105,10 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
             return std::nullopt;
         }
         std::memcpy(view.data(), kv.kv_bytes.data(), expected);
-        std::fprintf(stderr, "[ckpt] import: after memcpy, view[0]=0x%02X want=0x%02X\n",
-                     static_cast<unsigned>(view.data()[0]),
-                     static_cast<unsigned>(kv.kv_bytes[0]));
+        // No diagnostics here. There was a pair of fprintf calls printing the first byte before and
+        // after publish while the byte-for-byte mismatch was being chased; they belong to that
+        // investigation, not to every restore, and they printed payload bytes into the server log.
         published = host_kv_extents->publish(std::move(*reservation));
-        {
-            const auto check = host_kv_extents->page_view(*text_kv_pages, pages[0]);
-            if (check && check->valid()) {
-                std::fprintf(stderr, "[ckpt] import: after publish, page0[0]=0x%02X\n",
-                             static_cast<unsigned>(check->data()[0]));
-            } else {
-                std::fprintf(stderr, "[ckpt] import: after publish, page0 view invalid\n");
-            }
-        }
 
         // The Device copy is deliberately not made here. A restored checkpoint is a Host-only
         // artifact, exactly like one that was captured and demoted, and restore_addressed_host_pages()
