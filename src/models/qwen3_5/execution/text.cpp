@@ -1253,10 +1253,22 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                          : (prefill ? nvtx::Name::PrefillGdn : nvtx::Name::VerifyGdn),
                     full ? nvtx::Category::Attention : nvtx::Category::Gdn, layer);
                 auto scope = work_.scope();
+                const bool trace_stage =
+                    std::getenv("NINFER_ALLOC_DEBUG") != nullptr && layer == 0;
+                if (trace_stage) {
+                    std::fprintf(stderr, "[stage] layer %zu mixer start: used %zu\n", layer,
+                                 work_.used());
+                    std::fflush(stderr);
+                }
                 if (full) {
                     attn_mix(block, x, compact, ph);
                 } else {
                     gdn_mix(block, x, compact, ph);
+                }
+                if (trace_stage) {
+                    std::fprintf(stderr, "[stage] layer %zu mixer end: used %zu\n", layer,
+                                 work_.used());
+                    std::fflush(stderr);
                 }
                 if (std::getenv("NINFER_ALLOC_DEBUG") != nullptr &&
                     work_.used() * 10 >= work_.capacity() * 9) {
@@ -1270,7 +1282,19 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                                                 : nvtx::Name::VerifyPostMixer,
                                         nvtx::Category::PostMixer, layer);
                 auto scope = work_.scope();
+                const bool trace_stage =
+                    std::getenv("NINFER_ALLOC_DEBUG") != nullptr && layer == 0;
+                if (trace_stage) {
+                    std::fprintf(stderr, "[stage] layer %zu post-mixer start: used %zu\n", layer,
+                                 work_.used());
+                    std::fflush(stderr);
+                }
                 mlp_tail(block, x, ph, next_projection_hints(static_cast<int>(layer)));
+                if (trace_stage) {
+                    std::fprintf(stderr, "[stage] layer %zu post-mixer end: used %zu\n", layer,
+                                 work_.used());
+                    std::fflush(stderr);
+                }
                 if (std::getenv("NINFER_ALLOC_DEBUG") != nullptr &&
                     work_.used() * 10 >= work_.capacity() * 9) {
                     std::fprintf(stderr, "[stage] layer %zu post-mixer: used %zu of %zu\n", layer,
