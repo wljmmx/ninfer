@@ -212,7 +212,17 @@ DeviceSpan DeviceArena::alloc_bytes(std::size_t bytes, std::size_t align) {
         throw std::overflow_error("arena allocation end offset overflows size_t");
     }
     const std::size_t end = aligned_offset + bytes;
-    if (end > cap_) { throw std::bad_alloc(); }
+    if (end > cap_) {
+        // The same diagnostic MemoryArena carries, for the same reason: a bare bad_alloc becomes
+        // "bad allocation" a few frames up and cannot be attributed to anything. Need vs capacity is
+        // the number that says whether the arena is undersized or the request outgrew it.
+        if (std::getenv("NINFER_ALLOC_DEBUG") != nullptr) {
+            std::fprintf(stderr, "[alloc] device arena wants %zu byte(s) at offset %zu, holds %zu\n",
+                         bytes, aligned_offset, cap_);
+            std::fflush(stderr);
+        }
+        throw std::bad_alloc();
+    }
 
     auto* ptr = static_cast<unsigned char*>(base_) + aligned_offset;
     off_      = end;
