@@ -1270,6 +1270,16 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 tap.capture_layer(static_cast<int>(layer), x, ctx_.stream);
             }
         } catch (const std::exception& error) {
+            // The arena state at the failure is the only thing that says whether the plan sized the
+            // workspace for this width or whether the request outgrew it. Printed before the rethrow
+            // so the numbers survive the single-line error the caller reports.
+            if (std::getenv("NINFER_ALLOC_DEBUG") != nullptr) {
+                std::fprintf(stderr,
+                             "[alloc] layer %zu %s failed at columns=%d: arena peak %zu of %zu\n",
+                             layer, prefill ? "prefill" : "verify", x.ne[1], work_.peak_used(),
+                             work_.capacity());
+                std::fflush(stderr);
+            }
             throw std::runtime_error("text/layers/" + std::to_string(layer) +
                                      (prefill ? " prefill" : " verify") +
                                      " columns=" + std::to_string(x.ne[1]) + ": " + error.what());
