@@ -1258,6 +1258,12 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 } else {
                     gdn_mix(block, x, compact, ph);
                 }
+                if (std::getenv("NINFER_ALLOC_DEBUG") != nullptr &&
+                    work_.used() * 10 >= work_.capacity() * 9) {
+                    std::fprintf(stderr, "[stage] layer %zu %s mixer: used %zu of %zu\n", layer,
+                                 full ? "full" : "gdn", work_.used(), work_.capacity());
+                    std::fflush(stderr);
+                }
             }
             {
                 nvtx::ScopedRange range(prefill ? nvtx::Name::PrefillPostMixer
@@ -1265,6 +1271,12 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                                         nvtx::Category::PostMixer, layer);
                 auto scope = work_.scope();
                 mlp_tail(block, x, ph, next_projection_hints(static_cast<int>(layer)));
+                if (std::getenv("NINFER_ALLOC_DEBUG") != nullptr &&
+                    work_.used() * 10 >= work_.capacity() * 9) {
+                    std::fprintf(stderr, "[stage] layer %zu post-mixer: used %zu of %zu\n", layer,
+                                 work_.used(), work_.capacity());
+                    std::fflush(stderr);
+                }
             }
             if constexpr (Tap::enabled) {
                 tap.capture_layer(static_cast<int>(layer), x, ctx_.stream);
