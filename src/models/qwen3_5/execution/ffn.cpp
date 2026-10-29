@@ -737,9 +737,25 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
             // rounds the residual once, exactly like the device epilogue.
             const auto shared_f32 = static_cast<std::size_t>(moe->profile.routed.ffn.hidden) *
                                     static_cast<std::size_t>(last) * sizeof(float);
+            // streamed_ffn() also allocates the read-back pack and the CPU merge term straight from
+            // the arena, and this formula used to leave both out. Measured consequence: the plan
+            // reported 72,097,792 for a 1024-column chunk while a 921-column prefill already needed
+            // 72,195,840, so anything above ~900 columns died in layer 0 with std::bad_alloc. The
+            // merge term alone is hidden x columns x 4 -- 8.4 MB at 1024 -- which is the size of the
+            // gap that was measured.
+            const std::size_t handoff_x =
+                static_cast<std::size_t>(moe->profile.routed.ffn.hidden) *
+                static_cast<std::size_t>(last);
+            const std::size_t handoff_ids =
+                static_cast<std::size_t>(moe->profile.routed.top_k) *
+                static_cast<std::size_t>(last);
+            const std::size_t pack = ops::moe_pack_host_fetch_bytes(
+                handoff_x * 2, handoff_x * 2, handoff_ids * 4, handoff_ids * 4);
+            const std::size_t host_term = handoff_x * sizeof(float);
             return stream_route_tensor_bytes(*moe, last) + shared_f32 +
                    std::max(stream_route_bytes(*moe, first, last),
-                            stream_expert_bytes(*moe, first, last));
+                            stream_expert_bytes(*moe, first, last)) +
+                   pack + host_term;
         }
         return ops::topk_softmax_swiglu_moe_workspace_capacity_bytes(
             moe->profile, ops::MoeEpilogue::AddResidual, first, last);

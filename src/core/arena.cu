@@ -227,6 +227,13 @@ DeviceSpan DeviceArena::alloc_bytes(std::size_t bytes, std::size_t align) {
     auto* ptr = static_cast<unsigned char*>(base_) + aligned_offset;
     off_      = end;
     if (off_ > peak_) { peak_ = off_; }
+    if (bytes >= (1u << 20) && std::getenv("NINFER_ALLOC_TRACE") != nullptr) {
+        // Every large allocation, in order, with where it landed. This is what reconciles a plan
+        // number against the runtime: a capacity that is 8 MB short names itself here.
+        std::fprintf(stderr, "[trace] alloc %zu byte(s) at %zu, used %zu of %zu\n", bytes,
+                     aligned_offset, off_, cap_);
+        std::fflush(stderr);
+    }
     return DeviceSpan{ptr, bytes};
 }
 
