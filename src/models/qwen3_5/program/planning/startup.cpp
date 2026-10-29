@@ -765,6 +765,17 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         }
     }
 
+    if (std::getenv("NINFER_ALLOC_DEBUG") != nullptr) {
+        // Which of the seven stages actually sizes the work arena, and by how much. Without this
+        // the capacity is one opaque number and a request that outgrows it cannot be attributed to
+        // a stage.
+        std::fprintf(stderr,
+                     "[stage] workspace: prefill %zu round %zu mtp_prefill %zu mtp_round %zu "
+                     "dflash_ctx %zu dflash_round %zu causal_score %zu chunk %u\n",
+                     out.text_prefill, out.ordinary_round, out.mtp_prefill, out.mtp_round,
+                     out.dflash_context, out.dflash_round, out.causal_score, plan.prefill_chunk);
+        std::fflush(stderr);
+    }
     out.general_capacity =
         std::max({out.text_prefill, out.ordinary_round, out.mtp_prefill, out.mtp_round,
                   out.dflash_context, out.dflash_round, out.causal_score});
