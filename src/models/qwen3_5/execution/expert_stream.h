@@ -86,6 +86,16 @@ public:
         std::uint64_t inside = 0;
     };
     [[nodiscard]] Coverage coverage() const noexcept { return coverage_; }
+    // port (sm_89): what the last ensure() call spent, split by node, so the layer timeline can say
+    // where a split token goes instead of folding routing, layout and upload into one number. The
+    // clocks are taken unconditionally - three steady_clock reads per layer - and only the reporting
+    // is gated on NINFER_SPLIT_TIMING.
+    struct StepCost {
+        double route_ms  = 0.0; // the route ids, only when the caller has none to hand over
+        double layout_ms = 0.0; // hot set, slot publish, mask and offset tables
+        double upload_ms = 0.0; // prepare + wait_for_progress
+    };
+    [[nodiscard]] StepCost last_cost() const noexcept { return last_cost_; }
     // port (sm_89): how many slots a frozen set must leave free. Measured on real text, a token
     // misses 0.57 experts a layer at 163 slots (p99 = 3) and 0.91 at 109 (p99 = 4), so a percentage
     // of the pool over-reserves badly at the large end - 15% of 163 is 24 slots for a p99 of 3 -
@@ -189,6 +199,7 @@ private:
     std::uint64_t steps_ = 0;
     // Routed entries published so far and how many were already resident (see Coverage).
     Coverage coverage_{};
+    StepCost last_cost_{};
     // Misses per step, histogram 0..32, decayed so a new workload is not held hostage. One
     // sample per step: the spill region holds every lane's miss at once (8 lanes x 8 experts).
     std::array<std::uint32_t, 33> miss_hist_{};

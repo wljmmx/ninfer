@@ -6,6 +6,7 @@
 #include "core/device_scope.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -90,6 +91,13 @@ struct ExpertCache::Impl {
     // each image would otherwise pay its own cudaStreamSynchronize (~2.5 ms of WDDM submission on
     // sm_89). The staging buffer therefore holds one slot image per batch position.
     static constexpr std::size_t kUploadBatch = 4;
+    // port (sm_89): the staging slots are a ring, not a per-turn scratch pad. A staged image may not
+    // be overwritten until its copy has landed, and the old shape enforced that with one
+    // cudaStreamSynchronize per turn - forty of them a decode token, ~0.2-0.3 ms each on this driver.
+    // With a ring each slot only waits for the copy that used it kStagingRing slots ago, which is a
+    // dozen layers back and therefore certainly finished, so the wait costs nothing and the copies
+    // stay asynchronous.
+    static constexpr std::size_t kStagingRing = 32;
     // port (sm_89): one layer's uploads are independent copies - distinct slots, distinct sources,
     // one direction - so the batch API can submit them as one. A submission costs ~10 us on this
     // driver whatever its size, and a split layer makes up to a dozen of them; the batch form also
@@ -105,6 +113,12 @@ struct ExpertCache::Impl {
     static constexpr std::uint64_t kMinimumHotSet = 8;
     std::size_t max_entry_bytes               = 0;
     std::unique_ptr<PinnedHostBuffer> staging;
+    // Ring cursor for the slots above, and one event per slot recording when that slot's copy was
+    // queued. Before a slot is reused its event is waited on, which is the only ordering the ring
+    // needs: the data path itself is already ordered by the consumer stream.
+    std::size_t staging_cursor = 0;
+    std::array<cudaEvent_t, kStagingRing> staging_event{};
+    std::vector<std::size_t> staging_used;
     // port (sm_89): the stream the consumer runs on. Uploads queued there are ordered before the
     // kernels that read them, so a Host-replica upload needs no barrier at all.
     cudaStream_t upload_stream = nullptr;
@@ -163,7 +177,7 @@ struct ExpertCache::Impl {
           max_entry_bytes(req.max_entry_bytes),
           staging(req.max_entry_bytes
                       ? std::make_unique<PinnedHostBuffer>(
-                            static_cast<std::size_t>(req.max_entry_bytes) * kUploadBatch)
+                            static_cast<std::size_t>(req.max_entry_bytes) * kStagingRing)
                       : nullptr) {
         if (req != describe_expert_cache(specs, req.config)) {
             throw std::invalid_argument("expert cache requirements differ from their sources");
@@ -570,11 +584,18 @@ struct ExpertCache::Impl {
                 }
                 auto* host_base = static_cast<std::byte*>(staging->data()) +
                                   staging_slot * max_entry_bytes;
+                // This slot is about to be overwritten. Its previous copy was queued kStagingRing
+                // turns ago; waiting on that event is a bookkeeping check, not a stall - but if the
+                // ring were ever made small enough to matter, the wait would still be correct.
+                if (staging_event[staging_slot] != nullptr) {
+                    (void)cudaEventSynchronize(staging_event[staging_slot]);
+                }
                 file_reader->read_entry(
                     *file, {host_base, static_cast<std::size_t>(file->image_bytes)});
                 ++stat_staged;
                 if (batch != nullptr) {
                     ++stat_push;
+                    staging_used.push_back(staging_slot);
                     batch->push_back({base, host_base, static_cast<std::size_t>(file->image_bytes)});
                     entry.ready    = true;
                     entry.last_use = ++epoch;
@@ -632,6 +653,7 @@ ExpertCache::ExpertCache(std::span<const ExpertBankSpec> specs,
 ExpertCache::~ExpertCache() = default;
 
 void ExpertCache::prepare(std::span<const ExpertCacheKey> required, cudaStream_t stream) {
+    const auto begin = std::chrono::steady_clock::now();
     // Experts the pool does not hold are dropped here: the caller masks them out of the GPU job and
     // serves them from the host tier, so uploading them would only evict a resident expert.
     impl_->upload_stream = stream;
@@ -643,6 +665,17 @@ void ExpertCache::prepare(std::span<const ExpertCacheKey> required, cudaStream_t
             impl_->required.push_back(key);
             // A hit is an expert the pool already holds: the step costs no upload for it.
             if (impl_->entries[impl_->index(key)].ready) { ++impl_->hits; }
+        }
+    }
+    if (std::getenv("NINFER_UPLOAD_TIMING") != nullptr) {
+        static std::uint64_t calls = 0;
+        static double ms            = 0.0;
+        ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
+                  .count();
+        if (++calls % 40 == 0) {
+            std::fprintf(stderr, "[prepare] %.3fms/layer\n", ms / 40.0);
+            std::fflush(stderr);
+            ms = 0.0;
         }
     }
 }
@@ -672,7 +705,11 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
         const auto& entry = impl_->entries[impl_->index(key)];
         if (entry.ready) { continue; }
         if (staged == Impl::kUploadBatch) { break; }
-        impl_->upload_one(key, stream, false, staged, &batch);
+        // The ring position persists across turns: a staged image stays valid until its slot comes
+        // round again, which is what lets the copies stay in flight between layers.
+        impl_->upload_one(key, stream, false,
+                          impl_->staging_cursor % Impl::kStagingRing, &batch);
+        ++impl_->staging_cursor;
         ++staged;
     }
     const auto collect_begin = std::chrono::steady_clock::now();
@@ -716,11 +753,21 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
             }
         }
     }
-    // port (sm_89): the artifact path stages through one pinned buffer per batch position, so the
-    // next batch would overwrite an image that is still being copied. The Host-replica path copies
-    // straight out of the arena and needs no barrier; its copies are ordered by the consumer stream
-    // and the kernel that reads them, so nothing has to be waited for at all.
-    if (impl_->staging_needed) {
+    // port (sm_89): the staging ring replaces the per-turn barrier. Each slot used by this turn gets
+    // an event on the stream, and that event is the only thing waited on before the slot is reused -
+    // by which time the copy is a dozen layers old. The data path needs no barrier at all: the
+    // kernel that reads the destination is queued behind the copy on this same stream.
+    for (const auto slot : impl_->staging_used) {
+        if (impl_->staging_event[slot] == nullptr) {
+            (void)cudaEventCreateWithFlags(&impl_->staging_event[slot], cudaEventDisableTiming);
+        }
+        (void)cudaEventRecord(impl_->staging_event[slot], stream);
+    }
+    impl_->staging_used.clear();
+    // A/B switch: NINFER_STAGING_SYNC=1 restores the per-turn barrier the ring replaces, so the two
+    // can be measured in one session against the same binary. Across sessions this box's decode rate
+    // moves by more than the difference being measured.
+    if (std::getenv("NINFER_STAGING_SYNC") != nullptr) {
         const auto settled = cudaStreamSynchronize(stream);
         if (settled != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(settled)); }
     }
@@ -787,7 +834,39 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
 }
 
 void ExpertCache::wait_for_progress(cudaStream_t stream) {
-    while (!progress(stream).required_published) {}
+    // port (sm_89): the caller's report says this is where a fully covered split layer spends its
+    // time, and the body below says it should be a no-op when nothing is missing. Those two cannot
+    // both be true, so the round count and the staged count are published: a layer that uploads
+    // nothing must report rounds=1 staged=0, and a layer that does not is the answer.
+    const bool timing    = std::getenv("NINFER_UPLOAD_TIMING") != nullptr;
+    const auto begin     = std::chrono::steady_clock::now();
+    std::uint64_t rounds = 0;
+    std::uint64_t staged_total = 0;
+    while (true) {
+        const auto state = progress(stream);
+        ++rounds;
+        staged_total += state.submitted_batches;
+        if (state.required_published) { break; }
+    }
+    if (timing) {
+        static std::uint64_t calls       = 0;
+        static double ms                 = 0.0;
+        static std::uint64_t rounds_seen = 0;
+        static std::uint64_t staged_seen = 0;
+        ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
+                  .count();
+        rounds_seen += rounds;
+        staged_seen += staged_total;
+        if (++calls % 40 == 0) {
+            std::fprintf(stderr, "[wait] %.3fms/layer rounds=%.1f staged=%.1f\n", ms / 40.0,
+                         static_cast<double>(rounds_seen) / 40.0,
+                         static_cast<double>(staged_seen) / 40.0);
+            std::fflush(stderr);
+            ms          = 0.0;
+            rounds_seen = 0;
+            staged_seen = 0;
+        }
+    }
 }
 
 void ExpertCache::attach_arena(const ExpertArenaSource* arena) noexcept {

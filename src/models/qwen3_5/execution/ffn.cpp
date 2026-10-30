@@ -29,6 +29,115 @@
 namespace ninfer::models::qwen3_5::execution {
 namespace {
 
+// port (sm_89): where a split token goes, node by node, on both sides of the PCIe lane.
+//
+// The host nodes are wall clock. The Device half cannot be: its kernel is enqueued and returns at
+// once, so a host clock around the launch measures the launch and nothing else. It is timed with a
+// pair of events instead, and the pair is read at the START OF THE NEXT LAYER - by then that work is
+// certainly finished, so cudaEventQuery answers without a synchronise and the measurement itself
+// costs no stall. That distinction matters here: this file's whole problem is per-layer stalls, and
+// an instrument that adds one would measure its own cost.
+//
+// The numbers are summed over the forty layers of a decode token and printed once per token, because
+// a decode rate is quoted per token and a per-layer number hides how the forty add up.
+struct SplitTimeline {
+    double wall        = 0.0; // the whole layer's FFN, host clock, entry to exit
+    double fetch       = 0.0; // host: pack launch + one D2H of x/residual/ids/coef + the wait
+    double ens_route   = 0.0; // host: the route ids, only when the caller has none to hand over
+    double ens_layout  = 0.0; // host: hot set, slot publish, mask and offset tables
+    double ens_upload  = 0.0; // host: prepare + wait_for_progress
+    double gpu         = 0.0; // device: the routed expert kernel (subset or resident)
+    double host_cpu    = 0.0; // host: the CPU expert GEMM for the experts the pool lacks
+    double host_write  = 0.0; // host: merge submission (the device folds it in)
+    std::uint64_t missing = 0; // routed entries this layer the pool did not hold
+    std::uint64_t layers  = 0;
+
+    void report();
+};
+
+SplitTimeline& timeline() {
+    static thread_local SplitTimeline state;
+    return state;
+}
+
+// One pair of events, reused. Two events per layer would be an allocation per layer; a pair reused
+// in order is enough because only one layer's kernel can be in flight at a time on this stream.
+struct GpuClock {
+    cudaEvent_t begin = nullptr;
+    cudaEvent_t end   = nullptr;
+    bool pending      = false;
+};
+
+GpuClock& gpu_clock() {
+    static thread_local GpuClock state;
+    return state;
+}
+
+void timeline_gpu_begin(cudaStream_t stream) {
+    if (std::getenv("NINFER_SPLIT_TIMING") == nullptr) { return; }
+    auto& clock = gpu_clock();
+    if (clock.begin == nullptr) {
+        (void)cudaEventCreateWithFlags(&clock.begin, cudaEventDefault);
+        (void)cudaEventCreateWithFlags(&clock.end, cudaEventDefault);
+    }
+    clock.pending = true;
+    (void)cudaEventRecord(clock.begin, stream);
+}
+
+void timeline_gpu_end(cudaStream_t stream) {
+    if (std::getenv("NINFER_SPLIT_TIMING") == nullptr) { return; }
+    auto& clock = gpu_clock();
+    if (clock.pending) { (void)cudaEventRecord(clock.end, stream); }
+}
+
+// Reads last layer's pair. Called at the start of a layer; never waits.
+void timeline_gpu_collect() {
+    auto& clock = gpu_clock();
+    if (!clock.pending) { return; }
+    if (cudaEventQuery(clock.end) != cudaSuccess) { return; }
+    float elapsed = 0.0F;
+    if (cudaEventElapsedTime(&elapsed, clock.begin, clock.end) == cudaSuccess) {
+        timeline().gpu += static_cast<double>(elapsed);
+    }
+    clock.pending = false;
+}
+
+void SplitTimeline::report() {
+    if (layers == 0) { return; }
+    const auto per = 1.0 / static_cast<double>(layers);
+    std::fprintf(stderr,
+                 "[tl] token: wall=%.1fms fetch=%.1f ens(route=%.2f layout=%.2f upload=%.2f) "
+                 "gpu=%.1f host(cpu=%.1f write=%.1f) miss=%.2f/layer\n",
+                 wall, fetch, ens_route, ens_layout, ens_upload, gpu, host_cpu, host_write,
+                 static_cast<double>(missing) * per);
+    std::fprintf(stderr,
+                 "[tl] per layer: wall=%.3f fetch=%.3f ens=%.3f gpu=%.3f host=%.3f "
+                 "unaccounted=%.3f\n",
+                 wall * per, fetch * per, (ens_route + ens_layout + ens_upload) * per, gpu * per,
+                 (host_cpu + host_write) * per,
+                 wall * per - (fetch + ens_route + ens_layout + ens_upload + gpu + host_cpu +
+                               host_write) * per);
+    std::fflush(stderr);
+    *this = SplitTimeline{};
+}
+
+// Adds one layer to the timeline on the way out, whichever of the three exits it took.
+struct LayerScope {
+    bool on;
+    std::chrono::steady_clock::time_point begin;
+    explicit LayerScope(bool enabled)
+        : on(enabled), begin(std::chrono::steady_clock::now()) {}
+    ~LayerScope() {
+        if (!on) { return; }
+        auto& state = timeline();
+        state.wall += std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - begin)
+                          .count();
+        if (++state.layers % 40 == 0) { state.report(); }
+    }
+};
+
+
 // port (sm_89): the streamed routed path runs routing, a host round trip and the expert call as
 // three steps, so its scratch is the route tensors plus the larger of the two Op capacities.
 std::size_t stream_route_bytes(const RoutedMoeParameters& moe, std::int32_t first,
@@ -110,8 +219,11 @@ HostRoutedFetch fetch_host_routed(const Tensor& hidden, const ops::ExpertRoutes&
         if (std::getenv("NINFER_SPLIT_TIMING") != nullptr) {
             static double accumulated_ms = 0.0;
             static std::uint64_t calls   = 0;
-            accumulated_ms += std::chrono::duration<double, std::milli>(
-                                  std::chrono::steady_clock::now() - fetch_begin).count();
+            const auto fetch_ms          = std::chrono::duration<double, std::milli>(
+                                               std::chrono::steady_clock::now() - fetch_begin)
+                                               .count();
+            accumulated_ms += fetch_ms;
+            timeline().fetch += fetch_ms;
             if (++calls % 40 == 0) {
                 std::fprintf(stderr, "[fetch] %.2fms per token\n", accumulated_ms);
                 accumulated_ms = 0.0;
@@ -164,8 +276,11 @@ HostRoutedFetch fetch_host_routed(const Tensor& hidden, const ops::ExpertRoutes&
     if (std::getenv("NINFER_SPLIT_TIMING") != nullptr) {
         static double accumulated = 0.0;
         static std::uint64_t calls = 0;
-        accumulated += std::chrono::duration<double, std::milli>(
-                           std::chrono::steady_clock::now() - fetch_begin).count();
+        const auto fetch_ms        = std::chrono::duration<double, std::milli>(
+                                         std::chrono::steady_clock::now() - fetch_begin)
+                                         .count();
+        accumulated += fetch_ms;
+        timeline().fetch += fetch_ms;
         if (++calls % 40 == 0) {
             std::fprintf(stderr, "[fetch] %.2fms per token\n", accumulated);
             accumulated = 0.0;
@@ -313,9 +428,13 @@ void host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParameters& mo
         if (timing) {
             static std::uint64_t calls = 0;
             static double acc[2]       = {0.0, 0.0};
+            const auto write_ms        = std::chrono::duration<double, std::milli>(
+                                             std::chrono::steady_clock::now() - write_begin)
+                                             .count();
             acc[0] += cpu_ms;
-            acc[1] += std::chrono::duration<double, std::milli>(
-                          std::chrono::steady_clock::now() - write_begin).count();
+            acc[1] += write_ms;
+            timeline().host_cpu += cpu_ms;
+            timeline().host_write += write_ms;
             if (++calls % 40 == 0) {
                 const auto& stats = host->stats();
                 std::fprintf(stderr,
@@ -541,6 +660,11 @@ private:
 
 void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& residual,
                   WorkspaceArena& workspace, DeviceExecutionView execution) {
+    const bool layer_timing = std::getenv("NINFER_SPLIT_TIMING") != nullptr;
+    // Last layer's Device pair is certainly finished by now, so this read is free. Doing it here,
+    // before any work is queued, is what keeps the measurement out of the thing being measured.
+    timeline_gpu_collect();
+    LayerScope layer_scope(layer_timing);
     StageSample stage_sample(execution.stream);
     StageSample::state().calls++;
     const auto columns       = hidden.ne[1];
@@ -610,6 +734,13 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
     } catch (const std::exception& error) {
         throw std::invalid_argument(std::string("expert stream upload: ") + error.what());
     }
+    if (layer_timing) {
+        const auto cost = moe.stream->last_cost();
+        auto& state     = timeline();
+        state.ens_route += cost.route_ms;
+        state.ens_layout += cost.layout_ms;
+        state.ens_upload += cost.upload_ms;
+    }
     if (!moe.stream->fully_resident()) {
         // Split layer: the pool holds the experts this layer routes to most, the host tier covers
         // the rest. Both halves land in FP32 and are folded into the residual once, so a split
@@ -623,22 +754,26 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
         // decode was still 45.9 tok/s against 214-235 when the layer is fully resident, because the
         // split path was taken on the pool's shape alone.
         bool all_resident = true;
+        std::uint64_t missing = 0;
         for (std::size_t i = 0; i < fetch.ids.size(); ++i) {
             const auto expert = fetch.ids[i];
             if (expert < 0 ||
                 static_cast<std::size_t>(expert) >= mask_host.size() || !mask_host[expert]) {
+                ++missing;
                 all_resident = false;
-                break;
             }
         }
+        if (layer_timing) { timeline().missing += missing; }
         if (all_resident) {
             // Same call as the fully resident tail: empty subset, BF16 accumulation into the
             // residual. Bit-identical by construction, which is what the PPL gate checks.
             try {
                 MemoryArena arena(MemorySpan{scratch.data, scratch.bytes, execution.device()});
+                timeline_gpu_begin(execution.stream);
                 ops::routed_swiglu(hidden, routed, moe.stream->experts(), routes, {},
                                    ops::ScaledSwiGLUTerm{moe.shared, shared_coefficients},
                                    ops::MoeEpilogue::AddResidual, residual, arena, execution);
+                timeline_gpu_end(execution.stream);
             } catch (const std::exception& error) {
                 throw std::invalid_argument(std::string("expert stream run: ") + error.what());
             }
@@ -658,10 +793,15 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
         Tensor device_mask(const_cast<void*>(moe.stream->resident_mask()), execution.device(),
                            DType::I32, {mask_size});
         const auto moe_run = [&] {
+            // A capture cannot record an event, so the Device clock is only taken when the graph is
+            // off. With it on the panel would be wrong rather than missing, which is worse.
+            const bool timed = layer_timing && !LayerGraphs::instance().enabled();
+            if (timed) { timeline_gpu_begin(execution.stream); }
             ops::routed_swiglu(hidden, routed, moe.stream->experts(), routes,
                                ops::ExpertSubset{ops::ExpertSubsetKind::MaskOnes, device_mask},
                                ops::ScaledSwiGLUTerm{moe.shared, shared_coefficients},
                                ops::MoeEpilogue::Write, mixed_f32, mixed_arena, execution);
+            if (timed) { timeline_gpu_end(execution.stream); }
         };
         const auto dev_begin = std::chrono::steady_clock::now();
         auto& graphs = LayerGraphs::instance();

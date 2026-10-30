@@ -326,6 +326,8 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     if (pinned_) {
         if (cache_->window_resident(bank_)) {
             rebase_window();
+            // A pinned layer pays none of the bookkeeping below, so its cost is zero everywhere.
+            last_cost_ = StepCost{};
             // GH1 on the fully resident path. This early return skips every counter below, which is
             // why the panel reported nothing at all once the pool held all 10,240 slots: the healthy
             // configuration was the one it could not describe. A pinned layer is by definition
@@ -1106,6 +1108,11 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     // port (sm_89): the bank's window can move between layers, so the plane bases are
     // rebased onto the window that is resident now. A fixed base would address window 0.
     rebase_window();
+    last_cost_.route_ms  = route_ms;
+    last_cost_.layout_ms = layout_ms;
+    last_cost_.upload_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - upload_begin)
+            .count();
     // The uploads were queued on the consumer stream, so the kernels that read them are already
     // ordered after the copies; only the artifact path had to wait, and it did so inside
     // progress(). A device-wide synchronise here used to cost most of the layer's time.

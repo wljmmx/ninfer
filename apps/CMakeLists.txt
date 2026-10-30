@@ -18,6 +18,12 @@ add_executable(ninfer-perplexity
 ninfer_internal_includes(ninfer-perplexity)
 target_link_libraries(ninfer-perplexity PRIVATE
   ninfer_engine ninfer_product_logging ninfer::json)
+# The engine's context transaction uses the RESP client, which is Winsock. ninfer-serve links it
+# already; without it here the link fails with ten unresolved __imp_*socket symbols, which is what
+# kept the perplexity gate from being runnable at all.
+if(WIN32)
+  target_link_libraries(ninfer-perplexity PRIVATE ws2_32)
+endif()
 
 # port (sm_89): offline MoE kernel diagnostic. Compares the shipped sparse op with the imported
 # routed op on one layer's device bank; never part of the product binaries.
