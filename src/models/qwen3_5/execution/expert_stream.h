@@ -1,3 +1,4 @@
+#include <algorithm>
 #pragma once
 
 #include "core/arena.h"
@@ -86,6 +87,25 @@ public:
         std::uint64_t inside = 0;
     };
     [[nodiscard]] Coverage coverage() const noexcept { return coverage_; }
+    // Experts worth keeping in the warm tier: routed more than once and not in the Device set.
+    //
+    // The warm tier is a partition by probability, not a copy of everything the router touched: an
+    // expert that has been routed once is a cold miss and belongs on disk, while one that keeps
+    // coming back but does not fit the Device pool is exactly what RAM is for. `min_hits` is a count
+    // of routes seen so far, not a byte threshold - it says "this one has proven it comes back".
+    void warm_candidates(std::span<const std::int32_t> routes, std::vector<std::int32_t>& out,
+                         float min_hits) const {
+        out.clear();
+        if (hot_score_.size() != static_cast<std::size_t>(count_)) { return; }
+        for (const auto route : routes) {
+            const auto expert = static_cast<std::size_t>(route);
+            if (expert >= hot_score_.size()) { continue; }
+            if (hot_score_[expert] < min_hits) { continue; }
+            out.push_back(route);
+        }
+        std::sort(out.begin(), out.end());
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+    }
     // GH1 rates, for the policy controller: static = the set did not move this step, no_miss = every
     // route was already in the pool, capturable = the step did not take the split path at all.
     // Denominator is gh1_calls_. Negative means "not measured yet", never zero.

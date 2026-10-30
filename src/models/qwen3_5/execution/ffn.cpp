@@ -761,14 +761,41 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
     // copy in RAM, a repeat miss becomes one DMA instead of a read plus a DMA.
     if (std::getenv("NINFER_HOST_MIRROR") != nullptr && early && !moe.stream->fully_resident()) {
         if (auto* host_tier = moe.stream->host()) {
-            std::vector<TokenId> routes;
+            static thread_local std::vector<std::int32_t> routes;
+            static thread_local std::vector<std::int32_t> warm_list;
+            routes.clear();
             routes.reserve(early->ids.size());
             for (const auto id : early->ids) {
                 if (id >= 0) { routes.push_back(static_cast<TokenId>(id)); }
             }
-            std::sort(routes.begin(), routes.end());
-            routes.erase(std::unique(routes.begin(), routes.end()), routes.end());
-            host_tier->ensure(ExpertBankId{moe.stream->bank_index()}, routes, nullptr);
+            // Admission by probability, not by contact: only an expert that has already been routed
+            // a few times is worth a RAM slot. Everything else stays on disk, which is what keeps the
+            // warm tier a partition instead of a second copy of the model.
+            static const float min_hits = [] {
+                const char* value = std::getenv("NINFER_HOST_MIRROR_MIN_HITS");
+                return value != nullptr && *value != '\0' ? static_cast<float>(std::atof(value))
+                                                          : 3.0F;
+            }();
+            moe.stream->warm_candidates(routes, warm_list, min_hits);
+            if (!warm_list.empty()) {
+                host_tier->ensure(ExpertBankId{moe.stream->bank_index()}, warm_list, nullptr);
+            }
+            // One line per token: how many experts the admission rule let into the warm tier. A zero
+            // here means the policy filtered everything (the tier is empty for a reason we can name);
+            // a healthy number with an empty arena means the tier is not answering instead.
+            static std::uint64_t mirror_layers = 0;
+            static std::uint64_t mirror_admitted = 0;
+            static std::uint64_t mirror_routes = 0;
+            mirror_admitted += warm_list.size();
+            mirror_routes += routes.size();
+            if (++mirror_layers % 40 == 0) {
+                std::fprintf(stderr, "[mirror] admitted=%.1f/layer of %.1f routes\n",
+                             static_cast<double>(mirror_admitted) / 40.0,
+                             static_cast<double>(mirror_routes) / 40.0);
+                std::fflush(stderr);
+                mirror_admitted = 0;
+                mirror_routes = 0;
+            }
         }
     }
     if (layer_timing) {
