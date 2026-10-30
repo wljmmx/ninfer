@@ -752,6 +752,25 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
     } catch (const std::exception& error) {
         throw std::invalid_argument(std::string("expert stream upload: ") + error.what());
     }
+    // port (sm_89): O5, first half - keep a RAM copy of every expert this step routes to.
+    //
+    // A split layer's upload reads the image out of the artifact and copies it into the pool: 211 us
+    // per expert at 8 GiB, of which roughly two thirds is that read. The host tier already exists and
+    // the cache already prefers it as a source when the expert is there; what was missing is anyone
+    // filling it on the split path (the tier is only touched by the whole-layer CPU fallback). With a
+    // copy in RAM, a repeat miss becomes one DMA instead of a read plus a DMA.
+    if (std::getenv("NINFER_HOST_MIRROR") != nullptr && early && !moe.stream->fully_resident()) {
+        if (auto* host_tier = moe.stream->host()) {
+            std::vector<TokenId> routes;
+            routes.reserve(early->ids.size());
+            for (const auto id : early->ids) {
+                if (id >= 0) { routes.push_back(static_cast<TokenId>(id)); }
+            }
+            std::sort(routes.begin(), routes.end());
+            routes.erase(std::unique(routes.begin(), routes.end()), routes.end());
+            host_tier->ensure(ExpertBankId{moe.stream->bank_index()}, routes, nullptr);
+        }
+    }
     if (layer_timing) {
         const auto cost = moe.stream->last_cost();
         auto& state     = timeline();
