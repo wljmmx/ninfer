@@ -501,6 +501,20 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     dimension(parameters.model.resources().public_token_count), 1, 1));
     }
     out.text_prefill = finish(text_prefill);
+    // S0: the width classes, and what each one costs. Printed from the same planner that sizes the
+    // arena, so the number next to a class IS its memory bound - the criterion that X1 (1x.4e) was
+    // missing when a 921-column request outgrew a plan built for 1024.
+    if (std::getenv("NINFER_SHAPE_REPORT") != nullptr) {
+        for (const std::int32_t width : {1024, 2048, 4096}) {
+            if (width > static_cast<std::int32_t>(plan.prefill_chunk)) { continue; }
+            WorkspaceLayoutBuilder probe;
+            text_common_root(probe, width);
+            target_body(probe, 1, width, qwen3_5::TextPhase::Prefill, GdnWorkspacePath::Prefill, 1,
+                        1, width, text_envelope);
+            std::fprintf(stderr, "[shape] class width=%d bytes=%zu\n", width, finish(probe));
+            std::fflush(stderr);
+        }
+    }
 
     if (plan.causal_scoring) {
         WorkspaceLayoutBuilder causal_score;
