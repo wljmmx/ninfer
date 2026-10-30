@@ -207,6 +207,12 @@ HostRoutedFetch fetch_host_routed(const Tensor& hidden, const ops::ExpertRoutes&
         staging.resize(total);
         CUDA_CHECK(cudaMemcpyAsync(staging.data(), packed_device, total, cudaMemcpyDeviceToHost,
                                    stream));
+        // port (sm_89): polling cudaStreamQuery instead of blocking on the stream was measured and
+        // changed nothing (fetch 0.072-0.075 ms/layer either way, decode 152.9 vs 152.9 at 16 GiB).
+        // The 10 KiB copy itself is ~3 us at 3 GB/s, so the cost is not the bytes and not the wait
+        // primitive: it is the round trip to observe device progress at all. Removing it needs the
+        // host to stop observing - a device-side decision, or a speculative run replayed at the
+        // token boundary - not a cheaper way to wait.
         CUDA_CHECK(cudaStreamSynchronize(stream));
         const auto align16 = [](std::size_t value) { return (value + 15U) & ~std::size_t{15}; };
         const auto off_res  = align16(x_bytes);
