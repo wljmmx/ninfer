@@ -221,7 +221,30 @@ HostRoutedFetch fetch_host_routed(const Tensor& hidden, const ops::ExpertRoutes&
         // primitive: it is the round trip to observe device progress at all. Removing it needs the
         // host to stop observing - a device-side decision, or a speculative run replayed at the
         // token boundary - not a cheaper way to wait.
+        // Split the wait in two: what the host spent *issuing* the read-back, and what it spent
+        // waiting for the Device to finish everything queued ahead of it. Only the first part is
+        // overhead that removing the round trip could save; the second is work the layer needs
+        // anyway (1x.4s).
+        const double issue_us = std::chrono::duration<double, std::micro>(
+                                    std::chrono::steady_clock::now() - fetch_begin)
+                                    .count();
         CUDA_CHECK(cudaStreamSynchronize(stream));
+        const double wait_us = std::chrono::duration<double, std::micro>(
+                                   std::chrono::steady_clock::now() - fetch_begin)
+                                   .count() - issue_us;
+        if (std::getenv("NINFER_SPLIT_TIMING") != nullptr) {
+            static double acc_issue = 0.0, acc_wait = 0.0;
+            static std::uint64_t calls = 0;
+            acc_issue += issue_us;
+            acc_wait += wait_us;
+            if (++calls % 40 == 0) {
+                std::fprintf(stderr, "[fetch-split] issue=%.1fus wait=%.1fus\n", acc_issue / 40.0,
+                             acc_wait / 40.0);
+                std::fflush(stderr);
+                acc_issue = 0.0;
+                acc_wait = 0.0;
+            }
+        }
         const auto align16 = [](std::size_t value) { return (value + 15U) & ~std::size_t{15}; };
         const auto off_res  = align16(x_bytes);
         const auto off_ids  = align16(off_res + res_bytes);
