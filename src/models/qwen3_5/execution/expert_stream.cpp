@@ -286,6 +286,20 @@ bool ExpertStream::fully_resident() const noexcept {
     return cache_ != nullptr && cache_->resident_capacity() >= count_;
 }
 
+void ExpertStream::gh1_report() {
+    if (std::getenv("NINFER_EXPERT_TIMING") == nullptr || gh1_calls_ % 8 != 0) { return; }
+    const auto pct = [](std::uint64_t part, std::uint64_t all) {
+        return all == 0 ? 0.0 : 100.0 * static_cast<double>(part) / static_cast<double>(all);
+    };
+    // static/no_miss are per STEP on the split path, capturable is per CALL (layer). Saying which
+    // denominator each number uses is the difference between a metric and a mystery.
+    std::fprintf(stderr,
+                 "[gh1] bank=%u calls=%llu static=%.1f%% no_miss=%.1f%% capturable=%.1f%%\n",
+                 bank_, static_cast<unsigned long long>(gh1_calls_),
+                 pct(gh1_static_calls_, gh1_calls_), pct(gh1_no_miss_calls_, gh1_calls_),
+                 pct(gh1_calls_ - gh1_split_calls_, gh1_calls_));
+    std::fflush(stderr);
+}
 bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32_t tokens,
                           cudaStream_t stream, const std::int32_t* host_ids) {
     if (cache_ == nullptr) { throw std::logic_error("expert stream is not attached"); }
@@ -299,6 +313,14 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     if (pinned_) {
         if (cache_->window_resident(bank_)) {
             rebase_window();
+            // GH1 on the fully resident path. This early return skips every counter below, which is
+            // why the panel reported nothing at all once the pool held all 10,240 slots: the healthy
+            // configuration was the one it could not describe. A pinned layer is by definition
+            // capturable, its table does not move and it cannot miss.
+            ++gh1_calls_;
+            ++gh1_no_miss_calls_;
+            ++gh1_static_calls_;
+            gh1_report();
             return true;
         }
         // A resize dropped this window; fall through so the normal path allocates a new one.
@@ -330,17 +352,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         ++gh1_no_miss_calls_;
         ++gh1_static_calls_;
     }
-    if (std::getenv("NINFER_EXPERT_TIMING") != nullptr && gh1_calls_ % 8 == 0) {
-        const auto pct = [](std::uint64_t part, std::uint64_t all) {
-            return all == 0 ? 0.0 : 100.0 * static_cast<double>(part) / static_cast<double>(all);
-        };
-        std::fprintf(stderr,
-                     "[gh1] bank=%u calls=%llu static=%.1f%% no_miss=%.1f%% capturable=%.1f%%\n",
-                     bank_, static_cast<unsigned long long>(gh1_calls_),
-                     pct(gh1_static_steps_, gh1_steps_), pct(gh1_no_miss_steps_, gh1_steps_),
-                     pct(gh1_calls_ - gh1_split_calls_, gh1_calls_));
-        std::fflush(stderr);
-    }
+    gh1_report();
     const auto values = static_cast<std::size_t>(top_k) * static_cast<std::size_t>(tokens);
     const auto bytes  = values * sizeof(std::int32_t);
     // port (sm_89): the host must know the routed experts before it can publish them, so one
@@ -865,8 +877,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                     miss_samples_ = 0;
                 }
             }
-            ++gh1_steps_;
-            if (inside == values) { ++gh1_no_miss_steps_; }
+            if (inside == values) { ++gh1_no_miss_calls_; }
             coverage_.routes += values;
             coverage_.inside += inside;
             if (bank_ == 0 && (std::getenv("NINFER_SPLIT_TIMING") != nullptr ||
@@ -895,18 +906,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                     : static_cast<double>(entered_) / static_cast<double>(entered_steps_);
                 if (bank_ == 0) {
                     std::fprintf(stderr, "[set] bank=0 entered=%.2f/step\n", entered_per_step);
-                    if (gh1_steps_ % 50 == 0) {
-                        const auto pct = [](std::uint64_t part, std::uint64_t all) {
-                            return all == 0 ? 0.0
-                                            : 100.0 * static_cast<double>(part) /
-                                                  static_cast<double>(all);
-                        };
-                        std::fprintf(stderr,
-                                     "[gh1] steps=%llu static=%.1f%% no_miss=%.1f%%\n",
-                                     static_cast<unsigned long long>(gh1_steps_),
-                                     pct(gh1_static_steps_, gh1_steps_),
-                                     pct(gh1_no_miss_steps_, gh1_steps_));
-                    }
+
                 }
             }
         }
@@ -1024,7 +1024,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 }
                 ++publish_calls_;
             }
-            if (moved.empty()) { ++gh1_static_steps_; }
+            if (moved.empty()) { ++gh1_static_calls_; }
             entered_ += entered_this_step;
             ++entered_steps_;
             for (const auto expert : moved) {

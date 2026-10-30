@@ -175,6 +175,8 @@ private:
     std::uint64_t gh1_split_calls_  = 0;
     std::uint64_t gh1_no_miss_calls_ = 0;
     std::uint64_t gh1_static_calls_  = 0;
+    // Prints the GH1 panel; one place so the pinned fast path and the normal path cannot drift.
+    void gh1_report();
     std::uint64_t entered_steps_ = 0;
     // port (sm_26): whether this bank's resident set has ever been built. A prefill is not allowed to
     // choose the set, but the first call has to, or a cold start would route everything to the host
