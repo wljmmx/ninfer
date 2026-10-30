@@ -778,7 +778,17 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
             const auto demoted = moe.stream->demoted_this_step();
             warm_list.assign(demoted.begin(), demoted.end());
             if (!warm_list.empty()) {
+                const auto fill_begin = std::chrono::steady_clock::now();
                 host_tier->ensure(ExpertBankId{moe.stream->bank_index()}, warm_list, nullptr);
+                const double fill_us = std::chrono::duration<double, std::micro>(
+                                           std::chrono::steady_clock::now() - fill_begin)
+                                           .count();
+                // What one admitted expert costs to keep, so the controller can weigh it against
+                // what one hit saves (1y.7 step 3f).
+                auto& policy = policy_controller();
+                const double per_expert = fill_us / static_cast<double>(warm_list.size());
+                policy.signals.mirror_fill_us_per_expert +=
+                    (per_expert - policy.signals.mirror_fill_us_per_expert) / 16.0;
                 // Does the tier actually answer for what it was just given? A zero hit rate in the
                 // cache is ambiguous between "the policy admits the wrong experts" and "the tier
                 // cannot hand them back"; this one probe separates them.
@@ -870,6 +880,22 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
             // still has none (the queue has no consumer), so it stays "not measured".
             const auto rates = moe.stream->gh1_rates();
             control.observe_coverage(rates.static_pct, rates.no_miss_pct, rates.capturable_pct);
+            // Warm-tier sides: what a cold read costs (measured in upload_one) and how often the
+            // pinned copy answers instead. The mirror decision is the ratio between them.
+            {
+                const auto sources = moe.stream->upload_source_stats();
+                if (sources.file_experts > 0) {
+                    const double cold = sources.read_us / static_cast<double>(sources.file_experts);
+                    control.signals.cold_read_us_per_expert +=
+                        (cold - control.signals.cold_read_us_per_expert) / 16.0;
+                }
+                const auto total = sources.arena_experts + sources.file_experts;
+                if (total > 0) {
+                    const double ratio =
+                        static_cast<double>(sources.arena_experts) / static_cast<double>(total);
+                    control.signals.mirror_hit_ratio += (ratio - control.signals.mirror_hit_ratio) / 16.0;
+                }
+            }
             control.step(false, false, false, false);
             control.report();
         }

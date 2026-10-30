@@ -96,6 +96,9 @@ public:
     // Experts the pool dropped on the last ensure(): the warm tier admits from here rather than from
     // the routes, because these are the ones with a demonstrated short reuse distance.
     [[nodiscard]] std::span<const std::int32_t> demoted_this_step() const noexcept { return demoted_; }
+    [[nodiscard]] ExpertCache::UploadSourceStats upload_source_stats() const {
+        return cache_->upload_sources();
+    }
     void warm_candidates(std::span<const std::int32_t> routes, std::vector<std::int32_t>& out,
                          float min_hits) const {
         out.clear();

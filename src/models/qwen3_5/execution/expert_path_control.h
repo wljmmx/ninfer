@@ -45,6 +45,11 @@ struct PolicySignals {
     double static_pct     = -1.0;
     double no_miss_pct    = -1.0;
     double capturable_pct = -1.0;
+    // Warm-tier decision (1y.7 step 3f): what a cold read costs, what a hit saves, and what making
+    // the copy costs. Break-even is a ratio between the last two, measured - not a RAM size.
+    double cold_read_us_per_expert = 0.0;
+    double mirror_fill_us_per_expert = 0.0;
+    double mirror_hit_ratio          = -1.0;
     double prefetch_usefulness = -1.0; // D4 gate input
     double decode_tps          = -1.0; // the outcome every actuator is judged by
 };
@@ -64,6 +69,7 @@ public:
     PolicyActuator expert_path;
     PolicyActuator prefetch;
     PolicyActuator graph;
+    PolicyActuator warm_mirror; // 1y.7: keep managed copies in the pinned tier
     PolicyActuator freeze_set;
     double link_gbps    = 0.0;
     std::uint64_t layers = 0;
@@ -149,11 +155,22 @@ public:
     }
     [[nodiscard]] bool want_freeze() const { return signals.no_miss_pct >= 99.0; }
 
+    // A managed warm copy pays a fill per admission and saves a read per hit, so it wins when
+    // hit_ratio * cold_read > fill. Both sides are measured; the margin keeps it from flapping.
+    [[nodiscard]] bool want_warm_mirror() const {
+        if (signals.mirror_hit_ratio <= 0.0 || signals.mirror_fill_us_per_expert <= 0.0) {
+            return false;
+        }
+        return signals.mirror_hit_ratio * signals.cold_read_us_per_expert >
+               signals.mirror_fill_us_per_expert * 1.2;
+    }
+
     void step(bool device_path_ready, bool prefetch_wired, bool graph_wired, bool freeze_wired) {
         ++layers;
         drive(expert_path, want_device_path(), device_path_ready, "cost model");
         drive(prefetch, want_prefetch(), prefetch_wired, "usefulness>=10%");
         drive(graph, want_graph(), graph_wired, "capturable>=90% && static>=95%");
+        drive(warm_mirror, want_warm_mirror(), true, "hit_ratio*cold>fill");
         drive(freeze_set, want_freeze(), freeze_wired, "no_miss>=99%");
     }
 
@@ -181,6 +198,12 @@ public:
                      want_device_path() ? "device" : "host", host_cost_us(), device_cost_us(),
                      want_prefetch() ? "on" : "off", want_graph() ? "on" : "off",
                      want_freeze() ? "on" : "off");
+        std::fprintf(stderr,
+                     "[ctl] warm: cold=%.0fus fill=%.0fus hit=%.2f -> mirror=%s (%.2f vs %.2f)\n",
+                     signals.cold_read_us_per_expert, signals.mirror_fill_us_per_expert,
+                     signals.mirror_hit_ratio, want_warm_mirror() ? "on" : "off",
+                     signals.mirror_hit_ratio * signals.cold_read_us_per_expert,
+                     signals.mirror_fill_us_per_expert * 1.2);
         std::fflush(stderr);
     }
 

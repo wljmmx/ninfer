@@ -133,6 +133,9 @@ struct ExpertCache::Impl {
     std::uint64_t stat_staged = 0;
     std::uint64_t stat_views  = 0;
     std::uint64_t stat_arena  = 0;
+    std::uint64_t stat_arena_experts = 0;
+    std::uint64_t stat_file_experts  = 0;
+    double stat_read_us              = 0.0;
     // Counted at the one place every upload passes through, so the figure cannot disagree with the
     // batch it describes the way the per-branch counters did.
     std::uint64_t stat_push = 0;
@@ -493,6 +496,7 @@ struct ExpertCache::Impl {
                 const auto* arena_image =
                     arena_source->arena_image(key.bank, key.expert, arena_bytes);
                 if (arena_image != nullptr && arena_bytes != 0) {
+                    ++stat_arena_experts;
                     // Verification: does the arena actually hold this expert's image? Cheap to ask,
                     // and it separates "the pinned tier hands over the wrong bytes" from everything
                     // else that could make a run produce empty text.
@@ -592,8 +596,15 @@ struct ExpertCache::Impl {
                 if (staging_event[staging_slot] != nullptr) {
                     (void)cudaEventSynchronize(staging_event[staging_slot]);
                 }
-                file_reader->read_entry(
-                    *file, {host_base, static_cast<std::size_t>(file->image_bytes)});
+                {
+                    const auto read_begin = std::chrono::steady_clock::now();
+                    file_reader->read_entry(
+                        *file, {host_base, static_cast<std::size_t>(file->image_bytes)});
+                    stat_read_us += std::chrono::duration<double, std::micro>(
+                                        std::chrono::steady_clock::now() - read_begin)
+                                        .count();
+                    ++stat_file_experts;
+                }
                 ++stat_staged;
                 if (batch != nullptr) {
                     ++stat_push;
@@ -873,6 +884,14 @@ void ExpertCache::wait_for_progress(cudaStream_t stream) {
 }
 
 std::uint32_t ExpertCache::last_uploaded() const noexcept { return impl_->last_staged; }
+
+ExpertCache::UploadSourceStats ExpertCache::upload_sources() const {
+    UploadSourceStats stats;
+    stats.arena_experts = impl_->stat_arena_experts;
+    stats.file_experts  = impl_->stat_file_experts;
+    stats.read_us       = impl_->stat_read_us;
+    return stats;
+}
 
 void ExpertCache::attach_arena(const ExpertArenaSource* arena) noexcept {
     // port (sm_89): on by default. A bank addressed in place has no arena slot, and the arena is

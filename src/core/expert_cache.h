@@ -155,6 +155,15 @@ void prepare(std::span<const ExpertCacheKey> required, cudaStream_t stream = nul
     // It is the only honest miss count - the residency mask is published from the same decision that
     // places the routes, so asking it "was this a miss?" always answers no.
     [[nodiscard]] std::uint32_t last_uploaded() const noexcept;
+    // Where the images came from, and what the cold path cost to read. The warm-tier decision (1y.7
+    // step 3f) needs both sides: an arena hit skips the read entirely, so "is a managed copy worth
+    // its admission cost" is a ratio between read_us and the copy that filling it costs.
+    struct UploadSourceStats {
+        std::uint64_t arena_experts = 0; // served from the pinned warm copy
+        std::uint64_t file_experts  = 0; // read out of the artifact mapping
+        double read_us              = 0.0; // host time spent in read_entry, cumulative
+    };
+    [[nodiscard]] UploadSourceStats upload_sources() const;
     // port (sm_89): how many banks' worth of slots the pool currently backs. Kept as the reported
     // pool size unit; the pool itself is one flat slot space.
     [[nodiscard]] std::uint64_t windows() const noexcept;
