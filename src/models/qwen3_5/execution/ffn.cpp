@@ -801,8 +801,10 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
                                       moe.stream->last_cost().layout_ms +
                                       moe.stream->last_cost().upload_ms,
                                   timeline().last_gpu, timeline().last_wall);
-            // Coverage and prefetch usefulness have no source on this path yet: left as "not
-            // measured" (negative), which the rules read as "do not act".
+            // GH1 has a source now: the same counters the [gh1] panel prints. Prefetch usefulness
+            // still has none (the queue has no consumer), so it stays "not measured".
+            const auto rates = moe.stream->gh1_rates();
+            control.observe_coverage(rates.static_pct, rates.no_miss_pct, rates.capturable_pct);
             control.step(false, false, false, false);
             control.report();
         }

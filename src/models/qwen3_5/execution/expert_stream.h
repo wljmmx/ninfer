@@ -86,6 +86,23 @@ public:
         std::uint64_t inside = 0;
     };
     [[nodiscard]] Coverage coverage() const noexcept { return coverage_; }
+    // GH1 rates, for the policy controller: static = the set did not move this step, no_miss = every
+    // route was already in the pool, capturable = the step did not take the split path at all.
+    // Denominator is gh1_calls_. Negative means "not measured yet", never zero.
+    struct Gh1Rates {
+        double static_pct     = -1.0;
+        double no_miss_pct    = -1.0;
+        double capturable_pct = -1.0;
+    };
+    [[nodiscard]] Gh1Rates gh1_rates() const noexcept {
+        Gh1Rates rates;
+        if (gh1_calls_ == 0) { return rates; }
+        const auto denom     = static_cast<double>(gh1_calls_);
+        rates.static_pct     = 100.0 * static_cast<double>(gh1_static_calls_) / denom;
+        rates.no_miss_pct    = 100.0 * static_cast<double>(gh1_no_miss_calls_) / denom;
+        rates.capturable_pct = 100.0 * static_cast<double>(gh1_calls_ - gh1_split_calls_) / denom;
+        return rates;
+    }
     // port (sm_89): what the last ensure() call spent, split by node, so the layer timeline can say
     // where a split token goes instead of folding routing, layout and upload into one number. The
     // clocks are taken unconditionally - three steady_clock reads per layer - and only the reporting

@@ -892,7 +892,9 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                     miss_samples_ = 0;
                 }
             }
-            if (inside == values) { ++gh1_no_miss_calls_; }
+            // "no miss" is not `inside == values`: `chosen` is this step's own placement, so that
+            // comparison is true by construction. The honest count is taken at the tail of ensure,
+            // from what actually had to be moved into the pool.
             coverage_.routes += values;
             coverage_.inside += inside;
             if (bank_ == 0 && (std::getenv("NINFER_SPLIT_TIMING") != nullptr ||
@@ -1116,6 +1118,8 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     // The honest miss count for the path controller: the mask cannot answer this question, because
     // it is written from the same decision that places the step's routes.
     last_cost_.uploaded = cache_->last_uploaded();
+    // GH1's no_miss, defined so it can be false: the pool already held every route this step.
+    if (last_cost_.uploaded == 0) { ++gh1_no_miss_calls_; }
     // The uploads were queued on the consumer stream, so the kernels that read them are already
     // ordered after the copies; only the artifact path had to wait, and it did so inside
     // progress(). A device-wide synchronise here used to cost most of the layer's time.
