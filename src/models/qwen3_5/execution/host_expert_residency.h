@@ -350,8 +350,14 @@ public:
 
     void ensure(ExpertBankId bank, std::span<const std::int32_t> experts,
                 const std::int32_t* resident_mask) override {
-        // Addressed in place: the weights are already where the kernels read them.
-        if (bank.index < direct_.size() && direct_[bank.index]) { return; }
+        // Addressed in place means the *address* is already right - not that the bytes are resident.
+        // A bank served straight out of the artifact mapping is backed by file pages the OS may
+        // evict at any time, so it is a cold tier wearing a warm tier's address. A managed pinned
+        // copy is therefore still worth keeping, and NINFER_ARENA_MANAGED asks for one even here:
+        // that is what makes the warm tier a tier we control instead of a page cache we do not.
+        if (!managed_even_in_place() && bank.index < direct_.size() && direct_[bank.index]) {
+            return;
+        }
         auto& s = state_[bank.index];
         // port (sm_89): a call that wants more experts than the arena has slots would evict the
         // slots it just filled, and the offsets handed back would name another expert's bytes. That
@@ -392,7 +398,9 @@ public:
                                  std::uint64_t& bytes) const override {
         bytes = 0;
         if (bank >= state_.size()) { return nullptr; }
-        if (bank < direct_.size() && direct_[bank]) { return nullptr; }
+        if (!managed_even_in_place() && bank < direct_.size() && direct_[bank]) {
+            return nullptr;
+        }
         const auto& s = state_[bank];
         if (expert >= s.slot_of.size()) { return nullptr; }
         const auto slot = s.slot_of[expert];
@@ -589,6 +597,12 @@ private:
     std::uint32_t slot_capacity_ = 0;
     std::uint32_t used_          = 0;
     std::vector<bool> direct_; // bank addressed in place, no arena copy
+    // When set, an in-place bank still gets a managed pinned copy. Off by default so a run that
+    // never asks for the warm tier behaves exactly as before.
+    static bool managed_even_in_place() {
+        static const bool value = std::getenv("NINFER_ARENA_MANAGED") != nullptr;
+        return value;
+    }
     std::vector<std::uint32_t> slot_bank_, slot_expert_;
     std::vector<std::uint64_t> slot_last_use_;
     std::uint64_t epoch_ = 0;
