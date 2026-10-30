@@ -134,6 +134,7 @@ struct ExpertCache::Impl {
     std::uint64_t stat_views  = 0;
     std::uint64_t stat_arena  = 0;
     std::uint64_t stat_arena_experts = 0;
+    std::uint64_t stat_arena_probes  = 0;
     std::uint64_t stat_file_experts  = 0;
     double stat_read_us              = 0.0;
     // Counted at the one place every upload passes through, so the figure cannot disagree with the
@@ -495,6 +496,26 @@ struct ExpertCache::Impl {
                 std::uint64_t arena_bytes = 0;
                 const auto* arena_image =
                     arena_source->arena_image(key.bank, key.expert, arena_bytes);
+                // Every Nth arena hit is deliberately served from the artifact instead, so the cold
+                // side of the warm-tier decision keeps producing a number while the warm side is
+                // winning. A controller that only measures the path it chose cannot tell when the
+                // chosen path stops being the right one (1y.7 step 3f).
+                static const std::uint64_t probe_every = [] {
+                    const char* value = std::getenv("NINFER_ARENA_PROBE");
+                    return value != nullptr && *value != '\0'
+                               ? std::strtoull(value, nullptr, 10)
+                               : std::uint64_t{64};
+                }();
+                static std::uint64_t arena_hits_seen = 0;
+                bool probe_cold = false;
+                if (probe_every != 0 && arena_image != nullptr && arena_bytes != 0) {
+                    probe_cold = (++arena_hits_seen % probe_every) == 0;
+                }
+                if (probe_cold) {
+                    ++stat_arena_probes;
+                    arena_image = nullptr;
+                    arena_bytes = 0;
+                }
                 if (arena_image != nullptr && arena_bytes != 0) {
                     ++stat_arena_experts;
                     // Verification: does the arena actually hold this expert's image? Cheap to ask,
@@ -888,6 +909,7 @@ std::uint32_t ExpertCache::last_uploaded() const noexcept { return impl_->last_s
 ExpertCache::UploadSourceStats ExpertCache::upload_sources() const {
     UploadSourceStats stats;
     stats.arena_experts = impl_->stat_arena_experts;
+    stats.arena_probes  = impl_->stat_arena_probes;
     stats.file_experts  = impl_->stat_file_experts;
     stats.read_us       = impl_->stat_read_us;
     return stats;

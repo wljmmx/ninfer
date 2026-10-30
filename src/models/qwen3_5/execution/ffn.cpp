@@ -890,6 +890,15 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
                         (cold - control.signals.cold_read_us_per_expert) / 16.0;
                 }
                 const auto total = sources.arena_experts + sources.file_experts;
+                static std::uint64_t last_probes = 0;
+                if (sources.arena_probes != last_probes) {
+                    std::fprintf(stderr, "[warm] probes=%llu file_experts=%llu read_us=%.0f\n",
+                                 static_cast<unsigned long long>(sources.arena_probes),
+                                 static_cast<unsigned long long>(sources.file_experts),
+                                 sources.read_us);
+                    std::fflush(stderr);
+                    last_probes = sources.arena_probes;
+                }
                 if (total > 0) {
                     const double ratio =
                         static_cast<double>(sources.arena_experts) / static_cast<double>(total);

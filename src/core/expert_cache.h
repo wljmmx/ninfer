@@ -160,6 +160,7 @@ void prepare(std::span<const ExpertCacheKey> required, cudaStream_t stream = nul
     // its admission cost" is a ratio between read_us and the copy that filling it costs.
     struct UploadSourceStats {
         std::uint64_t arena_experts = 0; // served from the pinned warm copy
+        std::uint64_t arena_probes  = 0; // arena hits deliberately served cold, to keep that side measured
         std::uint64_t file_experts  = 0; // read out of the artifact mapping
         double read_us              = 0.0; // host time spent in read_entry, cumulative
     };
