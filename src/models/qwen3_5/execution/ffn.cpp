@@ -614,10 +614,46 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
         // Split layer: the pool holds the experts this layer routes to most, the host tier covers
         // the rest. Both halves land in FP32 and are folded into the residual once, so a split
         // layer rounds exactly like a resident or a fully hosted one.
-        auto fetch      = std::move(*early);
+        auto fetch           = std::move(*early);
+        const auto mask_host = moe.stream->resident_mask_host();
+        // The pool decides how a layer MAY run; the routing decides how it HAS to run. When every
+        // route this step publishes is already resident, the host half is empty and the whole split
+        // apparatus - the masked subset kernel, the FP32 intermediate, the merge - computes what the
+        // resident path computes directly. Measured at 12 GiB: coverage is already 100% there and
+        // decode was still 45.9 tok/s against 214-235 when the layer is fully resident, because the
+        // split path was taken on the pool's shape alone.
+        bool all_resident = true;
+        for (std::size_t i = 0; i < fetch.ids.size(); ++i) {
+            const auto expert = fetch.ids[i];
+            if (expert < 0 ||
+                static_cast<std::size_t>(expert) >= mask_host.size() || !mask_host[expert]) {
+                all_resident = false;
+                break;
+            }
+        }
+        if (all_resident) {
+            // Same call as the fully resident tail: empty subset, BF16 accumulation into the
+            // residual. Bit-identical by construction, which is what the PPL gate checks.
+            try {
+                MemoryArena arena(MemorySpan{scratch.data, scratch.bytes, execution.device()});
+                ops::routed_swiglu(hidden, routed, moe.stream->experts(), routes, {},
+                                   ops::ScaledSwiGLUTerm{moe.shared, shared_coefficients},
+                                   ops::MoeEpilogue::AddResidual, residual, arena, execution);
+            } catch (const std::exception& error) {
+                throw std::invalid_argument(std::string("expert stream run: ") + error.what());
+            }
+            if (std::getenv("NINFER_SPLIT_TIMING") != nullptr) {
+                static std::uint64_t fast = 0;
+                if (++fast % 40 == 0) {
+                    std::fprintf(stderr, "[split] all-resident fast path x%llu\n",
+                                 static_cast<unsigned long long>(fast));
+                    std::fflush(stderr);
+                }
+            }
+            return;
+        }
         auto mixed_f32 = workspace.alloc(DType::FP32, {hidden.ne[0], columns});
         MemoryArena mixed_arena(MemorySpan{scratch.data, scratch.bytes, execution.device()});
-        const auto mask_host = moe.stream->resident_mask_host();
         const auto mask_size = static_cast<std::int32_t>(mask_host.size());
         Tensor device_mask(const_cast<void*>(moe.stream->resident_mask()), execution.device(),
                            DType::I32, {mask_size});
@@ -627,6 +663,7 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
                                ops::ScaledSwiGLUTerm{moe.shared, shared_coefficients},
                                ops::MoeEpilogue::Write, mixed_f32, mixed_arena, execution);
         };
+        const auto dev_begin = std::chrono::steady_clock::now();
         auto& graphs = LayerGraphs::instance();
         if (graphs.enabled()) {
             // What the capture baked in is the argument list, so the key is the set of buffer
@@ -675,11 +712,31 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
         } else {
             moe_run();
         }
+        const auto dev_end = std::chrono::steady_clock::now();
         Tensor host_mask(const_cast<std::int32_t*>(mask_host.data()), Device::cpu(), DType::I32,
                          {mask_size});
         host_routed_ffn(fetch, moe,
                         ops::ExpertSubset{ops::ExpertSubsetKind::MaskZeros, host_mask}, mixed_f32,
                         residual, execution, host_term_device);
+        if (std::getenv("NINFER_SPLIT_TIMING") != nullptr) {
+            // Where the split path's per-layer time actually goes. Without this the 4x gap against
+            // full residency could only be guessed at: the expert bookkeeping measures ~0.01 ms, so
+            // the cost has to be in the device subset run or the host merge - and which one decides
+            // what to remove.
+            static double dev_ms = 0.0;
+            static double host_ms = 0.0;
+            static std::uint64_t layers = 0;
+            const auto host_end = std::chrono::steady_clock::now();
+            dev_ms += std::chrono::duration<double, std::milli>(dev_end - dev_begin).count();
+            host_ms += std::chrono::duration<double, std::milli>(host_end - dev_end).count();
+            if (++layers % 40 == 0) {
+                std::fprintf(stderr, "[split] layer dev=%.3fms host=%.3fms\n", dev_ms / 40.0,
+                             host_ms / 40.0);
+                std::fflush(stderr);
+                dev_ms = 0.0;
+                host_ms = 0.0;
+            }
+        }
         return;
     }
     try {
