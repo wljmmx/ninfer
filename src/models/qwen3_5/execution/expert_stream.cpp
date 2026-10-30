@@ -158,6 +158,19 @@ ExpertStream::ExpertStream(std::uint32_t count, WeightBankLayout gate_up, Weight
                     [&](std::uint64_t object) { return object != gate_up_objects_.front(); }) ||
         std::any_of(down_objects_.begin(), down_objects_.end(),
                     [&](std::uint64_t object) { return object != down_objects_.front(); });
+    if (std::getenv("NINFER_EXPERT_TIMING") != nullptr) {
+        // One line, once: which artifact layout this bank is built from. The two are described and
+        // materialized differently (per-expert objects vs one fused object addressed by row range),
+        // and without this line a run cannot be attributed to either.
+        static bool artifact_logged = false;
+        if (!artifact_logged) {
+            artifact_logged = true;
+            std::fprintf(stderr, "[experts] artifact layout: %s\n",
+                         per_expert_objects_ ? "per-expert objects (e2)"
+                                             : "fused (one object per bank)");
+            std::fflush(stderr);
+        }
+    }
     const std::array<std::uint64_t, 2> gate_up_shape{gate_up_.region.rows, gate_up_.columns};
     const std::array<std::uint64_t, 2> down_shape{down_.region.rows, down_.columns};
     gate_up_expert_ = weight_geometry(gate_up_.format, gate_up_.layout, gate_up_shape);
