@@ -151,6 +151,10 @@ void prepare(std::span<const ExpertCacheKey> required, cudaStream_t stream = nul
     [[nodiscard]] std::uint64_t uploads() const noexcept;
     [[nodiscard]] std::uint64_t evictions() const noexcept;
     [[nodiscard]] std::uint64_t hits() const noexcept;
+    // port (sm_89): how many experts this stream actually moved into the pool on the last turn.
+    // It is the only honest miss count - the residency mask is published from the same decision that
+    // places the routes, so asking it "was this a miss?" always answers no.
+    [[nodiscard]] std::uint32_t last_uploaded() const noexcept;
     // port (sm_89): how many banks' worth of slots the pool currently backs. Kept as the reported
     // pool size unit; the pool itself is one flat slot space.
     [[nodiscard]] std::uint64_t windows() const noexcept;
@@ -185,6 +189,7 @@ private:
 };
 
 } // namespace ninfer
+
 
 
 

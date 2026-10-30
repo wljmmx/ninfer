@@ -1113,6 +1113,9 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     last_cost_.upload_ms =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - upload_begin)
             .count();
+    // The honest miss count for the path controller: the mask cannot answer this question, because
+    // it is written from the same decision that places the step's routes.
+    last_cost_.uploaded = cache_->last_uploaded();
     // The uploads were queued on the consumer stream, so the kernels that read them are already
     // ordered after the copies; only the artifact path had to wait, and it did so inside
     // progress(). A device-wide synchronise here used to cost most of the layer's time.
@@ -1120,5 +1123,6 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
 }
 
 } // namespace ninfer::models::qwen3_5::execution
+
 
 

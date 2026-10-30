@@ -1,6 +1,7 @@
 #include "models/qwen3_5/execution/ffn.h"
 
 #include "models/qwen3_5/execution/expert_stream.h"
+#include "models/qwen3_5/execution/expert_path_control.h"
 #include "models/qwen3_5/execution/host_expert_residency.h"
 #include "core/cpu/executor.h"
 #include "core/cpu/system.h"
@@ -712,9 +713,13 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
     void* host_term_device = std::getenv("NINFER_HOST_MERGE_CPU") != nullptr ? nullptr
                                                                            : host_term_span.data;
     std::optional<HostRoutedFetch> early;
+    const auto fetch_begin = std::chrono::steady_clock::now();
     if (!moe.stream->fully_resident()) {
         early.emplace(fetch_host_routed(hidden, routes, residual, execution.stream, pack_device));
     }
+    const double fetch_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - fetch_begin)
+                                .count();
     try {
         if (!moe.stream->ensure(ids.data, routed.top_k, columns, execution.stream,
                                 early ? early->ids.data() : nullptr)) {
@@ -770,6 +775,23 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
             }
         }
         if (layer_timing) { timeline().missing += missing; }
+        // The controller reads the same nodes the panel shows, one layer at a time. It is in shadow
+        // mode (no Device branch in the kernels yet): it prints what it would take and the numbers
+        // behind it, and changes nothing.
+        if (layer_timing) {
+            auto& control = expert_path_control();
+            if (control.layers == 0) {
+                control.probe_link(static_cast<std::uint64_t>(2U << 20));
+            }
+            control.observe_fetch(fetch_ms * 1000.0);
+            // `missing` here is the empty half of the mask, which the placement itself decided, so it
+            // is always zero on a covered step. The controller needs what actually moved.
+            const auto moved = moe.stream->last_cost().uploaded;
+            control.observe_upload(moe.stream->last_cost().upload_ms * 1000.0, moved);
+            control.observe_misses(moved);
+            control.step(false);
+            control.report();
+        }
         if (all_resident) {
             // Same call as the fully resident tail: empty subset, BF16 accumulation into the
             // residual. Bit-identical by construction, which is what the PPL gate checks.

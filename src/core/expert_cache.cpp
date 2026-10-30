@@ -117,6 +117,8 @@ struct ExpertCache::Impl {
     // queued. Before a slot is reused its event is waited on, which is the only ordering the ring
     // needs: the data path itself is already ordered by the consumer stream.
     std::size_t staging_cursor = 0;
+    // Experts moved on the last progress() turn, for the path controller's miss estimate.
+    std::uint32_t last_staged = 0;
     std::array<cudaEvent_t, kStagingRing> staging_event{};
     std::vector<std::size_t> staging_used;
     // port (sm_89): the stream the consumer runs on. Uploads queued there are ordered before the
@@ -848,6 +850,7 @@ void ExpertCache::wait_for_progress(cudaStream_t stream) {
         staged_total += state.submitted_batches;
         if (state.required_published) { break; }
     }
+    impl_->last_staged = static_cast<std::uint32_t>(staged_total);
     if (timing) {
         static std::uint64_t calls       = 0;
         static double ms                 = 0.0;
@@ -868,6 +871,8 @@ void ExpertCache::wait_for_progress(cudaStream_t stream) {
         }
     }
 }
+
+std::uint32_t ExpertCache::last_uploaded() const noexcept { return impl_->last_staged; }
 
 void ExpertCache::attach_arena(const ExpertArenaSource* arena) noexcept {
     // port (sm_89): on by default. A bank addressed in place has no arena slot, and the arena is
@@ -933,6 +938,9 @@ bool ExpertCache::window_resident(std::uint32_t bank) const noexcept {
 void ExpertCache::preload_all() { impl_->preload_every_layer(); }
 
 } // namespace ninfer
+
+
+
 
 
 

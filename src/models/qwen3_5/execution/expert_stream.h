@@ -94,6 +94,7 @@ public:
         double route_ms  = 0.0; // the route ids, only when the caller has none to hand over
         double layout_ms = 0.0; // hot set, slot publish, mask and offset tables
         double upload_ms = 0.0; // prepare + wait_for_progress
+        std::uint32_t uploaded = 0; // experts actually moved into the pool on this layer
     };
     [[nodiscard]] StepCost last_cost() const noexcept { return last_cost_; }
     // port (sm_89): how many slots a frozen set must leave free. Measured on real text, a token
@@ -233,4 +234,5 @@ private:
 };
 
 } // namespace ninfer::models::qwen3_5::execution
+
 
