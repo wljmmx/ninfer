@@ -771,14 +771,33 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
             // Admission by probability, not by contact: only an expert that has already been routed
             // a few times is worth a RAM slot. Everything else stays on disk, which is what keeps the
             // warm tier a partition instead of a second copy of the model.
-            static const float min_hits = [] {
-                const char* value = std::getenv("NINFER_HOST_MIRROR_MIN_HITS");
-                return value != nullptr && *value != '\0' ? static_cast<float>(std::atof(value))
-                                                          : 3.0F;
-            }();
-            moe.stream->warm_candidates(routes, warm_list, min_hits);
+            // Admission on eviction (1y.7 step 3b): what the Device pool just dropped is exactly the
+            // set with a demonstrated short reuse distance. Admission on routes flooded the tier -
+            // 7.3 of 8 per layer across 40 banks rolled a 3200-slot arena over in ~10 steps, and the
+            // hit rate stayed at zero.
+            const auto demoted = moe.stream->demoted_this_step();
+            warm_list.assign(demoted.begin(), demoted.end());
             if (!warm_list.empty()) {
                 host_tier->ensure(ExpertBankId{moe.stream->bank_index()}, warm_list, nullptr);
+                // Does the tier actually answer for what it was just given? A zero hit rate in the
+                // cache is ambiguous between "the policy admits the wrong experts" and "the tier
+                // cannot hand them back"; this one probe separates them.
+                if (moe.stream->bank_index() == 0) {
+                    std::uint64_t probe_bytes = 0;
+                    const auto* probe_image = host_tier->arena_image(
+                        moe.stream->bank_index(), static_cast<std::uint32_t>(warm_list.front()),
+                        probe_bytes);
+                    static std::uint64_t probes = 0, answered = 0;
+                    ++probes;
+                    if (probe_image != nullptr && probe_bytes != 0) { ++answered; }
+                    if (probes % 40 == 0) {
+                        std::fprintf(stderr, "[mirror] tier answers %.0f%% (bytes=%llu)\n",
+                                     100.0 * static_cast<double>(answered) / 40.0,
+                                     static_cast<unsigned long long>(probe_bytes));
+                        std::fflush(stderr);
+                        answered = 0;
+                    }
+                }
             }
             // One line per token: how many experts the admission rule let into the warm tier. A zero
             // here means the policy filtered everything (the tier is empty for a reason we can name);

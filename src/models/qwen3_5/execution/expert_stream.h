@@ -93,6 +93,9 @@ public:
     // expert that has been routed once is a cold miss and belongs on disk, while one that keeps
     // coming back but does not fit the Device pool is exactly what RAM is for. `min_hits` is a count
     // of routes seen so far, not a byte threshold - it says "this one has proven it comes back".
+    // Experts the pool dropped on the last ensure(): the warm tier admits from here rather than from
+    // the routes, because these are the ones with a demonstrated short reuse distance.
+    [[nodiscard]] std::span<const std::int32_t> demoted_this_step() const noexcept { return demoted_; }
     void warm_candidates(std::span<const std::int32_t> routes, std::vector<std::int32_t>& out,
                          float min_hits) const {
         out.clear();
@@ -168,6 +171,7 @@ private:
     // the top entries of this instead of whatever the current step happened to route to, which
     // used to replace all eight experts on every token and make the hot set useless.
     std::vector<float> hot_score_;
+    std::vector<std::int32_t> demoted_;
     // llama.cpp-style SLRU over slot ids (src/llama-moe-cache.cpp:16-121): a probation list and a
     // protected half. A hit promotes the slot, a miss takes the probation head while skipping the
     // experts this step needs, and a slot that keeps its expert keeps its number, so republishing

@@ -965,6 +965,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             // anything changed or not. The full copy stays as the fallback when most rows move.
             if (prev_slot_.size() != count_) { prev_slot_.assign(count_, -1); }
             std::uint32_t entered_this_step = 0;
+            demoted_.clear();
             std::vector<std::uint32_t> moved;
             moved.reserve(count_);
             for (std::uint32_t expert = 0; expert < count_; ++expert) {
@@ -972,6 +973,11 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 const auto now  = slot ? static_cast<std::int32_t>(*slot) : -1;
                 if (now != prev_slot_[expert]) {
                     moved.push_back(expert);
+                    // Leaving the Device pool is the one signal that says "this expert was hot and is
+                    // not hot enough any more" - the warm tier's admission criterion (1y.7 step 3b).
+                    if (prev_slot_[expert] >= 0 && now < 0) {
+                        demoted_.push_back(static_cast<std::int32_t>(expert));
+                    }
                     // An expert that was not resident at all is a row that has to be uploaded, not
                     // just a table entry that moved: that is the number the transfer cost follows.
                     if (prev_slot_[expert] < 0 && now >= 0) { ++entered_this_step; }
