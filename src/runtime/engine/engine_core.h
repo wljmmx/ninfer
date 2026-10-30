@@ -1109,6 +1109,21 @@ private:
                                    static_cast<std::ptrdiff_t>(row * pending.row_stride());
                 request->generated.insert(request->generated.end(), first,
                                           first + static_cast<std::ptrdiff_t>(accepted));
+                // Token-level trace for the replay question (E9). Text cannot carry it: the chat
+                // template re-renders and detokenisation both move the bytes, which is why an
+                // HTTP-level comparison contradicted a bit-identical PPL run. The sampled ids do
+                // not have that problem - two runs agree or they do not, token by token.
+                if (const char* dump_path = std::getenv("NINFER_TOKEN_DUMP")) {
+                    static std::FILE* dump = std::fopen(dump_path, "ab");
+                    if (dump != nullptr) {
+                        for (std::size_t k = 0; k < accepted; ++k) {
+                            std::fprintf(dump, "%llu %d\n",
+                                         static_cast<unsigned long long>(request->id),
+                                         static_cast<int>(*(first + static_cast<std::ptrdiff_t>(k))));
+                        }
+                        std::fflush(dump);
+                    }
+                }
             }
         } catch (...) {
             const std::exception_ptr error = std::current_exception();
