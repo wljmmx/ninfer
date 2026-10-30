@@ -241,6 +241,26 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     }
     constexpr std::uint64_t kLayerHeadroom = 2;
     host_want = host_layer * kLayerHeadroom * instance.expert_cache->slot_bytes();
+    // port (sm_89): 1y.7 step two - the warm tier stops taking a share of free RAM on its own and
+    // asks the ledger, which is the one place that can see every tier at once. The number it grants
+    // is computed exactly as before (working-set estimate, RAM share, explicit override), so this
+    // step is behaviour-neutral; what changes is that the amount is now accounted and printed
+    // beside the other two tiers instead of being decided in isolation.
+    const std::uint64_t host_arena_bytes = host_expert_arena_bytes(host_want);
+    instance.ledger.set_cap(core::Tier::Device,
+                            instance.expert_cache->capacity_bytes() + (260ull << 20));
+    // The warm tier's ceiling is the budget it just computed, not "a quarter of free RAM": the
+    // partition is what the scheduler grants, and a module may not widen it on its own.
+    instance.ledger.set_cap(core::Tier::Host, host_arena_bytes);
+    (void)instance.ledger.reserve(core::Tier::Device, "expert-pool",
+                                  instance.expert_cache->capacity_bytes());
+    (void)instance.ledger.reserve(core::Tier::Device, "kv-pages", 260ull << 20);
+    if (!instance.ledger.reserve(core::Tier::Host, "expert-warm", host_arena_bytes)) {
+        std::fprintf(stderr,
+                     "[ledger] expert-warm asked %llu MiB and did not fit; the engine keeps its own "
+                     "estimate for now (step two is accounting only)\n",
+                     static_cast<unsigned long long>(host_arena_bytes >> 20));
+    }
     std::fprintf(stderr,
                  "[experts] banks=%zu slot=%llu windows=%llu pool=%lluMiB host=%d arena=%lluMiB "
                  "want=%lluMiB top_k=%u kept=%llu layer=%llu\n",
@@ -249,10 +269,20 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
                  static_cast<unsigned long long>(instance.expert_cache->windows()),
                  static_cast<unsigned long long>(instance.expert_cache->capacity_bytes() >> 20),
                  int(instance.expert_host_source != nullptr),
-                 static_cast<unsigned long long>(host_expert_arena_bytes(host_want) >> 20),
+                 static_cast<unsigned long long>(host_arena_bytes >> 20),
                  static_cast<unsigned long long>(host_want >> 20), routed_top_k,
                  static_cast<unsigned long long>(host_kept),
                  static_cast<unsigned long long>(host_layer));
+    // port (sm_89): one line that says what each tier holds, from the ledger rather than from three
+    // modules that cannot see each other (1y.7 step two: accounting only, allocations unchanged).
+    {
+        const std::uint64_t payload = host_layer == 0
+                                          ? 0
+                                          : static_cast<std::uint64_t>(requirements.banks.front().count) *
+                                                static_cast<std::uint64_t>(requirements.banks.size()) *
+                                                instance.expert_cache->slot_bytes();
+        instance.ledger.report(payload);
+    }
     // A pool that cannot hold a layer hands the remainder to the host tier: one arena, the same
     // uniform slot images the Device pool uses, filled on demand.
     bool short_pool = false;
@@ -283,7 +313,7 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
                              streams[i]->per_expert_objects()});
         }
         auto residency = std::make_unique<models::qwen3_5::execution::HostExpertResidency>(
-            descs, files, source, host_expert_arena_bytes(host_want));
+            descs, files, source, host_arena_bytes);
         for (std::size_t i = 0; i < streams.size(); ++i) {
             streams[i]->attach_host(*residency);
         }

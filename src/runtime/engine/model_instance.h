@@ -5,6 +5,7 @@
 #include "models/qwen3_5/program/runtime_types.h"
 #include "runtime/engine/context_cache/context_cost.h"
 #include "core/expert_file.h"
+#include "core/memory_ledger.h"
 #include "runtime/engine/kv_capacity.h"
 
 #include <memory>
@@ -40,6 +41,9 @@ struct ModelInstance {
     // port (sm_89): true when the whole resident set fits at once, so a captured decode graph may
     // already point into it and the pool must not change size underneath that graph.
     bool expert_pool_pinned = false;
+    // port (sm_89): the one place that knows what each tier holds (1y.7). Step two only registers
+    // and prints; the allocations still use their own estimates.
+    core::MemoryLedger ledger;
 
     ModelInstance(std::unique_ptr<models::qwen3_5::Model> model, const EngineOptions& options);
     ~ModelInstance();
