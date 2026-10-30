@@ -1,4 +1,5 @@
 #include "models/qwen3_5/execution/attention.h"
+#include "models/qwen3_5/execution/shape_class.h"
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/gdn.h"
 #include "models/qwen3_5/execution/mtp.h"
@@ -505,7 +506,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     // arena, so the number next to a class IS its memory bound - the criterion that X1 (1x.4e) was
     // missing when a 921-column request outgrew a plan built for 1024.
     if (std::getenv("NINFER_SHAPE_REPORT") != nullptr) {
-        for (const std::int32_t width : {1024, 2048, 4096}) {
+        // The class set comes from one place (shape_class.h) instead of an inline list here: S0's
+        // whole point is that a width is rounded up to a class, so the classes have to be named once.
+        for (const std::int32_t width : execution::kPrefillShapeClasses) {
             if (width > static_cast<std::int32_t>(plan.prefill_chunk)) { continue; }
             WorkspaceLayoutBuilder probe;
             text_common_root(probe, width);
