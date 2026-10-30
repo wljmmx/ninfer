@@ -312,6 +312,35 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     // 14.4 tok/s on the split path against a host-only layer at the same pool size.
     if (capacity < 4) { return false; }
     const bool fully = capacity >= count_;
+    // GH1: the three coverage numbers the plan gates on, all with ONE denominator - the number of
+    // ensure() calls, i.e. layers. Counted here rather than only inside the split branch, because on
+    // a fully resident build the split branch never runs and the panel would report 0% for
+    // everything, which is the opposite of the truth.
+    //
+    //   static     : the R1 table did not move for this layer
+    //   no_miss    : every route this layer published was already resident
+    //   capturable : the whole expert set fitted the pool, so a router -> GEMM capture needs no
+    //                host intervention (this is GH2/G2's precondition, not a promise that a graph
+    //                exists yet)
+    ++gh1_calls_;
+    if (!fully) {
+        ++gh1_split_calls_;
+    } else {
+        // A resident layer cannot miss and its table cannot move.
+        ++gh1_no_miss_calls_;
+        ++gh1_static_calls_;
+    }
+    if (std::getenv("NINFER_EXPERT_TIMING") != nullptr && gh1_calls_ % 8 == 0) {
+        const auto pct = [](std::uint64_t part, std::uint64_t all) {
+            return all == 0 ? 0.0 : 100.0 * static_cast<double>(part) / static_cast<double>(all);
+        };
+        std::fprintf(stderr,
+                     "[gh1] bank=%u calls=%llu static=%.1f%% no_miss=%.1f%% capturable=%.1f%%\n",
+                     bank_, static_cast<unsigned long long>(gh1_calls_),
+                     pct(gh1_static_steps_, gh1_steps_), pct(gh1_no_miss_steps_, gh1_steps_),
+                     pct(gh1_calls_ - gh1_split_calls_, gh1_calls_));
+        std::fflush(stderr);
+    }
     const auto values = static_cast<std::size_t>(top_k) * static_cast<std::size_t>(tokens);
     const auto bytes  = values * sizeof(std::int32_t);
     // port (sm_89): the host must know the routed experts before it can publish them, so one
@@ -359,6 +388,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     // experts with the highest decayed score, so the next step has a chance to hit. The cache only
     // uploads the experts that actually changed, and experts that stay keep their slot.
     if (!fully) {
+        // (the split branch itself is counted at the top of ensure)
         if (tokens <= kHotSetUpdateTokens) {
             for (std::size_t i = 0; i < values; ++i) {
                 hot_score_[static_cast<std::size_t>(route_ids[i])] += 1.0F;
