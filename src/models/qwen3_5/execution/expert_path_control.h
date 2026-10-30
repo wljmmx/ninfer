@@ -1,25 +1,28 @@
 #pragma once
 
-// port (sm_89): which tier serves a routed expert is a runtime decision, not a build-time constant.
+// port (sm_89): the runtime policy controller - the one place that decides how a running instance
+// serves experts, whether it prefetches, whether it may capture graphs, and whether it keeps a
+// frozen set. Every decision is taken from measurement; none is keyed on a pool size or a GiB figure.
 //
-// The obvious implementation - "use the Device-side path above 16 GiB" - is wrong for two reasons.
-// A pool size is not a measurement: the same pool serves a converged set at 0.05 misses a layer and
-// a cold one at 2.2, so one number describes two completely different machines. And the costs it
-// would be compared against are properties of this box on this driver: how long a layer waits for
-// its routes to come back, how long an expert takes to travel, how fast the Device reads host RAM.
+// Why: the same 12 GiB pool serves a converged set at 0.05 misses a layer and a cold one at 2.2.
+// A size number describes two different machines, so a threshold on it is a guess wearing a
+// constant's clothes.
 //
-// So the decision is made from measurement. Each layer reports what it actually cost; a moving
-// average of those feeds a two-sided cost model:
+// The plan already names what this drives (v6 section 7, runtime console):
 //
-//   host path   = fetch (the per-layer round trip) + misses x upload_per_expert
-//   device path = misses x read_per_expert        + fixed launch cost
+//   actuator     plan id   changes                                  guardrail (v6 section 6)
+//   -----------  --------  ---------------------------------------  ---------------------------
+//   expert path  E5/O1     host upload vs device-side serving      cost model, see below
+//   prefetch     D1-D5     queue on/off, window budget              usefulness < 10% -> off
+//   layer graph  GH3/GH4   capture whole layers or not              capturable < 90% -> off
+//   frozen set   B1-B5     freeze the placement set or not          no_miss < 99%    -> off
 //
-// The Device path wins when it is cheaper by a margin, and the flag only flips after a run of
-// agreeing layers, so one noisy step cannot move it. Both sides are measured at runtime; nothing
-// here is keyed on a pool size, a model name, or a GiB figure.
+// Each actuator follows the same shape: observe, compare against a rule, require a run of agreeing
+// layers, then act - recording the throughput at the moment of acting, so a change that costs more
+// than it buys is reverted and that actuator is parked for a while.
 //
-// Until the kernels gain a Device-side branch, `device_path_ready` is false and this reports in
-// shadow mode: it prints what it would decide, with the numbers behind it, and changes nothing.
+// Until an actuator is wired into the kernels it reports "(shadow)": it prints what it would do and
+// why, and changes nothing.
 
 #include <cuda_runtime.h>
 
@@ -29,35 +32,70 @@
 
 namespace ninfer::models::qwen3_5::execution {
 
-struct ExpertPathControl {
-    // Measurements, exponentially smoothed with weight 1/16: about sixteen layers of memory. Long
-    // enough to be stable across a layer stack, short enough to follow a conversation changing topic.
-    double fetch_us             = 0.0; // host wait for this layer's routes
-    double upload_us_per_expert = 0.0; // host-to-device travel, measured per expert
+struct PolicySignals {
+    double fetch_us             = 0.0; // host waiting for this layer's routes
+    double upload_us_per_expert = 0.0; // host-to-device travel per expert
     double read_us_per_expert   = 0.0; // device reading host RAM, from the measured link
-    double miss_per_layer       = 0.0; // routes the pool did not hold
-    double link_gbps            = 0.0;
+    double miss_per_layer       = 0.0; // experts the pool had to move in
+    double ens_ms               = 0.0;
+    double gpu_ms               = 0.0;
+    double wall_ms              = 0.0;
+    // Coverage, from GH1. Negative means "not measured on this path"; never zero, which would read
+    // as a measurement of failure rather than an absence of one.
+    double static_pct     = -1.0;
+    double no_miss_pct    = -1.0;
+    double capturable_pct = -1.0;
+    double prefetch_usefulness = -1.0; // D4 gate input
+    double decode_tps          = -1.0; // the outcome every actuator is judged by
+};
 
-    bool device_path_ready = false; // true once the kernels have a Device-side branch
-    bool device_path       = false; // the decision in force
-    std::uint32_t agree    = 0;     // consecutive layers agreeing with the pending decision
-    std::uint64_t layers   = 0;
+struct PolicyActuator {
+    bool enabled  = false; // value in force
+    bool wired    = false; // false: shadow, the switch does not exist yet
+    std::uint32_t agree = 0;
+    double baseline_tps = -1.0;
+    std::uint32_t parked_layers = 0;
+    const char* reason = "n/a";
+};
 
-    void observe_fetch(double micros) { fetch_us += (micros - fetch_us) / 16.0; }
+class PolicyController {
+public:
+    PolicySignals signals;
+    PolicyActuator expert_path;
+    PolicyActuator prefetch;
+    PolicyActuator graph;
+    PolicyActuator freeze_set;
+    double link_gbps    = 0.0;
+    std::uint64_t layers = 0;
 
-    // A fully covered layer still tells us the fetch cost, so `experts` may be zero.
+    void observe_fetch(double micros) { signals.fetch_us += (micros - signals.fetch_us) / 16.0; }
+
     void observe_upload(double micros, std::uint32_t experts) {
         if (experts == 0) { return; }
         const double per = micros / static_cast<double>(experts);
-        upload_us_per_expert += (per - upload_us_per_expert) / 16.0;
+        signals.upload_us_per_expert += (per - signals.upload_us_per_expert) / 16.0;
     }
 
     void observe_misses(std::uint32_t experts) {
-        miss_per_layer += (static_cast<double>(experts) - miss_per_layer) / 16.0;
+        signals.miss_per_layer += (static_cast<double>(experts) - signals.miss_per_layer) / 16.0;
     }
 
-    // One 32 MiB host-to-device copy, timed once. It rides the same PCIe link the Device would read
-    // host-tier experts over, so it stands in for that bandwidth until a kernel measures it directly.
+    void observe_layer(double ens_ms, double gpu_ms, double wall_ms) {
+        signals.ens_ms += (ens_ms - signals.ens_ms) / 16.0;
+        signals.gpu_ms += (gpu_ms - signals.gpu_ms) / 16.0;
+        signals.wall_ms += (wall_ms - signals.wall_ms) / 16.0;
+    }
+
+    void observe_coverage(double static_pct, double no_miss_pct, double capturable_pct) {
+        signals.static_pct     = static_pct;
+        signals.no_miss_pct    = no_miss_pct;
+        signals.capturable_pct = capturable_pct;
+    }
+
+    void observe_decode(double tps) { signals.decode_tps = tps; }
+
+    // One 32 MiB host-to-device copy, timed once: the link the Device would read host experts over.
+    // Replaced by a per-layer measurement once that path exists.
     void probe_link(std::uint64_t slot_bytes) {
         constexpr std::size_t kBytes = 32U << 20;
         void* host                   = nullptr;
@@ -85,8 +123,9 @@ struct ExpertPathControl {
             if (ms < best) { best = ms; }
         }
         if (best > 0.0F) {
-            link_gbps          = static_cast<double>(kBytes) / (static_cast<double>(best) * 1e-3) / 1e9;
-            read_us_per_expert = static_cast<double>(slot_bytes) / (link_gbps * 1e9) * 1e6;
+            link_gbps = static_cast<double>(kBytes) / (static_cast<double>(best) * 1e-3) / 1e9;
+            signals.read_us_per_expert =
+                static_cast<double>(slot_bytes) / (link_gbps * 1e9) * 1e6;
         }
         (void)cudaEventDestroy(begin);
         (void)cudaEventDestroy(end);
@@ -94,50 +133,105 @@ struct ExpertPathControl {
         (void)cudaFreeHost(host);
     }
 
-    // The cost model. `kRoundTripCreditUs` is deliberately zero: the round trip's real cost on this
-    // path is not its 7 us but the pipeline it drains, and inventing a number for that here would be
-    // exactly the hardcoded judgement this controller exists to avoid. It is measured by A/B instead.
-    [[nodiscard]] bool prefer_device_path() const {
-        if (!device_path_ready || read_us_per_expert <= 0.0) { return false; }
-        const double host_cost   = fetch_us + miss_per_layer * upload_us_per_expert;
-        const double device_cost = miss_per_layer * read_us_per_expert;
-        return device_cost < host_cost * 0.8; // margin: no flip inside measurement noise
+    [[nodiscard]] double host_cost_us() const {
+        return signals.fetch_us + signals.miss_per_layer * signals.upload_us_per_expert;
     }
+    [[nodiscard]] double device_cost_us() const {
+        return signals.miss_per_layer * signals.read_us_per_expert;
+    }
+    [[nodiscard]] bool want_device_path() const {
+        if (signals.read_us_per_expert <= 0.0) { return false; }
+        return device_cost_us() < host_cost_us() * 0.8;
+    }
+    [[nodiscard]] bool want_prefetch() const { return signals.prefetch_usefulness >= 0.10; }
+    [[nodiscard]] bool want_graph() const {
+        return signals.capturable_pct >= 90.0 && signals.static_pct >= 95.0;
+    }
+    [[nodiscard]] bool want_freeze() const { return signals.no_miss_pct >= 99.0; }
 
-    void step(bool ready_now) {
-        device_path_ready = ready_now;
+    void step(bool device_path_ready, bool prefetch_wired, bool graph_wired, bool freeze_wired) {
         ++layers;
-        const bool want = prefer_device_path();
-        if (want == device_path) {
-            agree = 0;
-            return;
-        }
-        if (++agree >= 32) { // a full layer stack's worth of agreement before the flag moves
-            device_path = want;
-            agree       = 0;
-        }
+        drive(expert_path, want_device_path(), device_path_ready, "cost model");
+        drive(prefetch, want_prefetch(), prefetch_wired, "usefulness>=10%");
+        drive(graph, want_graph(), graph_wired, "capturable>=90% && static>=95%");
+        drive(freeze_set, want_freeze(), freeze_wired, "no_miss>=99%");
     }
 
     void report(bool force = false) {
         if (!force && layers % 40 != 0) { return; }
-        const double host_cost   = fetch_us + miss_per_layer * upload_us_per_expert;
-        const double device_cost = miss_per_layer * read_us_per_expert;
-        // In shadow mode the flag cannot move (there is no branch to move to), so report the side the
-        // model would pick rather than the side in force - otherwise the line reads as a contradiction.
-        const bool would   = prefer_device_path();
-        const char* verdict = device_path ? "device" : (would && !device_path_ready ? "device" : "host");
+        char s[8];
+        char n[8];
+        char c[8];
+        fmt_pct(s, sizeof(s), signals.static_pct);
+        fmt_pct(n, sizeof(n), signals.no_miss_pct);
+        fmt_pct(c, sizeof(c), signals.capturable_pct);
         std::fprintf(stderr,
-                     "[ctl] link=%.1fGB/s read=%.0fus/expert fetch=%.0fus upload=%.0fus/expert "
-                     "miss=%.2f/layer -> host=%.0fus device=%.0fus : %s%s\n",
-                     link_gbps, read_us_per_expert, fetch_us, upload_us_per_expert, miss_per_layer,
-                     host_cost, device_cost, verdict,
-                     device_path_ready ? "" : " (shadow: no Device branch in the kernels yet)");
+                     "[ctl] fetch=%.0fus upload=%.0fus/exp read=%.0fus/exp miss=%.2f | "
+                     "wall=%.3fms gpu=%.3fms ens=%.3fms | cov static=%s no_miss=%s capt=%s | "
+                     "path=%s(%s) pf=%s(%s) graph=%s(%s) freeze=%s(%s) | tps=%.1f\n",
+                     signals.fetch_us, signals.upload_us_per_expert, signals.read_us_per_expert,
+                     signals.miss_per_layer, signals.wall_ms, signals.gpu_ms, signals.ens_ms, s, n,
+                     c, on_off(expert_path.enabled), expert_path.wired ? "live" : "shadow",
+                     on_off(prefetch.enabled), prefetch.wired ? "live" : "shadow",
+                     on_off(graph.enabled), graph.wired ? "live" : "shadow",
+                     on_off(freeze_set.enabled), freeze_set.wired ? "live" : "shadow",
+                     signals.decode_tps < 0.0 ? 0.0 : signals.decode_tps);
+        std::fprintf(stderr,
+                     "[ctl] would: path=%s (host=%.0fus vs device=%.0fus) pf=%s graph=%s freeze=%s\n",
+                     want_device_path() ? "device" : "host", host_cost_us(), device_cost_us(),
+                     want_prefetch() ? "on" : "off", want_graph() ? "on" : "off",
+                     want_freeze() ? "on" : "off");
         std::fflush(stderr);
+    }
+
+private:
+    static const char* on_off(bool value) { return value ? "on" : "off"; }
+
+    static void fmt_pct(char* out, std::size_t size, double value) {
+        if (value < 0.0) {
+            std::snprintf(out, size, "n/a");
+        } else {
+            std::snprintf(out, size, "%.0f%%", value);
+        }
+    }
+
+    // One actuator's lifecycle: agree for a layer stack, then act; remember the throughput the
+    // change was made at; if the next window comes back more than 3% slower, revert and park it.
+    void drive(PolicyActuator& actuator, bool want, bool wired_now, const char* reason) {
+        if (actuator.parked_layers > 0) {
+            --actuator.parked_layers;
+            actuator.reason = "parked";
+            return;
+        }
+        if (want == actuator.enabled) {
+            actuator.agree = 0;
+            return;
+        }
+        if (++actuator.agree < 32) { return; }
+        if (actuator.baseline_tps > 0.0 && signals.decode_tps > 0.0 &&
+            signals.decode_tps < actuator.baseline_tps * 0.97) {
+            actuator.enabled       = !actuator.enabled;
+            actuator.agree         = 0;
+            actuator.baseline_tps  = signals.decode_tps;
+            actuator.parked_layers = 40U * 32U;
+            actuator.reason        = "reverted";
+            return;
+        }
+        actuator.enabled      = want;
+        actuator.agree        = 0;
+        actuator.baseline_tps = signals.decode_tps;
+        actuator.reason       = reason;
+        if (!wired_now) {
+            // Shadow: record the decision, but leave the switch where it is.
+            actuator.enabled = !want;
+            actuator.reason  = "shadow";
+        }
+        actuator.wired = wired_now;
     }
 };
 
-inline ExpertPathControl& expert_path_control() {
-    static thread_local ExpertPathControl state;
+inline PolicyController& policy_controller() {
+    static thread_local PolicyController state;
     return state;
 }
 

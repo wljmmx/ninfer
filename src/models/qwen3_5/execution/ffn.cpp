@@ -52,6 +52,9 @@ struct SplitTimeline {
     double host_write  = 0.0; // host: merge submission (the device folds it in)
     std::uint64_t missing = 0; // routed entries this layer the pool did not hold
     std::uint64_t layers  = 0;
+    // Last single-layer readings: the controller judges a layer, not a token average.
+    double last_gpu  = 0.0;
+    double last_wall = 0.0;
 
     void report();
 };
@@ -99,6 +102,8 @@ void timeline_gpu_collect() {
     float elapsed = 0.0F;
     if (cudaEventElapsedTime(&elapsed, clock.begin, clock.end) == cudaSuccess) {
         timeline().gpu += static_cast<double>(elapsed);
+        timeline().last_gpu = static_cast<double>(elapsed);
+        timeline().last_gpu = static_cast<double>(elapsed);
     }
     clock.pending = false;
 }
@@ -131,9 +136,11 @@ struct LayerScope {
     ~LayerScope() {
         if (!on) { return; }
         auto& state = timeline();
-        state.wall += std::chrono::duration<double, std::milli>(
-                          std::chrono::steady_clock::now() - begin)
-                          .count();
+        const auto layer_ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - begin)
+                                  .count();
+        state.wall += layer_ms;
+        state.last_wall = layer_ms;
         if (++state.layers % 40 == 0) { state.report(); }
     }
 };
@@ -779,7 +786,7 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
         // mode (no Device branch in the kernels yet): it prints what it would take and the numbers
         // behind it, and changes nothing.
         if (layer_timing) {
-            auto& control = expert_path_control();
+            auto& control = policy_controller();
             if (control.layers == 0) {
                 control.probe_link(static_cast<std::uint64_t>(2U << 20));
             }
@@ -789,7 +796,14 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
             const auto moved = moe.stream->last_cost().uploaded;
             control.observe_upload(moe.stream->last_cost().upload_ms * 1000.0, moved);
             control.observe_misses(moved);
-            control.step(false);
+            // Layer cost, for the actuator guardrail: a change that costs >3% gets reverted.
+            control.observe_layer(moe.stream->last_cost().route_ms +
+                                      moe.stream->last_cost().layout_ms +
+                                      moe.stream->last_cost().upload_ms,
+                                  timeline().last_gpu, timeline().last_wall);
+            // Coverage and prefetch usefulness have no source on this path yet: left as "not
+            // measured" (negative), which the rules read as "do not act".
+            control.step(false, false, false, false);
             control.report();
         }
         if (all_resident) {
@@ -1086,4 +1100,7 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
 }
 
 } // namespace ninfer::models::qwen3_5::execution
+
+
+
 
