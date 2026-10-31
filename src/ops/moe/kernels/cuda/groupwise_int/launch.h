@@ -79,6 +79,13 @@ void launch_group_index(const ExpertRoutes& routes, const GroupedStorage& storag
 void launch_group_count_scan(const ExpertRoutes& routes, ExpertSubset subset, const GroupedPlan& plan,
                              const GroupedStorage& storage, CudaExecutionView execution,
                              std::uint32_t* missed = nullptr);
+
+// port (sm_89): O1's coverage test (see route_coverage). One block reduces over every assignment and
+// stores the count, so a covered layer and an uncovered one are told apart by one word rather than
+// by a read-back of the ids. Independent of the expert format: it reads only ids and mask.
+void launch_route_coverage(const std::int32_t* ids, int assignments, const std::int32_t* mask,
+                           int experts, int member, std::uint32_t* excluded,
+                           CudaExecutionView execution);
 void launch_token_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
                          const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
                          ExpertSubset subset, const ScaledSwiGLUTerm* shared, MoeEpilogue epilogue,

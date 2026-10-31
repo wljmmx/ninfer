@@ -36,8 +36,28 @@ public:
     // Publishes the experts the next call routes to, then republishes the offset table. Returns
     // false when the pool cannot hold one whole layer at all; the caller then owns the decision
     // (today it raises, later it can fall back to the host tier).
+    //
+    // `assume_covered` is O1's arm: the caller has decided, from a verdict it already read, that
+    // every route of this layer is resident, so the one thing ensure() needs the ids for - the
+    // placement - has nothing to do. The layer then pays neither the copy nor the stream
+    // synchronise that waits for it (measured at 0.06 ms a layer, 2.4 ms a token).
+    //
+    // Measured at 12 GiB and NOT usable as a prediction: the pool there holds 47 of a bank's 256
+    // experts and its set moves, so "the previous step was covered" is false for 3-44 routes of the
+    // next step. Every armed step came back dirty, every token was replayed, and decode fell from
+    // 6.4/7.5 to 12.0/11.6 ms a token (155/133 -> 84/86 tok/s). Without this claim the same skip is
+    // clean and gains nothing (1x.4u), so the arm is kept for the machinery, defaulted off, and the
+    // work that would make it pay is a device-side residency decision, not a step-level guess.
     bool ensure(const void* device_ids, std::int32_t top_k, std::int32_t tokens,
-                cudaStream_t stream, const std::int32_t* host_ids = nullptr);
+                cudaStream_t stream, const std::int32_t* host_ids = nullptr,
+                bool assume_covered = false);
+
+    // port (sm_89): O1's device verdict word (see ops::route_coverage). Mapped host memory written by
+    // the coverage kernel on the stream, so the host reads a layer's answer at its next synchronise
+    // without a read-back of the ids. Allocated on first use and only when a caller asks for it.
+    [[nodiscard]] std::uint32_t* route_coverage_device();
+    // Valid once the stream has synchronised past the layer that wrote it.
+    [[nodiscard]] std::uint32_t route_coverage_read();
 
     [[nodiscard]] const ops::CudaSwiGLUExperts& experts() const noexcept { return experts_; }
     [[nodiscard]] std::uint32_t bank_index() const noexcept { return bank_; }
@@ -322,6 +342,11 @@ private:
     std::unique_ptr<DeviceBuffer> mask_device_;
     std::vector<std::int32_t> mask_host_;
     std::unique_ptr<PinnedHostBuffer> route_staging_;
+    // O1's device verdict: one mapped word, stored by the coverage kernel and read by the host.
+    std::unique_ptr<PinnedHostBuffer> coverage_word_;
+    std::uint32_t* coverage_word_host_   = nullptr;
+    std::uint32_t* coverage_word_device_ = nullptr;
+    bool coverage_word_checked_          = false;
     // O1's counter: mapped, so the skip is counted where it happens. `miss_lag_` is the host total
     // through the previous layer, which is what a reading can actually be compared with.
     std::unique_ptr<PinnedHostBuffer> miss_count_;

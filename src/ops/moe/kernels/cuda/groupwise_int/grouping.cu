@@ -168,6 +168,31 @@ __global__ void index_assignments(const int* ids, GroupedStorage out, int assign
     out.inverse[assignment] = packed;
     out.tokens[packed]      = assignment / Shape::top_k;
 }
+
+// port (sm_89): O1's coverage test. One block for the whole layer: a decode step is eight routes and
+// a prefill slice is at most kSliceTokens of them, so the read is a few kilobytes either way and a
+// second launch would cost more than the scan. The sum is an integer reduction, so the store is
+// deterministic and a covered layer is a true zero rather than a rounding of one.
+__global__ void count_uncovered(const int* __restrict__ ids, const int* __restrict__ mask,
+                                int member, int experts, int assignments,
+                                std::uint32_t* excluded) {
+    __shared__ int total;
+    if (threadIdx.x == 0) { total = 0; }
+    __syncthreads();
+    int uncovered = 0;
+    for (int assignment = threadIdx.x; assignment < assignments; assignment += blockDim.x) {
+        // The same rule the host applies: an id outside the bank, or one the mask does not name as
+        // a member, is an assignment the resident set did not cover. A negative id is zero padding
+        // some paths leave behind and is not a route either, so it counts as uncovered exactly as
+        // the host's scan counts it.
+        const int expert  = ids[assignment];
+        const bool inside = expert >= 0 && expert < experts;
+        if (!inside || mask[expert] != member) { ++uncovered; }
+    }
+    if (uncovered != 0) { atomicAdd(&total, uncovered); }
+    __syncthreads();
+    if (threadIdx.x == 0) { *excluded = static_cast<std::uint32_t>(total); }
+}
 } // namespace
 
 void launch_group_count(const ExpertRoutes& routes, ExpertSubset subset,
@@ -229,6 +254,21 @@ void launch_group_index(const ExpertRoutes& routes, const GroupedStorage& storag
     const int count = S::top_k * routes.ids.ne[1];
     index_assignments<S><<<(count + 255) / 256, 256, 0, execution.stream>>>(
         static_cast<const int*>(routes.ids.data), storage, count);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_route_coverage(const std::int32_t* ids, int assignments, const std::int32_t* mask,
+                           int experts, int member, std::uint32_t* excluded,
+                           CudaExecutionView execution) {
+    if (assignments <= 0) {
+        // An empty route list is covered by definition; the word is still written so a caller never
+        // reads a stale verdict from the layer before.
+        (void)cudaMemsetAsync(excluded, 0, sizeof(std::uint32_t), execution.stream);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    count_uncovered<<<1, 256, 0, execution.stream>>>(ids, mask, member, experts, assignments,
+                                                     excluded);
     CUDA_CHECK(cudaGetLastError());
 }
 

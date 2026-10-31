@@ -9,6 +9,7 @@
 #include <cstring>
 
 #include "core/layout.h"
+#include "core/arena.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/act_quant_a8.h"
 #include <cstdio>
@@ -184,6 +185,65 @@ std::size_t stream_route_tensor_bytes(const RoutedMoeParameters& moe, std::int32
     const auto tokens = static_cast<std::size_t>(last);
     return top_k * tokens * sizeof(std::int32_t) + top_k * tokens * sizeof(float) +
            tokens * sizeof(float) + 512;
+}
+
+// port (sm_89): O1's device verdict, checked before anything runs on it.
+//
+// The Device answers "how many of this layer's routes did the published mask exclude?" with
+// ops::route_coverage, which stores one word into mapped memory. The host answers the same question,
+// and to make that a comparison of the kernel rather than of two different arrays it scans the very
+// array the kernel read: the 1 KiB mask is copied to pinned memory on the same stream, right behind
+// the kernel, and scanned when the host reads the word a step later. No synchronise is added, so the
+// layer costs the instrument two submissions and nothing else.
+//
+// Comparing it against `missing` instead would have measured something else, and did: the mask the
+// pool publishes to the Device and the `mask_host_` the split path carries are NOT the same set. At
+// 12 GiB the device mask holds 179 of a bank's 256 experts while `mask_host_` names 47, and the 132
+// extra are one-directional - the host's set is a strict subset, so a layer the host calls covered is
+// covered on the device too, and the split path's `all_resident` is safe. That is why `missing` comes
+// out zero while the device-side answer over the same routes is also zero, and why the two agree for
+// the wrong reason: they are both looking at a set that contains the routes, not at the same set.
+struct CoverageProbe {
+    bool enabled = false;
+    bool built   = false;
+    // Per bank: whether a verdict is waiting to be checked, and the routes that produced it.
+    std::vector<std::vector<std::int32_t>> ids;
+    std::vector<std::uint8_t> pending;
+    // The mask as the kernel saw it: enqueued to pinned memory behind the kernel, scanned next call.
+    // One buffer per bank, because a bank's next call comes forty layers later and every other bank
+    // writes its own copy in between - a single buffer compares one bank's routes with another bank's
+    // expert set, which is what the first version of this did (18,733 "mismatches" of pure algebra).
+    std::vector<std::unique_ptr<PinnedHostBuffer>> mask_staging;
+    std::size_t mask_size = 0;
+    std::uint64_t compared = 0, mismatch = 0, device_total = 0, host_total = 0, uncovered = 0;
+    // The pool's mask against the split path's own copy, for the report above: how many experts the
+    // Device holds that `mask_host_` does not name.
+    std::uint64_t mask_extra = 0;
+
+    void build(std::uint32_t bank, std::size_t experts) {
+        if (ids.size() <= bank) {
+            ids.resize(bank + 1);
+            pending.resize(bank + 1, 0);
+            mask_staging.resize(bank + 1);
+        }
+        if (!mask_staging[bank]) {
+            mask_staging[bank] = std::make_unique<PinnedHostBuffer>(experts * sizeof(std::int32_t));
+            mask_size          = experts;
+        }
+    }
+
+    [[nodiscard]] const std::int32_t* seen(std::uint32_t bank) const {
+        return static_cast<const std::int32_t*>(mask_staging[bank]->data());
+    }
+};
+
+CoverageProbe& coverage_probe() {
+    static thread_local CoverageProbe probe;
+    if (!probe.built) {
+        probe.built   = true;
+        probe.enabled = std::getenv("NINFER_O1_COVERAGE") != nullptr;
+    }
+    return probe;
 }
 
 // Whole-layer host fallback, used when the Device pool cannot hold the layer's expert set at all.
@@ -811,9 +871,56 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
     const double fetch_ms = std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() - fetch_begin)
                                 .count();
+    // port (sm_89): O1's verdict, read from the previous call of this same bank. The read-back above
+    // has synchronised the stream, so the word - and the mask copy behind it - this bank's last layer
+    // wrote are final, and the host scans exactly the array the kernel read.
+    if (coverage_probe().enabled) {
+        auto& probe     = coverage_probe();
+        const auto bank = static_cast<std::size_t>(moe.stream->bank_index());
+        probe.build(static_cast<std::uint32_t>(bank), moe.stream->count());
+        if (probe.pending[bank] != 0) {
+            probe.pending[bank] = 0;
+            // The host's answer, over the same array and the same routes: the mask copy the kernel's
+            // layer enqueued, scanned by the ids that layer routed to.
+            const auto* seen = probe.seen(static_cast<std::uint32_t>(bank));
+            const auto& ids  = probe.ids[bank];
+            std::uint64_t uncovered = 0, extra = 0;
+            for (std::size_t i = 0; i < probe.mask_size; ++i) {
+                extra += seen[i] != 0 && moe.stream->resident_mask_host()[i] == 0 ? 1 : 0;
+            }
+            for (const auto expert : ids) {
+                const bool inside = expert >= 0 && expert < static_cast<std::int32_t>(probe.mask_size);
+                if (!inside || seen[expert] == 0) { ++uncovered; }
+            }
+            const std::uint32_t now = moe.stream->route_coverage_read();
+            probe.mask_extra += extra;
+            probe.device_total += now;
+            probe.host_total += uncovered;
+            if (now != uncovered) { ++probe.mismatch; }
+            if (now != 0) { ++probe.uncovered; }
+            if (++probe.compared % 40 == 0) {
+                std::fprintf(stderr,
+                             "[o1v] compared=%llu mismatch=%llu | device=%llu host=%llu | "
+                             "uncovered layers=%llu | mask extra over host set=%llu\n",
+                             static_cast<unsigned long long>(probe.compared),
+                             static_cast<unsigned long long>(probe.mismatch),
+                             static_cast<unsigned long long>(probe.device_total),
+                             static_cast<unsigned long long>(probe.host_total),
+                             static_cast<unsigned long long>(probe.uncovered),
+                             static_cast<unsigned long long>(probe.mask_extra));
+                std::fflush(stderr);
+            }
+        }
+    }
     try {
+        // `assume_covered` is O1's arm: inside a step whose last verdict was clean, every layer is
+        // expected to be covered, and taking ensure()'s covered path without its own read-back is
+        // what removes the 0.06 ms a layer the skip path still paid after the fetch was gone. A wrong
+        // claim is caught by the step gate, not trusted.
+        static const bool device_verdict = std::getenv("NINFER_O1_DEVICE") != nullptr;
+        const bool assume_covered        = device_verdict && o1_skip_armed();
         if (!moe.stream->ensure(ids.data, routed.top_k, columns, execution.stream,
-                                early ? early->ids.data() : nullptr)) {
+                                early ? early->ids.data() : nullptr, assume_covered)) {
             // The pool cannot hold this layer: the shared expert still runs on the device (subset
             // None touches only the shared term), and the routed term moves to the host tier.
             // Keep the shared term in FP32 so that the host fallback can fold it into the same
@@ -835,6 +942,22 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
         }
     } catch (const std::exception& error) {
         throw std::invalid_argument(std::string("expert stream upload: ") + error.what());
+    }
+    // port (sm_89): O1's verdict, written after ensure() so it describes the mask this layer will run
+    // under. The word is mapped, so the host reads it a step later at a synchronise it already pays -
+    // no read-back of the ids is added to the layer, which is the property that makes this worth
+    // building at all.
+    if (coverage_probe().enabled) {
+        auto& probe = coverage_probe();
+        Tensor coverage_mask(const_cast<void*>(moe.stream->resident_mask()), execution.device(),
+                             DType::I32, {static_cast<std::int32_t>(moe.stream->count())});
+        ops::route_coverage(ids, coverage_mask, 1, moe.stream->route_coverage_device(), execution);
+        // The same 256 words, copied to pinned memory on the same stream right behind the kernel: the
+        // host scan that checks it happens a step later and must see the array the kernel saw, not
+        // whatever the placement has done since.
+        CUDA_CHECK(cudaMemcpyAsync(probe.mask_staging[moe.stream->bank_index()]->data(),
+                                   coverage_mask.data, probe.mask_size * sizeof(std::int32_t),
+                                   cudaMemcpyDeviceToHost, execution.stream));
     }
     // port (sm_89): O1's skip, after ensure rather than instead of it. ensure() is what publishes the
     // mask and the offset table and rebases the window onto the current resident set - a layer that
@@ -996,6 +1119,15 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
             }
         }
         if (layer_timing) { timeline().missing += missing; }
+        // The routes this layer handed the Device, kept until the next call of this bank so the check
+        // above can ask what they cost against the mask the kernel actually read.
+        if (coverage_probe().enabled) {
+            auto& probe     = coverage_probe();
+            const auto bank = static_cast<std::size_t>(moe.stream->bank_index());
+            probe.build(static_cast<std::uint32_t>(bank), moe.stream->count());
+            probe.ids[bank].assign(fetch.ids.begin(), fetch.ids.end());
+            probe.pending[bank] = 1;
+        }
         // O1 step 2's decision numbers. The prediction the plan wants to act on is "the previous
         // step was clean, so this one is too", and it is taken for a whole step: a layer that skips
         // its read-back cannot hand its routes to the host half, so a wrong prediction costs a

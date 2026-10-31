@@ -197,6 +197,25 @@ void topk_softmax_swiglu_moe(const Tensor& x, const MoeProfile& profile, const M
                              MoeEpilogue epilogue, Tensor& destination, MemoryArena& workspace,
                              CudaExecutionView execution, const MoeExecutionHints& hints = {});
 
+// port (sm_89): O1's device-side coverage test. Of the K*T assignments in `ids`, how many does `mask`
+// exclude? An assignment is covered when its id lies in [0, mask.ne[0]) and mask[id] == `member`
+// (`member` is 1 for the resident set and 0 for its complement), which is the same rule a host scan
+// of the same two arrays applies.
+//
+// It exists because the honest question - did the resident set cover this layer? - was only
+// answerable by reading the ids back to the host. The route-skipping kernels can count the same
+// thing while they run (`missed_routes`), but only after the placement has published a mask that
+// includes this layer's own routes, which is the answer "yes" by construction. This asks the mask
+// that is already published, so it answers the placement that the layer will actually run under.
+//
+// Only ids and mask are read - no expert payload, no quantised format - so unlike `missed_routes` it
+// answers on every expert path. `excluded` receives the count as a store, not an addition: it must be
+// mapped host memory or Device memory that outlives the enqueued work, and a caller that never reads
+// the ids back can still tell a covered layer from an uncovered one at its next synchronise.
+// Enqueues on `execution` without host synchronisation; CUDA Graph capture/replay is supported.
+void route_coverage(const Tensor& ids, const Tensor& mask, std::int32_t member,
+                    std::uint32_t* excluded, CudaExecutionView execution);
+
 // port (sm_89): the split layer's host hand-off (kernels/cuda/host_handoff.cu).
 //
 // The four buffers a split layer reads back are packed into one block so the layer pays one

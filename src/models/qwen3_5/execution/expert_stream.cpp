@@ -315,7 +315,7 @@ void ExpertStream::gh1_report() {
     std::fflush(stderr);
 }
 bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32_t tokens,
-                          cudaStream_t stream, const std::int32_t* host_ids) {
+                          cudaStream_t stream, const std::int32_t* host_ids, bool assume_covered) {
     if (cache_ == nullptr) { throw std::logic_error("expert stream is not attached"); }
     // port (sm_89): measurement switch. Claiming the layer cannot be held makes the caller take the
     // host tier for the whole routed term, which is the CPU reference the device kernels are scored
@@ -369,6 +369,23 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         ++gh1_static_calls_;
     }
     gh1_report();
+    // port (sm_89): O1's arm (see the declaration). Taken before anything needs the ids, because
+    // needing the ids is exactly what it removes: the branch below copies 32 bytes back and waits on
+    // the stream for them, and that wait - not the copy - is 0.06 ms of every layer.
+    //
+    // What it also skips is this layer's placement, and at 12 GiB that is the part that matters: the
+    // pool holds 47 of a bank's 256 experts and its set moves every step, so the mask the step runs
+    // under stops covering the routes within a layer or two. Measured: every armed step came back
+    // dirty (3-44 routes), every token was replayed, and decode went from 6.4/7.5 to 12.0/11.6 ms a
+    // token. Nothing here is silent about it - the step gate counts the routes this skips - but the
+    // numbers say the claim is false, not that the detection is weak.
+    if (assume_covered && !fully) {
+        ++gh1_static_calls_;
+        ++gh1_no_miss_calls_;
+        last_cost_ = StepCost{};
+        rebase_window();
+        return true;
+    }
     const auto values = static_cast<std::size_t>(top_k) * static_cast<std::size_t>(tokens);
     const auto bytes  = values * sizeof(std::int32_t);
     // port (sm_89): the host must know the routed experts before it can publish them, so one
@@ -1237,6 +1254,32 @@ std::uint32_t* ExpertStream::missed_routes_device() {
 
 bool ExpertStream::miss_count_enabled() { return missed_routes_device() != nullptr; }
 
+std::uint32_t* ExpertStream::route_coverage_device() {
+    if (!coverage_word_checked_) {
+        coverage_word_checked_ = true;
+        // Same shape as the miss counter: one mapped word, built on first use, so a run that never
+        // asks never pays for it.
+        coverage_word_ = std::make_unique<PinnedHostBuffer>(sizeof(std::uint32_t), true);
+        coverage_word_host_ = static_cast<std::uint32_t*>(coverage_word_->data());
+        *coverage_word_host_ = 0;
+        const cudaError_t err =
+            cudaHostGetDevicePointer(reinterpret_cast<void**>(&coverage_word_device_),
+                                     coverage_word_->data(), 0);
+        if (err != cudaSuccess) {
+            throw std::runtime_error(std::string("cudaHostGetDevicePointer failed: ") +
+                                     cudaGetErrorString(err));
+        }
+        std::fprintf(stderr, "[o1v] coverage word on (mapped) bank=%u\n", bank_);
+        std::fflush(stderr);
+    }
+    return coverage_word_device_;
+}
+
+std::uint32_t ExpertStream::route_coverage_read() {
+    if (coverage_word_host_ == nullptr) { return 0; }
+    return *static_cast<volatile std::uint32_t*>(coverage_word_host_);
+}
+
 std::uint32_t ExpertStream::missed_routes_total() {
     if (miss_count_host_ == nullptr) { return 0; }
     // Volatile, because the word is written on the other side of the bus: a cached read would keep
@@ -1288,8 +1331,12 @@ struct StepGate {
 StepGate& step_gate() {
     static StepGate gate;
     if (!gate.built) {
-        gate.built   = true;
-        gate.enabled = std::getenv("NINFER_O1_STEP_GATE") != nullptr;
+        gate.built = true;
+        // The verdict is not optional bookkeeping: both ways of running a step without a read-back
+        // need it to notice a wrong prediction, so asking for either turns it on.
+        gate.enabled = std::getenv("NINFER_O1_STEP_GATE") != nullptr ||
+                       std::getenv("NINFER_O1_SKIP") != nullptr ||
+                       std::getenv("NINFER_O1_DEVICE") != nullptr;
         if (gate.enabled) {
             gate.buffer = std::make_unique<PinnedHostBuffer>(sizeof(std::uint32_t), true);
             gate.host   = static_cast<std::uint32_t*>(gate.buffer->data());
@@ -1347,6 +1394,12 @@ void o1_arm_skip(bool armed) { skip_armed().store(armed, std::memory_order_relax
 bool o1_force_fetch() { return force_fetch().load(std::memory_order_relaxed); }
 
 void o1_force_fetch(bool force) { force_fetch().store(force, std::memory_order_relaxed); }
+
+bool o1_skip_requested() {
+    static const bool requested = std::getenv("NINFER_O1_SKIP") != nullptr ||
+                                  std::getenv("NINFER_O1_DEVICE") != nullptr;
+    return requested;
+}
 
 } // namespace ninfer::models::qwen3_5::execution
 

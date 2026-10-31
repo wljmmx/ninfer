@@ -170,4 +170,23 @@ void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
     execute(x, profile, experts, routes, subset, &shared, mode, destination, workspace, execution,
             missed_routes);
 }
+
+void route_coverage(const Tensor& ids, const Tensor& mask, std::int32_t member,
+                    std::uint32_t* excluded, CudaExecutionView execution) {
+    if (excluded == nullptr) {
+        throw std::invalid_argument("route_coverage: excluded must receive the count");
+    }
+    if (ids.dtype != DType::I32 || ids.ne[0] <= 0 || ids.ne[1] <= 0 || !ids.is_contiguous()) {
+        throw std::invalid_argument("route_coverage: ids must be contiguous I32 [K,T], K,T > 0");
+    }
+    if (mask.dtype != DType::I32 || mask.ne[0] <= 0 || !mask.is_contiguous()) {
+        throw std::invalid_argument("route_coverage: mask must be contiguous I32 [E], E > 0");
+    }
+    if (member != 0 && member != 1) {
+        throw std::invalid_argument("route_coverage: member must be 0 or 1");
+    }
+    integer::launch_route_coverage(static_cast<const std::int32_t*>(ids.data), ids.ne[0] * ids.ne[1],
+                                   static_cast<const std::int32_t*>(mask.data), mask.ne[0], member,
+                                   excluded, execution);
+}
 } // namespace ninfer::ops

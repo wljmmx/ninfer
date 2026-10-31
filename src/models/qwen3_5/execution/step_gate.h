@@ -26,4 +26,10 @@ void o1_arm_skip(bool armed);
 bool o1_force_fetch();
 void o1_force_fetch(bool force);
 
+// Whether a read-back-free step was asked for at all: NINFER_O1_SKIP drops the fetch, and
+// NINFER_O1_DEVICE also drops ensure()'s own read-back on the strength of the previous verdict. Both
+// are only taken when the step verdict below can catch a wrong prediction, so the gate follows them
+// rather than being a separate thing a caller can forget to set.
+bool o1_skip_requested();
+
 } // namespace ninfer::models::qwen3_5::execution

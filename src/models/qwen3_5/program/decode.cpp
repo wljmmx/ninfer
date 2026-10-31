@@ -329,7 +329,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
         bool o1_armed              = false;
         static bool o1_last_clean  = false;
         {
-            if (std::getenv("NINFER_O1_SKIP") != nullptr && lanes.size() == 1) {
+            if (execution::o1_skip_requested() && lanes.size() == 1) {
                 if (!o1_step_image) { o1_step_image = state_store->reserve_destination(); }
                 if (o1_step_image) {
                     const StateImageSelectors selectors = state_selectors(active_sequence(lanes[0]));
@@ -391,7 +391,20 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
         // output is wrong and no later layer can repair it: put the state back to where it was before
         // the step and run the same step again with the read-back on. Once only - a second dirty
         // answer through the normal path is not a prediction any more.
-        if (o1_armed && execution::step_miss_read() != 0) {
+        //
+        // port (sm_89): the verdict is taken once, here, and reported from this variable. The panel
+        // below used to read the word itself - after this block had already reset it and, when it
+        // fired, after a second, clean run had overwritten it. It therefore printed `dirty=0` through
+        // a session in which every single step replayed, which is exactly the kind of number that
+        // makes a losing design look free.
+        const std::uint32_t step_verdict = execution::step_miss_read();
+        if (o1_armed && step_verdict != 0) {
+            if (std::getenv("NINFER_O1_DEBUG") != nullptr) {
+                static std::uint64_t replays = 0;
+                std::fprintf(stderr, "[o1k] replay %llu: armed step was dirty on %u routes\n",
+                             static_cast<unsigned long long>(++replays), step_verdict);
+                std::fflush(stderr);
+            }
             const StateImageSelectors selectors = state_selectors(active_sequence(lanes[0]));
             state_images->copy_slot(state_store->physical_slot(*o1_step_image), selectors.source,
                                     device.stream);
@@ -408,8 +421,8 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
         execution::o1_arm_skip(false);
         // The next step may skip only if this one ended clean - including the replay, when there was
         // one. Without this the arm never rises and the skip is dead code that measures nothing.
-        if (std::getenv("NINFER_O1_SKIP") != nullptr) {
-            o1_last_clean = execution::step_miss_read() == 0;
+        if (execution::o1_skip_requested()) {
+            o1_last_clean = step_verdict == 0;
         }
         timing.end_wait();
 
@@ -418,10 +431,9 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
         // skip cannot resolve without replaying the token.
         {
             static std::uint64_t steps = 0, dirty = 0, routes = 0;
-            const std::uint32_t misses = execution::step_miss_read();
-            if (misses != 0) {
+            if (step_verdict != 0) {
                 ++dirty;
-                routes += misses;
+                routes += step_verdict;
             }
             if (++steps % 64 == 0) {
                 std::fprintf(stderr, "[o1t] steps=%llu dirty=%llu routes=%llu\n",
