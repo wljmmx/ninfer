@@ -314,6 +314,50 @@ void ExpertStream::gh1_report() {
                  pct(gh1_calls_ - gh1_split_calls_, gh1_calls_));
     std::fflush(stderr);
 }
+// port (sm_89): Q10's instrument. The plan's gate is "static ≥95%", and `static` is incremented in
+// two places - the covered fast path and "the placement moved nothing" - so the number alone does not
+// say what to fix. This separates the reasons a layer is not static:
+//
+//   absent  : a route has no slot at all      -> the placement policy is not holding it
+//   unready : a route has a slot, image not in -> the upload did not land before the next layer
+//   moved   : rows that changed in the table   (ins + outs; only ins cost an upload)
+//
+// and it is a counter, not an inference: it prints every 400 layers on one stream. Off by default -
+// the probe adds two hash lookups per route, which is the thing being measured.
+namespace {
+void static_probe(bool covered, std::uint32_t absent, std::uint32_t unready, std::uint64_t moved,
+                  std::uint64_t ins, std::uint64_t staged) {
+    static const bool on = std::getenv("NINFER_STATIC_PROBE") != nullptr;
+    if (!on) { return; }
+    struct Totals {
+        std::uint64_t calls = 0, cov = 0, absent = 0, absent_layers = 0;
+        std::uint64_t unready = 0, unready_layers = 0, moved = 0, ins = 0, staged = 0;
+    };
+    static thread_local Totals t;
+    ++t.calls;
+    if (covered) { ++t.cov; }
+    if (absent != 0) { t.absent += absent; ++t.absent_layers; }
+    if (unready != 0) { t.unready += unready; ++t.unready_layers; }
+    t.moved += moved;
+    t.ins += ins;
+    t.staged += staged;
+    if (t.calls % 400 != 0) { return; }
+    const double n = static_cast<double>(t.calls);
+    std::fprintf(stderr,
+                 "[st] layers=%llu covered=%.1f%% | absent=%llu (%llu layers) unready=%llu "
+                 "(%llu layers) | moved=%.2f/layer ins=%.2f/layer staged=%.2f/layer\n",
+                 static_cast<unsigned long long>(t.calls), 100.0 * static_cast<double>(t.cov) / n,
+                 static_cast<unsigned long long>(t.absent),
+                 static_cast<unsigned long long>(t.absent_layers),
+                 static_cast<unsigned long long>(t.unready),
+                 static_cast<unsigned long long>(t.unready_layers),
+                 static_cast<double>(t.moved) / n, static_cast<double>(t.ins) / n,
+                 static_cast<double>(t.staged) / n);
+    std::fflush(stderr);
+    t = Totals{};
+}
+} // namespace
+
 bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32_t tokens,
                           cudaStream_t stream, const std::int32_t* host_ids, bool assume_covered) {
     if (cache_ == nullptr) { throw std::logic_error("expert stream is not attached"); }
@@ -350,6 +394,10 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     // 14.4 tok/s on the split path against a host-only layer at the same pool size.
     if (capacity < 4) { return false; }
     const bool fully = capacity >= count_;
+    // Q10 probe (see static_probe): why this layer was not static. Filled in the split branch, printed
+    // at its end where the upload count is known. Zero cost when the switch is off.
+    std::uint32_t probe_absent = 0, probe_unready = 0;
+    std::uint64_t probe_moved = 0, probe_ins = 0;
     // GH1: the three coverage numbers the plan gates on, all with ONE denominator - the number of
     // ensure() calls, i.e. layers. Counted here rather than only inside the split branch, because on
     // a fully resident build the split branch never runs and the panel would report 0% for
@@ -452,13 +500,25 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         // cache whether each route is resident *and ready* is the honest test - the mask cannot answer
         // it, because the mask is written from the placement that this skip avoids making.
         bool covered = true;
+        // port (sm_89): Q10 asks why a third of the layers move the table when the mask says every
+        // route is resident. The answer has to separate the two ways `offset()` says no - the expert
+        // has no slot at all, or it has one whose image has not landed yet - because they call for
+        // different fixes (placement policy vs upload pacing). Counted here, printed by [st].
+        std::uint32_t absent = 0, unready = 0;
         for (std::size_t i = 0; i < values; ++i) {
             const auto expert = static_cast<std::size_t>(route_ids[i]);
-            if (expert >= keys_.size() || !cache_->offset(keys_[expert])) {
+            if (expert >= keys_.size() || !cache_->expert_slot(bank_, expert)) {
+                ++absent;
                 covered = false;
-                break;
+                continue;
+            }
+            if (!cache_->offset(keys_[expert])) {
+                ++unready;
+                covered = false;
             }
         }
+        probe_absent  = absent;
+        probe_unready = unready;
         if (last_covered_) { ++predict_trials_; if (covered) { ++predict_hits_; } }
         last_covered_ = covered;
         if (covered) {
@@ -467,6 +527,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             last_cost_          = StepCost{};
             last_cost_.route_ms = route_ms;
             rebase_window();
+            static_probe(true, probe_absent, probe_unready, 0, 0, 0);
             return true;
         }
         // port (sm_89): two policies, because they disagree on what the set is for.
@@ -1145,6 +1206,8 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 ++publish_calls_;
             }
             if (moved.empty()) { ++gh1_static_calls_; }
+            probe_moved = moved.size();
+            probe_ins   = entered_this_step;
             entered_ += entered_this_step;
             ++entered_steps_;
             for (const auto expert : moved) {
@@ -1221,6 +1284,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     // The honest miss count for the path controller: the mask cannot answer this question, because
     // it is written from the same decision that places the step's routes.
     last_cost_.uploaded = cache_->last_uploaded();
+    static_probe(false, probe_absent, probe_unready, probe_moved, probe_ins, last_cost_.uploaded);
     // GH1's no_miss, defined so it can be false: the pool already held every route this step.
     if (last_cost_.uploaded == 0) { ++gh1_no_miss_calls_; }
     // The uploads were queued on the consumer stream, so the kernels that read them are already
