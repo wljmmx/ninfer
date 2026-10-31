@@ -17,4 +17,13 @@ std::uint32_t* step_miss_device();
 std::uint32_t step_miss_read();
 void step_miss_reset();
 
+// Whether the layer should run without a read-back. Only the decode batch arms this, and only when
+// it is prepared to replay the whole token on a dirty verdict - a layer that skips its read-back
+// cannot hand its routes to the host half, so nothing else may turn this on.
+bool o1_skip_armed();
+void o1_arm_skip(bool armed);
+// Set when a dirty step has to be re-run through the normal path.
+bool o1_force_fetch();
+void o1_force_fetch(bool force);
+
 } // namespace ninfer::models::qwen3_5::execution

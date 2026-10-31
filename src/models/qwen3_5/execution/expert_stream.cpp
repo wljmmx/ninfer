@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <numeric>
 #include <chrono>
 #include <map>
@@ -1284,6 +1285,30 @@ void step_miss_reset() {
     if (!gate.enabled) { return; }
     *gate.host = 0;
 }
+
+namespace {
+std::atomic<bool>& skip_armed() {
+    static std::atomic<bool> flag{false};
+    return flag;
+}
+std::atomic<bool>& force_fetch() {
+    static std::atomic<bool> flag{false};
+    return flag;
+}
+} // namespace
+
+bool o1_skip_armed() {
+    // Both switches are needed: the env var says the feature exists, the arm says decode has
+    // promised to replay this step if it comes back dirty.
+    return skip_armed().load(std::memory_order_relaxed) &&
+           !force_fetch().load(std::memory_order_relaxed);
+}
+
+void o1_arm_skip(bool armed) { skip_armed().store(armed, std::memory_order_relaxed); }
+
+bool o1_force_fetch() { return force_fetch().load(std::memory_order_relaxed); }
+
+void o1_force_fetch(bool force) { force_fetch().store(force, std::memory_order_relaxed); }
 
 } // namespace ninfer::models::qwen3_5::execution
 

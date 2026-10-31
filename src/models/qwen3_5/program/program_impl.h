@@ -425,6 +425,10 @@ public:
     std::unique_ptr<qwen3_5::StateImageDevicePool> state_images;
     std::unique_ptr<qwen3_5::HostStatePool> host_state_images;
     std::unique_ptr<StateImageStore> state_store;
+    // port (sm_89): O1's replay keeps one destination slot aside as the pre-step image. Reserved on
+    // the first decode step that asks for it; when the pool has no spare slot the reservation fails
+    // and the skip stays off - a property of the pool, not a size written into the code.
+    std::optional<StateImageHandle> o1_step_image;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
     std::optional<DFlashPersistentState> dflash;
