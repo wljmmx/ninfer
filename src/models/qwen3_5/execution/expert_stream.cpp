@@ -1287,6 +1287,11 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     // Off by default, per v6's rule for a new mechanism, so the current behaviour stays the reference
     // this switch is measured against.
     static const bool host_tier = std::getenv("NINFER_HOST_TIER") != nullptr;
+    // port (sm_89): 2026-10-31 - NINFER_HOST_TIER is verified on the prefill/scoring path (PPL
+    // 7.785666 bit-identical, arena hit 19.9%) and NOT on decode: a decode request with the switch on
+    // fails to return (no exception in the log, the connection is reset). The tier is therefore
+    // reachable only from the path that was measured; turning it on for serving needs that fixed
+    // first, and nothing else in the tree depends on it.
     if (host_tier && host_ != nullptr) {
         // The tier is filled per expert, not per route: a 511-token prefill publishes 4,088 route
         // entries for a bank that has 248 experts, and the arena's own guard counts slots against the
