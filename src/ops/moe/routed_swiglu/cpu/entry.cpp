@@ -146,7 +146,10 @@ std::size_t routed_swiglu_workspace_capacity_bytes(const RoutedSwiGLUProfile& pr
 
 void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
                    const CpuSwiGLUExperts& experts, const ExpertRoutes& routes, ExpertSubset subset,
-                   Tensor& destination, MemoryArena& workspace, CpuExecutionView execution) {
+                   Tensor& destination, MemoryArena& workspace, CpuExecutionView execution,
+                   std::uint32_t* missed_routes) {
+    // The CPU half of a split layer runs exactly the routes its mask kept, so it never skips one.
+    (void)missed_routes;
     const auto& shape = impl::shape_dispatch(profile);
     const int tokens  = x.ne[1];
     impl::validate_capacity(subset.kind, tokens, tokens);

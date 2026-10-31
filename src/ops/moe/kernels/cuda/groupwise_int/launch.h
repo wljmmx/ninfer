@@ -69,19 +69,22 @@ struct ExpertStorage {
 void launch_group_count(const ExpertRoutes& routes, ExpertSubset subset,
                         const GroupedStorage& storage, CudaExecutionView execution);
 void launch_group_scan(const ExpertRoutes& routes, const GroupedPlan& plan,
-                       const GroupedStorage& storage, CudaExecutionView execution);
+                       const GroupedStorage& storage, CudaExecutionView execution,
+                       std::uint32_t* missed = nullptr);
 void launch_group_index(const ExpertRoutes& routes, const GroupedStorage& storage,
                         CudaExecutionView execution);
 
 // port (sm_89): count and scan in one launch for a single-tile grouping (a decode step).
+// `missed`, when not null, receives the routes the mask excluded (see routed_swiglu's note).
 void launch_group_count_scan(const ExpertRoutes& routes, ExpertSubset subset, const GroupedPlan& plan,
-                             const GroupedStorage& storage, CudaExecutionView execution);
+                             const GroupedStorage& storage, CudaExecutionView execution,
+                             std::uint32_t* missed = nullptr);
 void launch_token_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
                          const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
                          ExpertSubset subset, const ScaledSwiGLUTerm* shared, MoeEpilogue epilogue,
                          Tensor& destination, const TokenPlan& plan, const ExpertStorage& storage,
                          const MoeExecutionHints& hints, CudaExecutionView execution,
-                         bool adaptive = false);
+                         std::uint32_t* missed = nullptr, bool adaptive = false);
 void launch_grouped_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
                            const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
                            const ScaledSwiGLUTerm* shared, MoeEpilogue epilogue,

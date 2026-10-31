@@ -27,7 +27,8 @@ __global__ void count_assignments(const int* ids, const int* mask, int member, i
 }
 
 template <class Shape>
-__global__ void scan_assignments(GroupedStorage out, int tiles, GroupedPlan plan) {
+__global__ void scan_assignments(GroupedStorage out, int tiles, GroupedPlan plan, int routes,
+                                 std::uint32_t* missed) {
     __shared__ int scan[Shape::experts];
     const int e = threadIdx.x;
     int count   = 0;
@@ -72,10 +73,17 @@ __global__ void scan_assignments(GroupedStorage out, int tiles, GroupedPlan plan
     }
     if (e == Shape::experts - 1) {
         const int total = scan[e];
-        *out.info       = {total,
-                           int(plan.adaptive &&
-                         total * plan.direct_denominator > plan.direct_numerator * assignments),
-                           int(total * plan.spread_denominator < plan.spread_numerator * active)};
+        const int direct = int(plan.adaptive &&
+                               total * plan.direct_denominator > plan.direct_numerator * assignments);
+        *out.info = {total, direct,
+                     int(total * plan.spread_denominator < plan.spread_numerator * active)};
+        // `assignments` here is the saved total of the per-expert counts - the assignments the mask
+        // kept - not `total`, which by now is the job-list prefix sum. The rest of the routes are the
+        // ones this layer skipped: no per-route count needed. When the plan went `direct` the token
+        // kernels run instead and count the skips themselves; adding them here would double them.
+        if (missed != nullptr && !direct) {
+            atomicAdd(missed, static_cast<unsigned>(routes - assignments));
+        }
     }
 }
 
@@ -85,7 +93,7 @@ __global__ void scan_assignments(GroupedStorage out, int tiles, GroupedPlan plan
 // per-expert counts, the same offsets, tile bases and job list.
 template <class Shape, bool Masked>
 __global__ void fuse_count_scan(const int* ids, const int* mask, int member, int assignments,
-                                GroupedStorage out, GroupedPlan plan) {
+                                GroupedStorage out, GroupedPlan plan, std::uint32_t* missed) {
     constexpr int E = Shape::experts;
     __shared__ int counts[E];
     __shared__ int scan[E];
@@ -118,10 +126,13 @@ __global__ void fuse_count_scan(const int* ids, const int* mask, int member, int
     if (e == E - 1) { out.offsets[E] = total; }
     const int active = __syncthreads_count(count > 0);
     if (e == E - 1) {
-        *out.info = {total,
-                     int(plan.adaptive &&
-                         total * plan.direct_denominator > plan.direct_numerator * assignments),
+        const int direct = int(plan.adaptive &&
+                               total * plan.direct_denominator > plan.direct_numerator * assignments);
+        *out.info = {total, direct,
                      int(total * plan.spread_denominator < plan.spread_numerator * active)};
+        if (missed != nullptr && !direct) {
+            atomicAdd(missed, static_cast<unsigned>(assignments - total));
+        }
     }
     __syncthreads();
     const int jobs = plan.columns > 0 ? (count + plan.columns - 1) / plan.columns : 0;
@@ -178,16 +189,17 @@ void launch_group_count(const ExpertRoutes& routes, ExpertSubset subset,
 }
 
 void launch_group_scan(const ExpertRoutes& routes, const GroupedPlan& plan,
-                       const GroupedStorage& storage, CudaExecutionView execution) {
+                       const GroupedStorage& storage, CudaExecutionView execution,
+                       std::uint32_t* missed) {
     using S = SwiGLUH2048I512E256K8;
-    scan_assignments<S>
-        <<<1, S::experts, 0, execution.stream>>>(storage, (routes.ids.ne[1] + 7) / 8, plan);
+    scan_assignments<S><<<1, S::experts, 0, execution.stream>>>(
+        storage, (routes.ids.ne[1] + 7) / 8, plan, routes.ids.ne[1] * S::top_k, missed);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void launch_group_count_scan(const ExpertRoutes& routes, ExpertSubset subset,
-                              const GroupedPlan& plan, const GroupedStorage& storage,
-                              CudaExecutionView execution) {
+void launch_group_count_scan(const ExpertRoutes& routes, ExpertSubset subset, const GroupedPlan& plan,
+                              const GroupedStorage& storage, CudaExecutionView execution,
+                              std::uint32_t* missed) {
     using S         = SwiGLUH2048I512E256K8;
     const int count = routes.ids.ne[1] * S::top_k;
     const int tiles = (count + 8 * S::top_k - 1) / (8 * S::top_k);
@@ -195,17 +207,18 @@ void launch_group_count_scan(const ExpertRoutes& routes, ExpertSubset subset,
         // A prefill chunk spreads over several tiles; the fused kernel only covers one, so the
         // three-kernel chain stays for it.
         launch_group_count(routes, subset, storage, execution);
-        launch_group_scan(routes, plan, storage, execution);
+        launch_group_scan(routes, plan, storage, execution, missed);
         return;
     }
     const auto* ids  = static_cast<const int*>(routes.ids.data);
     const auto* mask = static_cast<const int*>(subset.mask.data);
     if (subset.kind == ExpertSubsetKind::All) {
         fuse_count_scan<S, false>
-            <<<1, S::experts, 0, execution.stream>>>(ids, nullptr, 0, count, storage, plan);
+            <<<1, S::experts, 0, execution.stream>>>(ids, nullptr, 0, count, storage, plan, nullptr);
     } else {
         fuse_count_scan<S, true><<<1, S::experts, 0, execution.stream>>>(
-            ids, mask, subset.kind == ExpertSubsetKind::MaskOnes ? 1 : 0, count, storage, plan);
+            ids, mask, subset.kind == ExpertSubsetKind::MaskOnes ? 1 : 0, count, storage, plan,
+            missed);
     }
     CUDA_CHECK(cudaGetLastError());
 }

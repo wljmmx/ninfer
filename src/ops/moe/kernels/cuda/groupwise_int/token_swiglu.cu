@@ -14,7 +14,8 @@ __global__ void token_gate_up(const __nv_bfloat16* __restrict__ input, const int
                               Access weights, PackedExpertMatrix shared,
                               const int* __restrict__ mask, int member,
                               float* __restrict__ activation, int tokens,
-                              const GroupedInfo* __restrict__ info, bool programmatic_input) {
+                              const GroupedInfo* __restrict__ info, bool programmatic_input,
+                              std::uint32_t* __restrict__ missed) {
     constexpr int H = Shape::hidden, I = Shape::intermediate, K = Shape::top_k;
     constexpr int Contributions = int(Routed) * K + int(Shared);
     constexpr int PathBlocks    = (Contributions + Paths - 1) / Paths;
@@ -51,7 +52,16 @@ __global__ void token_gate_up(const __nv_bfloat16* __restrict__ input, const int
                 if constexpr (Routed) {
                     if (path < K) {
                         const int expert = ids[token * K + path];
-                        if constexpr (Masked) { selected = mask[expert] == member; }
+                        if constexpr (Masked) {
+                            selected = mask[expert] == member;
+                            // One thread per (token, path): the row loop visits every route I times
+                            // and only the row-0 visit counts it. In the adaptive traversal row 0
+                            // is a different work index, not a different block, so the same guard
+                            // holds for both.
+                            if (!selected && missed != nullptr && !lane && row == 0) {
+                                atomicAdd(missed, 1u);
+                            }
+                        }
                         if (selected) { matrix = weights.template resolve<2 * I>(expert); }
                     }
                 }
@@ -64,7 +74,10 @@ __global__ void token_gate_up(const __nv_bfloat16* __restrict__ input, const int
                 if (path < K) {
                     const int expert = ids[token * K + path];
                     bool selected    = true;
-                    if constexpr (Masked) { selected = mask[expert] == member; }
+                    if constexpr (Masked) {
+                        selected = mask[expert] == member;
+                        if (!selected && missed != nullptr && !lane && row == 0) { atomicAdd(missed, 1u); }
+                    }
                     if (selected) {
                         const auto matrix = weights.template resolve<2 * I>(expert);
                         dot_two_rows<Codec, H>(matrix.codes, matrix.high, matrix.scales,
@@ -183,7 +196,7 @@ void token_launch(const Tensor& x, const RoutedSwiGLUProfile& profile, Access ga
                   const ExpertRoutes& routes, ExpertSubset subset, const ScaledSwiGLUTerm* shared,
                   MoeEpilogue epilogue, Tensor& destination, const TokenPlan& plan,
                   const ExpertStorage& storage, const MoeExecutionHints& hints,
-                  CudaExecutionView execution) {
+                  CudaExecutionView execution, std::uint32_t* missed) {
     constexpr bool adaptive     = Traversal == TokenTraversal::Adaptive;
     constexpr bool single       = Traversal == TokenTraversal::Single;
     using S                     = SwiGLUH2048I512E256K8;
@@ -207,10 +220,12 @@ void token_launch(const Tensor& x, const RoutedSwiGLUProfile& profile, Access ga
         if (plan.programmatic_input) {
             CUDA_CHECK(pdl::launch_dependent({grid, dim3(Paths * 32), 0, stream}, kernel, input,
                                                ids, gate_up, shared_gu, mask, member,
-                                               storage.token_activation, x.ne[1], info, true));
+                                               storage.token_activation, x.ne[1], info, true,
+                                               missed));
         } else {
             kernel<<<grid, Paths * 32, 0, stream>>>(input, ids, gate_up, shared_gu, mask, member,
-                                                      storage.token_activation, x.ne[1], info, false);
+                                                      storage.token_activation, x.ne[1], info, false,
+                                                      missed);
             CUDA_CHECK(cudaGetLastError());
         }
     };
@@ -310,19 +325,19 @@ void launch_token_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
                          ExpertSubset subset, const ScaledSwiGLUTerm* shared, MoeEpilogue epilogue,
                          Tensor& destination, const TokenPlan& plan, const ExpertStorage& storage,
                          const MoeExecutionHints& hints, CudaExecutionView execution,
-                         bool adaptive) {
+                         std::uint32_t* missed, bool adaptive) {
     const auto run = [&]<TokenTraversal Traversal>() {
         if (subset.kind == ExpertSubsetKind::None) {
             token_launch<PackedExpertMatrix, false, true, false, Traversal>(
                 x, profile, {}, {}, {}, subset, shared, epilogue, destination, plan, storage, hints,
-                execution);
+                execution, nullptr);
             return;
         }
         with_expert_addresses(experts, profile, [&](auto gu, auto down) {
             const auto invoke = [&]<bool Shared, bool Masked>() {
                 token_launch<decltype(gu), true, Shared, Masked, Traversal>(
                     x, profile, gu, down, routes, subset, shared, epilogue, destination, plan,
-                    storage, hints, execution);
+                    storage, hints, execution, missed);
             };
             if (shared) {
                 if (subset.kind == ExpertSubsetKind::All) {

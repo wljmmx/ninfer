@@ -946,6 +946,53 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
             }
         }
         if (layer_timing) { timeline().missing += missing; }
+        // port (sm_89): O1's counter. The Device half counted the routes its mask dropped; the host
+        // just counted the same routes from the ids it fetched, and that host count is the only one
+        // that can be checked - it comes from data, not from the mask the placement itself wrote.
+        // The reading is one layer behind (the fetch that synchronised only covered the layers before
+        // this one), which is what observe_missed compares against. Off unless NINFER_O1_MISS_COUNT.
+        if (moe.stream->miss_count_enabled()) {
+            // Diagnostic: on a prefill layer the Device count and the host count are the same
+            // quantity only if both looked at the same mask. Compare the mask the kernel will read
+            // with the host's copy, once.
+            static bool mask_compared = false;
+            if (!mask_compared && hidden.ne[1] > 1 && std::getenv("NINFER_O1_DEBUG") != nullptr) {
+                mask_compared = true;
+                std::vector<std::int32_t> device_mask(mask_host.size());
+                CUDA_CHECK(cudaMemcpy(device_mask.data(), moe.stream->resident_mask(),
+                                      device_mask.size() * sizeof(std::int32_t),
+                                      cudaMemcpyDeviceToHost));
+                std::size_t host_ones = 0, dev_ones = 0, differ = 0;
+                for (std::size_t i = 0; i < device_mask.size(); ++i) {
+                    const bool h = mask_host[i] != 0;
+                    const bool d = device_mask[i] != 0;
+                    host_ones += h;
+                    dev_ones += d;
+                    differ += h != d;
+                }
+                std::fprintf(stderr, "[o1m] bank=%u host_ones=%llu dev_ones=%llu differ=%llu\n",
+                             moe.stream->bank_index(),
+                             static_cast<unsigned long long>(host_ones),
+                             static_cast<unsigned long long>(dev_ones),
+                             static_cast<unsigned long long>(differ));
+                std::fflush(stderr);
+            }
+            moe.stream->observe_missed(moe.stream->missed_routes_total(), missing,
+                                       hidden.ne[1] == 1);
+            const auto& tally = moe.stream->miss_tally();
+            if ((tally.compared + tally.prefill_compared) % 40 == 0) {
+                std::fprintf(stderr,
+                             "[o1] decode=%llu mismatch=%llu | prefill=%llu mismatch=%llu | "
+                             "routes device=%llu host=%llu\n",
+                             static_cast<unsigned long long>(tally.compared),
+                             static_cast<unsigned long long>(tally.mismatch),
+                             static_cast<unsigned long long>(tally.prefill_compared),
+                             static_cast<unsigned long long>(tally.prefill_mismatch),
+                             static_cast<unsigned long long>(tally.device),
+                             static_cast<unsigned long long>(tally.host));
+                std::fflush(stderr);
+            }
+        }
         // The controller reads the same nodes the panel shows, one layer at a time. It is in shadow
         // mode (no Device branch in the kernels yet): it prints what it would take and the numbers
         // behind it, and changes nothing.
@@ -1042,7 +1089,8 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
             ops::routed_swiglu(hidden, routed, moe.stream->experts(), routes,
                                ops::ExpertSubset{ops::ExpertSubsetKind::MaskOnes, device_mask},
                                ops::ScaledSwiGLUTerm{moe.shared, shared_coefficients},
-                               ops::MoeEpilogue::Write, mixed_f32, mixed_arena, execution);
+                               ops::MoeEpilogue::Write, mixed_f32, mixed_arena, execution,
+                               moe.stream->missed_routes_device());
             if (timed) { timeline_gpu_end(execution.stream); }
         };
         const auto dev_begin = std::chrono::steady_clock::now();

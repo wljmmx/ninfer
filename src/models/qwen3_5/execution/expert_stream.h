@@ -96,6 +96,36 @@ public:
     // Experts the pool dropped on the last ensure(): the warm tier admits from here rather than from
     // the routes, because these are the ones with a demonstrated short reuse distance.
     [[nodiscard]] std::span<const std::int32_t> demoted_this_step() const noexcept { return demoted_; }
+
+    // port (sm_89): O1's miss counter. A predicted skip runs a layer without reading the ids back, so
+    // "did the resident set really cover it?" cannot be answered from the mask - the mask is published
+    // by the same decision that placed the routes, so asking it always answers yes (GH1's `no_miss`
+    // read 100% for exactly that reason). The kernels add one per route they skip, into mapped host
+    // memory, and the host reads the running total where it already synchronises. Off unless
+    // NINFER_O1_MISS_COUNT is set: today it is an instrument that has to agree with the host's own
+    // count, and it becomes a fast path only once the numbers say a prediction pays.
+    [[nodiscard]] bool miss_count_enabled();
+    [[nodiscard]] std::uint32_t* missed_routes_device();
+    // The running total as the host reads it. Callers must have synchronised the stream first; the
+    // value is a plain word in mapped memory, so the read is volatile rather than cached.
+    [[nodiscard]] std::uint32_t missed_routes_total();
+    // `reading` is the counter's running total; `host_layer` is what this layer's fetched ids said the
+    // mask dropped. A reading's delta against the previous one is the previous call's layer, because
+    // the read sits right after a fetch that only covered the layers before this one.
+    void observe_missed(std::uint32_t reading, std::uint64_t host_layer, bool decode);
+    struct MissTally {
+        std::uint64_t device   = 0; // routes the Device half skipped, as read so far
+        std::uint64_t host     = 0; // the same routes counted from the fetched ids
+        std::uint64_t compared = 0; // decode layers, where the comparison is a gate
+        std::uint64_t mismatch = 0; // readings where the two disagreed
+        // A prefill layer can republish the resident set between the host's count and the kernel's
+        // run, so the two are then not looking at the same mask. Reported, not gated: O1 replays a
+        // decode step, and there the mask does not move underneath the comparison.
+        std::uint64_t prefill_compared = 0;
+        std::uint64_t prefill_mismatch = 0;
+    };
+    [[nodiscard]] const MissTally& miss_tally() const noexcept { return miss_tally_; }
+
     [[nodiscard]] ExpertCache::UploadSourceStats upload_source_stats() const {
         return cache_->upload_sources();
     }
@@ -286,6 +316,15 @@ private:
     std::unique_ptr<DeviceBuffer> mask_device_;
     std::vector<std::int32_t> mask_host_;
     std::unique_ptr<PinnedHostBuffer> route_staging_;
+    // O1's counter: mapped, so the skip is counted where it happens. `miss_lag_` is the host total
+    // through the previous layer, which is what a reading can actually be compared with.
+    std::unique_ptr<PinnedHostBuffer> miss_count_;
+    std::uint32_t* miss_count_host_   = nullptr;
+    std::uint32_t* miss_count_device_ = nullptr;
+    bool miss_count_checked_          = false;
+    MissTally miss_tally_{};
+    std::uint32_t miss_last_reading_ = 0;
+    std::uint64_t miss_prev_host_    = 0;
     ops::CudaSwiGLUExperts experts_{};
 };
 

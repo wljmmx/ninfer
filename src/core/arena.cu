@@ -258,25 +258,32 @@ std::size_t DeviceArena::peak_used() const noexcept { return peak_; }
 
 void DeviceArena::reset_peak() noexcept { peak_ = off_; }
 
-PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
+PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) : PinnedHostBuffer(size_bytes, false) {}
+
+PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes, bool mapped) {
     if (size_bytes == 0) { throw std::invalid_argument("PinnedHostBuffer size must be nonzero"); }
 
-    void* ptr             = nullptr;
-    const cudaError_t err = cudaMallocHost(&ptr, size_bytes);
+    void* ptr = nullptr;
+    const cudaError_t err =
+        mapped ? cudaHostAlloc(&ptr, size_bytes, cudaHostAllocMapped) : cudaMallocHost(&ptr, size_bytes);
     if (err != cudaSuccess) {
-        throw std::runtime_error(cuda_error_message("cudaMallocHost failed", err));
+        throw std::runtime_error(cuda_error_message(mapped ? "cudaHostAlloc failed"
+                                                           : "cudaMallocHost failed",
+                                                    err));
     }
 
-    data_ = ptr;
-    size_ = size_bytes;
+    data_   = ptr;
+    size_   = size_bytes;
+    mapped_ = mapped;
 }
 
 PinnedHostBuffer::~PinnedHostBuffer() { free_pinned(data_); }
 
 PinnedHostBuffer::PinnedHostBuffer(PinnedHostBuffer&& other) noexcept
-    : data_(other.data_), size_(other.size_) {
+    : data_(other.data_), size_(other.size_), mapped_(other.mapped_) {
     other.data_ = nullptr;
     other.size_ = 0;
+    other.mapped_ = false;
 }
 
 PinnedHostBuffer& PinnedHostBuffer::operator=(PinnedHostBuffer&& other) noexcept {
@@ -285,9 +292,11 @@ PinnedHostBuffer& PinnedHostBuffer::operator=(PinnedHostBuffer&& other) noexcept
     free_pinned(data_);
     data_ = other.data_;
     size_ = other.size_;
+    mapped_ = other.mapped_;
 
     other.data_ = nullptr;
     other.size_ = 0;
+    other.mapped_ = false;
     return *this;
 }
 

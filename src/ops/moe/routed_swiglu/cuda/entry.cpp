@@ -6,6 +6,8 @@
 #include "ops/moe/kernels/cuda/groupwise_int/workspace.h"
 #include "ops/moe/kernels/cuda/block_scaled/workspace.h"
 
+#include <stdexcept>
+
 namespace ninfer::ops {
 namespace {
 namespace kernel       = detail::moe_cuda;
@@ -57,7 +59,7 @@ std::size_t capacity(const RoutedSwiGLUProfile& profile, const SwiGLUProfile* sh
 void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiGLUExperts& experts,
              const ExpertRoutes& routes, ExpertSubset subset, const ScaledSwiGLUTerm* shared,
              MoeEpilogue mode, Tensor& destination, MemoryArena& workspace,
-             CudaExecutionView execution) {
+             CudaExecutionView execution, std::uint32_t* missed) {
     const auto& shape = impl::shape_dispatch(profile);
     detail::MoeOperands operands("routed_swiglu", execution);
     const int tokens = operands.input(x, profile.ffn.hidden);
@@ -100,6 +102,13 @@ void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiG
         const auto buffers = allocate(workspace, plan, count, subset.kind, shared != nullptr,
                                       profile.ffn.gate_up_type == QType::Q8_G32_FP16);
         if (plan.implementation == kernel::ExpertImplementation::BlockScaled) {
+            // The block-scaled kernels skip a masked-out route without counting it. Reporting a zero
+            // there would be worse than refusing: a predicted skip would read "no miss" from a path
+            // that never looked.
+            if (missed != nullptr) {
+                throw std::invalid_argument(
+                    "routed_swiglu: missed_routes is not implemented for the block-scaled paths");
+            }
             block_scaled::launch(input, experts, selection, subset, term ? &*term : nullptr, mode,
                                  output, plan.block_scaled, buffers.block_scaled, execution);
             continue;
@@ -112,11 +121,11 @@ void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiG
         }
         if (plan.integer.grouped) {
             integer::launch_group_count_scan(selection, subset, plan.integer.group, storage.groups,
-                                             execution);
+                                              execution, missed);
             if (plan.integer.group.adaptive) {
                 integer::launch_token_swiglu(input, profile, experts, selection, subset,
                                              term ? &*term : nullptr, mode, output,
-                                             plan.integer.token, storage, {}, execution, true);
+                                             plan.integer.token, storage, {}, execution, missed, true);
             }
             integer::launch_group_index(selection, storage.groups, execution);
             integer::launch_grouped_swiglu(input, profile, experts, selection,
@@ -125,7 +134,7 @@ void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiG
         } else {
             integer::launch_token_swiglu(input, profile, experts, selection, subset,
                                          term ? &*term : nullptr, mode, output, plan.integer.token,
-                                         storage, {}, execution);
+                                         storage, {}, execution, missed);
         }
     }
 }
@@ -147,14 +156,18 @@ std::size_t routed_swiglu_workspace_capacity_bytes(const RoutedSwiGLUProfile& pr
 void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
                    const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
                    ExpertSubset subset, MoeEpilogue mode, Tensor& destination,
-                   MemoryArena& workspace, CudaExecutionView execution) {
-    execute(x, profile, experts, routes, subset, nullptr, mode, destination, workspace, execution);
+                   MemoryArena& workspace, CudaExecutionView execution,
+                   std::uint32_t* missed_routes) {
+    execute(x, profile, experts, routes, subset, nullptr, mode, destination, workspace, execution,
+            missed_routes);
 }
 
 void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
                    const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
                    ExpertSubset subset, const ScaledSwiGLUTerm& shared, MoeEpilogue mode,
-                   Tensor& destination, MemoryArena& workspace, CudaExecutionView execution) {
-    execute(x, profile, experts, routes, subset, &shared, mode, destination, workspace, execution);
+                   Tensor& destination, MemoryArena& workspace, CudaExecutionView execution,
+                   std::uint32_t* missed_routes) {
+    execute(x, profile, experts, routes, subset, &shared, mode, destination, workspace, execution,
+            missed_routes);
 }
 } // namespace ninfer::ops

@@ -93,6 +93,11 @@ private:
 class PinnedHostBuffer {
 public:
     explicit PinnedHostBuffer(std::size_t size_bytes);
+    // port (sm_89): a mapped buffer keeps its host address and also gets a Device address from
+    // cudaHostGetDevicePointer, so a kernel can write into it with no copy and no submission. Used
+    // for counters a fast path reads once per token; nothing here is cached, so every device write
+    // costs a trip over the bus.
+    PinnedHostBuffer(std::size_t size_bytes, bool mapped);
     ~PinnedHostBuffer();
 
     PinnedHostBuffer(const PinnedHostBuffer&)            = delete;
@@ -106,6 +111,7 @@ public:
 private:
     void* data_       = nullptr;
     std::size_t size_ = 0;
+    bool mapped_      = false;
 };
 
 using WorkspaceArena = DeviceArena;

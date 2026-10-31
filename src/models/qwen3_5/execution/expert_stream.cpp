@@ -1173,6 +1173,67 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     return true;
 }
 
+std::uint32_t* ExpertStream::missed_routes_device() {
+    if (!miss_count_checked_) {
+        miss_count_checked_ = true;
+        if (std::getenv("NINFER_O1_MISS_COUNT") != nullptr) {
+            // One word, allocated on first use: the Device context is certainly up by the time a
+            // layer asks for it, and a run that never enables the counter never pays for it.
+            miss_count_      = std::make_unique<PinnedHostBuffer>(sizeof(std::uint32_t), true);
+            miss_count_host_ = static_cast<std::uint32_t*>(miss_count_->data());
+            *miss_count_host_ = 0;
+            const cudaError_t err =
+                cudaHostGetDevicePointer(reinterpret_cast<void**>(&miss_count_device_),
+                                         miss_count_->data(), 0);
+            if (err != cudaSuccess) {
+                throw std::runtime_error(std::string("cudaHostGetDevicePointer failed: ") +
+                                         cudaGetErrorString(err));
+            }
+            std::fprintf(stderr, "[o1] miss counter on (mapped) bank=%u\n", bank_);
+            std::fflush(stderr);
+        }
+    }
+    return miss_count_device_;
+}
+
+bool ExpertStream::miss_count_enabled() { return missed_routes_device() != nullptr; }
+
+std::uint32_t ExpertStream::missed_routes_total() {
+    if (miss_count_host_ == nullptr) { return 0; }
+    // Volatile, because the word is written on the other side of the bus: a cached read would keep
+    // returning whatever the host happened to see first.
+    return *static_cast<volatile std::uint32_t*>(miss_count_host_);
+}
+
+void ExpertStream::observe_missed(std::uint32_t reading, std::uint64_t host_layer, bool decode) {
+    // The counter is never reset, so a reading is a running total. Its delta against the last reading
+    // is the layer that produced the previous call: the read sits right after the fetch that
+    // synchronised, and that fetch only covers what was enqueued before this layer's Device half.
+    // Deltas rather than totals, because one divergence would otherwise offset every later reading.
+    const std::uint32_t delta = reading - miss_last_reading_;
+    miss_last_reading_        = reading;
+    miss_tally_.device += delta;
+    miss_tally_.host += host_layer;
+    if (decode) {
+        if (delta != miss_prev_host_) { ++miss_tally_.mismatch; }
+        ++miss_tally_.compared;
+    } else {
+        if (delta != miss_prev_host_) { ++miss_tally_.prefill_mismatch; }
+        ++miss_tally_.prefill_compared;
+    }
+    miss_prev_host_ = host_layer;
+    if (std::getenv("NINFER_O1_DEBUG") != nullptr) {
+        static std::uint64_t shown = 0;
+        if (bank_ == 0 && shown++ < 400) {
+            std::fprintf(stderr, "[o1d] n=%llu delta=%u host_layer=%llu prev=%llu\n",
+                         static_cast<unsigned long long>(shown), delta,
+                         static_cast<unsigned long long>(host_layer),
+                         static_cast<unsigned long long>(miss_prev_host_));
+            std::fflush(stderr);
+        }
+    }
+}
+
 } // namespace ninfer::models::qwen3_5::execution
 
 

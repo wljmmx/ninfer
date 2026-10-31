@@ -135,6 +135,14 @@ void topk_softmax_route(const Tensor& x, const RouteProfile& profile, const Weig
 // is private; there is no semantic staging cast. No hidden allocation, transfer or host readback
 // is performed.
 // Fixed-profile Graph replay may change route/mask/index contents after prior consumers finish.
+//
+// port (sm_89): `missed_routes`, when not null, receives one for every route the mask excluded, added
+// on the device where the route is skipped. It is the only honest answer to "did the resident set
+// cover this layer?" for a caller that deliberately never read the ids back: the mask is published
+// from the same decision that places the routes, so asking the mask always says it covered them.
+// The address must be mapped host memory or Device memory that outlives the enqueued work, and the
+// count is not reset here. Only the groupwise-int paths count; a block-scaled layer rejects a
+// non-null pointer rather than report a zero it did not measure.
 [[nodiscard]] std::size_t
 routed_swiglu_workspace_capacity_bytes(const RoutedSwiGLUProfile& profile, ExpertSubsetKind subset,
                                        DType output_type, MoeEpilogue epilogue,
@@ -145,11 +153,13 @@ routed_swiglu_workspace_capacity_bytes(const RoutedSwiGLUProfile& profile, Exper
 void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
                    const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
                    ExpertSubset subset, MoeEpilogue epilogue, Tensor& destination,
-                   MemoryArena& workspace, CudaExecutionView execution);
+                   MemoryArena& workspace, CudaExecutionView execution,
+                   std::uint32_t* missed_routes = nullptr);
 void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
                    const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
                    ExpertSubset subset, const ScaledSwiGLUTerm& shared, MoeEpilogue epilogue,
-                   Tensor& destination, MemoryArena& workspace, CudaExecutionView execution);
+                   Tensor& destination, MemoryArena& workspace, CudaExecutionView execution,
+                   std::uint32_t* missed_routes = nullptr);
 
 // CPU contribution of the same routed formula. x is BF16 [H,T], destination is FP32 [H,T];
 // all tensors are contiguous CPU views with element alignment. Encoded bank planes have
@@ -167,9 +177,12 @@ void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
                                                                  ExpertSubsetKind subset,
                                                                  std::int32_t min_tokens,
                                                                  std::int32_t max_tokens);
+// `missed_routes` is accepted for signature parity and ignored: the CPU half of a split layer runs
+// exactly the routes the mask kept, so it never skips one.
 void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
                    const CpuSwiGLUExperts& experts, const ExpertRoutes& routes, ExpertSubset subset,
-                   Tensor& destination, MemoryArena& workspace, CpuExecutionView execution);
+                   Tensor& destination, MemoryArena& workspace, CpuExecutionView execution,
+                   std::uint32_t* missed_routes = nullptr);
 
 // Complete top-k-softmax routed SwiGLU plus sigmoid-gated shared SwiGLU, with the same routing,
 // expert and residual formulas above. Destination is BF16 [H,T]. Every routed expert is readable.

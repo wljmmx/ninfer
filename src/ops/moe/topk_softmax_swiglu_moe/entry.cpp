@@ -117,7 +117,7 @@ void topk_softmax_swiglu_moe(const Tensor& x, const MoeProfile& profile, const M
             if (plan.integer.group.adaptive) {
                 integer::launch_token_swiglu(input, p, weights.routed, storage.routes, {}, &shared,
                                              mode, output, plan.integer.token, storage.experts, {},
-                                             execution, true);
+                                             execution, nullptr, true);
             }
             integer::launch_group_index(storage.routes, storage.experts.groups, execution);
             integer::launch_grouped_swiglu(input, p, weights.routed, storage.routes, &shared, mode,
