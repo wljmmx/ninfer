@@ -4,6 +4,8 @@
 #include "ops/moe/kernels/cuda/routing/router_mma.cuh"
 #include "ops/moe/kernels/cuda/routing/topk.cuh"
 
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail::moe_cuda::routing {
@@ -158,6 +160,21 @@ template <class S>
 void launch_route_shape(const Tensor& x, const Weight& control, const ExpertRoutes& routes,
                         const Tensor& shared, const RouterPlan& plan, const RouteStorage& storage,
                         const MoeExecutionHints& hints, CudaExecutionView execution) {
+    // port (sm_89): a latched error is not this kernel's. cudaGetLastError reports the first failure
+    // since the last check, so a launch that never ran can be blamed for an allocation that failed a
+    // thousand calls earlier - which is how a 19.4 GiB pool reported "route.cu:182 invalid argument"
+    // on its very first layer. Asking here (and only here) separates "the router launch is invalid"
+    // from "something before it left an error behind". Off by default: draining the error has to be
+    // a decision, not a side effect of asking.
+    if (std::getenv("NINFER_DEBUG_LATCH") != nullptr) {
+        static std::uint64_t reported = 0;
+        const cudaError_t latched = cudaGetLastError();
+        if (latched != cudaSuccess && reported++ < 4) {
+            std::fprintf(stderr, "[route] latched before this layer's router launch: %s\n",
+                         cudaGetErrorString(latched));
+            std::fflush(stderr);
+        }
+    }
     const auto* input   = static_cast<const __nv_bfloat16*>(x.data);
     const auto* weights = static_cast<const __nv_bfloat16*>(control.qdata);
     const auto stream   = execution.stream;
