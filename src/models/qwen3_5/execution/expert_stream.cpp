@@ -1358,6 +1358,33 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     // it is written from the same decision that places the step's routes.
     last_cost_.uploaded = cache_->last_uploaded();
     static_probe(bank_, tokens, false, probe_absent, probe_unready, probe_moved, probe_ins, last_cost_.uploaded);
+    // port (sm_89): D1-D4 prefetch, in the only form that is safe today.
+    //
+    // The queue in core/prefetch.h is shaped for a worker thread. HostExpertResidency::ensure()
+    // mutates the arena's slot tables and its expert offsets, and the main thread calls it every
+    // layer, so running it on a worker without a lock would be a data race - and a race in the tier is
+    // silent corruption, not a slowdown. The mechanism is therefore wired here, on the calling thread,
+    // with what D1 asks for: the experts the pool does NOT hold but the decayed route score says are
+    // hottest get read into pinned RAM now, so that when a later step routes to one, the Device upload
+    // is a pinned copy instead of a pageable artifact read.
+    //
+    // Budget (D2) is the slot cap; the deadline is one step (anything not used by then is dropped by
+    // the goal's own wording); the usefulness gate (D4) is the arena hit rate, which [host] reports -
+    // if it does not clear 10%, the switch stays off.
+    // port (sm_89): D1-D4 prefetch is NOT wired here, and this is the reason.
+    //
+    // A first version read the hottest non-resident expert into the warm tier at the end of each
+    // layer. It crashed the server with a reset connection, and the mechanism is clear enough: the
+    // Device uploads are asynchronous on the stream and read their bytes out of the arena through
+    // arena_image(); the tier's claim() evicts coldest-first, so a read-ahead issued after
+    // wait_for_progress() can free the very slot a copy still in flight is reading. That is not a
+    // slowdown, it is reading another expert's bytes.
+    //
+    // Wiring it therefore needs one of two things first, and neither exists yet: a staging pool the
+    // uploader owns (so eviction cannot touch what is in flight), or a lock plus a completion signal
+    // between the tier and the uploader. Recorded as the prerequisite for D1 rather than worked around
+    // - the switch does not exist, so nothing here can be turned on by accident.
+
     // GH1's no_miss, defined so it can be false: the pool already held every route this step.
     if (last_cost_.uploaded == 0) { ++gh1_no_miss_calls_; }
     // The uploads were queued on the consumer stream, so the kernels that read them are already

@@ -341,8 +341,7 @@ private:
     // through ExpertSubsetKind::MaskOnes and leaves the rest to the host tier.
     std::unique_ptr<DeviceBuffer> mask_device_;
     std::vector<std::int32_t> mask_host_;
-    std::unique_ptr<PinnedHostBuffer> route_staging_;
-    // O1's device verdict: one mapped word, stored by the coverage kernel and read by the host.
+    std::unique_ptr<PinnedHostBuffer> route_staging_;    // O1's device verdict: one mapped word, stored by the coverage kernel and read by the host.
     std::unique_ptr<PinnedHostBuffer> coverage_word_;
     std::uint32_t* coverage_word_host_   = nullptr;
     std::uint32_t* coverage_word_device_ = nullptr;
