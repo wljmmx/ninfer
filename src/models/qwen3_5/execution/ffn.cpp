@@ -1113,12 +1113,25 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
         if (all_resident) {
             // Same call as the fully resident tail: empty subset, BF16 accumulation into the
             // residual. Bit-identical by construction, which is what the PPL gate checks.
+            //
+            // port (sm_89): O1's skip path runs this same layer with the mask on - it has no ids on
+            // the host, so it can only run "everything the mask keeps" into the residual. That is a
+            // third shape ({MaskOnes, AddResidual}) next to the two the gate already covers, so
+            // NINFER_O1_SKIP_ARITH forces it here and lets the gate and the token dump say whether
+            // it is the same number.
+            const bool masked_shape = std::getenv("NINFER_O1_SKIP_ARITH") != nullptr;
             try {
                 MemoryArena arena(MemorySpan{scratch.data, scratch.bytes, execution.device()});
+                Tensor masked_mask(const_cast<void*>(moe.stream->resident_mask()), execution.device(),
+                                   DType::I32,
+                                   {static_cast<std::int32_t>(mask_host.size())});
                 timeline_gpu_begin(execution.stream);
-                ops::routed_swiglu(hidden, routed, moe.stream->experts(), routes, {},
-                                   ops::ScaledSwiGLUTerm{moe.shared, shared_coefficients},
-                                   ops::MoeEpilogue::AddResidual, residual, arena, execution);
+                ops::routed_swiglu(
+                    hidden, routed, moe.stream->experts(), routes,
+                    masked_shape ? ops::ExpertSubset{ops::ExpertSubsetKind::MaskOnes, masked_mask}
+                                 : ops::ExpertSubset{},
+                    ops::ScaledSwiGLUTerm{moe.shared, shared_coefficients},
+                    ops::MoeEpilogue::AddResidual, residual, arena, execution);
                 timeline_gpu_end(execution.stream);
             } catch (const std::exception& error) {
                 throw std::invalid_argument(std::string("expert stream run: ") + error.what());
