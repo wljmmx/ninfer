@@ -764,29 +764,6 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
     } catch (const std::exception& error) {
         throw std::invalid_argument(std::string("expert stream route: ") + error.what());
     }
-    // port (sm_89): O1's skip. When decode has armed the step (the previous one was clean), the host
-    // never learns these ids: the layer runs what the mask keeps straight into the residual and the
-    // step gate reports whatever the mask dropped. A dirty answer means decode replays the token, so
-    // this branch must stay unreachable unless decode is prepared to do exactly that - which is why
-    // it is gated on an arm set by the decode batch and not on an environment variable alone.
-    if (o1_skip_armed()) {
-        const auto skip_mask_size = static_cast<std::int32_t>(moe.stream->count());
-        Tensor skip_mask(const_cast<void*>(moe.stream->resident_mask()), execution.device(),
-                         DType::I32, {skip_mask_size});
-        try {
-            MemoryArena arena(MemorySpan{scratch.data, scratch.bytes, execution.device()});
-            timeline_gpu_begin(execution.stream);
-            ops::routed_swiglu(hidden, routed, moe.stream->experts(), routes,
-                               ops::ExpertSubset{ops::ExpertSubsetKind::MaskOnes, skip_mask},
-                               ops::ScaledSwiGLUTerm{moe.shared, shared_coefficients},
-                               ops::MoeEpilogue::AddResidual, residual, arena, execution,
-                               step_miss_device());
-            timeline_gpu_end(execution.stream);
-        } catch (const std::exception& error) {
-            throw std::invalid_argument(std::string("expert stream skip run: ") + error.what());
-        }
-        return;
-    }
     // port (sm_89): one read-back per layer. The residency decision needs the 32 route ids and the
     // CPU half needs the layer inputs; they come down in the same batch with one stream synchronise.
     // The split path used to pay two - a 32-byte copy inside ensure and the inputs here - and that
@@ -812,7 +789,7 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
     std::optional<HostRoutedFetch> early;
     const auto fetch_begin = std::chrono::steady_clock::now();
     seg_pre_ms = std::chrono::duration<double, std::milli>(fetch_begin - t_layer_begin).count();
-    if (!moe.stream->fully_resident()) {
+    if (!o1_skip_armed() && !moe.stream->fully_resident()) {
         // Which shape to ask for is a measurement, not a policy: the controller already tracks how
         // many experts a layer has to move, and a pool that misses almost nothing only needs the ids.
         // A pool that misses often would pay the second transfer on top of the first, so it gets the
@@ -858,6 +835,29 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
         }
     } catch (const std::exception& error) {
         throw std::invalid_argument(std::string("expert stream upload: ") + error.what());
+    }
+    // port (sm_89): O1's skip, after ensure rather than instead of it. ensure() is what publishes the
+    // mask and the offset table and rebases the window onto the current resident set - a layer that
+    // returned before it ran with the previous layer's addressing, which is why the first version of
+    // this branch differed from the normal path on 42 of 48 tokens. ensure() takes the ids on the
+    // device, so it costs no read-back; only the ids and the inputs stay on the device.
+    if (o1_skip_armed()) {
+        const auto skip_mask_size = static_cast<std::int32_t>(moe.stream->count());
+        Tensor skip_mask(const_cast<void*>(moe.stream->resident_mask()), execution.device(),
+                         DType::I32, {skip_mask_size});
+        try {
+            MemoryArena arena(MemorySpan{scratch.data, scratch.bytes, execution.device()});
+            timeline_gpu_begin(execution.stream);
+            ops::routed_swiglu(hidden, routed, moe.stream->experts(), routes,
+                               ops::ExpertSubset{ops::ExpertSubsetKind::MaskOnes, skip_mask},
+                               ops::ScaledSwiGLUTerm{moe.shared, shared_coefficients},
+                               ops::MoeEpilogue::AddResidual, residual, arena, execution,
+                               step_miss_device());
+            timeline_gpu_end(execution.stream);
+        } catch (const std::exception& error) {
+            throw std::invalid_argument(std::string("expert stream skip run: ") + error.what());
+        }
+        return;
     }
     // port (sm_89): O5, first half - keep a RAM copy of every expert this step routes to.
     //
