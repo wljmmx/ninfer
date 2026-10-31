@@ -325,13 +325,19 @@ void ExpertStream::gh1_report() {
 // and it is a counter, not an inference: it prints every 400 layers on one stream. Off by default -
 // the probe adds two hash lookups per route, which is the thing being measured.
 namespace {
-void static_probe(std::int32_t tokens, bool covered, std::uint32_t absent, std::uint32_t unready,
-                  std::uint64_t moved, std::uint64_t ins, std::uint64_t staged) {
+void static_probe(std::uint32_t bank, std::int32_t tokens, bool covered, std::uint32_t absent,
+                  std::uint32_t unready, std::uint64_t moved, std::uint64_t ins,
+                  std::uint64_t staged) {
     static const bool on = std::getenv("NINFER_STATIC_PROBE") != nullptr;
     if (!on) { return; }
     struct Totals {
         std::uint64_t calls = 0, cov = 0, absent = 0, absent_layers = 0;
         std::uint64_t unready = 0, unready_layers = 0, moved = 0, ins = 0, staged = 0;
+        // Step accounting. A round is 40 layers and a graph is captured per round, so layer coverage
+        // says nothing about it: if one layer in forty misses, the round cannot be replayed from a
+        // captured graph at all. A step is closed when bank 0 comes round again.
+        std::uint64_t steps = 0, clean_steps = 0, step_layers = 0;
+        bool step_dirty = false;
     };
     static thread_local Totals narrow_win, narrow_all;  // decode: one (or two) tokens a call
     static thread_local Totals wide_all;                // prefill: many tokens a call
@@ -340,6 +346,17 @@ void static_probe(std::int32_t tokens, bool covered, std::uint32_t absent, std::
     // length, not the pool. Every number this probe is asked for is a decode property.
     Totals& t   = tokens <= 2 ? narrow_win : wide_all;
     Totals& all = tokens <= 2 ? narrow_all : wide_all;
+    if (tokens <= 2) {
+        if (bank == 0 && t.step_layers != 0) {
+            ++t.steps;
+            ++all.steps;
+            if (!t.step_dirty) { ++t.clean_steps; ++all.clean_steps; }
+            t.step_layers = 0;
+            t.step_dirty  = false;
+        }
+        ++t.step_layers;
+        if (absent != 0) { t.step_dirty = true; }
+    }
     ++t.calls;
     ++all.calls;
     if (covered) { ++t.cov; ++all.cov; }
@@ -351,10 +368,11 @@ void static_probe(std::int32_t tokens, bool covered, std::uint32_t absent, std::
     if (tokens > 2 || narrow_win.calls % 400 != 0) { return; }
     const double n  = static_cast<double>(narrow_win.calls);
     const double na = static_cast<double>(narrow_all.calls);
+    const double ns = static_cast<double>(narrow_all.steps);
     std::fprintf(stderr,
                  "[st] win=%llu decode_layers=%llu | window covered=%.1f%% absent=%llu (%llu L) "
-                 "unready=%llu | cum covered=%.1f%% absent=%.3f/L | moved=%.2f ins=%.2f staged=%.2f "
-                 "| prefill calls=%llu absent=%llu\n",
+                 "unready=%llu | cum covered=%.1f%% absent=%.3f/L | steps=%llu clean=%.1f%% "
+                 "| moved=%.2f ins=%.2f staged=%.2f | prefill calls=%llu absent=%llu\n",
                  static_cast<unsigned long long>(narrow_all.calls / 400),
                  static_cast<unsigned long long>(narrow_win.calls),
                  100.0 * static_cast<double>(narrow_win.cov) / n,
@@ -363,6 +381,8 @@ void static_probe(std::int32_t tokens, bool covered, std::uint32_t absent, std::
                  static_cast<unsigned long long>(narrow_win.unready),
                  100.0 * static_cast<double>(narrow_all.cov) / na,
                  static_cast<double>(narrow_all.absent) / na,
+                 static_cast<unsigned long long>(narrow_all.steps),
+                 100.0 * static_cast<double>(narrow_all.clean_steps) / ns,
                  static_cast<double>(narrow_win.moved) / n, static_cast<double>(narrow_win.ins) / n,
                  static_cast<double>(narrow_win.staged) / n,
                  static_cast<unsigned long long>(wide_all.calls),
@@ -541,7 +561,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             last_cost_          = StepCost{};
             last_cost_.route_ms = route_ms;
             rebase_window();
-            static_probe(tokens, true, probe_absent, probe_unready, 0, 0, 0);
+            static_probe(bank_, tokens, true, probe_absent, probe_unready, 0, 0, 0);
             return true;
         }
         // port (sm_89): two policies, because they disagree on what the set is for.
@@ -1298,7 +1318,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     // The honest miss count for the path controller: the mask cannot answer this question, because
     // it is written from the same decision that places the step's routes.
     last_cost_.uploaded = cache_->last_uploaded();
-    static_probe(tokens, false, probe_absent, probe_unready, probe_moved, probe_ins, last_cost_.uploaded);
+    static_probe(bank_, tokens, false, probe_absent, probe_unready, probe_moved, probe_ins, last_cost_.uploaded);
     // GH1's no_miss, defined so it can be false: the pool already held every route this step.
     if (last_cost_.uploaded == 0) { ++gh1_no_miss_calls_; }
     // The uploads were queued on the consumer stream, so the kernels that read them are already
