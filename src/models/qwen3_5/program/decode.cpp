@@ -340,16 +340,54 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
             }
             execution::o1_arm_skip(o1_armed);
         }
+        // port (sm_89): where a token's time goes, and whether host and Device overlap at all. The
+        // expert tier's own panel says its host side is 5.0 ms of an 8.8 ms token and its Device side
+        // 0.4-0.8 ms, which leaves 3.8 ms unexplained - so measure the round instead of inferring it:
+        // how long the host spent enqueueing, how long the Device was busy (start of the first kernel
+        // to the end of the last, gaps included), and how long the synchronise then waited.
+        const bool stage_timing = std::getenv("NINFER_STAGE_TIMING") != nullptr;
+        static cudaEvent_t stage_begin = nullptr;
+        static cudaEvent_t stage_end   = nullptr;
+        if (stage_timing && stage_begin == nullptr) {
+            CUDA_CHECK(cudaEventCreate(&stage_begin));
+            CUDA_CHECK(cudaEventCreate(&stage_end));
+        }
+        if (stage_timing) { CUDA_CHECK(cudaEventRecord(stage_begin, device.stream)); }
         execution::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                          envelope, executable);
+        if (stage_timing) { CUDA_CHECK(cudaEventRecord(stage_end, device.stream)); }
         submit_range.reset();
+        const auto wait_begin = Clock::now();
         timing.begin_wait();
         {
             nvtx::ScopedRange wait_range(nvtx::Name::DecodeOrdinaryWait, nvtx::Category::Control,
                                          static_cast<std::uint64_t>(lanes.size()));
             device.synchronize();
         }
-        // A dirty step means the mask dropped routes the host half would have covered, so the layer's
+        if (stage_timing) {
+            const double wait_ms = std::chrono::duration<double, std::milli>(
+                                       Clock::now() - wait_begin)
+                                       .count();
+            float gpu_ms = 0.0F;
+            CUDA_CHECK(cudaEventElapsedTime(&gpu_ms, stage_begin, stage_end));
+            const double submit_ms = std::chrono::duration<double, std::milli>(
+                                         wait_begin - start)
+                                         .count();
+            static std::uint64_t rounds = 0;
+            static double sum_submit = 0.0, sum_gpu = 0.0, sum_wait = 0.0;
+            sum_submit += submit_ms;
+            sum_gpu += gpu_ms;
+            sum_wait += wait_ms;
+            if (++rounds % 40 == 0) {
+                std::fprintf(stderr,
+                             "[stage] round: host_submit=%.1f ms gpu_span=%.1f ms wait=%.1f ms "
+                             "(token %.1f ms)\n",
+                             sum_submit / 40.0, sum_gpu / 40.0, sum_wait / 40.0,
+                             (sum_submit + sum_wait) / 40.0);
+                std::fflush(stderr);
+                sum_submit = sum_gpu = sum_wait = 0.0;
+            }
+        }
         // output is wrong and no later layer can repair it: put the state back to where it was before
         // the step and run the same step again with the read-back on. Once only - a second dirty
         // answer through the normal path is not a prediction any more.
