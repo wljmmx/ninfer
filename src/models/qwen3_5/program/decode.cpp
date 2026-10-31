@@ -298,6 +298,11 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
                     std::fprintf(stderr, "[o1c] ordinary step row=%zu read=%d write=%d fork=%d\n", row,
                                  selectors.source, selectors.destination,
                                  static_cast<int>(sequence.state.fork_pending));
+                    // Whether a snapshot needs a NEW slot or can use one the store already holds
+                    // idle: with one sequence and two device slots, one of them is free.
+                    std::fprintf(stderr, "[o1c] device slots occupied=%u capacity=%u free=%u\n",
+                                 state_store->device_occupied(), state_store->device_capacity(),
+                                 state_store->device_capacity() - state_store->device_occupied());
                     std::fflush(stderr);
                 }
             }
