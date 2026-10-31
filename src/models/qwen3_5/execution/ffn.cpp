@@ -177,6 +177,9 @@ std::size_t stream_route_tensor_bytes(const RoutedMoeParameters& moe, std::int32
 // Everything the host half needs that the Device kernel does not produce. It is copied before that
 // kernel is launched, so the CPU work can overlap with it instead of queueing behind it.
 struct HostRoutedFetch {
+    // True when only the route ids came down: one copy, no pack kernel. The rest of the block is
+    // fetched later, and only by a layer that actually has experts to compute on the host.
+    bool ids_only = false;
     std::vector<std::uint16_t> x;
     std::vector<std::uint16_t> residual;
     std::vector<std::int32_t> ids;
@@ -186,6 +189,25 @@ struct HostRoutedFetch {
 // port (sm_89): `packed_device`, when the caller provides it, is a device block big enough for
 // the four buffers below. The pack kernel copies them into it on the stream and one transfer brings
 // the whole block down, which is what turns four submissions into one.
+// port (sm_89): the ids alone, in one submission. The full read-back packages x, residual, the ids
+// and the coefficients into one block and brings them down in one transfer - but that is a kernel
+// launch plus a copy, and on this driver a submission costs tens of microseconds. A layer whose
+// experts are all resident needs none of x, residual or coefficients: it needs the 32 ids and
+// nothing else. So the cheap shape is one cudaMemcpyAsync straight out of the route tensor, and the
+// expensive shape is only paid by a layer that turns out to have work for the host half.
+HostRoutedFetch fetch_ids_only(const ops::ExpertRoutes& routes, cudaStream_t stream) {
+    const auto top_k    = routes.ids.ne[0];
+    const auto tokens   = routes.ids.ne[1];
+    HostRoutedFetch fetch;
+    fetch.ids_only = true;
+    fetch.ids.resize(static_cast<std::size_t>(top_k) * tokens);
+    CUDA_CHECK(cudaMemcpyAsync(fetch.ids.data(), routes.ids.data,
+                               fetch.ids.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost,
+                               stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return fetch;
+}
+
 HostRoutedFetch fetch_host_routed(const Tensor& hidden, const ops::ExpertRoutes& routes,
                                   const Tensor& residual, cudaStream_t stream,
                                   void* packed_device) {
@@ -745,7 +767,23 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
     std::optional<HostRoutedFetch> early;
     const auto fetch_begin = std::chrono::steady_clock::now();
     if (!moe.stream->fully_resident()) {
-        early.emplace(fetch_host_routed(hidden, routes, residual, execution.stream, pack_device));
+        // Which shape to ask for is a measurement, not a policy: the controller already tracks how
+        // many experts a layer has to move, and a pool that misses almost nothing only needs the ids.
+        // A pool that misses often would pay the second transfer on top of the first, so it gets the
+        // full read-back in one go, exactly as before.
+        const double misses = policy_controller().signals.miss_per_layer;
+        // Measured at 16 GiB, 512 then 1024 tokens in the same session: the ids-only shape does cut
+        // the read-back from 0.070 to 0.022-0.031 ms a layer, and yet decode came out 136.8 against
+        // 148.1 - the saved time reappears as ~85 us of unaccounted time per layer, and wall does
+        // not move. Whatever the driver does with the small transfer costs at least what the pack
+        // kernel and the bigger copy did. So it stays off by default; NINFER_FETCH_IDS turns it on
+        // for whoever wants to chase that difference down.
+        static const bool ids_requested = std::getenv("NINFER_FETCH_IDS") != nullptr;
+        const bool ids_only = ids_requested && misses >= 0.0 && misses < 0.20;
+        early.emplace(ids_only
+                          ? fetch_ids_only(routes, execution.stream)
+                          : fetch_host_routed(hidden, routes, residual, execution.stream,
+                                              pack_device));
     }
     const double fetch_ms = std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() - fetch_begin)
@@ -863,6 +901,20 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
         // layer rounds exactly like a resident or a fully hosted one.
         auto fetch           = std::move(*early);
         const auto mask_host = moe.stream->resident_mask_host();
+        // A layer that only brought the ids down has to fetch the rest now: the host half needs x,
+        // the residual before the layer, and the coefficients. This is the case the cheap shape was
+        // betting against, so it is the one place that pays twice.
+        if (fetch.ids_only) {
+            auto full = fetch_host_routed(hidden, routes, residual, execution.stream, pack_device);
+            if (full.ids != fetch.ids) {
+                std::fprintf(stderr,
+                             "[fetch] ids changed between the two read-backs (bank=%u) - using the "
+                             "later one\n",
+                             moe.stream->bank_index());
+                std::fflush(stderr);
+            }
+            fetch = std::move(full);
+        }
         // The pool decides how a layer MAY run; the routing decides how it HAS to run. When every
         // route this step publishes is already resident, the host half is empty and the whole split
         // apparatus - the masked subset kernel, the FP32 intermediate, the merge - computes what the
