@@ -849,12 +849,16 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
         acc[6] += static_cast<double>(push_delta);
         acc_arena += static_cast<double>(arena_delta);
         if (++calls % 40 == 0) {
+            // "per call", not "per layer": `calls` only advances when a layer actually uploads
+            // something, so dividing by 40 normalises across the 40 *uploading* layers in the window.
+            // Reading it as 40 layers = one token is how 1.187 ms/layer turned into an impossible
+            // 47 ms/token next to the expert panel's 1.5-2.5 ms/token.
             std::fprintf(stderr,
-                         "[upload] collect=%.3fms submit=%.3fms ops=%.1f mb=%.2f per layer "
-                         "direct=%.1f staged=%.1f views=%.1f\n",
+                         "[upload] collect=%.3fms submit=%.3fms ops=%.1f mb=%.2f per uploading call "
+                         "(x40 window) direct=%.1f staged=%.1f views=%.1f\n",
                          acc[0] / 40.0, acc[1] / 40.0, acc[6] / 40.0,
                          acc[2] / 40.0 / 1048576.0, acc[3] / 40.0, acc[4] / 40.0, acc[5] / 40.0);
-            std::fprintf(stderr, "[upload] arena=%.1f experts per layer\n", acc_arena / 40.0);
+            std::fprintf(stderr, "[upload] arena=%.1f experts per uploading call\n", acc_arena / 40.0);
             // Raw values for the call being reported: if these two disagree while the averages
             // above do, the disagreement is in the accumulation and not in the upload itself.
             std::fprintf(stderr,
