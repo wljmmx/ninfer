@@ -3,6 +3,7 @@
 #include "models/qwen3_5/execution/expert_stream.h"
 #include "models/qwen3_5/execution/expert_path_control.h"
 #include "models/qwen3_5/execution/host_expert_residency.h"
+#include "models/qwen3_5/execution/step_gate.h"
 #include "core/cpu/executor.h"
 #include "core/cpu/system.h"
 #include <cstring>
@@ -1142,11 +1143,17 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
             // off. With it on the panel would be wrong rather than missing, which is worse.
             const bool timed = layer_timing && !LayerGraphs::instance().enabled();
             if (timed) { timeline_gpu_begin(execution.stream); }
+            // The step gate counts into one word for the whole model, which is what a replay reads at
+            // the sampling boundary; the per-bank counter exists to validate that count layer by
+            // layer. Whichever is on gets the pointer, so no kernel ever counts into a word nobody
+            // reads.
+            std::uint32_t* const miss_target =
+                step_miss_device() != nullptr ? step_miss_device() : moe.stream->missed_routes_device();
             ops::routed_swiglu(hidden, routed, moe.stream->experts(), routes,
                                ops::ExpertSubset{ops::ExpertSubsetKind::MaskOnes, device_mask},
                                ops::ScaledSwiGLUTerm{moe.shared, shared_coefficients},
                                ops::MoeEpilogue::Write, mixed_f32, mixed_arena, execution,
-                               moe.stream->missed_routes_device());
+                               miss_target);
             if (timed) { timeline_gpu_end(execution.stream); }
         };
         const auto dev_begin = std::chrono::steady_clock::now();

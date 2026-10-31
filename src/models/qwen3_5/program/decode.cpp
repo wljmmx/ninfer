@@ -1,3 +1,4 @@
+#include "models/qwen3_5/execution/step_gate.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/execution_context.h"
@@ -304,6 +305,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
             state_images->continuation_hidden_store()};
 
         mark_workspace_usage(workspace_plan.ordinary_round);
+        execution::step_miss_reset();
         execution::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                          envelope, executable);
         submit_range.reset();
@@ -314,6 +316,25 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
             device.synchronize();
         }
         timing.end_wait();
+
+        // port (sm_89): O1's step verdict, read where the step already pays for a synchronise. A
+        // nonzero count means some layer of this step dropped routes - exactly the case a predicted
+        // skip cannot resolve without replaying the token.
+        {
+            static std::uint64_t steps = 0, dirty = 0, routes = 0;
+            const std::uint32_t misses = execution::step_miss_read();
+            if (misses != 0) {
+                ++dirty;
+                routes += misses;
+            }
+            if (++steps % 64 == 0) {
+                std::fprintf(stderr, "[o1t] steps=%llu dirty=%llu routes=%llu\n",
+                             static_cast<unsigned long long>(steps),
+                             static_cast<unsigned long long>(dirty),
+                             static_cast<unsigned long long>(routes));
+                std::fflush(stderr);
+            }
+        }
 
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {

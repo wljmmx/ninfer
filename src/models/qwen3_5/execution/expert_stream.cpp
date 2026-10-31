@@ -1234,6 +1234,57 @@ void ExpertStream::observe_missed(std::uint32_t reading, std::uint64_t host_laye
     }
 }
 
+namespace {
+// O1's step verdict storage. One mapped word for the whole model, because a replay asks whether ANY
+// layer of the step dropped a route, not which one - and it has to be read where the step already
+// synchronises, the sampling wait in the decode batch. Built on first use and only under the switch.
+struct StepGate {
+    std::unique_ptr<PinnedHostBuffer> buffer;
+    std::uint32_t* host   = nullptr;
+    std::uint32_t* device = nullptr;
+    bool enabled          = false;
+    bool built            = false;
+};
+
+StepGate& step_gate() {
+    static StepGate gate;
+    if (!gate.built) {
+        gate.built   = true;
+        gate.enabled = std::getenv("NINFER_O1_STEP_GATE") != nullptr;
+        if (gate.enabled) {
+            gate.buffer = std::make_unique<PinnedHostBuffer>(sizeof(std::uint32_t), true);
+            gate.host   = static_cast<std::uint32_t*>(gate.buffer->data());
+            *gate.host  = 0;
+            const cudaError_t err =
+                cudaHostGetDevicePointer(reinterpret_cast<void**>(&gate.device), gate.buffer->data(),
+                                         0);
+            if (err != cudaSuccess) {
+                throw std::runtime_error(std::string("cudaHostGetDevicePointer failed: ") +
+                                         cudaGetErrorString(err));
+            }
+            std::fprintf(stderr, "[o1t] step gate on (mapped %p)\n", static_cast<void*>(gate.device));
+            std::fflush(stderr);
+        }
+    }
+    return gate;
+}
+} // namespace
+
+std::uint32_t* step_miss_device() { return step_gate().device; }
+
+std::uint32_t step_miss_read() {
+    StepGate& gate = step_gate();
+    if (!gate.enabled) { return 0; }
+    // Volatile: the word is written from the other side of the bus.
+    return *static_cast<volatile std::uint32_t*>(gate.host);
+}
+
+void step_miss_reset() {
+    StepGate& gate = step_gate();
+    if (!gate.enabled) { return; }
+    *gate.host = 0;
+}
+
 } // namespace ninfer::models::qwen3_5::execution
 
 
