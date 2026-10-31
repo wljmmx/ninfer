@@ -896,6 +896,11 @@ void ExpertCache::wait_for_progress(cudaStream_t stream) {
         if (state.required_published) { break; }
     }
     impl_->last_staged = static_cast<std::uint32_t>(staged_total);
+    // port (sm_89): the staging events this loop waits on are the copies' completion, so this is the
+    // moment the arena may reuse the slots it handed out (ExpertArenaSource::uploads_settled).
+    if (impl_->arena_source != nullptr) {
+        const_cast<ExpertArenaSource*>(impl_->arena_source)->uploads_settled();
+    }
     if (timing) {
         static std::uint64_t calls       = 0;
         static double ms                 = 0.0;

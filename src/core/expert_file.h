@@ -78,6 +78,13 @@ public:
     // hold it (or is not the backing for that bank). `bytes` receives the image length.
     virtual const std::byte* arena_image(std::uint32_t bank, std::uint32_t expert,
                                          std::uint64_t& bytes) const = 0;
+    // port (sm_89): the copies that were handed out by arena_image() have landed.
+    //
+    // Handing out that pointer is the moment a slot stops being "a slot I may reuse" and becomes "bytes
+    // a copy in flight is reading". Without this call the arena cannot tell the difference, and its
+    // coldest-first eviction can free the slot under the copy - which reads another expert's weights
+    // with no error anywhere. A tier that never runs copies simply does not override it.
+    virtual void uploads_settled() {}
 };
 
 } // namespace ninfer

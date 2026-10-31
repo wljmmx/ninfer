@@ -65,6 +65,10 @@ public:
         slot_bank_.assign(slot_capacity_, kNone);
         slot_expert_.assign(slot_capacity_, kNone);
         slot_last_use_.assign(slot_capacity_, 0);
+        // port (sm_89): slots whose bytes a Device copy is reading right now. Handing out the pointer in
+        // arena_image() is the only moment that becomes true, and uploads_settled() is the only moment
+        // it stops - see the note on ExpertArenaSource.
+        in_flight_.assign(slot_capacity_, 0);
 
         state_.resize(banks_.size());
         direct_.assign(banks_.size(), false);
@@ -413,7 +417,16 @@ public:
         const auto image = bank_files.experts[expert].image_bytes;
         if (image == 0 || image > slot_bytes_) { return nullptr; }
         bytes = image;
+        // Handing out the pointer is when the copy can start: from here until uploads_settled() this
+        // slot must not be evicted.
+        in_flight_[slot] = 1;
         return arena_ + std::uint64_t{slot} * slot_bytes_;
+    }
+
+    // port (sm_89): the copies the uploader handed out have landed (called where the staging events
+    // are waited). Clearing them all is safe by construction: settle means none is reading any more.
+    void uploads_settled() override {
+        std::fill(in_flight_.begin(), in_flight_.end(), std::uint8_t{0});
     }
     [[nodiscard]] std::uint64_t slot_bytes() const noexcept { return slot_bytes_; }
     [[nodiscard]] std::uint32_t slot_capacity() const noexcept { return slot_capacity_; }
@@ -506,13 +519,21 @@ private:
             slot_expert_[slot] = expert;
             return slot;
         }
-        std::uint32_t victim  = 0;
+        std::uint32_t victim  = kNone;
         std::uint64_t coldest = ~std::uint64_t{0};
         for (std::uint32_t s = 0; s < slot_capacity_; ++s) {
+            // A slot a copy is reading is not a candidate, whatever its age. Evicting it would hand
+            // the Device another expert's bytes with no error anywhere - the crash this protection
+            // exists to prevent (a read-ahead issued after wait_for_progress() freed the slot an
+            // in-flight copy was reading).
+            if (in_flight_[s] != 0) { continue; }
             if (slot_last_use_[s] < coldest) {
                 coldest = slot_last_use_[s];
                 victim  = s;
             }
+        }
+        if (victim == kNone) {
+            throw std::runtime_error("host expert arena: every slot is in flight");
         }
         if (coldest == 0) { throw std::runtime_error("host expert arena: nothing to evict"); }
         ++stats_.evictions;
@@ -613,6 +634,9 @@ private:
     }
     std::vector<std::uint32_t> slot_bank_, slot_expert_;
     std::vector<std::uint64_t> slot_last_use_;
+    // mutable: arena_image() is const (it is the uploader's view) but handing out a pointer is what
+    // marks the slot in flight.
+    mutable std::vector<std::uint8_t> in_flight_;
     std::uint64_t epoch_ = 0;
     Stats stats_{};
 };
