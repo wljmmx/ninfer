@@ -628,8 +628,18 @@ private:
     // counter read hits=0 misses=0 - which is exactly how "the tier is never filled" survived a
     // switch that looked connected.
     static bool managed_even_in_place() {
-        static const bool value =
-            std::getenv("NINFER_ARENA_MANAGED") != nullptr || std::getenv("NINFER_HOST_TIER") != nullptr;
+        // port (sm_89): 2026-10-31 - NOT bound to NINFER_HOST_TIER any more.
+        //
+        // Binding them made the switch reach an arena-backed path on an artifact whose every bank is
+        // addressed in place, and a decode request with the switch on then failed to return (no
+        // exception, connection reset, process alive). Prefill was fine, which is why it looked
+        // verified: perplexity is a prefill path.
+        //
+        // Until that failure is diagnosed, the switch stays inert on this artifact - a direct_ bank
+        // returns before touching the arena - rather than reachable and broken. The managed copy is
+        // opt-in again through NINFER_ARENA_MANAGED, which is what it was before, and the decode
+        // failure is recorded with it.
+        static const bool value = std::getenv("NINFER_ARENA_MANAGED") != nullptr;
         return value;
     }
     std::vector<std::uint32_t> slot_bank_, slot_expert_;
