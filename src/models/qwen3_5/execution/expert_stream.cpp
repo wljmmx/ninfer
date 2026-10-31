@@ -426,6 +426,29 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 since_decay_ = 0;
             }
         }
+        // port (sm_89): a step whose routes are all already in the pool has nothing to publish.
+        //
+        // The set is a means to an end, and the policies below re-rank the fill every step: at 16 GiB
+        // that moves 1.77 experts a layer even though 91% of layers miss nothing, which costs a table
+        // publish per layer (static 0%) and is what keeps a whole-layer graph uncapturable. Asking the
+        // cache whether each route is resident *and ready* is the honest test - the mask cannot answer
+        // it, because the mask is written from the placement that this skip avoids making.
+        bool covered = true;
+        for (std::size_t i = 0; i < values; ++i) {
+            const auto expert = static_cast<std::size_t>(route_ids[i]);
+            if (expert >= keys_.size() || !cache_->offset(keys_[expert])) {
+                covered = false;
+                break;
+            }
+        }
+        if (covered) {
+            ++gh1_static_calls_;
+            ++gh1_no_miss_calls_;
+            last_cost_          = StepCost{};
+            last_cost_.route_ms = route_ms;
+            rebase_window();
+            return true;
+        }
         // port (sm_89): two policies, because they disagree on what the set is for.
         //
         // Streaming (default): this step's routes are placed first, so the Device computes them
@@ -1000,7 +1023,14 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             // The mask must be the member buffer, not a local: an async copy out of a local vector
             // outlives the scope that owns it, which is a use-after-free that only shows up as a
             // resident set that is occasionally one layer stale.
-            if (table_bytes != 0 && mask_bytes != 0) {
+            // A layer whose set did not move has nothing to publish: the Device tables already say
+            // what this layer needs. Skipping the submission is worth more than making it cheaper -
+            // at 16 GiB most layers move nothing, and the layer's cost is a chain of submissions that
+            // are not overlapped (1x.4s), not one expensive call.
+            static thread_local bool published_once = false;
+            const bool unchanged = moved.empty() && published_once;
+            if (!unchanged && table_bytes != 0 && mask_bytes != 0) {
+                published_once = true;
                 cudaMemcpyAttributes attributes{};
                 attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
                 attributes.flags          = 0;
