@@ -326,9 +326,9 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
         // port (sm_89): O1's skip is taken for the whole step, so the state image that would have to
         // be put back is taken once, before it. The slot comes from the store's own free list: if the
         // pool has no spare destination the reservation fails and the step runs the normal way.
-        bool o1_armed = false;
+        bool o1_armed              = false;
+        static bool o1_last_clean  = false;
         {
-            static bool o1_last_clean = false;
             if (std::getenv("NINFER_O1_SKIP") != nullptr && lanes.size() == 1) {
                 if (!o1_step_image) { o1_step_image = state_store->reserve_destination(); }
                 if (o1_step_image) {
@@ -368,6 +368,11 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
             }
         }
         execution::o1_arm_skip(false);
+        // The next step may skip only if this one ended clean - including the replay, when there was
+        // one. Without this the arm never rises and the skip is dead code that measures nothing.
+        if (std::getenv("NINFER_O1_SKIP") != nullptr) {
+            o1_last_clean = execution::step_miss_read() == 0;
+        }
         timing.end_wait();
 
         // port (sm_89): O1's step verdict, read where the step already pays for a synchronise. A
