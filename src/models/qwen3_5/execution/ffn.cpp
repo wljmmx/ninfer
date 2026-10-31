@@ -54,6 +54,9 @@ struct SplitTimeline {
     std::uint64_t layers  = 0;
     // Last single-layer readings: the controller judges a layer, not a token average.
     double last_gpu  = 0.0;
+    // Layer split for attribution: pre = entry to the read-back, ensure_win = read-back to done.
+    double seg_pre = 0.0;
+    double seg_ensure = 0.0;
     double last_wall = 0.0;
 
     void report();
@@ -118,11 +121,12 @@ void SplitTimeline::report() {
                  static_cast<double>(missing) * per);
     std::fprintf(stderr,
                  "[tl] per layer: wall=%.3f fetch=%.3f ens=%.3f gpu=%.3f host=%.3f "
-                 "unaccounted=%.3f\n",
+                 "unaccounted=%.3f pre=%.3f ensure_win=%.3f\n",
                  wall * per, fetch * per, (ens_route + ens_layout + ens_upload) * per, gpu * per,
                  (host_cpu + host_write) * per,
                  wall * per - (fetch + ens_route + ens_layout + ens_upload + gpu + host_cpu +
-                               host_write) * per);
+                               host_write) * per,
+                 seg_pre * per, seg_ensure * per);
     std::fflush(stderr);
     *this = SplitTimeline{};
 }
@@ -724,6 +728,11 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
     // before any work is queued, is what keeps the measurement out of the thing being measured.
     timeline_gpu_collect();
     LayerScope layer_scope(layer_timing);
+    // Four-way split of a layer, so "unaccounted" can be attributed instead of shrugged at: what the
+    // layer spent before the read-back, the read-back itself, ensure, and everything after the kernel
+    // launch. The ids-only experiment moved 85 us into "unaccounted" and this is what says where.
+    const auto t_layer_begin = std::chrono::steady_clock::now();
+    double seg_pre_ms = 0.0;
     StageSample stage_sample(execution.stream);
     StageSample::state().calls++;
     const auto columns       = hidden.ne[1];
@@ -766,6 +775,7 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
                                                                            : host_term_span.data;
     std::optional<HostRoutedFetch> early;
     const auto fetch_begin = std::chrono::steady_clock::now();
+    seg_pre_ms = std::chrono::duration<double, std::milli>(fetch_begin - t_layer_begin).count();
     if (!moe.stream->fully_resident()) {
         // Which shape to ask for is a measurement, not a policy: the controller already tracks how
         // many experts a layer has to move, and a pool that misses almost nothing only needs the ids.
@@ -891,6 +901,10 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
     if (layer_timing) {
         const auto cost = moe.stream->last_cost();
         auto& state     = timeline();
+        state.seg_pre += seg_pre_ms;
+        state.seg_ensure += std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - fetch_begin)
+                                .count() - fetch_ms;
         state.ens_route += cost.route_ms;
         state.ens_layout += cost.layout_ms;
         state.ens_upload += cost.upload_ms;
