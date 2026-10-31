@@ -289,6 +289,18 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
             const StateImageSelectors selectors                 = state_selectors(sequence);
             ordinary_host_ingress->state_source_slots[row]      = selectors.source;
             ordinary_host_ingress->state_destination_slots[row] = selectors.destination;
+            // port (sm_89): whether an ordinary step already runs with the two state slots apart
+            // decides how O1's replay is built: apart means "discard the step" is free, in place
+            // means it has to put 61.4 MiB back first.
+            if (std::getenv("NINFER_O1_SLOTS") != nullptr) {
+                static std::uint64_t shown = 0;
+                if (shown++ < 8) {
+                    std::fprintf(stderr, "[o1c] ordinary step row=%zu read=%d write=%d fork=%d\n", row,
+                                 selectors.source, selectors.destination,
+                                 static_cast<int>(sequence.state.fork_pending));
+                    std::fflush(stderr);
+                }
+            }
             ordinary_host_ingress->sampling[row]                = request.sampling_host;
             ordinary_host_ingress->sampling[row].mask           = fill_grammar_mask(masks, row, {});
             ensure_sequence_kv_mapped(sequence, frontier + 1, 0);
