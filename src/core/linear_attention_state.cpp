@@ -212,6 +212,30 @@ void LinearAttentionStatePool::copy_slot(std::int32_t src, std::int32_t dst, cud
     validate_layer_slot(*this, 0, src, "LinearAttentionStatePool copy_slot source");
     validate_layer_slot(*this, 0, dst, "LinearAttentionStatePool copy_slot destination");
     if (src == dst) { return; }
+    // port (sm_89): one submission per component instead of one per layer. Every layer's region is
+    // laid out at a uniform pitch and both slots sit at the same offset inside a layer, so a whole
+    // component is one strided copy - 60 cudaMemcpyAsync calls became 2. That is what decides
+    // whether a per-step snapshot is affordable: O1's step replay has to put all 30 layers of
+    // recurrent state back before it can re-run a token.
+    const LinearAttentionStateSlotView view = slot_view(src);
+    const bool strided =
+        view.layers > 1 &&
+        view.conv_layer_pitch_bytes >= static_cast<std::ptrdiff_t>(view.conv_layer_bytes) &&
+        view.recurrent_layer_pitch_bytes >= static_cast<std::ptrdiff_t>(view.recurrent_layer_bytes);
+    if (strided) {
+        const Tensor conv_src      = conv_slot(0, src);
+        const Tensor conv_dst      = conv_slot(0, dst);
+        const Tensor recurrent_src = recurrent_slot(0, src);
+        const Tensor recurrent_dst = recurrent_slot(0, dst);
+        CUDA_CHECK(cudaMemcpy2DAsync(conv_dst.data, view.conv_layer_pitch_bytes, conv_src.data,
+                                     view.conv_layer_pitch_bytes, view.conv_layer_bytes,
+                                     view.layers, cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpy2DAsync(recurrent_dst.data, view.recurrent_layer_pitch_bytes,
+                                     recurrent_src.data, view.recurrent_layer_pitch_bytes,
+                                     view.recurrent_layer_bytes, view.layers,
+                                     cudaMemcpyDeviceToDevice, stream));
+        return;
+    }
     for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
         const Tensor source      = conv_slot(layer, src);
         const Tensor destination = conv_slot(layer, dst);

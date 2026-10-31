@@ -2,6 +2,9 @@
 
 #include "core/device.h"
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -313,6 +316,38 @@ StateImageDevicePool::StateImageDevicePool(DeviceSpan backing, const StateImageD
             throw std::invalid_argument("StateImage components do not share one slot geometry");
         }
         dflash_local_.emplace(backing, *layout.dflash_local);
+    }
+    // port (sm_89): O1's step replay has to restore the recurrent state of every layer, and the
+    // only way to know whether a per-step snapshot is affordable is the size of one slot. Printed
+    // once, under the switch, next to the width a copy of it would move.
+    if (std::getenv("NINFER_O1_REPLAY") != nullptr) {
+        const auto probe = linear_.slot_view(0);
+        const std::size_t per_slot = static_cast<std::size_t>(linear_.layer_count()) *
+                                         (probe.conv_layer_bytes + probe.recurrent_layer_bytes) +
+                                     continuation_hidden_slot(0).bytes();
+        std::fprintf(stderr,
+                     "[o1s] state image: layers=%u conv/layer=%zu recurrent/layer=%zu "
+                     "hidden=%zu slot=%zu bytes (%.1f MiB) slots=%d\\n",
+                     linear_.layer_count(), probe.conv_layer_bytes, probe.recurrent_layer_bytes,
+                     continuation_hidden_slot(0).bytes(), per_slot,
+                     static_cast<double>(per_slot) / (1024.0 * 1024.0), linear_.slot_count());
+        std::fflush(stderr);
+        // What a per-step snapshot would cost, measured here rather than estimated: a replay has to
+        // copy one slot out and, when it fires, back.
+        if (linear_.slot_count() >= 2) {
+            constexpr int kRounds = 20;
+            cudaStreamSynchronize(nullptr);
+            const auto begin = std::chrono::steady_clock::now();
+            for (int round = 0; round < kRounds; ++round) { copy_slot(0, 1, nullptr); }
+            cudaStreamSynchronize(nullptr);
+            const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - begin)
+                                  .count() /
+                              kRounds;
+            std::fprintf(stderr, "[o1s] copy_slot %d rounds: %.3f ms/slot (%.0f MiB/s)\n", kRounds, ms,
+                         static_cast<double>(per_slot) / (1024.0 * 1024.0) / (ms / 1000.0));
+            std::fflush(stderr);
+        }
     }
 }
 
