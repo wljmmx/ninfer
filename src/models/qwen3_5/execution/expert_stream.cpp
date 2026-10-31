@@ -441,6 +441,8 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 break;
             }
         }
+        if (last_covered_) { ++predict_trials_; if (covered) { ++predict_hits_; } }
+        last_covered_ = covered;
         if (covered) {
             ++gh1_static_calls_;
             ++gh1_no_miss_calls_;

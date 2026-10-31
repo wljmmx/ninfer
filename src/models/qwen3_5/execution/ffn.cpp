@@ -969,6 +969,15 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
             // still has none (the queue has no consumer), so it stays "not measured".
             const auto rates = moe.stream->gh1_rates();
             control.observe_coverage(rates.static_pct, rates.no_miss_pct, rates.capturable_pct);
+            // O1's expected hit rate: how often a covered layer follows a covered one. Printed with
+            // the rest so the speculative design is judged by a number before it is built.
+            static std::uint64_t pred_reports = 0;
+            if (++pred_reports % 40 == 0) {
+                std::fprintf(stderr, "[pred] covered-after-covered=%.1f%% trials=%llu\n",
+                             100.0 * moe.stream->covered_predictor_rate(),
+                             static_cast<unsigned long long>(pred_reports));
+                std::fflush(stderr);
+            }
             // Warm-tier sides: what a cold read costs (measured in upload_one) and how often the
             // pinned copy answers instead. The mirror decision is the ratio between them.
             {

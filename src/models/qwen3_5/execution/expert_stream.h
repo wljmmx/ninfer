@@ -120,6 +120,12 @@ public:
         double no_miss_pct    = -1.0;
         double capturable_pct = -1.0;
     };
+    // Share of layers that are covered when the previous layer was covered - the speculative skip's
+    // expected hit rate. Negative when there is no sample yet.
+    [[nodiscard]] double covered_predictor_rate() const noexcept {
+        if (predict_trials_ == 0) { return -1.0; }
+        return static_cast<double>(predict_hits_) / static_cast<double>(predict_trials_);
+    }
     [[nodiscard]] Gh1Rates gh1_rates() const noexcept {
         Gh1Rates rates;
         if (gh1_calls_ == 0) { return rates; }
@@ -175,6 +181,12 @@ private:
     // used to replace all eight experts on every token and make the hot set useless.
     std::vector<float> hot_score_;
     std::vector<std::int32_t> demoted_;
+    // Predictor scoreboard for O1's speculative skip: if the previous layer was fully covered, how
+    // often is this one too? That ratio is the repair rate a speculative design would pay, and it is
+    // the number that decides whether skipping the read-back is worth its complexity.
+    bool last_covered_             = false;
+    std::uint64_t predict_trials_  = 0;
+    std::uint64_t predict_hits_    = 0;
     // llama.cpp-style SLRU over slot ids (src/llama-moe-cache.cpp:16-121): a probation list and a
     // protected half. A hit promotes the slot, a miss takes the probation head while skipping the
     // experts this step needs, and a slot that keeps its expert keeps its number, so republishing
