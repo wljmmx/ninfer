@@ -659,12 +659,44 @@ namespace {
 // layer. NINFER_STAGE_TIMING prints the sampled layer's device time once per token.
 class StageSample {
 public:
+    // port (sm_89): these three calls used to discard their status with `(void)`. At a 19,352 MiB
+    // pool one of them fails with cudaErrorInvalidValue and the first check that asks - the routing
+    // launch forty kernels later - reports it, which is why a full-residency run looked like a
+    // routing bug. A discarded failure is not free: it is a failing call nobody can see.
+    static void note(const char* what, cudaError_t status) {
+        if (status == cudaSuccess) { return; }
+        static std::uint64_t shown = 0;
+        if (std::getenv("NINFER_DEBUG_LATCH") != nullptr && shown++ < 8) {
+            std::fprintf(stderr, "[latch] stage sample %s: %s\n", what, cudaGetErrorString(status));
+            std::fflush(stderr);
+        }
+    }
+
     explicit StageSample(cudaStream_t stream) : stream_(stream) {
         auto& s = state();
         if (!s.enabled) { return; }
+        // port (sm_89): nothing in here is legal inside a graph capture, and at a 19,352 MiB pool the
+        // whole round IS captured. Recorded under capture, an event never reaches the stream, so the
+        // next sample's cudaEventElapsedTime answers cudaErrorInvalidValue - which the (void) above
+        // used to swallow, and which the first check that asked, the routing launch forty kernels
+        // later, then reported as a routing failure. Sampling is skipped instead of broken: the panel
+        // says once why it has no numbers.
+        cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream_, &capturing) == cudaSuccess &&
+            capturing != cudaStreamCaptureStatusNone) {
+            static bool told = false;
+            if (!told) {
+                told = true;
+                std::fprintf(stderr,
+                             "[stage] expert tier sampling off: the round is inside a CUDA graph "
+                             "capture (events do not land on a captured stream)\n");
+                std::fflush(stderr);
+            }
+            return;
+        }
         if (!s.created) {
-            (void)cudaEventCreate(&s.begin);
-            (void)cudaEventCreate(&s.end);
+            note("create begin", cudaEventCreate(&s.begin));
+            note("create end", cudaEventCreate(&s.end));
             s.created = true;
         }
         if (s.calls % 40 != 20) { return; }
@@ -673,7 +705,24 @@ public:
         // sampled layer by ~40% when it was tried.
         if (s.pending) {
             float ms = 0.0F;
-            (void)cudaEventElapsedTime(&ms, s.begin, s.end);
+            static std::uint64_t samples_seen = 0, failures = 0;
+            const cudaError_t status = cudaEventElapsedTime(&ms, s.begin, s.end);
+            ++samples_seen;
+            if (status != cudaSuccess) {
+                // Cannot happen once the capture check above is in place; kept because the previous
+                // version of this line is why a full-residency run reported a routing failure. If it
+                // ever prints, the capture check missed a path and that is worth knowing.
+                ++failures;
+                if (failures <= 4) {
+                    std::fprintf(stderr,
+                                 "[stage] expert tier sample dropped: %s (sample #%llu of %llu)\n",
+                                 cudaGetErrorString(status),
+                                 static_cast<unsigned long long>(failures),
+                                 static_cast<unsigned long long>(samples_seen));
+                    std::fflush(stderr);
+                }
+                ms = 0.0F;
+            }
             s.sum += ms;
             s.pending = false;
             if (++s.samples % 16 == 0) {
@@ -685,12 +734,12 @@ public:
                 s.samples = 0;
             }
         }
-        (void)cudaEventRecord(s.begin, stream_);
+        note("record begin", cudaEventRecord(s.begin, stream_));
         armed_ = true;
     }
     ~StageSample() {
         if (!armed_) { return; }
-        (void)cudaEventRecord(state().end, stream_);
+        note("record end", cudaEventRecord(state().end, stream_));
         state().pending = true;
     }
 
@@ -797,6 +846,18 @@ private:
 void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& residual,
                   WorkspaceArena& workspace, DeviceExecutionView execution) {
     const bool layer_timing = std::getenv("NINFER_SPLIT_TIMING") != nullptr;
+    // port (sm_89): the 19.4 GiB pool latches cudaErrorInvalidValue somewhere before this layer's
+    // routing launch, and the routing check is only the first one that asks. This asks earlier: on
+    // the FFN's own entry, before anything in it is queued. Off unless NINFER_DEBUG_LATCH is set.
+    if (std::getenv("NINFER_DEBUG_LATCH") != nullptr) {
+        static std::uint64_t shown = 0;
+        const cudaError_t latched  = cudaGetLastError();
+        if (latched != cudaSuccess && shown++ < 6) {
+            std::fprintf(stderr, "[latch] ffn entry (bank=%u): %s\n", moe.stream->bank_index(),
+                         cudaGetErrorString(latched));
+            std::fflush(stderr);
+        }
+    }
     // Last layer's Device pair is certainly finished by now, so this read is free. Doing it here,
     // before any work is queued, is what keeps the measurement out of the thing being measured.
     timeline_gpu_collect();

@@ -348,14 +348,36 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
         const bool stage_timing = std::getenv("NINFER_STAGE_TIMING") != nullptr;
         static cudaEvent_t stage_begin = nullptr;
         static cudaEvent_t stage_end   = nullptr;
+        // port (sm_89): where the 19.4 GiB pool's latched cudaErrorInvalidValue comes from. The first
+        // routing check of a layer reported it, and asking before that launch showed the error was
+        // already there - so it belongs to something in the round, and the round is where it has to be
+        // cornered. Each checkpoint drains the error (that is what cudaGetLastError does) and prints
+        // the first four occurrences; off unless NINFER_DEBUG_LATCH is set, because draining a failure
+        // has to be a decision.
+        const bool latch_debug = std::getenv("NINFER_DEBUG_LATCH") != nullptr;
+        const auto latch_check = [latch_debug](const char* where) {
+            if (!latch_debug) { return; }
+            static std::uint64_t reported = 0;
+            const cudaError_t latched     = cudaGetLastError();
+            if (latched != cudaSuccess && reported++ < 8) {
+                std::fprintf(stderr, "[latch] %s: %s\n", where, cudaGetErrorString(latched));
+                std::fflush(stderr);
+            }
+        };
+        latch_check("round start");
         if (stage_timing && stage_begin == nullptr) {
             CUDA_CHECK(cudaEventCreate(&stage_begin));
+            latch_check("after event create");
             CUDA_CHECK(cudaEventCreate(&stage_end));
+            latch_check("after event create 2");
         }
         if (stage_timing) { CUDA_CHECK(cudaEventRecord(stage_begin, device.stream)); }
+        latch_check("after record begin");
         execution::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                          envelope, executable);
+        latch_check("after batch");
         if (stage_timing) { CUDA_CHECK(cudaEventRecord(stage_end, device.stream)); }
+        latch_check("after record end");
         submit_range.reset();
         const auto wait_begin = Clock::now();
         timing.begin_wait();
@@ -364,12 +386,14 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
                                          static_cast<std::uint64_t>(lanes.size()));
             device.synchronize();
         }
+        latch_check("after sync");
         if (stage_timing) {
             const double wait_ms = std::chrono::duration<double, std::milli>(
                                        Clock::now() - wait_begin)
                                        .count();
             float gpu_ms = 0.0F;
             CUDA_CHECK(cudaEventElapsedTime(&gpu_ms, stage_begin, stage_end));
+            latch_check("after elapsed");
             const double submit_ms = std::chrono::duration<double, std::milli>(
                                          wait_begin - start)
                                          .count();
