@@ -857,6 +857,20 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
         } catch (const std::exception& error) {
             throw std::invalid_argument(std::string("expert stream skip run: ") + error.what());
         }
+        // Same nodes as the normal path. Without this the branch returns before the block that
+        // accumulates them and everything ensure() just spent lands in "unaccounted" - which is what
+        // made the first skip measurement look like the read-back's cost had merely moved.
+        if (layer_timing) {
+            const auto cost = moe.stream->last_cost();
+            auto& state     = timeline();
+            state.seg_pre += seg_pre_ms;
+            state.seg_ensure += std::chrono::duration<double, std::milli>(
+                                    std::chrono::steady_clock::now() - fetch_begin)
+                                    .count();
+            state.ens_route += cost.route_ms;
+            state.ens_layout += cost.layout_ms;
+            state.ens_upload += cost.upload_ms;
+        }
         return;
     }
     // port (sm_89): O5, first half - keep a RAM copy of every expert this step routes to.
