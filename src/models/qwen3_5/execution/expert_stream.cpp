@@ -716,7 +716,30 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             }
             // Promotion: expected demand above the cheap threshold, and above the coldest hot entry
             // by a margin - a swap that does not beat what it displaces is churn.
+            //
+            // port (sm_89): the two install sites below are counted apart, because "upload costs
+            // 1.5-2.5 ms per token while nothing misses" only says something once you know whether
+            // the copies come from this preparatory admission or from a route that was genuinely
+            // absent. The answer decides whether O1's next lever is the ranking or the transfer.
+            std::uint64_t promoted = 0, absent = 0;
+            // port (sm_89): the pool already serving every expert this step needs is the signal that
+            // the ranking has nothing left to buy. measured at 12 GiB, 512 tokens: promoted 0.88-1.05
+            // experts per layer against absent 0.40-0.53, and 1.3-1.5 experts a layer is what the
+            // 1.5-2.5 ms of upload per token is. NINFER_LAZY_PROMOTE stops the preparatory half when
+            // the step is fully served; the fallback loop below still installs anything genuinely
+            // absent, so a real miss can never be swallowed.
+            static const bool lazy_promote = std::getenv("NINFER_LAZY_PROMOTE") != nullptr;
+            bool all_served                 = true;
+            if (lazy_promote) {
+                for (const auto expert : need) {
+                    if (slru_of_expert_[expert] < 0) {
+                        all_served = false;
+                        break;
+                    }
+                }
+            }
             for (const auto expert : need) {
+                if (all_served) { break; }
                 if (slru_of_expert_[expert] >= 0) { continue; }
                 const auto slot = coldest(true);
                 if (slot < 0) { break; }
@@ -725,12 +748,27 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 const auto displaced = held == kEmpty ? 0.0F : demand_[held];
                 if (incoming < 0.25F || incoming < displaced + 0.1F) { continue; }
                 install(slot, expert, false);
+                ++promoted;
             }
             for (const auto expert : need) {
                 if (slru_of_expert_[expert] >= 0) { continue; }
                 const auto slot = coldest(true);
                 if (slot < 0) { break; }
                 install(slot, expert, false);
+                ++absent;
+            }
+            if (std::getenv("NINFER_UPLOAD_TIMING") != nullptr) {
+                static std::uint64_t layers = 0, promoted_total = 0, absent_total = 0;
+                promoted_total += promoted;
+                absent_total += absent;
+                if (++layers % 40 == 0) {
+                    std::fprintf(stderr, "[install] per layer: promoted=%.2f absent=%.2f\n",
+                                 static_cast<double>(promoted_total) / 40.0,
+                                 static_cast<double>(absent_total) / 40.0);
+                    std::fflush(stderr);
+                    promoted_total = 0;
+                    absent_total = 0;
+                }
             }
             wanted.clear();
             wanted.reserve(capacity);
