@@ -159,6 +159,12 @@ void prepare(std::span<const ExpertCacheKey> required, cudaStream_t stream = nul
     // publication was skipped for the right reason: "the table did not move" is a claim about the
     // cache, so it is the cache that has to say so (A3).
     [[nodiscard]] std::uint64_t layout_generation() const noexcept;
+    // port (sm_89): the same fact per bank. `layout_generation()` is one counter for the whole pool, so
+    // a bank that published at generation 1 looks stale the moment any of the other 39 banks places an
+    // expert - which is 39 times out of 40. A validity check has to compare like with like: what this
+    // bank's Device tables hold against what this bank's set now is. Measured the hard way: a per-bank
+    // table generation checked against the global counter fired on the default path with `1 vs 40`.
+    [[nodiscard]] std::uint64_t bank_generation(std::uint32_t bank) const noexcept;
     // Where the images came from, and what the cold path cost to read. The warm-tier decision (1y.7
     // step 3f) needs both sides: an arena hit skips the read entirely, so "is a managed copy worth
     // its admission cost" is a ratio between read_us and the copy that filling it costs.

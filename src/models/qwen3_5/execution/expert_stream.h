@@ -227,6 +227,11 @@ private:
     ExpertCache* cache_ = nullptr;
     HostExpertResidency* host_ = nullptr;
     std::uint32_t bank_ = 0;
+    // port (sm_89): A3b. The per-bank generation this bank's Device tables actually hold, set only when
+    // the driver accepted the publish. Compared before the kernels read the tables; a mismatch means a
+    // publication did not land, and computing on it would be a silent wrong token.
+    static constexpr std::uint64_t kTableUnknown = ~std::uint64_t{0};
+    std::uint64_t table_generation_ = 0;
     ExpertBankLayout entry_{};
     // port (sm_89): the pool holds every layer at once, so this bank's window is fixed and no
     // per-step routing decision - and therefore no host round trip - is needed.

@@ -1187,7 +1187,12 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             // A3's check, applied where it now matters - the skip below would otherwise hide a stale
             // table behind a correct-looking diff.
             static thread_local std::uint64_t published_generation = 0;
-            const auto generation = cache_->layout_generation();
+            // port (sm_89): this bank's own generation, not the pool's. layout_generation() counts
+            // every bank, so a bank that published at 1 looked stale as soon as any of the other 39
+            // placed an expert - which is nearly every layer, and is why the "did anything move" skip
+            // kept republishing. The per-bank number is the only one a per-bank publisher can compare
+            // against, and it is also what the table-validity check at the end of the layer uses.
+            const auto generation = cache_->bank_generation(bank_);
             const bool stale      = published_generation != generation;
             static thread_local bool published_once = false;
             const bool unchanged = moved.empty() && published_once && !stale;
@@ -1238,6 +1243,10 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                     }
                     publish_bytes_ += static_cast<std::uint64_t>(table_bytes + mask_bytes);
                 }
+                // A3b: what this bank's Device tables now hold, as a generation that can be compared.
+                // Only a submission the driver accepted counts - "we tried to publish" is exactly the
+                // state that used to look fine and compute with the previous layer's addresses.
+                table_generation_ = submitted == cudaSuccess ? generation : kTableUnknown;
                 ++publish_calls_;
             }
             if (moved.empty()) { ++gh1_static_calls_; }
@@ -1358,6 +1367,21 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     // it is written from the same decision that places the step's routes.
     last_cost_.uploaded = cache_->last_uploaded();
     static_probe(bank_, tokens, false, probe_absent, probe_unready, probe_moved, probe_ins, last_cost_.uploaded);
+    // port (sm_89): A3b, on the per-bank generation this time. A layer is about to hand these two
+    // tables to kernels that read them as addresses; if what this bank's Device tables hold is not
+    // what this bank's set now is, a publish did not land and the kernels would compute with another
+    // set's offsets - a silent wrong token, the one outcome the plan never accepts.
+    //
+    // The first version compared against layout_generation() and fired on the default path with
+    // `1 vs 40`: the pool's counter had moved 39 times for other banks. That is why the number had to
+    // become per-bank before the check could be one.
+    if (std::getenv("NINFER_TABLE_STALE") != nullptr) { table_generation_ = kTableUnknown; }
+    if (table_generation_ != cache_->bank_generation(bank_)) {
+        throw std::runtime_error("expert table is stale (bank " + std::to_string(bank_) +
+                                 "): device holds generation " +
+                                 std::to_string(table_generation_) + ", cache is on " +
+                                 std::to_string(cache_->bank_generation(bank_)));
+    }
     // port (sm_89): D1-D4 prefetch, in the only form that is safe today.
     //
     // The queue in core/prefetch.h is shaped for a worker thread. HostExpertResidency::ensure()

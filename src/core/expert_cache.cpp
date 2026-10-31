@@ -119,8 +119,10 @@ struct ExpertCache::Impl {
     std::size_t staging_cursor = 0;
     // Experts moved on the last progress() turn, for the path controller's miss estimate.
     std::uint32_t last_staged = 0;
-    // Incremented on every set_resident() that changed something (see layout_generation()).
-    std::uint64_t layout_generation = 0;
+// Incremented on every set_resident() that changed something (see layout_generation()).
+std::uint64_t layout_generation = 0;
+// ... and once per changed bank, which is the only form a per-bank publisher can compare against.
+std::vector<std::uint64_t> bank_generation;
     std::array<cudaEvent_t, kStagingRing> staging_event{};
     std::vector<std::size_t> staging_used;
     // port (sm_89): the stream the consumer runs on. Uploads queued there are ordered before the
@@ -327,6 +329,10 @@ struct ExpertCache::Impl {
         // turns a per-token reupload into a hit.
         if (!changed) { return false; }
         ++layout_generation;
+        // The same bump, per bank: this is the one a publisher of this bank's tables can compare
+        // against without being invalidated by the other banks (see bank_generation()).
+        if (bank_generation.size() <= bank) { bank_generation.resize(bank + 1, 0); }
+        ++bank_generation[bank];
         std::uint32_t held = 0;
         for (std::size_t expert = 0; expert < slots.size(); ++expert) {
             if (slots[expert] == kAbsentSlot) { continue; }
@@ -914,6 +920,10 @@ void ExpertCache::wait_for_progress(cudaStream_t stream) {
 std::uint32_t ExpertCache::last_uploaded() const noexcept { return impl_->last_staged; }
 
 std::uint64_t ExpertCache::layout_generation() const noexcept { return impl_->layout_generation; }
+
+std::uint64_t ExpertCache::bank_generation(std::uint32_t bank) const noexcept {
+    return bank < impl_->bank_generation.size() ? impl_->bank_generation[bank] : 0;
+}
 
 ExpertCache::UploadSourceStats ExpertCache::upload_sources() const {
     UploadSourceStats stats;
