@@ -1,4 +1,5 @@
 #include "models/qwen3_5/execution/expert_stream.h"
+#include "models/qwen3_5/execution/host_expert_residency.h"
 
 #include <cuda_runtime.h>
 
@@ -1265,6 +1266,44 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                                     return a.expert == b.expert;
                                 }),
                     required_.end());
+    // port (sm_89): fill the host tier before the Device asks for these experts.
+    //
+    // The warm tier existed and nothing filled it. HostExpertResidency::ensure() has been able to read
+    // a slot image out of the artifact since it was written, but only the whole-layer CPU fallback ever
+    // called it - so in the split path the arena stayed empty and every Device upload read the pageable
+    // artifact mapping instead of a pinned slot. That is the "arena = 0.0 experts per layer" the plan
+    // measured (1x.6 O5, root cause 2). This is the consumer, not an optimisation: without it the tier
+    // is unreachable from the path that needs it.
+    //
+    // Off by default, per v6's rule for a new mechanism, so the current behaviour stays the reference
+    // this switch is measured against.
+    static const bool host_tier = std::getenv("NINFER_HOST_TIER") != nullptr;
+    if (host_tier && host_ != nullptr) {
+        // The tier is filled per expert, not per route: a 511-token prefill publishes 4,088 route
+        // entries for a bank that has 248 experts, and the arena's own guard counts slots against the
+        // list it is handed. Deduplicating here is what makes the call mean "these experts", which is
+        // also what the guard was written to protect.
+        static thread_local std::vector<std::int32_t> distinct;
+        distinct.assign(route_ids, route_ids + values);
+        std::sort(distinct.begin(), distinct.end());
+        distinct.erase(std::unique(distinct.begin(), distinct.end()), distinct.end());
+        host_->ensure(ExpertBankId{bank_}, std::span<const std::int32_t>(distinct), nullptr);
+        if (timing) {
+            static std::uint64_t shown = 0;
+            const auto& filled = host_->stats();
+            if (++shown % 40 == 0) {
+                const auto total = filled.hits + filled.misses;
+                std::fprintf(stderr, "[host] arena hits=%llu misses=%llu evict=%llu hit=%.1f%%\n",
+                             static_cast<unsigned long long>(filled.hits),
+                             static_cast<unsigned long long>(filled.misses),
+                             static_cast<unsigned long long>(filled.evictions),
+                             total != 0 ? 100.0 * static_cast<double>(filled.hits) /
+                                              static_cast<double>(total)
+                                        : 0.0);
+                std::fflush(stderr);
+            }
+        }
+    }
     const auto upload_begin = std::chrono::steady_clock::now();
     cache_->prepare(required_, stream);
     try {

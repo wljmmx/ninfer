@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <span>
+#include <string>
 #include <stdexcept>
 #include <vector>
 
@@ -599,8 +600,15 @@ private:
     std::vector<bool> direct_; // bank addressed in place, no arena copy
     // When set, an in-place bank still gets a managed pinned copy. Off by default so a run that
     // never asks for the warm tier behaves exactly as before.
+    //
+    // NINFER_HOST_TIER implies this: asking for the warm tier means asking for a tier we control
+    // rather than a page cache we do not. Without the pairing the consumer call was inert - every
+    // bank on this artifact resolves in place, so ensure() returned before touching the arena and the
+    // counter read hits=0 misses=0 - which is exactly how "the tier is never filled" survived a
+    // switch that looked connected.
     static bool managed_even_in_place() {
-        static const bool value = std::getenv("NINFER_ARENA_MANAGED") != nullptr;
+        static const bool value =
+            std::getenv("NINFER_ARENA_MANAGED") != nullptr || std::getenv("NINFER_HOST_TIER") != nullptr;
         return value;
     }
     std::vector<std::uint32_t> slot_bank_, slot_expert_;
