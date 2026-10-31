@@ -1029,10 +1029,19 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             // what this layer needs. Skipping the submission is worth more than making it cheaper -
             // at 16 GiB most layers move nothing, and the layer's cost is a chain of submissions that
             // are not overlapped (1x.4s), not one expensive call.
+            // "The table did not move" is a claim about the cache, so the cache has to confirm it: any
+            // set_resident() that changed a bank bumps its generation, and a generation the publisher
+            // has not seen yet forces the publication even when this step's `moved` is empty. That is
+            // A3's check, applied where it now matters - the skip below would otherwise hide a stale
+            // table behind a correct-looking diff.
+            static thread_local std::uint64_t published_generation = 0;
+            const auto generation = cache_->layout_generation();
+            const bool stale      = published_generation != generation;
             static thread_local bool published_once = false;
-            const bool unchanged = moved.empty() && published_once;
+            const bool unchanged = moved.empty() && published_once && !stale;
             if (!unchanged && table_bytes != 0 && mask_bytes != 0) {
-                published_once = true;
+                published_once     = true;
+                published_generation = generation;
                 cudaMemcpyAttributes attributes{};
                 attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
                 attributes.flags          = 0;

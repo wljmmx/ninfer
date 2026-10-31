@@ -155,6 +155,10 @@ void prepare(std::span<const ExpertCacheKey> required, cudaStream_t stream = nul
     // It is the only honest miss count - the residency mask is published from the same decision that
     // places the routes, so asking it "was this a miss?" always answers no.
     [[nodiscard]] std::uint32_t last_uploaded() const noexcept;
+    // Bumped whenever a bank's resident set actually changes. The publisher uses it to prove a skipped
+    // publication was skipped for the right reason: "the table did not move" is a claim about the
+    // cache, so it is the cache that has to say so (A3).
+    [[nodiscard]] std::uint64_t layout_generation() const noexcept;
     // Where the images came from, and what the cold path cost to read. The warm-tier decision (1y.7
     // step 3f) needs both sides: an arena hit skips the read entirely, so "is a managed copy worth
     // its admission cost" is a ratio between read_us and the copy that filling it costs.
