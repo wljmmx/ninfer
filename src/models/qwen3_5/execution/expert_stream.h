@@ -126,6 +126,12 @@ public:
     };
     [[nodiscard]] const MissTally& miss_tally() const noexcept { return miss_tally_; }
 
+    // O1 step 2's predictor, one bit per bank: whether this bank's layer covered its routes on the
+    // previous step. Kept here because a bank sees exactly one layer per step, so "the same layer
+    // last step" is the only history a bank has.
+    void note_layer_covered(bool covered) noexcept { prev_covered_ = covered; }
+    [[nodiscard]] bool predicted_covered() const noexcept { return prev_covered_; }
+
     [[nodiscard]] ExpertCache::UploadSourceStats upload_source_stats() const {
         return cache_->upload_sources();
     }
@@ -325,6 +331,7 @@ private:
     MissTally miss_tally_{};
     std::uint32_t miss_last_reading_ = 0;
     std::uint64_t miss_prev_host_    = 0;
+    bool prev_covered_               = false;
     ops::CudaSwiGLUExperts experts_{};
 };
 

@@ -67,6 +67,18 @@ SplitTimeline& timeline() {
     return state;
 }
 
+// port (sm_89): what O1 step 2 would get and what it would cost. `predicted` is the whole step's
+// prediction (every layer's "this bank was covered last step"), `actual` is whether every layer
+// really was. A step that is predicted and not actual is a step a predicted skip would have to
+// replay, which is the cost side the per-layer hit rate hides.
+struct StepPrediction {
+    std::size_t layers   = 0;
+    bool predicted       = true;
+    bool actual          = true;
+    std::uint64_t missing = 0;
+    std::uint64_t steps = 0, candidates = 0, hits = 0, replays = 0, dropped = 0;
+};
+
 // One pair of events, reused. Two events per layer would be an allocation per layer; a pair reused
 // in order is enough because only one layer's kernel can be in flight at a time on this stream.
 struct GpuClock {
@@ -946,6 +958,50 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
             }
         }
         if (layer_timing) { timeline().missing += missing; }
+        // O1 step 2's decision numbers. The prediction the plan wants to act on is "the previous
+        // step was clean, so this one is too", and it is taken for a whole step: a layer that skips
+        // its read-back cannot hand its routes to the host half, so a wrong prediction costs a
+        // whole-step replay. That makes the per-layer rate (88.7% at 16 GiB, 3c930cb7) the wrong
+        // number to plan on - what decides the design is how often a STEP is predicted clean and is
+        // clean. Per bank, the prediction is this same layer's answer on the previous step.
+        if (std::getenv("NINFER_O1_PREDICT") != nullptr && hidden.ne[1] == 1) {
+            auto& stream = *moe.stream;
+            static StepPrediction tally;
+            // Banks appear in pipeline order, one call per layer per step, so a bank 0 after a
+            // non-empty step closes the previous one.
+            if (stream.bank_index() == 0 && tally.layers > 0) {
+                ++tally.steps;
+                if (tally.predicted) {
+                    ++tally.candidates;
+                    if (tally.actual) {
+                        ++tally.hits;
+                    } else {
+                        ++tally.replays;
+                        tally.dropped += tally.missing;
+                    }
+                }
+                if (tally.steps % 8 == 0) {
+                    std::fprintf(stderr,
+                                 "[o1p] steps=%llu cand=%llu hit=%llu replay=%llu dropped=%llu\n",
+                                 static_cast<unsigned long long>(tally.steps),
+                                 static_cast<unsigned long long>(tally.candidates),
+                                 static_cast<unsigned long long>(tally.hits),
+                                 static_cast<unsigned long long>(tally.replays),
+                                 static_cast<unsigned long long>(tally.dropped));
+                    std::fflush(stderr);
+                }
+                tally.layers  = 0;
+                tally.predicted = true;
+                tally.actual    = true;
+                tally.missing   = 0;
+            }
+            ++tally.layers;
+            const bool covered = missing == 0;
+            tally.predicted = tally.predicted && stream.predicted_covered();
+            tally.actual    = tally.actual && covered;
+            tally.missing += missing;
+            stream.note_layer_covered(covered);
+        }
         // port (sm_89): O1's counter. The Device half counted the routes its mask dropped; the host
         // just counted the same routes from the ids it fetched, and that host count is the only one
         // that can be checked - it comes from data, not from the mask the placement itself wrote.
