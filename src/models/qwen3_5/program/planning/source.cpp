@@ -242,10 +242,13 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
     if (from_tier) {
         std::fprintf(stderr,
                      "[kvt] candidate consume=%d move_state=%d split=%d move_history=%d "
-                     "transfers=%zu reused=%u\n",
+                     "transfers=%zu reused=%u | keep_source=%d pins=%u state_refs=%u "
+                     "state_source_pins=%d\n",
                      candidate.consume_source ? 1 : 0, candidate.move_state ? 1 : 0,
                      candidate.split_state ? 1 : 0, candidate.move_history ? 1 : 0,
-                     candidate.transfers.size(), candidate.reused_tokens);
+                     candidate.transfers.size(), candidate.reused_tokens, keep_source ? 1 : 0,
+                     checkpoints[handle->index].pins, state_references,
+                     state_store->source_pins(record.state));
         std::fflush(stderr);
     }
     return candidate;
