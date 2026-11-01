@@ -6,6 +6,7 @@
 
 #include "core/kv_checkpoint_blob.h"
 #include "core/kv_tier.h"
+#include "core/tier_checkpoint_payload.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -29,6 +30,9 @@ using ninfer::core::checkpoint_key;
 using ninfer::core::DiskKvTier;
 using ninfer::core::KvBlockKey;
 using ninfer::core::KvTierState;
+using ninfer::core::TierCheckpointPayload;
+using ninfer::core::encode_tier_checkpoint;
+using ninfer::core::decode_tier_checkpoint;
 
     std::vector<std::byte> kv(4096), state(1024);
     for (std::size_t i = 0; i < kv.size(); ++i) { kv[i] = static_cast<std::byte>((i * 7) & 0xFF); }
@@ -112,6 +116,57 @@ using ninfer::core::KvTierState;
         const auto empty_blob = encode_checkpoint(0, empty);
         const auto empty_view = decode_checkpoint(empty_blob);
         expect(empty_view.has_value() && empty_view->spans.empty(), "a checkpoint with no spans is still well formed");
+    }
+
+    // Q54: the tier payload carries both halves and the shape the state was cut from. A state image
+    // restored into a different geometry lands in slots that mean something else, so the shape has
+    // to travel with it and has to be checked against the bytes that actually arrived.
+    {
+        TierCheckpointPayload payload;
+        payload.frontier    = 803;
+        payload.page_count    = 2;
+        payload.page_bytes    = 64;
+        payload.kv.assign(128, std::byte{0x11});
+        payload.image_bytes   = 96;
+        payload.layers        = 12;
+        payload.conv_channels = 4;
+        payload.value_heads   = 8;
+        payload.value_head_dim = 128;
+        payload.key_head_dim   = 128;
+        payload.hidden         = 2048;
+        payload.has_dflash_local = true;
+        payload.state.assign(96, std::byte{0x22});
+
+        const auto tier_blob = encode_tier_checkpoint(payload);
+        expect(!tier_blob.empty(), "a tier payload encodes");
+        const auto back = decode_tier_checkpoint(tier_blob);
+        expect(back.has_value(), "a tier payload decodes");
+        if (back) {
+            expect(back->frontier == 803 && back->page_count == 2 && back->page_bytes == 64,
+                   "frontier and page geometry survive");
+            expect(back->kv == payload.kv, "the KV run comes back byte for byte");
+            expect(back->state == payload.state, "the state image comes back byte for byte");
+            expect(back->layers == 12 && back->hidden == 2048 && back->has_dflash_local,
+                   "the state shape survives");
+        }
+
+        // A header that claims more bytes than arrived must be refused: the alternative is a restore
+        // whose last layer is read from whatever the slot held before.
+        {
+            auto lying = payload;
+            lying.image_bytes = 95;
+            expect(!decode_tier_checkpoint(encode_tier_checkpoint(lying)).has_value(),
+                   "a state header that disagrees with its bytes is refused");
+        }
+        // KV without state is not a checkpoint: the GDN layers would resume from an empty state.
+        {
+            const CheckpointSpan kv_only{CheckpointSpanTag::KvPages,
+                                         std::span<const std::byte>(payload.kv), 64, 2};
+            const auto kv_only_blob =
+                encode_checkpoint(803, std::span<const CheckpointSpan>(&kv_only, 1));
+            expect(!decode_tier_checkpoint(kv_only_blob).has_value(),
+                   "KV without its state is refused");
+        }
     }
 
     // Q54: the third tier's own round trip, on the backend that needs no service. This is the
