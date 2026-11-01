@@ -232,6 +232,8 @@ private:
     // publication did not land, and computing on it would be a silent wrong token.
     static constexpr std::uint64_t kTableUnknown = ~std::uint64_t{0};
     std::uint64_t table_generation_ = 0;
+    // port (sm_89): D1 read-ahead counter (see the call site).
+    std::uint64_t prefetch_calls_ = 0;
     ExpertBankLayout entry_{};
     // port (sm_89): the pool holds every layer at once, so this bank's window is fixed and no
     // per-step routing decision - and therefore no host round trip - is needed.

@@ -1372,6 +1372,34 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     // it is written from the same decision that places the step's routes.
     last_cost_.uploaded = cache_->last_uploaded();
     static_probe(bank_, tokens, false, probe_absent, probe_unready, probe_moved, probe_ins, last_cost_.uploaded);
+    // port (sm_89): D1 read-ahead, retried on the arena F1 fixed. One expert a layer - the hottest the
+    // pool does not hold - issued after this layer's uploads, so the tier it fills is what the next
+    // layer's uploader reads. claim() already skips slots a copy is still reading.
+    static const bool prefetch = std::getenv("NINFER_PREFETCH") != nullptr;
+    if (prefetch && host_ != nullptr) {
+        float best_score         = 0.0F;
+        std::int32_t best_expert = -1;
+        for (std::uint32_t expert = 0; expert < count_; ++expert) {
+            if (hot_score_[expert] <= best_score) { continue; }
+            if (cache_->expert_slot(bank_, expert)) { continue; }
+            best_score  = hot_score_[expert];
+            best_expert = static_cast<std::int32_t>(expert);
+        }
+        if (best_expert >= 0) {
+            host_->ensure(ExpertBankId{bank_}, std::span<const std::int32_t>(&best_expert, 1), nullptr);
+            ++prefetch_calls_;
+            if (prefetch_calls_ % 40 == 0) {
+                const auto& st = host_->stats();
+                const auto total = st.hits + st.misses;
+                std::fprintf(stderr, "[pf] calls=%llu hit=%.1f%% evict=%llu\n",
+                             (unsigned long long)prefetch_calls_,
+                             total ? 100.0 * (double)st.hits / (double)total : 0.0,
+                             (unsigned long long)st.evictions);
+                std::fflush(stderr);
+            }
+        }
+    }
+
     // port (sm_89): A3b, on the per-bank generation this time. A layer is about to hand these two
     // tables to kernels that read them as addresses; if what this bank's Device tables hold is not
     // what this bank's set now is, a publish did not land and the kernels would compute with another
