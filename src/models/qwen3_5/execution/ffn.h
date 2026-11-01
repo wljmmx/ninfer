@@ -9,6 +9,18 @@ namespace ninfer::models::qwen3_5::execution {
                                               std::int32_t last, bool mtp = false);
 void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual,
          const ops::SparseMoeHints& hints, WorkspaceArena& workspace, DeviceExecutionView execution,
-         bool mtp = false);
+         bool mtp = false,
+         // port (sm_89): Q68b probe. The residual stream as it stood at the end of the previous
+         // layer, or null. This layer's router applied to it is a *prediction* of this layer's
+         // routes: z_(L-1) is what x_L would be if this block's attention added nothing. Diagnostic
+         // only - the routes actually used are still computed from `hidden`.
+         const Tensor* predictor_input = nullptr);
+
+// Probe-only plumbing (NINFER_LAYER_PROBE=2, decode only): the layer loop records the residual
+// stream after each layer and hands it back as the next layer's predictor input. Both are no-ops
+// unless the switch is on, so a normal run allocates and copies nothing.
+[[nodiscard]] bool router_probe_enabled();
+void router_probe_save(const Tensor& residual);
+[[nodiscard]] const Tensor* router_probe_input(Device device);
 
 } // namespace ninfer::models::qwen3_5::execution

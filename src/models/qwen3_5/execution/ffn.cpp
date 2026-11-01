@@ -33,6 +33,22 @@
 namespace ninfer::models::qwen3_5::execution {
 namespace {
 
+// port (sm_89): Q68b's crossing point. One small device buffer holds the residual stream as it
+// stood at the end of the previous layer - the only thing that has to move between layers for the
+// predictor, since a layer already owns the router it uses to score it. Allocated once, only when
+// the probe switch is on, and never touched by a normal run.
+struct RouterProbeBuffer {
+    void* data        = nullptr;
+    std::size_t bytes = 0;
+    std::int32_t hidden = 0;
+    bool valid        = false;
+};
+
+RouterProbeBuffer& router_probe_buffer() {
+    static RouterProbeBuffer buffer;
+    return buffer;
+}
+
 // port (sm_89): where a split token goes, node by node, on both sides of the PCIe lane.
 //
 // The host nodes are wall clock. The Device half cannot be: its kernel is enqueued and returns at
@@ -845,7 +861,8 @@ private:
 } // namespace
 
 void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& residual,
-                  WorkspaceArena& workspace, DeviceExecutionView execution) {
+                  WorkspaceArena& workspace, DeviceExecutionView execution,
+                  const Tensor* predictor_input) {
     const bool layer_timing = std::getenv("NINFER_SPLIT_TIMING") != nullptr;
     // port (sm_89): the 19.4 GiB pool latches cudaErrorInvalidValue somewhere before this layer's
     // routing launch, and the routing check is only the first one that asks. This asks earlier: on
@@ -885,6 +902,46 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
                                 arena, execution);
     } catch (const std::exception& error) {
         throw std::invalid_argument(std::string("expert stream route: ") + error.what());
+    }
+    // port (sm_89): Q68b. What would this layer's routes be if its router saw the *previous* layer's
+    // residual stream? Predicted = top-K(control * z_(L-1)), actual = the routes just computed. This
+    // is the measurement the old probe could not make: copying expert ids across layers is not a
+    // prediction (2-3%, i.e. the random level), while applying the next router to the residual stream
+    // is. Diagnostic only - the real routes above are untouched and this never runs in capture.
+    if (predictor_input != nullptr && columns == 1 && router_probe_enabled()) {
+        auto guess_ids    = workspace.alloc(DType::I32, {routed.top_k, 1});
+        auto guess_coeffs = workspace.alloc(DType::FP32, {routed.top_k, 1});
+        auto guess_shared = workspace.alloc(DType::FP32, {1});
+        auto guess_scratch =
+            workspace.alloc_bytes(stream_route_bytes(moe, 1, 1));
+        MemoryArena guess_arena(
+            MemorySpan{guess_scratch.data, guess_scratch.bytes, execution.device()});
+        ops::ExpertRoutes guessed{guess_ids, guess_coeffs};
+        ops::topk_softmax_route(*predictor_input, route_profile, moe.control, guessed, guess_shared,
+                                guess_arena, execution);
+        // Two 32-byte read-backs and a sync per layer: acceptable for a probe, which is exactly why
+        // it is not the mechanism.
+        std::vector<std::int32_t> actual(routed.top_k), guess(routed.top_k);
+        const std::size_t bytes = static_cast<std::size_t>(routed.top_k) * sizeof(std::int32_t);
+        (void)cudaMemcpyAsync(actual.data(), ids.data, bytes, cudaMemcpyDeviceToHost, execution.stream);
+        (void)cudaMemcpyAsync(guess.data(), guess_ids.data, bytes, cudaMemcpyDeviceToHost,
+                              execution.stream);
+        (void)cudaStreamSynchronize(execution.stream);
+        std::size_t hit = 0;
+        for (const auto id : actual) {
+            for (const auto other : guess) {
+                if (id == other) { ++hit; break; }
+            }
+        }
+        static double recall_sum = 0.0;
+        static std::uint64_t probes = 0;
+        recall_sum += static_cast<double>(hit) / static_cast<double>(routed.top_k);
+        if (++probes % 40 == 0) {
+            std::fprintf(stderr, "[probe2] recall_pred=%.3f layers=%llu\n", recall_sum / 40.0,
+                         static_cast<unsigned long long>(probes));
+            std::fflush(stderr);
+            recall_sum = 0.0;
+        }
     }
     // port (sm_89): one read-back per layer. The residency decision needs the 32 route ids and the
     // CPU half needs the layer inputs; they come down in the same batch with one stream synchronise.
@@ -1627,7 +1684,7 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
 
 void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual,
          const ops::SparseMoeHints& hints, WorkspaceArena& workspace, DeviceExecutionView execution,
-         bool mtp) {
+         bool mtp, const Tensor* predictor_input) {
     const auto stream  = execution.stream;
     auto scope         = workspace.scope();
     const auto columns = hidden.ne[1];
@@ -1644,7 +1701,7 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
         // through that scale so the perplexity cost can be measured before any kernel changes.
         ops::act_quant_a8_roundtrip_bf16(hidden.data, hidden.ne[0], columns, stream);
         if (moe->stream) {
-            streamed_ffn(hidden, *moe, residual, workspace, execution);
+            streamed_ffn(hidden, *moe, residual, workspace, execution, predictor_input);
             return;
         }
         const auto storage =
@@ -1689,6 +1746,46 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
         return;
     }
     ops::linear_add(activation, down, residual, p.down.policy, workspace, stream);
+}
+
+// port (sm_89): Q68b probe plumbing. The switch is read once; the buffer is allocated on first use
+// and only when the probe is on, so a normal run pays a single branch here and nothing else.
+bool router_probe_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_LAYER_PROBE");
+        return value != nullptr && value[0] == '2';
+    }();
+    return enabled;
+}
+
+void router_probe_save(const Tensor& residual) {
+    if (!router_probe_enabled() || residual.ne[1] != 1 || residual.data == nullptr) { return; }
+    auto& buffer      = router_probe_buffer();
+    const std::size_t bytes = static_cast<std::size_t>(residual.ne[0]) * sizeof(std::uint16_t);
+    if (buffer.data == nullptr || buffer.bytes < bytes) {
+        if (buffer.data != nullptr) { (void)cudaFree(buffer.data); }
+        if (cudaMalloc(&buffer.data, bytes) != cudaSuccess) {
+            buffer.data = nullptr;
+            return;
+        }
+        buffer.bytes = bytes;
+    }
+    buffer.hidden = residual.ne[0];
+    buffer.valid  = false;
+    // A probe may stall: it is decode-only, it runs between layers, and the alternative (tracking the
+    // layer's stream through this call) is plumbing the mechanism would not need.
+    (void)cudaMemcpy(buffer.data, residual.data, bytes, cudaMemcpyDeviceToDevice);
+    (void)cudaDeviceSynchronize();
+    buffer.valid = true;
+}
+
+const Tensor* router_probe_input(Device device) {
+    if (!router_probe_enabled()) { return nullptr; }
+    auto& buffer = router_probe_buffer();
+    if (!buffer.valid || buffer.data == nullptr) { return nullptr; }
+    static thread_local Tensor view;
+    view = Tensor{buffer.data, device, DType::BF16, {buffer.hidden, 1}};
+    return &view;
 }
 
 } // namespace ninfer::models::qwen3_5::execution

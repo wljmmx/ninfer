@@ -1232,7 +1232,12 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase,
     ops::rmsnorm(x, weights.post_attention_norm, config_.rms_norm_eps, true, h, ctx_.stream);
     // [P1 probe] optional per-token int8 activation round-trip (NINFER_ACT_A8)
     ops::act_quant_a8_roundtrip_bf16(h.data, h.ne[0], h.ne[1], ctx_.stream);
-    ffn(h, weights.ffn, x, hints, work_, ctx_.execution_view());
+    ffn(h, weights.ffn, x, hints, work_, ctx_.execution_view(), false,
+        // Q68b probe: score this layer's router against the residual stream the previous layer left
+        // behind, then record this layer's own for the next one. Both calls are no-ops unless
+        // NINFER_LAYER_PROBE=2.
+        router_probe_input(ctx_.execution_view().device()));
+    router_probe_save(x);
 }
 
 template <class Tap>
