@@ -520,6 +520,12 @@ public:
     }
     [[nodiscard]] std::uint64_t slot_bytes() const noexcept { return slot_bytes_; }
     [[nodiscard]] std::uint32_t slot_capacity() const noexcept { return slot_capacity_; }
+    // port (sm_89): the tier as the Device sees it, or null when the driver would not map the arena
+    // (pageable fallback). This is Q20's second addressing leg: a route the pool cannot hold gets an
+    // address here instead of an upload, so the layer itself needs no host round trip. Callers must
+    // treat the bytes at an offset as valid only for a slot `claim()` currently names - the arena
+    // moves slots, the address space does not.
+    [[nodiscard]] const std::byte* arena_device_base() const noexcept { return arena_device_; }
     // The two pools inside the arena (see claim()).
     [[nodiscard]] std::uint32_t routed_capacity() const noexcept { return routed_capacity_; }
     [[nodiscard]] std::uint32_t prefetch_slots() const noexcept { return prefetch_slots_; }
@@ -577,6 +583,32 @@ private:
             // 0.43 ms per expert against 0.041 ms on warm pages. Pageable reservation stays as the
             // fallback, because a locked allocation can fail on a busy box.
             void* locked = nullptr;
+            // port (sm_89): mapped as well as locked. Q20 needs the Device to address this tier
+            // directly - that is what makes a route the pool cannot hold resolvable inside the layer
+            // without a host upload, and therefore what `capt_free` is a measurement of. Mapping does
+            // not change the upload path: `arena_image()` still hands the host address to the
+            // uploader, and the Device address is only read by callers that ask for it.
+            if (cudaHostAlloc(&locked, arena_bytes_, cudaHostAllocMapped) == cudaSuccess) {
+                arena_  = static_cast<std::byte*>(locked);
+                pinned_ = true;
+                void* device = nullptr;
+                if (cudaHostGetDevicePointer(&device, locked, 0) == cudaSuccess) {
+                    arena_device_ = static_cast<std::byte*>(device);
+                }
+                // One line, once: whether the Device can address this tier at all is the premise
+                // Q20 rests on, and a silent fallback to "not mapped" would turn the second
+                // addressing leg into a host round trip that no counter would blame.
+                cudaPointerAttributes attributes{};
+                const auto known = arena_device_ != nullptr &&
+                                   cudaPointerGetAttributes(&attributes, arena_device_) == cudaSuccess;
+                std::fprintf(stderr,
+                             "[host] arena mapped bytes=%llu host=%p dev=%p device_accessible=%d\n",
+                             static_cast<unsigned long long>(arena_bytes_),
+                             static_cast<const void*>(arena_), static_cast<const void*>(arena_device_),
+                             known ? 1 : 0);
+                std::fflush(stderr);
+                return arena_;
+            }
             if (cudaHostAlloc(&locked, arena_bytes_, cudaHostAllocDefault) == cudaSuccess) {
                 arena_  = static_cast<std::byte*>(locked);
                 pinned_ = true;
@@ -716,6 +748,9 @@ private:
     std::uint64_t slot_bytes_    = 0;
     std::uint64_t arena_bytes_   = 0;
     std::byte* arena_            = nullptr;
+    // Device-visible alias of `arena_`, same bytes (cudaHostGetDevicePointer). Null on the pageable
+    // fallback; see arena_device_base().
+    std::byte* arena_device_     = nullptr;
     bool pinned_                 = false;
     std::uint32_t slot_capacity_ = 0;
     // Slots [0, routed_capacity_) belong to the layers, [routed_capacity_, slot_capacity_) to the
