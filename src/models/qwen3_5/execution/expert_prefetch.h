@@ -56,11 +56,14 @@ public:
     void note_used(std::size_t bytes);
     // D3: the step boundary the deadlines are measured against.
     void advance(std::uint64_t now);
+    // The controller's decision, pushed down: the queue measures, it does not judge.
+    void set_enabled(bool value);
+    [[nodiscard]] bool enabled() const;
+    [[nodiscard]] double usefulness() const;
 
     [[nodiscard]] Stats stats() const;
     [[nodiscard]] bool gate_open() const;
     [[nodiscard]] int users() const;
-
 private:
     ExpertPrefetchQueue()  = default;
     ~ExpertPrefetchQueue() = default;

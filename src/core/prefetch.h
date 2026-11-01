@@ -98,7 +98,7 @@ public:
             ++stats_.dropped_deadline;
             return false;
         }
-        if (!gate_open_) {
+        if (!enabled_) {
             ++stats_.dropped_gate;
             return false;
         }
@@ -129,8 +129,10 @@ public:
         stats_.bytes_used += bytes;
     }
 
-    // Advances the window: drops jobs whose deadline has passed, recomputes the gate, resets the
-    // byte budget. `now` is the logical step the engine is about to run.
+    // Advances the window: drops jobs whose deadline has passed and resets the byte budget. `now` is
+    // the logical step the engine is about to run. It deliberately does NOT decide whether the queue
+    // should be on - that is the controller's call, and a second decision point here is how a gate
+    // ends up fighting the policy that is supposed to own it.
     void advance(std::uint64_t now) {
         std::lock_guard lock(mutex_);
         jobs_.erase(std::remove_if(jobs_.begin(), jobs_.end(),
@@ -143,14 +145,6 @@ public:
                                    }),
                     jobs_.end());
         window_bytes_ = 0;
-        const auto used = stats_.usefulness();
-        if (stats_.enqueued >= 16) {  // too few samples to judge
-            if (used < min_usefulness_) {
-                gate_open_ = false;
-            } else if (used >= min_usefulness_ * 2.0) {
-                gate_open_ = true;
-            }
-        }
     }
 
     [[nodiscard]] PrefetchStats stats() const {
@@ -170,9 +164,17 @@ public:
         return max_pending_;
     }
 
-    [[nodiscard]] bool gate_open() const {
+    // The gate is no longer decided here (2026-11-01). A threshold on usefulness is a number that
+    // only holds for the machine it was measured on, and the runtime already has one place that
+    // decides what to enable - PolicyController. This queue therefore measures and obeys: it counts
+    // what it was asked for and what was used, and takes its on/off from the controller.
+    void set_enabled(bool value) {
         std::lock_guard lock(mutex_);
-        return gate_open_;
+        enabled_ = value;
+    }
+    [[nodiscard]] bool enabled() const {
+        std::lock_guard lock(mutex_);
+        return enabled_;
     }
 
     void set_budget(std::size_t bytes) {
@@ -211,8 +213,8 @@ private:
     std::size_t window_bytes_        = 0;
     std::size_t max_pending_         = 8;
     std::size_t running_             = 0; // 0 or 1: the worker's job, if it is carrying one
-    double min_usefulness_           = 0.10;
-    bool gate_open_                  = true;
+    double min_usefulness_           = 0.10; // kept for reporting only; nothing acts on it
+    bool enabled_                    = true; // the controller's decision, not this queue's
     bool stopping_                   = false;
     PrefetchStats stats_{};
 };

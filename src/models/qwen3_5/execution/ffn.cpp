@@ -1,6 +1,7 @@
 #include "models/qwen3_5/execution/ffn.h"
 
 #include "models/qwen3_5/execution/expert_stream.h"
+#include "models/qwen3_5/execution/expert_prefetch.h"
 #include "models/qwen3_5/execution/expert_path_control.h"
 #include "models/qwen3_5/execution/host_expert_residency.h"
 #include "models/qwen3_5/execution/step_gate.h"
@@ -1280,10 +1281,11 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
                 std::fflush(stderr);
             }
         }
-        // The controller reads the same nodes the panel shows, one layer at a time. It is in shadow
-        // mode (no Device branch in the kernels yet): it prints what it would take and the numbers
-        // behind it, and changes nothing.
-        if (layer_timing) {
+        // The controller reads the same nodes the panel shows, one layer at a time. It used to run
+        // only under NINFER_SPLIT_TIMING, which made every actuator conditional on a debug switch;
+        // it now runs every layer, and only the debug printing below stays behind the switch -
+        // a policy that only exists while someone is watching is not a policy.
+        {
             auto& control = policy_controller();
             if (control.layers == 0) {
                 control.probe_link(static_cast<std::uint64_t>(2U << 20));
@@ -1306,7 +1308,7 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
             // O1's expected hit rate: how often a covered layer follows a covered one. Printed with
             // the rest so the speculative design is judged by a number before it is built.
             static std::uint64_t pred_reports = 0;
-            if (++pred_reports % 40 == 0) {
+            if (layer_timing && ++pred_reports % 40 == 0) {
                 std::fprintf(stderr, "[pred] covered-after-covered=%.1f%% trials=%llu\n",
                              100.0 * moe.stream->covered_predictor_rate(),
                              static_cast<unsigned long long>(pred_reports));
@@ -1323,7 +1325,7 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
                 }
                 const auto total = sources.arena_experts + sources.file_experts;
                 static std::uint64_t last_probes = 0;
-                if (sources.arena_probes != last_probes) {
+                if (layer_timing && sources.arena_probes != last_probes) {
                     std::fprintf(stderr, "[warm] probes=%llu file_experts=%llu read_us=%.0f\n",
                                  static_cast<unsigned long long>(sources.arena_probes),
                                  static_cast<unsigned long long>(sources.file_experts),
@@ -1337,8 +1339,44 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
                     control.signals.mirror_hit_ratio += (ratio - control.signals.mirror_hit_ratio) / 16.0;
                 }
             }
-            control.step(false, false, false, false);
-            control.report();
+            // The guardrail's input: every actuator is judged by throughput, and until now nothing fed
+            // it (`tps=0.0` in every [ctl] line), which made "revert if the next window is 3% slower"
+            // unreachable. Timed here from the layer interval, not from the request loop, so it works
+            // without NINFER_SPLIT_TIMING and covers prefill as well as decode.
+            {
+                static std::chrono::steady_clock::time_point last_tick{};
+                static double ewma_layer_ms = 0.0;
+                const auto tick             = std::chrono::steady_clock::now();
+                if (last_tick.time_since_epoch().count() != 0) {
+                    const double ms =
+                        std::chrono::duration<double, std::milli>(tick - last_tick).count();
+                    if (ms > 0.0) {
+                        ewma_layer_ms = ewma_layer_ms == 0.0 ? ms : ewma_layer_ms + (ms - ewma_layer_ms) / 16.0;
+                        // Forty layers make one token on this model; the estimate is the decoder's own
+                        // clock, not a wall-clock figure taken from outside.
+                        control.observe_decode(1000.0 / (ewma_layer_ms * 40.0));
+                    }
+                }
+                last_tick = tick;
+            }
+            // The read-ahead's side of the same controller (Q70). The queue measures; this decides,
+            // and the decision is pushed back down after step(), so there is exactly one place that
+            // says whether the read-ahead runs. Usefulness is asked-for bytes against used bytes.
+            {
+                auto& queue = ExpertPrefetchQueue::instance();
+                const auto pf = queue.stats();
+                if (pf.queue.bytes_requested > 0) {
+                    control.signals.prefetch_usefulness = pf.queue.usefulness();
+                }
+            }
+            // `wired` is "there is a queue to control": without NINFER_PREFETCH no residency attaches
+            // and the actuator stays in shadow, which keeps [ctl] honest about what is real.
+            const bool pf_attached = ExpertPrefetchQueue::instance().users() > 0;
+            control.step(false, pf_attached, false, false);
+            ExpertPrefetchQueue::instance().set_enabled(control.prefetch.enabled);
+            // Printing stays behind the timing switch (4096 lines per 1024 tokens otherwise); the
+            // decision above does not.
+            if (layer_timing) { control.report(); }
         }
         if (all_resident) {
             // Same call as the fully resident tail: empty subset, BF16 accumulation into the

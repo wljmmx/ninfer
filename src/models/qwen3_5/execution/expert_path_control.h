@@ -149,7 +149,18 @@ public:
         if (signals.read_us_per_expert <= 0.0) { return false; }
         return device_cost_us() < host_cost_us() * 0.8;
     }
-    [[nodiscard]] bool want_prefetch() const { return signals.prefetch_usefulness >= 0.10; }
+    // Prefetch: the queue no longer decides this for itself (it used to close its own gate at a
+    // written 10%). Two things take its place, and neither is a constant:
+    //   1. exploration while nothing has been measured - a rule cannot judge a mechanism that has
+    //      never run, and the revert loop below bounds what exploring costs;
+    //   2. once bytes have been measured, "did anything the read-ahead fetched ever get used".
+    //      Whether that is *worth* the I/O is not decided by a ratio here: drive() records the
+    //      throughput the switch was flipped at and parks the actuator if the next window is 3%
+    //      slower, which is the only measurement specific to this machine.
+    [[nodiscard]] bool want_prefetch() const {
+        if (signals.prefetch_usefulness < 0.0) { return true; } // nothing measured yet: explore
+        return signals.prefetch_usefulness > 0.0;
+    }
     [[nodiscard]] bool want_graph() const {
         return signals.capturable_pct >= 90.0 && signals.static_pct >= 95.0;
     }
@@ -168,7 +179,7 @@ public:
     void step(bool device_path_ready, bool prefetch_wired, bool graph_wired, bool freeze_wired) {
         ++layers;
         drive(expert_path, want_device_path(), device_path_ready, "cost model");
-        drive(prefetch, want_prefetch(), prefetch_wired, "usefulness>=10%");
+        drive(prefetch, want_prefetch(), prefetch_wired, "usefulness measured");
         drive(graph, want_graph(), graph_wired, "capturable>=90% && static>=95%");
         drive(warm_mirror, want_warm_mirror(), true, "hit_ratio*cold>fill");
         drive(freeze_set, want_freeze(), freeze_wired, "no_miss>=99%");

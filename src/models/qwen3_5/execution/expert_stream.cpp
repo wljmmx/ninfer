@@ -1477,7 +1477,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 const auto queued = ExpertPrefetchQueue::instance().stats();
                 std::fprintf(stderr,
                              "[pf] experts=%llu recent=%llu batches=%llu hit=%.1f%% evict=%llu | q enq=%llu "
-                             "drop(budget=%llu gate=%llu deadline=%llu backlog=%llu stopped=%llu) "
+                             "drop(budget=%llu off=%llu deadline=%llu backlog=%llu stopped=%llu) "
                              "ran=%llu expired=%llu pending=%llu/%llu useful=%.2f\n",
                              (unsigned long long)prefetch_calls_,
                              (unsigned long long)prefetch_recent_,

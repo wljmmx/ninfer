@@ -156,8 +156,21 @@ bool ExpertPrefetchQueue::gate_open() const {
         std::lock_guard lock(mutex_);
         worker = worker_;
     }
-    return worker ? worker->gate_open() : false;
+    return worker ? worker->enabled() : false;
 }
+
+void ExpertPrefetchQueue::set_enabled(bool value) {
+    std::shared_ptr<core::Prefetcher> worker;
+    {
+        std::lock_guard lock(mutex_);
+        worker = worker_;
+    }
+    if (worker) { worker->set_enabled(value); }
+}
+
+bool ExpertPrefetchQueue::enabled() const { return gate_open(); }
+
+double ExpertPrefetchQueue::usefulness() const { return stats().queue.usefulness(); }
 
 int ExpertPrefetchQueue::users() const {
     std::lock_guard lock(mutex_);

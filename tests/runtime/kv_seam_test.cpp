@@ -65,18 +65,23 @@ int main() {
             prefetch.advance(2);
             prefetch.note_used(32);
         }
-        expect(prefetch.gate_open(), "a useful prefetcher keeps its gate open");
+        expect(prefetch.enabled(), "a prefetcher runs until something turns it off");
 
-        // The gate assertion below must depend on usefulness alone, so this queue is given room to
-        // queue: with the default cap of 8 a tight loop can be refused by backpressure before it
-        // has offered the 16 jobs the gate needs to judge.
+        // The queue measures, it does not judge (2026-11-01): a written usefulness threshold here
+        // was a second decision point next to PolicyController, and two decision points disagree.
         ninfer::core::Prefetcher useless(1024, 0.10, /*max_pending=*/256);
         for (int i = 0; i < 40; ++i) {
             useless.enqueue(job, 32, 100, 0);
             useless.advance(1);
         }
-        expect(!useless.gate_open(), "a prefetcher whose bytes are never used closes its gate");
-        expect(!useless.enqueue(job, 32, 100, 1), "a closed gate refuses new jobs");
+        expect(useless.stats().usefulness() == 0.0,
+               "a prefetcher whose bytes are never used reports zero usefulness");
+        expect(useless.enabled(), "and stays enabled: the decision is the controller's");
+        useless.set_enabled(false);
+        expect(!useless.enqueue(job, 32, 100, 1), "a queue turned off refuses new jobs");
+        expect(useless.stats().dropped_gate == 1, "the refusal is counted as a gate drop");
+        useless.set_enabled(true);
+        expect(useless.enqueue(job, 32, 100, 1), "and takes work again when it is turned back on");
     }
 
     {
