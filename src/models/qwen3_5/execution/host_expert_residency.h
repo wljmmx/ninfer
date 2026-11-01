@@ -402,6 +402,12 @@ public:
     const std::byte* arena_image(std::uint32_t bank, std::uint32_t expert,
                                  std::uint64_t& bytes) const override {
         bytes = 0;
+        // port (sm_89): F1 bisect. With NINFER_ARENA_NO_READ the tier is still filled and its offsets
+        // rewritten, but the uploader is told nothing is there and reads the artifact as before.
+        // Crash gone => the fault is on the read side (the pointer, its lifetime, or when the copy
+        // lands); crash stays => the fill side. Two runs instead of another guess.
+        static const bool no_read = std::getenv("NINFER_ARENA_NO_READ") != nullptr;
+        if (no_read) { return nullptr; }
         if (bank >= state_.size()) { return nullptr; }
         if (!managed_even_in_place() && bank < direct_.size() && direct_[bank]) {
             return nullptr;
