@@ -16,6 +16,7 @@
 #include "models/qwen3_5/program/storage/host_kv_store.h"
 #include "models/qwen3_5/program/storage/kv_address_space.h"
 #include "models/qwen3_5/program/storage/state_store.h"
+#include "models/qwen3_5/program/storage/tier_source.h"
 #include "models/qwen3_5/program/prefix_identity.h"
 #include "core/host_context_arena.h"
 #include "models/qwen3_5/execution/text.h"
@@ -279,12 +280,12 @@ public:
     inspect_source(const RequestBasePlan&, std::optional<CheckpointHandle>, bool = false,
                    std::span<const CheckpointHandle> = {},
                    std::span<const CheckpointHandle> = {});
-    // port (sm_89): Q54. Looks the prefix up in the third tier and imports it when found. Non-const
-    // because a successful import publishes a checkpoint record, which is the same state a capture
-    // would have produced. Returns nullopt on a miss or a refusal; `error` carries the reason a
-    // refusal gives, because "the tier had it but the import declined" must not look like a miss.
-    [[nodiscard]] std::optional<CheckpointHandle>
-    tier_try_load(std::span<const TokenId> prefix, std::string* error);
+    // port (sm_89): Q54. Looks the prompt up in the third tier and, on a hit, imports the run as an
+    // OWNERSHIP TRANSFER rather than a checkpoint record: the bytes arrive, nothing in this process
+    // owns them, and the request that asked for them becomes the owner. Returns nullopt on a miss or
+    // a refusal; `error` carries the reason a refusal gives, because "the tier had it but the import
+    // declined" must not look like a miss.
+    [[nodiscard]] std::optional<TierSource> tier_open(const RequestBasePlan& base, std::string* error);
     [[nodiscard]] PrefixShortlistKey checkpoint_key(CheckpointHandle, std::uint32_t frontier) const;
     [[nodiscard]] runtime::ContextResourceUsage
         checkpoint_footprint(std::span<const CheckpointHandle>) const;
@@ -309,6 +310,27 @@ public:
     void verify_import_round_trip(CheckpointHandle handle);
     // Diagnostic: force the failure path and check that nothing was left allocated.
     void verify_import_rollback(CheckpointHandle handle);
+    // Q54: the import in its own form. Everything an import brings in -- the KV run as a brand-new
+    // inactive address, the state image as a published Host replica, the frontier -- and nothing
+    // else. This is the half that used to be welded to `reserve_checkpoint()`; splitting it here is
+    // what lets a third-tier restore enter binding without pretending to be a record first.
+    //
+    // State first, then pages, then the address: the state import validates the fingerprint and can
+    // refuse cheaply, and doing it before any page is allocated means a mismatched payload costs
+    // nothing. On failure nothing is left allocated.
+    [[nodiscard]] std::optional<TierSource> import_checkpoint_source(
+        const CheckpointExport& kv, const std::vector<std::string>& state_shards,
+        const ninfer::core::fingerprint::CheckpointFingerprint& want, std::string& error,
+        bool pin_pages = true);
+    // The other half: take a source that is already in hand and make it a checkpoint record. Only
+    // the slot pool can fail here, and it fails after both halves exist, so the unwind is one call.
+    [[nodiscard]] std::optional<CheckpointHandle> adopt_checkpoint_source(
+        TierSource&& source, std::shared_ptr<const PreparedCaptureBacking> identity,
+        const PrefixShortlistKey* key, std::string& error);
+    // Gives an import back: the same release an aborted binding does, for the caller that never got
+    // as far as a transaction. Safe to call twice and safe on a source that was already handed on --
+    // each field is cleared as it is released.
+    void discard_tier_source(TierSource& source) noexcept;
     [[nodiscard]] std::optional<CheckpointHandle> import_checkpoint(
         const CheckpointExport& kv, const std::vector<std::string>& state_shards,
         const ninfer::core::fingerprint::CheckpointFingerprint& want, std::string& error,
@@ -324,6 +346,11 @@ public:
         std::shared_ptr<const PreparedCaptureBacking> identity = nullptr,
         const PrefixShortlistKey* key = nullptr, std::string* error = nullptr,
         bool pin_pages = true);
+    // The same fingerprinting and shard-splitting, stopping at the source. The third tier has bytes
+    // and no identity, which is exactly the case this stops for.
+    [[nodiscard]] std::optional<TierSource> import_checkpoint_source_current_layout(
+        const CheckpointExport& kv, const std::vector<std::string>& state_shards,
+        std::string* error = nullptr, bool pin_pages = true);
     [[nodiscard]] std::optional<StateImageHandle> import_state(
         const std::vector<std::string>& shards,
         const ninfer::core::fingerprint::CheckpointFingerprint& want, std::string& error);
@@ -507,6 +534,11 @@ public:
         std::uint32_t lane        = 0;
         std::uint64_t epoch       = 0;
         std::optional<CheckpointHandle> source;
+        // Q54: the third tier's half of a binding. Not a checkpoint and not `source`: it has no
+        // record, no identity and no pins, and the request that adopts it owns it outright. Kept
+        // beside `source` rather than replacing it so the record paths keep reading one field and
+        // the tier path reads the other -- a shared type was tried and produced contradictions.
+        std::optional<TierSource> tier;
         std::vector<std::pair<CheckpointHandle, runtime::CheckpointRole>> capture_points;
         std::vector<CheckpointHandle> carried_points;
         std::vector<CheckpointHandle> carried_pins;

@@ -366,7 +366,9 @@ void ProgramImpl::publish_capture(ContextTransaction& tx) {
         if (const auto kv = export_checkpoint(handle)) {
             if (const auto state_export = export_state(handle)) {
                 if (tier_store_export(*kv_tier, key, *kv, *state_export)) {
-                    std::fprintf(stderr, "[kvt] stored frontier=%u pages=%u bytes=%zu\n",
+                    std::fprintf(stderr,
+                                 "[kvt] stored key=%016llx/%u frontier=%u pages=%u bytes=%zu\n",
+                                 static_cast<unsigned long long>(key.hash), key.tokens,
                                  kv->frontier, kv->page_count, kv->kv_bytes.size());
                     std::fflush(stderr);
                 }

@@ -692,29 +692,88 @@ bool ProgramImpl::tier_selftest() {
     return ok;
 }
 
-std::optional<CheckpointHandle> ProgramImpl::tier_try_load(std::span<const TokenId> prefix,
-                                                          std::string* error) {
-    if (kv_tier == nullptr || prefix.empty()) { return std::nullopt; }
-    const auto key = core::KvBlockKey{core::kv_hash_tokens(prefix),
-                                      static_cast<std::uint32_t>(prefix.size())};
+std::optional<TierSource> ProgramImpl::tier_open(const RequestBasePlan& base, std::string* error) {
+    if (kv_tier == nullptr || !base.impl_) { return std::nullopt; }
+    const auto& plan = *base.impl_;
+    // Prefix reuse disabled means the operator asked for cold prefill. A disk hit must not override
+    // that: the flag exists to make exactly this kind of reuse switchable off.
+    if (!plan.allow_prefix_reuse || !plan.prompt || plan.prompt->token_ids.empty()) {
+        return std::nullopt;
+    }
+    // The payload is one main KV run and its state image. A request that also runs a draft/backend
+    // cache (MTP, DFlash) would restore the half that validates and then claim coverage for the half
+    // that does not exist -- the payload carries no backend KV and the export never produced one, so
+    // this is refused rather than half-applied.
+    if (speculative_backend != SpeculativeBackend::None) {
+        if (error != nullptr) { *error = "the third tier holds no draft/backend KV"; }
+        return std::nullopt;
+    }
+    const auto& prompt_ids = plan.prompt->token_ids;
+    const auto key         = core::KvBlockKey{core::kv_hash_tokens(prompt_ids),
+                                              static_cast<std::uint32_t>(prompt_ids.size())};
     CheckpointExport kv;
     CheckpointStateExport state;
-    if (!tier_load_export(*kv_tier, key, kv, state)) { return std::nullopt; }
-    // The importer splits a bare image itself - a single non-empty shard is exactly that, and one
-    // that already carries a header is passed through. Encoding it here would be the same work done
-    // twice, with a second chance to disagree about the page budget.
+    // Printed before the lookup, not after: a key that does not match the one a store named is a
+    // different problem from a directory that has nothing, and only this line tells them apart.
+    std::fprintf(stderr, "[kvt] lookup key=%016llx/%u\n",
+                 static_cast<unsigned long long>(key.hash), key.tokens);
+    std::fflush(stderr);
+    if (!tier_load_export(*kv_tier, key, kv, state)) {
+        std::fprintf(stderr, "[kvt] miss key=%016llx/%u\n",
+                     static_cast<unsigned long long>(key.hash), key.tokens);
+        std::fflush(stderr);
+        return std::nullopt;
+    }
+    ninfer::core::fingerprint::CheckpointFingerprint want;
+    host_state_fingerprint(want);
+    // The run has to cover text this prompt actually has. A payload from a longer prompt would make
+    // the request resume from tokens it never had.
+    if (kv.frontier == 0 || kv.frontier > prompt_ids.size()) {
+        if (error != nullptr) {
+            *error = "payload covers " + std::to_string(kv.frontier) + " of " +
+                     std::to_string(prompt_ids.size()) + " token(s)";
+        }
+        return std::nullopt;
+    }
+    // And its pages have to be this process's pages. A directory left behind by another layout would
+    // be copied in at the wrong stride; the import's size check only fires when the extent is too
+    // small, and a narrower page would slip through.
+    if (want.kv_page_bytes != 0 && kv.page_bytes != want.kv_page_bytes) {
+        if (error != nullptr) {
+            *error = "payload page is " + std::to_string(kv.page_bytes) + " B, this layout uses " +
+                     std::to_string(want.kv_page_bytes) + " B";
+        }
+        return std::nullopt;
+    }
+    // Refuse only when the import cannot be paid for at all. A reserve on top of that was tried and
+    // is the wrong lever here: at this engine's 32-page pool it rejected a 10-page import with 10
+    // free, which is the exact case this tier exists for. Pressure after the import (the request
+    // needing its next page) is handled where it already was, by the engine's reclaim before a unit,
+    // and a reclaim that cannot proceed shows up as a binding shortage instead of a silent cold run.
+    if (const auto headroom = checkpoint_pool_headroom();
+        headroom.capacity_pages != 0 && headroom.available_pages < kv.page_count) {
+        if (error != nullptr) {
+            *error = "needs " + std::to_string(kv.page_count) + " page(s); " +
+                     std::to_string(headroom.available_pages) + " of " +
+                     std::to_string(headroom.capacity_pages) + " free";
+        }
+        return std::nullopt;
+    }
+    // The tier stores the state image as one blob; the import splits it and checks the fingerprint
+    // against the layout this process has. A bare image is exactly what it expects here.
     std::vector<std::string> shards{
         std::string(reinterpret_cast<const char*>(state.bytes.data()), state.bytes.size())};
-    std::string local;
-    auto handle = import_checkpoint_current_layout(kv, shards, nullptr, nullptr, &local,
-                                                   /*pin_pages=*/false);
-    if (!handle && error != nullptr) { *error = std::move(local); }
-    if (handle) {
-        std::fprintf(stderr, "[kvt] loaded frontier=%u pages=%u bytes=%zu\n", kv.frontier,
-                     kv.page_count, kv.kv_bytes.size());
-        std::fflush(stderr);
+    std::string why;
+    auto source = import_checkpoint_source_current_layout(kv, shards, &why, /*pin_pages=*/false);
+    if (!source) {
+        if (error != nullptr) { *error = std::move(why); }
+        return std::nullopt;
     }
-    return handle;
+    std::fprintf(stderr, "[kvt] reopened key=%016llx/%u frontier=%u pages=%u bytes=%zu\n",
+                 static_cast<unsigned long long>(key.hash), key.tokens, kv.frontier, kv.page_count,
+                 kv.kv_bytes.size());
+    std::fflush(stderr);
+    return source;
 }
 
 } // namespace ninfer::models::qwen3_5::detail

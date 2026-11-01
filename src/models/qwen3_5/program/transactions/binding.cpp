@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <stdexcept>
 
 namespace ninfer::models::qwen3_5::detail {
@@ -75,6 +76,37 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
                             (resume && checkpoint(*source).frontier > resume->frontier()))))) {
         return {.source_valid = false};
     }
+    // port (sm_89): Q54. With no in-process source and no resumable state, the prompt may still be in
+    // the third tier. The import enters HERE and not as a checkpoint candidate: the caller never sees
+    // it, the resource manager never counts it, and nothing about it has to look like a record to be
+    // bound -- which is exactly what the record-shaped version could not manage.
+    //
+    // A refusal is not a miss, and the difference is printed for the same reason the cache restore
+    // prints it: "the tier had it and the import declined" must not read as "nothing to reuse".
+    std::optional<TierSource> tier;
+    if (!source && !resume) {
+        std::string why;
+        tier = tier_open(base, &why);
+        if (tier) {
+            std::fprintf(stderr, "[kvt] open frontier=%u for %u token(s)\n", tier->frontier,
+                         base.summary().prompt_tokens);
+            std::fflush(stderr);
+        } else if (!why.empty()) {
+            std::fprintf(stderr, "[kvt] declined: %s\n", why.c_str());
+            std::fflush(stderr);
+        }
+    }
+    // Until a transaction owns the import, this is the only thing that gives it back. TierSource has
+    // no destructor on purpose -- two paths hand it on, and a destructor would release what a
+    // committed transaction already owns -- so every early return below has to do it, once.
+    struct TierGuard {
+        ProgramImpl* self;
+        std::optional<TierSource>* held;
+        ~TierGuard() {
+            if (self != nullptr && held != nullptr && *held) { self->discard_tier_source(**held); }
+        }
+    } tier_guard{this, &tier};
+
     ContextTransaction transaction;
     transaction.kind               = ContextOperationKind::Bind;
     transaction.lane               = lane;
@@ -82,8 +114,12 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
     transaction.base               = base.impl_;
     transaction.resume             = resume;
     transaction.source             = source;
-    transaction.reuse_frontier     = source ? checkpoint(*source).frontier : 0;
-    transaction.backend_frontier   = source ? checkpoint(*source).backend_frontier : 0;
+    transaction.reuse_frontier     = source   ? checkpoint(*source).frontier
+                                     : tier   ? tier->frontier
+                                              : 0;
+    transaction.backend_frontier   = source   ? checkpoint(*source).backend_frontier
+                                     : tier   ? tier->backend_frontier
+                                              : 0;
     transaction.source_tail_hidden = source && checkpoint(*source).tail_hidden_valid;
     transaction.resume_snapshot    = own_snapshot;
     transaction.retired_points.reserve(candidate.retired_points.size() + 1);
@@ -227,9 +263,13 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
             : 0U;
     const auto usage = physical_usage();
     runtime::ContextResourceUsage shortage;
+    // A tier source brings its own state image, and it is Host-only until the promotion below: what
+    // the account has to cover is a Device slot for it, not a fresh destination.
     const bool needs_state_slot =
-        (!transaction.borrow_state && !transaction.split_state) ||
-        (transaction.borrow_state && !state_store->device_resident(checkpoint(*source).state));
+        tier ? !state_store->device_resident(*tier->state)
+             : (!transaction.borrow_state && !transaction.split_state) ||
+                   (transaction.borrow_state &&
+                    !state_store->device_resident(checkpoint(*source).state));
     shortage.state_slots =
         needs_state_slot && usage.occupied.state_slots == usage.capacity.state_slots ? 1U : 0U;
     const auto difference = [](std::uint32_t required, std::uint32_t available) {
@@ -254,6 +294,18 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
             main_prefix + main_growth + main_tail <= usage.capacity.main_kv_pages &&
             (!backend_kv_pages ||
              backend_prefix + backend_growth + backend_tail <= usage.capacity.backend_kv_pages);
+        if (tier) {
+            // The import is about to be given back and the request will be re-bound after a reclaim,
+            // so this costs a second disk read and a second Device copy. Said out loud because the
+            // numbers are the only way to tell which pool refused it.
+            std::fprintf(stderr,
+                         "[kvt] import discarded: shortage state=%u main=%u backend=%u "
+                         "(occupied state=%u/%u, pages %u free)\n",
+                         shortage.state_slots, shortage.main_kv_pages, shortage.backend_kv_pages,
+                         usage.occupied.state_slots, usage.capacity.state_slots,
+                         text_kv_pages->physical_pool().available_pages());
+            std::fflush(stderr);
+        }
         return {.capacity_possible = capacity_possible, .shortage = shortage};
     }
     // No ordinary capacity failure follows this point. Prepare allocating request metadata
@@ -261,7 +313,8 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
     BindingReservation result{.reserved       = true,
                               .retired_points = candidate.retired_points,
                               .consumed_source =
-                                  transaction.consume_source ? source : std::nullopt};
+                                  transaction.consume_source ? source : std::nullopt,
+                              .reused_tokens = tier ? transaction.reuse_frontier : 0U};
     request.base      = base.impl_;
     request.lifecycle = Lifecycle::Prefilling;
     initialize_prefill(lane, transaction.reuse_frontier);
@@ -284,6 +337,13 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
         result.consumed_source = transaction.consume_source ? source : std::nullopt;
     }
     transaction.source_history = source ? checkpoint(*source).kv : nullptr;
+    if (tier) {
+        // The transaction is the owner from here. The optional is cleared by hand: moving an optional
+        // leaves the source engaged, and a guard that then "gave back" a moved-from source would
+        // release the very handles the transaction is about to bind.
+        transaction.tier = std::move(tier);
+        tier.reset();
+    }
     context_transaction_.emplace(std::move(transaction));
     auto& tx = *context_transaction_;
     if (source) { ++checkpoints[source->index].pins; }
@@ -314,10 +374,19 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
                     transfer.pages->reserve_device_replica(page, *transfer.device_reservation));
             }
         }
+        // Three ways an address arrives: owned by a checkpoint this request is taking over, handed
+        // over by the third tier, or brand new for a cold prefix.
         auto main = tx.borrow_text ? std::optional(checkpoint(*source).kv->text)
+                    : tx.tier      ? std::optional(*tx.tier->text)
                                    : text_kv_addresses->create_inactive();
         if (!main) { throw std::logic_error("binding exhausted bounded KV descriptors"); }
         tx.reserved_kv = SequenceKVBundle{.text = *main};
+        if (tx.tier) {
+            // Exactly one owner from here on: reserved_kv. The tier source is a carrier, not a
+            // holder (its destructor releases nothing), so the handle has to live in one place or
+            // abort and commit could both give it back.
+            tx.tier->text.reset();
+        }
         if (backend_kv_addresses) {
             auto backend = tx.borrow_backend ? checkpoint(*source).kv->backend
                                              : backend_kv_addresses->create_inactive();
@@ -331,12 +400,20 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
             tx.binding_history->text    = tx.reserved_kv->text;
             tx.binding_history->backend = tx.reserved_kv->backend;
         }
-        const bool host_state = source && !state_store->device_resident(checkpoint(*source).state);
+        const bool host_state = source   ? !state_store->device_resident(checkpoint(*source).state)
+                                : tx.tier ? !state_store->device_resident(*tx.tier->state)
+                                          : false;
         tx.reserved_state     = tx.borrow_state ? std::optional(checkpoint(*source).state)
+                                // The import's own image is the destination. It is already published
+                                // as a Host replica and promoting it is the whole restore; reserving
+                                // a fresh slot here would copy a whole state image to say the same
+                                // thing and then release the original.
+                                : tx.tier     ? tx.tier->state
                                 : (host_state || tx.split_state)
                                     ? state_store->reserve_logical_destination()
                                     : state_store->reserve_destination();
         if (!tx.reserved_state) { throw std::logic_error("binding lost its state capacity"); }
+        if (tx.tier) { tx.tier->state.reset(); }
         context_source_ready_.record(device.stream);
         context_source_ready_.wait(device.transfer_stream);
         if (tx.backup_state) {
@@ -351,8 +428,10 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
             tx.transfers.push_back(state_transfer_requirement(
                 state_images->host_layout(), runtime::ContextTransferDirection::HostToDevice));
             start_context_transfer_timer(runtime::ContextResourceClass::State);
+            // A tier image is not a source to fork from -- nothing else reads it and no record keeps
+            // it alive -- so its own image is promoted in place rather than copied into a new one.
             auto transfer =
-                tx.borrow_state
+                tx.tier || tx.borrow_state
                     ? state_store->begin_host_to_device(*tx.reserved_state, device.transfer_stream)
                     : state_store->begin_host_fork(checkpoint(*source).state, *tx.reserved_state,
                                                    device.transfer_stream);
@@ -488,8 +567,16 @@ void ProgramImpl::prepare_binding(ContextTransaction& tx) {
         if (is_masked_draft_backend(speculative_backend)) {
             copy_local_for_context(tx, selectors.source, selectors.destination);
         }
-    } else if (!tx.source) {
+    } else if (!tx.source && !tx.tier) {
         state_store->activate_reset(*tx.reserved_state, device.transfer_stream);
+    } else if (tx.tier) {
+        // The image arrived as a checkpoint (adopt_host_replica makes every restored image one) and
+        // this request is about to own it. That is the transition a borrowed state makes in
+        // retire_source -- move_checkpoint_to_active -- minus the record that no longer exists.
+        if (!state_store->device_resident(*tx.reserved_state)) {
+            throw std::logic_error("third-tier state was not promoted before binding");
+        }
+        state_store->move_checkpoint_to_active(*tx.reserved_state);
     }
     tx.submitted = !tx.source || !tx.transfers.empty();
     if (tx.submitted) { context_completion_.record(device.transfer_stream); }

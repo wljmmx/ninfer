@@ -417,6 +417,14 @@ void ProgramImpl::abort_context() noexcept {
                            tx.reuse_frontier);
             tx.reserved_kv.reset();
         }
+        if (tx.tier) {
+            // Whatever the import still holds. Most of it was handed to reserved_kv / reserved_state
+            // above and is released there; this is the window where it had not been handed over yet
+            // (an allocation failure between the address and the state). The call is a no-op for the
+            // fields that already moved, which is why it can be unconditional.
+            discard_tier_source(*tx.tier);
+            tx.tier.reset();
+        }
         if (tx.kind == ContextOperationKind::Bind) {
             // Any already-installed state binding is still private to this unpublished lane.
             if (sequences[tx.lane].state.fork_pending) {

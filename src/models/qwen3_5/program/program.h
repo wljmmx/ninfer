@@ -246,6 +246,11 @@ struct BindingReservation {
     runtime::ContextResourceUsage shortage;
     std::vector<CheckpointHandle> retired_points;
     std::optional<CheckpointHandle> consumed_source;
+    // What this binding actually reuses, when the caller cannot know it from the candidate. A
+    // third-tier import is found inside binding (there is no handle to pass in and none to read the
+    // frontier from), so the number has to travel back out or the request would report itself as a
+    // root prefill after reusing most of its prompt.
+    std::uint32_t reused_tokens = 0;
 
     explicit operator bool() const noexcept { return reserved; }
 };

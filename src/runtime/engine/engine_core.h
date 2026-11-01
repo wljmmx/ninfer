@@ -1916,11 +1916,17 @@ private:
                 resources_.binding_started(request->id, reservation.retired_points,
                                            reservation.consumed_source);
                 const auto& source = choice.source;
+                // A third-tier import is found inside binding, so there is no candidate here to read
+                // a frontier from: the reservation reports what it actually reused. Reporting zero
+                // would label a 296-token reuse as a root prefill in every observation.
+                const std::uint32_t reused = reservation.reused_tokens != 0
+                                                 ? reservation.reused_tokens
+                                                 : source.reused_tokens;
                 const BeginSummary begin{
                     .prompt_tokens        = request->base_plan->summary().prompt_tokens,
-                    .reused_prompt_tokens = source.reused_tokens,
+                    .reused_prompt_tokens = reused,
                     .prefix_reuse_path =
-                        source.reused_tokens ? PrefixReusePath::Checkpoint : PrefixReusePath::Root};
+                        reused ? PrefixReusePath::Checkpoint : PrefixReusePath::Root};
                 if (restoring) {
                     std::erase(paused_, request);
                     observe_scheduling(request, GenerationSchedulingTransition::RestoreStarted,
@@ -1938,6 +1944,11 @@ private:
                     finish_source_wait(request, binding_started);
                     request->admission.revoked_checkpoints =
                         resources_.source_revocations(request->id);
+                    if (reservation.reused_tokens != 0) {
+                        // The candidate said "root"; the binding turned out to reuse a third-tier
+                        // run. Record what happened, not what was predicted.
+                        request->admission.preferred_reused_tokens = reservation.reused_tokens;
+                    }
                     request->admitted_at = binding_started;
                     request->host_timing.queue_wait_ns =
                         elapsed_ns(request->submitted, *request->admitted_at);

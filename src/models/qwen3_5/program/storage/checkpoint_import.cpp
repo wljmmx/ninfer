@@ -23,66 +23,61 @@
 #include <vector>
 
 namespace ninfer::models::qwen3_5::detail {
+namespace {
 
-std::optional<CheckpointHandle> ProgramImpl::import_checkpoint_current_layout(
-    const CheckpointExport& kv, const std::vector<std::string>& state_shards,
-    std::shared_ptr<const PreparedCaptureBacking> identity, const PrefixShortlistKey* key,
-    std::string* error, bool pin_pages) {
-    ninfer::core::fingerprint::CheckpointFingerprint want;
-    host_state_fingerprint(want);
-
-    // Coverage and pages have to describe the same amount of text. A record whose frontier says 384
-    // while its payload holds 8 pages would commit an address whose pages and coverage disagree --
-    // that is wrong KV, not a miss, and nothing downstream would notice.
-    //
-    // The rule is "exactly enough pages for the coverage", not "pages x tokens == coverage": the
-    // engine's own export is routinely NOT page aligned (a capture at 467 tokens holds 8 pages, the
-    // last one partly filled), so demanding an exact product refuses records this engine produced.
-    const auto geometry = checkpoint_geometry();
-    const auto page_tokens = static_cast<std::uint64_t>(geometry.page_tokens);
-    if (page_tokens > 0) {
-        const std::uint64_t needed =
-            (static_cast<std::uint64_t>(kv.frontier) + page_tokens - 1) / page_tokens;
-        if (needed != kv.page_count) {
-            if (error != nullptr) {
-                *error = "frontier " + std::to_string(kv.frontier) + " needs " +
-                         std::to_string(needed) + " page(s) of " + std::to_string(page_tokens) +
-                         " token(s); the payload holds " + std::to_string(kv.page_count);
-            }
-            return std::nullopt;
-        }
-    }
-
-    // A cache stores the image as one blob (it has no reason to shard it), while the import path
-    // joins self-describing shards and refuses anything without a header. Splitting here keeps that
-    // requirement local: the caller hands over what it has, and the format it has to be in stays a
-    // property of this path rather than something every producer must know.
-    std::vector<std::string> shards = state_shards;
-    if (shards.size() == 1 && !shards[0].empty()) {
+// A cache and the third tier store the image as one blob (neither has a reason to shard it), while
+// the import path joins self-describing shards and refuses anything without a header. Splitting here
+// keeps that requirement local: the caller hands over what it has, and the format it has to be in
+// stays a property of this path rather than something every producer must know. A shard that already
+// carries a header also arrives as one element; split() refusing it is the signal to pass it through
+// untouched rather than a failure.
+std::vector<std::string> with_shard_headers(
+    const ninfer::core::fingerprint::CheckpointFingerprint& want,
+    const std::vector<std::string>& shards) {
+    std::vector<std::string> split = shards;
+    if (split.size() == 1 && !split[0].empty()) {
         ninfer::core::state_shards::RegionSizes sizes;
         sizes.conv_bytes  = want.state_conv_bytes;
         sizes.layer_bytes = want.state_layer_bytes;
         sizes.layers      = want.state_layers;
         const std::uint64_t covered = sizes.conv_bytes + sizes.layer_bytes * sizes.layers;
-        sizes.tail_bytes =
-            want.state_image_bytes > covered ? want.state_image_bytes - covered : 0;
-        const auto split =
-            ninfer::core::state_shards::split(shards[0], sizes, 6ull * 1024 * 1024);
-        // A shard that already carries a header also arrives as one element; split() refusing it is
-        // the signal to pass it through untouched rather than a failure.
-        if (split.ok) { shards = split.shards; }
+        sizes.tail_bytes = want.state_image_bytes > covered ? want.state_image_bytes - covered : 0;
+        const auto parts = ninfer::core::state_shards::split(split[0], sizes, 6ull * 1024 * 1024);
+        if (parts.ok) { split = parts.shards; }
     }
-
-    std::string local;
-    auto handle = import_checkpoint(kv, shards, want, local, std::move(identity), key, pin_pages);
-    if (!handle && error != nullptr) { *error = std::move(local); }
-    return handle;
+    return split;
 }
 
-std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
+} // namespace
+
+std::optional<TierSource> ProgramImpl::import_checkpoint_source_current_layout(
+    const CheckpointExport& kv, const std::vector<std::string>& state_shards, std::string* error,
+    bool pin_pages) {
+    ninfer::core::fingerprint::CheckpointFingerprint want;
+    host_state_fingerprint(want);
+    std::string local;
+    auto source = import_checkpoint_source(kv, with_shard_headers(want, state_shards), want, local,
+                                           pin_pages);
+    if (!source && error != nullptr) { *error = std::move(local); }
+    return source;
+}
+
+std::optional<CheckpointHandle> ProgramImpl::import_checkpoint_current_layout(
+    const CheckpointExport& kv, const std::vector<std::string>& state_shards,
+    std::shared_ptr<const PreparedCaptureBacking> identity, const PrefixShortlistKey* key,
+    std::string* error, bool pin_pages) {
+    std::string why;
+    auto source = import_checkpoint_source_current_layout(kv, state_shards, &why, pin_pages);
+    if (!source) {
+        if (error != nullptr) { *error = std::move(why); }
+        return std::nullopt;
+    }
+    return adopt_checkpoint_source(std::move(*source), std::move(identity), key, why);
+}
+
+std::optional<TierSource> ProgramImpl::import_checkpoint_source(
     const CheckpointExport& kv, const std::vector<std::string>& state_shards,
     const ninfer::core::fingerprint::CheckpointFingerprint& want, std::string& error,
-    std::shared_ptr<const PreparedCaptureBacking> identity, const PrefixShortlistKey* key,
     bool pin_pages) {
     error.clear();
     if (!text_kv_pages || !text_kv_addresses || !host_kv_extents) {
@@ -98,22 +93,46 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
         return std::nullopt;
     }
 
+    // Coverage and pages have to describe the same amount of text. A record whose frontier says 384
+    // while its payload holds 8 pages would commit an address whose pages and coverage disagree --
+    // that is wrong KV, not a miss, and nothing downstream would notice.
+    //
+    // The rule is "exactly enough pages for the coverage", not "pages x tokens == coverage": the
+    // engine's own export is routinely NOT page aligned (a capture at 467 tokens holds 8 pages, the
+    // last one partly filled), so demanding an exact product refuses records this engine produced.
+    const auto geometry = checkpoint_geometry();
+    const auto page_tokens = static_cast<std::uint64_t>(geometry.page_tokens);
+    if (page_tokens > 0) {
+        const std::uint64_t needed =
+            (static_cast<std::uint64_t>(kv.frontier) + page_tokens - 1) / page_tokens;
+        if (needed != kv.page_count) {
+            if (error.empty()) {
+                error = "frontier " + std::to_string(kv.frontier) + " needs " +
+                        std::to_string(needed) + " page(s) of " + std::to_string(page_tokens) +
+                        " token(s); the payload holds " + std::to_string(kv.page_count);
+            }
+            return std::nullopt;
+        }
+    }
+
     // 1. State first: it validates the fingerprint and refuses before anything is allocated.
     const auto state = import_state(state_shards, want, error);
     if (!state) { return std::nullopt; }
     // adopt_host_replica already left it CheckpointImmutable, and freeze() cannot help here:
     // it demands a Device slot, which a restored image does not have.
-    state_store->retain_checkpoint_reference(*state);
+    //
+    // No checkpoint reference is taken here, deliberately. A reference exists so a RECORD's image
+    // survives as long as the record does; an import has no record yet, and the image is held by
+    // this handle until someone either adopts it into one or hands it to a request.
 
     // 2. Device first, because a logical page is born in VRAM: can_pin_source() and
     //    can_pin_active_source() both require a Device replica, so a page without one can never be
     //    given a Host extent. Restoring straight into Host memory is not a path this store has.
     auto device_pages = text_kv_pages->physical_pool().reserve(kv.page_count);
     if (!device_pages) {
-        // The state image was adopted first, so it is the one thing to give back here. Dropping its
-        // checkpoint reference and releasing it returns the Host slot; leaving it behind would make
-        // the state pool shrink by one image per failed import.
-        state_store->release_checkpoint_reference(*state);
+        // The state image was adopted first, so it is the one thing to give back here. Releasing it
+        // returns the Host slot; leaving it behind would make the state pool shrink by one image per
+        // failed import.
         (void)state_store->release(*state);
         error = "no free Device pages for the restored checkpoint";
         return std::nullopt;
@@ -131,10 +150,20 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
     {
         auto reservation = host_kv_extents->prepare(*text_kv_pages, pages);
         if (!reservation) {
+            // A refusal here used to be one string, which cannot distinguish "the arena is full" from
+            // "the policy said no". Both numbers are cheap and they are the reason this path fails.
+            std::fprintf(stderr,
+                         "[kvt] no Host extent: %u page(s) of %zu B, extents %u/%u occupied, "
+                         "state image %llu B\n",
+                         kv.page_count, host_kv_extents->page_layout(*text_kv_pages).page_stride,
+                         host_kv_extents->occupied(), host_kv_extents->capacity(),
+                         static_cast<unsigned long long>(want.state_image_bytes));
+            std::fflush(stderr);
             // Nothing is published yet, so the pages are the only thing to give back. Releasing them
             // returns their Device leases too; without this a run of failed imports would drain the
             // page pool and the symptom would look like "allocation stopped working" much later.
             for (const LogicalKVPageHandle page : pages) { (void)text_kv_pages->release(page); }
+            (void)state_store->release(*state);
             error = "no Host extent for the restored pages";
             return std::nullopt;
         }
@@ -145,6 +174,7 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
         if (view.data() == nullptr || available < expected) {
             host_kv_extents->abort(*reservation);
             for (const LogicalKVPageHandle page : pages) { (void)text_kv_pages->release(page); }
+            (void)state_store->release(*state);
             error = "Host extent is smaller than the restored payload";
             return std::nullopt;
         }
@@ -183,7 +213,6 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
         if (rollback_pending) {
             if (published) { (void)host_kv_extents->release(*published); }
             for (const LogicalKVPageHandle page : pages) { (void)text_kv_pages->release(page); }
-            state_store->release_checkpoint_reference(*state);
             (void)state_store->release(*state);
             error = "could not fill the Device copies of the restored pages";
             return std::nullopt;
@@ -194,8 +223,7 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
     const auto rollback = [&]() {
         if (published) { (void)host_kv_extents->release(*published); }
         for (const LogicalKVPageHandle page : pages) { (void)text_kv_pages->release(page); }
-        // The state image is the other half of the record and is still ours at this point.
-        state_store->release_checkpoint_reference(*state);
+        // The state image is the other half of the source and is still ours at this point.
         (void)state_store->release(*state);
     };
 
@@ -254,28 +282,8 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
         }
     }
 
-    // 5. The record.
-    const auto handle = reserve_checkpoint();
-    if (!handle) {
-        (void)text_kv_addresses->release(*address);
-        rollback();
-        error = "no free checkpoint slot";
-        return std::nullopt;
-    }
-    auto history  = std::make_shared<KVHistory>();
-    history->text = *address;
-    // Identity and key come from the request that is restoring this prefix. Without them the record
-    // is readable but checkpoint_matches() will never accept it -- the comparison is on token
-    // content, not on bytes, so nothing about the payload can substitute for them.
-    checkpoints[handle->index].value =
-        CheckpointState{.kv       = std::move(history),
-                        .state    = *state,
-                        .identity = std::move(identity),
-                        .key      = key != nullptr ? *key : PrefixShortlistKey{},
-                        .frontier = kv.frontier};
-    checkpoints[handle->index].reserved = false;
     if (!pin_pages) {
-        // port (sm_89): the readings the adopt path decides on, taken at the moment the record is
+        // port (sm_89): the readings the adopt path decides on, taken at the moment the source is
         // complete. Without them "the import cannot be taken over" is a guess about three counters.
         const auto tail_index = text_kv_addresses->page_count(*address) - 1U;
         const auto tail       = text_kv_addresses->logical_page(*address, tail_index);
@@ -291,7 +299,96 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
                      text_kv_addresses->page_count(*address));
         std::fflush(stderr);
     }
+
+    // Both halves leave in one struct. Nothing is attached to a record, nothing is pinned, and no
+    // handle is retained twice: the caller either adopts this into a record (which takes the
+    // reference) or hands it to a request (which takes the ownership).
+    TierSource source;
+    source.text                   = *address;
+    source.frontier               = kv.frontier;
+    source.state                  = *state;
+    source.materialised_host_copy = true;
+    return source;
+}
+
+std::optional<CheckpointHandle> ProgramImpl::adopt_checkpoint_source(
+    TierSource&& source, std::shared_ptr<const PreparedCaptureBacking> identity,
+    const PrefixShortlistKey* key, std::string& error) {
+    // 5. The record. Everything below has both halves in hand, so the only failure left is a full
+    //    slot pool -- and one call gives them back rather than each branch repeating the unwind.
+    const auto handle = reserve_checkpoint();
+    if (!handle) {
+        discard_tier_source(source);
+        error = "no free checkpoint slot";
+        return std::nullopt;
+    }
+    // A record owns its image through a checkpoint reference; the import carried none because no
+    // record existed. Taken here, after the slot exists, so a refused adoption never leaves one.
+    state_store->retain_checkpoint_reference(*source.state);
+    auto history  = std::make_shared<KVHistory>();
+    history->text = *source.text;
+    // The record's address goes back when the last holder of the history does. Without this an
+    // imported record releases its state image but leaves its address run allocated, which is a
+    // slow leak that reads as "the page pool shrank for no reason".
+    history->owner = this;
+    if (source.backend) { history->backend = *source.backend; }
+    // Identity and key come from the request that is restoring this prefix. Without them the record
+    // is readable but checkpoint_matches() will never accept it -- the comparison is on token
+    // content, not on bytes, so nothing about the payload can substitute for them.
+    checkpoints[handle->index].value =
+        CheckpointState{.kv       = std::move(history),
+                        .state    = *source.state,
+                        .identity = std::move(identity),
+                        .key      = key != nullptr ? *key : PrefixShortlistKey{},
+                        .frontier = source.frontier};
+    checkpoints[handle->index].reserved = false;
+    source.text.reset();
+    source.state.reset();
+    source.materialised_host_copy = false;
     return handle;
+}
+
+void ProgramImpl::discard_tier_source(TierSource& source) noexcept {
+    // Give back exactly what the import took, in the reverse of the order it took it, and only what
+    // is still here: each field is cleared as it is released, so a second call is a no-op and the
+    // transaction abort and the pre-transaction guard cannot both release the same page run.
+    try {
+        if (source.text) {
+            // A pinned run protects a checkpoint a request may still be using. A discard is the one
+            // caller that knows nothing else will, so the pin goes first -- otherwise the release
+            // below refuses and this terminates.
+            text_kv_addresses->set_checkpoint_requirement(*source.text, 0);
+            if (!text_kv_addresses->release_after_deactivate(*source.text)) { std::terminate(); }
+            source.text.reset();
+        }
+        if (source.backend) {
+            backend_kv_addresses->set_checkpoint_requirement(*source.backend, 0);
+            if (!backend_kv_addresses->release_after_deactivate(*source.backend)) {
+                std::terminate();
+            }
+            source.backend.reset();
+        }
+        if (source.materialised_host_copy && host_kv_extents) {
+            // The pages are unreferenced now, and a Host extent only goes back when every page in it
+            // does. A source that never became a record has no history to run this on its way out.
+            (void)host_kv_extents->release_unreferenced();
+            source.materialised_host_copy = false;
+        }
+        if (source.state) {
+            if (!state_store->release(*source.state)) { std::terminate(); }
+            source.state.reset();
+        }
+    } catch (...) { std::terminate(); }
+}
+
+std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
+    const CheckpointExport& kv, const std::vector<std::string>& state_shards,
+    const ninfer::core::fingerprint::CheckpointFingerprint& want, std::string& error,
+    std::shared_ptr<const PreparedCaptureBacking> identity, const PrefixShortlistKey* key,
+    bool pin_pages) {
+    auto source = import_checkpoint_source(kv, state_shards, want, error, pin_pages);
+    if (!source) { return std::nullopt; }
+    return adopt_checkpoint_source(std::move(*source), std::move(identity), key, error);
 }
 
 // Diagnostic entry point, kept out of the dump hook so that hook stays one call long. Importing a
