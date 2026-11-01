@@ -706,7 +706,8 @@ std::optional<CheckpointHandle> ProgramImpl::tier_try_load(std::span<const Token
     std::vector<std::string> shards{
         std::string(reinterpret_cast<const char*>(state.bytes.data()), state.bytes.size())};
     std::string local;
-    auto handle = import_checkpoint_current_layout(kv, shards, nullptr, nullptr, &local);
+    auto handle = import_checkpoint_current_layout(kv, shards, nullptr, nullptr, &local,
+                                                   /*pin_pages=*/false);
     if (!handle && error != nullptr) { *error = std::move(local); }
     if (handle) {
         std::fprintf(stderr, "[kvt] loaded frontier=%u pages=%u bytes=%zu\n", kv.frontier,

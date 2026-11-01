@@ -27,7 +27,7 @@ namespace ninfer::models::qwen3_5::detail {
 std::optional<CheckpointHandle> ProgramImpl::import_checkpoint_current_layout(
     const CheckpointExport& kv, const std::vector<std::string>& state_shards,
     std::shared_ptr<const PreparedCaptureBacking> identity, const PrefixShortlistKey* key,
-    std::string* error) {
+    std::string* error, bool pin_pages) {
     ninfer::core::fingerprint::CheckpointFingerprint want;
     host_state_fingerprint(want);
 
@@ -74,7 +74,7 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint_current_layout(
     }
 
     std::string local;
-    auto handle = import_checkpoint(kv, shards, want, local, std::move(identity), key);
+    auto handle = import_checkpoint(kv, shards, want, local, std::move(identity), key, pin_pages);
     if (!handle && error != nullptr) { *error = std::move(local); }
     return handle;
 }
@@ -82,7 +82,8 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint_current_layout(
 std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
     const CheckpointExport& kv, const std::vector<std::string>& state_shards,
     const ninfer::core::fingerprint::CheckpointFingerprint& want, std::string& error,
-    std::shared_ptr<const PreparedCaptureBacking> identity, const PrefixShortlistKey* key) {
+    std::shared_ptr<const PreparedCaptureBacking> identity, const PrefixShortlistKey* key,
+    bool pin_pages) {
     error.clear();
     if (!text_kv_pages || !text_kv_addresses || !host_kv_extents) {
         error = "no KV storage in this program";
@@ -216,7 +217,14 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
     // materialize() left at 0 -- without that the pages look empty to anything reading coverage, and
     // the protection below would refuse a frontier above zero.
     text_kv_addresses->commit_inactive_frontier(*address, kv.frontier);
-    text_kv_addresses->set_checkpoint_requirement(*address, kv.frontier);
+    // port (sm_89): a record restored from the third tier is NOT protected here.
+    //
+    // The requirement exists so a checkpoint a request is still using cannot be evicted. For an
+    // import it does the opposite of what the caller needs: it pins the pages, and the adopt path
+    // moves or copies exactly those pages, so pinning turns "take this over" into "copy these and
+    // find room", which the capacity account then refuses. The authoritative copy is on disk, so
+    // there is nothing here worth protecting - if this one is evicted, load it again.
+    if (pin_pages) { text_kv_addresses->set_checkpoint_requirement(*address, kv.frontier); }
 
     // Only now are the pages made read-only, and the order is not cosmetic: commit_coverage() above
     // requires writer_references == 1, while can_pin_source() -- what a later fork needs -- requires

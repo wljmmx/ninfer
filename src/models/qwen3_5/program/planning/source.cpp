@@ -48,17 +48,18 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
             std::fflush(stderr);
         }
     }
-    if (!base.impl_ || (handle && !checkpoint_matches(*handle, base))) {
-        // port (sm_89): Q54 - an import the request then refuses is an orphan. It owns KV pages and a
-        // state slot, and nothing else in the engine will ever release it, because no request ever
-        // adopted it. Measured as a request that failed with every resource reading zero: the
-        // rejected checkpoint still held them.
-        //
-        // Releasing here turns a refusal into a cold prefix, which is the honest outcome - the tier
-        // had bytes, this model cannot use them.
-        if (from_tier && handle) { release_checkpoint(*handle); }
-        return std::nullopt;
-    }
+    if (!base.impl_) { return std::nullopt; }
+    // port (sm_89): an import from the tier does not have to pass the captured-path fingerprint.
+    //
+    // That check exists to prove a checkpoint belongs to THIS request: it compares the record's
+    // ledger and digests against the base plan. An import has no such identity by design - the
+    // external-cache entry point takes identity as null by default and its comment says so ("it has
+    // bytes, not a fingerprint"). Its identity is established the other way round: the lookup key
+    // was this prompt, so the bytes were found BY this request, not offered to it.
+    //
+    // Requiring both made the import unusable: the record was created, the match refused it, and the
+    // pages plus the state slot stayed owned by a record nothing would ever adopt.
+    if (handle && !from_tier && !checkpoint_matches(*handle, base)) { return std::nullopt; }
     SourceCandidate candidate{.checkpoint    = handle,
                               .reused_tokens = handle ? checkpoint(*handle).frontier : 0};
     const auto& prompt       = *base.impl_->prompt;
@@ -237,6 +238,15 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
                                   : record.backend_frontier;
         scan(*backend_kv_addresses, *backend_kv_pages, *record.kv->backend, frontier,
              runtime::ContextResourceClass::BackendKV);
+    }
+    if (from_tier) {
+        std::fprintf(stderr,
+                     "[kvt] candidate consume=%d move_state=%d split=%d move_history=%d "
+                     "transfers=%zu reused=%u\n",
+                     candidate.consume_source ? 1 : 0, candidate.move_state ? 1 : 0,
+                     candidate.split_state ? 1 : 0, candidate.move_history ? 1 : 0,
+                     candidate.transfers.size(), candidate.reused_tokens);
+        std::fflush(stderr);
     }
     return candidate;
 }

@@ -313,7 +313,7 @@ public:
         const CheckpointExport& kv, const std::vector<std::string>& state_shards,
         const ninfer::core::fingerprint::CheckpointFingerprint& want, std::string& error,
         std::shared_ptr<const PreparedCaptureBacking> identity = nullptr,
-        const PrefixShortlistKey* key = nullptr);
+        const PrefixShortlistKey* key = nullptr, bool pin_pages = true);
     // Same import, priced against the layout this program has right now. For a caller restoring from
     // an external cache: it has bytes, not a fingerprint, and only the state half is checked anyway
     // (the fingerprint is what refuses an image from a different model). Deriving it here also means
@@ -322,7 +322,8 @@ public:
     [[nodiscard]] std::optional<CheckpointHandle> import_checkpoint_current_layout(
         const CheckpointExport& kv, const std::vector<std::string>& state_shards,
         std::shared_ptr<const PreparedCaptureBacking> identity = nullptr,
-        const PrefixShortlistKey* key = nullptr, std::string* error = nullptr);
+        const PrefixShortlistKey* key = nullptr, std::string* error = nullptr,
+        bool pin_pages = true);
     [[nodiscard]] std::optional<StateImageHandle> import_state(
         const std::vector<std::string>& shards,
         const ninfer::core::fingerprint::CheckpointFingerprint& want, std::string& error);
