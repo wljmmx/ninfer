@@ -34,13 +34,23 @@ struct ModelInstance {
     std::unique_ptr<models::qwen3_5::Program> program;
     // port (sm_89): routed experts stream from the artifact into this shared pool.
     std::unique_ptr<artifact::ArtifactExpertReader> expert_source;
-    std::unique_ptr<ExpertCache> expert_cache;
     std::unique_ptr<ExpertBlobReader> expert_host_source;
     // Host half of a split expert tier; only created when the Device pool cannot hold a layer.
-    std::unique_ptr<models::qwen3_5::execution::HostExpertResidency> expert_host_residency;
+    //
+    // Shared, because a read-ahead job outlives the call that issued it: the queue holds it weakly
+    // and takes a strong reference only for the length of one fill. Declared before the cache and
+    // the pool so that it is destroyed after both - the cache holds a non-owning ExpertArenaSource*
+    // to it, and the reader it reads through is declared above and therefore outlives it.
+    std::shared_ptr<models::qwen3_5::execution::HostExpertResidency> expert_host_residency;
+    std::unique_ptr<ExpertCache> expert_cache;
     // port (sm_89): true when the whole resident set fits at once, so a captured decode graph may
     // already point into it and the pool must not change size underneath that graph.
     bool expert_pool_pinned = false;
+    // port (sm_89): true when this instance attached to the process-wide read-ahead queue, so the
+    // destructor knows whether it has to detach. The detach is what joins the worker: doing it in
+    // the destructor body rather than in a static destructor keeps the join while the pinned arena
+    // and the CUDA context are still alive.
+    bool expert_prefetch_retained = false;
     // port (sm_89): the one place that knows what each tier holds (1y.7). Step two only registers
     // and prints; the allocations still use their own estimates.
     core::MemoryLedger ledger;

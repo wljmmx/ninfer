@@ -5,6 +5,7 @@
 #include "artifact/formats.h"
 #include "core/expert_cache.h"
 #include "core/startup.h"
+#include "models/qwen3_5/execution/expert_prefetch.h"
 #include "models/qwen3_5/execution/expert_stream.h"
 #include "models/qwen3_5/execution/host_expert_reader.h"
 #include "models/qwen3_5/execution/host_expert_residency.h"
@@ -312,10 +313,17 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
                                            streams[i]->count()),
                              streams[i]->per_expert_objects()});
         }
-        auto residency = std::make_unique<models::qwen3_5::execution::HostExpertResidency>(
+        auto residency = std::make_shared<models::qwen3_5::execution::HostExpertResidency>(
             descs, files, source, host_arena_bytes);
         for (std::size_t i = 0; i < streams.size(); ++i) {
-            streams[i]->attach_host(*residency);
+            streams[i]->attach_host(residency);
+        }
+        // port (sm_89): the read-ahead tracks this residency from here on, so the worker exists
+        // exactly as long as the tier does. Only when the switch is on: a run that never prefetches
+        // starts no thread and has none to join.
+        if (std::getenv("NINFER_PREFETCH") != nullptr) {
+            models::qwen3_5::execution::ExpertPrefetchQueue::instance().retain();
+            instance.expert_prefetch_retained = true;
         }
         std::fprintf(stderr, "[experts] host tier slots=%u slot_bytes=%llu\n",
                      residency->slot_capacity(),
@@ -527,7 +535,16 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
                                .media_preprocess_threads = options.media_preprocess_threads})),
       capacity(options.max_context) {}
 
-ModelInstance::~ModelInstance() = default;
+ModelInstance::~ModelInstance() {
+    // port (sm_89): detach before any member is destroyed. release() stops and joins the read-ahead
+    // worker, so no fill can be running while the arena, its reader or the CUDA context go away.
+    // The weak reference in each job is the safety net; this is the ordering that makes the net
+    // unnecessary on the normal path.
+    if (expert_prefetch_retained) {
+        models::qwen3_5::execution::ExpertPrefetchQueue::instance().release();
+        expert_prefetch_retained = false;
+    }
+}
 
 std::uint64_t ModelInstance::resize_expert_pool(std::uint64_t target_bytes) {
     if (!expert_cache) { return 0; }

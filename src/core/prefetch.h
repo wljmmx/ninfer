@@ -29,6 +29,9 @@ struct PrefetchStats {
     std::uint64_t enqueued         = 0;
     std::uint64_t dropped_budget   = 0;
     std::uint64_t dropped_deadline = 0;
+    // Offered after stop(). A process-scoped owner is stopped before it is destroyed, so this is
+    // the count of callers that raced the shutdown rather than a scheduling decision.
+    std::uint64_t dropped_stopped  = 0;
     std::uint64_t bytes_requested  = 0;
     std::uint64_t bytes_used       = 0;
 
@@ -52,36 +55,47 @@ public:
         worker_ = std::thread([this] { run(); });
     }
 
-    ~Prefetcher() {
+    // Stops and joins the worker. A process-scoped owner has to be able to say "the fill is over"
+    // before the objects a job points into are destroyed, and a destructor is too late to say it:
+    // by then the last strong reference may already be the one a job is holding.
+    //
+    // Idempotent, and safe to call from any thread but the worker itself.
+    void stop() {
         {
             std::lock_guard lock(mutex_);
             stopping_ = true;
         }
         wake_.notify_all();
-        if (worker_.joinable()) { worker_.join(); }
+        std::lock_guard join(join_mutex_);
+        if (!worker_.joinable()) { return; }
+        if (worker_.get_id() == std::this_thread::get_id()) { return; }
+        worker_.join();
     }
+
+    ~Prefetcher() { stop(); }
 
     Prefetcher(const Prefetcher&)            = delete;
     Prefetcher& operator=(const Prefetcher&) = delete;
 
     // Enqueues a job if it fits the window budget and is not already past its deadline.
     bool enqueue(std::function<bool()> run, std::size_t bytes, std::uint64_t due, std::uint64_t now) {
+        std::lock_guard lock(mutex_);
+        if (stopping_) {
+            ++stats_.dropped_stopped;
+            return false;
+        }
         if (bytes == 0 || due <= now) {
-            std::lock_guard lock(mutex_);
             ++stats_.dropped_deadline;
             return false;
         }
-        {
-            std::lock_guard lock(mutex_);
-            if (!gate_open_ || window_bytes_ + bytes > budget_) {
-                ++stats_.dropped_budget;
-                return false;
-            }
-            window_bytes_ += bytes;
-            stats_.bytes_requested += bytes;
-            ++stats_.enqueued;
-            jobs_.push_back(Job{std::move(run), bytes, due});
+        if (!gate_open_ || window_bytes_ + bytes > budget_) {
+            ++stats_.dropped_budget;
+            return false;
         }
+        window_bytes_ += bytes;
+        stats_.bytes_requested += bytes;
+        ++stats_.enqueued;
+        jobs_.push_back(Job{std::move(run), bytes, due});
         wake_.notify_one();
         return true;
     }
@@ -148,6 +162,9 @@ private:
     }
 
     mutable std::mutex mutex_;
+    // Held only across the join, so two stop() calls cannot both wait on the same thread object.
+    // Deliberately not `mutex_`: the worker needs that one to observe `stopping_` and exit.
+    std::mutex join_mutex_;
     std::condition_variable wake_;
     std::deque<Job> jobs_;
     std::thread worker_;

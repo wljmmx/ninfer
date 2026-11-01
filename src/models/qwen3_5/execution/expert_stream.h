@@ -9,6 +9,7 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace ninfer::models::qwen3_5::execution {
@@ -72,7 +73,15 @@ public:
     [[nodiscard]] bool fully_resident() const noexcept;
     [[nodiscard]] bool attached() const noexcept { return cache_ != nullptr; }
     // Host half of a split tier; null when the Device pool holds every expert.
-    void attach_host(HostExpertResidency& host) noexcept { host_ = &host; }
+    //
+    // Taken as a shared_ptr, and kept both ways: the raw pointer is what the layer's own fill uses
+    // (it is called with the model alive, by construction), while the weak one is what a job
+    // enqueued on the process-wide read-ahead worker carries. A queue job outlives the call that
+    // issued it, so it has to be able to find the residency gone rather than assume it is there.
+    void attach_host(std::shared_ptr<HostExpertResidency> host) noexcept {
+        host_      = host.get();
+        host_weak_ = std::move(host);
+    }
     [[nodiscard]] HostExpertResidency* host() const noexcept { return host_; }
 
     [[nodiscard]] std::uint32_t count() const noexcept { return count_; }
@@ -226,6 +235,9 @@ private:
 
     ExpertCache* cache_ = nullptr;
     HostExpertResidency* host_ = nullptr;
+    // port (sm_89): the read-ahead queue's view of the same object. Expired means the model was
+    // destroyed while a fill was queued, which the queue reports instead of dereferencing.
+    std::weak_ptr<HostExpertResidency> host_weak_;
     std::uint32_t bank_ = 0;
     // port (sm_89): A3b. The per-bank generation this bank's Device tables actually hold, set only when
     // the driver accepted the publish. Compared before the kernels read the tables; a mismatch means a

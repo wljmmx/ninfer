@@ -1,4 +1,5 @@
 #include "models/qwen3_5/execution/expert_stream.h"
+#include "models/qwen3_5/execution/expert_prefetch.h"
 #include "models/qwen3_5/execution/host_expert_residency.h"
 
 #include <cuda_runtime.h>
@@ -1372,25 +1373,23 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     // it is written from the same decision that places the step's routes.
     last_cost_.uploaded = cache_->last_uploaded();
     static_probe(bank_, tokens, false, probe_absent, probe_unready, probe_moved, probe_ins, last_cost_.uploaded);
-    // port (sm_89): D1 read-ahead, retried on the arena F1 fixed. One expert a layer - the hottest the
-    // pool does not hold - issued after this layer's uploads, so the tier it fills is what the next
-    // layer's uploader reads. claim() already skips slots a copy is still reading.
+    // port (sm_89): D1 read-ahead, in three pieces that are now separate on purpose.
     //
-    // Measured at 8 GiB (64-token request, same content, switch on and off): arena hit 35.9% -> 37.2%,
-    // one fill every forty layers, wall 21.6 s -> 22.8 s. So it works and it costs more than it saves at
-    // this size: +1.3 points of hit rate against +5.6% wall. Keep it off; a fill that pays needs to run
-    // off the calling thread, which is what D1's queue is for and what the arena now makes possible.
-    // port (sm_89): D1 read-ahead. One *batch* a layer, not one expert: NINFER_PREFETCH_PER_LAYER
-    // (default 8) experts, taken from the top of the decayed route score among the ones the pool does
-    // not hold. Batching matters twice - a batch of pinned slices submits far cheaper per slice than
-    // the same slices one at a time, and the arena fill is a memcpy per expert either way.
-    //
-    // The pool a prefetch aims at is R3 (NINFER_PREFETCH_SLOTS, plan D1), sized by D2's budget; the
-    // arena is what stands in for it here. This is the wiring and the batch size, not the queue: the
-    // fill still runs on the calling thread, which is why no performance conclusion may be drawn from
-    // it yet - the queue in core/prefetch.h has to own the fill first.
-    static const bool prefetch = std::getenv("NINFER_PREFETCH") != nullptr;
-    if (prefetch && host_ != nullptr) {
+    // 1. The selection (below) is unchanged: NINFER_PREFETCH_PER_LAYER (default 8) experts, taken
+    //    from the top of the decayed route score among the ones the pool does not hold. Batching
+    //    matters twice - a batch of pinned slices submits far cheaper per slice than the same slices
+    //    one at a time, and the arena fill is a memcpy per expert either way.
+    // 2. NINFER_PREFETCH_SYNC keeps the original fill on the calling thread. It is the A/B
+    //    reference for the queued path and nothing else, so it is a separate switch rather than
+    //    the same one wearing two meanings.
+    // 3. NINFER_PREFETCH offers the same batch to the process-wide queue. The queue takes the bank
+    //    and the expert list with the job and holds the residency weakly, so forty banks share one
+    //    worker and a job cannot outlive the model it fills. The job body is still a placeholder:
+    //    it counts itself and stages nothing (that is item 4), so turning this on today changes
+    //    nothing about what is resident.
+    static const bool prefetch_sync  = std::getenv("NINFER_PREFETCH_SYNC") != nullptr;
+    static const bool prefetch_queue = std::getenv("NINFER_PREFETCH") != nullptr;
+    if ((prefetch_sync || prefetch_queue) && host_ != nullptr) {
         static const std::uint32_t per_layer = [] {
             const char* value = std::getenv("NINFER_PREFETCH_PER_LAYER");
             if (value != nullptr && *value != '\0') {
@@ -1416,20 +1415,38 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         if (!top.empty()) {
             std::vector<std::int32_t> wanted(top.size());
             for (std::size_t i = 0; i < top.size(); ++i) { wanted[i] = top[i].second; }
-            host_->ensure(ExpertBankId{bank_}, std::span<const std::int32_t>(wanted), nullptr);
+            if (prefetch_sync) {
+                host_->ensure(ExpertBankId{bank_}, std::span<const std::int32_t>(wanted), nullptr);
+            } else {
+                // Due/now are the queue's D3 deadline, which has no step clock to read yet: 0/1 is
+                // the honest "no deadline" it accepts, not a value chosen to pass a check.
+                (void)ExpertPrefetchQueue::instance().enqueue(
+                    host_weak_, bank_, std::span<const std::int32_t>(wanted),
+                    static_cast<std::size_t>(wanted.size()) * host_->slot_bytes(), 1, 0);
+            }
             prefetch_calls_ += wanted.size();
             if ((++prefetch_batches_ % 40) == 0) {
-                const auto& st = host_->stats();
-                const auto total = st.hits + st.misses;
-                std::fprintf(stderr, "[pf] experts=%llu batches=%llu hit=%.1f%% evict=%llu\n",
+                const auto& st    = host_->stats();
+                const auto total  = st.hits + st.misses;
+                const auto queued = ExpertPrefetchQueue::instance().stats();
+                std::fprintf(stderr,
+                             "[pf] experts=%llu batches=%llu hit=%.1f%% evict=%llu | q enq=%llu "
+                             "drop=%llu ran=%llu expired=%llu useful=%.2f\n",
                              (unsigned long long)prefetch_calls_,
                              (unsigned long long)prefetch_batches_,
                              total ? 100.0 * (double)st.hits / (double)total : 0.0,
-                             (unsigned long long)st.evictions);
+                             (unsigned long long)st.evictions,
+                             (unsigned long long)queued.queue.enqueued,
+                             (unsigned long long)(queued.queue.dropped_budget +
+                                                  queued.queue.dropped_deadline +
+                                                  queued.queue.dropped_stopped),
+                             (unsigned long long)queued.ran, (unsigned long long)queued.expired,
+                             queued.queue.usefulness());
                 std::fflush(stderr);
             }
         }
-    }    // port (sm_89): A3b, on the per-bank generation this time. A layer is about to hand these two
+    }
+    // port (sm_89): A3b, on the per-bank generation this time. A layer is about to hand these two
     // tables to kernels that read them as addresses; if what this bank's Device tables hold is not
     // what this bank's set now is, a publish did not land and the kernels would compute with another
     // set's offsets - a silent wrong token, the one outcome the plan never accepts.
