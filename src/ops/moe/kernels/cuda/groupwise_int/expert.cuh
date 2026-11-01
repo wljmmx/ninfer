@@ -44,9 +44,19 @@ struct StridedExpertMatrix {
 struct IndexedExpertMatrix {
     PackedExpertMatrix planes;
     const std::uint64_t* offsets;
+    // port (sm_89): Q20's second leg. Null on every path that was not asked for it, which is why
+    // the branch below costs one null test per expert rather than a separate kernel variant.
+    PackedExpertMatrix host;
+    const std::uint64_t* host_offsets;
+    const std::int32_t* host_flags;
 
     template <int Rows>
     __device__ __forceinline__ ExpertPlanes resolve(int expert) const {
+        if (host_flags != nullptr && host_flags[expert] != 0) {
+            const auto offset = host_offsets[expert];
+            return {host.codes + offset, host.high ? host.high + offset : nullptr,
+                    host.scales + offset, 0};
+        }
         const auto offset = offsets[expert];
         return {planes.codes + offset, planes.high ? planes.high + offset : nullptr,
                 planes.scales + offset, 0};
@@ -65,14 +75,26 @@ inline PackedExpertMatrix matrix(const Weight& weight) {
             static_cast<const std::uint8_t*>(weight.scales)};
 }
 
+// port (sm_89): the second leg as the kernel wants it - three plane bases, no strides, because a
+// pinned slot is one contiguous expert image exactly like a pool slot.
+inline PackedExpertMatrix host_matrix(const ExpertMatrixDeviceView& view) {
+    return {reinterpret_cast<const std::uint8_t*>(view.host_codes),
+            reinterpret_cast<const std::uint8_t*>(view.host_high),
+            reinterpret_cast<const std::uint8_t*>(view.host_scales)};
+}
+
 template <class Function>
 void with_expert_addresses(const CudaSwiGLUExperts& experts, const RoutedSwiGLUProfile& profile,
                            Function&& function) {
     const auto& gu   = experts.bank.gate_up;
     const auto& down = experts.bank.down;
     if (gu.offsets) {
-        function(IndexedExpertMatrix{matrix(gu), gu.offsets},
-                 IndexedExpertMatrix{matrix(down), down.offsets});
+        // Q20: the second leg travels with the indexed form only. An affine or packed bank is a
+        // layout whose experts are addressed by stride, and the host tier cannot serve that shape.
+        function(IndexedExpertMatrix{matrix(gu), gu.offsets, host_matrix(gu), gu.host_offsets,
+                                     gu.host_flags},
+                 IndexedExpertMatrix{matrix(down), down.offsets, host_matrix(down),
+                                     down.host_offsets, down.host_flags});
         return;
     }
     const auto packed = [](const ExpertMatrixDeviceView& view, QType type, int n, int k) {

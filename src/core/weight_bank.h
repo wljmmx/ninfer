@@ -103,6 +103,21 @@ struct ExpertMatrixDeviceView {
     // Indexed addresses refer into this backing; the owner retains selected entries through
     // execution.
     ConstMemorySpan indexed_storage;
+
+    // port (sm_89): Q20's second addressing leg, and the reason the host arena is mapped.
+    //
+    // When `host_flags[expert]` is non-zero the expert's planes are read from `host_*` at
+    // `host_offsets[expert]` instead of from codes/high/scales at `offsets[expert]`. Both legs are
+    // one table of the same shape, so a route the pool cannot hold is served by the same GEMM from
+    // the pinned tier: no upload, no CPU half, and nothing in the layer the host has to wait on.
+    //
+    // All five are null on every existing path. The kernel tests `host_flags` alone, so the
+    // publisher must set the other four whenever it sets that one.
+    const std::byte* host_codes       = nullptr;
+    const std::byte* host_high        = nullptr;
+    const std::byte* host_scales      = nullptr;
+    const std::uint64_t* host_offsets = nullptr;
+    const std::int32_t* host_flags    = nullptr;
 };
 
 struct ExpertBankDeviceView {

@@ -405,6 +405,20 @@ private:
     // through ExpertSubsetKind::MaskOnes and leaves the rest to the host tier.
     std::unique_ptr<DeviceBuffer> mask_device_;
     std::vector<std::int32_t> mask_host_;
+    // port (sm_89): Q20's second leg, as tables the kernel reads.
+    //
+    //   host_flags[e]   1 => this expert's planes come from the pinned tier, not the pool
+    //   host_offsets[e] slot * slot_bytes inside that tier
+    //
+    // Both are written on the same cadence as the pool tables and published the same way. When the
+    // switch is off they stay empty and the kernel's `host_flags != nullptr` test is the only trace.
+    std::vector<std::uint64_t> host_offsets_;
+    std::vector<std::int32_t> host_flags_;
+    std::unique_ptr<DeviceBuffer> host_offsets_device_;
+    std::unique_ptr<DeviceBuffer> host_flags_device_;
+    // Where each plane starts inside a slot, so the Device bases are arena_device_base() + offset.
+    std::uint64_t host_gate_up_plane_[3] = {};
+    std::uint64_t host_down_plane_[3]    = {};
     std::unique_ptr<PinnedHostBuffer> route_staging_;    // O1's device verdict: one mapped word, stored by the coverage kernel and read by the host.
     std::unique_ptr<PinnedHostBuffer> coverage_word_;
     std::uint32_t* coverage_word_host_   = nullptr;

@@ -85,6 +85,9 @@ public:
         // per expert, because that is the lifetime that matters: whichever expert the slot holds
         // next loses the mark, and only a hit on the same slot can count as usefulness.
         prefetched_.assign(slot_capacity_, 0);
+        // Q20 second leg: slots a queued GEMM is addressing. Two generations, see begin_layer().
+        device_held_.assign(slot_capacity_, 0);
+        device_held_prev_.assign(slot_capacity_, 0);
 
         state_.resize(banks_.size());
         direct_.assign(banks_.size(), false);
@@ -526,6 +529,60 @@ public:
     // treat the bytes at an offset as valid only for a slot `claim()` currently names - the arena
     // moves slots, the address space does not.
     [[nodiscard]] const std::byte* arena_device_base() const noexcept { return arena_device_; }
+
+    // port (sm_89): Q20 second leg, host side. Three things the Device publisher needs, all read
+    // under the same lock the fill path takes:
+    //
+    //   plane_offsets  - where each plane starts inside a slot, so the Device bases are
+    //                    arena_device_base() + offset and the per-expert table is just slot*bytes
+    //   peek           - which slot an expert occupies RIGHT NOW, without filling it and without
+    //                    marking it in flight. -1 means "not in RAM", and a caller that reads it
+    //                    anyway would get another expert's bytes
+    //   hold/release   - keep a slot from being evicted while the Device is reading it. The layer
+    //                    reads asynchronously, so a claim() in the next layer can otherwise move the
+    //                    bytes out from under a GEMM that has not run yet.
+    [[nodiscard]] bool plane_offsets(std::uint32_t bank, std::uint64_t gate_up[3],
+                                     std::uint64_t down[3], std::uint64_t& gate_up_high_bytes,
+                                     std::uint64_t& down_high_bytes) const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (arena_device_ == nullptr || bank >= banks_.size()) { return false; }
+        const auto& e      = banks_[bank].entry;
+        gate_up[0]         = e.codes.offset;
+        gate_up[1]         = e.high.offset;
+        gate_up[2]         = e.scales.offset;
+        down[0]            = e.down_codes.offset;
+        down[1]            = e.down_high.offset;
+        down[2]            = e.down_scales.offset;
+        gate_up_high_bytes = e.high.bytes;
+        down_high_bytes    = e.down_high.bytes;
+        return true;
+    }
+    [[nodiscard]] std::int64_t peek_slot(std::uint32_t bank, std::uint32_t expert) const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (bank >= state_.size() || expert >= state_[bank].slot_of.size()) { return -1; }
+        const auto slot = state_[bank].slot_of[expert];
+        return slot == kNone ? -1 : static_cast<std::int64_t>(slot);
+    }
+    void hold_for_device(std::uint32_t bank, std::uint32_t expert) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (bank >= state_.size() || expert >= state_[bank].slot_of.size()) { return; }
+        const auto slot = state_[bank].slot_of[expert];
+        if (slot != kNone && slot < device_held_.size()) { device_held_[slot] = 1; }
+    }
+    // port (sm_89): two generations, not one. The Device reads asynchronously, and the next layer's
+    // fill happens before the previous layer's GEMM has necessarily finished, so a single set cleared
+    // at layer start would release exactly the slots that are still being read. Rotating means a slot
+    // is protected for the layer that named it and the one after, and released only once a later
+    // layer has waited on the stream.
+    void begin_layer() {
+        std::lock_guard<std::mutex> guard(mutex_);
+        std::swap(device_held_, device_held_prev_);
+        std::fill(device_held_.begin(), device_held_.end(), std::uint8_t{0});
+    }
+    void release_device_holds() {
+        std::lock_guard<std::mutex> guard(mutex_);
+        std::fill(device_held_.begin(), device_held_.end(), std::uint8_t{0});
+    }
     // The two pools inside the arena (see claim()).
     [[nodiscard]] std::uint32_t routed_capacity() const noexcept { return routed_capacity_; }
     [[nodiscard]] std::uint32_t prefetch_slots() const noexcept { return prefetch_slots_; }
@@ -659,6 +716,10 @@ private:
             // exists to prevent (a read-ahead issued after wait_for_progress() freed the slot an
             // in-flight copy was reading).
             if (in_flight_[s] != 0) { continue; }
+            // A slot the Device is reading is not a candidate either, and for the same reason: the
+            // GEMM runs asynchronously, so claim() in the next layer can free a slot whose bytes are
+            // still being consumed. Released once per layer, after the stream has been waited on.
+            if (device_held_[s] != 0 || device_held_prev_[s] != 0) { continue; }
             if (slot_last_use_[s] < coldest) {
                 coldest = slot_last_use_[s];
                 victim  = s;
@@ -788,6 +849,11 @@ private:
     // mutable: arena_image() is const (it is the uploader's view) but handing out a pointer is what
     // marks the slot in flight.
     mutable std::vector<std::uint8_t> in_flight_;
+    // Slots the Device is addressing this layer (Q20 second leg). Kept apart from in_flight_: that
+    // one covers a copy the uploader is reading, this one covers a GEMM that has been queued but may
+    // not have run. Both make a slot un-evictable; they end at different times.
+    mutable std::vector<std::uint8_t> device_held_;
+    mutable std::vector<std::uint8_t> device_held_prev_;
     // Slots the read-ahead filled and a routed layer has not consumed yet (D4's numerator).
     std::vector<std::uint8_t> prefetched_;
     std::uint64_t prefetch_hits_ = 0;
