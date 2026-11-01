@@ -258,6 +258,23 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
                         .key      = key != nullptr ? *key : PrefixShortlistKey{},
                         .frontier = kv.frontier};
     checkpoints[handle->index].reserved = false;
+    if (!pin_pages) {
+        // port (sm_89): the readings the adopt path decides on, taken at the moment the record is
+        // complete. Without them "the import cannot be taken over" is a guess about three counters.
+        const auto tail_index = text_kv_addresses->page_count(*address) - 1U;
+        const auto tail       = text_kv_addresses->logical_page(*address, tail_index);
+        std::fprintf(stderr,
+                     "[kvt] import refs: addr_refs=%u src_pins=%d truncate=%d state_refs=%u "
+                     "state_pins=%d tail_page=%u/%u\n",
+                     text_kv_pages->address_references(tail), text_kv_pages->source_pins(tail) ? 1 : 0,
+                     text_kv_addresses->can_destructive_truncate_inactive(*address, kv.frontier, true)
+                         ? 1
+                         : 0,
+                     state_store->checkpoint_references(*state),
+                     state_store->source_pins(*state) ? 1 : 0, tail_index,
+                     text_kv_addresses->page_count(*address));
+        std::fflush(stderr);
+    }
     return handle;
 }
 
