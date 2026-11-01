@@ -1437,6 +1437,14 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             top.emplace_back(hot_score_[expert], expert);
         };
         const std::size_t before = top.size();
+        // Q68b: the prediction comes first now. It is what this layer's router would pick from the
+        // previous layer's residual stream - measured at 74% of the real routes, 25x the chance
+        // level - so it is a better target than either of the two history signals below.
+        const std::size_t predicted_before = top.size();
+        for (const auto expert : predicted_) { take(expert); }
+        prefetch_predicted_ += top.size() - predicted_before;
+        // Then the previous step of this same bank (7% of the time it survives residency), and the
+        // decayed score only fills whatever is left.
         for (const auto expert : prev_routes_) { take(expert); }
         // How many of the wanted experts came from the previous step rather than from the score.
         // This is the kill-switch for the idea: if it is zero the recency signal never applies (the
@@ -1492,10 +1500,11 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 const auto total  = st.hits + st.misses;
                 const auto queued = ExpertPrefetchQueue::instance().stats();
                 std::fprintf(stderr,
-                             "[pf] experts=%llu recent=%llu batches=%llu hit=%.1f%% evict=%llu | q enq=%llu "
+                             "[pf] experts=%llu pred=%llu recent=%llu batches=%llu hit=%.1f%% evict=%llu | q enq=%llu "
                              "drop(budget=%llu off=%llu deadline=%llu backlog=%llu stopped=%llu) "
                              "ran=%llu expired=%llu pending=%llu/%llu useful=%.2f\n",
                              (unsigned long long)prefetch_calls_,
+                             (unsigned long long)prefetch_predicted_,
                              (unsigned long long)prefetch_recent_,
                              (unsigned long long)prefetch_batches_,
                              total ? 100.0 * (double)st.hits / (double)total : 0.0,

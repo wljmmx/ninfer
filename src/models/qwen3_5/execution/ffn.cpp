@@ -49,6 +49,14 @@ RouterProbeBuffer& router_probe_buffer() {
     return buffer;
 }
 
+// The prediction is also a production input (NINFER_PREFETCH_PREDICT drives the read-ahead), so the
+// buffer has to exist for either switch. Only the probe prints, and only the probe pays the extra
+// read-back of the real routes.
+bool router_predict_enabled() {
+    static const bool enabled = std::getenv("NINFER_PREFETCH_PREDICT") != nullptr;
+    return enabled;
+}
+
 // port (sm_89): where a split token goes, node by node, on both sides of the PCIe lane.
 //
 // The host nodes are wall clock. The Device half cannot be: its kernel is enqueued and returns at
@@ -903,44 +911,53 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
     } catch (const std::exception& error) {
         throw std::invalid_argument(std::string("expert stream route: ") + error.what());
     }
-    // port (sm_89): Q68b. What would this layer's routes be if its router saw the *previous* layer's
-    // residual stream? Predicted = top-K(control * z_(L-1)), actual = the routes just computed. This
-    // is the measurement the old probe could not make: copying expert ids across layers is not a
-    // prediction (2-3%, i.e. the random level), while applying the next router to the residual stream
-    // is. Diagnostic only - the real routes above are untouched and this never runs in capture.
-    if (predictor_input != nullptr && columns == 1 && router_probe_enabled()) {
+    // port (sm_89): Q68b. Two uses of one prediction - what this layer's routes would be if its
+    // router saw the *previous* layer's residual stream:
+    //   * NINFER_LAYER_PROBE=2 measures it against the real routes;
+    //   * NINFER_PREFETCH_PREDICT=1 hands it to the stream, which is where the read-ahead decision
+    //     lives, so the queue can fetch "predicted and not resident" instead of "historically hot".
+    // The prediction is computed here because only this scope has both the router and the stream.
+    static const bool predict_routes = router_predict_enabled();
+    if (predictor_input != nullptr && columns == 1 && (router_probe_enabled() || predict_routes)) {
         auto guess_ids    = workspace.alloc(DType::I32, {routed.top_k, 1});
         auto guess_coeffs = workspace.alloc(DType::FP32, {routed.top_k, 1});
         auto guess_shared = workspace.alloc(DType::FP32, {1});
-        auto guess_scratch =
-            workspace.alloc_bytes(stream_route_bytes(moe, 1, 1));
+        auto guess_scratch = workspace.alloc_bytes(stream_route_bytes(moe, 1, 1));
         MemoryArena guess_arena(
             MemorySpan{guess_scratch.data, guess_scratch.bytes, execution.device()});
         ops::ExpertRoutes guessed{guess_ids, guess_coeffs};
         ops::topk_softmax_route(*predictor_input, route_profile, moe.control, guessed, guess_shared,
                                 guess_arena, execution);
-        // Two 32-byte read-backs and a sync per layer: acceptable for a probe, which is exactly why
-        // it is not the mechanism.
-        std::vector<std::int32_t> actual(routed.top_k), guess(routed.top_k);
+        std::vector<std::int32_t> guess(routed.top_k);
         const std::size_t bytes = static_cast<std::size_t>(routed.top_k) * sizeof(std::int32_t);
-        (void)cudaMemcpyAsync(actual.data(), ids.data, bytes, cudaMemcpyDeviceToHost, execution.stream);
         (void)cudaMemcpyAsync(guess.data(), guess_ids.data, bytes, cudaMemcpyDeviceToHost,
                               execution.stream);
-        (void)cudaStreamSynchronize(execution.stream);
-        std::size_t hit = 0;
-        for (const auto id : actual) {
-            for (const auto other : guess) {
-                if (id == other) { ++hit; break; }
-            }
+        if (predict_routes) {
+            (void)cudaStreamSynchronize(execution.stream);
+            moe.stream->set_predicted(guess);
         }
-        static double recall_sum = 0.0;
-        static std::uint64_t probes = 0;
-        recall_sum += static_cast<double>(hit) / static_cast<double>(routed.top_k);
-        if (++probes % 40 == 0) {
-            std::fprintf(stderr, "[probe2] recall_pred=%.3f layers=%llu\n", recall_sum / 40.0,
-                         static_cast<unsigned long long>(probes));
-            std::fflush(stderr);
-            recall_sum = 0.0;
+        if (router_probe_enabled()) {
+            // Diagnostic: two 32-byte read-backs and a sync per layer, which is why the probe is not
+            // the mechanism.
+            std::vector<std::int32_t> actual(routed.top_k);
+            (void)cudaMemcpyAsync(actual.data(), ids.data, bytes, cudaMemcpyDeviceToHost,
+                                  execution.stream);
+            (void)cudaStreamSynchronize(execution.stream);
+            std::size_t hit = 0;
+            for (const auto id : actual) {
+                for (const auto other : guess) {
+                    if (id == other) { ++hit; break; }
+                }
+            }
+            static double recall_sum = 0.0;
+            static std::uint64_t probes = 0;
+            recall_sum += static_cast<double>(hit) / static_cast<double>(routed.top_k);
+            if (++probes % 40 == 0) {
+                std::fprintf(stderr, "[probe2] recall_pred=%.3f layers=%llu\n", recall_sum / 40.0,
+                             static_cast<unsigned long long>(probes));
+                std::fflush(stderr);
+                recall_sum = 0.0;
+            }
         }
     }
     // port (sm_89): one read-back per layer. The residency decision needs the 32 route ids and the
@@ -1758,8 +1775,15 @@ bool router_probe_enabled() {
     return enabled;
 }
 
+// The prediction is also a production input now (NINFER_PREFETCH_PREDICT drives the read-ahead), so
+// the buffer has to exist for either switch - but only the probe prints, and only the probe pays the
+// extra read-back of the real routes.
+
 void router_probe_save(const Tensor& residual) {
-    if (!router_probe_enabled() || residual.ne[1] != 1 || residual.data == nullptr) { return; }
+    if ((!router_probe_enabled() && !router_predict_enabled()) || residual.ne[1] != 1 ||
+        residual.data == nullptr) {
+        return;
+    }
     auto& buffer      = router_probe_buffer();
     const std::size_t bytes = static_cast<std::size_t>(residual.ne[0]) * sizeof(std::uint16_t);
     if (buffer.data == nullptr || buffer.bytes < bytes) {
@@ -1780,7 +1804,7 @@ void router_probe_save(const Tensor& residual) {
 }
 
 const Tensor* router_probe_input(Device device) {
-    if (!router_probe_enabled()) { return nullptr; }
+    if (!router_probe_enabled() && !router_predict_enabled()) { return nullptr; }
     auto& buffer = router_probe_buffer();
     if (!buffer.valid || buffer.data == nullptr) { return nullptr; }
     static thread_local Tensor view;

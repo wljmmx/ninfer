@@ -221,6 +221,11 @@ public:
     // to count its misses on the device. Null until such a capture exists.
     [[nodiscard]] const std::uint32_t* device_miss_counter() const noexcept { return nullptr; }
 
+    // port (sm_89): Q68b. The experts this layer's router would pick if it saw the previous layer's
+    // residual stream. The prediction is made where the router lives (ffn), and this is where it is
+    // consumed: the read-ahead asks for "predicted and not resident" instead of "historically hot".
+    void set_predicted(std::vector<std::int32_t> ids) { predicted_ = std::move(ids); }
+
 private:
     std::uint32_t count_          = 0;
     WeightBankLayout gate_up_;
@@ -235,6 +240,7 @@ private:
 
     ExpertCache* cache_ = nullptr;
     HostExpertResidency* host_ = nullptr;
+
     // port (sm_89): the experts this bank routed on its previous small-batch step (D1's selection).
     //
     // The decayed score ranks what this bank has been using, and what it has been using is what the
@@ -242,6 +248,7 @@ private:
     // itself token to token, so the previous step's routes are the ones most likely to be wanted
     // again after an eviction, and they are the ones a read-ahead should fetch.
     std::vector<std::int32_t> prev_routes_;
+    std::vector<std::int32_t> predicted_;
     std::weak_ptr<HostExpertResidency> host_weak_;
     std::uint32_t bank_ = 0;
     // port (sm_89): A3b. The per-bank generation this bank's Device tables actually hold, set only when
@@ -253,6 +260,7 @@ private:
     std::uint64_t prefetch_calls_ = 0;   // experts
     std::uint64_t prefetch_batches_ = 0; // layers that prefetched
     std::uint64_t prefetch_recent_ = 0;  // of those experts, how many came from the previous step
+    std::uint64_t prefetch_predicted_ = 0; // ... and how many from the router prediction (Q68b)
     ExpertBankLayout entry_{};
     // port (sm_89): the pool holds every layer at once, so this bank's window is fixed and no
     // per-step routing decision - and therefore no host round trip - is needed.
