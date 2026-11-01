@@ -48,7 +48,17 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
             std::fflush(stderr);
         }
     }
-    if (!base.impl_ || (handle && !checkpoint_matches(*handle, base))) { return std::nullopt; }
+    if (!base.impl_ || (handle && !checkpoint_matches(*handle, base))) {
+        // port (sm_89): Q54 - an import the request then refuses is an orphan. It owns KV pages and a
+        // state slot, and nothing else in the engine will ever release it, because no request ever
+        // adopted it. Measured as a request that failed with every resource reading zero: the
+        // rejected checkpoint still held them.
+        //
+        // Releasing here turns a refusal into a cold prefix, which is the honest outcome - the tier
+        // had bytes, this model cannot use them.
+        if (from_tier && handle) { release_checkpoint(*handle); }
+        return std::nullopt;
+    }
     SourceCandidate candidate{.checkpoint    = handle,
                               .reused_tokens = handle ? checkpoint(*handle).frontier : 0};
     const auto& prompt       = *base.impl_->prompt;
