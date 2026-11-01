@@ -59,10 +59,21 @@ public:
         for (const auto& bank : banks_) {
             widest = std::max(widest, bank.entry.entry_bytes);
         }
-        constexpr std::uint64_t kBlock = 128 * 1024;
-        slot_bytes_    = (widest + kBlock - 1) / kBlock * kBlock;
-        arena_bytes_   = std::max(arena_bytes_, slot_bytes_);
+        slot_bytes_ = slot_bytes_for(widest);
+        arena_bytes_ = std::max(arena_bytes_, slot_bytes_);
+        // port (sm_89): R3. The read-ahead gets slots of its own, carved out of the end of the
+        // arena. Shared slots made the mechanism untestable: a layer routes 320 experts through a
+        // 496-slot tier, so anything the read-ahead filled was evicted by the next layer's own
+        // routes before it could pay - the prefetch measured zero hits for a reason that had
+        // nothing to do with its selection. Reserved only when the read-ahead is on, so a default
+        // run allocates exactly what it did before.
+        prefetch_slots_ = prefetch_slots_from_env();
+        // Carved out of the budget the caller granted, not added to it: the caller asks the ledger
+        // for `prefetch_bytes_for()` on top and passes the total, so the RAM that R3 uses is the
+        // RAM that was accounted. Adding it here as well counted it twice (930 -> 1410 MiB).
         slot_capacity_ = static_cast<std::uint32_t>(arena_bytes_ / slot_bytes_);
+        if (prefetch_slots_ > slot_capacity_) { prefetch_slots_ = slot_capacity_; }
+        routed_capacity_ = slot_capacity_ - prefetch_slots_;
         slot_bank_.assign(slot_capacity_, kNone);
         slot_expert_.assign(slot_capacity_, kNone);
         slot_last_use_.assign(slot_capacity_, 0);
@@ -359,6 +370,27 @@ public:
         }
     }
 
+    // port (sm_89): R3's shape, in one place so the budget that reserves the bytes and the class
+    // that uses them cannot disagree.
+    static std::uint64_t slot_bytes_for(std::uint64_t entry_bytes) {
+        constexpr std::uint64_t kBlock = 128 * 1024;
+        return (entry_bytes + kBlock - 1) / kBlock * kBlock;
+    }
+    // Slots the read-ahead owns. Zero unless the read-ahead is on: an off switch must not move the
+    // arena size, or "prefetch off" would stop being the baseline it is compared against.
+    static std::uint32_t prefetch_slots_from_env() {
+        if (std::getenv("NINFER_PREFETCH") == nullptr) { return 0; }
+        if (const char* value = std::getenv("NINFER_PREFETCH_SLOTS");
+            value != nullptr && *value != '\0') {
+            return static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
+        }
+        return 128;
+    }
+    // Bytes those slots add to the arena, so the ledger can be told before the arena exists.
+    static std::uint64_t prefetch_bytes_for(std::uint64_t entry_bytes) {
+        return std::uint64_t{prefetch_slots_from_env()} * slot_bytes_for(entry_bytes);
+    }
+
     void ensure(ExpertBankId bank, std::span<const std::int32_t> experts,
                 const std::int32_t* resident_mask) override {
         // port (sm_89): the slot tables and the arena are mutated here and read by the uploader in
@@ -404,14 +436,17 @@ public:
             return;
         }
         auto& s = state_[bank.index];
-        // port (sm_89): a call that wants more experts than the arena has slots would evict the
+        // port (sm_89): a call that wants more experts than its pool has slots would evict the
         // slots it just filled, and the offsets handed back would name another expert's bytes. That
         // is silent corruption, not a slowdown, so it fails here instead. A 1-slot arena turned a
         // split PPL of 7.766 into 1131 before this check existed.
-        if (experts.size() > slot_capacity_) {
+        const auto capacity = prefetch ? prefetch_slots_ : routed_capacity_;
+        if (prefetch && prefetch_slots_ == 0) { return; } // read-ahead off: no pool to fill
+        if (experts.size() > capacity) {
             throw std::runtime_error("host expert arena: one layer needs " +
-                                     std::to_string(experts.size()) + " slots but the arena holds " +
-                                     std::to_string(slot_capacity_) +
+                                     std::to_string(experts.size()) + " slots but the " +
+                                     (prefetch ? "read-ahead pool holds " : "arena holds ") +
+                                     std::to_string(capacity) +
                                      "; raise NINFER_EXPERT_HOST_ARENA_MB");
         }
         for (const auto value : experts) {
@@ -420,7 +455,7 @@ public:
             auto& slot        = s.slot_of[expert];
             if (slot == kNone) {
                 ++stats_.misses;
-                slot = claim(bank.index, expert);
+                slot = claim(bank.index, expert, prefetch);
                 load(bank.index, expert, slot);
                 // The mark lives with the slot, so an eviction clears it: a slot reused by a routed
                 // expert is not "a prefetched expert that was used".
@@ -485,6 +520,9 @@ public:
     }
     [[nodiscard]] std::uint64_t slot_bytes() const noexcept { return slot_bytes_; }
     [[nodiscard]] std::uint32_t slot_capacity() const noexcept { return slot_capacity_; }
+    // The two pools inside the arena (see claim()).
+    [[nodiscard]] std::uint32_t routed_capacity() const noexcept { return routed_capacity_; }
+    [[nodiscard]] std::uint32_t prefetch_slots() const noexcept { return prefetch_slots_; }
 
     // port (sm_89): what the arena actually did. A split run is only cheap when `miss` stops
     // growing: a miss is an artifact read, a hit is a byte range that was already in RAM. Reported
@@ -567,16 +605,23 @@ private:
 #endif
     }
 
-    std::uint32_t claim(std::uint32_t bank, std::uint32_t expert) {
-        if (used_ < slot_capacity_) {
-            const auto slot    = used_++;
+    // port (sm_89): two pools, one arena. The routed range is [0, routed_capacity_), the read-ahead's
+    // is [routed_capacity_, slot_capacity_). They are carved apart so a layer's own routes cannot
+    // evict what the read-ahead just filled - with one shared range that is exactly what happened,
+    // and the prefetch reported zero hits for a reason that had nothing to do with its selection.
+    std::uint32_t claim(std::uint32_t bank, std::uint32_t expert, bool prefetch) {
+        const std::uint32_t begin = prefetch ? routed_capacity_ : 0;
+        const std::uint32_t end   = prefetch ? slot_capacity_ : routed_capacity_;
+        std::uint32_t& used       = prefetch ? used_prefetch_ : used_;
+        if (used < end - begin) {
+            const auto slot    = begin + used++;
             slot_bank_[slot]   = bank;
             slot_expert_[slot] = expert;
             return slot;
         }
         std::uint32_t victim  = kNone;
         std::uint64_t coldest = ~std::uint64_t{0};
-        for (std::uint32_t s = 0; s < slot_capacity_; ++s) {
+        for (std::uint32_t s = begin; s < end; ++s) {
             // A slot a copy is reading is not a candidate, whatever its age. Evicting it would hand
             // the Device another expert's bytes with no error anywhere - the crash this protection
             // exists to prevent (a read-ahead issued after wait_for_progress() freed the slot an
@@ -593,6 +638,7 @@ private:
         if (coldest == 0) { throw std::runtime_error("host expert arena: nothing to evict"); }
         ++stats_.evictions;
         state_[slot_bank_[victim]].slot_of[slot_expert_[victim]] = kNone;
+        prefetched_[victim]  = 0; // the slot now holds another expert, so the mark dies with it
         slot_bank_[victim]   = bank;
         slot_expert_[victim] = expert;
         return victim;
@@ -672,7 +718,12 @@ private:
     std::byte* arena_            = nullptr;
     bool pinned_                 = false;
     std::uint32_t slot_capacity_ = 0;
-    std::uint32_t used_          = 0;
+    // Slots [0, routed_capacity_) belong to the layers, [routed_capacity_, slot_capacity_) to the
+    // read-ahead. `used_` counts the first range's bump allocation, `used_prefetch_` the second's.
+    std::uint32_t used_            = 0;
+    std::uint32_t routed_capacity_ = 0;
+    std::uint32_t prefetch_slots_  = 0;
+    std::uint32_t used_prefetch_   = 0;
     std::vector<bool> direct_; // bank addressed in place, no arena copy
     // When set, an in-place bank still gets a managed pinned copy. Off by default so a run that
     // never asks for the warm tier behaves exactly as before.

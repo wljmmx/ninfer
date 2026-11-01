@@ -33,6 +33,7 @@ namespace ninfer::runtime {
 namespace {
 
 std::uint64_t host_expert_arena_bytes(std::uint64_t want_bytes);
+std::uint64_t readahead_bytes(std::span<const ExpertBankLayout> banks);
 using Clock = std::chrono::steady_clock;
 
 // port (sm_89): a sentinel that asks the engine to size the expert pool from free device memory.
@@ -247,7 +248,8 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     // is computed exactly as before (working-set estimate, RAM share, explicit override), so this
     // step is behaviour-neutral; what changes is that the amount is now accounted and printed
     // beside the other two tiers instead of being decided in isolation.
-    const std::uint64_t host_arena_bytes = host_expert_arena_bytes(host_want);
+    const std::uint64_t host_arena_bytes =
+        host_expert_arena_bytes(host_want) + readahead_bytes(requirements.banks);
     instance.ledger.set_cap(core::Tier::Device,
                             instance.expert_cache->capacity_bytes() + (260ull << 20));
     // The warm tier's ceiling is the budget it just computed, not "a quarter of free RAM": the
@@ -325,8 +327,9 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
             models::qwen3_5::execution::ExpertPrefetchQueue::instance().retain();
             instance.expert_prefetch_retained = true;
         }
-        std::fprintf(stderr, "[experts] host tier slots=%u slot_bytes=%llu\n",
-                     residency->slot_capacity(),
+        std::fprintf(stderr, "[experts] host tier slots=%u (%u routed + %u read-ahead) slot_bytes=%llu\n",
+                     residency->slot_capacity(), residency->routed_capacity(),
+                     residency->prefetch_slots(),
                      static_cast<unsigned long long>(residency->slot_bytes()));
         // port (sm_89): the Device uploader may read a miss out of this pinned tier instead of the
         // pageable artifact mapping. Only experts the host tier actually keeps are answered; the rest
@@ -410,6 +413,15 @@ std::uint64_t current_free_host_bytes() {
     if (GlobalMemoryStatusEx(&status) != 0) { return status.ullAvailPhys; }
 #endif
     return 0;
+}
+
+// port (sm_89): R3's bytes, asked for before the arena exists so the ledger is told the truth
+// rather than discovering the pool afterwards. Zero unless the read-ahead is on - an off switch
+// must not move the arena size, or "prefetch off" stops being the baseline it is compared against.
+std::uint64_t readahead_bytes(std::span<const ExpertBankLayout> banks) {
+    std::uint64_t widest = 0;
+    for (const auto& bank : banks) { widest = std::max(widest, bank.entry_bytes); }
+    return models::qwen3_5::execution::HostExpertResidency::prefetch_bytes_for(widest);
 }
 
 // Host-side arena for experts the Device pool cannot hold. It takes what the caller says the host
