@@ -360,7 +360,14 @@ public:
         // evict at any time, so it is a cold tier wearing a warm tier's address. A managed pinned
         // copy is therefore still worth keeping, and NINFER_ARENA_MANAGED asks for one even here:
         // that is what makes the warm tier a tier we control instead of a page cache we do not.
-        if (!managed_even_in_place() && bank.index < direct_.size() && direct_[bank.index]) {
+        // port (sm_89): F1 bisect, step 2. A bank addressed in place is built with file-based
+        // offsets and a parent pointing at the artifact; turning the managed copy on makes ensure()
+        // rewrite both to arena-based ones on the same object. NINFER_ARENA_SKIP_DIRECT restores the
+        // old early return for exactly those banks, so if the crash disappears the mixing of the two
+        // addressing schemes is the fault, and not the arena fill itself.
+        static const bool skip_direct = std::getenv("NINFER_ARENA_SKIP_DIRECT") != nullptr;
+        if ((skip_direct || !managed_even_in_place()) && bank.index < direct_.size() &&
+            direct_[bank.index]) {
             return;
         }
         auto& s = state_[bank.index];
