@@ -1548,6 +1548,13 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             ExpertPrefetchQueue::instance().note_used(static_cast<std::size_t>(hits) *
                                                       host_->slot_bytes());
         }
+        // Q69: a warmed expert that a routed fill later loaded is the same evidence as a filled
+        // slot that was routed to - it is the read-ahead having paid. Reported in bytes so the gate
+        // compares like with like.
+        if (const auto warm_hits = host_->take_warm_hits(); warm_hits != 0) {
+            ExpertPrefetchQueue::instance().note_used(static_cast<std::size_t>(warm_hits) *
+                                                      host_->slot_bytes());
+        }
         if (timing) {
             static std::uint64_t shown = 0;
             const auto& filled = host_->stats();
@@ -1740,7 +1747,19 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             std::vector<std::int32_t> wanted(top.size());
             for (std::size_t i = 0; i < top.size(); ++i) { wanted[i] = top[i].second; }
             if (prefetch_sync) {
-                host_->ensure(ExpertBankId{bank_}, std::span<const std::int32_t>(wanted), nullptr);
+                // Q69: the synchronous path is the A/B reference for the queued one, so it takes the
+                // same target the queued path would - otherwise the two arms would differ by two
+                // things instead of one.
+                static const bool warm_mode = [] {
+                    const char* value = std::getenv("NINFER_PREFETCH_MODE");
+                    return value != nullptr && std::strcmp(value, "warm") == 0;
+                }();
+                if (warm_mode) {
+                    host_->warm(ExpertBankId{bank_}, std::span<const std::int32_t>(wanted));
+                } else {
+                    host_->ensure(ExpertBankId{bank_}, std::span<const std::int32_t>(wanted),
+                                  nullptr);
+                }
             } else {
                 // D3: the deadline is measured in layer batches, so the clock is one tick per offer
                 // and it is process-wide - the forty banks are forty layers of the same step, and a
@@ -1770,7 +1789,8 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 std::fprintf(stderr,
                              "[pf] experts=%llu pred=%llu recent=%llu batches=%llu hit=%.1f%% evict=%llu | q enq=%llu "
                              "drop(budget=%llu off=%llu deadline=%llu backlog=%llu stopped=%llu) "
-                             "ran=%llu expired=%llu pending=%llu/%llu useful=%.2f\n",
+                             "ran=%llu expired=%llu pending=%llu/%llu useful=%.2f | "
+                             "warm=%llu MiB memcpy_hits=%llu skip=%llu\n",
                              (unsigned long long)prefetch_calls_,
                              (unsigned long long)prefetch_predicted_,
                              (unsigned long long)prefetch_recent_,
@@ -1786,7 +1806,10 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                              (unsigned long long)queued.ran, (unsigned long long)queued.expired,
                              (unsigned long long)queued.pending,
                              (unsigned long long)queued.max_pending,
-                             queued.queue.usefulness());
+                             queued.queue.usefulness(),
+                             (unsigned long long)(st.warmed_bytes >> 20),
+                             (unsigned long long)st.memcpy_hits,
+                             (unsigned long long)st.warm_skips);
                 std::fflush(stderr);
             }
         }

@@ -3,6 +3,7 @@
 #include "models/qwen3_5/execution/host_expert_residency.h"
 
 #include <cstdlib>
+#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -57,6 +58,22 @@ std::size_t max_pending() {
 
 } // namespace
 
+// Q69: which target a read-ahead should take.
+//
+//   tier (default) - fill an arena slot. That is what D1 was built for and what every recorded
+//                    `useful=` number was measured with; it also competes with the routes of the
+//                    layer that follows, which is why four fifths of it was never routed to.
+//   warm           - pull the bytes through the buffered reader and let the OS hold them. No slot is
+//                    claimed and nothing can be evicted; the fill that follows a real miss becomes a
+//                    memcpy out of the page cache (the same 8.6 ms -> 0.2 ms this project measured
+//                    on the fill path).
+//
+// The two are alternatives, not layers: doing both would read every expert twice.
+bool warm_target() {
+    const char* value = std::getenv("NINFER_PREFETCH_MODE");
+    return value != nullptr && std::strcmp(value, "warm") == 0;
+}
+
 ExpertPrefetchQueue& ExpertPrefetchQueue::instance() {
     static ExpertPrefetchQueue queue;
     return queue;
@@ -106,8 +123,13 @@ bool ExpertPrefetchQueue::enqueue(std::weak_ptr<HostExpertResidency> host, std::
                 ++expired_;
                 return false;
             }
-            residency->fill_prefetch(ExpertBankId{job->bank},
-                                     std::span<const std::int32_t>(job->experts));
+            if (warm_target()) {
+                residency->warm(ExpertBankId{job->bank},
+                                std::span<const std::int32_t>(job->experts));
+            } else {
+                residency->fill_prefetch(ExpertBankId{job->bank},
+                                         std::span<const std::int32_t>(job->experts));
+            }
             std::lock_guard lock(mutex_);
             ++ran_;
             return true;

@@ -91,6 +91,10 @@ public:
 
         state_.resize(banks_.size());
         direct_.assign(banks_.size(), false);
+        // Q69: one bit per expert per bank, so a warming pass can tell "already in the page cache"
+        // from "must be read". Sized here rather than lazily because load() asks the question on
+        // every fill and a size check per fill is not worth the branch.
+        warmed_.resize(files_.size());
         for (std::size_t i = 0; i < banks_.size(); ++i) {
             auto& s = state_[i];
             s.slot_of.assign(banks_[i].entry.count, kNone);
@@ -422,6 +426,62 @@ public:
         return taken;
     }
 
+    // Q69: the read-ahead's other target, and the reason it exists.
+    //
+    // The tier is 930 MiB of arena carved into slots, and a read-ahead that fills them competes with
+    // the routes a layer actually needs - measured at 0.20 useful, i.e. four fifths of what it put in
+    // the arena was never routed to. The OS already keeps every expert it has read in the page cache,
+    // so there is a second, cheaper target: read the entry through the buffered handle into a scratch
+    // buffer and let the page cache hold it. No slot is claimed, nothing can be evicted, and the fill
+    // that follows a real miss is a memcpy out of RAM instead of a physical read - which is exactly
+    // the 8.6 ms -> 0.2 ms this file already measured on the fill path.
+    //
+    // The scratch buffer is one slot, allocated on first use, so the cost of the mode is 1.8 MiB and
+    // not a second arena.
+    void warm(ExpertBankId bank, std::span<const std::int32_t> experts) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        warm_locked(bank, experts);
+    }
+
+    void warm_locked(ExpertBankId bank, std::span<const std::int32_t> experts) {
+        if (bank.index >= files_.size()) { return; }
+        if (warm_scratch_.empty()) {
+            warm_scratch_.resize(static_cast<std::size_t>(slot_bytes_));
+        }
+        auto& bits = warmed_[bank.index];
+        if (bits.size() != files_[bank.index].experts.size()) {
+            bits.assign(files_[bank.index].experts.size(), 0);
+        }
+        for (const auto value : experts) {
+            if (value < 0 || static_cast<std::size_t>(value) >= bits.size()) { continue; }
+            const auto expert = static_cast<std::size_t>(value);
+            if (bits[expert] != 0) {
+                ++stats_.warm_skips;
+                continue;
+            }
+            const auto& entry = files_[bank.index].experts[expert];
+            try {
+                reader_->read_entry_cached(
+                    entry, {warm_scratch_.data(), static_cast<std::size_t>(slot_bytes_)});
+            } catch (const std::exception&) {
+                // A read-ahead that could not read is not an error: the routed fill will read the
+                // same bytes on demand and report the failure where it matters.
+                continue;
+            }
+            bits[expert] = 1;
+            stats_.warmed_bytes += entry.image_bytes;
+        }
+    }
+
+    // Warmed experts that a routed fill has since loaded, since the last call. Same contract as
+    // take_prefetch_hits(): a count of experts, turned into bytes by the consumer.
+    [[nodiscard]] std::uint64_t take_warm_hits() {
+        std::lock_guard<std::mutex> guard(mutex_);
+        const auto taken = warm_hits_;
+        warm_hits_       = 0;
+        return taken;
+    }
+
     void fill_locked(ExpertBankId bank, std::span<const std::int32_t> experts,
                      const std::int32_t* resident_mask, bool prefetch) {
         // A bank served straight out of the artifact mapping is backed by file pages the OS may
@@ -595,6 +655,13 @@ public:
         std::uint64_t hits      = 0;
         std::uint64_t misses    = 0;
         std::uint64_t evictions = 0;
+        // Q69: what the page-cache target did. `warmed_bytes` is what the read-ahead pulled through
+        // the buffered handle without claiming an arena slot; `memcpy_hits` is how many of those
+        // experts were later actually loaded, i.e. how much of the warming paid. Both are counters,
+        // not judgements: the queue's usefulness gate decides.
+        std::uint64_t warmed_bytes = 0;
+        std::uint64_t memcpy_hits  = 0;
+        std::uint64_t warm_skips   = 0; // asked to warm an expert that is already warm
     };
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
 
@@ -773,6 +840,18 @@ private:
             // memcpy out of RAM (0.2 ms). Measured 14 ms per token of ensure against 560-830 ms.
             reader_->read_entry_cached(entry, {destination, static_cast<std::size_t>(slot_bytes_)});
         }
+        // Q69: this fill is what the read-ahead was for. Either path above reads through the page
+        // cache (spans() is an mmap memcpy, read_entry_cached is a buffered read), so an expert the
+        // warming pass already touched costs no physical read here. Counted once: the bit is cleared
+        // so a second fill of the same expert is not credited twice.
+        if (bank < warmed_.size() && expert < warmed_[bank].size() && warmed_[bank][expert] != 0) {
+            warmed_[bank][expert] = 0;
+            // Two counters, one event: the cumulative one is what the panel prints, the pending one
+            // is what the consumer drains into the usefulness gate. Keeping them apart is what lets
+            // the panel show the total after the drain has zeroed the delta.
+            ++stats_.memcpy_hits;
+            ++warm_hits_;
+        }
         // One arena base for every bank; the per-plane tables carry the slot origin.
         state_[bank].gate_up_parent.data = base;
         state_[bank].down_parent.data    = base;
@@ -857,6 +936,11 @@ private:
     // Slots the read-ahead filled and a routed layer has not consumed yet (D4's numerator).
     std::vector<std::uint8_t> prefetched_;
     std::uint64_t prefetch_hits_ = 0;
+    // Q69: experts whose bytes the read-ahead pulled through the page cache, per bank, and the one
+    // scratch slot that pass reads into. Guarded by the same mutex as the slot tables.
+    std::vector<std::vector<std::uint8_t>> warmed_;
+    std::vector<std::byte> warm_scratch_;
+    std::uint64_t warm_hits_ = 0;
     // Serialises ensure() with the uploader's arena_image()/uploads_settled(): the first mutates slot
     // tables, the others read them, and D1 runs the fill on its own thread.
     mutable std::mutex mutex_;
