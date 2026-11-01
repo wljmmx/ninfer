@@ -362,6 +362,9 @@ private:
     // Layers that were both fully covered and host-free: the only state in which a captured
     // whole layer would replay the table it was captured with (Q20 -> GC2).
     std::uint64_t gh1_capt_ready_calls_ = 0;
+    // Routes of the last layer that the pinned tier addressed for the Device (Q20). Part of every
+    // host-free layer, so it is reported with the rate rather than inferred from it.
+    std::uint32_t last_host_routes_ = 0;
     // Prints the GH1 panel; one place so the pinned fast path and the normal path cannot drift.
     void gh1_report();
     std::uint64_t entered_steps_ = 0;

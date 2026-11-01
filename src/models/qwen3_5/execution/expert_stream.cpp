@@ -628,14 +628,14 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             last_cost_          = StepCost{};
             last_cost_.route_ms = route_ms;
             rebase_window();
-            // Nothing is published or uploaded on a covered layer - this return is above both - so
-            // the only thing that can make it host-bound is the read-back that produced route_ids.
-            if (!host_fetch) { ++gh1_capt_free_calls_; }
-            // Covered and host-free on the same layer: the only state a whole-layer graph may be
-            // captured in. This is GC2's gate, and it is deliberately the AND of the two rates
-            // above rather than a third independent measurement.
-            if (!host_fetch) { ++gh1_capt_ready_calls_; }
-            static_probe(bank_, tokens, true, probe_absent, probe_unready, 0, 0, 0, !host_fetch);
+            // Nothing is published or uploaded on a covered layer - this return is above both. The
+            // only thing that could make it host-bound is a read-back, and a covered layer does not
+            // need one to compute: every route already has a pool address. Under Q20's definition
+            // that is a host-free layer, which is what the rate is supposed to count.
+            ++gh1_capt_free_calls_;
+            ++gh1_capt_ready_calls_;
+            last_host_routes_ = 0;
+            static_probe(bank_, tokens, true, probe_absent, probe_unready, 0, 0, 0, true);
             return true;
         }
         // port (sm_89): two policies, because they disagree on what the set is for.
@@ -1622,9 +1622,49 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     // counting the call instead of the transfer would report the split path as host-bound even when
     // it was not, which is the same mistake F3 made in the other direction.
     host_upload = last_cost_.uploaded != 0;
-    if (!host_fetch && !host_publish && !host_upload) { ++gh1_capt_free_calls_; }
+    // port (sm_89): Q20 - a route the second leg resolves is not a host-bound route.
+    //
+    // `capt_free` used to fail a layer whenever the ids had been read back, and the ids are read
+    // back on nearly every split layer just to maintain the tables. That made the rate track the
+    // bookkeeping rather than the data path: a layer whose every expert came from the pool or the
+    // pinned tier still counted as host-bound, even though nothing was moved and nothing waited.
+    //
+    // The read-back only counts against the layer when it is there to find a route the Device
+    // cannot address. If every route already has an address, the bookkeeping copy is not a data
+    // dependency - and the number this rate exists to describe is whether the layer needed the host
+    // to compute.
+    std::uint32_t host_resolved = 0, pool_resolved = 0;
+    for (std::size_t i = 0; i < values; ++i) {
+        const auto expert = static_cast<std::uint32_t>(route_ids[i]);
+        if (expert < host_flags_.size() && host_flags_[expert] != 0) {
+            ++host_resolved;
+        } else if (cache_->expert_slot(bank_, expert).has_value()) {
+            ++pool_resolved;
+        }
+    }
+    last_host_routes_ = host_resolved;
+    const bool all_addressable = host_resolved + pool_resolved >= values;
+    const bool host_bound = host_upload || host_publish || (host_fetch && !all_addressable);
+    if (!host_bound) { ++gh1_capt_free_calls_; }
+    // GC2's precondition is the same question plus coverage: every route has an address AND none
+    // is outside the two tiers. A layer that satisfies both would replay a table it was captured
+    // with.
+    if (!host_bound && all_addressable) { ++gh1_capt_ready_calls_; }
+    if (bank_ == 0 && host_direct && std::getenv("NINFER_EXPERT_TIMING")) {
+        static std::uint64_t layers2 = 0, host_routes = 0, pool_routes = 0;
+        host_routes += host_resolved;
+        pool_routes += pool_resolved;
+        if (++layers2 % 8 == 0) {
+            std::fprintf(stderr, "[hostd] routes/layer: pool=%.2f host=%.2f of %.0f\n",
+                         static_cast<double>(pool_routes) / 8.0,
+                         static_cast<double>(host_routes) / 8.0, static_cast<double>(values));
+            std::fflush(stderr);
+            host_routes = 0;
+            pool_routes = 0;
+        }
+    }
     static_probe(bank_, tokens, false, probe_absent, probe_unready, probe_moved, probe_ins,
-                 last_cost_.uploaded, !host_fetch && !host_publish && !host_upload);
+                 last_cost_.uploaded, !host_bound);
     // port (sm_89): D1 read-ahead, in three pieces that are now separate on purpose.
     //
     // 1. The selection (below) is unchanged: NINFER_PREFETCH_PER_LAYER (default 8) experts, taken
