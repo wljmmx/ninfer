@@ -35,33 +35,17 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
     // does not match this model, a page count that does not cover the frontier), the reason is
     // printed rather than silently treated as a cold prefix. That distinction is what separates
     // "nothing to reuse" from "reuse is broken here".
-    bool from_tier = false;
-    if (!handle && kv_tier != nullptr && base.impl_ && base.impl_->prompt &&
-        !base.impl_->prompt->token_ids.empty()) {
-        std::string why;
-        if (const auto from_disk = tier_try_load(
-                std::span<const TokenId>(base.impl_->prompt->token_ids), &why)) {
-            handle    = from_disk;
-            from_tier = true;
-        } else if (!why.empty()) {
-            std::fprintf(stderr, "[kvt] tier refused the prefix: %s\n", why.c_str());
-            std::fflush(stderr);
-        }
-    }
-    if (!base.impl_) { return std::nullopt; }
-    // port (sm_89): "external" is a property of the record, not of this call.
+    // port (sm_89): Q54 no longer imports into a checkpoint record here.
     //
-    // inspect_source() runs twice for one request: the engine calls it to plan, then start_binding()
-    // calls it again to re-price against the resources that are actually free. A flag set by the
-    // first call ("I looked in the tier") is false on the second, so the second pass fell back to
-    // checkpoint_matches() and refused the very record the first pass had just imported - which
-    // surfaced as source_valid=false and a request that failed with every resource reading zero.
+    // A record is a REFERENCE to an address space some sequence owns; an import is an OWNERSHIP
+    // transfer of bytes that nothing owns yet. Expressing the second as the first required the
+    // record to have no identity (so checkpoint_matches refuses it), to be unpinned (so movable
+    // accepts it), and to give back a page reference it never took - three contradictions that
+    // showed up one at a time as a request failing with every resource reading zero.
     //
-    // A record with no identity is an import: the external-cache entry point takes identity as null
-    // by default, and its identity is established by the lookup key rather than by a captured
-    // ledger. Testing that property makes both passes agree.
-    const bool external_source = handle && !checkpoint(*handle).identity;
-    if (handle && !external_source && !checkpoint_matches(*handle, base)) { return std::nullopt; }
+    // The tier path now produces a TierSource and enters binding through its own door; this
+    // function stays exactly what its name says, an inspection of in-process sources.
+    if (!base.impl_ || (handle && !checkpoint_matches(*handle, base))) { return std::nullopt; }
     SourceCandidate candidate{.checkpoint    = handle,
                               .reused_tokens = handle ? checkpoint(*handle).frontier : 0};
     const auto& prompt       = *base.impl_->prompt;
@@ -78,13 +62,8 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
     }
     if (!handle) { return candidate; }
     const auto& record       = checkpoint(*handle);
-    // port (sm_89): a checkpoint that came from the tier is always safe to consume. Its authoritative
-    // copy is on disk, so keeping an in-process one only costs a state slot the request then cannot
-    // reserve - measured as "cannot reserve its first legal unit: state=0" on a 1-slot store, where
-    // the import had taken the only slot to hold a copy of what the disk already has.
-    const bool take_source   = consume_source || from_tier;
-    candidate.consume_source = take_source;
-    candidate.take_private   = take_source;
+    candidate.consume_source = consume_source;
+    candidate.take_private   = consume_source;
     for (const auto point : retired_points) {
         if (point == handle || !can_release_checkpoint(point)) { return std::nullopt; }
         if (std::find(candidate.retired_points.begin(), candidate.retired_points.end(), point) ==
@@ -134,11 +113,6 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
     const bool keep_source =
         std::find(candidate.private_points.begin(), candidate.private_points.end(), *handle) !=
         candidate.private_points.end();
-    // port (sm_89): candidate.consume_source, not the parameter. The parameter says what the CALLER
-    // wants; `from_tier` says this record was imported a few lines above and its disk copy makes
-    // consuming it free. Reading the parameter here made every one of the five conditions print as
-    // satisfied while move_state stayed 0 - the conditions were being evaluated against a flag the
-    // code had already decided to override.
     const bool consuming = candidate.consume_source;
     candidate.move_state = consuming && !keep_source && checkpoints[handle->index].pins == 0 &&
                            state_references == 1 && state_store->source_pins(record.state) == 0;
@@ -246,26 +220,6 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
                                   : record.backend_frontier;
         scan(*backend_kv_addresses, *backend_kv_pages, *record.kv->backend, frontier,
              runtime::ContextResourceClass::BackendKV);
-    }
-    if (from_tier) {
-        std::fprintf(stderr,
-                     "[kvt] candidate consume=%d move_state=%d split=%d move_history=%d "
-                     "transfers=%zu reused=%u | keep_source=%d pins=%u state_refs=%u "
-                     "state_source_pins=%d\n",
-                     candidate.consume_source ? 1 : 0, candidate.move_state ? 1 : 0,
-                     candidate.split_state ? 1 : 0, candidate.move_history ? 1 : 0,
-                     candidate.transfers.size(), candidate.reused_tokens, keep_source ? 1 : 0,
-                     checkpoints[handle->index].pins, state_references,
-                     state_store->source_pins(record.state));
-        std::fflush(stderr);
-        for (const auto& transfer : candidate.transfers) {
-            std::fprintf(stderr, "[kvt] transfer resource=%d direction=%d units=%llu pages=%u\n",
-                         static_cast<int>(transfer.resource), static_cast<int>(transfer.direction),
-                         static_cast<unsigned long long>(transfer.units), transfer.page_count);
-        }
-        std::fprintf(stderr, "[kvt] state pool: occupied=%u capacity=%u device_resident=%d\n",
-                     state_store->device_occupied(), state_store->device_capacity(),
-                     state_store->device_resident(record.state) ? 1 : 0);
     }
     return candidate;
 }
