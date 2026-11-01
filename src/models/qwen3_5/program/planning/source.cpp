@@ -132,7 +132,13 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
     const bool keep_source =
         std::find(candidate.private_points.begin(), candidate.private_points.end(), *handle) !=
         candidate.private_points.end();
-    candidate.move_state = consume_source && !keep_source && checkpoints[handle->index].pins == 0 &&
+    // port (sm_89): candidate.consume_source, not the parameter. The parameter says what the CALLER
+    // wants; `from_tier` says this record was imported a few lines above and its disk copy makes
+    // consuming it free. Reading the parameter here made every one of the five conditions print as
+    // satisfied while move_state stayed 0 - the conditions were being evaluated against a flag the
+    // code had already decided to override.
+    const bool consuming = candidate.consume_source;
+    candidate.move_state = consuming && !keep_source && checkpoints[handle->index].pins == 0 &&
                            state_references == 1 && state_store->source_pins(record.state) == 0;
     candidate.split_state =
         !candidate.move_state && occupied_states == state_store->device_capacity() &&
@@ -147,7 +153,7 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
             candidate.backup_state = candidate.split_state = true;
             candidate.transfers.push_back(state_transfer_requirement(
                 state_images->host_layout(), runtime::ContextTransferDirection::DeviceToHost));
-        } else if (consume_source && state_references == 1) {
+        } else if (consuming && state_references == 1) {
             // One physical slot cannot retain its immutable recovery image and a writer.
             // Consume this optional point while preserving its already computed execution input.
             candidate.move_state = true;
@@ -167,7 +173,7 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
                                       ? record.frontier - 1U
                                       : record.backend_frontier;
     candidate.move_history =
-        consume_source &&
+        consuming &&
         movable(*text_kv_addresses, *text_kv_pages, record.kv->text, record.frontier) &&
         (!record.kv->backend ||
          movable(*backend_kv_addresses, *backend_kv_pages, *record.kv->backend, backend_frontier));
