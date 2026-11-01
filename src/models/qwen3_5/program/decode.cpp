@@ -269,6 +269,20 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
         DecodeGraphExecutable* executable = nullptr;
         ops::CausalAttentionExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + 1};
         if (use_cuda_graph) {
+            // Q30: whether whole-layer capture is actually in force, as opposed to a planner flag
+            // that a memory curve quietly turned off. One line, once - the alternative is inferring
+            // it from a throughput number, which is exactly how "the graph is on" survived several
+            // reports without being true.
+            if (std::getenv("NINFER_EXPERT_TIMING") != nullptr) {
+                static bool announced = false;
+                if (!announced) {
+                    announced = true;
+                    std::fprintf(stderr,
+                                 "[graph] ordinary decode captures whole layers, lanes=%zu\n",
+                                 lanes.size());
+                    std::fflush(stderr);
+                }
+            }
             DecodeGraphProfile& profile =
                 ordinary_graphs.select(static_cast<std::uint32_t>(lanes.size()), maximum_frontier);
             executable = &ordinary_graphs.install(profile);
