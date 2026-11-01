@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <future>
 #include <thread>
 #include <vector>
 
@@ -66,13 +67,53 @@ int main() {
         }
         expect(prefetch.gate_open(), "a useful prefetcher keeps its gate open");
 
-        ninfer::core::Prefetcher useless(1024, 0.10);
+        // The gate assertion below must depend on usefulness alone, so this queue is given room to
+        // queue: with the default cap of 8 a tight loop can be refused by backpressure before it
+        // has offered the 16 jobs the gate needs to judge.
+        ninfer::core::Prefetcher useless(1024, 0.10, /*max_pending=*/256);
         for (int i = 0; i < 40; ++i) {
             useless.enqueue(job, 32, 100, 0);
             useless.advance(1);
         }
         expect(!useless.gate_open(), "a prefetcher whose bytes are never used closes its gate");
         expect(!useless.enqueue(job, 32, 100, 1), "a closed gate refuses new jobs");
+    }
+
+    {
+        // Backpressure (D2's second gate). The byte budget bounds what one window may ask for; it
+        // says nothing about how far the producer may run ahead of a worker stuck in a slow read.
+        // The cap is therefore on running + waiting, and it is proved here rather than by hoping a
+        // disk is slow at the right moment: one long job fills the cap, the next offer must be
+        // refused and counted as backlog, and once the job finishes the count returns to zero.
+        ninfer::core::Prefetcher blocked(1 << 20, 0.10, /*max_pending=*/1);
+        std::promise<void> release;
+        const std::shared_future<void> gate = release.get_future().share();
+        std::atomic<int> entered{0};
+        const auto long_job = [&] {
+            ++entered;
+            gate.wait();
+            return true;
+        };
+        expect(blocked.enqueue(long_job, 64, 100, 0), "a job inside the cap is accepted");
+        for (int i = 0; i < 500 && entered.load() == 0; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        expect(entered.load() == 1, "the worker picked the long job up");
+        expect(!blocked.enqueue(long_job, 64, 100, 0),
+               "a further job is refused while the cap is full");
+        expect(blocked.stats().dropped_backlog == 1,
+               "the refusal is counted as backlog, not as budget");
+        expect(blocked.pending() == 1, "pending counts the job being run");
+        release.set_value();
+        for (int i = 0; i < 500 && blocked.pending() != 0; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        expect(blocked.pending() == 0, "pending returns to zero when the job finishes");
+        blocked.stop();
+        expect(blocked.stats().dropped_backlog == 1, "finishing a job is not a drop");
+        expect(!blocked.enqueue(long_job, 64, 100, 0), "a stopped prefetcher refuses new jobs");
+        expect(blocked.stats().dropped_stopped == 1, "the refusal after stop is counted as stopped");
+        blocked.stop(); // idempotent: the second stop must not join the same thread twice
     }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(50));

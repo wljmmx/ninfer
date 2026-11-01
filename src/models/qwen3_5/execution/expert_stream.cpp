@@ -1431,16 +1431,20 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 const auto queued = ExpertPrefetchQueue::instance().stats();
                 std::fprintf(stderr,
                              "[pf] experts=%llu batches=%llu hit=%.1f%% evict=%llu | q enq=%llu "
-                             "drop=%llu ran=%llu expired=%llu useful=%.2f\n",
+                             "drop(budget=%llu deadline=%llu backlog=%llu stopped=%llu) "
+                             "ran=%llu expired=%llu pending=%llu/%llu useful=%.2f\n",
                              (unsigned long long)prefetch_calls_,
                              (unsigned long long)prefetch_batches_,
                              total ? 100.0 * (double)st.hits / (double)total : 0.0,
                              (unsigned long long)st.evictions,
                              (unsigned long long)queued.queue.enqueued,
-                             (unsigned long long)(queued.queue.dropped_budget +
-                                                  queued.queue.dropped_deadline +
-                                                  queued.queue.dropped_stopped),
+                             (unsigned long long)queued.queue.dropped_budget,
+                             (unsigned long long)queued.queue.dropped_deadline,
+                             (unsigned long long)queued.queue.dropped_backlog,
+                             (unsigned long long)queued.queue.dropped_stopped,
                              (unsigned long long)queued.ran, (unsigned long long)queued.expired,
+                             (unsigned long long)queued.pending,
+                             (unsigned long long)queued.max_pending,
                              queued.queue.usefulness());
                 std::fflush(stderr);
             }

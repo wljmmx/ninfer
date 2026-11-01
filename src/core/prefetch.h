@@ -29,6 +29,10 @@ struct PrefetchStats {
     std::uint64_t enqueued         = 0;
     std::uint64_t dropped_budget   = 0;
     std::uint64_t dropped_deadline = 0;
+    // Refused because the worker already has max_pending jobs (the one it is running plus the ones
+    // waiting). This is the backpressure valve: a byte budget bounds what a window may spend, not
+    // how far the producer may run ahead of a slow disk.
+    std::uint64_t dropped_backlog  = 0;
     // Offered after stop(). A process-scoped owner is stopped before it is destroyed, so this is
     // the count of callers that raced the shutdown rather than a scheduling decision.
     std::uint64_t dropped_stopped  = 0;
@@ -50,8 +54,9 @@ public:
         std::uint64_t due   = 0;    // logical step by which this must have started
     };
 
-    Prefetcher(std::size_t budget_bytes, double min_usefulness = 0.10)
-        : budget_(budget_bytes), min_usefulness_(min_usefulness) {
+    Prefetcher(std::size_t budget_bytes, double min_usefulness = 0.10,
+               std::size_t max_pending = 8)
+        : budget_(budget_bytes), min_usefulness_(min_usefulness), max_pending_(max_pending) {
         worker_ = std::thread([this] { run(); });
     }
 
@@ -90,6 +95,14 @@ public:
         }
         if (!gate_open_ || window_bytes_ + bytes > budget_) {
             ++stats_.dropped_budget;
+            return false;
+        }
+        // Backpressure (D2's second gate). The byte budget says how much a window may ask for; this
+        // says how far the caller may run ahead of the worker. Without it a slow disk turns the
+        // read-ahead into an unbounded queue of jobs whose deadline has long passed by the time they
+        // run, and the drop counter would blame the budget for a backlog.
+        if (running_ + jobs_.size() >= max_pending_) {
+            ++stats_.dropped_backlog;
             return false;
         }
         window_bytes_ += bytes;
@@ -136,6 +149,18 @@ public:
         return stats_;
     }
 
+    // Jobs the worker has taken but not finished, plus the ones still waiting: the number the
+    // backpressure gate compares against max_pending.
+    [[nodiscard]] std::size_t pending() const {
+        std::lock_guard lock(mutex_);
+        return running_ + jobs_.size();
+    }
+
+    [[nodiscard]] std::size_t max_pending() const {
+        std::lock_guard lock(mutex_);
+        return max_pending_;
+    }
+
     [[nodiscard]] bool gate_open() const {
         std::lock_guard lock(mutex_);
         return gate_open_;
@@ -156,8 +181,13 @@ private:
                 if (stopping_) { return; }
                 job = std::move(jobs_.front());
                 jobs_.pop_front();
+                running_ = 1;
             }
             if (job.run) { (void)job.run(); }
+            // Cleared after the job returns, so "pending" cannot dip below one while the worker is
+            // inside a fill and let the producer overshoot the cap by the width of that window.
+            std::lock_guard lock(mutex_);
+            running_ = 0;
         }
     }
 
@@ -170,6 +200,8 @@ private:
     std::thread worker_;
     std::size_t budget_              = 0;
     std::size_t window_bytes_        = 0;
+    std::size_t max_pending_         = 8;
+    std::size_t running_             = 0; // 0 or 1: the worker's job, if it is carrying one
     double min_usefulness_           = 0.10;
     bool gate_open_                  = true;
     bool stopping_                   = false;

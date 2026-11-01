@@ -30,6 +30,19 @@ std::size_t budget_bytes() {
     return std::size_t{1024} << 20;
 }
 
+// The backpressure valve: how far the producer may run ahead of the worker. Eight is a step's worth
+// of layers divided by five, i.e. enough that a burst of a few layers never blocks, and small enough
+// that a disk which has stopped answering holds a bounded amount of queued work instead of the whole
+// conversation. 0 is a legal value and turns every read-ahead into a refusal, which is what the
+// positive control in tests/runtime/kv_seam_test.cpp uses to prove the gate is wired.
+std::size_t max_pending() {
+    if (const char* value = std::getenv("NINFER_PREFETCH_PENDING");
+        value != nullptr && *value != '\0') {
+        return static_cast<std::size_t>(std::strtoull(value, nullptr, 10));
+    }
+    return 8;
+}
+
 } // namespace
 
 ExpertPrefetchQueue& ExpertPrefetchQueue::instance() {
@@ -42,7 +55,7 @@ void ExpertPrefetchQueue::retain() {
     if (users_++ != 0) { return; }
     // The worker starts with the first residency, not with the process: a run that leaves the
     // read-ahead off pays neither the thread nor its shutdown.
-    worker_ = std::make_shared<core::Prefetcher>(budget_bytes());
+    worker_ = std::make_shared<core::Prefetcher>(budget_bytes(), 0.10, max_pending());
 }
 
 void ExpertPrefetchQueue::release() {
@@ -115,7 +128,11 @@ ExpertPrefetchQueue::Stats ExpertPrefetchQueue::stats() const {
         out.expired     = expired_;
         out.staged      = staged_;
     }
-    if (worker) { out.queue = worker->stats(); }
+    if (worker) {
+        out.queue       = worker->stats();
+        out.pending     = worker->pending();
+        out.max_pending = worker->max_pending();
+    }
     return out;
 }
 
