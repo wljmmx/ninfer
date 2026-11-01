@@ -692,4 +692,28 @@ bool ProgramImpl::tier_selftest() {
     return ok;
 }
 
+std::optional<CheckpointHandle> ProgramImpl::tier_try_load(std::span<const TokenId> prefix,
+                                                          std::string* error) {
+    if (kv_tier == nullptr || prefix.empty()) { return std::nullopt; }
+    const auto key = core::KvBlockKey{core::kv_hash_tokens(prefix),
+                                      static_cast<std::uint32_t>(prefix.size())};
+    CheckpointExport kv;
+    CheckpointStateExport state;
+    if (!tier_load_export(*kv_tier, key, kv, state)) { return std::nullopt; }
+    // The importer splits a bare image itself - a single non-empty shard is exactly that, and one
+    // that already carries a header is passed through. Encoding it here would be the same work done
+    // twice, with a second chance to disagree about the page budget.
+    std::vector<std::string> shards{
+        std::string(reinterpret_cast<const char*>(state.bytes.data()), state.bytes.size())};
+    std::string local;
+    auto handle = import_checkpoint_current_layout(kv, shards, nullptr, nullptr, &local);
+    if (!handle && error != nullptr) { *error = std::move(local); }
+    if (handle) {
+        std::fprintf(stderr, "[kvt] loaded frontier=%u pages=%u bytes=%zu\n", kv.frontier,
+                     kv.page_count, kv.kv_bytes.size());
+        std::fflush(stderr);
+    }
+    return handle;
+}
+
 } // namespace ninfer::models::qwen3_5::detail

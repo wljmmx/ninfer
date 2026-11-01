@@ -353,10 +353,16 @@ void ProgramImpl::publish_capture(ContextTransaction& tx) {
     // Once per capture, not once per point: the points of a group share one KV run and one state
     // image, so writing each of them would store the same bytes two or three times.
     if (kv_tier != nullptr && !tx.capture_points.empty() && tx.reuse_frontier > 0 &&
-        tx.reuse_frontier <= state.ledger.size()) {
+        request.base && request.base->prompt && !request.base->prompt->token_ids.empty()) {
         const auto handle = tx.capture_points.front().first;
-        const auto tokens = std::span<const TokenId>(state.ledger.data(), tx.reuse_frontier);
-        const auto key    = core::kv_block_key(tokens);
+        // port (sm_89): keyed by the whole prompt, not by the frontier. A reader only has a prompt,
+        // so a key that encodes the capture point is unfindable from it - measured as a store at
+        // frontier=296 next to a lookup over 303 tokens, which is a miss by construction. The
+        // frontier still travels inside the payload, where it says how much of that prompt the KV
+        // run actually covers.
+        const auto& prompt_ids = request.base->prompt->token_ids;
+        const auto key         = core::KvBlockKey{core::kv_hash_tokens(prompt_ids),
+                                          static_cast<std::uint32_t>(prompt_ids.size())};
         if (const auto kv = export_checkpoint(handle)) {
             if (const auto state_export = export_state(handle)) {
                 if (tier_store_export(*kv_tier, key, *kv, *state_export)) {

@@ -278,7 +278,13 @@ public:
     [[nodiscard]] std::optional<SourceCandidate>
     inspect_source(const RequestBasePlan&, std::optional<CheckpointHandle>, bool = false,
                    std::span<const CheckpointHandle> = {},
-                   std::span<const CheckpointHandle> = {}) const;
+                   std::span<const CheckpointHandle> = {});
+    // port (sm_89): Q54. Looks the prefix up in the third tier and imports it when found. Non-const
+    // because a successful import publishes a checkpoint record, which is the same state a capture
+    // would have produced. Returns nullopt on a miss or a refusal; `error` carries the reason a
+    // refusal gives, because "the tier had it but the import declined" must not look like a miss.
+    [[nodiscard]] std::optional<CheckpointHandle>
+    tier_try_load(std::span<const TokenId> prefix, std::string* error);
     [[nodiscard]] PrefixShortlistKey checkpoint_key(CheckpointHandle, std::uint32_t frontier) const;
     [[nodiscard]] runtime::ContextResourceUsage
         checkpoint_footprint(std::span<const CheckpointHandle>) const;

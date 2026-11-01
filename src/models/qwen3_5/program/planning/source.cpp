@@ -25,7 +25,29 @@ bool ProgramImpl::checkpoint_matches(CheckpointHandle handle, const RequestBaseP
 std::optional<SourceCandidate>
 ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHandle> handle,
                             bool consume_source, std::span<const CheckpointHandle> private_points,
-                            std::span<const CheckpointHandle> retired_points) const {
+                            std::span<const CheckpointHandle> retired_points) {
+    // port (sm_89): Q54. A prefix this process has never seen can still be on disk. This runs before
+    // anything else because everything below is written in terms of a handle: with one, the
+    // existing candidate construction, transfer planning and identity checks all apply unchanged,
+    // and the disk source is indistinguishable from an in-process capture.
+    //
+    // A refusal is not a miss: if the tier had the block and the import declined it (a shape that
+    // does not match this model, a page count that does not cover the frontier), the reason is
+    // printed rather than silently treated as a cold prefix. That distinction is what separates
+    // "nothing to reuse" from "reuse is broken here".
+    bool from_tier = false;
+    if (!handle && kv_tier != nullptr && base.impl_ && base.impl_->prompt &&
+        !base.impl_->prompt->token_ids.empty()) {
+        std::string why;
+        if (const auto from_disk = tier_try_load(
+                std::span<const TokenId>(base.impl_->prompt->token_ids), &why)) {
+            handle    = from_disk;
+            from_tier = true;
+        } else if (!why.empty()) {
+            std::fprintf(stderr, "[kvt] tier refused the prefix: %s\n", why.c_str());
+            std::fflush(stderr);
+        }
+    }
     if (!base.impl_ || (handle && !checkpoint_matches(*handle, base))) { return std::nullopt; }
     SourceCandidate candidate{.checkpoint    = handle,
                               .reused_tokens = handle ? checkpoint(*handle).frontier : 0};
@@ -43,8 +65,13 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
     }
     if (!handle) { return candidate; }
     const auto& record       = checkpoint(*handle);
-    candidate.consume_source = consume_source;
-    candidate.take_private   = consume_source;
+    // port (sm_89): a checkpoint that came from the tier is always safe to consume. Its authoritative
+    // copy is on disk, so keeping an in-process one only costs a state slot the request then cannot
+    // reserve - measured as "cannot reserve its first legal unit: state=0" on a 1-slot store, where
+    // the import had taken the only slot to hold a copy of what the disk already has.
+    const bool take_source   = consume_source || from_tier;
+    candidate.consume_source = take_source;
+    candidate.take_private   = take_source;
     for (const auto point : retired_points) {
         if (point == handle || !can_release_checkpoint(point)) { return std::nullopt; }
         if (std::find(candidate.retired_points.begin(), candidate.retired_points.end(), point) ==
