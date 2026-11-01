@@ -27,9 +27,10 @@
 
 namespace ninfer::core {
 
-inline constexpr std::uint16_t kCheckpointBlobVersion = 1;
+inline constexpr std::uint16_t kCheckpointBlobVersion = 2;
 inline constexpr std::size_t kCheckpointHeaderBytes   = 4 + 2 + 2 + 4 + 8 + 8;
-inline constexpr std::size_t kCheckpointSpanBytes     = 4 + 4 + 8;
+// tag, size, offset, page size, page count
+inline constexpr std::size_t kCheckpointSpanBytes     = 4 + 4 + 8 + 4 + 4;
 
 enum class CheckpointSpanTag : std::uint32_t {
     KvPages    = 1,
@@ -39,13 +40,19 @@ enum class CheckpointSpanTag : std::uint32_t {
 struct CheckpointSpan {
     CheckpointSpanTag tag = CheckpointSpanTag::KvPages;
     std::span<const std::byte> bytes;
+    // Q54: a span whose payload is an ordered run of fixed-size pages says so. Without this the
+    // importer had the bytes but not the page boundaries, so it could only ever write them back as
+    // one blob - which is a transport, not a restore. Zero means opaque bytes, which is what every
+    // span was before the third tier needed to cut it.
+    std::uint32_t page_bytes = 0;
+    std::uint32_t pages      = 0;
 };
 
 struct CheckpointBlobView {
     std::uint32_t frontier = 0;
     std::uint64_t digest   = 0;
-    // One entry per span, pointing into the decoded buffer.
-    std::vector<std::pair<CheckpointSpanTag, std::span<const std::byte>>> spans;
+    // One entry per span; `bytes` points into the decoded buffer.
+    std::vector<CheckpointSpan> spans;
 };
 
 // 64-bit content digest (FNV-1a over the header fields and every span byte). It is the key suffix,
@@ -141,6 +148,8 @@ inline std::uint64_t get_u64(const std::byte* p) {
         detail::put_u32(out, static_cast<std::uint32_t>(span.tag));
         detail::put_u32(out, static_cast<std::uint32_t>(span.bytes.size()));
         detail::put_u64(out, offset);
+        detail::put_u32(out, span.page_bytes);
+        detail::put_u32(out, span.pages);
         offset += span.bytes.size();
     }
     out.insert(out.end(), payload.begin(), payload.end());
@@ -180,11 +189,20 @@ inline std::uint64_t get_u64(const std::byte* p) {
         const auto tag         = detail::get_u32(entry);
         const auto bytes       = detail::get_u32(entry + 4);
         const auto offset      = detail::get_u64(entry + 8);
+        const auto page_bytes  = detail::get_u32(entry + 16);
+        const auto pages       = detail::get_u32(entry + 20);
         // Spans must be laid out in order, without gaps or overlap, inside the payload.
         if (offset != cursor || offset + bytes > total) { return std::nullopt; }
+        // A page run has to describe itself consistently, or the importer would cut a page in half
+        // and write the second half into the next page slot.
+        if (page_bytes != 0 && (pages == 0 ||
+                                static_cast<std::uint64_t>(page_bytes) * pages != bytes)) {
+            return std::nullopt;
+        }
         cursor += bytes;
-        view.spans.emplace_back(static_cast<CheckpointSpanTag>(tag),
-                                std::span<const std::byte>(body + offset, bytes));
+        view.spans.push_back(CheckpointSpan{static_cast<CheckpointSpanTag>(tag),
+                                            std::span<const std::byte>(body + offset, bytes),
+                                            page_bytes, pages});
     }
     if (cursor != total) { return std::nullopt; }
 

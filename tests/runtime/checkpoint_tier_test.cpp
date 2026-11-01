@@ -61,8 +61,8 @@ int main() {
     if (loaded) {
         expect(loaded->frontier == 803, "the frontier survives the round trip");
         expect(loaded->spans.size() == 2, "both spans come back");
-        expect(std::equal(loaded->spans[0].second.begin(), loaded->spans[0].second.end(), kv.begin()) &&
-                   std::equal(loaded->spans[1].second.begin(), loaded->spans[1].second.end(), state.begin()),
+        expect(std::equal(loaded->spans[0].bytes.begin(), loaded->spans[0].bytes.end(), kv.begin()) &&
+                   std::equal(loaded->spans[1].bytes.begin(), loaded->spans[1].bytes.end(), state.begin()),
                "KV and state bytes are identical");
     }
 
