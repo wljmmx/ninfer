@@ -1303,6 +1303,14 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         std::sort(distinct.begin(), distinct.end());
         distinct.erase(std::unique(distinct.begin(), distinct.end()), distinct.end());
         host_->ensure(ExpertBankId{bank_}, std::span<const std::int32_t>(distinct), nullptr);
+        // port (sm_89): D4's numerator. An expert that was served from a slot the read-ahead filled
+        // is the only thing that makes a prefetch "useful", and the tier is the only place that
+        // knows it: it marks the slots it fills and reports the hits here. Reported in bytes so the
+        // gate compares against what the queue asked for.
+        if (const auto hits = host_->take_prefetch_hits(); hits != 0) {
+            ExpertPrefetchQueue::instance().note_used(static_cast<std::size_t>(hits) *
+                                                      host_->slot_bytes());
+        }
         if (timing) {
             static std::uint64_t shown = 0;
             const auto& filled = host_->stats();
@@ -1418,11 +1426,25 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             if (prefetch_sync) {
                 host_->ensure(ExpertBankId{bank_}, std::span<const std::int32_t>(wanted), nullptr);
             } else {
-                // Due/now are the queue's D3 deadline, which has no step clock to read yet: 0/1 is
-                // the honest "no deadline" it accepts, not a value chosen to pass a check.
-                (void)ExpertPrefetchQueue::instance().enqueue(
-                    host_weak_, bank_, std::span<const std::int32_t>(wanted),
-                    static_cast<std::size_t>(wanted.size()) * host_->slot_bytes(), 1, 0);
+                // D3: the deadline is measured in layer batches, so the clock is one tick per offer
+                // and it is process-wide - the forty banks are forty layers of the same step, and a
+                // per-bank clock would let one bank's backlog expire against another's progress.
+                // The window is NINFER_PREFETCH_WINDOW batches (default 40, one token's worth on
+                // this model) and advance() is what drops the jobs that could not start inside it.
+                static std::atomic<std::uint64_t> layer_tick{0};
+                static const std::uint64_t window = [] {
+                    const char* value = std::getenv("NINFER_PREFETCH_WINDOW");
+                    if (value != nullptr && *value != '\0') {
+                        return static_cast<std::uint64_t>(std::strtoull(value, nullptr, 10));
+                    }
+                    return std::uint64_t{40};
+                }();
+                auto& queue     = ExpertPrefetchQueue::instance();
+                const auto tick = ++layer_tick;
+                if (window != 0 && (tick % window) == 0) { queue.advance(tick); }
+                (void)queue.enqueue(host_weak_, bank_, std::span<const std::int32_t>(wanted),
+                                    static_cast<std::size_t>(wanted.size()) * host_->slot_bytes(),
+                                    tick + window, tick);
             }
             prefetch_calls_ += wanted.size();
             if ((++prefetch_batches_ % 40) == 0) {
@@ -1431,7 +1453,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 const auto queued = ExpertPrefetchQueue::instance().stats();
                 std::fprintf(stderr,
                              "[pf] experts=%llu batches=%llu hit=%.1f%% evict=%llu | q enq=%llu "
-                             "drop(budget=%llu deadline=%llu backlog=%llu stopped=%llu) "
+                             "drop(budget=%llu gate=%llu deadline=%llu backlog=%llu stopped=%llu) "
                              "ran=%llu expired=%llu pending=%llu/%llu useful=%.2f\n",
                              (unsigned long long)prefetch_calls_,
                              (unsigned long long)prefetch_batches_,
@@ -1439,6 +1461,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                              (unsigned long long)st.evictions,
                              (unsigned long long)queued.queue.enqueued,
                              (unsigned long long)queued.queue.dropped_budget,
+                             (unsigned long long)queued.queue.dropped_gate,
                              (unsigned long long)queued.queue.dropped_deadline,
                              (unsigned long long)queued.queue.dropped_backlog,
                              (unsigned long long)queued.queue.dropped_stopped,

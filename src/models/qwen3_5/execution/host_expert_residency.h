@@ -70,6 +70,10 @@ public:
         // arena_image() is the only moment that becomes true, and uploads_settled() is the only moment
         // it stops - see the note on ExpertArenaSource.
         in_flight_.assign(slot_capacity_, 0);
+        // port (sm_89): slots the read-ahead filled and no routed layer has used yet. Per slot, not
+        // per expert, because that is the lifetime that matters: whichever expert the slot holds
+        // next loses the mark, and only a hit on the same slot can count as usefulness.
+        prefetched_.assign(slot_capacity_, 0);
 
         state_.resize(banks_.size());
         direct_.assign(banks_.size(), false);
@@ -361,7 +365,30 @@ public:
         // arena_image(), and D1 wants the fill on its own thread. One lock covers all three entry
         // points so that is a safe call to make; without it the two threads would race on slot_of.
         std::lock_guard<std::mutex> guard(mutex_);
-        // Addressed in place means the *address* is already right - not that the bytes are resident.
+        fill_locked(bank, experts, resident_mask, /*prefetch=*/false);
+    }
+
+    // port (sm_89): the read-ahead's entry point. Same fill, but every slot it claims is marked, so
+    // that when the layer later routes to that expert the hit can be attributed to the read-ahead
+    // and reported as usefulness. Nothing else changes: a marked slot is an ordinary slot, and the
+    // expert is served from it whether the mark was set or not.
+    void fill_prefetch(ExpertBankId bank, std::span<const std::int32_t> experts) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        fill_locked(bank, experts, nullptr, /*prefetch=*/true);
+    }
+
+    // Routed experts that were served from a slot the read-ahead had filled, since the last call.
+    // The consumer (ExpertStream) turns this into bytes and reports it to the queue's usefulness
+    // gate; it is a count of experts, not bytes, so the tier stays the one that knows slot_bytes.
+    [[nodiscard]] std::uint64_t take_prefetch_hits() {
+        std::lock_guard<std::mutex> guard(mutex_);
+        const auto taken = prefetch_hits_;
+        prefetch_hits_   = 0;
+        return taken;
+    }
+
+    void fill_locked(ExpertBankId bank, std::span<const std::int32_t> experts,
+                     const std::int32_t* resident_mask, bool prefetch) {
         // A bank served straight out of the artifact mapping is backed by file pages the OS may
         // evict at any time, so it is a cold tier wearing a warm tier's address. A managed pinned
         // copy is therefore still worth keeping, and NINFER_ARENA_MANAGED asks for one even here:
@@ -395,8 +422,15 @@ public:
                 ++stats_.misses;
                 slot = claim(bank.index, expert);
                 load(bank.index, expert, slot);
+                // The mark lives with the slot, so an eviction clears it: a slot reused by a routed
+                // expert is not "a prefetched expert that was used".
+                prefetched_[slot] = prefetch ? 1 : 0;
             } else {
                 ++stats_.hits;
+                if (prefetched_[slot] != 0) {
+                    prefetched_[slot] = 0;
+                    ++prefetch_hits_;
+                }
             }
             slot_last_use_[slot] = ++epoch_;
             const auto base      = std::uint64_t{slot} * slot_bytes_;
@@ -668,6 +702,9 @@ private:
     // mutable: arena_image() is const (it is the uploader's view) but handing out a pointer is what
     // marks the slot in flight.
     mutable std::vector<std::uint8_t> in_flight_;
+    // Slots the read-ahead filled and a routed layer has not consumed yet (D4's numerator).
+    std::vector<std::uint8_t> prefetched_;
+    std::uint64_t prefetch_hits_ = 0;
     // Serialises ensure() with the uploader's arena_image()/uploads_settled(): the first mutates slot
     // tables, the others read them, and D1 runs the fill on its own thread.
     mutable std::mutex mutex_;

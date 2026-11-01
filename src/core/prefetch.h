@@ -28,6 +28,11 @@ namespace ninfer::core {
 struct PrefetchStats {
     std::uint64_t enqueued         = 0;
     std::uint64_t dropped_budget   = 0;
+    // The gate closed (the bytes fetched so far were not used), so the mechanism is off until the
+    // usefulness it did measure recovers. Counted apart from dropped_budget: one is "this window is
+    // spent", the other is "this mechanism is not paying for itself", and folding them together
+    // made a closed gate look like a budget problem.
+    std::uint64_t dropped_gate     = 0;
     std::uint64_t dropped_deadline = 0;
     // Refused because the worker already has max_pending jobs (the one it is running plus the ones
     // waiting). This is the backpressure valve: a byte budget bounds what a window may spend, not
@@ -93,7 +98,11 @@ public:
             ++stats_.dropped_deadline;
             return false;
         }
-        if (!gate_open_ || window_bytes_ + bytes > budget_) {
+        if (!gate_open_) {
+            ++stats_.dropped_gate;
+            return false;
+        }
+        if (window_bytes_ + bytes > budget_) {
             ++stats_.dropped_budget;
             return false;
         }

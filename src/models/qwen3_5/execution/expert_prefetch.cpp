@@ -84,18 +84,21 @@ bool ExpertPrefetchQueue::enqueue(std::weak_ptr<HostExpertResidency> host, std::
         Job{std::move(host), bank, std::vector<std::int32_t>(experts.begin(), experts.end())});
     return worker->enqueue(
         [this, job]() {
-            // port (sm_89): D1's body, still a placeholder - it stages nothing. What it does do is
-            // the ownership handshake the rest of D1 rests on: the residency is taken by strong
-            // reference for the length of the job, so a model destroyed under a running fill is
-            // seen here as an expired reference instead of a dangling pointer.
+            // D1's body. The residency is taken by strong reference for the length of the fill, so
+            // a model destroyed under a running job is seen as an expired reference instead of a
+            // dangling pointer; `->fill_prefetch` is the ordinary arena fill with the slots marked
+            // so a later hit on one of them can be counted as usefulness (D4).
             auto residency = job->host.lock();
-            std::lock_guard lock(mutex_);
             if (!residency) {
+                std::lock_guard lock(mutex_);
                 ++expired_;
                 return false;
             }
+            residency->fill_prefetch(ExpertBankId{job->bank},
+                                     std::span<const std::int32_t>(job->experts));
+            std::lock_guard lock(mutex_);
             ++ran_;
-            return false; // the fill itself is item 4, deliberately not here yet
+            return true;
         },
         bytes, due, now);
 }
@@ -126,7 +129,6 @@ ExpertPrefetchQueue::Stats ExpertPrefetchQueue::stats() const {
         worker          = worker_;
         out.ran         = ran_;
         out.expired     = expired_;
-        out.staged      = staged_;
     }
     if (worker) {
         out.queue       = worker->stats();

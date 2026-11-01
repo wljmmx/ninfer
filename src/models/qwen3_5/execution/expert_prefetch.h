@@ -34,7 +34,6 @@ public:
         core::PrefetchStats queue;
         std::uint64_t ran     = 0; // jobs the worker executed
         std::uint64_t expired = 0; // jobs whose residency was already gone
-        std::uint64_t staged  = 0; // bytes actually staged into the warm tier (0 until item 4)
         std::size_t pending   = 0; // running + waiting, against NINFER_PREFETCH_PENDING
         std::size_t max_pending = 0;
     };
@@ -72,7 +71,6 @@ private:
     std::shared_ptr<core::Prefetcher> worker_;
     std::uint64_t ran_     = 0;
     std::uint64_t expired_ = 0;
-    std::uint64_t staged_  = 0;
     int users_             = 0;
 };
 
