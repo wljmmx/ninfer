@@ -268,8 +268,13 @@ struct StartupLogRenderer::Impl {
             progress->clear();
             if (failure_logged) { return; }
             failure_logged = true;
-            logger->error("startup failed | {} | {}", presentation.active,
-                          format_pretty_duration(static_cast<double>(event.elapsed_ns) * 1.0e-9));
+            // A failed *attempt*, not a failed startup. The caller owns the decision: the engine
+            // retries a per-expert artifact through the streamed tier and comes up normally
+            // (measured 2026-11-01: this line said "ERROR startup failed" while the server answered
+            // 200 three seconds later). A startup that is really lost is reported as FATAL by the
+            // product layer, so nothing is hidden by keeping this one at warning level.
+            logger->warn("startup attempt failed | {} | {}", presentation.active,
+                         format_pretty_duration(static_cast<double>(event.elapsed_ns) * 1.0e-9));
             return;
         }
     }

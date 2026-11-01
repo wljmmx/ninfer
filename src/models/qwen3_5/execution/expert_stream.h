@@ -235,8 +235,13 @@ private:
 
     ExpertCache* cache_ = nullptr;
     HostExpertResidency* host_ = nullptr;
-    // port (sm_89): the read-ahead queue's view of the same object. Expired means the model was
-    // destroyed while a fill was queued, which the queue reports instead of dereferencing.
+    // port (sm_89): the experts this bank routed on its previous small-batch step (D1's selection).
+    //
+    // The decayed score ranks what this bank has been using, and what it has been using is what the
+    // pool already holds - prefetching that is prefetching into a hit. The conversation repeats
+    // itself token to token, so the previous step's routes are the ones most likely to be wanted
+    // again after an eviction, and they are the ones a read-ahead should fetch.
+    std::vector<std::int32_t> prev_routes_;
     std::weak_ptr<HostExpertResidency> host_weak_;
     std::uint32_t bank_ = 0;
     // port (sm_89): A3b. The per-bank generation this bank's Device tables actually hold, set only when
@@ -247,6 +252,7 @@ private:
     // port (sm_89): D1 read-ahead counter (see the call site).
     std::uint64_t prefetch_calls_ = 0;   // experts
     std::uint64_t prefetch_batches_ = 0; // layers that prefetched
+    std::uint64_t prefetch_recent_ = 0;  // of those experts, how many came from the previous step
     ExpertBankLayout entry_{};
     // port (sm_89): the pool holds every layer at once, so this bank's window is fixed and no
     // per-step routing decision - and therefore no host round trip - is needed.

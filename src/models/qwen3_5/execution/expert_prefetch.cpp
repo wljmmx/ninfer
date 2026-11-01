@@ -18,16 +18,28 @@ struct Job {
     std::vector<std::int32_t> experts;
 };
 
-// D2's budget. One window is a step: at the plan's default shape that is 8 experts a layer over 40
-// layers at the 1.8 MiB slot image this artifact produces, about 576 MiB. The default below is a
-// ceiling for that and not a tuned number - what turns the budget into a decision is item 3.
+// D2's budget. Measured, not invented: with the gate held open over the eight-slice long dialogue
+// (1024 tokens, 12 GiB), 1 GiB spent on read-ahead was 0.16 useful and 256 MiB was 0.18 - the
+// budget prunes exactly the attempts that would not have paid, so the smaller window is the better
+// one. NINFER_PREFETCH_BUDGET_MB overrides it.
 std::size_t budget_bytes() {
     if (const char* value = std::getenv("NINFER_PREFETCH_BUDGET_MB");
         value != nullptr && *value != '\0') {
         const auto mb = std::strtoull(value, nullptr, 10);
         if (mb != 0) { return static_cast<std::size_t>(mb) << 20; }
     }
-    return std::size_t{1024} << 20;
+    return std::size_t{256} << 20;
+}
+
+// The gate's threshold (D4). 0.10 is the plan's number and stays the default; a sweep has to be
+// able to hold it open, because a gate that closes after sixteen samples makes every later
+// configuration look identical - the pool size cannot matter to a mechanism that has stopped.
+double min_usefulness() {
+    if (const char* value = std::getenv("NINFER_PREFETCH_MIN_USEFUL");
+        value != nullptr && *value != '\0') {
+        return std::strtod(value, nullptr);
+    }
+    return 0.10;
 }
 
 // The backpressure valve: how far the producer may run ahead of the worker. Eight is a step's worth
@@ -55,7 +67,7 @@ void ExpertPrefetchQueue::retain() {
     if (users_++ != 0) { return; }
     // The worker starts with the first residency, not with the process: a run that leaves the
     // read-ahead off pays neither the thread nor its shutdown.
-    worker_ = std::make_shared<core::Prefetcher>(budget_bytes(), 0.10, max_pending());
+    worker_ = std::make_shared<core::Prefetcher>(budget_bytes(), min_usefulness(), max_pending());
 }
 
 void ExpertPrefetchQueue::release() {

@@ -1405,14 +1405,38 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             }
             return 8U;
         }();
-        // Partial selection: keep the `per_layer` highest scores among non-resident experts. The array is
-        // 248 entries, forty times a token, so this stays a linear scan with a small insertion.
+        // Partial selection: recency first, then the decayed score. The score ranks experts this
+        // bank has been using, which is exactly the set the pool already holds, so it can only ever
+        // fill the tail; the head is what this bank routed on its previous step, which is what the
+        // conversation is most likely to ask for again.
         std::vector<std::pair<float, std::int32_t>> top;
         top.reserve(per_layer);
+        auto take = [&](std::int32_t expert) {
+            if (expert < 0 || static_cast<std::uint32_t>(expert) >= count_) { return; }
+            if (top.size() == per_layer) { return; }
+            if (cache_->expert_slot(bank_, expert)) { return; }
+            for (const auto& taken : top) {
+                if (taken.second == expert) { return; }
+            }
+            top.emplace_back(hot_score_[expert], expert);
+        };
+        const std::size_t before = top.size();
+        for (const auto expert : prev_routes_) { take(expert); }
+        // How many of the wanted experts came from the previous step rather than from the score.
+        // This is the kill-switch for the idea: if it is zero the recency signal never applies (the
+        // previous step's routes are still resident) and the variant is the old one wearing a new
+        // comment.
+        prefetch_recent_ += top.size() - before;
         for (std::uint32_t expert = 0; expert < count_; ++expert) {
             const float score = hot_score_[expert];
             if (score <= 0.0F) { continue; }
             if (cache_->expert_slot(bank_, expert)) { continue; }
+            // Already taken by recency in the head of the list.
+            bool taken = false;
+            for (const auto& entry : top) {
+                if (entry.second == static_cast<std::int32_t>(expert)) { taken = true; break; }
+            }
+            if (taken) { continue; }
             if (top.size() == per_layer && score <= top.back().first) { continue; }
             const std::pair<float, std::int32_t> entry{score, static_cast<std::int32_t>(expert)};
             const auto at = std::lower_bound(top.begin(), top.end(), entry,
@@ -1452,10 +1476,11 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 const auto total  = st.hits + st.misses;
                 const auto queued = ExpertPrefetchQueue::instance().stats();
                 std::fprintf(stderr,
-                             "[pf] experts=%llu batches=%llu hit=%.1f%% evict=%llu | q enq=%llu "
+                             "[pf] experts=%llu recent=%llu batches=%llu hit=%.1f%% evict=%llu | q enq=%llu "
                              "drop(budget=%llu gate=%llu deadline=%llu backlog=%llu stopped=%llu) "
                              "ran=%llu expired=%llu pending=%llu/%llu useful=%.2f\n",
                              (unsigned long long)prefetch_calls_,
+                             (unsigned long long)prefetch_recent_,
                              (unsigned long long)prefetch_batches_,
                              total ? 100.0 * (double)st.hits / (double)total : 0.0,
                              (unsigned long long)st.evictions,
@@ -1472,6 +1497,14 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 std::fflush(stderr);
             }
         }
+    }
+    // Record this step's routes for the next step's read-ahead. Small batches only: a prefill chunk
+    // touches most of the bank, and a read-ahead that copied it would be copying the prefill.
+    if (tokens <= kHotSetUpdateTokens) {
+        prev_routes_.assign(route_ids, route_ids + values);
+        std::sort(prev_routes_.begin(), prev_routes_.end());
+        prev_routes_.erase(std::unique(prev_routes_.begin(), prev_routes_.end()),
+                           prev_routes_.end());
     }
     // port (sm_89): A3b, on the per-bank generation this time. A layer is about to hand these two
     // tables to kernels that read them as addresses; if what this bank's Device tables hold is not
