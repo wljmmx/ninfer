@@ -49,17 +49,19 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
         }
     }
     if (!base.impl_) { return std::nullopt; }
-    // port (sm_89): an import from the tier does not have to pass the captured-path fingerprint.
+    // port (sm_89): "external" is a property of the record, not of this call.
     //
-    // That check exists to prove a checkpoint belongs to THIS request: it compares the record's
-    // ledger and digests against the base plan. An import has no such identity by design - the
-    // external-cache entry point takes identity as null by default and its comment says so ("it has
-    // bytes, not a fingerprint"). Its identity is established the other way round: the lookup key
-    // was this prompt, so the bytes were found BY this request, not offered to it.
+    // inspect_source() runs twice for one request: the engine calls it to plan, then start_binding()
+    // calls it again to re-price against the resources that are actually free. A flag set by the
+    // first call ("I looked in the tier") is false on the second, so the second pass fell back to
+    // checkpoint_matches() and refused the very record the first pass had just imported - which
+    // surfaced as source_valid=false and a request that failed with every resource reading zero.
     //
-    // Requiring both made the import unusable: the record was created, the match refused it, and the
-    // pages plus the state slot stayed owned by a record nothing would ever adopt.
-    if (handle && !from_tier && !checkpoint_matches(*handle, base)) { return std::nullopt; }
+    // A record with no identity is an import: the external-cache entry point takes identity as null
+    // by default, and its identity is established by the lookup key rather than by a captured
+    // ledger. Testing that property makes both passes agree.
+    const bool external_source = handle && !checkpoint(*handle).identity;
+    if (handle && !external_source && !checkpoint_matches(*handle, base)) { return std::nullopt; }
     SourceCandidate candidate{.checkpoint    = handle,
                               .reused_tokens = handle ? checkpoint(*handle).frontier : 0};
     const auto& prompt       = *base.impl_->prompt;
