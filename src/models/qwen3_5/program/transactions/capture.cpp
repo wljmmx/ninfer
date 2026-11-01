@@ -1,8 +1,10 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
+#include "models/qwen3_5/program/storage/checkpoint_tier_adapter.h"
 #include "core/device.h"
 
 #include <algorithm>
+#include <span>
 #include <stdexcept>
 
 namespace ninfer::models::qwen3_5::detail {
@@ -341,6 +343,29 @@ void ProgramImpl::publish_capture(ContextTransaction& tx) {
             .rope_delta        = state.rope_delta,
             .tail_hidden_valid = true};
         checkpoints[handle.index].reserved = false;
+    }
+    // port (sm_89): Q54. This is the moment the content is in place - the loop above gave every
+    // point its KV reference, its state slot and its frontier - so it is the only correct place to
+    // hand a finished checkpoint to the third tier. Doing it earlier would store a record whose
+    // pages are not yet committed; doing it later would store one that a later request may have
+    // already replaced.
+    //
+    // Once per capture, not once per point: the points of a group share one KV run and one state
+    // image, so writing each of them would store the same bytes two or three times.
+    if (kv_tier != nullptr && !tx.capture_points.empty() && tx.reuse_frontier > 0 &&
+        tx.reuse_frontier <= state.ledger.size()) {
+        const auto handle = tx.capture_points.front().first;
+        const auto tokens = std::span<const TokenId>(state.ledger.data(), tx.reuse_frontier);
+        const auto key    = core::kv_block_key(tokens);
+        if (const auto kv = export_checkpoint(handle)) {
+            if (const auto state_export = export_state(handle)) {
+                if (tier_store_export(*kv_tier, key, *kv, *state_export)) {
+                    std::fprintf(stderr, "[kvt] stored frontier=%u pages=%u bytes=%zu\n",
+                                 kv->frontier, kv->page_count, kv->kv_bytes.size());
+                    std::fflush(stderr);
+                }
+            }
+        }
     }
     if (state_store->residency(*tx.reserved_state) == StateReplicaResidency::None) {
         state_store->split_device_replica_identity(source_state, *tx.reserved_state);
