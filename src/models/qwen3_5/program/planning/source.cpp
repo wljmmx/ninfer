@@ -261,6 +261,9 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
                          static_cast<int>(transfer.resource), static_cast<int>(transfer.direction),
                          static_cast<unsigned long long>(transfer.units), transfer.page_count);
         }
+        std::fprintf(stderr, "[kvt] state pool: occupied=%u capacity=%u device_resident=%d\n",
+                     state_store->device_occupied(), state_store->device_capacity(),
+                     state_store->device_resident(record.state) ? 1 : 0);
     }
     return candidate;
 }
