@@ -4,34 +4,101 @@
 //
 // The engine already knows how to take a checkpoint apart (export_checkpoint / export_state) and how
 // to put one back together (import_checkpoint_current_layout / import_state). The tier knows how to
-// hold bytes on disk. Neither knows about the other, and this is the only place that has to: one
-// function turns a pair of exports into a stored blob, one turns a stored blob back into a pair.
+// hold bytes on disk. Neither knows about the other, and this is the only place that has to.
 //
-// Deliberately not a ProgramImpl member. Keeping it a free function on the tier means it can be
-// exercised with a synthetic export, without a model, a device or a request.
+// Header-only on purpose: it is a translation between two structs, and a .cpp for it would be a
+// build-system entry that buys nothing. Deliberately not a ProgramImpl member either, so it can be
+// exercised with a synthetic export - no model, no device, no request.
 
 #include "core/kv_tier.h"
+#include "core/tier_checkpoint_payload.h"
 #include "models/qwen3_5/program/program.h"
 
-namespace ninfer::models::qwen3_5 {
+namespace ninfer::models::qwen3_5::detail {
+namespace tier_adapter_detail {
+
+inline core::TierCheckpointPayload to_payload(const CheckpointExport& kv,
+                                              const CheckpointStateExport& state) {
+    core::TierCheckpointPayload out;
+    out.frontier         = kv.frontier;
+    out.page_count       = kv.page_count;
+    out.page_bytes       = static_cast<std::uint64_t>(kv.page_bytes);
+    out.kv               = kv.kv_bytes;
+    out.image_bytes      = state.image_bytes;
+    out.layers           = state.layers;
+    out.conv_channels    = state.conv_channels;
+    out.value_heads      = state.value_heads;
+    out.value_head_dim   = state.value_head_dim;
+    out.key_head_dim     = state.key_head_dim;
+    out.hidden           = state.hidden;
+    out.has_dflash_local = state.has_dflash_local;
+    out.state            = state.bytes;
+    return out;
+}
+
+inline void from_payload(const core::TierCheckpointPayload& payload, CheckpointExport& kv,
+                         CheckpointStateExport& state) {
+    kv.frontier   = payload.frontier;
+    kv.page_count = payload.page_count;
+    kv.page_bytes = static_cast<std::size_t>(payload.page_bytes);
+    kv.kv_bytes   = payload.kv;
+    // Not carried across processes: epochs name pages of the pool that exported the run, and a
+    // reader's pages are its own. The importer addresses by page index and re-derives them.
+    kv.epochs.clear();
+
+    state.image_bytes       = payload.image_bytes;
+    state.layers            = payload.layers;
+    state.conv_channels     = payload.conv_channels;
+    state.value_heads       = payload.value_heads;
+    state.value_head_dim    = payload.value_head_dim;
+    state.key_head_dim      = payload.key_head_dim;
+    state.hidden            = payload.hidden;
+    state.has_dflash_local  = payload.has_dflash_local;
+    // A blob is always a materialised image; the flag only ever described the exporting process.
+    state.materialised_host_copy = true;
+    state.bytes                  = payload.state;
+}
+
+} // namespace tier_adapter_detail
 
 // Stores the pair under `key`. False when the payload cannot be built (a KV run whose pages do not
-// add up) or when the backend refuses the write. Never throws: a tier that is down must not take a
-// request with it.
-[[nodiscard]] bool tier_store_export(core::KvTier& tier, const core::KvBlockKey& key,
-                                     const CheckpointExport& kv,
-                                     const CheckpointStateExport& state);
+// add up) or when the backend refuses the write.
+[[nodiscard]] inline bool tier_store_export(core::KvTier& tier, const core::KvBlockKey& key,
+                                            const CheckpointExport& kv,
+                                            const CheckpointStateExport& state) {
+    const auto blob = core::encode_tier_checkpoint(tier_adapter_detail::to_payload(kv, state));
+    if (blob.empty()) { return false; }
+    return tier.store(key, blob);
+}
 
 // Reads the pair back. False on a miss, a decode the format refuses, or a backend failure; the
 // outputs are only written on success, so a caller cannot act on half a checkpoint.
-[[nodiscard]] bool tier_load_export(core::KvTier& tier, const core::KvBlockKey& key,
-                                    CheckpointExport& kv, CheckpointStateExport& state);
+[[nodiscard]] inline bool tier_load_export(core::KvTier& tier, const core::KvBlockKey& key,
+                                           CheckpointExport& kv, CheckpointStateExport& state) {
+    const auto hit = tier.lookup(key);
+    if (hit.state == core::KvTierState::miss || hit.bytes == 0) { return false; }
+    std::vector<std::byte> buffer(hit.bytes, std::byte{0});
+    if (!tier.retrieve(key, buffer)) { return false; }
+    const auto payload = core::decode_tier_checkpoint(buffer);
+    if (!payload) { return false; }
+    tier_adapter_detail::from_payload(*payload, kv, state);
+    return true;
+}
 
 // Store, read back, compare both halves. The tier is the one component that can be wrong in a way
 // nothing downstream notices - a blob that decodes cleanly and carries another frontier's KV - so
 // the round trip is a function the caller can run before it trusts a backend.
-[[nodiscard]] bool tier_round_trip_ok(core::KvTier& tier, const core::KvBlockKey& key,
-                                      const CheckpointExport& kv,
-                                      const CheckpointStateExport& state);
+[[nodiscard]] inline bool tier_round_trip_ok(core::KvTier& tier, const core::KvBlockKey& key,
+                                             const CheckpointExport& kv,
+                                             const CheckpointStateExport& state) {
+    if (!tier_store_export(tier, key, kv, state)) { return false; }
+    CheckpointExport back;
+    CheckpointStateExport back_state;
+    if (!tier_load_export(tier, key, back, back_state)) { return false; }
+    return back.frontier == kv.frontier && back.page_count == kv.page_count &&
+           back.page_bytes == kv.page_bytes && back.kv_bytes == kv.kv_bytes &&
+           back_state.image_bytes == state.image_bytes && back_state.layers == state.layers &&
+           back_state.hidden == state.hidden && back_state.bytes == state.bytes;
+}
 
-} // namespace ninfer::models::qwen3_5
+} // namespace ninfer::models::qwen3_5::detail

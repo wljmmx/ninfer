@@ -1,4 +1,5 @@
 #include "models/qwen3_5/program/program_impl.h"
+#include "models/qwen3_5/program/storage/checkpoint_tier_adapter.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/execution_context.h"
 #include "models/qwen3_5/execution/linear.h"
@@ -143,6 +144,15 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         (workspace_plan.vision &&
          workspace_plan.vision->general_capacity_bytes != workspace_plan.general_capacity)) {
         throw std::invalid_argument("Qwen3.5 workspace plan does not match startup features");
+    }
+    // port (sm_89): Q54's third tier. Off unless a directory is named; when it is, the backend runs
+    // one self-check here so "the tier works" is a printed line rather than an assumption carried
+    // forward until the first request fails in a way nobody traces back to storage.
+    if (const char* tier_dir = std::getenv("NINFER_KV_TIER_DIR"); tier_dir != nullptr && *tier_dir) {
+        kv_tier = std::make_unique<core::DiskKvTier>(std::filesystem::path(tier_dir));
+        std::fprintf(stderr, "[kvt] tier dir=%s\n", tier_dir);
+        std::fflush(stderr);
+        tier_selftest();
     }
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
     decoder      = std::make_unique<qwen3_5::DecoderState>(backing, plan.persistent.decoder);
@@ -658,5 +668,28 @@ void ProgramImpl::reset_memory_peaks() noexcept {
     }
 }
 
+
+bool ProgramImpl::tier_selftest() {
+    if (!kv_tier) { return false; }
+    // A synthetic pair, so the check exercises the adapter and the backend without a model, a
+    // device or a request. It answers exactly one question: can this directory hold a checkpoint
+    // and give it back unchanged. A backend that fails here would fail every real store too, and
+    // the failure would otherwise be attributed to the checkpoint path.
+    CheckpointExport kv;
+    kv.frontier   = 1;
+    kv.page_count = 1;
+    kv.page_bytes = 64;
+    kv.kv_bytes.assign(64, std::byte{0x5a});
+    CheckpointStateExport state;
+    state.image_bytes = 32;
+    state.layers      = 1;
+    state.hidden      = 8;
+    state.bytes.assign(32, std::byte{0x3c});
+    const core::KvBlockKey key{0x5e1f7e5712345678ULL, 1};
+    const bool ok = tier_round_trip_ok(*kv_tier, key, kv, state);
+    std::fprintf(stderr, "[kvt] tier selftest %s\n", ok ? "OK" : "FAIL");
+    std::fflush(stderr);
+    return ok;
+}
 
 } // namespace ninfer::models::qwen3_5::detail

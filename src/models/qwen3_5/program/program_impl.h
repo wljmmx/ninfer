@@ -1,6 +1,7 @@
 #pragma once
 #include "models/qwen3_5/program/internal.h"
 #include "core/checkpoint_fingerprint.h"
+#include "core/kv_tier.h"
 
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
@@ -450,6 +451,11 @@ public:
     std::array<RequestControl, kMaximumConcurrency> requests;
     std::array<std::uint64_t, kMaximumConcurrency> lane_epochs{};
     std::vector<CheckpointSlot> checkpoints;
+    // port (sm_89): Q54's third tier. Null unless NINFER_KV_TIER_DIR names a directory; when it is
+    // set, tier_selftest() runs once at startup so "the backend works" is a printed line rather
+    // than an assumption. Nothing stores through it yet - see checkpoint_tier_adapter.h.
+    std::unique_ptr<core::KvTier> kv_tier;
+    [[nodiscard]] bool tier_selftest();
 
     std::optional<PinnedHostBuffer> round_host;
     std::optional<PinnedHostBuffer> score_logprobs_host;

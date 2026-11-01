@@ -1,7 +1,9 @@
 #include "models/qwen3_5/program/storage/checkpoint_tier_adapter.h"
 
 #include "core/tier_checkpoint_payload.h"
+#include "models/qwen3_5/program/program_impl.h"
 
+#include <cstdio>
 #include <vector>
 
 namespace ninfer::models::qwen3_5 {
@@ -83,3 +85,30 @@ bool tier_round_trip_ok(core::KvTier& tier, const core::KvBlockKey& key, const C
 }
 
 } // namespace ninfer::models::qwen3_5
+
+namespace ninfer::models::qwen3_5::detail {
+
+bool ProgramImpl::tier_selftest() {
+    if (!kv_tier) { return false; }
+    // A synthetic pair, so the check exercises the adapter and the backend without a model, a
+    // device or a request. It answers exactly one question: can this directory hold a checkpoint
+    // and give it back unchanged. A backend that fails here would fail every real store too, and
+    // the failure would otherwise be attributed to the checkpoint path.
+    CheckpointExport kv;
+    kv.frontier   = 1;
+    kv.page_count = 1;
+    kv.page_bytes = 64;
+    kv.kv_bytes.assign(64, std::byte{0x5a});
+    CheckpointStateExport state;
+    state.image_bytes = 32;
+    state.layers      = 1;
+    state.hidden      = 8;
+    state.bytes.assign(32, std::byte{0x3c});
+    const core::KvBlockKey key{0x5e1f7e5712345678ULL, 1};
+    const bool ok = tier_round_trip_ok(*kv_tier, key, kv, state);
+    std::fprintf(stderr, "[kvt] tier selftest %s\n", ok ? "OK" : "FAIL");
+    std::fflush(stderr);
+    return ok;
+}
+
+} // namespace ninfer::models::qwen3_5::detail
