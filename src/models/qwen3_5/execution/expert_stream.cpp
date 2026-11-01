@@ -19,6 +19,22 @@
 namespace ninfer::models::qwen3_5::execution {
 namespace {
 
+// port (sm_89): Q68a. Each bank remembers what it routed on its last small-batch step, so a probe
+// can ask the question the read-ahead's next selection depends on: do adjacent layers route the
+// same experts? Indices are compared, not bytes - different layers own different matrices; the
+// hypothesis is that the router prefers similar indices from one layer to the next, and that is
+// exactly what this measures. Nothing here changes behaviour; it only counts.
+struct LayerTrace {
+    std::array<std::vector<std::int32_t>, 64> sets;
+    std::array<bool, 64> valid{};
+};
+
+LayerTrace& layer_trace() {
+    static LayerTrace trace;
+    return trace;
+}
+
+
 std::uint64_t rows_of(const WeightGeometry& parent, std::uint64_t elements) {
     if (parent.shape.empty() || parent.shape.back() == 0) {
         throw std::invalid_argument("streamed expert parent has no column axis");
@@ -1505,6 +1521,36 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         std::sort(prev_routes_.begin(), prev_routes_.end());
         prev_routes_.erase(std::unique(prev_routes_.begin(), prev_routes_.end()),
                            prev_routes_.end());
+        // Q68a: the same set, published for the neighbouring layer to be measured against. The
+        // probe reads bank-1's copy, which was written earlier in this step because the layers run
+        // in order, so it compares this layer with the layer below it on the same token.
+        if (std::getenv("NINFER_LAYER_PROBE") != nullptr) {
+            auto& trace = layer_trace();
+            trace.sets[bank_]  = prev_routes_;
+            trace.valid[bank_] = true;
+            if (bank_ > 0 && trace.valid[bank_ - 1] && !prev_routes_.empty()) {
+                const auto& below = trace.sets[bank_ - 1];
+                std::size_t shared = 0, not_resident = 0;
+                for (const auto expert : prev_routes_) {
+                    if (!std::binary_search(below.begin(), below.end(), expert)) { continue; }
+                    ++shared;
+                    if (!cache_->expert_slot(bank_, expert)) { ++not_resident; }
+                }
+                static double recall_sum = 0.0, absent_sum = 0.0;
+                static std::uint64_t probes = 0;
+                recall_sum += static_cast<double>(shared) / static_cast<double>(prev_routes_.size());
+                absent_sum += shared == 0 ? 0.0
+                                          : static_cast<double>(not_resident) /
+                                                static_cast<double>(shared);
+                if (++probes % 40 == 0) {
+                    std::fprintf(stderr, "[probe] recall=%.3f absent=%.3f layers=%llu\n",
+                                 recall_sum / 40.0, absent_sum / 40.0,
+                                 static_cast<unsigned long long>(probes));
+                    std::fflush(stderr);
+                    recall_sum = absent_sum = 0.0;
+                }
+            }
+        }
     }
     // port (sm_89): A3b, on the per-bank generation this time. A layer is about to hand these two
     // tables to kernels that read them as addresses; if what this bank's Device tables hold is not
