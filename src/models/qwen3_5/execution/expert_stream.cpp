@@ -1375,6 +1375,11 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     // port (sm_89): D1 read-ahead, retried on the arena F1 fixed. One expert a layer - the hottest the
     // pool does not hold - issued after this layer's uploads, so the tier it fills is what the next
     // layer's uploader reads. claim() already skips slots a copy is still reading.
+    //
+    // Measured at 8 GiB (64-token request, same content, switch on and off): arena hit 35.9% -> 37.2%,
+    // one fill every forty layers, wall 21.6 s -> 22.8 s. So it works and it costs more than it saves at
+    // this size: +1.3 points of hit rate against +5.6% wall. Keep it off; a fill that pays needs to run
+    // off the calling thread, which is what D1's queue is for and what the arena now makes possible.
     static const bool prefetch = std::getenv("NINFER_PREFETCH") != nullptr;
     if (prefetch && host_ != nullptr) {
         float best_score         = 0.0F;
