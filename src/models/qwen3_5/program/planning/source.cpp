@@ -256,6 +256,11 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
                      checkpoints[handle->index].pins, state_references,
                      state_store->source_pins(record.state));
         std::fflush(stderr);
+        for (const auto& transfer : candidate.transfers) {
+            std::fprintf(stderr, "[kvt] transfer resource=%d direction=%d units=%llu pages=%u\n",
+                         static_cast<int>(transfer.resource), static_cast<int>(transfer.direction),
+                         static_cast<unsigned long long>(transfer.units), transfer.page_count);
+        }
     }
     return candidate;
 }
