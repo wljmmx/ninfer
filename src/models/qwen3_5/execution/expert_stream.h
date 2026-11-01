@@ -233,7 +233,8 @@ private:
     static constexpr std::uint64_t kTableUnknown = ~std::uint64_t{0};
     std::uint64_t table_generation_ = 0;
     // port (sm_89): D1 read-ahead counter (see the call site).
-    std::uint64_t prefetch_calls_ = 0;
+    std::uint64_t prefetch_calls_ = 0;   // experts
+    std::uint64_t prefetch_batches_ = 0; // layers that prefetched
     ExpertBankLayout entry_{};
     // port (sm_89): the pool holds every layer at once, so this bank's window is fixed and no
     // per-step routing decision - and therefore no host round trip - is needed.

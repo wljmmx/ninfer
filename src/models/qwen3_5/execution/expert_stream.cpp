@@ -1380,32 +1380,56 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     // one fill every forty layers, wall 21.6 s -> 22.8 s. So it works and it costs more than it saves at
     // this size: +1.3 points of hit rate against +5.6% wall. Keep it off; a fill that pays needs to run
     // off the calling thread, which is what D1's queue is for and what the arena now makes possible.
+    // port (sm_89): D1 read-ahead. One *batch* a layer, not one expert: NINFER_PREFETCH_PER_LAYER
+    // (default 8) experts, taken from the top of the decayed route score among the ones the pool does
+    // not hold. Batching matters twice - a batch of pinned slices submits far cheaper per slice than
+    // the same slices one at a time, and the arena fill is a memcpy per expert either way.
+    //
+    // The pool a prefetch aims at is R3 (NINFER_PREFETCH_SLOTS, plan D1), sized by D2's budget; the
+    // arena is what stands in for it here. This is the wiring and the batch size, not the queue: the
+    // fill still runs on the calling thread, which is why no performance conclusion may be drawn from
+    // it yet - the queue in core/prefetch.h has to own the fill first.
     static const bool prefetch = std::getenv("NINFER_PREFETCH") != nullptr;
     if (prefetch && host_ != nullptr) {
-        float best_score         = 0.0F;
-        std::int32_t best_expert = -1;
+        static const std::uint32_t per_layer = [] {
+            const char* value = std::getenv("NINFER_PREFETCH_PER_LAYER");
+            if (value != nullptr && *value != '\0') {
+                return static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
+            }
+            return 8U;
+        }();
+        // Partial selection: keep the `per_layer` highest scores among non-resident experts. The array is
+        // 248 entries, forty times a token, so this stays a linear scan with a small insertion.
+        std::vector<std::pair<float, std::int32_t>> top;
+        top.reserve(per_layer);
         for (std::uint32_t expert = 0; expert < count_; ++expert) {
-            if (hot_score_[expert] <= best_score) { continue; }
+            const float score = hot_score_[expert];
+            if (score <= 0.0F) { continue; }
             if (cache_->expert_slot(bank_, expert)) { continue; }
-            best_score  = hot_score_[expert];
-            best_expert = static_cast<std::int32_t>(expert);
+            if (top.size() == per_layer && score <= top.back().first) { continue; }
+            const std::pair<float, std::int32_t> entry{score, static_cast<std::int32_t>(expert)};
+            const auto at = std::lower_bound(top.begin(), top.end(), entry,
+                                             [](const auto& l, const auto& r) { return l.first > r.first; });
+            top.insert(at, entry);
+            if (top.size() > per_layer) { top.pop_back(); }
         }
-        if (best_expert >= 0) {
-            host_->ensure(ExpertBankId{bank_}, std::span<const std::int32_t>(&best_expert, 1), nullptr);
-            ++prefetch_calls_;
-            if (prefetch_calls_ % 40 == 0) {
+        if (!top.empty()) {
+            std::vector<std::int32_t> wanted(top.size());
+            for (std::size_t i = 0; i < top.size(); ++i) { wanted[i] = top[i].second; }
+            host_->ensure(ExpertBankId{bank_}, std::span<const std::int32_t>(wanted), nullptr);
+            prefetch_calls_ += wanted.size();
+            if ((++prefetch_batches_ % 40) == 0) {
                 const auto& st = host_->stats();
                 const auto total = st.hits + st.misses;
-                std::fprintf(stderr, "[pf] calls=%llu hit=%.1f%% evict=%llu\n",
+                std::fprintf(stderr, "[pf] experts=%llu batches=%llu hit=%.1f%% evict=%llu\n",
                              (unsigned long long)prefetch_calls_,
+                             (unsigned long long)prefetch_batches_,
                              total ? 100.0 * (double)st.hits / (double)total : 0.0,
                              (unsigned long long)st.evictions);
                 std::fflush(stderr);
             }
         }
-    }
-
-    // port (sm_89): A3b, on the per-bank generation this time. A layer is about to hand these two
+    }    // port (sm_89): A3b, on the per-bank generation this time. A layer is about to hand these two
     // tables to kernels that read them as addresses; if what this bank's Device tables hold is not
     // what this bank's set now is, a publish did not land and the kernels would compute with another
     // set's offsets - a silent wrong token, the one outcome the plan never accepts.
