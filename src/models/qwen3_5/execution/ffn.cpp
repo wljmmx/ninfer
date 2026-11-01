@@ -1378,7 +1378,8 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
             // GH1 has a source now: the same counters the [gh1] panel prints. Prefetch usefulness
             // still has none (the queue has no consumer), so it stays "not measured".
             const auto rates = moe.stream->gh1_rates();
-            control.observe_coverage(rates.static_pct, rates.no_miss_pct, rates.capturable_pct);
+            control.observe_coverage(rates.static_pct, rates.no_miss_pct, rates.capturable_pct,
+                                     rates.capt_free_pct, rates.capt_ready_pct);
             // O1's expected hit rate: how often a covered layer follows a covered one. Printed with
             // the rest so the speculative design is judged by a number before it is built.
             static std::uint64_t pred_reports = 0;

@@ -180,10 +180,31 @@ public:
     // GH1 rates, for the policy controller: static = the set did not move this step, no_miss = every
     // route was already in the pool, capturable = the step did not take the split path at all.
     // Denominator is gh1_calls_. Negative means "not measured yet", never zero.
+    //
+    // port (sm_89): Q20 adds a fourth rate, and it is a different question from `capturable`.
+    //
+    //   capturable : the layer FITS - the pool could hold every expert it routed to. On an 8 GiB
+    //                pool that is 0% by construction (106 slots against 256 experts a bank), so it
+    //                says nothing about the work Q20 does. It is a capacity statement.
+    //   capt_free  : the layer NEEDED NOTHING FROM THE HOST - no route read-back, no offset/mask
+    //                publication, no upload waited on. This is the one a capture and the "clean
+    //                step" gate are about, and the one F3 was really reporting when it printed 0%.
+    //
+    // Two numbers, one denominator. Reporting only `capturable` is what let "0% capturable" stand in
+    // for "the layer needs the host", which is false at 16 GiB and true at 8 GiB for different
+    // reasons.
     struct Gh1Rates {
-        double static_pct     = -1.0;
-        double no_miss_pct    = -1.0;
-        double capturable_pct = -1.0;
+        double static_pct      = -1.0;
+        double no_miss_pct     = -1.0;
+        double capturable_pct  = -1.0;
+        double capt_free_pct   = -1.0;
+        // Q20: GC2's precondition, counted rather than asserted. A whole-layer graph needs BOTH the
+        // capacity statement and the execution statement to hold on the same layer - the pool could
+        // hold it AND the layer asked the host for nothing. On 8 GiB these two fail for different
+        // reasons (106 slots vs 256 experts; a read-back every layer), and this is the number that
+        // says so in one place. Any value short of 100% means "a captured whole layer would replay a
+        // table that is not the one it was captured with".
+        double capt_ready_pct  = -1.0;
     };
     // Share of layers that are covered when the previous layer was covered - the speculative skip's
     // expected hit rate. Negative when there is no sample yet.
@@ -198,6 +219,8 @@ public:
         rates.static_pct     = 100.0 * static_cast<double>(gh1_static_calls_) / denom;
         rates.no_miss_pct    = 100.0 * static_cast<double>(gh1_no_miss_calls_) / denom;
         rates.capturable_pct = 100.0 * static_cast<double>(gh1_calls_ - gh1_split_calls_) / denom;
+        rates.capt_free_pct  = 100.0 * static_cast<double>(gh1_capt_free_calls_) / denom;
+        rates.capt_ready_pct = 100.0 * static_cast<double>(gh1_capt_ready_calls_) / denom;
         return rates;
     }
     // port (sm_89): what the last ensure() call spent, split by node, so the layer timeline can say
@@ -332,6 +355,13 @@ private:
     std::uint64_t gh1_split_calls_  = 0;
     std::uint64_t gh1_no_miss_calls_ = 0;
     std::uint64_t gh1_static_calls_  = 0;
+    // Q20: layers that asked the host for nothing (see Gh1Rates). Its own counter, not derived from
+    // the other three - a layer can be uncovered (capacity) and still need no host (device-side
+    // addressing), and that is exactly the state Q20 exists to create.
+    std::uint64_t gh1_capt_free_calls_ = 0;
+    // Layers that were both fully covered and host-free: the only state in which a captured
+    // whole layer would replay the table it was captured with (Q20 -> GC2).
+    std::uint64_t gh1_capt_ready_calls_ = 0;
     // Prints the GH1 panel; one place so the pinned fast path and the normal path cannot drift.
     void gh1_report();
     std::uint64_t entered_steps_ = 0;

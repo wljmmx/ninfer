@@ -325,11 +325,18 @@ void ExpertStream::gh1_report() {
     };
     // static/no_miss are per STEP on the split path, capturable is per CALL (layer). Saying which
     // denominator each number uses is the difference between a metric and a mystery.
+    //
+    // Q20: `capturable` and `capt_free` are printed side by side on purpose. The first is a capacity
+    // statement ("the pool could hold the layer"), the second is the execution statement ("the layer
+    // did not touch the host"). F3 was the first number standing in for the second.
     std::fprintf(stderr,
-                 "[gh1] bank=%u calls=%llu static=%.1f%% no_miss=%.1f%% capturable=%.1f%%\n",
+                 "[gh1] bank=%u calls=%llu static=%.1f%% no_miss=%.1f%% capturable=%.1f%% "
+                 "capt_free=%.1f%% capt_ready=%.1f%%\n",
                  bank_, static_cast<unsigned long long>(gh1_calls_),
                  pct(gh1_static_calls_, gh1_calls_), pct(gh1_no_miss_calls_, gh1_calls_),
-                 pct(gh1_calls_ - gh1_split_calls_, gh1_calls_));
+                 pct(gh1_calls_ - gh1_split_calls_, gh1_calls_),
+                 pct(gh1_capt_free_calls_, gh1_calls_),
+                 pct(gh1_capt_ready_calls_, gh1_calls_));
     std::fflush(stderr);
 }
 // port (sm_89): Q10's instrument. The plan's gate is "static ≥95%", and `static` is incremented in
@@ -345,7 +352,7 @@ void ExpertStream::gh1_report() {
 namespace {
 void static_probe(std::uint32_t bank, std::int32_t tokens, bool covered, std::uint32_t absent,
                   std::uint32_t unready, std::uint64_t moved, std::uint64_t ins,
-                  std::uint64_t staged) {
+                  std::uint64_t staged, bool capt_free) {
     static const bool on = std::getenv("NINFER_STATIC_PROBE") != nullptr;
     if (!on) { return; }
     struct Totals {
@@ -354,8 +361,14 @@ void static_probe(std::uint32_t bank, std::int32_t tokens, bool covered, std::ui
         // Step accounting. A round is 40 layers and a graph is captured per round, so layer coverage
         // says nothing about it: if one layer in forty misses, the round cannot be replayed from a
         // captured graph at all. A step is closed when bank 0 comes round again.
-        std::uint64_t steps = 0, clean_steps = 0, step_layers = 0;
+        //
+        // Q20 keeps TWO step rates, because "clean" has been asked to mean two things:
+        //   clean      - no layer was absent (a capacity statement: the pool held every route)
+        //   clean_capt - no layer needed the host (an execution statement: nothing was fetched,
+        //                published or uploaded). This is the one a capture can be built on.
+        std::uint64_t steps = 0, clean_steps = 0, clean_capt_steps = 0, step_layers = 0;
         bool step_dirty = false;
+        bool step_capt  = true;
     };
     static thread_local Totals narrow_win, narrow_all;  // decode: one (or two) tokens a call
     static thread_local Totals wide_all;                // prefill: many tokens a call
@@ -369,11 +382,14 @@ void static_probe(std::uint32_t bank, std::int32_t tokens, bool covered, std::ui
             ++t.steps;
             ++all.steps;
             if (!t.step_dirty) { ++t.clean_steps; ++all.clean_steps; }
+            if (t.step_capt) { ++t.clean_capt_steps; ++all.clean_capt_steps; }
             t.step_layers = 0;
             t.step_dirty  = false;
+            t.step_capt   = true;
         }
         ++t.step_layers;
         if (absent != 0) { t.step_dirty = true; }
+        if (!capt_free) { t.step_capt = false; }
     }
     ++t.calls;
     ++all.calls;
@@ -390,6 +406,7 @@ void static_probe(std::uint32_t bank, std::int32_t tokens, bool covered, std::ui
     std::fprintf(stderr,
                  "[st] win=%llu decode_layers=%llu | window covered=%.1f%% absent=%llu (%llu L) "
                  "unready=%llu | cum covered=%.1f%% absent=%.3f/L | steps=%llu clean=%.1f%% "
+                 "clean_capt=%.1f%% "
                  "| moved=%.2f ins=%.2f staged=%.2f | prefill calls=%llu absent=%llu\n",
                  static_cast<unsigned long long>(narrow_all.calls / 400),
                  static_cast<unsigned long long>(narrow_win.calls),
@@ -401,6 +418,7 @@ void static_probe(std::uint32_t bank, std::int32_t tokens, bool covered, std::ui
                  static_cast<double>(narrow_all.absent) / na,
                  static_cast<unsigned long long>(narrow_all.steps),
                  100.0 * static_cast<double>(narrow_all.clean_steps) / ns,
+                 100.0 * static_cast<double>(narrow_all.clean_capt_steps) / ns,
                  static_cast<double>(narrow_win.moved) / n, static_cast<double>(narrow_win.ins) / n,
                  static_cast<double>(narrow_win.staged) / n,
                  static_cast<unsigned long long>(wide_all.calls),
@@ -413,6 +431,11 @@ void static_probe(std::uint32_t bank, std::int32_t tokens, bool covered, std::ui
 bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32_t tokens,
                           cudaStream_t stream, const std::int32_t* host_ids, bool assume_covered) {
     if (cache_ == nullptr) { throw std::logic_error("expert stream is not attached"); }
+    // port (sm_89): Q20's measurement. Three separate booleans rather than one "did the host do
+    // anything": when capt_free stays at zero the fix depends on WHICH of the three fired - a route
+    // read-back is removed by device-side coverage, a publication by a static table, an upload by a
+    // second addressing leg. One boolean would say "not capturable" and name none of them.
+    bool host_fetch = false, host_publish = false, host_upload = false;
     // port (sm_89): measurement switch. Claiming the layer cannot be held makes the caller take the
     // host tier for the whole routed term, which is the CPU reference the device kernels are scored
     // against. Nothing else changes: same fetch, same FP32 fold, same shared expert.
@@ -432,6 +455,10 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             ++gh1_calls_;
             ++gh1_no_miss_calls_;
             ++gh1_static_calls_;
+            // A pinned layer re-points host-side pointers and nothing else: no read-back, no table,
+            // no copy. It is the one path where both rates are honest 100%.
+            ++gh1_capt_free_calls_;
+            ++gh1_capt_ready_calls_;
             gh1_report();
             return true;
         }
@@ -482,6 +509,11 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     if (assume_covered && !fully) {
         ++gh1_static_calls_;
         ++gh1_no_miss_calls_;
+        // Same reason as the pinned path: coverage was established on the Device and this call only
+        // rebases host pointers. Counting it is what makes capt_free a rate rather than a restatement
+        // of the pool size.
+        ++gh1_capt_free_calls_;
+        ++gh1_capt_ready_calls_;
         last_cost_ = StepCost{};
         rebase_window();
         return true;
@@ -504,6 +536,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     double route_ms   = 0.0;
     const std::int32_t* route_ids = host_ids;
     if (route_ids == nullptr) {
+        host_fetch = true;
         const auto stage_begin = std::chrono::steady_clock::now();
         const auto status     = cudaMemcpyAsync(route_staging_->data(), device_ids, bytes,
                                                 cudaMemcpyDeviceToHost, stream);
@@ -579,7 +612,14 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             last_cost_          = StepCost{};
             last_cost_.route_ms = route_ms;
             rebase_window();
-            static_probe(bank_, tokens, true, probe_absent, probe_unready, 0, 0, 0);
+            // Nothing is published or uploaded on a covered layer - this return is above both - so
+            // the only thing that can make it host-bound is the read-back that produced route_ids.
+            if (!host_fetch) { ++gh1_capt_free_calls_; }
+            // Covered and host-free on the same layer: the only state a whole-layer graph may be
+            // captured in. This is GC2's gate, and it is deliberately the AND of the two rates
+            // above rather than a third independent measurement.
+            if (!host_fetch) { ++gh1_capt_ready_calls_; }
+            static_probe(bank_, tokens, true, probe_absent, probe_unready, 0, 0, 0, !host_fetch);
             return true;
         }
         // port (sm_89): two policies, because they disagree on what the set is for.
@@ -1214,6 +1254,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             static thread_local bool published_once = false;
             const bool unchanged = moved.empty() && published_once && !stale;
             if (!unchanged && table_bytes != 0 && mask_bytes != 0) {
+                host_publish = true;
                 published_once     = true;
                 published_generation = generation;
                 cudaMemcpyAttributes attributes{};
@@ -1396,7 +1437,14 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     // The honest miss count for the path controller: the mask cannot answer this question, because
     // it is written from the same decision that places the step's routes.
     last_cost_.uploaded = cache_->last_uploaded();
-    static_probe(bank_, tokens, false, probe_absent, probe_unready, probe_moved, probe_ins, last_cost_.uploaded);
+    // An upload only counts as host intervention when bytes actually moved. `prepare()` is called on
+    // every split layer, but a layer whose required experts are already resident submits nothing -
+    // counting the call instead of the transfer would report the split path as host-bound even when
+    // it was not, which is the same mistake F3 made in the other direction.
+    host_upload = last_cost_.uploaded != 0;
+    if (!host_fetch && !host_publish && !host_upload) { ++gh1_capt_free_calls_; }
+    static_probe(bank_, tokens, false, probe_absent, probe_unready, probe_moved, probe_ins,
+                 last_cost_.uploaded, !host_fetch && !host_publish && !host_upload);
     // port (sm_89): D1 read-ahead, in three pieces that are now separate on purpose.
     //
     // 1. The selection (below) is unchanged: NINFER_PREFETCH_PER_LAYER (default 8) experts, taken

@@ -45,6 +45,12 @@ struct PolicySignals {
     double static_pct     = -1.0;
     double no_miss_pct    = -1.0;
     double capturable_pct = -1.0;
+    // Q20: the execution half of the capture question, next to the capacity half above.
+    // capt_free = the layer asked the host for nothing; capt_ready = that AND it was fully covered,
+    // which is the state a whole-layer graph can actually be captured in. `graph` is driven by
+    // capt_ready, not by capturable - see want_graph().
+    double capt_free_pct  = -1.0;
+    double capt_ready_pct = -1.0;
     // Warm-tier decision (1y.7 step 3f): what a cold read costs, what a hit saves, and what making
     // the copy costs. Break-even is a ratio between the last two, measured - not a RAM size.
     double cold_read_us_per_expert = 0.0;
@@ -92,10 +98,13 @@ public:
         signals.wall_ms += (wall_ms - signals.wall_ms) / 16.0;
     }
 
-    void observe_coverage(double static_pct, double no_miss_pct, double capturable_pct) {
+    void observe_coverage(double static_pct, double no_miss_pct, double capturable_pct,
+                          double capt_free_pct = -1.0, double capt_ready_pct = -1.0) {
         signals.static_pct     = static_pct;
         signals.no_miss_pct    = no_miss_pct;
         signals.capturable_pct = capturable_pct;
+        signals.capt_free_pct  = capt_free_pct;
+        signals.capt_ready_pct = capt_ready_pct;
     }
 
     void observe_decode(double tps) { signals.decode_tps = tps; }
@@ -161,7 +170,15 @@ public:
         if (signals.prefetch_usefulness < 0.0) { return true; } // nothing measured yet: explore
         return signals.prefetch_usefulness > 0.0;
     }
+    // Q20 / F3: this used to gate on `capturable` alone, which is a capacity statement. On an 8 GiB
+    // pool capturable is 0% by construction, so the gate could never open there even on a layer that
+    // needed no host at all - and on a larger pool it could open on a layer that still fetched and
+    // published, which is worse. The gate is now the AND of the capacity statement and the measured
+    // execution statement (capt_ready), which is the condition a captured whole layer really needs.
     [[nodiscard]] bool want_graph() const {
+        if (signals.capt_ready_pct >= 0.0) {
+            return signals.capt_ready_pct >= 90.0 && signals.static_pct >= 95.0;
+        }
         return signals.capturable_pct >= 90.0 && signals.static_pct >= 95.0;
     }
     [[nodiscard]] bool want_freeze() const { return signals.no_miss_pct >= 99.0; }
@@ -180,7 +197,7 @@ public:
         ++layers;
         drive(expert_path, want_device_path(), device_path_ready, "cost model");
         drive(prefetch, want_prefetch(), prefetch_wired, "usefulness measured");
-        drive(graph, want_graph(), graph_wired, "capturable>=90% && static>=95%");
+        drive(graph, want_graph(), graph_wired, "capt_ready>=90% && static>=95%");
         drive(warm_mirror, want_warm_mirror(), true, "hit_ratio*cold>fill");
         drive(freeze_set, want_freeze(), freeze_wired, "no_miss>=99%");
     }
@@ -190,16 +207,22 @@ public:
         char s[8];
         char n[8];
         char c[8];
+        char f[8];
+        char r[8];
         fmt_pct(s, sizeof(s), signals.static_pct);
         fmt_pct(n, sizeof(n), signals.no_miss_pct);
         fmt_pct(c, sizeof(c), signals.capturable_pct);
+        fmt_pct(f, sizeof(f), signals.capt_free_pct);
+        fmt_pct(r, sizeof(r), signals.capt_ready_pct);
         std::fprintf(stderr,
                      "[ctl] fetch=%.0fus upload=%.0fus/exp read=%.0fus/exp miss=%.2f | "
-                     "wall=%.3fms gpu=%.3fms ens=%.3fms | cov static=%s no_miss=%s capt=%s | "
+                     "wall=%.3fms gpu=%.3fms ens=%.3fms | cov static=%s no_miss=%s capt=%s "
+                     "capt_free=%s capt_ready=%s | "
                      "path=%s(%s) pf=%s(%s) graph=%s(%s) freeze=%s(%s) | tps=%.1f\n",
                      signals.fetch_us, signals.upload_us_per_expert, signals.read_us_per_expert,
                      signals.miss_per_layer, signals.wall_ms, signals.gpu_ms, signals.ens_ms, s, n,
-                     c, on_off(expert_path.enabled), expert_path.wired ? "live" : "shadow",
+                     c, f, r,
+                     on_off(expert_path.enabled), expert_path.wired ? "live" : "shadow",
                      on_off(prefetch.enabled), prefetch.wired ? "live" : "shadow",
                      on_off(graph.enabled), graph.wired ? "live" : "shadow",
                      on_off(freeze_set.enabled), freeze_set.wired ? "live" : "shadow",
