@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <span>
 #include <string>
 #include <stdexcept>
@@ -356,6 +357,10 @@ public:
 
     void ensure(ExpertBankId bank, std::span<const std::int32_t> experts,
                 const std::int32_t* resident_mask) override {
+        // port (sm_89): the slot tables and the arena are mutated here and read by the uploader in
+        // arena_image(), and D1 wants the fill on its own thread. One lock covers all three entry
+        // points so that is a safe call to make; without it the two threads would race on slot_of.
+        std::lock_guard<std::mutex> guard(mutex_);
         // Addressed in place means the *address* is already right - not that the bytes are resident.
         // A bank served straight out of the artifact mapping is backed by file pages the OS may
         // evict at any time, so it is a cold tier wearing a warm tier's address. A managed pinned
@@ -410,6 +415,7 @@ public:
     const std::byte* arena_image(std::uint32_t bank, std::uint32_t expert,
                                  std::uint64_t& bytes) const override {
         bytes = 0;
+        std::lock_guard<std::mutex> guard(mutex_);
         // port (sm_89): F1 bisect. With NINFER_ARENA_NO_READ the tier is still filled and its offsets
         // rewritten, but the uploader is told nothing is there and reads the artifact as before.
         // Crash gone => the fault is on the read side (the pointer, its lifetime, or when the copy
@@ -440,6 +446,7 @@ public:
     // port (sm_89): the copies the uploader handed out have landed (called where the staging events
     // are waited). Clearing them all is safe by construction: settle means none is reading any more.
     void uploads_settled() override {
+        std::lock_guard<std::mutex> guard(mutex_);
         std::fill(in_flight_.begin(), in_flight_.end(), std::uint8_t{0});
     }
     [[nodiscard]] std::uint64_t slot_bytes() const noexcept { return slot_bytes_; }
@@ -661,6 +668,9 @@ private:
     // mutable: arena_image() is const (it is the uploader's view) but handing out a pointer is what
     // marks the slot in flight.
     mutable std::vector<std::uint8_t> in_flight_;
+    // Serialises ensure() with the uploader's arena_image()/uploads_settled(): the first mutates slot
+    // tables, the others read them, and D1 runs the fill on its own thread.
+    mutable std::mutex mutex_;
     std::uint64_t epoch_ = 0;
     Stats stats_{};
 };
