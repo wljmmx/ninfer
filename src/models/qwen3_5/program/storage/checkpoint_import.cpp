@@ -232,6 +232,22 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint(
     // monotonic"; clearing it after leaves these pages in the state a captured-then-demoted record
     // has, which is what the fork path expects.
 
+    // port (sm_89): give back the creator's reference.
+    //
+    // materialize() sets references = 1 so the code that made the page can hand it on, and
+    // adopt_pages() retains a second for the address. A page that is meant to live in exactly one
+    // address has to end at 1: at 2, movable() refuses it, and every restore is priced as a copy
+    // instead of a hand-over - which the capacity account then declines, so the request fails with
+    // every resource reading zero. Measured before this: addr_refs=2 where 1 was required.
+    //
+    // Only on the unpinned path. A record that keeps its checkpoint requirement is one a request is
+    // still using, and source_pins == 1 with references == 1 makes the release refuse by design.
+    if (!pin_pages) {
+        for (const LogicalKVPageHandle page : pages) {
+            (void)text_kv_pages->release_reference(page, false);
+        }
+    }
+
     for (const LogicalKVPageHandle page : pages) {
         if (text_kv_pages->writer_references(page) != 0) {
             text_kv_pages->set_writer(page, false);
