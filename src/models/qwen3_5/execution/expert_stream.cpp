@@ -811,6 +811,9 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                                          static_cast<std::size_t>(capacity) / 3);
         }();
         const auto hot_cap = static_cast<std::size_t>(capacity) - spill_cap;
+        // Kept for the attribution pass at the tail of ensure(), which runs outside this scope and has
+        // to know where the hot set ends inside `resident_order_`.
+        hot_cap_ = hot_cap;
 
         if (frozen_) {
             // port (sm_89): a frozen set used to take every slot, so a route outside it had nowhere
@@ -1227,6 +1230,20 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                              (unsigned long long)publish_bytes_step_max_,
                              publish_bytes_step_max_ <= 128 ? "step part fits"
                                                             : "step part over");
+                // P6/step 5: where the routes actually came from. Percentages because the absolute
+                // counts differ per bank and the question is "which structure is carrying this layer".
+                const auto total = static_cast<double>(route_hot_ + route_ring_ + route_prefetch_ +
+                                                       route_host_ + route_cpu_);
+                const auto pct = [&](std::uint64_t part) {
+                    return total == 0 ? 0.0 : 100.0 * static_cast<double>(part) / total;
+                };
+                std::fprintf(stderr,
+                             "[route] bank=%u hot=%.1f%% ring=%.1f%% pred=%.1f%% host=%.1f%% "
+                             "cpu=%.1f%% (n=%llu)\n",
+                             bank_, pct(route_hot_), pct(route_ring_), pct(route_prefetch_),
+                             pct(route_host_), pct(route_cpu_),
+                             (unsigned long long)(route_hot_ + route_ring_ + route_prefetch_ +
+                                                  route_host_ + route_cpu_));
                 const auto entered_per_step = entered_steps_ == 0
                     ? 0.0
                     : static_cast<double>(entered_) / static_cast<double>(entered_steps_);
@@ -1757,6 +1774,37 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     // is outside the two tiers. A layer that satisfies both would replay a table it was captured
     // with.
     if (!host_bound && all_addressable) { ++gh1_capt_ready_calls_; }
+    // P6/step 5: which structure served each route. A hit is a joint outcome of the hot region, the
+    // spill ring, the prediction region and the host leg, and until this existed the panel could only
+    // say "the pool served it" - which is exactly the number a controller cannot act on. Classified
+    // by the slot the route resolves to, so the total always equals `values`.
+    {
+        // `wanted` is built hot-first, so the first `hot_cap` entries are the epoch's hot set; the
+        // rest are the ring. That is the distinction the controller needs (a ring hit is cheap but
+        // not repeatable, a hot hit is the set it chose), and it is not recoverable from the slot.
+        const auto hot_end = std::min<std::size_t>(resident_order_.size(), hot_cap_);
+        std::vector<char> is_hot(count_, 0);
+        for (std::size_t i = 0; i < hot_end; ++i) {
+            const auto expert = resident_order_[i];
+            if (expert < count_) { is_hot[expert] = 1; }
+        }
+        for (std::size_t i = 0; i < values; ++i) {
+            const auto expert = static_cast<std::uint32_t>(route_ids[i]);
+            if (expert >= count_) { continue; }
+            const auto slot = cache_->expert_slot(bank_, expert);
+            if (slot && cache_->prefetch_slot(*slot)) {
+                ++route_prefetch_;
+            } else if (slot) {
+                // Hot and ring share one slot space; the difference is whether the expert is in the
+                // set the epoch chose, which is what the warm/cold decision below is about.
+                if (is_hot[expert]) { ++route_hot_; } else { ++route_ring_; }
+            } else if (host_ != nullptr && expert < host_flags_.size() && host_flags_[expert] != 0) {
+                ++route_host_;
+            } else {
+                ++route_cpu_;
+            }
+        }
+    }
     if (bank_ == 0 && host_direct && std::getenv("NINFER_EXPERT_TIMING")) {
         static std::uint64_t layers2 = 0, host_routes = 0, pool_routes = 0;
         host_routes += host_resolved;

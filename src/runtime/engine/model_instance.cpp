@@ -657,8 +657,15 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
         // recording an upload that a later step would then repeat with the wrong experts.
         const bool every_layer = instance->expert_cache->can_hold_every_layer();
         if (every_layer) { instance->expert_cache->preload_all(); }
-        // The pool cycle knob unmaps windows across rounds, which a captured graph cannot survive.
-        const bool graph_ok = graph_requested && every_layer &&
+        // P6/step 4: the construction-time door used to require the pool to hold every layer, which is
+        // a capacity fact - not the condition a captured layer actually needs. What a capture needs is
+        // that the layer it records needs no host work, and that is what PolicyController::want_graph()
+        // decides per layer (capt_ready >= 90% and static >= 95%). NINFER_GRAPH_BUDGET=1 pays the
+        // allowance even when the pool cannot hold a whole layer, so that decision can be made at
+        // runtime instead of being pre-empted here. The A3b check stays as the net: a replay under a
+        // set the tables were not published for throws rather than computing a wrong token.
+        static const bool budget_opt_in = std::getenv("NINFER_GRAPH_BUDGET") != nullptr;
+        const bool graph_ok = graph_requested && (every_layer || budget_opt_in) &&
                               std::getenv("NINFER_EXPERT_POOL_CYCLE") == nullptr;
         // Only a captured graph freezes the offsets, so only then is the pool off-limits to resize.
         instance->expert_pool_pinned = graph_ok;

@@ -322,6 +322,16 @@ private:
     // asked. Together with `prefetch_calls_` this gives the per-layer ask, which is the number the
     // job granularity and the budget have to be sized from.
     std::uint64_t prefetch_target_ = 0;
+    // P6/step 5: routes served by each structure. They sum to the routed experts counted, which is
+    // what makes the split checkable instead of decorative.
+    std::uint64_t route_hot_      = 0; // the epoch's hot set
+    std::uint64_t route_ring_     = 0; // resident, but not chosen by this epoch
+    std::uint64_t route_prefetch_ = 0; // the prediction region
+    std::uint64_t route_host_     = 0; // the pinned host tier, read by the Device (Q20 second leg)
+    std::uint64_t route_cpu_      = 0; // neither: the CPU half computed it
+    // Where the hot set ends inside `resident_order_` (hot first, then the ring). Stored because the
+    // attribution pass runs outside the scope that computes it.
+    std::size_t hot_cap_ = 0;
     // A1 needs the two segments apart, because they answer different questions: the R1 segment moves
     // at an epoch boundary (a large publish, once per 64 steps) and only the per-step part is bounded
     // by the 128 B bar. Classified by the number of experts that moved - a boundary re-placement
