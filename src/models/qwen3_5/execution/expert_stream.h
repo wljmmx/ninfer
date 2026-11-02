@@ -425,6 +425,9 @@ private:
     // choose the set, but the first call has to, or a cold start would route everything to the host
     // tier and never establish one.
     bool set_initialised_ = false;
+    // Q11/Q12: the set was frozen by the no_miss rule, so the same rule may thaw it. A freeze the
+    // caller asked for is not this rule's to undo.
+    bool freeze_by_rule_ = false;
     std::uint32_t since_decay_   = 0;
     std::uint32_t since_reorder_ = 0;
     // port (sm_89): a warm-up then a frozen set, so a static policy stops re-ranking per step.

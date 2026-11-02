@@ -4,6 +4,7 @@
 #include "artifact/reader.h"
 #include "artifact/formats.h"
 #include "core/expert_cache.h"
+#include "core/memory_budget.h"
 #include "core/startup.h"
 #include "models/qwen3_5/execution/expert_prefetch.h"
 #include "models/qwen3_5/execution/expert_stream.h"
@@ -75,19 +76,12 @@ struct ExpertPlacement {
 
 // Placement policy: split the free device budget between the KV arena and the expert pool.
 // The arena is satisfied first because every decode step touches the whole active context, while
-// the pool only serves the routed top-k; the pool then takes what is left. P12.4 replaces this
-// with a measured cost model - keeping the split in one place makes that swap local.
-struct DeviceSplit {
-    std::size_t pool_bytes   = 0;
-    std::size_t safety_bytes = 0;
-};
-
-[[nodiscard]] DeviceSplit split_device_budget(std::size_t free_bytes,
-                                              std::size_t kv_reservation_bytes) {
-    constexpr std::size_t kPoolSafetyBytes = 1ULL << 30;
-    const auto pledged = kv_reservation_bytes + kPoolSafetyBytes;
-    return {free_bytes > pledged ? free_bytes - pledged : std::size_t{0}, kPoolSafetyBytes};
-}
+// the pool only serves the routed top-k; the pool then takes what is left.
+//
+// port (sm_89): Q50 - the rule moved to core/memory_budget.h, where the same decision carries the
+// measured value of a gigabyte and two overrides. It still reproduces this rule byte for byte by
+// default; what is new is that the split is printed with what the next GiB is worth, and that a
+// pinned split says so when it does not fit.
 
 [[nodiscard]] bool kv_capacity_shortage(const std::invalid_argument& error) noexcept;
 
@@ -140,8 +134,9 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
             throw std::runtime_error("expert cache auto sizing cannot read device memory");
         }
         // Graph capture and the staging buffers still need room after the pool takes its share.
-        const auto split = split_device_budget(free_bytes, kv_reserve_bytes);
-        requested        = split.pool_bytes;
+        const auto split = core::plan_device_split(free_bytes, kv_reserve_bytes);
+        core::report_device_split(split, free_bytes);
+        requested = split.pool_bytes;
     }
     // Whole windows only: a partial window is dead space and would make the slot count odd.
     std::uint64_t widest = 0;
@@ -248,21 +243,54 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     // is computed exactly as before (working-set estimate, RAM share, explicit override), so this
     // step is behaviour-neutral; what changes is that the amount is now accounted and printed
     // beside the other two tiers instead of being decided in isolation.
-    const std::uint64_t host_arena_bytes =
+    std::uint64_t host_arena_bytes =
         host_expert_arena_bytes(host_want) + readahead_bytes(requirements.banks);
-    instance.ledger.set_cap(core::Tier::Device,
-                            instance.expert_cache->capacity_bytes() + (260ull << 20));
-    // The warm tier's ceiling is the budget it just computed, not "a quarter of free RAM": the
-    // partition is what the scheduler grants, and a module may not widen it on its own.
-    instance.ledger.set_cap(core::Tier::Host, host_arena_bytes);
-    (void)instance.ledger.reserve(core::Tier::Device, "expert-pool",
-                                  instance.expert_cache->capacity_bytes());
-    (void)instance.ledger.reserve(core::Tier::Device, "kv-pages", 260ull << 20);
-    if (!instance.ledger.reserve(core::Tier::Host, "expert-warm", host_arena_bytes)) {
+    // port (sm_89): Q51 - the two levels of budget meet the three-tier ledger here, and a refusal
+    // is a number instead of silence.
+    //
+    // Before: the caps were the asks (a ledger that cannot fail is a ledger that says nothing), the
+    // KV part was a hardcoded 260 MiB rather than what the planner reserved, and both device
+    // reservations were `(void)`. Now the Device cap covers the three consumers that actually hold
+    // device memory - the pool, the KV pages and the safety the split reserved - each is admitted
+    // separately, and a refusal names the owner, what it asked for and what is left. The totals are
+    // unchanged, so this is accounting that can say "no", not a new allocation policy.
+    const std::uint64_t device_cap =
+        instance.expert_cache->capacity_bytes() + kv_reserve_bytes + (1ULL << 30);
+    instance.ledger.set_cap(core::Tier::Device, device_cap);
+    const auto admit = [&instance](core::Tier tier, const char* owner, std::uint64_t bytes) {
+        if (instance.ledger.reserve(tier, owner, bytes)) { return true; }
         std::fprintf(stderr,
-                     "[ledger] expert-warm asked %llu MiB and did not fit; the engine keeps its own "
-                     "estimate for now (step two is accounting only)\n",
-                     static_cast<unsigned long long>(host_arena_bytes >> 20));
+                     "[ledger] REJECTED owner=%s asked=%llu MiB cap=%llu MiB used=%llu MiB - the "
+                     "caller has to lower its ask\n",
+                     owner, static_cast<unsigned long long>(bytes >> 20),
+                     static_cast<unsigned long long>(instance.ledger.cap(tier) >> 20),
+                     static_cast<unsigned long long>(instance.ledger.used(tier) >> 20));
+        std::fflush(stderr);
+        return false;
+    };
+    (void)admit(core::Tier::Device, "expert-pool", instance.expert_cache->capacity_bytes());
+    (void)admit(core::Tier::Device, "kv-pages", kv_reserve_bytes);
+    (void)admit(core::Tier::Device, "staging", 1ULL << 30);
+    // The warm tier's ceiling is the budget it just computed, not "a quarter of free RAM": the
+    // partition is what the scheduler grants, and a module may not widen it on its own. The override
+    // exists so a caller can grant less - and then the arena is what actually shrinks, rather than
+    // the ledger being told a smaller number than the arena takes.
+    std::uint64_t host_cap = host_arena_bytes;
+    if (const char* value = std::getenv("NINFER_BUDGET_RAM_MB"); value != nullptr && *value != '\0') {
+        const auto pinned = static_cast<std::uint64_t>(std::strtoull(value, nullptr, 10)) << 20;
+        if (pinned != 0 && pinned < host_cap) { host_cap = pinned; }
+    }
+    instance.ledger.set_cap(core::Tier::Host, host_cap);
+    if (!admit(core::Tier::Host, "expert-warm", host_arena_bytes)) {
+        const auto granted = host_cap - instance.ledger.used(core::Tier::Host);
+        std::fprintf(stderr,
+                     "[ledger] expert-warm lowered %llu -> %llu MiB to fit the %llu MiB grant\n",
+                     static_cast<unsigned long long>(host_arena_bytes >> 20),
+                     static_cast<unsigned long long>(granted >> 20),
+                     static_cast<unsigned long long>(host_cap >> 20));
+        std::fflush(stderr);
+        host_arena_bytes = granted;
+        (void)admit(core::Tier::Host, "expert-warm", host_arena_bytes);
     }
     std::fprintf(stderr,
                  "[experts] banks=%zu slot=%llu windows=%llu pool=%lluMiB host=%d arena=%lluMiB "

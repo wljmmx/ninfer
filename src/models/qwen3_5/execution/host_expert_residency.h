@@ -74,6 +74,28 @@ public:
         slot_capacity_ = static_cast<std::uint32_t>(arena_bytes_ / slot_bytes_);
         if (prefetch_slots_ > slot_capacity_) { prefetch_slots_ = slot_capacity_; }
         routed_capacity_ = slot_capacity_ - prefetch_slots_;
+        // port (sm_89): Q53 - the warm tier is a partition with two densities, not one pool.
+        //
+        // Until now a routed expert that lost its slot was simply dropped: the next route to it paid
+        // a full artifact read. The eviction signal is exactly "this was hot and is not any more",
+        // which is a weak form of "it may come back" - so it goes to a cold region instead of out of
+        // the arena, and a route that lands there is a memcpy rather than a read. The cold region is
+        // carved out of the routed range, so a default run (no cold slots) allocates exactly what it
+        // did before, and the region is FIFO by construction (round robin over its own slots).
+        //
+        // A cold hit promotes back into the routed range while it has room: that is the whole policy
+        // - keep what keeps being asked for, and let the rest age out through the cold region. Sizing
+        // the region is tuning; wiring it is this.
+        cold_slots_ = cold_slots_from_env();
+        if (cold_slots_ > routed_capacity_ / 2) { cold_slots_ = routed_capacity_ / 2; }
+        routed_capacity_ -= cold_slots_;
+        if (cold_slots_ != 0) {
+            std::fprintf(stderr,
+                         "[warm] cold region slots=%u (routed=%u read-ahead=%u) - evicted experts "
+                         "stay addressable as RAM copies\n",
+                         cold_slots_, routed_capacity_, prefetch_slots_);
+            std::fflush(stderr);
+        }
         slot_bank_.assign(slot_capacity_, kNone);
         slot_expert_.assign(slot_capacity_, kNone);
         slot_last_use_.assign(slot_capacity_, 0);
@@ -393,6 +415,16 @@ public:
         }
         return 128;
     }
+    // port (sm_89): Q53's cold region. Zero by default, because a region that changes where an
+    // evicted expert goes changes the split path's read behaviour, and this is wiring: the switch has
+    // to be measurable against a run without it.
+    static std::uint32_t cold_slots_from_env() {
+        if (const char* value = std::getenv("NINFER_WARM_COLD_SLOTS");
+            value != nullptr && *value != '\0') {
+            return static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
+        }
+        return 0;
+    }
     // Bytes those slots add to the arena, so the ledger can be told before the arena exists.
     static std::uint64_t prefetch_bytes_for(std::uint64_t entry_bytes) {
         return std::uint64_t{prefetch_slots_from_env()} * slot_bytes_for(entry_bytes);
@@ -528,6 +560,14 @@ public:
                 if (prefetched_[slot] != 0) {
                     prefetched_[slot] = 0;
                     ++prefetch_hits_;
+                }
+                // port (sm_89): Q53. A route that lands in the cold region is still a hit - the bytes
+                // are in RAM - and if the routed range has room it earns its way back: that is the
+                // "按概率分区" half, admission by repeated demand instead of by first contact.
+                if (cold_slots_ != 0 && slot >= routed_capacity_ &&
+                    slot < routed_capacity_ + cold_slots_) {
+                    ++stats_.cold_hits;
+                    slot = promote_cold(bank, expert, slot);
                 }
             }
             slot_last_use_[slot] = ++epoch_;
@@ -690,6 +730,12 @@ public:
         std::uint64_t warmed_bytes = 0;
         std::uint64_t memcpy_hits  = 0;
         std::uint64_t warm_skips   = 0; // asked to warm an expert that is already warm
+        // Q53: what the cold region did. `cold_admissions` are evictions that became a copy instead
+        // of a drop, `cold_hits` are routes answered from it, `cold_promotions` are the ones that
+        // earned their way back into the routed range.
+        std::uint64_t cold_admissions = 0;
+        std::uint64_t cold_hits       = 0;
+        std::uint64_t cold_promotions = 0;
     };
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
 
@@ -789,13 +835,15 @@ private:
 #endif
     }
 
-    // port (sm_89): two pools, one arena. The routed range is [0, routed_capacity_), the read-ahead's
-    // is [routed_capacity_, slot_capacity_). They are carved apart so a layer's own routes cannot
-    // evict what the read-ahead just filled - with one shared range that is exactly what happened,
-    // and the prefetch reported zero hits for a reason that had nothing to do with its selection.
+    // port (sm_89): three ranges, one arena - routed [0, routed_capacity_), cold [routed, cold_end),
+    // read-ahead [cold_end, slot_capacity_). They are carved apart so nothing can evict what another
+    // range just filled: with one shared range a layer's 320 routes evicted the read-ahead's fill
+    // before it could pay, and the prefetch reported zero hits for a reason that had nothing to do
+    // with its selection.
     std::uint32_t claim(std::uint32_t bank, std::uint32_t expert, bool prefetch) {
-        const std::uint32_t begin = prefetch ? routed_capacity_ : 0;
-        const std::uint32_t end   = prefetch ? slot_capacity_ : routed_capacity_;
+        const std::uint32_t cold_end = routed_capacity_ + cold_slots_;
+        const std::uint32_t begin    = prefetch ? cold_end : 0;
+        const std::uint32_t end      = prefetch ? slot_capacity_ : routed_capacity_;
         std::uint32_t& used       = prefetch ? used_prefetch_ : used_;
         if (used < end - begin) {
             const auto slot    = begin + used++;
@@ -825,11 +873,64 @@ private:
         }
         if (coldest == 0) { throw std::runtime_error("host expert arena: nothing to evict"); }
         ++stats_.evictions;
-        state_[slot_bank_[victim]].slot_of[slot_expert_[victim]] = kNone;
+        // port (sm_89): Q53. The victim's bytes are still the expert that owned them, and that
+        // expert was hot a moment ago - so it goes to the cold region (a memcpy inside RAM) instead
+        // of out of the arena. When the region is off this is the old behaviour exactly: the mapping
+        // is cleared and the slot is handed to the newcomer.
+        if (!demote_cold(victim)) {
+            state_[slot_bank_[victim]].slot_of[slot_expert_[victim]] = kNone;
+        }
         prefetched_[victim]  = 0; // the slot now holds another expert, so the mark dies with it
         slot_bank_[victim]   = bank;
         slot_expert_[victim] = expert;
         return victim;
+    }
+
+    // port (sm_89): Q53, the two movements of the partition. `demote_cold` runs inside claim(), on a
+    // slot that has already been chosen as a victim; `promote_cold` runs on a cold hit while the
+    // routed range still has room. Both are copies inside the arena - no artifact read, no upload.
+    bool demote_cold(std::uint32_t slot) {
+        if (cold_slots_ == 0 || slot >= routed_capacity_) { return false; }
+        const auto bank   = slot_bank_[slot];
+        const auto expert = slot_expert_[slot];
+        if (bank == kNone || expert == kNone) { return false; }
+        const auto target = routed_capacity_ + (cold_next_++ % cold_slots_);
+        // Whatever the target held stops being addressable: that slot is about to hold another
+        // expert, and a stale mapping would hand a route the wrong bytes - the failure this tier has
+        // already paid for once.
+        if (const auto previous = slot_bank_[target]; previous != kNone && previous < state_.size()) {
+            auto& other = state_[previous].slot_of[slot_expert_[target]];
+            if (other == target) { other = kNone; }
+        }
+        auto* base = arena();
+        std::memcpy(base + std::uint64_t{target} * slot_bytes_,
+                    base + std::uint64_t{slot} * slot_bytes_,
+                    static_cast<std::size_t>(slot_bytes_));
+        slot_bank_[target]     = bank;
+        slot_expert_[target]   = expert;
+        slot_last_use_[target] = slot_last_use_[slot];
+        prefetched_[target]    = 0;
+        state_[bank].slot_of[expert] = target;
+        ++stats_.cold_admissions;
+        return true;
+    }
+
+    std::uint32_t promote_cold(ExpertBankId bank, std::uint32_t expert, std::uint32_t from) {
+        if (slot_bank_.empty() || used_ >= routed_capacity_) { return from; }
+        const auto target = used_++;
+        auto* base        = arena();
+        std::memcpy(base + std::uint64_t{target} * slot_bytes_,
+                    base + std::uint64_t{from} * slot_bytes_,
+                    static_cast<std::size_t>(slot_bytes_));
+        slot_bank_[target]     = bank.index;
+        slot_expert_[target]   = expert;
+        slot_last_use_[target] = slot_last_use_[from];
+        prefetched_[target]    = 0;
+        slot_bank_[from]       = kNone;
+        slot_expert_[from]     = kNone;
+        state_[bank.index].slot_of[expert] = target;
+        ++stats_.cold_promotions;
+        return target;
     }
 
     void load(std::uint32_t bank, std::uint32_t expert, std::uint32_t slot) {
@@ -927,6 +1028,10 @@ private:
     std::uint32_t routed_capacity_ = 0;
     std::uint32_t prefetch_slots_  = 0;
     std::uint32_t used_prefetch_   = 0;
+    // Q53: the cold region sits between the routed range and the read-ahead's, and `cold_next_` is
+    // its round-robin cursor - which is what makes it FIFO without a second clock.
+    std::uint32_t cold_slots_ = 0;
+    std::uint32_t cold_next_  = 0;
     std::vector<bool> direct_; // bank addressed in place, no arena copy
     // When set, an in-place bank still gets a managed pinned copy. Off by default so a run that
     // never asks for the warm tier behaves exactly as before.

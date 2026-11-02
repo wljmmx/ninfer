@@ -48,6 +48,22 @@ std::uint64_t rows_of(const WeightGeometry& parent, std::uint64_t elements) {
 constexpr std::int32_t kHotSetUpdateTokens  = 4;
 constexpr std::uint32_t kHotSetReorderPeriod = 32;
 
+// port (sm_89): Q11/Q12. The freeze rule is judged on a window, not on the last layer: the controller
+// uses 32 agreeing layers for its own actuators, and the same number here keeps the two from
+// disagreeing about what "a while" means.
+constexpr std::int32_t kFreezeWindowCalls = 32;
+
+// 0 (the default) keeps the rule off. A percentage, because the rule the plan states is stated in
+// percent ("no_miss ≥ 99%"), and a fraction would invite the two to be mixed up.
+double freeze_no_miss_pct() {
+    static const double value = [] {
+        const char* text = std::getenv("NINFER_FREEZE_ON_NO_MISS");
+        if (text == nullptr || *text == '\0') { return 0.0; }
+        return std::strtod(text, nullptr);
+    }();
+    return value;
+}
+
 // port (sm_89): how long the ranking remembers. The 32-step half-life is ~64 tokens of memory, which
 // is too short for a fixed hot set to mean anything: the plan asked for a long window or an offline
 // profile (section 6, item 3). NINFER_EXPERT_DECAY_STEPS overrides it, 0 keeps the scores forever.
@@ -1134,6 +1150,43 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 ++steps_ >= static_cast<std::uint64_t>(freeze_after)) {
                 frozen_        = true;
                 frozen_wanted_ = wanted;
+            }
+        }
+        // port (sm_89): Q11/Q12 - the freeze rule as a measurement, not as a switch.
+        //
+        // The rule the plan states: freeze only when the pool answered EVERY route of a layer in at
+        // least `NINFER_FREEZE_ON_NO_MISS` percent of the layers so far; otherwise keep following the
+        // routing, which 1x.4r measured to converge on its own. The same rule read backwards is the
+        // thaw: a frozen set that stops meeting the bar goes back to following. The threshold is a
+        // percentage and 0 (the default) keeps the rule off, so no existing run changes.
+        //
+        // It lives here because `wanted` is the set the rule is about: freezing before the set is
+        // built would freeze whatever the previous policy happened to leave behind.
+        if (const double bar = freeze_no_miss_pct(); bar > 0.0) {
+            if (gh1_calls_ >= static_cast<std::uint64_t>(kFreezeWindowCalls)) {
+                const double rate =
+                    100.0 * static_cast<double>(gh1_no_miss_calls_) / static_cast<double>(gh1_calls_);
+                if (!frozen_ && rate >= bar) {
+                    frozen_              = true;
+                    freeze_by_rule_      = true;
+                    frozen_wanted_       = wanted;
+                    if (bank_ == 0) {
+                        std::fprintf(stderr,
+                                     "[freeze] frozen at no_miss=%.1f%% (bar %.1f%%, %llu layers)\n",
+                                     rate, bar, static_cast<unsigned long long>(gh1_calls_));
+                        std::fflush(stderr);
+                    }
+                } else if (frozen_ && freeze_by_rule_ && rate < bar) {
+                    // Only a set this rule froze is this rule's to undo: a freeze the caller asked
+                    // for (NINFER_EXPERT_STATIC, generation mode) is not.
+                    frozen_         = false;
+                    freeze_by_rule_ = false;
+                    if (bank_ == 0) {
+                        std::fprintf(stderr, "[freeze] thawed at no_miss=%.1f%% (bar %.1f%%)\n", rate,
+                                     bar);
+                        std::fflush(stderr);
+                    }
+                }
             }
         }
         // port (sm_89): the router does not repeat a step, so the set is refreshed every step. A
