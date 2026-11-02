@@ -522,7 +522,6 @@ private:
     std::unique_ptr<DeviceBuffer> ring_candidates_device_;
     std::unique_ptr<DeviceBuffer> ring_descriptors_device_;
     std::unique_ptr<DeviceBuffer> ring_count_device_;
-    std::vector<std::uint32_t> ring_candidates_host_;
     std::unique_ptr<DeviceBuffer> ring_resident_device_;
     std::vector<std::int32_t> ring_resident_host_;
     std::vector<ops::RingAdmitDescriptor> ring_descriptors_host_;

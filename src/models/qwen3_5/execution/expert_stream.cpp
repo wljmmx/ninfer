@@ -577,23 +577,23 @@ std::size_t ExpertStream::device_admit_ring(const void* device_ids, std::int32_t
     ring_resident_device_->copy_from_host(ring_resident_host_.data(), candidate_bytes);
     ring_snapshot_host_.assign(count_, ops::kRingAdmitAbsent);
     host_->snapshot_slots(bank_, ring_snapshot_host_);
-    ring_candidates_host_.assign(count_, ops::kRingAdmitAbsent);
+    // Q20: the candidate table is the warm tier's whole live slot table, not this step's routes
+    // filtered on the host. The Device already has the route ids; it can ask `candidate[e]` itself.
+    // The host only publishes what the tier holds (one 256-entry table), and never decides which of
+    // those experts the ring admits.
     std::size_t candidates_seen = 0;
     for (std::uint32_t expert = 0; expert < count_; ++expert) {
-        if (ring_snapshot_host_[expert] != HostExpertResidency::kAbsentSlot) {
-            ring_candidates_host_[expert] = ring_snapshot_host_[expert];
-            ++candidates_seen;
-        }
+        if (ring_snapshot_host_[expert] != HostExpertResidency::kAbsentSlot) { ++candidates_seen; }
     }
     if (bank_ == 0 && std::getenv("NINFER_RING_PROBE") != nullptr) {
         static int shown = 0;
         if (shown++ < 4) {
-            std::fprintf(stderr, "[ring] admit call values=%d ring=%u base=%u candidates=%zu\n",
+            std::fprintf(stderr, "[ring] admit call values=%d ring=%u base=%u warm_candidates=%zu\n",
                          values, ring_slots, ring_base, candidates_seen);
             std::fflush(stderr);
         }
     }
-    ring_candidates_device_->copy_from_host(ring_candidates_host_.data(), candidate_bytes);
+    ring_candidates_device_->copy_from_host(ring_snapshot_host_.data(), candidate_bytes);
     ring_count_device_->fill(0);
     const auto capacity = std::min(cache_->resident_capacity(), ring_slots);
     ops::ring_admit_launch(device_ids, values,
