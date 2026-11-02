@@ -91,6 +91,12 @@ public:
                          second_chance_slots_, routed_capacity_, prefetch_slots_);
             std::fflush(stderr);
         }
+        if (std::getenv("NINFER_HOST_WARM") != nullptr) {
+            std::fprintf(stderr,
+                         "[warm] arena path enabled: CPU half reads the pinned tier, in-place "
+                         "artifact addressing disabled\n");
+            std::fflush(stderr);
+        }
         slot_bank_.assign(slot_capacity_, kNone);
         slot_expert_.assign(slot_capacity_, kNone);
         slot_last_use_.assign(slot_capacity_, 0);
@@ -167,8 +173,10 @@ public:
             // before it is used, falling back to the copying path when the check fails.
             // NINFER_HOST_COPY=1 forces the copying path, which is what the split gate compares
             // against.
+            static const bool warm_arena = std::getenv("NINFER_HOST_WARM") != nullptr;
             static const bool allow_direct =
-                std::getenv("NINFER_HOST_COPY") == nullptr && !managed_even_in_place();
+                std::getenv("NINFER_HOST_COPY") == nullptr && !managed_even_in_place() &&
+                !warm_arena;
             // port (sm_89): a fused bank keeps codes, high and scales in three runs per matrix, far
             // apart inside one object, so one per-expert offset cannot name all three. Each plane
             // gets its own table (WeightBankView::codes_offsets and friends), filled from the chunk

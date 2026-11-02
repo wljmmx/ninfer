@@ -1542,12 +1542,16 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                         const auto& warm = host_->stats();
                         std::fprintf(stderr,
                                      "[warm] second-chance: admitted=%llu declined=%llu hits=%llu "
-                                     "promoted=%llu used=%u\n",
+                                     "promoted=%llu used=%u | warm hits=%llu misses=%llu "
+                                     "evictions=%llu\n",
                                      (unsigned long long)warm.second_chance_admissions,
                                      (unsigned long long)warm.second_chance_declines,
                                      (unsigned long long)warm.second_chance_hits,
                                      (unsigned long long)warm.second_chance_promotions,
-                                     host_->second_chance_used());
+                                     host_->second_chance_used(),
+                                     (unsigned long long)warm.hits,
+                                     (unsigned long long)warm.misses,
+                                     (unsigned long long)warm.evictions);
                     }
                 }
             }
