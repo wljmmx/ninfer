@@ -284,6 +284,10 @@ private:
     std::uint64_t prefetch_batches_ = 0; // layers that prefetched
     std::uint64_t prefetch_recent_ = 0;  // of those experts, how many came from the previous step
     std::uint64_t prefetch_predicted_ = 0; // ... and how many from the router prediction (Q68b)
+    // A1: the largest single table publication, in bytes. The plan's bar is 128 B per step, so this
+    // has to be visible before the R1/R2 split can be judged: one full-bank publish is 2 KiB
+    // (256 experts x (8 B offset + 4 B mask)), which is 16x the bar by itself.
+    std::uint64_t publish_bytes_max_ = 0;
     ExpertBankLayout entry_{};
     // port (sm_89): the pool holds every layer at once, so this bank's window is fixed and no
     // per-step routing decision - and therefore no host round trip - is needed.

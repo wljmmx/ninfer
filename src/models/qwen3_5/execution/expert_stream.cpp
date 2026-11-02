@@ -1164,10 +1164,13 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                                               static_cast<double>(publish_calls_);
                 std::fprintf(stderr,
                              "[set] bank=%u coverage=%llu/%llu (%.1f%%) misses/token=%.2f slots=%u "
-                             "publish=%.0fB/step\n",
+                             "publish=%.0fB/call max=%lluB (A1 bar 128B/step: %s)\n",
                              bank_, static_cast<unsigned long long>(coverage_.inside),
                              static_cast<unsigned long long>(coverage_.routes), covered,
-                             misses_per_token, capacity, bytes_per_step);
+                             misses_per_token, capacity, bytes_per_step,
+                             (unsigned long long)publish_bytes_max_,
+                             publish_bytes_max_ <= 128 ? "one call fits"
+                                                       : "needs R1/R2 split");
                 const auto entered_per_step = entered_steps_ == 0
                     ? 0.0
                     : static_cast<double>(entered_) / static_cast<double>(entered_steps_);
@@ -1471,7 +1474,10 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                     submitted = cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(),
                                                      sizes.size(), &attributes, &attribute_index, 1,
                                                      stream);
-                    if (submitted == cudaSuccess) { publish_bytes_ += delta_bytes; }
+                    if (submitted == cudaSuccess) {
+                        publish_bytes_ += delta_bytes;
+                        publish_bytes_max_ = std::max(publish_bytes_max_, delta_bytes);
+                    }
                 }
                 if (!delta || submitted != cudaSuccess) {
                     void* const       destinations[2] = {offsets_device_->p, mask_device_->p};
@@ -1488,6 +1494,8 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                                               cudaMemcpyHostToDevice, stream);
                     }
                     publish_bytes_ += static_cast<std::uint64_t>(table_bytes + mask_bytes);
+                    publish_bytes_max_ = std::max(publish_bytes_max_,
+                                                  static_cast<std::uint64_t>(table_bytes + mask_bytes));
                 }
                 // A3b: what this bank's Device tables now hold, as a generation that can be compared.
                 // Only a submission the driver accepted counts - "we tried to publish" is exactly the
