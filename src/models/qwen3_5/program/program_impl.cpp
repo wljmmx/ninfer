@@ -681,9 +681,12 @@ bool ProgramImpl::tier_selftest() {
     kv.page_bytes = 64;
     kv.kv_bytes.assign(64, std::byte{0x5a});
     CheckpointStateExport state;
-    state.image_bytes = 32;
-    state.layers      = 1;
-    state.hidden      = 8;
+    state.image_bytes  = 32;
+    // L6-b: the state header carries this, and a zero length is refused on the way back, so the
+    // synthetic pair has to state the length it claims (the one page above covers it).
+    state.valid_tokens = 1;
+    state.layers       = 1;
+    state.hidden       = 8;
     state.bytes.assign(32, std::byte{0x3c});
     const core::KvBlockKey key{0x5e1f7e5712345678ULL, 1};
     const bool ok = tier_round_trip_ok(*kv_tier, key, kv, state);

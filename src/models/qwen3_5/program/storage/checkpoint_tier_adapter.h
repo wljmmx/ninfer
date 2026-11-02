@@ -25,6 +25,7 @@ inline core::TierCheckpointPayload to_payload(const CheckpointExport& kv,
     out.page_bytes       = static_cast<std::uint64_t>(kv.page_bytes);
     out.kv               = kv.kv_bytes;
     out.image_bytes      = state.image_bytes;
+    out.valid_tokens     = state.valid_tokens;
     out.layers           = state.layers;
     out.conv_channels    = state.conv_channels;
     out.value_heads      = state.value_heads;
@@ -47,6 +48,7 @@ inline void from_payload(const core::TierCheckpointPayload& payload, CheckpointE
     kv.epochs.clear();
 
     state.image_bytes       = payload.image_bytes;
+    state.valid_tokens      = payload.valid_tokens;
     state.layers            = payload.layers;
     state.conv_channels     = payload.conv_channels;
     state.value_heads       = payload.value_heads;
@@ -97,7 +99,8 @@ inline void from_payload(const core::TierCheckpointPayload& payload, CheckpointE
     if (!tier_load_export(tier, key, back, back_state)) { return false; }
     return back.frontier == kv.frontier && back.page_count == kv.page_count &&
            back.page_bytes == kv.page_bytes && back.kv_bytes == kv.kv_bytes &&
-           back_state.image_bytes == state.image_bytes && back_state.layers == state.layers &&
+           back_state.image_bytes == state.image_bytes &&
+           back_state.valid_tokens == state.valid_tokens && back_state.layers == state.layers &&
            back_state.hidden == state.hidden && back_state.bytes == state.bytes;
 }
 

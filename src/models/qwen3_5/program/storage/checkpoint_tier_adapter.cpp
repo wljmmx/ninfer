@@ -17,6 +17,7 @@ core::TierCheckpointPayload to_payload(const CheckpointExport& kv,
     out.page_bytes       = static_cast<std::uint64_t>(kv.page_bytes);
     out.kv               = kv.kv_bytes;
     out.image_bytes      = state.image_bytes;
+    out.valid_tokens     = state.valid_tokens;
     out.layers           = state.layers;
     out.conv_channels    = state.conv_channels;
     out.value_heads      = state.value_heads;
@@ -39,6 +40,7 @@ void from_payload(const core::TierCheckpointPayload& payload, CheckpointExport& 
     kv.epochs.clear();
 
     state.image_bytes       = payload.image_bytes;
+    state.valid_tokens      = payload.valid_tokens;
     state.layers            = payload.layers;
     state.conv_channels     = payload.conv_channels;
     state.value_heads       = payload.value_heads;
@@ -80,7 +82,8 @@ bool tier_round_trip_ok(core::KvTier& tier, const core::KvBlockKey& key, const C
     if (!tier_load_export(tier, key, back, back_state)) { return false; }
     return back.frontier == kv.frontier && back.page_count == kv.page_count &&
            back.page_bytes == kv.page_bytes && back.kv_bytes == kv.kv_bytes &&
-           back_state.image_bytes == state.image_bytes && back_state.layers == state.layers &&
+           back_state.image_bytes == state.image_bytes &&
+           back_state.valid_tokens == state.valid_tokens && back_state.layers == state.layers &&
            back_state.hidden == state.hidden && back_state.bytes == state.bytes;
 }
 
@@ -100,9 +103,10 @@ bool ProgramImpl::tier_selftest() {
     kv.page_bytes = 64;
     kv.kv_bytes.assign(64, std::byte{0x5a});
     CheckpointStateExport state;
-    state.image_bytes = 32;
-    state.layers      = 1;
-    state.hidden      = 8;
+    state.image_bytes  = 32;
+    state.valid_tokens = 1;
+    state.layers       = 1;
+    state.hidden       = 8;
     state.bytes.assign(32, std::byte{0x3c});
     const core::KvBlockKey key{0x5e1f7e5712345678ULL, 1};
     const bool ok = tier_round_trip_ok(*kv_tier, key, kv, state);

@@ -9,8 +9,13 @@
 //
 // Format (little endian, all offsets relative to the payload start):
 //     "NFCK" | u16 version | u16 span_count | u32 frontier | u64 total_bytes | digest[8]
-//     span_count * { u32 tag | u32 bytes | u64 offset }
+//     span_count * { u32 tag | u32 bytes | u64 offset | u32 page_bytes | u32 pages }
 //     payload bytes, spans back to back
+//
+// v3 (L6-b): the state span's own header grew a `valid_tokens` field, so the real token length of the
+// checkpoint travels with the state instead of being inferred from the (page-rounded) KV byte count.
+// The version is compared exactly, so a v2 blob is refused rather than decoded with its state header
+// read 4 bytes past where the fields actually end -- an old blob is a miss, never a silent accept.
 //
 // Namespace: these keys are NOT LMCache keys. LMCache's tier stores one raw block per key
 // (model@world@worker@hash@dtype) and knows nothing about our span table, so a checkpoint under
@@ -27,7 +32,7 @@
 
 namespace ninfer::core {
 
-inline constexpr std::uint16_t kCheckpointBlobVersion = 2;
+inline constexpr std::uint16_t kCheckpointBlobVersion = 3;
 inline constexpr std::size_t kCheckpointHeaderBytes   = 4 + 2 + 2 + 4 + 8 + 8;
 // tag, size, offset, page size, page count
 inline constexpr std::size_t kCheckpointSpanBytes     = 4 + 4 + 8 + 4 + 4;
@@ -165,6 +170,9 @@ inline std::uint64_t get_u64(const std::byte* p) {
           p[3] == std::byte{'K'})) {
         return std::nullopt;
     }
+    // Exact match, not "at least": a blob from an older version has a state header whose fields end
+    // before valid_tokens, and reading it anyway would take the first four state bytes for a length.
+    // Refusing here is the whole compatibility rule for this format.
     if (detail::get_u16(p + 4) != kCheckpointBlobVersion) { return std::nullopt; }
     const auto span_count = detail::get_u16(p + 6);
     const auto frontier   = detail::get_u32(p + 8);

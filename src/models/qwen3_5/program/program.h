@@ -174,6 +174,11 @@ struct CheckpointSummary {
 // output, so the import side has to be able to refuse on numbers rather than on faith.
 struct CheckpointStateExport {
     std::uint64_t image_bytes    = 0;  // u64: a u32 would cap the image at 4 GiB
+    // L6-b: the tokens the state was captured after. The KV run is stored in whole pages, so
+    // page_count * page_tokens is a bound and not the length; the tier's state header carries this
+    // so a reader can tell where the real prefix ends (and, later, pad the tail to a whole page
+    // without claiming the padding).
+    std::uint32_t valid_tokens   = 0;
     std::uint32_t layers         = 0;   // linear-attention layers that own this image
     std::int32_t  conv_channels  = 0;
     std::int32_t  value_heads    = 0;

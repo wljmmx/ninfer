@@ -47,6 +47,10 @@ std::optional<CheckpointStateExport> ProgramImpl::export_state(CheckpointHandle 
     if (layout.image_bytes == 0) { return std::nullopt; }
 
     out.image_bytes = layout.image_bytes;
+    // L6-b: the length this state belongs to. record.frontier is the token count the capture
+    // committed (the KV pages cover it), while page_count * page_tokens is only how much room the
+    // pages happen to have. Exporting the former is what lets the tier report the real length.
+    out.valid_tokens = record.frontier;
     out.layers      = layout.spec.linear.layers;
     out.conv_channels  = layout.spec.linear.conv_channels;
     out.value_heads    = layout.spec.linear.value_heads;

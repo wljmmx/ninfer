@@ -128,6 +128,7 @@ using ninfer::core::decode_tier_checkpoint;
         payload.page_bytes    = 64;
         payload.kv.assign(128, std::byte{0x11});
         payload.image_bytes   = 96;
+        payload.valid_tokens  = 803;
         payload.layers        = 12;
         payload.conv_channels = 4;
         payload.value_heads   = 8;
@@ -148,6 +149,9 @@ using ninfer::core::decode_tier_checkpoint;
             expect(back->state == payload.state, "the state image comes back byte for byte");
             expect(back->layers == 12 && back->hidden == 2048 && back->has_dflash_local,
                    "the state shape survives");
+            // L6-b: the length the state was captured after travels in the state header. It is not
+            // page_count * page_tokens (2 * 64 here), because the page run is rounded up.
+            expect(back->valid_tokens == 803, "the real token length survives");
         }
 
         // A header that claims more bytes than arrived must be refused: the alternative is a restore
@@ -157,6 +161,27 @@ using ninfer::core::decode_tier_checkpoint;
             lying.image_bytes = 95;
             expect(!decode_tier_checkpoint(encode_tier_checkpoint(lying)).has_value(),
                    "a state header that disagrees with its bytes is refused");
+        }
+        // L6-b: the state header's length and the KV run have to close. A zero length is not a
+        // length, and a length past the frontier claims tokens the pages never held.
+        {
+            auto zero = payload;
+            zero.valid_tokens = 0;
+            expect(!decode_tier_checkpoint(encode_tier_checkpoint(zero)).has_value(),
+                   "a state header with no real length is refused");
+            auto over = payload;
+            over.valid_tokens = payload.frontier + 1;
+            expect(!decode_tier_checkpoint(encode_tier_checkpoint(over)).has_value(),
+                   "a length past the covered frontier is refused");
+        }
+        // The blob version is compared exactly. A v2 blob has a state header that ends four bytes
+        // earlier, so decoding it as v3 would read the image's first four bytes as a length; it has
+        // to be a miss instead.
+        {
+            auto older = tier_blob;
+            older[4] = std::byte{0x02};
+            older[5] = std::byte{0x00};
+            expect(!decode_tier_checkpoint(older).has_value(), "a v2 blob is not decoded as v3");
         }
         // KV without state is not a checkpoint: the GDN layers would resume from an empty state.
         {

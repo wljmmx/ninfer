@@ -11,6 +11,13 @@
 // The shape travels with the state, not beside it. A state image restored into a different geometry
 // is silent corruption: the bytes land in slots that mean something else, and the only symptom is
 // text that is subtly wrong. Carrying the shape lets the importer refuse instead.
+//
+// L6-b: the state header also carries the checkpoint's real token length. The KV half travels in
+// whole pages, so `page_count * page_tokens` is an upper bound on what the run covers, never the
+// length itself -- the last page is usually part filled. A reader that only had the bound would
+// either lose that tail (today) or, once the tail is padded to a whole page, claim coverage for
+// tokens that were never prefilled. The state is the half that was captured after those tokens, so
+// the number belongs here rather than beside it.
 
 #include "core/kv_checkpoint_blob.h"
 
@@ -38,11 +45,14 @@ struct TierCheckpointPayload {
     std::int32_t key_head_dim    = 0;
     std::int32_t hidden          = 0;
     bool has_dflash_local        = false;
+    // Tokens the checkpoint really covers (L6-b). The page run is rounded up, so this is the only
+    // field that says where the real prefix ends.
+    std::uint32_t valid_tokens   = 0;
     std::vector<std::byte> state;
 };
 
-// 8 (image_bytes) + 7 * 4 (layers, five shape ints, the dflash flag).
-inline constexpr std::size_t kStateHeaderBytes = 8 + 4 * 7;
+// 8 (image_bytes) + 8 * 4 (layers, five shape ints, the dflash flag, valid_tokens).
+inline constexpr std::size_t kStateHeaderBytes = 8 + 4 * 8;
 
 [[nodiscard]] inline std::vector<std::byte>
 encode_tier_checkpoint(const TierCheckpointPayload& payload) {
@@ -60,6 +70,7 @@ encode_tier_checkpoint(const TierCheckpointPayload& payload) {
     detail::put_u32(state, static_cast<std::uint32_t>(payload.key_head_dim));
     detail::put_u32(state, static_cast<std::uint32_t>(payload.hidden));
     detail::put_u32(state, payload.has_dflash_local ? 1U : 0U);
+    detail::put_u32(state, payload.valid_tokens);
     state.insert(state.end(), payload.state.begin(), payload.state.end());
 
     const CheckpointSpan spans[2] = {
@@ -103,11 +114,17 @@ decode_tier_checkpoint(std::span<const std::byte> blob) {
     out.key_head_dim      = static_cast<std::int32_t>(detail::get_u32(header + 24));
     out.hidden            = static_cast<std::int32_t>(detail::get_u32(header + 28));
     out.has_dflash_local  = detail::get_u32(header + 32) != 0;
+    out.valid_tokens      = detail::get_u32(header + 36);
     out.state.assign(state->bytes.begin() + static_cast<std::ptrdiff_t>(kStateHeaderBytes),
                      state->bytes.end());
     // The header's size and the bytes it arrived with have to agree: an image that claims 12 MiB and
     // carries 11 would be restored with its last layer read from whatever was in the slot.
     if (out.image_bytes != out.state.size()) { return std::nullopt; }
+    // Length and page run have to close. A zero length is not a length, and a state captured after
+    // more tokens than the KV run covers would let a restore resume over a tail the pages do not
+    // hold. Only the upper side is checked: the run may be padded past the real length (L7), and
+    // that is exactly the case this field exists to describe.
+    if (out.valid_tokens == 0 || out.valid_tokens > out.frontier) { return std::nullopt; }
     return out;
 }
 
