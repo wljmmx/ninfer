@@ -188,7 +188,11 @@ public:
         }
         return signals.capturable_pct >= 100.0 && signals.static_pct >= 100.0;
     }
-    [[nodiscard]] bool want_freeze() const { return signals.no_miss_pct >= 99.0; }
+    // Q11/Q12: the 99% threshold is gone here too. Freezing is a state - the pool answered every
+    // route in the window - and the keep/thaw decision is made by ExpertStream from the measured
+    // static/tps after 32 layers. This actuator is the shadow view of that decision, so a cumulative
+    // no_miss below 100% means "not a freeze candidate"; it never invents a percentage.
+    [[nodiscard]] bool want_freeze() const { return signals.no_miss_pct >= 100.0; }
 
     // A managed warm copy pays a fill per admission and saves a read per hit, so it wins when
     // hit_ratio * cold_read > fill. Both sides are measured; the margin keeps it from flapping.
@@ -204,9 +208,9 @@ public:
         ++layers;
         drive(expert_path, want_device_path(), device_path_ready, "cost model");
         drive(prefetch, want_prefetch(), prefetch_wired, "usefulness measured");
-        drive(graph, want_graph(), graph_wired, "capt_ready>=90% && static>=95%");
+        drive(graph, want_graph(), graph_wired, "capt_ready==100 && static==100");
         drive(warm_mirror, want_warm_mirror(), true, "hit_ratio*cold>fill");
-        drive(freeze_set, want_freeze(), freeze_wired, "no_miss>=99%");
+        drive(freeze_set, want_freeze(), freeze_wired, "32 clean layers; keep if static or tps holds");
     }
 
     void report(bool force = false) {
