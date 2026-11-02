@@ -324,6 +324,32 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
             ordinary_host_ingress->sampling[row].mask           = fill_grammar_mask(masks, row, {});
             ensure_sequence_kv_mapped(sequence, frontier + 1, 0);
         }
+        // Q67/S1 batch container, first measurement: what a batch's rows actually are. The prefill
+        // batch has to write several prompts' KV into these rows inside one pass, so the geometry it
+        // must respect is (rows in this round, each row's address row, its page count, its frontier).
+        // Printed every 64 rounds, not per round: the point is the shape of the container, not a
+        // trace.
+        static const bool batch_report = std::getenv("NINFER_BATCH_REPORT") != nullptr;
+        if (batch_report) {
+            static std::uint64_t reported = 0;
+            static std::uint64_t multi    = 0;
+            ++reported;
+            if (lanes.size() > 1) { ++multi; }
+            if (reported <= 3 || (lanes.size() > 1 && multi <= 4) || reported % 64 == 0) {
+                std::fprintf(stderr, "[batch] rows=%zu frontier_max=%u", lanes.size(),
+                             maximum_frontier);
+                for (std::size_t row = 0; row < lanes.size(); ++row) {
+                    const SequenceState& sequence = active_sequence(lanes[row]);
+                    std::fprintf(stderr, " %u:row%d/pages%u/frontier%u",
+                                 static_cast<unsigned>(lanes[row]),
+                                 text_kv_addresses->bound_row(sequence.kv->text),
+                                 text_kv_addresses->page_count(sequence.kv->text),
+                                 sequence.execution_frontier);
+                }
+                std::fprintf(stderr, "\n");
+                std::fflush(stderr);
+            }
+        }
 
         execution::OrdinaryBatchContext schedule_state{
             {device, parameters, work, state_images->linear(),
