@@ -433,10 +433,22 @@ void ExpertStream::stage_predicted(cudaStream_t stream) {
         const char* value = std::getenv("NINFER_PREFETCH_MODE");
         return value != nullptr && std::strcmp(value, "vram") == 0;
     }();
-    if (!vram || cache_ == nullptr || predicted_.empty() ||
-        cache_->prefetch_slots_per_bank() == 0) {
-        return;
-    }
+    // One line for the first few calls, whatever the reason: "no placement happened" and "the region
+    // is off" look identical in the counters, and that ambiguity already cost a measurement round.
+    static std::uint64_t calls = 0;
+    const bool trace =
+        bank_ < 4 && std::getenv("NINFER_EXPERT_TIMING") != nullptr && ++calls <= 6;
+    const auto say = [&](const char* why) {
+        if (!trace) { return; }
+        std::fprintf(stderr, "[pfv] skip bank=0: %s (vram=%d cache=%d predicted=%zu region=%u)\n", why,
+                     vram ? 1 : 0, cache_ != nullptr ? 1 : 0, predicted_.size(),
+                     cache_ != nullptr ? cache_->prefetch_slots_per_bank() : 0U);
+        std::fflush(stderr);
+    };
+    if (!vram) { say("mode is not vram"); return; }
+    if (cache_ == nullptr) { say("no cache"); return; }
+    if (predicted_.empty()) { say("predicted_ is empty"); return; }
+    if (cache_->prefetch_slots_per_bank() == 0) { say("no region"); return; }
     std::vector<std::uint32_t> absent;
     absent.reserve(predicted_.size());
     for (const auto expert : predicted_) {
@@ -453,8 +465,8 @@ void ExpertStream::stage_predicted(cudaStream_t stream) {
         prefetch_placed_ += placed.size();
     }
     static std::uint64_t reports = 0;
-    if (bank_ == 0 && (++reports % 40) == 0) {
-        std::fprintf(stderr, "[pfv] delta=%llu placed=%llu hits=%llu region=%u/bank\n",
+    if (bank_ < 4 && (++reports % 40) == 0) {
+        std::fprintf(stderr, "[pfv] bank=%u delta=%llu placed=%llu hits=%llu region=%u/bank\n", bank_,
                      (unsigned long long)prefetch_delta_,
                      (unsigned long long)prefetch_placed_,
                      (unsigned long long)prefetch_hits_,
@@ -1870,8 +1882,13 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 if (warm_mode) {
                     host_->warm(ExpertBankId{bank_}, std::span<const std::int32_t>(wanted));
                 } else {
-                    host_->ensure(ExpertBankId{bank_}, std::span<const std::int32_t>(wanted),
-                                  nullptr);
+                    // Same per-expert granularity on the reference path, so the two arms differ only
+                    // in "who does the read", not in how the work is cut.
+                    for (const auto expert : wanted) {
+                        const std::int32_t one[1] = {expert};
+                        host_->ensure(ExpertBankId{bank_}, std::span<const std::int32_t>(one, 1),
+                                      nullptr);
+                    }
                 }
             } else {
                 // D3: the deadline is measured in layer batches, so the clock is one tick per offer
@@ -1890,9 +1907,19 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 auto& queue     = ExpertPrefetchQueue::instance();
                 const auto tick = ++layer_tick;
                 if (window != 0 && (tick % window) == 0) { queue.advance(tick); }
-                (void)queue.enqueue(host_weak_, bank_, std::span<const std::int32_t>(wanted),
-                                    static_cast<std::size_t>(wanted.size()) * host_->slot_bytes(),
-                                    tick + window, tick);
+                // One job per expert, not one job per bank. A job is a disk read and the buffered
+                // reader serialises concurrent reads on one handle by design (a single file pointer),
+                // so the only parallelism available is across jobs - and one bank's two experts were
+                // a single job, i.e. serial by construction. Per expert, the workers split them.
+                //
+                // The budget is charged the same total bytes; only the granularity changed, so a job
+                // that is refused now costs one expert's worth instead of the whole batch's.
+                for (const auto expert : wanted) {
+                    const std::int32_t one[1] = {expert};
+                    (void)queue.enqueue(host_weak_, bank_, std::span<const std::int32_t>(one, 1),
+                                        static_cast<std::size_t>(host_->slot_bytes()), tick + window,
+                                        tick);
+                }
             }
             prefetch_calls_ += wanted.size();
             if ((++prefetch_batches_ % 40) == 0) {

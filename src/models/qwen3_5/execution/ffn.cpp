@@ -885,7 +885,22 @@ bool predict_enabled() {
 
 void predict_next_layer(const Tensor& residual, const RoutedMoeParameters& next,
                         WorkspaceArena& workspace, DeviceExecutionView execution) {
-    if (!predict_enabled() || next.stream == nullptr || residual.ne[1] != 1) { return; }
+    // The trace is deliberately outside the enable check: "the switch is off" and "the guess was not
+    // produced" must not look the same in a log.
+    static std::uint64_t calls = 0;
+    // The trace names the stream the guess is handed TO, which is L+1's - so a `bank == 0` guard would
+    // only ever fire for a stream that no layer predicts into.
+    const bool trace = next.stream != nullptr && next.stream->bank_index() < 4 &&
+                       std::getenv("NINFER_EXPERT_TIMING") != nullptr && ++calls <= 6;
+    if (!predict_enabled()) {
+        if (trace) { std::fprintf(stderr, "[pred] off (NINFER_PREFETCH_PREDICT)\n"); }
+        return;
+    }
+    if (next.stream == nullptr) {
+        if (trace) { std::fprintf(stderr, "[pred] no stream for the next layer\n"); }
+        return;
+    }
+    if (residual.ne[1] != 1) { return; }
     const auto& routed = next.profile.routed;
     const ops::RouteProfile route_profile{routed.ffn.hidden, routed.experts, routed.top_k};
     auto guess_ids     = workspace.alloc(DType::I32, {routed.top_k, 1});
@@ -902,6 +917,10 @@ void predict_next_layer(const Tensor& residual, const RoutedMoeParameters& next,
                           execution.stream);
     (void)cudaStreamSynchronize(execution.stream);
     next.stream->set_predicted(guess);
+    if (trace) {
+        std::fprintf(stderr, "[pred] bank=0 -> next stream, top_k=%d\n", routed.top_k);
+        std::fflush(stderr);
+    }
 }
 
 void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& residual,
@@ -1523,6 +1542,9 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
                     std::fflush(stderr);
                 }
             }
+            // The covered-layer fast path finishes here too, and it is the one most layers take: a
+            // prediction hook only on the split branch would run on the minority of layers.
+            if (predict_next != nullptr) { predict_next_layer(residual, *predict_next, workspace, execution); }
             return;
         }
         auto mixed_f32 = workspace.alloc(DType::FP32, {hidden.ne[0], columns});

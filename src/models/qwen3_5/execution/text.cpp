@@ -1243,6 +1243,12 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase,
         if (const auto* moe_next = std::get_if<RoutedMoeParameters>(&ffn_next)) {
             predict_next = moe_next;
         }
+        if (layer == 0 && std::getenv("NINFER_EXPERT_TIMING") != nullptr) {
+            std::fprintf(stderr, "[pred] probe layer=0 this.variant=%zu next.variant=%zu stream=%d\n",
+                         weights.ffn.index(), ffn_next.index(),
+                         predict_next != nullptr && predict_next->stream != nullptr ? 1 : 0);
+            std::fflush(stderr);
+        }
     }
     ffn(h, weights.ffn, x, hints, work_, ctx_.execution_view(), false,
         // Q68b probe: score this layer's router against the residual stream the previous layer left
@@ -1250,6 +1256,12 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase,
         // NINFER_LAYER_PROBE=2.
         router_probe_input(ctx_.execution_view().device()), predict_next);
     router_probe_save(x);
+    // Q30/P6: the prediction is handed to the next layer's region right here, between the layers, so
+    // the copy is in flight before that layer's kernels are queued. Doing it in the next layer's
+    // ensure() is too late: by then its routes are known and the "prediction" is the demand set.
+    if (predict_next != nullptr && predict_next->stream) {
+        predict_next->stream->stage_predicted(ctx_.stream);
+    }
 }
 
 template <class Tap>
