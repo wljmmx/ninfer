@@ -288,6 +288,11 @@ private:
     // has to be visible before the R1/R2 split can be judged: one full-bank publish is 2 KiB
     // (256 experts x (8 B offset + 4 B mask)), which is 16x the bar by itself.
     std::uint64_t publish_bytes_max_ = 0;
+    // A1 needs the two segments apart, because they answer different questions: the R1 segment moves
+    // at an epoch boundary (a large publish, once per 64 steps) and only the per-step part is bounded
+    // by the 128 B bar. Classified by the number of experts that moved - a boundary re-placement
+    // moves a set, a ring swap moves one or two.
+    std::uint64_t publish_bytes_step_max_ = 0;
     ExpertBankLayout entry_{};
     // port (sm_89): the pool holds every layer at once, so this bank's window is fixed and no
     // per-step routing decision - and therefore no host round trip - is needed.
