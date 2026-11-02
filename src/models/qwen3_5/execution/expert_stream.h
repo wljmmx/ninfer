@@ -278,7 +278,17 @@ private:
     // the driver accepted the publish. Compared before the kernels read the tables; a mismatch means a
     // publication did not land, and computing on it would be a silent wrong token.
     static constexpr std::uint64_t kTableUnknown = ~std::uint64_t{0};
-    std::uint64_t table_generation_ = 0;
+    // A1: the three segments' versions as this bank's Device tables hold them. The check at the end
+    // of a layer compares all three; the hot one is what an epoch-boundary re-placement moves, so a
+    // boundary publish cannot be mistaken for a per-step staleness.
+    std::uint64_t table_hot_      = 0;
+    std::uint64_t table_step_     = 0;
+    std::uint64_t table_prefetch_ = 0;
+    // What the publisher last recorded, per instance. The check compares these against the cache.
+    std::uint64_t pub_hot_      = 0;
+    std::uint64_t pub_step_     = 0;
+    std::uint64_t pub_prefetch_ = 0;
+    bool published_once_        = false;
     // port (sm_89): D1 read-ahead counter (see the call site).
     std::uint64_t prefetch_calls_ = 0;   // experts
     std::uint64_t prefetch_batches_ = 0; // layers that prefetched
@@ -288,6 +298,13 @@ private:
     // has to be visible before the R1/R2 split can be judged: one full-bank publish is 2 KiB
     // (256 experts x (8 B offset + 4 B mask)), which is 16x the bar by itself.
     std::uint64_t publish_bytes_max_ = 0;
+    // Q30/P6: the Device-target side of the prediction - how many predicted experts the pool did not
+    // already hold (the delta the region is sized for) and how many the region took.
+    std::uint64_t prefetch_delta_  = 0;
+    std::uint64_t prefetch_placed_ = 0;
+    // Routes served from the prediction region. Placements count work; this counts value, and it is
+    // the number that decides whether the region is sized right (or should be zero).
+    std::uint64_t prefetch_hits_ = 0;
     // A1 needs the two segments apart, because they answer different questions: the R1 segment moves
     // at an epoch boundary (a large publish, once per 64 steps) and only the per-step part is bounded
     // by the 128 B bar. Classified by the number of experts that moved - a boundary re-placement

@@ -1242,7 +1242,61 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         // Skipping it on an unchanged layer would leave a slot pinned for a layer that never reads
         // it, which is a leak the tier cannot see.
         if (host_ != nullptr && host_direct) { host_->begin_layer(); }
-        if (refresh && cache_->set_resident_experts(bank_, wanted)) {
+        // Q30/P6: the Device-target prediction, placed BEFORE the residency decision and therefore
+        // before this layer's table publish. That ordering is the whole point: the copy is queued on
+        // this stream ahead of the kernels, the rebuild below gives the new rows an offset and a
+        // mask, and the layer that routes to them finds them resident. Placing it after the publish
+        // was tried first and tripped A3b (a placement the published tables did not contain).
+        //
+        // Only the part the pool does not already hold is placed - a prediction that is already
+        // resident is not a prediction - which is what keeps the region small: the measured delta is
+        // about one expert a layer, not top-k.
+        static const bool vram_prefetch = [] {
+            const char* value = std::getenv("NINFER_PREFETCH_MODE");
+            return value != nullptr && std::strcmp(value, "vram") == 0;
+        }();
+        std::uint32_t prefetch_placed = 0;
+        if (vram_prefetch && cache_ != nullptr && tokens > 0 && tokens <= kHotSetUpdateTokens &&
+            !predicted_.empty()) {
+            std::vector<std::uint32_t> absent;
+            absent.reserve(predicted_.size());
+            for (const auto expert : predicted_) {
+                if (expert < 0 || static_cast<std::uint32_t>(expert) >= count_) { continue; }
+                const auto id = static_cast<std::uint32_t>(expert);
+                if (cache_->expert_slot(bank_, id)) { continue; } // already resident
+                absent.push_back(id);
+            }
+            prefetch_delta_ += absent.size();
+            std::vector<ExpertCacheKey> placed;
+            if (!absent.empty() && cache_->set_prefetch_experts(bank_, absent, placed) != 0) {
+                cache_->prepare(std::span<const ExpertCacheKey>(placed), stream);
+                (void)cache_->progress(stream);
+                prefetch_placed_ += placed.size();
+                prefetch_placed = static_cast<std::uint32_t>(placed.size());
+            }
+            // Did this layer's routes land in the region? That is the only honest numerator for the
+            // prediction: placements count work, hits count value.
+            for (std::size_t i = 0; i < values; ++i) {
+                const auto expert = static_cast<std::uint32_t>(route_ids[i]);
+                if (expert >= count_) { continue; }
+                const auto slot = cache_->expert_slot(bank_, expert);
+                if (slot && cache_->prefetch_slot(*slot)) { ++prefetch_hits_; }
+            }
+            static std::uint64_t reports = 0;
+            if (bank_ == 0 && (++reports % 40) == 0) {
+                std::fprintf(stderr, "[pfv] delta=%llu placed=%llu hits=%llu region=%u/bank\n",
+                             (unsigned long long)prefetch_delta_,
+                             (unsigned long long)prefetch_placed_,
+                             (unsigned long long)prefetch_hits_,
+                             cache_->prefetch_slots_per_bank());
+                std::fflush(stderr);
+            }
+        }
+        // A prediction is a placement, so the table has to be rebuilt even when the resident set did
+        // not move - otherwise the rows the region just took never reach the Device.
+        const bool set_moved =
+            refresh && cache_->set_resident_experts(bank_, wanted, static_cast<std::uint32_t>(hot_cap));
+        if (set_moved || prefetch_placed != 0) {
             set_initialised_ = true;
             std::fill(offsets_.begin(), offsets_.end(), 0);
             mask_host_.assign(count_, 0);
@@ -1435,20 +1489,27 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             // has not seen yet forces the publication even when this step's `moved` is empty. That is
             // A3's check, applied where it now matters - the skip below would otherwise hide a stale
             // table behind a correct-looking diff.
-            static thread_local std::uint64_t published_generation = 0;
-            // port (sm_89): this bank's own generation, not the pool's. layout_generation() counts
-            // every bank, so a bank that published at 1 looked stale as soon as any of the other 39
-            // placed an expert - which is nearly every layer, and is why the "did anything move" skip
-            // kept republishing. The per-bank number is the only one a per-bank publisher can compare
-            // against, and it is also what the table-validity check at the end of the layer uses.
-            const auto generation = cache_->bank_generation(bank_);
-            const bool stale      = published_generation != generation;
-            static thread_local bool published_once = false;
-            const bool unchanged = moved.empty() && published_once && !stale;
+            // A1: three segments, three lifetimes, so three generations on each side. The hot segment
+            // may only move at an epoch boundary (so its generation does not change inside one), the
+            // step segment moves with the ring, and the prediction region moves on its own placements.
+            //
+            // These are PER INSTANCE, not `static thread_local`: a thread-local counter here is shared
+            // by all forty banks, so one bank's publish marked every other bank as up to date and the
+            // next bank skipped its own - which the A3b check then caught as "device holds 23, cache
+            // is on 24". The old single counter had the same shape; it only survived because every
+            // bank happened to publish every layer.
+            const auto hot_gen      = cache_->hot_generation(bank_);
+            const auto step_gen     = cache_->step_generation(bank_);
+            const auto prefetch_gen = cache_->prefetch_generation(bank_);
+            const bool stale = pub_hot_ != hot_gen || pub_step_ != step_gen ||
+                              pub_prefetch_ != prefetch_gen;
+            const bool unchanged = moved.empty() && published_once_ && !stale;
             if (!unchanged && table_bytes != 0 && mask_bytes != 0) {
-                host_publish = true;
-                published_once     = true;
-                published_generation = generation;
+                host_publish    = true;
+                published_once_ = true;
+                pub_hot_        = hot_gen;
+                pub_step_       = step_gen;
+                pub_prefetch_   = prefetch_gen;
                 cudaMemcpyAttributes attributes{};
                 attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
                 attributes.flags          = 0;
@@ -1507,10 +1568,16 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                             static_cast<std::uint64_t>(table_bytes + mask_bytes));
                     }
                 }
-                // A3b: what this bank's Device tables now hold, as a generation that can be compared.
+                // A3b: what this bank's Device tables now hold, as generations that can be compared.
                 // Only a submission the driver accepted counts - "we tried to publish" is exactly the
                 // state that used to look fine and compute with the previous layer's addresses.
-                table_generation_ = submitted == cudaSuccess ? generation : kTableUnknown;
+                if (submitted == cudaSuccess) {
+                    table_step_     = step_gen;
+                    table_hot_      = hot_gen;
+                    table_prefetch_ = prefetch_gen;
+                } else {
+                    table_step_ = table_hot_ = table_prefetch_ = kTableUnknown;
+                }
                 ++publish_calls_;
             }
             if (moved.empty()) { ++gh1_static_calls_; }
@@ -1878,12 +1945,18 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     // The first version compared against layout_generation() and fired on the default path with
     // `1 vs 40`: the pool's counter had moved 39 times for other banks. That is why the number had to
     // become per-bank before the check could be one.
-    if (std::getenv("NINFER_TABLE_STALE") != nullptr) { table_generation_ = kTableUnknown; }
-    if (table_generation_ != cache_->bank_generation(bank_)) {
+    if (std::getenv("NINFER_TABLE_STALE") != nullptr) {
+        table_step_ = table_hot_ = table_prefetch_ = kTableUnknown;
+    }
+    if (table_step_ != cache_->step_generation(bank_) || table_hot_ != cache_->hot_generation(bank_) ||
+        table_prefetch_ != cache_->prefetch_generation(bank_)) {
         throw std::runtime_error("expert table is stale (bank " + std::to_string(bank_) +
-                                 "): device holds generation " +
-                                 std::to_string(table_generation_) + ", cache is on " +
-                                 std::to_string(cache_->bank_generation(bank_)));
+                                 "): device holds hot/step/pred " + std::to_string(table_hot_) + "/" +
+                                 std::to_string(table_step_) + "/" +
+                                 std::to_string(table_prefetch_) + ", cache is on " +
+                                 std::to_string(cache_->hot_generation(bank_)) + "/" +
+                                 std::to_string(cache_->step_generation(bank_)) + "/" +
+                                 std::to_string(cache_->prefetch_generation(bank_)));
     }
     // port (sm_89): D1-D4 prefetch, in the only form that is safe today.
     //

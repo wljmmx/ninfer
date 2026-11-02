@@ -111,7 +111,33 @@ void prepare(std::span<const ExpertCacheKey> required, cudaStream_t stream = nul
     // port (sm_89): restricts a bank to `experts` and returns whether that changed the set. Experts
     // that stay resident keep their slot, so a caller only republishes its offset table when this
     // returns true. The rest of the bank streams in again on their next use.
-    bool set_resident_experts(std::uint32_t bank, std::span<const std::uint32_t> experts);
+    // port (sm_89): A1. `hot_count` is how many of the leading entries are the hot set; the rest are
+    // the spill ring and are reported separately, because the two segments have different lifetimes:
+    // the hot segment may only move at an epoch boundary, the ring moves every step. With the default
+    // (all entries hot) the two counters move together, i.e. exactly the previous behaviour.
+    bool set_resident_experts(std::uint32_t bank, std::span<const std::uint32_t> experts,
+                              std::uint32_t hot_count = UINT32_MAX);
+
+    // A1: the two generations, split. `hot_generation` moves only when the hot segment's membership
+    // does; `step_generation` moves whenever the whole set does. A publisher that keeps its Device
+    // tables in two segments compares each against its own counter, which is what lets an
+    // epoch-boundary hot re-placement coexist with a per-step ring delta.
+    [[nodiscard]] std::uint64_t hot_generation(std::uint32_t bank) const noexcept;
+    [[nodiscard]] std::uint64_t step_generation(std::uint32_t bank) const noexcept;
+    // A1: the third segment - the prediction region, if one was carved. It moves on a placement, not
+    // on a residency decision, and it must not invalidate either of the other two.
+    [[nodiscard]] std::uint64_t prefetch_generation(std::uint32_t bank) const noexcept;
+    // The region's experts in ring order, with holes (kAbsentSlot) where a slot has been reused but
+    // the publisher has not rewritten it. The publisher walks this and skips the holes.
+    [[nodiscard]] const std::vector<std::uint32_t>& prefetch_owners(std::uint32_t bank) const;
+
+    // port (sm_89): Q30/P6. Places experts the pool does NOT already hold into a per-bank ring of
+    // reserved slots and returns the keys that need an upload. Experts already resident are ignored:
+    // a prediction that is already there is not a prediction, and the delta is what sizes the region.
+    std::uint32_t set_prefetch_experts(std::uint32_t bank, std::span<const std::uint32_t> experts,
+                                       std::vector<ExpertCacheKey>& placed);
+    [[nodiscard]] bool prefetch_slot(std::uint32_t slot) const noexcept;
+    [[nodiscard]] std::uint32_t prefetch_slots_per_bank() const noexcept;
 
     // port (sm_89): the pinned RAM tier the host half keeps its working set in. When set, an upload
     // of an expert that tier already holds copies from locked memory instead of the pageable artifact

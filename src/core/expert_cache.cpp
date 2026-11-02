@@ -18,6 +18,14 @@ namespace ninfer {
 namespace {
 
 constexpr std::uint64_t kAbsent = std::numeric_limits<std::uint64_t>::max();
+// Q30/P6: slots per bank in the prediction region. Off unless asked for. The caller sizes it from the
+// measured delta between "predicted for the next layer" and "already in the pool", which is much
+// smaller than top-k - about one expert a layer on this artifact, not eight.
+std::uint32_t prefetch_slots_from_env() {
+    const char* value = std::getenv("NINFER_PREFETCH_SLOTS");
+    if (value == nullptr || *value == '\0') { return 0; }
+    return static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
+}
 constexpr std::uint32_t kAbsentSlot = std::numeric_limits<std::uint32_t>::max();
 
 std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
@@ -177,6 +185,19 @@ std::vector<std::uint64_t> bank_generation;
     std::vector<std::uint32_t> free_slots;
     // How many experts of each bank own a slot right now.
     std::vector<std::uint32_t> resident_count;
+    // A1: the two table segments' generations, per bank. `step_gen` moves on any set change and is
+    // what the per-step segment is checked against; `hot_gen` moves only when the hot membership
+    // does, so a boundary re-placement cannot make the per-step check fail.
+    std::vector<std::uint64_t> hot_gen, step_gen, prefetch_gen;
+    std::vector<std::vector<std::uint32_t>> prev_hot; // sorted hot set at the last decision
+    // Q30/P6: the prediction region - slots reserved at the top of the pool, never handed to a
+    // resident set. Separate from the spill ring on purpose: the ring holds exactly this step's
+    // misses (C1) and is sized from the widest step (B4), while predictions belong to the NEXT layer;
+    // sharing would make them the oldest arrivals, i.e. the first thing FIFO drops.
+    std::uint32_t prefetch_per_bank = 0;
+    std::uint32_t prefetch_base     = 0; // region is [base, slots_live)
+    std::vector<std::vector<std::uint32_t>> prefetch_owner;   // bank -> region index -> expert
+    std::vector<std::uint32_t> prefetch_cursor;               // bank -> next region index to reuse
     int ordinal = 0;
 
     Impl(std::span<const ExpertBankSpec> specs, const ExpertCacheRequirements& req,
@@ -282,13 +303,24 @@ std::vector<std::uint64_t> bank_generation;
         }
         slot_of.resize(banks.size());
         resident_count.assign(banks.size(), 0);
+        // Q30/P6: size the prediction region BEFORE seeding and take it out of each bank's seed
+        // (hot = capacity - S_p, the same shape B4 uses for the ring). Taking it from the leftovers
+        // was tried first and never produced a region: the pool seeds every bank to its cap, so
+        // nothing is left to carve.
+        prefetch_per_bank = prefetch_slots_from_env();
+        if (prefetch_per_bank != 0 && !banks.empty()) {
+            const auto room = static_cast<std::uint32_t>(slot_cap / 4);
+            prefetch_per_bank = std::min(prefetch_per_bank, room);
+        }
+        const std::uint32_t seed =
+            prefetch_per_bank < slot_cap ? slot_cap - prefetch_per_bank : slot_cap;
         // port (sm_89): only the experts that fit the per-bank hint start resident. The identity
         // mapping is right when the hint holds the whole layer; a smaller hint must start with the
         // rest absent, or a stale slot index would point at another bank's expert.
         for (std::size_t b = 0; b < banks.size(); ++b) {
             slot_of[b].assign(banks[b].count, kAbsentSlot);
             if (banks[b].resident) { continue; }
-            for (std::uint32_t e = 0; e < banks[b].count && e < slot_cap; ++e) {
+            for (std::uint32_t e = 0; e < banks[b].count && e < seed; ++e) {
                 if (free_slots.empty()) {
                     throw std::invalid_argument("expert pool cannot seed every bank's hot set");
                 }
@@ -297,14 +329,86 @@ std::vector<std::uint64_t> bank_generation;
                 ++resident_count[b];
             }
         }
+        if (prefetch_per_bank != 0) {
+            const auto per_bank = static_cast<std::uint64_t>(prefetch_per_bank);
+            prefetch_base       = static_cast<std::uint32_t>(
+                slots_live - per_bank * static_cast<std::uint64_t>(banks.size()));
+            std::erase_if(free_slots, [&](std::uint32_t slot) { return slot >= prefetch_base; });
+            prefetch_owner.assign(banks.size(),
+                                  std::vector<std::uint32_t>(prefetch_per_bank, kAbsentSlot));
+            prefetch_cursor.assign(banks.size(), 0);
+            prefetch_gen.assign(banks.size(), 0);
+            std::fprintf(stderr, "[pool] prefetch region: %u slot(s)/bank, %u total, hot seed %u\n",
+                         prefetch_per_bank,
+                         prefetch_per_bank * static_cast<std::uint32_t>(banks.size()), seed);
+            std::fflush(stderr);
+        }
     }
 
-    // Makes `experts` the bank's resident set, in list order. The caller recomputes and republishes
-    // its offset table afterwards. Returns true when the resident set changed. Experts that stay
-    // resident keep their slot, so a step that routes to experts already present uploads nothing
-    // and never discards them; slots of the ones leaving go back to the shared free list, and
-    // arrivals take whatever the list has left.
-    bool set_resident(std::uint32_t bank, std::span<const std::uint32_t> experts) {
+    // Q30/P6: the prediction's entry point. Only experts the pool does NOT already hold are placed;
+    // the caller filters by the same rule, and this repeats it because a stale prediction list must
+    // not displace a slot that is currently serving routes.
+    //
+    // The region is a ring per bank: the next placement reuses the oldest region slot. With a delta
+    // of one or two experts a layer (prediction minus what is already resident), the region needs to
+    // be that small, not top-k - an over-sized region only steals slots from the hot set.
+    //
+    // No upload happens here: the placed keys come back to the caller, which hands them to
+    // prepare()/progress() on the compute stream (the tested upload path, and the copy is ordered
+    // before the layer that reads it).
+    std::uint32_t set_prefetch(std::uint32_t bank, std::span<const std::uint32_t> experts,
+                               std::vector<ExpertCacheKey>& placed) {
+        if (prefetch_per_bank == 0 || bank >= banks.size()) { return 0; }
+        auto& slots  = slot_of[bank];
+        auto& owner  = prefetch_owner[bank];
+        auto& cursor = prefetch_cursor[bank];
+        std::uint32_t count = 0;
+        for (const std::uint32_t expert : experts) {
+            if (expert >= slots.size()) { continue; }
+            if (slots[expert] != kAbsentSlot) { continue; } // already in the pool: nothing to do
+            const std::uint32_t region = cursor++ % prefetch_per_bank;
+            const std::uint32_t slot   = prefetch_base + bank * prefetch_per_bank + region;
+            const std::uint32_t old    = owner[region];
+            if (old != kAbsentSlot && old < slots.size() && slots[old] == slot) {
+                slots[old]                       = kAbsentSlot;
+                entries[first[bank] + old].ready = false;
+                ++evictions;
+            }
+            owner[region]                       = expert;
+            slots[expert]                       = slot;
+            entries[first[bank] + expert].ready = false;
+            placed.push_back(ExpertCacheKey{bank, expert});
+            ++count;
+        }
+        if (count != 0) {
+            if (prefetch_gen.size() <= bank) { prefetch_gen.resize(bank + 1, 0); }
+            ++prefetch_gen[bank];
+        }
+        return count;
+    }
+
+    // True when this global slot belongs to a bank's prediction region.
+    [[nodiscard]] bool prefetch_slot(std::uint32_t slot) const noexcept {
+        return prefetch_per_bank != 0 && slot >= prefetch_base && slot < slots_live;
+    }
+
+    // Does `expert` count as a member of the bank's resident set (as opposed to a prediction)? The
+    // distinction matters in set_resident: a prediction is not the hot set's to free, and it must not
+    // make a step look changed when the hot set is identical.
+    [[nodiscard]] bool resident_slot(std::uint32_t bank, std::uint32_t expert) const noexcept {
+        if (bank >= slot_of.size() || expert >= slot_of[bank].size()) { return false; }
+        const auto slot = slot_of[bank][expert];
+        if (slot == kAbsentSlot) { return false; }
+        return !prefetch_slot(slot);
+    }
+
+    // Makes `experts` the bank's resident set, in list order, with the first `hot_count` entries
+    // being the hot segment. The caller recomputes and republishes its offset table afterwards.
+    // Returns true when the resident set changed. Experts that stay resident keep their slot, so a
+    // step that routes to experts already present uploads nothing and never discards them; slots of
+    // the ones leaving go back to the shared free list, and arrivals take whatever the list has left.
+    bool set_resident(std::uint32_t bank, std::span<const std::uint32_t> experts,
+                      std::uint32_t hot_count) {
         if (bank >= banks.size()) { throw std::out_of_range("expert cache bank"); }
         auto& slots = slot_of[bank];
         std::vector<std::uint32_t> wanted;
@@ -320,24 +424,53 @@ std::vector<std::uint64_t> bank_generation;
         // many it actually gets, and the caller reads the result back off the offset table.
         bool changed = false;
         for (std::size_t expert = 0; expert < slots.size(); ++expert) {
-            if ((slots[expert] != kAbsentSlot) != keep[expert]) {
+            // A prediction is not a member of the resident set: it must not make the set look
+            // changed, or every step that ever prefetched would republish the whole table.
+            if (resident_slot(bank, static_cast<std::uint32_t>(expert)) != keep[expert]) {
                 changed = true;
                 break;
             }
         }
+        // A1: the hot segment's own membership. Compared as a sorted set because the caller's order is
+        // a policy detail, while a generation has to mean "the same experts are hot".
+        const std::uint32_t hot_n =
+            hot_count == UINT32_MAX ? static_cast<std::uint32_t>(wanted.size())
+                                    : std::min(hot_count, static_cast<std::uint32_t>(wanted.size()));
+        std::vector<std::uint32_t> hot_now(wanted.begin(), wanted.begin() + hot_n);
+        std::sort(hot_now.begin(), hot_now.end());
+        if (prev_hot.size() <= bank) { prev_hot.resize(bank + 1); }
+        const bool hot_changed = prev_hot[bank] != hot_now;
+        if (hot_changed) { prev_hot[bank] = hot_now; }
         // Consecutive steps usually route to the same experts. Keeping the set when it is unchanged
         // turns a per-token reupload into a hit.
-        if (!changed) { return false; }
+        if (!changed && !hot_changed) { return false; }
         ++layout_generation;
         // The same bump, per bank: this is the one a publisher of this bank's tables can compare
         // against without being invalidated by the other banks (see bank_generation()).
         if (bank_generation.size() <= bank) { bank_generation.resize(bank + 1, 0); }
         ++bank_generation[bank];
+        // A1: the split. `step_generation` is what the per-step table segment is checked against and
+        // moves whenever anything in the set does; `hot_generation` is the epoch-segment's, and only
+        // a hot re-placement moves it - which is what lets a boundary publish leave the per-step
+        // check untouched.
+        if (step_gen.size() <= bank) { step_gen.resize(bank + 1, 0); }
+        if (hot_gen.size() <= bank) { hot_gen.resize(bank + 1, 0); }
+        if (changed) { ++step_gen[bank]; }
+        if (hot_changed) { ++hot_gen[bank]; }
+        if (!changed) { return true; } // hot-only change: nothing in the slot tables moves
         std::uint32_t held = 0;
         for (std::size_t expert = 0; expert < slots.size(); ++expert) {
             if (slots[expert] == kAbsentSlot) { continue; }
             if (keep[expert]) {
                 ++held;
+                continue;
+            }
+            if (prefetch_slot(slots[expert])) {
+                // The region recycles its own slots. Handing one to the free list would give a
+                // prediction slot to another bank's hot set and leave the ring addressing bytes the
+                // ring no longer owns.
+                slots[expert]                       = kAbsentSlot;
+                entries[first[bank] + expert].ready = false;
                 continue;
             }
             // Leaving: hand the slot to whoever needs it next. This happens before the arrivals are
@@ -723,10 +856,43 @@ void ExpertCache::prepare(std::span<const ExpertCacheKey> required, cudaStream_t
     }
 }
 
-bool ExpertCache::set_resident_experts(std::uint32_t bank,
-                                       std::span<const std::uint32_t> experts) {
-    return impl_->set_resident(bank, experts);
+bool ExpertCache::set_resident_experts(std::uint32_t bank, std::span<const std::uint32_t> experts,
+                                       std::uint32_t hot_count) {
+    return impl_->set_resident(bank, experts, hot_count);
 }
+
+std::uint32_t ExpertCache::set_prefetch_experts(std::uint32_t bank,
+                                                std::span<const std::uint32_t> experts,
+                                                std::vector<ExpertCacheKey>& placed) {
+    return impl_->set_prefetch(bank, experts, placed);
+}
+
+bool ExpertCache::prefetch_slot(std::uint32_t slot) const noexcept {
+    return impl_->prefetch_slot(slot);
+}
+
+std::uint32_t ExpertCache::prefetch_slots_per_bank() const noexcept {
+    return impl_->prefetch_per_bank;
+}
+
+std::uint64_t ExpertCache::hot_generation(std::uint32_t bank) const noexcept {
+    return bank < impl_->hot_gen.size() ? impl_->hot_gen[bank] : 0;
+}
+
+std::uint64_t ExpertCache::step_generation(std::uint32_t bank) const noexcept {
+    return bank < impl_->step_gen.size() ? impl_->step_gen[bank] : 0;
+}
+
+std::uint64_t ExpertCache::prefetch_generation(std::uint32_t bank) const noexcept {
+    return bank < impl_->prefetch_gen.size() ? impl_->prefetch_gen[bank] : 0;
+}
+
+const std::vector<std::uint32_t>& ExpertCache::prefetch_owners(std::uint32_t bank) const {
+    static const std::vector<std::uint32_t> none;
+    if (bank >= impl_->prefetch_owner.size()) { return none; }
+    return impl_->prefetch_owner[bank];
+}
+
 
 std::optional<std::uint32_t> ExpertCache::expert_slot(std::uint32_t bank,
                                                       std::uint32_t expert) const noexcept {
