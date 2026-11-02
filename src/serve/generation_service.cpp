@@ -6,6 +6,7 @@
 
 #if NINFER_HAVE_LMCACHE
 #include "core/lmcache_bridge.h"
+#include "core/lmcache_layout.h"
 #include "core/lmcache_state_payload.h"
 #endif
 
@@ -240,32 +241,20 @@ public:
         if (chunk_bytes_total == 0 || chunk_tokens_ == 0 || page_bytes_ == 0 || page_tokens_ == 0) {
             return;
         }
-        const std::size_t payload_chunks = checkpoint.kv_bytes.size() / chunk_bytes_total;
+        // Q64 2d-2b-4: the layout arithmetic lives in core/lmcache_layout.h so the store side and the
+        // restore side cannot drift apart. This call computes exactly what the inline block did.
+        const auto plan = ninfer::core::lmcache::plan_payload(
+            checkpoint.kv_bytes.size(), checkpoint.valid_tokens, checkpoint.frontier,
+            prompt_tokens.size(), chunk_bytes_total, chunk_tokens_, page_bytes_, page_tokens_);
+        if (plan.chunks == 0 || plan.valid_tokens == 0) { return; }
+        const std::size_t payload_chunks = plan.payload_chunks;
         const std::size_t addressable    = prompt_tokens.size() / chunk_tokens_;
-        const std::size_t chunks         = std::min(payload_chunks, addressable);
-        if (chunks == 0) { return; }
-        const std::size_t complete = chunks * chunk_bytes_total;
-        const std::size_t covered  = chunks * chunk_tokens_;
-
-        // The committed length, not the page bound: 467 for a 474-token prompt whose key stops at
-        // 384. A backend that did not report it falls back to the frontier, which is the same number
-        // whenever the capture set one.
-        //
-        // Two clamps keep the header honest, and both matter because the reader cuts the tail by
-        // whole pages: a length longer than the request would describe a prompt this key does not
-        // have, and a length past the pages this export still holds after the last addressable chunk
-        // would make the reader take zero padding for KV.
-        const std::size_t tail_begin = complete;
-        const std::size_t tail_have =
-            checkpoint.kv_bytes.size() > tail_begin ? checkpoint.kv_bytes.size() - tail_begin : 0;
-        const std::size_t tail_capacity = std::min(tail_have, chunk_bytes_total);
-        const std::size_t tail_tokens   = tail_capacity / page_bytes_ * page_tokens_;
-        std::uint32_t valid_tokens =
-            checkpoint.valid_tokens != 0 ? checkpoint.valid_tokens : checkpoint.frontier;
-        valid_tokens = static_cast<std::uint32_t>(
-            std::min({static_cast<std::size_t>(valid_tokens), prompt_tokens.size(),
-                      covered + tail_tokens}));
-        if (valid_tokens == 0) { return; }
+        const std::size_t chunks         = plan.chunks;
+        const std::size_t complete       = plan.complete;
+        const std::size_t covered        = plan.covered;
+        const std::size_t tail_begin     = plan.tail_begin;
+        const std::size_t tail_capacity  = plan.tail_capacity;
+        const std::uint32_t valid_tokens = plan.valid_tokens;
 
         if (valid_tokens > covered) {
             std::fprintf(stderr,
