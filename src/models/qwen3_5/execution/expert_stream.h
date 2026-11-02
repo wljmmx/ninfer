@@ -78,10 +78,9 @@ public:
     // (it is called with the model alive, by construction), while the weak one is what a job
     // enqueued on the process-wide read-ahead worker carries. A queue job outlives the call that
     // issued it, so it has to be able to find the residency gone rather than assume it is there.
-    void attach_host(std::shared_ptr<HostExpertResidency> host) noexcept {
-        host_      = host.get();
-        host_weak_ = std::move(host);
-    }
+    // Q53: the tier needs this bank's ranking for cold admission, so the attachment also registers
+    // the score vector. Defined in the .cpp, where HostExpertResidency is complete.
+    void attach_host(std::shared_ptr<HostExpertResidency> host) noexcept;
     [[nodiscard]] HostExpertResidency* host() const noexcept { return host_; }
 
     [[nodiscard]] std::uint32_t count() const noexcept { return count_; }
@@ -428,6 +427,16 @@ private:
     // Q11/Q12: the set was frozen by the no_miss rule, so the same rule may thaw it. A freeze the
     // caller asked for is not this rule's to undo.
     bool freeze_by_rule_ = false;
+    // Q11/Q12, measured rule. The window counts LAYERS, not routes: a layer is clean when every one
+    // of its routes was already resident. `freeze_static_baseline_` / `freeze_tps_baseline_` are the
+    // two numbers the freeze has to beat - it is kept only when it raised the static rate or at
+    // least did not lower throughput, which is the rule the plan states and the 99% threshold never
+    // was. `frozen_layers_` is how long the comparison has been running.
+    std::uint32_t freeze_window_layers_ = 0;
+    std::uint32_t freeze_window_clean_  = 0;
+    std::uint32_t frozen_layers_        = 0;
+    double freeze_static_baseline_      = -1.0;
+    double freeze_tps_baseline_         = -1.0;
     std::uint32_t since_decay_   = 0;
     std::uint32_t since_reorder_ = 0;
     // port (sm_89): a warm-up then a frozen set, so a static policy stops re-ranking per step.

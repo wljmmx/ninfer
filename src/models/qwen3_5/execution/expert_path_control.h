@@ -175,11 +175,18 @@ public:
     // needed no host at all - and on a larger pool it could open on a layer that still fetched and
     // published, which is worse. The gate is now the AND of the capacity statement and the measured
     // execution statement (capt_ready), which is the condition a captured whole layer really needs.
+    //
+    // Q30: the 90/95 percentages were a guess and have been replaced by the measurement they were
+    // standing in for. At 19.4 GiB (the only tier that can capture today), two interleaved rounds:
+    // graph on 43.6 / 43.7 tok/s, graph off 41.5 / 41.6 tok/s - the graph is worth +5.0%. The
+    // condition is now structural rather than a rate: a captured whole layer replays a table, so
+    // EVERY layer has to be host-free and static, not 90% of them. 100% is the capture's validity
+    // requirement; anything less means a replayed layer would read a table it was not captured with.
     [[nodiscard]] bool want_graph() const {
         if (signals.capt_ready_pct >= 0.0) {
-            return signals.capt_ready_pct >= 90.0 && signals.static_pct >= 95.0;
+            return signals.capt_ready_pct >= 100.0 && signals.static_pct >= 100.0;
         }
-        return signals.capturable_pct >= 90.0 && signals.static_pct >= 95.0;
+        return signals.capturable_pct >= 100.0 && signals.static_pct >= 100.0;
     }
     [[nodiscard]] bool want_freeze() const { return signals.no_miss_pct >= 99.0; }
 

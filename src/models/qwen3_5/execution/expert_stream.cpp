@@ -1,6 +1,8 @@
 #include "models/qwen3_5/execution/expert_stream.h"
 #include "models/qwen3_5/execution/expert_prefetch.h"
+#include "models/qwen3_5/execution/expert_path_control.h"
 #include "models/qwen3_5/execution/host_expert_residency.h"
+#include "core/memory_budget.h"
 
 #include <cuda_runtime.h>
 
@@ -53,13 +55,32 @@ constexpr std::uint32_t kHotSetReorderPeriod = 32;
 // disagreeing about what "a while" means.
 constexpr std::int32_t kFreezeWindowCalls = 32;
 
-// 0 (the default) keeps the rule off. A percentage, because the rule the plan states is stated in
-// percent ("no_miss ≥ 99%"), and a fraction would invite the two to be mixed up.
-double freeze_no_miss_pct() {
-    static const double value = [] {
-        const char* text = std::getenv("NINFER_FREEZE_ON_NO_MISS");
-        if (text == nullptr || *text == '\0') { return 0.0; }
-        return std::strtod(text, nullptr);
+// port (sm_89): Q11/Q12. The old rule was a percentage copied from 1y.3. A percentage cannot answer
+// the question a freeze has to answer - "does holding the set still earn more than following it" -
+// and 99% was never met on the pool sizes this box runs. The rule now has two halves:
+//
+//   freeze  when the last 32 layers were all clean. That is a state, not a threshold: the pool
+//           answered every route, so there is nothing for the router to buy.
+//   keep    only if the freeze raised the static rate or did not lower throughput. If it did
+//           neither, it is churn that bought nothing, and the set goes back to following.
+//
+// Either way the decision is made from this run's numbers. NINFER_FREEZE_RULE=1 enables it; the old
+// NINFER_FREEZE_ON_NO_MISS name is accepted as the same switch, with its number deliberately
+// ignored - keeping it would keep the threshold the rule exists to remove.
+bool freeze_rule_enabled() {
+    static const bool value = [] {
+        if (const char* text = std::getenv("NINFER_FREEZE_RULE"); text != nullptr && text[0] != '0') {
+            return true;
+        }
+        if (const char* text = std::getenv("NINFER_FREEZE_ON_NO_MISS");
+            text != nullptr && text[0] != '\0') {
+            std::fprintf(stderr,
+                         "[freeze] NINFER_FREEZE_ON_NO_MISS is now a switch: the measured rule "
+                         "replaces the percentage\n");
+            std::fflush(stderr);
+            return text[0] != '0';
+        }
+        return false;
     }();
     return value;
 }
@@ -227,13 +248,30 @@ ExpertStream::ExpertStream(std::uint32_t count, WeightBankLayout gate_up, Weight
         return value == nullptr || value[0] != 0;
     }();
     regions_ = [] {
-        const char* value = std::getenv("NINFER_EXPERT_REGIONS");
-        return value != nullptr && value[0] != '0';
+        if (const char* value = std::getenv("NINFER_EXPERT_REGIONS");
+            value != nullptr && *value != '\0') {
+            return value[0] != '0';
+        }
+        // Q20: host-direct is the path with a device-side second leg, and the fixed-S ring is what
+        // gives that path an R2 region whose shape does not move. Measured at 8 GiB: S = 8 moved
+        // 8.4% of routes off the host leg (21.1% -> 12.7%) at neutral throughput (46.6 vs 46.4);
+        // S = 16 and 32 cost 1-5% for little more coverage, so the default stays the same fixed few
+        // slots the split path already measured. NINFER_EXPERT_RING_SLOTS overrides; 0 disables.
+        return std::getenv("NINFER_HOST_DIRECT") != nullptr;
     }();
     slru_policy_ = [] {
         const char* value = std::getenv("NINFER_EXPERT_POLICY");
         return value != nullptr && std::strcmp(value, "slru") == 0;
     }();
+}
+
+void ExpertStream::attach_host(std::shared_ptr<HostExpertResidency> host) noexcept {
+    host_      = host.get();
+    host_weak_ = std::move(host);
+    // Q53: the cold region's admission compares this bank's score against the occupant it would
+    // displace, so the tier needs the ranking. The vector is allocated once in the constructor, so
+    // the pointer stays valid for the stream's life.
+    if (host_ != nullptr) { host_->attach_scores(bank_, hot_score_.data(), count_); }
 }
 
 void ExpertStream::attach(ExpertCache& cache, std::uint32_t bank, const ExpertBankLayout& entry) {
@@ -244,6 +282,7 @@ void ExpertStream::attach(ExpertCache& cache, std::uint32_t bank, const ExpertBa
     cache_ = &cache;
     bank_  = bank;
     entry_ = entry;
+    if (host_ != nullptr) { host_->attach_scores(bank_, hot_score_.data(), count_); }
     for (auto& key : keys_) { key.bank = bank; }
     
 
@@ -575,6 +614,11 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         ++gh1_static_calls_;
     }
     gh1_report();
+    // Q11/Q12: the window the freeze rule reads. Counted here so a layer that returns through the
+    // covered fast path is still part of the window - that is exactly the layer the rule is looking
+    // for, and counting only the split path would make "32 clean layers" unreachable by construction.
+    const bool freeze_watch = freeze_rule_enabled();
+    if (freeze_watch) { ++freeze_window_layers_; }
     // port (sm_89): O1's arm (see the declaration). Taken before anything needs the ids, because
     // needing the ids is exactly what it removes: the branch below copies 32 bytes back and waits on
     // the stream for them, and that wait - not the copy - is 0.06 ms of every layer.
@@ -705,6 +749,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             // that is a host-free layer, which is what the rate is supposed to count.
             ++gh1_capt_free_calls_;
             ++gh1_capt_ready_calls_;
+            if (freeze_watch) { ++freeze_window_clean_; }
             last_host_routes_ = 0;
             static_probe(bank_, tokens, true, probe_absent, probe_unready, 0, 0, 0, true);
             return true;
@@ -1154,39 +1199,75 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         }
         // port (sm_89): Q11/Q12 - the freeze rule as a measurement, not as a switch.
         //
-        // The rule the plan states: freeze only when the pool answered EVERY route of a layer in at
-        // least `NINFER_FREEZE_ON_NO_MISS` percent of the layers so far; otherwise keep following the
-        // routing, which 1x.4r measured to converge on its own. The same rule read backwards is the
-        // thaw: a frozen set that stops meeting the bar goes back to following. The threshold is a
-        // percentage and 0 (the default) keeps the rule off, so no existing run changes.
+        // The old rule read "no_miss >= 99%" for the whole run, which is a percentage nobody could
+        // satisfy on a pool that holds part of a layer, and it said nothing about whether freezing
+        // helped. The two questions are separate:
         //
-        // It lives here because `wanted` is the set the rule is about: freezing before the set is
-        // built would freeze whatever the previous policy happened to leave behind.
-        if (const double bar = freeze_no_miss_pct(); bar > 0.0) {
-            if (gh1_calls_ >= static_cast<std::uint64_t>(kFreezeWindowCalls)) {
-                const double rate =
-                    100.0 * static_cast<double>(gh1_no_miss_calls_) / static_cast<double>(gh1_calls_);
-                if (!frozen_ && rate >= bar) {
-                    frozen_              = true;
-                    freeze_by_rule_      = true;
-                    frozen_wanted_       = wanted;
-                    if (bank_ == 0) {
-                        std::fprintf(stderr,
-                                     "[freeze] frozen at no_miss=%.1f%% (bar %.1f%%, %llu layers)\n",
-                                     rate, bar, static_cast<unsigned long long>(gh1_calls_));
-                        std::fflush(stderr);
+        //   freeze  when the last 32 layers were all clean. Every route was already resident, so
+        //           following the router cannot buy anything; holding the set still is free.
+        //   keep    only if the following 32 layers show the freeze raised the static rate or did
+        //           not lower throughput. If neither, the freeze bought nothing and is undone.
+        //
+        // `wanted` is the set the freeze is about, so the decision lives here rather than at the top
+        // of ensure(). The window above counts every layer, including the covered fast returns.
+        if (freeze_watch) {
+            if (frozen_ && freeze_by_rule_) {
+                ++frozen_layers_;
+                if (frozen_layers_ >= kFreezeWindowCalls) {
+                    const double static_now = policy_controller().signals.static_pct;
+                    const double tps_now    = policy_controller().signals.decode_tps;
+                    const bool static_up =
+                        freeze_static_baseline_ >= 0.0 && static_now >= 0.0 &&
+                        static_now > freeze_static_baseline_;
+                    const bool tps_ok =
+                        freeze_tps_baseline_ <= 0.0 || tps_now <= 0.0 ||
+                        tps_now >= freeze_tps_baseline_ * 0.97;
+                    if (static_up || tps_ok) {
+                        if (bank_ == 0) {
+                            std::fprintf(stderr,
+                                         "[freeze] kept: static %.1f%% (was %.1f%%), tps %.1f "
+                                         "(was %.1f)\n",
+                                         static_now, freeze_static_baseline_, tps_now,
+                                         freeze_tps_baseline_);
+                            std::fflush(stderr);
+                        }
+                    } else {
+                        frozen_         = false;
+                        freeze_by_rule_ = false;
+                        if (bank_ == 0) {
+                            std::fprintf(stderr,
+                                         "[freeze] thawed: static %.1f%% (was %.1f%%) and tps %.1f "
+                                         "(was %.1f) - the freeze bought nothing\n",
+                                         static_now, freeze_static_baseline_, tps_now,
+                                         freeze_tps_baseline_);
+                            std::fflush(stderr);
+                        }
                     }
-                } else if (frozen_ && freeze_by_rule_ && rate < bar) {
-                    // Only a set this rule froze is this rule's to undo: a freeze the caller asked
-                    // for (NINFER_EXPERT_STATIC, generation mode) is not.
-                    frozen_         = false;
-                    freeze_by_rule_ = false;
-                    if (bank_ == 0) {
-                        std::fprintf(stderr, "[freeze] thawed at no_miss=%.1f%% (bar %.1f%%)\n", rate,
-                                     bar);
-                        std::fflush(stderr);
-                    }
+                    frozen_layers_          = 0;
+                    freeze_static_baseline_ = static_now;
+                    freeze_tps_baseline_    = tps_now;
                 }
+            } else if (!frozen_ && freeze_window_layers_ >= kFreezeWindowCalls &&
+                       freeze_window_clean_ >= freeze_window_layers_) {
+                frozen_                 = true;
+                freeze_by_rule_         = true;
+                frozen_wanted_          = wanted;
+                frozen_layers_          = 0;
+                freeze_static_baseline_ = policy_controller().signals.static_pct;
+                freeze_tps_baseline_    = policy_controller().signals.decode_tps;
+                freeze_window_layers_   = 0;
+                freeze_window_clean_    = 0;
+                if (bank_ == 0) {
+                    std::fprintf(stderr,
+                                 "[freeze] frozen: %u clean layers, static=%.1f%% tps=%.1f\n",
+                                 kFreezeWindowCalls, freeze_static_baseline_,
+                                 freeze_tps_baseline_);
+                    std::fflush(stderr);
+                }
+            }
+            if (freeze_window_layers_ >= kFreezeWindowCalls) {
+                freeze_window_layers_ = 0;
+                freeze_window_clean_  = 0;
             }
         }
         // port (sm_89): the router does not repeat a step, so the set is refreshed every step. A
@@ -1258,9 +1339,24 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             // from what actually had to be moved into the pool.
             coverage_.routes += values;
             coverage_.inside += inside;
-            if (bank_ == 0 && (std::getenv("NINFER_SPLIT_TIMING") != nullptr ||
-                 std::getenv("NINFER_EXPERT_TIMING") != nullptr) &&
-                ++coverage_calls_ % 40 == 0) {
+            // Q50: the live point. The split is decided once at startup from a baked curve; this is
+            // how the run's own measurement replaces that prior, so the next decision (the runtime
+            // re-split, which is the controller's) reads this machine's numbers and not a comment.
+            // Bank 0 only: every bank sees the same pool size, and forty copies of one observation
+            // would just be forty writes to the same 512 MiB bucket.
+            const bool curve_tick = bank_ == 0 && ++coverage_calls_ % 40 == 0;
+            if (curve_tick) {
+                const auto routes = static_cast<double>(coverage_.routes == 0 ? 1 : coverage_.routes);
+                const auto misses_per_token =
+                    top_k == 0 ? 0.0
+                               : static_cast<double>(coverage_.routes - coverage_.inside) *
+                                     static_cast<double>(top_k) / routes;
+                ninfer::core::observe_pool_value(
+                    cache_->capacity_bytes(), misses_per_token,
+                    policy_controller().signals.decode_tps);
+            }
+            if (curve_tick && (std::getenv("NINFER_SPLIT_TIMING") != nullptr ||
+                 std::getenv("NINFER_EXPERT_TIMING") != nullptr)) {
                 const auto routes = static_cast<double>(coverage_.routes == 0 ? 1 : coverage_.routes);
                 const auto covered = 100.0 * static_cast<double>(coverage_.inside) / routes;
                 // One token publishes top_k entries per layer, so the miss rate scales back to a
@@ -1302,7 +1398,17 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                     : static_cast<double>(entered_) / static_cast<double>(entered_steps_);
                 if (bank_ == 0) {
                     std::fprintf(stderr, "[set] bank=0 entered=%.2f/step\n", entered_per_step);
-
+                    if (host_ != nullptr) {
+                        const auto& warm = host_->stats();
+                        std::fprintf(stderr,
+                                     "[warm] cold: admitted=%llu declined=%llu hits=%llu "
+                                     "promoted=%llu used=%u\n",
+                                     (unsigned long long)warm.cold_admissions,
+                                     (unsigned long long)warm.cold_declines,
+                                     (unsigned long long)warm.cold_hits,
+                                     (unsigned long long)warm.cold_promotions,
+                                     host_->cold_used());
+                    }
                 }
             }
         }
@@ -1341,11 +1447,38 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             std::stable_sort(ranked.begin(), ranked.end(), [&](std::uint32_t a, std::uint32_t b) {
                 return hot_score_[a] > hot_score_[b];
             });
+            // Q20: the fixed S ring, finally active on the path that has a device-side second leg.
+            //
+            // Under host-direct the set used to be the top `capacity` experts by score, so the ring
+            // was overwritten here and `[route] ring` read 0.0% even with an epoch set: every route
+            // outside the hot set went to the pinned tier. That is safe but it is not the structure
+            // GC2 needs - R2 has to be a fixed-S region whose members change without the grid
+            // changing. S is taken from the same place the split policy takes it (a fixed few slots,
+            // one token's routing), so a layer that misses k <= S experts serves them from the pool
+            // and only the rest fall to the host leg.
+            std::uint32_t ring = 0;
+            if (const char* value = std::getenv("NINFER_EXPERT_RING_SLOTS");
+                value != nullptr && *value != '\0') {
+                ring = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
+            } else if (regions_) {
+                ring = spill_slots(capacity);
+            }
+            ring = std::min<std::uint32_t>(ring, static_cast<std::uint32_t>(capacity / 2));
+            const auto keep = static_cast<std::size_t>(capacity - ring);
             wanted.assign(ranked.begin(),
                           ranked.begin() + static_cast<std::ptrdiff_t>(
-                                               std::min<std::size_t>(capacity, ranked.size())));
+                                               std::min<std::size_t>(keep, ranked.size())));
             std::fill(chosen.begin(), chosen.end(), false);
             for (const auto expert : wanted) { chosen[expert] = true; }
+            for (std::size_t i = 0; i < values && wanted.size() < capacity; ++i) {
+                const auto expert = static_cast<std::uint32_t>(route_ids[i]);
+                if (chosen[expert]) { continue; }
+                chosen[expert] = true;
+                wanted.push_back(expert);
+            }
+            // The attribution pass and set_resident() both read this: everything before `keep` is the
+            // hot regime, everything after it is the ring.
+            hot_cap_ = keep;
         }
         // port (sm_89): Q20 second leg, filled BEFORE the Device tables are built.
         //
@@ -1358,8 +1491,8 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             std::sort(host_distinct.begin(), host_distinct.end());
             host_distinct.erase(std::unique(host_distinct.begin(), host_distinct.end()),
                                 host_distinct.end());
-            host_->ensure(ExpertBankId{bank_},
-                          std::span<const std::int32_t>(host_distinct), nullptr);
+            host_->ensure_scored(ExpertBankId{bank_},
+                                 std::span<const std::int32_t>(host_distinct), hot_score_.data());
         }
         const bool refresh = !set_initialised_ || tokens <= kSetUpdateTokens ||
                              capacity < kPrefillProtectMin;

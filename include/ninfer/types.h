@@ -191,6 +191,12 @@ public:
     // with itself.
     virtual void store(std::span<const TokenId> /*prompt_tokens*/,
                        const CachedCheckpoint& /*checkpoint*/) {}
+
+    // Q64: an explicit shutdown, separate from destruction. A backend that owns a worker has to be
+    // able to stop it and say so - "writer stopped" was only reachable from the destructor, so the
+    // only way to verify that entry was to end the process. `stop()` is idempotent; the default does
+    // nothing for backends without a worker.
+    virtual void stop() {}
 };
 
 struct ContextCacheOptions {

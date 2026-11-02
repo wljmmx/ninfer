@@ -18,18 +18,24 @@
 // 8 -> 12 GiB buys coverage (45.2 -> 65.1%, -1.60 miss/token, +10.3 tok/s). So the marginal value of
 // a gigabyte depends on where you already are, which is exactly what this header makes visible.
 //
-// This is wiring, not tuning: the default path is the old rule, reproduced number for number, and
-// the new part is that the decision is printed with its marginal value and can be overridden
-// (NINFER_BUDGET_EXPERT_MB / NINFER_BUDGET_KV_MB). Choosing the split from the table is Q50's next
-// step and belongs to the controller, not to a constant baked in here.
+// Q50, second half: the table above is the initial curve, not the answer. A run measures its own
+// (pool bytes, misses per token, tokens per second) triple and every observation replaces the
+// nearest 512 MiB bucket, so the next decision is made from this machine's numbers. The baked-in
+// points stay as the prior until the run has measured its own.
+//
+// This is still wiring: the default split is the old rule byte for byte, and only
+// NINFER_BUDGET_SELECT=1 asks the curve to choose the point. What is new is that the choice is a
+// function of measured value, printed next to the point it picked, rather than a size copied from a
+// comment.
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 
 namespace ninfer::core {
 
-// One measured point of the pool's value curve. `pool_bytes` is what the pool got; the two numbers
+// One measured point of the pool's value curve. `pool_bytes` is what the pool got; the three numbers
 // are what the same run measured at that size.
 struct PoolValuePoint {
     std::uint64_t pool_bytes = 0;
@@ -44,18 +50,96 @@ inline constexpr PoolValuePoint kMeasuredPoolValue[] = {
     {12ULL << 30, 2.79, 30.7},
 };
 
+inline constexpr std::size_t kPoolCurvePoints = 16;
+
+// The live curve. One instance per process: the split is decided once at startup, and every
+// observation after that is evidence for the next decision (the runtime re-split belongs to the
+// controller; this is the memory it will read). Writes are single-threaded today - the panel that
+// observes is printed from the engine thread - and the read at startup happens before any layer, so
+// the array needs no lock. Stated so a later caller does not assume a safety that is not here.
+struct PoolValueCurve {
+    std::array<PoolValuePoint, kPoolCurvePoints> points{};
+    std::size_t count = 0;
+
+    PoolValueCurve() {
+        for (const auto& point : kMeasuredPoolValue) { add(point); }
+    }
+
+    // 512 MiB buckets: two observations of the same operating point replace each other instead of
+    // accumulating noise, and a 4 -> 12 GiB sweep still has room for every point.
+    void add(PoolValuePoint point) {
+        if (point.pool_bytes == 0 || point.tokens_per_second <= 0.0) { return; }
+        constexpr std::uint64_t kBucket = 512ULL << 20;
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto low  = points[i].pool_bytes / kBucket;
+            const auto high = point.pool_bytes / kBucket;
+            if (low == high) {
+                points[i] = point;
+                return;
+            }
+        }
+        if (count == kPoolCurvePoints) { return; }
+        points[count++] = point;
+        for (std::size_t i = count; i > 1; --i) {
+            if (points[i - 1].pool_bytes >= points[i - 2].pool_bytes) { break; }
+            const auto swap = points[i - 1];
+            points[i - 1]     = points[i - 2];
+            points[i - 2]     = swap;
+        }
+    }
+
+    [[nodiscard]] double marginal_misses_per_gib(std::uint64_t pool_bytes) const {
+        for (std::size_t i = 0; i + 1 < count; ++i) {
+            const auto& low  = points[i];
+            const auto& high = points[i + 1];
+            if (pool_bytes < low.pool_bytes || pool_bytes >= high.pool_bytes) { continue; }
+            const auto span =
+                static_cast<double>(high.pool_bytes - low.pool_bytes) / static_cast<double>(1ULL << 30);
+            return (low.misses_per_token - high.misses_per_token) / span;
+        }
+        return 0.0;
+    }
+
+    [[nodiscard]] double marginal_tps_per_gib(std::uint64_t pool_bytes) const {
+        for (std::size_t i = 0; i + 1 < count; ++i) {
+            const auto& low  = points[i];
+            const auto& high = points[i + 1];
+            if (pool_bytes < low.pool_bytes || pool_bytes >= high.pool_bytes) { continue; }
+            const auto span =
+                static_cast<double>(high.pool_bytes - low.pool_bytes) / static_cast<double>(1ULL << 30);
+            return (high.tokens_per_second - low.tokens_per_second) / span;
+        }
+        return 0.0;
+    }
+
+    // The nearest measured point at or below `bytes`, or 0 when the curve starts above it.
+    [[nodiscard]] std::uint64_t floor_point(std::uint64_t bytes) const {
+        std::uint64_t best = 0;
+        for (std::size_t i = 0; i < count; ++i) {
+            if (points[i].pool_bytes <= bytes) { best = points[i].pool_bytes; }
+        }
+        return best;
+    }
+};
+
+inline PoolValueCurve& pool_value_curve() {
+    static PoolValueCurve curve;
+    return curve;
+}
+
+// Q50's observation entry point. Called from the split path's own panel, so the curve is built from
+// the run that just measured it; `tokens_per_second` may be negative (not measured yet) and is then
+// ignored.
+inline void observe_pool_value(std::uint64_t pool_bytes, double misses_per_token,
+                               double tokens_per_second) {
+    if (misses_per_token < 0.0 || tokens_per_second <= 0.0) { return; }
+    pool_value_curve().add(PoolValuePoint{pool_bytes, misses_per_token, tokens_per_second});
+}
+
 // What the next gigabyte of pool is worth at this size: misses avoided per token, from the segment
 // the size falls in. Zero outside the measured range - "not measured" is not "no value".
 inline double marginal_misses_per_gib(std::uint64_t pool_bytes) {
-    constexpr std::size_t count = sizeof(kMeasuredPoolValue) / sizeof(kMeasuredPoolValue[0]);
-    for (std::size_t i = 0; i + 1 < count; ++i) {
-        const auto& low  = kMeasuredPoolValue[i];
-        const auto& high = kMeasuredPoolValue[i + 1];
-        if (pool_bytes < low.pool_bytes || pool_bytes >= high.pool_bytes) { continue; }
-        const auto span = static_cast<double>(high.pool_bytes - low.pool_bytes);
-        return (low.misses_per_token - high.misses_per_token) / (span / static_cast<double>(1ULL << 30));
-    }
-    return 0.0;
+    return pool_value_curve().marginal_misses_per_gib(pool_bytes);
 }
 
 struct DeviceSplit {
@@ -65,6 +149,11 @@ struct DeviceSplit {
     // Which knob produced the split. Printed, because "the pool is this big" is only useful next to
     // "and here is what decided it".
     const char* decided_by = "kv-first";
+    // Q50's selection, when it is enabled: the measured point the decision was taken at, and whether
+    // the pool was rounded down onto it (a partial gigabyte above a measured point is not itself a
+    // measurement, so a run that wants repeatable points stays on the point).
+    std::uint64_t selected_point = 0;
+    bool rounded_to_point        = false;
 };
 
 namespace detail {
@@ -74,6 +163,28 @@ inline std::uint64_t env_mib(const char* name) {
     return static_cast<std::uint64_t>(std::strtoull(value, nullptr, 10)) << 20;
 }
 } // namespace detail
+
+// Q50: choose the point from the curve. The default split reproduces the old rule, so this only runs
+// when NINFER_BUDGET_SELECT is set; what it adds is the decision the plan asked for - the pool is a
+// point whose value has been measured, not "whatever was left".
+//
+// The rule: take as much as the device can spare, except that a size less than one gigabyte above a
+// measured point is rounded down onto that point. A partial gigabyte buys the value of its segment
+// (already measured) but makes the run incomparable with the point itself, and the whole point of a
+// curve is that runs stay comparable. At or beyond the largest measured point nothing is held back:
+// "not measured" is not "worth nothing", and the pool is the only consumer left once KV and the
+// safety floor are paid.
+inline std::uint64_t select_pool_bytes(std::uint64_t available_bytes, DeviceSplit& split) {
+    if (std::getenv("NINFER_BUDGET_SELECT") == nullptr) { return available_bytes; }
+    const auto point = pool_value_curve().floor_point(available_bytes);
+    if (point != 0 && available_bytes - point < (1ULL << 30)) {
+        split.selected_point   = point;
+        split.rounded_to_point = true;
+        return point;
+    }
+    split.selected_point = available_bytes;
+    return available_bytes;
+}
 
 // The split, in one place. Default reproduces the rule that was here before, to the byte:
 //   pool = free - (kv + 1 GiB safety), floored at zero.
@@ -112,19 +223,38 @@ inline DeviceSplit plan_device_split(std::size_t free_bytes, std::size_t kv_need
         return split;
     }
     const auto pledged = split.kv_bytes + split.safety_bytes;
-    split.pool_bytes   = free_bytes > pledged ? free_bytes - pledged : 0;
+    const auto available = free_bytes > pledged ? free_bytes - pledged : 0;
+    split.pool_bytes   = select_pool_bytes(available, split);
+    split.decided_by   = split.rounded_to_point ? "curve point" : "curve: affordable";
     return split;
 }
 
 inline void report_device_split(const DeviceSplit& split, std::size_t free_bytes) {
     constexpr double kMib = 1024.0 * 1024.0;
+    const auto misses    = marginal_misses_per_gib(split.pool_bytes);
+    const auto tps       = pool_value_curve().marginal_tps_per_gib(split.pool_bytes);
+    // Zero here means "this size is outside every measured segment", not "a gigabyte is worthless".
+    // Printing 0.00 for both would turn an absence of evidence into a claim.
+    char marginal[96] = {};
+    if (misses == 0.0 && tps == 0.0) {
+        std::snprintf(marginal, sizeof(marginal), "next GiB unmeasured at this size");
+    } else {
+        std::snprintf(marginal, sizeof(marginal), "next GiB of pool worth %.2f miss/token, %.2f tok/s",
+                      misses, tps);
+    }
     std::fprintf(stderr,
                  "[budget][split] free=%.0f MiB kv=%.0f MiB pool=%.0f MiB safety=%.0f MiB by=%s | "
-                 "next GiB of pool worth %.2f miss/token\n",
+                 "%s\n",
                  static_cast<double>(free_bytes) / kMib, static_cast<double>(split.kv_bytes) / kMib,
                  static_cast<double>(split.pool_bytes) / kMib,
-                 static_cast<double>(split.safety_bytes) / kMib, split.decided_by,
-                 marginal_misses_per_gib(split.pool_bytes));
+                 static_cast<double>(split.safety_bytes) / kMib, split.decided_by, marginal);
+    if (split.rounded_to_point) {
+        std::fprintf(stderr,
+                     "[budget][split] rounded %.0f MiB down onto the measured %.0f MiB point: a "
+                     "partial gigabyte above a point is not itself a measurement\n",
+                     static_cast<double>(free_bytes - split.kv_bytes - split.safety_bytes) / kMib,
+                     static_cast<double>(split.selected_point) / kMib);
+    }
     std::fflush(stderr);
 }
 

@@ -164,6 +164,10 @@ public:
     // either way, because the cache is an accelerator and not a dependency.
     bool attach_checkpoint_cache();
     [[nodiscard]] bool has_checkpoint_cache() const noexcept { return checkpoint_cache_ != nullptr; }
+    // Q64: stop the cache's writer (if it has one) without destroying the service. Idempotent; the
+    // destructor calls it too, so an explicit call is a verification entry point, not a second
+    // lifecycle.
+    void stop_checkpoint_cache();
 
 private:
     enum class CacheParticipation : std::uint8_t {

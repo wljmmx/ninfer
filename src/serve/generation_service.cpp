@@ -259,18 +259,22 @@ public:
         write_cv_.notify_one();
     }
 
-    ~LmcacheBackend() override {
+    // Q64: the explicit exit. This is the same body the destructor used to run inline; the only
+    // change is that it is now reachable without ending the process, which is what verifying
+    // "writer stopped" required. Draining is still not attempted: a stopped writer drops its last
+    // queued writes by design, and the counters say how many.
+    void stop() override {
         std::size_t pending = 0;
         {
             std::lock_guard<std::mutex> guard(write_mutex_);
+            if (write_stop_) { return; }
             pending     = writes_.size();
             write_stop_ = true;
         }
         write_cv_.notify_all();
         if (writer_.joinable()) { writer_.join(); }
-        // Printed once, at exit, because a writer that silently lost its last writes looks exactly
-        // like a cache that had nothing to say. Draining is not attempted: the process is going away
-        // and a miss on the next run is cheaper than a shutdown that hangs.
+        // Printed once, on the way out: a writer that silently lost its last writes looks exactly
+        // like a cache that had nothing to say.
         if (async_write_ && (written_ != 0 || dropped_writes_ != 0 || pending != 0)) {
             std::fprintf(stderr, "[lmcache] writer stopped: written=%llu dropped=%llu pending=%llu\n",
                          static_cast<unsigned long long>(written_),
@@ -279,6 +283,8 @@ public:
             std::fflush(stderr);
         }
     }
+
+    ~LmcacheBackend() override { stop(); }
 
     struct Job {
         std::vector<TokenId> tokens;
@@ -423,7 +429,16 @@ struct GenerationService::CheckpointCache {
 struct GenerationService::CheckpointCache {};
 #endif
 
-GenerationService::~GenerationService() = default;
+GenerationService::~GenerationService() {
+    stop_checkpoint_cache();
+    checkpoint_cache_.reset();
+}
+
+void GenerationService::stop_checkpoint_cache() {
+#if NINFER_HAVE_LMCACHE
+    if (checkpoint_cache_ && checkpoint_cache_->backend) { checkpoint_cache_->backend->stop(); }
+#endif
+}
 
 bool GenerationService::attach_checkpoint_cache() {
 #if !NINFER_HAVE_LMCACHE
