@@ -620,15 +620,20 @@ std::vector<std::uint64_t> bank_generation;
         if (!enabled || count == 0 || file_reader == nullptr) { return nullptr; }
         const auto bank = banks[0];
         if (bank >= files.size()) { return nullptr; }
+        const bool trace = std::getenv("NINFER_UPLOAD_TIMING") != nullptr;
         std::uint32_t file_index = 0;
         std::uint64_t lo         = ~std::uint64_t{0};
         std::uint64_t hi         = 0;
         for (std::size_t i = 0; i < count; ++i) {
-            if (banks[i] != bank || experts[i] >= files[bank].experts.size()) { return nullptr; }
+            if (banks[i] != bank || experts[i] >= files[bank].experts.size()) {
+                if (trace) { std::fprintf(stderr, "[cover] reject: bank/expert i=%zu\n", i); }
+                return nullptr;
+            }
             for (const auto& chunk : files[bank].experts[experts[i]].chunks) {
                 if (i == 0) {
                     file_index = chunk.file_index;
                 } else if (chunk.file_index != file_index) {
+                    if (trace) { std::fprintf(stderr, "[cover] reject: file_index mix\n"); }
                     return nullptr;
                 }
                 lo = std::min(lo, chunk.file_offset);
@@ -636,7 +641,26 @@ std::vector<std::uint64_t> bank_generation;
             }
         }
         constexpr std::uint64_t kMaxCover = 64ULL << 20;
-        if (hi <= lo || hi - lo > kMaxCover) { return nullptr; }
+        // The point of a cover is that its bytes are the members' bytes. A range that also spans
+        // everything between two experts reads - and copies - the whole gap, so the test is
+        // contiguity, not just size: the covering range may not exceed what the members need by more
+        // than a small slack. This is also the fuse-vs-e2 dispatch, measured rather than declared -
+        // a fused bank's experts are adjacent runs and pass, an e2 bank's are separate objects spread
+        // across the file and fail it in one comparison.
+        constexpr std::uint64_t kCoverSlack = 1ULL << 20;
+        std::uint64_t sum = 0;
+        for (std::size_t i = 0; i < count; ++i) {
+            for (const auto& chunk : files[bank].experts[experts[i]].chunks) { sum += chunk.bytes; }
+        }
+        if (hi <= lo || hi - lo > kMaxCover || hi - lo > sum + kCoverSlack) {
+            if (trace) {
+                std::fprintf(stderr, "[cover] reject: range lo=%llu hi=%llu need=%llu\n",
+                             static_cast<unsigned long long>(lo),
+                             static_cast<unsigned long long>(hi),
+                             static_cast<unsigned long long>(sum));
+            }
+            return nullptr;
+        }
         const auto bytes = static_cast<std::size_t>(hi - lo);
         if (!cover || cover->size() < bytes) {
             cover      = std::make_unique<PinnedHostBuffer>(bytes);
@@ -645,6 +669,7 @@ std::vector<std::uint64_t> bank_generation;
         if (!file_reader->read_range(
                 file_index, lo,
                 {static_cast<std::byte*>(cover->data()), bytes})) {
+            if (trace) { std::fprintf(stderr, "[cover] reject: read_range false\n"); }
             return nullptr;
         }
         ++stat_cover_reads;
