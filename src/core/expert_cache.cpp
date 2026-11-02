@@ -120,6 +120,15 @@ struct ExpertCache::Impl {
     // narrower window than that cannot hold one step's route and would thrash.
     static constexpr std::uint64_t kMinimumHotSet = 8;
     std::size_t max_entry_bytes               = 0;
+    // port (sm_89): Q60. A coalesced turn reads the range that covers its keys once, into pinned
+    // memory, and then hands each expert's slices to the batch straight from there - no staging ring
+    // position, no second copy, one open/seek instead of one per expert. Sized on first use and kept:
+    // a layer pays for this forty times a token, so reallocating per turn is the one thing that would
+    // make the coalesced form slower than the per-expert one.
+    std::unique_ptr<PinnedHostBuffer> cover;
+    std::uint64_t cover_bytes    = 0;
+    std::uint64_t stat_coalesced = 0;
+    std::uint64_t stat_cover_reads = 0;
     std::unique_ptr<PinnedHostBuffer> staging;
     // Ring cursor for the slots above, and one event per slot recording when that slot's copy was
     // queued. Before a slot is reused its event is waited on, which is the only ordering the ring
@@ -597,8 +606,57 @@ std::vector<std::uint64_t> bank_generation;
         return live_bytes();
     }
 
+    // port (sm_89): Q60. Read the range that covers this turn's keys once, into pinned memory.
+    //
+    // The shape of the turn decides whether that is possible: the keys must be one bank and one
+    // object (a fused artifact keeps a layer's experts in a few contiguous runs of one object, an e2
+    // artifact gives each expert its own), the covering range must be bounded, and the reader must be
+    // able to answer a byte range at all. Anything else returns null and the caller takes the
+    // per-expert path it has always taken - so a run without the switch, or on a source that cannot
+    // coalesce, behaves exactly as before.
+    const std::byte* cover_for(const std::uint32_t* banks, const std::uint32_t* experts,
+                               std::size_t count, std::uint64_t& lo_out, std::uint64_t& end_out) {
+        static const bool enabled = std::getenv("NINFER_UPLOAD_COALESCE") != nullptr;
+        if (!enabled || count == 0 || file_reader == nullptr) { return nullptr; }
+        const auto bank = banks[0];
+        if (bank >= files.size()) { return nullptr; }
+        std::uint32_t file_index = 0;
+        std::uint64_t lo         = ~std::uint64_t{0};
+        std::uint64_t hi         = 0;
+        for (std::size_t i = 0; i < count; ++i) {
+            if (banks[i] != bank || experts[i] >= files[bank].experts.size()) { return nullptr; }
+            for (const auto& chunk : files[bank].experts[experts[i]].chunks) {
+                if (i == 0) {
+                    file_index = chunk.file_index;
+                } else if (chunk.file_index != file_index) {
+                    return nullptr;
+                }
+                lo = std::min(lo, chunk.file_offset);
+                hi = std::max(hi, chunk.file_offset + chunk.bytes);
+            }
+        }
+        constexpr std::uint64_t kMaxCover = 64ULL << 20;
+        if (hi <= lo || hi - lo > kMaxCover) { return nullptr; }
+        const auto bytes = static_cast<std::size_t>(hi - lo);
+        if (!cover || cover->size() < bytes) {
+            cover      = std::make_unique<PinnedHostBuffer>(bytes);
+            cover_bytes = hi - lo;
+        }
+        if (!file_reader->read_range(
+                file_index, lo,
+                {static_cast<std::byte*>(cover->data()), bytes})) {
+            return nullptr;
+        }
+        ++stat_cover_reads;
+        lo_out  = lo;
+        end_out = hi;
+        return static_cast<const std::byte*>(cover->data());
+    }
+
     void upload_one(ExpertCacheKey key, cudaStream_t stream, bool settle = true,
-                    std::size_t staging_slot = 0, std::vector<UploadOp>* batch = nullptr) {
+                    std::size_t staging_slot = 0, std::vector<UploadOp>* batch = nullptr,
+                    const std::byte* cover_base = nullptr, std::uint64_t cover_lo = 0,
+                    std::uint64_t cover_end = 0) {
         const auto& bank = banks[key.bank];
         auto& entry = entries[index(key)];
         const auto slot = slot_of[key.bank][key.expert];
@@ -746,6 +804,33 @@ std::vector<std::uint64_t> bank_generation;
                     }
                 }
             } else {
+                // port (sm_89): Q60. If this turn's cover was read in one go, the expert's slices are
+                // already in pinned memory: name them and let the batch copy from there. Every chunk
+                // has to lie inside the cover, or the bytes would be someone else's - so the test is
+                // per chunk, not per expert.
+                if (cover_base != nullptr && batch != nullptr) {
+                    bool covered = !file->chunks.empty();
+                    for (const auto& chunk : file->chunks) {
+                        if (chunk.file_offset < cover_lo ||
+                            chunk.bytes > cover_end - chunk.file_offset) {
+                            covered = false;
+                            break;
+                        }
+                    }
+                    if (covered) {
+                        for (const auto& chunk : file->chunks) {
+                            ++stat_push;
+                            batch->push_back({base + chunk.image_offset,
+                                              cover_base + (chunk.file_offset - cover_lo),
+                                              chunk.bytes});
+                        }
+                        entry.ready    = true;
+                        entry.last_use = ++epoch;
+                        ++uploads;
+                        ++stat_coalesced;
+                        return;
+                    }
+                }
                 // The artifact is the source: one fetch into staging, one copy to the pool.
                 if (!staging || file->image_bytes > max_entry_bytes ||
                     staging->size() < (staging_slot + 1) * max_entry_bytes) {
@@ -910,16 +995,38 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
     std::size_t staged = 0;
     auto& batch = impl_->upload_ops;
     batch.clear();
-    for (const auto& key : impl_->required) {
-        const auto& entry = impl_->entries[impl_->index(key)];
-        if (entry.ready) { continue; }
-        if (staged == Impl::kUploadBatch) { break; }
-        // The ring position persists across turns: a staged image stays valid until its slot comes
-        // round again, which is what lets the copies stay in flight between layers.
-        impl_->upload_one(key, stream, false,
-                          impl_->staging_cursor % Impl::kStagingRing, &batch);
-        ++impl_->staging_cursor;
-        ++staged;
+    {
+        // port (sm_89): Q60. Which keys this turn takes is decided before anything is read, because
+        // the coalesced form needs all of them: a range that covers four experts is one read, a range
+        // that covers one is the read it always was.
+        std::uint32_t pick_bank[Impl::kUploadBatch];
+        std::uint32_t pick_expert[Impl::kUploadBatch];
+        std::size_t pick_staging[Impl::kUploadBatch];
+        std::size_t picked = 0;
+        static const bool group_by_bank = std::getenv("NINFER_UPLOAD_COALESCE") != nullptr;
+        for (auto it = impl_->required.begin(); it != impl_->required.end(); ++it) {
+            const auto& candidate = impl_->entries[impl_->index(*it)];
+            if (candidate.ready) { continue; }
+            if (picked == Impl::kUploadBatch) { break; }
+            // A coalesced turn has to be one bank: the cover is a byte range of one object, so a
+            // mixed turn cannot be covered. Grouping costs nothing when the switch is off, and when
+            // it is on the turn simply takes what the first key's bank has pending.
+            if (picked != 0 && group_by_bank && it->bank != pick_bank[0]) { continue; }
+            pick_bank[picked]    = it->bank;
+            pick_expert[picked]  = it->expert;
+            pick_staging[picked] = impl_->staging_cursor % Impl::kStagingRing;
+            ++impl_->staging_cursor;
+            ++picked;
+        }
+        std::uint64_t cover_lo = 0, cover_end = 0;
+        const std::byte* cover_base =
+            picked == 0 ? nullptr
+                        : impl_->cover_for(pick_bank, pick_expert, picked, cover_lo, cover_end);
+        for (std::size_t i = 0; i < picked; ++i) {
+            impl_->upload_one({pick_bank[i], pick_expert[i]}, stream, false, pick_staging[i], &batch,
+                              cover_base, cover_lo, cover_end);
+            ++staged;
+        }
     }
     const auto collect_begin = std::chrono::steady_clock::now();
     if (staged == 0) { return {0, true}; }
@@ -1015,6 +1122,11 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
         static std::uint64_t seen_push = 0;
         const auto push_delta = impl_->stat_push - seen_push;
         seen_push             = impl_->stat_push;
+        // Q60: how much of the turn the coalesced form actually covered - one read for how many
+        // experts. Without this the switch "working" and the switch "never firing" look the same.
+        static std::uint64_t seen_coalesced = 0;
+        const auto coalesced_delta          = impl_->stat_coalesced - seen_coalesced;
+        seen_coalesced                      = impl_->stat_coalesced;
         acc[3] += static_cast<double>(direct_delta);
         acc[4] += static_cast<double>(staged_delta);
         acc[5] += static_cast<double>(views_delta);
@@ -1031,6 +1143,12 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
                          acc[0] / 40.0, acc[1] / 40.0, acc[6] / 40.0,
                          acc[2] / 40.0 / 1048576.0, acc[3] / 40.0, acc[4] / 40.0, acc[5] / 40.0);
             std::fprintf(stderr, "[upload] arena=%.1f experts per uploading call\n", acc_arena / 40.0);
+            // Q60: experts answered from a cover read, per uploading call. A number that stays at
+            // zero while the switch is on says the turn's keys were not one bank - which is a fact
+            // about the picker, not about the reader.
+            std::fprintf(stderr, "[upload] coalesced=%.1f experts/call cover_reads=%llu\n",
+                         static_cast<double>(coalesced_delta) / 40.0,
+                         static_cast<unsigned long long>(impl_->stat_cover_reads));
             // Raw values for the call being reported: if these two disagree while the averages
             // above do, the disagreement is in the accumulation and not in the upload itself.
             std::fprintf(stderr,
