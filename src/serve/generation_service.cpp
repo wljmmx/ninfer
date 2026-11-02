@@ -195,22 +195,18 @@ public:
         // (a shorter capture), and a frontier that disagrees with the page count produces an address
         // whose coverage and pages do not line up -- that is wrong data, not a miss. Page count and
         // frontier computed from the same number cannot disagree.
-        const std::size_t chunks = kv.size() / chunk_bytes_total;
-        out.frontier = static_cast<std::uint32_t>(chunks * chunk_tokens_);
+        // Q64 2d-2b-4: the same arithmetic the store side uses, from the same header. The restore side
+        // used to re-derive the frontier from the byte count and re-do the page rounding by hand, which
+        // is how "coverage" could mean 384 here and 467 there in one build.
+        const auto plan = ninfer::core::lmcache::plan_restore(
+            kv.size(), valid_tokens, object->tail.size(), chunk_bytes_total, chunk_tokens_,
+            page_bytes_, page_tokens_);
+        if (plan.chunks == 0) { return std::nullopt; }
+        out.frontier = static_cast<std::uint32_t>(plan.frontier);
         out.kv_bytes = std::move(kv);
-        // L7-b: put the carried tail back on the end of the KV run, truncated to the pages the real
-        // length needs -- ceil(valid_tokens / page_tokens) in total, which is
-        // chunks * pages_per_chunk + ceil(tail_tokens / page_tokens) because the frontier is
-        // chunk-aligned. The tail has to fit the region the object reserved for it; anything longer
-        // means the header and the payload disagree, and importing it would commit pages of padding.
-        if (valid_tokens > out.frontier) {
-            const std::size_t tail_tokens = valid_tokens - out.frontier;
-            const std::size_t tail_pages  = (tail_tokens + page_tokens_ - 1) / page_tokens_;
-            const std::size_t tail_bytes  = tail_pages * page_bytes_;
-            if (tail_bytes > object->tail.size()) { return std::nullopt; }
-            const auto tail = object->tail.first(tail_bytes);
+        if (plan.tail_pages != 0) {
+            const auto tail = object->tail.first(plan.tail_pages * page_bytes_);
             out.kv_bytes.insert(out.kv_bytes.end(), tail.begin(), tail.end());
-            out.frontier = valid_tokens;
         }
         out.valid_tokens = valid_tokens;
         // One element: the image travels whole (v6 1n). The sharded layout exists for transport
