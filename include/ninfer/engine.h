@@ -123,6 +123,13 @@ public:
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     [[nodiscard]] bool is_available() const;
 
+    // 13.4: runtime pool resize. Only legal while the engine is idle: an expert window a running
+    // layer is addressing cannot be unmapped, and a captured graph froze the window offsets. The
+    // call synchronizes the device after checking both, and returns the capacity actually reached
+    // (whole windows only). Throws when the engine is not idle, when a graph pinned the pool, or
+    // when the target cannot be met; it never silently shrinks below the current windows.
+    std::uint64_t resize_expert_pool(std::uint64_t target_bytes);
+
     void reset_memory_peaks() noexcept;
 
 private:

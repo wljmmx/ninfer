@@ -365,6 +365,16 @@ void ProgramImpl::publish_capture(ContextTransaction& tx) {
                                           static_cast<std::uint32_t>(prompt_ids.size())};
         if (const auto kv = export_checkpoint(handle)) {
             if (const auto state_export = export_state(handle)) {
+                if (std::getenv("NINFER_KVT_DEBUG") != nullptr) {
+                    std::fprintf(stderr,
+                                 "[kvt-debug] store request_frontier=%u kv_frontier=%u pages=%u "
+                                 "state_valid=%u state_bytes=%llu prompt=%zu\n",
+                                 tx.reuse_frontier, kv->frontier, kv->page_count,
+                                 state_export->valid_tokens,
+                                 static_cast<unsigned long long>(state_export->image_bytes),
+                                 request.base->prompt->token_ids.size());
+                    std::fflush(stderr);
+                }
                 if (tier_store_export(*kv_tier, key, *kv, *state_export)) {
                     std::fprintf(stderr,
                                  "[kvt] stored key=%016llx/%u frontier=%u pages=%u bytes=%zu\n",

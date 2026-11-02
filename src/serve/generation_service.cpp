@@ -11,6 +11,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -174,7 +175,15 @@ public:
         // Device copies) without saying how much of it is the cache.
         const auto fetch_started = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> guard(bridge_mutex_);
-        if (!bridge_->restore(key, &kv, &state)) { return std::nullopt; }
+        ++fetches_;
+        if (!bridge_->restore(key, &kv, &state)) {
+            // Q70/13.4: the first half of the hit-rate shutdown. A lookup that reached the bridge
+            // and came back empty is a miss; an early return above is not counted, because it never
+            // asked.
+            ++misses_;
+            return std::nullopt;
+        }
+        ++hits_;
         const double fetch_seconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - fetch_started).count();
         std::fprintf(stderr, "[lmcache] fetch %zu KV byte(s) + %zu state byte(s) in %.3f s\n",
@@ -206,6 +215,14 @@ public:
         const auto plan = ninfer::core::lmcache::plan_restore(
             kv.size(), valid_tokens, object->tail.size(), chunk_bytes_total, chunk_tokens_,
             page_bytes_, page_tokens_);
+        if (std::getenv("NINFER_KVT_DEBUG") != nullptr) {
+            std::fprintf(stderr,
+                         "[kvt-debug] restore prompt=%zu valid=%u kv_bytes=%zu chunks=%zu "
+                         "frontier=%zu tail_pages=%zu tail_bytes=%zu page=%zu\n",
+                         prompt_tokens.size(), valid_tokens, kv.size(), plan.chunks, plan.frontier,
+                         plan.tail_pages, object->tail.size(), page_bytes_);
+            std::fflush(stderr);
+        }
         if (plan.chunks == 0) { return std::nullopt; }
         out.frontier = static_cast<std::uint32_t>(plan.frontier);
         out.kv_bytes = std::move(kv);
@@ -234,7 +251,27 @@ public:
     void store(std::span<const TokenId> prompt_tokens,
                const ninfer::CachedCheckpoint& checkpoint) override {
         if (!ready_.load() || bridge_ == nullptr || prompt_tokens.empty()) { return; }
+        if (write_disabled_.load(std::memory_order_relaxed)) { return; }
         if (checkpoint.page_bytes == 0 || checkpoint.kv_bytes.empty()) { return; }
+        ++stores_;
+        // Q70/13.4: the second half of the hit-rate shutdown. A write costs bytes and a round trip;
+        // it only pays if something reads it back. Eight lookups with zero restores is not a ratio
+        // threshold, it is the state "this process has never been served by the cache"; continuing
+        // to fill it in that state is cost with no measured return. The switch is opt-in so the
+        // default cache still fills before its first reader arrives.
+        if (std::getenv("NINFER_LMCACHE_AUTO_OFF") != nullptr && fetches_.load() >= 8 &&
+            hits_.load() == 0) {
+            bool expected = false;
+            if (write_disabled_.compare_exchange_strong(expected, true)) {
+                std::fprintf(stderr,
+                             "[lmcache] writes disabled: %llu fetch(es), 0 hit(s), %llu store(s) - "
+                             "the cache has never answered a lookup\n",
+                             static_cast<unsigned long long>(fetches_.load()),
+                             static_cast<unsigned long long>(stores_.load()));
+                std::fflush(stderr);
+            }
+            return;
+        }
         std::call_once(writer_once_, [this] {
             // Read once, at the first store: a cache either writes behind the request or in front of
             // it, and flipping mid-run would make the two indistinguishable in a log.
@@ -280,6 +317,11 @@ public:
                          static_cast<unsigned long long>(written_),
                          static_cast<unsigned long long>(dropped_writes_),
                          static_cast<unsigned long long>(pending));
+            std::fprintf(stderr, "[lmcache] lookups fetches=%llu hits=%llu misses=%llu stores=%llu\n",
+                         static_cast<unsigned long long>(fetches_.load()),
+                         static_cast<unsigned long long>(hits_.load()),
+                         static_cast<unsigned long long>(misses_.load()),
+                         static_cast<unsigned long long>(stores_.load()));
             std::fflush(stderr);
         }
     }
@@ -408,6 +450,13 @@ private:
     bool async_write_  = false;
     std::uint64_t written_        = 0;
     std::uint64_t dropped_writes_ = 0;
+    // 13.4: what the cache was asked and what it returned, so "stop writing" is a decision about
+    // this process's traffic instead of a timer.
+    std::atomic<std::uint64_t> fetches_{0};
+    std::atomic<std::uint64_t> hits_{0};
+    std::atomic<std::uint64_t> misses_{0};
+    std::atomic<std::uint64_t> stores_{0};
+    std::atomic<bool> write_disabled_{false};
     std::atomic<bool> ready_{false};
     std::atomic<std::uint64_t> sequence_{0};
     std::size_t page_bytes_ = 0;

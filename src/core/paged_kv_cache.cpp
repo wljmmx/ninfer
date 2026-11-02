@@ -796,12 +796,23 @@ DeviceKVPagePool::copy_host_pages(std::span<const DeviceKVPageHandle> pages,
                           std::size_t host_pitch, std::size_t width, std::size_t height) {
         if (use_batch) {
             cudaMemcpy3DBatchOp op{};
+            // Q66: the batch form was written for D2H and then used for both directions, so an H2D
+            // batch copied device -> host: the destination pages were never filled and the freshly
+            // imported Host bytes were zeroed. The direction is per-operation; name it here instead
+            // of assuming the one the first caller happened to need.
             op.src.type             = cudaMemcpyOperandTypePointer;
-            op.src.op.ptr.ptr       = device_base;
-            op.src.op.ptr.rowLength = device_pitch;
             op.dst.type             = cudaMemcpyOperandTypePointer;
-            op.dst.op.ptr.ptr = const_cast<void*>(static_cast<const void*>(host_base));
-            op.dst.op.ptr.rowLength = host_pitch;
+            if constexpr (ToHost) {
+                op.src.op.ptr.ptr       = device_base;
+                op.src.op.ptr.rowLength = device_pitch;
+                op.dst.op.ptr.ptr       = const_cast<void*>(static_cast<const void*>(host_base));
+                op.dst.op.ptr.rowLength = host_pitch;
+            } else {
+                op.src.op.ptr.ptr       = const_cast<void*>(static_cast<const void*>(host_base));
+                op.src.op.ptr.rowLength = host_pitch;
+                op.dst.op.ptr.ptr       = device_base;
+                op.dst.op.ptr.rowLength = device_pitch;
+            }
             op.extent               = make_cudaExtent(width, height, 1);
             op.srcAccessOrder       = cudaMemcpySrcAccessOrderStream;
             op.flags                = 0;

@@ -48,11 +48,18 @@ std::optional<CheckpointExport> ProgramImpl::export_checkpoint(CheckpointHandle 
         // a Host extent and then copied down. Prefer the Host copy when it exists: the Device path
         // borrows a temporary extent, and prepare() refuses a page that is already Host-resident,
         // so taking the Device branch first would fail on a page that has perfectly good bytes.
-        if (index == 0) {
-            std::fprintf(stderr, "[ckpt] export page0: host=%d device=%d spilled=%d\n",
-                         text_kv_pages->host_resident(page) ? 1 : 0,
-                         text_kv_pages->device_resident(page) ? 1 : 0,
+        if (index == 0 && std::getenv("NINFER_KVT_DEBUG") != nullptr) {
+            const bool hosted = text_kv_pages->host_resident(page);
+            std::fprintf(stderr, "[ckpt] export page0: host=%d device=%d spilled=%d",
+                         hosted ? 1 : 0, text_kv_pages->device_resident(page) ? 1 : 0,
                          text_kv_pages->spilled(page) ? 1 : 0);
+            if (hosted) {
+                const auto replica = text_kv_pages->host_replica(page);
+                std::fprintf(stderr, " off=%u cols=%u epoch=%llu", replica.page_offset,
+                             replica.committed_columns,
+                             static_cast<unsigned long long>(replica.content_epoch));
+            }
+            std::fprintf(stderr, "\n");
         }
         if (text_kv_pages->host_resident(page)) {
             const auto view = host_kv_extents->page_view(*text_kv_pages, page);

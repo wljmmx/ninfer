@@ -179,10 +179,27 @@ std::optional<TierSource> ProgramImpl::import_checkpoint_source(
             return std::nullopt;
         }
         std::memcpy(view.data(), kv.kv_bytes.data(), expected);
+        if (std::getenv("NINFER_KVT_DEBUG") != nullptr) {
+            std::fprintf(stderr,
+                         "[kvt-debug] import write view=%p first=%02x last=%02x expected=%zu "
+                         "stride=%zu pages=%u\n",
+                         static_cast<const void*>(view.data()),
+                         static_cast<unsigned>(view.data()[0]),
+                         static_cast<unsigned>(view.data()[expected - 1]), expected,
+                         host_kv_extents->page_layout(*text_kv_pages).page_stride, kv.page_count);
+            std::fflush(stderr);
+        }
         // No diagnostics here. There was a pair of fprintf calls printing the first byte before and
         // after publish while the byte-for-byte mismatch was being chased; they belong to that
         // investigation, not to every restore, and they printed payload bytes into the server log.
         published = host_kv_extents->publish(std::move(*reservation));
+        if (std::getenv("NINFER_KVT_DEBUG") != nullptr) {
+            const auto check = host_kv_extents->page_view(*text_kv_pages, pages.front());
+            std::fprintf(stderr, "[kvt-debug] import publish: view=%d first=%02x\n",
+                         check ? 1 : 0,
+                         check && check->valid() ? static_cast<unsigned>(check->data()[0]) : 0u);
+            std::fflush(stderr);
+        }
 
         // The Device replicas reserved in step 2 exist but hold nothing: every byte went into the Host
         // extent. Two consequences, and they have to be fixed together:
@@ -218,6 +235,12 @@ std::optional<TierSource> ProgramImpl::import_checkpoint_source(
             return std::nullopt;
         }
     }
+    if (std::getenv("NINFER_KVT_DEBUG") != nullptr) {
+        const auto check = host_kv_extents->page_view(*text_kv_pages, pages.front());
+        std::fprintf(stderr, "[kvt-debug] after device copy: view=%d first=%02x\n", check ? 1 : 0,
+                     check && check->valid() ? static_cast<unsigned>(check->data()[0]) : 0u);
+        std::fflush(stderr);
+    }
     // From here on, a failure has to give back the published extent and the pages behind it. The
     // pages come with their Device leases, so one release per page covers both tiers.
     const auto rollback = [&]() {
@@ -244,7 +267,25 @@ std::optional<TierSource> ProgramImpl::import_checkpoint_source(
     // inactive twin does the same work here: it also fills each page's committed_columns, which
     // materialize() left at 0 -- without that the pages look empty to anything reading coverage, and
     // the protection below would refuse a frontier above zero.
+    if (std::getenv("NINFER_KVT_DEBUG") != nullptr) {
+        const auto check = host_kv_extents->page_view(*text_kv_pages, pages.front());
+        std::fprintf(stderr, "[kvt-debug] before commit: view=%d first=%02x\n", check ? 1 : 0,
+                     check && check->valid() ? static_cast<unsigned>(check->data()[0]) : 0u);
+        std::fflush(stderr);
+    }
     text_kv_addresses->commit_inactive_frontier(*address, kv.frontier);
+    if (std::getenv("NINFER_KVT_DEBUG") != nullptr) {
+        std::fprintf(stderr, "[kvt-debug] import adopt: addr_page0_is_first=%d host=%d\n",
+                     text_kv_addresses->logical_page(*address, 0) == pages.front() ? 1 : 0,
+                     text_kv_pages->host_resident(pages.front()) ? 1 : 0);
+        std::fflush(stderr);
+    }
+    if (std::getenv("NINFER_KVT_DEBUG") != nullptr) {
+        const auto check = host_kv_extents->page_view(*text_kv_pages, pages.front());
+        std::fprintf(stderr, "[kvt-debug] after commit: view=%d first=%02x\n", check ? 1 : 0,
+                     check && check->valid() ? static_cast<unsigned>(check->data()[0]) : 0u);
+        std::fflush(stderr);
+    }
     // port (sm_89): a record restored from the third tier is NOT protected here.
     //
     // The requirement exists so a checkpoint a request is still using cannot be evicted. For an
@@ -280,6 +321,13 @@ std::optional<TierSource> ProgramImpl::import_checkpoint_source(
         if (text_kv_pages->writer_references(page) != 0) {
             text_kv_pages->set_writer(page, false);
         }
+    }
+
+    if (std::getenv("NINFER_KVT_DEBUG") != nullptr) {
+        const auto check = host_kv_extents->page_view(*text_kv_pages, pages.front());
+        std::fprintf(stderr, "[kvt-debug] after refs/writer: view=%d first=%02x\n", check ? 1 : 0,
+                     check && check->valid() ? static_cast<unsigned>(check->data()[0]) : 0u);
+        std::fflush(stderr);
     }
 
     if (!pin_pages) {

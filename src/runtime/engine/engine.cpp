@@ -422,6 +422,29 @@ RuntimeStats Engine::runtime_stats() const {
         impl_->core);
 }
 
+std::uint64_t Engine::resize_expert_pool(std::uint64_t target_bytes) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    const RuntimeStats stats = runtime_stats();
+    const std::uint64_t busy = static_cast<std::uint64_t>(stats.running_requests) +
+                               stats.prefilling_requests + stats.decode_ready_requests +
+                               stats.waiting_requests + stats.paused_requests +
+                               stats.replaying_requests + stats.materializing_requests +
+                               stats.capture_pending_requests + stats.terminal_pending_requests;
+    if (busy != 0) {
+        throw std::logic_error("expert pool resize requires an idle engine");
+    }
+    // The counters are read from the scheduler, but a worker may be between a unit and the counter
+    // update. Synchronize first, then re-read: a request that started during the sync is the one
+    // this second check refuses.
+    impl_->device.synchronize();
+    const RuntimeStats again = runtime_stats();
+    if (again.running_requests != 0 || again.waiting_requests != 0 || again.paused_requests != 0 ||
+        again.prefilling_requests != 0 || again.decode_ready_requests != 0) {
+        throw std::logic_error("expert pool resize lost its idle window");
+    }
+    return impl_->active->resize_expert_pool(target_bytes);
+}
+
 bool Engine::is_available() const {
     if (impl_ == nullptr) { return false; }
     return std::visit(

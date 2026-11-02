@@ -456,8 +456,11 @@ public:
     }
 
     // Q53: where the admitted cold slots currently end, so the panel can say whether the region is
-    // full (a full region is the only state in which admission is a comparison).
-    [[nodiscard]] std::uint32_t cold_used() const noexcept { return cold_used_; }
+    // full (a full region is the only state in which admission is a comparison). A promoted slot is
+    // returned to the region, not leaked: without that the region shrinks by one every promotion.
+    [[nodiscard]] std::uint32_t cold_used() const noexcept {
+        return cold_used_ - static_cast<std::uint32_t>(cold_free_.size());
+    }
 
     // port (sm_89): the read-ahead's entry point. Same fill, but every slot it claims is marked, so
     // that when the layer later routes to that expert the hit can be attributed to the read-ahead
@@ -928,7 +931,10 @@ private:
                                   ? scores[expert]
                                   : 0.0F;
         std::uint32_t target = kNone;
-        if (cold_used_ < cold_slots_) {
+        if (!cold_free_.empty()) {
+            target = cold_free_.back();
+            cold_free_.pop_back();
+        } else if (cold_used_ < cold_slots_) {
             target = routed_capacity_ + cold_used_++;
         } else {
             float coldest = std::numeric_limits<float>::max();
@@ -1010,6 +1016,7 @@ private:
         prefetched_[target]    = 0;
         slot_bank_[from]       = kNone;
         slot_expert_[from]     = kNone;
+        cold_free_.push_back(from);
         state_[bank.index].slot_of[expert] = target;
         ++stats_.cold_promotions;
         return target;
@@ -1115,6 +1122,9 @@ private:
     // only a comparison once it is full.
     std::uint32_t cold_slots_ = 0;
     std::uint32_t cold_used_  = 0;
+    // Slots a promotion handed back. Reused before the bump pointer so a promotion does not shrink
+    // the region by one slot forever.
+    std::vector<std::uint32_t> cold_free_;
     // Q53: each bank's decayed route scores, registered by its stream. Borrowed pointers; see
     // score_of(). kMaxBanks is the same bound the bank ids already carry.
     std::array<const float*, 64> score_bank_{};
