@@ -8,6 +8,7 @@
 #include "runtime/engine/causal_score_core.h"
 #include "runtime/engine/engine_core.h"
 #include "runtime/engine/model_instance.h"
+#include "runtime/engine/slo_admission.h"
 
 #include <algorithm>
 #include <limits>
@@ -185,6 +186,9 @@ public:
     std::unique_ptr<runtime::ModelInstance> active;
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;
+    // 13.4: admission is the only place that can refuse before a queue entry exists. Off unless
+    // NINFER_SLO_TTFT_MS / _TOTAL_MS / _MAX_WAITING names a budget.
+    runtime::SloAdmission slo = runtime::SloAdmission::from_env();
     Core core;
 };
 
@@ -304,6 +308,17 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
         throw RequestError(
             RequestErrorKind::ContextLengthExceeded,
             context_capacity_error(prompt_summary.prompt_tokens, impl_->options.max_context));
+    }
+    // 13.4: SLO admission. The counters are sampled here rather than in a background thread: a
+    // process with no traffic has no service rate to estimate, and its last rate is the best one.
+    if (impl_->slo.enabled()) {
+        const auto reason =
+            impl_->slo.check(prompt_summary.prompt_tokens,
+                             resolved_options.execution.requested_output_tokens, runtime_stats());
+        if (reason) {
+            impl_->slo.note_refusal();
+            throw RequestError(RequestErrorKind::Overloaded, "SLO admission: " + *reason);
+        }
     }
     const double prepare_seconds = prompt.impl_->prepare.seconds;
     if (resolved_options.execution.requested_output_tokens == 0) {
@@ -443,6 +458,27 @@ std::uint64_t Engine::resize_expert_pool(std::uint64_t target_bytes) {
         throw std::logic_error("expert pool resize lost its idle window");
     }
     return impl_->active->resize_expert_pool(target_bytes);
+}
+
+std::uint32_t Engine::resize_kv_pages(std::uint32_t target_pages) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (target_pages == 0) { throw std::invalid_argument("KV page target must be positive"); }
+    const RuntimeStats stats = runtime_stats();
+    const std::uint64_t busy = static_cast<std::uint64_t>(stats.running_requests) +
+                               stats.prefilling_requests + stats.decode_ready_requests +
+                               stats.waiting_requests + stats.paused_requests +
+                               stats.replaying_requests + stats.materializing_requests +
+                               stats.capture_pending_requests + stats.terminal_pending_requests;
+    if (busy != 0) { throw std::logic_error("KV pool resize requires an idle engine"); }
+    // Same two-read window as the expert pool: a request that started during the synchronize is the
+    // one the second check refuses.
+    impl_->device.synchronize();
+    const RuntimeStats again = runtime_stats();
+    if (again.running_requests != 0 || again.waiting_requests != 0 || again.paused_requests != 0 ||
+        again.prefilling_requests != 0 || again.decode_ready_requests != 0) {
+        throw std::logic_error("KV pool resize lost its idle window");
+    }
+    return impl_->active->resize_kv_capacity(target_pages);
 }
 
 bool Engine::is_available() const {

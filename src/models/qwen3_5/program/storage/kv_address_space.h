@@ -191,7 +191,27 @@ public:
         return static_cast<std::uint32_t>(addresses_.size());
     }
 
+    [[nodiscard]] std::uint32_t page_capacity() const noexcept { return page_capacity_; }
+
     [[nodiscard]] std::uint32_t occupied() const noexcept { return capacity() - free_count_; }
+
+    // 13.4: the per-address page bound is part of the KV half's capacity. Lowering it is legal only
+    // when no address still owns more pages than the new edge; a retained checkpoint above it is an
+    // owner, not slack, so the shrink is refused rather than truncated.
+    [[nodiscard]] bool can_shrink_page_capacity(std::uint32_t target_pages) const noexcept {
+        if (target_pages == 0 || target_pages > page_capacity_) { return false; }
+        for (const Address& address : addresses_) {
+            if (address.occupied && address.page_count > target_pages) { return false; }
+        }
+        return true;
+    }
+
+    void shrink_page_capacity(std::uint32_t target_pages) {
+        if (!can_shrink_page_capacity(target_pages)) {
+            throw std::logic_error("KV address space shrink has an owner above the new edge");
+        }
+        page_capacity_ = target_pages;
+    }
 
     [[nodiscard]] std::optional<KVAddressSpaceHandle>
     create_active(std::uint32_t growth_pages, std::int32_t execution_row, cudaStream_t stream) {

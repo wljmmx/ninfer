@@ -5,6 +5,7 @@
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/expert_stream.h"
 #include "models/qwen3_5/execution/mtp.h"
+#include "models/qwen3_5/execution/shape_class.h"
 #include "models/qwen3_5/execution/workspace.h"
 
 #include "core/nvtx.h"
@@ -757,7 +758,33 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
         ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, hidden, stream);
-        project(hidden, *lm_head_, logits, work_, stream);
+        // Q67: zero-weight scratch rows for the row-independent output projection. The class width
+        // is the compiled shape; the extra rows read zero hidden and their logits are never sampled.
+        // This is deliberately the first absorption site, not the whole batch: attention and the
+        // recurrent state still run at the real width until the batch container owns scratch KV and
+        // state rows (S1). Off by default, and real rows are copied, so values are unchanged.
+        static const bool pad_class = [] {
+            const char* value = std::getenv("NINFER_PAD_CLASS");
+            return value != nullptr && *value != '\0' && std::strtol(value, nullptr, 10) != 0;
+        }();
+        const std::int32_t width = pad_class ? decode_class_for(batch) : batch;
+        if (width > batch) {
+            Tensor padded_hidden = work_.alloc(DType::BF16, {dimension(config_.hidden_size), width});
+            CUDA_CHECK(cudaMemsetAsync(padded_hidden.data, 0, padded_hidden.bytes(), stream));
+            CUDA_CHECK(cudaMemcpy2DAsync(padded_hidden.data, padded_hidden.nb[1], hidden.data,
+                                         hidden.nb[1], hidden.bytes() / static_cast<std::size_t>(batch),
+                                         static_cast<std::size_t>(batch), cudaMemcpyDeviceToDevice,
+                                         stream));
+            Tensor padded_logits = work_.alloc(DType::BF16, {dimension(config_.vocab_size), width});
+            project(padded_hidden, *lm_head_, padded_logits, work_, stream);
+            CUDA_CHECK(cudaMemcpy2DAsync(logits.data, logits.nb[1], padded_logits.data,
+                                         padded_logits.nb[1],
+                                         logits.bytes() / static_cast<std::size_t>(batch),
+                                         static_cast<std::size_t>(batch), cudaMemcpyDeviceToDevice,
+                                         stream));
+        } else {
+            project(hidden, *lm_head_, logits, work_, stream);
+        }
     }
     work_.reset();
 }

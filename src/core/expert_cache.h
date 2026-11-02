@@ -118,6 +118,22 @@ void prepare(std::span<const ExpertCacheKey> required, cudaStream_t stream = nul
     bool set_resident_experts(std::uint32_t bank, std::span<const std::uint32_t> experts,
                               std::uint32_t hot_count = UINT32_MAX);
 
+    // Q20: the Device chose an expert and a ring slot; the host has already copied the bytes. This
+    // adopts that pair as residency without assigning a slot of its own and without queueing an
+    // upload. A slot previously owned by another expert is released to the shared free list, so a
+    // ring that rotates every layer does not leak. Returns false when the pair cannot be represented
+    // (out of range, or the slot belongs to the prediction region).
+    bool adopt_resident_slot(std::uint32_t bank, std::uint32_t expert, std::uint32_t slot);
+
+    // Q20: a fixed-S ring per bank, taken out of the shared free list once. The ring slots have
+    // stable ids, which is what lets the Device name a destination without the host choosing it.
+    // Without this reservation, "ring slot 3" is just a position in a list and its address belongs
+    // to whichever expert the allocator put there.
+    void configure_ring(std::uint32_t bank, std::uint32_t slots);
+    [[nodiscard]] std::uint32_t ring_slot_count(std::uint32_t bank) const noexcept;
+    [[nodiscard]] std::optional<std::uint32_t> ring_slot(std::uint32_t bank,
+                                                         std::uint32_t index) const noexcept;
+
     // A1: the two generations, split. `hot_generation` moves only when the hot segment's membership
     // does; `step_generation` moves whenever the whole set does. A publisher that keeps its Device
     // tables in two segments compares each against its own counter, which is what lets an

@@ -35,6 +35,7 @@ namespace {
 
 std::uint64_t host_expert_arena_bytes(std::uint64_t want_bytes);
 std::uint64_t readahead_bytes(std::span<const ExpertBankLayout> banks);
+std::uint64_t second_chance_budget_bytes(std::span<const ExpertBankLayout> banks);
 using Clock = std::chrono::steady_clock;
 
 // port (sm_89): a sentinel that asks the engine to size the expert pool from free device memory.
@@ -243,8 +244,14 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     // is computed exactly as before (working-set estimate, RAM share, explicit override), so this
     // step is behaviour-neutral; what changes is that the amount is now accounted and printed
     // beside the other two tiers instead of being decided in isolation.
-    std::uint64_t host_arena_bytes =
-        host_expert_arena_bytes(host_want) + readahead_bytes(requirements.banks);
+    // 13.4/Q53: the warm tier is three budgets, not one arena with auxiliaries carved out of it.
+    // Routed is granted first; prefetch and the second-chance band get what is left. Enabling either
+    // auxiliary therefore cannot shrink the routed working set - the failure mode that made "more
+    // cache" mean "less warm tier".
+    const auto routed_bytes        = host_expert_arena_bytes(host_want);
+    const auto prefetch_bytes      = readahead_bytes(requirements.banks);
+    const auto second_chance_ask = second_chance_budget_bytes(requirements.banks);
+    const auto host_ask            = routed_bytes + prefetch_bytes + second_chance_ask;
     // port (sm_89): Q51 - the two levels of budget meet the three-tier ledger here, and a refusal
     // is a number instead of silence.
     //
@@ -275,32 +282,50 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     // partition is what the scheduler grants, and a module may not widen it on its own. The override
     // exists so a caller can grant less - and then the arena is what actually shrinks, rather than
     // the ledger being told a smaller number than the arena takes.
-    std::uint64_t host_cap = host_arena_bytes;
+    std::uint64_t host_cap = host_ask;
     if (const char* value = std::getenv("NINFER_BUDGET_RAM_MB"); value != nullptr && *value != '\0') {
         const auto pinned = static_cast<std::uint64_t>(std::strtoull(value, nullptr, 10)) << 20;
         if (pinned != 0 && pinned < host_cap) { host_cap = pinned; }
     }
     instance.ledger.set_cap(core::Tier::Host, host_cap);
-    if (!admit(core::Tier::Host, "expert-warm", host_arena_bytes)) {
-        const auto granted = host_cap - instance.ledger.used(core::Tier::Host);
+    // Routed first, then prefetch, then the second-chance band. A tight cap drops the auxiliaries
+    // before it touches the working set; it never takes a routed slot to pay for a cache.
+    const std::uint64_t grant_routed = std::min(routed_bytes, host_cap);
+    std::uint64_t remaining          = host_cap - grant_routed;
+    const std::uint64_t grant_prefetch = std::min(prefetch_bytes, remaining);
+    remaining -= grant_prefetch;
+    const std::uint64_t grant_second_chance = std::min(second_chance_ask, remaining);
+    const std::uint64_t host_arena_bytes =
+        grant_routed + grant_prefetch + grant_second_chance;
+    if (host_arena_bytes != host_ask) {
         std::fprintf(stderr,
-                     "[ledger] expert-warm lowered %llu -> %llu MiB to fit the %llu MiB grant\n",
+                     "[ledger] warm lowered %llu -> %llu MiB (routed %llu, prefetch %llu, "
+                     "second-chance %llu)\n",
+                     static_cast<unsigned long long>(host_ask >> 20),
                      static_cast<unsigned long long>(host_arena_bytes >> 20),
-                     static_cast<unsigned long long>(granted >> 20),
-                     static_cast<unsigned long long>(host_cap >> 20));
+                     static_cast<unsigned long long>(grant_routed >> 20),
+                     static_cast<unsigned long long>(grant_prefetch >> 20),
+                     static_cast<unsigned long long>(grant_second_chance >> 20));
         std::fflush(stderr);
-        host_arena_bytes = granted;
-        (void)admit(core::Tier::Host, "expert-warm", host_arena_bytes);
+    }
+    (void)admit(core::Tier::Host, "expert-warm", grant_routed);
+    if (grant_prefetch != 0) { (void)admit(core::Tier::Host, "expert-prefetch", grant_prefetch); }
+    if (grant_second_chance != 0) {
+        (void)admit(core::Tier::Host, "expert-second-chance", grant_second_chance);
     }
     std::fprintf(stderr,
                  "[experts] banks=%zu slot=%llu windows=%llu pool=%lluMiB host=%d arena=%lluMiB "
-                 "want=%lluMiB top_k=%u kept=%llu layer=%llu\n",
+                 "(routed=%llu prefetch=%llu second-chance=%llu) want=%lluMiB top_k=%u kept=%llu "
+                 "layer=%llu\n",
                  streams.size(),
                  static_cast<unsigned long long>(instance.expert_cache->slot_bytes()),
                  static_cast<unsigned long long>(instance.expert_cache->windows()),
                  static_cast<unsigned long long>(instance.expert_cache->capacity_bytes() >> 20),
                  int(instance.expert_host_source != nullptr),
                  static_cast<unsigned long long>(host_arena_bytes >> 20),
+                 static_cast<unsigned long long>(grant_routed >> 20),
+                 static_cast<unsigned long long>(grant_prefetch >> 20),
+                 static_cast<unsigned long long>(grant_second_chance >> 20),
                  static_cast<unsigned long long>(host_want >> 20), routed_top_k,
                  static_cast<unsigned long long>(host_kept),
                  static_cast<unsigned long long>(host_layer));
@@ -344,7 +369,11 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
                              streams[i]->per_expert_objects()});
         }
         auto residency = std::make_shared<models::qwen3_5::execution::HostExpertResidency>(
-            descs, files, source, host_arena_bytes);
+            descs, files, source,
+            models::qwen3_5::execution::HostWarmBudget{
+                .routed_bytes = grant_routed,
+                .prefetch_bytes = grant_prefetch,
+                .second_chance_bytes = grant_second_chance});
         for (std::size_t i = 0; i < streams.size(); ++i) {
             streams[i]->attach_host(residency);
         }
@@ -450,6 +479,12 @@ std::uint64_t readahead_bytes(std::span<const ExpertBankLayout> banks) {
     std::uint64_t widest = 0;
     for (const auto& bank : banks) { widest = std::max(widest, bank.entry_bytes); }
     return models::qwen3_5::execution::HostExpertResidency::prefetch_bytes_for(widest);
+}
+
+std::uint64_t second_chance_budget_bytes(std::span<const ExpertBankLayout> banks) {
+    std::uint64_t widest = 0;
+    for (const auto& bank : banks) { widest = std::max(widest, bank.entry_bytes); }
+    return models::qwen3_5::execution::HostExpertResidency::second_chance_bytes_for(widest);
 }
 
 // Host-side arena for experts the Device pool cannot hold. It takes what the caller says the host
@@ -611,6 +646,17 @@ std::uint64_t ModelInstance::resize_expert_pool(std::uint64_t target_bytes) {
 
 std::uint64_t ModelInstance::expert_pool_capacity() const noexcept {
     return expert_cache ? expert_cache->capacity_bytes() : 0;
+}
+
+std::uint32_t ModelInstance::resize_kv_capacity(std::uint32_t target_pages) {
+    if (!program) { return 0; }
+    const auto after = program->resize_kv_capacity(target_pages);
+    if (const char* debug = std::getenv("NINFER_KV_DEBUG"); debug != nullptr && *debug) {
+        std::fprintf(stderr, "[kv-pool] capacity -> %u page(s) (target %u)\n", after,
+                     target_pages);
+        std::fflush(stderr);
+    }
+    return after;
 }
 
 namespace {

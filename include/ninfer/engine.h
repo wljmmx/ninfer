@@ -130,6 +130,13 @@ public:
     // when the target cannot be met; it never silently shrinks below the current windows.
     std::uint64_t resize_expert_pool(std::uint64_t target_bytes);
 
+    // 13.4: the KV half of runtime resize. Same idle-window contract as the expert pool, and the
+    // same refusal style: a retained checkpoint that owns pages above the new edge is an owner, not
+    // slack, so the call throws instead of invalidating it. The physical driver reservation is not
+    // returned (the VMM block stays mapped); the capacity, the free list and the address bound move.
+    // Returns the capacity in pages (64 tokens each) actually in effect.
+    std::uint32_t resize_kv_pages(std::uint32_t target_pages);
+
     void reset_memory_peaks() noexcept;
 
 private:

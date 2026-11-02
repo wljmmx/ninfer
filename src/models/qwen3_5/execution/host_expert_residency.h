@@ -42,6 +42,17 @@ struct HostExpertBankDesc {
     bool per_expert = false;
 };
 
+// The warm tier's three budgets, in bytes and kept apart. They used to be one arena with the
+// auxiliary ranges carved out of the routed range, so enabling prefetch or the second-chance band
+// silently took routed slots away - the pool got smaller exactly when a cache was added. Each range
+// now has its own grant: the caller reserves these separately (and routed first), and this class
+// only gives each its own slots. A range that is not granted is zero; it never borrows from routed.
+struct HostWarmBudget {
+    std::uint64_t routed_bytes        = 0;
+    std::uint64_t prefetch_bytes      = 0;
+    std::uint64_t second_chance_bytes = 0;
+};
+
 // The host half of a split expert tier. It reserves one arena up front, commits it slot by slot,
 // and holds one uniform slot per expert using the same entry image the Device pool stores. A slot
 // is evicted coldest-first when the arena fills, so RAM holds what fits and everything else keeps
@@ -54,48 +65,30 @@ class HostExpertResidency final : public HostResidency, public ExpertArenaSource
 public:
     HostExpertResidency(std::span<const HostExpertBankDesc> banks,
                         std::span<const ExpertFileBank> files, const ExpertBlobReader* reader,
-                        std::uint64_t arena_bytes)
-        : banks_(banks.begin(), banks.end()), files_(files.begin(), files.end()), reader_(reader),
-          arena_bytes_(arena_bytes) {
+                        HostWarmBudget budget)
+        : banks_(banks.begin(), banks.end()), files_(files.begin(), files.end()), reader_(reader) {
         std::uint64_t widest = 0;
         for (const auto& bank : banks_) {
             widest = std::max(widest, bank.entry.entry_bytes);
         }
         slot_bytes_ = slot_bytes_for(widest);
-        arena_bytes_ = std::max(arena_bytes_, slot_bytes_);
-        // port (sm_89): R3. The read-ahead gets slots of its own, carved out of the end of the
-        // arena. Shared slots made the mechanism untestable: a layer routes 320 experts through a
-        // 496-slot tier, so anything the read-ahead filled was evicted by the next layer's own
-        // routes before it could pay - the prefetch measured zero hits for a reason that had
-        // nothing to do with its selection. Reserved only when the read-ahead is on, so a default
-        // run allocates exactly what it did before.
-        prefetch_slots_ = prefetch_slots_from_env();
-        // Carved out of the budget the caller granted, not added to it: the caller asks the ledger
-        // for `prefetch_bytes_for()` on top and passes the total, so the RAM that R3 uses is the
-        // RAM that was accounted. Adding it here as well counted it twice (930 -> 1410 MiB).
-        slot_capacity_ = static_cast<std::uint32_t>(arena_bytes_ / slot_bytes_);
-        if (prefetch_slots_ > slot_capacity_) { prefetch_slots_ = slot_capacity_; }
-        routed_capacity_ = slot_capacity_ - prefetch_slots_;
-        // port (sm_89): Q53 - the warm tier is a partition with two densities, not one pool.
-        //
-        // Until now a routed expert that lost its slot was simply dropped: the next route to it paid
-        // a full artifact read. The eviction signal is exactly "this was hot and is not any more",
-        // which is a weak form of "it may come back" - so it goes to a cold region instead of out of
-        // the arena, and a route that lands there is a memcpy rather than a read. The cold region is
-        // carved out of the routed range, so a default run (no cold slots) allocates exactly what it
-        // did before, and the region is FIFO by construction (round robin over its own slots).
-        //
-        // A cold hit promotes back into the routed range while it has room: that is the whole policy
-        // - keep what keeps being asked for, and let the rest age out through the cold region. Sizing
-        // the region is tuning; wiring it is this.
-        cold_slots_ = cold_slots_from_env();
-        if (cold_slots_ > routed_capacity_ / 2) { cold_slots_ = routed_capacity_ / 2; }
-        routed_capacity_ -= cold_slots_;
-        if (cold_slots_ != 0) {
+        const auto slots_for = [this](std::uint64_t bytes) {
+            return static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                bytes / slot_bytes_, std::numeric_limits<std::uint32_t>::max()));
+        };
+        // Routed is the primary range and is granted first by the caller. Prefetch and the
+        // second-chance band get their own bytes; they are not subtracted from routed here.
+        routed_capacity_ = slots_for(budget.routed_bytes);
+        prefetch_slots_  = slots_for(budget.prefetch_bytes);
+        second_chance_slots_      = slots_for(budget.second_chance_bytes);
+        if (routed_capacity_ == 0) { routed_capacity_ = 1; } // a warm tier with no routed slot is inert
+        slot_capacity_ = routed_capacity_ + prefetch_slots_ + second_chance_slots_;
+        arena_bytes_   = static_cast<std::uint64_t>(slot_capacity_) * slot_bytes_;
+        if (second_chance_slots_ != 0) {
             std::fprintf(stderr,
-                         "[warm] cold region slots=%u (routed=%u read-ahead=%u) - evicted experts "
-                         "stay addressable as RAM copies\n",
-                         cold_slots_, routed_capacity_, prefetch_slots_);
+                         "[warm] second-chance band slots=%u (routed=%u read-ahead=%u) - its own "
+                         "budget, not taken from routed\n",
+                         second_chance_slots_, routed_capacity_, prefetch_slots_);
             std::fflush(stderr);
         }
         slot_bank_.assign(slot_capacity_, kNone);
@@ -417,12 +410,15 @@ public:
         }
         return 128;
     }
-    // port (sm_89): Q53's cold region. Zero by default, because a region that changes where an
+    // port (sm_89): Q53's second-chance band. Zero by default, because a region that changes where an
     // evicted expert goes changes the split path's read behaviour, and this is wiring: the switch has
     // to be measurable against a run without it.
-    static std::uint32_t cold_slots_from_env() {
-        if (const char* value = std::getenv("NINFER_WARM_COLD_SLOTS");
-            value != nullptr && *value != '\0') {
+    static std::uint32_t second_chance_slots_from_env() {
+        const char* value = std::getenv("NINFER_WARM_SECOND_CHANCE_SLOTS");
+        // v8 renamed the band; keep the old spelling as an input alias so recorded experiments are
+        // still runnable, but never print the old name as if it were the current one.
+        if (value == nullptr || *value == '\0') { value = std::getenv("NINFER_WARM_COLD_SLOTS"); }
+        if (value != nullptr && *value != '\0') {
             return static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
         }
         return 0;
@@ -430,6 +426,11 @@ public:
     // Bytes those slots add to the arena, so the ledger can be told before the arena exists.
     static std::uint64_t prefetch_bytes_for(std::uint64_t entry_bytes) {
         return std::uint64_t{prefetch_slots_from_env()} * slot_bytes_for(entry_bytes);
+    }
+    // Q53: the second-chance band asks for its own bytes now. Zero unless NINFER_WARM_SECOND_CHANCE_SLOTS
+    // says otherwise; the caller reserves it separately and never subtracts it from routed.
+    static std::uint64_t second_chance_bytes_for(std::uint64_t entry_bytes) {
+        return std::uint64_t{second_chance_slots_from_env()} * slot_bytes_for(entry_bytes);
     }
 
     void ensure(ExpertBankId bank, std::span<const std::int32_t> experts,
@@ -442,8 +443,8 @@ public:
     }
 
     // Q53: the ranked fill. `scores` is this bank's decayed route score (one float per expert), the
-    // same number the Device-side placement ranks by. The cold region's admission uses it to answer
-    // "is the expert being evicted hotter than the one that would lose its cold slot"; without it
+    // same number the Device-side placement ranks by. The second-chance band's admission uses it to answer
+    // "is the expert being evicted hotter than the one that would lose its second-chance slot"; without it
     // the region is the old "eviction is admission" rule, which measured +33% ens / -29% tps.
     //
     // The pointer is borrowed for the duration of the call and is stable for the bank's life (the
@@ -455,11 +456,11 @@ public:
         fill_locked(bank, experts, nullptr, /*prefetch=*/false, scores);
     }
 
-    // Q53: where the admitted cold slots currently end, so the panel can say whether the region is
+    // Q53: where the admitted second-chance slots currently end, so the panel can say whether the region is
     // full (a full region is the only state in which admission is a comparison). A promoted slot is
     // returned to the region, not leaked: without that the region shrinks by one every promotion.
-    [[nodiscard]] std::uint32_t cold_used() const noexcept {
-        return cold_used_ - static_cast<std::uint32_t>(cold_free_.size());
+    [[nodiscard]] std::uint32_t second_chance_used() const noexcept {
+        return second_chance_used_ - static_cast<std::uint32_t>(second_chance_free_.size());
     }
 
     // port (sm_89): the read-ahead's entry point. Same fill, but every slot it claims is marked, so
@@ -584,13 +585,13 @@ public:
                     prefetched_[slot] = 0;
                     ++prefetch_hits_;
                 }
-                // port (sm_89): Q53. A route that lands in the cold region is still a hit - the bytes
+                // port (sm_89): Q53. A route that lands in the second-chance band is still a hit - the bytes
                 // are in RAM - and if the routed range has room it earns its way back: that is the
                 // "按概率分区" half, admission by repeated demand instead of by first contact.
-                if (cold_slots_ != 0 && slot >= routed_capacity_ &&
-                    slot < routed_capacity_ + cold_slots_) {
-                    ++stats_.cold_hits;
-                    slot = promote_cold(bank, expert, slot);
+                if (second_chance_slots_ != 0 && slot >= routed_capacity_ &&
+                    slot < routed_capacity_ + second_chance_slots_) {
+                    ++stats_.second_chance_hits;
+                    slot = promote_second_chance(bank, expert, slot);
                 }
             }
             slot_last_use_[slot] = ++epoch_;
@@ -753,13 +754,13 @@ public:
         std::uint64_t warmed_bytes = 0;
         std::uint64_t memcpy_hits  = 0;
         std::uint64_t warm_skips   = 0; // asked to warm an expert that is already warm
-        // Q53: what the cold region did. `cold_admissions` are evictions that became a copy instead
-        // of a drop, `cold_hits` are routes answered from it, `cold_promotions` are the ones that
+        // Q53: what the second-chance band did. `second_chance_admissions` are evictions that became a copy instead
+        // of a drop, `second_chance_hits` are routes answered from it, `second_chance_promotions` are the ones that
         // earned their way back into the routed range.
-        std::uint64_t cold_admissions = 0;
-        std::uint64_t cold_declines   = 0; // evictions the ranking refused to keep
-        std::uint64_t cold_hits       = 0;
-        std::uint64_t cold_promotions = 0;
+        std::uint64_t second_chance_admissions = 0;
+        std::uint64_t second_chance_declines   = 0; // evictions the ranking refused to keep
+        std::uint64_t second_chance_hits       = 0;
+        std::uint64_t second_chance_promotions = 0;
     };
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
 
@@ -859,15 +860,14 @@ private:
 #endif
     }
 
-    // port (sm_89): three ranges, one arena - routed [0, routed_capacity_), cold [routed, cold_end),
-    // read-ahead [cold_end, slot_capacity_). They are carved apart so nothing can evict what another
-    // range just filled: with one shared range a layer's 320 routes evicted the read-ahead's fill
-    // before it could pay, and the prefetch reported zero hits for a reason that had nothing to do
-    // with its selection.
+    // port (sm_89): three ranges, one arena - routed [0, routed_capacity_), second-chance
+    // [routed, second_chance_end), read-ahead [second_chance_end, slot_capacity_). Each range has
+    // its own budget, so nothing can evict what another range just filled and no auxiliary range can
+    // take a routed slot.
     std::uint32_t claim(std::uint32_t bank, std::uint32_t expert, bool prefetch,
                         const float* scores) {
-        const std::uint32_t cold_end = routed_capacity_ + cold_slots_;
-        const std::uint32_t begin    = prefetch ? cold_end : 0;
+        const std::uint32_t second_chance_end = routed_capacity_ + second_chance_slots_;
+        const std::uint32_t begin    = prefetch ? second_chance_end : 0;
         const std::uint32_t end      = prefetch ? slot_capacity_ : routed_capacity_;
         std::uint32_t& used       = prefetch ? used_prefetch_ : used_;
         if (used < end - begin) {
@@ -899,10 +899,11 @@ private:
         if (coldest == 0) { throw std::runtime_error("host expert arena: nothing to evict"); }
         ++stats_.evictions;
         // port (sm_89): Q53. The victim's bytes are still the expert that owned them, and that
-        // expert was hot a moment ago - so it goes to the cold region (a memcpy inside RAM) instead
-        // of out of the arena. When the region is off this is the old behaviour exactly: the mapping
-        // is cleared and the slot is handed to the newcomer.
-        if (!demote_cold(victim, scores)) {
+        // expert was hot a moment ago - so it moves to the warm tier's second-chance band (a memcpy
+        // inside the same pinned arena) instead of leaving the arena. The band has its own budget;
+        // it never takes a routed slot. When the band is off this is the old behaviour exactly: the
+        // mapping is cleared and the slot is handed to the newcomer.
+        if (!demote_second_chance(victim, scores)) {
             state_[slot_bank_[victim]].slot_of[slot_expert_[victim]] = kNone;
         }
         prefetched_[victim]  = 0; // the slot now holds another expert, so the mark dies with it
@@ -911,19 +912,20 @@ private:
         return victim;
     }
 
-    // port (sm_89): Q53, the two movements of the partition. `demote_cold` runs inside claim(), on a
-    // slot that has already been chosen as a victim; `promote_cold` runs on a cold hit while the
-    // routed range still has room. Both are copies inside the arena - no artifact read, no upload.
+    // port (sm_89): Q53, the two movements of the second-chance band. `demote_second_chance` runs inside
+    // claim(), on a slot that has already been chosen as a victim; `promote_second_chance` runs on a band hit
+    // while the routed range still has room. Both are copies inside the arena - no artifact read,
+    // no upload - and neither changes the band's budget: a promoted slot goes to `second_chance_free_`.
     //
-    // Q53 second take: admission is a comparison, not "eviction means cold". Measured with the
-    // previous rule, the region was a net loss (+33% ens, -29% tps): it kept every evicted expert,
+    // Q53 second take: admission is a comparison, not "eviction means second chance". Measured with the
+    // previous rule, the band was a net loss (+33% ens, -29% tps): it kept every evicted expert,
     // including the ones the ranking had just decided were not worth a routed slot, and the copy
     // displaced an expert that had been asked for more recently. The region now admits an evicted
     // expert only when its decayed score beats the coldest score already in the region; otherwise
     // the eviction is a drop, exactly as it was before the region existed. With `scores == nullptr`
     // (a caller that does not rank) the old mechanical rule is the fallback.
-    bool demote_cold(std::uint32_t slot, const float* scores) {
-        if (cold_slots_ == 0 || slot >= routed_capacity_) { return false; }
+    bool demote_second_chance(std::uint32_t slot, const float* scores) {
+        if (second_chance_slots_ == 0 || slot >= routed_capacity_) { return false; }
         const auto bank   = slot_bank_[slot];
         const auto expert = slot_expert_[slot];
         if (bank == kNone || expert == kNone) { return false; }
@@ -931,15 +933,15 @@ private:
                                   ? scores[expert]
                                   : 0.0F;
         std::uint32_t target = kNone;
-        if (!cold_free_.empty()) {
-            target = cold_free_.back();
-            cold_free_.pop_back();
-        } else if (cold_used_ < cold_slots_) {
-            target = routed_capacity_ + cold_used_++;
+        if (!second_chance_free_.empty()) {
+            target = second_chance_free_.back();
+            second_chance_free_.pop_back();
+        } else if (second_chance_used_ < second_chance_slots_) {
+            target = routed_capacity_ + second_chance_used_++;
         } else {
             float coldest = std::numeric_limits<float>::max();
             for (std::uint32_t candidate = routed_capacity_;
-                 candidate < routed_capacity_ + cold_slots_; ++candidate) {
+                 candidate < routed_capacity_ + second_chance_slots_; ++candidate) {
                 if (slot_bank_[candidate] == kNone || in_flight_[candidate] != 0 ||
                     device_held_[candidate] != 0 || device_held_prev_[candidate] != 0) {
                     continue;
@@ -959,7 +961,7 @@ private:
             // Strictly hotter. A tie is not evidence that the newcomer is worth displacing what is
             // already there, and the score is decayed, so an unused expert sinks on its own.
             if (scores != nullptr && incoming <= coldest) {
-                ++stats_.cold_declines;
+                ++stats_.second_chance_declines;
                 return false;
             }
         }
@@ -979,11 +981,11 @@ private:
         slot_last_use_[target] = slot_last_use_[slot];
         prefetched_[target]    = 0;
         state_[bank].slot_of[expert] = target;
-        ++stats_.cold_admissions;
+        ++stats_.second_chance_admissions;
         return true;
     }
 
-    // The score of an expert whose bank is not the one being filled. The cold region is shared, so
+    // The score of an expert whose bank is not the one being filled. The second-chance band is shared, so
     // an admission may compare this bank's evictee against another bank's occupant; the score
     // vectors are per bank and owned by the streams, which keep them alive for the process.
     [[nodiscard]] float score_of(std::uint32_t bank, std::uint32_t expert) const noexcept {
@@ -1003,7 +1005,7 @@ public:
     }
 private:
 
-    std::uint32_t promote_cold(ExpertBankId bank, std::uint32_t expert, std::uint32_t from) {
+    std::uint32_t promote_second_chance(ExpertBankId bank, std::uint32_t expert, std::uint32_t from) {
         if (slot_bank_.empty() || used_ >= routed_capacity_) { return from; }
         const auto target = used_++;
         auto* base        = arena();
@@ -1016,9 +1018,9 @@ private:
         prefetched_[target]    = 0;
         slot_bank_[from]       = kNone;
         slot_expert_[from]     = kNone;
-        cold_free_.push_back(from);
+        second_chance_free_.push_back(from);
         state_[bank.index].slot_of[expert] = target;
-        ++stats_.cold_promotions;
+        ++stats_.second_chance_promotions;
         return target;
     }
 
@@ -1117,14 +1119,14 @@ private:
     std::uint32_t routed_capacity_ = 0;
     std::uint32_t prefetch_slots_  = 0;
     std::uint32_t used_prefetch_   = 0;
-    // Q53: the cold region sits between the routed range and the read-ahead's, and `cold_used_` is
+    // Q53: the second-chance band sits between the routed range and the read-ahead's, and `second_chance_used_` is
     // how many of its slots have ever been filled - the region is a fixed-size set, and admission is
     // only a comparison once it is full.
-    std::uint32_t cold_slots_ = 0;
-    std::uint32_t cold_used_  = 0;
+    std::uint32_t second_chance_slots_ = 0;
+    std::uint32_t second_chance_used_  = 0;
     // Slots a promotion handed back. Reused before the bump pointer so a promotion does not shrink
     // the region by one slot forever.
-    std::vector<std::uint32_t> cold_free_;
+    std::vector<std::uint32_t> second_chance_free_;
     // Q53: each bank's decayed route scores, registered by its stream. Borrowed pointers; see
     // score_of(). kMaxBanks is the same bound the bank ids already carry.
     std::array<const float*, 64> score_bank_{};

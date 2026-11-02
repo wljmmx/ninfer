@@ -232,6 +232,11 @@ public:
     [[nodiscard]] std::uint32_t allocated_pages() const noexcept;
     [[nodiscard]] std::uint32_t reserved_pages() const noexcept;
     [[nodiscard]] std::uint32_t available_pages() const noexcept;
+    // 13.4: runtime shrink. Lowers the usable capacity; pages above `target` must be free, and the
+    // request is refused (not partially applied) otherwise. Physical backing stays mapped - the
+    // driver reservation is not returned - so this is an admission-control shrink, and growing back
+    // is possible as long as no page above the new capacity was reused.
+    [[nodiscard]] std::uint32_t shrink_capacity(std::uint32_t target_pages);
     [[nodiscard]] std::size_t plane_count() const noexcept;
     [[nodiscard]] const Tensor& plane(std::size_t index) const;
 

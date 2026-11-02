@@ -176,6 +176,36 @@ PhysicalUsageSnapshot ProgramImpl::physical_usage() const noexcept {
     return out;
 }
 
+std::uint32_t ProgramImpl::resize_kv_capacity(std::uint32_t target_pages) {
+    if (!text_kv_pages || !text_kv_addresses) { return 0; }
+    if (context_transaction_ || pending_transaction_) {
+        throw std::logic_error("KV capacity cannot change during a context transaction");
+    }
+    for (const auto& sequence : sequences) {
+        if (sequence.kv) {
+            throw std::logic_error("KV capacity cannot change while a sequence holds an address");
+        }
+    }
+    DeviceKVPagePool& pool = text_kv_pages->physical_pool();
+    const std::uint32_t current = pool.capacity_pages();
+    if (target_pages >= current) { return current; }
+    if (target_pages == 0) {
+        throw std::invalid_argument("KV capacity target must be positive");
+    }
+    // Validate the address-space half before the pool changes: a retained checkpoint whose
+    // directory reaches above the new edge is an owner, and truncating the pool under it would turn
+    // that checkpoint into an address with missing pages.
+    const std::uint32_t address_target =
+        std::min(target_pages, text_kv_addresses->page_capacity());
+    if (!text_kv_addresses->can_shrink_page_capacity(address_target)) {
+        throw std::logic_error(
+            "KV capacity shrink refused: a retained checkpoint owns pages above the target");
+    }
+    const std::uint32_t after = pool.shrink_capacity(target_pages);
+    text_kv_addresses->shrink_page_capacity(address_target);
+    return after;
+}
+
 PrefixShortlistKey ProgramImpl::checkpoint_key(CheckpointHandle handle,
                                                std::uint32_t frontier) const {
     const auto& record = checkpoint(handle);

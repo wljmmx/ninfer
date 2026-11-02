@@ -374,6 +374,48 @@ TransferWork DeviceKVPagePool::device_copy_work(std::uint32_t pages) const {
 
 std::uint32_t DeviceKVPagePool::capacity_pages() const noexcept { return spec_.page_group_count; }
 
+std::uint32_t DeviceKVPagePool::shrink_capacity(std::uint32_t target_pages) {
+    const std::uint32_t current = capacity_pages();
+    if (target_pages >= current) { return current; }
+    if (target_pages == 0) {
+        throw std::invalid_argument("Paged KV shrink target must be positive");
+    }
+    // A page that is allocated or reserved above the new edge has an owner that will still address
+    // it. Refusing here is the difference between a capacity change and two owners of one page.
+    if (static_cast<std::uint64_t>(allocated_pages_) + reserved_pages_ > target_pages) {
+        throw std::logic_error("Paged KV shrink refused: " +
+                               std::to_string(allocated_pages_) + " allocated + " +
+                               std::to_string(reserved_pages_) + " reserved > target " +
+                               std::to_string(target_pages));
+    }
+    // Trim the free runs at the new edge. A run that crosses it keeps its low half; a run that
+    // starts above it disappears. Runs below the edge are untouched, so the allocator's order and
+    // its first-fit behaviour stay exactly as they were.
+    std::vector<FreePageRun> kept;
+    kept.reserve(free_page_runs_.size());
+    std::uint64_t free_pages = 0;
+    for (const auto& run : free_page_runs_) {
+        if (run.begin >= static_cast<std::int32_t>(target_pages)) { continue; }
+        FreePageRun trimmed = run;
+        const auto edge = static_cast<std::int32_t>(target_pages);
+        if (trimmed.begin + static_cast<std::int32_t>(trimmed.count) > edge) {
+            trimmed.count = static_cast<std::uint32_t>(edge - trimmed.begin);
+        }
+        if (trimmed.count == 0) { continue; }
+        free_pages += trimmed.count;
+        kept.push_back(trimmed);
+    }
+    const std::uint64_t expected = static_cast<std::uint64_t>(target_pages) - allocated_pages_;
+    if (free_pages != expected) {
+        throw std::logic_error("Paged KV shrink found an inconsistent free list (" +
+                               std::to_string(free_pages) + " free, " +
+                               std::to_string(expected) + " expected)");
+    }
+    free_page_runs_        = std::move(kept);
+    spec_.page_group_count = target_pages;
+    return target_pages;
+}
+
 std::uint32_t DeviceKVPagePool::allocated_pages() const noexcept { return allocated_pages_; }
 
 std::uint32_t DeviceKVPagePool::reserved_pages() const noexcept { return reserved_pages_; }

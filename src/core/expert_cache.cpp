@@ -211,6 +211,10 @@ std::vector<std::uint64_t> bank_generation;
     std::uint32_t prefetch_base     = 0; // region is [base, slots_live)
     std::vector<std::vector<std::uint32_t>> prefetch_owner;   // bank -> region index -> expert
     std::vector<std::uint32_t> prefetch_cursor;               // bank -> next region index to reuse
+    // Q20: fixed ring slots per bank, taken from `free_slots` by configure_ring(). `ring_slot_flag`
+    // is the global test the allocator and the publisher share.
+    std::vector<std::vector<std::uint32_t>> ring_slots;
+    std::vector<std::uint8_t> ring_slot_flag;
     int ordinal = 0;
 
     Impl(std::span<const ExpertBankSpec> specs, const ExpertCacheRequirements& req,
@@ -316,6 +320,38 @@ std::vector<std::uint64_t> bank_generation;
         }
         slot_of.resize(banks.size());
         resident_count.assign(banks.size(), 0);
+        ring_slots.resize(banks.size());
+        ring_slot_flag.assign(slots_live, 0);
+        // Q20: the fixed ring is a slice of each bank's own window, not extra capacity. Taking it
+        // after seeding failed by construction on an 8 GiB pool (106 slots/bank, 39 free in total,
+        // 8 x 40 needed), so it is taken here and the hot seed is shortened by the same amount.
+        std::uint32_t ring_per_bank = 0;
+        if (const char* enabled = std::getenv("NINFER_RING_DEVICE_ADMIT");
+            enabled != nullptr && *enabled != '\0' && std::strtol(enabled, nullptr, 10) != 0) {
+            ring_per_bank = 8;
+            if (const char* value = std::getenv("NINFER_RING_SLOTS");
+                value != nullptr && *value != '\0') {
+                ring_per_bank = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
+            }
+            ring_per_bank = std::min<std::uint32_t>(ring_per_bank, slot_cap / 2);
+        }
+        for (std::size_t b = 0; b < banks.size() && ring_per_bank != 0; ++b) {
+            if (free_slots.size() < ring_per_bank) {
+                throw std::invalid_argument("expert pool cannot reserve a ring for every bank");
+            }
+            ring_slots[b].reserve(ring_per_bank);
+            for (std::uint32_t index = 0; index < ring_per_bank; ++index) {
+                const std::uint32_t slot = free_slots.back();
+                free_slots.pop_back();
+                ring_slot_flag[slot] = 1;
+                ring_slots[b].push_back(slot);
+            }
+        }
+        if (ring_per_bank != 0) {
+            std::fprintf(stderr, "[ring] fixed slots=%u/bank (%u total), hot seed reduced\n",
+                         ring_per_bank, ring_per_bank * static_cast<std::uint32_t>(banks.size()));
+            std::fflush(stderr);
+        }
         // Q30/P6: size the prediction region BEFORE seeding and take it out of each bank's seed
         // (hot = capacity - S_p, the same shape B4 uses for the ring). Taking it from the leftovers
         // was tried first and never produced a region: the pool seeds every bank to its cap, so
@@ -325,8 +361,9 @@ std::vector<std::uint64_t> bank_generation;
             const auto room = static_cast<std::uint32_t>(slot_cap / 4);
             prefetch_per_bank = std::min(prefetch_per_bank, room);
         }
+        const std::uint32_t reserved_per_bank = prefetch_per_bank + ring_per_bank;
         const std::uint32_t seed =
-            prefetch_per_bank < slot_cap ? slot_cap - prefetch_per_bank : slot_cap;
+            reserved_per_bank < slot_cap ? slot_cap - reserved_per_bank : slot_cap;
         // port (sm_89): only the experts that fit the per-bank hint start resident. The identity
         // mapping is right when the hint holds the whole layer; a smaller hint must start with the
         // rest absent, or a stale slot index would point at another bank's expert.
@@ -405,6 +442,10 @@ std::vector<std::uint64_t> bank_generation;
         return prefetch_per_bank != 0 && slot >= prefetch_base && slot < slots_live;
     }
 
+    [[nodiscard]] bool ring_slot(std::uint32_t slot) const noexcept {
+        return slot < ring_slot_flag.size() && ring_slot_flag[slot] != 0;
+    }
+
     // Does `expert` count as a member of the bank's resident set (as opposed to a prediction)? The
     // distinction matters in set_resident: a prediction is not the hot set's to free, and it must not
     // make a step look changed when the hot set is identical.
@@ -412,7 +453,7 @@ std::vector<std::uint64_t> bank_generation;
         if (bank >= slot_of.size() || expert >= slot_of[bank].size()) { return false; }
         const auto slot = slot_of[bank][expert];
         if (slot == kAbsentSlot) { return false; }
-        return !prefetch_slot(slot);
+        return !prefetch_slot(slot) && !ring_slot(slot);
     }
 
     // Makes `experts` the bank's resident set, in list order, with the first `hot_count` entries
@@ -486,6 +527,13 @@ std::vector<std::uint64_t> bank_generation;
                 entries[first[bank] + expert].ready = false;
                 continue;
             }
+            if (ring_slot(slots[expert])) {
+                // Q20: the fixed ring owns these slots and the Device admits into them. The hot set
+                // leaving one is a mapping change, not a free.
+                slots[expert]                       = kAbsentSlot;
+                entries[first[bank] + expert].ready = false;
+                continue;
+            }
             // Leaving: hand the slot to whoever needs it next. This happens before the arrivals are
             // placed, so a swap of equal size always has the slots it is about to need.
             free_slots.push_back(slots[expert]);
@@ -513,8 +561,75 @@ std::vector<std::uint64_t> bank_generation;
     }
 
 
-    std::size_t index(ExpertCacheKey key) const {
-        if (key.bank >= banks.size() || banks[key.bank].resident ||
+    // Q20 device-side admission: the Device named the expert and the ring slot; the host copied the
+    // bytes. This makes that pair the bank's residency without a second slot assignment, and hands
+    // the slot's previous owner back to the free list.
+    bool adopt_slot(std::uint32_t bank, std::uint32_t expert, std::uint32_t slot) {
+        if (bank >= banks.size() || expert >= slot_of[bank].size() || slot >= slots_live ||
+            prefetch_slot(slot) || !ring_slot(slot)) {
+            return false;
+        }
+        // The ring is per-bank: a slot configured for another bank names bytes this bank's offset
+        // table must never address.
+        const auto& owned = ring_slots[bank];
+        if (std::find(owned.begin(), owned.end(), slot) == owned.end()) { return false; }
+        auto& slots = slot_of[bank];
+        if (slots[expert] != slot) {
+            // One slot names one expert. Clearing the old owner is what keeps the offset table from
+            // pointing two rows at the same bytes.
+            for (std::uint32_t other = 0; other < slots.size(); ++other) {
+                if (other != expert && slots[other] == slot) {
+                    slots[other]                        = kAbsentSlot;
+                    entries[first[bank] + other].ready = false;
+                }
+            }
+            if (slots[expert] != kAbsentSlot) {
+                if (!prefetch_slot(slots[expert]) && !ring_slot(slots[expert])) {
+                    free_slots.push_back(slots[expert]);
+                }
+                entries[first[bank] + expert].ready = false;
+            }
+            slots[expert]                       = slot;
+            entries[first[bank] + expert].ready = true;
+            required.erase(std::remove_if(required.begin(), required.end(),
+                                          [&](const ExpertCacheKey& key) {
+                                              return key.bank == bank && key.expert == expert;
+                                          }),
+                           required.end());
+            if (step_gen.size() <= bank) { step_gen.resize(bank + 1, 0); }
+            if (bank_generation.size() <= bank) { bank_generation.resize(bank + 1, 0); }
+            ++step_gen[bank];
+            ++bank_generation[bank];
+        } else {
+            entries[first[bank] + expert].ready = true;
+        }
+        resident_count[bank] = static_cast<std::uint32_t>(
+            std::count_if(slots.begin(), slots.end(), [](auto value) { return value != kAbsentSlot; }));
+        return true;
+    }
+
+        // Q20: take a fixed run of slots out of the shared free list. The ids are stable for the life of
+    // the pool, so the Device can name one and the host can address it without a second lookup.
+    void configure_ring(std::uint32_t bank, std::uint32_t slots) {
+        if (bank >= banks.size() || slots == 0) { return; }
+        auto& owned = ring_slots[bank];
+        if (!owned.empty()) { return; }
+        if (free_slots.size() < slots) {
+            throw std::invalid_argument("expert pool cannot reserve a ring for every bank");
+        }
+        if (ring_slot_flag.size() < slots_live) { ring_slot_flag.resize(slots_live, 0); }
+        owned.reserve(slots);
+        for (std::uint32_t index = 0; index < slots; ++index) {
+            const std::uint32_t slot = free_slots.back();
+            free_slots.pop_back();
+            ring_slot_flag[slot] = 1;
+            owned.push_back(slot);
+        }
+        std::fprintf(stderr, "[ring] bank=%u fixed slots=%u\n", bank, slots);
+        std::fflush(stderr);
+    }
+
+    std::size_t index(ExpertCacheKey key) const {        if (key.bank >= banks.size() || banks[key.bank].resident ||
             key.expert >= banks[key.bank].count) {
             throw std::out_of_range("expert cache key");
         }
@@ -584,6 +699,16 @@ std::vector<std::uint64_t> bank_generation;
         const auto keep = static_cast<std::size_t>(
             (wanted * slot_bytes + kSegmentBytes - 1) / kSegmentBytes * kSegmentBytes);
         if (wanted < slots_live) {
+            // Q20: a fixed ring slot that the shrink would unmap has no replacement address. The
+            // ring is not "expert residency" the resize is allowed to drop.
+            for (const auto& owned : ring_slots) {
+                for (const auto slot : owned) {
+                    if (slot >= wanted) {
+                        throw std::invalid_argument(
+                            "expert pool cannot shrink below its fixed ring slots");
+                    }
+                }
+            }
             // Experts above the new limit lose their slot; the reservation still owns those
             // addresses, so a grow later hands them out again from the free list.
             for (std::uint32_t b = 0; b < banks.size(); ++b) {
@@ -607,6 +732,7 @@ std::vector<std::uint64_t> bank_generation;
             pool->acquire(keep - pool->mapped());
         }
         slots_live = wanted;
+        if (ring_slot_flag.size() < wanted) { ring_slot_flag.resize(wanted, 0); }
         return live_bytes();
     }
 
@@ -973,6 +1099,29 @@ void ExpertCache::prepare(std::span<const ExpertCacheKey> required, cudaStream_t
 bool ExpertCache::set_resident_experts(std::uint32_t bank, std::span<const std::uint32_t> experts,
                                        std::uint32_t hot_count) {
     return impl_->set_resident(bank, experts, hot_count);
+}
+
+bool ExpertCache::adopt_resident_slot(std::uint32_t bank, std::uint32_t expert,
+                                      std::uint32_t slot) {
+    return impl_->adopt_slot(bank, expert, slot);
+}
+
+void ExpertCache::configure_ring(std::uint32_t bank, std::uint32_t slots) {
+    impl_->configure_ring(bank, slots);
+}
+
+std::uint32_t ExpertCache::ring_slot_count(std::uint32_t bank) const noexcept {
+    return bank < impl_->ring_slots.size()
+               ? static_cast<std::uint32_t>(impl_->ring_slots[bank].size())
+               : 0;
+}
+
+std::optional<std::uint32_t> ExpertCache::ring_slot(std::uint32_t bank,
+                                                    std::uint32_t index) const noexcept {
+    if (bank >= impl_->ring_slots.size() || index >= impl_->ring_slots[bank].size()) {
+        return std::nullopt;
+    }
+    return impl_->ring_slots[bank][index];
 }
 
 std::uint32_t ExpertCache::set_prefetch_experts(std::uint32_t bank,

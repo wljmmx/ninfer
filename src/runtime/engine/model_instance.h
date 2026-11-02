@@ -65,6 +65,9 @@ struct ModelInstance {
     // has no expert pool. Experts of a dropped window stream in again on their next use.
     std::uint64_t resize_expert_pool(std::uint64_t target_bytes);
     [[nodiscard]] std::uint64_t expert_pool_capacity() const noexcept;
+    // 13.4: the KV half of the same contract. Pages are the unit (64 tokens each); the call
+    // validates ownership first and returns the capacity actually in effect.
+    std::uint32_t resize_kv_capacity(std::uint32_t target_pages);
 };
 
 struct ConstructedModel {

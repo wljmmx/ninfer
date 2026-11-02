@@ -7,7 +7,9 @@
 #if NINFER_HAVE_LMCACHE
 #include "core/lmcache_bridge.h"
 #include "core/lmcache_layout.h"
+#include "core/lmcache_prefix_registry.h"
 #include "core/lmcache_state_payload.h"
+#include "core/lmcache_wal.h"
 #endif
 
 #include <algorithm>
@@ -15,6 +17,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <filesystem>
 #include <mutex>
 #include <thread>
 #include <cstddef>
@@ -150,6 +153,23 @@ public:
             return false;
         }
         ready_.store(true);
+        // 13.4: jobs the previous process accepted and did not confirm. Replaying after ready means
+        // the same publish path the writer thread uses; a record is removed only after publish
+        // returns, so a crash during replay leaves it for the next start.
+        if (const char* wal_dir = std::getenv("NINFER_LMCACHE_WAL_DIR");
+            wal_dir != nullptr && *wal_dir != '\0' && wal_.open(wal_dir)) {
+            const auto pending = wal_.pending();
+            std::size_t replayed = 0;
+            for (const auto& record : pending) {
+                if (!publish_job(record.tokens, record.checkpoint)) { continue; }
+                wal_.complete(record.path);
+                ++replayed;
+            }
+            if (replayed != 0) {
+                std::fprintf(stderr, "[lmcache] wal: replayed %zu pending write(s)\n", replayed);
+                std::fflush(stderr);
+            }
+        }
         return true;
     }
 
@@ -162,6 +182,40 @@ public:
         // Fewer tokens than one chunk means no complete chunk to look up. The server replies to such
         // a lookup with nothing at all, so asking costs a full receive timeout.
         if (chunk_tokens_ != 0 && prompt_tokens.size() < chunk_tokens_) { return std::nullopt; }
+
+        // Q54: the cache key is the whole prompt, so a request that extends a stored prefix computes
+        // a different one. Query the request's own prefixes instead, longest first. The registry
+        // holds only lengths this process has stored or restored, so this is a handful of lookups,
+        // not a scan of every possible frontier.
+        std::vector<std::size_t> attempts;
+        attempts.push_back(prompt_tokens.size());
+        std::vector<std::int64_t> sequence(prompt_tokens.begin(), prompt_tokens.end());
+        for (const auto frontier : registry_.candidates(sequence, 3)) {
+            if (frontier >= chunk_tokens_ && frontier < prompt_tokens.size()) {
+                attempts.push_back(frontier);
+            }
+        }
+
+        for (const std::size_t length : attempts) {
+            const auto attempt = prompt_tokens.first(length);
+            if (auto restored = restore_prefix(attempt)) {
+                // The run that came from the cache is not captured: record its coverage so the next
+                // request in this process can find it without another round trip.
+                const std::vector<std::int64_t> prefix(attempt.begin(), attempt.end());
+                registry_.record(prefix, restored->frontier);
+                if (restored->valid_tokens != 0 && restored->valid_tokens <= attempt.size()) {
+                    registry_.record(prefix, restored->valid_tokens);
+                }
+                return restored;
+            }
+        }
+        return std::nullopt;
+    }
+
+    // One lookup at one frontier. Split out of fetch() because Q54 makes a hit consist of several
+    // candidate lengths; everything below is the single-prompt behaviour that was measured.
+    [[nodiscard]] std::optional<ninfer::CachedCheckpoint>
+    restore_prefix(std::span<const TokenId> prompt_tokens) {
         ninfer::core::lmcache::BridgeKey key;
         key.tokens.assign(prompt_tokens.begin(), prompt_tokens.end());
         // The server keys its token session by request_id and does not reset the rolling hash when
@@ -279,7 +333,8 @@ public:
             if (async_write_) { writer_ = std::thread([this] { write_loop(); }); }
         });
         if (!async_write_) {
-            publish_job(prompt_tokens, checkpoint);
+            const auto wal_path = wal_.append(prompt_tokens, checkpoint);
+            if (publish_job(prompt_tokens, checkpoint)) { wal_.complete(wal_path); }
             return;
         }
         {
@@ -290,8 +345,11 @@ public:
                 ++dropped_writes_;
                 return;
             }
+            // 13.4: the record is written before the job becomes queued, so "accepted" and
+            // "recoverable" are the same instant. A crash between here and the publish leaves a
+            // file that the next start replays.
             writes_.push_back(Job{std::vector<TokenId>(prompt_tokens.begin(), prompt_tokens.end()),
-                                  checkpoint});
+                                  checkpoint, wal_.append(prompt_tokens, checkpoint)});
         }
         write_cv_.notify_one();
     }
@@ -331,6 +389,7 @@ public:
     struct Job {
         std::vector<TokenId> tokens;
         ninfer::CachedCheckpoint checkpoint;
+        std::filesystem::path wal_path;
     };
 
     void write_loop() {
@@ -346,17 +405,20 @@ public:
                 job = std::move(writes_.front());
                 writes_.pop_front();
             }
-            publish_job(job.tokens, job.checkpoint);
-            ++written_;
+            if (publish_job(job.tokens, job.checkpoint)) {
+                wal_.complete(job.wal_path);
+                ++written_;
+            }
         }
     }
 
     // The body that used to be store(): unchanged, so the async path is the same code, on another
-    // thread.
-    void publish_job(std::span<const TokenId> prompt_tokens,
+    // thread. Returns whether the server accepted the publish, which is also whether the WAL record
+    // may be removed.
+    bool publish_job(std::span<const TokenId> prompt_tokens,
                      const ninfer::CachedCheckpoint& checkpoint) {
-        if (!ready_.load() || bridge_ == nullptr || prompt_tokens.empty()) { return; }
-        if (checkpoint.page_bytes == 0 || checkpoint.kv_bytes.empty()) { return; }
+        if (!ready_.load() || bridge_ == nullptr || prompt_tokens.empty()) { return false; }
+        if (checkpoint.page_bytes == 0 || checkpoint.kv_bytes.empty()) { return false; }
 
         // Only whole chunks can be addressed, so the key and the KV group stay chunk-aligned. The
         // partial trailing chunk is not thrown away any more: it rides in the state object (L7-b).
@@ -370,14 +432,14 @@ public:
         // The publish was lost silently; only a cross-process retrieve would have shown it.
         const std::size_t chunk_bytes_total = chunk_bytes_;
         if (chunk_bytes_total == 0 || chunk_tokens_ == 0 || page_bytes_ == 0 || page_tokens_ == 0) {
-            return;
+            return false;
         }
         // Q64 2d-2b-4: the layout arithmetic lives in core/lmcache_layout.h so the store side and the
         // restore side cannot drift apart. This call computes exactly what the inline block did.
         const auto plan = ninfer::core::lmcache::plan_payload(
             checkpoint.kv_bytes.size(), checkpoint.valid_tokens, checkpoint.frontier,
             prompt_tokens.size(), chunk_bytes_total, chunk_tokens_, page_bytes_, page_tokens_);
-        if (plan.chunks == 0 || plan.valid_tokens == 0) { return; }
+        if (plan.chunks == 0 || plan.valid_tokens == 0) { return false; }
         const std::size_t payload_chunks = plan.payload_chunks;
         const std::size_t addressable    = prompt_tokens.size() / chunk_tokens_;
         const std::size_t chunks         = plan.chunks;
@@ -409,7 +471,7 @@ public:
 
         std::string state;
         for (const std::string& shard : checkpoint.state_shards) { state += shard; }
-        if (state.size() != image_bytes_) { return; }
+        if (state.size() != image_bytes_) { return false; }
 
         // [u32 valid_tokens][state image][tail chunk]. The tail region is zero when the real length
         // does not reach past the last addressable chunk, so a reader can slice it blind.
@@ -424,13 +486,31 @@ public:
             valid_tokens, tail, chunk_bytes_total);
 
         std::lock_guard<std::mutex> guard(bridge_mutex_);
-        (void)bridge_->publish(
+        const bool written = bridge_->publish(
             key, std::span<const std::byte>(checkpoint.kv_bytes.data(), complete),
             std::span<const std::byte>(payload.data(), payload.size()));
+        if (written) {
+            // Q54: remember which prefix lengths this entry answers for. The frontier and the real
+            // committed length are different numbers (388 vs 397 in the measured case), and a longer
+            // request has to be able to name either one.
+            const std::vector<std::int64_t> sequence(prompt_tokens.begin(), prompt_tokens.end());
+            if (valid_tokens != 0 && valid_tokens <= sequence.size()) {
+                registry_.record(sequence, valid_tokens);
+            }
+            if (checkpoint.frontier != 0 && checkpoint.frontier <= sequence.size()) {
+                registry_.record(sequence, checkpoint.frontier);
+            }
+        }
+        return written;
     }
 
 private:
     std::unique_ptr<ninfer::core::lmcache::Bridge> bridge_;
+    // Q54: which prefix lengths this process knows the cache can answer. Written on store and on a
+    // successful restore, read by fetch before it spends a lookup timeout.
+    ninfer::core::lmcache::PrefixRegistry registry_;
+    // 13.4: write replay. Inert unless NINFER_LMCACHE_WAL_DIR names a directory.
+    ninfer::core::lmcache::CheckpointWriteAheadLog wal_;
     // Q64 2d-2h, step 1: one lock for the bridge, because it owns a ZMQ socket and a socket is not
     // thread-safe. Publishing moves to a writer thread in step 2; that is only safe if every user of
     // the bridge - the restore on the request path and the publish on either - takes this first.

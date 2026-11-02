@@ -268,7 +268,7 @@ ExpertStream::ExpertStream(std::uint32_t count, WeightBankLayout gate_up, Weight
 void ExpertStream::attach_host(std::shared_ptr<HostExpertResidency> host) noexcept {
     host_      = host.get();
     host_weak_ = std::move(host);
-    // Q53: the cold region's admission compares this bank's score against the occupant it would
+    // Q53: the second-chance band's admission compares this bank's score against the occupant it would
     // displace, so the tier needs the ranking. The vector is allocated once in the constructor, so
     // the pointer stays valid for the stream's life.
     if (host_ != nullptr) { host_->attach_scores(bank_, hot_score_.data(), count_); }
@@ -342,6 +342,9 @@ void ExpertStream::attach(ExpertCache& cache, std::uint32_t bank, const ExpertBa
     if (mask_copy != cudaSuccess) {
         throw std::runtime_error(std::string("expert residency mask: ") + cudaGetErrorString(mask_copy));
     }
+    // Q20: the ring was reserved by the cache at construction (a slice of each bank's window).
+    // Read its size here; configuring it after seeding would need slots the pool does not have.
+    device_ring_slots_ = cache.ring_slot_count(bank);
     // port (sm_89): with a fixed slot run per bank the resident set never changes, so this stream
     // can skip the routing round trip entirely and a captured graph stays valid.
     pinned_ = cache.can_hold_every_layer();
@@ -530,9 +533,146 @@ void ExpertStream::stage_predicted(cudaStream_t stream) {
     }
 }
 
+std::size_t ExpertStream::device_admit_ring(const void* device_ids, std::int32_t values,
+                                            std::uint32_t ring_base, std::uint32_t ring_slots,
+                                            cudaStream_t stream, std::vector<std::uint32_t>& wanted,
+                                            std::vector<bool>& chosen) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_RING_DEVICE_ADMIT");
+        return value != nullptr && *value != '\0' && std::strtol(value, nullptr, 10) != 0;
+    }();
+    if (!enabled || host_ == nullptr || device_ids == nullptr || values <= 0 || ring_slots == 0 ||
+        count_ == 0) {
+        return 0;
+    }
+    const std::byte* arena = host_->arena_device_base();
+    if (arena == nullptr || host_->slot_bytes() != cache_->slot_bytes()) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::fprintf(stderr,
+                         "[ring] device admission disabled: no mapped arena or slot size mismatch "
+                         "(host %llu, pool %llu)\n",
+                         static_cast<unsigned long long>(host_->slot_bytes()),
+                         static_cast<unsigned long long>(cache_->slot_bytes()));
+            std::fflush(stderr);
+        }
+        return 0;
+    }
+    const std::size_t candidate_bytes = static_cast<std::size_t>(count_) * sizeof(std::uint32_t);
+    if (!ring_candidates_device_ || ring_candidates_device_->bytes < candidate_bytes) {
+        ring_candidates_device_ = std::make_unique<DeviceBuffer>(candidate_bytes);
+        ring_resident_device_   = std::make_unique<DeviceBuffer>(candidate_bytes);
+        ring_descriptors_device_ =
+            std::make_unique<DeviceBuffer>(static_cast<std::size_t>(cache_->resident_capacity()) *
+                                          sizeof(ops::RingAdmitDescriptor));
+        ring_count_device_  = std::make_unique<DeviceBuffer>(sizeof(std::uint32_t));
+    }
+    // Membership at this instant, not the previous layer's published mask: "already resident" is
+    // what makes an expert not a miss, and a hot expert admitted into the ring would lose its slot.
+    ring_resident_host_.assign(count_, 0);
+    for (std::uint32_t expert = 0; expert < count_; ++expert) {
+        if (cache_->expert_slot(bank_, expert)) { ring_resident_host_[expert] = 1; }
+    }
+    ring_resident_device_->copy_from_host(ring_resident_host_.data(), candidate_bytes);
+    ring_snapshot_host_.assign(count_, ops::kRingAdmitAbsent);
+    host_->snapshot_slots(bank_, ring_snapshot_host_);
+    ring_candidates_host_.assign(count_, ops::kRingAdmitAbsent);
+    std::size_t candidates_seen = 0;
+    for (std::uint32_t expert = 0; expert < count_; ++expert) {
+        if (ring_snapshot_host_[expert] != HostExpertResidency::kAbsentSlot) {
+            ring_candidates_host_[expert] = ring_snapshot_host_[expert];
+            ++candidates_seen;
+        }
+    }
+    if (bank_ == 0 && std::getenv("NINFER_RING_PROBE") != nullptr) {
+        static int shown = 0;
+        if (shown++ < 4) {
+            std::fprintf(stderr, "[ring] admit call values=%d ring=%u base=%u candidates=%zu\n",
+                         values, ring_slots, ring_base, candidates_seen);
+            std::fflush(stderr);
+        }
+    }
+    ring_candidates_device_->copy_from_host(ring_candidates_host_.data(), candidate_bytes);
+    ring_count_device_->fill(0);
+    const auto capacity = std::min(cache_->resident_capacity(), ring_slots);
+    ops::ring_admit_launch(device_ids, values,
+                           static_cast<const std::uint32_t*>(ring_candidates_device_->p),
+                           static_cast<const std::int32_t*>(ring_resident_device_->p), count_,
+                           ring_base, ring_slots,
+                           static_cast<ops::RingAdmitDescriptor*>(ring_descriptors_device_->p),
+                           static_cast<std::uint32_t*>(ring_count_device_->p), capacity, stream);
+    // The queue head is the only thing the host must see before it can act; the copies themselves
+    // stay on the stream and are ordered before the layer that reads them.
+    if (cudaStreamSynchronize(stream) != cudaSuccess) {
+        throw std::runtime_error(std::string("ring admission: ") +
+                                 cudaGetErrorString(cudaGetLastError()));
+    }
+    std::uint32_t requested = 0;
+    ring_count_device_->copy_to_host(&requested, sizeof(requested));
+    requested = std::min(requested, capacity);
+    if (bank_ == 0 && std::getenv("NINFER_RING_PROBE") != nullptr) {
+        static int shown = 0;
+        if (shown++ < 4) {
+            std::fprintf(stderr, "[ring] descriptors=%u capacity=%u\n", requested, capacity);
+            std::fflush(stderr);
+        }
+    }
+    if (requested == 0) { return 0; }
+    ring_descriptors_host_.resize(requested);
+    ring_descriptors_device_->copy_to_host(
+        ring_descriptors_host_.data(),
+        static_cast<std::size_t>(requested) * sizeof(ops::RingAdmitDescriptor));
+    const std::size_t slot_bytes = cache_->slot_bytes();
+    std::size_t admitted = 0;
+    for (const auto& descriptor : ring_descriptors_host_) {
+        if (descriptor.expert >= count_ || descriptor.ring_slot >= ring_slots) { continue; }
+        const auto mapped = cache_->ring_slot(bank_, descriptor.ring_slot);
+        if (!mapped) { continue; }
+        const std::uint32_t ring_slot = *mapped;
+        const std::byte* source = arena + static_cast<std::size_t>(descriptor.host_slot) *
+                                              host_->slot_bytes();
+        std::byte* destination =
+            const_cast<std::byte*>(static_cast<const std::byte*>(cache_->pool().data)) +
+            static_cast<std::size_t>(ring_slot) * slot_bytes;
+        // The copy reads the pinned slot asynchronously; keep the tier from handing it out until a
+        // later layer has waited on the stream.
+        host_->hold_for_device(bank_, descriptor.expert);
+        if (cudaMemcpyAsync(destination, source, slot_bytes, cudaMemcpyDeviceToDevice, stream) !=
+            cudaSuccess) {
+            throw std::runtime_error(std::string("ring admission copy: ") +
+                                     cudaGetErrorString(cudaGetLastError()));
+        }
+        if (!cache_->adopt_resident_slot(bank_, descriptor.expert, ring_slot)) { continue; }
+        if (bank_ == 0 && std::getenv("NINFER_RING_PROBE") != nullptr) {
+            static bool checked = false;
+            if (!checked) {
+                checked = true;
+                std::vector<std::byte> from_pool(slot_bytes), from_host(slot_bytes);
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                CUDA_CHECK(cudaMemcpy(from_pool.data(), destination, slot_bytes,
+                                      cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(from_host.data(), source, slot_bytes,
+                                      cudaMemcpyDeviceToHost));
+                std::fprintf(stderr, "[ring] copy check expert=%u slot=%u bytes=%zu %s\n",
+                             descriptor.expert, ring_slot, slot_bytes,
+                             std::memcmp(from_pool.data(), from_host.data(), slot_bytes) == 0
+                                 ? "identical"
+                                 : "MISMATCH");
+                std::fflush(stderr);
+            }
+        }
+        if (!chosen[descriptor.expert]) {
+            chosen[descriptor.expert] = true;
+            wanted.push_back(descriptor.expert);
+        }
+        ++admitted;
+    }
+    return admitted;
+}
+
 bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32_t tokens,
-                          cudaStream_t stream, const std::int32_t* host_ids, bool assume_covered) {
-    if (cache_ == nullptr) { throw std::logic_error("expert stream is not attached"); }
+                          cudaStream_t stream, const std::int32_t* host_ids, bool assume_covered) {    if (cache_ == nullptr) { throw std::logic_error("expert stream is not attached"); }
     // port (sm_89): Q20's measurement. Three separate booleans rather than one "did the host do
     // anything": when capt_free stays at zero the fix depends on WHICH of the three fired - a route
     // read-back is removed by device-side coverage, a publication by a static table, an upload by a
@@ -1401,13 +1541,13 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                     if (host_ != nullptr) {
                         const auto& warm = host_->stats();
                         std::fprintf(stderr,
-                                     "[warm] cold: admitted=%llu declined=%llu hits=%llu "
+                                     "[warm] second-chance: admitted=%llu declined=%llu hits=%llu "
                                      "promoted=%llu used=%u\n",
-                                     (unsigned long long)warm.cold_admissions,
-                                     (unsigned long long)warm.cold_declines,
-                                     (unsigned long long)warm.cold_hits,
-                                     (unsigned long long)warm.cold_promotions,
-                                     host_->cold_used());
+                                     (unsigned long long)warm.second_chance_admissions,
+                                     (unsigned long long)warm.second_chance_declines,
+                                     (unsigned long long)warm.second_chance_hits,
+                                     (unsigned long long)warm.second_chance_promotions,
+                                     host_->second_chance_used());
                     }
                 }
             }
@@ -1441,6 +1581,9 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         // Under NINFER_HOST_DIRECT the set is chosen by demand only. A route outside it is served
         // from the pinned tier if it is there, and by the CPU half if it is not, which is the split
         // Q20 is about.
+        // Q20: device-side admission uses these even when it finds nothing; zero means the ring is
+        // host-filled (the measured default).
+        std::uint32_t device_ring_slots = device_ring_slots_;
         if (host_direct) {
             std::vector<std::uint32_t> ranked(count_);
             std::iota(ranked.begin(), ranked.end(), 0U);
@@ -1456,11 +1599,11 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             // changing. S is taken from the same place the split policy takes it (a fixed few slots,
             // one token's routing), so a layer that misses k <= S experts serves them from the pool
             // and only the rest fall to the host leg.
-            std::uint32_t ring = 0;
-            if (const char* value = std::getenv("NINFER_EXPERT_RING_SLOTS");
-                value != nullptr && *value != '\0') {
+            std::uint32_t ring = device_ring_slots != 0 ? device_ring_slots : 0;
+            if (ring == 0 && std::getenv("NINFER_EXPERT_RING_SLOTS") != nullptr) {
+                const char* value = std::getenv("NINFER_EXPERT_RING_SLOTS");
                 ring = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
-            } else if (regions_) {
+            } else if (ring == 0 && regions_) {
                 ring = spill_slots(capacity);
             }
             ring = std::min<std::uint32_t>(ring, static_cast<std::uint32_t>(capacity / 2));
@@ -1470,11 +1613,20 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                                                std::min<std::size_t>(keep, ranked.size())));
             std::fill(chosen.begin(), chosen.end(), false);
             for (const auto expert : wanted) { chosen[expert] = true; }
-            for (std::size_t i = 0; i < values && wanted.size() < capacity; ++i) {
-                const auto expert = static_cast<std::uint32_t>(route_ids[i]);
-                if (chosen[expert]) { continue; }
-                chosen[expert] = true;
-                wanted.push_back(expert);
+            // Q20: when the Device owns admission, the host stops naming this step's ring members.
+            // Leaving the slots empty is deliberate - the kernel below fills them from the pinned
+            // candidate set, and only the experts it names are copied.
+            static const bool ring_device_admit = [] {
+                const char* value = std::getenv("NINFER_RING_DEVICE_ADMIT");
+                return value != nullptr && *value != '\0' && std::strtol(value, nullptr, 10) != 0;
+            }();
+            if (!ring_device_admit) {
+                for (std::size_t i = 0; i < values && wanted.size() < capacity; ++i) {
+                    const auto expert = static_cast<std::uint32_t>(route_ids[i]);
+                    if (chosen[expert]) { continue; }
+                    chosen[expert] = true;
+                    wanted.push_back(expert);
+                }
             }
             // The attribution pass and set_resident() both read this: everything before `keep` is the
             // hot regime, everything after it is the ring.
@@ -1493,6 +1645,19 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                                 host_distinct.end());
             host_->ensure_scored(ExpertBankId{bank_},
                                  std::span<const std::int32_t>(host_distinct), hot_score_.data());
+        }
+        if (host_direct && device_ring_slots != 0 && host_ != nullptr && device_ids != nullptr) {
+            const auto admitted =
+                device_admit_ring(device_ids, static_cast<std::int32_t>(values), 0,
+                                  device_ring_slots, stream, wanted, chosen);
+            if (admitted != 0 && bank_ == 0 && std::getenv("NINFER_RING_PROBE") != nullptr) {
+                static int shown = 0;
+                if (shown++ < 8) {
+                    std::fprintf(stderr, "[ring] device admitted %zu expert(s)/layer (S=%u)\n",
+                                 admitted, device_ring_slots);
+                    std::fflush(stderr);
+                }
+            }
         }
         const bool refresh = !set_initialised_ || tokens <= kSetUpdateTokens ||
                              capacity < kPrefillProtectMin;

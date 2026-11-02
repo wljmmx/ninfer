@@ -4,6 +4,7 @@
 #include "core/arena.h"
 #include "core/expert_cache.h"
 #include "core/expert_file.h"
+#include "core/ring_admission.h"
 #include "core/weight_bank.h"
 #include "ninfer/ops/moe.h"
 
@@ -78,7 +79,7 @@ public:
     // (it is called with the model alive, by construction), while the weak one is what a job
     // enqueued on the process-wide read-ahead worker carries. A queue job outlives the call that
     // issued it, so it has to be able to find the residency gone rather than assume it is there.
-    // Q53: the tier needs this bank's ranking for cold admission, so the attachment also registers
+    // Q53: the tier needs this bank's ranking for second-chance admission, so the attachment also registers
     // the score vector. Defined in the .cpp, where HostExpertResidency is complete.
     void attach_host(std::shared_ptr<HostExpertResidency> host) noexcept;
     [[nodiscard]] HostExpertResidency* host() const noexcept { return host_; }
@@ -341,6 +342,13 @@ private:
     // per-step routing decision - and therefore no host round trip - is needed.
     bool pinned_ = false;
     void rebase_window();
+    // Q20: the Device picks this layer's ring members and names their ring slots. The host drains
+    // the descriptor queue, copies the pinned candidate bytes and adopts the pairs. Returns how many
+    // admissions were applied. `wanted`/`chosen` are extended so set_resident keeps them.
+    std::size_t device_admit_ring(const void* device_ids, std::int32_t values,
+                                  std::uint32_t ring_base, std::uint32_t ring_slots,
+                                  cudaStream_t stream, std::vector<std::uint32_t>& wanted,
+                                  std::vector<bool>& chosen);
     // port (sm_89): decayed per-expert route counts. A pool that cannot hold a whole layer keeps
     // the top entries of this instead of whatever the current step happened to route to, which
     // used to replace all eight experts on every token and make the hot set useless.
@@ -508,6 +516,20 @@ private:
     std::unique_ptr<PinnedHostBuffer> route_staging_;    // O1's device verdict: one mapped word, stored by the coverage kernel and read by the host.
     std::unique_ptr<PinnedHostBuffer> coverage_word_;
     std::uint32_t* coverage_word_host_   = nullptr;
+    // Q20 device-side admission. The candidate table is one word per expert (pinned slot or
+    // kRingAdmitAbsent); descriptors and the cursor live on the Device. Lazily allocated only when
+    // NINFER_RING_DEVICE_ADMIT is set, so the default path pays nothing.
+    std::unique_ptr<DeviceBuffer> ring_candidates_device_;
+    std::unique_ptr<DeviceBuffer> ring_descriptors_device_;
+    std::unique_ptr<DeviceBuffer> ring_count_device_;
+    std::vector<std::uint32_t> ring_candidates_host_;
+    std::unique_ptr<DeviceBuffer> ring_resident_device_;
+    std::vector<std::int32_t> ring_resident_host_;
+    std::vector<ops::RingAdmitDescriptor> ring_descriptors_host_;
+    std::vector<std::uint32_t> ring_snapshot_host_;
+    // Q20: fixed ring slots this bank reserved from the pool at attach. Zero when the mechanism is
+    // off; otherwise every device-admitted expert lands in one of these addresses.
+    std::uint32_t device_ring_slots_ = 0;
     std::uint32_t* coverage_word_device_ = nullptr;
     bool coverage_word_checked_          = false;
     // O1's counter: mapped, so the skip is counted where it happens. `miss_lag_` is the host total

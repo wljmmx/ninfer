@@ -381,6 +381,7 @@ public:
     release_redundant_host(std::span<const CheckpointHandle> excluded,
                            std::optional<SequenceHandle> pending_backup = std::nullopt);
     [[nodiscard]] runtime::ResourceReservation reserve_units(std::span<const ExecutionUnit>);
+    std::uint32_t resize_kv_capacity(std::uint32_t target_pages);
     [[nodiscard]] bool reclaim_capture_reservation(runtime::ContextResourceUsage shortage);
     void release_units(std::span<const SequenceHandle>) noexcept;
     [[nodiscard]] BindingReservation start_binding(const RequestBasePlan&, runtime::LaneId,

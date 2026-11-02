@@ -525,6 +525,11 @@ public:
                            std::optional<SequenceHandle> pending_backup = std::nullopt);
     // Reservations stay owned by their lane through commit. Failure leaves prior permits intact.
     [[nodiscard]] runtime::ResourceReservation reserve_units(std::span<const ExecutionUnit> units);
+    // 13.4: runtime shrink of the KV half. The caller is the engine's idle-window check; what this
+    // adds is the ownership check - a retained checkpoint whose pages sit above the new edge is an
+    // owner, so the shrink is refused instead of silently invalidating it. Returns the capacity in
+    // effect afterwards (0 when the model has no main KV pool).
+    std::uint32_t resize_kv_capacity(std::uint32_t target_pages);
     [[nodiscard]] bool reclaim_capture_reservation(runtime::ContextResourceUsage shortage);
     void release_units(std::span<const SequenceHandle> sequences) noexcept;
     [[nodiscard]] BindingReservation
