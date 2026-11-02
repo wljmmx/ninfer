@@ -468,10 +468,28 @@ private:
     //
     // Both are written on the same cadence as the pool tables and published the same way. When the
     // switch is off they stay empty and the kernel's `host_flags != nullptr` test is the only trace.
-    std::vector<std::uint64_t> host_offsets_;
     std::vector<std::int32_t> host_flags_;
     std::unique_ptr<DeviceBuffer> host_offsets_device_;
     std::unique_ptr<DeviceBuffer> host_flags_device_;
+    // port (sm_89): GH3 - where every expert lives, one word per expert (see ops::moe_expand_expert_placements).
+    //
+    // `placement_` is this layer's answer, `placement_published_` is what the Device holds. They are
+    // compared row by row so the host's publication is the difference and nothing else: four bytes per
+    // expert that moved, against twelve for the offset/mask rows it replaces. The three tables are then
+    // derived on the Device, so the mask - the one array every route consults - is a consequence of the
+    // placement rather than a second copy of it maintained by hand.
+    //
+    // `placement_dirty_` is the invariant, not a counter: the tier's snapshot is re-derived every layer,
+    // and a table that did not reach the Device is refused instead of used.
+    std::vector<std::uint32_t> placement_;
+    std::vector<std::uint32_t> placement_published_;
+    std::vector<std::uint32_t> host_slots_;   // one snapshot of the tier, filled under its lock
+    std::vector<std::uint32_t> placed_slots_; // the slots this layer's table names, held for it
+    std::vector<std::int32_t> pool_slot_;     // the pool's slot per expert, read once per layer
+    std::unique_ptr<DeviceBuffer> placement_device_;
+    std::unique_ptr<PinnedHostBuffer> placement_stage_[2];
+    int placement_stage_next_ = 0;
+    bool placement_dirty_     = false;
     // Where each plane starts inside a slot, so the Device bases are arena_device_base() + offset.
     std::uint64_t host_gate_up_plane_[3] = {};
     std::uint64_t host_down_plane_[3]    = {};

@@ -629,6 +629,34 @@ public:
         const auto slot = state_[bank].slot_of[expert];
         if (slot != kNone && slot < device_held_.size()) { device_held_[slot] = 1; }
     }
+    // port (sm_89): GH3. The publisher needs "where does the tier hold each expert" as one answer,
+    // not 256 of them. peek_slot() per expert took the lock 256 times and could observe the tier
+    // before one load and after the next, so a table built that way was never guaranteed to have
+    // been true at any single instant. This returns one consistent snapshot instead, and the publisher
+    // builds its placement word from it.
+    //
+    // kAbsentSlot means "not in RAM". A caller that names a slot in a Device table must keep the
+    // entry in `held` for as long as that table is live: the bytes at a slot are only that expert's
+    // until somebody else claims it.
+    static constexpr std::uint32_t kAbsentSlot = 0xffffffffu;
+    void snapshot_slots(std::uint32_t bank, std::span<std::uint32_t> slots) const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        std::fill(slots.begin(), slots.end(), kAbsentSlot);
+        if (bank >= state_.size()) { return; }
+        const auto& state = state_[bank];
+        const auto count  = std::min(slots.size(), state.slot_of.size());
+        for (std::size_t expert = 0; expert < count; ++expert) {
+            slots[expert] = state.slot_of[expert];
+        }
+    }
+    // Hold a whole batch of slots under one lock. Used with the snapshot above: exactly the entries a
+    // published table names are held, so the protection ends when the table does.
+    void hold_slots(std::span<const std::uint32_t> slots) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        for (const auto slot : slots) {
+            if (slot < device_held_.size()) { device_held_[slot] = 1; }
+        }
+    }
     // port (sm_89): two generations, not one. The Device reads asynchronously, and the next layer's
     // fill happens before the previous layer's GEMM has necessarily finished, so a single set cleared
     // at layer start would release exactly the slots that are still being read. Rotating means a slot

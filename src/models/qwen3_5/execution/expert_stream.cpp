@@ -1331,15 +1331,41 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         const auto prefetch_gen = cache_->prefetch_generation(bank_);
         const bool need_publish = !published_once_ || pub_hot_ != hot_gen || pub_step_ != step_gen ||
                                  pub_prefetch_ != prefetch_gen;
-        if (set_moved || need_publish) {
+        // port (sm_89): GH3 - the Device derives its own tables from one placement word per expert.
+        //
+        // This is where the NaN under NINFER_HOST_DIRECT came from, and it is worth naming because the
+        // shape of the fix is the answer to it. The tier holds each expert for a while and then drops
+        // it; a Device table that names a slot is only true while that slot still holds that expert.
+        // The old publisher tied the tier's table to the POOL's generations - so on the layers where
+        // the pool happened not to move (which is most of them once the hot set is static), the tier
+        // table went stale while the arena kept churning underneath it: the hold it had taken expired
+        // after two layers, the slot was reused for another expert, and the GEMM addressed it. That is
+        // reading another expert's bytes, and half a bf16 stream of another expert overflows to inf
+        // within a few layers - the router's coefficients came back NaN and the CPU half refused them.
+        //
+        // The invariant that removes it: the tier's contribution to the Device tables is re-derived
+        // EVERY layer, from one snapshot, and exactly the slots it names are held for that layer. The
+        // placement word is that contribution, so `placement_mode` also has to rebuild the block below
+        // even when nothing in the pool moved.
+        const bool placement_mode =
+            host_direct && host_ != nullptr && host_->arena_device_base() != nullptr;
+        if (set_moved || need_publish || placement_mode) {
             set_initialised_ = true;
+            // One pass over the pool. The slot each expert owns was read twice here (once for the
+            // offset table, once for the diff) and GH3 needs the same answer a third time for the
+            // placement word, so it is taken once and shared.
+            if (pool_slot_.size() != count_) { pool_slot_.assign(count_, -1); }
+            for (std::uint32_t expert = 0; expert < count_; ++expert) {
+                const auto slot    = cache_->expert_slot(bank_, expert);
+                pool_slot_[expert] = slot ? static_cast<std::int32_t>(*slot) : -1;
+            }
+            if (offsets_.size() != count_) { offsets_.assign(count_, 0); }
             std::fill(offsets_.begin(), offsets_.end(), 0);
             mask_host_.assign(count_, 0);
             for (std::uint32_t expert = 0; expert < count_; ++expert) {
-                const auto slot = cache_->expert_slot(bank_, expert);
-                if (!slot) { continue; }
-                offsets_[expert]         = static_cast<std::uint64_t>(*slot) * cache_->slot_bytes();
-                mask_host_[expert]       = 1;
+                if (pool_slot_[expert] < 0) { continue; }
+                offsets_[expert]   = static_cast<std::uint64_t>(pool_slot_[expert]) * cache_->slot_bytes();
+                mask_host_[expert] = 1;
             }
             resident_order_ = wanted;
             const auto table_bytes = offsets_.size() * sizeof(std::uint64_t);
@@ -1354,8 +1380,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             std::vector<std::uint32_t> moved;
             moved.reserve(count_);
             for (std::uint32_t expert = 0; expert < count_; ++expert) {
-                const auto slot = cache_->expert_slot(bank_, expert);
-                const auto now  = slot ? static_cast<std::int32_t>(*slot) : -1;
+                const auto now = pool_slot_[expert];
                 if (now != prev_slot_[expert]) {
                     moved.push_back(expert);
                     // Leaving the Device pool is the one signal that says "this expert was hot and is
@@ -1368,79 +1393,65 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                     if (prev_slot_[expert] < 0 && now >= 0) { ++entered_this_step; }
                 }
             }
-            // port (sm_89): Q20's second leg, filled where the pool table is filled.
+            // port (sm_89): Q20's second leg, and GH3's placement word.
             //
             // Only experts ALREADY in the pinned tier qualify. Filling a cold one here would be a
             // synchronous artifact read inside the layer, which is exactly the host round trip this
-            // removes - a cold expert keeps mask 0 and is served by the CPU half as before.
-            if (host_direct && host_ != nullptr) {
+            // removes - a cold expert stays absent and is served by the CPU half as before.
+            //
+            // The tier's side of the table is rebuilt here on EVERY layer, not only when the pool
+            // moved. That is the fix discussed above: the arena keeps churning while the pool sits
+            // still, so "the pool did not move" says nothing about whether this table is still true.
+            bool placement_changed = false;
+            if (placement_mode) {
                 std::uint64_t gu_plane[3] = {}, dn_plane[3] = {};
                 std::uint64_t gu_high_bytes = 0, dn_high_bytes = 0;
                 const auto* host_base = host_->arena_device_base();
+                if (placement_.size() != count_) {
+                    placement_.assign(count_, ops::kExpertPlacementAbsent);
+                    placement_published_.assign(count_, ops::kExpertPlacementAbsent);
+                    host_slots_.assign(count_, HostExpertResidency::kAbsentSlot);
+                    host_flags_.assign(count_, 0);
+                }
                 if (host_base != nullptr &&
                     host_->plane_offsets(bank_, gu_plane, dn_plane, gu_high_bytes, dn_high_bytes)) {
                     for (std::size_t k = 0; k < 3; ++k) {
                         host_gate_up_plane_[k] = gu_plane[k];
                         host_down_plane_[k]    = dn_plane[k];
                     }
-                    if (host_offsets_.size() != count_) { host_offsets_.assign(count_, 0); }
-                    if (host_flags_.size() != count_) { host_flags_.assign(count_, 0); }
-                    const auto drop = [&](std::uint32_t expert) {
-                        if (host_flags_[expert] != 0) {
-                            host_flags_[expert] = 0;
-                            moved.push_back(expert);
-                        }
-                    };
-                    std::uint32_t from_host = 0;
+                    // One consistent answer for all 256 experts, under the tier's own lock.
+                    host_->snapshot_slots(bank_, host_slots_);
+                    placed_slots_.clear();
                     for (std::uint32_t expert = 0; expert < count_; ++expert) {
-                        if (mask_host_[expert] != 0) { drop(expert); continue; } // the pool wins
-                        const auto slot = host_->peek_slot(bank_, expert);
-                        if (slot < 0) { drop(expert); continue; }
-                        host_offsets_[expert] =
-                            static_cast<std::uint64_t>(slot) * host_->slot_bytes();
-                        if (host_flags_[expert] == 0) { moved.push_back(expert); }
-                        host_flags_[expert] = 1;
-                        // The Device computes this route now, so it has to be inside the mask the
-                        // GEMM runs under. The CPU half then sees it covered and leaves it alone.
-                        mask_host_[expert] = 1;
-                        ++from_host;
-                    }
-                    // What the layer actually ran on, not how many table rows point at the tier:
-                    // a bank can offer six host experts and route to one of them.
-                    if (bank_ == 0 && std::getenv("NINFER_HOST_PROBE") != nullptr) {
-                        static int shown = 0;
-                        if (shown < 12) {
-                            std::uint32_t miss = 0, peeked = 0;
-                            for (std::size_t i = 0; i < values; ++i) {
-                                const auto e = static_cast<std::uint32_t>(route_ids[i]);
-                                // mask_host_ is already the merged mask here; recompute the pool side
-                                // from the offset table instead, which host_flags does not touch.
-                                const bool in_pool = cache_->expert_slot(bank_, e).has_value();
-                                if (!in_pool) {
-                                    ++miss;
-                                    if (host_->peek_slot(bank_, e) >= 0) { ++peeked; }
-                                }
-                            }
-                            std::fprintf(stderr,
-                                         "[hostd-probe] bank=0 routes=%zu miss=%u peeked=%u "
-                                         "filled=%u\n",
-                                         values, miss, peeked, from_host);
-                            std::fflush(stderr);
-                            ++shown;
+                        // The pool wins a tie: an expert resident in both is addressed in video memory,
+                        // which is the copy the Device reads faster and the one the ring orders.
+                        std::uint32_t placement = ops::kExpertPlacementAbsent;
+                        if (pool_slot_[expert] >= 0) {
+                            placement = static_cast<std::uint32_t>(pool_slot_[expert]);
+                        } else if (host_slots_[expert] != HostExpertResidency::kAbsentSlot) {
+                            placement = ops::kExpertPlacementHost | host_slots_[expert];
+                        }
+                        if (placement != placement_published_[expert]) { placement_changed = true; }
+                        placement_[expert]  = placement;
+                        const bool absent   = placement == ops::kExpertPlacementAbsent;
+                        const bool on_host  = !absent && (placement & ops::kExpertPlacementHost) != 0;
+                        host_flags_[expert] = on_host ? 1 : 0;
+                        // The mask is the same rule the CPU half's complement uses: an expert has an
+                        // address or it does not, whichever leg it lives on.
+                        mask_host_[expert]  = absent ? 0 : 1;
+                        if (on_host) {
+                            placed_slots_.push_back(placement & ~ops::kExpertPlacementHost);
                         }
                     }
-                    std::uint32_t host_hits = 0;
-                    for (std::size_t i = 0; i < values; ++i) {
-                        const auto expert = static_cast<std::uint32_t>(route_ids[i]);
-                        if (expert < host_flags_.size() && host_flags_[expert] != 0) { ++host_hits; }
-                    }
-                    // Retained for the layer: a claim() in the next one must not move these bytes
-                    // out from under a GEMM that has been queued but may not have run.
-                    for (std::uint32_t expert = 0; expert < count_; ++expert) {
-                        if (host_flags_[expert] != 0) { host_->hold_for_device(bank_, expert); }
-                    }
-                    // The kernel reads these two tables, so they are handed to the view here rather
-                    // than at rebase time - rebase only re-points the pool planes.
+                    // The first layer has to publish even if the word happens to match the empty table
+                    // the bank was attached with: "nothing has been published" is not "nothing moved".
+                    if (!published_once_) { placement_changed = true; }
+                    // Held for exactly as long as the table names them. This used to run only when a
+                    // publication happened, which is precisely why a run of unchanged-pool layers
+                    // could drop a slot the Device still addressed.
+                    host_->hold_slots(placed_slots_);
+                    // The kernel reads these bases and the two tables, so they are handed to the view
+                    // here rather than at rebase time - rebase only re-points the pool planes.
                     auto& gu = experts_.bank.gate_up;
                     auto& dn = experts_.bank.down;
                     gu.host_codes  = host_base + host_gate_up_plane_[0];
@@ -1449,55 +1460,124 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                     dn.host_codes  = host_base + host_down_plane_[0];
                     dn.host_high   = dn_high_bytes != 0 ? host_base + host_down_plane_[1] : nullptr;
                     dn.host_scales = host_base + host_down_plane_[2];
-                    if (from_host != 0 || !moved.empty()) {
-                        if (host_offsets_device_ == nullptr) {
-                            host_offsets_device_ =
-                                std::make_unique<DeviceBuffer>(count_ * sizeof(std::uint64_t));
-                            host_flags_device_ =
-                                std::make_unique<DeviceBuffer>(count_ * sizeof(std::int32_t));
-                        }
-                        (void)cudaMemcpyAsync(host_offsets_device_->p, host_offsets_.data(),
-                                              count_ * sizeof(std::uint64_t),
-                                              cudaMemcpyHostToDevice, stream);
-                        (void)cudaMemcpyAsync(host_flags_device_->p, host_flags_.data(),
-                                              count_ * sizeof(std::int32_t),
-                                              cudaMemcpyHostToDevice, stream);
-                        gu.host_offsets = static_cast<const std::uint64_t*>(host_offsets_device_->p);
-                        dn.host_offsets = static_cast<const std::uint64_t*>(host_offsets_device_->p);
-                        gu.host_flags   = static_cast<const std::int32_t*>(host_flags_device_->p);
-                        dn.host_flags   = static_cast<const std::int32_t*>(host_flags_device_->p);
+                    if (host_offsets_device_ == nullptr) {
+                        host_offsets_device_ =
+                            std::make_unique<DeviceBuffer>(count_ * sizeof(std::uint64_t));
+                        host_flags_device_ =
+                            std::make_unique<DeviceBuffer>(count_ * sizeof(std::int32_t));
+                        placement_device_ =
+                            std::make_unique<DeviceBuffer>(count_ * sizeof(std::uint32_t));
+                        placement_stage_[0] =
+                            std::make_unique<PinnedHostBuffer>(count_ * sizeof(std::uint32_t));
+                        placement_stage_[1] =
+                            std::make_unique<PinnedHostBuffer>(count_ * sizeof(std::uint32_t));
                     }
-                    // A bank whose routes are all served this way needs no CPU half at all: that is
-                    // the point, and it is reported as such rather than inferred from the mask.
-                    // Printed every window including zeros: a second leg that silently serves
-                    // nothing looks exactly like one that is not wired.
+                    gu.host_offsets = static_cast<const std::uint64_t*>(host_offsets_device_->p);
+                    dn.host_offsets = gu.host_offsets;
+                    gu.host_flags   = static_cast<const std::int32_t*>(host_flags_device_->p);
+                    dn.host_flags   = gu.host_flags;
+                    if (placement_changed) {
+                        // The one word per expert is the whole publication: 4 bytes per expert that
+                        // moved, and the Device derives the three tables the GEMM reads.
+                        //
+                        // The batch reads from a pinned copy, and it alternates between two of them:
+                        // the sources are consumed in stream order, so the copy this layer hands over
+                        // must not be the one the layer before it already handed over.
+                        auto& stage = placement_stage_[placement_stage_next_];
+                        placement_stage_next_ ^= 1;
+                        std::memcpy(stage->data(), placement_.data(), count_ * sizeof(std::uint32_t));
+                        std::vector<void*>       dsts;
+                        std::vector<const void*> srcs;
+                        std::vector<std::size_t> sizes;
+                        dsts.reserve(count_);
+                        srcs.reserve(count_);
+                        sizes.reserve(count_);
+                        for (std::uint32_t expert = 0; expert < count_; ++expert) {
+                            if (placement_[expert] == placement_published_[expert]) { continue; }
+                            dsts.push_back(static_cast<char*>(placement_device_->p) +
+                                           static_cast<std::size_t>(expert) * sizeof(std::uint32_t));
+                            srcs.push_back(static_cast<const char*>(stage->data()) +
+                                           static_cast<std::size_t>(expert) * sizeof(std::uint32_t));
+                            sizes.push_back(sizeof(std::uint32_t));
+                        }
+                        cudaMemcpyAttributes attributes{};
+                        attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+                        attributes.flags          = 0;
+                        std::size_t attribute_index = 0;
+                        const auto submitted        = cudaMemcpyBatchAsync(
+                            dsts.data(), srcs.data(), sizes.data(), sizes.size(), &attributes,
+                            &attribute_index, 1, stream);
+                        publish_bytes_ += sizes.size() * sizeof(std::uint32_t);
+                        publish_bytes_max_ =
+                            std::max(publish_bytes_max_, sizes.size() * sizeof(std::uint32_t));
+                        // A1's step judgement, on the same rule the pool's publication uses: a step
+                        // that moves a handful of rows is the one a captured layer has to absorb. A
+                        // tier that turned over half its table in one layer is a budget event, not the
+                        // steady state, and averaging the two would hide both.
+                        if (sizes.size() <= 4) {
+                            publish_bytes_step_max_ = std::max<std::uint64_t>(
+                                publish_bytes_step_max_, sizes.size() * sizeof(std::uint32_t));
+                        }
+                        if (submitted != cudaSuccess) {
+                            // A driver that rejects the batch still has to get the word across, or the
+                            // layer would run on the previous placement - the exact failure this
+                            // rewrite exists to make impossible. The full copy is 1 KiB.
+                            (void)cudaMemcpyAsync(placement_device_->p, stage->data(),
+                                                  count_ * sizeof(std::uint32_t),
+                                                  cudaMemcpyHostToDevice, stream);
+                        }
+                        ops::moe_expand_expert_placements(
+                            static_cast<const std::uint32_t*>(placement_device_->p),
+                            static_cast<int>(count_), cache_->slot_bytes(), host_->slot_bytes(),
+                            static_cast<std::uint64_t*>(offsets_device_->p),
+                            static_cast<std::int32_t*>(mask_device_->p),
+                            static_cast<std::uint64_t*>(host_offsets_device_->p),
+                            static_cast<std::int32_t*>(host_flags_device_->p), stream);
+                        placement_published_ = placement_;
+                        placement_dirty_     = false;
+                        ++publish_calls_;
+                    }
                     if (bank_ == 0 && std::getenv("NINFER_EXPERT_TIMING")) {
-                        static std::uint64_t layers = 0, host_total = 0, seen_total = 0,
-                                             route_total = 0;
-                        host_total += from_host;
+                        static std::uint64_t layers = 0, placed_total = 0, route_total = 0;
+                        std::uint32_t host_hits = 0;
+                        for (std::size_t i = 0; i < values; ++i) {
+                            const auto expert = static_cast<std::uint32_t>(route_ids[i]);
+                            if (expert < host_flags_.size() && host_flags_[expert] != 0) { ++host_hits; }
+                        }
+                        placed_total += placed_slots_.size();
                         route_total += host_hits;
-                        ++seen_total;
                         if (++layers % 8 == 0) {
                             std::fprintf(stderr,
                                          "[hostd] per layer: host_experts=%.2f route_hits=%.2f "
                                          "of %llu\n",
-                                         static_cast<double>(host_total) / 8.0,
+                                         static_cast<double>(placed_total) / 8.0,
                                          static_cast<double>(route_total) / 8.0,
-                                         static_cast<unsigned long long>(seen_total));
+                                         static_cast<unsigned long long>(values));
                             std::fflush(stderr);
-                            host_total  = 0;
-                            route_total = 0;
-                            seen_total  = 0;
+                            placed_total = 0;
+                            route_total  = 0;
                         }
                     }
+                } else {
+                    // The tier cannot be addressed, so nothing it holds is offerable: every route the
+                    // pool does not hold goes to the CPU half. Drop the addresses rather than leaving
+                    // last layer's in place, and leave `placement_dirty_` set so the A3b check below
+                    // reports it instead of computing with them.
+                    placement_dirty_ = true;
+                    std::fill(host_flags_.begin(), host_flags_.end(), 0);
+                    experts_.bank.gate_up.host_flags   = nullptr;
+                    experts_.bank.down.host_flags      = nullptr;
+                    experts_.bank.gate_up.host_offsets = nullptr;
+                    experts_.bank.down.host_offsets    = nullptr;
                 }
-            } else {
+            } else if (!host_flags_.empty()) {
                 // Switching it off must leave nothing behind: a stale flags table would keep
                 // addressing the tier for a route the pool expects to own.
                 host_flags_.clear();
-                host_offsets_.clear();
-                experts_.bank.gate_up.host_flags = nullptr;
-                experts_.bank.down.host_flags    = nullptr;
+                experts_.bank.gate_up.host_flags   = nullptr;
+                experts_.bank.down.host_flags      = nullptr;
+                experts_.bank.gate_up.host_offsets = nullptr;
+                experts_.bank.down.host_offsets    = nullptr;
             }
             const auto delta_bytes = moved.size() * (sizeof(std::uint64_t) + sizeof(std::int32_t));            static const bool delta_enabled = [] {
                 const char* value = std::getenv("NINFER_PUBLISH_DELTA");
@@ -1536,7 +1616,24 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             const bool stale = pub_hot_ != hot_gen || pub_step_ != step_gen ||
                               pub_prefetch_ != prefetch_gen;
             const bool unchanged = moved.empty() && published_once_ && !stale;
-            if (!unchanged && table_bytes != 0 && mask_bytes != 0) {
+            if (placement_mode) {
+                // GH3: the tables this layer reads were written by the Device from this layer's own
+                // placement, so there is nothing to copy and no row to push. Only the bookkeeping has
+                // to say they are current - A3b below compares those numbers, and skipping them would
+                // make a correct table look stale.
+                published_once_ = true;
+                pub_hot_        = hot_gen;
+                pub_step_       = step_gen;
+                pub_prefetch_   = prefetch_gen;
+                table_hot_      = hot_gen;
+                table_step_     = step_gen;
+                table_prefetch_ = prefetch_gen;
+                // A layer whose placement moved did touch the host, so it is not host-free: the
+                // question `capt_free` asks is whether a captured layer could replay the tables it
+                // was captured with, and a row that changed answers that with "no". What got smaller
+                // is the price of the answer (4 bytes a row, not 12), not the answer.
+                if (placement_changed) { host_publish = true; }
+            } else if (!unchanged && table_bytes != 0 && mask_bytes != 0) {
                 host_publish    = true;
                 published_once_ = true;
                 pub_hot_        = hot_gen;
@@ -2060,6 +2157,14 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                                  std::to_string(cache_->hot_generation(bank_)) + "/" +
                                  std::to_string(cache_->step_generation(bank_)) + "/" +
                                  std::to_string(cache_->prefetch_generation(bank_)));
+    }
+    // GH3's half of the same check, and the one that would have caught the NINFER_HOST_DIRECT NaN on
+    // the first layer it happened instead of forty layers later: if the placement this layer derived
+    // did not reach the Device, the GEMM is about to address slots that no longer hold those experts.
+    // Better a refusal than another expert's bytes.
+    if (placement_dirty_) {
+        throw std::runtime_error("host placement is stale (bank " + std::to_string(bank_) +
+                                 "): the Device is running on an earlier snapshot of the tier");
     }
     // port (sm_89): D1-D4 prefetch, in the only form that is safe today.
     //

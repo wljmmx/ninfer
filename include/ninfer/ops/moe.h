@@ -229,4 +229,34 @@ void moe_pack_host_fetch(const void* x, const void* residual, const void* ids,
 void moe_merge_host_term(const void* host_term, const void* gpu_term, void* residual, int count,
                          cudaStream_t stream);
 
+// port (sm_89): GH3 - the Device writes the expert tables (kernels/cuda/expert_table.cu).
+//
+// The publisher used to keep three parallel per-expert tables and merge them on the host: a pool
+// offset, a host-tier offset, and a mask that meant "either one has an address". Every publish then
+// pushed those rows to the Device. The mask in particular was *computed* on the host, which is the
+// one thing a captured layer cannot absorb - and the host's per-row work grew with every structure
+// added to the placement (the prediction region was the third).
+//
+// GH3 collapses the source of truth to one word per expert:
+//
+//   <slot>                        the pool holds this expert at `slot`
+//   kExpertPlacementHost | <slot> the pinned tier holds it at `slot`
+//   kExpertPlacementAbsent        neither, so the CPU half serves it
+//
+// and this kernel expands that word into the four tables the GEMM reads. The host's publish is now
+// 4 bytes per expert that moved instead of 12, and `mask[e] = 1` - "this route resolves to an
+// address" - is written where it is consumed.
+inline constexpr std::uint32_t kExpertPlacementAbsent = 0xffffffffu;
+inline constexpr std::uint32_t kExpertPlacementHost   = 0x80000000u;
+
+// `count` is the logical expert count of one bank. The two slot strides are the byte distance between
+// consecutive slots of the pool and of the pinned tier; they differ, which is why the tables are
+// derived here rather than handed over finished. Any of the four destinations may be null, and a
+// table the caller does not keep is not written. Enqueues on `stream`; no host synchronisation.
+void moe_expand_expert_placements(const std::uint32_t* placements, int count,
+                                  std::uint64_t pool_slot_bytes, std::uint64_t host_slot_bytes,
+                                  std::uint64_t* pool_offsets, std::int32_t* pool_mask,
+                                  std::uint64_t* host_offsets, std::int32_t* host_flags,
+                                  cudaStream_t stream);
+
 } // namespace ninfer::ops
