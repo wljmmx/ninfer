@@ -12,6 +12,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -217,10 +221,92 @@ public:
         return out;
     }
 
-    // Publishing is best effort and silent by design: it runs on the request path, and a cache that
-    // cannot be written must not turn a good request into a bad one.
+    // port (sm_89): Q64 2d-2h. The publish is a one-second round trip (measured: 1.02 s transfer for a
+    // 469-token checkpoint), and it used to run inside the request that produced it. A cache write
+    // does not make the request any better, so with NINFER_LMCACHE_ASYNC_WRITE it goes to a writer
+    // thread and the request returns as soon as the checkpoint is copied.
+    //
+    // The copy is the price: the checkpoint owns its bytes, so handing it to the thread costs one
+    // memcpy of kv_bytes (~2.8 MB, about a millisecond). That is the reason this can be done without
+    // touching the engine's buffers or their lifetimes.
+    //
+    // Switch off (the default) is the old call, on the old thread, byte for byte.
     void store(std::span<const TokenId> prompt_tokens,
                const ninfer::CachedCheckpoint& checkpoint) override {
+        if (!ready_.load() || bridge_ == nullptr || prompt_tokens.empty()) { return; }
+        if (checkpoint.page_bytes == 0 || checkpoint.kv_bytes.empty()) { return; }
+        std::call_once(writer_once_, [this] {
+            // Read once, at the first store: a cache either writes behind the request or in front of
+            // it, and flipping mid-run would make the two indistinguishable in a log.
+            async_write_ = std::getenv("NINFER_LMCACHE_ASYNC_WRITE") != nullptr;
+            if (async_write_) { writer_ = std::thread([this] { write_loop(); }); }
+        });
+        if (!async_write_) {
+            publish_job(prompt_tokens, checkpoint);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> guard(write_mutex_);
+            // A writer that cannot keep up must not grow without bound: a dropped write costs one
+            // future miss, while an unbounded queue costs the process. Counted, never silent.
+            if (writes_.size() >= kMaxPendingWrites) {
+                ++dropped_writes_;
+                return;
+            }
+            writes_.push_back(Job{std::vector<TokenId>(prompt_tokens.begin(), prompt_tokens.end()),
+                                  checkpoint});
+        }
+        write_cv_.notify_one();
+    }
+
+    ~LmcacheBackend() override {
+        std::size_t pending = 0;
+        {
+            std::lock_guard<std::mutex> guard(write_mutex_);
+            pending     = writes_.size();
+            write_stop_ = true;
+        }
+        write_cv_.notify_all();
+        if (writer_.joinable()) { writer_.join(); }
+        // Printed once, at exit, because a writer that silently lost its last writes looks exactly
+        // like a cache that had nothing to say. Draining is not attempted: the process is going away
+        // and a miss on the next run is cheaper than a shutdown that hangs.
+        if (async_write_ && (written_ != 0 || dropped_writes_ != 0 || pending != 0)) {
+            std::fprintf(stderr, "[lmcache] writer stopped: written=%llu dropped=%llu pending=%llu\n",
+                         static_cast<unsigned long long>(written_),
+                         static_cast<unsigned long long>(dropped_writes_),
+                         static_cast<unsigned long long>(pending));
+            std::fflush(stderr);
+        }
+    }
+
+    struct Job {
+        std::vector<TokenId> tokens;
+        ninfer::CachedCheckpoint checkpoint;
+    };
+
+    void write_loop() {
+        for (;;) {
+            Job job;
+            {
+                std::unique_lock<std::mutex> lock(write_mutex_);
+                write_cv_.wait(lock, [this] { return write_stop_ || !writes_.empty(); });
+                if (writes_.empty()) {
+                    if (write_stop_) { return; }
+                    continue;
+                }
+                job = std::move(writes_.front());
+                writes_.pop_front();
+            }
+            publish_job(job.tokens, job.checkpoint);
+            ++written_;
+        }
+    }
+
+    // The body that used to be store(): unchanged, so the async path is the same code, on another
+    // thread.
+    void publish_job(std::span<const TokenId> prompt_tokens,
+                     const ninfer::CachedCheckpoint& checkpoint) {
         if (!ready_.load() || bridge_ == nullptr || prompt_tokens.empty()) { return; }
         if (checkpoint.page_bytes == 0 || checkpoint.kv_bytes.empty()) { return; }
 
@@ -303,6 +389,19 @@ private:
     // Today both callers are on one thread, so this changes nothing observable, which is exactly why
     // it is landing ahead of the thread rather than with it.
     std::mutex bridge_mutex_;
+    // 2d-2h: the writer and its queue. Every field below is inert unless NINFER_LMCACHE_ASYNC_WRITE
+    // was set at the first store; with the switch off the thread is never created and the queue never
+    // holds anything, so the synchronous path is the one that was measured.
+    static constexpr std::size_t kMaxPendingWrites = 8;
+    std::once_flag writer_once_;
+    std::thread writer_;
+    std::mutex write_mutex_;
+    std::condition_variable write_cv_;
+    std::deque<Job> writes_;
+    bool write_stop_   = false;
+    bool async_write_  = false;
+    std::uint64_t written_        = 0;
+    std::uint64_t dropped_writes_ = 0;
     std::atomic<bool> ready_{false};
     std::atomic<std::uint64_t> sequence_{0};
     std::size_t page_bytes_ = 0;
