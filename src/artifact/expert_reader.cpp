@@ -117,6 +117,12 @@ const std::byte* ArtifactExpertReader::object_base(std::uint32_t object_index) c
 bool ArtifactExpertReader::spans(const ExpertFileEntry& entry,
                                  std::vector<ExpertBlobSpan>& out) const {
     out.clear();
+    // port (sm_89): Q60's measurement switch. On this machine every artifact object maps, so spans()
+    // always succeeds and the uploader never takes the staged path - which is why the coalesced read
+    // measured zero: it had no consumer, not a defect. This makes the reader answer "I cannot name
+    // them" so that path runs, and the coalesced form can be compared against the per-expert one.
+    static const bool no_spans = std::getenv("NINFER_NO_SPANS") != nullptr;
+    if (no_spans) { return false; }
     out.reserve(entry.chunks.size());
     // Only name slices that are already mapped. A file that cannot be mapped here falls back to
     // read_entry, which is the path this replaces rather than the one it depends on.
