@@ -428,6 +428,41 @@ void static_probe(std::uint32_t bank, std::int32_t tokens, bool covered, std::ui
 }
 } // namespace
 
+void ExpertStream::stage_predicted(cudaStream_t stream) {
+    static const bool vram = [] {
+        const char* value = std::getenv("NINFER_PREFETCH_MODE");
+        return value != nullptr && std::strcmp(value, "vram") == 0;
+    }();
+    if (!vram || cache_ == nullptr || predicted_.empty() ||
+        cache_->prefetch_slots_per_bank() == 0) {
+        return;
+    }
+    std::vector<std::uint32_t> absent;
+    absent.reserve(predicted_.size());
+    for (const auto expert : predicted_) {
+        if (expert < 0 || static_cast<std::uint32_t>(expert) >= count_) { continue; }
+        const auto id = static_cast<std::uint32_t>(expert);
+        if (cache_->expert_slot(bank_, id)) { continue; } // already resident: not a prediction
+        absent.push_back(id);
+    }
+    prefetch_delta_ += absent.size();
+    std::vector<ExpertCacheKey> placed;
+    if (!absent.empty() && cache_->set_prefetch_experts(bank_, absent, placed) != 0) {
+        cache_->prepare(std::span<const ExpertCacheKey>(placed), stream);
+        (void)cache_->progress(stream);
+        prefetch_placed_ += placed.size();
+    }
+    static std::uint64_t reports = 0;
+    if (bank_ == 0 && (++reports % 40) == 0) {
+        std::fprintf(stderr, "[pfv] delta=%llu placed=%llu hits=%llu region=%u/bank\n",
+                     (unsigned long long)prefetch_delta_,
+                     (unsigned long long)prefetch_placed_,
+                     (unsigned long long)prefetch_hits_,
+                     cache_->prefetch_slots_per_bank());
+        std::fflush(stderr);
+    }
+}
+
 bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32_t tokens,
                           cudaStream_t stream, const std::int32_t* host_ids, bool assume_covered) {
     if (cache_ == nullptr) { throw std::logic_error("expert stream is not attached"); }
@@ -575,6 +610,14 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         const auto expert = route_ids[i];
         if (expert < 0 || static_cast<std::uint32_t>(expert) >= count_) {
             throw std::out_of_range("expert stream received a route outside its bank");
+        }
+    }
+    // Q30/P6: how much of this layer the prediction region actually served. A placement is work; this
+    // is the only number that says whether the region is worth its slots.
+    if (cache_ != nullptr && cache_->prefetch_slots_per_bank() != 0) {
+        for (std::size_t i = 0; i < values; ++i) {
+            const auto slot = cache_->expert_slot(bank_, static_cast<std::uint32_t>(route_ids[i]));
+            if (slot && cache_->prefetch_slot(*slot)) { ++prefetch_hits_; }
         }
     }
     // port (sm_89): a pool that cannot hold a whole layer keeps a hot set per bank. This step's
@@ -1242,61 +1285,24 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         // Skipping it on an unchanged layer would leave a slot pinned for a layer that never reads
         // it, which is a leak the tier cannot see.
         if (host_ != nullptr && host_direct) { host_->begin_layer(); }
-        // Q30/P6: the Device-target prediction, placed BEFORE the residency decision and therefore
-        // before this layer's table publish. That ordering is the whole point: the copy is queued on
-        // this stream ahead of the kernels, the rebuild below gives the new rows an offset and a
-        // mask, and the layer that routes to them finds them resident. Placing it after the publish
-        // was tried first and tripped A3b (a placement the published tables did not contain).
-        //
-        // Only the part the pool does not already hold is placed - a prediction that is already
-        // resident is not a prediction - which is what keeps the region small: the measured delta is
-        // about one expert a layer, not top-k.
-        static const bool vram_prefetch = [] {
-            const char* value = std::getenv("NINFER_PREFETCH_MODE");
-            return value != nullptr && std::strcmp(value, "vram") == 0;
-        }();
-        std::uint32_t prefetch_placed = 0;
-        if (vram_prefetch && cache_ != nullptr && tokens > 0 && tokens <= kHotSetUpdateTokens &&
-            !predicted_.empty()) {
-            std::vector<std::uint32_t> absent;
-            absent.reserve(predicted_.size());
-            for (const auto expert : predicted_) {
-                if (expert < 0 || static_cast<std::uint32_t>(expert) >= count_) { continue; }
-                const auto id = static_cast<std::uint32_t>(expert);
-                if (cache_->expert_slot(bank_, id)) { continue; } // already resident
-                absent.push_back(id);
-            }
-            prefetch_delta_ += absent.size();
-            std::vector<ExpertCacheKey> placed;
-            if (!absent.empty() && cache_->set_prefetch_experts(bank_, absent, placed) != 0) {
-                cache_->prepare(std::span<const ExpertCacheKey>(placed), stream);
-                (void)cache_->progress(stream);
-                prefetch_placed_ += placed.size();
-                prefetch_placed = static_cast<std::uint32_t>(placed.size());
-            }
-            // Did this layer's routes land in the region? That is the only honest numerator for the
-            // prediction: placements count work, hits count value.
-            for (std::size_t i = 0; i < values; ++i) {
-                const auto expert = static_cast<std::uint32_t>(route_ids[i]);
-                if (expert >= count_) { continue; }
-                const auto slot = cache_->expert_slot(bank_, expert);
-                if (slot && cache_->prefetch_slot(*slot)) { ++prefetch_hits_; }
-            }
-            static std::uint64_t reports = 0;
-            if (bank_ == 0 && (++reports % 40) == 0) {
-                std::fprintf(stderr, "[pfv] delta=%llu placed=%llu hits=%llu region=%u/bank\n",
-                             (unsigned long long)prefetch_delta_,
-                             (unsigned long long)prefetch_placed_,
-                             (unsigned long long)prefetch_hits_,
-                             cache_->prefetch_slots_per_bank());
-                std::fflush(stderr);
-            }
-        }
+        // Q30/P6: the prediction is placed by stage_predicted(), at the end of the layer that made it.
+        // Placing it here was tried first and is structurally useless: by the time ensure() runs, this
+        // layer's routes are known, so "predicted and not resident" is no longer a prediction - it is
+        // the demand set, and the demand path fills it anyway.
         // A prediction is a placement, so the table has to be rebuilt even when the resident set did
         // not move - otherwise the rows the region just took never reach the Device.
         const bool set_moved =
             refresh && cache_->set_resident_experts(bank_, wanted, static_cast<std::uint32_t>(hot_cap));
-        if (set_moved || prefetch_placed != 0) {
+        // A section's publish is needed when either the residency changed or a segment moved since the
+        // last publication. The second half matters now that the prediction region is staged at the
+        // end of the previous layer's ffn: that placement happens outside ensure(), so `set_moved`
+        // does not see it and the rows would otherwise never reach the Device.
+        const auto hot_gen      = cache_->hot_generation(bank_);
+        const auto step_gen     = cache_->step_generation(bank_);
+        const auto prefetch_gen = cache_->prefetch_generation(bank_);
+        const bool need_publish = !published_once_ || pub_hot_ != hot_gen || pub_step_ != step_gen ||
+                                 pub_prefetch_ != prefetch_gen;
+        if (set_moved || need_publish) {
             set_initialised_ = true;
             std::fill(offsets_.begin(), offsets_.end(), 0);
             mask_host_.assign(count_, 0);
@@ -1498,9 +1504,6 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             // next bank skipped its own - which the A3b check then caught as "device holds 23, cache
             // is on 24". The old single counter had the same shape; it only survived because every
             // bank happened to publish every layer.
-            const auto hot_gen      = cache_->hot_generation(bank_);
-            const auto step_gen     = cache_->step_generation(bank_);
-            const auto prefetch_gen = cache_->prefetch_generation(bank_);
             const bool stale = pub_hot_ != hot_gen || pub_step_ != step_gen ||
                               pub_prefetch_ != prefetch_gen;
             const bool unchanged = moved.empty() && published_once_ && !stale;
@@ -1774,13 +1777,38 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     static const bool prefetch_sync  = std::getenv("NINFER_PREFETCH_SYNC") != nullptr;
     static const bool prefetch_queue = std::getenv("NINFER_PREFETCH") != nullptr;
     if ((prefetch_sync || prefetch_queue) && host_ != nullptr) {
-        static const std::uint32_t per_layer = [] {
+        // Q30/P6: how many experts one read-ahead asks for.
+        //
+        // It used to be a fixed eight, which is neither the model's top-k nor the problem's size: the
+        // prediction already filters to "predicted AND not in the pool", and on this artifact that
+        // delta is about one expert a layer - so seven of every eight were work the filter threw away,
+        // and a job is billed by its bytes (8 x 1.92 MiB = 15.4 MiB against a 256 MiB budget). The
+        // count now IS the delta, with the model's own top-k as the ceiling; NINFER_PREFETCH_PER_LAYER
+        // stays as an override (0 = derive), so an A/B can still pin it.
+        static const std::uint32_t per_layer_override = [] {
             const char* value = std::getenv("NINFER_PREFETCH_PER_LAYER");
-            if (value != nullptr && *value != '\0') {
-                return static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
-            }
-            return 8U;
+            return value != nullptr && *value != '\0'
+                       ? static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10))
+                       : 0U;
         }();
+        std::uint32_t predicted_absent = 0;
+        {
+            std::vector<std::uint32_t> distinct;
+            distinct.reserve(predicted_.size());
+            for (const auto expert : predicted_) {
+                if (expert < 0 || static_cast<std::uint32_t>(expert) >= count_) { continue; }
+                const auto id = static_cast<std::uint32_t>(expert);
+                if (cache_->expert_slot(bank_, id)) { continue; } // already resident: not a prediction
+                if (std::find(distinct.begin(), distinct.end(), id) != distinct.end()) { continue; }
+                distinct.push_back(id);
+            }
+            predicted_absent = static_cast<std::uint32_t>(distinct.size());
+        }
+        const std::size_t per_layer =
+            per_layer_override != 0
+                ? static_cast<std::size_t>(per_layer_override)
+                : static_cast<std::size_t>(std::max(1U, predicted_absent));
+        prefetch_target_ += predicted_absent;
         // Partial selection: recency first, then the decayed score. The score ranks experts this
         // bank has been using, which is exactly the set the pool already holds, so it can only ever
         // fill the tail; the head is what this bank routed on its previous step, which is what the

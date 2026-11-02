@@ -868,9 +868,45 @@ private:
 
 } // namespace
 
+// Q68b in the form the plan describes: at the END of layer L, score layer L+1's router against the
+// residual L has just produced, and hand the answer to L+1's stream.
+//
+// The earlier form scored L's own router against L-1's residual and handed the answer to L's own
+// stream - a prediction for the layer that had just finished, which nothing downstream could use (the
+// VRAM prediction region built on it measured 0.9% of placements ever routed). Scoring forward is
+// also the cheaper question: the residual exists either way, and only the router rows differ.
+bool predict_enabled() {
+    static const bool value = [] {
+        const char* v = std::getenv("NINFER_PREFETCH_PREDICT");
+        return v != nullptr && *v != '\0' && std::strtol(v, nullptr, 10) != 0;
+    }();
+    return value;
+}
+
+void predict_next_layer(const Tensor& residual, const RoutedMoeParameters& next,
+                        WorkspaceArena& workspace, DeviceExecutionView execution) {
+    if (!predict_enabled() || next.stream == nullptr || residual.ne[1] != 1) { return; }
+    const auto& routed = next.profile.routed;
+    const ops::RouteProfile route_profile{routed.ffn.hidden, routed.experts, routed.top_k};
+    auto guess_ids     = workspace.alloc(DType::I32, {routed.top_k, 1});
+    auto guess_coeffs  = workspace.alloc(DType::FP32, {routed.top_k, 1});
+    auto guess_shared  = workspace.alloc(DType::FP32, {1});
+    auto guess_scratch = workspace.alloc_bytes(stream_route_bytes(next, 1, 1));
+    MemoryArena guess_arena(MemorySpan{guess_scratch.data, guess_scratch.bytes, execution.device()});
+    ops::ExpertRoutes guessed{guess_ids, guess_coeffs};
+    ops::topk_softmax_route(residual, route_profile, next.control, guessed, guess_shared,
+                            guess_arena, execution);
+    std::vector<std::int32_t> guess(routed.top_k);
+    const std::size_t bytes = static_cast<std::size_t>(routed.top_k) * sizeof(std::int32_t);
+    (void)cudaMemcpyAsync(guess.data(), guess_ids.data, bytes, cudaMemcpyDeviceToHost,
+                          execution.stream);
+    (void)cudaStreamSynchronize(execution.stream);
+    next.stream->set_predicted(guess);
+}
+
 void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& residual,
                   WorkspaceArena& workspace, DeviceExecutionView execution,
-                  const Tensor* predictor_input) {
+                  const Tensor* predictor_input, const RoutedMoeParameters* predict_next) {
     const bool layer_timing = std::getenv("NINFER_SPLIT_TIMING") != nullptr;
     // port (sm_89): the 19.4 GiB pool latches cudaErrorInvalidValue somewhere before this layer's
     // routing launch, and the routing check is only the first one that asks. This asks earlier: on
@@ -1567,6 +1603,8 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
         host_routed_ffn(fetch, moe,
                         ops::ExpertSubset{ops::ExpertSubsetKind::MaskZeros, host_mask}, mixed_f32,
                         residual, execution, host_term_device);
+        // The residual for this layer is final: score the next layer's router on it and hand it over.
+        if (predict_next != nullptr) { predict_next_layer(residual, *predict_next, workspace, execution); }
         if (std::getenv("NINFER_SPLIT_TIMING") != nullptr) {
             // Where the split path's per-layer time actually goes. Without this the 4x gap against
             // full residency could only be guessed at: the expert bookkeeping measures ~0.01 ms, so
@@ -1596,6 +1634,8 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
         ops::routed_swiglu(hidden, routed, moe.stream->experts(), routes, {},
                            ops::ScaledSwiGLUTerm{moe.shared, shared_coefficients},
                            ops::MoeEpilogue::AddResidual, residual, arena, execution);
+        // Same hand-over on the streamed path: the residual is final here too.
+        if (predict_next != nullptr) { predict_next_layer(residual, *predict_next, workspace, execution); }
     } catch (const std::exception& error) {
         throw std::invalid_argument(std::string("expert stream run: ") + error.what());
     }
@@ -1702,7 +1742,7 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
 
 void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual,
          const ops::SparseMoeHints& hints, WorkspaceArena& workspace, DeviceExecutionView execution,
-         bool mtp, const Tensor* predictor_input) {
+         bool mtp, const Tensor* predictor_input, const RoutedMoeParameters* predict_next) {
     const auto stream  = execution.stream;
     auto scope         = workspace.scope();
     const auto columns = hidden.ne[1];
@@ -1719,7 +1759,7 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
         // through that scale so the perplexity cost can be measured before any kernel changes.
         ops::act_quant_a8_roundtrip_bf16(hidden.data, hidden.ne[0], columns, stream);
         if (moe->stream) {
-            streamed_ffn(hidden, *moe, residual, workspace, execution, predictor_input);
+            streamed_ffn(hidden, *moe, residual, workspace, execution, predictor_input, predict_next);
             return;
         }
         const auto storage =

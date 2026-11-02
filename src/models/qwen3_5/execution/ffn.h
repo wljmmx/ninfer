@@ -14,7 +14,12 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
          // layer, or null. This layer's router applied to it is a *prediction* of this layer's
          // routes: z_(L-1) is what x_L would be if this block's attention added nothing. Diagnostic
          // only - the routes actually used are still computed from `hidden`.
-         const Tensor* predictor_input = nullptr);
+         const Tensor* predictor_input = nullptr,
+         // port (sm_89): Q68b, the form the plan describes. The NEXT layer's routed block: at the end
+         // of this layer its router is scored against the residual just produced, and the answer is
+         // handed to that layer's stream. Null on the last layer, and a no-op unless
+         // NINFER_PREFETCH_PREDICT is set.
+         const RoutedMoeParameters* predict_next = nullptr);
 
 // Probe-only plumbing (NINFER_LAYER_PROBE=2, decode only): the layer loop records the residual
 // stream after each layer and hands it back as the next layer's predictor input. Both are no-ops

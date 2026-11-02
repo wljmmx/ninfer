@@ -3,6 +3,7 @@
 #include "models/qwen3_5/execution/attention.h"
 #include "models/qwen3_5/execution/gdn.h"
 #include "models/qwen3_5/execution/ffn.h"
+#include "models/qwen3_5/execution/expert_stream.h"
 #include "models/qwen3_5/execution/mtp.h"
 #include "models/qwen3_5/execution/workspace.h"
 
@@ -1227,16 +1228,27 @@ ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
 }
 
 void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase,
-                           const ops::SparseMoeHints& hints) {
+                           const ops::SparseMoeHints& hints, int layer) {
     Tensor h = workspace::post_mixer_hidden(work_, config_, x.ne[1]);
     ops::rmsnorm(x, weights.post_attention_norm, config_.rms_norm_eps, true, h, ctx_.stream);
     // [P1 probe] optional per-token int8 activation round-trip (NINFER_ACT_A8)
     ops::act_quant_a8_roundtrip_bf16(h.data, h.ne[0], h.ne[1], ctx_.stream);
+    // Q68b: hand the NEXT layer's routed block in, so the prediction computed after this layer's
+    // residual is the one that layer will consume. Layer indices here are the block ordinal, which is
+    // also the expert bank's index, so `+1` names both.
+    const auto next = static_cast<std::size_t>(layer) + 1;
+    const RoutedMoeParameters* predict_next = nullptr;
+    if (next < parameters_.text.layers.size()) {
+        const auto& ffn_next = parameters_.text.layers[next].ffn;
+        if (const auto* moe_next = std::get_if<RoutedMoeParameters>(&ffn_next)) {
+            predict_next = moe_next;
+        }
+    }
     ffn(h, weights.ffn, x, hints, work_, ctx_.execution_view(), false,
         // Q68b probe: score this layer's router against the residual stream the previous layer left
         // behind, then record this layer's own for the next one. Both calls are no-ops unless
         // NINFER_LAYER_PROBE=2.
-        router_probe_input(ctx_.execution_view().device()));
+        router_probe_input(ctx_.execution_view().device()), predict_next);
     router_probe_save(x);
 }
 
@@ -1294,7 +1306,8 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                                  work_.used());
                     std::fflush(stderr);
                 }
-                mlp_tail(block, x, ph, next_projection_hints(static_cast<int>(layer)));
+                mlp_tail(block, x, ph, next_projection_hints(static_cast<int>(layer)),
+                         static_cast<int>(layer));
                 if (trace_stage) {
                     std::fprintf(stderr, "[stage] layer %zu post-mixer end: used %zu\n", layer,
                                  work_.used());

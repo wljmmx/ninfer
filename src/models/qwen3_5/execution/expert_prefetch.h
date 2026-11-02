@@ -23,6 +23,7 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <vector>
 
 namespace ninfer::models::qwen3_5::execution {
 
@@ -71,7 +72,13 @@ private:
     ExpertPrefetchQueue& operator=(const ExpertPrefetchQueue&) = delete;
 
     mutable std::mutex mutex_;
-    std::shared_ptr<core::Prefetcher> worker_;
+    // More than one worker because a read-ahead is a disk read and the queue is process-wide: forty
+    // banks offer one job each per token, and a single worker serialised them behind whichever job it
+    // held (measured `pending=8/8` with `dropped_backlog` climbing). The first worker owns the meter
+    // (budget, gate, usefulness); the rest mirror its gate so one decision governs all of them.
+    std::vector<std::shared_ptr<core::Prefetcher>> workers_;
+    std::size_t worker_cursor_        = 0;
+    bool workers_enabled_             = false;
     std::uint64_t ran_     = 0;
     std::uint64_t expired_ = 0;
     int users_             = 0;

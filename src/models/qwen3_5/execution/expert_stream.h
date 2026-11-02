@@ -249,6 +249,19 @@ public:
     // consumed: the read-ahead asks for "predicted and not resident" instead of "historically hot".
     void set_predicted(std::vector<std::int32_t> ids) { predicted_ = std::move(ids); }
 
+    // Q30/P6: put the prediction into the Device region NOW, at the end of the layer that made it.
+    // Placing it at the next layer's ensure() is structurally useless - by then that layer's routes
+    // are known, so "predicted and not resident" is just the demand set. Here the copy is queued
+    // between the layers, and the next layer's table publish picks the new rows up.
+    void stage_predicted(cudaStream_t stream);
+
+    // Routes a layer actually found in the region since the last call (the prediction's numerator).
+    [[nodiscard]] std::uint64_t take_prefetch_hits() noexcept {
+        const auto taken = prefetch_hits_;
+        prefetch_hits_   = 0;
+        return taken;
+    }
+
 private:
     std::uint32_t count_          = 0;
     WeightBankLayout gate_up_;
@@ -305,6 +318,10 @@ private:
     // Routes served from the prediction region. Placements count work; this counts value, and it is
     // the number that decides whether the region is sized right (or should be zero).
     std::uint64_t prefetch_hits_ = 0;
+    // Q30/P6: how many experts one read-ahead was asked for (the delta), summed over the layers that
+    // asked. Together with `prefetch_calls_` this gives the per-layer ask, which is the number the
+    // job granularity and the budget have to be sized from.
+    std::uint64_t prefetch_target_ = 0;
     // A1 needs the two segments apart, because they answer different questions: the R1 segment moves
     // at an epoch boundary (a large publish, once per 64 steps) and only the per-step part is bounded
     // by the 128 B bar. Classified by the number of experts that moved - a boundary re-placement
