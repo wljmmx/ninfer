@@ -746,6 +746,13 @@ public:
     // The two pools inside the arena (see claim()).
     [[nodiscard]] std::uint32_t routed_capacity() const noexcept { return routed_capacity_; }
     [[nodiscard]] std::uint32_t prefetch_slots() const noexcept { return prefetch_slots_; }
+    [[nodiscard]] std::uint32_t bank_count() const noexcept {
+        return static_cast<std::uint32_t>(state_.size());
+    }
+    // Q20 static candidates: bumped whenever any slot->expert mapping moves. A Device-side candidate
+    // table is only valid for the generation it was copied at, so the ring path checks this before
+    // it names a host slot.
+    [[nodiscard]] std::uint64_t slot_generation() const noexcept { return slot_generation_; }
 
     // port (sm_89): what the arena actually did. A split run is only cheap when `miss` stops
     // growing: a miss is an artifact read, a hit is a byte range that was already in RAM. Reported
@@ -882,6 +889,7 @@ private:
             const auto slot    = begin + used++;
             slot_bank_[slot]   = bank;
             slot_expert_[slot] = expert;
+            ++slot_generation_;
             return slot;
         }
         std::uint32_t victim  = kNone;
@@ -917,6 +925,7 @@ private:
         prefetched_[victim]  = 0; // the slot now holds another expert, so the mark dies with it
         slot_bank_[victim]   = bank;
         slot_expert_[victim] = expert;
+        ++slot_generation_;
         return victim;
     }
 
@@ -989,6 +998,7 @@ private:
         slot_last_use_[target] = slot_last_use_[slot];
         prefetched_[target]    = 0;
         state_[bank].slot_of[expert] = target;
+        ++slot_generation_;
         ++stats_.second_chance_admissions;
         return true;
     }
@@ -1028,6 +1038,7 @@ private:
         slot_expert_[from]     = kNone;
         second_chance_free_.push_back(from);
         state_[bank.index].slot_of[expert] = target;
+        ++slot_generation_;
         ++stats_.second_chance_promotions;
         return target;
     }
@@ -1132,6 +1143,7 @@ private:
     // only a comparison once it is full.
     std::uint32_t second_chance_slots_ = 0;
     std::uint32_t second_chance_used_  = 0;
+    std::uint64_t slot_generation_     = 0;
     // Slots a promotion handed back. Reused before the bump pointer so a promotion does not shrink
     // the region by one slot forever.
     std::vector<std::uint32_t> second_chance_free_;

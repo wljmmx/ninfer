@@ -263,6 +263,9 @@ ExpertStream::ExpertStream(std::uint32_t count, WeightBankLayout gate_up, Weight
         const char* value = std::getenv("NINFER_EXPERT_POLICY");
         return value != nullptr && std::strcmp(value, "slru") == 0;
     }();
+    static_warm_ = std::getenv("NINFER_WARM_STATIC") != nullptr &&
+                   std::getenv("NINFER_HOST_WARM") != nullptr &&
+                   std::getenv("NINFER_HOST_DIRECT") != nullptr;
 }
 
 void ExpertStream::attach_host(std::shared_ptr<HostExpertResidency> host) noexcept {
@@ -533,6 +536,50 @@ void ExpertStream::stage_predicted(cudaStream_t stream) {
     }
 }
 
+std::uint32_t ExpertStream::publish_static_table() {
+    ring_snapshot_host_.assign(count_, ops::kRingAdmitAbsent);
+    host_->snapshot_slots(bank_, ring_snapshot_host_);
+    std::uint32_t present = 0;
+    for (const auto slot : ring_snapshot_host_) {
+        if (slot != HostExpertResidency::kAbsentSlot) { ++present; }
+    }
+    const std::size_t bytes = static_cast<std::size_t>(count_) * sizeof(std::uint32_t);
+    if (!ring_candidates_device_ || ring_candidates_device_->bytes < bytes) {
+        ring_candidates_device_ = std::make_unique<DeviceBuffer>(bytes);
+    }
+    ring_candidates_device_->copy_from_host(ring_snapshot_host_.data(), bytes);
+    ++static_table_refreshes_;
+    static_candidates_ready_ = true;
+    static_candidates_count_ = present;
+    static_table_generation_ = host_->slot_generation();
+    if (bank_ == 0 && std::getenv("NINFER_RING_PROBE") != nullptr) {
+        std::fprintf(stderr, "[warm-static] table copy #%llu present=%u\n",
+                     static_cast<unsigned long long>(static_table_refreshes_), present);
+        std::fflush(stderr);
+    }
+    return present;
+}
+
+void ExpertStream::refresh_static_candidates() {
+    if (!static_warm_ || host_ == nullptr) { return; }
+    const auto banks = std::max<std::uint32_t>(1U, host_->bank_count());
+    const auto per_bank = std::max<std::uint32_t>(8U, host_->routed_capacity() / banks);
+    const auto keep     = std::min<std::uint32_t>(per_bank, count_);
+    std::vector<std::uint32_t> ranked(count_);
+    std::iota(ranked.begin(), ranked.end(), 0U);
+    std::stable_sort(ranked.begin(), ranked.end(),
+                     [&](std::uint32_t a, std::uint32_t b) { return hot_score_[a] > hot_score_[b]; });
+    std::vector<std::int32_t> candidates(ranked.begin(),
+                                         ranked.begin() + static_cast<std::ptrdiff_t>(keep));
+    host_->ensure_scored(ExpertBankId{bank_}, candidates, hot_score_.data());
+    publish_static_table();
+    if (bank_ == 0 && std::getenv("NINFER_RING_PROBE") != nullptr) {
+        std::fprintf(stderr, "[warm-static] bank=%u asked=%u held=%u per_bank=%u\n", bank_, keep,
+                     static_candidates_count_, per_bank);
+        std::fflush(stderr);
+    }
+}
+
 std::size_t ExpertStream::device_admit_ring(const void* device_ids, std::int32_t values,
                                             std::uint32_t ring_base, std::uint32_t ring_slots,
                                             cudaStream_t stream, std::vector<std::uint32_t>& wanted,
@@ -562,12 +609,16 @@ std::size_t ExpertStream::device_admit_ring(const void* device_ids, std::int32_t
     const std::size_t candidate_bytes = static_cast<std::size_t>(count_) * sizeof(std::uint32_t);
     if (!ring_candidates_device_ || ring_candidates_device_->bytes < candidate_bytes) {
         ring_candidates_device_ = std::make_unique<DeviceBuffer>(candidate_bytes);
-        ring_resident_device_   = std::make_unique<DeviceBuffer>(candidate_bytes);
+    }
+    if (!ring_resident_device_ || ring_resident_device_->bytes < candidate_bytes) {
+        ring_resident_device_ = std::make_unique<DeviceBuffer>(candidate_bytes);
+    }
+    if (!ring_descriptors_device_) {
         ring_descriptors_device_ =
             std::make_unique<DeviceBuffer>(static_cast<std::size_t>(cache_->resident_capacity()) *
                                           sizeof(ops::RingAdmitDescriptor));
-        ring_count_device_  = std::make_unique<DeviceBuffer>(sizeof(std::uint32_t));
     }
+    if (!ring_count_device_) { ring_count_device_ = std::make_unique<DeviceBuffer>(sizeof(std::uint32_t)); }
     // Membership at this instant, not the previous layer's published mask: "already resident" is
     // what makes an expert not a miss, and a hot expert admitted into the ring would lose its slot.
     ring_resident_host_.assign(count_, 0);
@@ -575,15 +626,13 @@ std::size_t ExpertStream::device_admit_ring(const void* device_ids, std::int32_t
         if (cache_->expert_slot(bank_, expert)) { ring_resident_host_[expert] = 1; }
     }
     ring_resident_device_->copy_from_host(ring_resident_host_.data(), candidate_bytes);
-    ring_snapshot_host_.assign(count_, ops::kRingAdmitAbsent);
-    host_->snapshot_slots(bank_, ring_snapshot_host_);
-    // Q20: the candidate table is the warm tier's whole live slot table, not this step's routes
-    // filtered on the host. The Device already has the route ids; it can ask `candidate[e]` itself.
-    // The host only publishes what the tier holds (one 256-entry table), and never decides which of
-    // those experts the ring admits.
-    std::size_t candidates_seen = 0;
-    for (std::uint32_t expert = 0; expert < count_; ++expert) {
-        if (ring_snapshot_host_[expert] != HostExpertResidency::kAbsentSlot) { ++candidates_seen; }
+    std::size_t candidates_seen = static_candidates_count_;
+    // The Device-side table is only valid for the warm tier generation it was copied at. Any fill
+    // (this bank's uncovered fallback, or another bank's fill) bumps that generation; a mismatch
+    // means a slot this table names may already hold another expert, so refresh before admitting.
+    if (!(static_warm_ && static_candidates_ready_ &&
+          host_->slot_generation() == static_table_generation_)) {
+        candidates_seen = publish_static_table();
     }
     if (bank_ == 0 && std::getenv("NINFER_RING_PROBE") != nullptr) {
         static int shown = 0;
@@ -593,7 +642,6 @@ std::size_t ExpertStream::device_admit_ring(const void* device_ids, std::int32_t
             std::fflush(stderr);
         }
     }
-    ring_candidates_device_->copy_from_host(ring_snapshot_host_.data(), candidate_bytes);
     ring_count_device_->fill(0);
     const auto capacity = std::min(cache_->resident_capacity(), ring_slots);
     ops::ring_admit_launch(device_ids, values,
@@ -1274,6 +1322,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                     seen[expert] = true;
                     hot_list_.push_back(expert);
                 }
+                if (static_warm_) { refresh_static_candidates(); }
             }
             for (std::size_t i = 0; i < values; ++i) {
                 load_window_[static_cast<std::size_t>(route_ids[i])] += 1.0F;
@@ -1288,6 +1337,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 std::fill(load_window_.begin(), load_window_.end(), 0.0F);
                 step_in_epoch_ = 0;
                 ++epochs_;
+                if (static_warm_) { refresh_static_candidates(); }
             }
             wanted.assign(hot_list_.begin(), hot_list_.end());
             for (const auto expert : wanted) { chosen[expert] = true; }
@@ -1552,6 +1602,13 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                                      (unsigned long long)warm.hits,
                                      (unsigned long long)warm.misses,
                                      (unsigned long long)warm.evictions);
+                        if (static_warm_) {
+                            std::fprintf(stderr,
+                                         "[warm-static] table refreshes=%llu candidates=%u "
+                                         "set=%u/bank\n",
+                                         (unsigned long long)static_table_refreshes_,
+                                         static_candidates_count_, hot_cap_);
+                        }
                     }
                 }
             }
@@ -1647,9 +1704,33 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             std::sort(host_distinct.begin(), host_distinct.end());
             host_distinct.erase(std::unique(host_distinct.begin(), host_distinct.end()),
                                 host_distinct.end());
-            host_->ensure_scored(ExpertBankId{bank_},
-                                 std::span<const std::int32_t>(host_distinct), hot_score_.data());
+            if (static_warm_ && static_candidates_ready_) {
+                // Fill only routes the static set does not already cover. A fully covered layer does
+                // no host fill at all; an uncovered route still gets a warm slot (or the CPU half
+                // would read expert 0's offset). The generation bump from this fill makes the ring
+                // path refresh its Device table before it names a slot.
+                if (host_->slot_generation() != static_table_generation_) {
+                    publish_static_table();
+                }
+                std::vector<std::int32_t> missing;
+                for (const auto expert : host_distinct) {
+                    if (static_cast<std::uint32_t>(expert) >= count_ ||
+                        ring_snapshot_host_[static_cast<std::size_t>(expert)] ==
+                            HostExpertResidency::kAbsentSlot) {
+                        missing.push_back(expert);
+                    }
+                }
+                if (!missing.empty()) {
+                    host_->ensure_scored(ExpertBankId{bank_},
+                                         std::span<const std::int32_t>(missing), hot_score_.data());
+                    publish_static_table();
+                }
+            } else {
+                host_->ensure_scored(ExpertBankId{bank_},
+                                     std::span<const std::int32_t>(host_distinct), hot_score_.data());
+            }
         }
+        if (static_warm_ && !static_candidates_ready_) { refresh_static_candidates(); }
         if (host_direct && device_ring_slots != 0 && host_ != nullptr && device_ids != nullptr) {
             const auto admitted =
                 device_admit_ring(device_ids, static_cast<std::int32_t>(values), 0,

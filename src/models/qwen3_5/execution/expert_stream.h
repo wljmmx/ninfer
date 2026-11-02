@@ -349,6 +349,15 @@ private:
                                   std::uint32_t ring_base, std::uint32_t ring_slots,
                                   cudaStream_t stream, std::vector<std::uint32_t>& wanted,
                                   std::vector<bool>& chosen);
+    // Q20 static path: at an epoch boundary fill a per-bank static candidate set in the warm tier
+    // and publish its whole slot table to the Device once. The table carries the warm tier's slot
+    // generation; if any bank's fill moves a slot, the next admission sees the mismatch and
+    // refreshes before naming a host slot.
+    void refresh_static_candidates();
+    // Copy this bank's whole warm slot table to the Device in one go, stamp it with the tier's
+    // current slot generation, and return how many experts it holds. Every fill in the tier bumps
+    // that generation, so the copy is only trusted until the next fill.
+    std::uint32_t publish_static_table();
     // port (sm_89): decayed per-expert route counts. A pool that cannot hold a whole layer keeps
     // the top entries of this instead of whatever the current step happened to route to, which
     // used to replace all eight experts on every token and make the hot set useless.
@@ -529,6 +538,17 @@ private:
     // Q20: fixed ring slots this bank reserved from the pool at attach. Zero when the mechanism is
     // off; otherwise every device-admitted expert lands in one of these addresses.
     std::uint32_t device_ring_slots_ = 0;
+    // Q20 static warm candidates: filled at an epoch boundary, not per layer. The generation is the
+    // warm tier's slot-generation at the moment the Device table was copied; a mismatch means some
+    // slot moved (possibly another bank's fill), so the table must be refreshed before use.
+    bool static_warm_             = false;
+    bool static_candidates_ready_ = false;
+    std::uint32_t static_candidates_count_ = 0;
+    std::uint64_t static_table_generation_  = 0;
+    // How many times the Device table has been re-copied. A static set that is really static pays
+    // one copy per epoch; a number near one per layer means every uncovered route moved a slot and
+    // the "static" table is a per-layer table with extra steps.
+    std::uint64_t static_table_refreshes_ = 0;
     std::uint32_t* coverage_word_device_ = nullptr;
     bool coverage_word_checked_          = false;
     // O1's counter: mapped, so the skip is counted where it happens. `miss_lag_` is the host total
