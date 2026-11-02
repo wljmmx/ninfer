@@ -52,9 +52,35 @@ void ArtifactExpertReader::read_entry(const ExpertFileEntry& entry,
     }
 }
 
+bool ArtifactExpertReader::read_range(std::uint32_t object_index, std::uint64_t offset,
+                                      std::span<std::byte> destination) const {
+    if (object_index >= files_.size() || destination.empty()) { return false; }
+    try {
+        auto& file = files_[object_index];
+        if (!file) { file = reader_.open_file(object_index); }
+        if (!file) { return false; }
+        // The same alignment rule read_entry applies per chunk: the direct path needs aligned
+        // offset, length and destination, and anything that is not falls back to the buffered read.
+        // A coalesced range is a whole run of chunks, so it is aligned whenever its chunks are.
+        const bool aligned =
+            mode_ == ReadMode::Direct && offset % kPayloadAlignment == 0 &&
+            destination.size() % kPayloadAlignment == 0 &&
+            reinterpret_cast<std::uintptr_t>(destination.data()) % kPayloadAlignment == 0;
+        if (aligned) {
+            (void)file->read_direct(offset, destination);
+        } else {
+            (void)file->read_exact(offset, destination);
+        }
+    } catch (...) {
+        // A source that cannot answer this range leaves the caller on read_entry; saying so is the
+        // whole contract, and throwing would turn a fallback into a failure.
+        return false;
+    }
+    return true;
+}
+
 void ArtifactExpertReader::read_entry_cached(const ExpertFileEntry& entry,
-                                            std::span<std::byte> destination) const {
-    if (destination.size() < entry.image_bytes) {
+                                            std::span<std::byte> destination) const {    if (destination.size() < entry.image_bytes) {
         throw std::invalid_argument("expert entry image exceeds its destination");
     }
     for (const auto& chunk : entry.chunks) {

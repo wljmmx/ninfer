@@ -38,6 +38,14 @@ public:
     // falls back to read_entry.
     bool spans(const ExpertFileEntry& entry, std::vector<ExpertBlobSpan>& out) const override;
 
+    // port (sm_89): Q60. One byte range of one object, so the uploader can fetch the range that
+    // covers a layer's experts with a single read instead of one read_entry per expert. Both file
+    // modes answer it: the direct path when offset, length and destination are aligned, the buffered
+    // one otherwise - the same rule read_entry uses per chunk, which is why a coalesced read and a
+    // per-entry read return identical bytes.
+    bool read_range(std::uint32_t object_index, std::uint64_t offset,
+                    std::span<std::byte> destination) const override;
+
     [[nodiscard]] const Reader& reader() const noexcept { return reader_; }
 
 private:
