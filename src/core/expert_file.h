@@ -64,6 +64,25 @@ public:
                                    std::span<std::byte> destination) const {
         read_entry(entry, destination);
     }
+    // port (sm_89): Q60 - read a byte range of an object, so a layer's experts can be fetched with ONE
+    // read of the range that covers them instead of one read_entry per expert.
+    //
+    // This is the primitive the plan's "按工件形态分派搬运" was missing. The reader only offered
+    // whole-entry reads, so both artifact shapes had to be served by the same per-expert read_entry -
+    // which is exactly what 1x.4g measured as "the dispatch never fires". A fused bank keeps a layer's
+    // experts in a few contiguous runs of one object; an e2 bank keeps one object per expert. Only the
+    // first can be coalesced, and only with a primitive that reads bytes rather than an entry.
+    //
+    // Returns false when the source cannot answer (no mapping, range outside the object, or a reader
+    // with no second path); the caller falls back to read_entry. Additive by construction: a run that
+    // never asks gets exactly the old behaviour.
+    virtual bool read_range(std::uint32_t object_index, std::uint64_t offset,
+                            std::span<std::byte> destination) const {
+        (void)object_index;
+        (void)offset;
+        (void)destination;
+        return false;
+    }
 };
 
 // port (sm_89): a pinned RAM tier the Device uploader can read from, when one exists. The host tier
