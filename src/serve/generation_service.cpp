@@ -169,6 +169,7 @@ public:
         // steps, and the serve log's queue_wait_seconds covers the whole admission path (fetch, import,
         // Device copies) without saying how much of it is the cache.
         const auto fetch_started = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> guard(bridge_mutex_);
         if (!bridge_->restore(key, &kv, &state)) { return std::nullopt; }
         const double fetch_seconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - fetch_started).count();
@@ -288,6 +289,7 @@ public:
                                        state.size()),
             valid_tokens, tail, chunk_bytes_total);
 
+        std::lock_guard<std::mutex> guard(bridge_mutex_);
         (void)bridge_->publish(
             key, std::span<const std::byte>(checkpoint.kv_bytes.data(), complete),
             std::span<const std::byte>(payload.data(), payload.size()));
@@ -295,6 +297,12 @@ public:
 
 private:
     std::unique_ptr<ninfer::core::lmcache::Bridge> bridge_;
+    // Q64 2d-2h, step 1: one lock for the bridge, because it owns a ZMQ socket and a socket is not
+    // thread-safe. Publishing moves to a writer thread in step 2; that is only safe if every user of
+    // the bridge - the restore on the request path and the publish on either - takes this first.
+    // Today both callers are on one thread, so this changes nothing observable, which is exactly why
+    // it is landing ahead of the thread rather than with it.
+    std::mutex bridge_mutex_;
     std::atomic<bool> ready_{false};
     std::atomic<std::uint64_t> sequence_{0};
     std::size_t page_bytes_ = 0;
