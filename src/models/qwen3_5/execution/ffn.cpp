@@ -1455,13 +1455,20 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
                 }
                 const auto total = sources.arena_experts + sources.file_experts;
                 static std::uint64_t last_probes = 0;
-                if (layer_timing && sources.arena_probes != last_probes) {
+                static std::uint64_t last_file   = 0;
+                // Q55: the line used to be gated on `arena_probes` alone, so a run with the warm
+                // mirror off (the default) never printed it even while every fill was a cold read -
+                // exactly the number the cold-read decision needs. A cold read is a change in
+                // `file_experts`, so either side moving is a reason to print.
+                if (layer_timing &&
+                    (sources.arena_probes != last_probes || sources.file_experts != last_file)) {
                     std::fprintf(stderr, "[warm] probes=%llu file_experts=%llu read_us=%.0f\n",
                                  static_cast<unsigned long long>(sources.arena_probes),
                                  static_cast<unsigned long long>(sources.file_experts),
                                  sources.read_us);
                     std::fflush(stderr);
                     last_probes = sources.arena_probes;
+                    last_file   = sources.file_experts;
                 }
                 if (total > 0) {
                     const double ratio =

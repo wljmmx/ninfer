@@ -161,6 +161,10 @@ std::vector<std::uint64_t> bank_generation;
     // Counted at the one place every upload passes through, so the figure cannot disagree with the
     // batch it describes the way the per-branch counters did.
     std::uint64_t stat_push = 0;
+    // Q52: API submissions, which is the number "one submit per layer" is about. `stat_push` counts
+    // slices and stays near 11.6 by construction (six planes an expert); a batch of those slices is
+    // one submission, and that is what the driver is asked to do.
+    std::uint64_t stat_submits = 0;
     // Reused across layers. Allocating these per call looked free and was not: a split layer pays
     // the upload turn forty times a token, and on this allocator seventy-two entries of scratch is
     // most of the collect budget on a layer that only has one expert to move.
@@ -1061,7 +1065,17 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
     // queued behind the whole batch on this stream.
     if (!batch.empty()) {
         bool submitted = false;
-        if (stream != nullptr && batch.size() > 1) {
+        // Q52: the batch form is one submission, but a submission is not free. At the shape the
+        // split path actually has (2.8 slices a layer after the span merge), three interleaved
+        // rounds at 8 GiB measured batch 0.158/0.161/0.159 ms ens against per-slice
+        // 0.154/0.151/0.151 - the batch API costs 4-5% for copies this small. The criterion is
+        // "ops per layer <= 3", and 2.8 already meets it; the batch is therefore opt-in for the
+        // case where the slice count grows, not the default.
+        static const bool batch_submit = [] {
+            const char* value = std::getenv("NINFER_UPLOAD_SINGLE_SUBMIT");
+            return value != nullptr && value[0] != '0';
+        }();
+        if (stream != nullptr && batch.size() > 1 && batch_submit) {
             auto& destinations = impl_->upload_destinations;
             auto& sources      = impl_->upload_sources;
             auto& sizes        = impl_->upload_sizes;
@@ -1081,7 +1095,9 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
                 destinations.data(), sources.data(), sizes.data(), batch.size(), &attributes,
                 &attribute_index, 1, stream);
             submitted = status == cudaSuccess;
-            if (!submitted && status != cudaErrorNotSupported && status != cudaErrorInvalidValue) {
+            if (submitted) {
+                ++impl_->stat_submits;
+            } else if (status != cudaErrorNotSupported && status != cudaErrorInvalidValue) {
                 throw std::runtime_error(cudaGetErrorString(status));
             }
         }
@@ -1091,6 +1107,7 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
                     cudaMemcpyAsync(op.destination, op.source, op.bytes, cudaMemcpyHostToDevice,
                                     stream);
                 if (status != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(status)); }
+                ++impl_->stat_submits;
             }
         }
     }
@@ -1121,6 +1138,7 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
         static std::uint64_t calls = 0;
         static double acc[7] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
         static double acc_arena = 0.0;
+        static double acc_submits = 0.0;
         // acc: collect, submit, bytes, direct, staged, views, pushes. Every per-call delta has to
         // be accumulated here first; dividing a single call's delta by 40 was what made the
         // operation count read 0.1 while the byte total said five megabytes.
@@ -1147,6 +1165,10 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
         static std::uint64_t seen_push = 0;
         const auto push_delta = impl_->stat_push - seen_push;
         seen_push             = impl_->stat_push;
+        static std::uint64_t seen_submits = 0;
+        const auto submit_delta           = impl_->stat_submits - seen_submits;
+        seen_submits                      = impl_->stat_submits;
+        acc_submits += static_cast<double>(submit_delta);
         // Q60: how much of the turn the coalesced form actually covered - one read for how many
         // experts. Without this the switch "working" and the switch "never firing" look the same.
         static std::uint64_t seen_coalesced = 0;
@@ -1163,9 +1185,9 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
             // Reading it as 40 layers = one token is how 1.187 ms/layer turned into an impossible
             // 47 ms/token next to the expert panel's 1.5-2.5 ms/token.
             std::fprintf(stderr,
-                         "[upload] collect=%.3fms submit=%.3fms ops=%.1f mb=%.2f per uploading call "
-                         "(x40 window) direct=%.1f staged=%.1f views=%.1f\n",
-                         acc[0] / 40.0, acc[1] / 40.0, acc[6] / 40.0,
+                         "[upload] collect=%.3fms submit=%.3fms ops=%.1f submits=%.1f mb=%.2f per "
+                         "uploading call (x40 window) direct=%.1f staged=%.1f views=%.1f\n",
+                         acc[0] / 40.0, acc[1] / 40.0, acc[6] / 40.0, acc_submits / 40.0,
                          acc[2] / 40.0 / 1048576.0, acc[3] / 40.0, acc[4] / 40.0, acc[5] / 40.0);
             std::fprintf(stderr, "[upload] arena=%.1f experts per uploading call\n", acc_arena / 40.0);
             // Q60: experts answered from a cover read, per uploading call. A number that stays at
@@ -1182,6 +1204,7 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
                          layer_bytes / 1048576.0, staged);
             acc[0] = acc[1] = acc[2] = acc[3] = acc[4] = acc[5] = acc[6] = 0.0;
             acc_arena = 0.0;
+            acc_submits = 0.0;
         }
         (void)direct_delta;
         (void)staged_delta;
