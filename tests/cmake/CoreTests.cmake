@@ -118,6 +118,12 @@ ninfer_add_test(ninfer_kv_checkpoint_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/kv_checkpoint_test.cpp"
   LIBRARIES ninfer_core)
 
+# L7-b: the tail chunk that rides in the LMCache state object. Header-only and free of transport, so
+# the encode -> decode round trip runs without a server.
+ninfer_add_test(ninfer_lmcache_state_payload_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/lmcache_state_payload_test.cpp"
+  LIBRARIES ninfer_core)
+
 # P1-b-2d: checkpoint blobs through the tier, keyed by content digest.
 ninfer_add_test(ninfer_checkpoint_tier_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/checkpoint_tier_test.cpp"

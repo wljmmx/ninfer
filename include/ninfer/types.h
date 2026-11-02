@@ -161,6 +161,11 @@ struct CachedCheckpoint {
     // Tokens the checkpoint covers. The caller derives it from the request, because the cache only
     // stores bytes and a wrong frontier silently makes the record unmatchable.
     std::uint32_t frontier   = 0;
+    // L7-b: the length the capture really committed, as opposed to the whole-page bound the KV run
+    // happens to have. A backend that can carry it puts it in the payload so a reader can tell where
+    // the prefix ends inside the padding; zero means "not reported", and the reader falls back to
+    // frontier, which is the same number whenever a capture set it.
+    std::uint32_t valid_tokens = 0;
     std::size_t page_bytes   = 0;
     std::vector<std::byte> kv_bytes;
     // One entry for a whole state image. The sharded layout exists for transport sizing, not for

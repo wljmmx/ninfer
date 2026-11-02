@@ -351,6 +351,9 @@ public:
         CachedCheckpoint out;
         out.frontier   = kv->frontier;
         out.page_bytes = kv->page_bytes;
+        // L7-b: the committed length, not the page bound. A transport that carries it can put the
+        // partial tail page back on the far side instead of truncating to whole chunks.
+        out.valid_tokens = state->valid_tokens;
         out.kv_bytes   = std::move(kv->kv_bytes);
         // One element: the image travels whole (v6 1n).
         out.state_shards.emplace_back(reinterpret_cast<const char*>(state->bytes.data()),

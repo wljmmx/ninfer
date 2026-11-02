@@ -6,6 +6,7 @@
 
 #if NINFER_HAVE_LMCACHE
 #include "core/lmcache_bridge.h"
+#include "core/lmcache_state_payload.h"
 #endif
 
 #include <algorithm>
@@ -86,8 +87,16 @@ public:
         // the server can express two, so the shape states the byte count and nothing else.
         config.kv =
             ninfer::core::lmcache::GroupSpec::exact("uint8", 2 * geometry.page_bytes);
-        config.state =
-            ninfer::core::lmcache::GroupSpec::exact("uint8", geometry.state_image_bytes);
+        // L7-b: the state object is where a partial trailing chunk travels, because the key addresses
+        // whole chunks only and the KV group is sized to a whole chunk per object:
+        //   [u32 valid_tokens][state image][one tail chunk, zero padded to chunk_bytes]
+        // Without it a 474-token prompt was restored as 384. The extra 4 + chunk_bytes are part of
+        // the registered shape, which is also what publish() checks the payload against.
+        const std::size_t chunk_bytes =
+            static_cast<std::size_t>(config.pages_per_chunk) * geometry.page_bytes;
+        config.state = ninfer::core::lmcache::GroupSpec::exact(
+            "uint8",
+            ninfer::core::lmcache::state_object_bytes(geometry.state_image_bytes, chunk_bytes));
         config.state.window_chunks = 1;
         config.state.recurrent     = true;
         // The key is the model and the tokens; the geometry is what changes when the format or the
@@ -98,12 +107,18 @@ public:
         // ':' and not '@': LMCache forbids '@' in a salt because it separates the fields of its own
         // cache key, and it answers a violating request by raising -- no reply frame at all, so the
         // client's only symptom is a receive timeout. Measured: a two-minute stall.
+        // ':l7b1' is the payload version: the state object now carries a length header and a tail
+        // chunk, so an entry written by the old client must not be read by this one (and vice versa).
+        // Naming it in the salt is what keeps the two apart without inspecting a payload.
         config.cache_salt = model_name + ":" + std::to_string(geometry.page_bytes) + ":" +
                             std::to_string(geometry.page_tokens) + ":" +
                             std::to_string(geometry.state_image_bytes) + ":k" +
                             std::to_string(geometry.kv_dtype_tag) + "p" +
-                            std::to_string(geometry.kv_planes);
-        page_bytes_ = geometry.page_bytes;
+                            std::to_string(geometry.kv_planes) + ":l7b1";
+        page_bytes_    = geometry.page_bytes;
+        page_tokens_   = static_cast<std::size_t>(geometry.page_tokens);
+        image_bytes_   = geometry.state_image_bytes;
+        chunk_bytes_   = chunk_bytes;
         // A lookup resolves complete chunks only. Below one chunk there is nothing to ask about --
         // and the server answers such a request with no frames at all, so the client sits on its
         // receive timeout. Measured: a 22-token prompt held a request for two minutes.
@@ -160,20 +175,47 @@ public:
                      kv.size(), state.size(), fetch_seconds);
         if (page_bytes_ == 0 || kv.size() % page_bytes_ != 0) { return std::nullopt; }
 
+        const std::size_t chunk_bytes_total = chunk_bytes_;
+        if (chunk_bytes_total == 0) { return std::nullopt; }
+        // L7-b: [u32 valid_tokens][state image][tail chunk]. The size is exact, so an object that
+        // does not have it is not one this client wrote (or one written before the salt version
+        // changed) -- a miss, not a guess at where the image starts.
+        const auto object =
+            ninfer::core::lmcache::decode_state_object(state, image_bytes_, chunk_bytes_total);
+        if (!object) { return std::nullopt; }
+        const std::uint32_t valid_tokens = object->valid_tokens;
+        // Zero is "no length recorded", and a length longer than the prompt describes a prefix this
+        // request does not have. Adopting either would claim coverage that is not there.
+        if (valid_tokens == 0 || valid_tokens > prompt_tokens.size()) { return std::nullopt; }
+
         ninfer::CachedCheckpoint out;
         out.page_bytes = page_bytes_;
         // Derived from the bytes, never from the prompt. The record may cover less than the prompt
         // (a shorter capture), and a frontier that disagrees with the page count produces an address
         // whose coverage and pages do not line up -- that is wrong data, not a miss. Page count and
         // frontier computed from the same number cannot disagree.
-        const std::size_t chunk_bytes_total = bridge_->chunk_bytes();
-        const std::size_t chunks =
-            chunk_bytes_total == 0 ? 0 : kv.size() / chunk_bytes_total;
+        const std::size_t chunks = kv.size() / chunk_bytes_total;
         out.frontier = static_cast<std::uint32_t>(chunks * chunk_tokens_);
         out.kv_bytes = std::move(kv);
+        // L7-b: put the carried tail back on the end of the KV run, truncated to the pages the real
+        // length needs -- ceil(valid_tokens / page_tokens) in total, which is
+        // chunks * pages_per_chunk + ceil(tail_tokens / page_tokens) because the frontier is
+        // chunk-aligned. The tail has to fit the region the object reserved for it; anything longer
+        // means the header and the payload disagree, and importing it would commit pages of padding.
+        if (valid_tokens > out.frontier) {
+            const std::size_t tail_tokens = valid_tokens - out.frontier;
+            const std::size_t tail_pages  = (tail_tokens + page_tokens_ - 1) / page_tokens_;
+            const std::size_t tail_bytes  = tail_pages * page_bytes_;
+            if (tail_bytes > object->tail.size()) { return std::nullopt; }
+            const auto tail = object->tail.first(tail_bytes);
+            out.kv_bytes.insert(out.kv_bytes.end(), tail.begin(), tail.end());
+            out.frontier = valid_tokens;
+        }
+        out.valid_tokens = valid_tokens;
         // One element: the image travels whole (v6 1n). The sharded layout exists for transport
-        // sizing, not for import.
-        out.state_shards.emplace_back(reinterpret_cast<const char*>(state.data()), state.size());
+        // sizing, not for import. The header and the tail stay here -- neither is part of the image.
+        out.state_shards.emplace_back(reinterpret_cast<const char*>(object->image.data()),
+                                      object->image.size());
         return out;
     }
 
@@ -184,31 +226,61 @@ public:
         if (!ready_.load() || bridge_ == nullptr || prompt_tokens.empty()) { return; }
         if (checkpoint.page_bytes == 0 || checkpoint.kv_bytes.empty()) { return; }
 
-        // Only whole chunks can be addressed, so a partial trailing chunk is not stored. Storing it
-        // would mean making up a range end that the server rejects anyway.
+        // Only whole chunks can be addressed, so the key and the KV group stay chunk-aligned. The
+        // partial trailing chunk is not thrown away any more: it rides in the state object (L7-b).
         //
         // Two counts decide the payload, and they are not the same number: how many chunks the export
         // holds, and how many the prompt can address. The key is truncated from the prompt, so the
-        // payload has to be cut to the same count -- otherwise the envelope carries more tensors than
-        // the key has chunks and the server refuses the whole store. Measured on a 474-token prompt:
-        // the checkpoint covered 467 tokens (8 pages, 4 chunks) while the key ended at 384 (3), and
-        // the server answered "Inline tensor group 0 chunk index out of range (chunks=3)". The
-        // publish was lost silently; only a cross-process retrieve would have shown it.
-        const std::size_t chunk_bytes_total = bridge_->chunk_bytes();
-        if (chunk_bytes_total == 0 || chunk_tokens_ == 0) { return; }
+        // KV payload has to be cut to the same count -- otherwise the envelope carries more tensors
+        // than the key has chunks and the server refuses the whole store. Measured on a 474-token
+        // prompt: the checkpoint covered 467 tokens (8 pages, 4 chunks) while the key ended at 384
+        // (3), and the server answered "Inline tensor group 0 chunk index out of range (chunks=3)".
+        // The publish was lost silently; only a cross-process retrieve would have shown it.
+        const std::size_t chunk_bytes_total = chunk_bytes_;
+        if (chunk_bytes_total == 0 || chunk_tokens_ == 0 || page_bytes_ == 0 || page_tokens_ == 0) {
+            return;
+        }
         const std::size_t payload_chunks = checkpoint.kv_bytes.size() / chunk_bytes_total;
         const std::size_t addressable    = prompt_tokens.size() / chunk_tokens_;
         const std::size_t chunks         = std::min(payload_chunks, addressable);
         if (chunks == 0) { return; }
-        // Not silent: a prefix whose tail is dropped is a real loss of coverage, and the honest place
-        // to say so is here rather than in a retrieve that later misses.
-        if (addressable < payload_chunks) {
+        const std::size_t complete = chunks * chunk_bytes_total;
+        const std::size_t covered  = chunks * chunk_tokens_;
+
+        // The committed length, not the page bound: 467 for a 474-token prompt whose key stops at
+        // 384. A backend that did not report it falls back to the frontier, which is the same number
+        // whenever the capture set one.
+        //
+        // Two clamps keep the header honest, and both matter because the reader cuts the tail by
+        // whole pages: a length longer than the request would describe a prompt this key does not
+        // have, and a length past the pages this export still holds after the last addressable chunk
+        // would make the reader take zero padding for KV.
+        const std::size_t tail_begin = complete;
+        const std::size_t tail_have =
+            checkpoint.kv_bytes.size() > tail_begin ? checkpoint.kv_bytes.size() - tail_begin : 0;
+        const std::size_t tail_capacity = std::min(tail_have, chunk_bytes_total);
+        const std::size_t tail_tokens   = tail_capacity / page_bytes_ * page_tokens_;
+        std::uint32_t valid_tokens =
+            checkpoint.valid_tokens != 0 ? checkpoint.valid_tokens : checkpoint.frontier;
+        valid_tokens = static_cast<std::uint32_t>(
+            std::min({static_cast<std::size_t>(valid_tokens), prompt_tokens.size(),
+                      covered + tail_tokens}));
+        if (valid_tokens == 0) { return; }
+
+        if (valid_tokens > covered) {
+            std::fprintf(stderr,
+                         "[lmcache] publish covers %zu of %zu token(s) (%zu of %zu chunk(s)) "
+                         "+ the %zu-token tail\n",
+                         static_cast<std::size_t>(valid_tokens), prompt_tokens.size(), chunks,
+                         payload_chunks, static_cast<std::size_t>(valid_tokens) - covered);
+        } else if (addressable < payload_chunks) {
+            // Not silent: the key truncated the prefix, and this export had nothing past the last
+            // chunk to carry. The tail is then prefilled again on reuse.
             std::fprintf(stderr,
                          "[lmcache] publish covers %zu of %zu token(s) (%zu of %zu chunk(s)); "
-                         "the tail is prefilled\n",
-                         chunks * chunk_tokens_, prompt_tokens.size(), chunks, payload_chunks);
+                         "no tail past the last chunk\n",
+                         covered, prompt_tokens.size(), chunks, payload_chunks);
         }
-        const std::size_t complete = chunks * chunk_bytes_total;
 
         ninfer::core::lmcache::BridgeKey key;
         key.tokens.assign(prompt_tokens.begin(), prompt_tokens.end());
@@ -217,11 +289,23 @@ public:
 
         std::string state;
         for (const std::string& shard : checkpoint.state_shards) { state += shard; }
+        if (state.size() != image_bytes_) { return; }
+
+        // [u32 valid_tokens][state image][tail chunk]. The tail region is zero when the real length
+        // does not reach past the last addressable chunk, so a reader can slice it blind.
+        const std::size_t carried = valid_tokens > covered ? tail_capacity : 0;
+        const std::span<const std::byte> tail =
+            carried == 0 ? std::span<const std::byte>{}
+                         : std::span<const std::byte>(checkpoint.kv_bytes.data() + tail_begin,
+                                                      carried);
+        const auto payload = ninfer::core::lmcache::encode_state_object(
+            std::span<const std::byte>(reinterpret_cast<const std::byte*>(state.data()),
+                                       state.size()),
+            valid_tokens, tail, chunk_bytes_total);
 
         (void)bridge_->publish(
             key, std::span<const std::byte>(checkpoint.kv_bytes.data(), complete),
-            std::span<const std::byte>(reinterpret_cast<const std::byte*>(state.data()),
-                                       state.size()));
+            std::span<const std::byte>(payload.data(), payload.size()));
     }
 
 private:
@@ -229,6 +313,9 @@ private:
     std::atomic<bool> ready_{false};
     std::atomic<std::uint64_t> sequence_{0};
     std::size_t page_bytes_ = 0;
+    std::size_t page_tokens_ = 0;
+    std::size_t image_bytes_ = 0;
+    std::size_t chunk_bytes_ = 0;
     std::size_t chunk_tokens_ = 0;
     std::int64_t instance_tag_ =
         static_cast<std::int64_t>(std::chrono::system_clock::now().time_since_epoch().count());
@@ -267,14 +354,20 @@ bool GenerationService::attach_checkpoint_cache() {
         return false;
     }
     const std::size_t chunk = checkpoint_cache_->backend->chunk_tokens();
+    const std::size_t chunk_pages = chunk / static_cast<std::size_t>(geometry.page_tokens);
+    const std::size_t chunk_bytes = chunk_pages * geometry.page_bytes;
     std::fprintf(stderr,
                  "[lmcache] attached | page %zu B, %lld token(s), chunk %zu token(s) "
                  "(= %zu page(s)) -- the server must run --chunk-size %zu;\n"
-                 "          kv %s (tag %u, %u plane(s)), state image %zu B, %d connection(s)\n",
+                 "          kv %s (tag %u, %u plane(s)), state %zu B "
+                 "(= %zu B image + %zu B length + %zu B tail chunk), %d connection(s)\n",
             geometry.page_bytes, static_cast<long long>(geometry.page_tokens), chunk,
-            chunk / static_cast<std::size_t>(geometry.page_tokens), chunk,
+            chunk_pages, chunk,
             kv_format_name(geometry.kv_dtype_tag).data(), geometry.kv_dtype_tag,
-            geometry.kv_planes, geometry.state_image_bytes, connections);
+            geometry.kv_planes,
+            ninfer::core::lmcache::state_object_bytes(geometry.state_image_bytes, chunk_bytes),
+            geometry.state_image_bytes, ninfer::core::lmcache::kStateLengthBytes, chunk_bytes,
+            connections);
     return true;
 #endif
 }
