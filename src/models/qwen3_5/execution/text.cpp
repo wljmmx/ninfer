@@ -875,6 +875,89 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                              sink);
 }
 
+void TextContext::prefill_batch(std::span<const std::int32_t> ids,
+                                std::span<const std::int32_t> positions,
+                                std::span<const std::int32_t> rope_positions,
+                                std::span<const std::int32_t> valid_columns,
+                                std::span<const std::int32_t> kv_table_rows,
+                                std::span<const std::int32_t> state_source_slots,
+                                std::span<const std::int32_t> state_destination_slots,
+                                std::int32_t width, std::int32_t batch,
+                                ops::CausalAttentionExecutionEnvelope envelope, Tensor& logits,
+                                Tensor& tokens) {
+    if (width <= 0 || batch <= 0 || batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
+        throw std::invalid_argument("prefill batch shape is outside the supported domain");
+    }
+    const std::int32_t columns = width * batch;
+    if (static_cast<std::uint32_t>(columns) > prefill_chunk_) {
+        throw std::invalid_argument("prefill batch exceeds the chunk the workspace was planned for");
+    }
+    const std::size_t lane_count = static_cast<std::size_t>(batch);
+    if (ids.size() != static_cast<std::size_t>(columns) || positions.size() != ids.size() ||
+        rope_positions.size() != ids.size() || valid_columns.size() != lane_count ||
+        kv_table_rows.size() != lane_count || state_source_slots.size() != lane_count ||
+        state_destination_slots.size() != lane_count) {
+        throw std::invalid_argument("prefill batch host spans do not match the pass shape");
+    }
+    require_tensor_shape(logits, DType::BF16, {dimension(config_.vocab_size), batch},
+                         "prefill batch logits");
+    require_tensor_shape(tokens, DType::I32, {batch}, "prefill batch tokens");
+
+    cudaStream_t stream = ctx_.stream;
+    work_.reset();
+    Tensor d_ids       = work_.alloc(DType::I32, {width, batch});
+    Tensor d_positions = work_.alloc(DType::I32, {width, batch});
+    Tensor d_rope      = work_.alloc(DType::I32, {width, batch});
+    Tensor d_valid     = work_.alloc(DType::I32, {batch});
+    Tensor d_kv_rows   = work_.alloc(DType::I32, {batch});
+    Tensor d_src       = work_.alloc(DType::I32, {batch});
+    Tensor d_dst       = work_.alloc(DType::I32, {batch});
+    copy_i32(ids.data(), d_ids, stream);
+    copy_i32(positions.data(), d_positions, stream);
+    copy_i32(rope_positions.data(), d_rope, stream);
+    copy_i32(valid_columns.data(), d_valid, stream);
+    copy_i32(kv_table_rows.data(), d_kv_rows, stream);
+    copy_i32(state_source_slots.data(), d_src, stream);
+    copy_i32(state_destination_slots.data(), d_dst, stream);
+
+    ScopedPositions cache_binding(active_cache_positions_, d_positions);
+    ScopedPositions rope_binding(active_rope_positions_, d_rope);
+    ScopedEnvelope envelope_binding(active_causal_attention_envelope_, envelope);
+    ScopedValue<const Tensor*> kv_binding(active_kv_table_rows_, &d_kv_rows);
+    ScopedValue<const Tensor*> state_binding(active_linear_state_source_slots_, &d_src);
+    ScopedValue<const Tensor*> dest_binding(active_linear_state_destination_slots_, &d_dst);
+    ScopedValue<const Tensor*> valid_binding(active_valid_columns_, &d_valid);
+    ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
+    ScopedValue<std::int32_t> width_binding(active_sequence_width_, width);
+
+    Tensor x = work_.alloc(DType::BF16, {dimension(config_.hidden_size), columns});
+    ops::embedding(d_ids.view({columns}), *embed_, x, stream);
+    if (prefill_gpu_timer_ != nullptr) { prefill_gpu_timer_->start(); }
+    run_layers(x, Phase::Verify);
+    // Prefill only needs the token that follows each row's last prompt token, so the projection runs
+    // over one column per row instead of the whole rectangle: a [vocab, width, batch] logits tensor
+    // at width 1024 would be hundreds of megabytes for one useful column.
+    Tensor last   = work_.alloc(DType::BF16, {dimension(config_.hidden_size), batch});
+    Tensor normed = work_.alloc(DType::BF16, {dimension(config_.hidden_size), batch});
+    for (std::int32_t row = 0; row < batch; ++row) {
+        const std::int32_t column = valid_columns[static_cast<std::size_t>(row)] - 1;
+        if (column < 0 || column >= width) {
+            throw std::invalid_argument("prefill batch row has no valid column");
+        }
+        CUDA_CHECK(cudaMemcpyAsync(
+            static_cast<char*>(last.data) + static_cast<std::size_t>(row) * last.nb[1],
+            static_cast<const char*>(x.data) + static_cast<std::size_t>(column) * x.nb[1] +
+                static_cast<std::size_t>(row) * x.nb[2],
+            static_cast<std::size_t>(dimension(config_.hidden_size)) * sizeof(std::uint16_t),
+            cudaMemcpyDeviceToDevice, stream));
+    }
+    ops::rmsnorm(last, *final_norm_, config_.rms_norm_eps, true, normed, stream);
+    project(normed, *lm_head_, logits, work_, stream);
+    ops::argmax(logits, tokens, dimension(parameters_.model.resources().public_token_count), stream);
+    if (prefill_gpu_timer_ != nullptr) { prefill_gpu_timer_->record_stop(); }
+    work_.reset();
+}
+
 void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
                                            const Tensor& cache_positions,
                                            const Tensor& rope_positions,
@@ -1134,8 +1217,10 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         if (width <= 0 || width * active_sequence_batch_ != T) {
             throw std::logic_error("GDN sequence batch binding does not match aggregate columns");
         }
-        if (gdn_state_action_ == GdnStateAction::UpdateInPlace && width != 1) {
-            throw std::logic_error("In-place batched GDN update requires width one");
+        if (gdn_state_action_ == GdnStateAction::UpdateInPlace &&
+            active_linear_state_destination_slots_ == nullptr) {
+            throw std::logic_error(
+                "In-place batched GDN update requires bound destination state slots");
         }
         Tensor projection_input =
             h.view({dimension(config_.hidden_size), width, active_sequence_batch_});

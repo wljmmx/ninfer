@@ -145,6 +145,19 @@ public:
                              const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
                              ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
                              Tensor& logits, Tensor& target_tokens, DFlashFeatureSink& sink);
+    // Q67/S1: one merged prefill pass. Same per-row bindings the verify path uses - per-row KV table
+    // rows, per-row positions, per-row valid columns, per-row state slots - which is what keeps the
+    // rows block-diagonal without a mask: row i only ever reads KV row i. Host spans are copied in
+    // here so the caller only builds plain arrays; `logits` is [vocab, batch] and `tokens` is
+    // [batch] - one column per row, the row's last valid token, because prefill only needs that one.
+    void prefill_batch(std::span<const std::int32_t> ids, std::span<const std::int32_t> positions,
+                       std::span<const std::int32_t> rope_positions,
+                       std::span<const std::int32_t> valid_columns,
+                       std::span<const std::int32_t> kv_table_rows,
+                       std::span<const std::int32_t> state_source_slots,
+                       std::span<const std::int32_t> state_destination_slots, std::int32_t width,
+                       std::int32_t batch, ops::CausalAttentionExecutionEnvelope envelope,
+                       Tensor& logits, Tensor& tokens);
     void mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
                                   const Tensor& cache_positions, const Tensor& rope_positions,
                                   const Tensor& valid_columns, const Tensor& kv_table_rows,
@@ -197,8 +210,7 @@ private:
                                   Tensor& logits, Tensor& target_tokens, Tap& tap);
 
     void mtp_forward_stem(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
-                          Tensor& x, Tensor& ah);
-    void mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& positions,
+                          Tensor& x, Tensor& ah);    void mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& positions,
                           const Tensor& rope_positions,
                           ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden);
     void mtp_forward_core(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
