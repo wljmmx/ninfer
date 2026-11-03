@@ -782,7 +782,8 @@ public:
     // that does not finish their prompt). Interior chunks only, deliberately: the final chunk is what
     // produces a request's pending token, and that path stays exactly as it is. Returns true when a
     // merged pass ran, so the caller skips the single-lane dispatch.
-    bool advance_prefill_batch();    void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
+    [[nodiscard]] std::optional<Program::MergedPrefillResult> advance_prefill_batch();
+    void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                        std::span<const std::uint32_t> starts,
                                        std::span<const std::uint32_t> counts);
     void validate_licensed_tokens(std::span<const TokenId> tokens) const;

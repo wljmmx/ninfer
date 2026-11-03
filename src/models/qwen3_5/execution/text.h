@@ -159,7 +159,8 @@ public:
                        std::span<const std::int32_t> state_source_slots,
                        std::span<const std::int32_t> state_destination_slots, std::int32_t width,
                        std::int32_t batch, ops::CausalAttentionExecutionEnvelope envelope,
-                       std::span<std::int32_t> next_tokens);
+                       std::span<std::int32_t> next_tokens,
+                       std::span<Tensor* const> tail_hidden_rows);
     void mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
                                   const Tensor& cache_positions, const Tensor& rope_positions,
                                   const Tensor& valid_columns, const Tensor& kv_table_rows,

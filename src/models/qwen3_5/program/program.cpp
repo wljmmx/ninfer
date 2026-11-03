@@ -173,7 +173,7 @@ std::size_t Program::prefill_batch_rows(std::span<const std::uint32_t> lanes,
     return impl_->prefill_batch_rows(lanes, out);
 }
 
-bool Program::advance_prefill_batch() { return impl_->advance_prefill_batch(); }
+std::optional<Program::MergedPrefillResult> Program::advance_prefill_batch() { return impl_->advance_prefill_batch(); }
 
 void Program::report_prefill_rows(std::span<const std::uint32_t> lanes) {
     impl_->report_prefill_rows(lanes);

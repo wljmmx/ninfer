@@ -69,7 +69,8 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
 
 void prefill_batch_pass(PrefillContext& state, const PrefillBatchPass& pass,
                         ops::CausalAttentionExecutionEnvelope envelope,
-                        std::span<std::int32_t> next_tokens) {
+                        std::span<std::int32_t> next_tokens,
+                        std::span<Tensor* const> tail_hidden_rows) {
     TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
@@ -79,7 +80,7 @@ void prefill_batch_pass(PrefillContext& state, const PrefillBatchPass& pass,
     card.set_prefill_gpu_timer(state.prefill_gpu_timer);
     card.prefill_batch(pass.ids, pass.positions, pass.rope_positions, pass.valid_columns,
                        pass.kv_table_rows, pass.state_source_slots, pass.state_destination_slots,
-                       pass.width, pass.batch, envelope, next_tokens);
+                       pass.width, pass.batch, envelope, next_tokens, tail_hidden_rows);
 }
 
 PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const TokenId> ids,
@@ -315,8 +316,8 @@ void ProgramImpl::report_prefill_rows(std::span<const std::uint32_t> lanes) {
     std::fflush(stderr);
 }
 
-bool ProgramImpl::advance_prefill_batch() {
-    if (std::getenv("NINFER_PREFILL_BATCH_EXEC") == nullptr) { return false; }
+std::optional<Program::MergedPrefillResult> ProgramImpl::advance_prefill_batch() {
+    if (std::getenv("NINFER_PREFILL_BATCH_EXEC") == nullptr) { return std::nullopt; }
 
     std::array<std::uint32_t, kMaximumConcurrency> lanes{};
     std::size_t lane_count = 0;
@@ -324,50 +325,54 @@ bool ProgramImpl::advance_prefill_batch() {
         if (prefill_remaining(lane) == 0) { continue; }
         lanes[lane_count++] = lane;
     }
-    if (lane_count < 2) {
-        if (std::getenv("NINFER_PREFILL_BATCH_EXEC") != nullptr) {
-            static std::uint64_t shown = 0;
-            if (shown++ < 8) {
-                std::fprintf(stderr, "[prefill-merged] skip: lanes=%zu rem=", lane_count); for (std::uint32_t L = 0; L < max_concurrency; ++L) { std::fprintf(stderr, "%u%s", prefill_remaining(L), L + 1 == max_concurrency ? "\n" : ","); }
-                std::fflush(stderr);
-            }
-        }
-        return false;
-    }
+    if (lane_count < 2) { return std::nullopt; }
 
     std::array<execution::PrefillRow, kMaximumConcurrency> rows{};
     const std::size_t built =
         prefill_batch_rows(std::span<const std::uint32_t>(lanes.data(), lane_count), rows);
+    if (built < 2) { return std::nullopt; }
 
-    // Interior chunks only. The chunk that ends a prompt is what produces its pending token, and that
-    // path stays exactly as it is; batching it would mean reproducing the pending/resolve machinery
-    // per row, which is a separate change with its own proof obligation.
+    // Narrow path only: no capture group on the horizon, no MTP bridge, no vision. Each of those has
+    // its own single-lane bookkeeping and is not part of a merged pass yet.
+    for (std::size_t i = 0; i < built; ++i) {
+        const RequestControl& candidate = requests[rows[i].lane];
+        if (candidate.capture_pending || candidate.next_capture < candidate.capture_groups.size()) {
+            return std::nullopt;
+        }
+        const RequestControl::Prefill& staged = *candidate.prefill;
+        if (staged.prepare_mtp || staged.vision || staged.mtp_bridge != MtpBridgeMode::None) {
+            return std::nullopt;
+        }
+    }
+
+    // Rows may end their prompt here: a finishing row's token comes straight out of the pass, so
+    // interior and final chunks can share one rectangle. Short lanes are padded with zero-weight
+    // columns, and `valid_columns` says how many each row really owns.
     std::array<std::size_t, kMaximumConcurrency> selected{};
     std::size_t batch    = 0;
     std::uint32_t widest = 0;
     for (std::size_t i = 0; i < built; ++i) {
-        const RequestControl::Prefill& staged = *requests[rows[i].lane].prefill;
-        if (rows[i].base + rows[i].count >= staged.prompt_tokens) { continue; }
         const std::uint32_t candidate = std::max(widest, rows[i].count);
         const std::int32_t width =
             models::qwen3_5::execution::prefill_class_for(static_cast<std::int32_t>(candidate));
         if (static_cast<std::uint64_t>(width) * (batch + 1) > prefill_chunk) { break; }
-        widest             = candidate;
-        selected[batch++]  = i;
+        widest            = candidate;
+        selected[batch++] = i;
     }
-    if (batch < 2) {
-        if (std::getenv("NINFER_PREFILL_BATCH_EXEC") != nullptr) {
-            static std::uint64_t shown2 = 0;
-            if (shown2++ < 8) {
-                std::fprintf(stderr, "[prefill-merged] skip: interior=%zu of %zu\
-", batch, built);
-                std::fflush(stderr);
-            }
-        }
-        return false;
+    if (batch < 2) { return std::nullopt; }
+
+    // The GDN conv snapshot path is verify-shaped: gdn_input_proj_conv_snapshot accepts width <= 16
+    // when batch > 1, and its conv-state tensor is sized for at most that many columns. A prefill
+    // chunk is 128..1024 wide, so a merged pass over it fails inside the kernel (invalid convolution
+    // snapshot state) rather than producing wrong tokens. Refusing here keeps that failure from
+    // reaching a request; lifting it needs a wide-batch conv kernel, which is the remaining kernel
+    // work for this feature.
+    if (models::qwen3_5::execution::prefill_class_for(static_cast<std::int32_t>(widest)) > 16) {
+        return std::nullopt;
     }
 
-    const std::int32_t width = models::qwen3_5::execution::prefill_class_for(static_cast<std::int32_t>(widest));
+    const std::int32_t width =
+        models::qwen3_5::execution::prefill_class_for(static_cast<std::int32_t>(widest));
     const std::int32_t rows_n = static_cast<std::int32_t>(batch);
     std::vector<std::int32_t> ids(static_cast<std::size_t>(width) * batch, 0);
     std::vector<std::int32_t> positions(ids.size(), 0);
@@ -377,17 +382,22 @@ bool ProgramImpl::advance_prefill_batch() {
     std::vector<std::int32_t> src(batch, 0);
     std::vector<std::int32_t> dst(batch, 0);
     std::vector<std::int32_t> next_tokens(batch, 0);
+    std::array<Tensor*, kMaximumConcurrency> tails{};
+    std::array<bool, kMaximumConcurrency> finishes{};
 
-    std::uint32_t visible = 0;
+    std::uint32_t visible   = 0;
+    std::uint32_t processed = 0;
     for (std::size_t b = 0; b < batch; ++b) {
         const execution::PrefillRow& row = rows[selected[b]];
         SequenceState& sequence          = active_sequence(row.lane);
-        RequestControl::Prefill& staged  = *requests[row.lane].prefill;
+        const RequestControl::Prefill& staged = *requests[row.lane].prefill;
         ensure_sequence_kv_mapped(sequence, row.base + row.count, 0);
-        valid[b]   = static_cast<std::int32_t>(row.count);
-        kv_rows[b] = static_cast<std::int32_t>(row.kv_row);
-        src[b]     = row.state_source;
-        dst[b]     = row.state_destination;
+        valid[b]     = static_cast<std::int32_t>(row.count);
+        kv_rows[b]   = static_cast<std::int32_t>(row.kv_row);
+        src[b]       = row.state_source;
+        dst[b]       = row.state_destination;
+        tails[b]     = &sequence.tail_hidden;
+        finishes[b]  = row.base + row.count >= staged.prompt_tokens;
         for (std::uint32_t t = 0; t < row.count; ++t) {
             const std::size_t at = static_cast<std::size_t>(t) * batch + b;
             ids[at]       = staged.prompt.token_ids[row.base + t];
@@ -395,6 +405,7 @@ bool ProgramImpl::advance_prefill_batch() {
             rope[at]      = static_cast<std::int32_t>(row.base + t + sequence.rope_delta);
         }
         visible = std::max(visible, row.base + row.count);
+        processed += row.count;
     }
 
     const SequenceState& first = active_sequence(rows[selected[0]].lane);
@@ -418,36 +429,77 @@ bool ProgramImpl::advance_prefill_batch() {
         0,
         &prefill_gpu_timer_};
 
-    execution::PrefillBatchPass pass{ids, positions, rope, valid, kv_rows, src, dst,
-                                       static_cast<std::int32_t>(width), rows_n};
-    if (std::getenv("NINFER_PREFILL_BATCH_EXEC") != nullptr) {
-        std::fprintf(stderr, "[prefill-merged] rows=%zu width=%d columns=%zu lanes=",
-                     batch, width, static_cast<std::size_t>(width) * batch);
-        for (std::size_t b = 0; b < batch; ++b) {
-            std::fprintf(stderr, " %u:", rows[selected[b]].lane);
-            std::fprintf(stderr, "%u", rows[selected[b]].count);
-        }
-        std::fprintf(stderr, "\n");
-        std::fflush(stderr);
-    }
+    execution::PrefillBatchPass pass{ids, positions, rope, valid, kv_rows, src, dst, width, rows_n};
     mark_workspace_usage(workspace_plan.text_prefill);
-    execution::prefill_batch_pass(
-        schedule_state, pass,
-        ops::CausalAttentionExecutionEnvelope{visible, visible},
-        next_tokens);
+    execution::prefill_batch_pass(schedule_state, pass,
+                                  ops::CausalAttentionExecutionEnvelope{visible, visible},
+                                  next_tokens, std::span<Tensor* const>(tails.data(), batch));
     device.synchronize();
 
+    Program::MergedPrefillResult result;
+    std::array<TokenId, kMaximumConcurrency> finished_tokens{};
     for (std::size_t b = 0; b < batch; ++b) {
         const execution::PrefillRow& row = rows[selected[b]];
         SequenceState& sequence          = active_sequence(row.lane);
-        RequestControl::Prefill& staged  = *requests[row.lane].prefill;
+        RequestControl& request          = requests[row.lane];
+        RequestControl::Prefill& staged  = *request.prefill;
+        const std::uint32_t prompt_tokens = staged.prompt_tokens;
+        const std::uint32_t reused_base   = staged.base;
+        const PrefixReusePath reused_path = staged.reuse;
         staged.cursor += row.count;
         sequence.text_kv_valid = staged.cursor;
         commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
+        if (!finishes[b]) { continue; }
+        if (staged.cursor != prompt_tokens) {
+            throw std::logic_error("merged prefill finished a row off its frontier");
+        }
+        const TokenId token = static_cast<TokenId>(next_tokens[b]);
+        validate_licensed_tokens(std::span<const TokenId>(&token, 1));
+        if (sequence.ledger.size() != prompt_tokens) {
+            throw std::logic_error("merged prefill ledger does not match prompt length");
+        }
+        sequence.ledger.push_back(token);
+        sequence.prefix_identity.append_generated(1, sequence.rope_delta);
+        sequence.prefix_digests.append_generated(std::span<const TokenId>(&token, 1),
+                                                 sequence.rope_delta);
+        sequence.text_kv_valid     = prompt_tokens;
+        sequence.tail_hidden_valid = true;
+        request.timings.prefill_seconds =
+            std::max(0.0, staged.elapsed_seconds - staged.retired_vision_seconds);
+        request.prefill.reset();
+        request.pending = PendingCandidate{.kind          = PendingKind::Begin,
+                                           .base_E        = 0,
+                                           .base_S        = 0,
+                                           .prompt_tokens = prompt_tokens,
+                                           .produced      = 1};
+        request.lifecycle = Lifecycle::Pending;
+        const std::size_t index    = result.count;
+        result.lanes[index]        = row.lane;
+        result.summaries[index]    = runtime::BeginSummary{.prompt_tokens = prompt_tokens,
+                                                           .reused_prompt_tokens = reused_base,
+                                                           .prefix_reuse_path    = reused_path};
+        finished_tokens[index]     = token;
+        ++result.count;
     }
-    return true;
-}
 
+    result.progress.processed_prompt_tokens = processed;
+    if (result.count != 0) {
+        result.progress.complete = true;
+        const runtime::BatchedGeneratedRound round{
+            .tokens     = std::span<const TokenId>(finished_tokens.data(), result.count),
+            .row_counts = {},
+            .row_stride = 1,
+        };
+        result.progress.pending.emplace(
+            wrap_pending(std::span<const std::uint32_t>(result.lanes.data(), result.count), round));
+    }
+    if (std::getenv("NINFER_PREFILL_BATCH_EXEC") != nullptr) {
+        std::fprintf(stderr, "[prefill-merged] rows=%zu width=%d columns=%zu finished=%zu\n", batch,
+                     width, static_cast<std::size_t>(width) * batch, result.count);
+        std::fflush(stderr);
+    }
+    return result;
+}
 runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     std::span<const std::uint32_t> lanes, std::span<const std::uint32_t> accepted_tokens,
     std::span<const std::uint8_t> terminal, std::span<const std::uint8_t> discarded,

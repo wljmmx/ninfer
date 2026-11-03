@@ -539,7 +539,15 @@ public:
     std::size_t prefill_batch_rows(std::span<const std::uint32_t> lanes,
                                    std::span<execution::PrefillRow> out);
     void report_prefill_rows(std::span<const std::uint32_t> lanes);
-    bool advance_prefill_batch();
+    // Q67/S1: what one merged prefill pass produced. `lanes`/`summaries` are the per-row bookkeeping
+    // the engine needs, because commit_pending takes N lanes exactly like a decode round.
+    struct MergedPrefillResult {
+        PrefillProgress progress;
+        std::array<std::uint32_t, kMaximumConcurrency> lanes{};
+        std::array<runtime::BeginSummary, kMaximumConcurrency> summaries{};
+        std::size_t count = 0;
+    };
+    [[nodiscard]] std::optional<MergedPrefillResult> advance_prefill_batch();
     [[nodiscard]] bool reclaim_capture_reservation(runtime::ContextResourceUsage shortage);
     void release_units(std::span<const SequenceHandle> sequences) noexcept;
     [[nodiscard]] BindingReservation

@@ -884,7 +884,8 @@ void TextContext::prefill_batch(std::span<const std::int32_t> ids,
                                 std::span<const std::int32_t> state_destination_slots,
                                 std::int32_t width, std::int32_t batch,
                                 ops::CausalAttentionExecutionEnvelope envelope,
-                                std::span<std::int32_t> next_tokens) {
+                                std::span<std::int32_t> next_tokens,
+                                std::span<Tensor* const> tail_hidden_rows) {
     if (width <= 0 || batch <= 0 || batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
         throw std::invalid_argument("prefill batch shape is outside the supported domain");
     }
@@ -899,7 +900,7 @@ void TextContext::prefill_batch(std::span<const std::int32_t> ids,
         state_destination_slots.size() != lane_count) {
         throw std::invalid_argument("prefill batch host spans do not match the pass shape");
     }
-    if (next_tokens.size() != lane_count) {
+    if (next_tokens.size() != lane_count || tail_hidden_rows.size() != lane_count) {
         throw std::invalid_argument("prefill batch token output does not match the row count");
     }
 
@@ -957,6 +958,15 @@ void TextContext::prefill_batch(std::span<const std::int32_t> ids,
     Tensor tokens = work_.alloc(DType::I32, {batch});
     project(normed, *lm_head_, logits, work_, stream);
     ops::argmax(logits, tokens, dimension(parameters_.model.resources().public_token_count), stream);
+    // Each row's own tail hidden: the next decode step reads it, so it has to land in that lane's
+    // sequence rather than in a shared scratch tensor.
+    for (std::int32_t row = 0; row < batch; ++row) {
+        Tensor* target = tail_hidden_rows[static_cast<std::size_t>(row)];
+        CUDA_CHECK(cudaMemcpyAsync(target->data,
+                                   static_cast<const char*>(last.data) +
+                                       static_cast<std::size_t>(row) * last.nb[1],
+                                   target->bytes(), cudaMemcpyDeviceToDevice, stream));
+    }
     CUDA_CHECK(cudaMemcpyAsync(next_tokens.data(), tokens.data,
                                lane_count * sizeof(std::int32_t), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));

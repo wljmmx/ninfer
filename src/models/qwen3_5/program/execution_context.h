@@ -161,7 +161,8 @@ struct PrefillBatchPass {
 
 void prefill_batch_pass(PrefillContext& state, const PrefillBatchPass& pass,
                         ops::CausalAttentionExecutionEnvelope envelope,
-                        std::span<std::int32_t> next_tokens);
+                        std::span<std::int32_t> next_tokens,
+                        std::span<Tensor* const> tail_hidden_rows);
 
 [[nodiscard]] PrefillChunkResult prefill_text_chunk(PrefillContext& state,
                                                     std::span<const TokenId> ids,

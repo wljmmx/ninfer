@@ -2601,9 +2601,23 @@ private:
                     hold_prefill = (!pending_.empty() || materializing_.has_value()) &&
                                    !admission_deferred_;
                 }
-                if (prefill_batch_exec_ && instance_.program->advance_prefill_batch()) {
-                    // Q67/S1: one merged pass carried several lanes' interior chunks. The final
-                    // chunk of every prompt still goes through the single-lane path below.
+                auto merged = prefill_batch_exec_ ? instance_.program->advance_prefill_batch()
+                                                  : std::nullopt;
+                if (merged) {
+                    // Q67/S1: one merged pass carried several lanes' chunks. Every row that finished
+                    // owns a pending token, and committing a multi-row pending is the same call the
+                    // decode batch uses.
+                    for (std::size_t row = 0; row < merged->count; ++row) {
+                        if (auto& request = slots_[merged->lanes[row]]; request != nullptr) {
+                            request->begin = merged->summaries[row];
+                        }
+                    }
+                    if (merged->progress.pending) {
+                        commit_pending(
+                            std::move(*merged->progress.pending),
+                            std::span<const std::uint32_t>(merged->lanes.data(), merged->count), false,
+                            snapshot_cancellations());
+                    }
                     executed = true;
                 } else if (hold_prefill) {
                     // A deliberate pass, not an idle one: the loop must not sleep waiting for work
