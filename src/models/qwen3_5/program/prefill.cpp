@@ -230,13 +230,21 @@ ProgramImpl::advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* f
 }
 
 runtime::ExecutionTiming ProgramImpl::resolve_prefill_raw(std::uint32_t lane, bool terminal,
-                                                          runtime::ExecutionTiming* failed_timing) {
+                                                           runtime::ExecutionTiming* failed_timing) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     if (requests[lane].pending.kind != PendingKind::Begin) {
         throw std::logic_error("prefill resolution requires a pending prefill token");
     }
     return resolve_non_speculative_pending(active_sequence(lane), requests[lane], 1, terminal,
                                            std::nullopt, failed_timing);
+}
+
+std::uint32_t ProgramImpl::prefill_remaining(std::uint32_t lane) const {
+    if (lane >= max_concurrency) { return 0; }
+    const RequestControl& request = requests[lane];
+    if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) { return 0; }
+    const RequestControl::Prefill& staged = *request.prefill;
+    return staged.cursor >= staged.prompt_tokens ? 0U : staged.prompt_tokens - staged.cursor;
 }
 
 runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(

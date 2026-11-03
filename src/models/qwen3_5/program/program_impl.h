@@ -766,6 +766,10 @@ public:
     [[nodiscard]] runtime::PrefillStepResult
     advance_prefill(SequenceState& sequence, RequestControl& request,
                     runtime::ExecutionTiming* failed_timing);
+    // Q67/S1: how many prompt tokens this lane still has to prefill, 0 when it is not prefilling.
+    // The batch container needs it to decide what a merged pass would be padded to; the cursor lives
+    // here, not in the engine's request record.
+    [[nodiscard]] std::uint32_t prefill_remaining(std::uint32_t lane) const;
     void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                        std::span<const std::uint32_t> starts,
                                        std::span<const std::uint32_t> counts);

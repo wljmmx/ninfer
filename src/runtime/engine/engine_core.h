@@ -11,6 +11,7 @@
 #include "runtime/engine/context_cache/resource_manager.h"
 #include "runtime/engine/scheduler.h"
 #include "runtime/engine/generation_budget.h"
+#include "models/qwen3_5/execution/shape_class.h"
 
 #include <algorithm>
 #include <array>
@@ -2504,6 +2505,33 @@ private:
                         prefill_slots[lane].reset();
                     }
                 }
+                // Q67/S1: what a merged prefill would be, before one exists. The batch container's
+                // decision is pure arithmetic on the queued lanes' remaining prompt tokens, so the
+                // prediction is printable while prefill is still one lane at a time: if the fit is
+                // wrong here it is wrong in the batch too, and this is the cheap place to see it.
+                // NINFER_PREFILL_BATCH turns the report on; the default keeps this branch compiled
+                // out of the hot path entirely.
+                if (prefill_batch_report_) {
+                    std::array<std::uint32_t, kMaximumConcurrency> remaining{};
+                    std::size_t queued = 0;
+                    for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                        if (!prefill_slots[lane]) { continue; }
+                        const std::uint32_t left = instance_.program->prefill_remaining(lane);
+                        if (left == 0) { continue; }
+                        remaining[queued++] = left;
+                    }
+                    const auto fit = models::qwen3_5::execution::prefill_batch_fit(
+                        std::span<const std::uint32_t>(remaining.data(), queued));
+                    ++prefill_batch_reports_;
+                    if (prefill_batch_reports_ <= 8 || prefill_batch_reports_ % 32 == 0) {
+                        std::fprintf(stderr,
+                                     "[prefill-batch] queued=%zu pick=%d lanes=%zu "
+                                     "merged=%.0fms separate=%.0fms\n",
+                                     queued, fit.width, fit.lanes, fit.merged_ms,
+                                     fit.separate_ms);
+                        std::fflush(stderr);
+                    }
+                }
                 if (const auto lane = scheduler_.next_prefill(prefill_slots, max_concurrency_)) {
                     const auto request = slots_[*lane];
                     set_host_work_class(HostWorkClass::Prefill);
@@ -2586,6 +2614,10 @@ private:
     std::uint64_t expert_pool_rounds_ = 0;
     std::vector<std::shared_ptr<Request>> paused_;
     Scheduling scheduler_;
+    // Q67/S1: read once, so the report costs a pointer comparison per prefill pass and nothing on
+    // the decode path. NINFER_PREFILL_BATCH prints what a merged prefill would be.
+    bool prefill_batch_report_ = std::getenv("NINFER_PREFILL_BATCH") != nullptr;
+    std::uint64_t prefill_batch_reports_ = 0;
     std::array<bool, kMaximumConcurrency> runnable_units_{};
     std::atomic<bool> admission_check_pending_{false};
     std::uint64_t worker_accounted_elapsed_ns_ = 0;

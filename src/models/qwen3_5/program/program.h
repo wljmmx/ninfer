@@ -530,6 +530,10 @@ public:
     // owner, so the shrink is refused instead of silently invalidating it. Returns the capacity in
     // effect afterwards (0 when the model has no main KV pool).
     std::uint32_t resize_kv_capacity(std::uint32_t target_pages);
+    // Q67/S1: prompt tokens this lane still has to prefill (0 when it is not prefilling). The
+    // cursor lives in the Program, not in the engine's request record, so the batch container asks
+    // here for what a merged pass would be padded to.
+    [[nodiscard]] std::uint32_t prefill_remaining(std::uint32_t lane) const;
     [[nodiscard]] bool reclaim_capture_reservation(runtime::ContextResourceUsage shortage);
     void release_units(std::span<const SequenceHandle> sequences) noexcept;
     [[nodiscard]] BindingReservation

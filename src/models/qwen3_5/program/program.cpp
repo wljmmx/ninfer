@@ -164,6 +164,10 @@ std::uint32_t Program::resize_kv_capacity(std::uint32_t target_pages) {
     return impl_->resize_kv_capacity(target_pages);
 }
 
+std::uint32_t Program::prefill_remaining(std::uint32_t lane) const {
+    return impl_->prefill_remaining(lane);
+}
+
 CheckpointSummary Program::checkpoint_summary(CheckpointHandle h) const {
     return impl_->checkpoint_summary(h);
 }
