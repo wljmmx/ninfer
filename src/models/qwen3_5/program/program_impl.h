@@ -770,7 +770,14 @@ public:
     // The batch container needs it to decide what a merged pass would be padded to; the cursor lives
     // here, not in the engine's request record.
     [[nodiscard]] std::uint32_t prefill_remaining(std::uint32_t lane) const;
-    void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
+    // Q67/S1 step 1: name each lane's place in a merged pass - its own KV address row, its absolute
+    // base, how many prompt tokens it contributes, and the state slots it reads and writes. Builds
+    // only; nothing executes until advance_prefill_batch exists.
+    std::size_t prefill_batch_rows(std::span<const std::uint32_t> lanes,
+                                   std::span<execution::PrefillRow> out);
+    // Prints the rows a merged pass would use. Lives here so the row type stays out of the engine's
+    // headers; the engine only passes lane ids.
+    void report_prefill_rows(std::span<const std::uint32_t> lanes);    void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                        std::span<const std::uint32_t> starts,
                                        std::span<const std::uint32_t> counts);
     void validate_licensed_tokens(std::span<const TokenId> tokens) const;

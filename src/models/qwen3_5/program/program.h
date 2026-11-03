@@ -3,6 +3,7 @@
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "models/qwen3_5/program/prefill_row.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -534,6 +535,10 @@ public:
     // cursor lives in the Program, not in the engine's request record, so the batch container asks
     // here for what a merged pass would be padded to.
     [[nodiscard]] std::uint32_t prefill_remaining(std::uint32_t lane) const;
+    // Q67/S1: name each lane's place in a merged prefill pass (build only; nothing executes).
+    std::size_t prefill_batch_rows(std::span<const std::uint32_t> lanes,
+                                   std::span<execution::PrefillRow> out);
+    void report_prefill_rows(std::span<const std::uint32_t> lanes);
     [[nodiscard]] bool reclaim_capture_reservation(runtime::ContextResourceUsage shortage);
     void release_units(std::span<const SequenceHandle> sequences) noexcept;
     [[nodiscard]] BindingReservation

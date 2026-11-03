@@ -260,6 +260,45 @@ std::uint32_t ProgramImpl::prefill_remaining(std::uint32_t lane) const {
     return staged.cursor >= staged.prompt_tokens ? 0U : staged.prompt_tokens - staged.cursor;
 }
 
+std::size_t ProgramImpl::prefill_batch_rows(std::span<const std::uint32_t> lanes,
+                                            std::span<execution::PrefillRow> out) {
+    std::size_t count = 0;
+    for (const auto lane : lanes) {
+        if (count >= out.size()) { break; }
+        if (lane >= max_concurrency) { continue; }
+        const RequestControl& request = requests[lane];
+        if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) { continue; }
+        const SequenceState& sequence = active_sequence(lane);
+        if (!sequence.kv) { continue; }
+        const auto row = text_kv_addresses->bound_row(sequence.kv->text);
+        if (row < 0) { continue; }
+        const RequestControl::Prefill& staged = *request.prefill;
+        if (staged.cursor >= staged.prompt_tokens) { continue; }
+        const StateImageSelectors selectors = state_selectors(sequence);
+        execution::PrefillRow& target         = out[count++];
+        target.lane                           = lane;
+        target.kv_row                         = static_cast<std::uint32_t>(row);
+        target.base                           = staged.cursor;
+        target.count = std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+        target.state_source      = selectors.source;
+        target.state_destination = selectors.destination;
+    }
+    return count;
+}
+
+void ProgramImpl::report_prefill_rows(std::span<const std::uint32_t> lanes) {
+    std::array<execution::PrefillRow, kMaximumConcurrency> rows{};
+    const std::size_t count = prefill_batch_rows(lanes, rows);
+    std::fprintf(stderr, "[prefill-rows] n=%zu", count);
+    for (std::size_t i = 0; i < count; ++i) {
+        std::fprintf(stderr, " | lane=%u kv=%u base=%u count=%u ss=%d sd=%d", rows[i].lane,
+                     rows[i].kv_row, rows[i].base, rows[i].count, rows[i].state_source,
+                     rows[i].state_destination);
+    }
+    std::fprintf(stderr, "\n");
+    std::fflush(stderr);
+}
+
 runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     std::span<const std::uint32_t> lanes, std::span<const std::uint32_t> accepted_tokens,
     std::span<const std::uint8_t> terminal, std::span<const std::uint8_t> discarded,

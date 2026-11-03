@@ -1,5 +1,6 @@
 #pragma once
 #include "models/qwen3_5/program/internal.h"
+#include "models/qwen3_5/program/prefill_row.h"
 
 #include "core/arena.h"
 #include "core/decode_graph.h"
@@ -40,6 +41,7 @@ struct ExecutionCore {
     ProposalHead proposal_head;
 };
 
+// Q67/S1: one lane's place in a merged prefill pass (see prefill_row.h).
 struct PrefillContext {
     ExecutionCore execution;
     qwen3_5::PagedKVCacheView text_kv;
@@ -57,6 +59,9 @@ struct PrefillContext {
     qwen3_5::DFlashPrefillIngress* dflash_prefill_host_ingress = nullptr;
     std::int32_t rope_delta                                    = 0;
     CudaEventTimer* prefill_gpu_timer                          = nullptr;
+    // Q67/S1: empty for the single-request path, which keeps using the scalar members above and
+    // must stay byte-identical. A merged pass fills these instead.
+    std::span<const PrefillRow> rows;
 };
 
 struct OrdinaryBatchContext {

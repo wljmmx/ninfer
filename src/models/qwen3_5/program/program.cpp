@@ -168,6 +168,15 @@ std::uint32_t Program::prefill_remaining(std::uint32_t lane) const {
     return impl_->prefill_remaining(lane);
 }
 
+std::size_t Program::prefill_batch_rows(std::span<const std::uint32_t> lanes,
+                                        std::span<execution::PrefillRow> out) {
+    return impl_->prefill_batch_rows(lanes, out);
+}
+
+void Program::report_prefill_rows(std::span<const std::uint32_t> lanes) {
+    impl_->report_prefill_rows(lanes);
+}
+
 CheckpointSummary Program::checkpoint_summary(CheckpointHandle h) const {
     return impl_->checkpoint_summary(h);
 }

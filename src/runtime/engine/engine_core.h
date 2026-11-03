@@ -2570,6 +2570,16 @@ private:
                                      static_cast<unsigned long long>(admit_probe_ok_));
                         std::fflush(stderr);
                     }
+                    if (prefill_batch_verbose_) {
+                        std::array<std::uint32_t, kMaximumConcurrency> ids{};
+                        std::size_t id_count = 0;
+                        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                            if (!prefill_slots[lane]) { continue; }
+                            ids[id_count++] = lane;
+                        }
+                        instance_.program->report_prefill_rows(
+                            std::span<const std::uint32_t>(ids.data(), id_count));
+                    }
                 }
                 // Q67/S1 step 0, second half: admission runs behind prefill. A queued lane is bound
                 // only after the lane before it has finished its head chunk, so two lanes are never
