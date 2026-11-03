@@ -1650,6 +1650,12 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
                                    DType::I32,
                                    {static_cast<std::int32_t>(mask_host.size())});
                 const auto all_resident_run = [&] {
+                    // Probe: is the tail reading scratch it assumes is zeroed? The fast path has a
+                    // different history in the arena, so stale bytes would show up as a different
+                    // result with identical inputs.
+                    if (std::getenv("NINFER_ZERO_SCRATCH") != nullptr) {
+                        (void)cudaMemsetAsync(scratch.data, 0, scratch.bytes, execution.stream);
+                    }
                     ops::routed_swiglu(
                         hidden, routed, moe.stream->experts(), routes,
                         masked_shape
