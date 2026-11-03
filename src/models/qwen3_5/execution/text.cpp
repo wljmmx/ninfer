@@ -883,8 +883,8 @@ void TextContext::prefill_batch(std::span<const std::int32_t> ids,
                                 std::span<const std::int32_t> state_source_slots,
                                 std::span<const std::int32_t> state_destination_slots,
                                 std::int32_t width, std::int32_t batch,
-                                ops::CausalAttentionExecutionEnvelope envelope, Tensor& logits,
-                                Tensor& tokens) {
+                                ops::CausalAttentionExecutionEnvelope envelope,
+                                std::span<std::int32_t> next_tokens) {
     if (width <= 0 || batch <= 0 || batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
         throw std::invalid_argument("prefill batch shape is outside the supported domain");
     }
@@ -899,9 +899,9 @@ void TextContext::prefill_batch(std::span<const std::int32_t> ids,
         state_destination_slots.size() != lane_count) {
         throw std::invalid_argument("prefill batch host spans do not match the pass shape");
     }
-    require_tensor_shape(logits, DType::BF16, {dimension(config_.vocab_size), batch},
-                         "prefill batch logits");
-    require_tensor_shape(tokens, DType::I32, {batch}, "prefill batch tokens");
+    if (next_tokens.size() != lane_count) {
+        throw std::invalid_argument("prefill batch token output does not match the row count");
+    }
 
     cudaStream_t stream = ctx_.stream;
     work_.reset();
@@ -952,8 +952,14 @@ void TextContext::prefill_batch(std::span<const std::int32_t> ids,
             cudaMemcpyDeviceToDevice, stream));
     }
     ops::rmsnorm(last, *final_norm_, config_.rms_norm_eps, true, normed, stream);
+    Tensor logits = work_.alloc(DType::BF16,
+                                {dimension(config_.vocab_size), batch});
+    Tensor tokens = work_.alloc(DType::I32, {batch});
     project(normed, *lm_head_, logits, work_, stream);
     ops::argmax(logits, tokens, dimension(parameters_.model.resources().public_token_count), stream);
+    CUDA_CHECK(cudaMemcpyAsync(next_tokens.data(), tokens.data,
+                               lane_count * sizeof(std::int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
     if (prefill_gpu_timer_ != nullptr) { prefill_gpu_timer_->record_stop(); }
     work_.reset();
 }

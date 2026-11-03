@@ -539,6 +539,7 @@ public:
     std::size_t prefill_batch_rows(std::span<const std::uint32_t> lanes,
                                    std::span<execution::PrefillRow> out);
     void report_prefill_rows(std::span<const std::uint32_t> lanes);
+    bool advance_prefill_batch();
     [[nodiscard]] bool reclaim_capture_reservation(runtime::ContextResourceUsage shortage);
     void release_units(std::span<const SequenceHandle> sequences) noexcept;
     [[nodiscard]] BindingReservation

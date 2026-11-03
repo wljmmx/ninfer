@@ -159,9 +159,9 @@ struct PrefillBatchPass {
     std::int32_t batch = 0;
 };
 
-void prefill_batch_pass(ExecutionCore& execution, TextContext& card, const PrefillBatchPass& pass,
-                        ops::CausalAttentionExecutionEnvelope envelope, Tensor& logits,
-                        Tensor& tokens);
+void prefill_batch_pass(PrefillContext& state, const PrefillBatchPass& pass,
+                        ops::CausalAttentionExecutionEnvelope envelope,
+                        std::span<std::int32_t> next_tokens);
 
 [[nodiscard]] PrefillChunkResult prefill_text_chunk(PrefillContext& state,
                                                     std::span<const TokenId> ids,

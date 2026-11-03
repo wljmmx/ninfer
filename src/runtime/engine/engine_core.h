@@ -2601,7 +2601,11 @@ private:
                         hold_prefill = !pending_.empty();
                     }
                 }
-                if (hold_prefill) {
+                if (prefill_batch_exec_ && instance_.program->advance_prefill_batch()) {
+                    // Q67/S1: one merged pass carried several lanes' interior chunks. The final
+                    // chunk of every prompt still goes through the single-lane path below.
+                    executed = true;
+                } else if (hold_prefill) {
                     // A deliberate pass, not an idle one: the loop must not sleep waiting for work
                     // it just chose not to do.
                     executed = true;
@@ -2692,6 +2696,8 @@ private:
     bool prefill_batch_report_ = std::getenv("NINFER_PREFILL_BATCH") != nullptr;
     // Q67/S1: opt-in "admit before prefilling" hold; see the prefill dispatch.
     bool prefill_admit_first_ = std::getenv("NINFER_PREFILL_ADMIT_FIRST") != nullptr;
+    // Q67/S1: opt-in merged prefill dispatch (interior chunks only).
+    bool prefill_batch_exec_ = std::getenv("NINFER_PREFILL_BATCH_EXEC") != nullptr;
     // "all" (or any value starting with 'a') prints every dispatch instead of the first few.
     bool prefill_batch_verbose_ = [] {
         const char* value = std::getenv("NINFER_PREFILL_BATCH");

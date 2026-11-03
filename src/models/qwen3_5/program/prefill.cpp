@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/execution_context.h"
+#include "models/qwen3_5/execution/shape_class.h"
 #include "models/qwen3_5/execution/linear.h"
 #include "core/device.h"
 #include "ninfer/ops/gdn_replay.h"
@@ -64,6 +65,21 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
     if (card.proposal_head() == nullptr || card.proposal_head_n() <= 0) {
         throw std::runtime_error("optimized proposal head is unavailable");
     }
+}
+
+void prefill_batch_pass(PrefillContext& state, const PrefillBatchPass& pass,
+                        ops::CausalAttentionExecutionEnvelope envelope,
+                        std::span<std::int32_t> next_tokens) {
+    TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
+                     state.text_kv, state.execution.linear_attention, state.execution.io,
+                     state.execution.prefill_hidden, state.execution.prefill_chunk,
+                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+    configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
+                        state.state_destination_slot, state.mtp_proposal_extent);
+    card.set_prefill_gpu_timer(state.prefill_gpu_timer);
+    card.prefill_batch(pass.ids, pass.positions, pass.rope_positions, pass.valid_columns,
+                       pass.kv_table_rows, pass.state_source_slots, pass.state_destination_slots,
+                       pass.width, pass.batch, envelope, next_tokens);
 }
 
 PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const TokenId> ids,
@@ -300,12 +316,136 @@ void ProgramImpl::report_prefill_rows(std::span<const std::uint32_t> lanes) {
 }
 
 bool ProgramImpl::advance_prefill_batch() {
-    // Q67/S1: the merged pass is implemented (TextContext::prefill_batch, committed), but the Program
-    // side still needs two things this file cannot supply on its own: the TextContext handle the
-    // execution layer expects, and device buffers for the [vocab, batch] logits tail. Until those are
-    // wired, the caller keeps the single-lane dispatch: eturn false is the honest answer, and the
-    // env switch stays off by default.
-    return false;
+    if (std::getenv("NINFER_PREFILL_BATCH_EXEC") == nullptr) { return false; }
+
+    std::array<std::uint32_t, kMaximumConcurrency> lanes{};
+    std::size_t lane_count = 0;
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        if (prefill_remaining(lane) == 0) { continue; }
+        lanes[lane_count++] = lane;
+    }
+    if (lane_count < 2) {
+        if (std::getenv("NINFER_PREFILL_BATCH_EXEC") != nullptr) {
+            static std::uint64_t shown = 0;
+            if (shown++ < 8) {
+                std::fprintf(stderr, "[prefill-merged] skip: lanes=%zu\n", lane_count);
+                std::fflush(stderr);
+            }
+        }
+        return false;
+    }
+
+    std::array<execution::PrefillRow, kMaximumConcurrency> rows{};
+    const std::size_t built =
+        prefill_batch_rows(std::span<const std::uint32_t>(lanes.data(), lane_count), rows);
+
+    // Interior chunks only. The chunk that ends a prompt is what produces its pending token, and that
+    // path stays exactly as it is; batching it would mean reproducing the pending/resolve machinery
+    // per row, which is a separate change with its own proof obligation.
+    std::array<std::size_t, kMaximumConcurrency> selected{};
+    std::size_t batch    = 0;
+    std::uint32_t widest = 0;
+    for (std::size_t i = 0; i < built; ++i) {
+        const RequestControl::Prefill& staged = *requests[rows[i].lane].prefill;
+        if (rows[i].base + rows[i].count >= staged.prompt_tokens) { continue; }
+        const std::uint32_t candidate = std::max(widest, rows[i].count);
+        const std::int32_t width =
+            models::qwen3_5::execution::prefill_class_for(static_cast<std::int32_t>(candidate));
+        if (static_cast<std::uint64_t>(width) * (batch + 1) > prefill_chunk) { break; }
+        widest             = candidate;
+        selected[batch++]  = i;
+    }
+    if (batch < 2) {
+        if (std::getenv("NINFER_PREFILL_BATCH_EXEC") != nullptr) {
+            static std::uint64_t shown2 = 0;
+            if (shown2++ < 8) {
+                std::fprintf(stderr, "[prefill-merged] skip: interior=%zu of %zu\
+", batch, built);
+                std::fflush(stderr);
+            }
+        }
+        return false;
+    }
+
+    const std::int32_t width = models::qwen3_5::execution::prefill_class_for(static_cast<std::int32_t>(widest));
+    const std::int32_t rows_n = static_cast<std::int32_t>(batch);
+    std::vector<std::int32_t> ids(static_cast<std::size_t>(width) * batch, 0);
+    std::vector<std::int32_t> positions(ids.size(), 0);
+    std::vector<std::int32_t> rope(ids.size(), 0);
+    std::vector<std::int32_t> valid(batch, 0);
+    std::vector<std::int32_t> kv_rows(batch, 0);
+    std::vector<std::int32_t> src(batch, 0);
+    std::vector<std::int32_t> dst(batch, 0);
+    std::vector<std::int32_t> next_tokens(batch, 0);
+
+    std::uint32_t visible = 0;
+    for (std::size_t b = 0; b < batch; ++b) {
+        const execution::PrefillRow& row = rows[selected[b]];
+        SequenceState& sequence          = active_sequence(row.lane);
+        RequestControl::Prefill& staged  = *requests[row.lane].prefill;
+        ensure_sequence_kv_mapped(sequence, row.base + row.count, 0);
+        valid[b]   = static_cast<std::int32_t>(row.count);
+        kv_rows[b] = static_cast<std::int32_t>(row.kv_row);
+        src[b]     = row.state_source;
+        dst[b]     = row.state_destination;
+        for (std::uint32_t t = 0; t < row.count; ++t) {
+            const std::size_t at = static_cast<std::size_t>(t) * batch + b;
+            ids[at]       = staged.prompt.token_ids[row.base + t];
+            positions[at] = static_cast<std::int32_t>(row.base + t);
+            rope[at]      = static_cast<std::int32_t>(row.base + t + sequence.rope_delta);
+        }
+        visible = std::max(visible, row.base + row.count);
+    }
+
+    const SequenceState& first = active_sequence(rows[selected[0]].lane);
+    execution::PrefillContext schedule_state{
+        {device, parameters, work, state_images->linear(),
+         replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
+         proposal_head},
+        text_kv_view(first),
+        {},
+        decoder->text_kv,
+        decoder->mtp_cache(),
+        nullptr,
+        0,
+        nullptr,
+        nullptr,
+        0,
+        0,
+        0,
+        0,
+        nullptr,
+        0,
+        &prefill_gpu_timer_};
+
+    execution::PrefillBatchPass pass{ids, positions, rope, valid, kv_rows, src, dst,
+                                       static_cast<std::int32_t>(width), rows_n};
+    if (std::getenv("NINFER_PREFILL_BATCH_EXEC") != nullptr) {
+        std::fprintf(stderr, "[prefill-merged] rows=%zu width=%d columns=%zu lanes=",
+                     batch, width, static_cast<std::size_t>(width) * batch);
+        for (std::size_t b = 0; b < batch; ++b) {
+            std::fprintf(stderr, " %u:", rows[selected[b]].lane);
+            std::fprintf(stderr, "%u", rows[selected[b]].count);
+        }
+        std::fprintf(stderr, "\n");
+        std::fflush(stderr);
+    }
+    mark_workspace_usage(workspace_plan.text_prefill);
+    execution::prefill_batch_pass(
+        schedule_state, pass,
+        ops::CausalAttentionExecutionEnvelope{visible, visible},
+        next_tokens);
+    device.synchronize();
+
+    for (std::size_t b = 0; b < batch; ++b) {
+        const execution::PrefillRow& row = rows[selected[b]];
+        SequenceState& sequence          = active_sequence(row.lane);
+        RequestControl::Prefill& staged  = *requests[row.lane].prefill;
+        staged.cursor += row.count;
+        sequence.text_kv_valid = staged.cursor;
+        commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
+    }
+    return true;
 }
 
 runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(

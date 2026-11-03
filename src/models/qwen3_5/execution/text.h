@@ -149,7 +149,9 @@ public:
     // rows, per-row positions, per-row valid columns, per-row state slots - which is what keeps the
     // rows block-diagonal without a mask: row i only ever reads KV row i. Host spans are copied in
     // here so the caller only builds plain arrays; `logits` is [vocab, batch] and `tokens` is
-    // [batch] - one column per row, the row's last valid token, because prefill only needs that one.
+    // [batch], one column per row, the row's last valid token, because prefill only needs that one.
+    // The logits tensor this needs is allocated inside, after the workspace reset, and only the
+    // resulting tokens come back: a caller-owned [vocab, batch] tensor would be freed by the reset.
     void prefill_batch(std::span<const std::int32_t> ids, std::span<const std::int32_t> positions,
                        std::span<const std::int32_t> rope_positions,
                        std::span<const std::int32_t> valid_columns,
@@ -157,7 +159,7 @@ public:
                        std::span<const std::int32_t> state_source_slots,
                        std::span<const std::int32_t> state_destination_slots, std::int32_t width,
                        std::int32_t batch, ops::CausalAttentionExecutionEnvelope envelope,
-                       Tensor& logits, Tensor& tokens);
+                       std::span<std::int32_t> next_tokens);
     void mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
                                   const Tensor& cache_positions, const Tensor& rope_positions,
                                   const Tensor& valid_columns, const Tensor& kv_table_rows,

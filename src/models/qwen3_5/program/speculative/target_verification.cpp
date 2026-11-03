@@ -24,17 +24,6 @@ void target_verify_forward(ExecutionCore& execution, TextContext& card, TargetVe
     }
 }
 
-void prefill_batch_pass(ExecutionCore& execution, TextContext& card, const PrefillBatchPass& pass,
-                        ops::CausalAttentionExecutionEnvelope envelope, Tensor& logits,
-                        Tensor& tokens) {
-    (void)execution;
-    // The state action stays UpdateInPlace: the batched GDN path writes each row's destination slot,
-    // which is what a prefill advance is when the slots are bound per row.
-    card.prefill_batch(pass.ids, pass.positions, pass.rope_positions, pass.valid_columns,
-                       pass.kv_table_rows, pass.state_source_slots, pass.state_destination_slots,
-                       pass.width, pass.batch, envelope, logits, tokens);
-}
-
 void target_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                    TargetVerifyFrameView frame) {
     if (frame.proposal_q.data != nullptr) {
