@@ -852,6 +852,21 @@ void ExpertStream::freeze_now(std::uint32_t /*tokens*/, cudaStream_t stream) {
     if (cache_ != nullptr && !frozen_wanted_.empty()) {
         (void)cache_->set_resident_experts(bank_, frozen_wanted_,
                                            static_cast<std::uint32_t>(frozen_wanted_.size()));
+        // Materialise the whole set before publishing anything. set_resident_experts only assigns
+        // slots: every expert it places comes back `ready == false`, and a mask built from the
+        // mapping alone calls 133 of 163 experts resident while the pool still holds the bytes of
+        // whoever used those slots before. The layer then runs the right arithmetic on the wrong
+        // weights, which is silent until the tokens drift. `covers_all` is a promise that a route
+        // needs no read-back to be served, so it has to be a promise about the bytes.
+        std::vector<ExpertCacheKey> keys;
+        keys.reserve(frozen_wanted_.size());
+        for (const auto expert : frozen_wanted_) { keys.push_back(ExpertCacheKey{bank_, expert}); }
+        for (std::uint32_t turn = 0; turn < 256; ++turn) {
+            if (cache_->unready_count(bank_, frozen_wanted_) == 0) { break; }
+            cache_->prepare(keys, stream);
+            cache_->wait_for_progress(stream);
+        }
+        freeze_pool_unready_ = cache_->unready_count(bank_, frozen_wanted_);
     }
     // Can every route be addressed without reading the ids back? This is the property a fully
     // static layer would need; kept as a counter, not as a branch (see the note at the covered
@@ -863,15 +878,16 @@ void ExpertStream::freeze_now(std::uint32_t /*tokens*/, cudaStream_t stream) {
     }
     freeze_pool_missing_ = pool_missing;
     freeze_covers_all_ = (freeze_members_ == count_ - device) &&
-                         (freeze_present_ == freeze_members_) && (pool_missing == 0);
+                         (freeze_present_ == freeze_members_) && (pool_missing == 0) &&
+                         (freeze_pool_unready_ == 0);
     publish_static_table();
     std::fprintf(stderr,
                  "[freeze] bank=%u state=frozen device=%zu host_static=%u present=%u d=%u c=%u "
-                 "p=%u covers_all=%d pool_missing=%u clock=%llu\n",
+                 "p=%u covers_all=%d pool_missing=%u pool_unready=%u clock=%llu\n",
                  bank_, frozen_wanted_.size(), freeze_members_, freeze_present_,
                  host_->dynamic_slots_per_bank(), host_->second_chance_per_bank(),
                  host_->prefetch_slots_per_bank(), int(freeze_covers_all_),
-                 freeze_pool_missing_,
+                 freeze_pool_missing_, freeze_pool_unready_,
                  static_cast<unsigned long long>(freeze_clock_));
     std::fflush(stderr);
     ++freeze_membership_moves_; // the one move a set is allowed: the move into the freeze
@@ -1236,6 +1252,15 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         // could never proceed.
         if (host_ != nullptr) { host_->begin_layer(); }
         probe_tables("fast");
+        if (std::getenv("NINFER_READY_PROBE") != nullptr && bank_ == 0) {
+            static std::uint32_t shown = 0;
+            if (shown++ < 48) {
+                const auto unready = cache_ == nullptr ? 0U : cache_->unready_count(bank_, frozen_wanted_);
+                std::fprintf(stderr, "[ready] seq=%u where=fast mapped=%zu unready=%u\n",
+                             shown - 1, frozen_wanted_.size(), unready);
+                std::fflush(stderr);
+            }
+        }
         probe_device_tables("fast", device_ids,
                             static_cast<std::size_t>(top_k) * static_cast<std::size_t>(tokens));
         return true;
@@ -2464,6 +2489,16 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                     host_->hold_slots(placed_slots_);
                     probe_tables("full");
                     probe_device_tables("full", device_ids, values);
+                    if (std::getenv("NINFER_READY_PROBE") != nullptr && bank_ == 0) {
+                        static std::uint32_t shown = 0;
+                        if (shown++ < 48) {
+                            const auto unready =
+                                cache_ == nullptr ? 0U : cache_->unready_count(bank_, frozen_wanted_);
+                            std::fprintf(stderr, "[ready] seq=%u where=full mapped=%zu unready=%u\n",
+                                         shown - 1, frozen_wanted_.size(), unready);
+                            std::fflush(stderr);
+                        }
+                    }
                     if (std::getenv("NINFER_PUBLISH_PROBE") != nullptr &&
                         (moved_pool + moved_s + moved_d + moved_c + moved_p + moved_absent) != 0) {
                         static std::uint32_t shown = 0;

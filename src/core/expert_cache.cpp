@@ -1121,6 +1121,20 @@ bool ExpertCache::set_resident_experts(std::uint32_t bank, std::span<const std::
     return impl_->set_resident(bank, experts, hot_count);
 }
 
+std::uint32_t ExpertCache::unready_count(std::uint32_t bank,
+                                         std::span<const std::uint32_t> experts) const {
+    auto& state = *impl_;
+    if (bank >= state.first.size() || bank >= state.entries.size()) { return 0; }
+    std::uint32_t unready = 0;
+    for (const std::uint32_t expert : experts) {
+        if (expert >= state.slot_of[bank].size()) { continue; }
+        if (state.slot_of[bank][expert] == kAbsentSlot) { continue; } // not mapped: a host route
+        const auto& entry = state.entries[state.first[bank] + expert];
+        if (!entry.ready) { ++unready; }
+    }
+    return unready;
+}
+
 bool ExpertCache::adopt_resident_slot(std::uint32_t bank, std::uint32_t expert,
                                       std::uint32_t slot) {
     return impl_->adopt_slot(bank, expert, slot);

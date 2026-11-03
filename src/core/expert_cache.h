@@ -197,6 +197,12 @@ void prepare(std::span<const ExpertCacheKey> required, cudaStream_t stream = nul
     // It is the only honest miss count - the residency mask is published from the same decision that
     // places the routes, so asking it "was this a miss?" always answers no.
     [[nodiscard]] std::uint32_t last_uploaded() const noexcept;
+    // Diagnostic: how many of these experts are mapped into the pool but their bytes have not landed.
+    // A route the mask calls resident whose slot is not ready reads whatever the slot held before, and
+    // that is silent - the arithmetic is right, the weights are not. Counted by name rather than by
+    // hashing the payload, because the payload's address is the thing under test.
+    [[nodiscard]] std::uint32_t unready_count(std::uint32_t bank,
+                                              std::span<const std::uint32_t> experts) const;
     // Bumped whenever a bank's resident set actually changes. The publisher uses it to prove a skipped
     // publication was skipped for the right reason: "the table did not move" is a claim about the
     // cache, so it is the cache that has to say so (A3).
