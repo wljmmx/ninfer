@@ -328,7 +328,7 @@ bool ProgramImpl::advance_prefill_batch() {
         if (std::getenv("NINFER_PREFILL_BATCH_EXEC") != nullptr) {
             static std::uint64_t shown = 0;
             if (shown++ < 8) {
-                std::fprintf(stderr, "[prefill-merged] skip: lanes=%zu\n", lane_count);
+                std::fprintf(stderr, "[prefill-merged] skip: lanes=%zu rem=", lane_count); for (std::uint32_t L = 0; L < max_concurrency; ++L) { std::fprintf(stderr, "%u%s", prefill_remaining(L), L + 1 == max_concurrency ? "\n" : ","); }
                 std::fflush(stderr);
             }
         }
