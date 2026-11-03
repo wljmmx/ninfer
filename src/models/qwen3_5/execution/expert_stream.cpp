@@ -197,6 +197,23 @@ void register_profile_dump(std::uint32_t bank, const std::vector<float>* scores)
 
 } // namespace
 
+// The request boundary (see the declaration in the header). Registration is process-lifetime:
+// the streams live inside the loaded model's parameters and are never moved or destroyed while the
+// engine runs, so attach() may add and nothing needs to remove. The mutex exists because the
+// boundary fires from the request path while a second model could be loading on another thread.
+namespace {
+std::mutex g_request_boundary_mutex;
+std::vector<ExpertStream*>& request_boundary_streams() {
+    static std::vector<ExpertStream*> streams;
+    return streams;
+}
+} // namespace
+
+void note_expert_request_begin() {
+    std::lock_guard<std::mutex> guard(g_request_boundary_mutex);
+    for (auto* stream : request_boundary_streams()) { stream->note_request_begin(); }
+}
+
 ExpertStream::ExpertStream(std::uint32_t count, WeightBankLayout gate_up, WeightBankLayout down,
                            WeightGeometry gate_up_parent, WeightGeometry down_parent,
                            std::uint64_t gate_up_object, std::uint64_t down_object)
@@ -331,6 +348,13 @@ void ExpertStream::attach(ExpertCache& cache, std::uint32_t bank, const ExpertBa
     cache_ = &cache;
     bank_  = bank;
     entry_ = entry;
+    // Once attached, this bank can act on the request boundary. attach() runs once per stream at
+    // model wiring, so the flag also guards a hypothetical second call.
+    if (!boundary_registered_) {
+        boundary_registered_ = true;
+        std::lock_guard<std::mutex> guard(g_request_boundary_mutex);
+        request_boundary_streams().push_back(this);
+    }
     if (host_ != nullptr) { host_->attach_scores(bank_, hot_score_.data(), count_); }
     for (auto& key : keys_) { key.bank = bank; }
     
@@ -436,15 +460,25 @@ void ExpertStream::gh1_report() {
     // Q20: `capturable` and `capt_free` are printed side by side on purpose. The first is a capacity
     // statement ("the pool could hold the layer"), the second is the execution statement ("the layer
     // did not touch the host"). F3 was the first number standing in for the second.
+    //
+    // The three fail counters attribute the gap between capt_free and capt_ready. A rate names the
+    // problem; the counters name whose lifetime caused it - an unaddressable route is the data path,
+    // a publish is the placement, an upload is the loader - and a controller can only act on the
+    // second kind. They can overlap on one layer, so they print as attribution, not as a partition.
     std::fprintf(stderr,
                  "[gh1] bank=%u calls=%llu static=%.1f%% no_miss=%.1f%% capturable=%.1f%% "
-                 "capt_free=%.1f%% capt_ready=%.1f%%\n",
-                 bank_, static_cast<unsigned long long>(gh1_calls_),
-                 pct(gh1_static_calls_, gh1_calls_), pct(gh1_no_miss_calls_, gh1_calls_),
-                 pct(gh1_calls_ - gh1_split_calls_, gh1_calls_),
-                 pct(gh1_capt_free_calls_, gh1_calls_),
-                 pct(gh1_capt_ready_calls_, gh1_calls_));
+                 "capt_free=%.1f%% capt_ready=%.1f%% fail_unaddr=%llu fail_publish=%llu "
+                 "fail_upload=%llu\n",
+                  bank_, static_cast<unsigned long long>(gh1_calls_),
+                  pct(gh1_static_calls_, gh1_calls_), pct(gh1_no_miss_calls_, gh1_calls_),
+                  pct(gh1_calls_ - gh1_split_calls_, gh1_calls_),
+                  pct(gh1_capt_free_calls_, gh1_calls_),
+                  pct(gh1_capt_ready_calls_, gh1_calls_),
+                  static_cast<unsigned long long>(gh1_captfail_unaddressable_),
+                  static_cast<unsigned long long>(gh1_captfail_publish_),
+                  static_cast<unsigned long long>(gh1_captfail_upload_));
     std::fflush(stderr);
+
 }
 // port (sm_89): Q10's instrument. The plan's gate is "static ≥95%", and `static` is incremented in
 // two places - the covered fast path and "the placement moved nothing" - so the number alone does not
@@ -2959,6 +2993,14 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     // is outside the two tiers. A layer that satisfies both would replay a table it was captured
     // with.
     if (!host_bound && all_addressable) { ++gh1_capt_ready_calls_; }
+    // The attribution of the other case, counted at the decision so a rate never has to be read
+    // as a cause (F3's mistake, in the other direction). One layer can fire several reasons, which
+    // is exactly the point: "not ready" is not one problem.
+    if (host_bound || !all_addressable) {
+        if (!all_addressable) { ++gh1_captfail_unaddressable_; }
+        if (host_publish) { ++gh1_captfail_publish_; }
+        if (host_upload) { ++gh1_captfail_upload_; }
+    }
     // P6/step 5: which structure served each route. A hit is a joint outcome of the hot region, the
     // spill ring, the prediction region and the host leg, and until this existed the panel could only
     // say "the pool served it" - which is exactly the number a controller cannot act on. Classified

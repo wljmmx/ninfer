@@ -462,6 +462,13 @@ private:
     // Layers that were both fully covered and host-free: the only state in which a captured
     // whole layer would replay the table it was captured with (Q20 -> GC2).
     std::uint64_t gh1_capt_ready_calls_ = 0;
+    // WHY a layer was not capt_ready, counted where the decision is made rather than inferred
+    // later: the read-back found a route with no address (a real data dependency on the host),
+    // the placement published a new table, or bytes were uploaded. The three may fire together on
+    // one layer, so their sum is not the failure count - it is the attribution of it.
+    std::uint64_t gh1_captfail_unaddressable_ = 0;
+    std::uint64_t gh1_captfail_publish_       = 0;
+    std::uint64_t gh1_captfail_upload_        = 0;
     // Routes of the last layer that the pinned tier addressed for the Device (Q20). Part of every
     // host-free layer, so it is reported with the rate rather than inferred from it.
     std::uint32_t last_host_routes_ = 0;
@@ -644,7 +651,20 @@ private:
     std::uint64_t miss_prev_host_    = 0;
     bool prev_covered_               = false;
     ops::CudaSwiGLUExperts experts_{};
+    // Whether attach() put this stream on the request-boundary registry (see
+    // note_expert_request_begin). Guards against a second attach registering it twice.
+    bool boundary_registered_ = false;
 };
+
+// The request boundary, as a hook the freeze policy can act on. The streams live inside the layer
+// parameters where no request-path code can see them, so they register here at attach() and the
+// boundary is one free call; Program::plan_request makes it, exactly once per accepted request, on
+// the path both the service and the CLI take.
+//
+// The hook carries no decision of its own: it is an event, and whether the event does anything is
+// `FreezePolicy::thaw_on_request`, which the controller owns through set_freeze_policy(). The
+// environment variable NINFER_FREEZE_THAW_REQUEST is only the initial value, like every other knob.
+void note_expert_request_begin();
 
 } // namespace ninfer::models::qwen3_5::execution
 

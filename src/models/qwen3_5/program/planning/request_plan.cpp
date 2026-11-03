@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/execution_context.h"
+#include "models/qwen3_5/execution/expert_stream.h"
 #include <algorithm>
 #include <cmath>
 #include <iterator>
@@ -187,6 +188,10 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
         std::sort(base->capture_groups.begin(), base->capture_groups.end(),
                   [](const auto& a, const auto& b) { return a.frontier < b.frontier; });
     }
+    // The model's request boundary: one accepted request is about to generate. This is the event the
+    // freeze policy may act on (thaw_on_request, controller-owned); the call carries no decision, so
+    // a deployment that never set the policy pays nothing but a mutex walk over empty state.
+    execution::note_expert_request_begin();
     return RequestBasePlan(std::move(base));
 }
 

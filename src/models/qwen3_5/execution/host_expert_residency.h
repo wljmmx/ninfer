@@ -1296,9 +1296,13 @@ private:
         const auto expert = slot_expert_[slot];
         if (bank == kNone || expert == kNone || bank >= state_.size()) { return false; }
         const auto cbase    = second_chance_base_ + bank * second_chance_per_bank_;
-        const auto incoming = scores != nullptr && expert < banks_[bank].entry.count
-                                  ? scores[expert]
-                                  : 0.0F;
+        // The dynamic range is shared by every bank, so the evictee here usually belongs to another
+        // bank than the one whose fill chose this victim - and `scores` is the REQUESTING bank's
+        // vector. Reading `scores[expert]` scored the evictee on the wrong bank's scale: expert ids
+        // are only meaningful per bank, so the comparison must use the evictee's own bank. Policy
+        // only (the bytes are the same either way), but a policy that compares across banks admits
+        // by noise. `scores == nullptr` keeps the old mechanical rule as the fallback.
+        const auto incoming = scores != nullptr ? score_of(bank, expert) : 0.0F;
         std::uint32_t target = kNone;
         auto& free           = second_chance_free_[bank];
         // A slot a promotion handed back may still be named by the previous layer's Device table.
@@ -1365,9 +1369,10 @@ private:
         return true;
     }
 
-    // The score of an expert whose bank is not the one being filled. The second-chance band is shared, so
-    // an admission may compare this bank's evictee against another bank's occupant; the score
-    // vectors are per bank and owned by the streams, which keep them alive for the process.
+    // The score of an expert in ITS OWN bank. The band is per bank, but the dynamic range it is
+    // demoted from is shared, so an admission routinely holds an evictee of one bank and an occupant
+    // of the same band belonging to a different traffic history; both sides of the comparison must
+    // be read on the bank that owns the expert, not the bank that happened to fill.
     [[nodiscard]] float score_of(std::uint32_t bank, std::uint32_t expert) const noexcept {
         constexpr std::uint32_t kMaxBanks = 64;
         if (bank >= kMaxBanks || score_bank_[bank] == nullptr) { return 0.0F; }
