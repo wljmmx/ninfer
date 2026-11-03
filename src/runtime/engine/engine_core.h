@@ -1730,8 +1730,18 @@ private:
     }
 
     bool try_admit_one(bool restoring) {
-        if (instance_.program->has_context_transaction()) { return false; }
+        // Q67/S1: the batch container's step 0 is to overlap the next lane's bind/capture with the
+        // current lane's chunk, so this probe counts what blocks admission today. Printed with the
+        // prefill batch report; the counters only move under that switch.
+        const bool admit_probe = prefill_batch_report_ && !restoring;
+        if (admit_probe) { ++admit_probe_calls_; }
+        admission_deferred_ = false;
+        if (instance_.program->has_context_transaction()) {
+            if (admit_probe) { ++admit_probe_tx_busy_; }
+            return false;
+        }
         const auto lane = free_lane();
+        if (admit_probe && !lane) { ++admit_probe_no_lane_; }
         if (!lane && restoring) {
             if (!paused_.empty() && !has_older_resident(paused_.front()->id)) {
                 if (const auto victim =
@@ -1938,6 +1948,7 @@ private:
                     std::erase(pending_, request);
                 }
                 request->model_state = EngineRequestState::Materializing;
+                if (admit_probe) { ++admit_probe_ok_; }
                 materializing_.emplace(
                     MaterializingRequest{request, LaneId{*lane}, begin, restoring, choice});
                 admission_decision_.reset();
@@ -1958,8 +1969,11 @@ private:
                 }
                 return true;
             }
-            admission_decision_.reset();
-            if (deferred) {
+                admission_decision_.reset();
+                if (deferred) {
+                    // Capacity, not ordering, is what refused this candidate. Remember it so the loop
+                    // stops re-arming the scan until a real capacity event arrives.
+                    admission_deferred_ = true;
                 if (restoring) {
                     scheduler_.restoration_blocked();
                     return false;
@@ -2433,6 +2447,15 @@ private:
                     }
                     if (admission_decision_ || scheduler_.admission_scan_pending()) {
                         (void)try_admit_one(false);
+                    } else if (!admission_deferred_ && free_lane() &&
+                               !instance_.program->has_context_transaction()) {
+                        // Q67/S1 step 0: a queued request used to wait for the previous request's
+                        // whole prefill, because the admission scan was only armed by a submission or
+                        // a capacity event. While a lane is free and something is queued, arm it here
+                        // instead - that is what lets the next lane's bind materialize while the
+                        // current lane's chunk runs, which is the precondition a merged prefill has.
+                        std::lock_guard lock(queue_mutex_);
+                        if (!pending_.empty()) { scheduler_.begin_admission_scan(); }
                     }
                 }
                 if (instance_.program->has_context_transaction()) {
@@ -2533,9 +2556,14 @@ private:
                         std::fprintf(stderr,
                                      "[prefill-batch] queued=%zu pick=%d lanes=%zu "
                                      "merged=%.0fms separate=%.0fms | engine_prefill=%zu "
-                                     "capture_held=%zu bound_ready=%zu\n",
+                                     "capture_held=%zu bound_ready=%zu | admit calls=%llu "
+                                     "tx_busy=%llu no_lane=%llu ok=%llu\n",
                                      queued, fit.width, fit.lanes, fit.merged_ms,
-                                     fit.separate_ms, engine_state, capture_held, bound_ready);
+                                     fit.separate_ms, engine_state, capture_held, bound_ready,
+                                     static_cast<unsigned long long>(admit_probe_calls_),
+                                     static_cast<unsigned long long>(admit_probe_tx_busy_),
+                                     static_cast<unsigned long long>(admit_probe_no_lane_),
+                                     static_cast<unsigned long long>(admit_probe_ok_));
                         std::fflush(stderr);
                     }
                 }
@@ -2625,6 +2653,13 @@ private:
     // the decode path. NINFER_PREFILL_BATCH prints what a merged prefill would be.
     bool prefill_batch_report_ = std::getenv("NINFER_PREFILL_BATCH") != nullptr;
     std::uint64_t prefill_batch_reports_ = 0;
+    // Q67/S1: admission probe counters, see try_admit_one.
+    std::uint64_t admit_probe_calls_   = 0;
+    std::uint64_t admit_probe_tx_busy_  = 0;
+    std::uint64_t admit_probe_no_lane_  = 0;
+    std::uint64_t admit_probe_ok_       = 0;
+    // Q67/S1: set by try_admit_one when a candidate was refused for capacity rather than ordering.
+    bool admission_deferred_ = false;
     std::array<bool, kMaximumConcurrency> runnable_units_{};
     std::atomic<bool> admission_check_pending_{false};
     std::uint64_t worker_accounted_elapsed_ns_ = 0;
