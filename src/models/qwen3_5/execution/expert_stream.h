@@ -622,6 +622,9 @@ private:
     std::uint64_t freeze_membership_moves_ = 0;
     std::uint64_t freeze_report_layers_ = 0;
     void freeze_now(std::uint32_t tokens, cudaStream_t stream);
+    // Diagnostic: a hash of the two host-side tables the kernel's addressing is built from, so a
+    // fast path and a full path can be compared at the same layer instead of at the output.
+    void probe_tables(const char* where) const;
     std::uint32_t* coverage_word_device_ = nullptr;
     bool coverage_word_checked_          = false;
     // O1's counter: mapped, so the skip is counted where it happens. `miss_lag_` is the host total

@@ -696,6 +696,25 @@ void ExpertStream::refresh_static_candidates() {
 // halves during the transition, which is the CPU divergence the gate exists to catch. One stall at
 // the boundary is the honest trade until the backfill can be shown to be complete before a layer
 // needs it.
+void ExpertStream::probe_tables(const char* where) const {
+    if (std::getenv("NINFER_TABLE_PROBE") == nullptr || bank_ != 0) { return; }
+    std::uint64_t placement = 1469598103934665603ULL;
+    std::uint64_t flags     = 1469598103934665603ULL;
+    for (const auto word : placement_) {
+        placement ^= word;
+        placement *= 1099511628211ULL;
+    }
+    for (const auto flag : host_flags_) {
+        flags ^= static_cast<std::uint64_t>(static_cast<std::uint32_t>(flag));
+        flags *= 1099511628211ULL;
+    }
+    std::fprintf(stderr, "[table] bank=0 where=%s placement=%016llx flags=%016llx pool0=%d\n",
+                 where, static_cast<unsigned long long>(placement),
+                 static_cast<unsigned long long>(flags),
+                 static_cast<int>(pool_slot_.empty() ? -2 : pool_slot_[0]));
+    std::fflush(stderr);
+}
+
 void ExpertStream::freeze_now(std::uint32_t /*tokens*/, cudaStream_t stream) {
     if (frozen_ || host_ == nullptr || cache_ == nullptr) { return; }
     if (freeze_trace()) {
@@ -1129,11 +1148,18 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         // Settle the stream the way the full path does. The copy pool publishes and settles in one
         // place; a layer that returns without it can leave the uploader's staging ownership open.
         if (cache_ != nullptr) { cache_->wait_for_progress(stream); }
+        // Timing probe: the full path synchronises the stream because it reads the routes back. The
+        // fast path removes that barrier; if anything wrote the tier asynchronously just before this
+        // layer, the kernel could read it before it lands. One sync tells the difference.
+        if (std::getenv("NINFER_STATIC_FAST_SYNC") != nullptr) {
+            (void)cudaStreamSynchronize(stream);
+        }
         rebase_window();
         // The layer skipped its placement pass, so the holds that pass would rotate must still
         // happen once per layer - otherwise a later re-freeze (which refuses to reset held slots)
         // could never proceed.
         if (host_ != nullptr) { host_->begin_layer(); }
+        probe_tables("fast");
         return true;
     }
     const auto values = static_cast<std::size_t>(top_k) * static_cast<std::size_t>(tokens);
@@ -2147,6 +2173,17 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         }
         cache_->prepare(std::span<const ExpertCacheKey>(preload), stream);
         cache_->wait_for_progress(stream);
+        // Did the preload actually land? `offset()` answers only for a ready image, so this is the
+        // difference between "the set is named" and "the set is on the Device".
+        std::uint32_t unready = 0;
+        for (const auto expert : frozen_wanted_) {
+            if (!cache_->offset(keys_[expert])) { ++unready; }
+        }
+        if (unready != 0) {
+            std::fprintf(stderr, "[freeze] bank=%u preload unready=%u of %zu\n", bank_, unready,
+                         frozen_wanted_.size());
+            std::fflush(stderr);
+        }
     }
                     }
                 }
@@ -2347,6 +2384,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                     // publication happened, which is precisely why a run of unchanged-pool layers
                     // could drop a slot the Device still addressed.
                     host_->hold_slots(placed_slots_);
+                    probe_tables("full");
                     if (std::getenv("NINFER_PUBLISH_PROBE") != nullptr &&
                         (moved_pool + moved_s + moved_d + moved_c + moved_p + moved_absent) != 0) {
                         static std::uint32_t shown = 0;

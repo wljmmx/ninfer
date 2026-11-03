@@ -1347,6 +1347,19 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
             }
         }
         if (layer_timing) { timeline().missing += missing; }
+        // Which shape this layer takes. The all_resident tail is only equivalent when every route is
+        // pool resident; a route served from the host set needs the split shape (FP32 term + merge).
+        // A fast path that forces the tail over host routes changes the arithmetic, not just the cost.
+        {
+            static std::uint64_t ar_layers = 0, split_layers = 0;
+            if (all_resident) { ++ar_layers; } else { ++split_layers; }
+            if ((ar_layers + split_layers) % 40 == 0) {
+                std::fprintf(stderr, "[shape] all_resident=%llu split=%llu\n",
+                             static_cast<unsigned long long>(ar_layers),
+                             static_cast<unsigned long long>(split_layers));
+                std::fflush(stderr);
+            }
+        }
         // The routes this layer handed the Device, kept until the next call of this bank so the check
         // above can ask what they cost against the mask the kernel actually read.
         if (coverage_probe().enabled) {
