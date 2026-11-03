@@ -859,7 +859,10 @@ private:
         cudaGraphExec_t exec = nullptr;
         std::uint64_t key    = 0;
     };
-    LayerGraphs() : enabled_(std::getenv("NINFER_LAYER_GRAPH") != nullptr), entries_(40) {}
+    LayerGraphs() : enabled_(std::getenv("NINFER_LAYER_GRAPH") != nullptr), entries_(40) {
+        std::fprintf(stderr, "[layer-graph] enabled=%d\n", int(enabled_));
+        std::fflush(stderr);
+    }
     std::vector<Entry> entries_;
     bool enabled_          = false;
     std::uint64_t captures_ = 0;
@@ -1530,14 +1533,43 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
                 Tensor masked_mask(const_cast<void*>(moe.stream->resident_mask()), execution.device(),
                                    DType::I32,
                                    {static_cast<std::int32_t>(mask_host.size())});
-                timeline_gpu_begin(execution.stream);
-                ops::routed_swiglu(
-                    hidden, routed, moe.stream->experts(), routes,
-                    masked_shape ? ops::ExpertSubset{ops::ExpertSubsetKind::MaskOnes, masked_mask}
-                                 : ops::ExpertSubset{},
-                    ops::ScaledSwiGLUTerm{moe.shared, shared_coefficients},
-                    ops::MoeEpilogue::AddResidual, residual, arena, execution);
-                timeline_gpu_end(execution.stream);
+                const auto all_resident_run = [&] {
+                    ops::routed_swiglu(
+                        hidden, routed, moe.stream->experts(), routes,
+                        masked_shape
+                            ? ops::ExpertSubset{ops::ExpertSubsetKind::MaskOnes, masked_mask}
+                            : ops::ExpertSubset{},
+                        ops::ScaledSwiGLUTerm{moe.shared, shared_coefficients},
+                        ops::MoeEpilogue::AddResidual, residual, arena, execution);
+                };
+                // The freeze route lands HERE, not on the split path: every route has an address
+                // (pool or host), so the layer takes the all-resident tail. The per-bank graph had
+                // only ever covered the split branch, which is why a fully frozen run reported
+                // enabled=1 and no captures. The key is the same idea - the buffers a replay reads -
+                // and the mask contents are deliberately excluded: ensure() rewrites them through a
+                // fixed device pointer every layer.
+                auto& graphs = LayerGraphs::instance();
+                if (graphs.enabled()) {
+                    std::uint64_t key = 1469598103934665603ULL;
+                    const auto mix    = [&key](std::uint64_t value) {
+                        key ^= value;
+                        key *= 1099511628211ULL;
+                    };
+                    mix(reinterpret_cast<std::uintptr_t>(hidden.data));
+                    mix(reinterpret_cast<std::uintptr_t>(residual.data));
+                    mix(reinterpret_cast<std::uintptr_t>(moe.stream->resident_mask()));
+                    mix(reinterpret_cast<std::uintptr_t>(shared_coefficients.data));
+                    mix(masked_shape ? 1U : 0U);
+                    graphs.run(moe.stream->bank_index(), key, execution.stream, all_resident_run);
+                    if (std::getenv("NINFER_LAYER_GRAPH_REPORT") != nullptr) {
+                        static std::uint64_t calls = 0;
+                        if (++calls % 40 == 0) { graphs.report(); }
+                    }
+                } else {
+                    timeline_gpu_begin(execution.stream);
+                    all_resident_run();
+                    timeline_gpu_end(execution.stream);
+                }
             } catch (const std::exception& error) {
                 throw std::invalid_argument(std::string("expert stream run: ") + error.what());
             }

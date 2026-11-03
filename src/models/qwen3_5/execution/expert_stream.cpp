@@ -21,6 +21,13 @@
 namespace ninfer::models::qwen3_5::execution {
 namespace {
 
+// One read of the switch per process: the fill path asks this on every layer, and a getenv scan
+// there is pure overhead when the trace is off (which is always, outside a diagnosis).
+inline bool freeze_trace() {
+    static const bool enabled = std::getenv("NINFER_FREEZE_TRACE") != nullptr;
+    return enabled;
+}
+
 // port (sm_89): Q68a. Each bank remembers what it routed on its last small-batch step, so a probe
 // can ask the question the read-ahead's next selection depends on: do adjacent layers route the
 // same experts? Indices are compared, not bytes - different layers own different matrices; the
@@ -266,6 +273,36 @@ ExpertStream::ExpertStream(std::uint32_t count, WeightBankLayout gate_up, Weight
     static_warm_ = std::getenv("NINFER_WARM_STATIC") != nullptr &&
                    std::getenv("NINFER_HOST_WARM") != nullptr &&
                    std::getenv("NINFER_HOST_DIRECT") != nullptr;
+    // P1: the per-layer frozen set. A separate mode rather than a sixth environment variable to
+    // remember: with NINFER_HOST_FREEZE the static set is not "a feature you can also enable", it is
+    // the placement, and a run that forgot one of the three switches above would silently be the
+    // streaming path wearing a freeze label. The mode implies the warm tier; the caller still owns
+    // the arena and the budget.
+    freeze_mode_ = [] {
+        const char* value = std::getenv("NINFER_HOST_FREEZE");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    if (freeze_mode_) { static_warm_ = true; }
+    freeze_after_ = [] {
+        const char* value = std::getenv("NINFER_EXPERT_FREEZE");
+        if (value != nullptr && *value != '\0') {
+            return static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
+        }
+        // Four ensure() calls: one layer has decided nothing yet, and a single decode token routes
+        // eight experts. A gate pins the number explicitly; a serving run that wants a converged set
+        // should raise it.
+        return std::uint32_t{4};
+    }();
+    freeze_refresh_ = [] {
+        const char* value = std::getenv("NINFER_FREEZE_REFRESH");
+        return value != nullptr && *value != '\0'
+                   ? static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10))
+                   : 0U;
+    }();
+    thaw_on_request_ = [] {
+        const char* value = std::getenv("NINFER_FREEZE_THAW_REQUEST");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
 }
 
 void ExpertStream::attach_host(std::shared_ptr<HostExpertResidency> host) noexcept {
@@ -275,6 +312,15 @@ void ExpertStream::attach_host(std::shared_ptr<HostExpertResidency> host) noexce
     // displace, so the tier needs the ranking. The vector is allocated once in the constructor, so
     // the pointer stays valid for the stream's life.
     if (host_ != nullptr) { host_->attach_scores(bank_, hot_score_.data(), count_); }
+    // Q20/B: the static stripe must exist before the first dynamic fill - configuring it later moves
+    // the dynamic bump pointer under a pointer that has already advanced, and the next eviction then
+    // scans untouched slots and reports "nothing to evict" (the tier now refuses that ordering
+    // outright). The quota is a process-wide decision, so the first stream installs it and the rest
+    // are no-ops. The freeze route always installs it: its S stripe is the placement, not an option.
+    if (host_ != nullptr && static_warm_ &&
+        (freeze_mode_ || std::getenv("NINFER_WARM_STATIC_RESERVE") != nullptr)) {
+        host_->configure_static_slots(static_quota());
+    }
 }
 
 void ExpertStream::attach(ExpertCache& cache, std::uint32_t bank, const ExpertBankLayout& entry) {
@@ -551,7 +597,7 @@ std::uint32_t ExpertStream::publish_static_table() {
     ++static_table_refreshes_;
     static_candidates_ready_ = true;
     static_candidates_count_ = present;
-    static_table_generation_ = host_->slot_generation();
+    static_table_generation_ = host_->bank_slot_generation(bank_);
     if (bank_ == 0 && std::getenv("NINFER_RING_PROBE") != nullptr) {
         std::fprintf(stderr, "[warm-static] table copy #%llu present=%u\n",
                      static_cast<unsigned long long>(static_table_refreshes_), present);
@@ -560,22 +606,198 @@ std::uint32_t ExpertStream::publish_static_table() {
     return present;
 }
 
+std::uint32_t ExpertStream::static_quota() const {
+    if (host_ == nullptr) { return 0; }
+    const auto room = host_->routed_slots_per_bank() > 1
+                          ? host_->routed_slots_per_bank() - 1
+                          : 0;
+    if (const char* value = std::getenv("NINFER_WARM_STATIC_SLOTS");
+        value != nullptr && *value != '\0') {
+        const auto requested = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
+        const auto clamped    = std::min({requested, room, count_});
+        if (clamped != requested) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                std::fprintf(stderr,
+                             "[freeze] bank=%u: NINFER_WARM_STATIC_SLOTS=%u clamped to %u "
+                             "(routed/bank=%u, count=%u) - a stripe with no dynamic slot would be "
+                             "refused\n",
+                             bank_, requested, clamped, host_->routed_slots_per_bank(), count_);
+                std::fflush(stderr);
+            }
+        }
+        return clamped;
+    }
+    if (freeze_mode_ && cache_ != nullptr) {
+        // The host set is the complement of the Device set: the pool keeps the top `capacity`
+        // experts, the tier keeps the rest of the bank. Clamped to the routed grant minus one
+        // dynamic slot, because the static stripe and the dynamic stripe share it.
+        const auto device = std::min(cache_->resident_capacity(), count_);
+        const auto keep   = count_ - device;
+        return std::min({keep, room, count_});
+    }
+    const auto banks = std::max<std::uint32_t>(1U, host_->bank_count());
+    auto quota = std::max<std::uint32_t>(8U, host_->routed_capacity() / banks);
+    return std::min(quota, count_);
+}
+
 void ExpertStream::refresh_static_candidates() {
     if (!static_warm_ || host_ == nullptr) { return; }
-    const auto banks = std::max<std::uint32_t>(1U, host_->bank_count());
-    const auto per_bank = std::max<std::uint32_t>(8U, host_->routed_capacity() / banks);
-    const auto keep     = std::min<std::uint32_t>(per_bank, count_);
+    // P1: a frozen set is not refreshed. Re-ranking while the Device holds the set is exactly what
+    // made the two halves disagree - the table moved every epoch while the pool did not, and every
+    // move cost a republish.
+    if (static_frozen_) { return; }
+    const auto keep = static_quota();
     std::vector<std::uint32_t> ranked(count_);
     std::iota(ranked.begin(), ranked.end(), 0U);
     std::stable_sort(ranked.begin(), ranked.end(),
                      [&](std::uint32_t a, std::uint32_t b) { return hot_score_[a] > hot_score_[b]; });
-    std::vector<std::int32_t> candidates(ranked.begin(),
-                                         ranked.begin() + static_cast<std::ptrdiff_t>(keep));
-    host_->ensure_scored(ExpertBankId{bank_}, candidates, hot_score_.data());
+    // P3: the host set is the complement of the Device set, not another copy of it. Both were taking
+    // the top of the same score, so the 12 host slots named experts the pool already held and served
+    // none of the routes that actually reached the host (measured: static_present=12, route_static=0).
+    // Slicing at the Device's per-bank capacity makes the two sets disjoint by construction.
+    std::size_t offset = 0;
+    if (std::getenv("NINFER_WARM_STATIC_SLICE") != nullptr && cache_ != nullptr) {
+        offset = std::min<std::size_t>(cache_->resident_capacity(), ranked.size());
+        if (offset + keep > ranked.size()) {
+            offset = ranked.size() - std::min<std::size_t>(keep, ranked.size());
+        }
+    }
+    std::vector<std::int32_t> candidates(
+        ranked.begin() + static_cast<std::ptrdiff_t>(offset),
+        ranked.begin() + static_cast<std::ptrdiff_t>(offset + keep));
+    static_member_.assign(count_, 0);
+    for (const auto expert : candidates) {
+        static_member_[static_cast<std::size_t>(expert)] = 1;
+    }
+    // Q20/B: with the split on, the set gets its own stripe and the fill may only evict inside it.
+    // Without the split the old shared-range fill is kept byte-identical.
+    static const bool reserve = std::getenv("NINFER_WARM_STATIC_RESERVE") != nullptr;
+    if (reserve && !static_frozen_) { host_->configure_static_slots(keep); }
+    host_->ensure_scored(ExpertBankId{bank_}, candidates, hot_score_.data(), reserve && !static_frozen_);
     publish_static_table();
     if (bank_ == 0 && std::getenv("NINFER_RING_PROBE") != nullptr) {
         std::fprintf(stderr, "[warm-static] bank=%u asked=%u held=%u per_bank=%u\n", bank_, keep,
-                     static_candidates_count_, per_bank);
+                     static_candidates_count_, host_->static_slots_per_bank());
+        std::fflush(stderr);
+    }
+}
+
+// P1: choose the whole placement once, from one ranking, and never let the two halves drift.
+//
+// The Device keeps the top `capacity` of the decayed score; the host keeps the next `q`, so the
+// two sets are disjoint by construction. `q` is the complement of the Device set (clamped to the
+// routed grant), which is the capacity the plan measured: a host tier smaller than the complement
+// churns, one equal to it never misses.
+//
+// The fill is synchronous on purpose. The set is 150 slots a bank on this model, and a freeze
+// happens once per bank: the alternative - backfilling across layers - leaves routes outside both
+// halves during the transition, which is the CPU divergence the gate exists to catch. One stall at
+// the boundary is the honest trade until the backfill can be shown to be complete before a layer
+// needs it.
+void ExpertStream::freeze_now(std::uint32_t /*tokens*/) {
+    if (frozen_ || host_ == nullptr || cache_ == nullptr) { return; }
+    if (freeze_trace()) {
+        std::fprintf(stderr, "[freeze] bank=%u enter clock=%llu\n", bank_,
+                     static_cast<unsigned long long>(freeze_clock_));
+        std::fflush(stderr);
+    }
+    std::vector<std::uint32_t> ranked(count_);
+    std::iota(ranked.begin(), ranked.end(), 0U);
+    std::stable_sort(ranked.begin(), ranked.end(), [&](std::uint32_t a, std::uint32_t b) {
+        if (hot_score_[a] != hot_score_[b]) { return hot_score_[a] > hot_score_[b]; }
+        return a < b; // a deterministic tie-break: the same run must freeze the same set
+    });
+    const auto capacity = std::min<std::size_t>(cache_->resident_capacity(), ranked.size());
+    frozen_wanted_.assign(ranked.begin(), ranked.begin() + static_cast<std::ptrdiff_t>(capacity));
+    const auto q = static_quota();
+    std::vector<std::int32_t> candidates;
+    const auto offset = std::min<std::size_t>(capacity, ranked.size());
+    const auto take   = std::min<std::size_t>(q, ranked.size() - offset);
+    candidates.reserve(take);
+    for (std::size_t i = 0; i < take; ++i) {
+        candidates.push_back(static_cast<std::int32_t>(ranked[offset + i]));
+    }
+    static_member_.assign(count_, 0);
+    for (const auto expert : candidates) {
+        static_member_[static_cast<std::size_t>(expert)] = 1;
+    }
+    // The stripe was installed at attach_host; if it was refused there is no static range to fill
+    // into, and a static fill would silently fall back to the dynamic one. Say so once.
+    if (host_->static_slots_per_bank() == 0 && !candidates.empty()) {
+        std::fprintf(stderr,
+                     "[freeze] bank=%u: static stripe is not configured (routed/bank=%u) - the "
+                     "freeze keeps the Device set only\n",
+                     bank_, host_->routed_slots_per_bank());
+        std::fflush(stderr);
+    }
+    // Replace the warm-up contents wholesale. The reset refuses while a slot is still being read;
+    // the holds rotate every layer, so a retry on the next ensure always succeeds. Freezing before
+    // the rewrite lands would publish a table that names a half-rewritten stripe.
+    if (host_->static_slots_per_bank() != 0 && !candidates.empty() &&
+        !host_->reset_static_stripe(bank_)) {
+        return;
+    }
+    if (freeze_trace()) {
+        std::fprintf(stderr, "[freeze] bank=%u reset ok candidates=%zu\n", bank_,
+                     candidates.size());
+        std::fflush(stderr);
+    }
+    frozen_         = true;
+    static_frozen_  = true;
+    freeze_members_ = static_cast<std::uint32_t>(candidates.size());
+    if (host_->static_slots_per_bank() != 0) { host_->set_static_frozen(bank_, false); }
+    if (!candidates.empty()) {
+        host_->ensure_scored(ExpertBankId{bank_}, candidates, hot_score_.data(),
+                             /*static_fill=*/true);
+    }
+    if (host_->static_slots_per_bank() != 0) { host_->set_static_frozen(bank_, true); }
+    freeze_present_ = host_->static_present(bank_, candidates);
+    publish_static_table();
+    std::fprintf(stderr,
+                 "[freeze] bank=%u state=frozen device=%zu host_static=%u present=%u d=%u c=%u "
+                 "p=%u clock=%llu\n",
+                 bank_, frozen_wanted_.size(), freeze_members_, freeze_present_,
+                 host_->dynamic_slots_per_bank(), host_->second_chance_per_bank(),
+                 host_->prefetch_slots_per_bank(),
+                 static_cast<unsigned long long>(freeze_clock_));
+    std::fflush(stderr);
+    ++freeze_membership_moves_; // the one move a set is allowed: the move into the freeze
+}
+
+void ExpertStream::set_freeze_policy(const FreezePolicy& policy) {
+    freeze_after_    = policy.freeze_after;
+    freeze_refresh_  = policy.reselect_after;
+    thaw_on_request_ = policy.thaw_on_request;
+    if (bank_ == 0) {
+        std::fprintf(stderr,
+                     "[freeze] policy: freeze_after=%u reselect_after=%u thaw_on_request=%d\n",
+                     freeze_after_, freeze_refresh_, int(thaw_on_request_));
+        std::fflush(stderr);
+    }
+}
+
+ExpertStream::FreezePolicy ExpertStream::freeze_policy() const noexcept {
+    return FreezePolicy{freeze_after_, freeze_refresh_, thaw_on_request_};
+}
+
+void ExpertStream::note_request_begin() {
+    if (thaw_on_request_) { thaw(); }
+}
+
+void ExpertStream::thaw() {
+    if (!freeze_mode_ || (!frozen_ && !static_frozen_)) { return; }
+    frozen_         = false;
+    static_frozen_  = false;
+    freeze_clock_   = 0;
+    freeze_present_ = 0;
+    frozen_wanted_.clear();
+    static_member_.assign(count_, 0);
+    // The stripe returns to warm-up: its fill may churn again until the next freeze rewrites it.
+    if (host_ != nullptr) { host_->set_static_frozen(bank_, false); }
+    if (bank_ == 0) {
+        std::fprintf(stderr, "[freeze] bank=0 thawed (placement follows the router again)\n");
         std::fflush(stderr);
     }
 }
@@ -631,7 +853,7 @@ std::size_t ExpertStream::device_admit_ring(const void* device_ids, std::int32_t
     // (this bank's uncovered fallback, or another bank's fill) bumps that generation; a mismatch
     // means a slot this table names may already hold another expert, so refresh before admitting.
     if (!(static_warm_ && static_candidates_ready_ &&
-          host_->slot_generation() == static_table_generation_)) {
+          host_->bank_slot_generation(bank_) == static_table_generation_)) {
         candidates_seen = publish_static_table();
     }
     if (bank_ == 0 && std::getenv("NINFER_RING_PROBE") != nullptr) {
@@ -727,12 +949,31 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     // second addressing leg. One boolean would say "not capturable" and name none of them.
     bool host_fetch = false, host_publish = false, host_upload = false;
     // Q20: the second addressing leg. Read once so the fill site and the tier-fill site cannot
-    // disagree about whether the layer is meant to run without an upload.
-    static const bool host_direct = std::getenv("NINFER_HOST_DIRECT") != nullptr;
+    // disagree about whether the layer is meant to run without an upload. The freeze mode implies
+    // both: its placement only exists if the tier is filled before the tables and the Device can
+    // address it, so a run that sets only NINFER_HOST_FREEZE is not a half-configured streaming run.
+    static const bool host_direct = std::getenv("NINFER_HOST_DIRECT") != nullptr ||
+                                    std::getenv("NINFER_HOST_FREEZE") != nullptr;
     // Declared here as well as used at the fill site, because Q20's second leg needs the tier filled
     // BEFORE the Device tables are built - the tables name slots, and a slot filled afterwards names
     // the previous layer's expert.
-    static const bool host_tier = std::getenv("NINFER_HOST_TIER") != nullptr;
+    static const bool host_tier = std::getenv("NINFER_HOST_TIER") != nullptr ||
+                                  std::getenv("NINFER_HOST_FREEZE") != nullptr;
+    // P0/A: the epoch clock. Everything below the covered fast return can be skipped when the Device
+    // pool already holds the layer, and that is exactly the state a high-coverage run is in - so the
+    // refresh installed the static set once and never again (measured: asked=1 over 192 tokens,
+    // static_present=0 afterwards). Count every call here, one per bank per token, so the epoch
+    // arrives regardless of coverage. The probe-only arm measures how long a refreshed set survives;
+    // the S/D split (NINFER_WARM_STATIC_RESERVE) keeps this same clock because a refresh that only
+    // touches the static stripe cannot cost the layer its working set.
+    static const bool static_reserve = std::getenv("NINFER_WARM_STATIC_RESERVE") != nullptr;
+    if (static_warm_ && epoch_steps_ > 0 &&
+        (static_reserve || std::getenv("NINFER_STATIC_PROBE") != nullptr)) {
+        if (++static_refresh_clock_ >= epoch_steps_) {
+            static_refresh_clock_ = 0;
+            refresh_static_candidates();
+        }
+    }
     if (host_direct && bank_ == 0 && std::getenv("NINFER_HOST_PROBE") != nullptr) {
         static bool announced = false;
         if (!announced) {
@@ -779,6 +1020,30 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     // 14.4 tok/s on the split path against a host-only layer at the same pool size.
     if (capacity < 4) { return false; }
     const bool fully = capacity >= count_;
+    // P1: the per-layer freeze clock. It advances on every call, not on one policy branch: the old
+    // `steps_` lived inside the streaming branch, so a layer whose routes were all resident returned
+    // before it ever reached the freeze and the set was installed on the first token, from an empty
+    // ranking, and never corrected.
+    if (freeze_mode_) {
+        ++freeze_clock_;
+        if (frozen_ && freeze_refresh_ != 0 && freeze_clock_ >= freeze_refresh_) {
+            // Re-select. The set was chosen from the traffic up to the freeze boundary; once the
+            // request has moved on (prefill into decode) that set is a profile of the wrong phase.
+            // Following the router again for `freeze_after_` calls and then re-freezing replaces it
+            // with one measured on the current traffic. Capture is off by definition here: the
+            // table moves during the re-warm.
+            frozen_        = false;
+            static_frozen_ = false;
+            if (host_ != nullptr) { host_->set_static_frozen(bank_, false); }
+            freeze_clock_ = 0;
+            if (bank_ == 0) {
+                std::fprintf(stderr, "[freeze] bank=0 re-select after %u calls\n", freeze_refresh_);
+                std::fflush(stderr);
+            }
+        } else if (!frozen_ && freeze_after_ != 0 && freeze_clock_ >= freeze_after_) {
+            freeze_now(tokens);
+        }
+    }
     // Q10 probe (see static_probe): why this layer was not static. Filled in the split branch, printed
     // at its end where the upload count is known. Zero cost when the switch is off.
     std::uint32_t probe_absent = 0, probe_unready = 0;
@@ -805,7 +1070,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     // Q11/Q12: the window the freeze rule reads. Counted here so a layer that returns through the
     // covered fast path is still part of the window - that is exactly the layer the rule is looking
     // for, and counting only the split path would make "32 clean layers" unreachable by construction.
-    const bool freeze_watch = freeze_rule_enabled();
+    const bool freeze_watch = !freeze_mode_ && freeze_rule_enabled();
     if (freeze_watch) { ++freeze_window_layers_; }
     // port (sm_89): O1's arm (see the declaration). Taken before anything needs the ids, because
     // needing the ids is exactly what it removes: the branch below copies 32 bytes back and waits on
@@ -1031,6 +1296,9 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         // for the region split, and mixing them into the same path is what left it half converted.
         const bool pure_slru = slru_active && !regions_ && epoch_steps_ == 0;
         const auto spill_cap = [&]() -> std::size_t {
+            // P1: a frozen placement has no ring. A ring member is a slot that moves every step,
+            // which is exactly what a table that a captured layer replays cannot contain.
+            if (freeze_mode_ && frozen_) { return 0; }
             if (slru_active) { return 0; }
             if (!regions_) {
                 // default policy: the eight fixed slots the report measured
@@ -1065,26 +1333,19 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         hot_cap_ = hot_cap;
 
         if (frozen_) {
-            // port (sm_89): a frozen set used to take every slot, so a route outside it had nowhere
-            // to go and was forced onto the CPU - measured 121 ms of CPU per token at a 4096 MiB
-            // pool against 0.00 ms of upload, for about 3.2 experts a layer. Hold the set back to
-            // `capacity - spill` and let this step's outside routes take the rest, where an upload
-            // costs 0.12 ms against the CPU's 0.5.
-            // Measured across 4-12 GiB: holding 15% back is worth 5.4x at 4 GiB (a frozen set that
-            // takes every slot has nowhere to put the routes outside it, so they fall to the CPU at
-            // 0.5 ms each - 121 ms per token measured), and it is still the best policy up to 10 GiB.
-            // At 12 GiB the set covers 95.7% and the outside routes cost only 0.8 ms on the CPU, so
-            // filling the pool wins there (100.5 against 94.6 tok/s) - and a full, static table is
-            // what a per-layer graph needs anyway.
-            const auto keep = std::min<std::size_t>(hot_cap, frozen_wanted_.size());
+            // P1: the placement is the set. No route is appended and no slot is borrowed for this
+            // step's demand: the Device table, the host static table and the offset tables are all
+            // functions of `frozen_wanted_` alone, which is what lets a layer be captured.
+            //
+            // The old branch held 15% of the pool back for outside routes and appended them here,
+            // because a full set sent every outsider to the CPU at 0.5 ms. That trade is now made on
+            // the host side: the complement lives in the pinned tier, and a route outside the Device
+            // set is a host hit rather than a CPU miss. With a host tier smaller than the complement
+            // the old behaviour is still available by not freezing.
+            const auto keep = std::min<std::size_t>(capacity, frozen_wanted_.size());
             wanted.assign(frozen_wanted_.begin(), frozen_wanted_.begin() + keep);
             for (const auto expert : wanted) { chosen[expert] = true; }
-            for (std::size_t i = 0; i < values && wanted.size() < capacity; ++i) {
-                const auto expert = static_cast<std::uint32_t>(route_ids[i]);
-                if (chosen[expert]) { continue; }
-                chosen[expert] = true;
-                wanted.push_back(expert);
-            }
+            hot_cap_ = keep;
         } else if (slru_active) {
             // llama.cpp's 50/50 SLRU (src/llama-moe-cache.cpp:16-121), over slot ids so a slot that
             // keeps its expert keeps its number: hits are promoted to the protected half, misses
@@ -1534,7 +1795,8 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             // re-split, which is the controller's) reads this machine's numbers and not a comment.
             // Bank 0 only: every bank sees the same pool size, and forty copies of one observation
             // would just be forty writes to the same 512 MiB bucket.
-            const bool curve_tick = bank_ == 0 && ++coverage_calls_ % 40 == 0;
+            static const bool route_all = std::getenv("NINFER_ROUTE_ALL") != nullptr;
+            const bool curve_tick = (bank_ == 0 || route_all) && ++coverage_calls_ % 40 == 0;
             if (curve_tick) {
                 const auto routes = static_cast<double>(coverage_.routes == 0 ? 1 : coverage_.routes);
                 const auto misses_per_token =
@@ -1645,7 +1907,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         // Q20: device-side admission uses these even when it finds nothing; zero means the ring is
         // host-filled (the measured default).
         std::uint32_t device_ring_slots = device_ring_slots_;
-        if (host_direct) {
+        if (host_direct && !frozen_) {
             std::vector<std::uint32_t> ranked(count_);
             std::iota(ranked.begin(), ranked.end(), 0U);
             std::stable_sort(ranked.begin(), ranked.end(), [&](std::uint32_t a, std::uint32_t b) {
@@ -1698,39 +1960,151 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         // The tables name slots, so a slot claimed after they are built still holds the previous
         // expert: measured as host_experts=5.0 route_hits=0.0, a leg that looked wired and served
         // nothing. This is the same fill the tier always wanted; only its position changed.
+        // Whether this layer is allowed to change the pool's resident set. Computed here because
+        // the host fill has to know which pool it is complementing: a fill against `wanted` is right
+        // only if `wanted` is about to be installed, and a fill against the current residency is
+        // right only if the set is held. Getting this backwards leaves routes with no address on
+        // either leg (measured: ~190 routes a layer on a prefill).
+        const bool refresh = !set_initialised_ || tokens <= kSetUpdateTokens ||
+                             capacity < kPrefillProtectMin;
         if (host_tier && host_ != nullptr && route_ids != nullptr) {
             static thread_local std::vector<std::int32_t> host_distinct;
             host_distinct.assign(route_ids, route_ids + values);
             std::sort(host_distinct.begin(), host_distinct.end());
             host_distinct.erase(std::unique(host_distinct.begin(), host_distinct.end()),
                                 host_distinct.end());
-            if (static_warm_ && static_candidates_ready_) {
-                // Fill only routes the static set does not already cover. A fully covered layer does
-                // no host fill at all; an uncovered route still gets a warm slot (or the CPU half
-                // would read expert 0's offset). The generation bump from this fill makes the ring
-                // path refresh its Device table before it names a slot.
-                if (host_->slot_generation() != static_table_generation_) {
-                    publish_static_table();
+            // P0: the tier serves the routes the pool will NOT hold this layer. Asking the current
+            // residency is one layer stale: `set_resident_experts` runs after this fill and installs
+            // `wanted`, so an expert that is resident now but not in `wanted` would be skipped here
+            // and then dropped from the pool - no address on either leg, and the CPU half computes
+            // it. That gap was ~13.5 routes a layer on the streaming path.
+            static thread_local std::vector<std::int32_t> host_targets;
+            host_targets.clear();
+            host_targets.reserve(host_distinct.size());
+            {
+                static thread_local std::vector<std::uint8_t> in_wanted;
+                if (in_wanted.size() != count_) { in_wanted.assign(count_, 0); }
+                std::fill(in_wanted.begin(), in_wanted.end(), std::uint8_t{0});
+                for (const auto expert : wanted) {
+                    if (expert < in_wanted.size()) { in_wanted[expert] = 1; }
                 }
-                std::vector<std::int32_t> missing;
                 for (const auto expert : host_distinct) {
-                    if (static_cast<std::uint32_t>(expert) >= count_ ||
-                        ring_snapshot_host_[static_cast<std::size_t>(expert)] ==
-                            HostExpertResidency::kAbsentSlot) {
-                        missing.push_back(expert);
+                    const auto id = static_cast<std::uint32_t>(expert);
+                    const bool pool_serves =
+                        refresh ? (id < in_wanted.size() && in_wanted[id] != 0)
+                                : cache_->expert_slot(bank_, id).has_value();
+                    if (!pool_serves) { host_targets.push_back(expert); }
+                }
+            }
+            // P0: the tier's own hit counter cannot answer "did the static set survive" - the static
+            // path asks only for the experts that are missing, so a perfect static set still reports
+            // hits=0. Count per expert against the membership list instead, and count what the layer's
+            // own routes found, which is the coverage the arrangement actually buys.
+            static const bool static_probe = std::getenv("NINFER_STATIC_PROBE") != nullptr;
+            if (static_probe && static_warm_) {
+                if (static_probe_slots_.size() != count_) {
+                    static_probe_slots_.assign(count_, HostExpertResidency::kAbsentSlot);
+                }
+                host_->snapshot_slots(bank_, static_probe_slots_);
+                std::uint32_t static_present = 0, dyn_present = 0;
+                for (std::uint32_t expert = 0; expert < count_; ++expert) {
+                    if (static_probe_slots_[expert] == HostExpertResidency::kAbsentSlot) { continue; }
+                    const bool member = expert < static_member_.size() && static_member_[expert] != 0;
+                    if (member) { ++static_present; } else { ++dyn_present; }
+                }
+                std::uint32_t route_static = 0, route_dyn = 0, route_absent = 0;
+                for (const auto expert : host_distinct) {
+                    const auto id = static_cast<std::uint32_t>(expert);
+                    if (id >= count_) { continue; }
+                    if (static_probe_slots_[id] == HostExpertResidency::kAbsentSlot) {
+                        ++route_absent;
+                    } else if (id < static_member_.size() && static_member_[id] != 0) {
+                        ++route_static;
+                    } else {
+                        ++route_dyn;
                     }
                 }
-                if (!missing.empty()) {
-                    host_->ensure_scored(ExpertBankId{bank_},
-                                         std::span<const std::int32_t>(missing), hot_score_.data());
+                static_probe_static_present_ += static_present;
+                static_probe_dyn_present_ += dyn_present;
+                static_probe_route_static_ += route_static;
+                static_probe_route_dyn_ += route_dyn;
+                static_probe_route_absent_ += route_absent;
+                if (bank_ == 0 && ++static_probe_layers_ % 1 == 0) {
+                    constexpr double kWindow = 1.0;
+                    std::fprintf(stderr,
+                                 "[static-probe] bank=0 static_present=%.1f dyn_present=%.1f "
+                                 "route_static=%.2f route_dyn=%.2f route_absent=%.2f q=%u\n",
+                                 static_cast<double>(static_probe_static_present_) / kWindow,
+                                 static_cast<double>(static_probe_dyn_present_) / kWindow,
+                                 static_cast<double>(static_probe_route_static_) / kWindow,
+                                 static_cast<double>(static_probe_route_dyn_) / kWindow,
+                                 static_cast<double>(static_probe_route_absent_) / kWindow,
+                                 static_cast<std::uint32_t>(static_member_.size() == 0
+                                                                ? 0
+                                                                : std::count(static_member_.begin(),
+                                                                             static_member_.end(),
+                                                                             std::uint8_t{1})));
+                    std::fflush(stderr);
+                    static_probe_static_present_ = 0;
+                    static_probe_dyn_present_    = 0;
+                    static_probe_route_static_   = 0;
+                    static_probe_route_dyn_      = 0;
+                    static_probe_route_absent_   = 0;
+                }
+            }
+            if (freeze_mode_ && !static_frozen_) {
+                // P1 warm-up. Before the set is chosen the static stripe is an ordinary working set:
+                // every route is filled there (overflowing into the dynamic stripe), so the layer
+                // runs with cpu=0 while the scores are still being learned. The freeze replaces the
+                // contents wholesale, so churn here costs nothing that survives.
+                if (freeze_trace()) {
+                    std::fprintf(stderr,
+                                 "[freeze] bank=%u warm targets=%zu s=%u d=%u used=%u clock=%llu\n",
+                                 bank_, host_targets.size(), host_->static_slots_per_bank(),
+                                 host_->dynamic_slots_per_bank(), 0U,
+                                 static_cast<unsigned long long>(freeze_clock_));
+                    std::fflush(stderr);
+                }
+                host_->ensure_scored(ExpertBankId{bank_},
+                                     std::span<const std::int32_t>(host_targets),
+                                     hot_score_.data(), /*static_fill=*/true);
+                if (freeze_trace()) {
+                    std::fprintf(stderr, "[freeze] bank=%u warm fill done\n", bank_);
+                    std::fflush(stderr);
+                }
+                publish_static_table();
+                if (freeze_trace()) {
+                    std::fprintf(stderr, "[freeze] bank=%u warm publish done\n", bank_);
+                    std::fflush(stderr);
+                }
+            } else if (static_warm_ && static_candidates_ready_) {
+                // Fill the whole target set, not only the ones absent from the last snapshot. The
+                // snapshot says what was present BEFORE this fill, and the fill itself can evict a
+                // D entry that is one of this layer's targets - which then has no address and falls
+                // to the CPU half. Filling every target is a hash lookup for the resident ones and
+                // makes the fill's own protection cover the layer.
+                if (host_->bank_slot_generation(bank_) != static_table_generation_) {
                     publish_static_table();
+                }
+                if (!host_targets.empty()) {
+                    host_->ensure_scored(ExpertBankId{bank_},
+                                         std::span<const std::int32_t>(host_targets),
+                                         hot_score_.data());
+                    if (host_->bank_slot_generation(bank_) != static_table_generation_) {
+                        publish_static_table();
+                    }
                 }
             } else {
                 host_->ensure_scored(ExpertBankId{bank_},
-                                     std::span<const std::int32_t>(host_distinct), hot_score_.data());
+                                     std::span<const std::int32_t>(host_targets), hot_score_.data());
             }
         }
-        if (static_warm_ && !static_candidates_ready_) { refresh_static_candidates(); }
+        if (freeze_mode_) {
+            // The freeze installs and fills the set itself; there is nothing to refresh, and
+            // refreshing before the freeze would install the first token's routing as "the set".
+        } else if (static_warm_ && !static_candidates_ready_) {
+            refresh_static_candidates();
+        }
         if (host_direct && device_ring_slots != 0 && host_ != nullptr && device_ids != nullptr) {
             const auto admitted =
                 device_admit_ring(device_ids, static_cast<std::int32_t>(values), 0,
@@ -1744,12 +2118,15 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 }
             }
         }
-        const bool refresh = !set_initialised_ || tokens <= kSetUpdateTokens ||
-                             capacity < kPrefillProtectMin;
+        if (host_ != nullptr) { host_->begin_layer(); }
+        if (freeze_trace()) {
+            std::fprintf(stderr, "[freeze] bank=%u begin_layer done wanted=%zu\n", bank_,
+                         wanted.size());
+            std::fflush(stderr);
+        }
         // Q20: rotate the Device-hold generations once per layer, whether or not the table moved.
         // Skipping it on an unchanged layer would leave a slot pinned for a layer that never reads
         // it, which is a leak the tier cannot see.
-        if (host_ != nullptr && host_direct) { host_->begin_layer(); }
         // Q30/P6: the prediction is placed by stage_predicted(), at the end of the layer that made it.
         // Placing it here was tried first and is structurally useless: by the time ensure() runs, this
         // layer's routes are known, so "predicted and not resident" is no longer a prediction - it is
@@ -1758,6 +2135,10 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         // not move - otherwise the rows the region just took never reach the Device.
         const bool set_moved =
             refresh && cache_->set_resident_experts(bank_, wanted, static_cast<std::uint32_t>(hot_cap));
+        if (freeze_trace()) {
+            std::fprintf(stderr, "[freeze] bank=%u resident done moved=%d\n", bank_, int(set_moved));
+            std::fflush(stderr);
+        }
         // A section's publish is needed when either the residency changed or a segment moved since the
         // last publication. The second half matters now that the prediction region is staged at the
         // end of the previous layer's ffn: that placement happens outside ensure(), so `set_moved`
@@ -1787,6 +2168,11 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             host_direct && host_ != nullptr && host_->arena_device_base() != nullptr;
         if (set_moved || need_publish || placement_mode) {
             set_initialised_ = true;
+            if (freeze_trace()) {
+                std::fprintf(stderr, "[fz] bank=%u block moved=%d publish=%d\n", bank_, int(set_moved),
+                             int(need_publish));
+                std::fflush(stderr);
+            }
             // One pass over the pool. The slot each expert owns was read twice here (once for the
             // offset table, once for the diff) and GH3 needs the same answer a third time for the
             // placement word, so it is taken once and shared.
@@ -1839,6 +2225,10 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             // moved. That is the fix discussed above: the arena keeps churning while the pool sits
             // still, so "the pool did not move" says nothing about whether this table is still true.
             bool placement_changed = false;
+            // Which region a changed row came from. A rate says the table moved; this says whose
+            // lifetime did, which is the difference between "S is not frozen" and "D churned".
+            std::uint32_t moved_pool = 0, moved_s = 0, moved_d = 0, moved_c = 0, moved_p = 0,
+                          moved_absent = 0;
             if (placement_mode) {
                 std::uint64_t gu_plane[3] = {}, dn_plane[3] = {};
                 std::uint64_t gu_high_bytes = 0, dn_high_bytes = 0;
@@ -1867,7 +2257,21 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                         } else if (host_slots_[expert] != HostExpertResidency::kAbsentSlot) {
                             placement = ops::kExpertPlacementHost | host_slots_[expert];
                         }
-                        if (placement != placement_published_[expert]) { placement_changed = true; }
+                        if (placement != placement_published_[expert]) {
+                            placement_changed = true;
+                            if (placement == ops::kExpertPlacementAbsent) {
+                                ++moved_absent;
+                            } else if ((placement & ops::kExpertPlacementHost) == 0) {
+                                ++moved_pool;
+                            } else {
+                                switch (host_->slot_region(placement & ~ops::kExpertPlacementHost)) {
+                                    case HostExpertResidency::SlotRegion::Static: ++moved_s; break;
+                                    case HostExpertResidency::SlotRegion::SecondChance: ++moved_c; break;
+                                    case HostExpertResidency::SlotRegion::Prefetch: ++moved_p; break;
+                                    default: ++moved_d; break;
+                                }
+                            }
+                        }
                         placement_[expert]  = placement;
                         const bool absent   = placement == ops::kExpertPlacementAbsent;
                         const bool on_host  = !absent && (placement & ops::kExpertPlacementHost) != 0;
@@ -1886,6 +2290,23 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                     // publication happened, which is precisely why a run of unchanged-pool layers
                     // could drop a slot the Device still addressed.
                     host_->hold_slots(placed_slots_);
+                    if (std::getenv("NINFER_PUBLISH_PROBE") != nullptr &&
+                        (moved_pool + moved_s + moved_d + moved_c + moved_p + moved_absent) != 0) {
+                        static std::uint32_t shown = 0;
+                        if (shown++ < 200) {
+                            std::fprintf(stderr,
+                                         "[publish] bank=%u pool=%u s=%u d=%u c=%u p=%u absent=%u\n",
+                                         bank_, moved_pool, moved_s, moved_d, moved_c, moved_p,
+                                         moved_absent);
+                            std::fflush(stderr);
+                        }
+                    }
+                    if (freeze_trace()) {
+                        std::fprintf(stderr, "[fz] bank=%u held=%zu changed=%d\n", bank_,
+                                     placed_slots_.size(), int(placement_changed));
+                        std::fflush(stderr);
+                    }
+                    if (std::getenv("NINFER_STATIC_PROBE") != nullptr) {                         if (host_check_.size() != count_) { host_check_.assign(count_, HostExpertResidency::kAbsentSlot); }                         host_->snapshot_slots(bank_, host_check_);                         std::uint32_t moved = 0;                         for (std::uint32_t e = 0; e < count_; ++e) {                             if (host_slots_[e] != host_check_[e]) { ++moved; }                         }                         if (moved != 0) {                             static std::uint32_t reported = 0;                             if (bank_ == 0 && reported++ < 8) {                                 std::fprintf(stderr, "[static-probe] mapping moved after publish: bank=%u experts=%u\n", bank_, moved);                                 std::fflush(stderr);                             }                         }                     }
                     // The kernel reads these bases and the two tables, so they are handed to the view
                     // here rather than at rebase time - rebase only re-points the pool planes.
                     auto& gu = experts_.bank.gate_up;
@@ -1940,9 +2361,18 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                         attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
                         attributes.flags          = 0;
                         std::size_t attribute_index = 0;
+                        if (freeze_trace()) {
+                            std::fprintf(stderr, "[fz] bank=%u batch n=%zu\n", bank_, sizes.size());
+                            std::fflush(stderr);
+                        }
                         const auto submitted        = cudaMemcpyBatchAsync(
                             dsts.data(), srcs.data(), sizes.data(), sizes.size(), &attributes,
                             &attribute_index, 1, stream);
+                        if (freeze_trace()) {
+                            std::fprintf(stderr, "[fz] bank=%u batch done status=%d\n", bank_,
+                                         int(submitted));
+                            std::fflush(stderr);
+                        }
                         publish_bytes_ += sizes.size() * sizeof(std::uint32_t);
                         publish_bytes_max_ =
                             std::max(publish_bytes_max_, sizes.size() * sizeof(std::uint32_t));
@@ -1969,6 +2399,10 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                             static_cast<std::int32_t*>(mask_device_->p),
                             static_cast<std::uint64_t*>(host_offsets_device_->p),
                             static_cast<std::int32_t*>(host_flags_device_->p), stream);
+                        if (freeze_trace()) {
+                            std::fprintf(stderr, "[fz] bank=%u expand done\n", bank_);
+                            std::fflush(stderr);
+                        }
                         placement_published_ = placement_;
                         placement_dirty_     = false;
                         ++publish_calls_;
@@ -2223,10 +2657,18 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     }
     const auto upload_begin = std::chrono::steady_clock::now();
     cache_->prepare(required_, stream);
+    if (freeze_trace()) {
+        std::fprintf(stderr, "[fz] bank=%u prepared\n", bank_);
+        std::fflush(stderr);
+    }
     try {
         cache_->wait_for_progress(stream);
     } catch (const std::exception& error) {
         throw std::runtime_error(std::string("pool: ") + error.what());
+    }
+    if (freeze_trace()) {
+        std::fprintf(stderr, "[fz] bank=%u uploaded\n", bank_);
+        std::fflush(stderr);
     }
     if (timing) {
         static std::uint64_t calls = 0;
@@ -2353,6 +2795,19 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     }
     static_probe(bank_, tokens, false, probe_absent, probe_unready, probe_moved, probe_ins,
                  last_cost_.uploaded, !host_bound);
+    if (freeze_mode_ && bank_ == 0 && (++freeze_report_layers_ % 10) == 0) {
+        const auto& host_stats = host_ != nullptr ? host_->stats() : HostExpertResidency::Stats{};
+        std::fprintf(stderr,
+                     "[freeze] summary layers=%llu frozen=%d members=%u present=%u moves=%llu "
+                     "route_cpu=%llu static_drops=%llu evictions=%llu\n",
+                     static_cast<unsigned long long>(freeze_report_layers_), int(frozen_),
+                     freeze_members_, freeze_present_,
+                     static_cast<unsigned long long>(freeze_membership_moves_),
+                     static_cast<unsigned long long>(route_cpu_),
+                     static_cast<unsigned long long>(host_stats.static_drops),
+                     static_cast<unsigned long long>(host_stats.evictions));
+        std::fflush(stderr);
+    }
     // port (sm_89): D1 read-ahead, in three pieces that are now separate on purpose.
     //
     // 1. The selection (below) is unchanged: NINFER_PREFETCH_PER_LAYER (default 8) experts, taken
@@ -2412,6 +2867,10 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             if (expert < 0 || static_cast<std::uint32_t>(expert) >= count_) { return; }
             if (top.size() == per_layer) { return; }
             if (cache_->expert_slot(bank_, expert)) { return; }
+            // P1: an expert the host tier already holds is not a prediction either. Without this the
+            // read-ahead copied the static set into the read-ahead stripe, one slot at a time, and
+            // evicted the previous prediction to do it.
+            if (host_->holds(bank_, static_cast<std::uint32_t>(expert))) { return; }
             for (const auto& taken : top) {
                 if (taken.second == expert) { return; }
             }
@@ -2463,13 +2922,12 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 if (warm_mode) {
                     host_->warm(ExpertBankId{bank_}, std::span<const std::int32_t>(wanted));
                 } else {
-                    // Same per-expert granularity on the reference path, so the two arms differ only
-                    // in "who does the read", not in how the work is cut.
-                    for (const auto expert : wanted) {
-                        const std::int32_t one[1] = {expert};
-                        host_->ensure(ExpertBankId{bank_}, std::span<const std::int32_t>(one, 1),
-                                      nullptr);
-                    }
+                    // The queued path fills the read-ahead stripe (expert_prefetch.cpp calls
+                    // fill_prefetch). The reference path must do the same, or the two arms differ by
+                    // where the bytes land as well as by who reads them - the old loop called
+                    // ensure(), which fills the dynamic stripe and evicts the working set.
+                    host_->fill_prefetch(ExpertBankId{bank_},
+                                         std::span<const std::int32_t>(wanted));
                 }
             } else {
                 // D3: the deadline is measured in layer batches, so the clock is one tick per offer
@@ -2810,6 +3268,8 @@ bool o1_skip_requested() {
 }
 
 } // namespace ninfer::models::qwen3_5::execution
+
+
 
 
 

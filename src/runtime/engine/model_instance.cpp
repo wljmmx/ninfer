@@ -230,8 +230,12 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     std::uint64_t host_want = 0;
     std::uint64_t host_kept = 0;
     std::uint64_t host_layer = 0;
+    std::uint64_t widest_count = 0;
+    std::uint64_t streamed_banks = 0;
     for (const auto& bank : requirements.banks) {
         if (bank.resident) { continue; }
+        ++streamed_banks;
+        widest_count = std::max<std::uint64_t>(widest_count, bank.count);
         const auto kept = std::min<std::uint64_t>(
             instance.expert_cache->resident_capacity(), static_cast<std::uint64_t>(routed_top_k));
         host_kept += kept;
@@ -239,6 +243,39 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     }
     constexpr std::uint64_t kLayerHeadroom = 2;
     host_want = host_layer * kLayerHeadroom * instance.expert_cache->slot_bytes();
+    // P1: the per-layer frozen set is a placement, so its capacity is a formula rather than a
+    // working-set estimate. S is the complement of what the pool holds; D is whatever is left of
+    // that complement, with at least one decode step's routes as headroom. S+D covers every expert
+    // the Device does not keep, which is the only state in which a layer has no CPU route.
+    const bool freeze_mode = [] {
+        const char* value = std::getenv("NINFER_HOST_FREEZE");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    std::uint64_t freeze_s = 0, freeze_d = 0;
+    if (freeze_mode) {
+        const auto device = std::min<std::uint64_t>(
+            instance.expert_cache->resident_capacity(), widest_count);
+        const auto complement = widest_count > device ? widest_count - device : 0;
+        if (const char* value = std::getenv("NINFER_WARM_STATIC_SLOTS");
+            value != nullptr && *value != '\0') {
+            freeze_s = std::min<std::uint64_t>(std::strtoull(value, nullptr, 10), complement);
+        } else {
+            freeze_s = complement;
+        }
+        freeze_d = std::max<std::uint64_t>(8, complement - freeze_s);
+        if (streamed_banks != 0) {
+            host_want = (freeze_s + freeze_d) * streamed_banks *
+                        instance.expert_cache->slot_bytes();
+        }
+        // The freeze route wants the read-ahead on: its D is deliberately smaller than the
+        // complement, so a predicted expert that arrives before its route is a fill the layer does
+        // not wait for. Only the worker switch is set here; the SIZE is left to the tier
+        // (NINFER_PREFETCH_SLOTS would also carve the Device prediction region, which this mode does
+        // not want), so the tier's own default applies.
+        if (std::getenv("NINFER_PREFETCH") == nullptr) {
+            _putenv_s("NINFER_PREFETCH", "1");
+        }
+    }
     // port (sm_89): 1y.7 step two - the warm tier stops taking a share of free RAM on its own and
     // asks the ledger, which is the one place that can see every tier at once. The number it grants
     // is computed exactly as before (working-set estimate, RAM share, explicit override), so this
@@ -248,7 +285,16 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     // Routed is granted first; prefetch and the second-chance band get what is left. Enabling either
     // auxiliary therefore cannot shrink the routed working set - the failure mode that made "more
     // cache" mean "less warm tier".
-    const auto routed_bytes        = host_expert_arena_bytes(host_want);
+    const auto routed_bytes = [&] {
+        // The freeze formula is the budget: bypass the working-set clamp, which would cut a
+        // complement-sized tier (about 12 GiB here) down to 4 GiB and silently turn the static set
+        // back into a churning one. An explicit override still wins, so an experiment can ask for
+        // less and watch S get clamped instead.
+        if (freeze_mode && std::getenv("NINFER_EXPERT_HOST_ARENA_MB") == nullptr) {
+            return host_want;
+        }
+        return host_expert_arena_bytes(host_want);
+    }();
     const auto prefetch_bytes      = readahead_bytes(requirements.banks);
     const auto second_chance_ask = second_chance_budget_bytes(requirements.banks);
     const auto host_ask            = routed_bytes + prefetch_bytes + second_chance_ask;
@@ -329,6 +375,28 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
                  static_cast<unsigned long long>(host_want >> 20), routed_top_k,
                  static_cast<unsigned long long>(host_kept),
                  static_cast<unsigned long long>(host_layer));
+    if (freeze_mode) {
+        const auto pool_keeps = std::min<std::uint64_t>(
+            instance.expert_cache->resident_capacity(), widest_count);
+        std::fprintf(stderr,
+                     "[freeze] budget: per bank s=%llu d=%llu (%llu slots; the pool keeps %llu, "
+                     "the complement is %llu), c=%llu p=%llu; banks=%llu\n",
+                     static_cast<unsigned long long>(freeze_s),
+                     static_cast<unsigned long long>(freeze_d),
+                     static_cast<unsigned long long>(freeze_s + freeze_d),
+                     static_cast<unsigned long long>(pool_keeps),
+                     static_cast<unsigned long long>(widest_count - pool_keeps),
+                     static_cast<unsigned long long>(grant_second_chance /
+                                                     std::max<std::uint64_t>(
+                                                         1, instance.expert_cache->slot_bytes()) /
+                                                     std::max<std::uint64_t>(1, streamed_banks)),
+                     static_cast<unsigned long long>(grant_prefetch /
+                                                     std::max<std::uint64_t>(
+                                                         1, instance.expert_cache->slot_bytes()) /
+                                                     std::max<std::uint64_t>(1, streamed_banks)),
+                     static_cast<unsigned long long>(streamed_banks));
+        std::fflush(stderr);
+    }
     // port (sm_89): one line that says what each tier holds, from the ledger rather than from three
     // modules that cannot see each other (1y.7 step two: accounting only, allocations unchanged).
     {
@@ -392,6 +460,15 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
         // pageable artifact mapping. Only experts the host tier actually keeps are answered; the rest
         // still stream from the artifact.
         instance.expert_cache->attach_arena(residency.get());
+        if (freeze_mode) { residency->materialize_arena(); }
+        if (freeze_mode && residency->arena_device_base() == nullptr) {
+            // The freeze route's whole point is a placement the Device can name. A fallback to
+            // pageable memory would still run, but every "host route" would be an upload, no table
+            // could be captured, and no counter would say so. Fail where it is visible.
+            throw std::runtime_error(
+                "NINFER_HOST_FREEZE requires a device-accessible pinned arena; the mapped "
+                "allocation was refused (see [host] arena mapped ... device_accessible=0)");
+        }
         placement.host_experts =
             static_cast<std::uint64_t>(residency->slot_capacity());
         instance.expert_host_residency = std::move(residency);

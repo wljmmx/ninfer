@@ -78,20 +78,45 @@ public:
         };
         // Routed is the primary range and is granted first by the caller. Prefetch and the
         // second-chance band get their own bytes; they are not subtracted from routed here.
-        routed_capacity_ = slots_for(budget.routed_bytes);
-        prefetch_slots_  = slots_for(budget.prefetch_bytes);
-        second_chance_slots_      = slots_for(budget.second_chance_bytes);
-        if (routed_capacity_ == 0) { routed_capacity_ = 1; } // a warm tier with no routed slot is inert
-        slot_capacity_ = routed_capacity_ + prefetch_slots_ + second_chance_slots_;
-        arena_bytes_   = static_cast<std::uint64_t>(slot_capacity_) * slot_bytes_;
-        if (second_chance_slots_ != 0) {
+        //
+        // Ranges: S [0, banks*s) per bank (the frozen set), D [banks*s, routed) shared (the layer's
+        // working set), C and P per bank above routed. S is what "冻结一层" names, so it is the one
+        // range that must never be borrowed; D is demand, and a layer's demand is not the grant
+        // divided by forty - the old shared range is what keeps a 480-slot tier able to hold a
+        // 41-route prefill layer.
+        const auto bank_count = std::max<std::uint32_t>(1U, static_cast<std::uint32_t>(banks_.size()));
+        const auto slots = [&](std::uint64_t bytes) { return slots_for(bytes); };
+        const auto routed_slots = slots(budget.routed_bytes);
+        routed_capacity_ = std::max<std::uint32_t>(1U, routed_slots);
+        prefetch_per_bank_       = slots(budget.prefetch_bytes) / bank_count;
+        second_chance_per_bank_  = slots(budget.second_chance_bytes) / bank_count;
+        // The static stripe is configured later (it is a policy decision, not a budget); until
+        // then every routed slot is dynamic and the tier behaves as a single-segment arena.
+        static_per_bank_     = 0;
+        dynamic_base_        = 0;
+        dynamic_capacity_    = routed_capacity_;
+        prefetch_slots_      = prefetch_per_bank_ * bank_count;
+        second_chance_slots_ = second_chance_per_bank_ * bank_count;
+        second_chance_base_  = routed_capacity_;
+        prefetch_base_       = second_chance_base_ + second_chance_slots_;
+        slot_capacity_       = prefetch_base_ + prefetch_slots_;
+        arena_bytes_         = static_cast<std::uint64_t>(slot_capacity_) * slot_bytes_;
+        used_dynamic_ = 0;
+        static_used_.assign(bank_count, 0);
+        used_prefetch_.assign(bank_count, 0);
+        second_chance_used_.assign(bank_count, 0);
+        second_chance_free_.resize(bank_count);
+        static_frozen_bank_.assign(bank_count, 0);
+        if (second_chance_slots_ != 0 || prefetch_slots_ != 0) {
             std::fprintf(stderr,
-                         "[warm] second-chance band slots=%u (routed=%u read-ahead=%u) - its own "
-                         "budget, not taken from routed\n",
-                         second_chance_slots_, routed_capacity_, prefetch_slots_);
+                         "[warm] striped arena: banks=%u routed=%u static/bank=%u "
+                         "dynamic=%u second-chance/bank=%u read-ahead/bank=%u (slots %u)\n",
+                         bank_count, routed_capacity_, static_per_bank_,
+                         dynamic_capacity_, second_chance_per_bank_, prefetch_per_bank_,
+                         slot_capacity_);
             std::fflush(stderr);
         }
-        if (std::getenv("NINFER_HOST_WARM") != nullptr) {
+        if (std::getenv("NINFER_HOST_WARM") != nullptr || std::getenv("NINFER_HOST_FREEZE") != nullptr) {
             std::fprintf(stderr,
                          "[warm] arena path enabled: CPU half reads the pinned tier, in-place "
                          "artifact addressing disabled\n");
@@ -172,8 +197,11 @@ public:
             // per-expert bank has one object per expert - and each one verifies its own layout
             // before it is used, falling back to the copying path when the check fails.
             // NINFER_HOST_COPY=1 forces the copying path, which is what the split gate compares
-            // against.
-            static const bool warm_arena = std::getenv("NINFER_HOST_WARM") != nullptr;
+            // against. The freeze mode is an arena mode by definition: its whole placement is a
+            // slot table in this tier, so a run that sets only NINFER_HOST_FREEZE must not fall
+            // back to in-place artifact addressing (which never fills a slot at all).
+            static const bool warm_arena = std::getenv("NINFER_HOST_WARM") != nullptr ||
+                                           std::getenv("NINFER_HOST_FREEZE") != nullptr;
             static const bool allow_direct =
                 std::getenv("NINFER_HOST_COPY") == nullptr && !managed_even_in_place() &&
                 !warm_arena;
@@ -418,9 +446,11 @@ public:
         }
         return 128;
     }
-    // port (sm_89): Q53's second-chance band. Zero by default, because a region that changes where an
-    // evicted expert goes changes the split path's read behaviour, and this is wiring: the switch has
-    // to be measurable against a run without it.
+    // port (sm_89): Q53's second-chance band. Off in the streaming path, where a region that changes
+    // where an evicted expert goes changes the read behaviour and has to be measurable against a run
+    // without it. The freeze mode turns it on by default: its D is deliberately smaller than the
+    // complement, so a second chance is the difference between an eviction and a re-read. 160 slots
+    // is 4 a bank on this model; NINFER_WARM_SECOND_CHANCE_SLOTS overrides.
     static std::uint32_t second_chance_slots_from_env() {
         const char* value = std::getenv("NINFER_WARM_SECOND_CHANCE_SLOTS");
         // v8 renamed the band; keep the old spelling as an input alias so recorded experiments are
@@ -429,7 +459,7 @@ public:
         if (value != nullptr && *value != '\0') {
             return static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
         }
-        return 0;
+        return std::getenv("NINFER_HOST_FREEZE") != nullptr ? 160U : 0U;
     }
     // Bytes those slots add to the arena, so the ledger can be told before the arena exists.
     static std::uint64_t prefetch_bytes_for(std::uint64_t entry_bytes) {
@@ -459,16 +489,21 @@ public:
     // stream allocates the score vector once). A torn read would at worst mis-rank one admission,
     // never mis-address a slot: the slot tables themselves are only mutated under this lock.
     void ensure_scored(ExpertBankId bank, std::span<const std::int32_t> experts,
-                       const float* scores) {
+                       const float* scores, bool static_fill = false) {
         std::lock_guard<std::mutex> guard(mutex_);
-        fill_locked(bank, experts, nullptr, /*prefetch=*/false, scores);
+        fill_locked(bank, experts, nullptr, /*prefetch=*/false, scores, static_fill);
     }
 
     // Q53: where the admitted second-chance slots currently end, so the panel can say whether the region is
     // full (a full region is the only state in which admission is a comparison). A promoted slot is
     // returned to the region, not leaked: without that the region shrinks by one every promotion.
     [[nodiscard]] std::uint32_t second_chance_used() const noexcept {
-        return second_chance_used_ - static_cast<std::uint32_t>(second_chance_free_.size());
+        std::uint32_t total = 0;
+        for (std::size_t bank = 0; bank < second_chance_used_.size(); ++bank) {
+            total += second_chance_used_[bank] -
+                     static_cast<std::uint32_t>(second_chance_free_[bank].size());
+        }
+        return total;
     }
 
     // port (sm_89): the read-ahead's entry point. Same fill, but every slot it claims is marked, so
@@ -547,7 +582,8 @@ public:
     }
 
     void fill_locked(ExpertBankId bank, std::span<const std::int32_t> experts,
-                     const std::int32_t* resident_mask, bool prefetch, const float* scores) {
+                     const std::int32_t* resident_mask, bool prefetch, const float* scores,
+                     bool static_fill = false) {
         // A bank served straight out of the artifact mapping is backed by file pages the OS may
         // evict at any time, so it is a cold tier wearing a warm tier's address. A managed pinned
         // copy is therefore still worth keeping, and NINFER_ARENA_MANAGED asks for one even here:
@@ -563,18 +599,42 @@ public:
             return;
         }
         auto& s = state_[bank.index];
-        // port (sm_89): a call that wants more experts than its pool has slots would evict the
-        // slots it just filled, and the offsets handed back would name another expert's bytes. That
-        // is silent corruption, not a slowdown, so it fails here instead. A 1-slot arena turned a
-        // split PPL of 7.766 into 1131 before this check existed.
-        const auto capacity = prefetch ? prefetch_slots_ : routed_capacity_;
-        if (prefetch && prefetch_slots_ == 0) { return; } // read-ahead off: no pool to fill
+        // Q53: what a fill is allowed to ask for is the SEGMENT's size, not the arena's. The old
+        // check compared against the whole routed range, so a dynamic fill of 150 experts into a
+        // 6-slot dynamic stripe passed the check and then evicted the slots it had just filled -
+        // every offset handed back named another expert's bytes. That is silent corruption, and it
+        // is what made a small D produce different tokens rather than a slowdown.
+        const bool stripe_static =
+            static_fill && static_per_bank_ != 0 && bank.index < static_used_.size();
+        // Before the freeze the static stripe may overflow into the dynamic one, so the fill's
+        // ceiling is the two together (they cover the complement exactly); after the freeze it is the
+        // stripe alone, because a member that does not fit is a placement bug, not a miss.
+        const auto capacity =
+            prefetch ? prefetch_per_bank_
+                     : (stripe_static
+                            ? (static_frozen(bank.index) ? static_per_bank_
+                                                         : static_per_bank_ + dynamic_capacity_)
+                            : dynamic_capacity_);
+        if (prefetch && prefetch_per_bank_ == 0) { return; } // read-ahead off: no pool to fill
         if (experts.size() > capacity) {
-            throw std::runtime_error("host expert arena: one layer needs " +
-                                     std::to_string(experts.size()) + " slots but the " +
-                                     (prefetch ? "read-ahead pool holds " : "arena holds ") +
-                                     std::to_string(capacity) +
-                                     "; raise NINFER_EXPERT_HOST_ARENA_MB");
+            throw std::runtime_error(
+                "host expert arena: one fill needs " + std::to_string(experts.size()) +
+                " slots but the " +
+                (prefetch ? "read-ahead stripe holds " : (stripe_static ? "static stripe holds "
+                                                                        : "dynamic stripe holds ")) +
+                std::to_string(capacity) +
+                "; raise the budget or lower the set size (S+D must cover a layer's working set)");
+        }
+        // P0: protect this fill's whole target set from its own evictions. A layer's targets are
+        // filled in order; without this, a later target that needs a slot can evict an earlier
+        // target that was already resident, and that route then has no address and falls to the CPU
+        // half - a handful of routes a window, i.e. exactly the size of the residual C showed.
+        if (fill_protect_.size() != slot_capacity_) { fill_protect_.assign(slot_capacity_, 0); }
+        std::fill(fill_protect_.begin(), fill_protect_.end(), std::uint8_t{0});
+        for (const auto value : experts) {
+            if (resident_mask != nullptr && resident_mask[value] == 0) { continue; }
+            const auto slot = s.slot_of[static_cast<std::uint32_t>(value)];
+            if (slot != kNone && slot < fill_protect_.size()) { fill_protect_[slot] = 1; }
         }
         for (const auto value : experts) {
             if (resident_mask != nullptr && resident_mask[value] == 0) { continue; }
@@ -582,7 +642,13 @@ public:
             auto& slot        = s.slot_of[expert];
             if (slot == kNone) {
                 ++stats_.misses;
-                slot = claim(bank.index, expert, prefetch, scores);
+                slot = claim(bank.index, expert, prefetch, scores, static_fill);
+                if (slot == kNone) {
+                    // A speculative fill or a backfill that found no evictable slot: the expert
+                    // simply is not there this time. A routed fill never returns kNone (claim throws
+                    // instead), so the CPU half cannot read a stale offset.
+                    continue;
+                }
                 load(bank.index, expert, slot);
                 // The mark lives with the slot, so an eviction clears it: a slot reused by a routed
                 // expert is not "a prefetched expert that was used".
@@ -594,10 +660,10 @@ public:
                     ++prefetch_hits_;
                 }
                 // port (sm_89): Q53. A route that lands in the second-chance band is still a hit - the bytes
-                // are in RAM - and if the routed range has room it earns its way back: that is the
-                // "按概率分区" half, admission by repeated demand instead of by first contact.
-                if (second_chance_slots_ != 0 && slot >= routed_capacity_ &&
-                    slot < routed_capacity_ + second_chance_slots_) {
+                // are in RAM - and it earns its way back by exchange with the coldest dynamic slot.
+                // That is the "按概率分区" half: admission by repeated demand instead of first contact.
+                if (second_chance_per_bank_ != 0 && slot >= second_chance_base_ &&
+                    slot < prefetch_base_) {
                     ++stats_.second_chance_hits;
                     slot = promote_second_chance(bank, expert, slot);
                 }
@@ -607,6 +673,7 @@ public:
             s.gate_up_offsets[expert] = base + banks_[bank.index].entry.codes.offset;
             s.down_offsets[expert]    = base + banks_[bank.index].entry.down_codes.offset;
         }
+        std::fill(fill_protect_.begin(), fill_protect_.end(), std::uint8_t{0});
     }
 
     [[nodiscard]] const ops::CpuSwiGLUExperts& experts(ExpertBankId bank) const {
@@ -661,6 +728,13 @@ public:
     // treat the bytes at an offset as valid only for a slot `claim()` currently names - the arena
     // moves slots, the address space does not.
     [[nodiscard]] const std::byte* arena_device_base() const noexcept { return arena_device_; }
+    // Force the backing allocation now instead of on the first fill. The freeze route has to know
+    // whether the Device can address the tier before it accepts the run; discovering it at the first
+    // layer would make "no graph" a runtime surprise.
+    void materialize_arena() {
+        std::lock_guard<std::mutex> guard(mutex_);
+        (void)arena();
+    }
 
     // port (sm_89): Q20 second leg, host side. Three things the Device publisher needs, all read
     // under the same lock the fill path takes:
@@ -734,17 +808,190 @@ public:
     // at layer start would release exactly the slots that are still being read. Rotating means a slot
     // is protected for the layer that named it and the one after, and released only once a later
     // layer has waited on the stream.
-    void begin_layer() {
+    void begin_layer(cudaStream_t stream = nullptr) {
         std::lock_guard<std::mutex> guard(mutex_);
+        // Q20/B: the fence. The fill runs on the CPU while the Device reads the previous layer's
+        // host slots; a hold counted in layers only bounds how far ahead the CPU may run if the
+        // GPU is actually keeping up. With the S/D split the dynamic range is smaller and the CPU
+        // runs further ahead, which is why the partition produced different tokens on a long run.
+        // One event per layer, recorded after the previous layer's kernels were enqueued; waiting
+        // on the oldest of four guarantees the slots about to be dropped were consumed.
+        static const bool fence = std::getenv("NINFER_HOST_FENCE") != nullptr;
+        if (fence && stream != nullptr) {
+            if (!fence_ready_) {
+                for (auto& event : fence_events_) {
+                    if (event == nullptr) {
+                        (void)cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+                    }
+                }
+                fence_ready_ = true;
+            }
+            // The generation dropped below was named at L-2; the event recorded at L-1 is ordered after
+            // L-2's kernels, so this is the earliest wait that actually covers it.
+            const auto oldest = (fence_cursor_ + fence_events_.size() - 1) % fence_events_.size();
+            if (fence_events_[oldest] != nullptr) {
+                (void)cudaEventSynchronize(fence_events_[oldest]);
+            }
+            if (fence_events_[fence_cursor_] != nullptr) {
+                (void)cudaEventRecord(fence_events_[fence_cursor_], stream);
+            }
+            fence_cursor_ = (fence_cursor_ + 1) % fence_events_.size();
+        }
         std::swap(device_held_, device_held_prev_);
         std::fill(device_held_.begin(), device_held_.end(), std::uint8_t{0});
     }
     void release_device_holds() {
         std::lock_guard<std::mutex> guard(mutex_);
         std::fill(device_held_.begin(), device_held_.end(), std::uint8_t{0});
+        std::fill(device_held_prev_.begin(), device_held_prev_.end(), std::uint8_t{0});
     }
     // The two pools inside the arena (see claim()).
     [[nodiscard]] std::uint32_t routed_capacity() const noexcept { return routed_capacity_; }
+    // Which lifetime a slot belongs to, so a caller can say WHICH region moved when a placement
+    // table changes. Without this, "capt_ready is 97%" names a rate and not a cause.
+    enum class SlotRegion : std::uint8_t { Absent, Static, Dynamic, SecondChance, Prefetch };
+    [[nodiscard]] SlotRegion slot_region(std::uint32_t slot) const noexcept {
+        if (slot == kNone || slot >= slot_capacity_) { return SlotRegion::Absent; }
+        if (static_per_bank_ != 0 && slot < dynamic_base_) { return SlotRegion::Static; }
+        if (slot >= dynamic_base_ && slot < routed_capacity_) { return SlotRegion::Dynamic; }
+        if (slot >= second_chance_base_ && slot < prefetch_base_) {
+            return SlotRegion::SecondChance;
+        }
+        if (slot >= prefetch_base_ && slot < slot_capacity_) { return SlotRegion::Prefetch; }
+        return SlotRegion::Absent;
+    }
+    // Q20/B: the static set's own stripe. The routed grant is split into [0, banks * q) owned by
+    // the banks' static sets and the rest, which is this bank's dynamic range. A static fill may
+    // only evict inside its own stripe, so the layer that follows it cannot take the set away, and
+    // a dynamic fill can never name a slot the frozen set holds. This is the arrangement the
+    // second-chance band and the read-ahead already use: one range per lifetime, one budget each.
+    //
+    // Must be called before the first fill: the split changes where the dynamic bump pointer
+    // starts, and moving it under a pointer that has advanced is exactly the "nothing to evict"
+    // failure this class already paid for once.
+    void configure_static_slots(std::uint32_t per_bank) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (static_per_bank_ != 0 || per_bank == 0) { return; }
+        const auto banks = static_cast<std::uint32_t>(state_.size());
+        if (banks == 0) { return; }
+        if (slot_generation_ != 0) {
+            throw std::logic_error(
+                "host expert arena: the static stripe must be configured before the first fill");
+        }
+        if (per_bank + 1 > routed_capacity_ / banks && banks != 0) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                std::fprintf(stderr,
+                             "[warm] static stripe refused: %u slots/bank leaves no dynamic slot "
+                             "(routed=%u over %u banks)\n",
+                             per_bank, routed_capacity_, banks);
+                std::fflush(stderr);
+            }
+            return;
+        }
+        static_per_bank_  = per_bank;
+        // S is per bank and frozen; D stays one shared range, because a layer's working set is not
+        // the grant divided by forty - the old shared range is what let 41 routes fit in a 480-slot
+        // tier, and splitting it per bank turned that into a 12-slot ceiling and a hard failure.
+        dynamic_base_     = static_per_bank_ * banks;
+        dynamic_capacity_ = routed_capacity_ - dynamic_base_;
+        static_used_.assign(banks, 0);
+        used_dynamic_ = 0;
+        static_frozen_bank_.assign(banks, 0);
+    }
+    // P1: per-bank. A stripe that is still warming may churn inside itself (the warm-up fill is a
+    // normal working set); once the set is frozen the stripe may not evict at all, because every
+    // eviction would invalidate a table a captured layer replays. Bank-local because the 40 layers
+    // freeze at different calls and a global switch would drop the neighbours' warm-up fills.
+    void set_static_frozen(std::uint32_t bank, bool frozen) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (bank < static_frozen_bank_.size()) {
+            static_frozen_bank_[bank] = frozen ? 1 : 0;
+            // Unfreezing starts a new fill from the stripe base: the pointer has to move back, or
+            // the rewritten set would be appended to the old one and overflow into the dynamic
+            // range. The slots it walks are the stripe's own, and claim() clears the previous
+            // owner's mapping before reusing them.
+            if (!frozen && bank < static_used_.size()) { static_used_[bank] = 0; }
+        }
+    }
+    [[nodiscard]] bool static_frozen(std::uint32_t bank) const noexcept {
+        return bank < static_frozen_bank_.size() && static_frozen_bank_[bank] != 0;
+    }
+    // P1: rewrite a bank's static stripe from scratch. Called once at the freeze boundary, when the
+    // warm-up working set is replaced by the chosen set. A slot the Device or a copy is still reading
+    // is never cleared; the caller retries on its next layer instead (the holds rotate every layer,
+    // so the retry always succeeds within two calls).
+    bool reset_static_stripe(std::uint32_t bank) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (bank >= state_.size() || static_per_bank_ == 0 || bank >= static_used_.size()) {
+            return false;
+        }
+        const auto base = bank * static_per_bank_;
+        for (std::uint32_t slot = base; slot < base + static_per_bank_; ++slot) {
+            if (in_flight_[slot] != 0 || device_held_[slot] != 0 || device_held_prev_[slot] != 0) {
+                return false;
+            }
+        }
+        auto& slots = state_[bank].slot_of;
+        for (std::uint32_t slot = base; slot < base + static_per_bank_; ++slot) {
+            const auto expert = slot_expert_[slot];
+            if (slot_bank_[slot] == bank && expert != kNone && expert < slots.size() &&
+                slots[expert] == slot) {
+                slots[expert] = kNone;
+            }
+            slot_bank_[slot]     = kNone;
+            slot_expert_[slot]   = kNone;
+            prefetched_[slot]    = 0;
+            slot_last_use_[slot] = 0;
+        }
+        static_used_[bank] = 0;
+        bump_bank_generation(bank);
+        ++slot_generation_;
+        return true;
+    }
+    [[nodiscard]] std::uint32_t static_slots_per_bank() const noexcept {
+        return static_per_bank_;
+    }
+    [[nodiscard]] std::uint32_t dynamic_slots_per_bank() const noexcept {
+        const auto banks = static_cast<std::uint32_t>(state_.size());
+        return banks == 0 ? dynamic_capacity_ : dynamic_capacity_ / banks;
+    }
+    [[nodiscard]] std::uint32_t second_chance_per_bank() const noexcept {
+        return second_chance_per_bank_;
+    }
+    [[nodiscard]] std::uint32_t prefetch_slots_per_bank() const noexcept {
+        return prefetch_per_bank_;
+    }
+    // How many of this bank's static members currently own a slot. The backfill's progress is a
+    // count, not a percentage: a layer is only capturable when this equals the configured set.
+    [[nodiscard]] std::uint32_t static_present(std::uint32_t bank,
+                                               std::span<const std::int32_t> members) const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (bank >= state_.size()) { return 0; }
+        std::uint32_t present = 0;
+        const auto& slots = state_[bank].slot_of;
+        for (const auto expert : members) {
+            const auto id = static_cast<std::uint32_t>(expert);
+            if (id < slots.size() && slots[id] != kNone && slots[id] < static_per_bank_ * (bank + 1) &&
+                slots[id] >= bank * static_per_bank_) {
+                ++present;
+            }
+        }
+        return present;
+    }
+    // P1/P0: does the tier already hold this expert? The read-ahead asks before it copies bytes: a
+    // prediction for an expert that is already in the static stripe is not a prediction, and filling
+    // it would only move a slot. Locked because the prefetch worker runs off the layer thread.
+    [[nodiscard]] bool holds(std::uint32_t bank, std::uint32_t expert) const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        return bank < state_.size() && expert < state_[bank].slot_of.size() &&
+               state_[bank].slot_of[expert] != kNone;
+    }
+    [[nodiscard]] std::uint32_t routed_slots_per_bank() const noexcept {
+        const auto banks = static_cast<std::uint32_t>(state_.size());
+        return banks == 0 ? routed_capacity_ : routed_capacity_ / banks;
+    }
     [[nodiscard]] std::uint32_t prefetch_slots() const noexcept { return prefetch_slots_; }
     [[nodiscard]] std::uint32_t bank_count() const noexcept {
         return static_cast<std::uint32_t>(state_.size());
@@ -753,6 +1000,9 @@ public:
     // table is only valid for the generation it was copied at, so the ring path checks this before
     // it names a host slot.
     [[nodiscard]] std::uint64_t slot_generation() const noexcept { return slot_generation_; }
+    [[nodiscard]] std::uint64_t bank_slot_generation(std::uint32_t bank) const noexcept {
+        return bank < bank_generation_.size() ? bank_generation_[bank] : 0;
+    }
 
     // port (sm_89): what the arena actually did. A split run is only cheap when `miss` stops
     // growing: a miss is an artifact read, a hit is a byte range that was already in RAM. Reported
@@ -776,6 +1026,11 @@ public:
         std::uint64_t second_chance_declines   = 0; // evictions the ranking refused to keep
         std::uint64_t second_chance_hits       = 0;
         std::uint64_t second_chance_promotions = 0;
+        std::uint64_t second_chance_swaps      = 0; // promotions by exchange with a dynamic slot
+        // Frozen-stripe health. Both must stay at zero while a layer is frozen: an eviction would
+        // mean the set is not the set, and a drop would mean the backfill could not place a member.
+        std::uint64_t static_drops      = 0;
+        std::uint64_t prefetch_drops    = 0;
     };
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
 
@@ -832,13 +1087,21 @@ private:
                 void* device = nullptr;
                 if (cudaHostGetDevicePointer(&device, locked, 0) == cudaSuccess) {
                     arena_device_ = static_cast<std::byte*>(device);
+                } else {
+                    // A refused mapping must not stay in the error state: the next CUDA_CHECK in the
+                    // model would report it at an unrelated call site. This is expected on a large
+                    // request (the mapped range is limited on WDDM), not a fatal condition.
+                    (void)cudaGetLastError();
                 }
                 // One line, once: whether the Device can address this tier at all is the premise
                 // Q20 rests on, and a silent fallback to "not mapped" would turn the second
                 // addressing leg into a host round trip that no counter would blame.
-                cudaPointerAttributes attributes{};
-                const auto known = arena_device_ != nullptr &&
-                                   cudaPointerGetAttributes(&attributes, arena_device_) == cudaSuccess;
+                bool known = false;
+                if (arena_device_ != nullptr) {
+                    cudaPointerAttributes attributes{};
+                    known = cudaPointerGetAttributes(&attributes, arena_device_) == cudaSuccess;
+                    if (!known) { (void)cudaGetLastError(); }
+                }
                 std::fprintf(stderr,
                              "[host] arena mapped bytes=%llu host=%p dev=%p device_accessible=%d\n",
                              static_cast<unsigned long long>(arena_bytes_),
@@ -847,11 +1110,40 @@ private:
                 std::fflush(stderr);
                 return arena_;
             }
+            // The mapped request was refused. Its error is still the last error CUDA recorded;
+            // clear it before the fallback so it cannot surface at the next kernel launch.
+            const auto mapped_error = cudaGetLastError();
+            std::fprintf(stderr,
+                         "[host] mapped allocation of %llu MiB failed: %s - trying a registered "
+                         "fallback\n",
+                         static_cast<unsigned long long>(arena_bytes_ >> 20),
+                         cudaGetErrorString(mapped_error));
+            std::fflush(stderr);
+            // A second route to the same property: allocate locked, then register the range as
+            // mapped. cudaHostAllocMapped can refuse a large request where the two-step form
+            // succeeds, and the Device only needs the alias, not how it was produced.
             if (cudaHostAlloc(&locked, arena_bytes_, cudaHostAllocDefault) == cudaSuccess) {
+                void* device = nullptr;
+                if (cudaHostRegister(locked, arena_bytes_, cudaHostRegisterMapped) == cudaSuccess &&
+                    cudaHostGetDevicePointer(&device, locked, 0) == cudaSuccess) {
+                    arena_        = static_cast<std::byte*>(locked);
+                    arena_device_ = static_cast<std::byte*>(device);
+                    pinned_       = true;
+                    std::fprintf(stderr,
+                                 "[host] arena mapped bytes=%llu host=%p dev=%p "
+                                 "device_accessible=1 (registered)\n",
+                                 static_cast<unsigned long long>(arena_bytes_),
+                                 static_cast<const void*>(arena_),
+                                 static_cast<const void*>(arena_device_));
+                    std::fflush(stderr);
+                    return arena_;
+                }
+                (void)cudaGetLastError();
                 arena_  = static_cast<std::byte*>(locked);
                 pinned_ = true;
                 return arena_;
             }
+            (void)cudaGetLastError();
 #if defined(_WIN32)
             arena_ = static_cast<std::byte*>(
                 VirtualAlloc(nullptr, arena_bytes_, MEM_RESERVE, PAGE_NOACCESS));
@@ -879,27 +1171,61 @@ private:
     // [routed, second_chance_end), read-ahead [second_chance_end, slot_capacity_). Each range has
     // its own budget, so nothing can evict what another range just filled and no auxiliary range can
     // take a routed slot.
+    // A bank's table is only invalidated by a change to a slot its experts occupy: its own fill, or
+    // another bank's fill that evicted one of its slots. The global counter made every bank stale on
+    // every layer; this one lets an untouched bank keep its table, which is what a capture needs.
+    void bump_bank_generation(std::uint32_t bank) {
+        if (bank >= bank_generation_.size()) { bank_generation_.resize(bank + 1, 0); }
+        ++bank_generation_[bank];
+    }
+
     std::uint32_t claim(std::uint32_t bank, std::uint32_t expert, bool prefetch,
-                        const float* scores) {
-        const std::uint32_t second_chance_end = routed_capacity_ + second_chance_slots_;
-        const std::uint32_t begin    = prefetch ? second_chance_end : 0;
-        const std::uint32_t end      = prefetch ? slot_capacity_ : routed_capacity_;
-        std::uint32_t& used       = prefetch ? used_prefetch_ : used_;
-        if (used < end - begin) {
-            const auto slot    = begin + used++;
+                        const float* scores, bool static_fill) {
+        // A stripe that was never configured falls back to the dynamic range: the allocation must
+        // never point at a slot the arena does not have.
+        bool stripe_static = static_fill && static_per_bank_ != 0 && bank < static_used_.size();
+        // Before the set is frozen the static stripe is a warm-up working set, so a fill that
+        // overflows it continues into the dynamic stripe instead of failing: together they cover the
+        // whole complement, which is all a layer can ask for. After the freeze the stripe may not
+        // churn and the dynamic range takes the overflow.
+        if (stripe_static && static_used_[bank] >= static_per_bank_ && !static_frozen(bank)) {
+            stripe_static = false;
+        }
+        const std::uint32_t slots_per_bank =
+            prefetch ? prefetch_per_bank_ : (stripe_static ? static_per_bank_ : dynamic_capacity_);
+        const std::uint32_t base =
+            prefetch ? prefetch_base_ + bank * prefetch_per_bank_
+                     : (stripe_static ? bank * static_per_bank_ : dynamic_base_);
+        std::uint32_t& used = prefetch ? used_prefetch_[bank]
+                                       : (stripe_static ? static_used_[bank] : used_dynamic_);
+        if (used < slots_per_bank) {
+            const auto slot    = base + used++;
+            // A rewrite of the static stripe starts from its base again, so the slot may still name
+            // the expert it held before the freeze. Clear that mapping first: one slot names one
+            // expert, and a stale offset is how this tier has handed out another expert's bytes.
+            if (slot_bank_[slot] != kNone &&
+                !(slot_bank_[slot] == bank && slot_expert_[slot] == expert)) {
+                auto& other = state_[slot_bank_[slot]].slot_of[slot_expert_[slot]];
+                if (other == slot) { other = kNone; }
+                bump_bank_generation(slot_bank_[slot]);
+            }
             slot_bank_[slot]   = bank;
             slot_expert_[slot] = expert;
+            bump_bank_generation(bank);
             ++slot_generation_;
             return slot;
         }
         std::uint32_t victim  = kNone;
         std::uint64_t coldest = ~std::uint64_t{0};
-        for (std::uint32_t s = begin; s < end; ++s) {
+        for (std::uint32_t s = base; s < base + slots_per_bank; ++s) {
             // A slot a copy is reading is not a candidate, whatever its age. Evicting it would hand
             // the Device another expert's bytes with no error anywhere - the crash this protection
             // exists to prevent (a read-ahead issued after wait_for_progress() freed the slot an
             // in-flight copy was reading).
             if (in_flight_[s] != 0) { continue; }
+            // A slot this same fill already placed is not a candidate either: evicting it would
+            // leave a route of the layer being filled with no address.
+            if (s < fill_protect_.size() && fill_protect_[s] != 0) { continue; }
             // A slot the Device is reading is not a candidate either, and for the same reason: the
             // GEMM runs asynchronously, so claim() in the next layer can free a slot whose bytes are
             // still being consumed. Released once per layer, after the stream has been waited on.
@@ -909,22 +1235,43 @@ private:
                 victim  = s;
             }
         }
-        if (victim == kNone) {
-            throw std::runtime_error("host expert arena: every slot is in flight");
+        if (victim == kNone || coldest == 0) {
+            // A speculative fill has nothing to prove: dropping one is the correct answer when the
+            // segment is full of slots the Device is still reading. A routed fill cannot drop - the
+            // CPU half would read another expert's bytes - so it fails loudly. A frozen static
+            // stripe is the third case: a member that is not there after the freeze is a placement
+            // bug, and moving a member out would silently break the set a captured table names.
+            if (prefetch || (stripe_static && static_frozen(bank))) {
+                if (prefetch) { ++stats_.prefetch_drops; } else { ++stats_.static_drops; }
+                return kNone;
+            }
+            throw std::runtime_error(victim == kNone
+                                         ? "host expert arena: every slot is in flight"
+                                         : "host expert arena: nothing to evict");
         }
-        if (coldest == 0) { throw std::runtime_error("host expert arena: nothing to evict"); }
         ++stats_.evictions;
-        // port (sm_89): Q53. The victim's bytes are still the expert that owned them, and that
-        // expert was hot a moment ago - so it moves to the warm tier's second-chance band (a memcpy
+        // Q53: the victim's bytes are still the expert that owned them, and that expert was hot a
+        // moment ago - so a dynamic eviction moves to this bank's second-chance band (a memcpy
         // inside the same pinned arena) instead of leaving the arena. The band has its own budget;
-        // it never takes a routed slot. When the band is off this is the old behaviour exactly: the
-        // mapping is cleared and the slot is handed to the newcomer.
-        if (!demote_second_chance(victim, scores)) {
-            state_[slot_bank_[victim]].slot_of[slot_expert_[victim]] = kNone;
+        // it never takes a routed slot, and the static stripe has no edge at all: a frozen member is
+        // never demoted, because moving it would silently break the set a captured table names.
+        const auto previous_bank = slot_bank_[victim];
+        if (!prefetch && !stripe_static && !demote_second_chance(victim, scores)) {
+            if (previous_bank < state_.size()) {
+                state_[previous_bank].slot_of[slot_expert_[victim]] = kNone;
+            }
+        } else if (!prefetch && stripe_static && previous_bank != kNone) {
+            // The victim of a static fill is an old member of this bank's stripe (or of the dynamic
+            // range, before the freeze). Its mapping must go with the bytes; demote() does that for
+            // the dynamic case, and this covers the stripe.
+            auto& other = state_[previous_bank].slot_of[slot_expert_[victim]];
+            if (other == victim) { other = kNone; }
         }
         prefetched_[victim]  = 0; // the slot now holds another expert, so the mark dies with it
         slot_bank_[victim]   = bank;
         slot_expert_[victim] = expert;
+        if (previous_bank != kNone) { bump_bank_generation(previous_bank); }
+        bump_bank_generation(bank);
         ++slot_generation_;
         return victim;
     }
@@ -942,33 +1289,46 @@ private:
     // the eviction is a drop, exactly as it was before the region existed. With `scores == nullptr`
     // (a caller that does not rank) the old mechanical rule is the fallback.
     bool demote_second_chance(std::uint32_t slot, const float* scores) {
-        if (second_chance_slots_ == 0 || slot >= routed_capacity_) { return false; }
+        if (second_chance_per_bank_ == 0 || slot < dynamic_base_ || slot >= routed_capacity_) {
+            return false;
+        }
         const auto bank   = slot_bank_[slot];
         const auto expert = slot_expert_[slot];
-        if (bank == kNone || expert == kNone) { return false; }
+        if (bank == kNone || expert == kNone || bank >= state_.size()) { return false; }
+        const auto cbase    = second_chance_base_ + bank * second_chance_per_bank_;
         const auto incoming = scores != nullptr && expert < banks_[bank].entry.count
                                   ? scores[expert]
                                   : 0.0F;
         std::uint32_t target = kNone;
-        if (!second_chance_free_.empty()) {
-            target = second_chance_free_.back();
-            second_chance_free_.pop_back();
-        } else if (second_chance_used_ < second_chance_slots_) {
-            target = routed_capacity_ + second_chance_used_++;
+        auto& free           = second_chance_free_[bank];
+        // A slot a promotion handed back may still be named by the previous layer's Device table.
+        // Reusing it here writes over bytes a queued GEMM is reading - the same class of fault the
+        // in-flight check exists for, and the reason a promoted slot is held for two layers.
+        while (!free.empty()) {
+            const auto candidate = free.back();
+            free.pop_back();
+            if (in_flight_[candidate] == 0 && device_held_[candidate] == 0 &&
+                device_held_prev_[candidate] == 0) {
+                target = candidate;
+                break;
+            }
+        }
+        if (target != kNone) {
+            // taken from the returned list; nothing else to decide
+        } else if (second_chance_used_[bank] < second_chance_per_bank_) {
+            target = cbase + second_chance_used_[bank]++;
         } else {
             float coldest = std::numeric_limits<float>::max();
-            for (std::uint32_t candidate = routed_capacity_;
-                 candidate < routed_capacity_ + second_chance_slots_; ++candidate) {
+            for (std::uint32_t candidate = cbase;
+                 candidate < cbase + second_chance_per_bank_; ++candidate) {
                 if (slot_bank_[candidate] == kNone || in_flight_[candidate] != 0 ||
                     device_held_[candidate] != 0 || device_held_prev_[candidate] != 0) {
                     continue;
                 }
-                const auto other_bank   = slot_bank_[candidate];
                 const auto other_expert = slot_expert_[candidate];
-                const auto value = other_bank < banks_.size() &&
-                                           other_expert < banks_[other_bank].entry.count
-                                       ? score_of(other_bank, other_expert)
-                                       : 0.0F;
+                const auto value        = other_expert < banks_[bank].entry.count
+                                              ? score_of(bank, other_expert)
+                                              : 0.0F;
                 if (value < coldest) {
                     coldest = value;
                     target  = candidate;
@@ -988,6 +1348,7 @@ private:
         if (const auto previous = slot_bank_[target]; previous != kNone && previous < state_.size()) {
             auto& other = state_[previous].slot_of[slot_expert_[target]];
             if (other == target) { other = kNone; }
+            bump_bank_generation(previous);
         }
         auto* base = arena();
         std::memcpy(base + std::uint64_t{target} * slot_bytes_,
@@ -998,6 +1359,7 @@ private:
         slot_last_use_[target] = slot_last_use_[slot];
         prefetched_[target]    = 0;
         state_[bank].slot_of[expert] = target;
+        bump_bank_generation(bank);
         ++slot_generation_;
         ++stats_.second_chance_admissions;
         return true;
@@ -1024,20 +1386,77 @@ public:
 private:
 
     std::uint32_t promote_second_chance(ExpertBankId bank, std::uint32_t expert, std::uint32_t from) {
-        if (slot_bank_.empty() || used_ >= routed_capacity_) { return from; }
-        const auto target = used_++;
-        auto* base        = arena();
-        std::memcpy(base + std::uint64_t{target} * slot_bytes_,
-                    base + std::uint64_t{from} * slot_bytes_,
-                    static_cast<std::size_t>(slot_bytes_));
-        slot_bank_[target]     = bank.index;
+        const auto b = bank.index;
+        if (slot_bank_.empty() || second_chance_per_bank_ == 0) { return from; }
+        const auto promoted_use = slot_last_use_[from];
+        const auto dbase        = dynamic_base_;
+        auto* base              = arena();
+        std::uint32_t target    = kNone;
+        bool moved_into_from    = false;
+        if (used_dynamic_ < dynamic_capacity_) {
+            target = dbase + used_dynamic_++;
+            std::memcpy(base + std::uint64_t{target} * slot_bytes_,
+                        base + std::uint64_t{from} * slot_bytes_,
+                        static_cast<std::size_t>(slot_bytes_));
+        } else {
+            // No room in the dynamic range: exchange with its coldest slot. The old bump-only
+            // promotion could never run once the range was full - which is the normal state - so
+            // the band was a parking lot that only ever filled.
+            //
+            // Two conditions make the exchange safe. The source slot must not be one the previous
+            // layer's Device table still names (it is about to be overwritten with the displaced
+            // expert), and the displaced expert moves into the band rather than being dropped - a
+            // promotion must not make an expert that is part of this layer's route set disappear.
+            if (in_flight_[from] != 0 || device_held_[from] != 0 || device_held_prev_[from] != 0) {
+                return from;
+            }
+            std::uint32_t victim  = kNone;
+            std::uint64_t coldest = ~std::uint64_t{0};
+            for (std::uint32_t s = dbase; s < routed_capacity_; ++s) {
+                if (slot_bank_[s] == kNone || in_flight_[s] != 0 || device_held_[s] != 0 ||
+                    device_held_prev_[s] != 0) {
+                    continue;
+                }
+                if (slot_last_use_[s] < coldest) {
+                    coldest = slot_last_use_[s];
+                    victim  = s;
+                }
+            }
+            if (victim == kNone) { return from; }
+            const auto victim_expert = slot_expert_[victim];
+            if (victim_expert == kNone || score_of(b, expert) <= score_of(b, victim_expert)) {
+                ++stats_.second_chance_declines;
+                return from;
+            }
+            if (swap_scratch_.size() < slot_bytes_) { swap_scratch_.resize(slot_bytes_); }
+            std::memcpy(swap_scratch_.data(), base + std::uint64_t{victim} * slot_bytes_,
+                        static_cast<std::size_t>(slot_bytes_));
+            std::memcpy(base + std::uint64_t{victim} * slot_bytes_,
+                        base + std::uint64_t{from} * slot_bytes_,
+                        static_cast<std::size_t>(slot_bytes_));
+            std::memcpy(base + std::uint64_t{from} * slot_bytes_, swap_scratch_.data(),
+                        static_cast<std::size_t>(slot_bytes_));
+            state_[b].slot_of[victim_expert] = from;
+            slot_bank_[from]                 = b;
+            slot_expert_[from]               = victim_expert;
+            slot_last_use_[from]             = slot_last_use_[victim];
+            prefetched_[from]                = 0;
+            target                           = victim;
+            moved_into_from                  = true;
+            ++stats_.second_chance_swaps;
+        }
+        if (target != from && !moved_into_from && slot_bank_[from] == b) {
+            slot_bank_[from]     = kNone;
+            slot_expert_[from]   = kNone;
+            slot_last_use_[from] = 0;
+            second_chance_free_[b].push_back(from);
+        }
+        slot_bank_[target]     = b;
         slot_expert_[target]   = expert;
-        slot_last_use_[target] = slot_last_use_[from];
+        slot_last_use_[target] = promoted_use;
         prefetched_[target]    = 0;
-        slot_bank_[from]       = kNone;
-        slot_expert_[from]     = kNone;
-        second_chance_free_.push_back(from);
-        state_[bank.index].slot_of[expert] = target;
+        state_[b].slot_of[expert] = target;
+        bump_bank_generation(b);
         ++slot_generation_;
         ++stats_.second_chance_promotions;
         return target;
@@ -1132,21 +1551,37 @@ private:
     std::byte* arena_device_     = nullptr;
     bool pinned_                 = false;
     std::uint32_t slot_capacity_ = 0;
-    // Slots [0, routed_capacity_) belong to the layers, [routed_capacity_, slot_capacity_) to the
-    // read-ahead. `used_` counts the first range's bump allocation, `used_prefetch_` the second's.
-    std::uint32_t used_            = 0;
-    std::uint32_t routed_capacity_ = 0;
-    std::uint32_t prefetch_slots_  = 0;
-    std::uint32_t used_prefetch_   = 0;
-    // Q53: the second-chance band sits between the routed range and the read-ahead's, and `second_chance_used_` is
-    // how many of its slots have ever been filled - the region is a fixed-size set, and admission is
-    // only a comparison once it is full.
-    std::uint32_t second_chance_slots_ = 0;
-    std::uint32_t second_chance_used_  = 0;
-    std::uint64_t slot_generation_     = 0;
-    // Slots a promotion handed back. Reused before the bump pointer so a promotion does not shrink
-    // the region by one slot forever.
-    std::vector<std::uint32_t> second_chance_free_;
+    // Four ranges. S [0, banks*s) is per bank and frozen; D [dynamic_base_, routed_capacity_) is one
+    // shared working set; C [second_chance_base_, prefetch_base_) and P [prefetch_base_,
+    // slot_capacity_) are per bank. S/C/P are the lifetimes a freeze can name; D is the only range a
+    // layer's demand may churn, so it is the only one that needs to borrow across banks.
+    std::uint32_t routed_capacity_        = 0;
+    std::uint32_t static_per_bank_        = 0;
+    // S is per bank and frozen. D is one shared range above it: a layer's working set is not the
+    // grant divided by forty, and the shared form is what keeps a 480-slot tier able to hold a
+    // 41-route prefill layer.
+    std::uint32_t dynamic_base_           = 0;
+    std::uint32_t dynamic_capacity_       = 0;
+    std::uint32_t second_chance_base_     = 0;
+    std::uint32_t prefetch_base_          = 0;
+    std::uint32_t used_dynamic_           = 0;
+    std::uint32_t prefetch_per_bank_      = 0;
+    std::uint32_t second_chance_per_bank_ = 0;
+    std::uint32_t prefetch_slots_         = 0;
+    std::uint32_t second_chance_slots_    = 0;
+    std::vector<std::uint32_t> static_used_;
+    std::vector<std::uint32_t> used_prefetch_;
+    // Per bank: the static set has been frozen. A frozen stripe never evicts (see claim()).
+    std::vector<std::uint8_t> static_frozen_bank_;
+    // Per-bank second-chance accounting: how many of the bank's band slots were ever filled, and the
+    // slots a promotion handed back (reused before the bump pointer).
+    std::vector<std::uint32_t> second_chance_used_;
+    std::vector<std::vector<std::uint32_t>> second_chance_free_;
+    std::uint64_t slot_generation_ = 0;
+    std::vector<std::uint64_t> bank_generation_;
+    // One slot of scratch, allocated on the first exchange promotion. A swap needs a third image;
+    // keeping it here costs 1.9 MiB and only when the band is on.
+    std::vector<std::byte> swap_scratch_;
     // Q53: each bank's decayed route scores, registered by its stream. Borrowed pointers; see
     // score_of(). kMaxBanks is the same bound the bank ids already carry.
     std::array<const float*, 64> score_bank_{};
@@ -1185,8 +1620,14 @@ private:
     // not have run. Both make a slot un-evictable; they end at different times.
     mutable std::vector<std::uint8_t> device_held_;
     mutable std::vector<std::uint8_t> device_held_prev_;
+    // One event per layer for the host-slot fence; see begin_layer().
+    std::array<cudaEvent_t, 4> fence_events_{};
+    std::uint32_t fence_cursor_ = 0;
+    bool fence_ready_ = false;
     // Slots the read-ahead filled and a routed layer has not consumed yet (D4's numerator).
     std::vector<std::uint8_t> prefetched_;
+    // Slots of the fill in progress; claim() may not evict them (see fill_locked).
+    std::vector<std::uint8_t> fill_protect_;
     std::uint64_t prefetch_hits_ = 0;
     // Q69: experts whose bytes the read-ahead pulled through the page cache, per bank, and the one
     // scratch slot that pass reads into. Guarded by the same mutex as the slot tables.

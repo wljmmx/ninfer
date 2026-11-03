@@ -240,6 +240,27 @@ public:
     // while a fixed few is enough everywhere. This is the p99 of the tracked distribution.
     [[nodiscard]] std::uint32_t spill_slots(std::uint32_t capacity) const noexcept;
     void reset_coverage() noexcept { coverage_ = Coverage{}; }
+    // P1: the freeze is a placement policy, not a constant. These are the knobs a controller will
+    // drive; the environment only sets their initial values.
+    //
+    //   freeze_after     ensure() calls of warm-up before the set is chosen (0 = never freeze)
+    //   reselect_after   ensure() calls in the frozen state before it is chosen again (0 = never)
+    //   thaw_on_request  a new request clears the placement and re-warms from its own traffic
+    struct FreezePolicy {
+        std::uint32_t freeze_after    = 4;
+        std::uint32_t reselect_after  = 0;
+        bool          thaw_on_request = false;
+    };
+    void set_freeze_policy(const FreezePolicy& policy);
+    [[nodiscard]] FreezePolicy freeze_policy() const noexcept;
+    // Called by the serving layer at a request boundary. Thaws only when the policy says so; the
+    // layer then re-freezes after `freeze_after` calls of the new request's traffic.
+    void note_request_begin();
+    // Clear the frozen placement now. The Device set follows the router again and the host stripe
+    // returns to warm-up; the next freeze installs a new one.
+    void thaw();
+    [[nodiscard]] bool frozen() const noexcept { return frozen_; }
+    [[nodiscard]] bool freeze_mode() const noexcept { return freeze_mode_; }
     // Reserved for a captured expert table: a capture cannot read a host tally, so that design has
     // to count its misses on the device. Null until such a capture exists.
     [[nodiscard]] const std::uint32_t* device_miss_counter() const noexcept { return nullptr; }
@@ -354,6 +375,10 @@ private:
     // generation; if any bank's fill moves a slot, the next admission sees the mismatch and
     // refreshes before naming a host slot.
     void refresh_static_candidates();
+    // The per-bank quota the static stripe is configured with, in one place: attach_host() has to
+    // install the stripe before the first fill (a stripe configured afterwards leaves the dynamic
+    // bump pointer past its new base), and the refresh asks for the same number.
+    [[nodiscard]] std::uint32_t static_quota() const;
     // Copy this bank's whole warm slot table to the Device in one go, stamp it with the tier's
     // current slot generation, and return how many experts it holds. Every fill in the tier bumps
     // that generation, so the copy is only trusted until the next fill.
@@ -549,6 +574,39 @@ private:
     // one copy per epoch; a number near one per layer means every uncovered route moved a slot and
     // the "static" table is a per-layer table with extra steps.
     std::uint64_t static_table_refreshes_ = 0;
+    // Q20/P0: which experts the static set names, so residency and coverage can be counted per
+    // expert instead of read off the tier's hit counter. The tier's counter answers "was the expert
+    // I asked for already there"; the static path only asks for the missing ones, so that counter is
+    // zero by construction and cannot say whether the set survived. Off unless NINFER_STATIC_PROBE.
+    std::vector<std::uint8_t> static_member_;
+    std::vector<std::uint32_t> static_probe_slots_;
+    std::vector<std::uint32_t> host_check_;
+    std::uint64_t static_probe_layers_        = 0;
+    std::uint64_t static_probe_static_present_ = 0;
+    std::uint64_t static_probe_dyn_present_    = 0;
+    std::uint64_t static_probe_route_static_   = 0;
+    std::uint64_t static_probe_route_dyn_      = 0;
+    std::uint64_t static_probe_route_absent_   = 0;
+    // P0/A: the epoch clock the policy branch never reaches on a covered layer.
+    std::uint32_t static_refresh_clock_ = 0;
+    // P1: the per-layer frozen set. NINFER_HOST_FREEZE makes the Device set and the host static
+    // set be chosen once - both from the same ranking, disjoint by construction - and then held.
+    // `freeze_clock_` counts ensure() calls, not branch hits: the old `steps_` only advanced on one
+    // policy branch, so a covered layer never reached the freeze at all.
+    bool freeze_mode_ = false;
+    bool static_frozen_ = false;
+    std::uint64_t freeze_clock_ = 0;
+    std::uint32_t freeze_after_ = 0;
+    // Re-select after this many ensure() calls in the frozen state (0 = never). The set chosen from
+    // prefill routing is not the set decode uses; this is the knob that lets a serving run replace
+    // it once decode traffic has been seen, without a request hook the model does not have.
+    std::uint32_t freeze_refresh_ = 0;
+    bool thaw_on_request_ = false;
+    std::uint32_t freeze_members_ = 0;
+    std::uint32_t freeze_present_ = 0;
+    std::uint64_t freeze_membership_moves_ = 0;
+    std::uint64_t freeze_report_layers_ = 0;
+    void freeze_now(std::uint32_t tokens);
     std::uint32_t* coverage_word_device_ = nullptr;
     bool coverage_word_checked_          = false;
     // O1's counter: mapped, so the skip is counted where it happens. `miss_lag_` is the host total

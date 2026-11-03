@@ -929,30 +929,50 @@ std::vector<std::uint64_t> bank_generation;
                     if (settle) { (void)cudaStreamSynchronize(stream); }
                 }
             }
-            // port (sm_89): a source that already holds the bytes in place (the Host replica)
-            // names the slices, so the transfer goes straight from host memory to the pool.
+            // port (sm_89): the reader can name the slices, so each expert is read once from the
+            // page cache into the pinned ring instead of through read_entry's chunk loop.
             std::vector<ExpertBlobSpan> direct;
             if (file_reader->spans(*file, direct) && !direct.empty()) {
                 ++stat_direct;
+                // port (sm_89): a span names page-cache bytes in the artifact's file mapping, which
+                // is not pinned memory. DMA-ing straight out of a file section is what raised
+                // cudaErrorAlreadyMapped asynchronously on WDDM - the status only surfaced at the
+                // next kernel launch, and only for experts whose file pages happened to collide with
+                // an existing mapping. The spans are still the cheap source; the copy now lands in
+                // the pinned staging ring first, which is the source the driver can map without
+                // ambiguity. Same ring, same event wait, same one-DMA-per-expert shape as read_entry.
+                if (!staging || file->image_bytes > max_entry_bytes ||
+                    staging->size() < (staging_slot + 1) * max_entry_bytes) {
+                    throw std::runtime_error("expert file image exceeds the staging buffer");
+                }
+                auto* host_base = static_cast<std::byte*>(staging->data()) +
+                                  staging_slot * max_entry_bytes;
+                if (staging_event[staging_slot] != nullptr) {
+                    (void)cudaEventSynchronize(staging_event[staging_slot]);
+                }
                 for (const auto& span : direct) {
                     if (span.image_offset > file->image_bytes ||
                         span.bytes > file->image_bytes - span.image_offset) {
                         throw std::runtime_error("expert span lies outside its entry image");
                     }
-                    if (batch != nullptr) {
-                        ++stat_push;
-                        batch->push_back({base + span.image_offset, span.source, span.bytes});
-                        continue;
-                    }
-                    const auto copied =
-                        cudaMemcpyAsync(base + span.image_offset, span.source,
-                                        static_cast<std::size_t>(span.bytes),
-                                        cudaMemcpyHostToDevice, stream);
-                    if (copied != cudaSuccess) {
-                        throw std::runtime_error(cudaGetErrorString(copied));
-                    }
+                    std::memcpy(host_base + span.image_offset, span.source,
+                                static_cast<std::size_t>(span.bytes));
                 }
-                if (batch == nullptr && settle) {
+                if (batch != nullptr) {
+                    ++stat_push;
+                    staging_used.push_back(staging_slot);
+                    batch->push_back(
+                        {base, host_base, static_cast<std::size_t>(file->image_bytes)});
+                    entry.ready    = true;
+                    entry.last_use = ++epoch;
+                    ++uploads;
+                    return;
+                }
+                const auto copied =
+                    cudaMemcpyAsync(base, host_base, static_cast<std::size_t>(file->image_bytes),
+                                    cudaMemcpyHostToDevice, stream);
+                if (copied != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(copied)); }
+                if (settle) {
                     const auto settled = cudaStreamSynchronize(stream);
                     if (settled != cudaSuccess) {
                         throw std::runtime_error(cudaGetErrorString(settled));
