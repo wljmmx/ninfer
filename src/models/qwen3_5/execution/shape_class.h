@@ -66,46 +66,55 @@ static_assert(prefill_class_for(104) == 128);
 static_assert(prefill_class_for(256) == 256);
 static_assert(prefill_class_for(500) == 512);
 
-// Q67/S1: is a merged prefill actually cheaper than running the queued prompts one by one? A
-// padding ratio cannot answer that, because it ignores what a pass costs before any of it is
-// useful: about a second of state setup and expert fill, then ~12 ms per row at small widths
-// (measured on the 4090: 26 tokens = 1232 ms, 74 = 2245, 138 = 2596; the marginal drops to ~2 ms
-// per row above ~490, which makes this model conservative where it matters).
+// Q67/S1: is a merged prefill actually cheaper than running the queued prompts one by one?
 //
-// Two constants, both measured, decide it by comparing predicted costs. At 4x26 tokens merging wins
-// 2.2x; at 2x600 it loses by 1.5x and the caller runs them separately, exactly as it should.
+// The executed shape is a RECTANGLE, not a concatenation: the batch runs `class(max remaining)` columns
+// wide by `lanes` rows, so the work is class(max) * lanes and the short lanes are padded. That is also
+// the constraint that decides how many lanes can go together - the rectangle has to stay inside the
+// prefill workspace class, and 4096 columns is the largest one.
+//
+// Two measured constants price it: ~1200 ms before a pass is useful (state setup plus expert fill),
+// then ~12 ms per row at small widths (26 tokens = 1232 ms, 74 = 2245, 138 = 2596 on the 4090; the
+// marginal drops to ~2 ms above ~490, which keeps this model conservative exactly where it matters).
 struct PrefillCostModel {
     double fixed_ms     = 1200.0;
     double per_token_ms = 12.0;
 };
 
 struct PrefillBatchFit {
-    std::int32_t width = 0;  // class width to run at; 0 means "do not merge"
-    std::size_t lanes  = 0;  // how many of the leading lanes that width covers
-    double merged_ms   = 0.0;
-    double separate_ms = 0.0;
+    std::int32_t width   = 0;  // class width (columns per lane); 0 means "do not merge"
+    std::size_t lanes    = 0;  // how many of the leading lanes fit that width
+    std::uint32_t columns = 0; // width * lanes: what the workspace has to hold
+    double merged_ms     = 0.0;
+    double separate_ms   = 0.0;
 };
 
-// Takes the longest prefix of `remaining` whose sum still fits the largest class, and picks the
-// prefix/class pair that costs least. One lane is never a merge: that is the single-request path,
-// which stays bit-identical by taking its exact width.
+// Takes the longest prefix whose padded rectangle still fits the largest class, and picks the prefix
+// that costs least. One lane is never a merge: that is the single-request path, which stays
+// byte-identical by taking its exact width.
 constexpr PrefillBatchFit prefill_batch_fit(std::span<const std::uint32_t> remaining,
-                                            const PrefillCostModel model = {}) {
-    constexpr std::int32_t largest = kPrefillShapeClasses[std::size(kPrefillShapeClasses) - 1];
+                                            const PrefillCostModel model = {},
+                                            std::int32_t columns_cap = kPrefillShapeClasses[
+                                                std::size(kPrefillShapeClasses) - 1]) {
     PrefillBatchFit best{};
-    std::uint64_t sum      = 0;
-    double separate        = 0.0;
+    double separate      = 0.0;
+    std::uint32_t widest = 0;
     for (std::size_t i = 0; i < remaining.size(); ++i) {
-        const std::uint64_t next = sum + remaining[i];
-        if (next > static_cast<std::uint64_t>(largest)) { break; }
-        sum = next;
         separate += model.fixed_ms + static_cast<double>(remaining[i]) * model.per_token_ms;
+        if (remaining[i] > widest) { widest = remaining[i]; }
         if (i == 0) { continue; }
-        const std::int32_t width = prefill_class_for(static_cast<std::int32_t>(sum));
-        const double merged      = model.fixed_ms + static_cast<double>(width) * model.per_token_ms;
+        const std::int32_t width = prefill_class_for(static_cast<std::int32_t>(widest));
+        const std::uint64_t columns =
+            static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(i + 1);
+        // The rectangle has to fit whatever the workspace plan holds: the largest class by default,
+        // or the chunk width a caller passes in. A shorter prefix might fit, so stop rather than skip
+        // ahead to lanes that would be even wider.
+        if (columns > static_cast<std::uint64_t>(columns_cap)) { break; }
+        const double merged = model.fixed_ms + static_cast<double>(columns) * model.per_token_ms;
         if (merged >= separate) { continue; }
         best.width       = width;
         best.lanes       = i + 1;
+        best.columns     = static_cast<std::uint32_t>(columns);
         best.merged_ms   = merged;
         best.separate_ms = separate;
     }

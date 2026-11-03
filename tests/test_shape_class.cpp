@@ -53,7 +53,7 @@ int main() {
     // Four short prompts: this is the case the old {1024,2048,4096} set turned into a 1024-row pass.
     {
         const auto result = fit(std::array<std::uint32_t, 4>{26, 26, 26, 26});
-        check_equal(static_cast<std::uint64_t>(result.width), 128, "4x26 merges at 128");
+        check_equal(static_cast<std::uint64_t>(result.width), 32, "4x26 merges at 32 columns wide");
         check_equal(result.lanes, 4, "4x26 takes all four lanes");
         check(result.merged_ms < result.separate_ms, "4x26: merging is cheaper");
     }
@@ -77,7 +77,7 @@ int main() {
     // Five 1000-token prompts: only the first four fit under 4096, and that prefix wins.
     {
         const auto result = fit(std::array<std::uint32_t, 5>{1000, 1000, 1000, 1000, 1000});
-        check_equal(static_cast<std::uint64_t>(result.width), 4096, "4x1000 merges at 4096");
+        check_equal(static_cast<std::uint64_t>(result.width), 1024, "4x1000 merges at 1024 columns wide");
         check_equal(result.lanes, 4, "4x1000 stops where the class stops");
     }
 
@@ -91,7 +91,7 @@ int main() {
     // Eight one-chunk prompts: the case the plan quotes as 3.5x.
     {
         const auto result = fit(std::array<std::uint32_t, 8>{128, 128, 128, 128, 128, 128, 128, 128});
-        check_equal(static_cast<std::uint64_t>(result.width), 1024, "8x128 merges at 1024");
+        check_equal(static_cast<std::uint64_t>(result.width), 128, "8x128 merges at 128 columns wide");
         check_equal(result.lanes, 8, "8x128 takes all eight lanes");
         // Conservative on purpose: the model charges 12 ms for every padded row, while the measured
         // marginal at ~1000 rows is ~2 ms, so the real ratio is 3.5x (18 s against 5.1 s) and the
@@ -102,7 +102,7 @@ int main() {
     // Whatever the mixture, a merged width is always a class and always covers the lanes it names.
     {
         const auto result = fit(std::array<std::uint32_t, 3>{37, 41, 5});
-        check_equal(static_cast<std::uint64_t>(result.width), 128, "37+41+5 merges at 128");
+        check_equal(static_cast<std::uint64_t>(result.width), 64, "37+41+5 merges at 64 columns wide");
         check_equal(result.lanes, 3, "37+41+5 takes three lanes");
     }
 
