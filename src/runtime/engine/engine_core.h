@@ -2593,13 +2593,13 @@ private:
                 // opt-in until it has been measured.
                 bool hold_prefill = false;
                 if (prefill_admit_first_) {
-                    const bool can_bind =
-                        free_lane() && !admission_deferred_ &&
-                        !instance_.program->has_context_transaction();
-                    if (can_bind) {
-                        std::lock_guard lock(queue_mutex_);
-                        hold_prefill = !pending_.empty();
-                    }
+                    // Hold while anything is still queued - not only while a bind can start right
+                    // now. Binding is a context transaction that opens and closes over several loop
+                    // passes; holding only when it is free let a head slip in between two binds, and
+                    // then no two lanes ever had a chunk at the same time.
+                    std::lock_guard lock(queue_mutex_);
+                    hold_prefill = (!pending_.empty() || materializing_.has_value()) &&
+                                   !admission_deferred_;
                 }
                 if (prefill_batch_exec_ && instance_.program->advance_prefill_batch()) {
                     // Q67/S1: one merged pass carried several lanes' interior chunks. The final
