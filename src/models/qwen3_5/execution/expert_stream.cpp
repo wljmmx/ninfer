@@ -2000,7 +2000,8 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         // either leg (measured: ~190 routes a layer on a prefill).
         const bool refresh = !set_initialised_ || tokens <= kSetUpdateTokens ||
                              capacity < kPrefillProtectMin;
-        if (host_tier && host_ != nullptr && route_ids != nullptr) {
+        if (host_tier && host_ != nullptr && route_ids != nullptr &&
+            std::getenv("NINFER_SKIP_HOST_FILL") == nullptr) {
             static thread_local std::vector<std::int32_t> host_distinct;
             host_distinct.assign(route_ids, route_ids + values);
             std::sort(host_distinct.begin(), host_distinct.end());
@@ -2211,7 +2212,8 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         // placement word is that contribution, so `placement_mode` also has to rebuild the block below
         // even when nothing in the pool moved.
         const bool placement_mode =
-            host_direct && host_ != nullptr && host_->arena_device_base() != nullptr;
+            host_direct && host_ != nullptr && host_->arena_device_base() != nullptr &&
+            std::getenv("NINFER_SKIP_PLACEMENT") == nullptr;
         if (set_moved || need_publish || placement_mode) {
             set_initialised_ = true;
             if (freeze_trace()) {
