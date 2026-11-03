@@ -805,6 +805,9 @@ public:
     }
 
     [[nodiscard]] bool enabled() const noexcept { return enabled_; }
+    // The controller owns this decision: the measurement says capture is neutral on this machine,
+    // not that it is forbidden. NINFER_LAYER_GRAPH=0 remains the hard off for a bisect.
+    void set_enabled(bool on) noexcept { enabled_ = on; }
 
     // Replays the recorded work, or records it on the first call for this key.
     //
@@ -874,7 +877,12 @@ private:
         cudaGraphExec_t exec = nullptr;
         std::uint64_t key    = 0;
     };
-    LayerGraphs() : enabled_(std::getenv("NINFER_LAYER_GRAPH") != nullptr) {
+    LayerGraphs() : enabled_([] {
+        const char* value = std::getenv("NINFER_LAYER_GRAPH");
+        // Default on: 96 tokens interleaved measured 5.63/5.61 s with the graph and 5.63/5.61 s
+        // without it - neutral, not harmful. A run that wants the old behaviour sets =0.
+        return value == nullptr || value[0] != '0';
+    }()) {
         for (auto& bank : entries_) { bank.resize(kEntriesPerBank); }
         std::fprintf(stderr, "[layer-graph] enabled=%d\n", int(enabled_));
         std::fflush(stderr);

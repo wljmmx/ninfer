@@ -754,13 +754,26 @@ void ExpertStream::freeze_now(std::uint32_t /*tokens*/) {
     }
     if (host_->static_slots_per_bank() != 0) { host_->set_static_frozen(bank_, true); }
     freeze_present_ = host_->static_present(bank_, candidates);
+    // Install the frozen device set NOW. The layer's normal `set_resident_experts` is gated on
+    // `refresh`, which is false during prefill - so the freeze boundary could otherwise publish a
+    // placement for a pool that still held the streaming set.
+    if (cache_ != nullptr && !frozen_wanted_.empty()) {
+        (void)cache_->set_resident_experts(bank_, frozen_wanted_,
+                                           static_cast<std::uint32_t>(frozen_wanted_.size()));
+    }
+    // Can every route be addressed without reading the ids back? This is the property a fully
+    // static layer would need; kept as a counter, not as a branch (see the note at the covered
+    // check: the 0.5 ms fetch is in ffn, not in ensure).
+    const auto device = std::min<std::uint32_t>(cache_->resident_capacity(), count_);
+    const bool covers_all =
+        (freeze_members_ == count_ - device) && (freeze_present_ == freeze_members_);
     publish_static_table();
     std::fprintf(stderr,
                  "[freeze] bank=%u state=frozen device=%zu host_static=%u present=%u d=%u c=%u "
-                 "p=%u clock=%llu\n",
+                 "p=%u covers_all=%d clock=%llu\n",
                  bank_, frozen_wanted_.size(), freeze_members_, freeze_present_,
                  host_->dynamic_slots_per_bank(), host_->second_chance_per_bank(),
-                 host_->prefetch_slots_per_bank(),
+                 host_->prefetch_slots_per_bank(), int(covers_all),
                  static_cast<unsigned long long>(freeze_clock_));
     std::fflush(stderr);
     ++freeze_membership_moves_; // the one move a set is allowed: the move into the freeze
@@ -1082,6 +1095,10 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     // dirty (3-44 routes), every token was replayed, and decode went from 6.4/7.5 to 12.0/11.6 ms a
     // token. Nothing here is silent about it - the step gate counts the routes this skips - but the
     // numbers say the claim is false, not that the detection is weak.
+    // Note: an "ensure skips the read-back when the frozen set covers the bank" variant was tried
+    // and reverted. It saved ~0.03 ms a layer, because the 0.5 ms fetch is NOT here - ffn reads the
+    // ids to pack the split and decide `all_resident`, and that call site is the one to change. The
+    // variant also diverged when the pool still held the warm-up set, so it was the wrong lever.
     if (assume_covered && !fully) {
         ++gh1_static_calls_;
         ++gh1_no_miss_calls_;
