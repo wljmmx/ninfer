@@ -807,17 +807,30 @@ public:
     [[nodiscard]] bool enabled() const noexcept { return enabled_; }
 
     // Replays the recorded work, or records it on the first call for this key.
+    //
+    // A bank needs more than one entry: the step's workspace rotates through a small set of buffers
+    // (measured: three distinct pointer sets cycling), so a single entry per bank re-captures on
+    // every token and reports replays=0. Four entries make the rotation a hit. The key still names
+    // the buffers, so a genuinely new set is still a new capture.
+    static constexpr std::size_t kEntriesPerBank = 4;
     void run(std::uint32_t bank, std::uint64_t key, cudaStream_t stream,
              const std::function<void()>& work) {
-        Entry& entry = entries_[bank % entries_.size()];
-        if (entry.exec != nullptr && entry.key == key) {
-            (void)cudaGraphLaunch(entry.exec, stream);
-            ++replays_;
-            return;
+        auto& entries = entries_[bank % entries_.size()];
+        for (auto& entry : entries) {
+            if (entry.exec != nullptr && entry.key == key) {
+                (void)cudaGraphLaunch(entry.exec, stream);
+                ++replays_;
+                return;
+            }
         }
-        if (entry.exec != nullptr) {
-            (void)cudaGraphExecDestroy(entry.exec);
-            entry.exec = nullptr;
+        Entry* slot = nullptr;
+        for (auto& entry : entries) {
+            if (entry.exec == nullptr) { slot = &entry; break; }
+        }
+        if (slot == nullptr) {
+            slot = &entries[evict_cursor_++ % entries.size()];
+            (void)cudaGraphExecDestroy(slot->exec);
+            slot->exec = nullptr;
         }
         (void)cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
         work();
@@ -828,16 +841,16 @@ public:
             work();
             return;
         }
-        if (cudaGraphInstantiate(&entry.exec, graph, nullptr, nullptr, 0) != cudaSuccess) {
-            entry.exec = nullptr;
+        if (cudaGraphInstantiate(&slot->exec, graph, nullptr, nullptr, 0) != cudaSuccess) {
+            slot->exec = nullptr;
             (void)cudaGraphDestroy(graph);
             work();
             return;
         }
         (void)cudaGraphDestroy(graph);
-        entry.key = key;
+        slot->key = key;
         ++captures_;
-        (void)cudaGraphLaunch(entry.exec, stream);
+        (void)cudaGraphLaunch(slot->exec, stream);
     }
 
     void report() {
@@ -849,8 +862,10 @@ public:
     }
 
     ~LayerGraphs() {
-        for (auto& entry : entries_) {
-            if (entry.exec != nullptr) { (void)cudaGraphExecDestroy(entry.exec); }
+        for (auto& bank : entries_) {
+            for (auto& entry : bank) {
+                if (entry.exec != nullptr) { (void)cudaGraphExecDestroy(entry.exec); }
+            }
         }
     }
 
@@ -859,11 +874,13 @@ private:
         cudaGraphExec_t exec = nullptr;
         std::uint64_t key    = 0;
     };
-    LayerGraphs() : enabled_(std::getenv("NINFER_LAYER_GRAPH") != nullptr), entries_(40) {
+    LayerGraphs() : enabled_(std::getenv("NINFER_LAYER_GRAPH") != nullptr) {
+        for (auto& bank : entries_) { bank.resize(kEntriesPerBank); }
         std::fprintf(stderr, "[layer-graph] enabled=%d\n", int(enabled_));
         std::fflush(stderr);
     }
-    std::vector<Entry> entries_;
+    std::array<std::vector<Entry>, 40> entries_;
+    std::size_t evict_cursor_ = 0;
     bool enabled_          = false;
     std::uint64_t captures_ = 0;
     std::uint64_t replays_  = 0;
@@ -1560,6 +1577,20 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
                     mix(reinterpret_cast<std::uintptr_t>(moe.stream->resident_mask()));
                     mix(reinterpret_cast<std::uintptr_t>(shared_coefficients.data));
                     mix(masked_shape ? 1U : 0U);
+                    if (std::getenv("NINFER_LAYER_GRAPH_DEBUG") != nullptr &&
+                        moe.stream->bank_index() == 0) {
+                        static std::uint32_t shown = 0;
+                        if (shown++ < 24) {
+                            std::fprintf(stderr,
+                                         "[ar-key] bank=0 h=%p res=%p mask=%p sh=%p key=%016llx\n",
+                                         static_cast<const void*>(hidden.data),
+                                         static_cast<const void*>(residual.data),
+                                         moe.stream->resident_mask(),
+                                         static_cast<const void*>(shared_coefficients.data),
+                                         static_cast<unsigned long long>(key));
+                            std::fflush(stderr);
+                        }
+                    }
                     graphs.run(moe.stream->bank_index(), key, execution.stream, all_resident_run);
                     if (std::getenv("NINFER_LAYER_GRAPH_REPORT") != nullptr) {
                         static std::uint64_t calls = 0;
