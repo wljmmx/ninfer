@@ -747,13 +747,43 @@ void ExpertStream::probe_device_tables(const char* where, const void* device_ids
         host_placement ^= word;
         host_placement *= 1099511628211ULL;
     }
+    // The last input the kernel has that no table hash covers: the bytes at the address the table
+    // names. Same offset on a different base, or a different payload at the same offset, both read
+    // as "identical addressing" from the tables alone.
+    const auto base = reinterpret_cast<const std::byte*>(experts_.bank.gate_up.codes);
+    const auto down_base = reinterpret_cast<const std::byte*>(experts_.bank.down.codes);
+    std::int32_t first_id = -1;
+    std::uint64_t slot_off = ~std::uint64_t{0};
+    if (device_ids != nullptr) {
+        if (cudaMemcpy(&first_id, device_ids, sizeof(first_id), cudaMemcpyDeviceToHost) !=
+            cudaSuccess) {
+            (void)cudaGetLastError();
+            first_id = -1;
+        }
+    }
+    if (first_id >= 0 && static_cast<std::size_t>(first_id) < count_) {
+        std::vector<std::uint64_t> offs(count_);
+        if (cudaMemcpy(offs.data(), offsets_device_->p, count_ * sizeof(std::uint64_t),
+                       cudaMemcpyDeviceToHost) == cudaSuccess) {
+            slot_off = offs[static_cast<std::size_t>(first_id)];
+        } else {
+            (void)cudaGetLastError();
+        }
+    }
+    // NOTE: `codes + offsets[e]` is NOT the expert's payload - measuring it reads zero padding and
+    // reports the same hash for different experts. Sampling the weights needs the plane addressing
+    // (stride/layout), so this probe deliberately stops at the pointers and the offset value.
     std::fprintf(stderr,
                  "[devtab] seq=%u where=%s offsets=%016llx mask=%016llx host_offsets=%016llx "
-                 "host_flags=%016llx ids=%016llx placement=%016llx\n",
+                 "host_flags=%016llx ids=%016llx placement=%016llx gu=%p dn=%p hgu=%p id=%d "
+                 "off=%llu\n",
                  seq, where, static_cast<unsigned long long>(offsets),
                  static_cast<unsigned long long>(mask), static_cast<unsigned long long>(hoffs),
                  static_cast<unsigned long long>(hflags), static_cast<unsigned long long>(ids),
-                 static_cast<unsigned long long>(host_placement));
+                 static_cast<unsigned long long>(host_placement), static_cast<const void*>(base),
+                 static_cast<const void*>(down_base),
+                 static_cast<const void*>(experts_.bank.gate_up.host_codes), first_id,
+                 static_cast<unsigned long long>(slot_off));
     std::fflush(stderr);
 }
 
@@ -1190,6 +1220,10 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         // Settle the stream the way the full path does. The copy pool publishes and settles in one
         // place; a layer that returns without it can leave the uploader's staging ownership open.
         if (cache_ != nullptr) { cache_->wait_for_progress(stream); }
+        // The pool upload runs on the cache's own stream. A stream-local sync cannot order it
+        // against this layer's kernel; a device-wide one can. The read-back the full path pays for
+        // ends in cudaStreamSynchronize, so nobody ever noticed which of the two it was covering.
+        if (std::getenv("NINFER_STATIC_FAST_DEV_SYNC") != nullptr) { (void)cudaDeviceSynchronize(); }
         // Timing probe: the full path synchronises the stream because it reads the routes back. The
         // fast path removes that barrier; if anything wrote the tier asynchronously just before this
         // layer, the kernel could read it before it lands. One sync tells the difference.
