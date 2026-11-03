@@ -1068,12 +1068,14 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
     std::optional<HostRoutedFetch> early;
     const auto fetch_begin = std::chrono::steady_clock::now();
     seg_pre_ms = std::chrono::duration<double, std::milli>(fetch_begin - t_layer_begin).count();
-    // Opt-in for now: the skip removes the ~0.5 ms read-back (measured 116 tok/s against 36), but
-    // the result diverges - the layer no longer sees the ids on the host, and something the
-    // all_resident branch still depends on (the covered decision, the mask publish or the pool
-    // refresh) goes with them. NINFER_STATIC_FAST enables it for the next bisect.
     const bool static_covered =
         std::getenv("NINFER_STATIC_FAST") != nullptr && moe.stream->static_covered();
+    // Bisect switch: with PARTIAL set, ffn still skips its own read-back but ensure() runs its full
+    // path (and does the copy itself). If that matches the baseline, the divergence is in what
+    // ensure() was skipping (pool refresh / placement); if it does not, it is the empty id list the
+    // all_resident branch now decides on.
+    const bool static_skip_ensure =
+        static_covered && std::getenv("NINFER_STATIC_FAST_PARTIAL") == nullptr;
     if (!o1_skip_armed() && !moe.stream->fully_resident() && !static_covered) {
         // Which shape to ask for is a measurement, not a policy: the controller already tracks how
         // many experts a layer has to move, and a pool that misses almost nothing only needs the ids.
@@ -1146,7 +1148,7 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
         const bool assume_covered        = device_verdict && o1_skip_armed();
         if (!moe.stream->ensure(ids.data, routed.top_k, columns, execution.stream,
                                 early ? early->ids.data() : nullptr,
-                                assume_covered || static_covered)) {
+                                assume_covered || static_skip_ensure)) {
             // The pool cannot hold this layer: the shared expert still runs on the device (subset
             // None touches only the shared term), and the routed term moves to the host tier.
             // Keep the shared term in FP32 so that the host fallback can fold it into the same

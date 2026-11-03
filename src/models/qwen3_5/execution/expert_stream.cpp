@@ -696,7 +696,7 @@ void ExpertStream::refresh_static_candidates() {
 // halves during the transition, which is the CPU divergence the gate exists to catch. One stall at
 // the boundary is the honest trade until the backfill can be shown to be complete before a layer
 // needs it.
-void ExpertStream::freeze_now(std::uint32_t /*tokens*/) {
+void ExpertStream::freeze_now(std::uint32_t /*tokens*/, cudaStream_t stream) {
     if (frozen_ || host_ == nullptr || cache_ == nullptr) { return; }
     if (freeze_trace()) {
         std::fprintf(stderr, "[freeze] bank=%u enter clock=%llu\n", bank_,
@@ -1057,7 +1057,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 std::fflush(stderr);
             }
         } else if (!frozen_ && freeze_after_ != 0 && freeze_clock_ >= freeze_after_) {
-            freeze_now(tokens);
+            freeze_now(tokens, stream);
         }
     }
     // Q10 probe (see static_probe): why this layer was not static. Filled in the split branch, printed
@@ -1102,7 +1102,8 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     // decide all_resident. This branch only removes ensure's own work; it is taken when the caller
     // already knows coverage (O1's device verdict) or when the frozen table covers the whole bank.
     if ((assume_covered ||
-         (std::getenv("NINFER_STATIC_FAST") != nullptr && static_covered())) &&
+         (std::getenv("NINFER_STATIC_FAST") != nullptr &&
+          std::getenv("NINFER_STATIC_FAST_PARTIAL") == nullptr && static_covered())) &&
         !fully) {
         ++gh1_static_calls_;
         ++gh1_no_miss_calls_;
@@ -1112,6 +1113,13 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         ++gh1_capt_free_calls_;
         ++gh1_capt_ready_calls_;
         last_cost_ = StepCost{};
+        // Re-assert the frozen pool set. It is idempotent when nothing moved, and it is the one part
+        // of the skipped path that can differ: an expert that could not get a pool slot at the
+        // freeze is not in S either, so it would be uncovered for every later layer.
+        if (cache_ != nullptr && !frozen_wanted_.empty()) {
+            (void)cache_->set_resident_experts(bank_, frozen_wanted_,
+                                               static_cast<std::uint32_t>(frozen_wanted_.size()));
+        }
         rebase_window();
         // The layer skipped its placement pass, so the holds that pass would rotate must still
         // happen once per layer - otherwise a later re-freeze (which refuses to reset held slots)
@@ -2116,7 +2124,20 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                                          std::span<const std::int32_t>(host_targets),
                                          hot_score_.data());
                     if (host_->bank_slot_generation(bank_) != static_table_generation_) {
-                        publish_static_table();
+    publish_static_table();
+    // Upload the whole frozen pool set now. `set_resident_experts` only names the slots; the images
+    // arrive lazily through prepare() on the layer that routes to them. A later layer that skips
+    // ensure() would otherwise read another expert's bytes for any member whose image never landed -
+    // measured as a wrong hash with the fast path on and correct with the full path.
+    if (cache_ != nullptr && !frozen_wanted_.empty()) {
+        std::vector<ExpertCacheKey> preload;
+        preload.reserve(frozen_wanted_.size());
+        for (const auto expert : frozen_wanted_) {
+            if (expert < keys_.size()) { preload.push_back(keys_[expert]); }
+        }
+        cache_->prepare(std::span<const ExpertCacheKey>(preload), stream);
+        cache_->wait_for_progress(stream);
+    }
                     }
                 }
             } else {

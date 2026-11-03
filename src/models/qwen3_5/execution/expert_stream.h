@@ -617,7 +617,7 @@ private:
     bool freeze_table_published_ = false;
     std::uint64_t freeze_membership_moves_ = 0;
     std::uint64_t freeze_report_layers_ = 0;
-    void freeze_now(std::uint32_t tokens);
+    void freeze_now(std::uint32_t tokens, cudaStream_t stream);
     std::uint32_t* coverage_word_device_ = nullptr;
     bool coverage_word_checked_          = false;
     // O1's counter: mapped, so the skip is counted where it happens. `miss_lag_` is the host total
