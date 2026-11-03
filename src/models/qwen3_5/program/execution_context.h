@@ -145,6 +145,24 @@ void target_verify_forward(ExecutionCore&, TextContext&, TargetVerifyFrameView,
                            ops::CausalAttentionExecutionEnvelope);
 void target_accept(ExecutionCore&, Tensor& continuation_hidden_store, TargetVerifyFrameView);
 
+// Q67/S1: the host arrays one merged prefill pass needs. Rectangular by construction: `width` columns
+// by `batch` rows, with each row's own valid-column count, own KV address row and own state slots.
+struct PrefillBatchPass {
+    std::span<const std::int32_t> ids;
+    std::span<const std::int32_t> positions;
+    std::span<const std::int32_t> rope_positions;
+    std::span<const std::int32_t> valid_columns;
+    std::span<const std::int32_t> kv_table_rows;
+    std::span<const std::int32_t> state_source_slots;
+    std::span<const std::int32_t> state_destination_slots;
+    std::int32_t width = 0;
+    std::int32_t batch = 0;
+};
+
+void prefill_batch_pass(ExecutionCore& execution, TextContext& card, const PrefillBatchPass& pass,
+                        ops::CausalAttentionExecutionEnvelope envelope, Tensor& logits,
+                        Tensor& tokens);
+
 [[nodiscard]] PrefillChunkResult prefill_text_chunk(PrefillContext& state,
                                                     std::span<const TokenId> ids,
                                                     std::uint32_t nominal_length,

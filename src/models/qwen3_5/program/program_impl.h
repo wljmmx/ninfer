@@ -777,7 +777,12 @@ public:
                                    std::span<execution::PrefillRow> out);
     // Prints the rows a merged pass would use. Lives here so the row type stays out of the engine's
     // headers; the engine only passes lane ids.
-    void report_prefill_rows(std::span<const std::uint32_t> lanes);    void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
+        void report_prefill_rows(std::span<const std::uint32_t> lanes);
+    // Q67/S1 step 2: run one merged pass over the lanes that still have an interior chunk (a chunk
+    // that does not finish their prompt). Interior chunks only, deliberately: the final chunk is what
+    // produces a request's pending token, and that path stays exactly as it is. Returns true when a
+    // merged pass ran, so the caller skips the single-lane dispatch.
+    bool advance_prefill_batch();    void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                        std::span<const std::uint32_t> starts,
                                        std::span<const std::uint32_t> counts);
     void validate_licensed_tokens(std::span<const TokenId> tokens) const;

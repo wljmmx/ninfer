@@ -299,6 +299,15 @@ void ProgramImpl::report_prefill_rows(std::span<const std::uint32_t> lanes) {
     std::fflush(stderr);
 }
 
+bool ProgramImpl::advance_prefill_batch() {
+    // Q67/S1: the merged pass is implemented (TextContext::prefill_batch, committed), but the Program
+    // side still needs two things this file cannot supply on its own: the TextContext handle the
+    // execution layer expects, and device buffers for the [vocab, batch] logits tail. Until those are
+    // wired, the caller keeps the single-lane dispatch: eturn false is the honest answer, and the
+    // env switch stays off by default.
+    return false;
+}
+
 runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     std::span<const std::uint32_t> lanes, std::span<const std::uint32_t> accepted_tokens,
     std::span<const std::uint8_t> terminal, std::span<const std::uint8_t> discarded,
