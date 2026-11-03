@@ -625,6 +625,9 @@ private:
     // Diagnostic: a hash of the two host-side tables the kernel's addressing is built from, so a
     // fast path and a full path can be compared at the same layer instead of at the output.
     void probe_tables(const char* where) const;
+    // Diagnostic: the same hashes read back from the DEVICE tables the kernel actually reads. A
+    // matching host copy does not prove these match - they are written by the placement expansion.
+    void probe_device_tables(const char* where, const void* device_ids, std::size_t id_values) const;
     std::uint32_t* coverage_word_device_ = nullptr;
     bool coverage_word_checked_          = false;
     // O1's counter: mapped, so the skip is counted where it happens. `miss_lag_` is the host total

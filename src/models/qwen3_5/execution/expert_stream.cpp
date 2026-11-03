@@ -715,6 +715,48 @@ void ExpertStream::probe_tables(const char* where) const {
     std::fflush(stderr);
 }
 
+void ExpertStream::probe_device_tables(const char* where, const void* device_ids,
+                                       std::size_t id_values) const {
+    if (std::getenv("NINFER_DEVICE_TABLE_PROBE") == nullptr || bank_ != 0) { return; }
+    if (!offsets_device_ || !mask_device_ || !host_offsets_device_ || !host_flags_device_) { return; }
+    static std::uint32_t shown = 0;
+    if (shown >= 48) { return; }
+    const auto seq = shown++;
+    const auto hash_of = [](const void* device, std::size_t bytes) {
+        std::vector<std::uint8_t> host(bytes);
+        if (cudaMemcpy(host.data(), device, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return std::uint64_t{0};
+        }
+        std::uint64_t h = 1469598103934665603ULL;
+        for (const auto byte : host) {
+            h ^= byte;
+            h *= 1099511628211ULL;
+        }
+        return h;
+    };
+    const auto offsets = hash_of(offsets_device_->p, count_ * sizeof(std::uint64_t));
+    const auto mask    = hash_of(mask_device_->p, count_ * sizeof(std::int32_t));
+    const auto hoffs   = hash_of(host_offsets_device_->p, count_ * sizeof(std::uint64_t));
+    const auto hflags  = hash_of(host_flags_device_->p, count_ * sizeof(std::int32_t));
+    const auto ids     = device_ids == nullptr
+                             ? std::uint64_t{0}
+                             : hash_of(device_ids, id_values * sizeof(std::int32_t));
+    std::uint64_t host_placement = 1469598103934665603ULL;
+    for (const auto word : placement_) {
+        host_placement ^= word;
+        host_placement *= 1099511628211ULL;
+    }
+    std::fprintf(stderr,
+                 "[devtab] seq=%u where=%s offsets=%016llx mask=%016llx host_offsets=%016llx "
+                 "host_flags=%016llx ids=%016llx placement=%016llx\n",
+                 seq, where, static_cast<unsigned long long>(offsets),
+                 static_cast<unsigned long long>(mask), static_cast<unsigned long long>(hoffs),
+                 static_cast<unsigned long long>(hflags), static_cast<unsigned long long>(ids),
+                 static_cast<unsigned long long>(host_placement));
+    std::fflush(stderr);
+}
+
 void ExpertStream::freeze_now(std::uint32_t /*tokens*/, cudaStream_t stream) {
     if (frozen_ || host_ == nullptr || cache_ == nullptr) { return; }
     if (freeze_trace()) {
@@ -1160,6 +1202,8 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         // could never proceed.
         if (host_ != nullptr) { host_->begin_layer(); }
         probe_tables("fast");
+        probe_device_tables("fast", device_ids,
+                            static_cast<std::size_t>(top_k) * static_cast<std::size_t>(tokens));
         return true;
     }
     const auto values = static_cast<std::size_t>(top_k) * static_cast<std::size_t>(tokens);
@@ -2385,6 +2429,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                     // could drop a slot the Device still addressed.
                     host_->hold_slots(placed_slots_);
                     probe_tables("full");
+                    probe_device_tables("full", device_ids, values);
                     if (std::getenv("NINFER_PUBLISH_PROBE") != nullptr &&
                         (moved_pool + moved_s + moved_d + moved_c + moved_p + moved_absent) != 0) {
                         static std::uint32_t shown = 0;
