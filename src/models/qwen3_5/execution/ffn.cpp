@@ -1068,6 +1068,75 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
     std::optional<HostRoutedFetch> early;
     const auto fetch_begin = std::chrono::steady_clock::now();
     seg_pre_ms = std::chrono::duration<double, std::milli>(fetch_begin - t_layer_begin).count();
+    // Input probe, same counter as the output one: tells whether a differing output layer already
+    // had a differing input (then the MoE is innocent and the difference is upstream).
+    if (std::getenv("NINFER_LAYER_OUT_PROBE") != nullptr &&
+        moe.stream->bank_index() == 0) {
+        static std::uint32_t shown_in = 0;
+        if (shown_in < 400) {
+            const auto bytes = static_cast<std::size_t>(hidden.ne[0]) *
+                               static_cast<std::size_t>(hidden.ne[1]) * 2U;
+            std::vector<std::uint8_t> host(bytes);
+            if (cudaMemcpyAsync(host.data(), hidden.data, bytes, cudaMemcpyDeviceToHost,
+                                execution.stream) == cudaSuccess) {
+                (void)cudaStreamSynchronize(execution.stream);
+                std::uint64_t h = 1469598103934665603ULL;
+                for (const auto byte : host) {
+                    h ^= byte;
+                    h *= 1099511628211ULL;
+                }
+                std::fprintf(stderr, "[in] n=%u bank=0 hash=%016llx cols=%d\n", shown_in,
+                             static_cast<unsigned long long>(h), hidden.ne[0]);
+                // Same layer, the other two inputs the MoE reads: the residual it adds into, and
+                // the route ids.
+                const auto res_bytes = static_cast<std::size_t>(residual.ne[0]) *
+                                       static_cast<std::size_t>(residual.ne[1]) * 2U;
+                std::vector<std::uint8_t> res_host(res_bytes);
+                const auto id_bytes = static_cast<std::size_t>(routes.ids.ne[0]) *
+                                      static_cast<std::size_t>(routes.ids.ne[1]) * 4U;
+                std::vector<std::uint8_t> id_host(id_bytes);
+                auto fnv = [](const std::vector<std::uint8_t>& bytes) {
+                    std::uint64_t value = 1469598103934665603ULL;
+                    for (const auto byte : bytes) {
+                        value ^= byte;
+                        value *= 1099511628211ULL;
+                    }
+                    return value;
+                };
+                if (cudaMemcpyAsync(res_host.data(), residual.data, res_bytes,
+                                    cudaMemcpyDeviceToHost, execution.stream) == cudaSuccess &&
+                    cudaMemcpyAsync(id_host.data(), routes.ids.data, id_bytes,
+                                    cudaMemcpyDeviceToHost, execution.stream) == cudaSuccess) {
+                    (void)cudaStreamSynchronize(execution.stream);
+                    std::fprintf(stderr, "[pre] n=%u residual=%016llx ids=%016llx top_k=%d tok=%d\n",
+                                 shown_in, static_cast<unsigned long long>(fnv(res_host)),
+                                 static_cast<unsigned long long>(fnv(id_host)), routes.ids.ne[0],
+                                 routes.ids.ne[1]);
+                    // The shared-gate coefficients are the last input of the layer. If these match
+                    // too, the kernel call is identical and the difference is inside the kernel.
+                    const auto sc_bytes = static_cast<std::size_t>(shared_coefficients.ne[0]) *
+                                          static_cast<std::size_t>(shared_coefficients.ne[1]) * 4U;
+                    std::vector<std::uint8_t> sc_host(sc_bytes);
+                    if (cudaMemcpyAsync(sc_host.data(), shared_coefficients.data, sc_bytes,
+                                        cudaMemcpyDeviceToHost, execution.stream) == cudaSuccess) {
+                        (void)cudaStreamSynchronize(execution.stream);
+                        std::fprintf(stderr, "[pre] n=%u shared_coeff=%016llx elems=%d\n", shown_in,
+                                     static_cast<unsigned long long>(fnv(sc_host)),
+                                     shared_coefficients.ne[0] * shared_coefficients.ne[1]);
+                    } else {
+                        (void)cudaGetLastError();
+                    }
+                    std::fflush(stderr);
+                } else {
+                    (void)cudaGetLastError();
+                }
+                std::fflush(stderr);
+            } else {
+                (void)cudaGetLastError();
+            }
+            ++shown_in;
+        }
+    }
     const bool static_covered =
         std::getenv("NINFER_STATIC_FAST") != nullptr && moe.stream->static_covered();
     // Bisect switch: with PARTIAL set, ffn still skips its own read-back but ensure() runs its full
@@ -1630,6 +1699,40 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
                     timeline_gpu_begin(execution.stream);
                     all_resident_run();
                     timeline_gpu_end(execution.stream);
+                }
+                // Probe: the fast path removes the per-layer D2H barrier, so the host can run ahead
+                // of the Device. A sync after the launch says whether that run-ahead is what changes
+                // the result (it would mean a buffer reused before its reader finished).
+                if (std::getenv("NINFER_STATIC_FAST_TAIL_SYNC") != nullptr) {
+                    (void)cudaStreamSynchronize(execution.stream);
+                }
+                // Layer-level localisation: hash this layer's output for bank 0. Comparing two runs
+                // line by line names the first layer whose arithmetic differs, which is the only
+                // thing that can distinguish "wrong table" from "wrong input" from "wrong shape".
+                if (std::getenv("NINFER_LAYER_OUT_PROBE") != nullptr &&
+                    moe.stream->bank_index() == 0) {
+                    static std::uint32_t shown = 0;
+                    if (shown < 400) {
+                        const auto bytes = static_cast<std::size_t>(residual.ne[0]) *
+                                           static_cast<std::size_t>(residual.ne[1]) * 2U;
+                        std::vector<std::uint8_t> host(bytes);
+                        if (cudaMemcpyAsync(host.data(), residual.data, bytes,
+                                            cudaMemcpyDeviceToHost, execution.stream) ==
+                                cudaSuccess) {
+                            (void)cudaStreamSynchronize(execution.stream);
+                            std::uint64_t h = 1469598103934665603ULL;
+                            for (const auto byte : host) {
+                                h ^= byte;
+                                h *= 1099511628211ULL;
+                            }
+                            std::fprintf(stderr, "[out] n=%u bank=0 hash=%016llx cols=%d\n", shown,
+                                         static_cast<unsigned long long>(h), residual.ne[0]);
+                            std::fflush(stderr);
+                        } else {
+                            (void)cudaGetLastError();
+                        }
+                        ++shown;
+                    }
                 }
             } catch (const std::exception& error) {
                 throw std::invalid_argument(std::string("expert stream run: ") + error.what());
