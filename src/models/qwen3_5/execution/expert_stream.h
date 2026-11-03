@@ -615,6 +615,10 @@ private:
     // address, so the ids are not an input to the residency decision.
     bool freeze_covers_all_ = false;
     bool freeze_table_published_ = false;
+    // Members of the frozen device set that the pool could not give a slot. Non-zero means the set
+    // does not actually live where the placement says, and `covers_all` must stay false: forcing
+    // `all_resident` over a route to one of these reads another expert's bytes.
+    std::uint32_t freeze_pool_missing_ = 0;
     std::uint64_t freeze_membership_moves_ = 0;
     std::uint64_t freeze_report_layers_ = 0;
     void freeze_now(std::uint32_t tokens, cudaStream_t stream);

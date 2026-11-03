@@ -766,15 +766,21 @@ void ExpertStream::freeze_now(std::uint32_t /*tokens*/, cudaStream_t stream) {
     // static layer would need; kept as a counter, not as a branch (see the note at the covered
     // check: the 0.5 ms fetch is in ffn, not in ensure).
     const auto device = std::min<std::uint32_t>(cache_->resident_capacity(), count_);
-    freeze_covers_all_ =
-        (freeze_members_ == count_ - device) && (freeze_present_ == freeze_members_);
+    std::uint32_t pool_missing = 0;
+    for (const auto expert : frozen_wanted_) {
+        if (!cache_->expert_slot(bank_, expert)) { ++pool_missing; }
+    }
+    freeze_pool_missing_ = pool_missing;
+    freeze_covers_all_ = (freeze_members_ == count_ - device) &&
+                         (freeze_present_ == freeze_members_) && (pool_missing == 0);
     publish_static_table();
     std::fprintf(stderr,
                  "[freeze] bank=%u state=frozen device=%zu host_static=%u present=%u d=%u c=%u "
-                 "p=%u covers_all=%d clock=%llu\n",
+                 "p=%u covers_all=%d pool_missing=%u clock=%llu\n",
                  bank_, frozen_wanted_.size(), freeze_members_, freeze_present_,
                  host_->dynamic_slots_per_bank(), host_->second_chance_per_bank(),
                  host_->prefetch_slots_per_bank(), int(freeze_covers_all_),
+                 freeze_pool_missing_,
                  static_cast<unsigned long long>(freeze_clock_));
     std::fflush(stderr);
     ++freeze_membership_moves_; // the one move a set is allowed: the move into the freeze
@@ -1120,6 +1126,9 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             (void)cache_->set_resident_experts(bank_, frozen_wanted_,
                                                static_cast<std::uint32_t>(frozen_wanted_.size()));
         }
+        // Settle the stream the way the full path does. The copy pool publishes and settles in one
+        // place; a layer that returns without it can leave the uploader's staging ownership open.
+        if (cache_ != nullptr) { cache_->wait_for_progress(stream); }
         rebase_window();
         // The layer skipped its placement pass, so the holds that pass would rotate must still
         // happen once per layer - otherwise a later re-freeze (which refuses to reset held slots)
@@ -2848,13 +2857,14 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         const auto& host_stats = host_ != nullptr ? host_->stats() : HostExpertResidency::Stats{};
         std::fprintf(stderr,
                      "[freeze] summary layers=%llu frozen=%d members=%u present=%u moves=%llu "
-                     "route_cpu=%llu static_drops=%llu evictions=%llu\n",
+                     "route_cpu=%llu static_drops=%llu evictions=%llu pool_missing=%u\n",
                      static_cast<unsigned long long>(freeze_report_layers_), int(frozen_),
                      freeze_members_, freeze_present_,
                      static_cast<unsigned long long>(freeze_membership_moves_),
                      static_cast<unsigned long long>(route_cpu_),
                      static_cast<unsigned long long>(host_stats.static_drops),
-                     static_cast<unsigned long long>(host_stats.evictions));
+                     static_cast<unsigned long long>(host_stats.evictions),
+                     freeze_pool_missing_);
         std::fflush(stderr);
     }
     // port (sm_89): D1 read-ahead, in three pieces that are now separate on purpose.
