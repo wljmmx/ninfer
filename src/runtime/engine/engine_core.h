@@ -2571,10 +2571,13 @@ private:
                         std::fflush(stderr);
                     }
                     if (prefill_batch_verbose_) {
+                        // Every lane the Program still owes prefill work, not just the ones this pass
+                        // would dispatch: a lane held by a capture is exactly a lane a merged pass
+                        // would want to include, and filtering on runnable_units_ hid that.
                         std::array<std::uint32_t, kMaximumConcurrency> ids{};
                         std::size_t id_count = 0;
                         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-                            if (!prefill_slots[lane]) { continue; }
+                            if (instance_.program->prefill_remaining(lane) == 0) { continue; }
                             ids[id_count++] = lane;
                         }
                         instance_.program->report_prefill_rows(
