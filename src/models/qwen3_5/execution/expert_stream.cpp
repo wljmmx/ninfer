@@ -1215,7 +1215,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     // decide all_resident. This branch only removes ensure's own work; it is taken when the caller
     // already knows coverage (O1's device verdict) or when the frozen table covers the whole bank.
     if ((assume_covered ||
-         (std::getenv("NINFER_STATIC_FAST") != nullptr &&
+         (std::getenv("NINFER_STATIC_FAST_OFF") == nullptr &&
           std::getenv("NINFER_STATIC_FAST_PARTIAL") == nullptr && static_covered())) &&
         !fully) {
         ++gh1_static_calls_;

@@ -1137,8 +1137,13 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
             ++shown_in;
         }
     }
-    const bool static_covered =
-        std::getenv("NINFER_STATIC_FAST") != nullptr && moe.stream->static_covered();
+    // On by default wherever the freeze holds: `static_covered()` is a promise that every route has
+    // an address, and since the boundary materialises the set (`pool_unready == 0`) it is now also a
+    // promise that those addresses hold the right bytes. Measured at 12 GiB, 256 tokens: same hash and
+    // the same PPL as the full path, 6.25 s against 8.02 s. The switch stays so the comparison is one
+    // env away, and so the controller can still turn it off per deployment.
+    static const bool static_fast_off = std::getenv("NINFER_STATIC_FAST_OFF") != nullptr;
+    const bool static_covered = !static_fast_off && moe.stream->static_covered();
     // Bisect switch: with PARTIAL set, ffn still skips its own read-back but ensure() runs its full
     // path (and does the copy itself). If that matches the baseline, the divergence is in what
     // ensure() was skipping (pool refresh / placement); if it does not, it is the empty id list the
