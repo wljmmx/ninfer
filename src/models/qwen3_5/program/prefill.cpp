@@ -226,7 +226,20 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle handle,
 runtime::PrefillStepResult
 ProgramImpl::advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* failed_timing) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
-    return advance_prefill(active_sequence(lane), requests[lane], failed_timing);
+    // Q67/S1 step 0, the probe that decides the next change: does a lane keep its remaining tokens
+    // across loop passes, or does one call drain the whole prompt? NINFER_PREFILL_BATCH=all logs
+    // every call, because the question is the cadence, not an average.
+    const bool trace  = std::getenv("NINFER_PREFILL_BATCH") != nullptr &&
+                        std::getenv("NINFER_PREFILL_BATCH")[0] == 'a';
+    const std::uint32_t before = trace ? prefill_remaining(lane) : 0;
+    auto result                = advance_prefill(active_sequence(lane), requests[lane], failed_timing);
+    if (trace) {
+        std::fprintf(stderr, "[prefill-call] lane=%u before=%u processed=%u after=%u complete=%d\n",
+                     lane, before, result.processed_prompt_tokens,
+                     prefill_remaining(lane), result.complete ? 1 : 0);
+        std::fflush(stderr);
+    }
+    return result;
 }
 
 runtime::ExecutionTiming ProgramImpl::resolve_prefill_raw(std::uint32_t lane, bool terminal,

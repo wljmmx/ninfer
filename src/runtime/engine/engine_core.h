@@ -2571,7 +2571,28 @@ private:
                         std::fflush(stderr);
                     }
                 }
-                if (const auto lane = scheduler_.next_prefill(prefill_slots, max_concurrency_)) {
+                // Q67/S1 step 0, second half: admission runs behind prefill. A queued lane is bound
+                // only after the lane before it has finished its head chunk, so two lanes are never
+                // both at "a full chunk of work" at the same dispatch (the per-call trace shows
+                // 1570 -> 546 -> 7 for one lane while the next lane's 1570 starts only after that
+                // lane is down to its 7-token tail). Holding the prefill dispatch for a pass while
+                // a queued lane can still be bound is what puts two heads in the same pass; it is
+                // opt-in until it has been measured.
+                bool hold_prefill = false;
+                if (prefill_admit_first_) {
+                    const bool can_bind =
+                        free_lane() && !admission_deferred_ &&
+                        !instance_.program->has_context_transaction();
+                    if (can_bind) {
+                        std::lock_guard lock(queue_mutex_);
+                        hold_prefill = !pending_.empty();
+                    }
+                }
+                if (hold_prefill) {
+                    // A deliberate pass, not an idle one: the loop must not sleep waiting for work
+                    // it just chose not to do.
+                    executed = true;
+                } else if (const auto lane = scheduler_.next_prefill(prefill_slots, max_concurrency_)) {
                     const auto request = slots_[*lane];
                     set_host_work_class(HostWorkClass::Prefill);
                     if (request->is_replaying()) {
@@ -2656,6 +2677,8 @@ private:
     // Q67/S1: read once, so the report costs a pointer comparison per prefill pass and nothing on
     // the decode path. NINFER_PREFILL_BATCH prints what a merged prefill would be.
     bool prefill_batch_report_ = std::getenv("NINFER_PREFILL_BATCH") != nullptr;
+    // Q67/S1: opt-in "admit before prefilling" hold; see the prefill dispatch.
+    bool prefill_admit_first_ = std::getenv("NINFER_PREFILL_ADMIT_FIRST") != nullptr;
     // "all" (or any value starting with 'a') prints every dispatch instead of the first few.
     bool prefill_batch_verbose_ = [] {
         const char* value = std::getenv("NINFER_PREFILL_BATCH");
