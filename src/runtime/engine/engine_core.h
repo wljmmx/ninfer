@@ -2552,7 +2552,11 @@ private:
                     const auto fit = models::qwen3_5::execution::prefill_batch_fit(
                         std::span<const std::uint32_t>(remaining.data(), queued));
                     ++prefill_batch_reports_;
-                    if (prefill_batch_reports_ <= 8 || prefill_batch_reports_ % 32 == 0) {
+                    // NINFER_PREFILL_BATCH=all prints every dispatch, not just the first few: a
+                    // sampled report hid whether the later dispatches already see two ready lanes,
+                    // and that is the whole question this counter exists to answer.
+                    if (prefill_batch_verbose_ || prefill_batch_reports_ <= 8 ||
+                        prefill_batch_reports_ % 32 == 0) {
                         std::fprintf(stderr,
                                      "[prefill-batch] queued=%zu pick=%d lanes=%zu "
                                      "merged=%.0fms separate=%.0fms | engine_prefill=%zu "
@@ -2652,6 +2656,11 @@ private:
     // Q67/S1: read once, so the report costs a pointer comparison per prefill pass and nothing on
     // the decode path. NINFER_PREFILL_BATCH prints what a merged prefill would be.
     bool prefill_batch_report_ = std::getenv("NINFER_PREFILL_BATCH") != nullptr;
+    // "all" (or any value starting with 'a') prints every dispatch instead of the first few.
+    bool prefill_batch_verbose_ = [] {
+        const char* value = std::getenv("NINFER_PREFILL_BATCH");
+        return value != nullptr && (value[0] == 'a' || value[0] == 'A');
+    }();
     std::uint64_t prefill_batch_reports_ = 0;
     // Q67/S1: admission probe counters, see try_admit_one.
     std::uint64_t admit_probe_calls_   = 0;
