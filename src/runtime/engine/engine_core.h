@@ -2513,11 +2513,17 @@ private:
                 // out of the hot path entirely.
                 if (prefill_batch_report_) {
                     std::array<std::uint32_t, kMaximumConcurrency> remaining{};
-                    std::size_t queued = 0;
+                    std::size_t queued      = 0;
+                    std::size_t engine_state = 0;  // engine says prefilling
+                    std::size_t capture_held = 0;  // ...but a capture has not landed yet
+                    std::size_t bound_ready   = 0;  // Program agrees the lane still has a chunk
                     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                         if (!prefill_slots[lane]) { continue; }
+                        if (prefill_slots[lane]->is_prefilling()) { ++engine_state; }
+                        if (prefill_slots[lane]->capture_pending) { ++capture_held; }
                         const std::uint32_t left = instance_.program->prefill_remaining(lane);
                         if (left == 0) { continue; }
+                        ++bound_ready;
                         remaining[queued++] = left;
                     }
                     const auto fit = models::qwen3_5::execution::prefill_batch_fit(
@@ -2526,9 +2532,10 @@ private:
                     if (prefill_batch_reports_ <= 8 || prefill_batch_reports_ % 32 == 0) {
                         std::fprintf(stderr,
                                      "[prefill-batch] queued=%zu pick=%d lanes=%zu "
-                                     "merged=%.0fms separate=%.0fms\n",
+                                     "merged=%.0fms separate=%.0fms | engine_prefill=%zu "
+                                     "capture_held=%zu bound_ready=%zu\n",
                                      queued, fit.width, fit.lanes, fit.merged_ms,
-                                     fit.separate_ms);
+                                     fit.separate_ms, engine_state, capture_held, bound_ready);
                         std::fflush(stderr);
                     }
                 }
