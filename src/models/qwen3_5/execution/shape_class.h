@@ -20,7 +20,14 @@
 namespace ninfer::models::qwen3_5::execution {
 
 inline constexpr std::int32_t kDecodeShapeClasses[] = {1, 2, 4, 8};
-inline constexpr std::int32_t kPrefillShapeClasses[] = {1024, 2048, 4096};
+// Q67/S1: the prefill ladder starts at 16, not at 128. A batch of queued prompts has to be padded up
+// to a class, and the old set - {1024, 2048, 4096} - turned four 26-token prompts into a 1024-row
+// pass, which the measurements say is slower than running them one by one (5.1 s against 4.9 s).
+// 16 is the floor because an sm_89 MMA tile is 16 rows (m16n8k16): a narrower class would still
+// issue a 16-row tile, so 8 and below buy nothing. 1 is deliberately absent - the single-request path
+// must stay bit-identical, and that is decode_class_for(1)'s job, not this ladder's.
+inline constexpr std::int32_t kPrefillShapeClasses[] = {16,  32,  64,   128,  256,
+                                                        512, 1024, 2048, 4096};
 
 // Smallest class that can hold `width`, or `width` itself when it is already a class. A width above
 // the largest class is returned unchanged: the caller has to either split it or raise the class set,
@@ -46,5 +53,15 @@ static_assert(decode_class_for(3) == 4);
 static_assert(prefill_class_for(1024) == 1024);
 static_assert(prefill_class_for(1025) == 2048);
 static_assert(prefill_class_for(5000) == 5000);
+// The small end of the ladder, pinned one boundary at a time: these are the widths a merged prefill
+// will actually ask for, and an off-by-one here is a 2x pass for nothing.
+static_assert(prefill_class_for(1) == 16);
+static_assert(prefill_class_for(16) == 16);
+static_assert(prefill_class_for(17) == 32);
+static_assert(prefill_class_for(64) == 64);
+static_assert(prefill_class_for(65) == 128);
+static_assert(prefill_class_for(104) == 128);
+static_assert(prefill_class_for(256) == 256);
+static_assert(prefill_class_for(500) == 512);
 
 } // namespace ninfer::models::qwen3_5::execution
