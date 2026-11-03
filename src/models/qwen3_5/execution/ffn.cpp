@@ -1068,7 +1068,13 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
     std::optional<HostRoutedFetch> early;
     const auto fetch_begin = std::chrono::steady_clock::now();
     seg_pre_ms = std::chrono::duration<double, std::milli>(fetch_begin - t_layer_begin).count();
-    if (!o1_skip_armed() && !moe.stream->fully_resident()) {
+    // Opt-in for now: the skip removes the ~0.5 ms read-back (measured 116 tok/s against 36), but
+    // the result diverges - the layer no longer sees the ids on the host, and something the
+    // all_resident branch still depends on (the covered decision, the mask publish or the pool
+    // refresh) goes with them. NINFER_STATIC_FAST enables it for the next bisect.
+    const bool static_covered =
+        std::getenv("NINFER_STATIC_FAST") != nullptr && moe.stream->static_covered();
+    if (!o1_skip_armed() && !moe.stream->fully_resident() && !static_covered) {
         // Which shape to ask for is a measurement, not a policy: the controller already tracks how
         // many experts a layer has to move, and a pool that misses almost nothing only needs the ids.
         // A pool that misses often would pay the second transfer on top of the first, so it gets the
@@ -1139,7 +1145,8 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
         static const bool device_verdict = std::getenv("NINFER_O1_DEVICE") != nullptr;
         const bool assume_covered        = device_verdict && o1_skip_armed();
         if (!moe.stream->ensure(ids.data, routed.top_k, columns, execution.stream,
-                                early ? early->ids.data() : nullptr, assume_covered)) {
+                                early ? early->ids.data() : nullptr,
+                                assume_covered || static_covered)) {
             // The pool cannot hold this layer: the shared expert still runs on the device (subset
             // None touches only the shared term), and the routed term moves to the host tier.
             // Keep the shared term in FP32 so that the host fallback can fold it into the same
@@ -1305,7 +1312,7 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
         // Split layer: the pool holds the experts this layer routes to most, the host tier covers
         // the rest. Both halves land in FP32 and are folded into the residual once, so a split
         // layer rounds exactly like a resident or a fully hosted one.
-        auto fetch           = std::move(*early);
+        auto fetch           = early ? std::move(*early) : HostRoutedFetch{};
         const auto mask_host = moe.stream->resident_mask_host();
         // A layer that only brought the ids down has to fetch the rest now: the host half needs x,
         // the residual before the layer, and the coefficients. This is the case the cheap shape was

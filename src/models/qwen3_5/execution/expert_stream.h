@@ -261,6 +261,12 @@ public:
     void thaw();
     [[nodiscard]] bool frozen() const noexcept { return frozen_; }
     [[nodiscard]] bool freeze_mode() const noexcept { return freeze_mode_; }
+    // The layer can run without `fetch_host_routed`: the frozen device set plus S cover the bank and
+    // the table of that placement is on the Device. ffn reads this once per layer; it is the only
+    // place the ~0.5 ms read-back can be removed.
+    [[nodiscard]] bool static_covered() const noexcept {
+        return freeze_covers_all_ && freeze_table_published_;
+    }
     // Reserved for a captured expert table: a capture cannot read a host tally, so that design has
     // to count its misses on the device. Null until such a capture exists.
     [[nodiscard]] const std::uint32_t* device_miss_counter() const noexcept { return nullptr; }
@@ -604,6 +610,11 @@ private:
     bool thaw_on_request_ = false;
     std::uint32_t freeze_members_ = 0;
     std::uint32_t freeze_present_ = 0;
+    // Device set ∪ S covers the bank, and the placement that belongs to it has been published. Only
+    // then can a layer run without the route ids reaching the host: every route already has an
+    // address, so the ids are not an input to the residency decision.
+    bool freeze_covers_all_ = false;
+    bool freeze_table_published_ = false;
     std::uint64_t freeze_membership_moves_ = 0;
     std::uint64_t freeze_report_layers_ = 0;
     void freeze_now(std::uint32_t tokens);

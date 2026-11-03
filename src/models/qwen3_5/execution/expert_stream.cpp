@@ -746,6 +746,7 @@ void ExpertStream::freeze_now(std::uint32_t /*tokens*/) {
     }
     frozen_         = true;
     static_frozen_  = true;
+    freeze_table_published_ = false;
     freeze_members_ = static_cast<std::uint32_t>(candidates.size());
     if (host_->static_slots_per_bank() != 0) { host_->set_static_frozen(bank_, false); }
     if (!candidates.empty()) {
@@ -765,7 +766,7 @@ void ExpertStream::freeze_now(std::uint32_t /*tokens*/) {
     // static layer would need; kept as a counter, not as a branch (see the note at the covered
     // check: the 0.5 ms fetch is in ffn, not in ensure).
     const auto device = std::min<std::uint32_t>(cache_->resident_capacity(), count_);
-    const bool covers_all =
+    freeze_covers_all_ =
         (freeze_members_ == count_ - device) && (freeze_present_ == freeze_members_);
     publish_static_table();
     std::fprintf(stderr,
@@ -773,7 +774,7 @@ void ExpertStream::freeze_now(std::uint32_t /*tokens*/) {
                  "p=%u covers_all=%d clock=%llu\n",
                  bank_, frozen_wanted_.size(), freeze_members_, freeze_present_,
                  host_->dynamic_slots_per_bank(), host_->second_chance_per_bank(),
-                 host_->prefetch_slots_per_bank(), int(covers_all),
+                 host_->prefetch_slots_per_bank(), int(freeze_covers_all_),
                  static_cast<unsigned long long>(freeze_clock_));
     std::fflush(stderr);
     ++freeze_membership_moves_; // the one move a set is allowed: the move into the freeze
@@ -805,6 +806,8 @@ void ExpertStream::thaw() {
     static_frozen_  = false;
     freeze_clock_   = 0;
     freeze_present_ = 0;
+    freeze_covers_all_ = false;
+    freeze_table_published_ = false;
     frozen_wanted_.clear();
     static_member_.assign(count_, 0);
     // The stripe returns to warm-up: its fill may churn again until the next freeze rewrites it.
@@ -1095,11 +1098,12 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     // dirty (3-44 routes), every token was replayed, and decode went from 6.4/7.5 to 12.0/11.6 ms a
     // token. Nothing here is silent about it - the step gate counts the routes this skips - but the
     // numbers say the claim is false, not that the detection is weak.
-    // Note: an "ensure skips the read-back when the frozen set covers the bank" variant was tried
-    // and reverted. It saved ~0.03 ms a layer, because the 0.5 ms fetch is NOT here - ffn reads the
-    // ids to pack the split and decide `all_resident`, and that call site is the one to change. The
-    // variant also diverged when the pool still held the warm-up set, so it was the wrong lever.
-    if (assume_covered && !fully) {
+    // Note: the ~0.5 ms fetch is NOT in this function - ffn reads the ids to pack the split and
+    // decide all_resident. This branch only removes ensure's own work; it is taken when the caller
+    // already knows coverage (O1's device verdict) or when the frozen table covers the whole bank.
+    if ((assume_covered ||
+         (std::getenv("NINFER_STATIC_FAST") != nullptr && static_covered())) &&
+        !fully) {
         ++gh1_static_calls_;
         ++gh1_no_miss_calls_;
         // Same reason as the pinned path: coverage was established on the Device and this call only
@@ -1109,6 +1113,10 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         ++gh1_capt_ready_calls_;
         last_cost_ = StepCost{};
         rebase_window();
+        // The layer skipped its placement pass, so the holds that pass would rotate must still
+        // happen once per layer - otherwise a later re-freeze (which refuses to reset held slots)
+        // could never proceed.
+        if (host_ != nullptr) { host_->begin_layer(); }
         return true;
     }
     const auto values = static_cast<std::size_t>(top_k) * static_cast<std::size_t>(tokens);
@@ -2421,6 +2429,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                             std::fflush(stderr);
                         }
                         placement_published_ = placement_;
+                        if (frozen_ && static_frozen_) { freeze_table_published_ = true; }
                         placement_dirty_     = false;
                         ++publish_calls_;
                     }
