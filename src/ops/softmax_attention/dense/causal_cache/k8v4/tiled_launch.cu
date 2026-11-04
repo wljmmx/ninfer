@@ -11,13 +11,13 @@
 namespace ninfer::ops::detail {
 void k8v4_kv_tiled_attention(const CausalAttentionOperands& p, K8V4KvReadView cache,
                              CausalKvPartition partition, WorkspaceArena& workspace,
-                             cudaStream_t stream) {
+                             Tensor* page_score, cudaStream_t stream) {
     auto scope = workspace.scope();
     const auto partial =
         allocate_causal_partials(workspace, p.query_heads, p.width, partition.capacity, 1);
     const auto invoke = [&]<class G>() {
         launch_mxfp8_kv_tiled_mma<G, K8V4KvTiledInstance, K8V4KvTiledValues>(
-            p, cache, partition, partial.view(), stream);
+            p, cache, partition, partial.view(), page_score, stream);
         launch_causal_tiled_merge<G, true>(p, cache.valid_columns, partition, partial.view(),
                                            stream);
     };

@@ -375,7 +375,7 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
 
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
         detail::fp8_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                        cache, envelope, workspace, out, execution);
+                                        cache, envelope, workspace, out, execution, page_score);
         return;
     }
 
@@ -401,7 +401,7 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
 #if defined(NINFER_ENABLE_K8V4)
         detail::k8v4_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                         cache, envelope, workspace, out, execution);
+                                         cache, envelope, workspace, out, execution, page_score);
         return;
 #else
         throw std::invalid_argument(
@@ -532,5 +532,6 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
 }
 
 } // namespace ninfer::ops
+
 
 

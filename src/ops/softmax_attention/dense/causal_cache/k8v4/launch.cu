@@ -128,7 +128,7 @@ void k8v4_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& positions, const Tensor& valid, const Tensor& rows,
                               float scale, PagedKVBatchLayerView cache,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-                              Tensor& out, DeviceExecutionView execution) {
+                              Tensor& out, DeviceExecutionView execution, Tensor* page_score) {
     const cudaStream_t stream = execution.stream;
     const auto plan           = make_k8v4_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
                                                          execution.multiprocessor_count);
@@ -138,7 +138,7 @@ void k8v4_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         const auto view =
             make_quantized_causal_cache_view<K8V4KvCacheView<false>>(cache, &valid, &rows);
         if (plan.family == K8V4KvFamily::Tiled)
-            k8v4_kv_tiled_attention(p, view, plan.partition, workspace, stream);
+            k8v4_kv_tiled_attention(p, view, plan.partition, workspace, page_score, stream);
         else
             execute_parallel(p, view, plan, workspace, stream);
     } else {
@@ -161,7 +161,7 @@ void k8v4_kv_cached_attention(const Tensor& q, const Tensor& positions, float sc
         k8v4_kv_tiled_attention(
             make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),
             make_quantized_causal_cache_view<K8V4KvCacheView<false>>(view), plan.partition,
-            workspace, stream);
+            workspace, nullptr, stream);
     else if (plan.family == K8V4KvFamily::ParallelGrouped)
         execute_parallel(make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),
                          make_quantized_causal_cache_view<K8V4KvCacheView<false>>(view), plan,

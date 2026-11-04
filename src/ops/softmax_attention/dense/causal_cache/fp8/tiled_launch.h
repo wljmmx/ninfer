@@ -5,5 +5,6 @@
 
 namespace ninfer::ops::detail {
 void fp8_kv_tiled_attention(const CausalAttentionOperands&, Fp8KvReadView, CausalKvPartition,
-                            WorkspaceArena&, cudaStream_t);
+                            WorkspaceArena&, Tensor*, cudaStream_t);
 } // namespace ninfer::ops::detail
+

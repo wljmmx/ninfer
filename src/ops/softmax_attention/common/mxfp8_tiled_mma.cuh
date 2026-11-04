@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ops/kernel/page_score_codec.cuh"
 #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
 #include "ops/softmax_attention/common/causal_epilogue.cuh"
@@ -19,7 +20,9 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
     const std::uint8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
     const typename Values::Scale* __restrict__ cache_v_scale, Metadata metadata,
     const std::int32_t* __restrict__ positions, float scale, std::int32_t width,
-    CausalKvPartition partition, CausalPartialView partial) {
+    CausalKvPartition partition, CausalPartialView partial, unsigned* __restrict__ page_scores,
+    unsigned* __restrict__ page_scores_recent, std::int32_t score_row_span, float score_tolerance,
+    std::int32_t score_mass) {
     constexpr int D             = 256;
     constexpr int Br            = Schedule::kQueryRows;
     constexpr int Bc            = Schedule::kKeyRows;
@@ -62,6 +65,13 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
     const int end_owned_tile        = (split + 1) * logical_tiles / active_splits;
     const int base_pos              = positions[0];
     const std::int32_t* block_table = metadata.block_table();
+    // P6 2c: the same planes the INT8 family records. Split-local semantics by design: each split
+    // owns a disjoint range of key tiles, so a page is voted on once, against this split's running
+    // max - which is exactly what int8/grouped_mma.cuh does.
+    unsigned* const counters = page_scores != nullptr ? page_scores : metadata.counters();
+    unsigned* const recent   = metadata.recents();
+    const int score_row_begin =
+        ninfer::ops::paged_kv_page_score_row_begin(positions[width - 1], score_row_span);
     const int tile_rows             = min(Br, tokens - q0);
     const int max_query_abs         = base_pos + q0 + tile_rows - 1;
     const int key_blocks = max(0, min(end_owned_tile, max_query_abs / Bc + 1) - first_owned_tile);
@@ -321,6 +331,28 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
         }
         bm0 = warp_max<4>(bm0, FullMask);
         bm1 = warp_max<4>(bm1, FullMask);
+
+        // P6 2c: split-local vote, same shape as int8/grouped_mma.cuh. `m0/m1` is this split's running
+        // max, `bm` the current key tile's; one lane per row pair does the add.
+        if ((counters != nullptr || recent != nullptr) && current_tile_present && lid == 0) {
+            if (m0 != -CUDART_INF_F || m1 != -CUDART_INF_F) {
+                const int every = (bm0 > m0 - score_tolerance ? 1 : 0) +
+                                  (bm1 > m1 - score_tolerance ? 1 : 0);
+                if (every > 0 && counters != nullptr) {
+                    atomicAdd(counters + (k0 >> kPagedKVPageShift), static_cast<unsigned>(every));
+                }
+                if (score_row_span > 0 && recent != nullptr && score_mass == 0) {
+                    const bool vote0 = qabs0 >= score_row_begin;
+                    const bool vote1 = qabs1 >= score_row_begin;
+                    const int newest = (vote0 && bm0 > m0 - score_tolerance ? 1 : 0) +
+                                       (vote1 && bm1 > m1 - score_tolerance ? 1 : 0);
+                    if (newest > 0) {
+                        atomicAdd(recent + (k0 >> kPagedKVPageShift),
+                                  static_cast<unsigned>(newest));
+                    }
+                }
+            }
+        }
 
         const float alpha0     = update_softmax(m0, bm0);
         const float alpha1     = update_softmax(m1, bm1);

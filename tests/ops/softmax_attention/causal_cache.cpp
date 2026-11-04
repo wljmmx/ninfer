@@ -2785,13 +2785,17 @@ int run_verify_width_cases(DeviceExecutionView execution, KvCacheStorage storage
         for (int width : {32, 64, 128, 256})
             for (int batch : {2, 4}) failures += run(width, batch, 0, false);
     }
-    // P6 2c: bind a page-score matrix and require the kernel to have recorded something. BF16 used to
-    // leave the planes at zero, which made an evict policy reading them fall back to a pure window.
-    if (storage == KvCacheStorage::BFloat16) {
-        // W=256 is four key tiles: the first one has no running max yet (the vote is gated on it), so a
-        // single-tile prompt would legitimately record nothing.
+    // P6 2c: bind a page-score matrix and require the kernel to have recorded something. BF16 and INT8
+    // cover the wide-batch path (B=2); FP8 and K8V4 do not have a wide-batch kernel yet, so they are
+    // probed on the single-row tiled path, which is the one they actually use.
+    if (storage == KvCacheStorage::BFloat16 || storage == KvCacheStorage::Int8Group64) {
         BatchAttentionCase scored{256, {0, 17}, {256, 255}, {0, 1}, MappingPattern::Fragmented, 9001u,
                                   false};
+        scored.check_scores = true;
+        failures += run_batch_case(execution, kGeometries[0], storage, scored);
+    } else if (storage == KvCacheStorage::Fp8E4M3Row256 ||
+               storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+        BatchAttentionCase scored{256, {0}, {256}, {0}, MappingPattern::Fragmented, 9002u, false};
         scored.check_scores = true;
         failures += run_batch_case(execution, kGeometries[0], storage, scored);
     }
