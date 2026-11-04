@@ -8,7 +8,7 @@
 #error "int8 KV scoring kernels: include via int8/template_launch.cuh, from int8/launch.cu (P6 2c C3)"
 #endif
 
-#include "ops/softmax_attention/dense/causal_cache/int8/tile_io.cuh"`r`n#include "ops/kernel/page_score_codec.cuh"
+#include "ops/softmax_attention/dense/causal_cache/int8/tile_io.cuh"
 #include "ops/kernel/page_score_codec.cuh"
 
 #include "ops/kernel/e8_root_codec.cuh"

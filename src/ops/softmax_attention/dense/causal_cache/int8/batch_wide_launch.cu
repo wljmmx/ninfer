@@ -4,7 +4,7 @@
 // the explicit registration the P6 2c guard asks for; nothing about the dump changes.
 #define NINFER_INT8_KV_SCORING_OWNER
 
-#include "ops/softmax_attention/dense/causal_cache/int8/batch_wide_mma.cuh"`r`n#include "ops/softmax_attention/dense/causal_cache/int8/instances.h"
+#include "ops/softmax_attention/dense/causal_cache/int8/batch_wide_mma.cuh"
 #include "ops/softmax_attention/dense/causal_cache/int8/instances.h"
 
 #include "core/device.h"
