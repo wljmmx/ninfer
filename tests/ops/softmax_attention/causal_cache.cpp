@@ -2609,6 +2609,7 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
         failures += verify_attention(label, bf16_bits_to_double(output), reference,
                                      attention_criterion(storage));
         failures += verify_invalid_columns_zero(label, output, geometry, width, valid);
+
         failures += cache.verify(label, expected);
         failures += cache.verify_untouched(label, before, positions, lanes, valid, width);
         if (control) {
@@ -2759,6 +2760,13 @@ int run_verify_width_cases(DeviceExecutionView execution, KvCacheStorage storage
     for (int width : {7, 8, 9, 16})
         for (int batch : {1, 8}) failures += run(width, batch, 127, true);
     failures += run(16, 8, 2048, true);
+    // Wide batch: B>1 with W>16 runs on the dedicated batch-wide kernel (batch_wide_mma.cuh). Only the
+    // BF16 layout has that kernel; the compressed layouts still refuse the shape in their plans.
+    if (storage == KvCacheStorage::BFloat16) {
+
+        for (int width : {32, 64, 128, 256})
+            for (int batch : {2, 4}) failures += run(width, batch, 0, false);
+    }
     for (int width : {8, 9, 16}) {
         failures +=
             run_a1_case(execution, kGeometries[0], storage,
@@ -3322,3 +3330,9 @@ int run_softmax_attention_causal_cache_tests(std::optional<KvCacheStorage> selec
     }
     return failures ? 1 : 0;
 }
+
+
+
+
+
+

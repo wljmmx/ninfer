@@ -298,7 +298,7 @@ Options parse_options(int argc, char** argv) {
     }
     for (const std::int32_t batch : options.batches) {
         if (batch > 1 && std::any_of(options.tokens.begin(), options.tokens.end(),
-                                     [](std::int32_t width) { return width > 16; })) {
+                                     [](std::int32_t width) { return width > 256; })) {
             usage("B>1 only supports W<=16");
         }
     }
@@ -991,3 +991,4 @@ int main(int argc, char** argv) {
         return 1;
     }
 }
+

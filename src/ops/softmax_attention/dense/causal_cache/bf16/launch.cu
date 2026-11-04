@@ -1,4 +1,5 @@
 #include "ops/softmax_attention/dense/causal_cache/bf16/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/bf16/batch_wide_launch.h"
 #include "ops/softmax_attention/dense/causal_cache/bf16/template_launch.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/plan.h"
 #include "ops/kv_cache/append/launch.h"
@@ -87,6 +88,14 @@ void bf16_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                               Tensor& out, DeviceExecutionView execution) {
     const cudaStream_t stream = execution.stream;
+    // B > 1 with W > 16 has its own kernel; neither the grouped path (narrow batch) nor the tiled path
+    // (single row) is asked to absorb this shape.
+    if (q.ne[3] > 1 && q.ne[2] > 16) {
+        kv_cache_append_batch_launch(k, v, positions, valid_columns, table_rows, cache, stream);
+        bf16_kv_batch_wide_attention(q, positions, valid_columns, table_rows, scale, cache, envelope,
+                                     out, execution);
+        return;
+    }
     const auto plan           = make_bf16_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
                                                          execution.multiprocessor_count);
     if (!plan.grouped()) {
@@ -119,3 +128,8 @@ void bf16_kv_cached_attention(const Tensor& q, const Tensor& positions, float sc
     }
 }
 } // namespace ninfer::ops::detail
+
+
+
+
+

@@ -232,8 +232,7 @@ void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions
     const std::int32_t kv_heads = geometry.kv_heads;
     const std::int32_t width    = q.ne[2];
     const std::int32_t batch    = q.ne[3];
-    if (width <= 0 || batch <= 0 || batch > kMaximumBatchSize ||
-        (batch > 1 && width > kMaximumVerifyTokens)) {
+    if (width <= 0 || batch <= 0 || batch > kMaximumBatchSize) {
         throw std::invalid_argument(std::string(op) + ": unsupported B/W domain");
     }
     require_shape(q, kHeadDim, q_heads, width, batch, op, "q");
@@ -273,13 +272,20 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
     } catch (const std::invalid_argument&) { supported_dtype = false; }
     if (execution.multiprocessor_count <= 0 || !supported_dtype || batch_size <= 0 ||
         batch_size > kMaximumBatchSize || min_width <= 0 || max_width < min_width ||
-        (batch_size > 1 && max_width > kMaximumVerifyTokens) || envelope.min_visible_keys == 0 ||
+        envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
         envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys) {
         throw std::invalid_argument(
             "causal_softmax_attention workspace: invalid profile or interval");
     }
 
+    // A batch wider than the verify width runs on the dedicated wide-batch kernel, which keeps no
+    // split-K partials: its workspace is empty. Other layouts still refuse that shape in their plans.
+    if (batch_size > 1 && max_width > kMaximumVerifyTokens) {
+        if (cache_storage == KvCacheStorage::BFloat16) { return 0; }
+        throw std::invalid_argument(
+            "causal_softmax_attention workspace: invalid profile or interval");
+    }
     if (cache_storage == KvCacheStorage::BFloat16)
         return detail::bf16_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
                                                execution.multiprocessor_count);
@@ -526,3 +532,4 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
 }
 
 } // namespace ninfer::ops
+

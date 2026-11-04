@@ -102,6 +102,52 @@ __global__ void kv_cache_append_full_bf16_kernel(const __nv_bfloat16* __restrict
     store_vec(&cache_v[cache_off], v_value);
 }
 
+// Batched twin of kv_cache_append_full_bf16_kernel. The single-row kernel reads positions[0] and takes
+// no batch offset, so a B>1 append through it silently writes one row; fp8 and int8 already have a
+// batch kernel, bf16 did not.
+template <typename Geometry, bool Masked>
+__launch_bounds__(256) __global__
+    void kv_cache_append_full_bf16_batch_kernel(const __nv_bfloat16* __restrict__ k,
+                                                const __nv_bfloat16* __restrict__ v,
+                                                const std::int32_t* __restrict__ positions,
+                                                PagedKVBatchMetadata<Masked> metadata,
+                                                __nv_bfloat16* __restrict__ cache_k,
+                                                __half* __restrict__ cache_v, std::int32_t width) {
+    constexpr int VecElems = 8;
+    const int batch        = blockIdx.z;
+    metadata.table_rows += batch;
+    if constexpr (Masked) metadata.valid_columns += batch;
+    const int tokens       = metadata.valid_tokens(width);
+    const std::int64_t idx = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::int64_t n   = static_cast<std::int64_t>(tokens) * Geometry::KVHeads *
+                           (kKVCacheAppendFullHeadDim / VecElems);
+    if (idx >= n) return;
+
+    const int vec      = static_cast<int>(idx % (kKVCacheAppendFullHeadDim / VecElems));
+    const int tmp      = static_cast<int>(idx / (kKVCacheAppendFullHeadDim / VecElems));
+    const int kv_head  = tmp % Geometry::KVHeads;
+    const int token    = tmp / Geometry::KVHeads;
+    const int d        = vec * VecElems;
+    // positions is [B][W]: a row starts at batch*width.
+    const int position = positions[batch * width] + token;
+    const int lane     = static_cast<int>(threadIdx.x) & 31;
+    const std::int32_t* block_table = metadata.block_table();
+    int physical_page               = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
+    // q/k/v are [B][W][D*KVHeads], so the row block comes first.
+    const std::int64_t src_off =
+        static_cast<std::int64_t>(batch) * width * kKVCacheAppendFullHeadDim * Geometry::KVHeads +
+        static_cast<std::int64_t>(d) +
+        static_cast<std::int64_t>(kKVCacheAppendFullHeadDim) * (kv_head + Geometry::KVHeads * token);
+    const int4 k_value = load_vec<int4>(&k[src_off]);
+    const int4 v_value = bf16x8_bits_to_f16x8_bits(load_vec<int4>(&v[src_off]));
+    physical_page      = __shfl_sync(0xffffffffu, physical_page, 0);
+    const std::int64_t cache_off =
+        paged_kv_element_offset<kKVCacheAppendFullHeadDim, Geometry::KVHeads>(
+            physical_page, kv_head, position & kPagedKVPageMask, d);
+    store_vec(&cache_k[cache_off], k_value);
+    store_vec(&cache_v[cache_off], v_value);
+}
+
 template <typename Geometry, typename Metadata>
 __launch_bounds__(256) __global__
     void kv_cache_append_full_fp8_kernel(const __nv_bfloat16* __restrict__ k,
