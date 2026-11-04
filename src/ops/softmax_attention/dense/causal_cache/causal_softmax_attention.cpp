@@ -282,7 +282,7 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
     // A batch wider than the verify width runs on the dedicated wide-batch kernel, which keeps no
     // split-K partials: its workspace is empty. Other layouts still refuse that shape in their plans.
     if (batch_size > 1 && max_width > kMaximumVerifyTokens) {
-        if (cache_storage == KvCacheStorage::BFloat16) { return 0; }
+        if (cache_storage == KvCacheStorage::BFloat16 || cache_storage == KvCacheStorage::Int8Group64) { return 0; }
         throw std::invalid_argument(
             "causal_softmax_attention workspace: invalid profile or interval");
     }
@@ -532,4 +532,5 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
 }
 
 } // namespace ninfer::ops
+
 

@@ -2760,10 +2760,9 @@ int run_verify_width_cases(DeviceExecutionView execution, KvCacheStorage storage
     for (int width : {7, 8, 9, 16})
         for (int batch : {1, 8}) failures += run(width, batch, 127, true);
     failures += run(16, 8, 2048, true);
-    // Wide batch: B>1 with W>16 runs on the dedicated batch-wide kernel (batch_wide_mma.cuh). Only the
-    // BF16 layout has that kernel; the compressed layouts still refuse the shape in their plans.
-    if (storage == KvCacheStorage::BFloat16) {
-
+    // Wide batch: B>1 with W>16 runs on the dedicated batch-wide kernel. BF16 and INT8 both have it;
+    // the compressed layouts still refuse the shape in their plans.
+    if (storage == KvCacheStorage::BFloat16 || storage == KvCacheStorage::Int8Group64) {
         for (int width : {32, 64, 128, 256})
             for (int batch : {2, 4}) failures += run(width, batch, 0, false);
     }

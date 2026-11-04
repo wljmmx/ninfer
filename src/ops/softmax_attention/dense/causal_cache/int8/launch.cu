@@ -9,6 +9,11 @@
 #include "ops/kv_cache/append/launch.h"
 
 namespace ninfer::ops::detail {
+
+// Defined in batch_wide_launch.cu: the wide-batch kernel is a second, explicitly registered scoring
+// owner so it can live in its own translation unit without splitting the counter planes.
+void int8_kv_batch_wide_attention(const CausalAttentionOperands& p, Int8KvReadView cache,
+                                  Tensor* page_score, cudaStream_t stream);
 namespace {
 
 template <class G, int Tokens, class Input, bool Writable>
@@ -444,6 +449,16 @@ void int8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                               Tensor& out, DeviceExecutionView execution, Tensor* page_score) {
     const cudaStream_t stream = execution.stream;
+    // B > 1 with W > 16 has its own kernel; the append is the shared batched one and the attention is
+    // read-only over the same view the tiled path uses.
+    if (q.ne[3] > 1 && q.ne[2] > 16) {
+        kv_cache_append_batch_launch(k, v, positions, valid, rows, cache, stream);
+        const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
+        const auto view =
+            make_quantized_causal_cache_view<Int8KvCacheView<false>>(cache, &valid, &rows);
+        int8_kv_batch_wide_attention(p, view, page_score, stream);
+        return;
+    }
     const auto plan           = make_int8_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
                                                          execution.multiprocessor_count);
     if (plan.family != Int8KvFamily::Grouped) {
