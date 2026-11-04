@@ -102,7 +102,10 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_batch_wide_mma_kern
     const int base_pos              = positions[static_cast<std::int64_t>(b) * width];
     const std::int32_t* block_table = metadata.block_table();
     // The relevance-counter row of this CTA, resolved exactly like block_table (appendix CA.2/CA.3).
-    unsigned* const counters = page_score != nullptr ? page_score : metadata.counters();
+    // The caller's override binds the matrix base, so it takes the same row offset the metadata's
+    // own plane would; without it every request votes into row 0 and the heat map loses a request.
+    unsigned* const counters =
+        page_score != nullptr ? page_score + metadata.score_offset() : metadata.counters();
     // P6 2c B4 (appendix DN): the oldest query row allowed to vote. `width` is this call's token count,
     // so `base_pos + width - 1` is its last token; span 0 - the default - admits every row.
     const int score_row_begin =

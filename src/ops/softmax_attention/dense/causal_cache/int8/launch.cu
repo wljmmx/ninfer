@@ -11,9 +11,20 @@
 namespace ninfer::ops::detail {
 
 // Defined in batch_wide_launch.cu: the wide-batch kernel is a second, explicitly registered scoring
-// owner so it can live in its own translation unit without splitting the counter planes.
+// owner so it can live in its own translation unit without splitting the counter planes. The rk
+// layouts run the same kernel with their own read-back codecs, so each one is registered here too.
 void int8_kv_batch_wide_attention(const CausalAttentionOperands& p, Int8KvReadView cache,
                                   Tensor* page_score, cudaStream_t stream);
+void rk4v4_kv_batch_wide_attention(const CausalAttentionOperands& p, Int8KvReadView cache,
+                                   Tensor* page_score, cudaStream_t stream);
+void rk8v4_kv_batch_wide_attention(const CausalAttentionOperands& p, Int8KvReadView cache,
+                                   Tensor* page_score, cudaStream_t stream);
+void rk4v4e8_kv_batch_wide_attention(const CausalAttentionOperands& p, Int8KvReadView cache,
+                                     Tensor* page_score, cudaStream_t stream);
+void rk4v2e8_kv_batch_wide_attention(const CausalAttentionOperands& p, Int8KvReadView cache,
+                                     Tensor* page_score, cudaStream_t stream);
+void rk2v4e8_kv_batch_wide_attention(const CausalAttentionOperands& p, Int8KvReadView cache,
+                                     Tensor* page_score, cudaStream_t stream);
 namespace {
 
 template <class G, int Tokens, class Input, bool Writable>
@@ -535,6 +546,16 @@ void rk4v4_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v
                                CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                                Tensor& out, DeviceExecutionView execution, Tensor* page_score) {
     const cudaStream_t stream = execution.stream;
+    // B > 1 with W > 16 belongs to the batch-wide kernel; its read-back has to select the same rk
+    // codec the tiled branch does, and the append is the same standalone one.
+    if (q.ne[3] > 1 && q.ne[2] > 16) {
+        kv_cache_append_rk4v4_batch_launch(k, v, positions, valid, rows, cache, stream);
+        const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
+        const auto view =
+            make_quantized_causal_cache_view<Int8KvCacheView<false>>(cache, &valid, &rows);
+        rk4v4_kv_batch_wide_attention(p, view, page_score, stream);
+        return;
+    }
     auto plan           = make_int8_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
                                                           execution.multiprocessor_count);
     if (plan.family == Int8KvFamily::Grouped) {
@@ -591,6 +612,16 @@ void rk8v4_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v
                                Tensor& out, DeviceExecutionView execution, Tensor* page_score) {
     // rk8v4 = 8-bit K (no packing) + 4-bit V (PackedV=true, PackedK=false).
     const cudaStream_t stream = execution.stream;
+    // B > 1 with W > 16 belongs to the batch-wide kernel; its read-back has to select the same rk
+    // codec the tiled branch does, and the append is the same standalone one.
+    if (q.ne[3] > 1 && q.ne[2] > 16) {
+        kv_cache_append_rk8v4_batch_launch(k, v, positions, valid, rows, cache, stream);
+        const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
+        const auto view =
+            make_quantized_causal_cache_view<Int8KvCacheView<false>>(cache, &valid, &rows);
+        rk8v4_kv_batch_wide_attention(p, view, page_score, stream);
+        return;
+    }
     auto plan           = make_int8_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
                                                           execution.multiprocessor_count);
     if (plan.family == Int8KvFamily::Grouped) {
@@ -644,6 +675,16 @@ void rk4v4e8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor&
                                  WorkspaceArena& workspace, Tensor& out,
                                  DeviceExecutionView execution, Tensor* page_score) {
     const cudaStream_t stream = execution.stream;
+    // B > 1 with W > 16 belongs to the batch-wide kernel; its read-back has to select the same rk
+    // codec the tiled branch does, and the append is the same standalone one.
+    if (q.ne[3] > 1 && q.ne[2] > 16) {
+        kv_cache_append_rk4v4e8_batch_launch(k, v, positions, valid, rows, cache, stream);
+        const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
+        const auto view =
+            make_quantized_causal_cache_view<Int8KvCacheView<false>>(cache, &valid, &rows);
+        rk4v4e8_kv_batch_wide_attention(p, view, page_score, stream);
+        return;
+    }
     auto plan           = make_int8_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
                                                           execution.multiprocessor_count);
     if (plan.family == Int8KvFamily::Grouped) {
@@ -697,6 +738,16 @@ void rk4v2e8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor&
                                  WorkspaceArena& workspace, Tensor& out,
                                  DeviceExecutionView execution, Tensor* page_score) {
     const cudaStream_t stream = execution.stream;
+    // B > 1 with W > 16 belongs to the batch-wide kernel; its read-back has to select the same rk
+    // codec the tiled branch does, and the append is the same standalone one.
+    if (q.ne[3] > 1 && q.ne[2] > 16) {
+        kv_cache_append_rk4v2e8_batch_launch(k, v, positions, valid, rows, cache, stream);
+        const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
+        const auto view =
+            make_quantized_causal_cache_view<Int8KvCacheView<false>>(cache, &valid, &rows);
+        rk4v2e8_kv_batch_wide_attention(p, view, page_score, stream);
+        return;
+    }
     auto plan           = make_int8_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
                                                           execution.multiprocessor_count);
     if (plan.family == Int8KvFamily::Grouped) {
@@ -750,8 +801,18 @@ void rk2v4e8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor&
                                  WorkspaceArena& workspace, Tensor& out,
                                  DeviceExecutionView execution, Tensor* page_score) {
     const cudaStream_t stream = execution.stream;
+    // B > 1 with W > 16 belongs to the batch-wide kernel; its read-back has to select the same rk
+    // codec the tiled branch does, and the append is the same standalone one.
+    if (q.ne[3] > 1 && q.ne[2] > 16) {
+        kv_cache_append_rk2v4e8_batch_launch(k, v, positions, valid, rows, cache, stream);
+        const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
+        const auto view =
+            make_quantized_causal_cache_view<Int8KvCacheView<false>>(cache, &valid, &rows);
+        rk2v4e8_kv_batch_wide_attention(p, view, page_score, stream);
+        return;
+    }
     auto plan           = make_int8_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
-                                                           execution.multiprocessor_count);
+                                                          execution.multiprocessor_count);
     if (plan.family == Int8KvFamily::Grouped) {
         rk_execute_grouped<CausalAppendInput, RkVariant::E8Root>(
             q, positions, scale, cache, &valid, &rows,

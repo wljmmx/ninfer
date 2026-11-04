@@ -54,20 +54,24 @@ inline std::int32_t kv_page_score_mass() {
     return on;
 }
 
-template <class G, class S>
+// The rk layouts reuse this kernel unchanged: only the cache read-back codec differs, exactly as in
+// rk_tiled. PackedV also halves the V slot, so it has to reach the smem request as well.
+template <class G, class S, bool PackedV = false, bool PackedK = false, bool E8Root = false,
+          bool V8Root = false, bool E8Lattice = false>
 void launch_wide(const CausalAttentionOperands& p, Int8KvReadView cache, Tensor* page_score,
                  cudaStream_t stream) {
     validate_quantized_causal_operands<G>(p, cache);
     const auto invoke = [&]<class Metadata>(Metadata metadata) {
-        constexpr auto kernel = int8_kv_batch_wide_mma_kernel<G, S, Metadata>;
-        const auto status     = cudaFuncSetAttribute(kernel,
-                                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                     Int8KvTiledSmemBytes<S, false>::kBytes);
+        constexpr auto kernel = int8_kv_batch_wide_mma_kernel<G, S, Metadata, PackedV, PackedK,
+                                                              E8Root, V8Root, E8Lattice>;
+        constexpr int kSmem   = Int8KvTiledSmemBytes<S, PackedV>::kBytes;
+        const auto status =
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
         CUDA_CHECK(status);
         const dim3 grid(div_up(p.width, S::kQueryRows), G::QHeads, p.batch);
         unsigned* const override_scores =
             page_score != nullptr ? static_cast<unsigned*>(page_score->data) : nullptr;
-        kernel<<<grid, S::kThreads, Int8KvTiledSmemBytes<S, false>::kBytes, stream>>>(
+        kernel<<<grid, S::kThreads, kSmem, stream>>>(
             p.q, cache.keys, cache.values, cache.key_scales, cache.value_scales, metadata,
             p.positions, p.scale, p.out, override_scores, p.width, cache.page_scores_recent,
             kv_page_score_row_span(), kv_page_score_tolerance(), kv_page_score_mass());
@@ -91,6 +95,59 @@ void int8_kv_batch_wide_attention(const CausalAttentionOperands& p, Int8KvReadVi
         launch_wide<CausalD256H24Kv4, Int8KvTiledInstance>(p, cache, page_score, stream);
     else
         launch_wide<CausalD256H16Kv2, Int8KvTiledInstance>(p, cache, page_score, stream);
+}
+
+// rk8v4: 8-bit K + int4 V (PackedV only).
+void rk8v4_kv_batch_wide_attention(const CausalAttentionOperands& p, Int8KvReadView cache,
+                                   Tensor* page_score, cudaStream_t stream) {
+    if (p.query_heads == 24)
+        launch_wide<CausalD256H24Kv4, Int8KvTiledInstance, true>(p, cache, page_score, stream);
+    else
+        launch_wide<CausalD256H16Kv2, Int8KvTiledInstance, true>(p, cache, page_score, stream);
+}
+
+// rk4v4: int4 K + int4 V.
+void rk4v4_kv_batch_wide_attention(const CausalAttentionOperands& p, Int8KvReadView cache,
+                                   Tensor* page_score, cudaStream_t stream) {
+    if (p.query_heads == 24)
+        launch_wide<CausalD256H24Kv4, Int8KvTiledInstance, true, true>(p, cache, page_score,
+                                                                      stream);
+    else
+        launch_wide<CausalD256H16Kv2, Int8KvTiledInstance, true, true>(p, cache, page_score,
+                                                                      stream);
+}
+
+// rk4v4-e8: int4 K carried as E8 lattice + residual (E8Lattice) + int4 V.
+void rk4v4e8_kv_batch_wide_attention(const CausalAttentionOperands& p, Int8KvReadView cache,
+                                     Tensor* page_score, cudaStream_t stream) {
+    if (p.query_heads == 24)
+        launch_wide<CausalD256H24Kv4, Int8KvTiledInstance, true, true, false, false, true>(
+            p, cache, page_score, stream);
+    else
+        launch_wide<CausalD256H16Kv2, Int8KvTiledInstance, true, true, false, false, true>(
+            p, cache, page_score, stream);
+}
+
+// rk4v2-e8: int4 K + 2-bit E8 cylinder V (V8Root), both under the E8 lattice carrier.
+void rk4v2e8_kv_batch_wide_attention(const CausalAttentionOperands& p, Int8KvReadView cache,
+                                     Tensor* page_score, cudaStream_t stream) {
+    if (p.query_heads == 24)
+        launch_wide<CausalD256H24Kv4, Int8KvTiledInstance, false, true, false, true, true>(
+            p, cache, page_score, stream);
+    else
+        launch_wide<CausalD256H16Kv2, Int8KvTiledInstance, false, true, false, true, true>(
+            p, cache, page_score, stream);
+}
+
+// rk2v4-e8: 2-bit E8 cylinder K (E8Root) + int4 V.
+void rk2v4e8_kv_batch_wide_attention(const CausalAttentionOperands& p, Int8KvReadView cache,
+                                     Tensor* page_score, cudaStream_t stream) {
+    if (p.query_heads == 24)
+        launch_wide<CausalD256H24Kv4, Int8KvTiledInstance, true, false, true>(p, cache, page_score,
+                                                                            stream);
+    else
+        launch_wide<CausalD256H16Kv2, Int8KvTiledInstance, true, false, true>(p, cache, page_score,
+                                                                            stream);
 }
 
 } // namespace ninfer::ops::detail
