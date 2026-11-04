@@ -493,10 +493,12 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
         }
         require_contiguous_nonnull(*page_score, op, "page_score");
     }
-    // Only the INT8 and rk families thread the plane into a cached route that records it. Every
-    // other storage has no cached kernel that writes it, so a validated-but-ignored plane would
-    // hand the eviction policy zeroes it never asked for and the caller could not tell a no-op
-    // from a recorded pass. Reject those storages loudly instead.
+    // Only the INT8 and rk families own a cached route that can record the op-level plane, and
+    // inside them only the width > 16 route does: that is the batch-wide kernel, which binds the
+    // plane as this request's count-matrix base. Every other storage has no cached kernel that
+    // writes it, so a validated-but-ignored plane would hand the eviction policy zeroes it never
+    // asked for and the caller could not tell a no-op from a recorded pass. Reject those storages
+    // loudly instead.
     switch (cache.storage) {
     case KvCacheStorage::Int8Group64:
     case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
@@ -512,6 +514,20 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
                                   "this KV storage has no cached kernel that writes it");
         }
         break;
+    }
+    // The width axis of the same contract. At width <= 16 the INT8/rk cached plan selects only
+    // the Grouped and ParallelGrouped families, whose kernels resolve the counters through the
+    // cache view's own score planes and take no override input; a plane accepted here would be
+    // validated and then silently ignored - the same undetectable no-op the storage switch above
+    // rejects. A caller that wants the counters on a narrow width binds the row's score planes
+    // into the cache view, exactly as the engine does.
+    if (page_score != nullptr && q.ne[2] <= 16) {
+        throw std::invalid_argument(
+            std::string(op) + ": page_score is recorded by the INT8/rk cached routes only above "
+                              "width 16, where the batch-wide kernel binds the op-level plane as "
+                              "the count-matrix base; at width <= 16 the counters live in the "
+                              "cache view's own score planes, so bind the row's planes into the "
+                              "view instead of passing the op-level override");
     }
 
     if (cache.storage == KvCacheStorage::BFloat16) {

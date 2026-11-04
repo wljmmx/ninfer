@@ -158,8 +158,15 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * q/out are contiguous BF16 [256,24|16,T], positions is contiguous sequential device I32 [T],
  * and cache geometry, visible rows, scale, numerical oracle, envelope, alias, and workspace rules
  * are the same as causal_softmax_attention. The Op accepts no new K/V and leaves every cache byte
- * unchanged; out is completely overwritten. `page_score` is optional and behaves as in
- * causal_softmax_attention.
+ * unchanged; out is completely overwritten.
+ *
+ * `page_score` is optional, and its recording contract is pinned rather than best-effort: a call
+ * that cannot record the plane throws instead of validating it and silently writing nothing. The
+ * INT8 and rk families record it only above width 16, where the batch-wide kernel binds the
+ * plane as this request's count-matrix base; at width <= 16 those routes resolve their counters
+ * through the cache view's own score planes and reject the override (bind the row's planes into
+ * the view to count a narrow width). Every other KV storage has no cached kernel that writes
+ * the plane and rejects it outright.
  */
 void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
                                      AttentionHeadGeometry geometry, float scale,

@@ -3412,8 +3412,9 @@ int run_absent_page_cases(DeviceExecutionView execution, KvCacheStorage storage)
     return failures;
 }
 
-// Only the INT8 and rk families thread the op-level page_score plane into a cached route that
-// records it; every other storage has no cached kernel that writes it.
+// Only the INT8 and rk families own a cached route that can record the op-level page_score
+// plane, and inside them only the width > 16 route (the batch-wide kernel) binds the plane as
+// this request's count-matrix base.
 bool cached_route_records_page_scores(KvCacheStorage storage) {
     switch (storage) {
     case KvCacheStorage::Int8Group64:
@@ -3428,52 +3429,82 @@ bool cached_route_records_page_scores(KvCacheStorage storage) {
     }
 }
 
-// The dispatcher validates page_score on every entry. The contract case pins the split the
-// validation implies: the storages that own a recording cached route accept the plane, every
-// other layout rejects it loudly instead of validating it and then silently recording nothing
-// (a caller could not tell that no-op from a recorded pass).
+// The dispatcher validates page_score on every entry. The contract case pins both axes of the
+// split the validation implies:
+//  - storage: the families that own a recording cached route accept the plane, every other
+//    layout rejects it loudly instead of validating it and then silently recording nothing
+//    (a caller could not tell that no-op from a recorded pass);
+//  - width: inside the recording families the plane is accepted only above 16, where the
+//    batch-wide kernel binds it. The width <= 16 cached plan is Grouped/ParallelGrouped only;
+//    those kernels count into the cache view's own score planes and have no override input, so
+//    the entry rejects the plane there instead of accepting a silent no-op. A wide acceptance
+//    must also leave a nonzero counter behind (the suite runs with a permissive score
+//    tolerance, so every present page is hit), which is what tells a recorded pass from a
+//    validated-but-ignored one.
 int run_page_score_contract_cases(DeviceExecutionView execution, KvCacheStorage storage) {
     // The NVFP4 suite runs only in Blackwell builds; the sm_89 run skips that storage entirely.
     if (storage == KvCacheStorage::Nvfp4Group16) { return 0; }
-    int failures            = 0;
+    int failures             = 0;
     const Geometry& geometry = kGeometries[0];
-    constexpr std::int32_t tokens = 1, context = 64;
+    const bool records        = cached_route_records_page_scores(storage);
+    constexpr std::int32_t context = 64;
     HostCache cache_host  = make_cache(geometry, storage, context, 6201u);
     DeviceCache cache(cache_host, MappingPattern::Identity, context);
-    const std::vector<float> q = make_bf16_values(
-        std::size_t(kHeadDim) * geometry.q_heads * tokens, 6202u, -0.25f, 0.25f);
-    const std::vector<std::int32_t> positions{context};
-    const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
-    GuardedDeviceBuffer dq(q_bits.size() * sizeof(std::uint16_t)), dp(sizeof(std::int32_t)),
-        dout(q_bits.size() * sizeof(std::uint16_t)), dscores(64 * sizeof(std::int32_t), 256, 0);
-    dq.copy_from_host(q_bits.data(), q_bits.size() * sizeof(std::uint16_t));
-    dp.copy_from_host(positions.data(), positions.size() * sizeof(std::int32_t));
-    Tensor tq(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, tokens});
-    Tensor tp(dp.data(), DType::I32, {tokens});
-    Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, tokens});
-    Tensor tscores(dscores.data(), DType::I32, {64, 1});
-    const ops::CausalAttentionExecutionEnvelope envelope{
-        static_cast<std::uint32_t>(context + tokens), static_cast<std::uint32_t>(context + tokens)};
-    const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
-        op_geometry(geometry), storage, envelope, 1, tokens, tokens, execution);
-    GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
-    WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
-    const bool records = cached_route_records_page_scores(storage);
-    try {
-        ops::causal_softmax_attention_cached(tq, tp, op_geometry(geometry), kAttentionScale,
-                                             cache.view(), envelope, workspace, tout, execution,
-                                             &tscores);
-        if (!records) {
-            std::cerr << cache_name(storage)
-                      << ": causal_softmax_attention_cached accepted a page_score no cached route "
-                         "records\n";
-            ++failures;
+    for (const std::int32_t tokens : {1, 24}) {
+        const std::vector<float> q = make_bf16_values(
+            std::size_t(kHeadDim) * geometry.q_heads * tokens, 6202u, -0.25f, 0.25f);
+        std::vector<std::int32_t> positions(static_cast<std::size_t>(tokens));
+        for (std::int32_t t = 0; t < tokens; ++t) {
+            positions[static_cast<std::size_t>(t)] = context + t;
         }
-    } catch (const std::invalid_argument&) {
-        if (records) {
+        const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
+        GuardedDeviceBuffer dq(q_bits.size() * sizeof(std::uint16_t)),
+            dp(positions.size() * sizeof(std::int32_t)),
+            dout(q_bits.size() * sizeof(std::uint16_t)), dscores(64 * sizeof(std::int32_t), 256, 0);
+        dq.copy_from_host(q_bits.data(), q_bits.size() * sizeof(std::uint16_t));
+        dp.copy_from_host(positions.data(), positions.size() * sizeof(std::int32_t));
+        Tensor tq(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, tokens});
+        Tensor tp(dp.data(), DType::I32, {tokens});
+        Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, tokens});
+        Tensor tscores(dscores.data(), DType::I32, {64, 1});
+        const ops::CausalAttentionExecutionEnvelope envelope{
+            static_cast<std::uint32_t>(context + tokens),
+            static_cast<std::uint32_t>(context + tokens)};
+        const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
+            op_geometry(geometry), storage, envelope, 1, tokens, tokens, execution);
+        GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
+        WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
+        const bool route_records = records && tokens > 16;
+        bool threw               = false;
+        try {
+            ops::causal_softmax_attention_cached(tq, tp, op_geometry(geometry), kAttentionScale,
+                                                 cache.view(), envelope, workspace, tout, execution,
+                                                 &tscores);
+            // The recording route runs on the engine's non-blocking stream; the plane can only
+            // be read after it has actually executed.
+            cuda_synchronize();
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        if (threw == route_records) {
+            std::cerr << cache_name(storage) << ": width " << tokens << " "
+                      << (threw ? "rejected" : "accepted") << " the page_score plane, but the "
+                      << (route_records ? "wide route must record it" : "route cannot record it")
+                      << '\n';
+            ++failures;
+            continue;
+        }
+        if (!route_records) { continue; }
+        const auto scores = copy_from_guarded<std::int32_t>(dscores, 64);
+        if (std::all_of(scores.begin(), scores.end(), [](std::int32_t value) { return value == 0; })) {
+            const int guard_failures =
+                dscores.verify_guards(cache_name(storage) + std::string(" contract scores"));
             std::cerr << cache_name(storage)
-                      << ": causal_softmax_attention_cached rejected the page_score its own route "
-                         "records\n";
+                      << ": width " << tokens
+                      << " accepted the page_score plane but recorded no page hit (guard_failures="
+                      << guard_failures << " first8=";
+            for (int i = 0; i < 8; ++i) { std::cerr << scores[static_cast<std::size_t>(i)] << ' '; }
+            std::cerr << ")\n";
             ++failures;
         }
     }
