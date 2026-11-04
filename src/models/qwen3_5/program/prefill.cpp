@@ -319,28 +319,54 @@ void ProgramImpl::report_prefill_rows(std::span<const std::uint32_t> lanes) {
 std::optional<Program::MergedPrefillResult> ProgramImpl::advance_prefill_batch() {
     if (std::getenv("NINFER_PREFILL_BATCH_EXEC") == nullptr) { return std::nullopt; }
 
+    // Diagnosis only: every early return says why it happened, at most 400 lines per process. This is
+    // compiled in but silent unless the switch is on, and it is what turns "no [prefill-merged] line"
+    // into a named guard instead of a guess across six of them.
+    const auto reject = [](const char* why, std::size_t a, std::size_t b) {
+        static std::uint64_t n = 0;
+        if (++n > 400) { return; }
+        std::fprintf(stderr, "[prefill-reject] %s a=%zu b=%zu\n", why, a, b);
+        std::fflush(stderr);
+    };
+
     std::array<std::uint32_t, kMaximumConcurrency> lanes{};
     std::size_t lane_count = 0;
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
         if (prefill_remaining(lane) == 0) { continue; }
         lanes[lane_count++] = lane;
     }
-    if (lane_count < 2) { return std::nullopt; }
+    if (lane_count < 2) {
+        reject("lane_count", lane_count, 0);
+        return std::nullopt;
+    }
 
     std::array<execution::PrefillRow, kMaximumConcurrency> rows{};
     const std::size_t built =
         prefill_batch_rows(std::span<const std::uint32_t>(lanes.data(), lane_count), rows);
-    if (built < 2) { return std::nullopt; }
+    if (built < 2) {
+        reject("built", built, lane_count);
+        return std::nullopt;
+    }
 
     // Narrow path only: no capture group on the horizon, no MTP bridge, no vision. Each of those has
     // its own single-lane bookkeeping and is not part of a merged pass yet.
     for (std::size_t i = 0; i < built; ++i) {
         const RequestControl& candidate = requests[rows[i].lane];
-        if (candidate.capture_pending || candidate.next_capture < candidate.capture_groups.size()) {
+        if (candidate.capture_pending) {
+            reject("capture_pending", i, 0);
+            return std::nullopt;
+        }
+        // Diagnosis only: NINFER_PREFILL_IGNORE_CAPTURE lets the merged pass run without the
+        // prompt-frontier capture carrier so the batch kernels can be judged on their own. Never set
+        // this outside a probe run: the capture is what a later request reuses.
+        if (candidate.next_capture < candidate.capture_groups.size() &&
+            std::getenv("NINFER_PREFILL_IGNORE_CAPTURE") == nullptr) {
+            reject("next_capture", candidate.next_capture, candidate.capture_groups.size());
             return std::nullopt;
         }
         const RequestControl::Prefill& staged = *candidate.prefill;
         if (staged.prepare_mtp || staged.vision || staged.mtp_bridge != MtpBridgeMode::None) {
+            reject("narrow_path", staged.prepare_mtp ? 1 : 0, staged.vision ? 1 : 0);
             return std::nullopt;
         }
     }
@@ -359,7 +385,10 @@ std::optional<Program::MergedPrefillResult> ProgramImpl::advance_prefill_batch()
         widest            = candidate;
         selected[batch++] = i;
     }
-    if (batch < 2) { return std::nullopt; }
+    if (batch < 2) {
+        reject("batch", batch, built);
+        return std::nullopt;
+    }
 
     // The GDN conv snapshot path is verify-shaped: gdn_input_proj_conv_snapshot accepts width <= 16
     // when batch > 1, and its conv-state tensor is sized for at most that many columns. A prefill
@@ -368,6 +397,7 @@ std::optional<Program::MergedPrefillResult> ProgramImpl::advance_prefill_batch()
     // reaching a request; lifting it needs a wide-batch conv kernel, which is the remaining kernel
     // work for this feature.
     if (models::qwen3_5::execution::prefill_class_for(static_cast<std::int32_t>(widest)) > 16) {
+        reject("width", widest, 0);
         return std::nullopt;
     }
 
