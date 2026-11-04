@@ -49,20 +49,6 @@ __device__ __forceinline__ void cp_wait() {
     asm volatile("cp.async.wait_group %0;\n" : : "n"(Groups));
 }
 
-template <int Bytes>
-__device__ __forceinline__ void pipe_copy(void* smem_dst, const void* gmem_src) {
-    static_assert(Bytes == 4 || Bytes == 8 || Bytes == 16, "pipe_copy supports 4, 8, or 16 bytes");
-    __pipeline_memcpy_async(smem_dst, gmem_src, Bytes);
-}
-
-__device__ __forceinline__ void pipe_commit() { __pipeline_commit(); }
-
-template <int Groups>
-__device__ __forceinline__ void pipe_wait() {
-    static_assert(Groups >= 0 && Groups <= 7, "pipe_wait group count must fit the PTX immediate");
-    __pipeline_wait_prior(Groups);
-}
-
 __device__ __forceinline__ void cta_mbarrier_init(std::uint64_t* barrier, std::uint32_t arrivals) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
                  :
