@@ -28,7 +28,8 @@ namespace ninfer::ops::detail {
 template <typename Geometry, typename Schedule, typename Metadata, bool PackedV = false,
           bool PackedK = false, bool E8Root = false, bool V8Root = false,
           bool E8Lattice = false>
-__global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_batch_wide_mma_kernel(
+__launch_bounds__(Schedule::kThreads) __global__ __maxnreg__(Schedule::kMaxRegisters) void
+int8_kv_batch_wide_mma_kernel(
     const __nv_bfloat16* __restrict__ q, const std::int8_t* __restrict__ cache_k,
     const std::int8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
     const __half* __restrict__ cache_v_scale, Metadata metadata,

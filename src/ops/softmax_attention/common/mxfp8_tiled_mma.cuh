@@ -15,7 +15,8 @@ namespace ninfer::ops::detail {
 // Values selects the stored V representation; split outputs remain FP32 with
 // maxima in natural scaled-score units for the final merge.
 template <class Geometry, class Schedule, class Values, class Metadata>
-__global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
+__launch_bounds__(Schedule::kThreads) __global__ __maxnreg__(Schedule::kMaxRegisters) void
+mxfp8_kv_tiled_mma_kernel(
     const __nv_bfloat16* __restrict__ q, const std::uint8_t* __restrict__ cache_k,
     const std::uint8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
     const typename Values::Scale* __restrict__ cache_v_scale, Metadata metadata,
