@@ -279,22 +279,25 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
             "causal_softmax_attention workspace: invalid profile or interval");
     }
 
-    // A batch wider than the verify width runs on a dedicated batch-wide kernel that keeps no
-    // split-K partials: its workspace is empty. BF16, INT8 and the rk layouts have that kernel;
-    // FP8 and K8V4 serve the shape from the tiled kernel and compute a batch-scaled arena.
-    if (batch_size > 1 && max_width > kMaximumVerifyTokens) {
-        switch (cache_storage) {
-        case KvCacheStorage::BFloat16:
-        case KvCacheStorage::Int8Group64:
-        case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
-        case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
-        case KvCacheStorage::RK4V4E8:
-        case KvCacheStorage::RK2V4E8:
-        case KvCacheStorage::RK4V2E8:
-            return 0;
-        default:
-            break;
-        }
+    // A width above the verify tile runs on the dedicated batch-wide kernel at every batch size,
+    // and that kernel keeps no split-K partials: its workspace is empty. BF16, INT8 and the rk
+    // layouts have that kernel; FP8 and K8V4 serve every width from the tiled family and compute a
+    // batch-scaled arena. An interval that straddles the tile only has to cover its narrow part,
+    // and one that starts above the tile needs nothing at all - a wide-only answer for a straddling
+    // interval would plan less than the narrow widths of the same interval allocate.
+    switch (cache_storage) {
+    case KvCacheStorage::BFloat16:
+    case KvCacheStorage::Int8Group64:
+    case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
+    case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
+    case KvCacheStorage::RK4V4E8:
+    case KvCacheStorage::RK2V4E8:
+    case KvCacheStorage::RK4V2E8:
+        if (min_width > kMaximumVerifyTokens) { return 0; }
+        max_width = std::min(max_width, kMaximumVerifyTokens);
+        break;
+    default:
+        break;
     }
     if (cache_storage == KvCacheStorage::BFloat16)
         return detail::bf16_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,

@@ -83,10 +83,10 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_batch_wide_mma_kern
     const int q_head  = static_cast<int>(blockIdx.y);
     // Batch row: counters and the block table resolve through table_rows[0]/valid_columns[0], so
     // advancing both by b gives this CTA its own row, exactly as grouped_mma.cuh does. The page-score
-    // planes travel with the metadata, so the counters stay continuous across this second owner.
+    // planes travel with the metadata, so the counters stay continuous across this second owner. A
+    // cached call binds one row and passes no table_rows; select_batch then leaves row 0 in place.
     const int b = static_cast<int>(blockIdx.z);
-    metadata.table_rows += b;
-    if (metadata.valid_columns != nullptr) { metadata.valid_columns += b; }
+    metadata.select_batch(b);
     const std::int64_t q_base = static_cast<std::int64_t>(b) * width * D * Geometry::QHeads;
     const int tid     = static_cast<int>(threadIdx.x);
     const int warp    = tid >> 5;

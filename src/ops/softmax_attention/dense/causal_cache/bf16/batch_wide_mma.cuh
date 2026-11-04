@@ -96,10 +96,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         return;
     }
     // positions is [B][W] like q: grouped_mma.cuh does `positions += batch * width`.
-    const int base_pos              = positions[static_cast<std::int64_t>(b) * width];
-    const std::int32_t* block_table = tables + static_cast<std::int64_t>(table_rows[b]) * table_stride;
-    // P6 2c: the counter row resolves exactly like the block table (same stride, same row index).
-    const std::int64_t score_row = table_rows[b];
+    const int base_pos = positions[static_cast<std::int64_t>(b) * width];
+    // A cached call binds one pool row (single_row_paged_kv_batch_view) and passes no table_rows:
+    // row 0 is the only row that view has. The counter row resolves exactly like the block table.
+    const std::int64_t score_row    = table_rows != nullptr ? table_rows[b] : 0;
+    const std::int32_t* block_table = tables + score_row * table_stride;
     unsigned* const counters =
         page_scores != nullptr ? page_scores + score_row * table_stride : nullptr;
     unsigned* const recent =

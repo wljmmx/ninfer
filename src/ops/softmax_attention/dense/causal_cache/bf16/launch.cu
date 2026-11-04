@@ -90,9 +90,10 @@ void bf16_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                               Tensor& out, DeviceExecutionView execution, Tensor* page_score) {
     const cudaStream_t stream = execution.stream;
-    // B > 1 with W > 16 has its own kernel; neither the grouped path (narrow batch) nor the tiled path
-    // (single row) is asked to absorb this shape.
-    if (q.ne[3] > 1 && q.ne[2] > 16) {
+    // W > 16 has its own kernel at every batch size, so one route serves the shape and a request's
+    // result no longer depends on whether it shared the call. The grouped (W <= 16) and tiled paths
+    // keep the narrow shapes.
+    if (q.ne[2] > 16) {
         kv_cache_append_batch_launch(k, v, positions, valid_columns, table_rows, cache, stream);
         bf16_kv_batch_wide_attention(q, positions, valid_columns, table_rows, scale, cache, envelope,
                                      out, execution, page_score);
@@ -119,9 +120,17 @@ void bf16_kv_cached_attention(const Tensor& q, const Tensor& positions, float sc
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                               Tensor& out, DeviceExecutionView execution) {
     const cudaStream_t stream = execution.stream;
+    const auto view           = single_row_paged_kv_batch_view(cache);
+    // The cached shape is one request, but W > 16 is the batch-wide kernel's shape: running it here
+    // too is what makes this request's result identical to the same request inside a batch. One
+    // row, no mask, so the entry takes row 0 and the full width.
+    if (q.ne[2] > 16) {
+        bf16_kv_batch_wide_attention(q, positions, Tensor{}, Tensor{}, scale, view, envelope, out,
+                                     execution, nullptr);
+        return;
+    }
     const auto plan =
         make_bf16_kv_causal_plan(q.ne[1], q.ne[2], 1, envelope, execution.multiprocessor_count);
-    const auto view = single_row_paged_kv_batch_view(cache);
     if (!plan.grouped()) {
         tiled(make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),
               bf16_kv_cache_view<false>(view), plan, nullptr, stream);

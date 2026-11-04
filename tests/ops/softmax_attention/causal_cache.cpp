@@ -2751,9 +2751,9 @@ int run_quantized_batch_cases(DeviceExecutionView execution, KvCacheStorage stor
     return failures;
 }
 
-// One route probe: run row 0 of a W=256 request either alone (B=1, the tiled/grouped route) or as the
-// first row of a B=2 batch (the wide-batch route), with byte-identical q/k/v for row 0. The only
-// difference left between the two outputs is the kernel's reduction order.
+// One request-shape probe: run row 0 of a W=256 request either alone (B=1) or as the first row of a
+// B=2 batch, with byte-identical q/k/v for row 0. Batching must not change which kernel serves the
+// request, so the two outputs are expected to be the same bits.
 bool supports_wide_batch(KvCacheStorage storage);
 
 std::vector<double> probe_route_order(DeviceExecutionView execution, KvCacheStorage storage,
@@ -2810,9 +2810,9 @@ std::vector<double> probe_route_order(DeviceExecutionView execution, KvCacheStor
     return std::vector<double>(values.begin(), values.begin() + q_cols * width);
 }
 
-// Report, per layout, how far a batched row 0 drifts from the same row run alone. The route is chosen
-// by the shape (B=1 runs the tiled/grouped kernel, B=2 the wide one), so the two reductions order the
-// same terms differently; the contract this asserts is that the difference stays at the last bit.
+// Report how far a batched row 0 drifts from the same row run alone. Both sides now take one route
+// for this shape (W > 16 is the wide kernel at every batch size), so the two runs must agree bit
+// for bit; anything else means a request's result still depends on whether it shared the call.
 int measure_route_order(DeviceExecutionView execution, KvCacheStorage storage) {
     if (!supports_wide_batch(storage)) { return 0; }
     const auto single = probe_route_order(execution, storage, 1);
@@ -2827,18 +2827,20 @@ int measure_route_order(DeviceExecutionView execution, KvCacheStorage storage) {
         differing += delta != 0.0 ? 1 : 0;
     }
     const double relative = std::sqrt(squared / std::max(reference, 1e-300));
-    // Measured on sm_89: BF16 and the int8/rk family land at rel_l2 5.8e-4 with every differing
-    // element off by exactly one BF16 ulp (9.77e-4); FP8 and K8V4 are bit-identical at this shape.
-    constexpr double kMaximumRelative = 1.0e-3;
-    constexpr double kMaximumAbsolute = 5.0e-3;
-    const bool inside = relative <= kMaximumRelative && maximum <= kMaximumAbsolute;
+    // One route per shape, so the same request reduces the same terms in the same order: W > 16
+    // runs the batch-wide kernel at every batch size for BF16, INT8 and the rk layouts, while
+    // FP8/K8V4 interleave the batch into the same tiled ladder. Measured on sm_89, all nine
+    // layouts: differing=0/1572864, rel_l2=0, max_abs=0. The former 1e-3 / 5e-3 envelope only
+    // absorbed the one-ulp gap between two kernels, and keeping it would hide exactly the split
+    // this asserts against; the criterion is bitwise equality.
+    const bool inside = differing == 0;
     std::cout << "[order] " << cache_name(storage) << " W=256 B=1 vs B=2 row0 rel_l2=" << relative
               << " max_abs=" << maximum << " differing=" << differing << "/" << single.size()
               << (inside ? " PASS" : " FAIL") << '\n';
     return inside ? 0 : 1;
 }
 
-// B > 1 with W > 16 is the wide-batch shape. BF16, INT8 and the rk layouts serve it with a
+// W > 16 is the wide-batch shape at every batch size. BF16, INT8 and the rk layouts serve it with a
 // dedicated batch-wide kernel (rk instantiates the INT8 one with its own cache read-back); FP8 and
 // K8V4 serve it by interleaving the batch into the tiled kernel's split ladder. NVFP4 stays outside
 // both routes.

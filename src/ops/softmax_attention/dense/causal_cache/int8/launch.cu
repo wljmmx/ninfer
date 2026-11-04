@@ -460,9 +460,9 @@ void int8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                               Tensor& out, DeviceExecutionView execution, Tensor* page_score) {
     const cudaStream_t stream = execution.stream;
-    // B > 1 with W > 16 has its own kernel; the append is the shared batched one and the attention is
-    // read-only over the same view the tiled path uses.
-    if (q.ne[3] > 1 && q.ne[2] > 16) {
+    // W > 16 has its own kernel at every batch size; the append is the shared batched one and the
+    // attention is read-only over the same view the tiled path uses.
+    if (q.ne[2] > 16) {
         kv_cache_append_batch_launch(k, v, positions, valid, rows, cache, stream);
         const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
         const auto view =
@@ -494,9 +494,18 @@ void int8_kv_cached_attention(const Tensor& q, const Tensor& positions, float sc
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                               Tensor& out, DeviceExecutionView execution, Tensor* page_score) {
     const cudaStream_t stream = execution.stream;
+    const auto view           = single_row_paged_kv_batch_view(cache);
+    // W > 16 is this kernel's shape at every batch size, so the cached one-request call takes the
+    // same entry: that is what makes its result identical to the same request inside a batch. One
+    // pool row, no mask, so the entry reads row 0 at the full width.
+    if (q.ne[2] > 16) {
+        const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
+        int8_kv_batch_wide_attention(
+            p, make_quantized_causal_cache_view<Int8KvCacheView<false>>(view), page_score, stream);
+        return;
+    }
     const auto plan =
         make_int8_kv_causal_plan(q.ne[1], q.ne[2], 1, envelope, execution.multiprocessor_count);
-    const auto view = single_row_paged_kv_batch_view(cache);
     if (plan.family == Int8KvFamily::Tiled)
         tiled(make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),
               make_quantized_causal_cache_view<Int8KvCacheView<false>>(view), page_score, stream);
@@ -546,9 +555,9 @@ void rk4v4_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v
                                CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                                Tensor& out, DeviceExecutionView execution, Tensor* page_score) {
     const cudaStream_t stream = execution.stream;
-    // B > 1 with W > 16 belongs to the batch-wide kernel; its read-back has to select the same rk
-    // codec the tiled branch does, and the append is the same standalone one.
-    if (q.ne[3] > 1 && q.ne[2] > 16) {
+    // W > 16 belongs to the batch-wide kernel at every batch size; its read-back has to select the
+    // same rk codec the tiled branch does, and the append is the same standalone one.
+    if (q.ne[2] > 16) {
         kv_cache_append_rk4v4_batch_launch(k, v, positions, valid, rows, cache, stream);
         const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
         const auto view =
@@ -583,9 +592,18 @@ void rk4v4_kv_cached_attention(const Tensor& q, const Tensor& positions, float s
                                CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                                Tensor& out, DeviceExecutionView execution, Tensor* page_score) {
     const cudaStream_t stream = execution.stream;
+    const auto view           = single_row_paged_kv_batch_view(cache);
+    // W > 16 is this kernel's shape at every batch size, so the cached one-request call takes the
+    // same entry: that is what makes its result identical to the same request inside a batch. One
+    // pool row, no mask, so the entry reads row 0 at the full width.
+    if (q.ne[2] > 16) {
+        const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
+        rk4v4_kv_batch_wide_attention(
+            p, make_quantized_causal_cache_view<Int8KvCacheView<false>>(view), page_score, stream);
+        return;
+    }
     const auto plan =
         make_int8_kv_causal_plan(q.ne[1], q.ne[2], 1, envelope, execution.multiprocessor_count);
-    const auto view = single_row_paged_kv_batch_view(cache);
     if (plan.family == Int8KvFamily::Grouped) {
         // rk4v4's K plane is int4-packed: the cached read must use PackedKOnly
         // (routing through Plain read int4 nibbles as int8 codes).
@@ -612,9 +630,9 @@ void rk8v4_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v
                                Tensor& out, DeviceExecutionView execution, Tensor* page_score) {
     // rk8v4 = 8-bit K (no packing) + 4-bit V (PackedV=true, PackedK=false).
     const cudaStream_t stream = execution.stream;
-    // B > 1 with W > 16 belongs to the batch-wide kernel; its read-back has to select the same rk
-    // codec the tiled branch does, and the append is the same standalone one.
-    if (q.ne[3] > 1 && q.ne[2] > 16) {
+    // W > 16 belongs to the batch-wide kernel at every batch size; its read-back has to select the
+    // same rk codec the tiled branch does, and the append is the same standalone one.
+    if (q.ne[2] > 16) {
         kv_cache_append_rk8v4_batch_launch(k, v, positions, valid, rows, cache, stream);
         const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
         const auto view =
@@ -648,9 +666,18 @@ void rk8v4_kv_cached_attention(const Tensor& q, const Tensor& positions, float s
                                CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                                Tensor& out, DeviceExecutionView execution, Tensor* page_score) {
     const cudaStream_t stream = execution.stream;
+    const auto view           = single_row_paged_kv_batch_view(cache);
+    // W > 16 is this kernel's shape at every batch size, so the cached one-request call takes the
+    // same entry: that is what makes its result identical to the same request inside a batch. One
+    // pool row, no mask, so the entry reads row 0 at the full width.
+    if (q.ne[2] > 16) {
+        const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
+        rk8v4_kv_batch_wide_attention(
+            p, make_quantized_causal_cache_view<Int8KvCacheView<false>>(view), page_score, stream);
+        return;
+    }
     const auto plan =
         make_int8_kv_causal_plan(q.ne[1], q.ne[2], 1, envelope, execution.multiprocessor_count);
-    const auto view = single_row_paged_kv_batch_view(cache);
     if (plan.family == Int8KvFamily::Grouped) {
         // rk8v4's K plane is plain int8: the cached read stays on Plain (PackedV only).
         rk_execute_grouped<CausalCachedInput, RkVariant::Plain>(q, positions, scale, view, nullptr,
@@ -675,9 +702,9 @@ void rk4v4e8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor&
                                  WorkspaceArena& workspace, Tensor& out,
                                  DeviceExecutionView execution, Tensor* page_score) {
     const cudaStream_t stream = execution.stream;
-    // B > 1 with W > 16 belongs to the batch-wide kernel; its read-back has to select the same rk
-    // codec the tiled branch does, and the append is the same standalone one.
-    if (q.ne[3] > 1 && q.ne[2] > 16) {
+    // W > 16 belongs to the batch-wide kernel at every batch size; its read-back has to select the
+    // same rk codec the tiled branch does, and the append is the same standalone one.
+    if (q.ne[2] > 16) {
         kv_cache_append_rk4v4e8_batch_launch(k, v, positions, valid, rows, cache, stream);
         const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
         const auto view =
@@ -713,9 +740,18 @@ void rk4v4e8_kv_cached_attention(const Tensor& q, const Tensor& positions, float
                                  WorkspaceArena& workspace, Tensor& out,
                                  DeviceExecutionView execution, Tensor* page_score) {
     const cudaStream_t stream = execution.stream;
+    const auto view           = single_row_paged_kv_batch_view(cache);
+    // W > 16 is this kernel's shape at every batch size, so the cached one-request call takes the
+    // same entry: that is what makes its result identical to the same request inside a batch. One
+    // pool row, no mask, so the entry reads row 0 at the full width.
+    if (q.ne[2] > 16) {
+        const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
+        rk4v4e8_kv_batch_wide_attention(
+            p, make_quantized_causal_cache_view<Int8KvCacheView<false>>(view), page_score, stream);
+        return;
+    }
     const auto plan =
         make_int8_kv_causal_plan(q.ne[1], q.ne[2], 1, envelope, execution.multiprocessor_count);
-    const auto view = single_row_paged_kv_batch_view(cache);
     if (plan.family == Int8KvFamily::Grouped) {
         rk_execute_grouped<CausalCachedInput, RkVariant::E8Lattice>(q, positions, scale, view, nullptr, nullptr,
                                                     CausalCachedInput{}, plan, workspace, out, stream);
@@ -738,9 +774,9 @@ void rk4v2e8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor&
                                  WorkspaceArena& workspace, Tensor& out,
                                  DeviceExecutionView execution, Tensor* page_score) {
     const cudaStream_t stream = execution.stream;
-    // B > 1 with W > 16 belongs to the batch-wide kernel; its read-back has to select the same rk
-    // codec the tiled branch does, and the append is the same standalone one.
-    if (q.ne[3] > 1 && q.ne[2] > 16) {
+    // W > 16 belongs to the batch-wide kernel at every batch size; its read-back has to select the
+    // same rk codec the tiled branch does, and the append is the same standalone one.
+    if (q.ne[2] > 16) {
         kv_cache_append_rk4v2e8_batch_launch(k, v, positions, valid, rows, cache, stream);
         const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
         const auto view =
@@ -776,9 +812,18 @@ void rk4v2e8_kv_cached_attention(const Tensor& q, const Tensor& positions, float
                                  WorkspaceArena& workspace, Tensor& out,
                                  DeviceExecutionView execution, Tensor* page_score) {
     const cudaStream_t stream = execution.stream;
+    const auto view           = single_row_paged_kv_batch_view(cache);
+    // W > 16 is this kernel's shape at every batch size, so the cached one-request call takes the
+    // same entry: that is what makes its result identical to the same request inside a batch. One
+    // pool row, no mask, so the entry reads row 0 at the full width.
+    if (q.ne[2] > 16) {
+        const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
+        rk4v2e8_kv_batch_wide_attention(
+            p, make_quantized_causal_cache_view<Int8KvCacheView<false>>(view), page_score, stream);
+        return;
+    }
     const auto plan =
         make_int8_kv_causal_plan(q.ne[1], q.ne[2], 1, envelope, execution.multiprocessor_count);
-    const auto view = single_row_paged_kv_batch_view(cache);
     if (plan.family == Int8KvFamily::Grouped) {
         rk_execute_grouped<CausalCachedInput, RkVariant::E8LatticeV2>(q, positions, scale, view, nullptr, nullptr,
                                                     CausalCachedInput{}, plan, workspace, out, stream);
@@ -801,9 +846,9 @@ void rk2v4e8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor&
                                  WorkspaceArena& workspace, Tensor& out,
                                  DeviceExecutionView execution, Tensor* page_score) {
     const cudaStream_t stream = execution.stream;
-    // B > 1 with W > 16 belongs to the batch-wide kernel; its read-back has to select the same rk
-    // codec the tiled branch does, and the append is the same standalone one.
-    if (q.ne[3] > 1 && q.ne[2] > 16) {
+    // W > 16 belongs to the batch-wide kernel at every batch size; its read-back has to select the
+    // same rk codec the tiled branch does, and the append is the same standalone one.
+    if (q.ne[2] > 16) {
         kv_cache_append_rk2v4e8_batch_launch(k, v, positions, valid, rows, cache, stream);
         const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
         const auto view =
@@ -841,9 +886,18 @@ void rk2v4e8_kv_cached_attention(const Tensor& q, const Tensor& positions, float
                                  WorkspaceArena& workspace, Tensor& out,
                                  DeviceExecutionView execution, Tensor* page_score) {
     const cudaStream_t stream = execution.stream;
+    const auto view           = single_row_paged_kv_batch_view(cache);
+    // W > 16 is this kernel's shape at every batch size, so the cached one-request call takes the
+    // same entry: that is what makes its result identical to the same request inside a batch. One
+    // pool row, no mask, so the entry reads row 0 at the full width.
+    if (q.ne[2] > 16) {
+        const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
+        rk2v4e8_kv_batch_wide_attention(
+            p, make_quantized_causal_cache_view<Int8KvCacheView<false>>(view), page_score, stream);
+        return;
+    }
     const auto plan =
         make_int8_kv_causal_plan(q.ne[1], q.ne[2], 1, envelope, execution.multiprocessor_count);
-    const auto view = single_row_paged_kv_batch_view(cache);
     if (plan.family == Int8KvFamily::Grouped) {
         rk_execute_grouped<CausalCachedInput, RkVariant::E8Root>(q, positions, scale, view, nullptr,
                                                                   nullptr, CausalCachedInput{}, plan,

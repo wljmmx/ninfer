@@ -63,8 +63,15 @@ struct PagedKVBatchMetadata {
         return width;
     }
 
+    /// The pool row this CTA reads. A view built from single_row_paged_kv_batch_view has exactly
+    /// one row and passes no table_rows, so an unbound index means row 0 - the same row its block
+    /// table starts at.
+    __device__ __forceinline__ std::int32_t row_index() const {
+        return table_rows != nullptr ? table_rows[0] : 0;
+    }
+
     __device__ __forceinline__ const std::int32_t* block_table() const {
-        return tables + static_cast<std::int64_t>(table_rows[0]) * table_stride;
+        return tables + static_cast<std::int64_t>(row_index()) * table_stride;
     }
 
     /// The counter row for this CTA, resolved the same way as block_table(): the matrix is indexed
@@ -72,35 +79,36 @@ struct PagedKVBatchMetadata {
     __device__ __forceinline__ unsigned* counters() const {
         return page_scores == nullptr
                    ? nullptr
-                   : page_scores + static_cast<std::int64_t>(table_rows[0]) * table_stride;
+                   : page_scores + static_cast<std::int64_t>(row_index()) * table_stride;
     }
 
     /// The peak-score row for this CTA, resolved exactly like counters().
     __device__ __forceinline__ unsigned* peaks() const {
         return page_score_peaks == nullptr
                    ? nullptr
-                   : page_score_peaks + static_cast<std::int64_t>(table_rows[0]) * table_stride;
+                   : page_score_peaks + static_cast<std::int64_t>(row_index()) * table_stride;
     }
 
     /// The newest-rows count row for this CTA, resolved exactly like counters().
     __device__ __forceinline__ unsigned* recents() const {
         return page_score_recents == nullptr
                    ? nullptr
-                   : page_score_recents + static_cast<std::int64_t>(table_rows[0]) * table_stride;
+                   : page_score_recents + static_cast<std::int64_t>(row_index()) * table_stride;
     }
 
     /// Move this view onto request `b`. The row-dependent accessors above all resolve through
     /// table_rows[0]/valid_columns[0], so advancing the two pointer bases selects the batch row
-    /// exactly as the block table does (the same trick int8/batch_wide_mma.cuh uses).
+    /// exactly as the block table does (the same trick int8/batch_wide_mma.cuh uses). An unbound
+    /// table_rows keeps meaning row 0 at every batch element.
     __device__ __forceinline__ void select_batch(int b) {
-        table_rows += b;
+        if (table_rows != nullptr) { table_rows += b; }
         if (valid_columns != nullptr) { valid_columns += b; }
     }
 
     /// The page-score matrix offset of this CTA's row, for callers that bind the plane themselves
     /// instead of going through counters().
     __device__ __forceinline__ std::int64_t score_offset() const {
-        return static_cast<std::int64_t>(table_rows[0]) * table_stride;
+        return static_cast<std::int64_t>(row_index()) * table_stride;
     }
 };
 
