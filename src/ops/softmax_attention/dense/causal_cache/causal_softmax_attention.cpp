@@ -311,8 +311,17 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
         return detail::int8_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
                                                execution.multiprocessor_count);
 
-    if (cache_storage == KvCacheStorage::Nvfp4Group16)
+    if (cache_storage == KvCacheStorage::Nvfp4Group16) {
 #if defined(NINFER_ENABLE_NVFP4)
+        // B2 contract guard: the plan still rejects batch>1 above the verify tile, and the width
+        // loop below would hit that throw mid-query with a message that names neither the shape
+        // nor the workaround. Reject the whole interval up front instead.
+        if (batch_size > 1 && max_width > kMaximumVerifyTokens) {
+            throw std::invalid_argument(
+                "causal_softmax_attention workspace: NVFP4 KV has no batch route above the verify "
+                "tile yet (batch>1 with width>16), so no width of this interval can be planned; "
+                "use width<=16 verify batches or BF16/INT8/FP8 KV storage");
+        }
         return detail::nvfp4_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
                                                 execution.multiprocessor_count);
 #else
@@ -321,6 +330,7 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
             "(sm_120a) build with NVFP4 tensor cores; choose BF16, INT8 or FP8 KV on "
             "RTX 4090 (sm_89).");
 #endif
+    }
 
     if (cache_storage == KvCacheStorage::Fp8KeyNvfp4Value)
 #if defined(NINFER_ENABLE_K8V4)
@@ -400,6 +410,17 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
 
     if (cache.storage == KvCacheStorage::Nvfp4Group16) {
 #if defined(NINFER_ENABLE_NVFP4)
+        if (page_score != nullptr) {
+            throw std::invalid_argument(std::string(op) +
+                                        ": page_score recording is not implemented for NVFP4 KV "
+                                        "attention");
+        }
+        if (batch > 1 && width > kMaximumVerifyTokens) {
+            throw std::invalid_argument(
+                std::string(op) + ": NVFP4 KV attention has no batch route above the verify tile "
+                                  "yet (batch>1 with width>16); use width<=16 verify batches or "
+                                  "BF16/INT8/FP8 KV storage");
+        }
         detail::nvfp4_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
                                           cache, envelope, workspace, out, execution);
         return;
@@ -471,6 +492,26 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
             throw std::invalid_argument(std::string(op) + ": page_score must be device I32");
         }
         require_contiguous_nonnull(*page_score, op, "page_score");
+    }
+    // Only the INT8 and rk families thread the plane into a cached route that records it. Every
+    // other storage has no cached kernel that writes it, so a validated-but-ignored plane would
+    // hand the eviction policy zeroes it never asked for and the caller could not tell a no-op
+    // from a recorded pass. Reject those storages loudly instead.
+    switch (cache.storage) {
+    case KvCacheStorage::Int8Group64:
+    case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
+    case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
+    case KvCacheStorage::RK4V4E8:
+    case KvCacheStorage::RK2V4E8:
+    case KvCacheStorage::RK4V2E8:
+        break;
+    default:
+        if (page_score != nullptr) {
+            throw std::invalid_argument(
+                std::string(op) + ": page_score is only recorded by the INT8 and rk cached routes; "
+                                  "this KV storage has no cached kernel that writes it");
+        }
+        break;
     }
 
     if (cache.storage == KvCacheStorage::BFloat16) {

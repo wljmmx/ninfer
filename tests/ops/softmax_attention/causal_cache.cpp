@@ -3412,6 +3412,74 @@ int run_absent_page_cases(DeviceExecutionView execution, KvCacheStorage storage)
     return failures;
 }
 
+// Only the INT8 and rk families thread the op-level page_score plane into a cached route that
+// records it; every other storage has no cached kernel that writes it.
+bool cached_route_records_page_scores(KvCacheStorage storage) {
+    switch (storage) {
+    case KvCacheStorage::Int8Group64:
+    case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
+    case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
+    case KvCacheStorage::RK4V4E8:
+    case KvCacheStorage::RK2V4E8:
+    case KvCacheStorage::RK4V2E8:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// The dispatcher validates page_score on every entry. The contract case pins the split the
+// validation implies: the storages that own a recording cached route accept the plane, every
+// other layout rejects it loudly instead of validating it and then silently recording nothing
+// (a caller could not tell that no-op from a recorded pass).
+int run_page_score_contract_cases(DeviceExecutionView execution, KvCacheStorage storage) {
+    // The NVFP4 suite runs only in Blackwell builds; the sm_89 run skips that storage entirely.
+    if (storage == KvCacheStorage::Nvfp4Group16) { return 0; }
+    int failures            = 0;
+    const Geometry& geometry = kGeometries[0];
+    constexpr std::int32_t tokens = 1, context = 64;
+    HostCache cache_host  = make_cache(geometry, storage, context, 6201u);
+    DeviceCache cache(cache_host, MappingPattern::Identity, context);
+    const std::vector<float> q = make_bf16_values(
+        std::size_t(kHeadDim) * geometry.q_heads * tokens, 6202u, -0.25f, 0.25f);
+    const std::vector<std::int32_t> positions{context};
+    const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
+    GuardedDeviceBuffer dq(q_bits.size() * sizeof(std::uint16_t)), dp(sizeof(std::int32_t)),
+        dout(q_bits.size() * sizeof(std::uint16_t)), dscores(64 * sizeof(std::int32_t), 256, 0);
+    dq.copy_from_host(q_bits.data(), q_bits.size() * sizeof(std::uint16_t));
+    dp.copy_from_host(positions.data(), positions.size() * sizeof(std::int32_t));
+    Tensor tq(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, tokens});
+    Tensor tp(dp.data(), DType::I32, {tokens});
+    Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, tokens});
+    Tensor tscores(dscores.data(), DType::I32, {64, 1});
+    const ops::CausalAttentionExecutionEnvelope envelope{
+        static_cast<std::uint32_t>(context + tokens), static_cast<std::uint32_t>(context + tokens)};
+    const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
+        op_geometry(geometry), storage, envelope, 1, tokens, tokens, execution);
+    GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
+    WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
+    const bool records = cached_route_records_page_scores(storage);
+    try {
+        ops::causal_softmax_attention_cached(tq, tp, op_geometry(geometry), kAttentionScale,
+                                             cache.view(), envelope, workspace, tout, execution,
+                                             &tscores);
+        if (!records) {
+            std::cerr << cache_name(storage)
+                      << ": causal_softmax_attention_cached accepted a page_score no cached route "
+                         "records\n";
+            ++failures;
+        }
+    } catch (const std::invalid_argument&) {
+        if (records) {
+            std::cerr << cache_name(storage)
+                      << ": causal_softmax_attention_cached rejected the page_score its own route "
+                         "records\n";
+            ++failures;
+        }
+    }
+    return failures;
+}
+
 int run_storage_cases(DeviceExecutionView execution, KvCacheStorage storage) {
     // Rank-compressed layouts run the same suite matrix: the layouts, names and tolerances
     // are registered, the cache is filled by the engine append op (append_rk_planes), and the
@@ -3448,6 +3516,7 @@ int run_storage_cases(DeviceExecutionView execution, KvCacheStorage storage) {
     failures += run_numerical_profile_cases(execution, storage);
     failures += run_small_prefill_cases(execution, storage);
     failures += run_absent_page_cases(execution, storage);
+    failures += run_page_score_contract_cases(execution, storage);
     return failures;
 }
 
