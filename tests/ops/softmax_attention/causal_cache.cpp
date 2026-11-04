@@ -2420,8 +2420,10 @@ struct BatchAttentionCase {
     MappingPattern mapping;
     std::uint32_t seed;
     bool graph_replay = false;
-    // Optional per-replay contexts exercise large live-length changes with stable device views.
     std::vector<std::vector<std::int32_t>> replay_contexts;
+    // When set, the case also binds a page-score matrix and asserts the kernel recorded something:
+    // BF16 used to accumulate nothing, so a zero row here means the evict policy sees no heat.
+    bool check_scores = false;
 };
 
 std::vector<float> extract_request_columns(const std::vector<float>& source,
@@ -2503,6 +2505,12 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
         control.emplace(initial, test_case.mapping, envelope.max_visible_keys);
     GuardedDeviceBuffer dq(q.size() * 2), dk(k.size() * 2), dv(v.size() * 2), dp(columns * 4),
         dvalid(batch * 4), dlanes(batch * 4), dout(q.size() * 2);
+    // P6 2c score matrix: one row per pool row, generously wide so the kernel's own stride fits.
+    const std::size_t score_columns = 4096;
+    GuardedDeviceBuffer dscores(std::size_t(pool_rows) * score_columns * sizeof(std::int32_t), 256, 0);
+    dscores.fill(0);
+    Tensor tscores(dscores.data(), DType::I32,
+                   {static_cast<std::int32_t>(pool_rows), static_cast<std::int32_t>(score_columns)});
     Tensor tq(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, width, batch});
     Tensor tk(dk.data(), DType::BF16, {kHeadDim, geometry.kv_heads, width, batch}),
         tv(dv.data(), DType::BF16, {kHeadDim, geometry.kv_heads, width, batch});
@@ -2519,7 +2527,8 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
     const auto launch = [&] {
         ops::causal_softmax_attention(tq, tk, tv, tp, masked ? tvalid : Tensor{}, tlanes,
                                       op_geometry(geometry), kAttentionScale, cache.view(),
-                                      envelope, workspace, tout, execution);
+                                      envelope, workspace, tout, execution,
+                                      test_case.check_scores ? &tscores : nullptr);
     };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
@@ -2610,6 +2619,16 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
                                      attention_criterion(storage));
         failures += verify_invalid_columns_zero(label, output, geometry, width, valid);
 
+        if (test_case.check_scores) {
+            const auto scores = copy_from_guarded<std::int32_t>(
+                dscores, std::size_t(pool_rows) * score_columns);
+            const bool any = std::any_of(scores.begin(), scores.end(),
+                                         [](std::int32_t value) { return value > 0; });
+            if (!any) {
+                std::cerr << label << ": page scores are all zero, the kernel recorded nothing\n";
+                ++failures;
+            }
+        }
         failures += cache.verify(label, expected);
         failures += cache.verify_untouched(label, before, positions, lanes, valid, width);
         if (control) {
@@ -2765,6 +2784,16 @@ int run_verify_width_cases(DeviceExecutionView execution, KvCacheStorage storage
     if (storage == KvCacheStorage::BFloat16 || storage == KvCacheStorage::Int8Group64) {
         for (int width : {32, 64, 128, 256})
             for (int batch : {2, 4}) failures += run(width, batch, 0, false);
+    }
+    // P6 2c: bind a page-score matrix and require the kernel to have recorded something. BF16 used to
+    // leave the planes at zero, which made an evict policy reading them fall back to a pure window.
+    if (storage == KvCacheStorage::BFloat16) {
+        // W=256 is four key tiles: the first one has no running max yet (the vote is gated on it), so a
+        // single-tile prompt would legitimately record nothing.
+        BatchAttentionCase scored{256, {0, 17}, {256, 255}, {0, 1}, MappingPattern::Fragmented, 9001u,
+                                  false};
+        scored.check_scores = true;
+        failures += run_batch_case(execution, kGeometries[0], storage, scored);
     }
     for (int width : {8, 9, 16}) {
         failures +=

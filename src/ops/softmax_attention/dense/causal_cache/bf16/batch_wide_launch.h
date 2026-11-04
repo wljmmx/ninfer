@@ -13,6 +13,6 @@ namespace ninfer::ops::detail {
 void bf16_kv_batch_wide_attention(const Tensor& q, const Tensor& positions, const Tensor& valid_columns,
                                   const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
                                   CausalAttentionExecutionEnvelope envelope, Tensor& out,
-                                  DeviceExecutionView execution);
+                                  DeviceExecutionView execution, Tensor* page_score = nullptr);
 
 } // namespace ninfer::ops::detail

@@ -8,6 +8,10 @@ int run_softmax_attention_plain_and_packed_tests();
 int run_softmax_attention_context_tests();
 
 int main(int argc, char** argv) {
+    // The score probe reads this once, at first launch. With the exact comparison (0) a random tile
+    // rarely beats the running max, so a correctness run can legitimately record nothing; the test only
+    // wants to know the planes are written at all.
+    _putenv_s("NINFER_KV_PAGE_SCORE_TOL", "1000");
     bool causal_only = false;
     std::optional<ninfer::KvCacheStorage> storage;
     try {

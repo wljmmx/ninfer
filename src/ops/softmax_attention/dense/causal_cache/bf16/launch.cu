@@ -95,7 +95,7 @@ void bf16_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     if (q.ne[3] > 1 && q.ne[2] > 16) {
         kv_cache_append_batch_launch(k, v, positions, valid_columns, table_rows, cache, stream);
         bf16_kv_batch_wide_attention(q, positions, valid_columns, table_rows, scale, cache, envelope,
-                                     out, execution);
+                                     out, execution, page_score);
         return;
     }
     const auto plan           = make_bf16_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
