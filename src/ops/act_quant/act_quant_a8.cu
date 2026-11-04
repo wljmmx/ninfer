@@ -10,7 +10,7 @@
 namespace ninfer::ops {
 namespace {
 
-__global__ void a8_roundtrip_kernel(__nv_bfloat16* __restrict__ data, int k) {
+__launch_bounds__(512) __global__ void a8_roundtrip_kernel(__nv_bfloat16* __restrict__ data, int k) {
     const int t                     = blockIdx.x;
     __nv_bfloat16* __restrict__ row = data + static_cast<std::size_t>(t) * k;
     float amax                      = 0.0f;
@@ -42,7 +42,7 @@ __global__ void a8_roundtrip_kernel(__nv_bfloat16* __restrict__ data, int k) {
 // One scale per `group` contiguous elements, matching the dense W4A8 quantiser (kG = 64) and the
 // weight groups it multiplies. Sixteen lanes cooperate on one group, each taking a contiguous run,
 // so a warp covers two groups as one coalesced pass.
-__global__ void a8_roundtrip_group_kernel(__nv_bfloat16* __restrict__ data, int k, int group) {
+__launch_bounds__(512) __global__ void a8_roundtrip_group_kernel(__nv_bfloat16* __restrict__ data, int k, int group) {
     constexpr int kLanesPerGroup = 16;
     const int t                  = blockIdx.x;
     __nv_bfloat16* __restrict__ row = data + static_cast<std::size_t>(t) * k;

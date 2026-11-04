@@ -57,7 +57,7 @@ template <int G> __device__ __forceinline__ void cpw() {
 // One thread decodes a 16-element quarter of one group (8 packed code bytes + 2 high-bit
 // bytes -> one 16-byte vector store), so the reads and writes are vectorized and no
 // per-element 64-bit division is needed (the row comes from blockIdx.y).
-__global__ void dequant_q5_i8(const std::uint8_t* __restrict__ codes,
+__launch_bounds__(256) __global__ void dequant_q5_i8(const std::uint8_t* __restrict__ codes,
                               const std::uint8_t* __restrict__ high, std::int8_t* __restrict__ out,
                               int groups, int k) {
     const int task = blockIdx.x * blockDim.x + threadIdx.x;
@@ -662,7 +662,8 @@ __global__ __launch_bounds__(kSGThreads, 2) void w4a8_swiglu_kernel(
 // grouped kernel's fold can index (token, group) unconditionally and the two
 // modes share one kernel.
 template <bool kPerGroup>
-__global__ void quant_a8_grouped_kernel(const __nv_bfloat16* __restrict__ x,
+// The launcher sizes the block from k (4 * k/64, capped at 1024), so the bound is the cap.
+__launch_bounds__(1024) __global__ void quant_a8_grouped_kernel(const __nv_bfloat16* __restrict__ x,
                                         std::int8_t* __restrict__ out, float* __restrict__ scale,
                                         int k, int tokens) {
     constexpr int kG = 64;
@@ -786,7 +787,7 @@ struct W4A8GroupedJob {
 };
 
 // q4/q5 (groups of 64) -> int8, natural row order. q5 adds the high-bit plane.
-__global__ void dequant_q4q5_i8(const std::uint8_t* __restrict__ codes,
+__launch_bounds__(256) __global__ void dequant_q4q5_i8(const std::uint8_t* __restrict__ codes,
                                 const std::uint8_t* __restrict__ high, std::int8_t* __restrict__ out,
                                 int groups, int k, int q5) {
     const int task = blockIdx.x * blockDim.x + threadIdx.x;

@@ -11,8 +11,10 @@
 namespace ninfer::ops::detail {
 namespace {
 
+// Launched with 256 threads everywhere (the StaticWidth==4 fast path uses 64, which the
+// ceiling form admits).
 template <int Channels, int QueryRows, int KeyRows, int ValueRows, int StaticWidth, class Publish>
-__global__ void gdn_projected_conv_kernel(
+__launch_bounds__(256) __global__ void gdn_projected_conv_kernel(
     const __nv_bfloat16* __restrict__ projected, const __nv_bfloat16* __restrict__ conv_weight,
     const __nv_bfloat16* __restrict__ state_read, const std::int32_t* __restrict__ valid_columns,
     const std::int32_t* __restrict__ initial_state_slots, __nv_bfloat16* __restrict__ query,

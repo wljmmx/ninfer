@@ -36,7 +36,7 @@ constexpr int k35K           = 2048;
 constexpr int k35LogicalRows = 2 * k35N;
 
 template <int TokenTile, int KSlice, int RowsPerBlock>
-__global__ void bf16_gdn_gating_proj_small_t_partial_kernel(
+__launch_bounds__(RowsPerBlock * 32) __global__ void bf16_gdn_gating_proj_small_t_partial_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ a_weight,
     const __nv_bfloat16* __restrict__ b_weight, float* __restrict__ partial, std::int32_t t) {
     static_assert(TokenTile == kSmallTMax, "small-T token tile is fixed to 8");
@@ -115,7 +115,7 @@ __global__ void bf16_gdn_gating_proj_small_t_partial_kernel(
     }
 }
 
-__global__ void bf16_gdn_gating_proj_small_t_reduce_kernel(const float* __restrict__ partial,
+__launch_bounds__(128) __global__ void bf16_gdn_gating_proj_small_t_reduce_kernel(const float* __restrict__ partial,
                                                            const float* __restrict__ A_log,
                                                            const float* __restrict__ dt_bias,
                                                            float* __restrict__ g,
@@ -143,7 +143,7 @@ __global__ void bf16_gdn_gating_proj_small_t_reduce_kernel(const float* __restri
     beta[out_index]              = sigmoid(acc_b);
 }
 
-__global__ void bf16_gdn_gating_proj_gemv_kernel(const __nv_bfloat16* x,
+__launch_bounds__(kThreads) __global__ void bf16_gdn_gating_proj_gemv_kernel(const __nv_bfloat16* x,
                                                  const __nv_bfloat16* a_weight,
                                                  const __nv_bfloat16* b_weight, const float* A_log,
                                                  const float* dt_bias, float* g, float* beta) {
@@ -178,7 +178,7 @@ __global__ void bf16_gdn_gating_proj_gemv_kernel(const __nv_bfloat16* x,
 }
 
 template <int ColsPerTile>
-__global__ void bf16_gdn_gating_proj_35_simt_kernel(const __nv_bfloat16* __restrict__ x,
+__launch_bounds__(32) __global__ void bf16_gdn_gating_proj_35_simt_kernel(const __nv_bfloat16* __restrict__ x,
                                                     const __nv_bfloat16* __restrict__ a_weight,
                                                     const __nv_bfloat16* __restrict__ b_weight,
                                                     const float* __restrict__ A_log,
