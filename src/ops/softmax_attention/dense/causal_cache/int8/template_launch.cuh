@@ -121,8 +121,9 @@ void launch_int8_kv_tiled_mma(const CausalAttentionOperands& p, Int8KvReadView c
             Int8KvTiledSmemBytes<S, PackedV>::kBytes);
         CUDA_CHECK(status);
         const dim3 grid(div_up(p.width, S::kQueryRows), G::QHeads);
-        // P6 2c: the op-level argument is an already-resolved counter row and overrides the view;
-        // the view's buffer is a base that the metadata resolves per row (appendix CA.3).
+        // P6 2c: the op-level argument binds the score-matrix base and overrides the view's plane;
+        // the kernel resolves its row through metadata.score_offset(), exactly like the view's own
+        // buffer would (appendix CA.3). Direct metadata has no batch, so its offset is zero.
         unsigned* const override_scores =
             page_score != nullptr ? static_cast<unsigned*>(page_score->data) : nullptr;
         kernel<<<grid, S::kThreads, Int8KvTiledSmemBytes<S, PackedV>::kBytes, stream>>>(

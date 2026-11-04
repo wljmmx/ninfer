@@ -2421,8 +2421,10 @@ struct BatchAttentionCase {
     std::uint32_t seed;
     bool graph_replay = false;
     std::vector<std::vector<std::int32_t>> replay_contexts;
-    // When set, the case also binds a page-score matrix and asserts the kernel recorded something:
-    // BF16 used to accumulate nothing, so a zero row here means the evict policy sees no heat.
+    // When set, the case also binds a page-score matrix and asserts every request recorded into
+    // its own pool row while no other row was touched: BF16 used to accumulate nothing, so a zero
+    // row here means the evict policy sees no heat, and a kernel that dropped the row offset
+    // would pile every vote into row 0.
     bool check_scores = false;
 };
 
@@ -2505,12 +2507,15 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
         control.emplace(initial, test_case.mapping, envelope.max_visible_keys);
     GuardedDeviceBuffer dq(q.size() * 2), dk(k.size() * 2), dv(v.size() * 2), dp(columns * 4),
         dvalid(batch * 4), dlanes(batch * 4), dout(q.size() * 2);
-    // P6 2c score matrix: one row per pool row, generously wide so the kernel's own stride fits.
-    const std::size_t score_columns = 4096;
-    GuardedDeviceBuffer dscores(std::size_t(pool_rows) * score_columns * sizeof(std::int32_t), 256, 0);
+    // P6 2c score plane: the same [logical pages, pool rows] shape and row stride the engine's
+    // execution tables use, so the kernels resolve a request's row through table_stride exactly
+    // like they would their own plane. One row per pool row.
+    const std::int32_t score_columns = cache.view().block_tables.ne[0];
+    GuardedDeviceBuffer dscores(
+        std::size_t(pool_rows) * static_cast<std::size_t>(score_columns) * sizeof(std::int32_t),
+        256, 0);
     dscores.fill(0);
-    Tensor tscores(dscores.data(), DType::I32,
-                   {static_cast<std::int32_t>(pool_rows), static_cast<std::int32_t>(score_columns)});
+    Tensor tscores(dscores.data(), DType::I32, {score_columns, static_cast<std::int32_t>(pool_rows)});
     Tensor tq(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, width, batch});
     Tensor tk(dk.data(), DType::BF16, {kHeadDim, geometry.kv_heads, width, batch}),
         tv(dv.data(), DType::BF16, {kHeadDim, geometry.kv_heads, width, batch});
@@ -2622,11 +2627,30 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
         if (test_case.check_scores) {
             const auto scores = copy_from_guarded<std::int32_t>(
                 dscores, std::size_t(pool_rows) * score_columns);
-            const bool any = std::any_of(scores.begin(), scores.end(),
-                                         [](std::int32_t value) { return value > 0; });
-            if (!any) {
-                std::cerr << label << ": page scores are all zero, the kernel recorded nothing\n";
-                ++failures;
+            // Each request votes into its own pool row: the wide/tiled kernels resolve the row
+            // through table_rows. A kernel that dropped the row offset would pile every vote into
+            // row 0, so both halves below fail - the owned rows stay empty and row 0 is not.
+            for (int b = 0; b < batch; ++b) {
+                if (!valid[b]) continue;
+                const std::int32_t* row =
+                    scores.data() + static_cast<std::size_t>(lanes[b]) * score_columns;
+                if (std::none_of(row, row + score_columns,
+                                 [](std::int32_t value) { return value > 0; })) {
+                    std::cerr << label << ": request " << b
+                              << " recorded no page score in its own row " << lanes[b] << '\n';
+                    ++failures;
+                }
+            }
+            for (int row_index = 0; row_index < pool_rows; ++row_index) {
+                if (std::find(lanes.begin(), lanes.end(), row_index) != lanes.end()) continue;
+                const std::int32_t* row =
+                    scores.data() + static_cast<std::size_t>(row_index) * score_columns;
+                if (std::any_of(row, row + score_columns,
+                                [](std::int32_t value) { return value != 0; })) {
+                    std::cerr << label << ": page score row " << row_index
+                              << " belongs to no request but is not zero\n";
+                    ++failures;
+                }
             }
         }
         failures += cache.verify(label, expected);
@@ -2891,11 +2915,12 @@ int run_verify_width_cases(DeviceExecutionView execution, KvCacheStorage storage
     failures += run(16, 8, 2048, true);
     // Wide batch: B>1 with W>16. Everything that owns a route for it is probed, including the rk
     // layouts, which now inherit the INT8 kernel through their own codec instantiations. The score
-    // probe rides the same shape with B=2, so each request has to reach its own counter row.
+    // probe rides the same shape with B=2 at pool rows 1 and 2, so each request has to reach its
+    // own counter row while row 0 - owned by nobody - has to stay untouched.
     if (supports_wide_batch(storage)) {
         for (int width : {32, 64, 128, 256})
             for (int batch : {2, 4}) failures += run(width, batch, 0, false);
-        BatchAttentionCase scored{256, {0, 17}, {256, 255}, {0, 1}, MappingPattern::Fragmented,
+        BatchAttentionCase scored{256, {0, 17}, {256, 255}, {1, 2}, MappingPattern::Fragmented,
                                   9001u, false};
         scored.check_scores = true;
         failures += run_batch_case(execution, kGeometries[0], storage, scored);

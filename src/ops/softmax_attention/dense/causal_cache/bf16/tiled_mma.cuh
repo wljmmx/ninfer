@@ -56,8 +56,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     const int base_pos              = positions[0];
     const std::int32_t* block_table = metadata.block_table();
     // P6 2c: the counter planes the INT8 family records. BF16 accumulated none, so a reader of this row
-    // saw all zeros and the evict policy silently fell back to a pure window.
-    unsigned* const counters = page_score != nullptr ? page_score : metadata.counters();
+    // saw all zeros and the evict policy silently fell back to a pure window. The caller's override
+    // binds the matrix base, so it takes the same row offset the metadata's own plane would.
+    unsigned* const counters =
+        page_score != nullptr ? page_score + metadata.score_offset() : metadata.counters();
     unsigned* const recent   = metadata.recents();
     const int score_row_begin =
         ninfer::ops::paged_kv_page_score_row_begin(base_pos + width - 1, score_row_span);

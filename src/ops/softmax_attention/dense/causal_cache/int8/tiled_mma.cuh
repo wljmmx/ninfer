@@ -36,7 +36,8 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
     std::int32_t score_row_span, float score_tolerance, std::int32_t score_mass) {
     // P6 2c hook site (appendix BL.2/BM.1 step 1.2). One CTA covers exactly one 64-token page
     // here, so the CTA-wide hit reduction feeds counters[k0 >> kPagedKVPageShift]. `page_score` is
-    // the caller's already-resolved override; the metadata path is resolved below.
+    // the caller's override and binds the matrix base; the row resolution below moves it onto this
+    // request's row exactly like the metadata's own plane (the wide kernel's appendix CA.2/CA.3).
     constexpr int D             = 256;
     constexpr int Br            = Schedule::kQueryRows;
     constexpr int Bc            = Schedule::kKeyRows;
@@ -94,7 +95,10 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
     const int base_pos              = positions[0];
     const std::int32_t* block_table = metadata.block_table();
     // The relevance-counter row of this CTA, resolved exactly like block_table (appendix CA.2/CA.3).
-    unsigned* const counters = page_score != nullptr ? page_score : metadata.counters();
+    // The caller's override binds the matrix base, so it takes the same row offset the metadata's
+    // own plane would; without it every request votes into row 0 and the heat map loses a request.
+    unsigned* const counters =
+        page_score != nullptr ? page_score + metadata.score_offset() : metadata.counters();
     // P6 2c B4 (appendix DN): the oldest query row allowed to vote. `width` is this call's token count,
     // so `base_pos + width - 1` is its last token; span 0 - the default - admits every row.
     const int score_row_begin =
