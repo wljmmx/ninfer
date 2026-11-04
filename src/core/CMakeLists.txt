@@ -37,4 +37,11 @@ ninfer_cuda_archive(ninfer_core)
 target_link_libraries(ninfer_core PUBLIC ninfer_cpu CUDA::cudart CUDA::nvtx3 Threads::Threads)
 # port (sm_89): VmmPool drives the driver VMM entry points directly.
 target_link_libraries(ninfer_core PUBLIC CUDA::cuda_driver)
+# core/resp.h is a header-only Winsock client: every translation unit that instantiates
+# RespClient (directly or via checkpoint_tier.h / redis_kv_tier.h) references the ws2_32
+# import symbols, and those units live in every library that consumes core headers
+# (model_runtime's context_transaction.cpp is the one the test exes actually pull in).
+# The dependency belongs to the header's owner, so propagate it like cudart: any exe
+# that links core - directly or transitively - gets ws2_32 on Windows.
+target_link_libraries(ninfer_core PUBLIC $<$<PLATFORM_ID:Windows>:ws2_32>)
 

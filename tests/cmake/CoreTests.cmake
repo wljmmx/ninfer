@@ -98,16 +98,17 @@ ninfer_add_test(ninfer_kv_seam_test
   LIBRARIES ninfer_core)
 
 # The RESP transport for the LMCache remote tier: encoding always runs, the round trip runs only
-# when NINFER_RESP_PORT points at a Redis (77 = skipped otherwise).
+# when NINFER_RESP_PORT points at a Redis (77 = skipped otherwise). ws2_32 arrives transitively
+# through ninfer_core (core/resp.h owns the Winsock dependency), so tests never spell it out.
 ninfer_add_test(ninfer_resp_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/resp_test.cpp"
-  LIBRARIES ninfer_core $<$<PLATFORM_ID:Windows>:ws2_32>)
+  LIBRARIES ninfer_core)
 set_tests_properties(ninfer_resp_test PROPERTIES SKIP_RETURN_CODE 77)
 
 # P1-b: the LMCache key format, the consecutive-prefix rule, and the Redis-backed KV tier.
 ninfer_add_test(ninfer_kv_tier_redis_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/kv_tier_redis_test.cpp"
-  LIBRARIES ninfer_core $<$<PLATFORM_ID:Windows>:ws2_32>)
+  LIBRARIES ninfer_core)
 set_tests_properties(ninfer_kv_tier_redis_test PROPERTIES SKIP_RETURN_CODE 77)
 
 # P1-b: chunk hashing (ours, chained) and the contiguous-prefix skip length.
@@ -129,5 +130,5 @@ ninfer_add_test(ninfer_lmcache_state_payload_test
 # P1-b-2d: checkpoint blobs through the tier, keyed by content digest.
 ninfer_add_test(ninfer_checkpoint_tier_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/checkpoint_tier_test.cpp"
-  LIBRARIES ninfer_core $<$<PLATFORM_ID:Windows>:ws2_32>)
+  LIBRARIES ninfer_core)
 set_tests_properties(ninfer_checkpoint_tier_test PROPERTIES SKIP_RETURN_CODE 77)
