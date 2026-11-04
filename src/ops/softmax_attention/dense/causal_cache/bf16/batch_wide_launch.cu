@@ -21,7 +21,8 @@ void launch_wide(const CausalAttentionOperands& p, Bf16KvCacheView<false> cache,
         p.q, cache.keys, cache.values, cache.valid_columns,
         cache.table_rows,
         static_cast<const std::int32_t*>(cache.tables), cache.table_stride, p.positions, p.scale, p.out,
-        p.width, p.batch);
+        p.width, p.batch, cache.page_scores, cache.page_scores_peak, cache.page_scores_recent,
+        kv_page_score_row_span(), kv_page_score_tolerance(), kv_page_score_mass());
     CUDA_CHECK(cudaGetLastError());
 }
 
