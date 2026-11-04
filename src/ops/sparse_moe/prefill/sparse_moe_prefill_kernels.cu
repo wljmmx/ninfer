@@ -417,21 +417,24 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
             }
         };
 
-        // Q4MmaDecodeAtom::decode_eight takes the group's fp16 scale explicitly. Sr holds
-        // every group's scale for these rows, indexed (row * GroupsPerRow + group).
-        auto decode_weight = [&](int stage, int group) {
+        // The decoded weights stay exact integers: kExpertBK equals the Q4 group width, so one
+        // k-tile is exactly one quant group and the tile's fp32 product takes the group's fp16
+        // scale once per output element below, instead of rounding every code*scale to bf16 on
+        // the way into As (Q4ScaleApply::PostMma in the q4 A16 schedule). Cr holds the current
+        // tile's codes; Sr holds every group's scale for these rows, indexed
+        // (row * GroupsPerRow + group).
+        static_assert(kExpertBK == Q4RowSplitStorage::kGroupK,
+                      "post-MMA scaling assumes one k-tile spans exactly one quant group");
+        auto decode_weight = [&](int stage) {
             constexpr int CodeChunksPerRow = Q4RowSplitStorage::kCodeBytesPerGroup / 4;
             static_assert(CodeChunksPerRow * 8 == kExpertBK,
                           "a row of codes must decode to exactly the tile's k width");
             for (int item = tid; item < kExpertBM * CodeChunksPerRow; item += ExpertThreads) {
                 const int row   = item / CodeChunksPerRow;
                 const int chunk = item - row * CodeChunksPerRow;
-                const float scale = __half2float(__ushort_as_half(
-                    *reinterpret_cast<const std::uint16_t*>(&Sr[(row * GroupsPerRow + group) * 2])));
                 unsigned decoded[4];
                 Q4MmaDecodeAtom::decode_eight(
-                    *reinterpret_cast<const unsigned*>(&Cr[stage][row * 32 + chunk * 4]), scale,
-                    decoded);
+                    *reinterpret_cast<const unsigned*>(&Cr[stage][row * 32 + chunk * 4]), decoded);
                 store_vec(&As[row * kExpertBK + gemm_swz64(row, chunk * 8)],
                           make_int4(static_cast<int>(decoded[0]), static_cast<int>(decoded[1]),
                                     static_cast<int>(decoded[2]), static_cast<int>(decoded[3])));
@@ -451,7 +454,7 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
             const int stage = kt % Stages;
             cp_wait<Stages - 1>();
             __syncthreads();
-            decode_weight(stage, kt);
+            decode_weight(stage);
             __syncthreads();
 
             if (warp * WarpCols < cols) {
@@ -484,15 +487,22 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
                 }
 #pragma unroll
                 for (int mi = 0; mi < 4; ++mi) {
-                    // decode_weight already folded this group's scale into the decoded values, so
-                    // partial is scaled. Applying the scale a second time here squared it and left
-                    // the routed term wrong by a factor of scale^2 on every prefill tile.
+                    // The tile's mma rows are tile-local rows mi*16+gid and +8, and Sr is indexed
+                    // the same way. The four lanes of a gid quartet all hold elements of those two
+                    // rows, so every lane reads the same two halfwords: a broadcast shared load,
+                    // cheaper in registers and instructions than a shuffle distribution.
+                    const int row0 = mi * 16 + gid;
+                    const int row1 = row0 + 8;
+                    const float scale0 = __half2float(__ushort_as_half(
+                        *reinterpret_cast<const std::uint16_t*>(&Sr[(row0 * GroupsPerRow + kt) * 2])));
+                    const float scale1 = __half2float(__ushort_as_half(
+                        *reinterpret_cast<const std::uint16_t*>(&Sr[(row1 * GroupsPerRow + kt) * 2])));
 #pragma unroll
                     for (int ni = 0; ni < WarpNT; ++ni) {
-                        acc[mi][ni][0] += partial[mi][ni][0];
-                        acc[mi][ni][1] += partial[mi][ni][1];
-                        acc[mi][ni][2] += partial[mi][ni][2];
-                        acc[mi][ni][3] += partial[mi][ni][3];
+                        acc[mi][ni][0] = fmaf(partial[mi][ni][0], scale0, acc[mi][ni][0]);
+                        acc[mi][ni][1] = fmaf(partial[mi][ni][1], scale0, acc[mi][ni][1]);
+                        acc[mi][ni][2] = fmaf(partial[mi][ni][2], scale1, acc[mi][ni][2]);
+                        acc[mi][ni][3] = fmaf(partial[mi][ni][3], scale1, acc[mi][ni][3]);
                     }
                 }
             }
