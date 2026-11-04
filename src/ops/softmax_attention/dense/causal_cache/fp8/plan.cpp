@@ -13,7 +13,7 @@ Fp8KvCausalPlan make_fp8_kv_causal_plan(int heads, int width, int batch,
                                         CausalAttentionExecutionEnvelope envelope,
                                         int multiprocessor_count) {
     if (multiprocessor_count <= 0 || (heads != 24 && heads != 16) || width < 1 || batch < 1 ||
-        batch > 8 || (batch > 1 && width > 16) || envelope.min_visible_keys == 0 ||
+        batch > 8 || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
         envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys)
         throw std::invalid_argument("FP8 attention: invalid plan inputs");
@@ -28,7 +28,8 @@ Fp8KvCausalPlan make_fp8_kv_causal_plan(int heads, int width, int batch,
             width,
             batch,
             envelope,
-            mxfp8_tiled_partition(heads, width, envelope.max_visible_keys, multiprocessor_count)};
+            mxfp8_tiled_partition(heads, width, batch, envelope.max_visible_keys,
+                                  multiprocessor_count)};
     const int tiles =
         family == Fp8KvFamily::ParallelGrouped ? (width + grouped_limit - 1) / grouped_limit : 1;
     const int independent_tiles = batch * (heads == 24 ? 4 : 2) * tiles;
@@ -60,8 +61,8 @@ std::size_t fp8_kv_workspace_bytes(int heads, int batch, int min_width, int max_
         maximum = std::max(maximum, layout.peak_bytes(1));
     }
     return std::max(maximum, mxfp8_tiled_workspace_bytes(
-                                 heads, std::max(min_width, kGroupedPrefillMaxWidth + 1), max_width,
-                                 envelope.max_visible_keys, multiprocessor_count));
+                                 heads, batch, std::max(min_width, kGroupedPrefillMaxWidth + 1),
+                                 max_width, envelope.max_visible_keys, multiprocessor_count));
 }
 
 } // namespace ninfer::ops::detail

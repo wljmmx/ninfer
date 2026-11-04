@@ -10,7 +10,7 @@ void fp8_kv_tiled_attention(const CausalAttentionOperands& p, Fp8KvReadView cach
                             Tensor* page_score, cudaStream_t stream) {
     auto scope = workspace.scope();
     const auto partial =
-        allocate_causal_partials(workspace, p.query_heads, p.width, partition.capacity, 1);
+        allocate_causal_partials(workspace, p.query_heads, p.width, partition.capacity, p.batch);
     const auto invoke = [&]<class G>() {
         launch_mxfp8_kv_tiled_mma<G, Fp8KvTiledInstance, Fp8KvTiledValues>(p, cache, partition,
                                                                            partial.view(), page_score,

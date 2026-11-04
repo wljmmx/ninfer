@@ -34,6 +34,12 @@ struct PagedKVDirectMetadata {
 
     /// The newest-rows count row for this CTA, resolved the same way as block_table().
     __device__ __forceinline__ unsigned* recents() const { return page_score_recents; }
+
+    /// One row is all this view binds, so there is no batch to select.
+    __device__ __forceinline__ void select_batch(int) {}
+
+    /// The caller-supplied counter plane already is the row of the only request.
+    __device__ __forceinline__ std::int64_t score_offset() const { return 0; }
 };
 
 template <bool Masked>
@@ -81,6 +87,20 @@ struct PagedKVBatchMetadata {
         return page_score_recents == nullptr
                    ? nullptr
                    : page_score_recents + static_cast<std::int64_t>(table_rows[0]) * table_stride;
+    }
+
+    /// Move this view onto request `b`. The row-dependent accessors above all resolve through
+    /// table_rows[0]/valid_columns[0], so advancing the two pointer bases selects the batch row
+    /// exactly as the block table does (the same trick int8/batch_wide_mma.cuh uses).
+    __device__ __forceinline__ void select_batch(int b) {
+        table_rows += b;
+        if (valid_columns != nullptr) { valid_columns += b; }
+    }
+
+    /// The page-score matrix offset of this CTA's row, for callers that bind the plane themselves
+    /// instead of going through counters().
+    __device__ __forceinline__ std::int64_t score_offset() const {
+        return static_cast<std::int64_t>(table_rows[0]) * table_stride;
     }
 };
 

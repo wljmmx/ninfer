@@ -2779,23 +2779,23 @@ int run_verify_width_cases(DeviceExecutionView execution, KvCacheStorage storage
     for (int width : {7, 8, 9, 16})
         for (int batch : {1, 8}) failures += run(width, batch, 127, true);
     failures += run(16, 8, 2048, true);
-    // Wide batch: B>1 with W>16 runs on the dedicated batch-wide kernel. BF16 and INT8 both have it;
-    // the compressed layouts still refuse the shape in their plans.
-    if (storage == KvCacheStorage::BFloat16 || storage == KvCacheStorage::Int8Group64) {
+    // Wide batch: B>1 with W>16. BF16 and INT8 run their dedicated batch-wide kernels; FP8 and K8V4
+    // interleave the batch into the tiled kernel's split ladder. The rank-compressed layouts (which
+    // inherit INT8) are not covered here.
+    if (storage == KvCacheStorage::BFloat16 || storage == KvCacheStorage::Int8Group64 ||
+        storage == KvCacheStorage::Fp8E4M3Row256 ||
+        storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         for (int width : {32, 64, 128, 256})
             for (int batch : {2, 4}) failures += run(width, batch, 0, false);
     }
-    // P6 2c: bind a page-score matrix and require the kernel to have recorded something. BF16 and INT8
-    // cover the wide-batch path (B=2); FP8 and K8V4 do not have a wide-batch kernel yet, so they are
-    // probed on the single-row tiled path, which is the one they actually use.
-    if (storage == KvCacheStorage::BFloat16 || storage == KvCacheStorage::Int8Group64) {
-        BatchAttentionCase scored{256, {0, 17}, {256, 255}, {0, 1}, MappingPattern::Fragmented, 9001u,
-                                  false};
-        scored.check_scores = true;
-        failures += run_batch_case(execution, kGeometries[0], storage, scored);
-    } else if (storage == KvCacheStorage::Fp8E4M3Row256 ||
-               storage == KvCacheStorage::Fp8KeyNvfp4Value) {
-        BatchAttentionCase scored{256, {0}, {256}, {0}, MappingPattern::Fragmented, 9002u, false};
+    // P6 2c: bind a page-score matrix and require the kernel to have recorded something. All four
+    // layouts that own a wide-batch path are probed with B=2, so the per-request counter row is
+    // exercised, not just the single-row base.
+    if (storage == KvCacheStorage::BFloat16 || storage == KvCacheStorage::Int8Group64 ||
+        storage == KvCacheStorage::Fp8E4M3Row256 ||
+        storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+        BatchAttentionCase scored{256, {0, 17}, {256, 255}, {0, 1}, MappingPattern::Fragmented,
+                                  9001u, false};
         scored.check_scores = true;
         failures += run_batch_case(execution, kGeometries[0], storage, scored);
     }

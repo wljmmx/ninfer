@@ -51,16 +51,19 @@ void launch_mxfp8_kv_tiled_mma(const CausalAttentionOperands& p, View cache,
                                CausalKvPartition partition, CausalPartialView partial,
                                Tensor* page_score, cudaStream_t stream) {
     validate_quantized_causal_operands<G>(p, cache);
-    if (p.batch != 1 || partition.target < 1 || partition.target > kMxfp8TiledMaxSplits ||
+    if (partition.target < 1 || partition.target > kMxfp8TiledMaxSplits ||
         partition.capacity != partition.active(p.visible_capacity) || !partial.acc ||
         !partial.maximum || !partial.sum)
-        throw std::invalid_argument("MXFP8 tiled attention: invalid batch or partial storage");
+        throw std::invalid_argument("MXFP8 tiled attention: invalid partition or partial storage");
     const auto invoke = [&]<class Metadata>(Metadata metadata) {
         constexpr auto kernel    = mxfp8_kv_tiled_mma_kernel<G, S, Values, Metadata>;
         static const auto status = cudaFuncSetAttribute(
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, S::kSharedBytes);
         CUDA_CHECK(status);
-        const dim3 grid(div_up(p.width, S::kQueryRows), G::QHeads, partition.capacity);
+        // The split ladder already owns z, so a wide batch interleaves with it rather than
+        // replacing it: z = batch * capacity, which the kernel splits back into (batch, split).
+        const dim3 grid(div_up(p.width, S::kQueryRows), G::QHeads,
+                        p.batch * partition.capacity);
         unsigned* const override_scores =
             page_score != nullptr ? static_cast<unsigned*>(page_score->data) : nullptr;
         kernel<<<grid, S::kThreads, S::kSharedBytes, stream>>>(

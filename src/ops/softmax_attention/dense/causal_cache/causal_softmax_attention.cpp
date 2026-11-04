@@ -280,11 +280,12 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
     }
 
     // A batch wider than the verify width runs on the dedicated wide-batch kernel, which keeps no
-    // split-K partials: its workspace is empty. Other layouts still refuse that shape in their plans.
-    if (batch_size > 1 && max_width > kMaximumVerifyTokens) {
-        if (cache_storage == KvCacheStorage::BFloat16 || cache_storage == KvCacheStorage::Int8Group64) { return 0; }
-        throw std::invalid_argument(
-            "causal_softmax_attention workspace: invalid profile or interval");
+    // split-K partials: its workspace is empty. FP8 and K8V4 now run that shape through the tiled
+    // kernel, so they compute a real (batch-scaled) partial workspace below instead.
+    if (batch_size > 1 && max_width > kMaximumVerifyTokens &&
+        (cache_storage == KvCacheStorage::BFloat16 ||
+         cache_storage == KvCacheStorage::Int8Group64)) {
+        return 0;
     }
     if (cache_storage == KvCacheStorage::BFloat16)
         return detail::bf16_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,

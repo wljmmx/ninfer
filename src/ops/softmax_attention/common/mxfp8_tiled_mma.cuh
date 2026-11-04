@@ -48,30 +48,52 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
 
     const int q_block = static_cast<int>(blockIdx.x);
     const int q_head  = static_cast<int>(blockIdx.y);
+    // grid.z is batch * capacity: the CTA's z is a (batch, split) pair with the batch outermost, so
+    // one launch covers every request while each still gets its own KV split ladder.
+    const int b       = static_cast<int>(blockIdx.z) / partition.capacity;
+    const int split   = static_cast<int>(blockIdx.z) - b * partition.capacity;
     const int tid     = static_cast<int>(threadIdx.x);
     const int warp    = tid >> 5;
     const int lane    = tid & 31;
     const int q0      = q_block * Br;
     const int kv_head = q_head / Geometry::GroupSize;
+    // The batch row resolves through the metadata exactly like the block table does, so
+    // valid_tokens / block_table / counters all follow request b after this call.
+    metadata.select_batch(b);
     const int tokens  = metadata.valid_tokens(width);
     if (q_head >= Geometry::QHeads || q0 >= width) return;
     if (q0 >= tokens) return;
-    const int split         = blockIdx.z;
-    const int visible       = positions[width - 1] + 1;
+    // q, positions and the partial planes are [B][W][...]: the batch is the outermost block, so a
+    // column keeps the same D*H stride it has when B is 1. The Tensor shape is metadata only.
+    const __nv_bfloat16* const q_b =
+        q + static_cast<std::int64_t>(b) * width * D * Geometry::QHeads;
+    const std::int32_t* const positions_b = positions + static_cast<std::int64_t>(b) * width;
+    if (b > 0) {
+        const std::int64_t stat_offset =
+            static_cast<std::int64_t>(b) * Geometry::QHeads * width * partition.capacity;
+        partial.acc += static_cast<std::int64_t>(b) * D * Geometry::QHeads * width *
+                       partition.capacity;
+        partial.maximum += stat_offset;
+        partial.sum += stat_offset;
+    }
+    const int visible       = positions_b[width - 1] + 1;
     const int active_splits = partition.active(visible);
     if (split >= active_splits) return;
     const int logical_tiles         = div_up(visible, Bc);
     const int first_owned_tile      = split * logical_tiles / active_splits;
     const int end_owned_tile        = (split + 1) * logical_tiles / active_splits;
-    const int base_pos              = positions[0];
+    const int base_pos              = positions_b[0];
     const std::int32_t* block_table = metadata.block_table();
     // P6 2c: the same planes the INT8 family records. Split-local semantics by design: each split
     // owns a disjoint range of key tiles, so a page is voted on once, against this split's running
-    // max - which is exactly what int8/grouped_mma.cuh does.
-    unsigned* const counters = page_scores != nullptr ? page_scores : metadata.counters();
+    // max - which is exactly what int8/grouped_mma.cuh does. The caller's override binds the matrix
+    // base, so it moves to request b's row the same way the metadata's own plane does.
+    unsigned* const counters = page_scores != nullptr
+                                   ? page_scores + metadata.score_offset()
+                                   : metadata.counters();
     unsigned* const recent   = metadata.recents();
     const int score_row_begin =
-        ninfer::ops::paged_kv_page_score_row_begin(positions[width - 1], score_row_span);
+        ninfer::ops::paged_kv_page_score_row_begin(positions_b[width - 1], score_row_span);
     const int tile_rows             = min(Br, tokens - q0);
     const int max_query_abs         = base_pos + q0 + tile_rows - 1;
     const int key_blocks = max(0, min(end_owned_tile, max_query_abs / Bc + 1) - first_owned_tile);
@@ -83,7 +105,7 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
         for (int r = 0; r < 8; ++r) {
             const int d = lane + 32 * r;
             values[r]   = row < tile_rows
-                              ? __bfloat162float(q[causal_q_index<Geometry>(q_head, d, q0 + row)])
+                              ? __bfloat162float(q_b[causal_q_index<Geometry>(q_head, d, q0 + row)])
                               : 0.0F;
         }
         normalized_hadamard_d256_inplace(values, lane);
