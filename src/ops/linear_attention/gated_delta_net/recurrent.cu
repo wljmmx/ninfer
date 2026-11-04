@@ -37,10 +37,11 @@ void launch_recurrent_direct_fixed(const Tensor& q, const Tensor& k, const Tenso
 
 template <bool NormalizeInputs>
 void launch_recurrent_batch_update_fixed(const Tensor& q, const Tensor& k, const Tensor& v,
-                                         const Tensor& g, const Tensor& beta, float scale,
-                                         Tensor& ssm_states, const Tensor& source_state_slots,
-                                         const Tensor& destination_state_slots, Tensor& out,
-                                         cudaStream_t stream) {
+                                          const Tensor& g, const Tensor& beta, float scale,
+                                          Tensor& ssm_states, const Tensor& source_state_slots,
+                                          const Tensor& destination_state_slots,
+                                          const Tensor& valid_columns, Tensor& out,
+                                          cudaStream_t stream) {
     const auto heads = head_map::of(q.ne[1], v.ne[1]);
     const dim3 grid(static_cast<unsigned>(v.ne[1]), static_cast<unsigned>(q.ne[3]),
                     static_cast<unsigned>(kStateDim / kBlockDv));
@@ -59,6 +60,10 @@ void launch_recurrent_batch_update_fixed(const Tensor& q, const Tensor& k, const
         static_cast<const std::int32_t*>(destination_state_slots.data),
         static_cast<__nv_bfloat16*>(out.data),
         heads,
+        static_cast<std::int32_t>(q.ne[2]),
+        valid_columns.data == nullptr
+            ? nullptr
+            : static_cast<const std::int32_t*>(valid_columns.data),
         state_slot_stride,
         scale,
     };
@@ -158,16 +163,17 @@ void launch_recurrent_batch_update(const Tensor& q, const Tensor& k, const Tenso
                                    const Tensor& g, const Tensor& beta, float scale,
                                    bool normalize_qk, Tensor& ssm_states,
                                    const Tensor& source_state_slots,
-                                   const Tensor& destination_state_slots, Tensor& out,
+                                   const Tensor& destination_state_slots,
+                                   const Tensor& valid_columns, Tensor& out,
                                    cudaStream_t stream) {
     if (normalize_qk) {
         launch_recurrent_batch_update_fixed<true>(q, k, v, g, beta, scale, ssm_states,
-                                                  source_state_slots, destination_state_slots, out,
-                                                  stream);
+                                                   source_state_slots, destination_state_slots,
+                                                   valid_columns, out, stream);
     } else {
         launch_recurrent_batch_update_fixed<false>(q, k, v, g, beta, scale, ssm_states,
-                                                   source_state_slots, destination_state_slots, out,
-                                                   stream);
+                                                   source_state_slots, destination_state_slots,
+                                                   valid_columns, out, stream);
     }
 }
 

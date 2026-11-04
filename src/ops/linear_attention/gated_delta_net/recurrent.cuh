@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/common/bf16_vector.cuh"
+#include "ops/linear_attention/gated_delta_net/chunked/launch.h"
 #include "ops/linear_attention/gated_delta_net/common.cuh"
 #include "ops/linear_attention/gated_delta_net/launch.h"
 
@@ -294,6 +295,13 @@ struct BatchUpdateAccess {
     const std::int32_t* destination_state_slots;
     __nv_bfloat16* out;
     head_map heads;
+    // The update was the decode shape (W == 1), where a row's single column IS its flat index.
+    // The batched prefill rectangle addresses the same tensors batch-major as every other Op in
+    // the pass - row b's token t at flat column b*width + t - and carries a per-row live prefix,
+    // because a padding column's g/beta are real values (the fill seeds every padding column with
+    // token 0) and exp(g) would decay the state a mask-less run cannot skip.
+    std::int32_t width;
+    const std::int32_t* valid_columns;
     std::int64_t state_slot_stride;
     float scale;
 
@@ -302,10 +310,16 @@ struct BatchUpdateAccess {
                                 static_cast<std::int32_t>(blockIdx.z), heads);
     }
 
+    __device__ __forceinline__ std::int32_t
+    active_columns(const RecurrentCoordinates& coord) const {
+        if (valid_columns == nullptr) { return width; }
+        const std::int32_t valid = valid_columns[coord.batch];
+        return valid < 0 ? 0 : (valid > width ? width : valid);
+    }
+
     __device__ __forceinline__ std::int64_t column(const RecurrentCoordinates& coord,
                                                    std::int32_t token) const {
-        (void)token;
-        return coord.batch;
+        return static_cast<std::int64_t>(coord.batch) * width + token;
     }
 
     __device__ __forceinline__ const float*
@@ -666,9 +680,15 @@ template <bool NormalizeInputs>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     recurrent_batch_update_kernel(BatchUpdateAccess access) {
     const RecurrentCoordinates coord = access.coordinates();
+    // The batched entry routes each row to the same kernel its single-lane counterpart runs: rows
+    // at or above the chunked route's minimum belong to the chunked kernel, whose blocks skip them
+    // here the same way this kernel's blocks skip the short rows.
+    const std::int32_t valid = access.active_columns(coord);
+    if (valid == 0 || valid >= chunked::kMinTokens) { return; }
     __align__(16) float state[kDvPerWarp][kQkPerLane];
     load_state_tile(state, access.state_read_base(coord), coord);
-    run_recurrent_sequence<NormalizeInputs, OutputEffects>(state, access, coord, 1);
+    run_recurrent_sequence<NormalizeInputs, OutputEffects>(state, access, coord, valid);
+    if (valid < access.width) { zero_output_suffix(access, coord, valid, access.width); }
     store_state_tile(state, access.state_write_base(coord), coord);
 }
 

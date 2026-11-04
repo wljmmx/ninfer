@@ -17,19 +17,27 @@ struct PrepareShared {
 template <bool Normalize>
 __global__
 __launch_bounds__(256, 2) void prepare_kernel(Arguments args, QkChunk* __restrict__ qk_workspace,
-                                              ControlChunk* __restrict__ control_workspace) {
+                                               ControlChunk* __restrict__ control_workspace) {
     __shared__ PrepareShared sm;
     const int tid = threadIdx.x, lane = tid & 31;
-    const int head = blockIdx.x % args.value_heads, chunk = blockIdx.x / args.value_heads;
-    const int start = chunk * kChunkSize, length = min(kChunkSize, args.tokens - start);
-    const int group = args.value_heads / args.qk_heads, qh = head / group;
+    // One block per (value head, chunk, row). The row's resolved view carries its live token
+    // count, so a chunk entirely past the row's live prefix writes nothing and returns; the
+    // workspace keeps a fixed chunk stride per row (chunk_count of the physical width), which is
+    // the single-lane stride whenever batch == 1.
+    const int chunks_ws = chunk_count(args.width);
+    const int batch_row = static_cast<int>(blockIdx.z);
+    const Arguments local = resolve_row_arguments(args, batch_row);
+    const int head = blockIdx.x % local.value_heads, chunk = blockIdx.x / local.value_heads;
+    if (chunk * kChunkSize >= local.tokens) { return; }
+    const int start = chunk * kChunkSize, length = min(kChunkSize, local.tokens - start);
+    const int group = local.value_heads / local.qk_heads, qh = head / group;
     const int row = tid / 16, col = (tid & 15) * 8;
-    const auto qo = (static_cast<std::int64_t>(start + row) * args.qk_heads + qh) * kStateDim;
+    const auto qo = (static_cast<std::int64_t>(start + row) * local.qk_heads + qh) * kStateDim;
 
     float q[8]{}, k[8]{};
     if (row < length) {
-        const uint4 qp = load_vec<uint4>(args.q + qo + col);
-        const uint4 kp = load_vec<uint4>(args.k + qo + col);
+        const uint4 qp = load_vec<uint4>(local.q + qo + col);
+        const uint4 kp = load_vec<uint4>(local.k + qo + col);
         const auto* qb = reinterpret_cast<const __nv_bfloat16*>(&qp);
         const auto* kb = reinterpret_cast<const __nv_bfloat16*>(&kp);
 #pragma unroll
@@ -61,9 +69,9 @@ __launch_bounds__(256, 2) void prepare_kernel(Arguments args, QkChunk* __restric
     }
     if (tid < 32) sm.control.padding[tid] = 0;
     if (tid < kChunkSize) {
-        const auto off = static_cast<std::int64_t>(start + tid) * args.value_heads + head;
-        float g        = tid < length ? args.g[off] : 0.0F;
-        sm.beta[tid]   = tid < length ? args.beta[off] : 0.0F;
+        const auto off = static_cast<std::int64_t>(start + tid) * local.value_heads + head;
+        float g        = tid < length ? local.g[off] : 0.0F;
+        sm.beta[tid]   = tid < length ? local.beta[off] : 0.0F;
 #pragma unroll
         for (int offset = 1; offset < kChunkSize; offset <<= 1) {
             const float previous = __shfl_up_sync(0xffffU, g, offset, kChunkSize);
@@ -130,16 +138,25 @@ __launch_bounds__(256, 2) void prepare_kernel(Arguments args, QkChunk* __restric
     sm.control.solve[square_index(row, tid & 15)] *= sm.beta[tid & 15];
     __syncthreads();
 
-    const int chunks = chunk_count(args.tokens);
-    auto* ctrl       = reinterpret_cast<uint4*>(control_workspace +
-                                                static_cast<std::int64_t>(head) * chunks + chunk);
+    // Packets are laid out [chunk, head, row] with a fixed per-row stride of the physical width's
+    // chunk count, so a ragged row's shorter packet run leaves the rest of its region untouched.
+    auto* ctrl = reinterpret_cast<uint4*>(
+        control_workspace +
+        (static_cast<std::int64_t>(head) +
+         static_cast<std::int64_t>(batch_row) * local.value_heads) *
+            chunks_ws +
+        chunk);
     const auto* src  = reinterpret_cast<const uint4*>(&sm.control);
     if (tid < sizeof(ControlChunk) / 16) ctrl[tid] = src[tid];
     // Only the first value head in a group publishes Q/K. Other producers never read this
     // workspace; the following kernel supplies the only producer/consumer synchronization.
     if (head % group == 0) {
-        auto* dst =
-            reinterpret_cast<uint4*>(qk_workspace + static_cast<std::int64_t>(qh) * chunks + chunk);
+        auto* dst = reinterpret_cast<uint4*>(
+            qk_workspace +
+            (static_cast<std::int64_t>(qh) +
+             static_cast<std::int64_t>(batch_row) * local.qk_heads) *
+                chunks_ws +
+            chunk);
         const auto* data = reinterpret_cast<const uint4*>(&sm.qk);
 #pragma unroll
         for (int i = tid; i < sizeof(QkChunk) / 16; i += 256) dst[i] = data[i];
@@ -148,13 +165,16 @@ __launch_bounds__(256, 2) void prepare_kernel(Arguments args, QkChunk* __restric
 } // namespace
 
 void launch_prepare(const Arguments& args, QkChunk* qk, ControlChunk* control, bool normalize_qk,
-                    cudaStream_t stream) {
-    const unsigned blocks = static_cast<unsigned>(static_cast<std::int64_t>(args.value_heads) *
-                                                  chunk_count(args.tokens));
+                     cudaStream_t stream) {
+    // The grid covers the physical width's chunks; per-row blocks past a row's live prefix exit
+    // inside the kernel, so one launch serves ragged rows.
+    const dim3 grid(static_cast<unsigned>(static_cast<std::int64_t>(args.value_heads) *
+                                          chunk_count(args.width)),
+                    1, static_cast<unsigned>(args.batch));
     if (normalize_qk)
-        prepare_kernel<true><<<blocks, 256, 0, stream>>>(args, qk, control);
+        prepare_kernel<true><<<grid, 256, 0, stream>>>(args, qk, control);
     else
-        prepare_kernel<false><<<blocks, 256, 0, stream>>>(args, qk, control);
+        prepare_kernel<false><<<grid, 256, 0, stream>>>(args, qk, control);
     CUDA_CHECK(cudaGetLastError());
 }
 } // namespace ninfer::ops::detail::gated_delta_net::chunked

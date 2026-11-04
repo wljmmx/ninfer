@@ -80,6 +80,44 @@ void gated_delta_net_batch_update(const Tensor& q, const Tensor& k, const Tensor
                                   cudaStream_t stream);
 
 /**
+ * Returns the transient arena capacity the batch form below requires for the given rectangle.
+ * `width` is every row's physical column count and `batch` the row count; the layout is
+ * per-row chunk packets, so the total is the single-lane capacity of an equally large column
+ * budget (rows x width columns cost the same chunk units one wide call does).
+ */
+[[nodiscard]] std::size_t gated_delta_net_batch_workspace_capacity_bytes(std::int32_t qk_heads,
+                                                                        std::int32_t value_heads,
+                                                                        std::int32_t width,
+                                                                        std::int32_t batch);
+
+/**
+ * Multi-token batch form for B independent state-pool slots: the same recurrence, shapes and
+ * oracle as gated_delta_net, with q/k contiguous BF16 [128,Hqk,W,B], v/out BF16 [128,Hv,W,B] and
+ * g/beta FP32 [Hv,W,B] addressed batch-major (row b's token t at flat column b*W + t, the layout
+ * every batched Op in the prefill pass uses). `ssm_states` is contiguous FP32 [128,128,Hv,Slots];
+ * both selector tensors are contiguous device I32 [B]; `valid_columns` is contiguous device I32
+ * [B] holding each row's live prefix in [1,W], or an empty Tensor for dense rows. B is in [1,8]
+ * and W is any positive value.
+ *
+ * Row b reads source_state_slots[b] and publishes its final state to destination_state_slots[b];
+ * selectors may be equal for an in-place row and destination slots are distinct across rows. A
+ * row whose live prefix is at least the chunked route's minimum token count executes the chunked
+ * kernel; a shorter row executes the sequential recurrent kernel - in both cases the same kernel
+ * the single-lane form runs at that token count, over the same resolved addresses, so each row's
+ * outputs and final state are bit-identical to running that row alone through gated_delta_net.
+ * The mask is load-bearing, not hygiene: a rectangle's padding columns carry real g/beta (the
+ * fill seeds every padding column with a live token), and an unmasked transition would decay the
+ * row state by exp(g). Invalid-tail output columns are exact BF16 zero and do not touch the state.
+ * `execution` supplies the stream and physical SM count; `ws` supplies the transient storage
+ * reported by gated_delta_net_batch_workspace_capacity_bytes.
+ */
+void gated_delta_net_batch(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                          const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
+                          Tensor& ssm_states, const Tensor& valid_columns,
+                          const Tensor& source_state_slots, const Tensor& destination_state_slots,
+                          Tensor& out, DeviceExecutionView execution);
+
+/**
  * Op: gated_delta_net_replay_record
  *
  * Evaluates B independent normalized Gated DeltaNet recurrences from absolute state-pool slots

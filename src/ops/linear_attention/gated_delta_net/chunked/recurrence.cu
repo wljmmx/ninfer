@@ -64,9 +64,8 @@ template <int DV>
 __device__ __forceinline__ void load_stage(typename RecurrenceShared<DV>::Stage& stage,
                                            const Arguments& args, const QkChunk* qk_workspace,
                                            const ControlChunk* control_workspace, int head,
-                                           int value_start, int chunk, int tid) {
+                                           int value_start, int chunk, int chunks, int tid) {
     const int qh       = head / (args.value_heads / args.qk_heads);
-    const int chunks   = chunk_count(args.tokens);
     const auto* qk_src = reinterpret_cast<const uint4*>(
         qk_workspace + static_cast<std::int64_t>(qh) * chunks + chunk);
     auto* qk_dst = reinterpret_cast<uint4*>(&stage.qk);
@@ -125,7 +124,7 @@ __device__ __forceinline__ void matrix_delta(float (&acc)[4], const float* matri
 }
 
 __device__ __forceinline__ void store_output(const Arguments& args, float (&acc)[4], int chunk,
-                                             int head, int value_start, int n, int lane) {
+                                              int head, int value_start, int n, int lane) {
     const int row = lane / 4, col = value_start + n * 8 + (lane & 3) * 2;
     const int t0  = chunk * kChunkSize + row;
     const auto o0 = (static_cast<std::int64_t>(t0) * args.value_heads + head) * kStateDim + col;
@@ -151,11 +150,23 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
     auto& sm      = *reinterpret_cast<RecurrenceShared<DV>*>(backing);
     const int tid = threadIdx.x, lane = tid & 31, warp = tid / 32;
     const int g = lane / 4, t = lane & 3;
+    // One block per (head, value tile, row). The row's resolved view carries its live token count
+    // and its source/destination state slots; a row shorter than the chunked route's minimum never
+    // runs this kernel at all in the single-lane form, and the batched entry skips it here the
+    // same way (the sequential kernel owns those rows).
+    const int batch_row = static_cast<int>(blockIdx.z);
+    const Arguments local = resolve_row_arguments(args, batch_row);
+    if (local.tokens < kMinTokens) { return; }
+    const int chunks_ws    = chunk_count(args.width);
+    const QkChunk* qk_row      = qk_workspace +
+                            static_cast<std::int64_t>(batch_row) * args.qk_heads * chunks_ws;
+    const ControlChunk* ctrl_row = control_workspace +
+                                  static_cast<std::int64_t>(batch_row) * args.value_heads * chunks_ws;
     const int head        = blockIdx.x / (kStateDim / DV);
     const int value_start = blockIdx.x % (kStateDim / DV) * DV;
     const int n_start     = warp % NT;
     const int m_start     = NT < kWarps ? warp / NT : 0;
-    const int chunks      = chunk_count(args.tokens);
+    const int chunks      = chunk_count(local.tokens);
     const auto state_base = static_cast<std::int64_t>(head) * kStateDim * kStateDim;
 
     // MMA accumulators describe S^T[key,value]. External state remains [value,key].
@@ -167,16 +178,15 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
         for (int mi = 0; mi < MPW; ++mi) {
             const int key    = (m_start + mi * MW) * 16 + g;
             const int value  = value_start + n * 8 + t * 2;
-            state[ni][mi][0] = args.state_in[state_base + value * kStateDim + key];
-            state[ni][mi][1] = args.state_in[state_base + (value + 1) * kStateDim + key];
-            state[ni][mi][2] = args.state_in[state_base + value * kStateDim + key + 8];
-            state[ni][mi][3] = args.state_in[state_base + (value + 1) * kStateDim + key + 8];
+            state[ni][mi][0] = local.state_in[state_base + value * kStateDim + key];
+            state[ni][mi][1] = local.state_in[state_base + (value + 1) * kStateDim + key];
+            state[ni][mi][2] = local.state_in[state_base + value * kStateDim + key + 8];
+            state[ni][mi][3] = local.state_in[state_base + (value + 1) * kStateDim + key + 8];
         }
     }
-    load_stage<DV>(sm.stage[0], args, qk_workspace, control_workspace, head, value_start, 0, tid);
+    load_stage<DV>(sm.stage[0], local, qk_row, ctrl_row, head, value_start, 0, chunks_ws, tid);
     if (chunks > 1)
-        load_stage<DV>(sm.stage[1], args, qk_workspace, control_workspace, head, value_start, 1,
-                       tid);
+        load_stage<DV>(sm.stage[1], local, qk_row, ctrl_row, head, value_start, 1, chunks_ws, tid);
 
     for (int chunk = 0; chunk < chunks; ++chunk) {
         if (chunk + 1 < chunks)
@@ -284,7 +294,7 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
                 history[ni][2] *= p.prefix[g + 8];
                 history[ni][3] *= p.prefix[g + 8];
                 matrix_delta<DV>(history[ni], p.mqk, sm.delta, n, lane);
-                store_output(args, history[ni], chunk, head, value_start, n, lane);
+                store_output(local, history[ni], chunk, head, value_start, n, lane);
             }
         } else if (warp >= NT && warp < 2 * NT) {
             const int n = warp - NT;
@@ -293,7 +303,7 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
             history[0][2] *= p.prefix[g + 8];
             history[0][3] *= p.prefix[g + 8];
             matrix_delta<DV>(history[0], p.mqk, sm.delta, n, lane);
-            store_output(args, history[0], chunk, head, value_start, n, lane);
+            store_output(local, history[0], chunk, head, value_start, n, lane);
         }
 
         // S^T = gamma S^T + K^T diag(suffix) Delta. The master state stays FP32.
@@ -331,8 +341,8 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
         }
         __syncthreads();
         if (chunk + 2 < chunks) {
-            load_stage<DV>(sm.stage[chunk & 1], args, qk_workspace, control_workspace, head,
-                           value_start, chunk + 2, tid);
+            load_stage<DV>(sm.stage[chunk & 1], local, qk_row, ctrl_row, head, value_start,
+                           chunk + 2, chunks_ws, tid);
         }
     }
 #pragma unroll
@@ -342,10 +352,24 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
         for (int mi = 0; mi < MPW; ++mi) {
             const int key                                        = (m_start + mi * MW) * 16 + g;
             const int value                                      = value_start + n * 8 + t * 2;
-            args.state_out[state_base + value * kStateDim + key] = state[ni][mi][0];
-            args.state_out[state_base + (value + 1) * kStateDim + key]     = state[ni][mi][1];
-            args.state_out[state_base + value * kStateDim + key + 8]       = state[ni][mi][2];
-            args.state_out[state_base + (value + 1) * kStateDim + key + 8] = state[ni][mi][3];
+            local.state_out[state_base + value * kStateDim + key] = state[ni][mi][0];
+            local.state_out[state_base + (value + 1) * kStateDim + key]     = state[ni][mi][1];
+            local.state_out[state_base + value * kStateDim + key + 8]       = state[ni][mi][2];
+            local.state_out[state_base + (value + 1) * kStateDim + key + 8] = state[ni][mi][3];
+        }
+    }
+
+    // A batched rectangle's invalid tail is exact BF16 zero across the whole row, like every
+    // other Op in the pass. The chunk scan only visits ceil(tokens/16) chunks, so the tail this
+    // block's value tile owns is zeroed here in one sweep - including the part past the last
+    // visited chunk. The single-lane form runs width == tokens and the loop never executes.
+    if (local.tokens < args.width) {
+        const __nv_bfloat16 zero = __float2bfloat16_rn(0.0F);
+        for (int token = local.tokens; token < args.width; ++token) {
+            const auto o =
+                (static_cast<std::int64_t>(token) * local.value_heads + head) * kStateDim +
+                value_start;
+            for (int d = tid; d < DV; d += kThreads<DV>) { local.out[o + d] = zero; }
         }
     }
 }
@@ -356,9 +380,9 @@ void launch(const Arguments& args, const QkChunk* qk, const ControlChunk* contro
     constexpr int shared_bytes = sizeof(RecurrenceShared<DV>);
     CUDA_CHECK(cudaFuncSetAttribute(chunk_recurrence_kernel<DV>,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
+    const dim3 grid(args.value_heads * (kStateDim / DV), 1, static_cast<unsigned>(args.batch));
     chunk_recurrence_kernel<DV>
-        <<<args.value_heads*(kStateDim / DV), kThreads<DV>, shared_bytes, stream>>>(args, qk,
-                                                                                    control);
+        <<<grid, kThreads<DV>, shared_bytes, stream>>>(args, qk, control);
     CUDA_CHECK(cudaGetLastError());
 }
 

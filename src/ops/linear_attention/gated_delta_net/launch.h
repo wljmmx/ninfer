@@ -34,7 +34,8 @@ void launch_recurrent_batch_update(const Tensor& q, const Tensor& k, const Tenso
                                    const Tensor& g, const Tensor& beta, float scale,
                                    bool normalize_qk, Tensor& ssm_states,
                                    const Tensor& source_state_slots,
-                                   const Tensor& destination_state_slots, Tensor& out,
+                                   const Tensor& destination_state_slots,
+                                   const Tensor& valid_columns, Tensor& out,
                                    cudaStream_t stream);
 
 void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,

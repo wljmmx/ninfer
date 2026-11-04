@@ -626,6 +626,230 @@ int batch_update_case(const Case& test_case, const std::vector<int>& source_slot
     return failures;
 }
 
+// The multi-token batch form's contract is per-row bit-identity with the single-lane form at the
+// same token count - that is what lets the merged prefill pass claim token-level equality against
+// the single-lane path. Each row runs once through gated_delta_net_batch (over the [W, B] rectangle
+// with the batched state pool) and once through gated_delta_net (alone, with a private state pair),
+// and the outputs and final states must match exactly, bit for bit, with no tolerance anywhere.
+// The rectangle's invalid tails must be exact BF16 zero and must not touch any state.
+int batch_case(const Case& test_case, int width, const std::vector<int>& valid_columns,
+               const std::vector<int>& source_slots, const std::vector<int>& destination_slots,
+               int slots, std::uint32_t seed) {
+    if (valid_columns.empty()) { throw std::logic_error("batch_case requires row extents"); }
+    const int batch = static_cast<int>(valid_columns.size());
+    if (static_cast<int>(source_slots.size()) != batch ||
+        static_cast<int>(destination_slots.size()) != batch) {
+        throw std::logic_error("batch_case selector sizes differ from the row count");
+    }
+    for (const int valid : valid_columns) {
+        if (valid <= 0 || valid > width) {
+            throw std::logic_error("batch_case row extent is outside the rectangle");
+        }
+    }
+    const float scale = 1.0f / std::sqrt(static_cast<float>(kStateDim));
+    const std::size_t row_state_size =
+        static_cast<std::size_t>(kStateDim) * kStateDim * test_case.value_heads;
+    const std::size_t row_out_size =
+        static_cast<std::size_t>(kStateDim) * test_case.value_heads * width;
+    const std::size_t row_qk_size = static_cast<std::size_t>(kStateDim) * test_case.qk_heads * width;
+    const std::size_t row_value_size =
+        static_cast<std::size_t>(kStateDim) * test_case.value_heads * width;
+    const std::size_t row_gate_size =
+        static_cast<std::size_t>(test_case.value_heads) * width;
+
+    Case row_case     = test_case;
+    row_case.tokens   = width;
+    std::vector<gdn_ref::Inputs> rows;
+    std::vector<float> initial_states(row_state_size * static_cast<std::size_t>(slots), 0.125f);
+    for (int row = 0; row < batch; ++row) {
+        gdn_ref::Inputs input = make_inputs(row_case, seed + static_cast<std::uint32_t>(row) * 131U);
+        std::copy(input.state.begin(), input.state.end(),
+                  initial_states.begin() +
+                      static_cast<std::size_t>(source_slots[static_cast<std::size_t>(row)]) *
+                          row_state_size);
+        rows.push_back(std::move(input));
+    }
+
+    // The aggregate rectangle: row-major concatenation of the rows' W-column blocks, which is the
+    // batch-major [.., W, B] layout the batch form addresses.
+    gdn_ref::Inputs aggregate;
+    aggregate.head_dim    = kStateDim;
+    aggregate.qk_heads    = test_case.qk_heads;
+    aggregate.value_heads = test_case.value_heads;
+    for (int row = 0; row < batch; ++row) {
+        const gdn_ref::Inputs& input = rows[static_cast<std::size_t>(row)];
+        aggregate.q.insert(aggregate.q.end(), input.q.begin(), input.q.end());
+        aggregate.k.insert(aggregate.k.end(), input.k.begin(), input.k.end());
+        aggregate.v.insert(aggregate.v.end(), input.v.begin(), input.v.end());
+        aggregate.g.insert(aggregate.g.end(), input.g.begin(), input.g.end());
+        aggregate.beta.insert(aggregate.beta.end(), input.beta.begin(), input.beta.end());
+    }
+
+    DeviceInputs device(aggregate);
+    DeviceBuffer device_valid              = to_device(valid_columns);
+    DeviceBuffer device_source_slots      = to_device(source_slots);
+    DeviceBuffer device_destination_slots = to_device(destination_slots);
+    GuardedDeviceBuffer states(initial_states.size() * sizeof(float));
+    GuardedDeviceBuffer out(aggregate.v.size() * sizeof(std::uint16_t));
+    states.copy_from_host(initial_states.data(), states.bytes());
+    out.fill(0xff);
+
+    Tensor q(device.q.p, DType::BF16, {kStateDim, test_case.qk_heads, width, batch});
+    Tensor k(device.k.p, DType::BF16, {kStateDim, test_case.qk_heads, width, batch});
+    Tensor v(device.v.p, DType::BF16, {kStateDim, test_case.value_heads, width, batch});
+    Tensor g(device.g.p, DType::FP32, {test_case.value_heads, width, batch});
+    Tensor beta(device.beta.p, DType::FP32, {test_case.value_heads, width, batch});
+    Tensor valid_tensor(device_valid.p, DType::I32, {batch});
+    Tensor source_tensor(device_source_slots.p, DType::I32, {batch});
+    Tensor destination_tensor(device_destination_slots.p, DType::I32, {batch});
+    Tensor states_tensor(states.data(), DType::FP32,
+                         {kStateDim, kStateDim, test_case.value_heads, slots});
+    Tensor out_tensor(out.data(), DType::BF16, {kStateDim, test_case.value_heads, width, batch});
+
+    const auto workspace_bytes = ops::gated_delta_net_batch_workspace_capacity_bytes(
+        test_case.qk_heads, test_case.value_heads, width, batch);
+    GuardedDeviceBuffer scratch(std::max<std::size_t>(workspace_bytes, 256));
+    scratch.fill(0xff);
+    WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
+    const auto device_execution = execution();
+
+    ops::gated_delta_net_batch(q, k, v, g, beta, scale, test_case.normalize_qk, workspace,
+                               states_tensor, valid_tensor, source_tensor, destination_tensor,
+                               out_tensor, device_execution);
+    cuda_synchronize();
+    if (workspace.used() != 0) {
+        std::cerr << "gated_delta_net_batch left the workspace unreleased\n";
+        return 1;
+    }
+    if (workspace.peak_used() != workspace_bytes) {
+        std::cerr << "gated_delta_net_batch workspace query/execution high-water mismatch\n";
+        return 1;
+    }
+
+    const std::string label = std::string(test_case.name) + " batch W=" + std::to_string(width) +
+                             " B=" + std::to_string(batch);
+    int failures                        = 0;
+    const std::vector<std::uint16_t> batched_out_bits =
+        from_device<std::uint16_t>(out.data(), aggregate.v.size());
+    const std::vector<float> batched_states =
+        from_device<float>(states.data(), initial_states.size());
+
+    for (int row = 0; row < batch; ++row) {
+        const int valid       = valid_columns[static_cast<std::size_t>(row)];
+        const auto row_label  = label + " row=" + std::to_string(row) + " valid=" + std::to_string(valid);
+        const gdn_ref::Inputs& input = rows[static_cast<std::size_t>(row)];
+
+        // The same row, alone, through the single-lane form at exactly its live token count.
+        DeviceInputs row_device(input);
+        GuardedDeviceBuffer row_state_in(row_state_size * sizeof(float));
+        GuardedDeviceBuffer row_state_out(row_state_size * sizeof(float));
+        GuardedDeviceBuffer row_out(
+            static_cast<std::size_t>(kStateDim) * test_case.value_heads * valid *
+            sizeof(std::uint16_t));
+        row_state_in.copy_from_host(input.state.data(), row_state_in.bytes());
+        row_state_out.fill(0xff);
+        row_out.fill(0xff);
+        Tensor row_q(row_device.q.p, DType::BF16, {kStateDim, test_case.qk_heads, valid});
+        Tensor row_k(row_device.k.p, DType::BF16, {kStateDim, test_case.qk_heads, valid});
+        Tensor row_v(row_device.v.p, DType::BF16, {kStateDim, test_case.value_heads, valid});
+        Tensor row_g(row_device.g.p, DType::FP32, {test_case.value_heads, valid});
+        Tensor row_beta(row_device.beta.p, DType::FP32, {test_case.value_heads, valid});
+        Tensor row_state_in_tensor(row_state_in.data(), DType::FP32,
+                                   {kStateDim, kStateDim, test_case.value_heads});
+        Tensor row_state_out_tensor(row_state_out.data(), DType::FP32,
+                                    {kStateDim, kStateDim, test_case.value_heads});
+        Tensor row_out_tensor(row_out.data(), DType::BF16,
+                              {kStateDim, test_case.value_heads, valid});
+        const auto single_workspace_bytes = ops::gated_delta_net_workspace_capacity_bytes(
+            test_case.qk_heads, test_case.value_heads, valid, valid);
+        GuardedDeviceBuffer single_scratch(std::max<std::size_t>(single_workspace_bytes, 256));
+        WorkspaceArena single_workspace(
+            DeviceSpan{single_scratch.data(), single_scratch.bytes()});
+        ops::gated_delta_net(row_q, row_k, row_v, row_g, row_beta, scale, test_case.normalize_qk,
+                             single_workspace, row_state_in_tensor, row_state_out_tensor,
+                             row_out_tensor, device_execution);
+        cuda_synchronize();
+
+        const std::vector<std::uint16_t> single_out_bits =
+            from_device<std::uint16_t>(row_out.data(), row_out.bytes() / sizeof(std::uint16_t));
+        const std::vector<float> single_state =
+            from_device<float>(row_state_out.data(), row_state_size);
+
+        // Bit-exact outputs over the row's live prefix.
+        for (int t = 0; t < valid; ++t) {
+            const std::size_t batched_column =
+                static_cast<std::size_t>(row) * width + t;
+            for (int h = 0; h < test_case.value_heads; ++h) {
+                const std::size_t batched_base =
+                    (batched_column * test_case.value_heads + h) * kStateDim;
+                const std::size_t single_base =
+                    (static_cast<std::size_t>(t) * test_case.value_heads + h) * kStateDim;
+                failures += verify_exact(
+                    row_label + " out column " + std::to_string(t) + " head " + std::to_string(h),
+                    std::vector<std::uint16_t>(batched_out_bits.begin() + batched_base,
+                                               batched_out_bits.begin() + batched_base + kStateDim),
+                    std::vector<std::uint16_t>(single_out_bits.begin() + single_base,
+                                               single_out_bits.begin() + single_base + kStateDim));
+            }
+        }
+        // The row's invalid tail is exact BF16 zero.
+        for (int t = valid; t < width; ++t) {
+            const std::size_t batched_column = static_cast<std::size_t>(row) * width + t;
+            const std::size_t batched_base   = batched_column * test_case.value_heads * kStateDim;
+            failures += verify_exact(
+                row_label + " invalid tail column " + std::to_string(t),
+                std::vector<std::uint16_t>(batched_out_bits.begin() + batched_base,
+                                           batched_out_bits.begin() + batched_base +
+                                               test_case.value_heads * kStateDim),
+                std::vector<std::uint16_t>(
+                    static_cast<std::size_t>(test_case.value_heads) * kStateDim, 0));
+        }
+        // Bit-exact final state in the row's destination slot.
+        const std::size_t destination_base =
+            static_cast<std::size_t>(destination_slots[static_cast<std::size_t>(row)]) *
+            row_state_size;
+        failures += verify_exact(row_label + " final state",
+                                 std::vector<float>(batched_states.begin() + destination_base,
+                                                    batched_states.begin() + destination_base +
+                                                        row_state_size),
+                                 single_state);
+        // The row's source slot still holds the initial state when the pair is distinct.
+        const std::size_t source_base =
+            static_cast<std::size_t>(source_slots[static_cast<std::size_t>(row)]) * row_state_size;
+        if (source_slots[static_cast<std::size_t>(row)] !=
+            destination_slots[static_cast<std::size_t>(row)]) {
+            failures += verify_exact(
+                row_label + " source state unchanged",
+                std::vector<float>(batched_states.begin() + source_base,
+                                   batched_states.begin() + source_base + row_state_size),
+                std::vector<float>(initial_states.begin() + source_base,
+                                   initial_states.begin() + source_base + row_state_size));
+        }
+    }
+
+    // Slots no row wrote keep their initial contents.
+    std::vector<bool> written(static_cast<std::size_t>(slots), false);
+    for (const int slot : destination_slots) { written[static_cast<std::size_t>(slot)] = true; }
+    for (int slot = 0; slot < slots; ++slot) {
+        if (written[static_cast<std::size_t>(slot)]) continue;
+        const std::size_t begin = static_cast<std::size_t>(slot) * row_state_size;
+        failures += verify_exact(label + " untouched slot " + std::to_string(slot),
+                                 std::vector<float>(batched_states.begin() + begin,
+                                                    batched_states.begin() + begin + row_state_size),
+                                 std::vector<float>(initial_states.begin() + begin,
+                                                    initial_states.begin() + begin + row_state_size));
+    }
+    failures += states.verify_guards((label + " states").c_str());
+    failures += out.verify_guards((label + " out").c_str());
+    failures += scratch.verify_guards((label + " workspace").c_str());
+    failures += verify_common_inputs_unchanged(label, aggregate, device.q, device.k, device.v,
+                                               device.g, device.beta);
+    std::cout << "GDN_BATCH_CASE " << label << " valid=";
+    for (const int valid : valid_columns) { std::cout << valid << ' '; }
+    std::cout << "failures " << failures << '\n';
+    return failures;
+}
+
 int contract_rejection_cases() {
     DeviceBuffer q_buffer(kStateDim * 8 * sizeof(std::uint16_t));
     DeviceBuffer k_buffer(kStateDim * 8 * sizeof(std::uint16_t));
@@ -779,6 +1003,24 @@ int main() {
                                   {8, 9, 10, 11, 12, 13, 14, 15}, 16, 13001u);
     failures += batch_update_case({"35b mixed fork destinations", 16, 32, 1, true}, {0, 2, 4, 6},
                                   {1, 3, 5, 7}, 8, 13101u);
+
+    // The multi-token batch form, per row bit-identical to the single-lane form at the same token
+    // count. Rows at or above the chunked minimum exercise the batched chunked kernel; shorter
+    // rows exercise the widened sequential kernel; ragged rectangles also pin the exact-zero
+    // invalid tails. 256 is the prefill class a merged pass asks for at that tail size, and the
+    // mixed 32/7 rectangle splits its rows across both kernels in one call.
+    failures += batch_case({"27b merged rectangle", 16, 48, 256, true}, 256, {256, 256}, {0, 2},
+                           {1, 3}, 6, 15101u);
+    failures += batch_case({"27b merged ragged", 16, 48, 256, true}, 256, {256, 100, 1}, {0, 2, 4},
+                           {1, 3, 5}, 8, 15201u);
+    failures += batch_case({"27b mixed routes", 16, 48, 32, true}, 32, {32, 7}, {0, 2}, {1, 3}, 6,
+                           15301u);
+    failures += batch_case({"35b short rows", 16, 32, 15, true}, 15, {15, 3}, {0, 1}, {2, 3}, 6,
+                           15401u);
+    failures += batch_case({"27b raw qk wide", 16, 48, 64, false}, 64, {64, 64}, {0, 2}, {1, 3}, 6,
+                           15501u);
+    failures += batch_case({"27b in-place rows", 16, 48, 48, true}, 48, {48, 48}, {0, 1}, {0, 1}, 4,
+                           15601u);
 
     print_summaries();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net correctness\n";
