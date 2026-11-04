@@ -1,6 +1,7 @@
 #pragma once
 
-#include "core/expert_bank.h"`r`n#include "core/memory.h"
+#include "core/expert_bank.h"
+#include "core/memory.h"
 #include "core/weight_view.h"
 
 namespace ninfer {
