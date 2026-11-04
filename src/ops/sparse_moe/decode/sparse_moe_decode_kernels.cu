@@ -68,11 +68,11 @@ __device__ __forceinline__ float router_row_dot(const __nv_bfloat16* x, const __
     return warp_reduce_sum(sum);
 }
 
-__global__ void sparse_moe_d1_kernel(const __nv_bfloat16* __restrict__ x,
-                                     const __nv_bfloat16* __restrict__ router,
-                                     float* __restrict__ scores,
-                                     const char* __restrict__ shared_down_codes,
-                                     unsigned long long shared_down_bytes) {
+__launch_bounds__(kD1Warps * 32) __global__ void
+sparse_moe_d1_kernel(const __nv_bfloat16* __restrict__ x,
+                     const __nv_bfloat16* __restrict__ router, float* __restrict__ scores,
+                     const char* __restrict__ shared_down_codes,
+                     unsigned long long shared_down_bytes) {
     __shared__ float partial[kD1Warps];
     const int row   = static_cast<int>(blockIdx.x);
     const int warp  = static_cast<int>(threadIdx.x) >> 5;
@@ -96,9 +96,9 @@ __global__ void sparse_moe_d1_kernel(const __nv_bfloat16* __restrict__ x,
     }
 }
 
-__global__ void sparse_moe_d2_warp_kernel(const float* __restrict__ scores, int* __restrict__ ids,
-                                          float* __restrict__ alpha,
-                                          float* __restrict__ shared_scale) {
+__launch_bounds__(32) __global__ void
+sparse_moe_d2_warp_kernel(const float* __restrict__ scores, int* __restrict__ ids,
+                          float* __restrict__ alpha, float* __restrict__ shared_scale) {
     __shared__ float selected_logits[kTopK];
     if (threadIdx.x == 0) { pdl::trigger_dependents(); }
     sparse_moe_select_top8_warp(scores, ids, alpha, shared_scale, selected_logits);
@@ -238,7 +238,7 @@ __device__ __forceinline__ void dot_two_rows(const std::uint8_t* codes, const st
 }
 
 template <class RoutedCodec>
-__global__ void sparse_moe_d3_nine_warp_kernel(
+__launch_bounds__(9 * 32) __global__ void sparse_moe_d3_nine_warp_kernel(
     const __nv_bfloat16* __restrict__ x, const int* __restrict__ ids,
     const std::uint8_t* __restrict__ routed_codes, const std::uint8_t* __restrict__ routed_high,
     const std::uint8_t* __restrict__ routed_scales, const std::uint8_t* __restrict__ shared_codes,
@@ -269,7 +269,7 @@ __global__ void sparse_moe_d3_nine_warp_kernel(
 }
 
 template <class RoutedCodec, int PathsPerBlock, bool Adaptive>
-__global__ void sparse_moe_d3_path_tiled_kernel(
+__launch_bounds__(PathsPerBlock * 32) __global__ void sparse_moe_d3_path_tiled_kernel(
     const __nv_bfloat16* __restrict__ x, const int* __restrict__ token_ids,
     const std::uint8_t* __restrict__ routed_codes, const std::uint8_t* __restrict__ routed_high,
     const std::uint8_t* __restrict__ routed_scales, const std::uint8_t* __restrict__ shared_codes,
@@ -385,7 +385,7 @@ __device__ __forceinline__ void dot_fp32_rows(const std::uint8_t* codes, const s
 }
 
 template <class RoutedCodec, int Rows>
-__global__ void sparse_moe_d4_nine_warp_kernel(
+__launch_bounds__(9 * 32) __global__ void sparse_moe_d4_nine_warp_kernel(
     const int* __restrict__ ids, const float* __restrict__ alpha,
     const float* __restrict__ shared_scale, const float* __restrict__ act,
     const std::uint8_t* __restrict__ routed_codes, const std::uint8_t* __restrict__ routed_high,
@@ -438,7 +438,7 @@ __global__ void sparse_moe_d4_nine_warp_kernel(
 }
 
 template <class RoutedCodec, int Rows, bool Adaptive>
-__global__ void sparse_moe_d4_token_kernel(
+__launch_bounds__(9 * 32) __global__ void sparse_moe_d4_token_kernel(
     const int* __restrict__ token_ids, const float* __restrict__ token_alpha,
     const float* __restrict__ shared_scale, const float* __restrict__ token_activations,
     const std::uint8_t* __restrict__ routed_codes, const std::uint8_t* __restrict__ routed_high,

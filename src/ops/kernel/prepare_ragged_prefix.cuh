@@ -8,7 +8,8 @@ namespace ninfer::ops {
 
 inline constexpr int kRaggedPrefixVectorsPerBlock = 128;
 
-__global__ void prepare_ragged_prefix_kernel(
+__launch_bounds__(kRaggedPrefixVectorsPerBlock) __global__ void
+prepare_ragged_prefix_kernel(
     const uint4* __restrict__ source, const std::int32_t* __restrict__ lanes,
     const std::int32_t* __restrict__ starts, const std::int32_t* __restrict__ ends,
     uint4* __restrict__ destination, std::int32_t* __restrict__ positions,

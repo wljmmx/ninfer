@@ -119,9 +119,9 @@ void logits_topk_softmax_launch(const Tensor& logits, Tensor& top_ids, Tensor& t
 // are packed (one draft position per row), and grows to a whole draft window when the bitmap is
 // laid out per (row, position) - a multi-row speculative batch then finds row b's column 0 at
 // b * column_stride_words instead of b * stride_words.
-__global__ void apply_sampling_mask_kernel(const __nv_bfloat16* source, __nv_bfloat16* destination,
-                                           int rows, int columns, int column_stride_words,
-                                           const std::uint32_t* words) {
+__launch_bounds__(256) __global__ void
+apply_sampling_mask_kernel(const __nv_bfloat16* source, __nv_bfloat16* destination, int rows,
+                           int columns, int column_stride_words, const std::uint32_t* words) {
     const int total = rows * columns;
     for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < total;
          index += blockDim.x * gridDim.x) {

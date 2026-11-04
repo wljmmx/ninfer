@@ -104,7 +104,8 @@ struct Q5GemvStoreEpilogue {
 template <int kN, int kK, int kRowsPerBlock, int kStages, bool kStageX, bool kResidual,
           bool kSplitOutput = false, int kSplitRow = 0, class Epilogue = Q5GemvStoreEpilogue,
           bool TriggerPdl = false, bool JoinPdl = false>
-__global__ void
+// One block owns kRowsPerBlock output rows (kRowsPerBlock warps): its launcher's exact size.
+__launch_bounds__(kRowsPerBlock * 32) __global__ void
 q5_rowsplit_gemv_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
                         const std::uint8_t* __restrict__ high_bits,
                         const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out,

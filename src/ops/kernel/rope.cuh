@@ -95,9 +95,12 @@ __device__ __forceinline__ void apply_rope_head(__nv_bfloat16* data, std::int64_
 }
 
 template <RopeKernelMode Mode, int QHeads, int KHeads>
-__global__ void rope_fixed_kernel(const std::int32_t* positions, __nv_bfloat16* q, __nv_bfloat16* k,
-                                  std::int32_t tokens, std::int64_t q_token_stride,
-                                  std::int64_t k_token_stride, RopeScaling scaling) {
+// The launcher picks the block at runtime between 128 and 1024 threads; the bound is that upper
+// edge. The kernel uses 24-26 registers, well under the 64 the 1024-thread form allows.
+__launch_bounds__(1024) __global__ void
+rope_fixed_kernel(const std::int32_t* positions, __nv_bfloat16* q, __nv_bfloat16* k,
+                  std::int32_t tokens, std::int64_t q_token_stride,
+                  std::int64_t k_token_stride, RopeScaling scaling) {
     constexpr int kHeadDim = Mode == RopeKernelMode::Vision2D       ? 72
                              : Mode == RopeKernelMode::DflashText1D ? 128
                                                                     : 256;
@@ -139,7 +142,9 @@ __global__ void rope_fixed_kernel(const std::int32_t* positions, __nv_bfloat16* 
 }
 
 template <RopeKernelMode Mode, int QHeads, int KHeads, int HeadsPerBlock>
-__global__ void rope_fixed_split_kernel(const std::int32_t* positions, __nv_bfloat16* q,
+// HeadsPerBlock is at most 8, so a block is at most 256 threads.
+__launch_bounds__(256) __global__ void
+rope_fixed_split_kernel(const std::int32_t* positions, __nv_bfloat16* q,
                                         __nv_bfloat16* k, std::int32_t tokens,
                                         std::int64_t q_token_stride, std::int64_t k_token_stride,
                                         RopeScaling scaling) {
@@ -191,7 +196,8 @@ __device__ __forceinline__ void generic_axis_frequency(int axes, int head_dim, i
     }
 }
 
-static __global__ void rope_generic_kernel(const std::int32_t* positions, std::int32_t axes,
+static __global__ __launch_bounds__(128)
+void rope_generic_kernel(const std::int32_t* positions, std::int32_t axes,
                                            __nv_bfloat16* q, __nv_bfloat16* k,
                                            std::int32_t head_dim, std::int32_t rotary_dim,
                                            float theta, std::int32_t q_heads, std::int32_t k_heads,

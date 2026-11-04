@@ -71,9 +71,10 @@ struct CausalConvSplitOutput3 {
 } // namespace detail
 
 template <class Output>
-__global__ void causal_conv1d_prefill_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
-                                             const __nv_bfloat16* conv_state, Output out,
-                                             std::int32_t C, std::int32_t T) {
+__launch_bounds__(256) __global__ void
+causal_conv1d_prefill_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                             const __nv_bfloat16* conv_state, Output out, std::int32_t C,
+                             std::int32_t T) {
     const std::int64_t C64      = static_cast<std::int64_t>(C);
     const std::int64_t c_blocks = div_up(C64, static_cast<std::int64_t>(blockDim.x));
     const std::int64_t block    = static_cast<std::int64_t>(blockIdx.x);
@@ -101,10 +102,10 @@ __global__ void causal_conv1d_prefill_kernel(const __nv_bfloat16* x, const __nv_
 }
 
 template <class Output>
-__global__ void causal_conv1d_prefill_pairs_kernel(const __nv_bfloat16* x,
-                                                   const __nv_bfloat16* weight,
-                                                   const __nv_bfloat16* conv_state, Output out,
-                                                   std::int32_t C, std::int32_t T) {
+__launch_bounds__(256) __global__ void
+causal_conv1d_prefill_pairs_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                                  const __nv_bfloat16* conv_state, Output out, std::int32_t C,
+                                  std::int32_t T) {
     const std::int64_t C2        = static_cast<std::int64_t>(C / 2);
     const std::int64_t c_blocks  = div_up(C2, static_cast<std::int64_t>(blockDim.x));
     const std::int64_t block     = static_cast<std::int64_t>(blockIdx.x);
@@ -142,10 +143,9 @@ __global__ void causal_conv1d_prefill_pairs_kernel(const __nv_bfloat16* x,
 // selected GDN snapshot slot while always publishing the running state to slot 0.
 // The initial values are loaded into registers before any store, so overlapping
 // in/out (in == out) has no read/write hazard.
-__global__ void causal_conv1d_prefill_state_kernel(const __nv_bfloat16* x,
-                                                   const __nv_bfloat16* conv_state_in,
-                                                   __nv_bfloat16* conv_state_out, std::int32_t C,
-                                                   std::int32_t T) {
+__launch_bounds__(256) __global__ void
+causal_conv1d_prefill_state_kernel(const __nv_bfloat16* x, const __nv_bfloat16* conv_state_in,
+                                  __nv_bfloat16* conv_state_out, std::int32_t C, std::int32_t T) {
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     const std::int64_t C64    = static_cast<std::int64_t>(C);
@@ -177,10 +177,12 @@ __global__ void causal_conv1d_prefill_state_kernel(const __nv_bfloat16* x,
 // tile for the full sequence. Loading history into shared memory before any state publication makes
 // the exact-alias state form safe without a second kernel.
 template <class Output>
-__global__ void causal_conv1d_smallt_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
-                                            const __nv_bfloat16* conv_state_in,
-                                            __nv_bfloat16* conv_state_out, Output out,
-                                            std::int32_t C, std::int32_t T) {
+// 2D block (kCausalConvChannelTile x T, T <= kCausalConvParallelMaxTokens), so 32*32 = 1024
+// threads is the ceiling.
+__launch_bounds__(1024) __global__ void
+causal_conv1d_smallt_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                            const __nv_bfloat16* conv_state_in, __nv_bfloat16* conv_state_out,
+                            Output out, std::int32_t C, std::int32_t T) {
     __shared__ __nv_bfloat16 history[3][kCausalConvChannelTile];
     __shared__ __nv_bfloat16 weights[4][kCausalConvChannelTile];
 
@@ -231,9 +233,9 @@ __global__ void causal_conv1d_smallt_kernel(const __nv_bfloat16* x, const __nv_b
     }
 }
 
-__global__ void causal_conv1d_decode_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
-                                            __nv_bfloat16* conv_state, __nv_bfloat16* out,
-                                            std::int32_t C) {
+__launch_bounds__(256) __global__ void
+causal_conv1d_decode_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                            __nv_bfloat16* conv_state, __nv_bfloat16* out, std::int32_t C) {
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     const std::int64_t C64    = static_cast<std::int64_t>(C);
@@ -258,7 +260,7 @@ __global__ void causal_conv1d_decode_kernel(const __nv_bfloat16* x, const __nv_b
     }
 }
 
-__global__ void causal_conv1d_decode_distinct_kernel(
+__launch_bounds__(256) __global__ void causal_conv1d_decode_distinct_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight,
     const __nv_bfloat16* __restrict__ conv_state_in, __nv_bfloat16* __restrict__ conv_state_out,
     __nv_bfloat16* __restrict__ out, std::int32_t C) {
@@ -286,7 +288,7 @@ __global__ void causal_conv1d_decode_distinct_kernel(
     }
 }
 
-__global__ void causal_conv1d_snapshot_decode_kernel(
+__launch_bounds__(256) __global__ void causal_conv1d_snapshot_decode_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight,
     __nv_bfloat16* __restrict__ conv_states, const std::int32_t* __restrict__ initial_slot,
     const std::int32_t* __restrict__ snapshot_base_slot, __nv_bfloat16* __restrict__ out,
@@ -319,7 +321,7 @@ __global__ void causal_conv1d_snapshot_decode_kernel(
     }
 }
 
-__global__ void
+__launch_bounds__(32) __global__ void
 causal_conv1d_sequence_snapshot_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                                        __nv_bfloat16* conv_states, const std::int32_t* initial_slot,
                                        const std::int32_t* snapshot_base_slot, __nv_bfloat16* out,
@@ -365,7 +367,8 @@ causal_conv1d_sequence_snapshot_kernel(const __nv_bfloat16* x, const __nv_bfloat
 // request-local state is loaded before that row publishes any snapshot. It is used for W=1 and
 // for masked B=1 widths outside the parallel small-W domain.
 template <bool Masked>
-__global__ void causal_conv1d_batched_sequence_snapshot_kernel(
+// The launcher uses 256 threads for W=1 and 32 for wider widths, so 256 is the ceiling.
+__launch_bounds__(256) __global__ void causal_conv1d_batched_sequence_snapshot_kernel(
     const __nv_bfloat16* x, const __nv_bfloat16* weight, __nv_bfloat16* conv_states,
     const std::int32_t* valid_columns, const std::int32_t* initial_state_slots,
     const std::int32_t* snapshot_base_slots, __nv_bfloat16* out, std::int32_t C, std::int32_t width,
@@ -417,7 +420,8 @@ __global__ void causal_conv1d_batched_sequence_snapshot_kernel(
 // Small-T snapshot form. A CTA owns all token outputs for one channel tile. The selected history
 // is cached before any snapshot slot is written, so initial_slot may name any slot, including one
 // overwritten by this call.
-__global__ void
+// 2D block (kCausalConvChannelTile x T, T <= kCausalConvParallelMaxTokens): 1024-thread ceiling.
+__launch_bounds__(1024) __global__ void
 causal_conv1d_snapshot_smallt_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                                      __nv_bfloat16* conv_states, const std::int32_t* initial_slot,
                                      const std::int32_t* snapshot_base_slot, __nv_bfloat16* out,
@@ -475,7 +479,9 @@ causal_conv1d_snapshot_smallt_kernel(const __nv_bfloat16* x, const __nv_bfloat16
 }
 
 template <bool Masked>
-__global__ void causal_conv1d_batched_snapshot_smallt_kernel(
+// 2D block (kCausalConvChannelTile x width, width <= kCausalConvParallelMaxTokens):
+// 1024-thread ceiling.
+__launch_bounds__(1024) __global__ void causal_conv1d_batched_snapshot_smallt_kernel(
     const __nv_bfloat16* x, const __nv_bfloat16* weight, __nv_bfloat16* conv_states,
     const std::int32_t* valid_columns, const std::int32_t* initial_state_slots,
     const std::int32_t* snapshot_base_slots, __nv_bfloat16* out, std::int32_t C, std::int32_t width,

@@ -480,8 +480,9 @@ constexpr int kSGPM      = kSGBM / 2;        // 32 parents per block
 // [group][row] makes them contiguous. Tiled through shared memory so both the read and
 // the write stay coalesced.
 template <int kTile>
-__global__ void transpose_wsc_group_major(const __half* __restrict__ src,
-                                          __half* __restrict__ dst, int rows, int groups) {
+__launch_bounds__(256) __global__ void
+transpose_wsc_group_major(const __half* __restrict__ src, __half* __restrict__ dst, int rows,
+                          int groups) {
     __shared__ __half tile[kTile][kTile + 1];
     const int g0 = blockIdx.x * kTile;
     const int r0 = blockIdx.y * kTile;
@@ -501,9 +502,9 @@ __global__ void transpose_wsc_group_major(const __half* __restrict__ src,
     }
 }
 
-__global__ void dequant_q4_i8_folded(const std::uint8_t* __restrict__ codes,
-                                     std::int8_t* __restrict__ out, int groups, int k,
-                                     int parents) {
+__launch_bounds__(256) __global__ void
+dequant_q4_i8_folded(const std::uint8_t* __restrict__ codes, std::int8_t* __restrict__ out,
+                      int groups, int k, int parents) {
     const int task = blockIdx.x * blockDim.x + threadIdx.x;
     if (task >= groups * 4) return;
     const int R     = blockIdx.y; // folded row

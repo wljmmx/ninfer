@@ -4,8 +4,10 @@
 
 namespace ninfer::ops {
 
-__global__ void fill_i32_positions_kernel(std::int32_t* positions, std::int32_t count,
-                                          std::int32_t start) {
+// offset_i32_positions_kernel deliberately carries no bound: its exported launcher takes the
+// block size as a runtime argument, so a compile-time ceiling would reject legal launches.
+__launch_bounds__(256) __global__ void
+fill_i32_positions_kernel(std::int32_t* positions, std::int32_t count, std::int32_t start) {
     const std::int32_t i = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
     if (i < count) { positions[i] = start + i; }
 }

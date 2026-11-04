@@ -10,8 +10,9 @@
 
 namespace ninfer::ops::detail {
 
-__global__ void increment_token_counts_kernel(const std::int32_t* token_ids, std::int32_t count,
-                                              std::int32_t* token_counts) {
+__launch_bounds__(256) __global__ void
+increment_token_counts_kernel(const std::int32_t* token_ids, std::int32_t count,
+                              std::int32_t* token_counts) {
     const int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index < count) { atomicAdd(&token_counts[token_ids[index]], 1); }
 }

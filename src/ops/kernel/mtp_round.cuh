@@ -7,7 +7,7 @@
 
 namespace ninfer::ops {
 
-__global__ void mtp_prepare_next_round_kernel(
+__launch_bounds__(32) __global__ void mtp_prepare_next_round_kernel(
     const std::int32_t* verify_ids, const std::int32_t* next_anchors, const std::int32_t* accepted,
     const std::int32_t* updated_frontiers, const std::int32_t* remaining_budgets,
     const std::int32_t* licensed_counts, const std::int32_t* rope_deltas,
