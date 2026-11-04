@@ -356,13 +356,16 @@ std::optional<Program::MergedPrefillResult> ProgramImpl::advance_prefill_batch()
             reject("capture_pending", i, 0);
             return std::nullopt;
         }
-        // Diagnosis only: NINFER_PREFILL_IGNORE_CAPTURE lets the merged pass run without the
-        // prompt-frontier capture carrier so the batch kernels can be judged on their own. Never set
-        // this outside a probe run: the capture is what a later request reuses.
-        if (candidate.next_capture < candidate.capture_groups.size() &&
-            std::getenv("NINFER_PREFILL_IGNORE_CAPTURE") == nullptr) {
-            reject("next_capture", candidate.next_capture, candidate.capture_groups.size());
-            return std::nullopt;
+        // A capture that sits at the prompt frontier is expressible in a merged pass: the row ends the
+        // pass exactly there, the commit marks the carrier and the capture runs afterwards row by row.
+        // A capture in the middle of the prompt is not: the single-lane path has to stop and capture
+        // at that frontier, and a merged pass has nowhere to put that stop yet. Refuse only that.
+        if (candidate.next_capture < candidate.capture_groups.size()) {
+            const std::uint32_t frontier = candidate.capture_groups[candidate.next_capture].frontier;
+            if (frontier != candidate.prefill->prompt_tokens) {
+                reject("mid_capture", frontier, candidate.prefill->prompt_tokens);
+                return std::nullopt;
+            }
         }
         const RequestControl::Prefill& staged = *candidate.prefill;
         if (staged.prepare_mtp || staged.vision || staged.mtp_bridge != MtpBridgeMode::None) {
@@ -421,7 +424,17 @@ std::optional<Program::MergedPrefillResult> ProgramImpl::advance_prefill_batch()
         const execution::PrefillRow& row = rows[selected[b]];
         SequenceState& sequence          = active_sequence(row.lane);
         const RequestControl::Prefill& staged = *requests[row.lane].prefill;
-        ensure_sequence_kv_mapped(sequence, row.base + row.count, 0);
+        // Map through the admission permit, exactly like the single-lane path does (prefill.cpp, the
+        // advance_prefill entry): the permit's frontier is the coverage the unit reserved at bind time.
+        // Mapping to `row.base + row.count` alone asks for pages nobody reserved, which is the
+        // "required_pages=17 mapped_pages=16 reserved_pages=0" failure at a prompt that ends on a new
+        // page.
+        const std::uint32_t need = row.base + row.count;
+        const auto& permit       = requests[row.lane].permit;
+        const std::uint32_t main_coverage =
+            permit ? std::max(permit->main_frontier, need) : need;
+        const std::uint32_t backend_coverage = permit ? permit->backend_frontier : 0U;
+        ensure_sequence_kv_mapped(sequence, main_coverage, backend_coverage);
         valid[b]     = static_cast<std::int32_t>(row.count);
         kv_rows[b]   = static_cast<std::int32_t>(row.kv_row);
         src[b]       = row.state_source;
@@ -558,6 +571,33 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             timing.include(resolve_non_speculative_pending(
                 active_sequence(lane), requests[lane], accepted_tokens.front(),
                 terminal.front() != 0, prefix_execution_splits.front(), failed_timing));
+            timing.resume_post();
+        }
+        return timing.finish();
+    }
+
+    // A merged prefill pass finishes several rows at once and every one of them carries the same Begin
+    // kind, so the single-lane branch above is just the one-row case of this. Without this branch a
+    // merged pass could execute and then have nowhere to commit, which is exactly the dead end the
+    // feature sat in.
+    const bool begin_batch = std::all_of(lanes.begin(), lanes.end(), [&](std::uint32_t lane) {
+        return lane < max_concurrency && requests[lane].lifecycle == Lifecycle::Pending &&
+               requests[lane].pending.kind == PendingKind::Begin;
+    });
+    if (begin_batch && lanes.size() > 1) {
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            const std::uint32_t lane = lanes[row];
+            if (discarded[row]) {
+                if (accepted_tokens[row] != 0 || !terminal[row]) {
+                    throw std::logic_error("discarded prefill pending decision is invalid");
+                }
+                clear_lane(active_sequence(lane), requests[lane]);
+                continue;
+            }
+            timing.pause();
+            timing.include(resolve_non_speculative_pending(
+                active_sequence(lane), requests[lane], accepted_tokens[row], terminal[row] != 0,
+                prefix_execution_splits[row], failed_timing));
             timing.resume_post();
         }
         return timing.finish();
