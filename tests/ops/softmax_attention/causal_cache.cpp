@@ -3028,12 +3028,23 @@ int run_graph_envelope_cases(DeviceExecutionView execution, KvCacheStorage stora
     int failures = 0;
     constexpr std::array<std::uint32_t, 5> short_limits{64, 128, 2048, 64, 2048};
     constexpr std::array<std::uint32_t, 4> long_limits{32769, 65536, 131072, 32769};
+    const std::array<int, 3> wide_graph_queries{0, 63, 255};
     for (const auto& geometry : kGeometries) {
         for (int width : {1, 4, 8, 16})
             failures += run_a1_case(execution, geometry, storage, {width, 17, 2048, 965u},
                                     MappingPattern::Fragmented, {}, short_limits);
         failures += run_a1_case(execution, geometry, storage, {1, 32768, 131072, 966u},
                                 MappingPattern::Fragmented, {}, long_limits);
+        // The wide cached route under Graph at the context that crashed the pre-unification build
+        // (8192, cudaErrorIllegalAddress during capture): the cached W > 16 shape belongs to the
+        // batch-wide kernel since the route unification, and its workspace contract is checked
+        // exactly by the case runner. No other Graph case reaches this corner - the replay case
+        // below stays at width 13, inside the grouped family - so without this row the only
+        // thing standing between a route/workspace split and a silent capture failure is the
+        // bench. Oracle rows are sampled like the 9216 case below; guards and cache-state
+        // checks still cover the whole request.
+        failures += run_a3_case(execution, geometry, storage, {256, 8192, 9216, 968u, false, true},
+                                MappingPattern::Fragmented, wide_graph_queries);
         BatchAttentionCase replay{16,
                                   {17, 31, 0},
                                   {7, 16, 0},
