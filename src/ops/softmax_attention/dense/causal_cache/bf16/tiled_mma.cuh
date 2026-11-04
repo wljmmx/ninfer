@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/softmax_attention/dense/causal_cache/bf16/tile_io.cuh"
+#include "ops/kernel/page_score_codec.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/softmax.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/epilogue.cuh"
 #include <math_constants.h>
@@ -15,7 +16,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                                   const __nv_bfloat16* __restrict__ cache_k,
                                   const __half* __restrict__ cache_v, Metadata metadata,
                                   const std::int32_t* __restrict__ positions, float scale,
-                                  __nv_bfloat16* __restrict__ out, std::int32_t width) {
+                                  __nv_bfloat16* __restrict__ out, std::int32_t width,
+                                  unsigned* __restrict__ page_score,
+                                  unsigned* __restrict__ page_score_recent,
+                                  std::int32_t score_row_span, float score_tolerance,
+                                  std::int32_t score_mass) {
     constexpr int D             = Geometry::kHeadDim;   // 256
     constexpr int Br            = Schedule::kQueryRows; // 64 query rows
     constexpr int Bc            = Schedule::kKeyRows;   // 64 key cols
@@ -50,6 +55,12 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     }
     const int base_pos              = positions[0];
     const std::int32_t* block_table = metadata.block_table();
+    // P6 2c: the counter planes the INT8 family records. BF16 accumulated none, so a reader of this row
+    // saw all zeros and the evict policy silently fell back to a pure window.
+    unsigned* const counters = page_score != nullptr ? page_score : metadata.counters();
+    unsigned* const recent   = metadata.recents();
+    const int score_row_begin =
+        ninfer::ops::paged_kv_page_score_row_begin(base_pos + width - 1, score_row_span);
 
     const int gid = lane >> 2;
     const int lid = lane & 3;
@@ -249,6 +260,31 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         }
         bm0 = warp_max<4>(bm0, FullMask);
         bm1 = warp_max<4>(bm1, FullMask);
+
+        // P6 2c: the same vote the INT8 family records. `bm` is this key tile's row max, `state.maximum`
+        // the running one before this tile; a row votes when the tile is within tolerance of it. One
+        // lane per row pair does the add so a page gets one count per (tile, row), not per lane.
+        if ((counters != nullptr || recent != nullptr) && tile_present && lid == 0) {
+            const float running0 = state0.maximum;
+            const float running1 = state1.maximum;
+            if (running0 != -CUDART_INF_F || running1 != -CUDART_INF_F) {
+                const int every = (bm0 > running0 - score_tolerance ? 1 : 0) +
+                                  (bm1 > running1 - score_tolerance ? 1 : 0);
+                if (every > 0 && counters != nullptr) {
+                    atomicAdd(counters + (k0 >> kPagedKVPageShift), static_cast<unsigned>(every));
+                }
+                if (score_row_span > 0 && recent != nullptr && score_mass == 0) {
+                    const bool vote0 = qabs0 >= score_row_begin;
+                    const bool vote1 = qabs1 >= score_row_begin;
+                    const int newest = (vote0 && bm0 > running0 - score_tolerance ? 1 : 0) +
+                                       (vote1 && bm1 > running1 - score_tolerance ? 1 : 0);
+                    if (newest > 0) {
+                        atomicAdd(recent + (k0 >> kPagedKVPageShift),
+                                  static_cast<unsigned>(newest));
+                    }
+                }
+            }
+        }
 
         const float alpha0     = state0.update<!FullTile>(bm0, scale_l2);
         const float alpha1     = state1.update<!FullTile>(bm1, scale_l2);

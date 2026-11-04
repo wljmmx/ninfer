@@ -15,6 +15,10 @@ struct Bf16KvCacheView {
     int table_stride;
     int head_dim;
     int kv_heads;
+    // P6 2c counter planes, resolved per row by the metadata exactly as in the INT8 family.
+    unsigned* page_scores;
+    unsigned* page_scores_peak;
+    unsigned* page_scores_recent;
 };
 
 using Bf16KvReadView  = Bf16KvCacheView<false>;
@@ -31,7 +35,10 @@ Bf16KvCacheView<Writable> bf16_kv_cache_view(const PagedKVBatchLayerView& cache,
             rows ? static_cast<const std::int32_t*>(rows->data) : nullptr,
             cache.block_tables.ne[0],
             cache.head_dim,
-            cache.num_kv_heads};
+            cache.num_kv_heads,
+            static_cast<unsigned*>(cache.page_scores.data),
+            static_cast<unsigned*>(cache.page_scores_peak.data),
+            static_cast<unsigned*>(cache.page_scores_recent.data)};
 }
 
 } // namespace ninfer::ops::detail

@@ -369,7 +369,7 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
 
     if (cache.storage == KvCacheStorage::BFloat16) {
         detail::bf16_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                         cache, envelope, workspace, out, execution);
+                                         cache, envelope, workspace, out, execution, page_score);
         return;
     }
 

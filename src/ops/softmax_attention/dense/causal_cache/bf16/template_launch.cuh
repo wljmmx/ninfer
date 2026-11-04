@@ -79,9 +79,46 @@ void launch_bf16_kv_merge(const CausalAttentionOperands& p, Bf16KvCacheView<Writ
     CUDA_CHECK(cudaGetLastError());
 }
 
+// Same three probes the INT8 family reads; separate translation unit, so they are repeated here.
+inline std::int32_t kv_page_score_row_span() {
+    static const std::int32_t span = [] {
+        const char* value = std::getenv("NINFER_KV_PAGE_SCORE_ROW_SPAN");
+        if (value == nullptr) {
+            if (std::getenv("NINFER_KV_EVICT_PROFILE") != nullptr ||
+                std::getenv("NINFER_KV_EVICT_KEEP_RATIO") != nullptr) {
+                return std::int32_t{8};
+            }
+            return std::int32_t{0};
+        }
+        const long parsed = std::strtol(value, nullptr, 10);
+        return parsed > 0 ? static_cast<std::int32_t>(parsed) : std::int32_t{0};
+    }();
+    return span;
+}
+
+inline float kv_page_score_tolerance() {
+    static const float tolerance = [] {
+        const char* value = std::getenv("NINFER_KV_PAGE_SCORE_TOL");
+        if (value == nullptr) { return 0.0f; }
+        const float parsed = std::strtof(value, nullptr);
+        return parsed > 0.0f ? parsed : 0.0f;
+    }();
+    return tolerance;
+}
+
+inline std::int32_t kv_page_score_mass() {
+    static const std::int32_t on = [] {
+        const char* value = std::getenv("NINFER_KV_PAGE_SCORE_MASS");
+        if (value == nullptr) { return std::int32_t{0}; }
+        const long parsed = std::strtol(value, nullptr, 10);
+        return parsed > 0 ? std::int32_t{1} : std::int32_t{0};
+    }();
+    return on;
+}
+
 template <class Geometry, class Schedule>
 void launch_bf16_kv_tiled_mma(const CausalAttentionOperands& p, Bf16KvReadView cache,
-                              cudaStream_t stream) {
+                              Tensor* page_score, cudaStream_t stream) {
     validate_bf16_kv_operands<Geometry>(p, cache);
     if (p.batch != 1)
         throw std::invalid_argument("BF16 tiled attention requires a complete single-row query");
@@ -90,18 +127,25 @@ void launch_bf16_kv_tiled_mma(const CausalAttentionOperands& p, Bf16KvReadView c
         const int bytes =
             bf16_kv_dynamic_shared<bf16_kv_tiled_shared_bytes<Geometry, Schedule>, kernel>();
         const dim3 grid(div_up(p.width, Schedule::kQueryRows), Geometry::QHeads);
-        kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p.q, cache.keys, cache.values, metadata,
-                                                            p.positions, p.scale, p.out, p.width);
+        unsigned* const override_scores =
+            page_score != nullptr ? static_cast<unsigned*>(page_score->data) : nullptr;
+        kernel<<<grid, Schedule::kThreads, bytes, stream>>>(
+            p.q, cache.keys, cache.values, metadata, p.positions, p.scale, p.out, p.width,
+            override_scores, cache.page_scores_recent, kv_page_score_row_span(),
+            kv_page_score_tolerance(), kv_page_score_mass());
         CUDA_CHECK(cudaGetLastError());
     };
     if (!cache.table_rows) {
-        launch(PagedKVDirectMetadata{cache.tables});
+        launch(PagedKVDirectMetadata{cache.tables, cache.page_scores, cache.page_scores_peak,
+                                     cache.page_scores_recent});
     } else if (cache.valid_columns) {
         launch(PagedKVBatchMetadata<true>{cache.tables, cache.valid_columns, cache.table_rows,
-                                          cache.table_stride});
+                                          cache.table_stride, cache.page_scores,
+                                          cache.page_scores_peak, cache.page_scores_recent});
     } else {
         launch(PagedKVBatchMetadata<false>{cache.tables, nullptr, cache.table_rows,
-                                           cache.table_stride});
+                                           cache.table_stride, cache.page_scores,
+                                           cache.page_scores_peak, cache.page_scores_recent});
     }
 }
 
