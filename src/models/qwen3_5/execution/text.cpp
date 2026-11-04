@@ -945,17 +945,16 @@ void TextContext::prefill_batch(std::span<const std::int32_t> ids,
         if (column < 0 || column >= width) {
             throw std::invalid_argument("prefill batch row has no valid column");
         }
-        // The batch rectangle is filled width-major (prefill.cpp: at = t*batch + b), so x is the
-        // flat [hidden, width*batch] tensor and row b's token at width index t lives in flat
-        // column t*batch + b. The previous form addressed a [hidden, width, batch] layout with
-        // `column*x.nb[1] + row*x.nb[2]`, but this Tensor always extends nb contiguously past the
-        // declared rank (nb[2] = nb[1]*ne[1] = the whole tensor), so every row past the first
-        // read out of bounds and every row past the first also read the wrong column.
+        // The batch rectangle is filled row-major (prefill.cpp: at = b*width + t), so x is the flat
+        // [hidden, width*batch] tensor and row b's token at width index t lives in flat column
+        // b*width + t. The fill, every batched kernel the pass feeds (attention positions, the GDN
+        // conv column walk, the delta net's record mapping) and this tail-column read share the
+        // one helper - a private layout here would be the same bug the width-major fill was.
         CUDA_CHECK(cudaMemcpyAsync(
             static_cast<char*>(last.data) + static_cast<std::size_t>(row) * last.nb[1],
             static_cast<const char*>(x.data) +
                 static_cast<std::size_t>(
-                    models::qwen3_5::execution::prefill_batch_flat_column(column, row, batch)) *
+                    models::qwen3_5::execution::prefill_batch_flat_column(column, row, width)) *
                 x.nb[1],
             static_cast<std::size_t>(dimension(config_.hidden_size)) * sizeof(std::uint16_t),
             cudaMemcpyDeviceToDevice, stream));

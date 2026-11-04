@@ -490,8 +490,7 @@ std::optional<Program::MergedPrefillResult> ProgramImpl::advance_prefill_batch()
         for (std::uint32_t t = 0; t < row.count; ++t) {
             const std::size_t at = static_cast<std::size_t>(
                 models::qwen3_5::execution::prefill_batch_flat_column(
-                    static_cast<std::int32_t>(t), static_cast<std::int32_t>(b),
-                    static_cast<std::int32_t>(batch)));
+                    static_cast<std::int32_t>(t), static_cast<std::int32_t>(b), width));
             ids[at]       = staged.prompt.token_ids[row.base + t];
             positions[at] = static_cast<std::int32_t>(row.base + t);
             rope[at]      = static_cast<std::int32_t>(row.base + t + sequence.rope_delta);

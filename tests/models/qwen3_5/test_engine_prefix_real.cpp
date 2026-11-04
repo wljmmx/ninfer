@@ -1721,8 +1721,8 @@ bool capture_contains(const char* path, const char* needle) {
 }
 
 // The merged prefill pass's dispatch conditions, pinned end to end with the opt-in switches on.
-// The pass takes each row's tail column out of the width-major [hidden, width*batch] rectangle in
-// execution::prefill_batch (row b's token at width index t is flat column t*batch + b, one shared
+// The pass takes each row's tail column out of the row-major [hidden, width*batch] rectangle in
+// execution::prefill_batch (row b's token at width index t is flat column b*width + t, one shared
 // helper now), and it may only execute rows whose end is covered by a reserved unit or by the
 // bind's growth, whose rectangle fits the conv-state slot budget, and whose width the GDN kernels
 // can serve.
