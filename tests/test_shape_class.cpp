@@ -106,6 +106,23 @@ int main() {
         check_equal(result.lanes, 3, "37+41+5 takes three lanes");
     }
 
+    // The width-major rectangle the merged pass fills and reads: row b's token at width index t
+    // is flat column t*batch + b, and the fill and the tail-column read share this one mapping.
+    // The read used to address a [hidden, width, batch] layout instead, which for batch=2 put
+    // row 1 a whole-tensor stride out of bounds and read the wrong column even for row 0.
+    for (std::int32_t batch = 1; batch <= 8; ++batch) {
+        for (std::int32_t row = 0; row < batch; ++row) {
+            for (std::int32_t t = 0; t < 16; ++t) {
+                const auto flat = execution::prefill_batch_flat_column(t, row, batch);
+                check_equal(static_cast<std::uint64_t>(flat),
+                            static_cast<std::uint64_t>(t) * static_cast<std::uint64_t>(batch) +
+                                static_cast<std::uint64_t>(row),
+                            "width-major flat column");
+                check(flat < 16 * batch, "flat column stays inside the 16-wide rectangle");
+            }
+        }
+    }
+
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

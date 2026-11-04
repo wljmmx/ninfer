@@ -88,12 +88,21 @@ add_test(NAME ninfer_qwen3_5_agent_continuation_real_test
 set_tests_properties(ninfer_qwen3_5_agent_continuation_real_test PROPERTIES
   ENVIRONMENT "NINFER_PREFIX_REAL_SCENARIO=agent-continuation")
 
+# The merged prefill pass's tail-column addressing: two rows with different prompts and lengths
+# must produce the same greedy tokens as the single-lane path, and the captured dispatch log has
+# to prove the two-row pass actually ran.
+add_test(NAME ninfer_qwen3_5_merged_prefill_real_test
+  COMMAND ninfer_qwen3_5_prefix_real_test)
+set_tests_properties(ninfer_qwen3_5_merged_prefill_real_test PROPERTIES
+  ENVIRONMENT "NINFER_PREFIX_REAL_SCENARIO=merged-prefill")
+
 # A real-model test owns the single GPU while its artifact is resident.
 set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_loading_real_test
   ninfer_qwen3_5_native_transactions_test
   ninfer_qwen3_5_prefix_real_test
   ninfer_qwen3_5_agent_continuation_real_test
+  ninfer_qwen3_5_merged_prefill_real_test
   ninfer_qwen3_5_preemption_real_test
   ninfer_qwen3_5_grammar_real_test
   ninfer_qwen3_5_tools_real_test

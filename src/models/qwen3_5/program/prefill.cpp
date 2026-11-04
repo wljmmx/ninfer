@@ -372,6 +372,27 @@ std::optional<Program::MergedPrefillResult> ProgramImpl::advance_prefill_batch()
             reject("narrow_path", staged.prepare_mtp ? 1 : 0, staged.vision ? 1 : 0);
             return std::nullopt;
         }
+        // The single-lane prefill contract runs a chunk only under a reserved execution unit
+        // (advance_prefill: require_unit, then mapping through the permit's frontier), because
+        // settling a unit releases its growth reservation and the next chunk's pages have to be
+        // reserved again before anything maps them. The merged attempt dispatches between unit
+        // reservations - the engine hands the prefill turn to one lane per round - so a row
+        // whose unit has settled (an interior chunk's tail) holds neither a permit nor growth,
+        // and mapping it would demand pages nobody reserved ("KV coverage exceeds reserved unit
+        // growth"). Admit a row only when its end is already covered: by its unit permit, or by
+        // the growth its bind reserved for a row that has not executed yet. Anything else stays
+        // queued and runs through the single-lane path under its own unit.
+        const std::uint32_t end = candidate.prefill->cursor + rows[i].count;
+        const auto& row_state   = active_sequence(rows[i].lane);
+        const bool covered =
+            candidate.permit
+                ? candidate.permit->main_frontier >= end
+                : text_kv_addresses->growth_pages_for_tokens(row_state.kv->text, end) <=
+                      text_kv_addresses->reserved_growth_pages(row_state.kv->text);
+        if (!covered) {
+            reject("permit", rows[i].lane, end);
+            return std::nullopt;
+        }
     }
 
     // Rows may end their prompt here: a finishing row's token comes straight out of the pass, so
@@ -407,6 +428,31 @@ std::optional<Program::MergedPrefillResult> ProgramImpl::advance_prefill_batch()
     const std::int32_t width =
         models::qwen3_5::execution::prefill_class_for(static_cast<std::int32_t>(widest));
     const std::int32_t rows_n = static_cast<std::int32_t>(batch);
+    // The same snapshot's second bound: the layer's conv-state tensor doubles as the snapshot's
+    // column scratch, so the rectangle's aggregate columns must fit the pool's slot count
+    // (max_concurrency + device_state_slots). No default engine plans that for a multi-row
+    // prefill rectangle - two rows at the 16-wide class floor already need 32 slots - so the
+    // pass refuses here instead of failing the request inside the layer. Planning enough state
+    // slots is what lets a merged pass through; the wide-batch conv kernel remains the feature's
+    // named work for larger aggregates.
+    const auto state_slots = state_images->linear().slot_count();
+    if (static_cast<std::int64_t>(width) * rows_n > static_cast<std::int64_t>(state_slots)) {
+        reject("conv_state", static_cast<std::size_t>(width) * rows_n,
+               static_cast<std::size_t>(state_slots));
+        return std::nullopt;
+    }
+    // The GDN delta net's non-replay batch entry (gated_delta_net_batch_update) accepts exactly
+    // W=1 - it is the decode-batch shape. The replay-record entry that serves W>1 verify
+    // rectangles exists only on speculative engines, which the narrow path above already
+    // excluded. A merged rectangle's width is the prefill class of its widest row, and the
+    // class ladder's floor is 16, so no pass can run the model layers until the wide-batch
+    // delta-net kernel lands (the same remaining-work family as the wide-batch conv kernel the
+    // width gate names). Refuse with the domain named instead of failing the request inside the
+    // layer.
+    if (width > 1) {
+        reject("delta_net", width, rows_n);
+        return std::nullopt;
+    }
     std::vector<std::int32_t> ids(static_cast<std::size_t>(width) * batch, 0);
     std::vector<std::int32_t> positions(ids.size(), 0);
     std::vector<std::int32_t> rope(ids.size(), 0);
@@ -442,7 +488,10 @@ std::optional<Program::MergedPrefillResult> ProgramImpl::advance_prefill_batch()
         tails[b]     = &sequence.tail_hidden;
         finishes[b]  = row.base + row.count >= staged.prompt_tokens;
         for (std::uint32_t t = 0; t < row.count; ++t) {
-            const std::size_t at = static_cast<std::size_t>(t) * batch + b;
+            const std::size_t at = static_cast<std::size_t>(
+                models::qwen3_5::execution::prefill_batch_flat_column(
+                    static_cast<std::int32_t>(t), static_cast<std::int32_t>(b),
+                    static_cast<std::int32_t>(batch)));
             ids[at]       = staged.prompt.token_ids[row.base + t];
             positions[at] = static_cast<std::int32_t>(row.base + t);
             rope[at]      = static_cast<std::int32_t>(row.base + t + sequence.rope_delta);

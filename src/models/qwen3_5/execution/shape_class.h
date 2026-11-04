@@ -48,6 +48,23 @@ constexpr std::int32_t prefill_class_for(std::int32_t width) {
     return width;
 }
 
+// The merged prefill rectangle is width-major: row b's token at width index t lives in flat
+// column t*batch + b of the [hidden, width*batch] tensor. The fill (program/prefill.cpp) and the
+// tail-column read (execution::prefill_batch) must agree on exactly this mapping - the read used
+// to address a [hidden, width, batch] layout and read out of bounds for every row past the first
+// - so the mapping lives beside the shape classes instead of being re-derived at each site.
+constexpr std::int32_t prefill_batch_flat_column(std::int32_t width_index, std::int32_t row,
+                                                 std::int32_t batch) {
+    return width_index * batch + row;
+}
+
+static_assert(prefill_batch_flat_column(0, 0, 2) == 0);
+static_assert(prefill_batch_flat_column(0, 1, 2) == 1);
+static_assert(prefill_batch_flat_column(1, 0, 2) == 2);
+static_assert(prefill_batch_flat_column(5, 0, 2) == 10);
+static_assert(prefill_batch_flat_column(7, 1, 2) == 15);
+static_assert(prefill_batch_flat_column(8, 1, 2) == 17);
+
 // A single lane must stay a class of its own: the whole point of keeping batches out of the k=1 path
 // is that the untuned single-request path is bit-identical to what shipped.
 static_assert(decode_class_for(1) == 1);
