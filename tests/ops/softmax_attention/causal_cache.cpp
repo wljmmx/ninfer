@@ -2751,6 +2751,93 @@ int run_quantized_batch_cases(DeviceExecutionView execution, KvCacheStorage stor
     return failures;
 }
 
+// One route probe: run row 0 of a W=256 request either alone (B=1, the tiled/grouped route) or as the
+// first row of a B=2 batch (the wide-batch route), with byte-identical q/k/v for row 0. The only
+// difference left between the two outputs is the kernel's reduction order.
+bool supports_wide_batch(KvCacheStorage storage);
+
+std::vector<double> probe_route_order(DeviceExecutionView execution, KvCacheStorage storage,
+                                      int batch) {
+    const Geometry& geometry      = kGeometries[0];
+    constexpr std::int32_t width  = 256;
+    const std::int32_t contexts[2] = {128, 64};
+    const std::size_t q_cols      = std::size_t(kHeadDim) * geometry.q_heads;
+    const std::size_t kv_cols     = std::size_t(kHeadDim) * geometry.kv_heads;
+    std::vector<float> q(q_cols * width * batch), k(kv_cols * width * batch),
+        v(kv_cols * width * batch);
+    for (int b = 0; b < batch; ++b) {
+        const auto q_row = make_bf16_values(q_cols * width, 7000u + 10u * b, -.25f, .25f);
+        const auto k_row = make_bf16_values(kv_cols * width, 7001u + 10u * b, -.25f, .25f);
+        const auto v_row = make_bf16_values(kv_cols * width, 7002u + 10u * b, -1.f, 1.f);
+        std::copy(q_row.begin(), q_row.end(), q.begin() + b * q_cols * width);
+        std::copy(k_row.begin(), k_row.end(), k.begin() + b * kv_cols * width);
+        std::copy(v_row.begin(), v_row.end(), v.begin() + b * kv_cols * width);
+    }
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(width) * batch);
+    for (int b = 0; b < batch; ++b)
+        for (int j = 0; j < width; ++j) positions[b * width + j] = contexts[b] + j;
+    std::vector<std::int32_t> lanes(batch);
+    for (int b = 0; b < batch; ++b) lanes[b] = b;
+    // Every pool row must share one physical geometry, so they all get the same capacity.
+    std::vector<HostCache> initial;
+    for (int row = 0; row < batch; ++row)
+        initial.push_back(make_cache(geometry, storage, contexts[0] + width + 3, 9300u + 7u * row));
+    BatchDeviceCache cache(initial, MappingPattern::Identity, contexts[0] + width);
+    GuardedDeviceBuffer dq(q.size() * 2), dk(k.size() * 2), dv(v.size() * 2),
+        dp(positions.size() * 4), dlanes(batch * 4), dout(q.size() * 2);
+    const auto q_bits = to_bf16_bits(q), k_bits = to_bf16_bits(k), v_bits = to_bf16_bits(v);
+    dq.copy_from_host(q_bits.data(), q_bits.size() * 2);
+    dk.copy_from_host(k_bits.data(), k_bits.size() * 2);
+    dv.copy_from_host(v_bits.data(), v_bits.size() * 2);
+    dp.copy_from_host(positions.data(), positions.size() * 4);
+    dlanes.copy_from_host(lanes.data(), batch * 4);
+    Tensor tq(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, width, batch});
+    Tensor tk(dk.data(), DType::BF16, {kHeadDim, geometry.kv_heads, width, batch}),
+        tv(dv.data(), DType::BF16, {kHeadDim, geometry.kv_heads, width, batch});
+    Tensor tp(dp.data(), DType::I32, {width, batch}), tlanes(dlanes.data(), DType::I32, {batch});
+    Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, width, batch});
+    const ops::CausalAttentionExecutionEnvelope envelope{456u, 456u};
+    const auto capacity = ops::causal_softmax_attention_workspace_capacity_bytes(
+        op_geometry(geometry), storage, envelope, batch, width, width, execution);
+    GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1u << 20));
+    WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
+    ops::causal_softmax_attention(tq, tk, tv, tp, Tensor{}, tlanes, op_geometry(geometry),
+                                  kAttentionScale, cache.view(), envelope, workspace, tout,
+                                  execution, nullptr);
+    cuda_synchronize(execution.stream);
+    const auto output = copy_from_guarded<std::uint16_t>(dout, q.size());
+    const auto values = bf16_bits_to_double(output);
+    return std::vector<double>(values.begin(), values.begin() + q_cols * width);
+}
+
+// Report, per layout, how far a batched row 0 drifts from the same row run alone. The route is chosen
+// by the shape (B=1 runs the tiled/grouped kernel, B=2 the wide one), so the two reductions order the
+// same terms differently; the contract this asserts is that the difference stays at the last bit.
+int measure_route_order(DeviceExecutionView execution, KvCacheStorage storage) {
+    if (!supports_wide_batch(storage)) { return 0; }
+    const auto single = probe_route_order(execution, storage, 1);
+    const auto paired = probe_route_order(execution, storage, 2);
+    double squared = 0.0, reference = 0.0, maximum = 0.0;
+    std::size_t differing = 0;
+    for (std::size_t i = 0; i < single.size(); ++i) {
+        const double delta = single[i] - paired[i];
+        squared += delta * delta;
+        reference += single[i] * single[i];
+        maximum = std::max(maximum, std::abs(delta));
+        differing += delta != 0.0 ? 1 : 0;
+    }
+    const double relative = std::sqrt(squared / std::max(reference, 1e-300));
+    // Measured on sm_89: BF16 and the int8/rk family land at rel_l2 5.8e-4 with every differing
+    // element off by exactly one BF16 ulp (9.77e-4); FP8 and K8V4 are bit-identical at this shape.
+    constexpr double kMaximumRelative = 1.0e-3;
+    constexpr double kMaximumAbsolute = 5.0e-3;
+    const bool inside = relative <= kMaximumRelative && maximum <= kMaximumAbsolute;
+    std::cout << "[order] " << cache_name(storage) << " W=256 B=1 vs B=2 row0 rel_l2=" << relative
+              << " max_abs=" << maximum << " differing=" << differing << "/" << single.size()
+              << (inside ? " PASS" : " FAIL") << '\n';
+    return inside ? 0 : 1;
+}
+
 // B > 1 with W > 16 is the wide-batch shape. BF16, INT8 and the rk layouts serve it with a
 // dedicated batch-wide kernel (rk instantiates the INT8 one with its own cache read-back); FP8 and
 // K8V4 serve it by interleaving the batch into the tiled kernel's split ladder. NVFP4 stays outside
@@ -3330,6 +3417,7 @@ int run_storage_cases(DeviceExecutionView execution, KvCacheStorage storage) {
     failures += run_batch_cases(execution, storage);
     failures += run_graph_envelope_cases(execution, storage);
     failures += run_verify_width_cases(execution, storage);
+    failures += measure_route_order(execution, storage);
     failures += run_numerical_profile_cases(execution, storage);
     failures += run_small_prefill_cases(execution, storage);
     failures += run_absent_page_cases(execution, storage);
