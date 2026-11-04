@@ -2,11 +2,14 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -18,8 +21,10 @@ namespace {
 constexpr std::uint64_t kTestNowMs = 1000;
 
 using Usage = ninfer::runtime::ContextResourceUsage;
-using Key   = std::vector<std::uint32_t>;
-using Role  = ninfer::runtime::CheckpointRole;
+// The token stream is TokenId end to end: restore_from_cache hands the prompt to an external
+// cache backend whose lookup is keyed by exactly this sequence (fetch(std::span<const TokenId>)).
+using Key  = std::vector<ninfer::TokenId>;
+using Role = ninfer::runtime::CheckpointRole;
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }
@@ -29,6 +34,11 @@ struct Handle {
     std::uint32_t index;
     friend bool operator==(Handle, Handle) = default;
 };
+
+// The production's PreparedCaptureBacking fingerprints a capture so a record restored from an
+// external cache is matchable later. The fixture's identity is the shortlist key itself, so the
+// backing exists only to satisfy import_checkpoint_current_layout's signature.
+struct CaptureBacking {};
 
 struct Base {
     struct Summary {
@@ -55,6 +65,12 @@ struct Base {
         if (frontier > tokens.size()) { return std::nullopt; }
         return Key(tokens.begin(), tokens.begin() + frontier);
     }
+
+    // The prompt as the model will see it, read-only: the only identity an external cache can
+    // be keyed by. The fixture never prepares a capture backing, so that view stays empty.
+    [[nodiscard]] std::span<const ninfer::TokenId> prompt_tokens() const { return tokens; }
+
+    [[nodiscard]] std::shared_ptr<const CaptureBacking> capture_backing() const { return nullptr; }
 };
 
 struct Source {
@@ -66,6 +82,23 @@ struct Source {
     bool take_private   = false;
     std::vector<Handle> retired_points;
     std::vector<Handle> private_points;
+};
+
+// A checkpoint's KV prefix as raw Host bytes, mirroring qwen3_5::CheckpointExport. The fixture
+// never moves real bytes; this shape exists so restore_from_cache compiles against the import
+// contract, and the fixture's import reads only the page count.
+struct CheckpointExport {
+    std::uint32_t frontier   = 0;
+    std::uint32_t page_count = 0;
+    std::size_t page_bytes   = 0;
+    std::vector<std::uint32_t> epochs;
+    std::vector<std::byte> kv_bytes;
+};
+
+// Live room in the fixture's main-KV page pool, mirroring qwen3_5::CheckpointPoolHeadroom.
+struct CheckpointPoolHeadroom {
+    std::uint32_t capacity_pages  = 0;
+    std::uint32_t available_pages = 0;
 };
 
 // Concrete immutable contents and their Host aliases, without cache policy or an allocator.
@@ -180,6 +213,35 @@ struct Program {
         const auto& content = contents.at(handle.index);
         require(content.alive && frontier <= content.tokens.size(), "invalid prefix identity read");
         return {content.tokens.begin(), content.tokens.begin() + frontier};
+    }
+
+    [[nodiscard]] CheckpointPoolHeadroom checkpoint_pool_headroom() const {
+        std::uint32_t occupied = 0;
+        for (const auto& content : contents) {
+            if (content.alive) { occupied += content.main_pages; }
+        }
+        return {.capacity_pages  = main_capacity,
+                .available_pages = occupied < main_capacity ? main_capacity - occupied : 0};
+    }
+
+    // Restores one Content from an external cache's payload. The bytes are opaque to this
+    // fixture: the record enters as a Continuation carrying the shortlist key it must be
+    // matchable by -- without the key the record is readable and never matched again -- and
+    // the Device pages it holds for its whole life, which is what the headroom above counts.
+    [[nodiscard]] std::optional<Handle> import_checkpoint_current_layout(
+        const CheckpointExport& kv, const std::vector<std::string>& state_shards,
+        std::shared_ptr<const CaptureBacking> /*identity*/, const Key* key = nullptr,
+        std::string* error = nullptr) {
+        if (key == nullptr || state_shards.empty() || kv.page_count == 0) {
+            if (error) { *error = "fixture import needs a keyed, whole-prefix payload"; }
+            return std::nullopt;
+        }
+        Content content{*key};
+        content.role       = Role::Continuation;
+        content.main_pages = kv.page_count;
+        const Handle handle{static_cast<std::uint32_t>(contents.size())};
+        contents.push_back(std::move(content));
+        return handle;
     }
 
     [[nodiscard]] PhysicalUsage physical_usage() const {
@@ -531,6 +593,9 @@ struct Model {
     using CheckpointHandle = Handle;
     using SourceCandidate  = Source;
     using CacheSessionKey  = std::uint64_t;
+    // Namespace-level in the production RuntimeTypes, and the same here, because
+    // restore_from_cache names it as Model::CheckpointExport.
+    using CheckpointExport = ::CheckpointExport;
 };
 
 struct Fixture {
