@@ -67,10 +67,16 @@ struct ConvGeometry {
 
 ConvGeometry require_snapshot_input(const Tensor& x, std::int32_t hidden) {
     constexpr std::int32_t kMaximumBatch = 8;
-    constexpr std::int32_t kMaximumWidth = 16;
-    const std::int32_t width             = x.ne[1];
-    const std::int32_t batch             = x.ne[2];
-    if (width <= 0 || batch <= 0 || batch > kMaximumBatch || (batch > 1 && width > kMaximumWidth)) {
+    // The snapshot's downstream is column-generic: the materialized projection routes on the
+    // aggregate count and the projected conv walks column batch*width + token. The binding bound
+    // is therefore the aggregate column budget, not a per-request width cap - the conv-state
+    // pool a production caller borrows as the column scratch is what actually limits a call,
+    // and that is the caller's planning quantity, checked where it is known.
+    constexpr std::int64_t kMaximumAggregateColumns = 8192;
+    const std::int32_t width                       = x.ne[1];
+    const std::int32_t batch                       = x.ne[2];
+    if (width <= 0 || batch <= 0 || batch > kMaximumBatch ||
+        static_cast<std::int64_t>(width) * batch > kMaximumAggregateColumns) {
         throw std::invalid_argument("gdn_input_proj_conv_snapshot: unsupported B/W domain");
     }
     require_conv_tensor(x, hidden, width, batch, "gdn_input_proj_conv_snapshot", "x");
@@ -233,9 +239,12 @@ void require_parent_nonoverlap(const Weight& weight,
 void require_snapshot_capacity_domain(std::int32_t batch_size, std::int32_t min_width,
                                       std::int32_t max_width) {
     constexpr std::int32_t kMaximumBatch = 8;
-    constexpr std::int32_t kMaximumWidth = 16;
+    // Same aggregate column budget as require_snapshot_input: the capacity query must admit
+    // exactly the shapes execution does, or a planner would size the workspace for a domain
+    // smaller than the one it has to serve.
+    constexpr std::int64_t kMaximumAggregateColumns = 8192;
     if (batch_size <= 0 || batch_size > kMaximumBatch || min_width <= 0 || max_width < min_width ||
-        (batch_size > 1 && max_width > kMaximumWidth)) {
+        static_cast<std::int64_t>(max_width) * batch_size > kMaximumAggregateColumns) {
         throw std::invalid_argument("gdn_input_proj_conv_snapshot workspace: invalid B/W domain");
     }
 }

@@ -22,6 +22,24 @@ namespace {
 
 // This criterion belongs to the complete A16 fused projection/conv/snapshot Op.
 constexpr ReductionCriterion kGdnInputProjConvSnapshotA16Tolerance{3.15e-3, 4.0e-3, 3.2e-3};
+// This criterion belongs to the same Op's materialized route when the projection takes the W4A8
+// int8-activation path (aggregate columns a multiple of 128 under LinearPolicy::AllowA8): the
+// activation quantisation is part of that route's arithmetic, so the A16 criterion - written for
+// routes that keep BF16 activations - does not describe it. Same {relative_l2, gross_absolute,
+// gross_relative_to_max_reference} structure as every other criterion here, values calibrated on
+// RTX 4090 (sm_89, CUDA 13.4) against the FP64 oracle over the B=1 T={128,256,1024} and
+// B=2 W=128 ragged cases below (~130k compared values per case family):
+//   relative_l2: measured maximum 4.73e-3 -> limit 6.0e-3, the same 1.27x headroom the A16
+//     criterion gives its measured maximum (T=96 bf16 route: 2.48e-3 against 3.15e-3);
+//   gross_absolute 2.0e-3: the observed maximum absolute error on the small-magnitude outputs
+//     (query/key/value) is 1.04e-3, so the floor doubles it;
+//   gross_relative 8.0e-3: the large-magnitude comparisons (conv state, z) measured errors up to
+//     5.92e-2 against max references 11.1..13.8, i.e. 5.3e-3 relative to the maximum - the
+//     slope takes that with 1.5x headroom (binding case ratio 0.65).
+// The route is an order of magnitude tighter than the FP8 A8 criterion {0.04, 1/256, 0.06}
+// because W4A8 quantises activations per (token, 64-K-group) instead of per token as one FP8
+// block; the FP8 values are a structural reference, not a magnitude to copy.
+constexpr ReductionCriterion kGdnInputProjConvSnapshotA8Tolerance{6.0e-3, 2.0e-3, 8.0e-3};
 constexpr ReductionCriterion kGdnInputProjConvSnapshotA4Tolerance{0.16, 4.0e-3, 0.16};
 constexpr ReductionCriterion kFp8GdnInputProjConvSnapshotA16Tolerance{1.0 / 256.0, 1.0 / 256.0,
                                                                       2.0 / 256.0};
@@ -438,7 +456,8 @@ int run_batched_case(std::string_view label, std::int32_t hidden, std::int32_t v
 }
 
 int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_weight,
-                   std::int32_t tokens, std::int32_t initial_slot, bool full_reference = false) {
+                    std::int32_t tokens, std::int32_t initial_slot, bool full_reference = false,
+                    const ReductionCriterion& criterion = kGdnInputProjConvSnapshotA16Tolerance) {
     constexpr std::int32_t kHidden           = 5120;
     constexpr std::int32_t kValueRows        = 6144;
     constexpr std::int32_t kZRows            = 6144;
@@ -503,11 +522,11 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
                                " initial=" + std::to_string(initial_slot) +
                                " base=" + std::to_string(kSnapshotBaseSlot);
     int failures = verify_snapshot_outputs(suffix, query, key, value, kValueRows, tokens, oracle,
-                                           kGdnInputProjConvSnapshotA16Tolerance, full_reference);
+                                            criterion, full_reference);
     failures += compare(
         "snapshot state" + suffix,
         gather_state(state_after, kChannels, kValueRows, tokens, kSnapshotBaseSlot, full_reference),
-        oracle.state, kGdnInputProjConvSnapshotA16Tolerance);
+        oracle.state, criterion);
     failures += state.verify_guards("snapshot state" + suffix);
     failures += verify_state_effects("snapshot state" + suffix, state_before, state_after,
                                      kChannels, tokens, slots, kSnapshotBaseSlot);
@@ -517,7 +536,7 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
                         gather_rows(z.values(), kZRows, 0, kZRows, tokens, sample_count),
                         projection_oracle(value_z_weight.host, kValueRows, kZRows, activation,
                                           kHidden, tokens, sample_count),
-                        kGdnInputProjConvSnapshotA16Tolerance);
+                        criterion);
     failures += verify_preserved("snapshot x" + suffix, device_activation, activation_bits);
     failures +=
         verify_preserved("snapshot conv weight" + suffix, device_conv_weight, conv_weight_bits);
@@ -567,6 +586,18 @@ int run_q4_q5() {
     // routes.
     for (const std::int32_t tokens : {32, 33, 64}) {
         failures += run_q4_q5_case(query_key, value_z_weight, tokens, tokens + 1);
+    }
+    // The wide end of the domain, where the materialized projection changes arithmetic. 96 is the
+    // first >=65 column count that is NOT a multiple of 128: the GroupedMixedMma bf16 route, so the
+    // A16 criterion still describes it. 128/256/1024 are multiples of 128, which take the W4A8
+    // int8-activation projection under AllowA8 - the route whose activation quantisation is part of
+    // its arithmetic and therefore carries its own criterion (the FP8 A8 route set the precedent
+    // for a per-route criterion). 1024 is the prefill chunk width a merged pass plans for, and the
+    // B=2 x 128 case below is the batched organisation of the same route with a ragged second row.
+    failures += run_q4_q5_case(query_key, value_z_weight, 96, 97);
+    for (const std::int32_t tokens : {128, 256, 1024}) {
+        failures += run_q4_q5_case(query_key, value_z_weight, tokens, tokens + 1, false,
+                                   kGdnInputProjConvSnapshotA8Tolerance);
     }
     constexpr std::int32_t kValueRows    = 6144;
     constexpr std::int32_t kZRows        = 6144;
@@ -682,6 +713,41 @@ int run_q4_q5() {
     failures += run_batched_case(
         "Q4/Q5 A16 B=3 W=16 masked", kHidden, kValueRows, kZRows, kMixedWidth, kMixedBatch,
         mixed_valid, conv_weight, mixed_workspace_bytes, kGdnInputProjConvSnapshotA16Tolerance,
+        [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
+            const float* column =
+                activation.data() + static_cast<std::size_t>(flat_column) * kHidden;
+            if (row < kQueryRows + kKeyRows) {
+                return quantized_weight::dot_fp64(query_key.host, row, column, kHidden);
+            }
+            return quantized_weight::dot_fp64(value_z_weight.host, row - kQueryRows - kKeyRows,
+                                              column, kHidden);
+        },
+        [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
+            return quantized_weight::dot_fp64(
+                value_z_weight.host, kValueRows + row,
+                activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
+        },
+        [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
+            const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
+            Tensor& z, WorkspaceArena& workspace) {
+            ops::gdn_input_proj_conv_snapshot(x, query_key.view(), value_z_weight.view(), conv,
+                                              state, valid, initial, snapshot_base, q, k, v, z,
+                                              workspace, nullptr);
+        });
+    // The wide batched shape a merged prefill rectangle asks for: two rows of the 128-wide class
+    // (aggregate 256 columns) with a ragged second row, over the W4A8 int8-activation projection
+    // the aggregate count routes to. This is the batch organisation of the dense B=1 T=128/256
+    // cases above - one aggregate projection route for the whole call, per-request conv history
+    // and exact-zero invalid tails - carrying the A8 criterion for the same reason they do.
+    constexpr std::int32_t kWideWidth = 128;
+    constexpr std::int32_t kWideBatch = 2;
+    const std::vector<std::int32_t> wide_valid{128, 96};
+    const std::size_t wide_workspace_bytes =
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+            kQueryRows, kKeyRows, kValueRows, kWideBatch, kWideWidth, kWideWidth);
+    failures += run_batched_case(
+        "Q4/Q5 A8 B=2 W=128 masked", kHidden, kValueRows, kZRows, kWideWidth, kWideBatch,
+        wide_valid, conv_weight, wide_workspace_bytes, kGdnInputProjConvSnapshotA8Tolerance,
         [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
             const float* column =
                 activation.data() + static_cast<std::size_t>(flat_column) * kHidden;
