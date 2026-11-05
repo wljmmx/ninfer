@@ -930,6 +930,15 @@ void TextContext::prefill_batch(std::span<const std::int32_t> ids,
     ScopedValue<const Tensor*> valid_binding(active_valid_columns_, &d_valid);
     ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
     ScopedValue<std::int32_t> width_binding(active_sequence_width_, width);
+    // The GDN conv split below slices each row's columns and state slots on the host, so the pass
+    // publishes its own host spans next to the device copies. The layers are not graph captured,
+    // and the spans point at the caller's storage, which outlives this call.
+    ScopedValue<std::span<const std::int32_t>> source_host_binding(
+        active_linear_state_source_slots_host_, state_source_slots);
+    ScopedValue<std::span<const std::int32_t>> destination_host_binding(
+        active_linear_state_destination_slots_host_, state_destination_slots);
+    ScopedValue<std::span<const std::int32_t>> valid_host_binding(active_valid_columns_host_,
+                                                                  valid_columns);
 
     Tensor x = work_.alloc(DType::BF16, {dimension(config_.hidden_size), columns});
     ops::embedding(d_ids.view({columns}), *embed_, x, stream);
@@ -960,11 +969,21 @@ void TextContext::prefill_batch(std::span<const std::int32_t> ids,
             cudaMemcpyDeviceToDevice, stream));
     }
     ops::rmsnorm(last, *final_norm_, config_.rms_norm_eps, true, normed, stream);
-    Tensor logits = work_.alloc(DType::BF16,
-                                {dimension(config_.vocab_size), batch});
+    // The single-lane path projects each chunk's last hidden column alone (prefill_impl: matrix
+    // window at T=1, then project). A [vocab, batch] projection is a different column count and
+    // therefore a different route, so the merged pass samples each row at T=1 too: the rows'
+    // logits then match the single-lane arm's by the same construction every other per-column op
+    // here relies on. Greedy output only - the pass carries no per-row sampling state.
     Tensor tokens = work_.alloc(DType::I32, {batch});
-    project(normed, *lm_head_, logits, work_, stream);
-    ops::argmax(logits, tokens, dimension(parameters_.model.resources().public_token_count), stream);
+    Tensor logits = work_.alloc(DType::BF16, {dimension(config_.vocab_size), 1});
+    for (std::int32_t row = 0; row < batch; ++row) {
+        project(normed.slice(1, row, 1), *lm_head_, logits, work_, stream);
+        Tensor row_token(static_cast<char*>(tokens.data) +
+                             static_cast<std::size_t>(row) * tokens.nb[0],
+                         DType::I32, {1});
+        ops::argmax(logits, row_token,
+                    dimension(parameters_.model.resources().public_token_count), stream);
+    }
     // Each row's own tail hidden: the next decode step reads it, so it has to land in that lane's
     // sequence rather than in a shared scratch tensor.
     for (std::int32_t row = 0; row < batch; ++row) {
@@ -1265,6 +1284,48 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             gdn_projection_record(projection_input, p, *config_.gdn, conv_states, valid,
                                   *active_linear_state_source_slots_, records.conv, query_output,
                                   key_output, value_output, gate_output, work_, s);
+        } else if (width > 1) {
+            // The merged prefill rectangle (UpdateInPlace, W>1; only prefill_batch binds this).
+            // It runs the single-lane prefill chunk's own conv form per row: the aggregate
+            // projection at the rectangle's column count, then the SAME causal_conv1d_silu_split op
+            // on each row's slice with that row's state slots. The conv outputs and the
+            // destination conv state are therefore the single-lane results by construction - no
+            // snapshot column scratch is borrowed from the state pool, so the pass needs no slot
+            // spans, and the state lands in the row's destination slot where the fork settle
+            // expects it.
+            if (active_valid_columns_host_.empty() ||
+                active_linear_state_source_slots_host_.empty() ||
+                active_linear_state_destination_slots_host_.empty()) {
+                throw std::logic_error(
+                    "merged prefill GDN requires the pass's host state bindings");
+            }
+            Tensor qkv = workspace::gdn_prefill_conv(work_, config_, T);
+            Tensor z_flat = z.view({dimension(config_.gdn->value_width()), T});
+            gdn_projection(h, p, qkv, z_flat, work_, s);
+            // Column-window helper: the split op takes writable Tensor& operands and Tensor::slice
+            // returns a temporary, so each row's window is built explicitly from the base pointer.
+            const auto row_window = [](Tensor& source, std::int32_t first, std::int32_t columns) {
+                return Tensor(
+                    static_cast<char*>(source.data) +
+                        static_cast<std::size_t>(first) * source.nb[1],
+                    source.dtype, {source.ne[0], columns});
+            };
+            for (std::int32_t row = 0; row < active_sequence_batch_; ++row) {
+                const std::int32_t count = active_valid_columns_host_[static_cast<std::size_t>(row)];
+                const std::int32_t base  = row * width;
+                Tensor conv_state_in =
+                    state_.conv_slot(static_cast<std::uint32_t>(gidx),
+                                     active_linear_state_source_slots_host_[static_cast<std::size_t>(row)]);
+                Tensor conv_state_out = state_.conv_slot(
+                    static_cast<std::uint32_t>(gidx),
+                    active_linear_state_destination_slots_host_[static_cast<std::size_t>(row)]);
+                Tensor query_out   = row_window(qc, base, count);
+                Tensor key_out     = row_window(kc, base, count);
+                Tensor value_out   = row_window(vc, base, count);
+                Tensor projected_in = row_window(qkv, base, count);
+                ops::causal_conv1d_silu_split(projected_in, p.convolution, conv_state_in,
+                                              conv_state_out, query_out, key_out, value_out, s);
+            }
         } else {
             gdn_projection_snapshot(projection_input, p, *config_.gdn, conv_states, valid,
                                     *active_linear_state_source_slots_,
@@ -1321,6 +1382,18 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                     1.0 / std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim))),
                 recurrent_states, valid, *active_linear_state_source_slots_, records.key,
                 records.value, records.gate, out_batch, s);
+        } else if (width > 1) {
+            // The merged rectangle's recurrence runs each row through the same kernel its
+            // single-lane counterpart runs (chunked above the minimum, sequential below), with
+            // the row's own state slots and live prefix - the entry whose op-level contract is
+            // per-row bit-identity with gated_delta_net.
+            ops::gated_delta_net_batch(
+                q_batch, k_batch, v_batch, g_batch, beta_batch,
+                static_cast<float>(
+                    1.0 / std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim))),
+                /*normalize_qk=*/true, work_, recurrent_states, valid,
+                *active_linear_state_source_slots_, *active_linear_state_destination_slots_,
+                out_batch, ctx_.execution_view());
         } else {
             ops::gated_delta_net_batch_update(
                 q_batch, k_batch, v_batch, g_batch, beta_batch,

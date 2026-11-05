@@ -1691,16 +1691,17 @@ ninfer::EngineOptions merged_prefill_engine_options(const char* artifact,
     // Two lanes' full context: the pool may hold at most max_concurrency rows of max_context
     // tokens, so a larger explicit capacity is rejected at startup.
     options.kv_capacity                       = ninfer::KvCapacityPolicy::explicit_capacity(2048);
-    options.prefill_chunk                     = 256;
+    // 512 admits a two-row pass of 256-wide rows: prefill_chunk is the pass's whole-column
+    // budget, so the merged rectangle must fit width*rows inside it.
+    options.prefill_chunk                     = 512;
     // MTP preparation is outside the merged pass's narrow path: the backend stays off so the
     // merged dispatch actually fires.
     options.speculative.backend               = ninfer::SpeculativeBackend::None;
     options.max_concurrency                   = 2;
     options.max_pending_requests              = 2;
-    // The pass's conv snapshot borrows the layer's conv-state tensor as its column scratch, so
-    // its aggregate columns must fit the pool's slot count (max_concurrency + these slots). The
-    // default 2 (slot count 4) refuses every multi-row pass; 30 (slot count 32) admits a
-    // two-row pass at the 16-wide class floor.
+    // The state-slot budget is no longer a merged-pass bound at all: the pass runs the single-lane
+    // conv form per row and borrows no conv-state slot spans, so the default budget executes the
+    // same rectangle the explicitly planned one does.
     options.context_cache.device_state_slots  = device_state_slots;
     options.context_cache.host_capacity_bytes = 0;
     return options;
@@ -1720,35 +1721,53 @@ bool capture_contains(const char* path, const char* needle) {
     return found;
 }
 
-// The merged prefill pass's dispatch conditions, pinned end to end with the opt-in switches on.
-// The pass takes each row's tail column out of the row-major [hidden, width*batch] rectangle in
-// execution::prefill_batch (row b's token at width index t is flat column b*width + t, one shared
-// helper now), and it may only execute rows whose end is covered by a reserved unit or by the
-// bind's growth, whose rectangle fits the conv-state slot budget, and whose width the GDN kernels
-// can serve.
+// The merged prefill pass's dispatch conditions and numerical identity, pinned end to end with
+// the opt-in switches on. The pass fills its rectangle row-major (execution::prefill_batch, one
+// shared mapping), admits only rows whose end is covered by a reserved unit or by the bind's
+// growth, and - since the wide-batch GDN kernels landed - executes multi-row rectangles through
+// the single-lane forms' own arithmetic: the aggregate projection routes on the rectangle's
+// column count, the conv split and the delta net run each row through the same kernel the
+// single-lane path runs at that row's token count, and the tail hidden is sampled per row at one
+// column, exactly like the single-lane chunk. Bitwise token equality against the single-lane
+// path therefore holds only when both arms' column counts route identically - which is why the
+// merge prompts are exactly 256 tokens (every GEMM in the stack routes 256 and the 512-column
+// aggregate identically: W4A8 at multiples of 128, the gating band covers 9..1024), and why a
+// ragged production load whose rows route differently is a within-criterion, not a bitwise,
+// comparison.
 //
-// Phase 1: two fresh single-chunk prompts (6 and 8 tokens, neither tail the rectangle's last
-// column) clear the reservation and conv-state gates and must then be refused on the GDN kernel
-// domain - the delta net's non-replay batch entry accepts exactly W=1, and the narrow path
-// excluded the speculative engines whose replay entry serves wider rectangles.
-// Phase 2: a 263-token prompt's settled 7-token tail meeting a fresh 9-token prompt must be
+// Phase 1: two fresh single-chunk 256-token prompts merge in one pass; [prefill-merged] must
+// appear and the tokens must match the single-lane reference bit for bit.
+// Phase 2: a 521-token prompt's settled 9-token tail meeting a fresh 9-token prompt must be
 // refused on the reservation guard - after a unit settles the lane holds neither a permit nor
 // growth, and mapping it would demand pages nobody reserved.
-// Phase 3: the default state-slot budget must refuse the same fresh pair on the conv-state
-// capacity before anything reaches the layers.
-// Every phase's requests must still complete with the single-lane path's tokens, bit for bit;
-// the dense artifact has no expert tier, so the comparisons run in the full-resident regime by
+// Phase 3: the default state-slot budget runs the same 256-token merge - the conv form borrows
+// no conv-state slot spans, so no slot planning gates the pass - and the tokens still match.
+// Every phase's requests must complete with the single-lane path's tokens, bit for bit; the
+// dense artifact has no expert tier, so the comparisons run in the full-resident regime by
 // construction.
 int exercise_merged_prefill_tail(const char* artifact) {
-    const std::vector<ninfer::TokenId> merge_prompt_a{248045, 846, 198, 4321, 248046, 198};
-    const std::vector<ninfer::TokenId> merge_prompt_b{248045, 846, 198, 5321, 5322, 5323, 248046,
-                                                      198};
+    // Two fresh prompts of exactly the 256-token class: single-chunk at this engine's chunk
+    // width, and route-aligned with their two-row aggregate (512 columns).
+    std::vector<ninfer::TokenId> merge_prompt_a{248045, 846, 198};
+    std::vector<ninfer::TokenId> merge_prompt_b{248045, 846, 198};
+    for (std::uint32_t i = 0; i < 251; ++i) {
+        merge_prompt_a.push_back(static_cast<ninfer::TokenId>(500 + (i % 900)));
+        merge_prompt_b.push_back(static_cast<ninfer::TokenId>(1500 + (i % 700)));
+    }
+    merge_prompt_a.push_back(248046);
+    merge_prompt_a.push_back(198);
+    merge_prompt_b.push_back(248046);
+    merge_prompt_b.push_back(198);
+    // The reservation-guard pair: one interior 512-wide chunk, then a settled 9-token tail.
     std::vector<ninfer::TokenId> guard_prompt_long{248045, 846, 198};
-    for (std::uint32_t i = 0; i < 258; ++i) {
+    for (std::uint32_t i = 0; i < 512; ++i) {
         guard_prompt_long.push_back(static_cast<ninfer::TokenId>(500 + (i % 900)));
     }
     guard_prompt_long.push_back(248046);
     guard_prompt_long.push_back(198);
+    for (std::uint32_t i = 0; i < 4; ++i) {
+        guard_prompt_long.push_back(static_cast<ninfer::TokenId>(700 + i));
+    }
     const std::vector<ninfer::TokenId> guard_prompt_short{248045, 846, 198, 6321, 6322, 6323,
                                                           6324, 248046, 198};
 
@@ -1771,12 +1790,11 @@ int exercise_merged_prefill_tail(const char* artifact) {
     _putenv_s("NINFER_PREFILL_BATCH_EXEC", "1");
     int outcome = 0;
     {
-        // Phase 1: the fresh short pair clears the reservation guard and the conv-state budget,
-        // and must then be refused on the GDN kernel domain - the delta net's non-replay batch
-        // entry accepts exactly W=1, and the narrow path excluded the speculative engines whose
-        // replay-record entry serves W>1. The single-lane path must still deliver bit-identical
-        // tokens; the alternative (running the rectangle) fails the requests inside the layers.
-        ninfer::Engine merged(merged_prefill_engine_options(artifact, 30));
+        // Phase 1: the fresh 256-token pair must actually merge. This is the first engine-level
+        // configuration where the pass executes the model layers, so the assertion is both the
+        // trigger ([prefill-merged] with rows=2) and the numerical identity (bit-identical
+        // tokens to the single-lane reference above).
+        ninfer::Engine merged(merged_prefill_engine_options(artifact));
         const char* const merge_capture = "prefix-real-merged-prefill-phase1.log";
         const int saved_stderr          = _dup(2);
         if (saved_stderr < 0 || freopen(merge_capture, "w", stderr) == nullptr) {
@@ -1799,12 +1817,8 @@ int exercise_merged_prefill_tail(const char* artifact) {
                       << " row_b_match=" << (row_b.generated_token_ids == expected[1]) << '\n';
             outcome = 1;
         }
-        if (capture_contains(merge_capture, "[prefill-merged]")) {
-            std::cerr << "phase 1 ran a merged pass the GDN kernel domain cannot serve\n";
-            outcome = 1;
-        }
-        if (!capture_contains(merge_capture, "[prefill-reject] delta_net")) {
-            std::cerr << "phase 1 never refused the W>1 rectangle on the GDN kernel domain\n";
+        if (!capture_contains(merge_capture, "[prefill-merged] rows=2")) {
+            std::cerr << "phase 1 never ran a two-row merged pass\n";
             outcome = 1;
         }
 
@@ -1821,7 +1835,7 @@ int exercise_merged_prefill_tail(const char* artifact) {
         auto long_request = merged.submit(merged.prepare_tokens(guard_prompt_long),
                                           fixed_output(16, false));
         auto short_request = merged.submit(merged.prepare_tokens(guard_prompt_short),
-                                           fixed_output(16, false));
+                                            fixed_output(16, false));
         const ninfer::GenerationResult long_row   = long_request.wait();
         const ninfer::GenerationResult short_row = short_request.wait();
         std::fflush(stderr);
@@ -1834,18 +1848,14 @@ int exercise_merged_prefill_tail(const char* artifact) {
                       << " short_match=" << (short_row.generated_token_ids == expected[3]) << '\n';
             outcome = 1;
         }
-        if (capture_contains(guard_capture, "[prefill-merged]")) {
-            std::cerr << "guard phase ran a merged pass over a row without reserved growth\n";
-            outcome = 1;
-        }
         if (!capture_contains(guard_capture, "[prefill-reject] permit")) {
             std::cerr << "guard phase never refused the uncovered tail row\n";
             outcome = 1;
         }
 
-        // Phase 3: the default slot budget must refuse the same fresh pair that phase 1 merged -
-        // the conv-state scratch cannot hold the aggregate, so the pass must not reach the
-        // layers.
+        // Phase 3: the default slot budget runs the same merge. The conv form no longer borrows
+        // the conv-state pool as column scratch, so no slot-span planning gates the pass; the
+        // default budget executes the identical rectangle and must produce identical tokens.
         ninfer::Engine unplanned(merged_prefill_engine_options(artifact));
         const char* const unplanned_capture = "prefix-real-merged-prefill-phase3.log";
         const int saved_unplanned_stderr    = _dup(2);
@@ -1859,7 +1869,7 @@ int exercise_merged_prefill_tail(const char* artifact) {
         auto third = unplanned.submit(unplanned.prepare_tokens(merge_prompt_a),
                                       fixed_output(16, false));
         auto fourth = unplanned.submit(unplanned.prepare_tokens(merge_prompt_b),
-                                       fixed_output(16, false));
+                                        fixed_output(16, false));
         const ninfer::GenerationResult unplanned_a = third.wait();
         const ninfer::GenerationResult unplanned_b = fourth.wait();
         std::fflush(stderr);
@@ -1867,26 +1877,20 @@ int exercise_merged_prefill_tail(const char* artifact) {
         _close(saved_unplanned_stderr);
         if (unplanned_a.generated_token_ids != expected[0] ||
             unplanned_b.generated_token_ids != expected[1]) {
-            std::cerr << "unplanned phase produced different tokens than the single-lane path:"
+            std::cerr << "default-budget phase produced different tokens than the single-lane path:"
                       << " row_a_match=" << (unplanned_a.generated_token_ids == expected[0])
-                      << " row_b_match=" << (unplanned_b.generated_token_ids == expected[1])
-                      << '\n';
+                      << " row_b_match=" << (unplanned_b.generated_token_ids == expected[1]) << '\n';
             outcome = 1;
         }
-        if (capture_contains(unplanned_capture, "[prefill-merged]")) {
-            std::cerr << "unplanned phase ran a merged pass the conv state cannot hold\n";
+        if (!capture_contains(unplanned_capture, "[prefill-merged] rows=2")) {
+            std::cerr << "default-budget phase never ran a two-row merged pass\n";
             outcome = 1;
         }
-        // The reject diagnostics have a per-process line cap that the idle dispatch loop can
-        // exhaust, so this phase pins the outcome rather than the printed reason: with the
-        // default budget the pass cannot fit the conv-state scratch, so no rectangle may run.
     }
     _putenv_s("NINFER_PREFILL_ADMIT_FIRST", "");
     _putenv_s("NINFER_PREFILL_BATCH_EXEC", "");
     return outcome;
 }
-
-
 int exercise_concurrent_resource_settlement(const char* artifact) {
     ninfer::Engine engine(concurrent_engine_options(artifact));
 

@@ -494,6 +494,15 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     WorkspacePlan out;
     WorkspaceLayoutBuilder text_prefill;
     text_common_root(text_prefill, chunk);
+    // Q67/S1 (merged prefill): a merged pass keeps its rectangle metadata live across the whole
+    // layer call - ids/positions/rope as [width, batch] (width*batch <= chunk columns) plus four
+    // I32 row selectors - and the single-lane chunk's equivalents live in text_prefill_roots, so
+    // the merged form's share is planned beside them. Without this the plan misses a few KiB that
+    // the layer peak has no room for: at chunk 512 the FFN's wide workspace leaves 4 KiB of slack
+    // and the merged metadata is 6 KiB, which is exactly the "wants 186613760, holds 214929408"
+    // three-KiB shortfall the first live merge run hit.
+    matrix(text_prefill, DType::I32, chunk, 3);
+    matrix(text_prefill, DType::I32, 1, 4 * static_cast<std::int32_t>(plan.max_concurrency));
     target_body(text_prefill, 1, chunk, qwen3_5::TextPhase::Prefill, GdnWorkspacePath::Prefill, 1,
                 1, chunk, text_envelope);
     if (!plan.causal_scoring) {

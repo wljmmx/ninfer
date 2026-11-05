@@ -414,45 +414,17 @@ std::optional<Program::MergedPrefillResult> ProgramImpl::advance_prefill_batch()
         return std::nullopt;
     }
 
-    // The GDN conv snapshot path is verify-shaped: gdn_input_proj_conv_snapshot accepts width <= 16
-    // when batch > 1, and its conv-state tensor is sized for at most that many columns. A prefill
-    // chunk is 128..1024 wide, so a merged pass over it fails inside the kernel (invalid convolution
-    // snapshot state) rather than producing wrong tokens. Refusing here keeps that failure from
-    // reaching a request; lifting it needs a wide-batch conv kernel, which is the remaining kernel
-    // work for this feature.
-    if (models::qwen3_5::execution::prefill_class_for(static_cast<std::int32_t>(widest)) > 16) {
-        reject("width", widest, 0);
-        return std::nullopt;
-    }
+    // The three GDN bounds that used to refuse here are gone because the kernels now serve the
+    // rectangle: the wide-batch conv snapshot domain (op-level, its own criterion), the delta
+    // net's batched chunked entry, and - decisively - the conv form the merged pass binds. The
+    // pass no longer borrows the conv-state pool as snapshot column scratch at all: it runs the
+    // single-lane prefill chunk's own causal_conv1d_silu_split per row, so a rectangle needs only
+    // the rows' own state slots and no slot-span planning, and the row's final conv state lands
+    // in its destination slot where the fork settle expects it.
 
     const std::int32_t width =
         models::qwen3_5::execution::prefill_class_for(static_cast<std::int32_t>(widest));
     const std::int32_t rows_n = static_cast<std::int32_t>(batch);
-    // The same snapshot's second bound: the layer's conv-state tensor doubles as the snapshot's
-    // column scratch, so the rectangle's aggregate columns must fit the pool's slot count
-    // (max_concurrency + device_state_slots). No default engine plans that for a multi-row
-    // prefill rectangle - two rows at the 16-wide class floor already need 32 slots - so the
-    // pass refuses here instead of failing the request inside the layer. Planning enough state
-    // slots is what lets a merged pass through; the wide-batch conv kernel remains the feature's
-    // named work for larger aggregates.
-    const auto state_slots = state_images->linear().slot_count();
-    if (static_cast<std::int64_t>(width) * rows_n > static_cast<std::int64_t>(state_slots)) {
-        reject("conv_state", static_cast<std::size_t>(width) * rows_n,
-               static_cast<std::size_t>(state_slots));
-        return std::nullopt;
-    }
-    // The GDN delta net's non-replay batch entry (gated_delta_net_batch_update) accepts exactly
-    // W=1 - it is the decode-batch shape. The replay-record entry that serves W>1 verify
-    // rectangles exists only on speculative engines, which the narrow path above already
-    // excluded. A merged rectangle's width is the prefill class of its widest row, and the
-    // class ladder's floor is 16, so no pass can run the model layers until the wide-batch
-    // delta-net kernel lands (the same remaining-work family as the wide-batch conv kernel the
-    // width gate names). Refuse with the domain named instead of failing the request inside the
-    // layer.
-    if (width > 1) {
-        reject("delta_net", width, rows_n);
-        return std::nullopt;
-    }
     std::vector<std::int32_t> ids(static_cast<std::size_t>(width) * batch, 0);
     std::vector<std::int32_t> positions(ids.size(), 0);
     std::vector<std::int32_t> rope(ids.size(), 0);

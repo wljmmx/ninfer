@@ -275,7 +275,13 @@ private:
     std::int32_t active_sequence_width_                                            = 0;
     std::int32_t rope_delta_                                                       = 0;
     std::int32_t linear_state_source_slot_                                         = 0;
-    std::int32_t linear_state_destination_slot_                                    = 0;
+    std::int32_t linear_state_destination_slot_                                     = 0;
+    // Host mirrors of the batch bindings, for the merged prefill pass's per-row host loop: the GDN
+    // conv split slices each row's columns and state slots on the host (the pass is never graph
+    // captured), which the device selector tensors alone cannot express.
+    std::span<const std::int32_t> active_linear_state_source_slots_host_{};
+    std::span<const std::int32_t> active_linear_state_destination_slots_host_{};
+    std::span<const std::int32_t> active_valid_columns_host_{};
     GdnStateAction gdn_state_action_          = GdnStateAction::UpdateInPlace;
     const GdnReplayRecords* replay_records_   = nullptr;
     std::int64_t prefill_split_frontier_      = -1;
