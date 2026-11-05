@@ -83,6 +83,12 @@ ninfer_add_test(ninfer_qwen3_5_visual_scatter_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_visual_scatter.cpp"
   LIBRARIES ninfer_engine ninfer_core)
 
+# v8 section 12, first phase: the parameter bus, the serial rule (9.3) and the three deployment
+# modes are pure host-side logic - no GPU, no model - so this runs in the plain test list.
+ninfer_add_test(ninfer_qwen3_5_param_bus_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_param_bus.cpp"
+  LIBRARIES ninfer_core)
+
 add_test(NAME ninfer_qwen3_5_agent_continuation_real_test
   COMMAND ninfer_qwen3_5_prefix_real_test)
 set_tests_properties(ninfer_qwen3_5_agent_continuation_real_test PROPERTIES
