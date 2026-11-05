@@ -26,9 +26,15 @@ Bf16Launch select_bf16_n5120_k6144(std::int32_t tokens) {
         return launch_bf16_tma_mma<Bf16ScheduleInstance<Bf16A16TmaR64T64K64S3, 6144>>;
     return launch_bf16_tma_mma<Bf16ScheduleInstance<Bf16A16TmaR64T128K64S2, 6144>>;
 #else
-    // Ada fallback: no TMA on sm_89; the large-K cp.async MMA kernel covers all larger
-    // token counts (K=6144 is a multiple of 256).
-    return launch_bf16_mma<Bf16ScheduleInstance<Bf16A16MmaR32T32K256S3, 6144>>;
+    // Ada fallback: no TMA on sm_89; run the ladder above on the cp.async companions
+    // of the TMA instances (bf16_instances.cuh, geometry and staging preserved).
+    // Measured on sm_89: the 64x64/BK128 rung regressed over (64, 128] (+49%/+14%) and
+    // the 64x64/BK64 tile is also marginally slower over (64, 96], so that short span
+    // stays on the R32T32K192S2 kernel the (32, 64] rung already uses.
+    if (tokens <= 96) return launch_bf16_mma<Bf16ScheduleInstance<Bf16A16MmaR32T32K192S2, 6144>>;
+    if (tokens <= 192)
+        return launch_bf16_mma<Bf16ScheduleInstance<Bf16AdaR64T64K64S3, 6144>>;
+    return launch_bf16_mma<Bf16ScheduleInstance<Bf16AdaR64T128K64S2, 6144>>;
 #endif
 }
 } // namespace ninfer::ops::detail
