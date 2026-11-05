@@ -12,11 +12,19 @@ Scratch allocate(Arena& arena, int tokens, int token_block) {
     const int columns = std::min(token_block, tokens);
     // One weight scale covers 64 values, so one activation scale does too.
     const int groups = hidden / 64;
+    // port (sm_89): the quantised activation plane is sized for int16 (two bytes per value) so
+    // the int16 gate tier can use it in place; the int8 tier only touches the first half of the
+    // bytes. Both plane sizes (hidden * columns * {1, 2}) are multiples of the arena's 256-byte
+    // alignment, so the following allocations keep their alignment unchanged. The scales stay
+    // fp32 per 64-value group and are shared by both tiers.
+    auto* quantised = static_cast<std::int16_t*>(
+        arena.alloc_bytes(sizeof(std::int16_t) * hidden * columns).data);
     return {static_cast<Group*>(arena.alloc_bytes(sizeof(Group) * top_k * columns).data),
             static_cast<Task*>(arena.alloc_bytes(sizeof(Task) * top_k * columns).data),
             static_cast<float*>(arena.alloc(DType::FP32, {hidden, columns}).data),
             static_cast<float*>(arena.alloc(DType::FP32, {intermediate, top_k * columns}).data),
-            static_cast<std::int8_t*>(arena.alloc_bytes(sizeof(std::int8_t) * hidden * columns).data),
+            reinterpret_cast<std::int8_t*>(quantised),
+            quantised,
             static_cast<float*>(arena.alloc_bytes(sizeof(float) * groups * columns).data),
             static_cast<std::int32_t*>(
                 arena.alloc_bytes(sizeof(std::int32_t) * groups * columns).data)};
@@ -62,9 +70,15 @@ void launch(const Invocation& args, const Plan& plan, MemoryArena& arena,
     work.workers = static_cast<int>(execution.worker_count());
     // port (sm_89): the int8 row path is the default. It measured 1.70x on gate_up (0.491 -> 0.289
     // ms/expert) for 0.145% of perplexity error against a 1% gate, and 18% off the CPU half of a
-    // split token. NINFER_MOE_CPU_INT8=0 keeps the float reference for the gate that compares both.
+    // split token. NINFER_MOE_CPU_INT8=0 keeps the float reference for the gate that compares
+    // both, =16 selects the int16 tier (same kernel shape, 258x finer codes).
     const char* int8_switch = std::getenv("NINFER_MOE_CPU_INT8");
-    work.int8_path = int8_switch == nullptr || std::strcmp(int8_switch, "0") != 0;
+    work.int16_path = int8_switch != nullptr && std::strcmp(int8_switch, "16") == 0;
+    work.int8_path  = !work.int16_path &&
+                     (int8_switch == nullptr || std::strcmp(int8_switch, "0") != 0);
+    // port (sm_89): mirror the device plane regime - grouped stores BF16 planes from
+    // grouped_first tokens up (see work.h), token keeps FP32.
+    work.plane_round = args.tokens >= grouped_first;
     if (plan.kernel->first_chunk == FirstChunkPreparation::Caller) {
         prepare_chunk(work, 0, std::min(args.tokens, plan.token_block));
     }

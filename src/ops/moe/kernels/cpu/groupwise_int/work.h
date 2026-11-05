@@ -13,6 +13,11 @@ inline constexpr int max_token_block = 8;
 // leaves only 32 units per expert, so a layer with one or two missing experts cannot fill a wide
 // team; the launch halves it when there is not enough work (see `block` in Work).
 inline constexpr int channel_block = 16;
+// port (sm_89): the grouped CUDA path takes over from the token path at this many tokens
+// (routed_swiglu/cuda/q4_q5/shapes/h2048_i512_e256_k8/dispatch.cpp, kGroupedFirst). The token
+// path keeps its activation and value planes in FP32 while the grouped path stores BF16, and
+// the CPU kernel must mirror whichever regime the launch is in.
+inline constexpr int grouped_first = 47;
 
 enum class FirstChunkPreparation { Caller, Worker };
 
@@ -89,6 +94,9 @@ struct Scratch {
     // port (sm_89): the input row quantised to int8 alongside its per-64-group scale, so the q4 dot
     // product can run on 32 weights per instruction pair instead of decoding eight at a time.
     std::int8_t* input_q8;
+    // port (sm_89): the same plane sized for int16 - the int16 gate tier uses it in place while
+    // the int8 tier only reads the first half of the bytes. Both tiers share input_scale.
+    std::int16_t* input_q16;
     float* input_scale;
     // Integer sum of each group's quantised values, so the offset-by-8 nibble product can undo its
     // bias once per group: sum(b * x) = sum(w * x) + 8 * sum(x).
@@ -111,7 +119,13 @@ struct Work {
     // Decided once per launch, not inside the hot function: a getenv and a branch there cost 17%
     // with the path disabled, because it changed how the compiler laid out the vector loop.
     bool int8_path        = false;
+    // port (sm_89): the int16 gate tier (NINFER_MOE_CPU_INT8=16) - 258x finer activation codes
+    // at the same kernel shape. Same once-per-launch discipline as int8_path.
+    bool int16_path       = false;
     bool has_four_columns = false;
+    // port (sm_89): mirror of the device plane regime: the grouped path stores the activation
+    // and value planes as BF16 from grouped_first tokens up, the token path stores FP32.
+    bool plane_round      = false;
 };
 
 void prepare_chunk(Work&, int token_begin, int columns) noexcept;

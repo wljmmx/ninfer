@@ -169,17 +169,96 @@ template <class Simd, int K, int Rows, int Columns>
                 _mm256_loadu_si256(reinterpret_cast<const __m256i*>(codes)), bias);
             const auto low  = _mm256_and_si256(flipped, nibble);
             const auto high = _mm256_and_si256(_mm256_srli_epi16(flipped, 4), nibble);
-            // The weight scale is per row and group, so it folds into the same broadcast.
             const float weight = common::cpu::avx2::fp16_to_f32(
                 matrix.scales[std::size_t(rows[r]) * kGroups + group]);
+            const auto weight_vector = _mm256_set1_ps(weight);
             for (int c = 0; c < Columns; ++c) {
                 const auto pairs = _mm256_sub_epi32(
                     _mm256_add_epi32(
                         _mm256_madd_epi16(_mm256_maddubs_epi16(low, even[c]), ones),
                         _mm256_madd_epi16(_mm256_maddubs_epi16(high, odd[c]), ones)),
                     correction[c]);
-                total[r][c] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(pairs),
-                                              _mm256_set1_ps(scale[c] * weight), total[r][c]);
+                // Scale chain in the device order - gate[0] += (float)acc_g[0] * sg_lo * a0
+                // (grouped_gate_up_i8_tile.cuh): weight scale first, activation scale second,
+                // one add at the end. Two roundings where a fused scale[c] * weight had one.
+                const auto scaled = _mm256_mul_ps(_mm256_cvtepi32_ps(pairs), weight_vector);
+                total[r][c] =
+                    _mm256_add_ps(_mm256_mul_ps(scaled, _mm256_set1_ps(scale[c])), total[r][c]);
+            }
+        }
+    }
+    for (int r = 0; r < Rows; ++r) {
+        for (int c = 0; c < Columns; ++c) { out[r][c] = common::cpu::avx2::reduce_sum(total[r][c]); }
+    }
+}
+
+// port (sm_89): int16 dot product for 4-bit weights - the same tier as dot_q4_q8 with 258x
+// finer activation codes. The activation plane stores natural-order int16 (two bytes a value),
+// so the dot pays twice the bytes maddubs paid but keeps one instruction shape per 16 products.
+//
+// The packed weights hold weight 2b in the low nibble of byte b and 2b+1 in the high nibble,
+// two's complement. unpack_u4 widens 16 code bytes into 16 lanes that each pack the pair
+// w[2i] | w[2i+1] << 8; read as 32 bytes those are the group's nibbles in natural order, so
+// widening each 128-bit half with cvtepu8_epi16 turns them into 16-bit channels 0..15, and
+// (x ^ 8) - 8 restores the sign at two instructions per 16 values. madd then pairs adjacent
+// weights and values with no shuffles at all, where the int8 path had to interleave its rows.
+// Overflow: one group's partial sum is at most 64 * 8 * 32767 = 16777504 < 2^31, so the int32
+// lanes of the four madds never wrap and the group total is exact.
+// Out of line like dot_q4_q8: this only runs when the path is enabled, and inlining it would
+// let it change the layout of the vector loop that runs when it is not.
+template <class Simd, int K, int Rows, int Columns>
+[[gnu::noinline]] void dot_q4_q16(Work& work, const Matrix& matrix, const int (&rows)[Rows],
+                                  const int* columns, float (&out)[Rows][Columns]) noexcept {
+    static_assert(std::is_base_of_v<common::cpu::avx2::F32, Simd>,
+                  "the int16 path is written against AVX2 registers");
+    constexpr int kGroups = K / 64;
+    const auto eight      = _mm256_set1_epi16(8);
+    // One vector accumulator per output and one reduction at the end: a horizontal sum per group
+    // would cost more than the products it is summing.
+    __m256 total[Rows][Columns];
+    for (int r = 0; r < Rows; ++r) {
+        for (int c = 0; c < Columns; ++c) { total[r][c] = _mm256_setzero_ps(); }
+    }
+    for (int group = 0; group < kGroups; ++group) {
+        // The activation rows depend only on the group, so hoist them out of the row loop.
+        __m256i activation[Columns][4];
+        __m256 activation_scale[Columns];
+        for (int c = 0; c < Columns; ++c) {
+            const auto* row = work.scratch.input_q16 + columns[c] * K + group * 64;
+            for (int q = 0; q < 4; ++q) {
+                activation[c][q] =
+                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row + q * 16));
+            }
+            activation_scale[c] =
+                _mm256_set1_ps(work.scratch.input_scale[columns[c] * kGroups + group]);
+        }
+        for (int r = 0; r < Rows; ++r) {
+            const auto* codes = matrix.codes + std::size_t(rows[r]) * (K / 2) + group * 32;
+            __m256i weights[4];
+            for (int half = 0; half < 2; ++half) {
+                const auto packed = common::cpu::avx2::unpack_u4(codes + half * 16);
+                for (int part = 0; part < 2; ++part) {
+                    const auto bytes = part == 0 ? _mm256_castsi256_si128(packed)
+                                                 : _mm256_extracti128_si256(packed, 1);
+                    const auto channels = _mm256_cvtepu8_epi16(bytes);
+                    weights[2 * half + part] =
+                        _mm256_sub_epi16(_mm256_xor_si256(channels, eight), eight);
+                }
+            }
+            const auto weight_vector = _mm256_set1_ps(common::cpu::avx2::fp16_to_f32(
+                matrix.scales[std::size_t(rows[r]) * kGroups + group]));
+            for (int c = 0; c < Columns; ++c) {
+                const auto acc = _mm256_add_epi32(
+                    _mm256_add_epi32(_mm256_madd_epi16(weights[0], activation[c][0]),
+                                     _mm256_madd_epi16(weights[1], activation[c][1])),
+                    _mm256_add_epi32(_mm256_madd_epi16(weights[2], activation[c][2]),
+                                     _mm256_madd_epi16(weights[3], activation[c][3])));
+                // Scale chain in the device order - gate[0] += (float)acc_g[0] * sg_lo * a0
+                // (grouped_gate_up_i8_tile.cuh): weight scale first, activation scale second,
+                // one add at the end.
+                const auto scaled = _mm256_mul_ps(_mm256_cvtepi32_ps(acc), weight_vector);
+                total[r][c] =
+                    _mm256_add_ps(_mm256_mul_ps(scaled, activation_scale[c]), total[r][c]);
             }
         }
     }
@@ -227,6 +306,9 @@ inline void gate_up(Work& work, const Group& group, int first, int channel, int 
             if (work.int8_path) {
                 dot_q4_q8<Simd, hidden, rows, Columns>(work, group.gate_up, indices,
                                                        group.tokens + first, values);
+            } else if (work.int16_path) {
+                dot_q4_q16<Simd, hidden, rows, Columns>(work, group.gate_up, indices,
+                                                       group.tokens + first, values);
             } else {
                 run_default();
             }
@@ -235,12 +317,15 @@ inline void gate_up(Work& work, const Group& group, int first, int channel, int 
         }
         for (int r = 0; r < rows / 2; ++r) {
             for (int c = 0; c < Columns; ++c) {
-                // The device kernels store this plane as BF16 and feed the down projection from
-                // it, so round here too; otherwise the host fallback is more precise than the
-                // path it is standing in for and the two diverge over the layer stack.
+                const float value =
+                    common::silu_stable(values[2 * r][c]) * values[2 * r + 1][c];
+                // The grouped device kernel stores this plane as BF16 and feeds the down
+                // projection from it, so round in that regime or the host fallback is more
+                // precise than the path it is standing in for and the two diverge over the
+                // layer stack; the token kernel stores FP32 below grouped_first and the plane
+                // must stay unrounded there. plane_round tracks which regime the launch is in.
                 work.scratch.activation[group.slots[first + c] * intermediate + i + r] =
-                    common::bf16_round(common::silu_stable(values[2 * r][c]) *
-                                       values[2 * r + 1][c]);
+                    work.plane_round ? common::bf16_round(value) : value;
             }
         }
     }
@@ -248,7 +333,7 @@ inline void gate_up(Work& work, const Group& group, int first, int channel, int 
 
 template <class Simd, int DownBits, int Columns>
 inline void down(Work& work, const Group& group, int first, int channel,
-                 float (&accumulated)[max_token_block][channel_block]) noexcept {
+                 float (&contributions)[max_token_block * top_k][channel_block]) noexcept {
     constexpr int rows = Columns == 4 ? Simd::rows / 2 : Simd::rows;
     const float* input[Columns];
     for (int c = 0; c < Columns; ++c) {
@@ -261,8 +346,13 @@ inline void down(Work& work, const Group& group, int first, int channel,
         dot<Simd, DownBits, intermediate>(group.down, indices, input, values);
         for (int r = 0; r < rows; ++r) {
             for (int c = 0; c < Columns; ++c) {
-                accumulated[group.tokens[first + c]][i + r] +=
-                    group.coefficients[first + c] * values[r][c];
+                // port (sm_89): the grouped device kernel stores the per-expert down values as
+                // a BF16 plane and folds the coefficients at the reduction
+                // (grouped_swiglu.cu reduce_assignments); the token kernel keeps FP32. The
+                // merge order itself is decided by the caller. plane_round picks the regime so
+                // the half-layers stay aligned.
+                contributions[group.slots[first + c]][i + r] =
+                    work.plane_round ? common::bf16_round(values[r][c]) : values[r][c];
             }
         }
     }
@@ -291,22 +381,43 @@ template <class Simd, int DownBits, bool FourColumns>
         }
     }
     worker.barrier();
+    // port (sm_89): the merge runs per token in route order, not in expert-group order: the
+    // token device kernel sums values[p] for p ascending (token_swiglu.cu) and the grouped
+    // reducer walks route 0..top_k (grouped_swiglu.cu reduce_assignments). slot = t * top_k + j
+    // is exactly that order, so the down pass collects per-slot values and the merge replays
+    // each token by ascending j. Group order differs whenever two tokens share experts in
+    // swapped route positions, and fp32 addition is not associative.
+    bool present[max_token_block * top_k]       = {};
+    float coefficients[max_token_block * top_k] = {};
+    for (int g = 0; g < work.group_count; ++g) {
+        const auto& group = work.scratch.groups[g];
+        for (int member = 0; member < group.count; ++member) {
+            present[group.slots[member]]       = true;
+            coefficients[group.slots[member]] = group.coefficients[member];
+        }
+    }
     const auto outputs = worker.range(hidden / work.block);
     for (auto block = outputs.begin; block < outputs.end; ++block) {
         const int channel = block * work.block;
         float accumulated[max_token_block][channel_block]{};
+        // Uninitialised on purpose: only slots marked present are written by the down pass
+        // below and read by the merge, and every present slot is fully written for this block.
+        float contributions[max_token_block * top_k][channel_block];
         if constexpr (FourColumns) {
             for (int index = 0; index < work.task_count; ++index) {
                 const auto& task  = work.scratch.tasks[index];
                 const auto& group = work.scratch.groups[task.group_index];
                 if (task.columns == 4) {
-                    down<Simd, DownBits, 4>(work, group, task.first_column, channel, accumulated);
+                    down<Simd, DownBits, 4>(work, group, task.first_column, channel,
+                                            contributions);
                     continue;
                 }
                 if (task.columns == 2) {
-                    down<Simd, DownBits, 2>(work, group, task.first_column, channel, accumulated);
+                    down<Simd, DownBits, 2>(work, group, task.first_column, channel,
+                                            contributions);
                 } else {
-                    down<Simd, DownBits, 1>(work, group, task.first_column, channel, accumulated);
+                    down<Simd, DownBits, 1>(work, group, task.first_column, channel,
+                                            contributions);
                 }
             }
         } else {
@@ -314,10 +425,19 @@ template <class Simd, int DownBits, bool FourColumns>
                 const auto& group = work.scratch.groups[g];
                 for (int first = 0; first < group.count; first += 2) {
                     if (first + 1 < group.count) {
-                        down<Simd, DownBits, 2>(work, group, first, channel, accumulated);
+                        down<Simd, DownBits, 2>(work, group, first, channel, contributions);
                     } else {
-                        down<Simd, DownBits, 1>(work, group, first, channel, accumulated);
+                        down<Simd, DownBits, 1>(work, group, first, channel, contributions);
                     }
+                }
+            }
+        }
+        for (int t = 0; t < columns; ++t) {
+            for (int j = 0; j < top_k; ++j) {
+                const int slot = t * top_k + j;
+                if (!present[slot]) { continue; }
+                for (int i = 0; i < work.block; ++i) {
+                    accumulated[t][i] += coefficients[slot] * contributions[slot][i];
                 }
             }
         }
@@ -371,6 +491,41 @@ template <class Simd>
     }
 }
 
+// port (sm_89): quantise the input row to int16 in the same 64-value groups as quantise_input,
+// with the same degenerate semantics (an all-zero group keeps scale zero and codes zero). The
+// int16 gate tier pays this once per row to buy 258x finer codes; the peak scan stays scalar so
+// NaN and degenerate inputs behave exactly like the int8 tier. cvtepi32 rounds like lrint (both
+// take MXCSR), and every x * (1/scale) product stays within half an ulp of 32767, so the
+// saturating pack below can never clamp. Natural value order, one store per 16 values.
+// Out of line so it cannot change the layout of the vector loop that runs when it is disabled.
+template <class Simd>
+[[gnu::noinline]] void quantise_input_i16(Work& work, const CpuWorkerContext& worker,
+                                          int columns) noexcept {
+    constexpr int kGroups = hidden / 64;
+    const auto range      = worker.range(kGroups * columns);
+    for (auto g = range.begin; g < range.end; ++g) {
+        const int column    = static_cast<int>(g) / kGroups;
+        const int group     = static_cast<int>(g) % kGroups;
+        const float* source = work.scratch.input + column * hidden + group * 64;
+        float peak          = 0.0F;
+        for (int i = 0; i < 64; ++i) { peak = std::max(peak, std::fabs(source[i])); }
+        const float scale   = peak > 0.0F ? peak / 32767.0F : 0.0F;
+        const float inverse = scale > 0.0F ? 1.0F / scale : 0.0F;
+        work.scratch.input_scale[column * kGroups + group] = scale;
+        auto* out         = work.scratch.input_q16 + column * hidden + group * 64;
+        const auto factor = _mm256_set1_ps(inverse);
+        for (int i = 0; i < 64; i += 16) {
+            const auto first  = _mm256_mul_ps(_mm256_loadu_ps(source + i), factor);
+            const auto second = _mm256_mul_ps(_mm256_loadu_ps(source + i + 8), factor);
+            // packs_epi32 joins two epi32 vectors as [a0..a3 b0..b3 | a4..a7 b4..b7]; the
+            // permute restores natural order, 16 codes to one unaligned store.
+            const auto packed = _mm256_permute4x64_epi64(
+                _mm256_packs_epi32(_mm256_cvtps_epi32(first), _mm256_cvtps_epi32(second)), 0xD8);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + i), packed);
+        }
+    }
+}
+
 template <class Simd, int DownBits>
 void compute(void* argument, const CpuWorkerContext& worker) noexcept {
     auto& work = *static_cast<Work*>(argument);
@@ -393,6 +548,10 @@ void compute(void* argument, const CpuWorkerContext& worker) noexcept {
         if (begin != 0 || !Simd::bf16_gate) { worker.barrier(); }
         if (work.int8_path) {
             quantise_input<Simd>(work, worker, columns);
+            worker.barrier();
+        } else if (work.int16_path) {
+            // The int16 tier replaces the int8 quantisation pass instead of running beside it.
+            quantise_input_i16<Simd>(work, worker, columns);
             worker.barrier();
         }
         // port (sm_89): a split layer routes to a handful of experts, so at 16 channels per unit
