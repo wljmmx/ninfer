@@ -798,6 +798,17 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
     // "the device changed under us" apart from "we spent it ourselves".
     resolution.available_after_startup_bytes = current_free_device_bytes(
         options.wddm_evictable_budget, instance->model->storage_stats().device_capacity_bytes);
+    // port (sm_89): request admission and output clamping both run against max_context, so the
+    // arena must never resolve below it. The capacity curve guarantees this structurally - its
+    // minimum is max(page_count(max_context), max_concurrency) and the degradation path in
+    // kv_capacity.cpp never drops below that minimum - but this is the one place where both
+    // numbers meet, and the invariant is too load-bearing to leave implicit.
+    if (resolution.resolved_tokens < options.max_context) {
+        throw std::logic_error(
+            "resolved KV capacity of " + std::to_string(resolution.resolved_tokens) +
+            " tokens cannot serve the configured max_context of " +
+            std::to_string(options.max_context) + " tokens");
+    }
     // The KV plan is settled before the expert pool is sized, so the pool can take everything the
     // arena does not need instead of holding back a fixed amount.
     if (options.expert_cache_bytes != 0) {

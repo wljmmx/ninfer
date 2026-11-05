@@ -403,6 +403,33 @@ int main() {
                               ninfer::kDefaultKvCapacityHeadroomBytes,
                       "--kv-capacity auto did not select automatic sizing");
 
+    // An explicit arena below max_context would let admission accept a request the arena cannot
+    // hold, so the server refuses it up front. `auto` has no such check because its floor is the
+    // capacity curve's minimum, which is one full context by construction.
+    bool kv_below_context_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--max-context", "16384", "--kv-capacity",
+                     "8192"});
+    } catch (const std::invalid_argument&) { kv_below_context_rejected = true; }
+    failures += check(kv_below_context_rejected,
+                      "explicit --kv-capacity below --max-context was accepted");
+
+    const ServeOptions automatic_headroom =
+        parse({"ninfer-serve", "model.ninfer", "--kv-capacity", "auto",
+               "--kv-capacity-headroom-mib", "512"});
+    failures +=
+        check(automatic_headroom.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
+                  automatic_headroom.kv_capacity.automatic_headroom_bytes == (512ULL << 20),
+              "--kv-capacity-headroom-mib did not reach the automatic policy");
+
+    bool headroom_with_explicit_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--kv-capacity", "16384",
+                     "--kv-capacity-headroom-mib", "512"});
+    } catch (const std::invalid_argument&) { headroom_with_explicit_rejected = true; }
+    failures += check(headroom_with_explicit_rejected,
+                      "automatic headroom was accepted without --kv-capacity auto");
+
     const ServeOptions logged = parse({"ninfer-serve", "model.ninfer", "--request-log-jsonl",
                                        "requests.jsonl", "--api-key", "do-not-log"});
     failures += check(logged.request_log_jsonl == "requests.jsonl",

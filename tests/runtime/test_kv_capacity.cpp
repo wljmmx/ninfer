@@ -51,6 +51,32 @@ int main() {
     failures += check(insufficient_rejected,
                       "automatic KV capacity accepted less than the minimum reservation");
 
+    // --- port (sm_89): the degradation floor is the curve minimum ----------------------------
+    // A request that misses the budget degrades to the largest feasible page count instead of
+    // aborting startup. On the real curves the minimum IS one full max_context (startup.cpp sizes
+    // it as max(page_count(max_context), max_concurrency)), so pinning "degradation never crosses
+    // the curve minimum" here is pinning "the arena always holds at least one full-length
+    // request" - the invariant request admission and the output clamp rely on.
+    const auto degraded_mid = ninfer::runtime::resolve_kv_capacity(
+        ninfer::KvCapacityPolicy::explicit_capacity(384), curve, 1360);
+    failures += check(degraded_mid.main_page_groups == 4 &&
+                          degraded_mid.resolved_tokens == 256 &&
+                          degraded_mid.runtime_reservation_bytes == 1256,
+                      "KV capacity degradation did not keep the largest fitting page count");
+
+    const auto degraded_floor = ninfer::runtime::resolve_kv_capacity(
+        ninfer::KvCapacityPolicy::explicit_capacity(384), curve, 1001);
+    failures += check(degraded_floor.main_page_groups == 2 &&
+                          degraded_floor.resolved_tokens == 128 &&
+                          degraded_floor.runtime_reservation_bytes == 1000,
+                      "KV capacity degradation dropped below the curve minimum");
+
+    const auto automatic_floor = ninfer::runtime::resolve_kv_capacity(
+        ninfer::KvCapacityPolicy::automatic(0), curve, 1105);
+    failures += check(automatic_floor.main_page_groups == 2 &&
+                          automatic_floor.resolved_tokens == 128,
+                      "automatic KV capacity expanded past its own budget");
+
     // --- Residency split of the per-page device cost (appendix BP) ----------------------
     // Measured on the RTX 4090 / qwen3.8-27b / rk4v4-e8 configuration:
     //   reservation(P) = 683,493,888 + 983,044*P,  i.e. 746,408,704 at the 64-page anchor.
