@@ -71,6 +71,13 @@ ninfer_add_test(ninfer_qwen3_5_dflash_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_dflash_real.cpp"
   LIBRARIES ninfer_engine)
 
+# port (sm_89): Q54's prefix index against the real artifact: exact-prompt restores, the two
+# long-prefix tiers (500 / 4100), the whole-prompt decline, and the no-index / bad-index
+# fallbacks - every arm compared token for token against a cold run of the same prompt.
+ninfer_add_test(ninfer_qwen3_5_kv_tier_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_kv_tier_real.cpp"
+  LIBRARIES ninfer_engine)
+
 ninfer_add_test(ninfer_qwen3_5_expert_stream_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_stream_real.cpp"
   LIBRARIES ninfer_artifact ninfer_ops ninfer_core)
@@ -128,6 +135,7 @@ set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_dflash_prefill_real_test
   ninfer_qwen3_5_moe_real_test
   ninfer_qwen3_5_dflash_real_test
+  ninfer_qwen3_5_kv_tier_real_test
   ninfer_qwen3_5_expert_stream_real_test)
 set_tests_properties(${ninfer_qwen3_5_real_tests} PROPERTIES
   SKIP_RETURN_CODE 77
