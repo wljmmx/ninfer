@@ -48,22 +48,15 @@ void grouped_instance(const CausalAttentionOperands& p, Bf16KvCacheView<Writable
 
 void tiled(const CausalAttentionOperands& p, Bf16KvReadView cache, const Bf16KvCausalPlan& plan,
            Tensor* page_score, cudaStream_t stream) {
-    const auto invoke = [&]<class G>() {
-        if (plan.instance == Bf16KvInstance::Tiled128)
-            launch_bf16_kv_tiled_mma<
-                G, typename Bf16KvInstanceTraits<Bf16KvInstance::Tiled128>::Schedule>(p, cache,
-                                                                                      page_score,
-                                                                                      stream);
-        else
-            launch_bf16_kv_tiled_mma<
-                G, typename Bf16KvInstanceTraits<Bf16KvInstance::Tiled64>::Schedule>(p, cache,
-                                                                                     page_score,
-                                                                                     stream);
-    };
-    if (p.query_heads == 24)
-        invoke.template operator()<CausalD256H24Kv4>();
-    else
-        invoke.template operator()<CausalD256H16Kv2>();
+    // Unreachable from both causal entries: they route W > 16 to the batch-wide kernel, so the
+    // plan here only ever sees width <= 16 and the planner groups every such width (its Tiled
+    // instances require width > 256). The tiled kernel remains live for the fp8/k8v4 families;
+    // this guard turns a broken dispatch into a report instead of a silent wrong-kernel run.
+    (void)p;
+    (void)cache;
+    (void)page_score;
+    (void)stream;
+    throw std::logic_error("BF16 causal entry received an unreachable tiled plan (width <= 16)");
 }
 
 template <class Input>

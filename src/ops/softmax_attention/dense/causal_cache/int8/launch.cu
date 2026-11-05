@@ -429,27 +429,32 @@ void rk_execute_parallel(const CausalAttentionOperands& p, Int8KvReadView cache,
 
 void tiled(const CausalAttentionOperands& p, Int8KvReadView cache, Tensor* page_score,
            cudaStream_t stream) {
-    if (p.query_heads == 24)
-        launch_int8_kv_tiled_mma<CausalD256H24Kv4, Int8KvTiledInstance>(p, cache, page_score,
-                                                                    stream);
-    else
-        launch_int8_kv_tiled_mma<CausalD256H16Kv2, Int8KvTiledInstance>(p, cache, page_score,
-                                                                    stream);
+    // Unreachable from the causal entries: they route W > 16 to the batch-wide kernel, so the
+    // plan only ever sees width <= 16, and the planner classifies every such width as Grouped
+    // (<= 8) or ParallelGrouped (9..16) - its Tiled family requires width > 256. The guard
+    // turns a broken dispatch into a report instead of a silent wrong-kernel run.
+    (void)p;
+    (void)cache;
+    (void)page_score;
+    (void)stream;
+    throw std::logic_error("INT8 causal entry received an unreachable tiled plan (width <= 16)");
 }
 
 // rk tiled: same tiled kernel with the rk-family cache codecs selected for the
 // read-back (PackedV int4 V always; PackedK int4 K or E8Root 2-bit cylinder K).
 // E8Lattice selects the [EXPERIMENT E8+1bit] carrier read-back.
+// Unreachable from the causal entries for the same width-classification reason
+// as the plain int8 form above; the signatures stay so the twelve rk entry
+// points read unchanged.
 template <bool PackedV, bool PackedK = false, bool E8Root = false, bool V8Root = false,
           bool E8Lattice = false>
 void rk_tiled(const CausalAttentionOperands& p, Int8KvReadView cache,
               Tensor* page_score, cudaStream_t stream) {
-    if (p.query_heads == 24)
-        launch_int8_kv_tiled_mma<CausalD256H24Kv4, Int8KvTiledInstance, PackedV, PackedK,
-                                  E8Root, V8Root, E8Lattice>(p, cache, page_score, stream);
-    else
-        launch_int8_kv_tiled_mma<CausalD256H16Kv2, Int8KvTiledInstance, PackedV, PackedK,
-                                  E8Root, V8Root, E8Lattice>(p, cache, page_score, stream);
+    (void)p;
+    (void)cache;
+    (void)page_score;
+    (void)stream;
+    throw std::logic_error("rk causal entry received an unreachable tiled plan (width <= 16)");
 }
 
 } // namespace
