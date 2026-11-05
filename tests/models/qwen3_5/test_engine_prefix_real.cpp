@@ -140,7 +140,12 @@ ninfer::PromptInput chinese_chat(bool enable_thinking) {
 }
 
 int exercise_artifact_frontend(const ninfer::Engine& engine) {
-    if (engine.count_tokens(chinese_chat(true)) != 16) {
+    // Goldens re-recorded 2026-11-05 against qwen3_8_27b_v3.ninfer (artifact replaced
+    // 2026-10-11): the v3 thinking template expands the same Chinese prompt to 58 tokens
+    // where the pre-v3 template produced 16; the no-thinking golden stayed 18. These
+    // counts are the sentinel for artifact tokenizer / chat-template drift - when the
+    // artifact changes again, re-measure with count_tokens and re-record both.
+    if (engine.count_tokens(chinese_chat(true)) != 58) {
         std::cerr << "artifact tokenizer/chat template changed the thinking prompt golden\n";
         return 1;
     }
