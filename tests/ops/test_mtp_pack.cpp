@@ -152,6 +152,9 @@ int main() {
     failures += pack_case(2048, 1);
     failures += pack_case(2048, 6);
     failures += pack_case(2048, 48);
+    // Rows not divisible by the uint4 vector width exercise the scalar tail path.
+    failures += pack_case(5124, 3);
+    failures += pack_case(2052, 1);
     failures += split_case(1);
     failures += split_case(6);
     failures += split_case(48);
