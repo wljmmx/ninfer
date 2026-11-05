@@ -48,6 +48,10 @@ struct Options {
     SamplingOverrides sampling;
     bool greedy                 = false;
     product::LogLevel log_level = product::LogLevel::Info;
+    // v8 section 12 first phase: the runtime controller's deployment mode ("auto" default).
+    // The CLI runs single-stream, so the mode only changes the freeze/prefetch criteria weights;
+    // the flag exists so a launch script does not need a different binary to select it.
+    std::string controller_mode = "auto";
 };
 
 [[nodiscard]] Options parse_options(int argc, char** argv);

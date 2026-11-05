@@ -139,6 +139,26 @@ int main() {
     } catch (const std::invalid_argument&) { implicit_backend_rejected = true; }
     failures += check(implicit_backend_rejected, "--draft-tokens selected a backend implicitly");
 
+    // v8 section 12, first phase: the controller-mode flag is the initial value for who the
+    // runtime controller optimizes for; a typo must be refused rather than silently mean "auto".
+    failures += check(defaults.controller_mode == "auto",
+                      "controller mode is not auto by default");
+    const ServeOptions stable = parse({"ninfer-serve", "model.ninfer", "--controller-mode", "stable"});
+    failures += check(stable.controller_mode == "stable",
+                      "--controller-mode stable did not parse");
+    const ServeOptions performance =
+        parse({"ninfer-serve", "model.ninfer", "--controller-mode", "performance"});
+    failures += check(performance.controller_mode == "performance",
+                      "--controller-mode performance did not parse");
+    bool bad_mode_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--controller-mode", "aggressive"});
+    } catch (const std::invalid_argument&) { bad_mode_rejected = true; }
+    failures += check(bad_mode_rejected, "an invalid --controller-mode was accepted");
+    failures += check(
+        serve_usage_text("ninfer-serve").find("--controller-mode") != std::string::npos,
+        "serve help omits --controller-mode");
+
     const ServeOptions configured = parse({"ninfer-serve",
                                            "model.ninfer",
                                            "--no-prefix-reuse",

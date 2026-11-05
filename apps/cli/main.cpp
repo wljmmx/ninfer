@@ -7,6 +7,8 @@
 
 #include "ninfer/engine.h"
 
+#include "core/controller_mode.h"
+
 #include <cstdint>
 #include <exception>
 #include <fstream>
@@ -312,6 +314,11 @@ int main(int argc, char** argv) {
         engine_options.context_cache.host_capacity_bytes = 0;
         engine_options.startup_observer                  = startup_log.observer();
 
+        // v8 section 12, first phase: the controller mode is an INITIAL value; it must be set
+        // before the engine exists so no worker thread has read the mode yet.
+        if (cli.controller_mode != "auto") {
+            (void)ninfer::set_controller_mode_initial(cli.controller_mode);
+        }
         ninfer::Engine engine(std::move(engine_options));
         startup_log.engine_ready(engine.load_summary());
         engine.reset_memory_peaks();

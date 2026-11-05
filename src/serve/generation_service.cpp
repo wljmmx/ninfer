@@ -5,6 +5,7 @@
 #include "serve/translate.h"
 
 #if NINFER_HAVE_LMCACHE
+#include "core/controller_mode.h"
 #include "core/lmcache_bridge.h"
 #include "core/lmcache_layout.h"
 #include "core/lmcache_prefix_registry.h"
@@ -941,6 +942,14 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
         checkpoint_cache_->backend     = backend;
         engine_options.checkpoint_cache = backend;
 #endif
+    }
+    // v8 section 12, first phase: apply the deployment mode as the controller's INITIAL value.
+    // This must run before the engine exists - no worker thread may have read the mode yet - and
+    // after this point the mode lives in the controller, not in the environment or the argv.
+    // NINFER_CONTROLLER_MODE is the same initial-value channel for launches without the flag,
+    // and it is parsed (and logged) by the mode's own first read.
+    if (!options_.controller_mode.empty() && options_.controller_mode != "auto") {
+        (void)ninfer::set_controller_mode_initial(options_.controller_mode);
     }
     engine_           = std::make_unique<ninfer::Engine>(std::move(engine_options));
     request_capacity_ = std::make_shared<RequestCapacity>(

@@ -137,5 +137,18 @@ int main() {
                   (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--top-k", "21"});
               }),
               "CLI accepted top_k beyond the executable candidate domain");
+    // v8 section 12, first phase: the CLI accepts the controller-mode flag (the single-stream CLI
+    // only feels it in the freeze/prefetch criteria weights); a typo is refused, not defaulted.
+    const ninfer::cli::Options stable_mode =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--controller-mode", "stable"});
+    failures += check(stable_mode.controller_mode == "stable",
+                      "--controller-mode stable did not parse on the CLI");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--controller-mode", "aggressive"});
+                      }),
+                      "CLI accepted an invalid --controller-mode");
+    failures += check(help.find("--controller-mode") != std::string::npos,
+                      "CLI help omits --controller-mode");
     return failures == 0 ? 0 : 1;
 }

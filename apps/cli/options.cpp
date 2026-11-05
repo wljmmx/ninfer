@@ -1,4 +1,5 @@
 #include "options.h"
+#include "core/controller_mode.h"
 #include "product/speculative_options.h"
 
 #include <cerrno>
@@ -101,8 +102,9 @@ std::string usage_text(const char* argv0) {
            "        --regex PATTERN | --choice TEXT ...]\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
            "       [--reasoning-effort none|minimal|low|medium|high|xhigh|max] [--vision]\n"
-           "       [--no-cuda-graph]\n"
-           "       [--log-level trace|debug|info|warning|error|critical|off]\n"
+            "       [--no-cuda-graph]\n"
+            "       [--controller-mode auto|stable|performance]\n"
+            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
@@ -218,6 +220,13 @@ Options parse_options(int argc, char** argv) {
             options.sampling.seed = parse_u64(value(arg), "seed");
         } else if (arg == "--greedy") {
             options.greedy = true;
+        } else if (arg == "--controller-mode") {
+            options.controller_mode = value(arg);
+            ninfer::ControllerMode parsed = ninfer::ControllerMode::Auto;
+            if (!ninfer::parse_controller_mode(options.controller_mode, parsed)) {
+                throw std::invalid_argument(
+                    "--controller-mode must be auto, stable or performance");
+            }
         } else if (arg == "--log-level") {
             options.log_level = product::parse_log_level(value(arg));
         } else {

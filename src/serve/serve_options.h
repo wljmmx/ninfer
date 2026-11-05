@@ -67,6 +67,10 @@ struct ServeOptions {
     SamplingOverrides sampling_overrides;
     bool greedy                 = false; // --greedy: force temperature 0 (exact argmax)
     product::LogLevel log_level = product::LogLevel::Info;
+    // v8 section 12 first phase: who the runtime controller optimizes for. "auto" | "stable" |
+    // "performance"; parsed here, applied as the controller's INITIAL value before the engine
+    // starts (the environment variable NINFER_CONTROLLER_MODE is the equivalent channel).
+    std::string controller_mode = "auto";
 
     // Exact process argv for the server-start record. Secret-bearing option values are redacted
     // while parsing; this is provenance only and never affects execution.

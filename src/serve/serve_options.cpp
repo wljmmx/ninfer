@@ -1,4 +1,5 @@
 #include "serve/serve_options.h"
+#include "core/controller_mode.h"
 #include "product/speculative_options.h"
 
 #include <cerrno>
@@ -138,8 +139,9 @@ std::string serve_usage_text(const char* argv0) {
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|rk4v2-e8] [--spec mtp|dflash|dflash2 --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
-           "[--vision] [--no-cuda-graph] [--wddm-evictable-budget] [--no-prefix-reuse] "
-           "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
+            "[--vision] [--no-cuda-graph] [--wddm-evictable-budget] [--no-prefix-reuse] "
+            "[--controller-mode auto|stable|performance] "
+            "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
            "[--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -173,7 +175,12 @@ std::string serve_usage_text(const char* argv0) {
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
-           "       --greedy forces temperature 0 (exact argmax).\n";
+            "       --greedy forces temperature 0 (exact argmax).\n"
+            "       --controller-mode selects who the runtime controller optimizes for: auto "
+            "(three measured criteria live, 3% revert protection), stable (freeze kept, "
+            "concurrency only lowers, latency-weighted), performance (5% revert allowance, "
+            "prefetch re-exploration). NINFER_CONTROLLER_MODE is the equivalent environment "
+            "initial value; serve applies the flag before the engine starts.\n";
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
@@ -253,6 +260,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--max-concurrency") {
             options.max_concurrency = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-concurrency"), "max-concurrency"));
+        } else if (arg == "--controller-mode") {
+            options.controller_mode = require_value("--controller-mode");
+            ninfer::ControllerMode parsed = ninfer::ControllerMode::Auto;
+            if (!ninfer::parse_controller_mode(options.controller_mode, parsed)) {
+                throw std::invalid_argument(
+                    "--controller-mode must be auto, stable or performance");
+            }
         } else if (arg == "--max-pending-requests") {
             options.max_pending_requests = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--max-pending-requests"), "max-pending-requests"));
