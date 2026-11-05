@@ -58,7 +58,11 @@ if not exist "%CORPUS%" (
 )
 
 echo [2/3] perplexity, MoE streaming pool 12288 MiB (Track B, expect 7.776858 +-0.5%%)
-set "OUTD=%TEMP%\ninfer_gate_ppl_%RANDOM%%RANDOM%"
+rem A deterministic output directory, not %RANDOM%%RANDOM%: the reader below must open the
+rem same path the run wrote, and the two-line %RANDOM% form intermittently handed the reader a
+rem different roll than the run on this box. Cleaned first so a previous report can never pass.
+set "OUTD=%TEMP%\ninfer_gate_ppl"
+if exist "%OUTD%" rmdir /s /q "%OUTD%"
 set "NINFER_EXPERT_CACHE_MB=12288"
 "%BUILD%\apps\ninfer-perplexity.exe" "%MODEL%" --text "%CORPUS%" --context 512 --stride 256 ^
   --output "%OUTD%" --log-level warning
