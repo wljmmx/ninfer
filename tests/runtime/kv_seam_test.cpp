@@ -1,6 +1,7 @@
 #include "core/kv_tier.h"
 #include "core/prefetch.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -48,6 +49,89 @@ int main() {
         expect(reopened.lookup(ka).state == ninfer::core::KvTierState::resident,
                "directory index survives a restart");
         expect(reopened.retrieve(ka, out), "restarted tier still serves the block");
+    }
+    {
+        // Q54: the prefix index sidecar. One note per stored block, rewritten with each store,
+        // surviving restarts, and skipped - not fatal - when the file is short or corrupted.
+        const auto notes_dir =
+            std::filesystem::temp_directory_path() / "ninfer_kv_seam_prefix_test";
+        std::filesystem::remove_all(notes_dir, ec);
+        {
+            ninfer::core::DiskKvTier tier(notes_dir);
+            ninfer::core::KvTierPrefixNote note;
+            note.block_hash   = 0x0123456789abcdefULL;
+            note.block_tokens = 397;
+            note.frontier     = 388;
+            note.digest_a     = 0x1111111111111111ULL;
+            note.digest_b     = 0x2222222222222222ULL;
+            note.identity_tag = 0x00020000U;
+            for (std::size_t i = 0; i < note.fingerprint.size(); ++i) {
+                note.fingerprint[i] = static_cast<std::uint8_t>(i & 0xff);
+            }
+            expect(tier.prefix_notes().empty(), "a fresh directory carries no prefix notes");
+            expect(tier.note_prefix(note), "the tier accepts a prefix note");
+            expect(tier.note_prefix(note), "restating the same note is idempotent");
+            const auto notes = tier.prefix_notes();
+            expect(notes.size() == 1, "one note is live after two identical stores");
+            expect(notes[0].block_hash == note.block_hash && notes[0].frontier == note.frontier &&
+                       notes[0].digest_a == note.digest_a && notes[0].digest_b == note.digest_b &&
+                       notes[0].identity_tag == note.identity_tag &&
+                       notes[0].fingerprint == note.fingerprint,
+                   "the live note round-trips every field");
+            ninfer::core::KvTierPrefixNote longer = note;
+            longer.frontier = 397;
+            longer.digest_a = 0x3333333333333333ULL;
+            longer.digest_b = 0x4444444444444444ULL;
+            expect(tier.note_prefix(longer), "a restated block replaces its own note");
+            expect(tier.prefix_notes().size() == 1 &&
+                       tier.prefix_notes().front().frontier == 397,
+                   "the sidecar of one block holds the latest store");
+            ninfer::core::KvTierPrefixNote other = note;
+            other.block_hash   = 0x0fedcba987654321ULL;
+            other.block_tokens = 215;
+            other.frontier     = 215;
+            expect(tier.note_prefix(other), "a second block gets its own note");
+            expect(tier.prefix_notes().size() == 2, "notes accumulate across blocks");
+        }
+        {
+            ninfer::core::DiskKvTier reopened(notes_dir);
+            const auto notes = reopened.prefix_notes();
+            expect(notes.size() == 2, "prefix notes survive a restart");
+            expect(std::any_of(notes.begin(), notes.end(), [](const auto& entry) {
+                       return entry.frontier == 397 && entry.block_hash == 0x0123456789abcdefULL;
+                   }) &&
+                       std::any_of(notes.begin(), notes.end(), [](const auto& entry) {
+                           return entry.frontier == 215 &&
+                                  entry.block_hash == 0x0fedcba987654321ULL;
+                       }),
+                   "restarted notes keep their digests and blocks");
+        }
+        {
+            // A torn sidecar and a checksum failure must each fall back to "no entry", and must
+            // not take the healthy entry with them.
+            const auto sidecar = notes_dir / "pfx-0123456789abcdef.397";
+            expect(std::filesystem::file_size(sidecar, ec) > 8, "the sidecar exists on disk");
+            std::FILE* file = std::fopen(sidecar.string().c_str(), "r+b");
+            expect(file != nullptr, "the sidecar is writable for the corruption fixture");
+            if (file != nullptr) {
+                std::fseek(file, 16, SEEK_SET);  // inside digest_a: breaks the checksum
+                const int flipped = 'X';
+                std::fwrite(&flipped, 1, 1, file);
+                std::fclose(file);
+            }
+            const auto torn = notes_dir / "pfx-0fedcba987654321.215";
+            std::filesystem::resize_file(torn, 7, ec);  // shorter than the header
+            ninfer::core::DiskKvTier damaged(notes_dir);
+            const auto notes = damaged.prefix_notes();
+            expect(notes.empty(), "a bad index reads as no index, never as a wrong entry");
+            // The pre-index constructor parsed every file as a block; a pfx- name would have
+            // been indexed as hash 0 with the tokens after the dot. Miss here proves the
+            // sidecar is recognized as an index file and not misread as a block.
+            expect(damaged.lookup(ninfer::core::KvBlockKey{0, 397}).state ==
+                       ninfer::core::KvTierState::miss,
+                   "a pfx sidecar is not misread as a block");
+        }
+        std::filesystem::remove_all(notes_dir, ec);
     }
     std::filesystem::remove_all(dir, ec);
 

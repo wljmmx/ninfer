@@ -712,71 +712,179 @@ std::optional<TierSource> ProgramImpl::tier_open(const RequestBasePlan& base, st
         return std::nullopt;
     }
     const auto& prompt_ids = plan.prompt->token_ids;
-    const auto key         = core::KvBlockKey{core::kv_hash_tokens(prompt_ids),
-                                              static_cast<std::uint32_t>(prompt_ids.size())};
-    CheckpointExport kv;
-    CheckpointStateExport state;
+    // The state half of the fingerprint is needed by both the index prefilter and the import; the
+    // KV page size by the payload check below. One read of the live layout serves all three.
+    ninfer::core::fingerprint::CheckpointFingerprint want;
+    host_state_fingerprint(want);
+    // Loads, validates and imports one block. `expected_frontier` is the frontier the caller has
+    // digest evidence for (the prefix path); zero means the caller named the block by its own
+    // whole-prompt key, so the payload frontier needs no cross-check against an index entry.
+    const auto open_block = [&](const core::KvBlockKey& key, std::uint32_t expected_frontier)
+                               -> std::optional<TierSource> {
+        CheckpointExport kv;
+        CheckpointStateExport state;
+        if (!tier_load_export(*kv_tier, key, kv, state)) { return std::nullopt; }
+        if (expected_frontier != 0 && kv.frontier != expected_frontier) {
+            // The index entry and the block it names disagree: the note is stale (the block was
+            // rewritten by a later capture of the same prompt). The digest evidence names a
+            // frontier the payload does not cover, so this probe is skipped rather than trusted;
+            // with no expected_frontier there is nothing to disagree with.
+            std::fprintf(stderr,
+                          "[kvt] prefix stale: note frontier=%u, block %016llx/%u holds %u\n",
+                          expected_frontier, static_cast<unsigned long long>(key.hash), key.tokens,
+                          kv.frontier);
+            std::fflush(stderr);
+            return std::nullopt;
+        }
+        // The run has to cover text this prompt actually has. A payload from a longer prompt would
+        // make the request resume from tokens it never had.
+        if (kv.frontier == 0 || kv.frontier > prompt_ids.size()) {
+            if (error != nullptr) {
+                *error = "payload covers " + std::to_string(kv.frontier) + " of " +
+                         std::to_string(prompt_ids.size()) + " token(s)";
+            }
+            return std::nullopt;
+        }
+        // A payload that covers the whole prompt would put the request on the zero-suffix path,
+        // which samples its first token from the checkpoint's tail hidden. The tier payload has
+        // no tail hidden (the state image is the recurrent state, not the last activation), so
+        // such an import would bind and then die at "zero-suffix reuse has no target tail
+        // hidden". Refusing here turns that failure into an ordinary cold prefill, which by
+        // construction reproduces the cold run.
+        if (kv.frontier == prompt_ids.size()) {
+            if (error != nullptr) {
+                *error = "payload covers the whole prompt; a tier image carries no tail hidden";
+            }
+            return std::nullopt;
+        }
+        // And its pages have to be this process's pages. A directory left behind by another layout
+        // would be copied in at the wrong stride; the import's size check only fires when the
+        // extent is too small, and a narrower page would slip through.
+        if (want.kv_page_bytes != 0 && kv.page_bytes != want.kv_page_bytes) {
+            if (error != nullptr) {
+                *error = "payload page is " + std::to_string(kv.page_bytes) + " B, this layout uses " +
+                         std::to_string(want.kv_page_bytes) + " B";
+            }
+            return std::nullopt;
+        }
+        // Refuse only when the import cannot be paid for at all. A reserve on top of that was
+        // tried and is the wrong lever here: at this engine's 32-page pool it rejected a 10-page
+        // import with 10 free, which is the exact case this tier exists for. Pressure after the
+        // import (the request needing its next page) is handled where it already was, by the
+        // engine's reclaim before a unit, and a reclaim that cannot proceed shows up as a binding
+        // shortage instead of a silent cold run.
+        if (const auto headroom = checkpoint_pool_headroom();
+            headroom.capacity_pages != 0 && headroom.available_pages < kv.page_count) {
+            if (error != nullptr) {
+                *error = "needs " + std::to_string(kv.page_count) + " page(s); " +
+                         std::to_string(headroom.available_pages) + " of " +
+                         std::to_string(headroom.capacity_pages) + " free";
+            }
+            return std::nullopt;
+        }
+        // The tier stores the state image as one blob; the import splits it and checks the
+        // fingerprint against the layout this process has. A bare image is exactly what it
+        // expects here.
+        std::vector<std::string> shards{
+            std::string(reinterpret_cast<const char*>(state.bytes.data()), state.bytes.size())};
+        std::string why;
+        auto source = import_checkpoint_source_current_layout(kv, shards, &why, /*pin_pages=*/false);
+        if (!source) {
+            if (error != nullptr) { *error = std::move(why); }
+            return std::nullopt;
+        }
+        std::fprintf(stderr, "[kvt] reopened key=%016llx/%u frontier=%u pages=%u bytes=%zu\n",
+                     static_cast<unsigned long long>(key.hash), key.tokens, kv.frontier,
+                     kv.page_count, kv.kv_bytes.size());
+        std::fflush(stderr);
+        return source;
+    };
+    const auto key = core::KvBlockKey{core::kv_hash_tokens(prompt_ids),
+                                      static_cast<std::uint32_t>(prompt_ids.size())};
     // Printed before the lookup, not after: a key that does not match the one a store named is a
     // different problem from a directory that has nothing, and only this line tells them apart.
     std::fprintf(stderr, "[kvt] lookup key=%016llx/%u\n",
                  static_cast<unsigned long long>(key.hash), key.tokens);
     std::fflush(stderr);
-    if (!tier_load_export(*kv_tier, key, kv, state)) {
-        std::fprintf(stderr, "[kvt] miss key=%016llx/%u\n",
-                     static_cast<unsigned long long>(key.hash), key.tokens);
+    // port (sm_89): Q54's prefix index, read side. The whole-prompt key stays the FIRST attempt:
+    // a hit on it is byte-identical to the pre-index behaviour. Only a miss walks the notes, and
+    // the walk is longest frontier first, so a longer request consumes the deepest cached point
+    // it actually shares. The digests were computed once at plan time (one per frontier), so a
+    // probe is a lookup, not a rehash; the number of probes is bounded by the stored notes.
+    if (auto source = open_block(key, 0)) { return source; }
+    if (error != nullptr && !error->empty()) { return std::nullopt; }
+    struct PrefixCandidate {
+        std::uint32_t frontier;
+        std::uint32_t block_tokens;
+        std::uint64_t block_hash;
+        std::uint64_t digest_a;
+        std::uint64_t digest_b;
+    };
+    // Probes stay proportional to the index, and the index to the distinct stored prompts: a
+    // tier fed by a shared corpus accumulates entries, and the cap keeps one directory from
+    // turning every cold request into a directory scan. Longest first, so the cap only ever
+    // trims shorter (less valuable) candidates.
+    constexpr std::size_t kMaximumTierPrefixProbes = 64;
+    std::vector<PrefixCandidate> candidates;
+    for (const auto& note : kv_tier->prefix_notes()) {
+        ninfer::core::fingerprint::CheckpointFingerprint have;
+        const std::string bytes(reinterpret_cast<const char*>(note.fingerprint.data()),
+                                note.fingerprint.size());
+        if (!ninfer::core::fingerprint::decode(bytes, have)) { continue; }
+        std::string difference;
+        if (!ninfer::core::fingerprint::matches_state(have, want, difference) ||
+            have.kv_page_bytes != want.kv_page_bytes) {
+            continue;
+        }
+        // The identity tag is what checkpoint_matches compares in-process; the tier entry gets
+        // the same gate so a note from another engine configuration never costs a payload read.
+        if (note.identity_tag != plan.prefix_identity_tag) { continue; }
+        if (note.frontier == 0 || note.frontier > prompt_ids.size()) { continue; }
+        const PrefixCandidate candidate{note.frontier, note.block_tokens, note.block_hash,
+                                        note.digest_a, note.digest_b};
+        if (std::none_of(candidates.begin(), candidates.end(), [&](const auto& existing) {
+                return existing.frontier == candidate.frontier &&
+                       existing.block_hash == candidate.block_hash &&
+                       existing.block_tokens == candidate.block_tokens &&
+                       existing.digest_a == candidate.digest_a &&
+                       existing.digest_b == candidate.digest_b;
+            })) {
+            candidates.push_back(candidate);
+        }
+    }
+    std::sort(candidates.begin(), candidates.end(),
+              [](const PrefixCandidate& left, const PrefixCandidate& right) {
+                  return left.frontier > right.frontier;
+              });
+    if (candidates.size() > kMaximumTierPrefixProbes) { candidates.resize(kMaximumTierPrefixProbes); }
+    std::size_t probed = 0;
+    for (const auto& candidate : candidates) {
+        if (candidate.frontier > plan.prefix_digests.size()) { continue; }
+        const auto digest = plan.prefix_digests.at(candidate.frontier);
+        if (digest[0] != candidate.digest_a || digest[1] != candidate.digest_b) { continue; }
+        ++probed;
+        std::fprintf(stderr, "[kvt] prefix probe frontier=%u block=%016llx/%u\n",
+                     candidate.frontier, static_cast<unsigned long long>(candidate.block_hash),
+                     candidate.block_tokens);
         std::fflush(stderr);
-        return std::nullopt;
-    }
-    ninfer::core::fingerprint::CheckpointFingerprint want;
-    host_state_fingerprint(want);
-    // The run has to cover text this prompt actually has. A payload from a longer prompt would make
-    // the request resume from tokens it never had.
-    if (kv.frontier == 0 || kv.frontier > prompt_ids.size()) {
-        if (error != nullptr) {
-            *error = "payload covers " + std::to_string(kv.frontier) + " of " +
-                     std::to_string(prompt_ids.size()) + " token(s)";
+        // Digest evidence at this frontier exists, so the import below either lands (and the
+        // request prefills only the suffix) or the tier's refusal is a refusal - not a miss.
+        if (auto source = open_block({candidate.block_hash, candidate.block_tokens},
+                                     candidate.frontier)) {
+            std::fprintf(stderr,
+                          "[kvt] prefix hit frontier=%u of %zu token(s), probe %zu of %zu "
+                          "candidate(s), %zu prefill token(s) saved\n",
+                          candidate.frontier, prompt_ids.size(), probed, candidates.size(),
+                          prompt_ids.size() - candidate.frontier);
+            std::fflush(stderr);
+            return source;
         }
-        return std::nullopt;
+        if (error != nullptr && !error->empty()) { return std::nullopt; }
     }
-    // And its pages have to be this process's pages. A directory left behind by another layout would
-    // be copied in at the wrong stride; the import's size check only fires when the extent is too
-    // small, and a narrower page would slip through.
-    if (want.kv_page_bytes != 0 && kv.page_bytes != want.kv_page_bytes) {
-        if (error != nullptr) {
-            *error = "payload page is " + std::to_string(kv.page_bytes) + " B, this layout uses " +
-                     std::to_string(want.kv_page_bytes) + " B";
-        }
-        return std::nullopt;
-    }
-    // Refuse only when the import cannot be paid for at all. A reserve on top of that was tried and
-    // is the wrong lever here: at this engine's 32-page pool it rejected a 10-page import with 10
-    // free, which is the exact case this tier exists for. Pressure after the import (the request
-    // needing its next page) is handled where it already was, by the engine's reclaim before a unit,
-    // and a reclaim that cannot proceed shows up as a binding shortage instead of a silent cold run.
-    if (const auto headroom = checkpoint_pool_headroom();
-        headroom.capacity_pages != 0 && headroom.available_pages < kv.page_count) {
-        if (error != nullptr) {
-            *error = "needs " + std::to_string(kv.page_count) + " page(s); " +
-                     std::to_string(headroom.available_pages) + " of " +
-                     std::to_string(headroom.capacity_pages) + " free";
-        }
-        return std::nullopt;
-    }
-    // The tier stores the state image as one blob; the import splits it and checks the fingerprint
-    // against the layout this process has. A bare image is exactly what it expects here.
-    std::vector<std::string> shards{
-        std::string(reinterpret_cast<const char*>(state.bytes.data()), state.bytes.size())};
-    std::string why;
-    auto source = import_checkpoint_source_current_layout(kv, shards, &why, /*pin_pages=*/false);
-    if (!source) {
-        if (error != nullptr) { *error = std::move(why); }
-        return std::nullopt;
-    }
-    std::fprintf(stderr, "[kvt] reopened key=%016llx/%u frontier=%u pages=%u bytes=%zu\n",
-                 static_cast<unsigned long long>(key.hash), key.tokens, kv.frontier, kv.page_count,
-                 kv.kv_bytes.size());
+    std::fprintf(stderr, "[kvt] miss key=%016llx/%u (%zu candidate(s), %zu probed)\n",
+                 static_cast<unsigned long long>(key.hash), key.tokens, candidates.size(), probed);
     std::fflush(stderr);
-    return source;
+    return std::nullopt;
 }
 
 } // namespace ninfer::models::qwen3_5::detail

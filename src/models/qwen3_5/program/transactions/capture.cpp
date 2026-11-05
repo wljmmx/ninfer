@@ -381,6 +381,38 @@ void ProgramImpl::publish_capture(ContextTransaction& tx) {
                                  static_cast<unsigned long long>(key.hash), key.tokens,
                                  kv->frontier, kv->page_count, kv->kv_bytes.size());
                     std::fflush(stderr);
+                    // port (sm_89): Q54's prefix index. The block above is named by the whole
+                    // prompt, so only a request with this exact prompt can name it. The note
+                    // records the identity digest at the frontier the payload actually covers,
+                    // which is what a LONGER request with the same prefix needs: it walks its own
+                    // digests against the notes and finds this block through block_hash/tokens.
+                    // The digest already exists - plan_request computed one per frontier - so
+                    // this costs no hashing. Same block key means the sidecar is rewritten with
+                    // each store, never accumulated against stale bytes.
+                    if (kv->frontier != 0 && kv->frontier <= request.base->prefix_digests.size()) {
+                        core::KvTierPrefixNote note;
+                        note.block_hash    = key.hash;
+                        note.block_tokens  = key.tokens;
+                        note.frontier      = kv->frontier;
+                        note.identity_tag  = request.base->prefix_identity_tag;
+                        const auto digest  = request.base->prefix_digests.at(kv->frontier);
+                        note.digest_a      = digest[0];
+                        note.digest_b      = digest[1];
+                        ninfer::core::fingerprint::CheckpointFingerprint print;
+                        host_state_fingerprint(print);
+                        const auto encoded = ninfer::core::fingerprint::encode(print);
+                        std::copy(encoded.begin(), encoded.end(), note.fingerprint.begin());
+                        if (kv_tier->note_prefix(note)) {
+                            std::fprintf(stderr,
+                                         "[kvt] indexed block=%016llx/%u frontier=%u "
+                                         "digest=%016llx%016llx\n",
+                                         static_cast<unsigned long long>(note.block_hash),
+                                         note.block_tokens, note.frontier,
+                                         static_cast<unsigned long long>(note.digest_a),
+                                         static_cast<unsigned long long>(note.digest_b));
+                            std::fflush(stderr);
+                        }
+                    }
                 }
             }
         }
