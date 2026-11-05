@@ -561,6 +561,33 @@ private:
         return admission_check_pending_.exchange(false, std::memory_order_acq_rel);
     }
 
+    // v8 13.4 item 4 (joiner pacing): does the queued head still belong to the current merge
+    // window? The active prefill lanes' remaining tokens plus the head's prompt form the
+    // candidate rectangle; when prefill_batch_fit prices the whole set into one pass, or when
+    // nothing merges anyway (each row runs alone), binding the head now is free. When the
+    // column budget cuts the window short of the head, the head waits for the next window: it
+    // would bind mid-flight into a pass it cannot join and push the batch into narrow rows.
+    // The hold is bounded: as the current window's lanes finish, their remaining counts drop
+    // out and the head becomes the only row, which always binds.
+    [[nodiscard]] bool queued_head_joins_prefill_window() {
+        std::array<std::uint32_t, kMaximumConcurrency> remaining{};
+        std::size_t queued = 0;
+        {
+            std::lock_guard lock(queue_mutex_);
+            if (pending_.empty()) { return true; }
+            for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                if (!slots_[lane]) { continue; }
+                const std::uint32_t left = instance_.program->prefill_remaining(lane);
+                if (left != 0) { remaining[queued++] = left; }
+            }
+            remaining[queued++] = pending_.front()->prompt_summary.prompt_tokens;
+        }
+        if (queued <= 1) { return true; }
+        const auto fit = models::qwen3_5::execution::prefill_batch_fit(
+            std::span<const std::uint32_t>(remaining.data(), queued));
+        return fit.width == 0 || fit.lanes == queued;
+    }
+
     struct MaterializingRequest {
         std::shared_ptr<Request> request;
         LaneId destination;
@@ -2448,12 +2475,15 @@ private:
                     if (admission_decision_ || scheduler_.admission_scan_pending()) {
                         (void)try_admit_one(false);
                     } else if (!admission_deferred_ && free_lane() &&
-                               !instance_.program->has_context_transaction()) {
+                               !instance_.program->has_context_transaction() &&
+                               (!prefill_pacing_ || queued_head_joins_prefill_window())) {
                         // Q67/S1 step 0: a queued request used to wait for the previous request's
                         // whole prefill, because the admission scan was only armed by a submission or
                         // a capacity event. While a lane is free and something is queued, arm it here
                         // instead - that is what lets the next lane's bind materialize while the
                         // current lane's chunk runs, which is the precondition a merged prefill has.
+                        // With pacing on, the queued head only arms when it belongs to the current
+                        // merge window (see queued_head_joins_prefill_window).
                         std::lock_guard lock(queue_mutex_);
                         if (!pending_.empty()) { scheduler_.begin_admission_scan(); }
                     }
@@ -2718,6 +2748,11 @@ private:
     bool prefill_admit_first_ = std::getenv("NINFER_PREFILL_ADMIT_FIRST") != nullptr;
     // Q67/S1: opt-in merged prefill dispatch (interior chunks only).
     bool prefill_batch_exec_ = std::getenv("NINFER_PREFILL_BATCH_EXEC") != nullptr;
+    // v8 13.4 item 4, second half: opt-in joiner pacing. NINFER_PREFILL_ADMIT_FIRST holds the
+    // prefill until every queued joiner is bound; this knob holds a *new* joiner when the
+    // merge-window column budget has no room for it, so it does not bind into a pass it cannot
+    // join and waits for the next window instead.
+    bool prefill_pacing_ = std::getenv("NINFER_PREFILL_PACING") != nullptr;
     // "all" (or any value starting with 'a') prints every dispatch instead of the first few.
     bool prefill_batch_verbose_ = [] {
         const char* value = std::getenv("NINFER_PREFILL_BATCH");
