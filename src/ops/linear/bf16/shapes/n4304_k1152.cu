@@ -19,6 +19,39 @@ using S4 = Bf16RowTailSchedule<
 using S5 = Bf16RowTailSchedule<Bf16A16TmaMmaSchedule<96, 64, 64, 48, 32, 2, 2>>;
 using S6 = Bf16RowTailSchedule<
     Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<64, 128, 64, 64, 32, 2, 2>, 1152>>;
+
+// Ada fallbacks (docs/maintainer/sm89-fallback-table.md): the cp.async Xor64
+// equivalents of the TMA instances above - tile geometry, stages, raster and
+// outer wrappers preserved (only the producer staging changes).
+using F1 = Bf16RowTailSchedule<Bf16ScheduleInstance<
+    Bf16A16MmaSchedule<64, 32, 64, 32, 16, 3, 2, Cache::cg, Cache::cg,
+                       Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast,
+                       Bf16MmaSwizzle::Xor64, 1>,
+                         1152>>;
+using F2 = Bf16RowTailSchedule<Bf16ScheduleInstance<
+    Bf16A16MmaSchedule<64, 64, 64, 32, 16, 3, 2, Cache::cg, Cache::cg,
+                       Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast,
+                       Bf16MmaSwizzle::Xor64, 1>,
+                         1152>>;
+using F3 = Bf16RowTailSchedule<Bf16ScheduleInstance<
+    Bf16A16MmaSchedule<64, 64, 64, 32, 16, 2, 2, Cache::cg, Cache::cg,
+                       Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast,
+                       Bf16MmaSwizzle::Xor64, 1>,
+                         1152>>;
+using F4 = Bf16RowTailSchedule<Bf16ScheduleInstance<
+    Bf16A16MmaSchedule<128, 128, 64, 64, 32, 3, 1, Cache::cg, Cache::cg,
+                       Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast,
+                       Bf16MmaSwizzle::Xor64, 1>,
+                         1152>>;
+using F5 = Bf16RowTailSchedule<
+    Bf16A16MmaSchedule<96, 64, 64, 48, 32, 2, 2, Cache::cg, Cache::cg,
+                       Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast,
+                       Bf16MmaSwizzle::Xor64, 1>>;
+using F6 = Bf16RowTailSchedule<Bf16ScheduleInstance<
+    Bf16A16MmaSchedule<64, 128, 64, 64, 32, 2, 2, Cache::cg, Cache::cg,
+                       Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast,
+                       Bf16MmaSwizzle::Xor64, 1>,
+                         1152>>;
 } // namespace
 
 Bf16Launch select_bf16_n4304_k1152(std::int32_t tokens) {
@@ -34,9 +67,15 @@ Bf16Launch select_bf16_n4304_k1152(std::int32_t tokens) {
     if (tokens <= 2048) return launch_bf16_tma_mma<S5>;
     return launch_bf16_tma_mma<S6>;
 #else
-    // Ada fallback: no TMA on sm_89; reuse this shape's own cp.async MMA
-    // schedule for the token ranges the TMA instances covered.
-    return launch_bf16_mma<S0>;
+    // Ada fallback: no TMA on sm_89; run the ladder above on the recorded cp.async
+    // Xor64 equivalents of each TMA instance (docs/maintainer/sm89-fallback-table.md).
+    if (tokens <= 96) return launch_bf16_mma<F1>;
+    if (tokens <= 128) return launch_bf16_mma<F2>;
+    if (tokens <= 256) return launch_bf16_mma<F3>;
+    if (tokens <= 512) return launch_bf16_mma<F4>;
+    if (tokens <= 1024) return launch_bf16_mma<F2>;
+    if (tokens <= 2048) return launch_bf16_mma<F5>;
+    return launch_bf16_mma<F6>;
 #endif
 }
 } // namespace ninfer::ops::detail

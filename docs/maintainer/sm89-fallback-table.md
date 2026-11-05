@@ -31,12 +31,22 @@ sm_89 (`kBlockRows % kWarpRows == 0`, `kBlockTokens % kWarpTokens == 0`, `kBlock
 
 ## Status
 
-- **Recorded, not wired in.** The `#else` branches still keep their conservative reuse; the
-  fallbacks below are proposed replacements, verified by static reasoning only - not yet
-  compiled or benchmarked on device.
+- **Wired in and measured on sm_89 (RTX 4090).** The `#else` branches of all sixteen
+  ladders below run the recorded cp.async fallback per token range. Verified by
+  `ninfer_linear_bf16_a16_test` and by interleaved A/B `linear_bench --sweep 512:4096:512`
+  (min, repeat 200, flush 96 MiB): every wired rung is a win or neutral except the two
+  documented deviations in `n1152_k1152.cu` and `n1152_k4304.cu` (see below).
+- **Measured deviations.** `n1152_k1152`: the 32x64 rung regressed +21% at (128, 256] and
+  the 64x128 / 128x128 rungs wave-quantize (9 row tiles x tokens/128 = 144 blocks = 2
+  unbalanced waves on 128 SMs), so that shape runs S5 to 256 and the 64x64 F7 beyond.
+  `n1152_k4304`: the 64x64 / 64x128 rungs regressed +23%/+14% over (256, 1024] and the
+  128x128 rung quantizes at 2048 tokens, so those spans keep S4 while (116, 256] and
+  (1280, 1792] / (2048, inf] keep the wired fallbacks.
 - **Stage 2 is deferred** (no target model family): every shape here is inert for the
   current baseline, qwen3.8-27b (hidden = 5120).
-- Regenerate with `python tools/port/gen_bf16_fallback_table.py`.
+- Regenerate with `python tools/port/gen_bf16_fallback_table.py`. The generator reads the
+  `#if NINFER_ENABLE_TMA` ladder only; the two measured deviations live in the `#else`
+  branches and are not regenerated.
 
 `token range` is the token interval that selects the instance; `inf` is the final `return`
 (no upper bound). Only TMA-selected steps get a fallback row; a non-TMA step interleaved
