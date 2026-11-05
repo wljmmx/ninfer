@@ -6,7 +6,20 @@
 #include <stdexcept>
 
 namespace ninfer::ops::detail::moe_cuda::block_scaled::nvfp4 {
-#if NINFER_CUDA_HAS_BLOCK_SCALE_MMA
+// port (sm_89) / audit K6: the bench MoE tree this file was imported from keyed its kernels on
+// NINFER_CUDA_HAS_BLOCK_SCALE_MMA - a macro no build in this repository has ever defined (checked
+// against the full local history and against upstream/master, which does not carry this tree at
+// all), so the kernels below were dead code on EVERY architecture and these fail-loud stubs were
+// the only compiled behaviour. On Ada that is exactly right: the kernels ride block-scaled
+// mxf4nvf4 MMA, which only sm_100+ hardware implements, and the sm_89 build does not define
+// NINFER_ENABLE_NVFP4 - so both directions of this gate compile identically here, with zero
+// sm_89 impact either way. It is deliberately kept closed for sm_120a as well: nothing in this
+// port has run these kernels on real Blackwell hardware, and silently enabling an unvalidated
+// expert path would trade a loud error for wrong bytes. The gate is now spelled against the
+// feature macros this build owns, so the branch is reachable once that validation happens - add
+// NINFER_ENABLE_BLOCK_SCALED_MOE_MMA next to the other sm_120a feature definitions in the
+// top-level CMakeLists.
+#if defined(NINFER_ENABLE_NVFP4) && defined(NINFER_ENABLE_BLOCK_SCALED_MOE_MMA)
 namespace {
 __global__ void quantize_input(const __nv_bfloat16* x, std::uint8_t* codes, std::uint8_t* scales,
                                float divisor, int tokens, int* counts, float* routed_sum,
@@ -118,24 +131,33 @@ void launch_vector(const Tensor& x, const CudaSwiGLUExperts& experts, const Expe
     }
 }
 #else
-// port (sm_89): block-scaled NVFP4 MoE experts need sm_100+. This route is only selected when the caller asks for that
-// storage format or expert format, so an Ada build fails loudly here rather than silently
-// computing something else. See nvfp4_a4.cu for the same treatment on the linear side.
+// port (sm_89): block-scaled NVFP4 MoE experts need sm_100+ hardware. This route is only selected
+// when the caller asks for that storage format or expert format, so an Ada build fails loudly
+// here rather than silently computing something else. See nvfp4_a4.cu for the same treatment on
+// the linear side. On sm_120a this is also the branch in force until the explicit opt-in above
+// is defined, so the message below names the opt-in instead of asserting the hardware is too
+// old.
 
 void launch_input(const Tensor& x, const CudaSwiGLUExperts& experts, const Storage& s,
                   CudaExecutionView execution, bool clear_counts) {
-    throw std::logic_error("block-scaled NVFP4 MoE experts need sm_100+");
+    throw std::logic_error(
+        "block-scaled NVFP4 MoE experts are not compiled into this build: they need sm_100+ "
+        "hardware and the NINFER_ENABLE_BLOCK_SCALED_MOE_MMA opt-in");
 }
 
 void launch_experts(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
                     const Plan& plan, const Storage& s, CudaExecutionView execution) {
-    throw std::logic_error("block-scaled NVFP4 MoE experts need sm_100+");
+    throw std::logic_error(
+        "block-scaled NVFP4 MoE experts are not compiled into this build: they need sm_100+ "
+        "hardware and the NINFER_ENABLE_BLOCK_SCALED_MOE_MMA opt-in");
 }
 
 void launch_vector(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
                    ExpertSubset subset, bool shared, MoeEpilogue mode, Tensor& destination,
                    const Storage& s, CudaExecutionView execution) {
-    throw std::logic_error("block-scaled NVFP4 MoE experts need sm_100+");
+    throw std::logic_error(
+        "block-scaled NVFP4 MoE experts are not compiled into this build: they need sm_100+ "
+        "hardware and the NINFER_ENABLE_BLOCK_SCALED_MOE_MMA opt-in");
 }
 #endif
 } // namespace ninfer::ops::detail::moe_cuda::block_scaled::nvfp4

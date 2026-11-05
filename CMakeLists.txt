@@ -27,6 +27,10 @@ project(ninfer LANGUAGES C CXX CUDA)
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
   add_compile_definitions(NINFER_ARCH_SM120=1 NINFER_ENABLE_TMA=1 NINFER_ENABLE_NVFP4=1
     NINFER_ENABLE_K8V4=1)
+  # audit K6: NINFER_ENABLE_BLOCK_SCALED_MOE_MMA (the block-scaled NVFP4 MoE expert kernels,
+  # src/ops/moe/kernels/cuda/block_scaled/nvfp4/launch.cu) deliberately stays off until those
+  # kernels have been run on real Blackwell hardware; add it to the definitions above to compile
+  # them in. The sm_89 build never defines the NVFP4 feature macro, so it cannot reach them.
   set(NINFER_ENABLE_NVFP4 ON)
 else()
   add_compile_definitions(NINFER_ARCH_SM89=1 NINFER_ENABLE_K8V4=1)
