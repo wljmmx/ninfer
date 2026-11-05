@@ -82,6 +82,26 @@ ninfer_add_test(ninfer_qwen3_5_expert_stream_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_stream_real.cpp"
   LIBRARIES ninfer_artifact ninfer_ops ninfer_core)
 
+# v8 13.5 (step 5): runtime pool / KV reallocation under a real 4-way load. The contract: the
+# idle double read refuses a resize while requests are in flight, the frozen-graph pin refuses
+# at construction, and a grow->shrink round trip at a request boundary leaves the pool
+# producing the control run's tokens verbatim. Cross-tier token identity is asserted only
+# between same-tier batches (a wider tier shifts the host-tier split by design).
+ninfer_add_test(ninfer_qwen3_5_resize_under_load_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_resize_under_load.cpp"
+  LIBRARIES ninfer_engine)
+
+# The frozen-graph arm of the same acceptance: NINFER_GRAPH_BUDGET pays the capture allowance so
+# the pool is pinned at construction, and the binary answers only its own scenario so the budget
+# never leaks into the load arms (the sources read the variable once per process).
+add_test(NAME ninfer_qwen3_5_resize_pinned_graph_real_test
+  COMMAND ninfer_qwen3_5_resize_under_load_real_test)
+# NINFER_LAYER_GRAPH=0 because the per-layer capture defaults on and its replayed rounds call a
+# stream sync the capture forbids (ffn.cpp:355, cudaErrorStreamCaptureUnsupported) once the
+# budget is paid on this artifact; the pool pin and the resize refusal do not depend on it.
+set_tests_properties(ninfer_qwen3_5_resize_pinned_graph_real_test PROPERTIES
+  ENVIRONMENT "NINFER_RESIZE_TEST_SCENARIO=pinned;NINFER_GRAPH_BUDGET=1;NINFER_LAYER_GRAPH=0")
+
 ninfer_add_test(ninfer_tool_call_parser_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../../test_tool_call_parser.cpp"
   LIBRARIES ninfer_engine ninfer::json)
@@ -136,11 +156,20 @@ set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_moe_real_test
   ninfer_qwen3_5_dflash_real_test
   ninfer_qwen3_5_kv_tier_real_test
-  ninfer_qwen3_5_expert_stream_real_test)
+  ninfer_qwen3_5_expert_stream_real_test
+  ninfer_qwen3_5_resize_under_load_real_test
+  ninfer_qwen3_5_resize_pinned_graph_real_test)
 set_tests_properties(${ninfer_qwen3_5_real_tests} PROPERTIES
   SKIP_RETURN_CODE 77
   RUN_SERIAL TRUE
   LABELS "gpu;real")
+
+# The resize acceptance builds three real engines and runs six 4-way batches; the default
+# ctest timeout would kill it long before the pinned-graph engine exists.
+set_tests_properties(ninfer_qwen3_5_resize_under_load_real_test PROPERTIES
+  TIMEOUT 5400)
+set_tests_properties(ninfer_qwen3_5_resize_pinned_graph_real_test PROPERTIES
+  TIMEOUT 1800)
 
 set_tests_properties(
   ninfer_qwen3_5_state_image_test

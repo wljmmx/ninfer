@@ -78,18 +78,39 @@ int main() {
         expect("expert is resident after upload", cache.offset({b, 0}).has_value());
     }
 
+    // 13.5 (step 5): a resize moves the layout - experts above the new edge lose their slots -
+    // and the stream republishes its offset tables only when the generations move. A shrink or
+    // a grow that left them still would serve a table naming a released segment (the illegal
+    // address the resize-under-load acceptance caught on the e2 artifact), so every generation a
+    // publisher compares against must advance; a same-size call is the documented no-op.
+    const auto layout_before = cache.layout_generation();
+    const auto bank_before   = cache.bank_generation(0);
+    const auto hot_before    = cache.hot_generation(0);
+    const auto step_before   = cache.step_generation(0);
     const auto before = free_bytes();
-    const auto shrunk = cache.resize(16ull << 20);
+    const auto shrunk_now = cache.resize(16ull << 20);
     const auto after = free_bytes();
-    expect("shrink keeps two bank runs", shrunk == (16ull << 20) && cache.windows() == 2);
+    expect("a shrink advances the published-table generations",
+           cache.layout_generation() > layout_before && cache.bank_generation(0) > bank_before &&
+               cache.hot_generation(0) > hot_before && cache.step_generation(0) > step_before);
+    expect("shrink keeps two bank runs", shrunk_now == (16ull << 20) && cache.windows() == 2);
     expect("shrunk bytes reach the driver", after >= before + (40ull << 20));
     expect("a dropped run is gone", !cache.window_resident(3) && !cache.offset({3, 0}).has_value());
     expect("a kept run still answers", cache.window_resident(1) && cache.offset({1, 0}).has_value());
 
+    const auto layout_mid = cache.layout_generation();
+    const auto bank_mid   = cache.bank_generation(0);
+    expect("a same-size resize is the documented no-op",
+           cache.resize(16ull << 20) == shrunk_now && cache.layout_generation() == layout_mid &&
+               cache.bank_generation(0) == bank_mid);
+
     // Growing back must make the reservation usable again, and the data that was dropped has to
     // come back through the normal upload path with its original bytes. Slots are shared, so the
     // bank asks for one instead of assuming its old address is still there.
+    const auto layout_grown = cache.layout_generation();
     expect("grow restores the reservation", cache.resize(kCapacity) == kCapacity);
+    expect("a grow advances the published-table generations",
+           cache.layout_generation() > layout_grown);
     const std::uint32_t expert_zero = 0;
     cache.set_resident_experts(3, std::span<const std::uint32_t>(&expert_zero, 1));
     cache.prepare(std::span<const ExpertCacheKey>(&keys[3], 1));
@@ -106,7 +127,7 @@ int main() {
 
     std::printf("expert pool resize test: full=%llu shrunk=%llu windows=%llu uploads=%llu\n",
                 static_cast<unsigned long long>(full),
-                static_cast<unsigned long long>(shrunk),
+                static_cast<unsigned long long>(shrunk_now),
                 static_cast<unsigned long long>(cache.windows()),
                 static_cast<unsigned long long>(cache.uploads()));
     std::printf("%s expert pool resize\n", failures == 0 ? "OK" : "FAIL");

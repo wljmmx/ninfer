@@ -124,13 +124,20 @@ int main() {
                           tiered.fully_resident_reservation_bytes == 16043556388ULL,
                       "residency resolution did not match the appendix BP numbers");
 
-    bool fully_resident_rejected = false;
-    try {
-        (void)ninfer::runtime::resolve_kv_capacity(
-            ninfer::KvCapacityPolicy::explicit_capacity(1000000), measured_curve, 7060000000ULL);
-    } catch (const std::invalid_argument&) { fully_resident_rejected = true; }
-    failures += check(fully_resident_rejected,
-                      "the fully resident model accepted a capacity the device cannot hold");
+    // The fully resident model degrades instead of throwing (kv_capacity.cpp: the port rule that
+    // replaced "over budget must abort"): 1M tokens price at 16,043,556,388 bytes, and the
+    // 7.06 GB budget cuts that to the largest feasible count - 6486 page groups at
+    // 7,059,517,272 bytes. That is the same resident page count the residency split picked two
+    // cases above, because both walks price the same per-group stride against the same budget.
+    // The degradation never crosses the curve minimum; here the budget holds 6486 groups, far
+    // above the 64-group floor, and the slack pins that the choice was budget-exact.
+    const auto fully_resident_degraded = ninfer::runtime::resolve_kv_capacity(
+        ninfer::KvCapacityPolicy::explicit_capacity(1000000), measured_curve, 7060000000ULL);
+    failures += check(fully_resident_degraded.main_page_groups == 6486 &&
+                          fully_resident_degraded.resolved_tokens == 415104 &&
+                          fully_resident_degraded.runtime_reservation_bytes == 7059517272ULL &&
+                          fully_resident_degraded.planned_slack_bytes == 482728ULL,
+                      "the fully resident model did not degrade to the largest feasible page count");
 
     // Unset strides must leave resolution untouched, including under the automatic policy.
     const auto inactive = ninfer::runtime::resolve_kv_capacity_with_residency(
