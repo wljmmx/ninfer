@@ -1506,6 +1506,36 @@ private:
                std::all_of(slots_.begin(), slots_.end(), [](const auto& p) { return !p; });
     }
 
+    // 13.5 (step 5): the live counterpart of the idle the worker itself waits for. The
+    // published RuntimeStats gauges are a boundary-consistent snapshot, and a long merged
+    // prefill does not publish while it runs, so a caller can read all nine gauges as zero
+    // with a four-way batch in flight - the double read in Engine::resize_* then sailed
+    // straight through and the KV shrink ran concurrently with the decode it should have
+    // refused (measured on the e2 artifact: the in-flight batch diverged after the resize).
+    // The worker holds execution_mutex_ for the whole of an execution round and drops it to
+    // idle on the condition variable, so the lock itself answers the question: when the
+    // try-lock fails the worker is inside a round and the caller is refused NOW instead of
+    // parking behind a multi-second prefill. When it succeeds, the queue state is read under
+    // both locks in the worker's own order.
+public:
+    [[nodiscard]] bool any_inflight() const {
+        std::unique_lock execution_lock(execution_mutex_, std::try_to_lock);
+        if (!execution_lock.owns_lock()) { return true; }
+        std::lock_guard lock(queue_mutex_);
+        // The decision containers are the boundary states a request can sit in between the
+        // queue and a lane: a mid-admission scan, an armed capture, or a transaction owner.
+        // The first draft of this check read only the settled states and a resize slipped
+        // through exactly one of these - the controller had just flipped the lane count and
+        // the batch was neither queued nor resident for the length of the flip.
+        const bool holding_decision =
+            admission_decision_.has_value() || context_owner_ != nullptr ||
+            std::any_of(capture_decisions_.begin(), capture_decisions_.end(),
+                        [](const auto& decision) { return decision.has_value(); });
+        return !pending_.empty() || !resident_empty() || !paused_.empty() || holding_decision;
+    }
+
+private:
+
     [[nodiscard]] bool has_older_resident(std::uint64_t ticket) const noexcept {
         return std::any_of(slots_.begin(), slots_.end(), [ticket](const auto& request) {
             return request && request->id < ticket;

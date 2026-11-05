@@ -2739,7 +2739,18 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 const char* value = std::getenv("NINFER_PUBLISH_DELTA");
                 return value == nullptr || value[0] != '0';
             }();
-            const bool delta = delta_enabled && !moved.empty() &&
+            // 13.5 (step 5): the delta path assumes the Device tables still hold the rows this
+            // publisher last wrote. A resize breaks that baseline from outside - the cache moved
+            // slots this stream never published, and the generation bump that follows is exactly
+            // what `need_publish` reports. Measured on the e2 artifact: after a pool shrink the
+            // first republish of the cleared banks submitted its moved rows through the batch
+            // copy, the call returned success, and the Device table still held the pre-shrink
+            // high offsets - the grouped kernel then read a released VMM segment and the layer
+            // died as cudaErrorIllegalAddress. A publication that follows a generation change
+            // therefore carries the whole table: the fallback path writes both buffers in one
+            // submission and was verified to land (bank 0-3 of the same batch, moved=0, stayed
+            // correct while every delta bank stayed stale).
+            const bool delta = delta_enabled && !moved.empty() && !need_publish &&
                                delta_bytes * 2 < table_bytes + mask_bytes;
             // Async on the consumer stream: the kernels that read these tables are queued behind
             // them there, while a blocking copy would stall the host twice per layer.

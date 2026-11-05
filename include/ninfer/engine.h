@@ -128,6 +128,12 @@ public:
     // call synchronizes the device after checking both, and returns the capacity actually reached
     // (whole windows only). Throws when the engine is not idle, when a graph pinned the pool, or
     // when the target cannot be met; it never silently shrinks below the current windows.
+    // v8 13.5 (step 5): ACCEPTED under load on the RTX 4090 / qwen3.6-35b e2 artifact (four-way
+    // batches, this commit's resize-under-load test): the idle double read refuses mid-batch, the
+    // grow->shrink round trip at a request boundary leaves the pool reproducing the
+    // never-resized run's tokens verbatim, and the frozen-graph pin refuses at construction.
+    // Controller L1 wiring can proceed on these three; the KV entry's boundary hand-off race and
+    // the post-KV-shrink page-placement divergence are the two open items it must not assume away.
     std::uint64_t resize_expert_pool(std::uint64_t target_bytes);
 
     // 13.4: the KV half of runtime resize. Same idle-window contract as the expert pool, and the

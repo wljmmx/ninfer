@@ -132,6 +132,13 @@ public:
         return !stopping_;
     }
 
+    // 13.5 (step 5): the scoring core publishes no gauges, so Engine::resize_* asks this for the
+    // live in-flight state instead. The single job slot is the whole of it.
+    [[nodiscard]] bool any_inflight() const {
+        std::lock_guard lock(queue_mutex_);
+        return job_ != nullptr;
+    }
+
     void reset_memory_peaks() noexcept {
         try {
             std::scoped_lock lock(execution_mutex_);

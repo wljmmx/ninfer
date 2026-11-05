@@ -733,6 +733,28 @@ std::vector<std::uint64_t> bank_generation;
         }
         slots_live = wanted;
         if (ring_slot_flag.size() < wanted) { ring_slot_flag.resize(wanted, 0); }
+        // 13.5 (step 5): the layout just moved. Experts above the new edge lost their slots, and
+        // the backing below it changed hands with the driver. The published offset tables name
+        // slots, and a stream republishes them exactly when the generations below move - so bump
+        // every one of them, for every bank. The per-bank vectors are filled lazily on first
+        // placement, so they are sized up first: a resize that arrives before any placement (the
+        // pool is elastic from construction) must still invalidate the table a placement
+        // publisher would otherwise compare as already published. A table left stale by a shrink
+        // still names a segment the driver has taken back, which the GPU reports as an illegal
+        // address the first time a grouped kernel reads it (found by the resize-under-load
+        // acceptance on the e2 artifact).
+        ++layout_generation;
+        {
+            const auto size = banks.size();
+            const auto grow = [size](std::vector<std::uint64_t>& generations) {
+                if (generations.size() < size) { generations.resize(size, 0); }
+                for (auto& generation : generations) { ++generation; }
+            };
+            grow(bank_generation);
+            grow(hot_gen);
+            grow(step_gen);
+            grow(prefetch_gen);
+        }
         return live_bytes();
     }
 
