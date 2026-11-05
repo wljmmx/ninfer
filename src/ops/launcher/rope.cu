@@ -13,7 +13,11 @@ constexpr int kLargeBlock               = 256;
 constexpr int kFullChunkBlock           = 192;
 constexpr int kSmallBlock               = 128;
 constexpr int kDefaultChunkTargetTokens = 1024;
-// Qualified residency of this 256-thread instance on the sm_120a target.
+// Residency of this 256-thread instance. Measured on sm_89 (RTX 4090, 2026-11-05): a sweep
+// of resident CTAs per SM over {4, 5, 6} against the 256-block window boundary
+// (tokens 256..1280, 27b and 35b pair geometries, interleaved, min of repeat batches)
+// found no point where the variants differ by more than noise (<2%), so the qualified
+// sm_120a value is kept.
 constexpr int kLargeBlockResidentCtasPerSm = 6;
 
 template <RopeKernelMode Mode>
