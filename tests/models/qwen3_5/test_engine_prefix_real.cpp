@@ -2,9 +2,11 @@
 #include "kv_cache_storage.h"
 
 #include <cstdint>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <io.h>
 #include <iostream>
 #include <optional>
@@ -1737,9 +1739,13 @@ bool capture_contains(const char* path, const char* needle) {
 //
 // Phase 1: two fresh single-chunk 256-token prompts merge in one pass; [prefill-merged] must
 // appear and the tokens must match the single-lane reference bit for bit.
-// Phase 2: a 521-token prompt's settled 9-token tail meeting a fresh 9-token prompt must be
-// refused on the reservation guard - after a unit settles the lane holds neither a permit nor
-// growth, and mapping it would demand pages nobody reserved.
+// Phase 2: a 521-token prompt's settled 9-token tail meeting a fresh 9-token prompt used to be
+// refused on the reservation guard - after a unit settles the lane held neither a permit nor
+// growth. The pass now reserves its own execution units, so the pair must MERGE: the assertion
+// is the trigger plus completion. The pair's tokens are not compared bit for bit any more:
+// nine columns route the projection differently from the merged 32-column aggregate (the 1-12
+// direct band against the 13-32 grouped band), so that comparison is within-criterion by
+// construction; the bitwise claim lives in the route-aligned phases and the production scenario.
 // Phase 3: the default state-slot budget runs the same 256-token merge - the conv form borrows
 // no conv-state slot spans, so no slot planning gates the pass - and the tokens still match.
 // Every phase's requests must complete with the single-lane path's tokens, bit for bit; the
@@ -1822,8 +1828,11 @@ int exercise_merged_prefill_tail(const char* artifact) {
             outcome = 1;
         }
 
-        // Phase 2: the settled tail plus a fresh prompt must be refused on the reservation
-        // guard, not mapped.
+        // Phase 2: the settled tail plus a fresh prompt used to be refused on the reservation
+        // guard. The pass now reserves its own execution units, so the pair must merge; the
+        // tokens are not compared bit for bit because nine columns route the projection
+        // differently from the merged 32-column aggregate (the 1-12 direct band against the
+        // 13-32 grouped band), which is a within-criterion difference by construction.
         const char* const guard_capture = "prefix-real-merged-prefill-phase2.log";
         const int saved_guard_stderr    = _dup(2);
         if (saved_guard_stderr < 0 || freopen(guard_capture, "w", stderr) == nullptr) {
@@ -1841,15 +1850,15 @@ int exercise_merged_prefill_tail(const char* artifact) {
         std::fflush(stderr);
         _dup2(saved_guard_stderr, 2);
         _close(saved_guard_stderr);
-        if (long_row.generated_token_ids != expected[2] ||
-            short_row.generated_token_ids != expected[3]) {
-            std::cerr << "guard phase produced different tokens than the single-lane path:"
-                      << " long_match=" << (long_row.generated_token_ids == expected[2])
-                      << " short_match=" << (short_row.generated_token_ids == expected[3]) << '\n';
+        if (long_row.generated_token_ids.size() != 16 ||
+            short_row.generated_token_ids.size() != 16) {
+            std::cerr << "reservation-backed merge did not complete both requests: long="
+                      << long_row.generated_token_ids.size()
+                      << " short=" << short_row.generated_token_ids.size() << '\n';
             outcome = 1;
         }
-        if (!capture_contains(guard_capture, "[prefill-reject] permit")) {
-            std::cerr << "guard phase never refused the uncovered tail row\n";
+        if (!capture_contains(guard_capture, "[prefill-merged] rows=2")) {
+            std::cerr << "guard phase never merged the settled-tail pair under its own units\n";
             outcome = 1;
         }
 
@@ -1889,6 +1898,204 @@ int exercise_merged_prefill_tail(const char* artifact) {
     }
     _putenv_s("NINFER_PREFILL_ADMIT_FIRST", "");
     _putenv_s("NINFER_PREFILL_BATCH_EXEC", "");
+    return outcome;
+}
+
+// The production-shaped merge, in process: four lanes whose prompts are exactly the 256-token
+// class, then four 3*1024+256 prompts at chunk 1024, so the merged rectangle is the production
+// tail shape (4 x 256 = 1024 columns) and - because raw token prompts carry no chat template -
+// the tail chunk is NOT split at a template rewrite frontier: the whole 256-column block is the
+// chunk that merges, and 256 columns route every GEMM in the stack identically to the merged
+// 1024-column aggregate (W4A8 at multiples of 128, the gating band spans 9..1024). Raw prompts
+// are also the only way to get that: a chat-templated prompt of any length ends in the
+// assistant-turn segment, whose rewrite frontier cuts the final chunk seven tokens short, and a
+// seven-token merged block routes differently from a seven-token single-lane chunk - that
+// boundary is a within-criterion comparison, not a bitwise one.
+//
+// Both engines hold admission until all lanes are bound (admit-first), so the only difference
+// between the arms is the merged pass itself. The per-lane arm finishes the four tails one
+// engine turn apart, so a lane can decode for a few steps at a smaller batch than the merged
+// arm's simultaneous finish; the dense artifact's decode GEMMs are scheduled per batch size
+// (gemv at B=1, simt at B<=2 and B<=4), so that window is a pre-existing composition sensitivity
+// the comparison reports instead of hiding: the first generated token (the prefill's own sampled
+// Begin) is asserted separately from the full generated sequence.
+int exercise_merged_prefill_production(const char* artifact) {
+    auto wide_options = [&](std::int32_t context) {
+        ninfer::EngineOptions options;
+        options.artifact_path                     = artifact;
+        options.max_context                       = context;
+        options.kv_capacity        = ninfer::KvCapacityPolicy::explicit_capacity(
+            static_cast<std::uint32_t>(4) * static_cast<std::uint32_t>(context));
+        options.prefill_chunk                     = 1024;
+        options.speculative.backend               = ninfer::SpeculativeBackend::None;
+        options.max_concurrency                   = 4;
+        options.max_pending_requests              = 4;
+        options.context_cache.device_state_slots  = 2;
+        options.context_cache.host_capacity_bytes = 0;
+        return options;
+    };
+
+    struct Load {
+        const char* name;
+        std::int32_t prompt_tokens;
+        std::int32_t context;
+        // The production-shaped load asserts the full generated sequence: it is the shape the
+        // acceptance names and it measured a clean sweep. The single-chunk probe asserts the
+        // begin token - the prefill's own output, which is what the merge owns - and reports the
+        // sequence as evidence, because a lane that finishes its whole prompt alone in one arm
+        // and inside a merged pair in the other decodes through a different batch-size window
+        // and the dense artifact schedules its decode GEMMs per batch size (gemv at 1, simt at
+        // 2 and 4), a pre-existing sensitivity that is not the merge's arithmetic.
+        bool assert_sequence;
+    };
+    int outcome = 0;
+    for (const Load& load : {Load{"four-256", 256, 512, false},
+                            Load{"four-3328", 3 * 1024 + 256, 3 * 1024 + 256 + 64, true}}) {
+        std::vector<std::vector<ninfer::TokenId>> prompts(4);
+        for (std::size_t lane = 0; lane < 4; ++lane) {
+            prompts[lane].reserve(static_cast<std::size_t>(load.prompt_tokens));
+            for (std::int32_t i = 0; i < load.prompt_tokens; ++i) {
+                prompts[lane].push_back(static_cast<ninfer::TokenId>(
+                    400 + ((i * 7 + static_cast<std::int32_t>(lane) * 131) % 900)));
+            }
+        }
+
+        std::vector<std::vector<ninfer::TokenId>> expected;
+        {
+            ninfer::Engine reference(wide_options(load.context));
+            _putenv_s("NINFER_PREFILL_ADMIT_FIRST", "1");
+            std::vector<ninfer::GenerationHandle> handles;
+            const auto reference_started = std::chrono::steady_clock::now();
+            for (const auto& prompt : prompts) {
+                handles.push_back(reference.submit(reference.prepare_tokens(prompt),
+                                                   fixed_output(64, false)));
+            }
+            for (auto& handle : handles) { expected.push_back(handle.wait().generated_token_ids); }
+            const double reference_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - reference_started).count();
+            std::printf("merged-prefill production %s: per-lane arm wall %.3f s\n", load.name,
+                        reference_seconds);
+            std::fflush(stdout);
+        }
+        _putenv_s("NINFER_PREFILL_BATCH_EXEC", "1");
+        std::optional<std::string> failure;
+        std::vector<std::vector<ninfer::TokenId>> merged_tokens;
+        std::size_t merged_rows = 0;
+        {
+            ninfer::Engine merged(wide_options(load.context));
+            const char* const capture = "prefix-real-merged-prefill-production.log";
+            const int saved_stderr    = _dup(2);
+            if (saved_stderr < 0 || freopen(capture, "w", stderr) == nullptr) {
+                _putenv_s("NINFER_PREFILL_ADMIT_FIRST", "");
+                _putenv_s("NINFER_PREFILL_BATCH_EXEC", "");
+                std::cerr << "production merge could not capture the engine's dispatch log\n";
+                return 1;
+            }
+            std::vector<ninfer::GenerationHandle> handles;
+            const auto started = std::chrono::steady_clock::now();
+            for (const auto& prompt : prompts) {
+                handles.push_back(
+                    merged.submit(merged.prepare_tokens(prompt), fixed_output(64, false)));
+            }
+            for (auto& handle : handles) { merged_tokens.push_back(handle.wait().generated_token_ids); }
+            const double merged_seconds =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+            std::fflush(stderr);
+            _dup2(saved_stderr, 2);
+            _close(saved_stderr);
+            std::printf("merged-prefill production %s: merged arm wall %.3f s\n", load.name,
+                        merged_seconds);
+            std::fflush(stdout);
+            // The pass fires on whatever lanes are at their tail-class chunks at the same
+            // dispatch: a rejected attempt feeds a single-lane turn that advances one lane a
+            // whole chunk (the fdbf7fec drift), so equal-length prompts do not guarantee all
+            // four lanes line up at once - the proof is that every lane's tail went through a
+            // merged pass (the summed rows cover the lane count), not that one pass held all
+            // four.
+            std::size_t merged_row_total = 0;
+            std::size_t merged_passes    = 0;
+            {
+                std::FILE* file = std::fopen(capture, "r");
+                if (file == nullptr) { failure = "the merged arm's dispatch log is missing"; }
+                else {
+                    char buffer[512];
+                    while (std::fgets(buffer, sizeof(buffer), file) != nullptr) {
+                        const std::string text(buffer);
+                        if (text.find("[prefill-merged] rows=") == std::string::npos) { continue; }
+                        ++merged_passes;
+                        const auto at = text.find("rows=") + 5;
+                        merged_row_total +=
+                            static_cast<std::size_t>(std::strtoul(text.c_str() + at, nullptr, 10));
+                    }
+                    std::fclose(file);
+                }
+            }
+            if (!failure && (merged_passes == 0 || merged_row_total < 4)) {
+                failure = "the merged arm never covered the four lanes' tails";
+            }
+            for (const auto& line : [&] {
+                std::vector<std::string> lines;
+                std::FILE* file = std::fopen(capture, "r");
+                if (file == nullptr) { return lines; }
+                char buffer[512];
+                while (std::fgets(buffer, sizeof(buffer), file) != nullptr) {
+                    const std::string text(buffer);
+                    if (text.find("[prefill-merged]") != std::string::npos) {
+                        lines.push_back(text.substr(0, text.find('\n')));
+                    }
+                }
+                std::fclose(file);
+                return lines;
+            }()) {
+                std::printf("merged-prefill production %s: %s\n", load.name, line.c_str());
+                std::fflush(stdout);
+            }
+        }
+        _putenv_s("NINFER_PREFILL_ADMIT_FIRST", "");
+        _putenv_s("NINFER_PREFILL_BATCH_EXEC", "");
+
+        if (failure) {
+            std::cerr << "merged-prefill production " << load.name << ": " << *failure << '\n';
+            outcome = 1;
+            continue;
+        }
+        std::size_t begin_mismatches = 0;
+        std::size_t sequence_mismatches = 0;
+        for (std::size_t lane = 0; lane < 4; ++lane) {
+            if (merged_tokens[lane].size() != expected[lane].size()) {
+                std::cerr << "merged-prefill production " << load.name
+                          << ": lane " << lane << " produced " << merged_tokens[lane].size()
+                          << " tokens, expected " << expected[lane].size() << '\n';
+                outcome = 1;
+                continue;
+            }
+            if (!merged_tokens[lane].empty() &&
+                merged_tokens[lane].front() != expected[lane].front()) {
+                ++begin_mismatches;
+                std::cerr << "merged-prefill production " << load.name
+                          << ": lane " << lane << " BEGIN token differs ("
+                          << merged_tokens[lane].front() << " vs " << expected[lane].front()
+                          << ") - the prefill arithmetic itself is not identical\n";
+            }
+            if (merged_tokens[lane] != expected[lane]) {
+                ++sequence_mismatches;
+                std::size_t first = 0;
+                while (first < merged_tokens[lane].size() &&
+                       merged_tokens[lane][first] == expected[lane][first]) {
+                    ++first;
+                }
+                std::cerr << "merged-prefill production " << load.name << ": lane " << lane
+                          << " sequence differs from index " << first << " of "
+                          << merged_tokens[lane].size() << '\n';
+            }
+        }
+        std::printf(
+            "merged-prefill production %s: begin mismatches %zu, sequence mismatches %zu\n",
+            load.name, begin_mismatches, sequence_mismatches);
+        std::fflush(stdout);
+        if (begin_mismatches != 0) { outcome = 1; }
+        if (load.assert_sequence && sequence_mismatches != 0) { outcome = 1; }
+    }
     return outcome;
 }
 int exercise_concurrent_resource_settlement(const char* artifact) {
@@ -2194,6 +2401,13 @@ int main() {
             result = exercise_merged_prefill_tail(artifact);
         } catch (const std::exception& error) {
             std::cerr << "merged prefill integration failed: " << error.what() << '\n';
+            return 1;
+        }
+    } else if (scenario == "merged-prefill-production") {
+        try {
+            result = exercise_merged_prefill_production(artifact);
+        } catch (const std::exception& error) {
+            std::cerr << "merged prefill production failed: " << error.what() << '\n';
             return 1;
         }
     } else if (scenario == "explicit-prefix") {

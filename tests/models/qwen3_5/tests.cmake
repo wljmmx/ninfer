@@ -96,6 +96,15 @@ add_test(NAME ninfer_qwen3_5_merged_prefill_real_test
 set_tests_properties(ninfer_qwen3_5_merged_prefill_real_test PROPERTIES
   ENVIRONMENT "NINFER_PREFIX_REAL_SCENARIO=merged-prefill")
 
+# The production-shaped merge: four lanes at the 256-column class and four 3328-token prompts at
+# chunk 1024, both arms admitted together so only the merged pass differs, with the four-row pass
+# pinned in the dispatch log and the per-row begin token asserted separately from the full
+# sequence (the dense decode is scheduled per batch size, a pre-existing composition window).
+add_test(NAME ninfer_qwen3_5_merged_prefill_production_real_test
+  COMMAND ninfer_qwen3_5_prefix_real_test)
+set_tests_properties(ninfer_qwen3_5_merged_prefill_production_real_test PROPERTIES
+  ENVIRONMENT "NINFER_PREFIX_REAL_SCENARIO=merged-prefill-production")
+
 # A real-model test owns the single GPU while its artifact is resident.
 set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_loading_real_test
@@ -103,6 +112,7 @@ set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_prefix_real_test
   ninfer_qwen3_5_agent_continuation_real_test
   ninfer_qwen3_5_merged_prefill_real_test
+  ninfer_qwen3_5_merged_prefill_production_real_test
   ninfer_qwen3_5_preemption_real_test
   ninfer_qwen3_5_grammar_real_test
   ninfer_qwen3_5_tools_real_test

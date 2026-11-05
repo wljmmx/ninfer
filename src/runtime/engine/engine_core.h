@@ -2601,8 +2601,14 @@ private:
                     hold_prefill = (!pending_.empty() || materializing_.has_value()) &&
                                    !admission_deferred_;
                 }
-                auto merged = prefill_batch_exec_ ? instance_.program->advance_prefill_batch()
-                                                  : std::nullopt;
+                // The merged attempt obeys the same hold as the single-lane turn: admit-first
+                // exists precisely so a queued batch binds before anything prefills, and a merge
+                // that fires with half the lanes bound consumes the first two rows in one pass
+                // and the rest in another - two narrow passes instead of the one the cost model
+                // priced.
+                auto merged = prefill_batch_exec_ && !hold_prefill
+                                  ? instance_.program->advance_prefill_batch()
+                                  : std::nullopt;
                 if (merged) {
                     // Q67/S1: one merged pass carried several lanes' chunks. Every row that finished
                     // owns a pending token, and committing a multi-row pending is the same call the

@@ -372,27 +372,12 @@ std::optional<Program::MergedPrefillResult> ProgramImpl::advance_prefill_batch()
             reject("narrow_path", staged.prepare_mtp ? 1 : 0, staged.vision ? 1 : 0);
             return std::nullopt;
         }
-        // The single-lane prefill contract runs a chunk only under a reserved execution unit
-        // (advance_prefill: require_unit, then mapping through the permit's frontier), because
-        // settling a unit releases its growth reservation and the next chunk's pages have to be
-        // reserved again before anything maps them. The merged attempt dispatches between unit
-        // reservations - the engine hands the prefill turn to one lane per round - so a row
-        // whose unit has settled (an interior chunk's tail) holds neither a permit nor growth,
-        // and mapping it would demand pages nobody reserved ("KV coverage exceeds reserved unit
-        // growth"). Admit a row only when its end is already covered: by its unit permit, or by
-        // the growth its bind reserved for a row that has not executed yet. Anything else stays
-        // queued and runs through the single-lane path under its own unit.
-        const std::uint32_t end = candidate.prefill->cursor + rows[i].count;
-        const auto& row_state   = active_sequence(rows[i].lane);
-        const bool covered =
-            candidate.permit
-                ? candidate.permit->main_frontier >= end
-                : text_kv_addresses->growth_pages_for_tokens(row_state.kv->text, end) <=
-                      text_kv_addresses->reserved_growth_pages(row_state.kv->text);
-        if (!covered) {
-            reject("permit", rows[i].lane, end);
-            return std::nullopt;
-        }
+        // No coverage check here any more: the pass reserves its own execution units below, so a
+        // selected row's permit is created for exactly the columns the pass executes, whether or
+        // not the row's previous interior unit has settled. The old guard (admit only rows already
+        // covered by a unit permit or bind growth) refused every multi-chunk prompt's tail chunk
+        // for good reason - mapping a settled row demanded pages nobody reserved - and the
+        // reservation is the fix, not a wider guard.
     }
 
     // Rows may end their prompt here: a finishing row's token comes straight out of the pass, so
@@ -421,6 +406,28 @@ std::optional<Program::MergedPrefillResult> ProgramImpl::advance_prefill_batch()
     // single-lane prefill chunk's own causal_conv1d_silu_split per row, so a rectangle needs only
     // the rows' own state slots and no slot-span planning, and the row's final conv state lands
     // in its destination slot where the fork settle expects it.
+
+    // The pass holds its own execution units (13.4c item 2). The engine dispatches it between
+    // the single-lane turn reservations, so a row whose interior unit settled - every tail chunk
+    // of a multi-chunk prompt - holds neither a permit nor growth, and mapping it would demand
+    // pages nobody reserved. Reserving Prefill units for the selected rows here gives each one a
+    // permit whose frontier covers exactly the columns the pass will execute, through the same
+    // reserve_units the single-lane turn uses; the rows settle at the bottom of the pass. A
+    // page shortage refuses the whole rectangle and leaves the rows queued, because the
+    // single-lane path reclaims and retries per lane.
+    std::array<SequenceHandle, kMaximumConcurrency> unit_sequences{};
+    std::array<ExecutionUnit, kMaximumConcurrency> units{};
+    for (std::size_t b = 0; b < batch; ++b) {
+        unit_sequences[b]      = sequence_handle(rows[selected[b]].lane);
+        units[b]               = ExecutionUnit{unit_sequences[b], ExecutionUnitKind::Prefill, 0};
+    }
+    const auto reservation =
+        reserve_units(std::span<const ExecutionUnit>(units.data(), batch));
+    if (!reservation.reserved) {
+        reject("reserve", reservation.shortage.main_kv_pages,
+               reservation.shortage.backend_kv_pages);
+        return std::nullopt;
+    }
 
     const std::int32_t width =
         models::qwen3_5::execution::prefill_class_for(static_cast<std::int32_t>(widest));
@@ -561,6 +568,11 @@ std::optional<Program::MergedPrefillResult> ProgramImpl::advance_prefill_batch()
                      width, static_cast<std::size_t>(width) * batch, result.count);
         std::fflush(stderr);
     }
+    // The pass held its own execution units: release them now, exactly as the engine's
+    // single-lane cycle releases its turn's units. Settling is valid for both a continuing row
+    // (its growth hands back to the committed frontier) and a finished one (the frontier is the
+    // whole prompt); either way the lane's next unit reserves through the normal path again.
+    for (std::size_t b = 0; b < batch; ++b) { settle_unit(rows[selected[b]].lane); }
     return result;
 }
 runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
