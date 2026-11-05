@@ -158,8 +158,10 @@ std::mutex& profile_mutex() {
     return mutex;
 }
 std::map<std::uint32_t, const std::vector<float>*>& profile_registry() {
-    static std::map<std::uint32_t, const std::vector<float>*> registry;
-    return registry;
+    // Intentionally never destroyed, like the request-boundary list above: entries are deregistered
+    // by ~ExpertStream(), which may itself run during static teardown.
+    static auto* registry = new std::map<std::uint32_t, const std::vector<float>*>();
+    return *registry;
 }
 void dump_profiles() {
     const char* path = std::getenv("NINFER_EXPERT_PROFILE_DUMP");
@@ -197,15 +199,18 @@ void register_profile_dump(std::uint32_t bank, const std::vector<float>* scores)
 
 } // namespace
 
-// The request boundary (see the declaration in the header). Registration is process-lifetime:
-// the streams live inside the loaded model's parameters and are never moved or destroyed while the
-// engine runs, so attach() may add and nothing needs to remove. The mutex exists because the
-// boundary fires from the request path while a second model could be loading on another thread.
+// The request boundary (see the declaration in the header). attach() registers a stream here and
+// ~ExpertStream() removes it again: the registry must only ever hold live streams, because a
+// process that tears one Engine down and builds the next (a test, a serving reload) would
+// otherwise leave freed streams in the list. The mutex exists because the boundary fires from
+// the request path while a second model could be loading on another thread. The list itself is
+// intentionally never destroyed: a deregistration during static teardown must not touch a
+// vector that already died.
 namespace {
 std::mutex g_request_boundary_mutex;
 std::vector<ExpertStream*>& request_boundary_streams() {
-    static std::vector<ExpertStream*> streams;
-    return streams;
+    static auto* streams = new std::vector<ExpertStream*>();
+    return *streams;
 }
 } // namespace
 
@@ -320,6 +325,36 @@ ExpertStream::ExpertStream(std::uint32_t count, WeightBankLayout gate_up, Weight
         const char* value = std::getenv("NINFER_FREEZE_THAW_REQUEST");
         return value != nullptr && value[0] != '\0' && value[0] != '0';
     }();
+}
+
+ExpertStream::~ExpertStream() {
+    // port (sm_89): both process-wide registries hold raw pointers into this object, and the old
+    // "registration is process-lifetime" assumption behind them is only true for a process that
+    // never tears an Engine down. ninfer_qwen3_5_dflash_real_test builds a Vision Engine, destroys
+    // it, then builds the next one; the destroyed Engine's streams stayed registered, and the
+    // next Engine's first admitted request walked them: note_expert_request_begin() called
+    // note_request_begin() on freed memory, where the reused bytes made every thaw() guard read
+    // as true, and static_member_.assign() then wrote into and freed a stale heap block - c0000374
+    // at the next free (RTX 4090, cdb: note_expert_request_begin+0x116 -> vector<uint8_t>::assign
+    // -> free_base). Unregister here so a registry only ever holds streams that are still alive.
+    if (boundary_registered_) {
+        std::lock_guard<std::mutex> guard(g_request_boundary_mutex);
+        auto& streams = request_boundary_streams();
+        const auto it = std::find(streams.begin(), streams.end(), this);
+        if (it != streams.end()) { streams.erase(it); }
+        boundary_registered_ = false;
+    }
+    // The profile rows are borrowed from the live streams too, and the registry is keyed by bank:
+    // a second Engine reuses bank numbers, so only drop entries that point at THIS stream's row.
+    std::lock_guard<std::mutex> guard(profile_mutex());
+    auto& registry = profile_registry();
+    for (auto it = registry.begin(); it != registry.end();) {
+        if (it->second == &hot_score_) {
+            it = registry.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 void ExpertStream::attach_host(std::shared_ptr<HostExpertResidency> host) noexcept {

@@ -32,6 +32,12 @@ public:
                  WeightGeometry gate_up_parent, WeightGeometry down_parent,
                  std::vector<std::uint64_t> gate_up_objects, std::vector<std::uint64_t> down_objects);
 
+    // Unregisters this stream from the process-wide request-boundary and profile registries. Both
+    // hold raw pointers into this object, so a stream that dies without unregistering leaves them
+    // dangling - and a second Engine built in the same process then walks freed memory on its first
+    // request (see ~ExpertStream in the .cpp).
+    ~ExpertStream();
+
     // Startup-only. `entry` is the cache's per-entry plane layout for this bank.
     void attach(ExpertCache& cache, std::uint32_t bank, const ExpertBankLayout& entry);
 
