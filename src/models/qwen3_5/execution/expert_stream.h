@@ -267,6 +267,11 @@ public:
     void thaw();
     [[nodiscard]] bool frozen() const noexcept { return frozen_; }
     [[nodiscard]] bool freeze_mode() const noexcept { return freeze_mode_; }
+    // v8 9.2 row 3: whether ANY freeze mechanism is armed on this stream - the host-freeze mode or
+    // the measured rule (NINFER_FREEZE_RULE / the old NINFER_FREEZE_ON_NO_MISS name). The
+    // controller uses this to mark its freeze actuator live and mirror the real state instead of
+    // reporting a shadow decision next to a mechanism that is actually deciding.
+    [[nodiscard]] bool freeze_armed() const noexcept;
     // The layer can run without `fetch_host_routed`: the frozen device set plus S cover the bank and
     // the table of that placement is on the Device. ffn reads this once per layer; it is the only
     // place the ~0.5 ms read-back can be removed.

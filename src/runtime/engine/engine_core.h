@@ -12,6 +12,8 @@
 #include "runtime/engine/scheduler.h"
 #include "runtime/engine/generation_budget.h"
 #include "models/qwen3_5/execution/shape_class.h"
+#include "models/qwen3_5/execution/expert_path_control.h"
+#include "models/qwen3_5/execution/param_bus.h"
 
 #include <algorithm>
 #include <array>
@@ -110,6 +112,7 @@ public:
           max_concurrency_(options.max_concurrency),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
+          active_concurrency_(options.max_concurrency),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
           resources_(options.context_cache.enabled, std::move(context_cost),
                      options.checkpoint_cache) {
@@ -1456,8 +1459,41 @@ private:
         }
     }
 
+    // v8 9.3: the lane limit in force - the controller may hold it below the configured maximum.
+    [[nodiscard]] std::uint32_t effective_concurrency() const noexcept {
+        const std::uint32_t active = active_concurrency_.load(std::memory_order_acquire);
+        return active < max_concurrency_ ? active : max_concurrency_;
+    }
+
+    // The bus's accepted executor for "concurrency" (v8 12.2). The bounds are the configured
+    // maximum: the engine never admits beyond what its buffers were sized for, and never below
+    // one lane. The step from one value to the next costs nothing - it takes effect at the next
+    // admission decision, so cost_ms=0 in the spec.
+    bool apply_active_concurrency(double value) {
+        const auto lanes = static_cast<std::uint32_t>(value);
+        if (lanes < 1U || lanes > max_concurrency_) {
+            std::fprintf(stderr, "[ctl] engine concurrency refused: %u outside [1,%u]\n", lanes,
+                         max_concurrency_);
+            std::fflush(stderr);
+            return false;
+        }
+        const std::uint32_t previous =
+            active_concurrency_.exchange(lanes, std::memory_order_acq_rel);
+        if (previous != lanes) {
+            std::fprintf(stderr, "[ctl] engine concurrency: %u -> %u (controller)\n", previous,
+                         lanes);
+            std::fflush(stderr);
+        }
+        return true;
+    }
+
     [[nodiscard]] std::optional<std::uint32_t> free_lane() const noexcept {
-        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+        // v8 9.3: admission is bounded by the ACTIVE limit - the controller may have serialized
+        // serving. Lanes above the limit stay allocated (in-flight requests there keep draining
+        // to completion; the round/prefill membership still scans every configured lane), but no
+        // new request is admitted into one.
+        const std::uint32_t limit = effective_concurrency();
+        for (std::uint32_t lane = 0; lane < limit; ++lane) {
             if (!slots_[lane] && (!materializing_ || materializing_->destination.value != lane)) {
                 return lane;
             }
@@ -2348,6 +2384,16 @@ private:
     }
 
     void worker_loop() noexcept {
+        // v8 9.3 + 12.2: register this engine's concurrency executor on the parameter bus. The bus
+        // is thread-local, and this worker thread is the thread that both runs the model (whose
+        // PolicyController decides) and schedules lanes (whose count is the parameter), so the
+        // registration and every later write are race-free by construction. Until this runs, the
+        // concurrency actuator stays shadow - which is exactly right for every caller that is
+        // not this engine (the single-threaded CLI, perplexity, tests).
+        models::qwen3_5::execution::param_bus().attach_applier(
+            "concurrency", max_concurrency_, 1.0, static_cast<double>(max_concurrency_),
+            [this](double value) { return apply_active_concurrency(value); });
+        models::qwen3_5::execution::param_bus().note_value("lanes", max_concurrency_);
         for (;;) {
             {
                 std::unique_lock lock(queue_mutex_);
@@ -2366,6 +2412,17 @@ private:
             std::unique_lock execution_lock(execution_mutex_);
             bool executed = false;
             try {
+                // v8 9.3: the serial rule is judged on the lanes actually in service, not the
+                // configured ceiling - serializing one busy lane is a no-op. One observation per
+                // scheduling pass; the model code running later in this pass reads the previous
+                // pass's count, which is the freshest input available at decision time.
+                {
+                    std::uint32_t busy_lanes = materializing_ ? 1U : 0U;
+                    for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                        if (slots_[lane]) { ++busy_lanes; }
+                    }
+                    models::qwen3_5::execution::policy_controller().observe_lanes(busy_lanes);
+                }
                 set_host_work_class(HostWorkClass::Control);
                 auto boundary = begin_host_phase();
                 (void)expire_pending_requests();
@@ -2511,6 +2568,9 @@ private:
                 finish_engine_phase(boundary, EngineHostPhase::Boundary);
                 if (!controls.empty()) {
                     set_host_work_class(HostWorkClass::Control);
+                    // v8 9.3: control rounds are decode-family work for the serial rule's
+                    // purposes (spec-decode tokens, one layer pass = one token).
+                    models::qwen3_5::execution::policy_controller().observe_prefill(false);
                     run_control_batch(controls);
                     executed = true;
                 }
@@ -2536,6 +2596,10 @@ private:
                 if (!decode.empty()) {
                     maybe_cycle_expert_pool();
                     set_host_work_class(HostWorkClass::Decode, decode.lane_span());
+                    // v8 9.3: the serial rule is decided and verified on decode measurements
+                    // only; a prefill layer pass carries a whole chunk and its interval reads as
+                    // a fraction-of-a-token tps. This is the decode dispatch's own marker.
+                    models::qwen3_5::execution::policy_controller().observe_prefill(false);
                     run_decode_round(decode, cancelled);
                     executed = true;
                 }
@@ -2660,6 +2724,9 @@ private:
                     // it just chose not to do.
                     executed = true;
                 } else if (const auto lane = scheduler_.next_prefill(prefill_slots, max_concurrency_)) {
+                    // v8 9.3: prefill/replay dispatch - the layers this pass runs are prefill
+                    // layers, whatever the serial rule thinks of the traffic.
+                    models::qwen3_5::execution::policy_controller().observe_prefill(true);
                     const auto request = slots_[*lane];
                     set_host_work_class(HostWorkClass::Prefill);
                     if (request->is_replaying()) {
@@ -2708,6 +2775,12 @@ private:
     const std::uint32_t max_context_;
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
+    // v8 9.3/12.2: the controller-owned lane limit. The buffers above stay sized for
+    // max_concurrency_ forever - shrinking is an admission decision, never a reallocation - so
+    // the only writers are the worker thread itself (bus applier) and the only reader is the
+    // scheduling code on the same thread; the atomic is for the public setter's contract, not
+    // for contention.
+    std::atomic<std::uint32_t> active_concurrency_;
     const std::chrono::milliseconds pending_timeout_;
     ResourceManagement resources_;
 

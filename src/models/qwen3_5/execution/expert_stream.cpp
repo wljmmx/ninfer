@@ -978,6 +978,13 @@ ExpertStream::FreezePolicy ExpertStream::freeze_policy() const noexcept {
     return FreezePolicy{freeze_after_, freeze_refresh_, thaw_on_request_};
 }
 
+bool ExpertStream::freeze_armed() const noexcept {
+    // freeze_mode_ is NINFER_HOST_FREEZE (the mode installs its own set on a clock); the rule is
+    // the Q11/Q12 measured freeze (NINFER_FREEZE_RULE, or the old switch name). Either way the
+    // freeze decision is live in this stream, and the controller should say so.
+    return freeze_mode_ || freeze_rule_enabled();
+}
+
 void ExpertStream::note_request_begin() {
     if (thaw_on_request_) { thaw(); }
 }

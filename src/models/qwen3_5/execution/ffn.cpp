@@ -1633,11 +1633,25 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
             // `wired` is "there is a queue to control": without NINFER_PREFETCH no residency attaches
             // and the actuator stays in shadow, which keeps [ctl] honest about what is real.
             const bool pf_attached = ExpertPrefetchQueue::instance().users() > 0;
-            control.step(false, pf_attached, false, false);
+            // v8 9.2 row 3: with the freeze mechanism armed (rule or mode) the stream owns the real
+            // freeze - 32 clean layers, keep only if static rose or tps held - so the controller
+            // mirrors that state and marks the actuator live instead of shadow-deciding for it.
+            const bool freeze_armed = moe.stream->freeze_armed();
+            control.observe_freeze_state(moe.stream->frozen());
+            // v8 12.2/12.4: the bus ticks before the step, so a change made at layer N is
+            // re-settable at the earliest at N+32 - one decision window between writes of the
+            // same parameter. The concurrency actuator is live exactly when the engine worker has
+            // attached its executor to the bus.
+            param_bus().tick();
+            control.step(false, pf_attached, false, freeze_armed,
+                         param_bus().has_applier("concurrency"));
             ExpertPrefetchQueue::instance().set_enabled(control.prefetch.enabled);
             // Printing stays behind the timing switch (4096 lines per 1024 tokens otherwise); the
             // decision above does not.
-            if (layer_timing) { control.report(); }
+            if (layer_timing) {
+                control.report();
+                param_bus().report();
+            }
         }
         if (all_resident) {
             // Same call as the fully resident tail: empty subset, BF16 accumulation into the
