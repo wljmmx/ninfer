@@ -835,8 +835,25 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
         // runtime instead of being pre-empted here. The A3b check stays as the net: a replay under a
         // set the tables were not published for throws rather than computing a wrong token.
         static const bool budget_opt_in = std::getenv("NINFER_GRAPH_BUDGET") != nullptr;
-        const bool graph_ok = graph_requested && (every_layer || budget_opt_in) &&
-                              std::getenv("NINFER_EXPERT_POOL_CYCLE") == nullptr;
+        bool graph_ok = graph_requested && (every_layer || budget_opt_in) &&
+                        std::getenv("NINFER_EXPERT_POOL_CYCLE") == nullptr;
+        // port (sm_89), capture guard: a pool that cannot hold every layer still streams, and
+        // on this artifact that means some layer WILL take the split path, whose host fetch
+        // waits on cudaStreamSynchronize (ffn.cpp) - an operation a capture forbids. The budget
+        // used to open the door anyway and the NINFER_GRAPH_BUDGET=1 construction died inside
+        // the warm body of the capture as CUDA_CHECK abort (cudaErrorStreamCaptureUnsupported,
+        // ffn.cpp:355), before the pool was ever pinned. Now the guard skips the capture
+        // instead: a streamed layout keeps the ordinary path, and the budget stays paid for
+        // the one tier that can actually capture (full residency). every_layer is the
+        // construction-time form of "no layer needs a host fetch": with one window per bank
+        // and the whole set preloaded, no route can miss.
+        if (graph_ok && !every_layer) {
+            std::fprintf(stderr,
+                         "[graph] skipped: layer needs host fetch (pool cannot hold every layer; "
+                         "the split path's stream sync is illegal inside a capture)\n");
+            std::fflush(stderr);
+            graph_ok = false;
+        }
         // Only a captured graph freezes the offsets, so only then is the pool off-limits to resize.
         instance->expert_pool_pinned = graph_ok;
         options.use_cuda_graph = graph_ok;
