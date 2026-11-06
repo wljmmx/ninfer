@@ -533,6 +533,11 @@ int exercise_explicit_prefix(const char* artifact) {
     request.execution.requested_output_tokens = 3;
     request.execution.sampling.temperature    = 0.0F;
     request.stop.include_model_defaults       = false;
+    // Same as the other tool-declaring fixtures: the declaration exists for the
+    // ToolBoundary prefix marker, the assertion is on KV/checkpoint semantics. Automatic
+    // keeps the unconstrained-tools shape that a non-default stop policy is legal with;
+    // the default Basic would force a grammar session and be refused at make_output_session.
+    request.tool_choice.constraints = ninfer::ToolConstraintMode::Automatic;
 
     std::string description;
     for (std::uint32_t index = 0; index < 120; ++index) { description += "stable-schema "; }
@@ -628,6 +633,13 @@ int exercise_nested_tool_markers(const char* artifact) {
     request.execution.sampling.temperature    = 0.0F;
     request.execution.allow_prefix_reuse      = true;
     request.stop.include_model_defaults       = false;
+    // The fixture declares tools so the ToolBoundary cache markers render, but what it
+    // exercises is shared-prefix checkpoint semantics, not the tool-output grammar. The
+    // default Basic constraint would force a grammar session, which make_output_session
+    // only pairs with the model-default EOS policy - refused against this fixture's
+    // non-default stop policy. Automatic constrains only strict tools; none are declared
+    // here, so the tools stay declarative and the request is legal.
+    request.tool_choice.constraints = ninfer::ToolConstraintMode::Automatic;
 
     // A single source creates both markers. Each probe changes the user suffix so the
     // private response/endpoint cannot satisfy the shared-prefix conformance check.
@@ -1102,6 +1114,15 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine) {
         result.execution.sampling.temperature    = 0.0F;
         result.execution.allow_prefix_reuse      = reuse;
         result.stop.include_model_defaults       = false;
+        // The fixture declares tools so the tool-call HISTORY renders, but what it exercises is
+        // KV/checkpoint semantics, not the tool-output grammar. The default ToolConstraintMode
+        // (Basic) forces a grammar session, and make_output_session's contract pairs grammar
+        // with the model-default EOS policy only - a non-default stop policy plus a Basic tool
+        // choice is refused there (RequestError "constraints require default EOS..."), and that
+        // refusal escapes the bare all-scenario chain as a FAST_FAIL with no output at all.
+        // Automatic constrains only strict tools, and this fixture declares none: the tools
+        // stay declarative, the stop policy stays the fixture's, and the request is legal.
+        result.tool_choice.constraints = ninfer::ToolConstraintMode::Automatic;
         return result;
     };
 
@@ -1358,6 +1379,12 @@ int exercise_rewrite_branch(const char* artifact) {
         value.execution.sampling.temperature    = 0.0F;
         value.execution.allow_prefix_reuse      = reuse;
         value.stop.include_model_defaults       = false;
+        // The lookup declaration exists so the tool-call history renders; this exercise
+        // asserts on KV/checkpoint semantics, not the tool-output grammar. Basic (the
+        // default) would force a grammar session, which make_output_session refuses to
+        // pair with a non-default stop policy - Automatic keeps the declaration
+        // unconstrained (no strict tools) and the request legal.
+        value.tool_choice.constraints = ninfer::ToolConstraintMode::Automatic;
         return value;
     };
 
@@ -2227,33 +2254,56 @@ int verify_loaded_product(const ninfer::Engine& engine) {
 } // namespace
 
 int exercise_artifact(const char* artifact) {
+    // One progress line per step: the chain runs a dozen exercises over several real
+    // engines, and a hard exit anywhere in the middle (terminate, GPU fault) otherwise
+    // leaves no trace of how far it got - the [step] trail is the first thing to read.
+    const auto step = [](const char* name) {
+        std::cerr << "[step] " << name << '\n';
+        std::fflush(stderr);
+    };
     {
+        step("engine construction");
         ninfer::EngineOptions options            = engine_options(artifact);
         options.context_cache.device_state_slots = 2;
         ninfer::Engine engine(std::move(options));
         if (const int result = verify_loaded_product(engine); result != 0) { return result; }
+        step("frontend goldens");
         if (const int result = exercise_artifact_frontend(engine); result != 0) { return result; }
+        step("stream observations");
         if (const int result = exercise_stream_observations(engine); result != 0) { return result; }
+        step("full prefill chunk");
         if (const int result = exercise_full_prefill_chunk(engine); result != 0) { return result; }
+        step("rewrite checkpoints");
         if (const int result = exercise_rewrite_checkpoints(engine); result != 0) { return result; }
+        step("prefix");
         if (const int result = exercise_prefix(engine); result != 0) { return result; }
+        step("abandoned handle capacity");
         if (const int result = exercise_abandoned_handle_capacity(engine); result != 0) {
             return result;
         }
     }
+    step("rewrite branch");
     if (const int result = exercise_rewrite_branch(artifact); result != 0) { return result; }
+    step("late instructions");
     if (const int result = exercise_late_instructions(artifact); result != 0) { return result; }
     {
+        step("vision");
         ninfer::Engine engine(engine_options(artifact));
         if (const int result = exercise_vision(engine); result != 0) { return result; }
     }
+    step("semantic captures");
     if (const int result = exercise_semantic_captures(artifact); result != 0) { return result; }
+    step("host restore");
     if (const int result = exercise_host_restore(artifact); result != 0) { return result; }
+    step("explicit prefix");
     if (const int result = exercise_explicit_prefix(artifact); result != 0) { return result; }
+    step("nested tool markers");
     if (const int result = exercise_nested_tool_markers(artifact); result != 0) { return result; }
+    step("explicit anchor branch");
     if (const int result = exercise_explicit_anchor_branch(artifact); result != 0) {
         return result;
     }
+    step("concurrent resource settlement");
     if (const int result = exercise_concurrent_resource_settlement(artifact); result != 0) {
         return result;
     }
@@ -2388,7 +2438,20 @@ int main() {
         ninfer::Engine engine(engine_options(artifact));
         result = exercise_vision(engine);
     } else if (scenario == "all") {
-        result = exercise_artifact(artifact);
+        // The whole-artifact chain used to run bare, so any escape from an exercise (a
+        // RequestError the chain is not armed for) left main() unwinding into terminate -
+        // the process died as FAST_FAIL 0xc0000409 with zero output, which reports nothing
+        // about WHICH step or WHY. Report the failure the way every other scenario already
+        // does, so the exercise chain stays diagnosable.
+        try {
+            result = exercise_artifact(artifact);
+        } catch (const std::exception& error) {
+            std::cerr << "artifact exercises failed: " << error.what() << '\n';
+            return 1;
+        } catch (...) {
+            std::cerr << "artifact exercises failed: unknown exception\n";
+            return 1;
+        }
     } else if (scenario == "concurrent") {
         result = exercise_concurrent_resource_settlement(artifact);
     } else if (scenario == "anthropic-prefix-regression") {
