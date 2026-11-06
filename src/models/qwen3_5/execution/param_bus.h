@@ -15,21 +15,53 @@
 //
 // set() is REFUSAL-CAPABLE, and that is the whole difference between a controller and a pile of
 // switches (v8 12.2): an out-of-range value, a caller without authority for the tier, a param in
-// cooldown, or a tier whose executor has not been accepted yet (L1 pool/KV/arena resize: v8
-// 13.5-5, load acceptance is another work item) all come back with a reason, and every applied
-// change lands in the ledger with the throughput before and after it.
+// cooldown, or a parameter whose executor does not exist all come back with a reason, and every
+// applied change lands in the ledger with the throughput before and after it.
 //
 // Tiers (v8 12.1):
 //   L0  frozen     model geometry; never writable.
-//   L1  slow       expert pool / KV pages / warm arena; per 30-60s, needs reallocation; REFUSED
-//                  this phase ("load acceptance pending").
+//   L1  slow       expert pool / KV pages / warm arena; per 30-60s, needs reallocation.
 //   L2  medium     concurrency / prefetch / graph / freeze family; per window (32 layers).
 //   L3  fast       hot set / spill ring / second chance / per-layer counts; per layer.
 //
-// This phase wires exactly ONE live executor through the bus: "concurrency" (v8 9.3), attached by
-// the engine's worker thread where the model code and the scheduler share one thread-local bus.
-// Everything else is readable, printable and refusable - taking over more parameters is later
-// phases (v8 12.5), and pretending otherwise would make the panel a work of fiction.
+// Phase two (v8 12.5 step 4) lifts the L1 blanket refusal for exactly one row: "expert_pool_mb"
+// now obeys the same ladder as any other parameter, because its executor - the engine worker's
+// slow dial (PolicyController::slow_pool_step) parking a target that the worker applies through
+// Engine::resize_expert_pool's idle contract - exists and is accepted. The other two L1 rows stay
+// refused, each with its own reason in the panel:
+//   kv_pages       Engine::resize_kv_pages exists, but the resize acceptance (2026-11-05) found
+//                  an open race against the boundary gauges and a degradation divergence under
+//                  load - load acceptance is still pending, so the write is refused.
+//   warm_arena_mb  no runtime path exists at all: HostExpertResidency sizes its arena once, at
+//                  construction, from the HostWarmBudget; there is nothing to hand a set() to.
+//
+// Live executors after this phase: "concurrency" (engine worker, v8 9.3), "prefetch_on" (the
+// read-ahead queue's gate, v8 9.2 row 2, attached where the queue's owner runs) and
+// "expert_pool_mb" (the slow dial above). Everything else is readable, printable and refusable -
+// taking over more parameters is later phases (v8 12.5), and pretending otherwise would make the
+// panel a work of fiction.
+//
+// Honest no-executor register (v8 section 11's seven domains, audited 2026-11-05):
+//   graph_on        the +5% (13.5-1, 43.6/43.7 vs 41.5/41.6 tok/s at 19.4 GiB) is the WHOLE-STEP
+//                   decode graph, decided at construction (ProgramImpl::use_cuda_graph is const;
+//                   the planner freezes it in model_instance.cpp graph_ok) and not flippable at
+//                   runtime: a capture body is chosen once, and the split path's fetch waits on
+//                   cudaStreamSynchronize (ffn.cpp, the NINFER_GRAPH_BUDGET=1 construction crash
+//                   the resize acceptance reproduced) which is illegal inside a capture. The
+//                   per-bank LAYER graph (NINFER_LAYER_GRAPH) is a different, runtime-flippable
+//                   mechanism with a measured ZERO gain - it is not what this row's criterion
+//                   (capt_ready==100 && static==100) was measured on, so wiring the row to it
+//                   would put a borrowed +5% on a neutral switch. graph_on therefore stays
+//                   no-executor: construction-time decision, mirrored for print only.
+//   kv_pages / warm_arena_mb   refused L1, reasons above.
+//   L3 family       hot_cap (epoch is a constructor constant), spill_slots (an env re-read, not a
+//                   setter), second_chance_slots (a construction-time budget), per_layer (a static
+//                   const read once), admit_min (no admission floor exists in the code yet) -
+//                   all startup-only, all printed as no-executor.
+//   domain 6        LMCache control (ENDPOINT/RESTORE/ASYNC_WRITE and the WAL/auto-off paths) is
+//                   entirely startup-time environment and construction wiring; there is no
+//                   runtime decision point to hand an executor, so lmcache_restore and
+//                   lmcache_async stay no-executor until one exists.
 
 #include "core/controller_mode.h"
 
@@ -90,6 +122,10 @@ struct ParamSpec {
     double rollback = 0.0;    // where to go when it made things worse
     const char* source = "";   // initial-value provenance, printed once per panel
     bool source_missing = false; // no readable initial-value source in the code today
+    // A row this phase refuses outright, with the reason set() returns for it. Used by the two
+    // L1 rows that stay locked (kv_pages: load acceptance; warm_arena_mb: no runtime path) so
+    // the panel prints the actual blocker instead of a blanket tier label.
+    ParamReject refusal = ParamReject::Ok;
 };
 
 class ParamBus {
@@ -112,11 +148,13 @@ public:
         if (index < 0) { return ParamReject::Unknown; }
         ParamSpec& spec = specs_[static_cast<std::size_t>(index)];
         if (spec.tier == ParamTier::L0) { return ParamReject::TierLocked; }
+        if (spec.refusal != ParamReject::Ok) { return spec.refusal; }
         if (spec.tier == ParamTier::L1) {
-            // v8 13.5-5: Engine::resize_expert_pool/resize_kv_pages exist but are not
-            // load-accepted under traffic, and no controller-side caller has been accepted
-            // either. L1 stays read-only until that work item closes.
-            return ParamReject::LoadAccept;
+            // v8 13.5-5, phase two: the blanket L1 refusal is lifted for rows with refusal==Ok
+            // and an executor - today that is expert_pool_mb, whose slow-dial executor the engine
+            // worker attaches (PolicyController::slow_pool_step + Engine::resize_expert_pool's
+            // idle contract). A row with no executor falls through to NoExecutor below, which is
+            // the honest answer for a caller on a thread where no engine worker ever attached.
         }
         if (!from_controller) { return ParamReject::TierLocked; }
         if (std::isnan(value) || value < spec.lo || value > spec.hi) {
@@ -150,6 +188,12 @@ public:
         if (tps <= 0.0) { return; }
         for (auto it = ledger_.rbegin(); it != ledger_.rend(); ++it) {
             if (it->tps_after >= 0.0) { break; } // only the newest open entry
+            // A flip lands ON a window boundary (the 32nd agreeing layer), so settling at that
+            // same boundary would fill tps_after with the tps the flip itself was judged on - a
+            // verification with no information in it (found by the phase-two unit tests: the
+            // prefetch flip entry settled to its own tps_before within the same layer). The
+            // entry may settle only after one full window has actually passed over it.
+            if (it->layer + kCooldownLayers > layers_) { return; }
             it->tps_after = tps;
             break;
         }
@@ -171,6 +215,13 @@ public:
     [[nodiscard]] double rollback_of(const char* name) const {
         const int index = find(name);
         return index < 0 ? std::nan("") : specs_[static_cast<std::size_t>(index)].rollback;
+    }
+
+    // The registered upper bound - the slow dial reads it so it stops at the hard edge of the
+    // range (v8 12.1: the controller may not leave the bounds) without duplicating the constant.
+    [[nodiscard]] double hi_of(const char* name) const {
+        const int index = find(name);
+        return index < 0 ? std::nan("") : specs_[static_cast<std::size_t>(index)].hi;
     }
 
     // Installs the accepted executor for a parameter and pins its real range/initial value.
@@ -284,8 +335,12 @@ private:
                        .observe = "kv-hit/evict",
                        .rollback = 0.0,
                        .source = "missing: --kv-capacity is a serve CLI value; the models "
-                                 "layer cannot read it and L1 is refused this phase anyway",
-                       .source_missing = true});
+                                 "layer cannot read it. Engine::resize_kv_pages exists but "
+                                 "the resize acceptance (2026-11-05) found an open race "
+                                 "against the boundary gauges and a degradation divergence "
+                                 "under load, so the write stays refused.",
+                       .source_missing = true,
+                       .refusal = ParamReject::LoadAccept});
         register_spec({.name = "warm_arena_mb",
                        .initial = env_number("NINFER_BUDGET_RAM_MB", -1.0),
                        .lo = 256.0,
@@ -294,7 +349,9 @@ private:
                        .cost_ms = 3000.0,
                        .observe = "ledger.ram/cold-read",
                        .rollback = env_number("NINFER_BUDGET_RAM_MB", -1.0),
-                       .source = "NINFER_BUDGET_RAM_MB"});
+                       .source = "NINFER_BUDGET_RAM_MB (arena sized once at construction; no "
+                                 "runtime path exists to hand a set() to)",
+                       .refusal = ParamReject::NoExecutor});
 
         // ---- L2: per-window. Only "concurrency" has an accepted executor this phase. ----
         register_spec({.name = "concurrency",
@@ -316,13 +373,17 @@ private:
                        .rollback = 0.0,
                        .source = "derived from --max-concurrency (in-batch lane ceiling)"});
         register_spec({.name = "prefetch_on",
-                       .initial = env_presence("NINFER_PREFETCH"),
+                       // NINFER_PREFETCH=0 attaches the queue with the gate closed (the worker
+                       // threads exist for the residency's lifetime, so the mechanism can be
+                       // observed while the switch itself starts off) - the switch form, not
+                       // mere presence, is the initial value.
+                       .initial = env_switch("NINFER_PREFETCH"),
                        .lo = 0.0,
                        .hi = 1.0,
                        .tier = ParamTier::L2,
                        .cost_ms = 0.0,
                        .observe = "useful/tps",
-                       .rollback = env_presence("NINFER_PREFETCH"),
+                       .rollback = env_switch("NINFER_PREFETCH"),
                        .source = "NINFER_PREFETCH"});
         register_spec({.name = "prefetch_slots",
                        .initial = env_number("NINFER_PREFETCH_SLOTS", 0.0),
@@ -352,14 +413,17 @@ private:
                        .initial = [] {
                            const char* value = std::getenv("NINFER_LAYER_GRAPH");
                            return value != nullptr && std::strcmp(value, "0") == 0 ? 0.0 : 1.0;
-                       }(), // default on; NINFER_LAYER_GRAPH=0 is the hard off
+                       }(), // mirrored: the CONSTRUCTION decision (graph_ok -> use_cuda_graph)
                        .lo = 0.0,
                        .hi = 1.0,
                        .tier = ParamTier::L2,
-                       .cost_ms = 0.0, // the capture cost is paid once, not per flip
+                       .cost_ms = 0.0, // the capture cost is paid once at construction
                        .observe = "tps/ens",
                        .rollback = 1.0,
-                       .source = "NINFER_LAYER_GRAPH"});
+                       .source = "no-executor: whole-step graph is construction-time "
+                                 "(ProgramImpl::use_cuda_graph is const; the split-path fetch "
+                                 "sync is illegal inside a capture) - value mirrored from "
+                                 "graph_ok by the engine worker"});
         register_spec({.name = "freeze_on",
                        .initial = std::max(env_switch("NINFER_FREEZE_RULE"),
                                            env_presence("NINFER_FREEZE_ON_NO_MISS")),
@@ -499,7 +563,7 @@ private:
     }
 
     void print_tier(ParamTier tier) const {
-        const char* label = tier == ParamTier::L1 ? "L1 ro(load acceptance pending)"
+        const char* label = tier == ParamTier::L1 ? "L1"
                           : tier == ParamTier::L2 ? "L2"
                           : tier == ParamTier::L3 ? "L3"
                                                  : "L0 frozen";
@@ -516,8 +580,9 @@ private:
             }
             std::fprintf(stderr, "[%g..%g] obs=%s", spec.lo, spec.hi, spec.observe);
             if (spec.source_missing) { std::fprintf(stderr, " src-missing"); }
-            if (tier == ParamTier::L1) {
-                // every L1 write is refused this phase; the state is the refusal reason
+            if (spec.refusal != ParamReject::Ok) {
+                // the row is refused outright; the reason IS its state on the panel
+                std::fprintf(stderr, " refused(%s)", param_reject_text(spec.refusal));
             } else if (appliers_[i]) {
                 std::fprintf(stderr, " live");
             } else if (cooldowns_[i] > 0) {

@@ -2,8 +2,10 @@
 #include "models/qwen3_5/execution/expert_path_control.h"
 #include "models/qwen3_5/execution/param_bus.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <string>
 
@@ -109,12 +111,19 @@ int main() {
         require(bus.get("no_such_param") != bus.get("no_such_param"), // NaN != NaN
                 "an unknown parameter must read as NaN, not 0");
 
-        // L1: every write is refused this phase, reason "load acceptance pending" (v8 13.5-5).
+        // L1, phase two (v8 12.5 step 4): expert_pool_mb obeys the ladder - without an executor
+        // attached on this thread the write lands as NoExecutor (the honest answer for a CLI/test
+        // caller; the engine worker is what attaches the slow-dial executor). The other two L1
+        // rows stay refused, each with its OWN reason: kv_pages is load-acceptance-pending (the
+        // API exists, the resize acceptance found an open race + divergence), warm_arena_mb has
+        // no runtime path at all (the arena is sized once at construction).
         require(bus.set("expert_pool_mb", 8192.0, /*from_controller=*/true) ==
-                    ParamReject::LoadAccept,
-                "L1 expert_pool_mb write was not refused as load-acceptance-pending");
+                     ParamReject::NoExecutor,
+                "L1 expert_pool_mb without an executor was not refused as no-executor");
         require(bus.set("kv_pages", 1.0, true) == ParamReject::LoadAccept,
-                "L1 kv_pages write was not refused");
+                "L1 kv_pages write was not refused as load-acceptance-pending");
+        require(bus.set("warm_arena_mb", 512.0, true) == ParamReject::NoExecutor,
+                "L1 warm_arena_mb write was not refused (no runtime path exists)");
         // Authority: L2/L3 belong to the controller; anyone else is refused (越权).
         require(bus.set("prefetch_slots", 8.0, /*from_controller=*/false) == ParamReject::TierLocked,
                 "a non-controller caller could write an L2 parameter");
@@ -141,6 +150,18 @@ int main() {
         require(bus.set("concurrency", 4.0, true) == ParamReject::Ok,
                 "the cooldown did not expire after one full window of ticks");
 
+        // L1 with an accepted executor: the same range/cooldown ladder as any other row.
+        bus.attach_applier("expert_pool_mb", 8192.0, 1024.0, 19456.0,
+                           [](double value) { return value >= 1024.0 && value <= 19456.0; });
+        require(bus.set("expert_pool_mb", 512.0, true) == ParamReject::Range,
+                "an L1 write below lo was not refused as out of range");
+        require(bus.set("expert_pool_mb", 8704.0, true) == ParamReject::Ok,
+                "an in-range L1 write with an accepted executor was refused");
+        require(bus.get("expert_pool_mb") == 8704.0,
+                "the L1 value did not move to what was set");
+        require(bus.set("expert_pool_mb", 8192.0, true) == ParamReject::Cooldown,
+                "a second L1 change inside one window was not refused as cooldown");
+
         // L0 geometry is never writable, by anyone.
         bus.register_spec({.name = "slot_bytes",
                           .initial = 1,
@@ -154,13 +175,19 @@ int main() {
         require(bus.set("slot_bytes", 1.0, true) == ParamReject::TierLocked,
                 "an L0 geometry write was not refused");
 
-        // record/settle: the ledger keeps (name, from, to, tps_before, tps_after).
+        // record/settle: the ledger keeps (name, from, to, tps_before, tps_after). The entry
+        // settles only after one full window has passed over it (a flip lands on a window
+        // boundary; settling that same boundary would verify the flip with its own tps).
         bus.record("concurrency", 1.0, 4.0, 50.0, -1.0);
         require(bus.ledger().back().tps_after < 0.0,
                 "a fresh ledger entry must not pretend to know tps_after");
         bus.settle_pending(55.0);
+        require(bus.ledger().back().tps_after < 0.0,
+                "an entry settled before a full window passed over it");
+        for (int i = 0; i < 32; ++i) { bus.tick(); }
+        bus.settle_pending(55.0);
         require(bus.ledger().back().tps_after == 55.0,
-                "settle_pending did not fill the newest open entry");
+                "settle_pending did not fill the newest open entry after its window");
     }
 
     // ---- want_serial: the three states of the 80% rule (v8 9.3) ----
@@ -354,6 +381,204 @@ int main() {
         c.mode = ninfer::ControllerMode::Performance;
         require(c.lambda_p99() < auto_p99 && c.lambda_miss() >= auto_miss,
                 "performance must nearly zero latency and not lower the miss weight");
+    }
+
+    // ---- prefetch: the flip goes through the bus (v8 12.2/12.4 step 4) ----
+    {
+        // A recording gate stands in for ExpertPrefetchQueue: the actuator is live exactly when
+        // the bus holds an accepted executor, and a flip must land in the ledger.
+        std::uint32_t gate_writes = 0;
+        param_bus().attach_applier(
+            "prefetch_on", 1.0, 0.0, 1.0,
+            [&gate_writes](double value) {
+                ++gate_writes;
+                return value == 0.0 || value == 1.0;
+            });
+        PolicyController c;
+        c.mode = ninfer::ControllerMode::Auto;
+        c.signals.decode_tps = 40.0;
+        c.prefetch.enabled = true;
+        c.prefetch.wired   = true;
+        c.signals.prefetch_usefulness = 0.0; // measured and dead: auto's exploration is over
+        for (int i = 0; i < 31; ++i) {
+            param_bus().tick();
+            c.step(false, /*prefetch_wired=*/true, false, false, false);
+        }
+        require(c.prefetch.enabled, "31 agreeing layers must not flip the read-ahead yet");
+        param_bus().tick();
+        c.step(false, true, false, false, false);
+        require(!c.prefetch.enabled, "the 32nd dead-usefulness layer did not close the gate");
+        require(param_bus().get("prefetch_on") == 0.0,
+                "the closed gate did not land in the bus");
+        require(gate_writes == 1U, "the flip did not reach the queue executor exactly once");
+        require(!param_bus().ledger().empty() &&
+                    std::strcmp(param_bus().ledger().back().name, "prefetch_on") == 0,
+                "the flip was not recorded in the ledger");
+        // The ledger entry carries the flip-time tps and waits for the next window to settle.
+        require(param_bus().ledger().back().tps_before == 40.0,
+                "the flip-time throughput was not recorded");
+        require(param_bus().ledger().back().tps_after < 0.0,
+                "a fresh flip entry must not pretend to know tps_after");
+    }
+
+    // ---- prefetch mode semantics: stable closes on low usefulness, the pin holds ----
+    {
+        // stable: usefulness 0.05 (< D4's 0.10 threshold) closes the gate even though auto's
+        // exploration form (>0 keeps) would have kept it.
+        param_bus().attach_applier(
+            "prefetch_on", 1.0, 0.0, 1.0, [](double) { return true; });
+        PolicyController s;
+        s.mode = ninfer::ControllerMode::Stable;
+        s.signals.decode_tps = 40.0;
+        s.prefetch.enabled = true;
+        s.prefetch.wired   = true;
+        s.signals.prefetch_usefulness = 0.05;
+        require(!s.want_prefetch(),
+                "stable must close the read-ahead below D4's threshold");
+        // auto on the same signal keeps it: only a usefulness of exactly zero argues for off.
+        PolicyController a;
+        a.mode = ninfer::ControllerMode::Auto;
+        a.prefetch.enabled = true;
+        a.signals.prefetch_usefulness = 0.05;
+        require(a.want_prefetch(), "auto closed a read-ahead that was measurably useful");
+        // Unmeasured: both explore with the gate open.
+        s.signals.prefetch_usefulness = -1.0;
+        a.signals.prefetch_usefulness = -1.0;
+        require(s.want_prefetch() && a.want_prefetch(),
+                "an unmeasured read-ahead must default open in every mode");
+    }
+
+    // ---- graph: stays shadow, and the [bus] row stays no-executor ----
+    {
+        // The +5% (13.5-1) is the construction-time whole-step graph; there is no runtime
+        // executor to attach (ProgramImpl::use_cuda_graph is const; the split path's fetch
+        // sync is illegal inside a capture), so nothing in this process may flip it - the
+        // actuator must keep reporting shadow decisions no matter how strongly the signals
+        // argue, and the bus row must refuse the write.
+        require(param_bus().set("graph_on", 0.0, /*from_controller=*/true) ==
+                    ParamReject::NoExecutor,
+                "graph_on accepted a runtime write with no executor in existence");
+        PolicyController c;
+        c.mode = ninfer::ControllerMode::Auto;
+        c.signals.capt_ready_pct = 100.0; // the structural criterion argues for capture
+        c.signals.static_pct    = 100.0;
+        require(c.want_graph(), "setup: the structural criterion must want the graph");
+        for (int i = 0; i < 64; ++i) {
+            param_bus().tick();
+            c.step(false, false, /*graph_wired=*/false, false, false);
+        }
+        require(!c.graph.wired, "the graph actuator reported itself live without an executor");
+        require(!c.graph.enabled, "a shadow actuator moved the in-force state");
+    }
+
+    // ---- the L1 slow dial: one step per period, verdict, revert, refusal (v8 12.5 step 4) ----
+    {
+        // A controllable clock: the dial's period is wall-clock, so the test drives it.
+        static std::chrono::steady_clock::time_point fake_now{};
+        const auto fake_clock = [] { return fake_now; };
+        // The executor accepts the target and lets the test decide what the engine did with
+        // it (applied-and-noted, or refused-and-noted-back).
+        double pool_now = 8192.0;
+        param_bus().attach_applier(
+            "expert_pool_mb", pool_now, 1024.0, 19456.0,
+            [&pool_now](double value) {
+                pool_now = value; // parked; the "worker" applies it by writing pool_now back
+                return true;
+            });
+
+        PolicyController c;
+        c.mode = ninfer::ControllerMode::Auto;
+        c.clock_now = fake_clock;
+        c.signals.decode_tps = 40.0;
+        c.signals.miss_per_layer = 0.5;
+        c.signals.upload_us_per_expert = 500.0; // miss_cost > 0: the dial has a reason to move
+
+        auto window = [&] {
+            for (int i = 0; i < 32; ++i) {
+                param_bus().tick();
+                c.step(false, false, false, false, false);
+            }
+        };
+
+        // First window: the dial only starts its observation clock - a cold-start window must not
+        // be the baseline a step is judged on, and no step may predate one full period.
+        window();
+        require(!c.pool_dial.in_flight && param_bus().get("expert_pool_mb") == 8192.0,
+                "the dial stepped before its observation period ran out");
+        // Second window (61 s later): the first step, 8192 -> 8704.
+        fake_now += std::chrono::seconds{61};
+        window();
+        require(c.pool_dial.in_flight && param_bus().get("expert_pool_mb") == 8704.0,
+                "the dial did not step 8192 -> 8704 after its observation period");
+        // The bus cooldown (32 layers) blocks a second step inside the same period.
+        window();
+        require(param_bus().get("expert_pool_mb") == 8704.0,
+                "the dial moved twice inside one period");
+
+        // The worker applies the step and notes the capacity back; 61 s later the verdict
+        // window runs: score improved, so the direction measured a payoff and it steps again.
+        fake_now += std::chrono::seconds{61};
+        c.signals.decode_tps = 44.0; // the pool answered more: tps and score both up
+        window();
+        require(c.pool_dial.up_paid, "a step that improved the score did not pay its direction");
+        require(param_bus().get("expert_pool_mb") == 9216.0,
+                "the paid direction did not step 8704 -> 9216");
+
+        // This step measures WORSE: revert to the last good capacity, park, and clear the
+        // direction's payoff mark (v8 12.5: only a measured direction moves again).
+        fake_now += std::chrono::seconds{61};
+        c.signals.decode_tps = 30.0; // score and tps both fell hard
+        window();
+        require(param_bus().get("expert_pool_mb") == 8704.0,
+                "a step that measured worse was not reverted");
+        require(c.pool_dial.park_windows > 0, "the revert did not park the dial");
+        require(!c.pool_dial.up_paid && c.pool_dial.falsified > 0,
+                "the falsified direction kept its payoff mark");
+        // Parked windows do not step, however much time passes.
+        const std::uint32_t parked = c.pool_dial.park_windows;
+        fake_now += std::chrono::seconds{120};
+        window();
+        require(c.pool_dial.park_windows == parked - 1,
+                "a parked window did not burn exactly one park slot");
+
+        // The idle contract refuses a parked target: the worker notes the capacity BACK, so
+        // the dial's next verdict window sees the refusal in the bus and backs off (streak).
+        c.pool_dial.park_windows = 0;
+        c.signals.decode_tps = 40.0;
+        window(); // steps 8704 -> 9216 again (the probe after the falsification)
+        require(c.pool_dial.in_flight, "setup: the post-park probe did not step");
+        param_bus().note_value("expert_pool_mb", 8704.0); // the worker's refusal, noted back
+        fake_now += std::chrono::seconds{61};
+        window();
+        require(!c.pool_dial.in_flight && c.pool_dial.refused_streak == 1 &&
+                    c.pool_dial.park_windows >= 4,
+                "a refused step did not back the dial off");
+
+        // stable: the dial never moves (the operator chose the initial value).
+        PolicyController st;
+        st.mode = ninfer::ControllerMode::Stable;
+        st.clock_now = fake_clock;
+        st.signals.decode_tps = 40.0;
+        st.signals.miss_per_layer = 0.5;
+        st.signals.upload_us_per_expert = 500.0;
+        fake_now += std::chrono::seconds{120};
+        for (int i = 0; i < 32; ++i) {
+            param_bus().tick();
+            st.step(false, false, false, false, false);
+        }
+        require(param_bus().get("expert_pool_mb") == 8704.0,
+                "stable mode let the dial move the pool");
+
+        // No misses: the pool answers everything, the score sees no pool-related cost, the
+        // dial holds (turning it can only introduce misses). A fresh dial burns its
+        // observation window first, so two windows pass: only the start, then the hold.
+        c.pool_dial = {}; // fresh dial, same bus attachment
+        c.signals.miss_per_layer = 0.0;
+        fake_now += std::chrono::seconds{120};
+        window(); // the observation window
+        window(); // and the first window after it: zero miss cost, no step
+        require(!c.pool_dial.in_flight,
+                "the dial moved with zero miss cost");
     }
 
     if (failures == 0) {

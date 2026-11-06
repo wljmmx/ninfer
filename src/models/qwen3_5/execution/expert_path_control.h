@@ -45,6 +45,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
@@ -213,8 +214,22 @@ public:
     //      Whether that is *worth* the I/O is not decided by a ratio here: drive() records the
     //      throughput the switch was flipped at and parks the actuator if the next window is 3%
     //      slower, which is the only measurement specific to this machine.
+    //
+    // Mode semantics (v8 12.2, prefetch row): stable defaults the read-ahead ON and closes it as
+    // soon as the measured usefulness sits under D4's threshold - 0.10 is not a new constant, it
+    // is the gate the plan itself measured with (Strata's read-ahead at 18 GiB, the same number
+    // the queue's min_usefulness still reports); auto/performance hold the exploration form and
+    // only a usefulness of exactly zero (nothing fetched was ever used) argues for off.
+    // NINFER_CONTROLLER_PREFETCH_OFF is the pinned-arm opt-out (the same diagnostic pattern as
+    // NINFER_CONTROLLER_SERIAL_OFF): the rule holds its current state forever, so an A/B can
+    // compare a controller-driven read-ahead against a fixed one.
     [[nodiscard]] bool want_prefetch() const {
+        static const bool pinned_off = std::getenv("NINFER_CONTROLLER_PREFETCH_OFF") != nullptr;
+        if (pinned_off) { return prefetch.enabled; } // the operator pinned the switch
         if (signals.prefetch_usefulness < 0.0) { return true; } // nothing measured yet: explore
+        if (mode == ninfer::ControllerMode::Stable) {
+            return signals.prefetch_usefulness >= 0.10; // stable: 低有用率即关 (D4's threshold)
+        }
         return signals.prefetch_usefulness > 0.0;
     }
     // Q20 / F3: this used to gate on `capturable` alone, which is a capacity statement. On an 8 GiB
@@ -229,6 +244,26 @@ public:
     // condition is now structural rather than a rate: a captured whole layer replays a table, so
     // EVERY layer has to be host-free and static, not 90% of them. 100% is the capture's validity
     // requirement; anything less means a replayed layer would read a table it was not captured with.
+    //
+    // port (sm_89), phase two - why this actuator stays SHADOW: the +5% above is the WHOLE-STEP
+    // decode graph, and that is a construction-time decision with no runtime flip path:
+    //   * ProgramImpl::use_cuda_graph is a const member, frozen by the planner in
+    //     model_instance.cpp's graph_ok (options.use_cuda_graph = graph_ok), so the object that
+    //     would receive a set() has no writable field to receive it;
+    //   * the capture body is chosen once at construction (graphs.cpp builds its plan under the
+    //     use_cuda_graph branch); "runtime on" would mean capturing a step body that was not
+    //     built to be captured;
+    //   * the split path's host fetch waits on cudaStreamSynchronize inside the step
+    //     (ffn.cpp, the line the NINFER_GRAPH_BUDGET=1 construction crash lands on), and a
+    //     synchronize inside a capture is cudaErrorStreamCaptureUnsupported - so "runtime on"
+    //     on any tier that still splits is structurally impossible, and on the only tier that
+    //     does not (19.4 GiB) the graph is already on by construction.
+    // The per-bank LAYER graph (NINFER_LAYER_GRAPH, LayerGraphs) IS runtime-flippable, but its
+    // measured gain is zero (132e2819: 96 tokens interleaved 5.63/5.61 s with the graph against
+    // 5.63/5.61 without) - wiring this actuator to it would put a borrowed +5% on a neutral
+    // switch, which is exactly the sheep's-head the honest register refuses. So the graph
+    // actuator keeps reporting what it would do and why, and the [bus] row stays no-executor
+    // with the construction decision mirrored for print.
     [[nodiscard]] bool want_graph() const {
         if (signals.capt_ready_pct >= 0.0) {
             return signals.capt_ready_pct >= 100.0 && signals.static_pct >= 100.0;
@@ -320,6 +355,189 @@ public:
                lambda_miss() * miss_cost_ms_per_token();
     }
 
+    // v8 12.5 step 4 - the L1 slow dial for the expert pool. One 512 MiB step at most per period
+    // (60 s in auto, 30 s in performance, never in stable), judged by the window score (v8 12.4
+    // step 2) with the same 3% tps guardrail drive() uses; only a direction that measured a
+    // payoff is re-tried, and a direction that measured worse is reverted and backed off
+    // exponentially. The application is deliberately indirect: bus.set parks the target with
+    // the engine worker's executor, and the worker applies it through Engine::resize_expert_
+    // pool's idle contract at its own scheduling point - a refusal there is logged and backs
+    // the dial off, never bypassed. The dial re-reads the bus each window, so a refused or
+    // clamped resize (the worker notes the real capacity back into the bus) is what the next
+    // verdict actually sees.
+    //
+    // MEASURED CEILING (2026-11-06, e2, initial 8192 MiB, 4-lane traffic): ExpertCache::resize
+    // is elastic only within the address reservation made at CONSTRUCTION (slots_max = the
+    // construction capacity, expert_cache.cpp), so a step above the construction capacity is
+    // clamped to it - and the slot alignment can even come out marginally BELOW the starting
+    // capacity (8023 -> 8021 MiB), which the verdict then correctly reads as worse and reverts.
+    // Upward crawling beyond the construction value is therefore structurally unreachable;
+    // the dial's real headroom is [lo, slots_max], and a deployment that wants the pool to
+    // reach a higher tier must reserve that tier at construction (the environment stays the
+    // initial value channel, v8 12.1). The full chain WAS exercised live: park 8535 -> idle
+    // window apply (clamped to 8021) -> ledger tps 117.9 -> 103.5 (-12%, past the 3% rail) ->
+    // revert + exponential park. Under SATURATED traffic the idle window never arrives, so a
+    // parked target simply waits - the dial does not treat "not yet" as a refusal (measured:
+    // 88.8 s of back-to-back 2-lane traffic, zero applies, no bypass).
+    struct SlowPoolDial {
+        static constexpr double kStepMb = 512.0; // v8 12.3: 1024-19456, step 512
+        double from_mb       = -1.0;   // capacity before the in-flight step
+        double score_before  = 0.0;   // window score when the step was taken
+        double tps_before    = -1.0;   // and the tps, for the shared 3% guardrail
+        bool in_flight       = false;  // a step the bus accepted, verdict pending
+        bool last_up         = false;
+        bool up_paid         = false;  // a step up measured a better window (v8 12.5: only a
+                                        // direction that measured a payoff moves again)
+        bool stepped_once    = false;
+        std::uint32_t park_windows    = 0;
+        std::uint32_t refused_streak  = 0; // consecutive steps the idle contract refused
+        std::uint32_t falsified       = 0; // consecutive steps that measured worse
+        std::chrono::steady_clock::time_point last_step{};
+        // The dial's own epoch: the FIRST step waits out the observation period too, so a
+        // cold-start window (a warming miss EWMA, an artifact still paging in) cannot be the
+        // baseline a step is judged on.
+        std::chrono::steady_clock::time_point started_at{};
+        bool started = false;
+        // Silent-return diagnostics (printed on the [ctl] pool line): the dial's guards return
+        // without a trace, so a window that never steps needs its blocker named.
+        std::uint64_t blocked_prefill = 0;
+        std::uint64_t blocked_tps = 0;
+        std::uint64_t blocked_miss = 0;
+        std::uint64_t blocked_period = 0;
+    } pool_dial;
+    // Test seam: the dial's period is wall-clock, so the no-GPU tests drive it themselves.
+    std::chrono::steady_clock::time_point (*clock_now)() = &std::chrono::steady_clock::now;
+
+    void slow_pool_step() {
+        auto& bus  = param_bus();
+        auto& dial = pool_dial;
+        if (!bus.has_applier("expert_pool_mb")) { return; } // no engine worker on this thread
+        if (mode == ninfer::ControllerMode::Stable) {
+            return; // stable: the dial is disabled, the pool keeps its initial value
+        }
+        if (signals.decode_tps <= 0.0) {
+            ++dial.blocked_tps;
+            return; // nothing measurable to judge by
+        }
+        // The same lesson the first live concurrency A/B taught (2026-11-05): a prefill layer's
+        // interval carries a whole chunk, so its tps reads 0.4-9 tok/s and its miss count is a
+        // cold-read artifact number. A step taken - or judged - inside a prefill window would
+        // freeze a garbage baseline that any later, healthy window "improves on", so the dial
+        // neither steps nor verifies there.
+        if (signals.in_prefill) {
+            ++dial.blocked_prefill;
+            return;
+        }
+        if (dial.park_windows > 0) {
+            --dial.park_windows;
+            return;
+        }
+        const double now_mb = bus.get("expert_pool_mb");
+        if (!(now_mb > 0.0)) { return; }
+        const auto now    = clock_now();
+        const auto period = mode == ninfer::ControllerMode::Performance ? std::chrono::seconds{30}
+                                                                      : std::chrono::seconds{60};
+        // The observation clock starts at the dial's first window; the first step waits out one
+        // full period on it (the cold-start rule above).
+        if (!dial.started) {
+            dial.started     = true;
+            dial.started_at  = now;
+            dial.last_step   = now;
+            dial.stepped_once = true; // gates the first step behind the same period check
+            return;
+        }
+        if (now - dial.last_step < period) {
+            ++dial.blocked_period;
+            return;
+        }
+
+        if (dial.in_flight) {
+            // Verdict on the in-flight step. The engine's idle contract may have refused it
+            // after the bus accepted it: the worker notes the pre-step capacity back into the
+            // bus, which is how the dial sees a refusal without sharing a lock with the engine.
+            if (now_mb == dial.from_mb) {
+                dial.in_flight    = false;
+                ++dial.refused_streak;
+                dial.park_windows = 4U << std::min(dial.refused_streak - 1U, 3U);
+                std::fprintf(stderr,
+                             "[ctl] pool dial %.0f MiB refused by the idle contract (streak %u, "
+                             "parking %u windows) mode=%s\n",
+                             dial.from_mb + SlowPoolDial::kStepMb, dial.refused_streak,
+                             dial.park_windows, ninfer::controller_mode_name(mode));
+                std::fflush(stderr);
+                return;
+            }
+            dial.in_flight     = false;
+            const double score_now = score();
+            const bool worse = score_now < dial.score_before ||
+                               (dial.tps_before > 0.0 &&
+                                signals.decode_tps < dial.tps_before * 0.97);
+            if (worse) {
+                // Undo the step: the same 3% rule drive() uses, judged on the score the plan
+                // names (v8 12.4). The direction measured worse, so it loses its "paid" mark
+                // and the next probe backs off exponentially.
+                const ParamReject reject =
+                    bus.set("expert_pool_mb", dial.from_mb, /*from_controller=*/true);
+                if (reject == ParamReject::Ok) {
+                    bus.record("expert_pool_mb", now_mb, dial.from_mb, signals.decode_tps, -1.0);
+                }
+                if (dial.last_up) { dial.up_paid = false; }
+                ++dial.falsified;
+                dial.park_windows = 4U << std::min(dial.falsified - 1U, 3U);
+                dial.last_step    = now;
+                std::fprintf(stderr,
+                             "[ctl] pool dial step back %.0f -> %.0f MiB (score %.1f -> %.1f, "
+                             "tps %.1f -> %.1f; park %u windows) mode=%s\n",
+                             now_mb, dial.from_mb, dial.score_before, score_now, dial.tps_before,
+                             signals.decode_tps, dial.park_windows,
+                             ninfer::controller_mode_name(mode));
+                std::fflush(stderr);
+                return;
+            }
+            // The step paid: this direction has now measured a payoff (v8 12.5).
+            dial.up_paid       = dial.up_paid || dial.last_up;
+            dial.falsified     = 0;
+            dial.refused_streak = 0;
+        }
+
+        // Direction: the only pool-related cost the score can see is misses (v8 12.4 step 3's
+        // "would moving back be better"), and the dial only moves UP on its own - a step down
+        // exists as the revert above, which is where "both directions" get their measurement.
+        // No miss cost means the pool already answers everything: turning the dial can only
+        // introduce misses, so it holds.
+        if (miss_cost_ms_per_token() <= 0.0) {
+            ++dial.blocked_miss;
+            return;
+        }
+        const double hi     = bus.hi_of("expert_pool_mb");
+        const double target = now_mb + SlowPoolDial::kStepMb;
+        if (target > hi) { return; } // the hard range edge (v8 12.1)
+        const ParamReject reject = bus.set("expert_pool_mb", target, /*from_controller=*/true);
+        if (reject != ParamReject::Ok) {
+            // The bus owns the ladder (range/cooldown/executor); a refusal parks nothing - the
+            // next window re-evaluates. Cooldown cannot fire at a 60 s cadence; this catch is
+            // for the executor being detached mid-run (engine teardown).
+            std::fprintf(stderr, "[ctl] pool dial refused by the bus: %s\n",
+                         param_reject_text(reject));
+            std::fflush(stderr);
+            return;
+        }
+        bus.record("expert_pool_mb", now_mb, target, signals.decode_tps, -1.0);
+        dial.from_mb      = now_mb;
+        dial.score_before = score();
+        dial.tps_before   = signals.decode_tps;
+        dial.in_flight    = true;
+        dial.last_up     = true;
+        dial.stepped_once = true;
+        dial.last_step    = now;
+        std::fprintf(stderr,
+                     "[ctl] pool dial up %.0f -> %.0f MiB (score %.1f, miss %.2f/layer, "
+                     "miss_cost %.3f ms/tok) mode=%s\n",
+                     now_mb, target, dial.score_before, signals.miss_per_layer,
+                     miss_cost_ms_per_token(), ninfer::controller_mode_name(mode));
+        std::fflush(stderr);
+    }
+
     void step(bool device_path_ready, bool prefetch_wired, bool graph_wired, bool freeze_wired,
               bool concurrency_wired = false) {
         ++layers;
@@ -338,7 +556,11 @@ public:
             pf_idle_layers_ = 0;
         }
         drive(expert_path, want_device_path(), device_path_ready, "path", "cost model");
-        drive(prefetch, want_prefetch(), prefetch_wired, "pf", "usefulness measured");
+        // v8 12.2/12.4 step 4: the prefetch flip is bus-mediated - ParamBus::set owns the ladder
+        // (range/cooldown/executor) and the ledger entry, so the flip is printable and refusable
+        // like every other controller write instead of a direct call into the queue.
+        drive(prefetch, want_prefetch(), prefetch_wired, "pf", "usefulness measured",
+              /*bus_name=*/"prefetch_on");
         drive(graph, want_graph(), graph_wired, "graph", "capt_ready==100 && static==100");
         drive(warm_mirror, want_warm_mirror(), true, "warm", "hit_ratio*cold>fill");
         // Freeze (v8 9.2 row 3): when the mechanism is armed the stream owns the decision, so the
@@ -356,11 +578,18 @@ public:
         }
         drive_concurrency(concurrency_wired);
         // Bus accounting: publish what the live mechanisms actually hold, and settle the last
-        // ledger entry's tps at the next window boundary (v8 12.4 step 6). freeze_on mirrors the
-        // armed SWITCH (the parameter); the frozen state is a signal and prints as freeze_real.
-        bus.note_value("prefetch_on", prefetch.enabled ? 1.0 : 0.0);
+        // ledger entry's tps at the next window boundary (v8 12.4 step 6). freeze_on mirrors
+        // the armed SWITCH (the parameter); the frozen state is a signal and prints as
+        // freeze_real. prefetch_on needs NO mirror: the queue's gate is applied synchronously by
+        // its bus executor, so the bus value is the mechanism's state by construction - a mirror
+        // here would only give a not-yet-aligned actuator a second write path.
         bus.note_value("freeze_on", freeze_wired ? 1.0 : 0.0);
-        if (layers % 32 == 0) { bus.settle_pending(signals.decode_tps); }
+        if (layers % 32 == 0) {
+            bus.settle_pending(signals.decode_tps);
+            // v8 12.5 step 4: the L1 slow dial runs on the same window beat, once per window,
+            // rate-limited by its own wall-clock period (60 s auto / 30 s performance).
+            slow_pool_step();
+        }
     }
 
     void report(bool force = false) {
@@ -418,9 +647,31 @@ public:
                      signals.freeze_active < 0.0
                          ? "n/a"
                          : (signals.freeze_active > 0.0 ? "frozen" : "streaming"));
+        // v8 12.5 step 4: the slow dial's own line - what it holds, what it is waiting for, and
+        // how many windows the idle contract has cost it. Printed every panel pass regardless of
+        // mode so a stable run says "disabled" instead of saying nothing.
+        {
+            auto& bus  = param_bus();
+            auto& dial = pool_dial;
+            const bool attached = bus.has_applier("expert_pool_mb");
+            std::fprintf(stderr,
+                         "[ctl] pool: capacity=%g MiB dial=%s in_flight=%d up_paid=%d "
+                         "park=%u refused=%u falsified=%u | miss_cost=%.3f ms/tok score=%.1f "
+                         "| windows: prefill=%llu tps=%llu period=%llu miss=%llu\n",
+                         bus.get("expert_pool_mb"),
+                         !attached                      ? "no-executor"
+                         : mode == ninfer::ControllerMode::Stable ? "stable:disabled"
+                         : dial.in_flight ? "verdict-pending"
+                                          : "idle",
+                         int(dial.in_flight), int(dial.up_paid), dial.park_windows,
+                         dial.refused_streak, dial.falsified, miss_cost_ms_per_token(), score(),
+                         static_cast<unsigned long long>(dial.blocked_prefill),
+                         static_cast<unsigned long long>(dial.blocked_tps),
+                         static_cast<unsigned long long>(dial.blocked_period),
+                         static_cast<unsigned long long>(dial.blocked_miss));
+        }
         std::fflush(stderr);
     }
-
 private:
     std::uint32_t pf_idle_layers_    = 0;
     std::uint32_t drop_revert_streak_ = 0; // consecutive refused serial probes (backoff input)
@@ -446,8 +697,11 @@ private:
 
     // One actuator's lifecycle: agree for a layer stack, then act; remember the throughput the
     // change was made at; if the next window comes back more than 3% slower, revert and park it.
+    // When bus_name is non-null the flips go through ParamBus::set (v8 12.2/12.4 step 4) - the
+    // bus owns the ladder and the ledger, a refusal leaves the in-force state untouched and the
+    // next window re-accumulates the agreement run.
     void drive(PolicyActuator& actuator, bool want, bool wired_now, const char* name,
-               const char* reason) {
+               const char* reason, const char* bus_name = nullptr) {
         if (actuator.parked_layers > 0) {
             --actuator.parked_layers;
             actuator.reason = "parked";
@@ -461,6 +715,19 @@ private:
         const bool was = actuator.enabled;
         if (actuator.baseline_tps > 0.0 && signals.decode_tps > 0.0 &&
             signals.decode_tps < actuator.baseline_tps * 0.97) {
+            if (bus_name != nullptr && actuator.wired) {
+                // Revert through the bus. The bus cooldown usually still holds from the flip
+                // being reverted (32 layers, and the tps EWMA needs ~64 to turn over anyway);
+                // the refusal keeps the old baseline so the next agreement run re-judges the
+                // same degradation against the same number instead of a moved goalpost.
+                if (flip_through_bus(actuator, name, bus_name, !actuator.enabled,
+                                     "reverted: degraded since the last flip")) {
+                    actuator.baseline_tps  = signals.decode_tps;
+                    actuator.parked_layers = 40U * 32U;
+                    actuator.reason        = "reverted";
+                }
+                return;
+            }
             actuator.enabled       = !actuator.enabled;
             actuator.agree         = 0;
             actuator.baseline_tps  = signals.decode_tps;
@@ -470,6 +737,14 @@ private:
                 print_flip(name, was, actuator.enabled, "reverted: degraded since the last flip",
                            signals.decode_tps, mode);
             }
+            return;
+        }
+        if (bus_name != nullptr && wired_now) {
+            if (flip_through_bus(actuator, name, bus_name, want, reason)) {
+                actuator.baseline_tps = signals.decode_tps;
+                actuator.reason        = reason;
+            }
+            actuator.wired = wired_now;
             return;
         }
         actuator.enabled      = want;
@@ -484,6 +759,39 @@ private:
             print_flip(name, was, actuator.enabled, reason, signals.decode_tps, mode);
         }
         actuator.wired = wired_now;
+    }
+
+    // One flip, bus-mediated: ParamBus::set owns the range check, the cooldown and the executor;
+    // the applied change lands in the ledger with the flip-time throughput and the panel gets
+    // the flip with its reason. A refusal returns false with the in-force state untouched (the
+    // caller decides what to do with its agreement run).
+    bool flip_through_bus(PolicyActuator& actuator, const char* name, const char* bus_name,
+                          bool target, const char* reason) {
+        auto& bus         = param_bus();
+        const bool was    = actuator.enabled;
+        const double from = bus.get(bus_name);
+        const double to   = target ? 1.0 : 0.0;
+        if (from == to) {
+            // The mechanism already holds the target (e.g. the bus mirror caught up first):
+            // sync the actuator to reality, print nothing, ledger nothing.
+            actuator.enabled = target;
+            actuator.agree   = 0;
+            return true;
+        }
+        const ParamReject reject = bus.set(bus_name, to, /*from_controller=*/true);
+        if (reject != ParamReject::Ok) {
+            actuator.reason = param_reject_text(reject);
+            actuator.agree  = 0;
+            std::fprintf(stderr, "[ctl] %s flip refused by the bus: %s\n", name,
+                         param_reject_text(reject));
+            std::fflush(stderr);
+            return false;
+        }
+        actuator.enabled = target;
+        actuator.agree   = 0;
+        bus.record(bus_name, from, to, signals.decode_tps, -1.0);
+        print_flip(name, was, target, reason, signals.decode_tps, mode);
+        return true;
     }
 
     // The concurrency actuator's own lifecycle. It keeps the shared shape (32-agreeing-layer
