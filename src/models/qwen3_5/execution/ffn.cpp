@@ -809,6 +809,23 @@ public:
     // not that it is forbidden. NINFER_LAYER_GRAPH=0 remains the hard off for a bisect.
     void set_enabled(bool on) noexcept { enabled_ = on; }
 
+    // port (sm_89), resize safety: a captured exec bakes the offset-table addresses the kernels
+    // read, and ExpertCache::resize moves the layout (it bumps every generation and may hand
+    // segments back to the driver - expert_cache.cpp's own comment calls a stale table an
+    // illegal address waiting to happen). Dropping the captures after a resize is the only way
+    // a replay can never run against a table the pool no longer serves. Called by the engine's
+    // resize path; a later layer simply captures fresh, as it did the first time.
+    void discard_all() noexcept {
+        for (auto& bank : entries_) {
+            for (auto& entry : bank) {
+                if (entry.exec != nullptr) { (void)cudaGraphExecDestroy(entry.exec); }
+                entry.exec = nullptr;
+                entry.key  = 0;
+            }
+        }
+        evict_cursor_ = 0;
+    }
+
     // Replays the recorded work, or records it on the first call for this key.
     //
     // A bank needs more than one entry: the step's workspace rotates through a small set of buffers
@@ -1633,6 +1650,22 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
             // `wired` is "there is a queue to control": without NINFER_PREFETCH no residency attaches
             // and the actuator stays in shadow, which keeps [ctl] honest about what is real.
             const bool pf_attached = ExpertPrefetchQueue::instance().users() > 0;
+            // v8 12.2, phase two: the queue's gate becomes a bus executor. The model code runs on
+            // the engine worker thread - the same thread-local bus the worker attached its
+            // concurrency executor to - so registering here is race-free by the same argument.
+            // The initial value is what the mechanism holds (retain() gates NINFER_PREFETCH=0
+            // off before the first layer ever runs), so attaching cannot itself flip anything.
+            if (pf_attached && !param_bus().has_applier("prefetch_on")) {
+                param_bus().attach_applier(
+                    "prefetch_on", ExpertPrefetchQueue::instance().gate_open() ? 1.0 : 0.0, 0.0,
+                    1.0, [](double value) {
+                        // The accepted executor: one decision, every worker - set_enabled
+                        // already fans the gate out across the queue's workers.
+                        ExpertPrefetchQueue::instance().set_enabled(value > 0.5);
+                        return true;
+                    });
+            }
+            const bool pf_wired = param_bus().has_applier("prefetch_on");
             // v8 9.2 row 3: with the freeze mechanism armed (rule or mode) the stream owns the real
             // freeze - 32 clean layers, keep only if static rose or tps held - so the controller
             // mirrors that state and marks the actuator live instead of shadow-deciding for it.
@@ -1643,9 +1676,10 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
             // same parameter. The concurrency actuator is live exactly when the engine worker has
             // attached its executor to the bus.
             param_bus().tick();
-            control.step(false, pf_attached, false, freeze_armed,
+            control.step(false, pf_wired, false, freeze_armed,
                          param_bus().has_applier("concurrency"));
-            ExpertPrefetchQueue::instance().set_enabled(control.prefetch.enabled);
+            // The read-ahead's on/off is applied by the bus executor attached above; the direct
+            // call the first phase used is gone, so the queue's gate has exactly one writer.
             // Printing stays behind the timing switch (4096 lines per 1024 tokens otherwise); the
             // decision above does not.
             if (layer_timing) {
@@ -1919,6 +1953,11 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
 }
 
 } // namespace
+
+// port (sm_89), resize safety (ffn.h has the contract): the engine's resize path calls this
+// after a successful ExpertCache::resize. Deliberately OUTSIDE the anonymous namespaces above:
+// inside one it would have internal linkage and the engine would not link (found the hard way).
+void discard_layer_graph_captures() noexcept { LayerGraphs::instance().discard_all(); }
 
 std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t first,
                                 std::int32_t last, bool mtp) {

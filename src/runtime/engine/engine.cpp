@@ -439,51 +439,43 @@ RuntimeStats Engine::runtime_stats() const {
 
 std::uint64_t Engine::resize_expert_pool(std::uint64_t target_bytes) {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    const RuntimeStats stats = runtime_stats();
-    const std::uint64_t busy = static_cast<std::uint64_t>(stats.running_requests) +
-                               stats.prefilling_requests + stats.decode_ready_requests +
-                               stats.waiting_requests + stats.paused_requests +
-                               stats.replaying_requests + stats.materializing_requests +
-                               stats.capture_pending_requests + stats.terminal_pending_requests;
-    const bool inflight = std::visit(
-        [](const auto& core) -> bool {
+    // v8 12.5 step 4 / 13.5-5: for the generation core the idle contract (nine gauges + live
+    // try-lock, then a synchronize and a second read) lives in ONE place now -
+    // EngineCore::resize_expert_pool_checked - because the L1 slow dial's worker scheduling
+    // point walks the same code this public entry does. A second, weaker copy is exactly how a
+    // controller path would end up bypassing the acceptance the external path still obeys.
+    // The offline scoring core keeps its checks right here: it has no controller dial (its
+    // worker attaches no bus executor), so this entry is the only path it will ever see.
+    return std::visit(
+        [&](auto& core) -> std::uint64_t {
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (std::is_same_v<CoreState, std::monostate>) {
-                return false;
+                throw std::logic_error("Engine core is unavailable");
+            } else if constexpr (std::is_same_v<CoreState,
+                                               std::unique_ptr<Impl::GenerationCore>>) {
+                return core->resize_expert_pool_checked(target_bytes);
             } else {
-                return core->any_inflight();
+                const RuntimeStats stats = runtime_stats();
+                const std::uint64_t busy = static_cast<std::uint64_t>(stats.running_requests) +
+                                           stats.prefilling_requests + stats.decode_ready_requests +
+                                           stats.waiting_requests + stats.paused_requests +
+                                           stats.replaying_requests + stats.materializing_requests +
+                                           stats.capture_pending_requests +
+                                           stats.terminal_pending_requests;
+                if (busy != 0 || core->any_inflight()) {
+                    throw std::logic_error("expert pool resize requires an idle engine");
+                }
+                impl_->device.synchronize();
+                const RuntimeStats again = runtime_stats();
+                if (core->any_inflight() || again.running_requests != 0 ||
+                    again.waiting_requests != 0 || again.paused_requests != 0 ||
+                    again.prefilling_requests != 0 || again.decode_ready_requests != 0) {
+                    throw std::logic_error("expert pool resize lost its idle window");
+                }
+                return impl_->active->resize_expert_pool(target_bytes);
             }
         },
         impl_->core);
-    // 13.5 (step 5): the gauges are a boundary-consistent snapshot, and a long merged prefill
-    // publishes only at its boundary - so all nine can read zero while the batch is in flight,
-    // which is exactly the window the live queue state below closes (found by the
-    // resize-under-load acceptance on the e2 artifact: a resize that slipped through between
-    // two all-zero snapshots ran under the batch).
-    if (busy != 0 || inflight) {
-        throw std::logic_error("expert pool resize requires an idle engine");
-    }
-    // The counters are read from the scheduler, but a worker may be between a unit and the counter
-    // update. Synchronize first, then re-read: a request that started during the sync is the one
-    // this second check refuses.
-    impl_->device.synchronize();
-    const RuntimeStats again = runtime_stats();
-    const bool inflight_again = std::visit(
-        [](const auto& core) -> bool {
-            using CoreState = std::remove_cvref_t<decltype(core)>;
-            if constexpr (std::is_same_v<CoreState, std::monostate>) {
-                return false;
-            } else {
-                return core->any_inflight();
-            }
-        },
-        impl_->core);
-    if (inflight_again || again.running_requests != 0 || again.waiting_requests != 0 ||
-        again.paused_requests != 0 || again.prefilling_requests != 0 ||
-        again.decode_ready_requests != 0) {
-        throw std::logic_error("expert pool resize lost its idle window");
-    }
-    return impl_->active->resize_expert_pool(target_bytes);
 }
 
 std::uint32_t Engine::resize_kv_pages(std::uint32_t target_pages) {

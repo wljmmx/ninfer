@@ -13,6 +13,7 @@
 #include "runtime/engine/generation_budget.h"
 #include "models/qwen3_5/execution/shape_class.h"
 #include "models/qwen3_5/execution/expert_path_control.h"
+#include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/param_bus.h"
 
 #include <algorithm>
@@ -1518,6 +1519,84 @@ private:
     // parking behind a multi-second prefill. When it succeeds, the queue state is read under
     // both locks in the worker's own order.
 public:
+    // v8 12.5 step 4 + 13.5-5: THE idle contract for an expert-pool resize, in ONE place. The
+    // nine gauge counters plus the live try-lock check first, then a device synchronize and a
+    // second read - a request that started during the synchronize is the one the second check
+    // refuses (found by the resize-under-load acceptance on the e2 artifact, 2026-11-05).
+    // Engine::resize_expert_pool forwards external callers here, and the worker's own
+    // scheduling point (apply_pending_pool_resize) walks the SAME code, so there is no second,
+    // weaker copy to drift. resize_mutex_ serializes the two entry points; the queue-side race
+    // is still covered by the double read, which is the part that makes a wrong-but-atomic
+    // answer impossible.
+    [[nodiscard]] std::uint64_t resize_expert_pool_checked(std::uint64_t target_bytes) {
+        std::lock_guard serialize(resize_mutex_);
+        const RuntimeStats stats = runtime_stats();
+        const std::uint64_t busy = static_cast<std::uint64_t>(stats.running_requests) +
+                                   stats.prefilling_requests + stats.decode_ready_requests +
+                                   stats.waiting_requests + stats.paused_requests +
+                                   stats.replaying_requests + stats.materializing_requests +
+                                   stats.capture_pending_requests + stats.terminal_pending_requests;
+        if (busy != 0 || any_inflight()) {
+            throw std::logic_error("expert pool resize requires an idle engine");
+        }
+        device_.synchronize();
+        const RuntimeStats again = runtime_stats();
+        if (any_inflight() || again.running_requests != 0 || again.waiting_requests != 0 ||
+            again.paused_requests != 0 || again.prefilling_requests != 0 ||
+            again.decode_ready_requests != 0) {
+            throw std::logic_error("expert pool resize lost its idle window");
+        }
+        return instance_.resize_expert_pool(target_bytes);
+    }
+
+    // The bus's accepted executor for "expert_pool_mb" (v8 12.5 step 4). It runs on the worker
+    // thread itself - the model code calling bus.set IS this thread, mid-round - so an actual
+    // resize needs an idle engine that this thread, right now, can never offer. The executor
+    // therefore only parks the target and wakes the worker's own scheduling point, which
+    // applies it through the same idle contract an external caller walks. The dial reads the
+    // capacity back from the bus, so whatever happens - applied, clamped, refused - is what
+    // the next verdict sees.
+    bool park_expert_pool_resize(double value) {
+        pending_pool_resize_mb_.store(value, std::memory_order_release);
+        {
+            // Take the lock so a worker sitting in the wait predicate cannot miss the store
+            // between its check and its sleep (the notify alone would be a race).
+            std::lock_guard lock(queue_mutex_);
+        }
+        queue_cv_.notify_all();
+        return true;
+    }
+
+    // The worker's own scheduling point: apply a parked pool target while idle. Runs OUTSIDE
+    // execution_mutex_ on purpose - any_inflight()'s try-lock must be able to see the queue, and
+    // the worker must not hold the very lock the contract probes. A refusal is logged and the
+    // bus is noted back to the pre-step capacity; it is never bypassed.
+    void apply_pending_pool_resize() {
+        const double mb = pending_pool_resize_mb_.exchange(0.0, std::memory_order_acq_rel);
+        if (mb <= 0.0) { return; }
+        const auto target    = static_cast<std::uint64_t>(mb) << 20;
+        const double from_mb = static_cast<double>(instance_.expert_pool_capacity() >> 20);
+        try {
+            const auto after      = resize_expert_pool_checked(target);
+            const double after_mb = static_cast<double>(after >> 20);
+            // A moved layout invalidates every captured layer graph - the baked offset-table
+            // addresses are the exact illegal-address trap expert_cache.cpp's resize note
+            // describes - so they are dropped here and the next layer captures fresh.
+            models::qwen3_5::execution::discard_layer_graph_captures();
+            models::qwen3_5::execution::param_bus().note_value("expert_pool_mb", after_mb);
+            std::fprintf(stderr,
+                         "[ctl] expert pool %.0f -> %.0f MiB (controller slow dial, idle window)\n",
+                         from_mb, after_mb);
+            std::fflush(stderr);
+        } catch (const std::exception& error) {
+            models::qwen3_5::execution::param_bus().note_value("expert_pool_mb", from_mb);
+            std::fprintf(stderr,
+                         "[ctl] expert pool resize refused: %s (capacity stays %.0f MiB)\n",
+                         error.what(), from_mb);
+            std::fflush(stderr);
+        }
+    }
+
     [[nodiscard]] bool any_inflight() const {
         std::unique_lock execution_lock(execution_mutex_, std::try_to_lock);
         if (!execution_lock.owns_lock()) { return true; }
@@ -2424,12 +2503,36 @@ private:
             "concurrency", max_concurrency_, 1.0, static_cast<double>(max_concurrency_),
             [this](double value) { return apply_active_concurrency(value); });
         models::qwen3_5::execution::param_bus().note_value("lanes", max_concurrency_);
+        // v8 12.5 step 4: the L1 slow dial's executor. Registered on the same thread-local bus,
+        // pinned to the pool's real capacity (a model with no expert pool - dense - attaches
+        // nothing, and the dial stays honestly no-executor there). The range is v8 12.3's
+        // 1024..19456 MiB; the executor only parks a target, the worker applies it when idle.
+        const double pool_mb = static_cast<double>(instance_.expert_pool_capacity() >> 20);
+        if (pool_mb > 0.0) {
+            models::qwen3_5::execution::param_bus().attach_applier(
+                "expert_pool_mb", pool_mb, 1024.0, 19456.0,
+                [this](double value) { return park_expert_pool_resize(value); });
+            std::fprintf(stderr, "[ctl] expert pool dial attached at %.0f MiB\n", pool_mb);
+            std::fflush(stderr);
+        }
+        // The construction-time whole-step graph decision, mirrored for print (the [bus] row is
+        // no-executor by the honest register): expert_pool_pinned is set from graph_ok in
+        // model_instance.cpp, and a pinned pool is exactly the state a captured decode graph
+        // froze its offsets against.
+        models::qwen3_5::execution::param_bus().note_value(
+            "graph_on", instance_.expert_pool_pinned ? 1.0 : 0.0);
         for (;;) {
+            bool idle_for_pool_dial = false;
             {
                 std::unique_lock lock(queue_mutex_);
+                const bool pool_dial_pending =
+                    pending_pool_resize_mb_.load(std::memory_order_acquire) > 0.0;
                 if (!stopping_ && pending_.empty() && resident_empty() && paused_.empty() &&
-                    !instance_.program->has_context_transaction()) {
-                    queue_cv_.wait(lock, [&] { return stopping_ || !pending_.empty(); });
+                    !instance_.program->has_context_transaction() && !pool_dial_pending) {
+                    queue_cv_.wait(lock, [&] {
+                        return stopping_ || !pending_.empty() ||
+                               pending_pool_resize_mb_.load(std::memory_order_acquire) > 0.0;
+                    });
                 }
                 if (stopping_) {
                     lock.unlock();
@@ -2438,6 +2541,18 @@ private:
                         RequestErrorKind::Unavailable, "inference engine is shutting down")));
                     return;
                 }
+                // The idle window the slow dial needs, observed under the queue lock: nothing
+                // queued, nothing resident, nothing paused, no transaction. When this is false
+                // the parked target STAYS parked - a busy engine is not a refusal, it is a
+                // "not yet", and the dial's next window re-reads the bus either way.
+                idle_for_pool_dial =
+                    pending_.empty() && resident_empty() && paused_.empty() &&
+                    !instance_.program->has_context_transaction() &&
+                    pending_pool_resize_mb_.load(std::memory_order_acquire) > 0.0;
+            }
+            if (idle_for_pool_dial) {
+                apply_pending_pool_resize();
+                continue; // re-evaluate the queue before the next round starts
             }
             std::unique_lock execution_lock(execution_mutex_);
             bool executed = false;
@@ -2813,6 +2928,14 @@ private:
     std::atomic<std::uint32_t> active_concurrency_;
     const std::chrono::milliseconds pending_timeout_;
     ResourceManagement resources_;
+
+    // v8 12.5 step 4: the parked expert-pool target, in MiB (0 = none). Written by the bus
+    // executor from the worker thread itself (park_expert_pool_resize), read by the worker's
+    // own scheduling point between rounds; the atomic is for the notify/wait handshake, not
+    // for contention. resize_mutex_ serializes the two entry points of the idle contract
+    // (external Engine::resize_expert_pool and the worker's apply_pending_pool_resize).
+    std::atomic<double> pending_pool_resize_mb_{0.0};
+    std::mutex resize_mutex_;
 
     mutable std::mutex execution_mutex_;
     mutable std::mutex queue_mutex_;

@@ -28,4 +28,13 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
 void router_probe_save(const Tensor& residual);
 [[nodiscard]] const Tensor* router_probe_input(Device device);
 
+// port (sm_89), resize safety: destroys every captured per-bank layer graph. A captured exec
+// bakes the offset-table addresses its kernels read; ExpertCache::resize moves the pool layout
+// and hands freed segments back to the driver, so a replay against a pre-resize capture would
+// read a table the pool no longer serves (expert_cache.cpp's own note calls the stale-table
+// read an illegal address the first grouped kernel trips over). The engine's resize path calls
+// this after a successful ExpertCache::resize; the next layer captures fresh, as it did the
+// first time. Safe when no graph was captured at all (it is then a no-op).
+void discard_layer_graph_captures() noexcept;
+
 } // namespace ninfer::models::qwen3_5::execution

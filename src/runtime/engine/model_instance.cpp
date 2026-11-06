@@ -447,10 +447,18 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
         }
         // port (sm_89): the read-ahead tracks this residency from here on, so the worker exists
         // exactly as long as the tier does. Only when the switch is on: a run that never prefetches
-        // starts no thread and has none to join.
+        // starts no thread and has none to join. NINFER_PREFETCH=0 attaches the queue but starts
+        // the gate CLOSED - the environment is the initial value only (v8 12.1), and the runtime
+        // owner of the gate is the controller; an A/B arm that wants it pinned off pairs this with
+        // NINFER_CONTROLLER_PREFETCH_OFF.
         if (std::getenv("NINFER_PREFETCH") != nullptr) {
             models::qwen3_5::execution::ExpertPrefetchQueue::instance().retain();
             instance.expert_prefetch_retained = true;
+            const char* initial = std::getenv("NINFER_PREFETCH");
+            if (initial != nullptr && *initial != '\0' && std::strcmp(initial, "0") == 0) {
+                models::qwen3_5::execution::ExpertPrefetchQueue::instance().set_enabled(false);
+                std::fprintf(stderr, "[experts] read-ahead attached, gate off (NINFER_PREFETCH=0)\n");
+            }
         }
         std::fprintf(stderr, "[experts] host tier slots=%u (%u routed + %u read-ahead) slot_bytes=%llu\n",
                      residency->slot_capacity(), residency->routed_capacity(),

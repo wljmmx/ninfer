@@ -3129,7 +3129,15 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     //    it counts itself and stages nothing (that is item 4), so turning this on today changes
     //    nothing about what is resident.
     static const bool prefetch_sync  = std::getenv("NINFER_PREFETCH_SYNC") != nullptr;
-    static const bool prefetch_queue = std::getenv("NINFER_PREFETCH") != nullptr;
+    // NINFER_PREFETCH is the STARTUP half of the switch only: it decides whether a residency
+    // attaches the process-wide queue at all (model_instance.cpp retain), because the workers'
+    // lifetime is bound to the residency. The RUNTIME half is the queue's gate, which the
+    // controller owns through the parameter bus (the prefetch_on executor pushes set_enabled
+    // down into every worker). Asking the gate here means a closed read-ahead stops the offer
+    // itself - the selection and the sort below cost host time a closed gate has no use for -
+    // and a run without NINFER_PREFETCH still sees users()==0, hence gate_open()==false, hence
+    // the same zero offers as before (the panel's usefulness simply never starts measuring).
+    const bool prefetch_queue = ExpertPrefetchQueue::instance().gate_open();
     if ((prefetch_sync || prefetch_queue) && host_ != nullptr) {
         // Q30/P6: how many experts one read-ahead asks for.
         //
