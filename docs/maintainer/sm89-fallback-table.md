@@ -246,3 +246,116 @@ current `#else` fallback: `S0` (`mma`)
 | (512, inf] | `Bf16ScheduleInstance< Bf16A16TmaMmaSchedule<96, 64, 64, 48, 32, 2, 2, Bf16MmaRaster::TokenFast, 1, 9>, 4608>` | `Bf16ScheduleInstance< Bf16A16MmaSchedule<96, 64, 64, 48, 32, 2, 2, Cache::cg, Cache::cg, Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast, Bf16MmaSwizzle::Xor64, 1>, 4608>` |
 
 current `#else` fallback: `S5` (`mma`)
+
+## T004 初稿：上游新增 bf16 形状的 sm_89 fallback（待 T016 复核/实测）
+
+> 范围：`upstream/master`（a754fcf3）中**本地树尚无同名 shape**、且不在 T001 判死组
+> （`*/dgx_spark/*`，本次排除 22 个 dgx_spark bf16 梯度）里的 bf16 TMA 梯度：
+> `linear/add/bf16` ×1、`linear/split/bf16/rtx5090` ×3、`linear/split/bf16` 共享 ×1，
+> 共 5 个 shape / 20 行。映射规则同上，仅换生产者 swizzle（Tma128→Xor64）并丢掉
+> ConsumerKUnroll；**未编译、未实测**，行内 token 区间只表达上游的分档意图。
+>
+> 生成命令：
+> `python tools/port/gen_bf16_fallback_table.py --shapes <upstream>/src/ops/linear --recursive
+> --instances <upstream>/src/ops/linear/kernels/bf16/bf16_instances.cuh --draft
+> --only split/bf16/rtx5090 --only split/bf16/shapes/ --only add/bf16`
+>
+> 上游这批文件没有 `#if defined(NINFER_ENABLE_TMA)`（上游只按目录/目标选编译单元），搬入时
+> 需先补门控，`#else` 分支按本表落 cp.async 回退，再由 T016 实测确认/修正。
+>
+> 新增入口 `--recursive`（遍历 shapes/）、`--instances`（解析 `Bf16A16TmaR64T64K64S3` 这类别名）、
+> `--only`（路径过滤）、`--draft`（只出 banner + 梯度表），默认输出与旧版逐字一致。
+
+### `n5120_k6144.cu` — `linear/add/bf16`
+
+`src/ops/linear/add/bf16/shapes/n5120_k6144.cu`
+
+| token range | TMA instance (sm_120a) | Ada fallback (sm_89) |
+|---|---|---|
+| (64, 96] | `Bf16A16TmaMmaSchedule<64, 32, 64, 32, 16, 3>` | `Bf16A16MmaSchedule<64, 32, 64, 32, 16, 3, Cache::cg, Cache::cg, Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast, Bf16MmaSwizzle::Xor64, 1>` |
+| (96, 128] | `Bf16A16TmaMmaSchedule<64, 64, 128, 32, 32, 2>` | `Bf16A16MmaSchedule<64, 64, 128, 32, 32, 2, Cache::cg, Cache::cg, Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast, Bf16MmaSwizzle::Xor64, 1>` |
+| (128, 256] | `Bf16A16TmaMmaSchedule<64, 64, 64, 32, 32, 3>` | `Bf16A16MmaSchedule<64, 64, 64, 32, 32, 3, Cache::cg, Cache::cg, Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast, Bf16MmaSwizzle::Xor64, 1>` |
+| (256, inf] | `Bf16A16TmaMmaSchedule<64, 128, 64, 32, 32, 2>` | `Bf16A16MmaSchedule<64, 128, 64, 32, 32, 2, Cache::cg, Cache::cg, Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast, Bf16MmaSwizzle::Xor64, 1>` |
+
+current `#else` fallback: `None`（上游无门控，搬入时补）
+
+### `n1152_k2560.cu` — `linear/split/bf16/rtx5090`
+
+`src/ops/linear/split/bf16/rtx5090/shapes/n1152_k2560.cu`
+
+| token range | TMA instance (sm_120a) | Ada fallback (sm_89) |
+|---|---|---|
+| (128, 256] | `Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<64, 32, 64, 16, 16, 3>, 2560>` | `Bf16ScheduleInstance<Bf16A16MmaSchedule<64, 32, 64, 16, 16, 3, Cache::cg, Cache::cg, Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast, Bf16MmaSwizzle::Xor64, 1>, 2560>` |
+| (256, 512] | `Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<64, 64, 64, 32, 32, 3>, 2560>` | `Bf16ScheduleInstance<Bf16A16MmaSchedule<64, 64, 64, 32, 32, 3, Cache::cg, Cache::cg, Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast, Bf16MmaSwizzle::Xor64, 1>, 2560>` |
+| (512, 1024] | `Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<64, 128, 64, 32, 32, 2>, 2560>` | `Bf16ScheduleInstance<Bf16A16MmaSchedule<64, 128, 64, 32, 32, 2, Cache::cg, Cache::cg, Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast, Bf16MmaSwizzle::Xor64, 1>, 2560>` |
+| (1024, inf] | `Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<128, 128, 64, 64, 32, 3>, 2560>` | `Bf16ScheduleInstance<Bf16A16MmaSchedule<128, 128, 64, 64, 32, 3, Cache::cg, Cache::cg, Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast, Bf16MmaSwizzle::Xor64, 1>, 2560>` |
+
+current `#else` fallback: `None`（上游无门控，搬入时补）
+
+### `n13952_k2560.cu` — `linear/split/bf16/rtx5090`
+
+`src/ops/linear/split/bf16/rtx5090/shapes/n13952_k2560.cu`
+
+| token range | TMA instance (sm_120a) | Ada fallback (sm_89) |
+|---|---|---|
+| (48, 64] | `Bf16A16TmaMmaSchedule<128, 64, 128, 32, 32, 2, 1>` | `Bf16A16MmaSchedule<128, 64, 128, 32, 32, 2, 1, Cache::cg, Cache::cg, Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast, Bf16MmaSwizzle::Xor64, 1>` |
+| (64, 96] | `Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<128, 32, 128, 16, 16, 2, 1>, 2560>` | `Bf16ScheduleInstance<Bf16A16MmaSchedule<128, 32, 128, 16, 16, 2, 1, Cache::cg, Cache::cg, Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast, Bf16MmaSwizzle::Xor64, 1>, 2560>` |
+| (96, 128] | `Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<128, 48, 64, 32, 16, 2, 1>, 2560>` | `Bf16ScheduleInstance<Bf16A16MmaSchedule<128, 48, 64, 32, 16, 2, 1, Cache::cg, Cache::cg, Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast, Bf16MmaSwizzle::Xor64, 1>, 2560>` |
+| (128, 512] | `Bf16A16TmaMmaSchedule<64, 64, 64, 32, 32, 3, 2>` | `Bf16A16MmaSchedule<64, 64, 64, 32, 32, 3, 2, Cache::cg, Cache::cg, Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast, Bf16MmaSwizzle::Xor64, 1>` |
+| (512, inf] | `Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<64, 128, 64, 32, 32, 3, 1>, 2560>` | `Bf16ScheduleInstance<Bf16A16MmaSchedule<64, 128, 64, 32, 32, 3, 1, Cache::cg, Cache::cg, Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast, Bf16MmaSwizzle::Xor64, 1>, 2560>` |
+
+current `#else` fallback: `None`（上游无门控，搬入时补）
+
+### `n1664_k2560.cu` — `linear/split/bf16/rtx5090`
+
+`src/ops/linear/split/bf16/rtx5090/shapes/n1664_k2560.cu`
+
+| token range | TMA instance (sm_120a) | Ada fallback (sm_89) |
+|---|---|---|
+| (96, 128] | `Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<64, 32, 64, 16, 16, 3, 2>, 2560>` | `Bf16ScheduleInstance<Bf16A16MmaSchedule<64, 32, 64, 16, 16, 3, 2, Cache::cg, Cache::cg, Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast, Bf16MmaSwizzle::Xor64, 1>, 2560>` |
+| (128, 512] | `Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<128, 48, 64, 32, 16, 2, 1>, 2560>` | `Bf16ScheduleInstance<Bf16A16MmaSchedule<128, 48, 64, 32, 16, 2, 1, Cache::cg, Cache::cg, Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast, Bf16MmaSwizzle::Xor64, 1>, 2560>` |
+| (512, inf] | `Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<128, 80, 64, 32, 16, 3, 1>, 2560>` | `Bf16ScheduleInstance<Bf16A16MmaSchedule<128, 80, 64, 32, 16, 3, 1, Cache::cg, Cache::cg, Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast, Bf16MmaSwizzle::Xor64, 1>, 2560>` |
+
+current `#else` fallback: `None`（上游无门控，搬入时补）
+
+### `n14336_k5120.cu` — `linear/split/bf16`
+
+`src/ops/linear/split/bf16/shapes/n14336_k5120.cu`
+
+| token range | TMA instance (sm_120a) | Ada fallback (sm_89) |
+|---|---|---|
+| (32, 64] | `Bf16A16TmaMmaSchedule<64, 64, 64, 32, 32, 3>` | `Bf16A16MmaSchedule<64, 64, 64, 32, 32, 3, Cache::cg, Cache::cg, Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast, Bf16MmaSwizzle::Xor64, 1>` |
+| (96, 128] | `Bf16A16TmaMmaSchedule<64, 128, 64, 32, 32, 2>` | `Bf16A16MmaSchedule<64, 128, 64, 32, 32, 2, Cache::cg, Cache::cg, Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast, Bf16MmaSwizzle::Xor64, 1>` |
+| (128, 192] | `Bf16A16TmaMmaSchedule<64, 64, 64, 32, 32, 3>` | `Bf16A16MmaSchedule<64, 64, 64, 32, 32, 3, Cache::cg, Cache::cg, Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast, Bf16MmaSwizzle::Xor64, 1>` |
+| (192, inf] | `Bf16A16TmaMmaSchedule<64, 128, 64, 32, 32, 2>` | `Bf16A16MmaSchedule<64, 128, 64, 32, 32, 2, Cache::cg, Cache::cg, Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast, Bf16MmaSwizzle::Xor64, 1>` |
+
+current `#else` fallback: `None`（上游无门控，搬入时补）
+
+## T004 登记：上游新增的量化 / 新家族形状（无机械映射，待移植时实测确定）
+
+上游 305 提交把 `src/ops/**/shapes/` 重排为「按 family + n/k 拆文件」：上游 shape 文件 268 个，
+本地有同名对应 117 个，上游独有 151 个。其中带 TMA 梯度的 81 个（按调度类名统计）：非判死组
+（`*/dgx_spark/*`）13 个，另有 2 个 bf16 shape 经 `bf16_instances.cuh` 别名走 TMA（调度类名统计不到），
+合计 **15 个需要 sm_89 回退**。
+
+- 5 个 bf16（`linear/add/bf16` ×1、`linear/split/bf16/rtx5090` ×3、`linear/split/bf16` 共享 ×1）已在上一节
+  按 bf16 映射规则出初稿（20 行）。
+- 其余 10 个量化 shape 与 4 个新 kernel 家族**没有可验证的机械映射**，下表只登记处置方式，不写死精确映射。
+- `dgx_spark` 的 68 个 TMA shape 属 T001 判死组（Spark/DGX），不生成初稿。
+
+| 家族 | 上游新增（非判死） | TMA 梯度 | sm_89 回退处置 | 依据 / 备注 |
+|---|---|---|---|---|
+| `linear/add/fp8` | 2（`n5120_k6144`、`n5120_k17408`） | `Fp8A8TmaMmaSchedule` / `Fp8A8TmaSplitKSchedule` | **待移植时实测确定** | 候选规则：`Fp8A8TmaMmaSchedule : Fp8A8MmaSchedule<…>`（`kernels/fp8/fp8_schedule.cuh:175`，差别仅在 `kTmaSwizzle` / 生产者线程数），与 bf16 同构；但本表只实测过 bf16，fp8 需另行验证 |
+| `linear/split/fp8` | 2（`n14336_k5120/a8`、`n16384_k5120/a8`） | 同上 | **待移植时实测确定** | 与 add 共用 fp8 A8 调度族 |
+| `linear/swiglu/fp8` | 1（`n34816_k5120/a8`） | 同上 | **待移植时实测确定** | 同上 |
+| `linear/add/nvfp4` | 2（`n5120_k6144_tma`、`n5120_k17408_tma`） | `Nvfp4A4TmaMmaSchedule` | **待移植时实测确定（大概率不可移植）** | NVFP4 权重/张量核在 sm_89 不存在，回退只能是「去量化到 bf16/FP8 再走 cp.async 路径」，属另一条数值路径，须实测精度与性能 |
+| `linear/split/nvfp4` | 2（`n14336_k5120/a4_tma`、`n16384_k5120/a4_tma`） | 同上 | 同上 | 同上 |
+| `linear/swiglu/nvfp4` | 1（`n34816_k5120/a4_tma`） | 同上 | 同上 | 同上 |
+| `linear/{projection,split}/q8`、`q4`、`q5`、`q6` | 0 | — | 不涉及 | 上游新增的 q4/q8 TMA shape 全在 `dgx_spark`（判死）；`rtx5090` 侧无新增 TMA shape |
+| QSA（`softmax_attention/qsa`） | 42 个文件（`indexer` / `prepare` / `sparse_gqa` / `tail_extract`） | 0 | **待移植时实测确定** | 新算法家族，无 bf16 TMA 梯度，本表机制不适用；先按 sm_89 可执行性（SM89 的 ldsm/mma.sync + cp.async）逐 kernel 评估 |
+| PLE（`ops/ple`） | 7 个文件（`conv` / `gate` / `lookup` / `state_extract`） | 0 | **待移植时实测确定** | 同上，且访存形态（lookup/gather）与 linear 不同 |
+| GDN（`linear_attention/gated_delta_net`） | 97 个文件 | 11（全在 `input_conv`：fp8 ×1、nvfp4 ×3、q8-dgx ×7） | **待移植时实测确定** | `control/bf16` 的 bf16 梯度（`n64_k2048`、`n96_k5120`、rtx5090 `n96_k2560`）**不带 TMA**，故不产生本表行；带 TMA 的部分都是量化输入投影 |
+| MoE execution（`ops/moe`） | 129 个文件 | 8（7 个 `dgx_spark` + `swiglu/kernel/q8_down.cuh`、`swiglu/dispatch.h`） | **待移植时实测确定** | `topk_softmax_swiglu_moe` / `topk_softmax_route` 的 shape 目录只有 `dispatch.cpp`（无 TMA 梯度）；D2/D3 已本地落地的是 CPU 专家路径，与这些 CUDA 融合 shape 无关 |
+
+> 判定口径：只有「同族调度类继承关系可读且仅差 swizzle」才写机械映射；其余一律登记为
+> 待实测，避免在计划里写入未验证的精确类型。T016 复核时应把这些行替换为实测结论或删除。
