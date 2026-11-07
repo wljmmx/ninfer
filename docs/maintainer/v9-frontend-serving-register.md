@@ -7,6 +7,7 @@
 | 编号 | 上游提交 | 结论 | 摘要 |
 |---|---|---|---|
 | T071 | `bc70d7c8` 原生工具调用参数流 | 登记缺口 | 本地没有 `OutputEvent` / `ToolArgumentsDelta`，参数流需要先落地事件形态 |
+| T072 | `58733a86` JPEG 解码对齐 Pillow | 部分跟随 | AVIO 缓冲泄漏已跟随；JPEG 像素对齐需 libjpeg-turbo |
 
 ## T071 `bc70d7c8` — 原生工具调用参数流
 
@@ -46,3 +47,23 @@
 
 在 1–3 落地前，本地保持"终端一次性解析 + 完整调用才发布"的现状；这与上游对**完整调用**
 的语义一致，差别只在流式可见性与不完整调用的投影。
+
+## T072 `58733a86` — JPEG 解码对齐 Pillow
+
+三方比对：本地 `src/media/decode/decode.cpp` 与上游父版本同构（自建 AVIO + FFmpeg
+解码 + swscale RGB 转换 + EXIF 朝向），所以该提交的**非 JPEG 部分**可以直接跟随：
+
+- 自定义 AVIO 的 32 KiB 缓冲由 `av_malloc` 分配、`avio_alloc_context` 接管，
+  `avio_context_free` 只释放上下文、不释放该缓冲；每次 `Decoder` 析构漏 32 KiB。
+  已按上游补 `av_freep(&io_->buffer)`（`cleanup()`）。
+- `apply_orientation` 只是提取函数，无语义变化，不跟随。
+
+JPEG 部分（`decode/jpeg.cpp`、`JPEG::JPEG` 链接、Pillow 像素金标）**登记缺口**：上游把
+JPEG 从 FFmpeg 路径剥离，改用 libjpeg 解码以获得与 Pillow（libjpeg-turbo）一致的色度
+上采样与 YCbCr→RGB 取整。本地 Windows 依赖树只有 FFmpeg shared 9.0.2，没有 `jpeglib.h`，
+`deps/vcpkg` 的 libjpeg-turbo 也未安装，`find_package(JPEG)` 无法成立。
+
+前置条件：引入 libjpeg-turbo（vcpkg 或预编译前缀）、在 `cmake/Dependencies.cmake` 与
+`vcpkg.json` 登记、`src/media/CMakeLists.txt` 链 `JPEG::JPEG`，再移植 `jpeg.cpp`
+（含 CMYK/YCCK 与截断 JPEG 的 `JWRN_JPEG_EOF` 处理）和上游金标用例。在此之前本地 JPEG 仍走
+FFmpeg MJPEG，像素与 Pillow 存在色度上采样差异。

@@ -374,7 +374,12 @@ private:
         av_packet_free(&packet_);
         avcodec_free_context(&codec_);
         if (format_ != nullptr) { avformat_close_input(&format_); }
-        if (io_ != nullptr) { avio_context_free(&io_); }
+        if (io_ != nullptr) {
+            // avio_alloc_context took the av_malloc'd buffer and avio_context_free releases only
+            // the context; upstream frees the buffer here instead of leaking 32 KiB per decoder.
+            av_freep(&io_->buffer);
+            avio_context_free(&io_);
+        }
     }
 
     AVFormatContext* format_ = nullptr;
