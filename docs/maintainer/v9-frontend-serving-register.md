@@ -1,0 +1,48 @@
+<!-- v9 吸收登记：Phase 4 frontend/serving 组（T071–T074），三方比对 = 81c8ce09 / de5d4288 线 / upstream a754fcf3 -->
+# v9 吸收登记：frontend / serving
+
+本文件记录 v9 计划 Phase 4 `frontend/serving` 组里**不能整块跟随**的上游提交：三方比对结论、
+本地现状与前置条件。能跟随的条目直接进代码与测试，这里只登记缺口与核对结论。
+
+| 编号 | 上游提交 | 结论 | 摘要 |
+|---|---|---|---|
+| T071 | `bc70d7c8` 原生工具调用参数流 | 登记缺口 | 本地没有 `OutputEvent` / `ToolArgumentsDelta`，参数流需要先落地事件形态 |
+
+## T071 `bc70d7c8` — 原生工具调用参数流
+
+三方比对：
+
+- 共同基线 `81c8ce09`：输出只有 `OutputDelta{text, reasoning}`，
+  `OutputSession::commit_preview()` 返回固定两槽的 `PublishedOutput`，工具调用由
+  `ToolCallOutputDecoder` 在终端一次性解析（`feed` 只返回可发布的正文，`finish` 返回
+  `Terminal{content, tool_calls, diagnostics}`）。
+- 本地 `de5d4288`..HEAD：同一形态，另加语法约束下的工具串自动机（T068/`1ae7c9e8`），
+  但 `OutputSink::publish(OutputDelta)`、CLI `apps/cli/main.cpp` 与
+  `generation_service.cpp` 的接收器仍然只认正文。
+- 上游 `bc70d7c8`：`publish(OutputEvent)`，`OutputEvent = variant<OutputDelta,
+  ToolCallStart, ToolArgumentsDelta, ToolCallEnd>`；`ToolCallOutputDecoder::feed` 直接返回
+  `vector<OutputEvent>`，只有需要推理的参数才缓冲；参数编码在解码前选定，参数名唯一性由
+  推测前瞻/提交/回滚共享的事务式语法状态保证。
+
+结论：**不兼容，登记缺口**。本地缺少的是事件形态本身，而不是某个解析分支；按上游语义做
+"只改解析器"的局部移植会退化成另一套半流式实现。
+
+落地前置条件（按依赖顺序）：
+
+1. `include/ninfer/types.h`：`ToolCallStatus`、`ToolCallStart`、`ToolArgumentsDelta`、
+   `ToolCallEnd`、`OutputEvent`，`OutputSink::publish(OutputEvent)`；`GeneratedToolCall`
+   带 `status`，不完整调用不进入历史。
+2. `OutputSession`：`PublishedOutput` 从两槽正文数组改为 `vector<OutputEvent>`，
+   `take_tool_calls()`/`finish` 的终态校验改为与流式事件逐项对账
+   （上游 `serve/tool_stream_state.h` 提供该对账）。
+3. `tool_call_parser`：增量解析改为事件产出，参数名唯一性与 JSON 语法放进
+   `text::GrammarSession` 的事务状态（推测前瞻/提交/回滚共用），
+   `tool_grammar` 的 `basic_arguments` 改为 `StringDispatch` over 流式 raw/JSON 参数编码
+   —— 这正是 T068 已作为 vendored API 预留、但本地尚未接线的形态。
+4. `Engine` 事件环、CLI、Chat Completions / Responses / Anthropic Messages、
+   `request_log` / `operational_log` 逐层透传 `OutputEvent`；协议层各自做 wire id 与
+   不完整调用的投影。
+5. 回归：上游 `tests/test_tool_streaming.cpp`（452 行）与 decoder 单测需要同步移植。
+
+在 1–3 落地前，本地保持"终端一次性解析 + 完整调用才发布"的现状；这与上游对**完整调用**
+的语义一致，差别只在流式可见性与不完整调用的投影。
