@@ -83,6 +83,16 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
         }
     }
     if constexpr (Epilogue == RmsEpilogue::Offset) {
+        if (aligned2 && d == 10240) {
+            // The 35B-A3B projected q/k width: one CTA per row with ten pairs per lane and the
+            // gains hoisted, which removes the dynamic pair predicates of the general route.
+            rmsnorm_cta_bf16x2_kernel<Epilogue, 512, 10, true, 10240>
+                <<<static_cast<unsigned>(rows), 512, 0, stream>>>(
+                    reinterpret_cast<const __nv_bfloat162*>(x_bf16),
+                    reinterpret_cast<const __nv_bfloat162*>(w_bf16), nullptr,
+                    reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
+            return;
+        }
         if (aligned2 && d == 256) {
             // One warp per row, four rows per CTA across both query and key projections.
             constexpr int block = 128;

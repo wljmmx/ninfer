@@ -176,6 +176,17 @@ int main() {
             failures += run_case("rmsnorm QK scale/unaligned", {256, 4, 17}, offset, 2002U, scale,
                                  true, true);
         }
+    for (int rows : {1, 8, 128, 1024, 4096}) {
+        const auto label  = "rmsnorm offset10240 rows=" + std::to_string(rows);
+        const bool replay = rows == 8 || rows == 128 || rows == 1024;
+        failures += run_case(label.c_str(), {10240, 1, rows}, true, 2100U + rows, 4.f, false,
+                             replay, rows == 128 ? 16 : 0);
+    }
+    for (float scale : {0.0f, 1.e-5f, 4096.f})
+        failures += run_case("rmsnorm offset10240 scale", {10240, 1, 3}, true, 2201U, scale);
+    failures +=
+        run_case("rmsnorm offset10240 unaligned", {10240, 1, 7}, true, 2202U, 4.f, true, true);
+    failures += run_case("rmsnorm plain10240", {10240, 1, 3}, false, 2203U);
     std::cout << (failures ? "FAIL" : "OK") << " rmsnorm\n";
     return failures ? 1 : 0;
 }
