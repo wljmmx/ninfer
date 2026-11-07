@@ -220,6 +220,12 @@ void InputFile::read_exact(std::uint64_t offset, std::span<std::byte> destinatio
 #endif
 }
 
+// FILE_FLAG_NO_BUFFERING requires the file offset, the destination address and the transfer
+// length to be multiples of the volume sector size. kPayloadAlignment (4096) is a multiple of the
+// 512-byte minimum and of the 4K sectors modern volumes report, so this port keeps one constant
+// instead of upstream's per-file statx contract: the stricter value is always legal, while
+// relaxing it to 512 would fail unbuffered reads on 4K-sector media. Staging destinations are
+// cudaMallocHost/page-aligned, which satisfies the address half of the contract.
 std::size_t InputFile::read_direct(std::uint64_t offset, std::span<std::byte> destination) const {
     if (offset % kPayloadAlignment || destination.size() % kPayloadAlignment ||
         reinterpret_cast<std::uintptr_t>(destination.data()) % kPayloadAlignment ||

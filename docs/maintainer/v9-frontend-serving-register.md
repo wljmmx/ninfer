@@ -9,6 +9,7 @@
 | T071 | `bc70d7c8` 原生工具调用参数流 | 登记缺口 | 本地没有 `OutputEvent` / `ToolArgumentsDelta`，参数流需要先落地事件形态 |
 | T072 | `58733a86` JPEG 解码对齐 Pillow | 部分跟随 | AVIO 缓冲泄漏已跟随；JPEG 像素对齐需 libjpeg-turbo |
 | T073 | `4de9e425` 专用 flash next chat 模板 | 不适用 | 本地没有 Qwen4Exp 转换器，模板无人引用 |
+| T074 | `d602894a` / `4ec903a0` | 跟随 + 核对 | 布局异常安全已跟随；direct I/O 对齐按 Windows 契约核对 |
 
 ## T071 `bc70d7c8` — 原生工具调用参数流
 
@@ -79,3 +80,35 @@ Qwen4Exp 的模型规格与转换路径。
 结论：**不适用，模板单独落地是死代码**（198 行 Jinja 不会被任何转换器或启动路径引用，
 测试也无从建立）。登记为"随 Qwen4Exp 转换器一起吸收"，届时连同模板表与
 `tests/text/test_chat_templates.py` 的 flash-next 用例一并移植。
+## T074 `d602894a` / `4ec903a0` — workspace 布局与 direct I/O 对齐
+
+**`d602894a`（跟随）**：共同基线的 `WorkspaceLayoutBuilder::alloc/alloc_bytes` 先写
+`cursor_` 再做溢出检查，失败时留下半更新的 cursor/peak；本地与上游父版本逐字一致，因此
+按上游改为局部计算成功后再提交（`src/core/layout.cpp`），并在 `tests/test_arena.cpp`
+补布局用例：失败分配保持 peak、后续分配不复用对齐填充、scope 回退后 cursor 正确。
+
+**`4ec903a0`（核对，不引入 per-file 契约）**：上游把该修复建立在
+`core/io/file.h` 的 `FileView{offset_alignment, memory_alignment}` 与
+`direct_read_window()` 上，对齐来源是 Linux `statx.stx_dio_offset_align`。本地没有这层
+抽象：Windows 路径是 `artifact/file_io` 的 `FILE_FLAG_NO_BUFFERING` +
+`ReadMode::Direct`，上游的 Host 原地读（`host_destination`）本地也不存在。
+
+本地对齐参数核对（`FILE_FLAG_NO_BUFFERING` 要求文件偏移、缓冲区地址、读写长度都按卷扇区
+对齐，Windows 卷扇区为 512/4096）：
+
+| 参数 | 本地来源 | 结论 |
+|---|---|---|
+| 读偏移 | `materializer.cpp` 按 `kPayloadAlignment=4096` 下取整，块步长 `slot_bytes` 也是 4096 倍数 | 对齐 |
+| 读长度 | `align_up(remaining, 4096)`，尾部短块按 EOF 允许的短读处理 | 对齐 |
+| 缓冲区地址 | staging 槽为 `PinnedHostBuffer`（`cudaMallocHost`，页对齐）；上游的 pinned slack 用于 per-file 512 契约，本地恒 4096 不需要 | 对齐 |
+| 入口校验 | `InputFile::read_direct/begin_direct_read` 对 offset/size/address 三重 `%4096` 校验 | 一致 |
+
+结论：本地常量 4096 同时覆盖 Windows 最小扇区 512 与常见 4K 扇区，比 per-file 契约更严格，
+不需要改成按文件查询；反而不能放宽到 512，否则 4K 扇区卷上的无缓冲读会失败。该结论以注释
+写入 `artifact/file_io.cpp` 的 `read_direct` 前，防止后续把它"优化"成 per-file 对齐。
+
+验证：`ninfer_arena_test` 通过（含新增布局用例）；`ninfer_media_decode_test` 通过；全量
+`cmake --build build-win -j 4` 收敛（`-j 8` 曾遇一次瞬态 `LNK1000`，重试通过）。
+`ninfer_artifact_materialization_test` 在 MSVC 下不构建（依赖 GNU ld `--wrap`），
+`ninfer_artifact_reader_test` 的 `ios_base::failbit` 在本次改动前的 HEAD 上同样复现，
+属既有环境问题，与本次修改无关。
