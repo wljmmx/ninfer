@@ -93,6 +93,11 @@ add_subdirectory(third_party/llama-jinja EXCLUDE_FROM_ALL)
 add_subdirectory(third_party/xgrammar EXCLUDE_FROM_ALL)
 
 if(NINFER_BUILD_PRODUCT_SUPPORT)
+  add_library(ninfer::toml INTERFACE IMPORTED GLOBAL)
+  target_include_directories(ninfer::toml INTERFACE
+    ${PROJECT_SOURCE_DIR}/third_party/tomlplusplus)
+  target_compile_features(ninfer::toml INTERFACE cxx_std_17)
+
   add_library(ninfer::httplib INTERFACE IMPORTED GLOBAL)
   target_include_directories(ninfer::httplib INTERFACE
     ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
