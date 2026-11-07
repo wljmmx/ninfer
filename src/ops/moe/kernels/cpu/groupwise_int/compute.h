@@ -620,24 +620,6 @@ void compute(void* argument, const CpuWorkerContext& worker) noexcept {
                 worker.barrier();
             }
         }
-        if constexpr (!Simd::bf16_gate) {
-            const auto input_range = worker.range(hidden * columns / Simd::lanes);
-            for (auto v = input_range.begin; v < input_range.end; ++v) {
-                const auto index = v * Simd::lanes;
-                Simd::store(
-                    work.scratch.input + index,
-                    Simd::bf16(work.args.input + static_cast<std::size_t>(begin) * hidden + index));
-            }
-        }
-        if (begin != 0 || !Simd::bf16_gate) { worker.barrier(); }
-        if (work.int8_path) {
-            quantise_input<Simd>(work, worker, columns);
-            worker.barrier();
-        } else if (work.int16_path) {
-            // The int16 tier replaces the int8 quantisation pass instead of running beside it.
-            quantise_input_i16<Simd>(work, worker, columns);
-            worker.barrier();
-        }
         // port (sm_89): a split layer routes to a handful of experts, so at 16 channels per unit
         // the team gets 32 units per expert - one or two each, with a barrier on both sides.
         // Halving the unit doubles the units and lets the same team work; with eight experts the
