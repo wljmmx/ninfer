@@ -2,12 +2,15 @@
 #include "serve/request.h"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <iostream>
 #include <string>
 #include <vector>
 
-#if defined(__linux__)
+#if defined(_WIN32)
+#    include <ws2tcpip.h>
+#elif defined(__linux__)
 #    include <arpa/inet.h>
 #    include <netinet/in.h>
 #    include <netinet/tcp.h>
@@ -160,58 +163,117 @@ int test_schema_number_precision() {
     return failures;
 }
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
+#if defined(_WIN32)
+using TestSocket                    = SOCKET;
+constexpr TestSocket kInvalidSocket = INVALID_SOCKET;
+int close_test_socket(TestSocket socket) { return ::closesocket(socket); }
+#else
+using TestSocket                    = int;
+constexpr TestSocket kInvalidSocket = -1;
+int close_test_socket(TestSocket socket) { return ::close(socket); }
+#endif
+
 class Socket final {
 public:
-    explicit Socket(int descriptor = -1) : descriptor_(descriptor) {}
+    explicit Socket(TestSocket descriptor = kInvalidSocket) : descriptor_(descriptor) {}
 
     ~Socket() {
-        if (descriptor_ >= 0) { ::close(descriptor_); }
+        if (descriptor_ != kInvalidSocket) { close_test_socket(descriptor_); }
     }
 
     Socket(const Socket&)            = delete;
     Socket& operator=(const Socket&) = delete;
 
-    [[nodiscard]] int get() const noexcept { return descriptor_; }
+    [[nodiscard]] TestSocket get() const noexcept { return descriptor_; }
 
 private:
-    int descriptor_ = -1;
+    TestSocket descriptor_ = kInvalidSocket;
 };
 
 template <class T>
-bool socket_option_equals(int socket, int level, int option, T expected) {
+bool socket_option_equals(TestSocket socket, int level, int option, T expected) {
     T actual{};
+#if defined(_WIN32)
+    int size = sizeof(actual);
+    if (::getsockopt(socket, level, option, reinterpret_cast<char*>(&actual), &size) != 0) {
+        return false;
+    }
+#else
     socklen_t size = sizeof(actual);
-    return ::getsockopt(socket, level, option, &actual, &size) == 0 && size == sizeof(actual) &&
-           actual == expected;
+    if (::getsockopt(socket, level, option, &actual, &size) != 0) { return false; }
+#endif
+    return size == sizeof(actual) && actual == expected;
 }
 
-int test_inherited_socket_liveness() {
-    int failures = 0;
-    Socket listener(::socket(AF_INET, SOCK_STREAM, 0));
-    if (listener.get() < 0) { return check(false, "failed to create HTTP listener test socket"); }
-    ninfer::serve::configure_http_server_socket(listener.get());
-
+// Binds a configured listener to an ephemeral loopback port and returns the bound address.
+sockaddr_in listen_on_loopback(TestSocket listener) {
     sockaddr_in address{};
     address.sin_family      = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     address.sin_port        = 0;
-    if (::bind(listener.get(), reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0 ||
-        ::listen(listener.get(), 1) != 0) {
-        return check(false, "failed to bind HTTP listener test socket");
+    if (::bind(listener, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0 ||
+        ::listen(listener, 4) != 0) {
+        return {};
     }
-    socklen_t address_size = sizeof(address);
-    if (::getsockname(listener.get(), reinterpret_cast<sockaddr*>(&address), &address_size) != 0) {
-        return check(false, "failed to inspect HTTP listener test address");
+#if defined(_WIN32)
+    int size = sizeof(address);
+#else
+    socklen_t size = sizeof(address);
+#endif
+    if (::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &size) != 0) { return {}; }
+    return address;
+}
+
+// Completes a server-first close so the listening port carries the closed connection.
+bool leave_server_closed_connection(TestSocket listener, const sockaddr_in& address) {
+    Socket client(::socket(AF_INET, SOCK_STREAM, 0));
+    if (client.get() == kInvalidSocket ||
+        ::connect(client.get(), reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0) {
+        return false;
     }
+    Socket accepted(::accept(listener, nullptr, nullptr));
+    if (accepted.get() == kInvalidSocket) { return false; }
+    char byte = 0;
+#if defined(_WIN32)
+    const int send_flag = SD_SEND;
+#else
+    const int send_flag = SHUT_WR;
+#endif
+    return ::shutdown(accepted.get(), send_flag) == 0 && ::recv(client.get(), &byte, 1, 0) == 0 &&
+           ::shutdown(client.get(), send_flag) == 0 && ::recv(accepted.get(), &byte, 1, 0) == 0;
+}
+
+int last_socket_error() {
+#if defined(_WIN32)
+    return ::WSAGetLastError();
+#else
+    return errno;
+#endif
+}
+#endif
+
+#if defined(__linux__)
+int test_inherited_socket_liveness() {
+    int failures = 0;
+    Socket listener(::socket(AF_INET, SOCK_STREAM, 0));
+    if (listener.get() == kInvalidSocket) {
+        return check(false, "failed to create HTTP listener test socket");
+    }
+    ninfer::serve::configure_http_server_socket(listener.get());
+
+    const auto address = listen_on_loopback(listener.get());
+    if (address.sin_port == 0) { return check(false, "failed to bind HTTP listener test socket"); }
 
     Socket client(::socket(AF_INET, SOCK_STREAM, 0));
-    if (client.get() < 0 || ::connect(client.get(), reinterpret_cast<const sockaddr*>(&address),
-                                      sizeof(address)) != 0) {
+    if (client.get() == kInvalidSocket ||
+        ::connect(client.get(), reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0) {
         return check(false, "failed to connect HTTP liveness test socket");
     }
     Socket accepted(::accept(listener.get(), nullptr, nullptr));
-    if (accepted.get() < 0) { return check(false, "failed to accept HTTP liveness test socket"); }
+    if (accepted.get() == kInvalidSocket) {
+        return check(false, "failed to accept HTTP liveness test socket");
+    }
 
     failures += check(socket_option_equals(accepted.get(), SOL_SOCKET, SO_KEEPALIVE, 1),
                       "accepted HTTP socket did not inherit SO_KEEPALIVE");
@@ -226,16 +288,141 @@ int test_inherited_socket_liveness() {
         "accepted HTTP socket did not inherit TCP_USER_TIMEOUT");
     return failures;
 }
+
+using SocketSetup = void (*)(ninfer::serve::socket_t);
+
+void reuse_address_only(ninfer::serve::socket_t socket) {
+    const int enabled = 1;
+    (void)::setsockopt(socket, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
+}
+
+int test_listener_reuse() {
+    const SocketSetup configure = ninfer::serve::configure_http_server_socket;
+
+    struct Case {
+        SocketSetup previous, next;
+    };
+
+    int failures = 0;
+    for (const Case c : {Case{configure, reuse_address_only}, Case{reuse_address_only, configure},
+                         Case{configure, configure}}) {
+        sockaddr_in address{};
+        {
+            Socket listener(::socket(AF_INET, SOCK_STREAM, 0));
+            if (listener.get() == kInvalidSocket) {
+                failures += check(false, "failed to create HTTP listener test socket");
+                continue;
+            }
+            c.previous(listener.get());
+            address = listen_on_loopback(listener.get());
+            if (address.sin_port == 0 ||
+                !leave_server_closed_connection(listener.get(), address)) {
+                failures += check(false, "failed to establish a closed HTTP connection");
+                continue;
+            }
+        }
+        Socket successor(::socket(AF_INET, SOCK_STREAM, 0));
+        c.next(successor.get());
+        failures += check(
+            ::bind(successor.get(), reinterpret_cast<const sockaddr*>(&address),
+                   sizeof(address)) == 0,
+            "closed listener prevented immediate port reuse");
+    }
+    Socket listener(::socket(AF_INET, SOCK_STREAM, 0));
+    configure(listener.get());
+    const auto address = listen_on_loopback(listener.get());
+    if (address.sin_port == 0) { return failures + check(false, "failed to bind active listener"); }
+    Socket duplicate(::socket(AF_INET, SOCK_STREAM, 0));
+    configure(duplicate.get());
+    const int result =
+        ::bind(duplicate.get(), reinterpret_cast<const sockaddr*>(&address), sizeof(address));
+    failures += check(result == -1 && last_socket_error() == EADDRINUSE,
+                      "HTTP listener allowed another server to share its active port");
+    return failures;
+}
+#elif defined(_WIN32)
+int test_windows_listener_privacy() {
+    int failures = 0;
+    {
+        Socket probe(::socket(AF_INET, SOCK_STREAM, 0));
+        if (probe.get() == kInvalidSocket) {
+            return check(false, "failed to create HTTP listener test socket");
+        }
+        ninfer::serve::configure_http_server_socket(probe.get());
+        failures += check(socket_option_equals(probe.get(), SOL_SOCKET, SO_EXCLUSIVEADDRUSE, 1),
+                          "HTTP listener did not request SO_EXCLUSIVEADDRUSE");
+        failures += check(
+            !socket_option_equals(probe.get(), SOL_SOCKET, SO_REUSEADDR, 1),
+            "HTTP listener enabled SO_REUSEADDR, which lets another process take its port");
+    }
+    for (const bool closed_connection : {false, true}) {
+        sockaddr_in address{};
+        {
+            Socket listener(::socket(AF_INET, SOCK_STREAM, 0));
+            if (listener.get() == kInvalidSocket) {
+                failures += check(false, "failed to create HTTP listener test socket");
+                continue;
+            }
+            ninfer::serve::configure_http_server_socket(listener.get());
+            address = listen_on_loopback(listener.get());
+            if (address.sin_port == 0 ||
+                (closed_connection && !leave_server_closed_connection(listener.get(), address))) {
+                failures += check(false, "failed to prepare a closed HTTP listener");
+                continue;
+            }
+        }
+        Socket successor(::socket(AF_INET, SOCK_STREAM, 0));
+        ninfer::serve::configure_http_server_socket(successor.get());
+        failures += check(
+            ::bind(successor.get(), reinterpret_cast<const sockaddr*>(&address),
+                   sizeof(address)) == 0,
+            closed_connection
+                ? "closed connection prevented port reuse after listener shutdown"
+                : "closed listener prevented immediate port reuse");
+    }
+    {
+        Socket listener(::socket(AF_INET, SOCK_STREAM, 0));
+        if (listener.get() == kInvalidSocket) {
+            return failures + check(false, "failed to create HTTP listener test socket");
+        }
+        ninfer::serve::configure_http_server_socket(listener.get());
+        const auto address = listen_on_loopback(listener.get());
+        if (address.sin_port == 0) {
+            return failures + check(false, "failed to bind active listener");
+        }
+        Socket duplicate(::socket(AF_INET, SOCK_STREAM, 0));
+        const int enabled = 1;
+        (void)::setsockopt(duplicate.get(), SOL_SOCKET, SO_REUSEADDR,
+                           reinterpret_cast<const char*>(&enabled), sizeof(enabled));
+        const int result =
+            ::bind(duplicate.get(), reinterpret_cast<const sockaddr*>(&address), sizeof(address));
+        failures += check(result != 0, "HTTP listener allowed another socket to take its active port");
+    }
+    return failures;
+}
 #endif
 
 } // namespace
 
 int main() {
+#if defined(_WIN32)
+    WSADATA winsock{};
+    if (::WSAStartup(MAKEWORD(2, 2), &winsock) != 0) {
+        std::cerr << "failed to initialize Winsock\n";
+        return 1;
+    }
+#endif
     int failures = test_sse_transport() + test_sse_response_headers() +
                    test_prompt_json_member_order() + test_schema_number_precision();
 #if defined(__linux__)
     failures += test_inherited_socket_liveness();
+    failures += test_listener_reuse();
+#elif defined(_WIN32)
+    failures += test_windows_listener_privacy();
 #endif
     if (failures == 0) { std::cout << "ok\n"; }
+#if defined(_WIN32)
+    ::WSACleanup();
+#endif
     return failures == 0 ? 0 : 1;
 }

@@ -14,7 +14,12 @@
 namespace ninfer::serve {
 namespace {
 
-#if defined(__linux__)
+#if defined(_WIN32)
+// setsockopt takes a const char* on Winsock.
+void set_socket_option(socket_t socket, int level, int option, int value) noexcept {
+    (void)::setsockopt(socket, level, option, reinterpret_cast<const char*>(&value), sizeof(value));
+}
+#elif defined(__linux__)
 constexpr int kKeepAliveIdleSeconds                = 10;
 constexpr int kKeepAliveIntervalSeconds            = 3;
 constexpr int kKeepAliveProbeCount                 = 3;
@@ -82,14 +87,24 @@ bool SseTransport::poll(Clock::time_point now) {
 }
 
 void configure_http_server_socket(socket_t socket) noexcept {
-    httplib::default_socket_options(socket);
-#if defined(__linux__)
+#if defined(_WIN32)
+    // Windows SO_REUSEADDR lets any socket that sets it bind over a live listener, so it is a
+    // hijack window rather than a restart convenience. SO_EXCLUSIVEADDRUSE keeps the active port
+    // private; a measured rebind after the listener closes succeeds with it, including with a
+    // TIME_WAIT connection from the closed socket. httplib::default_socket_options() sets
+    // SO_REUSEADDR on every platform, so it must not be called here.
+    set_socket_option(socket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, 1);
+#elif defined(__linux__)
     const int enabled = 1;
+    // Reuse closed connections' addresses while keeping the active listener exclusive.
+    set_socket_option(socket, SOL_SOCKET, SO_REUSEADDR, enabled);
     set_socket_option(socket, SOL_SOCKET, SO_KEEPALIVE, enabled);
     set_socket_option(socket, IPPROTO_TCP, TCP_KEEPIDLE, kKeepAliveIdleSeconds);
     set_socket_option(socket, IPPROTO_TCP, TCP_KEEPINTVL, kKeepAliveIntervalSeconds);
     set_socket_option(socket, IPPROTO_TCP, TCP_KEEPCNT, kKeepAliveProbeCount);
     set_socket_option(socket, IPPROTO_TCP, TCP_USER_TIMEOUT, kTcpUserTimeoutMilliseconds);
+#else
+    httplib::default_socket_options(socket);
 #endif
 }
 
