@@ -213,6 +213,7 @@ void EngineCore<Instance>::record_context_work(
     cumulative_stats_.state_restores += op.state_restores;
     cumulative_stats_.pressure_spill_pages += op.pressure_spill_pages;
     cumulative_stats_.partial_tail_cow_pages += op.partial_tail_cow_pages;
+    std::uint64_t longest_transfer_ns = 0;
     for (const auto& transfer : progress.transfers) {
         const auto direction = static_cast<std::size_t>(transfer.direction);
         std::array<std::uint64_t*, 3> bytes{}, units{};
@@ -248,6 +249,7 @@ void EngineCore<Instance>::record_context_work(
             break;
         }
         *bytes.at(direction) += transfer.work.payload_bytes;
+        longest_transfer_ns = std::max(longest_transfer_ns, transfer.elapsed_ns);
         *units.at(direction) +=
             transfer.resource == ContextResourceClass::State ? transfer.units : transfer.page_count;
         *seconds.at(direction) += transfer.elapsed_ns * 1.0e-9;
@@ -267,6 +269,13 @@ void EngineCore<Instance>::record_context_work(
                 owner->host_to_device_bytes += transfer.work.payload_bytes;
             }
         }
+    }
+    // upstream a754fcf3: an expensive restore (bind after a pause) earns a longer service
+    // slice. The longest transfer of the bind is this engine's recovery-cost proxy; the
+    // turn is still bounded by the scheduler's maximum service allowance.
+    if (owner && materializing_ && materializing_->resumed &&
+        progress.kind == decltype(progress.kind)::Bind) {
+        scheduler_.recovery_work(owner->id, longest_transfer_ns);
     }
 }
 
