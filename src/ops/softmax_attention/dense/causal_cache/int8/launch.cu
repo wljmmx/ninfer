@@ -3,6 +3,7 @@
 #define NINFER_INT8_KV_SCORING_OWNER 1
 
 #include "ops/softmax_attention/dense/causal_cache/int8/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/int8/host_partial.h"
 #include "ops/softmax_attention/dense/causal_cache/int8/instances.h"
 #include "ops/softmax_attention/dense/causal_cache/int8/plan.h"
 #include "ops/softmax_attention/dense/causal_cache/int8/template_launch.cuh"
@@ -60,6 +61,10 @@ void rk_grouped(const CausalAttentionOperands& p, Int8KvCacheView<Writable> cach
         launch_int8_kv_grouped_mma<G, typename Instance::Schedule, MultiBatch, Masked, Writable,
                                    Input, false, true, false, false>(p, cache, input, partition,
                                                                      partial, stream);
+        // P3 Phase C seam: optionally replace one split's partial with the CPU result before
+        // the merge (default off; host_partial.h owns the knob, the view and the staging).
+        rk_kv_cpu_split_gate<G, Masked, false>(p, partition, partial, Instance::Schedule::kKeyRows,
+                                              stream);
         launch_causal_natural_merge<G, typename Instance::Merge, MultiBatch, Masked, false>(
             p, cache.valid_columns, partition, partial, stream);
     };
@@ -91,6 +96,9 @@ void rk_packedk_grouped(const CausalAttentionOperands& p, Int8KvCacheView<Writab
                                    Input, false, true, true, false, false>(p, cache, input,
                                                                           partition, partial,
                                                                           stream);
+        // P3 Phase C seam: same knob as rk_grouped, with PackedK=true for this codec.
+        rk_kv_cpu_split_gate<G, Masked, true>(p, partition, partial, Instance::Schedule::kKeyRows,
+                                             stream);
         launch_causal_natural_merge<G, typename Instance::Merge, MultiBatch, Masked, false>(
             p, cache.valid_columns, partition, partial, stream);
     };
