@@ -141,6 +141,8 @@ int validate(Weights& w, std::span<const Column> ref, DeviceExecutionView e) {
     // consumes exactly its queried call-local capacity from the aligned starting position.
     constexpr std::size_t prefix_bytes = 768;
     GuardedDeviceBuffer nested_storage(prefix_bytes + f.capacity);
+    // Guard initialization uses the default stream; e.stream is nonblocking.
+    cuda_synchronize(nullptr);
     WorkspaceArena nested(DeviceSpan{nested_storage.data(), nested_storage.bytes()});
     const auto prefix = nested.alloc_bytes(prefix_bytes, 256);
     std::vector<std::uint16_t> prefix_words(prefix_bytes / 2, 0x4261);
@@ -164,6 +166,8 @@ int validate(Weights& w, std::span<const Column> ref, DeviceExecutionView e) {
 
     // Read-only sharing is legal. Qualify the real computation with z bound to a weight row.
     Fixture shared(w, 1, e);
+    // This case skips upload(), which normally completes default-stream initialization.
+    cuda_synchronize(nullptr);
     shared.z.data = const_cast<void*>(w.down.qdata);
     shared.invoke(e);
     cuda_synchronize(e.stream);

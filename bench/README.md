@@ -398,6 +398,9 @@ The existing DFlash, 35B target and GatedRMSNorm profiles remain selectable in `
 `--tokens` supplies aggregate matrix columns, independently of the speculative block width.
 Inputs and gains are nonuniform represented BF16 values. CSV reports actual geometry, Graph
 nodes/calls, zero scratch, logical bytes and median/min/p95 public-call latency.
+Its CSV also carries `logical_gb_s` and `bandwidth_reference_us`: the listed logical bytes moved
+per second, and the time the same traffic would take at the device's nominal memory bandwidth
+(reported only as a scale, since repeated reads and cache behaviour are not DRAM traffic).
 
 Cold mode flushes 256 MiB before each measured interval. Warm Graph bundles avoid host launch
 gaps and normalize time per public call; a cold bundle flushes only before its first call.

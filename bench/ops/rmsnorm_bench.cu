@@ -153,6 +153,12 @@ struct Case {
             ops::rmsnorm(x, w, 1.e-6f, shape.offset, y, execution.stream);
     }
 };
+
+std::string format_double(double value) {
+    char text[32];
+    std::snprintf(text, sizeof(text), "%.3f", value);
+    return text;
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -168,10 +174,15 @@ int main(int argc, char** argv) {
             csv.open(o.csv);
             if (!csv) throw std::runtime_error("cannot open CSV output");
             csv << "kind,D,heads,T,execution,cache,graph_nodes,graph_calls,workspace_bytes,logical_"
-                   "bytes,median_us,min_us,p95_us\n";
+                   "bytes,logical_gb_s,bandwidth_reference_us,median_us,min_us,p95_us\n";
         }
         std::printf("GPU=%s SMs=%d CUDART=%d\n", device.props.name, device.multiprocessor_count(),
                     CUDART_VERSION);
+        // Nominal memory bandwidth, used only as the bandwidth_reference_us scale.
+        int clock_khz = 0;
+        CUDA_CHECK(cudaDeviceGetAttribute(&clock_khz, cudaDevAttrMemoryClockRate, device.device));
+        const double memory_gbs = static_cast<double>(clock_khz) * 1.0e3 * 2.0 *
+                                  (static_cast<double>(device.props.memoryBusWidth) / 8.0) / 1.0e9;
         const Shape& shape = find_shape(o.kind);
         for (const int t : o.tokens) {
             Case data(shape, t);
@@ -229,8 +240,9 @@ int main(int argc, char** argv) {
             if (csv)
                 csv << shape.name << ',' << shape.d << ',' << shape.heads << ',' << t << ','
                     << o.execution << ',' << o.cache << ',' << nodes << ',' << o.graph_calls
-                    << ",0," << bytes << ',' << time.median_us << ',' << time.min_us << ','
-                    << time.p95_us << '\n';
+                    << ",0," << bytes << ',' << format_double(bytes / (time.median_us * 1000.0))
+                    << ',' << format_double(bytes / (memory_gbs * 1000.0)) << ','
+                    << time.median_us << ',' << time.min_us << ',' << time.p95_us << '\n';
         }
         return 0;
     } catch (const std::exception& error) {

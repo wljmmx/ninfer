@@ -333,6 +333,23 @@ int main() {
                              {{1, 1}, 1808U, 4.0F, false, false, Pattern::RoundingGate});
         failures += run_validation(execution, kind);
     }
+    // D128/H24 sigmoid geometry: the local GDN head layout, swept across the column regimes a
+    // batch of decode columns passes through, then across T/B and the adversarial gate patterns.
+    for (int t : {1,   4,   6,   8,   15,  16,  17,  31,  32,   33,   64,
+                  112, 113, 114, 128, 255, 256, 257, 512, 1024, 2048, 4096})
+        failures += run_case(execution, Gate::Sigmoid, "D128/H24 columns",
+                             {{128, 24, t}, 5000U + t, 4.0F, false, t == 16 || t == 257});
+    for (int b : {2, 8})
+        for (int t : {1, 2, 3, 4, 5, 6, 16})
+            failures += run_case(execution, Gate::Sigmoid, "D128/H24 T/B",
+                                 {{128, 24, t, b}, 6000U + 100 * b + t, 4.0F, false,
+                                  t == 6 || t == 16});
+    for (auto pattern : {Pattern::ZeroInput, Pattern::ZeroGate, Pattern::GateEdges,
+                         Pattern::DirectGain, Pattern::NegativeGate, Pattern::RoundingGate}) {
+        const auto label = "D128/H24 pattern " + std::to_string(static_cast<int>(pattern));
+        failures += run_case(execution, Gate::Sigmoid, label.c_str(),
+                             {{128, 24, 6, 8}, 7000U, 4.0F, false, true, pattern});
+    }
     std::cout << (failures ? "FAIL" : "OK") << " gated_rmsnorm (SiLU and sigmoid)\n";
     return failures ? 1 : 0;
 }
