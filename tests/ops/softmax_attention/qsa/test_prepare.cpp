@@ -4,7 +4,6 @@
 #include <array>
 #include <bit>
 #include <cmath>
-#include <cuda_fp16.h>
 #include <stdexcept>
 
 using namespace ninfer;
@@ -68,8 +67,11 @@ struct Error {
 int verify(Fixture& f, const std::string& label) {
     const auto actual_q  = from_device<std::uint16_t>(f.query_output.data, f.q.host.size());
     const auto actual_iq = from_device<std::uint16_t>(f.iq_output.data, f.iq.host.size());
-    const auto actual_k = f.keys.download(), actual_ik = f.compressed.download();
-    auto expected_k = f.keys.host, expected_ik = f.compressed.host, expected_v = f.values.host;
+    const auto actual_k = f.keys.download(), actual_ks = f.key_scales.download();
+    const auto actual_ik = f.compressed.download();
+    auto expected_k = f.keys.host, expected_v = f.values.host;
+    auto expected_ks = f.key_scales.host, expected_vs = f.value_scales.host;
+    auto expected_ik   = f.compressed.host;
     auto expected_raw  = f.records.host;
     auto expected_rope = f.record_rope.host;
     Error q_error, k_error, iq_error, ik_error;
@@ -78,11 +80,14 @@ int verify(Fixture& f, const std::string& label) {
         return std::array{f.rope.at(t, 0, b), f.rope.at(t, f.A == 1 ? 0 : 1, b),
                           f.rope.at(t, f.A == 1 ? 0 : 2, b)};
     };
-    const auto head = [&](const auto& input, int h, int t, int b, const auto& weight,
-                          const auto& actual, std::size_t offset, Error& error) {
+    const auto ideal_head = [&](const auto& input, int h, int t, int b, const auto& weight) {
         std::vector<double> raw(input.view.ne[0]);
         for (int c = 0; c < input.view.ne[0]; ++c) raw[c] = bf16_to_f32(input.at(c, h, t, b));
-        const auto ideal = oracle(raw, weight, coordinates(t, b), f.parameters);
+        return oracle(raw, weight, coordinates(t, b), f.parameters);
+    };
+    const auto head = [&](const auto& input, int h, int t, int b, const auto& weight,
+                          const auto& actual, std::size_t offset, Error& error) {
+        const auto ideal = ideal_head(input, h, t, b, weight);
         for (int c = 0; c < input.view.ne[0]; ++c)
             error.add(actual[offset + c], ideal.values[c], ideal.scales[c]);
     };
@@ -103,14 +108,49 @@ int verify(Fixture& f, const std::string& label) {
                 head(f.iq, h, t, b, f.wiq, actual_iq, f.iq.index(0, h, t, b), iq_error);
             const int p = f.positions.at(t, b), page = f.tables.at(p / 64, f.table_rows.at(b));
             for (int h = 0; h < 2; ++h) {
-                head(f.k, h, t, b, f.wk, actual_k, f.keys.index(0, p % 64, h, page), k_error);
-                for (int c = 0; c < 256; ++c) {
-                    const auto index = f.keys.index(c, p % 64, h, page);
-                    // Approximate values have been checked above; retain actual words here
-                    // solely to check that every other cache byte stayed untouched.
-                    expected_k[index]                              = actual_k[index];
-                    expected_v[f.values.index(c, p % 64, h, page)] =
-                        __half_as_ushort(__float2half_rn(bf16_to_f32(f.v.at(c, h, t, b))));
+                const auto ideal = ideal_head(f.k, h, t, b, f.wk);
+                if (f.storage == KvCacheStorage::BFloat16) {
+                    for (int c = 0; c < 256; ++c) {
+                        const auto index = f.keys.index(c, p % 64, h, page);
+                        const auto word  = read_u16(actual_k, index);
+                        k_error.add(word, ideal.values[c], ideal.scales[c]);
+                        // Live approximate values were checked above; every other byte is exact.
+                        write_u16(expected_k, index, word);
+                        write_u16(expected_v, f.values.index(c, p % 64, h, page),
+                                  fp16_encode(bf16_to_f32(f.v.at(c, h, t, b))));
+                    }
+                } else {
+                    const auto row = [&](const auto& data, const CachePlane& plane) {
+                        const auto first = data.begin() + plane.index(0, p % 64, h, page);
+                        return std::vector<std::uint8_t>(
+                            first, first + plane.view.ne[0] * dtype_size(plane.view.dtype));
+                    };
+                    const auto put = [&](auto& data, const CachePlane& plane, const auto& words) {
+                        std::copy(words.begin(), words.end(),
+                                  data.begin() + plane.index(0, p % 64, h, page));
+                    };
+                    std::array<double, 256> key;
+                    std::copy(ideal.values.begin(), ideal.values.end(), key.begin());
+                    EncodedRow got{row(actual_k, f.keys), row(actual_ks, f.key_scales)};
+                    if (!compatible_key_encoding(key, f.encoding.key, got)) {
+                        std::cerr << label << " K encoding incompatible with mathematical key at "
+                                  << b << '/' << t << '/' << h << '\n';
+                        ++failures;
+                    }
+                    if (f.exact_key) {
+                        std::array<float, 256> represented;
+                        std::copy(key.begin(), key.end(), represented.begin());
+                        const auto encoded = encode_row(represented, f.encoding.key);
+                        failures += verify_exact("exact K codes", got.data, encoded.data);
+                        failures += verify_exact("exact K scales", got.scales, encoded.scales);
+                    }
+                    put(expected_k, f.keys, got.data);
+                    put(expected_ks, f.key_scales, got.scales);
+                    std::array<float, 256> raw_value;
+                    for (int c = 0; c < 256; ++c) raw_value[c] = bf16_to_f32(f.v.at(c, h, t, b));
+                    const auto value = encode_row(raw_value, f.encoding.value);
+                    put(expected_v, f.values, value.data);
+                    put(expected_vs, f.value_scales, value.scales);
                 }
             }
             const int record = f.offsets.at(b) + t;
@@ -158,6 +198,8 @@ int verify(Fixture& f, const std::string& label) {
     failures += verify_exact("K untouched", actual_k, expected_k);
     failures += verify_exact("IK untouched", actual_ik, expected_ik);
     failures += verify_exact("V words", f.values.download(), expected_v);
+    failures += verify_exact("K scales untouched", actual_ks, expected_ks);
+    failures += verify_exact("V scales", f.value_scales.download(), expected_vs);
     failures += verify_exact("raw records", f.records.download(), expected_raw);
     failures += verify_exact("coordinate records", f.record_rope.download(), expected_rope);
     if (!(f.alias & 1)) failures += f.q.preserved("raw Q");
@@ -167,16 +209,18 @@ int verify(Fixture& f, const std::string& label) {
     for (auto* x : {&f.first, &f.positions, &f.rope, &f.valid, &f.table_rows, &f.slots, &f.offsets,
                     &f.tables})
         failures += x->preserved("metadata/state");
-    for (auto* x :
-         {&f.q, &f.iq, &f.out_q, &f.out_iq, &f.keys, &f.values, &f.compressed, &f.records})
+    for (auto* x : {&f.q, &f.iq, &f.out_q, &f.out_iq, &f.compressed, &f.records})
         failures += x->device->verify_guards(label);
+    for (auto* x : {&f.keys, &f.values, &f.key_scales, &f.value_scales})
+        failures += x->guards(label);
     failures += f.record_rope.device->verify_guards(label);
     if (failures) std::cerr << label << ": " << failures << " failures\n";
     return failures;
 }
 
-int run(DeviceContext& device, int t, int b, int axes, int alias, int layout, int capacity = 0) {
-    Fixture f(t, b, axes, alias, layout, capacity);
+int run(DeviceContext& device, int t, int b, int axes, int alias, int layout, int capacity = 0,
+        KvCacheStorage storage = KvCacheStorage::BFloat16) {
+    Fixture f(t, b, axes, alias, layout, capacity, storage);
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
     int failures = 0;
@@ -201,13 +245,14 @@ int run(DeviceContext& device, int t, int b, int axes, int alias, int layout, in
         failures +=
             verify(f, "prepare T=" + std::to_string(t) + " B=" + std::to_string(b) +
                           " A=" + std::to_string(axes) + " alias=" + std::to_string(alias) +
-                          " layout=" + std::to_string(layout) + " phase=" + std::to_string(phase));
+                          " layout=" + std::to_string(layout) + " phase=" + std::to_string(phase) +
+                          " storage=" + std::to_string(int(storage)));
     }
     return failures;
 }
 
-int continuation(DeviceContext& device) {
-    Fixture f(4, 1, 3, 0, 2);
+int continuation(DeviceContext& device, KvCacheStorage storage = KvCacheStorage::BFloat16) {
+    Fixture f(4, 1, 3, 0, 2, 0, storage);
     f.base_origin = 6;
     f.reset(0, true);
     f.launch(device.execution_view());
@@ -224,6 +269,8 @@ int continuation(DeviceContext& device) {
                 f.first.preserved("tail first coordinate");
     f.keys.host          = f.keys.download();
     f.values.host        = f.values.download();
+    f.key_scales.host    = f.key_scales.download();
+    f.value_scales.host  = f.value_scales.download();
     f.compressed.host    = f.compressed.download();
     f.records.host       = f.records.download();
     f.record_rope.host   = f.record_rope.download();
@@ -242,16 +289,17 @@ int continuation(DeviceContext& device) {
     return failures;
 }
 
-int chunking(DeviceContext& device) {
-    Fixture f(9, 1, 3, 3, 2);
+int chunking(DeviceContext& device, KvCacheStorage storage = KvCacheStorage::BFloat16) {
+    Fixture f(9, 1, 3, 3, 2, 0, storage);
     f.base_origin = 63;
     f.reset(0, true);
     f.launch(device.execution_view());
     device.synchronize();
     int failures = verify(f, "whole chunk");
-    const auto q = f.q.download(), iq = f.iq.download(), k = f.keys.download(),
-               v = f.values.download(), ik = f.compressed.download(),
-               records     = f.records.download();
+    const auto q = f.q.download(), iq = f.iq.download(), ik = f.compressed.download(),
+               records = f.records.download();
+    const auto k = f.keys.download(), v = f.values.download(), ks = f.key_scales.download(),
+               vs          = f.value_scales.download();
     const auto coordinates = f.record_rope.download();
     f.reset(0, true);
     int offset = 0;
@@ -297,6 +345,8 @@ int chunking(DeviceContext& device) {
         verify_exact("chunk Q", f.q.download(), q) + verify_exact("chunk IQ", f.iq.download(), iq);
     failures += verify_exact("chunk K", f.keys.download(), k) +
                 verify_exact("chunk V", f.values.download(), v);
+    failures += verify_exact("chunk K scales", f.key_scales.download(), ks) +
+                verify_exact("chunk V scales", f.value_scales.download(), vs);
     failures += verify_exact("chunk IK", f.compressed.download(), ik);
     failures += verify_exact("chunk records", f.records.download(), records);
     failures += verify_exact("chunk coordinates", f.record_rope.download(), coordinates);
@@ -344,32 +394,40 @@ int coordinate_handoff(DeviceContext& device) {
     return verify(f, "three-axis tail to one-axis current input");
 }
 
-int unaligned_norms(DeviceContext& device) {
-    Fixture f(129, 1, 1, 3, 1);
-    Buffer<std::uint16_t> wq(DType::BF16, {257}), wiq(DType::BF16, {129});
-    std::copy(f.wq.host.begin(), f.wq.host.end(), wq.host.begin() + 1);
-    std::copy(f.wiq.host.begin(), f.wiq.host.end(), wiq.host.begin() + 1);
-    wq.upload();
-    wiq.upload();
-    f.parameters.query_norm =
-        Tensor(static_cast<std::uint16_t*>(wq.view.data) + 1, DType::BF16, {256});
-    f.parameters.index_query_norm =
-        Tensor(static_cast<std::uint16_t*>(wiq.view.data) + 1, DType::BF16, {128});
+int norm_alignment_and_phase(DeviceContext& device,
+                             KvCacheStorage storage = KvCacheStorage::BFloat16) {
     int failures = 0;
-    for (float theta : {1e7F, 0.5F}) {
-        f.reset(2, true);
-        f.parameters.rope_theta = theta;
-        f.launch(device.execution_view());
-        device.synchronize();
-        failures += verify(f, "naturally aligned norms");
+    for (int tokens : {129, 321}) {
+        Fixture f(tokens, 1, 1, 3, 1, 0, storage);
+        Buffer<std::uint16_t> wq(DType::BF16, {257}), wiq(DType::BF16, {129});
+        std::copy(f.wq.host.begin(), f.wq.host.end(), wq.host.begin() + 1);
+        std::copy(f.wiq.host.begin(), f.wiq.host.end(), wiq.host.begin() + 1);
+        wq.upload();
+        wiq.upload();
+        for (bool shifted : {true, false}) {
+            f.parameters.query_norm =
+                shifted ? Tensor(static_cast<std::uint16_t*>(wq.view.data) + 1, DType::BF16, {256})
+                        : f.wq.view;
+            f.parameters.index_query_norm =
+                shifted ? Tensor(static_cast<std::uint16_t*>(wiq.view.data) + 1, DType::BF16, {128})
+                        : f.wiq.view;
+            for (float theta : {1e7F, 0.5F}) {
+                f.reset(2, true);
+                f.parameters.rope_theta = theta;
+                f.launch(device.execution_view());
+                device.synchronize();
+                failures += verify(f, "norm alignment/phase domain");
+            }
+        }
+        failures += wq.preserved("shifted Q norm") + wiq.preserved("shifted IQ norm");
     }
-    return failures + wq.preserved("shifted Q norm") + wiq.preserved("shifted IQ norm");
+    return failures;
 }
 
 // Inert projection columns/coordinates are deliberately uninitialized. Initcheck can detect
 // a masked read even if subsequent arithmetic discards it and the final output is zero.
-int read_footprint(DeviceContext& device) {
-    Fixture f(17, 2, 3, 0, 0);
+int read_footprint(DeviceContext& device, KvCacheStorage storage = KvCacheStorage::BFloat16) {
+    Fixture f(17, 2, 3, 0, 0, 0, storage);
     f.base_origin = 63;
     f.reset(0, true);
     f.valid.at(0)      = 1;
@@ -417,8 +475,8 @@ int validation(DeviceContext& device) {
     Fixture f(1, 1, 1);
     int failures         = 0;
     auto saved           = f.cache;
-    f.cache.main.storage = KvCacheStorage::Nvfp4Group16;
-    failures += rejects("unimplemented codec", [&] { f.launch(device.execution_view()); });
+    f.cache.main.storage = KvCacheStorage::Int8Group64;
+    failures += rejects("storage/plane mismatch", [&] { f.launch(device.execution_view()); });
     f.cache = saved;
     f.cache.index.block_tables.nb[1] += 4;
     failures += rejects("different table view", [&] { f.launch(device.execution_view()); });
@@ -435,6 +493,65 @@ int validation(DeviceContext& device) {
     return failures;
 }
 
+int exact_key_encoding(DeviceContext& device, KvCacheStorage storage) {
+    Fixture f(16, 1, 1, 3, 1, 0, storage);
+    f.base_origin = 64;
+    f.reset(0, true);
+    f.parameters.rms_epsilon = 3;
+    f.exact_key              = true;
+    // |Kraw|=1 and epsilon=3 give an exact inverse RMS of 1/2. Zero RoPE coordinates
+    // leave dyadic 0.5*(1+w) values that are FP32-exact but generally not BF16-exact.
+    for (int c = 0; c < 256; ++c) f.wk.at(c) = f32_to_bf16(((c * 37 + 17) % 127 - 63) / 512.0F);
+    int witnesses = 0;
+    for (int t = 0; t < f.T; ++t) {
+        f.rope.at(t, 0, 0) = 0;
+        for (int h = 0; h < 2; ++h) {
+            std::array<float, 256> exact, rounded;
+            for (int c = 0; c < 256; ++c) {
+                const float sign   = bf16_to_f32(sample(t, h, c, 719)) < 0 ? -1 : 1;
+                f.k.at(c, h, t, 0) = f32_to_bf16(sign);
+                exact[c]           = sign * 0.5F * (1 + bf16_to_f32(f.wk.at(c)));
+                rounded[c]         = bf16_to_f32(f32_to_bf16(exact[c]));
+            }
+            const auto wanted         = encode_row(exact, f.encoding.key);
+            const auto extra_rounding = encode_row(rounded, f.encoding.key);
+            witnesses +=
+                wanted.data != extra_rounding.data || wanted.scales != extra_rounding.scales;
+        }
+    }
+    f.upload();
+    f.launch(device.execution_view());
+    device.synchronize();
+    int failures = verify(f, "exact unrounded key codec");
+    if (witnesses == 0) {
+        std::cerr << "exact key case must distinguish an intermediate BF16 rounding\n";
+        ++failures;
+    }
+    for (auto& word : f.wk.host) word = f32_to_bf16(-1);
+    std::fill(f.v.host.begin(), f.v.host.end(), 0);
+    f.upload();
+    f.launch(device.execution_view());
+    device.synchronize();
+    failures += verify(f, "zero key/value codec");
+    return failures;
+}
+
+int scale_edges(DeviceContext& device, KvCacheStorage storage) {
+    Fixture f(8, 1, 1, 0, 1, 0, storage);
+    constexpr float amplitudes[]{0, 0x1p-30F, 0x1p-18F, 0x1p-10F, 1.0625F, 6.375F, 3072, 65536};
+    constexpr float values[]{0, 0.25F, 0.75F, 1.25F, 1.75F, 2.5F, 3.5F, 6};
+    for (int t = 0; t < f.T; ++t)
+        for (int h = 0; h < 2; ++h)
+            for (int c = 0; c < 256; ++c) {
+                const float sign   = (c / 8 + h) % 2 ? -1 : 1;
+                f.v.at(c, h, t, 0) = f32_to_bf16(sign * amplitudes[t] * values[c % 8]);
+            }
+    f.v.upload();
+    f.launch(device.execution_view());
+    device.synchronize();
+    return verify(f, "scale zero/underflow/saturation");
+}
+
 } // namespace
 
 int main() {
@@ -449,9 +566,20 @@ int main() {
         for (int alias = 0; alias < 4; ++alias)
             failures += run(device, 9, 8, 3, alias, alias % 3, 5);
         for (int t : {1024, 2048, 4096}) failures += run(device, t, 1, 3, 3, 0);
-        failures += epsilon_range(device) + coordinate_handoff(device) + unaligned_norms(device) +
-                    continuation(device) + chunking(device) + numerical_edges(device, true) +
-                    numerical_edges(device, false) + read_footprint(device) + validation(device);
+        failures += epsilon_range(device) + coordinate_handoff(device) +
+                    norm_alignment_and_phase(device) + continuation(device) + chunking(device) +
+                    numerical_edges(device, true) + numerical_edges(device, false) +
+                    read_footprint(device) + validation(device);
+        for (auto storage : {KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+                             KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+            for (int t : {1, 8, 17, 65, 319, 320, 321, 1024, 2048, 4096})
+                failures += run(device, t, 1, t % 3 ? 3 : 1, t % 4, t % 3, 0, storage);
+            for (int t : {1, 8, 39, 40, 41}) failures += run(device, t, 8, 3, t % 4, 2, 0, storage);
+            failures += run(device, 9, 8, 1, 3, 1, 5, storage);
+            failures += exact_key_encoding(device, storage) + scale_edges(device, storage) +
+                        norm_alignment_and_phase(device, storage) + continuation(device, storage) +
+                        chunking(device, storage) + read_footprint(device, storage);
+        }
         std::cout << "QSA Prepare: " << (failures ? "FAIL" : "PASS") << '\n';
         return failures ? 1 : 0;
     } catch (const std::exception& e) {

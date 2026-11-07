@@ -130,9 +130,17 @@ struct QsaRawRecordWriteView {
  * For each row b and t<valid_columns[b], p=positions[t,b]:
  *   query[:,h,t,b]       = BF16(R(N_256(projected.query[:,h,t,b],query_norm),rho[t,:,b]));
  *   index_query[:,h,t,b] = BF16(R(N_128(projected.index_query[:,h,t,b],index_query_norm),rho));
- *   main.K[p,h]         = BF16(R(N_256(projected.key[:,h,t,b],key_norm),rho));
- *   main.V[p,h]         = FP16_RNE(projected.value[:,h,t,b]).
- * raw index-key words and actual coordinates are copied to records[:,offsets[b]+t,b];
+ *   k                   = R(N_256(projected.key[:,h,t,b],key_norm),rho);
+ *   v                   = projected.value[:,h,t,b].
+ * BFloat16 main caches store BF16(k) and FP16_RNE(v). For quantized main caches, k enters
+ * the fixed FP32 H256/16 Hadamard and storage encoder directly from norm/RoPE, with no
+ * intermediate BF16 rounding. INT8-G64 and FP8 transform K only; NVFP4-G16 and K8V4 transform
+ * both K and V. V enters from the represented BF16 projection. Codes, represented scales,
+ * zero and saturation rules are those of kv_cache_append; its BF16 K input boundary does not
+ * apply to this fused computation. Q/index-Q and the compressed index cache remain BF16 and
+ * do not receive this main-cache Hadamard. The attention consumer owns the corresponding Q
+ * transform and any value-basis inversion.
+ * Raw index-key words and actual coordinates are copied to records[:,offsets[b]+t,b];
  * A=1 replicates the coordinate to all three record axes.
  * With F=positions[0,b] and n=valid_columns[b], each newly completed block
  * g in [floor(F/4),floor((F+n)/4)) writes:
@@ -148,7 +156,12 @@ struct QsaRawRecordWriteView {
  * and 16-byte aligned. Norm weights are contiguous, naturally aligned BF16 vectors. Positions
  * are contiguous I32 [T,B]; rho is contiguous I32 [T,A,B]. Metadata is contiguous Device I32 [B].
  * Tail/records follow QsaTailStateView's feature-contiguous, naturally aligned stride rules.
- * The main cache supports BFloat16 only: BF16 K / FP16 V [256,64,2,G], no scale planes.
+ * Main-cache data and scale planes:
+ *   BFloat16: BF16 K / FP16 V [256,64,2,G]; no scales.
+ *   Int8Group64: I8 K/V [256,64,2,G]; FP16 scales [4,64,2,G].
+ *   Fp8E4M3Row256: FP8_E4M3FN K/V [256,64,2,G]; FP16 scales [1,64,2,G].
+ *   Nvfp4Group16: packed U8 K/V [128,64,2,G]; U8 E4M3 scales [16,64,2,G].
+ *   Fp8KeyNvfp4Value: the FP8 key planes and NVFP4 value planes above.
  * Cache planes are page-major with contiguous features and non-overlapping positive outer
  * strides; tables have contiguous I32 page entries and a non-overlapping row stride.
  * Both caches share G and the identical block_tables view. R and the state pool size are positive.
@@ -160,10 +173,11 @@ struct QsaRawRecordWriteView {
  *
  * Numeric / effects:
  * Norm and rotation have no intermediate represented tensor. The pooled mean's BF16 rounding
- * is semantic; raw records preserve input words exactly. Final mathematical results are BF16
- * approximations to the complete formula, independently qualified against a high-precision
- * oracle. V uses the exact FP16 encoding. Q/IQ for t>=n are exactly BF16 +0; inert columns do not
- * read projections/positions/state or write cache/records. An empty row need not have valid
+ * is semantic; raw records preserve input words exactly. Q/IQ/index keys and BFloat16-cache K
+ * are BF16 approximations to the complete formula, independently qualified against a
+ * high-precision oracle. Quantized K includes the storage encoder's representation error;
+ * V uses its profile's exact persistent encoding. Q/IQ for t>=n are exactly BF16 +0; inert columns
+ * do not read projections/positions/state or write cache/records. An empty row need not have valid
  * slot/table selectors. before, metadata, page tables and untouched cache/record regions remain
  * unchanged. query may exactly alias projected.query, and index_query may independently exactly
  * alias projected.index_query (same address/shape/strides). Partial overlap and all other

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "cache_reference.h"
 #include "ninfer/ops/qsa.h"
 #include "ops/op_tester.h"
 
@@ -65,11 +66,52 @@ inline std::uint16_t sample(int p, int b, int c, unsigned seed) {
     return f32_to_bf16((int(x % 1025) - 512) * (1.0F / 64));
 }
 
+struct CachePlane {
+    Tensor view;
+    std::vector<std::uint8_t> host;
+    std::unique_ptr<GuardedDeviceBuffer> device;
+
+    CachePlane(DType dtype, int features, int pages, bool padded) {
+        if (features == 0) return;
+        view               = Tensor(nullptr, dtype, {features, 64, 2, pages});
+        const auto element = dtype_size(dtype);
+        if (padded)
+            for (int d = 1; d < 4; ++d)
+                view.nb[d] = view.nb[d - 1] * view.ne[d - 1] + (d + 1) * element;
+        std::size_t bytes = element;
+        for (int d = 0; d < 4; ++d) bytes += (view.ne[d] - 1) * view.nb[d];
+        host.resize(bytes);
+        device    = std::make_unique<GuardedDeviceBuffer>(bytes);
+        view.data = device->data();
+    }
+
+    std::size_t index(int d, int p, int h, int page) const {
+        return d * view.nb[0] + p * view.nb[1] + h * view.nb[2] + page * view.nb[3];
+    }
+
+    void upload() const {
+        if (!device) return;
+        device->copy_from_host(host.data(), host.size());
+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    }
+
+    std::vector<std::uint8_t> download() const {
+        return device ? from_device<std::uint8_t>(device->data(), host.size())
+                      : std::vector<std::uint8_t>{};
+    }
+
+    int guards(const std::string& label) const { return device ? device->verify_guards(label) : 0; }
+};
+
 struct Fixture {
     int T, B, A, alias, R, pages_per_row;
+    KvCacheStorage storage;
+    CacheEncoding encoding;
+    bool exact_key  = false;
     int base_origin = 60;
     Buffer<std::uint16_t> q, k, v, iq, ik, out_q, out_iq, wq, wk, wiq, wik;
-    Buffer<std::uint16_t> tail, records, keys, values, compressed;
+    Buffer<std::uint16_t> tail, records, compressed;
+    CachePlane keys, values, key_scales, value_scales;
     Buffer<std::int32_t> first, record_rope, positions, rope, valid, table_rows, slots, offsets,
         tables;
     std::vector<int> bases;
@@ -81,18 +123,26 @@ struct Fixture {
     ops::QsaCacheView cache;
     Tensor query_output, iq_output;
 
-    Fixture(int tokens, int rows, int axes, int aliases = 0, int layout = 0, int capacity = 0)
+    Fixture(int tokens, int rows, int axes, int aliases = 0, int layout = 0, int capacity = 0,
+            KvCacheStorage kv_storage = KvCacheStorage::BFloat16)
         : T(tokens), B(rows), A(axes), alias(aliases), R(capacity ? capacity : tokens + 4),
-          pages_per_row((tokens + 126) / 64), q(DType::BF16, {256, 24, T, B}),
+          pages_per_row((tokens + 126) / 64), storage(kv_storage),
+          encoding(cache_encoding(storage)), q(DType::BF16, {256, 24, T, B}),
           k(DType::BF16, {256, 2, T, B}), v(DType::BF16, {256, 2, T, B}),
           iq(DType::BF16, {128, 4, T, B}), ik(DType::BF16, {128, T, B}),
           out_q(DType::BF16, {256, 24, T, B}), out_iq(DType::BF16, {128, 4, T, B}),
           wq(DType::BF16, {256}), wk(DType::BF16, {256}), wiq(DType::BF16, {128}),
           wik(DType::BF16, {128}), tail(DType::BF16, {128, 3, B + 2}, layout),
           records(DType::BF16, {128, R, B}, layout),
-          keys(DType::BF16, {256, 64, 2, B * pages_per_row + 2}, layout != 0),
-          values(DType::FP16, {256, 64, 2, B * pages_per_row + 2}, layout != 0),
           compressed(DType::BF16, {128, 16, 1, B * pages_per_row + 2}, layout != 0),
+          keys(encoding.key.data_dtype, encoding.key.data_extent, B * pages_per_row + 2,
+               layout != 0),
+          values(encoding.value.data_dtype, encoding.value.data_extent, B * pages_per_row + 2,
+                 layout != 0),
+          key_scales(encoding.key.scale_dtype, encoding.key.scale_extent, B * pages_per_row + 2,
+                     layout != 0),
+          value_scales(encoding.value.scale_dtype, encoding.value.scale_extent,
+                       B * pages_per_row + 2, layout != 0),
           first(DType::I32, {3, B + 2}, layout), record_rope(DType::I32, {3, R, B}, layout),
           positions(DType::I32, {T, B}), rope(DType::I32, {T, A, B}), valid(DType::I32, {B}),
           table_rows(DType::I32, {B}), slots(DType::I32, {B}), offsets(DType::I32, {B}),
@@ -102,10 +152,11 @@ struct Fixture {
         batch      = {positions.view, valid.view, table_rows.view};
         before     = {tail.view, first.view, slots.view};
         write      = {records.view, record_rope.view, offsets.view};
-        PagedKVBatchLayerView main{keys.view, values.view, {}, {}, tables.view};
+        PagedKVBatchLayerView main{keys.view, values.view, key_scales.view, value_scales.view,
+                                  tables.view};
         main.head_dim     = 256;
         main.num_kv_heads = 2;
-        main.storage      = KvCacheStorage::BFloat16;
+        main.storage      = storage;
         cache = ops::QsaCacheView{main, ops::QsaIndexCacheView{compressed.view, tables.view}};
         query_output = alias & 1 ? q.view : out_q.view;
         iq_output    = alias & 2 ? iq.view : out_iq.view;
@@ -119,9 +170,10 @@ struct Fixture {
     }
 
     void reset(int phase, bool dense = false) {
-        for (auto* x :
-             {&q, &k, &v, &iq, &ik, &out_q, &out_iq, &tail, &records, &keys, &values, &compressed})
+        for (auto* x : {&q, &k, &v, &iq, &ik, &out_q, &out_iq, &tail, &records, &compressed})
             std::fill(x->host.begin(), x->host.end(), std::uint16_t(0x7fc1));
+        for (auto* x : {&keys, &values, &key_scales, &value_scales})
+            std::fill(x->host.begin(), x->host.end(), std::uint8_t(0xa5));
         for (auto* x : {&first, &record_rope, &positions, &rope, &tables})
             std::fill(x->host.begin(), x->host.end(), -1);
         int norm_role = 0;
@@ -182,8 +234,9 @@ struct Fixture {
 
     void upload() const {
         for (auto* x : {&q, &k, &v, &iq, &ik, &out_q, &out_iq, &wq, &wk, &wiq, &wik, &tail,
-                        &records, &keys, &values, &compressed})
+                        &records, &compressed})
             x->upload();
+        for (auto* x : {&keys, &values, &key_scales, &value_scales}) x->upload();
         for (auto* x : {&first, &record_rope, &positions, &rope, &valid, &table_rows, &slots,
                         &offsets, &tables})
             x->upload();

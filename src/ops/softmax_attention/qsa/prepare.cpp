@@ -87,12 +87,19 @@ void qsa_prepare(const QsaProjectionView& p, const QsaPrepareParameters& paramet
 
     const auto& main = cache.main;
     const int pages  = main.k_pages.ne[3];
-    v.require(main.storage == KvCacheStorage::BFloat16 && main.head_dim == 256 &&
-                  main.num_kv_heads == 2 && main.k_scale_pages.data == nullptr &&
-                  main.v_scale_pages.data == nullptr,
-              "BF16 cache geometry/storage");
-    plane(main.k_pages, DType::BF16, {256, 64, 2, pages}, "K pages");
-    plane(main.v_pages, DType::FP16, {256, 64, 2, pages}, "V pages");
+    v.require(main.head_dim == 256 && main.num_kv_heads == 2, "cache geometry");
+    const auto layout        = paged_kv_storage_layout(main.storage, 256);
+    const auto vector_planes = [&](const Tensor& data, const Tensor& scale,
+                                   const PagedKVVectorLayout& schema) {
+        plane(data, schema.data_dtype, {schema.data_leading_extent, 64, 2, pages}, "cache data");
+        if (schema.has_scale())
+            plane(scale, schema.scale_dtype, {schema.scale_leading_extent, 64, 2, pages},
+                  "cache scale");
+        else
+            v.require(scale.data == nullptr, "absent cache scale");
+    };
+    vector_planes(main.k_pages, main.k_scale_pages, layout.key);
+    vector_planes(main.v_pages, main.v_scale_pages, layout.value);
     plane(cache.index.keys, DType::BF16, {128, 16, 1, pages}, "index pages");
     plane(main.block_tables, DType::I32, {main.block_tables.ne[0], main.block_tables.ne[1], 1, 1},
           "block tables");

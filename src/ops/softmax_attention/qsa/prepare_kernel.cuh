@@ -2,6 +2,7 @@
 
 #include "ops/softmax_attention/qsa/norm_rope.cuh"
 #include "ops/softmax_attention/qsa/prepare_arguments.cuh"
+#include "ops/softmax_attention/qsa/prepare_cache.cuh"
 
 namespace ninfer::ops::detail::qsa {
 
@@ -43,25 +44,11 @@ __device__ __forceinline__ void prepare_raw(const PrepareArguments& a, int t, in
     for (int j = 0; j < 4; ++j) out[lane + 32 * j] = __float2bfloat16_rn(pooled[j]);
 }
 
-__device__ __forceinline__ void prepare_kv(const PrepareArguments& a, int head, int t, int b,
-                                           int lane, float2 sc) {
-    const auto m   = t + std::int64_t(b) * a.tokens;
-    const int p    = a.positions[m];
-    const int page = a.tables[p / 64 + std::int64_t(a.table_rows[b]) * a.table_stride];
-    prepare_head<256>(a.k + (m * 2 + head) * 256, a.wk, a.keys.at(p % 64, head, page), a.epsilon,
-                      sc, lane);
-    auto* out = a.values.at(p % 64, head, page);
-#pragma unroll
-    for (int j = 0; j < 8; ++j)
-        out[lane + 32 * j] =
-            __float2half_rn(__bfloat162float(a.v[(m * 2 + head) * 256 + lane + 32 * j]));
-}
-
 // A CTA owns four heads/roles. Small calls interleave groups per token; larger calls visit
 // one head group across tokens for memory throughput. Both use direct batch indexing and
 // constant head-group arithmetic. Compression reads immutable projections/tail, never records.
 // A carried block retains its first token's three axes even when current coordinates use A=1.
-template <bool BoundedPhase, bool VectorWeights, bool TokenMajor>
+template <KvCacheStorage Storage, bool BoundedPhase, bool VectorWeights, bool TokenMajor>
 __global__ __launch_bounds__(128) void prepare_kernel(const __grid_constant__ PrepareArguments a) {
     const int t = TokenMajor ? blockIdx.x / 8 : blockIdx.x;
     const int b = blockIdx.y, lane = threadIdx.x % 32;
@@ -83,7 +70,13 @@ __global__ __launch_bounds__(128) void prepare_kernel(const __grid_constant__ Pr
         vector_head<128, VectorWeights>(a.iq + offset, a.wiq, a.out_iq + offset, a.epsilon,
                                         coefficients, lane, live);
     } else if (live && task < 30) {
-        prepare_kv(a, task - 28, t, b, lane, coefficients[lane]);
+        if constexpr (Storage == KvCacheStorage::Nvfp4Group16 ||
+                      Storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+            __shared__ float scratch[2][256];
+            prepare_kv<Storage>(a, task - 28, t, b, lane, coefficients[lane], scratch[task - 28]);
+        } else {
+            prepare_kv<Storage>(a, task - 28, t, b, lane, coefficients[lane]);
+        }
     } else if (live && task == 30) {
         prepare_raw<BoundedPhase>(a, t, b, lane, m);
     }

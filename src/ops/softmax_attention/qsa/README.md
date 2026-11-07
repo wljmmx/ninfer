@@ -47,3 +47,15 @@ objects, not ops; they belong to the qwen4-exp execution line (T191+), not here.
 
 Directory-level `sources.cmake` registers the translation units in `ninfer_ops`; the
 public surface lives in `include/ninfer/ops/qsa.h`.
+
+## Quantized KV is opt-in (default off)
+
+`qsa_prepare` and `qsa_sparse_gqa` accept Int8Group64, Fp8E4M3Row256, Nvfp4Group16 and
+Fp8KeyNvfp4Value planes, selected solely by the caller's `cache.storage`. That capability
+is compiled and qualified on sm_89, but it is **not** a default: the quantized path drops
+the BF16 K rounding boundary (K enters the Hadamard/encoder directly from norm+RoPE) and
+rotates the V basis, so its output is not bitwise equal to the BFloat16 path. Nothing on
+the 27B/35B line selects QSA at all today; when a model line does, it must stay on
+`KvCacheStorage::BFloat16` until a dedicated PPL (bitwise-where-claimed) + task-suite
+evaluation clears the quantized arm.
+

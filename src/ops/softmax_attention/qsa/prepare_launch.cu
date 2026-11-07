@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cmath>
+#include <stdexcept>
 
 namespace ninfer::ops::detail::qsa {
 namespace {
@@ -48,9 +49,11 @@ PrepareArguments prepare_arguments(const QsaProjectionView& p, const QsaPrepareP
                        prepare_columns<const std::int32_t>(before.first_rope),
                        prepare_columns<__nv_bfloat16>(records.raw_keys),
                        prepare_columns<std::int32_t>(records.rope_positions),
-                       prepare_page<__nv_bfloat16>(cache.main.k_pages),
                        prepare_page<__nv_bfloat16>(cache.index.keys),
-                       prepare_page<__half>(cache.main.v_pages),
+                       prepare_page<std::uint8_t>(cache.main.k_pages),
+                       prepare_page<std::uint8_t>(cache.main.v_pages),
+                       prepare_page<std::uint8_t>(cache.main.k_scale_pages),
+                       prepare_page<std::uint8_t>(cache.main.v_scale_pages),
                        p.query.ne[2],
                        p.query.ne[3],
                        rope.ne[1],
@@ -69,16 +72,34 @@ PrepareArguments prepare_arguments(const QsaProjectionView& p, const QsaPrepareP
     return a;
 }
 
-template <bool BoundedPhase, bool VectorWeights>
+template <KvCacheStorage Storage, bool BoundedPhase, bool VectorWeights>
 void submit(const PrepareArguments& args, cudaStream_t stream) {
     // Short calls distribute a token's heads across CTAs; larger calls group heads across
     // tokens for memory throughput. The short-call bound also keeps tokens*8 in the x-grid.
     if (std::int64_t(args.tokens) * args.batch <= 320)
-        prepare_kernel<BoundedPhase, VectorWeights, true>
+        prepare_kernel<Storage, BoundedPhase, VectorWeights, true>
             <<<dim3(args.tokens * 8, args.batch), 128, 0, stream>>>(args);
     else
-        prepare_kernel<BoundedPhase, VectorWeights, false>
+        prepare_kernel<Storage, BoundedPhase, VectorWeights, false>
             <<<dim3(args.tokens, args.batch, 8), 128, 0, stream>>>(args);
+}
+
+template <KvCacheStorage Storage>
+void dispatch(const PrepareArguments& args, float theta, cudaStream_t stream) {
+    const bool vector_weights = reinterpret_cast<std::uintptr_t>(args.wq) % 16 == 0 &&
+                                reinterpret_cast<std::uintptr_t>(args.wiq) % 8 == 0;
+    // For theta>=1 every phase is bounded by the nonnegative-I32 coordinate domain.
+    if (theta >= 1) {
+        if (vector_weights)
+            submit<Storage, true, true>(args, stream);
+        else
+            submit<Storage, true, false>(args, stream);
+    } else {
+        if (vector_weights)
+            submit<Storage, false, true>(args, stream);
+        else
+            submit<Storage, false, false>(args, stream);
+    }
 }
 
 } // namespace
@@ -90,19 +111,24 @@ void launch_prepare(const QsaProjectionView& projected, const QsaPrepareParamete
                     DeviceExecutionView execution) {
     const auto args = prepare_arguments(projected, parameters, batch, rope_positions, before, cache,
                                         records, query, index_query);
-    const bool vector_weights = reinterpret_cast<std::uintptr_t>(args.wq) % 16 == 0 &&
-                                reinterpret_cast<std::uintptr_t>(args.wiq) % 8 == 0;
-    // For theta>=1 every phase is bounded by the nonnegative-I32 coordinate domain.
-    if (parameters.rope_theta >= 1) {
-        if (vector_weights)
-            submit<true, true>(args, execution.stream);
-        else
-            submit<true, false>(args, execution.stream);
-    } else {
-        if (vector_weights)
-            submit<false, true>(args, execution.stream);
-        else
-            submit<false, false>(args, execution.stream);
+    switch (cache.main.storage) {
+    case KvCacheStorage::BFloat16:
+        dispatch<KvCacheStorage::BFloat16>(args, parameters.rope_theta, execution.stream);
+        break;
+    case KvCacheStorage::Int8Group64:
+        dispatch<KvCacheStorage::Int8Group64>(args, parameters.rope_theta, execution.stream);
+        break;
+    case KvCacheStorage::Fp8E4M3Row256:
+        dispatch<KvCacheStorage::Fp8E4M3Row256>(args, parameters.rope_theta, execution.stream);
+        break;
+    case KvCacheStorage::Nvfp4Group16:
+        dispatch<KvCacheStorage::Nvfp4Group16>(args, parameters.rope_theta, execution.stream);
+        break;
+    case KvCacheStorage::Fp8KeyNvfp4Value:
+        dispatch<KvCacheStorage::Fp8KeyNvfp4Value>(args, parameters.rope_theta, execution.stream);
+        break;
+    default:
+        throw std::invalid_argument("qsa_prepare: unsupported KV storage");
     }
     CUDA_CHECK(cudaGetLastError());
 }
