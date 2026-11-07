@@ -3,6 +3,7 @@
 #include "media/decode/decode.h"
 #include "models/qwen3_5/frontend/digest.h"
 #include "models/qwen3_5/frontend/media_cache.h"
+#include "runtime/contract/request.h"
 
 #include <algorithm>
 #include <array>
@@ -938,8 +939,8 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
         check_preparation_control(control, "tokenization");
         if (preliminary_tokens > maximum_prompt_tokens) {
             throw ProcessorError(ProcessorErrorKind::ContextLengthExceeded,
-                                 "prepared prompt exceeds Engine max_context " +
-                                     std::to_string(maximum_prompt_tokens));
+                                 runtime::context_length_error_message(
+                                     preliminary_tokens, maximum_prompt_tokens, true));
         }
     }
     MediaPreparationPermit request_permit = media_cache_->acquire_request(control);
@@ -1068,8 +1069,8 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     check_preparation_control(control, "tokenization");
     if (encoded.input_ids.size() > maximum_prompt_tokens) {
         throw ProcessorError(ProcessorErrorKind::ContextLengthExceeded,
-                             "prepared prompt exceeds Engine max_context " +
-                                 std::to_string(maximum_prompt_tokens));
+                             runtime::context_length_error_message(encoded.input_ids.size(),
+                                                                   maximum_prompt_tokens, true));
     }
     output.starts_in_reasoning         = rendered.starts_in_reasoning;
     output.continuation_content        = rendered.continuation_content;

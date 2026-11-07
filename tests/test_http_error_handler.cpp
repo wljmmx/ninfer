@@ -1,5 +1,7 @@
 #include "serve/http_server.h"
 
+#include "runtime/contract/request.h"
+
 #include <nlohmann/json.hpp>
 
 #include <iostream>
@@ -35,7 +37,7 @@ int main() {
                       "invalid media did not retain its client-input classification");
     const ninfer::serve::ApiError context_limit = ninfer::serve::request_error_to_api_error(
         ninfer::RequestError(ninfer::RequestErrorKind::ContextLengthExceeded,
-                             "prepared prompt has 200 tokens, exceeding Engine max_context 128"));
+                             ninfer::runtime::context_length_error_message(200, 128)));
     failures +=
         check(context_limit.status == 400 && context_limit.code == "context_length_exceeded" &&
                   context_limit.message.find("200 tokens") != std::string::npos &&
