@@ -359,3 +359,47 @@ current `#else` fallback: `None`（上游无门控，搬入时补）
 
 > 判定口径：只有「同族调度类继承关系可读且仅差 swizzle」才写机械映射；其余一律登记为
 > 待实测，避免在计划里写入未验证的精确类型。T016 复核时应把这些行替换为实测结论或删除。
+
+---
+
+## HC mix (`src/ops/gated_residual/mix/`, T086 / upstream 5989682a)
+
+The four-stream HC mix ships two implementations per projection: TMA folded/projection
+kernels (sm_90+) and cp.async folded/split-K kernels (sm_80+). The production route table
+in `mix/plan.cpp` is measured on sm_120a and contains TMA arms from 65 columns upward.
+On sm_89 the TMA arms are compiled out (`#if defined(NINFER_ENABLE_TMA)` in
+`bf16_a16_tma_mma.cuh`, `up_tma_mix.cuh`, `bf16_split_k_launch.cuh`), and `plan()`
+remaps every TMA route onto the family's own cp.async schedule at the same token
+interval. `capacity()` runs the same remap, so workspace sizing (including the Down
+split factor, 2/4 -> 8) follows the executed plan.
+
+| Upstream (sm_120a) | sm_89 fallback | Note |
+|---|---|---|
+| `Down::TmaSplit2` (2 x 32x64x64) | `Down::Split8x32` (8 x 32x32x64) | split factor rises 2 -> 8 |
+| `Down::TmaSplit4` (4 x 32x64x64) | `Down::Split8x32` | split factor 4 -> 8 |
+| `Down::Tma96Split4` (4 x 32x96x64) | `Down::Split8x32` | 96-column tile -> 32 |
+| `Down::Tma96Split8` (8 x 32x96x64) | `Down::Split8x32` | 96-column tile -> 32 |
+| `Down::Tma80` (no split, 32x80x64) | `Down::Split8x32` | TMA-only 80-column tile |
+| `Up::TmaFolded16x64` | `Up::Folded16x16` (`up_mma_mix_kernel<16,16>`) | striped 4-D TMA gather -> per-row cp.async gather |
+| `Up::TmaFolded32x64` | `Up::Folded32x32` (`up_mma_mix_kernel<32,32>`) | same |
+
+Status: wired and exercised on sm_89 (RTX 4090) by `ninfer_hc_mix_test` (both `Block` and
+`Final` forms across the full column sweep, independent FP64 oracle) and
+`ninfer_hc_gated_residual_bench --op block-mix|final-mix`. The fallback is a correctness
+path, not a tuned one: the cp.async rungs were tuned upstream for the low-column region,
+and no sm_89 measurement of the TMA-to-folded gap exists yet (no local model wires HC).
+Re-measure before activating HC on a 35B/27B execution path.
+
+## Gated RMSNorm D128 ladder (`src/ops/launcher/rmsnorm.cu`, T084 / upstream 6a4104fd)
+
+Upstream 6a4104fd adds a dedicated D128 gated launch ladder (128/256/512-thread CTAs
+selected by row count) on top of the general gated route. The ladder is a sm_120a
+measurement and is kept there; on Ada the launcher falls through to the previous
+general path.
+
+| Upstream (sm_120a) | sm_89 (Ada) | Evidence |
+|---|---|---|
+| `launch_gated_d128<SiluGated|SigmoidGated, {128,256,512}>` ladder for `aligned2 && d == 128` | previous general gated route (`kGateOnGrid` prefetch policy) | D128/H48 graph cold, repeat 200: identical min/median at T=1,8,32,128,512,2048 (56.32 us at T=2048 for both). The ladder changed the FP32 reduction order and moved the 35B default PPL by +0.24% (4801: 2.051275 -> 2.053651), so it is not taken without a speed win. |
+
+`silu_gated_rmsnorm` / `sigmoid_gated_rmsnorm` remain fully available on sm_89; only the
+launch geometry differs.

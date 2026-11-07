@@ -44,18 +44,17 @@ __global__ void bf16_split_k_reduce_kernel(const float* __restrict__ partials, O
     }
 }
 
-// The caller owns disjoint scratch for all partials until the final reduction on this stream.
-// The contraction uses identity; only the final reduction may read residuals or apply nonlinearity.
-template <class Schedule, int Splits, class Output, class Epilogue>
-void launch_bf16_a16_split_k_mma(const Bf16A16Operands& p, Output output, Epilogue epilogue,
-                                 Bf16SplitKWorkspace workspace, cudaStream_t stream) {
+template <int Splits>
+void validate_bf16_split_k_workspace(const Bf16A16Operands& p, Bf16SplitKWorkspace workspace) {
     const auto required = bf16_split_k_workspace_bytes<Splits>(p.rows, p.tokens);
     if (!workspace.partials || reinterpret_cast<std::uintptr_t>(workspace.partials) % 16 ||
         workspace.bytes < required)
         throw std::invalid_argument("BF16 split-K needs aligned caller-owned FP32 workspace");
-    launch_bf16_mma_partitions<Schedule, Splits>(
-        p, Bf16SplitKPartialOutput{workspace.partials, p.rows, p.tokens}, LinearIdentityEpilogue{},
-        stream);
+}
+
+template <int Splits, class Output, class Epilogue>
+void launch_bf16_split_k_reduce(const Bf16A16Operands& p, Output output, Epilogue epilogue,
+                                Bf16SplitKWorkspace workspace, cudaStream_t stream) {
     const auto elements = static_cast<std::int64_t>(p.rows) * p.tokens;
     const auto blocks   = std::min<std::int64_t>((elements + 255) / 256, 65535);
     bf16_split_k_reduce_kernel<Splits><<<static_cast<unsigned>(blocks), 256, 0, stream>>>(
@@ -63,4 +62,27 @@ void launch_bf16_a16_split_k_mma(const Bf16A16Operands& p, Output output, Epilog
     CUDA_CHECK(cudaGetLastError());
 }
 
+// The caller owns disjoint scratch for all partials until the final reduction on this stream.
+// The contraction uses identity; only the final reduction may read residuals or apply nonlinearity.
+template <class Schedule, int Splits, class Output, class Epilogue>
+void launch_bf16_a16_split_k_mma(const Bf16A16Operands& p, Output output, Epilogue epilogue,
+                                 Bf16SplitKWorkspace workspace, cudaStream_t stream) {
+    validate_bf16_split_k_workspace<Splits>(p, workspace);
+    launch_bf16_mma_partitions<Schedule, Splits>(
+        p, Bf16SplitKPartialOutput{workspace.partials, p.rows, p.tokens}, LinearIdentityEpilogue{},
+        stream);
+    launch_bf16_split_k_reduce<Splits>(p, output, epilogue, workspace, stream);
+}
+
+#if defined(NINFER_ENABLE_TMA)
+template <class Schedule, int Splits, class Output, class Epilogue>
+void launch_bf16_a16_tma_split_k_mma(const Bf16A16Operands& p, Output output, Epilogue epilogue,
+                                     Bf16SplitKWorkspace workspace, cudaStream_t stream) {
+    validate_bf16_split_k_workspace<Splits>(p, workspace);
+    launch_bf16_a16_tma_mma<Schedule, Splits>(
+        p, Bf16SplitKPartialOutput{workspace.partials, p.rows, p.tokens}, LinearIdentityEpilogue{},
+        stream);
+    launch_bf16_split_k_reduce<Splits>(p, output, epilogue, workspace, stream);
+}
+#endif // NINFER_ENABLE_TMA
 } // namespace ninfer::ops::detail
