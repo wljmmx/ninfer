@@ -32,6 +32,13 @@ ninfer_internal_includes(diag-moe)
 target_link_libraries(diag-moe PRIVATE ninfer_engine ninfer_product_logging CUDA::cudart
                                          ninfer::json)
 
+# port (sm_89): offline CPU-partial verification harness for the KV-partition seam
+# (int8/host_partial.h). Compares the host attention partial against the production grouped
+# instance and runs the seam A/B on long decode workloads; never part of the product binaries.
+add_executable(diag-cpu-partial diag-cpu-partial/main.cpp)
+ninfer_internal_includes(diag-cpu-partial)
+target_link_libraries(diag-cpu-partial PRIVATE ninfer_engine ninfer_product_logging CUDA::cudart)
+
 # Windows product binaries decode argv and narrow file paths as UTF-8 (the engine's whole
 # text pipeline is UTF-8); the activeCodePage manifest makes the process ANSI code page
 # UTF-8 system-wide on Windows 10 1903 and newer.
