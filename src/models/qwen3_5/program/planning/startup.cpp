@@ -118,7 +118,7 @@ std::optional<std::uint32_t> declared_resident_pages(std::uint32_t fitted_pages)
             "arena SMALLER than the planned " + std::to_string(fitted_pages) +
             " pages; " + std::to_string(requested) +
             " would do nothing. To make the arena larger, size it from device memory with "
-            "--kv-capacity auto (optionally with --kv-capacity-headroom-mib), which keeps the "
+            "--kv-capacity auto (optionally with --kv-sizing-headroom-mib), which keeps the "
             "arena consistent with the resolved capacity reservation.");
     }
     return static_cast<std::uint32_t>(requested);

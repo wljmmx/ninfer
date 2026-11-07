@@ -174,6 +174,20 @@ int main() {
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--max-tokens", "12"});
     failures += check(canonical.launch.generation.max_tokens == 12,
                       "canonical --max-tokens spelling was not accepted");
+    // T050 / T020 J3: the startup planning headroom is its own startup field, configurable on both
+    // entry points and never folded into the KV sizing headroom.
+    const CliOptions planning_headroom =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+               "--startup-planning-headroom-mib", "3072"});
+    failures += check(planning_headroom.launch.engine.startup_planning_headroom_bytes == (3ULL << 30),
+                      "--startup-planning-headroom-mib did not reach the CLI engine options");
+    failures += check(help.find("--startup-planning-headroom-mib") != std::string::npos,
+                      "CLI help omits --startup-planning-headroom-mib");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--startup-planning-headroom-mib", "1.5x"});
+                      }),
+                      "CLI accepted a malformed startup planning headroom");
 
     // TOML file: the same field catalog, layered under argv.
     const auto config_path = write_config(
@@ -181,7 +195,8 @@ int main() {
         "cli.prompt = \"file prompt\"\n"
         "generation.max_tokens = 24\n"
         "generation.sampling.temperature = 0.5\n"
-        "engine.kv_dtype = \"int8\"\n");
+        "engine.kv_dtype = \"int8\"\n"
+        "engine.startup_planning_headroom_mib = 1280\n");
     const CliOptions from_file = parse({"ninfer-cli", "--config", config_path.string()});
     failures += check(from_file.launch.engine.artifact_path ==
                               config_path.parent_path() / "from-file.ninfer" &&
@@ -189,6 +204,8 @@ int main() {
                           from_file.launch.generation.max_tokens == 24 &&
                           from_file.launch.generation.sampling.temperature &&
                           *from_file.launch.generation.sampling.temperature == 0.5F &&
+                          from_file.launch.engine.startup_planning_headroom_bytes ==
+                              (1280ULL << 20) &&
                           from_file.launch.engine.kv_cache == ninfer::KvCacheStorage::Int8Group64,
                       "TOML startup file did not resolve through the shared schema");
     failures += check(from_file.launch.provenance.config_path ==

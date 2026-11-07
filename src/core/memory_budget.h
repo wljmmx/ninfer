@@ -28,6 +28,8 @@
 // function of measured value, printed next to the point it picked, rather than a size copied from a
 // comment.
 
+#include "ninfer/types.h"
+
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -187,14 +189,19 @@ inline std::uint64_t select_pool_bytes(std::uint64_t available_bytes, DeviceSpli
 }
 
 // The split, in one place. Default reproduces the rule that was here before, to the byte:
-//   pool = free - (kv + 1 GiB safety), floored at zero.
+//   pool = free - (kv + startup planning headroom), floored at zero.
+// The headroom is the startup planning allowance: Graph capture and weight staging may consume it,
+// and nothing requires it to stay free after initialization. It is configurable
+// (--startup-planning-headroom-mib) and is NOT the KV sizing headroom of --kv-capacity auto, which
+// was already deducted when the KV reservation above was resolved.
 // The overrides pin either side instead, and the other side takes what is left; a pinned pair that
 // does not fit is reported and the pool gives way, because KV is touched by every step of every
 // request and the pool only by the routed top-k.
-inline DeviceSplit plan_device_split(std::size_t free_bytes, std::size_t kv_need_bytes) {
-    constexpr std::size_t kPoolSafetyBytes = 1ULL << 30;
+inline DeviceSplit
+plan_device_split(std::size_t free_bytes, std::size_t kv_need_bytes,
+                  std::size_t startup_headroom_bytes = kDefaultStartupPlanningHeadroomBytes) {
     DeviceSplit split{};
-    split.safety_bytes = kPoolSafetyBytes;
+    split.safety_bytes = startup_headroom_bytes;
     split.kv_bytes     = kv_need_bytes;
 
     const auto pinned_pool = static_cast<std::size_t>(detail::env_mib("NINFER_BUDGET_EXPERT_MB"));

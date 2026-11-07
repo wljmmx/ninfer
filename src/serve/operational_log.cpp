@@ -553,10 +553,10 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
             const bool automatic = memory.kv_capacity_mode == KvCapacityMode::Automatic;
             const char* const mode_advice =
                 automatic ? "The arena is already memory-sized: free device memory with a smaller "
-                            "--kv-capacity-headroom-mib, or enable the eviction contract so "
+                            "--kv-sizing-headroom-mib, or enable the eviction contract so "
                             "residency can be smaller than the context"
                           : "Raise it with --kv-capacity auto (tune with "
-                            "--kv-capacity-headroom-mib), or enable the eviction contract so "
+                            "--kv-sizing-headroom-mib), or enable the eviction contract so "
                             "residency can be smaller than the context";
             // appendix GY: spell the trade-off out instead of assuming the memory can be found. The
             // degradation bands are MEASURED on the gate corpus (appendices GV/GW): reaching 77%
@@ -632,7 +632,7 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
     if (slack_shortfall > (256U * 1024U * 1024U)) {
         logger_->warn(
             "memory | {} free after startup against {} planned: the device lost {} of free "
-            "memory between planning and startup. Use a larger --kv-capacity-headroom-mib",
+            "memory between planning and startup. Use a larger --kv-sizing-headroom-mib",
             product::format_pretty_bytes(memory.available_after_startup_bytes),
             product::format_pretty_bytes(memory.planned_slack_bytes),
             product::format_pretty_bytes(slack_shortfall));

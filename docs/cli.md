@@ -320,10 +320,18 @@ The artifact describes its model configuration and weight representations;
 the 64-token page size. `--kv-capacity auto` loads the selected weights, measures the remaining GPU
 memory, and directly chooses the largest legal page capacity for the complete enabled runtime
 layout. This includes the selected speculative backend, fixed sequence state, unified workspace,
-and CUDA Graph allowance, while leaving the default 1 GiB automatic headroom
-unallocated. It does not probe allocations or resize the pool at request time. The single-request
-CLI normally leaves the option omitted so it follows
+and CUDA Graph allowance, while leaving the default 1 GiB of KV sizing headroom
+unallocated (`--kv-sizing-headroom-mib`; `--kv-capacity-headroom-mib` is its former spelling and is
+still accepted for this release). It does not probe allocations or resize the pool at request time.
+The single-request CLI normally leaves the option omitted so it follows
 `--max-context`; the distinction matters primarily to a concurrent Engine or server.
+
+The two headrooms are separate quantities and never share a name. The KV sizing headroom above
+applies only to `--kv-capacity auto` and is memory the arena has to leave free. The startup
+planning headroom (`--startup-planning-headroom-mib`, default 1024 MiB) is the allowance held back
+from the routed expert pool instead: CUDA Graph capture and weight staging may consume it, and
+nothing requires it to be free once initialization finishes. `0` removes the allowance; weights,
+Graph/communication storage and workspace still count against the device budget.
 
 At Engine startup NInfer reserves model weights, persistent sequence state, one phase-reused
 Program workspace, and a separate CUDA Graph driver allowance. With Vision enabled, that one

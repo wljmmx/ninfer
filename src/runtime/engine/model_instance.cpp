@@ -134,8 +134,12 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
         if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess || free_bytes == 0) {
             throw std::runtime_error("expert cache auto sizing cannot read device memory");
         }
-        // Graph capture and the staging buffers still need room after the pool takes its share.
-        const auto split = core::plan_device_split(free_bytes, kv_reserve_bytes);
+        // Graph capture and the staging buffers still need room after the pool takes its share;
+        // that allowance is the configurable startup planning headroom (not the KV sizing
+        // headroom, which resolve_kv_capacity already left free when the arena was planned).
+        const auto split =
+            core::plan_device_split(free_bytes, kv_reserve_bytes,
+                                    options.startup_planning_headroom_bytes);
         core::report_device_split(split, free_bytes);
         requested = split.pool_bytes;
     }
@@ -307,8 +311,11 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     // device memory - the pool, the KV pages and the safety the split reserved - each is admitted
     // separately, and a refusal names the owner, what it asked for and what is left. The totals are
     // unchanged, so this is accounting that can say "no", not a new allocation policy.
+    // The third consumer is the startup planning allowance itself, so the cap carries the
+    // configured value: a lowered allowance must tighten the ledger too, not just the pool.
+    const std::uint64_t startup_headroom = options.startup_planning_headroom_bytes;
     const std::uint64_t device_cap =
-        instance.expert_cache->capacity_bytes() + kv_reserve_bytes + (1ULL << 30);
+        instance.expert_cache->capacity_bytes() + kv_reserve_bytes + startup_headroom;
     instance.ledger.set_cap(core::Tier::Device, device_cap);
     const auto admit = [&instance](core::Tier tier, const char* owner, std::uint64_t bytes) {
         if (instance.ledger.reserve(tier, owner, bytes)) { return true; }
@@ -323,7 +330,7 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     };
     (void)admit(core::Tier::Device, "expert-pool", instance.expert_cache->capacity_bytes());
     (void)admit(core::Tier::Device, "kv-pages", kv_reserve_bytes);
-    (void)admit(core::Tier::Device, "staging", 1ULL << 30);
+    (void)admit(core::Tier::Device, "staging", startup_headroom);
     // The warm tier's ceiling is the budget it just computed, not "a quarter of free RAM": the
     // partition is what the scheduler grants, and a module may not widen it on its own. The override
     // exists so a caller can grant less - and then the arena is what actually shrinks, rather than

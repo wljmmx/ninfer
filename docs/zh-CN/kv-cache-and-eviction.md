@@ -63,7 +63,8 @@ choose BF16, INT8 or FP8 KV on RTX 4090 (sm_89).
 | C 主机装得下一次完整抢占 | `host_capacity_bytes ≥ 每条车道字节 × 并发` | 不够则会退化为重算 |
 | D 该 KV 类型有缺页路径 | `nvfp4` 没有（且本机不可运行） | 引擎能力表 |
 
-不满足时保持 `off`，并在启动日志里**指明哪一条不满足**与对应杠杆（降并发 / 减小 `--kv-capacity-headroom-mib` /
+不满足时保持 `off`，并在启动日志里**指明哪一条不满足**与对应杠杆（降并发 / 减小 `--kv-sizing-headroom-mib`（旧名
+`--kv-capacity-headroom-mib`，保留一版期） /
 加大 `--host-context-mib` / 或显式 `--kv-evict on` 自行承担质量代价）。
 
 ### 3.2 `--kv-idle-reclaim-ms N`（**默认 60000**，`0` = 关）

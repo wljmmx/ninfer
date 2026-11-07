@@ -153,8 +153,11 @@ StartupConfigurationView view(const LaunchOptions& launch, const CliOptions* cli
             else
                 value = std::uint64_t{e.kv_capacity.explicit_tokens};
             break;
-        case Field::KvCapacityHeadroom:
+        case Field::KvSizingHeadroom:
             value = std::uint64_t{e.kv_capacity.automatic_headroom_bytes};
+            break;
+        case Field::StartupPlanningHeadroom:
+            value = std::uint64_t{e.startup_planning_headroom_bytes};
             break;
         case Field::PrefillChunk:
             value = std::uint64_t{e.prefill_chunk};

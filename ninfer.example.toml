@@ -26,9 +26,14 @@ kv_dtype = "bf16"
 # Explicit page count, or "auto" to size from device memory. Omitting it follows max_context;
 # serve additionally selects "auto" when max_concurrency is above 1.
 kv_capacity = "auto"
-# Serve only: sizing headroom left free by kv_capacity = "auto", decimal MiB resolved to whole
-# bytes. This is KV sizing, not the startup memory planning reserve.
-kv_capacity_headroom_mib = 1024
+# Serve only: slack left free when kv_capacity = "auto" fits the Main KV arena, decimal MiB
+# resolved to whole bytes. KV sizing only - not the startup planning reserve below.
+# engine.kv_capacity_headroom_mib is the former key and is still read for this release.
+kv_sizing_headroom_mib = 1024
+# Startup planning allowance held back from the expert pool, decimal MiB resolved to whole bytes.
+# Graph capture and weight staging may consume it; it need not be free after initialization.
+# 0 disables the reserve; the default is 1024 MiB.
+startup_planning_headroom_mib = 1024
 # Positive multiple of 128; omitted lets the model resolve it.
 prefill_chunk = 1024
 cuda_graph = true

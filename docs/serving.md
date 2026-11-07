@@ -1160,8 +1160,13 @@ outside the GPU executor and do not delay formation of the next batch.
 
 `--max-context` is each sequence's logical ceiling. `--kv-capacity` fixes the shared Main Text KV
 pool used by active requests and retained prefixes. `auto` accounts for the complete enabled runtime
-and leaves 1 GiB of sizing headroom; omitting the option makes it follow `--max-context`. Capacity
-resolves once at startup.
+and leaves 1 GiB of KV sizing headroom (`--kv-sizing-headroom-mib`; `--kv-capacity-headroom-mib` is
+its former spelling and is still accepted for this release); omitting the option makes it follow
+`--max-context`. Capacity resolves once at startup.
+
+`--startup-planning-headroom-mib` (default 1024 MiB) is a different quantity: it is the device
+memory held back from the routed expert pool so CUDA Graph capture and weight staging may consume
+it. It is not required to be free after initialization, and `0` removes it.
 
 Before each prefill, decode or replay unit, the runtime reserves the additional pages and temporary
 storage required by that unit. It first reclaims inactive cache resources when capacity is short.

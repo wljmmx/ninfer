@@ -374,8 +374,11 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry) {
                 kv_follows_context = false;
             }
             break;
-        case Field::KvCapacityHeadroom:
+        case Field::KvSizingHeadroom:
             kv_headroom = static_cast<std::size_t>(u64());
+            break;
+        case Field::StartupPlanningHeadroom:
+            engine.startup_planning_headroom_bytes = static_cast<std::size_t>(u64());
             break;
         case Field::PrefillChunk:
             engine.prefill_chunk = u32();
@@ -577,7 +580,7 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry) {
     }
     if (kv_headroom) {
         if (engine.kv_capacity.mode != KvCapacityMode::Automatic)
-            fail(Field::KvCapacityHeadroom,
+            fail(Field::KvSizingHeadroom,
                  "only means something with --kv-capacity auto: an explicit capacity is a fixed "
                  "arena and has no memory budget to leave slack in");
         engine.kv_capacity.automatic_headroom_bytes = *kv_headroom;
@@ -684,11 +687,18 @@ std::string startup_usage_text(std::string_view executable, EntryPoint entry) {
     if (entry == EntryPoint::Cli)
         out << "\nAnswer content uses stdout; reasoning and diagnostics use stderr.\n";
     out << "\nNotes:\n"
-        << "  Ranges are UTF-8 decimal; --host-context-mib and --kv-capacity-headroom-mib accept "
+        << "  Ranges are UTF-8 decimal; --host-context-mib and --kv-sizing-headroom-mib accept "
            "decimal MiB\n"
         << "  that must resolve to whole bytes; other --*-mib options are integer MiB.\n"
         << "  --kv-capacity auto leaves "
-        << (kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) << " MiB of sizing headroom.\n"
+        << (kDefaultKvSizingHeadroomBytes / (1024ULL * 1024ULL))
+        << " MiB of KV sizing headroom (--kv-sizing-headroom-mib;\n"
+        << "  --kv-capacity-headroom-mib is its former spelling and still works for this release).\n"
+        << "  --startup-planning-headroom-mib holds "
+        << (kDefaultStartupPlanningHeadroomBytes / (1024ULL * 1024ULL))
+        << " MiB back from the expert pool by default for\n"
+        << "  Graph capture and staging; startup may consume it and it need not be free "
+           "afterwards.\n"
         << "  context defaults: device-state=max-concurrency; Host budget is resolved from "
            "startup memory planning\n"
         << "  --model-id overrides the artifact metadata.name reported by the server\n"

@@ -422,8 +422,16 @@ int main() {
     failures += check(automatic.launch.engine.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
                           automatic.launch.engine.kv_capacity.explicit_tokens == 0 &&
                           automatic.launch.engine.kv_capacity.automatic_headroom_bytes ==
-                              ninfer::kDefaultKvCapacityHeadroomBytes,
+                              ninfer::kDefaultKvSizingHeadroomBytes,
                       "--kv-capacity auto did not select automatic sizing");
+    failures += check(automatic.launch.engine.startup_planning_headroom_bytes ==
+                              ninfer::kDefaultStartupPlanningHeadroomBytes,
+                      "the startup planning headroom default did not reach the engine");
+    // T020 J3: the two headrooms are separate fields with separate names; the former spelling is
+    // accepted for one release and still means KV sizing.
+    failures +=
+        check(ninfer::kDefaultKvCapacityHeadroomBytes == ninfer::kDefaultKvSizingHeadroomBytes,
+              "the legacy KV headroom constant changed value");
 
     // An explicit arena below max_context would let admission accept a request the arena cannot
     // hold, so the server refuses it up front. `auto` has no such check because its floor is the
@@ -438,19 +446,39 @@ int main() {
 
     const ServeOptions automatic_headroom =
         parse({"ninfer-serve", "model.ninfer", "--kv-capacity", "auto",
-               "--kv-capacity-headroom-mib", "512"});
+               "--kv-sizing-headroom-mib", "512"});
     failures +=
         check(automatic_headroom.launch.engine.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
                   automatic_headroom.launch.engine.kv_capacity.automatic_headroom_bytes == (512ULL << 20),
-              "--kv-capacity-headroom-mib did not reach the automatic policy");
+              "--kv-sizing-headroom-mib did not reach the automatic policy");
+    const ServeOptions legacy_headroom =
+        parse({"ninfer-serve", "model.ninfer", "--kv-capacity", "auto",
+               "--kv-capacity-headroom-mib", "768"});
+    failures +=
+        check(legacy_headroom.launch.engine.kv_capacity.automatic_headroom_bytes == (768ULL << 20) &&
+                  legacy_headroom.launch.engine.startup_planning_headroom_bytes ==
+                      ninfer::kDefaultStartupPlanningHeadroomBytes,
+              "the legacy --kv-capacity-headroom-mib spelling no longer means KV sizing alone");
+    const ServeOptions planning_headroom =
+        parse({"ninfer-serve", "model.ninfer", "--startup-planning-headroom-mib", "2048"});
+    failures +=
+        check(planning_headroom.launch.engine.startup_planning_headroom_bytes == (2ULL << 30) &&
+                  planning_headroom.launch.engine.kv_capacity.automatic_headroom_bytes == 0,
+              "--startup-planning-headroom-mib did not stay separate from KV sizing");
+    failures +=
+        check(ninfer::product::startup_usage_text("ninfer-serve", ninfer::product::EntryPoint::Serve)
+                      .find("--startup-planning-headroom-mib") != std::string::npos &&
+                  ninfer::product::startup_usage_text("ninfer-serve", ninfer::product::EntryPoint::Serve)
+                          .find("--kv-sizing-headroom-mib") != std::string::npos,
+              "serve help omits one of the split headroom controls");
 
     bool headroom_with_explicit_rejected = false;
     try {
         (void)parse({"ninfer-serve", "model.ninfer", "--kv-capacity", "16384",
-                     "--kv-capacity-headroom-mib", "512"});
+                     "--kv-sizing-headroom-mib", "512"});
     } catch (const std::invalid_argument&) { headroom_with_explicit_rejected = true; }
     failures += check(headroom_with_explicit_rejected,
-                      "automatic headroom was accepted without --kv-capacity auto");
+                      "KV sizing headroom was accepted without --kv-capacity auto");
 
     const ServeOptions logged = parse({"ninfer-serve", "model.ninfer", "--request-log-jsonl",
                                        "requests.jsonl", "--api-key", "do-not-log"});
@@ -479,6 +507,7 @@ int main() {
                     "server.port = 9090\n"
                     "engine.max_concurrency = 3\n"
                     "engine.kv_capacity = \"auto\"\n"
+                    "engine.startup_planning_headroom_mib = 1536\n"
                     "engine.kv_capacity_headroom_mib = 256\n"
                     "context_cache.evict = \"auto\"\n";
         }
@@ -489,6 +518,8 @@ int main() {
                                   ninfer::KvCapacityMode::Automatic &&
                               from_file.launch.engine.kv_capacity.automatic_headroom_bytes ==
                                   (256ULL << 20) &&
+                              from_file.launch.engine.startup_planning_headroom_bytes ==
+                                  (1536ULL << 20) &&
                               from_file.launch.engine.evict_contract ==
                                   ninfer::EvictionContract::Auto,
                           "serve TOML configuration did not reach the local options");

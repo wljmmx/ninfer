@@ -76,11 +76,26 @@ enum class EvictionContract : std::uint8_t {
     Auto,
 };
 
-inline constexpr std::size_t kDefaultKvCapacityHeadroomBytes = 1024ULL * 1024ULL * 1024ULL;
+// KV sizing headroom: the slack `--kv-capacity auto` leaves free when it fits the Main KV arena
+// into whatever device memory remains after the weights. It is a sizing reserve, NOT the startup
+// planning allowance (see kDefaultStartupPlanningHeadroomBytes below).
+inline constexpr std::size_t kDefaultKvSizingHeadroomBytes = 1024ULL * 1024ULL * 1024ULL;
+// Former spelling, kept addressable for one release after the T020 J3 split (the value is the KV
+// sizing headroom, nothing else).
+inline constexpr std::size_t kDefaultKvCapacityHeadroomBytes = kDefaultKvSizingHeadroomBytes;
+
+// Startup planning headroom: device memory held back from the expert-pool split so startup
+// allocations (Graph capture, weight staging) may consume it. Allocating it is what the pool split
+// gives up; it is not memory that has to be free once initialization finishes. The port keeps the
+// measured 1 GiB it has always held back (upstream 6dd2b1b4 uses 512 MiB); lower it only with
+// measurements in hand.
+inline constexpr std::size_t kDefaultStartupPlanningHeadroomBytes = 1024ULL * 1024ULL * 1024ULL;
 
 struct KvCapacityPolicy {
     KvCapacityMode mode                  = KvCapacityMode::Explicit;
     std::uint32_t explicit_tokens        = 2048;
+    // KV sizing headroom, deducted once from the automatic arena budget. Never the startup
+    // planning allowance, and rejected outright with an explicit (fixed) capacity.
     std::size_t automatic_headroom_bytes = 0;
 
     [[nodiscard]] static constexpr KvCapacityPolicy
@@ -89,7 +104,7 @@ struct KvCapacityPolicy {
     }
 
     [[nodiscard]] static constexpr KvCapacityPolicy
-    automatic(std::size_t headroom_bytes = kDefaultKvCapacityHeadroomBytes) noexcept {
+    automatic(std::size_t headroom_bytes = kDefaultKvSizingHeadroomBytes) noexcept {
         return KvCapacityPolicy{KvCapacityMode::Automatic, 0, headroom_bytes};
     }
 };
@@ -227,6 +242,10 @@ struct EngineOptions {
     int device                         = 0;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
+    // Per-startup allowance held back from the expert-pool split; Graph capture and staging may
+    // consume it, and nothing requires it to be free after initialization. Distinct from the KV
+    // sizing headroom inside KvCapacityPolicy.
+    std::size_t startup_planning_headroom_bytes = kDefaultStartupPlanningHeadroomBytes;
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;

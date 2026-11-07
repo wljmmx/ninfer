@@ -29,7 +29,8 @@ enum class Field {
     MaxContext,
     KvDtype,
     KvCapacity,
-    KvCapacityHeadroom,
+    KvSizingHeadroom,
+    StartupPlanningHeadroom,
     PrefillChunk,
     CudaGraph,
     MaxConcurrency,
@@ -106,6 +107,10 @@ struct FieldSpec {
     std::string_view description;
     Scope scope            = Scope::Common;
     ConfigurationUnit unit = ConfigurationUnit::None;
+    // Superseded spellings accepted for one release period (T020 J3 split). They are parsed like
+    // the canonical ones and never printed in the help text.
+    std::string_view legacy_key;
+    std::string_view legacy_flag;
 };
 
 struct DefaultValue {};

@@ -43,7 +43,11 @@ void read_table(const toml::table& table, std::string_view prefix,
         const std::string name = std::string(prefix) + std::string(key.str());
         const auto catalog     = fields();
         const auto field       = std::find_if(catalog.begin(), catalog.end(),
-                                              [&](const auto& spec) { return spec.key == name; });
+                                              [&](const auto& spec) {
+                                                  return spec.key == name ||
+                                                         (!spec.legacy_key.empty() &&
+                                                          spec.legacy_key == name);
+                                              });
         const auto source      = source_of(value.source());
         if (field != catalog.end()) {
             try {

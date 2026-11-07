@@ -22,11 +22,19 @@ constexpr FieldSpec kFields[] = {
     {Field::KvCapacity, "engine.kv_capacity", "--kv-capacity", "", "", "", "N|auto",
      "Shared Main KV capacity; omitted follows --max-context (serve: auto when --max-concurrency "
      "is above 1)."},
-    {Field::KvCapacityHeadroom, "engine.kv_capacity_headroom_mib", "--kv-capacity-headroom-mib", "",
-     "", "", "MIB",
-     "Sizing headroom left free by --kv-capacity auto, in decimal MiB resolved to whole bytes. "
-     "This is KV sizing, not the startup memory planning reserve.",
-     Scope::Serve, ConfigurationUnit::Bytes},
+    // T020 J3: the two headrooms are different quantities and must not share a name. This one sizes
+    // the automatic Main KV arena; the startup planning allowance is the next field.
+    {Field::KvSizingHeadroom, "engine.kv_sizing_headroom_mib", "--kv-sizing-headroom-mib", "", "", "",
+     "MIB",
+     "Slack --kv-capacity auto leaves free when it fits the Main KV arena, in decimal MiB resolved "
+     "to whole bytes. KV sizing only; it is not the startup planning reserve.",
+     Scope::Serve, ConfigurationUnit::Bytes, "engine.kv_capacity_headroom_mib",
+     "--kv-capacity-headroom-mib"},
+    {Field::StartupPlanningHeadroom, "engine.startup_planning_headroom_mib",
+     "--startup-planning-headroom-mib", "", "", "", "MIB",
+     "Per-startup planning allowance held back from the expert pool (default 1024 MiB); Graph "
+     "capture and staging may consume it, and it need not be free after initialization.",
+     Scope::Common, ConfigurationUnit::Bytes},
     {Field::PrefillChunk, "engine.prefill_chunk", "--prefill-chunk", "", "", "", "N",
      "Prefill chunk; a positive multiple of 128."},
     {Field::CudaGraph, "engine.cuda_graph", "", "", "", "--no-cuda-graph", "",
@@ -271,8 +279,8 @@ std::uint64_t mib_bytes(const RawValue& value, bool positive) {
 }
 
 // Integer MiB -> bytes for the options that have always taken whole MiB only. --host-context-mib
-// and --kv-capacity-headroom-mib stay on mib_bytes because their historical contract is exact
-// bytes; the rest keep their original integer-only range.
+// and --kv-sizing-headroom-mib (formerly --kv-capacity-headroom-mib) stay on mib_bytes because
+// their historical contract is exact bytes; the rest keep their original integer-only range.
 std::uint64_t whole_mib_bytes(const RawValue& value, bool positive) {
     if (const auto* text_value = std::get_if<std::string>(&value);
         text_value && text_value->find('.') != std::string::npos)
@@ -301,6 +309,7 @@ bool accepts_flag(const FieldSpec& spec, EntryPoint entry, std::string_view spel
     if (!spec.cli_flag.empty() && entry == EntryPoint::Cli && spelling == spec.cli_flag) return true;
     if (!spec.serve_flag.empty() && entry == EntryPoint::Serve && spelling == spec.serve_flag)
         return true;
+    if (!spec.legacy_flag.empty() && spelling == spec.legacy_flag) return true;
     return !spec.flag.empty() && spelling == spec.flag;
 }
 
@@ -308,7 +317,8 @@ FieldValue parse_field_value(Field field, const RawValue& value, bool command_li
     const auto* string = std::get_if<std::string>(&value);
     const auto is      = [&](std::string_view word) { return string && *string == word; };
     switch (field) {
-    case Field::KvCapacityHeadroom:
+    case Field::KvSizingHeadroom:
+    case Field::StartupPlanningHeadroom:
     case Field::HostContext:
         return mib_bytes(value, false);
     case Field::MediaCache:
@@ -476,7 +486,8 @@ FieldValue parse_field_value(Field field, const RawValue& value, bool command_li
             invalid("stop strings must be nonempty");
         return result;
     }
-    case Field::KvCapacityHeadroom:
+    case Field::KvSizingHeadroom:
+    case Field::StartupPlanningHeadroom:
     case Field::HostContext:
     case Field::MediaCache:
     case Field::MediaLive:
