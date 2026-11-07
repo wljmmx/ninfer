@@ -1,5 +1,7 @@
 #include "ninfer/ops/causal_conv1d_silu.h"
 #include "ops/op_tester.h"
+#include "core/decode_graph.h"
+#include "core/device.h"
 
 #include <cuda_runtime.h>
 
@@ -296,9 +298,11 @@ int split_rejection_case(std::int32_t T) {
 }
 
 // One registered geometry, one column count, one state form. `offset_pairs` shifts every
-// destination by one BF16 pair, which the contract admits and the arena never produces.
+// destination by one BF16 pair, which the contract admits and the arena never produces. `captured`
+// replays the call through a CUDA graph, which is how the engine issues decode steps.
 int split_case(std::int32_t C, std::int32_t q_dim, std::int32_t k_dim, std::int32_t value_dim,
-               std::int32_t T, bool alias_state, bool offset_pairs, std::uint32_t seed) {
+               std::int32_t T, bool alias_state, bool offset_pairs, std::uint32_t seed,
+               bool captured = false) {
     const LogicalInput input       = make_input(C, T, seed);
     const std::vector<float> state = make_state(C, seed + 2U);
     const OracleResult oracle      = causal_conv_oracle(input.x, input.weight, state, C, T, false);
@@ -352,12 +356,25 @@ int split_case(std::int32_t C, std::int32_t q_dim, std::int32_t k_dim, std::int3
     Tensor tk(at(k), DType::BF16, {k_dim, T});
     Tensor tv(at(v), DType::BF16, {value_dim, T});
 
-    ops::causal_conv1d_silu_split(tx, tw, ts_in, ts_out, tq, tk, tv, nullptr);
-    cuda_synchronize();
+    if (!captured) {
+        ops::causal_conv1d_silu_split(tx, tw, ts_in, ts_out, tq, tk, tv, nullptr);
+        cuda_synchronize();
+    } else {
+        // Graph capture needs a non-default stream; the legacy stream cannot be captured.
+        DeviceContext device;
+        DecodeGraphDefinition definition;
+        DecodeGraphExecutable graph;
+        definition.capture(device.stream, [&] {
+            ops::causal_conv1d_silu_split(tx, tw, ts_in, ts_out, tq, tk, tv, device.stream);
+        });
+        graph.instantiate(definition);
+        graph.launch(device.stream);
+        cuda_synchronize();
+    }
 
     const std::string tag     = "causal_conv1d_silu_split C=" + std::to_string(C) +
                                 " T=" + std::to_string(T) + (alias_state ? " alias" : "") +
-                                (offset_pairs ? " offset" : "");
+                                (offset_pairs ? " offset" : "") + (captured ? " graph" : "");
     const std::size_t q_count = static_cast<std::size_t>(q_dim) * static_cast<std::size_t>(T);
     const std::size_t k_count = static_cast<std::size_t>(k_dim) * static_cast<std::size_t>(T);
     const std::size_t v_count = static_cast<std::size_t>(value_dim) * static_cast<std::size_t>(T);
@@ -766,6 +783,31 @@ int main() {
                                6200U + static_cast<std::uint32_t>(T));
         failures += split_case(kQwen35Channels, 2048, 2048, 4096, T, false, true,
                                7200U + static_cast<std::uint32_t>(T));
+    }
+
+    // Local Q/K/V channels; qualify complete outputs and exact history transitions.
+    for (const std::int32_t T : {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}) {
+        for (const bool alias : {false, true}) {
+            failures += split_case(5120, 1024, 1024, 3072, T, alias, false,
+                                   9000U + static_cast<std::uint32_t>(T));
+        }
+    }
+    for (const std::int32_t T : {17,  31,  32,  33,  63,  64,  65,   127,  128,  129, 255,
+                                 256, 257, 511, 512, 513, 1023, 1024, 1025, 2048, 4096}) {
+        for (const bool alias : {false, true}) {
+            failures += split_case(5120, 1024, 1024, 3072, T, alias, false,
+                                   10000U + static_cast<std::uint32_t>(T));
+        }
+    }
+    for (const std::int32_t T : {1, 6, 16, 33, 257, 512, 4096}) {
+        for (const bool alias : {false, true}) {
+            failures += split_case(5120, 1024, 1024, 3072, T, alias, false,
+                                   11000U + static_cast<std::uint32_t>(T), true);
+        }
+    }
+    for (const std::int32_t T : {16, 33, 257}) {
+        failures += split_case(5120, 1024, 1024, 3072, T, false, true,
+                               12000U + static_cast<std::uint32_t>(T));
     }
 
     // Argument rejection, on both sides of the route bound.

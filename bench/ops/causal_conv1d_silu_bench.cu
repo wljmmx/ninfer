@@ -49,8 +49,8 @@ struct Options {
 constexpr std::int32_t kSplitKeyDim = 2048;
 
 bool split_partition(std::int32_t channels, std::int32_t& key_dim, std::int32_t& value_dim) {
-    key_dim   = kSplitKeyDim;
-    value_dim = channels - 2 * kSplitKeyDim;
+    key_dim   = channels == 5120 ? 1024 : kSplitKeyDim;
+    value_dim = channels - 2 * key_dim;
     return value_dim > 0;
 }
 
