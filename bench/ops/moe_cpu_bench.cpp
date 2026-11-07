@@ -99,6 +99,25 @@ Bank make_bank(QType type, QuantLayout quant, std::uint64_t rows, std::uint64_t 
 int main(int argc, char** argv) {
     const int iterations = argc > 1 ? std::atoi(argv[1]) : 200;
     const int workers    = argc > 2 ? std::atoi(argv[2]) : 0;
+    // port (sm_89): NINFER_BENCH_TOKENS routes this many tokens through the same expert set, so
+    // every group carries that many members and gate_up runs its multi-column instantiations
+    // (columns = min(plan.max_columns, tokens); 2 on AVX2, where the wide 4-column body never
+    // runs). The engine's split layer calls this with one token per decode step, so 1 stays the
+    // default and the historical numbers keep their meaning.
+    static const int tokens = [] {
+        const char* value = std::getenv("NINFER_BENCH_TOKENS");
+        return value != nullptr ? std::max(1, std::atoi(value)) : 1;
+    }();
+    // port (sm_89): NINFER_BENCH_FLUSH_MIB touches this many MiB before every timed call. The
+    // rotating route already keeps the expert planes cold (the whole bank is far past L3), so
+    // this knob is the belt-and-braces house flush for shared planes and code paths; the touch
+    // itself is outside the timed region.
+    static const int flush_mib = [] {
+        const char* value = std::getenv("NINFER_BENCH_FLUSH_MIB");
+        return value != nullptr ? std::atoi(value) : 0;
+    }();
+    static std::vector<std::byte> flush_buffer;
+    if (flush_mib > 0) { flush_buffer.assign(std::size_t(flush_mib) << 20, std::byte{0}); }
 
     static CpuTopology topology;
     // plan_cpu_team() rejects a team wider than the processors it selected, and an exception
@@ -145,24 +164,26 @@ int main(int argc, char** argv) {
     // activation plane comes out exactly zero and the check below cannot tell a correct kernel
     // from a broken one. The spread matters too: a constant row quantises losslessly, which would
     // hide the int8 path's rounding instead of measuring it.
-    std::vector<std::uint16_t> x(static_cast<std::size_t>(kHidden));
+    std::vector<std::uint16_t> x(static_cast<std::size_t>(kHidden) * tokens);
     for (std::size_t i = 0; i < x.size(); ++i) {
         x[i] = static_cast<std::uint16_t>(0x3a80 + (i % 4) * 0x08);
     }
-    std::vector<float> out(static_cast<std::size_t>(kHidden), 0.0F);
-    std::vector<std::int32_t> ids(kTopK);
-    std::vector<float> coefficients(kTopK, 0.125F);
+    std::vector<float> out(static_cast<std::size_t>(kHidden) * tokens, 0.0F);
+    std::vector<std::int32_t> ids(kTopK * tokens);
+    std::vector<float> coefficients(kTopK * tokens, 0.125F);
     std::vector<std::int32_t> mask(kExperts, 1);
     for (int j = 0; j < kTopK; ++j) { ids[j] = 40 + j * 7; }
 
-    Tensor x_tensor(x.data(), Device::cpu(), DType::BF16, {kHidden, 1});
-    Tensor out_tensor(out.data(), Device::cpu(), DType::FP32, {kHidden, 1});
-    ops::ExpertRoutes routes{Tensor(ids.data(), Device::cpu(), DType::I32, {kTopK, 1}),
-                             Tensor(coefficients.data(), Device::cpu(), DType::FP32, {kTopK, 1})};
+    Tensor x_tensor(x.data(), Device::cpu(), DType::BF16, {kHidden, tokens});
+    Tensor out_tensor(out.data(), Device::cpu(), DType::FP32, {kHidden, tokens});
+    ops::ExpertRoutes routes{Tensor(ids.data(), Device::cpu(), DType::I32, {kTopK, tokens}),
+                             Tensor(coefficients.data(), Device::cpu(), DType::FP32,
+                                    {kTopK, tokens})};
     Tensor mask_tensor(mask.data(), Device::cpu(), DType::I32, {kExperts});
 
     const auto capacity =
-        ops::routed_swiglu_workspace_capacity_bytes(profile, ops::ExpertSubsetKind::All, 1, 1);
+        ops::routed_swiglu_workspace_capacity_bytes(profile, ops::ExpertSubsetKind::All, tokens,
+                                                    tokens);
     std::vector<std::byte> scratch(capacity + 256);
     const auto base    = reinterpret_cast<std::uintptr_t>(scratch.data());
     const auto aligned = (256 - (base & 255)) & 255;
@@ -170,8 +191,8 @@ int main(int argc, char** argv) {
     // The engine allocates this per layer, so its size is the cost of the per-layer scratch.
     std::printf("moe cpu bench: workspace=%.1f KiB per call (engine allocates it per layer)\n",
                 capacity / 1024.0);
-    std::printf("moe cpu bench: hidden=%d intermediate=%d experts=%d top_k=%d workers=%u\n", kHidden,
-                kIntermediate, kExperts, kTopK, execution.worker_count());
+    std::printf("moe cpu bench: hidden=%d intermediate=%d experts=%d top_k=%d tokens=%d workers=%u\n",
+                kHidden, kIntermediate, kExperts, kTopK, tokens, execution.worker_count());
 
     // port (sm_89): NINFER_BENCH_ACTIVE keeps the team spinning between calls, the same thing
     // NINFER_CPU_TEAM_ACTIVE does in the engine. Combined with NINFER_BENCH_GAP_US it separates
@@ -198,11 +219,14 @@ int main(int argc, char** argv) {
                                         : static_cast<std::uint32_t>(iteration * kTopK) % kExperts;
             std::fill(mask.begin(), mask.end(), 0);
             // The op rejects duplicate route IDs, so every one of the top_k entries is filled with
-            // a distinct expert; the mask alone decides how many of them are computed.
-            for (int j = 0; j < kTopK; ++j) {
-                const auto expert = static_cast<std::int32_t>((base + j * 37U) % kExperts);
-                ids[j]            = expert;
-                if (j < misses) { mask[expert] = 1; }
+            // a distinct expert; the mask alone decides how many of them are computed. Every token
+            // routes to the same set, so one miss expert is one group of `tokens` members.
+            for (int t = 0; t < tokens; ++t) {
+                for (int j = 0; j < kTopK; ++j) {
+                    const auto expert = static_cast<std::int32_t>((base + j * 37U) % kExperts);
+                    ids[t * kTopK + j] = expert;
+                    if (j < misses) { mask[expert] = 1; }
+                }
             }
         };
 
@@ -231,6 +255,10 @@ int main(int argc, char** argv) {
             route(i + 16);
             arena.reset();
             if (gap_us > 0) { std::this_thread::sleep_for(std::chrono::microseconds(gap_us)); }
+            if (!flush_buffer.empty()) {
+                volatile std::byte sink{};
+                for (std::size_t f = 0; f < flush_buffer.size(); f += 64) { sink = flush_buffer[f]; }
+            }
             const auto call_begin = std::chrono::steady_clock::now();
             ops::routed_swiglu(x_tensor, profile, experts, routes, subset, out_tensor, arena,
                                execution);
@@ -241,7 +269,9 @@ int main(int argc, char** argv) {
         std::sort(samples.begin(), samples.end());
         const auto best   = samples.front();
         const auto median = samples[samples.size() / 2];
-        std::printf("  misses=%d  min %.3f ms  median %.3f ms  %.3f ms/expert  %.1f GMAC/s\n",
+        // port (sm_89): four digits, not three - the int8-vs-int16 A/B lands within a percent and
+        // the default-tier decision reads this ratio, so a %.3f min can straddle the 95/97% bands.
+        std::printf("  misses=%d  min %.4f ms  median %.4f ms  %.4f ms/expert  %.2f GMAC/s\n",
                     misses, best, median, best / misses, 3.146 * misses / best);
     }
 
@@ -250,7 +280,9 @@ int main(int argc, char** argv) {
     // is meant to stay well inside that.
     {
         std::fill(mask.begin(), mask.end(), 1);
-        for (int j = 0; j < kTopK; ++j) { ids[j] = 40 + j * 7; }
+        for (int t = 0; t < tokens; ++t) {
+            for (int j = 0; j < kTopK; ++j) { ids[t * kTopK + j] = 40 + j * 7; }
+        }
         const auto subset = ops::ExpertSubset{ops::ExpertSubsetKind::MaskOnes, mask_tensor};
         MemoryArena arena(MemorySpan{scratch.data() + aligned, capacity, Device::cpu()});
         std::fill(out.begin(), out.end(), 0.0F);

@@ -72,6 +72,13 @@ void launch(const Invocation& args, const Plan& plan, MemoryArena& arena,
     // ms/expert) for 0.145% of perplexity error against a 1% gate, and 18% off the CPU half of a
     // split token. NINFER_MOE_CPU_INT8=0 keeps the float reference for the gate that compares
     // both, =16 selects the int16 tier (same kernel shape, 258x finer codes).
+    // 2026-11-07 A/B on the 4090 host (i9-14900K/AVX2, moe_cpu_bench misses=1, min of 200 with a
+    // 96 MiB flush before every call, int8/int16 runs interleaved in one session): int16 0.0504
+    // ms/expert vs int8 0.0484 (float 0.0724) at the shipped one-token split shape - 96.0% of
+    // the int8 speed - and 94.1% at the two-column batch shape, where both tiers spill ymm
+    // (q16: 29 stack loads vs 4 at one column). Both sit under the 97% bar for making int16 the
+    // default, so int8 stays it; int16 remains the opt-in for the 258x finer precision
+    // (1.46e-5 vs 3.58e-3 relative) whenever a caller decides to pay ~4-6% for it.
     const char* int8_switch = std::getenv("NINFER_MOE_CPU_INT8");
     work.int16_path = int8_switch != nullptr && std::strcmp(int8_switch, "16") == 0;
     work.int8_path  = !work.int16_path &&
