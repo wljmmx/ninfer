@@ -142,3 +142,4 @@ ninfer_add_op_test(ninfer_moe_int8_mma_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_moe_int8_mma.cu"
   LIBRARIES ninfer_ops)
 include("${CMAKE_CURRENT_LIST_DIR}/gated_residual/tests.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/softmax_attention/qsa/tests.cmake")
