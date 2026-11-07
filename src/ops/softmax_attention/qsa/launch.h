@@ -1,9 +1,6 @@
 #pragma once
 
-#include "core/tensor.h"
-#include "core/weight.h"
-
-#include <cuda_runtime.h>
+#include "ninfer/ops/qsa.h"
 
 namespace ninfer::ops::detail::qsa {
 
@@ -13,5 +10,9 @@ void launch_kv_index(const Tensor& x, const Weight& weight, Tensor& key, Tensor&
                      Tensor& index_query, Tensor& index_key, cudaStream_t stream);
 void launch_joint(const Tensor& x, const Weight& weight, Tensor& query, Tensor& key, Tensor& gate,
                   Tensor& value, Tensor& index_query, Tensor& index_key, cudaStream_t stream);
+
+void launch_tail_extract(const QsaTailStateView& before, const QsaRawRecordReadView& records,
+                         const Tensor& accepted, QsaTailStateView after,
+                         DeviceExecutionView execution);
 
 } // namespace ninfer::ops::detail::qsa
