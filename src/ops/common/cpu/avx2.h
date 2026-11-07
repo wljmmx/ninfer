@@ -69,12 +69,21 @@ struct F32 {
 
 template <int Bits>
 inline __m256 decode_signed_q(const std::uint8_t* code, const std::uint8_t* high) noexcept {
-    static_assert(Bits >= 4 && Bits <= 6);
+    static_assert(Bits >= 4 && Bits <= 8);
     // port (sm_89): measurement switch. NINFER_MOE_CPU_NODECODE replaces the decode with a
     // constant so the bench reports what the decode itself costs. The values are wrong on purpose;
     // only the timing is read, and it decides whether an int8 dot product is worth building.
     static const bool skip_decode = std::getenv("NINFER_MOE_CPU_NODECODE") != nullptr;
     if (skip_decode) { return _mm256_set1_ps(1.0F); }
+    if constexpr (Bits == 8) {
+        // port (sm_89, P4-B): Q8_G32_FP16 weights carry one plain int8 code per dimension
+        // (Q8RowSplitStorage, ops/common/quant/integer.cuh:311-316) — no nibble packing, no
+        // high plane. The load reads eight consecutive codes; `high` is unused.
+        std::uint64_t packed;
+        std::memcpy(&packed, code, sizeof(packed));
+        const auto codes = _mm256_cvtepi8_epi32(_mm_cvtsi64_si128(packed));
+        return _mm256_cvtepi32_ps(codes);
+    }
     std::uint32_t packed;
     std::memcpy(&packed, code, sizeof(packed));
     const auto words = _mm_cvtepu8_epi16(_mm_cvtsi32_si128(packed));

@@ -70,7 +70,20 @@ struct F32 {
 
 template <int Bits>
 inline __m512 decode_signed_q(const std::uint8_t* code, const std::uint8_t* high) noexcept {
-    static_assert(Bits >= 4 && Bits <= 6);
+    static_assert(Bits >= 4 && Bits <= 8);
+    if constexpr (Bits == 8) {
+        // port (sm_89, P4-B): Q8_G32_FP16 — one plain int8 code per dimension, no high plane
+        // (Q8RowSplitStorage, ops/common/quant/integer.cuh:311-316); sixteen lanes read
+        // sixteen consecutive codes.
+        std::uint64_t packed_lo;
+        std::uint64_t packed_hi;
+        std::memcpy(&packed_lo, code, sizeof(packed_lo));
+        std::memcpy(&packed_hi, code + 8, sizeof(packed_hi));
+        const auto lo = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(&packed_lo));
+        const auto hi = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(&packed_hi));
+        const auto codes = _mm512_cvtepi8_epi32(_mm_unpacklo_epi64(lo, hi));
+        return _mm512_cvtepi32_ps(codes);
+    }
     std::uint64_t packed;
     std::memcpy(&packed, code, sizeof(packed));
     const auto words = _mm_cvtepu8_epi16(_mm_cvtsi64_si128(packed));

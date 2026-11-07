@@ -66,6 +66,55 @@ inline void dot_wide32(const Matrix& matrix, const int (&rows)[Rows],
 template <class Simd, int Bits, int K, int Rows, int Columns, class Input>
 inline void dot(const Matrix& matrix, const int (&rows)[Rows], const Input* const (&x)[Columns],
                 float (&out)[Rows][Columns]) noexcept {
+    if constexpr (Bits == 8) {
+        // port (sm_89, P4-B): Q8_G32_FP16 rows — one plain int8 code per dimension and ONE
+        // FP16 scale per 32-value group (Q8RowSplitStorage, ops/common/quant/integer.cuh:
+        // 311-316), so both the group count and the plane strides differ from the packed
+        // 4..6-bit family: codes stride K bytes per row (not K/2) and scales stride K/32 FP16
+        // elements (not K/64). The accumulate order keeps the family's exact shape — group
+        // partials scaled once per group, one horizontal reduction per output.
+        static_assert(Bits == 8 && K % 32 == 0);
+        using V = typename Simd::Float;
+        constexpr int kGroups32 = K / 32;
+        V total[Rows][Columns];
+        for (int r = 0; r < Rows; ++r) {
+            for (int c = 0; c < Columns; ++c) { total[r][c] = Simd::zero(); }
+        }
+        for (int group = 0; group < kGroups32; ++group) {
+            V partial[Rows][Columns];
+            for (int r = 0; r < Rows; ++r) {
+                for (int c = 0; c < Columns; ++c) { partial[r][c] = Simd::zero(); }
+            }
+            for (int k = 0; k < 32; k += Simd::lanes) {
+                V input[Columns];
+                for (int c = 0; c < Columns; ++c) {
+                    if constexpr (std::is_same_v<Input, float>) {
+                        input[c] = Simd::load(x[c] + group * 32 + k);
+                    } else {
+                        input[c] = Simd::bf16(x[c] + group * 32 + k);
+                    }
+                }
+                for (int r = 0; r < Rows; ++r) {
+                    const auto* codes = matrix.codes + std::size_t(rows[r]) * K + group * 32 + k;
+                    const auto values = Simd::template decode<8>(codes, nullptr);
+                    for (int c = 0; c < Columns; ++c) {
+                        partial[r][c] = Simd::fma(values, input[c], partial[r][c]);
+                    }
+                }
+            }
+            for (int r = 0; r < Rows; ++r) {
+                const auto scale =
+                    Simd::scale(matrix.scales[std::size_t(rows[r]) * kGroups32 + group]);
+                for (int c = 0; c < Columns; ++c) {
+                    total[r][c] = Simd::fma(partial[r][c], scale, total[r][c]);
+                }
+            }
+        }
+        for (int r = 0; r < Rows; ++r) {
+            for (int c = 0; c < Columns; ++c) { out[r][c] = Simd::sum(total[r][c]); }
+        }
+        return;
+    }
     if constexpr (Bits == 5 && std::is_base_of_v<common::cpu::avx2::F32, Simd>) {
         // Read once: getenv in the dispatch would run per expert, and this is an A/B knob.
         static const bool narrow_q5 = std::getenv("NINFER_MOE_CPU_Q5_NARROW") != nullptr;
@@ -268,8 +317,13 @@ template <class Simd, int K, int Rows, int Columns>
 }
 
 // channel_block (the maximum unit width) lives in work.h.
+//
+// GateBits selects the gate/up plane's code width: 4 for the q4 family (q4_q5 / q4_q6), 8 for
+// the Q8_G32_FP16 gate of q8_q8 (P4-B). The int8/int16 activation tiers and the bf16 gate dot
+// are q4-gate-only paths (they decode packed nibbles), so GateBits == 8 always runs the float
+// decode + FMA dot above.
 
-template <class Simd, int Columns>
+template <class Simd, int GateBits, int Columns>
 inline void gate_up(Work& work, const Group& group, int first, int channel, int begin,
                     unsigned bf16_columns) noexcept {
     constexpr int rows = Columns == 4 ? Simd::rows / 2 : Simd::rows;
@@ -290,9 +344,9 @@ inline void gate_up(Work& work, const Group& group, int first, int channel, int 
         }
         float values[rows][Columns];
         // The bf16 gate path only covers whole columns, so it is tried first and everything else
-        // falls through to the int4 dot product.
+        // falls through to the bit-selected dot product.
         const auto run_default = [&]() noexcept {
-            if constexpr (Simd::bf16_gate) {
+            if constexpr (Simd::bf16_gate && GateBits == 4) {
                 unsigned mask = 0;
                 for (int c = 0; c < Columns; ++c) { mask |= 1U << group.tokens[first + c]; }
                 if ((bf16_columns & mask) == mask) {
@@ -300,15 +354,19 @@ inline void gate_up(Work& work, const Group& group, int first, int channel, int 
                     return;
                 }
             }
-            dot<Simd, 4, hidden>(group.gate_up, indices, input, values);
+            dot<Simd, GateBits, hidden>(group.gate_up, indices, input, values);
         };
-        if constexpr (std::is_base_of_v<common::cpu::avx2::F32, Simd>) {
-            if (work.int8_path) {
-                dot_q4_q8<Simd, hidden, rows, Columns>(work, group.gate_up, indices,
-                                                       group.tokens + first, values);
-            } else if (work.int16_path) {
-                dot_q4_q16<Simd, hidden, rows, Columns>(work, group.gate_up, indices,
-                                                       group.tokens + first, values);
+        if constexpr (GateBits == 4) {
+            if constexpr (std::is_base_of_v<common::cpu::avx2::F32, Simd>) {
+                if (work.int8_path) {
+                    dot_q4_q8<Simd, hidden, rows, Columns>(work, group.gate_up, indices,
+                                                           group.tokens + first, values);
+                } else if (work.int16_path) {
+                    dot_q4_q16<Simd, hidden, rows, Columns>(work, group.gate_up, indices,
+                                                             group.tokens + first, values);
+                } else {
+                    run_default();
+                }
             } else {
                 run_default();
             }
@@ -358,7 +416,7 @@ inline void down(Work& work, const Group& group, int first, int channel,
     }
 }
 
-template <class Simd, int DownBits, bool FourColumns>
+template <class Simd, int DownBits, int GateBits, bool FourColumns>
 [[gnu::always_inline]] inline void compute_chunk(Work& work, const CpuWorkerContext& worker,
                                                  int begin, int columns,
                                                  unsigned bf16_columns) noexcept {
@@ -370,14 +428,17 @@ template <class Simd, int DownBits, bool FourColumns>
         const int channel = (index % blocks) * work.block;
         if constexpr (FourColumns) {
             if (task.columns == 4) {
-                gate_up<Simd, 4>(work, group, task.first_column, channel, begin, bf16_columns);
+                gate_up<Simd, GateBits, 4>(work, group, task.first_column, channel, begin,
+                                          bf16_columns);
                 continue;
             }
         }
         if (task.columns == 2) {
-            gate_up<Simd, 2>(work, group, task.first_column, channel, begin, bf16_columns);
+            gate_up<Simd, GateBits, 2>(work, group, task.first_column, channel, begin,
+                                      bf16_columns);
         } else {
-            gate_up<Simd, 1>(work, group, task.first_column, channel, begin, bf16_columns);
+            gate_up<Simd, GateBits, 1>(work, group, task.first_column, channel, begin,
+                                      bf16_columns);
         }
     }
     worker.barrier();
@@ -450,10 +511,11 @@ template <class Simd, int DownBits, bool FourColumns>
 }
 
 // Keep the wide-column specializations outside the worker's live register range.
-template <class Simd, int DownBits, bool FourColumns>
+template <class Simd, int DownBits, int GateBits, bool FourColumns>
 [[gnu::noinline]] void compute_wide_chunk(Work& work, const CpuWorkerContext& worker, int begin,
                                           int columns, unsigned bf16_columns) noexcept {
-    compute_chunk<Simd, DownBits, FourColumns>(work, worker, begin, columns, bf16_columns);
+    compute_chunk<Simd, DownBits, GateBits, FourColumns>(work, worker, begin, columns,
+                                                         bf16_columns);
 }
 
 // port (sm_89): quantise the input row to int8 in 64-value groups - the width the weight scales
@@ -526,7 +588,7 @@ template <class Simd>
     }
 }
 
-template <class Simd, int DownBits>
+template <class Simd, int DownBits, int GateBits>
 void compute(void* argument, const CpuWorkerContext& worker) noexcept {
     auto& work = *static_cast<Work*>(argument);
     for (int begin = 0; begin < work.args.tokens;) {
@@ -535,6 +597,28 @@ void compute(void* argument, const CpuWorkerContext& worker) noexcept {
         // is published with the input barrier. Later chunks reuse joined scratch.
         if (begin != 0 || Simd::first_chunk == FirstChunkPreparation::Worker) {
             if (worker.rank() == 0) { prepare_chunk(work, begin, columns); }
+        }
+        if constexpr (!Simd::bf16_gate) {
+            const auto input_range = worker.range(hidden * columns / Simd::lanes);
+            for (auto v = input_range.begin; v < input_range.end; ++v) {
+                const int index = v * Simd::lanes;
+                Simd::store(
+                    work.scratch.input + index,
+                    Simd::bf16(work.args.input + static_cast<std::size_t>(begin) * hidden + index));
+            }
+        }
+        if (begin != 0 || !Simd::bf16_gate) { worker.barrier(); }
+        // port (sm_89, P4-B): the quantised activation tiers feed the q4 gate's nibble dot
+        // only — a Q8 gate decodes float codes and never reads the plane.
+        if constexpr (GateBits == 4) {
+            if (work.int8_path) {
+                quantise_input<Simd>(work, worker, columns);
+                worker.barrier();
+            } else if (work.int16_path) {
+                // The int16 tier replaces the int8 quantisation pass instead of running beside it.
+                quantise_input_i16<Simd>(work, worker, columns);
+                worker.barrier();
+            }
         }
         if constexpr (!Simd::bf16_gate) {
             const auto input_range = worker.range(hidden * columns / Simd::lanes);
@@ -562,20 +646,21 @@ void compute(void* argument, const CpuWorkerContext& worker) noexcept {
         work.block = (work.workers > 1 && units < work.workers * 8) ? channel_block / 2
                                                                    : channel_block;
         unsigned bf16_columns = 0;
-        if constexpr (Simd::bf16_gate) {
+        if constexpr (Simd::bf16_gate && GateBits == 4) {
             bf16_columns = Simd::safe_columns(
                 work.args.input + static_cast<std::size_t>(begin) * hidden, columns);
         }
         if constexpr (Simd::max_columns == 4) {
             if (work.has_four_columns) {
-                compute_wide_chunk<Simd, DownBits, true>(work, worker, begin, columns,
-                                                         bf16_columns);
+                compute_wide_chunk<Simd, DownBits, GateBits, true>(work, worker, begin, columns,
+                                                                    bf16_columns);
             } else {
-                compute_wide_chunk<Simd, DownBits, false>(work, worker, begin, columns,
-                                                          bf16_columns);
+                compute_wide_chunk<Simd, DownBits, GateBits, false>(work, worker, begin, columns,
+                                                                    bf16_columns);
             }
         } else {
-            compute_chunk<Simd, DownBits, false>(work, worker, begin, columns, bf16_columns);
+            compute_chunk<Simd, DownBits, GateBits, false>(work, worker, begin, columns,
+                                                            bf16_columns);
         }
         begin += columns;
         // Protect shared scratch before the next chunk; the final join is provided by run().
@@ -587,10 +672,15 @@ template <class Simd>
 constexpr Kernel make_kernel() {
     return {.run =
                 [](void* argument, const CpuWorkerContext& worker) noexcept {
-                    if (static_cast<Work*>(argument)->plan.down_bits == 6) {
-                        compute<Simd, 6>(argument, worker);
+                    const Work& work = *static_cast<Work*>(argument);
+                    // port (sm_89, P4-B): the (gate_bits, down_bits) pairs the shapes produce —
+                    // (4, 5) / (4, 6) for the q4 family, (8, 8) for q8_q8.
+                    if (work.plan.gate_bits == 8) {
+                        compute<Simd, 8, 8>(argument, worker);
+                    } else if (work.plan.down_bits == 6) {
+                        compute<Simd, 6, 4>(argument, worker);
                     } else {
-                        compute<Simd, 5>(argument, worker);
+                        compute<Simd, 5, 4>(argument, worker);
                     }
                 },
             .first_chunk = Simd::first_chunk};

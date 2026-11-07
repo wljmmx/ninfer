@@ -4,6 +4,7 @@ set(ninfer_moe_cpu_sources
   "${CMAKE_CURRENT_LIST_DIR}/dispatch.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/q4_q5/shapes/h2048_i512_e256_k8/dispatch.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/q4_q6/shapes/h2048_i512_e256_k8/dispatch.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/q8_q8/shapes/h2048_i512_e256_k8/dispatch.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/shapes/h2560_i640_e512_k10/dispatch.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/../../kernels/cpu/groupwise_int/launch.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/../../kernels/cpu/nvfp4/launch.cpp")

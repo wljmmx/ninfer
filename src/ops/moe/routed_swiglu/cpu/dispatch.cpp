@@ -43,6 +43,16 @@ const ShapePolicy& shape_dispatch(const RoutedSwiGLUProfile& profile) {
             }
         }
         break;
+    case QType::Q8_G32_FP16:
+        // port (sm_89, P4-B): q8_q8 — Q8_G32_FP16 gate/up + down (int8 codes, group 32,
+        // FP16 scales), the same h2048/i512/e256/k8 RowSplit geometry as q4_q5.
+        if (ffn.hidden == 2048 && ffn.intermediate == 512 && profile.experts == 256 &&
+            profile.top_k == 8 && ffn.down_type == QType::Q8_G32_FP16 &&
+            ffn.gate_up_layout == QuantLayout::RowSplit &&
+            ffn.down_layout == QuantLayout::RowSplit) {
+            return q8_q8_h2048_i512_e256_k8();
+        }
+        break;
     case QType::NVFP4:
         if (ffn.hidden == 2560 && ffn.intermediate == 640 && profile.experts == 512 &&
             profile.top_k == 10 && ffn.down_type == QType::NVFP4 &&

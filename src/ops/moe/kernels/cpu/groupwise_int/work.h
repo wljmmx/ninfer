@@ -30,6 +30,9 @@ struct Plan {
     const Kernel* kernel;
     int token_block;
     int down_bits;
+    // port (sm_89, P4-B): the gate/up plane's code width in bits. 4 is the q4 gate of the
+    // q4_q5 / q4_q6 shapes; 8 selects the Q8_G32_FP16 gate of q8_q8 (int8 codes, group 32).
+    int gate_bits = 4;
     int max_columns;
 };
 

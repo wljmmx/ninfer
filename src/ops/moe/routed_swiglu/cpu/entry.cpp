@@ -57,17 +57,25 @@ public:
         const auto& geometry     = bank.parent->geometry;
         const auto elements      = std::size_t(rows) * columns;
         const bool nvfp4         = type == QType::NVFP4;
+        // port (sm_89, P4-B): Q8_G32_FP16 carries one plain int8 code per dimension (no high
+        // plane) with an FP16 scale per 32-value group, so its code plane is elements bytes
+        // and its scale plane elements/16 — against elements/2 and elements/32 for the
+        // packed 4..6-bit family.
+        const bool q8            = type == QType::Q8_G32_FP16;
         const auto native_layout = layout.layout == QuantLayout::BatchedBlockScaleK16M128x4
                                        ? QuantLayout::BlockScaleK16M128x4
                                        : layout.layout;
         const auto high_bytes    = type == QType::Q5_G64_FP16   ? elements / 8
                                    : type == QType::Q6_G64_FP16 ? elements / 4
                                                                 : 0;
+        const auto code_bytes    = q8 ? elements : elements / 2;
+        const auto scale_bytes   = q8 ? elements / 16
+                                      : elements / (nvfp4 ? 16 : 32);
         require(layout.format == type && native_layout == format_layout &&
                     layout.region.count == unsigned(count) &&
                     layout.region.rows == unsigned(rows) && layout.columns == unsigned(columns),
                 "routed_swiglu CPU: weight bank differs from the profile");
-        require(geometry.group_size == (nvfp4 ? 16 : 64) &&
+        require(geometry.group_size == (nvfp4 ? 16 : q8 ? 32 : 64) &&
                     geometry.padded_columns == unsigned(columns) &&
                     geometry.scale_block_rows == 1 && layout.has_divisors == nvfp4,
                 "routed_swiglu CPU: invalid weight geometry");
@@ -93,9 +101,9 @@ public:
                       layout.scales.expert_stride == expected.scales.expert_stride &&
                       layout.has_divisors == expected.has_divisors
                 : layout == expected;
-        require(layout.codes.expert_bytes == elements / 2 &&
+        require(layout.codes.expert_bytes == code_bytes &&
                     layout.high.expert_bytes == high_bytes &&
-                    layout.scales.expert_bytes == elements / (nvfp4 ? 16 : 32) &&
+                    layout.scales.expert_bytes == scale_bytes &&
                     planes_agree,
                 "routed_swiglu CPU: invalid native weight planes");
         require(bank.parent->weight_divisors.size() == geometry.divisor_count,
