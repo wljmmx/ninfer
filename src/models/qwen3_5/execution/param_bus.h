@@ -128,6 +128,12 @@ struct ParamSpec {
     ParamReject refusal = ParamReject::Ok;
 };
 
+// port (sm_89), P2: the CPU in-place path's cost rows are registered by the free function
+// cpu_path_policy.h defines (bottom of this include chain), so the decision code that reads
+// them owns their names and provenance. Declared here because the bus constructor calls it.
+class ParamBus;
+void register_cpu_path_params(ParamBus& bus);
+
 class ParamBus {
 public:
     struct LedgerEntry {
@@ -548,6 +554,11 @@ private:
                        .observe = "[freeze] host_static/present,capt_ready",
                        .rollback = 0.0, // 0 = the complement set
                        .source = "NINFER_WARM_STATIC_SLOTS"});
+
+        // P2 (cpu in-place path): the calibrated CPU-path cost rows + the forced-switch
+        // mirror. L0 frozen for the measured/derived rates (never writable - a calibration is
+        // not a knob), L2 no-executor for the switch (nobody may flip a forced switch).
+        register_cpu_path_params(*this);
     }
 
     [[nodiscard]] int find(const char* name) const {
@@ -613,3 +624,9 @@ inline ParamBus& param_bus() {
 }
 
 } // namespace ninfer::models::qwen3_5::execution
+
+// The bottom include completes the P2 CPU-path seam: cpu_path_policy.h needs the complete
+// ParamBus for its row registration and decision functions, and every TU that builds a bus
+// must see their definitions - which is exactly what including it here guarantees (its own
+// param_bus.h include is a no-op by then, so either header may be included first).
+#include "models/qwen3_5/execution/cpu_path_policy.h"

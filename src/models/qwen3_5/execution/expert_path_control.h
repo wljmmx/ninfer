@@ -670,6 +670,10 @@ public:
                          static_cast<unsigned long long>(dial.blocked_period),
                          static_cast<unsigned long long>(dial.blocked_miss));
         }
+        // P2 (cpu in-place path): the CPU-leg decision observation - verdict counts, hit rates
+        // and the cost model's last two sides, shadow until an actuator lands (the runtime legs
+        // the verdicts name are later batches; NINFER_CPU_PATH_POLICY defaults them off).
+        cpu_path_ledger().report();
         std::fflush(stderr);
     }
 private:

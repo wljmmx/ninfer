@@ -3,6 +3,7 @@
 #include "models/qwen3_5/execution/expert_stream.h"
 #include "models/qwen3_5/execution/expert_prefetch.h"
 #include "models/qwen3_5/execution/expert_path_control.h"
+#include "models/qwen3_5/execution/cpu_path_policy.h"
 #include "models/qwen3_5/execution/host_expert_residency.h"
 #include "models/qwen3_5/execution/step_gate.h"
 #include "core/cpu/executor.h"
@@ -1566,6 +1567,18 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
             const auto moved = moe.stream->last_cost().uploaded;
             control.observe_upload(moe.stream->last_cost().upload_ms * 1000.0, moved);
             control.observe_misses(moved);
+            // P2 (cpu in-place path): the expert copy-vs-CPU-half decision point, fed by the
+            // same measured upload the panel prints. The verdict is recorded, not acted on:
+            // NINFER_CPU_PATH_POLICY (default off) holds the pool-copy leg, and the runtime leg
+            // a cpu-half verdict names (ensure() leaving the expert for the CPU half) is a
+            // later batch. Only a layer that actually moved experts in faced the choice.
+            if (moved > 0) {
+                double cpu_us = 0.0;
+                const auto cpu_leg =
+                    decide_cpu_expert_half(control.signals.upload_us_per_expert, &cpu_us);
+                cpu_path_ledger().note_expert(cpu_leg, control.signals.upload_us_per_expert,
+                                             cpu_us);
+            }
             // Layer cost, for the actuator guardrail: a change that costs >3% gets reverted.
             control.observe_layer(moe.stream->last_cost().route_ms +
                                       moe.stream->last_cost().layout_ms +
