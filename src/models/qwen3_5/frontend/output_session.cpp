@@ -356,10 +356,10 @@ public:
         prefix_execution.tracking        = starts_in_reasoning;
         semantic.budget                  = thinking.budget;
         semantic.exact_reasoning_framing = grammar != nullptr;
-        // The presentation decoder already tracks normal reasoning output. Keep the independent
-        // semantic tracker dormant unless a cap needs it, so the default unlimited path does not
-        // decode every model token twice.
-        semantic.in_reasoning = starts_in_reasoning && thinking.budget.has_value();
+        // Semantic counting is independent of budget and presentation: an unlimited thinking turn
+        // still reports its model-origin tokens, and the presentation decoder keeps its own
+        // reasoning count for the stream.
+        semantic.in_reasoning = starts_in_reasoning;
         if (!continuation.empty()) {
             saw_content = true;
             if (combined)
