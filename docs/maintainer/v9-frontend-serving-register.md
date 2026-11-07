@@ -8,6 +8,7 @@
 |---|---|---|---|
 | T071 | `bc70d7c8` 原生工具调用参数流 | 登记缺口 | 本地没有 `OutputEvent` / `ToolArgumentsDelta`，参数流需要先落地事件形态 |
 | T072 | `58733a86` JPEG 解码对齐 Pillow | 部分跟随 | AVIO 缓冲泄漏已跟随；JPEG 像素对齐需 libjpeg-turbo |
+| T073 | `4de9e425` 专用 flash next chat 模板 | 不适用 | 本地没有 Qwen4Exp 转换器，模板无人引用 |
 
 ## T071 `bc70d7c8` — 原生工具调用参数流
 
@@ -67,3 +68,14 @@ JPEG 从 FFmpeg 路径剥离，改用 libjpeg 解码以获得与 Pillow（libjpe
 `vcpkg.json` 登记、`src/media/CMakeLists.txt` 链 `JPEG::JPEG`，再移植 `jpeg.cpp`
 （含 CMYK/YCCK 与截断 JPEG 的 `JWRN_JPEG_EOF` 处理）和上游金标用例。在此之前本地 JPEG 仍走
 FFmpeg MJPEG，像素与 Pillow 存在色度上采样差异。
+## T073 `4de9e425` — 专用 flash next chat 模板
+
+三方比对：上游把 `qwen3_8_flash_next.jinja` 作为 **Qwen4Exp 转换器**的默认模板
+（`tools/convert/qwen4_exp.py` 覆盖 `chat_template.jinja` 资源，并更新
+`docs/weight-conversion.md` 的模板表）。本地 `tools/convert` 只有 `qwen3_5.py`，没有
+`qwen4_exp.py`；`tools/chat_templates` 只有 `qwen3_6.jinja` 与 `qwen3_8.jinja`，也没有
+Qwen4Exp 的模型规格与转换路径。
+
+结论：**不适用，模板单独落地是死代码**（198 行 Jinja 不会被任何转换器或启动路径引用，
+测试也无从建立）。登记为"随 Qwen4Exp 转换器一起吸收"，届时连同模板表与
+`tests/text/test_chat_templates.py` 的 flash-next 用例一并移植。
