@@ -1417,7 +1417,7 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     Tensor on = workspace::gdn_normalized_output(work_, config_, T)
                     .view({dimension(config_.gdn->linear_value_head_dim),
                            dimension(config_.gdn->linear_num_value_heads), T});
-    ops::gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, ctx_.execution_view());
+    ops::silu_gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, ctx_.execution_view());
 
     {
         Tensor gdn_out = on.view({dimension(config_.gdn->value_width()), T});

@@ -1,4 +1,4 @@
-// Measures public RMSNorm and GatedRMSNorm calls with represented BF16 inputs.
+// Measures public RMSNorm and SiLU/sigmoid gated RMSNorm with represented BF16 inputs.
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/gated_rmsnorm.h"
 #include "core/device.h"
@@ -56,7 +56,8 @@ Options parse(int argc, char** argv) {
         if (arg == "--help") {
             std::puts("usage: ninfer_rmsnorm_bench [--kind dflash2_hidden|hidden27|target_q27|"
                       "target_k27|dflash_hidden|dflash_q|dflash_k|target_hidden35|target_q35|"
-                      "target_k35|gated35|gated27] [--tokens T,...] [--execution eager|graph] "
+                      "target_k35|silu_gated32|silu_gated48|sigmoid_gated48] [--tokens M,...] "
+                      "[--execution eager|graph] "
                       "[--cache cold|warm] [--graph-calls 1..64] [--warmup N] [--repeat N] "
                       "[--csv-out PATH] [--profile]");
             std::exit(0);
@@ -91,19 +92,28 @@ Options parse(int argc, char** argv) {
     return o;
 }
 
+enum class Gate { None, Silu, Sigmoid };
+
 struct Shape {
     const char* name;
     int d, heads;
-    bool offset, gated;
+    bool offset;
+    Gate gate;
 };
 
-constexpr Shape shapes[]{
-    {"dflash2_hidden", 5120, 1, false, false}, {"hidden27", 5120, 1, true, false},
-    {"target_q27", 256, 24, true, false},      {"target_k27", 256, 4, true, false},
-    {"dflash_hidden", 2048, 1, false, false},  {"dflash_q", 128, 32, false, false},
-    {"dflash_k", 128, 8, false, false},        {"target_hidden35", 2048, 1, true, false},
-    {"target_q35", 256, 16, true, false},      {"target_k35", 256, 2, true, false},
-    {"gated35", 128, 32, false, true},         {"gated27", 128, 48, false, true}};
+constexpr Shape shapes[]{{"dflash2_hidden", 5120, 1, false, Gate::None},
+                         {"hidden27", 5120, 1, true, Gate::None},
+                         {"target_q27", 256, 24, true, Gate::None},
+                         {"target_k27", 256, 4, true, Gate::None},
+                         {"dflash_hidden", 2048, 1, false, Gate::None},
+                         {"dflash_q", 128, 32, false, Gate::None},
+                         {"dflash_k", 128, 8, false, Gate::None},
+                         {"target_hidden35", 2048, 1, true, Gate::None},
+                         {"target_q35", 256, 16, true, Gate::None},
+                         {"target_k35", 256, 2, true, Gate::None},
+                         {"silu_gated32", 128, 32, false, Gate::Silu},
+                         {"silu_gated48", 128, 48, false, Gate::Silu},
+                         {"sigmoid_gated48", 128, 48, false, Gate::Sigmoid}};
 
 const Shape& find_shape(const std::string& name) {
     for (const auto& shape : shapes)
@@ -129,14 +139,16 @@ struct Case {
 
     Case(const Shape& s, int t)
         : shape(s), source(varied(std::size_t(s.d) * s.heads * t, 1234)), weight(varied(s.d, 9876)),
-          gate(s.gated ? varied(std::size_t(s.d) * s.heads * t, 321) : DeviceBuffer()),
+          gate(s.gate != Gate::None ? varied(std::size_t(s.d) * s.heads * t, 321) : DeviceBuffer()),
           output(std::size_t(s.d) * s.heads * t * 2), x(source.p, DType::BF16, {s.d, s.heads, t}),
           w(weight.p, DType::BF16, {s.d}), z(gate.p, DType::BF16, {s.d, s.heads, t}),
           y(output.p, DType::BF16, {s.d, s.heads, t}) {}
 
     void launch(DeviceExecutionView execution) {
-        if (shape.gated)
-            ops::gated_rmsnorm(x, w, z, 1.e-6f, y, execution);
+        if (shape.gate == Gate::Silu)
+            ops::silu_gated_rmsnorm(x, w, z, 1.e-6f, y, execution);
+        else if (shape.gate == Gate::Sigmoid)
+            ops::sigmoid_gated_rmsnorm(x, w, z, 1.e-6f, y, execution);
         else
             ops::rmsnorm(x, w, 1.e-6f, shape.offset, y, execution.stream);
     }
@@ -158,8 +170,8 @@ int main(int argc, char** argv) {
             csv << "kind,D,heads,T,execution,cache,graph_nodes,graph_calls,workspace_bytes,logical_"
                    "bytes,median_us,min_us,p95_us\n";
         }
-        std::printf("GPU=%s SMs=%d CUDART=%d\n", device.props.name,
-                    device.multiprocessor_count(), CUDART_VERSION);
+        std::printf("GPU=%s SMs=%d CUDART=%d\n", device.props.name, device.multiprocessor_count(),
+                    CUDART_VERSION);
         const Shape& shape = find_shape(o.kind);
         for (const int t : o.tokens) {
             Case data(shape, t);
@@ -168,10 +180,13 @@ int main(int argc, char** argv) {
                 data.launch(device.execution_view());
                 CUDA_CHECK(cudaStreamSynchronize(device.stream));
                 graph.capture(device.stream, [&](cudaStream_t stream) {
-                    for (int call = 0; call < o.graph_calls; ++call) data.launch(device.execution_view().on_stream(stream));
+                    for (int call = 0; call < o.graph_calls; ++call)
+                        data.launch(device.execution_view().on_stream(stream));
                 });
             }
-            const auto launch = [&](cudaStream_t stream) { data.launch(device.execution_view().on_stream(stream)); };
+            const auto launch = [&](cudaStream_t stream) {
+                data.launch(device.execution_view().on_stream(stream));
+            };
             if (o.profile) {
                 for (int i = 0; i < o.warmup; ++i) {
                     if (o.execution == "graph")
@@ -204,8 +219,8 @@ int main(int argc, char** argv) {
             time.median_us /= o.graph_calls;
             time.min_us /= o.graph_calls;
             time.p95_us /= o.graph_calls;
-            const std::size_t bytes =
-                std::size_t(shape.d) * 2 * ((shape.gated ? 3 : 2) * shape.heads * t + 1);
+            const std::size_t bytes = std::size_t(shape.d) * 2 *
+                                      ((shape.gate != Gate::None ? 3 : 2) * shape.heads * t + 1);
             const auto nodes = o.execution == "graph" ? graph.nodes() : 0;
             std::printf("%s T=%d D=%d H=%d execution=%s cache=%s nodes=%zu calls=%d scratch=0 "
                         "median=%.3f min=%.3f p95=%.3f us\n",

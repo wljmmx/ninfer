@@ -1,10 +1,13 @@
 #include "ninfer/ops/gated_rmsnorm.h"
 #include "core/device.h"
+#include "core/decode_graph.h"
 #include "ops/norm_test_common.h"
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -14,96 +17,258 @@ using namespace ninfer::test::norm;
 
 namespace {
 
-constexpr ReductionCriterion gated_rmsnorm_bf16_criterion() {
-    return {/*relative_l2*/ 1.85e-3, /*gross_absolute*/ 4.5e-5,
-            /*gross_relative_to_max_reference*/ 2.8e-3};
+enum class Gate { Silu, Sigmoid };
+enum class Pattern {
+    Random,
+    ZeroGate,
+    ZeroInput,
+    GateEdges,
+    NegativeGate,
+    DirectGain,
+    RoundingGate
+};
+
+const char* gate_name(Gate gate) {
+    return gate == Gate::Silu ? "silu_gated_rmsnorm" : "sigmoid_gated_rmsnorm";
+}
+
+constexpr ReductionCriterion silu_gated_rmsnorm_bf16_criterion() {
+    // BF16 RNE alone can approach 2^-8 relative error in a small tensor or one element.
+    // The same profile-wide bound covers output storage and FP32 arithmetic in every route.
+    return {/*relative_l2*/ 3.95e-3, /*gross_absolute*/ 4.5e-5,
+            /*gross_relative_to_max_reference*/ 3.95e-3};
+}
+
+// BF16 RNE can incur almost 2^-8 relative error. The gross bound includes that output
+// representation error and FP32 reduction/rsqrt/nonlinearity error, including gate tails.
+constexpr ReductionCriterion sigmoid_gated_rmsnorm_bf16_criterion() {
+    return {/*relative_l2*/ 3.95e-3, /*gross_absolute*/ 1.0e-5,
+            /*gross_relative_to_max_reference*/ 3.95e-3};
+}
+
+struct GatedShape {
+    std::int32_t d;
+    std::int32_t heads;
+    std::int32_t tokens = 1;
+    std::int32_t batch  = 1;
+
+    std::size_t elements() const { return static_cast<std::size_t>(d) * heads * tokens * batch; }
+
+    Tensor tensor(void* data) const { return Tensor(data, DType::BF16, {d, heads, tokens, batch}); }
+};
+
+struct Case {
+    GatedShape shape;
+    std::uint32_t seed;
+    float input_scale      = 4.0F;
+    bool unaligned         = false;
+    bool graph             = false;
+    Pattern pattern        = Pattern::Random;
+    float eps              = kEps;
+    bool shared_input_gate = false;
+};
+
+void invoke(Gate gate, const Tensor& x, const Tensor& w, const Tensor& z, float eps, Tensor& out,
+            DeviceExecutionView execution) {
+    if (gate == Gate::Silu)
+        ops::silu_gated_rmsnorm(x, w, z, eps, out, execution);
+    else
+        ops::sigmoid_gated_rmsnorm(x, w, z, eps, out, execution);
 }
 
 std::vector<double> gated_rmsnorm_oracle(const std::vector<float>& input,
                                          const std::vector<float>& weight,
-                                         const std::vector<float>& gate, const Shape& shape) {
+                                         const std::vector<float>& gate, const GatedShape& shape,
+                                         float eps, Gate kind) {
     std::vector<double> output(input.size());
-    const auto row_count = static_cast<std::int64_t>(shape.rows) * shape.tokens;
-    for (std::int64_t row = 0; row < row_count; ++row) {
-        const std::size_t base = static_cast<std::size_t>(row) * shape.d;
+    const std::size_t row_count = input.size() / shape.d;
+    for (std::size_t row = 0; row < row_count; ++row) {
+        const std::size_t base = row * shape.d;
         double sum_squares     = 0.0;
         for (std::int32_t column = 0; column < shape.d; ++column) {
             const double value = input[base + column];
             sum_squares += value * value;
         }
-        const double inverse = 1.0 / std::sqrt(sum_squares / static_cast<double>(shape.d) + kEps);
+        const double inverse = 1.0 / std::sqrt(sum_squares / shape.d + static_cast<double>(eps));
         for (std::int32_t column = 0; column < shape.d; ++column) {
             const double gate_value = gate[base + column];
-            const double silu       = gate_value / (1.0 + std::exp(-gate_value));
+            const double sigmoid    = 1.0 / (1.0 + std::exp(-gate_value));
+            const double activation = kind == Gate::Silu ? gate_value * sigmoid : sigmoid;
             output[base + column]   = static_cast<double>(input[base + column]) * inverse *
-                                    static_cast<double>(weight[column]) * silu;
+                                    static_cast<double>(weight[column]) * activation;
         }
     }
     return output;
 }
 
-int run_case(DeviceExecutionView execution, const char* label, const Shape& shape,
-             std::uint32_t seed, float input_scale = 4.0F, bool bf16x2_unaligned = false,
-             bool graph = false) {
-    const std::size_t count = shape.elements();
-    std::vector<float> input(count), weight(shape.d), gate(count);
-    fill_uniform(input, seed, -input_scale, input_scale);
-    fill_uniform(weight, seed + 1U, 0.25F, 1.75F);
-    fill_uniform(gate, seed + 2U, -5.0F, 5.0F);
+int run_case(DeviceExecutionView execution, Gate kind, const char* description, const Case& c) {
+    const std::size_t count = c.shape.elements();
+    std::vector<float> input(count), weight(c.shape.d), gate(count);
+    fill_uniform(input, c.seed, -c.input_scale, c.input_scale);
+    fill_uniform(weight, c.seed + 1U, 0.25F, 1.75F);
+    fill_uniform(gate, c.seed + 2U, -5.0F, 5.0F);
     gate.front() = 0.0F;
     gate.back()  = -0.0F;
+    if (c.pattern == Pattern::ZeroGate) std::fill(gate.begin(), gate.end(), 0.0F);
+    if (c.pattern == Pattern::ZeroInput) std::fill(input.begin(), input.end(), 0.0F);
+    if (c.pattern == Pattern::NegativeGate) std::fill(gate.begin(), gate.end(), -12.0F);
+    if (c.pattern == Pattern::GateEdges) {
+        constexpr std::array edges{-40.0F, -12.0F,  -1.0F, -1.0e-4F, -0.0F,
+                                   0.0F,   1.0e-4F, 1.0F,  12.0F,    40.0F};
+        for (std::size_t i = 0; i < count; ++i) gate[i] = edges[i % edges.size()];
+    }
+    if (c.pattern == Pattern::DirectGain) {
+        fill_uniform(weight, c.seed + 1U, -1.5F, 1.5F);
+        weight.front() = 0.0F;
+        weight.back()  = -1.0F;
+    }
+    if (c.pattern == Pattern::RoundingGate) {
+        std::fill(input.begin(), input.end(), 1.0F);
+        std::fill(weight.begin(), weight.end(), 1.0F);
+        std::fill(gate.begin(), gate.end(), 0.0078125F);
+    }
     round_to_bf16(input);
     round_to_bf16(weight);
     round_to_bf16(gate);
-    std::vector<double> reference = gated_rmsnorm_oracle(input, weight, gate, shape);
+    if (c.shared_input_gate) gate = input;
 
-    DeviceInput device_input  = make_input(input, bf16x2_unaligned);
-    DeviceInput device_weight = make_input(weight, bf16x2_unaligned);
-    DeviceInput device_gate   = make_input(gate, bf16x2_unaligned);
-    const std::size_t leading = bf16x2_unaligned ? sizeof(std::uint16_t) : 0;
+    DeviceInput device_input  = make_input(input, c.unaligned);
+    DeviceInput device_weight = make_input(weight, c.unaligned);
+    DeviceInput device_gate   = make_input(gate, c.unaligned);
+    const std::size_t leading = c.unaligned ? sizeof(std::uint16_t) : 0;
     GuardedDeviceBuffer output(leading + count * sizeof(std::uint16_t));
-    output.fill(0xff);
-    void* output_data = static_cast<std::uint8_t*>(output.data()) + leading;
-
-    Tensor input_tensor = tensor_for(device_input.data, shape);
-    Tensor weight_tensor(device_weight.data, DType::BF16, {shape.d});
-    Tensor gate_tensor   = tensor_for(device_gate.data, shape);
-    Tensor output_tensor = tensor_for(output_data, shape);
-    ops::gated_rmsnorm(input_tensor, weight_tensor, gate_tensor, kEps, output_tensor, execution);
-    cuda_synchronize();
-
-    if (graph) {
-        cudaStream_t stream;
-        cudaGraph_t captured;
-        cudaGraphExec_t executable;
-        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-        ops::gated_rmsnorm(input_tensor, weight_tensor, gate_tensor, kEps, output_tensor,
-                           execution.on_stream(stream));
-        CUDA_CHECK(cudaStreamEndCapture(stream, &captured));
-        CUDA_CHECK(cudaGraphInstantiate(&executable, captured, nullptr, nullptr, 0));
-        CUDA_CHECK(cudaGraphLaunch(executable, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        for (std::size_t i = 0; i < gate.size(); ++i) {
-            gate[i]                                                   = -gate[i];
-            device_gate.expected[i + leading / sizeof(std::uint16_t)] = f32_to_bf16(gate[i]);
+    void* output_data   = static_cast<std::uint8_t*>(output.data()) + leading;
+    Tensor input_tensor = c.shape.tensor(device_input.data);
+    Tensor weight_tensor(device_weight.data, DType::BF16, {c.shape.d});
+    Tensor gate_tensor = c.shape.tensor(c.shared_input_gate ? device_input.data : device_gate.data);
+    Tensor output_tensor = c.shape.tensor(output_data);
+    const auto launch    = [&] {
+        invoke(kind, input_tensor, weight_tensor, gate_tensor, c.eps, output_tensor, execution);
+    };
+    DecodeGraphDefinition definition;
+    DecodeGraphExecutable graph;
+    const std::string label = std::string(gate_name(kind)) + " " + description + " [" +
+                              std::to_string(c.shape.d) + "," + std::to_string(c.shape.heads) +
+                              "," + std::to_string(c.shape.tokens) + "," +
+                              std::to_string(c.shape.batch) + "]";
+    int failures = 0;
+    for (int phase = 0; phase < (c.graph ? 2 : 1); ++phase) {
+        if (phase) {
+            for (std::size_t i = 0; i < input.size(); ++i)
+                input[i] = -input[i] * (i % 3 == 0 ? 0.5F : 1.0F);
+            for (auto& value : gate) value = -value;
+            for (auto& value : weight) value = -value;
+            if (c.shared_input_gate) gate = input;
+            const auto update = [&](DeviceInput& device, const std::vector<float>& values) {
+                for (std::size_t i = 0; i < values.size(); ++i)
+                    device.expected[i + leading / 2] = f32_to_bf16(values[i]);
+                CUDA_CHECK(cudaMemcpy(device.storage.p, device.expected.data(),
+                                      device.storage.bytes, cudaMemcpyHostToDevice));
+            };
+            update(device_input, input);
+            update(device_weight, weight);
+            update(device_gate, gate);
         }
-        CUDA_CHECK(cudaMemcpyAsync(device_gate.storage.p, device_gate.expected.data(),
-                                   device_gate.storage.bytes, cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaGraphLaunch(executable, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        CUDA_CHECK(cudaGraphExecDestroy(executable));
-        CUDA_CHECK(cudaGraphDestroy(captured));
-        CUDA_CHECK(cudaStreamDestroy(stream));
-        reference = gated_rmsnorm_oracle(input, weight, gate, shape);
+        output.fill(0xff);
+        cuda_synchronize();
+        if (c.graph) {
+            if (phase == 0) {
+                definition.capture(execution.stream, launch);
+                graph.instantiate(definition);
+            }
+            graph.launch(execution.stream);
+        } else {
+            launch();
+        }
+        cuda_synchronize(execution.stream);
+        const auto reference = gated_rmsnorm_oracle(input, weight, gate, c.shape, c.eps, kind);
+        const auto actual    = from_device_bf16(output_data, count);
+        const auto criterion = kind == Gate::Silu ? silu_gated_rmsnorm_bf16_criterion()
+                                                  : sigmoid_gated_rmsnorm_bf16_criterion();
+        const int numerical_failures = verify_reduction(
+            (label + " phase=" + std::to_string(phase)).c_str(), actual, reference, criterion);
+        failures += numerical_failures;
+        failures += verify_output_storage(label + " output", output, c.unaligned);
+        failures += verify_preserved(label + " preserves input", device_input);
+        failures += verify_preserved(label + " preserves weight", device_weight);
+        failures += verify_preserved(label + " preserves gate", device_gate);
     }
+    return failures;
+}
 
-    int failures = verify_reduction(label, from_device_bf16(output_data, count), reference,
-                                    gated_rmsnorm_bf16_criterion());
-    failures += verify_output_storage(std::string(label) + " output", output, bf16x2_unaligned);
-    failures += verify_preserved(std::string(label) + " preserves input", device_input);
-    failures += verify_preserved(std::string(label) + " preserves weight", device_weight);
-    failures += verify_preserved(std::string(label) + " preserves gate", device_gate);
+template <class Exception, class Function>
+int rejects(const std::string& label, Function&& call) {
+    try {
+        call();
+    } catch (const Exception&) { return 0; } catch (const std::exception& error) {
+        std::cerr << label << ": unexpected exception: " << error.what() << '\n';
+        return 1;
+    }
+    std::cerr << label << ": expected rejection\n";
+    return 1;
+}
+
+int run_validation(DeviceExecutionView execution, Gate kind) {
+    DeviceBuffer input(128 * 48 * 2), weight(128 * 2), gate(128 * 48 * 2), output(128 * 48 * 2);
+    const std::array<Tensor, 4> tensors{
+        Tensor(input.p, DType::BF16, {128, 48}), Tensor(weight.p, DType::BF16, {128}),
+        Tensor(gate.p, DType::BF16, {128, 48}), Tensor(output.p, DType::BF16, {128, 48})};
+    const std::string name = gate_name(kind);
+    const auto call        = [&](std::array<Tensor, 4> t, float eps = kEps) {
+        invoke(kind, t[0], t[1], t[2], eps, t[3], execution);
+    };
+    int failures = 0;
+    for (int i = 0; i < 4; ++i) {
+        auto t     = tensors;
+        t[i].dtype = DType::FP32;
+        failures += rejects<std::invalid_argument>(name + " wrong dtype", [&] { call(t); });
+        t         = tensors;
+        t[i].data = nullptr;
+        failures += rejects<std::invalid_argument>(name + " null input/output", [&] { call(t); });
+        t          = tensors;
+        t[i].nb[0] = 4;
+        failures += rejects<std::invalid_argument>(name + " noncontiguous", [&] { call(t); });
+        for (int extent : {0, -1}) {
+            t          = tensors;
+            t[i].ne[0] = extent;
+            failures +=
+                rejects<std::invalid_argument>(name + " nonpositive extent", [&] { call(t); });
+        }
+    }
+    for (int i : {2, 3}) {
+        auto t     = tensors;
+        t[i].ne[1] = 47;
+        failures += rejects<std::invalid_argument>(name + " shape mismatch", [&] { call(t); });
+    }
+    auto t     = tensors;
+    t[1].ne[1] = 2;
+    failures += rejects<std::invalid_argument>(name + " weight rank", [&] { call(t); });
+    for (float eps : {0.0F, -1.0F, std::numeric_limits<float>::infinity(),
+                      std::numeric_limits<float>::quiet_NaN()})
+        failures +=
+            rejects<std::invalid_argument>(name + " invalid eps", [&] { call(tensors, eps); });
+    for (int sms : {0, -1}) {
+        auto invalid_execution                 = execution;
+        invalid_execution.multiprocessor_count = sms;
+        failures += rejects<std::invalid_argument>(name + " invalid SM count", [&] {
+            auto original = tensors;
+            invoke(kind, original[0], original[1], original[2], kEps, original[3],
+                   invalid_execution);
+        });
+    }
+    for (int i : {0, 1, 2}) {
+        for (std::size_t offset : {std::size_t{0}, std::size_t{2}}) {
+            t         = tensors;
+            t[3].data = static_cast<std::byte*>(t[i].data) + offset;
+            failures += rejects<std::invalid_argument>(name + " output overlap", [&] { call(t); });
+        }
+    }
+    t = tensors;
+    for (auto& extent : t[0].ne) extent = std::numeric_limits<std::int32_t>::max();
+    failures += rejects<std::overflow_error>(name + " element count overflow", [&] { call(t); });
+    t         = tensors;
+    t[0].data = reinterpret_cast<void*>(std::numeric_limits<std::uintptr_t>::max() - 1);
+    failures += rejects<std::overflow_error>(name + " byte range overflow", [&] { call(t); });
     return failures;
 }
 
@@ -114,22 +279,60 @@ int main() {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
-
     DeviceContext device;
-    // Fixture initialization uses the default stream; keep the eager call ordered with it.
-    const auto execution = device.execution_view().on_stream(nullptr);
+    const auto execution = device.execution_view();
     int failures         = 0;
-    failures += run_case(execution, "gated_rmsnorm [128,48,1]", {128, 48}, 1401U);
-    for (int columns : {2, 7, 16, 48, 56, 57, 64, 96, 128}) {
-        const std::string label = "gated_rmsnorm target [128,48," + std::to_string(columns) + "]";
-        failures += run_case(execution, label.c_str(), {128, 48, columns}, 1420U + columns, 4.0F,
-                             false, columns == 56 || columns == 57 || columns == 128);
+    for (Gate kind : {Gate::Silu, Gate::Sigmoid}) {
+        failures += run_case(execution, kind, "single column", {{128, 48}, 1401U});
+        for (int columns :
+             {2, 4, 7, 8, 9, 16, 48, 55, 56, 57, 58, 64, 96, 127, 128, 129, 512, 1024, 2048})
+            failures +=
+                run_case(execution, kind, "target columns",
+                         {{128, 48, columns},
+                          1420U + columns,
+                          4.0F,
+                          false,
+                          columns == 56 || columns == 57 || columns == 128 || columns == 1024});
+        for (int batch = 1; batch <= 8; ++batch)
+            for (int width : {1, 7})
+                failures += run_case(execution, kind, "T/B",
+                                     {{128, 48, width, batch},
+                                      1500U + width * 8 + batch,
+                                      4.0F,
+                                      false,
+                                      width == 7 && (batch == 1 || batch == 8)});
+        for (int columns : {7, 11, 12, 13, 83, 84, 85, 86, 87, 128, 191, 192, 193, 1024})
+            failures += run_case(execution, kind, "32 heads",
+                                 {{128, 32, columns}, 1402U + columns, 4.0F, false, columns == 86});
+        failures += run_case(execution, kind, "near-zero", {{128, 32}, 1404U, 1.0e-5F});
+        failures +=
+            run_case(execution, kind, "BF16x2 unaligned", {{128, 48}, 1405U, 4.0F, true, true});
+        for (int d : {1, 63, 64, 127, 129, 192, 256, 511, 512, 2048, 2560, 3072, 3073, 4096, 5120,
+                      8192, 8193})
+            failures += run_case(execution, kind, "general D",
+                                 {{d, 3, 5}, 1600U + d, 4.0F, false, d == 129 || d == 5120});
+        // Wide-row gated prefetch branches, from both sides of a device-sized grid.
+        for (int rows : {device.multiprocessor_count() - 1, device.multiprocessor_count(),
+                         device.multiprocessor_count() + 1})
+            failures += run_case(execution, kind, "wide rows", {{4096, rows}, 1700U + rows});
+        failures += run_case(execution, kind, "zero gate",
+                             {{128, 48, 3}, 1801U, 4.0F, false, true, Pattern::ZeroGate});
+        failures += run_case(execution, kind, "zero input",
+                             {{128, 48}, 1802U, 4.0F, false, false, Pattern::ZeroInput});
+        failures += run_case(execution, kind, "gate edges",
+                             {{128, 48, 7}, 1803U, 4.0F, false, true, Pattern::GateEdges});
+        failures += run_case(execution, kind, "negative gate tail",
+                             {{128, 48, 4}, 1804U, 4.0F, false, false, Pattern::NegativeGate});
+        failures += run_case(execution, kind, "direct gains",
+                             {{128, 48, 4}, 1805U, 4.0F, false, true, Pattern::DirectGain});
+        failures += run_case(execution, kind, "eps-dominated",
+                             {{128, 48, 7}, 1806U, 1.0e-4F, false, true, Pattern::Random, 1.0e-3F});
+        failures += run_case(execution, kind, "shared read-only backing",
+                             {{128, 48, 4}, 1807U, 4.0F, false, true, Pattern::Random, kEps, true});
+        failures += run_case(execution, kind, "BF16 rounding edge",
+                             {{1, 1}, 1808U, 4.0F, false, false, Pattern::RoundingGate});
+        failures += run_validation(execution, kind);
     }
-    failures += run_case(execution, "gated_rmsnorm [128,32,7]", {128, 32, 7}, 1402U);
-    failures += run_case(execution, "gated_rmsnorm [128,32,128]", {128, 32, 128}, 1403U);
-    failures += run_case(execution, "gated_rmsnorm near-zero [128,32]", {128, 32}, 1404U, 1.0e-5F);
-    failures +=
-        run_case(execution, "gated_rmsnorm unaligned [128,48]", {128, 48}, 1405U, 4.0F, true);
-    std::cout << (failures ? "FAIL" : "OK") << " gated_rmsnorm\n";
+    std::cout << (failures ? "FAIL" : "OK") << " gated_rmsnorm (SiLU and sigmoid)\n";
     return failures ? 1 : 0;
 }

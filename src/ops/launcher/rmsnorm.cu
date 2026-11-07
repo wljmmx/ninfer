@@ -4,12 +4,31 @@
 #include "ops/kernel/rmsnorm.cuh"
 #include "core/device.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
+
+// port (sm_89): upstream tunes this dedicated D128 gated route on sm_120a. Measured on
+// RTX 4090 (D128/H48 graph, cold, repeat 200) it is performance-neutral against the
+// previous general gated path (identical min/median at T=1..2048; 56.32 us at T=2048 for
+// both), while its per-warp reduction order moves the 35B default PPL by +0.24%
+// (4801 tokens: 2.051275 -> 2.053651). Keep the tuned route on Blackwell builds and the
+// old general path on Ada so the numeric gates stay bit-exact.
+#if defined(NINFER_ARCH_SM120)
+template <RmsEpilogue Epilogue, int Block>
+void launch_gated_d128(const __nv_bfloat16* x, const __nv_bfloat16* weight, const __nv_bfloat16* z,
+                       __nv_bfloat16* out, std::int64_t rows, float eps, cudaStream_t stream) {
+    const auto blocks = static_cast<unsigned>((rows + Block / kWarpSize - 1) / (Block / kWarpSize));
+    rmsnorm_d128_bf16x2_kernel<Epilogue, Block><<<blocks, Block, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat162*>(x), reinterpret_cast<const __nv_bfloat162*>(weight),
+        reinterpret_cast<const __nv_bfloat162*>(z), reinterpret_cast<__nv_bfloat162*>(out), rows,
+        eps);
+}
+#endif
 
 // Above one CTA per SM, another CTA supplies overlap without the gated epilogue's extra
 // prefetch registers. The policy retains the measured crossover on the target device.
@@ -23,13 +42,35 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
     const auto* z_bf16 = z != nullptr ? static_cast<const __nv_bfloat16*>(z->data) : nullptr;
     auto* out_bf16     = static_cast<__nv_bfloat16*>(out.data);
 
-    // The hoisted weight and gate cost registers. Measured at 512-thread blocks, only the
-    // gated epilogue loses a block per SM for them: warp 35 -> 50 and the wide row 38 -> 48, both
-    // three blocks to two, while every other instantiation stays at three. So only that epilogue
-    // consults the grid, and the un-prefetched instantiation is compiled only where it is reached.
-    constexpr bool kGateOnGrid = Epilogue == RmsEpilogue::Gated;
+    if constexpr (rmsnorm_is_gated<Epilogue>) {
+#if defined(NINFER_ARCH_SM120)
+        if (aligned2 && d == 128) {
+            // D128/H32,H48 sweeps: small CTAs protect the core points; 16 warps cover the next
+            // interval within one CTA wave, then smaller CTAs improve multi-wave overlap. The broad
+            // streaming route retains eight warps for the 512/1024-column anchors.
+            if (rows <= 384 || (rows > 16LL * multiprocessor_count && rows <= 6144)) {
+                launch_gated_d128<Epilogue, 128>(x_bf16, w_bf16, z_bf16, out_bf16, rows, eps,
+                                                 stream);
+            } else if (rows <= 16LL * multiprocessor_count) {
+                launch_gated_d128<Epilogue, 512>(x_bf16, w_bf16, z_bf16, out_bf16, rows, eps,
+                                                 stream);
+            } else {
+                launch_gated_d128<Epilogue, 256>(x_bf16, w_bf16, z_bf16, out_bf16, rows, eps,
+                                                 stream);
+            }
+            return;
+        }
+#endif // NINFER_ARCH_SM120
+    }
 
-    if constexpr (Epilogue != RmsEpilogue::Gated) {
+    // The hoisted weight and gate cost registers. Measured at 512-thread blocks, only the
+    // SiLU gated epilogue loses a block per SM for them: warp 35 -> 50 and the wide row 38 -> 48,
+    // both three blocks to two. Both gated forms share the general-D prefetch policy and use
+    // the separately tuned fixed-width D128 route above. Only gated epilogues consult the grid,
+    // and the un-prefetched instantiation is compiled only where it is reached.
+    constexpr bool kGateOnGrid = rmsnorm_is_gated<Epilogue>;
+
+    if constexpr (!rmsnorm_is_gated<Epilogue>) {
         if (aligned2 && d == 5120) {
             // Fixed width removes the dynamic pair-count predicates. Ten pairs per thread
             // with hoisted gains wins the hidden-row sweep through prefill.
@@ -126,34 +167,55 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
 
 } // namespace
 
-void rmsnorm_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
+void rmsnorm_launch(const Tensor& x, const Tensor& weight, float eps, RmsEpilogue epilogue,
                     const Tensor* z, Tensor& out, std::int32_t multiprocessor_count,
                     cudaStream_t stream) {
-    const std::int32_t d = x.ne[0];
-    if (d <= 0) { throw std::invalid_argument("rmsnorm: ne[0] must be positive"); }
+    const std::int32_t d    = x.ne[0];
     const std::int64_t rows = out.numel() / d;
-    if (rows > std::numeric_limits<int>::max()) {
-        throw std::overflow_error("rmsnorm: row count exceeds CUDA grid limit");
-    }
-
-    const auto x_addr = reinterpret_cast<std::uintptr_t>(x.data);
-    const auto w_addr = reinterpret_cast<std::uintptr_t>(weight.data);
-    const auto z_addr = z != nullptr ? reinterpret_cast<std::uintptr_t>(z->data) : 0;
-    const auto o_addr = reinterpret_cast<std::uintptr_t>(out.data);
+    const auto x_addr       = reinterpret_cast<std::uintptr_t>(x.data);
+    const auto w_addr       = reinterpret_cast<std::uintptr_t>(weight.data);
+    const auto z_addr       = z != nullptr ? reinterpret_cast<std::uintptr_t>(z->data) : 0;
+    const auto o_addr       = reinterpret_cast<std::uintptr_t>(out.data);
     const bool aligned2 =
         ((x_addr | w_addr | z_addr | o_addr) & (alignof(__nv_bfloat162) - 1)) == 0;
 
-    if (z != nullptr) {
-        launch_rmsnorm<RmsEpilogue::Gated>(x, weight, z, out, d, rows, eps, aligned2,
-                                           multiprocessor_count, stream);
-    } else if (unit_offset) {
-        launch_rmsnorm<RmsEpilogue::Offset>(x, weight, nullptr, out, d, rows, eps, aligned2,
-                                            multiprocessor_count, stream);
-    } else {
-        launch_rmsnorm<RmsEpilogue::Plain>(x, weight, nullptr, out, d, rows, eps, aligned2,
-                                           multiprocessor_count, stream);
+    // CUDA grid limits are launch resources, not a semantic limit on the positive row extent.
+    constexpr std::int64_t kMaxLaunchRows = std::numeric_limits<int>::max();
+    for (std::int64_t first = 0; first < rows;) {
+        const std::int64_t count = std::min(rows - first, kMaxLaunchRows);
+        const std::size_t offset =
+            static_cast<std::size_t>(first) * static_cast<std::size_t>(d) * 2;
+        Tensor x_chunk   = x;
+        Tensor out_chunk = out;
+        Tensor z_chunk;
+        x_chunk.data   = static_cast<std::byte*>(x.data) + offset;
+        out_chunk.data = static_cast<std::byte*>(out.data) + offset;
+        if (z != nullptr) {
+            z_chunk      = *z;
+            z_chunk.data = static_cast<std::byte*>(z->data) + offset;
+        }
+        switch (epilogue) {
+        case RmsEpilogue::SiluGated:
+            launch_rmsnorm<RmsEpilogue::SiluGated>(x_chunk, weight, &z_chunk, out_chunk, d, count,
+                                                   eps, aligned2, multiprocessor_count, stream);
+            break;
+        case RmsEpilogue::SigmoidGated:
+            launch_rmsnorm<RmsEpilogue::SigmoidGated>(x_chunk, weight, &z_chunk, out_chunk, d,
+                                                      count, eps, aligned2, multiprocessor_count,
+                                                      stream);
+            break;
+        case RmsEpilogue::Offset:
+            launch_rmsnorm<RmsEpilogue::Offset>(x_chunk, weight, nullptr, out_chunk, d, count, eps,
+                                                aligned2, multiprocessor_count, stream);
+            break;
+        case RmsEpilogue::Plain:
+            launch_rmsnorm<RmsEpilogue::Plain>(x_chunk, weight, nullptr, out_chunk, d, count, eps,
+                                               aligned2, multiprocessor_count, stream);
+            break;
+        }
+        CUDA_CHECK(cudaGetLastError());
+        first += count;
     }
-    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace ninfer::ops::detail
