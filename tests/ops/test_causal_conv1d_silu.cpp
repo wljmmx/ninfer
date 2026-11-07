@@ -360,7 +360,10 @@ int split_case(std::int32_t C, std::int32_t q_dim, std::int32_t k_dim, std::int3
         ops::causal_conv1d_silu_split(tx, tw, ts_in, ts_out, tq, tk, tv, nullptr);
         cuda_synchronize();
     } else {
-        // Graph capture needs a non-default stream; the legacy stream cannot be captured.
+        // Graph capture needs a non-default stream; the legacy stream cannot be captured. The
+        // fixture fills above run on the legacy stream, which a nonblocking stream does not wait
+        // for, so settle them first or the kernel can race the poison fill.
+        cuda_synchronize(nullptr);
         DeviceContext device;
         DecodeGraphDefinition definition;
         DecodeGraphExecutable graph;
