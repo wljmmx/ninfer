@@ -761,19 +761,14 @@ private:
         release_consumer(request);
     }
 
-    bool mark_completed(const std::shared_ptr<Request>& request) noexcept {
-        bool release = false;
+    bool prepare_completion(const std::shared_ptr<Request>& request) {
         {
             std::lock_guard lock(request->mutex);
-            if (request->consumer_released && !request->capacity_released) {
-                request->capacity_released = true;
-                release                    = true;
-            }
+            if (request->response_done) { return false; }
         }
-        return release;
-    }
-
-    void release_planning_state(const std::shared_ptr<Request>& request) noexcept {
+        if (request->preemption_count) {
+            observe_scheduling(request, GenerationSchedulingTransition::Terminal);
+        }
         if (admission_decision_ && admission_decision_->request == request) {
             admission_decision_.reset();
         }
@@ -788,34 +783,58 @@ private:
         }
         request->suspended.reset();
         request->base_plan.reset();
-    }
-
-    void complete_error(const std::shared_ptr<Request>& request, std::exception_ptr error) {
-        if (request->preemption_count) {
-            observe_scheduling(request, GenerationSchedulingTransition::Terminal);
-        }
-        release_planning_state(request);
         request->prompt      = {};
         request->model_state = EngineRequestState::ModelFinished;
+        return true;
+    }
+
+    void release_request(const std::shared_ptr<Request>& request) noexcept {
+        if (request->lane) {
+            const auto lane = request->lane->value;
+            capture_decisions_[lane].reset();
+            runnable_units_[lane] = false;
+            slots_[lane].reset();
+            request_admission_check();
+            scheduler_.capacity_released();
+        }
         request->sequence.reset();
         request->lane.reset();
         request->budget.reset();
         request->terminal_reason.reset();
+    }
+
+    void publish_completion(const std::shared_ptr<Request>& request, GenerationResult result,
+                            std::exception_ptr error = {}) {
+        bool release = false;
         {
             std::lock_guard lock(request->mutex);
             if (request->response_done) { return; }
+            request->result        = std::move(result);
             request->error         = std::move(error);
             request->response_done = true;
+            if (request->consumer_released && !request->capacity_released) {
+                request->capacity_released = true;
+                release                    = true;
+            }
         }
-        if (mark_completed(request)) { release_reserved_capacity(); }
+        if (release) { release_reserved_capacity(); }
         request->cv.notify_one();
     }
 
-    void complete_success(const std::shared_ptr<Request>& request, FinishReason reason) {
+    void complete_error(const std::shared_ptr<Request>& request_ref, std::exception_ptr error) {
+        // Keep the request alive across release_request: that call clears its lane slot, which
+        // may be the very shared_ptr this reference aliases.
+        const auto request = request_ref;
+        if (!prepare_completion(request)) { return; }
+        release_request(request);
+        publish_runtime_stats();
+        publish_completion(request, {}, std::move(error));
+    }
+
+    void complete_success(const std::shared_ptr<Request>& request_ref, FinishReason reason) {
+        const auto request = request_ref;
         HostPhaseMeasurement completion = begin_host_phase();
-        if (request->preemption_count) {
-            observe_scheduling(request, GenerationSchedulingTransition::Terminal);
-        }
+        if (!prepare_completion(request)) { return; }
         double prompt_wall_seconds     = 0.0;
         double generation_wall_seconds = 0.0;
         if (request->observation.phase_timings && request->first_token) {
@@ -828,9 +847,6 @@ private:
             generation_wall_seconds =
                 std::chrono::duration<double>(*request->last_token - *request->first_token).count();
         }
-        release_planning_state(request);
-        request->prompt      = {};
-        request->model_state = EngineRequestState::ModelFinished;
         if (!request->queue_wait_recorded) {
             request->host_timing.queue_wait_ns = elapsed_ns(request->submitted, Clock::now());
             request->queue_wait_recorded       = true;
@@ -878,44 +894,25 @@ private:
         result.timings.total_seconds =
             request->prepare_seconds +
             std::chrono::duration<double>(Clock::now() - request->submitted).count();
-        request->sequence.reset();
-        request->lane.reset();
-        request->budget.reset();
-        request->terminal_reason.reset();
+        release_request(request);
         finish_engine_phase(completion, EngineHostPhase::CommitOutput);
         result.engine_timing       = request->host_timing.public_snapshot();
         result.first_output_timing = request->first_output_timing;
-        {
-            std::lock_guard lock(request->mutex);
-            if (request->response_done) { return; }
-            request->result        = std::move(result);
-            request->response_done = true;
-        }
-        if (mark_completed(request)) { release_reserved_capacity(); }
-        request->cv.notify_one();
+        publish_runtime_stats();
+        publish_completion(request, std::move(result));
     }
 
-    void complete_cancelled(const std::shared_ptr<Request>& request) {
-        (void)request->output.preview_terminal(FinishReason::Cancelled);
-        append_output(request, request->output.commit_preview());
-        complete_success(request, FinishReason::Cancelled);
-    }
-
-    void complete_detached_cancelled(const std::shared_ptr<Request>& request) {
+    void complete_cancelled(const std::shared_ptr<Request>& request_ref) {
+        const auto request = request_ref;
         try {
-            complete_cancelled(request);
+            (void)request->output.preview_terminal(FinishReason::Cancelled);
+            append_output(request, request->output.commit_preview());
+            complete_success(request, FinishReason::Cancelled);
         } catch (...) {
             const std::exception_ptr error = std::current_exception();
             complete_error(request, error);
             throw;
         }
-    }
-
-    void remove_completed_slot(std::uint32_t lane) {
-        capture_decisions_[lane].reset();
-        slots_[lane].reset();
-        request_admission_check();
-        scheduler_.capacity_released();
     }
 
     [[nodiscard]] std::array<bool, kMaximumConcurrency> snapshot_cancellations() const noexcept {
@@ -968,11 +965,9 @@ private:
 
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
             complete_success(request, reason);
-            remove_completed_slot(lane);
             boundary = begin_host_phase();
             changed  = true;
         }
-        if (changed) { publish_runtime_stats(); }
         return changed;
     }
 
@@ -981,7 +976,7 @@ private:
         if (instance_.program->has_context_transaction()) { return; }
         bool changed = false;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-            const auto& request = slots_[lane];
+            const auto request = slots_[lane];
             if (request == nullptr || !cancelled_at_boundary[lane]) { continue; }
             if (request->capture_pending) { continue; }
             if (!request->sequence || !request->lane || request->lane->value != lane) {
@@ -994,11 +989,9 @@ private:
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
             append_output(request, request->output.commit_preview());
             complete_success(request, FinishReason::Cancelled);
-            remove_completed_slot(lane);
             boundary = begin_host_phase();
             changed  = true;
         }
-        if (changed) { publish_runtime_stats(); }
     }
 
     [[nodiscard]] bool expire_pending_requests() {
@@ -1022,7 +1015,7 @@ private:
             have_pending = !pending_.empty();
         }
         try {
-            for (const auto& request : cancelled) { complete_detached_cancelled(request); }
+            for (const auto& request : cancelled) { complete_cancelled(request); }
             for (const auto& request : expired) {
                 complete_error(request,
                                std::make_exception_ptr(RequestError(
@@ -1035,10 +1028,7 @@ private:
             for (const auto& request : expired) { complete_error(request, error); }
             throw;
         }
-        if (!cancelled.empty() || !expired.empty()) {
-            request_admission_check();
-            publish_runtime_stats();
-        }
+        if (!cancelled.empty() || !expired.empty()) { request_admission_check(); }
         return have_pending;
     }
 
@@ -1062,7 +1052,6 @@ private:
         std::array<bool, kMaximumConcurrency> failed{};
         bool generated_staged = false;
         std::array<std::shared_ptr<Request>, kMaximumConcurrency> terminal_requests{};
-        std::array<std::uint32_t, kMaximumConcurrency> terminal_lanes{};
         std::array<FinishReason, kMaximumConcurrency> terminal_reasons{};
         std::size_t terminal_count    = 0;
         const auto rollback_generated = [&]() {
@@ -1247,7 +1236,6 @@ private:
                     complete_error(request, std::make_exception_ptr(
                                                 RequestError(RequestErrorKind::ConstraintDeadEnd,
                                                              "grammar has no valid next token")));
-                    remove_completed_slot(lane);
                     continue;
                 }
                 if (!cancelled[row]) { request->budget->commit(accepted); }
@@ -1258,7 +1246,6 @@ private:
                 if (decisions[row].terminal) {
                     if (cancelled[row]) {
                         terminal_requests[terminal_count] = request;
-                        terminal_lanes[terminal_count]    = lane;
                         terminal_reasons[terminal_count]  = finish_reasons[row];
                         ++terminal_count;
                     } else {
@@ -1297,14 +1284,12 @@ private:
             phase.finish();
             for (std::size_t index = 0; index < terminal_count; ++index) {
                 complete_success(terminal_requests[index], terminal_reasons[index]);
-                remove_completed_slot(terminal_lanes[index]);
             }
             throw;
         }
         phase.finish();
         for (std::size_t index = 0; index < terminal_count; ++index) {
             complete_success(terminal_requests[index], terminal_reasons[index]);
-            remove_completed_slot(terminal_lanes[index]);
         }
     }
 
@@ -1641,8 +1626,8 @@ private:
             const auto control  = std::move(*materializing_);
             const auto& request = control.request;
             if (!progress.published) {
-                complete_detached_cancelled(request);
                 materializing_.reset();
+                complete_cancelled(request);
                 scheduler_.capacity_released();
                 request_admission_check();
                 return true;
@@ -1704,11 +1689,8 @@ private:
                 const auto lane = request->lane->value;
                 if (!progress.published) {
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
-                    slots_[lane].reset();
-                    request->lane.reset();
-                    request->sequence.reset();
                     context_owner_.reset();
-                    complete_detached_cancelled(request);
+                    complete_cancelled(request);
                     scheduler_.capacity_released();
                     request_admission_check();
                     boundary = begin_host_phase();
@@ -2476,21 +2458,25 @@ private:
         admission_decision_.reset();
         for (auto& decision : capture_decisions_) { decision.reset(); }
         context_owner_.reset();
-        for (auto& request : paused_) {
-            request->suspended.reset();
-            complete_error(request, error);
-        }
-        paused_.clear();
+        std::vector<std::shared_ptr<Request>> paused;
+        paused.swap(paused_);
+        const auto residents = slots_;
+        const auto release   = [&](const std::shared_ptr<Request>& request) {
+            if (request && prepare_completion(request)) { release_request(request); }
+        };
+        for (const auto& request : paused) { release(request); }
+        for (const auto& request : residents) { release(request); }
+        release(materializing_request);
+        for (const auto& request : pending) { release(request); }
         resources_.release_all(*instance_.program);
-        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-            if (slots_[lane] != nullptr) {
-                complete_error(slots_[lane], error);
-                slots_[lane].reset();
-            }
-        }
-        if (materializing_request != nullptr) { complete_error(materializing_request, error); }
-        for (const auto& request : pending) { complete_error(request, error); }
         publish_runtime_stats();
+        const auto publish = [&](const std::shared_ptr<Request>& request) {
+            if (request) { publish_completion(request, {}, error); }
+        };
+        for (const auto& request : paused) { publish(request); }
+        for (const auto& request : residents) { publish(request); }
+        publish(materializing_request);
+        for (const auto& request : pending) { publish(request); }
     }
 
     void worker_loop() noexcept {
@@ -2592,7 +2578,7 @@ private:
                     }
                     request->suspended.reset();
                     it = paused_.erase(it);
-                    complete_detached_cancelled(request);
+                    complete_cancelled(request);
                     scheduler_.capacity_released();
                 }
                 const bool recovering =

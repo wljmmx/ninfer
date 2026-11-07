@@ -46,6 +46,8 @@ public:
     [[nodiscard]] explicit operator bool() const noexcept;
     [[nodiscard]] const ResolvedSamplingParameters& resolved_sampling() const noexcept;
 
+    // A terminal result or request error is visible after logical scheduling membership is
+    // released and the corresponding Engine snapshot is published.
     GenerationResult wait(OutputSink* sink = nullptr, const CancellationView& cancellation = {});
 
 private:
