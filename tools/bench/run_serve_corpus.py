@@ -84,7 +84,7 @@ SCENARIO_FIXTURES = {
 
 WARMUP_FIXTURE = "text_smoke_zh"
 RUN_ARTIFACT_TYPE = "ninfer_serve_corpus_result"
-RUN_SCHEMA_VERSION = 8
+RUN_SCHEMA_VERSION = 9
 SERVER_LOG_ARTIFACT_TYPE = "ninfer_serve_request_log"
 SERVER_LOG_SCHEMA_VERSION = 24
 STARTUP_TIMEOUT_SECONDS = 1800.0
@@ -568,6 +568,7 @@ def build_result_record(
         prompt_tokens = int(result["prompt_tokens"])
         completion_tokens = int(result["completion_tokens"])
         prepare_seconds = float(timings["prepare"])
+        ttft_seconds = float(timings["ttft"])
         vision_seconds = float(timings["vision"])
         prefill_seconds = float(timings["prefill"])
         decode_seconds = float(timings["decode"])
@@ -630,7 +631,7 @@ def build_result_record(
         "decode_seconds": decode_seconds,
         "total_seconds": total_seconds,
         "prefill_tok_s": safe_ratio(float(prompt_tokens), prefill_seconds),
-        "server_ttft_ms": 1000.0 * (prepare_seconds + vision_seconds + prefill_seconds),
+        "server_ttft_ms": 1000.0 * ttft_seconds,
         "decode_tok_s": safe_ratio(float(decode_tokens), decode_seconds),
         "speculative_rounds": speculative_rounds,
         "drafted_tokens": drafted_tokens,

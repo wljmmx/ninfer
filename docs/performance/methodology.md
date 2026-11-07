@@ -88,7 +88,7 @@ not a repeated-sample mean.
 | Published metric | Definition |
 |---|---|
 | Prefill phase (tok/s) | `prompt_tokens / prefill_seconds` for each serial request |
-| Server TTFT (ms) | `1000 * (prepare_seconds + vision_seconds + prefill_seconds)` |
+| Server TTFT (ms) | `1000 * request_done.timings_seconds.ttft` |
 | Decode phase (tok/s) | `(completion_tokens - 1) / decode_seconds` for each serial request |
 | Corpus prefill (tok/s) | Total computed prefill tokens / full corpus makespan |
 | Corpus decode (tok/s) | Total decode tokens / full corpus makespan |
@@ -97,8 +97,12 @@ not a repeated-sample mean.
 | Spec acceptance | Accepted draft tokens / drafted tokens |
 | Spec tokens/round | `1 + accepted_tokens / speculative_rounds` |
 
-Server TTFT is an internal phase sum. It does not include ingress queueing or HTTP transport and
-is not the external streaming TTFT measured by the [Serve TTFT client](../../tools/bench/ttft/README.md).
+Server TTFT follows the production first-token boundary: it starts at service preparation and ends at
+the first accepted output token, so it is not the sum of the reported phases. It does not include
+ingress queueing or HTTP transport and is separate from
+the external streaming TTFT measured by the [Serve TTFT client](../../tools/bench/ttft/README.md).
+Serial result schema v8 and earlier used the phase sum; those historical values have a different
+boundary from the current server TTFT.
 The three decode rates have different time denominators and must not share an unlabeled column.
 Committed decode tokens exclude the first completion token produced by prefill.
 
