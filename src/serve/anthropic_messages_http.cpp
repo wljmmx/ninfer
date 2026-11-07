@@ -135,6 +135,9 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     }
 
     try {
+        // Admission must be established before the response commits to SSE: a queued or rejected
+        // request still has a JSON error body to send.
+        service_->wait_for_admission(prepared, [&req] { return client_disconnected(req); });
         auto stream  = std::make_shared<HttpGenerationStream>(std::move(prepared));
         auto encoder = std::make_shared<AnthropicMessagesStream>(identity, input_tokens);
 

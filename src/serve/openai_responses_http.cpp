@@ -364,6 +364,9 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     }
 
     try {
+        // Admission must be established before the response commits to SSE: a queued or rejected
+        // request still has a JSON error body to send.
+        service_->wait_for_admission(prepared, [&req] { return client_disconnected(req); });
         auto stream                      = std::make_shared<StreamingResponse>();
         stream->prepared                 = std::move(prepared);
         stream->storage.input_turns      = std::move(request.prompt.input_turns);
