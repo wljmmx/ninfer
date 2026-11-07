@@ -8,8 +8,8 @@
 // kv_cache_int8_quant_code_index address (ops/kv_cache/int8_g64_codec.cuh) — with an
 // FP16 G64 scale plane; V matches rk4v4's packed-int4 plane (128 B/token-head, low
 // nibble = even dim, ops/kv_cache/rk4_codec.cuh) with its own FP16 G64 scale plane. The
-// serving name maps at src/serve/serve_options.cpp:110; the attention dispatch that
-// consumes this layout is RkVariant::Plain (int8 K, PackedV only) in
+// serving name maps at src/product/config/options.cpp kv_storage(); the attention dispatch
+// that consumes this layout is RkVariant::Plain (int8 K, PackedV only) in
 // src/ops/softmax_attention/dense/causal_cache/int8/launch.cu.
 //
 // Stored frame. Identical story to rk4v4: K is Hadamard-rotated before quantization

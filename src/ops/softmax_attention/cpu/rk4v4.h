@@ -7,8 +7,8 @@
 // both DType::U8 planes of 128 packed bytes per token-head — two int4 codes per byte, low
 // nibble = even dim (ops/kv_cache/rk4_codec.cuh) — and each carries its own FP16 G64
 // scale plane of 4 scales per token-head. The serving name maps at
-// src/serve/serve_options.cpp:111; the attention dispatch that consumes this layout is
-// RkVariant::PackedKOnly (src/ops/softmax_attention/dense/causal_cache/int8/launch.cu).
+// src/product/config/options.cpp kv_storage(); the attention dispatch that consumes this
+// layout is RkVariant::PackedKOnly (src/ops/softmax_attention/dense/causal_cache/int8/launch.cu).
 //
 // Stored frame. K is quantized AFTER the normalized D256 Hadamard rotation
 // (ops/kv_cache/append/rk_kernel.cuh rotates, then quantizes), so a decoded K row is in

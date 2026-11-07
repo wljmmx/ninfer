@@ -649,7 +649,7 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
             product::format_pretty_bytes(memory.free_after_startup_bytes));
     }
 
-    if (service.options().enable_vision) {
+    if (service.options().launch.engine.enable_vision) {
         const ninfer::MediaCacheSummary media = service.media_cache_summary();
         logger_->info("media | {} preprocess workers | cache {} | live {}",
                       media.preprocess_threads, product::format_pretty_bytes(media.capacity_bytes),

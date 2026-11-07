@@ -479,6 +479,37 @@ Json microseconds_per(std::uint64_t nanoseconds, std::uint64_t count) {
 
 } // namespace
 
+std::string format_startup_config_json(const std::string& server_instance_id,
+                                       std::uint64_t timestamp,
+                                       const product::ServeOptions& options) {
+    const auto view         = product::configuration_view(options);
+    Json record             = event_base(server_instance_id, timestamp, "startup_config");
+    record["entry"]         = "serve";
+    record["config_path"]   = view.config_path.string();
+    record["argv"]          = view.argv;
+    record["environment"]   = view.environment;
+    record["configuration"] = Json::object();
+    record["sources"]       = Json::object();
+    for (const auto& item : view.items) {
+        record["configuration"][item.key] =
+            std::visit([](const auto& value) { return Json(value); }, item.value);
+        Json source;
+        switch (item.source.kind) {
+        case product::ConfigSourceKind::Default:
+            source = {{"kind", "default"}};
+            break;
+        case product::ConfigSourceKind::File:
+            source = {{"kind", "file"}, {"line", item.source.line}, {"column", item.source.column}};
+            break;
+        case product::ConfigSourceKind::CommandLine:
+            source = {{"kind", "argv"}, {"argument", item.source.argument}};
+            break;
+        }
+        record["sources"][item.key] = std::move(source);
+    }
+    return record.dump();
+}
+
 std::string format_server_start_json(
     const std::string& server_instance_id, std::uint64_t timestamp, const ServeOptions& options,
     const ninfer::EngineOptions& engine_options,
@@ -490,8 +521,8 @@ std::string format_server_start_json(
     Json artifact_size = nullptr;
     if (artifact_size_bytes.has_value()) { artifact_size = *artifact_size_bytes; }
     Json default_thinking_budget = nullptr;
-    if (options.default_thinking_budget) {
-        default_thinking_budget = *options.default_thinking_budget;
+    if (options.launch.generation.thinking_budget) {
+        default_thinking_budget = *options.launch.generation.thinking_budget;
     }
 
     record["server"] =
@@ -501,17 +532,17 @@ std::string format_server_start_json(
              {"api_key_configured", !options.api_key.empty()},
              {"cors_enabled", options.enable_cors},
              {"max_request_bytes", options.max_request_bytes},
-             {"media_cache_bytes", options.media_cache_bytes},
-             {"media_live_bytes", options.media_live_bytes},
-             {"media_preprocess_threads", options.media_preprocess_threads},
-             {"request_log_jsonl", options.request_log_jsonl},
-             {"default_output_tokens", options.default_max_tokens},
+             {"media_cache_bytes", engine_options.media_cache_bytes},
+             {"media_live_bytes", engine_options.media_live_bytes},
+             {"media_preprocess_threads", engine_options.media_preprocess_threads},
+             {"request_log_jsonl", options.launch.logging.request_jsonl},
+             {"default_output_tokens", options.launch.generation.max_tokens},
              {"default_thinking",
-              options.enable_thinking ? Json(*options.enable_thinking) : Json(nullptr)},
+              options.launch.generation.enable_thinking ? Json(*options.launch.generation.enable_thinking) : Json(nullptr)},
              {"default_thinking_budget", std::move(default_thinking_budget)},
              {"default_preserve_thinking",
-              options.preserve_thinking ? Json(*options.preserve_thinking) : Json(nullptr)}};
-    record["artifact"]                             = Json{{"path", options.artifact_path},
+              options.launch.generation.preserve_thinking ? Json(*options.launch.generation.preserve_thinking) : Json(nullptr)}};
+    record["artifact"]                             = Json{{"path", engine_options.artifact_path},
                                                           {"size_bytes", std::move(artifact_size)},
                                                           {"architecture", load.architecture},
                                                           {"name", load.model_name},
@@ -540,11 +571,11 @@ std::string format_server_start_json(
              {"max_pending_requests", engine_options.max_pending_requests},
              {"pending_timeout_ms", engine_options.pending_timeout_ms},
              {"prefill_chunk", engine_options.prefill_chunk},
-             {"log_stats_interval_ms", options.log_stats_interval_ms},
+             {"log_stats_interval_ms", options.launch.logging.stats_interval_ms},
              {"kv_cache", kv_cache_name(engine_options.kv_cache)},
              {"vision", engine_options.enable_vision},
              {"cuda_graph", engine_options.use_cuda_graph},
-             {"prefix_reuse", options.allow_prefix_reuse},
+             {"prefix_reuse", options.launch.engine.context_cache.enabled},
              {"speculative_backend",
               product::speculative_backend_name(engine_options.speculative.backend)},
              {"speculative_draft_window", engine_options.speculative.draft_tokens},
@@ -563,9 +594,9 @@ std::string format_server_start_json(
     record["sampling_defaults"] =
         Json{{"thinking", preset_json(sampling_defaults.thinking)},
              {"non_thinking", preset_json(sampling_defaults.non_thinking)},
-             {"server_overrides", overrides_json(options.sampling_overrides)},
+             {"server_overrides", overrides_json(options.launch.generation.sampling)},
              {"omitted_seed", "random"},
-             {"greedy", options.greedy}};
+             {"greedy", options.launch.generation.greedy}};
     record["memory"] =
         Json{{"weights", arena_json(memory.weights)},
              {"sequence", arena_json(memory.sequence)},
@@ -595,7 +626,7 @@ std::string format_server_start_json(
              {"cuda_compile_version", environment.cuda_compile_version},
              {"cuda_runtime_version", environment.cuda_runtime_version},
              {"cuda_driver_version", environment.cuda_driver_version}};
-    record["argv"] = options.startup_argv;
+    record["argv"] = options.launch.provenance.argv;
     return record.dump();
 }
 
@@ -896,6 +927,11 @@ JsonlRequestLog::JsonlRequestLog(const std::string& path,
     }
 }
 
+void JsonlRequestLog::write_startup_config(const ServeOptions& options) {
+    if (!enabled()) { return; }
+    append(format_startup_config_json(server_instance_id_, unix_time_ms(), options));
+}
+
 void JsonlRequestLog::write_server_start(const ServeOptions& options,
                                          const ninfer::EngineOptions& engine_options,
                                          const ninfer::ModelSamplingDefaults& sampling_defaults,
@@ -904,12 +940,12 @@ void JsonlRequestLog::write_server_start(const ServeOptions& options,
                                          const ninfer::MemorySummary& memory) {
     if (!enabled()) { return; }
     std::error_code error;
-    const std::uintmax_t size = std::filesystem::file_size(options.artifact_path, error);
+    const std::uintmax_t size = std::filesystem::file_size(engine_options.artifact_path, error);
     const std::optional<std::uint64_t> artifact_size =
         error ? std::nullopt : std::optional<std::uint64_t>(size);
     append(format_server_start_json(server_instance_id_, unix_time_ms(), options, engine_options,
                                     sampling_defaults, public_model_id, load, memory,
-                                    query_server_log_environment(options.device), artifact_size));
+                                    query_server_log_environment(engine_options.device), artifact_size));
 }
 
 void JsonlRequestLog::write_request_start(const RequestLogContext& context) {

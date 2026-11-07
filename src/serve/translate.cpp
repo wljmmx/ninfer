@@ -37,7 +37,7 @@ std::uint64_t random_seed() {
 
 ninfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& request,
                                                      const ServeOptions& server) {
-    ninfer::SamplingOverrides sampling = server.sampling_overrides;
+    ninfer::SamplingOverrides sampling = server.launch.generation.sampling;
     if (request.temperature) { sampling.temperature = static_cast<float>(*request.temperature); }
     if (request.top_p) { sampling.top_p = static_cast<float>(*request.top_p); }
     if (request.min_p) { sampling.min_p = static_cast<float>(*request.min_p); }
@@ -50,8 +50,8 @@ ninfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& reque
     }
     if (request.seed) {
         sampling.seed = *request.seed;
-    } else if (server.sampling_overrides.seed) {
-        sampling.seed = *server.sampling_overrides.seed;
+    } else if (server.launch.generation.sampling.seed) {
+        sampling.seed = *server.launch.generation.sampling.seed;
     } else {
         sampling.seed = random_seed();
     }
@@ -83,7 +83,7 @@ ninfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& reque
         (*sampling.frequency_penalty < -2.0F || *sampling.frequency_penalty > 2.0F)) {
         invalid_sampling("frequency_penalty must be in [-2,2]", "frequency_penalty");
     }
-    if (server.greedy) { sampling.temperature = 0.0F; }
+    if (server.launch.generation.greedy) { sampling.temperature = 0.0F; }
     return sampling;
 }
 
@@ -143,8 +143,8 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
     }
     kwargs.erase("reasoning_effort");
     ResolvedPromptSemantics result{
-        .enable_thinking           = thinking ? thinking : server.enable_thinking,
-        .preserve_thinking         = preserve ? preserve : server.preserve_thinking,
+        .enable_thinking           = thinking ? thinking : server.launch.generation.enable_thinking,
+        .preserve_thinking         = preserve ? preserve : server.launch.generation.preserve_thinking,
         .chat_template_kwargs_json = kwargs.dump(),
     };
     if (effort) {
@@ -311,7 +311,7 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     options.execution.allow_prefix_reuse      = allow_prefix_reuse;
     if (semantics.enable_thinking != false) {
         options.execution.thinking.budget =
-            request.thinking_budget ? request.thinking_budget : server.default_thinking_budget;
+            request.thinking_budget ? request.thinking_budget : server.launch.generation.thinking_budget;
     }
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.output.raw                     = false;

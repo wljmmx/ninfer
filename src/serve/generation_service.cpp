@@ -897,30 +897,10 @@ private:
 
 GenerationService::GenerationService(ServeOptions options, StartupObserver startup_observer)
     : options_(std::move(options)) {
-    ninfer::EngineOptions engine_options;
-    engine_options.artifact_path            = options_.artifact_path;
-    engine_options.chat_template_path       = options_.chat_template_path;
-    engine_options.device                   = options_.device;
-    engine_options.max_context              = options_.max_context;
-    engine_options.kv_capacity              = options_.kv_capacity;
-    engine_options.max_concurrency          = options_.max_concurrency;
-    engine_options.max_pending_requests     = options_.max_pending_requests;
-    engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
-    engine_options.prefill_chunk            = options_.prefill_chunk;
-    engine_options.kv_cache                 = options_.kv_cache;
-    engine_options.enable_vision            = options_.enable_vision;
-    engine_options.use_cuda_graph           = options_.use_cuda_graph;
-    engine_options.wddm_evictable_budget     = options_.wddm_evictable_budget;
-    engine_options.speculative              = options_.speculative;
-    engine_options.context_cache            = options_.context_cache;
-    engine_options.evict_contract           = options_.evict_contract;
-    engine_options.evict_window_pages       = options_.evict_window_pages;
-    engine_options.evict_sink_pages         = options_.evict_sink_pages;
-    engine_options.context_cost.preset_path = options_.context_cost_presets;
-    engine_options.media_cache_bytes        = options_.media_cache_bytes;
-    engine_options.media_live_bytes         = options_.media_live_bytes;
-    engine_options.media_preprocess_threads = options_.media_preprocess_threads;
-    engine_options.startup_observer         = std::move(startup_observer);
+    // The unified startup configuration already built the engine options; serving only adds the
+    // pieces it owns (the startup observer, and the optional external checkpoint cache below).
+    ninfer::EngineOptions engine_options = options_.launch.engine;
+    engine_options.startup_observer      = std::move(startup_observer);
     // appendix IL: the idle demotion (9b) is ON by default through the CLI; the environment still
     // wins when it is set, so the recorded experiments stay reproducible.
     if (options_.idle_reclaim_ms != 0 && std::getenv("NINFER_KV_IDLE_RECLAIM_MS") == nullptr) {
@@ -948,12 +928,12 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     // after this point the mode lives in the controller, not in the environment or the argv.
     // NINFER_CONTROLLER_MODE is the same initial-value channel for launches without the flag,
     // and it is parsed (and logged) by the mode's own first read.
-    if (!options_.controller_mode.empty() && options_.controller_mode != "auto") {
-        (void)ninfer::set_controller_mode_initial(options_.controller_mode);
+    if (!options_.launch.controller_mode.empty() && options_.launch.controller_mode != "auto") {
+        (void)ninfer::set_controller_mode_initial(options_.launch.controller_mode);
     }
     engine_           = std::make_unique<ninfer::Engine>(std::move(engine_options));
     request_capacity_ = std::make_shared<RequestCapacity>(
-        static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
+        static_cast<std::size_t>(options_.launch.engine.max_concurrency) + options_.launch.engine.max_pending_requests);
 }
 
 std::shared_ptr<RequestLifetime>
@@ -971,7 +951,7 @@ GenerationService::acquire_request_lifetime(DeadlinePolicy deadline_policy) cons
         const Clock::time_point deadline =
             deadline_policy == DeadlinePolicy::UnboundedStartup
                 ? Clock::time_point::max()
-                : started + std::chrono::milliseconds(options_.pending_timeout_ms);
+                : started + std::chrono::milliseconds(options_.launch.engine.pending_timeout_ms);
         return std::make_shared<RequestLifetime>(request_capacity_, started, deadline);
     } catch (...) {
         std::lock_guard lock(request_capacity_->mutex);
@@ -987,7 +967,7 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                                            ContextCacheHints context_cache) const {
     return prepare_impl(request, consumer_mode, std::move(observation), std::move(is_cancelled),
                         std::move(context_cache),
-                        options_.allow_prefix_reuse ? CacheParticipation::ReadWrite
+                        options_.launch.engine.context_cache.enabled ? CacheParticipation::ReadWrite
                                                     : CacheParticipation::Disabled,
                         DeadlinePolicy::ClientPendingTimeout);
 }
@@ -1009,7 +989,7 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
     prepared.reasoning_effort    = semantics.reasoning_effort;
     prepared.preserve_thinking   = semantics.preserve_thinking;
     const bool request_has_media = request.media_item_count() != 0;
-    if (request_has_media && !options_.enable_vision) {
+    if (request_has_media && !options_.launch.engine.enable_vision) {
         const std::invalid_argument error("Vision is disabled for this server");
         throw_invalid_input(error, "vision_disabled");
     }
@@ -1078,12 +1058,12 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
 int GenerationService::count_prompt_tokens(const GenerationRequest& request,
                                            std::function<bool()> is_cancelled) const {
     const bool request_has_media = request.media_item_count() != 0;
-    if (request_has_media && !options_.enable_vision) {
+    if (request_has_media && !options_.launch.engine.enable_vision) {
         const std::invalid_argument error("Vision is disabled for this server");
         throw_invalid_input(error, "vision_disabled");
     }
     const Clock::time_point deadline =
-        Clock::now() + std::chrono::milliseconds(options_.pending_timeout_ms);
+        Clock::now() + std::chrono::milliseconds(options_.launch.engine.pending_timeout_ms);
     const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request, options_);
     try {
         std::size_t remaining_media_bytes =

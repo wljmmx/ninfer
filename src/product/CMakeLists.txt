@@ -16,8 +16,22 @@ target_link_libraries(ninfer_product_prompt_input PRIVATE ninfer_media_acquire n
 
 add_library(ninfer_product_logging STATIC
   logging/logging.cpp
+  logging/configuration.cpp
   logging/pretty_format.cpp
   logging/startup_log.cpp
 )
 ninfer_internal_includes(ninfer_product_logging)
 target_link_libraries(ninfer_product_logging PUBLIC spdlog::spdlog)
+
+# Unified startup configuration: one schema and one layered parser shared by both entry points.
+# TOML support is the vendored toml++ (T048); the parser only reads a launch file, it never
+# touches the runtime parameter bus.
+add_library(ninfer_product_config STATIC
+  config/options.cpp
+  config/schema.cpp
+  config/file.cpp
+  config/configuration.cpp)
+ninfer_internal_includes(ninfer_product_config)
+target_link_libraries(ninfer_product_config
+  PUBLIC ninfer_product_logging
+  PRIVATE ninfer::toml)

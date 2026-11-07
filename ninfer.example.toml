@@ -1,0 +1,123 @@
+# Ninfer startup configuration (TOML)
+#
+# One file describes both entry points: `ninfer --config FILE` and
+# `ninfer-serve --config FILE` read the same field catalog, and every key can also be
+# overridden on the command line. Values written here are STARTUP values only.
+#
+# The NINFER_* environment variables are NOT configured here: they are the initial values of the
+# runtime parameter bus (v8 section 12), which the bus reads once and which the runtime
+# controller may then change. A file or a flag decides what to launch; it does not own a live
+# parameter.
+#
+# Sections marked "serve only" / "cli only" belong to that entry point; the other entry point
+# ignores those keys, so the same file can be used with either binary.
+
+[model]
+path = "model.ninfer"
+# chat_template = "chat_template.jinja"   # empty uses the artifact
+vision = false                            # load Vision resources
+
+[engine]
+device = 0
+# CLI default 2048, serve default 8192.
+max_context = 8192
+# bf16 | int8 | fp8 | nvfp4 | k8v4 | rk8v4 | rk4v4 | rk4v4-e8 | rk2v4-e8 | rk4v2-e8
+kv_dtype = "bf16"
+# Explicit page count, or "auto" to size from device memory. Omitting it follows max_context;
+# serve additionally selects "auto" when max_concurrency is above 1.
+kv_capacity = "auto"
+# Serve only: sizing headroom left free by kv_capacity = "auto", decimal MiB resolved to whole
+# bytes. This is KV sizing, not the startup memory planning reserve.
+kv_capacity_headroom_mib = 1024
+# Positive multiple of 128; omitted lets the model resolve it.
+prefill_chunk = 1024
+cuda_graph = true
+# Serve only.
+max_concurrency = 1
+max_pending_requests = 16
+pending_timeout_ms = 30000
+# Windows: budget against total VRAM minus the DWM floor.
+wddm_evictable_budget = false
+# auto | stable | performance. Initial value for the runtime controller (v8 section 12);
+# NINFER_CONTROLLER_MODE is the equivalent channel for launches without a flag.
+controller_mode = "auto"
+
+[context_cache]
+# Serve only: cross-request history reuse.
+prefix_reuse = true
+# Serve only: extra complete StateImages beyond the active lanes (omitted = max_concurrency).
+# device_state_slots = 1
+# Serve only: shared Host State/KV and in-flight capacity in decimal MiB resolved to whole
+# bytes; 0 disables the backing pool (omitted = resolved from startup memory planning).
+# host_context_mib = 8192
+# Serve only: context-cost JSON overrides.
+# cost_presets = "context-cost.json"
+# Serve only: KV eviction contract (off | on | auto), resolved once at startup.
+evict = "off"
+evict_window_pages = 4
+evict_sink_pages = 1
+# Serve only: idle retained-prefix demotion delay; 0 disables it.
+idle_reclaim_ms = 60000
+
+[speculative]
+backend = "none"        # none | mtp | dflash | dflash2
+# Needed whenever backend is not "none": MTP/DFlash/DFlash2 accept 1..15.
+draft_tokens = 0
+proposal_head = "full"  # full | optimized
+
+[media]
+# Serve only: retained media cache (MiB, 0 disables reuse) and live BF16 patch payloads (MiB).
+cache_mib = 1024
+live_mib = 2048
+preprocess_threads = 0  # 0 selects auto (at most 16 workers)
+
+[generation]
+max_tokens = 8192       # CLI default 128
+# thinking = true       # omitted follows the model and prompt template
+# thinking_budget = 512 # model-origin thinking budget
+# greedy = false        # exact argmax, forces temperature 0
+# preserve_thinking = true  # serve only
+
+[generation.sampling]
+# temperature = 0.7     # [0,2]; 0 selects greedy
+# top_k = 20            # [0,20]
+# top_p = 0.95          # [0,1]
+# min_p = 0.0           # [0,1]
+# presence_penalty = 0.0
+# frequency_penalty = 0.0
+# seed = 42             # uint64; omitted = 0 on the CLI, random per request on the server
+
+[server]
+host = "127.0.0.1"
+port = 8080
+# api_key = "..."       # empty disables authentication
+# model_id = "..."      # public alias; omitted uses the artifact metadata.name
+cors = false
+max_request_mib = 384
+
+[server.responses]
+max_records = 1024
+max_mib = 256
+
+[logging]
+level = "info"          # trace | debug | info | warning | error | critical | off
+stats_interval_ms = 5000  # serve only; 0 disables periodic throughput logs
+# request_jsonl = "requests.jsonl"  # serve only; empty disables structured logging
+
+[cli]
+# Exactly one of prompt / messages is required when the CLI starts.
+# prompt = "hello"
+# messages = "messages.json"
+# reasoning_effort = "medium"   # none | minimal | low | medium | high | xhigh | max
+# raw_output = false
+# print_token_ids = false
+# stop_token_ids = [128009, 128001]
+# stop = ["</answer>"]
+# reasoning_stop = ["</thinking>"]
+
+[cli.constraint]
+kind = "none"           # none | grammar | json_object | json_schema | regex | choice
+# grammar_file = "answer.gbnf"
+# json_schema_file = "answer.schema.json"
+# regex = "^[a-z]+$"
+# choices = ["yes", "no"]

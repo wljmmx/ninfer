@@ -4,11 +4,13 @@
 
 #include "ninfer/types.h"
 #include "serve/request.h"
-#include "serve/serve_options.h"
+#include "product/config/options.h"
 
 #include <functional>
 
 namespace ninfer::serve {
+
+using product::ServeOptions;
 
 // Media acquisition is a product-layer concern. Translation preserves part order
 // and asks the caller to turn each wire source into owning bytes before the

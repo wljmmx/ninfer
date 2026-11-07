@@ -5,7 +5,7 @@
 
 #include "ninfer/engine.h"
 #include "serve/request.h"
-#include "serve/serve_options.h"
+#include "product/config/options.h"
 
 #include <chrono>
 #include <cstddef>
@@ -19,6 +19,8 @@
 #include <vector>
 
 namespace ninfer::serve {
+
+using product::ServeOptions;
 
 struct RequestLifetime;
 struct RequestCapacity;

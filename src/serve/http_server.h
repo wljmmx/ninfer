@@ -5,7 +5,7 @@
 #include "serve/operational_log.h"
 #include "serve/openai_responses_store.h"
 #include "serve/request_log.h"
-#include "serve/serve_options.h"
+#include "product/config/options.h"
 
 #include <httplib.h>
 
@@ -20,6 +20,8 @@
 #include <thread>
 
 namespace ninfer::serve {
+
+using product::ServeOptions;
 
 void write_openai_error(httplib::Response& response, const ApiError& error);
 void write_anthropic_error(httplib::Response& response, const ApiError& error,

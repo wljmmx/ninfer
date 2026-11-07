@@ -4,7 +4,7 @@
 // by operational_log.* and never consumes these serialized records.
 
 #include "serve/request_events.h"
-#include "serve/serve_options.h"
+#include "product/config/options.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -20,7 +20,9 @@ class logger;
 
 namespace ninfer::serve {
 
-inline constexpr int kRequestLogSchemaVersion        = 25;
+using product::ServeOptions;
+
+inline constexpr int kRequestLogSchemaVersion        = 26;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct ServerLogEnvironment {
@@ -37,6 +39,9 @@ struct ServerLogEnvironment {
 
 // Pure JSON formatters are public to repository tests. Each return value is one complete JSON
 // object without a trailing newline.
+std::string format_startup_config_json(const std::string& server_instance_id,
+                                       std::uint64_t timestamp_unix_ms,
+                                       const ServeOptions& options);
 std::string format_server_start_json(
     const std::string& server_instance_id, std::uint64_t timestamp_unix_ms,
     const ServeOptions& options, const ninfer::EngineOptions& engine_options,
@@ -83,6 +88,7 @@ public:
         return server_instance_id_;
     }
 
+    void write_startup_config(const ServeOptions& options);
     void write_server_start(const ServeOptions& options,
                             const ninfer::EngineOptions& engine_options,
                             const ninfer::ModelSamplingDefaults& sampling_defaults,

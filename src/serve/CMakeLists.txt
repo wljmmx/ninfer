@@ -20,11 +20,10 @@ add_library(ninfer_serve STATIC
   metrics.cpp
   http_server.cpp
   openai_responses_http.cpp
-  serve_options.cpp
 )
 ninfer_internal_includes(ninfer_serve)
 target_link_libraries(ninfer_serve
-  PUBLIC ninfer_engine Threads::Threads ninfer::json ninfer::httplib
+  PUBLIC ninfer_engine Threads::Threads ninfer::json ninfer::httplib ninfer_product_config
   PRIVATE ninfer_media_acquire ninfer_product_logging ninfer_grammar CUDA::cudart)
 
 # The checkpoint cache is the only thing here that needs libzmq, and it is optional: without the

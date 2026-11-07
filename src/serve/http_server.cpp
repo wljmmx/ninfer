@@ -214,9 +214,11 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
     : options_(std::move(options)), openai_responses_store_(options_.response_store_max_records,
                                                             options_.response_store_max_bytes),
       operational_log_(logger),
-      request_jsonl_(options_.request_log_jsonl, options_.artifact_path, std::move(logger)) {
-    const std::size_t queued_requests =
-        static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
+      request_jsonl_(options_.launch.logging.request_jsonl.string(),
+                     options_.launch.engine.artifact_path.string(), std::move(logger)) {
+    request_jsonl_.write_startup_config(options_);
+    const std::size_t queued_requests = static_cast<std::size_t>(options_.launch.engine.max_concurrency) +
+                                        options_.launch.engine.max_pending_requests;
     const std::size_t worker_count = queued_requests + 1;
     server_.new_task_queue         = [queued_requests, worker_count] {
         return new httplib::ThreadPool(worker_count, worker_count, queued_requests);
@@ -306,7 +308,7 @@ void HttpServer::run_stats_reporter() {
     using Clock                     = std::chrono::steady_clock;
     ninfer::RuntimeStats previous   = service_->runtime_stats();
     Clock::time_point previous_time = Clock::now();
-    const auto interval             = std::chrono::milliseconds(options_.log_stats_interval_ms);
+    const auto interval             = std::chrono::milliseconds(options_.launch.logging.stats_interval_ms);
     Clock::time_point next_deadline = previous_time + interval;
 
     for (;;) {
@@ -501,7 +503,7 @@ void HttpServer::register_routes() {
 }
 
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
-    res.set_content(make_models_list(public_model_id_, unix_time_now(), options_.max_context),
+    res.set_content(make_models_list(public_model_id_, unix_time_now(), options_.launch.engine.max_context),
                     "application/json");
 }
 
@@ -516,7 +518,7 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
         write_openai_error(res, error);
         return;
     }
-    res.set_content(make_model_object(public_model_id_, unix_time_now(), options_.max_context),
+    res.set_content(make_model_object(public_model_id_, unix_time_now(), options_.launch.engine.max_context),
                     "application/json");
 }
 
@@ -530,7 +532,7 @@ void HttpServer::attach(GenerationService& service) {
     // memory_summary waits for the completed worker boundary, including warmup publication.
     const ninfer::MemorySummary memory  = service.memory_summary();
     const ninfer::RuntimeStats baseline = service.runtime_stats();
-    public_model_id_                    = resolve_public_model_id(options_, load.model_name);
+    public_model_id_                    = product::resolve_public_model_id(options_, load.model_name);
     service_                            = &service;
     metrics_.configure(public_model_id_, service.engine_options(), memory, baseline);
     request_jsonl_.write_server_start(options_, service.engine_options(),
@@ -542,7 +544,7 @@ bool HttpServer::listen() {
     if (public_model_id_.empty()) {
         throw std::logic_error("HTTP public model id is not resolved");
     }
-    if (options_.log_stats_interval_ms != 0) {
+    if (options_.launch.logging.stats_interval_ms != 0) {
         stats_stopping_ = false;
         stats_thread_   = std::thread([this] { run_stats_reporter(); });
     }

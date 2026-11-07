@@ -19,10 +19,9 @@ target_include_directories(ninfer_perplexity_evaluation_test PRIVATE
   ${PROJECT_SOURCE_DIR}/apps/perplexity)
 
 ninfer_add_test(ninfer_cli_options_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_cli_options.cpp" ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp
-  LIBRARIES ninfer_runtime_support ninfer_product_logging)
-
-target_include_directories(ninfer_cli_options_test PRIVATE ${PROJECT_SOURCE_DIR}/apps/cli)
+  NEEDS_SOURCE_DIR
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_cli_options.cpp"
+  LIBRARIES ninfer_product_config)
 
 ninfer_add_test(ninfer_openai_schema_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_openai_schema.cpp"
@@ -41,6 +40,7 @@ ninfer_add_test(ninfer_anthropic_schema_test
   LIBRARIES ninfer_serve)
 
 ninfer_add_test(ninfer_serve_options_test
+  NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_serve_options.cpp"
   LIBRARIES ninfer_serve)
 
