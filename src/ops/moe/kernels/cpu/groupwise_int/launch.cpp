@@ -68,21 +68,23 @@ void launch(const Invocation& args, const Plan& plan, MemoryArena& arena,
               .down    = matrix_bank(args.experts.down),
               .scratch = allocate(arena, args.tokens, plan.token_block)};
     work.workers = static_cast<int>(execution.worker_count());
-    // port (sm_89): the int8 row path is the default. It measured 1.70x on gate_up (0.491 -> 0.289
-    // ms/expert) for 0.145% of perplexity error against a 1% gate, and 18% off the CPU half of a
-    // split token. NINFER_MOE_CPU_INT8=0 keeps the float reference for the gate that compares
-    // both, =16 selects the int16 tier (same kernel shape, 258x finer codes).
-    // 2026-11-07 A/B on the 4090 host (i9-14900K/AVX2, moe_cpu_bench misses=1, min of 200 with a
-    // 96 MiB flush before every call, int8/int16 runs interleaved in one session): int16 0.0504
-    // ms/expert vs int8 0.0484 (float 0.0724) at the shipped one-token split shape - 96.0% of
-    // the int8 speed - and 94.1% at the two-column batch shape, where both tiers spill ymm
-    // (q16: 29 stack loads vs 4 at one column). Both sit under the 97% bar for making int16 the
-    // default, so int8 stays it; int16 remains the opt-in for the 258x finer precision
-    // (1.46e-5 vs 3.58e-3 relative) whenever a caller decides to pay ~4-6% for it.
+    // port (sm_89): the int16 row path is the default now. It keeps the int8 kernel's shape but
+    // decodes the whole 64-value group in one pass (bias-flip + interleaved nibble planes +
+    // signed widening, compute.h dot_q4_q16) and reads the activation plane through fused madd
+    // memory operands, which took 17 instructions off each row's weight preparation and moved
+    // the totals out of the stack. NINFER_MOE_CPU_INT8=8 selects the int8 tier, =0 keeps the
+    // float reference for the gate that compares both.
+    // 2026-11-07 A/B on the 4090 host (i9-14900K/AVX2, moe_cpu_bench misses=1, min of 400 with
+    // a 96 MiB flush before every call, int8/int16 runs interleaved 5x in one session): int16
+    // 0.0505 ms/expert vs int8 0.0491 at the shipped one-token split shape - 97.2% of the int8
+    // speed, past the 97% bar - and 100.2% at the two-column batch shape with 98.1% at the
+    // four-column one, both over the 95% bar, so the default flipped from int8 (which measured
+    // 96.0%/94.1% on 2026-11-07 8d07afe3) to int16. The 258x finer codes come with the
+    // package: 1.46e-5 vs 3.58e-3 relative against the float reference, still opt-out-able.
+    // unset or "16" -> int16; "0" -> float; anything else ("8", "1", ...) -> int8.
     const char* int8_switch = std::getenv("NINFER_MOE_CPU_INT8");
-    work.int16_path = int8_switch != nullptr && std::strcmp(int8_switch, "16") == 0;
-    work.int8_path  = !work.int16_path &&
-                     (int8_switch == nullptr || std::strcmp(int8_switch, "0") != 0);
+    work.int16_path = int8_switch == nullptr || std::strcmp(int8_switch, "16") == 0;
+    work.int8_path  = !work.int16_path && std::strcmp(int8_switch, "0") != 0;
     // port (sm_89): mirror the device plane regime - grouped stores BF16 planes from
     // grouped_first tokens up (see work.h), token keeps FP32.
     work.plane_round = args.tokens >= grouped_first;

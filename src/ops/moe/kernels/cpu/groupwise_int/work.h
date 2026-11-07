@@ -122,8 +122,9 @@ struct Work {
     // Decided once per launch, not inside the hot function: a getenv and a branch there cost 17%
     // with the path disabled, because it changed how the compiler laid out the vector loop.
     bool int8_path        = false;
-    // port (sm_89): the int16 gate tier (NINFER_MOE_CPU_INT8=16) - 258x finer activation codes
-    // at the same kernel shape. Same once-per-launch discipline as int8_path.
+    // port (sm_89): the int16 gate tier - 258x finer activation codes at the same kernel shape,
+    // and the default since the 2026-11-07 A/B put it at 97.2%/100.2%/98.1% of the int8 speed
+    // (launch.cpp). NINFER_MOE_CPU_INT8=8 still selects int8. Same once-per-launch discipline.
     bool int16_path       = false;
     bool has_four_columns = false;
     // port (sm_89): mirror of the device plane regime: the grouped path stores the activation
