@@ -1,6 +1,6 @@
 #pragma once
 
-// port (sm_89): CPU partition partial over host-resident rk4v4 / rk8v4 KV pages.
+// port (sm_89): CPU partition partial over host-resident rk-family KV pages.
 //
 // Feasibility batch 2, built on the Phase A decode substrate (decode.h / rk4v4.h / rk8v4.h):
 // compute one KV split's attention partial for a decode-shaped query tile, in the exact
@@ -8,6 +8,12 @@
 // buffers the GPU merge kernel consumes. Header-only, host-only, no CUDA include, no runtime
 // wiring — the controller that decides which splits run on the host is a later batch (cost.h
 // is its decision input).
+//
+// P4 batch: the codec axis (RkKCodec / RkVCodec below) extends the partial over the rk -e8
+// layouts — rk4v4-e8 (E8Lattice K), rk2v4-e8 (E8Root K), rk4v2-e8 (E8Lattice K + E8Root V) —
+// on the e8_codec.h decode substrate. The e8 rows feed the SAME int8-dot / FP16-group-scale
+// numeric form (every e8 code decodes to int8 and every scale plane stays FP16 G64), so the
+// contract below is unchanged; only the code-fetch in Stage 1 varies by codec.
 //
 // --- partial contract (extracted, read-only) ------------------------------------------
 // CausalPartialView { float* acc; float* maximum; float* sum; } — unnormalized FP32
@@ -63,6 +69,7 @@
 // branch never applies to rk layouts (launch.cu passes false).
 
 #include "ops/softmax_attention/cpu/decode.h"
+#include "ops/softmax_attention/cpu/e8_codec.h"
 #include "ops/softmax_attention/cpu/hadamard_d256.h"
 
 #include <cmath>
@@ -155,6 +162,16 @@ inline std::uint16_t f32_to_bf16_bits_rn(float value) noexcept {
     x += 0x7fffu + lsb;
     return static_cast<std::uint16_t>(x >> 16);
 }
+
+// --- K/V codec selection -----------------------------------------------------------------
+// The rk family's per-layout plane codecs, as a template axis of the partial. Int4/Int8 are
+// the launch.cu PackedK pair (rk4v4 / rk8v4); E8Root is rk2v4-e8's 64 B cylinder K plane;
+// E8Lattice is the 96 B cylinder+residual K plane of rk4v4-e8 / rk4v2-e8; E8Root on the V side
+// is rk4v2-e8's calibrated 64 B cylinder V plane (VCodec::Int4 covers every other variant).
+// The K plane extents and decode semantics mirror e8_codec.h; the numeric form below never
+// changes — every codec still feeds the instance's exact int8 dot with FP16 G64 scales.
+enum class RkKCodec { Int4, Int8, E8Root, E8Lattice };
+enum class RkVCodec { Int4, E8Root };
 
 // --- partition mirror --------------------------------------------------------------------
 
@@ -294,9 +311,46 @@ inline int k_code_at(const std::uint8_t* k_plane, int kv_heads, std::int64_t pag
 }
 
 inline int v_code_at(const std::uint8_t* v_plane, int kv_heads, std::int64_t page, int kv_head,
-                     int token_in_page, int d) noexcept {
+                      int token_in_page, int d) noexcept {
     return unpack_int4(
         v_plane[plane_offset(kInt4Plane, kv_heads, page, kv_head, token_in_page, d >> 1)], d & 1);
+}
+
+// One key's 256 int8 K codes, codec-selected (the read-back paths the grouped instance
+// stages: rk4_unpack for PackedK (:645-660), the int8 cp_async plane (:662), the E8Root
+// cylinder (:549-577) and the E8Lattice carrier + residual (:628-638 + decode_e8_tile)).
+// The E8 codecs are the code-only rows of e8_codec.h; the sign window the GPU stages 4-byte
+// aligned collapses to the same per-subspace byte 64+s both sides read.
+template <RkKCodec KCodec>
+inline void k_codes_row(const std::uint8_t* k_plane, int kv_heads, std::int64_t page, int kv_head,
+                        int token_in_page, int* codes) noexcept {
+    if constexpr (KCodec == RkKCodec::Int4) {
+        for (int d = 0; d < kHeadDim; ++d) {
+            codes[d] = k_code_at<true>(k_plane, kv_heads, page, kv_head, token_in_page, d);
+        }
+    } else if constexpr (KCodec == RkKCodec::Int8) {
+        for (int d = 0; d < kHeadDim; ++d) {
+            codes[d] = k_code_at<false>(k_plane, kv_heads, page, kv_head, token_in_page, d);
+        }
+    } else if constexpr (KCodec == RkKCodec::E8Root) {
+        e8_cylinder_codes_row(k_plane, kv_heads, page, kv_head, token_in_page, codes, false);
+    } else {
+        e8_lattice_codes_row(k_plane, kv_heads, page, kv_head, token_in_page, codes);
+    }
+}
+
+// One key's 256 int8 V codes: int4-packed (grouped_mma.cuh:689-697) or the calibrated
+// rk4v2-e8 cylinder plane (grouped_mma.cuh:664-688, e8_root_decode_8d_fast_v).
+template <RkVCodec VCodec>
+inline void v_codes_row(const std::uint8_t* v_plane, int kv_heads, std::int64_t page, int kv_head,
+                        int token_in_page, int* codes) noexcept {
+    if constexpr (VCodec == RkVCodec::Int4) {
+        for (int d = 0; d < kHeadDim; ++d) {
+            codes[d] = v_code_at(v_plane, kv_heads, page, kv_head, token_in_page, d);
+        }
+    } else {
+        e8_cylinder_codes_row(v_plane, kv_heads, page, kv_head, token_in_page, codes, true);
+    }
 }
 
 // One key's unscaled score, the instance's exact arithmetic (grouped_mma.cuh:786-813): an
@@ -319,16 +373,23 @@ inline float rk_score_key(const int* q_codes_row, const float* q_scales_row,
 
 } // namespace rk_partial_detail
 
-// Compute one split's partial for every query head of the tile. PackedK selects the K codec:
-// true = rk4v4 (int4-packed rotated K, the rk_packedk_grouped_instance), false = rk8v4 (int8
-// rotated K, the rk_grouped_instance); V is int4-packed in both (launch.cu:55-108).
+// Compute one split's partial for every query head of the tile. KCodec/VCodec select the
+// plane codecs: (Int4, Int4) = rk4v4, (Int8, Int4) = rk8v4, (E8Root, Int4) = rk2v4-e8,
+// (E8Lattice, Int4) = rk4v4-e8, (E8Lattice, E8Root) = rk4v2-e8 — every combination the
+// launch.cu rk variants dispatch. Both codecs must be spelled as the enum explicitly:
+// an earlier bool-PackedK overload of this name silently captured enum spellings (an enum
+// value is a valid converted constant expression for a bool template parameter, and MSVC
+// resolved the ambiguity to the bool overload, running the int4 codec for every E8 call),
+// so the legacy bool form was REMOVED and its two callers spell the enum directly
+// (host_partial.h and apps/diag-cpu-partial).
 // All arithmetic mirrors the int8 grouped MMA instance (see the header comment). Two
 // deviation classes vs the GPU instance, both verified bounded on hardware: (1) accumulation
 // order inside a tile differs from the warp schedule — ulp-level; (2) the expf-vs-ex2.approx
 // residual can flip which side of a FP16 boundary p rounds to — a single FP16 quantum of one
 // key's contribution on rare elements. Measured: every element of every probe case either
 // meets 1e-5 relative or stays inside one 2^-11 quantum (see the batch-2 report).
-template <int QueryHeads, int KVHeads, bool PackedK>
+template <int QueryHeads, int KVHeads, RkKCodec KCodec = RkKCodec::Int4,
+          RkVCodec VCodec = RkVCodec::Int4>
 void rk_attention_partial(const RkPartialKvPages& pages, const RkPartialRequest& request,
                           const RkPartialOutput& partial) {
     using G = HostCausalGeometry<QueryHeads, KVHeads>;
@@ -364,6 +425,7 @@ void rk_attention_partial(const RkPartialKvPages& pages, const RkPartialRequest&
     std::vector<float> tile_alpha(static_cast<std::size_t>(rows));
     std::vector<std::uint16_t> tile_v16(static_cast<std::size_t>(key_tile) * D);
     std::vector<int> tile_k_codes(static_cast<std::size_t>(key_tile) * D);
+    std::vector<int> tile_v_codes(static_cast<std::size_t>(key_tile) * D);
     std::vector<float> tile_k_scales(static_cast<std::size_t>(key_tile) * kGroups);
     std::vector<unsigned char> tile_present(static_cast<std::size_t>(key_tile));
 
@@ -399,19 +461,17 @@ void rk_attention_partial(const RkPartialKvPages& pages, const RkPartialRequest&
                         plane_offset(kScalePlane, KVHeads, page, kv_head, tip, g);
                     k_scales[g] = fp16_bits_to_f32(pages.k_scales[scale_offset]);
                 }
-                for (int d = 0; d < D; ++d) {
-                    k_codes[d] = rk_partial_detail::k_code_at<PackedK>(pages.k_codes, KVHeads,
-                                                                      page, kv_head, tip, d);
-                }
+                rk_partial_detail::k_codes_row<KCodec>(pages.k_codes, KVHeads, page, kv_head,
+                                                       tip, k_codes);
+                rk_partial_detail::v_codes_row<VCodec>(pages.v_codes, KVHeads, page, kv_head,
+                                                       tip, &tile_v_codes[static_cast<std::size_t>(k) * D]);
                 for (int g = 0; g < kGroups; ++g) {
                     const float vs = fp16_bits_to_f32(
                         pages.v_scales[plane_offset(kScalePlane, KVHeads, page, kv_head, tip, g)]);
+                    const int* v_row = &tile_v_codes[static_cast<std::size_t>(k) * D];
                     for (int j = 0; j < kGroup; ++j) {
                         const int d = g * kGroup + j;
-                        const float product =
-                            static_cast<float>(rk_partial_detail::v_code_at(pages.v_codes, KVHeads,
-                                                                           page, kv_head, tip, d)) *
-                            vs;
+                        const float product = static_cast<float>(v_row[d]) * vs;
                         v16[d] = f32_to_f16_bits_rn(product);  // exact fp32 product, one RNE
                     }
                 }

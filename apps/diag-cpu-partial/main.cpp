@@ -650,16 +650,21 @@ void cpu_partials(const Fixture& f, int capacity, int active, int key_tile,
         request.range     = softmax_cpu::rk_partial_split_range(window, split, active, key_tile);
         request.key_tile  = key_tile;
         const softmax_cpu::RkPartialOutput out{acc.data(), maximum.data(), sum.data()};
+        // P4 codec axis: spell the K codec enum (the bool template form was removed).
         if (q_heads == 24) {
             if (f.dtype == seam::RkHostKvDType::Rk4v4)
-                softmax_cpu::rk_attention_partial<24, 4, true>(f.host_pages(), request, out);
+                softmax_cpu::rk_attention_partial<24, 4, softmax_cpu::RkKCodec::Int4>(
+                    f.host_pages(), request, out);
             else
-                softmax_cpu::rk_attention_partial<24, 4, false>(f.host_pages(), request, out);
+                softmax_cpu::rk_attention_partial<24, 4, softmax_cpu::RkKCodec::Int8>(
+                    f.host_pages(), request, out);
         } else {
             if (f.dtype == seam::RkHostKvDType::Rk4v4)
-                softmax_cpu::rk_attention_partial<16, 2, true>(f.host_pages(), request, out);
+                softmax_cpu::rk_attention_partial<16, 2, softmax_cpu::RkKCodec::Int4>(
+                    f.host_pages(), request, out);
             else
-                softmax_cpu::rk_attention_partial<16, 2, false>(f.host_pages(), request, out);
+                softmax_cpu::rk_attention_partial<16, 2, softmax_cpu::RkKCodec::Int8>(
+                    f.host_pages(), request, out);
         }
     }
 }

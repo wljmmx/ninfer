@@ -233,7 +233,15 @@ void rk_host_partial_stage(const RkHostPartialView& view, float scale, int width
     request.range    = range;
     request.key_tile = key_tile;
     const softmax_cpu::RkPartialOutput out{st.acc, st.maximum, st.sum};
-    softmax_cpu::rk_attention_partial<QueryHeads, KVHeads, PackedK>(view.pages, request, out);
+    // P4 codec axis: the partial's bool template form was removed (an enum spelling silently
+    // bound to the bool overload), so the seam spells the codec explicitly per PackedK.
+    if constexpr (PackedK) {
+        softmax_cpu::rk_attention_partial<QueryHeads, KVHeads, softmax_cpu::RkKCodec::Int4>(
+            view.pages, request, out);
+    } else {
+        softmax_cpu::rk_attention_partial<QueryHeads, KVHeads, softmax_cpu::RkKCodec::Int8>(
+            view.pages, request, out);
+    }
 
     const auto slot_acc  = static_cast<std::int64_t>(256) * QueryHeads * width * split;
     const auto slot_stat = static_cast<std::int64_t>(QueryHeads) * width * split;
