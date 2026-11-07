@@ -1,19 +1,14 @@
 cmake_minimum_required(VERSION 3.28)
 
 # The current implementation supports two single-GPU targets: RTX 4090 class Ada
-# devices (sm_89) and RTX 5090 class Blackwell devices (sm_120a). Set and validate the
-# architecture before CUDA compiler detection so CMake never injects a generic
-# host-toolchain default or accepts an unsupported target.
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "CUDA architectures to build")
-endif()
-if(NOT CMAKE_CUDA_ARCHITECTURES MATCHES "^(89|120a)$")
-  message(FATAL_ERROR
-    "NInfer supports CMAKE_CUDA_ARCHITECTURES=89 (RTX 4090, Ada) or "
-    "120a (RTX 5090, Blackwell); got '${CMAKE_CUDA_ARCHITECTURES}'")
-endif()
+# devices (sm_89) and RTX 5090 class Blackwell devices (sm_120a). The target
+# selection owns the architecture and validates it before CUDA compiler detection
+# so CMake never injects a generic host-toolchain default or accepts an unsupported
+# target.
+include(cmake/NinferPlatform.cmake)
 
 project(ninfer LANGUAGES C CXX CUDA)
+ninfer_validate_target()
 
 # --- Architecture feature gates ------------------------------------------------
 # sm_120a adds Blackwell-only execution paths: TMA bulk tensor copies, warp-specialized
@@ -24,7 +19,7 @@ project(ninfer LANGUAGES C CXX CUDA)
 # natively (including the plain E4M3 FP8 tensor core form). The K8V4 KV cache (FP8 keys
 # + NVFP4 value plane through the official CUDA 13 conversion intrinsics) runs on both
 # architectures, so its gate is defined unconditionally.
-if(CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
+if(NINFER_TARGET STREQUAL "rtx5090")
   add_compile_definitions(NINFER_ARCH_SM120=1 NINFER_ENABLE_TMA=1 NINFER_ENABLE_NVFP4=1
     NINFER_ENABLE_K8V4=1)
   # audit K6: NINFER_ENABLE_BLOCK_SCALED_MOE_MMA (the block-scaled NVFP4 MoE expert kernels,

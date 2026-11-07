@@ -21,7 +21,22 @@
       "binaryDir": "${sourceDir}/build-win",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
+        "NINFER_TARGET": "rtx4090",
         "CMAKE_CUDA_ARCHITECTURES": "89",
+        "NINFER_BUILD_APPS": "ON",
+        "BUILD_TESTING": "OFF",
+        "NINFER_BUILD_BENCHMARKS": "OFF",
+        "VCPKG_TARGET_TRIPLET": "x64-windows"
+      }
+    },
+    {
+      "name": "win-5090-release",
+      "displayName": "Windows MSVC build for RTX 5090 (sm_120a), vcpkg dependencies",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-win-5090",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "NINFER_TARGET": "rtx5090",
         "NINFER_BUILD_APPS": "ON",
         "BUILD_TESTING": "OFF",
         "NINFER_BUILD_BENCHMARKS": "OFF",
@@ -50,6 +65,7 @@
   "buildPresets": [
     { "name": "release", "configurePreset": "release" },
     { "name": "win-release", "configurePreset": "win-release" },
+    { "name": "win-5090-release", "configurePreset": "win-5090-release" },
     { "name": "dev", "configurePreset": "dev" },
     { "name": "win-dev", "configurePreset": "win-dev" }
   ],
