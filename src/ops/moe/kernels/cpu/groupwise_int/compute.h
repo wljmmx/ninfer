@@ -245,12 +245,23 @@ template <class Simd, int K, int Rows, int Columns>
 // finer activation codes. The activation plane stores natural-order int16 (two bytes a value),
 // so the dot pays twice the bytes maddubs paid but keeps one instruction shape per 16 products.
 //
-// The packed weights hold weight 2b in the low nibble of byte b and 2b+1 in the high nibble,
-// two's complement. unpack_u4 widens 16 code bytes into 16 lanes that each pack the pair
-// w[2i] | w[2i+1] << 8; read as 32 bytes those are the group's nibbles in natural order, so
-// widening each 128-bit half with cvtepu8_epi16 turns them into 16-bit channels 0..15, and
-// (x ^ 8) - 8 restores the sign at two instructions per 16 values. madd then pairs adjacent
-// weights and values with no shuffles at all, where the int8 path had to interleave its rows.
+// The packed weights hold weight 2b in the low nibble of byte b and 2b+1 in the high one,
+// two's complement. Weight preparation runs once per 64-value group instead of once per
+// 16-value half: one 32-byte load, XOR 0x88 - the same bias flip dot_q4_q8 pays, applied
+// before the planes split so one instruction offsets both nibbles of every byte at once -
+// then AND 0x0F / shift+AND split the even and odd nibble planes, and unpacklo/hi interleaves
+// them inside each 128-bit lane. The four half-lanes come out in natural value order
+// ([0..15] unpacklo low, [16..31] unpackhi low, [32..47] unpacklo high, [48..63] unpackhi
+// high) - the same interleave decode_signed_q32_q5 uses for its 32-wide decoder, so the
+// widening consumes the halves directly with no permute at all. vpmovsxbw widens the
+// offset-by-8 nibble b = u ^ 8 signed (b stays 0..15, so widening is exact) and ONE
+// word-domain subtract of 8 restores w = b - 8 - the same value the old per-half
+// (x ^ 8) - 8 chain produced, at 17 instructions per row instead of 24. madd then pairs
+// adjacent weights and values with no shuffles at all, where the int8 path had to interleave
+// its rows. The activation rows are read through fused madd memory operands (the plane is
+// L1-hot after quantise_input_i16), which leaves the vector accumulators out of the stack:
+// the AVX2 build used to keep all four total registers in [rbp] slots at two columns, one
+// load and one store per group each, and reload the nibble constants every iteration.
 // Overflow: one group's partial sum is at most 64 * 8 * 32767 = 16777504 < 2^31, so the int32
 // lanes of the four madds never wrap and the group total is exact.
 // Out of line like dot_q4_q8: this only runs when the path is enabled, and inlining it would
@@ -261,7 +272,13 @@ template <class Simd, int K, int Rows, int Columns>
     static_assert(std::is_base_of_v<common::cpu::avx2::F32, Simd>,
                   "the int16 path is written against AVX2 registers");
     constexpr int kGroups = K / 64;
-    const auto eight      = _mm256_set1_epi16(8);
+    // The q8 bias trick shared with dot_q4_q8: 0x88 flips bit 3 of both nibbles at once, turning
+    // each two's complement nibble u into the offset-by-8 form b = u ^ 8 before the planes
+    // split, so the interleave below needs no XOR of its own. 0x0F picks each b out of its
+    // byte; the word-domain 0x0008.. subtract restores w = b - 8.
+    const auto bias   = _mm256_set1_epi8(static_cast<char>(0x88));
+    const auto nibble = _mm256_set1_epi8(0x0F);
+    const auto eight  = _mm256_set1_epi16(8);
     // One vector accumulator per output and one reduction at the end: a horizontal sum per group
     // would cost more than the products it is summing.
     __m256 total[Rows][Columns];
@@ -269,39 +286,47 @@ template <class Simd, int K, int Rows, int Columns>
         for (int c = 0; c < Columns; ++c) { total[r][c] = _mm256_setzero_ps(); }
     }
     for (int group = 0; group < kGroups; ++group) {
-        // The activation rows depend only on the group, so hoist them out of the row loop.
-        __m256i activation[Columns][4];
+        // One activation scale per column and group; the rows below reuse it.
         __m256 activation_scale[Columns];
         for (int c = 0; c < Columns; ++c) {
-            const auto* row = work.scratch.input_q16 + columns[c] * K + group * 64;
-            for (int q = 0; q < 4; ++q) {
-                activation[c][q] =
-                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row + q * 16));
-            }
             activation_scale[c] =
-                _mm256_set1_ps(work.scratch.input_scale[columns[c] * kGroups + group]);
+                _mm256_set1_ps(work.scratch.input_scale[std::size_t(columns[c]) * kGroups + group]);
         }
         for (int r = 0; r < Rows; ++r) {
             const auto* codes = matrix.codes + std::size_t(rows[r]) * (K / 2) + group * 32;
-            __m256i weights[4];
-            for (int half = 0; half < 2; ++half) {
-                const auto packed = common::cpu::avx2::unpack_u4(codes + half * 16);
-                for (int part = 0; part < 2; ++part) {
-                    const auto bytes = part == 0 ? _mm256_castsi256_si128(packed)
-                                                 : _mm256_extracti128_si256(packed, 1);
-                    const auto channels = _mm256_cvtepu8_epi16(bytes);
-                    weights[2 * half + part] =
-                        _mm256_sub_epi16(_mm256_xor_si256(channels, eight), eight);
-                }
-            }
+            const auto flipped =
+                _mm256_xor_si256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(codes)), bias);
+            const auto even   = _mm256_and_si256(flipped, nibble);
+            const auto odd    = _mm256_and_si256(_mm256_srli_epi16(flipped, 4), nibble);
+            // The 128-bit lanes of unpacklo/hi interleave their own halves of the group: the
+            // half-lanes land as [0..15] (lo low), [16..31] (hi low), [32..47] (lo high),
+            // [48..63] (hi high) - already in natural value order, no permute needed.
+            const auto front = _mm256_unpacklo_epi8(even, odd);
+            const auto back  = _mm256_unpackhi_epi8(even, odd);
+            // Signed widening of b then one subtract of 8 restores the two's complement weight;
+            // the four 16-value segments keep their original pairing with the activation plane.
+            const auto w0 =
+                _mm256_sub_epi16(_mm256_cvtepi8_epi16(_mm256_castsi256_si128(front)), eight);
+            const auto w1 =
+                _mm256_sub_epi16(_mm256_cvtepi8_epi16(_mm256_castsi256_si128(back)), eight);
+            const auto w2 =
+                _mm256_sub_epi16(_mm256_cvtepi8_epi16(_mm256_extracti128_si256(front, 1)), eight);
+            const auto w3 =
+                _mm256_sub_epi16(_mm256_cvtepi8_epi16(_mm256_extracti128_si256(back, 1)), eight);
             const auto weight_vector = _mm256_set1_ps(common::cpu::avx2::fp16_to_f32(
                 matrix.scales[std::size_t(rows[r]) * kGroups + group]));
             for (int c = 0; c < Columns; ++c) {
+                // The plane is L1-hot after quantise_input_i16, so the madd loads stay fused
+                // memory operands and the activation rows never occupy vector registers.
+                const auto* activation = reinterpret_cast<const __m256i*>(
+                    work.scratch.input_q16 + std::size_t(columns[c]) * K + group * 64);
                 const auto acc = _mm256_add_epi32(
-                    _mm256_add_epi32(_mm256_madd_epi16(weights[0], activation[c][0]),
-                                     _mm256_madd_epi16(weights[1], activation[c][1])),
-                    _mm256_add_epi32(_mm256_madd_epi16(weights[2], activation[c][2]),
-                                     _mm256_madd_epi16(weights[3], activation[c][3])));
+                    _mm256_add_epi32(
+                        _mm256_madd_epi16(w0, _mm256_loadu_si256(activation)),
+                        _mm256_madd_epi16(w1, _mm256_loadu_si256(activation + 1))),
+                    _mm256_add_epi32(
+                        _mm256_madd_epi16(w2, _mm256_loadu_si256(activation + 2)),
+                        _mm256_madd_epi16(w3, _mm256_loadu_si256(activation + 3))));
                 // Scale chain in the device order - gate[0] += (float)acc_g[0] * sg_lo * a0
                 // (grouped_gate_up_i8_tile.cuh): weight scale first, activation scale second,
                 // one add at the end.
