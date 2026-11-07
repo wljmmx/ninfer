@@ -4,6 +4,7 @@
 .codex
 .idea
 .pytest_cache
+.temp
 .vscode
 
 build
