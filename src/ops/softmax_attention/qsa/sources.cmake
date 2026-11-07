@@ -6,4 +6,6 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/tail_extract.cu"
   "${CMAKE_CURRENT_LIST_DIR}/prepare.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/prepare_launch.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/indexer.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/indexer_launch.cu"
 )

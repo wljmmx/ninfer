@@ -118,6 +118,66 @@ struct QsaRawRecordWriteView {
     Tensor offsets;        // I32 [B], first record column written by this call.
 };
 
+struct QsaBlockSelection {
+    Tensor block_ids;    // Device I32 [512,T,B], logical four-token block ids.
+    Tensor block_counts; // Device I32 [T,B].
+};
+
+struct QsaIndexerExecutionEnvelope {
+    std::uint32_t max_visible_tokens = 0; // Fixed capture capacity, in original tokens.
+};
+
+/** Capacity over every positive T in [min_tokens,max_tokens], with fixed B and envelope.
+ * Includes only Op-local scratch, measured from a 256-byte-aligned workspace cursor.
+ */
+[[nodiscard]] std::size_t qsa_indexer_workspace_capacity_bytes(std::int32_t min_tokens,
+                                                               std::int32_t max_tokens,
+                                                               std::int32_t batch_size,
+                                                               QsaIndexerExecutionEnvelope envelope,
+                                                               DeviceExecutionView execution);
+
+/**
+ * Op: qsa_indexer
+ *
+ * Math / indexing:
+ * For each live (t,b), p=positions[t,b], C=floor((p+1)/4), and g in [0,C):
+ *   score[g] = sum_{h=0..3} max(0, sum_{d=0..127} index_query[d,h,t,b]*index.K[d,g]).
+ * The common positive 1/sqrt(128) factor is omitted because only ranking is observable.
+ * Select min(512,C) highest computed scores; exact numeric ties prefer smaller logical g.
+ * Index g addresses block_tables[g/16,table_rows[b]], row g%16 of the index plane.
+ * Four heads produce one shared selection. The incomplete token tail is not included here.
+ * C<=512 selects every g without reading Q, keys or page-table contents.
+ *
+ * Domain / numeric:
+ * T>0, B=1..8. index_query is contiguous, 16-byte-aligned BF16 [128,4,T,B]. Cache keys
+ * are naturally aligned BF16 [128,16,1,G], feature-contiguous with positive, non-overlapping
+ * page-major outer strides. Tables have contiguous I32 entries and non-overlapping row strides.
+ * Positions are contiguous I32 [T,B]; valid_columns and table_rows are Device I32 [B].
+ * Each row has 0<=n<=T; live positions are consecutive nonnegative original-token ordinals.
+ * Every live p+1 is <= envelope.max_visible_tokens <=262144, within the table capacity.
+ * Envelope zero permits only inert queries. Live scoring operands and their FP32 scores are
+ * finite. BF16 values enter FP32 accumulation directly; scores have no BF16 rounding boundary.
+ * Mathematical scores and selection boundaries are independently qualified against FP64.
+ * Device counts, positions, selectors and readable live pages are caller guarantees.
+ *
+ * Effects / output:
+ * Outputs are naturally aligned, contiguous I32 with the shapes above. Each live count is
+ * min(512,C); its first count ids are distinct and in [0,C), in unspecified order. Inert counts
+ * are zero and do not read positions, Q, keys or table selectors. Ids beyond count are undefined.
+ * Inputs and caches are preserved. Outputs, inputs and used workspace must not write/read
+ * overlap; read-only views may share storage. There is no persistent state or publication.
+ *
+ * Workspace / execution:
+ * Scratch comes from the caller's arena and is reused across bounded query windows, without
+ * hidden allocation. Fixed T/B, views, envelope and device facts determine the launch topology.
+ * Actual per-query lengths, mixed batch contexts and all-select/inert cases are handled inside
+ * the same kernels, including Graph replay. Metadata is not read back by the Host. Downstream
+ * consumers read only count ids; same-stream ordering supplies the dependency.
+ */
+void qsa_indexer(const Tensor& index_query, const QsaIndexCacheView& cache,
+                 const QsaBatchView& batch, QsaIndexerExecutionEnvelope envelope,
+                 WorkspaceArena& workspace, QsaBlockSelection& out, DeviceExecutionView execution);
+
 /**
  * Op: qsa_prepare
  *

@@ -2,6 +2,7 @@
 
 #include "ninfer/ops/qsa.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -19,6 +20,40 @@ struct ViewValidation {
 
     static bool aligned(const void* p, std::size_t bytes) {
         return p && reinterpret_cast<std::uintptr_t>(p) % bytes == 0;
+    }
+
+    void dense(const Tensor& t, DType dtype, std::array<int, 4> shape, int alignment,
+               const char* label) const {
+        require(t.dtype == dtype && t.is_contiguous() && aligned(t.data, alignment), label);
+        for (int d = 0; d < 4; ++d) require(t.ne[d] == shape[d] && shape[d] > 0, label);
+    }
+
+    // Page-major planes have contiguous features and ordered, non-overlapping outer axes.
+    void plane(const Tensor& t, DType dtype, std::array<int, 4> shape, const char* label) const {
+        const std::int64_t element = dtype_size(dtype);
+        require(t.dtype == dtype && t.nb[0] == element && aligned(t.data, element), label);
+        std::uint64_t span = element;
+        for (int d = 0; d < 4; ++d) {
+            require(t.ne[d] == shape[d] && shape[d] > 0, label);
+            if (shape[d] == 1) continue;
+            require(t.nb[d] >= static_cast<std::int64_t>(span) && t.nb[d] % element == 0, label);
+            const std::uint64_t stride = t.nb[d], count = shape[d] - 1;
+            require(stride <= (std::numeric_limits<std::int64_t>::max() - span) / count, label);
+            span += count * stride;
+        }
+        require(span <= std::numeric_limits<std::uintptr_t>::max() -
+                            reinterpret_cast<std::uintptr_t>(t.data),
+                label);
+    }
+
+    bool overlap(const Tensor& a, const Tensor& b) const {
+        const auto x  = reinterpret_cast<std::uintptr_t>(a.data),
+                   y  = reinterpret_cast<std::uintptr_t>(b.data);
+        const auto nx = a.bytes(), ny = b.bytes();
+        require(nx <= std::numeric_limits<std::uintptr_t>::max() - x &&
+                    ny <= std::numeric_limits<std::uintptr_t>::max() - y,
+                "address range");
+        return x < y + ny && y < x + nx;
     }
 
     void metadata(const Tensor& t, int batch, const char* label) const {
