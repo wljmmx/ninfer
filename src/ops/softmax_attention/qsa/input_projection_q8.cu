@@ -8,7 +8,7 @@
 namespace ninfer::ops::detail::qsa {
 namespace {
 
-struct SegmentedRoutes {
+struct Routes {
     Q8LinearOperands operands;
     LinearBf16SegmentedOutput<6144, 6144> output;
     cudaStream_t stream;
@@ -40,8 +40,7 @@ void launch_query_gate(const Tensor& x, const Weight& weight, Tensor& query, Ten
                        cudaStream_t stream) {
     const LinearBf16SegmentedOutput<6144, 6144> output{
         {static_cast<__nv_bfloat16*>(query.data), static_cast<__nv_bfloat16*>(gate.data)}};
-    q8_n12288_k2560::select(x.ne[1],
-                            SegmentedRoutes{q8_linear_operands(x, weight), output, stream});
+    q8_n12288_k2560::select(x.ne[1], Routes{q8_linear_operands(x, weight), output, stream});
 }
 
 } // namespace ninfer::ops::detail::qsa

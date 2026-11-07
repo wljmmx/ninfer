@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/device.h"
+#include "core/paged_kv_cache.h"
 #include "core/tensor.h"
 #include "core/weight.h"
 
@@ -77,6 +78,107 @@ struct QsaRawRecordReadView {
     Tensor base_positions; // I32 [B], F0: record column zero's input position.
     Tensor valid_columns;  // I32 [B], u: available record prefix.
 };
+
+struct QsaBatchView {
+    Tensor positions;     // I32 [T,B], original-token ordinals.
+    Tensor valid_columns; // I32 [B].
+    Tensor table_rows;    // I32 [B].
+};
+
+struct QsaProjectionView {
+    Tensor query;       // BF16 [256,24,T,B].
+    Tensor key;         // BF16 [256,2,T,B].
+    Tensor value;       // BF16 [256,2,T,B].
+    Tensor index_query; // BF16 [128,4,T,B].
+    Tensor index_key;   // BF16 [128,T,B], raw projection.
+};
+
+struct QsaPrepareParameters {
+    Tensor query_norm;       // BF16 [256], offset weights: gain = 1 + FP32(weight).
+    Tensor key_norm;         // BF16 [256].
+    Tensor index_query_norm; // BF16 [128].
+    Tensor index_key_norm;   // BF16 [128].
+    float rms_epsilon = 1e-6F;
+    float rope_theta  = 1e7F;
+};
+
+struct QsaIndexCacheView {
+    Tensor keys;         // BF16 [128,16,1,G], page-major.
+    Tensor block_tables; // I32 [logical_pages,table_rows], identical to main.block_tables.
+};
+
+struct QsaCacheView {
+    PagedKVBatchLayerView main;
+    QsaIndexCacheView index;
+};
+
+struct QsaRawRecordWriteView {
+    Tensor raw_keys;       // BF16 [128,R,B].
+    Tensor rope_positions; // I32 [3,R,B].
+    Tensor offsets;        // I32 [B], first record column written by this call.
+};
+
+/**
+ * Op: qsa_prepare
+ *
+ * Math / indexing:
+ * N_D(x,w) = x * (1+FP32(w)) / sqrt(sum(x*x)/D + rms_epsilon), independently per head.
+ * R(z,rho) rotates pairs (i,i+32), i in [0,32), by rho[axis(i)]*theta^(-2*i/64);
+ * axis(i)=i%3 on canonical three-axis rho. Current A=1 coordinates broadcast to three axes.
+ * R[i]=z[i]*cos-z[i+32]*sin,
+ * R[i+32]=z[i+32]*cos+z[i]*sin; dimensions [64,D) retain z.
+ * For each row b and t<valid_columns[b], p=positions[t,b]:
+ *   query[:,h,t,b]       = BF16(R(N_256(projected.query[:,h,t,b],query_norm),rho[t,:,b]));
+ *   index_query[:,h,t,b] = BF16(R(N_128(projected.index_query[:,h,t,b],index_query_norm),rho));
+ *   main.K[p,h]         = BF16(R(N_256(projected.key[:,h,t,b],key_norm),rho));
+ *   main.V[p,h]         = FP16_RNE(projected.value[:,h,t,b]).
+ * raw index-key words and actual coordinates are copied to records[:,offsets[b]+t,b];
+ * A=1 replicates the coordinate to all three record axes.
+ * With F=positions[0,b] and n=valid_columns[b], each newly completed block
+ * g in [floor(F/4),floor((F+n)/4)) writes:
+ *   u = BF16(mean(raw_index_key[4*g:4*g+4])); index.K[g] =
+ * BF16(R(N_128(u,index_key_norm),rho[4*g])). Raw keys preceding F come from before's canonical tail
+ * at F; other keys come from projected. A block starting before F uses before.first_rope; otherwise
+ * it uses this call's coordinates. Main p addresses table[p/64,table_rows[b]], row p%64; index g
+ * uses the same table at g/16, row g%16. Only complete blocks are written. No causal
+ * visibility/frontier is published.
+ *
+ * Logical shapes / supported domain:
+ * T>0, B in [1,8], A=1 or 3. Projections and both outputs have the shapes above, are contiguous
+ * and 16-byte aligned. Norm weights are contiguous, naturally aligned BF16 vectors. Positions
+ * are contiguous I32 [T,B]; rho is contiguous I32 [T,A,B]. Metadata is contiguous Device I32 [B].
+ * Tail/records follow QsaTailStateView's feature-contiguous, naturally aligned stride rules.
+ * The main cache supports BFloat16 only: BF16 K / FP16 V [256,64,2,G], no scale planes.
+ * Cache planes are page-major with contiguous features and non-overlapping positive outer
+ * strides; tables have contiguous I32 page entries and a non-overlapping row stride.
+ * Both caches share G and the identical block_tables view. R and the state pool size are positive.
+ * Every row has 0<=n<=T and 0<=offset<=offset+n<=R; R may be smaller than T.
+ * Live positions are consecutive, nonnegative ordinals below 262144. before corresponds to F.
+ * RoPE coordinates are independent nonnegative I32 values. Epsilon/theta are positive finite
+ * floats; live projection/norm values are finite. The caller provides valid live slots/page
+ * mappings and disjoint writes across rows. Host validation does not read Device metadata.
+ *
+ * Numeric / effects:
+ * Norm and rotation have no intermediate represented tensor. The pooled mean's BF16 rounding
+ * is semantic; raw records preserve input words exactly. Final mathematical results are BF16
+ * approximations to the complete formula, independently qualified against a high-precision
+ * oracle. V uses the exact FP16 encoding. Q/IQ for t>=n are exactly BF16 +0; inert columns do not
+ * read projections/positions/state or write cache/records. An empty row need not have valid
+ * slot/table selectors. before, metadata, page tables and untouched cache/record regions remain
+ * unchanged. query may exactly alias projected.query, and index_query may independently exactly
+ * alias projected.index_query (same address/shape/strides). Partial overlap and all other
+ * write/read overlap are forbidden. Device-selected state/cache/record alias relationships are
+ * caller guarantees, including across different views of an interleaved allocation.
+ *
+ * Workspace / execution:
+ * Zero global scratch, no sizing query or hidden allocation. execution supplies the stream and
+ * positive SM count. CUDA Graph replay reads current Device metadata; callers own operand
+ * readiness/lifetime, allocation, tail extraction, acceptance, and state publication.
+ */
+void qsa_prepare(const QsaProjectionView& projected, const QsaPrepareParameters& parameters,
+                 const QsaBatchView& batch, const Tensor& rope_positions,
+                 const QsaTailStateView& before, QsaCacheView cache, QsaRawRecordWriteView records,
+                 Tensor& query, Tensor& index_query, DeviceExecutionView execution);
 
 /**
  * Op: qsa_tail_extract
