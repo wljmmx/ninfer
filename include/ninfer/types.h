@@ -1037,6 +1037,17 @@ struct VisionWorkspaceMemorySummary {
     std::size_t handoff_peak_bytes        = 0;
 };
 
+struct GraphMemorySummary {
+    // What captured execution costs to build again: the measured capture growth of this startup's
+    // full configured graph set. Graphs are never released while serving, so this equals the
+    // capture increment rather than a separately probed reconstruction.
+    std::size_t rebuild_estimate_bytes = 0;
+    // Signed free-memory deltas; negative when the driver returned more than it took.
+    std::int64_t preparation_increment_bytes = 0;
+    std::int64_t calibration_increment_bytes = 0;
+    std::int64_t calibration_retained_bytes  = 0;
+};
+
 struct MemorySummary {
     int device                                = 0;
     std::uint32_t max_context                 = 0;
@@ -1067,7 +1078,15 @@ struct MemorySummary {
     std::size_t kv_capacity_headroom_bytes        = 0;
     std::size_t planned_slack_bytes               = 0;
     std::size_t workspace_logical_peak_bytes      = 0;
+    // The plan's static, topology-based reservation for CUDA Graph driver/module storage. Kept
+    // as the planning term; cuda_graph below is what startup actually measured.
     std::size_t cuda_graph_allowance_bytes        = 0;
+    // Measured graph preparation cost, present only when this Program captured graphs. The
+    // allowance above is the plan; this is the observed value, so the two can be compared.
+    std::optional<GraphMemorySummary> cuda_graph;
+    // Growth between the free-memory reading before final Program backing and the one after,
+    // minus the explicit reservation. Driver/module storage and delayed loading land here.
+    std::int64_t startup_retained_bytes = 0;
     std::size_t kv_payload_bytes                  = 0;
     // One shared physical Host context backing. Reserved bytes are included in occupied bytes;
     // State/KV occupancy below is a breakdown and must not be added to this ledger again.

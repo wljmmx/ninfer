@@ -10,6 +10,7 @@
 
 #include "core/controller_mode.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <exception>
 #include <fstream>
@@ -210,6 +211,16 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_metric("KV capacity headroom", format_bytes(memory.kv_capacity_headroom_bytes));
     print_metric("planned slack", format_bytes(memory.planned_slack_bytes));
     print_metric("CUDA Graph allowance", format_bytes(memory.cuda_graph_allowance_bytes));
+    if (memory.cuda_graph) {
+        print_metric("graph rebuild estimate",
+                     format_bytes(memory.cuda_graph->rebuild_estimate_bytes));
+        print_metric("graph capture (measured)",
+                     format_bytes(static_cast<std::uint64_t>(
+                         std::max<std::int64_t>(0, memory.cuda_graph->preparation_increment_bytes))));
+    }
+    print_metric("startup retained",
+                 format_bytes(static_cast<std::uint64_t>(
+                     std::max<std::int64_t>(0, memory.startup_retained_bytes))));
     print_metric("planned device total", format_bytes(reserved));
 
     const ninfer::SpeculativeStats& speculative = result.speculative;

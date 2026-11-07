@@ -30,6 +30,10 @@ struct ModelInstance {
     const models::qwen3_5::execution::Parameters parameters;
     models::qwen3_5::Frontend frontend;
     KvCapacityResolution kv_capacity_resolution;
+    // port (sm_89) / upstream 19367582: measured growth of the final Program backing beyond its
+    // explicit reservation. Driver/module storage and delayed loading are signed facts, not part
+    // of the plan; reported so the plan's constants can be checked against reality.
+    std::int64_t startup_retained_bytes = 0;
     const std::uint32_t capacity;
     std::unique_ptr<models::qwen3_5::Program> program;
     // port (sm_89): routed experts stream from the artifact into this shared pool.

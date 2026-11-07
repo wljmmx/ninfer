@@ -381,9 +381,20 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     }
     device.synchronize();
     if (use_cuda_graph) {
+        // Calibration input: the plan reserved graph_allowance_bytes by topology; this measures
+        // what capturing the configured set actually cost, so the two can be compared instead of
+        // the estimate being trusted silently.
+        const auto before_graphs = device_memory_snapshot(device.device);
         StartupPhaseScope graph_phase(startup_observer, StartupPhase::CudaGraphPrepare);
         prepare_graphs();
         graph_phase.complete();
+        device.synchronize();
+        const auto after_graphs = device_memory_snapshot(device.device);
+        graph_prepare_increment_bytes = device_memory_growth(before_graphs, after_graphs);
+        std::fprintf(stderr, "[graph] capture measured %.1f MiB (allowance %.1f MiB)\n",
+                     static_cast<double>(graph_prepare_increment_bytes) / 1048576.0,
+                     static_cast<double>(graph_allowance_bytes) / 1048576.0);
+        std::fflush(stderr);
     }
     work.reset();
     work.reset_peak();
@@ -634,6 +645,12 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
     }
     out.workspace_logical_peak_bytes = workspace_logical_peak_bytes;
     out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
+    if (use_cuda_graph) {
+        out.cuda_graph = GraphMemorySummary{
+            .rebuild_estimate_bytes      = graph_prepare_increment_bytes,
+            .preparation_increment_bytes = static_cast<std::int64_t>(graph_prepare_increment_bytes),
+        };
+    }
     out.kv_payload_bytes             = kv_payload_bytes;
     if (host_state_images) { out.host_state_occupied_slots = host_state_images->occupied(); }
     if (host_kv_arena) { out.host_kv_occupied_bytes = host_kv_arena->occupied_bytes(); }

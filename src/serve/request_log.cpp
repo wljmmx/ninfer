@@ -325,6 +325,14 @@ Json vision_workspace_json(const std::optional<ninfer::VisionWorkspaceMemorySumm
                 {"handoff_peak_bytes", vision->handoff_peak_bytes}};
 }
 
+Json graph_json(const std::optional<ninfer::GraphMemorySummary>& graph) {
+    if (!graph) { return nullptr; }
+    return Json{{"rebuild_estimate_bytes", graph->rebuild_estimate_bytes},
+                {"preparation_increment_bytes", graph->preparation_increment_bytes},
+                {"calibration_increment_bytes", graph->calibration_increment_bytes},
+                {"calibration_retained_bytes", graph->calibration_retained_bytes}};
+}
+
 Json speculative_json(const GenerationMetrics& metrics) {
     return Json{{"backend", product::speculative_backend_name(metrics.speculative_backend)},
                 {"draft_window", metrics.speculative_draft_window},
@@ -610,6 +618,8 @@ std::string format_server_start_json(
              {"kv_capacity_headroom_bytes", memory.kv_capacity_headroom_bytes},
              {"planned_slack_bytes", memory.planned_slack_bytes},
              {"cuda_graph_allowance_bytes", memory.cuda_graph_allowance_bytes},
+             {"cuda_graph", graph_json(memory.cuda_graph)},
+             {"startup_retained_bytes", memory.startup_retained_bytes},
              {"kv_payload_bytes", memory.kv_payload_bytes},
              {"host_context_capacity_bytes", memory.host_context_capacity_bytes},
              {"host_context_occupied_bytes", memory.host_context_occupied_bytes},

@@ -107,6 +107,36 @@ int main(int argc, char** argv) {
         return fail("stream synchronization returned before transfer completed");
     }
 
+    // Startup calibration reads the Device around steps whose footprint is not an explicit
+    // layout. Check the two primitives agree with a known allocation before anything relies on
+    // their sign and magnitude.
+    {
+        const auto before = ctx.memory_snapshot();
+        int* probe        = nullptr;
+        CUDA_CHECK(cudaMalloc(&probe, 64ULL * 1024ULL * 1024ULL));
+        CUDA_CHECK(cudaMemset(probe, 0, 64ULL * 1024ULL * 1024ULL));
+        ctx.synchronize();
+        const auto after  = ctx.memory_snapshot();
+        const auto growth = ninfer::device_memory_growth(before, after);
+        CUDA_CHECK(cudaFree(probe));
+        const auto released = -ninfer::device_memory_growth(after, ctx.memory_snapshot());
+        if (before.free_bytes == 0 || before.total_bytes == 0 ||
+            after.total_bytes != before.total_bytes) {
+            ++failures;
+            std::cerr << "device memory snapshot is not consistent\n";
+        }
+        if (growth < static_cast<std::int64_t>(64ULL * 1024ULL * 1024ULL)) {
+            ++failures;
+            std::cerr << "device memory growth did not see the probe allocation: " << growth
+                      << '\n';
+        }
+        if (released < static_cast<std::int64_t>(64ULL * 1024ULL * 1024ULL)) {
+            ++failures;
+            std::cerr << "device memory growth after release did not return the probe: "
+                      << released << '\n';
+        }
+    }
+
     const cudaStream_t original_stream = ctx.stream;
     ninfer::DeviceContext moved(std::move(ctx));
     if (ctx.stream != nullptr || ctx.transfer_stream != nullptr) {

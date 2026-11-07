@@ -933,10 +933,70 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
     instance->kv_capacity_resolution          = resolution;
     planning.complete();
     StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
-    instance->program = models::qwen3_5::create_program(instance->parameters, std::move(sequence),
-                                                        device, options.startup_observer);
+    // port (sm_89) / upstream 19367582: the graph term of the plan is still the static topology
+    // allowance, and the capture itself is what turns it into a real allocation. Read the Device
+    // around that step so the retained growth is measured, and treat a Device allocation failure
+    // as one recoverable sizing miss instead of a dead startup.
+    const auto before_program = device_memory_snapshot(device.device);
+    try {
+        instance->program = models::qwen3_5::create_program(instance->parameters,
+                                                           std::move(sequence), device,
+                                                           options.startup_observer);
+    } catch (const DeviceAllocationError& error) {
+        // One recovery: keep the explicit capacity and every execution feature, and give back the
+        // automatic part of the KV arena. An explicit capacity is never rewritten here.
+        if (options.kv_capacity.mode != KvCapacityMode::Automatic) { throw; }
+        auto recovery_planner =
+            models::qwen3_5::make_sequence_planner(instance->parameters, device, options);
+        const auto& recovery_curve            = recovery_planner.capacity_curve();
+        const std::uint32_t floor_pages       = recovery_curve.minimum_main_page_groups;
+        const std::size_t floor_reservation   = recovery_curve.reservation_bytes(floor_pages);
+        if (floor_pages >= resolution.main_page_groups) { throw; }
+        const std::size_t planning_available =
+            floor_reservation + options.kv_capacity.automatic_headroom_bytes;
+        auto recovered = resolve_kv_capacity(options.kv_capacity, recovery_curve,
+                                            planning_available);
+        recovered.available_after_weights_bytes = resolution.available_after_weights_bytes;
+        recovered.available_after_startup_bytes = resolution.available_after_startup_bytes;
+        recovered.evict_contract_effective      = resolution.evict_contract_effective;
+        recovered.evict_contract_reasons        = resolution.evict_contract_reasons;
+        std::fprintf(stderr,
+                     "[budget] Program allocation failed (%s); retrying once with the minimum KV "
+                     "capacity (%u -> %u page groups)\n",
+                     error.what(), resolution.main_page_groups, recovered.main_page_groups);
+        std::fflush(stderr);
+        auto recovered_plan = std::move(recovery_planner).finalize(recovered.main_page_groups);
+        options.context_cache.host_capacity_bytes = recovered_plan.host_capacity_bytes();
+        instance->kv_capacity_resolution          = recovered;
+        instance->program = models::qwen3_5::create_program(instance->parameters,
+                                                            std::move(recovered_plan), device,
+                                                            options.startup_observer);
+    }
     device.synchronize();
     program.complete();
+    {
+        // Everything this Program owns is explicit except what the capture and the driver keep;
+        // the difference against the reservation is the measured startup retainer.
+        const auto after_program = device_memory_snapshot(device.device);
+        instance->startup_retained_bytes =
+            device_memory_growth(before_program, after_program) -
+            static_cast<std::int64_t>(instance->kv_capacity_resolution.runtime_reservation_bytes);
+        if (const auto summary = instance->program->memory_summary(); summary.cuda_graph) {
+            // The estimate is a per-topology constant; this line says whether it held. Printed,
+            // not enforced: the arena above has already been placed from the plan.
+            if (summary.cuda_graph->preparation_increment_bytes >
+                static_cast<std::int64_t>(summary.cuda_graph_allowance_bytes)) {
+                std::fprintf(stderr,
+                             "[graph] capture exceeded the planned allowance by %.1f MiB; "
+                             "keep the arena and record the measured cost\n",
+                             static_cast<double>(summary.cuda_graph->preparation_increment_bytes -
+                                                 static_cast<std::int64_t>(
+                                                     summary.cuda_graph_allowance_bytes)) /
+                                 1048576.0);
+                std::fflush(stderr);
+            }
+        }
+    }
     instance->kv_capacity_resolution.free_after_startup_bytes = current_free_device_bytes(options.wddm_evictable_budget);
     const auto& stats = instance->model->storage_stats();
     LoadSummary summary;

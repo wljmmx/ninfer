@@ -443,6 +443,9 @@ public:
     const bool causal_scoring;
     const std::size_t kv_payload_bytes;
     const std::size_t graph_allowance_bytes;
+    // Measured growth of prepare_graphs(); zero when this Program captures no graphs. Reported
+    // through MemorySummary::cuda_graph as the observed counterpart of the static allowance.
+    std::size_t graph_prepare_increment_bytes = 0;
     const WorkspacePlan workspace_plan;
 
     DeviceArena persistent;

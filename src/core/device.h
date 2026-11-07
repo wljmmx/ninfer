@@ -6,8 +6,33 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer {
+
+// Only Device allocations use this error; pinned Host allocation failures stay distinct, so a
+// caller can tell "the GPU is full" apart from "the system is out of memory".
+class DeviceAllocationError : public std::runtime_error {
+public:
+    DeviceAllocationError(const char* operation, std::size_t requested_bytes = 0);
+
+    [[nodiscard]] std::size_t requested_bytes() const noexcept { return requested_bytes_; }
+
+private:
+    std::size_t requested_bytes_;
+};
+
+// One reading of the Device's free and total memory. Startup takes them around each step whose
+// footprint is not an explicit layout, so the growth is measured rather than assumed.
+struct DeviceMemorySnapshot {
+    std::size_t free_bytes  = 0;
+    std::size_t total_bytes = 0;
+};
+
+[[nodiscard]] DeviceMemorySnapshot device_memory_snapshot(int device);
+// Positive when memory was consumed between the two readings.
+[[nodiscard]] std::int64_t device_memory_growth(DeviceMemorySnapshot before,
+                                                DeviceMemorySnapshot after);
 
 void cuda_check(cudaError_t err, const char* expr, const char* file, int line);
 
@@ -51,6 +76,10 @@ struct DeviceContext {
     void bind_to_current_thread_noexcept() const noexcept;
     int compute_capability() const noexcept;
     int multiprocessor_count() const noexcept;
+    // The Device's free/total memory right now; the stream state is the caller's to settle.
+    [[nodiscard]] DeviceMemorySnapshot memory_snapshot() const {
+        return device_memory_snapshot(device);
+    }
     DeviceExecutionView execution_view() const noexcept;
     std::size_t total_vram() const noexcept;
     const char* sync_mode() const;

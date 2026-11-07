@@ -1,4 +1,5 @@
 #include "core/arena.h"
+#include "core/device.h"
 
 #include <cuda_runtime.h>
 
@@ -59,7 +60,9 @@ DeviceBuffer::DeviceBuffer(std::size_t size_bytes) : bytes(size_bytes) {
     void* ptr             = nullptr;
     const cudaError_t err = cudaMalloc(&ptr, bytes);
     if (err != cudaSuccess) {
-        throw std::runtime_error(cuda_error_message("cudaMalloc failed", err));
+        // A named error lets startup tell an exhausted Device apart from a broken request; the
+        // message keeps the CUDA diagnosis for the abort-free callers.
+        throw DeviceAllocationError("cudaMalloc failed", bytes);
     }
     p = ptr;
 }
@@ -146,7 +149,7 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
     void* ptr             = nullptr;
     const cudaError_t err = cudaMalloc(&ptr, capacity_bytes);
     if (err != cudaSuccess) {
-        throw std::runtime_error(cuda_error_message("cudaMalloc failed", err));
+        throw DeviceAllocationError("cudaMalloc failed", capacity_bytes);
     }
 
     base_ = ptr;

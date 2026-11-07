@@ -93,6 +93,7 @@ public:
         out.free_after_startup_bytes           = resolution.free_after_startup_bytes;
         out.kv_capacity_headroom_bytes         = resolution.automatic_headroom_bytes;
         out.planned_slack_bytes                = resolution.planned_slack_bytes;
+        out.startup_retained_bytes             = instance_.startup_retained_bytes;
         return out;
     }
 

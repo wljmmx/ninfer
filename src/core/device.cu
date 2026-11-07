@@ -58,6 +58,32 @@ void destroy_event(cudaEvent_t& event) noexcept {
 
 } // namespace
 
+DeviceAllocationError::DeviceAllocationError(const char* operation, std::size_t requested_bytes)
+    : std::runtime_error(std::string(operation) + ": insufficient Device memory"),
+      requested_bytes_(requested_bytes) {}
+
+DeviceMemorySnapshot device_memory_snapshot(int device) {
+    DeviceMemorySnapshot snapshot;
+    int previous = 0;
+    if (cudaGetDevice(&previous) != cudaSuccess) { previous = device; }
+    if (previous != device) {
+        if (cudaSetDevice(device) != cudaSuccess) {
+            throw std::runtime_error("device_memory_snapshot: cudaSetDevice failed");
+        }
+    }
+    const cudaError_t err = cudaMemGetInfo(&snapshot.free_bytes, &snapshot.total_bytes);
+    if (previous != device) { (void)cudaSetDevice(previous); }
+    if (err != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaMemGetInfo failed", err));
+    }
+    return snapshot;
+}
+
+std::int64_t device_memory_growth(DeviceMemorySnapshot before, DeviceMemorySnapshot after) {
+    return static_cast<std::int64_t>(before.free_bytes) -
+           static_cast<std::int64_t>(after.free_bytes);
+}
+
 void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
     if (err == cudaSuccess) { return; }
     std::fprintf(stderr, "%s:%d: CUDA_CHECK(%s) failed: %s: %s\n", file, line, expr,

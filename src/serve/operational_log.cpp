@@ -6,6 +6,7 @@
 #include <spdlog/logger.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <iomanip>
 #include <sstream>
 #include <string>
@@ -657,12 +658,16 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
     }
 
     logger_->debug("memory ledger | after weights {} | after startup {} | headroom {} | slack {} | "
-                   "CUDA graphs {}",
+                   "CUDA graphs {} planned / {} measured | startup retained {}",
                    product::format_pretty_bytes(memory.available_after_weights_bytes),
                    product::format_pretty_bytes(memory.available_after_startup_bytes),
                    product::format_pretty_bytes(memory.kv_capacity_headroom_bytes),
                    product::format_pretty_bytes(memory.planned_slack_bytes),
-                   product::format_pretty_bytes(memory.cuda_graph_allowance_bytes));
+                   product::format_pretty_bytes(memory.cuda_graph_allowance_bytes),
+                   product::format_pretty_bytes(
+                       memory.cuda_graph ? memory.cuda_graph->rebuild_estimate_bytes : 0),
+                   product::format_pretty_bytes(static_cast<std::uint64_t>(
+                       std::max<std::int64_t>(0, memory.startup_retained_bytes))));
     logger_->debug("context cost | transfer {} | prefill {} | hardware {} | prefill signature {}",
                    ninfer::context_cost_preset_source_name(context_cost.transfer_source),
                    ninfer::context_cost_preset_source_name(context_cost.prefill_source),
