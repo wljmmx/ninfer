@@ -47,9 +47,22 @@ struct ViewValidation {
     }
 
     bool overlap(const Tensor& a, const Tensor& b) const {
+        const auto span = [&](const Tensor& t) {
+            std::uint64_t bytes = dtype_size(t.dtype);
+            for (int d = 0; d < 4; ++d) {
+                require(t.ne[d] > 0, "view extent");
+                if (t.ne[d] == 1) continue;
+                require(t.nb[d] > 0, "view stride");
+                const std::uint64_t stride = t.nb[d], count = t.ne[d] - 1;
+                require(stride <= (std::numeric_limits<std::uintptr_t>::max() - bytes) / count,
+                        "view byte span");
+                bytes += count * stride;
+            }
+            return bytes;
+        };
         const auto x  = reinterpret_cast<std::uintptr_t>(a.data),
                    y  = reinterpret_cast<std::uintptr_t>(b.data);
-        const auto nx = a.bytes(), ny = b.bytes();
+        const auto nx = span(a), ny = span(b);
         require(nx <= std::numeric_limits<std::uintptr_t>::max() - x &&
                     ny <= std::numeric_limits<std::uintptr_t>::max() - y,
                 "address range");

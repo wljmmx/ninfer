@@ -178,6 +178,72 @@ void qsa_indexer(const Tensor& index_query, const QsaIndexCacheView& cache,
                  const QsaBatchView& batch, QsaIndexerExecutionEnvelope envelope,
                  WorkspaceArena& workspace, QsaBlockSelection& out, DeviceExecutionView execution);
 
+struct QsaSparseGqaExecutionEnvelope {
+    // Host-known upper bound on p+1 over live queries. Zero permits only inert queries.
+    // This resource promise does not assert that a selection is full.
+    std::uint32_t max_visible_tokens = 262144;
+};
+
+/** Capacity over every positive T in [min_tokens,max_tokens], with fixed storage, B and envelope.
+ * Includes only Op-local scratch, measured from a 256-byte-aligned workspace cursor.
+ */
+[[nodiscard]] std::size_t qsa_sparse_gqa_workspace_capacity_bytes(
+    KvCacheStorage storage, std::int32_t min_tokens, std::int32_t max_tokens,
+    std::int32_t batch_size, QsaSparseGqaExecutionEnvelope envelope, DeviceExecutionView execution);
+
+/**
+ * Op: qsa_sparse_gqa
+ *
+ * Math / indexing:
+ * For each live (t,b), p=positions[t,b], C=floor((p+1)/4), c=block_counts[t,b].
+ * J is the union of {4*g,4*g+1,4*g+2,4*g+3} for the first c block_ids and [4*C,p+1).
+ * For head h, kvh=floor(h/12), score[j]=dot(query[:,h,t,b],K[:,j,kvh])/16:
+ *   attention[d,h] = sum_{j in J} softmax(score)[j] * V[d,j,kvh];
+ *   out[d,h,t,b] = BF16(attention[d,h] * sigmoid(FP32(output_gate[d,h,t,b]))).
+ * There is no attention-output BF16 rounding before the gate. Indexer scores do not enter
+ * the logits. Logical token j addresses tables[j/64,table_rows[b]], row j%64.
+ * Empty J and inert queries produce exact +0, without reading query/gate/cache values.
+ * Quantized keys represent R*K, R=H256/16; logits use R*query and decoded keys. NVFP4 and
+ * K8V4 values represent R*V, so apply R^T to the fully reduced attention before the gate.
+ *
+ * Domain / numeric:
+ * T>0, B=1..8. Query, gate and out are contiguous, 16-byte-aligned BF16 [256,24,T,B].
+ * Cache supports BFloat16 (BF16 K / FP16 V), Fp8E4M3Row256, Int8Group64, Nvfp4Group16 and
+ * Fp8KeyNvfp4Value. Data/scale planes follow paged_kv_storage_layout(storage,256), with
+ * [leading_extent,64,2,G] geometry. Features are contiguous; naturally aligned positive,
+ * non-overlapping page-major outer strides are used. Q and softmax probabilities are not
+ * quantized to low-bit operands: MMA uses BF16/FP16 operands with FP32 accumulation, softmax
+ * and basis transforms. Decoded KV tiles stay on chip; there is no expanded global cache.
+ * BFloat16 is the only profile enabled by default on this port; the four low-bit profiles
+ * require NINFER_QSA_SPARSE_GQA_QUANT_KV to be set and are rejected otherwise.
+ * Tables have contiguous I32 entries and a non-overlapping row stride. Positions are contiguous
+ * I32 [T,B]; valid_columns/table_rows are contiguous Device I32 [B]. Each row has 0<=n<=T,
+ * with consecutive nonnegative live positions satisfying p+1<=envelope.max_visible_tokens<=262144,
+ * covered by its table. Selection is contiguous I32 [512,T,B] and [T,B]; each live c lies in
+ * [0,min(512,C)], with distinct ids in [0,C). Id order is unspecified; the set need not be an
+ * Indexer's actual TopK. Device metadata and readable selected pages are caller guarantees. Live
+ * mathematical operands/results are finite. The independent oracle decodes the actual stored
+ * codes/scales and evaluates basis transforms, dot, stable softmax, PV and sigmoid in FP64,
+ * comparing promoted BF16 output to the unrounded ideal under one A16 criterion. Cache storage
+ * quantization error is separate from this computation error.
+ *
+ * Effects / execution:
+ * All inputs and cache are preserved. There is no append, persistent state or publication.
+ * Inert queries do not inspect positions, selections or table selectors. Ids beyond c and
+ * unselected cache values are not read. Output and used workspace do not overlap inputs or
+ * each other; read-only views may share storage. Scratch is caller-owned, without hidden Device
+ * allocation. Fixed T/B, storage, views and device facts keep node count/order compatible across
+ * envelope updates. The Host bound selects launch/workspace configuration without reading Device
+ * metadata. Within a captured bound, per-query lengths, selections and mixed/all-select/inert
+ * cases remain Device inputs during replay. Each query attends at most 512*4+3 tokens.
+ * Same-stream ordering consumes Prepare/Indexer output directly; readiness/lifetime belong to the
+ * caller.
+ */
+void qsa_sparse_gqa(const Tensor& query, const Tensor& output_gate,
+                    const PagedKVBatchLayerView& cache, const QsaBatchView& batch,
+                    const QsaBlockSelection& selected, QsaSparseGqaExecutionEnvelope envelope,
+                    WorkspaceArena& workspace, Tensor& out, DeviceExecutionView execution);
+
 /**
  * Op: qsa_prepare
  *
