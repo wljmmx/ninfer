@@ -7,6 +7,7 @@ set(ninfer_op_tests
   rmsnorm
   rmsnorm_pack_tail
   gated_rmsnorm
+  fused_rmsnorm
   l2norm
   gated_delta_net
   kimi_delta_attention
