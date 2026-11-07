@@ -60,6 +60,10 @@ ninfer_add_op_test(ninfer_rmsnorm_rope_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_rmsnorm_rope.cpp"
   LIBRARIES ninfer_ops)
 
+ninfer_add_op_test(ninfer_rmsnorm_rope_2d_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_rmsnorm_rope_2d.cpp"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_context_kv_materialize_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_context_kv_materialize.cpp"
   LIBRARIES ninfer_ops)

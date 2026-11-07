@@ -2,8 +2,10 @@
 #include "ops/launcher/rope.h"
 
 #include "core/device.h" // CUDA_CHECK
+#include "ops/kernel/axial64.cuh"
 #include "ops/kernel/rope.cuh"
 
+#include <cmath>
 #include <cstdint>
 
 namespace ninfer::ops::detail {
@@ -80,11 +82,45 @@ void launch_dflash_split(const Tensor& positions, Tensor* q, Tensor* k, const Ro
             token_stride(k), scaling);
 }
 
+// port (T087 / upstream 628765e4): full D64 split-half 2-D RoPE on a half warp per head.
+// The upstream dispatch keeps one ladder for both the pair and the single form; the local
+// launcher splits them, so both call the same helper.
+template <int HeadsPerBlock>
+void launch_axial64(const Tensor& positions, Tensor* q, Tensor* k, float theta,
+                    cudaStream_t stream) {
+    launch_axial_rope64<false, HeadsPerBlock>(
+        {static_cast<const std::int32_t*>(positions.data), nullptr, nullptr,
+         q == nullptr ? nullptr : static_cast<__nv_bfloat16*>(q->data),
+         k == nullptr ? nullptr : static_cast<__nv_bfloat16*>(k->data), token_stride(q),
+         token_stride(k), positions.ne[0], q == nullptr ? 0 : q->ne[1],
+         k == nullptr ? 0 : k->ne[1], -std::log2(theta) / 16.F, 0.F},
+        stream);
+}
+
+bool launch_axial64_dispatch(const Tensor& positions, Tensor* q, Tensor* k, float theta,
+                             cudaStream_t stream) {
+    if (positions.ne[1] != 2 || positions.ne[2] != 1 || positions.ne[3] != 1) return false;
+    const Tensor& sample = q != nullptr ? *q : *k;
+    if (sample.ne[0] != 64) return false;
+    const int tokens = positions.ne[0];
+    if (tokens <= 2) {
+        launch_axial64<2>(positions, q, k, theta, stream);
+    } else if ((tokens >= 32 && tokens <= 64) || tokens >= 8192) {
+        launch_axial64<16>(positions, q, k, theta, stream);
+    } else {
+        launch_axial64<8>(positions, q, k, theta, stream);
+    }
+    return true;
+}
+
 bool launch_fixed_pair(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
                        const RopeScaling& scaling, DeviceExecutionView execution) {
     const auto stream = execution.stream;
     if (!bf16x2_aligned(q) || !bf16x2_aligned(k)) { return false; }
     const int axes = positions.ne[1];
+    if (axes == 2 && rotary_dim == 64 && !scaling.yarn) {
+        if (launch_axial64_dispatch(positions, &q, &k, theta, stream)) return true;
+    }
     if (axes == 1 && q.ne[0] == 128 && rotary_dim == 128 && theta == 1.0e7F && q.ne[1] == 32 &&
         k.ne[1] == 8) {
         const int tokens = positions.ne[0];
@@ -154,6 +190,9 @@ bool launch_fixed_single_dispatch(const Tensor& positions, int rotary_dim, float
                                   const RopeScaling& scaling, DeviceExecutionView execution) {
     if (!bf16x2_aligned(x)) { return false; }
     const int axes = positions.ne[1];
+    if (axes == 2 && rotary_dim == 64 && !scaling.yarn) {
+        if (launch_axial64_dispatch(positions, &x, nullptr, theta, execution.stream)) return true;
+    }
     if (axes == 1 && x.ne[0] == 128 && rotary_dim == 128 && theta == 1.0e7F) {
         if (x.ne[1] == 32) {
             launch_fixed_single<RopeKernelMode::DflashText1D, 32>(positions, x, scaling, execution);
