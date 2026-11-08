@@ -71,9 +71,9 @@ struct CachePlane {
     std::vector<std::uint8_t> host;
     std::unique_ptr<GuardedDeviceBuffer> device;
 
-    CachePlane(DType dtype, int features, int pages, bool padded) {
+    CachePlane(DType dtype, int features, int pages, bool padded, int heads = 2) {
         if (features == 0) return;
-        view               = Tensor(nullptr, dtype, {features, 64, 2, pages});
+        view               = Tensor(nullptr, dtype, {features, 64, heads, pages});
         const auto element = dtype_size(dtype);
         if (padded)
             for (int d = 1; d < 4; ++d)
@@ -104,7 +104,7 @@ struct CachePlane {
 };
 
 struct Fixture {
-    int T, B, A, alias, R, pages_per_row;
+    int T, B, A, alias, R, pages_per_row, heads;
     KvCacheStorage storage;
     CacheEncoding encoding;
     bool exact_key  = false;
@@ -124,25 +124,27 @@ struct Fixture {
     Tensor query_output, iq_output;
 
     Fixture(int tokens, int rows, int axes, int aliases = 0, int layout = 0, int capacity = 0,
-            KvCacheStorage kv_storage = KvCacheStorage::BFloat16)
+            KvCacheStorage kv_storage = KvCacheStorage::BFloat16, int query_heads = 24)
         : T(tokens), B(rows), A(axes), alias(aliases), R(capacity ? capacity : tokens + 4),
           pages_per_row((tokens + 126) / 64), storage(kv_storage),
-          encoding(cache_encoding(storage)), q(DType::BF16, {256, 24, T, B}),
-          k(DType::BF16, {256, 2, T, B}), v(DType::BF16, {256, 2, T, B}),
+          encoding(cache_encoding(storage)), heads(query_heads / 12),
+          q(DType::BF16, {256, query_heads, T, B}),
+          k(DType::BF16, {256, query_heads / 12, T, B}),
+          v(DType::BF16, {256, query_heads / 12, T, B}),
           iq(DType::BF16, {128, 4, T, B}), ik(DType::BF16, {128, T, B}),
-          out_q(DType::BF16, {256, 24, T, B}), out_iq(DType::BF16, {128, 4, T, B}),
+          out_q(DType::BF16, {256, query_heads, T, B}), out_iq(DType::BF16, {128, 4, T, B}),
           wq(DType::BF16, {256}), wk(DType::BF16, {256}), wiq(DType::BF16, {128}),
           wik(DType::BF16, {128}), tail(DType::BF16, {128, 3, B + 2}, layout),
           records(DType::BF16, {128, R, B}, layout),
           compressed(DType::BF16, {128, 16, 1, B * pages_per_row + 2}, layout != 0),
           keys(encoding.key.data_dtype, encoding.key.data_extent, B * pages_per_row + 2,
-               layout != 0),
+               layout != 0, heads),
           values(encoding.value.data_dtype, encoding.value.data_extent, B * pages_per_row + 2,
-                 layout != 0),
+                 layout != 0, heads),
           key_scales(encoding.key.scale_dtype, encoding.key.scale_extent, B * pages_per_row + 2,
-                     layout != 0),
+                     layout != 0, heads),
           value_scales(encoding.value.scale_dtype, encoding.value.scale_extent,
-                       B * pages_per_row + 2, layout != 0),
+                       B * pages_per_row + 2, layout != 0, heads),
           first(DType::I32, {3, B + 2}, layout), record_rope(DType::I32, {3, R, B}, layout),
           positions(DType::I32, {T, B}), rope(DType::I32, {T, A, B}), valid(DType::I32, {B}),
           table_rows(DType::I32, {B}), slots(DType::I32, {B}), offsets(DType::I32, {B}),
@@ -155,7 +157,7 @@ struct Fixture {
         PagedKVBatchLayerView main{keys.view, values.view, key_scales.view, value_scales.view,
                                   tables.view};
         main.head_dim     = 256;
-        main.num_kv_heads = 2;
+        main.num_kv_heads = heads;
         main.storage      = storage;
         cache = ops::QsaCacheView{main, ops::QsaIndexCacheView{compressed.view, tables.view}};
         query_output = alias & 1 ? q.view : out_q.view;
@@ -208,10 +210,10 @@ struct Fixture {
                 const int logical = p / 64;
                 tables.at(logical, table_rows.at(b)) =
                     1 + (B - 1 - b) * pages_per_row + pages_per_row - 1 - (logical - f / 64);
-                for (int h = 0; h < 24; ++h)
+                for (int h = 0; h < 12 * heads; ++h)
                     for (int c = 0; c < 256; ++c)
                         q.at(c, h, t, b) = sample(p, b, c + 256 * h, 3 + phase);
-                for (int h = 0; h < 2; ++h)
+                for (int h = 0; h < heads; ++h)
                     for (int c = 0; c < 256; ++c) {
                         k.at(c, h, t, b) = sample(p, b, c + 256 * h, 7 + phase);
                         v.at(c, h, t, b) = sample(p, b, c + 256 * h, 11 + phase);

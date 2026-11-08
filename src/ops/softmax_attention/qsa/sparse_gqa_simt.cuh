@@ -4,8 +4,9 @@
 namespace ninfer::ops::detail::qsa {
 template <KvCacheStorage Storage, int Warps, bool Vector>
 __launch_bounds__(Warps * 32) __global__ void sparse_gqa_simt_kernel(SparseGqaArguments a) {
-    const auto q   = a.begin + blockIdx.x / 24;
-    const int head = blockIdx.x % 24, kvh = head / 12, split = blockIdx.y;
+    const auto q   = a.begin + blockIdx.x / a.query_heads;
+    const int head = blockIdx.x % a.query_heads, kvh = head / a.heads_per_kv(),
+              split = blockIdx.y;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid / 32;
     const auto work = a.work(q);
     // This route always publishes FP32 partials; merge owns basis inversion and the gate.
@@ -17,7 +18,7 @@ __launch_bounds__(Warps * 32) __global__ void sparse_gqa_simt_kernel(SparseGqaAr
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
         const int d = kSparseQuantized<Storage> ? lane + 32 * i : lane * 8 + i;
-        query[i]    = __bfloat162float(a.query[(q * 24 + head) * 256 + d]);
+        query[i]    = __bfloat162float(a.query[(q * a.query_heads + head) * 256 + d]);
     }
     if constexpr (kSparseQuantized<Storage>) normalized_hadamard_d256_inplace(query, lane);
     const auto table = a.tables + std::int64_t(a.table_rows[q / a.tokens]) * a.table_stride;

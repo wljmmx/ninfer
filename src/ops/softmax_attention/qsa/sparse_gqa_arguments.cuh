@@ -24,6 +24,10 @@ struct SparseGqaArguments {
     float *numerator, *maximum, *sum;
     int tokens, batch, splits, key_rows;
     std::int64_t begin;
+    // Head geometry is (24,2) or (12,1): twelve query heads share one KV head.
+    int query_heads, kv_heads;
+
+    __device__ int heads_per_kv() const { return query_heads / kv_heads; }
 
     __device__ SparseGqaWork work(std::int64_t query_id) const {
         const int b = int(query_id / tokens), t = int(query_id % tokens);
@@ -35,7 +39,7 @@ struct SparseGqaArguments {
     }
 
     __device__ std::int64_t partial_row(std::int64_t q, int split, int h) const {
-        return ((std::int64_t(split) * batch * tokens + q) * 24 + h);
+        return ((std::int64_t(split) * batch * tokens + q) * query_heads + h);
     }
 };
 } // namespace ninfer::ops::detail::qsa

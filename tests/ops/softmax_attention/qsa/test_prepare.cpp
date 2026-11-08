@@ -95,19 +95,19 @@ int verify(Fixture& f, const std::string& label) {
         const int n = f.valid.at(b), base = f.bases[b];
         for (int t = 0; t < f.T; ++t) {
             if (t >= n) {
-                for (int h = 0; h < 24; ++h)
+                for (int h = 0; h < 12 * f.heads; ++h)
                     for (int c = 0; c < 256; ++c) failures += actual_q[f.q.index(c, h, t, b)] != 0;
                 for (int h = 0; h < 4; ++h)
                     for (int c = 0; c < 128; ++c)
                         failures += actual_iq[f.iq.index(c, h, t, b)] != 0;
                 continue;
             }
-            for (int h = 0; h < 24; ++h)
+            for (int h = 0; h < 12 * f.heads; ++h)
                 head(f.q, h, t, b, f.wq, actual_q, f.q.index(0, h, t, b), q_error);
             for (int h = 0; h < 4; ++h)
                 head(f.iq, h, t, b, f.wiq, actual_iq, f.iq.index(0, h, t, b), iq_error);
             const int p = f.positions.at(t, b), page = f.tables.at(p / 64, f.table_rows.at(b));
-            for (int h = 0; h < 2; ++h) {
+            for (int h = 0; h < f.heads; ++h) {
                 const auto ideal = ideal_head(f.k, h, t, b, f.wk);
                 if (f.storage == KvCacheStorage::BFloat16) {
                     for (int c = 0; c < 256; ++c) {
@@ -219,8 +219,8 @@ int verify(Fixture& f, const std::string& label) {
 }
 
 int run(DeviceContext& device, int t, int b, int axes, int alias, int layout, int capacity = 0,
-        KvCacheStorage storage = KvCacheStorage::BFloat16) {
-    Fixture f(t, b, axes, alias, layout, capacity, storage);
+        KvCacheStorage storage = KvCacheStorage::BFloat16, int query_heads = 24) {
+    Fixture f(t, b, axes, alias, layout, capacity, storage, query_heads);
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
     int failures = 0;
@@ -541,7 +541,7 @@ int scale_edges(DeviceContext& device, KvCacheStorage storage) {
     constexpr float amplitudes[]{0, 0x1p-30F, 0x1p-18F, 0x1p-10F, 1.0625F, 6.375F, 3072, 65536};
     constexpr float values[]{0, 0.25F, 0.75F, 1.25F, 1.75F, 2.5F, 3.5F, 6};
     for (int t = 0; t < f.T; ++t)
-        for (int h = 0; h < 2; ++h)
+        for (int h = 0; h < f.heads; ++h)
             for (int c = 0; c < 256; ++c) {
                 const float sign   = (c / 8 + h) % 2 ? -1 : 1;
                 f.v.at(c, h, t, 0) = f32_to_bf16(sign * amplitudes[t] * values[c % 8]);
@@ -566,6 +566,13 @@ int main() {
         for (int alias = 0; alias < 4; ++alias)
             failures += run(device, 9, 8, 3, alias, alias % 3, 5);
         for (int t : {1024, 2048, 4096}) failures += run(device, t, 1, 3, 3, 0);
+        // Local single-group geometry: twelve query heads share one KV head.
+        for (int t : {1, 8, 17, 319, 320, 321, 4096})
+            failures += run(device, t, 1, t % 3 ? 3 : 1, t % 4, t % 3, 0, KvCacheStorage::BFloat16,
+                            12);
+        failures += run(device, 9, 8, 1, 3, 1, 5, KvCacheStorage::BFloat16, 12);
+        failures += run(device, 41, 8, 3, 0, 2, 0, KvCacheStorage::BFloat16, 12);
+        failures += run(device, 65, 1, 3, 0, 0, 0, KvCacheStorage::Nvfp4Group16, 12);
         failures += epsilon_range(device) + coordinate_handoff(device) +
                     norm_alignment_and_phase(device) + continuation(device) + chunking(device) +
                     numerical_edges(device, true) + numerical_edges(device, false) +

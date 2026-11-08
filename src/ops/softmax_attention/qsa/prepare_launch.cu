@@ -57,6 +57,7 @@ PrepareArguments prepare_arguments(const QsaProjectionView& p, const QsaPrepareP
                        p.query.ne[2],
                        p.query.ne[3],
                        rope.ne[1],
+                       p.key.ne[1],
                        params.rms_epsilon,
                        {}};
     // Default model frequencies are constructed once on Host, with no Device allocation.
@@ -72,34 +73,43 @@ PrepareArguments prepare_arguments(const QsaProjectionView& p, const QsaPrepareP
     return a;
 }
 
-template <KvCacheStorage Storage, bool BoundedPhase, bool VectorWeights>
+template <KvCacheStorage Storage, bool BoundedPhase, bool VectorWeights, int KvHeads>
 void submit(const PrepareArguments& args, cudaStream_t stream) {
+    constexpr int groups = PrepareGeometry<KvHeads>::groups;
     // Short calls distribute a token's heads across CTAs; larger calls group heads across
-    // tokens for memory throughput. The short-call bound also keeps tokens*8 in the x-grid.
+    // tokens for memory throughput. The short-call bound also keeps tokens*groups in x.
     if (std::int64_t(args.tokens) * args.batch <= 320)
-        prepare_kernel<Storage, BoundedPhase, VectorWeights, true>
-            <<<dim3(args.tokens * 8, args.batch), 128, 0, stream>>>(args);
+        prepare_kernel<Storage, BoundedPhase, VectorWeights, true, KvHeads>
+            <<<dim3(args.tokens * groups, args.batch), 128, 0, stream>>>(args);
     else
-        prepare_kernel<Storage, BoundedPhase, VectorWeights, false>
-            <<<dim3(args.tokens, args.batch, 8), 128, 0, stream>>>(args);
+        prepare_kernel<Storage, BoundedPhase, VectorWeights, false, KvHeads>
+            <<<dim3(args.tokens, args.batch, groups), 128, 0, stream>>>(args);
 }
 
-template <KvCacheStorage Storage>
-void dispatch(const PrepareArguments& args, float theta, cudaStream_t stream) {
+template <KvCacheStorage Storage, int KvHeads>
+void dispatch_geometry(const PrepareArguments& args, float theta, cudaStream_t stream) {
     const bool vector_weights = reinterpret_cast<std::uintptr_t>(args.wq) % 16 == 0 &&
                                 reinterpret_cast<std::uintptr_t>(args.wiq) % 8 == 0;
     // For theta>=1 every phase is bounded by the nonnegative-I32 coordinate domain.
     if (theta >= 1) {
         if (vector_weights)
-            submit<Storage, true, true>(args, stream);
+            submit<Storage, true, true, KvHeads>(args, stream);
         else
-            submit<Storage, true, false>(args, stream);
+            submit<Storage, true, false, KvHeads>(args, stream);
     } else {
         if (vector_weights)
-            submit<Storage, false, true>(args, stream);
+            submit<Storage, false, true, KvHeads>(args, stream);
         else
-            submit<Storage, false, false>(args, stream);
+            submit<Storage, false, false, KvHeads>(args, stream);
     }
+}
+
+template <KvCacheStorage Storage>
+void dispatch(const PrepareArguments& args, float theta, cudaStream_t stream) {
+    if (args.kv_heads == 1)
+        dispatch_geometry<Storage, 1>(args, theta, stream);
+    else
+        dispatch_geometry<Storage, 2>(args, theta, stream);
 }
 
 } // namespace

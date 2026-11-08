@@ -10,6 +10,7 @@ sparse_gqa_all_select(SparseGqaArguments a, SparseGqaStorage<Storage, N, Queries
                       std::int64_t first, int head, std::uint16_t* qs) {
     constexpr int Nt = N / 8, Ks = N / 16;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid / 32;
+    const int rpk      = a.heads_per_kv();
     const auto total   = std::int64_t(a.tokens) * a.batch;
     const int b        = first / a.tokens;
     const auto last    = min(first + Queries, std::int64_t(b) * a.tokens + a.valid[b]);
@@ -104,7 +105,7 @@ sparse_gqa_all_select(SparseGqaArguments a, SparseGqaStorage<Storage, N, Queries
 #pragma unroll
     for (int j = 0; j < 2; ++j) {
         const int h = gid + j * 8;
-        if (q >= total || h >= 12) continue;
+        if (q >= total || h >= rpk) continue;
         const float inv = live ? __frcp_rn(state[j].sum) : 0;
 #pragma unroll
         for (int n = 0; n < 32; ++n) {
@@ -114,10 +115,11 @@ sparse_gqa_all_select(SparseGqaArguments a, SparseGqaStorage<Storage, N, Queries
                     *reinterpret_cast<float2*>(s.partial + (warp * 16 + h) * 256 + d) =
                         make_float2(acc[n][j * 2] * inv, acc[n][j * 2 + 1] * inv);
                 else
-                    sparse_gqa_store(a, q, head * 12 + h, d, acc[n][j * 2] * inv,
+                    sparse_gqa_store(a, q, head * rpk + h, d, acc[n][j * 2] * inv,
                                      acc[n][j * 2 + 1] * inv);
             } else
-                *reinterpret_cast<unsigned*>(a.out + (q * 24 + head * 12 + h) * 256 + d) = 0;
+                *reinterpret_cast<unsigned*>(a.out + (q * a.query_heads + head * rpk + h) * 256 + d) =
+                    0;
         }
     }
     if constexpr (kSparseRotatedValue<Storage>) {
@@ -131,9 +133,9 @@ template <KvCacheStorage Storage, int N, int Queries, bool Vector,
 __launch_bounds__(Queries * 32) __global__ void sparse_gqa_all_select_kernel(SparseGqaArguments a) {
     extern __shared__ __align__(16) unsigned char smem[];
     auto& s          = *reinterpret_cast<SparseGqaStorage<Storage, N, Queries, Load>*>(smem);
-    const auto first = a.begin + std::int64_t(blockIdx.x / 2) * Queries,
+    const auto first = a.begin + std::int64_t(blockIdx.x / a.kv_heads) * Queries,
                total = std::int64_t(a.tokens) * a.batch;
-    const int head   = blockIdx.x % 2;
+    const int head   = blockIdx.x % a.kv_heads;
     auto* qs         = reinterpret_cast<std::uint16_t*>(
         smem + (sizeof(SparseGqaStorage<Storage, N, Queries, Load>) + 15) / 16 * 16);
     if (sparse_gqa_all_selected<Queries>(a, first)) {

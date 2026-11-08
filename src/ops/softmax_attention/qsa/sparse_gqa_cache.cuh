@@ -121,16 +121,17 @@ template <KvCacheStorage Storage, int Warps, int Queries>
 __device__ void sparse_gqa_prepare_query(const SparseGqaArguments& a, std::int64_t first,
                                          std::int64_t last, int head, std::uint16_t* target) {
     const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
+    const int rpk = a.heads_per_kv();
     if constexpr (kSparseQuantized<Storage>) {
         for (int row = warp; row < Queries * 16; row += Warps) {
             const int h  = row % 16;
             const auto q = first + row / 16;
             float values[8]{};
-            if (q < last && h < 12) {
+            if (q < last && h < rpk) {
 #pragma unroll
                 for (int i = 0; i < 8; ++i)
-                    values[i] =
-                        __bfloat162float(a.query[(q * 24 + head * 12 + h) * 256 + lane + 32 * i]);
+                    values[i] = __bfloat162float(
+                        a.query[(q * a.query_heads + head * rpk + h) * 256 + lane + 32 * i]);
                 normalized_hadamard_d256_inplace(values, lane);
             }
 #pragma unroll
@@ -142,8 +143,9 @@ __device__ void sparse_gqa_prepare_query(const SparseGqaArguments& a, std::int64
         for (int i = tid; i < Queries * 16 * 32; i += Warps * 32) {
             const int row = i / 32, d = i % 32 * 8, h = row % 16;
             auto* dst = target + row * 256 + causal_swizzle(row, d);
-            if (first + row / 16 < last && h < 12)
-                cp_async<16>(dst, a.query + ((first + row / 16) * 24 + head * 12 + h) * 256 + d);
+            if (first + row / 16 < last && h < rpk)
+                cp_async<16>(dst, a.query + ((first + row / 16) * a.query_heads + head * rpk + h) * 256 +
+                                      d);
             else
                 store_vec(dst, make_int4(0, 0, 0, 0));
         }
