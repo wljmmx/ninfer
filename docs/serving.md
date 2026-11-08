@@ -57,6 +57,9 @@ selected for this process.
 |---|---|
 | `GET /health` | Engine readiness |
 | `GET /metrics` | Prometheus counters, gauges and latency histograms |
+| `GET /monitor/info` | process identity, model/rank description, redacted configuration, startup budgets |
+| `GET /monitor/snapshot` | one engine + service observation snapshot (counters, gauges, histograms) |
+| `GET /monitor/events` | live request lifecycle events over SSE (bounded, no replay) |
 | `GET /v1/models` | configured OpenAI model alias and effective `max_model_len` |
 | `GET /v1/models/{id}` | lookup of the configured alias and effective `max_model_len` |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
@@ -1026,6 +1029,43 @@ rate(ninfer_spec_decode_accepted_tokens_total[1m])
 The handler copies published snapshots and formats them outside the Engine worker. Scraping does
 not reset counters or initiate device work. Detailed per-request records remain available through
 the JSONL log. Monitoring tools with engine-specific metric names need an NInfer adapter.
+
+## Monitoring endpoints
+
+`GET /monitor/info`, `GET /monitor/snapshot` and `GET /monitor/events` expose the same facts the
+Prometheus endpoint does, but shaped for the bundled `dashboard/` process-level observer. They
+follow the server's API-key authentication.
+
+| Path | Content |
+|---|---|
+| `/monitor/info` | `server_instance_id`, `start_time_seconds`, the model/rank description, the redacted startup configuration and the startup memory budgets |
+| `/monitor/snapshot` | `engine` (counters, gauges, Host-phase totals, memory and media summaries) plus `service` (request counts, TTFT/duration/queue bins, live requests) |
+| `/monitor/events` | `text/event-stream` of request lifecycle events: `request_preparing`, `first_token`, scheduling transitions, `request_completed`, `request_cancelled`, `request_failed`, `request_rejected`, `response_failed` |
+
+```bash
+curl -s http://127.0.0.1:8080/monitor/snapshot | jq '.engine.runtime.host_work'
+```
+
+Boundaries are the same as everywhere else in this document, so a consumer never has to add
+quantities itself:
+
+- `runtime.host_work` holds exclusive Host phases in nanoseconds; `device_wait_ns` is blocked wall
+  time and is not part of their sum. There is no combined "GPU + Host" total.
+- `service.ttft` observes preparation once, at the first committed token; it is the request-level
+  TTFT boundary, not a sum of prepare/Vision/prefill phases.
+- Memory fields are the values the Engine publishes for this process: explicit capacity, logical
+  occupancy and (where measured) physical space stay separate and are not re-added.
+- A quantity this port does not measure is **absent**, never reported as zero: there are no
+  per-execution-kind latency groups, no per-position speculative arrays, no prefix-cache counters
+  and no NVML physical-memory samples in the payload. Consumers must treat a missing key as
+  "not measured".
+- `/monitor/events` is live-only. Each subscriber has a bounded queue (64 events / 64 KiB); a slow
+  consumer is disconnected rather than allowed to block a request. There is no replay, and a client
+  that reconnects observes a gap rather than fabricated continuity.
+
+The dashboard's collector is a separate Node process; it polls `/monitor/snapshot` at
+`sampling_interval_ms`, stores fine samples and minute aggregates, and reads `/monitor/events` for
+its event list. See `dashboard/README.md`.
 
 ## Structured request log
 

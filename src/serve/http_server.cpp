@@ -219,7 +219,7 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
     request_jsonl_.write_startup_config(options_);
     const std::size_t queued_requests = static_cast<std::size_t>(options_.launch.engine.max_concurrency) +
                                         options_.launch.engine.max_pending_requests;
-    const std::size_t worker_count = queued_requests + 1;
+    const std::size_t worker_count = queued_requests + 1 + MonitorEvents::kMaxSubscribers;
     server_.new_task_queue         = [queued_requests, worker_count] {
         return new httplib::ThreadPool(worker_count, worker_count, queued_requests);
     };
@@ -255,47 +255,57 @@ std::shared_ptr<HttpServer::RequestLifecycle> HttpServer::begin_request(RequestL
 }
 
 void HttpServer::record_request_start(const RequestLogContext& context) {
+    observations_.preparing(context.id, context.protocol, context);
     request_jsonl_.write_request_start(context);
     operational_log_.request_start(context);
 }
 
 void HttpServer::record_request_rejected(const RequestRejectionLogContext& context) {
     metrics_.rejected();
+    observations_.rejected(context.id);
     request_jsonl_.write_request_rejected(context);
     operational_log_.request_rejected(context);
 }
 
-ninfer::GenerationFirstTokenObserver HttpServer::first_token_observer() {
-    return [this](const ninfer::GenerationFirstTokenObservation& observation) {
+ninfer::GenerationFirstTokenObserver HttpServer::first_token_observer(std::uint64_t request_id) {
+    return [this, request_id](const ninfer::GenerationFirstTokenObservation& observation) {
         metrics_.first_token(observation);
+        observations_.first_token(request_id, observation);
     };
 }
 
 ninfer::GenerationSchedulingObserver HttpServer::scheduling_observer(std::uint64_t request_id,
                                                                      std::string http_request_id) {
-    if (!request_jsonl_.enabled()) { return {}; }
-    return [this, request_id, http_request_id = std::move(http_request_id)](
+    const bool enabled = request_jsonl_.enabled();
+    return [this, request_id, http_request_id = std::move(http_request_id), enabled](
                const ninfer::GenerationSchedulingObservation& observation) {
-        request_jsonl_.write_request_scheduling(request_id, http_request_id, observation);
+        observations_.scheduling(request_id, observation);
+        if (enabled) {
+            request_jsonl_.write_request_scheduling(request_id, http_request_id, observation);
+        }
     };
 }
 
 void HttpServer::record_request_done(const RequestLogContext& context,
                                      const GenerationOutcome& outcome) {
     metrics_.done(outcome);
+    observations_.done(context.id, outcome);
     request_jsonl_.write_request_done(context, outcome);
     operational_log_.request_done(context, outcome);
 }
 
 void HttpServer::record_request_failure(const RequestLogContext& context,
                                         const RequestFailure& failure) {
-    metrics_.failed(failure.classification == RequestFailureClass::ClientDisconnected);
+    const bool cancelled = failure.classification == RequestFailureClass::ClientDisconnected;
+    metrics_.failed(cancelled);
+    observations_.failed(context.id, cancelled);
     request_jsonl_.write_request_error(context, failure.machine_message);
     operational_log_.request_failure(context, failure);
 }
 
 void HttpServer::record_response_failure(std::uint64_t request_id, const RequestFailure& failure) {
     metrics_.response_failed();
+    observations_.response_failed(request_id);
     operational_log_.response_failure(request_id, failure);
 }
 
@@ -444,6 +454,7 @@ void HttpServer::register_routes() {
             }
         });
 
+    register_monitor_routes();
     server_.Get("/health", [this](const httplib::Request&, httplib::Response& res) {
         const bool available = service_ != nullptr && service_->is_available();
         res.status           = available ? 200 : 503;
@@ -534,6 +545,7 @@ void HttpServer::attach(GenerationService& service) {
     const ninfer::RuntimeStats baseline = service.runtime_stats();
     public_model_id_                    = product::resolve_public_model_id(options_, load.model_name);
     service_                            = &service;
+    observations_.attach();
     metrics_.configure(public_model_id_, service.engine_options(), memory, baseline);
     request_jsonl_.write_server_start(options_, service.engine_options(),
                                       service.sampling_defaults(), public_model_id_, load, memory);
@@ -550,14 +562,19 @@ bool HttpServer::listen() {
     }
     try {
         const bool result = server_.listen_after_bind();
+        observations_.stop();
         stop_stats_reporter();
         return result;
     } catch (...) {
+        observations_.stop();
         stop_stats_reporter();
         throw;
     }
 }
 
-void HttpServer::stop() { server_.stop(); }
+void HttpServer::stop() {
+    observations_.stop();
+    server_.stop();
+}
 
 } // namespace ninfer::serve
