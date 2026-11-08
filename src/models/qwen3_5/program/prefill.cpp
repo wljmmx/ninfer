@@ -15,6 +15,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <span>
@@ -993,6 +995,16 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                         remaining, split_frontier, final_candidate);
                 }
                 timing.include(result.timing);
+                // NINFER_PREFILL_TIMING brackets the whole chunk on the device (NINFER_DFLASH_TIMING's
+                // segment tables add a sync per segment, this one adds none), so a draft segment
+                // table can be read against what the chunk actually cost.
+                if (std::getenv("NINFER_PREFILL_TIMING") != nullptr &&
+                    schedule_state.prefill_gpu_timer != nullptr) {
+                    std::fprintf(stderr, "[df] chunk tokens=%u gpu=%.2f ms\n",
+                                 result.processed_tokens,
+                                 static_cast<double>(schedule_state.prefill_gpu_timer->elapsed_ms()));
+                    std::fflush(stderr);
+                }
                 timing.resume_post();
                 if (result.processed_tokens == 0 || result.processed_tokens > remaining) {
                     throw std::logic_error("ordinary prefill chunk made invalid progress");

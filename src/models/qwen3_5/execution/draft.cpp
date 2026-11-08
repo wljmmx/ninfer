@@ -32,7 +32,10 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <utility>
 
@@ -40,6 +43,98 @@ namespace ninfer::models::qwen3_5::execution {
 namespace {
 
 using detail::DFlashPersistentState;
+
+// NINFER_DFLASH_TIMING=1 splits one DFlash context append into CUDA-event intervals and prints them
+// once per call. The profile the append needs is "where does a prefill chunk's draft half go", and
+// the answer has to be per segment: a single nvtx range around the call cannot separate a slow GEMM
+// from a slow KV append. Default off, and then every method returns before touching CUDA.
+class AppendTiming {
+public:
+    enum Category : int {
+        kFeatureProject = 0,
+        kContextNorm,
+        kContextMaterialize,
+        kLayerLinearPair,
+        kKeyNorm,
+        kRope,
+        kKvAppend,
+        kCategoryCount,
+    };
+
+    static bool enabled() {
+        static const bool on = std::getenv("NINFER_DFLASH_TIMING") != nullptr;
+        return on;
+    }
+
+    explicit AppendTiming(cudaStream_t stream) : stream_(stream) {
+        if (!enabled()) { return; }
+        // The decode path calls the same append inside a captured graph. Creating or recording a
+        // timing event there invalidates the capture, so the probe stands down on a capturing
+        // stream instead of corrupting the graph it is trying to measure from the outside.
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &status) == cudaSuccess &&
+            status != cudaStreamCaptureStatusNone) {
+            return;
+        }
+        for (cudaEvent_t& event : events_) {
+            if (cudaEventCreate(&event) != cudaSuccess) { return; }
+        }
+        created_ = true;
+        mark(kCategoryCount);
+    }
+
+    AppendTiming(const AppendTiming&)            = delete;
+    AppendTiming& operator=(const AppendTiming&) = delete;
+
+    ~AppendTiming() {
+        if (!created_) { return; }
+        for (cudaEvent_t event : events_) { cudaEventDestroy(event); }
+    }
+
+    void mark(Category category) {
+        if (!created_ || count_ >= static_cast<int>(events_.size())) { return; }
+        if (cudaEventRecord(events_[static_cast<std::size_t>(count_)], stream_) != cudaSuccess) {
+            return;
+        }
+        if (count_ > 0) { interval_category_[static_cast<std::size_t>(count_)] = category; }
+        ++count_;
+    }
+
+    void report(const char* label, int width, int batch) {
+        if (!created_ || count_ < 2) { return; }
+        cudaEventSynchronize(events_[static_cast<std::size_t>(count_ - 1)]);
+        std::array<double, kCategoryCount> total{};
+        double span = 0.0;
+        for (int i = 0; i < count_ - 1; ++i) {
+            float ms = 0.0F;
+            if (cudaEventElapsedTime(&ms, events_[static_cast<std::size_t>(i)],
+                                     events_[static_cast<std::size_t>(i + 1)]) != cudaSuccess) {
+                continue;
+            }
+            const int category = interval_category_[static_cast<std::size_t>(i + 1)];
+            if (category >= 0 && category < kCategoryCount) {
+                total[static_cast<std::size_t>(category)] += static_cast<double>(ms);
+            }
+            span += static_cast<double>(ms);
+        }
+        std::fprintf(stderr,
+                     "[df] %s width=%d batch=%d intervals=%d total=%.2f ms | feature=%.2f norm=%.2f "
+                     "materialize=%.2f kv_proj=%.2f knorm=%.2f rope=%.2f kv_append=%.2f\n",
+                     label, width, batch, count_ - 1, span, total[kFeatureProject],
+                     total[kContextNorm], total[kContextMaterialize], total[kLayerLinearPair],
+                     total[kKeyNorm], total[kRope], total[kKvAppend]);
+        std::fflush(stderr);
+    }
+
+private:
+    static constexpr std::size_t kMaxMarks = 128;
+
+    cudaStream_t stream_ = nullptr;
+    bool created_        = false;
+    int count_           = 0;
+    std::array<cudaEvent_t, kMaxMarks> events_{};
+    std::array<int, kMaxMarks> interval_category_{};
+};
 
 void require_dflash_state(const PrefillContext& state) {
     if (state.dflash == nullptr || !state.execution.parameters.draft.has_value()) {
@@ -142,6 +237,7 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
         const Tensor input        = config.dflash2.has_value() && replace_local_window
                                         ? features.slice(1, local_offset, local_width)
                                         : features;
+        AppendTiming timing(state.execution.device.stream);
         const auto roots          = workspace::dflash_context(state.execution.work, target, config,
                                                               projected_width * batch);
         Tensor projected          = roots.projected;
@@ -151,8 +247,10 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                      projected_width * batch}),
                 state.execution.parameters.draft->feature_projection, projected,
                 state.execution.work, state.execution.device.stream);
+        timing.mark(AppendTiming::kFeatureProject);
         ops::rmsnorm(projected, state.execution.parameters.draft->context_norm, config.rms_norm_eps,
                      false, context, state.execution.device.stream);
+        timing.mark(AppendTiming::kContextNorm);
 
         if (config.dflash2) {
             std::array<ops::ContextKVMaterializeLayerView, ops::kContextKVMaterializeLayers> layers;
@@ -173,6 +271,7 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                 context.view({dimension(target.hidden_size), local_width, batch}), local_positions,
                 local_counts, lanes, layers, {local_envelope.min_count, local_envelope.max_count},
                 state.execution.work, state.execution.device.stream);
+            timing.mark(AppendTiming::kContextMaterialize);
         } else {
             for (int layer = 0; layer < dimension(config.num_hidden_layers); ++layer) {
                 auto layer_scope = state.execution.work.scope();
@@ -203,14 +302,17 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                 ops::linear_pair(layer_context, weight.context_key.weight,
                                  weight.context_value.weight, key_flat, value_flat,
                                  state.execution.device.stream);
+                timing.mark(AppendTiming::kLayerLinearPair);
                 Tensor key = layer_roots.key.view({dimension(config.attention.head_dim),
                                                    dimension(config.attention.num_key_value_heads),
                                                    layer_columns});
                 ops::rmsnorm(key_raw, weight.key_norm, config.rms_norm_eps, false, key,
                              state.execution.device.stream);
+                timing.mark(AppendTiming::kKeyNorm);
                 ops::rope(layer_positions.view({layer_columns}),
                           dimension(config.attention.head_dim), config.rope_theta, key,
                           state.execution.device.execution_view());
+                timing.mark(AppendTiming::kRope);
                 Tensor key_batch =
                     key.view({dimension(config.attention.head_dim),
                               dimension(config.attention.num_key_value_heads), layer_width, batch});
@@ -229,8 +331,10 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                         dflash_state(state).full_batch_layer(config.compact_layer_index(layer)),
                         state.execution.device.stream);
                 }
+                timing.mark(AppendTiming::kKvAppend);
             }
         }
+        timing.report("append", width, batch);
     }
 }
 

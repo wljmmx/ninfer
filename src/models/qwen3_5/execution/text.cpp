@@ -42,6 +42,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -155,6 +156,140 @@ private:
     T previous_;
 };
 
+// NINFER_PREFILL_PHASES splits one prefill chunk into the phases a draft tap can perturb: the
+// embedding, the layer stack (where the feature copy runs), the final norm and sample, the MTP
+// block, and the draft consumer. It syncs once per phase, which is enough to perturb a run that is
+// already close to its memory ceiling, so it is a separate switch from NINFER_DFLASH_TIMING:
+// NINFER_PREFILL_TIMING reports the same chunk total with no sync at all. Default off.
+class ChunkProbe {
+public:
+    enum Phase : int {
+        kEmbed = 0,
+        kLayers,
+        kFinal,
+        kMtp,
+        kDraftSink,
+        kPhaseCount,
+    };
+
+    explicit ChunkProbe(cudaStream_t stream) : stream_(stream) {
+        if (std::getenv("NINFER_PREFILL_PHASES") == nullptr) { return; }
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &status) == cudaSuccess &&
+            status != cudaStreamCaptureStatusNone) {
+            return;
+        }
+        for (cudaEvent_t& event : events_) {
+            if (cudaEventCreate(&event) != cudaSuccess) { return; }
+        }
+        created_ = true;
+        mark(kPhaseCount);
+    }
+
+    ChunkProbe(const ChunkProbe&)            = delete;
+    ChunkProbe& operator=(const ChunkProbe&) = delete;
+
+    ~ChunkProbe() {
+        if (!created_) { return; }
+        for (cudaEvent_t event : events_) { cudaEventDestroy(event); }
+    }
+
+    void mark(Phase phase) {
+        if (!created_ || count_ >= static_cast<int>(events_.size())) { return; }
+        if (cudaEventRecord(events_[static_cast<std::size_t>(count_)], stream_) != cudaSuccess) {
+            return;
+        }
+        if (count_ > 0) { interval_phase_[static_cast<std::size_t>(count_)] = phase; }
+        ++count_;
+    }
+
+    void report(std::int32_t tokens) {
+        if (!created_ || count_ < 2) { return; }
+        cudaEventSynchronize(events_[static_cast<std::size_t>(count_ - 1)]);
+        std::array<double, kPhaseCount> sum{};
+        double span = 0.0;
+        for (int i = 0; i < count_ - 1; ++i) {
+            float ms = 0.0F;
+            if (cudaEventElapsedTime(&ms, events_[static_cast<std::size_t>(i)],
+                                     events_[static_cast<std::size_t>(i + 1)]) != cudaSuccess) {
+                continue;
+            }
+            const int phase = interval_phase_[static_cast<std::size_t>(i + 1)];
+            if (phase >= 0 && phase < kPhaseCount) { sum[static_cast<std::size_t>(phase)] += ms; }
+            span += static_cast<double>(ms);
+        }
+        std::fprintf(stderr,
+                     "[df] target tokens=%d total=%.2f ms | embed=%.2f layers=%.2f final=%.2f "
+                     "mtp=%.2f draft=%.2f\n",
+                     tokens, span, sum[kEmbed], sum[kLayers], sum[kFinal], sum[kMtp],
+                     sum[kDraftSink]);
+        std::fflush(stderr);
+    }
+
+private:
+    static constexpr std::size_t kMaxMarks = 8;
+
+    cudaStream_t stream_ = nullptr;
+    bool created_        = false;
+    int count_           = 0;
+    std::array<cudaEvent_t, kMaxMarks> events_{};
+    std::array<int, kMaxMarks> interval_phase_{};
+};
+
+// NINFER_DFLASH_TIMING: the target-side feature copies are the other half of a draft's prefill
+// cost - one 2D copy per tap layer per chunk. They are timed as one bracket around all of them
+// (begin / end recorded once each) so the measurement adds a single sync per chunk instead of one
+// per copy.
+struct FeatureCopyTiming {
+    cudaEvent_t begin_event = nullptr;
+    cudaEvent_t end_event   = nullptr;
+    int copies              = 0;
+    bool active             = false;
+
+    static bool enabled() {
+        static const bool on = std::getenv("NINFER_DFLASH_TIMING") != nullptr;
+        return on;
+    }
+
+    void start(cudaStream_t stream) {
+        if (!enabled() || active) { return; }
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &status) == cudaSuccess &&
+            status != cudaStreamCaptureStatusNone) {
+            return;
+        }
+        if (begin_event == nullptr &&
+            (cudaEventCreate(&begin_event) != cudaSuccess ||
+             cudaEventCreate(&end_event) != cudaSuccess)) {
+            return;
+        }
+        if (cudaEventRecord(begin_event, stream) == cudaSuccess) { active = true; }
+    }
+
+    void stop(cudaStream_t stream) {
+        if (!active) { return; }
+        if (cudaEventRecord(end_event, stream) == cudaSuccess) { ++copies; }
+        active = false;
+    }
+
+    void report(const char* label) {
+        if (!enabled() || begin_event == nullptr || copies == 0) { return; }
+        cudaEventSynchronize(end_event);
+        float ms = 0.0F;
+        if (cudaEventElapsedTime(&ms, begin_event, end_event) == cudaSuccess) {
+            std::fprintf(stderr, "[df] feature %s taps=%d copy_span=%.2f ms\n", label, copies,
+                         static_cast<double>(ms));
+            std::fflush(stderr);
+        }
+        copies = 0;
+    }
+};
+
+FeatureCopyTiming& feature_copy_timing() {
+    static thread_local FeatureCopyTiming timing;
+    return timing;
+}
+
 } // namespace
 
 void DFlashFeatureSink::begin(const Tensor& value) {
@@ -198,9 +333,11 @@ void DFlashFeatureSink::capture_layer(int layer, const Tensor& value, cudaStream
     const std::size_t source_pitch  = static_cast<std::size_t>(value.nb[1]);
     const std::size_t target_pitch  = static_cast<std::size_t>(features->nb[1]);
     auto* target                    = static_cast<std::byte*>(features->data) + index * width_bytes;
+    feature_copy_timing().start(stream);
     CUDA_CHECK(cudaMemcpy2DAsync(target, target_pitch, value.data, source_pitch, width_bytes,
                                  static_cast<std::size_t>(active_tokens), cudaMemcpyDeviceToDevice,
                                  stream));
+    feature_copy_timing().stop(stream);
     captured_mask |= 1U << index;
 }
 
@@ -229,6 +366,7 @@ void DFlashFeatureSink::consume_prefill_chunk(std::int32_t tokens, bool rewrite_
     if (!consume_prefill || tokens != active_tokens) {
         throw std::logic_error("DFlash prefill feature consumer is unavailable");
     }
+    feature_copy_timing().report("prefill");
     Tensor feature_window  = features->slice(1, 0, tokens);
     Tensor position_window = positions->slice(0, 0, tokens);
     consume_prefill(feature_window, position_window, rewrite_checkpoint);
@@ -1640,6 +1778,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         const bool is_last = finalize_at_end && (t0 + len == T);
         nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
                                       static_cast<std::uint64_t>(len));
+        ChunkProbe chunk_probe(s);
 
         {
             std::vector<std::int32_t> local_scatter_indices;
@@ -1700,11 +1839,13 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                     1, visual_begin, static_cast<std::int32_t>(local_scatter_indices.size()));
                 ops::scatter(embeddings, indices_device, x, s);
             }
+            chunk_probe.mark(ChunkProbe::kEmbed);
             if constexpr (Tap::enabled) { tap.begin(x); }
             run_layers(x, Phase::Prefill, tap);
             if constexpr (requires { tap.capture_positions(positions, s); }) {
                 tap.capture_positions(positions, s);
             }
+            chunk_probe.mark(ChunkProbe::kLayers);
 
             Tensor xf = prefill_hidden_.data != nullptr
                             ? matrix_window(prefill_hidden_, len)
@@ -1729,6 +1870,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                                 dimension(parameters_.model.resources().public_token_count), s);
                 }
             }
+
+            chunk_probe.mark(ChunkProbe::kFinal);
 
             if (prepare_mtp_prompt) {
                 const std::uint32_t alignment_tokens =
@@ -1809,6 +1952,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                                       nullptr);
                 }
             }
+            chunk_probe.mark(ChunkProbe::kMtp);
 
             if (split_rel > 0 && t0 + len == split_rel &&
                 rewrite_checkpoint_hidden_output_ != nullptr) {
@@ -1826,6 +1970,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             work_.reset();
             tap.consume_prefill_chunk(len, split_rel > 0 && t0 + len == split_rel);
         }
+        chunk_probe.mark(ChunkProbe::kDraftSink);
+        chunk_probe.report(len);
 
         t0 += len;
         break;
