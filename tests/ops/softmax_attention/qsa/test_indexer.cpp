@@ -9,8 +9,8 @@ using namespace ninfer::test;
 using namespace ninfer::test::qsa::indexer;
 
 namespace {
-// BF16 products are exact in FP32 for these normal-range operands. This fixed gamma bound
-// covers 128-term accumulation, the 1-Lipschitz ReLU, and the four-head FP32 sum.
+// Fixed score-error criterion over represented inputs: 128-term dot products, ReLU and
+// the four-head sum. Every implementation uses this same ranking-error budget.
 constexpr double kU          = 0x1p-24;
 constexpr double kScoreGamma = (132 * kU) / (1 - 132 * kU);
 
@@ -198,6 +198,37 @@ int read_footprint(DeviceContext& device) {
     return verify(f, "masked reads", false);
 }
 
+// One captured graph is updated across metadata and envelope changes, including through the
+// all-select and inert bounds, without re-instantiating.
+int graph_update(DeviceContext& device) {
+    Fixture f(65, 1, 262144, 1, Pattern::Dyadic);
+    const ops::QsaIndexerExecutionEnvelope envelope{262144};
+    const auto bytes = ops::qsa_indexer_workspace_capacity_bytes(65, 65, 1, envelope,
+                                                                 device.execution_view());
+    GuardedDeviceBuffer scratch(std::max<std::size_t>(256, bytes));
+    WorkspaceArena workspace(DeviceSpan{scratch.data(), std::max<std::size_t>(256, bytes)});
+    DecodeGraphExecutable graph;
+    int failures = 0;
+    for (std::uint32_t bound : {0u, 2051u, 2052u, 8192u, 32768u, 262144u, 2051u}) {
+        f.history                     = std::max<std::uint32_t>(1, bound);
+        f.envelope.max_visible_tokens = bound;
+        f.reset(0, bound == 0);
+        DecodeGraphDefinition definition;
+        definition.capture(device.stream, [&] { f.launch(workspace, device.execution_view()); });
+        if (graph.ready())
+            graph.update(definition);
+        else
+            graph.instantiate(definition);
+        graph.launch(device.stream);
+        device.synchronize();
+        failures += verify(f, "indexer graph update bound=" + std::to_string(bound));
+        failures += scratch.verify_guards("indexer graph workspace");
+        if (workspace.used() != 0 || workspace.peak_used() > bytes) ++failures;
+        if (failures) return failures;
+    }
+    return failures;
+}
+
 template <class F>
 int rejects(F&& call) {
     try {
@@ -244,7 +275,7 @@ int main() {
     if (cuda_unavailable()) return 77;
     try {
         DeviceContext device;
-        int failures = validation(device);
+        int failures = validation(device) + graph_update(device);
         for (int history :
              {1, 3, 4, 5, 2047, 2048, 2049, 2050, 2051, 2052, 2053, 32764, 32768, 32772, 262144})
             failures += run(device, 1, 1, history, 0, Pattern::Dyadic);

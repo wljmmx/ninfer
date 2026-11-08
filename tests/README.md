@@ -71,6 +71,12 @@ Every participating comparison emits one `OP_ERROR_STATS` record containing the 
 actual error, active limit, and error-to-limit ratio. The switch changes reporting only; the same
 statistics still drive the normal verdict. Passing tests remain quiet without it.
 
+QSA Indexer and sparse GQA qualify both metadata changes during Graph replay and envelope
+changes through Graph executable updates, including transitions through all-select/inert calls.
+Their numerical criteria remain independent of target, extent and private arithmetic.
+QSA tail, prepare, indexer and sparse GQA retain partial-initialization recipes for Compute
+Sanitizer initcheck.
+
 `ninfer_softmax_attention_test --causal-only` runs both D256 geometries and all five KV types;
 `--kv-dtype bf16|int8|fp8|nvfp4|k8v4` selects the same complete causal suite for one type.
 The suite covers prefill, decode/spec widths, batched prefixes, cache effects, and Graph replay and

@@ -155,8 +155,9 @@ struct QsaIndexerExecutionEnvelope {
  * Positions are contiguous I32 [T,B]; valid_columns and table_rows are Device I32 [B].
  * Each row has 0<=n<=T; live positions are consecutive nonnegative original-token ordinals.
  * Every live p+1 is <= envelope.max_visible_tokens <=262144, within the table capacity.
- * Envelope zero permits only inert queries. Live scoring operands and their FP32 scores are
- * finite. BF16 values enter FP32 accumulation directly; scores have no BF16 rounding boundary.
+ * Envelope zero permits only inert queries. Live scoring operands and scores are
+ * finite. Ranking approximates the formula from represented inputs; there is no semantic
+ * intermediate score-storage rounding boundary.
  * Mathematical scores and selection boundaries are independently qualified against FP64.
  * Device counts, positions, selectors and readable live pages are caller guarantees.
  *
@@ -214,8 +215,9 @@ struct QsaSparseGqaExecutionEnvelope {
  * Nvfp4Group16 and Fp8KeyNvfp4Value. Data/scale planes follow paged_kv_storage_layout(storage,256),
  * with [leading_extent,64,Hkv,G] geometry. Features are contiguous; naturally aligned positive,
  * non-overlapping page-major outer strides are used. Q and softmax probabilities are not
- * quantized to low-bit operands: MMA uses BF16/FP16 operands with FP32 accumulation, softmax
- * and basis transforms. Decoded KV tiles stay on chip; there is no expanded global cache.
+ * quantized to low-bit operands. The A16 numerical policy applies to the complete attention
+ * and gate; intermediate arithmetic remains private. Decoded KV tiles stay on chip; there is
+ * no expanded global cache.
  * BFloat16 is the only profile enabled by default on this port; the four low-bit profiles
  * require NINFER_QSA_SPARSE_GQA_QUANT_KV to be set and are rejected otherwise.
  * Tables have contiguous I32 entries and a non-overlapping row stride. Positions are contiguous
