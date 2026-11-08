@@ -1,5 +1,7 @@
 #include "media/decode/decode.h"
 
+#include "media/decode/jpeg.h"
+
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -45,6 +47,11 @@ void validate_input(std::span<const std::uint8_t> bytes, const Policy& policy) {
     if (bytes.size() > policy.max_bytes) {
         throw Error(ErrorKind::BudgetExceeded, "media bytes exceed byte limit");
     }
+}
+
+// T072 (upstream 58733a86): the SOI marker is what routes JPEG to libjpeg-turbo.
+bool is_jpeg(std::span<const std::uint8_t> bytes) {
+    return bytes.size() >= 2 && bytes[0] == 0xff && bytes[1] == 0xd8;
 }
 
 int exif_orientation(std::span<const std::uint8_t> bytes) {
@@ -567,6 +574,9 @@ VideoScan scan_video(std::span<const std::uint8_t> bytes, const Policy& policy,
 ImageInfo inspect_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
     validate_input(bytes, policy);
     if (policy.checkpoint) { policy.checkpoint(); }
+    // T072 (upstream 58733a86): JPEG goes through libjpeg-turbo so the pixels match Pillow,
+    // which is what the qwen media frontends were trained against.
+    if (is_jpeg(bytes)) { return detail::inspect_jpeg(bytes, policy); }
     Decoder decoder(bytes, policy.max_decoded_pixels);
     int orientation = exif_orientation(bytes);
     if (orientation == 1) {
@@ -608,6 +618,8 @@ VideoInfo inspect_video(std::span<const std::uint8_t> bytes, const Policy& polic
 Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
     validate_input(bytes, policy);
     if (policy.checkpoint) { policy.checkpoint(); }
+    // T072 (upstream 58733a86): JPEG goes through libjpeg-turbo so the pixels match Pillow.
+    if (is_jpeg(bytes)) { return detail::decode_jpeg(bytes, policy); }
     Decoder decoder(bytes, policy.max_decoded_pixels);
     int orientation = exif_orientation(bytes);
     if (orientation == 1) {
