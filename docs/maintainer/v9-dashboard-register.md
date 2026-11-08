@@ -200,3 +200,28 @@ regressions: 0
 
 Phase 5 全部提交在 master 线性，提交标题带 upstream 哈希；按用户纪律**不建分支、不推送**。
 
+
+## T130 本地控制台接线与验收（2026-11-08）
+
+### 分工定案（③）
+- **上游 dashboard**（T126/T127 整搬）：引擎进程级观测台——`/monitor/info|snapshot|events` 快照/事件/持久历史，字段按 T009 时间/资源边界（Host 相位互斥、device_wait 不加进相位和、TTFT 首个已提交 token、缺失量不填 0）。
+- **本地控制台**（35b-moe-console.html + tools/console.cmd + tools/lmcache_console.py）：单机运维面——GPU（NVML）/LMCache 硬件遥测、控制器档位与档位对比；引擎源经同源代理接入同一批 `/monitor/*` 数据。
+- 两者**数据同源、视角不同**：不另起 collector，不重复造端点。
+
+### 工具侧（①）
+`tools/lmcache_console.py` 增 `/api/engine.json`：1 Hz 轮询引擎 `/monitor/info|snapshot|events`（同进程单订阅，无第二 collector），与既有 GPU（NVML）/LMCache 源并列；计数器按窗口差分、断线 gap 分段**不插值**；引擎不可达时 payload 明确标记"演示数据"，不静默假数。`tools/console.cmd` 增引擎基址参数（默认 http://127.0.0.1:11438）。
+
+### 前端侧（②）
+`35b-moe-console.html` 的 `sample()` 改为引擎在线取真实值（`ENGINE.everOk` 状态机）：端点缺失 → 卡片标"演示数据"；曾连上又断 → 只标 gap 并断线，**不回落到模拟值**；`demoSample()`（Math.random）仅作为明确标注的演示档位保留。未上报量留空并标"未上报"，不补 0。
+
+### 验收（④，真机 27B，serve 127.0.0.1:11438）
+| 项 | 引擎自报 | 控制台引擎源（/monitor/snapshot） | 判定 |
+|---|---|---|---|
+| prompt / TTFT | prompt_ms 277.53 | service.ttft.sum_seconds 0.27806 s | 一致（TTFT 含首 token 边界，差 0.5 ms） |
+| decode 时长 | predicted_ms 710.70 | duration.sum 988.81 − ttft 278.06 = 710.75 ms | 一致 |
+| decode 速率 | predicted_per_second 43.62 tok/s | （窗口差分口径见页面） | 一致量级 |
+| 请求计数 | 1 次 | submitted 1 / completed 1 / failed 0 | 一致 |
+
+**口径声明**：门禁与调优仍以引擎自报为准；控制台数字仅作观测。
+
+T131（控制面接线）保持**挂起**：解锁条件＝v8 §9–12 执行器判据接完且双门禁通过。
