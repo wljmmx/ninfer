@@ -867,7 +867,10 @@ public:
         });
     }
 
-    void publish(ninfer::OutputDelta delta) override {
+    void publish(ninfer::OutputEvent event) override {
+        const auto* published = std::get_if<ninfer::OutputDelta>(&event);
+        if (published == nullptr) { return; }
+        const ninfer::OutputDelta delta = std::move(*published);
         if (delta.text.empty()) { return; }
         deliver([&] {
             if (delta.channel == ninfer::OutputChannel::Reasoning) {

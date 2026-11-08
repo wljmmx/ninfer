@@ -179,9 +179,11 @@ public:
         timeline_.output(row_, timing.generated_tokens == kOutputTokens);
     }
 
-    void publish(ninfer::OutputDelta delta) override {
+    void publish(ninfer::OutputEvent event) override {
         require(timing_seen_, "output delta preceded its committed-token observation");
-        (delta.channel == ninfer::OutputChannel::Reasoning ? reasoning_ : content_) += delta.text;
+        const auto* delta = std::get_if<ninfer::OutputDelta>(&event);
+        if (delta == nullptr) { return; }
+        (delta->channel == ninfer::OutputChannel::Reasoning ? reasoning_ : content_) += delta->text;
     }
 
     [[nodiscard]] std::uint32_t committed_tokens() const noexcept {

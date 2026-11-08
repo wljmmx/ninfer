@@ -127,7 +127,10 @@ public:
 
     void timing(ninfer::GenerationTimingObservation) override {}
 
-    void publish(ninfer::OutputDelta delta) override {
+    void publish(ninfer::OutputEvent event) override {
+        const auto* published = std::get_if<ninfer::OutputDelta>(&event);
+        if (published == nullptr) { return; }
+        const ninfer::OutputDelta delta = std::move(*published);
         std::ostream& output =
             delta.channel == ninfer::OutputChannel::Reasoning ? std::cerr : std::cout;
         output << delta.text;

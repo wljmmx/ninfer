@@ -13,6 +13,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace ninfer {
@@ -444,10 +445,17 @@ struct ToolCall {
     std::string arguments_json;
 };
 
-// Model-origin structured output. Protocol adapters own any wire-level call identifier.
+enum class ToolCallStatus : std::uint8_t { InProgress, Complete, Incomplete };
+
+// Model-origin structured output. Incomplete arguments are an unmodified JSON prefix, not an
+// executable call. Protocol adapters own wire identifiers and their incomplete-result projection.
 struct GeneratedToolCall {
     std::string name;
     std::string arguments_json;
+    ToolCallStatus status = ToolCallStatus::Complete;
+
+    [[nodiscard]] friend constexpr bool
+    operator==(const GeneratedToolCall&, const GeneratedToolCall&) noexcept = default;
 };
 
 // Diagnostics for model-origin tool-call markup. Free generation uses schema-guided value
@@ -639,6 +647,7 @@ struct PromptInput {
 
 enum class RequestErrorKind : std::uint8_t {
     InvalidToolConstraint,
+    InvalidToolOutput,
     InvalidGrammar,
     InvalidChoice,
     InvalidRegex,
@@ -731,8 +740,29 @@ struct OutputDelta {
     std::string text;
 };
 
+struct ToolCallStart {
+    std::uint32_t index = 0;
+    std::string name;
+};
+
+struct ToolArgumentsDelta {
+    std::uint32_t index = 0;
+    std::string text;
+    // A complete parameter value has been decoded. Protocols requesting buffered parameters can
+    // flush here without parsing or interpreting the model's private framing themselves.
+    bool parameter_complete = false;
+};
+
+struct ToolCallEnd {
+    std::uint32_t index   = 0;
+    ToolCallStatus status = ToolCallStatus::Complete;
+};
+
+// Committed output is an ordered stream: text/reasoning deltas and tool-call lifecycle events.
+using OutputEvent = std::variant<OutputDelta, ToolCallStart, ToolArgumentsDelta, ToolCallEnd>;
+
 // Exact prompt accounting selected at admission. Streaming consumers receive this once before any
-// OutputDelta, after the prefix choice and materialization reservation are committed and before
+// OutputEvent, after the prefix choice and materialization reservation are committed and before
 // transfer/prefill execution.
 struct GenerationStart {
     PromptSummary prompt;
@@ -751,7 +781,7 @@ struct PromptProgress {
 
 // Cumulative timing snapshot at one stable output-commit boundary. Generated tokens count model
 // and Engine-injected tokens accepted into the sequence, independently of whether the Frontend has
-// enough visible bytes to publish an OutputDelta for that boundary.
+// enough visible bytes to publish an OutputEvent for that boundary.
 struct GenerationTimingObservation {
     std::uint32_t generated_tokens      = 0;
     std::uint64_t prompt_elapsed_ns     = 0;
@@ -764,7 +794,9 @@ public:
     virtual void start(GenerationStart start)               = 0;
     virtual void progress(PromptProgress progress)          = 0;
     virtual void timing(GenerationTimingObservation timing) = 0;
-    virtual void publish(OutputDelta delta)                 = 0;
+    virtual void publish(OutputEvent event)                 = 0;
+    // Convenience for text-only producers and consumers; every event still travels as OutputEvent.
+    void publish(OutputDelta delta) { publish(OutputEvent(std::move(delta))); }
 };
 
 enum class OutputConsumerMode : std::uint8_t {
