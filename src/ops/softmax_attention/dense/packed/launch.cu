@@ -9,26 +9,38 @@
 namespace ninfer::ops::detail {
 namespace {
 
+// The packed tile ladder: 64 query rows per CTA, 64 keys per step (the same constants the
+// former local kernel carried; the shared noncausal kernel takes them as template arguments).
+inline constexpr int kPackedAttentionBr = 64;
+inline constexpr int kPackedAttentionBc = 64;
+
 std::int64_t stride_elements(const Tensor& tensor, int dim) {
     return tensor.nb[dim] / static_cast<std::int64_t>(sizeof(__nv_bfloat16));
 }
 
+// T088 (upstream 6eb6056b): the noncausal kernel is head-dimension parameterized. The
+// packed path keeps its existing Br/Bc tile ladder and forwards to the shared launcher
+// with PaddedD = 128 and the caller's D (72 for the text heads, 64 for the vision heads).
+template <int Br, int Bc, int D = 72>
+void launch_flash_tuned(const Tensor& q, const Tensor& k, const Tensor& v,
+                        const PackedAttentionTile* tiles, std::int32_t uniform_segment_length,
+                        std::int32_t query_tiles, Tensor& out, cudaStream_t stream) {
+    ::ninfer::ops::detail::launch_flash<Br, Bc, 128, 128 / Br, D>(
+        q, k, v, tiles, uniform_segment_length, query_tiles, out, stream);
+}
+
+// Dispatches the tile ladder with the head dimension the caller resolved.
 template <int Br, int Bc>
-void launch_flash(const Tensor& q, const Tensor& k, const Tensor& v,
-                  const PackedAttentionTile* tiles, std::int32_t uniform_segment_length,
-                  std::int32_t query_tiles, Tensor& out, cudaStream_t stream) {
-    constexpr int kThreads = Br * 2;
-    constexpr int kSmemBytes =
-        (Br + 2 * Bc) * kPackedAttentionPaddedD * static_cast<int>(sizeof(__nv_bfloat16));
-    const dim3 grid(static_cast<unsigned>(query_tiles),
-                    static_cast<unsigned>(kPackedAttentionHeads), 1u);
-    packed_attention_flash_kernel<Br, Bc><<<grid, kThreads, kSmemBytes, stream>>>(
-        static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
-        static_cast<const __nv_bfloat16*>(v.data), tiles, q.ne[2], uniform_segment_length,
-        static_cast<__nv_bfloat16*>(out.data), stride_elements(q, 0), stride_elements(q, 1),
-        stride_elements(q, 2), stride_elements(k, 0), stride_elements(k, 1), stride_elements(k, 2),
-        stride_elements(v, 0), stride_elements(v, 1), stride_elements(v, 2));
-    CUDA_CHECK(cudaGetLastError());
+void launch_flash_for_dim(const Tensor& q, const Tensor& k, const Tensor& v,
+                          const PackedAttentionTile* tiles, std::int32_t uniform_segment_length,
+                          std::int32_t query_tiles, Tensor& out, cudaStream_t stream) {
+    if (q.ne[0] == 64) {
+        launch_flash_tuned<Br, Bc, 64>(q, k, v, tiles, uniform_segment_length, query_tiles, out,
+                                       stream);
+    } else {
+        launch_flash_tuned<Br, Bc, 72>(q, k, v, tiles, uniform_segment_length, query_tiles, out,
+                                       stream);
+    }
 }
 
 } // namespace
@@ -40,13 +52,13 @@ void packed_attention_launch(const Tensor& q, const Tensor& k, const Tensor& v,
     const int max_tiles =
         packed_segments ? tiles->ne[1] : (q.ne[2] + kPackedAttentionBr - 1) / kPackedAttentionBr;
     if (packed_segments) {
-        packed_attention_prepare_tiles_kernel<<<1, 256, 0, stream>>>(
+        packed_attention_prepare_tiles_kernel<1><<<1, 256, 0, stream>>>(
             static_cast<const std::int32_t*>(cu_seqlens.data), cu_seqlens.ne[0] - 1,
             static_cast<PackedAttentionTile*>(tiles->data), max_tiles, q.ne[2]);
         CUDA_CHECK(cudaGetLastError());
     }
 
-    launch_flash<kPackedAttentionBr, kPackedAttentionBc>(
+    launch_flash_for_dim<kPackedAttentionBr, kPackedAttentionBc>(
         q, k, v, packed_segments ? static_cast<const PackedAttentionTile*>(tiles->data) : nullptr,
         0, max_tiles, out, stream);
 }
@@ -79,13 +91,13 @@ void packed_attention_uniform_launch_with_tile(const Tensor& q, const Tensor& k,
     const std::int32_t query_tiles = segments * ((segment_length + tile_size - 1) / tile_size);
     switch (tile_size) {
     case 16:
-        launch_flash<16, 16>(q, k, v, nullptr, segment_length, query_tiles, out, stream);
+        launch_flash_for_dim<16, 16>(q, k, v, nullptr, segment_length, query_tiles, out, stream);
         return;
     case 32:
-        launch_flash<32, 32>(q, k, v, nullptr, segment_length, query_tiles, out, stream);
+        launch_flash_for_dim<32, 32>(q, k, v, nullptr, segment_length, query_tiles, out, stream);
         return;
     case 64:
-        launch_flash<64, 64>(q, k, v, nullptr, segment_length, query_tiles, out, stream);
+        launch_flash_for_dim<64, 64>(q, k, v, nullptr, segment_length, query_tiles, out, stream);
         return;
     default:
         throw std::invalid_argument("packed_softmax_attention: invalid uniform tile size");

@@ -6,6 +6,7 @@
 int run_softmax_attention_causal_cache_tests(std::optional<ninfer::KvCacheStorage> storage);
 int run_softmax_attention_plain_and_packed_tests();
 int run_softmax_attention_context_tests();
+int run_softmax_attention_noncausal64_tests();
 
 int main(int argc, char** argv) {
     // The score probe reads this once, at first launch. With the exact comparison (0) a random tile
@@ -43,7 +44,10 @@ int main(int argc, char** argv) {
     const int context = run_softmax_attention_context_tests();
     if (context == 77) return 77;
 
-    const int failures = causal + plain_and_packed + context;
+    const int noncausal64 = run_softmax_attention_noncausal64_tests();
+    if (noncausal64 == 77) return 77;
+
+    const int failures = causal + plain_and_packed + context + noncausal64;
     std::cout << (failures == 0 ? "softmax_attention: PASS\n" : "softmax_attention: FAIL\n");
     return failures == 0 ? 0 : 1;
 }
