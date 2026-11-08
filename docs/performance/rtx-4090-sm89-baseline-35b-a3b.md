@@ -46,14 +46,88 @@ Three properties of this matrix are load-bearing:
    measured 374–632 tok/s at 2k/4k prefill with a **3.3× per-repetition spread**
    (pp4096: 3.78 s … 12.35 s). Pinned at 19,456 MiB the spread collapses under 5% and the table
    above is what the hardware does. Deployment profiles that need a larger KV pool trade this
-   prefill away — state the pool with any number quoted from this page.
-2. **DFlash costs prefill and pays back at decode.** The draft model runs its own pass over the
-   prompt: 2,225 vs 11,499 tok/s at the same 2k prompt, while decode at 88% acceptance is
-   522–547 tok/s against 236–249 without speculation. Prefill-bound workloads should leave the
-   draft off; decode-bound ones should not.
+   prefill away — state the pool with any number quoted from this page. Note that the DFlash rows
+   are **not** at 19,456 MiB: DFlash reserves 431 MiB of KV against 177 MiB without it, and the pin
+   gives way to 18,685 MiB, which is what puts 423 experts on the host tier (§1b).
+2. **DFlash's own prefill pass is ~1% of a chunk; the 4.6× in the table is residency, not the
+   draft.** Measured with `NINFER_DFLASH_TIMING=1`, the whole draft append for a 1,024-token chunk
+   (feature projection + six K/V context projections + key RMSNorm + RoPE + draft KV append) costs
+   **1.14 ms / 0.99 ms** against a target chunk of 88–93 ms (§1b). The 2,225 tok/s row above was
+   taken with the pool at 18,685 MiB, where 423 of the 10,240 experts sit on the host tier — and
+   that same pool measures 1,731.6 tok/s with the draft switched **off**. The draft pays back at
+   decode (522–547 tok/s at 88% acceptance against 236–249 without speculation), and it is the
+   decode side that justifies it.
 3. **The cold-corpus DFlash4 point is weak by design.** Bench corpus continuation is close to
    unpredictable, so acceptance is 18% (len 1.72) and decode lands at the no-spec level. It is
    reported to keep the speculation table honest, not as a recommendation.
+
+### 1b. Where a DFlash prefill chunk actually goes
+
+Two env-gated probes carry this section (`NINFER_DFLASH_TIMING`, `NINFER_PREFILL_TIMING`; both are
+off by default and cost nothing when unset). The numbers below come from this tree at `55eac7f6`
+plus the probes; they are the only delta against the shipped `R:\infer` binaries, and with both
+variables unset the two produce the same tokens (§ "Token identity" below).
+
+- `NINFER_DFLASH_TIMING=1` splits one `dflash_append_context` call into CUDA-event intervals
+  (`src/models/qwen3_5/execution/draft.cpp`, `AppendTiming`) and prints one line per call. It also
+  brackets the target-side feature copies (`src/models/qwen3_5/execution/text.cpp`,
+  `FeatureCopyTiming`) and stands down on a capturing stream, because recording a timing event
+  inside a capture invalidates it.
+- `NINFER_PREFILL_TIMING=1` prints the device time of each whole prefill chunk from the Program's
+  own timer, with no extra synchronisation, so the two can be read against each other.
+
+Segment table for the draft append (`pp2048`, INT8 KV, chunk 1024, `--spec dflash
+--draft-tokens 7 --lm-head-draft`, pool at the all-resident point):
+
+| Segment (per 1,024-token chunk) | Chunk 1 | Chunk 2 |
+|---|---:|---:|
+| feature projection `[2048→2048]`, K = 8 × 2048 (`project`) | 0.54 ms | 0.49 ms |
+| context RMSNorm | 0.01 ms | 0.01 ms |
+| 6 × context K+V projections (Q8, `ops::linear_pair`) | 0.44 ms | 0.40 ms |
+| key RMSNorm × 6 | 0.03 ms | 0.03 ms |
+| RoPE × 6 | 0.03 ms | 0.03 ms |
+| draft KV append × 6 (`kv_cache_append_prefix`) | 0.10 ms | 0.04 ms |
+| **total draft append** | **1.14 ms** | **0.99 ms** |
+| target-side feature copies (8 taps × 4 MiB) | 0.42 ms | 0.18 ms |
+| target chunk, same shape, draft **off** | 88–93 ms | 88–93 ms |
+
+So the draft pass is **1.2–1.4%** of a chunk; the feature projection is a single 34.4 G-MAC GEMM
+(0.5 ms ≈ 137 TFLOPS) and the six K/V projections are 25.8 G MAC (0.44 ms ≈ 117 TFLOPS), i.e. both
+already run at the shape's ceiling, and even a perfect kernel would return under 1 ms of an 88 ms
+chunk. There is nothing to win here.
+
+**What actually costs 4.6–6.6× is which tier the experts are on.** Same binary, same corpus,
+`-p 2048 --kv-dtype int8 --prefill-chunk 1024 -r 3 --warmup 1`:
+
+| Configuration | `pp2048` | Pool | Experts unslotted |
+|---|---:|---:|---:|
+| no speculation, `NINFER_EXPERT_CACHE_MB=19456` | **11,376.9 ± 159.5** | 19,351 MiB | 0 of 10,240 |
+| no speculation, pool pinned to the DFlash run's size | 1,731.6 ± 269.1 | 18,406 MiB | 423 of 10,240 |
+| `--spec dflash` (auto split) | **1,849.0 ± 160.5** | 18,406 MiB | 423 of 10,240 |
+
+The last two rows differ only by the draft, and they differ by 7% inside a ±16% spread. DFlash adds
+528 MiB of draft weights and 254 MiB of draft local KV. The no-spec plan already sat 151 MiB above
+the 19,200 MiB all-resident point, so the draft pushes the pool off it: 423 experts go to the host
+tier and every layer that routes to one takes the split path for that chunk. That is the entire
+"DFlash costs prefill" effect on this card.
+
+Forcing the pool back to 19,200 MiB by spending the startup planning allowance does **not** recover
+it, and the attempt is recorded here because it is the obvious next idea: the pool plus KV then
+needs 19,631 MiB, `nvidia-smi` reports 23,764 MiB of 24,564 used with the SM at 21% utilisation,
+and the identical command measures anywhere from 40 to 2,910 tok/s (`pp1024` came in at 890 ms and at
+14,500 ms per chunk on two runs). On a 24 GB card the model, the draft weights, the draft KV and the
+all-resident expert set do not fit at 2k context at the same time; the draft KV is BFloat16 over the
+4,096-token sliding window and is the only one of the four that a future change could shrink.
+
+**Token identity.** The probes record events and nothing else: a 64-token greedy run of the same
+prompt with `NINFER_DFLASH_TIMING` unset and set produced byte-identical text
+(`SHA-256 2EED0A1D6B3D…`), and this tree's binaries produce byte-identical text to the shipped
+`R:\infer` binaries on both the draft-on and draft-off arms. One property is *not* covered by that
+check and predates this pass: on this artifact a greedy DFlash run and a greedy no-speculation run
+diverge at the **first** token (`秋风轻…` vs `秋风悄…`), in the shipped release binary as well. The
+first token is the prefill bonus sample, so the draft path changes what the prefill publishes; it is
+a verification/bonus-token question that needs its own investigation and is not a prefill-speed
+matter.
 
 The `pp32768+tg128` row is **not measured** in this pass. The full-residency pool leaves enough
 KV for rk4v4-e8 at 32k, but the long prefill exceeded this pass's wall-clock budget (the run was
@@ -97,22 +171,31 @@ should be quoted only after that procedure is run on this artifact.
 
 - Machine: single RTX 4090 24 GB, Windows 11, desktop sharing the card. Report the granted
   budget with any ceiling; the engine prints `capacity | KV ... | runtime ... | free ...`.
-- Pool: `NINFER_EXPERT_CACHE_MB=19456` for every row in §1 (full residency). §2 runs with the
-  default curve pool because perplexity is a single-pass deterministic measurement; the pool
-  size still selects how much of each layer runs on the CPU half, so quote it with the table.
-- Repetitions: `-r 5 --warmup 1` for every row (the 32k row would have used `-r 3`).
+- Pool: `NINFER_EXPERT_CACHE_MB=19456` for every row in §1 (full residency) — except the DFlash
+  rows, where the same pin resolves to 18,685 MiB because DFlash's KV reservation is larger; the
+  resolution is printed as `[budget][split] ... pool=<MiB>` and `[budget] experts: ... unslotted=N
+  of 10,240`. §2 runs with the default curve pool because perplexity is a single-pass
+  deterministic measurement; the pool size still selects how much of each layer runs on the CPU
+  half, so quote it with the table.
+- Repetitions: `-r 5 --warmup 1` for every row (the 32k row would have used `-r 3`). The §1b
+  residency A/B is `-r 3 --warmup 1`.
 - `ninfer_bench` writes a JSON report (`-o json --output-file ...`) with per-repetition timings;
   the means in §1 come from those reports, and the table does not hide the spread — see the
   pinned-versus-curved note above.
 - Chunking: `--prefill-chunk 1024` throughout; KV layouts are stated per row.
+- Timing probes: `NINFER_DFLASH_TIMING=1` and `NINFER_PREFILL_TIMING=1` (§1b) are diagnostic only.
+  Both add synchronisation and must never be left on for a throughput number; every number in §1
+  and §2 was taken with them unset.
 
 ## 4. How to use this as a baseline
 
 1. Pin the pool before comparing anything: the same binary moves 5× at 2k prefill between the
-   curved and the pinned pool.
+   curved and the pinned pool. Print `unslotted=` with the number — 423 missing experts and 0
+   missing experts are different products at the same nominal pool.
 2. Compare decode at the same speculation setting and the same acceptance; DFlash and no-spec
    are different products, not a faster/slower switch.
-3. Compare prefill at the same context and residency; the DFlash draft pass is part of prefill
-   whenever the draft is on.
+3. Compare prefill at the same context, **the same pool and the same `unslotted=` count**: the
+   draft's own pass is 1.2–1.4% of a chunk (§1b), so a prefill gap between DFlash and no-spec that
+   is larger than that is residency, not the draft.
 4. For KV layouts, compare PPL at the same `context`/`stride` and the same pool, and report the
    `vs int8` delta rather than the absolute level.

@@ -39,6 +39,34 @@ ninfer_bench ... -n 128        --kv-dtype int8
 Decoder acceptance is engine-reported (`speculative.acceptance_rate` / `acceptance_length`).
 MTP7 ran at 100% acceptance with a licensed length of 8.00 on the deep-context case.
 
+### 1b. DFlash2 draft: prefill cost and decode gain
+
+This artifact (`qwen3_8_27b_v3.ninfer`) ships the DFlash2 companion weights and no DFlash; the
+35B-A3B artifact ships DFlash and no DFlash2. Same machine, same corpus, `-r 3 --warmup 1`,
+`--prefill-chunk 1024`, `--draft-tokens 7 --lm-head-draft`:
+
+| Case | prefill tok/s | decode tok/s | acceptance | rounds / fallbacks |
+|---|---:|---:|---:|---:|
+| `pp2048` — no speculation | **3,248.5 ± 6.6** | — | — | — |
+| `pp2048` — `--spec dflash2` | **3,205.3 ± 8.0** (−1.3%) | — | — | — |
+| `pp2048+tg128` — no speculation, INT8 KV | 3,249.4 ± 7.6 | **45.1 ± 0.1** | — | — |
+| `pp2048+tg128` — DFlash2, INT8 KV | 3,212.6 ± 0.5 | **258.0 ± 0.3** (5.72×) | 88.0% (len 7.11) | 54 / 0 |
+| `pp2048+tg128` — DFlash2, rk4v4-e8 | 3,187.2 ± 42.7 | **255.5 ± 0.1** (5.66×) | 88.0% (len 7.11) | 54 / 0 |
+
+DFlash2's prefill tax is **1.3%** (74 tok/s of 3,248) against a **5.7×** decode gain, and it is two
+orders of magnitude smaller than the 4.6× the 35B page used to attribute to its draft: that model
+carries an MoE expert pool, and on a 24 GB card the draft's 782 MiB of weights and KV is what
+pushes the pool off its all-resident point
+([35B page §1b](rtx-4090-sm89-baseline-35b-a3b.md#1b-where-a-dflash-prefill-chunk-actually-goes)).
+The dense 27B has no pool to lose, which is why the same draft costs 1.3% here.
+
+`NINFER_DFLASH_TIMING=1` on this artifact splits that 1.3% for a 1,024-token chunk: feature
+projection `[5120→5120]` with K = 5 × 5120 **1.87 ms / 1.84 ms**, `context_kv_materialize` (all six
+draft layers' context K/V plus key RMSNorm and RoPE in one fused launch) **1.71 ms / 1.65 ms**, and
+the norm step 0.01 ms — **3.60 / 3.51 ms per chunk**, against a chunk of ~320 ms. The target-side
+feature copies (5 taps) are 0.02 ms, because DFlash2 reuses the same `cudaMemcpy2DAsync` capture and
+the buffers are pitch-compatible at this chunk size.
+
 This table was re-measured with the release binaries. The previous pass (build `96b18187`,
 2026-10-08) reported 2,386 / 2,664 / 2,626 prefill, 221.9 and 206.8 decode on the MTP7 rows and
 87.0 / 48.7 on the cold rows; it predates the 2026-11-04 score-plane route unification and must

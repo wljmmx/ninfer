@@ -241,8 +241,11 @@ Measured with the shipped release binaries (`R:\infer\ninfer_bench.exe`) and the
 artifacts on a single 24 GB RTX 4090, Windows 11, desktop sharing the card. Qwen3.8-27B runs
 MTP7/MTP4; Qwen3.6-35B-A3B runs its DFlash draft model. The MoE rows pin the expert pool at
 19,456 MiB (full residency): the auto-curved pool leaves experts on the CPU, and the measured
-per-repetition spread reaches 3.3× there. The 35B column also carries no-speculation 8,192-token
-points so prefill and decode can be compared with and without the draft pass.
+per-repetition spread reaches 3.3× there. The pin is not reachable for the DFlash rows — DFlash
+reserves 431 MiB of KV against 177 MiB without it, so the same pin resolves to 18,685 MiB and 423
+of 10,240 experts stay on the host tier; the paragraph under the table separates that effect from
+the draft's own cost. The 35B column also carries no-speculation 8,192-token points so prefill and
+decode can be compared with and without the draft pass.
 
 | `ninfer_bench` case | Qwen3.8-27B | Qwen3.6-35B-A3B |
 |---|---:|---:|
@@ -261,11 +264,20 @@ points so prefill and decode can be compared with and without the draft pass.
 prefill exceeded this pass's budget) or the streaming profile that is still being tuned; it is
 reported as unmeasured rather than estimated. The dense 27B row is the long-context reference.
 
-Two properties of the 35B column are worth stating plainly: DFlash costs prefill (2,225 vs
-11,499 tok/s at the same 2k prompt — the draft model runs its own pass over the prompt) and pays
-it back at decode (522–547 tok/s at 88% acceptance versus 236–249 without speculation). And MoE
-prefill scales with residency: the same binary with the auto-curved pool measured 374–632 tok/s
-at 2k/4k because part of every layer ran on the CPU half.
+Two properties of the 35B column are worth stating plainly. **DFlash's own prefill pass is cheap, and
+the 4.6× against the no-spec row is residency, not the draft.** The draft append — feature
+projection, six context K/V projections, key RMSNorm, RoPE and the draft KV append — measures
+1.14 ms and 0.99 ms per 1,024-token chunk against a target chunk of 88–93 ms, i.e. 1.2–1.4%; the
+target-side feature copies add 0.2–0.4 ms. What costs the 4.6× is that DFlash reserves 528 MiB of
+draft weights and 254 MiB of draft KV, and on a 24 GB card those 782 MiB are more than the 151 MiB
+the no-spec plan had left above the 19,200 MiB all-resident expert set: 423 of 10,240 experts fall
+to the host tier and every layer that routes to one takes the split path for that chunk. Measured
+at the *same* pool (18,406 MiB, 423 unslotted), no speculation gives 1,731.6 tok/s and DFlash gives
+1,849.0 — the draft is inside the noise, and the 2,225 tok/s row in the table is that same pool
+regime. DFlash still pays back at decode (522–547 tok/s at 88% acceptance versus 236–249 without
+speculation), and it is the decode side that justifies it. And MoE prefill scales with residency:
+the same binary with the auto-curved pool measured 374–632 tok/s at 2k/4k because part of every
+layer ran on the CPU half.
 
 Full records, command lines, per-layout precision tables and the context-ceiling procedure:
 [Qwen3.8-27B baseline](docs/performance/rtx-4090-sm89-baseline.md) ·
