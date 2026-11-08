@@ -65,6 +65,12 @@ Phase 8 收尾完成（T212 版本/接口/推送核对、T213 全量终验汇总
 - `R:\infer`：`ninfer.exe` / `ninfer-serve.exe` / `ninfer-perplexity.exe` / `ninfer_bench.exe` / `diag-moe.exe` / `diag-cpu-partial.exe` + 10 个 DLL + `docs/` + `templates/` + `symbols/` + `examples.toml` + `scripts/`（3 个启动档）+ `VERSION` + `RELEASE.md` + `SHA256SUMS.txt`。
 - `R:\model\<name>\<name>.ninfer`：5 个工件，逐个 SHA256 双向校验后删除 `D:\ninfer-rtx4090\models` 源文件；迁移清单 `R:\model\MIGRATION.txt`。
 
+### 推送与对齐状态
+
+- `git push origin master`：`12b3716e..2d8566c8`，108 笔提交推送成功；**pre-push 钩子自动跑了 `regress.py --tier fast`，结果是 `regressions: 0 / gates: PPL ok / dump ok`**（即本地 pre-push 门禁通过后才允许推送）。
+- 发布版本号：`v1.0.0-rtx4090-638-g2d8566c8`（写入 `R:\infer\VERSION`）。
+- 发布冒烟（发布目录自身二进制，`R:\infer\SMOKE.txt`）：`/health` 200；`/control/state` mode=auto banks=40；`POST /control/mode stable` 200 seq=1；非法模式 400（带原因）；`/v1/chat/completions` 200，8 token，87.83 tok/s，TTFT 223.68 ms。另验证 `R:\infer\ninfer.exe --help` 在 `C:\` 下可运行（DLL 随目录解析，发布目录自包含）。
+
 ### 上游对齐（详见 `upstream-alignment.md`）
 
 - 已吸收基线：`a754fcf3`（305 提交，v9）。
