@@ -262,4 +262,13 @@ Phase 5 全部提交在 master 线性，提交标题带 upstream 哈希；按用
 | 控制台代理 | `POST /api/control/mode` 200 并回显；`/api/engine.json` 的 `info.controller` 同步；页面点“稳定优先”→ 引擎 `seq=6 mode=stable` |
 | 生成回归 | 同机 `/v1/chat/completions` 正常（41.8 tok/s，6 token，reasoning 通道） |
 
+### 门禁复跑（2026-11-08，HEAD 84318d1f）
+
+| 门禁 | 基线 | 实测 | 判定 |
+|---|---|---|---|
+| 35B default 930 MiB PPL | 4801 / 2.051275 / 7.777808 | 4801 / 2.051275 / 7.777808 | 逐位不变 |
+| 35B 冻结 12 GiB PPL | 4801 / 2.049253 / 7.762104 | 4801 / 2.049253 / 7.762104 | 逐位不变 |
+
+控制面只在显式写入时改变 PolicyController::mode 与各 bank 的 FreezePolicy（启动默认由 bus 原样保留），因此两条 PPL 门禁不受影响。留档：.temp\t131-gate-20261108\。
+
 留档：`H:\TeleAgentWorks\.temp\t131-build*.log`、`background-registry-20261108-194943-36580-ca2e7645.*.log`。
