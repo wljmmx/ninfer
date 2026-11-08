@@ -1067,6 +1067,34 @@ The dashboard's collector is a separate Node process; it polls `/monitor/snapsho
 `sampling_interval_ms`, stores fine samples and minute aggregates, and reads `/monitor/events` for
 its event list. See `dashboard/README.md`.
 
+## Controller control plane
+
+`--controller-mode` and `NINFER_CONTROLLER_MODE` are the *initial* mode only. While the server
+runs, the three deployment modes (auto / stable / performance) and the expert freeze policy are
+owned by the engine and changed through these endpoints. They follow the same API-key
+authentication as every other route; with no key configured they are open on the bound address,
+so bind a non-loopback address only behind your own access control.
+
+| Path | Body | Effect |
+|---|---|---|
+| `GET /control/state` | — | The worker's in-force state: `mode`, `mode_live`, `sequence`, `detail`, and `freeze` (`after`, `reselect_after`, `thaw_on_request`, `armed`, `frozen`, `banks`) |
+| `POST /control/mode` | `{"mode":"auto"\|"stable"\|"performance"}` (or `?mode=`) | Sets the controller mode and that mode's freeze bundle: auto/stable keep the configured freeze criterion, performance disables the freeze placement (`freeze_after=0`). `400` on any other name |
+| `POST /control/freeze` | `{"freeze_after":N,"reselect_after":M,"thaw_on_request":bool}`; omitted fields keep their current value | Writes the expert freeze policy to every routed bank. `400` outside `0..32` / `0..256` |
+
+```bash
+curl -s http://127.0.0.1:8080/control/state | jq .controller
+curl -s -X POST -H 'Content-Type: application/json' \
+     -d '{"mode":"stable"}' http://127.0.0.1:8080/control/mode
+```
+
+The write is park-and-apply: the request is handed to the engine worker - the only thread that
+may touch the controller or an expert stream - and the response carries what the worker actually
+holds. `200` means it landed; `202` (with `detail` starting `queued`) means the engine was
+mid-round and will apply it at its next scheduling point. `detail` also states when a policy is
+stored but cannot act (`dense model: no routed expert banks`, or
+`no freeze mechanism armed` - the policy then applies to the next freeze the deployment takes).
+`/monitor/info` publishes the same `controller` object for read-only consumers.
+
 ## Structured request log
 
 `--request-log-jsonl FILE` enables the machine-readable measurement log. The server opens `FILE`

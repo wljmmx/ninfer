@@ -224,4 +224,42 @@ Phase 5 全部提交在 master 线性，提交标题带 upstream 哈希；按用
 
 **口径声明**：门禁与调优仍以引擎自报为准；控制台数字仅作观测。
 
-T131（控制面接线）保持**挂起**：解锁条件＝v8 §9–12 执行器判据接完且双门禁通过。
+## T131 控制面接线（2026-11-08，解锁并完成）
+
+解锁条件「v8 §9–12 执行器判据接完」成立（P2/P3/P4 已把控制器判据、KV 分区分支与 harness 落地），
+本轮把控制台的档位开关接成真正的控制面，判据仍全部归引擎：
+
+### 引擎侧
+- `Engine::apply_controller_mode(mode)` / `Engine::apply_expert_freeze_policy(policy)` /
+  `Engine::controller_control_state()`（`include/ninfer/engine.h`）。
+- `EngineCore` 沿用慢调（slow dial）的握手：HTTP 线程**park** 一个请求 → 唤醒 worker 自己的调度点 →
+  worker 在轮次之间应用（`apply_pending_control`），`control_state_` 经同一把锁发布，调用方最多等 1 s，
+  超时按 `queued` 返回——不回报没落地的值。
+- 三档模式是**运行时**归属（v8 12.1：env/CLI 只是初值）：worker 同时更新 `PolicyController::mode` 与
+  进程级 `controller_mode_cell`（新增 `set_controller_mode_runtime`），所以 `[ctl]`/`[bus]` 面板不会出现
+  两个模式值。
+- 模式的冻结语义集中在一处（`src/models/qwen3_5/execution/control_plane.h`）：auto/stable 保留配置的冻结
+  判据（`freeze_after` 取启动初值），performance 关闭冻结放置（`freeze_after=0`）。冻结策略经
+  `ModelInstance::set_expert_freeze_policy` 写到**每个**路由 bank；`banks` 字段如实报告 bank 数（0=稠密）。
+- 未启用任何冻结机制时状态行明确写 `no freeze mechanism armed: policy stored for the next freeze`，
+  不假装已冻结。
+
+### HTTP / 前端侧
+- 新端点 `GET /control/state`、`POST /control/mode`、`POST /control/freeze`（同 API key 鉴权；
+  `400` 拒绝 typo/越界，`202` 表示已 park 待应用）。`/monitor/info` 增 `controller` 块（同一 JSON 形状）。
+- `tools/lmcache_console.py` 增 `POST /api/control/mode|freeze` 同源代理与 `--engine-key`；
+  `35b-moe-console.html` 的档位按钮改为真实下发并回显引擎自报状态（`p-mode`/`p-freeze`/`w-mode` 不再写
+  "未发布"），并修掉在线视图 `series` 未初始化导致的两处 JS 异常。
+
+### 验收（真机，serve 127.0.0.1:11438）
+| 场景 | 结果 |
+|---|---|
+| 27B 稠密初始状态 | `mode=auto live=false seq=0 freeze.banks=0`（如实） |
+| `POST /control/mode stable→performance→auto` | 均 200，`seq` 递增，引擎日志 `[ctl] mode: ... (control plane)` |
+| `POST /control/freeze {after:8,reselect:2,thaw:true}` | 200，状态回读一致；`after=0` 时 detail 标 `freeze disabled` |
+| typo / 越界 / 空 body | 400 + 引擎侧原因（`controller mode must be auto\\|stable\\|performance`、`freeze_after must be in [0,32]`） |
+| 35B MoE（banks=40） | `stable` 下发后日志 `[ctl] freeze policy: freeze_after=4 ... banks=40`；`performance` 下发 `freeze_after=0 ... banks=40` |
+| 控制台代理 | `POST /api/control/mode` 200 并回显；`/api/engine.json` 的 `info.controller` 同步；页面点“稳定优先”→ 引擎 `seq=6 mode=stable` |
+| 生成回归 | 同机 `/v1/chat/completions` 正常（41.8 tok/s，6 token，reasoning 通道） |
+
+留档：`H:\TeleAgentWorks\.temp\t131-build*.log`、`background-registry-20261108-194943-36580-ca2e7645.*.log`。

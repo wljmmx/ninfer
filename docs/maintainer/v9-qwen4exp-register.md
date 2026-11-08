@@ -82,3 +82,28 @@
 
 ### 仍缺的本地功能（需工件）
 - 模型主体：text/vision/mtp 执行、程序、参数映射、HF→ninfer 工件注册（T192–T198）——依赖 qwen4exp 工件；PLE 磁盘层（src/models/qwen4_exp/ple/）与 QSA/GDN 算子已就位，工件到位即可接。
+
+## 新增：GGUF 直转（2026-11-08，只发布 GGUF 时的转换能力）
+
+用户要求：qwen4exp 若只有 GGUF，也要能转成 `.ninfer`。已落地一条可运行的转换链路，而不是继续登记“待工件”。
+
+### 实现
+- `tools/convert/sources/gguf.py`（新，numpy-only）：GGUF v2/v3 容器 + 元数据（全部值类型）+ 有界分块读取；反量化覆盖 F32/F16/BF16/F64、I8/I16/I32/I64、Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 与 K 系 Q2_K/Q3_K/Q4_K/Q5_K/Q6_K（llama.cpp gguf-py 反量化的移植，MIT）。未支持类型按名拒绝，不猜。
+- `tools/convert/gguf_qwen4exp.py`（新）：把 GGUF 以转换器已有的 duck-typed source 形式暴露（config/root/weight_map/describe/read_flat），因此 `tools/convert/qwen4_exp.py` 的轴映射与量化路径原样复用。三件必须做对的事：
+  1. 命名：`blk.N.*` → HF 逻辑名，取自 llama.cpp QWEN4EXP 张量表（conversion/qwen4exp.py + gguf-py TensorNameMap）的逆映射；
+  2. 合并张量拆回：expert `ffn_gate_up_exps`（或 gate/up 二分）、indexer `q_proj|k_proj` → `index_qk_proj`、linear-attn `attn_qkv_gate` → `in_proj_qkv|in_proj_z`、`ssm_beta/alpha`、`hc_*_down_inject` → down|inject；
+  3. V 头顺序：llama.cpp 对线性注意力按 tiled 存 V 头（`_LinearAttentionVReorderBase`），转换时做逆置换回 grouped；`nk == nv` 时恒等。
+- 配置重建：GGUF 元数据（`qwen4exp.block_count/embedding_length/attention.*/expert_*/ssm.*/hyper_connection.*/attention.indexer.*/ple.*/attention.compress_ratios/rope.freq_base`）合成 HF `config.json` 形状；GGUF 不携带的字段（`rope_parameters` 细节、`indexer_compress_ratio`、vision/mtp 子树）由 `--gguf-config` 侧车 config.json 覆盖。PLE 哈希常量是 GGUF **元数据** u64 数组（不是张量），按 int64 精确写入工件。
+- CLI：`--model X.gguf`、`--gguf-config`、`--gguf-root`；按 `architectures` 分派 qwen3_5 / qwen4_exp 构建器；`.gguf` 只允许 `--components text`（vision 在 mmproj、MTP 有独立转换，明确拒绝而非产出残缺工件）。
+- 新增 recipe `qwen4_exp`（Q4 路由专家/注意力 V 头投影、Q5 投影、Q8 词表）。
+- 顺带修复（Windows 可用性，均为真实缺陷）：
+  - `tools/artifact/win_compat.py` 的 dup 句柄在 `os.close` 后不释放 → 工件发布时硬链接/删除报 WinError 32（转换在最后一步必失败）；现随 fd 关闭一并关闭；新增 `file_io.pread` 可移植实现，`safetensors.py` 不再直接调 POSIX-only `os.pread`。
+  - `tools/convert/model.py` 补 `proposal_domain`、`proposal.py` 按其分派（上游 qwen4exp 构建器需要）。
+  - `qwen_resources.load_qwen_resources` 调用参数与本地 `load_resources` 不匹配（移植后从未跑过）→ 已修。
+  - `tools/chat_templates/qwen3_8_flash_next.jinja` 缺失（qwen4_exp 构建器引用）→ 从上游取回。
+  - `tools/convert/__main__.py` 的 `file.py:func` 解析会把 Windows 盘符当函数名 → 仅在后缀为标识符时切分。
+
+### 验证
+- `tests/convert/test_gguf_qwen4exp.py`（新，4 项全过）：容器/反量化对拍 gguf-py 自身（随机块覆盖 Q2_K/Q4_K/Q5_K/Q6_K/Q8_0/Q4_0/F16，含有界读）；名称/形状映射断言（conv 的 (C,1,taps)、专家 bank (E,2I,H)、indexer 融合、I64 控制量）；合并张量拆回与 V 头逆置换逐元素断言；真实转换（合成 Qwen4Exp GGUF → `--recipe qwen4_exp --device cpu` 产出 v3 工件 64 objects/59 tensors，PLE 控制量逐字节、bf16 张量逐字相等）。
+- `python -m pytest tests/convert -q`：28 passed / 1 skipped（含既有 27 项）。
+- 未验证部分（如实登记）：真实 100 GiB 级 qwen4exp 权重不存在，容量/带宽实账仍待工件；运行时装载属 T192–T198。GGUF 已量化源再转只保留该文件的近似精度（文档已写明）。

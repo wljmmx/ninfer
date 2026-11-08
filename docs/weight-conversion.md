@@ -5,7 +5,56 @@ can reuse an official conversion, change selected layers or projections, combine
 your own conversion method. The artifact contains the resulting configuration, encoded weights,
 logical bindings and frontend resources.
 
-Run the commands below from the repository root.
+Run the commands below from the repository root. The converter needs Python 3.11+ with PyTorch;
+a `.gguf` source additionally uses the reader in `tools/convert/sources/gguf.py`, which needs
+NumPy only.
+
+## Convert a GGUF source (Qwen4Exp)
+
+When only a GGUF distribution exists, the same converter reads it directly:
+
+```bash
+python -m tools.convert \
+  --model /path/to/model.gguf \
+  --recipe qwen4_exp \
+  --components text \
+  --device cuda \
+  --gguf-config /path/to/config.json \
+  --name Qwen4Exp \
+  --out models/qwen4_exp.ninfer
+```
+
+What the GGUF supplies, and what it does not:
+
+| Item | Source |
+|---|---|
+| Weights | The GGUF tensors, dequantized to float and re-quantized by the recipe. Readable types: F32, F16, BF16, F64, I8/16/32/64, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 and the K-quants Q2_K/Q3_K/Q4_K/Q5_K/Q6_K. Any other type is refused by name. |
+| Geometry | GGUF metadata (`qwen4exp.*`: block/embedding/head counts, expert sizes, `ssm.*` for the linear-attention geometry, `hyper_connection.*`, `attention.indexer.*`, `ple.*`, `attention.compress_ratios`, `rope.freq_base`). |
+| `rope_parameters`, `indexer_compress_ratio`, vision/MTP subtrees | Not in the GGUF. Pass `--gguf-config` with the checkpoint's `config.json`; the sidecar wins over the synthesized values. |
+| Tokenizer / chat template | Not in the GGUF. Put `tokenizer.json`, `tokenizer_config.json` and `generation_config.json` beside the file (or use `--resource`, and the maintained template is installed automatically). `--gguf-root` selects the directory holding them. |
+
+Scope and mapping notes:
+
+* The text component only. Vision ships as a separate mmproj GGUF and MTP has its own MTP-only
+  conversion; `--components` other than `text` is refused for a `.gguf` input.
+* GGUF uses llama.cpp's `blk.N.*` names; the inverse of llama.cpp's QWEN4EXP tensor map is
+  applied in `tools/convert/gguf_qwen4exp.py`. Tensors llama.cpp fuses for one matmul (expert
+  gate|up, the indexer q|k projection, the linear-attention qkv|z pair, beta|alpha, the
+  hyper-connection down|inject pair) are split back by row range.
+* Linear attention stores V heads in llama.cpp's *tiled* order; the converter restores the HF
+  *grouped* order (`tiled_to_grouped`) for every tensor that carries V heads.
+* The PLE hash controls (`ple.layer_multipliers`, `ple.head_offsets`, `ple.head_vocab_sizes`) are
+  GGUF metadata arrays; they are written to the artifact as exact int64 bytes.
+* The PLE table arrives as the single `per_layer_token_embd` tensor (llama.cpp merged the
+  shards), so `split_ngram_parts` must divide its row count; the value comes from the sidecar
+  config.
+* A GGUF has already lost the original float precision. Re-quantizing a Q4_K source stores the
+  GGUF's approximation, not the checkpoint's — this is a conversion of what the file contains.
+
+Verification: `tests/convert/test_gguf_qwen4exp.py` checks the container and every dequantizer
+against gguf-py's own writer/dequantizers on random blocks, asserts the Qwen4Exp name/shape
+mapping, and runs the real converter on a synthetic Qwen4Exp GGUF, comparing the artifact's PLE
+controls byte for byte and a bf16 tensor word for word.
 
 ## Upgrade an existing v2 artifact
 
@@ -55,6 +104,7 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_6_27b` | Q4/Q5 projections, Q6 vocabulary weights | None |
 | `qwen3_8_27b` | Q4/Q5 projections, Q8 vocabulary weights | None |
 | `qwen3_6_35b_a3b` | Q4 experts, Q5/Q6 expert down, Q8 shared/projection weights | None |
+| `qwen4_exp` | Qwen4Exp text: Q4 routed experts/attention V-head projections, Q5 projections, Q8 vocabulary | None |
 | `qwen3_6_27b_nvfp4` | Imported NVFP4, selected BF16 projections, Q8 vocabulary weights | `quantized` |
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
 
