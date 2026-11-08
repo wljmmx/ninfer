@@ -11,6 +11,7 @@
 | T120 | 88105a00 + a4e3f4be + 95a651aa | 不搬入（登记） | 本文件 §T120 |
 | T121 | 757194af | 搬入（判据＋MoE 用例） | `tests/ops/op_check.h`、`tests/ops/op_tester.h`、`tests/ops/test_moe_block_scaled_fp8.cpp` |
 | T122 | a08d5133 + 7ea6cb6e | 部分搬入：scratch 限定搬入；共享输出消费已成本地形态 | `src/ops/moe/operands.*`、`src/ops/moe/workspace.h`、4 个 entry |
+| T123 | a9c68b44 + ff17188e | 不搬入（登记） | 本文件 §T123 |
 
 ---
 
@@ -128,5 +129,42 @@
 
 **验证**：MoE 相关五个测试全 exit=0（`moe_block_scaled_fp8`、`moe_cpu_nvfp4`、`moe_int8_mma`、
 `sparse_moe`、`moe_weight_views`）。
+
+---
+
+## T123 token 序保持 ＋ 稀疏 FP8 route 压缩 —— 不搬入
+
+**裁决：零代码改动。** 两半各自不成立，原因不同。
+
+### a) a9c68b44 `token_ordered_groups`：本地几何下判据恒假
+
+- 上游新增 `fully_covered_groups()`（`block_scaled/h4096_i2048_e288_k8/launch.cu`）只在
+  「每个被选专家都覆盖全部 T 个 token、每专家恰好一个 job」时，把 packed 索引退化成
+  `offsets[e] + a/kTopK`（density 分支 `jobs[2]==1 && offsets[kExperts]==assignments/kTopK`；
+  非 density 分支要求 `load_range == [tokens, tokens]`）。
+- 本地几何 kTopK=10、kExperts=512（`block_scaled/launch.h`:7）：总 assignment 数是 10T，
+  判据要求「每个被选专家都有 T 行」⇒ 每个 token 必须选同一组 10 个专家。常规 top-10 路由下
+  每专家平均 10T/512 行；本地 fixture 的路由是 `route = j*(kExperts/kTopK) + 3*t`
+  （`tests/ops/test_moe_block_scaled_fp8.cpp`:185），逐 token 不同，判据恒假。
+  搬进去只是一个永不进入的分支。
+- 上游只把该开关写进 `routed_swiglu/cuda/{fp8,nvfp4}/dgx_spark/shapes/h4096_i2048_e288_k8/dispatch.cpp`；
+  本地的形状目录只有 h2560_i640_e512_k10 与 h2048_i512_e256_k8。
+
+### b) ff17188e 稀疏 FP8 route 压缩：目标内核本地不存在
+
+- 主体是 `block_scaled/h4096_i2048_e288_k8/fp8/vector_pair.cuh` 的 167 行重写（成对 route 的
+  工作压缩）＋该形状的 `launch.cu/h` 与 dispatch。
+- 本地 FP8 的向量路径是另一套内核：`block_scaled/fp8/launch.cu`:101–122 的
+  `vector_gate` / `vector_down`（`vector_activation[kIntermediate/4, T*kTopK]`），
+  没有「成对 route 工作区间」这个数据结构；`vector_pair.cuh` 本地不存在。
+  按 L02 的准入口径（融合必须与不融合时的选核共用同一套 ncols/nchannels/n_experts 口径），
+  在两个不同内核之间搬这段没有意义。
+
+### c) 顺带记录：本地「确定性」的真正位置
+
+- 本地单块分组 `block_scaled/launch.cu`:79–125 的 rank 由 `atomicAdd(counts+e,1)` 决定，
+  同一专家内的 packed 顺序跨线程不确定。要做到「token 序保持」须把 rank 改成按 assignment
+  序的前缀和 —— 那是**数值/确定性改动**，必须按 T028 同时报 KL（分长度）＋PPL 逐位＋任务套件
+  ＋交错 A/B。本条没有实测窗口，登记为后续候选，不在本轮伪装成移植。
 
 ---
