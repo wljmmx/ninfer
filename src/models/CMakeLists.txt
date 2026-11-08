@@ -17,3 +17,18 @@ include(qwen3_5/loading_sources.cmake)
 include(qwen3_5/frontend_sources.cmake)
 include(qwen3_5/execution_sources.cmake)
 include(qwen3_5/program_sources.cmake)
+
+# port (sm_89): qwen4-exp PLE disk layer. The table/row-reader/prepare pipeline is CPU only;
+# the optional GPU staging owner still links CUDA through ninfer_core. Upstream reads through
+# io_uring (core/io) - this tree routes every row read through artifact::InputFile's
+# NO_BUFFERING overlapped reads instead.
+add_library(ninfer_ple STATIC
+  qwen4_exp/ple/table.cpp
+  qwen4_exp/ple/hash.cpp
+  qwen4_exp/ple/read_queue.cpp
+  qwen4_exp/ple/row_reader.cpp
+  qwen4_exp/ple/prepare.cpp
+  qwen4_exp/ple/gpu.cpp
+)
+ninfer_internal_includes(ninfer_ple)
+target_link_libraries(ninfer_ple PUBLIC ninfer_artifact ninfer_core)

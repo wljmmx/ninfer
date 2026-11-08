@@ -19,6 +19,7 @@ memory_arena.cpp
 weight_bank.cpp
   device.cu
   dtype.cpp
+  nf4.cpp
   host_worker_pool.cpp
   gdn_replay_records.cpp
   cyclic_kv_cache.cpp

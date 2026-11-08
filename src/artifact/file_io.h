@@ -77,6 +77,11 @@ public:
     void begin_direct_read(std::uint64_t offset, std::span<std::byte> destination,
                            DirectReadState& state) const;
     [[nodiscard]] std::size_t complete_direct_read(DirectReadState& state) const;
+    // port (sm_89): non-blocking readiness and an explicit blocking wait, so the PLE row reader can
+    // keep io_depth overlapped reads in flight and retire them as their events signal.
+    [[nodiscard]] bool direct_read_ready(const DirectReadState& state) const;
+    // Returns false only on timeout; the read stays in flight then.
+    [[nodiscard]] bool wait_direct_read(const DirectReadState& state, unsigned timeout_ms) const;
 
     // port (sm_89): read-only view of the whole object, created on first use. A bank that lives in
     // one object can then be addressed where it already is instead of being copied into an arena

@@ -5,6 +5,7 @@ add_library(ninfer_artifact STATIC
   file_io.cpp
   reader.cpp
   binder.cpp
+  backing.cpp
 expert_files.cpp
   expert_reader.cpp
   materializer.cpp

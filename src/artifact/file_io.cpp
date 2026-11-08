@@ -385,4 +385,30 @@ std::size_t InputFile::complete_direct_read(DirectReadState& state) const {
 #endif
 }
 
+bool InputFile::direct_read_ready(const DirectReadState& state) const {
+#ifdef _WIN32
+    if (state.inline_completed_) { return true; }
+    if (!state.issued_) { return false; }
+    return ::WaitForSingleObject(static_cast<HANDLE>(state.op_event_), 0) == WAIT_OBJECT_0;
+#else
+    // The POSIX fallback completes inside complete_direct_read, so a queued read is
+    // immediately joinable.
+    (void)state;
+    return true;
+#endif
+}
+
+bool InputFile::wait_direct_read(const DirectReadState& state, unsigned timeout_ms) const {
+#ifdef _WIN32
+    if (state.inline_completed_) { return true; }
+    if (!state.issued_) { return false; }
+    const DWORD wait = timeout_ms == 0xffffffffU ? INFINITE : static_cast<DWORD>(timeout_ms);
+    return ::WaitForSingleObject(static_cast<HANDLE>(state.op_event_), wait) == WAIT_OBJECT_0;
+#else
+    (void)state;
+    (void)timeout_ms;
+    return true;
+#endif
+}
+
 } // namespace ninfer::artifact
