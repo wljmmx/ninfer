@@ -1038,6 +1038,45 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
     }
     device.synchronize();
     program.complete();
+    // T156 (upstream 049d5fb4): the state account, now with the layout in hand. Before the
+    // Program exists the recurrent state has no identity (its stride is a property of the built
+    // graph), which is why attach_expert_cache() could only report it as zero. Here the exact
+    // union is quoted: one StateImage per device state slot (the context cache normalizes the
+    // slot count to the concurrency when the option is unset, so the same rule is applied).
+    if (const char* joint = std::getenv("NINFER_CONTEXT_JOINT_PLAN");
+        joint != nullptr && *joint == '1') {
+        const auto& geometry = instance->program->checkpoint_geometry();
+        // The context cache normalizes the extra-slot count to the concurrency when the option is
+        // unset (configuration.cpp prints the same expression), so the state account uses it too.
+        const std::uint64_t slots = std::max<std::uint64_t>(
+            1, options.context_cache.device_state_slots.value_or(options.max_concurrency));
+        const std::uint64_t state_bytes = geometry.state_image_bytes * slots;
+        const std::uint64_t kv_bytes    = instance->kv_capacity_resolution.runtime_reservation_bytes;
+        // A dense model has no routed pool at all (attach_expert_cache returns before creating one),
+        // so its account is zero rather than a dereference of an absent cache.
+        const std::uint64_t pool_cap    = instance->expert_cache != nullptr
+                                              ? instance->expert_cache->capacity_bytes()
+                                              : 0;
+        const std::uint64_t device_cap  = pool_cap + kv_bytes +
+                                          options.startup_planning_headroom_bytes;
+        const auto exact = context_cache::plan_joint_capacity(
+            device_cap,
+            {.kv_bytes        = kv_bytes,
+             .state_bytes     = state_bytes,
+             .workspace_bytes = options.startup_planning_headroom_bytes},
+            0);
+        std::fprintf(stderr,
+                     "[joint] exact: cap=%llu MiB kv=%llu MiB state=%llu MiB (%llu slot(s) x "
+                     "%llu B) workspace(headroom)=%llu MiB feasible=%d\n",
+                     static_cast<unsigned long long>(device_cap >> 20),
+                     static_cast<unsigned long long>(exact.kv_bytes >> 20),
+                     static_cast<unsigned long long>(exact.state_bytes >> 20),
+                     static_cast<unsigned long long>(slots),
+                     static_cast<unsigned long long>(geometry.state_image_bytes),
+                     static_cast<unsigned long long>(exact.workspace_bytes >> 20),
+                     exact.feasible ? 1 : 0);
+        std::fflush(stderr);
+    }
     {
         // Everything this Program owns is explicit except what the capture and the driver keep;
         // the difference against the reservation is the measured startup retainer.
