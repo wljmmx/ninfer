@@ -21,6 +21,7 @@
 #include <filesystem>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -656,6 +657,12 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception,
         return "tools" + exception.pointer();
     };
     switch (exception.kind()) {
+    case ninfer::RequestErrorKind::InvalidToolOutput:
+        error.status = 500;
+        error.type   = "server_error";
+        error.code   = "invalid_tool_output";
+        error.param.clear();
+        break;
     case ninfer::RequestErrorKind::InvalidToolConstraint:
         error.status = 400;
         error.code   = "invalid_tool_constraint";
@@ -868,16 +875,26 @@ public:
     }
 
     void publish(ninfer::OutputEvent event) override {
-        const auto* published = std::get_if<ninfer::OutputDelta>(&event);
-        if (published == nullptr) { return; }
-        const ninfer::OutputDelta delta = std::move(*published);
-        if (delta.text.empty()) { return; }
         deliver([&] {
-            if (delta.channel == ninfer::OutputChannel::Reasoning) {
-                if (sink_->on_reasoning) { sink_->on_reasoning(delta.text); }
-            } else {
-                if (sink_->on_content) { sink_->on_content(delta.text); }
-            }
+            std::visit(
+                [&](const auto& delta) {
+                    using T = std::decay_t<decltype(delta)>;
+                    if constexpr (std::is_same_v<T, ninfer::OutputDelta>) {
+                        if (delta.text.empty()) { return; }
+                        if (delta.channel == ninfer::OutputChannel::Reasoning) {
+                            if (sink_->on_reasoning) { sink_->on_reasoning(delta.text); }
+                        } else if (sink_->on_content) {
+                            sink_->on_content(delta.text);
+                        }
+                    } else if constexpr (std::is_same_v<T, ninfer::ToolCallStart>) {
+                        if (sink_->on_tool_start) { sink_->on_tool_start(delta); }
+                    } else if constexpr (std::is_same_v<T, ninfer::ToolArgumentsDelta>) {
+                        if (sink_->on_tool_arguments) { sink_->on_tool_arguments(delta); }
+                    } else {
+                        if (sink_->on_tool_end) { sink_->on_tool_end(delta); }
+                    }
+                },
+                event);
         });
     }
 
