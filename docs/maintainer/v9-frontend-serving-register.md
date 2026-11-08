@@ -112,3 +112,26 @@ Qwen4Exp 的模型规格与转换路径。
 `ninfer_artifact_materialization_test` 在 MSVC 下不构建（依赖 GNU ld `--wrap`），
 `ninfer_artifact_reader_test` 的 `ios_base::failbit` 在本次改动前的 HEAD 上同样复现，
 属既有环境问题，与本次修改无关。
+## 缺口补充规划（2026-11-08）
+
+T071/T072 不再停留在“登记缺口”，按下列内部拆解执行；编号不占 T 序位，完成情况写回本表。
+每个子任务独立可编译、可复跑，不把“半流式”中间态长期留在树上。
+
+| 子任务 | 依赖 | 内容 | 验收 |
+|---|---|---|---|
+| T071a | T068 | types.h 增 ToolCallStatus/ToolCallStart/ToolArgumentsDelta/ToolCallEnd/OutputEvent，OutputSink 增 publish(OutputEvent) 并保留 OutputDelta 便捷重载；GeneratedToolCall 带 status | 全量构建零错；ninfer_public_api_test |
+| T071b | T071a | PublishedOutput 改 vector<OutputEvent>；commit 时正文与 ToolCall* 同批产出；take_tool_calls/finish 与事件逐项对账；engine_core 发布环、request_record 跟随 | 正文逐字节等价；frontend/tool 单测 |
+| T071c | T071b | tool_call_parser.feed 返回事件；参数名唯一性/JSON 语法进 GrammarSession 事务状态；tool_grammar 的 basic_arguments 接 StringDispatch（T068 预留 API） | 增量/重复参数/回滚用例；掩码逐位不变 |
+| T071d | T071c | engine.cpp、generation_service.cpp、CLI、OpenAI chat/responses、Anthropic、request_log/operational_log 透传；协议层各自 wire id 与不完整调用投影 | serve 单测；openai/anthropic schema；SSE 事件序比对 |
+| T071e | T071d | 移植上游 tests/test_tool_streaming.cpp 与 decoder 单测 | 新增用例全过、无回归 |
+| T071f | T071e | 本文档改“已跟随”，docs/serving.md 与 types.h 契约注释同步 | 文档与代码一致 |
+| T072a | — | 引入 libjpeg-turbo（vcpkg/离线包，代理 127.0.0.1:10808），vcpkg.json + Dependencies.cmake + media/CMakeLists 链 JPEG::JPEG | find_package(JPEG) 成立、构建零错 |
+| T072b | T072a | jpeg.cpp 移植（CMYK/YCCK、JWRN_JPEG_EOF、色度上采样对齐 Pillow） | ninfer_media_decode_test 全过 |
+| T072c | T072b | JPEG 像素金标（灰度/CMYK/渐进式/截断） | 逐像素容差内 |
+
+执行窗口纪律：构建前确认 ninja/cl/link 空闲且 `ninja -n` 只剩本批目标；同工作树里 ops 进程有
+未提交改动时不动 `include/ninfer/types.h` 等共享头（会触发对方全量重编）；提交只按本组路径
+`git commit -- <paths>`，不吞并 qsa 等未提交改动；T071a 与 b–d 在同一窗口内一次完成。
+
+2026-11-08 08:20 状态：代码未开始。当时工作树有 18 个 qsa 文件未提交、构建目录待 CMake 重跑，
+且本组要改共享头，故按上面的纪律等待窗口。
