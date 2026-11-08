@@ -12,6 +12,7 @@
 | T121 | 757194af | 搬入（判据＋MoE 用例） | `tests/ops/op_check.h`、`tests/ops/op_tester.h`、`tests/ops/test_moe_block_scaled_fp8.cpp` |
 | T122 | a08d5133 + 7ea6cb6e | 部分搬入：scratch 限定搬入；共享输出消费已成本地形态 | `src/ops/moe/operands.*`、`src/ops/moe/workspace.h`、4 个 entry |
 | T123 | a9c68b44 + ff17188e | 不搬入（登记） | 本文件 §T123 |
+| T124 | 67ded232 + 0857a495 | 不搬入（机制已在本地形态） | 本文件 §T124 |
 
 ---
 
@@ -166,5 +167,39 @@
   同一专家内的 packed 顺序跨线程不确定。要做到「token 序保持」须把 rank 改成按 assignment
   序的前缀和 —— 那是**数值/确定性改动**，必须按 T028 同时报 KL（分长度）＋PPL 逐位＋任务套件
   ＋交错 A/B。本条没有实测窗口，登记为后续候选，不在本轮伪装成移植。
+
+---
+
+## T124 dense FP8 down contributions 融合 ＋ Q8 shared GU tiles 缩减 —— 不搬入
+
+**裁决：零代码改动。** 前半的机制本地已有（不是缺），后半的目标内核本地不存在。
+
+### a) 67ded232 dense down contributions：本地已经是「down 直接落贡献」
+
+- 上游为 h4096_i2048_e288_k8/fp8 新增 `dense_down.cuh`，把 down 的输出与 contributions 的
+  累加合成一步。
+- 本地 FP8 专家的 down 本来就是这一步：`block_scaled/fp8/launch.cu`:30–49 的
+  `grouped_mma<false, Columns, Atomic>` 直接把结果写进 `s.contributions`，或在
+  `plan.atomic_output` 时（`:93–97`）直接原子累加进 `s.routed_sum`；随后
+  `block_scaled/launch.cu`:186–192 的 `reduce` 只做最后合并与写回。
+- gate 侧的 act+quant 也已融合：gate 内核的 epilogue 直接产出 `product_codes/product_scales`
+  （`launch.cu`:43–47），没有「先写 FP32 再量化」的第二趟。T044 记的「act+quant 融合会移动数值、
+  必须过 PPL 逐位」在这里不构成待办：本地没有可融合的第二趟。
+
+### b) 0857a495 Q8 shared GU tiles：改的是本地没有的 TMA 阶梯
+
+- 该提交只改 `src/ops/moe/swiglu/dgx_spark/q8.cu`：把 (65,128] 的
+  `Q8A16TmaMmaSchedule<32,128,…>` 换成新增的 `T64Rows32 = Q8A16TmaMmaSchedule<32,64,32,16,…>`。
+- 本地：无 `src/ops/moe/swiglu`；sm_89 无 TMA（`sm89-fallback-table.md`:1–30 把 TMA 阶梯整体
+  映射到 cp.async 回退，守卫脚本的 `tma` 规则对未门控调用直接判违规）。
+- 本地 Q8 共享 GU 走 `groupwise_int` 的 `SharedPlan.columns`（`groupwise_int/launch.h`:32–36），
+  按 token 区间选 MMA 列 tile，是另一套调度。若要在本地形态下重挑 (65,128] 的 tile，那是
+  **本地调优条目**：按 T028 同时报 KL（分长度）＋PPL 逐位＋任务套件＋交错 A/B，
+  而不是把上游的 TMA 实例名抄过来。
+
+### c) T044 裁决沿用
+
+- TMA 子项**不采纳**（sm_89 无此指令，上游门槛写死 `is_device_capability(90)`）；
+  act+quant 融合若要真动，必须按功能改动走 PPL 逐位＋dump 门禁 —— 本地当前无需动。
 
 ---
