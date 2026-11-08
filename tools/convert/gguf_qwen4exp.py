@@ -1,0 +1,804 @@
+"""Qwen4Exp GGUF -> NInfer logical source (text component).
+
+Why this exists: when a Qwen4Exp distribution ships only as GGUF, the converter's normal input
+(Safetensors + config.json) is unavailable. This module presents a GGUF as the same duck-typed
+source the Qwen4Exp builder already consumes (`config`, `root`, `weight_map`, `describe`,
+`read_flat`), so `tools/convert/qwen4_exp.py` maps and quantizes exactly as it does for a
+Safetensors checkpoint.
+
+Three things make that non-trivial, and each is answered here rather than in the recipe:
+
+* Names. GGUF uses llama.cpp's `blk.N.*` spelling. The mapping below is the inverse of llama.cpp's
+  own QWEN4EXP tensor map (conversion/qwen4exp.py + gguf-py's TensorNameMap, read out of that
+  map), not a guess.
+* Merged tensors. llama.cpp fuses several weights for one matmul - expert gate|up
+  (`ffn_gate_up_exps`), the indexer q|k projection, the linear-attention qkv|z pair
+  (`attn_qkv_gate`), beta|alpha (`ssm_beta_alpha_cat`), hyper-connection down|inject
+  (`hc_*_down_inject`). The builder asks for the unfused projections, so they are split back by
+  row range here.
+* Head order. For linear attention llama.cpp stores V heads in *tiled* order
+  (`_LinearAttentionVReorderBase`), while NInfer's kernels read the HF *grouped* order. The
+  inverse permutation is applied whenever `linear_num_key_heads != linear_num_value_heads`.
+
+Scope: text. Vision lives in a separate mmproj and MTP has its own MTP-only conversion; asking
+for those components from a GGUF is refused with that reason instead of producing a silently
+incomplete artifact.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import json
+from pathlib import Path
+from typing import Callable, Iterable
+
+import numpy as np
+
+from .sources.gguf import GGUFFile, GGML_I64
+
+_TEXT_ARCH = "qwen4exp"
+
+
+# ------------------------------------------------------------------------------------- views
+# Every view reads a flat element range [begin, end) and returns numpy values in the order the
+# converter expects. Integer views keep their dtype: the PLE hash constants are 45-bit values and
+# must reach the artifact exact.
+
+
+@dataclass(frozen=True)
+class _Info:
+    shape: tuple[int, ...]
+    dtype: str  # "BF16" | "I64"
+    offset: int = 0
+    bytes: int = 0
+
+
+class View:
+    shape: tuple[int, ...]
+    dtype: str
+
+    def read(self, begin: int, end: int) -> np.ndarray:  # pragma: no cover - interface
+        raise NotImplementedError
+
+    def info(self) -> _Info:
+        elements = int(np.prod(self.shape)) if self.shape else 0
+        width = 8 if self.dtype == "I64" else 2
+        return _Info(tuple(self.shape), self.dtype, 0, elements * width)
+
+
+def _empty(dtype: str) -> np.ndarray:
+    return np.empty(0, dtype=np.int64 if dtype == "I64" else np.float32)
+
+
+class _Direct(View):
+    def __init__(self, file: GGUFFile, name: str) -> None:
+        self.file = file
+        self.name = name
+        info = file.tensors[name]
+        self.shape = info.shape
+        self.dtype = "I64" if info.ggml_type == GGML_I64 else "BF16"
+
+    def read(self, begin: int, end: int) -> np.ndarray:
+        return self.file.read_flat(self.name, begin, end)
+
+
+class _ArrayView(View):
+    """A materialized block, used where a permutation needs a whole row section at once."""
+
+    def __init__(self, values: np.ndarray, dtype: str = "BF16") -> None:
+        self.values = np.ascontiguousarray(values, dtype=np.int64 if dtype == "I64" else np.float32)
+        self.shape = tuple(self.values.shape)
+        self.dtype = dtype
+
+    def read(self, begin: int, end: int) -> np.ndarray:
+        return self.values.reshape(-1)[begin:end]
+
+
+class _Rows(View):
+    """Rows [start, start+rows) of a matrix."""
+
+    def __init__(self, inner: View, start: int, rows: int, cols: int) -> None:
+        self.inner, self.start, self.cols = inner, start, cols
+        self.shape = (rows, cols)
+        self.dtype = inner.dtype
+
+    def read(self, begin: int, end: int) -> np.ndarray:
+        if begin == end:
+            return _empty(self.dtype)
+        first = self.start + begin // self.cols
+        last = self.start + (end - 1) // self.cols + 1
+        block = self.inner.read(first * self.cols, last * self.cols)
+        low = begin - (begin // self.cols) * self.cols
+        return block[low : low + (end - begin)]
+
+
+class _ConcatRows(View):
+    """Row-wise concatenation of views; each part contributes whole rows."""
+
+    def __init__(self, parts: Iterable[tuple[View, int, int]]) -> None:
+        self.parts = [(view, start, rows) for view, start, rows in parts]
+        cols = {int(view.shape[1]) for view, _, _ in self.parts}
+        if len(cols) != 1:
+            raise ValueError("row concatenation requires a common column count")
+        self.cols = cols.pop()
+        self.shape = (sum(rows for _, _, rows in self.parts), self.cols)
+        self.dtype = self.parts[0][0].dtype if self.parts else "BF16"
+
+    def read(self, begin: int, end: int) -> np.ndarray:
+        out: list[np.ndarray] = []
+        cursor = 0
+        for view, start, rows in self.parts:
+            span = rows * self.cols
+            low, high = max(begin, cursor), min(end, cursor + span)
+            if low < high:
+                out.append(view.read(start * self.cols + low - cursor,
+                                     start * self.cols + high - cursor))
+            cursor += span
+            if cursor >= end:
+                break
+        if not out:
+            return _empty(self.dtype)
+        return np.concatenate(out)
+
+
+class _FlatPermute(View):
+    """1-D permutation (A_log, dt_bias and the beta/alpha rows)."""
+
+    def __init__(self, inner: View, perm: np.ndarray) -> None:
+        if len(inner.shape) != 1:
+            raise ValueError("flat permutation requires a vector")
+        self.inner = inner
+        self.perm = np.asarray(perm, dtype=np.int64)
+        self.shape = (len(self.perm),)
+        self.dtype = inner.dtype
+
+    def read(self, begin: int, end: int) -> np.ndarray:
+        if begin == end:
+            return _empty(self.dtype)
+        values = np.concatenate(
+            [self.inner.read(int(i), int(i) + 1) for i in self.perm[begin:end]]
+        )
+        return values
+
+
+class _RowPermute(View):
+    """Output row i is inner row perm[i]."""
+
+    def __init__(self, inner: View, perm: np.ndarray) -> None:
+        self.inner = inner
+        self.perm = np.asarray(perm, dtype=np.int64)
+        self.cols = int(inner.shape[1])
+        self.shape = (len(self.perm), self.cols)
+        self.dtype = inner.dtype
+
+    def read(self, begin: int, end: int) -> np.ndarray:
+        if begin == end:
+            return _empty(self.dtype)
+        first = begin // self.cols
+        last = (end - 1) // self.cols + 1
+        rows = np.concatenate(
+            [
+                self.inner.read(int(row) * self.cols, (int(row) + 1) * self.cols)
+                for row in self.perm[first:last]
+            ]
+        )
+        low = begin - first * self.cols
+        return rows[low : low + (end - begin)]
+
+
+class _ColPermute(View):
+    """Output column j is inner column perm[j]."""
+
+    def __init__(self, inner: View, perm: np.ndarray) -> None:
+        self.inner = inner
+        self.perm = np.asarray(perm, dtype=np.int64)
+        self.cols = int(inner.shape[1])
+        self.shape = inner.shape
+        self.dtype = inner.dtype
+
+    def read(self, begin: int, end: int) -> np.ndarray:
+        if begin == end:
+            return _empty(self.dtype)
+        first = begin // self.cols
+        last = (end - 1) // self.cols + 1
+        block = self.inner.read(first * self.cols, last * self.cols).reshape(
+            last - first, self.cols
+        )[:, self.perm]
+        flat = block.reshape(-1)
+        low = begin - first * self.cols
+        return flat[low : low + (end - begin)]
+
+
+class _FusedExperts(View):
+    """[E, 2I, H] with gate rows then up rows per expert, from one fused bank or two halves."""
+
+    def __init__(self, fused: View | None, gate: View | None, up: View | None,
+                 experts: int, width: int, hidden: int) -> None:
+        if fused is None and (gate is None or up is None):
+            raise ValueError("fused experts need either the fused bank or both halves")
+        self.fused, self.gate, self.up = fused, gate, up
+        self.experts, self.width, self.hidden = experts, width, hidden
+        self.shape = (experts, 2 * width, hidden)
+        self.dtype = "BF16"
+
+    def _half(self, kind: str, expert: int, begin: int, end: int) -> np.ndarray:
+        if self.fused is not None:
+            base = expert * 2 * self.width * self.hidden
+            offset = 0 if kind == "gate" else self.width * self.hidden
+            return self.fused.read(base + offset + begin, base + offset + end)
+        view = self.gate if kind == "gate" else self.up
+        base = expert * self.width * self.hidden
+        return view.read(base + begin, base + end)
+
+    def read(self, begin: int, end: int) -> np.ndarray:
+        out: list[np.ndarray] = []
+        span = 2 * self.width * self.hidden
+        half_span = self.width * self.hidden
+        while begin < end:
+            expert, local = divmod(begin, span)
+            stop = min(end, (expert + 1) * span)
+            if local < half_span:
+                take = min(stop - begin, half_span - local)
+                out.append(self._half("gate", expert, local, local + take))
+            else:
+                take = min(stop - begin, span - local)
+                out.append(self._half("up", expert, local - half_span,
+                                      local - half_span + take))
+            begin += take
+        return np.concatenate(out) if out else _empty("BF16")
+
+
+class _Reshape(View):
+    """Same flat order, a different logical shape (a size-1 axis added)."""
+
+    def __init__(self, inner: View, shape: tuple[int, ...]) -> None:
+        if int(np.prod(shape)) != int(np.prod(inner.shape)):
+            raise ValueError("reshape changes the element count")
+        self.inner = inner
+        self.shape = shape
+        self.dtype = inner.dtype
+
+    def read(self, begin: int, end: int) -> np.ndarray:
+        return self.inner.read(begin, end)
+
+
+# ------------------------------------------------------------------- head-order permutation
+
+
+def _ple_layers(cfg: dict) -> list[int]:
+    """0-based PLE layer ids. The config carries HF's 1-based ids (qwen4_exp.text_config
+    subtracts one); the mapping loop indexes layers from zero."""
+    return [int(i) - 1 for i in (cfg.get("ple_layer_ids") or [])]
+
+
+def tiled_to_grouped(count: int, key_heads: int, per_key: int, head_dim: int) -> np.ndarray:
+    """Inverse of llama.cpp's V-head tiling.
+
+    GGUF (tiled): position = head_in_group * key_heads + key_head.
+    HF  (grouped): position = key_head * heads_per_group + head_in_group.
+    """
+    if key_heads * per_key * head_dim != count:
+        raise ValueError(
+            f"V-head order: {key_heads} key heads x {per_key} value heads x {head_dim} does not "
+            f"cover {count} rows"
+        )
+    grouped = np.arange(count).reshape(key_heads, per_key, head_dim)
+    return np.transpose(grouped, (1, 0, 2)).reshape(-1)
+
+
+# ---------------------------------------------------------------------------------- the source
+
+
+class GGUFSource:
+    """A GGUF file presented as the converter's logical source."""
+
+    def __init__(self, path: str | Path, *, config_path: str | Path | None = None,
+                 root: str | Path | None = None) -> None:
+        self.path = Path(path)
+        self.file = GGUFFile(self.path)
+        sidecar = Path(config_path) if config_path else None
+        if sidecar is None and (self.path.parent / "config.json").is_file():
+            sidecar = self.path.parent / "config.json"
+        self.config = build_config(self.file, sidecar)
+        self.root = Path(root) if root else (sidecar.parent if sidecar else self.path.parent)
+        self._views: dict[str, View] = {}
+        self._build_views()
+        self._attach_ple_table()
+        self.weight_map = {name: name for name in self._views}
+
+    # -- lifecycle ------------------------------------------------------
+    def close(self) -> None:
+        self.file.close()
+
+    def __enter__(self) -> "GGUFSource":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
+    # -- duck-typed source surface --------------------------------------
+    @property
+    def bytes_read(self) -> int:
+        return self.file.bytes_read
+
+    def describe(self, name: str) -> _Info:
+        try:
+            return self._views[name].info()
+        except KeyError as error:
+            raise ValueError(f"{self.path}: GGUF has no tensor for logical {name!r}") from error
+
+    def read_flat(self, name: str, begin: int = 0, end: int | None = None):
+        view = self._views.get(name)
+        if view is None:
+            raise ValueError(f"{self.path}: GGUF has no tensor for logical {name!r}")
+        elements = int(np.prod(view.shape))
+        end = elements if end is None else end
+        if not 0 <= begin <= end <= elements:
+            raise ValueError(f"{name}: range [{begin},{end}) exceeds {view.shape}")
+        values = view.read(begin, end)
+        import torch  # the conversion stack; the container/quant layer above needs none
+
+        if view.dtype == "I64":
+            return torch.from_numpy(np.ascontiguousarray(values, dtype=np.int64))
+        return torch.from_numpy(np.ascontiguousarray(values, dtype=np.float32)).to(
+            torch.bfloat16
+        )
+
+    # -- mapping --------------------------------------------------------
+    def _has(self, name: str) -> bool:
+        return name in self.file.tensors
+
+    def _direct(self, name: str) -> View:
+        return _Direct(self.file, name)
+
+    def _add(self, name: str, view: View) -> None:
+        self._views[name] = view
+
+    def _build_views(self) -> None:
+        cfg = self.config["text_config"]
+        layers = cfg["num_hidden_layers"]
+        hidden = cfg["hidden_size"]
+        experts = cfg["num_experts"]
+        inter = cfg["moe_intermediate_size"]
+        nk = cfg["linear_num_key_heads"]
+        nv = cfg["linear_num_value_heads"]
+        dk = cfg["linear_key_head_dim"]
+        dv = cfg["linear_value_head_dim"]
+        tiled = nk != nv
+
+        # ---- globals
+        if not self._has("token_embd.weight"):
+            raise ValueError(f"{self.path}: GGUF is missing token_embd.weight")
+        self._add("model.language_model.embed_tokens.weight", self._direct("token_embd.weight"))
+        if not self._has("output.weight"):
+            raise ValueError(
+                f"{self.path}: GGUF has no output.weight; NInfer stores the output head as its "
+                "own physical parameter and a tied head is not accepted by the converter"
+            )
+        self._add("lm_head.weight", self._direct("output.weight"))
+        for gguf_name, suffix in (
+            ("output_hc_norm", "hc_norm"),
+            ("output_hc_down", "input_mix_weight_down"),
+            ("output_hc_up", "input_mix_weight_up"),
+        ):
+            if self._has(gguf_name + ".weight"):
+                self._add(f"model.language_model.hyper_connection_mixer.{suffix}.weight",
+                          self._direct(gguf_name + ".weight"))
+
+        layer_types = cfg["layer_types"]
+        for layer in range(layers):
+            prefix = f"blk.{layer}."
+            target = f"model.language_model.layers.{layer}."
+            linear = layer_types[layer] == "linear_attention"
+
+            self._hc_pair(prefix, target + "attn_hyper_connection.", hidden, cfg,
+                          down="hc_attn_down", up="hc_attn_up", norm="hc_attn_norm",
+                          inject="hc_attn_inject", merged="hc_attn_down_inject")
+            self._hc_pair(prefix, target + "mlp_hyper_connection.", hidden, cfg,
+                          down="hc_ffn_down", up="hc_ffn_up", norm="hc_ffn_norm",
+                          inject="hc_ffn_inject", merged="hc_ffn_down_inject")
+
+            for gguf_name, suffix in (
+                ("ffn_gate_inp", "mlp.gate"),
+                ("ffn_gate_inp_shexp", "mlp.shared_expert_gate"),
+                ("ffn_gate_shexp", "mlp.shared_expert.gate_proj"),
+                ("ffn_up_shexp", "mlp.shared_expert.up_proj"),
+                ("ffn_down_shexp", "mlp.shared_expert.down_proj"),
+            ):
+                if self._has(prefix + gguf_name + ".weight"):
+                    self._add(target + suffix + ".weight",
+                              self._direct(prefix + gguf_name + ".weight"))
+
+            fused_name = prefix + "ffn_gate_up_exps.weight"
+            gate_name = prefix + "ffn_gate_exps.weight"
+            up_name = prefix + "ffn_up_exps.weight"
+            if self._has(fused_name) or (self._has(gate_name) and self._has(up_name)):
+                self._add(target + "mlp.experts.gate_up_proj",
+                          _FusedExperts(
+                              self._direct(fused_name) if self._has(fused_name) else None,
+                              self._direct(gate_name) if self._has(gate_name) else None,
+                              self._direct(up_name) if self._has(up_name) else None,
+                              experts, inter, hidden,
+                          ))
+            down_name = prefix + "ffn_down_exps.weight"
+            if self._has(down_name):
+                self._add(target + "mlp.experts.down_proj", self._direct(down_name))
+
+            if linear:
+                self._gdn(prefix, target, cfg, tiled, nk, nv, dk, dv)
+            else:
+                self._qsa(prefix, target, cfg)
+
+            if layer in _ple_layers(cfg):
+                self._ple(prefix, target, cfg)
+
+    def _hc_pair(self, prefix: str, target: str, hidden: int, cfg: dict, *, down: str, up: str,
+                 norm: str, inject: str, merged: str) -> None:
+        c = cfg["hc_count"]
+        r = cfg["hc_lowrank"]
+        if self._has(prefix + norm + ".weight"):
+            self._add(target + "hc_norm.weight", self._direct(prefix + norm + ".weight"))
+        if self._has(prefix + up + ".weight"):
+            self._add(target + "input_mix_weight_up.weight",
+                      self._direct(prefix + up + ".weight"))
+        if self._has(prefix + merged + ".weight"):
+            block = self._direct(prefix + merged + ".weight")
+            self._add(target + "input_mix_weight_down.weight", _Rows(block, 0, r, c * hidden))
+            self._add(target + "block_inject_weight.weight", _Rows(block, r, c, c * hidden))
+        else:
+            if self._has(prefix + down + ".weight"):
+                self._add(target + "input_mix_weight_down.weight",
+                          self._direct(prefix + down + ".weight"))
+            if self._has(prefix + inject + ".weight"):
+                self._add(target + "block_inject_weight.weight",
+                          self._direct(prefix + inject + ".weight"))
+
+    def _qsa(self, prefix: str, target: str, cfg: dict) -> None:
+        hidden = cfg["hidden_size"]
+        iq = cfg["indexer_n_heads"] * cfg["indexer_head_dim"]
+        ik = cfg["indexer_kv_heads"] * cfg["indexer_head_dim"]
+        # Q and the output gate are ONE (2*Q, H) parent with head-interleaved rows, which is what
+        # llama.cpp keeps under attn_q; the builder separates them by row range.
+        if not self._has(prefix + "attn_q.weight"):
+            raise ValueError(f"{self.path}: {prefix}attn_q.weight is missing")
+        self._add(target + "self_attn.q_proj.weight", self._direct(prefix + "attn_q.weight"))
+        for suffix, gguf_name in (
+            ("k_proj", "attn_k"),
+            ("v_proj", "attn_v"),
+            ("o_proj", "attn_output"),
+        ):
+            if self._has(prefix + gguf_name + ".weight"):
+                self._add(target + f"self_attn.{suffix}.weight",
+                          self._direct(prefix + gguf_name + ".weight"))
+        for suffix, gguf_name in (("q_norm", "attn_q_norm"), ("k_norm", "attn_k_norm")):
+            if self._has(prefix + gguf_name + ".weight"):
+                self._add(target + f"self_attn.{suffix}.weight",
+                          self._direct(prefix + gguf_name + ".weight"))
+        # The indexer q|k projection is one logical tensor in the HF checkpoint; llama.cpp
+        # splits it into indexer.q_proj / indexer.k_proj, so it is fused back here.
+        q_name = prefix + "indexer.q_proj.weight"
+        k_name = prefix + "indexer.k_proj.weight"
+        if self._has(q_name) and self._has(k_name):
+            self._add(target + "self_attn.indexer.index_qk_proj.weight",
+                      _ConcatRows([
+                          (_Rows(self._direct(q_name), 0, iq, hidden), 0, iq),
+                          (_Rows(self._direct(k_name), 0, ik, hidden), 0, ik),
+                      ]))
+        for suffix, gguf_name in (("q_layernorm", "indexer.q_norm"),
+                                  ("k_layernorm", "indexer.k_norm")):
+            if self._has(prefix + gguf_name + ".weight"):
+                self._add(target + f"self_attn.indexer.{suffix}.weight",
+                          self._direct(prefix + gguf_name + ".weight"))
+
+    def _gdn(self, prefix: str, target: str, cfg: dict, tiled: bool, nk: int, nv: int, dk: int,
+             dv: int) -> None:
+        hidden = cfg["hidden_size"]
+        taps = cfg["linear_conv_kernel_dim"]
+        q = nk * dk
+        v = nv * dv
+        c = 2 * q + v
+        per_key = nv // nk if nk else 1
+        perm_v = tiled_to_grouped(v, nk, per_key, dv) if tiled else None
+        name = target + "linear_attn."
+        merged_name = prefix + "attn_qkv_gate.weight"
+        qkv_name = prefix + "attn_qkv.weight"
+        z_name = prefix + "attn_gate.weight"
+        if self._has(merged_name):
+            merged = self._direct(merged_name)
+            qkv = _Rows(merged, 0, c, hidden)
+            z = _Rows(merged, c, v, hidden)
+            if perm_v is not None:
+                z = _RowPermute(z, perm_v)
+            self._add(name + "in_proj_z.weight", z)
+        elif self._has(qkv_name):
+            qkv = _Rows(self._direct(qkv_name), 0, c, hidden)
+            if self._has(z_name):
+                z = self._direct(z_name)
+                if perm_v is not None:
+                    z = _RowPermute(z, perm_v)
+                self._add(name + "in_proj_z.weight", z)
+        else:
+            raise ValueError(f"{self.path}: {prefix}attn_qkv.weight is missing")
+        # q | k | v, with the V section put back in grouped order.
+        if perm_v is not None:
+            qk = _Rows(qkv, 0, 2 * q, hidden)
+            vpart = _RowPermute(_Rows(qkv, 2 * q, v, hidden), perm_v)
+            qkv = _ConcatRows([(qk, 0, 2 * q), (vpart, 0, v)])
+        self._add(name + "in_proj_qkv.weight", qkv)
+        for suffix, gguf_name in (("in_proj_a", "ssm_alpha"), ("in_proj_b", "ssm_beta")):
+            if self._has(prefix + gguf_name + ".weight"):
+                weight = self._direct(prefix + gguf_name + ".weight")
+                if tiled:
+                    weight = _RowPermute(weight, tiled_to_grouped(nv, nk, per_key, 1))
+                self._add(name + f"{suffix}.weight", weight)
+        if self._has(prefix + "ssm_conv1d.weight"):
+            raw = self._direct(prefix + "ssm_conv1d.weight")
+            # llama.cpp squeezed [C, 1, taps] to [C, taps]; a size-1 axis moves no element, so it
+            # only has to be reported again - except the V channels are tiled, and that
+            # permutation needs the whole kernel at once.
+            if tiled:
+                rows = raw.read(0, c * taps).reshape(c, taps)
+                qk_channels = 2 * q
+                rows = np.concatenate([rows[:qk_channels], rows[qk_channels:][perm_v]])
+                conv = _ArrayView(rows.reshape(c, 1, taps))
+            else:
+                conv = _Reshape(raw, (c, 1, taps))
+            self._add(name + "conv1d.weight", conv)
+        for suffix, gguf_name in (("A_log", "ssm_a"), ("dt_bias", "ssm_dt")):
+            if self._has(prefix + gguf_name + ".weight"):
+                weight = self._direct(prefix + gguf_name + ".weight")
+                if tiled:
+                    weight = _FlatPermute(weight, tiled_to_grouped(nv, nk, per_key, 1))
+                self._add(name + suffix, weight)
+        if self._has(prefix + "ssm_norm.weight"):
+            self._add(name + "norm.weight", self._direct(prefix + "ssm_norm.weight"))
+        if self._has(prefix + "ssm_out.weight"):
+            out = self._direct(prefix + "ssm_out.weight")
+            if tiled:
+                out = _ColPermute(out, tiled_to_grouped(v, nk, per_key, dv))
+            self._add(name + "out_proj.weight", out)
+
+    def _ple(self, prefix: str, target: str, cfg: dict) -> None:
+        hidden = cfg["hidden_size"]
+        c = cfg["hc_count"]
+        taps = cfg["ple_conv_kernel_size"]
+        name = target + "ple."
+        for suffix, gguf_name in (
+            ("key_proj", "ple_key"),
+            ("value_proj", "ple_value"),
+            ("norm_key", "ple_norm_key"),
+            ("norm_query", "ple_norm_query"),
+            ("norm_conv", "ple_norm_conv"),
+        ):
+            if self._has(prefix + gguf_name + ".weight"):
+                self._add(name + suffix + ".weight",
+                          self._direct(prefix + gguf_name + ".weight"))
+        if self._has(prefix + "ple_conv1d.weight"):
+            self._add(name + "conv1d.weight",
+                      _Reshape(self._direct(prefix + "ple_conv1d.weight"),
+                               (hidden * c, 1, taps)))
+        # The PLE hash controls are GGUF *metadata* arrays (u64), not tensors: llama.cpp writes
+        # them with add_ple_layer_multipliers / head_offsets / head_vocab_sizes. HF keeps them as
+        # int64, and u64 -> int64 is exact for every value below 2^63, which these multipliers
+        # (45-bit range) and offsets are.
+        controls = {
+            "layer_multipliers": ("ple.layer_multipliers", cfg["ngram_size"]),
+            "ngram_heads_vocab_sizes": ("ple.head_vocab_sizes",
+                                        (cfg["ngram_size"] - 1) * cfg["heads_per_ngram"]),
+            "ngram_heads_offsets": ("ple.head_offsets",
+                                    (cfg["ngram_size"] - 1) * cfg["heads_per_ngram"]),
+        }
+        for role, (key, expected) in controls.items():
+            values = _meta(self.file, key)
+            if values is None:
+                raise ValueError(
+                    f"{self.path}: GGUF metadata {_TEXT_ARCH}.{key} is missing; the PLE hash "
+                    "controls are required by the layer that carries PLE"
+                )
+            array = np.asarray(values, dtype=np.int64)
+            if array.shape != (expected,):
+                raise ValueError(
+                    f"{self.path}: {_TEXT_ARCH}.{key} has {array.shape}, expected ({expected},)"
+                )
+            self._add(name + "ple_embedding." + role, _ArrayView(array, "I64"))
+
+    def _attach_ple_table(self) -> None:
+        cfg = self.config["text_config"]
+        layers = _ple_layers(cfg)
+        if not layers:
+            return
+        name = "per_layer_token_embd.weight"
+        if not self._has(name):
+            raise ValueError(
+                f"{self.path}: the config marks PLE layer(s) {layers} but the GGUF has no "
+                "per_layer_token_embd.weight"
+            )
+        table = self._direct(name)
+        rows_total, ed = table.shape
+        parts = int(cfg["split_ngram_parts"])
+        if rows_total % parts != 0:
+            raise ValueError(
+                f"{self.path}: the PLE table has {rows_total} rows, not divisible by "
+                f"split_ngram_parts={parts}; GGUF merged the original shards, so their row "
+                "split cannot be recovered - set split_ngram_parts in the sidecar config"
+            )
+        rows = rows_total // parts
+        base = f"model.language_model.layers.{int(layers[0])}.ple.ple_embedding." \
+               "ngram_embedding."
+        for index in range(parts):
+            self._add(base + f"shard_{index}.weight", _Rows(table, index * rows, rows, ed))
+
+
+# ---------------------------------------------------------------------------- config synthesis
+
+_HF_TEXT_FIELDS = (
+    "hidden_size",
+    "vocab_size",
+    "num_hidden_layers",
+    "max_position_embeddings",
+    "hc_count",
+    "hc_lowrank",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "head_dim",
+    "linear_num_key_heads",
+    "linear_num_value_heads",
+    "linear_key_head_dim",
+    "linear_value_head_dim",
+    "linear_conv_kernel_dim",
+    "indexer_n_heads",
+    "indexer_kv_heads",
+    "indexer_head_dim",
+    "indexer_compress_ratio",
+    "indexer_budget",
+    "num_experts",
+    "num_experts_per_tok",
+    "moe_intermediate_size",
+    "shared_expert_intermediate_size",
+)
+
+
+def _meta(file: GGUFFile, key: str):
+    return file.get(f"{_TEXT_ARCH}.{key}")
+
+
+def _need(file: GGUFFile, key: str, value):
+    if value is None or (isinstance(value, (int, float)) and value <= 0):
+        raise ValueError(
+            f"{file.path}: cannot reconstruct {_TEXT_ARCH}.{key} from the GGUF metadata; pass "
+            "--gguf-config with the checkpoint's config.json"
+        )
+    return value
+
+
+def build_config(file: GGUFFile, sidecar: Path | None) -> dict:
+    """Reconstruct the config.json shape qwen4_exp.text_config validates.
+
+    A GGUF carries the qwen4exp hyperparameters llama.cpp writes from the HF config, so the
+    geometry is recoverable. What it does not carry (the rope_parameters subtree, the raw
+    compression ratio, vision/mtp subtrees) comes from the optional sidecar config.json. A field
+    neither source supplies is a refusal - never a default that would silently change the math.
+    """
+    arch = str(file.get("general.architecture", ""))
+    if arch and arch != _TEXT_ARCH:
+        raise ValueError(
+            f"{file.path}: GGUF architecture is {arch!r}, not {_TEXT_ARCH!r}; this path converts "
+            "Qwen4Exp only"
+        )
+    base: dict = {}
+    if sidecar is not None:
+        base = json.loads(Path(sidecar).read_text())
+    text = dict(base.get("text_config") or {})
+    config = dict(base)
+    config.setdefault("architectures", ["Qwen4ExpForCausalLM"])
+
+    layers = _need(file, "block_count", _meta(file, "block_count"))
+    hidden = _need(file, "embedding_length", _meta(file, "embedding_length"))
+    heads = _need(file, "attention.head_count", _meta(file, "attention.head_count"))
+    head_dim = _need(file, "attention.key_length", _meta(file, "attention.key_length"))
+    kv_heads = _need(file, "attention.head_count_kv", _meta(file, "attention.head_count_kv"))
+    hc_count = _need(file, "hyper_connection.count", _meta(file, "hyper_connection.count"))
+    hc_rank = _need(file, "hyper_connection.low_rank", _meta(file, "hyper_connection.low_rank"))
+    experts = _need(file, "expert_count", _meta(file, "expert_count"))
+    experts_used = _need(file, "expert_used_count", _meta(file, "expert_used_count"))
+    moe_inter = _need(file, "expert_feed_forward_length",
+                      _meta(file, "expert_feed_forward_length"))
+    shared_inter = _need(file, "expert_shared_feed_forward_length",
+                         _meta(file, "expert_shared_feed_forward_length"))
+    nk = _need(file, "ssm.group_count", _meta(file, "ssm.group_count"))
+    nv = _need(file, "ssm.time_step_rank", _meta(file, "ssm.time_step_rank"))
+    dk = _need(file, "ssm.state_size", _meta(file, "ssm.state_size"))
+    inner = _need(file, "ssm.inner_size", _meta(file, "ssm.inner_size"))
+    conv_kernel = _need(file, "ssm.conv_kernel", _meta(file, "ssm.conv_kernel"))
+    idx_heads = _need(file, "attention.indexer.head_count",
+                      _meta(file, "attention.indexer.head_count"))
+    idx_dim = _need(file, "attention.indexer.key_length",
+                    _meta(file, "attention.indexer.key_length"))
+    idx_topk = _need(file, "attention.indexer.top_k", _meta(file, "attention.indexer.top_k"))
+
+    ratios = _meta(file, "attention.compress_ratios")
+    if ratios is None or len(ratios) < layers:
+        raise ValueError(
+            f"{file.path}: GGUF has no per-layer attention.compress_ratios; the sparse/dense "
+            "layer layout is required"
+        )
+    layer_types = ["full_attention" if int(ratios[i]) > 0 else "linear_attention"
+                   for i in range(layers)]
+
+    text.update(
+        {
+            "hidden_size": int(hidden),
+            "num_hidden_layers": int(layers),
+            "num_attention_heads": int(heads),
+            "head_dim": int(head_dim),
+            "num_key_value_heads": int(kv_heads),
+            "hc_count": int(hc_count),
+            "hc_lowrank": int(hc_rank),
+            "num_experts": int(experts),
+            "num_experts_per_tok": int(experts_used),
+            "moe_intermediate_size": int(moe_inter),
+            "shared_expert_intermediate_size": int(shared_inter),
+            "linear_num_key_heads": int(nk),
+            "linear_num_value_heads": int(nv),
+            "linear_key_head_dim": int(dk),
+            "linear_value_head_dim": int(inner) // int(nv),
+            "linear_conv_kernel_dim": int(conv_kernel),
+            "indexer_n_heads": int(idx_heads),
+            "indexer_kv_heads": int(kv_heads),
+            "indexer_head_dim": int(idx_dim),
+            "indexer_compress_ratio": int(text.get("indexer_compress_ratio", 1)),
+            "indexer_budget": int(idx_topk),
+            "layer_types": layer_types,
+        }
+    )
+    ple_layers = _meta(file, "ple.layers") or []
+    if ple_layers:
+        text["ple_layer_ids"] = [int(i) + 1 for i in ple_layers]  # HF is 1-based
+        text["ngram_size"] = int(_meta(file, "ple.ngram_size"))
+        text["heads_per_ngram"] = int(_meta(file, "ple.heads_per_ngram"))
+        text["ple_conv_kernel_size"] = int(_meta(file, "ple.conv_kernel"))
+        text["split_ngram_parts"] = int(text.get("split_ngram_parts", 1))
+        ple_ed = _meta(file, "embedding_length_per_layer_input")
+        if ple_ed:
+            text["ple_embed_dim"] = int(ple_ed)
+    if "token_embd.weight" in file.tensors:
+        text["vocab_size"] = int(file.tensors["token_embd.weight"].shape[0])
+    text.setdefault("max_position_embeddings", int(_meta(file, "context_length") or 0))
+    text.setdefault("rms_norm_eps",
+                    float(_meta(file, "attention.layer_norm_rms_epsilon") or 1e-6))
+    text.setdefault("hidden_act", "silu")
+    text.setdefault("output_gate_type", "sigmoid")
+    text.setdefault("tie_word_embeddings", False)
+    text.setdefault("attention_bias", False)
+    text.setdefault("mamba_ssm_dtype", "float32")
+    text.setdefault("norm_topk_prob", True)
+    if "eos_token_id" not in text:
+        eos = _meta(file, "ple.eos_token_id")
+        if eos is not None:
+            text["eos_token_id"] = int(eos)
+    if "rope_parameters" not in text:
+        base_freq = _meta(file, "rope.freq_base")
+        if base_freq is None:
+            raise ValueError(
+                f"{file.path}: GGUF has no rope.freq_base and the sidecar has no "
+                "rope_parameters; rotary geometry is required"
+            )
+        sections = _meta(file, "rope.dimension_sections")
+        text["rope_parameters"] = {
+            "rope_type": "default",
+            "rope_theta": float(base_freq),
+            "mrope_section": [int(x) for x in sections] if sections is not None else [0, 0, 0],
+        }
+    config["text_config"] = text
+    missing = [key for key in _HF_TEXT_FIELDS if not text.get(key)]
+    if missing:
+        raise ValueError(
+            f"{file.path}: cannot reconstruct {missing}; pass --gguf-config with the "
+            "checkpoint's config.json"
+        )
+    return config
+
+
+def open_source(path: str | Path, *, config_path: str | Path | None = None,
+                root: str | Path | None = None) -> GGUFSource:
+    return GGUFSource(path, config_path=config_path, root=root)

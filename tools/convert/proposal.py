@@ -98,6 +98,12 @@ def add_proposal(
 def add_official_proposal(
     recipe: Recipe, *, ranking=DEFAULT_RANKING, rows=131072
 ) -> None:
+    # Upstream parity: an architecture whose proposal domain is the whole vocabulary ("full")
+    # indexes every row, so the shortlist size does not apply.
+    if recipe.model.proposal_domain == "full":
+        rows = None
+    elif recipe.model.proposal_domain != "indexed":
+        raise ValueError("unknown architecture proposal domain")
     add_proposal(
         recipe,
         ranking=ranking,

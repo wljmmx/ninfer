@@ -10,10 +10,17 @@ from __future__ import annotations
 import os
 import threading
 
-if not hasattr(os, "pread"):
-    _sources: dict[int, object] = {}
-    _lock = threading.Lock()
+# Descriptor caches shared by the shims below. They must be dropped when the caller closes the
+# descriptor: on Windows an open handle blocks both the hard-link publish (the writer links the
+# temporary file into place) and its removal, so a leaked duplicate turns a finished artifact
+# into "another program is using this file" at exactly the last step.
+_needs_shims = not hasattr(os, "pread") or not hasattr(os, "pwrite")
+_sources: dict[int, object] = {}
+_targets: dict[int, object] = {}
+_lock = threading.Lock()
+_write_lock = threading.Lock()
 
+if not hasattr(os, "pread"):
     def _source(fd: int):
         source = _sources.get(fd)
         if source is None:
@@ -32,9 +39,6 @@ if not hasattr(os, "pread"):
     os.pread = _pread  # type: ignore[attr-defined]
 
 if not hasattr(os, "pwrite"):
-    _targets: dict[int, object] = {}
-    _write_lock = threading.Lock()
-
     def _target(fd: int):
         target = _targets.get(fd)
         if target is None:
@@ -49,6 +53,21 @@ if not hasattr(os, "pwrite"):
             return target.write(data)
 
     os.pwrite = _pwrite  # type: ignore[attr-defined]
+
+if _needs_shims:
+    _original_close = os.close
+
+    def _close(fd: int) -> None:
+        for cache in (_sources, _targets):
+            handle = cache.pop(fd, None)
+            if handle is not None:
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+        _original_close(fd)
+
+    os.close = _close  # type: ignore[assignment]
 
 if not hasattr(os, "link"):
 

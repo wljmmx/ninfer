@@ -174,10 +174,50 @@ def qwen3_8_27b_nvfp4(model, recipe, sources):
         )
 
 
+def qwen4_exp(model, recipe, sources):
+    """Qwen4Exp text: Q4 routed experts, Q5 projections, Q8 vocabulary.
+
+    The same shape the Qwen3.5 MoE recipe uses, applied to the architecture's own parameter
+    names: HC mixes and the PLE table stay at their float representation (they are not
+    projections), the V-head projections take Q4, and the shared expert / attention output take
+    Q5. A GGUF source arrives here after dequantization, so the formats below are chosen from
+    the artifact's needs, not from the source's quantization.
+    """
+    _optional(model, recipe)
+    _assign(recipe, "text/token_embedding", Q8)
+    _assign(recipe, "text/output_head", Q8)
+    for name, parameter in model.parameters.items():
+        if not name.startswith("text/") or not parameter.projection:
+            continue
+        if name.endswith(
+            ("/gdn/a_projection", "/gdn/b_projection", "/moe/router", "/moe/shared_score")
+        ):
+            continue
+        if "/moe/experts/" in name:
+            format = Q6 if name.endswith("/down") else Q4
+        elif name.endswith(
+            (
+                "/attention/query",
+                "/attention/output_gate",
+                "/attention/key",
+                "/attention/index_query",
+                "/attention/index_key",
+                "/gdn/query",
+                "/gdn/key",
+                "/gdn/z",
+            )
+        ):
+            format = Q4
+        else:
+            format = Q5
+        _assign(recipe, name, format)
+
+
 RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
     "qwen3_8_27b": qwen3_8_27b,
     "qwen3_8_27b_nvfp4": qwen3_8_27b_nvfp4,
     "qwen3_6_35b_a3b": qwen3_6_35b_a3b,
+    "qwen4_exp": qwen4_exp,
 }

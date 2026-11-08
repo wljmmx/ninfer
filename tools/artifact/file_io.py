@@ -11,6 +11,27 @@ WRITEBACK_BYTES = 64 * 1024 * 1024
 _PAGE_BYTES = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
 
 
+def pread(fd: int, count: int, offset: int) -> bytes:
+    """Positioned read that also exists on Windows.
+
+    os.pread is POSIX-only; the Windows port of the offline tools hit exactly that. The fallback
+    seeks and reads on the same descriptor - these readers are single-threaded by construction
+    (one source per conversion stage), so the seek costs nothing and changes nothing else.
+    """
+    if hasattr(os, "pread"):
+        return os.pread(fd, count, offset)
+    os.lseek(fd, offset, os.SEEK_SET)
+    chunks: list[bytes] = []
+    remaining = count
+    while remaining > 0:
+        chunk = os.read(fd, remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
 def discard_cached_pages(fd: int, offset: int = 0, count: int | None = None) -> None:
     if not hasattr(os, "posix_fadvise"):
         return

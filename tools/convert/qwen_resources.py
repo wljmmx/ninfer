@@ -18,10 +18,15 @@ def load_qwen_resources(
     vision_config: Mapping[str, int] | None,
     overrides: Mapping[str, str | Path] | None,
 ):
-    roles = {"text": TEXT_RESOURCES}
-    if vision_config is not None:
-        roles["vision"] = VISION_RESOURCES
-    result = load_resources(model_dir, vocab_size=vocab_size, roles=roles, overrides=overrides)
+    # The local loader derives its own role table from `vision_config` (text always, vision when
+    # a vision config is selected); this wrapper only forwards the choice and then checks the
+    # processor fields against the selected vision geometry.
+    result = load_resources(
+        model_dir,
+        vocab_size=vocab_size,
+        vision_config=vision_config,
+        overrides=overrides,
+    )
     references, payloads, _, _ = result
     if vision_config is not None:
         for role, object_id in references["vision"].items():

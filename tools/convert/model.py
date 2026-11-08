@@ -34,6 +34,9 @@ class Model:
     packing_groups: list[tuple[str, ...]] = field(default_factory=list)
     token_count: int = 0
     special_token_ids: tuple[int, ...] = ()
+    # Which token domain the proposal head indexes (upstream parity): "indexed" keeps the short
+    # list, "full" covers the whole vocabulary. Qwen4Exp declares "full".
+    proposal_domain: str = "indexed"
 
     @property
     def config(self) -> dict:

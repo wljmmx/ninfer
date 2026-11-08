@@ -12,9 +12,25 @@ from collections.abc import Mapping
 from .official_recipes import RECIPES
 from .pipeline import convert
 from .proposal import DEFAULT_RANKING, add_official_proposal
-from .qwen3_5 import build_model
+from . import qwen3_5, qwen4_exp
+from .gguf_qwen4exp import open_source as open_gguf_source
 from .recipe import Recipe
 from .sources.safetensors import SafetensorsSource
+
+
+def _open_base(path, *, gguf_config=None, gguf_root=None):
+    """Open the primary checkpoint. A .gguf file is presented through the GGUF source layer."""
+    if Path(path).suffix.lower() == ".gguf":
+        return open_gguf_source(path, config_path=gguf_config, root=gguf_root)
+    return SafetensorsSource(path)
+
+
+def _builder(config):
+    """Pick the architecture adapter from the checkpoint's declared architecture."""
+    architectures = [str(item) for item in (config.get("architectures") or [])]
+    if any(item.startswith("Qwen4Exp") for item in architectures):
+        return qwen4_exp.build_model
+    return qwen3_5.build_model
 
 
 class SourceInputs(Mapping):
@@ -61,9 +77,13 @@ def _pairs(values, label):
 def _function(value: str):
     if value in RECIPES:
         return RECIPES[value]
-    filename, separator, function = value.rpartition(":")
-    if not separator:
-        filename, function = value, "configure"
+    # "file.py:function" selects an entry point. Split on the last colon only when what follows
+    # is an identifier: a bare Windows path ("C:\work\recipe.py") also contains a colon, and
+    # splitting there would hand the loader a drive letter.
+    filename, function = value, "configure"
+    head, separator, tail = value.rpartition(":")
+    if separator and tail.isidentifier():
+        filename, function = head, tail
     path = Path(filename).resolve()
     spec = importlib.util.spec_from_file_location("ninfer_user_recipe", path)
     if spec is None or spec.loader is None:
@@ -87,7 +107,7 @@ def main(argv=None):
         "--model",
         type=Path,
         required=True,
-        help="primary checkpoint/config and default resources",
+        help="primary checkpoint/config and default resources (.safetensors dir or .gguf)",
     )
     parser.add_argument(
         "--recipe",
@@ -129,21 +149,36 @@ def main(argv=None):
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--rows-per-chunk", type=int, default=512)
     parser.add_argument("--max-file-bytes", type=int, default=32_000_000_000)
+    # GGUF input only: a GGUF carries weights and the llama.cpp hyperparameters, but not every
+    # field of the HF config.json (rope_parameters' mrope layout, vision/mtp subtrees). The
+    # sidecar is read when present; --gguf-root points at the directory holding the frontend
+    # resources (tokenizer.json, chat_template.jinja) when they do not sit beside the GGUF.
+    parser.add_argument("--gguf-config", type=Path,
+                        help="config.json sidecar for a .gguf input")
+    parser.add_argument("--gguf-root", type=Path,
+                        help="resource directory for a .gguf input (defaults to its folder)")
     args = parser.parse_args(argv)
     components = tuple(args.components.split(","))
     if len(components) != len(set(components)):
         raise ValueError("components must not repeat")
+    if Path(args.model).suffix.lower() == ".gguf" and components != ("text",):
+        raise ValueError(
+            "a .gguf source converts the text component only (vision ships as a separate "
+            "mmproj and MTP has its own conversion); use --components text"
+        )
     paths = _pairs(args.source, "source")
     if "base" in paths:
         raise ValueError("select the base source with --model")
     overrides = _pairs(args.resource, "resource")
     with ExitStack() as stack:
-        base = stack.enter_context(SafetensorsSource(args.model))
+        base = stack.enter_context(
+            _open_base(args.model, gguf_config=args.gguf_config, gguf_root=args.gguf_root)
+        )
         sources = SourceInputs(base, paths, stack)
         companions = {
             key: sources[key] for key in ("dflash", "dflash2") if key in components
         }
-        model = build_model(
+        model = _builder(base.config)(
             base,
             components=components,
             companions=companions,
