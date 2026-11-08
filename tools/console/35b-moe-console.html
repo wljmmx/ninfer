@@ -1,0 +1,2256 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ninfer 控制台 · 总控 / 实例</title>
+<style>
+  :root{--bg:#0b0e13;--panel:#121821;--panel2:#18202b;--line:#232c38;--line2:#2e3948;
+        --ink:#e6edf3;--muted:#8b98a8;--dim:#5d6878;--accent:#4c9aff;--accent2:#7c5cff;
+        --good:#3fb950;--warn:#d29922;--bad:#f85149;--cyan:#39c5cf;--pink:#f778ba;
+        --mono:"JetBrains Mono",Consolas,"SF Mono",monospace;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:13.5px/1.55 "Segoe UI","Microsoft YaHei",system-ui,sans-serif}
+  .wrap{max-width:1560px;margin:0 auto;padding:14px 22px 90px}
+
+  header{display:flex;align-items:center;gap:14px;padding:10px 0 12px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+  .logo{font-weight:650;letter-spacing:.02em}
+  .logo span{color:var(--accent)}
+  .tabs{display:flex;gap:4px;margin-left:16px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:3px}
+  .tab{padding:5px 14px;border-radius:6px;cursor:pointer;color:var(--muted);font-size:13px;user-select:none}
+  .tab.on{background:var(--panel2);color:var(--ink);box-shadow:inset 0 0 0 1px var(--line2)}
+  .grow{flex:1}
+  .pill{font-size:12px;color:var(--muted);border:1px solid var(--line);border-radius:20px;padding:3px 11px;background:var(--panel)}
+  .dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:6px;background:var(--good)}
+  .dot.warn{background:var(--warn)} .dot.bad{background:var(--bad)} .dot.idle{background:var(--dim)}
+
+  .modebox{display:flex;align-items:center;gap:9px;margin-left:6px}
+  .mlbl{font-size:12px;color:var(--muted)}
+  .seg{display:flex;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:3px;gap:3px}
+  .segbtn{padding:4px 13px;border-radius:6px;font-size:12.5px;color:var(--muted);cursor:pointer;user-select:none}
+  .segbtn.on{background:rgba(76,154,255,.16);color:var(--ink);box-shadow:inset 0 0 0 1px var(--accent)}
+
+  .plan-strip{margin-top:10px;display:flex;align-items:center;gap:12px;font-size:12px;color:var(--muted);flex-wrap:wrap;
+    background:linear-gradient(90deg,rgba(76,154,255,.10),rgba(124,92,255,.06));border:1px solid var(--line);border-radius:8px;padding:7px 12px}
+  .plan-strip b{color:var(--ink);font-weight:600;font-family:var(--mono);font-size:11.5px}
+
+  h2.sec{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--dim);margin:22px 0 8px}
+  .grid{display:grid;gap:12px}
+  .g6{grid-template-columns:repeat(6,1fr)} .g4{grid-template-columns:repeat(4,1fr)}
+  .g3{grid-template-columns:repeat(3,1fr)} .g2{grid-template-columns:1.55fr 1fr}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+  .card h3{margin:0 0 8px;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);display:flex;align-items:center;gap:8px}
+  .card h3 .r{margin-left:auto;font-size:11px;letter-spacing:0;text-transform:none;color:var(--dim)}
+  .metric{font-family:var(--mono);font-size:25px;font-weight:600;line-height:1.1}
+  .metric small{font-size:11.5px;color:var(--muted);font-weight:400;margin-left:4px}
+  .sub{color:var(--muted);font-size:11.5px}
+  .row{display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px dashed var(--line);font-size:12.5px;gap:8px}
+  .row:last-child{border-bottom:none}
+  .row b{font-family:var(--mono);font-weight:600;text-align:right}
+  .bar{height:6px;border-radius:4px;background:#1e2632;overflow:hidden;margin-top:6px;display:flex}
+  .bar > i{height:100%;display:block}
+
+  select,input,button{font:12.5px var(--mono)}
+  select,input[type=number],input[type=text]{background:var(--panel2);border:1px solid var(--line2);color:var(--ink);border-radius:6px;padding:5px 8px}
+  select:focus,input:focus{outline:1px solid var(--accent);border-color:var(--accent)}
+  .btn{background:var(--accent);color:#04121f;border:none;border-radius:6px;padding:7px 13px;font-weight:650;cursor:pointer;font-family:inherit}
+  .btn.ghost{background:transparent;color:var(--muted);border:1px solid var(--line2);font-weight:500}
+  .btn.ghost:hover{color:var(--ink);border-color:var(--accent)}
+  .btn.sm{padding:4px 9px;font-size:11.5px}
+  .btn.stop{background:transparent;color:var(--bad);border:1px solid rgba(248,81,73,.5);font-weight:600}
+
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  th,td{padding:7px 8px;text-align:left;border-bottom:1px solid var(--line);vertical-align:middle}
+  th{color:var(--muted);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;font-weight:600;border-bottom:1px solid var(--line2)}
+  td.n{font-family:var(--mono);text-align:right;font-variant-numeric:tabular-nums}
+  tr.pick{cursor:pointer}
+  tr.pick:hover{background:#161d27}
+  tr.cur{background:rgba(76,154,255,.09)}
+  .tag{font-size:11px;padding:1px 8px;border-radius:10px;border:1px solid var(--line2);color:var(--muted);white-space:nowrap}
+  .tag.run{color:var(--good);border-color:rgba(63,185,80,.45);background:rgba(63,185,80,.10)}
+  .tag.start{color:var(--warn);border-color:rgba(210,153,34,.45);background:rgba(210,153,34,.10)}
+  .tag.stop{color:var(--bad);border-color:rgba(248,81,73,.45);background:rgba(248,81,73,.10)}
+  .tag.e2{color:var(--cyan);border-color:rgba(57,197,207,.4)}
+  .tag.fused{color:var(--accent2);border-color:rgba(124,92,255,.4)}
+  .tag.mode{color:var(--accent);border-color:rgba(76,154,255,.5);background:rgba(76,154,255,.10);font-weight:600}
+  .tag.pf{color:var(--cyan);border-color:rgba(57,197,207,.4)}
+  .tag.dc{color:var(--good);border-color:rgba(63,185,80,.4)}
+  .tag.done{color:var(--muted)}
+  .tag.max{color:var(--warn);border-color:rgba(210,153,34,.4)}
+
+  .chart{width:100%;display:block}
+  .chartwrap{position:relative}
+  .readout{font-family:var(--mono);font-size:11.5px;color:var(--muted);min-height:16px}
+  .readout b{color:var(--ink);font-weight:600}
+  .legend{display:flex;flex-wrap:wrap;gap:6px;font-size:11.5px;color:var(--muted);margin-top:6px}
+  .chip{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line2);border-radius:20px;padding:2px 9px;cursor:pointer;user-select:none;background:var(--panel2)}
+  .chip.off{opacity:.38}
+  .chip i{width:9px;height:3px;border-radius:2px;display:inline-block}
+  .controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px}
+  .controls .lbl{color:var(--dim);font-size:11.5px}
+  .hidden{display:none}
+  .note{color:var(--dim);font-size:11.5px;margin-top:8px}
+  .kv{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:6px}
+  .kvbox{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+  .kvbox .t{font-size:10.5px;color:var(--dim);letter-spacing:.08em;text-transform:uppercase}
+  .kvbox .v{font-family:var(--mono);font-size:15px;margin-top:2px}
+  .gauge{display:flex;gap:10px;margin-top:10px}
+  .gauge .g{flex:1;text-align:center;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:7px 4px}
+  .gauge .g .n{font-family:var(--mono);font-size:16px;font-weight:600}
+  .gauge .g .l{font-size:10.5px;color:var(--dim);margin-top:1px}
+  .form{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:6px}
+  .form label{display:flex;flex-direction:column;gap:3px;font-size:11px;color:var(--dim)}
+  .alertbar{display:flex;gap:10px;align-items:center;font-size:12.5px;border:1px solid rgba(210,153,34,.35);
+    background:rgba(210,153,34,.08);color:#e2b64a;border-radius:8px;padding:7px 12px;margin-top:8px}
+  .kbd{font-family:var(--mono);font-size:11px;border:1px solid var(--line2);border-radius:4px;padding:0 5px;color:var(--muted)}
+  .split{display:flex;gap:8px;align-items:center}
+
+  .spark{width:100%;height:26px;display:block;margin-top:7px}
+  .feed{margin-top:8px;max-height:168px;overflow:auto}
+  .feed div{font-size:11.5px;color:var(--muted);padding:3px 0;border-bottom:1px dashed var(--line)}
+  .feed b{color:var(--ink);font-family:var(--mono);font-weight:600;font-size:11px}
+  .feed .fk-mode b{color:var(--accent)}
+  .feed .fk-auto{color:var(--cyan)}
+  .feed .fk-auto b{color:var(--cyan)}
+  .feed .fk-gap{color:var(--warn)}
+  .feed .fk-gap b{color:var(--warn)}
+  .wband{display:flex;height:14px;border-radius:4px;overflow:hidden;margin-top:6px;border:1px solid var(--line2)}
+  .wband i{display:block;height:100%}
+  .wlegend{display:flex;flex-wrap:wrap;gap:10px;font-size:11px;color:var(--muted);margin-top:6px}
+  .wlegend b{font-family:var(--mono)}
+
+  .reqctx{display:inline-flex;align-items:center;gap:6px}
+  .ctx-track{width:52px;height:5px;border-radius:3px;background:#1e2632;overflow:hidden;display:inline-block}
+  .ctx-track i{display:block;height:100%;background:var(--accent)}
+  .reqtrace{display:block}
+  .reqdiv{font-size:10.5px;color:var(--dim);letter-spacing:.12em;text-transform:uppercase;padding:6px 8px 2px;border-bottom:1px solid var(--line)}
+  .ttftbox{margin:2px 0 8px}
+  .ttftbox svg{width:100%;height:64px;display:block}
+  .ttftbox .cap{font-size:10.5px;color:var(--dim);font-family:var(--mono)}
+
+  .drawerwrap{position:fixed;inset:0;background:rgba(4,8,14,.55);z-index:60;display:flex;justify-content:flex-end}
+  .drawerwrap.hidden{display:none}
+  .drawer{width:430px;max-width:92vw;background:var(--panel);border-left:1px solid var(--line2);padding:18px 20px;overflow:auto}
+  .drawer h4{margin:0 0 4px;font-size:16px}
+  .drawer .facts{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:12px 0}
+  .drawer .facts div{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:7px 10px}
+  .drawer .facts .t{font-size:10.5px;color:var(--dim)}
+  .drawer .facts .v{font-family:var(--mono);font-size:14px;margin-top:2px}
+  .drawer .ev{font-size:11.5px;color:var(--muted);padding:3px 0;border-bottom:1px dashed var(--line)}
+  .drawer .ev b{font-family:var(--mono);color:var(--ink);font-size:11px}
+
+  .pagefoot{margin-top:26px;padding-top:10px;border-top:1px solid var(--line);display:flex;flex-wrap:wrap;gap:10px;align-items:center;
+    font-family:var(--mono);font-size:11px;color:var(--dim)}
+  .pagefoot .grow{flex:1}
+  .pagefoot button{font-size:11px;padding:2px 9px;cursor:pointer;background:transparent;border:1px solid var(--line2);color:var(--muted);border-radius:5px}
+  .pagefoot button:hover{color:var(--bad);border-color:var(--bad)}
+
+  .srcbar{display:flex;align-items:center;gap:10px;margin-top:10px;padding:7px 12px;border-radius:8px;font-size:12px;
+    border:1px solid var(--line);background:var(--panel);color:var(--muted);flex-wrap:wrap}
+  .srcbar b{color:var(--ink);font-weight:600}
+  .srcbar .k{font-family:var(--mono);font-size:11.5px}
+  .srcbar.live{border-color:rgba(63,185,80,.35);background:rgba(63,185,80,.06)}
+  .srcbar.demo{border-color:rgba(210,153,34,.4);background:rgba(210,153,34,.08)}
+  .srcbar.bad{border-color:rgba(248,81,73,.4);background:rgba(248,81,73,.07)}
+  .tag.eng{color:var(--good);border-color:rgba(63,185,80,.45);background:rgba(63,185,80,.10)}
+  .tag.demo{color:var(--warn);border-color:rgba(210,153,34,.45);background:rgba(210,153,34,.10)}
+  .tag.na{color:var(--dim);border-color:var(--line2);background:transparent}
+  .stale{color:var(--warn)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="logo">ninfer <span>·</span> 控制台</div>
+  <div class="tabs" role="tablist">
+    <div class="tab on" id="tab-fleet" role="tab" onclick="view('fleet')">总控大屏</div>
+    <div class="tab" id="tab-inst" role="tab" onclick="view('inst')">实例大屏</div>
+  </div>
+  <div class="modebox">
+    <span class="mlbl">控制器</span>
+    <div class="seg" id="modeSeg">
+      <div class="segbtn on" data-m="auto" onclick="setMode('auto')">自动</div>
+      <div class="segbtn" data-m="perf" onclick="setMode('perf')">性能优先</div>
+      <div class="segbtn" data-m="stable" onclick="setMode('stable')">稳定优先</div>
+    </div>
+  </div>
+  <div class="grow"></div>
+  <span class="pill" id="fleetState"><span class="dot"></span>— 运行 / — 启动中</span>
+  <span class="pill">LMCache 0.9.9 · tcp://127.0.0.1:6555 · WSL</span>
+  <span class="pill" id="clock">—</span>
+</header>
+
+<div class="srcbar" id="srcbar">
+  <span class="dot idle" id="srcDot"></span>
+  <b id="srcTitle">数据源：未接入</b>
+  <span class="k" id="srcDetail">解码 / prefill / TTFT 走引擎 /monitor（同源代理），断线 gap 分段不插值</span>
+  <span class="grow"></span>
+  <span class="k" id="srcGap">—</span>
+</div>
+
+<div class="plan-strip">
+  <span>当前阶段</span><b id="planStage">第 3 层 · 调优 / 控制器判据接线</b>
+  <span>当前项</span><b>并发 → 冻结 → 预取回退 → 预算 → warm_mirror → 图层</b>
+  <span class="grow"></span>
+  <span>门禁 <b>双通过</b> · 默认 930 MiB <b>4801 2.052284 / 7.785666</b> · 冻结 12 GiB <b>4801 2.049253 / 7.762104</b>（逐位）</span>
+</div>
+
+<!-- ================= 总控大屏 ================= -->
+<section id="pane-fleet">
+
+  <h2 class="sec">集群概览（单卡 24 GB 一次驻留一个池档）</h2>
+  <div class="grid g6">
+    <div class="card"><h3>聚合 decode</h3><div class="metric" id="f-dec">—<small>tok/s</small></div><div class="sub" id="f-dec-sub">—</div><svg class="spark" id="sp-fdec"></svg></div>
+    <div class="card"><h3>聚合 prefill</h3><div class="metric" id="f-pre">—<small>tok/s</small></div><div class="sub" id="f-pre-sub">—</div><svg class="spark" id="sp-fpre"></svg></div>
+    <div class="card"><h3>显存 <span class="r" id="f-vram-r"></span></h3><div class="metric" id="f-vram">—<small>GiB</small></div><div class="bar" id="f-vram-bar"></div><div class="sub" id="f-vram-sub">—</div><svg class="spark" id="sp-fvram"></svg></div>
+    <div class="card"><h3>主机 RAM</h3><div class="metric" id="f-ram">—<small>GiB</small></div><div class="bar" id="f-ram-bar"></div><div class="sub" id="f-ram-sub">—</div><svg class="spark" id="sp-fram"></svg></div>
+    <div class="card"><h3>KV 盘级</h3><div class="metric" id="f-disk">—<small>GiB</small></div><div class="bar" id="f-disk-bar"></div><div class="sub" id="f-disk-sub">—</div><svg class="spark" id="sp-fdisk"></svg></div>
+    <div class="card"><h3>上传带宽</h3><div class="metric" id="f-up">—<small>GB/s</small></div><div class="sub" id="f-up-sub">—</div><svg class="spark" id="sp-fup"></svg></div>
+  </div>
+
+  <h2 class="sec">GPU 状态 <span style="text-transform:none;letter-spacing:0;color:var(--dim)">（NVML 旁路线程 · 1 Hz；PCIe 每 5 s，单次调用阻塞 ~31 ms）</span></h2>
+  <div class="grid g4">
+    <div class="card"><h3>GPU 功耗 <span class="r" id="gpu-limit"></span></h3><div class="metric" id="gpu-power">—<small>W</small></div><div class="sub" id="gpu-power-sub">—</div><svg class="spark" id="sp-gpupw"></svg></div>
+    <div class="card"><h3>GPU 频率</h3><div class="metric" id="gpu-sm">—<small>MHz SM</small></div><div class="sub" id="gpu-sm-sub">—</div><svg class="spark" id="sp-gpuclk"></svg></div>
+    <div class="card"><h3>温度 / 风扇</h3><div class="metric" id="gpu-temp">—<small>°C</small></div><div class="sub" id="gpu-temp-sub">—</div><svg class="spark" id="sp-gputemp"></svg></div>
+    <div class="card"><h3>PCIe 实测 <span class="r">低频 · 5 s</span></h3><div class="metric" id="gpu-pcie">—<small>MB/s</small></div><div class="sub" id="gpu-pcie-sub">—</div></div>
+  </div>
+  <div class="sub" style="margin-top:6px">电压无官方接口（nvml.dll 无 voltage 导出、nvidia-smi -q -d VOLTAGE 为空）——以功耗上限 + power cap 事件位间接反映。全部为控制路径读数，不碰 CUDA 上下文，对 PPL/哈希门禁零影响。</div>
+
+  <div class="grid g2" style="margin-top:12px">
+    <div class="card">
+      <h3>集群曲线 <span class="r" id="fleetWinLbl">近 180 s · 1 Hz</span></h3>
+      <div class="chartwrap"><svg class="chart" id="fleetChart" viewBox="0 0 920 260" preserveAspectRatio="none"></svg></div>
+      <div class="readout" id="fleetHover"></div>
+      <div class="controls">
+        <span class="lbl">指标</span>
+        <select id="fleetMetric" onchange="drawFleet()">
+          <option value="decode">decode (tok/s)</option>
+          <option value="prefill">prefill (tok/s)</option>
+          <option value="ttft">TTFT (ms)</option>
+          <option value="upload">上传 (MB/层)</option>
+          <option value="cover">覆盖率 (%)</option>
+          <option value="prefetch">预取有用率 (%)</option>
+          <option value="capt">capt_ready (%)</option>
+          <option value="miss">miss (个/token)</option>
+        </select>
+        <span class="lbl">窗口</span>
+        <select id="fleetWin" onchange="drawFleet()">
+          <option value="60">1 分钟</option>
+          <option value="180" selected>3 分钟</option>
+          <option value="300">5 分钟</option>
+          <option value="900">15 分钟</option>
+        </select>
+        <span class="lbl">叠加</span>
+        <select id="fleetStack" onchange="drawFleet()">
+          <option value="overlay">分实例叠线</option>
+          <option value="sum">合计单线</option>
+        </select>
+        <span class="grow"></span>
+        <button class="btn ghost sm" onclick="togglePause()" id="pauseBtn">暂停</button>
+      </div>
+      <div class="legend" id="fleetLegend"></div>
+      <div class="note">带 = 采样 min–max；悬停读极值；采样断档分段显示不连线。</div>
+    </div>
+
+    <div class="card">
+      <h3>实例矩阵 <span class="r">点击行进入实例大屏</span></h3>
+      <table>
+        <thead><tr><th></th><th>实例 / 档位</th><th>状态</th><th class="n">decode</th><th class="n">TTFT p99</th><th class="n">覆盖</th><th class="n">capt</th><th>趋势</th></tr></thead>
+        <tbody id="fleetRows"></tbody>
+      </table>
+      <div class="note">stopped 档不占显存，仅作跨档对比与冷备；fused 比 e2 低约 3%，只作对照臂。</div>
+    </div>
+  </div>
+
+  <div class="grid g4" style="margin-top:12px">
+    <div class="card">
+      <h3>控制器 <span class="r">模式在页首切换</span></h3>
+      <div class="row"><span>模式</span><b id="c-mode">—</b></div>
+      <div class="row"><span>并发门槛</span><b id="c-bar" style="font-size:11px">—</b></div>
+      <div class="row"><span>翻面保护</span><b id="c-guard">—</b></div>
+      <div id="c-per" style="margin-top:6px"></div>
+      <div class="feed" id="c-feed" aria-live="polite"></div>
+    </div>
+    <div class="card">
+      <h3>放置与缓存（全实例）</h3>
+      <div class="row"><span>默认策略 route</span><b>route</b></div>
+      <div class="row"><span>溢出环（池侧 S）</span><b id="f-spill">—</b></div>
+      <div class="row"><span>miss / token</span><b id="f-miss">—</b></div>
+      <div class="row"><span>表发布</span><b id="f-pub">—</b></div>
+      <div class="row"><span>预取</span><b id="f-gate">—</b></div>
+      <div class="note">S 固定 8（实测 16/32 槽 −1.7%/−5.7%）；表发布 48→16 B/步。</div>
+    </div>
+    <div class="card">
+      <h3>三覆盖指标 <span class="r" title="static=表静态率；no_miss=无缺失步窗口占比；capt_ready=层捕获就绪率">能不能开图看这里</span></h3>
+      <div class="gauge">
+        <div class="g"><div class="n" id="f-static">—</div><div class="l">表静态率</div></div>
+        <div class="g"><div class="n" id="f-nomiss">—</div><div class="l">无缺失步</div></div>
+        <div class="g"><div class="n" id="f-cap">—</div><div class="l">capt_ready</div></div>
+      </div>
+      <div class="row" style="margin-top:8px"><span>缺口归因</span><b id="f-fail">—</b></div>
+      <div class="note">缺口全部来自表发布+字节上传（fail_unaddr=0）；冻结可达 100%。锚点：12 GiB 36.0% / 16 GiB 70.8%。</div>
+    </div>
+    <div class="card">
+      <h3>告警</h3>
+      <div id="alerts"></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <h3>LMCache 运行时 <span class="r" id="lcStamp">未接入</span></h3>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0 26px">
+      <div>
+        <div class="row"><span>L1 使用率</span><b id="lc-l1ratio">—</b></div>
+        <div class="row"><span>L1 已用</span><b id="lc-l1mem">—</b></div>
+        <div class="row"><span>L1 暂存（未准入）</span><b id="lc-staging">—</b></div>
+        <div class="row"><span>L1 淘汰轮次增速</span><b id="lc-evict">—</b></div>
+        <div class="row"><span>L2 适配器 存 / 取</span><b id="lc-l2">—</b></div>
+      </div>
+      <div>
+        <div class="row"><span>活跃预取 / P2P</span><b id="lc-jobs">—</b></div>
+        <div class="row"><span>事件总线队列</span><b id="lc-evdepth">—</b></div>
+        <div class="row"><span>丢弃事件</span><b id="lc-evdots">—</b></div>
+        <div class="row"><span>KV 事件日志深度</span><b id="lc-kvlog">—</b></div>
+        <div class="row"><span>进程 RSS / CPU</span><b id="lc-proc">—</b></div>
+      </div>
+    </div>
+    <div class="chartwrap" style="margin-top:10px">
+      <svg class="chart" id="lcSpark" viewBox="0 0 920 90" preserveAspectRatio="none" style="height:90px">
+        <line x1="0" y1="86" x2="920" y2="86" stroke="#26313d" stroke-width="1"/>
+        <polyline id="lcSparkLine" fill="none" stroke="#39c5cf" stroke-width="1.6" points=""/>
+      </svg>
+    </div>
+    <div class="note" id="lcNote">ZMQ engine_driven（端点须 tcp://）。真机：同进程 531/538；进程重启后 WAL 重放补发，仍 531/538（98.7%）、TTFT 6.01→1.53 s。LMCache 侧只有 L1（10 GB），服务重启条目即消失。连续 3 次取数失败记一次采样 gap。</div>
+  </div>
+  <div class="card" style="margin-top:12px">
+    <h3>实例管理 <span class="r">池/KV 改动需重启（resize API 未负载验收）；策略由控制器模式统一定档</span></h3>
+    <div class="form">
+      <label>模型<input id="newModel" type="text" value="qwen3.6-35b-a3b-e2"></label>
+      <label>专家池 (MiB)<input id="newPool" type="number" value="12288"></label>
+      <label>主机 KV (MiB)<input id="newKv" type="number" value="8192"></label>
+      <label>端口<input id="newPort" type="number" value="8126"></label>
+      <label>工件形态<select id="newArt"><option value="e2">e2（推荐）</option><option value="fused">fused（对照，−3%）</option></select></label>
+      <label>&nbsp;<button class="btn" onclick="createInstance()">启动实例</button></label>
+    </div>
+    <div class="note" id="newNote">推荐 12 GiB 或 17 GiB 档，避开 15–16 GiB"两头不靠"（交错 A/B 实测 −11%）。启动后先 starting，约 3 s 转 running；新实例按当前控制器模式接入。</div>
+  </div>
+</section>
+
+<!-- ================= 实例大屏 ================= -->
+<section id="pane-inst" class="hidden">
+
+  <div class="grid g4">
+    <div class="card">
+      <h3>实例</h3>
+      <div class="split">
+        <select id="inst" onchange="pickInstance(this.value)" style="flex:1"></select>
+        <button class="btn ghost sm" onclick="stepInstance(-1)">◀</button>
+        <button class="btn ghost sm" onclick="stepInstance(1)">▶</button>
+      </div>
+      <div class="row" style="margin-top:8px"><span>状态</span><b id="i-state">—</b></div>
+      <div class="row"><span>工件 / 池</span><b id="i-art">—</b></div>
+      <div class="row"><span>端口 / uptime</span><b id="i-up">—</b></div>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button class="btn sm" id="i-start" onclick="startStopInstance()">启动</button>
+        <button class="btn sm stop" id="i-stop" onclick="startStopInstance()">停止</button>
+      </div>
+    </div>
+
+    <div class="card"><h3>Decode</h3><div class="metric" id="i-dec">—<small>tok/s</small></div>
+      <div class="sub" id="i-dec-sub">单请求 / 峰值</div>
+      <div class="bar"><i id="i-dec-bar" style="width:0;background:var(--accent)"></i></div>
+      <svg class="spark" id="sp-idec"></svg></div>
+
+    <div class="card"><h3>Prefill</h3><div class="metric" id="i-pre">—<small>tok/s</small></div>
+      <div class="sub" id="i-pre-sub">chunked prefill</div>
+      <div class="bar"><i id="i-pre-bar" style="width:0;background:var(--good)"></i></div>
+      <svg class="spark" id="sp-ipre"></svg></div>
+
+    <div class="card"><h3>TTFT / KV</h3><div class="metric" id="i-ttft">—<small>ms</small></div>
+      <div class="row"><span>p50 / p99</span><b id="i-ttft2">—</b></div>
+      <div class="row"><span>前缀命中</span><b id="i-kvh">—</b></div>
+      <svg class="spark" id="sp-ittft"></svg></div>
+  </div>
+
+  <div class="grid g2" style="margin-top:12px">
+    <div class="card">
+      <h3>性能曲线 <span class="r" id="instWinLbl">近 180 s · 每个实例独立保留</span></h3>
+      <div class="chartwrap"><svg class="chart" id="instChart" viewBox="0 0 920 280" preserveAspectRatio="none"></svg></div>
+      <div class="readout" id="instHover"></div>
+      <div class="legend" id="instLegend"></div>
+      <div class="controls">
+        <span class="lbl">序列</span>
+        <span id="seriesPicker" class="legend" style="margin-top:0"></span>
+      </div>
+      <div class="controls">
+        <span class="lbl">窗口</span>
+        <select id="instWin" onchange="drawInst()">
+          <option value="60">1 分钟</option>
+          <option value="180" selected>3 分钟</option>
+          <option value="300">5 分钟</option>
+          <option value="900">15 分钟</option>
+        </select>
+        <span class="lbl">量纲</span>
+        <select id="instNorm" onchange="drawInst()">
+          <option value="0">原始值（左右双轴）</option>
+          <option value="1">各自归一化（看形状）</option>
+        </select>
+        <span class="grow"></span>
+        <button class="btn ghost sm" onclick="togglePause()" id="pauseBtn2">暂停</button>
+        <button class="btn ghost sm" onclick="exportSeries()">导出 CSV</button>
+      </div>
+      <div class="note">每条序列按自己的量纲画；带 = 采样 min–max；点图例可开关；历史在本地缓冲与持久化里，切走再切回不丢。</div>
+    </div>
+
+    <div class="card">
+      <h3>缓存与 KV</h3>
+      <div class="row"><span>驻留覆盖率</span><b id="c-cover">—</b></div>
+      <div class="bar"><i id="c-cover-bar" style="width:0;background:var(--accent)"></i></div>
+      <div class="row" style="margin-top:8px"><span>miss / token</span><b id="c-miss">—</b></div>
+      <div class="row"><span>表发布</span><b id="c-pub">—</b></div>
+      <div class="row"><span>溢出环（池侧 S）</span><b id="c-spill">—</b></div>
+      <div class="row"><span>预取有用率</span><b id="c-pfu">—</b></div>
+      <div class="kv">
+        <div class="kvbox"><div class="t">KV 设备</div><div class="v" id="kv-dev">—</div><div class="sub">paged</div></div>
+        <div class="kvbox"><div class="t">KV 主机</div><div class="v" id="kv-host">—</div><div class="sub">arena</div></div>
+        <div class="kvbox"><div class="t">KV 盘级</div><div class="v" id="kv-disk">—</div><div class="sub">LMCache / checkpoint</div></div>
+      </div>
+      <div class="gauge">
+        <div class="g"><div class="n" id="i-static">—</div><div class="l">表静态率</div></div>
+        <div class="g"><div class="n" id="i-nomiss">—</div><div class="l">无缺失步</div></div>
+        <div class="g"><div class="n" id="i-cap">—</div><div class="l">capt_ready</div></div>
+      </div>
+      <div class="row" style="margin-top:6px"><span>缺口归因</span><b id="i-fail">—</b></div>
+    </div>
+  </div>
+
+  <div class="grid g3" style="margin-top:12px">
+    <div class="card">
+      <h3>生效策略 <span class="r">由控制器模式决定</span></h3>
+      <div class="row"><span>模式</span><b id="p-mode">—</b></div>
+      <div class="row"><span>并发 C / lanes</span><b id="p-conc">—</b></div>
+      <div class="row"><span>放置</span><b>route · 环 S=8 · epoch 64</b></div>
+      <div class="row"><span>冻结</span><b id="p-freeze">—</b></div>
+      <div class="row"><span>预取</span><b id="p-pf">—</b></div>
+      <div class="row"><span>图层</span><b id="p-graph">—</b></div>
+      <div class="row"><span>路径</span><b>host_direct 开 · static_fast 备</b></div>
+      <div class="row"><span>二级缓存 C / 温区 S</span><b id="p-sc">—</b></div>
+      <div class="note">环境变量只是初值；运行期策略唯一拥有者是控制器，控制台只选模式、看读数。</div>
+    </div>
+
+    <div class="card">
+      <h3>温区四段 <span class="r">S/D/C/P · 独立预算</span></h3>
+      <div class="wband" id="wband"></div>
+      <div class="wlegend" id="wlegend"></div>
+      <div class="row" style="margin-top:8px"><span>模式</span><b id="w-mode">—</b></div>
+      <div class="row"><span>冻结状态</span><b id="w-fz">—</b></div>
+      <div class="row"><span>covers_all / pool_unready</span><b id="w-cov">—</b></div>
+    </div>
+
+    <div class="card">
+      <h3>控制器决策 <span class="r">判据读数与最近动作</span></h3>
+      <div class="row"><span>并发</span><b id="d-conc" style="font-size:11px">—</b></div>
+      <div class="row"><span>冻结</span><b id="d-freeze" style="font-size:11px">—</b></div>
+      <div class="row"><span>预取</span><b id="d-pf" style="font-size:11px">—</b></div>
+      <div class="row"><span>图层</span><b id="d-graph" style="font-size:11px">—</b></div>
+      <div class="row"><span>SLO 准入</span><b>阈值模式 · 默认 0 不拒绝</b></div>
+      <div class="feed" id="d-feed" style="max-height:120px" aria-live="polite"></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <h3>请求 <span class="r" id="reqCount">—</span></h3>
+    <div class="ttftbox" id="ttftbox"></div>
+    <table>
+      <thead id="reqHead"><tr>
+        <th>Phase</th><th>ID</th><th class="n">Age</th>
+        <th title="上下文占用 = prompt（含复用）+ 已生成 / 容量估计">Context</th>
+        <th class="n" title="decode 斜率口径（引擎自报）">Speed</th>
+        <th class="n" title="TTFT = 排队等待 + prefill；批内后到者含排队（§13.4 实测 2.1/5.2/5.2/5.3 s）">TTFT</th>
+        <th class="n">Gen</th>
+        <th class="n" title="前缀复用 token（不计入 prefill 速度口径）">复用</th>
+        <th>Trace</th>
+      </tr></thead>
+      <tbody id="reqRows"></tbody>
+    </table>
+    <div class="note">decode 批内 KV 分行已通；prefill 仍串行（advance_prefill 单请求，固定开销 ≈0.9–1.2 s/请求）。车道数随控制器并发决策；点击行看生命周期分解。观测不含 prompt 与输出文本。</div>
+  </div>
+</section>
+
+<footer class="pagefoot">
+  <span id="ft-left">1s 采样 · 缓冲 15 min · 带 = 采样 min–max · 断档分段显示</span>
+  <span id="ft-mid"></span>
+  <span class="grow"></span>
+  <span>请求观测不含 prompt 与输出文本</span>
+  <button onclick="clearHistory()">清除本地历史</button>
+</footer>
+
+<div class="drawerwrap hidden" id="drawerWrap" onclick="drawerBackdrop(event)">
+  <div class="drawer" id="drawerBody"></div>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+
+/* ---------- 指标定义：每个实例各存一条环形缓冲（[值, min, max] 三元组） ---------- */
+const METRICS = {
+  decode:  {label:'decode',     unit:'tok/s',  color:'#4c9aff'},
+  prefill: {label:'prefill',    unit:'tok/s',  color:'#3fb950'},
+  ttft:    {label:'TTFT',       unit:'ms',     color:'#d29922'},
+  upload:  {label:'上传/层',    unit:'MB',     color:'#7c5cff'},
+  cover:   {label:'覆盖率',     unit:'%',      color:'#39c5cf'},
+  prefetch:{label:'预取有用率', unit:'%',      color:'#f778ba'},
+  publish: {label:'发布字节',   unit:'B/步',   color:'#8b98a8'},
+  spill:   {label:'溢出环占用', unit:'槽',     color:'#f85149'},
+  capt:    {label:'capt_ready', unit:'%',      color:'#c084fc'},
+  miss:    {label:'miss/token', unit:'个',     color:'#fb923c'}
+};
+const SERIES_DEFAULT = ['decode','prefill','upload'];
+const SERIES_ORDER = ['decode','prefill','ttft','upload','cover','prefetch','publish','spill','capt','miss'];
+const HIST = 900;   // 15 分钟 @1 Hz
+const MAX_CONTEXT = 8192;   // token 容量估计（用于请求上下文条）
+
+/* ---------- 档位曲线（短样本口径，仅档间比较）：[池MiB, 槽, 覆盖%, miss/token, host%, tps] ---------- */
+const CURVE = [
+  [1024,12,25.1,5.99,86.8,6.9],[1536,18,28.3,5.74,83.0,7.0],[2048,25,31.2,5.51,78.6,7.9],
+  [2560,31,31.4,5.49,76.7,8.0],[3072,37,35.3,5.18,73.8,8.4],[3584,44,37.1,5.03,70.3,8.9],
+  [4096,50,38.3,4.93,68.2,9.2],[4608,56,40.4,4.77,65.0,9.4],[5120,62,41.1,4.71,63.4,9.6],
+  [5632,69,42.2,4.63,60.1,9.7],[6144,81,44.2,4.46,56.1,10.7],[6656,88,45.6,4.35,54.2,11.5],
+  [7168,94,44.1,4.47,53.4,11.8],[7680,100,44.2,4.46,48.9,12.1],[8192,106,44.2,4.46,46.6,12.0],
+  [8704,113,44.2,4.47,44.1,12.8],[9216,119,46.6,4.27,42.4,12.9],[9728,125,49.7,4.03,40.2,13.2],
+  [10240,132,55.5,3.56,37.6,13.3],[10752,138,59.0,3.28,36.0,13.3],[11264,144,61.5,3.08,33.8,13.8],
+  [11776,151,62.7,2.98,31.4,13.7],[12288,163,67.1,2.63,27.1,14.4],[12800,169,71.7,2.27,28.6,14.4],
+  [13312,176,73.9,2.08,26.9,15.1],[13824,182,75.1,1.99,25.1,14.8],[14336,188,76.9,1.84,22.6,15.7],
+  [14848,195,80.0,1.60,20.9,11.6],[15360,201,80.8,1.53,19.0,9.0],[15872,207,82.2,1.43,17.6,9.1],
+  [16384,213,83.3,1.34,15.5,8.7],[16896,220,79.6,1.63,10.4,17.6],[17408,226,81.4,1.49,9.2,18.1]
+];
+function curveFor(pool){
+  let best = CURVE[0];
+  for (const r of CURVE){ if (Math.abs(r[0]-pool) < Math.abs(best[0]-pool)) best = r; }
+  return best;
+}
+function staticFor(pool){ if (pool<=4096) return 40; if (pool<=8192) return 58.3; if (pool<=12288) return 66; if (pool<=16384) return 77.8; return 90; }
+function captFor(pool){ if (pool<=9216) return 30; if (pool<=13312) return 36; if (pool<=14848) return 50; if (pool<=16384) return 70.8; return 75; }
+function warmMiB(pool){ const s = curveFor(pool)[1]; return Math.round((256-s)*40*1.875); }  // 温区按显存补集
+
+/* ---------- 流式基线（档位曲线锚定实测） ---------- */
+function mkBase(pool, fused){
+  const row = curveFor(pool);
+  const b = {
+    decode: pool>=17920 ? 44.1 : row[5]*4.354,   // 12288 锚 62.7（Q60 e2）；全驻留锚 44.1（Q65）
+    prefill: Math.round(120 + row[2]*2.4),
+    ttft: Math.round(640 - row[2]*3.4),
+    upload: 2.45*12288/pool,
+    cover: row[2],
+    prefetch: 11,        // 实测带 9–13%
+    publish: 16,         // 48→16 B/步
+    spill: 8,
+    capt: captFor(pool),
+    miss: row[3],
+    static: staticFor(pool),
+    noMiss: 58
+  };
+  if (fused) b.decode *= 0.97;   // Q60：fused −3%
+  return b;
+}
+
+/* ---------- 本地持久化（模拟 collector 独立持史：关掉页面历史还在） ---------- */
+const LS_KEY = 'ninfer-console-v3';
+function round2(x){ return Math.round(x*100)/100; }
+function saveState(){
+  try{
+    const insts = Object.values(INSTANCES).map(i => ({
+      id:i.id, model:i.model, art:i.art, pool:i.pool, kv:i.kv, port:i.port,
+      state:i.state, startedAt:i.startedAt, note:i.note, sel:i.sel,
+      series:Object.fromEntries(Object.keys(METRICS).map(k => [k, i.series[k].map(t => [round2(t[0]), round2(t[1]), round2(t[2])])])),
+      reqId:i.reqId||1, doneR:i.doneR||[], ttftBins:i.ttftBins||null,
+      pref:i.pref||{prompt:0, reused:0}
+    }));
+    localStorage.setItem(LS_KEY, JSON.stringify({at:Date.now(), mode:ctlMode, feed:FEED, insts}));
+    $('ft-mid').textContent = '本地历史：' + new Date().toLocaleTimeString() + ' 已保存';
+  }catch(e){
+    $('ft-mid').textContent = '本地历史：不可用（' + (e.message||'quota') + '）';
+  }
+}
+function clearHistory(){
+  if (!confirm('清除本地保存的历史（曲线、流水、请求样本）并重载？')) return;
+  try{ localStorage.removeItem(LS_KEY); }catch(e){}
+  location.reload();
+}
+
+/* ---------- 实例 ---------- */
+function makeInstance(id, model, art, pool, kv, port){
+  return {id, model, art, pool, kv, port, frozen:false, state:'stopped', startedAt:0,
+          base0: mkBase(pool, art==='fused'), base:{}, policy:null, series:{}, sel:true, note:'',
+          reqId:1, active:[], doneR:[], ttftBins:null, pref:{prompt:0, reused:0},
+          pot:0, useLow:0, useHigh:0, op:false};
+}
+let INSTANCES = {};
+let restored = null;
+try{ restored = JSON.parse(localStorage.getItem(LS_KEY) || 'null'); }catch(e){ restored = null; }
+if (restored && restored.insts && restored.insts.length && Date.now() - restored.at < 7*86400e3){
+  for (const s of restored.insts){
+    const inst = makeInstance(s.id, s.model, s.art, s.pool, s.kv, s.port);
+    inst.state = s.state; inst.startedAt = s.startedAt; inst.note = s.note||''; inst.sel = !!s.sel;
+    inst.reqId = s.reqId||1; inst.doneR = s.doneR||[]; inst.ttftBins = s.ttftBins; inst.pref = s.pref || {prompt:0, reused:0};
+    for (const k of Object.keys(METRICS)) inst.series[k] = (s.series && s.series[k]) || [];
+    INSTANCES[inst.id] = inst;
+  }
+} else {
+  const a = makeInstance('e2-12288','qwen3.6-35b-a3b-e2','e2',12288,8192,8123);
+  a.state='running'; a.startedAt=Date.now()-2*3600e3-14*60e3;
+  const b = makeInstance('e2-8192','qwen3.6-35b-a3b-e2','e2',8192,6144,8124);
+  b.note='8 GiB 档冷备';
+  const c = makeInstance('fused-12288','qwen3.6-35b-a3b','fused',12288,8192,8125);
+  c.note='Q60：fused −3%，仅对照'; c.sel=false;
+  INSTANCES = {'e2-12288':a, 'e2-8192':b, 'fused-12288':c};
+}
+
+let current = Object.keys(INSTANCES)[0];
+let viewName = 'fleet';
+let paused = false;
+let seriesOn = new Set(SERIES_DEFAULT);
+
+function initSeries(inst){
+  for (const k of Object.keys(METRICS)) if (!inst.series[k]) inst.series[k] = [];
+}
+Object.values(INSTANCES).forEach(initSeries);
+
+/* ---------- 控制器：三档模式 ---------- */
+const MODES = {
+  auto:   {name:'自动',     barTxt:'static≥80% 才并发', flip:32, rb:3, cool:4},
+  perf:   {name:'性能优先', barTxt:'覆盖≥55% 即并发', flip:16, rb:5, cool:2},
+  stable: {name:'稳定优先', barTxt:'强制串行 C=1', flip:64, rb:1, cool:8}
+};
+let ctlMode = (restored && MODES[restored.mode]) ? restored.mode : 'auto';
+const FEED = (restored && Array.isArray(restored.feed)) ? restored.feed.slice(0,40) : [];
+function feedAdd(txt, kind){
+  FEED.unshift({t:new Date().toLocaleTimeString(), txt:txt, k:kind||'info'});
+  if (FEED.length > 40) FEED.pop();
+}
+function feedHtml(n){
+  return FEED.slice(0, n).map(f => '<div class="fk-' + (f.k||'info') + '"><b>' + f.t + '</b> ' + f.txt + '</div>').join('')
+       || '<div>暂无动作</div>';
+}
+
+function policyFor(inst){
+  const b0 = inst.base0;
+  if (ctlMode === 'stable') return {c:1, lanes:1, freeze:true, reselect:false, fast:true, prefetch:false, graph:true};
+  if (ctlMode === 'perf'){
+    const c = b0.cover >= 55 ? 4 : 1;
+    return {c:c, lanes:c, freeze:false, reselect:false, fast:false, prefetch:true, graph:false};
+  }
+  const c = b0.static >= 80 ? 4 : 1;   // 自动：static≥80
+  return {c:c, lanes:c, freeze:false, reselect:false, fast:false, prefetch:true, graph:false};
+}
+
+function rebase(inst){
+  const b0 = inst.base0, p = policyFor(inst);
+  const b = Object.assign({}, b0);
+  if (p.freeze){
+    b.decode = b0.decode*0.67;   // 12 GiB 冻结+快路径实测 42 vs 流式 62.7
+    b.cover = 100; b.miss = 0; b.capt = 100; b.static = 100; b.noMiss = 100;
+    b.spill = 0; b.publish = 0; b.prefetch = 0;
+  } else {
+    if (p.c > 1) b.decode = b0.decode * (b0.cover >= 80 ? 1.12 : 1.10);  // C=4 实测：12 GiB +10% / 17 GiB +13%
+    if (!p.prefetch) b.prefetch = 0;
+  }
+  inst.policy = p;
+  inst.base = b;
+  inst.useLow = 0; inst.useHigh = 0;
+}
+Object.values(INSTANCES).forEach(rebase);
+
+function setMode(m){
+  if (!MODES[m] || m === ctlMode) return;
+  if (engineLive()){ postControl('/api/control/mode', {mode: m}); return; }
+  const from = MODES[ctlMode].name, to = MODES[m].name;
+  ctlMode = m;
+  document.querySelectorAll('.segbtn').forEach(el => el.classList.toggle('on', el.getAttribute('data-m') === m));
+  for (const inst of Object.values(INSTANCES)){
+    if (inst.state !== 'running') continue;
+    const oldP = inst.policy;
+    rebase(inst);
+    const p = inst.policy, chg = [];
+    if (oldP.c !== p.c) chg.push('并发 ' + oldP.c + '→' + p.c);
+    if (!!oldP.freeze !== !!p.freeze) chg.push(p.freeze ? '冻结集安装（快路径，covers_all=1）' : '解冻→流式');
+    if (!!oldP.prefetch !== !!p.prefetch) chg.push('预取 ' + (p.prefetch ? '开' : '关'));
+    if (!!oldP.graph !== !!p.graph) chg.push('图 ' + (p.graph ? '开' : '关'));
+    feedAdd('模式 ' + from + '→' + to + '：' + inst.id + ' ' + (chg.length ? chg.join('，') : '策略不变'), 'mode');
+  }
+  if (viewName === 'fleet'){ renderFleet(); drawFleet(); } else renderInstance();
+}
+
+/* ---------- 控制面（T131）：三档模式与冻结策略的 HTTP 包装 ----------
+   真实端点：引擎 /control/mode、/control/freeze（同源代理 tools\lmcache_console.py 的
+   /api/control/*）。判据归引擎：页面只下发并回显引擎自报的状态（/monitor/info 的 controller
+   块），不本地推算；被拒绝（typo/越界/无核心）按错误显示，不假装成功。 */
+function engControl(){ return (ENGINE.info && ENGINE.info.controller) || ENGINE.control || null; }
+function modeKey(engineMode){
+  if (engineMode === 'performance') return 'perf';
+  if (engineMode === 'stable') return 'stable';
+  return 'auto';
+}
+function syncModeButtons(){
+  document.querySelectorAll('.segbtn').forEach(el => el.classList.toggle('on', el.getAttribute('data-m') === ctlMode));
+}
+function freezeText(c){
+  if (!c) return '—';
+  const f = c.freeze || {};
+  if (f.banks === 0) return 'dense 模型：无路由专家银行（策略仅登记）';
+  const state = f.armed ? (f.frozen ? '已冻结' : '未冻结') : '未启用冻结机制';
+  return 'after=' + (f.after != null ? f.after : '—') + ' · reselect=' +
+    (f.reselect_after != null ? f.reselect_after : '—') + ' · thaw=' +
+    (f.thaw_on_request ? 'on' : 'off') + ' · ' + state;
+}
+async function postControl(path, body){
+  try {
+    const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    let j = null;
+    try { j = await r.json(); } catch (e) { j = null; }
+    if (!j || !j.ok){
+      feedAdd('控制面拒绝：' + ((j && (j.error || ('HTTP ' + r.status))) || ('HTTP ' + r.status)) +
+              (j && j.detail ? ' — ' + j.detail : ''), 'gap');
+      return null;
+    }
+    if (j.controller){
+      ENGINE.control = j.controller;
+      if (ENGINE.info) ENGINE.info.controller = j.controller;
+      ctlMode = modeKey(j.controller.mode);
+      syncModeButtons();
+    }
+    feedAdd('控制面下发 mode=' + (j.controller ? j.controller.mode : '?') +
+            (j.controller && j.controller.sequence ? ' @seq ' + j.controller.sequence : '') +
+            ' · ' + ((j.controller && j.controller.detail) || '已应用'), 'mode');
+    if (viewName === 'fleet'){ renderFleet(); } else { renderInstance(); }
+    return j.controller;
+  } catch (e) {
+    feedAdd('控制面不可达：' + e.message + '（需经 tools\\console.cmd 打开）', 'gap');
+    return null;
+  }
+}
+
+/* 自动模式的预取判据：useful 连续 8 窗越线才翻（10% 开/关） */function judgedTick(){
+  if (engineLive()) return;                  // 控制器判据未接线（T131），在线时不模拟
+  for (const inst of Object.values(INSTANCES)){
+    if (inst.state !== 'running'){ continue; }
+    if (ctlMode !== 'auto'){ inst.useLow = 0; inst.useHigh = 0; continue; }
+    const pot = inst.pot || 0;
+    if (inst.policy.prefetch){
+      if (pot < 10){ inst.useLow++; inst.useHigh = 0; } else inst.useLow = 0;
+      if (inst.useLow >= 8){
+        inst.policy.prefetch = false; inst.base.prefetch = 0; inst.useLow = 0;
+        feedAdd(inst.id + ' 预取：自动关（useful ' + pot.toFixed(1) + '% < 10%，连续 8 窗）', 'auto');
+      }
+    } else {
+      if (pot >= 10){ inst.useHigh++; inst.useLow = 0; } else inst.useHigh = 0;
+      if (inst.useHigh >= 8){
+        inst.policy.prefetch = true; inst.base.prefetch = 11; inst.useHigh = 0;
+        feedAdd(inst.id + ' 预取：自动开（useful ' + pot.toFixed(1) + '% ≥ 10%，连续 8 窗）', 'auto');
+      }
+    }
+  }
+}
+
+/* ---------- 引擎数据源：/monitor/info|snapshot|events（同源代理 tools\console.cmd） ----------
+   数据口径（T009 / T130）：
+   - decode / prefill = 引擎累计计数的 1 Hz 差分（5 s 窗口对齐引擎自报的 throughput 行）；
+   - TTFT = 引擎 service.ttft 首个已提交 token 的观测（prepare + 提交后区间），单请求值来自事件流；
+   - 引擎未发布的量（上传/覆盖/预取/发布/溢出/capt/miss）在这种情况下留空，由页面标“未上报”，不补 0；
+   - 端点缺失 → 明确标注“演示数据”；曾连上又断 → 不再回落到模拟值，只标 gap 并断线。 */
+const ENGINE = {
+  ok:false, everOk:false, at:null, base:'', port:null, model:'', ready:false,
+  info:null, snap:null, rate:null, counters:null, service:null, health:null,
+  control:null,
+  events:[], recentTtft:[], fail:0, down:false, reason:'端点未接入',
+  gapFrom:0, gaps:0, instId:null
+};
+function engineLive(){ return ENGINE.ok; }
+function enginePort(base){
+  const m = /:(\d+)\s*$/.exec(base || '');
+  return m ? parseInt(m[1], 10) : null;
+}
+function renderSrcBar(){
+  const bar = $('srcbar'), dot = $('srcDot');
+  if (!bar) return;
+  if (ENGINE.ok){
+    const stale = ENGINE.health && ENGINE.health.last_success_seconds_ago;
+    const fresh = stale == null || stale < 3;
+    bar.className = 'srcbar ' + (fresh ? 'live' : 'bad');
+    dot.className = 'dot ' + (fresh ? '' : 'warn');
+    $('srcTitle').textContent = '数据源：引擎 ' + (ENGINE.base || '') + (ENGINE.ready ? ' · ready' : ' · 未就绪');
+    $('srcDetail').textContent = 'decode / prefill / TTFT 为引擎自报计数的差分（1 Hz，5 s 窗口）· 控制台数字仅作观测，门禁与调优以引擎自报为准';
+    $('srcGap').textContent = 'gap ' + (ENGINE.gaps || 0) + ' 段' +
+      (ENGINE.health && ENGINE.health.event_ok === false ? ' · 事件流断开' : ' · 事件流在线') +
+      ' · ' + String(ENGINE.at || '').slice(11, 19) + (fresh ? '' : ' · 采样滞后');
+  } else {
+    const secs = ENGINE.gapFrom ? Math.round((Date.now() - ENGINE.gapFrom) / 1000) : 0;
+    bar.className = 'srcbar ' + (ENGINE.everOk ? 'bad' : 'demo');
+    dot.className = 'dot ' + (ENGINE.everOk ? 'bad' : 'warn');
+    $('srcTitle').textContent = ENGINE.everOk
+      ? '数据源：引擎断开 ' + secs + ' s（gap 分段，不插值）'
+      : '数据源：演示数据（引擎端点未接入）';
+    $('srcDetail').textContent = ENGINE.reason + (ENGINE.base ? ' · ' + ENGINE.base : '') +
+      (ENGINE.everOk ? ' · 曲线停在上次真实值，不回落到模拟' : ' · 所有数字为示意，不是实测');
+    $('srcGap').textContent = ENGINE.everOk ? ('已断 ' + secs + ' s · gap ' + (ENGINE.gaps || 0) + ' 段')
+                                            : '经 tools\\console.cmd 打开即接引擎 /monitor';
+  }
+}
+function markDemoCards(){
+  const live = ENGINE.ok || ENGINE.everOk;
+  const ids = ['c-cover','c-miss','c-pub','c-spill','c-pfu','i-static','i-nomiss','i-cap','i-fail',
+               'f-spill','f-miss','f-pub','f-gate','f-static','f-nomiss','f-cap','f-fail','p-conc','p-freeze','p-pf','p-graph','p-sc'];
+  for (const id of ids){
+    const el = $(id);
+    const card = el && el.closest ? el.closest('.card') : null;
+    if (!card) continue;
+    let tag = card.querySelector('h3 .demoFlag');
+    if (live){
+      if (tag) tag.remove();
+      continue;
+    }
+    if (!tag){
+      tag = document.createElement('span');
+      tag.className = 'tag demo demoFlag';
+      tag.textContent = '演示';
+      const h = card.querySelector('h3');
+      if (h) h.appendChild(tag);
+    }
+  }
+}
+async function pollEngine(){
+  let j;
+  try {
+    const r = await fetch('/api/engine.json', {cache:'no-store'});
+    j = await r.json();
+  } catch (e) {
+    engineFail('端点缺失（需经 tools\\console.cmd 打开，且引擎在跑）');
+    return;
+  }
+  if (!j || !j.ok){
+    if (j && j.base) ENGINE.base = j.base;
+    engineFail((j && (j.error || j.reason)) || '引擎不可达');
+    return;
+  }
+  const first = !ENGINE.everOk;
+  ENGINE.ok = true; ENGINE.everOk = true; ENGINE.down = false; ENGINE.fail = 0; ENGINE.reason = '';
+  ENGINE.gapFrom = 0;
+  ENGINE.at = j.at; ENGINE.base = j.base || ''; ENGINE.port = enginePort(j.base);
+  ENGINE.info = j.info || ENGINE.info;
+  ENGINE.snap = j.snapshot || null;
+  ENGINE.rate = j.rate || null;
+  ENGINE.counters = j.counters || null;
+  ENGINE.service = j.service || null;
+  ENGINE.health = j.health || null;
+  ENGINE.recentTtft = Array.isArray(j.recent_ttft_ms) ? j.recent_ttft_ms : [];
+  ENGINE.events = Array.isArray(j.events) ? j.events : [];
+  ENGINE.gaps = (j.health && j.health.gaps) || 0;
+  ENGINE.model = (ENGINE.info && ENGINE.info.model && ENGINE.info.model.name) || ENGINE.model || '';
+  ENGINE.ready = !!(ENGINE.snap && ENGINE.snap.engine && ENGINE.snap.engine.status === 'ready');
+  // T131: the engine's own control-plane state (mode + freeze policy). The page adopts it
+  // instead of keeping a UI-side selection that the engine never heard about.
+  ENGINE.control = (ENGINE.info && ENGINE.info.controller) || ENGINE.control || null;
+  if (ENGINE.control && ENGINE.control.mode){
+    const k = modeKey(ENGINE.control.mode);
+    if (k !== ctlMode && MODES[k]){ ctlMode = k; syncModeButtons(); }
+  }
+  if (first){
+    ensureEngineInstance();
+    feedAdd('引擎源接入 ' + ENGINE.base + ' · ' + (ENGINE.model || '?') + '（真实端点，非 mock）', 'info');
+    markDemoCards();
+    if (viewName === 'fleet'){ renderFleet(); drawFleet(); } else renderInstance();
+  }
+  const bound = INSTANCES[ENGINE.instId];
+  if (bound && ENGINE.service) bound.ttftBins = engineTtftBins(ENGINE.service);
+  renderSrcBar();
+}
+function engineFail(reason){
+  const was = ENGINE.ok;
+  ENGINE.ok = false; ENGINE.fail++;
+  if (was || !ENGINE.gapFrom) ENGINE.gapFrom = ENGINE.gapFrom || Date.now();
+  if (ENGINE.fail === 3 && !ENGINE.down){
+    ENGINE.down = true;
+    ENGINE.reason = reason || '引擎不可达';
+    feedAdd('引擎采样中断（' + (reason || '不可达') + '）· gap 记入，不插值', 'gap');
+  } else if (!ENGINE.reason){
+    ENGINE.reason = reason || '引擎不可达';
+  }
+  if (was) ENGINE.gaps++;
+  renderSrcBar();
+}
+function ensureEngineInstance(){
+  const id = 'engine-' + (ENGINE.model || 'serve') + '@' + (ENGINE.port || 0);
+  if (ENGINE.instId && INSTANCES[ENGINE.instId]) return INSTANCES[ENGINE.instId];
+  // 引擎在线时只保留真实实例：演示档位停用，避免真假数字同屏
+  for (const k of Object.keys(INSTANCES)){ INSTANCES[k].state = 'stopped'; INSTANCES[k].demo = true; }
+  const m = (ENGINE.info && ENGINE.info.model) || {};
+  const conf = (ENGINE.info && ENGINE.info.configuration) || {};
+  const kvMiB = conf.context_cache_host_mib || null;
+  const inst = makeInstance(id, m.name || ENGINE.model || 'serve', 'e2', null, (kvMiB || 8192), ENGINE.port);
+  // The live instance is created after the page-wide initSeries pass (it did not exist at load
+  // time), so its series map has to be filled here - otherwise pushSamples()/sumSeries() read an
+  // empty object and the live view throws instead of drawing.
+  initSeries(inst);
+  inst.live = true; inst.demo = false; inst.state = 'running';
+  const startS = ENGINE.info && ENGINE.info.start_time_seconds;
+  inst.startedAt = startS ? startS * 1000 : Date.now();
+  inst.policy = {c:(m.max_concurrency || 1), lanes:(m.max_concurrency || 1), freeze:false,
+                 reselect:false, fast:false, prefetch:false, graph:true};
+  inst.note = ENGINE.model || '';
+  INSTANCES[id] = inst;
+  ENGINE.instId = id;
+  current = id;
+  return inst;
+}
+
+/* ---------- 数据发生器：引擎在线取真实值；端点缺失时才是明确标注的演示数据 ---------- */
+function triple(v, band){
+  if (v == null || !isFinite(v)) return [null, null, null];
+  const lo = (band && band[0] != null && isFinite(band[0])) ? Math.min(v, band[0]) : v;
+  const hi = (band && band[1] != null && isFinite(band[1])) ? Math.max(v, band[1]) : v;
+  return [v, lo, hi];
+}
+function sample(inst){
+  const s = {};
+  if (!engineLive()){
+    // 曾连上后断开：停在上次真实值之外，只推 gap，不回到模拟值
+    if (ENGINE.everOk){
+      for (const k of Object.keys(METRICS)) s[k] = [null, null, null];
+      return s;
+    }
+    return demoSample(inst);
+  }
+  for (const k of Object.keys(METRICS)) s[k] = [null, null, null];
+  if (!inst.live) return s;
+  const r = ENGINE.rate || {}, band = r.band || {};
+  s.decode = triple(r.decode_tps, band.decode);
+  s.prefill = triple(r.prefill_tps, band.prefill);
+  const tt = ENGINE.recentTtft || [];
+  if (tt.length){
+    const last = tt[tt.length - 1];
+    s.ttft = [last, Math.min.apply(null, tt), Math.max.apply(null, tt)];
+  } else if (r.ttft_ms_1s != null){
+    s.ttft = triple(r.ttft_ms_1s);
+  }
+  // upload/cover/prefetch/publish/spill/capt/miss：引擎不发布，留空（页面标“未上报”）
+  return s;
+}
+function demoSample(inst){
+  const s = {};
+  if (inst.state !== 'running'){
+    for (const k of Object.keys(METRICS)) s[k] = [0,0,0];
+    return s;
+  }
+  const b = inst.base, r = () => Math.random();
+  inst.pot = Math.min(60, Math.max(0, inst.base0.prefetch + (r()-0.5)*5));   // 预取潜力（判据读数）
+  const wrap = (v, spread) => [v, Math.max(0, v*(1-spread)), v*(1+spread)];
+  s.decode  = wrap(Math.max(0, b.decode  * (1 + (r()-0.5)*0.10)), 0.05);
+  s.prefill = wrap(Math.max(0, b.prefill * (1 + (r()-0.5)*0.16)), 0.08);
+  s.ttft    = wrap(Math.max(0, b.ttft    * (1 + (r()-0.5)*0.18)), 0.09);
+  s.upload  = wrap(Math.max(0, b.upload  * (1 + (r()-0.5)*0.20)), 0.10);
+  const cov = Math.min(100, Math.max(0, b.cover + (r()-0.5)*3));
+  s.cover   = [cov, Math.max(0, cov-1.5), Math.min(100, cov+1.5)];
+  s.prefetch= inst.policy.prefetch ? wrap(Math.min(60, Math.max(0, inst.pot)), 0.04) : [0,0,0];
+  s.publish = wrap(Math.max(0, b.publish + (r()-0.5)*1), 0.03);
+  const sp = b.spill ? Math.min(8, Math.max(0, Math.round(b.spill + (r()-0.5)*2))) : 0;
+  s.spill   = [sp, sp, sp];
+  const cp = Math.min(100, Math.max(0, b.capt + (r()-0.5)*2));
+  s.capt    = [cp, Math.max(0, cp-1), Math.min(100, cp+1)];
+  const ms0 = Math.max(0, b.miss * (1 + (r()-0.5)*0.12));
+  s.miss    = [ms0, ms0*0.94, ms0*1.06];
+  return s;
+}
+function pushSamples(){
+  for (const inst of Object.values(INSTANCES)){
+    const s = sample(inst);
+    for (const k of Object.keys(METRICS)){
+      const arr = inst.series[k] || (inst.series[k] = []);
+      arr.push(s[k]);
+      if (arr.length > HIST) arr.shift();
+    }
+  }
+}
+if (!restored){
+  for (let i=0;i<40;i++) pushSamples();   // 预置 40 点，开局不空图
+  for (const inst of Object.values(INSTANCES)){
+    if (inst.state === 'running'){
+      const p = inst.policy;
+      feedAdd(inst.id + ' 并发：C=' + p.c + '（static ' + inst.base0.static.toFixed(0) + '% ' + (p.c>1?'≥':'<') + ' 80%）');
+      feedAdd(inst.id + ' 冻结：流式（no_miss ' + inst.base0.noMiss + '%，判据"连续 32 层全 clean"未达）');
+    }
+  }
+} else {
+  const n = Object.values(INSTANCES)[0].series.decode.length;
+  feedAdd('已恢复本地历史 · ' + n + ' 点 · 保存于 ' + new Date(restored.at).toLocaleTimeString(), 'info');
+}
+
+/* ---------- 请求生命周期模拟（口径：TTFT = 排队 + prefill；速度 = decode 斜率） ---------- */
+const TTFT_BOUNDS = [200, 500, 1000, 2000, 3000, 4000, 5000, 6000, 8000, 12000, 20000];
+function emptyBins(){ return {bounds:TTFT_BOUNDS.slice(), bins:new Array(TTFT_BOUNDS.length+1).fill(0), count:0}; }
+function binsAdd(bins, ms){
+  let i = 0; while (i < bins.bounds.length && ms >= bins.bounds[i]) i++;
+  bins.bins[i]++; bins.count++;
+}
+function binsQuantile(bins, q){
+  if (!bins || !bins.count) return null;
+  const target = bins.count * q;
+  let acc = 0;
+  for (let i = 0; i < bins.bins.length; i++){
+    const c = bins.bins[i];
+    if (!c){ continue; }
+    if (acc + c >= target){
+      if (i >= bins.bounds.length) return null;              // 溢出桶（无上界）→ "—"
+      const lo = i === 0 ? 0 : bins.bounds[i-1];
+      const hi = bins.bounds[i];
+      return lo + ((target - acc) / c) * (hi - lo);          // 桶内线性估计（与上游同口径）
+    }
+    acc += c;
+  }
+  return null;
+}
+const PROMPTS = [26, 74, 138, 490, 970, 2048];
+function reqSimTick(inst){
+  if (engineLive()) return;                  // 引擎在线时请求来自 /monitor，不模拟生命周期
+  if (inst.state !== 'running'){ inst.active = []; return; }
+  const C = Math.max(1, Math.min(8, inst.policy.c || 1));
+  if (!inst.ttftBins) inst.ttftBins = emptyBins();
+  if (inst.active.length < C && Math.random() < 0.75){
+    const promptTokens = PROMPTS[Math.floor(Math.random()*PROMPTS.length)];
+    const reused = (Math.random() < 0.35 && promptTokens >= 490) ? Math.floor(promptTokens*0.25) : 0;
+    const lane = inst.active.length;   // 批内分行：每 lane 一行
+    const queueMs = inst.active.length === 0 ? Math.round(Math.random()*120) : Math.round(inst.active.length*900 + Math.random()*500);
+    const prefillMs = promptTokens < 490 ? 900 + promptTokens*12 : 1200 + promptTokens*4;
+    inst.active.push({
+      id: inst.reqId++, phase:'prefill', lane, promptTokens, reused,
+      ttftMs: queueMs + prefillMs, queueMs, prefillMs,
+      age:0, gen:0, target:[16,64,128,256,512][Math.floor(Math.random()*5)],
+      speed:0, trace:[], events:[{t:0, k:'prefill_start'}]
+    });
+  }
+  for (const req of inst.active){
+    req.age++;
+    if (req.phase === 'prefill'){
+      if (req.age*1000 >= req.prefillMs){
+        req.phase = 'decode';
+        req.events.push({t:req.age, k:'first_token'});
+      }
+    } else {
+      req.speed = Math.max(1, inst.base.decode * (1 - req.lane*0.02) * (1 + (Math.random()-0.5)*0.08));
+      req.gen += req.speed;
+      req.trace.push(req.speed);
+      if (req.trace.length > 60) req.trace.shift();
+      if (req.gen >= req.target){
+        req.phase = 'done';
+        req.finish = (req.target >= 512 && Math.random() < 0.5) ? 'max' : 'done';
+        req.events.push({t:req.age, k:'finished'});
+        req.durationS = req.age;
+        req.meanSpeed = req.gen / Math.max(1, req.age - req.prefillMs/1000);
+        binsAdd(inst.ttftBins, req.ttftMs);
+        inst.pref.prompt += req.promptTokens;
+        inst.pref.reused += req.reused;
+      }
+    }
+  }
+  const fin = inst.active.filter(r => r.phase === 'done');
+  inst.active = inst.active.filter(r => r.phase !== 'done');
+  inst.doneR = fin.concat(inst.doneR).slice(0, 10);
+}
+
+/* ---------- 迷你 sparkline ---------- */
+function spark(el, vals, color){
+  if (!el) return;
+  const arr = (vals || []).filter(v => v != null);
+  if (arr.length < 2){ el.innerHTML = ''; return; }
+  const top = Math.max(...arr), bot = Math.min(...arr);
+  const span = (top - bot) || 1;
+  const pts = arr.map((v,i) => (i/(arr.length-1)*100).toFixed(1) + ',' + (23 - (v-bot)/span*21).toFixed(1)).join(' ');
+  el.innerHTML = '<polyline fill="none" stroke="' + (color||'#4c9aff') + '" stroke-width="1.4" points="' + pts + '" vector-effect="non-scaling-stroke"/>';
+  el.setAttribute('viewBox', '0 0 100 24');
+  el.setAttribute('preserveAspectRatio', 'none');
+}
+
+/* ---------- 折线图（min–max 带 + null 分段 + hover 读数） ---------- */
+function fmtAxis(v){
+  const a = Math.abs(v);
+  if (a >= 100) return v.toFixed(0);
+  if (a >= 10) return v.toFixed(1);
+  if (a >= 1) return v.toFixed(1);
+  return v.toFixed(2);
+}
+function pathFor(data, n, P, min, max){
+  if (!n) return '';
+  let d = '', pen = false;
+  for (let i=0;i<n;i++){
+    const x = P.l + (n===1?0:(i/(n-1))*P.w);
+    const raw = data[i];
+    if (raw == null){ pen = false; continue; }   // 采样 gap：分段不连线
+    const v = Math.min(max, Math.max(min, raw));
+    const y = P.t + P.h - ((v-min)/((max-min)||1))*P.h;
+    d += (pen ? ' L' : ' M') + x.toFixed(1) + ',' + y.toFixed(1);
+    pen = true;
+  }
+  return d;
+}
+function bandPath(lo, hi, n, P, min, max){
+  let d = '', run = [];
+  const flush = () => {
+    if (run.length < 2){ run = []; return; }
+    const xs = i => P.l + (n===1?0:(i/(n-1))*P.w);
+    const ys = v => P.t + P.h - ((Math.min(max, Math.max(min, v))-min)/((max-min)||1))*P.h;
+    let seg = 'M' + xs(run[0]).toFixed(1) + ',' + ys(hi[run[0]]).toFixed(1);
+    for (let j=1;j<run.length;j++) seg += ' L' + xs(run[j]).toFixed(1) + ',' + ys(hi[run[j]]).toFixed(1);
+    for (let j=run.length-1;j>=0;j--) seg += ' L' + xs(run[j]).toFixed(1) + ',' + ys(lo[run[j]]).toFixed(1);
+    d += seg + ' Z';
+    run = [];
+  };
+  for (let i=0;i<n;i++){
+    if (lo[i] != null && hi[i] != null) run.push(i); else flush();
+  }
+  flush();
+  return d;
+}
+function niceMax(v){
+  const p = Math.pow(10, Math.floor(Math.log10(Math.max(1,v))));
+  return Math.ceil(v/p)*p;
+}
+function attachHover(svg, readoutEl){
+  if (!svg || svg._hinit) return;
+  svg._hinit = true;
+  svg.addEventListener('mousemove', ev => {
+    const P = svg._P, n = svg._n;
+    if (!P || !n){ return; }
+    const rect = svg.getBoundingClientRect();
+    const x = (ev.clientX - rect.left) / rect.width * 920;
+    const idx = Math.max(0, Math.min(n-1, Math.round((x - P.l) / (P.w || 1) * (n-1))));
+    svg._hov = idx;
+    hoverOverlay(svg);
+    if (svg._cb) readoutEl.innerHTML = svg._cb(idx);
+  });
+  svg.addEventListener('mouseleave', () => {
+    svg._hov = null;
+    hoverOverlay(svg);
+    if (svg._cb) readoutEl.innerHTML = svg._cb(null);
+  });
+}
+function hoverOverlay(svg){
+  const line = svg.querySelector('.hovline');
+  if (!line) return;
+  if (svg._hov == null){ line.setAttribute('visibility', 'hidden'); return; }
+  const P = svg._P, n = svg._n;
+  const x = P.l + (n===1?0:(svg._hov/(n-1))*P.w);
+  line.setAttribute('x1', x); line.setAttribute('x2', x);
+  line.setAttribute('visibility', 'visible');
+}
+function drawChart(svg, opts){
+  const W = 920, H = opts.height || 260;
+  const P = {l:54, r:opts.rightAxis?56:16, t:14, b:26};
+  P.w = W - P.l - P.r; P.h = H - P.t - P.b;
+  const n = opts.n;
+  svg._P = P; svg._n = n; svg._cb = opts.hover ? opts.hover.cb : null;
+  let g = '';
+  for (let i=0;i<=4;i++){
+    const y = P.t + (P.h*i/4);
+    g += '<line x1="'+P.l+'" y1="'+y.toFixed(1)+'" x2="'+(P.l+P.w)+'" y2="'+y.toFixed(1)+'" stroke="#1d2530" stroke-width="1"/>';
+  }
+  for (let i=0;i<=4;i++){
+    const y = P.t + (P.h*i/4);
+    const v = opts.left.max - (opts.left.max-opts.left.min)*i/4;
+    g += '<text x="'+(P.l-8)+'" y="'+(y+3.5).toFixed(1)+'" fill="#5d6878" font-size="10" text-anchor="end" font-family="monospace">'+fmtAxis(v)+'</text>';
+  }
+  if (opts.rightAxis){
+    for (let i=0;i<=4;i++){
+      const y = P.t + (P.h*i/4);
+      const v = opts.rightAxis.max - (opts.rightAxis.max-opts.rightAxis.min)*i/4;
+      g += '<text x="'+(P.l+P.w+8)+'" y="'+(y+3.5).toFixed(1)+'" fill="#5d6878" font-size="10" font-family="monospace">'+fmtAxis(v)+'</text>';
+    }
+  }
+  for (const s of opts.series){
+    if (!s.on) continue;
+    const axis = (s.axis === 'R' && opts.rightAxis) ? opts.rightAxis : opts.left;
+    if (s.lo && s.hi){
+      const bd = bandPath(s.lo, s.hi, n, P, axis.min, axis.max);
+      if (bd) g += '<path d="'+bd+'" fill="'+s.color+'" opacity="0.07"/>';
+    }
+    const d = pathFor(s.data, n, P, axis.min, axis.max);
+    if (d) g += '<path d="'+d+'" fill="none" stroke="'+s.color+'" stroke-width="'+(s.width||1.7)+'" stroke-linejoin="round"/>';
+    if (s.data.length){
+      const v = Math.min(axis.max, Math.max(axis.min, s.data[s.data.length-1]));
+      const y = P.t + P.h - ((v-axis.min)/((axis.max-axis.min)||1))*P.h;
+      g += '<circle cx="'+(P.l+P.w).toFixed(1)+'" cy="'+y.toFixed(1)+'" r="2.8" fill="'+s.color+'"/>';
+    }
+  }
+  g += '<line x1="'+P.l+'" y1="'+(P.t+P.h)+'" x2="'+(P.l+P.w)+'" y2="'+(P.t+P.h)+'" stroke="#2e3948"/>';
+  if (opts.hover){
+    const hx = svg._hov == null ? 0 : P.l + (n===1?0:(svg._hov/(n-1))*P.w);
+    g += '<line class="hovline" x1="'+hx+'" x2="'+hx+'" y1="'+P.t+'" y2="'+(P.t+P.h)+'" stroke="#3d4a5c" stroke-width="1" visibility="'+(svg._hov==null?'hidden':'visible')+'"/>';
+  }
+  g += '<text x="'+P.l+'" y="'+(H-6)+'" fill="#5d6878" font-size="10">'+(opts.left.unit||'')+'</text>';
+  if (opts.rightAxis) g += '<text x="'+(P.l+P.w)+'" y="'+(H-6)+'" fill="#5d6878" font-size="10" text-anchor="end">'+opts.rightAxis.unit+'</text>';
+  svg.innerHTML = g;
+  if (opts.hover) attachHover(svg, opts.hover.el);
+}
+
+/* ---------- 总控：集群曲线 ---------- */
+function visibleInstances(){
+  let v = Object.values(INSTANCES).filter(i=>i.state!=='stopped');
+  if (engineLive()) v = v.filter(i=>i.live);
+  return v;
+}
+function runningList(){
+  let v = Object.values(INSTANCES).filter(i=>i.state==='running');
+  if (engineLive()) v = v.filter(i=>i.live);
+  return v;
+}
+function tail(arr, win){ return arr.slice(-win); }
+function trip(arr, win){
+  const t = tail(arr, win);
+  return {v:t.map(x=>x[0]), lo:t.map(x=>x[1]), hi:t.map(x=>x[2])};
+}
+function drawFleet(){
+  const metric = $('fleetMetric').value;
+  const win = parseInt($('fleetWin').value,10);
+  const stack = $('fleetStack').value;
+  const M = METRICS[metric];
+  const list = visibleInstances();
+  const series = [];
+
+  if (stack === 'sum'){
+    const n = Math.min(win, HIST);
+    const v = [], lo = [], hi = [];
+    for (let i=0;i<n;i++){
+      let sv = 0, sl = 0, sh = 0, any = false;
+      for (const inst of list){
+        const arr = inst.series[metric];
+        const idx = arr.length - n + i;
+        if (idx >= 0 && arr[idx][0] != null){ sv += arr[idx][0]; sl += arr[idx][1]; sh += arr[idx][2]; any = true; }
+      }
+      v.push(any?sv:null); lo.push(any?sl:null); hi.push(any?sh:null);
+    }
+    series.push({label:'合计', data:v, lo:lo, hi:hi, color:M.color, axis:'L', on:true});
+  } else {
+    const palette = ['#4c9aff','#3fb950','#d29922','#7c5cff','#39c5cf','#f778ba','#f85149'];
+    list.forEach((inst, idx) => {
+      const t = trip(inst.series[metric], win);
+      series.push({label:inst.id, data:t.v, lo:t.lo, hi:t.hi,
+                   color:palette[idx%palette.length], axis:'L', on:inst.sel});
+    });
+  }
+  const on = series.filter(s=>s.on);
+  const all = on.flatMap(s=>s.data).filter(v => v != null);
+  const top = niceMax(Math.max(1, ...all) * 1.08);
+  const n = series.length ? Math.min(win, ...series.map(s=>s.data.length)) : win;
+  drawChart($('fleetChart'), {
+    n, height:260, series, left:{min:0, max:top, unit:M.unit},
+    hover:{el:$('fleetHover'), cb:idx => {
+      if (idx == null) return '';
+      const tSec = (n-1-idx);
+      const parts = on.filter(s=>s.data[idx] != null).map(s =>
+        '<b style="color:' + s.color + '">' + s.label + '</b> ' + s.data[idx].toFixed(1) +
+        ' <span class="sub">(' + (s.lo[idx]||0).toFixed(1) + '–' + (s.hi[idx]||0).toFixed(1) + ')</span>');
+      return 'T−' + tSec + 's · ' + (parts.join(' · ') || '—');
+    }}
+  });
+  $('fleetWinLbl').textContent = '近 ' + win + ' s · 1 Hz · ' + (stack==='sum'?'合计':'分实例');
+  const lg = $('fleetLegend');
+  if (stack === 'sum'){
+    lg.innerHTML = '<span class="chip" style="cursor:default"><i style="background:'+M.color+'"></i>全部实例合计 · '+M.label+' ('+M.unit+')</span>';
+  } else {
+    lg.innerHTML = series.map(s =>
+      '<span class="chip '+(s.on?'':'off')+'" onclick="toggleSelect(\''+s.label+'\')"><i style="background:'+s.color+'"></i>'+s.label+'</span>'
+    ).join('') + '<span class="chip off" style="cursor:default"><i style="background:#5d6878"></i>未勾选不画</span>';
+  }
+}
+
+/* ---------- 总控：指标卡 / 控制器 / 矩阵 ---------- */
+function latest(inst, k){
+  const a = inst.series[k];
+  if (!a || !a.length) return null;
+  const v = a[a.length-1][0];
+  return (v == null || !isFinite(v)) ? null : v;
+}
+function fmtNum(v, d){ return (v == null || !isFinite(v)) ? '—' : v.toFixed(d); }
+function fmtInt(v){ return (v == null || !isFinite(v)) ? '—' : Math.round(v).toLocaleString('en-US'); }
+function fmtGiB(bytes){ return (bytes == null || !isFinite(bytes)) ? '—' : (bytes/1073741824).toFixed(2) + ' GiB'; }
+const NOT_PUBLISHED = '<span class="tag na">引擎未上报</span>';
+function fleetVram(){
+  let poolSum = 0, kvSum = 0;
+  for (const i of visibleInstances()){ poolSum += i.pool; kvSum += 3200; }
+  return 2.3 + poolSum/1024 + kvSum/1024;
+}
+function fleetRam(){
+  let warm = 0;
+  for (const i of visibleInstances()) warm += warmMiB(i.pool);
+  return 8.0 + warm/1024;
+}
+function fleetUp(){
+  return runningList().reduce((s,i)=>s + latest(i,'upload')*40*i.base.decode/1024, 0);
+}
+function shortPolicy(inst){
+  const p = inst.policy;
+  return 'C=' + p.c + ' · ' + (p.freeze ? '冻结+快路径' : '流式') + ' · 预取' + (p.prefetch?'开':'关') + ' · 图' + (p.graph?'开':'关');
+}
+function sumSeries(metric, n){
+  const running = runningList();
+  const out = [];
+  for (let i=0;i<n;i++){
+    let v = 0, any = false;
+    for (const inst of running){
+      const arr = inst.series[metric] || [];
+      const idx = arr.length - n + i;
+      if (idx >= 0){ v += arr[idx][0]; any = true; }
+    }
+    out.push(any?v:null);
+  }
+  return out;
+}
+
+/* ---------- 引擎在线时的真实渲染：只显示引擎真正测量的量 ----------
+   边界照 T009：Host 相位与 device wait 不相加；TTFT 是首个已提交 token 的一次观测；
+   容量/占用/物理三分。本机 Engine 不发布的量（物理显存、上传带宽、缓存覆盖、预取、
+   capt_ready、miss/token、温区分段）一律显示“引擎未上报”，不画 0 也不估。 */
+function engRuntime(){ return (((ENGINE.snap || {}).engine || {}).runtime) || {}; }
+function engBudget(){
+  const ranks = (((ENGINE.info || {}).resources || {}).ranks) || [];
+  return (ranks[0] && ranks[0].budget) || {};
+}
+function engModel(){ return (ENGINE.info && ENGINE.info.model) || {}; }
+function engConfig(){ return (ENGINE.info && ENGINE.info.configuration) || {}; }
+function engineTtftBins(service){
+  const t = (service || {}).ttft;
+  if (!t || !Array.isArray(t.bins)) return null;
+  const bounds = ((service || {}).duration_bounds_seconds || []).map(x => x * 1000);
+  const bins = t.bins.slice();
+  const count = bins.reduce((a, b) => a + (b || 0), 0);
+  return {bounds: bounds, bins: bins, count: count};
+}
+function engineEventsByRequest(){
+  const map = {};
+  for (const e of (ENGINE.events || [])){
+    const id = e.request_id;
+    if (id == null) continue;
+    const rec = map[id] || (map[id] = {id: id});
+    if (e.kind === 'first_token' && e.details) rec.ttft_s = e.details.ttft_seconds;
+    if ((e.kind === 'request_completed' || e.kind === 'request_cancelled') && e.details){
+      rec.prompt = e.details.prompt_tokens;
+      rec.completion = e.details.completion_tokens;
+    }
+    rec.kind = e.kind;
+    rec.at = e.timestamp_unix_ms;
+  }
+  return Object.values(map).sort((a, b) => (b.at || 0) - (a.at || 0));
+}
+
+function renderFleetLive(){
+  const inst = INSTANCES[ENGINE.instId];
+  const rt = engRuntime(), budget = engBudget();
+  const d = inst ? latest(inst, 'decode') : null;
+  const p = inst ? latest(inst, 'prefill') : null;
+
+  $('f-dec').innerHTML = fmtNum(d, 1) + '<small>tok/s</small>';
+  $('f-dec-sub').textContent = '引擎自报差分（5 s 窗口）· 累计 decode ' + fmtInt(rt.committed_decode_tokens) + ' tok · ' + fmtInt(rt.decode_rounds) + ' 轮';
+  $('f-pre').innerHTML = fmtNum(p, 0) + '<small>tok/s</small>';
+  $('f-pre-sub').textContent = '累计 prefill ' + fmtInt(rt.computed_prefill_tokens) + ' tok · chunk ' + fmtInt(engModel().prefill_chunk);
+
+  const pages = rt.device_main_kv_occupied_pages, cap = budget.kv_capacity_page_groups;
+  const ratio = (pages != null && cap) ? Math.min(100, pages / cap * 100) : null;
+  $('f-vram').innerHTML = '—<small>GiB</small>';
+  $('f-vram-r').textContent = 'KV ' + fmtInt(pages) + ' / ' + fmtInt(cap) + ' 页';
+  $('f-vram-bar').innerHTML = ratio == null ? '' :
+    '<i style="width:' + ratio.toFixed(0) + '%;background:var(--accent)"></i>';
+  $('f-vram-sub').textContent = '逻辑 KV 占用；serve 不发布物理显存，硬件读数见下方 NVML';
+
+  $('f-ram').innerHTML = '—<small>GiB</small>';
+  $('f-ram-bar').innerHTML = '';
+  $('f-ram-sub').textContent = 'serve 不发布进程 RSS / 主机 arena 读数';
+  $('f-disk').innerHTML = LC.ok ? fmtGiB(LC.l1mem) : '—<small>GiB</small>';
+  $('f-disk-bar').innerHTML = LC.ok && LC.ratio != null
+    ? '<i style="width:' + Math.min(100, LC.ratio * 100).toFixed(0) + '%;background:var(--accent2)"></i>' : '';
+  $('f-disk-sub').textContent = LC.ok ? 'LMCache L1 使用率 ' + (LC.ratio * 100).toFixed(1) + '%（独立源）' : 'LMCache 未接入';
+  $('f-up').innerHTML = '—<small>GB/s</small>';
+  $('f-up-sub').textContent = '引擎未发布上传带宽';
+
+  spark($('sp-fdec'), sumSeries('decode', 60), '#4c9aff');
+  spark($('sp-fpre'), sumSeries('prefill', 60), '#3fb950');
+  spark($('sp-fvram'), [], '#7c5cff');
+  spark($('sp-fram'), [], '#39c5cf');
+  spark($('sp-fdisk'), lcHist.slice(-60), '#8b98a8');
+  spark($('sp-fup'), [], '#f778ba');
+
+  $('fleetState').innerHTML = '<span class="dot ' + (ENGINE.ready ? '' : 'warn') + '"></span>引擎 1 · ' +
+    (ENGINE.ready ? 'ready' : '未就绪') + ' · ' + (ENGINE.port ? ':' + ENGINE.port : '');
+
+  const ctl = engControl();
+  const ctlModeInfo = ctl && MODES[modeKey(ctl.mode)] ? MODES[modeKey(ctl.mode)] : null;
+  $('c-mode').innerHTML = ctl
+    ? '<span class="tag eng">引擎</span> ' + (ctlModeInfo ? ctlModeInfo.name : ctl.mode)
+    : '<span class="tag eng">只读观测</span> <span class="tag na">控制面未接入</span>';
+  $('c-bar').textContent = ctl
+    ? ((ctlModeInfo ? ctlModeInfo.barTxt : ('引擎模式 ' + ctl.mode)) + ' · 控制面 seq ' + (ctl.sequence || 0))
+    : '控制面未接入：模式切换不改变引擎策略';
+  $('c-guard').textContent = ctl ? (ctl.detail || '—') : '—';
+  $('c-per').innerHTML = inst ? ('<div class="row"><span class="sub">' + inst.id + '</span><b style="font-size:11px">C=' +
+    fmtInt(engModel().max_concurrency) + ' · ' + (engModel().kv_cache || '—') + ' · chunk ' + fmtInt(engModel().prefill_chunk) + '</b></div>')
+    : '<div class="sub">无引擎实例</div>';
+  $('c-feed').innerHTML = feedHtml(5);
+
+  const q = inst ? inst.ttftBins : null;
+  const p50 = q && q.count ? binsQuantile(q, 0.5) : null;
+  $('fleetRows').innerHTML = inst ? (function(){
+    const arr = inst.series.decode, n = Math.min(30, arr.length);
+    const base = Math.max(1, ...arr.map(x => x[0] || 0)) || 1;
+    const pts = arr.slice(-30).map((x, i) => {
+      const px = n === 1 ? 0 : (i / (n - 1)) * 80;
+      const py = x[0] == null ? 22 : 22 - Math.min(22, (x[0] / (base * 1.4)) * 22);
+      return px.toFixed(1) + ',' + py.toFixed(1);
+    }).join(' ');
+    return '<tr class="pick cur" onclick="enterInstance(\'' + inst.id + '\')">'
+      + '<td><input type="checkbox" checked onclick="event.stopPropagation()"></td>'
+      + '<td>' + inst.id + '<br><span class="sub">' + (ENGINE.model || '') + ' · :' + ENGINE.port + ' · live</span></td>'
+      + '<td><span class="tag eng">engine</span></td>'
+      + '<td class="n">' + fmtNum(latest(inst, 'decode'), 1) + '</td>'
+      + '<td class="n">' + (p50 == null ? '—' : fmtMs(p50)) + '</td>'
+      + '<td class="n">—</td><td class="n">—</td>'
+      + '<td><svg width="84" height="26" viewBox="0 0 84 26"><polyline fill="none" stroke="#3fb950" stroke-width="1.5" points="' + pts + '"/></svg></td>'
+      + '</tr>';
+  })() : '<tr><td colspan="8" class="sub">引擎未接入</td></tr>';
+
+  $('f-spill').innerHTML = NOT_PUBLISHED;
+  $('f-miss').innerHTML = NOT_PUBLISHED;
+  $('f-pub').innerHTML = NOT_PUBLISHED;
+  $('f-gate').innerHTML = NOT_PUBLISHED;
+  $('f-static').innerHTML = NOT_PUBLISHED;
+  $('f-nomiss').innerHTML = NOT_PUBLISHED;
+  $('f-cap').innerHTML = NOT_PUBLISHED;
+  $('f-fail').innerHTML = NOT_PUBLISHED;
+
+  const alerts = [];
+  if (!ENGINE.ready) alerts.push('引擎状态 ' + (((ENGINE.snap || {}).engine || {}).status || '?') + '：暂不接受工作');
+  if (ENGINE.health && ENGINE.health.gaps) alerts.push('引擎采样 gap ' + ENGINE.health.gaps + ' 段（断线期间曲线分段，未插值）');
+  if (ENGINE.health && ENGINE.health.event_ok === false) alerts.push('事件流断开：' + ENGINE.health.event_reason);
+  if (rt.waiting_requests) alerts.push('等待准入请求 ' + rt.waiting_requests + ' 个');
+  if (GPU.ok && GPU.cur){
+    const act = (GPU.cur.event_reasons && GPU.cur.event_reasons.active) || [];
+    if (act.indexOf('sw_power_cap') >= 0)
+      alerts.push('GPU：SW 功耗墙置位（' + (GPU.cur.power || 0).toFixed(0) + ' W / ' + (GPU.limit ? Math.round(GPU.limit) : '—') + ' W）');
+    if (GPU.cur.temp != null && GPU.cur.temp > 83) alerts.push('GPU 温度 ' + GPU.cur.temp + '°C > 83°C');
+  }
+  $('alerts').innerHTML = alerts.length
+    ? alerts.map(a => '<div class="alertbar">' + a + '</div>').join('')
+    : '<div class="row"><span>无告警</span><b style="color:var(--good)">OK</b></div>';
+}
+
+function renderInstanceLive(){
+  const inst = INSTANCES[ENGINE.instId];
+  if (!inst) return;
+  const rt = engRuntime(), budget = engBudget(), m = engModel();
+  const d = latest(inst, 'decode'), p = latest(inst, 'prefill'), t = latest(inst, 'ttft');
+  $('inst').innerHTML = instOptions();
+  $('inst').value = current;
+  $('i-state').innerHTML = '<span class="tag eng">engine</span>' +
+    (ENGINE.ready ? '' : ' <span class="tag start">未就绪</span>');
+  $('i-art').innerHTML = '<span class="tag e2">' + (m.architecture || 'model') + '</span> · ' +
+    (m.kv_cache || '—') + ' · max-context ' + fmtInt(m.max_context) + ' · 池未发布';
+  $('i-up').textContent = ':' + ENGINE.port + ' · ' + uptime(inst);
+  $('i-start').classList.add('hidden');
+  $('i-stop').classList.add('hidden');
+
+  $('i-dec').innerHTML = fmtNum(d, 1) + '<small>tok/s</small>';
+  $('i-dec-sub').textContent = '引擎自报差分 · 累计 ' + fmtInt(rt.committed_decode_tokens) + ' tok · ' + fmtInt(rt.decode_rounds) + ' 轮';
+  $('i-dec-bar').style.width = d == null ? '0%' : Math.min(100, d / 130 * 100).toFixed(0) + '%';
+  $('i-pre').innerHTML = fmtNum(p, 0) + '<small>tok/s</small>';
+  $('i-pre-sub').textContent = '累计 prefill ' + fmtInt(rt.computed_prefill_tokens) + ' tok · chunk ' + fmtInt(m.prefill_chunk);
+  $('i-pre-bar').style.width = p == null ? '0%' : Math.min(100, p / 620 * 100).toFixed(0) + '%';
+  $('i-ttft').innerHTML = fmtNum(t, 0) + '<small>ms</small>';
+  const q = inst.ttftBins;
+  $('i-ttft2').textContent = (q && q.count)
+    ? (fmtMs(binsQuantile(q, 0.5)) + ' / ' + fmtMs(binsQuantile(q, 0.99)) + ' · ' + q.count + ' 样本')
+    : '暂无首 token 样本';
+  const reused = rt.reused_prompt_tokens || 0, prompt = rt.prompt_tokens || 0;
+  $('i-kvh').textContent = prompt ? (fmtInt(reused) + '/' + fmtInt(prompt) + ' token 复用 · ' + (reused / prompt * 100).toFixed(0) + '%') : '暂无样本';
+
+  spark($('sp-idec'), inst.series.decode.slice(-60).map(x => x[0]), '#4c9aff');
+  spark($('sp-ipre'), inst.series.prefill.slice(-60).map(x => x[0]), '#3fb950');
+  spark($('sp-ittft'), inst.series.ttft.slice(-60).map(x => x[0]), '#d29922');
+
+  $('c-cover').innerHTML = NOT_PUBLISHED; $('c-cover-bar').style.width = '0%';
+  $('c-miss').innerHTML = NOT_PUBLISHED;
+  $('c-pub').innerHTML = NOT_PUBLISHED;
+  $('c-spill').innerHTML = NOT_PUBLISHED;
+  $('c-pfu').innerHTML = NOT_PUBLISHED;
+  $('kv-dev').textContent = fmtInt(rt.device_main_kv_occupied_pages) + ' / ' + fmtInt(budget.kv_capacity_page_groups) + ' 页';
+  $('kv-host').textContent = fmtGiB(rt.host_kv_occupied_bytes) + ' / ' + fmtGiB(budget.host_context_capacity_bytes);
+  $('kv-disk').textContent = LC.ok ? fmtGiB(LC.l1mem) : '—';
+  $('i-static').innerHTML = NOT_PUBLISHED;
+  $('i-nomiss').innerHTML = NOT_PUBLISHED;
+  $('i-cap').innerHTML = NOT_PUBLISHED;
+  $('i-fail').innerHTML = NOT_PUBLISHED;
+
+  const ctl = engControl();
+  $('p-mode').innerHTML = ctl
+    ? '<span class="tag eng">引擎</span> ' + ctl.mode + (ctl.mode_live ? '' : '（启动初值）')
+    : '<span class="tag eng">只读观测</span>';
+  $('p-conc').textContent = 'C=' + fmtInt(m.max_concurrency) + '（/monitor/info 启动配置）';
+  $('p-freeze').textContent = freezeText(ctl);
+  $('p-pf').innerHTML = NOT_PUBLISHED;
+  $('p-graph').textContent = '启动配置未在 /monitor 发布';
+  $('p-sc').innerHTML = NOT_PUBLISHED;
+
+  $('d-conc').textContent = '判据只在 [ctl] 日志（引擎未发布）';
+  $('d-freeze').textContent = ctl ? freezeText(ctl) : '引擎未发布';
+  $('d-pf').textContent = '判据只在 [ctl] 日志（引擎未发布）';
+  $('d-graph').textContent = '构造期决策：/monitor 未发布';
+  $('d-feed').innerHTML = feedHtml(4);
+
+  $('wband').innerHTML = '';
+  $('wlegend').innerHTML = '<span>温区四段：引擎未发布</span>';
+  $('w-mode').textContent = ctl ? ctl.mode : NOT_PUBLISHED;
+  $('w-fz').textContent = ctl ? freezeText(ctl) : NOT_PUBLISHED;
+  $('w-cov').innerHTML = NOT_PUBLISHED;
+
+  renderRequestsLive(inst);
+  drawInst();
+}
+
+const REQ_HEAD_LIVE = '<tr><th>Phase</th><th>ID</th><th>协议</th><th class="n">prompt</th>'
+  + '<th class="n">completion</th><th class="n" title="首个已提交 token：prepare + 提交后区间（T009）">TTFT</th>'
+  + '<th>事件</th></tr>';
+function renderRequestsLive(inst){
+  const svc = ENGINE.service || {};
+  const active = svc.requests || [];
+  const recs = engineEventsByRequest();
+  const finished = recs.filter(r => r.kind === 'request_completed' || r.kind === 'request_cancelled');
+  if ($('reqHead')) $('reqHead').innerHTML = REQ_HEAD_LIVE;
+  $('reqCount').textContent = active.length + ' 活跃 · ' + finished.length + ' 最近事件 · submitted ' +
+    fmtInt(svc.submitted) + ' / completed ' + fmtInt(svc.completed);
+  let html = active.map(r => '<tr>'
+    + '<td>' + (r.preparing ? '<span class="tag pf">prefill</span>' : '<span class="tag dc">decode</span>') + '</td>'
+    + '<td class="n">#' + r.id + '</td>'
+    + '<td class="sub">' + (r.protocol || '—') + (r.stream ? ' · stream' : '') + '</td>'
+    + '<td class="n">—</td><td class="n">—</td><td class="n">—</td>'
+    + '<td class="sub">进行中</td></tr>').join('');
+  if (finished.length){
+    html += '<tr class="reqdiv"><td colspan="7">Recently completed（事件流）</td></tr>';
+    html += finished.slice(0, 10).map(r => '<tr>'
+      + '<td><span class="tag ' + (r.kind === 'request_cancelled' ? 'max' : 'done') + '">' + (r.kind === 'request_cancelled' ? 'cancelled' : 'done') + '</span></td>'
+      + '<td class="n">#' + r.id + '</td>'
+      + '<td class="sub">—</td>'
+      + '<td class="n">' + fmtInt(r.prompt) + '</td>'
+      + '<td class="n">' + fmtInt(r.completion) + '</td>'
+      + '<td class="n">' + (r.ttft_s == null ? '—' : fmtMs(r.ttft_s * 1000)) + '</td>'
+      + '<td class="sub">' + (r.at ? new Date(r.at).toLocaleTimeString() : '—') + '</td></tr>').join('');
+  }
+  $('reqRows').innerHTML = html || '<tr><td colspan="7" class="sub">暂无请求（发起一次 chat 后出现）</td></tr>';
+  renderTTFT(inst.ttftBins);
+}
+
+function renderFleet(){
+  if (engineLive() && INSTANCES[ENGINE.instId]) return renderFleetLive();
+  const list = Object.values(INSTANCES);
+  const running = runningList();
+  const starting = list.filter(i=>i.state==='starting');
+  const M = MODES[ctlMode];
+
+  const dec = running.reduce((s,i)=>s+latest(i,'decode'),0);
+  const pre = running.reduce((s,i)=>s+latest(i,'prefill'),0);
+  $('f-dec').innerHTML = dec.toFixed(1) + '<small>tok/s</small>';
+  $('f-dec-sub').textContent = running.length + ' 个实例在跑 · 解码在显存带宽天花板（≈1.05 TB/s，峰值 1.008）';
+  $('f-pre').innerHTML = pre.toFixed(0) + '<small>tok/s</small>';
+  $('f-pre-sub').textContent = 'chunked prefill · 平均 ' + (running.length ? (pre/running.length).toFixed(0) : 0) + ' tok/s';
+
+  const vram = fleetVram();
+  $('f-vram').innerHTML = vram.toFixed(1) + '<small>GiB</small>';
+  $('f-vram-r').textContent = '权重 2.3 · 池 ' + (visibleInstances().reduce((s,i)=>s+i.pool,0)/1024).toFixed(1) + ' · KV ' + (visibleInstances().length*3.2).toFixed(1) + ' / 24';
+  const vOver = vram > 23;
+  $('f-vram-bar').innerHTML = '<i style="width:' + Math.min(100, vram/24*100).toFixed(0) + '%;background:' + (vOver?'var(--warn)':'var(--accent)') + '"></i>';
+  $('f-vram-sub').textContent = '留 1 GiB 安全' + (vOver ? ' · 已超安全余量' : '');
+
+  const ram = fleetRam();
+  const ramPct = ram/32*100;
+  $('f-ram').innerHTML = ram.toFixed(1) + '<small>GiB</small>';
+  $('f-ram-bar').innerHTML = '<i style="width:' + ramPct.toFixed(0) + '%;background:' + (ramPct>92?'var(--bad)':ramPct>80?'var(--warn)':'var(--cyan)') + '"></i>';
+  $('f-ram-sub').textContent = 'KV arena 8.0 · 温区 ' + (running.length ? (running.reduce((s,i)=>s+warmMiB(i.pool),0)/1024).toFixed(1) : '0') + '（显存补集）';
+
+  const disk = 12.4;
+  $('f-disk').innerHTML = disk.toFixed(1) + '<small>GiB</small>';
+  $('f-disk-bar').innerHTML = '<i style="width:34%;background:var(--accent2)"></i>';
+  $('f-disk-sub').textContent = 'LMCache · 命中 531/538（98.7% 真机）';
+
+  const up = fleetUp();
+  $('f-up').innerHTML = up.toFixed(2) + '<small>GB/s</small>';
+  $('f-up-sub').textContent = '每层上传 × 40 层 × decode · 实测上限 8.9';
+
+  /* 指标卡 sparkline（Strata 模式：每卡一条迷你曲线） */
+  spark($('sp-fdec'), sumSeries('decode', 60), '#4c9aff');
+  spark($('sp-fpre'), sumSeries('prefill', 60), '#3fb950');
+  spark($('sp-fvram'), FBUF.vram, '#7c5cff');
+  spark($('sp-fram'), FBUF.ram, '#39c5cf');
+  spark($('sp-fdisk'), FBUF.disk, '#8b98a8');
+  spark($('sp-fup'), FBUF.up, '#f778ba');
+
+  $('fleetState').innerHTML = '<span class="dot"></span>' + running.length + ' 运行 / ' + starting.length + ' 启动中';
+
+  /* 控制器卡 */
+  $('c-mode').innerHTML = '<span class="tag mode">' + M.name + '</span>' + (paused ? ' <span class="tag start">已暂停 · 采集继续</span>' : '');
+  $('c-bar').textContent = M.barTxt;
+  $('c-guard').textContent = M.flip + ' 窗一致 · −' + M.rb + '% 回退 · 冷却 ' + M.cool + ' 窗';
+  $('c-per').innerHTML = running.map(inst =>
+    '<div class="row"><span class="sub">' + inst.id + '</span><b style="font-size:11px">' + shortPolicy(inst) + '</b></div>'
+  ).join('') || '<div class="sub">无运行实例</div>';
+  $('c-feed').innerHTML = feedHtml(5);
+
+  $('fleetRows').innerHTML = Object.values(INSTANCES).map(inst => {
+    const d = latest(inst,'decode'), t = latest(inst,'ttft'), c = latest(inst,'cover'), cp = latest(inst,'capt');
+    const arr = inst.series.decode, n = Math.min(30, arr.length);
+    const base = inst.base.decode || 1;
+    const pts = arr.slice(-30).map((x,i) => {
+      const px = n===1 ? 0 : (i/(n-1))*80;
+      const py = 22 - Math.min(22, (x[0]/(base*1.4))*22);
+      return px.toFixed(1)+','+py.toFixed(1);
+    }).join(' ');
+    const st = inst.state==='running' ? '<span class="tag run">running</span>'
+             : inst.state==='starting' ? '<span class="tag start">starting</span>'
+             : '<span class="tag stop">stopped</span>';
+    return '<tr class="pick ' + (inst.id===current?'cur':'') + '" onclick="enterInstance(\'' + inst.id + '\')">'
+      + '<td><input type="checkbox" ' + (inst.sel?'checked':'') + ' onclick="event.stopPropagation()" onchange="toggleSelect(\'' + inst.id + '\')"></td>'
+      + '<td>' + inst.id + '<br><span class="sub">' + (inst.pool/1024|0) + ' GiB · :' + inst.port + ' · ' + inst.art + '</span></td>'
+      + '<td>' + st + '</td>'
+      + '<td class="n">' + (d ? d.toFixed(1) : '—') + '</td>'
+      + '<td class="n">' + (t ? t.toFixed(0)+' ms' : '—') + '</td>'
+      + '<td class="n">' + (c ? c.toFixed(0)+'%' : '—') + '</td>'
+      + '<td class="n">' + (cp ? cp.toFixed(0)+'%' : '—') + '</td>'
+      + '<td><svg width="84" height="26" viewBox="0 0 84 26"><polyline fill="none" stroke="' + (inst.sel?'#4c9aff':'#5d6878') + '" stroke-width="1.5" points="' + pts + '"/></svg></td>'
+      + '</tr>';
+  }).join('');
+
+  const ri = running[0];
+  $('f-spill').textContent = running.length ? (running.reduce((s,i)=>s+latest(i,'spill'),0).toFixed(0) + ' / ' + running.length*8 + ' 槽') : '—';
+  $('f-miss').textContent = ri ? latest(ri,'miss').toFixed(2) + ' 个/token' : '—';
+  $('f-pub').textContent = ri ? (ri.policy.freeze ? '0 B/步（表零移动）' : '16 B/步（48→16）') : '—';
+  $('f-gate').textContent = ri ? (ri.policy.prefetch
+    ? 'useful ' + (ri.pot||0).toFixed(0) + '% · ≥10% 开 / tps −3% 关'
+    : '关（useful ' + (ri.pot||0).toFixed(0) + '%，' + (ctlMode === 'auto' ? '自动判据' : '当前模式') + '）') : '—';
+  $('f-static').textContent = ri ? ri.base.static.toFixed(1)+'%' : '—';
+  $('f-nomiss').textContent = ri ? ri.base.noMiss.toFixed(0)+'%' : '—';
+  $('f-cap').textContent = ri ? latest(ri,'capt').toFixed(1)+'%' : '—';
+  $('f-fail').textContent = ri ? (ri.policy.freeze ? 'fail_unaddr 0 · fail_publish 0 · fail_upload 0' : 'fail_unaddr 0 · fail_publish 86 · fail_upload 86') : '—';
+
+  const alerts = [];
+  for (const inst of running){
+    const anchor = inst.base.decode || 1;
+    if (latest(inst,'decode') > 0 && latest(inst,'decode') < anchor*0.8)
+      alerts.push(inst.id + '：decode ' + latest(inst,'decode').toFixed(1) + ' 低于当前策略基线 0.8×（' + anchor.toFixed(0) + '）');
+    if (inst.policy.prefetch && latest(inst,'prefetch') > 0 && latest(inst,'prefetch') < 10)
+      alerts.push(inst.id + '：预取有用率 ' + latest(inst,'prefetch').toFixed(1) + '% < 10%（自动模式将连续 8 窗后关）');
+    if (inst.policy.c > 1 && ctlMode === 'auto' && inst.base0.static < 80)
+      alerts.push(inst.id + '：并发开着而 static < 80%，与自动判据不符');
+    if (!inst.policy.freeze && latest(inst,'capt') < 100)
+      alerts.push(inst.id + '：capt_ready ' + latest(inst,'capt').toFixed(0) + '%，图判据不满足（缺口在表发布+上传）');
+  }
+  if (GPU.ok && GPU.cur){
+    const act = (GPU.cur.event_reasons && GPU.cur.event_reasons.active) || [];
+    if (act.indexOf('sw_power_cap') >= 0)
+      alerts.push('GPU：SW 功耗墙置位（' + (GPU.cur.power||0).toFixed(0) + ' W / ' + (GPU.limit ? Math.round(GPU.limit) : '—') + ' W）——prefill 高负载期属预期，decode 期出现则非带宽顶');
+    if (GPU.cur.temp != null && GPU.cur.temp > 83)
+      alerts.push('GPU 温度 ' + GPU.cur.temp + '°C > 83°C');
+  }
+  if (vram > 23) alerts.push('显存 Σ ' + vram.toFixed(1) + ' GiB 超出单卡安全余量（留 1 GiB）');
+  if (starting.length) alerts.push(starting.map(i=>i.id).join('、') + ' 仍在加载权重');
+  $('alerts').innerHTML = alerts.length
+    ? alerts.map(a=>'<div class="alertbar">'+a+'</div>').join('')
+    : '<div class="row"><span>无告警</span><b style="color:var(--good)">OK</b></div>';
+}
+
+/* 集群级资源缓冲（卡片 sparkline 用，tick 里持续更新——暂停时也在采） */
+const FBUF = {vram:[], ram:[], up:[], disk:[]};
+function fleetBufTick(){
+  if (engineLive()){
+    FBUF.vram.push(null); FBUF.ram.push(null); FBUF.up.push(null);
+    FBUF.disk.push(LC.ok ? LC.ratio * 100 : null);
+    for (const k in FBUF) if (FBUF[k].length > 60) FBUF[k].shift();
+    return;
+  }
+  FBUF.vram.push(fleetVram()); FBUF.ram.push(fleetRam());
+  FBUF.up.push(fleetUp()); FBUF.disk.push(12.4);
+  for (const k in FBUF) if (FBUF[k].length > 60) FBUF[k].shift();
+}
+
+/* ---------- 实例大屏 ---------- */
+function instOptions(){
+  return Object.values(INSTANCES).map(i =>
+    '<option value="' + i.id + '">' + i.id + ' · ' +
+    (i.pool == null ? '池未发布' : (i.pool/1024|0) + ' GiB') + ' · :' + i.port + '</option>').join('');
+}
+function pickInstance(id){
+  if (!INSTANCES[id]) return;
+  current = id;
+  $('inst').innerHTML = instOptions();
+  $('inst').value = id;
+  renderInstance();
+}
+function stepInstance(d){
+  const ids = Object.keys(INSTANCES);
+  const i = ids.indexOf(current);
+  pickInstance(ids[(i+d+ids.length)%ids.length]);
+}
+function enterInstance(id){
+  pickInstance(id);
+  view('inst');
+}
+function drawInst(){
+  const inst = INSTANCES[current];
+  const win = parseInt($('instWin').value,10);
+  const norm = $('instNorm').value === '1';
+  const series = [];
+  for (const k of SERIES_ORDER){
+    const M = METRICS[k];
+    const t = trip(inst.series[k], win);
+    let v = t.v, lo = t.lo, hi = t.hi;
+    if (norm){
+      const mx = Math.max(1, ...v.filter(x=>x!=null));
+      v = v.map(x => x==null?null:x/mx*100);
+      lo = lo.map(x => x==null?null:x/mx*100);
+      hi = hi.map(x => x==null?null:x/mx*100);
+    }
+    series.push({label:M.label, data:v, lo:lo, hi:hi, axis: k==='decode'||k==='prefill'||k==='ttft' ? 'L' : 'R',
+                 color:M.color, on:seriesOn.has(k), width: k==='decode'?2.1:1.6});
+  }
+  const on = series.filter(s=>s.on);
+  const leftVals = on.filter(s=>s.axis==='L').flatMap(s=>s.data).filter(v=>v!=null);
+  const rightVals = on.filter(s=>s.axis==='R').flatMap(s=>s.data).filter(v=>v!=null);
+  const leftMax = norm ? 100 : niceMax(Math.max(1, ...leftVals) * 1.08);
+  const rightMax = norm ? 100 : niceMax(Math.max(1, ...rightVals) * 1.08);
+  const n = series.length ? Math.min(win, ...series.map(s=>s.data.length)) : win;
+  drawChart($('instChart'), {
+    n, height:280, series,
+    left:{min:0, max:leftMax, unit: norm ? '% 归一化' : '左轴 · tok/s、ms'},
+    rightAxis:{min:0, max:rightMax, unit:'右轴 · MB / % / 槽'},
+    hover:{el:$('instHover'), cb:idx => {
+      if (idx == null) return '';
+      const parts = on.filter(s=>s.data[idx] != null).map(s =>
+        '<b style="color:' + s.color + '">' + s.label + '</b> ' + s.data[idx].toFixed(1) +
+        ' <span class="sub">(' + (s.lo[idx]||0).toFixed(1) + '–' + (s.hi[idx]||0).toFixed(1) + ')</span>');
+      return 'T−' + (n-1-idx) + 's · ' + (parts.join(' · ') || '—');
+    }}
+  });
+  $('instWinLbl').textContent = '近 ' + win + ' s · ' + inst.id + ' 独立缓冲 ' + inst.series.decode.length + '/' + HIST + ' 点';
+  $('instLegend').innerHTML = on.length
+    ? on.map(s => '<span class="chip"><i style="background:'+s.color+'"></i>'+s.label+'</span>').join('')
+    : '<span class="sub">未选择序列</span>';
+  $('seriesPicker').innerHTML = SERIES_ORDER.map(k =>
+    '<span class="chip ' + (seriesOn.has(k)?'':'off') + '" onclick="toggleSeries(\'' + k + '\')"><i style="background:' + METRICS[k].color + '"></i>' + METRICS[k].label + '</span>'
+  ).join('');
+}
+function toggleSeries(k){
+  if (seriesOn.has(k)) seriesOn.delete(k); else seriesOn.add(k);
+  drawInst();
+}
+function uptime(inst){
+  if (inst.state !== 'running') return inst.note || '未运行';
+  const ms = Date.now() - inst.startedAt;
+  const h = Math.floor(ms/3600e3), m = Math.floor(ms%3600e3/60e3), s = Math.floor(ms%60e3/1000);
+  return h ? (h + ' h ' + m + ' m') : (m ? (m + ' m ' + s + ' s') : (s + ' s'));
+}
+function renderWarm(inst){
+  const total = warmMiB(inst.pool);
+  const slots = Math.round(total/1.875);
+  const fz = inst.policy.freeze;
+  let S=0, D=slots, C=0, P=0;
+  if (fz){ S = 12*40; C = 160; P = 128; D = Math.max(0, slots - S - C - P); }
+  const seg = (n, col, title) => '<i style="width:' + Math.max(1.2, n/slots*100) + '%;background:' + col + '" title="' + title + ' ' + n + ' 槽"></i>';
+  $('wband').innerHTML = fz
+    ? seg(S,'#7c5cff','S 条带/bank') + seg(D,'#4c9aff','D 共享工作集') + seg(C,'#39c5cf','C 二级缓存') + seg(P,'#f778ba','P 预读')
+    : seg(D,'#4c9aff','全补集单段');
+  $('wlegend').innerHTML = (fz
+    ? '<span><b style="color:#7c5cff">S</b> ' + S + '</span><span><b style="color:#4c9aff">D</b> ' + D + '</span><span><b style="color:#39c5cf">C</b> ' + C + '</span><span><b style="color:#f778ba">P</b> ' + P + '</span>'
+    : '<span><b style="color:#4c9aff">全补集</b> ' + slots + ' 槽</span>')
+    + '<span>共 ' + slots + ' 槽 · ' + (total/1024).toFixed(2) + ' GiB</span>';
+  $('w-mode').textContent = fz ? '冻结：S/D/C/P 四段' : '流式：全补集单段';
+  $('w-fz').textContent = fz ? 'frozen（放置不再追加 route）' : '未冻结（放置跟随路由）';
+  $('w-cov').textContent = fz ? 'covers_all=1 / pool_unready=0' : '—';
+}
+function concDecision(inst){
+  const p = inst.policy, b0 = inst.base0;
+  if (ctlMode === 'stable') return 'C=1 串行（稳定优先强制）';
+  if (ctlMode === 'perf') return p.c > 1
+    ? 'C=4（覆盖 ' + b0.cover.toFixed(1) + '% ≥ 55%，12 GiB 实测 +10%）'
+    : 'C=1 串行（覆盖 ' + b0.cover.toFixed(1) + '% < 55%，8 GiB 实测 −39%）';
+  return p.c > 1 ? 'C=4（static ≥ 80%）' : 'C=1 串行（static ' + b0.static.toFixed(1) + '% < 80%）';
+}
+function freezeDecision(inst){
+  const p = inst.policy;
+  if (p.freeze) return '冻结+快路径（covers_all=1 · pool_unready=0）';
+  if (ctlMode === 'perf') return '流式（decode 跟随路由最快：62.7 vs 冻结 42）';
+  return '流式（判据未达：需连续 32 层全 clean，no_miss 现测 ' + inst.base0.noMiss + '%）';
+}
+function prefetchDecision(inst){
+  const p = inst.policy, pot = inst.pot || 0;
+  if (ctlMode === 'stable') return '关（稳定优先）';
+  if (p.prefetch){
+    if (pot < 10) return '开（useful ' + pot.toFixed(1) + '% < 10%，连续 ' + inst.useLow + '/8 窗后自动关）';
+    return '开 · fill · 128 槽（useful ' + pot.toFixed(1) + '% ≥ 10%）';
+  }
+  return '关（useful ' + pot.toFixed(1) + '% < 10%，连续 ' + inst.useHigh + '/8 窗后自动开）';
+}
+function graphDecision(inst){
+  const p = inst.policy;
+  const capt = p.freeze ? 100 : inst.base0.capt, st = p.freeze ? 100 : inst.base0.static;
+  if (p.graph) return '开（capt 100% ∧ static 100%，实测中性）';
+  return '关（capt_ready ' + capt.toFixed(0) + '% < 100%，结构性判据）';
+}
+
+/* 请求表与 TTFT 直方图 */
+function reqRowHtml(inst, r, done){
+  const ctx = Math.min(100, ((r.promptTokens + r.gen) / MAX_CONTEXT) * 100);
+  const phaseTag = r.phase === 'prefill' ? '<span class="tag pf">prefill</span>'
+                 : r.phase === 'decode' ? '<span class="tag dc">decode</span>'
+                 : (r.finish === 'max' ? '<span class="tag max">max</span>' : '<span class="tag done">done</span>');
+  const tr = r.trace.length > 1
+    ? r.trace.map((v,i) => (i?' L':'M') + (i/(r.trace.length-1)*96).toFixed(1) + ',' + (19 - Math.min(18, v/(inst.base.decode*1.3)*18)).toFixed(1)).join(' ')
+    : '';
+  return '<tr class="pick" onclick="openDrawer(\'' + inst.id + '\',' + r.id + ')">'
+    + '<td>' + phaseTag + '</td>'
+    + '<td class="n">#' + r.id + '</td>'
+    + '<td class="n">' + r.age + ' s</td>'
+    + '<td><span class="reqctx"><span class="ctx-track"><i style="width:' + ctx.toFixed(0) + '%"></i></span>'
+    + '<span class="sub">' + (r.promptTokens + Math.round(r.gen)) + '</span></span></td>'
+    + '<td class="n">' + (r.speed ? r.speed.toFixed(1) : (done && r.meanSpeed ? r.meanSpeed.toFixed(1) : '—')) + '</td>'
+    + '<td class="n">' + (r.ttftMs >= 1000 ? (r.ttftMs/1000).toFixed(1)+' s' : r.ttftMs+' ms') + '</td>'
+    + '<td class="n">' + Math.round(r.gen) + '</td>'
+    + '<td class="n sub">' + (r.reused || '—') + '</td>'
+    + '<td><svg class="reqtrace" width="96" height="22" viewBox="0 0 96 22">' + (tr ? '<path d="' + tr + '" fill="none" stroke="#4c9aff" stroke-width="1.4"/>' : '') + '</svg></td>'
+    + '</tr>';
+}
+function renderRequests(inst){
+  const on = inst.state === 'running';
+  const C = Math.max(1, Math.min(8, inst.policy ? inst.policy.c : 1));
+  $('reqCount').textContent = on ? (inst.active.length + ' 活跃 · 车道 1–' + C + ' · 已完成样本 ' + ((inst.ttftBins&&inst.ttftBins.count)||0)) : '—';
+  if (!on){
+    $('reqRows').innerHTML = '<tr><td colspan="9" class="sub">实例未运行</td></tr>';
+    renderTTFT(null);
+    return;
+  }
+  let html = inst.active.map(r => reqRowHtml(inst, r, false)).join('');
+  if (inst.doneR.length){
+    html += '<tr class="reqdiv"><td colspan="9">Recently completed</td></tr>' + inst.doneR.map(r => reqRowHtml(inst, r, true)).join('');
+  }
+  $('reqRows').innerHTML = html || '<tr><td colspan="9" class="sub">等待请求</td></tr>';
+  renderTTFT(inst.ttftBins);
+}
+function fmtMs(v){ return v == null ? '—' : (v >= 1000 ? (v/1000).toFixed(1) + ' s' : Math.round(v) + ' ms'); }
+function renderTTFT(bins){
+  const box = $('ttftbox');
+  if (!bins || !bins.count){
+    box.innerHTML = '<div class="cap">TTFT 分布：暂无完成样本（完成请求后自动累积）</div>';
+    return;
+  }
+  const bounds = bins.bounds, counts = bins.bins;
+  const pop = counts.map((c,i) => ({c, i})).filter(b => b.c > 0);
+  const lo = pop[0].i === 0 ? 0 : (bounds[pop[0].i-1] || 0);
+  const hi = bounds[pop[pop.length-1].i] || bounds[bounds.length-1];
+  const minMs = Math.max(50, lo), maxMs = Math.max(1000, hi*1.3);
+  const W = 460, TOP = 4, BOT = 44;
+  const lg = v => Math.log10(Math.max(minMs, Math.min(maxMs, v)));
+  const x0 = lg(minMs), x1 = lg(maxMs);
+  const X = v => ((lg(v) - x0) / ((x1 - x0) || 1)) * W;
+  const maxC = Math.max(...counts);
+  let bars = '';
+  counts.forEach((c, i) => {
+    if (!c) return;
+    const bl = i === 0 ? minMs : bounds[i-1];
+    const bh = bounds[i] || maxMs;
+    const xa = Math.max(0, X(Math.max(minMs, bl))), xb = Math.min(W, X(Math.min(maxMs, bh)));
+    if (xb <= xa) return;
+    const h = (c / maxC) * (BOT - TOP);
+    bars += '<rect x="' + xa.toFixed(1) + '" y="' + (BOT - h).toFixed(1) + '" width="' + Math.max(1, xb - xa - 1).toFixed(1) + '" height="' + h.toFixed(1) + '" fill="#d29922" opacity=".55"><title>' + fmtMs(bl) + ' – ' + fmtMs(bh) + ': ' + c + '</title></rect>';
+  });
+  const p50 = binsQuantile(bins, 0.5), p90 = binsQuantile(bins, 0.9), p99 = binsQuantile(bins, 0.99);
+  const marker = (v, cls) => v == null ? '' : '<line x1="' + X(v).toFixed(1) + '" x2="' + X(v).toFixed(1) + '" y1="' + TOP + '" y2="' + BOT + '" stroke="var(--' + cls + ')" stroke-width="1.2"/>';
+  const ticks = [1000, 2000, 5000, 10000].filter(v => v >= minMs && v <= maxMs)
+    .map(v => '<text x="' + X(v).toFixed(1) + '" y="54" fill="#5d6878" font-size="9" text-anchor="middle" font-family="monospace">' + (v >= 1000 ? (v/1000) + 's' : v) + '</text>').join('');
+  box.innerHTML = '<svg viewBox="0 0 ' + W + ' 58" preserveAspectRatio="none">' + bars + marker(p50,'good') + marker(p90,'warn') + marker(p99,'bad') + ticks + '</svg>'
+    + '<div class="cap">TTFT 分布（' + bins.count + ' 样本 · 对数轴） · p50 ' + fmtMs(p50) + ' · p90 ' + fmtMs(p90) + ' · p99 ' + fmtMs(p99) + '（溢出桶记 —）</div>';
+}
+
+/* 请求下钻抽屉 */
+let drawerReq = null;
+function openDrawer(instId, reqId){
+  const inst = INSTANCES[instId];
+  if (!inst) return;
+  const r = inst.active.find(q => q.id === reqId) || inst.doneR.find(q => q.id === reqId);
+  if (!r) return;
+  drawerReq = {inst, r};
+  const phaseTag = r.phase === 'done' ? '<span class="tag ' + (r.finish==='max'?'max':'done') + '">' + (r.finish==='max'?'Max tokens':'Done') + '</span>'
+                 : '<span class="tag ' + (r.phase==='prefill'?'pf':'dc') + '">' + r.phase + '</span>';
+  const tr = r.trace.length > 1
+    ? r.trace.map((v,i) => (i?' L':'M') + (i/(r.trace.length-1)*380).toFixed(1) + ',' + (46 - Math.min(44, v/(inst.base.decode*1.3)*44)).toFixed(1)).join(' ')
+    : '';
+  const ev = r.events.map(e => '<div class="ev"><b>T+' + e.t + 's</b> ' + e.k + (e.k === 'first_token' ? '（TTFT ' + fmtMs(r.ttftMs) + ' = 排队 ' + fmtMs(r.queueMs) + ' + prefill ' + fmtMs(r.prefillMs) + '）' : '') + '</div>').join('');
+  $('drawerBody').innerHTML =
+    '<h4>Request #' + r.id + ' ' + phaseTag + ' <span class="sub">lane ' + (r.lane+1) + ' · ' + inst.id + '</span></h4>'
+    + '<div class="facts">'
+    + '<div><div class="t">TTFT（含排队）</div><div class="v">' + fmtMs(r.ttftMs) + '</div></div>'
+    + '<div><div class="t">排队 / prefill</div><div class="v">' + fmtMs(r.queueMs) + ' / ' + fmtMs(r.prefillMs) + '</div></div>'
+    + '<div><div class="t">prompt / 复用</div><div class="v">' + r.promptTokens + ' / ' + (r.reused||0) + '</div></div>'
+    + '<div><div class="t">已生成 / 上下文</div><div class="v">' + Math.round(r.gen) + ' / ' + (r.promptTokens + Math.round(r.gen)) + '</div></div>'
+    + '<div><div class="t">decode 速度</div><div class="v">' + (r.speed ? r.speed.toFixed(1) : (r.meanSpeed ? r.meanSpeed.toFixed(1) : '—')) + ' tok/s</div></div>'
+    + '<div><div class="t">时长</div><div class="v">' + (r.durationS || r.age) + ' s</div></div>'
+    + '</div>'
+    + '<div class="t sub" style="margin-bottom:2px">速度 trace（最近 ' + r.trace.length + ' 个采样）</div>'
+    + '<svg width="100%" height="48" viewBox="0 0 380 48" preserveAspectRatio="none">' + (tr ? '<path d="' + tr + '" fill="none" stroke="#4c9aff" stroke-width="1.6"/>' : '<text x="4" y="26" fill="#5d6878" font-size="11">prefill 中，尚无 decode 采样</text>') + '</svg>'
+    + '<div class="t sub" style="margin:10px 0 2px">事件（观测不含 prompt 与输出文本）</div>' + ev
+    + '<div style="margin-top:14px"><button class="btn ghost sm" onclick="closeDrawer()">关闭</button></div>';
+  $('drawerWrap').classList.remove('hidden');
+}
+function closeDrawer(){ $('drawerWrap').classList.add('hidden'); drawerReq = null; }
+function drawerBackdrop(ev){ if (ev.target === $('drawerWrap')) closeDrawer(); }
+document.addEventListener('keydown', ev => { if (ev.key === 'Escape') closeDrawer(); });
+
+function renderInstance(){
+  if (engineLive() && INSTANCES[ENGINE.instId]){
+    current = ENGINE.instId;
+    return renderInstanceLive();
+  }
+  const inst = INSTANCES[current];
+  $('inst').innerHTML = instOptions();
+  $('inst').value = current;
+  const d = latest(inst,'decode'), p = latest(inst,'prefill'), t = latest(inst,'ttft');
+  const on = inst.state === 'running';
+  const pol = inst.policy;
+  $('i-state').innerHTML = on ? '<span class="tag run">running</span>'
+                    : inst.state === 'starting' ? '<span class="tag start">starting</span>'
+                    : '<span class="tag stop">stopped</span>';
+  $('i-art').innerHTML = '<span class="tag ' + inst.art + '">' + inst.art + '</span> · ' + (inst.pool/1024).toFixed(0) + ' GiB 池 · ' + (inst.kv/1024|0) + ' GiB 主机 KV · 温区补集 ' + (warmMiB(inst.pool)/1024).toFixed(1) + ' GiB';
+  $('i-up').textContent = ':' + inst.port + ' · ' + uptime(inst);
+  $('i-start').classList.toggle('hidden', inst.state === 'running' || inst.state === 'starting');
+  $('i-stop').classList.toggle('hidden', inst.state !== 'running');
+  $('i-start').disabled = inst.op; $('i-stop').disabled = inst.op;
+
+  $('i-dec').innerHTML = (on ? d.toFixed(1) : '—') + '<small>tok/s</small>';
+  const peakArr = inst.series.decode.map(x => x[0]);
+  $('i-dec-sub').textContent = on ? ('单请求 · 峰值 ' + (peakArr.length ? Math.max.apply(null, peakArr).toFixed(1) : '—') + (pol.freeze && pol.fast ? ' · 冻结快路径（1.35×，哈希逐位一致）' : '')) : (inst.note || '未运行');
+  $('i-dec-bar').style.width = on ? Math.min(100, d/130*100).toFixed(0)+'%' : '0%';
+  $('i-pre').innerHTML = (on ? p.toFixed(0) : '—') + '<small>tok/s</small>';
+  $('i-pre-sub').textContent = on ? 'chunked prefill · 类集 {1024,2048,4096}' : '—';
+  $('i-pre-bar').style.width = on ? Math.min(100, p/620*100).toFixed(0)+'%' : '0%';
+  $('i-ttft').innerHTML = (on ? t.toFixed(0) : '—') + '<small>ms</small>';
+  const q = inst.ttftBins;
+  $('i-ttft2').textContent = on && q && q.count ? (fmtMs(binsQuantile(q,0.5)) + ' / ' + fmtMs(binsQuantile(q,0.99))) : (on ? (t.toFixed(0) + ' / ' + (t*1.9).toFixed(0)) : '—');
+  $('i-kvh').textContent = on && inst.pref.prompt ? (inst.pref.reused + '/' + inst.pref.prompt + ' token 复用 · ' + (inst.pref.reused/inst.pref.prompt*100).toFixed(0) + '%') : (on ? '暂无样本' : '—');
+
+  spark($('sp-idec'), inst.series.decode.slice(-60).map(x=>x[0]), '#4c9aff');
+  spark($('sp-ipre'), inst.series.prefill.slice(-60).map(x=>x[0]), '#3fb950');
+  spark($('sp-ittft'), inst.series.ttft.slice(-60).map(x=>x[0]), '#d29922');
+
+  $('c-cover').textContent = on ? latest(inst,'cover').toFixed(1)+'%' : '—';
+  $('c-cover-bar').style.width = on ? latest(inst,'cover').toFixed(0)+'%' : '0%';
+  $('c-miss').textContent = on ? latest(inst,'miss').toFixed(2)+' 个' : '—';
+  $('c-pub').textContent = on ? (pol.freeze ? '0 B/步（表零移动）' : '16 B/步（48→16）') : '—';
+  $('c-spill').textContent = on ? (pol.freeze ? '0（covers_all，环闲置）' : latest(inst,'spill').toFixed(0) + ' / 8') : '—';
+  $('c-pfu').textContent = on ? (pol.prefetch ? latest(inst,'prefetch').toFixed(1)+'%' : '关') : '—';
+  $('kv-dev').textContent = on ? '512 页' : '—';
+  $('kv-host').textContent = on ? '3.1 / 8 GiB' : '—';
+  $('kv-disk').textContent = on ? '12.4 GiB' : '—';
+  $('i-static').textContent = on ? inst.base.static.toFixed(1)+'%' : '—';
+  $('i-nomiss').textContent = on ? inst.base.noMiss.toFixed(0)+'%' : '—';
+  $('i-cap').textContent = on ? latest(inst,'capt').toFixed(1)+'%' : '—';
+  $('i-fail').textContent = on ? (pol.freeze ? 'fail_unaddr 0 · fail_publish 0 · fail_upload 0' : 'fail_unaddr 0 · fail_publish 86 · fail_upload 86') : '—';
+
+  /* 生效策略 */
+  $('p-mode').innerHTML = '<span class="tag mode">' + MODES[ctlMode].name + '</span>';
+  $('p-conc').textContent = 'C=' + pol.c + ' · lanes=' + pol.lanes;
+  $('p-freeze').textContent = pol.freeze ? 'freeze（after=4）+ 快路径 · reselect 关' : '关（流式跟随路由）';
+  $('p-pf').textContent = pol.prefetch ? '开 · fill · 128 槽 · 每层 0' : '关';
+  $('p-graph').textContent = pol.graph ? '开' : '关';
+  $('p-sc').textContent = (pol.freeze ? 'C=160 / S 条带 12×bank' : 'C=0 / S=补集（未切分）');
+
+  /* 控制器决策 */
+  $('d-conc').textContent = on ? concDecision(inst) : '—';
+  $('d-freeze').textContent = on ? freezeDecision(inst) : '—';
+  $('d-pf').textContent = on ? prefetchDecision(inst) : '—';
+  $('d-graph').textContent = on ? graphDecision(inst) : '—';
+  $('d-feed').innerHTML = feedHtml(4);
+
+  renderWarm(inst);
+  renderRequests(inst);
+  drawInst();
+}
+
+/* ---------- 实例启停（操作状态机） ---------- */
+function startStopInstance(){
+  if (engineLive()){
+    feedAdd('启停属控制面（T131 挂起）：实例随 serve 进程存在', 'gap');
+    return;
+  }
+  const inst = INSTANCES[current];
+  if (!inst || inst.op) return;
+  if (inst.state === 'running'){
+    inst.op = true;
+    inst.state = 'stopped';
+    inst.active = [];
+    inst.note = '已手动停止';
+    inst.op = false;
+    feedAdd(inst.id + ' 手动停止（观测归零，stopped 档不占显存）', 'info');
+  } else if (inst.state === 'stopped'){
+    inst.op = true;
+    inst.state = 'starting';
+    inst.note = '加载中';
+    renderInstance();
+    setTimeout(() => {
+      inst.state = 'running';
+      inst.startedAt = Date.now();
+      inst.note = '';
+      inst.op = false;
+      rebase(inst);
+      feedAdd(inst.id + ' 上线 · 模式 ' + MODES[ctlMode].name + '：' + shortPolicy(inst), 'info');
+      if (viewName === 'inst' && current === inst.id) renderInstance();
+      else { renderFleet(); drawFleet(); }
+    }, 3000);
+  }
+  if (viewName === 'fleet'){ renderFleet(); drawFleet(); } else renderInstance();
+}
+
+/* ---------- 交互 ---------- */
+function view(name){
+  viewName = name;
+  $('pane-fleet').classList.toggle('hidden', name !== 'fleet');
+  $('pane-inst').classList.toggle('hidden', name !== 'inst');
+  $('tab-fleet').classList.toggle('on', name === 'fleet');
+  $('tab-inst').classList.toggle('on', name === 'inst');
+  if (name === 'fleet') { renderFleet(); drawFleet(); } else renderInstance();
+}
+function toggleSelect(id){
+  const inst = INSTANCES[id];
+  if (!inst) return;
+  inst.sel = !inst.sel;
+  renderFleet(); drawFleet();
+}
+function togglePause(){
+  paused = !paused;
+  $('pauseBtn').textContent = paused ? '继续' : '暂停';
+  $('pauseBtn2').textContent = paused ? '继续' : '暂停';
+  if (viewName === 'fleet') renderFleet();
+}
+function createInstance(){
+  if (engineLive()){
+    $('newNote').textContent = '引擎在线：实例来自 serve 进程本身；启动新实例属控制面（T131 挂起）。';
+    return;
+  }
+  const model = $('newModel').value.trim() || 'qwen3.6-35b-a3b-e2';
+  const pool = parseInt($('newPool').value,10) || 12288;
+  const kv = parseInt($('newKv').value,10) || 8192;
+  const port = parseInt($('newPort').value,10) || 8126;
+  const art = $('newArt').value;
+  const id = art + '-' + pool;
+  if (INSTANCES[id]) { $('newNote').textContent = '实例 ' + id + ' 已存在，换一个池大小或形态。'; return; }
+  const inst = makeInstance(id, model, art, pool, kv, port);
+  inst.state = 'starting'; inst.startedAt = Date.now(); inst.note = '加载中';
+  INSTANCES[id] = inst;
+  rebase(inst);
+  for (let i=0;i<20;i++){
+    const s = sample(inst);
+    for (const k of Object.keys(METRICS)) inst.series[k].push(s[k]);
+  }
+  $('newPort').value = port + 1;
+  $('newNote').textContent = '已创建 ' + id + '（:' + port + '）；档位曲线为短样本口径，仅档间比较。3 s 后转 running 并按当前模式接入。';
+  setTimeout(function(){
+    const i2 = INSTANCES[id];
+    if (!i2) return;
+    i2.state = 'running';
+    i2.startedAt = Date.now();
+    i2.note = '';
+    rebase(i2);
+    feedAdd(i2.id + ' 上线 · 模式 ' + MODES[ctlMode].name + '：' + shortPolicy(i2), 'info');
+    if (viewName === 'fleet') { renderFleet(); drawFleet(); }
+    else if (current === id) renderInstance();
+  }, 3000);
+  renderFleet(); drawFleet();
+}
+function exportSeries(){
+  const inst = INSTANCES[current];
+  const keys = SERIES_ORDER.filter(k => seriesOn.has(k));
+  const n = inst.series.decode.length;
+  const rows = ['t,' + keys.map(k => k + ',min,max').join(',')];
+  for (let i=0;i<n;i++){
+    const t = i - n + 1;
+    rows.push([t].concat(keys.map(k => [inst.series[k][i][0], inst.series[k][i][1], inst.series[k][i][2]].map(v => v.toFixed(3))).flat()).flat().join(','));
+  }
+  const blob = new Blob([rows.join('\n')], {type:'text/csv'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = inst.id + '-series.csv';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+/* ---------- LMCache 真实指标（失败退避：连续 3 次才记 gap） ---------- */
+let lcHist = [], lcPrev = null, lcFail = 0, lcDown = false;
+const LC = {ok:false, at:null, l1mem:null, ratio:null, rss:null};
+function lcSet(id, txt){ const el = $(id); if (el) el.textContent = txt; }
+function lcBytes(v){
+  if (v == null || !isFinite(v)) return '—';
+  const u = ['B','KiB','MiB','GiB','TiB']; let n = v, i = 0;
+  while (n >= 1024 && i < u.length-1){ n /= 1024; i++; }
+  return n.toFixed(n < 10 ? 2 : 1) + ' ' + u[i];
+}
+function lcDrawSpark(){
+  const el = $('lcSparkLine'); if (!el) return;
+  const n = lcHist.length;
+  if (n < 2){ el.setAttribute('points', ''); return; }
+  const pts = [];
+  for (let i = 0; i < n; i++){
+    const x = (i / (n - 1)) * 920;
+    const y = 86 - Math.min(1, Math.max(0, lcHist[i])) * 84;
+    pts.push(x.toFixed(1) + ',' + y.toFixed(1));
+  }
+  el.setAttribute('points', pts.join(' '));
+}
+async function pollLmcache(){
+  let j;
+  try {
+    const r = await fetch('/api/lmcache.json', {cache: 'no-store'});
+    j = await r.json();
+  } catch (e) {
+    lcFail++;
+    if (lcFail === 3 && !lcDown){
+      lcDown = true;
+      lcSet('lcStamp', '不可达 · 重试中');
+      feedAdd('LMCache 采样中断（连续 3 次失败，gap 记入）', 'gap');
+    } else if (lcFail === 3){
+      lcSet('lcStamp', '不可达 · 重试中');
+    }
+    return;
+  }
+  if (!j || !j.ok){
+    lcFail++;
+    if (lcFail === 3 && !lcDown){
+      lcDown = true;
+      lcSet('lcStamp', '上游不通 · 重试中');
+      feedAdd('LMCache 采样中断（上游不通，gap 记入）', 'gap');
+    }
+    return;
+  }
+  if (lcDown){ feedAdd('LMCache 采样恢复', 'gap'); }
+  lcDown = false; lcFail = 0;
+  const L1 = j.l1 || {}, L2 = j.l2 || {}, J = j.jobs || {}, E = j.events || {}, P = j.process || {};
+  LC.ok = true; LC.at = j.at; LC.l1mem = L1.memory_bytes ?? null;
+  LC.ratio = L1.usage_ratio ?? null; LC.rss = P.rss_bytes ?? null;
+  lcSet('lcStamp', '实时 · ' + (j.at || '').slice(11, 19) + ' · ' + j.samples + ' 个样本');
+  lcSet('lc-l1ratio', ((L1.usage_ratio || 0) * 100).toFixed(1) + ' %');
+  lcSet('lc-l1mem', lcBytes(L1.memory_bytes));
+  lcSet('lc-staging', lcBytes(L1.staging_bytes));
+  if (lcPrev && L1.evict_ticks != null){
+    const dt = Math.max(0.001, (Date.now() - lcPrev.at) / 1000);
+    lcSet('lc-evict', ((L1.evict_ticks - lcPrev.ticks) / dt).toFixed(1) + ' /s');
+  } else {
+    lcSet('lc-evict', '—');
+  }
+  lcPrev = {at: Date.now(), ticks: L1.evict_ticks};
+  lcSet('lc-l2', (L2.store_adapters ?? 0) + ' / ' + (L2.prefetch_adapters ?? 0));
+  lcSet('lc-jobs', (J.active_prefetch ?? 0) + ' / ' + (J.active_p2p_lookup ?? 0));
+  lcSet('lc-evdepth', (E.queue_depth ?? 0) + ' 条（滞后 ' + (E.drain_lag_s ?? 0).toFixed(3) + ' s）');
+  lcSet('lc-evdots', String(E.dropped ?? 0));
+  lcSet('lc-kvlog', String(E.log_depth ?? 0));
+  lcSet('lc-proc', lcBytes(P.rss_bytes) + ' / ' + (P.cpu_seconds ?? 0).toFixed(1) + ' s');
+  const ratio = L1.usage_ratio || 0;
+  lcHist.push(ratio);
+  if (lcHist.length > 180) lcHist.shift();
+  lcDrawSpark();
+}
+
+/* ---------- GPU 遥测（NVML 控制路径读数，零 GPU 数据面影响） ---------- */
+const EV_LABELS = {gpu_idle:'Idle', applications_clocks:'Apps 时钟', sw_power_cap:'SW 功耗墙', hw_power_cap:'HW 功耗墙', sw_thermal_slowdown:'SW 热降频', hw_thermal_slowdown:'HW 热降频', hw_slowdown:'HW 降速', sync_boost:'Sync boost'};
+let GPU = {ok:false, reason:'', cur:null, hist:{power:[],sm:[],temp:[]}, pcie:null, limit:null, fail:0, down:false};
+function gpuFail(reason){
+  GPU.fail++;
+  if (GPU.fail === 3 && !GPU.down){
+    GPU.down = true; GPU.reason = reason;
+    feedAdd('GPU 遥测不可用（' + reason + '）', 'gap');
+  } else if (GPU.fail === 3){
+    GPU.reason = reason;
+  }
+  renderGpu();
+}
+async function pollGpu(){
+  let j;
+  try {
+    const r = await fetch('/api/gpu.json', {cache:'no-store'});
+    j = await r.json();
+  } catch (e) {
+    gpuFail('端点缺失（需经 tools\\console.cmd 打开）');
+    return;
+  }
+  if (!j.ok){ gpuFail(j.reason || 'NVML 不可用'); return; }
+  if (GPU.down) feedAdd('GPU 遥测恢复', 'info');
+  GPU.down = false; GPU.fail = 0; GPU.ok = true;
+  GPU.cur = Object.assign({}, j.current || {}, {event_reasons: j.event_reasons});
+  GPU.limit = j.power_limit_w;
+  GPU.hist = {power:(j.history&&j.history.power)||[], sm:(j.history&&j.history.sm)||[], temp:(j.history&&j.history.temp)||[]};
+  GPU.pcie = j.pcie || null;
+  renderGpu();
+}
+function renderGpu(){
+  const c = GPU.ok ? GPU.cur : null;
+  $('gpu-limit').textContent = GPU.limit ? 'limit ' + Math.round(GPU.limit) + ' W' : '';
+  if (!c || (c.power == null && c.sm == null)){
+    $('gpu-power').innerHTML = '—<small>W</small>';
+    $('gpu-power-sub').textContent = GPU.reason || '未接入';
+    $('gpu-sm').innerHTML = '—<small>MHz SM</small>'; $('gpu-sm-sub').textContent = '—';
+    $('gpu-temp').innerHTML = '—<small>°C</small>'; $('gpu-temp-sub').textContent = '—';
+    $('gpu-pcie').innerHTML = '—<small>MB/s</small>'; $('gpu-pcie-sub').textContent = '—';
+    spark($('sp-gpupw'), []); spark($('sp-gpuclk'), []); spark($('sp-gputemp'), []);
+    return;
+  }
+  const act = (c.event_reasons && c.event_reasons.active) || [];
+  const pw = c.power;
+  $('gpu-power').innerHTML = (pw != null ? pw.toFixed(1) : '—') + '<small>W</small>';
+  $('gpu-power-sub').textContent = (pw != null && GPU.limit) ? ('of ' + Math.round(GPU.limit) + ' W · ' + (pw/GPU.limit*100).toFixed(0) + '%') : '—';
+  $('gpu-sm').innerHTML = (c.sm ?? '—') + '<small>MHz SM</small>';
+  $('gpu-sm-sub').textContent = 'MEM ' + (c.mem ?? '—') + ' MHz · ' + (act.length ? act.map(k=>EV_LABELS[k]||k).join('，') : '无降频事件');
+  const t = c.temp;
+  $('gpu-temp').innerHTML = (t ?? '—') + '<small>°C</small>';
+  $('gpu-temp').style.color = t == null ? '' : (t > 83 ? 'var(--bad)' : t > 78 ? 'var(--warn)' : '');
+  $('gpu-temp-sub').textContent = '风扇 ' + (c.fan ?? '—') + '%';
+  const pc = GPU.pcie;
+  const rx = pc && pc.rx_kb != null ? pc.rx_kb/1024 : null;
+  const tx = pc && pc.tx_kb != null ? pc.tx_kb/1024 : null;
+  $('gpu-pcie').innerHTML = rx == null ? '—<small>MB/s</small>' : (rx >= 1024 ? (rx/1024).toFixed(2) + '<small>GB/s</small>' : rx.toFixed(0) + '<small>MB/s</small>');
+  $('gpu-pcie-sub').textContent = tx == null ? '等待低频采样' : ('tx ' + (tx >= 1024 ? (tx/1024).toFixed(2) + ' GB/s' : tx.toFixed(0) + ' MB/s') + (pc.at ? ' · ' + String(pc.at).slice(11,19) : ''));
+  spark($('sp-gpupw'), GPU.hist.power, '#f85149');
+  spark($('sp-gpuclk'), GPU.hist.sm, '#4c9aff');
+  spark($('sp-gputemp'), GPU.hist.temp, '#d29922');
+}
+
+/* ---------- 主循环：暂停只冻结渲染，采集继续 ---------- */
+let tickN = 0;
+function tick(){
+  pushSamples();          // 采集（暂停时也继续）
+  for (const inst of Object.values(INSTANCES)) reqSimTick(inst);
+  fleetBufTick();
+  judgedTick();
+  if (++tickN % 5 === 0) saveState();
+  if (!paused){
+    if (viewName === 'fleet') { renderFleet(); drawFleet(); }
+    else renderInstance();
+  }
+  $('clock').textContent = new Date().toLocaleTimeString();
+}
+window.addEventListener('beforeunload', saveState);
+document.querySelectorAll('.segbtn').forEach(el => el.classList.toggle('on', el.getAttribute('data-m') === ctlMode));
+$('ft-left').textContent = '1s 采样 · 缓冲 ' + (HIST/60) + ' min · 带 = 采样 min–max · 断档分段显示';
+view('fleet');
+markDemoCards();
+renderSrcBar();
+setInterval(tick, 1000);
+pollLmcache();
+setInterval(pollLmcache, 2000);
+pollGpu();
+setInterval(pollGpu, 1000);
+pollEngine();
+setInterval(pollEngine, 1000);
+$('clock').textContent = new Date().toLocaleTimeString();
+</script>
+</body>
+</html>
