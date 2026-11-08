@@ -24,15 +24,22 @@ int main(int argc, char** argv) {
                     for (const auto& cache :
                          measurement::selections(options.timing.cache, "cold", "warm")) {
                         const auto result = measurement::measure(
-                            [&](auto s) { fixture.launch(device.execution_view().on_stream(s)); },
-                            [&](auto s) { fixture.restore(s); }, flush, device.stream,
-                            options.timing, execution, cache);
+                            [&](cudaStream_t stream) {
+                                fixture.launch(device.execution_view().on_stream(stream));
+                            },
+                            [&](cudaStream_t stream) {
+                                fixture.restore(device.execution_view().on_stream(stream));
+                            },
+                            flush, device.stream, options.timing, execution, cache);
                         csv.write(row, result, execution, cache,
-                                     std::to_string(options.offset) + "," +
-                                         std::to_string(options.inplace));
+                                  std::to_string(options.offset) + "," +
+                                      std::to_string(options.inplace));
                     }
             };
-            if (options.op == "state-extract") {
+            if (options.op == "gate") {
+                ple::GateFixture fixture(options, t);
+                run(fixture);
+            } else if (options.op == "state-extract") {
                 ple::ExtractFixture fixture(options, t);
                 row.commits = ple::csv_list(fixture.commits);
                 run(fixture);

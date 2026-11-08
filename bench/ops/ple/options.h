@@ -20,10 +20,10 @@ inline Options parse_options(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string_view flag = argv[i];
         if (flag == "--help" || flag == "-h") {
-            std::cout << "PLE convolution and state extraction benchmark\n"
-                         "  --op conv-add|conv-add-norm|state-extract\n"
+            std::cout << "PLE gate, convolution and state extraction benchmark\n"
+                         "  --op gate|conv-add|conv-add-norm|state-extract\n"
                          "  --tokens T[,T...] or --sweep START:END[:STEP] --batch B\n"
-                         "  --valid dense|mixed|N[,N...] --offset N (convolution)\n"
+                         "  --valid dense|mixed|N[,N...] --offset N (gate/convolution)\n"
                          "  --accepted dense|mixed|N[,N...] (state extraction) --inplace\n"
                          "H=2560, streams=4, history=9, B=1..8. Defaults: conv-add-norm, T=B=1.\n";
             measurement::help();
@@ -52,12 +52,14 @@ inline Options parse_options(int argc, char** argv) {
         else if (!measurement::parse(o.timing, flag, value))
             throw std::invalid_argument("unknown option: " + std::string(flag));
     }
-    if (o.batch > 8 || (o.op != "conv-add" && o.op != "conv-add-norm" && o.op != "state-extract"))
+    if (o.batch > 8 || (o.op != "gate" && o.op != "conv-add" && o.op != "conv-add-norm" &&
+                        o.op != "state-extract"))
         throw std::invalid_argument("unsupported Op/batch");
+    if (o.op == "gate" && o.inplace) throw std::invalid_argument("gate has no in-place output");
     if ((o.op == "state-extract" && o.offset != 0) ||
         (o.op != "state-extract" && o.accepted != "dense"))
         throw std::invalid_argument(
-            "offset applies to convolution; accepted applies to extraction");
+            "offset applies to gate/convolution; accepted applies to extraction");
     if (*std::max_element(o.tokens.begin(), o.tokens.end()) >
         std::numeric_limits<int>::max() - o.offset)
         throw std::invalid_argument("record capacity exceeds the Tensor extent domain");
