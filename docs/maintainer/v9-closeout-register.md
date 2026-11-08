@@ -44,3 +44,30 @@ tps 与 T002 基线对比：T002 的 PPL score rate（default 60.1 / freeze 136.
 ## 结论
 
 Phase 8 收尾完成（T212 版本/接口/推送核对、T213 全量终验汇总、T214 归档与 305 对账）。v9 吸收执行至此闭环；未推送提交 93 条待用户收口指令统一处理。
+
+## 2026-11-08 二次收口（用户指令：核实遗漏、全部收尾、推送、对齐版本、正式 release）
+
+### 遗漏核实（170 行任务表：157 ☑ / 8 ⏸ / 5 ✗-判死）
+8 条挂起全部是 qwen4exp 运行时集成（T191–T198），5 条判死为设计结论。本轮把其中可执行的部分做完，其余降到"缺工件"这一个条件：
+
+| 项 | 本轮结果 |
+|---|---|
+| T131 控制面 | ✅ 已完成（`7f2a754f`）：运行时三档模式 + 冻结策略下发 + `/control/*` + 控制台回显；真机 27B/35B 验收、双 PPL 门禁逐位 |
+| T156 state 精确账 | ✅ 已完成（`7031b174`）：Program 建成后报 `[joint] exact`（35B state=61 MiB / 27B state=146 MiB，feasible=1），两模型 PPL 不变 |
+| T156 联合 sizing 接线 | ⏸ 保留 v9.1：`plan_context_capacity` 仍未被 `resolve_kv_capacity` 调用，阻塞点＝StateImage stride 在 sizing 时不可得（需 models 层在建 Program 前暴露）。不做半成品接线 |
+| T156 保留集选择 | ⏸ 保留 v9.1：`select_prefix_checkpoints` 接 `ResourceManager::victims`（策略变更，需 E9/PPL/regress） |
+| T191 转换链路 | ✅ 转换器 + GGUF 直转已落地并端到端验证（`ea0108c4`）；真实工件未完成下载（`R:\model\qwen4exp\UD-Q4_K_XL` 仅第 1 分片 10.9 MB，MTP 2.66 GiB 已完整） |
+| T192–T198 qwen4exp 运行时 | ⏸ 待工件：工件完整后按 v10 立项（见 `upstream-alignment.md` §3 的启动条件） |
+| T212/T213 发布线 | ✅ 正式 release 落 `R:\infer`；模型迁 `R:\model\<name>\`；发布目录自身二进制冒烟；门禁沿用本轮实测 |
+
+### 发布与迁移
+
+- `R:\infer`：`ninfer.exe` / `ninfer-serve.exe` / `ninfer-perplexity.exe` / `ninfer_bench.exe` / `diag-moe.exe` / `diag-cpu-partial.exe` + 10 个 DLL + `docs/` + `templates/` + `symbols/` + `examples.toml` + `scripts/`（3 个启动档）+ `VERSION` + `RELEASE.md` + `SHA256SUMS.txt`。
+- `R:\model\<name>\<name>.ninfer`：5 个工件，逐个 SHA256 双向校验后删除 `D:\ninfer-rtx4090\models` 源文件；迁移清单 `R:\model\MIGRATION.txt`。
+
+### 上游对齐（详见 `upstream-alignment.md`）
+
+- 已吸收基线：`a754fcf3`（305 提交，v9）。
+- 上游现状：`77c2e5e2`（+63）；62 条为 SM100 内核/FP4-Local（sm_89 不适用，守卫已禁），唯一需吸收的是 `77c2e5e2`。
+- **下一对齐目标（v10）＝ `77c2e5e2`**，拆 a 零 frontier 恢复 / b 关闭顺序 / c 观测字段 / d 回归夹具，DoD 与门禁已写入对齐文档。
+
