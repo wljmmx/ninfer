@@ -55,6 +55,14 @@ inline DeviceBuffer make_f32(std::size_t n, std::uint64_t seed, float low, float
     return result;
 }
 
+// Integer metadata operands (valid columns, slots, offsets) come from explicit host values.
+inline DeviceBuffer make_i32(const std::vector<int>& values) {
+    DeviceBuffer result(values.size() * sizeof(int));
+    if (!values.empty()) result.copy_from_host(values.data(), result.bytes);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    return result;
+}
+
 // Snapshot only mutable operands. Restore is setup, never part of a timed Op.
 class SavedBuffer {
 public:

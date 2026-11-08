@@ -71,3 +71,4 @@ ninfer_add_op_bench(ninfer_fused_rmsnorm_bench SOURCES "${CMAKE_CURRENT_LIST_DIR
 ninfer_add_op_bench(ninfer_hc_gated_residual_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/hc_gated_residual_bench.cu")
 include("${CMAKE_CURRENT_LIST_DIR}/rmsnorm/benchmarks.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/gdn_control/benchmarks.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/ple/benchmarks.cmake")
