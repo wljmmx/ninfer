@@ -18,6 +18,13 @@ constexpr std::array kFormats = {
     std::pair{QType::NVFP4, std::string_view{"nvfp4"}},
     std::pair{QType::FP8_E4M3FN_ROW_BF16, std::string_view{"fp8_e4m3fn_row_bf16"}},
     std::pair{QType::NF4_G16_E4M3FN, std::string_view{"nf4_g16_e4m3fn"}},
+    // port (sm_89) T117: the block-scaled FP8 weights the expert path already encodes. Without a
+    // name a container cannot carry them at all, and the 64x64 form T116 added would stay
+    // unreachable from an artifact.
+    std::pair{QType::FP8_E4M3FN_BLOCK128X128_BF16,
+              std::string_view{"fp8_e4m3fn_block128x128_bf16"}},
+    std::pair{QType::FP8_E4M3FN_BLOCK64X64_BF16,
+              std::string_view{"fp8_e4m3fn_block64x64_bf16"}},
 };
 constexpr std::array kLayouts = {
     std::pair{QuantLayout::Contiguous, std::string_view{"contiguous_le_v1"}},
@@ -25,6 +32,10 @@ constexpr std::array kLayouts = {
     std::pair{QuantLayout::RowScale, std::string_view{"row_scale_v1"}},
     std::pair{QuantLayout::RowPagedG16_4K, std::string_view{"row_paged_g16_4k_v1"}},
     std::pair{QuantLayout::BlockScaleK16M128x4, std::string_view{"block_scale_k16_m128x4_v1"}},
+    std::pair{QuantLayout::BatchedBlockScaleK16M128x4,
+              std::string_view{"batched_block_scale_k16_m128x4_v1"}},
+    std::pair{QuantLayout::BlockScaleM128K128, std::string_view{"block_scale_m128_k128_v1"}},
+    std::pair{QuantLayout::BlockScaleM64K64, std::string_view{"block_scale_m64_k64_v1"}},
 };
 
 } // namespace

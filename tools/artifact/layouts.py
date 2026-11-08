@@ -16,6 +16,7 @@ from typing import Sequence
 
 from .formats import (
     DirectFormat,
+    Fp8BlockFormat,
     Fp8RowFormat,
     Nvfp4Format,
     NumericFormat,
@@ -77,6 +78,18 @@ class RowScaleGeometry:
     payload_bytes: int
 
 
+@dataclass(frozen=True, slots=True)
+class Fp8BlockGeometry:
+    n: int
+    k: int
+    block_rows: int
+    block_columns: int
+    code_plane_bytes: int
+    scale_plane_offset: int
+    scale_plane_bytes: int
+    payload_bytes: int
+
+
 CONTIGUOUS_LE_V1 = Layout("contiguous_le_v1", 256, frozenset(("bf16", "fp32", "int32")))
 ROW_SPLIT_K128_V1 = Layout(
     "row_split_k128_v1",
@@ -93,6 +106,16 @@ ROW_SCALE_V1 = Layout(
     256,
     frozenset(("fp8_e4m3fn_row_bf16",)),
 )
+BLOCK_SCALE_M128_K128_V1 = Layout(
+    "block_scale_m128_k128_v1",
+    256,
+    frozenset(("fp8_e4m3fn_block128x128_bf16",)),
+)
+BLOCK_SCALE_M64_K64_V1 = Layout(
+    "block_scale_m64_k64_v1",
+    256,
+    frozenset(("fp8_e4m3fn_block64x64_bf16",)),
+)
 
 LAYOUTS = MappingProxyType(
     {
@@ -102,6 +125,8 @@ LAYOUTS = MappingProxyType(
             ROW_SPLIT_K128_V1,
             BLOCK_SCALE_K16_M128X4_V1,
             ROW_SCALE_V1,
+            BLOCK_SCALE_M128_K128_V1,
+            BLOCK_SCALE_M64_K64_V1,
         )
     }
 )
@@ -226,6 +251,34 @@ def block_scale_geometry(
     )
 
 
+def fp8_block_geometry(
+    format: str | Fp8BlockFormat, shape: Sequence[int]
+) -> Fp8BlockGeometry:
+    spec = _format(format)
+    if not isinstance(spec, Fp8BlockFormat):
+        raise ValueError("block-scaled FP8 requires an fp8 block format")
+    n, k = _shape(shape, rank=2)
+    block_rows, block_columns = spec.block_rows, spec.block_columns
+    if n % block_rows != 0 or k % block_columns != 0:
+        raise ValueError(
+            f"{spec.name} requires N divisible by {block_rows} "
+            f"and K divisible by {block_columns}"
+        )
+    code_plane_bytes = n * k
+    scale_plane_offset = align_up(code_plane_bytes, PLANE_ALIGNMENT)
+    scale_plane_bytes = (n // block_rows) * (k // block_columns) * 2
+    return Fp8BlockGeometry(
+        n=n,
+        k=k,
+        block_rows=block_rows,
+        block_columns=block_columns,
+        code_plane_bytes=code_plane_bytes,
+        scale_plane_offset=scale_plane_offset,
+        scale_plane_bytes=scale_plane_bytes,
+        payload_bytes=scale_plane_offset + scale_plane_bytes,
+    )
+
+
 def row_scale_geometry(
     format: str | Fp8RowFormat, shape: Sequence[int]
 ) -> RowScaleGeometry:
@@ -276,4 +329,8 @@ def encoded_size(
         if not isinstance(numeric_spec, Fp8RowFormat):
             raise ValueError("row_scale_v1 requires a row-scaled FP8 format")
         return row_scale_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec in (BLOCK_SCALE_M128_K128_V1, BLOCK_SCALE_M64_K64_V1):
+        if not isinstance(numeric_spec, Fp8BlockFormat):
+            raise ValueError(f"{layout_spec.name!r} requires an fp8 block format")
+        return fp8_block_geometry(numeric_spec, shape).payload_bytes
     raise ValueError(f"unsupported tensor layout: {layout_spec.name!r}")
