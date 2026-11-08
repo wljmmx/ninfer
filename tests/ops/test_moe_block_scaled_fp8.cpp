@@ -33,7 +33,10 @@ constexpr int kTopK         = 10;
 
 // One budget for the whole routed formula at A8: the FP64 oracle reads the *original* BF16 input
 // and the decoded weights, so the activation quantisation inside the kernel must fit inside it.
-constexpr ReductionCriterion kA8{0.08, 1e-7, 0.12};
+// The absolute RMS floor (1e-7) is the near-zero tail budget the fixture deliberately plants: the
+// first gate/up row tile is all zeros, so SiLU(0)=0 and those rows carry no signal for a relative
+// norm to divide by (upstream 757194af).
+constexpr ReductionCriterion kA8{0.08, 1e-7, 0.12, 1e-7};
 
 int cuda_ordinal() {
     int device = 0;

@@ -73,6 +73,13 @@ struct ReductionCriterion {
     double relative_l2;
     double gross_absolute;
     double gross_relative_to_max_reference;
+    // port (sm_89, upstream 757194af): optional absolute floor for the norm criterion
+    // (RMSE <= absolute_rms + relative_l2 * reference RMS). A near-zero reference makes the
+    // relative norm uninformative - a SiLU tail row of zeros is divided by nothing - so a
+    // criterion that has to accept such rows states the absolute budget it will tolerate
+    // instead of loosening relative_l2 for the rows that do carry signal. Zero keeps the
+    // pure relative form.
+    double absolute_rms = 0.0;
 };
 
 struct ReductionStats {
@@ -129,9 +136,19 @@ inline double gross_error_limit(const ReductionStats& stats, const ReductionCrit
            criterion.gross_relative_to_max_reference * stats.maximum_absolute_reference;
 }
 
+// The norm budget in the units of the reduction: an absolute floor plus the relative term.
+inline double reduction_rms_limit(const ReductionStats& stats,
+                                  const ReductionCriterion& criterion) {
+    return criterion.absolute_rms + criterion.relative_l2 * stats.reference_root_mean_square;
+}
+
 inline bool reduction_passes(const ReductionStats& stats, std::int64_t count,
                              const ReductionCriterion& criterion) {
-    return count > 0 && stats.first_non_finite < 0 && stats.relative_l2 <= criterion.relative_l2 &&
+    const bool norm_passes =
+        criterion.absolute_rms == 0.0
+            ? stats.relative_l2 <= criterion.relative_l2
+            : stats.root_mean_squared_error <= reduction_rms_limit(stats, criterion);
+    return count > 0 && stats.first_non_finite < 0 && norm_passes &&
            stats.maximum_absolute_error <= gross_error_limit(stats, criterion);
 }
 

@@ -9,6 +9,7 @@
 | 条目 | 上游提交 | 裁决 | 本地落点 |
 |---|---|---|---|
 | T120 | 88105a00 + a4e3f4be + 95a651aa | 不搬入（登记） | 本文件 §T120 |
+| T121 | 757194af | 搬入（判据＋MoE 用例） | `tests/ops/op_check.h`、`tests/ops/op_tester.h`、`tests/ops/test_moe_block_scaled_fp8.cpp` |
 
 ---
 
@@ -67,5 +68,24 @@
 - T044 的 **padding 语义下沉**（router 输出 `-1/0`、所有消费者统一跳过）仍是本地批组织若要
   引入 padding 行时的正确形态；本地当前批是紧凑的，无 padding 行可跳。
 - 上游 `warning_once(归因后的原因)`（af4db2a6）可直接搬到本地 feature-gate 日志，属日志条。
+
+---
+
+## T121 近零误差判据修正 —— 搬入
+
+**裁决：搬入判据本体，并把它用在本地的 MoE 用例上。**
+
+- `tests/ops/op_check.h`：`ReductionCriterion` 增加可选 `absolute_rms`（默认 0.0）。非零时
+  范数判据改为 `RMSE <= absolute_rms + relative_l2 * reference_rms`（`reduction_rms_limit`），
+  零时保持原来的纯相对形式 —— 所有既有 `{rel, gross_abs, gross_rel}` 初始化语义不变。
+- `tests/ops/op_tester.h`：`OP_ERROR_STATS kind=reduction` 增加
+  `rms_abs_limit / rms_limit / rms_ratio` 三个字段，判据变化在日志里可见（否则「为什么这条过了」
+  无法用日志回答）。
+- `tests/ops/test_moe_block_scaled_fp8.cpp`：`kA8` 从 `{0.08, 1e-7, 0.12}` 改成
+  `{0.08, 1e-7, 0.12, 1e-7}`。该 fixture 的第一块 gate/up 行 tile 是**全零**（`Matrix` 构造里
+  `nr == 0` 时 scale 取 0），SiLU(0)=0 的那些行对相对范数没有信号，正是上游这条修正的适用面。
+- 上游同时改的 `clamped_ep_fixture.*` 本地不存在（T120 裁决），未搬。
+
+**验证**：`ninfer_moe_block_scaled_fp8_test` 退出码 0（T=1/2/3/5/9 全过，含新增的近零尾行）。
 
 ---
