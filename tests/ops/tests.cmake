@@ -64,6 +64,13 @@ ninfer_add_op_test(ninfer_moe_block_scaled_fp8_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_moe_block_scaled_fp8.cpp"
   LIBRARIES ninfer_ops)
 
+# port (sm_89) T115: the CPU NVFP4 expert kernel. It instantiates the same AVX2 contract the
+# shipped kernel uses, so it needs the same ISA flags and runs on the CPU only.
+ninfer_add_op_test(ninfer_moe_cpu_nvfp4_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_moe_cpu_nvfp4.cpp"
+  LIBRARIES ninfer_ops)
+target_compile_options(ninfer_moe_cpu_nvfp4_test PRIVATE -mavx2 -mfma -mf16c)
+
 ninfer_add_op_test(ninfer_rmsnorm_rope_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_rmsnorm_rope.cpp"
   LIBRARIES ninfer_ops)
