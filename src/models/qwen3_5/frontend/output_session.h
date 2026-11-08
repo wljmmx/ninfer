@@ -6,7 +6,6 @@
 // With only a forward declaration that instantiation is ill-formed -- C++20 tolerated it, the
 // standard library's current completeness check does not.
 #include "text/grammar.h"
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -22,40 +21,8 @@ struct ToolCallOutputContract;
 } // namespace frontend
 class Frontend;
 
-class PublishedOutput {
-public:
-    using iterator       = std::array<OutputDelta, 2>::iterator;
-    using const_iterator = std::array<OutputDelta, 2>::const_iterator;
-
-    PublishedOutput()                                  = default;
-    PublishedOutput(const PublishedOutput&)            = default;
-    PublishedOutput& operator=(const PublishedOutput&) = default;
-    PublishedOutput(PublishedOutput&& other) noexcept;
-    PublishedOutput& operator=(PublishedOutput&& other) noexcept;
-
-    [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
-
-    [[nodiscard]] std::size_t size() const noexcept { return size_; }
-
-    [[nodiscard]] iterator begin() noexcept { return values_.begin(); }
-
-    [[nodiscard]] const_iterator begin() const noexcept { return values_.begin(); }
-
-    [[nodiscard]] iterator end() noexcept { return values_.begin() + size_; }
-
-    [[nodiscard]] const_iterator end() const noexcept { return values_.begin() + size_; }
-
-    [[nodiscard]] OutputDelta& back() noexcept { return values_[size_ - 1]; }
-
-    [[nodiscard]] const OutputDelta& back() const noexcept { return values_[size_ - 1]; }
-
-    void clear() noexcept;
-    void push_back(OutputDelta value);
-
-private:
-    std::array<OutputDelta, 2> values_{};
-    std::size_t size_ = 0;
-};
+// Committed output in event order: text/reasoning deltas interleaved with tool-call lifecycle.
+using PublishedOutput = std::vector<OutputEvent>;
 
 class OutputSession {
 public:

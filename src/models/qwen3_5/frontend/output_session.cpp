@@ -15,6 +15,7 @@
 namespace ninfer::models::qwen3_5 {
 namespace {
 namespace fi                                = frontend;
+using DecodedOutput                         = std::vector<OutputDelta>;
 constexpr std::string_view kThinkClose      = "</think>";
 constexpr std::string_view kUtf8Replacement = "\xef\xbf\xbd";
 
@@ -22,7 +23,7 @@ std::size_t channel_index(OutputChannel channel) noexcept {
     return channel == OutputChannel::Reasoning ? 0 : 1;
 }
 
-void append_delta(PublishedOutput& output, OutputChannel channel, std::string text) {
+void append_delta(DecodedOutput& output, OutputChannel channel, std::string text) {
     if (text.empty()) { return; }
     if (!output.empty() && output.back().channel == channel) {
         output.back().text += text;
@@ -183,7 +184,7 @@ struct StopMatch {
     std::uint32_t committed_tokens  = 0;
     std::uint64_t byte_cut          = 0;
     std::uint32_t declaration_order = 0;
-    PublishedOutput output;
+    DecodedOutput output;
 };
 
 bool stop_match_precedes(std::uint32_t committed_tokens, std::uint64_t byte_cut,
@@ -206,7 +207,7 @@ std::size_t stop_hold_size(std::string_view text, OutputChannel channel, const S
 }
 
 void feed_channel(DecoderState& state, OutputChannel channel, std::string_view text,
-                  const StopPolicy& policy, PublishedOutput& emitted,
+                  const StopPolicy& policy, DecodedOutput& emitted,
                   std::uint32_t committed_tokens, StopMatch* best_match) {
     if (text.empty()) { return; }
     std::string combined          = state.stop_pending[channel_index(channel)];
@@ -224,7 +225,7 @@ void feed_channel(DecoderState& state, OutputChannel channel, std::string_view t
             const auto order             = static_cast<std::uint32_t>(declaration);
             if (!stop_match_precedes(committed_tokens, byte_cut, order, *best_match)) { continue; }
 
-            PublishedOutput candidate = emitted;
+            DecodedOutput candidate = emitted;
             append_delta(candidate, channel, combined.substr(0, found));
             if (stop.include_in_output) { append_delta(candidate, channel, stop.text); }
             *best_match = StopMatch{.found             = true,
@@ -241,14 +242,14 @@ void feed_channel(DecoderState& state, OutputChannel channel, std::string_view t
     state.decoded_bytes += text.size();
 }
 
-void close_channel(DecoderState& state, OutputChannel channel, PublishedOutput& emitted) {
+void close_channel(DecoderState& state, OutputChannel channel, DecodedOutput& emitted) {
     std::string& pending = state.stop_pending[channel_index(channel)];
     append_delta(emitted, channel, std::move(pending));
     pending.clear();
 }
 
 void feed_content(DecoderState& state, std::string text, const StopPolicy& policy,
-                  PublishedOutput& emitted, std::uint32_t committed_tokens, StopMatch* best_match) {
+                  DecodedOutput& emitted, std::uint32_t committed_tokens, StopMatch* best_match) {
     if (state.strip_content_leading) {
         std::size_t begin = 0;
         while (begin < text.size() && std::isspace(static_cast<unsigned char>(text[begin])) != 0) {
@@ -262,7 +263,7 @@ void feed_content(DecoderState& state, std::string text, const StopPolicy& polic
 }
 
 void feed_decoded_text(DecoderState& state, std::string_view text, const StopPolicy& policy,
-                       PublishedOutput& emitted, std::uint32_t committed_tokens,
+                       DecodedOutput& emitted, std::uint32_t committed_tokens,
                        StopMatch* best_match) {
     if (!state.in_reasoning) {
         feed_content(state, std::string(text), policy, emitted, committed_tokens, best_match);
@@ -295,14 +296,14 @@ void feed_decoded_text(DecoderState& state, std::string_view text, const StopPol
 }
 
 void feed_token_bytes(DecoderState& state, std::string_view bytes, const StopPolicy& policy,
-                      PublishedOutput& emitted, std::uint32_t committed_tokens,
+                      DecodedOutput& emitted, std::uint32_t committed_tokens,
                       StopMatch* best_match) {
     state.utf8_pending.append(bytes);
     const std::string text = consume_generated_utf8(state.utf8_pending);
     feed_decoded_text(state, text, policy, emitted, committed_tokens, best_match);
 }
 
-void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput& emitted,
+void terminalize(DecoderState& state, const StopPolicy& policy, DecodedOutput& emitted,
                  std::uint32_t committed_tokens) {
     if (!state.utf8_pending.empty()) {
         // A token budget can end between byte-level tokens of one code point.
@@ -382,7 +383,7 @@ public:
     PrefixExecutionTracker prefix_execution;
     PrefixExecutionTracker preview_prefix_execution;
     std::optional<std::uint32_t> preview_execution_split_after;
-    PublishedOutput preview_output;
+    DecodedOutput preview_output;
     fi::ToolCallOutputDecoder tool_call_output;
     std::vector<GeneratedToolCall> tool_calls;
     ToolCallParseDiagnostics tool_call_parse;
@@ -404,27 +405,18 @@ public:
     }
 };
 
-PublishedOutput::PublishedOutput(PublishedOutput&& other) noexcept
-    : values_(std::move(other.values_)), size_(std::exchange(other.size_, 0)) {}
-
-PublishedOutput& PublishedOutput::operator=(PublishedOutput&& other) noexcept {
-    if (this != &other) {
-        values_ = std::move(other.values_);
-        size_   = std::exchange(other.size_, 0);
+void append_event(PublishedOutput& output, OutputEvent event) {
+    if (auto* delta = std::get_if<OutputDelta>(&event)) {
+        if (delta->text.empty()) { return; }
+        if (!output.empty()) {
+            if (auto* previous = std::get_if<OutputDelta>(&output.back());
+                previous != nullptr && previous->channel == delta->channel) {
+                previous->text += delta->text;
+                return;
+            }
+        }
     }
-    return *this;
-}
-
-void PublishedOutput::clear() noexcept {
-    for (std::size_t index = 0; index < size_; ++index) { values_[index] = {}; }
-    size_ = 0;
-}
-
-void PublishedOutput::push_back(OutputDelta value) {
-    if (size_ == values_.size()) {
-        throw std::logic_error("output decoder produced more than two channel transitions");
-    }
-    values_[size_++] = std::move(value);
+    output.push_back(std::move(event));
 }
 
 OutputSession::OutputSession() noexcept                           = default;
@@ -545,7 +537,7 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
             std::find(impl_->policy.token_ids.begin(), impl_->policy.token_ids.end(), token) !=
             impl_->policy.token_ids.end();
         DecoderState before_state;
-        PublishedOutput before_output;
+        DecodedOutput before_output;
         if (stop_token && !impl_->policy.publish_stop_token) {
             before_state  = impl_->preview_state;
             before_output = impl_->preview_output;
@@ -702,41 +694,49 @@ PublishedOutput OutputSession::commit_preview() {
     swap(impl_->state, impl_->preview_state);
     swap(impl_->semantic, impl_->preview_semantic);
     swap(impl_->prefix_execution, impl_->preview_prefix_execution);
-    PublishedOutput output = std::move(impl_->preview_output);
+    DecodedOutput decoded = std::move(impl_->preview_output);
     impl_->preview_output.clear();
     impl_->preview_ready = false;
 
     if (impl_->grammar) impl_->grammar->confirm();
 
-    for (OutputDelta& delta : output) {
+    PublishedOutput output;
+    for (OutputDelta& delta : decoded) {
         if (delta.channel == OutputChannel::Content) {
             impl_->saw_content |= !delta.text.empty();
             if (impl_->combined && impl_->branch == ConstraintOutputBranch::Undecided &&
                 !delta.text.empty())
                 impl_->branch = delta.text.front() == '<' ? ConstraintOutputBranch::Tools
                                                           : ConstraintOutputBranch::Content;
-            if (!impl_->combined || impl_->branch == ConstraintOutputBranch::Tools)
-                delta.text = impl_->tool_call_output.feed(delta.text);
+            if (!impl_->combined || impl_->branch == ConstraintOutputBranch::Tools) {
+                append_event(output,
+                             OutputEvent(OutputDelta{.channel = delta.channel,
+                                                     .text = impl_->tool_call_output.feed(delta.text)}));
+                continue;
+            }
         }
+        append_event(output, OutputEvent(std::move(delta)));
     }
     if (impl_->state.terminal &&
         (!impl_->combined || impl_->branch == ConstraintOutputBranch::Tools)) {
         fi::ToolCallOutputDecoder::Terminal terminal =
             impl_->tool_call_output.finish(impl_->preview_finish_reason);
-        impl_->tool_calls      = std::move(terminal.tool_calls);
         impl_->tool_call_parse = terminal.diagnostics;
-        if (!terminal.content.empty()) {
-            OutputDelta* content = nullptr;
-            for (OutputDelta& delta : output) {
-                if (delta.channel == OutputChannel::Content) { content = &delta; }
+        append_event(output, OutputEvent(OutputDelta{.channel = OutputChannel::Content,
+                                                     .text    = std::move(terminal.content)}));
+        // Terminal aggregate is published as the same ordered lifecycle events a streaming
+        // decoder produces, so every consumer observes one shape.
+        for (std::uint32_t index = 0; index < terminal.tool_calls.size(); ++index) {
+            const GeneratedToolCall& call = terminal.tool_calls[index];
+            output.emplace_back(ToolCallStart{.index = index, .name = call.name});
+            if (!call.arguments_json.empty()) {
+                output.emplace_back(ToolArgumentsDelta{.index              = index,
+                                                       .text               = call.arguments_json,
+                                                       .parameter_complete = true});
             }
-            if (content != nullptr) {
-                content->text += terminal.content;
-            } else {
-                output.push_back(OutputDelta{.channel = OutputChannel::Content,
-                                             .text    = std::move(terminal.content)});
-            }
+            output.emplace_back(ToolCallEnd{.index = index, .status = call.status});
         }
+        impl_->tool_calls = std::move(terminal.tool_calls);
     }
     return output;
 }

@@ -568,7 +568,7 @@ private:
                         if (auto* timing = std::get_if<GenerationTimingObservation>(&event)) {
                             sink->timing(std::move(*timing));
                         } else {
-                            sink->publish(std::move(std::get<OutputDelta>(event)));
+                            sink->publish(std::move(std::get<OutputEvent>(event)));
                         }
                     } catch (...) { fail_consumer(); }
                 }
@@ -704,8 +704,13 @@ private:
                        EnginePhaseScope* phase                           = nullptr) {
         if (output.empty() && !timing) { return; }
         if (!request->first_output_timing &&
-            std::any_of(output.begin(), output.end(),
-                        [](const auto& delta) { return !delta.text.empty(); })) {
+            std::any_of(output.begin(), output.end(), [](const OutputEvent& event) {
+                if (const auto* text = std::get_if<OutputDelta>(&event))
+                    return !text->text.empty();
+                if (const auto* arguments = std::get_if<ToolArgumentsDelta>(&event))
+                    return !arguments->text.empty();
+                return false;
+            })) {
             if (phase) { phase->checkpoint(); }
             record_first_output(request);
         }
@@ -713,11 +718,13 @@ private:
         {
             std::lock_guard lock(request->mutex);
             if (streaming && timing) { request->events.emplace_back(std::move(*timing)); }
-            for (OutputDelta& delta : output) {
-                std::string& full = delta.channel == OutputChannel::Reasoning ? request->reasoning
-                                                                              : request->content;
-                full += delta.text;
-                if (streaming) { request->events.emplace_back(std::move(delta)); }
+            for (OutputEvent& event : output) {
+                if (const auto* delta = std::get_if<OutputDelta>(&event)) {
+                    auto& full = delta->channel == OutputChannel::Reasoning ? request->reasoning
+                                                                            : request->content;
+                    full += delta->text;
+                }
+                if (streaming) { request->events.emplace_back(std::move(event)); }
             }
         }
         if (streaming) { request->cv.notify_one(); }

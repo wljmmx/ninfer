@@ -336,8 +336,9 @@ constexpr std::array<std::uint8_t, 32> kGradientDigest{
 
 std::string channel_text(const PublishedOutput& output, ninfer::OutputChannel channel) {
     std::string result;
-    for (const ninfer::OutputDelta& delta : output) {
-        if (delta.channel == channel) { result += delta.text; }
+    for (const ninfer::OutputEvent& event : output) {
+        const auto* delta = std::get_if<ninfer::OutputDelta>(&event);
+        if (delta != nullptr && delta->channel == channel) { result += delta->text; }
     }
     return result;
 }
