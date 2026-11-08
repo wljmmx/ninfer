@@ -162,15 +162,23 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         out.scale_bytes_per_row = k / 16;
         out.code_bytes          = out.elements / 2;
         out.scale_offset        = aligned(out.code_bytes, 256);
-    } else if (layout == QuantLayout::BlockScaleM128K128) {
-        // port (sm_89): bench's 128x128 block-scaled FP8, one scale per tile row block.
-        if (format != QType::FP8_E4M3FN_BLOCK128X128_BF16 || n % 128 || k % 128) {
-            throw std::invalid_argument("block-scaled FP8 requires N%128=0 and K%128=0");
+    } else if (layout == QuantLayout::BlockScaleM128K128 ||
+               layout == QuantLayout::BlockScaleM64K64) {
+        // port (sm_89): bench's 128x128 block-scaled FP8, one scale per tile row block. T116 adds
+        // the 64x64 form so a checkpoint that quantised at 64 does not have to be requantised to
+        // 128 to be viewable: the tile size is the only difference, the plane order is the same.
+        const auto block    = layout == QuantLayout::BlockScaleM64K64 ? std::uint64_t{64}
+                                                                     : std::uint64_t{128};
+        const auto expected = block == 64 ? QType::FP8_E4M3FN_BLOCK64X64_BF16
+                                          : QType::FP8_E4M3FN_BLOCK128X128_BF16;
+        if (format != expected || n % block || k % block) {
+            throw std::invalid_argument(
+                "block-scaled FP8 requires its own format and N%block=0, K%block=0");
         }
-        out.group_size          = 128;
-        out.scale_block_rows    = 128;
+        out.group_size          = block;
+        out.scale_block_rows    = block;
         out.code_bytes_per_row  = k;
-        out.scale_bytes_per_row = mul(k / 128, 2);
+        out.scale_bytes_per_row = mul(k / block, 2);
         out.code_bytes          = out.elements;
         out.scale_offset        = aligned(out.code_bytes, 256);
     } else {
@@ -227,6 +235,13 @@ std::uint64_t weight_scale_offset(const WeightGeometry& geometry, std::uint64_t 
         return geometry.scale_offset + (row / 128 * (geometry.shape[1] / 64) + group / 4) * 512 +
                inner % 32 * 16 + inner / 32 * 4 + group % 4;
     }
+    if (geometry.layout == QuantLayout::BlockScaleM128K128 ||
+        geometry.layout == QuantLayout::BlockScaleM64K64) {
+        // port (sm_89) T116: the row coordinate names a tile row here, not a matrix row - one word
+        // covers scale_block_rows rows by block columns.
+        return geometry.scale_offset +
+               row / geometry.scale_block_rows * geometry.scale_bytes_per_row + group * 2;
+    }
     return geometry.scale_offset + row * geometry.scale_bytes_per_row + group * 2;
 }
 
@@ -250,8 +265,10 @@ WeightRowPlanes weight_row_planes(const WeightRegion& region) {
     }
     out.swizzled_scales = g.layout == QuantLayout::BlockScaleK16M128x4;
     if (g.scale_bytes) {
-        out.scales = parent.data + g.scale_offset +
-                     (out.swizzled_scales ? 0 : out.row_begin * out.scale_row_bytes);
+        // port (sm_89) T116: a scale row covers scale_block_rows matrix rows, so a block-scaled
+        // view advances by whole tiles. Every other layout stores scale_block_rows = 1.
+        const auto scale_row = out.row_begin / g.scale_block_rows;
+        out.scales = parent.data + g.scale_offset + (out.swizzled_scales ? 0 : scale_row * out.scale_row_bytes);
     }
     return out;
 }
@@ -322,6 +339,21 @@ Weight native_weight(const WeightView& view, float input_divisor) {
         out.scale_nb[1] = out.scale_nb[2] = out.scale_nb[3] = static_cast<std::int64_t>(out.n) * 2;
     } else if (g.layout == QuantLayout::BlockScaleK16M128x4) {
         out.scale_dtype = DType::FP8_E4M3FN;
+    } else if (g.layout == QuantLayout::BlockScaleM128K128 ||
+               g.layout == QuantLayout::BlockScaleM64K64) {
+        // port (sm_89) T116: the block-scaled FP8 planes. A partial view may only start on a scale
+        // tile: the scale plane is indexed per tile row, so a region that began mid-tile would
+        // silently read its neighbour's scales (weight_row_planes advances by whole tile rows).
+        if (region.begin / g.shape[1] % g.scale_block_rows ||
+            (region.end - region.begin) / g.shape[1] % g.scale_block_rows) {
+            throw std::invalid_argument("block-scaled FP8 view splits a scale tile");
+        }
+        out.scale_dtype = DType::BF16;
+        out.scale_ne[0] = dimension(g.padded_columns / g.group_size);
+        out.scale_ne[1] = out.n / dimension(g.scale_block_rows);
+        out.scale_nb[0] = 2;
+        out.scale_nb[1] = static_cast<std::int64_t>(g.scale_bytes_per_row);
+        out.scale_nb[2] = out.scale_nb[3] = out.scale_nb[1] * out.scale_ne[1];
     }
     return out;
 }

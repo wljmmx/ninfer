@@ -52,6 +52,12 @@ ninfer_add_op_test(ninfer_kv_cache_append_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kv_cache_append.cpp"
   LIBRARIES ninfer_ops)
 
+# port (sm_89) T116: block-scaled FP8 weight views. Host-only: it grades the geometry and the
+# native Weight metadata a block-scaled parent hands to a consumer, so it needs no device.
+ninfer_add_op_test(ninfer_moe_weight_views_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_moe_weight_views.cpp"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_rmsnorm_rope_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_rmsnorm_rope.cpp"
   LIBRARIES ninfer_ops)
