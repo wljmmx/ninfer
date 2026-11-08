@@ -67,3 +67,18 @@
 | T200 | 完成 | T013 已对表 |
 | T201 | 回归 PASS / qwen4exp 待工件 | 记录 |
 | T202 | 不推送 | 登记 |
+
+## 补充核查与新增功能（2026-11-08 18:50）
+
+### 转换器已就位（本地无功能→已增加）
+- `tools/convert/qwen4_exp.py`（626 行，upstream d8c0fa6f 的文件）+ `tools/convert/qwen_resources.py`（30 行，其依赖）已移植，`py_compile` 通过，提交 `f377aa93`。
+- 运行前置（非新增要求）：依赖 `torch`（与本地既有 qwen3_5.py/methods.py 同一前置，本机 Python 环境未装 torch——转换在任何环境都需此依赖，不是 qwen4 特有）。
+- 覆盖：Qwen4ExpForConditionalGeneration / Qwen4ExpForCausalLM 两种架构，含 checkpoint 轴与逻辑参数映射。
+
+### qwen4-27b：与 qwen4-exp 共用转换器（已确认）
+- `upstream/feat/qwen4-27b-ops` 分支的 `tools/convert/` 与 `upstream/master` **完全一致**（目录列表相同、qwen4_exp.py blob 相同），即 qwen4-27b 不是独立模型格式，而是 Qwen4Exp 架构的 27B 配置；本地转换器已同时覆盖。
+- 该分支 787 文件 / +33445 的差异**全部是 QSA 算子优化**（四头 k8v4/nvfp4/int8/bf16 调优、sparse attention 跨 KV 格式调优、20480 整向量 rmsnorm、kpool fixture），不是模型集成功能。
+- 评估结论：qwen4-27b 的"模型转换/注册"功能本地已具备（转换器+QSA 基础算子+GDN+PLE 层）；剩余为**性能优化批次**（可选，不阻塞功能），建议在 qwen4-27b 工件出现后按 T028 纪律分批吸收（优先 20480 rmsnorm 整向量、QSA 四头 bf16/int8 调优）。
+
+### 仍缺的本地功能（需工件）
+- 模型主体：text/vision/mtp 执行、程序、参数映射、HF→ninfer 工件注册（T192–T198）——依赖 qwen4exp 工件；PLE 磁盘层（src/models/qwen4_exp/ple/）与 QSA/GDN 算子已就位，工件到位即可接。
