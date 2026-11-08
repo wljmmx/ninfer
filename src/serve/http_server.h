@@ -80,6 +80,9 @@ private:
 
     void register_routes();
     void register_monitor_routes();
+    // T131: the console's control plane (GET /control/state, POST /control/mode,
+    // POST /control/freeze). Same auth as every other route: the API key when one is set.
+    void register_control_routes();
     void handle_chat_completions(const httplib::Request& req, httplib::Response& res);
     void handle_messages(const httplib::Request& req, httplib::Response& res);
     void handle_count_tokens(const httplib::Request& req, httplib::Response& res);

@@ -1,6 +1,7 @@
 #include "serve/http_server.h"
 
 #include "product/config/options.h"
+#include "serve/control.h"
 #include "serve/http_transport.h"
 #include "serve/request_events.h"
 
@@ -288,6 +289,11 @@ void HttpServer::register_monitor_routes() {
         out["placements"] = Json::array();
         out["resources"]  = resources_json(service_->memory_summary());
         out["load"]       = load_json(load);
+        // T131: the control plane's in-force state, read-only here. The writes live on
+        // /control/mode and /control/freeze; this panel shows the worker's own answer, so the
+        // console can label a deployment with the mode the engine actually runs (and whether the
+        // freeze policy it holds is armed at all), instead of a UI-only selection.
+        out["controller"] = controller_control_json(service_->controller_control_state());
         res.set_header("Cache-Control", "no-store");
         res.set_content(out.dump(), "application/json");
     });

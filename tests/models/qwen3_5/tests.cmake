@@ -116,6 +116,13 @@ ninfer_add_test(ninfer_qwen3_5_param_bus_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_param_bus.cpp"
   LIBRARIES ninfer_core)
 
+# T131: the control plane's pure half - the three console modes and the freeze family's ranges.
+# Also host-only: the mapping is a header, and the engine-side park/apply half is covered by the
+# serve acceptance plus the live run.
+ninfer_add_test(ninfer_qwen3_5_control_plane_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_control_plane.cpp"
+  LIBRARIES ninfer_core)
+
 add_test(NAME ninfer_qwen3_5_agent_continuation_real_test
   COMMAND ninfer_qwen3_5_prefix_real_test)
 set_tests_properties(ninfer_qwen3_5_agent_continuation_real_test PROPERTIES

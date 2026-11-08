@@ -102,6 +102,10 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
         // A dense model has no routed bank; the switch then simply does nothing.
         return {};
     }
+    // T131: keep the bank list for the control plane's freeze policy (all banks, not just the
+    // one that happens to print). The pointers are the parameters' own shared objects, which
+    // outlive the instance's streams (Parameters is a member of it).
+    instance.expert_streams = streams;
     expert_debug("streams", streams.size());
     // port (sm_89): the streamed tier reads either the artifact or a retained Host replica.
     // port (sm_89): the cache keeps a raw pointer, so the source must outlive it - it lives on
@@ -773,6 +777,42 @@ std::uint32_t ModelInstance::resize_kv_capacity(std::uint32_t target_pages) {
         std::fflush(stderr);
     }
     return after;
+}
+
+// T131: the control plane's freeze half. One policy for every bank, because the placement of a
+// bank is per-bank: applying it to bank 0 alone would leave the other layers on their startup
+// values and the console would show a policy only one fortieth of the model obeys.
+void ModelInstance::set_expert_freeze_policy(std::uint32_t freeze_after,
+                                             std::uint32_t reselect_after,
+                                             bool thaw_on_request) {
+    models::qwen3_5::execution::ExpertStream::FreezePolicy policy;
+    policy.freeze_after    = freeze_after;
+    policy.reselect_after  = reselect_after;
+    policy.thaw_on_request = thaw_on_request;
+    for (auto* stream : expert_streams) {
+        if (stream != nullptr) { stream->set_freeze_policy(policy); }
+    }
+    if (!expert_streams.empty()) {
+        std::fprintf(stderr,
+                     "[ctl] freeze policy: freeze_after=%u reselect_after=%u thaw_on_request=%d "
+                     "banks=%zu\n",
+                     freeze_after, reselect_after, int(thaw_on_request), expert_streams.size());
+        std::fflush(stderr);
+    }
+}
+
+bool ModelInstance::expert_freeze_armed() const noexcept {
+    return std::any_of(expert_streams.begin(), expert_streams.end(),
+                       [](const models::qwen3_5::execution::ExpertStream* stream) {
+                           return stream != nullptr && stream->freeze_armed();
+                       });
+}
+
+bool ModelInstance::expert_frozen() const noexcept {
+    return std::any_of(expert_streams.begin(), expert_streams.end(),
+                       [](const models::qwen3_5::execution::ExpertStream* stream) {
+                           return stream != nullptr && stream->frozen();
+                       });
 }
 
 namespace {

@@ -1644,6 +1644,147 @@ public:
         return true;
     }
 
+    // ---- T131: the control plane's parked write -------------------------------------------
+    //
+    // The console's three deployment modes and the expert freeze policy reach the engine from an
+    // HTTP worker thread, but the things they change - PolicyController::mode, the thread-local
+    // ParamBus rows, every ExpertStream's FreezePolicy - live on the worker thread (the
+    // controller and the bus are thread_local BY DESIGN: v8 12.1, "one thread is the shared
+    // state"). This mirrors the slow dial's handshake exactly: an external caller parks a
+    // request, wakes the worker's own scheduling point, and the worker applies it between
+    // rounds. The queue mutex is taken on the way out so a worker sitting in its wait predicate
+    // cannot miss the store between its check and its sleep.
+    //
+    // `freeze_keep_initial` means "the policy this process started with" (NINFER_EXPERT_FREEZE
+    // and friends, read once by the bus); the mode bundles use it for auto/stable, where the
+    // configured warm-up is the policy, and pass an explicit 0 for performance (no freeze).
+    struct ControlRequest {
+        int mode                 = -1; // -1: leave the mode alone
+        bool freeze_valid        = false;
+        bool freeze_keep_initial = false;
+        std::uint32_t freeze_after    = 0;
+        std::uint32_t freeze_reselect = 0;
+        bool freeze_thaw_on_request   = false;
+        std::uint64_t sequence        = 0;
+    };
+    struct ControlState {
+        int mode = 0;
+        std::uint32_t freeze_after = 0;
+        std::uint32_t freeze_reselect = 0;
+        bool freeze_thaw_on_request = false;
+        bool freeze_armed = false;
+        bool frozen       = false;
+        std::uint32_t freeze_banks = 0; // routed banks the policy reaches (0 = dense model)
+        bool live         = false; // a control-plane write has landed
+        bool mode_live    = false; // ... and it included the mode
+        std::uint64_t sequence = 0;
+        std::string detail;
+    };
+
+    [[nodiscard]] std::uint64_t park_control(ControlRequest request) {
+        std::uint64_t sequence = 0;
+        {
+            std::lock_guard lock(control_mutex_);
+            sequence = ++control_sequence_;
+            request.sequence = sequence;
+            pending_control_ = request;
+        }
+        control_pending_.store(true, std::memory_order_release);
+        {
+            std::lock_guard lock(queue_mutex_);
+        }
+        queue_cv_.notify_all();
+        return sequence;
+    }
+
+    [[nodiscard]] ControlState control_state() const {
+        std::lock_guard lock(control_mutex_);
+        return control_state_;
+    }
+
+    // Returns true when the worker applied (or observed an equal) sequence within the timeout;
+    // false means the engine is mid-round and the write is still parked - the caller reports
+    // "queued", never a value it cannot see.
+    [[nodiscard]] bool wait_control(std::uint64_t sequence, std::chrono::milliseconds timeout) {
+        std::unique_lock lock(control_mutex_);
+        return control_cv_.wait_for(lock, timeout, [&] {
+            return control_state_.sequence >= sequence;
+        });
+    }
+
+    // The worker's own scheduling point for the control plane. Runs OUTSIDE execution_mutex_ and
+    // touches only worker-thread state, so it is safe between rounds and while idle.
+    void apply_pending_control() {
+        if (!control_pending_.load(std::memory_order_acquire)) { return; }
+        ControlRequest request;
+        {
+            std::lock_guard lock(control_mutex_);
+            if (!control_pending_.load(std::memory_order_relaxed)) { return; }
+            request = pending_control_;
+            control_pending_.store(false, std::memory_order_release);
+        }
+        using models::qwen3_5::execution::param_bus;
+        std::string detail = "applied";
+        if (request.mode >= 0) {
+            const auto mode = static_cast<ninfer::ControllerMode>(request.mode);
+            models::qwen3_5::execution::policy_controller().mode = mode;
+            // The same value in the process-wide cell: the [bus] panel and every other reader
+            // print the mode in force, so a control-plane change must move the cell too or the
+            // two panels would name different deployments in the same process.
+            ninfer::set_controller_mode_runtime(mode);
+            mode_from_control_ = true;
+            std::fprintf(stderr, "[ctl] mode: %s (control plane)\n",
+                         ninfer::controller_mode_name(mode));
+            std::fflush(stderr);
+        }
+        if (request.freeze_valid) {
+            freeze_after_    = request.freeze_keep_initial ? initial_freeze_after_
+                                                           : request.freeze_after;
+            freeze_reselect_ = request.freeze_keep_initial ? initial_freeze_reselect_
+                                                           : request.freeze_reselect;
+            freeze_thaw_     = request.freeze_keep_initial ? initial_freeze_thaw_
+                                                           : request.freeze_thaw_on_request;
+            instance_.set_expert_freeze_policy(freeze_after_, freeze_reselect_, freeze_thaw_);
+            // The bus rows are the panel's copy of the same policy; note_value is a mirror of a
+            // value the mechanism already holds, not a second write path.
+            auto& bus = param_bus();
+            bus.note_value("freeze_after", static_cast<double>(freeze_after_));
+            bus.note_value("freeze_reselect", static_cast<double>(freeze_reselect_));
+            bus.note_value("freeze_thaw_on_request", freeze_thaw_ ? 1.0 : 0.0);
+            if (freeze_after_ == 0) {
+                detail = "applied (freeze disabled: placement follows the router)";
+            } else if (instance_.expert_bank_count() == 0) {
+                detail = "applied (dense model: no routed expert banks to freeze)";
+            } else if (!instance_.expert_freeze_armed()) {
+                detail = "applied (no freeze mechanism armed: policy stored for the next freeze)";
+            }
+        }
+        publish_control_state(detail.c_str(), request.sequence);
+    }
+
+    // Publishes the worker's current view. `sequence == 0` refreshes the live-state half
+    // (armed/frozen) without claiming a new write; the last write's sequence and detail stay.
+    // `detail == nullptr` likewise keeps the last detail line.
+    void publish_control_state(const char* detail, std::uint64_t sequence) {
+        ControlState next;
+        next.mode                   = static_cast<int>(models::qwen3_5::execution::policy_controller().mode);
+        next.freeze_after           = freeze_after_;
+        next.freeze_reselect        = freeze_reselect_;
+        next.freeze_thaw_on_request = freeze_thaw_;
+        next.freeze_armed           = instance_.expert_freeze_armed();
+        next.frozen                 = instance_.expert_frozen();
+        next.freeze_banks           = static_cast<std::uint32_t>(instance_.expert_bank_count());
+        {
+            std::lock_guard lock(control_mutex_);
+            next.detail    = detail != nullptr ? detail : control_state_.detail;
+            next.sequence  = sequence != 0 ? sequence : control_state_.sequence;
+            next.live      = sequence != 0 || control_state_.live;
+            next.mode_live = mode_from_control_ || control_state_.mode_live;
+            control_state_ = std::move(next);
+        }
+        control_cv_.notify_all();
+    }
+
     // The worker's own scheduling point: apply a parked pool target while idle. Runs OUTSIDE
     // execution_mutex_ on purpose - any_inflight()'s try-lock must be able to see the queue, and
     // the worker must not hold the very lock the contract probes. A refusal is logged and the
@@ -2625,6 +2766,23 @@ private:
         // froze its offsets against.
         models::qwen3_5::execution::param_bus().note_value(
             "graph_on", instance_.expert_pool_pinned ? 1.0 : 0.0);
+        // T131: the control plane's starting view. initial_freeze_* is the policy this process
+        // configured (the bus read the environment once, at construction); auto/stable's bundle
+        // restores exactly this value. Publishing here also means a GET before any write answers
+        // the worker's real mode instead of a guess.
+        {
+            auto& bus = models::qwen3_5::execution::param_bus();
+            const auto clamp_u32 = [](double value) {
+                return value <= 0.0 ? 0U : static_cast<std::uint32_t>(value);
+            };
+            initial_freeze_after_    = clamp_u32(bus.get("freeze_after"));
+            initial_freeze_reselect_ = clamp_u32(bus.get("freeze_reselect"));
+            initial_freeze_thaw_     = bus.get("freeze_thaw_on_request") > 0.0;
+            freeze_after_            = initial_freeze_after_;
+            freeze_reselect_         = initial_freeze_reselect_;
+            freeze_thaw_             = initial_freeze_thaw_;
+            publish_control_state("startup", 0);
+        }
         for (;;) {
             bool idle_for_pool_dial = false;
             {
@@ -2632,10 +2790,12 @@ private:
                 const bool pool_dial_pending =
                     pending_pool_resize_mb_.load(std::memory_order_acquire) > 0.0;
                 if (!stopping_ && pending_.empty() && resident_empty() && paused_.empty() &&
-                    !instance_.program->has_context_transaction() && !pool_dial_pending) {
+                    !instance_.program->has_context_transaction() && !pool_dial_pending &&
+                    !control_pending_.load(std::memory_order_acquire)) {
                     queue_cv_.wait(lock, [&] {
                         return stopping_ || !pending_.empty() ||
-                               pending_pool_resize_mb_.load(std::memory_order_acquire) > 0.0;
+                               pending_pool_resize_mb_.load(std::memory_order_acquire) > 0.0 ||
+                               control_pending_.load(std::memory_order_acquire);
                     });
                 }
                 if (stopping_) {
@@ -2657,6 +2817,16 @@ private:
             if (idle_for_pool_dial) {
                 apply_pending_pool_resize();
                 continue; // re-evaluate the queue before the next round starts
+            }
+            // T131: the control plane's own scheduling point. A parked mode/freeze write is
+            // applied here, on the thread that owns the controller and the streams, before the
+            // next round reads them.
+            apply_pending_control();
+            // The frozen flag moves on its own clock (the freeze rule installs/thaws after 32
+            // layers), so the published state is refreshed on the same window beat instead of
+            // only when someone writes. Cheap: one modulo and one small copy per round.
+            if (models::qwen3_5::execution::param_bus().layers() % 32 == 0) {
+                publish_control_state(nullptr, 0);
             }
             std::unique_lock execution_lock(execution_mutex_);
             bool executed = false;
@@ -3050,6 +3220,25 @@ private:
     // (external Engine::resize_expert_pool and the worker's apply_pending_pool_resize).
     std::atomic<double> pending_pool_resize_mb_{0.0};
     std::mutex resize_mutex_;
+
+    // T131: the control plane's parked write (see park_control). control_pending_ is the wake
+    // predicate the worker's wait consults; the payload and the published state live behind
+    // control_mutex_. The freeze values below are the worker's own copy: initial_* is what the
+    // process configured (the "keep initial" half of the mode bundles), the bare names are what
+    // is in force after the last control write.
+    std::atomic<bool> control_pending_{false};
+    mutable std::mutex control_mutex_;
+    std::condition_variable control_cv_;
+    ControlRequest pending_control_{};
+    ControlState control_state_{};
+    std::uint64_t control_sequence_      = 0;
+    std::uint32_t initial_freeze_after_    = 4;
+    std::uint32_t initial_freeze_reselect_ = 0;
+    bool          initial_freeze_thaw_     = false;
+    std::uint32_t freeze_after_    = 4;
+    std::uint32_t freeze_reselect_ = 0;
+    bool          freeze_thaw_     = false;
+    bool          mode_from_control_ = false;
 
     mutable std::mutex execution_mutex_;
     mutable std::mutex queue_mutex_;

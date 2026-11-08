@@ -131,4 +131,14 @@ inline std::atomic<bool>& controller_mode_read() {
     return true;
 }
 
+// T131: the RUNTIME owner's write. v8 12.1 says the environment/flag is the initial value and
+// after startup the controller owns the mode - this is that ownership expressed as one write,
+// made by the engine worker when the control plane delivers a mode (EngineCore's parked-request
+// scheduling point). It marks the mode as read (so a late --controller-mode cannot overwrite it)
+// and stores the value in the same cell every reader already consults - one value, one home.
+inline void set_controller_mode_runtime(ControllerMode mode) {
+    detail::controller_mode_read().store(true);
+    detail::controller_mode_cell().store(mode);
+}
+
 } // namespace ninfer

@@ -455,6 +455,7 @@ void HttpServer::register_routes() {
         });
 
     register_monitor_routes();
+    register_control_routes();
     server_.Get("/health", [this](const httplib::Request&, httplib::Response& res) {
         const bool available = service_ != nullptr && service_->is_available();
         res.status           = available ? 200 : 503;

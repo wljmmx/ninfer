@@ -5,6 +5,7 @@
 #include "core/startup.h"
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/request.h"
+#include "models/qwen3_5/execution/control_plane.h"
 #include "runtime/engine/causal_score_core.h"
 #include "runtime/engine/engine_core.h"
 #include "runtime/engine/model_instance.h"
@@ -549,6 +550,112 @@ std::uint32_t Engine::resize_kv_pages(std::uint32_t target_pages) {
         throw std::logic_error("KV pool resize lost its idle window");
     }
     return impl_->active->resize_kv_capacity(target_pages);
+}
+
+namespace {
+
+// T131: EngineCore::ControlState -> the public, engine-owned view. The mode is a string on the
+// wire because the control plane is spoken to by name ("auto" / "stable" / "performance"); the
+// controller's own enum stays the single source of the three names.
+template <class CoreState>
+[[nodiscard]] Engine::ControllerControlState public_control_state(const CoreState& state) {
+    Engine::ControllerControlState out;
+    out.mode = ninfer::controller_mode_name(
+        static_cast<ninfer::ControllerMode>(state.mode));
+    out.live                   = state.live;
+    out.mode_live              = state.mode_live;
+    out.freeze_after           = state.freeze_after;
+    out.freeze_reselect        = state.freeze_reselect;
+    out.freeze_thaw_on_request = state.freeze_thaw_on_request;
+    out.freeze_armed           = state.freeze_armed;
+    out.frozen                 = state.frozen;
+    out.freeze_banks           = state.freeze_banks;
+    out.sequence               = state.sequence;
+    out.detail                 = state.detail;
+    return out;
+}
+
+} // namespace
+
+Engine::ControllerControlState Engine::apply_controller_mode(std::string_view mode) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    models::qwen3_5::execution::ModeBundle bundle;
+    if (!models::qwen3_5::execution::parse_mode_bundle(mode, bundle)) {
+        throw std::invalid_argument("controller mode must be auto|stable|performance");
+    }
+    return std::visit(
+        [&](auto& core) -> ControllerControlState {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::GenerationCore>>) {
+                typename Impl::GenerationCore::ControlRequest request;
+                request.mode                = static_cast<int>(bundle.mode);
+                request.freeze_valid        = true;
+                request.freeze_keep_initial =
+                    bundle.freeze == models::qwen3_5::execution::FreezeChoice::KeepInitial;
+                const std::uint64_t sequence = core->park_control(request);
+                const bool applied =
+                    core->wait_control(sequence, std::chrono::milliseconds{1000});
+                auto state = public_control_state(core->control_state());
+                if (!applied) {
+                    state.detail = "queued (engine mid-round; it will apply at the next "
+                                   "scheduling point)";
+                }
+                return state;
+            } else {
+                throw std::logic_error("controller mode requires a generation Engine");
+            }
+        },
+        impl_->core);
+}
+
+Engine::ControllerControlState
+Engine::apply_expert_freeze_policy(const ExpertFreezePolicy& policy) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    std::string reason;
+    if (!models::qwen3_5::execution::freeze_policy_in_range(policy.freeze_after,
+                                                            policy.reselect_after, &reason)) {
+        throw std::invalid_argument(reason);
+    }
+    return std::visit(
+        [&](auto& core) -> ControllerControlState {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::GenerationCore>>) {
+                typename Impl::GenerationCore::ControlRequest request;
+                request.mode                 = -1; // the freeze half only
+                request.freeze_valid         = true;
+                request.freeze_after         = policy.freeze_after;
+                request.freeze_reselect      = policy.reselect_after;
+                request.freeze_thaw_on_request = policy.thaw_on_request;
+                const std::uint64_t sequence = core->park_control(request);
+                const bool applied =
+                    core->wait_control(sequence, std::chrono::milliseconds{1000});
+                auto state = public_control_state(core->control_state());
+                if (!applied) {
+                    state.detail = "queued (engine mid-round; it will apply at the next "
+                                   "scheduling point)";
+                }
+                return state;
+            } else {
+                throw std::logic_error("freeze policy requires a generation Engine");
+            }
+        },
+        impl_->core);
+}
+
+Engine::ControllerControlState Engine::controller_control_state() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [](const auto& core) -> ControllerControlState {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::GenerationCore>>) {
+                return public_control_state(core->control_state());
+            } else {
+                ControllerControlState out;
+                out.detail = "no generation core (causal-scoring engine)";
+                return out;
+            }
+        },
+        impl_->core);
 }
 
 bool Engine::is_available() const {

@@ -147,6 +147,20 @@ public:
         return engine_->media_cache_summary();
     }
 
+    // T131: the control plane. The engine owns the park-and-apply contract; this layer only
+    // translates it to HTTP.
+    [[nodiscard]] ninfer::Engine::ControllerControlState controller_control_state() const {
+        return engine_->controller_control_state();
+    }
+    [[nodiscard]] ninfer::Engine::ControllerControlState
+    apply_controller_mode(std::string_view mode) {
+        return engine_->apply_controller_mode(mode);
+    }
+    [[nodiscard]] ninfer::Engine::ControllerControlState
+    apply_expert_freeze_policy(const ninfer::Engine::ExpertFreezePolicy& policy) {
+        return engine_->apply_expert_freeze_policy(policy);
+    }
+
     [[nodiscard]] ninfer::ModelSamplingDefaults sampling_defaults() const {
         return engine_->sampling_defaults();
     }

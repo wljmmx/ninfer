@@ -3,7 +3,9 @@
 #include "ninfer/types.h"
 
 #include <chrono>
+#include <cstdint>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -149,6 +151,45 @@ public:
     // returned (the VMM block stays mapped); the capacity, the free list and the address bound move.
     // Returns the capacity in pages (64 tokens each) actually in effect.
     std::uint32_t resize_kv_pages(std::uint32_t target_pages);
+
+    // T131: the control plane. The three deployment modes are a RUNTIME decision of this engine
+    // (v8 12.1: the environment/CLI flag is the initial value; after startup the owner is the
+    // controller), and so is the expert freeze policy the modes steer. Both are park-and-apply:
+    // the call hands the value to the engine worker - the only thread that may touch the
+    // controller or an expert stream - and waits briefly for it to land, so the returned state
+    // is what the worker actually holds (or `detail` says it is still queued because the worker
+    // is mid-round).
+    //
+    // apply_controller_mode throws std::invalid_argument for a name other than
+    // auto|stable|performance ("stable keeps the freeze criterion, performance spends it", see
+    // models/qwen3_5/execution/control_plane.h). apply_expert_freeze_policy throws
+    // std::invalid_argument for an out-of-range value (freeze_after 0..32, reselect_after
+    // 0..256).
+    struct ControllerControlState {
+        std::string mode  = "auto"; // in force
+        bool live         = false;  // a control-plane write has been applied by the worker
+        bool mode_live    = false;  // ... and that write included the mode
+        std::uint32_t freeze_after     = 0;
+        std::uint32_t freeze_reselect  = 0;
+        bool freeze_thaw_on_request    = false;
+        // Whether a freeze mechanism is armed at all (the measured rule or the host-freeze
+        // mode). When false the policy above is stored and applied to the NEXT freeze, not in
+        // force now - the control plane never claims a placement is frozen when none is armed.
+        bool freeze_armed = false;
+        bool frozen       = false;
+        std::uint32_t freeze_banks = 0; // routed banks the policy reaches (0 = dense model)
+        std::uint64_t sequence = 0; // 0 = no control-plane write has ever landed
+        std::string detail;         // one line: "applied" / "queued (engine busy: ...)" / ...
+    };
+    struct ExpertFreezePolicy {
+        std::uint32_t freeze_after     = 4;
+        std::uint32_t reselect_after   = 0;
+        bool          thaw_on_request  = false;
+    };
+
+    [[nodiscard]] ControllerControlState apply_controller_mode(std::string_view mode);
+    [[nodiscard]] ControllerControlState apply_expert_freeze_policy(const ExpertFreezePolicy&);
+    [[nodiscard]] ControllerControlState controller_control_state() const;
 
     void reset_memory_peaks() noexcept;
 
