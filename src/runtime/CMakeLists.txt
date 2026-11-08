@@ -1,6 +1,8 @@
 add_library(ninfer_runtime_support STATIC
   engine/context_cache/context_cost.cpp
   engine/context_cache/context_cost_defaults.cpp
+  engine/context_cache/prefix_checkpoint.cpp
+  engine/context_capacity.cpp
   engine/kv_capacity.cpp
   engine/public_types.cpp
 )
