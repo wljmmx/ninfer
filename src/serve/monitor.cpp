@@ -312,7 +312,11 @@ void HttpServer::register_monitor_routes() {
                                    {"context",
                                     Json{{"pools", Json::array()},
                                          {"resources", Json::array()},
-                                         {"metadata", Json::object()}}},
+                                         {"metadata", Json::object()},
+                                         // T166 (upstream e5e18b97): the resolved Main KV
+                                         // capacity is the context token capacity estimate.
+                                         {"context_token_capacity_estimate",
+                                          memory.kv_capacity}}},
                                    {"placements", Json::array()},
                                    {"ranks", Json::array({rank_json(memory, stats)})},
                                    {"media", media_json(media)},
