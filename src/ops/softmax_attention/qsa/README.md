@@ -59,3 +59,19 @@ the 27B/35B line selects QSA at all today; when a model line does, it must stay 
 `KvCacheStorage::BFloat16` until a dedicated PPL (bitwise-where-claimed) + task-suite
 evaluation clears the quantized arm.
 
+## MSVC two-phase lookup (upstream c7ca0958)
+
+Upstream `c7ca0958` had to write `jobs.template build<1, Partition>(a)` in the indexer
+partition kernel: upstream `IndexerJobs` is templated on the query bound, so `jobs` has a
+dependent type and the `template` keyword is required for a member template call.
+
+This port's `IndexerJobs` / `IndexerRadixStorage` are non-templated (fixed bounds), so
+`jobs` is never a dependent type and the `template` keyword must **not** be added — a
+`template` prefix on a non-dependent object is ill-formed. Both call sites
+(`indexer_score.cuh:22`, `indexer_select.cuh:127`) were audited and left as
+`jobs.build<...>`, and a full `-j 8` rebuild of `ninfer_ops` on MSVC is clean.
+
+Rule for later edits: if `IndexerJobs`, or any other holder of these kernels' member
+templates, gains a template parameter, every `obj.build<...>` on the dependent object must
+gain the `template` keyword in the same change.
+
