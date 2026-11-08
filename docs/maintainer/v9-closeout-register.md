@@ -39,7 +39,7 @@ tps 与 T002 基线对比：T002 的 PPL score rate（default 60.1 / freeze 136.
   - T002 基线 + Phase 1–8：A 类整搬（含 T048/T084–T130 等）、M 类三方融合（T049–T083）、语义对表（T145–T168）、参考核对（T021–T047/L01–L14）、模型集成登记（T191–T202）；
   - 无遗漏：305 全部落在上述处理路径；无重复：判死双计已显式标注。
 - **上游分支**：`upstream/feat/qwen4-27b-ops` **未入 master**（最新 e1874e94 "refactor(qsa): organize sparse scheduling and cache reads"）。若后续并入 master，按同规程立项 **v9.1**（复用本计划的七步流程/门禁/判死登记）。
-- **遗留清单**（2026-11-08 复核更新）：T072 JPEG（挂起：libjpeg-turbo 未在依赖树）、T131 控制面（挂起：控制器判据 shadow，等 v8 §9–12）、T156 接线（v9.1：planner 缺 state/workspace 字段）、T191–T198 qwen4exp（待工件；转换器已就位 f377aa93）、T213 发布线跑通（待用户收口）。**已解决**：T088 D64 非因果（整文件替换，commit 6c256193，D64 测试 exit=0）、T166 monitor 展示（commit e4d769d6，真机 estimate=2048）。
+- **遗留清单**（2026-11-08 二次复核）：T131 控制面（挂起：控制器判据 shadow，等 v8 §9–12）、T156 的 state 精确账（v9.1：models 层需暴露 StateImage stride；引擎侧联合预算已接线 1846bd5e）、T191–T198 qwen4exp（待工件；转换器已就位 f377aa93）、T213 发布线跑通（待用户收口）。**已解决**：T088 D64 非因果（整文件替换 6c256193，D64 测试 exit=0）、T166 monitor 展示（e4d769d6，真机 estimate=2048）、T072 JPEG 对齐（libjpeg-turbo 3.2.0 安装＋jpeg.cpp 接线＋测试通过，76293d9c）。
 
 ## 结论
 
