@@ -63,6 +63,7 @@ struct FoldProfile {
     std::int32_t layers;
     std::int32_t value_heads;
     std::int32_t conv_channels;
+    std::int32_t qk_heads = kQkHeads;
 };
 
 std::vector<float> initial_recurrent_values(std::size_t elements, std::uint32_t seed, int layer,
@@ -85,8 +86,9 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
              bool distinct_destination = false) {
     const std::vector<std::int32_t> source_slots = selected_slots(rows);
     std::vector<std::int32_t> destination_slots  = source_slots;
-    if (distinct_destination) { destination_slots[0] = rows == 1 ? 1 : 3; }
-    const std::int32_t slot_count = rows == 1 ? 3 : 11;
+    if (distinct_destination)
+        for (int row = 0; row < rows; ++row) destination_slots[row] = rows == 1 ? 1 : 11 + row;
+    const std::int32_t slot_count = rows == 1 ? 3 : distinct_destination ? 11 + rows : 11;
     const std::size_t recurrent_slot_elements =
         static_cast<std::size_t>(kStateDim) * kStateDim * profile.value_heads;
     const std::size_t recurrent_slot_bytes = recurrent_slot_elements * sizeof(float);
@@ -98,7 +100,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
         .record_capacity = kRecordCapacity,
         .width           = width,
         .conv_channels   = profile.conv_channels,
-        .qk_heads        = kQkHeads,
+        .qk_heads        = profile.qk_heads,
         .value_heads     = profile.value_heads,
         .key_dim         = kStateDim,
         .value_dim       = kStateDim,
@@ -129,9 +131,9 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                                  channel] =
                         bf16_pattern(seed + layer * 131U + row * 17U + token * 7U + channel);
                 }
-                for (std::int32_t head = 0; head < kQkHeads; ++head) {
+                for (std::int32_t head = 0; head < profile.qk_heads; ++head) {
                     const std::size_t base =
-                        static_cast<std::size_t>((column * kQkHeads + head) * kStateDim);
+                        static_cast<std::size_t>((column * profile.qk_heads + head) * kStateDim);
                     for (std::int32_t dim = 0; dim < kStateDim; ++dim) {
                         key_records[base + dim] =
                             bf16_pattern(seed + 100003U + layer * 197U + row * 23U + token * 11U +
@@ -259,7 +261,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     expected_recurrent.fill(0);
     DeviceBuffer local_state(recurrent_slot_bytes);
     local_state.fill(0);
-    const std::size_t q_elements = static_cast<std::size_t>(kStateDim) * kQkHeads * width;
+    const std::size_t q_elements = static_cast<std::size_t>(kStateDim) * profile.qk_heads * width;
     const std::size_t out_elements =
         static_cast<std::size_t>(kStateDim) * profile.value_heads * width;
     DeviceBuffer q(q_elements * sizeof(std::uint16_t));
@@ -267,7 +269,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     q.fill(0);
     DeviceBuffer g_row(static_cast<std::size_t>(profile.value_heads) * width * sizeof(float));
     DeviceBuffer beta_row(static_cast<std::size_t>(profile.value_heads) * width * sizeof(float));
-    const Tensor q_tensor(q.p, DType::BF16, {kStateDim, kQkHeads, width, 1});
+    const Tensor q_tensor(q.p, DType::BF16, {kStateDim, profile.qk_heads, width, 1});
     Tensor local_state_tensor(local_state.p, DType::FP32,
                               {kStateDim, kStateDim, profile.value_heads});
     Tensor output(out.p, DType::BF16, {kStateDim, profile.value_heads, width, 1});
@@ -318,10 +320,10 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
             // Snapshot each transition of the same full W record block. Saving N must not
             // change the input width or regenerate any projection at N.
             for (int token = 0; token < width; ++token) {
-                Tensor query = q_tensor.slice(2, token, 1).view({kStateDim, kQkHeads, 1});
+                Tensor query = q_tensor.slice(2, token, 1).view({kStateDim, profile.qk_heads, 1});
                 Tensor key   = layer_records.key.slice(3, row, 1)
                                  .slice(2, token, 1)
-                                 .view({kStateDim, kQkHeads, 1});
+                                 .view({kStateDim, profile.qk_heads, 1});
                 Tensor value = layer_records.value.slice(3, row, 1)
                                    .slice(2, token, 1)
                                    .view({kStateDim, profile.value_heads, 1});
@@ -362,7 +364,10 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
         DecodeGraphExecutable graph;
         definition.capture(context.stream, [&] { fold_plan.execute(fold_rows, context.stream); });
         graph.instantiate(definition);
-        // Host row descriptors are captured by value. Restore GPU state between replays.
+        // Host row descriptors are captured by value. Mutating them after capture must not alter
+        // the graph's accepted prefixes; GPU state remains a live operand.
+        for (auto& row : fold_rows) row.commit_columns = 0;
+        // Restore GPU state between replays.
         for (int replay = 0; replay < 2; ++replay) {
             cuda_check(cudaMemcpyAsync(state_base, original.p, state_bytes,
                                        cudaMemcpyDeviceToDevice, context.stream),
@@ -543,7 +548,7 @@ int run_record_fold_rounds() {
                                                  .record_capacity = 1,
                                                  .width           = kWidth,
                                                  .conv_channels   = kProfile.conv_channels,
-                                                 .qk_heads        = kQkHeads,
+                                                 .qk_heads        = kProfile.qk_heads,
                                                  .value_heads     = kProfile.value_heads,
                                                  .key_dim         = kStateDim,
                                                  .value_dim       = kStateDim});
@@ -665,12 +670,12 @@ int run_record_fold_rounds() {
                 initial_selector, layer_records.conv, record_query, record_key, record_value,
                 record_z_tensor, record_workspace, nullptr);
 
-            Tensor snapshot_q_view = snapshot_query.view({kStateDim, kQkHeads, kWidth, 1});
-            Tensor snapshot_k_view = snapshot_key.view({kStateDim, kQkHeads, kWidth, 1});
+            Tensor snapshot_q_view = snapshot_query.view({kStateDim, kProfile.qk_heads, kWidth, 1});
+            Tensor snapshot_k_view = snapshot_key.view({kStateDim, kProfile.qk_heads, kWidth, 1});
             Tensor snapshot_v_view =
                 snapshot_value.view({kStateDim, kProfile.value_heads, kWidth, 1});
-            Tensor record_q_view = record_query.view({kStateDim, kQkHeads, kWidth, 1});
-            Tensor record_k_view = record_key.view({kStateDim, kQkHeads, kWidth, 1});
+            Tensor record_q_view = record_query.view({kStateDim, kProfile.qk_heads, kWidth, 1});
+            Tensor record_k_view = record_key.view({kStateDim, kProfile.qk_heads, kWidth, 1});
             Tensor record_v_view = record_value.view({kStateDim, kProfile.value_heads, kWidth, 1});
             Tensor recurrent_states =
                 state_pool.layer_view(static_cast<std::uint32_t>(layer)).recurrent;
@@ -772,6 +777,27 @@ int main() {
     failures += run_case({30, 32, 8192}, 6, 1, {6}, 1841U);
     failures += run_case({30, 32, 8192}, 6, 2, {2, 5}, 1851U);
     failures += run_case({30, 32, 8192}, 16, 8, {0, 1, 2, 3, 16, 7, 12, 5}, 1861U);
+    // Local (36 layer, 8 Q/K heads, 24 V heads, 5120 conv channels) all-layer geometry.
+    for (int batch = 1; batch <= 8; ++batch) {
+        for (const int width : {2, 4, 6, 8, 16}) {
+            failures += run_case({36, 24, 5120, 8}, width, batch,
+                                 std::vector<int>(batch, width), 2200U + 100U * batch + width,
+                                 true);
+            std::vector<int> mixed(batch);
+            for (int row = 0; row < batch; ++row) mixed[row] = (3 * row + 1) % (width + 1);
+            failures += run_case({36, 24, 5120, 8}, width, batch, mixed,
+                                 3200U + 100U * batch + width);
+        }
+        failures += run_case({36, 24, 5120, 8}, 16, batch, std::vector<int>(batch, 0), 4200U + batch,
+                             true);
+        failures += run_case({36, 24, 5120, 8}, 16, batch, std::vector<int>(batch, 1), 4300U + batch,
+                             true);
+    }
+    for (int first = 0; first < 16; first += 8) {
+        std::vector<int> commits(8);
+        for (int row = 0; row < 8; ++row) commits[row] = first + row;
+        failures += run_case({36, 24, 5120, 8}, 16, 8, commits, 4400U + first, true);
+    }
     failures += run_record_fold_rounds();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_replay_fold\n";
     return failures == 0 ? 0 : 1;

@@ -44,7 +44,7 @@ int verify_equal(const std::string& label, const std::vector<std::uint16_t>& lhs
 
 int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
              std::vector<std::int32_t> valid_columns, std::uint32_t seed) {
-    constexpr std::int32_t kQkHeads = 16;
+    const std::int32_t kQkHeads     = value_heads == 24 ? 8 : 16;
     const bool dense                = valid_columns.empty();
     if (dense) { valid_columns.assign(static_cast<std::size_t>(batch), width); }
     const std::int32_t columns       = width * batch;
@@ -74,7 +74,10 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
 
     std::vector<std::int32_t> initial_slots(static_cast<std::size_t>(batch));
     for (std::int32_t row = 0; row < batch; ++row) {
-        initial_slots[static_cast<std::size_t>(row)] = row == 7 ? 7 : (row * 3 + 7) % slots;
+        initial_slots[static_cast<std::size_t>(row)] = (row == 7 ? 7 : (row * 3 + 7) % slots);
+        // Rotate every row's source slot so the read/write join is not the identity.
+        initial_slots[static_cast<std::size_t>(row)] =
+            (initial_slots[static_cast<std::size_t>(row)] + 3) % slots;
     }
 
     DeviceBuffer device_q        = to_device(q_bits);
@@ -295,6 +298,16 @@ int main() {
         failures += run_case(48, width, 8, valid, 1760U + width);
     }
     failures += run_case(48, 5, 3, {5, 3, 1}, 1791U);
+    // Local (8 Q/K heads, 24 V heads) recurrence records, dense and ragged over the whole
+    // registered width/batch domain.
+    for (int batch = 1; batch <= 8; ++batch) {
+        for (int width = 2; width <= 16; ++width) {
+            failures += run_case(24, width, batch, {}, 2000U + 100U * batch + width);
+            std::vector<std::int32_t> valid(batch);
+            for (int row = 0; row < batch; ++row) valid[row] = 1 + (3 * row + width - 1) % width;
+            failures += run_case(24, width, batch, valid, 3000U + 100U * batch + width);
+        }
+    }
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net_replay_record\n";
     return failures == 0 ? 0 : 1;
 }

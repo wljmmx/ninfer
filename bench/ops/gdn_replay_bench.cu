@@ -41,6 +41,7 @@ constexpr std::size_t kDefaultFlush    = 256ULL << 20;
 enum class ProfileSelection : std::uint8_t {
     Qwen27B,
     Qwen35B,
+    Local,
     All,
 };
 
@@ -69,6 +70,7 @@ struct Profile {
     std::int32_t value_heads;
     std::int32_t conv_channels;
     std::vector<std::int32_t> widths;
+    std::int32_t qk_heads = kQkHeads;
 };
 
 struct Options {
@@ -103,8 +105,9 @@ std::int32_t parse_i32(std::string_view text, const char* label, std::int32_t mi
 ProfileSelection parse_profile(std::string_view value) {
     if (value == "27b") return ProfileSelection::Qwen27B;
     if (value == "35b") return ProfileSelection::Qwen35B;
+    if (value == "local") return ProfileSelection::Local;
     if (value == "all") return ProfileSelection::All;
-    throw std::invalid_argument("--profile must be 27b, 35b, or all");
+    throw std::invalid_argument("--profile must be 27b, 35b, local, or all");
 }
 
 CommitSelection parse_commits(std::string_view value) {
@@ -131,7 +134,7 @@ ValidSelection parse_valid(std::string_view value) {
 
 void print_help(const char* program) {
     std::printf("Usage: %s [options]\n\n"
-                "  --profile 27b|35b|all       Registered all-layer geometry (default all).\n"
+                "  --profile 27b|35b|local|all Registered all-layer geometry (default all).\n"
                 "  --component fold|recurrent|all\n"
                 "                              Measured component (default all).\n"
                 "  --width T                   One physical width in [2,16].\n"
@@ -190,6 +193,9 @@ std::vector<Profile> selected_profiles(ProfileSelection selection) {
     }
     if (selection == ProfileSelection::Qwen35B || selection == ProfileSelection::All) {
         profiles.push_back({"35b-a3b", 30, 32, 8192, {2, 6, 16}});
+    }
+    if (selection == ProfileSelection::Local || selection == ProfileSelection::All) {
+        profiles.push_back({"local", 36, 24, 5120, {2, 8, 16}, 8});
     }
     return profiles;
 }
@@ -337,7 +343,7 @@ private:
                                                  .record_capacity = kRecordCapacity,
                                                  .width           = width,
                                                  .conv_channels   = profile.conv_channels,
-                                                 .qk_heads        = kQkHeads,
+                                                 .qk_heads        = profile.qk_heads,
                                                  .value_heads     = profile.value_heads,
                                                  .key_dim         = kStateDim,
                                                  .value_dim       = kStateDim});
@@ -413,8 +419,8 @@ public:
     }
 
     void launch_record(cudaStream_t stream) {
-        Tensor q(q_.p, DType::BF16, {kStateDim, kQkHeads, width_, batch_});
-        Tensor k(k_.p, DType::BF16, {kStateDim, kQkHeads, width_, batch_});
+        Tensor q(q_.p, DType::BF16, {kStateDim, profile_.qk_heads, width_, batch_});
+        Tensor k(k_.p, DType::BF16, {kStateDim, profile_.qk_heads, width_, batch_});
         Tensor v(v_.p, DType::BF16, {kStateDim, profile_.value_heads, width_, batch_});
         Tensor g(g_.p, DType::FP32, {profile_.value_heads, width_, batch_});
         Tensor beta(beta_.p, DType::FP32, {profile_.value_heads, width_, batch_});
@@ -422,7 +428,7 @@ public:
                       {kStateDim, kStateDim, profile_.value_heads, batch_});
         Tensor valid = valid_tensor();
         Tensor initial(record_initial_.p, DType::I32, {batch_});
-        Tensor key_record(key_record_.p, DType::BF16, {kStateDim, kQkHeads, width_, batch_});
+        Tensor key_record(key_record_.p, DType::BF16, {kStateDim, profile_.qk_heads, width_, batch_});
         Tensor value_record(value_record_.p, DType::BF16,
                             {kStateDim, profile_.value_heads, width_, batch_});
         Tensor gate_record(gate_record_.p, DType::FP32, {2, profile_.value_heads, width_, batch_});
@@ -435,7 +441,7 @@ private:
     [[nodiscard]] static float scale() { return 1.0F / std::sqrt(128.0F); }
 
     [[nodiscard]] std::size_t qk_elements() const {
-        return static_cast<std::size_t>(kStateDim) * kQkHeads * width_ * batch_;
+        return static_cast<std::size_t>(kStateDim) * profile_.qk_heads * width_ * batch_;
     }
 
     [[nodiscard]] std::size_t value_elements() const {
@@ -549,7 +555,9 @@ void print_result(const Profile& profile, std::int32_t width, std::int32_t batch
     }
     const double state_bytes = static_cast<double>(profile.layers) * updated * profile.value_heads *
                                kStateDim * kStateDim * sizeof(float) * 2.0;
-    const double state_gbs         = state_bytes / (measurement.cold.median_us * 1.0e3);
+    const double state_gbs = measurement.cold.median_us > 0.0
+                                 ? state_bytes / (measurement.cold.median_us * 1.0e3)
+                                 : 0.0;
     const double ns_per_transition = committed == 0
                                          ? 0.0
                                          : measurement.cold.median_us * 1000.0 /
