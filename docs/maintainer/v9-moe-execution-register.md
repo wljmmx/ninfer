@@ -13,6 +13,7 @@
 | T122 | a08d5133 + 7ea6cb6e | 部分搬入：scratch 限定搬入；共享输出消费已成本地形态 | `src/ops/moe/operands.*`、`src/ops/moe/workspace.h`、4 个 entry |
 | T123 | a9c68b44 + ff17188e | 不搬入（登记） | 本文件 §T123 |
 | T124 | 67ded232 + 0857a495 | 不搬入（机制已在本地形态） | 本文件 §T124 |
+| T125 | 组门禁 | 通过（见数据） | 本文件 §T125 |
 
 ---
 
@@ -201,5 +202,82 @@
 
 - TMA 子项**不采纳**（sm_89 无此指令，上游门槛写死 `is_device_capability(90)`）；
   act+quant 融合若要真动，必须按功能改动走 PPL 逐位＋dump 门禁 —— 本地当前无需动。
+
+---
+
+## T125 组门禁（T120–T124）—— 通过
+
+执行环境：RTX 4090 / sm_89 / Windows 11 / CUDA 13.4；本机全量测试与门禁同会话连跑。
+原始日志与 CSV：`.temp/t125/`（`ctest_full.log`、`regress_fast.log`、`regress_moe.log`、
+`guards.log`、`bench_sparse_moe.{log,csv}`、`softmax_attn.log`、各 MoE 测试日志）。
+
+### 1. 构建
+
+- 全量目标构建零错误；本轮最后改动后删掉 `src/ops/moe` 下全部 **28 个 .obj** 重编，
+  再到 `ninja: no work to do`（即改动面所在 TU 是干净重编出来的，不是旧 obj 复用）。
+
+### 2. 守卫复检
+
+- `python tools/port/check_blackwell_guards.py` → `ok: 1255 file(s) scanned, no ungated
+  Blackwell-only call sites`（exit 0）。
+
+### 3. 全量测试（ctest，176 条，1150 s）
+
+- 失败 6 条，与 T119 基线逐条对账后**无新增**：
+  - 既有失败、本轮同集合（5 条）：`ninfer_artifact_reader_test`、`ninfer_bench_support_test`、
+    `ninfer_qwen3_5_loading_test`、`ninfer_qwen3_5_frontend_test`(0xc0000409)、
+    `ninfer_kv_cache_append_test`(0xc0000409)。
+  - `ninfer_fused_rmsnorm_test`：T119 失败、本轮通过（flaky，方向变好）。
+  - `ninfer_softmax_attention_test`：全量跑里 **180 s 超时**（本轮整机负载：总时长 1150 s vs
+    T119 的 629 s）。单独复跑 `--kv-dtype rk4v4-e8` **114.8 s 通过，exit 0**
+    （日志末行 `PASS causal_softmax_attention rk4v4-e8 public-contract correctness (114.791 s)`）。
+    判为超时门槛 + 机器负载，不是本批回归；本批未触碰 attention。
+- MoE 相关六个程序复跑：`moe_block_scaled_fp8`、`moe_cpu_nvfp4`、`moe_int8_mma`、`sparse_moe`、
+  `moe_weight_views` 全 exit=0；`qwen3_5_moe_real_test` exit=77（无工件，SKIP，与本批无关）。
+
+### 4. regress `--tier fast`（双 PPL 的稠密侧 + 字节门 + 精度面）
+
+```
+default PPL 7.441868  expect 7.441868   PASS      ← 逐位
+selector-off dump 636e38de95046781  expect 636e38de95046781   PASS   ← 逐位
+accuracy: 9 hit / 2 miss，全部 PASS
+regressions: 0
+```
+
+### 5. regress `--tier moe`（双 PPL 的 MoE 侧，含 decode 哈希）
+
+```
+ctx 1024 stride 512   PPL 7.111129  expect 7.111129   PASS
+ctx 512  stride 256   PPL 7.777808  expect 7.777808   PASS
+ctx 4096 stride 2048  PPL 6.479183  expect 6.479183   PASS
+decode d093ac2070ab3292  expect d093ac2070ab3292   PASS   '2, 3, 5, 7, 11<|im_end|>'
+regressions: 0
+```
+
+结论：T122 的 scratch 生命周期改动对生产 MoE 路径**数值中性**（三点逐位不变、decode 哈希不变），
+这是本组唯一的算子侧改动，故 PPL 逐位即为该改动的验收。
+
+### 6. MoE bench
+
+`ninfer_sparse_moe_bench --codec all --sweep 1:2048:256 --repeat 200 --warmup 5 --flush-mib 96
+--cache cold --execution graph`（RTX 4090，理论 1008.1 GB/s，冷缓存，graph replay）：
+
+| codec | T=1 min | T=257 min | T=1025 min | T=1 唯一权重带宽 |
+|---|---|---|---|---|
+| q4-q5 | 35.840 us | 920.576 us | 1301.504 us | 510.3 GB/s (50.6%) |
+| q4-q6 | 34.816 us | 977.920 us | 1343.488 us | 554.2 GB/s (55.0%) |
+| q8-q8 | 50.176 us | 1494.016 us | 1995.776 us | 608.1 GB/s (60.3%) |
+
+注：该 bench 覆盖的是公开 `SparseMoe` 合约（h2048/e256/k8）；本轮改动的 `routed_swiglu`
+（h2560/e512/k10）在本地**没有独立 bench**，因此本条**不声称任何提速**，也不引用 bench 数字
+作为它的性能证据 —— 与「无提速声明」一致。
+
+### 7. T028 三件套适用性判定
+
+- T121 只动测试判据（不动算子），T122 只动 scratch 生命周期（不动算术，逐位门为证）：
+  两条都**不是提速型改动**，因此不触发「KL 分长度 + 套件 + 性能 A/B」；组门禁按
+  「regress fast + 双 PPL + MoE bench」口径执行完毕。
+- 遗留候选（转后续条目，均需 T028 全套）：T123c 的确定性 rank 改造（atomicAdd → 前缀和）、
+  T124b 的本地 Q8 共享 GU tile 重挑（需先给该 op 建 bench）。
 
 ---
