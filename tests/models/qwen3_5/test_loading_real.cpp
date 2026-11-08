@@ -100,8 +100,8 @@ void check_native_inputs(const qwen::Model& model) {
             const auto& gdn = std::get<qwen::GdnWeights>(weights.mixer);
             (void)ops::prepare_gdn_input_proj_weights(model.input(gdn.query), model.input(gdn.key),
                                                       model.input(gdn.value), model.input(gdn.z));
-            (void)ops::prepare_gdn_gating_proj_weights(model.input(gdn.a_projection),
-                                                       model.input(gdn.b_projection));
+            (void)ops::prepare_gdn_control_proj_weights(model.input(gdn.a_projection),
+                                                        model.input(gdn.b_projection));
             (void)linear(gdn.output);
         }
         if (const auto* mlp = std::get_if<qwen::DenseWeights>(&weights.ffn)) {

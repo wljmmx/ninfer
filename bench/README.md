@@ -392,50 +392,78 @@ cmake --build build -j --target ninfer_scatter_bf16_batch_bench
 
 ## RMSNorm Op benchmark
 
-`ninfer_rmsnorm_bench` measures public RMSNorm, with `--kind dflash2_hidden` for plain D=5120,
-`hidden27` for offset D=5120, and `target_q27` / `target_k27` for offset D=256 with 24 / 4 heads.
-The existing DFlash, 35B target and GatedRMSNorm profiles remain selectable in `--help`.
-`--tokens` supplies aggregate matrix columns, independently of the speculative block width.
-Inputs and gains are nonuniform represented BF16 values. CSV reports actual geometry, Graph
-nodes/calls, zero scratch, logical bytes and median/min/p95 public-call latency.
-Its CSV also carries `logical_gb_s` and `bandwidth_reference_us`: the listed logical bytes moved
-per second, and the time the same traffic would take at the device's nominal memory bandwidth
-(reported only as a scale, since repeated reads and cache behaviour are not DRAM traffic).
+`ninfer_rmsnorm_bench` measures one public RMSNorm call selected by
+`--op rmsnorm|offset|silu-gated|sigmoid-gated`. Plain and offset forms select direct or unit-offset
+gain; both gated forms use direct gain. `--dim D --heads H --tokens T[,T...] --batch B` describes
+BF16 `[D,H,T,B]`, with a separate D-element reduction for each of the `H*T*B` rows. Inputs, gains
+and gates are nonuniform represented BF16 values. Defaults are `rmsnorm`, D=128, H=48, T=1, B=1.
+`--sweep START:END[:STEP]` replaces the token list; `--tokens` and `--sweep` are mutually exclusive.
 
-Cold mode flushes 256 MiB before each measured interval. Warm Graph bundles avoid host launch
-gaps and normalize time per public call; a cold bundle flushes only before its first call.
-`--profile` brackets one public call with CUDA profiler start/stop.
+The RMSNorm and GDN control benchmarks share `bench/ops/op_measurement.cuh`. Each sample times one
+complete public Op. Graph GPU timing brackets the captured Op body with external CUDA event
+nodes; eager GPU timing includes host launch gaps. Host submission is measured separately.
+Fixture preparation and cold-cache eviction precede the timed interval. CSV reports semantic
+geometry, execution/cache mode, GPU and host median/min/p95 microseconds, `workspace_bytes`,
+`workspace_peak`, and `kernels` (actual captured kernel nodes, excluding event nodes).
+RMSNorm uses zero workspace. These measurements establish Op latency, not Engine latency.
+
+Both benchmarks accept `--execution graph|eager|both`, `--cache cold|warm|both`, `--warmup N`,
+`--repeat N`, `--flush-mib N` and `--csv-out PATH`. Defaults are Graph, both cache modes,
+10 warmups, 100 samples and a 256 MiB cold-cache flush; CSV goes to stdout unless a path is supplied.
 
 ```bash
 cmake --build build -j --target ninfer_rmsnorm_bench
-./build/bench/ninfer_rmsnorm_bench --kind dflash2_hidden --tokens 1,8,16,32,64,96,128,2048
-./build/bench/ninfer_rmsnorm_bench --kind target_q27 --tokens 1,8,16,32,64,96,128 \
-  --cache warm --graph-calls 32 --csv-out /tmp/rmsnorm.csv
-./build/bench/ninfer_rmsnorm_bench --kind hidden27 --tokens 128 --profile
+./build/bench/ninfer_rmsnorm_bench \
+  --op rmsnorm --dim 5120 --heads 1 --tokens 1,8,16,32,64,96,128,2048
+./build/bench/ninfer_rmsnorm_bench \
+  --op offset --dim 256 --heads 24 --tokens 1,8,16,32,64,96,128 \
+  --execution graph --cache warm --csv-out /tmp/rmsnorm.csv
+./build/bench/ninfer_rmsnorm_bench \
+  --op silu-gated --dim 128 --heads 48 --tokens 1,8,16,128
+./build/bench/ninfer_rmsnorm_bench \
+  --op sigmoid-gated --dim 128 --heads 48 --batch 8 --tokens 1,7,16 \
+  --execution both --cache both
 ```
 
-## GDN control-projection Op benchmark
+## GDN control Op benchmark
 
-`ninfer_gdn_gating_proj_bench` measures the complete public `gdn_norm_gating_proj` (`--op norm`,
-default) or `gdn_gating_proj` (`--op control`). `--geometry 27b` uses D5120/H48 and defaults to the
-Qwen3.8 contiguous BF16 `[96,5120]` parent; `--weights split` measures the two-weight form.
-`--geometry 35b` uses the D2048/H32 parent. All numerical inputs are nonuniform represented values.
+`ninfer_gdn_control_bench` selects `--op control|projection|norm-projection` for public
+`gdn_control`, `gdn_control_proj` and `gdn_norm_control_proj`. Direct control consumes BF16 a/b;
+projection includes AB projection and both nonlinear controls; norm-projection also includes
+offset input RMSNorm and its explicit BF16 normalized output. Controls are FP32. All numerical
+inputs are nonuniform represented values.
 
-The benchmark reports eager/Graph latency, graph call/node counts, and the public point workspace
-query against its measured peak. Cold runs flush 256 MiB before each call. For short warm Ops,
-`--graph-calls 16` captures consecutive calls and normalizes times per Op; it requires Graph/warm.
-`--profile` brackets one selected workload with CUDA profiler APIs. Production owns all dispatch.
+`--heads H --input-rows K --weights parent|pair` supplies numerical geometry and weight storage.
+Parent storage is a contiguous BF16 `[2H,K]` matrix, with A before B; pair storage uses two BF16
+`[H,K]` matrices. Supported combinations are:
+
+| Op | H | K | Weights |
+|---|---:|---:|---|
+| `control` | 48 | — | none; explicit `--input-rows` and `--weights` are rejected |
+| `projection` | 48 | 2560 | `parent` |
+| `projection`, `norm-projection` | 48 | 5120 | `parent` or `pair` |
+| `projection`, `norm-projection` | 32 | 2048 | `parent` |
+
+Defaults are `projection`, H=48, K=2560, `parent`, tokens=1 and batch=1. Norm-projection requires
+an explicit supported K. `--tokens T[,T...]` or `--sweep START:END[:STEP]` selects T, with
+`M=T*B`, column=`t+T*b`, and `--batch B` selecting B. Timing flags and CSV statistics follow the
+[RMSNorm benchmark](#rmsnorm-op-benchmark); GDN also reports `weights`. The workspace columns
+compare the public point capacity query with measured arena peak; direct control has no scratch.
+Only operands needed by the selected Op are allocated. Production owns all dispatch.
 
 ```bash
-cmake --build build -j --target ninfer_gdn_gating_proj_bench
-./build/bench/ninfer_gdn_gating_proj_bench \
-  --geometry 27b --op norm --weights parent --tokens 1,2,4,8,9,16,32,64,128 \
+cmake --build build -j --target ninfer_gdn_control_bench
+./build/bench/ninfer_gdn_control_bench \
+  --op projection --heads 48 --input-rows 2560 --weights parent --sweep 1:128 \
   --execution graph --cache cold --warmup 10 --repeat 61
-./build/bench/ninfer_gdn_gating_proj_bench \
-  --geometry 27b --op norm --tokens 1,2,4,8,9,16,32,64,128 \
-  --execution graph --cache warm --graph-calls 16 --csv-out /tmp/gdn-norm-warm.csv
-./build/bench/ninfer_gdn_gating_proj_bench \
-  --geometry 35b --op norm --tokens 16 --execution graph --cache cold --profile
+./build/bench/ninfer_gdn_control_bench \
+  --op norm-projection --heads 48 --input-rows 5120 --weights pair \
+  --tokens 1,2,4,8,9,16,32,64,128 --execution graph --cache warm \
+  --csv-out /tmp/gdn-norm-warm.csv
+./build/bench/ninfer_gdn_control_bench \
+  --op norm-projection --heads 32 --input-rows 2048 --tokens 16,17,128
+./build/bench/ninfer_gdn_control_bench \
+  --op control --heads 48 --batch 8 --tokens 1,7,16 --execution both --cache warm
 ```
 
 ## Dynamic grouped-convolution prepare Op benchmark

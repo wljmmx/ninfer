@@ -1,6 +1,6 @@
 #include "models/qwen3_5/execution/gdn.h"
 
-#include "ninfer/ops/gdn_gating_proj.h"
+#include "ninfer/ops/gdn_control.h"
 #include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/w4a8.h"
 
@@ -76,15 +76,8 @@ void gdn_projection(const Tensor& hidden, const GdnParameters& parameters, Tenso
 void gdn_norm_control(const Tensor& residual, const Tensor& norm, float epsilon,
                       const GdnParameters& parameters, Tensor& hidden, Tensor& g, Tensor& beta,
                       WorkspaceArena& workspace, DeviceExecutionView execution) {
-    if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.control)) {
-        ops::gdn_norm_gating_proj(residual, norm, epsilon, pair->first, pair->second,
-                                  parameters.a_log, parameters.dt_bias, workspace, hidden, g, beta,
-                                  execution);
-    } else {
-        const auto& single = std::get<LinearParameters>(parameters.control);
-        ops::gdn_norm_gating_proj(residual, norm, epsilon, single.weight, parameters.a_log,
-                                  parameters.dt_bias, workspace, hidden, g, beta, execution);
-    }
+    ops::gdn_norm_control_proj(residual, norm, epsilon, parameters.control, parameters.a_log,
+                               parameters.dt_bias, {hidden, {g, beta}}, workspace, execution);
 }
 
 void gdn_projection_snapshot(const Tensor& hidden, const GdnParameters& parameters,

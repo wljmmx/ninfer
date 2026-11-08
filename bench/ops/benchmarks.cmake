@@ -1,11 +1,8 @@
 ninfer_add_op_bench(ninfer_silu_mul_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/silu_mul_bench.cu")
 ninfer_add_op_bench(ninfer_residual_add_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/residual_add_bench.cu")
 ninfer_add_op_bench(ninfer_sigmoid_mul_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/sigmoid_mul_bench.cu")
-ninfer_add_op_bench(ninfer_rmsnorm_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/rmsnorm_bench.cu")
 ninfer_add_op_bench(ninfer_rmsnorm_pack_tail_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/rmsnorm_pack_tail_bench.cu")
 ninfer_add_op_bench(ninfer_l2norm_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/l2norm_bench.cu")
-ninfer_add_op_bench(ninfer_gdn_gating_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/gdn_gating_bench.cu")
-ninfer_add_op_bench(ninfer_gdn_gating_proj_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/gdn_gating_proj_bench.cu")
 ninfer_add_op_bench(ninfer_dynamic_grouped_conv_prepare_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/dynamic_grouped_conv_prepare_bench.cu")
 ninfer_add_op_bench(ninfer_linear_dynamic_grouped_conv_add_bench
@@ -72,3 +69,5 @@ ninfer_add_op_bench(ninfer_proposal_remap_bench SOURCES "${CMAKE_CURRENT_LIST_DI
 ninfer_add_op_bench(ninfer_moe_cpu_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/moe_cpu_bench.cpp")
 ninfer_add_op_bench(ninfer_fused_rmsnorm_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/fused_rmsnorm_bench.cu")
 ninfer_add_op_bench(ninfer_hc_gated_residual_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/hc_gated_residual_bench.cu")
+include("${CMAKE_CURRENT_LIST_DIR}/rmsnorm/benchmarks.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/gdn_control/benchmarks.cmake")

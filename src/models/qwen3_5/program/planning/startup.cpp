@@ -14,7 +14,7 @@
 #include "ninfer/ops/context_kv_materialize.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 #include "ninfer/ops/linear_topk.h"
-#include "ninfer/ops/gdn_gating_proj.h"
+#include "ninfer/ops/gdn_control.h"
 #include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
@@ -381,9 +381,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 } else {
                     const auto& gdn = std::get<execution::GdnParameters>(block.mixer);
                     (void)workspace::gdn_control(layout, config, last);
-                    scratch(layout, ops::gdn_norm_gating_proj_workspace_capacity_bytes(
-                                        dimension(config.gdn->linear_num_value_heads),
-                                        dimension(config.hidden_size), first, last));
+                    scratch(layout, ops::gdn_norm_control_proj_workspace_capacity_bytes(
+                                        gdn.control, first, last));
                     (void)workspace::gdn_projection(layout, config, last);
                     if (path == GdnWorkspacePath::Snapshot) {
                         scratch(layout, execution::gdn_snapshot_workspace_bytes(

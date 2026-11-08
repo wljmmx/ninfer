@@ -234,8 +234,8 @@ public:
             out.mixer     = GdnParameters{
                 ops::prepare_gdn_input_proj_weights(model_.input(g.query), model_.input(g.key),
                                                         model_.input(g.value), model_.input(g.z)),
-                ops::prepare_gdn_gating_proj_weights(model_.input(g.a_projection),
-                                                         model_.input(g.b_projection)),
+                ops::prepare_gdn_control_proj_weights(model_.input(g.a_projection),
+                                                          model_.input(g.b_projection)),
                 tensor(g.a_log),
                 tensor(g.dt_bias),
                 tensor(g.convolution),

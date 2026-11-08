@@ -76,8 +76,8 @@ struct ProjectionProfile {
                                                                const WeightInput& key,
                                                                const WeightInput& value,
                                                                const WeightInput& z);
-[[nodiscard]] ProjectionWeights prepare_gdn_gating_proj_weights(const WeightInput& a,
-                                                                const WeightInput& b);
+[[nodiscard]] ProjectionWeights prepare_gdn_control_proj_weights(const WeightInput& a,
+                                                                 const WeightInput& b);
 [[nodiscard]] SingleProjectionWeight prepare_linear_swiglu_weight(const WeightInput& gate,
                                                                   const WeightInput& up);
 [[nodiscard]] SparseMoeWeights

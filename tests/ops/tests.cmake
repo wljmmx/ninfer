@@ -4,9 +4,7 @@ set(ninfer_op_tests
   silu_mul
   residual_add
   sigmoid_mul
-  rmsnorm
   rmsnorm_pack_tail
-  gated_rmsnorm
   fused_rmsnorm
   l2norm
   gated_delta_net
@@ -15,8 +13,6 @@ set(ninfer_op_tests
   layer_norm
   embedding
   argmax
-  gdn_gating
-  gdn_gating_proj
   rope
   vision_pos_embed
   sampling
@@ -143,3 +139,5 @@ ninfer_add_op_test(ninfer_moe_int8_mma_test
   LIBRARIES ninfer_ops)
 include("${CMAKE_CURRENT_LIST_DIR}/gated_residual/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/softmax_attention/qsa/tests.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/rmsnorm/tests.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/gdn_control/tests.cmake")

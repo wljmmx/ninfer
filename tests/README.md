@@ -30,6 +30,11 @@ executables and CTest working directories under `build/tests/`.
 Concrete numerical criteria remain named by the semantic Op suite; there are no cross-Op tolerance
 presets.
 
+RMSNorm and GDN control suites live in `ops/rmsnorm/` and `ops/gdn_control/`, each with its own
+registration manifest. Both RMSNorm gates remain in one `test_gated.cpp`. GDN control separates
+represented-input fixtures, the FP64 oracle, semantic cases, the runner and public-contract
+validation; their shared C++ support compiles once with the independent oracle's arithmetic options.
+
 `ops/quantized_weight.h` is the common packed-weight fixture for Q4/Q5/Q6/Q8, FP8 and NVFP4 Op tests. It
 owns deterministic payload generation, device `Weight` views, row views, and independent logical
 weight decoding.
@@ -87,6 +92,35 @@ Large causal reference calculations use at most eight CPU workers while preservi
 FP64 accumulation order; small cases remain serial. Cache fixtures populate the reachable KV
 prefix while reserving the full execution-envelope page table. The runner reports elapsed time
 per KV type.
+
+Run the RMSNorm and GDN control families together:
+
+```bash
+cmake --build build -j --target \
+  ninfer_rmsnorm_test ninfer_gated_rmsnorm_test \
+  ninfer_gdn_control_test ninfer_gdn_control_proj_test ninfer_gdn_norm_control_proj_test
+ctest --test-dir build --output-on-failure \
+  -R '^ninfer_(rmsnorm|gated_rmsnorm|gdn_control|gdn_control_proj|gdn_norm_control_proj)_test$'
+```
+
+The five targets qualify plain/offset RMSNorm, both SiLU/sigmoid gated forms, pointwise GDN
+controls, control projection and offset norm/control projection. Independent FP64 oracles evaluate
+the complete formulas over represented inputs, without reproducing private staging, reduction
+trees or output storage rounding. Promoted BF16 outputs and FP32 controls are compared directly
+with those results. Checks cover complete outputs, eager and changed-input Graph replay, input
+preservation, output guards, public argument rejection and applicable workspace capacity/prefix
+rules. The new BF16 `[96,2560]` projection includes every M=1..128, larger extents and changed
+contents at captured addresses; norm/control projection keeps its K=5120/2048 support domain.
+Cases also retain zero/negative norm gains and physically reshaped combined parents.
+
+Numerical criteria live in the suites: gated criteria in
+[test_gated.cpp](ops/rmsnorm/test_gated.cpp), and GDN control criteria in
+[criteria.h](ops/gdn_control/criteria.h). Pointwise control budgets account for FP32 nonlinear
+arithmetic. The unnormalized projection uses an accumulation-depth estimate for its finite gross
+error cap while retaining the stricter relative L2 criterion; that estimate is a numerical quality
+limit, not a worst-case guarantee for arbitrary dot-product conditioning. Criteria apply to whole
+mathematical forms, without private-route or per-case overrides. Use `NINFER_OP_REPORT_STATS=1`
+with verbose CTest output to inspect the same criteria used by the normal verdict.
 
 Linear tests are independently runnable by weight and activation-compute profile:
 
