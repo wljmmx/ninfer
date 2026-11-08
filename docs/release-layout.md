@@ -73,3 +73,13 @@ cannot be shipped silently.
 4. `python -m tools.convert --help`, `python tools\upgrade_ninfer_v2_to_v3.py --help`,
    `python tools\console\lmcache_console.py --help` all run from the folder.
 5. The numerical gates were run on the same build tree (see `RELEASE.md`).
+
+## Two traps this page exists to prevent
+
+* **BOM in files a program parses.** Windows PowerShell 5.1 writes a BOM for `-Encoding UTF8`, and
+  Node's `JSON.parse` rejects it (`Unexpected token '﻿'`). The packager writes `config.local.json`
+  and `VERSION` through a BOM-free helper — the first packaging run had shipped a BOM'd
+  `config.local.json` and the dashboard refused to start.
+* **Stale binaries.** `ninfer.exe` older than the newest `src/`/`include/` file stops the script;
+  a release built from a tree that no longer matches its own sources is worse than a late one.
+

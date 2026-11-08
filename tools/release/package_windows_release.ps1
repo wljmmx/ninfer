@@ -12,6 +12,12 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# Windows PowerShell 5.1's `Set-Content -Encoding UTF8` writes a BOM, and Node's JSON.parse
+# rejects it ("Unexpected token"). Everything a program has to parse is written through this
+# helper instead, which is BOM-free on both 5.1 and 7.
+function Write-NoBom([string]$path, [string]$text) {
+    [System.IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding($false)))
+}
 if (-not $Repo) {
     # $PSScriptRoot is not always populated when the script is started with -File from another
     # shell; the command path always is.
@@ -98,7 +104,7 @@ foreach ($item in @('package.json', 'config.example.json', 'README.md')) {
   "history_days": 30,
   "default_theme": "paper"
 }
-'@ | Set-Content (Join-Path $dash 'config.local.json') -Encoding UTF8
+'@ | ForEach-Object { Write-NoBom (Join-Path $dash 'config.local.json') $_ }
 New-Item -ItemType Directory -Path (Join-Path $dash 'data') -Force | Out-Null
 
 @'
@@ -142,7 +148,7 @@ version:  $describe
 commit:   $commit
 built:    $((Get-Item (Join-Path $apps 'ninfer.exe')).LastWriteTime.ToString('yyyy-MM-dd HH:mm'))
 toolchain CUDA 13.4 / MSVC / CMake Release / sm_89
-"@ | Set-Content (Join-Path $Root 'VERSION') -Encoding UTF8
+"@ | ForEach-Object { Write-NoBom (Join-Path $Root 'VERSION') $_ }
 
 Get-ChildItem $Root -Recurse -File |
     Where-Object { $_.FullName -notlike '*\dashboard\node_modules\*' -and $_.Name -ne 'SHA256SUMS.txt' } |
