@@ -76,8 +76,11 @@ void topk_softmax_swiglu_moe(const Tensor& x, const MoeProfile& profile, const M
     operands.control(weights.control, {p.ffn.hidden, p.experts, p.top_k});
     operands.experts(weights.routed, p);
     operands.shared(weights.shared, p.ffn.hidden);
-    operands.workspace(
-        workspace, topk_softmax_swiglu_moe_workspace_capacity_bytes(profile, mode, tokens, tokens));
+    auto workspace_scope = workspace.scope();
+    MemoryArena scratch(detail::aligned_scratch(
+        workspace,
+        topk_softmax_swiglu_moe_workspace_capacity_bytes(profile, mode, tokens, tokens)));
+    operands.workspace(scratch.storage());
     operands.finish();
     nvtx::ScopedRange range(nvtx::Name::TopkSoftmaxSwiGLUMoe, nvtx::Category::Moe, tokens);
     for (std::int64_t start = 0; start < tokens; start += impl::kSliceTokens) {
@@ -86,8 +89,8 @@ void topk_softmax_swiglu_moe(const Tensor& x, const MoeProfile& profile, const M
         const auto plan    = shape.select(count);
         const auto input   = x.slice(1, offset, count);
         auto output        = destination.slice(1, offset, count);
-        auto scope         = workspace.scope();
-        const auto storage = allocate(workspace, plan, count, p.experts, p.top_k,
+        auto scope         = scratch.scope();
+        const auto storage = allocate(scratch, plan, count, p.experts, p.top_k,
                                       p.ffn.gate_up_type == QType::Q8_G32_FP16);
         const ScaledSwiGLUTerm shared{weights.shared, storage.shared};
         if (plan.implementation == kernel::ExpertImplementation::BlockScaled) {

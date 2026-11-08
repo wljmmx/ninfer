@@ -26,7 +26,10 @@ public:
     void subset(ExpertSubset subset, int experts);
     void experts(const CudaSwiGLUExperts& weights, const RoutedSwiGLUProfile& profile);
     void shared(const SwiGLUWeights& weights, int hidden);
-    void workspace(const MemoryArena& workspace, std::size_t bytes);
+    // port (sm_89, upstream 7ea6cb6e): the scratch range comes from the operator's own aligned
+    // subarena, not from wherever the caller's cursor happens to sit. A zero-byte span records
+    // nothing and allocates nothing.
+    void workspace(MemorySpan scratch);
     void finish() const;
 
 private:

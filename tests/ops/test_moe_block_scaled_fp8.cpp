@@ -166,7 +166,7 @@ struct Fixture {
     }
 };
 
-int run(Fixture& fixture, int tokens) {
+int run(Fixture& fixture, int tokens, std::size_t leading_scratch_bytes = 0) {
     const auto execution = execution_view();
     std::vector<float> x(std::size_t(kHidden) * std::size_t(tokens));
     for (int t = 0; t < tokens; ++t) {
@@ -200,14 +200,34 @@ int run(Fixture& fixture, int tokens) {
 
     const std::size_t bytes = ops::routed_swiglu_workspace_capacity_bytes(
         fixture.profile, subset.kind, DType::FP32, ops::MoeEpilogue::Write, tokens, tokens);
-    GuardedDeviceBuffer scratch(bytes), result(std::size_t(kHidden) * std::size_t(tokens) * 4);
+    GuardedDeviceBuffer scratch(bytes + 256), result(std::size_t(kHidden) * std::size_t(tokens) * 4);
     MemoryArena arena(MemorySpan{scratch.data(), scratch.bytes(), device});
+    if (leading_scratch_bytes != 0) {
+        // port (sm_89, upstream 7ea6cb6e): scratch is measured from the operator's own aligned
+        // origin, so a caller sitting at an odd cursor must still run - and must get its cursor
+        // back. The old contract demanded a 256-byte-aligned caller cursor and refused this call.
+        (void)arena.alloc_bytes(leading_scratch_bytes, 1);
+        const auto data = reinterpret_cast<std::uintptr_t>(scratch.data());
+        if (arena.used() != leading_scratch_bytes) {
+            std::cerr << "routed_swiglu: caller cursor did not advance to the odd offset\n";
+            return 1;
+        }
+        if ((data + leading_scratch_bytes) % 256 == 0) {
+            std::cerr << "routed_swiglu: the odd cursor is accidentally 256-byte aligned\n";
+            return 1;
+        }
+    }
     Tensor output(MemorySpan{result.data(), result.bytes(), device}, DType::FP32,
                   {kHidden, tokens});
 
     ops::routed_swiglu(input, fixture.profile, fixture.experts, routes, subset,
                        ops::MoeEpilogue::Write, output, arena, execution);
     cuda_synchronize();
+    if (arena.used() != leading_scratch_bytes) {
+        std::cerr << "routed_swiglu left the caller's cursor consumed: used=" << arena.used()
+                  << " expected=" << leading_scratch_bytes << '\n';
+        return 1;
+    }
 
     const std::vector<float> got_float =
         from_device<float>(result.data(), std::size_t(kHidden) * std::size_t(tokens));
@@ -303,6 +323,7 @@ int main() {
     try {
         Fixture fixture;
         for (const int tokens : {1, 2, 3, 5, 9}) { failures += run(fixture, tokens); }
+        failures += run(fixture, 3, 8); // caller cursor at an odd offset
         failures += nvfp4_is_dead();
     } catch (const std::exception& error) {
         std::cerr << "block-scaled MoE test exception: " << error.what() << '\n';

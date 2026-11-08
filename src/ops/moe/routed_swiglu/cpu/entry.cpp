@@ -1,6 +1,7 @@
 #include "ninfer/ops/moe.h"
 #include "ops/common/host/operands.h"
 #include "ops/moe/routed_swiglu/cpu/dispatch.h"
+#include "ops/moe/workspace.h"
 
 #include <array>
 #include <chrono>
@@ -167,7 +168,9 @@ void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
     // paid once per layer per token, so it competes with the arithmetic.
     const bool timing  = std::getenv("NINFER_CPU_TIMING") != nullptr;
     const auto started = std::chrono::steady_clock::now();
-    const Operands operands(x, destination, workspace, capacity, profile.ffn.hidden);
+    auto workspace_scope = workspace.scope();
+    MemoryArena scratch(detail::aligned_scratch(workspace, capacity));
+    const Operands operands(x, destination, scratch, capacity, profile.ffn.hidden);
     if (subset.kind == ExpertSubsetKind::None) {
         std::memset(destination.data, 0, destination.bytes());
         return;
@@ -227,7 +230,7 @@ void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
                   2 * profile.ffn.intermediate, profile.ffn.hidden, profile.experts, selected);
     operands.bank(experts.down, profile.ffn.down_type, profile.ffn.down_layout, profile.ffn.hidden,
                   profile.ffn.intermediate, profile.experts, selected);
-    auto scope = workspace.scope();
+    auto scope = scratch.scope();
     const kernel::Invocation args{.input        = static_cast<const std::uint16_t*>(x.data),
                                   .ids          = ids,
                                   .coefficients = coefficients,
@@ -240,7 +243,7 @@ void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started)
             .count();
     const auto launch_begin = std::chrono::steady_clock::now();
-    shape.launch(args, workspace, execution);
+    shape.launch(args, scratch, execution);
     if (timing) {
         const auto launch_ms = std::chrono::duration<double, std::milli>(
                                    std::chrono::steady_clock::now() - launch_begin).count();

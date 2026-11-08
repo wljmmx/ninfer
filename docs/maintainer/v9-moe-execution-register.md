@@ -10,6 +10,7 @@
 |---|---|---|---|
 | T120 | 88105a00 + a4e3f4be + 95a651aa | 不搬入（登记） | 本文件 §T120 |
 | T121 | 757194af | 搬入（判据＋MoE 用例） | `tests/ops/op_check.h`、`tests/ops/op_tester.h`、`tests/ops/test_moe_block_scaled_fp8.cpp` |
+| T122 | a08d5133 + 7ea6cb6e | 部分搬入：scratch 限定搬入；共享输出消费已成本地形态 | `src/ops/moe/operands.*`、`src/ops/moe/workspace.h`、4 个 entry |
 
 ---
 
@@ -87,5 +88,45 @@
 - 上游同时改的 `clamped_ep_fixture.*` 本地不存在（T120 裁决），未搬。
 
 **验证**：`ninfer_moe_block_scaled_fp8_test` 退出码 0（T=1/2/3/5/9 全过，含新增的近零尾行）。
+
+---
+
+## T122 共享输出消费 routed contributions ＋ scratch 限定 —— 后半搬入，前半已是本地形态
+
+### 7ea6cb6e「aligned scratch 限定在算子调用内」—— 搬入
+
+- 本地原实现（`src/ops/moe/operands.cpp` 的 `workspace(const MemoryArena&, size_t)`）把
+  **调用方游标所在的偏移**当作 scratch 原点：容量查询假设 256 字节对齐原点，而执行侧要求
+  `operand::aligned(span.data, 256)`，两条契约不一致；游标不在原点时直接抛
+  `"MoE: workspace is not aligned"`。调用方还必须自己保证「用完把游标还回去」。
+- 现在：`workspace(MemorySpan)` 只校验设备与落盘范围；每个 entry 先
+  `aligned_scratch(workspace, capacity)` 从调用方 arena 里切一块**对齐子 arena**
+  （`src/ops/moe/workspace.h`），所有切片分配改从该子 arena 取，函数返回时
+  `workspace.scope()` 把调用方游标还原。零字节不分配（仍带设备名，供操作数校验读同一答案）。
+- 落点：`routed_swiglu/cuda/entry.cpp`、`routed_swiglu/cpu/entry.cpp`、`topk_softmax_route/entry.cpp`、
+  `topk_softmax_swiglu_moe/entry.cpp`。CPU 半区同样处理（它原来也要求
+  `"workspace cursor must be 256-byte aligned"`），否则 split 层两侧契约不同。
+- **回归用例**：`tests/ops/test_moe_block_scaled_fp8.cpp` 新增 `run(fixture, 3, 8)` ——
+  先把调用方游标推到 8 字节（非 256 对齐）再调用，断言调用成功且游标被还原。
+  用例强度做过 A/B：把 `operands.*` 与四个 entry 退回旧实现重建，该用例以
+  `MoE: workspace is not aligned` 退出 1；换回新实现退出 0。
+
+### a08d5133「共享输出消费 routed contributions」—— 不搬入（本地已是等价且更省的单遍）
+
+- 上游把方向定为：路由先把贡献写成 FP32[H,T]＋可选有效性平面 `valid_tokens`
+  （`routed_swiglu/cuda/contribution.h` 新增 `RoutedSwiGLUContribution`），再由**共享 FFN**
+  在自己的 epilogue 里把路由贡献加进来（`swiglu_ffn::launch_*_ffn_join`），因此只 round 一次。
+  有效性平面存在的原因是该提交配套的 clamped 路径会整块跳过路由（数学零但 values 不可读）。
+- 本地是**反向的单遍**：共享 term 由路由内核在 epilogue 里消费
+  （`moe.h`:130–135 的 `ScaledSwiGLUTerm`；`routed_swiglu/cuda/entry.cpp` 把 `term` 直接交给
+  grouped/block-scaled 内核，`block_scaled::launch` 的 shared 分支在 `block_scaled/launch.cu`:183–185）。
+  两条路径的算术同为「路由和 + 系数×共享项，一次 round」，没有 FP32 往返可省。
+- 本地没有「数学零但 values 不可读」的行：split 层的 GPU 半区用 mask、CPU 半区只跑 mask 保留的
+  路由（`moe.h`:184–185），所以有效性平面在本地无对位；为它新增一套平面只会让两侧契约分叉。
+  与 `74671a4e` 建立的 CPU 执行半区口径一致：CPU 侧收到的就是「要被算的项」。
+- 结论：该提交的**目标**（一次 round、无中间往返）本地已达成，代码不搬。
+
+**验证**：MoE 相关五个测试全 exit=0（`moe_block_scaled_fp8`、`moe_cpu_nvfp4`、`moe_int8_mma`、
+`sparse_moe`、`moe_weight_views`）。
 
 ---

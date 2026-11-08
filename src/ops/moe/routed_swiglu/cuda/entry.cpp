@@ -75,8 +75,11 @@ void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiG
         operands.shared(shared->weights, profile.ffn.hidden);
         operands.coefficient(shared->coefficients, tokens, false);
     }
-    operands.workspace(workspace, capacity(profile, shared_profile ? &*shared_profile : nullptr,
-                                           subset.kind, destination.dtype, mode, tokens, tokens));
+    auto workspace_scope = workspace.scope();
+    MemoryArena scratch(
+        detail::aligned_scratch(workspace, capacity(profile, shared_profile ? &*shared_profile : nullptr,
+                                            subset.kind, destination.dtype, mode, tokens, tokens)));
+    operands.workspace(scratch.storage());
     operands.finish();
     nvtx::ScopedRange range(nvtx::Name::RoutedSwiGLU, nvtx::Category::Moe, tokens);
     if (subset.kind == ExpertSubsetKind::None && !shared) {
@@ -97,9 +100,9 @@ void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiG
         if (shared) {
             term = ScaledSwiGLUTerm{shared->weights, shared->coefficients.slice(0, offset, count)};
         }
-        auto scope         = workspace.scope();
+        auto scope         = scratch.scope();
         const auto plan    = shape.select(count, shared != nullptr);
-        const auto buffers = allocate(workspace, plan, count, subset.kind, shared != nullptr,
+        const auto buffers = allocate(scratch, plan, count, subset.kind, shared != nullptr,
                                       profile.ffn.gate_up_type == QType::Q8_G32_FP16);
         if (plan.implementation == kernel::ExpertImplementation::BlockScaled) {
             // The block-scaled kernels skip a masked-out route without counting it. Reporting a zero

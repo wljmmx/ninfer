@@ -266,15 +266,11 @@ void MoeOperands::shared(const SwiGLUWeights& weights, int hidden) {
     matrix(weights.down.weight, hidden, profile.intermediate, profile.down_type);
 }
 
-void MoeOperands::workspace(const MemoryArena& workspace, std::size_t bytes) {
-    operand::device(workspace.device(), device_, op_, "workspace");
-    require(workspace.used() <= workspace.capacity() &&
-                bytes <= workspace.capacity() - workspace.used(),
-            "MoE: insufficient workspace");
-    if (bytes) {
-        const auto span = workspace.storage().subspan(workspace.used(), bytes);
-        require(operand::aligned(span.data, 256), "MoE: workspace is not aligned");
-        writes_.at(write_count_++) = operand::range(span.data, span.bytes, op_);
+void MoeOperands::workspace(MemorySpan scratch) {
+    operand::device(scratch.device, device_, op_, "workspace");
+    require(scratch.bytes == 0 || scratch.data != nullptr, "MoE: workspace has no backing");
+    if (scratch.bytes) {
+        writes_.at(write_count_++) = operand::range(scratch.data, scratch.bytes, op_);
     }
 }
 
