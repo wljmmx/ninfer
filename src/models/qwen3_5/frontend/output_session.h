@@ -1,5 +1,6 @@
 #pragma once
 #include "ninfer/types.h"
+#include "models/qwen3_5/frontend/tool_output_error.h"
 #include "runtime/contract/request.h"
 // Complete, not forward-declared: the constructor below takes unique_ptr<GrammarSession>, so every
 // translation unit that constructs or destroys an OutputSession instantiates default_delete for it.
@@ -53,6 +54,7 @@ public:
     [[nodiscard]] std::uint32_t grammar_masks(std::span<const TokenId> drafts,
                                               std::span<std::uint32_t> words);
     [[nodiscard]] std::vector<GeneratedToolCall> take_tool_calls() noexcept;
+    [[nodiscard]] std::optional<frontend::ToolOutputError> output_error() const;
     [[nodiscard]] ToolCallParseDiagnostics tool_call_parse_diagnostics() const noexcept;
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;
     [[nodiscard]] ThinkingBudgetStats thinking_stats() const noexcept;

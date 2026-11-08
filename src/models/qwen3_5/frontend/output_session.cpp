@@ -385,8 +385,6 @@ public:
     std::optional<std::uint32_t> preview_execution_split_after;
     DecodedOutput preview_output;
     fi::ToolCallOutputDecoder tool_call_output;
-    std::vector<GeneratedToolCall> tool_calls;
-    ToolCallParseDiagnostics tool_call_parse;
     bool preview_ready                 = false;
     FinishReason preview_finish_reason = FinishReason::None;
     std::unique_ptr<text::GrammarSession> grammar;
@@ -450,7 +448,8 @@ std::optional<ConstraintObservation> OutputSession::constraint_observation() con
     auto result = impl_->grammar->observation();
     if (impl_->combined)
         result.branch = impl_->branch;
-    else if (impl_->tool_call_output.in_tool_region() || !impl_->tool_calls.empty())
+    else if (impl_->tool_call_output.in_tool_region() ||
+             impl_->tool_call_output.diagnostics().marker_seen)
         result.branch = ConstraintOutputBranch::Tools;
     else if (impl_->saw_content || (!impl_->state.in_reasoning && result.complete))
         result.branch = ConstraintOutputBranch::Content;
@@ -709,9 +708,9 @@ PublishedOutput OutputSession::commit_preview() {
                 impl_->branch = delta.text.front() == '<' ? ConstraintOutputBranch::Tools
                                                           : ConstraintOutputBranch::Content;
             if (!impl_->combined || impl_->branch == ConstraintOutputBranch::Tools) {
-                append_event(output,
-                             OutputEvent(OutputDelta{.channel = delta.channel,
-                                                     .text = impl_->tool_call_output.feed(delta.text)}));
+                for (OutputEvent& event : impl_->tool_call_output.feed(delta.text)) {
+                    append_event(output, std::move(event));
+                }
                 continue;
             }
         }
@@ -719,34 +718,26 @@ PublishedOutput OutputSession::commit_preview() {
     }
     if (impl_->state.terminal &&
         (!impl_->combined || impl_->branch == ConstraintOutputBranch::Tools)) {
-        fi::ToolCallOutputDecoder::Terminal terminal =
-            impl_->tool_call_output.finish(impl_->preview_finish_reason);
-        impl_->tool_call_parse = terminal.diagnostics;
-        append_event(output, OutputEvent(OutputDelta{.channel = OutputChannel::Content,
-                                                     .text    = std::move(terminal.content)}));
-        // Terminal aggregate is published as the same ordered lifecycle events a streaming
-        // decoder produces, so every consumer observes one shape.
-        for (std::uint32_t index = 0; index < terminal.tool_calls.size(); ++index) {
-            const GeneratedToolCall& call = terminal.tool_calls[index];
-            output.emplace_back(ToolCallStart{.index = index, .name = call.name});
-            if (!call.arguments_json.empty()) {
-                output.emplace_back(ToolArgumentsDelta{.index              = index,
-                                                       .text               = call.arguments_json,
-                                                       .parameter_complete = true});
-            }
-            output.emplace_back(ToolCallEnd{.index = index, .status = call.status});
+        for (OutputEvent& event : impl_->tool_call_output.finish(impl_->preview_finish_reason)) {
+            append_event(output, std::move(event));
         }
-        impl_->tool_calls = std::move(terminal.tool_calls);
     }
     return output;
 }
 
 std::vector<GeneratedToolCall> OutputSession::take_tool_calls() noexcept {
-    return impl_ != nullptr ? std::move(impl_->tool_calls) : std::vector<GeneratedToolCall>{};
+    if (impl_ == nullptr) { return {}; }
+    return impl_->tool_call_output.take_tool_calls();
+}
+
+std::optional<fi::ToolOutputError> OutputSession::output_error() const {
+    if (impl_ == nullptr) { return std::nullopt; }
+    return impl_->tool_call_output.error();
 }
 
 ToolCallParseDiagnostics OutputSession::tool_call_parse_diagnostics() const noexcept {
-    return impl_ != nullptr ? impl_->tool_call_parse : ToolCallParseDiagnostics{};
+    return impl_ != nullptr ? impl_->tool_call_output.diagnostics()
+                            : ToolCallParseDiagnostics{};
 }
 
 std::uint32_t OutputSession::reasoning_tokens() const noexcept {

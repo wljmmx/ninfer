@@ -730,6 +730,18 @@ private:
         if (streaming) { request->cv.notify_one(); }
     }
 
+    // Model-format failures settle only this already-committed row. Native abort still owns the
+    // sequence cleanup; decoder errors must not escape to the Engine-wide invariant handler.
+    bool fail_output(const std::shared_ptr<Request>& request) {
+        const auto error = request->output.output_error();
+        if (!error) { return false; }
+        auto aborted = instance_.program->abort(*request->sequence);
+        request->generation_timings = aborted.timings;
+        request->speculative_stats  = std::move(aborted.speculative);
+        complete_error(request, error->exception());
+        return true;
+    }
+
     void publish_prompt_progress(const std::shared_ptr<Request>& request) {
         if (!request->observation.prompt_progress) { return; }
         if (!request->admitted_begin || !request->admitted_at) {
@@ -1303,6 +1315,13 @@ private:
                 auto published = request->output.commit_preview();
                 auto timing    = record_committed_output(request, accepted);
                 append_output(request, std::move(published), std::move(timing), &phase);
+                if (request->output.output_error()) {
+                    if (committed.capture_ready[row]) {
+                        instance_.program->skip_capture(*request->sequence);
+                        committed.capture_ready[row] = false;
+                    }
+                    if (fail_output(request)) { continue; }
+                }
                 if (decisions[row].terminal) {
                     if (cancelled[row]) {
                         terminal_requests[terminal_count] = request;
@@ -2503,6 +2522,7 @@ private:
                            execution_elapsed_ns(control_timing));
             auto timing = record_committed_output(request, membership.row_stride);
             append_output(request, request->output.commit_preview(), std::move(timing), &phase);
+            if (fail_output(request)) { continue; }
             update_recovery(request);
             request->model_state = EngineRequestState::DecodeReady;
         }
