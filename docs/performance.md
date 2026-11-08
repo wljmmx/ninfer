@@ -8,6 +8,12 @@ mean every workload or concurrency has a published measurement.
 Read the [measurement and publication rules](performance/methodology.md) for workload definitions,
 metric formulas, statistics, comparison requirements, and the standard result-page format.
 
+RTX 4090 (sm_89) runs have their own product-matrix pages:
+[Qwen3.8-27B](performance/rtx-4090-sm89-baseline.md) ·
+[Qwen3.6-35B-A3B](performance/rtx-4090-sm89-baseline-35b-a3b.md). They use `ninfer_bench` with the
+shipped release binaries, report the expert-pool setting with every MoE number, and keep the KV
+layout precision and ceiling procedures separate from the 5090 serving tables below.
+
 ## Published coverage
 
 Each cell links to the relevant result section. “Not published” describes measurement coverage,

@@ -53,9 +53,12 @@ Get-ChildItem $apps -Filter '*.pdb' | ForEach-Object { Copy-Item $_.FullName "$R
 
 Copy-Item (Join-Path $Repo 'LICENSE') $Root -Force
 Copy-Item (Join-Path $Repo 'README.md') $Root -Force
+Copy-Item (Join-Path $Repo 'README.zh-CN.md') $Root -Force
 Copy-Item (Join-Path $Repo 'ninfer.example.toml') $Root -Force
 Copy-Item (Join-Path $Repo 'docs\*.md') "$Root\docs" -Force
 Copy-Item (Join-Path $Repo 'docs\maintainer') "$Root\docs" -Recurse -Force
+Copy-Item (Join-Path $Repo 'docs\performance') "$Root\docs" -Recurse -Force
+Copy-Item (Join-Path $Repo 'docs\zh-CN') "$Root\docs" -Recurse -Force
 Copy-Item (Join-Path $Repo 'tools\chat_templates\*.jinja') "$Root\templates" -Force
 Copy-Item (Join-Path $Repo 'tools\chat_templates\LICENSE') "$Root\templates" -Force
 

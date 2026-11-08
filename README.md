@@ -2,6 +2,8 @@
 
 > Selected checkpoints. Maximum single-GPU inference performance.
 
+**English** · [简体中文](README.zh-CN.md)
+
 NInfer is a from-scratch C++/CUDA inference engine for Qwen3.5 Dense and MoE architectures on a
 single NVIDIA GeForce RTX 5090 (Blackwell, `sm_120a`) or RTX 4090 (Ada, `sm_89`). It runs text,
 image, and video prompts through a local CLI or OpenAI-/Anthropic-compatible HTTP APIs. The
@@ -28,6 +30,38 @@ recipe or choose another supported mixture of formats.
 The current engine requires v3 artifacts. Existing official v2 downloads can be
 [upgraded locally](docs/weight-conversion.md#upgrade-an-existing-v2-artifact) without downloading
 the weights again.
+
+## Recent changes
+
+The Windows RTX 4090 line ships as a source build **and** a runnable release folder
+(`R:\infer`, `v1.0.0-rtx4090`, matching `symbols\`). What the current build
+(`ba33b85a`, 2026-11-08) adds:
+
+- **Runtime controller.** A parameter bus registers 22 runtime parameters with bounds and
+  refusal reasons; three measured criteria run live — concurrency (expert coverage below 80%
+  with more than one lane serialises: 8 GiB profile, 75.7 s vs 87.4 s median over four
+  256-token lanes), prefetch (usefulness-gated; it switches off when read-ahead measures
+  zero), and an expert-pool slow dial (one 512 MiB step per 60 s, 3% revert rail, applied only
+  in an idle window). `--controller-mode auto|stable|performance` selects the policy and serve
+  exposes `/control/state`, `/control/mode`, `/control/freeze`. Whole-step graph capture stays a
+  construction-time decision; at runtime it is registered as no-executor instead of being
+  pretended.
+- **Prefix reuse has an index.** The KV tier persists frontier notes, so a longer request
+  restores its longest cached prefix instead of requiring an exact prompt: 397+103 tokens
+  reused a 397-token checkpoint (TTFT 327 ms vs 3,957 ms cold) and 397+3,703 tokens reused the
+  same point (1,781 ms vs 7,035 ms); output tokens identical to a cold run.
+- **Runtime pool/KV resize is load-accepted** (refused while busy, zero disturbance when idle;
+  three real defects were fixed on the way: stale published offset tables, the delta-publish
+  baseline, and the idle-window double read).
+- **Measured q4 span routing.** Twelve shape spans now run their measured sm_89 winners
+  (−9% … −38% on those spans); every other ladder keeps its 5090-measured values.
+- **Determinism unchanged.** Default PPL `7.441868`, selector-off dump `636e38de95046781` and
+  the decode hash `d093ac2070ab3292` stay bit-exact. The grouped-MoE perplexity points were
+  re-recorded (`7.108737 / 7.766837 / 6.469093`) because the default CPU expert path now
+  mirrors the device rounding regime: a measured 0.11–0.17% move, attributed by A/B, not
+  accepted as drift.
+- **RTX 4090 baselines** below are re-measured with the shipped release binaries and the
+  `R:\model` artifacts, and now cover Qwen3.6-35B-A3B as well as Qwen3.8-27B.
 
 ## Quick start
 
@@ -203,39 +237,43 @@ linked from each model below.
 
 ### RTX 4090 (sm_89) baseline
 
-Measured on a single 24 GB RTX 4090 with the v3 artifact; kept as the reference point for 4090
-optimisation work. The [full record](docs/performance/rtx-4090-sm89-baseline.md) documents the
-`ninfer_bench` command lines, per-layout capacity/speed/precision tables, and both context-ceiling
-procedures.
+Measured with the shipped release binaries (`R:\infer\ninfer_bench.exe`) and the `R:\model`
+artifacts on a single 24 GB RTX 4090, Windows 11, desktop sharing the card. Qwen3.8-27B runs
+MTP7/MTP4; Qwen3.6-35B-A3B runs its DFlash draft model. The MoE rows pin the expert pool at
+19,456 MiB (full residency): the auto-curved pool leaves experts on the CPU, and the measured
+per-repetition spread reaches 3.3× there. The 35B column also carries no-speculation 8,192-token
+points so prefill and decode can be compared with and without the draft pass.
 
-| `ninfer_bench` case | Configuration | Result |
+| `ninfer_bench` case | Qwen3.8-27B | Qwen3.6-35B-A3B |
 |---|---:|---:|
-| `pp512` | chunk 1024, INT8 KV | 2,386 tok/s prefill |
-| `pp2048` | chunk 1024, INT8 KV | 2,664 tok/s prefill |
-| `pp4096` | chunk 1024, INT8 KV | 2,626 tok/s prefill |
-| `pp32768+tg128` | MTP7, rk4v4-e8 | 221.9 tok/s decode (100% acceptance, 8.00 tok/round) |
-| `pp2048+tg128` | MTP7, INT8 KV | 206.8 tok/s decode (88.0% acceptance, 7.11 tok/round) |
-| `tg128` | MTP4, rk4v4-e8 | 87.0 tok/s decode (38.5% acceptance) |
-| `tg128` | MTP0, INT8 KV, CUDA Graph | 48.7 tok/s decode |
+| `pp512` (INT8 KV, chunk 1024) | 2,531 tok/s prefill | 8,671 tok/s prefill |
+| `pp2048` | 3,233 tok/s prefill | 11,499 tok/s prefill |
+| `pp4096` | 3,215 tok/s prefill | 11,434 tok/s prefill |
+| `pp32768+tg128` (spec 7, rk4v4-e8) | 2,643 / 232.1 tok/s (acc 100%, len 8.00) | not measured ¹ |
+| `pp2048+tg128` (spec 7, INT8 KV) | 3,309 / 223.8 (acc 88.0%, len 7.11) | 2,225 / 522.8 (acc 88.0%, len 7.11) |
+| `pp2048+tg128` (spec 7, rk4v4-e8) | 3,112 / 188.5 (acc 82.6%, len 6.74) | 2,270 / 546.6 (acc 88.0%, len 7.11) |
+| `pp8192+tg128` (no spec, INT8 KV) | — | 12,377 / 236.1 |
+| `pp8192+tg128` (no spec, rk4v4-e8) | — | 12,141 / 234.6 |
+| `tg128` (spec 4, rk4v4-e8) | 65.1 decode (acc 23.0%, len 1.91) | 234.6 decode (acc 18.0%, len 1.72) |
+| `tg128` (no spec, INT8 KV) | 45.7 decode | 248.7 decode |
 
-Capacity and precision by KV layout. Perplexity at `context 4096 / stride 1024`; ceilings
-binary-searched, `strict` without an eviction budget:
+¹ The 32k MoE point needs either the full-residency pool (KV fits at rk4v4-e8, but the long
+prefill exceeded this pass's budget) or the streaming profile that is still being tuned; it is
+reported as unmeasured rather than estimated. The dense 27B row is the long-context reference.
 
-| KV layout | PPL | vs int8 | KV bytes/token | Ceiling (strict) | Ceiling (WDDM) |
-|---|---:|---:|---:|---:|---:|
-| `bf16` | 7.0035 | +0.02% | 64 KiB | 38,944 | 222,028 |
-| `int8` | 7.0024 | — | 33 KiB | 85,568 | 135,338 |
-| `fp8` | 7.0043 | +0.03% | 32 KiB | 120,288 | 261,328 |
-| `k8v4` | 7.0162 | +0.20% | 25 KiB | 108,384 | 259,016 |
-| `rk8v4` | 7.0127 | +0.15% | 25 KiB | 103,424 | 261,328 |
-| `rk4v4` | 7.0450 | +0.61% | 17 KiB | 142,112 | 261,328 |
-| `rk4v4-e8` | 7.0731 | +1.01% | 17 KiB | 168,896 | 261,328 |
-| `rk2v4-e8` | 7.6048 | +8.60% | 13 KiB | 189,728 | 261,328 |
+Two properties of the 35B column are worth stating plainly: DFlash costs prefill (2,225 vs
+11,499 tok/s at the same 2k prompt — the draft model runs its own pass over the prompt) and pays
+it back at decode (522–547 tok/s at 88% acceptance versus 236–249 without speculation). And MoE
+prefill scales with residency: the same binary with the auto-curved pool measured 374–632 tok/s
+at 2k/4k because part of every layer ran on the CPU half.
 
-Decode is weight-bandwidth bound, so a KV layout moves it by under 7%; the layout choice is really a
-capacity-versus-accuracy trade. Under `--wddm-evictable-budget` the ceiling is bounded by the
-eviction floor and the model's 262,144-token position capacity rather than by the KV footprint, so
-the two ceiling columns must never be compared with each other.
+Full records, command lines, per-layout precision tables and the context-ceiling procedure:
+[Qwen3.8-27B baseline](docs/performance/rtx-4090-sm89-baseline.md) ·
+[Qwen3.6-35B-A3B baseline](docs/performance/rtx-4090-sm89-baseline-35b-a3b.md).
+
+Decode is weight-bandwidth bound, so a KV layout moves it by under 7%; the layout choice is
+really a capacity-versus-accuracy trade. Per-layout PPL, bytes per token and both ceiling
+procedures live in the two baseline pages above.
 
 ## Evaluation
 
@@ -332,11 +370,15 @@ capacities remain fixed for the process lifetime.
 - [CLI](docs/cli.md)
 - [HTTP serving](docs/serving.md)
 - [Performance](docs/performance.md)
+- [RTX 4090 baseline — Qwen3.8-27B](docs/performance/rtx-4090-sm89-baseline.md)
+- [RTX 4090 baseline — Qwen3.6-35B-A3B](docs/performance/rtx-4090-sm89-baseline-35b-a3b.md)
 - [Perplexity evaluation](docs/perplexity.md)
 - [Weight conversion and custom recipes](docs/weight-conversion.md)
 - [Resource scheduling and context cache](docs/maintainer/resource-scheduling-and-context-cache.md)
 - [Serve TTFT benchmark](tools/bench/ttft/)
 - [CLI examples](examples/cli/)
+- [中文说明：KV 缓存与显存](docs/zh-CN/kv-cache-and-eviction.md)
+- [中文说明：RTX 4090 发布说明](docs/zh-CN/release-notes-v1.0.0-rtx4090.md)
 - [Contributing](CONTRIBUTING.md)
 
 Run the relevant `--help` for the exact current option contract.

@@ -1,6 +1,8 @@
 # RTX 4090 (sm_89) performance baseline — Qwen3.8-27B
 
-Build: **wljmmx/ninfer `96b18187`** (`build-win`, `CMAKE_CUDA_ARCHITECTURES=89`), CUDA 13.4, Windows 11, single 24 GB RTX 4090.
+Build: **wljmmx/ninfer `ba33b85a`** — the shipped release binaries (`R:\infer`,
+`v1.0.0-rtx4090`; `ninfer_bench.exe`), CUDA 13.4, Windows 11, single 24 GB RTX 4090 with the
+desktop sharing the card.
 Artifact: `qwen3_8_27b_v3.ninfer` (20,437,521,664 bytes, container v3); engine-reported weights 15.92 GiB.
 
 Method follows the [UDPSendToFailed/ninfer-4090](https://github.com/UDPSendToFailed/ninfer-4090) standard
@@ -11,35 +13,38 @@ This page is the reference point for later optimisation (KV tiering, sparsificat
 
 ## 1. Standard product benchmark matrix (`ninfer_bench`)
 
-`-r 5 --warmup 1 --prefill-chunk 1024 -o json`, greedy, corpus `bench/fixtures/bench_corpus.ids`:
+`-r 5 --warmup 1 --prefill-chunk 1024`, greedy, corpus `bench/fixtures/bench_corpus.ids`:
 
 ```powershell
-ninfer_bench --weights qwen3_8_27b_v3.ninfer --corpus bench/fixtures/bench_corpus.ids \
-  -p 512,2048,4096 --kv-dtype int8
+ninfer_bench --weights qwen3_8_27b_v3.ninfer --corpus bench/fixtures/bench_corpus.ids `
+  -r 5 --warmup 1 --prefill-chunk 1024 -p 512,2048,4096 --kv-dtype int8
 ninfer_bench ... -pg 32768,128 --kv-dtype rk4v4-e8 --spec mtp --draft-tokens 7 --lm-head-draft --max-ctx 40960
-ninfer_bench ... -pg 2048,128  --kv-dtype int8 --spec mtp --draft-tokens 7 --lm-head-draft
-ninfer_bench ... -pg 2048,128  --kv-dtype rk4v4-e8 --spec mtp --draft-tokens 7 --lm-head-draft
-ninfer_bench ... -n 128 --kv-dtype rk4v4-e8 --spec mtp --draft-tokens 4 --lm-head-draft
-ninfer_bench ... -n 128 --kv-dtype int8
+ninfer_bench ... -pg 2048,128  --kv-dtype int8      --spec mtp --draft-tokens 7 --lm-head-draft
+ninfer_bench ... -pg 2048,128  --kv-dtype rk4v4-e8  --spec mtp --draft-tokens 7 --lm-head-draft
+ninfer_bench ... -n 128        --kv-dtype rk4v4-e8  --spec mtp --draft-tokens 4 --lm-head-draft
+ninfer_bench ... -n 128        --kv-dtype int8
 ```
 
-| Test | `ninfer_bench` case | This build | ninfer-4090 (reference) |
-|---|---|---:|---:|
-| Prefill `pp512` (chunk 1024, INT8 KV) | `pp512` | **prefill 2386 tok/s** | 1,971.5 ± 6.4 tok/s |
-| Prefill `pp2048` (chunk 1024, INT8 KV) | `pp2048` | **prefill 2664 tok/s** | 2,146.3 ± 3.0 tok/s |
-| Prefill `pp4096` (chunk 1024, INT8 KV) | `pp4096` | **prefill 2626 tok/s** | 2,637.6 ± 3.3 tok/s |
-| `pp32768+tg128` MTP7, rk4v4-e8 | `pp32768+tg128` | **prefill 2297 / decode 221.9 tok/s** (acc 100.0%, len 8.00) | 272.5 ± 0.7 tok/s (acc 100%, len 8.00) |
-| `pp2048+tg128` MTP7, INT8 KV | `pp2048+tg128` | **prefill 2636 / decode 206.8 tok/s** (acc 88.0%, len 7.11) | 220.8 ± 23.5 tok/s (acc 88.0%, len 7.11) |
-| `pp2048+tg128` MTP7, rk4v4-e8 | `pp2048+tg128` | **prefill 2635 / decode 206.1 tok/s** (acc 88.0%, len 7.11) | 226.0 ± 23.2 tok/s (acc 88.0%, len 7.11) |
-| `tg128` MTP4, rk4v4-e8 (cold corpus) | `tg128` | **decode 87.0 tok/s** (acc 38.5%, len 2.51) | 79.5 ± 8.7 tok/s (acc 28.4%) |
-| `tg128` MTP0, INT8 KV, CUDA Graph | `tg128` | **decode 48.7 tok/s** | 51.9 ± 2.2 tok/s |
+| Test | `ninfer_bench` case | This build |
+|---|---|---:|
+| Prefill `pp512` (chunk 1024, INT8 KV) | `pp512` | **prefill 2,531 tok/s** |
+| Prefill `pp2048` (chunk 1024, INT8 KV) | `pp2048` | **prefill 3,233 tok/s** |
+| Prefill `pp4096` (chunk 1024, INT8 KV) | `pp4096` | **prefill 3,215 tok/s** |
+| `pp32768+tg128` MTP7, rk4v4-e8 | `pp32768+tg128` | **prefill 2,643 / decode 232.1 tok/s** (acc 100.0%, len 8.00) |
+| `pp2048+tg128` MTP7, INT8 KV | `pp2048+tg128` | **prefill 3,309 / decode 223.8 tok/s** (acc 88.0%, len 7.11) |
+| `pp2048+tg128` MTP7, rk4v4-e8 | `pp2048+tg128` | **prefill 3,112 / decode 188.5 tok/s** (acc 82.6%, len 6.74) |
+| `tg128` MTP4, rk4v4-e8 (cold corpus) | `tg128` | **decode 65.1 tok/s** (acc 23.0%, len 1.91) |
+| `tg128` MTP0, INT8 KV, CUDA Graph | `tg128` | **decode 45.7 tok/s** |
 
 Decoder acceptance is engine-reported (`speculative.acceptance_rate` / `acceptance_length`).
 MTP7 ran at 100% acceptance with a licensed length of 8.00 on the deep-context case.
 
-Do not read the two columns as a controlled A/B: the runs are not simultaneous, the desktop shares the
-card, and this build measures the v3 artifact (`qwen3_8_27b_v3.ninfer`) while the reference README used
-`qwen3_8_27b.ninfer`. Re-measure both on one machine for a like-for-like comparison.
+This table was re-measured with the release binaries. The previous pass (build `96b18187`,
+2026-10-08) reported 2,386 / 2,664 / 2,626 prefill, 221.9 and 206.8 decode on the MTP7 rows and
+87.0 / 48.7 on the cold rows; it predates the 2026-11-04 score-plane route unification and must
+not be read as a controlled A/B against the numbers above. The cold-corpus MTP4 acceptance is
+23.0% on this build versus 38.5% then — report the acceptance with any decode number, because a
+draft-policy difference moves decode tok/s more than the kernels do.
 
 ---
 
@@ -47,19 +52,27 @@ card, and this build measures the v3 artifact (`qwen3_8_27b_v3.ninfer`) while th
 
 | KV layout | PPL (ctx 4096) | vs int8 | KV bytes/token | KV payload @8192 | Ceiling (strict) | Ceiling (WDDM) | decode tok/s @8192 | prefill tok/s @8192 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| `bf16` | 7.0035 | +0.02% | 63.5 KiB | 508 MiB | 38944 | 222028 | 47.5 | 2530 |
-| `int8` | 7.0024 | +0.00% | 33.0 KiB | 264 MiB | 85568 | 135338 | 46.3 | 2510 |
-| `fp8` | 7.0043 | +0.03% | 32.2 KiB | 258 MiB | 120288 | 261328 | 47.8 | 2540 |
-| `k8v4` | 7.0162 | +0.20% | 25.1 KiB | 201 MiB | 108384 | 259016 | 47.8 | 2490 |
-| `rk8v4` | 7.0127 | +0.15% | 25.0 KiB | 200 MiB | 103424 | 261328 | 48.0 | 2510 |
-| `rk4v4` | 7.0450 | +0.61% | 17.0 KiB | 136 MiB | 142112 | 261328 | 48.0 | 2500 |
-| `rk4v4-e8` | 7.0731 | +1.01% | 17.0 KiB | 136 MiB | 168896 | 261328 | 48.1 | 2490 |
-| `rk2v4-e8` | 7.6048 | +8.60% | 13.0 KiB | 104 MiB | 189728 | 261328 | 47.9 | 2480 |
+| `bf16` | 7.057816 | +0.01% | 63.5 KiB | 508 MiB | 38944 | 222028 | 47.5 | 2530 |
+| `int8` | 7.057083 | — | 33.0 KiB | 264 MiB | 85568 | 135338 | 46.3 | 2510 |
+| `fp8` | 7.066428 | +0.13% | 32.2 KiB | 258 MiB | 120288 | 261328 | 47.8 | 2540 |
+| `k8v4` | 7.063178 | +0.09% | 25.1 KiB | 201 MiB | 108384 | 259016 | 47.8 | 2490 |
+| `rk8v4` | 7.083492 | +0.37% | 25.0 KiB | 200 MiB | 103424 | 261328 | 48.0 | 2510 |
+| `rk4v4` | 7.111376 | +0.77% | 17.0 KiB | 136 MiB | 142112 | 261328 | 48.0 | 2500 |
+| `rk4v4-e8` | 7.292094 | +3.33% | 17.0 KiB | 136 MiB | 168896 | 261328 | 48.1 | 2490 |
+| `rk2v4-e8` | 7.702104 | +9.14% | 13.0 KiB | 104 MiB | 189728 | 261328 | 47.9 | 2480 |
+
+The PPL column and both speed columns were re-measured with the release binaries (`ba33b85a`) on
+the same corpus and config as before. The absolute level moved ~0.8% against the `96b18187` page
+because that build predates the 2026-11-04 score-plane route unification; the rank-compressed
+layouts moved further (`rk4v4-e8`: +1.01% → +3.33%). Bytes per token are geometry (unchanged)
+and the ceiling columns were measured on `96b18187` — both are retained, and a ceiling must
+always be re-measured with the build in hand because the strict value depends on the desktop's
+VRAM at that moment.
 
 Sources:
 
-- **Precision** — perplexity, `context 4096 / stride 1024`, 11,654 scored tokens, after the rank-compressed
-  sign-extension fix (`194f7565`).
+- **Precision** — perplexity, `context 4096 / stride 1024`, 11,654 scored tokens (the corpus the
+  `7.441868` byte gate uses, scored at half the gate's stride).
 - **KV bytes/token** — measured from the engine's runtime reservation delta between 8192 and 16384, and matching
   the plane layout in `src/core/paged_kv_storage.h`.
 - **Speed** — `ninfer-serve` in isolation (`--no-prefix-reuse --device-state-slots 0 --host-context-mib 0`,

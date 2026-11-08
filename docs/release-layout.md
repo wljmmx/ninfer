@@ -24,7 +24,7 @@ cannot be shipped silently.
 | `*.exe` | `ninfer`, `ninfer-serve`, `ninfer-perplexity`, `ninfer_bench`, `diag-moe`, `diag-cpu-partial` | the product (generation, serving, gates, benchmark harness, two diagnostics) |
 | `*.dll` | FFmpeg 9, libcurl, libzmq, libjpeg-turbo | runtime dependencies of the above |
 | `symbols\*.pdb` | matching symbols | crash diagnosis without a rebuild |
-| `docs\` | public docs + `maintainer\` registers | what the product does, and why it does it that way |
+| `docs\` | public docs + `maintainer\` registers + `performance\` baselines + `zh-CN\` notes | what the product does, why it does it that way, and what it measured |
 | `templates\`, `tools\chat_templates\` | chat templates | serving needs them; the converter references them by path |
 | `ninfer.example.toml` | commented configuration | the only complete option reference |
 | `scripts\` | 3 serve profiles + 2 front ends | start the product without reading the docs first |
@@ -32,7 +32,7 @@ cannot be shipped silently.
 | `dashboard\` | process-level dashboard (+ `node_modules`) | history, request tables, per-request detail |
 | `tools\convert`, `tools\artifact`, `tools\freq_corpus` | converter stack | turning checkpoints into `.ninfer` is part of the product |
 | `tools\upgrade_ninfer_v2_to_v3.py` | v2 artifact upgrade | one-way, standard-library migration |
-| `LICENSE`, `README.md` | project licence and introduction | legal + orientation |
+| `LICENSE`, `README.md`, `README.zh-CN.md` | project licence, English introduction, Chinese introduction | legal + orientation in both languages |
 
 ## Deliberately not shipped
 
