@@ -58,6 +58,12 @@ ninfer_add_op_test(ninfer_moe_weight_views_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_moe_weight_views.cpp"
   LIBRARIES ninfer_ops)
 
+# port (sm_89) T114: block-FP8 routed experts on Ada, plus the NVFP4 refusal that records the
+# hardware verdict. The kernels are compiled into the sm_89 build; only the NVFP4 branch is dead.
+ninfer_add_op_test(ninfer_moe_block_scaled_fp8_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_moe_block_scaled_fp8.cpp"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_rmsnorm_rope_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_rmsnorm_rope.cpp"
   LIBRARIES ninfer_ops)

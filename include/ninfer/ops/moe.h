@@ -70,6 +70,10 @@ struct ScaledSwiGLUTerm {
 };
 
 struct ExpertRoutes {
+    // port (sm_89): the tensor is declared [K,T], but its *storage* is token-major: assignment
+    // (j,t) lives at index t*K + j, which is what topk_softmax_route writes
+    // (`ids + token * top_k`) and what the routed kernels read (`assignment = token * K + j`).
+    // Both halves agree; only the row/column labels of the declared shape are the transpose.
     Tensor ids;          // Contiguous I32 [K,T]; distinct logical IDs within each token.
     Tensor coefficients; // Contiguous FP32 [K,T]; consumed without renormalization.
 };
