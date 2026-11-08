@@ -458,9 +458,10 @@ struct GeneratedToolCall {
     operator==(const GeneratedToolCall&, const GeneratedToolCall&) noexcept = default;
 };
 
-// Diagnostics for model-origin tool-call markup. Free generation uses schema-guided value
-// normalization and can return malformed markup as text. Constrained calls use the model's
-// parameter encoding contract and publish only complete calls.
+// Diagnostics for model-origin tool-call markup. Free generation can return an unrecognized tool
+// header as text. Once a declared function has started, malformed output is a request error and
+// previously published arguments are never retracted. DuplicateParameter and TrailingContent are
+// retained for the request-log schema but are no longer produced by the incremental decoder.
 enum class ToolCallParseFallbackReason : std::uint8_t {
     None,
     MalformedStructure,
