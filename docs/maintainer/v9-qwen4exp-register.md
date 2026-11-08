@@ -8,7 +8,7 @@
 
 | 项 | 结果 | 证据 |
 |---|---|---|
-| qwen4-exp 源权重工件 | **不存在** | `D:\ninfer-rtx4090\models\` 仅有 qwen3.6-35B-A3B（b/e2）与 qwen3.8-27B（v3） |
+| qwen4-exp 源权重工件 | **不存在**（T191 立项基线快照；2026-11-08 起模型统一位于 `R:\model\`，qwen4exp 目录已有 MTP 2.66 GiB 与 UD-Q4_K_XL 第 1 分片） |
 | 转换器 | **不存在** | `tools\convert\` 只有 qwen3_5.py 等，无 qwen4_exp.py（T073 已登记） |
 | 可行性 | **未证** | T013：100.666 GiB 权重、4090 无 NVFP4 张量核（T114 已判死 NVFP4 MoE）、PLE 27 GiB 随机行读 |
 
