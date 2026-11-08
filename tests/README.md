@@ -157,6 +157,13 @@ sampled-output checks at larger extents including 512/1024 and 129/1025, product
 changed-input Graph replay, both public overloads, permissive policies, input/weight preservation,
 output guards, and valid/invalid workspace intervals.
 
+GDN recurrence uses one output criterion and one final-state criterion across running and
+state-pool updates, normalization choices, token extents and continuation partitions. Its
+independent FP64 oracle starts from represented inputs and retains the complete history, so a
+chunked prefix is graded under the same budget as a single recurrent call. Replay record/fold
+uses public one-token state-pool updates to build its exact reference snapshots; that bitwise
+consistency stays separate from the recurrence's mathematical accuracy.
+
 The Linear, LinearAdd and LinearSwiGLU common `.cpp` implementations each compile once into a
 test support library. Both those libraries and the Op test executables receive the oracle's
 `-fno-fast-math` and `-ffp-contract=off` options on GNU/Clang C++ compilers.

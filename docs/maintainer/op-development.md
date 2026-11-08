@@ -435,7 +435,9 @@ organization are not qualification subjects.
 
 Exact outputs and regions compare every observable bit or byte. Each approximate output or state
 uses a suite-owned named criterion for its real arithmetic or quantization profile; tests do not
-define per-case tolerance overrides.
+define per-case tolerance overrides. Private arithmetic, algorithm selection, target, or a history
+of selected routes must not select a stricter or looser criterion, and state storage dtype alone
+does not prescribe the precision of its internal updates.
 
 A floating-point criterion states its non-finite policy. Elementwise work uses a pointwise bound.
 Reductions and matrix or attention computations use a normwise bound with a finite gross

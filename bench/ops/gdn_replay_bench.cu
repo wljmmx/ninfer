@@ -10,6 +10,7 @@
 #include "core/gdn_replay_records.h"
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
+#include "gdn_traffic.h"
 #include "ninfer_bench_common.h"
 
 #include <cuda_runtime.h>
@@ -37,6 +38,9 @@ constexpr std::int32_t kStateDim       = 128;
 constexpr std::int32_t kRecordCapacity = 8;
 constexpr std::int32_t kStateSlots     = 11;
 constexpr std::size_t kDefaultFlush    = 256ULL << 20;
+
+// Nominal device memory bandwidth, used only as the roofline scale for the traffic columns.
+double g_memory_gbs = 0.0;
 
 enum class ProfileSelection : std::uint8_t {
     Qwen27B,
@@ -528,10 +532,26 @@ Measurement measure_component(Launch&& launch, bench::L2FlushBuffer& flush, int 
 void print_recurrent_result(const Profile& profile, std::int32_t width, std::int32_t batch,
                             ValidSelection valid, const char* form,
                             const Measurement& measurement) {
+    std::vector<int> extents(static_cast<std::size_t>(batch), width);
+    if (valid != ValidSelection::Dense) {
+        for (std::int32_t row = 0; row < batch; ++row)
+            extents[static_cast<std::size_t>(row)] = std::max(1, width - row % width);
+    }
+    const auto traffic = bench::gdn::record_traffic(profile.qk_heads, profile.value_heads, width, extents,
+                                             valid != ValidSelection::Dense);
     std::printf("component=recurrent form=%-8s profile=%-8s T=%2d B=%d valid=%-5s "
-                "gpu_warm=%8.2f us gpu_cold=%8.2f us host_submit=%7.2f us\n",
+                "gpu_warm=%8.2f us gpu_cold=%8.2f us host_submit=%7.2f us "
+                "logical=%llu B state=%llu B logical_io=%7.1f GB/s roofline=%7.1f GB/s "
+                "stream_ref=%7.1f us\n",
                 form, profile.name, width, batch, valid_name(valid), measurement.warm.median_us,
-                measurement.cold.median_us, measurement.host_median_us);
+                measurement.cold.median_us, measurement.host_median_us,
+                static_cast<unsigned long long>(traffic.logical.total()),
+                static_cast<unsigned long long>(traffic.state.total()),
+                measurement.cold.median_us > 0.0
+                    ? traffic.logical.total() / (measurement.cold.median_us * 1.0e3)
+                    : 0.0,
+                g_memory_gbs,
+                g_memory_gbs > 0.0 ? traffic.logical.total() / (g_memory_gbs * 1.0e3) : 0.0);
 }
 
 void run_recurrent_point(const Profile& profile, std::int32_t width, std::int32_t batch,
@@ -548,25 +568,37 @@ void print_result(const Profile& profile, std::int32_t width, std::int32_t batch
                   CommitSelection selection, const std::vector<ops::GdnReplayFoldRow>& rows,
                   const Measurement& measurement) {
     std::int64_t committed = 0;
-    std::int32_t updated   = 0;
-    for (const ops::GdnReplayFoldRow& row : rows) {
-        committed += row.commit_columns;
-        updated += row.commit_columns > 0 ? 1 : 0;
+    std::vector<int> commits(rows.size());
+    for (std::size_t index = 0; index < rows.size(); ++index) {
+        commits[index] = rows[index].commit_columns;
+        committed += rows[index].commit_columns;
     }
-    const double state_bytes = static_cast<double>(profile.layers) * updated * profile.value_heads *
-                               kStateDim * kStateDim * sizeof(float) * 2.0;
+    const auto traffic = bench::gdn::fold_traffic(profile.layers, profile.qk_heads, profile.value_heads,
+                                           profile.conv_channels, commits);
     const double state_gbs = measurement.cold.median_us > 0.0
-                                 ? state_bytes / (measurement.cold.median_us * 1.0e3)
+                                 ? static_cast<double>(traffic.state.total()) /
+                                       (measurement.cold.median_us * 1.0e3)
                                  : 0.0;
+    const double logical_gbs = measurement.cold.median_us > 0.0
+                                   ? static_cast<double>(traffic.logical.total()) /
+                                         (measurement.cold.median_us * 1.0e3)
+                                   : 0.0;
     const double ns_per_transition = committed == 0
                                          ? 0.0
                                          : measurement.cold.median_us * 1000.0 /
                                                (static_cast<double>(profile.layers) * committed);
     std::printf("component=fold profile=%-8s T=%2d B=%d commits=%-5s gpu_warm=%8.2f us "
                 "gpu_cold=%8.2f us "
-                "host_submit=%7.2f us state_io=%7.1f GB/s ns/(layer,row,transition)=%7.2f\n",
+                "host_submit=%7.2f us state_io=%7.1f GB/s logical=%llu B state=%llu B "
+                "logical_io=%7.1f GB/s roofline=%7.1f GB/s "
+                "stream_ref=%7.1f us ns/(layer,row,transition)=%7.2f\n",
                 profile.name, width, batch, commit_name(selection), measurement.warm.median_us,
                 measurement.cold.median_us, measurement.host_median_us, state_gbs,
+                static_cast<unsigned long long>(traffic.logical.total()),
+                static_cast<unsigned long long>(traffic.state.total()), logical_gbs, g_memory_gbs,
+                g_memory_gbs > 0.0
+                    ? static_cast<double>(traffic.logical.total()) / (g_memory_gbs * 1.0e3)
+                    : 0.0,
                 ns_per_transition);
 }
 
@@ -613,6 +645,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "no CUDA device available\n");
             return 77;
         }
+        cudaDeviceProp properties{};
+        CUDA_CHECK(cudaGetDeviceProperties(&properties, 0));
+        int clock_khz = 0;
+        CUDA_CHECK(cudaDeviceGetAttribute(&clock_khz, cudaDevAttrMemoryClockRate, 0));
+        g_memory_gbs = static_cast<double>(clock_khz) * 1.0e3 * 2.0 *
+                       (static_cast<double>(properties.memoryBusWidth) / 8.0) / 1.0e9;
         return run(parse_options(argc, argv));
     } catch (const std::exception& error) {
         std::fprintf(stderr, "error: %s\n", error.what());

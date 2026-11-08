@@ -588,6 +588,23 @@ cmake --build build --parallel --target ninfer_gdn_input_proj_conv_snapshot_benc
 `--execution eager|both` is available only to attribute launch behavior; it calls the same public
 Op with the same operands and workspace.
 
+## GDN ReplaySSM record/fold benchmark
+
+`ninfer_gdn_replay_bench` times the two halves of ReplaySSM: `--component recurrent` is one
+`gated_delta_net_replay_record` call over a physically dense width, `--component fold` is one
+`GdnReplayFoldPlan::execute` over the host row descriptors. `--profile 27b|35b|local|all` selects
+the registered all-layer geometries; `local` is the 36-layer, 8 Q/K-head, 24 V-head, 5120-channel
+form. `--commits one|dense|mixed|all` and `--valid dense|mixed|all` choose the commit and live-prefix
+policies, and `--width`/`--batch` pin one point.
+
+Both components print the same traffic fields. `logical` counts unique boundary payloads by
+direction (workspace excluded), `state` is the recurrent-state subset, and `logical_io` divides
+logical bytes by the complete body's cold median. `roofline` is the device's nominal memory
+bandwidth from its memory clock and bus width, used only as a scale; `stream_ref` is logical bytes
+at that rate. Neither rate is measured DRAM traffic: an in-place state update that fits in L2 can
+exceed nominal bandwidth, and cold samples evict before the body without flushing its writes.
+`state_io` remains the state-only rate, so state-resident comparisons stay possible.
+
 ## Softmax Attention Op benchmarks
 
 The four Softmax Attention executables share one harness rule: fixture setup, public workspace
