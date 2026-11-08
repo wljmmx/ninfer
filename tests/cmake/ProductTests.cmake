@@ -39,6 +39,12 @@ ninfer_add_test(ninfer_anthropic_schema_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_anthropic_schema.cpp"
   LIBRARIES ninfer_serve)
 
+# bc70d7c8 regression: committed tool events drive every protocol encoder, incomplete calls stay
+# out of history, and streamed argument bytes match the terminal aggregate exactly.
+ninfer_add_test(ninfer_qwen3_5_tool_streaming_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_tool_streaming.cpp"
+  LIBRARIES ninfer_serve)
+
 ninfer_add_test(ninfer_serve_options_test
   NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_serve_options.cpp"
