@@ -6,6 +6,7 @@
 #include "core/expert_cache.h"
 #include "core/memory_budget.h"
 #include "core/startup.h"
+#include "runtime/engine/context_cache/joint_planning.h"
 #include "models/qwen3_5/execution/expert_prefetch.h"
 #include "models/qwen3_5/execution/expert_stream.h"
 #include "models/qwen3_5/execution/host_expert_reader.h"
@@ -316,6 +317,29 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     const std::uint64_t startup_headroom = options.startup_planning_headroom_bytes;
     const std::uint64_t device_cap =
         instance.expert_cache->capacity_bytes() + kv_reserve_bytes + startup_headroom;
+    // T156 (upstream 049d5fb4): the three device accounts - expert pool, KV pages and the
+    // transient workspace (the startup allowance carries it) - are quoted together. The
+    // planning model lives in context_cache/joint_planning.h; the model layer still owns the
+    // StateImage stride, so `state` reports zero here rather than an invented number. When
+    // NINFER_CONTEXT_JOINT_PLAN=1 the check is printed; a feasible=false means the three
+    // accounts cannot fit the cap and the ledger admission below will name the owner.
+    if (const char* joint = std::getenv("NINFER_CONTEXT_JOINT_PLAN");
+        joint != nullptr && *joint == '1') {
+        const auto budget = context_cache::plan_joint_capacity(
+            device_cap,
+            {.kv_bytes        = kv_reserve_bytes,
+             .state_bytes     = 0,
+             .workspace_bytes = startup_headroom},
+            0);
+        std::fprintf(stderr,
+                     "[joint] cap=%llu MiB kv=%llu MiB state=0(layout not exposed) "
+                     "workspace(headroom)=%llu MiB feasible=%d\n",
+                     static_cast<unsigned long long>(device_cap >> 20),
+                     static_cast<unsigned long long>(budget.kv_bytes >> 20),
+                     static_cast<unsigned long long>(budget.workspace_bytes >> 20),
+                     budget.feasible ? 1 : 0);
+        std::fflush(stderr);
+    }
     instance.ledger.set_cap(core::Tier::Device, device_cap);
     const auto admit = [&instance](core::Tier tier, const char* owner, std::uint64_t bytes) {
         if (instance.ledger.reserve(tier, owner, bytes)) { return true; }
