@@ -267,7 +267,7 @@ reported as unmeasured rather than estimated. The dense 27B row is the long-cont
 Two properties of the 35B column are worth stating plainly. **DFlash's own prefill pass is cheap, and
 the 4.6× against the no-spec row is residency, not the draft.** The draft append — feature
 projection, six context K/V projections, key RMSNorm, RoPE and the draft KV append — measures
-1.14 ms and 0.99 ms per 1,024-token chunk against a target chunk of 88–93 ms, i.e. 1.2–1.4%; the
+1.14 ms and 0.99 ms per 1,024-token chunk against a target chunk of 88–94 ms, i.e. 1.2–1.4%; the
 target-side feature copies add 0.2–0.4 ms. What costs the 4.6× is that DFlash reserves 528 MiB of
 draft weights and 254 MiB of draft KV, and on a 24 GB card those 782 MiB are more than the 151 MiB
 the no-spec plan had left above the 19,200 MiB all-resident expert set: 423 of 10,240 experts fall

@@ -52,7 +52,7 @@ Three properties of this matrix are load-bearing:
 2. **DFlash's own prefill pass is ~1% of a chunk; the 4.6× in the table is residency, not the
    draft.** Measured with `NINFER_DFLASH_TIMING=1`, the whole draft append for a 1,024-token chunk
    (feature projection + six K/V context projections + key RMSNorm + RoPE + draft KV append) costs
-   **1.14 ms / 0.99 ms** against a target chunk of 88–93 ms (§1b). The 2,225 tok/s row above was
+   **1.14 ms / 0.99 ms** against a target chunk of 88–94 ms (§1b). The 2,225 tok/s row above was
    taken with the pool at 18,685 MiB, where 423 of the 10,240 experts sit on the host tier — and
    that same pool measures 1,731.6 tok/s with the draft switched **off**. The draft pays back at
    decode (522–547 tok/s at 88% acceptance against 236–249 without speculation), and it is the
@@ -89,12 +89,13 @@ Segment table for the draft append (`pp2048`, INT8 KV, chunk 1024, `--spec dflas
 | draft KV append × 6 (`kv_cache_append_prefix`) | 0.10 ms | 0.04 ms |
 | **total draft append** | **1.14 ms** | **0.99 ms** |
 | target-side feature copies (8 taps × 4 MiB) | 0.42 ms | 0.18 ms |
-| target chunk, same shape, draft **off** | 88–93 ms | 88–93 ms |
+| target chunk, same shape, draft **off** | 88–94 ms | 88–94 ms |
 
-So the draft pass is **1.2–1.4%** of a chunk; the feature projection is a single 34.4 G-MAC GEMM
-(0.5 ms ≈ 137 TFLOPS) and the six K/V projections are 25.8 G MAC (0.44 ms ≈ 117 TFLOPS), i.e. both
-already run at the shape's ceiling, and even a perfect kernel would return under 1 ms of an 88 ms
-chunk. There is nothing to win here.
+So the draft pass is **1.2–1.4%** of a chunk. The feature projection is a single 34.4 G-MAC GEMM
+(0.5 ms ≈ 137 TFLOPS) and the six K/V projections are 25.8 G MAC (0.44 ms ≈ 117 TFLOPS), i.e. the
+append moves 60 G MAC at ~67 TOPS of int8 work against the 4090's ~660 TOPS peak — the small-N
+dequant shapes are what limit it, and even at peak the whole append would return under 1 ms of an
+88 ms chunk. There is nothing to win here.
 
 **What actually costs 4.6–6.6× is which tier the experts are on.** Same binary, same corpus,
 `-p 2048 --kv-dtype int8 --prefill-chunk 1024 -r 3 --warmup 1`:
