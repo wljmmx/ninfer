@@ -65,3 +65,20 @@
 | T156 | 缺联合规划/保留选择 → 已落骨架 | 新增 joint_planning.h + 测试；接线另立 |
 | T157 | 部分等价（元数据压缩不吸收） | 登记 |
 | T158 | 纯新增头文件，数值惰性 | 门禁复核 |
+
+## 执行记录（2026-11-08 落地）
+
+### T156 完整实现（非仅骨架）
+- `src/runtime/engine/context_capacity.{h,cpp}`：`ContextCapacity{primary_page_groups, device_state_slots}` 三本账模型（KV reservation + StateImage 步长 + workspace + control bytes）、`ContextCapacityCurve`（reservation/control/total/resolved_tokens）、`ContextCapacityPlan`（分项 reservation、slack、checkpoint target）；`plan_context_capacity()` 联合规划：显式 KV 策略钉页数，自动策略先花在 checkpoint 槽（2×lanes + 每 interval 一个），再用余量买页、最后把离散槽余量回给页；`NINFER_CONTEXT_JOINT_PLAN` 未设时 `resolve_kv_capacity` 旧路径不变。
+- `src/runtime/engine/context_cache/joint_planning.h`：纯规划辅助（`plan_joint_capacity`、`select_prefix_checkpoints`），供接线侧与单测使用。
+- `src/runtime/engine/context_cache/prefix_checkpoint.{h,cpp}`：T042 落地——`PrefixBlockHasher`（每 token 滚动、每块摘要、lookahead L=1 覆盖后继 token）+ `plan_prefix_checkpoint`（窗口/边界/间隔/陈旧判定、draft span 策略）。
+- CMake：`ninfer_runtime_support` 源列表接入三个 .cpp。
+- 测试：`ninfer_joint_planning_test` ok；`ninfer_context_capacity_test` ok（隐式/显式/checkpoint target/slack 覆盖）；`ninfer_prefix_checkpoint_test` ok。
+- 提交：`c462ffcb`（joint_planning + register）、`cff631b8`（context_capacity + prefix_checkpoint + CMake）、`e5c37a71`（测试）。
+- 剩余接线：`plan_context_capacity` 接 `resolve_kv_capacity`/容量曲线入口（`NINFER_CONTEXT_JOINT_PLAN` 语义）；`select_prefix_checkpoints` 接 ResourceManager prune；接线后重跑 E9/双 PPL/regress。
+
+### T158 门禁结果
+- 35B default 930 MiB：4801 / 2.051275 / 7.777808 **逐位 PASS**。
+- 27B regress fast：default PPL **7.441868**、selector-off dump **636e38de95046781** 逐位，9 点任务套件 **regressions 0**。
+- tier/checkpoint/lmcache_state 相关 ctest：6 项通过（含 joint_planning/capacity/prefix 新测）。
+- 说明：本批新增为规划模型与测试，未接运行时热路径，数值惰性成立。
