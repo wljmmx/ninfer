@@ -281,6 +281,31 @@ K/V 的 code 和 scale planes 具有各自的 dtype、leading extent 和 group s
 identity、frontier 和 lifetime。Capacity curve、Device/Host replica、continuation transfer 和 memory
 summary 均从这一 typed plane inventory 计算，不能用 `2 * vector_bytes` 代替 K8V4 的非对称字节数。
 
+#### 4.3.1 上游「统一 FP8 cache 编码」的评估（T118，未采纳）
+
+上游 824bd3a4 把 GQA、QSA、Kpool 三条 FP8 cache 路径统一到一种格式：**E4M3FN，G128 分组，
+UE8M0（2 的幂）scale**。本地现行格式是 **E4M3FN，D256 整行一个 FP16 scale**（本文
+FP8-E4M3FN-row256，[`kv_cache_append.h`](../../include/ninfer/ops/kv_cache_append.h) 第 37–46 行给出完整
+公式）。两者的差别不是封装，而是数值：
+
+- scale 落点：每 128 个 K 元素一个 scale（上游）对每 256 元素 head 行一个（本地），分组边界与
+  量化误差来源不同；
+- scale 取值域：UE8M0 只取 2 的幂，均值 1.5 bit 精度损失且不可跨越；本地 FP16 scale 保留 11 bit
+  有效位（跨一个 FP16 表示值边界，见 codec 注释）；
+- 字节数：上游 G128 的 scale plane 是 \(D/128\) 字节，本地 row256 是 2 字节/行。
+
+因此把本地切到上游口径会移动**每一个** cache 值，属于数值路径变更，而 T118 的约束是「默认关、
+逐位验证后再评估」。本批不落地该重编码，理由与门槛写在这里，供后续独立任务使用：
+
+1. 本地已经「统一」在另一层意义上：编码公式只在
+   [`fp8_e4m3_row_codec.cuh`](../../src/ops/kv_cache/fp8_e4m3_row_codec.cuh) 实现一次，standalone 与
+   fused append 共用它，且两者字节一致（§4.5）；不存在上游那种三条路径各写一遍的重复。
+2. 若将来要引入 G128/UE8M0，应是**新增**一个 profile（新名字、新 plane 字节数进 §4.3 表、
+   capacity 曲线同步），而不是替换 row256；替换等于让既有工件与既有 golden 全部失效。
+3. 采纳前必须通过与本次门禁同级的证据：默认关 → 打开后 PPL 逐位对比（default 与 freeze 两档）、
+   解码 hash 对比（当前 4C9191FECDAE46AE）、以及 KV append/attention 的字节级对拍。任一不过，
+   该 profile 保持 opt-in。
+
 ### 4.4 Logical position domain
 
 Block table 使用 autoregressive cache ordinal：
