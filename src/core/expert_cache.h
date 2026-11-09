@@ -192,6 +192,19 @@ void prepare(std::span<const ExpertCacheKey> required, cudaStream_t stream = nul
     // port (sm_89): bytes between two experts of the same bank inside the pool. Banks address
     // through a per-expert offset table, so this is only the slot alignment unit.
     [[nodiscard]] std::uint64_t slot_bytes() const;
+    // Byte offset of a pool slot id inside `pool()`. Equal to `slot * slot_bytes()` on every
+    // artifact whose banks share an expert width; a heterogeneous artifact (40 narrow banks plus
+    // the wider MTP layer) charges each bank its own stride, so a caller must ask rather than
+    // multiply.
+    [[nodiscard]] std::uint64_t slot_offset(std::uint32_t slot) const noexcept;
+    // The stride and the byte bias of one bank's run. A caller that reproduces the address on the
+    // Device (the MoE placement table) multiplies the slot id by the stride and adds the bias;
+    // bias is zero whenever every bank shares one stride.
+    [[nodiscard]] std::uint64_t slot_stride(std::uint32_t bank) const noexcept;
+    [[nodiscard]] std::uint64_t slot_bias(std::uint32_t bank) const noexcept;
+    // Experts the pool actually holds, summed over every bank. `capacity_bytes() / slot_bytes()`
+    // undercounts a per-bank layout, because the banks are not one width.
+    [[nodiscard]] std::uint64_t resident_experts() const noexcept;
     // port (sm_89): byte origin of a bank window, so a strided bank view can rebase onto it. The
     // pool is a flat slot space, so this is always 0; it stays so such a view keeps compiling.
     [[nodiscard]] std::uint64_t window_origin(std::uint32_t bank) const;
@@ -232,9 +245,13 @@ void prepare(std::span<const ExpertCacheKey> required, cudaStream_t stream = nul
     // pool size unit; the pool itself is one flat slot space.
     [[nodiscard]] std::uint64_t windows() const noexcept;
 
-    // Experts of one bank the pool can hold at once. Equals the widest bank when a whole layer
-    // fits; smaller when the pool only holds part of one, which is the case a host tier covers.
+    // One conservative number for the whole pool: the narrowest bank's capacity. Answers "how large
+    // a resident set can every bank afford", which is what a pool-wide budget check wants.
     [[nodiscard]] std::uint32_t resident_capacity() const noexcept;
+    // Experts of THIS bank the pool can hold at once. Answers "how many may this bank keep", which
+    // is what a per-bank cap wants: per-bank pricing gives each bank its own run, so the narrowest
+    // bank's number would cap the other 40 at the MTP layer's share. Returns 0 for an unknown bank.
+    [[nodiscard]] std::uint32_t resident_capacity(std::uint32_t bank) const noexcept;
 
     // port (sm_89): global slot of an expert, or nullopt when the pool does not hold it. The slot
     // is stable across set_resident_experts() calls for experts that stay, which is what lets a

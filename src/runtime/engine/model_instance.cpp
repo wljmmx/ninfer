@@ -252,12 +252,17 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     std::uint64_t host_layer = 0;
     std::uint64_t widest_count = 0;
     std::uint64_t streamed_banks = 0;
-    for (const auto& bank : requirements.banks) {
+    for (std::size_t index = 0; index < requirements.banks.size(); ++index) {
+        const auto& bank = requirements.banks[index];
         if (bank.resident) { continue; }
         ++streamed_banks;
         widest_count = std::max<std::uint64_t>(widest_count, bank.count);
+        // Each bank is charged only the seats the pool gives it. Per-bank pricing means one bank may
+        // be much wider than the rest, so the pool-wide number understates the narrower banks' share
+        // and would size the host tier for a tier that is not actually short.
         const auto kept = std::min<std::uint64_t>(
-            instance.expert_cache->resident_capacity(), static_cast<std::uint64_t>(routed_top_k));
+            instance.expert_cache->resident_capacity(static_cast<std::uint32_t>(index)),
+            static_cast<std::uint64_t>(routed_top_k));
         host_kept += kept;
         host_layer = std::max<std::uint64_t>(host_layer, std::uint64_t{bank.count} - kept);
     }
@@ -456,8 +461,13 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     // A pool that cannot hold a layer hands the remainder to the host tier: one arena, the same
     // uniform slot images the Device pool uses, filled on demand.
     bool short_pool = false;
-    for (const auto& bank : requirements.banks) {
-        if (!bank.resident && instance.expert_cache->resident_capacity() < bank.count) {
+    for (std::size_t index = 0; index < requirements.banks.size(); ++index) {
+        const auto& bank = requirements.banks[index];
+        if (bank.resident) { continue; }
+        // This bank's own seats, not the narrowest bank's: with per-bank pricing a wide bank can fit
+        // entirely while the sibling that set the pool-wide number does not.
+        if (instance.expert_cache->resident_capacity(static_cast<std::uint32_t>(index)) <
+            bank.count) {
             short_pool = true;
         }
     }
@@ -528,9 +538,7 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
         instance.expert_host_residency = std::move(residency);
     }
     placement.slot_bytes = instance.expert_cache->slot_bytes();
-    placement.gpu_experts =
-        placement.slot_bytes != 0 ? instance.expert_cache->capacity_bytes() / placement.slot_bytes
-                                  : 0;
+    placement.gpu_experts = instance.expert_cache->resident_experts();
     for (const auto& bank : requirements.banks) { placement.total_experts += bank.count; }
     // Whatever the pool does not keep is served by the cache's source: the retained Host replica
     // when one exists, the artifact otherwise. The residency arena above is an extra cache in

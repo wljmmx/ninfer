@@ -190,6 +190,24 @@ std::vector<std::uint64_t> bank_generation;
     std::vector<ExpertCacheKey> required;
     std::uint64_t used = 0, uploads = 0, evictions = 0, epoch = 0, hits = 0;
     std::uint64_t slot_bytes = 0;
+    // port (sm_89): heterogeneous banks. A bank's expert image has its own padded width, and a
+    // single stride charges the widest bank to every slot. On the 35B-A3B MTP artifact that is 40
+    // banks at 1.875 MiB plus the MTP layer at 3.25 MiB; the uniform stride turned an 18.8 GiB pool
+    // into 5,774 of 10,496 resident experts (prefill 127.8 tok/s). When the banks disagree the slot
+    // space is priced per bank: bank b owns a contiguous run at its own stride, laid out as
+    // [every bank's live run][every bank's spare run]. Live ids stay below slots_live and spares
+    // above it, so the mapped range is still a prefix and a resize only moves the ids at the edge.
+    bool per_bank_layout = false;
+    std::vector<std::uint64_t> bank_stride;    // padded expert width per bank, 0 when resident
+    std::vector<std::uint32_t> bank_slot_base; // first slot id of the bank's live run
+    std::vector<std::uint32_t> bank_slot_max;  // ids the bank's ceiling can back
+    std::vector<std::uint32_t> bank_slot_live; // ids the bank has backed right now
+    std::vector<std::vector<std::uint32_t>> bank_free; // per-bank free ids (live run first)
+    std::vector<std::uint64_t> slot_offset;    // slot id -> byte offset in the reservation
+    std::vector<std::uint32_t> slot_owner;     // slot id -> bank
+    // 0 free, 1 prediction region, 2 fixed ring. One array for both roles: a slot is at most one.
+    static constexpr std::uint8_t kRoleNone = 0, kRolePrefetch = 1, kRoleRing = 2;
+    std::vector<std::uint8_t> slot_role;
     // Global slot of each expert, or kAbsentSlot when the pool does not hold it. A fully resident
     // bank keeps the identity, which is what lets a captured graph address expert i directly.
     std::vector<std::vector<std::uint32_t>> slot_of;
@@ -211,10 +229,8 @@ std::vector<std::uint64_t> bank_generation;
     std::uint32_t prefetch_base     = 0; // region is [base, slots_live)
     std::vector<std::vector<std::uint32_t>> prefetch_owner;   // bank -> region index -> expert
     std::vector<std::uint32_t> prefetch_cursor;               // bank -> next region index to reuse
-    // Q20: fixed ring slots per bank, taken from `free_slots` by configure_ring(). `ring_slot_flag`
-    // is the global test the allocator and the publisher share.
+    // Q20: fixed ring slots per bank, taken from the bank's own free list by configure_ring().
     std::vector<std::vector<std::uint32_t>> ring_slots;
-    std::vector<std::uint8_t> ring_slot_flag;
     int ordinal = 0;
 
     Impl(std::span<const ExpertBankSpec> specs, const ExpertCacheRequirements& req,
@@ -244,12 +260,6 @@ std::vector<std::uint64_t> bank_generation;
         // row_split_k128 codes at 1024 bytes/row, so one block is 128 KiB.
         constexpr std::uint64_t block = 128 * 1024;
         slot_bytes = (req.max_entry_bytes + block - 1) / block * block;
-        // One window per bank means every layer evicts the previous bank and reuploads a whole
-        // window. Splitting the pool into two windows halves that traffic, but it also halves the
-        // experts a bank can keep, so it only pays when the pool is nearly large enough for a whole
-        // layer: there the reupload is the dominant cost (measured 82 -> 92 tok/s at 251 slots),
-        // while at half a layer the lost Device work outweighs it (92 -> 88 at 135 slots).
-        const auto pool_slots = req.config.capacity_bytes / slot_bytes;
         std::uint64_t widest_bank = 0;
         std::uint64_t layer_count = 0;
         for (const auto& bank : req.banks) {
@@ -257,6 +267,36 @@ std::vector<std::uint64_t> bank_generation;
             widest_bank = std::max(widest_bank, std::uint64_t{bank.count});
             ++layer_count;
         }
+        // Per-bank pricing: decide before anything is laid out. Uniform banks (the common case, and
+        // every artifact shipped before the 35B MTP one) keep the flat slot space untouched; only a
+        // genuine width disagreement switches the pool to per-bank strides. NINFER_EXPERT_UNIFORM_SLOTS
+        // pins the old behaviour for an A/B.
+        const bool uniform_forced = std::getenv("NINFER_EXPERT_UNIFORM_SLOTS") != nullptr;
+        bank_stride.assign(banks.size(), 0);
+        for (std::size_t b = 0; b < banks.size(); ++b) {
+            if (!banks[b].resident) { bank_stride[b] = align_up(banks[b].entry_bytes, block); }
+        }
+        // Heterogeneous means "one bank is wide enough to starve the others", not "no two banks are
+        // byte-identical": rounding to the block already absorbs a layer whose down matrix carries a
+        // high plane (a 128 KiB difference on 1.875 MiB). The payout of pricing per bank is a slot
+        // count, and that only changes where experts land once the widest bank is a quarter wider
+        // than the narrowest - the MTP case is 3.25 against 1.875. Below the line the flat space is
+        // kept, because it is the layout every recorded perplexity byte belongs to.
+        std::uint64_t narrowest_stride = 0;
+        for (const auto stride : bank_stride) {
+            if (stride == 0) { continue; }
+            narrowest_stride =
+                narrowest_stride == 0 ? stride : std::min(narrowest_stride, stride);
+        }
+        const bool heterogeneous =
+            narrowest_stride != 0 && slot_bytes >= narrowest_stride + narrowest_stride / 4;
+        // On by default when the banks disagree: a single stride charges the widest bank to every
+        // slot, and on the 35B-A3B MTP artifact (40 banks at 1.875 MiB, the MTP layer at 3.25 MiB)
+        // that held 5,740 of 10,496 experts and measured 143 prefill / 84 decode against 10,344 and
+        // 2,094 / 404 with per-bank pricing (pp2048+tg128, INT8, -r 5, same machine). Artifacts whose
+        // banks agree never enter this branch. NINFER_EXPERT_UNIFORM_SLOTS restores the old layout
+        // for an A/B.
+        per_bank_layout = heterogeneous && !uniform_forced;
         // port (sm_89): a bank owns a fixed run of slots. As long as a bank can hold a whole layer,
         // a pool that misses even one layer pays a full layer reupload every step: 39 windows over
         // 40 layers measured 20.1 tok/s against 203.9 when every layer fit. Divide the slots rather
@@ -267,19 +307,6 @@ std::vector<std::uint64_t> bank_generation;
         //
         // That is the shape a model larger than the card needs: keep a per-layer hot set, leave
         // every other expert in host memory, and never spill VRAM to a slot swap.
-        const auto whole_layers = widest_bank * layer_count;
-        std::uint64_t cap = 1;
-        if (widest_bank != 0 && layer_count != 0) {
-            if (pool_slots >= whole_layers) {
-                cap = widest_bank;
-            } else {
-                cap = std::max<std::uint64_t>(kMinimumHotSet, pool_slots / layer_count);
-            }
-        }
-        if (const char* cap_env = std::getenv("NINFER_EXPERT_WINDOW_SLOTS")) {
-            const auto requested = std::strtoull(cap_env, nullptr, 10);
-            if (requested > 0) { cap = requested; }
-        }
         ordinal    = device.device;
         for (const auto& bank : files) {
             for (const auto& expert : bank.experts) {
@@ -292,43 +319,121 @@ std::vector<std::uint64_t> bank_generation;
         }
         // port (sm_89): reserve one contiguous address range and back it with fixed-size segments.
         // Slot i always addresses the same place inside the reservation; only the backing pages can
-        // be returned to the driver by resize().
-        if (pool_slots == 0) {
-            throw std::invalid_argument("expert cache holds no complete expert slot");
-        }
-        // The reservation is the growth ceiling, not the live pool: VmmPool reserves virtual
-        // address space and maps segments on demand, so reserving room for the auto-sized maximum
-        // while only capacity_bytes slots start mapped costs no device memory and makes the L1
-        // dial's upward steps reachable (the 2026-11-05 acceptance measured the old behaviour:
-        // slots_max == slots_live, so every grow was clamped back).
+        // be returned to the driver by resize(). The reservation is the growth ceiling, not the live
+        // pool: VmmPool reserves virtual address space and maps segments on demand, so reserving room
+        // for the auto-sized maximum while only capacity_bytes start mapped costs no device memory
+        // and makes the L1 dial's upward steps reachable (the 2026-11-05 acceptance measured the old
+        // behaviour: slots_max == slots_live, so every grow was clamped back).
         const auto limit_bytes = std::max(req.config.capacity_bytes,
                                           req.config.capacity_limit_bytes);
         const auto reserved = static_cast<std::size_t>(
             (limit_bytes + kSegmentBytes - 1) / kSegmentBytes * kSegmentBytes);
         pool = std::make_unique<VmmPool>(Device::cuda(ordinal), reserved, kSegmentBytes);
-        slots_max  = reserved / slot_bytes;
-        slots_live = pool_slots;
-        // A pool narrower than one hot set per bank cannot give every bank its own run: narrow the
-        // hot set instead of addressing past the live pool (growth adds windows, not a wider one).
-        if (layer_count != 0) {
-            const auto per_bank = slots_live / layer_count;
-            if (per_bank == 0) {
-                throw std::invalid_argument("expert pool cannot hold one slot per bank");
-            }
-            cap = std::min(cap, per_bank);
-        }
-        slot_cap = cap;
-        free_slots.clear();
-        free_slots.reserve(static_cast<std::size_t>(slots_live));
-        // Pushed high to low so the first pop hands out slot 0: a fresh bank then keeps the identity
-        // mapping it needs for a graph, exactly as the per-bank runs used to lay it out.
-        for (std::uint64_t slot = slots_live; slot > 0; --slot) {
-            free_slots.push_back(static_cast<std::uint32_t>(slot - 1));
-        }
         slot_of.resize(banks.size());
         resident_count.assign(banks.size(), 0);
         ring_slots.resize(banks.size());
-        ring_slot_flag.assign(slots_live, 0);
+        if (per_bank_layout) {
+            // Equal byte shares: every non-resident bank gets capacity/layers of live bytes and
+            // limit/layers of ceiling bytes, charged at its own stride. Live runs come first, so
+            // the mapped range is a prefix; the spare runs that follow are what a resize grows into.
+            const auto live_share    = req.config.capacity_bytes / layer_count;
+            const auto ceiling_share = limit_bytes / layer_count;
+            bank_slot_base.assign(banks.size(), 0);
+            bank_slot_max.assign(banks.size(), 0);
+            bank_slot_live.assign(banks.size(), 0);
+            bank_free.assign(banks.size(), {});
+            std::uint64_t live_total = 0, max_total = 0;
+            for (std::size_t b = 0; b < banks.size(); ++b) {
+                if (banks[b].resident) { continue; }
+                const auto stride = bank_stride[b];
+                bank_slot_live[b] = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                    banks[b].count, stride != 0 ? live_share / stride : 0));
+                bank_slot_max[b] = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                    banks[b].count, stride != 0 ? ceiling_share / stride : 0));
+                live_total += bank_slot_live[b];
+                max_total  += bank_slot_max[b];
+            }
+            if (live_total == 0) {
+                throw std::invalid_argument("expert pool cannot hold one slot per bank");
+            }
+            slot_offset.assign(static_cast<std::size_t>(max_total), 0);
+            slot_owner.assign(static_cast<std::size_t>(max_total), 0);
+            std::uint64_t base = 0, byte = 0;
+            for (std::size_t b = 0; b < banks.size(); ++b) { // live runs
+                if (banks[b].resident) { continue; }
+                bank_slot_base[b] = static_cast<std::uint32_t>(base);
+                for (std::uint32_t i = 0; i < bank_slot_live[b]; ++i, ++base) {
+                    slot_offset[base] = byte;
+                    slot_owner[base]  = static_cast<std::uint32_t>(b);
+                    byte += bank_stride[b];
+                }
+            }
+            for (std::size_t b = 0; b < banks.size(); ++b) { // growth tail
+                if (banks[b].resident) { continue; }
+                for (std::uint32_t i = bank_slot_live[b]; i < bank_slot_max[b]; ++i, ++base) {
+                    slot_offset[base] = byte;
+                    slot_owner[base]  = static_cast<std::uint32_t>(b);
+                    byte += bank_stride[b];
+                }
+            }
+            slots_live = live_total;
+            slots_max  = max_total;
+            slot_cap   = 0;
+            for (std::size_t b = 0; b < banks.size(); ++b) {
+                if (banks[b].resident) { continue; }
+                auto& list = bank_free[b];
+                list.reserve(static_cast<std::size_t>(bank_slot_live[b]));
+                // Only the live run is handed out: the spare run sits above the mapped prefix and is
+                // not backed until resize() grows the pool, so putting it on the free list would let
+                // a bank take a slot the driver has not given us (measured: cudaErrorIllegalAddress
+                // inside the first layer that placed beyond its run).
+                // Live run pushed high to low, so the first pop hands out the bank's base id: a
+                // fresh bank keeps the identity mapping expert e -> base + e.
+                for (std::uint32_t i = bank_slot_live[b]; i > 0; --i) {
+                    list.push_back(static_cast<std::uint32_t>(bank_slot_base[b] + i - 1));
+                }
+                slot_cap = std::max<std::uint64_t>(slot_cap, bank_slot_live[b]);
+            }
+        } else {
+            const auto pool_slots = req.config.capacity_bytes / slot_bytes;
+            const auto whole_layers = widest_bank * layer_count;
+            std::uint64_t cap = 1;
+            if (widest_bank != 0 && layer_count != 0) {
+                if (pool_slots >= whole_layers) {
+                    cap = widest_bank;
+                } else {
+                    cap = std::max<std::uint64_t>(kMinimumHotSet, pool_slots / layer_count);
+                }
+            }
+            if (const char* cap_env = std::getenv("NINFER_EXPERT_WINDOW_SLOTS")) {
+                const auto requested = std::strtoull(cap_env, nullptr, 10);
+                if (requested > 0) { cap = requested; }
+            }
+            if (pool_slots == 0) {
+                throw std::invalid_argument("expert cache holds no complete expert slot");
+            }
+            slots_max  = reserved / slot_bytes;
+            slots_live = pool_slots;
+            // A pool narrower than one hot set per bank cannot give every bank its own run: narrow
+            // the hot set instead of addressing past the live pool (growth adds windows, not a
+            // wider one).
+            if (layer_count != 0) {
+                const auto per_bank = slots_live / layer_count;
+                if (per_bank == 0) {
+                    throw std::invalid_argument("expert pool cannot hold one slot per bank");
+                }
+                cap = std::min(cap, per_bank);
+            }
+            slot_cap = cap;
+            free_slots.clear();
+            free_slots.reserve(static_cast<std::size_t>(slots_max));
+            // Pushed high to low so the first pop hands out slot 0: a fresh bank then keeps the
+            // identity mapping it needs for a graph, exactly as the per-bank runs used to lay it out.
+            for (std::uint64_t slot = slots_live; slot > 0; --slot) {
+                free_slots.push_back(static_cast<std::uint32_t>(slot - 1));
+            }
+        }
+        slot_role.assign(static_cast<std::size_t>(slots_max), kRoleNone);
         // Q20: the fixed ring is a slice of each bank's own window, not extra capacity. Taking it
         // after seeding failed by construction on an 8 GiB pool (106 slots/bank, 39 free in total,
         // 8 x 40 needed), so it is taken here and the hot seed is shortened by the same amount.
@@ -342,23 +447,6 @@ std::vector<std::uint64_t> bank_generation;
             }
             ring_per_bank = std::min<std::uint32_t>(ring_per_bank, slot_cap / 2);
         }
-        for (std::size_t b = 0; b < banks.size() && ring_per_bank != 0; ++b) {
-            if (free_slots.size() < ring_per_bank) {
-                throw std::invalid_argument("expert pool cannot reserve a ring for every bank");
-            }
-            ring_slots[b].reserve(ring_per_bank);
-            for (std::uint32_t index = 0; index < ring_per_bank; ++index) {
-                const std::uint32_t slot = free_slots.back();
-                free_slots.pop_back();
-                ring_slot_flag[slot] = 1;
-                ring_slots[b].push_back(slot);
-            }
-        }
-        if (ring_per_bank != 0) {
-            std::fprintf(stderr, "[ring] fixed slots=%u/bank (%u total), hot seed reduced\n",
-                         ring_per_bank, ring_per_bank * static_cast<std::uint32_t>(banks.size()));
-            std::fflush(stderr);
-        }
         // Q30/P6: size the prediction region BEFORE seeding and take it out of each bank's seed
         // (hot = capacity - S_p, the same shape B4 uses for the ring). Taking it from the leftovers
         // was tried first and never produced a region: the pool seeds every bank to its cap, so
@@ -368,21 +456,56 @@ std::vector<std::uint64_t> bank_generation;
             const auto room = static_cast<std::uint32_t>(slot_cap / 4);
             prefetch_per_bank = std::min(prefetch_per_bank, room);
         }
+        if (per_bank_layout && (ring_per_bank != 0 || prefetch_per_bank != 0)) {
+            // Both experiments assume one global slot stride: the ring hands a slot id to a Device
+            // kernel that indexes the pool by it, and the prediction region is carved out of the top
+            // of a flat slot space. Neither has been re-derived for per-bank strides, so they are
+            // refused rather than silently mis-addressing.
+            std::fprintf(stderr,
+                         "[pool] per-bank slot pricing disables the ring/prefetch experiments\n");
+            std::fflush(stderr);
+            ring_per_bank     = 0;
+            prefetch_per_bank = 0;
+        }
+        for (std::size_t b = 0; b < banks.size() && ring_per_bank != 0; ++b) {
+            auto& list = free_list(static_cast<std::uint32_t>(b));
+            if (list.size() < ring_per_bank) {
+                throw std::invalid_argument("expert pool cannot reserve a ring for every bank");
+            }
+            ring_slots[b].reserve(ring_per_bank);
+            for (std::uint32_t index = 0; index < ring_per_bank; ++index) {
+                const std::uint32_t slot = list.back();
+                list.pop_back();
+                slot_role[slot] = kRoleRing;
+                ring_slots[b].push_back(slot);
+            }
+        }
+        if (ring_per_bank != 0) {
+            std::fprintf(stderr, "[ring] fixed slots=%u/bank (%u total), hot seed reduced\n",
+                         ring_per_bank, ring_per_bank * static_cast<std::uint32_t>(banks.size()));
+            std::fflush(stderr);
+        }
         const std::uint32_t reserved_per_bank = prefetch_per_bank + ring_per_bank;
-        const std::uint32_t seed =
-            reserved_per_bank < slot_cap ? slot_cap - reserved_per_bank : slot_cap;
         // port (sm_89): only the experts that fit the per-bank hint start resident. The identity
         // mapping is right when the hint holds the whole layer; a smaller hint must start with the
         // rest absent, or a stale slot index would point at another bank's expert.
+        std::uint32_t seed = 0;
         for (std::size_t b = 0; b < banks.size(); ++b) {
             slot_of[b].assign(banks[b].count, kAbsentSlot);
             if (banks[b].resident) { continue; }
-            for (std::uint32_t e = 0; e < banks[b].count && e < seed; ++e) {
-                if (free_slots.empty()) {
+            // Per-bank pricing gives every bank its own live run; the uniform space shares one hint.
+            const auto cap_b = per_bank_layout ? bank_slot_live[b]
+                                               : static_cast<std::uint32_t>(slot_cap);
+            const std::uint32_t bank_seed =
+                reserved_per_bank < cap_b ? cap_b - reserved_per_bank : cap_b;
+            seed = std::max(seed, bank_seed);
+            auto& list = free_list(static_cast<std::uint32_t>(b));
+            for (std::uint32_t e = 0; e < banks[b].count && e < bank_seed; ++e) {
+                if (list.empty()) {
                     throw std::invalid_argument("expert pool cannot seed every bank's hot set");
                 }
-                slot_of[b][e] = free_slots.back();
-                free_slots.pop_back();
+                slot_of[b][e] = list.back();
+                list.pop_back();
                 ++resident_count[b];
             }
         }
@@ -391,6 +514,9 @@ std::vector<std::uint64_t> bank_generation;
             prefetch_base       = static_cast<std::uint32_t>(
                 slots_live - per_bank * static_cast<std::uint64_t>(banks.size()));
             std::erase_if(free_slots, [&](std::uint32_t slot) { return slot >= prefetch_base; });
+            for (std::uint32_t slot = prefetch_base; slot < slots_live; ++slot) {
+                slot_role[slot] = kRolePrefetch;
+            }
             prefetch_owner.assign(banks.size(),
                                   std::vector<std::uint32_t>(prefetch_per_bank, kAbsentSlot));
             prefetch_cursor.assign(banks.size(), 0);
@@ -398,6 +524,24 @@ std::vector<std::uint64_t> bank_generation;
             std::fprintf(stderr, "[pool] prefetch region: %u slot(s)/bank, %u total, hot seed %u\n",
                          prefetch_per_bank,
                          prefetch_per_bank * static_cast<std::uint32_t>(banks.size()), seed);
+            std::fflush(stderr);
+        }
+        if (heterogeneous) {
+            // The one line that says which pricing is in force and what it bought: a width
+            // disagreement is the only reason the layout can differ, and the residency count is what
+            // the prefill rate follows.
+            std::uint64_t resident = 0, total = 0;
+            for (std::size_t b = 0; b < banks.size(); ++b) {
+                total += banks[b].count;
+                resident += banks[b].resident ? banks[b].count : resident_count[b];
+            }
+            std::fprintf(stderr,
+                         "[pool] %s layout over %zu bank(s), widest stride %.1f KiB: %llu of %llu "
+                         "experts resident\n",
+                         per_bank_layout ? "per-bank" : "uniform", banks.size(),
+                         static_cast<double>(slot_bytes) / 1024.0,
+                         static_cast<unsigned long long>(resident),
+                         static_cast<unsigned long long>(total));
             std::fflush(stderr);
         }
     }
@@ -446,11 +590,11 @@ std::vector<std::uint64_t> bank_generation;
 
     // True when this global slot belongs to a bank's prediction region.
     [[nodiscard]] bool prefetch_slot(std::uint32_t slot) const noexcept {
-        return prefetch_per_bank != 0 && slot >= prefetch_base && slot < slots_live;
+        return slot < slot_role.size() && slot_role[slot] == kRolePrefetch;
     }
 
     [[nodiscard]] bool ring_slot(std::uint32_t slot) const noexcept {
-        return slot < ring_slot_flag.size() && ring_slot_flag[slot] != 0;
+        return slot < slot_role.size() && slot_role[slot] == kRoleRing;
     }
 
     // Does `expert` count as a member of the bank's resident set (as opposed to a prediction)? The
@@ -541,9 +685,9 @@ std::vector<std::uint64_t> bank_generation;
                 entries[first[bank] + expert].ready = false;
                 continue;
             }
-            // Leaving: hand the slot to whoever needs it next. This happens before the arrivals are
-            // placed, so a swap of equal size always has the slots it is about to need.
-            free_slots.push_back(slots[expert]);
+            // Leaving: hand the slot back to this bank's own list. Per-bank pricing means the bytes
+            // behind an id are only addressable at this bank's stride, so a slot cannot migrate.
+            free_list(bank).push_back(slots[expert]);
             slots[expert]                       = kAbsentSlot;
             entries[first[bank] + expert].ready = false;
         }
@@ -551,9 +695,9 @@ std::vector<std::uint64_t> bank_generation;
         for (const std::uint32_t expert : wanted) {
             if (held + taken >= wanted.size()) { break; }
             if (slots[expert] != kAbsentSlot) { continue; }
-            if (free_slots.empty()) { break; }
-            slots[expert]                       = free_slots.back();
-            free_slots.pop_back();
+            if (free_list(bank).empty()) { break; }
+            slots[expert]                       = free_list(bank).back();
+            free_list(bank).pop_back();
             entries[first[bank] + expert].ready = false;
             ++taken;
         }
@@ -592,7 +736,7 @@ std::vector<std::uint64_t> bank_generation;
             }
             if (slots[expert] != kAbsentSlot) {
                 if (!prefetch_slot(slots[expert]) && !ring_slot(slots[expert])) {
-                    free_slots.push_back(slots[expert]);
+                    free_list(bank).push_back(slots[expert]);
                 }
                 entries[first[bank] + expert].ready = false;
             }
@@ -615,21 +759,22 @@ std::vector<std::uint64_t> bank_generation;
         return true;
     }
 
-        // Q20: take a fixed run of slots out of the shared free list. The ids are stable for the life of
-    // the pool, so the Device can name one and the host can address it without a second lookup.
+        // Q20: take a fixed run of slots out of the bank's own free list. The ids are stable for the life
+    // of the pool, so the Device can name one and the host can address it without a second lookup.
     void configure_ring(std::uint32_t bank, std::uint32_t slots) {
         if (bank >= banks.size() || slots == 0) { return; }
         auto& owned = ring_slots[bank];
         if (!owned.empty()) { return; }
-        if (free_slots.size() < slots) {
+        auto& list = free_list(bank);
+        if (list.size() < slots) {
             throw std::invalid_argument("expert pool cannot reserve a ring for every bank");
         }
-        if (ring_slot_flag.size() < slots_live) { ring_slot_flag.resize(slots_live, 0); }
+        if (slot_role.size() < slots_max) { slot_role.resize(slots_max, kRoleNone); }
         owned.reserve(slots);
         for (std::uint32_t index = 0; index < slots; ++index) {
-            const std::uint32_t slot = free_slots.back();
-            free_slots.pop_back();
-            ring_slot_flag[slot] = 1;
+            const std::uint32_t slot = list.back();
+            list.pop_back();
+            slot_role[slot] = kRoleRing;
             owned.push_back(slot);
         }
         std::fprintf(stderr, "[ring] bank=%u fixed slots=%u\n", bank, slots);
@@ -646,14 +791,40 @@ std::vector<std::uint64_t> bank_generation;
     // port (sm_89): slots are uniform. Banks may differ in entry size (a layer whose down matrix
     // carries a high plane is 128 KiB larger), so only a slot of max_entry_bytes can be handed to
     // any bank.
+    //
+    // Per-bank pricing keeps that rule for banks that share a width and only splits the space when
+    // they genuinely disagree; `free_list` and `slot_address` are the two places the split shows,
+    // so nothing downstream multiplies a slot id by a stride any more.
+    std::vector<std::uint32_t>& free_list(std::uint32_t bank) {
+        return per_bank_layout ? bank_free[bank] : free_slots;
+    }
+    [[nodiscard]] std::uint64_t slot_address(std::uint32_t slot) const {
+        if (!per_bank_layout) { return std::uint64_t{slot} * slot_bytes; }
+        return slot < slot_offset.size() ? slot_offset[slot] : kAbsent;
+    }
     std::uint64_t slot_capacity() const { return slot_cap; }
 
     // Bytes the pool is allowed to use right now.
-    std::uint64_t live_bytes() const { return slots_live * slot_bytes; }
+    std::uint64_t live_bytes() const {
+        if (!per_bank_layout) { return slots_live * slot_bytes; }
+        std::uint64_t bytes = 0;
+        for (std::size_t b = 0; b < banks.size(); ++b) {
+            if (banks[b].resident) { continue; }
+            bytes += std::uint64_t{bank_slot_live[b]} * bank_stride[b];
+        }
+        return bytes;
+    }
 
-    // Every bank's whole layer fits at once. Slots are shared, so what matters is the total: with
-    // room for the sum of every bank, no bank is ever shortened.
+    // Every bank's whole layer fits at once. With per-bank pricing each bank has its own run, so the
+    // question is per bank; the uniform space shares one list, so the total is what matters.
     bool holds_every_layer() const noexcept {
+        if (per_bank_layout) {
+            for (std::size_t b = 0; b < banks.size(); ++b) {
+                if (banks[b].resident) { continue; }
+                if (bank_slot_live[b] < banks[b].count) { return false; }
+            }
+            return true;
+        }
         std::uint64_t needed = 0;
         for (const auto& bank : banks) {
             if (bank.resident) { continue; }
@@ -692,9 +863,25 @@ std::vector<std::uint64_t> bank_generation;
     // unmapped slot that a kernel still reads is a use-after-free.
     std::uint64_t resize(std::uint64_t target_bytes) {
         if (!pool) { return 0; }
-        auto wanted = target_bytes / slot_bytes;
-        wanted      = std::max<std::uint64_t>(wanted, 1);
-        wanted      = std::min<std::uint64_t>(wanted, slots_max);
+        std::uint64_t wanted = 0;
+        std::size_t keep = 0;
+        if (per_bank_layout) {
+            // Live ids are ordered [every bank's live run][every bank's spare run], so the new edge
+            // is the number of ids whose address starts below the backing we are about to keep.
+            keep = static_cast<std::size_t>(
+                (align_up(std::max<std::uint64_t>(target_bytes, 1), kSegmentBytes)));
+            if (keep > pool->size()) { keep = pool->size(); }
+            while (wanted < slot_offset.size() &&
+                   slot_offset[wanted] + bank_stride[slot_owner[wanted]] <= keep) {
+                ++wanted;
+            }
+        } else {
+            wanted = target_bytes / slot_bytes;
+            wanted = std::max<std::uint64_t>(wanted, 1);
+            wanted = std::min<std::uint64_t>(wanted, slots_max);
+            keep   = static_cast<std::size_t>(
+                (wanted * slot_bytes + kSegmentBytes - 1) / kSegmentBytes * kSegmentBytes);
+        }
         if (wanted == slots_live) { return live_bytes(); }
         DeviceScope scope(Device::cuda(ordinal));
         const auto settled = cudaDeviceSynchronize();
@@ -702,9 +889,6 @@ std::vector<std::uint64_t> bank_generation;
             throw std::runtime_error(std::string("expert pool resize: ") +
                                      cudaGetErrorString(settled));
         }
-        // Segments are fixed size, so the backing range is the slot bytes rounded up.
-        const auto keep = static_cast<std::size_t>(
-            (wanted * slot_bytes + kSegmentBytes - 1) / kSegmentBytes * kSegmentBytes);
         if (wanted < slots_live) {
             // Q20: a fixed ring slot that the shrink would unmap has no replacement address. The
             // ring is not "expert residency" the resize is allowed to drop.
@@ -728,18 +912,40 @@ std::vector<std::uint64_t> bank_generation;
                     --resident_count[b];
                 }
             }
-            free_slots.erase(std::remove_if(free_slots.begin(), free_slots.end(),
-                                            [&](std::uint32_t slot) { return slot >= wanted; }),
-                             free_slots.end());
+            if (per_bank_layout) {
+                for (auto& list : bank_free) {
+                    std::erase_if(list, [&](std::uint32_t slot) { return slot >= wanted; });
+                }
+            } else {
+                std::erase_if(free_slots,
+                              [&](std::uint32_t slot) { return slot >= wanted; });
+            }
             pool->release(pool->mapped() - keep, keep);
         } else {
-            for (std::uint64_t slot = slots_live; slot < wanted; ++slot) {
-                free_slots.push_back(static_cast<std::uint32_t>(slot));
+            if (per_bank_layout) {
+                for (std::uint64_t slot = slots_live; slot < wanted; ++slot) {
+                    bank_free[slot_owner[slot]].push_back(static_cast<std::uint32_t>(slot));
+                }
+            } else {
+                for (std::uint64_t slot = slots_live; slot < wanted; ++slot) {
+                    free_slots.push_back(static_cast<std::uint32_t>(slot));
+                }
             }
             pool->acquire(keep - pool->mapped());
         }
         slots_live = wanted;
-        if (ring_slot_flag.size() < wanted) { ring_slot_flag.resize(wanted, 0); }
+        if (per_bank_layout) {
+            std::fill(bank_slot_live.begin(), bank_slot_live.end(), 0);
+            for (std::uint64_t slot = 0; slot < wanted; ++slot) {
+                ++bank_slot_live[slot_owner[slot]];
+            }
+            slot_cap = 0;
+            for (std::size_t b = 0; b < banks.size(); ++b) {
+                if (banks[b].resident) { continue; }
+                slot_cap = std::max<std::uint64_t>(slot_cap, bank_slot_live[b]);
+            }
+        }
+        if (slot_role.size() < wanted) { slot_role.resize(wanted, kRoleNone); }
         // 13.5 (step 5): the layout just moved. Experts above the new edge lost their slots, and
         // the backing below it changed hands with the driver. The published offset tables name
         // slots, and a stream republishes them exactly when the generations below move - so bump
@@ -849,7 +1055,7 @@ std::vector<std::uint64_t> bank_generation;
             throw std::runtime_error("expert slot is not backed: slot=" + std::to_string(slot) +
                                      " live=" + std::to_string(slots_live));
         }
-        entry.offset = std::uint64_t(slot) * slot_bytes;
+        entry.offset = slot_address(slot);
         if (!pool || pool->mapped() == 0) {
             throw std::runtime_error("expert pool has no Device storage");
         }
@@ -1506,11 +1712,23 @@ std::optional<std::uint64_t> ExpertCache::offset(ExpertCacheKey key) const {
 }
 
 std::uint64_t ExpertCache::used_bytes() const noexcept {
-    std::uint64_t ready = 0;
-    for (const auto& entry : impl_->entries) {
-        if (entry.ready) { ++ready; }
+    if (!impl_->per_bank_layout) {
+        std::uint64_t ready = 0;
+        for (const auto& entry : impl_->entries) {
+            if (entry.ready) { ++ready; }
+        }
+        return ready * impl_->slot_bytes;
     }
-    return ready * impl_->slot_bytes;
+    std::uint64_t bytes = 0;
+    for (std::size_t b = 0; b < impl_->banks.size(); ++b) {
+        if (impl_->banks[b].resident) { continue; }
+        for (std::uint32_t e = 0; e < impl_->banks[b].count; ++e) {
+            if (impl_->entries[impl_->first[b] + e].ready) {
+                bytes += impl_->banks[b].entry_bytes;
+            }
+        }
+    }
+    return bytes;
 }
 std::uint64_t ExpertCache::capacity_bytes() const noexcept { return impl_->live_bytes(); }
 std::uint64_t ExpertCache::slot_bytes() const { return impl_->slot_bytes; }
@@ -1529,12 +1747,70 @@ ConstMemorySpan ExpertCache::pool() const {
 std::uint64_t ExpertCache::uploads() const noexcept { return impl_->uploads; }
 std::uint64_t ExpertCache::evictions() const noexcept { return impl_->evictions; }
 std::uint64_t ExpertCache::hits() const noexcept { return impl_->hits; }
-std::uint64_t ExpertCache::windows() const noexcept { return impl_->slot_capacity() != 0
-                                                                    ? impl_->slots_live / impl_->slot_capacity()
-                                                                    : 0; }
+std::uint64_t ExpertCache::windows() const noexcept {
+    // How many whole layers the pool holds. Per-bank pricing means each bank has its own run, so
+    // the answer is the number of banks that are fully backed, not a ratio of two totals.
+    if (impl_->per_bank_layout) {
+        std::uint64_t whole = 0;
+        for (std::size_t b = 0; b < impl_->banks.size(); ++b) {
+            if (impl_->banks[b].resident) { continue; }
+            if (impl_->bank_slot_live[b] == impl_->banks[b].count) { ++whole; }
+        }
+        return whole;
+    }
+    return impl_->slot_capacity() != 0 ? impl_->slots_live / impl_->slot_capacity() : 0;
+}
 std::uint32_t ExpertCache::resident_capacity() const noexcept {
+    // One conservative answer for the whole pool, so a caller that budgets every bank alike cannot
+    // over-commit the narrowest one.
+    if (impl_->per_bank_layout) {
+        std::uint32_t narrowest = std::numeric_limits<std::uint32_t>::max();
+        for (std::size_t b = 0; b < impl_->banks.size(); ++b) {
+            if (impl_->banks[b].resident) { continue; }
+            narrowest = std::min(narrowest, impl_->bank_slot_live[b]);
+        }
+        return narrowest == std::numeric_limits<std::uint32_t>::max() ? 0 : narrowest;
+    }
     return static_cast<std::uint32_t>(
         std::min<std::uint64_t>(impl_->slots_live, impl_->slot_capacity()));
+}
+
+std::uint32_t ExpertCache::resident_capacity(std::uint32_t bank) const noexcept {
+    // The bank's own run, not the narrowest run: per-bank pricing means one bank can be much wider
+    // than the rest, and a cap meant for this bank must be read off this bank.
+    if (!impl_->per_bank_layout) {
+        // One shared slot space: every bank draws from the same list, and the hint was already
+        // clamped to the per-bank share when the pool was built, so the live floor is a guard only.
+        return static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(impl_->slot_capacity(), impl_->slots_live));
+    }
+    if (bank >= impl_->bank_slot_live.size()) { return 0; }
+    return impl_->bank_slot_live[bank];
+}
+
+std::uint64_t ExpertCache::slot_offset(std::uint32_t slot) const noexcept {
+    // Address of one slot id. The ring admission path copies into `pool().data + this`, and with
+    // per-bank pricing that is no longer `slot * slot_bytes`.
+    return impl_->slot_address(slot);
+}
+
+std::uint64_t ExpertCache::slot_stride(std::uint32_t bank) const noexcept {
+    if (!impl_->per_bank_layout || bank >= impl_->banks.size()) { return impl_->slot_bytes; }
+    return impl_->bank_stride[bank];
+}
+
+std::uint64_t ExpertCache::slot_bias(std::uint32_t bank) const noexcept {
+    if (!impl_->per_bank_layout || bank >= impl_->banks.size()) { return 0; }
+    const auto base = impl_->bank_slot_base[bank];
+    return impl_->slot_offset[base] - std::uint64_t{base} * impl_->bank_stride[bank];
+}
+
+std::uint64_t ExpertCache::resident_experts() const noexcept {
+    std::uint64_t count = 0;
+    for (std::size_t b = 0; b < impl_->banks.size(); ++b) {
+        count += impl_->banks[b].resident ? impl_->banks[b].count : impl_->resident_count[b];
+    }
+    return count;
 }
 
 bool ExpertCache::can_hold_every_layer() const noexcept { return impl_->holds_every_layer(); }

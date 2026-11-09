@@ -23,6 +23,7 @@ namespace {
 // host is out of the loop.
 __global__ void expand_placements_kernel(const std::uint32_t* placements, int count,
                                          std::uint64_t pool_slot_bytes,
+                                         std::uint64_t pool_bias_bytes,
                                          std::uint64_t host_slot_bytes,
                                          std::uint64_t* pool_offsets, std::int32_t* pool_mask,
                                          std::uint64_t* host_offsets, std::int32_t* host_flags) {
@@ -40,7 +41,9 @@ __global__ void expand_placements_kernel(const std::uint32_t* placements, int co
     if (host_flags != nullptr) { host_flags[expert] = host ? 1 : 0; }
     if (pool_offsets != nullptr) {
         pool_offsets[expert] =
-            (!absent && !host) ? static_cast<std::uint64_t>(slot) * pool_slot_bytes : 0;
+            (!absent && !host)
+                ? static_cast<std::uint64_t>(slot) * pool_slot_bytes + pool_bias_bytes
+                : 0;
     }
     if (host_offsets != nullptr) {
         host_offsets[expert] = host ? static_cast<std::uint64_t>(slot) * host_slot_bytes : 0;
@@ -50,7 +53,8 @@ __global__ void expand_placements_kernel(const std::uint32_t* placements, int co
 } // namespace
 
 void moe_expand_expert_placements(const std::uint32_t* placements, int count,
-                                  std::uint64_t pool_slot_bytes, std::uint64_t host_slot_bytes,
+                                  std::uint64_t pool_slot_bytes, std::uint64_t pool_bias_bytes,
+                                  std::uint64_t host_slot_bytes,
                                   std::uint64_t* pool_offsets, std::int32_t* pool_mask,
                                   std::uint64_t* host_offsets, std::int32_t* host_flags,
                                   cudaStream_t stream) {
@@ -58,8 +62,9 @@ void moe_expand_expert_placements(const std::uint32_t* placements, int count,
     constexpr int block = 256;
     const int grid      = (count + block - 1) / block;
     expand_placements_kernel<<<grid, block, 0, stream>>>(placements, count, pool_slot_bytes,
-                                                         host_slot_bytes, pool_offsets, pool_mask,
-                                                         host_offsets, host_flags);
+                                                         pool_bias_bytes, host_slot_bytes,
+                                                         pool_offsets, pool_mask, host_offsets,
+                                                         host_flags);
 }
 
 } // namespace ninfer::ops

@@ -255,10 +255,14 @@ inline constexpr std::uint32_t kExpertPlacementHost   = 0x80000000u;
 
 // `count` is the logical expert count of one bank. The two slot strides are the byte distance between
 // consecutive slots of the pool and of the pinned tier; they differ, which is why the tables are
-// derived here rather than handed over finished. Any of the four destinations may be null, and a
-// table the caller does not keep is not written. Enqueues on `stream`; no host synchronisation.
+// derived here rather than handed over finished. `pool_bias_bytes` is added after the multiply: a
+// bank whose experts are wider than its neighbours owns a run that starts at its own byte base, so
+// `slot * stride` alone would land outside it (zero when every bank shares one stride). Any of the
+// four destinations may be null, and a table the caller does not keep is not written. Enqueues on
+// `stream`; no host synchronisation.
 void moe_expand_expert_placements(const std::uint32_t* placements, int count,
-                                  std::uint64_t pool_slot_bytes, std::uint64_t host_slot_bytes,
+                                  std::uint64_t pool_slot_bytes, std::uint64_t pool_bias_bytes,
+                                  std::uint64_t host_slot_bytes,
                                   std::uint64_t* pool_offsets, std::int32_t* pool_mask,
                                   std::uint64_t* host_offsets, std::int32_t* host_flags,
                                   cudaStream_t stream);

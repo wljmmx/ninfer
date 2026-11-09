@@ -400,17 +400,17 @@ void ExpertStream::attach(ExpertCache& cache, std::uint32_t bank, const ExpertBa
     gate_up_view.codes = base + entry.codes.offset;
     gate_up_view.high  = entry.high.bytes ? base + entry.high.offset : nullptr;
     gate_up_view.scales = base + entry.scales.offset;
-    gate_up_view.code_stride  = cache.slot_bytes();
-    gate_up_view.high_stride  = entry.high.bytes ? cache.slot_bytes() : 0;
-    gate_up_view.scale_stride = cache.slot_bytes();
+    gate_up_view.code_stride  = cache.slot_stride(bank);
+    gate_up_view.high_stride  = entry.high.bytes ? cache.slot_stride(bank) : 0;
+    gate_up_view.scale_stride = cache.slot_stride(bank);
     auto& down_view   = experts_.bank.down;
     down_view         = gate_up_view;
     down_view.codes   = base + entry.down_codes.offset;
     down_view.high    = entry.down_high.bytes ? base + entry.down_high.offset : nullptr;
     down_view.scales  = base + entry.down_scales.offset;
-    down_view.code_stride  = cache.slot_bytes();
-    down_view.high_stride  = entry.down_high.bytes ? cache.slot_bytes() : 0;
-    down_view.scale_stride = cache.slot_bytes();
+    down_view.code_stride  = cache.slot_stride(bank);
+    down_view.high_stride  = entry.down_high.bytes ? cache.slot_stride(bank) : 0;
+    down_view.scale_stride = cache.slot_stride(bank);
     experts_.bank.count  = count_;
     experts_.bank.device = pool.device;
 
@@ -422,7 +422,7 @@ void ExpertStream::attach(ExpertCache& cache, std::uint32_t bank, const ExpertBa
     for (std::uint32_t expert = 0; expert < count_; ++expert) {
         const auto slot = cache.expert_slot(bank, expert);
         if (!slot) { continue; }
-        offsets_[expert] = static_cast<std::uint64_t>(*slot) * cache.slot_bytes();
+        offsets_[expert] = cache.slot_offset(static_cast<std::uint32_t>(*slot));
         mask[expert]     = 1;
     }
     const auto table_bytes = offsets_.size() * sizeof(std::uint64_t);
@@ -481,7 +481,9 @@ std::uint32_t ExpertStream::spill_slots(std::uint32_t capacity) const noexcept {
     return std::min<std::uint32_t>(8U, std::max<std::uint32_t>(2U, capacity / 3));
 }
 bool ExpertStream::fully_resident() const noexcept {
-    return cache_ != nullptr && cache_->resident_capacity() >= count_;
+    // This stream's own bank, not the narrowest one: a wider bank may hold its whole layer while a
+    // narrower one cannot, and the answer decides whether this layer needs the split path at all.
+    return cache_ != nullptr && cache_->resident_capacity(bank_) >= count_;
 }
 
 void ExpertStream::gh1_report() {
@@ -702,7 +704,7 @@ std::uint32_t ExpertStream::static_quota() const {
         // The host set is the complement of the Device set: the pool keeps the top `capacity`
         // experts, the tier keeps the rest of the bank. Clamped to the routed grant minus one
         // dynamic slot, because the static stripe and the dynamic stripe share it.
-        const auto device = std::min(cache_->resident_capacity(), count_);
+        const auto device = std::min(cache_->resident_capacity(bank_), count_);
         const auto keep   = count_ - device;
         return std::min({keep, room, count_});
     }
@@ -728,7 +730,9 @@ void ExpertStream::refresh_static_candidates() {
     // Slicing at the Device's per-bank capacity makes the two sets disjoint by construction.
     std::size_t offset = 0;
     if (std::getenv("NINFER_WARM_STATIC_SLICE") != nullptr && cache_ != nullptr) {
-        offset = std::min<std::size_t>(cache_->resident_capacity(), ranked.size());
+        // Sliced at this bank's capacity: the host set must be the complement of this bank's Device
+        // set, and per-bank pricing makes that a different number for a wide bank.
+        offset = std::min<std::size_t>(cache_->resident_capacity(bank_), ranked.size());
         if (offset + keep > ranked.size()) {
             offset = ranked.size() - std::min<std::size_t>(keep, ranked.size());
         }
@@ -869,7 +873,8 @@ void ExpertStream::freeze_now(std::uint32_t /*tokens*/, cudaStream_t stream) {
         if (hot_score_[a] != hot_score_[b]) { return hot_score_[a] > hot_score_[b]; }
         return a < b; // a deterministic tie-break: the same run must freeze the same set
     });
-    const auto capacity = std::min<std::size_t>(cache_->resident_capacity(), ranked.size());
+    // The frozen Device set is this bank's seats, so it is this bank's capacity that sizes it.
+    const auto capacity = std::min<std::size_t>(cache_->resident_capacity(bank_), ranked.size());
     frozen_wanted_.assign(ranked.begin(), ranked.begin() + static_cast<std::ptrdiff_t>(capacity));
     const auto q = static_quota();
     std::vector<std::int32_t> candidates;
@@ -940,7 +945,7 @@ void ExpertStream::freeze_now(std::uint32_t /*tokens*/, cudaStream_t stream) {
     // Can every route be addressed without reading the ids back? This is the property a fully
     // static layer would need; kept as a counter, not as a branch (see the note at the covered
     // check: the 0.5 ms fetch is in ffn, not in ensure).
-    const auto device = std::min<std::uint32_t>(cache_->resident_capacity(), count_);
+    const auto device = std::min<std::uint32_t>(cache_->resident_capacity(bank_), count_);
     std::uint32_t pool_missing = 0;
     for (const auto expert : frozen_wanted_) {
         if (!cache_->expert_slot(bank_, expert)) { ++pool_missing; }
@@ -1042,8 +1047,9 @@ std::size_t ExpertStream::device_admit_ring(const void* device_ids, std::int32_t
     }
     if (!ring_descriptors_device_) {
         ring_descriptors_device_ =
-            std::make_unique<DeviceBuffer>(static_cast<std::size_t>(cache_->resident_capacity()) *
-                                          sizeof(ops::RingAdmitDescriptor));
+            std::make_unique<DeviceBuffer>(
+                static_cast<std::size_t>(cache_->resident_capacity(bank_)) *
+                sizeof(ops::RingAdmitDescriptor));
     }
     if (!ring_count_device_) { ring_count_device_ = std::make_unique<DeviceBuffer>(sizeof(std::uint32_t)); }
     // Membership at this instant, not the previous layer's published mask: "already resident" is
@@ -1070,7 +1076,7 @@ std::size_t ExpertStream::device_admit_ring(const void* device_ids, std::int32_t
         }
     }
     ring_count_device_->fill(0);
-    const auto capacity = std::min(cache_->resident_capacity(), ring_slots);
+    const auto capacity = std::min(cache_->resident_capacity(bank_), ring_slots);
     ops::ring_admit_launch(device_ids, values,
                            static_cast<const std::uint32_t*>(ring_candidates_device_->p),
                            static_cast<const std::int32_t*>(ring_resident_device_->p), count_,
@@ -1109,7 +1115,7 @@ std::size_t ExpertStream::device_admit_ring(const void* device_ids, std::int32_t
                                               host_->slot_bytes();
         std::byte* destination =
             const_cast<std::byte*>(static_cast<const std::byte*>(cache_->pool().data)) +
-            static_cast<std::size_t>(ring_slot) * slot_bytes;
+            cache_->slot_offset(ring_slot);
         // The copy reads the pinned slot asynchronously; keep the tier from handing it out until a
         // later layer has waited on the stream.
         host_->hold_for_device(bank_, descriptor.expert);
@@ -1218,7 +1224,8 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     }
     // One window holds a whole layer when the pool is large enough; otherwise the window shrinks to
     // the pool and the caller splits the layer between the Device pool and the host tier.
-    const auto capacity = cache_->resident_capacity();
+    // The window belongs to this bank alone, so it is sized from this bank's seats.
+    const auto capacity = cache_->resident_capacity(bank_);
     // With only a couple of slots per bank the split path costs more than it saves: it still pays
     // the routing read-back, the per-expert mask and the merge, while almost every expert lands on
     // the host anyway. Below this floor the whole layer goes to the host tier instead - measured
@@ -2459,7 +2466,8 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             mask_host_.assign(count_, 0);
             for (std::uint32_t expert = 0; expert < count_; ++expert) {
                 if (pool_slot_[expert] < 0) { continue; }
-                offsets_[expert]   = static_cast<std::uint64_t>(pool_slot_[expert]) * cache_->slot_bytes();
+                offsets_[expert]   = cache_->slot_offset(
+                    static_cast<std::uint32_t>(pool_slot_[expert]));
                 mask_host_[expert] = 1;
             }
             resident_order_ = wanted;
@@ -2679,7 +2687,8 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                         }
                         ops::moe_expand_expert_placements(
                             static_cast<const std::uint32_t*>(placement_device_->p),
-                            static_cast<int>(count_), cache_->slot_bytes(), host_->slot_bytes(),
+                            static_cast<int>(count_), cache_->slot_stride(bank_),
+                            cache_->slot_bias(bank_), host_->slot_bytes(),
                             static_cast<std::uint64_t*>(offsets_device_->p),
                             static_cast<std::int32_t*>(mask_device_->p),
                             static_cast<std::uint64_t*>(host_offsets_device_->p),
