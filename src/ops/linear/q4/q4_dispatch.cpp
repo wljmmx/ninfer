@@ -24,6 +24,9 @@ constexpr std::array kShapes{
     // Qwen4Exp (hidden 2560): GDN q/k (2048) and v/z (6144).
     ShapeEntry{2048, 2560, select_q4_n2048_k2560},
     ShapeEntry{6144, 2560, select_q4_n6144_k2560},
+    // Qwen4Exp (hidden 2560) QSA: key/index_query [512,2560], index_key [128,2560].
+    ShapeEntry{512, 2560, select_q4_n512_k2560},
+    ShapeEntry{128, 2560, select_q4_n128_k2560},
 };
 } // namespace
 

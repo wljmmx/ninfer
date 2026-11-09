@@ -142,6 +142,20 @@ int q5_a16_conformance() {
     failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5_g64_fp16_weight,
                           {2560, 6144, 199U, Comparison::Sampled, false, kN2560K6144});
 
+    // Qwen4Exp (hidden 2560) QSA: the artifact stores this layer's value projection in Q5, not Q4,
+    // as [512,2560]. N = 512 is a whole number of 64-row tiles, so the two shape-generic routes
+    // the sibling GDN value [6144,2560] uses admit it unchanged.
+    constexpr std::array kN512K2560Full{graph(1),  graph(2),  graph(3),  graph(4),  graph(5),
+                                        graph(8),  graph(9),  graph(16), graph(17), graph(32),
+                                        graph(64), graph(128)};
+    failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5_g64_fp16_weight,
+                          {512, 2560, 227U, Comparison::Full, true, kN512K2560Full});
+
+    constexpr std::array kN512K2560{a16(192), a16(256), a16(320), a16(384),
+                                    a16(512), a16(1024), a16(2048)};
+    failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5_g64_fp16_weight,
+                          {512, 2560, 227U, Comparison::Sampled, false, kN512K2560});
+
     return failures;
 }
 

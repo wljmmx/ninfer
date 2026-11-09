@@ -17,5 +17,8 @@ namespace ninfer::ops::detail {
 // Qwen4Exp (hidden 2560): the GDN query/key and value/z projections.
 [[nodiscard]] Q4Launch select_q4_n2048_k2560(std::int32_t tokens);
 [[nodiscard]] Q4Launch select_q4_n6144_k2560(std::int32_t tokens);
+// Qwen4Exp (hidden 2560): the QSA layer's key/index_query [512,2560] and index_key [128,2560].
+[[nodiscard]] Q4Launch select_q4_n512_k2560(std::int32_t tokens);
+[[nodiscard]] Q4Launch select_q4_n128_k2560(std::int32_t tokens);
 
 } // namespace ninfer::ops::detail

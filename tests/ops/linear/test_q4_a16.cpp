@@ -207,6 +207,36 @@ int q4_a16_conformance() {
     failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
                           {6144, 2560, 193U, Comparison::Sampled, false, kN6144K2560});
 
+    // Qwen4Exp (hidden 2560) QSA: the key projection and index_query are [512,2560]; index_key is
+    // [128,2560]. The rungs are the generic K=2560 routes (2560 is 40 whole quant groups and a
+    // multiple of the 64/128/256-wide K tiles), with the 128-row geometry kept on 16/32-row tiles
+    // so the grid does not collapse below eight CTAs. Full oracles cover every rung seam and both
+    // row-tile boundaries; the sampled sets carry the wide token extents.
+    constexpr std::array kN512K2560Full{
+        graph(1),  graph(2),  graph(3),  graph(4),  graph(5),  graph(7),  graph(8),  graph(9),
+        graph(16), graph(17), graph(32), graph(33), graph(64), graph(65), graph(96), graph(97),
+        graph(128)};
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
+                          {512, 2560, 211U, Comparison::Full, true, kN512K2560Full});
+
+    constexpr std::array kN512K2560{a16(129),  a16(192),  a16(256), a16(319), a16(320), a16(321),
+                                    a16(384), a16(512),  a16(575), a16(576), a16(577), a16(768),
+                                    a16(1024), a16(1279), a16(1280), a16(1281), a16(2048)};
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
+                          {512, 2560, 211U, Comparison::Sampled, false, kN512K2560});
+
+    constexpr std::array kN128K2560Full{
+        graph(1),  graph(2),  graph(3),  graph(4),  graph(5),  graph(7),  graph(8),  graph(9),
+        graph(16), graph(17), graph(32), graph(33), graph(64), graph(65), graph(96), graph(97),
+        graph(128)};
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
+                          {128, 2560, 223U, Comparison::Full, true, kN128K2560Full});
+
+    constexpr std::array kN128K2560{a16(129), a16(160), a16(192), a16(256), a16(384),
+                                    a16(512), a16(1024), a16(2048)};
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
+                          {128, 2560, 223U, Comparison::Sampled, false, kN128K2560});
+
     return failures;
 }
 

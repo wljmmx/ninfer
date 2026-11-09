@@ -83,6 +83,14 @@ Q5Launch select_q5_v2_prefill(std::int32_t n, std::int32_t k, std::int32_t t) {
             if (t <= 8) return launch_q5_simt_r8_c4;
             return launch_q5_mma_r64_c128;
         }
+        // Qwen4Exp QSA value [512,2560] (the artifact stores this one in Q5, not Q4): N = 512
+        // is a whole number of 64-row tiles, so the same two shape-generic routes admit it. The
+        // projection is small (800 KiB of codes and high bits), so the 64-row MMA tile is the
+        // decode-latency route and SIMT the small-T one, exactly as for the sibling 640/6144 rows.
+        if (n == 512) {
+            if (t <= 8) return launch_q5_simt_r8_c4;
+            return launch_q5_mma_r64_c128;
+        }
         break;
     case 640:
         if (n == 2560) {
