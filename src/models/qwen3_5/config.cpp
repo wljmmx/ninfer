@@ -38,6 +38,17 @@ float positive_float(const Json& config, const char* name) {
     return result;
 }
 
+bool flag(const Json& config, const char* name, bool fallback) {
+    if (!config.contains(name)) { return fallback; }
+    const auto& value = config.at(name);
+    if (!value.is_boolean()) { throw ArtifactError(std::string(name) + " must be boolean"); }
+    return value.get<bool>();
+}
+
+std::string name(const Json& config, const char* key) {
+    return config.contains(key) ? artifact::require_id(config.at(key), key) : std::string{};
+}
+
 std::string architecture(const Json& config) {
     const auto& names = config.at("architectures");
     if (!names.is_array() || names.size() != 1) {
@@ -104,7 +115,7 @@ void compute_yarn_frequencies(RopeConfig& out, double beta_fast, double beta_slo
 RopeConfig rope(const Json& value, std::uint32_t head_dim) {
     require_members(value, {"rope_theta", "partial_rotary_factor", "mrope_section"},
                     {"rope_type", "factor", "original_max_position_embeddings", "beta_fast",
-                     "beta_slow", "attention_factor"},
+                     "beta_slow", "attention_factor", "mrope_interleaved"},
                     "text RoPE");
     RopeConfig out;
     out.rope_theta            = positive_float(value, "rope_theta");
@@ -137,10 +148,15 @@ RopeConfig rope(const Json& value, std::uint32_t head_dim) {
     if (counts != out.mrope_section) {
         throw ArtifactError("MRoPE sections exceed interleaved axis ranges");
     }
+    out.mrope_interleaved = flag(value, "mrope_interleaved", true);
+    if (!out.mrope_interleaved) { throw ArtifactError("non-interleaved MRoPE is not implemented"); }
     if (value.contains("rope_type")) {
-        if (artifact::require_id(value.at("rope_type"), "rope_type") != "yarn") {
-            throw ArtifactError("unsupported rope_type; only yarn is implemented");
+        const auto type = artifact::require_id(value.at("rope_type"), "rope_type");
+        // "default" is the trained theta^(-2*i/rotary_dim) table this engine always uses.
+        if (type != "yarn" && type != "default") {
+            throw ArtifactError("unsupported rope_type " + type);
         }
+        if (type == "default") { return out; }
         if (!value.contains("factor") || !value.contains("original_max_position_embeddings")) {
             throw ArtifactError("yarn requires factor and original_max_position_embeddings");
         }
@@ -170,7 +186,16 @@ TextConfig text(const Json& value, bool mtp) {
         {"num_attention_heads", "num_key_value_heads", "head_dim", "rope_parameters",
          "linear_num_key_heads", "linear_key_head_dim", "linear_num_value_heads",
          "linear_value_head_dim", "linear_conv_kernel_dim", "intermediate_size", "num_experts",
-         "num_experts_per_tok", "moe_intermediate_size", "shared_expert_intermediate_size"},
+         "num_experts_per_tok", "moe_intermediate_size", "shared_expert_intermediate_size",
+         "attention_bias", "output_gate_type", "mamba_ssm_dtype", "norm_topk_prob", "hc_count",
+         "hc_lowrank", "indexer_n_heads", "indexer_kv_heads", "indexer_head_dim",
+         "indexer_compress_ratio", "indexer_budget", "ple_embed_dim", "ngram_size",
+         "heads_per_ngram", "split_ngram_parts", "ple_conv_kernel_size", "ple_layer_ids",
+         "ple_shard_shape", "ple_conv_dilation", "image_token_id", "video_token_id",
+         "vision_start_token_id", "vision_end_token_id",
+         // Tolerated without a consumer: hidden_act is the only activation this engine
+         // implements, and the sampler takes its stop IDs from generation_config.json.
+         "hidden_act", "eos_token_id"},
         "text config");
     TextConfig out;
     out.architecture = resolve_architecture(
@@ -192,6 +217,10 @@ TextConfig text(const Json& value, bool mtp) {
         if (layer == "full_attention") {
             out.layer_types.push_back(MixerKind::FullAttention);
             out.compact_layer_indices.push_back(out.full_attention_layers++);
+        } else if (layer == "indexed_attention") {
+            out.layer_types.push_back(MixerKind::IndexedAttention);
+            out.compact_layer_indices.push_back(out.full_attention_layers++);
+            ++out.indexed_attention_layers;
         } else if (layer == "linear_attention") {
             out.layer_types.push_back(MixerKind::LinearAttention);
             out.compact_layer_indices.push_back(out.linear_attention_layers++);
@@ -218,7 +247,62 @@ TextConfig text(const Json& value, bool mtp) {
         (void)gdn.conv_channels();
         out.gdn = gdn;
     }
-    if (out.architecture == Architecture::Qwen3_5Moe) {
+    out.attention_bias   = flag(value, "attention_bias", false);
+    out.norm_topk_prob   = flag(value, "norm_topk_prob", false);
+    out.output_gate_type = name(value, "output_gate_type");
+    out.mamba_ssm_dtype  = name(value, "mamba_ssm_dtype");
+    if (value.contains("hc_count") || value.contains("hc_lowrank")) {
+        HcConfig hc{dimension(value, "hc_count"), dimension(value, "hc_lowrank")};
+        (void)hc.stream_width(out.hidden_size);
+        out.hc = hc;
+    }
+    if (value.contains("indexer_n_heads") || value.contains("indexer_kv_heads") ||
+        value.contains("indexer_head_dim") || value.contains("indexer_compress_ratio") ||
+        value.contains("indexer_budget")) {
+        IndexerConfig indexer{
+            dimension(value, "indexer_n_heads"), dimension(value, "indexer_kv_heads"),
+            dimension(value, "indexer_head_dim"), dimension(value, "indexer_compress_ratio"),
+            dimension(value, "indexer_budget")};
+        if (indexer.num_heads % indexer.num_kv_heads) {
+            throw ArtifactError("indexer heads must be divisible by KV heads");
+        }
+        out.indexer = indexer;
+    }
+    if (out.indexed_attention_layers && !out.indexer) {
+        throw ArtifactError("indexed layer_type requires the indexer geometry");
+    }
+    if (value.contains("ple_embed_dim") || value.contains("ple_shard_shape")) {
+        PleConfig ple{
+            dimension(value, "ple_embed_dim"),        dimension(value, "ngram_size"),
+            dimension(value, "heads_per_ngram"),      dimension(value, "split_ngram_parts"),
+            dimension(value, "ple_conv_kernel_size"), dimension(value, "ple_conv_dilation")};
+        const auto& ids = value.at("ple_layer_ids");
+        if (!ids.is_array() || ids.empty()) {
+            throw ArtifactError("ple_layer_ids must name at least one text block");
+        }
+        for (const auto& id : ids) {
+            const auto layer = integer(id, "ple layer index", false);
+            if (layer >= out.num_hidden_layers) {
+                throw ArtifactError("ple_layer_ids index exceeds the text blocks");
+            }
+            ple.layer_ids.push_back(layer);
+        }
+        const auto& shard = value.at("ple_shard_shape");
+        if (!shard.is_array() || shard.size() != 2) {
+            throw ArtifactError("ple_shard_shape must hold rows and width");
+        }
+        ple.shard_shape[0] = integer(shard[0], "ple shard rows");
+        ple.shard_shape[1] = integer(shard[1], "ple shard width");
+        (void)ple.table_rows();
+        out.ple = ple;
+    }
+    if (value.contains("image_token_id")) {
+        MultimodalTokenIds ids{
+            dimension(value, "image_token_id"), dimension(value, "video_token_id"),
+            dimension(value, "vision_start_token_id"), dimension(value, "vision_end_token_id")};
+        out.multimodal_token_ids = ids;
+    }
+    if (moe_text(out.architecture)) {
         if (value.contains("intermediate_size")) {
             throw ArtifactError("MoE config carries Dense FFN width");
         }
@@ -350,6 +434,14 @@ DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
 std::uint64_t GdnConfig::conv_channels() const {
     return artifact::checked_add(artifact::checked_mul(2, key_width(), "GDN key width"),
                                  value_width(), "GDN convolution channels");
+}
+
+std::uint64_t HcConfig::stream_width(std::uint32_t hidden) const {
+    return artifact::checked_mul(count, hidden, "HC stream width");
+}
+
+std::uint64_t PleConfig::table_rows() const {
+    return artifact::checked_mul(shard_shape[0], split_parts, "PLE table rows");
 }
 
 std::uint64_t VisionConfig::patch_width() const {

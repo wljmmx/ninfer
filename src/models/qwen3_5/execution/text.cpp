@@ -57,6 +57,20 @@
 namespace ninfer::models::qwen3_5::execution {
 namespace {
 
+// An indexed layer is a full-attention mixer whose softmax runs over the indexer's selected KV
+// blocks. The indexer (QSA) is not wired into the layer yet, so the layer runs the full-attention
+// path; saying so once keeps a run from being mistaken for the real mixer.
+void note_indexed_mixer_deferred() {
+    static const bool told = [] {
+        std::fprintf(stderr,
+                     "[qsa] indexed layers run the full-attention path: block selection is not "
+                     "wired yet\n");
+        std::fflush(stderr);
+        return true;
+    }();
+    (void)told;
+}
+
 void project(const Tensor& x, const LinearParameters& parameters, Tensor& out,
              WorkspaceArena& workspace, cudaStream_t stream) {
     ops::linear(x, parameters.weight, out, parameters.policy, workspace, stream);
@@ -1612,9 +1626,15 @@ template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     const bool prefill = ph == Phase::Prefill;
     for (std::size_t layer = 0; layer < parameters_.text.layers.size(); ++layer) {
-        const auto& block  = parameters_.text.layers[layer];
-        const bool full    = config_.layer_types[layer] == MixerKind::FullAttention;
-        const auto compact = dimension(config_.compact_layer_indices[layer]);
+        const auto& block = parameters_.text.layers[layer];
+        // The config owns the dispatch: an indexed layer is a full-attention mixer whose softmax
+        // runs over the indexer's KV blocks. QSA is not wired yet (M4), so an indexed layer runs the
+        // full-attention path for now - but it must not fall into the GDN branch, whose weights it
+        // does not carry.
+        const auto kind     = config_.layer_types[layer];
+        const bool full     = attention_mixer(kind);
+        const bool indexed  = kind == MixerKind::IndexedAttention;
+        const auto compact  = dimension(config_.compact_layer_indices[layer]);
         nvtx::ScopedRange layer_range(
             full ? (prefill ? nvtx::Name::PrefillLayerFull : nvtx::Name::VerifyLayerFull)
                  : (prefill ? nvtx::Name::PrefillLayerGdn : nvtx::Name::VerifyLayerGdn),
@@ -1634,6 +1654,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     std::fflush(stderr);
                 }
                 if (full) {
+                    if (indexed) { note_indexed_mixer_deferred(); }
                     attn_mix(block, x, compact, ph);
                 } else {
                     gdn_mix(block, x, compact, ph);

@@ -1,23 +1,78 @@
 #include "models/qwen3_5/load/bindings.h"
 
+#include <algorithm>
 #include <limits>
 #include <set>
+#include <string>
 
 namespace ninfer::models::qwen3_5::loading {
+namespace {
 
-AttentionWeights bind_attention(Bindings& b, const TextConfig& config, const std::string& p) {
+// Qwen4Exp normalizes the HC-expanded residual, so its stream norms cover every HC stream.
+std::uint64_t norm_width(const TextConfig& config) {
+    return config.hc ? config.hc->stream_width(config.hidden_size)
+                     : std::uint64_t(config.hidden_size);
+}
+
+// The low-rank correction around one grouped norm. `inject` writes the streams back, which the
+// final correction does without: it feeds the head instead.
+HcWeights bind_hc(Bindings& b, const TextConfig& config, const std::string& p, bool inject) {
+    const auto& hc   = config.hc.value();
+    const auto width = hc.stream_width(config.hidden_size);
+    HcWeights out;
+    out.down = b.parameter(p + "down", {hc.lowrank, width}, {p + "normalized_streams"});
+    out.up   = b.parameter(p + "up", {width, hc.lowrank}, {p + "lowrank_activation"});
+    if (inject) {
+        out.inject = b.parameter(p + "inject", {hc.count, width}, {p + "normalized_streams"});
+    }
+    return out;
+}
+
+// The n-gram table is paged from disk and never resident, so its binding needs no device bytes.
+PleWeights bind_ple(Bindings& b, const TextConfig& config, const std::string& p) {
+    const auto& ple    = config.ple.value();
+    const auto streams = std::uint64_t(config.hc ? config.hc->count : 1) * ple.embed_dim;
+    PleWeights out;
+    out.key         = b.parameter(p + "key", {streams, ple.embed_dim}, {p + "embedding"});
+    out.value       = b.parameter(p + "value", {ple.embed_dim, ple.embed_dim}, {p + "embedding"});
+    out.norm_key    = b.direct(p + "norm_key", {streams});
+    out.norm_query  = b.direct(p + "norm_query", {streams});
+    out.norm_conv   = b.direct(p + "norm_conv", {streams});
+    out.convolution = b.direct(p + "convolution", {ple.conv_kernel_size, streams});
+    out.table = b.parameter(p + "table", {ple.table_rows(), ple.table_width()}, {}, std::nullopt,
+                            artifact::Residency::Streamed);
+    return out;
+}
+
+} // namespace
+
+AttentionWeights bind_attention(Bindings& b, const TextConfig& config, const std::string& p,
+                                bool indexed) {
     const auto& a = config.attention.value();
     const auto h  = config.hidden_size;
     const auto q  = a.query_width();
     const auto k  = a.key_width();
     AttentionWeights out;
-    out.query      = b.parameter(p + "attention/query", {q, h}, {p + "mixer_input"});
-    out.key        = b.parameter(p + "attention/key", {k, h}, {p + "mixer_input"});
-    out.gate       = b.parameter(p + "attention/gate", {q, h}, {p + "mixer_input"});
+    out.query = b.parameter(p + "attention/query", {q, h}, {p + "mixer_input"});
+    out.key   = b.parameter(p + "attention/key", {k, h}, {p + "mixer_input"});
+    // Qwen4Exp keeps the output gate beside the query inside one fused parent and names it apart.
+    out.gate       = indexed ? b.aliased(p + "attention/gate", p + "attention/output_gate", {q, h},
+                                         {p + "mixer_input"})
+                             : b.parameter(p + "attention/gate", {q, h}, {p + "mixer_input"});
     out.value      = b.parameter(p + "attention/value", {k, h}, {p + "mixer_input"});
     out.query_norm = b.direct(p + "attention/query_norm", {a.head_dim});
     out.key_norm   = b.direct(p + "attention/key_norm", {a.head_dim});
     out.output     = b.parameter(p + "attention/output", {h, q}, {p + "attention/gated_output"});
+    if (indexed) {
+        const auto& x = config.indexer.value();
+        IndexerWeights index;
+        index.query =
+            b.parameter(p + "attention/index_query", {x.query_width(), h}, {p + "mixer_input"});
+        index.key = b.parameter(p + "attention/index_key", {x.key_width(), h}, {p + "mixer_input"});
+        index.query_norm = b.direct(p + "attention/index_query_norm", {x.head_dim});
+        index.key_norm   = b.direct(p + "attention/index_key_norm", {x.head_dim});
+        out.indexer      = index;
+    }
     return out;
 }
 
@@ -61,6 +116,9 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& config, const std::string& pr
     const auto h      = config.hidden_size;
     const auto ir     = moe.moe_intermediate_size;
     const auto shared = moe.shared_expert_intermediate_size;
+    // Qwen4Exp packs every expert of a bank into one binding, so a per-expert parameter is a row
+    // block of that bank; the plan keeps the per-expert shape the execution path runs with.
+    const bool banked = config.architecture == Architecture::Qwen4Exp;
     MoeWeights out;
     out.router       = b.parameter(p + "router", {moe.num_experts, h}, {input});
     out.shared_score = b.parameter(p + "shared_score", {1, h}, {input});
@@ -70,12 +128,22 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& config, const std::string& pr
         b.stream_experts ? (b.expert_host_copy ? artifact::Residency::Host
                                                : artifact::Residency::Streamed)
                          : artifact::Residency::Device;
+    const auto product = banked ? p + "experts/product" : std::string{};
     for (std::uint32_t e = 0; e < moe.num_experts; ++e) {
         const auto ep = p + "experts/" + std::to_string(e) + "/";
-        out.experts.push_back({b.parameter(ep + "gate", {ir, h}, {input}, std::nullopt, residency),
-                               b.parameter(ep + "up", {ir, h}, {input}, std::nullopt, residency),
-                               b.parameter(ep + "down", {h, ir}, {ep + "product"}, std::nullopt,
-                                           residency)});
+        if (banked) {
+            out.experts.push_back({b.banked(ep + "gate", p + "experts/gate", {ir, h},
+                                            std::uint64_t(e) * ir, ir, {input}, residency),
+                                   b.banked(ep + "up", p + "experts/up", {ir, h},
+                                            std::uint64_t(e) * ir, ir, {input}, residency),
+                                   b.banked(ep + "down", p + "experts/down", {h, ir},
+                                            std::uint64_t(e) * h, h, {product}, residency)});
+        } else {
+            out.experts.push_back(
+                {b.parameter(ep + "gate", {ir, h}, {input}, std::nullopt, residency),
+                 b.parameter(ep + "up", {ir, h}, {input}, std::nullopt, residency),
+                 b.parameter(ep + "down", {h, ir}, {ep + "product"}, std::nullopt, residency)});
+        }
     }
     out.shared = {b.parameter(p + "shared/gate", {shared, h}, {input}),
                   b.parameter(p + "shared/up", {shared, h}, {input}),
@@ -88,12 +156,31 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& config, const std::string& pr
 BlockWeights bind_block(Bindings& b, const TextConfig& config, const std::string& p,
                         MixerKind mixer) {
     BlockWeights out;
-    out.input_norm          = b.direct(p + "input_norm", {config.hidden_size});
-    out.post_attention_norm = b.direct(p + "post_attention_norm", {config.hidden_size});
-    if (mixer == MixerKind::FullAttention) {
-        out.mixer = bind_attention(b, config, p);
+    if (config.architecture == Architecture::Qwen4Exp) {
+        // Qwen4Exp names the activation the mixer and the MoE each read: `attention_input` for the
+        // mixer and `moe_input` for the FFN. The logical names stay the engine's; both spellings
+        // resolve, and a Use that matches both or neither is refused under the logical parameter.
+        b.alias_input(p + "mixer_input", p + "attention_input");
+        b.alias_input(p + "ffn_input", p + "moe_input");
+    }
+    // Qwen4Exp folds the grouped stream norm into the HC binding that consumes it.
+    if (config.hc) {
+        out.input_norm =
+            b.aliased_direct(p + "input_norm", p + "attention_hc/norm", {norm_width(config)});
+        out.post_attention_norm =
+            b.aliased_direct(p + "post_attention_norm", p + "moe_hc/norm", {norm_width(config)});
+    } else {
+        out.input_norm          = b.direct(p + "input_norm", {config.hidden_size});
+        out.post_attention_norm = b.direct(p + "post_attention_norm", {config.hidden_size});
+    }
+    if (attention_mixer(mixer)) {
+        out.mixer = bind_attention(b, config, p, mixer == MixerKind::IndexedAttention);
     } else {
         out.mixer = bind_gdn(b, config, p);
+    }
+    if (config.hc) {
+        out.input_hc          = bind_hc(b, config, p + "attention_hc/", true);
+        out.post_attention_hc = bind_hc(b, config, p + "moe_hc/", true);
     }
     if (const auto* dense = std::get_if<DenseConfig>(&config.ffn)) {
         out.ffn = bind_dense(b, config.hidden_size, dense->intermediate_size, p);
@@ -113,11 +200,19 @@ TextWeights bind_text(Bindings& b, const TextConfig& config, const LoadOptions& 
     }
     out.output_head = b.parameter("text/output_head", {config.vocab_size, config.hidden_size},
                                   std::move(head_inputs));
-    out.final_norm  = b.direct("text/final_norm", {config.hidden_size});
+    out.final_norm =
+        config.hc ? b.aliased_direct("text/final_norm", "text/final_hc/norm", {norm_width(config)})
+                  : b.direct("text/final_norm", {config.hidden_size});
+    if (config.hc) { out.final_hc = bind_hc(b, config, "text/final_hc/", false); }
     out.layers.reserve(config.num_hidden_layers);
     for (std::uint32_t i = 0; i < config.num_hidden_layers; ++i) {
-        out.layers.push_back(
-            bind_block(b, config, "text/layers/" + std::to_string(i) + "/", config.layer_types[i]));
+        const auto p = "text/layers/" + std::to_string(i) + "/";
+        out.layers.push_back(bind_block(b, config, p, config.layer_types[i]));
+        // Qwen4Exp embeds n-grams on named blocks only.
+        if (config.ple && std::find(config.ple->layer_ids.begin(), config.ple->layer_ids.end(),
+                                    i) != config.ple->layer_ids.end()) {
+            out.layers.back().ple = bind_ple(b, config, p + "ple/");
+        }
     }
     return out;
 }

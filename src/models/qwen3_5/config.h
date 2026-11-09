@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <variant>
 #include <vector>
 
@@ -16,8 +17,14 @@ struct Directory;
 
 namespace ninfer::models::qwen3_5 {
 
-enum class MixerKind { FullAttention, LinearAttention };
+enum class MixerKind { FullAttention, LinearAttention, IndexedAttention };
 enum class DraftAttentionKind { FullAttention, SlidingAttention };
+
+// An indexed layer is a full-attention mixer whose softmax runs over the indexer's selected KV
+// blocks instead of the whole history.
+[[nodiscard]] constexpr bool attention_mixer(MixerKind kind) noexcept {
+    return kind != MixerKind::LinearAttention;
+}
 
 struct AttentionConfig {
     std::uint32_t num_attention_heads = 0;
@@ -39,6 +46,8 @@ struct RopeConfig {
     std::array<std::uint32_t, 3> mrope_section{};
     std::uint32_t rotary_dim = 0;
     std::vector<std::uint8_t> pair_axes;
+    // The pair layout above is the interleaved MRoPE convention; the artifact states it.
+    bool mrope_interleaved = true;
 
     // YaRN frequency scaling. When yarn is false every field below is inert and the frequencies
     // are the trained theta^(-2*i/rotary_dim) ones.
@@ -79,6 +88,55 @@ struct DenseConfig {
     std::uint32_t intermediate_size = 0;
 };
 
+// Qwen4Exp keeps the residual as `count` streams and mixes them through a rank-`lowrank` pair.
+struct HcConfig {
+    std::uint32_t count   = 0;
+    std::uint32_t lowrank = 0;
+
+    [[nodiscard]] std::uint64_t stream_width(std::uint32_t hidden) const;
+};
+
+// Qwen4Exp's sparse attention: small indexer heads score KV blocks before the main softmax.
+struct IndexerConfig {
+    std::uint32_t num_heads      = 0;
+    std::uint32_t num_kv_heads   = 0;
+    std::uint32_t head_dim       = 0;
+    std::uint32_t compress_ratio = 0;
+    std::uint32_t budget         = 0;
+
+    [[nodiscard]] std::uint64_t query_width() const noexcept {
+        return std::uint64_t(num_heads) * head_dim;
+    }
+
+    [[nodiscard]] std::uint64_t key_width() const noexcept {
+        return std::uint64_t(num_kv_heads) * head_dim;
+    }
+};
+
+// Per-layer n-gram embeddings: one row of the paged table per hash head.
+struct PleConfig {
+    std::uint32_t embed_dim        = 0;
+    std::uint32_t ngram_size       = 0;
+    std::uint32_t heads_per_ngram  = 0;
+    std::uint32_t split_parts      = 0;
+    std::uint32_t conv_kernel_size = 0;
+    std::uint32_t conv_dilation    = 0;
+    std::vector<std::uint32_t> layer_ids;
+    std::array<std::uint64_t, 2> shard_shape{};
+
+    [[nodiscard]] std::uint64_t table_rows() const;
+
+    [[nodiscard]] std::uint64_t table_width() const noexcept { return shard_shape[1]; }
+};
+
+// Sentinel IDs the text tokenizer reserves for multimodal media.
+struct MultimodalTokenIds {
+    std::uint32_t image        = 0;
+    std::uint32_t video        = 0;
+    std::uint32_t vision_start = 0;
+    std::uint32_t vision_end   = 0;
+};
+
 struct MoeConfig {
     std::uint32_t num_experts                     = 0;
     std::uint32_t num_experts_per_tok             = 0;
@@ -96,12 +154,22 @@ struct TextConfig {
     float rms_norm_eps                    = 0;
     std::vector<MixerKind> layer_types;
     std::vector<std::uint32_t> compact_layer_indices;
-    std::uint32_t full_attention_layers   = 0;
-    std::uint32_t linear_attention_layers = 0;
+    std::uint32_t full_attention_layers    = 0;
+    std::uint32_t linear_attention_layers  = 0;
+    std::uint32_t indexed_attention_layers = 0;
     std::optional<AttentionConfig> attention;
     std::optional<RopeConfig> rope_parameters;
     std::optional<GdnConfig> gdn;
     std::variant<DenseConfig, MoeConfig> ffn;
+    // Qwen4Exp-only structure. Absent keeps the qwen3_5 layout these fields were appended to.
+    bool attention_bias = false;
+    bool norm_topk_prob = false;
+    std::string output_gate_type;
+    std::string mamba_ssm_dtype;
+    std::optional<HcConfig> hc;
+    std::optional<IndexerConfig> indexer;
+    std::optional<PleConfig> ple;
+    std::optional<MultimodalTokenIds> multimodal_token_ids;
 };
 
 struct VisionConfig {

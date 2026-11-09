@@ -955,7 +955,8 @@ void predict_next_layer(const Tensor& residual, const RoutedMoeParameters& next,
     auto guess_scratch = workspace.alloc_bytes(stream_route_bytes(next, 1, 1));
     MemoryArena guess_arena(MemorySpan{guess_scratch.data, guess_scratch.bytes, execution.device()});
     ops::ExpertRoutes guessed{guess_ids, guess_coeffs};
-    ops::topk_softmax_route(residual, route_profile, next.control, guessed, guess_shared,
+    ops::topk_softmax_route(residual, route_profile, next.fused_control(), guessed,
+                            guess_shared,
                             guess_arena, execution);
     std::vector<std::int32_t> guess(routed.top_k);
     const std::size_t bytes = static_cast<std::size_t>(routed.top_k) * sizeof(std::int32_t);
@@ -1007,7 +1008,8 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
     ops::ExpertRoutes routes{ids, coefficients};
     try {
         MemoryArena arena(MemorySpan{scratch.data, scratch.bytes, execution.device()});
-        ops::topk_softmax_route(hidden, route_profile, moe.control, routes, shared_coefficients,
+        ops::topk_softmax_route(hidden, route_profile, moe.fused_control(), routes,
+                                shared_coefficients,
                                 arena, execution);
     } catch (const std::exception& error) {
         throw std::invalid_argument(std::string("expert stream route: ") + error.what());
@@ -1027,7 +1029,8 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
         MemoryArena guess_arena(
             MemorySpan{guess_scratch.data, guess_scratch.bytes, execution.device()});
         ops::ExpertRoutes guessed{guess_ids, guess_coeffs};
-        ops::topk_softmax_route(*predictor_input, route_profile, moe.control, guessed, guess_shared,
+        ops::topk_softmax_route(*predictor_input, route_profile, moe.fused_control(), guessed,
+                                guess_shared,
                                 guess_arena, execution);
         std::vector<std::int32_t> guess(routed.top_k);
         const std::size_t bytes = static_cast<std::size_t>(routed.top_k) * sizeof(std::int32_t);
@@ -1254,7 +1257,7 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
             MemoryArena shared_arena(MemorySpan{scratch.data, scratch.bytes, execution.device()});
             ops::routed_swiglu(hidden, routed, moe.stream->experts(), routes,
                                ops::ExpertSubset{ops::ExpertSubsetKind::None, {}},
-                               ops::ScaledSwiGLUTerm{moe.shared, shared_coefficients},
+                               ops::ScaledSwiGLUTerm{moe.fused_shared(), shared_coefficients},
                                ops::MoeEpilogue::Write, shared_f32, shared_arena, execution);
             host_routed_ffn(fetch, moe, ops::ExpertSubset{ops::ExpertSubsetKind::All, {}},
                             shared_f32, residual, execution, host_term_device);
@@ -1293,7 +1296,7 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
             timeline_gpu_begin(execution.stream);
             ops::routed_swiglu(hidden, routed, moe.stream->experts(), routes,
                                ops::ExpertSubset{ops::ExpertSubsetKind::MaskOnes, skip_mask},
-                               ops::ScaledSwiGLUTerm{moe.shared, shared_coefficients},
+                               ops::ScaledSwiGLUTerm{moe.fused_shared(), shared_coefficients},
                                ops::MoeEpilogue::AddResidual, residual, arena, execution,
                                step_miss_device());
             timeline_gpu_end(execution.stream);
@@ -1727,7 +1730,7 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
                         masked_shape
                             ? ops::ExpertSubset{ops::ExpertSubsetKind::MaskOnes, masked_mask}
                             : ops::ExpertSubset{},
-                        ops::ScaledSwiGLUTerm{moe.shared, shared_coefficients},
+                        ops::ScaledSwiGLUTerm{moe.fused_shared(), shared_coefficients},
                         ops::MoeEpilogue::AddResidual, residual, arena, execution);
                 };
                 // The freeze route lands HERE, not on the split path: every route has an address
@@ -1840,7 +1843,7 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
                 step_miss_device() != nullptr ? step_miss_device() : moe.stream->missed_routes_device();
             ops::routed_swiglu(hidden, routed, moe.stream->experts(), routes,
                                ops::ExpertSubset{ops::ExpertSubsetKind::MaskOnes, device_mask},
-                               ops::ScaledSwiGLUTerm{moe.shared, shared_coefficients},
+                               ops::ScaledSwiGLUTerm{moe.fused_shared(), shared_coefficients},
                                ops::MoeEpilogue::Write, mixed_f32, mixed_arena, execution,
                                miss_target);
             if (timed) { timeline_gpu_end(execution.stream); }
@@ -1929,7 +1932,7 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
         // port (sm_89): routed and shared run in one combined plan - measured closest to the
         // resident path (7.094349 vs 7.096182 for two additive passes).
         ops::routed_swiglu(hidden, routed, moe.stream->experts(), routes, {},
-                           ops::ScaledSwiGLUTerm{moe.shared, shared_coefficients},
+                           ops::ScaledSwiGLUTerm{moe.fused_shared(), shared_coefficients},
                            ops::MoeEpilogue::AddResidual, residual, arena, execution);
         // Same hand-over on the streamed path: the residual is final here too.
         if (predict_next != nullptr) { predict_next_layer(residual, *predict_next, workspace, execution); }
@@ -1980,6 +1983,14 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
                                                         moe->routed_down.qtype, first, last);
     }
     if (const auto* moe = std::get_if<RoutedMoeParameters>(&parameters)) {
+        if (moe->split) {
+            // Same refusal as ffn(): a split-bank layer has no fused profile a kernel could size
+            // against, and sizing it with the split geometry would report a cost nothing can run.
+            throw std::invalid_argument(
+                moe->split->parameter +
+                ": Qwen4Exp stores the routed experts, the router and the shared expert in separate "
+                "parents; the routed kernel reads fused matrices (M5 wires the split form)");
+        }
         if (moe->stream) {
             // port (sm_89): the host fallback keeps the shared term in FP32 so that a layer
             // rounds the residual once, exactly like the device epilogue.
@@ -2064,11 +2075,22 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
             streamed_ffn(hidden, *moe, residual, workspace, execution, predictor_input, predict_next);
             return;
         }
+        if (moe->split) {
+            // M2: the parameter model describes Qwen4Exp's three independent expert banks, its own
+            // router/shared-logit pair and its own shared gate/up/down. The routed kernels still read
+            // the fused matrices qwen3_5 carries, so running one of these layers is refused by name
+            // instead of multiplying by the empty fused members.
+            throw std::invalid_argument(
+                moe->split->parameter +
+                ": Qwen4Exp stores the routed experts, the router and the shared expert in separate "
+                "parents; the routed kernel reads fused matrices (M5 wires the split form)");
+        }
         const auto storage =
             workspace.alloc_bytes(ffn_workspace_bytes(parameters, columns, columns));
         MemoryArena scratch(MemorySpan{storage.data, storage.bytes, execution.device()});
         ops::topk_softmax_swiglu_moe(hidden, moe->profile,
-                                     ops::MoeWeights{moe->control, moe->routed, moe->shared},
+                                     ops::MoeWeights{moe->fused_control(), moe->routed,
+                                                     moe->fused_shared()},
                                      ops::MoeEpilogue::AddResidual, residual, scratch, execution);
         return;
     }

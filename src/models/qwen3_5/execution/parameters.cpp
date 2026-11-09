@@ -21,6 +21,312 @@ auto with_context(const std::string& context, Function&& function) {
     }
 }
 
+[[noreturn]] void refuse(const std::string& parameter, const std::string& detail) {
+    throw std::invalid_argument(parameter + ": " + detail);
+}
+
+// Rows of one parent that holds `columns`-wide matrices, refusing anything that is not a matrix
+// bank this description can address.
+std::uint64_t parent_rows(const WeightParent& parent, std::uint64_t columns,
+                          const std::string& parameter, const char* role) {
+    const auto& shape = parent.geometry.shape;
+    if (shape.size() != 2 || !columns || shape[1] != columns) {
+        refuse(parameter, std::string(role) + " bank is not a " + std::to_string(columns) +
+                              "-column matrix");
+    }
+    return shape[0];
+}
+
+// One bank-wide view over `parent`, validated against the description it claims.
+WeightBankView bank_view(const WeightParent& parent, const WeightBankRegion& region,
+                         const std::string& parameter) {
+    WeightBankView view;
+    view.parent = &parent;
+    try {
+        view.layout = describe_weight_bank(parent.geometry, region);
+    } catch (const std::invalid_argument& error) {
+        refuse(parameter, std::string("expert bank rows do not match the description: ") +
+                              error.what());
+    }
+    return view;
+}
+
+const WeightRegion& single_part(const WeightView& view, std::uint64_t columns,
+                                const std::string& parameter, const char* role) {
+    if (view.parts.size() != 1 || !view.parts[0].parent) {
+        refuse(parameter, std::string(role) + " bank is not one contiguous row block");
+    }
+    const auto& part = view.parts[0];
+    if (part.begin % columns || part.end % columns) {
+        refuse(parameter, std::string(role) + " bank splits a row");
+    }
+    return part;
+}
+
+void require_shape(const WeightView& view, std::uint64_t rows, std::uint64_t columns,
+                   const std::string& parameter, const char* role) {
+    if (view.shape != std::vector<std::uint64_t>{rows, columns}) {
+        refuse(parameter, std::string(role) + " bank is [" + std::to_string(rows) + "," +
+                              std::to_string(columns) + "] per expert, not what the config declares");
+    }
+}
+
+} // namespace
+
+std::uint64_t ExpertBankDescription::rows(ExpertBankRole role) const {
+    switch (role) {
+    case ExpertBankRole::GateUp: return 2 * intermediate_;
+    case ExpertBankRole::Gate:
+    case ExpertBankRole::Up: return intermediate_;
+    case ExpertBankRole::Down: return hidden_;
+    }
+    refuse(parameter_, "unknown expert bank role");
+}
+
+const WeightBankLayout& ExpertBankDescription::layout(ExpertBankRole role) const {
+    const std::optional<WeightBankView>* view = nullptr;
+    switch (role) {
+    case ExpertBankRole::GateUp: view = &gate_up_; break;
+    case ExpertBankRole::Gate: view = &gate_; break;
+    case ExpertBankRole::Up: view = &up_; break;
+    case ExpertBankRole::Down: view = &down_; break;
+    }
+    if (view == nullptr || !view->has_value()) {
+        refuse(parameter_, fused_ ? "the artifact stores gate and up as one fused bank, not as " +
+                                        std::string(role == ExpertBankRole::Down ? "down" : "gate/up") +
+                                        " alone"
+                                  : "the artifact stores gate, up and down as separate banks");
+    }
+    return (*view)->layout;
+}
+
+const WeightBankView& ExpertBankDescription::bank(ExpertBankRole role) const {
+    (void)layout(role);
+    if (!whole_bank_) {
+        refuse(parameter_, "the artifact holds one expert per object, so this bank has no "
+                           "bank-wide parent");
+    }
+    switch (role) {
+    case ExpertBankRole::GateUp: return *gate_up_;
+    case ExpertBankRole::Gate: return *gate_;
+    case ExpertBankRole::Up: return *up_;
+    case ExpertBankRole::Down: return *down_;
+    }
+    refuse(parameter_, "unknown expert bank role");
+}
+
+WeightBankRegion ExpertBankDescription::block(ExpertBankRole role, std::uint32_t expert) const {
+    if (expert >= count_) {
+        refuse(parameter_, "expert " + std::to_string(expert) + " is outside a bank of " +
+                               std::to_string(count_));
+    }
+    const auto index = std::uint64_t(expert);
+    // A fused parent holds gate and up back to back, so each role keeps its own half of the block.
+    switch (role) {
+    case ExpertBankRole::GateUp:
+        if (!fused_) { (void)layout(role); }
+        return {gate_up_begin_ + index * 2 * intermediate_, 1, 2 * intermediate_,
+                2 * intermediate_};
+    case ExpertBankRole::Gate:
+        return {fused_ ? gate_up_begin_ + index * 2 * intermediate_
+                       : gate_begin_ + index * intermediate_,
+                1, intermediate_, intermediate_};
+    case ExpertBankRole::Up:
+        return {fused_ ? gate_up_begin_ + index * 2 * intermediate_ + intermediate_
+                       : up_begin_ + index * intermediate_,
+                1, intermediate_, intermediate_};
+    case ExpertBankRole::Down:
+        return {down_begin_ + index * hidden_, 1, hidden_, hidden_};
+    }
+    refuse(parameter_, "unknown expert bank role");
+}
+
+ExpertBankDescription ExpertBankDescription::fused(const WeightView& gate, const WeightView& up,
+                                                   const WeightView& down, std::uint32_t count,
+                                                   std::uint64_t intermediate,
+                                                   std::string parameter) {
+    if (!count || !intermediate) { refuse(parameter, "a fused expert bank needs E and I"); }
+    const auto hidden = gate.shape.size() == 2 ? gate.shape[1] : 0;
+    if (!hidden) { refuse(parameter, "fused gate bank is not a matrix"); }
+    require_shape(gate, intermediate, hidden, parameter, "gate");
+    require_shape(up, intermediate, hidden, parameter, "up");
+    require_shape(down, hidden, intermediate, parameter, "down");
+    const auto& gate_part = single_part(gate, hidden, parameter, "gate");
+    const auto& up_part   = single_part(up, hidden, parameter, "up");
+    const auto& down_part = single_part(down, intermediate, parameter, "down");
+    if (gate_part.parent != up_part.parent) {
+        refuse(parameter, "the fused form keeps gate and up in one parent");
+    }
+    const auto& parent   = *gate_part.parent;
+    const auto gate_begin = gate_part.begin / hidden;
+    const auto rows      = parent_rows(parent, hidden, parameter, "gate_up");
+    const auto per       = 2 * intermediate;
+    if (gate_begin >= rows) { refuse(parameter, "gate starts past its parent"); }
+    const auto available = rows - gate_begin;
+    const bool whole     = available == std::uint64_t(count) * per;
+    if (!whole && available != per) {
+        refuse(parameter, "gate_up holds " + std::to_string(available) + " rows from expert 0, "
+                              "which is neither E*2I (" + std::to_string(std::uint64_t(count) * per) +
+                              ") nor 2I (" + std::to_string(per) + ")");
+    }
+    // Expert 0's gate rows, then its up rows, immediately behind.
+    if (gate_part.end != gate_part.begin + intermediate * hidden ||
+        up_part.begin != gate_part.begin + intermediate * hidden ||
+        up_part.end != gate_part.begin + per * hidden || up_part.begin % hidden) {
+        refuse(parameter, "gate and up do not occupy the first expert's two halves");
+    }
+    const auto& down_parent = *down_part.parent;
+    const auto down_begin   = down_part.begin / intermediate;
+    const auto down_rows    = parent_rows(down_parent, intermediate, parameter, "down");
+    if (down_begin >= down_rows) { refuse(parameter, "down starts past its parent"); }
+    const auto down_available = down_rows - down_begin;
+    const bool down_whole     = down_available >= std::uint64_t(count) * hidden;
+    if (!down_whole && down_available != hidden) {
+        refuse(parameter, "down holds " + std::to_string(down_available) +
+                              " rows from expert 0, which is neither E*H (" +
+                              std::to_string(std::uint64_t(count) * hidden) + ") nor H (" +
+                              std::to_string(hidden) + ")");
+    }
+    if (down_part.end != down_part.begin + hidden * intermediate) {
+        refuse(parameter, "down does not hold exactly one expert's rows");
+    }
+    ExpertBankDescription out;
+    out.fused_         = true;
+    out.whole_bank_    = whole && down_whole;
+    out.count_         = count;
+    out.intermediate_  = intermediate;
+    out.hidden_        = hidden;
+    out.parameter_     = std::move(parameter);
+    out.gate_up_begin_ = gate_begin;
+    out.gate_begin_    = gate_begin;
+    out.up_begin_      = gate_begin + intermediate;
+    out.down_begin_    = down_begin;
+    if (out.whole_bank_) {
+        out.gate_up_ =
+            bank_view(parent, {gate_begin, count, per, per}, out.parameter_);
+        out.down_ = bank_view(down_parent, {down_begin, count, hidden, hidden}, out.parameter_);
+    }
+    return out;
+}
+
+ExpertBankDescription ExpertBankDescription::separate(const WeightView& gate, const WeightView& up,
+                                                      const WeightView& down, std::uint32_t count,
+                                                      std::uint64_t intermediate,
+                                                      std::string parameter) {
+    if (!count || !intermediate) { refuse(parameter, "a separate expert bank needs E and I"); }
+    const auto hidden = gate.shape.size() == 2 ? gate.shape[1] : 0;
+    if (!hidden) { refuse(parameter, "separate gate bank is not a matrix"); }
+    require_shape(gate, intermediate, hidden, parameter, "gate");
+    require_shape(up, intermediate, hidden, parameter, "up");
+    require_shape(down, hidden, intermediate, parameter, "down");
+    const auto& gate_part = single_part(gate, hidden, parameter, "gate");
+    const auto& up_part   = single_part(up, hidden, parameter, "up");
+    const auto& down_part = single_part(down, intermediate, parameter, "down");
+    if (gate_part.parent == up_part.parent) {
+        refuse(parameter, "separate banks cannot share the gate and up parent of the fused form");
+    }
+    const auto& gate_parent = *gate_part.parent;
+    const auto gate_begin   = gate_part.begin / hidden;
+    const auto up_begin     = up_part.begin / hidden;
+    const auto down_begin   = down_part.begin / intermediate;
+    const auto gate_rows    = parent_rows(gate_parent, hidden, parameter, "gate");
+    if (gate_begin >= gate_rows) { refuse(parameter, "gate starts past its parent"); }
+    const auto available = gate_rows - gate_begin;
+    const bool whole     = available == std::uint64_t(count) * intermediate;
+    if (!whole && available != intermediate) {
+        refuse(parameter, "gate holds " + std::to_string(available) + " rows from expert 0, "
+                              "which is neither E*I (" +
+                              std::to_string(std::uint64_t(count) * intermediate) + ") nor I (" +
+                              std::to_string(intermediate) + ")");
+    }
+    const auto& up_parent = *up_part.parent;
+    if (parent_rows(up_parent, hidden, parameter, "up") != gate_rows) {
+        refuse(parameter, "gate and up banks hold a different number of rows");
+    }
+    for (const auto& part : {gate_part, up_part}) {
+        if (part.end != part.begin + intermediate * hidden) {
+            refuse(parameter, "a separate gate/up block does not hold exactly one expert's rows");
+        }
+    }
+    const auto& down_parent = *down_part.parent;
+    const auto down_rows    = parent_rows(down_parent, intermediate, parameter, "down");
+    if (down_begin >= down_rows) { refuse(parameter, "down starts past its parent"); }
+    const auto down_available = down_rows - down_begin;
+    const bool down_whole     = down_available == std::uint64_t(count) * hidden;
+    if (!down_whole && down_available != hidden) {
+        refuse(parameter, "down holds " + std::to_string(down_available) +
+                              " rows from expert 0, which is neither E*H (" +
+                              std::to_string(std::uint64_t(count) * hidden) + ") nor H (" +
+                              std::to_string(hidden) + ")");
+    }
+    if (down_part.end != down_part.begin + hidden * intermediate) {
+        refuse(parameter, "down does not hold exactly one expert's rows");
+    }
+    ExpertBankDescription out;
+    out.fused_         = false;
+    out.whole_bank_    = whole && down_whole;
+    out.count_         = count;
+    out.intermediate_  = intermediate;
+    out.hidden_        = hidden;
+    out.parameter_     = std::move(parameter);
+    out.gate_begin_    = gate_begin;
+    out.up_begin_      = up_begin;
+    out.down_begin_    = down_begin;
+    out.gate_up_begin_ = gate_begin;
+    if (out.whole_bank_) {
+        out.gate_ =
+            bank_view(gate_parent, {gate_begin, count, intermediate, intermediate}, out.parameter_);
+        out.up_ =
+            bank_view(up_parent, {up_begin, count, intermediate, intermediate}, out.parameter_);
+        out.down_ = bank_view(down_parent, {down_begin, count, hidden, hidden}, out.parameter_);
+    }
+    return out;
+}
+
+ExpertBankDescription ExpertBankDescription::from_bindings(const WeightView& gate,
+                                                           const WeightView& up,
+                                                           const WeightView& down,
+                                                           std::uint32_t count,
+                                                           std::uint64_t intermediate,
+                                                           std::string parameter) {
+    if (!count || !intermediate || gate.shape.size() != 2 || up.shape != gate.shape ||
+        down.shape.size() != 2) {
+        refuse(parameter, "routed expert matrices are not the expected matrices of one bank");
+    }
+    const auto hidden = gate.shape[1];
+    // The form is the artifact's: one parent holding 2I rows per expert is the fused bank, three
+    // parents holding I, I and H rows are Qwen4Exp's independent banks. Anything else is refused
+    // here rather than sliced with the wrong row count.
+    const bool fused = gate.parts.size() == 1 && up.parts.size() == 1 &&
+                       gate.parts[0].parent != nullptr && gate.parts[0].parent == up.parts[0].parent;
+    return fused ? ExpertBankDescription::fused(gate, up, down, count, intermediate,
+                                               std::move(parameter))
+                 : ExpertBankDescription::separate(gate, up, down, count, intermediate,
+                                                   std::move(parameter));
+}
+
+const Weight& RoutedMoeParameters::fused_control() const {
+    if (split) {
+        throw std::invalid_argument(
+            split->parameter +
+            ": the artifact keeps the router and the shared logit in their own parents; the routed "
+            "kernel reads one fused [E+1,H] control matrix");
+    }
+    return control;
+}
+
+const ops::SwiGLUWeights& RoutedMoeParameters::fused_shared() const {
+    if (split) {
+        throw std::invalid_argument(
+            split->parameter +
+            ": the artifact keeps the shared expert's gate, up and down in their own parents; the "
+            "routed kernel reads one fused gate_up [2I,H]");
+    }
+    return shared;
+}
+
+namespace {
+
 class Prepare {
 public:
     explicit Prepare(const Model& model) : model_(model) {}
@@ -63,62 +369,61 @@ public:
                 linear(w.down)};
     }
 
-    WeightBankView expert_bank(const WeightView& first, std::uint32_t count,
-                               std::uint64_t rows, std::uint64_t columns) const {
-        if (first.parts.size() != 1 || !first.parts[0].parent) {
-            throw std::invalid_argument("expert bank requires one parent matrix");
+    // The fused [E+1,H] control rows, or nothing when the artifact keeps the router and the shared
+    // logit in their own parents (Qwen4Exp). The shapes are always checked, so a caller that reads
+    // the fused form never gets rows of the wrong width.
+    std::optional<Weight> control_weight(const MoeWeights& moe) const {
+        const auto& router_name = model_.weight(moe.router).name;
+        const auto& router      = model_.weight(moe.router).view;
+        const auto& score       = model_.weight(moe.shared_score).view;
+        if (router.shape.size() != 2 || score.shape.size() != 2 ||
+            router.shape.at(1) != score.shape.at(1) || score.shape.at(0) != 1) {
+            throw std::invalid_argument(router_name +
+                                        ": MoE control rows are not [E,H] followed by [1,H]");
         }
-        const auto& part = first.parts[0];
-        if (part.begin % columns) { throw std::invalid_argument("expert bank splits a row"); }
-        if (std::getenv("NINFER_BANK_DEBUG")) {
-            std::fprintf(stderr, "[bank] parent_rows=%llu cols=%llu count=%u rows=%llu begin=%llu\n",
-                         static_cast<unsigned long long>(part.parent->geometry.shape.empty()
-                                                             ? 0
-                                                             : part.parent->geometry.shape.front()),
-                         static_cast<unsigned long long>(columns), count,
-                         static_cast<unsigned long long>(rows),
-                         static_cast<unsigned long long>(part.begin));
-        }
-        return bind_weight_bank(
-            *part.parent,
-            describe_weight_bank(part.parent->geometry, {part.begin / columns, count, rows, rows}));
-    }
-
-    Weight control_weight(const MoeWeights& moe) const {
-        const auto& router = model_.weight(moe.router).view;
-        const auto& score  = model_.weight(moe.shared_score).view;
-        if (router.parts.size() != 1 || score.parts.size() != 1 ||
-            router.parts[0].parent != score.parts[0].parent ||
-            router.parts[0].end != score.parts[0].begin) {
-            throw std::invalid_argument("MoE control rows are not contiguous");
-        }
+        const bool fused = router.parts.size() == 1 && score.parts.size() == 1 &&
+                           router.parts[0].parent != nullptr &&
+                           router.parts[0].parent == score.parts[0].parent &&
+                           router.parts[0].end == score.parts[0].begin;
+        if (!fused) { return std::nullopt; }
         const auto rows = router.shape.at(0) + 1;
         return native_weight({{rows, router.shape.at(1)},
                               {{router.parts[0].parent, router.parts[0].begin,
                                 score.parts[0].end}}});
     }
 
-    ops::SwiGLUWeights shared_weights(const MoeWeights& moe) const {
+    // The fused gate_up [2I,H] plus down [H,I], or nothing when the shared expert's three matrices
+    // occupy their own parents (Qwen4Exp).
+    std::optional<ops::SwiGLUWeights> shared_weights(const MoeWeights& moe) const {
         const auto& gate = model_.weight(moe.shared.gate).view;
         const auto& up   = model_.weight(moe.shared.up).view;
-        if (gate.shape.size() != 2 || up.shape != gate.shape || gate.parts.size() != 1 ||
-            up.parts.size() != 1 || gate.parts[0].parent != up.parts[0].parent ||
-            gate.parts[0].end != up.parts[0].begin) {
-            throw std::invalid_argument("shared gate/up are not interleaved");
-        }
-        const auto rows  = gate.shape.at(0) * 2;
-        const auto fused = native_weight({{rows, gate.shape.at(1)},
-                                          {{gate.parts[0].parent, gate.parts[0].begin,
-                                            up.parts[0].end}}});
         const auto& down = model_.weight(moe.shared.down).view;
-        return {ops::SingleProjectionWeight{fused, ops::LinearPolicy::A16Only},
-                ops::SingleProjectionWeight{native_weight(down), ops::LinearPolicy::A16Only}};
+        if (gate.shape.size() != 2 || up.shape != gate.shape || down.shape.size() != 2 ||
+            down.shape.at(0) != gate.shape.at(1) || down.shape.at(1) != gate.shape.at(0)) {
+            throw std::invalid_argument(model_.weight(moe.shared.gate).name +
+                                        ": shared expert matrices have inconsistent shapes");
+        }
+        const bool fused = gate.parts.size() == 1 && up.parts.size() == 1 &&
+                           gate.parts[0].parent != nullptr &&
+                           gate.parts[0].parent == up.parts[0].parent &&
+                           gate.parts[0].end == up.parts[0].begin;
+        if (!fused) { return std::nullopt; }
+        const auto rows  = gate.shape.at(0) * 2;
+        const auto fused_gate_up = native_weight({{rows, gate.shape.at(1)},
+                                                  {{gate.parts[0].parent, gate.parts[0].begin,
+                                                    up.parts[0].end}}});
+        return ops::SwiGLUWeights{ops::SingleProjectionWeight{fused_gate_up,
+                                                            ops::LinearPolicy::A16Only},
+                                  ops::SingleProjectionWeight{native_weight(down),
+                                                              ops::LinearPolicy::A16Only}};
     }
 
     RoutedMoeParameters routed_moe(const MoeWeights& moe) const {
         const auto count = static_cast<std::uint32_t>(moe.experts.size());
         if (count == 0) { throw std::invalid_argument("MoE has no experts"); }
-        constexpr std::int32_t top_k = 8;
+        const auto top_k = static_cast<std::int32_t>(
+            std::get<MoeConfig>(model_.config().text.ffn).num_experts_per_tok);
+        if (top_k <= 0) { throw std::invalid_argument("MoE declares no top-k route"); }
         const auto& gate = model_.weight(moe.experts.front().gate).view;
         const auto& up   = model_.weight(moe.experts.front().up).view;
         const auto& down = model_.weight(moe.experts.front().down).view;
@@ -126,46 +431,59 @@ public:
             throw std::invalid_argument("MoE expert matrices must be 2D");
         }
         const auto intermediate = gate.shape.at(0);
-        if (down.shape.at(1) != intermediate) {
-            throw std::invalid_argument("MoE expert down differs in I");
+        const auto hidden       = gate.shape.at(1);
+        if (down.shape.at(1) != intermediate || down.shape.at(0) != hidden) {
+            throw std::invalid_argument("MoE expert down differs in H or I");
         }
-        // port (sm_89): a streamed bank has no bytes at load time, so its layout and profile come
-        // from the artifact description instead of a bound parent.
-        if (gate.parts.at(0).parent == nullptr || gate.parts.at(0).parent->data == nullptr ||
-            gate.parts.at(0).parent->device.type() != DeviceType::CUDA) {
+        // The banks are read off the artifact's own row blocks. qwen3_5 fuses gate|up into one
+        // parent, Qwen4Exp keeps three; a bank that matches neither is refused here, which is what
+        // stops a 2I-row slice from being taken out of an I-row bank.
+        const auto banks = ExpertBankDescription::from_bindings(
+            gate, up, down, count, intermediate, model_.weight(moe.experts.front().gate).name);
+        const auto control = with_context(model_.weight(moe.router).name,
+                                          [&] { return control_weight(moe); });
+        const auto shared  = with_context(model_.weight(moe.shared.gate).name,
+                                          [&] { return shared_weights(moe); });
+
+        if (banks.fused_form() && control && shared) {
             const auto& gate_parent = *gate.parts.at(0).parent;
             const auto& down_parent = *down.parts.at(0).parent;
-            const auto columns      = gate_parent.geometry.shape.back();
+            // port (sm_89): a streamed bank has no bytes at load time, so its layout and profile
+            // come from the artifact description instead of a bound parent.
+            const bool resident = banks.whole_bank() && gate_parent.data != nullptr &&
+                                  gate_parent.device.type() == DeviceType::CUDA;
+            if (resident) {
+                const auto& gate_up   = banks.bank(ExpertBankRole::GateUp);
+                const auto& down_bank = banks.bank(ExpertBankRole::Down);
+                RoutedMoeParameters out;
+                out.control = *control;
+                out.shared  = *shared;
+                out.routed  = {device_expert_bank(gate_up, down_bank), {}};
+                out.profile = {ops::routed_swiglu_profile(gate_up, down_bank, top_k,
+                                                          ops::LinearPolicy::A16Only,
+                                                          ops::LinearPolicy::A16Only),
+                               ops::swiglu_profile(out.shared)};
+                return out;
+            }
             // port (sm_89): an artifact that keeps one object per expert gives this weight a parent
             // of exactly one expert's rows, so a bank-wide region would run past it. The bank keeps
             // the same per-expert shape either way; only where the row block starts differs.
-            const auto gate_up_rows = static_cast<std::uint64_t>(2 * intermediate);
-            const auto down_rows    = static_cast<std::uint64_t>(down.shape.at(0));
-            const bool per_expert_artifact = gate_parent.geometry.shape.front() == gate_up_rows &&
-                                             down_parent.geometry.shape.front() == down_rows;
             auto gate_up_layout =
-                per_expert_artifact
-                    ? describe_weight_bank(gate_parent.geometry, {0, 1, gate_up_rows, gate_up_rows})
-                    : describe_weight_bank(gate_parent.geometry,
-                                           {gate.parts.at(0).begin / columns, count, gate_up_rows,
-                                            gate_up_rows});
-            const auto down_columns = down_parent.geometry.shape.back();
-            auto down_layout =
-                per_expert_artifact
-                    ? describe_weight_bank(down_parent.geometry, {0, 1, down_rows, down_rows})
-                    : describe_weight_bank(down_parent.geometry,
-                                           {down.parts.at(0).begin / down_columns, count, down_rows,
-                                            down_rows});
-            if (per_expert_artifact) {
+                banks.whole_bank()
+                    ? banks.layout(ExpertBankRole::GateUp)
+                    : describe_weight_bank(gate_parent.geometry, {0, 1, 2 * intermediate,
+                                                                 2 * intermediate});
+            auto down_layout = banks.whole_bank()
+                                   ? banks.layout(ExpertBankRole::Down)
+                                   : describe_weight_bank(down_parent.geometry, {0, 1, hidden, hidden});
+            if (!banks.whole_bank()) {
                 // The bank still holds `count` experts; only its object layout is per expert.
                 gate_up_layout.region.count = count;
                 down_layout.region.count    = count;
             }
             RoutedMoeParameters streamed;
-            streamed.control = with_context(model_.weight(moe.router).name, [&] {
-                return control_weight(moe);
-            });
-            streamed.shared = shared_weights(moe);
+            streamed.control = *control;
+            streamed.shared  = *shared;
             // port (sm_89): an artifact may hold one object per expert, which lets the loader copy a
             // whole expert with one range instead of six. Collect the handle per expert; a fused
             // artifact repeats the same value here and the stream stays on the single-object path.
@@ -188,27 +506,52 @@ public:
                 ops::swiglu_profile(streamed.shared)};
             return streamed;
         }
-        const auto gate_up   = expert_bank(gate, count, 2 * intermediate, gate.shape.at(1));
-        const auto down_bank = expert_bank(down, count, down.shape.at(0), down.shape.at(1));
-        RoutedMoeParameters out;
-        out.control = with_context(model_.weight(moe.router).name, [&] {
-            return control_weight(moe);
+
+        // Qwen4Exp keeps the router, the shared logit, the shared expert and the three expert banks
+        // in their own parents. Describe each of them as the artifact stores it; the fused form the
+        // routed kernel reads is refused by the accessors above, not approximated here.
+        if (!banks.whole_bank()) {
+            throw std::invalid_argument(
+                banks.parameter() +
+                ": one expert per object cannot be combined with separate router/shared parents");
+        }
+        MoeSplitParameters split;
+        split.parameter    = banks.parameter();
+        split.router       = with_context(model_.weight(moe.router).name, [&] {
+            return native_weight(model_.weight(moe.router).view);
         });
-        out.shared  = shared_weights(moe);
-        out.routed  = {device_expert_bank(gate_up, down_bank), {}};
-        out.profile = {ops::routed_swiglu_profile(gate_up, down_bank, top_k,
-                                                  ops::LinearPolicy::A16Only,
-                                                  ops::LinearPolicy::A16Only),
-                       ops::swiglu_profile(out.shared)};
+        split.shared_score = with_context(model_.weight(moe.shared_score).name, [&] {
+            return native_weight(model_.weight(moe.shared_score).view);
+        });
+        split.shared_gate  = linear(moe.shared.gate);
+        split.shared_up    = linear(moe.shared.up);
+        split.shared_down  = linear(moe.shared.down);
+        split.experts      = banks;
+
+        const auto& gate_layout =
+            banks.layout(banks.fused_form() ? ExpertBankRole::GateUp : ExpertBankRole::Gate);
+        const auto& down_layout = banks.layout(ExpertBankRole::Down);
+        const auto& shared_gate = split.shared_gate.weight;
+        const auto& shared_down = split.shared_down.weight;
+        RoutedMoeParameters out;
+        out.profile = {
+            ops::RoutedSwiGLUProfile{
+                {dimension(hidden), dimension(intermediate), gate_layout.format, down_layout.format,
+                 gate_layout.layout, down_layout.layout, ops::LinearPolicy::A16Only,
+                 ops::LinearPolicy::A16Only},
+                dimension(count), top_k},
+            ops::SwiGLUProfile{dimension(shared_gate.k), dimension(shared_gate.n), shared_gate.qtype,
+                               shared_down.qtype, shared_gate.layout, shared_down.layout,
+                               ops::LinearPolicy::A16Only, ops::LinearPolicy::A16Only}};
+        out.split = std::move(split);
         return out;
     }
 
     FfnParameters ffn(const BlockWeights& w) const {
         if (const auto* d = std::get_if<DenseWeights>(&w.ffn)) { return dense(*d); }
         const auto& moe = std::get<MoeWeights>(w.ffn);
-        if (std::get<MoeConfig>(model_.config().text.ffn).num_experts_per_tok != 8) {
-            throw std::invalid_argument("MoE implements top-8 routing");
-        }
+        // The route width is the config's: qwen3_5 routes 8, Qwen4Exp 10, and the routing Op
+        // validates its own (H,E,K) profile.
         // port (sm_89): the shipped sparse MoE prefill kernel cannot index this artifact's expert
         // bank - it hardcodes 1024 rows per expert and stages no usable scales, so it writes a
         // zero routed term and the layer silently degenerates to the shared expert alone

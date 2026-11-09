@@ -9,6 +9,7 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <variant>
 #include <vector>
 
@@ -23,12 +24,81 @@ using LinearParameters = ops::SingleProjectionWeight;
     return static_cast<std::int32_t>(value);
 }
 
+// Which matrix of a routed layer a bank names.
+enum class ExpertBankRole { GateUp, Gate, Up, Down };
+
+// The routed experts of one layer as their artifact stores them.
+//
+// qwen3_5 keeps gate and up adjacent inside one parent, so expert e owns rows [e*2I, (e+1)*2I) of
+// that matrix (gate rows first, then up rows). Qwen4Exp keeps three independent banks, so expert e
+// owns rows [e*I, (e+1)*I) of gate, the same block of up, and rows [e*H, (e+1)*H) of down.
+//
+// The form is read off the parents, never assumed: a bank whose rows match neither form is refused
+// under its logical parameter name. `block()` is the only way to address one expert, so a caller
+// can never quietly read the neighbouring expert's rows.
+class ExpertBankDescription {
+public:
+    [[nodiscard]] static ExpertBankDescription
+    from_bindings(const WeightView& gate, const WeightView& up, const WeightView& down,
+                  std::uint32_t count, std::uint64_t intermediate, std::string parameter);
+    [[nodiscard]] static ExpertBankDescription fused(const WeightView& gate, const WeightView& up,
+                                                     const WeightView& down, std::uint32_t count,
+                                                     std::uint64_t intermediate,
+                                                     std::string parameter);
+    [[nodiscard]] static ExpertBankDescription separate(const WeightView& gate, const WeightView& up,
+                                                        const WeightView& down, std::uint32_t count,
+                                                        std::uint64_t intermediate,
+                                                        std::string parameter);
+
+    [[nodiscard]] bool fused_form() const noexcept { return fused_; }
+    // False when one object holds one expert: the same rows, but no bank-wide parent to view.
+    [[nodiscard]] bool whole_bank() const noexcept { return whole_bank_; }
+    [[nodiscard]] std::uint32_t count() const noexcept { return count_; }
+    [[nodiscard]] std::uint64_t intermediate() const noexcept { return intermediate_; }
+    // Per-expert rows of one bank. GateUp is the fused block width (2I), which no separate bank
+    // holds; asking a separate description for that bank is refused by `bank()`.
+    [[nodiscard]] std::uint64_t rows(ExpertBankRole role) const;
+
+    // The bank-wide view, one entry per expert in expert order. A role the description does not
+    // carry, or a bank whose parent does not hold every expert, is refused by parameter name.
+    [[nodiscard]] const WeightBankView& bank(ExpertBankRole role) const;
+    // The pointer-free layout of one bank; available even when the parent holds one expert.
+    [[nodiscard]] const WeightBankLayout& layout(ExpertBankRole role) const;
+    // The row block expert `expert` occupies in `role`.
+    [[nodiscard]] WeightBankRegion block(ExpertBankRole role, std::uint32_t expert) const;
+    [[nodiscard]] const std::string& parameter() const noexcept { return parameter_; }
+
+private:
+    bool fused_          = true;
+    bool whole_bank_     = true;
+    std::uint32_t count_ = 0;
+    std::uint64_t intermediate_ = 0;
+    std::uint64_t hidden_       = 0;
+    // Where expert 0's block starts in each bank's parent, so a parent may carry a prefix.
+    std::uint64_t gate_up_begin_ = 0;
+    std::uint64_t gate_begin_    = 0;
+    std::uint64_t up_begin_      = 0;
+    std::uint64_t down_begin_    = 0;
+    std::string parameter_;
+    std::optional<WeightBankView> gate_up_, gate_, up_, down_;
+};
+
 struct DenseParameters {
     LinearParameters gate_up;
     LinearParameters down;
 };
 
 class ExpertStream;
+
+// Qwen4Exp keeps the routed control rows, the shared expert and the three expert banks in their
+// own parents instead of the fused matrices qwen3_5 carries. Every field is the artifact's own
+// matrix, so nothing here is a re-slice of a neighbour's rows.
+struct MoeSplitParameters {
+    std::string parameter;               // the expert bank this layer describes, for refusals
+    Weight router, shared_score;         // BF16 [E,H] and [1,H]
+    LinearParameters shared_gate, shared_up, shared_down;
+    ExpertBankDescription experts;
+};
 
 // port (sm_89): the bench routed-MoE view of the same artifact tensors. Experts form one affine
 // bank per layer (experts/e/gate, experts/e/up interleaved), so the routed kernel reads them
@@ -40,6 +110,13 @@ struct RoutedMoeParameters {
     ops::CudaSwiGLUExperts routed;
     // port (sm_89): non-null when the experts stream from the artifact instead of being resident.
     std::shared_ptr<ExpertStream> stream;
+    // Non-null when the artifact keeps those matrices apart (Qwen4Exp). The fused members above
+    // then hold nothing, and a caller that needs a fused form asks the accessors below and is
+    // refused by name instead of multiplying by an empty matrix.
+    std::optional<MoeSplitParameters> split;
+
+    [[nodiscard]] const Weight& fused_control() const;
+    [[nodiscard]] const ops::SwiGLUWeights& fused_shared() const;
 };
 
 using FfnParameters =

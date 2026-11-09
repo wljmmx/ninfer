@@ -36,9 +36,15 @@ struct BoundWeight {
     std::vector<WeightUse> uses;
 };
 
+struct IndexerWeights {
+    WeightId query, key, query_norm, key_norm;
+};
+
 struct AttentionWeights {
     WeightId query, key, gate, value;
     WeightId query_norm, key_norm, output;
+    // Qwen4Exp's sparse indexer: small heads that score KV blocks before the main softmax.
+    std::optional<IndexerWeights> indexer;
 };
 
 struct GdnWeights {
@@ -51,6 +57,19 @@ struct DenseWeights {
     WeightId gate, up, down;
 };
 
+// The low-rank correction Qwen4Exp applies around a grouped stream norm. The norm itself is the
+// block's input_norm / post_attention_norm; the final correction has no injection stream.
+struct HcWeights {
+    WeightId down, up;
+    std::optional<WeightId> inject;
+};
+
+// One paged table row per hash head, folded into the residual on the layer's own input.
+struct PleWeights {
+    WeightId key, value;
+    WeightId norm_key, norm_query, norm_conv, convolution, table;
+};
+
 struct MoeWeights {
     WeightId router, shared_score;
     std::vector<DenseWeights> experts;
@@ -59,12 +78,17 @@ struct MoeWeights {
 
 struct BlockWeights {
     WeightId input_norm, post_attention_norm;
+    // Qwen4Exp streams the residual through the mixer and the MoE behind their own corrections.
+    std::optional<HcWeights> input_hc;
+    std::optional<HcWeights> post_attention_hc;
+    std::optional<PleWeights> ple;
     std::variant<AttentionWeights, GdnWeights> mixer;
     std::variant<DenseWeights, MoeWeights> ffn;
 };
 
 struct TextWeights {
     WeightId token_embedding, output_head, final_norm;
+    std::optional<HcWeights> final_hc;
     WeightUseId output_head_use;
     std::vector<BlockWeights> layers;
 };
