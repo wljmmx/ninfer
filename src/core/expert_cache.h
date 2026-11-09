@@ -23,6 +23,11 @@ namespace ninfer {
 // window; uploads are batched per slot and observed without blocking the caller.
 struct ExpertCacheConfig {
     std::uint64_t capacity_bytes = 0; // pool bytes, 256-aligned
+    // Address-space reservation ceiling for runtime growth. 0 means "same as capacity_bytes"
+    // (the historical behaviour: the pool could only shrink). When set higher, the VMM range is
+    // reserved to this size at construction and only the capacity_bytes slots are mapped, so
+    // resize() can grow up to the ceiling by mapping segments from the driver on demand.
+    std::uint64_t capacity_limit_bytes = 0;
     std::size_t max_batch_bytes   = 32U * 1024U * 1024U;
     std::uint32_t upload_slots    = 2;
 

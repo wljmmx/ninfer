@@ -132,23 +132,28 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     // because an evicted slot is handed to whichever bank needs it next.
     const auto entry = probe.max_entry_bytes;
     auto requested   = options.expert_cache_bytes;
+    // The KV arena is planned first and already knows its exact reservation, so the pool takes
+    // everything above it instead of guessing a fixed 6 GiB: on a 256K/k8v4 run that guess left
+    // 3.8 GiB idle while 28% of the experts still streamed from the host.
+    std::size_t free_bytes = 0, total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess || free_bytes == 0) {
+        throw std::runtime_error("expert cache sizing cannot read device memory");
+    }
+    // Graph capture and the staging buffers still need room after the pool takes its share; that
+    // allowance is the configurable startup planning headroom (not the KV sizing headroom, which
+    // resolve_kv_capacity already left free when the arena was planned).
+    const auto split = core::plan_device_split(free_bytes, kv_reserve_bytes,
+                                               options.startup_planning_headroom_bytes);
     if (requested == kExpertCacheAuto) {
-        // The KV arena is planned first and already knows its exact reservation, so the pool takes
-        // everything above it instead of guessing a fixed 6 GiB: on a 256K/k8v4 run that guess
-        // left 3.8 GiB idle while 28% of the experts still streamed from the host.
-        std::size_t free_bytes = 0, total_bytes = 0;
-        if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess || free_bytes == 0) {
-            throw std::runtime_error("expert cache auto sizing cannot read device memory");
-        }
-        // Graph capture and the staging buffers still need room after the pool takes its share;
-        // that allowance is the configurable startup planning headroom (not the KV sizing
-        // headroom, which resolve_kv_capacity already left free when the arena was planned).
-        const auto split =
-            core::plan_device_split(free_bytes, kv_reserve_bytes,
-                                    options.startup_planning_headroom_bytes);
         core::report_device_split(split, free_bytes);
         requested = split.pool_bytes;
     }
+    // The VMM reservation is the growth ceiling. Reserve the auto-sized maximum even when the
+    // caller pinned a smaller live pool: the L1 slow dial's upward steps then map segments from the
+    // driver instead of being clamped at the construction size (slots_max == slots_live was the
+    // measured ceiling that made every grow a no-op). A caller asking for more than auto gets its
+    // own number as the ceiling.
+    const std::size_t pool_limit = std::max<std::size_t>(requested, split.pool_bytes);
     // Whole windows only: a partial window is dead space and would make the slot count odd.
     std::uint64_t widest = 0;
     for (const auto& spec : specs) { widest = std::max<std::uint64_t>(widest, spec.count); }
@@ -162,8 +167,13 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
         throw std::invalid_argument("expert cache holds less than one expert window (" +
                                     std::to_string(entry * widest) + " bytes)");
     }
+    // The ceiling is aligned like the live capacity so slots_max is always a whole slot count.
+    const auto capacity_limit = std::max<std::uint64_t>(
+        capacity, static_cast<std::uint64_t>(pool_limit) / entry * entry);
     expert_debug("capacity", capacity, entry);
-    const auto requirements = describe_expert_cache(specs, {.capacity_bytes = capacity});
+    const auto requirements =
+        describe_expert_cache(specs, {.capacity_bytes = capacity,
+                                      .capacity_limit_bytes = capacity_limit});
 
     std::vector<ExpertFileBank> files;
     files.reserve(streams.size());

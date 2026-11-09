@@ -296,15 +296,22 @@ std::vector<std::uint64_t> bank_generation;
         if (pool_slots == 0) {
             throw std::invalid_argument("expert cache holds no complete expert slot");
         }
+        // The reservation is the growth ceiling, not the live pool: VmmPool reserves virtual
+        // address space and maps segments on demand, so reserving room for the auto-sized maximum
+        // while only capacity_bytes slots start mapped costs no device memory and makes the L1
+        // dial's upward steps reachable (the 2026-11-05 acceptance measured the old behaviour:
+        // slots_max == slots_live, so every grow was clamped back).
+        const auto limit_bytes = std::max(req.config.capacity_bytes,
+                                          req.config.capacity_limit_bytes);
         const auto reserved = static_cast<std::size_t>(
-            (req.config.capacity_bytes + kSegmentBytes - 1) / kSegmentBytes * kSegmentBytes);
+            (limit_bytes + kSegmentBytes - 1) / kSegmentBytes * kSegmentBytes);
         pool = std::make_unique<VmmPool>(Device::cuda(ordinal), reserved, kSegmentBytes);
         slots_max  = reserved / slot_bytes;
         slots_live = pool_slots;
         // A pool narrower than one hot set per bank cannot give every bank its own run: narrow the
-        // hot set instead of addressing past the reservation.
+        // hot set instead of addressing past the live pool (growth adds windows, not a wider one).
         if (layer_count != 0) {
-            const auto per_bank = slots_max / layer_count;
+            const auto per_bank = slots_live / layer_count;
             if (per_bank == 0) {
                 throw std::invalid_argument("expert pool cannot hold one slot per bank");
             }
