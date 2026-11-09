@@ -201,3 +201,29 @@ ok: every upstream commit up to the tip has a disposition row.
 - `needs-review` 9 条全部是上游 `docs` 提交（`b963bf96`、`19c3a2ae`、`a78bf9ec`、`af26313c`、`c72ba1b9`、`05327b22`、`6e772ee3`、`f1ace85e`、`fbd285b5`），证据列留空，等人工一次性定处置。
 - `dead` 151＝T001 封口池与 T013/T108，加 register 明写「不搬入 / 不跟随」的条目（T120、T123、T124、T145 五条、T149、T151、T163、T127 的 Docker 条）。
 - 每次上游前移，先跑脚本拿 `NO ROW` 清单，补行（同一规则表），再看退出码是否回到 0。
+
+## 8. 更正 6.1 的两行：QSA/HC 内核**本地已有**，缺的是格式与接线（2026-11-10）
+
+§6 的表按**路径**比对上游目录，把命名不同当成了缺失。逐文件核对后更正：
+
+| 上游路径 | 本地实际 | 结论 |
+|---|---|---|
+| `qsa/indexer/{score,select,work_map,plan,launch}`, `qsa/prepare/{kernel,norm_rope,cache}`, `qsa/sparse_gqa/{kernel,tile,prefill,simt,epilogue}` | 本地是**扁平同名**文件：`qsa/indexer_{score,select,launch}.cu(h)`、`qsa/prepare_{kernel,cache}.cuh`、`qsa/sparse_gqa_{kernel,tile,prefill,simt}.cuh`，且已进 `qsa/sources.cmake`、随 `ninfer_ops` 编译 | **已移植**，不是缺失；本地没有的是上游的 `rtx5090/`、`dgx_spark/` 两个硬件变体目录（sm_89 本来就不适用） |
+| `gated_residual/mix/*`, `norm_combine/*` | 本地 `gated_residual/mix/{launch,plan,operands,mix.cpp}` + `mix/kernel/{up_mma_mix,up_tma_mix,output,shared_layout,math}` + `kernel/{combine,norm}` | **已移植**（含 MMA 与 TMA 两条），同样缺 `rtx5090/`、`dgx_spark/` 变体 |
+| `ple/*`、`models/qwen4_exp/ple/*` | 8 + 12 文件齐 | 已移植 |
+
+因此 M4 的真缺口不是"移植内核"，而是下面三类**本地化**工作：
+
+1. **格式接纳**（sm_89 路线的核心）：
+   - QSA 输入投影只认 `Q8 [6144,6144]` 或 BF16；工件是 **Q4 [12288,2560]**（query+gate 同父）+ Q4/Q5 的 K/V、Q4 index_key；
+   - HC `mix` 只认 **BF16 contiguous**；工件存 **Q5**（`[320,10240]`/`[10240,320]`/`[4,10240]`）；
+   - PLE 表是 **q4 136 B/行**，`PleTableSource` 只吃 NF4 90 B/行。
+2. **模型层接线**：`text.cpp` 的 indexed 层仍打印 "QSA not wired yet (M4)" 并退回 full attention；HC 的四流混合、PLE 的第 2 层注入都没有进 `run_layers`。
+3. **sm_89 路径选择**：`up_tma_mix` 走 TMA（sm_90+），4090 必须走 `up_mma_mix`/SIMT；QSA 的三个内核要确认没有 `cp.async.bulk`/`wgmma`/cluster 依赖（本地已按 sm_89 编过，仍需按形状实测）。
+
+### 8.1 单独立项：`ninfer_qwen3_5_moe_real_test` 的 0xC0000005
+
+- 现象：`exercise_maximum_configuration`（256K 最大配置 + "routed experts in host RAM" 回退）崩 `0xC0000005`，最后一行日志固定在
+  `[budget][split] free=20478 MiB kv=3118 MiB pool=16336 MiB safety=1024 MiB by:curve: affordable`。
+- 归因：A2 时把 `expert_stream.{h,cpp}` 与 `ffn.cpp` 回退到基线 `98c3f24d` 重建，崩点与日志逐字相同 → **基线既有**，与 A1–A4 无关。
+- 处置：登记为本文件外的独立项（不阻塞 Qwen4Exp 路线），需要时按"最大配置 + host 专家回退"单独复现与定位。
