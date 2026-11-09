@@ -36,6 +36,7 @@ ninfer_bench ... -n 128       --kv-dtype int8
 | `pp2048+tg128` DFlash7, rk4v4-e8 | `pp2048+tg128` | **prefill 2,270 / decode 546.6 tok/s** (acc 88.0%, len 7.11) |
 | `pp8192+tg128` no speculation, INT8 KV | `pp8192+tg128` | **prefill 12,377 / decode 236.1 tok/s** |
 | `pp8192+tg128` no speculation, rk4v4-e8 | `pp8192+tg128` | **prefill 12,141 / decode 234.6 tok/s** |
+| `pp32768+tg128` no speculation, rk4v4-e8 (`-r 3`, max-ctx 40960) | `pp32768+tg128` | **prefill 724.5 / decode 45.4 tok/s** |
 | `tg128` DFlash4, rk4v4-e8 (cold corpus) | `tg128` | **decode 234.6 tok/s** (acc 18.0%, len 1.72) |
 | `tg128` no speculation, INT8 KV | `tg128` | **decode 248.7 tok/s** |
 
@@ -130,11 +131,12 @@ first token is the prefill bonus sample, so the draft path changes what the pref
 a verification/bonus-token question that needs its own investigation and is not a prefill-speed
 matter.
 
-The `pp32768+tg128` row is **not measured** in this pass. The full-residency pool leaves enough
-KV for rk4v4-e8 at 32k, but the long prefill exceeded this pass's wall-clock budget (the run was
-stopped after 19 minutes without completing a warm-up plus three measured passes), and the
-streaming profile is still being tuned with the CPU-partition line. It is left as unmeasured
-rather than estimated; the dense 27B page carries the long-context reference point.
+The `pp32768+tg128` row is measured **without speculation** under the same full-residency pool:
+prefill 724.5 tok/s, decode 45.4 tok/s (`-r 3`, rk4v4-e8, `--max-ctx 40960`). Long-context
+attention, not the expert tier, is the binding cost there — the same command at 8,192 context
+measures 12,141 / 234.6. The DFlash variant of this row is not published: the draft pass over a
+32k prompt plus the draft KV pushes the pool off full residency on a 24 GB card, and the
+identical command measured anywhere from 40 to 2,910 tok/s depending on where the pool landed.
 
 ---
 
