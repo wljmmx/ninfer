@@ -32,9 +32,13 @@ struct RouteSpec {
     Q5LinearAddScheduleId schedule;
 };
 
-constexpr std::array<SupportSpec, 2> kSupports{{
+constexpr std::array<SupportSpec, 3> kSupports{{
     {5120, 6144, 6144},
     {5120, 17408, 17408},
+    // Qwen4Exp (H = 2560) GDN output projection: 2560 rows over K = 6144. Every rung of
+    // kK6144Routes is row-tile shaped (rows per CTA 16/32/64, rows per GEMV block 8) and
+    // 2560 = 160 x 16 = 80 x 32 = 40 x 64 = 320 x 8, so the 6144 table is used unchanged.
+    {2560, 6144, 6144},
 }};
 
 constexpr std::array<RouteSpec, 13> kK6144Routes{{

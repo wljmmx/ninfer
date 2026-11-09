@@ -16,6 +16,7 @@ using Geom6144x5120  = Q5SmallTGeometry<6144, 5120>;
 using Geom7168x5120  = Q5SmallTGeometry<7168, 5120>;
 using Geom5120x6144  = Q5SmallTGeometry<5120, 6144>;
 using Geom5120x17408 = Q5SmallTGeometry<5120, 17408>;
+using Geom2560x6144  = Q5SmallTGeometry<2560, 6144>;
 
 template <class Geometry, int TileTokens, int ActiveTokens>
 void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
@@ -132,6 +133,10 @@ constexpr auto kResidualDeterministic5120x6144 =
     make_residual_deterministic_launchers<Geom5120x6144>(std::make_index_sequence<16>{});
 constexpr auto kResidualDeterministic5120x17408 =
     make_residual_deterministic_launchers<Geom5120x17408>(std::make_index_sequence<16>{});
+// Qwen4Exp GDN output (H = 2560): same 16-row CTAs (2560 = 160 x 16) over 12 whole
+// 512-wide K groups, so the KSplits = 1 deterministic residual partition is exact.
+constexpr auto kResidualDeterministic2560x6144 =
+    make_residual_deterministic_launchers<Geom2560x6144>(std::make_index_sequence<16>{});
 
 } // namespace
 
@@ -200,6 +205,10 @@ void launch_q5_linear_add_small_t_mma_deterministic(const Tensor& x, const Weigh
 
     if (weight.n == 5120 && weight.k == 6144) {
         kResidualDeterministic5120x6144[idx](x, weight, residual_out, stream);
+        return;
+    }
+    if (weight.n == 2560 && weight.k == 6144) {
+        kResidualDeterministic2560x6144[idx](x, weight, residual_out, stream);
         return;
     }
     if (weight.n == 5120 && weight.k == 17408) {

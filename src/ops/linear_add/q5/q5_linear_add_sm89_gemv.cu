@@ -24,6 +24,13 @@ void q5_linear_add_gemv_residual_launch(const Tensor& x, const Weight& w, Tensor
     if (w.n == 5120 && w.k == 6144 && w.padded_shape[1] == 6144) {
         q5_rowsplit_gemv_residual_launch_kernel<5120, 6144, 8, 3, true>(xp, codes, high, scales,
                                                                          out, stream);
+    } else if (w.n == 2560 && w.k == 6144 && w.padded_shape[1] == 6144) {
+        // Qwen4Exp GDN output (H = 2560). Same 16-group tile walk (6144 = 96 groups = 6 tiles)
+        // and the same warp-per-row/8-rows-per-block/3-stage/stage-x recipe: 2560 = 320 x 8
+        // keeps the grid at 320 blocks (>= 2 per SM on 128 SMs), and x (12 KiB) plus the
+        // 3-deep weight buffers (15.75 KiB) stay far inside the 100 KiB shared budget.
+        q5_rowsplit_gemv_residual_launch_kernel<2560, 6144, 8, 3, true>(xp, codes, high, scales,
+                                                                        out, stream);
     } else if (w.n == 5120 && w.k == 17408 && w.padded_shape[1] == 17408) {
         q5_rowsplit_gemv_residual_launch_kernel<5120, 17408, 16, 2, false>(xp, codes, high, scales,
                                                                            out, stream);

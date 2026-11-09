@@ -185,7 +185,8 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
 
     if (w.qtype == QType::Q5_G64_FP16) {
         require_q5(w);
-        const bool supported_shape = (w.n == 5120 && w.k == 17408) || (w.n == 5120 && w.k == 6144);
+        const bool supported_shape = (w.n == 5120 && w.k == 17408) || (w.n == 5120 && w.k == 6144) ||
+                                     (w.n == 2560 && w.k == 6144);
         if (!supported_shape) { throw std::invalid_argument("linear_add: unsupported Q5 shape"); }
         if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16) ||
             !aligned_to(w.qdata, 16) || !aligned_to(w.qhigh, 16) || !aligned_to(w.scales, 16)) {

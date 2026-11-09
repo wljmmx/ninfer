@@ -28,6 +28,20 @@ int q5_a16_conformance() {
             "Q5_A16 LinearAdd", WeightFormat::Q5G64F16S,
             ShapeCase{5120, k, 401U, no_starts, full, {}, true, 0});
     }
+
+    // Qwen4Exp (H = 2560) GDN output projection [2560, 6144]. The K = 6144 rung table is reused
+    // unchanged: every rung is row-tile shaped and 2560 divides by each tile (GEMV block 8,
+    // CTA rows 16/32/64), so the same transitions and the same 512-wave composite tail are
+    // probed here. 14 and 15 are added to the interiors: they are the first two columns of the
+    // 14..16 MMA rung, which the shared T sequence otherwise only reaches at 16.
+    constexpr std::array<std::int32_t, 15> interiors2560{1,  2,   3,   7,   13,  14,  15,  20,
+                                                         40, 80,  112, 144, 224, 768, 1024};
+    failures += ninfer::test::linear_add::run_shape(
+        "Q5_A16 LinearAdd", WeightFormat::Q5G64F16S,
+        ShapeCase{2560, 6144, 403U, starts, interiors2560, graphs, false, 512});
+    failures += ninfer::test::linear_add::run_shape(
+        "Q5_A16 LinearAdd", WeightFormat::Q5G64F16S,
+        ShapeCase{2560, 6144, 403U, no_starts, full, {}, true, 0});
     return failures;
 }
 
