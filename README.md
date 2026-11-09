@@ -264,15 +264,17 @@ decode can be compared with and without the draft pass.
 | `pp4096` | 3,215 tok/s prefill | 11,434 tok/s prefill |
 | `pp32768+tg128` (spec 7, rk4v4-e8) | 2,643 / 232.1 tok/s (acc 100%, len 8.00) | not measured ¹ |
 | `pp2048+tg128` (spec 7, INT8 KV) | 3,309 / 223.8 (acc 88.0%, len 7.11) | 2,225 / 522.8 (acc 88.0%, len 7.11) |
+| `pp2048+tg128` (MTP7, INT8 KV) | 3,309 / 223.8 | 127.8 / 76.1 (acc 88.0%) |
 | `pp2048+tg128` (spec 7, rk4v4-e8) | 3,112 / 188.5 (acc 82.6%, len 6.74) | 2,270 / 546.6 (acc 88.0%, len 7.11) |
 | `pp8192+tg128` (no spec, INT8 KV) | — | 12,377 / 236.1 |
 | `pp8192+tg128` (no spec, rk4v4-e8) | — | 12,141 / 234.6 |
+| `pp32768+tg128` (no spec, rk4v4-e8) | — | 724.5 / 45.4 |
 | `tg128` (spec 4, rk4v4-e8) | 65.1 decode (acc 23.0%, len 1.91) | 234.6 decode (acc 18.0%, len 1.72) |
 | `tg128` (no spec, INT8 KV) | 45.7 decode | 248.7 decode |
 
-¹ The 32k MoE point needs either the full-residency pool (KV fits at rk4v4-e8, but the long
-prefill exceeded this pass's budget) or the streaming profile that is still being tuned; it is
-reported as unmeasured rather than estimated. The dense 27B row is the long-context reference.
+¹ The 27B row is the long-context reference; the 35B 32k point is measured without speculation
+(724.5 / 45.4), and its DFlash variant is deliberately unpublished because the draft pushes the
+pool off full residency and the same command ranged 40–2,910 tok/s.
 
 Two properties of the 35B column are worth stating plainly. **DFlash's own prefill pass is cheap, and
 the 4.6× against the no-spec row is residency, not the draft.** The draft append — feature
@@ -288,6 +290,17 @@ regime. DFlash still pays back at decode (522–547 tok/s at 88% acceptance vers
 speculation), and it is the decode side that justifies it. And MoE prefill scales with residency:
 the same binary with the auto-curved pool measured 374–632 tok/s at 2k/4k because part of every
 layer ran on the CPU half.
+
+**MTP was measured on the 35B too, and it is not a way out.** At the same pin, MTP7 gives 127.8
+prefill / 76.1 decode at 88% acceptance — worse than DFlash on prefill and worse than no
+speculation on decode. The MTP head adds a 41st expert bank whose expert is 3.25 MiB against
+1.875 MiB for the 40 main banks, and the pool prices **every** slot from the widest bank, so the
+ask becomes 33.2 GiB against the 18.8 GiB granted: 5,774 of 10,496 experts stay resident. Three
+directions exist and none is implemented: sizing slots per bank (arithmetic puts it at 20,030 MiB —
+better than 55% residency, not full), halving the draft KV (about a sixth of the DFlash gap, nothing
+for MTP), and switching the pool between prefill and decode (the idle-window resize exists, but a
+captured graph freezes the expert offsets). Until then: no speculation for prefill-heavy traffic,
+DFlash when decode is the point, MTP on the dense 27B where the head costs no residency.
 
 Full records, command lines, per-layout precision tables and the context-ceiling procedure:
 [Qwen3.8-27B baseline](docs/performance/rtx-4090-sm89-baseline.md) ·

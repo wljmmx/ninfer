@@ -138,6 +138,46 @@ measures 12,141 / 234.6. The DFlash variant of this row is not published: the dr
 32k prompt plus the draft KV pushes the pool off full residency on a 24 GB card, and the
 identical command measured anywhere from 40 to 2,910 tok/s depending on where the pool landed.
 
+### 1c. MTP on this artifact: measured, and why it loses
+
+The 35B artifact carries an `mtp` component, so "use MTP instead of DFlash" is a fair question and
+it was measured rather than argued (`--spec mtp --draft-tokens 7 --lm-head-draft`, `-pg 2048,128
+--kv-dtype int8`, `-r 5 --warmup 1 --prefill-chunk 1024`, `NINFER_EXPERT_CACHE_MB=19456`):
+
+| Mode | prefill tok/s | decode tok/s | acceptance | pool | resident experts |
+|---|---:|---:|---:|---:|---:|
+| no speculation | **11,499** | 236.1 | — | 19,351 MiB | 10,240 / 10,240 |
+| `--spec dflash` 7 | 2,225 | **522.8** | 88.0% | 18,685 MiB | 9,817 / 10,240 |
+| `--spec mtp` 7 | 127.8 ± 46.6 | 76.1 ± 4.1 | 88.0% | 18,766 MiB | 5,774 / 10,496 |
+
+MTP is not a substitute here: it loses prefill to DFlash by 17× and decode to the *no-speculation*
+row, at the same acceptance rate. The cause is residency again, but of a different shape. Startup
+reports `banks=41 slot=3407872` for MTP against `banks=40 slot=1966080` without it: the MTP head
+adds a 41st expert bank whose expert is 3.25 MiB against 1.875 MiB for the 40 main banks, and the
+pool sizes **every** slot from the widest bank (`req.max_entry_bytes`, `core/expert_cache.cpp:246`).
+The ask therefore becomes 10,496 × 3.25 MiB ≈ 33.2 GiB against the 18.8 GiB the card grants, so
+5,774 of 10,496 experts stay resident and most layers take the split path for most chunks — which
+is the same mechanism §1b describes, at three times the miss rate.
+
+What could change this, in order of how much it would buy (none of it is implemented, and only the
+first two are pure arithmetic on the layouts):
+
+1. **Size slots per bank instead of from the global maximum.** The 40 main banks would be billed
+   19,200 MiB (as today's all-resident point) and the MTP bank 830 MiB. That is 20,030 MiB, still
+   above the 18,766 MiB granted, so the MTP bank would have to stream in part — much better than
+   55% residency, still not full residency.
+2. **Narrow the draft KV.** It is BFloat16 over the sliding window; `int8`/`fp8` halves its 254 MiB.
+   That closes roughly a sixth of the DFlash gap (§1b) and does nothing for the MTP gap, so it is a
+   partial measure at best.
+3. **Switch the pool between prefill and decode.** Prefill wants the all-resident 19,351 MiB;
+   decode wants the draft's 782 MiB. The idle-window `resize` path already moves pool and KV at a
+   request boundary (§"Runtime pool/KV resize" in the release notes), but a captured whole-step graph
+   freezes the expert offsets, so this needs a capture/no-capture trade first. Unproven.
+
+Until one of those lands, the choice is by workload: no speculation for prefill-heavy traffic
+(11,499 / 236), DFlash when decode throughput is the point (2,225 / 523), and MTP only on the dense
+27B, where the head costs no residency (3,309 / 223.8).
+
 ---
 
 ## 2. KV layout: precision and speed at 8,192 context
