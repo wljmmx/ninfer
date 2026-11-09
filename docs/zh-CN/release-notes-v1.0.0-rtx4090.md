@@ -18,8 +18,10 @@
      `resize_expert_pool` 契约执行。实测发现上行受构造期 `slots_max` 封顶：想用 12 GiB 池
      必须以该值启动，运行期只能降。
    `--controller-mode auto|stable|performance` 选择策略；serve 暴露 `/control/state`、
-   `/control/mode`、`/control/freeze`。整步图捕获是构造期决策，运行期如实登记为 no-executor
-   （分层图实测收益为零，不做挂羊头接线）。
+    `/control/mode`、`/control/freeze`。整步图的开关规则归控制器（`PolicyController::want_graph`）：
+    本次只把"未测量"时的答案从"无实测收益→不开"翻成"→开"（实测收益小但非负，被结构护栏跳过的
+    捕获不付代价），有测量后仍按"每层可捕获且无需 host 取数"判决。构造期决策只消费该规则，运行期
+    如实登记为 no-executor（分层图实测收益为零，不做挂羊头接线）。
 2. **KV tier 前缀索引（Q54）。** tier 目录持久化 frontier sidecar（带校验，坏文件回退为无索引）；
    更长的请求恢复自己前缀里最长的缓存点：397+103 token 命中 397 点（TTFT 327 ms 对冷跑
    3,957 ms），397+3,703 token 同样命中（1,781 ms 对 7,035 ms），输出与冷跑逐 token 一致。
@@ -122,7 +124,8 @@ KV 布局精度（ctx 4096 / stride 1024，4,801 评分 token，默认曲线池�
 - 运行期 KV 重分配的两个 open 已关闭：入口判决与变更多次共用 queue 锁（hand-off 竞态消失，
   1000 次压测 0 引擎侧穿透），降档往返不再发散（tier 用例钉全驻留）。`kv_pages` 已接入 L1 慢调。
 - 专家池上行慢调受构造期 `slots_max` 封顶，运行期只能降；需要更大池请以该值启动。
-- 整步图捕获为构造期决策，运行期不可翻转（已登记 no-executor）。
+- 整步图的规则由控制器判决（未测量时默认开，有测量后按结构判据），构造期消费该规则并冻结为常量，
+  运行期不可翻转（已登记 no-executor）。
 - e2 工件（22.8 GB mmap）构造期有低概率不稳（预存族，本轮 6 连跑未再现）；失败时按 `[kv]`
   三值日志与 `[fallback]` 行判断。
 - B2（NVFP4 宽批）仅 sm_120a 可验证。

@@ -43,9 +43,13 @@ The Windows RTX 4090 line ships as a source build **and** a runnable release fol
   256-token lanes), prefetch (usefulness-gated; it switches off when read-ahead measures
   zero), and an expert-pool slow dial (one 512 MiB step per 60 s, 3% revert rail, applied only
   in an idle window). `--controller-mode auto|stable|performance` selects the policy and serve
-  exposes `/control/state`, `/control/mode`, `/control/freeze`. Whole-step graph capture stays a
-  construction-time decision; at runtime it is registered as no-executor instead of being
-  pretended.
+  exposes `/control/state`, `/control/mode`, `/control/freeze`. The whole-step graph rule belongs
+  to the controller (`PolicyController::want_graph`); this build flips only its unmeasured answer
+  from "no proven benefit -> off" to "-> on" (the measured gain is small but not negative, and a
+  capture the structural guard skips costs nothing), while the measured rule — every layer
+  capturable and host-free — still governs once data exists. The construction decision consumes
+  that rule and stays a construction-time const; at runtime the actuator is registered as
+  no-executor instead of being pretended.
 - **Prefix reuse has an index.** The KV tier persists frontier notes, so a longer request
   restores its longest cached prefix instead of requiring an exact prompt: 397+103 tokens
   reused a 397-token checkpoint (TTFT 327 ms vs 3,957 ms cold) and 397+3,703 tokens reused the

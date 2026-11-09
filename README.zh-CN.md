@@ -38,8 +38,10 @@ Windows RTX 4090 线现在同时提供**源码构建**与**可直接运行的发
   token 负载，中位 75.7 s 对 87.4 s）、预取（按 usefulness 判定，读前读实测为零即关闭）、
   专家池慢调（每 60 s 最多 512 MiB 一格，3% 回退护栏，只在空闲窗口执行）。
   `--controller-mode auto|stable|performance` 选择策略；serve 暴露 `/control/state`、
-  `/control/mode`、`/control/freeze`。整步图捕获仍是构造期决策，运行期如实登记为
-  no-executor，而不是假装可翻转。
+  `/control/mode`、`/control/freeze`。整步图的开关规则仍归控制器（`PolicyController::want_graph`）：
+  本次只把"未测量"时的答案从"无实测收益→不开"翻成"→开"（实测收益小但非负，且被结构护栏跳过的
+  捕获不付代价），一旦有测量，判据仍是"每层可捕获且无需 host 取数"这条结构规则。构造期决策只是
+  消费该规则，本身仍是构造期常量；运行期该执行器如实登记为 no-executor，而不是假装可翻转。
 - **前缀复用有了索引**。KV tier 会持久化 frontier 记录，更长的请求可以恢复自己前缀里
   最长的缓存点，而不再要求整段 prompt 完全相同：397+103 token 命中 397 点前缀
   （TTFT 327 ms 对冷跑 3,957 ms），397+3,703 token 同样命中该点（1,781 ms 对 7,035 ms），
