@@ -66,3 +66,54 @@
 - 参考核对原文：`H:\TeleAgentWorks\.temp\upstream-scan\ref-review\{S,W,L}-REVIEW.md`
 - 守卫与判死：`.temp/upstream-scan/{guards-violations.txt,verdict-deadlist-sealed.txt}`
 - 每次对齐的门禁：`v9-dashboard-register.md` 的 T131 门禁节 + 各 phase-gate 留档
+
+## 6. 2026-11-09 核对：上游 Qwen4Exp 的本地化缺口（更正 §1 的基线说法）
+
+上一轮把"已吸收 a754fcf3（305 提交）"写进了本文，实测**不成立**：
+`git merge-base --is-ancestor a754fcf3 master` 为假，本地最后一次吸收上游是
+`cc3938c9`（2026-10-09）。相对 `upstream/master`（`77c2e5e2`）本地 **领先 810 / 落后 368**。
+下面是这次逐目录对账的结果（差距只列 Qwen4Exp 线，其余按 §2 判定 N/A）。
+
+| 上游内容 | 本地状态 | 影响 |
+|---|---|---|
+| `src/models/qwen4_exp/`（114 文件：config/definition/load/execution(gdn,qsa,ple,mtp)/program/session/state/parallel/wire） | **仅 12 个 PLE 文件**，模型层整层缺失 | Qwen4Exp 的权威实现不在树内；本地走的是在 `qwen3_5` 树上外挂（M1/M2），不是上游形态 |
+| `src/ops/softmax_attention/qsa/{indexer,sparse_gqa,prepare}` | **缺失 43 文件中的 39**（本地只有 gated_residual 之外的旧 QSA 片段） | QSA 稀疏注意力无可用内核，Qwen4Exp 的 12 个 QSA 层无法执行 |
+| `src/ops/gated_residual/{mix,norm_combine}` | 缺 17 文件（`mix/{implementation,select,up_gemv_mix}`、`norm_combine/launch.cuh`、`rtx5090/`、`dgx_spark/`） | HC 四流混合与 norm-combine 只有部分实现 |
+| `src/ops/ple/*` | 8/8 齐（本地已移植） | PLE 卷积/状态提取可用 |
+| 分页 NF4、expert cache/offload、paged KV 混合行跨度、校准优先级 | 缺失（在 368 提交内） | 上游的 PLE 表 NF4 磁盘路径与 5090 专家缓存不可用 |
+| `upstream/dev`（`41da21f4`） | 不跟踪 | 分布式 Spark 集合通信、native FP4 流水（非发布线） |
+
+### 6.1 上游的量化选择与 sm_89 的冲突
+
+`model-cards/Qwen3.8-Flash-Next-NInfer/artifact-manifest.json` 给出上游 recipe 的对象统计：
+`nvfp4 96`、`bf16 916`、`q8_g32_fp16 96`、`fp32 72`、`fp8_e4m3 2`、`nf4_g16 128`、`q4_g64 1`。
+`docs/maintainer/qwen4_exp-model.md` 写明取舍：**Main routed experts 导入 NVIDIA NVFP4、允许 A4**；
+MTP experts Block-FP8 A8；GDN/QSA 大投影 Q8 A16；PLE 表 NF4。
+
+- NVFP4 的 A4 路径需要 FP4 张量核（SM100/SM120），4090（sm_89）没有；本地 T013/T108 已判死该路线。
+- Q8 A16 的 GEMM 是 `q8_g32` 行缩放，本地 linear 只注册了部分形状；`14976x5120` 一类的 5090 专用 tile 缺失。
+- `upstream/feat/qwen4-27b-ops` 的 18 条提交全部标注 "RTX 5090"（四头 k8v4/nvfp4/int8/bf16 KV、
+  20480 整向量 rmsnorm、fp8 四流 residual mixing），属 sm_120a 调优，sm_89 不适用。
+
+**结论**：上游代码是完整的，但它对 4090 的可用性取决于"有没有 sm_89 版本的专家与线性内核"。
+本地已有 q4/q5/q6 的 groupwise-int 专家路径（本次扩展到 Qwen4Exp 形状），因此走
+"保留 GGUF 的 q4/q5/q6 专家、补齐所需内核"这条路，不需要重转专家，也不需要 NVFP4。
+
+### 6.2 本次已落地的内核侧（`a72a704a`）
+
+- groupwise-int 全链路按 `ShapeKind` 选形状（工作区/分组/token/grouped/shared），新增
+  `SwiGLUH2560I640E512K10` 的 q4_q5、q4_q6 两条 ShapePolicy。
+- `CudaSwiGLUExperts` 增加可选 `gate` / `up` 视图，支持"一专家两对象"的拆分 bank；
+  同时给两种形态会被拒绝，不做优先级猜测。
+- 新形状暴露并修掉三个在 2048 下不可见的缺陷：`dot_fp32_rows` 的组四元组越行读、
+  `grouped_integer_down` 的 16 字节 scale 暂存错位（20 字节行距）与越界读、
+  `reduce_assignments` 的 16 字节向量错位（H=2560/256=10 元素）。
+- 验证：新增 `ninfer_moe_qwen4exp_split_test`（512 专家拆分 bank、T=1/8/64、对同一批码字的
+  double 参考），compute-sanitizer 0 错误；`ctest -R "moe|qwen4"` 10/10 通过。
+
+### 6.3 仍未做
+
+1. 模型层接线（`ffn.cpp` 仍以 "M5 wires the split form" 拒绝三 bank）：
+   `ExpertStream` 只支持 gate_up+down 两 bank，Qwen4Exp 的 121 GB 工件必须走三 bank 流式。
+2. QSA/indexer（12 层）与 HC、PLE 注入进 `run_layers`——依赖 6.1 表中缺失的上游内核。
+3. 上游 368 提交的吸收仍按 §3 的 v10 计划另立，与本节的"能跑起来"目标分开推进。
