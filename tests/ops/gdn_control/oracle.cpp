@@ -57,7 +57,9 @@ int verify_projection(std::string_view name, const Fixture& f, const Reference& 
         return std::vector<double>(floats.begin(), floats.end());
     };
     const std::string prefix(name);
-    const auto criterion = f.normalize_input ? kNormControl : kProjection;
+    const auto criterion = f.normalize_input
+                               ? norm_control_criterion(f.profile.input_rows, f.test_case.columns)
+                               : kProjection;
     int failures         = verify_reduction((prefix + " g").c_str(), read(f.g, expected.g.size()),
                                             expected.g, criterion);
     failures += verify_reduction((prefix + " beta").c_str(), read(f.beta, expected.beta.size()),

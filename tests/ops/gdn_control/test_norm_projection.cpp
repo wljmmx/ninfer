@@ -14,7 +14,6 @@ int main() {
     DeviceContext device;
     int failed = 0;
     for (auto profile : control::kProfiles) {
-        if (profile.input_rows == 2560) continue;
         for (auto test_case : control::norm_cases(profile))
             failed += control::run(profile, test_case, true, device.execution_view());
         failed += control::validate(profile, true, device.execution_view());

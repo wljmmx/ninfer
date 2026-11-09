@@ -41,6 +41,13 @@ Q5Launch select_q5_v2_prefill(std::int32_t n, std::int32_t k, std::int32_t t) {
             if (t <= 128) return launch_q5_mma_r64_c64;
             return launch_q5_mma_r64_c128;
         }
+        // Qwen4Exp GDN output [2560,6144] (the attention output shares this shape). K = 6144 is a
+        // whole number of 64-wide K tiles and 2560 % 64 == 0, so the two shape-generic routes
+        // admit it: SIMT for the small token counts, the row-tiled MMA for the rest.
+        if (n == 2560) {
+            if (t <= 8) return launch_q5_simt_r8_c4;
+            return launch_q5_mma_r64_c128;
+        }
         break;
     case 17408:
         if (n == 5120) {
@@ -68,6 +75,11 @@ Q5Launch select_q5_v2_prefill(std::int32_t n, std::int32_t k, std::int32_t t) {
     // pay, the row-tiled MMA the rest. Both require N % 64 == 0 (640, 2560) and K % 64 == 0.
     case 2560:
         if (n == 640) {
+            if (t <= 8) return launch_q5_simt_r8_c4;
+            return launch_q5_mma_r64_c128;
+        }
+        // Qwen4Exp GDN value [6144,2560]: the same shape-generic pair of routes.
+        if (n == 6144) {
             if (t <= 8) return launch_q5_simt_r8_c4;
             return launch_q5_mma_r64_c128;
         }

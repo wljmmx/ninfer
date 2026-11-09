@@ -117,6 +117,31 @@ int q5_a16_conformance() {
     failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5_g64_fp16_weight,
                           {1152, 4304, 187U, Comparison::Sampled, false, kN1152K4304});
 
+    // Qwen4Exp (hidden 2560): the GDN value [6144,2560] and output [2560,6144] Q5 projections.
+    // Both take the shape-generic Q5 routes this file already covers at K=5120/6144, so the checks
+    // pin the shape admission and the small-T/large-T hand-off at K=2560.
+    constexpr std::array kN6144K2560Full{graph(1),  graph(2),  graph(3),  graph(4),  graph(5),
+                                         graph(8),  graph(9),  graph(16), graph(17), graph(32),
+                                         graph(64), graph(128)};
+    failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5_g64_fp16_weight,
+                          {6144, 2560, 197U, Comparison::Full, true, kN6144K2560Full});
+
+    constexpr std::array kN6144K2560{a16(192), a16(256), a16(320), a16(384),
+                                     a16(512), a16(1024), a16(2048)};
+    failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5_g64_fp16_weight,
+                          {6144, 2560, 197U, Comparison::Sampled, false, kN6144K2560});
+
+    constexpr std::array kN2560K6144Full{graph(1),  graph(2),  graph(3),  graph(4),  graph(5),
+                                         graph(8),  graph(9),  graph(16), graph(17), graph(32),
+                                         graph(64), graph(128)};
+    failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5_g64_fp16_weight,
+                          {2560, 6144, 199U, Comparison::Full, true, kN2560K6144Full});
+
+    constexpr std::array kN2560K6144{a16(192), a16(256), a16(320), a16(384),
+                                     a16(512), a16(1024), a16(2048)};
+    failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5_g64_fp16_weight,
+                          {2560, 6144, 199U, Comparison::Sampled, false, kN2560K6144});
+
     return failures;
 }
 

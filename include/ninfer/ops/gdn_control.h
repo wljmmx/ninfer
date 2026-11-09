@@ -95,9 +95,13 @@ gdn_control_proj_workspace_capacity_bytes(const ProjectionWeights& weights, std:
  *   beta[h,m] = sigmoid(b[h,m]).
  *
  * Supported domain:
- *   Projection operands/effects follow gdn_control_proj for (H,K)=(48,5120),(32,2048).
+ *   Projection operands/effects follow gdn_control_proj for (H,K)=(48,5120),(32,2048),(48,2560).
  *   norm_weight is contiguous BF16 [K], normalized is BF16 [K,M]; both are 16-byte aligned.
  *   eps is positive and finite.
+ *   (H,K)=(48,2560) has no fused form: its forty K tiles admit no whole-K split-32 normalizing
+ *   MMA, and the fused SIMT kernel is compiled for K=5120, so that geometry materializes the
+ *   normalization (one RMSNorm writing normalized) and then runs its projection route. Fusing and
+ *   materializing remain implementation choices for the other geometries, as before.
  *
  * Numeric:
  *   normalized is the explicit BF16 output for other projections. Promoted normalized and FP32

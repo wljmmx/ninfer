@@ -121,13 +121,23 @@ int validate(Profile p, bool normalize_input, DeviceExecutionView execution) {
     failed += f.check(name);
     if (f.arena.used() != f.prefix) ++failed;
     if (p.input_rows == 2560) {
-        failed += rejects(name + " norm domain",
-                          [&] { (void)workspace_capacity(f.weights.prepared, true, 1, 8); });
-        failed += rejects(name + " norm execution domain", [&] {
-            ops::gdn_norm_control_proj(f.input, f.norm_weight, kEps, f.weights.prepared,
-                                       f.a_log_tensor, f.dt_bias_tensor,
-                                       {f.normalized_tensor, f.outputs}, f.arena, execution);
-        });
+        // 2560 admits the norm form by materializing the normalization, so the capacity query and
+        // execution must both accept it (the fused forms remain 5120/2048-only).
+        try {
+            (void)workspace_capacity(f.weights.prepared, true, 1, 8);
+            if (normalize_input) {
+                ops::gdn_norm_control_proj(f.input, f.norm_weight, kEps, f.weights.prepared,
+                                           f.a_log_tensor, f.dt_bias_tensor,
+                                           {f.normalized_tensor, f.outputs}, f.arena, execution);
+                cuda_synchronize(execution.stream);
+            }
+        } catch (const std::exception& error) {
+            std::cerr << name << " 2560 materialized norm domain: unexpected rejection: "
+                      << error.what() << '\n';
+            ++failed;
+        }
+        // Two separate [48,2560] parents have no stored combined form for this geometry, so the
+        // paired representation stays refused.
         const auto first = std::get<ops::SingleProjectionWeight>(f.weights.prepared).weight;
         Weight a = first, b = first;
         a.n = b.n  = 48;

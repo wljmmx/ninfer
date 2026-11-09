@@ -14,5 +14,8 @@ namespace ninfer::ops::detail {
 [[nodiscard]] Q4Launch select_q4_n131072_k2048(std::int32_t tokens);
 [[nodiscard]] Q4Launch select_q4_n3456_k1152(std::int32_t tokens);
 [[nodiscard]] Q4Launch select_q4_n4304_k1152(std::int32_t tokens);
+// Qwen4Exp (hidden 2560): the GDN query/key and value/z projections.
+[[nodiscard]] Q4Launch select_q4_n2048_k2560(std::int32_t tokens);
+[[nodiscard]] Q4Launch select_q4_n6144_k2560(std::int32_t tokens);
 
 } // namespace ninfer::ops::detail

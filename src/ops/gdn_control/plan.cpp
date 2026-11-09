@@ -73,11 +73,16 @@ Plan projection_plan(Geometry geometry, std::int32_t columns) {
 }
 
 NormPlan norm_plan(Geometry geometry, std::int32_t columns) {
-    if (geometry.input_rows == 2560)
-        throw std::invalid_argument("gdn_control: unsupported norm geometry");
     const auto projection = projection_plan(geometry, columns);
     if (geometry.input_rows == 5120 && columns <= 42) return {NormKernel::Simt, {}};
     if (geometry.input_rows == 2048 && columns <= 16) return {NormKernel::Mma, mma(64, 32)};
+    // 2560 has forty K tiles (2560/64). The fused normalizing MMA requires SplitK == 32 to divide
+    // them, and the fused SIMT kernel is compiled for D == 5120 only, so neither fused form covers
+    // this geometry. The materialized route is the generic one: one RMSNorm that writes the
+    // normalized BF16 parent, then the projection route above (which is complete and closed for
+    // 2560). It differs from the fused forms in exactly two ways: the normalized activation is
+    // rounded to BF16 before the dot product, and the norm needs no split-K partial scratch. The
+    // 5120 prefill span (> 42 columns) already takes this route in production.
     return {NormKernel::Materialized, projection};
 }
 

@@ -52,6 +52,10 @@ std::vector<Case> norm_cases(Profile p) {
     std::vector<Case> outputs{{1}, {64}, {128}, {8192}};
     if (p.input_rows == 5120)
         boundaries(outputs, {2, 14, 28, 42, 1024, 2048, 4096});
+    else if (p.input_rows == 2560)
+        // 2560 materializes the normalization, so the seams that matter are the projection
+        // routes' own boundaries (plus the 8/9 hand-off from the tiled GEMV).
+        boundaries(outputs, {8, 192, 448, 896, 1280, 2688, 5120, 7168, 8192});
     else
         boundaries(outputs, {6, 8, 12, 16, 127, 1024, 2048, 4096});
     unique(outputs);

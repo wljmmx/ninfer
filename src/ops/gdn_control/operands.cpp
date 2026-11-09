@@ -91,7 +91,6 @@ void validate_projection(const Tensor& x, const Weights& weights, const Tensor& 
 
 void validate_norm(const Tensor& x, const Tensor& weight, float eps, Geometry geometry,
                    const Tensor& normalized) {
-    require(geometry.input_rows != 2560, "norm projection does not admit this geometry");
     require(eps > 0 && std::isfinite(eps), "epsilon must be positive and finite");
     vector(weight, DType::BF16, geometry.input_rows);
     matrix(normalized, DType::BF16, geometry.input_rows, x.ne[1]);
