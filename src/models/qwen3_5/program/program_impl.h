@@ -445,7 +445,9 @@ public:
     const std::size_t graph_allowance_bytes;
     // Measured growth of prepare_graphs(); zero when this Program captures no graphs. Reported
     // through MemorySummary::cuda_graph as the observed counterpart of the static allowance.
-    std::size_t graph_prepare_increment_bytes = 0;
+    // Signed: a capture can hand memory back (the driver frees the temporary the graph replaces),
+    // and storing that delta in a size_t wrapped it to ~1.7e13 MiB in the startup log.
+    std::int64_t graph_prepare_increment_bytes = 0;
     const WorkspacePlan workspace_plan;
 
     DeviceArena persistent;

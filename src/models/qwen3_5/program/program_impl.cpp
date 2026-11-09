@@ -391,7 +391,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         device.synchronize();
         const auto after_graphs = device_memory_snapshot(device.device);
         graph_prepare_increment_bytes = device_memory_growth(before_graphs, after_graphs);
-        std::fprintf(stderr, "[graph] capture measured %.1f MiB (allowance %.1f MiB)\n",
+        std::fprintf(stderr, "[graph] capture measured %+.1f MiB (allowance %.1f MiB)\n",
                      static_cast<double>(graph_prepare_increment_bytes) / 1048576.0,
                      static_cast<double>(graph_allowance_bytes) / 1048576.0);
         std::fflush(stderr);
@@ -647,8 +647,10 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
     out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
     if (use_cuda_graph) {
         out.cuda_graph = GraphMemorySummary{
-            .rebuild_estimate_bytes      = graph_prepare_increment_bytes,
-            .preparation_increment_bytes = static_cast<std::int64_t>(graph_prepare_increment_bytes),
+            .rebuild_estimate_bytes      = graph_prepare_increment_bytes > 0
+                                               ? static_cast<std::size_t>(graph_prepare_increment_bytes)
+                                               : 0,
+            .preparation_increment_bytes = graph_prepare_increment_bytes,
         };
     }
     out.kv_payload_bytes             = kv_payload_bytes;
