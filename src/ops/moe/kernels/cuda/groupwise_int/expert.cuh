@@ -18,10 +18,33 @@ struct ExpertPlanes {
     int row;
 };
 
+// port (sm_89): a split bank keeps the gate object and the up object apart, so an expert's gate
+// rows and up rows are one image each in *different* allocations. `gate_rows` is the number of
+// rows an image holds (Shape::intermediate); the row below it belongs to the up object, never to
+// the gate object's successor. Every access type below states `kSplit` so the kernels can build
+// the two-plane form only where it exists and never pay for the test on the fused layout.
+struct SplitExpertPlanes {
+    ExpertPlanes gate, up;
+    int gate_rows;
+};
+
+__device__ __forceinline__ ExpertPlanes gate_up_row(const ExpertPlanes& p, int row) {
+    return {p.codes, p.high, p.scales, p.row + row};
+}
+
+// The fused layout: rows [0,I) are gate and [I,2I) are up inside the same image.
+__device__ __forceinline__ ExpertPlanes gate_up_row(const SplitExpertPlanes& p, int row) {
+    return row < p.gate_rows
+               ? ExpertPlanes{p.gate.codes, p.gate.high, p.gate.scales, p.gate.row + row}
+               : ExpertPlanes{p.up.codes, p.up.high, p.up.scales,
+                              p.up.row + row - p.gate_rows};
+}
+
 struct PackedExpertMatrix {
     const std::uint8_t* codes;
     const std::uint8_t* high;
     const std::uint8_t* scales;
+    static constexpr bool kSplit = false;
 
     template <int Rows>
     __device__ __forceinline__ ExpertPlanes resolve(int expert) const {
@@ -32,6 +55,7 @@ struct PackedExpertMatrix {
 struct StridedExpertMatrix {
     PackedExpertMatrix planes;
     std::uint64_t code_stride, high_stride, scale_stride;
+    static constexpr bool kSplit = false;
 
     template <int Rows>
     __device__ __forceinline__ ExpertPlanes resolve(int expert) const {
@@ -49,6 +73,7 @@ struct IndexedExpertMatrix {
     PackedExpertMatrix host;
     const std::uint64_t* host_offsets;
     const std::int32_t* host_flags;
+    static constexpr bool kSplit = false;
 
     template <int Rows>
     __device__ __forceinline__ ExpertPlanes resolve(int expert) const {
@@ -60,6 +85,17 @@ struct IndexedExpertMatrix {
         const auto offset = offsets[expert];
         return {planes.codes + offset, planes.high ? planes.high + offset : nullptr,
                 planes.scales + offset, 0};
+    }
+};
+
+template <class Half>
+struct SplitExpertMatrix {
+    Half gate, up;
+    static constexpr bool kSplit = true;
+
+    template <int Rows>
+    __device__ __forceinline__ SplitExpertPlanes resolve(int expert) const {
+        return {gate.template resolve<Rows>(expert), up.template resolve<Rows>(expert), Rows / 2};
     }
 };
 
@@ -88,6 +124,32 @@ void with_expert_addresses(const CudaSwiGLUExperts& experts, const RoutedSwiGLUP
                            Function&& function) {
     const auto& gu   = experts.bank.gate_up;
     const auto& down = experts.bank.down;
+    // Split gate/up: two objects instead of one fused parent. The operand check has already
+    // refused a bank that names both forms, so this test only decides which row map the kernels
+    // are compiled with.
+    if (experts.gate.codes != nullptr) {
+        if (experts.gate.offsets) {
+            function(SplitExpertMatrix<IndexedExpertMatrix>{
+                         IndexedExpertMatrix{matrix(experts.gate), experts.gate.offsets,
+                                            host_matrix(experts.gate), experts.gate.host_offsets,
+                                            experts.gate.host_flags},
+                         IndexedExpertMatrix{matrix(experts.up), experts.up.offsets,
+                                            host_matrix(experts.up), experts.up.host_offsets,
+                                            experts.up.host_flags}},
+                     IndexedExpertMatrix{matrix(down), down.offsets, host_matrix(down),
+                                         down.host_offsets, down.host_flags});
+            return;
+        }
+        const auto strided = [](const ExpertMatrixDeviceView& view) {
+            StridedExpertMatrix result{matrix(view), view.code_stride, view.high_stride,
+                                       view.scale_stride};
+            return result;
+        };
+        function(SplitExpertMatrix<StridedExpertMatrix>{strided(experts.gate), strided(experts.up)},
+                 StridedExpertMatrix{matrix(down), down.code_stride, down.high_stride,
+                                    down.scale_stride});
+        return;
+    }
     if (gu.offsets) {
         // Q20: the second leg travels with the indexed form only. An affine or packed bank is a
         // layout whose experts are addressed by stride, and the host tier cannot serve that shape.

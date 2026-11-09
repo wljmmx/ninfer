@@ -65,8 +65,6 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void grouped_q4_gate_up(
         const int row_block   = work - route_job * row_blocks;
         const int expert      = route_job_experts[route_job];
         const auto matrix     = weights.template resolve<2 * Shape::intermediate>(expert);
-        const auto* codes     = matrix.codes;
-        const auto* scales    = matrix.scales;
         const int logical0    = row_block * (BM / 2);
         const int begin       = expert_offsets[expert];
         const int count       = expert_offsets[expert + 1] - begin;
@@ -84,9 +82,14 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void grouped_q4_gate_up(
         }
         float acc[4][WarpNT][4] = {};
 
-        auto global_row = [&](int local_row) {
+        // The tile holds BM/2 gate rows and BM/2 up rows, which on a fused bank are rows
+        // logical and logical + I of one image, and on a split bank are row `logical` of two
+        // images. Both are spelled by this one lambda so the address arithmetic never assumes
+        // which of the two layouts is in use.
+        auto row_planes = [&](int local_row) {
             const int logical = logical0 + (local_row & (BM / 2 - 1));
-            return matrix.row + logical + (local_row >= BM / 2 ? Shape::intermediate : 0);
+            return gate_up_row(matrix,
+                               logical + (local_row >= BM / 2 ? Shape::intermediate : 0));
         };
 
         auto stage_scales = [&] {
@@ -95,9 +98,11 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void grouped_q4_gate_up(
             for (int item = tid; item < BM * ChunksPerRow; item += ExpertThreads) {
                 const int row   = item / ChunksPerRow;
                 const int chunk = item - row * ChunksPerRow;
+                const auto planes = row_planes(row);
                 const std::int64_t gi =
-                    static_cast<std::int64_t>(global_row(row)) * GroupsPerRow + chunk * 8;
-                cp_async<16, Cache::cg>(&Sr[row * ScaleBytesPerRow + chunk * 16], &scales[gi * 2]);
+                    static_cast<std::int64_t>(planes.row) * GroupsPerRow + chunk * 8;
+                cp_async<16, Cache::cg>(&Sr[row * ScaleBytesPerRow + chunk * 16],
+                                        &planes.scales[gi * 2]);
             }
         };
 
@@ -116,10 +121,11 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void grouped_q4_gate_up(
             for (int item = tid; item < BM * 2; item += ExpertThreads) {
                 const int row  = item >> 1;
                 const int half = item & 1;
+                const auto planes = row_planes(row);
                 const std::int64_t gi =
-                    static_cast<std::int64_t>(global_row(row)) * GroupsPerRow + group;
+                    static_cast<std::int64_t>(planes.row) * GroupsPerRow + group;
                 cp_async<16, Cache::cg>(&Cr[stage][row * 32 + half * 16],
-                                        &codes[gi * 32 + half * 16]);
+                                        &planes.codes[gi * 32 + half * 16]);
             }
         };
 

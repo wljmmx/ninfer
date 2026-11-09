@@ -35,9 +35,14 @@ struct Q8Codec : Q8ScalarDecodeAtom {
     static constexpr bool kPackedWord8              = false;
 };
 
+// port (sm_89): the gate row and the up row may live in two different expert images. Every form
+// below therefore takes one plane triple and one row per half; a fused bank passes the same triple
+// twice, which the compiler folds back into the single-image loop it had before.
 template <class Codec, int K>
-__device__ __forceinline__ void dot_two_rows(const std::uint8_t* codes, const std::uint8_t* high,
-                                             const std::uint8_t* scales, int row0, int row1,
+__device__ __forceinline__ void dot_two_rows(const std::uint8_t* codes0, const std::uint8_t* high0,
+                                             const std::uint8_t* scales0, int row0,
+                                             const std::uint8_t* codes1, const std::uint8_t* high1,
+                                             const std::uint8_t* scales1, int row1,
                                              const __nv_bfloat16* x, int k_begin, int k_end,
                                              float& result0, float& result1) {
     constexpr int kGroups = K / Codec::kGroupK;
@@ -57,11 +62,11 @@ __device__ __forceinline__ void dot_two_rows(const std::uint8_t* codes, const st
             const std::int64_t index0 = static_cast<std::int64_t>(row0) * kGroups + group;
             const std::int64_t index1 = static_cast<std::int64_t>(row1) * kGroups + group;
             const std::uint32_t packed0 =
-                *reinterpret_cast<const std::uint32_t*>(codes + index0 * 32 + lane_in_group * 4);
+                *reinterpret_cast<const std::uint32_t*>(codes0 + index0 * 32 + lane_in_group * 4);
             const std::uint32_t packed1 =
-                *reinterpret_cast<const std::uint32_t*>(codes + index1 * 32 + lane_in_group * 4);
-            const auto scale0 = *reinterpret_cast<const std::uint16_t*>(scales + index0 * 2);
-            const auto scale1 = *reinterpret_cast<const std::uint16_t*>(scales + index1 * 2);
+                *reinterpret_cast<const std::uint32_t*>(codes1 + index1 * 32 + lane_in_group * 4);
+            const auto scale0 = *reinterpret_cast<const std::uint16_t*>(scales0 + index0 * 2);
+            const auto scale1 = *reinterpret_cast<const std::uint16_t*>(scales1 + index1 * 2);
             float weights0[8];
             float weights1[8];
             common::Q4SimtDecodeAtom::decode_eight(packed0, scale0, weights0);
@@ -82,8 +87,8 @@ __device__ __forceinline__ void dot_two_rows(const std::uint8_t* codes, const st
         for (int group = first_group; group < last_group; ++group) {
             const std::int64_t index0 = static_cast<std::int64_t>(row0) * kGroups + group;
             const std::int64_t index1 = static_cast<std::int64_t>(row1) * kGroups + group;
-            const float w0            = Codec::load_one(codes, scales, index0, lane);
-            const float w1            = Codec::load_one(codes, scales, index1, lane);
+            const float w0            = Codec::load_one(codes0, scales0, index0, lane);
+            const float w1            = Codec::load_one(codes1, scales1, index1, lane);
             const float xv            = __bfloat162float(x[group * Codec::kGroupK + lane]);
             acc0                      = fmaf(w0, xv, acc0);
             acc1                      = fmaf(w1, xv, acc1);
@@ -91,10 +96,10 @@ __device__ __forceinline__ void dot_two_rows(const std::uint8_t* codes, const st
     } else if (lane < Codec::kGroupK / 2) {
         for (int group = first_group; group < last_group; ++group) {
             float w00, w01, w10, w11;
-            Codec::load_pair(codes, high, scales, static_cast<std::int64_t>(row0) * kGroups + group,
-                             lane, w00, w01);
-            Codec::load_pair(codes, high, scales, static_cast<std::int64_t>(row1) * kGroups + group,
-                             lane, w10, w11);
+            Codec::load_pair(codes0, high0, scales0,
+                             static_cast<std::int64_t>(row0) * kGroups + group, lane, w00, w01);
+            Codec::load_pair(codes1, high1, scales1,
+                             static_cast<std::int64_t>(row1) * kGroups + group, lane, w10, w11);
             const int k     = group * Codec::kGroupK + lane * 2;
             const float2 xv = __bfloat1622float2(load_vec<__nv_bfloat162>(x + k));
             acc0            = fmaf(w00, xv.x, acc0);
@@ -120,10 +125,17 @@ __device__ __forceinline__ void dot_fp32_rows(const std::uint8_t* codes, const s
     if constexpr (Codec::kPackedWord8) {
         // Q5/Q6 use the same eight-value lane ownership as gate/up. The high plane and FP16 scale
         // are decoded exactly from their registered row-split codec before FP32 accumulation.
+        //
+        // port (sm_89): four groups share one transaction, so the loop walks in quadruples. K need
+        // not be a multiple of 4*group - the Qwen4Exp down matrix has 640 columns, i.e. ten groups -
+        // and a lane whose group lies past the last one must contribute nothing rather than read
+        // the first groups of the next row. The 512-column row (eight groups) lands on the boundary
+        // exactly, so its arithmetic is unchanged.
         const int lane_group    = lane >> 3;
         const int lane_in_group = lane & 7;
         for (int group_base = first_group; group_base < last_group; group_base += 4) {
             const int group = group_base + lane_group;
+            if (group >= last_group) { continue; }
             const float4 x0 = load_vec<float4>(x + group * Codec::kGroupK + lane_in_group * 8);
             const float4 x1 = load_vec<float4>(x + group * Codec::kGroupK + lane_in_group * 8 + 4);
             const float values[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};

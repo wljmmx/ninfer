@@ -8,9 +8,12 @@ namespace ninfer::ops::detail::moe_cuda::groupwise_int {
 
 inline constexpr int kAssignmentTile = 64;
 
-template <class Arena>
+// port (sm_89): every buffer below is sized against one expert shape. The shape used to be baked
+// into this header as SwiGLUH2048I512E256K8; it is now a template parameter so the same arithmetic
+// serves the Qwen4Exp row (H2560/I640/E512/K10) without a second copy of the allocation code.
+template <class Shape, class Arena>
 GroupedStorage allocate_grouping(Arena& arena, int tokens, int columns) {
-    using S = SwiGLUH2048I512E256K8;
+    using S = Shape;
     GroupedStorage out;
     const int assignments = S::top_k * tokens;
     const int tiles       = (assignments + kAssignmentTile - 1) / kAssignmentTile;
@@ -32,9 +35,9 @@ GroupedStorage allocate_grouping(Arena& arena, int tokens, int columns) {
     return out;
 }
 
-template <class Arena>
+template <class Shape, class Arena>
 ExpertStorage allocate_token(Arena& arena, int tokens, bool shared, bool routed = true) {
-    using S = SwiGLUH2048I512E256K8;
+    using S = Shape;
     ExpertStorage out;
     out.token_activation = static_cast<float*>(
         arena.alloc(DType::FP32, {S::intermediate, (int(routed) * S::top_k + int(shared)) * tokens})
@@ -42,12 +45,12 @@ ExpertStorage allocate_token(Arena& arena, int tokens, bool shared, bool routed 
     return out;
 }
 
-template <class Arena>
+template <class Shape, class Arena>
 ExpertStorage allocate_grouped(Arena& arena, int tokens, const GroupedPlan& plan, bool shared,
                                bool split_activation) {
-    using S = SwiGLUH2048I512E256K8;
+    using S = Shape;
     ExpertStorage out;
-    out.groups     = allocate_grouping(arena, tokens, plan.columns);
+    out.groups     = allocate_grouping<S>(arena, tokens, plan.columns);
     out.grouped_io = arena.alloc(DType::BF16, {S::hidden, S::top_k * tokens}).data;
     // Down consumes both activation planes before reduction overwrites them with the FP32 sum.
     const auto activation_bytes =
@@ -66,9 +69,9 @@ ExpertStorage allocate_grouped(Arena& arena, int tokens, const GroupedPlan& plan
     return out;
 }
 
-template <class Arena>
+template <class Shape, class Arena>
 ExpertStorage allocate_shared(Arena& arena, int tokens) {
-    using S = SwiGLUH2048I512E256K8;
+    using S = Shape;
     ExpertStorage out;
     // SIMT keeps FP32 values; MMA keeps BF16 high/low planes in the same-sized storage.
     const auto buffer     = arena.alloc(DType::FP32, {S::intermediate, tokens});

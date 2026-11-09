@@ -195,9 +195,12 @@ __global__ void count_uncovered(const int* __restrict__ ids, const int* __restri
 }
 } // namespace
 
-void launch_group_count(const ExpertRoutes& routes, ExpertSubset subset,
-                        const GroupedStorage& storage, CudaExecutionView execution) {
-    using S          = SwiGLUH2048I512E256K8;
+namespace {
+// port (sm_89): the grouping arithmetic is shape-driven (E assignments per tile, E blocks), so each
+// body takes the shape and the public entry points select it once.
+template <class S>
+void count_shape(const ExpertRoutes& routes, ExpertSubset subset, const GroupedStorage& storage,
+                 CudaExecutionView execution) {
     const int count  = routes.ids.ne[1] * S::top_k;
     const int tiles  = (count + 8 * S::top_k - 1) / (8 * S::top_k);
     const auto* ids  = static_cast<const int*>(routes.ids.data);
@@ -213,26 +216,25 @@ void launch_group_count(const ExpertRoutes& routes, ExpertSubset subset,
     CUDA_CHECK(cudaGetLastError());
 }
 
-void launch_group_scan(const ExpertRoutes& routes, const GroupedPlan& plan,
-                       const GroupedStorage& storage, CudaExecutionView execution,
-                       std::uint32_t* missed) {
-    using S = SwiGLUH2048I512E256K8;
+template <class S>
+void scan_shape(const ExpertRoutes& routes, const GroupedPlan& plan, const GroupedStorage& storage,
+                CudaExecutionView execution, std::uint32_t* missed) {
     scan_assignments<S><<<1, S::experts, 0, execution.stream>>>(
         storage, (routes.ids.ne[1] + 7) / 8, plan, routes.ids.ne[1] * S::top_k, missed);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void launch_group_count_scan(const ExpertRoutes& routes, ExpertSubset subset, const GroupedPlan& plan,
-                              const GroupedStorage& storage, CudaExecutionView execution,
-                              std::uint32_t* missed) {
-    using S         = SwiGLUH2048I512E256K8;
+template <class S>
+void count_scan_shape(const ExpertRoutes& routes, ExpertSubset subset, const GroupedPlan& plan,
+                      const GroupedStorage& storage, CudaExecutionView execution,
+                      std::uint32_t* missed) {
     const int count = routes.ids.ne[1] * S::top_k;
     const int tiles = (count + 8 * S::top_k - 1) / (8 * S::top_k);
     if (tiles > 1) {
         // A prefill chunk spreads over several tiles; the fused kernel only covers one, so the
         // three-kernel chain stays for it.
-        launch_group_count(routes, subset, storage, execution);
-        launch_group_scan(routes, plan, storage, execution, missed);
+        count_shape<S>(routes, subset, storage, execution);
+        scan_shape<S>(routes, plan, storage, execution, missed);
         return;
     }
     const auto* ids  = static_cast<const int*>(routes.ids.data);
@@ -248,13 +250,38 @@ void launch_group_count_scan(const ExpertRoutes& routes, ExpertSubset subset, co
     CUDA_CHECK(cudaGetLastError());
 }
 
-void launch_group_index(const ExpertRoutes& routes, const GroupedStorage& storage,
-                        CudaExecutionView execution) {
-    using S         = SwiGLUH2048I512E256K8;
+template <class S>
+void index_shape(const ExpertRoutes& routes, const GroupedStorage& storage,
+                 CudaExecutionView execution) {
     const int count = S::top_k * routes.ids.ne[1];
     index_assignments<S><<<(count + 255) / 256, 256, 0, execution.stream>>>(
         static_cast<const int*>(routes.ids.data), storage, count);
     CUDA_CHECK(cudaGetLastError());
+}
+} // namespace
+
+void launch_group_count(const ExpertRoutes& routes, ExpertSubset subset, ShapeKind kind,
+                        const GroupedStorage& storage, CudaExecutionView execution) {
+    with_shape(kind, [&]<class S>() { count_shape<S>(routes, subset, storage, execution); });
+}
+
+void launch_group_scan(const ExpertRoutes& routes, const GroupedPlan& plan, ShapeKind kind,
+                       const GroupedStorage& storage, CudaExecutionView execution,
+                       std::uint32_t* missed) {
+    with_shape(kind, [&]<class S>() { scan_shape<S>(routes, plan, storage, execution, missed); });
+}
+
+void launch_group_count_scan(const ExpertRoutes& routes, ExpertSubset subset, const GroupedPlan& plan,
+                             ShapeKind kind, const GroupedStorage& storage,
+                             CudaExecutionView execution, std::uint32_t* missed) {
+    with_shape(kind, [&]<class S>() {
+        count_scan_shape<S>(routes, subset, plan, storage, execution, missed);
+    });
+}
+
+void launch_group_index(const ExpertRoutes& routes, ShapeKind kind, const GroupedStorage& storage,
+                        CudaExecutionView execution) {
+    with_shape(kind, [&]<class S>() { index_shape<S>(routes, storage, execution); });
 }
 
 void launch_route_coverage(const std::int32_t* ids, int assignments, const std::int32_t* mask,

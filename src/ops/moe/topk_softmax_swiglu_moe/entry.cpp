@@ -24,7 +24,7 @@ struct CallStorage {
 
 template <class Arena>
 CallStorage allocate(Arena& arena, const impl::Plan& plan, int tokens, int experts, int top_k,
-                     bool split_activation) {
+                     bool split_activation, kernel::ShapeKind kind) {
     CallStorage out;
     out.routes = detail::allocate_routes(arena, top_k, tokens);
     out.shared = arena.alloc(DType::FP32, {tokens});
@@ -34,10 +34,13 @@ CallStorage allocate(Arena& arena, const impl::Plan& plan, int tokens, int exper
         out.block_scaled = block_scaled::allocate(arena, plan.block_scaled, tokens, true, true);
         return out;
     }
-    out.experts =
-        plan.integer.grouped
-            ? integer::allocate_grouped(arena, tokens, plan.integer.group, true, split_activation)
-            : integer::allocate_token(arena, tokens, true);
+    kernel::with_shape(kind, [&]<class Shape>() {
+        out.experts =
+            plan.integer.grouped
+                ? integer::allocate_grouped<Shape>(arena, tokens, plan.integer.group, true,
+                                                   split_activation)
+                : integer::allocate_token<Shape>(arena, tokens, true);
+    });
     if (plan.router.count_assignments) {
         out.route.local_ranks = out.experts.groups.local_ranks;
         out.route.tile_counts = out.experts.groups.tile_counts;
@@ -57,7 +60,8 @@ std::size_t topk_softmax_swiglu_moe_workspace_capacity_bytes(const MoeProfile& p
             WorkspaceLayoutBuilder layout;
             (void)allocate(layout, shape.select(tokens), tokens, profile.routed.experts,
                            profile.routed.top_k,
-                           profile.routed.ffn.gate_up_type == QType::Q8_G32_FP16);
+                           profile.routed.ffn.gate_up_type == QType::Q8_G32_FP16,
+                           kernel::shape_kind(profile.routed));
             return layout.peak_bytes(1);
         });
 }
@@ -91,7 +95,8 @@ void topk_softmax_swiglu_moe(const Tensor& x, const MoeProfile& profile, const M
         auto output        = destination.slice(1, offset, count);
         auto scope         = scratch.scope();
         const auto storage = allocate(scratch, plan, count, p.experts, p.top_k,
-                                      p.ffn.gate_up_type == QType::Q8_G32_FP16);
+                                      p.ffn.gate_up_type == QType::Q8_G32_FP16,
+                                      kernel::shape_kind(p));
         const ScaledSwiGLUTerm shared{weights.shared, storage.shared};
         if (plan.implementation == kernel::ExpertImplementation::BlockScaled) {
             block_scaled::launch_control_shared(input, weights, storage.routes, storage.shared,
@@ -112,17 +117,19 @@ void topk_softmax_swiglu_moe(const Tensor& x, const MoeProfile& profile, const M
         if (plan.integer.grouped) {
             if (!plan.router.count_assignments) {
                 integer::launch_group_count_scan(storage.routes, {}, plan.integer.group,
-                                                 storage.experts.groups, execution);
+                                                 kernel::shape_kind(p), storage.experts.groups,
+                                                 execution);
             } else {
-                integer::launch_group_scan(storage.routes, plan.integer.group, storage.experts.groups,
-                                           execution);
+                integer::launch_group_scan(storage.routes, plan.integer.group,
+                                           kernel::shape_kind(p), storage.experts.groups, execution);
             }
             if (plan.integer.group.adaptive) {
                 integer::launch_token_swiglu(input, p, weights.routed, storage.routes, {}, &shared,
                                              mode, output, plan.integer.token, storage.experts, {},
                                              execution, nullptr, true);
             }
-            integer::launch_group_index(storage.routes, storage.experts.groups, execution);
+            integer::launch_group_index(storage.routes, kernel::shape_kind(p),
+                                        storage.experts.groups, execution);
             integer::launch_grouped_swiglu(input, p, weights.routed, storage.routes, &shared, mode,
                                            output, plan.integer.group, storage.experts, execution);
         } else {

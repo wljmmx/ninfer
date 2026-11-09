@@ -54,6 +54,13 @@ private:
 struct CudaSwiGLUExperts {
     ExpertBankDeviceView bank;
     ExpertActivationDivisors activation_divisors;
+    // Qwen4Exp stores an expert's gate and up as two separate objects instead of one fused
+    // [2I,H] parent, so the fused row map - "expert * 2I, then gate rows, then up rows" - cannot
+    // describe them: row I of the gate object is the *next* expert's first gate row. These two
+    // views therefore carry one image of `intermediate` rows per expert each, and `bank.gate_up`
+    // must stay empty while they are set; a call that supplies both is refused rather than
+    // resolved by precedence. Both are null on the fused layout.
+    ExpertMatrixDeviceView gate, up;
 };
 
 struct CpuSwiGLUExperts {

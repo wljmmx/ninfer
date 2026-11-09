@@ -48,11 +48,16 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void grouped_integer_down(
     if (info->direct) { return; }
     constexpr int ExpertThreads = ExpertWarps * 32;
     constexpr int GroupsPerRow  = Shape::intermediate / 64;
+    // port (sm_89): the scale staging moves 16 bytes at a time, so a row of scales must start on a
+    // 16-byte boundary. I=512 gives eight groups (16 bytes) and needs no padding; the Qwen4Exp
+    // I=640 gives ten groups (20 bytes), and the packed stride put every odd row at an offset the
+    // async copy refuses. Pad the row to 16 bytes and keep the read at the same stride.
+    constexpr int ScaleStride = (GroupsPerRow * 2 + 15) / 16 * 16;
     __shared__ __align__(16) __nv_bfloat16 As[BM * BK];
     __shared__ __align__(16) __nv_bfloat16 Bs[Stages][ExpertBN * BK];
     __shared__ __align__(16) std::uint8_t Cr[Stages][BM * 32];
     __shared__ __align__(16) std::uint8_t Hr[Stages][BM * Codec::kHighBytes];
-    __shared__ __align__(16) std::uint8_t Sr[BM * GroupsPerRow * 2];
+    __shared__ __align__(16) std::uint8_t Sr[BM * ScaleStride];
 
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -85,10 +90,28 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void grouped_integer_down(
         float acc[4][4]       = {};
 
         auto stage_scales = [&] {
-            for (int row = tid; row < BM; row += ExpertThreads) {
-                const int global_row  = matrix.row + row0 + row;
-                const std::int64_t gi = static_cast<std::int64_t>(global_row) * GroupsPerRow;
-                cp_async<16, Cache::cg>(&Sr[row * GroupsPerRow * 2], &scales[gi * 2]);
+            constexpr int ScaleRowBytes = GroupsPerRow * 2;
+            if constexpr (ScaleRowBytes % 16 == 0) {
+                // Eight groups (I=512) fill the async window exactly and neither read nor write can
+                // leave the row.
+                for (int row = tid; row < BM; row += ExpertThreads) {
+                    const int global_row  = matrix.row + row0 + row;
+                    const std::int64_t gi = static_cast<std::int64_t>(global_row) * GroupsPerRow;
+                    cp_async<16, Cache::cg>(&Sr[row * ScaleStride], &scales[gi * 2]);
+                }
+            } else {
+                // I=640 holds ten groups (20 bytes). A 16-byte async read would step over the end of
+                // the last expert's scale plane, so the row is staged one half at a time; 640 halves
+                // over one block are cheaper than the fence this replaces.
+                for (int item = tid; item < BM * GroupsPerRow; item += ExpertThreads) {
+                    const int row        = item / GroupsPerRow;
+                    const int group      = item - row * GroupsPerRow;
+                    const int global_row = matrix.row + row0 + row;
+                    const std::int64_t gi =
+                        static_cast<std::int64_t>(global_row) * GroupsPerRow + group;
+                    *reinterpret_cast<std::uint16_t*>(&Sr[row * ScaleStride + group * 2]) =
+                        *reinterpret_cast<const std::uint16_t*>(&scales[gi * 2]);
+                }
             }
         };
 
@@ -135,7 +158,7 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void grouped_integer_down(
                 const int row     = item / CodeChunksPerRow;
                 const int chunk   = item - row * CodeChunksPerRow;
                 const float scale = __half2float(__ushort_as_half(
-                    *reinterpret_cast<const std::uint16_t*>(&Sr[(row * GroupsPerRow + kt) * 2])));
+                    *reinterpret_cast<const std::uint16_t*>(&Sr[row * ScaleStride + kt * 2])));
                 unsigned decoded[4];
                 Codec::decode_eight(
                     *reinterpret_cast<const unsigned*>(&Cr[stage][row * 32 + chunk * 4]),

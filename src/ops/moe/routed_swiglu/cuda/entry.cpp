@@ -22,7 +22,7 @@ struct CallStorage {
 
 template <class Arena>
 CallStorage allocate(Arena& arena, const impl::Plan& plan, int tokens, ExpertSubsetKind subset,
-                     bool shared, bool split_activation) {
+                     bool shared, bool split_activation, kernel::ShapeKind kind) {
     if (plan.implementation == kernel::ExpertImplementation::BlockScaled) {
         CallStorage out;
         out.block_scaled = block_scaled::allocate(arena, plan.block_scaled, tokens,
@@ -30,13 +30,21 @@ CallStorage allocate(Arena& arena, const impl::Plan& plan, int tokens, ExpertSub
         return out;
     }
     if (subset == ExpertSubsetKind::None) {
-        if (!shared) { return {}; }
-        return {.integer = integer::allocate_shared(arena, tokens)};
+        CallStorage out;
+        if (!shared) { return out; }
+        kernel::with_shape(kind, [&]<class Shape>() {
+            out.integer = integer::allocate_shared<Shape>(arena, tokens);
+        });
+        return out;
     }
-    return {.integer = plan.integer.grouped
-                           ? integer::allocate_grouped(arena, tokens, plan.integer.group, shared,
-                                                       split_activation)
-                           : integer::allocate_token(arena, tokens, shared)};
+    CallStorage out;
+    kernel::with_shape(kind, [&]<class Shape>() {
+        out.integer = plan.integer.grouped
+                          ? integer::allocate_grouped<Shape>(arena, tokens, plan.integer.group, shared,
+                                                             split_activation)
+                          : integer::allocate_token<Shape>(arena, tokens, shared);
+    });
+    return out;
 }
 
 std::size_t capacity(const RoutedSwiGLUProfile& profile, const SwiGLUProfile* shared,
@@ -51,7 +59,8 @@ std::size_t capacity(const RoutedSwiGLUProfile& profile, const SwiGLUProfile* sh
     return detail::interval_capacity(first, last, boundaries, impl::kSliceTokens, [&](int tokens) {
         WorkspaceLayoutBuilder layout;
         (void)allocate(layout, shape.select(tokens, shared != nullptr), tokens, subset,
-                       shared != nullptr, profile.ffn.gate_up_type == QType::Q8_G32_FP16);
+                       shared != nullptr, profile.ffn.gate_up_type == QType::Q8_G32_FP16,
+                       kernel::shape_kind(profile));
         return layout.peak_bytes(1);
     });
 }
@@ -103,7 +112,8 @@ void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiG
         auto scope         = scratch.scope();
         const auto plan    = shape.select(count, shared != nullptr);
         const auto buffers = allocate(scratch, plan, count, subset.kind, shared != nullptr,
-                                      profile.ffn.gate_up_type == QType::Q8_G32_FP16);
+                                      profile.ffn.gate_up_type == QType::Q8_G32_FP16,
+                                      kernel::shape_kind(profile));
         if (plan.implementation == kernel::ExpertImplementation::BlockScaled) {
             // The block-scaled kernels skip a masked-out route without counting it. Reporting a zero
             // there would be worse than refusing: a predicted skip would read "no miss" from a path
@@ -117,20 +127,21 @@ void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiG
             continue;
         }
         const auto& storage = buffers.integer;
+        const auto kind     = kernel::shape_kind(profile);
         if (subset.kind == ExpertSubsetKind::None) {
             integer::launch_shared_swiglu(input, *term, mode, output, storage, plan.integer.shared,
-                                          execution);
+                                          kind, execution);
             continue;
         }
         if (plan.integer.grouped) {
-            integer::launch_group_count_scan(selection, subset, plan.integer.group, storage.groups,
-                                              execution, missed);
+            integer::launch_group_count_scan(selection, subset, plan.integer.group, kind,
+                                              storage.groups, execution, missed);
             if (plan.integer.group.adaptive) {
                 integer::launch_token_swiglu(input, profile, experts, selection, subset,
                                              term ? &*term : nullptr, mode, output,
                                              plan.integer.token, storage, {}, execution, missed, true);
             }
-            integer::launch_group_index(selection, storage.groups, execution);
+            integer::launch_group_index(selection, kind, storage.groups, execution);
             integer::launch_grouped_swiglu(input, profile, experts, selection,
                                            term ? &*term : nullptr, mode, output,
                                            plan.integer.group, storage, execution);

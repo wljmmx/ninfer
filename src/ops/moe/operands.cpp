@@ -44,9 +44,21 @@ void validate_expert_profile(const RoutedSwiGLUProfile& p) {
         const bool fp8 = f.gate_up_type == QType::FP8_E4M3FN_BLOCK128X128_BF16 &&
                          f.gate_up_layout == QuantLayout::BlockScaleM128K128 &&
                          f.gate_up_policy == LinearPolicy::AllowA8;
-        require(f.intermediate == 640 && (nvfp4 || fp8) && f.down_type == f.gate_up_type &&
-                    f.down_layout == f.gate_up_layout && f.down_policy == f.gate_up_policy,
-                "routed SwiGLU: unsupported block-scaled profile");
+        if (nvfp4 || fp8) {
+            require(f.intermediate == 640 && f.down_type == f.gate_up_type &&
+                        f.down_layout == f.gate_up_layout && f.down_policy == f.gate_up_policy,
+                    "routed SwiGLU: unsupported block-scaled profile");
+            return;
+        }
+        // port (sm_89): the Qwen4Exp expert shape in the groupwise-int family - a q4 gate/up
+        // object and a q5 or q6 down object, all RowSplit. Decode state only; the artifact keeps
+        // its own quantisation.
+        require(f.intermediate == 640 && f.gate_up_type == QType::Q4_G64_FP16 &&
+                    (f.down_type == QType::Q5_G64_FP16 || f.down_type == QType::Q6_G64_FP16) &&
+                    f.gate_up_layout == QuantLayout::RowSplit &&
+                    f.down_layout == QuantLayout::RowSplit && valid_linear_policy(f.gate_up_policy) &&
+                    valid_linear_policy(f.down_policy),
+                "routed SwiGLU: unsupported Qwen4Exp weight profile");
         return;
     }
     require(f.intermediate == 512 && f.gate_up_layout == QuantLayout::RowSplit &&
@@ -169,9 +181,24 @@ void MoeOperands::subset(ExpertSubset subset, int experts) {
 
 void MoeOperands::experts(const CudaSwiGLUExperts& w, const RoutedSwiGLUProfile& p) {
     operand::device(w.bank.device, device_, op_, "expert bank");
-    require(w.bank.count == std::uint32_t(p.experts) &&
-                bool(w.bank.gate_up.offsets) == bool(w.bank.down.offsets),
+    // A split bank names the gate and the up object separately; a fused bank names one parent.
+    // Supplying both forms is refused instead of resolved by precedence: the two row maps are
+    // different, and picking one silently would read whatever happened to be at the address.
+    const bool split = w.gate.codes != nullptr || w.up.codes != nullptr;
+    require(w.bank.count == std::uint32_t(p.experts),
             "MoE: expert bank count or addressing differs");
+    if (split) {
+        require(w.gate.codes && w.up.codes && w.bank.gate_up.codes == nullptr &&
+                    w.bank.gate_up.high == nullptr && w.bank.gate_up.scales == nullptr &&
+                    w.bank.gate_up.offsets == nullptr && !w.bank.gate_up.indexed_storage.data,
+                "MoE: split gate/up banks cannot be combined with a fused gate_up view");
+        require(bool(w.gate.offsets) == bool(w.up.offsets) &&
+                    bool(w.gate.offsets) == bool(w.bank.down.offsets),
+                "MoE: split gate/up addressing differs");
+    } else {
+        require(bool(w.bank.gate_up.offsets) == bool(w.bank.down.offsets),
+                "MoE: expert bank count or addressing differs");
+    }
     for (const auto divisor : {w.activation_divisors.gate_up, w.activation_divisors.down}) {
         require(!divisor || (std::isfinite(*divisor) && *divisor > 0),
                 "MoE: activation divisor must be finite and positive");
@@ -236,8 +263,24 @@ void MoeOperands::experts(const CudaSwiGLUExperts& w, const RoutedSwiGLUProfile&
                   ? 2
                   : 16);
     };
-    matrix(w.bank.gate_up, p.ffn.gate_up_type, p.ffn.gate_up_layout, 2 * p.ffn.intermediate,
-           p.ffn.hidden);
+    if (split) {
+        // Each half holds one image of `intermediate` rows per expert. A bank whose stride spans
+        // two images is a fused gate_up parent wearing the wrong name, and reading it as one half
+        // would visit every other expert's gate rows; refuse it here rather than in a comment.
+        const auto bytes = matrix_bytes(p.ffn.gate_up_type, p.ffn.gate_up_layout,
+                                        p.ffn.intermediate, p.ffn.hidden);
+        for (const auto* view : {&w.gate, &w.up}) {
+            if (view->offsets) { continue; }
+            require(view->code_stride >= bytes.codes && view->code_stride < 2 * bytes.codes,
+                    "MoE: a split gate/up bank must stride exactly one expert image");
+        }
+        require(w.gate.codes != w.up.codes, "MoE: split gate and up banks are the same object");
+        matrix(w.gate, p.ffn.gate_up_type, p.ffn.gate_up_layout, p.ffn.intermediate, p.ffn.hidden);
+        matrix(w.up, p.ffn.gate_up_type, p.ffn.gate_up_layout, p.ffn.intermediate, p.ffn.hidden);
+    } else {
+        matrix(w.bank.gate_up, p.ffn.gate_up_type, p.ffn.gate_up_layout, 2 * p.ffn.intermediate,
+               p.ffn.hidden);
+    }
     matrix(w.bank.down, p.ffn.down_type, p.ffn.down_layout, p.ffn.hidden, p.ffn.intermediate);
 }
 

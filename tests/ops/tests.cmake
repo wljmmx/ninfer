@@ -162,3 +162,8 @@ include("${CMAKE_CURRENT_LIST_DIR}/softmax_attention/qsa/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/rmsnorm/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/gdn_control/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/ple/tests.cmake")
+# port (sm_89): the Qwen4Exp expert row (H2560/I640/E512/K10) with the gate and up matrices in two
+# objects, which is how the shipped artifact stores its q4 experts.
+ninfer_add_op_test(ninfer_moe_qwen4exp_split_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_moe_qwen4exp_split.cpp"
+  LIBRARIES ninfer_ops)

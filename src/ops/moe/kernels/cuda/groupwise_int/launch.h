@@ -66,19 +66,19 @@ struct ExpertStorage {
     GroupedStorage groups;
 };
 
-void launch_group_count(const ExpertRoutes& routes, ExpertSubset subset,
+void launch_group_count(const ExpertRoutes& routes, ExpertSubset subset, ShapeKind kind,
                         const GroupedStorage& storage, CudaExecutionView execution);
-void launch_group_scan(const ExpertRoutes& routes, const GroupedPlan& plan,
+void launch_group_scan(const ExpertRoutes& routes, const GroupedPlan& plan, ShapeKind kind,
                        const GroupedStorage& storage, CudaExecutionView execution,
                        std::uint32_t* missed = nullptr);
-void launch_group_index(const ExpertRoutes& routes, const GroupedStorage& storage,
+void launch_group_index(const ExpertRoutes& routes, ShapeKind kind, const GroupedStorage& storage,
                         CudaExecutionView execution);
 
 // port (sm_89): count and scan in one launch for a single-tile grouping (a decode step).
 // `missed`, when not null, receives the routes the mask excluded (see routed_swiglu's note).
 void launch_group_count_scan(const ExpertRoutes& routes, ExpertSubset subset, const GroupedPlan& plan,
-                             const GroupedStorage& storage, CudaExecutionView execution,
-                             std::uint32_t* missed = nullptr);
+                             ShapeKind kind, const GroupedStorage& storage,
+                             CudaExecutionView execution, std::uint32_t* missed = nullptr);
 
 // port (sm_89): O1's coverage test (see route_coverage). One block reduces over every assignment and
 // stores the count, so a covered layer and an uncovered one are told apart by one word rather than
@@ -99,5 +99,5 @@ void launch_grouped_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
                            const ExpertStorage& storage, CudaExecutionView execution);
 void launch_shared_swiglu(const Tensor& x, const ScaledSwiGLUTerm& shared, MoeEpilogue epilogue,
                           Tensor& destination, const ExpertStorage& storage, const SharedPlan& plan,
-                          CudaExecutionView execution);
+                          ShapeKind kind, CudaExecutionView execution);
 } // namespace ninfer::ops::detail::moe_cuda::groupwise_int
