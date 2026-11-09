@@ -4,6 +4,7 @@
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/w4a8.h"
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace ninfer::models::qwen3_5::execution {
@@ -30,6 +31,18 @@ std::size_t attention_projection_workspace_bytes(const AttentionParameters& para
         return ops::attn_input_proj_workspace_capacity_bytes(weight.qtype, weight.n, weight.k,
                                                          single->policy, first, last);
     }
+    const auto* separate = std::get_if<ops::SeparateProjectionWeights>(&parameters.projection);
+    if (separate != nullptr) {
+        // One Linear per projection: the widest capacity covers all four, which the caller runs
+        // one after another in the same arena.
+        std::size_t bytes = 0;
+        for (const auto& row : separate->rows) {
+            const auto& weight = row.weight;
+            bytes = std::max(bytes, ops::linear_workspace_capacity_bytes(
+                                        weight.qtype, weight.n, weight.k, row.policy, first, last));
+        }
+        return bytes;
+    }
     const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection);
     return pair == nullptr ? 0
                            : ops::w4a8_attn_input_workspace_capacity_bytes(
@@ -39,7 +52,14 @@ std::size_t attention_projection_workspace_bytes(const AttentionParameters& para
 void attention_projection(const Tensor& hidden, const AttentionParameters& parameters,
                           Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
                           WorkspaceArena& workspace, cudaStream_t stream) {
-    if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
+    const auto* separate = std::get_if<ops::SeparateProjectionWeights>(&parameters.projection);
+    const auto* pair     = std::get_if<ops::PairedProjectionWeights>(&parameters.projection);
+    if (separate != nullptr) {
+        // rows holds query, key, gate, value in that order; the outputs are named apart.
+        ops::attn_input_proj(hidden, separate->rows[0].weight, separate->rows[1].weight,
+                             separate->rows[2].weight, separate->rows[3].weight, query, gate, key,
+                             value, separate->rows[0].policy, workspace, stream);
+    } else if (pair != nullptr) {
         ops::attn_input_proj(hidden, pair->first, pair->second, query, gate, key, value,
                              ops::LinearPolicy::AllowA8, workspace, stream);
     } else {

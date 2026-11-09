@@ -19,6 +19,17 @@ std::size_t gdn_projection_workspace_bytes(const GdnParameters& parameters, std:
         return ops::gdn_input_proj_workspace_capacity_bytes(w.qtype, w.n, w.k, single->policy,
                                                             first, last);
     }
+    const auto* separate = std::get_if<ops::SeparateProjectionWeights>(&parameters.projection);
+    if (separate != nullptr) {
+        // One Linear per projection: the widest capacity covers all four.
+        std::size_t bytes = 0;
+        for (const auto& row : separate->rows) {
+            const auto& w = row.weight;
+            bytes = std::max(bytes, ops::linear_workspace_capacity_bytes(w.qtype, w.n, w.k,
+                                                                         row.policy, first, last));
+        }
+        return bytes;
+    }
     const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection);
     return pair == nullptr ? 0
                            : ops::w4a8_gdn_input_workspace_capacity_bytes(
@@ -64,7 +75,14 @@ std::size_t gdn_record_workspace_bytes(const GdnParameters& parameters, const Gd
 
 void gdn_projection(const Tensor& hidden, const GdnParameters& parameters, Tensor& qkv, Tensor& z,
                     WorkspaceArena& workspace, cudaStream_t stream) {
-    if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
+    const auto* separate = std::get_if<ops::SeparateProjectionWeights>(&parameters.projection);
+    const auto* pair     = std::get_if<ops::PairedProjectionWeights>(&parameters.projection);
+    if (separate != nullptr) {
+        // rows holds query, key, value, z; the operator writes the first three into qkv in order.
+        ops::gdn_input_proj(hidden, separate->rows[0].weight, separate->rows[1].weight,
+                            separate->rows[2].weight, separate->rows[3].weight, qkv, z,
+                            separate->rows[0].policy, workspace, stream);
+    } else if (pair != nullptr) {
         ops::gdn_input_proj(hidden, pair->first, pair->second, qkv, z,
                             ops::LinearPolicy::AllowA8, workspace, stream);
     } else {
@@ -89,6 +107,14 @@ void gdn_projection_snapshot(const Tensor& hidden, const GdnParameters& paramete
     auto scope = workspace.scope();
     WorkspaceArena scratch(workspace.alloc_bytes(gdn_snapshot_workspace_bytes(
         parameters, config, hidden.ne[2], hidden.ne[1], hidden.ne[1])));
+    if (std::holds_alternative<ops::SeparateProjectionWeights>(parameters.projection)) {
+        // The state-writing forms fuse the projection and the convolution step around one parent
+        // row order; a per-projection artifact has no such order and would need its own composed
+        // route. Refuse by name instead of reading the wrong rows.
+        throw std::invalid_argument(
+            "GDN projection snapshot: this artifact keeps q, k, v and z in their own parents; the "
+            "state-writing snapshot form needs a fused parent");
+    }
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
         ops::gdn_input_proj_conv_snapshot(hidden, pair->first, pair->second, parameters.convolution,
                                           conv_states, valid_columns, initial_slots,
@@ -109,6 +135,11 @@ void gdn_projection_record(const Tensor& hidden, const GdnParameters& parameters
     auto scope = workspace.scope();
     WorkspaceArena scratch(workspace.alloc_bytes(
         gdn_record_workspace_bytes(parameters, config, hidden.ne[2], hidden.ne[1], hidden.ne[1])));
+    if (std::holds_alternative<ops::SeparateProjectionWeights>(parameters.projection)) {
+        throw std::invalid_argument(
+            "GDN projection record: this artifact keeps q, k, v and z in their own parents; the "
+            "record-producing form needs a fused parent");
+    }
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
         ops::gdn_input_proj_conv_record(hidden, pair->first, pair->second, parameters.convolution,
                                         conv_states, valid_columns, initial_slots, conv_record,

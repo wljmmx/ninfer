@@ -98,6 +98,20 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight,
                      Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream);
 
 /**
+ * Four-parent Q/K/output-gate/V projection.
+ *
+ * Qwen4Exp keeps the query, key, output gate and value matrices in their own parents, so no fused
+ * row order exists to split. Each projection is an independent Linear over the same `x`; this is
+ * the generic route whenever the parent geometry is not one of the compiled fused forms above, and
+ * it consults no shape registry of its own. `gate_output` receives the output gate. The four
+ * matrices must each be registered by Linear for their own [N,K] problem, and `workspace` must
+ * cover the largest of their Linear capacities.
+ */
+void attn_input_proj(const Tensor& x, const Weight& query, const Weight& key, const Weight& gate,
+                     const Weight& value, Tensor& q, Tensor& gate_output, Tensor& k, Tensor& v,
+                     LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
  * Three-output Q8 specialization. The Q8_G32_FP16 RowSplit parent stores rows in order
  * [query 4096, key 1024, value 1024]. Registered parent forms are [6144,2048] with BF16
  * x [2048,T] for the Qwen3.6 companion and [6144,5120] with BF16 x [5120,T] for DFlash2.

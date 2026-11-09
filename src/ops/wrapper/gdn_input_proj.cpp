@@ -784,6 +784,34 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
                            stream);
 }
 
+void gdn_input_proj(const Tensor& x, const Weight& query, const Weight& key, const Weight& value,
+                    const Weight& z_weight, Tensor& qkv, Tensor& z, LinearPolicy policy,
+                    WorkspaceArena& workspace, cudaStream_t stream) {
+    validate_policy(policy);
+    const std::int32_t cols = x.ne[1];
+    if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
+    const std::int32_t qkv_rows = query.n + key.n + value.n;
+    require_matrix(x, x.ne[0], cols, "x");
+    require_matrix(qkv, qkv_rows, cols, "qkv");
+    require_matrix(z, z_weight.n, cols, "z");
+    require_single_parent_nonoverlap(x, qkv, z);
+    // The row windows below start on a parent row, and a row is the projection's own width, so
+    // each window is 16-byte aligned exactly when its first row is. Every projection width here is
+    // a multiple of 8 columns.
+    const auto row_window = [](Tensor& source, std::int32_t first_row, std::int32_t rows) {
+        return Tensor(static_cast<char*>(source.data) +
+                          static_cast<std::size_t>(first_row) * source.nb[1],
+                      source.dtype, {rows, source.ne[1]});
+    };
+    Tensor q_out = row_window(qkv, 0, query.n);
+    Tensor k_out = row_window(qkv, query.n, key.n);
+    Tensor v_out = row_window(qkv, query.n + key.n, value.n);
+    ops::linear(x, query, q_out, policy, workspace, stream);
+    ops::linear(x, key, k_out, policy, workspace, stream);
+    ops::linear(x, value, v_out, policy, workspace, stream);
+    ops::linear(x, z_weight, z, policy, workspace, stream);
+}
+
 std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {

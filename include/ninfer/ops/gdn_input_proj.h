@@ -92,6 +92,18 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
                     cudaStream_t stream);
 
 /**
+ * Four-parent GDN projection: the query, key, value and z matrices live in their own parents, as
+ * Qwen4Exp stores them, so there is no fused row order to split. `qkv` receives the query, key and
+ * value projections in that row order and `z` receives the z projection; the row widths are the
+ * parents' own, so `qkv` must be [query.n + key.n + value.n, T]. Each projection is an independent
+ * Linear, which is the generic route whenever the parent geometry is not one of the compiled fused
+ * forms above. `workspace` must cover the largest of their Linear capacities.
+ */
+void gdn_input_proj(const Tensor& x, const Weight& query, const Weight& key, const Weight& value,
+                    const Weight& z_weight, Tensor& qkv, Tensor& z, LinearPolicy policy,
+                    WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
  * Returns the transient capacity required by the registered two-parent Q4/Q5 or single-parent Q8
  * snapshot profile. `batch_size` is exact and the query covers every W in the inclusive width
  * interval. B=1 preserves the format-specific fused/composed resolver. B=2..8 uses aggregate

@@ -5,6 +5,7 @@
 #include <array>
 #include <limits>
 #include <new>
+#include <type_traits>
 
 namespace ninfer::test::gdn_control {
 namespace {
@@ -145,7 +146,14 @@ int validate_capacity(Profile p, bool normalize_input) {
     auto metadata = weights.prepared;
     std::visit(
         [](auto& value) {
-            if constexpr (requires { value.weight; }) {
+            if constexpr (std::is_same_v<std::decay_t<decltype(value)>,
+                                         ops::SeparateProjectionWeights>) {
+                // GDN control never prepares this form; the visitor still compiles for it.
+                for (auto& row : value.rows) {
+                    row.weight.qdata     = nullptr;
+                    row.weight.payload   = nullptr;
+                }
+            } else if constexpr (requires { value.weight; }) {
                 value.weight.qdata   = nullptr;
                 value.weight.payload = nullptr;
             } else {

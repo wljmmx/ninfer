@@ -4,9 +4,12 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/sparse_moe.h"
 
+#include <array>
 #include <optional>
 #include <span>
+#include <utility>
 #include <variant>
+#include <vector>
 
 namespace ninfer::ops {
 
@@ -26,7 +29,16 @@ struct PairedProjectionWeights {
     Weight first, second;
 };
 
-using ProjectionWeights = std::variant<SingleProjectionWeight, PairedProjectionWeights>;
+// One parent per logical projection: the artifact keeps each matrix in its own object, so the four
+// inputs have no fused row order to concatenate. `rows` follows the caller's own order - query,
+// key, gate, value for attention, query, key, value, z for GDN - and each row is executed on its
+// own through Linear.
+struct SeparateProjectionWeights {
+    std::array<SingleProjectionWeight, 4> rows;
+};
+
+using ProjectionWeights =
+    std::variant<SingleProjectionWeight, PairedProjectionWeights, SeparateProjectionWeights>;
 
 // port (sm_89): address-independent matrix description used by execution planning. The bench
 // tree keeps these in projection_weights.h; this tree keeps one header for both.
@@ -42,6 +54,9 @@ struct LinearProfile {
 struct ProjectionProfile {
     LinearProfile first;
     std::optional<LinearProfile> second;
+    // One entry per parent when the artifact keeps each projection in its own object; empty for
+    // the fused and paired forms.
+    std::vector<LinearProfile> separate;
 
     friend bool operator==(const ProjectionProfile&, const ProjectionProfile&) = default;
 };
@@ -54,10 +69,16 @@ struct ProjectionProfile {
 
 [[nodiscard]] inline ProjectionProfile projection_profile(const ProjectionWeights& weights) {
     if (const auto* single = std::get_if<SingleProjectionWeight>(&weights)) {
-        return {linear_profile(*single), {}};
+        return {linear_profile(*single), {}, {}};
+    }
+    if (const auto* separate = std::get_if<SeparateProjectionWeights>(&weights)) {
+        std::vector<LinearProfile> rows;
+        rows.reserve(separate->rows.size());
+        for (const auto& row : separate->rows) { rows.push_back(linear_profile(row)); }
+        return {rows.front(), {}, std::move(rows)};
     }
     const auto& pair = std::get<PairedProjectionWeights>(weights);
-    return {linear_profile({pair.first}), linear_profile({pair.second})};
+    return {linear_profile({pair.first}), linear_profile({pair.second}), {}};
 }
 
 // Prepare the existing native forms; no device allocation, upload, execution or graph rewrite.

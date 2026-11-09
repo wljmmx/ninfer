@@ -127,7 +127,20 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
                         k == std::vector<std::uint64_t>{512, 2048} && third == q && fourth == k
                   : q == std::vector<std::uint64_t>{2048, 2048} && k == q &&
                         third == std::vector<std::uint64_t>{4096, 2048} && fourth == third;
-    require(dense || moe, "input projection: unsupported logical projection geometry");
+    // A geometry the compiled fused forms do not register is the artifact's own layout: every
+    // logical matrix is a complete parent region (Qwen4Exp keeps q, k, the output gate and v, or
+    // GDN's q, k, v and z, in their own objects). Each projection is then executed on its own.
+    if (!dense && !moe) {
+        std::array<SingleProjectionWeight, 4> rows;
+        for (std::size_t i = 0; i < inputs.size(); ++i) {
+            const std::array one{inputs[i]};
+            rows[i] = single(one);
+        }
+        // One call runs four Linears, so the strictest admitted policy governs all of them.
+        const auto policy = common_policy(inputs);
+        for (auto& row : rows) { row.policy = policy; }
+        return SeparateProjectionWeights{rows};
+    }
     const auto joined = concatenate_rows(inputs);
     if (contiguous(joined)) {
         auto result       = single(inputs);

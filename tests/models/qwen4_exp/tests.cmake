@@ -9,3 +9,7 @@ ninfer_add_test(ninfer_ple_disk_test
 ninfer_add_test(ninfer_qwen4_exp_parameters_banked_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_parameters_banked.cpp"
   LIBRARIES ninfer_model_runtime)
+
+ninfer_add_test(ninfer_qwen4_exp_projection_dispatch_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_projection_dispatch.cpp"
+  LIBRARIES ninfer_model_runtime)
