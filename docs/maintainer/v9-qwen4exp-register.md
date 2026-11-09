@@ -107,3 +107,16 @@
 - `tests/convert/test_gguf_qwen4exp.py`（新，4 项全过）：容器/反量化对拍 gguf-py 自身（随机块覆盖 Q2_K/Q4_K/Q5_K/Q6_K/Q8_0/Q4_0/F16，含有界读）；名称/形状映射断言（conv 的 (C,1,taps)、专家 bank (E,2I,H)、indexer 融合、I64 控制量）；合并张量拆回与 V 头逆置换逐元素断言；真实转换（合成 Qwen4Exp GGUF → `--recipe qwen4_exp --device cpu` 产出 v3 工件 64 objects/59 tensors，PLE 控制量逐字节、bf16 张量逐字相等）。
 - `python -m pytest tests/convert -q`：28 passed / 1 skipped（含既有 27 项）。
 - 未验证部分（如实登记）：真实 100 GiB 级 qwen4exp 权重不存在，容量/带宽实账仍待工件；运行时装载属 T192–T198。GGUF 已量化源再转只保留该文件的近似精度（文档已写明）。
+
+## 真实工件转换完成（2026-11-09）
+
+源：`R:\model\qwen4exp\UD-Q4_K_XL\Qwen3.8-Flash-Next-UD-Q4_K_XL-0000{1..4}-of-00004.gguf`（4 片 103.7 GiB；第 1 片为**元数据片**：67 个 KV、0 张量；第 4 片是单张 27 GiB 的 `per_layer_token_embd`，IQ4_NL）。
+侧车：`R:\model\qwen4exp\hf\{config.json,tokenizer.json,tokenizer_config.json,generation_config.json,chat_template.jinja}`（取自 Qwen/Qwen3.8-Flash-Next；tokenizer.json 完整 12.8 MB，首次下载截断后断点续传补齐）。
+
+命令：`python -m tools.convert --model <首片> --recipe qwen4_exp --components text --gguf-config ...\hf\config.json --gguf-root ...\hf --device cpu --name qwen3.8-flash-next-ud-q4k-xl --out R:\model\qwen3_8_flash_next\qwen3_8_flash_next.ninfer`
+
+结果（conversion.json）：**1163 张量 / 1168 对象 / 4 个文件 / 121.25 GB**，用时 **2890.8 s**；格式分布 q5 436、bf16 353、q4 253、q6 48、q8 1、fp32 72；device=cpu（本机 torch 2.15.0+cpu）。工件 inspect：容器 **version 3**，config 与官方一致（mrope_section [11,11,10]、partial_rotary_factor 0.25、ple_shard_shape [2500012,160]（128 分片）、image/video_token_id），bindings 1308。
+
+**装载验证（如实登记失败点）**：ninfer.exe 打开该工件在 planning 108 us 后失败——`error: Qwen3.5 config: text config: unknown member attention_bias`。引擎目前只有 Qwen3.5 的配置/程序路径，**没有 Qwen4Exp 架构入口（T192–T198 未做）**，因此本工件**无法端到端推理，无 tok/s 可测**。已实测的只有组件级：ninfer_ple_lookup/conv/gate/state_extract/disk 五项全部通过（8.8/14.1/5.9/3.8/0.24 s）。
+
+容量账（按工件配置计算，非实测 tps）：满注意力层 12 层，KV = 2 x 2 kv_head x 256 x 2 B x 12 = **24 KiB/token**（2K=48 MiB、8K=192 MiB、32K=768 MiB、128K=3.0 GiB、256K=6.0 GiB）；PLE 表 q4 约 **25.3 GiB**；路由专家 120.8 G 元素约 **69 GiB** -> 24 GB 卡必须走专家流式 + PLE 页式。
