@@ -110,6 +110,11 @@ struct RoutedMoeParameters {
     ops::CudaSwiGLUExperts routed;
     // port (sm_89): non-null when the experts stream from the artifact instead of being resident.
     std::shared_ptr<ExpertStream> stream;
+    // port (sm_89): keeps the split form's control rows alive. Qwen4Exp stores the router [E,H]
+    // and the shared logit [1,H] in two parents, while the routing op reads one [E+1,H] matrix;
+    // preparation copies the two into this device allocation and `control` points into it. Null on
+    // the fused form, whose control rows are one contiguous region of the artifact.
+    std::shared_ptr<void> control_rows;
     // Non-null when the artifact keeps those matrices apart (Qwen4Exp). The fused members above
     // then hold nothing, and a caller that needs a fused form asks the accessors below and is
     // refused by name instead of multiplying by an empty matrix.

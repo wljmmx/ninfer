@@ -121,11 +121,40 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
                              ? static_cast<const ExpertBlobReader*>(instance.expert_host_source.get())
                              : static_cast<const ExpertBlobReader*>(instance.expert_source.get());
 
+    // port (sm_89): the gate/up/down form owns three cache runs per layer - one per matrix - while
+    // the fused form owns one. The cache's entry image always carries two matrix slots (a gate_up
+    // and a down), so a run that owns one matrix leaves the spare slot as a single row of the same
+    // column axis: about 0.5 KiB per expert that nothing ever addresses.
+    //
+    // `runs[i]` records where stream i's runs start, so the attach and the file plans below index
+    // exactly the way the cache does.
+    struct StreamRuns {
+        bool split          = false;
+        std::uint32_t first = 0;
+    };
+    std::vector<StreamRuns> runs(streams.size());
+    const auto spare_matrix = [](const WeightGeometry& expert) {
+        const std::uint64_t shape[2] = {1, expert.shape.empty() ? 0 : expert.shape.back()};
+        return weight_geometry(expert.format, expert.layout, shape);
+    };
     std::vector<ExpertBankSpec> specs;
-    specs.reserve(streams.size());
-    for (const auto* stream : streams) {
-        specs.push_back({{stream->gate_up_expert_geometry()}, {stream->down_expert_geometry()},
-                         stream->count(), false});
+    specs.reserve(streams.size() * 3);
+    for (std::size_t i = 0; i < streams.size(); ++i) {
+        const auto* stream = streams[i];
+        runs[i].first      = static_cast<std::uint32_t>(specs.size());
+        if (!stream->split_banks()) {
+            specs.push_back({{stream->gate_up_expert_geometry()}, {stream->down_expert_geometry()},
+                             stream->count(), false});
+            continue;
+        }
+        runs[i].split = true;
+        for (const auto role : {models::qwen3_5::execution::ExpertMatrixRole::Gate,
+                                models::qwen3_5::execution::ExpertMatrixRole::Up,
+                                models::qwen3_5::execution::ExpertMatrixRole::Down}) {
+            const auto& expert = stream->split_expert_geometry(role);
+            specs.push_back({ExpertMatrixSpec{expert}, ExpertMatrixSpec{spare_matrix(expert)},
+                             stream->count(), false});
+        }
     }
     const auto probe = describe_expert_cache(specs, {.capacity_bytes = 256});
     // port (sm_89): the pool holds a whole number of slots, one per expert regardless of bank,
@@ -176,12 +205,30 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
                                       .capacity_limit_bytes = capacity_limit});
 
     std::vector<ExpertFileBank> files;
-    files.reserve(streams.size());
+    files.reserve(streams.size() * 3);
     // port (sm_89): the bank description must match the reader that was created above. A host
     // tier has no artifact reader at all, so asking it for one dereferences a null pointer.
     const bool host_tier = instance.expert_host_source != nullptr;
     for (std::size_t i = 0; i < streams.size(); ++i) {
         const auto* stream = streams[i];
+        if (runs[i].split) {
+            // One file plan per matrix: the entry image carries only that matrix, and the artifact
+            // stores its experts either as row blocks of one object or as one object each.
+            for (std::size_t role = 0; role < 3; ++role) {
+                const auto matrix_role =
+                    static_cast<models::qwen3_5::execution::ExpertMatrixRole>(role);
+                std::vector<artifact::ObjectHandle> objects;
+                for (const auto object : stream->split_objects(matrix_role)) {
+                    objects.push_back(artifact::ObjectHandle{object});
+                }
+                files.push_back(artifact::describe_matrix_expert_files(
+                    instance.expert_source->reader(), objects,
+                    stream->split_expert_geometry(matrix_role), stream->count(),
+                    static_cast<std::uint32_t>(stream->split_layout(matrix_role).region.rows),
+                    requirements.banks[runs[i].first + role]));
+            }
+            continue;
+        }
         const auto gate_up = artifact::ObjectHandle{stream->gate_up_object()};
         const auto down    = artifact::ObjectHandle{stream->down_object()};
         const auto gu_rows = static_cast<std::uint32_t>(stream->gate_up_layout().region.rows);
@@ -205,11 +252,13 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
                                 ? artifact::describe_expert_objects(
                                       gate_up_objects, down_objects,
                                       stream->gate_up_expert_geometry(),
-                                      stream->down_expert_geometry(), requirements.banks[i])
+                                      stream->down_expert_geometry(),
+                                      requirements.banks[runs[i].first])
                                 : artifact::describe_expert_files(
                                       instance.expert_source->reader(), gate_up_objects,
                                       down_objects, stream->gate_up_expert_geometry(),
-                                      stream->down_expert_geometry(), requirements.banks[i]));
+                                      stream->down_expert_geometry(),
+                                      requirements.banks[runs[i].first]));
             continue;
         }
         // port (sm_89): the host tier takes the same plan as the device tier. describe_fused_expert_host
@@ -219,15 +268,24 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
         // that happened to re-read by image offset. The per-expert plan was never affected.
         files.push_back(artifact::describe_fused_expert_files(
             instance.expert_source->reader(), gate_up, down, stream->gate_up_parent(),
-            stream->down_parent(), stream->count(), gu_rows, dn_rows, requirements.banks[i]));
+            stream->down_parent(), stream->count(), gu_rows, dn_rows,
+            requirements.banks[runs[i].first]));
     }
     expert_debug("files", files.size(), requirements.banks.size());
     instance.expert_cache = std::make_unique<ExpertCache>(
         specs, requirements, device, std::span<const ExpertBankPair>{}, files,
         source);
     for (std::size_t i = 0; i < streams.size(); ++i) {
-        streams[i]->attach(*instance.expert_cache, static_cast<std::uint32_t>(i),
-                           requirements.banks[i]);
+        const auto first = runs[i].first;
+        if (!runs[i].split) {
+            streams[i]->attach(*instance.expert_cache, first, requirements.banks[first]);
+            continue;
+        }
+        // port (sm_89): one cache run per matrix. `bank_` becomes the gate run, which is the
+        // layer's identity; the three tables are reachable through the stream's split accessors.
+        streams[i]->attach_split(*instance.expert_cache, first, requirements.banks[first], first + 1,
+                                 requirements.banks[first + 1], first + 2,
+                                 requirements.banks[first + 2]);
     }
     expert_debug("attached", instance.expert_cache->capacity_bytes(),
                  instance.expert_cache->windows());
@@ -471,7 +529,30 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
             short_pool = true;
         }
     }
-    if (short_pool && !streams.empty()) {
+    // port (sm_89): the host tier is one pool run per layer - its entry image, its slot table and the
+    // GH3 placement word all name one bank - so the gate/up/down form (three runs) cannot use it.
+    // Instead of building an arena no layer can address, the shortfall is reported with the numbers
+    // the first MoE layer will refuse with (see the check in ffn).
+    const bool any_split = std::any_of(runs.begin(), runs.end(),
+                                       [](const StreamRuns& entry) { return entry.split; });
+    if (short_pool && !streams.empty() && any_split) {
+        std::fprintf(stderr,
+                     "[experts] no host tier: the gate/up/down form owns three pool runs per layer "
+                     "and the tier describes one\n");
+        for (std::size_t i = 0; i < streams.size(); ++i) {
+            if (!runs[i].split) { continue; }
+            const auto first = runs[i].first;
+            const auto seats = [&](std::uint32_t bank) {
+                return instance.expert_cache->resident_capacity(bank);
+            };
+            std::fprintf(stderr,
+                         "[experts] stream %zu: pool holds gate=%u up=%u down=%u of %u experts per "
+                         "run; a layer needs all three runs resident and this form has no CPU half\n",
+                         i, seats(first), seats(first + 1), seats(first + 2), streams[i]->count());
+        }
+        std::fflush(stderr);
+    }
+    if (short_pool && !streams.empty() && !any_split) {
         std::vector<models::qwen3_5::execution::HostExpertBankDesc> descs;
         descs.reserve(streams.size());
         for (std::size_t i = 0; i < streams.size(); ++i) {
@@ -484,7 +565,7 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
                     static_cast<std::uint64_t>(count) * expert.shape.front(), expert.shape.back()};
                 return weight_geometry(expert.format, expert.layout, shape);
             };
-            descs.push_back({requirements.banks[i], streams[i]->gate_up_layout(),
+            descs.push_back({requirements.banks[runs[i].first], streams[i]->gate_up_layout(),
                              streams[i]->down_layout(),
                              bank_geometry(streams[i]->gate_up_expert_geometry(),
                                            streams[i]->count()),

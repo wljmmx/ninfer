@@ -22,6 +22,7 @@
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/residual_add.h"
+#include "ninfer/ops/scaled_add.h"
 #include "ninfer/ops/silu_mul.h"
 
 #include <thread>
@@ -968,6 +969,137 @@ void predict_next_layer(const Tensor& residual, const RoutedMoeParameters& next,
         std::fprintf(stderr, "[pred] bank=0 -> next stream, top_k=%d\n", routed.top_k);
         std::fflush(stderr);
     }
+}
+
+// port (sm_89): the Qwen4Exp form's capacity, sized from the same recipe split_moe_ffn() carves.
+// Two things make this form different from the fused one and are therefore counted here: the
+// router needs its own routing call (the fused MoE op does not exist for three banks), and the
+// shared expert is a projection pair whose two I-row projections and H-row term have to be live at
+// the same time as the routed term.
+//
+// The three shared projections run through the A16Only overload of linear(), which takes no caller
+// workspace: every format this form carries (row-split Q5) has an A16 route that needs none. A
+// matrix that did need an A8/A4 scratch would refuse at the call instead of over-running this
+// arena.
+[[nodiscard]] std::size_t split_moe_workspace_bytes(const RoutedMoeParameters& moe,
+                                                    std::int32_t min_tokens,
+                                                    std::int32_t max_tokens) {
+    if (!moe.split) { throw std::invalid_argument("split MoE layer has no split description"); }
+    const auto& routed      = moe.profile.routed;
+    const auto top_k        = routed.top_k;
+    const auto hidden       = routed.ffn.hidden;
+    const auto intermediate = routed.ffn.intermediate;
+    if (top_k <= 0 || hidden <= 0 || intermediate <= 0) {
+        throw std::invalid_argument("split MoE layer has an empty routed profile");
+    }
+    const ops::RouteProfile route_profile{hidden, routed.experts, top_k};
+    WorkspaceLayoutBuilder layout;
+    (void)layout.alloc(DType::I32, {top_k, max_tokens});   // route ids
+    (void)layout.alloc(DType::FP32, {top_k, max_tokens});  // route coefficients
+    (void)layout.alloc(DType::FP32, {max_tokens});         // shared-expert coefficient
+    (void)layout.alloc_bytes(ops::topk_softmax_route_workspace_capacity_bytes(
+        route_profile, min_tokens, max_tokens));
+    (void)layout.alloc_bytes(ops::routed_swiglu_workspace_capacity_bytes(
+        routed, ops::ExpertSubsetKind::All, DType::BF16, ops::MoeEpilogue::AddResidual, min_tokens,
+        max_tokens));
+    (void)layout.alloc(DType::BF16, {intermediate, max_tokens}); // shared gate
+    (void)layout.alloc(DType::BF16, {intermediate, max_tokens}); // shared up
+    (void)layout.alloc(DType::BF16, {intermediate, max_tokens}); // SiLU(gate) * up
+    (void)layout.alloc(DType::BF16, {hidden, max_tokens});       // shared product
+    return layout.peak_bytes(256);
+}
+
+// port (sm_89): one layer of the Qwen4Exp form.
+//
+// The artifact keeps three routed banks (gate, up, down) and the shared expert as its own Linear
+// triple, and the router and the shared logit in two parents - parameters.cpp has already copied
+// those two into the one [E+1,H] control matrix the routing op reads. The layer is therefore:
+//
+//   routes, coefficient := topk_softmax_route(hidden, control)
+//   residual            += routed_swiglu(gate, up, down, routes)
+//   shared               = down( silu(gate*x) * up*x )
+//   residual            += coefficient * shared
+//
+// The fused form folds the shared term into the routed epilogue's FP32 accumulator and rounds
+// once. This form cannot: the shared expert is its own projection pair, so its result is a BF16
+// matrix that is added afterwards. That second rounding is the one numerical difference between the
+// two forms, and it is stated here rather than hidden.
+//
+// There is no CPU half. The host tier describes one pool run per layer (ExpertStream::
+// attach_split), so a layer the pool cannot hold in all three runs is refused with its numbers
+// instead of running a routed term that is missing experts.
+void split_moe_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& residual,
+                   WorkspaceArena& workspace, DeviceExecutionView execution) {
+    const auto stream       = execution.stream;
+    const auto columns      = hidden.ne[1];
+    const auto& routed      = moe.profile.routed;
+    const auto top_k        = routed.top_k;
+    const auto hidden_rows  = routed.ffn.hidden;
+    const auto intermediate = routed.ffn.intermediate;
+    if (moe.stream != nullptr) {
+        // Every run of this stream has to hold the whole layer; a shortfall is not a split layer
+        // here, it is a layer this form cannot run at all.
+        const auto seats = [&](models::qwen3_5::execution::ExpertMatrixRole role) {
+            return moe.stream->split_resident_capacity(role);
+        };
+        const auto count = moe.stream->count();
+        if (!moe.stream->fully_resident()) {
+            throw std::runtime_error(
+                moe.split->parameter + ": the expert pool cannot hold this layer - it keeps " +
+                std::to_string(seats(models::qwen3_5::execution::ExpertMatrixRole::Gate)) + "/" +
+                std::to_string(seats(models::qwen3_5::execution::ExpertMatrixRole::Up)) + "/" +
+                std::to_string(seats(models::qwen3_5::execution::ExpertMatrixRole::Down)) +
+                " (gate/up/down) of the " + std::to_string(count) +
+                " experts every run needs, and the gate/up/down form has no host tier or CPU half "
+                "to serve the rest");
+        }
+    }
+
+    Tensor ids          = workspace.alloc(DType::I32, {top_k, columns});
+    Tensor coefficients = workspace.alloc(DType::FP32, {top_k, columns});
+    Tensor shared_coeff = workspace.alloc(DType::FP32, {columns});
+    ops::ExpertRoutes routes{ids, coefficients};
+    const ops::RouteProfile route_profile{hidden_rows, routed.experts, top_k};
+    {
+        const auto block = workspace.alloc_bytes(ops::topk_softmax_route_workspace_capacity_bytes(
+            route_profile, columns, columns));
+        MemoryArena arena(MemorySpan{block.data, block.bytes, execution.device()});
+        ops::topk_softmax_route(hidden, route_profile, moe.control, routes, shared_coeff, arena,
+                                execution);
+    }
+    {
+        const auto block = workspace.alloc_bytes(ops::routed_swiglu_workspace_capacity_bytes(
+            routed, ops::ExpertSubsetKind::All, DType::BF16, ops::MoeEpilogue::AddResidual, columns,
+            columns));
+        MemoryArena arena(MemorySpan{block.data, block.bytes, execution.device()});
+        if (moe.stream != nullptr) {
+            // Place this layer's experts and settle the upload on the layer's stream; the kernels
+            // below are queued behind it. `fully_resident` above is the capacity statement, this is
+            // the placement, and a refusal here means the pool changed under the layer.
+            if (!moe.stream->ensure(routes.ids.data, top_k, columns, stream)) {
+                throw std::runtime_error(
+                    moe.split->parameter +
+                    ": the expert pool refused this layer's placement (gate/up/down form)");
+            }
+        }
+        const auto& experts = moe.stream != nullptr ? moe.stream->experts() : moe.routed;
+        ops::routed_swiglu(hidden, routed, experts, routes, ops::ExpertSubset{},
+                           ops::MoeEpilogue::AddResidual, residual, arena, execution);
+    }
+    // The shared expert, as its own BF16 projection pair. Its coefficient is the sigmoid of the
+    // shared logit the routing op just wrote, applied to the term as it enters the residual.
+    const auto& shared_gate = moe.split->shared_gate;
+    const auto& shared_up   = moe.split->shared_up;
+    const auto& shared_down = moe.split->shared_down;
+    Tensor gate = workspace.alloc(DType::BF16, {intermediate, columns});
+    Tensor up   = workspace.alloc(DType::BF16, {intermediate, columns});
+    Tensor act  = workspace.alloc(DType::BF16, {intermediate, columns});
+    Tensor term = workspace.alloc(DType::BF16, {hidden_rows, columns});
+    ops::linear(hidden, shared_gate.weight, gate, stream);
+    ops::linear(hidden, shared_up.weight, up, stream);
+    ops::silu_mul(gate, up, act, stream);
+    ops::linear(act, shared_down.weight, term, stream);
+    ops::scaled_add(term, shared_coeff, residual, stream);
 }
 
 void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& residual,
@@ -1984,14 +2116,11 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
     }
     if (const auto* moe = std::get_if<RoutedMoeParameters>(&parameters)) {
         if (moe->split) {
-            // Same refusal as ffn(): a split-bank layer has no fused profile a kernel could size
-            // against, and sizing it with the split geometry would report a cost nothing can run.
-            throw std::invalid_argument(
-                moe->split->parameter +
-                ": Qwen4Exp stores the routed experts, the router and the shared expert in separate "
-                "parents; the routed kernel reads fused matrices (M5 wires the split form)");
+            // port (sm_89): three expert banks and the shared expert as its own projection pair.
+            return split_moe_workspace_bytes(*moe, first, last);
         }
         if (moe->stream) {
+
             // port (sm_89): the host fallback keeps the shared term in FP32 so that a layer
             // rounds the residual once, exactly like the device epilogue.
             const auto shared_f32 = static_cast<std::size_t>(moe->profile.routed.ffn.hidden) *
@@ -2071,19 +2200,16 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
         // [probe] W4A8 quantises the routed A operand to int8 per token. Round-trip the MoE input
         // through that scale so the perplexity cost can be measured before any kernel changes.
         ops::act_quant_a8_roundtrip_bf16(hidden.data, hidden.ne[0], columns, stream);
+        // port (sm_89): the gate/up/down form first. It carries `stream` too when the banks are not
+        // resident, but its layer is not the fused one streamed_ffn() runs: three pool runs, a
+        // separate routing call and the shared expert as its own projection pair.
+        if (moe->split) {
+            split_moe_ffn(hidden, *moe, residual, workspace, execution);
+            return;
+        }
         if (moe->stream) {
             streamed_ffn(hidden, *moe, residual, workspace, execution, predictor_input, predict_next);
             return;
-        }
-        if (moe->split) {
-            // M2: the parameter model describes Qwen4Exp's three independent expert banks, its own
-            // router/shared-logit pair and its own shared gate/up/down. The routed kernels still read
-            // the fused matrices qwen3_5 carries, so running one of these layers is refused by name
-            // instead of multiplying by the empty fused members.
-            throw std::invalid_argument(
-                moe->split->parameter +
-                ": Qwen4Exp stores the routed experts, the router and the shared expert in separate "
-                "parents; the routed kernel reads fused matrices (M5 wires the split form)");
         }
         const auto storage =
             workspace.alloc_bytes(ffn_workspace_bytes(parameters, columns, columns));

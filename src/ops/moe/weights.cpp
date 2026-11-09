@@ -81,4 +81,28 @@ RoutedSwiGLUProfile routed_swiglu_profile(const WeightBankView& gate_up, const W
     }
     return routed_swiglu_profile(gate_up.layout, down.layout, top_k, gu, dn);
 }
+
+RoutedSwiGLUProfile routed_swiglu_profile(const WeightBankLayout& gate, const WeightBankLayout& up,
+                                          const WeightBankLayout& down, std::int32_t top_k,
+                                          LinearPolicy gate_policy, LinearPolicy down_policy) {
+    // One expert occupies I rows of gate and of up, and H rows of down; the three banks have to
+    // agree about the expert count and the two axes. A gate/up pair whose stored encodings differ
+    // cannot be described by the single gate-side format the profile carries, so it is refused
+    // rather than run with one of the two.
+    if (gate.columns != up.columns || gate.region.rows != up.region.rows ||
+        gate.format != up.format || gate.layout != up.layout) {
+        throw std::invalid_argument(
+            "routed SwiGLU: the gate and up banks do not agree on geometry or encoding");
+    }
+    if (gate.region.count != up.region.count || gate.region.count != down.region.count ||
+        gate.columns != down.region.rows || gate.region.rows != down.columns || top_k <= 0 ||
+        std::uint32_t(top_k) > gate.region.count || !valid_linear_policy(gate_policy) ||
+        !valid_linear_policy(down_policy)) {
+        throw std::invalid_argument("routed SwiGLU banks have inconsistent geometry or policy");
+    }
+    return {{dimension(gate.columns), dimension(gate.region.rows), gate.format, down.format,
+             matrix_layout(gate.layout), matrix_layout(down.layout), gate_policy, down_policy},
+            dimension(gate.region.count),
+            top_k};
+}
 } // namespace ninfer::ops

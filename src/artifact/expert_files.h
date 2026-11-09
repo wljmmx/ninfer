@@ -43,4 +43,17 @@ namespace ninfer::artifact {
     std::span<const ObjectHandle> gate_up_objects, std::span<const ObjectHandle> down_objects,
     const WeightGeometry& gate_up, const WeightGeometry& down, const ExpertBankLayout& layout);
 
+// port (sm_89): ONE matrix per bank - the Qwen4Exp gate/up/down form, where a run owns a single
+// matrix of every expert. Two artifact layouts are covered: one object per bank with the experts in
+// consecutive row blocks (what the shipped artifact has), and one object per expert. `matrix` is
+// the per-expert geometry (I rows of the gate column axis, or H rows of the down one), `rows` its
+// row count, and the entry image carries only that matrix's three planes - the cache layout's
+// second matrix slot is a placeholder nothing addresses.
+[[nodiscard]] ExpertFileBank describe_matrix_expert_files(const Reader& reader,
+                                                          std::span<const ObjectHandle> objects,
+                                                          const WeightGeometry& matrix,
+                                                          std::uint32_t count, std::uint32_t rows,
+                                                          const ExpertBankLayout& layout);
+
 } // namespace ninfer::artifact
+

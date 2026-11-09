@@ -119,6 +119,12 @@ routed_swiglu_profile(const WeightBankLayout& gate_up, const WeightBankLayout& d
 [[nodiscard]] RoutedSwiGLUProfile
 routed_swiglu_profile(const WeightBankView& gate_up, const WeightBankView& down, std::int32_t top_k,
                       LinearPolicy gate_up_policy, LinearPolicy down_policy);
+// port (sm_89): the split form Qwen4Exp stores - gate and up in two banks of I rows each, down in
+// a third of H rows. The routed profile carries one gate-side format and layout, so the two banks
+// must agree on both; a pair that does not is refused instead of being reported as one of them.
+[[nodiscard]] RoutedSwiGLUProfile routed_swiglu_profile(
+    const WeightBankLayout& gate, const WeightBankLayout& up, const WeightBankLayout& down,
+    std::int32_t top_k, LinearPolicy gate_up_policy, LinearPolicy down_policy);
 
 // Execution admits registered geometries and format pairs; unsupported profiles are rejected.
 // For each BF16 x[:,t], l=control*x; select K greatest l[0:E], descending, ties by lower ID.

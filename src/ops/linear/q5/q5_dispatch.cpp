@@ -62,6 +62,22 @@ Q5Launch select_q5_v2_prefill(std::int32_t n, std::int32_t k, std::int32_t t) {
             return launch_q5_mma_r64_c128;
         }
         break;
+    // port (sm_89): Qwen4Exp's shared expert, which the split MoE form runs on its own. The two
+    // gene matrices are shape-generic routes (rows from the output, K from the activation), so no
+    // new kernel instance is needed: SIMT serves the small token counts Decode and short prompts
+    // pay, the row-tiled MMA the rest. Both require N % 64 == 0 (640, 2560) and K % 64 == 0.
+    case 2560:
+        if (n == 640) {
+            if (t <= 8) return launch_q5_simt_r8_c4;
+            return launch_q5_mma_r64_c128;
+        }
+        break;
+    case 640:
+        if (n == 2560) {
+            if (t <= 8) return launch_q5_simt_r8_c4;
+            return launch_q5_mma_r64_c128;
+        }
+        break;
     default: break;
     }
     return nullptr;  // Fall back to v3 shape table.

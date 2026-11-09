@@ -172,4 +172,44 @@ ExpertFileBank describe_expert_objects(std::span<const ObjectHandle> gate_up_obj
     return bank;
 }
 
+ExpertFileBank describe_matrix_expert_files(const Reader& reader,
+                                           std::span<const ObjectHandle> objects,
+                                           const WeightGeometry& matrix, std::uint32_t count,
+                                           std::uint32_t rows, const ExpertBankLayout& layout) {
+    if (!count || count != layout.count || !rows || matrix.shape.empty() ||
+        objects.size() != count) {
+        throw std::invalid_argument("single-matrix expert plan disagrees on the expert count");
+    }
+    // One object per expert: each expert's matrix is the whole object, so its planes start at the
+    // matrix's own offsets. A bank-wide object keeps the experts in consecutive row blocks.
+    const bool per_expert = objects.front().index != objects.back().index;
+    const auto bank_geometry = [&] {
+        const std::uint64_t shape[2] = {static_cast<std::uint64_t>(count) * rows,
+                                        matrix.shape.back()};
+        return weight_geometry(matrix.format, matrix.layout, shape);
+    }();
+    ExpertFileBank bank;
+    bank.experts.reserve(count);
+    for (std::uint32_t expert = 0; expert < count; ++expert) {
+        // The same affine description the operator's bank view uses, so the entry image and the
+        // kernel cannot disagree about where a plane begins.
+        const auto slice = per_expert
+                               ? describe_weight_bank(matrix, {0, 1, rows, rows})
+                               : describe_weight_bank(
+                                     bank_geometry,
+                                     {static_cast<std::uint64_t>(expert) * rows, 1, rows, rows});
+        ExpertFileEntry entry;
+        entry.image_bytes = layout.entry_bytes;
+        const auto object_index = objects[per_expert ? expert : 0].index;
+        append_plane(entry, reader, ObjectHandle{object_index}, slice.codes.offset,
+                     slice.codes.expert_bytes, layout.codes.offset);
+        append_plane(entry, reader, ObjectHandle{object_index}, slice.high.offset,
+                     slice.high.expert_bytes, layout.high.offset);
+        append_plane(entry, reader, ObjectHandle{object_index}, slice.scales.offset,
+                     slice.scales.expert_bytes, layout.scales.offset);
+        bank.experts.push_back(std::move(entry));
+    }
+    return bank;
+}
+
 } // namespace ninfer::artifact

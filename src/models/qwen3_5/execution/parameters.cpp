@@ -2,7 +2,10 @@
 
 #include "models/qwen3_5/execution/expert_stream.h"
 
+#include "core/arena.h"
 #include "core/weight_view.h"
+
+#include <cuda_runtime.h>
 
 #include <cstdlib>
 #include <limits>
@@ -306,7 +309,10 @@ ExpertBankDescription ExpertBankDescription::from_bindings(const WeightView& gat
 }
 
 const Weight& RoutedMoeParameters::fused_control() const {
-    if (split) {
+    // The split form carries real [E+1,H] rows once preparation has copied them (see
+    // control_rows() in parameters.cpp); a split description without them is refused rather than
+    // handed to the routing op as an empty matrix.
+    if (split && control.qdata == nullptr) {
         throw std::invalid_argument(
             split->parameter +
             ": the artifact keeps the router and the shared logit in their own parents; the routed "
@@ -390,6 +396,54 @@ public:
         return native_weight({{rows, router.shape.at(1)},
                               {{router.parts[0].parent, router.parts[0].begin,
                                 score.parts[0].end}}});
+    }
+
+    // port (sm_89): the split form's control matrix. The routing op reads one BF16 [E+1,H] matrix -
+    // the router rows, then the shared logit - while Qwen4Exp keeps the two in their own parents.
+    // The rows are copied once here into a device allocation the parameter owns, so the op sees the
+    // same contiguous matrix the fused artifact carries. Two objects that happen to be adjacent are
+    // deliberately not relied on: their placement belongs to the materializer, not to this layer.
+    Weight control_rows(const MoeWeights& moe, std::shared_ptr<void>& owner) const {
+        const auto& router_name = model_.weight(moe.router).name;
+        const auto router       = native_weight(model_.weight(moe.router).view);
+        const auto score        = native_weight(model_.weight(moe.shared_score).view);
+        if (router.qtype != QType::BF16 || router.layout != QuantLayout::Contiguous ||
+            score.qtype != QType::BF16 || score.layout != QuantLayout::Contiguous ||
+            router.ndim != 2 || score.ndim != 2 || score.n != 1 || score.k != router.k ||
+            router.qdata == nullptr || score.qdata == nullptr) {
+            throw std::invalid_argument(router_name +
+                                        ": MoE router/shared logit are not resident BF16 matrices");
+        }
+        if (router.device.type() != DeviceType::CUDA || !(router.device == score.device)) {
+            throw std::invalid_argument(
+                router_name + ": the split MoE control rows require the router and the shared logit "
+                              "on one CUDA device");
+        }
+        const auto rows      = static_cast<std::uint64_t>(router.n) + 1;
+        const auto hidden    = static_cast<std::uint64_t>(router.k);
+        const auto row_bytes = hidden * std::uint64_t{sizeof(std::uint16_t)};
+        auto buffer          = std::make_shared<DeviceBuffer>(rows * row_bytes);
+        auto status = cudaMemcpy(buffer->p, router.qdata, std::uint64_t(router.n) * row_bytes,
+                                 cudaMemcpyDeviceToDevice);
+        if (status == cudaSuccess) {
+            status = cudaMemcpy(static_cast<std::byte*>(buffer->p) +
+                                    std::uint64_t(router.n) * row_bytes,
+                                score.qdata, row_bytes, cudaMemcpyDeviceToDevice);
+        }
+        if (status != cudaSuccess) {
+            throw std::runtime_error(std::string("MoE control rows: ") +
+                                     cudaGetErrorString(status));
+        }
+        WeightParent parent;
+        const std::array<std::uint64_t, 2> control_shape{rows, hidden};
+        parent.geometry = weight_geometry(QType::BF16, QuantLayout::Contiguous, control_shape);
+        parent.data     = static_cast<const std::byte*>(buffer->p);
+        parent.device   = router.device;
+        WeightView view;
+        view.shape = {rows, hidden};
+        view.parts.push_back({&parent, 0, rows * hidden});
+        owner = buffer;
+        return native_weight(view);
     }
 
     // The fused gate_up [2I,H] plus down [H,I], or nothing when the shared expert's three matrices
@@ -508,13 +562,12 @@ public:
         }
 
         // Qwen4Exp keeps the router, the shared logit, the shared expert and the three expert banks
-        // in their own parents. Describe each of them as the artifact stores it; the fused form the
-        // routed kernel reads is refused by the accessors above, not approximated here.
-        if (!banks.whole_bank()) {
-            throw std::invalid_argument(
-                banks.parameter() +
-                ": one expert per object cannot be combined with separate router/shared parents");
-        }
+        // in their own parents. Describe each of them as the artifact stores it: the routed operator
+        // reads three banks (gate, up, down), and the shared expert runs as its own Linear pair, so
+        // `shared` stays empty instead of being approximated by a fused matrix.
+        std::shared_ptr<void> control_owner;
+        const auto merged_control = with_context(model_.weight(moe.router).name,
+                                                [&] { return control_rows(moe, control_owner); });
         MoeSplitParameters split;
         split.parameter    = banks.parameter();
         split.router       = with_context(model_.weight(moe.router).name, [&] {
@@ -528,22 +581,80 @@ public:
         split.shared_down  = linear(moe.shared.down);
         split.experts      = banks;
 
-        const auto& gate_layout =
-            banks.layout(banks.fused_form() ? ExpertBankRole::GateUp : ExpertBankRole::Gate);
-        const auto& down_layout = banks.layout(ExpertBankRole::Down);
+        const auto& gate_parent = *gate.parts.at(0).parent;
+        const auto& up_parent   = *up.parts.at(0).parent;
+        const auto& down_parent = *down.parts.at(0).parent;
+        // port (sm_89): exactly the fused form's rule - a bank whose parents hold bytes is resident,
+        // a streamed one has none and is described from the artifact. The three banks share one
+        // answer: a layer that streams any of them streams all three (the routed expert flows
+        // through all of them, so a resident gate with a streamed up or down is not a state to run
+        // in - the operator would read a null plane).
+        const bool resident = banks.whole_bank() && gate_parent.data != nullptr &&
+                              up_parent.data != nullptr &&
+                              gate_parent.device.type() == DeviceType::CUDA &&
+                              down_parent.data != nullptr;
+        WeightBankLayout gate_layout =
+            banks.whole_bank()
+                ? banks.layout(ExpertBankRole::Gate)
+                : describe_weight_bank(gate_parent.geometry,
+                                       {0, 1, intermediate, intermediate});
+        WeightBankLayout up_layout =
+            banks.whole_bank()
+                ? banks.layout(ExpertBankRole::Up)
+                : describe_weight_bank(up_parent.geometry, {0, 1, intermediate, intermediate});
+        WeightBankLayout down_layout =
+            banks.whole_bank()
+                ? banks.layout(ExpertBankRole::Down)
+                : describe_weight_bank(down_parent.geometry, {0, 1, hidden, hidden});
+        if (!banks.whole_bank()) {
+            // The bank still holds `count` experts; only its object layout is per expert.
+            for (auto* layout : {&gate_layout, &up_layout, &down_layout}) {
+                layout->region.count = count;
+            }
+        }
+
         const auto& shared_gate = split.shared_gate.weight;
         const auto& shared_down = split.shared_down.weight;
         RoutedMoeParameters out;
-        out.profile = {
-            ops::RoutedSwiGLUProfile{
-                {dimension(hidden), dimension(intermediate), gate_layout.format, down_layout.format,
-                 gate_layout.layout, down_layout.layout, ops::LinearPolicy::A16Only,
-                 ops::LinearPolicy::A16Only},
-                dimension(count), top_k},
-            ops::SwiGLUProfile{dimension(shared_gate.k), dimension(shared_gate.n), shared_gate.qtype,
-                               shared_down.qtype, shared_gate.layout, shared_down.layout,
-                               ops::LinearPolicy::A16Only, ops::LinearPolicy::A16Only}};
+        out.control      = merged_control;
+        out.control_rows = control_owner;
+        out.profile      = {
+            routed_swiglu_profile(gate_layout, up_layout, down_layout, top_k,
+                                  ops::LinearPolicy::A16Only, ops::LinearPolicy::A16Only),
+            ops::SwiGLUProfile{dimension(shared_gate.k), dimension(shared_gate.n),
+                               shared_gate.qtype, shared_down.qtype, shared_gate.layout,
+                               shared_down.layout, ops::LinearPolicy::A16Only,
+                               ops::LinearPolicy::A16Only}};
         out.split = std::move(split);
+        if (resident) {
+            // The three banks are already in device memory (a small artifact, or a test fixture):
+            // no stream is needed and the operator reads the three affine views directly. The gate
+            // and up views carry I rows each per expert, which is the split form the operator
+            // requires (bank.gate_up stays empty).
+            out.routed.gate      = device_weight_bank(banks.bank(ExpertBankRole::Gate));
+            out.routed.up        = device_weight_bank(banks.bank(ExpertBankRole::Up));
+            out.routed.bank.down = device_weight_bank(banks.bank(ExpertBankRole::Down));
+            out.routed.bank.count  = count;
+            out.routed.bank.device = gate_parent.device;
+            return out;
+        }
+        // One object handle per expert per bank. A bank-wide artifact repeats the same handle and
+        // the loader keeps its row-range addressing; a per-expert artifact names a distinct object.
+        const auto objects_of = [&](auto member) {
+            std::vector<std::uint64_t> objects;
+            objects.reserve(count);
+            for (const auto& expert : moe.experts) {
+                objects.push_back(model_.weight(expert.*member).view.parts.at(0).parent->source_object);
+            }
+            return objects;
+        };
+        out.stream = std::make_shared<ExpertStream>(
+            count,
+            ExpertMatrixBankDesc{gate_layout, gate_parent.geometry,
+                                 objects_of(&DenseWeights::gate)},
+            ExpertMatrixBankDesc{up_layout, up_parent.geometry, objects_of(&DenseWeights::up)},
+            ExpertMatrixBankDesc{down_layout, down_parent.geometry,
+                                 objects_of(&DenseWeights::down)});
         return out;
     }
 
