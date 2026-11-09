@@ -82,6 +82,17 @@ ninfer_add_test(ninfer_qwen3_5_expert_stream_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_stream_real.cpp"
   LIBRARIES ninfer_artifact ninfer_ops ninfer_core)
 
+# port (sm_89): A1 - the routed-expert stream in Qwen4Exp's gate/up/down form. The three-bank shape
+# is built synthetically (q4 gate, q4 up, q6 down, one object per expert, no artifact) and the test
+# asserts the placement into all three pool runs, the per-bank tables and masks, the per-bank stride
+# pricing and the eviction a pool that cannot hold every expert has to perform.
+ninfer_add_test(ninfer_qwen3_5_expert_stream_split_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_stream_split.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_core)
+set_tests_properties(ninfer_qwen3_5_expert_stream_split_test PROPERTIES
+  LABELS "gpu"
+  RUN_SERIAL TRUE)
+
 # v8 13.5 (step 5): runtime pool / KV reallocation under a real 4-way load. The contract: the
 # idle double read refuses a resize while requests are in flight, the frozen-graph pin refuses
 # at construction, and a grow->shrink round trip at a request boundary leaves the pool

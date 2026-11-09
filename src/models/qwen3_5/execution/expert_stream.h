@@ -17,6 +17,23 @@ namespace ninfer::models::qwen3_5::execution {
 
 class HostExpertResidency;
 
+// port (sm_89): one routed-expert matrix stored as its own artifact bank, with one object per
+// expert. Qwen4Exp keeps gate, up and down in three objects per expert (q4, q4, q6, RowSplit), so
+// the fused [2I,H] bank cannot describe it: row I of the gate object is the next expert's first
+// gate row. Three of these describe the split form (see the constructor below); the fused form
+// keeps describing gate_up [2I,H] plus down [H,I] through the existing constructors.
+struct ExpertMatrixBankDesc {
+    WeightBankLayout layout;
+    WeightGeometry parent;
+    std::vector<std::uint64_t> objects; // one object handle per expert
+};
+
+// The three runs of the split form. Deliberately a stream-local enum: parameters.h already names
+// four artifact banks (GateUp/Gate/Up/Down) for the parameter model, and this stream only ever owns
+// the three of them - a caller maps Gate/Up/Down by name. Gates are 0..2, so `split_[index]` is the
+// run and no lookup table can disagree with itself.
+enum class ExpertMatrixRole : std::uint32_t { Gate = 0, Up = 1, Down = 2 };
+
 // port (sm_89): one routed-expert bank whose weights stay in the artifact and stream into a
 // shared Device pool. The bank description is fixed at startup; only the per-expert offset table
 // is republished as the resident set changes.
@@ -32,6 +49,21 @@ public:
                  WeightGeometry gate_up_parent, WeightGeometry down_parent,
                  std::vector<std::uint64_t> gate_up_objects, std::vector<std::uint64_t> down_objects);
 
+    // port (sm_89): the split form. Qwen4Exp stores an expert's gate, up and down as three
+    // independent objects, so a layer owns three pool runs instead of two views into one entry
+    // image. Each bank is described by its own layout, parent and per-expert object handles, and
+    // each is priced at its own stride by the cache (`slot_stride(bank)`), because the q6 down
+    // matrix is wider than the q4 gate/up pair.
+    //
+    // This form is not a different policy: ensure() places the same expert set into all three runs
+    // (the router names the expert, not the matrix), and every table is published per run. The
+    // paths that describe ONE run per layer - the pinned host tier, the GH3 placement table, the
+    // freeze placement, the device ring and the prediction region - are refused by name at
+    // attach_split() rather than half-applied (see split_refused_switch() in the .cpp).
+    ExpertStream(std::uint32_t count, ExpertMatrixBankDesc gate, ExpertMatrixBankDesc up,
+                 ExpertMatrixBankDesc down);
+
+
     // Unregisters this stream from the process-wide request-boundary and profile registries. Both
     // hold raw pointers into this object, so a stream that dies without unregistering leaves them
     // dangling - and a second Engine built in the same process then walks freed memory on its first
@@ -40,6 +72,18 @@ public:
 
     // Startup-only. `entry` is the cache's per-entry plane layout for this bank.
     void attach(ExpertCache& cache, std::uint32_t bank, const ExpertBankLayout& entry);
+    // port (sm_89): attach the split form. One cache bank per matrix, one entry image per bank.
+    // `bank_` becomes the gate bank: it is the layer's identity (diagnostics, graph keys, the
+    // score registry), and the three runs are reachable through split_bank(role).
+    //
+    // Refuses (`std::logic_error`) the switches whose mechanism is defined over one pool run per
+    // layer: NINFER_HOST_TIER / NINFER_HOST_DIRECT / NINFER_HOST_FREEZE / NINFER_WARM_STATIC,
+    // NINFER_PREFETCH{,_SYNC,_SLOTS,_MODE} and NINFER_RING_DEVICE_ADMIT / NINFER_EXPERT_RING_SLOTS.
+    // A run that asks for one of those on this form is not silently downgraded to the streaming
+    // path.
+    void attach_split(ExpertCache& cache, std::uint32_t gate_bank, const ExpertBankLayout& gate_entry,
+                      std::uint32_t up_bank, const ExpertBankLayout& up_entry,
+                      std::uint32_t down_bank, const ExpertBankLayout& down_entry);
 
     // Publishes the experts the next call routes to, then republishes the offset table. Returns
     // false when the pool cannot hold one whole layer at all; the caller then owns the decision
@@ -68,15 +112,32 @@ public:
     [[nodiscard]] std::uint32_t route_coverage_read();
 
     [[nodiscard]] const ops::CudaSwiGLUExperts& experts() const noexcept { return experts_; }
+    // For the split form this is the gate run: it identifies the layer, and the three runs are
+    // reachable through split_bank(role). The fused form has exactly one bank.
     [[nodiscard]] std::uint32_t bank_index() const noexcept { return bank_; }
     // Device-side int32 array, one entry per expert: 1 when the pool holds it.
+    //
+    // port (sm_89): in the split form this is the GATE run's mask. The three runs can hold different
+    // sets (their seats differ), so a caller that needs another run's mask asks split_mask_device().
     [[nodiscard]] const void* resident_mask() const noexcept {
+        if (split_banks_) {
+            const auto& run = split_[split_index(ExpertMatrixRole::Gate)];
+            return run.mask_device ? run.mask_device->p : nullptr;
+        }
         return mask_device_ ? mask_device_->p : nullptr;
     }
     // Host copy of the same mask, for the CPU half of a split layer.
     [[nodiscard]] std::span<const std::int32_t> resident_mask_host() const noexcept {
+        if (split_banks_) { return split_[split_index(ExpertMatrixRole::Gate)].mask; }
         return mask_host_;
     }
+    // port (sm_89): false for the gate/up/down form, whose layer is three pool runs. The engine asks
+    // this before building a host tier: the tier (and Q20's second leg) is defined over one run per
+    // layer, so attaching one to this form would be refused at attach_host() anyway.
+    [[nodiscard]] bool host_tier_supported() const noexcept { return !split_banks_; }
+    // True when every run of this stream could hold the whole layer at once (the fused form has one
+    // run). In the split form all three have to answer yes: a single narrow run makes the layer a
+    // split layer.
     [[nodiscard]] bool fully_resident() const noexcept;
     [[nodiscard]] bool attached() const noexcept { return cache_ != nullptr; }
     // Host half of a split tier; null when the Device pool holds every expert.
@@ -101,6 +162,59 @@ public:
     }
     [[nodiscard]] std::span<const std::uint64_t> down_objects() const noexcept {
         return down_objects_;
+    }
+
+    // port (sm_89): the split form (gate/up/down as three banks). `split_banks()` is the single
+    // question the rest of the model asks; everything below is only meaningful when it answers true
+    // and throws otherwise, so a mixed-up call cannot read a table that was never built.
+    [[nodiscard]] bool split_banks() const noexcept { return split_banks_; }
+    [[nodiscard]] const ExpertMatrixBankDesc& split_bank_desc(ExpertMatrixRole role) const {
+        return split_desc(role);
+    }
+    // Cache bank index of one run (set by attach_split()).
+    [[nodiscard]] std::uint32_t split_bank(ExpertMatrixRole role) const {
+        return split_[split_index(role)].bank;
+    }
+    // The kernel-side view of one run. `down` is the same object experts_.bank.down points at;
+    // experts_.bank.gate_up stays empty, which is what the operator requires of this form.
+    [[nodiscard]] const ExpertMatrixDeviceView& split_view(ExpertMatrixRole role) const {
+        return view_for(split_index(role));
+    }
+    // Per-run tables, one entry per expert, published by ensure().
+    [[nodiscard]] const void* split_mask_device(ExpertMatrixRole role) const {
+        const auto& bank = split_[split_index(role)];
+        return bank.mask_device ? bank.mask_device->p : nullptr;
+    }
+    [[nodiscard]] std::span<const std::int32_t> split_mask_host(ExpertMatrixRole role) const {
+        return split_[split_index(role)].mask;
+    }
+    [[nodiscard]] const void* split_offsets_device(ExpertMatrixRole role) const {
+        const auto& bank = split_[split_index(role)];
+        return bank.offsets_device ? bank.offsets_device->p : nullptr;
+    }
+    [[nodiscard]] std::span<const std::uint64_t> split_offsets_host(ExpertMatrixRole role) const {
+        return split_[split_index(role)].offsets;
+    }
+    // Experts of this run the pool holds right now, and how many of this layer's routes it covered.
+    [[nodiscard]] std::uint32_t split_resident_capacity(ExpertMatrixRole role) const noexcept;
+    // Experts the last publication put in this run (the mask's population). Equal to the run's seat
+    // count when the set filled it, less when the routes were fewer.
+    [[nodiscard]] std::uint32_t split_resident(ExpertMatrixRole role) const noexcept {
+        return split_banks_ ? split_[split_index(role)].resident : 0;
+    }
+    // What one run is described by: the artifact bank, its parent (metadata for a loader that names
+    // the expert objects) and the per-expert geometry the operator sizes against.
+    [[nodiscard]] const WeightBankLayout& split_layout(ExpertMatrixRole role) const {
+        return split_[split_index(role)].desc.layout;
+    }
+    [[nodiscard]] const WeightGeometry& split_parent(ExpertMatrixRole role) const {
+        return split_[split_index(role)].desc.parent;
+    }
+    [[nodiscard]] const WeightGeometry& split_expert_geometry(ExpertMatrixRole role) const {
+        return split_[split_index(role)].expert;
+    }
+    [[nodiscard]] const std::vector<std::uint64_t>& split_objects(ExpertMatrixRole role) const {
+        return split_[split_index(role)].desc.objects;
     }
     [[nodiscard]] const WeightGeometry& gate_up_parent() const noexcept { return gate_up_parent_; }
     [[nodiscard]] const WeightGeometry& down_parent() const noexcept { return down_parent_; }
@@ -312,6 +426,55 @@ private:
     std::vector<std::uint64_t> down_objects_;
     bool per_expert_objects_ = false;
 
+    // port (sm_89): A3b. The per-bank generation a Device table actually holds, set only when the
+    // driver accepted the publish. Compared before the kernels read the tables; a mismatch means a
+    // publication did not land, and computing on it would be a silent wrong token.
+    static constexpr std::uint64_t kTableUnknown = ~std::uint64_t{0};
+    // port (sm_89): the split form. One record per matrix: what the artifact says (desc), which
+    // cache run it lives in (bank), the entry image inside that run (entry), and the per-expert
+    // tables this stream publishes into it (offsets/mask + their Device copies). The three records
+    // are independent on purpose - the q6 down run is priced at its own stride and can hold fewer
+    // experts than the q4 gate/up runs, so no field is shared between them.
+    struct SplitRun {
+        ExpertMatrixBankDesc desc;
+        WeightGeometry expert;
+        std::uint32_t bank = 0;
+        ExpertBankLayout entry{};
+        std::vector<std::uint64_t> offsets;
+        std::vector<std::int32_t> mask;
+        std::unique_ptr<DeviceBuffer> offsets_device;
+        std::unique_ptr<DeviceBuffer> mask_device;
+        // What this run's Device tables hold, and what the publisher last recorded: the A3b check
+        // compares the first against the cache's generation of THIS bank.
+        std::uint64_t table_hot = kTableUnknown;
+        std::uint64_t table_step = kTableUnknown;
+        std::uint64_t table_prefetch = kTableUnknown;
+        std::uint64_t pub_hot = 0;
+        std::uint64_t pub_step = 0;
+        std::uint64_t pub_prefetch = 0;
+        bool published = false;
+        bool attached = false;
+        // Per-run residency the last publication carried, so an eviction is observable.
+        std::uint32_t resident = 0;
+    };
+    bool split_banks_ = false;
+    std::array<SplitRun, 3> split_{};
+    static constexpr std::size_t split_index(ExpertMatrixRole role) noexcept {
+        return static_cast<std::size_t>(role);
+    }
+    [[nodiscard]] const ExpertMatrixBankDesc& split_desc(ExpertMatrixRole role) const;
+    [[nodiscard]] const ExpertMatrixDeviceView& view_for(std::size_t index) const noexcept;
+    [[nodiscard]] ExpertMatrixDeviceView& mutable_view(std::size_t index) noexcept;
+    // Shared constructor body: the ranking buffer, the per-expert keys and the policy switches.
+    void init_stream_state();
+    void attach_split_one(std::size_t index, ExpertCache& cache, std::uint32_t bank,
+                          const ExpertBankLayout& entry);
+    // The three-run layer: placement, per-run publication, one batched upload and the staleness
+    // check. Called from ensure() when split_banks() holds; the fused path never enters it.
+    bool ensure_split(const void* device_ids, std::int32_t top_k, std::int32_t tokens,
+                      cudaStream_t stream, const std::int32_t* host_ids);
+    void rebase_split();
+
     ExpertCache* cache_ = nullptr;
     HostExpertResidency* host_ = nullptr;
 
@@ -325,10 +488,6 @@ private:
     std::vector<std::int32_t> predicted_;
     std::weak_ptr<HostExpertResidency> host_weak_;
     std::uint32_t bank_ = 0;
-    // port (sm_89): A3b. The per-bank generation this bank's Device tables actually hold, set only when
-    // the driver accepted the publish. Compared before the kernels read the tables; a mismatch means a
-    // publication did not land, and computing on it would be a silent wrong token.
-    static constexpr std::uint64_t kTableUnknown = ~std::uint64_t{0};
     // A1: the three segments' versions as this bank's Device tables hold them. The check at the end
     // of a layer compares all three; the hot one is what an epoch-boundary re-placement moves, so a
     // boundary publish cannot be mistaken for a per-step staleness.
