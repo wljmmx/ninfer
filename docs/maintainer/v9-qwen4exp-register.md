@@ -120,3 +120,17 @@
 **装载验证（如实登记失败点）**：ninfer.exe 打开该工件在 planning 108 us 后失败——`error: Qwen3.5 config: text config: unknown member attention_bias`。引擎目前只有 Qwen3.5 的配置/程序路径，**没有 Qwen4Exp 架构入口（T192–T198 未做）**，因此本工件**无法端到端推理，无 tok/s 可测**。已实测的只有组件级：ninfer_ple_lookup/conv/gate/state_extract/disk 五项全部通过（8.8/14.1/5.9/3.8/0.24 s）。
 
 容量账（按工件配置计算，非实测 tps）：满注意力层 12 层，KV = 2 x 2 kv_head x 256 x 2 B x 12 = **24 KiB/token**（2K=48 MiB、8K=192 MiB、32K=768 MiB、128K=3.0 GiB、256K=6.0 GiB）；PLE 表 q4 约 **25.3 GiB**；路由专家 120.8 G 元素约 **69 GiB** -> 24 GB 卡必须走专家流式 + PLE 页式。
+
+## M1/M2 已落地（2026-11-09，提交 f6f8840a）
+
+- M1：Qwen4Exp 配置键全部放行、架构注册（复用 MoE plan）、绑定别名（final_hc / attention_hc / moe_hc / output_gate / indexer 四项 / PLE 七项 / 三专家 bank 展开为每专家行块），未知或歧义按逻辑参数名报错。
+- M2：Use 别名（attention_input / moe_input / experts/product）、参数模型支持「融合 bank」与「三独立 bank」两种描述（读错行即报错，旧的 2*I 行假设已删）、mixer 判据改 `attention_mixer()`（indexed 层不再落进 GDN 分支，暂走 full attention 并打印 QSA 未接线）。
+- 真实工件：48 层 / 1308 绑定 / 74,892 逻辑参数全部解析，卡在 `text/layers/0: input projection: unsupported logical projection geometry`（ops 的融合投影白名单）。测试 `ctest -R qwen4_exp` 2/2 通过。
+
+## 路线修正：MoE 并非"无可用核"
+
+前一条"MoE 只注册 NVFP4/FP8、本工件 q4/q6 被拒"需要精确化：`ops/moe/operands.cpp:31-45` 的 `validate_route_profile` **本身就接受 hidden 2560 / E 512 / top-10**，`validate_expert_profile` 对 hidden 2560 接受 **FP8 block128x128（AllowA8）** 或 NVFP4。也就是说：
+- 4090 上没有 NVFP4，但 **FP8 块缩放路线是有核的**；
+- 转换器已支持 `fp8_e4m3fn_block128x128_bf16`（`tools/artifact/formats.py:69`）；
+- 因此**不需要写新 MoE 核**，最短路径是「专家三 bank 用 FP8 块缩放重转 + 投影通用化（M3）+ HC/PLE/QSA 接线（M4）」。
+剩余硬点：PLE 表行格式（工件 q4 136 B/行，`PleTableSource` 只吃 NF4 90 B/行，需转码或扩读取器）与 24 GB 卡上的专家流式（69 GiB）+ 表分页（40.5 GiB）。
