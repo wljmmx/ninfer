@@ -9,11 +9,14 @@
 
 | 项 | 值 |
 |---|---|
-| 上游基线（**已吸收**） | `a754fcf3` — `fix(runtime): prevent request starvation under context pressure`（2026-11-07） |
-| 基线之前 | `de5d4288`（v8 完工）→ `a754fcf3` 共 **305** 提交，按 v9 计划吸收完毕 |
+| 上游基线（**已逐条核对，非全部吸收**） | `77c2e5e2` — `fix(runtime): recover preempted requests without stalling`（2026-11-07）；逐条处置见 §7 台账 |
+| 基线之前 | `de5d4288`（v8 完工）→ `77c2e5e2` 共 **1565** 提交；其中 `a754fcf3` 之前的 1197 条经 `cc3938c9`（2026-10-09）并入本地历史，其余按 §7 台账逐条标注 |
 | 吸收路径 | 判死 132（Spark 96 / GLM 18 / TP2 18，双计已标注）；A 类整搬；M 类三方融合（T049–T083）；语义对表（T145–T168）；参考核对（T021–T047 / L01–L14）；模型集成登记（T191–T202） |
 | 本地版本 | `git describe` → 见 `VERSION`（`v1.0.0-rtx4090-<N>-g<hash>`） |
 | 对齐证据 | `docs/maintainer/v9-*.md` 各登记、`v9-closeout-register.md` 的 305 条对账、`.temp/upstream-scan/` 留档 |
+
+> **更正（2026-11-09）**：本表原先记的「上游基线 `a754fcf3` **已吸收**、基线前 305 条按 v9 计划吸收完毕」**不成立**——
+> 依据与本轮逐目录核对见 §6。自今日起本文件以 `77c2e5e2` 为增量基线，逐条处置记录见 §7。
 
 ## 2. 上游现状（本轮核对）
 
@@ -117,3 +120,84 @@ MTP experts Block-FP8 A8；GDN/QSA 大投影 Q8 A16；PLE 表 NF4。
    `ExpertStream` 只支持 gate_up+down 两 bank，Qwen4Exp 的 121 GB 工件必须走三 bank 流式。
 2. QSA/indexer（12 层）与 HC、PLE 注入进 `run_layers`——依赖 6.1 表中缺失的上游内核。
 3. 上游 368 提交的吸收仍按 §3 的 v10 计划另立，与本节的"能跑起来"目标分开推进。
+
+## 7. 增量对齐台账（2026-11-09）
+
+**固定基线＝`77c2e5e2`（`upstream/master`，2026-11-07）。** 基线以内的 1565 条上游提交已逐条写入台账：
+这是**已逐条核对（triaged）**，**不是逐条吸收（absorbed）**——`absorbed` 只表示"有书面依据说明内容已在本地"，
+其余五条分级各自带原因。此后每一轮只看基线之后的新提交，旧的 1565 条不再重读。
+
+| 项 | 值 |
+|---|---|
+| 台账 | `docs/maintainer/upstream-dispositions.tsv` |
+| 列 | `commit`（8 位短哈希）/ `date`（`%ad --date=short`）/ `subject`（原样，去制表符，超 120 字符截断并以 `...` 结尾）/ `class` / `evidence` / `note`；UTF-8 无 BOM、制表符分隔、首行表头 |
+| 行数 | **1565**，与 `git rev-list upstream/master` 逐条对应（无重复、无遗漏） |
+| 分级 | absorbed **1306** / dead **151** / na-arch **62** / todo **35** / needs-review **9** / na-hardware **2** |
+| 生成方式 | 先 `git log upstream/master --format="%h%x09%ad%x09%s" --date=short` 取全量行，再按 §7.2 规则表顺序匹配、先命中先用地打级；证据列只引用下列文档或本地提交号，不自造哈希 |
+| 报告脚本 | `powershell -NoProfile -ExecutionPolicy Bypass -File tools/upstream/alignment_report.ps1` |
+
+报告脚本以自身位置（`tools/upstream/`）推出仓库根，任意工作目录都能跑；`upstream` remote 或 `upstream/master` ref 缺失时以退出码 **2** 明确报错（不静默通过）；
+`baseline..upstream/master` 只要有一条缺处置记录就以退出码 **1** 退出并打印 `NO ROW` 清单，因此可以直接当对齐门禁用（0＝干净）。
+
+**规则：每一轮只处理 `baseline..upstream/master` 中缺处置记录的新提交，旧提交不再重读。**
+
+### 7.1 分级口径
+
+| class | 判据 | 台账里的落级来源 |
+|---|---|---|
+| absorbed | 内容已在本地树内，或已有对表记录 | `cc3938c9`（2026-10-09 合并上游至 `81c8ce09`，1197 条）、本地提交 message 里的 `[upstream <hash>]`（移植或对表登记）、v9 各 register 判「搬入 / 跟随 / 等价」的条目 |
+| na-arch | sm_89 指令集上不成立 | 按 §2 的逐类判定：MXFP8 / NVFP4 / Block-FP8 / TMA / cluster / A16 / EP / CSF / MLA / kpool / A8-FFN |
+| na-hardware | 只有 sm_120a（RTX 5090）才有的对象 | §6.1 |
+| dead | 判死不吸收 | T001 封口池（Spark 96 / GLM 18 / TP2 18）、T013/T108（FP4-Local），以及 register 明写「不搬入 / 不跟随」的条目 |
+| todo | 待吸收，缺口已定位 | §3 的 `77c2e5e2`、§6.3 的 `qwen4_exp`/QSA/`gated_residual` 缺口、qwen4exp 挂起项（T192–T198）、§6 的 305 条内查不到落地依据者 |
+| needs-review | 规则表放不下，需人工定处置 | 证据列**留空** |
+
+### 7.2 规则表（前缀 / 路径 -> 分级 -> 证据）
+
+顺序匹配，先命中先用：
+
+| 匹配 | class | evidence |
+|---|---|---|
+| 是 `81c8ce09` 的祖先 | absorbed | `local:cc3938c9` |
+| 某本地提交的 message 带 `[upstream <hash>]` | absorbed | `local:<该本地提交>` |
+| v9 各 register 逐条判定过（T071–T074、T120–T168、T192–T199） | 按 register | `v9-<area>-register#T<nnn>` |
+| `a754fcf3..77c2e5e2`（63 条） | 按 §2 表 | `upstream-alignment#2:<行名>` |
+| 主题含 `spark` / `dgx` / `glm` / `tp2` / `distributed` / `tensor-parallel` / `sharded` / `partitioned vocab` | dead | `v9-closeout-register#T214:T001` |
+| 主题含 `FP4-Local` | dead | `v9-closeout-register#T214:T013/T108` |
+| 触及 `src/ops/ple` | absorbed | `upstream-alignment#6`（8/8 已移植） |
+| 触及 `src/models/qwen4_exp`、`src/ops/softmax_attention/qsa`、`src/ops/gated_residual` | todo | `upstream-alignment#6.3` |
+| 主题含 `mxfp8` / `nvfp4` / `block-fp8` / `tma` / `cluster` / `a16` / `csf` / `mla` / `kpool` / `a8 ffn` | na-arch | `upstream-alignment#2:perf(<area>)` |
+| `perf(linear\|moe\|swiglu\|kpool\|kda\|mhc\|rmsnorm\|embedding)`、`style(ops)` | na-arch | `upstream-alignment#2:<原行名>` |
+| `q5090` 前缀、`docs` 提交里提到的 RTX 5090 | na-hardware | `upstream-alignment#6.1` |
+| 在 `81c8ce09..a754fcf3` 内且以上皆不命中 | todo | `upstream-alignment#6` |
+| 其余（当前全部是上游 `docs` 提交） | needs-review | 空 |
+
+### 7.3 当前实测（2026-11-09 跑 `tools/upstream/alignment_report.ps1`）
+
+```
+== upstream alignment report ==
+register : H:\TeleAgentWorks\ninfer-4090-port\ninfer\docs\maintainer\upstream-dispositions.tsv
+           1565 row(s), 6 class(es)
+upstream : upstream/master @ 77c2e5e2  2026-11-07  fix(runtime): recover preempted requests without stalling
+baseline : 77c2e5e2  2026-11-07  fix(runtime): recover preempted requests without stalling
+           pinned at upstream commit 1565 of 1565; 0 commit(s) after it
+
+nothing to triage: the register already covers the upstream tip.
+classes over the whole register:
+  absorbed       1306
+  dead           151
+  na-arch        62
+  todo           35
+  needs-review   9
+  na-hardware    2
+
+ok: every upstream commit up to the tip has a disposition row.
+```
+
+读法：
+
+- 63 条 `a754fcf3..77c2e5e2` 的 class 与 §2 完全对齐（60 na-arch / 2 dead / 1 todo＝`77c2e5e2`）。其中 `361dbbd1`、`4441cf47` 两条 Spark 提交在 §2 里按 `perf(rmsnorm)`、`perf(embedding)` 记为不适用，故落 na-arch 而非 305 段里 Spark 惯用的 dead——以 §2 为准。
+- `absorbed` 1306＝`cc3938c9` 合并带入的 1197 条 + 109 条有本地移植/对表依据的条目。**这仍然是 `cc3938c9` 的口径，不重新主张 §6 已否定的「305 条已吸收」。**
+- `needs-review` 9 条全部是上游 `docs` 提交（`b963bf96`、`19c3a2ae`、`a78bf9ec`、`af26313c`、`c72ba1b9`、`05327b22`、`6e772ee3`、`f1ace85e`、`fbd285b5`），证据列留空，等人工一次性定处置。
+- `dead` 151＝T001 封口池与 T013/T108，加 register 明写「不搬入 / 不跟随」的条目（T120、T123、T124、T145 五条、T149、T151、T163、T127 的 Docker 条）。
+- 每次上游前移，先跑脚本拿 `NO ROW` 清单，补行（同一规则表），再看退出码是否回到 0。
