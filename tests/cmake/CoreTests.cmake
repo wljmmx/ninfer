@@ -92,6 +92,14 @@ add_test(NAME ninfer_chat_templates_test
 
 ninfer_add_test(ninfer_expert_cache_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_expert_cache.cpp" LIBRARIES ninfer_core)
 
+# Per-bank slot pricing: 40 narrow banks plus one wide one, which is the 35B-A3B MTP shape. Covers the
+# stride/bias arithmetic the Device placement table performs, address disjointness, and the grow /
+# shrink round trip that the artifact-level resize tests cannot reach (they run a 40-bank artifact,
+# which stays on the flat layout).
+ninfer_add_test(ninfer_expert_cache_per_bank_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_expert_cache_per_bank.cpp"
+  LIBRARIES ninfer_core)
+
 # The KV tier protocol and the prefetch queue: both are header-only seams with no GPU dependency.
 ninfer_add_test(ninfer_kv_seam_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/kv_seam_test.cpp"
