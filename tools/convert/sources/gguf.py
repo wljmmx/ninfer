@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from math import prod
 import os
 from pathlib import Path
+import re
 import struct
 from typing import Any
 
@@ -53,6 +54,8 @@ GGML_Q3_K = 11
 GGML_Q4_K = 12
 GGML_Q5_K = 13
 GGML_Q6_K = 14
+GGML_IQ4_NL = 20
+GGML_IQ4_XS = 23
 GGML_I8 = 24
 GGML_I16 = 25
 GGML_I32 = 26
@@ -76,6 +79,8 @@ QUANT_SIZES: dict[int, tuple[int, int]] = {
     GGML_Q4_K: (QK_K, 144),
     GGML_Q5_K: (QK_K, 176),
     GGML_Q6_K: (QK_K, 210),
+    GGML_IQ4_NL: (32, 18),
+    GGML_IQ4_XS: (QK_K, 136),
     GGML_I8: (1, 1),
     GGML_I16: (1, 2),
     GGML_I32: (1, 4),
@@ -97,6 +102,8 @@ QUANT_NAMES = {
     GGML_Q4_K: "Q4_K",
     GGML_Q5_K: "Q5_K",
     GGML_Q6_K: "Q6_K",
+    GGML_IQ4_NL: "IQ4_NL",
+    GGML_IQ4_XS: "IQ4_XS",
     GGML_I8: "I8",
     GGML_I16: "I16",
     GGML_I32: "I32",
@@ -263,12 +270,32 @@ def _q8_0(blocks: np.ndarray) -> np.ndarray:
     return x * d
 
 
+_IQ4_NL_VALUES = np.array(
+    (-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113), dtype=np.int8
+)
+
+
+def _iq4_nl(blocks: np.ndarray) -> np.ndarray:
+    """4-bit non-linear codes: one fp16 scale plus 16 nibbles per 32 values (gguf-py layout)."""
+    n_blocks = blocks.shape[0]
+    d, qs = np.hsplit(blocks, [2])
+    d = d.view(np.float16).astype(np.float32)
+    qs = qs.reshape((n_blocks, -1, 1, 16)) >> np.array([0, 4], dtype=np.uint8).reshape((1, 1, 2, 1))
+    qs = (qs & np.uint8(0x0F)).reshape((n_blocks, -1, 1))
+    values = _IQ4_NL_VALUES.reshape((1, 1, 16))
+    qs = np.take_along_axis(values, qs.astype(np.int64), axis=-1).astype(np.float32).reshape(
+        (n_blocks, -1)
+    )
+    return d * qs
+
+
 _DEQUANT = {
     GGML_Q4_0: _q4_0,
     GGML_Q4_1: _q4_1,
     GGML_Q5_0: _q5_0,
     GGML_Q5_1: _q5_1,
     GGML_Q8_0: _q8_0,
+    GGML_IQ4_NL: _iq4_nl,
     GGML_Q2_K: _q2_k,
     GGML_Q3_K: _q3_k,
     GGML_Q4_K: _q4_k,
@@ -435,7 +462,7 @@ class GGUFFile:
                 entries.append((name, tuple(reversed(dims)), ggml_type, rel_offset))
             alignment = int(self.metadata.get("general.alignment", 32) or 32)
             data_start = _align(stream.tell(), alignment)
-        if data_start > file_bytes:
+        if data_start > file_bytes and entries:
             raise ValueError(f"{self.path}: GGUF tensor data starts beyond the file")
         self.alignment = alignment
         tensors: dict[str, GGUFTensor] = {}
@@ -524,6 +551,94 @@ class GGUFFile:
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         self.close()
+
+
+class GGUFSet:
+    """All parts of a split GGUF, presented as one source.
+
+    llama.cpp's split writer emits `name-0000N-of-0000M.gguf`; the metadata (including
+    `general.architecture`) lives in the part that carries it - the first one in practice, which
+    may hold no tensors at all - while each part keeps its own tensor directory and data offsets.
+    Reading is delegated per tensor, so a 100 GiB model is never materialized.
+    """
+
+    def __init__(self, paths: list[str | Path]) -> None:
+        if not paths:
+            raise ValueError("a GGUF set needs at least one part")
+        self.parts = [GGUFFile(path) for path in paths]
+        header = next(
+            (part for part in self.parts if "general.architecture" in part.metadata),
+            self.parts[0],
+        )
+        self.metadata = header.metadata
+        self.alignment = header.alignment
+        self.path = header.path
+        self.root = header.root
+        self.tensors: dict[str, GGUFTensor] = {}
+        self._owner: dict[str, GGUFFile] = {}
+        for part in self.parts:
+            for name, info in part.tensors.items():
+                if name in self.tensors:
+                    raise ValueError(f"tensor {name!r} appears in more than one GGUF part")
+                self.tensors[name] = info
+                self._owner[name] = part
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.metadata.get(key, default)
+
+    def require(self, key: str) -> Any:
+        if key not in self.metadata:
+            raise ValueError(f"{self.path}: GGUF metadata is missing {key!r}")
+        return self.metadata[key]
+
+    def arch(self) -> str:
+        return str(self.require("general.architecture"))
+
+    def read_flat(self, name: str, begin: int = 0, end: int | None = None) -> np.ndarray:
+        owner = self._owner.get(name)
+        if owner is None:
+            raise ValueError(f"{self.path}: missing GGUF tensor {name!r}")
+        return owner.read_flat(name, begin, end)
+
+    def read_tensor(self, name: str) -> np.ndarray:
+        info = self.tensors.get(name)
+        if info is None:
+            raise ValueError(f"{self.path}: missing GGUF tensor {name!r}")
+        return self.read_flat(name, 0, prod(info.shape)).reshape(info.shape)
+
+    @property
+    def bytes_read(self) -> int:
+        return sum(part.bytes_read for part in self.parts)
+
+    def close(self) -> None:
+        for part in self.parts:
+            part.close()
+
+    def __enter__(self) -> "GGUFSet":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
+
+_SPLIT_NAME = re.compile(r"^(?P<base>.*)-(?P<index>\d{5})-of-(?P<total>\d{5})\.gguf$", re.I)
+
+
+def open_gguf(path: str | Path) -> "GGUFFile | GGUFSet":
+    """Open one GGUF, or every part of a split set when the name says it is one."""
+    path = Path(path)
+    match = _SPLIT_NAME.match(path.name)
+    if match is None:
+        return GGUFFile(path)
+    total = int(match.group("total"))
+    base = match.group("base")
+    parts = [path.with_name(f"{base}-{index:05d}-of-{total:05d}.gguf") for index in range(1, total + 1)]
+    missing = [part.name for part in parts if not part.exists()]
+    if missing:
+        raise ValueError(
+            f"{path}: split GGUF is missing part(s) {missing}; all {total} parts are required"
+        )
+    return GGUFSet(parts)
 
 
 def _sizes(ggml_type: int) -> tuple[int, int]:

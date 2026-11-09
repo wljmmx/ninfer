@@ -34,7 +34,7 @@ from typing import Callable, Iterable
 
 import numpy as np
 
-from .sources.gguf import GGUFFile, GGML_I64
+from .sources.gguf import GGML_I64, open_gguf
 
 _TEXT_ARCH = "qwen4exp"
 
@@ -295,7 +295,9 @@ class GGUFSource:
     def __init__(self, path: str | Path, *, config_path: str | Path | None = None,
                  root: str | Path | None = None) -> None:
         self.path = Path(path)
-        self.file = GGUFFile(self.path)
+        # A split set (name-0000N-of-0000M.gguf) is opened as one source: the metadata lives in
+        # the part that carries it, the tensors are spread over all parts.
+        self.file = open_gguf(self.path)
         sidecar = Path(config_path) if config_path else None
         if sidecar is None and (self.path.parent / "config.json").is_file():
             sidecar = self.path.parent / "config.json"
@@ -339,10 +341,9 @@ class GGUFSource:
         import torch  # the conversion stack; the container/quant layer above needs none
 
         if view.dtype == "I64":
-            return torch.from_numpy(np.ascontiguousarray(values, dtype=np.int64))
-        return torch.from_numpy(np.ascontiguousarray(values, dtype=np.float32)).to(
-            torch.bfloat16
-        )
+            return torch.from_numpy(np.array(values, dtype=np.int64, copy=True))
+        # copy=True: torch refuses a read-only buffer, and the view may hand back a slice of one.
+        return torch.from_numpy(np.array(values, dtype=np.float32, copy=True)).to(torch.bfloat16)
 
     # -- mapping --------------------------------------------------------
     def _has(self, name: str) -> bool:
@@ -406,8 +407,12 @@ class GGUFSource:
                 ("ffn_down_shexp", "mlp.shared_expert.down_proj"),
             ):
                 if self._has(prefix + gguf_name + ".weight"):
-                    self._add(target + suffix + ".weight",
-                              self._direct(prefix + gguf_name + ".weight"))
+                    view = self._direct(prefix + gguf_name + ".weight")
+                    if suffix == "mlp.shared_expert_gate" and len(view.shape) == 1:
+                        # llama.cpp stores this router bias as a vector; the builder wants the
+                        # 1xH matrix the HF checkpoint carries.
+                        view = _Reshape(view, (1, view.shape[0]))
+                    self._add(target + suffix + ".weight", view)
 
             fused_name = prefix + "ffn_gate_up_exps.weight"
             gate_name = prefix + "ffn_gate_exps.weight"
@@ -545,11 +550,17 @@ class GGUFSource:
                 conv = _Reshape(raw, (c, 1, taps))
             self._add(name + "conv1d.weight", conv)
         for suffix, gguf_name in (("A_log", "ssm_a"), ("dt_bias", "ssm_dt")):
-            if self._has(prefix + gguf_name + ".weight"):
-                weight = self._direct(prefix + gguf_name + ".weight")
-                if tiled:
-                    weight = _FlatPermute(weight, tiled_to_grouped(nv, nk, per_key, 1))
-                self._add(name + suffix, weight)
+            # llama.cpp names these without the weight suffix (ssm_a, ssm_dt.bias); the earlier
+            # spelling is kept as a fallback for files produced by other converters.
+            for candidate in (gguf_name, gguf_name + ".weight", gguf_name + ".bias"):
+                if self._has(prefix + candidate):
+                    weight = self._direct(prefix + candidate)
+                    if tiled:
+                        weight = _FlatPermute(weight, tiled_to_grouped(nv, nk, per_key, 1))
+                    self._add(name + suffix, weight)
+                    break
+            else:
+                raise ValueError(f"{self.path}: {prefix}{gguf_name} is missing")
         if self._has(prefix + "ssm_norm.weight"):
             self._add(name + "norm.weight", self._direct(prefix + "ssm_norm.weight"))
         if self._has(prefix + "ssm_out.weight"):
@@ -725,44 +736,59 @@ def build_config(file: GGUFFile, sidecar: Path | None) -> dict:
     layer_types = ["full_attention" if int(ratios[i]) > 0 else "linear_attention"
                    for i in range(layers)]
 
-    text.update(
-        {
-            "hidden_size": int(hidden),
-            "num_hidden_layers": int(layers),
-            "num_attention_heads": int(heads),
-            "head_dim": int(head_dim),
-            "num_key_value_heads": int(kv_heads),
-            "hc_count": int(hc_count),
-            "hc_lowrank": int(hc_rank),
-            "num_experts": int(experts),
-            "num_experts_per_tok": int(experts_used),
-            "moe_intermediate_size": int(moe_inter),
-            "shared_expert_intermediate_size": int(shared_inter),
-            "linear_num_key_heads": int(nk),
-            "linear_num_value_heads": int(nv),
-            "linear_key_head_dim": int(dk),
-            "linear_value_head_dim": int(inner) // int(nv),
-            "linear_conv_kernel_dim": int(conv_kernel),
-            "indexer_n_heads": int(idx_heads),
-            "indexer_kv_heads": int(kv_heads),
-            "indexer_head_dim": int(idx_dim),
-            "indexer_compress_ratio": int(text.get("indexer_compress_ratio", 1)),
-            "indexer_budget": int(idx_topk),
-            "layer_types": layer_types,
-        }
-    )
+    # Derived from the file; the sidecar (an authoritative HF config.json) wins wherever it
+    # speaks, because the GGUF's flattened metadata cannot express every field faithfully.
+    derived = {
+        "hidden_size": int(hidden),
+        "num_hidden_layers": int(layers),
+        "num_attention_heads": int(heads),
+        "head_dim": int(head_dim),
+        "num_key_value_heads": int(kv_heads),
+        "hc_count": int(hc_count),
+        "hc_lowrank": int(hc_rank),
+        "num_experts": int(experts),
+        "num_experts_per_tok": int(experts_used),
+        "moe_intermediate_size": int(moe_inter),
+        "shared_expert_intermediate_size": int(shared_inter),
+        "linear_num_key_heads": int(nk),
+        "linear_num_value_heads": int(nv),
+        "linear_key_head_dim": int(dk),
+        "linear_value_head_dim": int(inner) // int(nv),
+        "linear_conv_kernel_dim": int(conv_kernel),
+        "indexer_n_heads": int(idx_heads),
+        "indexer_head_dim": int(idx_dim),
+        "indexer_budget": int(idx_topk),
+        "layer_types": layer_types,
+    }
+    # The indexer's key projection is its own geometry (Qwen3.8-Flash-Next: one key head), not
+    # the attention's `head_count_kv`; the tensor is the authority when the sidecar is silent.
+    indexer_kv = None
+    for name, info in file.tensors.items():
+        if name.endswith(".indexer.k_proj.weight"):
+            indexer_kv = int(info.shape[0]) // int(idx_dim)
+            break
+    derived["indexer_kv_heads"] = int(indexer_kv if indexer_kv else kv_heads)
     ple_layers = _meta(file, "ple.layers") or []
     if ple_layers:
-        text["ple_layer_ids"] = [int(i) + 1 for i in ple_layers]  # HF is 1-based
-        text["ngram_size"] = int(_meta(file, "ple.ngram_size"))
-        text["heads_per_ngram"] = int(_meta(file, "ple.heads_per_ngram"))
-        text["ple_conv_kernel_size"] = int(_meta(file, "ple.conv_kernel"))
-        text["split_ngram_parts"] = int(text.get("split_ngram_parts", 1))
-        ple_ed = _meta(file, "embedding_length_per_layer_input")
-        if ple_ed:
-            text["ple_embed_dim"] = int(ple_ed)
+        derived["ple_layer_ids"] = [int(i) + 1 for i in ple_layers]  # HF is 1-based
+        derived["ngram_size"] = int(_meta(file, "ple.ngram_size"))
+        derived["heads_per_ngram"] = int(_meta(file, "ple.heads_per_ngram"))
+        derived["ple_conv_kernel_size"] = int(_meta(file, "ple.conv_kernel"))
+        # ple_embed_dim is the width of the PLE *projections*; the GGUF's
+        # embedding_length_per_layer_input is the width of the hash table, a different number.
+        for name, info in file.tensors.items():
+            if name.endswith(".ple_key.weight"):
+                derived["ple_embed_dim"] = int(info.shape[1])
+                break
+    text = {**derived, **text}
     if "token_embd.weight" in file.tensors:
-        text["vocab_size"] = int(file.tensors["token_embd.weight"].shape[0])
+        rows = int(file.tensors["token_embd.weight"].shape[0])
+        if text.get("vocab_size") not in (None, rows):
+            raise ValueError(
+                f"{file.path}: the sidecar says vocab_size={text['vocab_size']} but the embedding "
+                f"has {rows} rows"
+            )
+        text["vocab_size"] = rows
     text.setdefault("max_position_embeddings", int(_meta(file, "context_length") or 0))
     text.setdefault("rms_norm_eps",
                     float(_meta(file, "attention.layer_norm_rms_epsilon") or 1e-6))
@@ -772,6 +798,8 @@ def build_config(file: GGUFFile, sidecar: Path | None) -> dict:
     text.setdefault("attention_bias", False)
     text.setdefault("mamba_ssm_dtype", "float32")
     text.setdefault("norm_topk_prob", True)
+    if ple_layers:
+        text.setdefault("split_ngram_parts", 1)
     if "eos_token_id" not in text:
         eos = _meta(file, "ple.eos_token_id")
         if eos is not None:

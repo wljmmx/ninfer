@@ -175,25 +175,28 @@ def qwen3_8_27b_nvfp4(model, recipe, sources):
 
 
 def qwen4_exp(model, recipe, sources):
-    """Qwen4Exp text: Q4 routed experts, Q5 projections, Q8 vocabulary.
+    """Qwen4Exp text: Q4 routed experts and hash table, Q5 projections, Q8 vocabulary.
 
     The same shape the Qwen3.5 MoE recipe uses, applied to the architecture's own parameter
-    names: HC mixes and the PLE table stay at their float representation (they are not
-    projections), the V-head projections take Q4, and the shared expert / attention output take
-    Q5. A GGUF source arrives here after dequantization, so the formats below are chosen from
-    the artifact's needs, not from the source's quantization.
+    names. Two entries are specific to this architecture: the PLE n-gram table is a lookup rather
+    than a projection (bf16 would make it 102 GiB for Qwen3.8-Flash-Next, while the source file
+    already carries it as IQ4_NL at about 4.5 bits, so Q4 keeps both the precision and the size),
+    and the HC mixers stay at their float representation. A GGUF source arrives here after
+    dequantization, so the formats below follow the artifact's needs, not the source's.
     """
     _optional(model, recipe)
     _assign(recipe, "text/token_embedding", Q8)
     _assign(recipe, "text/output_head", Q8)
     for name, parameter in model.parameters.items():
-        if not name.startswith("text/") or not parameter.projection:
+        if not name.startswith("text/") or (not parameter.projection and "/ple/table" not in name):
             continue
         if name.endswith(
             ("/gdn/a_projection", "/gdn/b_projection", "/moe/router", "/moe/shared_score")
         ):
             continue
-        if "/moe/experts/" in name:
+        if "/ple/table" in name:
+            format = Q4
+        elif "/moe/experts/" in name:
             format = Q6 if name.endswith("/down") else Q4
         elif name.endswith(
             (

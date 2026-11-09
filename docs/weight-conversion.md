@@ -40,14 +40,25 @@ Scope and mapping notes:
 * GGUF uses llama.cpp's `blk.N.*` names; the inverse of llama.cpp's QWEN4EXP tensor map is
   applied in `tools/convert/gguf_qwen4exp.py`. Tensors llama.cpp fuses for one matmul (expert
   gate|up, the indexer q|k projection, the linear-attention qkv|z pair, beta|alpha, the
-  hyper-connection down|inject pair) are split back by row range.
+  hyper-connection down|inject pair) are split back by row range; tensors it stores without the
+  `.weight` suffix (`ssm_a`, `ssm_dt.bias`) and the 1-D shared-expert router bias are handled too.
+* **Split files are one source.** Passing the first part of `name-0000N-of-0000M.gguf` opens every
+  part: the metadata comes from the part that carries `general.architecture` (in practice the
+  first, which may hold no tensors at all) and the tensor directories are merged, so a 100 GiB
+  model reads as one file. A missing part is refused by name.
+* **A sidecar `config.json` wins over the GGUF-derived fields** (`--gguf-config`). The flattened
+  GGUF metadata cannot express the rope subtree, `indexer_compress_ratio`, `indexer_kv_heads`,
+  `ple_embed_dim` or `split_ngram_parts` faithfully; those come from the sidecar when given, and
+  otherwise are derived from tensor shapes (indexer key-projection rows, `ple_key` width) or
+  refused.
 * Linear attention stores V heads in llama.cpp's *tiled* order; the converter restores the HF
   *grouped* order (`tiled_to_grouped`) for every tensor that carries V heads.
 * The PLE hash controls (`ple.layer_multipliers`, `ple.head_offsets`, `ple.head_vocab_sizes`) are
   GGUF metadata arrays; they are written to the artifact as exact int64 bytes.
 * The PLE table arrives as the single `per_layer_token_embd` tensor (llama.cpp merged the
   shards), so `split_ngram_parts` must divide its row count; the value comes from the sidecar
-  config.
+  config. The `qwen4_exp` recipe stores that table as Q4: it is a lookup, the source carries it at
+  about 4.5 bits already, and bf16 would make it 102 GiB for a 320M-row table.
 * A GGUF has already lost the original float precision. Re-quantizing a Q4_K source stores the
   GGUF's approximation, not the checkpoint's — this is a conversion of what the file contains.
 
