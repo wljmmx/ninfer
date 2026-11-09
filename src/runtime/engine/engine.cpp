@@ -451,6 +451,39 @@ MediaCacheSummary Engine::media_cache_summary() const {
     return impl_->active->frontend.media_cache_summary();
 }
 
+std::size_t Engine::resize_accepted_inflight() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [](const auto& core) -> std::size_t {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+                throw std::logic_error("Engine core is unavailable");
+            } else if constexpr (requires { core->resize_accepted_inflight_snapshot(); }) {
+                return static_cast<std::size_t>(core->resize_accepted_inflight_snapshot());
+            } else {
+                return 0;
+            }
+        },
+        impl_->core);
+}
+
+std::size_t Engine::outstanding_requests() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [](const auto& core) -> std::size_t {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+                throw std::logic_error("Engine core is unavailable");
+            } else if constexpr (requires { core->outstanding_snapshot(); }) {
+                return core->outstanding_snapshot();
+            } else {
+                // The offline scoring core owns no request lifecycle of its own.
+                return 0;
+            }
+        },
+        impl_->core);
+}
+
 RuntimeStats Engine::runtime_stats() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit(
@@ -509,47 +542,47 @@ std::uint64_t Engine::resize_expert_pool(std::uint64_t target_bytes) {
 std::uint32_t Engine::resize_kv_pages(std::uint32_t target_pages) {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     if (target_pages == 0) { throw std::invalid_argument("KV page target must be positive"); }
-    const RuntimeStats stats = runtime_stats();
-    const std::uint64_t busy = static_cast<std::uint64_t>(stats.running_requests) +
-                               stats.prefilling_requests + stats.decode_ready_requests +
-                               stats.waiting_requests + stats.paused_requests +
-                               stats.replaying_requests + stats.materializing_requests +
-                               stats.capture_pending_requests + stats.terminal_pending_requests;
-    const bool inflight = std::visit(
-        [](const auto& core) -> bool {
+    // 13.5-5 / open #1: the generation core walks the SAME acceptance as the expert pool -
+    // EngineCore::resize_kv_pages_checked - so there is one idle contract, one verdict log and one
+    // request-lifecycle counter behind both. This entry keeps its own copy only for the offline
+    // scoring core, which has no controller dial and no worker-side scheduling point.
+    return std::visit(
+        [&](auto& core) -> std::uint32_t {
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (std::is_same_v<CoreState, std::monostate>) {
-                return false;
+                throw std::logic_error("Engine core is unavailable");
+            } else if constexpr (std::is_same_v<CoreState,
+                                               std::unique_ptr<Impl::GenerationCore>>) {
+                return core->resize_kv_pages_checked(target_pages);
             } else {
-                return core->any_inflight();
+                const RuntimeStats stats  = runtime_stats();
+                const std::uint64_t busy  = static_cast<std::uint64_t>(stats.running_requests) +
+                                           stats.prefilling_requests + stats.decode_ready_requests +
+                                           stats.waiting_requests + stats.paused_requests +
+                                           stats.replaying_requests + stats.materializing_requests +
+                                           stats.capture_pending_requests +
+                                           stats.terminal_pending_requests;
+                const bool inflight = core->any_inflight();
+                // Same live-state leg as the expert pool entry: a KV shrink that slips through
+                // between two all-zero gauge snapshots trims the free list underneath a batch
+                // still allocating pages.
+                if (busy != 0 || inflight) {
+                    throw std::logic_error("KV pool resize requires an idle engine");
+                }
+                // Same two-read window as the expert pool: a request that started during the
+                // synchronize is the one the second check refuses.
+                impl_->device.synchronize();
+                const RuntimeStats again = runtime_stats();
+                const bool inflight_again = core->any_inflight();
+                if (inflight_again || again.running_requests != 0 ||
+                    again.waiting_requests != 0 || again.paused_requests != 0 ||
+                    again.prefilling_requests != 0 || again.decode_ready_requests != 0) {
+                    throw std::logic_error("KV pool resize lost its idle window");
+                }
+                return impl_->active->resize_kv_capacity(target_pages);
             }
         },
         impl_->core);
-    // Same live-state leg as the expert pool entry: a KV shrink that slips through between two
-    // all-zero gauge snapshots trims the free list underneath a batch still allocating pages.
-    if (busy != 0 || inflight) {
-        throw std::logic_error("KV pool resize requires an idle engine");
-    }
-    // Same two-read window as the expert pool: a request that started during the synchronize is the
-    // one the second check refuses.
-    impl_->device.synchronize();
-    const RuntimeStats again = runtime_stats();
-    const bool inflight_again = std::visit(
-        [](const auto& core) -> bool {
-            using CoreState = std::remove_cvref_t<decltype(core)>;
-            if constexpr (std::is_same_v<CoreState, std::monostate>) {
-                return false;
-            } else {
-                return core->any_inflight();
-            }
-        },
-        impl_->core);
-    if (inflight_again || again.running_requests != 0 || again.waiting_requests != 0 ||
-        again.paused_requests != 0 || again.prefilling_requests != 0 ||
-        again.decode_ready_requests != 0) {
-        throw std::logic_error("KV pool resize lost its idle window");
-    }
-    return impl_->active->resize_kv_capacity(target_pages);
 }
 
 namespace {

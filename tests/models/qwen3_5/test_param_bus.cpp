@@ -107,21 +107,26 @@ int main() {
         require(bus.get("warm_arena_mb") == 930.0,
                 "warm_arena_mb did not take NINFER_BUDGET_RAM_MB as its initial value");
         require(bus.get("kv_pages") < 0.0,
-                "kv_pages should be source-missing (negative), not a made-up number");
+                "kv_pages must start un-pinned (negative) and take its edge from the engine "
+                "attach, not invent a number");
         require(bus.get("no_such_param") != bus.get("no_such_param"), // NaN != NaN
                 "an unknown parameter must read as NaN, not 0");
 
-        // L1, phase two (v8 12.5 step 4): expert_pool_mb obeys the ladder - without an executor
-        // attached on this thread the write lands as NoExecutor (the honest answer for a CLI/test
-        // caller; the engine worker is what attaches the slow-dial executor). The other two L1
-        // rows stay refused, each with its OWN reason: kv_pages is load-acceptance-pending (the
-        // API exists, the resize acceptance found an open race + divergence), warm_arena_mb has
-        // no runtime path at all (the arena is sized once at construction).
+        // L1, phase two (v8 12.5 step 4): both slow-dial rows obey the ladder - without an
+        // executor attached on this thread a write lands as NoExecutor (the honest answer for a
+        // CLI/test caller; the engine worker is what attaches the slow-dial executors). kv_pages
+        // was load-acceptance-pending until 2026-11-09; it is live now (the hand-off race and the
+        // "divergence" were both closed - see test_engine_resize_handoff.cpp and the pinned
+        // controller in test_engine_resize_under_load.cpp). warm_arena_mb still has no runtime
+        // path at all (the arena is sized once at construction).
         require(bus.set("expert_pool_mb", 8192.0, /*from_controller=*/true) ==
                      ParamReject::NoExecutor,
                 "L1 expert_pool_mb without an executor was not refused as no-executor");
-        require(bus.set("kv_pages", 1.0, true) == ParamReject::LoadAccept,
-                "L1 kv_pages write was not refused as load-acceptance-pending");
+        // kv_pages has no edge to name until an engine attaches, so the row carries the collapsed
+        // [0..0] range the bus uses for "not pinned yet" and refuses every value as out of range
+        // (the same convention as any other un-attached row).
+        require(bus.set("kv_pages", 1.0, true) == ParamReject::Range,
+                "L1 kv_pages before an engine attach was not refused as out of range");
         require(bus.set("warm_arena_mb", 512.0, true) == ParamReject::NoExecutor,
                 "L1 warm_arena_mb write was not refused (no runtime path exists)");
         // Authority: L2/L3 belong to the controller; anyone else is refused (越权).

@@ -24,22 +24,24 @@
 //   L2  medium     concurrency / prefetch / graph / freeze family; per window (32 layers).
 //   L3  fast       hot set / spill ring / second chance / per-layer counts; per layer.
 //
-// Phase two (v8 12.5 step 4) lifts the L1 blanket refusal for exactly one row: "expert_pool_mb"
-// now obeys the same ladder as any other parameter, because its executor - the engine worker's
-// slow dial (PolicyController::slow_pool_step) parking a target that the worker applies through
-// Engine::resize_expert_pool's idle contract - exists and is accepted. The other two L1 rows stay
-// refused, each with its own reason in the panel:
-//   kv_pages       Engine::resize_kv_pages exists, but the resize acceptance (2026-11-05) found
-//                  an open race against the boundary gauges and a degradation divergence under
-//                  load - load acceptance is still pending, so the write is refused.
+// Phase two (v8 12.5 step 4) lifts the L1 blanket refusal row by row. "expert_pool_mb" and
+// "kv_pages" both obey the same ladder now, because both executors - the engine worker's slow
+// dials (PolicyController::slow_pool_step / slow_kv_step parking a target that the worker applies
+// through Engine::resize_expert_pool / resize_kv_pages' idle contract) exist and are accepted:
+//   kv_pages       accepted 2026-11-09. The 2026-11-05 acceptance's two open items are closed:
+//                  the queue->lane hand-off race (the idle judgment now reads the request-
+//                  lifecycle counter, so a request that exists at all refuses the resize) and the
+//                  post-shrink token divergence (measured to be the controller's own serial
+//                  actuator changing the batch shape mid-run, not the page edge; the acceptance
+//                  now pins the controller and asserts token identity across the edge).
 //   warm_arena_mb  no runtime path exists at all: HostExpertResidency sizes its arena once, at
 //                  construction, from the HostWarmBudget; there is nothing to hand a set() to.
 //
 // Live executors after this phase: "concurrency" (engine worker, v8 9.3), "prefetch_on" (the
-// read-ahead queue's gate, v8 9.2 row 2, attached where the queue's owner runs) and
-// "expert_pool_mb" (the slow dial above). Everything else is readable, printable and refusable -
-// taking over more parameters is later phases (v8 12.5), and pretending otherwise would make the
-// panel a work of fiction.
+// read-ahead queue's gate, v8 9.2 row 2, attached where the queue's owner runs),
+// "expert_pool_mb" and "kv_pages" (the two slow dials above). Everything else is readable,
+// printable and refusable - taking over more parameters is later phases (v8 12.5), and pretending
+// otherwise would make the panel a work of fiction.
 //
 // Honest no-executor register (v8 section 11's seven domains, audited 2026-11-05):
 //   graph_on        the +5% (13.5-1, 43.6/43.7 vs 41.5/41.6 tok/s at 19.4 GiB) is the WHOLE-STEP
@@ -53,7 +55,8 @@
 //                   (capt_ready==100 && static==100) was measured on, so wiring the row to it
 //                   would put a borrowed +5% on a neutral switch. graph_on therefore stays
 //                   no-executor: construction-time decision, mirrored for print only.
-//   kv_pages / warm_arena_mb   refused L1, reasons above.
+//   kv_pages / warm_arena_mb   warm_arena_mb stays refused (no runtime path, above); kv_pages is
+//                   live through the slow dial.
 //   L3 family       hot_cap (epoch is a constructor constant), spill_slots (an env re-read, not a
 //                   setter), second_chance_slots (a construction-time budget), per_layer (a static
 //                   const read once), admit_min (no admission floor exists in the code yet) -
@@ -230,6 +233,13 @@ public:
         return index < 0 ? std::nan("") : specs_[static_cast<std::size_t>(index)].hi;
     }
 
+    // ... and the lower bound, for the dial whose steps go DOWN (kv_pages: one page-group step
+    // towards the registered floor, then the 3% rail turns it around).
+    [[nodiscard]] double lo_of(const char* name) const {
+        const int index = find(name);
+        return index < 0 ? std::nan("") : specs_[static_cast<std::size_t>(index)].lo;
+    }
+
     // Installs the accepted executor for a parameter and pins its real range/initial value.
     // Used by the engine worker thread for "concurrency" (v8 9.3): the bus is thread-local and
     // the engine worker is the thread that both runs the model (the controller) and schedules
@@ -334,19 +344,19 @@ private:
                        .source = "NINFER_EXPERT_CACHE_MB"});
         register_spec({.name = "kv_pages",
                        .initial = -1.0,
+                       // Pinned by the engine worker at attach: [16 or 25% of the edge, the edge the
+                       // pool was laid out with]. The physical backing above the construction edge
+                       // was never mapped, so a larger value is not a knob the engine could honour.
                        .lo = 0.0,
                        .hi = 0.0,
                        .tier = ParamTier::L1,
                        .cost_ms = 3000.0,
                        .observe = "kv-hit/evict",
                        .rollback = 0.0,
-                       .source = "missing: --kv-capacity is a serve CLI value; the models "
-                                 "layer cannot read it. Engine::resize_kv_pages exists but "
-                                 "the resize acceptance (2026-11-05) found an open race "
-                                 "against the boundary gauges and a degradation divergence "
-                                 "under load, so the write stays refused.",
-                       .source_missing = true,
-                       .refusal = ParamReject::LoadAccept});
+                       .source = "attachment: pool capacity in page groups; the executor parks a "
+                                 "target the engine applies through the idle contract "
+                                 "(Engine::resize_kv_pages). Shrink and grow are both legal up to "
+                                 "the construction edge; load acceptance 2026-11-09."});
         register_spec({.name = "warm_arena_mb",
                        .initial = env_number("NINFER_BUDGET_RAM_MB", -1.0),
                        .lo = 256.0,

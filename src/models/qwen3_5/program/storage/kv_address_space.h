@@ -213,6 +213,30 @@ public:
         page_capacity_ = target_pages;
     }
 
+    // Raises the bound back towards the execution table's logical page capacity. Only legal
+    // while no address owns more pages than the bound (guaranteed: a shrink could not be made
+    // under such an owner, and growth is bounded by the table's own width).
+    void grow_page_capacity(std::uint32_t target_pages) {
+        if (target_pages <= page_capacity_) { return; }
+        if (target_pages > tables_->logical_page_capacity()) {
+            throw std::invalid_argument("KV address space grow exceeds the execution table width");
+        }
+        page_capacity_ = target_pages;
+    }
+
+    // 13.4: the per-address page bound is part of the KV half's capacity, so a runtime shrink can
+    // make a frontier the execution geometry still allows unmappable. growth_pages_for_tokens()
+    // throws for that case, and the throw would escape a bind into the worker round (fatal), so
+    // the planner asks this predicate first and reports a capacity shortage instead.
+    [[nodiscard]] bool fits_tokens(std::uint32_t tokens) const noexcept {
+        return pages_for_tokens(tokens) <= page_capacity_;
+    }
+
+    [[nodiscard]] std::uint32_t pages_missing_for_tokens(std::uint32_t tokens) const noexcept {
+        const std::uint32_t required = pages_for_tokens(tokens);
+        return required > page_capacity_ ? required - page_capacity_ : 0U;
+    }
+
     [[nodiscard]] std::optional<KVAddressSpaceHandle>
     create_active(std::uint32_t growth_pages, std::int32_t execution_row, cudaStream_t stream) {
         if (growth_pages > page_capacity_) { return std::nullopt; }

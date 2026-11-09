@@ -205,6 +205,14 @@ int main() {
         std::cout << "skip: NINFER_TEST_ARTIFACT is not set\n";
         return 77;
     }
+    // The tier arms compare a restored run against a cold run generated in a different Engine.
+    // With the auto-curved pool a few hundred experts stay unslotted and are served from the CPU
+    // half, whose numerics differ from the device kernels; which experts land where depends on the
+    // preceding traffic, so the comparison is a knife edge (measured 2026-11-09: the 500-tier arm
+    // flipped its first token against an otherwise identical cold run). Pinning the pool to full
+    // residency removes that variable: the tier contract is about KV restoration, not about which
+    // half of a split layer happened to hold an expert.
+    _putenv_s("NINFER_EXPERT_CACHE_MB", "19456");
     const auto guard = [](auto&& body) -> int {
         try {
             return body();

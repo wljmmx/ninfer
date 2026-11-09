@@ -302,6 +302,25 @@ runtime::ResourceReservation ProgramImpl::reserve_units(std::span<const Executio
             }
             continue;
         }
+        // A runtime KV shrink (13.4) lowers the per-address page bound below the construction
+        // geometry, so a frontier the token capacity still allows can be unmappable now. Growth
+        // would throw "KV unit exceeds address capacity" out of growth_pages_for_tokens(), and that
+        // throw escapes a bind straight into the worker round, where it fails EVERY lane and
+        // stops the engine. Report the same fact as a capacity shortage instead: the request is
+        // refused admission (or paused/replayed) like any other capacity refusal.
+        if (!text_kv_addresses->fits_tokens(coverage[lane].main_frontier)) {
+            return {.reserved = false,
+                    .shortage = {.main_kv_pages = text_kv_addresses->pages_missing_for_tokens(
+                                     coverage[lane].main_frontier),
+                                 .backend_kv_pages = 0}};
+        }
+        if (state.kv->backend && backend_kv_addresses &&
+            !backend_kv_addresses->fits_tokens(coverage[lane].backend_frontier)) {
+            return {.reserved = false,
+                    .shortage = {.main_kv_pages = 0,
+                                 .backend_kv_pages = backend_kv_addresses->pages_missing_for_tokens(
+                                     coverage[lane].backend_frontier)}};
+        }
         const auto main = text_kv_addresses->growth_pages_for_tokens(state.kv->text,
                                                                      coverage[lane].main_frontier);
         old_main[lane]  = text_kv_addresses->reserved_growth_pages(state.kv->text);

@@ -232,11 +232,23 @@ public:
     [[nodiscard]] std::uint32_t allocated_pages() const noexcept;
     [[nodiscard]] std::uint32_t reserved_pages() const noexcept;
     [[nodiscard]] std::uint32_t available_pages() const noexcept;
+    // The capacity the pool was laid out with. It is the hard upper edge of a runtime grow: the
+    // planes, the generation/occupancy vectors and the free-run table were all sized for exactly
+    // this many page groups, and nothing above it can be handed out without a new layout.
+    [[nodiscard]] std::uint32_t construction_capacity_pages() const noexcept {
+        return page_group_limit_;
+    }
     // 13.4: runtime shrink. Lowers the usable capacity; pages above `target` must be free, and the
     // request is refused (not partially applied) otherwise. Physical backing stays mapped - the
     // driver reservation is not returned - so this is an admission-control shrink, and growing back
     // is possible as long as no page above the new capacity was reused.
     [[nodiscard]] std::uint32_t shrink_capacity(std::uint32_t target_pages);
+    // The complement of shrink_capacity: hands pages [capacity, target) back to the free list.
+    // Legal up to construction_capacity_pages() and only while every owned page sits below the
+    // current edge - which the shrink invariant already guarantees, because the allocator can
+    // only pick from the free list and a shrink trims that list at the edge. Refused (not
+    // partially applied) otherwise.
+    [[nodiscard]] std::uint32_t grow_capacity(std::uint32_t target_pages);
     [[nodiscard]] std::size_t plane_count() const noexcept;
     [[nodiscard]] const Tensor& plane(std::size_t index) const;
 
@@ -334,6 +346,9 @@ private:
     std::size_t host_page_stride_         = 0;
     std::uint64_t page_payload_bytes_     = 0;
     std::size_t maximum_host_plane_group_ = 1;
+    // The geometry's page_group_count. Held apart from spec_ because spec_ carries the LIVE edge
+    // (shrink/grow move it) while this one is what the layout was built for.
+    std::uint32_t page_group_limit_        = 0;
     std::vector<FreePageRun> free_page_runs_;
     std::vector<std::uint32_t> page_generations_;
     std::vector<bool> page_allocated_;

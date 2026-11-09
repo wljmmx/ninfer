@@ -130,6 +130,14 @@ public:
     [[nodiscard]] MemorySummary memory_summary() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
+    // The request-lifecycle counter the resize idle contract is built on: requests exist from
+    // submission (before they are queued) until their consumer releases them. Exposed so an
+    // acceptance test can assert "a reallocation was never accepted while this was nonzero"
+    // against the engine's own view instead of a client-side guess.
+    [[nodiscard]] std::size_t outstanding_requests() const;
+    // Every accepted reallocation must have cleared a verdict that saw no request in its
+    // lifecycle. This counter is the engine's own evidence for that invariant; it must stay zero.
+    [[nodiscard]] std::size_t resize_accepted_inflight() const;
     [[nodiscard]] bool is_available() const;
 
     // 13.4: runtime pool resize. Only legal while the engine is idle: an expert window a running

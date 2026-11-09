@@ -91,8 +91,15 @@ ninfer_add_test(ninfer_qwen3_5_resize_under_load_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_resize_under_load.cpp"
   LIBRARIES ninfer_engine)
 
-# The frozen-graph arm of the same acceptance: NINFER_GRAPH_BUDGET pays the capture allowance so
-# the pool is pinned at construction, and the binary answers only its own scenario so the budget
+# Open #1 (2026-11-05) acceptance: the hand-off race. Four clients submit back-to-back while two
+# hammer threads ask for a REAL shrink (edge - 8 page groups); every attempt must be refused and
+# the workload must finish intact. The engine's own `[resize]` verdict lines carry the state that
+# refused each attempt.
+ninfer_add_test(ninfer_qwen3_5_resize_handoff_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_resize_handoff.cpp"
+  LIBRARIES ninfer_engine)
+
+# The frozen-graph arm of the same acceptance: NINFER_GRAPH_BUDGET pays the capture allowance so# the pool is pinned at construction, and the binary answers only its own scenario so the budget
 # never leaks into the load arms (the sources read the variable once per process).
 add_test(NAME ninfer_qwen3_5_resize_pinned_graph_real_test
   COMMAND ninfer_qwen3_5_resize_under_load_real_test)
@@ -165,6 +172,7 @@ set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_kv_tier_real_test
   ninfer_qwen3_5_expert_stream_real_test
   ninfer_qwen3_5_resize_under_load_real_test
+  ninfer_qwen3_5_resize_handoff_real_test
   ninfer_qwen3_5_resize_pinned_graph_real_test)
 set_tests_properties(${ninfer_qwen3_5_real_tests} PROPERTIES
   SKIP_RETURN_CODE 77
@@ -176,6 +184,8 @@ set_tests_properties(${ninfer_qwen3_5_real_tests} PROPERTIES
 set_tests_properties(ninfer_qwen3_5_resize_under_load_real_test PROPERTIES
   TIMEOUT 5400)
 set_tests_properties(ninfer_qwen3_5_resize_pinned_graph_real_test PROPERTIES
+  TIMEOUT 1800)
+set_tests_properties(ninfer_qwen3_5_resize_handoff_real_test PROPERTIES
   TIMEOUT 1800)
 
 set_tests_properties(

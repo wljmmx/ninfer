@@ -188,10 +188,31 @@ std::uint32_t ProgramImpl::resize_kv_capacity(std::uint32_t target_pages) {
     }
     DeviceKVPagePool& pool = text_kv_pages->physical_pool();
     const std::uint32_t current = pool.capacity_pages();
-    if (target_pages >= current) { return current; }
     if (target_pages == 0) {
         throw std::invalid_argument("KV capacity target must be positive");
     }
+    if (target_pages > current) {
+        // Grow back towards the construction edge. The physical backing was never returned, so
+        // this is the exact inverse of the shrink - bounded by what the layout was built for and
+        // by what the execution tables can address.
+        const std::uint32_t target =
+            std::min(target_pages, pool.construction_capacity_pages());
+        const std::uint32_t after = pool.grow_capacity(target);
+        // The per-address page bound follows the pool edge it was shrunk away from. grow_page_
+        // capacity() caps at the execution table's width and refuses anything wider, which is the
+        // one way this could disagree with the geometry.
+        text_kv_addresses->grow_page_capacity(after);
+        if (const char* debug = std::getenv("NINFER_KV_DEBUG"); debug != nullptr && *debug) {
+            std::fprintf(stderr,
+                         "[kv-pool] grow %u -> %u page(s) (target %u, construction %u, "
+                         "allocated %u reserved %u)\n",
+                         current, after, target_pages, pool.construction_capacity_pages(),
+                         pool.allocated_pages(), pool.reserved_pages());
+            std::fflush(stderr);
+        }
+        return after;
+    }
+    if (target_pages == current) { return current; }
     // Validate the address-space half before the pool changes: a retained checkpoint whose
     // directory reaches above the new edge is an owner, and truncating the pool under it would turn
     // that checkpoint into an address with missing pages.
@@ -203,6 +224,14 @@ std::uint32_t ProgramImpl::resize_kv_capacity(std::uint32_t target_pages) {
     }
     const std::uint32_t after = pool.shrink_capacity(target_pages);
     text_kv_addresses->shrink_page_capacity(address_target);
+    if (const char* debug = std::getenv("NINFER_KV_DEBUG"); debug != nullptr && *debug) {
+        std::fprintf(stderr,
+                     "[kv-pool] shrink %u -> %u page(s) (address edge %u, allocated %u reserved "
+                     "%u, free %u)\n",
+                     current, after, address_target, pool.allocated_pages(), pool.reserved_pages(),
+                     pool.available_pages());
+        std::fflush(stderr);
+    }
     return after;
 }
 

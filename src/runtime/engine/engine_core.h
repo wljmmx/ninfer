@@ -296,7 +296,11 @@ public:
         MemorySummary out                      = instance_.program->memory_summary();
         const KvCapacityResolution& resolution = instance_.kv_capacity_resolution;
         out.kv_capacity_mode                   = resolution.mode;
-        out.kv_capacity_page_groups            = resolution.main_page_groups;
+        // 13.4: the program reports the pool's LIVE edge (a runtime shrink/grow moves it); the
+        // resolution is only the fallback for a model without a paged text cache.
+        out.kv_capacity_page_groups            = out.kv_capacity_page_groups != 0
+                                                     ? out.kv_capacity_page_groups
+                                                     : resolution.main_page_groups;
         out.kv_capacity_max_page_groups        = resolution.maximum_main_page_groups;
         out.evict_contract_effective =
             resolution.evict_contract_effective != 0 ? EvictionContract::On : EvictionContract::Off;
@@ -1596,35 +1600,130 @@ private:
     // parking behind a multi-second prefill. When it succeeds, the queue state is read under
     // both locks in the worker's own order.
 public:
-    // v8 12.5 step 4 + 13.5-5: THE idle contract for an expert-pool resize, in ONE place. The
-    // nine gauge counters plus the live try-lock check first, then a device synchronize and a
-    // second read - a request that started during the synchronize is the one the second check
-    // refuses (found by the resize-under-load acceptance on the e2 artifact, 2026-11-05).
-    // Engine::resize_expert_pool forwards external callers here, and the worker's own
-    // scheduling point (apply_pending_pool_resize) walks the SAME code, so there is no second,
-    // weaker copy to drift. resize_mutex_ serializes the two entry points; the queue-side race
-    // is still covered by the double read, which is the part that makes a wrong-but-atomic
-    // answer impossible.
+    // v8 12.5 step 4 + 13.5-5: THE idle contract for a reallocation, in ONE place, for both the
+    // expert pool and the KV pages. Engine::resize_expert_pool / resize_kv_pages forward external
+    // callers here, and the worker's own scheduling point (apply_pending_pool_resize) walks the
+    // SAME code, so there is no second, weaker copy to drift. resize_mutex_ serializes the entry
+    // points.
+    //
+    // The window itself (open #1, measured on the e2 artifact 2026-11-05 as one refusal and one
+    // penetration in the same run): the two-read form only *observed* idleness, it never held it.
+    // Executing between the check and the mutation needs execution_mutex_ - the worker's round
+    // takes it - so a submission arriving in that gap could be admitted and start binding while
+    // the pool was being rebuilt. The contract is now: try the round lock (refuse immediately if a
+    // round is running, never park behind a multi-second prefill), and on success HOLD it across
+    // the verdict, the device synchronize and the mutation. With it held the worker cannot start a
+    // round, so nothing can be admitted or bound; the only thing that can still change is the
+    // request-lifecycle counter (a submission), which the second read refuses. Idle observation and
+    // idle preservation are the same lock.
+    struct IdleVerdict {
+        bool idle = false;
+        std::string why;
+    };
+
+    // Requires BOTH execution_mutex_ and queue_mutex_ to be held by the caller (see above); reads
+    // the queue side and the request-lifecycle counter, which is what makes "a request that exists
+    // at all" answer busy. The resize entries hold the queue lock from the verdict through the
+    // mutation, so no submission can increment outstanding_ inside the window the verdict clears.
+    [[nodiscard]] IdleVerdict idle_state_held() const {
+        IdleVerdict verdict;
+        const bool holding_decision =
+            admission_decision_.has_value() || context_owner_ != nullptr ||
+            std::any_of(capture_decisions_.begin(), capture_decisions_.end(),
+                        [](const auto& decision) { return decision.has_value(); });
+        verdict.idle = outstanding_ == 0 && pending_.empty() && resident_empty() &&
+                       paused_.empty() && !holding_decision;
+        if (!verdict.idle) {
+            verdict.why = std::string("request lifecycle: outstanding=") +
+                          std::to_string(outstanding_) + " queued=" +
+                          std::to_string(pending_.size()) +
+                          " resident=" + (resident_empty() ? "0" : "1") +
+                          " paused=" + std::to_string(paused_.size()) +
+                          " decision=" + (holding_decision ? "1" : "0");
+        }
+        return verdict;
+    }
+
     [[nodiscard]] std::uint64_t resize_expert_pool_checked(std::uint64_t target_bytes) {
         std::lock_guard serialize(resize_mutex_);
-        const RuntimeStats stats = runtime_stats();
-        const std::uint64_t busy = static_cast<std::uint64_t>(stats.running_requests) +
-                                   stats.prefilling_requests + stats.decode_ready_requests +
-                                   stats.waiting_requests + stats.paused_requests +
-                                   stats.replaying_requests + stats.materializing_requests +
-                                   stats.capture_pending_requests + stats.terminal_pending_requests;
-        if (busy != 0 || any_inflight()) {
+        // A bounded grace, not an admit-anywhere window: a request that just finished leaves the
+        // worker in its settle round for a few milliseconds, and refusing that tail would make an
+        // "idle" engine look busy to the caller that waited for it. A multi-second prefill still
+        // refuses, at the same 80 ms bound.
+        std::unique_lock execution(execution_mutex_, std::defer_lock);
+        if (!execution.try_lock_for(std::chrono::milliseconds(80))) {
+            log_resize_verdict("expert pool", "refused", "an execution round holds the engine");
             throw std::logic_error("expert pool resize requires an idle engine");
         }
-        device_.synchronize();
-        const RuntimeStats again = runtime_stats();
-        if (any_inflight() || again.running_requests != 0 || again.waiting_requests != 0 ||
-            again.paused_requests != 0 || again.prefilling_requests != 0 ||
-            again.decode_ready_requests != 0) {
-            throw std::logic_error("expert pool resize lost its idle window");
+        IdleVerdict verdict;
+        {
+            // Held from the verdict through the mutation: a submission blocks on this lock and
+            // therefore cannot increment outstanding_ between the cleared verdict and the
+            // reallocation. Before, the second read only *observed* idleness; the mutation ran
+            // after it was released (the 2026-11-05 penetration).
+            std::unique_lock queue(queue_mutex_);
+            verdict = idle_state_held();
+            if (!verdict.idle) {
+                log_resize_verdict("expert pool", "refused", verdict.why);
+                throw std::logic_error("expert pool resize requires an idle engine");
+            }
+            // The synchronize runs with both locks held: no round can start and no request can be
+            // submitted meanwhile, so this is the whole in-flight set, not a snapshot racing one.
+            device_.synchronize();
+            verdict = idle_state_held();
+            if (!verdict.idle) {
+                log_resize_verdict("expert pool", "refused",
+                                   "lost its idle window to a submission: " + verdict.why);
+                throw std::logic_error("expert pool resize lost its idle window");
+            }
+            log_resize_verdict("expert pool", "accepted", verdict.why);
+            // The verdict above required outstanding_ == 0 under this lock; if that ever stops
+            // being true the counter makes it visible to the acceptance test instead of hiding in
+            // a log line.
+            if (outstanding_.load(std::memory_order_acquire) != 0) {
+                resize_accepted_inflight_.fetch_add(1, std::memory_order_relaxed);
+            }
+            return instance_.resize_expert_pool(target_bytes);
         }
-        return instance_.resize_expert_pool(target_bytes);
     }
+
+    // 13.5-5 / open #1: the KV half, same acceptance, same lock discipline, same verdict log.
+    [[nodiscard]] std::uint32_t resize_kv_pages_checked(std::uint32_t target_pages) {
+        std::lock_guard serialize(resize_mutex_);
+        if (target_pages == 0) { throw std::invalid_argument("KV page target must be positive"); }
+        std::unique_lock execution(execution_mutex_, std::defer_lock);
+        if (!execution.try_lock_for(std::chrono::milliseconds(80))) {
+            log_resize_verdict("kv", "refused", "an execution round holds the engine");
+            throw std::logic_error("KV pool resize requires an idle engine");
+        }
+        IdleVerdict verdict;
+        {
+            // Same lock discipline as the expert half: verdict and mutation under one queue lock.
+            std::unique_lock queue(queue_mutex_);
+            verdict = idle_state_held();
+            if (!verdict.idle) {
+                log_resize_verdict("kv", "refused", verdict.why);
+                throw std::logic_error("KV pool resize requires an idle engine");
+            }
+            device_.synchronize();
+            verdict = idle_state_held();
+            if (!verdict.idle) {
+                log_resize_verdict("kv", "refused",
+                                   "lost its idle window to a submission: " + verdict.why);
+                throw std::logic_error("KV pool resize lost its idle window");
+            }
+            const std::uint32_t before = instance_.program->physical_usage().capacity.main_kv_pages;
+            const std::uint32_t after  = instance_.resize_kv_capacity(target_pages);
+            log_resize_verdict("kv", "accepted", std::string("pages ") + std::to_string(before) +
+                                                     " -> " + std::to_string(after) + " (target " +
+                                                     std::to_string(target_pages) + ")");
+            if (outstanding_.load(std::memory_order_acquire) != 0) {
+                resize_accepted_inflight_.fetch_add(1, std::memory_order_relaxed);
+            }
+            return after;
+        }
+    }
+
 
     // The bus's accepted executor for "expert_pool_mb" (v8 12.5 step 4). It runs on the worker
     // thread itself - the model code calling bus.set IS this thread, mid-round - so an actual
@@ -1638,6 +1737,21 @@ public:
         {
             // Take the lock so a worker sitting in the wait predicate cannot miss the store
             // between its check and its sleep (the notify alone would be a race).
+            std::lock_guard lock(queue_mutex_);
+        }
+        queue_cv_.notify_all();
+        return true;
+    }
+
+    // The KV half of the slow dial's executor (13.4 + v8 12.3's L1 rows). Same handshake, same
+    // parking discipline: the worker applies it at its own idle scheduling point through
+    // resize_kv_pages_checked, i.e. the very contract an external caller walks. A value of 0 means
+    // "nothing parked".
+    bool park_kv_resize_pages(double value) {
+        pending_kv_pages_.store(value > 0.0 ? static_cast<double>(static_cast<std::uint32_t>(value))
+                                           : 0.0,
+                                std::memory_order_release);
+        {
             std::lock_guard lock(queue_mutex_);
         }
         queue_cv_.notify_all();
@@ -1790,6 +1904,11 @@ public:
     // the worker must not hold the very lock the contract probes. A refusal is logged and the
     // bus is noted back to the pre-step capacity; it is never bypassed.
     void apply_pending_pool_resize() {
+        apply_pending_expert_pool_resize();
+        apply_pending_kv_resize();
+    }
+
+    void apply_pending_expert_pool_resize() {
         const double mb = pending_pool_resize_mb_.exchange(0.0, std::memory_order_acq_rel);
         if (mb <= 0.0) { return; }
         const auto target    = static_cast<std::uint64_t>(mb) << 20;
@@ -1815,20 +1934,86 @@ public:
         }
     }
 
-    [[nodiscard]] bool any_inflight() const {
+    // 13.4: the KV half. The bus row is the single read-back channel, exactly like the pool: the
+    // worker notes the capacity the resize actually produced (a shrink that a retained checkpoint
+    // refused leaves the old edge in place), so the dial's next verdict judges what is in force.
+    void apply_pending_kv_resize() {
+        const double parked = pending_kv_pages_.exchange(0.0, std::memory_order_acq_rel);
+        if (parked <= 0.0) { return; }
+        const auto target    = static_cast<std::uint32_t>(parked);
+        const std::uint32_t before = instance_.program->physical_usage().capacity.main_kv_pages;
+        try {
+            const std::uint32_t after = resize_kv_pages_checked(target);
+            models::qwen3_5::execution::param_bus().note_value("kv_pages", after);
+            std::fprintf(stderr,
+                         "[ctl] kv pages %u -> %u (controller slow dial, idle window)\n", before,
+                         after);
+            std::fflush(stderr);
+        } catch (const std::exception& error) {
+            models::qwen3_5::execution::param_bus().note_value("kv_pages", before);
+            std::fprintf(stderr,
+                         "[ctl] kv resize refused: %s (capacity stays %u pages)\n", error.what(),
+                         before);
+            std::fflush(stderr);
+        }
+    }
+
+    // THE idle question, in one place: is any request anywhere in its lifecycle? Used by the
+    // offline scoring core's resize entry (which has no worker scheduling point of its own) and
+    // by tests; the generation core's own contract goes through idle_state_held() while HOLDING
+    // both the round and the queue lock, which is the stronger statement. `outstanding_` is the
+    // request-lifecycle counter (bumped under queue_mutex_ by submit() *before* the request object
+    // exists, released when its consumer lets go), so a request that is pre-queue, queued, binding,
+    // resident or terminal-pending all answer "busy" - the queue -> lane hand-off has no gap left
+    // to shrink.
+    [[nodiscard]] bool any_inflight(std::string* why = nullptr) const {
         std::unique_lock execution_lock(execution_mutex_, std::try_to_lock);
-        if (!execution_lock.owns_lock()) { return true; }
-        std::lock_guard lock(queue_mutex_);
-        // The decision containers are the boundary states a request can sit in between the
-        // queue and a lane: a mid-admission scan, an armed capture, or a transaction owner.
-        // The first draft of this check read only the settled states and a resize slipped
-        // through exactly one of these - the controller had just flipped the lane count and
-        // the batch was neither queued nor resident for the length of the flip.
-        const bool holding_decision =
-            admission_decision_.has_value() || context_owner_ != nullptr ||
-            std::any_of(capture_decisions_.begin(), capture_decisions_.end(),
-                        [](const auto& decision) { return decision.has_value(); });
-        return !pending_.empty() || !resident_empty() || !paused_.empty() || holding_decision;
+        if (!execution_lock.owns_lock()) {
+            if (why != nullptr) { *why = "an execution round holds the engine"; }
+            return true;
+        }
+        const IdleVerdict verdict = [&] {
+            std::lock_guard queue(queue_mutex_);
+            return idle_state_held();
+        }();
+        if (why != nullptr) {
+            *why = verdict.idle
+                       ? std::string("idle under the queue lock (outstanding=0, queued=0, "
+                                     "resident=0, paused=0, no decision)")
+                       : verdict.why;
+        }
+        return !verdict.idle;
+    }
+
+    // One line per verdict, so a refusal recorded in a log names the state that refused it and
+    // an acceptance names the edge it moved. Cheap: only the resize entry points call it.
+    void log_resize_verdict(const char* which, const char* verdict, const std::string& detail) const {
+        const RuntimeStats stats = runtime_stats();
+        std::fprintf(stderr,
+                     "[resize] %s %s: %s | gauges run=%u pref=%u ready=%u wait=%u pause=%u "
+                     "replay=%u mat=%u capt=%u term=%u outstanding=%zu\n",
+                     which, verdict, detail.c_str(), stats.running_requests,
+                     stats.prefilling_requests, stats.decode_ready_requests,
+                     stats.waiting_requests, stats.paused_requests, stats.replaying_requests,
+                     stats.materializing_requests, stats.capture_pending_requests,
+                     stats.terminal_pending_requests, outstanding_snapshot());
+        std::fflush(stderr);
+    }
+
+    [[nodiscard]] std::size_t outstanding_snapshot() const {
+        // Lock-free on purpose: the resize verdict logging calls this while it already holds
+        // queue_mutex_ (the verdict and the mutation share that lock), so taking it again would
+        // self-deadlock. The counter itself is still only mutated under queue_mutex_.
+        return outstanding_.load(std::memory_order_acquire);
+    }
+
+    // Every accepted reallocation must have cleared a verdict that saw outstanding_ == 0. This
+    // counter exists so the acceptance test can assert that invariant engine-side instead of
+    // sampling a counter from outside (where a request finishing during the 80 ms settle grace,
+    // or the next one being submitted right after the return, is indistinguishable from a
+    // penetration). It must stay zero.
+    [[nodiscard]] std::uint64_t resize_accepted_inflight_snapshot() const {
+        return resize_accepted_inflight_.load(std::memory_order_relaxed);
     }
 
 private:
@@ -2760,8 +2945,24 @@ private:
             std::fprintf(stderr, "[ctl] expert pool dial attached at %.0f MiB\n", pool_mb);
             std::fflush(stderr);
         }
-        // The construction-time whole-step graph decision, mirrored for print (the [bus] row is
-        // no-executor by the honest register): expert_pool_pinned is set from graph_ok in
+        // 13.4 + v8 12.3: the KV half of the L1 slow dial. Same shape as the pool row - pinned to
+        // the pool's real edge, executor parks a target the worker applies through the idle
+        // contract. The range's floor is the smallest edge the dial may ask for (16 page groups =
+        // 1024 tokens at this page size); the ceiling is the construction capacity, because the
+        // physical backing above it was never laid out.
+        const std::uint32_t kv_edge = instance_.program->physical_usage().capacity.main_kv_pages;
+        if (kv_edge > 0) {
+            const double floor_pages =
+                std::max(16.0, static_cast<double>(kv_edge) / 4.0);
+            models::qwen3_5::execution::param_bus().attach_applier(
+                "kv_pages", static_cast<double>(kv_edge), floor_pages,
+                static_cast<double>(kv_edge),
+                [this](double value) { return park_kv_resize_pages(value); });
+            std::fprintf(stderr, "[ctl] kv page dial attached at %u page(s) (floor %.0f)\n", kv_edge,
+                         floor_pages);
+            std::fflush(stderr);
+        }
+        // The construction-time whole-step graph decision, mirrored for print (the [bus] row is        // no-executor by the honest register): expert_pool_pinned is set from graph_ok in
         // model_instance.cpp, and a pinned pool is exactly the state a captured decode graph
         // froze its offsets against.
         models::qwen3_5::execution::param_bus().note_value(
@@ -2789,12 +2990,15 @@ private:
                 std::unique_lock lock(queue_mutex_);
                 const bool pool_dial_pending =
                     pending_pool_resize_mb_.load(std::memory_order_acquire) > 0.0;
+                const bool kv_dial_pending =
+                    pending_kv_pages_.load(std::memory_order_acquire) > 0.0;
                 if (!stopping_ && pending_.empty() && resident_empty() && paused_.empty() &&
                     !instance_.program->has_context_transaction() && !pool_dial_pending &&
-                    !control_pending_.load(std::memory_order_acquire)) {
+                    !kv_dial_pending && !control_pending_.load(std::memory_order_acquire)) {
                     queue_cv_.wait(lock, [&] {
                         return stopping_ || !pending_.empty() ||
                                pending_pool_resize_mb_.load(std::memory_order_acquire) > 0.0 ||
+                               pending_kv_pages_.load(std::memory_order_acquire) > 0.0 ||
                                control_pending_.load(std::memory_order_acquire);
                     });
                 }
@@ -2806,13 +3010,17 @@ private:
                     return;
                 }
                 // The idle window the slow dial needs, observed under the queue lock: nothing
-                // queued, nothing resident, nothing paused, no transaction. When this is false
-                // the parked target STAYS parked - a busy engine is not a refusal, it is a
-                // "not yet", and the dial's next window re-reads the bus either way.
+                // queued, nothing resident, nothing paused, no transaction, and no request
+                // anywhere in its lifecycle (outstanding_ - the same counter any_inflight()
+                // answers from, so the worker's own scheduling point and the external entry
+                // cannot disagree about what idle means). When this is false the parked target
+                // STAYS parked - a busy engine is not a refusal, it is a "not yet", and the
+                // dial's next window re-reads the bus either way.
                 idle_for_pool_dial =
-                    pending_.empty() && resident_empty() && paused_.empty() &&
+                    outstanding_ == 0 && pending_.empty() && resident_empty() && paused_.empty() &&
                     !instance_.program->has_context_transaction() &&
-                    pending_pool_resize_mb_.load(std::memory_order_acquire) > 0.0;
+                    (pending_pool_resize_mb_.load(std::memory_order_acquire) > 0.0 ||
+                     pending_kv_pages_.load(std::memory_order_acquire) > 0.0);
             }
             if (idle_for_pool_dial) {
                 apply_pending_pool_resize();
@@ -2827,6 +3035,11 @@ private:
             // only when someone writes. Cheap: one modulo and one small copy per round.
             if (models::qwen3_5::execution::param_bus().layers() % 32 == 0) {
                 publish_control_state(nullptr, 0);
+                // 13.4: hand the KV dial this window's occupancy peak (see publish_runtime_stats)
+                // and start a fresh window. One observation per window, on the thread that owns
+                // both the controller and the pool counters.
+                models::qwen3_5::execution::policy_controller().observe_kv_pool(kv_window_peak_);
+                kv_window_peak_ = 0.0;
             }
             std::unique_lock execution_lock(execution_mutex_);
             bool executed = false;
@@ -3219,6 +3432,9 @@ private:
     // for contention. resize_mutex_ serializes the two entry points of the idle contract
     // (external Engine::resize_expert_pool and the worker's apply_pending_pool_resize).
     std::atomic<double> pending_pool_resize_mb_{0.0};
+    // 13.4: the parked KV page target (0 = none). Same handshake as the pool one; kept in page
+    // groups because that is the unit the pool's edge is measured in.
+    std::atomic<double> pending_kv_pages_{0.0};
     std::mutex resize_mutex_;
 
     // T131: the control plane's parked write (see park_control). control_pending_ is the wake
@@ -3240,12 +3456,17 @@ private:
     bool          freeze_thaw_     = false;
     bool          mode_from_control_ = false;
 
-    mutable std::mutex execution_mutex_;
+    // Timed so a caller that arrives during the settle round of a just-finished request can wait
+    // a bounded 80 ms for it instead of being told the engine is busy (see the resize entries).
+    mutable std::timed_mutex execution_mutex_;
     mutable std::mutex queue_mutex_;
     mutable std::mutex stats_mutex_;
     std::condition_variable queue_cv_;
     std::deque<std::shared_ptr<Request>> pending_;
-    std::size_t outstanding_              = 0;
+    // Mutated only under queue_mutex_; atomic so the resize verdict log can read it while it
+    // already holds that lock (see outstanding_snapshot).
+    std::atomic<std::size_t> outstanding_{0};
+    std::atomic<std::uint64_t> resize_accepted_inflight_{0};
     std::uint64_t next_request_id_        = 1;
     std::uint64_t next_publication_order_ = 1;
     std::array<std::shared_ptr<Request>, kMaximumConcurrency> slots_{};
@@ -3257,6 +3478,8 @@ private:
     // appendix HX (plan item 9b): the idle trigger's state. The threshold is read ONCE (not per
     // round, as item 4 did) and the sweep runs at most once per threshold window, so a refusal
     // cannot be counted once per round - the mistake appendix HM had to fix for the lane trigger.
+    // 13.4: the KV slow dial's window input (peak edge occupancy since the last window).
+    double kv_window_peak_ = 0.0;
     std::uint64_t idle_reclaim_ms_ = read_idle_reclaim_ms();
     std::uint64_t last_idle_sweep_ms_ = 0;
     // port (sm_89): one-shot validation of the elastic expert pool. NINFER_EXPERT_POOL_CYCLE

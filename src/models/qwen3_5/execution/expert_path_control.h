@@ -79,6 +79,8 @@ struct PolicySignals {
     double mirror_hit_ratio          = -1.0;
     double prefetch_usefulness = -1.0; // D4 gate input
     double decode_tps          = -1.0; // the outcome every actuator is judged by
+    // 13.4: occupied share of the paged KV edge, 0..1, -1 = not measured this window.
+    double kv_occupancy        = -1.0;
     // v8 9.3: the serial rule is judged on the lanes actually in service, not the configured
     // ceiling - serializing one lane is a no-op. Fed by the engine worker (the thread that owns
     // the slots) once per scheduling pass.
@@ -150,6 +152,12 @@ public:
 
     // v8 9.3: the engine's live lane count, one observation per scheduling pass.
     void observe_lanes(std::uint32_t busy) { signals.lanes_busy = busy; }
+
+    // 13.4: how much of the paged KV edge the last window actually used, 0..1 (-1 = unmeasured).
+    // The KV slow dial's only structural input: an edge that is never approached is device memory
+    // the expert pool could use, and an edge that saturates is the opposite statement. Fed by the
+    // engine worker once per window from the program's own physical usage, never estimated here.
+    void observe_kv_pool(double occupancy) { signals.kv_occupancy = occupancy; }
 
     // v8 9.2 row 3: the real frozen state of the stream currently being served.
     void observe_freeze_state(bool frozen) { signals.freeze_active = frozen ? 1.0 : 0.0; }
@@ -405,6 +413,38 @@ public:
         std::uint64_t blocked_miss = 0;
         std::uint64_t blocked_period = 0;
     } pool_dial;
+
+    // 13.4 - the KV half of the L1 slow dial. Same lifecycle as the pool dial (one step per
+    // period, one decision window between verdicts, the 3% tps rail, exponential park after a
+    // falsified step, disabled in stable), with the direction inverted: the pool dial can only
+    // grow its own reservation, the KV edge can only be spent down and won back. The rule is
+    // structural rather than a tuned constant: an edge the last window never approached (occupancy
+    // under a half) is device memory the expert pool could be serving from, so one step is spent
+    // to find out; the 3% rail buys it back the moment the measurement says the step cost more
+    // than it saved. Because the physical backing is never returned, growing back is exact
+    // (DeviceKVPagePool::grow_capacity), which is what makes the revert a real experiment rather
+    // than a one-way door.
+    struct SlowKvDial {
+        static constexpr double kOccupancyPct = 50.0; // "the edge is not being used"
+        double from_pages    = -1.0; // edge before the in-flight step
+        double score_before  = 0.0;
+        double tps_before    = -1.0;
+        bool in_flight       = false;
+        bool last_down       = false;
+        bool down_paid       = false; // a shrink measured a better window
+        std::uint32_t park_windows   = 0;
+        std::uint32_t refused_streak = 0;
+        std::uint32_t falsified      = 0;
+        std::chrono::steady_clock::time_point last_step{};
+        bool started   = false;
+        std::uint64_t blocked_prefill = 0;
+        std::uint64_t blocked_tps     = 0;
+        std::uint64_t blocked_period  = 0;
+        std::uint64_t blocked_occupancy = 0;
+        std::uint64_t steps = 0;      // applied steps this process
+        std::uint64_t reverts = 0;    // steps undone by the rail
+    } kv_dial;
+
     // Test seam: the dial's period is wall-clock, so the no-GPU tests drive it themselves.
     std::chrono::steady_clock::time_point (*clock_now)() = &std::chrono::steady_clock::now;
 
@@ -538,6 +578,135 @@ public:
         std::fflush(stderr);
     }
 
+    // The KV dial's period: v8 12.3's L1 cadence (60 s auto, 30 s performance), overridable so a
+    // bounded acceptance can watch a real step land without waiting two minutes of wall clock.
+    // Read once per process - the same rule the bus applies to its initial values.
+    static std::chrono::seconds kv_dial_period() {
+        static const std::chrono::seconds period = [] {
+            if (const char* text = std::getenv("NINFER_KV_DIAL_PERIOD_MS"); text != nullptr) {
+                const long long ms = std::strtoll(text, nullptr, 10);
+                if (ms > 0) { return std::chrono::seconds{ms / 1000 + (ms % 1000 ? 1 : 0)}; }
+            }
+            return std::chrono::seconds{60};
+        }();
+        return period;
+    }
+
+    void slow_kv_step() {
+        auto& bus  = param_bus();
+        auto& dial = kv_dial;
+        if (!bus.has_applier("kv_pages")) { return; }
+        if (mode == ninfer::ControllerMode::Stable) { return; } // stable: KV keeps its edge
+        if (signals.decode_tps <= 0.0) {
+            ++dial.blocked_tps;
+            return;
+        }
+        if (signals.in_prefill) {
+            ++dial.blocked_prefill;
+            return;
+        }
+        if (dial.park_windows > 0) {
+            --dial.park_windows;
+            return;
+        }
+        const double now_pages = bus.get("kv_pages");
+        if (!(now_pages > 0.0)) { return; }
+        const auto now = clock_now();
+        auto period    = kv_dial_period();
+        if (mode == ninfer::ControllerMode::Performance) { period = period / 2; }
+        if (!dial.started) {
+            dial.started   = true;
+            dial.last_step = now;
+            return; // the first step waits out one full observation period
+        }
+        if (now - dial.last_step < period) {
+            ++dial.blocked_period;
+            return;
+        }
+        if (dial.in_flight) {
+            dial.in_flight = false;
+            // The engine's idle contract may have refused the parked step: the worker notes the
+            // pre-step edge back into the bus, which is how the dial sees a refusal without
+            // sharing a lock with the engine.
+            if (now_pages == dial.from_pages) {
+                ++dial.refused_streak;
+                dial.park_windows = 4U << std::min(dial.refused_streak - 1U, 3U);
+                std::fprintf(stderr,
+                             "[ctl] kv dial %.0f pages refused by the idle contract (streak %u, "
+                             "parking %u windows) mode=%s\n",
+                             dial.from_pages, dial.refused_streak, dial.park_windows,
+                             ninfer::controller_mode_name(mode));
+                std::fflush(stderr);
+                return;
+            }
+            const double score_now = score();
+            const bool worse = score_now < dial.score_before ||
+                               (dial.tps_before > 0.0 &&
+                                signals.decode_tps < dial.tps_before * 0.97);
+            if (worse) {
+                // Undo it: the edge goes back to where the step found it. Unlike the pool's
+                // revert this one is exact, because the backing was never unmapped.
+                const ParamReject reject =
+                    bus.set("kv_pages", dial.from_pages, /*from_controller=*/true);
+                if (reject == ParamReject::Ok) {
+                    bus.record("kv_pages", now_pages, dial.from_pages, signals.decode_tps, -1.0);
+                    ++dial.reverts;
+                } else {
+                    std::fprintf(stderr, "[ctl] kv dial revert refused by the bus: %s\n",
+                                 param_reject_text(reject));
+                    std::fflush(stderr);
+                }
+                dial.down_paid = false;
+                ++dial.falsified;
+                dial.park_windows = 4U << std::min(dial.falsified - 1U, 3U);
+                dial.last_step    = now;
+                std::fprintf(stderr,
+                             "[ctl] kv dial step back %.0f -> %.0f pages (score %.1f -> %.1f, "
+                             "tps %.1f -> %.1f; park %u windows) mode=%s\n",
+                             now_pages, dial.from_pages, dial.score_before, score_now,
+                             dial.tps_before, signals.decode_tps, dial.park_windows,
+                             ninfer::controller_mode_name(mode));
+                std::fflush(stderr);
+                return;
+            }
+            dial.down_paid      = true;
+            dial.falsified      = 0;
+            dial.refused_streak = 0;
+        }
+        // Direction: spend the edge down while the measured occupancy says nobody is using it.
+        // An unmeasured occupancy (-1) or one above the half means the edge is working: hold.
+        if (signals.kv_occupancy < 0.0 ||
+            signals.kv_occupancy * 100.0 >= SlowKvDial::kOccupancyPct) {
+            ++dial.blocked_occupancy;
+            return;
+        }
+        const double floor_pages = bus.lo_of("kv_pages");
+        const double step        = std::max(1.0, std::floor(bus.hi_of("kv_pages") / 8.0));
+        const double target      = std::max(floor_pages, now_pages - step);
+        if (!(target < now_pages)) { return; } // already at the floor
+        const ParamReject reject = bus.set("kv_pages", target, /*from_controller=*/true);
+        if (reject != ParamReject::Ok) {
+            std::fprintf(stderr, "[ctl] kv dial refused by the bus: %s\n",
+                         param_reject_text(reject));
+            std::fflush(stderr);
+            return;
+        }
+        bus.record("kv_pages", now_pages, target, signals.decode_tps, -1.0);
+        dial.from_pages   = now_pages;
+        dial.score_before = score();
+        dial.tps_before   = signals.decode_tps;
+        dial.in_flight    = true;
+        dial.last_down    = true;
+        dial.last_step    = now;
+        ++dial.steps;
+        std::fprintf(stderr,
+                     "[ctl] kv dial down %.0f -> %.0f page(s) (occupancy %.0f%%, score %.1f) "
+                     "mode=%s\n",
+                     now_pages, target, signals.kv_occupancy * 100.0, dial.score_before,
+                     ninfer::controller_mode_name(mode));
+        std::fflush(stderr);
+    }
+
     void step(bool device_path_ready, bool prefetch_wired, bool graph_wired, bool freeze_wired,
               bool concurrency_wired = false) {
         ++layers;
@@ -589,6 +758,8 @@ public:
             // v8 12.5 step 4: the L1 slow dial runs on the same window beat, once per window,
             // rate-limited by its own wall-clock period (60 s auto / 30 s performance).
             slow_pool_step();
+            // 13.4: the KV half, same beat and same rail, inverted direction.
+            slow_kv_step();
         }
     }
 
@@ -669,6 +840,31 @@ public:
                          static_cast<unsigned long long>(dial.blocked_tps),
                          static_cast<unsigned long long>(dial.blocked_period),
                          static_cast<unsigned long long>(dial.blocked_miss));
+        }
+        // 13.4: the KV dial's own line, same discipline: what the edge is, what the dial is
+        // waiting for, and every window that did not step names its blocker.
+        {
+            auto& bus  = param_bus();
+            auto& dial = kv_dial;
+            const bool attached = bus.has_applier("kv_pages");
+            std::fprintf(stderr,
+                         "[ctl] kv: pages=%g occupancy=%.0f%% dial=%s in_flight=%d down_paid=%d "
+                         "park=%u refused=%u falsified=%u steps=%llu reverts=%llu | score=%.1f "
+                         "| windows: prefill=%llu tps=%llu period=%llu occupancy=%llu\n",
+                         bus.get("kv_pages"),
+                         signals.kv_occupancy < 0.0 ? -1.0 : signals.kv_occupancy * 100.0,
+                         !attached                      ? "no-executor"
+                         : mode == ninfer::ControllerMode::Stable ? "stable:disabled"
+                         : dial.in_flight ? "verdict-pending"
+                                          : "idle",
+                         int(dial.in_flight), int(dial.down_paid), dial.park_windows,
+                         dial.refused_streak, dial.falsified,
+                         static_cast<unsigned long long>(dial.steps),
+                         static_cast<unsigned long long>(dial.reverts), score(),
+                         static_cast<unsigned long long>(dial.blocked_prefill),
+                         static_cast<unsigned long long>(dial.blocked_tps),
+                         static_cast<unsigned long long>(dial.blocked_period),
+                         static_cast<unsigned long long>(dial.blocked_occupancy));
         }
         // P2 (cpu in-place path): the CPU-leg decision observation - verdict counts, hit rates
         // and the cost model's last two sides, shadow until an actuator lands (the runtime legs

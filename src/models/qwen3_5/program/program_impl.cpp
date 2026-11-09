@@ -652,6 +652,11 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
         };
     }
     out.kv_payload_bytes             = kv_payload_bytes;
+    // 13.4: the LIVE capacity edge, not the construction-time resolution. A runtime shrink moves
+    // the pool's edge (and a grow moves it back), so reporting the resolution here made the
+    // console, the monitor and the controller's own read-back all name an upper bound the pool no
+    // longer has - which is exactly the state a slow dial must never judge a step by.
+    if (text_kv_pages) { out.kv_capacity_page_groups = text_kv_pages->physical_pool().capacity_pages(); }
     if (host_state_images) { out.host_state_occupied_slots = host_state_images->occupied(); }
     if (host_kv_arena) { out.host_kv_occupied_bytes = host_kv_arena->occupied_bytes(); }
     if (host_context_arena) {

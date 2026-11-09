@@ -167,6 +167,16 @@ void EngineCore<Instance>::publish_runtime_stats() {
     snapshot.device_state_occupied_slots      = physical.occupied.state_slots;
     snapshot.device_main_kv_occupied_pages    = physical.occupied.main_kv_pages;
     snapshot.device_backend_kv_occupied_pages = physical.occupied.backend_kv_pages;
+    // 13.4: the KV slow dial's window input - the highest edge occupancy sampled this window.
+    // Sampled here because this is the one place the engine already reads the pool's own counters,
+    // and a snapshot taken at publication time is what the dial would see anyway; the window
+    // maximum is kept so a step is not judged on the moment right after a batch released its
+    // pages.
+    if (physical.capacity.main_kv_pages != 0) {
+        const double occupancy = static_cast<double>(physical.occupied.main_kv_pages) /
+                                 static_cast<double>(physical.capacity.main_kv_pages);
+        if (occupancy > kv_window_peak_) { kv_window_peak_ = occupancy; }
+    }
 
     {
         std::lock_guard lock(queue_mutex_);

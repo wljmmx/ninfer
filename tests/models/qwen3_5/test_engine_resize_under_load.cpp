@@ -19,10 +19,10 @@
 //     offsets", twice, with a healthy generation in between proving the refusal had no side
 //     effects.
 //   * KV pages - same idle refusal under load; at the boundary a shrink between two page
-//     tiers succeeds, a grow attempt returns the current capacity unchanged (the KV half is
-//     deliberately shrink-only: the VMM block stays mapped, only the capacity edge moves),
-//     and the batch after the shrink still completes and matches the control engine token
-//     for token - page capacity does not change page bytes.
+//     tiers succeeds and a grow restores the construction edge (the VMM block stays mapped,
+//     only the capacity edge moves; a grow past the construction capacity is refused), and the
+//     batch after the round trip still completes and matches the control engine token for
+//     token - page capacity does not change page bytes.
 //
 // Cross-tier token identity (12 GiB batch vs 8 GiB control) is deliberately NOT asserted: a
 // wider pool changes how much of a layer the host tier has to cover (slot_cap is decided at
@@ -571,9 +571,9 @@ int main() {
         }
 
         // The KV half, at the request boundary: a shrink between two page tiers must succeed,
-        // a grow attempt must report the current capacity unchanged (the shrink-only design),
-        // and the batch after the shrink must still complete intact. The edge is measured from
-        // the live capacity - a slipped load-time attempt above may have moved it already.
+        // a grow must restore the construction edge (elastic edge; past it is refused), and the
+        // batch after the round trip must still complete intact. The edge is measured from the
+        // live capacity - a slipped load-time attempt above may have moved it already.
         std::uint32_t kv_live = engine.memory_summary().kv_capacity_page_groups;
         if (kv_slipped) {
             const std::uint32_t slipped = engine.resize_kv_pages(kv_live);
@@ -586,13 +586,24 @@ int main() {
                 fail("the KV shrink did not move the capacity edge: " + std::to_string(kv_live) +
                      " -> " + std::to_string(down) + " (asked " + std::to_string(target) + ")");
             }
+            // 13.4 + the L1 dial: the edge is elastic in both directions up to the construction
+            // capacity (the layout is sized for exactly that many page groups).
             const std::uint32_t up = engine.resize_kv_pages(kv_live);
-            if (up != down) {
-                fail("a KV grow attempt changed the capacity (" + std::to_string(down) + " -> " +
-                     std::to_string(up) + "); the design keeps the edge at the last shrink");
+            if (up != kv_live) {
+                fail("a KV grow did not restore the construction edge (" + std::to_string(down) +
+                     " -> " + std::to_string(up) + ", asked " + std::to_string(kv_live) + ")");
             }
-            std::cerr << "[kv-pool] " << kv_live << " -> " << down
-                      << " pages; grow attempt returned " << up << " (shrink-only contract)\n";
+            const std::uint32_t beyond =
+                engine.memory_summary().kv_capacity_page_groups + 8;
+            const std::uint32_t clamped = engine.resize_kv_pages(beyond);
+            if (clamped != kv_live) {
+                fail("a KV grow past the construction capacity was not clamped (" +
+                     std::to_string(beyond) + " -> " + std::to_string(clamped) + ", edge " +
+                     std::to_string(kv_live) + ")");
+            }
+            std::cerr << "[kv-pool] " << kv_live << " -> " << down << " -> " << up
+                      << " pages (elastic edge; beyond-capacity grow clamped to " << clamped
+                      << ")\n";
         }
         {
             const Batch batch = run_batch(engine, prompts, kOutputs);

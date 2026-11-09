@@ -228,7 +228,7 @@ void DeviceKVPageReservation::release() noexcept {
 }
 
 DeviceKVPagePool::DeviceKVPagePool(DeviceSpan backing, const DeviceKVPagePoolLayout& layout)
-    : spec_(layout.spec) {
+    : spec_(layout.spec), page_group_limit_(layout.spec.page_group_count) {
     validate_geometry(spec_.geometry);
     if (layout.planes.size() != spec_.geometry.planes.size() || layout.planes.empty()) {
         throw std::invalid_argument("Paged KV device layout plane inventory is inconsistent");
@@ -412,6 +412,61 @@ std::uint32_t DeviceKVPagePool::shrink_capacity(std::uint32_t target_pages) {
                                std::to_string(expected) + " expected)");
     }
     free_page_runs_        = std::move(kept);
+    spec_.page_group_count = target_pages;
+    return target_pages;
+}
+
+std::uint32_t DeviceKVPagePool::grow_capacity(std::uint32_t target_pages) {
+    const std::uint32_t current = capacity_pages();
+    if (target_pages <= current) { return current; }
+    if (target_pages > page_group_limit_) {
+        throw std::invalid_argument("Paged KV grow exceeds the construction capacity (" +
+                                    std::to_string(target_pages) + " > " +
+                                    std::to_string(page_group_limit_) + ")");
+    }
+    // The allocator only ever picks from the free list, and every shrink trims that list at the
+    // edge - so no owned page can sit above it. Asserting it turns "grow a pool somebody is still
+    // writing into" into a refusal instead of two owners of one page.
+    if (static_cast<std::uint64_t>(allocated_pages_) + reserved_pages_ > current) {
+        throw std::logic_error("Paged KV grow refused: " +
+                               std::to_string(allocated_pages_) + " allocated + " +
+                               std::to_string(reserved_pages_) + " reserved > edge " +
+                               std::to_string(current));
+    }
+    const auto edge  = static_cast<std::int32_t>(current);
+    const auto extra = target_pages - current;
+    if (!free_page_runs_.empty() &&
+        free_page_runs_.back().begin +
+                static_cast<std::int32_t>(free_page_runs_.back().count) >
+            edge) {
+        // A free run reaching above the edge means the last shrink did not trim (or somebody
+        // grew without this function) - refuse rather than hand out a page twice.
+        throw std::logic_error("Paged KV grow found free pages above the edge");
+    }
+    // Validate the free list BEFORE moving the edge: the trimmed list must hold exactly the pages
+    // the edge leaves unowned. A mismatch means the pool and its edge already disagree, and
+    // growing would publish the disagreement instead of fixing it.
+    std::uint64_t counted = 0;
+    for (const auto& run : free_page_runs_) { counted += run.count; }
+    const std::uint64_t expected =
+        static_cast<std::uint64_t>(current) - allocated_pages_ - reserved_pages_;
+    if (counted != expected) {
+        throw std::logic_error("Paged KV grow found an inconsistent free list (" +
+                               std::to_string(counted) + " free, " +
+                               std::to_string(expected) + " expected below the edge)");
+    }
+    const bool merge_top = !free_page_runs_.empty() &&
+                           free_page_runs_.back().begin +
+                                   static_cast<std::int32_t>(free_page_runs_.back().count) ==
+                               edge;
+    if (merge_top) {
+        // The tail run abuts the edge, so the new pages extend it. Extending keeps the list
+        // merged, which is the invariant release_page() relies on to find a neighbour by index.
+        free_page_runs_.back().count += extra;
+    } else {
+        // A full pool (every page below the edge owned) or an empty list: the tail is its own run.
+        free_page_runs_.push_back(FreePageRun{.begin = edge, .count = extra});
+    }
     spec_.page_group_count = target_pages;
     return target_pages;
 }
