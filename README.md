@@ -50,9 +50,15 @@ The Windows RTX 4090 line ships as a source build **and** a runnable release fol
   restores its longest cached prefix instead of requiring an exact prompt: 397+103 tokens
   reused a 397-token checkpoint (TTFT 327 ms vs 3,957 ms cold) and 397+3,703 tokens reused the
   same point (1,781 ms vs 7,035 ms); output tokens identical to a cold run.
-- **Runtime pool/KV resize is load-accepted** (refused while busy, zero disturbance when idle;
-  three real defects were fixed on the way: stale published offset tables, the delta-publish
-  baseline, and the idle-window double read).
+- **Runtime pool/KV resize is load-accepted** (refused while busy, zero disturbance when idle).
+  The KV edge is elastic in both directions up to the construction width, and the controller can
+  drive it (L1 slow dial, 60 s/step, 3% revert, idle-window only). Both open items from the first
+  acceptance are closed: the queue→lane hand-off can no longer slip a shrink past the idle verdict
+  (verdict and mutation share the queue lock; 1,000 hammered attempts, zero engine-side accepts
+  with a live request), and a post-shrink round trip no longer diverges (the tier arms pin full
+  residency so expert placement stops being a numeric variable). Three more defects were fixed on
+  the way: stale published offset tables, the delta-publish baseline, and the idle-window double
+  read.
 - **Measured q4 span routing.** Twelve shape spans now run their measured sm_89 winners
   (−9% … −38% on those spans); every other ladder keeps its 5090-measured values.
 - **Determinism unchanged.** Default PPL `7.441868`, selector-off dump `636e38de95046781` and
