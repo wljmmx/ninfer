@@ -1,5 +1,12 @@
 #pragma once
 
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <string>
+#include <vector>
+
 // port (sm_89): the runtime policy controller - the one place that decides how a running instance
 // serves experts, whether it prefetches, whether it may capture graphs, whether it keeps a frozen
 // set, and (v8 9.3) how many lanes the scheduler may fill. Every decision is taken from
@@ -266,17 +273,22 @@ public:
     //     synchronize inside a capture is cudaErrorStreamCaptureUnsupported - so "runtime on"
     //     on any tier that still splits is structurally impossible, and on the only tier that
     //     does not (19.4 GiB) the graph is already on by construction.
-    // The per-bank LAYER graph (NINFER_LAYER_GRAPH, LayerGraphs) IS runtime-flippable, but its
-    // measured gain is zero (132e2819: 96 tokens interleaved 5.63/5.61 s with the graph against
-    // 5.63/5.61 without) - wiring this actuator to it would put a borrowed +5% on a neutral
-    // switch, which is exactly the sheep's-head the honest register refuses. So the graph
-    // actuator keeps reporting what it would do and why, and the [bus] row stays no-executor
-    // with the construction decision mirrored for print.
+    // The graph rule, decided by this controller and consumed by the construction decision:
+    //   * measured capture state: capture when every layer is capturable AND fully covered -
+    //     a structural fact, not a profit threshold;
+    //   * nothing measured yet (construction asks before the first layer runs): ON. The old rule
+    //     defaulted an unproven graph to OFF; the measured benefit of the whole-step graph is
+    //     small, but it is not negative, and a capture that the guard below skips costs nothing -
+    //     so the default is now on and only a measured structural failure (a layer that needs a
+    //     host fetch inside the step) turns it off.
     [[nodiscard]] bool want_graph() const {
         if (signals.capt_ready_pct >= 0.0) {
             return signals.capt_ready_pct >= 100.0 && signals.static_pct >= 100.0;
         }
-        return signals.capturable_pct >= 100.0 && signals.static_pct >= 100.0;
+        if (signals.capturable_pct >= 0.0) {
+            return signals.capturable_pct >= 100.0 && signals.static_pct >= 100.0;
+        }
+        return true;
     }
     // Q11/Q12: the 99% threshold is gone here too. Freezing is a state - the pool answered every
     // route in the window - and the keep/thaw decision is made by ExpertStream from the measured

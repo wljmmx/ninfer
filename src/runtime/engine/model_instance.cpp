@@ -8,6 +8,7 @@
 #include "core/startup.h"
 #include "runtime/engine/context_cache/joint_planning.h"
 #include "models/qwen3_5/execution/expert_prefetch.h"
+#include "models/qwen3_5/execution/expert_path_control.h"
 #include "models/qwen3_5/execution/expert_stream.h"
 #include "models/qwen3_5/execution/host_expert_reader.h"
 #include "models/qwen3_5/execution/host_expert_residency.h"
@@ -898,15 +899,15 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
         // recording an upload that a later step would then repeat with the wrong experts.
         const bool every_layer = instance->expert_cache->can_hold_every_layer();
         if (every_layer) { instance->expert_cache->preload_all(); }
-        // P6/step 4: the construction-time door used to require the pool to hold every layer, which is
-        // a capacity fact - not the condition a captured layer actually needs. What a capture needs is
-        // that the layer it records needs no host work, and that is what PolicyController::want_graph()
-        // decides per layer (capt_ready >= 90% and static >= 95%). NINFER_GRAPH_BUDGET=1 pays the
-        // allowance even when the pool cannot hold a whole layer, so that decision can be made at
-        // runtime instead of being pre-empted here. The A3b check stays as the net: a replay under a
-        // set the tables were not published for throws rather than computing a wrong token.
-        static const bool budget_opt_in = std::getenv("NINFER_GRAPH_BUDGET") != nullptr;
-        bool graph_ok = graph_requested && (every_layer || budget_opt_in) &&
+        // P6/step 4 + the default-on rule: the construction decision asks the controller's rule
+        // (PolicyController::want_graph) instead of hard-coding a capacity or profit threshold.
+        // Before the first layer has run nothing is measured, and the rule now answers "on" there:
+        // the whole-step graph's measured benefit is small but not negative, and a capture the
+        // guard below skips costs nothing. Only a measured structural failure (a layer that needs
+        // a host fetch inside the step) turns it off. NINFER_GRAPH_BUDGET no longer gates
+        // anything; it is accepted for compatibility.
+        bool graph_ok = graph_requested &&
+                        models::qwen3_5::execution::policy_controller().want_graph() &&
                         std::getenv("NINFER_EXPERT_POOL_CYCLE") == nullptr;
         // port (sm_89), capture guard: a pool that cannot hold every layer still streams, and
         // on this artifact that means some layer WILL take the split path, whose host fetch
