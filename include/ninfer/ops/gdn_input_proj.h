@@ -167,6 +167,24 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
                                   cudaStream_t stream);
 
 /**
+ * Four-parent form of gdn_input_proj_conv_snapshot: q, k, v and z live in their own parents, so
+ * there is no single fused row order to fuse the projection into the convolution around. The same
+ * state contract runs as the composition the batched two-parent form already uses: the whole
+ * rectangle is projected into a private packed buffer at the aggregate column count, then the
+ * projected-conv snapshot reads the device selectors and writes query/key/value plus each row's
+ * destination history. Numerically this is the width-four fp32 convolution over BF16 history that
+ * the prefill chunk's own conv op evaluates, without the fused projection epilogue.
+ */
+void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_weight,
+                                  const Weight& key_weight, const Weight& value_weight,
+                                  const Weight& z_weight, const Tensor& conv_weight,
+                                  Tensor& conv_states, const Tensor& valid_columns,
+                                  const Tensor& initial_state_slots,
+                                  const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
+                                  Tensor& value, Tensor& z, LinearPolicy policy, WorkspaceArena& ws,
+                                  cudaStream_t stream);
+
+/**
  * Single-parent form of gdn_input_proj_conv_snapshot. Registered parents are Q8_G32_FP16 RowSplit
  * [12288,2048], NVFP4 BlockScaleK16M128x4 [16384,5120], and FP8_E4M3FN_ROW_BF16 RowScale
  * [16384,5120], all in q/k/value/z row order. All policies permit Q8 A16. NVFP4 uses A16

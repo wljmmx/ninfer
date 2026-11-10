@@ -45,6 +45,28 @@ std::size_t gdn_projection_workspace_bytes(const GdnParameters& parameters, std:
 std::size_t gdn_snapshot_workspace_bytes(const GdnParameters& parameters, const GdnConfig& config,
                                          std::int32_t batch, std::int32_t first_width,
                                          std::int32_t last_width) {
+    if (const auto* separate = std::get_if<ops::SeparateProjectionWeights>(&parameters.projection)) {
+        // Composed route: the packed projection rectangle (channels x B*W) and the projection's own
+        // placement scratch are live together, and the four Linear calls may add scratch of their own.
+        const std::int32_t columns = batch * last_width;
+        const std::size_t channels = static_cast<std::size_t>(separate->rows[0].weight.n) +
+                                     static_cast<std::size_t>(separate->rows[1].weight.n) +
+                                     static_cast<std::size_t>(separate->rows[2].weight.n);
+        std::size_t widest = 0;
+        std::size_t bytes  = 0;
+        for (const auto& row : separate->rows) {
+            widest = std::max(widest, static_cast<std::size_t>(row.weight.n));
+            bytes  = std::max(bytes, ops::linear_workspace_capacity_bytes(
+                                        row.weight.qtype, row.weight.n, row.weight.k, row.policy,
+                                        first_width, last_width));
+        }
+        const std::size_t element_bytes = sizeof(std::uint16_t);
+        const std::size_t packed =
+            widest * static_cast<std::size_t>(columns) * element_bytes;
+        const std::size_t projected =
+            channels * static_cast<std::size_t>(columns) * element_bytes;
+        return std::max(bytes, packed) + projected;
+    }
     const auto* single = std::get_if<LinearParameters>(&parameters.projection);
     std::size_t bytes;
     if (single && single->weight.qtype != QType::Q8_G32_FP16) {
@@ -113,13 +135,18 @@ void gdn_projection_snapshot(const Tensor& hidden, const GdnParameters& paramete
     auto scope = workspace.scope();
     WorkspaceArena scratch(workspace.alloc_bytes(gdn_snapshot_workspace_bytes(
         parameters, config, hidden.ne[2], hidden.ne[1], hidden.ne[1])));
-    if (std::holds_alternative<ops::SeparateProjectionWeights>(parameters.projection)) {
-        // The state-writing forms fuse the projection and the convolution step around one parent
-        // row order; a per-projection artifact has no such order and would need its own composed
-        // route. Refuse by name instead of reading the wrong rows.
-        throw std::invalid_argument(
-            "GDN projection snapshot: this artifact keeps q, k, v and z in their own parents; the "
-            "state-writing snapshot form needs a fused parent");
+    if (const auto* separate = std::get_if<ops::SeparateProjectionWeights>(&parameters.projection)) {
+        // No fused parent row order exists here, so the state-writing form cannot fuse the
+        // projection into the convolution. It runs as the composition instead: project the
+        // rectangle, then convolve it and publish the destination history. The row windows below
+        // (query/output_gate and friends) are already packed per projection, which is exactly what
+        // that composition writes.
+        ops::gdn_input_proj_conv_snapshot(hidden, separate->rows[0].weight, separate->rows[1].weight,
+                                          separate->rows[2].weight, separate->rows[3].weight,
+                                          parameters.convolution, conv_states, valid_columns,
+                                          initial_slots, destination_slots, query, key, value, z,
+                                          separate->rows[0].policy, scratch, stream);
+        return;
     }
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
         ops::gdn_input_proj_conv_snapshot(hidden, pair->first, pair->second, parameters.convolution,

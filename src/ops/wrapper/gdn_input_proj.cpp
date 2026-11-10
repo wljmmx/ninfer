@@ -712,6 +712,44 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
 
 } // namespace
 
+void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_weight,
+                                  const Weight& key_weight, const Weight& value_weight,
+                                  const Weight& z_weight, const Tensor& conv_weight,
+                                  Tensor& conv_states, const Tensor& valid_columns,
+                                  const Tensor& initial_state_slots,
+                                  const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
+                                  Tensor& value, Tensor& z, LinearPolicy policy, WorkspaceArena& ws,
+                                  cudaStream_t stream) {
+    validate_policy(policy);
+    const ConvGeometry geometry = require_snapshot_input(x, x.ne[0]);
+    const std::int32_t channels = query_weight.n + key_weight.n + value_weight.n;
+    require_snapshot_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
+                              snapshot_base_slots, channels, geometry);
+    require_conv_tensor(query, query_weight.n, geometry.width, geometry.batch,
+                        "gdn_input_proj_conv_snapshot", "query");
+    require_conv_tensor(key, key_weight.n, geometry.width, geometry.batch,
+                        "gdn_input_proj_conv_snapshot", "key");
+    require_conv_tensor(value, value_weight.n, geometry.width, geometry.batch,
+                        "gdn_input_proj_conv_snapshot", "value");
+    require_conv_tensor(z, z_weight.n, geometry.width, geometry.batch,
+                        "gdn_input_proj_conv_snapshot", "z");
+    // Separate parents have no fused row order, so the state-writing form runs as the composition the
+    // batched two-parent form already uses: project the whole rectangle into a private packed buffer
+    // at the aggregate column count, then convolve it and publish the destination history from the
+    // device selectors. Both buffers live in the caller's snapshot scratch.
+    auto scope       = ws.scope();
+    Tensor projected = ws.alloc(DType::BF16, {channels, geometry.aggregate_columns});
+    Tensor x_flat    = flatten_columns(x, x.ne[0], geometry);
+    Tensor z_flat    = flatten_columns(z, z_weight.n, geometry);
+    gdn_input_proj(x_flat, query_weight, key_weight, value_weight, z_weight, projected, z_flat,
+                   policy, ws, stream);
+    Tensor projected_rect(projected.data, DType::BF16,
+                          {channels, geometry.width, geometry.batch});
+    detail::gdn_projected_conv_snapshot_launch(projected_rect, conv_weight, conv_states,
+                                               valid_columns, initial_state_slots,
+                                               snapshot_base_slots, query, key, value, stream);
+}
+
 void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                     Tensor& qkv, Tensor& z, LinearPolicy policy, WorkspaceArena& ws,
                     cudaStream_t stream) {
