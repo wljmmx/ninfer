@@ -55,11 +55,16 @@ public:
     // each is priced at its own stride by the cache (`slot_stride(bank)`), because the q6 down
     // matrix is wider than the q4 gate/up pair.
     //
-    // This form is not a different policy: ensure() places the same expert set into all three runs
-    // (the router names the expert, not the matrix), and every table is published per run. The
-    // paths that describe ONE run per layer - the pinned host tier, the GH3 placement table, the
-    // freeze placement, the device ring and the prediction region - are refused by name at
-    // attach_split() rather than half-applied (see split_refused_switch() in the .cpp).
+    // This form carries the same layering as the fused one, one run at a time:
+    //
+    //   * ensure() places the experts this layer routes to into all three runs (as many as fit),
+    //     with the decayed ranking filling the rest of each run's seats;
+    //   * the pinned host tier serves the routes a run could not hold - three entry images, three
+    //     slot tables, and three Q20 host legs, so the GEMM reads a host-resident expert from the
+    //     mapped tier exactly as it does in the fused form;
+    //   * a route neither leg can hold goes to the CPU half (`CpuSwiGLUExperts` with gate/up/down),
+    //     and ffn folds it into the same FP32 term the Device half writes;
+    //   * the freeze holds the pool placement; the prediction region (prefetch) stages per run.
     ExpertStream(std::uint32_t count, ExpertMatrixBankDesc gate, ExpertMatrixBankDesc up,
                  ExpertMatrixBankDesc down);
 
@@ -76,11 +81,12 @@ public:
     // `bank_` becomes the gate bank: it is the layer's identity (diagnostics, graph keys, the
     // score registry), and the three runs are reachable through split_bank(role).
     //
-    // Refuses (`std::logic_error`) the switches whose mechanism is defined over one pool run per
-    // layer: NINFER_HOST_TIER / NINFER_HOST_DIRECT / NINFER_HOST_FREEZE / NINFER_WARM_STATIC,
-    // NINFER_PREFETCH{,_SYNC,_SLOTS,_MODE} and NINFER_RING_DEVICE_ADMIT / NINFER_EXPERT_RING_SLOTS.
-    // A run that asks for one of those on this form is not silently downgraded to the streaming
-    // path.
+    // The switches that describe one run per layer are applied per run instead of refused:
+    // NINFER_HOST_TIER / NINFER_HOST_DIRECT / NINFER_HOST_FREEZE / NINFER_WARM_STATIC (a tier bank
+    // and a GH3 placement word per run), NINFER_PREFETCH{,_MODE} (a prediction region per run) and
+    // NINFER_EXPERT_RING_SLOTS (a fixed seat ring per run). NINFER_RING_DEVICE_ADMIT stays
+    // host-side on this form - see the note in ensure_split(): a device-admitted ring copies one
+    // whole pool slot out of one whole tier slot, and the three runs do not share a slot image.
     void attach_split(ExpertCache& cache, std::uint32_t gate_bank, const ExpertBankLayout& gate_entry,
                       std::uint32_t up_bank, const ExpertBankLayout& up_entry,
                       std::uint32_t down_bank, const ExpertBankLayout& down_entry);
@@ -115,10 +121,12 @@ public:
     // For the split form this is the gate run: it identifies the layer, and the three runs are
     // reachable through split_bank(role). The fused form has exactly one bank.
     [[nodiscard]] std::uint32_t bank_index() const noexcept { return bank_; }
-    // Device-side int32 array, one entry per expert: 1 when the pool holds it.
+    // Device-side int32 array, one entry per expert: 1 when the route resolves to an address.
     //
-    // port (sm_89): in the split form this is the GATE run's mask. The three runs can hold different
-    // sets (their seats differ), so a caller that needs another run's mask asks split_mask_device().
+    // port (sm_89): in the split form this is the GATE run's mask. Three runs can hold different
+    // sets (their seats differ), so a caller that needs another run's mask asks
+    // split_mask_device(). The mask means exactly what GH3 writes it as - "pool OR pinned tier" -
+    // so the CPU half's complement (MaskZeros) is "neither leg has it", not "the pool lacks it".
     [[nodiscard]] const void* resident_mask() const noexcept {
         if (split_banks_) {
             const auto& run = split_[split_index(ExpertMatrixRole::Gate)];
@@ -131,10 +139,9 @@ public:
         if (split_banks_) { return split_[split_index(ExpertMatrixRole::Gate)].mask; }
         return mask_host_;
     }
-    // port (sm_89): false for the gate/up/down form, whose layer is three pool runs. The engine asks
-    // this before building a host tier: the tier (and Q20's second leg) is defined over one run per
-    // layer, so attaching one to this form would be refused at attach_host() anyway.
-    [[nodiscard]] bool host_tier_supported() const noexcept { return !split_banks_; }
+    // port (sm_89): false for nothing - both forms now carry a host tier. Kept as the question the
+    // engine asks before building one, so a future form that cannot be backed can answer for itself.
+    [[nodiscard]] bool host_tier_supported() const noexcept { return true; }
     // True when every run of this stream could hold the whole layer at once (the fused form has one
     // run). In the split form all three have to answer yes: a single narrow run makes the layer a
     // split layer.
@@ -197,11 +204,14 @@ public:
     }
     // Experts of this run the pool holds right now, and how many of this layer's routes it covered.
     [[nodiscard]] std::uint32_t split_resident_capacity(ExpertMatrixRole role) const noexcept;
-    // Experts the last publication put in this run (the mask's population). Equal to the run's seat
-    // count when the set filled it, less when the routes were fewer.
+    // Experts the last publication put in the pool of this run (the mask's population less the
+    // experts the pinned tier owns).
     [[nodiscard]] std::uint32_t split_resident(ExpertMatrixRole role) const noexcept {
         return split_banks_ ? split_[split_index(role)].resident : 0;
     }
+    // port (sm_89): how many of this layer's gate-run routes the pinned tier served. The gate run is
+    // the router's own matrix, so it is the one the [experts] line reports.
+    [[nodiscard]] std::uint32_t split_host_routes() const noexcept { return split_host_routes_; }
     // What one run is described by: the artifact bank, its parent (metadata for a loader that names
     // the expert objects) and the per-expert geometry the operator sizes against.
     [[nodiscard]] const WeightBankLayout& split_layout(ExpertMatrixRole role) const {
@@ -456,6 +466,32 @@ private:
         bool attached = false;
         // Per-run residency the last publication carried, so an eviction is observable.
         std::uint32_t resident = 0;
+
+        // port (sm_89): GH3's placement word for THIS run - "pool slot", "pinned tier | slot" or
+        // "absent" - and the tables derived from it. One word per expert is the whole publication:
+        // `moe_expand_expert_placements` turns it into this run's offsets/mask and (when the tier can
+        // be addressed) its host offsets/flags, on the Device, with this run's pool stride and bias.
+        std::vector<std::uint32_t> placement;
+        std::vector<std::uint32_t> placement_published;
+        std::vector<std::int32_t> pool_slot;    // this run's slot per expert, -1 when absent
+        std::vector<std::uint32_t> host_slots;  // one snapshot of the tier, under its lock
+        std::vector<std::uint32_t> placed_slots; // tier slots this layer's table names, held for it
+        std::vector<std::int32_t> host_flags;
+        std::unique_ptr<DeviceBuffer> placement_device;
+        std::unique_ptr<DeviceBuffer> host_offsets_device;
+        std::unique_ptr<DeviceBuffer> host_flags_device;
+        std::unique_ptr<PinnedHostBuffer> placement_stage[2];
+        int placement_stage_next = 0;
+        // Where each plane starts inside a tier slot, so the Device bases are
+        // arena_device_base() + offset. One set per run: the q6 down run's planes are not the q4
+        // pair's.
+        std::uint64_t host_plane[3] = {};
+        std::uint64_t host_high_bytes = 0;
+        bool host_leg = false; // this run's views carry the pinned-tier addressing
+        // "The Device holds a placement this stream published": the first layer has to publish even
+        // when the new word happens to equal the empty table the bank was attached with.
+        bool placement_published_once = false;
+        std::uint32_t host_routes = 0; // of the last layer's routes, how many this run served from RAM
     };
     bool split_banks_ = false;
     std::array<SplitRun, 3> split_{};
@@ -473,7 +509,17 @@ private:
     // check. Called from ensure() when split_banks() holds; the fused path never enters it.
     bool ensure_split(const void* device_ids, std::int32_t top_k, std::int32_t tokens,
                       cudaStream_t stream, const std::int32_t* host_ids);
+    // port (sm_89): one run of the three-run layer: its pool set is installed, the tier is asked to
+    // hold what the pool will not, and the placement word is expanded into this run's four tables.
+    void publish_split_run(std::size_t index, cudaStream_t stream, bool placement_mode);
+    // The frozen pool set, chosen once per boundary from the decayed ranking and held per run.
+    void freeze_split(cudaStream_t stream);
     void rebase_split();
+    // Tier routes per run: the distinct routes this run's pool will not hold. Empty when no tier is
+    // attached. Filled by ensure_split, consumed by the fill.
+    std::array<std::vector<std::int32_t>, 3> split_host_targets_;
+    std::array<std::vector<std::uint32_t>, 3> split_frozen_; // per run, when frozen_
+    std::uint32_t split_host_routes_ = 0;
 
     ExpertCache* cache_ = nullptr;
     HostExpertResidency* host_ = nullptr;

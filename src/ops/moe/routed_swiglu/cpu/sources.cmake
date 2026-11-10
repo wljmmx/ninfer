@@ -2,6 +2,7 @@
 set(ninfer_moe_cpu_sources
   "${CMAKE_CURRENT_LIST_DIR}/entry.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/dispatch.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/split.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/q4_q5/shapes/h2048_i512_e256_k8/dispatch.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/q4_q6/shapes/h2048_i512_e256_k8/dispatch.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/q8_q8/shapes/h2048_i512_e256_k8/dispatch.cpp"

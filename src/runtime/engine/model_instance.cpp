@@ -529,42 +529,39 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
             short_pool = true;
         }
     }
-    // port (sm_89): the host tier is one pool run per layer - its entry image, its slot table and the
-    // GH3 placement word all name one bank - so the gate/up/down form (three runs) cannot use it.
-    // Instead of building an arena no layer can address, the shortfall is reported with the numbers
-    // the first MoE layer will refuse with (see the check in ffn).
+    // port (sm_89): the host tier backs both forms. The fused form describes one bank per layer; the
+    // gate/up/down form describes THREE - one per matrix - because each run's pool set, tier slot
+    // table and GH3 placement word are its own. A split run's entry image carries that one matrix in
+    // the cache's gate_up planes and a one-row placeholder in the down planes (the loader's
+    // ExpertMatrixSpec above), so the tier is told exactly what the pool was told.
     const bool any_split = std::any_of(runs.begin(), runs.end(),
                                        [](const StreamRuns& entry) { return entry.split; });
-    if (short_pool && !streams.empty() && any_split) {
-        std::fprintf(stderr,
-                     "[experts] no host tier: the gate/up/down form owns three pool runs per layer "
-                     "and the tier describes one\n");
-        for (std::size_t i = 0; i < streams.size(); ++i) {
-            if (!runs[i].split) { continue; }
-            const auto first = runs[i].first;
-            const auto seats = [&](std::uint32_t bank) {
-                return instance.expert_cache->resident_capacity(bank);
-            };
-            std::fprintf(stderr,
-                         "[experts] stream %zu: pool holds gate=%u up=%u down=%u of %u experts per "
-                         "run; a layer needs all three runs resident and this form has no CPU half\n",
-                         i, seats(first), seats(first + 1), seats(first + 2), streams[i]->count());
-        }
-        std::fflush(stderr);
-    }
-    if (short_pool && !streams.empty() && !any_split) {
+    if (short_pool && !streams.empty()) {
         std::vector<models::qwen3_5::execution::HostExpertBankDesc> descs;
-        descs.reserve(streams.size());
+        descs.reserve(streams.size() * 3);
+        // port (sm_89): the host arena describes a whole bank, but a per-expert artifact gives
+        // the weight a parent of exactly one expert's rows. Scale that geometry back up to
+        // the bank so the CPU op's bank-validation sees the same domain either way; a fused
+        // artifact already has this shape and the call is a no-op there.
+        const auto bank_geometry = [](const WeightGeometry& expert, std::uint32_t count) {
+            const std::uint64_t shape[2] = {
+                static_cast<std::uint64_t>(count) * expert.shape.front(), expert.shape.back()};
+            return weight_geometry(expert.format, expert.layout, shape);
+        };
         for (std::size_t i = 0; i < streams.size(); ++i) {
-            // port (sm_89): the host arena describes a whole bank, but a per-expert artifact gives
-            // the weight a parent of exactly one expert's rows. Scale that geometry back up to the
-            // bank so the CPU op's bank-validation sees the same domain either way; a fused
-            // artifact already has this shape and the call is a no-op there.
-            const auto bank_geometry = [](const WeightGeometry& expert, std::uint32_t count) {
-                const std::uint64_t shape[2] = {
-                    static_cast<std::uint64_t>(count) * expert.shape.front(), expert.shape.back()};
-                return weight_geometry(expert.format, expert.layout, shape);
-            };
+            if (runs[i].split) {
+                for (std::size_t role = 0; role < 3; ++role) {
+                    const auto matrix_role =
+                        static_cast<models::qwen3_5::execution::ExpertMatrixRole>(role);
+                    const auto geometry = bank_geometry(
+                        streams[i]->split_expert_geometry(matrix_role), streams[i]->count());
+                    descs.push_back(
+                        {requirements.banks[runs[i].first + role],
+                         streams[i]->split_layout(matrix_role), streams[i]->split_layout(matrix_role),
+                         geometry, geometry, streams[i]->per_expert_objects()});
+                }
+                continue;
+            }
             descs.push_back({requirements.banks[runs[i].first], streams[i]->gate_up_layout(),
                              streams[i]->down_layout(),
                              bank_geometry(streams[i]->gate_up_expert_geometry(),
@@ -597,10 +594,13 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
                 std::fprintf(stderr, "[experts] read-ahead attached, gate off (NINFER_PREFETCH=0)\n");
             }
         }
-        std::fprintf(stderr, "[experts] host tier slots=%u (%u routed + %u read-ahead) slot_bytes=%llu\n",
+        std::fprintf(stderr,
+                     "[experts] host tier slots=%u (%u routed + %u read-ahead) slot_bytes=%llu "
+                     "banks=%zu form=%s\n",
                      residency->slot_capacity(), residency->routed_capacity(),
                      residency->prefetch_slots(),
-                     static_cast<unsigned long long>(residency->slot_bytes()));
+                     static_cast<unsigned long long>(residency->slot_bytes()), descs.size(),
+                     any_split ? "gate/up/down (one tier bank per run)" : "fused");
         // port (sm_89): the Device uploader may read a miss out of this pinned tier instead of the
         // pageable artifact mapping. Only experts the host tier actually keeps are answered; the rest
         // still stream from the artifact.

@@ -196,37 +196,18 @@ void register_profile_dump(std::uint32_t bank, const std::vector<float>* scores)
     std::lock_guard<std::mutex> lock(profile_mutex());
     profile_registry()[bank] = scores;
 }
-
-// port (sm_89): the switches whose mechanism is defined over ONE pool run per layer, and which the
-// gate/up/down form therefore refuses by name at attach.
+// port (sm_89): the switches that used to be refused on the gate/up/down form are applied per run
+// now (see ensure_split / publish_split_run / freeze_split / stage_predicted): a tier bank, a GH3
+// placement word, a freeze placement and a prediction region exist once per matrix, which is exactly
+// what three pool runs need. The one mechanism that is NOT per run is the device-admitted ring:
 //
-// Each of them answers "where is the rest of this layer" with a host-side structure keyed by one
-// bank: the tier's complement of the pool set (HostExpertResidency::ensure), GH3's one-word
-// placement table (which names a pool slot OR a host slot per expert), the freeze's static stripe,
-// the fixed device ring (a slice of one bank's seats) and the prediction region (carved out of the
-// top of a flat slot space). With three runs per layer every one of those needs a per-run rewrite -
-// three complements, three placement words, three rings - so a run that asks for one is told so
-// instead of silently running the plain streaming path under its name.
-const char* split_refused_switch() {
-    struct Switch {
-        const char* name;
-        bool zero_is_off; // "0" means "attached but closed" for the read-ahead queue
-    };
-    static const Switch switches[] = {
-        {"NINFER_HOST_TIER", false},        {"NINFER_HOST_DIRECT", false},
-        {"NINFER_HOST_FREEZE", false},      {"NINFER_WARM_STATIC", false},
-        {"NINFER_PREFETCH", true},          {"NINFER_PREFETCH_SYNC", true},
-        {"NINFER_PREFETCH_SLOTS", false},   {"NINFER_PREFETCH_MODE", false},
-        {"NINFER_RING_DEVICE_ADMIT", true}, {"NINFER_EXPERT_RING_SLOTS", false},
-    };
-    for (const auto& entry : switches) {
-        const char* value = std::getenv(entry.name);
-        if (value == nullptr) { continue; }
-        if (entry.zero_is_off && value[0] == '0' && value[1] == '\0') { continue; }
-        return entry.name;
-    }
-    return nullptr;
-}
+//   device_admit_ring() copies one whole pool slot out of one whole tier slot and refuses unless
+//   `host_->slot_bytes() == cache_->slot_bytes()` (expert_stream.cpp, the "no mapped arena or slot
+//   size mismatch" guard). A tier prices every bank at ONE slot size - slot_bytes_for(widest entry),
+//   host_expert_residency.h - while a three-run layer has three different pool strides (0.87 MiB for
+//   the q4 runs, 1.28 MiB for the q6 run). One uniform tier slot cannot be copied into all three, so
+//   on this form the ring is the HOST-side one (a fixed seat ring the routes fill, NINFER_EXPERT_RING_SLOTS)
+//   and NINFER_RING_DEVICE_ADMIT is reported as host-side rather than silently doing nothing.
 
 } // namespace
 
@@ -449,39 +430,32 @@ ExpertStream::~ExpertStream() {
 }
 
 void ExpertStream::attach_host(std::shared_ptr<HostExpertResidency> host) noexcept {
-    // port (sm_89): the tier is one pool run per layer by construction (its entry image, its slot
-    // table, its static stripe and the GH3 placement word all name one bank), so the three-run form
-    // cannot be attached to it. The switch that asks for it is refused at attach_split() as well;
-    // this is the second door (a caller attaching a tier without setting the env).
-    if (split_banks_) {
-        host_      = nullptr;
-        host_weak_ = std::shared_ptr<HostExpertResidency>{};
-        // One line, not a silent drop: a tier attached to this form is refused, and the reason has
-        // to be in the log because the engine builds the tier whenever the pool is short - which is
-        // the normal case on this artifact. `host_tier_supported()` lets the wiring ask first.
-        static bool announced = false;
-        if (!announced) {
-            announced = true;
-            std::fprintf(stderr,
-                         "[experts] the host tier is not supported by the gate/up/down form: it "
-                         "describes one pool run per layer (entry image, slot table, placement "
-                         "word); the tier request is dropped and the layer streams from the pool\n");
-            std::fflush(stderr);
-        }
-        return;
-    }
     host_      = host.get();
     host_weak_ = std::move(host);
     // Q53: the second-chance band's admission compares this bank's score against the occupant it would
     // displace, so the tier needs the ranking. The vector is allocated once in the constructor, so
-    // the pointer stays valid for the stream's life.
-    if (host_ != nullptr) { host_->attach_scores(bank_, hot_score_.data(), count_); }
+    // the pointer stays valid for the stream's life. On the three-run form every run is its own tier
+    // bank, and each one's fill is scored by the same ranking (the router names the expert, not the
+    // matrix), so all three registers point at this stream's row.
+    if (host_ != nullptr) {
+        host_->attach_scores(bank_, hot_score_.data(), count_);
+        if (split_banks_) {
+            for (const auto& run : split_) {
+                host_->attach_scores(run.bank, hot_score_.data(), count_);
+            }
+        }
+    }
     // Q20/B: the static stripe must exist before the first dynamic fill - configuring it later moves
     // the dynamic bump pointer under a pointer that has already advanced, and the next eviction then
     // scans untouched slots and reports "nothing to evict" (the tier now refuses that ordering
     // outright). The quota is a process-wide decision, so the first stream installs it and the rest
     // are no-ops. The freeze route always installs it: its S stripe is the placement, not an option.
-    if (host_ != nullptr && static_warm_ &&
+    //
+    // The three-run form keeps its frozen placement in the pool (freeze_split) and lets the tier's
+    // dynamic range serve the rest: the stripe's quota is ONE number per bank, while these three runs
+    // have three different complement sizes (count - capacity(bank)), so a single stripe would either
+    // overflow the narrowest run or waste the widest. The dynamic range has no such shape.
+    if (host_ != nullptr && !split_banks_ && static_warm_ &&
         (freeze_mode_ || std::getenv("NINFER_WARM_STATIC_RESERVE") != nullptr)) {
         host_->configure_static_slots(static_quota());
     }
@@ -649,14 +623,7 @@ void ExpertStream::attach_split(ExpertCache& cache, std::uint32_t gate_bank,
     if (!split_banks_) {
         throw std::logic_error("expert stream: attach_split() requires the gate/up/down form");
     }
-    if (const char* refused = split_refused_switch(); refused != nullptr) {
-        throw std::logic_error(std::string("expert stream: ") + refused +
-                               " is defined over one pool run per layer and is not supported by the "
-                               "gate/up/down form");
-    }
-    if (host_ != nullptr) {
-        throw std::logic_error("expert stream: the host tier cannot back the gate/up/down form");
-    }
+    // A tier attached before the cache is kept: it is the second leg of these three runs.
     const std::array<std::uint32_t, 3> banks{gate_bank, up_bank, down_bank};
     const std::array<const ExpertBankLayout*, 3> entries{&gate_entry, &up_entry, &down_entry};
     for (std::size_t index = 0; index < banks.size(); ++index) {
@@ -686,8 +653,24 @@ void ExpertStream::attach_split(ExpertCache& cache, std::uint32_t gate_bank,
     experts_.bank.gate_up = ExpertMatrixDeviceView{};
     experts_.bank.count   = count_;
     experts_.bank.device  = cache.pool().device;
-    device_ring_slots_    = 0; // the ring is refused above; nothing reserves a slice of these runs
-    pinned_               = cache.can_hold_every_layer();
+    // port (sm_89): the device-admitted ring is the one mechanism that is not per run - it copies a
+    // whole pool slot out of a whole tier slot and needs both to be the same image, which a tier with
+    // one slot size cannot be for three different pool strides. The host-side ring (a fixed seat
+    // slice the routes fill) is what this form uses; see the note at the top of ensure_split.
+    device_ring_slots_ = 0;
+    if (std::getenv("NINFER_RING_DEVICE_ADMIT") != nullptr) {
+        static bool announced = false;
+        if (!announced) {
+            announced = true;
+            std::fprintf(stderr,
+                         "[ring] NINFER_RING_DEVICE_ADMIT: host-side admission on the gate/up/down "
+                         "form - a device-admitted ring copies one whole pool slot from one whole "
+                         "tier slot, and this tier prices every bank at a single slot size while "
+                         "these three runs have three strides\n");
+            std::fflush(stderr);
+        }
+    }
+    pinned_ = cache.can_hold_every_layer();
 }
 
 void ExpertStream::rebase_split() {
@@ -904,20 +887,33 @@ void ExpertStream::stage_predicted(cudaStream_t stream) {
     if (cache_ == nullptr) { say("no cache"); return; }
     if (predicted_.empty()) { say("predicted_ is empty"); return; }
     if (cache_->prefetch_slots_per_bank() == 0) { say("no region"); return; }
-    std::vector<std::uint32_t> absent;
-    absent.reserve(predicted_.size());
-    for (const auto expert : predicted_) {
-        if (expert < 0 || static_cast<std::uint32_t>(expert) >= count_) { continue; }
-        const auto id = static_cast<std::uint32_t>(expert);
-        if (cache_->expert_slot(bank_, id)) { continue; } // already resident: not a prediction
-        absent.push_back(id);
+    // port (sm_89): the prediction region exists per bank, so the three-run form stages the same
+    // predicted set into each of its runs. One run's region is sized per bank by the cache, so a run
+    // that cannot take the whole set takes what fits and the rest stays a demand miss next layer.
+    std::array<std::uint32_t, 4> banks{};
+    std::size_t bank_count = 1;
+    banks[0] = bank_;
+    if (split_banks_) {
+        bank_count = split_.size();
+        for (std::size_t index = 0; index < split_.size(); ++index) { banks[index] = split_[index].bank; }
     }
-    prefetch_delta_ += absent.size();
-    std::vector<ExpertCacheKey> placed;
-    if (!absent.empty() && cache_->set_prefetch_experts(bank_, absent, placed) != 0) {
-        cache_->prepare(std::span<const ExpertCacheKey>(placed), stream);
-        (void)cache_->progress(stream);
-        prefetch_placed_ += placed.size();
+    for (std::size_t index = 0; index < bank_count; ++index) {
+        const auto bank = banks[index];
+        std::vector<std::uint32_t> absent;
+        absent.reserve(predicted_.size());
+        for (const auto expert : predicted_) {
+            if (expert < 0 || static_cast<std::uint32_t>(expert) >= count_) { continue; }
+            const auto id = static_cast<std::uint32_t>(expert);
+            if (cache_->expert_slot(bank, id)) { continue; } // already resident: not a prediction
+            absent.push_back(id);
+        }
+        prefetch_delta_ += absent.size();
+        std::vector<ExpertCacheKey> placed;
+        if (!absent.empty() && cache_->set_prefetch_experts(bank, absent, placed) != 0) {
+            cache_->prepare(std::span<const ExpertCacheKey>(placed), stream);
+            (void)cache_->progress(stream);
+            prefetch_placed_ += placed.size();
+        }
     }
     static std::uint64_t reports = 0;
     if (bank_ < 4 && (++reports % 40) == 0) {
@@ -1280,6 +1276,7 @@ void ExpertStream::thaw() {
     freeze_covers_all_ = false;
     freeze_table_published_ = false;
     frozen_wanted_.clear();
+    for (auto& set : split_frozen_) { set.clear(); }
     static_member_.assign(count_, 0);
     // The stripe returns to warm-up: its fill may churn again until the next freeze rewrites it.
     if (host_ != nullptr) { host_->set_static_frozen(bank_, false); }
@@ -1431,29 +1428,235 @@ std::size_t ExpertStream::device_admit_ring(const void* device_ids, std::int32_t
 
 // port (sm_89): the layer as three runs.
 //
-// The router names an expert, not a matrix, so all three runs hold the same expert set - but sized
-// per run, because the cache prices each run at its own stride and the q6 down matrix is wider than
-// the q4 gate/up pair (on Qwen4Exp: 1.61 MiB against 0.83 MiB, so the down run keeps about half as
-// many experts for the same bytes). Everything below is per-run; nothing is derived from a sibling
-// run's slot numbering.
+// The router names an expert, not a matrix, so all three runs hold the same expert *identity* - but
+// sized per run, because the cache prices each run at its own stride and the q6 down matrix is wider
+// than the q4 gate/up pair (on Qwen4Exp: 1.28 MiB against 0.87 MiB, so the down run keeps fewer
+// experts for the same bytes). Everything below is per-run; nothing is derived from a sibling run's
+// slot numbering.
 //
 // Order inside the layer, and why it is this order:
 //
 //   1. read the routes back (or take the caller's copy) - the placement needs them;
-//   2. per run: the set is this step's routes first, then the decayed score, capped by that run's
-//      own seat count; set_resident_experts() installs it and evicts what does not fit;
-//   3. per run: offsets and mask are rebuilt from the pool and published on the layer's stream,
-//      stamped with that run's generations (A3b);
-//   4. one prepare()/wait_for_progress() for all three runs' routed keys - the uploader is per key,
+//   2. per run: the set is this step's routes first (or the held/frozen set), then the decayed
+//      score, capped by that run's own seat count; set_resident_experts() installs it;
+//   3. the pinned tier is asked to hold, per run, the routes that run's pool will NOT hold. The fill
+//      happens before the tables are built because the tables name slots: a fill that ran afterwards
+//      would name the previous layer's expert (the fused path measured exactly that);
+//   4. per run: one placement word per expert (pool slot / pinned slot / absent) is expanded on the
+//      Device into that run's offsets, mask and host flags - with that run's pool stride and bias;
+//   5. one prepare()/wait_for_progress() for all three runs' routed keys - the uploader is per key,
 //      so the three runs share one turn instead of three;
-//   5. rebase the views and compare each run's published generation against the cache's.
+//   6. rebase the views and compare each run's published generation against the cache's.
 //
-// Concurrency: this runs on the layer thread, like the fused path, and it owns every buffer it
-// writes (offsets/mask/required_ are per stream). The Device copies read the same host vectors the
-// next layer will overwrite, so they are submitted stream-ordered on the consumer stream and every
-// consumer kernel is queued behind them - the fused publisher's contract. There is no new shared
-// state across streams: the three runs of ONE ExpertStream are touched by one thread, and two
-// streams never share a cache bank (attach_split refuses equal bank ids).
+// The mask that reaches the kernels means "this route resolves to an address" (pool or pinned tier),
+// which is the same rule GH3 writes and the same rule ffn's CPU complement reads: MaskZeros over it
+// is "neither leg has this expert", not "the pool lacks it".
+namespace {
+// The layer policy constants, shared with the fused path (see the notes at their use sites there).
+constexpr std::int32_t kSplitSetUpdateTokens    = 8;
+constexpr std::uint32_t kSplitPrefillProtectMin = 96;
+} // namespace
+
+// port (sm_89): one run's tables, from one placement word.
+//
+// `placement_mode` says the pinned tier can be addressed by the Device. It is re-derived on EVERY
+// layer even when the pool's set did not move: the tier keeps churning while the pool sits still, so
+// "the pool did not move" says nothing about whether a host slot still holds the expert the table
+// names. The held set (`hold_slots`) is exactly the slots this layer's table names.
+void ExpertStream::publish_split_run(std::size_t index, cudaStream_t stream, bool placement_mode) {
+    auto& run = split_[index];
+    if (run.pool_slot.size() != count_) { run.pool_slot.assign(count_, -1); }
+    for (std::uint32_t expert = 0; expert < count_; ++expert) {
+        const auto slot       = cache_->expert_slot(run.bank, expert);
+        const auto previous   = run.pool_slot[expert];
+        run.pool_slot[expert] = slot ? static_cast<std::int32_t>(*slot) : -1;
+        // Leaving the pool is the one signal that says "this expert was hot and is not hot enough
+        // any more": it is the warm tier's admission criterion, and the gate run's journal is the
+        // one the model reads.
+        if (previous >= 0 && run.pool_slot[expert] < 0 && index == 0) {
+            demoted_.push_back(static_cast<std::int32_t>(expert));
+        }
+    }
+    if (run.placement.size() != count_) {
+        run.placement.assign(count_, ops::kExpertPlacementAbsent);
+        run.placement_published.assign(count_, ops::kExpertPlacementAbsent);
+        run.host_slots.assign(count_, HostExpertResidency::kAbsentSlot);
+        run.host_flags.assign(count_, 0);
+    }
+    const auto* host_base = placement_mode ? host_->arena_device_base() : nullptr;
+    bool tier_usable      = host_base != nullptr;
+    if (tier_usable) {
+        std::uint64_t gu_plane[3] = {}, dn_plane[3] = {}, gu_high = 0, dn_high = 0;
+        if (host_->plane_offsets(run.bank, gu_plane, dn_plane, gu_high, dn_high)) {
+            for (std::size_t k = 0; k < 3; ++k) { run.host_plane[k] = gu_plane[k]; }
+            run.host_high_bytes = gu_high;
+            host_->snapshot_slots(run.bank, run.host_slots);
+        } else {
+            // The tier cannot describe this bank: nothing it holds is offerable, so every route the
+            // pool does not hold goes to the CPU half rather than to a slot table we cannot trust.
+            tier_usable = false;
+        }
+    }
+
+    bool changed = !run.placement_published_once;
+    run.placed_slots.clear();
+    run.placed_slots.reserve(count_);
+    for (std::uint32_t expert = 0; expert < count_; ++expert) {
+        // The pool wins a tie: an expert resident in both is addressed in video memory.
+        std::uint32_t placement = ops::kExpertPlacementAbsent;
+        if (run.pool_slot[expert] >= 0) {
+            placement = static_cast<std::uint32_t>(run.pool_slot[expert]);
+        } else if (tier_usable && run.host_slots[expert] != HostExpertResidency::kAbsentSlot) {
+            placement = ops::kExpertPlacementHost | run.host_slots[expert];
+        }
+        if (placement != run.placement_published[expert]) { changed = true; }
+        run.placement[expert] = placement;
+        const bool absent     = placement == ops::kExpertPlacementAbsent;
+        const bool on_host    = !absent && (placement & ops::kExpertPlacementHost) != 0;
+        run.host_flags[expert] = on_host ? 1 : 0;
+        if (on_host) { run.placed_slots.push_back(placement & ~ops::kExpertPlacementHost); }
+    }
+    if (tier_usable) { host_->hold_slots(run.placed_slots); }
+
+    // The host mirror of the tables the Device derives. Readers that are not kernels ask for these
+    // (the tests, the coverage attribution, the demotion journal); they are the same four rules
+    // `moe_expand_expert_placements` applies, so the two cannot disagree about a resident expert.
+    if (run.offsets.size() != count_) { run.offsets.assign(count_, 0); }
+    if (run.mask.size() != count_) { run.mask.assign(count_, 0); }
+    std::uint32_t pool_resident = 0, host_resident = 0;
+    for (std::uint32_t expert = 0; expert < count_; ++expert) {
+        const auto placement = run.placement[expert];
+        const bool absent    = placement == ops::kExpertPlacementAbsent;
+        const bool on_host   = !absent && (placement & ops::kExpertPlacementHost) != 0;
+        run.mask[expert]    = absent ? 0 : 1;
+        run.offsets[expert] = absent || on_host
+                                  ? 0
+                                  : cache_->slot_offset(static_cast<std::uint32_t>(placement));
+        pool_resident += on_host || absent ? 0U : 1U;
+        host_resident += on_host ? 1U : 0U;
+    }
+    run.resident        = pool_resident;
+    run.host_routes     = 0; // filled by ensure_split from the routes it just placed
+    run.host_leg        = tier_usable && host_resident != 0;
+
+    if (run.placement_device == nullptr) {
+        run.placement_device   = std::make_unique<DeviceBuffer>(count_ * sizeof(std::uint32_t));
+        run.placement_stage[0] = std::make_unique<PinnedHostBuffer>(count_ * sizeof(std::uint32_t));
+        run.placement_stage[1] = std::make_unique<PinnedHostBuffer>(count_ * sizeof(std::uint32_t));
+    }
+    if (run.host_leg) {
+        if (run.host_offsets_device == nullptr) {
+            run.host_offsets_device = std::make_unique<DeviceBuffer>(count_ * sizeof(std::uint64_t));
+            run.host_flags_device   = std::make_unique<DeviceBuffer>(count_ * sizeof(std::int32_t));
+        }
+    }
+    auto& view = mutable_view(index);
+    if (run.host_leg) {
+        view.host_codes   = host_base + run.host_plane[0];
+        view.host_high    = run.host_high_bytes != 0 ? host_base + run.host_plane[1] : nullptr;
+        view.host_scales  = host_base + run.host_plane[2];
+        view.host_offsets = static_cast<const std::uint64_t*>(run.host_offsets_device->p);
+        view.host_flags   = static_cast<const std::int32_t*>(run.host_flags_device->p);
+    } else {
+        // Leaving last layer's addresses behind would be worse than having none: the kernel would
+        // keep reading the tier for a route the pool now expects to own.
+        view.host_codes   = nullptr;
+        view.host_high    = nullptr;
+        view.host_scales  = nullptr;
+        view.host_offsets = nullptr;
+        view.host_flags   = nullptr;
+    }
+
+    if (changed) {
+        // The publication is one word per expert: 4 bytes x 512 = 2 KiB, which the Device expands
+        // into the four tables the GEMM reads. A whole-table copy is cheaper than the bookkeeping a
+        // per-row batch would need at this size - and the driver refused the batch form on this
+        // platform (cudaMemcpyBatchAsync -> invalid argument, measured here), so the table goes over
+        // in one submission per run.
+        auto& stage = run.placement_stage[run.placement_stage_next];
+        run.placement_stage_next ^= 1;
+        std::memcpy(stage->data(), run.placement.data(), count_ * sizeof(std::uint32_t));
+        if (cudaMemcpyAsync(run.placement_device->p, stage->data(),
+                            count_ * sizeof(std::uint32_t), cudaMemcpyHostToDevice, stream) !=
+            cudaSuccess) {
+            throw std::runtime_error(std::string("expert split placement copy: ") +
+                                     cudaGetErrorString(cudaGetLastError()));
+        }
+        ops::moe_expand_expert_placements(
+            static_cast<const std::uint32_t*>(run.placement_device->p), static_cast<int>(count_),
+            cache_->slot_stride(run.bank), cache_->slot_bias(run.bank),
+            run.host_leg ? host_->slot_bytes() : 0,
+            static_cast<std::uint64_t*>(run.offsets_device->p),
+            static_cast<std::int32_t*>(run.mask_device->p),
+            run.host_leg ? static_cast<std::uint64_t*>(run.host_offsets_device->p) : nullptr,
+            run.host_leg ? static_cast<std::int32_t*>(run.host_flags_device->p) : nullptr, stream);
+        run.placement_published = run.placement;
+        run.placement_published_once = true;
+        publish_calls_ += 1;
+        publish_bytes_ += static_cast<std::uint64_t>(count_) * sizeof(std::uint32_t);
+        if (const auto latched = cudaGetLastError(); latched != cudaSuccess) {
+            // A placement that did not reach the Device is not a slowdown: the kernels would read the
+            // previous layer's table. Refuse it here rather than compute with it.
+            throw std::runtime_error(std::string("expert split placement publish: ") +
+                                     cudaGetErrorString(latched));
+        }
+    }
+
+    run.published    = true;
+    run.pub_hot      = cache_->hot_generation(run.bank);
+    run.pub_step     = cache_->step_generation(run.bank);
+    run.pub_prefetch = cache_->prefetch_generation(run.bank);
+    run.table_hot      = run.pub_hot;
+    run.table_step     = run.pub_step;
+    run.table_prefetch = run.pub_prefetch;
+}
+
+// The frozen pool set: this run's seats, taken from the decayed ranking once and held. The pinned
+// tier keeps filling whatever the pool does not hold, layer by layer; what the freeze removes is the
+// pool's churn, not the second leg.
+void ExpertStream::freeze_split(cudaStream_t stream) {
+    if (frozen_ || cache_ == nullptr) { return; }
+    std::vector<std::uint32_t> ranked(count_);
+    std::iota(ranked.begin(), ranked.end(), 0U);
+    std::stable_sort(ranked.begin(), ranked.end(), [&](std::uint32_t a, std::uint32_t b) {
+        if (hot_score_[a] != hot_score_[b]) { return hot_score_[a] > hot_score_[b]; }
+        return a < b; // deterministic: the same run must freeze the same set
+    });
+    std::vector<ExpertCacheKey> preload;
+    for (std::size_t index = 0; index < split_.size(); ++index) {
+        const auto bank_seats = std::min<std::size_t>(
+            cache_->resident_capacity(split_[index].bank), ranked.size());
+        auto& set = split_frozen_[index];
+        set.assign(ranked.begin(), ranked.begin() + static_cast<std::ptrdiff_t>(bank_seats));
+        (void)cache_->set_resident_experts(split_[index].bank, set,
+                                           static_cast<std::uint32_t>(set.size()));
+        for (const auto expert : set) {
+            preload.push_back(ExpertCacheKey{split_[index].bank, expert});
+        }
+    }
+    // Materialise the whole set before anything publishes it: a mask built from the mapping alone
+    // calls an expert resident while the pool still holds whoever used that slot before.
+    for (std::uint32_t turn = 0; turn < 256 && !preload.empty(); ++turn) {
+        bool unready = false;
+        for (std::size_t index = 0; index < split_.size() && !unready; ++index) {
+            if (cache_->unready_count(split_[index].bank, split_frozen_[index]) != 0) {
+                unready = true;
+            }
+        }
+        if (!unready) { break; }
+        cache_->prepare(std::span<const ExpertCacheKey>(preload), stream);
+        cache_->wait_for_progress(stream);
+    }
+    frozen_ = true;
+    std::fprintf(stderr,
+                 "[freeze] bank=%u state=frozen gate/up/down sets=%zu/%zu/%zu (the pool placement "
+                 "is held; the pinned tier keeps serving the rest every layer, and the static host "
+                 "stripe stays on the fused form because its quota is one number per bank while "
+                 "these three runs have three complement sizes)\n",
+                 bank_, split_frozen_[0].size(), split_frozen_[1].size(), split_frozen_[2].size());
+    std::fflush(stderr);
+}
+
 bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std::int32_t tokens,
                                 cudaStream_t stream, const std::int32_t* host_ids) {
     if (top_k <= 0 || tokens <= 0) {
@@ -1463,7 +1666,8 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
     const bool timing = std::getenv("NINFER_SPLIT_TIMING") != nullptr;
 
     std::uint32_t capacity[3] = {};
-    bool fully = true;
+    bool fully                = true;
+    std::uint32_t narrowest   = 0xffffffffu;
     for (std::size_t index = 0; index < split_.size(); ++index) {
         const auto& run = split_[index];
         if (cache_ == nullptr || !run.attached) {
@@ -1473,18 +1677,20 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
         // A run with no seat cannot hold a single route, so this layer cannot run on the pool at
         // all. False hands the whole routed term to the caller's fallback, which is the honest
         // answer: two of three runs resident is not three.
-        //
-        // (The fused path's floor of four seats is a statement about that path's fixed cost - the
-        // read-back, the mask and the merge over one run. Here the floor is structural: one seat.)
         if (capacity[index] == 0) { return false; }
         if (capacity[index] < count_) { fully = false; }
+        narrowest = std::min(narrowest, capacity[index]);
     }
     ++gh1_calls_;
-    if (!fully) { ++gh1_split_calls_; } else { ++gh1_no_miss_calls_; ++gh1_static_calls_; }
+    if (!fully) {
+        ++gh1_split_calls_;
+    } else {
+        ++gh1_no_miss_calls_;
+        ++gh1_static_calls_;
+    }
 
     // port (sm_89): a pinned pool holds every expert of every run from construction, so the window
-    // cannot move and the router does not have to be read back. Same early return as the fused
-    // pinned path, for the same reason (it is what keeps a captured layer valid).
+    // cannot move and the router does not have to be read back.
     if (pinned_) {
         bool resident = true;
         for (const auto& run : split_) {
@@ -1502,7 +1708,24 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
         // A resize dropped one of the runs; fall through to the normal path.
     }
 
-    double route_ms = 0.0;
+    // P1: the freeze clock counts ensure() calls, not branch hits - a covered layer must still
+    // reach the boundary that freezes the set.
+    if (freeze_mode_) {
+        ++freeze_clock_;
+        if (frozen_ && freeze_refresh_ != 0 && freeze_clock_ >= freeze_refresh_) {
+            frozen_        = false;
+            freeze_clock_  = 0;
+            for (auto& set : split_frozen_) { set.clear(); }
+            if (bank_ == 0) {
+                std::fprintf(stderr, "[freeze] bank=0 re-select after %u calls\n", freeze_refresh_);
+                std::fflush(stderr);
+            }
+        } else if (!frozen_ && freeze_after_ != 0 && freeze_clock_ >= freeze_after_) {
+            freeze_split(stream);
+        }
+    }
+
+    double route_ms               = 0.0;
     const std::int32_t* route_ids = host_ids;
     if (route_ids == nullptr) {
         const auto bytes = values * sizeof(std::int32_t);
@@ -1533,7 +1756,7 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
 
     // The score follows the router on small batches only, exactly as the fused streaming path does:
     // a prefill chunk touches most of the bank and would wash the ranking out.
-    if (tokens <= kHotSetUpdateTokens) {
+    if (tokens <= kSplitSetUpdateTokens) {
         for (std::size_t i = 0; i < values; ++i) {
             hot_score_[static_cast<std::size_t>(route_ids[i])] += 1.0F;
         }
@@ -1544,10 +1767,16 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
         }
     }
 
-    // A layer needs nothing when every route already has a ready image in every run. Asking the
-    // cache (slot AND ready) is the honest test: the masks are written from the placement this
-    // check is about to skip.
-    bool covered = true;
+    // port (sm_89): whether the pinned tier can be addressed by the Device decides whether this
+    // layer must re-derive its placement every time (it must: the tier churns under a still pool).
+    const bool placement_mode = host_ != nullptr && host_->arena_device_base() != nullptr &&
+                                std::getenv("NINFER_SKIP_PLACEMENT") == nullptr;
+
+    // A layer needs nothing when every route already has a ready image in every run - and, with a
+    // live second leg, only when the placement it published is still true, which is a per-layer
+    // property of the tier and not of the pool. So the covered shortcut is taken on the pool-only
+    // path and nowhere else.
+    bool covered = !placement_mode;
     for (std::size_t index = 0; index < split_.size() && covered; ++index) {
         const auto bank = split_[index].bank;
         for (std::size_t i = 0; i < values; ++i) {
@@ -1571,8 +1800,13 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
         return true;
     }
 
-    // This step's set per run: routes first (they must run on the Device), then the decayed score
-    // for whatever seats are left, so the next step has a chance to hit.
+    // Whether this layer may change the pool's resident set. A prefill on a pool that can hold most
+    // of a layer would otherwise replace the decode set with experts decode never asks for; a pool
+    // that cannot hold a layer gains nothing from protecting it, so the floor is the same one the
+    // fused path uses.
+    const bool refresh = !set_initialised_ || tokens <= kSplitSetUpdateTokens ||
+                         narrowest < kSplitPrefillProtectMin;
+
     std::array<std::vector<std::uint32_t>, 3> wanted;
     std::vector<std::uint32_t> ranked; // built once: the ranking is per expert, not per run
     std::vector<bool> chosen(count_, false);
@@ -1580,7 +1814,22 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
     for (std::size_t index = 0; index < split_.size(); ++index) {
         auto& set = wanted[index];
         set.reserve(capacity[index]);
+        if (frozen_ && !split_frozen_[index].empty()) {
+            set = split_frozen_[index];
+            continue;
+        }
         std::fill(chosen.begin(), chosen.end(), false);
+        if (!refresh) {
+            // Hold the set: the pool keeps what it holds, and only the seats it leaves go to this
+            // layer's demand.
+            for (std::uint32_t expert = 0; expert < count_ && set.size() < capacity[index];
+                 ++expert) {
+                if (cache_->expert_slot(split_[index].bank, expert)) {
+                    chosen[expert] = true;
+                    set.push_back(expert);
+                }
+            }
+        }
         for (std::size_t i = 0; i < values && set.size() < capacity[index]; ++i) {
             const auto expert = static_cast<std::uint32_t>(route_ids[i]);
             if (chosen[expert]) { continue; }
@@ -1609,68 +1858,76 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
         }
     }
 
-    // Placement and publication, one run at a time. A run publishes when its set moved OR when its
-    // own generation moved (a prediction/ring placement outside this call would do that; those are
-    // refused here, so in practice only the first applies).
-    bool published_any = false;
+    // Q20 second leg, filled BEFORE the tables are built: a slot claimed after them still holds the
+    // previous expert. Per run: each run's pool set is different, so its complement is too.
+    if (host_ != nullptr && std::getenv("NINFER_SKIP_HOST_FILL") == nullptr) {
+        static thread_local std::vector<std::int32_t> distinct;
+        distinct.assign(route_ids, route_ids + values);
+        std::sort(distinct.begin(), distinct.end());
+        distinct.erase(std::unique(distinct.begin(), distinct.end()), distinct.end());
+        static thread_local std::vector<std::uint8_t> in_wanted;
+        if (in_wanted.size() != count_) { in_wanted.assign(count_, 0); }
+        for (std::size_t index = 0; index < split_.size(); ++index) {
+            auto& targets = split_host_targets_[index];
+            targets.clear();
+            std::fill(in_wanted.begin(), in_wanted.end(), std::uint8_t{0});
+            for (const auto expert : wanted[index]) {
+                if (expert < in_wanted.size()) { in_wanted[expert] = 1; }
+            }
+            for (const auto expert : distinct) {
+                const auto id = static_cast<std::uint32_t>(expert);
+                const bool pool_serves =
+                    refresh ? id < in_wanted.size() && in_wanted[id] != 0
+                            : cache_->expert_slot(split_[index].bank, id).has_value();
+                if (!pool_serves) { targets.push_back(expert); }
+            }
+            // A run's complement can be wider than the tier's dynamic range: three runs price their
+            // experts differently, so one quota cannot cover all three complements (that is why the
+            // static stripe stays on the fused form). Asking the tier for more than it holds is
+            // refused inside the fill, and a refused fill would abort the layer; the documented
+            // answer is that the tier keeps what fits and the CPU half serves the rest, so the
+            // target set is cut to the range, hottest first, and the rest stays a CPU route.
+            if (const auto room = host_->routed_capacity(); targets.size() > room) {
+                std::stable_sort(targets.begin(), targets.end(),
+                                 [&](std::int32_t a, std::int32_t b) {
+                                     const auto sa = hot_score_[static_cast<std::size_t>(a)];
+                                     const auto sb = hot_score_[static_cast<std::size_t>(b)];
+                                     if (sa != sb) { return sa > sb; }
+                                     return a < b;
+                                 });
+                targets.resize(room);
+                std::sort(targets.begin(), targets.end());
+            }
+            if (!targets.empty()) {
+                host_->ensure(ExpertBankId{split_[index].bank},
+                              std::span<const std::int32_t>(targets), nullptr);
+            }
+        }
+        host_->begin_layer();
+    } else {
+        for (auto& targets : split_host_targets_) { targets.clear(); }
+    }
+
+    // Install each run's set, then publish all three.
     demoted_.clear();
     for (std::size_t index = 0; index < split_.size(); ++index) {
-        auto& run = split_[index];
-        const auto& set = wanted[index];
-        const bool moved = cache_->set_resident_experts(
-            run.bank, std::span<const std::uint32_t>(set),
-            static_cast<std::uint32_t>(set.size()));
-        const auto hot_gen      = cache_->hot_generation(run.bank);
-        const auto step_gen     = cache_->step_generation(run.bank);
-        const auto prefetch_gen = cache_->prefetch_generation(run.bank);
-        const bool need_publish = !run.published || run.pub_hot != hot_gen ||
-                                  run.pub_step != step_gen || run.pub_prefetch != prefetch_gen;
-        if (!moved && !need_publish) { continue; }
-
-        run.offsets.assign(count_, 0);
-        std::uint32_t present = 0;
-        for (std::uint32_t expert = 0; expert < count_; ++expert) {
-            const auto slot = cache_->expert_slot(run.bank, expert);
-            if (!slot) {
-                if (index == 0 && expert < run.mask.size() && run.mask[expert] != 0) {
-                    demoted_.push_back(static_cast<std::int32_t>(expert));
-                }
-                run.mask[expert] = 0;
-                continue;
+        (void)cache_->set_resident_experts(split_[index].bank,
+                                           std::span<const std::uint32_t>(wanted[index]),
+                                           static_cast<std::uint32_t>(wanted[index].size()));
+    }
+    std::uint32_t host_routes_gate = 0;
+    for (std::size_t index = 0; index < split_.size(); ++index) {
+        publish_split_run(index, stream, placement_mode);
+        std::uint32_t host_hits = 0;
+        for (std::size_t i = 0; i < values; ++i) {
+            const auto expert = static_cast<std::size_t>(route_ids[i]);
+            if (expert < split_[index].host_flags.size() &&
+                split_[index].host_flags[expert] != 0) {
+                ++host_hits;
             }
-            run.offsets[expert] = cache_->slot_offset(static_cast<std::uint32_t>(*slot));
-            run.mask[expert]    = 1;
-            ++present;
         }
-        const auto table_bytes = static_cast<std::size_t>(count_) * sizeof(std::uint64_t);
-        const auto mask_bytes  = static_cast<std::size_t>(count_) * sizeof(std::int32_t);
-        auto status = cudaMemcpyAsync(run.offsets_device->p, run.offsets.data(), table_bytes,
-                                      cudaMemcpyHostToDevice, stream);
-        if (status == cudaSuccess) {
-            status = cudaMemcpyAsync(run.mask_device->p, run.mask.data(), mask_bytes,
-                                     cudaMemcpyHostToDevice, stream);
-        }
-        if (status != cudaSuccess) {
-            // "We tried to publish" is exactly the state that looks fine and computes with the
-            // previous layer's addresses, so it is refused rather than recorded.
-            run.table_hot = run.table_step = run.table_prefetch = kTableUnknown;
-            throw std::runtime_error(std::string("expert table publish: ") +
-                                     cudaGetErrorString(status));
-        }
-        run.published    = true;
-        run.pub_hot      = hot_gen;
-        run.pub_step     = step_gen;
-        run.pub_prefetch = prefetch_gen;
-        run.table_hot    = hot_gen;
-        run.table_step   = step_gen;
-        run.table_prefetch = prefetch_gen;
-        run.resident     = present;
-        published_any    = true;
-        ++publish_calls_;
-        publish_bytes_ += static_cast<std::uint64_t>(table_bytes + mask_bytes);
-        publish_bytes_max_ = std::max<std::uint64_t>(publish_bytes_max_,
-                                                     static_cast<std::uint64_t>(table_bytes +
-                                                                                mask_bytes));
+        split_[index].host_routes = host_hits;
+        if (index == 0) { host_routes_gate = host_hits; }
     }
 
     // One upload turn for all three runs: the routed keys of each run, deduplicated per bank.
@@ -1724,8 +1981,7 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
     }
 
     // Coverage: the router's own run is the one the ranking is about, so the reported number is the
-    // gate run's. The per-run numbers are reachable through split_mask_host() when a caller needs
-    // them; summing three runs would count every route three times.
+    // gate run's. Summing three runs would count every route three times.
     coverage_.routes += values;
     coverage_.inside += inside_gate;
     if (last_cost_.uploaded == 0) { ++gh1_no_miss_calls_; }
@@ -1738,21 +1994,17 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
             if (expert >= run.mask.size() || run.mask[expert] == 0) { all_addressable = false; }
         }
     }
-    const bool host_bound = published_any || last_cost_.uploaded != 0;
+    const bool host_bound = last_cost_.uploaded != 0;
     if (!host_bound && all_addressable) {
         ++gh1_capt_free_calls_;
         ++gh1_capt_ready_calls_;
-    }
-    if (host_bound || !all_addressable) {
+    } else {
         if (!all_addressable) { ++gh1_captfail_unaddressable_; }
-        if (published_any) { ++gh1_captfail_publish_; }
         if (last_cost_.uploaded != 0) { ++gh1_captfail_upload_; }
     }
-    last_host_routes_ = 0; // this form has no second leg; every route is pool or CPU
-    set_initialised_  = true;
-    // The same panel the fused path prints, on the same cadence: the three-run form must be
-    // describable by the numbers every other stream is judged by, even where a rate has to mean
-    // "the gate run" (see the coverage note above).
+    last_host_routes_    = host_routes_gate;
+    split_host_routes_   = host_routes_gate;
+    set_initialised_     = true;
     gh1_report();
     if (timing) {
         static std::uint64_t calls = 0;
@@ -1761,15 +2013,14 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
         layout_total += last_cost_.layout_ms;
         if (++calls % 40 == 0) {
             std::fprintf(stderr,
-                         "[split] gate/up/down per-layer route=%.3fms layout=%.3fms (of 40 layers)\n",
-                         route_total / 40.0, layout_total / 40.0);
+                         "[split] gate/up/down per-layer route=%.3fms layout=%.3fms host_routes=%.2f "
+                         "of %zu (of 40 layers)\n",
+                         route_total / 40.0, layout_total / 40.0,
+                         static_cast<double>(split_host_routes_) , values);
             route_total = layout_total = 0.0;
         }
     }
-    // The read-ahead's recency signal, kept current even though the read-ahead is refused on this
-    // form: the number is a property of the traffic, and a later version that re-derives the
-    // prediction for three runs should not have to relearn it.
-    if (tokens <= kHotSetUpdateTokens) {
+    if (tokens <= kSplitSetUpdateTokens) {
         prev_routes_.assign(route_ids, route_ids + values);
         std::sort(prev_routes_.begin(), prev_routes_.end());
         prev_routes_.erase(std::unique(prev_routes_.begin(), prev_routes_.end()), prev_routes_.end());

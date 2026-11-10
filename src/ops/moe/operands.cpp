@@ -274,7 +274,8 @@ void MoeOperands::experts(const CudaSwiGLUExperts& w, const RoutedSwiGLUProfile&
             require(view->code_stride >= bytes.codes && view->code_stride < 2 * bytes.codes,
                     "MoE: a split gate/up bank must stride exactly one expert image");
         }
-        require(w.gate.codes != w.up.codes, "MoE: split gate and up banks are the same object");
+        require(w.gate.codes != w.up.codes || w.gate.offsets != w.up.offsets,
+                "MoE: split gate and up banks are the same object");
         matrix(w.gate, p.ffn.gate_up_type, p.ffn.gate_up_layout, p.ffn.intermediate, p.ffn.hidden);
         matrix(w.up, p.ffn.gate_up_type, p.ffn.gate_up_layout, p.ffn.intermediate, p.ffn.hidden);
     } else {

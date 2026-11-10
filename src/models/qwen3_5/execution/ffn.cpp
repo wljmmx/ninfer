@@ -981,6 +981,11 @@ void predict_next_layer(const Tensor& residual, const RoutedMoeParameters& next,
 // workspace: every format this form carries (row-split Q5) has an A16 route that needs none. A
 // matrix that did need an A8/A4 scratch would refuse at the call instead of over-running this
 // arena.
+//
+// The split shape adds the four blocks a layer that cannot hold all three runs needs: the packed
+// host fetch (x, residual, ids, coefficients in one copy), the FP32 Device term, the FP32 host term
+// the merge reads, and the per-expert addressable mask. Whatever the subset, the routed scratch is
+// the same size, so the budget takes the widest of the three shapes instead of the resident one.
 [[nodiscard]] std::size_t split_moe_workspace_bytes(const RoutedMoeParameters& moe,
                                                     std::int32_t min_tokens,
                                                     std::int32_t max_tokens) {
@@ -999,14 +1004,205 @@ void predict_next_layer(const Tensor& residual, const RoutedMoeParameters& next,
     (void)layout.alloc(DType::FP32, {max_tokens});         // shared-expert coefficient
     (void)layout.alloc_bytes(ops::topk_softmax_route_workspace_capacity_bytes(
         route_profile, min_tokens, max_tokens));
-    (void)layout.alloc_bytes(ops::routed_swiglu_workspace_capacity_bytes(
-        routed, ops::ExpertSubsetKind::All, DType::BF16, ops::MoeEpilogue::AddResidual, min_tokens,
-        max_tokens));
+    for (const auto subset : {ops::ExpertSubsetKind::All, ops::ExpertSubsetKind::MaskOnes,
+                              ops::ExpertSubsetKind::MaskZeros, ops::ExpertSubsetKind::None}) {
+        (void)layout.alloc_bytes(ops::routed_swiglu_workspace_capacity_bytes(
+            routed, subset, DType::BF16, ops::MoeEpilogue::AddResidual, min_tokens, max_tokens));
+    }
+    // Split-layer hand-off: one packed read-back, an FP32 Device term, an FP32 host term and the
+    // addressable mask. Only a layer that cannot keep all three runs pays them.
+    (void)layout.alloc_bytes(ops::moe_pack_host_fetch_bytes(
+        static_cast<std::size_t>(hidden) * max_tokens * 2, static_cast<std::size_t>(hidden) * max_tokens * 2,
+        static_cast<std::size_t>(top_k) * max_tokens * 4,
+        static_cast<std::size_t>(top_k) * max_tokens * 4));
+    (void)layout.alloc(DType::FP32, {hidden, max_tokens});   // Device routed term
+    (void)layout.alloc(DType::FP32, {hidden, max_tokens});   // host routed term
+    (void)layout.alloc_bytes(static_cast<std::size_t>(routed.experts) * sizeof(std::int32_t));
     (void)layout.alloc(DType::BF16, {intermediate, max_tokens}); // shared gate
     (void)layout.alloc(DType::BF16, {intermediate, max_tokens}); // shared up
     (void)layout.alloc(DType::BF16, {intermediate, max_tokens}); // SiLU(gate) * up
     (void)layout.alloc(DType::BF16, {hidden, max_tokens});       // shared product
     return layout.peak_bytes(256);
+}
+
+// port (sm_89): the CPU half of a gate/up/down layer.
+//
+// The fused form's host half (host_routed_ffn) reads one bank: the pool run it complements, its
+// completion mask and the tier's entry image for that run. This form has three of everything, so the
+// same steps are taken per run: fill the tier with the experts this half will compute, then address
+// each matrix through its own bank's view. Everything else - the CPU team, the FP32 term, the merge
+// into the BF16 residual - is the same arithmetic and the same order, because a route served here
+// must produce the value the Device half would have produced for it.
+void split_host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParameters& moe,
+                           const ops::ExpertSubset& subset, const Tensor& gpu_term,
+                           Tensor& residual, DeviceExecutionView execution, void* host_term_device) {
+    auto* host = moe.stream->host();
+    if (host == nullptr) { throw std::runtime_error("split host routed ffn: no host tier"); }
+    const auto cols   = residual.ne[0];
+    const auto tokens = residual.ne[1];
+    const auto top_k  = moe.profile.routed.top_k;
+    const auto stream = execution.stream;
+    const auto count  = moe.stream->count();
+    using models::qwen3_5::execution::ExpertMatrixRole;
+
+    static const auto cpu_team = [] {
+        static CpuTopology topology;
+        const auto selectable = cpu_worker_order(topology.info(), false).size();
+        const char* value     = std::getenv("NINFER_CPU_TEAM_SIZE");
+        if (value != nullptr && *value != '\0') {
+            const auto wanted = static_cast<std::size_t>(std::strtoul(value, nullptr, 10));
+            return std::max<std::size_t>(1, std::min(wanted, selectable));
+        }
+        return std::max<std::size_t>(1, selectable);
+    }();
+    static CpuTopology topology;
+    static CpuExecutor executor(topology,
+                                plan_cpu_team(topology.info(), static_cast<std::uint32_t>(cpu_team)));
+    static constexpr std::size_t kSmallTeam    = 4;
+    static constexpr std::size_t kSmallExperts = 4;
+    static CpuExecutor small_executor(
+        topology, plan_cpu_team(topology.info(),
+                                static_cast<std::uint32_t>(std::min(kSmallTeam, cpu_team))));
+    const auto cpu       = executor.execution_view();
+    const auto cpu_small = small_executor.execution_view();
+    static std::optional<CpuExecutionView::ActiveScope> sticky_team;
+    if (std::getenv("NINFER_CPU_TEAM_ACTIVE") != nullptr && !sticky_team) {
+        sticky_team.emplace(cpu.keep_active());
+    }
+
+    std::vector<float> host_out(static_cast<std::size_t>(cols) * tokens);
+    std::vector<float> host_gpu(static_cast<std::size_t>(cols) * tokens);
+    Tensor x_cpu(const_cast<std::uint16_t*>(fetch.x.data()), Device::cpu(), DType::BF16,
+                 {cols, tokens});
+    Tensor out_cpu(host_out.data(), Device::cpu(), DType::FP32, {cols, tokens});
+    ops::ExpertRoutes routes_cpu{
+        Tensor(const_cast<std::int32_t*>(fetch.ids.data()), Device::cpu(), DType::I32, {top_k, tokens}),
+        Tensor(const_cast<float*>(fetch.coefficients.data()), Device::cpu(), DType::FP32,
+               {top_k, tokens})};
+
+    // The experts this half computes: the routes the mask excluded, which on this form means "no
+    // address in any of the three runs".
+    std::vector<std::int32_t> wanted;
+    {
+        const auto* mask = subset.kind == ops::ExpertSubsetKind::MaskZeros && subset.mask.data
+                               ? static_cast<const std::int32_t*>(subset.mask.data)
+                               : nullptr;
+        std::vector<bool> seen(static_cast<std::size_t>(count), false);
+        for (std::size_t i = 0; i < fetch.ids.size(); ++i) {
+            const auto expert = fetch.ids[i];
+            if (expert < 0 || static_cast<std::size_t>(expert) >= seen.size()) { continue; }
+            if (mask != nullptr && mask[expert] != 0) { continue; }
+            if (seen[static_cast<std::size_t>(expert)]) { continue; }
+            seen[static_cast<std::size_t>(expert)] = true;
+            wanted.push_back(expert);
+        }
+    }
+    // One fill per run: each run's bank holds its own matrix, so the tier decides per bank what it
+    // can keep. A tier addressed in place answers immediately (the artifact's pages already are the
+    // image), which is why this costs nothing on an artifact that lives in one container.
+    const auto ensure_begin = std::chrono::steady_clock::now();
+    for (const auto role : {ExpertMatrixRole::Gate, ExpertMatrixRole::Up, ExpertMatrixRole::Down}) {
+        host->ensure(ExpertBankId{moe.stream->split_bank(role)}, wanted, nullptr);
+    }
+    const auto ensure_ms = std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - ensure_begin).count();
+    const bool timing = std::getenv("NINFER_SPLIT_TIMING") != nullptr;
+
+    double cpu_ms = 0.0;
+    if (!wanted.empty()) {
+        const auto bytes = ops::split_routed_swiglu_workspace_capacity_bytes(
+            moe.profile.routed, ops::ExpertSubsetKind::MaskZeros, tokens, tokens);
+        std::vector<std::byte> scratch(bytes + 256);
+        const auto base    = reinterpret_cast<std::uintptr_t>(scratch.data());
+        const auto aligned = (256 - (base & 255)) & 255;
+        MemoryArena arena(MemorySpan{scratch.data() + aligned, bytes, Device::cpu()});
+        ops::CpuSwiGLUExperts views;
+        views.gate = host->experts(ExpertBankId{moe.stream->split_bank(ExpertMatrixRole::Gate)})
+                         .gate_up;
+        views.up = host->experts(ExpertBankId{moe.stream->split_bank(ExpertMatrixRole::Up)}).gate_up;
+        views.down =
+            host->experts(ExpertBankId{moe.stream->split_bank(ExpertMatrixRole::Down)}).gate_up;
+        const auto& cpu_view = wanted.size() <= kSmallExperts ? cpu_small : cpu;
+        const auto cpu_begin = std::chrono::steady_clock::now();
+        ops::routed_swiglu(x_cpu, moe.profile.routed, views, routes_cpu, subset, out_cpu, arena,
+                           cpu_view);
+        cpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                          cpu_begin)
+                     .count();
+    }
+    (void)ensure_ms;
+    if (host_term_device != nullptr) {
+        const auto write_begin = std::chrono::steady_clock::now();
+        CUDA_CHECK(cudaMemcpyAsync(host_term_device, host_out.data(),
+                                   host_out.size() * sizeof(float), cudaMemcpyHostToDevice,
+                                   stream));
+        ops::moe_merge_host_term(host_term_device, gpu_term.data, residual.data,
+                                 static_cast<int>(host_out.size()), stream);
+        if (timing) {
+            static std::uint64_t calls = 0;
+            static double acc[2]       = {0.0, 0.0};
+            const auto write_ms        = std::chrono::duration<double, std::milli>(
+                                             std::chrono::steady_clock::now() - write_begin)
+                                             .count();
+            acc[0] += cpu_ms;
+            acc[1] += write_ms;
+            timeline().host_cpu += cpu_ms;
+            timeline().host_write += write_ms;
+            if (++calls % 40 == 0) {
+                const auto& stats = host->stats();
+                std::fprintf(stderr,
+                             "[host] cpu=%.2fms write=%.2fms (device merge) per token; split form; "
+                             "arena=%u slots hit=%llu miss=%llu evict=%llu\n",
+                             acc[0], acc[1], host->slot_capacity(),
+                             static_cast<unsigned long long>(stats.hits),
+                             static_cast<unsigned long long>(stats.misses),
+                             static_cast<unsigned long long>(stats.evictions));
+                acc[0] = acc[1] = 0.0;
+            }
+        }
+        return;
+    }
+    // No device merge: bring the Device term down and fold it here, in the same order the device
+    // epilogue uses (BF16 residual, then the host term, then the Device term, one RNE rounding).
+    const auto join_begin = std::chrono::steady_clock::now();
+    CUDA_CHECK(cudaMemcpyAsync(host_gpu.data(), gpu_term.data, host_gpu.size() * sizeof(float),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const auto join_ms = std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - join_begin).count();
+    const auto merge_begin = std::chrono::steady_clock::now();
+    std::vector<std::uint16_t> packed(host_out.size());
+    for (std::size_t i = 0; i < host_out.size(); ++i) {
+        const float sum = (__bfloat162float(__ushort_as_bfloat16(fetch.residual[i])) + host_out[i]) +
+                          host_gpu[i];
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &sum, sizeof(bits));
+        const std::uint32_t lsb = (bits >> 16) & 1u;
+        bits += 0x7fffu + lsb;
+        packed[i] = static_cast<std::uint16_t>(bits >> 16);
+    }
+    const auto merge_ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - merge_begin).count();
+    const auto write_begin = std::chrono::steady_clock::now();
+    CUDA_CHECK(cudaMemcpyAsync(residual.data, packed.data(), packed.size() * sizeof(std::uint16_t),
+                               cudaMemcpyHostToDevice, stream));
+    if (timing) {
+        static std::uint64_t calls = 0;
+        static double acc[5]       = {0.0, 0.0, 0.0, 0.0, 0.0};
+        acc[0] += cpu_ms;
+        acc[1] += join_ms;
+        acc[2] += merge_ms;
+        acc[3] += std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - write_begin).count();
+        acc[4] += ensure_ms;
+        if (++calls % 40 == 0) {
+            std::fprintf(stderr,
+                         "[host] cpu=%.2fms join=%.2fms merge=%.2fms write=%.2fms ensure=%.2fms "
+                         "per token; split form\n",
+                         acc[0], acc[1], acc[2], acc[3], acc[4]);
+            for (double& value : acc) { value = 0.0; }
+        }
+    }
 }
 
 // port (sm_89): one layer of the Qwen4Exp form.
@@ -1020,14 +1216,19 @@ void predict_next_layer(const Tensor& residual, const RoutedMoeParameters& next,
 //   shared               = down( silu(gate*x) * up*x )
 //   residual            += coefficient * shared
 //
-// The fused form folds the shared term into the routed epilogue's FP32 accumulator and rounds
-// once. This form cannot: the shared expert is its own projection pair, so its result is a BF16
-// matrix that is added afterwards. That second rounding is the one numerical difference between the
-// two forms, and it is stated here rather than hidden.
+// The routed term has three shapes, exactly as the fused form's does:
 //
-// There is no CPU half. The host tier describes one pool run per layer (ExpertStream::
-// attach_split), so a layer the pool cannot hold in all three runs is refused with its numbers
-// instead of running a routed term that is missing experts.
+//   resident    every run holds every expert: one masked-free pass into the residual;
+//   split       the pool holds what it can, the pinned tier the rest and the CPU half the remainder
+//               - the Device pass writes its FP32 term, the CPU half its own, and one merge folds
+//               residual + cpu + device so the layer rounds once;
+//   fallback    a run has no seat at all: the whole routed term is the CPU half's.
+//
+// The fused form folds the shared term into the routed epilogue's FP32 accumulator and rounds once.
+// This form cannot: the shared expert is its own projection pair, so its result is a BF16 matrix that
+// is added afterwards. That second rounding is the one numerical difference between the two forms,
+// and it is stated here rather than hidden. It is also the same in all three shapes, which is why a
+// route computed on the CPU and one computed on the Device still land in the same layer arithmetic.
 void split_moe_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& residual,
                    WorkspaceArena& workspace, DeviceExecutionView execution) {
     const auto stream       = execution.stream;
@@ -1036,23 +1237,10 @@ void split_moe_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor&
     const auto top_k        = routed.top_k;
     const auto hidden_rows  = routed.ffn.hidden;
     const auto intermediate = routed.ffn.intermediate;
-    if (moe.stream != nullptr) {
-        // Every run of this stream has to hold the whole layer; a shortfall is not a split layer
-        // here, it is a layer this form cannot run at all.
-        const auto seats = [&](models::qwen3_5::execution::ExpertMatrixRole role) {
-            return moe.stream->split_resident_capacity(role);
-        };
-        const auto count = moe.stream->count();
-        if (!moe.stream->fully_resident()) {
-            throw std::runtime_error(
-                moe.split->parameter + ": the expert pool cannot hold this layer - it keeps " +
-                std::to_string(seats(models::qwen3_5::execution::ExpertMatrixRole::Gate)) + "/" +
-                std::to_string(seats(models::qwen3_5::execution::ExpertMatrixRole::Up)) + "/" +
-                std::to_string(seats(models::qwen3_5::execution::ExpertMatrixRole::Down)) +
-                " (gate/up/down) of the " + std::to_string(count) +
-                " experts every run needs, and the gate/up/down form has no host tier or CPU half "
-                "to serve the rest");
-        }
+    if (!moe.split.has_value()) {
+        throw std::invalid_argument(moe.profile.routed.experts > 0
+                                        ? "split MoE layer has no split description"
+                                        : "split MoE layer has an empty routed profile");
     }
 
     Tensor ids          = workspace.alloc(DType::I32, {top_k, columns});
@@ -1067,24 +1255,111 @@ void split_moe_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor&
         ops::topk_softmax_route(hidden, route_profile, moe.control, routes, shared_coeff, arena,
                                 execution);
     }
+
+    const bool streaming = moe.stream != nullptr;
+    const bool resident  = !streaming || moe.stream->fully_resident();
     {
         const auto block = workspace.alloc_bytes(ops::routed_swiglu_workspace_capacity_bytes(
             routed, ops::ExpertSubsetKind::All, DType::BF16, ops::MoeEpilogue::AddResidual, columns,
             columns));
         MemoryArena arena(MemorySpan{block.data, block.bytes, execution.device()});
-        if (moe.stream != nullptr) {
-            // Place this layer's experts and settle the upload on the layer's stream; the kernels
-            // below are queued behind it. `fully_resident` above is the capacity statement, this is
-            // the placement, and a refusal here means the pool changed under the layer.
-            if (!moe.stream->ensure(routes.ids.data, top_k, columns, stream)) {
-                throw std::runtime_error(
-                    moe.split->parameter +
-                    ": the expert pool refused this layer's placement (gate/up/down form)");
+        const auto& experts = streaming ? moe.stream->experts() : moe.routed;
+        if (resident) {
+            // Today's path, unchanged: every route is addressable, so the pass reads the whole layer
+            // and adds it into the residual. A pool that holds the layer is bit-identical to the
+            // behaviour before the layering existed.
+            if (streaming && !moe.stream->ensure(routes.ids.data, top_k, columns, stream)) {
+                throw std::runtime_error(moe.split->parameter +
+                                         ": the expert pool refused this layer's placement "
+                                         "(gate/up/down form)");
+            }
+            ops::routed_swiglu(hidden, routed, experts, routes, ops::ExpertSubset{},
+                               ops::MoeEpilogue::AddResidual, residual, arena, execution);
+        } else {
+            // Split layer. The tier's routes are the ones the pool cannot hold: fetch what the CPU
+            // half needs first (it syncs), hand the ids to ensure() so the placement costs no second
+            // read-back, then let the two halves run concurrently.
+            const std::size_t handoff_x    = static_cast<std::size_t>(hidden.ne[0]) * columns;
+            const std::size_t handoff_ids  = static_cast<std::size_t>(top_k) * columns;
+            static const bool pack_read_back = std::getenv("NINFER_DMA_PACK") == nullptr ||
+                                               std::getenv("NINFER_DMA_PACK")[0] != '0';
+            auto pack_span = workspace.alloc_bytes(ops::moe_pack_host_fetch_bytes(
+                handoff_x * 2, handoff_x * 2, handoff_ids * 4, handoff_ids * 4));
+            auto host_term_span = workspace.alloc_bytes(handoff_x * sizeof(float));
+            void* host_term_device = std::getenv("NINFER_HOST_MERGE_CPU") != nullptr
+                                         ? nullptr
+                                         : host_term_span.data;
+            auto fetch = fetch_host_routed(hidden, routes, residual, stream,
+                                           pack_read_back ? pack_span.data : nullptr);
+            if (!moe.stream->ensure(ids.data, top_k, columns, stream, fetch.ids.data())) {
+                throw std::runtime_error(moe.split->parameter +
+                                         ": the expert pool refused this layer's placement "
+                                         "(gate/up/down form)");
+            }
+            // Addressable = every run has it. A route whose gate is in the pool and whose down is
+            // not has no address for the down GEMM, so the expert is the CPU half's - and the CPU
+            // reads all three matrices from the tier, which is what makes that answer complete.
+            std::vector<std::int32_t> addressable(static_cast<std::size_t>(moe.stream->count()), 1);
+            const auto mask_of = [&](models::qwen3_5::execution::ExpertMatrixRole role) {
+                return moe.stream->split_mask_host(role);
+            };
+            for (const auto role : {models::qwen3_5::execution::ExpertMatrixRole::Gate,
+                                    models::qwen3_5::execution::ExpertMatrixRole::Up,
+                                    models::qwen3_5::execution::ExpertMatrixRole::Down}) {
+                const auto mask = mask_of(role);
+                for (std::size_t expert = 0; expert < addressable.size() && expert < mask.size();
+                     ++expert) {
+                    if (mask[expert] == 0) { addressable[expert] = 0; }
+                }
+            }
+            std::uint64_t missing = 0;
+            for (const auto id : fetch.ids) {
+                if (id >= 0 && static_cast<std::size_t>(id) < addressable.size() &&
+                    addressable[static_cast<std::size_t>(id)] == 0) {
+                    ++missing;
+                }
+            }
+            const auto mask_span = workspace.alloc_bytes(addressable.size() * sizeof(std::int32_t));
+            Tensor addressable_device(mask_span.data, execution.device(), DType::I32,
+                                      {static_cast<std::int32_t>(addressable.size())});
+            CUDA_CHECK(cudaMemcpyAsync(addressable_device.data, addressable.data(),
+                                       addressable.size() * sizeof(std::int32_t),
+                                       cudaMemcpyHostToDevice, stream));
+            // The Device half writes the routed term of the experts it can address (FP32, no
+            // residual); the CPU half computes the rest; one merge folds both into the residual.
+            auto mixed_f32 = workspace.alloc(DType::FP32, {hidden.ne[0], columns});
+            const bool any_addressable = missing < fetch.ids.size();
+            if (any_addressable) {
+                ops::routed_swiglu(hidden, routed, experts, routes,
+                                   ops::ExpertSubset{ops::ExpertSubsetKind::MaskOnes,
+                                                     addressable_device},
+                                   ops::MoeEpilogue::Write, mixed_f32, arena, execution);
+            } else {
+                // Nothing to run on the Device; `None` still has to leave a zero term because the
+                // merge below adds it.
+                ops::routed_swiglu(hidden, routed, experts, routes,
+                                   ops::ExpertSubset{ops::ExpertSubsetKind::None, {}},
+                                   ops::MoeEpilogue::Write, mixed_f32, arena, execution);
+            }
+            Tensor host_mask(addressable.data(), Device::cpu(), DType::I32,
+                             {static_cast<std::int32_t>(addressable.size())});
+            split_host_routed_ffn(fetch, moe,
+                                  ops::ExpertSubset{ops::ExpertSubsetKind::MaskZeros, host_mask},
+                                  mixed_f32, residual, execution, host_term_device);
+            if (std::getenv("NINFER_SPLIT_TIMING") != nullptr) {
+                static std::uint64_t layers = 0, routes = 0, covered = 0;
+                routes += fetch.ids.size();
+                covered += fetch.ids.size() - missing;
+                if (++layers % 40 == 0) {
+                    std::fprintf(stderr,
+                                 "[split-form] addressable=%.2f of %.2f routes/layer (host_routes=%u)\n",
+                                 static_cast<double>(covered) / 40.0,
+                                 static_cast<double>(routes) / 40.0,
+                                 moe.stream->split_host_routes());
+                    routes = covered = 0;
+                }
             }
         }
-        const auto& experts = moe.stream != nullptr ? moe.stream->experts() : moe.routed;
-        ops::routed_swiglu(hidden, routed, experts, routes, ops::ExpertSubset{},
-                           ops::MoeEpilogue::AddResidual, residual, arena, execution);
     }
     // The shared expert, as its own BF16 projection pair. Its coefficient is the sigmoid of the
     // shared logit the routing op just wrote, applied to the term as it enters the residual.

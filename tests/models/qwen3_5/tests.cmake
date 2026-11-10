@@ -93,6 +93,16 @@ set_tests_properties(ninfer_qwen3_5_expert_stream_split_test PROPERTIES
   LABELS "gpu"
   RUN_SERIAL TRUE)
 
+# port (sm_89): the gate/up/down form's LAYERED execution, numerically: a pool that holds only part
+# of a layer plus a pinned tier for part of the rest, the CPU half for what neither leg can hold, and
+# the per-run placement tables - all against an FP64 decode of the same bytes.
+ninfer_add_test(ninfer_qwen3_5_expert_stream_split_layers_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_stream_split_layers.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_ops ninfer_core)
+set_tests_properties(ninfer_qwen3_5_expert_stream_split_layers_test PROPERTIES
+  LABELS "gpu"
+  RUN_SERIAL TRUE)
+
 # v8 13.5 (step 5): runtime pool / KV reallocation under a real 4-way load. The contract: the
 # idle double read refuses a resize while requests are in flight, the frozen-graph pin refuses
 # at construction, and a grow->shrink round trip at a request boundary leaves the pool

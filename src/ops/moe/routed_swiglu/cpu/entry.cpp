@@ -1,6 +1,7 @@
 #include "ninfer/ops/moe.h"
 #include "ops/common/host/operands.h"
 #include "ops/moe/routed_swiglu/cpu/dispatch.h"
+#include "ops/moe/routed_swiglu/cpu/split.h"
 #include "ops/moe/workspace.h"
 
 #include <array>
@@ -153,16 +154,33 @@ std::size_t routed_swiglu_workspace_capacity_bytes(const RoutedSwiGLUProfile& pr
     return subset == ExpertSubsetKind::None ? 0 : shape.capacity(last);
 }
 
+// port (sm_89): the gate/up/down form's CPU half. Its mats do not belong to a fused shape family,
+// so the scratch is the activation plane alone: [intermediate, tokens] FP32.
+std::size_t split_routed_swiglu_workspace_capacity_bytes(const RoutedSwiGLUProfile& profile,
+                                                         ExpertSubsetKind subset,
+                                                         std::int32_t first, std::int32_t last) {
+    impl::validate_capacity(subset, first, last);
+    if (subset == ExpertSubsetKind::None) { return 0; }
+    if (profile.ffn.hidden <= 0 || profile.ffn.intermediate <= 0) {
+        throw std::invalid_argument("routed_swiglu CPU: empty split profile");
+    }
+    return impl::split_capacity(profile.ffn.intermediate, last);
+}
+
 void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
                    const CpuSwiGLUExperts& experts, const ExpertRoutes& routes, ExpertSubset subset,
                    Tensor& destination, MemoryArena& workspace, CpuExecutionView execution,
                    std::uint32_t* missed_routes) {
     // The CPU half of a split layer runs exactly the routes its mask kept, so it never skips one.
     (void)missed_routes;
-    const auto& shape = impl::shape_dispatch(profile);
-    const int tokens  = x.ne[1];
+    const bool split_form = experts.gate.parent != nullptr || experts.up.parent != nullptr;
+    const int tokens      = x.ne[1];
     impl::validate_capacity(subset.kind, tokens, tokens);
-    const auto capacity = subset.kind == ExpertSubsetKind::None ? 0 : shape.capacity(tokens);
+    const auto capacity =
+        subset.kind == ExpertSubsetKind::None
+            ? std::size_t{0}
+            : split_form ? impl::split_capacity(profile.ffn.intermediate, tokens)
+                         : impl::shape_dispatch(profile).capacity(tokens);
     // port (sm_89): NINFER_CPU_TIMING separates the per-call setup (operand validation, route
     // bookkeeping, the scratch cursor) from the kernels. At a split layer's granularity the setup is
     // paid once per layer per token, so it competes with the arithmetic.
@@ -226,6 +244,37 @@ void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
         std::memset(destination.data, 0, destination.bytes());
         return;
     }
+    // port (sm_89): the gate/up/down form. Each matrix is validated against its own row domain:
+    // gate and up are I rows wide, down is H rows — the fused 2I row map is not this form's.
+    if (split_form) {
+        require(experts.gate_up.parent == nullptr,
+                "routed_swiglu CPU: a split gate/up bank cannot carry a fused gate_up view");
+        require(experts.up.parent != nullptr, "routed_swiglu CPU: split gate without an up bank");
+        require(experts.down.parent != nullptr, "routed_swiglu CPU: split form without a down bank");
+        operands.bank(experts.gate, profile.ffn.gate_up_type, profile.ffn.gate_up_layout,
+                      profile.ffn.intermediate, profile.ffn.hidden, profile.experts, selected);
+        operands.bank(experts.up, profile.ffn.gate_up_type, profile.ffn.gate_up_layout,
+                      profile.ffn.intermediate, profile.ffn.hidden, profile.experts, selected);
+        operands.bank(experts.down, profile.ffn.down_type, profile.ffn.down_layout,
+                      profile.ffn.hidden, profile.ffn.intermediate, profile.experts, selected);
+        auto scope = scratch.scope();
+        impl::split_launch(x, experts, routes, subset, destination, scratch, execution,
+                           profile.ffn.hidden, profile.ffn.intermediate, profile.experts,
+                           profile.top_k);
+        if (timing) {
+            const auto launch_ms = std::chrono::duration<double, std::milli>(
+                                       std::chrono::steady_clock::now() - started).count();
+            static double accumulated = 0.0;
+            static std::uint64_t calls = 0;
+            accumulated += launch_ms;
+            if (++calls % 40 == 0) {
+                std::fprintf(stderr, "[cpu] split form %.3fms per layer\n", accumulated / 40.0);
+                accumulated = 0.0;
+            }
+        }
+        return;
+    }
+    const auto& shape = impl::shape_dispatch(profile);
     operands.bank(experts.gate_up, profile.ffn.gate_up_type, profile.ffn.gate_up_layout,
                   2 * profile.ffn.intermediate, profile.ffn.hidden, profile.experts, selected);
     operands.bank(experts.down, profile.ffn.down_type, profile.ffn.down_layout, profile.ffn.hidden,

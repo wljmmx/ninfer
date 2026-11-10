@@ -65,6 +65,12 @@ struct CudaSwiGLUExperts {
 
 struct CpuSwiGLUExperts {
     WeightBankView gate_up, down;
+    // port (sm_89): the gate/up/down form on the host side. Qwen4Exp stores an expert's gate and up
+    // as two objects, so the fused [2I,H] row map cannot describe them (row I of the gate object is
+    // the next expert's first gate row). Each view names one image of `intermediate` rows per
+    // expert; `gate_up` must stay default-constructed while they are set, and the CPU op refuses a
+    // bank that names both forms.
+    WeightBankView gate, up;
 };
 
 struct SwiGLUWeights {
@@ -194,6 +200,13 @@ void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
                                                                  ExpertSubsetKind subset,
                                                                  std::int32_t min_tokens,
                                                                  std::int32_t max_tokens);
+// port (sm_89): the CPU half of the gate/up/down form. Same contract as the fused query above, but
+// the scratch is the activation plane of that form ([intermediate, tokens] FP32), because the three
+// matrices are addressed per expert instead of through one [2I,H] parent.
+[[nodiscard]] std::size_t
+split_routed_swiglu_workspace_capacity_bytes(const RoutedSwiGLUProfile& profile,
+                                            ExpertSubsetKind subset, std::int32_t min_tokens,
+                                            std::int32_t max_tokens);
 // `missed_routes` is accepted for signature parity and ignored: the CPU half of a split layer runs
 // exactly the routes the mask kept, so it never skips one.
 void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,

@@ -367,7 +367,7 @@ int main() {
             fail("the second layer moved nothing into the pool");
         }
         // The demotion journal is what the warm tier admits from; on this form it is the gate run's
-        // answer (the host tier itself is refused).
+        // answer (each run prices its own seats, so each run has its own set to demote from).
         const auto demoted = stream.demoted_this_step();
         for (const auto expert : {5, 6}) {
             bool listed = false;
@@ -378,27 +378,30 @@ int main() {
             }
         }
 
-        // The refusal is part of the contract, not a detail: a run that asks for the host tier or the
-        // read-ahead on this form must be told, not quietly served the plain streaming path under
-        // the switch's name. Nothing here touches the attached stream.
+        // The switches that used to be refused on this form are applied per run now: a tier bank, a
+        // GH3 placement word, a prediction region and a fixed seat ring exist once per matrix, so a
+        // run that asks for one is served rather than told. What stays pinned here is the wiring:
+        // attach_split() accepts them, and the question the engine asks before building a tier
+        // answers yes (the three-run form carries one tier bank per run).
         {
             _putenv_s("NINFER_PREFETCH", "1");
-            bool refused = false;
+            bool accepted = false;
             try {
                 ExpertStream other(kExperts, desc(gate_layout, gate_geometry, 4000),
                                    desc(gate_layout, gate_geometry, 5000),
                                    desc(down_layout, down_geometry, 6000));
                 other.attach_split(cache, 0, requirements.banks[0], 1, requirements.banks[1], 2,
                                    requirements.banks[2]);
+                accepted = true;
             } catch (const std::logic_error&) {
-                refused = true;
+                accepted = false;
             }
             _putenv_s("NINFER_PREFETCH", "");
-            if (!refused) {
-                fail("attach_split() accepted a switch that is defined over one pool run per layer");
+            if (!accepted) {
+                fail("attach_split() refused a switch that is now applied per run");
             }
-            if (stream.host_tier_supported()) {
-                fail("host_tier_supported() did not answer false for the three-run form");
+            if (!stream.host_tier_supported()) {
+                fail("host_tier_supported() refused the three-run form, which has a tier per run");
             }
         }
 
