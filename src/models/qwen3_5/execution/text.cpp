@@ -1321,15 +1321,12 @@ void TextContext::hc_stem(Tensor& embedding, std::int32_t tokens) {
                         ctx_.execution_view());
 }
 
-void TextContext::hc_mix_into(const HcParameters& weights, bool block_form, std::int32_t tokens) {
+void TextContext::hc_mix_into(const HcParameters& weights, std::int32_t tokens) {
     const auto normalized = hc_.normalized.view({dimension(config_.hidden_size),
                                                  dimension(config_.hc->count), tokens});
-    if (block_form) {
-        ops::hc_mix(normalized, weights.block_form(), work_, hc_.input, hc_.injection,
-                    ctx_.execution_view());
-    } else {
-        ops::hc_mix(normalized, weights.final_form(), work_, hc_.input, ctx_.execution_view());
-    }
+    // Produces the block's single-stream input and the four coefficients its correction applies.
+    ops::hc_mix(normalized, weights.block_form(), work_, hc_.input, hc_.injection,
+                ctx_.execution_view());
 }
 
 void TextContext::hc_combine(const Tensor& product, const Tensor& norm_weight,
@@ -1751,13 +1748,13 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 if (full) {
                     if (indexed) { note_indexed_mixer_deferred(); }
                     if (hc) {
-                        hc_mix_into(*block.input_hc, true, tokens);
+                        hc_mix_into(*block.input_hc, tokens);
                         folded = &hc_.input;
                     }
                     attn_mix(block, product, compact, ph, folded);
                 } else {
                     if (hc) {
-                        hc_mix_into(*block.input_hc, true, tokens);
+                        hc_mix_into(*block.input_hc, tokens);
                         folded = &hc_.input;
                     }
                     gdn_mix(block, product, compact, ph, folded);
@@ -1766,7 +1763,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     // The mixer's product goes back through the four streams behind the MoE norm,
                     // then the MoE's own fold.
                     hc_combine(product, block.post_attention_norm, tokens);
-                    hc_mix_into(*block.post_attention_hc, true, tokens);
+                    hc_mix_into(*block.post_attention_hc, tokens);
                     folded = &hc_.input;
                 }
                 if (trace_stage) {

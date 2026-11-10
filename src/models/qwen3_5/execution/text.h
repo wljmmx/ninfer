@@ -213,7 +213,7 @@ private:
     // normalized view to a single stream, and the correction splits the product back out.
     [[nodiscard]] bool hc_enabled() const noexcept { return final_hc_ != nullptr; }
     void hc_stem(Tensor& embedding, std::int32_t tokens);
-    void hc_mix_into(const HcParameters& weights, bool block_form, std::int32_t tokens);
+    void hc_mix_into(const HcParameters& weights, std::int32_t tokens);
     void hc_combine(const Tensor& product, const Tensor& norm_weight, std::int32_t tokens);
     // The last hidden the head reads: the final correction's fold, or the plain final norm.
     void final_hidden(Tensor& x, Tensor& out, std::int32_t tokens);
