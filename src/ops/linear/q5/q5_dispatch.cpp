@@ -91,6 +91,17 @@ Q5Launch select_q5_v2_prefill(std::int32_t n, std::int32_t k, std::int32_t t) {
             if (t <= 8) return launch_q5_simt_r8_c4;
             return launch_q5_mma_r64_c128;
         }
+        // Qwen4Exp vocabulary head [248320,2560]: the artifact's largest Q5 matrix (398 MiB of
+        // codes/high bits over 40 whole 64-wide K groups). N = 248320 = 64 * 3880 = 8 * 31040, so
+        // both shape-generic routes tile it exactly and no partial row tile is left over; the
+        // 1940/970 splits only matter to kernels that quantize by 128/256, which these two do not.
+        // The head runs at T = 1 for every decoded token and once per prefill column, so SIMT takes
+        // the small-T end and the row-tiled MMA the rest, exactly as for the sibling K = 2560
+        // projections above.
+        if (n == 248320) {
+            if (t <= 8) return launch_q5_simt_r8_c4;
+            return launch_q5_mma_r64_c128;
+        }
         break;
     case 640:
         if (n == 2560) {

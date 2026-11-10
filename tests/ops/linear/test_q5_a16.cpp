@@ -156,6 +156,20 @@ int q5_a16_conformance() {
     failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5_g64_fp16_weight,
                           {512, 2560, 227U, Comparison::Sampled, false, kN512K2560});
 
+    // Qwen4Exp vocabulary head [248320,2560]: the artifact's largest Q5 matrix (398 MiB of codes
+    // and high bits) and the one projection that runs on every decoded token. 248320 = 64 * 3880 =
+    // 8 * 31040, so neither shape-generic route has a partial row tile to mask, and K = 2560 is 40
+    // whole 64-wide K groups equal to the stored padded K. The token counts walk the SIMT/MMA
+    // hand-off (8 then 9), both 128-column rungs of the row-tiled MMA, and the 512-column wave with
+    // its one-column tail; every case replays through a captured graph, which is how decode runs
+    // the head. Sampling keeps the FP64 oracle to 32 rows x 32 columns, but the sample is inclusive
+    // of row n-1, i.e. the last row of the final 64-row tile.
+    constexpr std::array kN248320K2560{graph(1),   graph(2),   graph(7),   graph(8),   graph(9),
+                                       graph(16),  graph(17),  graph(64),  graph(127), graph(128),
+                                       graph(129), graph(511), graph(512), graph(513)};
+    failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5_g64_fp16_weight,
+                          {248320, 2560, 233U, Comparison::Sampled, true, kN248320K2560});
+
     return failures;
 }
 
