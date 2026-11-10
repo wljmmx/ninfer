@@ -101,8 +101,9 @@ std::uint64_t fnv1a64(const void* data, std::size_t bytes) {
     return hash;
 }
 
+// `columns` is the pass's column extent, or zero for a plane that keeps one file per layer.
 void qsa_dump_tensor(const char* variable, const char* name, const Tensor& value, int layer,
-                     cudaStream_t stream) {
+                     std::int32_t columns, cudaStream_t stream) {
     const char* directory = std::getenv(variable);
     if (directory == nullptr || *directory == '\0' || layer != qsa_dump_layer()) { return; }
     if (value.data == nullptr || !value.is_contiguous()) {
@@ -116,6 +117,12 @@ void qsa_dump_tensor(const char* variable, const char* name, const Tensor& value
     path += name;
     path += "_layer";
     path += std::to_string(layer);
+    // The column extent names the call: a prefill chunk and a decode step write different files, so
+    // a comparison can pick the pass it means instead of racing the last write.
+    if (columns > 0) {
+        path += "_T";
+        path += std::to_string(columns);
+    }
     path += ".bin";
     if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
         (void)std::fwrite(host.data(), 1, host.size(), file);
@@ -1617,6 +1624,12 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
     text_rope(rope_for_op, *config_.rope_parameters, qn, kn, ctx_.execution_view());
+    // Diagnosis: the normalized-and-rotated Q/K/V the dense arm feeds its append, so the same
+    // tensors can be compared against prepare's own output instead of being inferred through
+    // attention.
+    qsa_dump_tensor("NINFER_QSA_LAYER_DUMP", "query", qn, fidx, T, s);
+    qsa_dump_tensor("NINFER_QSA_LAYER_DUMP", "key_in", kn, fidx, T, s);
+    qsa_dump_tensor("NINFER_QSA_LAYER_DUMP", "value_in", v, fidx, T, s);
 
     Tensor a = results.attention.view({dimension(config_.attention->head_dim),
                                        dimension(config_.attention->num_attention_heads), T});
@@ -1662,12 +1675,14 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     ops::sigmoid_mul(gate, a, s);
     // The same file the sparse arm writes: the two arms' attention outputs are the S3 gate.
     qsa_dump_tensor("NINFER_QSA_LAYER_DUMP", "attention",
-                    a.view({dimension(config_.attention->query_width()), T}), fidx, s);
+                    a.view({dimension(config_.attention->head_dim),
+                            dimension(config_.attention->num_attention_heads), T}),
+                    fidx, T, s);
     // This arm appends through the dense Op, so its K plane is the reference the byte gate compares
     // prepare's write against.
     qsa_dump_tensor("NINFER_QSA_KV_DUMP", "main_key",
                     batch_text_kv_->batch_layer_view(static_cast<std::uint32_t>(fidx)).k_pages, fidx,
-                    s);
+                    0, s);
 
     {
         Tensor attn_out = a.view({dimension(config_.attention->query_width()), T});
@@ -2029,12 +2044,31 @@ void TextContext::qsa_mix(const BlockParameters& w, Tensor& x, int fidx, Phase, 
     Tensor prepared_index_query = projected.index_query;
     ops::qsa_prepare(projected, prepare_parameters, batch_view, rope, before, cache, records,
                      prepared_query, prepared_index_query, execution);
+    // Same names the dense arm writes: its post-norm/post-RoPE Q and its pre-append V.
+    qsa_dump_tensor("NINFER_QSA_LAYER_DUMP", "query",
+                    prepared_query.view({head_dim, query_hd, T}), fidx, T, s);
+    qsa_dump_tensor("NINFER_QSA_LAYER_DUMP", "value_in",
+                    projected.value.view({head_dim, kv_heads, T}), fidx, T, s);
 
     // The envelope is the resolved capacity, which is also what the startup plan priced: a host
     // launch promise, fixed across every replay, never a mask.
     const auto visible = std::min<std::uint32_t>(kv_.max_context(), 262144U);
     Tensor attention   = qsa.attention.view({head_dim, query_hd, T, batch});
-    if (qsa_dense_read() && batch == 1) {
+    // The read-only dense Op takes one execution row's own table, which only a single-lane pass
+    // carries; a batch traversal binds its tables through `batch_text_kv_` instead, so it stays on
+    // the sparse arm even under the switch.
+    const bool dense_read = qsa_dense_read() && batch == 1 && kv_.valid();
+    if (qsa_dense_read() && !dense_read) {
+        static const bool told = [] {
+            std::fprintf(stderr,
+                         "[qsa] NINFER_QSA_DENSE_READ has no read-only row for this pass; the "
+                         "layer runs the sparse arm\n");
+            std::fflush(stderr);
+            return true;
+        }();
+        (void)told;
+    }
+    if (dense_read) {
         // S2's own stage: prepare owns the cache, and the dense Op reads that cache back without
         // appending anything (`prepared_query` is already the normalized, rotated query).
         Tensor dense_out = attention.view({head_dim, query_hd, T});
@@ -2066,9 +2100,9 @@ void TextContext::qsa_mix(const BlockParameters& w, Tensor& x, int fidx, Phase, 
     ops::qsa_tail_extract(before, read_records, valid_columns,
                           qsa_tail_view(fidx, destination_slots), execution);
 
-    qsa_dump_tensor("NINFER_QSA_KV_DUMP", "main_key", main_cache.k_pages, fidx, s);
-    qsa_dump_tensor("NINFER_QSA_KV_DUMP", "index_key", index_cache.keys, fidx, s);
-    qsa_dump_tensor("NINFER_QSA_LAYER_DUMP", "attention", qsa.attention, fidx, s);
+    qsa_dump_tensor("NINFER_QSA_KV_DUMP", "main_key", main_cache.k_pages, fidx, 0, s);
+    qsa_dump_tensor("NINFER_QSA_KV_DUMP", "index_key", index_cache.keys, fidx, 0, s);
+    qsa_dump_tensor("NINFER_QSA_LAYER_DUMP", "attention", attention, fidx, T, s);
 
     {
         Tensor attn_out = qsa.attention.view({query_w, T});
