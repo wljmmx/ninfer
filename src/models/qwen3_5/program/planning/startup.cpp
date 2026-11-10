@@ -431,10 +431,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     (void)workspace::text_attention_projection(layout, config, last);
                     scratch(layout, execution::attention_projection_workspace_bytes(*attention,
                                                                                     first, last));
+                    // `indexed` is false on a plain attention layer and on the FORCE_FULL reference
+                    // arm, both of which run the dense mixer.
                     const bool indexed =
                         attention->indexer.has_value() && !qsa_dense_probe;
-                    if (!indexed || qsa_read_probe) {
+                    if (!indexed) {
                         (void)workspace::text_attention_results(layout, config, last);
+                    }
+                    if (!indexed || qsa_read_probe) {
                         scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
                                             {dimension(config.attention->head_dim),
                                              dimension(config.attention->num_attention_heads),
@@ -448,9 +452,6 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                         linear_scratch(layout, attention->indexer->query, first, last);
                         linear_scratch(layout, attention->indexer->key, first, last);
                         (void)workspace::qsa_roots(layout, config, last);
-                        if (qsa_read_probe) {
-                            (void)workspace::qsa_dense_query(layout, config, last);
-                        }
                         scratch(layout, execution::qsa_indexer_workspace_bytes(qsa_inputs));
                         scratch(layout, execution::qsa_sparse_gqa_workspace_bytes(qsa_inputs));
                     }

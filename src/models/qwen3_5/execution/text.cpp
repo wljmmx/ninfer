@@ -5,6 +5,7 @@
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/expert_stream.h"
 #include "models/qwen3_5/execution/mtp.h"
+#include "models/qwen3_5/execution/qsa.h"
 #include "models/qwen3_5/execution/shape_class.h"
 #include "models/qwen3_5/execution/workspace.h"
 
@@ -31,6 +32,7 @@
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/mtp_pack.h"
 #include "ninfer/ops/position.h"
+#include "ninfer/ops/qsa.h"
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
@@ -59,14 +61,14 @@
 namespace ninfer::models::qwen3_5::execution {
 namespace {
 
-// An indexed layer is a full-attention mixer whose softmax runs over the indexer's selected KV
-// blocks. The indexer (QSA) is not wired into the layer yet, so the layer runs the full-attention
-// path; saying so once keeps a run from being mistaken for the real mixer.
-void note_indexed_mixer_deferred() {
+// An indexed layer runs `qsa_mix` unless NINFER_QSA_FORCE_FULL asks for the dense mixer, which is
+// the reference arm the byte and output gates compare against. Saying so once keeps a reference run
+// from being mistaken for the real mixer.
+void note_dense_indexed_arm() {
     static const bool told = [] {
         std::fprintf(stderr,
-                     "[qsa] indexed layers run the full-attention path: block selection is not "
-                     "wired yet\n");
+                     "[qsa] NINFER_QSA_FORCE_FULL: the indexed layers run the dense mixer (the "
+                     "reference arm)\n");
         std::fflush(stderr);
         return true;
     }();
@@ -78,6 +80,80 @@ void project(const Tensor& x, const LinearParameters& parameters, Tensor& out,
     ops::linear(x, parameters.weight, out, parameters.policy, workspace, stream);
 }
 
+// Diagnosis: the two QSA gates compare bytes produced by two different runs of the same prefix, so
+// the only usable evidence is a file dump plus a stream hash. NINFER_QSA_KV_DUMP=dir writes the
+// main K plane and the index plane prepare wrote; NINFER_QSA_LAYER_DUMP=dir writes the indexed
+// layer's attention output as the dense arm and the sparse arm produce it. Both dump one layer,
+// NINFER_QSA_DUMP_LAYER (default 3, the artifact's first indexed layer).
+int qsa_dump_layer() {
+    const char* value = std::getenv("NINFER_QSA_DUMP_LAYER");
+    if (value == nullptr || *value == '\0') { return 3; }
+    return static_cast<int>(std::strtol(value, nullptr, 10));
+}
+
+std::uint64_t fnv1a64(const void* data, std::size_t bytes) {
+    const auto* bytes_in = static_cast<const std::uint8_t*>(data);
+    std::uint64_t hash   = 1469598103934665603ULL;
+    for (std::size_t i = 0; i < bytes; ++i) {
+        hash ^= bytes_in[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+void qsa_dump_tensor(const char* variable, const char* name, const Tensor& value, int layer,
+                     cudaStream_t stream) {
+    const char* directory = std::getenv(variable);
+    if (directory == nullptr || *directory == '\0' || layer != qsa_dump_layer()) { return; }
+    if (value.data == nullptr || !value.is_contiguous()) {
+        throw std::logic_error("QSA dump needs a contiguous device tensor");
+    }
+    std::vector<std::uint8_t> host(value.bytes());
+    CUDA_CHECK(cudaMemcpyAsync(host.data(), value.data, host.size(), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::string path(directory);
+    path += "\\";
+    path += name;
+    path += "_layer";
+    path += std::to_string(layer);
+    path += ".bin";
+    if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
+        (void)std::fwrite(host.data(), 1, host.size(), file);
+        (void)std::fclose(file);
+    }
+    std::fprintf(stderr, "[qsa] dump %s layer=%d bytes=%zu fnv=%016llx path=%s\n", name, layer,
+                 host.size(), static_cast<unsigned long long>(fnv1a64(host.data(), host.size())),
+                 path.c_str());
+    std::fflush(stderr);
+}
+
+// NINFER_QSA_FORCE_FULL: the indexed layers run the dense mixer instead - its own KV append
+// included - which is the reference arm of both the byte gate and the long-context A/B. Read once,
+// because the startup plan follows the same switch.
+bool qsa_dense_arm() {
+    static const bool dense = std::getenv("NINFER_QSA_FORCE_FULL") != nullptr;
+    return dense;
+}
+
+// NINFER_QSA_DENSE_READ: keep the read side dense (S2's own stage) - prepare still owns the cache,
+// and the attention reads it back through the read-only cached Op instead of the indexer. Only a
+// single-row traversal has a read-only dense form, so the batch paths stay on the sparse arm.
+bool qsa_dense_read() {
+    static const bool dense = std::getenv("NINFER_QSA_DENSE_READ") != nullptr;
+    return dense;
+}
+
+void copy_first_row(const Tensor& source, Tensor& destination, cudaStream_t stream) {
+    if (source.dtype != DType::I32 || source.nb[1] % 4 != 0 ||
+        destination.ne[0] != source.ne[1] || !destination.is_contiguous()) {
+        throw std::invalid_argument("QSA record base copy does not match the pass metadata");
+    }
+    CUDA_CHECK(cudaMemcpy2DAsync(destination.data, sizeof(std::int32_t), source.data,
+                                 static_cast<std::size_t>(source.nb[1]), sizeof(std::int32_t),
+                                 static_cast<std::size_t>(source.ne[1]),
+                                 cudaMemcpyDeviceToDevice, stream));
+}
+
 void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stream) {
     if (source == nullptr || destination.dtype != DType::I32 || !destination.is_contiguous() ||
         destination.data == nullptr) {
@@ -85,6 +161,31 @@ void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stre
     }
     CUDA_CHECK(cudaMemcpyAsync(destination.data, source, destination.bytes(),
                                cudaMemcpyHostToDevice, stream));
+}
+
+void zero_i32(Tensor& destination, cudaStream_t stream) {
+    CUDA_CHECK(cudaMemsetAsync(destination.data, 0, destination.bytes(), stream));
+}
+
+// One pass's QSA metadata, allocated from the same arena the layer workspace uses and bound for the
+// whole pass. A pass with no indexed layer allocates nothing.
+struct QsaPassBinding {
+    workspace::QsaPassBindings storage;
+    Tensor columns, base, offsets;
+    Tensor source_slot, destination_slot;
+    bool active = false;
+};
+
+void begin_qsa_pass(WorkspaceArena& work, const TextConfig& config, std::int32_t batch,
+                    QsaPassBinding& out) {
+    if (config.indexed_attention_layers == 0) { return; }
+    out.storage          = workspace::qsa_pass_bindings(work);
+    out.active           = true;
+    out.columns          = out.storage.columns.slice(0, 0, batch);
+    out.base             = out.storage.base_positions.slice(0, 0, batch);
+    out.offsets          = out.storage.offsets.slice(0, 0, batch);
+    out.source_slot      = out.storage.source_slot;
+    out.destination_slot = out.storage.destination_slot;
 }
 
 void require_tensor_shape(const Tensor& t, DType dtype, std::initializer_list<std::int32_t> shape,
@@ -908,6 +1009,25 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
 
         Tensor x = work_.alloc(DType::BF16, {dimension(config_.hidden_size), batch});
         ops::embedding(ids, *embed_, x, stream);
+        // A decode column is one token, so the pass's live-column count is the pool's row of ones
+        // and the record base is the row's own position; both stay device tensors, which keeps the
+        // captured traversal replayable without a host read.
+        QsaPassBinding qsa;
+        begin_qsa_pass(work_, config_, batch, qsa);
+        if (qsa.active) {
+            const Tensor ones = batch_text_kv_->qsa_decode_columns(batch);
+            CUDA_CHECK(cudaMemcpyAsync(qsa.columns.data, ones.data, qsa.columns.bytes(),
+                                       cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(qsa.base.data, cache_positions.data, qsa.base.bytes(),
+                                       cudaMemcpyDeviceToDevice, stream));
+            zero_i32(qsa.offsets, stream);
+        }
+        ScopedValue<const Tensor*> qsa_columns_binding(active_qsa_columns_,
+                                                       qsa.active ? &qsa.columns : nullptr);
+        ScopedValue<const Tensor*> qsa_base_binding(active_qsa_base_positions_,
+                                                    qsa.active ? &qsa.base : nullptr);
+        ScopedValue<const Tensor*> qsa_offsets_binding(active_qsa_offsets_,
+                                                       qsa.active ? &qsa.offsets : nullptr);
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
         final_hidden(x, hidden, batch);
@@ -988,6 +1108,20 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor x        = work_.alloc(DType::BF16, {dimension(config_.hidden_size), columns});
         Tensor flat_ids = ids.view({columns});
         ops::embedding(flat_ids, *embed_, x, stream);
+        // The verify rectangle's metadata is the pass's own: its live columns are `valid_columns`,
+        // its record base is each row's first position, and the record offset is zero.
+        QsaPassBinding qsa;
+        begin_qsa_pass(work_, config_, batch, qsa);
+        if (qsa.active) {
+            copy_first_row(cache_positions, qsa.base, stream);
+            zero_i32(qsa.offsets, stream);
+        }
+        ScopedValue<const Tensor*> qsa_columns_binding(
+            active_qsa_columns_, qsa.active ? &valid_columns : nullptr);
+        ScopedValue<const Tensor*> qsa_base_binding(active_qsa_base_positions_,
+                                                    qsa.active ? &qsa.base : nullptr);
+        ScopedValue<const Tensor*> qsa_offsets_binding(active_qsa_offsets_,
+                                                       qsa.active ? &qsa.offsets : nullptr);
         if constexpr (Tap::enabled) { tap.begin(x); }
         run_layers(x, Phase::Verify, tap);
         if constexpr (requires { tap.capture_positions(cache_positions, stream); }) {
@@ -1095,6 +1229,20 @@ void TextContext::prefill_batch(std::span<const std::int32_t> ids,
 
     Tensor x = work_.alloc(DType::BF16, {dimension(config_.hidden_size), columns});
     ops::embedding(d_ids.view({columns}), *embed_, x, stream);
+    // The merged rectangle hands every QSA layer the same per-row metadata the GDN path uses: the
+    // row's live prefix, its record base and an identity record offset.
+    QsaPassBinding qsa;
+    begin_qsa_pass(work_, config_, batch, qsa);
+    if (qsa.active) {
+        copy_first_row(d_positions, qsa.base, stream);
+        zero_i32(qsa.offsets, stream);
+    }
+    ScopedValue<const Tensor*> qsa_columns_binding(active_qsa_columns_,
+                                                   qsa.active ? &d_valid : nullptr);
+    ScopedValue<const Tensor*> qsa_base_binding(active_qsa_base_positions_,
+                                                qsa.active ? &qsa.base : nullptr);
+    ScopedValue<const Tensor*> qsa_offsets_binding(active_qsa_offsets_,
+                                                   qsa.active ? &qsa.offsets : nullptr);
     if (prefill_gpu_timer_ != nullptr) { prefill_gpu_timer_->start(); }
     run_layers(x, Phase::Verify);
     // Prefill only needs the token that follows each row's last prompt token, so the projection runs
@@ -1512,6 +1660,14 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
             ctx_.execution_view());
     }
     ops::sigmoid_mul(gate, a, s);
+    // The same file the sparse arm writes: the two arms' attention outputs are the S3 gate.
+    qsa_dump_tensor("NINFER_QSA_LAYER_DUMP", "attention",
+                    a.view({dimension(config_.attention->query_width()), T}), fidx, s);
+    // This arm appends through the dense Op, so its K plane is the reference the byte gate compares
+    // prepare's write against.
+    qsa_dump_tensor("NINFER_QSA_KV_DUMP", "main_key",
+                    batch_text_kv_->batch_layer_view(static_cast<std::uint32_t>(fidx)).k_pages, fidx,
+                    s);
 
     {
         Tensor attn_out = a.view({dimension(config_.attention->query_width()), T});
@@ -1754,6 +1910,180 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     }
 }
 
+ops::QsaTailStateView TextContext::qsa_tail_view(int index, const Tensor& slots) const {
+    if (batch_text_kv_ == nullptr || !batch_text_kv_->has_qsa()) {
+        throw std::logic_error("QSA tail state needs an indexed text cache");
+    }
+    const qwen3_5::QsaStateSlot layer =
+        batch_text_kv_->qsa_tail_layer(static_cast<std::uint32_t>(index));
+    return {layer.raw_keys, layer.first_rope, slots};
+}
+
+void TextContext::qsa_mix(const BlockParameters& w, Tensor& x, int fidx, Phase, const Tensor* normalized) {
+    const auto& p = std::get<AttentionParameters>(w.mixer);
+    if (!p.indexer) { throw std::logic_error("indexed mixer has no indexer weights"); }
+    if (batch_text_kv_ == nullptr || !batch_text_kv_->has_qsa()) {
+        throw std::logic_error("indexed mixer has no QSA cache planes");
+    }
+    if (active_qsa_columns_ == nullptr || active_qsa_base_positions_ == nullptr ||
+        active_qsa_offsets_ == nullptr) {
+        throw std::logic_error("QSA pass metadata is not bound");
+    }
+    const auto& indexer = *p.indexer;
+    cudaStream_t s      = ctx_.stream;
+    const int T         = x.ne[1];
+    // The same row/width/slot model every other mixer uses: a merged pass is one rectangle of
+    // `width x batch` columns, a decode is that rectangle at width one, a single-lane chunk is
+    // width T by one row.
+    const std::int32_t batch = active_sequence_batch_ != 0 ? active_sequence_batch_ : 1;
+    const std::int32_t width = active_sequence_batch_ != 0 ? active_sequence_width_ : T;
+    if (width <= 0 || width * batch != T) {
+        throw std::logic_error("QSA sequence batch binding does not match aggregate columns");
+    }
+
+    const auto head_dim  = dimension(config_.attention->head_dim);
+    const auto query_hd  = dimension(config_.attention->num_attention_heads);
+    const auto kv_heads  = dimension(config_.attention->num_key_value_heads);
+    const auto query_w   = dimension(config_.attention->query_width());
+    const auto key_w     = dimension(config_.attention->key_width());
+    if (!config_.indexer) { throw std::logic_error("indexed mixer has no indexer config"); }
+    const auto index_hd  = dimension(config_.indexer->head_dim);
+    const DeviceExecutionView execution = ctx_.execution_view();
+
+    // Positions, RoPE coordinates and the live-column count come from the pass, never from a host
+    // read of device state: this is what keeps a captured traversal replayable at another length.
+    const Tensor& cache_positions =
+        active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
+    const Tensor& rope_source =
+        active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
+    Tensor positions = active_sequence_batch_ != 0 ? cache_positions : cache_positions.view({T, 1});
+    Tensor rope;
+    if (active_sequence_batch_ != 0) {
+        rope = width == 1 ? rope_source.view({1, 1, batch})
+                          : rope_source.view({width, 1, batch});
+    } else {
+        rope = rope_source.ne[1] == 3 ? rope_source.view({T, 3, 1})
+                                      : rope_source.view({T, 1, 1});
+    }
+    const Tensor& valid_columns = *active_qsa_columns_;
+    const Tensor& kv_table_rows =
+        active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
+    const Tensor& source_slots =
+        active_linear_state_source_slots_ != nullptr ? *active_linear_state_source_slots_
+                                                     : *active_qsa_source_slots_;
+    const Tensor& destination_slots =
+        active_linear_state_destination_slots_ != nullptr ? *active_linear_state_destination_slots_
+                                                          : *active_qsa_destination_slots_;
+    if (valid_columns.ne[0] != batch || source_slots.ne[0] != batch ||
+        destination_slots.ne[0] != batch || kv_table_rows.ne[0] < batch) {
+        throw std::logic_error("QSA pass metadata does not match the bound batch");
+    }
+
+    const auto projection = workspace::text_attention_projection(work_, config_, T);
+    auto qsa              = workspace::qsa_roots(work_, config_, T);
+    Tensor h              = normalized != nullptr ? *normalized : projection.hidden;
+    if (normalized == nullptr) ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s);
+
+    Tensor q_flat    = projection.query.view({query_w, T});
+    Tensor gate_flat = projection.gate.view({query_w, T});
+    Tensor k_flat    = projection.key.view({key_w, T});
+    Tensor v_flat    = projection.value.view({key_w, T});
+    attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s);
+    // The artifact keeps the indexer's two matrices in their own parents, so each is one Linear
+    // segment instead of a merged parent no Op overload could take.
+    project(h, indexer.query, qsa.index_query, work_, s);
+    project(h, indexer.key, qsa.index_key, work_, s);
+    nan_probe_tensor("qsa-proj-q", q_flat, 100 + std::size_t(fidx), s);
+
+    ops::QsaProjectionView projected{
+        q_flat.view({head_dim, query_hd, T, batch}),
+        k_flat.view({head_dim, kv_heads, T, batch}),
+        v_flat.view({head_dim, kv_heads, T, batch}),
+        qsa.index_query.view({index_hd, 4, T, batch}),
+        qsa.index_key.view({index_hd, T, batch}),
+    };
+    const ops::QsaBatchView batch_view{positions, valid_columns, kv_table_rows};
+    // Two norms of 256 for the mixer's heads and two of 128 for the indexer's, all unit-offset.
+    const ops::QsaPrepareParameters prepare_parameters{
+        p.query_norm, p.key_norm, indexer.query_norm, indexer.key_norm,
+        config_.rms_norm_eps, config_.rope_parameters->rope_theta,
+    };
+    // One cache view for both planes: the index plane is addressed through the main cache's own
+    // block table, which prepare itself requires to be the identical tensor.
+    PagedKVBatchLayerView main_cache = batch_text_kv_->batch_layer_view(static_cast<std::uint32_t>(fidx));
+    const ops::QsaIndexCacheView index_cache{
+        batch_text_kv_->qsa_index_layer(static_cast<std::uint32_t>(fidx)),
+        main_cache.block_tables,
+    };
+    const ops::QsaCacheView cache{main_cache, index_cache};
+    const ops::QsaRawRecordWriteView records{
+        qsa.record_keys.view({index_hd, T, batch}),
+        qsa.record_rope.view({3, T, batch}),
+        *active_qsa_offsets_,
+    };
+    const ops::QsaTailStateView before = qsa_tail_view(fidx, source_slots);
+
+    // `query` and `index_query` exactly alias their projections, which prepare admits: it is the
+    // normalization and rotation of that same storage, not a second buffer.
+    Tensor prepared_query      = projected.query;
+    Tensor prepared_index_query = projected.index_query;
+    ops::qsa_prepare(projected, prepare_parameters, batch_view, rope, before, cache, records,
+                     prepared_query, prepared_index_query, execution);
+
+    // The envelope is the resolved capacity, which is also what the startup plan priced: a host
+    // launch promise, fixed across every replay, never a mask.
+    const auto visible = std::min<std::uint32_t>(kv_.max_context(), 262144U);
+    Tensor attention   = qsa.attention.view({head_dim, query_hd, T, batch});
+    if (qsa_dense_read() && batch == 1) {
+        // S2's own stage: prepare owns the cache, and the dense Op reads that cache back without
+        // appending anything (`prepared_query` is already the normalized, rotated query).
+        Tensor dense_out = attention.view({head_dim, query_hd, T});
+        ops::causal_softmax_attention_cached(
+            prepared_query.view({head_dim, query_hd, T}), positions.view({T}),
+            {head_dim, query_hd, kv_heads},
+            static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_dim))),
+            kv_.layer_view(static_cast<std::uint32_t>(fidx)),
+            ops::CausalAttentionExecutionEnvelope{visible, visible}, work_, dense_out, execution);
+        ops::sigmoid_mul(gate_flat.view({head_dim, query_hd, T}), dense_out, s);
+    } else {
+        const ops::QsaIndexerExecutionEnvelope indexer_envelope{visible};
+        const ops::QsaSparseGqaExecutionEnvelope gqa_envelope{visible};
+        ops::QsaBlockSelection selected{
+            qsa.block_ids.view({512, T, batch}),
+            qsa.block_counts.view({T, batch}),
+        };
+        ops::qsa_indexer(prepared_index_query, index_cache, batch_view, indexer_envelope, work_,
+                         selected, execution);
+        // The sparse Op applies the output gate itself, so its output is already the gated
+        // attention result the dense arm computes with sigmoid_mul.
+        ops::qsa_sparse_gqa(prepared_query, gate_flat.view({head_dim, query_hd, T, batch}),
+                            main_cache, batch_view, selected, gqa_envelope, work_, attention,
+                            execution);
+    }
+
+    ops::QsaRawRecordReadView read_records{
+        records.raw_keys, records.rope_positions, *active_qsa_base_positions_, valid_columns};
+    ops::qsa_tail_extract(before, read_records, valid_columns,
+                          qsa_tail_view(fidx, destination_slots), execution);
+
+    qsa_dump_tensor("NINFER_QSA_KV_DUMP", "main_key", main_cache.k_pages, fidx, s);
+    qsa_dump_tensor("NINFER_QSA_KV_DUMP", "index_key", index_cache.keys, fidx, s);
+    qsa_dump_tensor("NINFER_QSA_LAYER_DUMP", "attention", qsa.attention, fidx, s);
+
+    {
+        Tensor attn_out = qsa.attention.view({query_w, T});
+        nan_probe_tensor("qsa-attn", attn_out, 100 + std::size_t(fidx), s);
+        if (normalized != nullptr) {
+            // The four-stream correction owns the residual, so the projection is a pure write.
+            ops::linear(attn_out, p.output.weight, x, p.output.policy, work_, s);
+        } else if (ops::w4a8_supported(p.output.weight, T)) {
+            ops::w4a8_linear_add(attn_out, p.output.weight, x, work_, s);
+        } else {
+            ops::linear_add(attn_out, p.output.weight, x, p.output.policy, work_, s);
+        }
+    }
+}
+
 ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
     const auto next = static_cast<std::size_t>(layer) + 1;
     return next < parameters_.text.layers.size() ? parameters_.text.layers[next].projection_prefetch
@@ -1834,9 +2164,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     for (std::size_t layer = 0; layer < parameters_.text.layers.size(); ++layer) {
         const auto& block = parameters_.text.layers[layer];
         // The config owns the dispatch: an indexed layer is a full-attention mixer whose softmax
-        // runs over the indexer's KV blocks. QSA is not wired yet (M4), so an indexed layer runs the
-        // full-attention path for now - but it must not fall into the GDN branch, whose weights it
-        // does not carry.
+        // runs over the indexer's selected KV blocks (see `qsa_mix`).
         const auto kind     = config_.layer_types[layer];
         const bool full     = attention_mixer(kind);
         const bool indexed  = kind == MixerKind::IndexedAttention;
@@ -1866,12 +2194,19 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     std::fflush(stderr);
                 }
                 if (full) {
-                    if (indexed) { note_indexed_mixer_deferred(); }
                     if (hc) {
                         hc_mix_into(*block.input_hc, tokens);
                         folded = &hc_.input;
                     }
-                    attn_mix(block, product, compact, ph, folded);
+                    // An indexed layer writes its own KV through prepare and reads it back through
+                    // the indexer's selection; NINFER_QSA_FORCE_FULL keeps the old dense mixer as
+                    // the reference arm of both QSA gates.
+                    if (indexed && !qsa_dense_arm()) {
+                        qsa_mix(block, product, compact, ph, folded);
+                    } else {
+                        if (indexed) { note_dense_indexed_arm(); }
+                        attn_mix(block, product, compact, ph, folded);
+                    }
                 } else {
                     if (hc) {
                         hc_mix_into(*block.input_hc, tokens);
@@ -2098,6 +2433,32 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             const auto visible = static_cast<std::uint32_t>(base_i + t0 + len);
             const ops::CausalAttentionExecutionEnvelope chunk_envelope{visible, visible};
             ScopedEnvelope scoped_envelope(active_causal_attention_envelope_, chunk_envelope);
+
+            // This chunk is one row of `len` tokens: every column is live, the record base is the
+            // chunk's first absolute position and the record offset is zero. A chunk is never graph
+            // captured, so these three are the pass's host values.
+            QsaPassBinding qsa;
+            begin_qsa_pass(work_, config_, 1, qsa);
+            if (qsa.active) {
+                std::int32_t columns_host = len;
+                std::int32_t base_host    = base_i + t0;
+                std::int32_t offset_host  = 0;
+                copy_i32(&columns_host, qsa.columns, s);
+                copy_i32(&base_host, qsa.base, s);
+                copy_i32(&offset_host, qsa.offsets, s);
+                copy_i32(&linear_state_source_slot_, qsa.source_slot, s);
+                copy_i32(&linear_state_destination_slot_, qsa.destination_slot, s);
+            }
+            ScopedValue<const Tensor*> qsa_columns_binding(active_qsa_columns_,
+                                                           qsa.active ? &qsa.columns : nullptr);
+            ScopedValue<const Tensor*> qsa_base_binding(active_qsa_base_positions_,
+                                                        qsa.active ? &qsa.base : nullptr);
+            ScopedValue<const Tensor*> qsa_offsets_binding(active_qsa_offsets_,
+                                                           qsa.active ? &qsa.offsets : nullptr);
+            ScopedValue<const Tensor*> qsa_source_binding(active_qsa_source_slots_,
+                                                          qsa.active ? &qsa.source_slot : nullptr);
+            ScopedValue<const Tensor*> qsa_destination_binding(
+                active_qsa_destination_slots_, qsa.active ? &qsa.destination_slot : nullptr);
 
             Tensor x = roots.residual;
             ops::embedding(ids_device, *embed_, x, s);

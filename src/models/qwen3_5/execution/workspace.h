@@ -91,12 +91,17 @@ struct QsaPassBindings {
     Tensor columns;
     Tensor base_positions;
     Tensor offsets;
+    // A single-lane pass has no slot tensors of its own: its slots are two host integers, so they
+    // are published into these one-element planes beside the rest of the pass metadata.
+    Tensor source_slot;
+    Tensor destination_slot;
 };
 
 template <class Allocator>
 QsaPassBindings qsa_pass_bindings(Allocator& allocator) {
     return {vector(allocator, DType::I32, 8), vector(allocator, DType::I32, 8),
-            vector(allocator, DType::I32, 8)};
+            vector(allocator, DType::I32, 8), vector(allocator, DType::I32, 1),
+            vector(allocator, DType::I32, 1)};
 }
 
 // One indexed layer's transient side. The projections take the same shape they do in the dense
@@ -110,9 +115,6 @@ struct QsaRoots {
     Tensor block_counts;   // I32 [tokens]
     Tensor record_keys;    // BF16 [128, tokens]
     Tensor record_rope;    // I32 [3, tokens]
-    // Diagnosis only (NINFER_QSA_DENSE_READ): the read-only dense consumer normalizes its query
-    // into its own buffer, which the sparse path never needs.
-    Tensor normalized_query;
 };
 
 template <class Allocator>
@@ -128,11 +130,6 @@ QsaRoots qsa_roots(Allocator& allocator, const TextConfig& config, std::int32_t 
     out.record_keys  = matrix(allocator, DType::BF16, dimension(indexer.head_dim), tokens);
     out.record_rope  = matrix(allocator, DType::I32, 3, tokens);
     return out;
-}
-
-template <class Allocator>
-Tensor qsa_dense_query(Allocator& allocator, const TextConfig& config, std::int32_t tokens) {
-    return matrix(allocator, DType::BF16, dimension(config.attention->query_width()), tokens);
 }
 
 struct GdnControlRoots {

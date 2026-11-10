@@ -9,6 +9,7 @@
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/qsa.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/sparse_moe.h"
 #include "models/qwen3_5/state/decoder_state.h"
@@ -204,6 +205,12 @@ private:
                   const Tensor* normalized = nullptr);
     void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase,
                  const Tensor* normalized = nullptr);
+    // Qwen4Exp's indexed mixer: the same Q/K/V/gate projection the dense mixer runs plus the two
+    // indexer matrices, then prepare (the only writer of both caches), the indexer's block
+    // selection, and the sparse GQA read.
+    void qsa_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase,
+                 const Tensor* normalized = nullptr);
+    [[nodiscard]] ops::QsaTailStateView qsa_tail_view(int index, const Tensor& slots) const;
     void mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
                   const ops::SparseMoeHints& hints, int layer,
                   const Tensor* normalized = nullptr);
@@ -285,6 +292,16 @@ private:
     const Tensor* active_linear_state_source_slots_                                = nullptr;
     const Tensor* active_linear_state_destination_slots_                           = nullptr;
     const Tensor* active_valid_columns_                                            = nullptr;
+    // QSA per-pass metadata: the row's live columns, the record base (`positions[0,b]`) and the
+    // record offset this call writes from. Bound by every pass entry point beside the GDN slots,
+    // because a QSA layer takes them from the pass rather than reading device state on the host.
+    const Tensor* active_qsa_columns_                                              = nullptr;
+    const Tensor* active_qsa_base_positions_                                       = nullptr;
+    const Tensor* active_qsa_offsets_                                              = nullptr;
+    // A single-lane pass publishes its two host slot integers here, so every pass hands the QSA
+    // tail state its slots the same way it hands the GDN state its own.
+    const Tensor* active_qsa_source_slots_                                         = nullptr;
+    const Tensor* active_qsa_destination_slots_                                    = nullptr;
     const Tensor* active_backend_kv_table_rows_                                    = nullptr;
     const ops::CausalAttentionExecutionEnvelope* active_causal_attention_envelope_ = nullptr;
     std::int32_t active_sequence_batch_                                            = 0;
