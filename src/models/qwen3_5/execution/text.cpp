@@ -716,7 +716,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
              dimension(config_.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
             mtp_kv_.layer_view(0), envelope, work_, a, ctx_.execution_view());
-        ops::sigmoid_mul(gate, a, s);
+    ops::sigmoid_mul(gate, a, s);
 
         Tensor o = work_.alloc(DType::BF16, {dimension(config_.hidden_size), 1});
         project(a.view({dimension(config_.attention->query_width()), 1}), mtp_->output, o, work_,
@@ -1321,12 +1321,60 @@ void TextContext::hc_stem(Tensor& embedding, std::int32_t tokens) {
                         ctx_.execution_view());
 }
 
+namespace {
+void nan_probe_tensor(const char* tag, const Tensor& value, std::size_t layer, cudaStream_t stream) {
+    if (std::getenv("NINFER_NAN_PROBE") == nullptr || value.data == nullptr) { return; }
+    if (value.dtype != DType::BF16) { return; }
+    const auto rows = value.ne[0], cols = value.ne[1];
+    std::vector<std::uint16_t> host(static_cast<std::size_t>(rows) * cols);
+    if (cudaMemcpyAsync(host.data(), value.data, host.size() * sizeof(std::uint16_t),
+                        cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
+        return;
+    }
+    if (cudaStreamSynchronize(stream) != cudaSuccess) { return; }
+    std::size_t bad = 0, elements = 0;
+    int first = -1;
+    std::vector<std::size_t> row_hits(static_cast<std::size_t>(rows), 0);
+    for (int c = 0; c < cols; ++c) {
+        std::size_t token_bad = 0;
+        for (int r = 0; r < rows; ++r) {
+            const auto bits = host[static_cast<std::size_t>(c) * rows + r];
+            if ((bits & 0x7f80U) == 0x7f80U && (bits & 0x7fU) != 0U) {
+                ++token_bad;
+                ++elements;
+                ++row_hits[static_cast<std::size_t>(r)];
+            }
+        }
+        if (token_bad != 0) {
+            ++bad;
+            if (first < 0) { first = c; }
+        }
+    }
+    std::size_t bad_rows = 0, first_bad_row = static_cast<std::size_t>(-1);
+    for (std::size_t r = 0; r < row_hits.size(); ++r) {
+        if (row_hits[r] != 0) {
+            ++bad_rows;
+            if (first_bad_row == static_cast<std::size_t>(-1)) { first_bad_row = r; }
+        }
+    }
+    std::fprintf(stderr,
+                 "[nan-probe] layer=%zu %s columns=%d bad_columns=%zu first=%d elements=%zu "
+                 "bad_rows=%zu first_row=%lld\n",
+                 layer, tag, cols, bad, first, elements, bad_rows,
+                 static_cast<long long>(first_bad_row));
+    std::fflush(stderr);
+}
+} // namespace
+
 void TextContext::hc_mix_into(const HcParameters& weights, std::int32_t tokens) {
     const auto normalized = hc_.normalized.view({dimension(config_.hidden_size),
                                                  dimension(config_.hc->count), tokens});
     // Produces the block's single-stream input and the four coefficients its correction applies.
+    nan_probe_tensor("hc-mix-pre", hc_.input, 300, ctx_.stream);
+    nan_probe_tensor("hc-normed", hc_.normalized, 400, ctx_.stream);
     ops::hc_mix(normalized, weights.block_form(), work_, hc_.input, hc_.injection,
                 ctx_.execution_view());
+    nan_probe_tensor("hc-mix-out", hc_.input, 200, ctx_.stream);
 }
 
 void TextContext::hc_combine(const Tensor& product, const Tensor& norm_weight,
@@ -1379,6 +1427,9 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     Tensor k_flat    = k.view({dimension(config_.attention->key_width()), T});
     Tensor v_flat    = v.view({dimension(config_.attention->key_width()), T});
     attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s);
+    nan_probe_tensor("attn-proj-q", q_flat, 100 + std::size_t(fidx), s);
+    nan_probe_tensor("attn-proj-k", k_flat, 100 + std::size_t(fidx), s);
+    nan_probe_tensor("attn-proj-v", v_flat, 100 + std::size_t(fidx), s);
 
     const auto results = workspace::text_attention_results(work_, config_, T);
     Tensor qn =
@@ -1388,6 +1439,8 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
                                              dimension(config_.attention->num_key_value_heads), T});
     ops::rmsnorm(q, p.query_norm, config_.rms_norm_eps, true, qn, s);
     ops::rmsnorm(k, p.key_norm, config_.rms_norm_eps, true, kn, s);
+    nan_probe_tensor("attn-qn", qn.view({dimension(config_.attention->query_width()), T}),
+                     100 + std::size_t(fidx), s);
     const Tensor& cache_positions =
         active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
     const Tensor& rope_positions =
@@ -1440,6 +1493,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
 
     {
         Tensor attn_out = a.view({dimension(config_.attention->query_width()), T});
+        nan_probe_tensor("attn-out", attn_out, 100 + std::size_t(fidx), s);
         if (normalized != nullptr) {
             // The four-stream correction owns the residual, so the projection is a pure write.
             ops::linear(attn_out, p.output.weight, x, p.output.policy, work_, s);
@@ -1570,6 +1624,9 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         ops::causal_conv1d_silu_split(qkv, p.convolution, conv_state_in, conv_state_out, qc, kc, vc,
                                       s);
     }
+    nan_probe_tensor("gdn-qc", qc, gidx, s);
+    nan_probe_tensor("gdn-vc", vc, gidx, s);
+    nan_probe_tensor("gdn-gate", z.view({dimension(config_.gdn->value_width()), T}), gidx, s);
 
     Tensor q_recurrent = qc.view({dimension(config_.gdn->linear_key_head_dim),
                                   dimension(config_.gdn->linear_num_key_heads), T});
@@ -1645,6 +1702,10 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                     .view({dimension(config_.gdn->linear_value_head_dim),
                            dimension(config_.gdn->linear_num_value_heads), T});
     ops::silu_gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, ctx_.execution_view());
+    nan_probe_tensor("gdn-recurrent-o",
+                     o.view({dimension(config_.gdn->value_width()), T}), gidx, s);
+    nan_probe_tensor("gdn-normed-on",
+                     on.view({dimension(config_.gdn->value_width()), T}), gidx, s);
 
     {
         Tensor gdn_out = on.view({dimension(config_.gdn->value_width()), T});
@@ -1707,6 +1768,30 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase,
 template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     const bool prefill = ph == Phase::Prefill;
+    const auto nan_probe = [&](const char* tag, const Tensor& value, std::size_t layer) {
+        if (std::getenv("NINFER_NAN_PROBE") == nullptr || value.data == nullptr) { return; }
+        const auto rows = value.ne[0], cols = value.ne[1];
+        std::vector<std::uint16_t> host(static_cast<std::size_t>(rows) * cols);
+        CUDA_CHECK(cudaMemcpyAsync(host.data(), value.data, host.size() * sizeof(std::uint16_t),
+                                   cudaMemcpyDeviceToHost, ctx_.stream));
+        CUDA_CHECK(cudaStreamSynchronize(ctx_.stream));
+        std::size_t bad = 0;
+        int first = -1;
+        for (int c = 0; c < cols; ++c) {
+            std::size_t token_bad = 0;
+            for (int r = 0; r < rows; ++r) {
+                const auto bits = host[static_cast<std::size_t>(c) * rows + r];
+                if ((bits & 0x7f80U) == 0x7f80U && (bits & 0x7fU) != 0U) { ++token_bad; }
+            }
+            if (token_bad != 0) {
+                ++bad;
+                if (first < 0) { first = c; }
+            }
+        }
+        std::fprintf(stderr, "[nan-probe] layer=%zu %s columns=%d bad_columns=%zu first=%d\n", layer,
+                     tag, cols, bad, first);
+        std::fflush(stderr);
+    };
     // Qwen4Exp: the embedding becomes four residual streams once, and every block reads a folded
     // single-stream view of them. The tensors are roots of the call, so they are allocated here and
     // live to its end; the plan reserves them from the same recipe in the same order.
@@ -1760,12 +1845,16 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     gdn_mix(block, product, compact, ph, folded);
                 }
                 if (hc) {
-                    // The mixer's product goes back through the four streams behind the MoE norm,
-                    // then the MoE's own fold.
+                    nan_probe("pre-combine-residual", hc_.residual, layer);
+                    nan_probe("pre-combine-product", hc_.output, layer);
                     hc_combine(product, block.post_attention_norm, tokens);
+                    nan_probe("post-combine-residual", hc_.residual, layer);
+                    nan_probe("post-combine-normed", hc_.normalized, layer);
+                    nan_probe("post-mixer-combine", hc_.input, layer);
                     hc_mix_into(*block.post_attention_hc, tokens);
                     folded = &hc_.input;
                 }
+                nan_probe("post-mixer", hc ? hc_.input : x, layer);
                 if (trace_stage) {
                     std::fprintf(stderr, "[stage] layer %zu mixer end: used %zu\n", layer,
                                  work_.used());
@@ -1797,6 +1886,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 }
                 mlp_tail(block, product, ph, next_projection_hints(static_cast<int>(layer)),
                          static_cast<int>(layer), folded);
+                nan_probe("post-mlp", hc ? hc_.input : x, layer);
                 if (trace_stage) {
                     std::fprintf(stderr, "[stage] layer %zu post-mixer end: used %zu\n", layer,
                                  work_.used());
@@ -1818,6 +1908,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                                ? parameters_.text.layers[next].input_norm
                                : *final_norm_,
                            tokens);
+                nan_probe("pre-next-input", hc_.input, layer);
             }
             if constexpr (Tap::enabled) {
                 tap.capture_layer(static_cast<int>(layer), hc ? hc_.input : x, ctx_.stream);

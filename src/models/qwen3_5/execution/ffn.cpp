@@ -1248,12 +1248,79 @@ void split_moe_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor&
     Tensor shared_coeff = workspace.alloc(DType::FP32, {columns});
     ops::ExpertRoutes routes{ids, coefficients};
     const ops::RouteProfile route_profile{hidden_rows, routed.experts, top_k};
+    const bool route_debug = std::getenv("NINFER_ROUTE_DEBUG") != nullptr;
+    if (route_debug) {
+        // Entry probe: is the MoE input already non-finite before this layer touches the arena?
+        std::vector<std::uint16_t> entry(static_cast<std::size_t>(hidden.ne[0]) * columns);
+        CUDA_CHECK(cudaMemcpyAsync(entry.data(), hidden.data, entry.size() * sizeof(std::uint16_t),
+                                   cudaMemcpyDeviceToHost, execution.stream));
+        CUDA_CHECK(cudaStreamSynchronize(execution.stream));
+        int first_bad = -1;
+        std::size_t bad_tokens = 0;
+        for (int t = 0; t < columns; ++t) {
+            std::size_t bad = 0;
+            for (int r = 0; r < hidden.ne[0]; ++r) {
+                if ((entry[static_cast<std::size_t>(t) * hidden.ne[0] + r] & 0x7f80U) == 0x7f80U) {
+                    ++bad;
+                }
+            }
+            if (bad != 0) {
+                ++bad_tokens;
+                if (first_bad < 0) { first_bad = t; }
+            }
+        }
+        std::fprintf(stderr, "[split-entry] columns=%d bad_tokens=%zu first=%d\n", columns,
+                     bad_tokens, first_bad);
+        std::fflush(stderr);
+    }
+    if (route_debug) {
+        // Sentinel fill, so the dump below can tell "the router never wrote this token" from "the
+        // router wrote a non-finite number": 12345 cannot come out of a softmax.
+        const std::vector<float> sentinel(static_cast<std::size_t>(top_k) * columns, 12345.0F);
+        const std::vector<std::int32_t> sentinel_ids(static_cast<std::size_t>(top_k) * columns, -777);
+        CUDA_CHECK(cudaMemcpyAsync(coefficients.data, sentinel.data(),
+                                   sentinel.size() * sizeof(float), cudaMemcpyHostToDevice,
+                                   execution.stream));
+        CUDA_CHECK(cudaMemcpyAsync(ids.data, sentinel_ids.data(),
+                                   sentinel_ids.size() * sizeof(std::int32_t),
+                                   cudaMemcpyHostToDevice, execution.stream));
+        CUDA_CHECK(cudaStreamSynchronize(execution.stream));
+    }
     {
         const auto block = workspace.alloc_bytes(ops::topk_softmax_route_workspace_capacity_bytes(
             route_profile, columns, columns));
         MemoryArena arena(MemorySpan{block.data, block.bytes, execution.device()});
         ops::topk_softmax_route(hidden, route_profile, moe.control, routes, shared_coeff, arena,
                                 execution);
+    }
+    if (route_debug) {
+        std::vector<std::int32_t> h_ids(static_cast<std::size_t>(top_k) * columns);
+        std::vector<float> h_coef(static_cast<std::size_t>(top_k) * columns);
+        std::vector<std::uint16_t> h_x(static_cast<std::size_t>(hidden.ne[0]) * columns);
+        CUDA_CHECK(cudaMemcpyAsync(h_ids.data(), ids.data, h_ids.size() * sizeof(std::int32_t),
+                                   cudaMemcpyDeviceToHost, execution.stream));
+        CUDA_CHECK(cudaMemcpyAsync(h_coef.data(), coefficients.data,
+                                   h_coef.size() * sizeof(float), cudaMemcpyDeviceToHost,
+                                   execution.stream));
+        CUDA_CHECK(cudaMemcpyAsync(h_x.data(), hidden.data, h_x.size() * sizeof(std::uint16_t),
+                                   cudaMemcpyDeviceToHost, execution.stream));
+        CUDA_CHECK(cudaStreamSynchronize(execution.stream));
+        for (int t = 0; t < columns; ++t) {
+            const auto row = static_cast<std::size_t>(t) * top_k;
+            int finite     = 0;
+            for (int j = 0; j < top_k; ++j) {
+                if (std::isfinite(h_coef[row + j])) { ++finite; }
+            }
+            std::size_t x_bad = 0;
+            for (int r = 0; r < hidden.ne[0]; ++r) {
+                const auto bits = h_x[static_cast<std::size_t>(t) * hidden.ne[0] + r];
+                if ((bits & 0x7f80U) == 0x7f80U) { ++x_bad; }
+            }
+            std::fprintf(stderr, "[route-dev] t=%d finite=%d/%d c0=%.9g ids=%d,%d x_bad=%zu\n", t,
+                         finite, top_k, static_cast<double>(h_coef[row]), h_ids[row],
+                         h_ids[row + 1], x_bad);
+        }
+        std::fflush(stderr);
     }
 
     const bool streaming = moe.stream != nullptr;

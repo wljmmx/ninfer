@@ -214,6 +214,19 @@ void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
     const auto* coefficients = static_cast<const float*>(routes.coefficients.data);
     std::array<bool, max_experts> selected{};
     bool has_work = false;
+    if (std::getenv("NINFER_CPU_ROUTE_DUMP") != nullptr) {
+        for (int t = 0; t < tokens; ++t) {
+            const auto row = std::size_t(t) * profile.top_k;
+            int finite     = 0;
+            for (int j = 0; j < profile.top_k; ++j) {
+                if (std::isfinite(coefficients[row + j])) { ++finite; }
+            }
+            std::fprintf(stderr, "[route-dump] t=%d finite=%d/%d c0=%.9g ids=%d,%d tokens=%d\n", t,
+                         finite, profile.top_k, static_cast<double>(coefficients[row]),
+                         ids[row], ids[row + 1], tokens);
+        }
+        std::fflush(stderr);
+    }
     for (int t = 0; t < tokens; ++t) {
         const auto offset = std::size_t(t) * profile.top_k;
         for (int j = 0; j < profile.top_k; ++j) {
