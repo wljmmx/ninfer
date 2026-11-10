@@ -166,3 +166,55 @@ NINFER_QSA_DUMP_LAYER=0` 跑两次——`NINFER_QSA_FORCE_FULL=1`（dense 参考
 未因此放宽的部分：S2 的「主 KV 逐字节相等」与 S3 的「层输出与 dense 位级相等」两条**按原措辞不成立**，
 原因就是上表的契约差（另加 sparse 与 dense 两个软最大核的归约顺序差，≤2 ulp）。若要恢复位级相等，
 唯一办法是在 `qsa_prepare` 的 norm 与旋转之间插入一次 BF16 舍入——2026-11-10 决定**不做**，保持算子契约。
+
+## T204 dense 侧 24Q/2KV/D256 的量化 KV 路由（独立工作项，未开工）
+
+状态：**只立方案**。QSA 的 rk 端到端门被这一项阻塞：`--kv-dtype rk*` 在第一个 attention 层被拒，
+因此「prepare 写 vs dense append 写」的同层主 KV 双转储比对无法在本机执行。
+
+### 现状证据（2026-11-10 实测）
+
+| 项 | 事实 | 位置 |
+|---|---|---|
+| 拒绝点 | `24q/2kv + 非 BF16` 直接抛 `the 24q/2kv D256 head geometry is served by the BF16 KV route only` | `src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp:48`（`require_storage_supports_geometry`） |
+| 几何类型 | `CausalGeometry<256,24,2>` **已存在**（注释即写明是 Qwen4Exp indexed 层的 GQA-12 配对） | `src/ops/softmax_attention/common/causal_geometry.h:17` |
+| 实例覆盖 | 只有 **BF16 族**为 `CausalD256H24Kv2` 实例化 | `bf16/launch.cu:80`、`bf16/batch_wide_launch.cu:48` |
+| 分派形状 | 五个量化族**只按 `query_heads` 分支**，24 头一律落 `CausalD256H24Kv4`（KVHeads=4），故操作数不匹配 | 例：`int8/batch_wide_launch.cu:95-99`；同型见 `int8/launch.cu:335/371/433/560`、`fp8/launch.cu:66/101`、`fp8/tiled_launch.cu:22`、`nvfp4/launch.cu:71/120`、`nvfp4/tiled_launch.cu:14`、`k8v4/launch.cu:71/120`、`k8v4/tiled_launch.cu:25` |
+| rk 解码算术 | **已具备**：int8 目录同时承载 int8 与 rk8v4/rk4v4/rk4v4-e8/rk2v4-e8/rk4v2-e8（`PackedK`/`PackedV`/`E8Lattice`/`E8Root`/`V8Root` 五个模板开关） | `int8/batch_wide_mma.cuh`、`int8/grouped_mma.cuh`、`int8/batch_wide_launch.cu:100-147` |
+
+结论：缺的**不是解码算术**，而是 `(24,2)` 这一对在每个量化族的模板实例化与 `kv_heads` 分派。
+
+### 改动清单
+
+| 文件 | 改动 | 量级 |
+|---|---|---|
+| `dense/causal_cache/int8/batch_wide_launch.cu` | 6 个入口（int8 / rk8v4 / rk4v4 / rk4v4-e8 / rk4v2-e8 / rk2v4-e8）的分派由 `query_heads==24 ? H24Kv4 : H16Kv2` 改为 `kv_heads==2 ? H24Kv2 : (query_heads==24 ? H24Kv4 : H16Kv2)`，并为 `CausalD256H24Kv2` 实例化对应模板 | 6 个实例 + 1 处分派 |
+| `dense/causal_cache/int8/launch.cu`（prefill：grouped / parallel_grouped / tiled） | 同上 3 处分派 + 实例 | 3 处 |
+| `dense/causal_cache/fp8/launch.cu`、`fp8/tiled_launch.cu` | 同上 2 处 | 2 处 |
+| `dense/causal_cache/nvfp4/launch.cu`、`nvfp4/tiled_launch.cu` | 同上 2 处 | 2 处 |
+| `dense/causal_cache/k8v4/launch.cu`、`k8v4/tiled_launch.cu` | 同上 2 处 | 2 处 |
+| `dense/causal_cache/causal_softmax_attention.cpp:48` | 把「24/2 只服务 BF16」的整段拒绝改为按族逐项放开（保留未实例化组合的按名拒绝） | 1 处表 |
+| `cpu/partial.h:87`（`rk_partial<24,4>`/`<16,2>` 注释处） | 确认 CPU 侧部分和 oracle 是否需要 `<24,2>` | 1 处 |
+
+### 风险
+
+- **tile 假设**：量化核按 head 映射分块（tile 16、`rpk ∈ {6,8}`）。GQA-12 不整除 16，很可能触发
+  `static_assert` 或需要改 `grouped_mma.cuh` / `batch_wide_mma.cuh` 的 tile 选择；
+  **一旦改动落入这两个文件，就是 prefill + decode 两套新核**，工作量与验证面都上一个量级。
+- **基线移动**：任何 tile/归约顺序改动都会移动 BF16 的位级 golden（PPL 7.441868、dump、regress），需重录并复跑门禁。
+- rk 变体在 `PackedV` 下的 zero-fill 宽度（`rk4_zero_packed_v`）与 masked 列处理已有前车之鉴（宽度 >256 时 16B 存会 `MisalignedAddress`），新实例要覆盖到。
+
+### 分阶段与门（每阶段独立可回滚）
+
+| 阶段 | 内容 | 门 |
+|---|---|---|
+| S1 | 只加实例与 `kv_heads` 分派，**不**放开拒绝 | 现有 BF16 golden 逐位复跑（default PPL 7.441868、`dump` e7ceb89d…、`regress` 0）；`ctest -R "qsa|linear_"` 全绿 |
+| S2 | 放开 24/2 的量化存储（先 int8 与 rk8v4/rk4v4） | `--kv-dtype rk8v4 --prompt Hello --max-new 8` 两次 token 逐位一致；再跑 `rk4v4`（`NINFER_EXPERT_CACHE_MB=8192`） |
+| S3 | prepare 写 vs dense append 写同层主 KV 双转储 | `NINFER_QSA_FORCE_FULL=1` 与默认臂各转储一次，`main_key_layer0.bin`/`main_value_layer0.bin`/`index_key_layer0.bin` 哈希比对（rk 应与 append 逐字节相等，故差异元素数应为 0） |
+| S4 | 长前缀与选择性 A/B | 2200/4152 前缀无非法访存、无新增 NaN 探针命中；4096 前缀 `NINFER_QSA_FORCE_FULL` A/B 记录 top-1 与速度 |
+
+### 预估与前置
+
+- 若 S1 的模板实例化不触发 tile 断言：约 0.5–1 天（机械实例 + 分派 + 复跑 golden）。
+- 若触发 tile 断言（GQA-12 vs tile 16）：另加 1–2 天用于 `grouped_mma.cuh`/`batch_wide_mma.cuh` 的分块改造与两套路径复验。
+- 前置：本项是 **rk 端到端门** 的唯一障碍（QSA 侧读侧 5/5 oracle 已过、写侧 2/5 逐字节已过、E8 写侧 K 平面 1024/1024 子空间码已对齐）；不解决它就无法在真实模型上验证 rk KV 的端到端正确性。
