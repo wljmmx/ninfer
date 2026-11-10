@@ -134,3 +134,35 @@
 - 转换器已支持 `fp8_e4m3fn_block128x128_bf16`（`tools/artifact/formats.py:69`）；
 - 因此**不需要写新 MoE 核**，最短路径是「专家三 bank 用 FP8 块缩放重转 + 投影通用化（M3）+ HC/PLE/QSA 接线（M4）」。
 剩余硬点：PLE 表行格式（工件 q4 136 B/行，`PleTableSource` 只吃 NF4 90 B/行，需转码或扩读取器）与 24 GB 卡上的专家流式（69 GiB）+ 表分页（40.5 GiB）。
+
+## T203 QSA 接线：S2/S3 门按算子契约重述（2026-11-10）
+
+`qsa_prepare` 的数值契约是「归一化与旋转之间没有可表示的 BF16 中间量」（`include/ninfer/ops/qsa.h`），
+而既有 dense 路径是 `rmsnorm → BF16 → rope → BF16`。两者因此**不可能逐字节相等**，且这是契约差而非接线错：
+已定位到唯一差异源，并把门重述为可判定、可重复的形式。
+
+差异定位（位置 1..50，两个 KV 头，每对 (i, i+32)）：
+- 相位差 |Δφ| 均值 4e-4…9e-4 rad，**不随位置线性增长**（token 1 为 3.95e-4、token 50 为 9.15e-4，2.3×）——
+  频率/theta 错会随位置线性放大，实测没有；
+- 角抖动 × 对幅值（扰动向量长度）最大 **1.41 ulp**（BF16 相对 ulp 2^-7），与「输入多/少一次舍入」相符；
+- 归一化输出（`dim≥64`，不旋转）**0 差异**，V 平面 **0 差异**，位置 0（旋转为恒等）**逐字节相同**。
+
+| 门 | 判据（重述后） | 实测（layer 3 = 首个 indexed 层，51 列前缀） | 结论 |
+|---|---|---|---|
+| S2-A | `dim≥64` 逐元素相同 | 0 / 786,432 差异 | 过 |
+| S2-B | 差异只在旋转维 `dim<64` | 1,325 差异全部在 `dim<64`，最大 \|Δu16\| 239（近抵消对） | 过 |
+| S2-C | 位置 0 逐字节相同 | 两个 KV 头的第 0 行完全相同 | 过 |
+| S2-D1 | 相位差不随位置增长 | 3.95e-4 → 9.15e-4 rad（2.3×，非 50×） | 过 |
+| S2-D2 | 角抖动 × 幅值 ≤ 2 BF16 ulp | 1.41 ulp | 过 |
+| S2-V | V 平面 0 差异 | 0 / 26,112 | 过 |
+| S3 | 同一 prepare 缓存上 sparse 与只读 dense ≤2 BF16 ulp，且单可见行 token 相同 | p99 2.87e-3、峰 7.81e-3 × 行幅值（预算 1.56e-2）；token 0 相同；247,079/313,344 逐字节相同；0 NaN | 过 |
+
+复现方式（不依赖人工结论）：`NINFER_QSA_KV_DUMP=<dir> NINFER_QSA_LAYER_DUMP=<dir>
+NINFER_QSA_DUMP_LAYER=0` 跑两次——`NINFER_QSA_FORCE_FULL=1`（dense 参考臂）与
+`NINFER_QSA_DENSE_READ=1`（prepare 写 + 只读 dense 读）——再以 `.temp\qsa_gates.py s2 <dense> <prepare>`
+判 S2；S3 用 `NINFER_QSA_DENSE_READ` 与稀疏臂两组 `attention_layer*_T<列>.bin` 交 `qsa_gates.py s3`。
+脚本逐条打印上表判据与数值，任一不满足即非零退出。
+
+未因此放宽的部分：S2 的「主 KV 逐字节相等」与 S3 的「层输出与 dense 位级相等」两条**按原措辞不成立**，
+原因就是上表的契约差（另加 sparse 与 dense 两个软最大核的归约顺序差，≤2 ulp）。若要恢复位级相等，
+唯一办法是在 `qsa_prepare` 的 norm 与旋转之间插入一次 BF16 舍入——2026-11-10 决定**不做**，保持算子契约。
