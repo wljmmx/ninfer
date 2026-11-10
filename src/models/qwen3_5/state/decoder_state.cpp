@@ -1,5 +1,6 @@
 #include "models/qwen3_5/state/decoder_state.h"
 
+#include <array>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -45,7 +46,8 @@ bool kv_residency_contract_active() {
 
 PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std::uint32_t capacity,
                               std::int32_t kv_heads, std::int32_t head_dim, KvCacheStorage storage,
-                              std::int32_t table_rows, std::uint32_t physical_page_groups) {
+                              std::int32_t table_rows, std::uint32_t physical_page_groups,
+                              const QsaCacheSpec* qsa = nullptr) {
     if (layers == 0 ||
         layers > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
@@ -77,7 +79,7 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
                                        layer_storage.value.scale_leading_extent, kv_heads, 256});
         }
     }
-    return PagedKVCacheLayout{
+    PagedKVCacheLayout layout{
         .pages = plan_device_kv_page_pool(
             builder, DeviceKVPagePoolSpec{.page_group_count = physical_page_groups,
                                           .geometry         = std::move(geometry)}),
@@ -89,15 +91,56 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
         .kv_heads      = kv_heads,
         .layer_storage = layer_storage,
     };
+    if (qsa != nullptr) {
+        if (qsa->indexed_layers == 0 || qsa->index_head_dim <= 0 ||
+            qsa->index_blocks_per_page != kPagedKVPageSize / 4 || qsa->tail_columns <= 0 ||
+            qsa->state_slots <= 0 || qsa->indexed_layers > layers) {
+            throw std::invalid_argument("QSA index cache geometry is invalid");
+        }
+        QsaCacheLayout q;
+        q.spec = *qsa;
+        q.index.reserve(qsa->indexed_layers);
+        q.tail_keys.reserve(qsa->indexed_layers);
+        q.tail_rope.reserve(qsa->indexed_layers);
+        for (std::uint32_t layer = 0; layer < qsa->indexed_layers; ++layer) {
+            // One index block per four tokens, sixteen blocks to a page, page-major, every layer
+            // in the main cache's own page count so a page id means the same row everywhere.
+            q.index.push_back(builder.add_tensor(
+                DType::BF16,
+                {qsa->index_head_dim, qsa->index_blocks_per_page, 1,
+                 static_cast<std::int32_t>(physical_page_groups)},
+                256, "QSA index plane " + std::to_string(layer)));
+            q.tail_keys.push_back(builder.add_tensor(
+                DType::BF16, {qsa->index_head_dim, qsa->tail_columns, qsa->state_slots}, 256,
+                "QSA tail keys " + std::to_string(layer)));
+            q.tail_rope.push_back(builder.add_tensor(
+                DType::I32, {qsa->tail_columns, qsa->state_slots}, 256,
+                "QSA tail coordinates " + std::to_string(layer)));
+        }
+        q.decode_columns = builder.add_tensor(
+            DType::I32, {static_cast<std::int32_t>(kMaximumConcurrency)}, 256,
+            "QSA decode live columns");
+        layout.qsa = std::move(q);
+    }
+    return layout;
 }
 
 } // namespace
+
+std::size_t QsaCacheLayout::payload_bytes() const noexcept {
+    std::size_t total = decode_columns.region.bytes;
+    for (const auto* planes : {&index, &tail_keys, &tail_rope}) {
+        for (const TensorRegion& plane : *planes) { total += plane.region.bytes; }
+    }
+    return total;
+}
 
 DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderStateSpec& spec) {
     DecoderStateLayout layout;
     layout.text_kv = plan_cache(builder, spec.full_attention_layers, spec.capacity, spec.kv_heads,
                                 spec.attention_head_dim, spec.kv_storage, spec.kv_table_rows,
-                                spec.text_physical_page_groups);
+                                spec.text_physical_page_groups,
+                                spec.qsa ? &*spec.qsa : nullptr);
     if (spec.enable_mtp) {
         layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
                                    spec.attention_head_dim, spec.kv_storage, spec.kv_table_rows,
@@ -114,6 +157,70 @@ PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
         static_cast<std::size_t>(layers_) * layer_storage_.planes_per_layer()) {
         throw std::invalid_argument("Paged KV layer plane inventory is inconsistent");
     }
+    if (layout.qsa) {
+        const QsaCacheLayout& q = *layout.qsa;
+        if (q.index.size() != q.spec.indexed_layers ||
+            q.tail_keys.size() != q.spec.indexed_layers ||
+            q.tail_rope.size() != q.spec.indexed_layers) {
+            throw std::invalid_argument("QSA cache plane inventory is inconsistent");
+        }
+        // The index planes are addressed by the main cache's own block table, so they must hold
+        // exactly the physical pages that table can name.
+        if (q.index.front().shape[3] != static_cast<std::int32_t>(pages_.construction_capacity_pages())) {
+            throw std::invalid_argument("QSA index plane page count differs from the main cache");
+        }
+        qsa_index_.reserve(q.spec.indexed_layers);
+        qsa_tail_keys_.reserve(q.spec.indexed_layers);
+        qsa_tail_rope_.reserve(q.spec.indexed_layers);
+        for (std::uint32_t layer = 0; layer < q.spec.indexed_layers; ++layer) {
+            qsa_index_.push_back(q.index[layer].bind(backing));
+            qsa_tail_keys_.push_back(q.tail_keys[layer].bind(backing));
+            qsa_tail_rope_.push_back(q.tail_rope[layer].bind(backing));
+        }
+        qsa_decode_columns_ = q.decode_columns.bind(backing);
+        // The width-1 traversals read this as their live-column count; filling it once here keeps
+        // every later call a pure device read.
+        std::array<std::int32_t, kMaximumConcurrency> ones{};
+        ones.fill(1);
+        if (cudaMemcpy(qsa_decode_columns_.data, ones.data(),
+                       static_cast<std::size_t>(qsa_decode_columns_.ne[0]) * sizeof(std::int32_t),
+                       cudaMemcpyHostToDevice) != cudaSuccess) {
+            throw std::runtime_error("QSA decode column fill failed");
+        }
+        qsa_ = q;
+    }
+}
+
+namespace {
+
+void require_indexed_layer(const std::optional<QsaCacheLayout>& layout, std::uint32_t layer,
+                           const std::vector<Tensor>& planes) {
+    if (!layout || layer >= planes.size()) {
+        throw std::out_of_range("QSA layer is not an indexed layer of this cache");
+    }
+}
+
+} // namespace
+
+Tensor PagedKVCache::qsa_index_layer(std::uint32_t layer) const {
+    require_indexed_layer(qsa_, layer, qsa_index_);
+    return qsa_index_[layer];
+}
+
+QsaStateSlot PagedKVCache::qsa_tail_layer(std::uint32_t layer) const {
+    require_indexed_layer(qsa_, layer, qsa_tail_keys_);
+    return {qsa_tail_keys_[layer], qsa_tail_rope_[layer]};
+}
+
+Tensor PagedKVCache::qsa_decode_columns(std::int32_t batch) const {
+    if (!qsa_ || batch <= 0 || batch > qsa_decode_columns_.ne[0]) {
+        throw std::out_of_range("QSA decode columns slice is outside the pool");
+    }
+    return qsa_decode_columns_.slice(0, 0, batch);
+}
+
+std::uint32_t PagedKVCache::qsa_pages() const noexcept {
+    return qsa_ ? pages_.construction_capacity_pages() : 0U;
 }
 
 PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, Tensor block_table,
@@ -185,9 +292,7 @@ PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const 
 
 std::size_t DecoderStateLayout::kv_payload_bytes() const noexcept {
     return text_kv.payload_bytes() + (mtp_kv ? mtp_kv->payload_bytes() : 0);
-}
-
-DecoderState::DecoderState(DeviceSpan backing, const DecoderStateLayout& layout)
+}DecoderState::DecoderState(DeviceSpan backing, const DecoderStateLayout& layout)
     : text_kv(backing, layout.text_kv) {
     if (layout.mtp_kv) { mtp_kv.emplace(backing, *layout.mtp_kv); }
 }

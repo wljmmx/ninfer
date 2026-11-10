@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
+#include "models/qwen3_5/config.h"
 #include "ninfer/ops/qsa.h"
 
 #include <cstddef>
@@ -22,6 +23,10 @@ struct QsaGeometry {
     std::int32_t tail_columns   = 0;  // 3, the incomplete block's visible prefix
     std::int32_t layers         = 0;  // indexed layer count
 };
+
+// The artifact's declared geometry, or a zero `layers` when this model line has no indexed mixer.
+// Every number comes from the config, so a plan can never outlive the geometry it was sized for.
+[[nodiscard]] QsaGeometry qsa_geometry(const TextConfig& config);
 
 // Everything the transient side depends on, taken from the controller's resolved dial values rather
 // than compiled-in caps: `min_tokens`/`max_tokens` are the prefill chunk interval the plan resolved
@@ -55,5 +60,14 @@ struct QsaPlanInputs {
 // never drift from what execution asks for.
 [[nodiscard]] std::size_t qsa_indexer_workspace_bytes(const QsaPlanInputs& inputs);
 [[nodiscard]] std::size_t qsa_sparse_gqa_workspace_bytes(const QsaPlanInputs& inputs);
+
+// The inputs both scratch queries take, from the artifact and the resolved dial values. `first`/`last`
+// are the layer's column interval (a prefill chunk, or a decode width) and `batch` its concurrency;
+// `visible_tokens` is the host-side upper bound on any live p+1, which both Ops use as their
+// envelope and which therefore has to be the same number at plan time and at execution time.
+[[nodiscard]] QsaPlanInputs qsa_plan_inputs(const TextConfig& config, std::int32_t first,
+                                            std::int32_t last, std::int32_t batch,
+                                            KvCacheStorage storage, std::uint32_t visible_tokens,
+                                            DeviceExecutionView execution);
 
 } // namespace ninfer::models::qwen3_5::execution

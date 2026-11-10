@@ -84,6 +84,57 @@ TextAttentionResultRoots text_attention_results(Allocator& allocator, const Text
     };
 }
 
+struct QsaPassBindings {
+    // Live columns per row, the record column base of the call's first token, and the record
+    // offset prepare writes from. All three are device metadata of the current pass: the first is
+    // the row's live prefix, the other two are `positions[0,b]` and zero.
+    Tensor columns;
+    Tensor base_positions;
+    Tensor offsets;
+};
+
+template <class Allocator>
+QsaPassBindings qsa_pass_bindings(Allocator& allocator) {
+    return {vector(allocator, DType::I32, 8), vector(allocator, DType::I32, 8),
+            vector(allocator, DType::I32, 8)};
+}
+
+// One indexed layer's transient side. The projections take the same shape they do in the dense
+// mixer (`[row_width, tokens]`, tokens = T*B), and `query`/`index_query` are normalized and rotated
+// in place by prepare, which the Op admits exactly.
+struct QsaRoots {
+    Tensor index_query;    // BF16 [4*128, tokens], prepared in place
+    Tensor index_key;      // BF16 [128, tokens], raw projection words
+    Tensor attention;      // BF16 [query_width, tokens], post-gate attention output
+    Tensor block_ids;      // I32 [512, tokens]
+    Tensor block_counts;   // I32 [tokens]
+    Tensor record_keys;    // BF16 [128, tokens]
+    Tensor record_rope;    // I32 [3, tokens]
+    // Diagnosis only (NINFER_QSA_DENSE_READ): the read-only dense consumer normalizes its query
+    // into its own buffer, which the sparse path never needs.
+    Tensor normalized_query;
+};
+
+template <class Allocator>
+QsaRoots qsa_roots(Allocator& allocator, const TextConfig& config, std::int32_t tokens) {
+    const auto& indexer = config.indexer.value();
+    const auto query_width = dimension(config.attention->query_width());
+    QsaRoots out;
+    out.index_query = matrix(allocator, DType::BF16, dimension(indexer.query_width()), tokens);
+    out.index_key   = matrix(allocator, DType::BF16, dimension(indexer.key_width()), tokens);
+    out.attention   = matrix(allocator, DType::BF16, query_width, tokens);
+    out.block_ids   = matrix(allocator, DType::I32, 512, tokens);
+    out.block_counts = vector(allocator, DType::I32, tokens);
+    out.record_keys  = matrix(allocator, DType::BF16, dimension(indexer.head_dim), tokens);
+    out.record_rope  = matrix(allocator, DType::I32, 3, tokens);
+    return out;
+}
+
+template <class Allocator>
+Tensor qsa_dense_query(Allocator& allocator, const TextConfig& config, std::int32_t tokens) {
+    return matrix(allocator, DType::BF16, dimension(config.attention->query_width()), tokens);
+}
+
 struct GdnControlRoots {
     Tensor hidden;
     Tensor g;

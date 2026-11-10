@@ -3,6 +3,7 @@
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/gdn.h"
 #include "models/qwen3_5/execution/mtp.h"
+#include "models/qwen3_5/execution/qsa.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/planning/startup.h"
@@ -163,19 +164,33 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                     "MTP Paged KV physical pages exceed int32"));
     LayoutBuilder builder;
     PersistentLayout out;
-    out.decoder = qwen3_5::plan_decoder_state(
-        builder, qwen3_5::DecoderStateSpec{
-                     .full_attention_layers     = config.full_attention_layers,
-                     .mtp_layers                = 1,
-                     .capacity                  = plan.capacity,
-                     .kv_heads                  = dimension(config.attention->num_key_value_heads),
-                     .attention_head_dim        = dimension(config.attention->head_dim),
-                     .kv_storage                = plan.kv_storage,
-                     .enable_mtp                = plan.features.mtp(),
-                     .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
-                     .text_physical_page_groups = physical_pages,
-                     .mtp_physical_page_groups  = mtp_physical_pages,
-                 });
+    qwen3_5::DecoderStateSpec decoder_spec{
+        .full_attention_layers     = config.full_attention_layers,
+        .mtp_layers                = 1,
+        .capacity                  = plan.capacity,
+        .kv_heads                  = dimension(config.attention->num_key_value_heads),
+        .attention_head_dim        = dimension(config.attention->head_dim),
+        .kv_storage                = plan.kv_storage,
+        .enable_mtp                = plan.features.mtp(),
+        .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
+        .text_physical_page_groups = physical_pages,
+        .mtp_physical_page_groups  = mtp_physical_pages,
+    };
+    {
+        // QSA: the index plane and the raw-index-key tail live in the text cache's page space, so
+        // they are planned beside it and in the same slot space the Linear Attention states use.
+        const execution::QsaGeometry geometry = execution::qsa_geometry(config);
+        if (geometry.layers != 0) {
+            decoder_spec.qsa = qwen3_5::QsaCacheSpec{
+                .indexed_layers        = static_cast<std::uint32_t>(geometry.layers),
+                .index_head_dim        = geometry.index_head_dim,
+                .index_blocks_per_page = execution::qsa_index_blocks_per_page(geometry),
+                .tail_columns          = geometry.tail_columns,
+                .state_slots           = state_image_slots,
+            };
+        }
+    }
+    out.decoder = qwen3_5::plan_decoder_state(builder, decoder_spec);
     qwen3_5::StateImageSpec state_image_spec{
         .linear =
             {
@@ -362,6 +377,16 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         scratch(layout, ops::linear_workspace_capacity_bytes(p.weight.qtype, p.weight.n, p.weight.k,
                                                              p.policy, first, last));
     };
+    // QSA: both debug arms allocate buffers the production path never touches - the dense mixer for
+    // NINFER_QSA_FORCE_FULL, the normalized query alone for NINFER_QSA_DENSE_READ - so the plan
+    // follows the switch instead of paying for them on every run.
+    const bool qsa_dense_probe = std::getenv("NINFER_QSA_FORCE_FULL") != nullptr;
+    const bool qsa_read_probe  = std::getenv("NINFER_QSA_DENSE_READ") != nullptr;
+    const bool qsa_enabled     = config.indexed_attention_layers != 0;
+    // The QSA Ops bound a live p+1 at 262144 (qsa.h's visible-token ceiling), so the envelope is
+    // the resolved capacity clamped to that - the same number execution passes.
+    constexpr std::uint32_t kQsaVisibleCeiling = 262144;
+    const std::uint32_t qsa_visible = std::min(plan.capacity, kQsaVisibleCeiling);
     const auto add_scratch = [&](WorkspaceLayoutBuilder& layout,
                                  const execution::LinearParameters& p, int first, int last) {
         scratch(layout, std::max(ops::linear_add_workspace_capacity_bytes(
@@ -374,6 +399,18 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                  std::int32_t batch_size, std::int32_t min_width,
                                  std::int32_t max_width,
                                  ops::CausalAttentionExecutionEnvelope envelope) {
+        // One indexed layer's Ops size their scratch from the layer's own column interval and the
+        // batch it runs at. A merged prefill pass reaches the concurrency bound through the same
+        // arena as the single-lane chunk, so the prefill body has to price the rectangle too.
+        const std::int32_t qsa_batch =
+            phase == qwen3_5::TextPhase::Prefill ? static_cast<std::int32_t>(plan.max_concurrency)
+                                                 : batch_size;
+        const execution::QsaPlanInputs qsa_inputs =
+            qsa_enabled
+                ? execution::qsa_plan_inputs(config, first, last, qsa_batch, plan.kv_storage,
+                                             qsa_visible, device_execution)
+                : execution::QsaPlanInputs{};
+        if (qsa_enabled) { (void)workspace::qsa_pass_bindings(layout); }
         for (const auto& block : parameters.text.layers) {
             // The four-stream correction runs before and after every mixer and before every FFN, and
             // its Down/Up scratch is the largest single reservation in the stage.
@@ -394,13 +431,29 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     (void)workspace::text_attention_projection(layout, config, last);
                     scratch(layout, execution::attention_projection_workspace_bytes(*attention,
                                                                                     first, last));
-                    (void)workspace::text_attention_results(layout, config, last);
-                    scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
-                                        {dimension(config.attention->head_dim),
-                                         dimension(config.attention->num_attention_heads),
-                                         dimension(config.attention->num_key_value_heads)},
-                                        plan.kv_storage, envelope, batch_size, min_width, max_width,
-                                        device_execution));
+                    const bool indexed =
+                        attention->indexer.has_value() && !qsa_dense_probe;
+                    if (!indexed || qsa_read_probe) {
+                        (void)workspace::text_attention_results(layout, config, last);
+                        scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
+                                            {dimension(config.attention->head_dim),
+                                             dimension(config.attention->num_attention_heads),
+                                             dimension(config.attention->num_key_value_heads)},
+                                            plan.kv_storage, envelope, batch_size, min_width,
+                                            max_width, device_execution));
+                    }
+                    if (indexed) {
+                        // The projection halves the indexer keeps apart, the two stateful Ops'
+                        // own scratch, and the selection/record planes they publish.
+                        linear_scratch(layout, attention->indexer->query, first, last);
+                        linear_scratch(layout, attention->indexer->key, first, last);
+                        (void)workspace::qsa_roots(layout, config, last);
+                        if (qsa_read_probe) {
+                            (void)workspace::qsa_dense_query(layout, config, last);
+                        }
+                        scratch(layout, execution::qsa_indexer_workspace_bytes(qsa_inputs));
+                        scratch(layout, execution::qsa_sparse_gqa_workspace_bytes(qsa_inputs));
+                    }
                     add_scratch(layout, attention->output, first, last);
                 } else {
                     const auto& gdn = std::get<execution::GdnParameters>(block.mixer);

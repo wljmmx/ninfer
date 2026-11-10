@@ -695,10 +695,20 @@ public:
         if (w.input_hc) out.input_hc = hc(*w.input_hc);
         if (w.post_attention_hc) out.post_attention_hc = hc(*w.post_attention_hc);
         if (const auto* a = std::get_if<AttentionWeights>(&w.mixer)) {
-            out.mixer = AttentionParameters{
+            AttentionParameters attention{
                 ops::prepare_attn_input_proj_weights(model_.input(a->query), model_.input(a->key),
                                                      model_.input(a->gate), model_.input(a->value)),
-                tensor(a->query_norm), tensor(a->key_norm), linear(a->output)};
+                tensor(a->query_norm), tensor(a->key_norm), linear(a->output), std::nullopt};
+            if (a->indexer) {
+                // QSA's two extra matrices are their own parents in this artifact, so they are bound
+                // as separate Linears instead of one merged six-output parent. The Op family admits
+                // that form; the layer runs each segment through ops::linear.
+                attention.indexer = IndexerParameters{linear(a->indexer->query),
+                                                      linear(a->indexer->key),
+                                                      tensor(a->indexer->query_norm),
+                                                      tensor(a->indexer->key_norm)};
+            }
+            out.mixer = std::move(attention);
             out.projection_prefetch =
                 prefetch(std::get<AttentionParameters>(out.mixer).projection, a->query);
         } else {

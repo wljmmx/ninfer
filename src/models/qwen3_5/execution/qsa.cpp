@@ -1,8 +1,45 @@
 #include "models/qwen3_5/execution/qsa.h"
 
+#include <limits>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::models::qwen3_5::execution {
+namespace {
+
+// This header is also used by the planner before any execution object exists, so it reads the
+// config's own integers instead of borrowing the execution dimension wrapper.
+std::int32_t positive_dimension(std::uint64_t value, const char* label) {
+    if (value == 0 || value > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::invalid_argument(std::string("qsa plan: invalid ") + label);
+    }
+    return static_cast<std::int32_t>(value);
+}
+
+} // namespace
+
+QsaGeometry qsa_geometry(const TextConfig& config) {
+    QsaGeometry geometry;
+    if (config.indexed_attention_layers == 0) { return geometry; }
+    if (!config.indexer || !config.attention) {
+        throw std::invalid_argument("qsa plan: indexed layers need an indexer and attention config");
+    }
+    geometry.layers         = positive_dimension(config.indexed_attention_layers, "layer count");
+    geometry.head_dim       = positive_dimension(config.attention->head_dim, "head extent");
+    geometry.kv_heads       = positive_dimension(config.attention->num_key_value_heads, "KV heads");
+    geometry.index_head_dim = positive_dimension(config.indexer->head_dim, "index head extent");
+    geometry.block_tokens   = positive_dimension(config.indexer->compress_ratio, "block size");
+    geometry.page_tokens    = static_cast<std::int32_t>(kPagedKVPageSize);
+    // The raw index-key tail holds the unfinished block's already-projected columns: a block of
+    // `block_tokens` tokens has `block_tokens - 1` of them still unwritten when the next call
+    // starts inside it.
+    geometry.tail_columns = geometry.block_tokens - 1;
+    if (geometry.tail_columns <= 0 ||
+        geometry.page_tokens % geometry.block_tokens != 0) {
+        throw std::invalid_argument("qsa plan: the index block size is not usable");
+    }
+    return geometry;
+}
 
 std::int32_t qsa_index_blocks_per_page(const QsaGeometry& geometry) {
     if (geometry.page_tokens <= 0 || geometry.block_tokens <= 0 ||
@@ -63,6 +100,26 @@ std::size_t qsa_sparse_gqa_workspace_bytes(const QsaPlanInputs& inputs) {
                                                         inputs.kv_heads, inputs.min_tokens,
                                                         inputs.max_tokens, inputs.batch_size,
                                                         inputs.gqa, inputs.execution);
+}
+
+QsaPlanInputs qsa_plan_inputs(const TextConfig& config, std::int32_t first, std::int32_t last,
+                              std::int32_t batch, KvCacheStorage storage,
+                              std::uint32_t visible_tokens, DeviceExecutionView execution) {
+    if (!config.indexer) { throw std::invalid_argument("qsa plan: the layer has no indexer"); }
+    QsaPlanInputs inputs;
+    inputs.min_tokens  = first;
+    inputs.max_tokens  = last;
+    inputs.batch_size  = batch;
+    inputs.query_heads = positive_dimension(config.attention->num_attention_heads, "query heads");
+    inputs.kv_heads    = positive_dimension(config.attention->num_key_value_heads, "KV heads");
+    inputs.storage     = storage;
+    // Both stateful Ops take the same host-side bound: the deepest position any live query can
+    // name. It is a resource promise over the batch maximum, never a mask, and it fixes the launch
+    // topology and the scratch size - hence one number for plan and execution.
+    inputs.indexer.max_visible_tokens = visible_tokens;
+    inputs.gqa.max_visible_tokens     = visible_tokens;
+    inputs.execution                  = execution;
+    return inputs;
 }
 
 } // namespace ninfer::models::qwen3_5::execution

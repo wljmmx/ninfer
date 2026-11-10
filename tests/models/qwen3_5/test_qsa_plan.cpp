@@ -6,6 +6,7 @@
 #include <string>
 
 using namespace ninfer;
+using namespace ninfer::models::qwen3_5;
 using namespace ninfer::models::qwen3_5::execution;
 
 namespace {
@@ -65,6 +66,22 @@ int main() {
                                      3 * std::size_t{slots} * sizeof(std::int32_t)),
           "tail bytes");
 
+    // The geometry is derived from the artifact's own config, so a plan can never outlive the
+    // numbers it was sized for.
+    TextConfig config;
+    config.indexed_attention_layers = 12;
+    config.attention                = AttentionConfig{24, 2, 256};
+    config.indexer                  = IndexerConfig{4, 1, 128, 4, 2048};
+    const QsaGeometry declared      = qsa_geometry(config);
+    check(declared.layers == 12 && declared.head_dim == 256 && declared.kv_heads == 2 &&
+              declared.index_head_dim == 128 && declared.block_tokens == 4 &&
+              declared.page_tokens == kPagedKVPageSize && declared.tail_columns == 3,
+          "declared geometry");
+    check(qsa_index_pool_bytes(declared, 32) == qsa_index_pool_bytes(geometry, 32),
+          "declared geometry prices the same index pool");
+    check(qsa_tail_state_bytes(declared, slots) == tail,
+          "declared geometry prices the same tail state");
+
     // The transient side is delegated, so the plan cannot drift from the ops' own queries. The
     // interval is what a controller dial resolves: a prefill chunk or a decode width, not a cap.
     QsaPlanInputs inputs{
@@ -86,6 +103,15 @@ int main() {
     check(gqa == ops::qsa_sparse_gqa_workspace_capacity_bytes(
                       KvCacheStorage::BFloat16, 24, 2, 1, 1024, 1, inputs.gqa, inputs.execution),
           "sparse GQA workspace matches the op query");
+    // ... and the config-driven form the planner actually calls resolves to the same two numbers.
+    check(qsa_indexer_workspace_bytes(qsa_plan_inputs(config, 1, 1024, 1,
+                                                      KvCacheStorage::BFloat16, 2048,
+                                                      inputs.execution)) == indexer,
+          "config-driven indexer workspace");
+    check(qsa_sparse_gqa_workspace_bytes(qsa_plan_inputs(config, 1, 1024, 1,
+                                                        KvCacheStorage::BFloat16, 2048,
+                                                        inputs.execution)) == gqa,
+          "config-driven sparse GQA workspace");
 
     // Wider intervals and larger batches must not shrink: the dial only moves the interval.
     QsaPlanInputs wider = inputs;
@@ -105,6 +131,8 @@ int main() {
     check_throws([&] { (void)qsa_tail_state_bytes(geometry, 0); }, "zero-slot tail state");
     check_throws([&] { (void)qsa_indexer_workspace_bytes(QsaPlanInputs{}); },
                  "indexer without head geometry");
+    config.indexed_attention_layers = 0;
+    check(qsa_geometry(config).layers == 0, "a model without indexed layers plans no QSA state");
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " qsa_plan (page group " << page_group
               << " B, pool@32 " << qsa_index_pool_bytes(geometry, 32) << " B, tail@" << slots << " "

@@ -128,10 +128,21 @@ struct RoutedMoeParameters {
 using FfnParameters =
     std::variant<DenseParameters, ops::SparseMoeWeights, RoutedMoeParameters>;
 
+// Qwen4Exp's sparse indexer: two small matrices that score four-token KV blocks before the main
+// softmax. The artifact keeps both apart from the mixer's fused parent, so each is its own Linear -
+// `query` is [4*128,H] (four index heads), `key` is [128,H] - and both norms are unit-offset
+// vectors exactly like the mixer's.
+struct IndexerParameters {
+    LinearParameters query, key;
+    Tensor query_norm, key_norm;
+};
+
 struct AttentionParameters {
     ops::ProjectionWeights projection;
     Tensor query_norm, key_norm;
     LinearParameters output;
+    // Absent on a plain attention layer; present on every indexed one.
+    std::optional<IndexerParameters> indexer;
 };
 
 struct GdnParameters {
