@@ -161,6 +161,45 @@ void hc_mix(const Tensor& normalized, const HcFinalMixWeights& weights, Workspac
             Tensor& sample_hidden, DeviceExecutionView execution);
 
 /**
+ * The same block mix with the injection rows bound as their own matrix.
+ *
+ * An artifact that keeps `down` and `inject` as two row regions of one quantized object cannot be
+ * described by HcMixWeights, whose down_injection is a single 324-row contiguous BF16 matrix: a
+ * row-split groupwise format stores each region's planes at its own offset. The mathematics,
+ * outputs and effects of this overload are those of HcMixWeights; only the weight geometry differs.
+ *
+ * Supported weight domain:
+ *   down is Q5_G64_FP16 RowSplit [320,10240], inject is Q5_G64_FP16 RowSplit [4,10240], and up is
+ *   Q5_G64_FP16 RowSplit [10240,320]. The padded K of each matrix is the artifact's own
+ *   (aligned to 128) and every plane base is 16-byte aligned. Any other format or geometry is
+ *   refused by name, so a mismatch is a diagnostic rather than a silent misread. The quantized
+ *   codes are decoded where they are consumed; no dequantized copy is resident.
+ *
+ * Numeric:
+ *   The oracle's weights are the values the stored 5-bit codes and FP16 group scales represent.
+ *   Up consumes BF16-decoded weight tiles, which is the same storage form the dense BF16 form
+ *   already stages, so the mixing budgets apply unchanged.
+ */
+struct HcSeparateMixWeights {
+    Weight down;   // Q5 RowSplit [320,10240].
+    Weight inject; // Q5 RowSplit [4,10240].
+    Weight up;     // Q5 RowSplit [10240,320], row=s*2560+d.
+};
+
+void hc_mix(const Tensor& normalized, const HcSeparateMixWeights& weights,
+            WorkspaceArena& workspace, Tensor& block_input, Tensor& injection,
+            DeviceExecutionView execution);
+
+/** Final form of the separate-weight mix: down [320,10240] and up [10240,320], no injection. */
+struct HcFinalSeparateMixWeights {
+    Weight down;
+    Weight up;
+};
+
+void hc_mix(const Tensor& normalized, const HcFinalSeparateMixWeights& weights,
+            WorkspaceArena& workspace, Tensor& sample_hidden, DeviceExecutionView execution);
+
+/**
  * Minimum call-local workspace high-water capacity from a 256-byte-aligned arena cursor, for every
  * M in the inclusive positive [min_tokens,max_tokens] interval under the same weight metadata and
  * execution facts. Includes private activations, Down partials, internal scratch and alignment,
@@ -177,5 +216,12 @@ void hc_mix(const Tensor& normalized, const HcFinalMixWeights& weights, Workspac
                                                           std::int32_t min_tokens,
                                                           std::int32_t max_tokens,
                                                           DeviceExecutionView execution);
+[[nodiscard]] std::size_t hc_mix_workspace_capacity_bytes(const HcSeparateMixWeights& weights,
+                                                          std::int32_t min_tokens,
+                                                          std::int32_t max_tokens,
+                                                          DeviceExecutionView execution);
+[[nodiscard]] std::size_t hc_mix_workspace_capacity_bytes(
+    const HcFinalSeparateMixWeights& weights, std::int32_t min_tokens, std::int32_t max_tokens,
+    DeviceExecutionView execution);
 
 } // namespace ninfer::ops

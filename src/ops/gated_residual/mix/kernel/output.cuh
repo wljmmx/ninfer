@@ -22,4 +22,23 @@ struct DownOutput {
     }
 };
 
+// The separate-weight form launches the low-rank rows and the injection rows as two matrices, so
+// each has its own single-purpose store: the fused row branch above never fires there.
+struct RankActivationOutput {
+    __nv_bfloat16* activation;
+
+    __device__ __forceinline__ void store(int row, int token, float dot) const {
+        const float a                                 = dot * 0.25F;
+        activation[std::int64_t(token) * kRank + row] = __float2bfloat16_rn(a * sigmoid_gate(a));
+    }
+};
+
+struct InjectionOutput {
+    float* injection;
+
+    __device__ __forceinline__ void store(int row, int token, float dot) const {
+        injection[std::int64_t(token) * kStreams + row] = 2.F * sigmoid(dot * 0.25F);
+    }
+};
+
 } // namespace ninfer::ops::detail::hc::mix

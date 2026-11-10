@@ -30,6 +30,15 @@ inline Layout layout(Kind kind, Plan plan, std::int32_t columns) {
     return {u, temporary, b.finish(1)};
 }
 
+// The separate-weight (Q5) form reduces inside the SIMT kernel and folds in the Up kernel, so the
+// only reservation is the rank-wide SiLU activation the fold reads back.
+inline Layout layout_separate(std::int32_t columns) {
+    LayoutBuilder b;
+    const auto u = b.add(operand::bytes(std::uint64_t(kRank) * columns, 2, "hc_mix"), 256,
+                         "HC low-rank activation");
+    return {u, LayoutRegion{}, b.finish(1)};
+}
+
 inline Scratch allocate_workspace(WorkspaceArena& arena, Layout l) {
     const auto storage = arena.alloc_bytes(l.bytes, 256);
     return {storage, l.activation.bind(storage).data,
