@@ -1,5 +1,6 @@
 #include "ninfer/ops/qsa.h"
 #include "ops/softmax_attention/qsa/launch.h"
+#include "ops/softmax_attention/qsa/storage.h"
 #include "ops/softmax_attention/qsa/validation.h"
 
 #include <cmath>
@@ -56,6 +57,9 @@ void qsa_prepare(const QsaProjectionView& p, const QsaPrepareParameters& paramet
     const auto& main = cache.main;
     const int pages  = main.k_pages.ne[3];
     v.require(main.head_dim == 256 && main.num_kv_heads == kv_heads, "cache geometry");
+    if (!detail::qsa::qsa_storage_supported(main.storage)) {
+        detail::qsa::throw_unsupported_storage("qsa_prepare", main.storage);
+    }
     const auto layout        = paged_kv_storage_layout(main.storage, 256);
     const auto vector_planes = [&](const Tensor& data, const Tensor& scale,
                                    const PagedKVVectorLayout& schema) {

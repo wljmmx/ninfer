@@ -1,7 +1,9 @@
 #include "sparse_gqa_fixture.h"
 #include "core/decode_graph.h"
+#include "ops/softmax_attention/qsa/storage.h"
 
 #include <cstdlib>
+#include <string>
 
 using namespace ninfer;
 using namespace ninfer::test;
@@ -289,6 +291,23 @@ int validation(DeviceContext& device) {
             (void)capacity(KvCacheStorage::Fp8E4M3Row256, 24, 1, 1, 1, f.envelope,
                            device.execution_view());
         });
+    // Every enumerator is accounted for: the five implemented profiles reach the switch's own
+    // gate, and the five rk profiles the dense path owns are refused by name. A new enumerator
+    // lands in whichever arm it belongs to instead of falling through a generic default.
+    for (int raw = 0; raw <= static_cast<int>(KvCacheStorage::RK4V2E8); ++raw) {
+        const auto storage = static_cast<KvCacheStorage>(raw);
+        const bool implemented = raw <= static_cast<int>(KvCacheStorage::Fp8KeyNvfp4Value);
+        if (!implemented) {
+            bool named = false;
+            try {
+                (void)capacity(storage, 24, 2, 1, 1, f.envelope, device.execution_view());
+            } catch (const std::exception& e) {
+                const std::string message = e.what();
+                named = message.find(ops::detail::qsa::qsa_storage_name(storage)) != std::string::npos;
+            }
+            failures += named ? 0 : 1;
+        }
+    }
     // Only the two local geometries are admitted; a mismatched pair is a contract error.
     failures += rejects([&] {
         (void)ops::qsa_sparse_gqa_workspace_capacity_bytes(KvCacheStorage::BFloat16, 24, 1, 1, 1, 1,

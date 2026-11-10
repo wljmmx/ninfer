@@ -1,5 +1,6 @@
 #include "ops/softmax_attention/qsa/launch.h"
 #include "ops/softmax_attention/qsa/prepare_kernel.cuh"
+#include "ops/softmax_attention/qsa/storage.h"
 
 #include <array>
 #include <cmath>
@@ -138,7 +139,9 @@ void launch_prepare(const QsaProjectionView& projected, const QsaPrepareParamete
         dispatch<KvCacheStorage::Fp8KeyNvfp4Value>(args, parameters.rope_theta, execution.stream);
         break;
     default:
-        throw std::invalid_argument("qsa_prepare: unsupported KV storage");
+        // Unreachable through the public entry, which refuses an unimplemented storage by name
+        // before it gets here; kept so a new enumerator cannot be dispatched silently.
+        throw_unsupported_storage("qsa_prepare", cache.main.storage);
     }
     CUDA_CHECK(cudaGetLastError());
 }

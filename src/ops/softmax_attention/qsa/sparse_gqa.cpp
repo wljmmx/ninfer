@@ -1,5 +1,6 @@
 #include "ninfer/ops/qsa.h"
 #include "ops/softmax_attention/qsa/sparse_gqa_plan.h"
+#include "ops/softmax_attention/qsa/storage.h"
 #include "ops/softmax_attention/qsa/validation.h"
 
 #include <cstdlib>
@@ -21,12 +22,11 @@ void profile(KvCacheStorage storage, int query_heads, int kv_heads, int lo, int 
     v.require((query_heads == 24 && kv_heads == 2) || (query_heads == 12 && kv_heads == 1),
               "query/KV heads");
     v.require(envelope.max_visible_tokens <= 262144, "visible-token capacity");
-    const bool quantized = storage == KvCacheStorage::Fp8E4M3Row256 ||
-                           storage == KvCacheStorage::Int8Group64 ||
-                           storage == KvCacheStorage::Nvfp4Group16 ||
-                           storage == KvCacheStorage::Fp8KeyNvfp4Value;
-    v.require(storage == KvCacheStorage::BFloat16 || (quantized && quantized_kv_enabled()),
-              "cache storage");
+    // The implemented set is shared with prepare; the low-bit profiles additionally sit behind
+    // NINFER_QSA_SPARSE_GQA_QUANT_KV until each one has been through its own gate on this port.
+    if (!detail::qsa::qsa_storage_supported(storage)) { detail::qsa::throw_unsupported_storage("qsa_sparse_gqa", storage); }
+    const bool quantized = storage != KvCacheStorage::BFloat16;
+    v.require(!quantized || quantized_kv_enabled(), "cache storage (NINFER_QSA_SPARSE_GQA_QUANT_KV)");
     v.require(lo > 0 && hi >= lo && batch >= 1 && batch <= 8, "T/B interval");
     v.require(execution.multiprocessor_count > 0, "SM count");
 }
