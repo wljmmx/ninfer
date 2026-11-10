@@ -279,6 +279,11 @@ int main() {
         for (int history :
              {1, 3, 4, 5, 2047, 2048, 2049, 2050, 2051, 2052, 2053, 32764, 32768, 32772, 262144})
             failures += run(device, 1, 1, history, 0, Pattern::Dyadic);
+        // A decode-shaped window (one query, one row) whose history crosses the 512-block
+        // all-select bound, at the smallest capacity that admits it: the geometry a long-context
+        // single-lane decode actually presents.
+        for (int history : {2049, 2053, 2253, 4093})
+            failures += run(device, 1, 1, history, 0, Pattern::Dyadic, false, 8192);
         for (int capacity : {2051, 2052, 16388})
             failures += run(device, 5, 3, capacity, 1, Pattern::Dyadic, true, capacity);
         for (int t : {2, 3, 4, 5, 8, 9, 16, 17, 31, 32, 33, 63, 64, 65})

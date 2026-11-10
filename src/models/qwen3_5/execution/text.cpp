@@ -2096,8 +2096,12 @@ void TextContext::qsa_mix(const BlockParameters& w, Tensor& x, int fidx, Phase, 
                     projected.value.view({head_dim, kv_heads, T}), fidx, T, s);
 
     // The envelope is the resolved capacity, which is also what the startup plan priced: a host
-    // launch promise, fixed across every replay, never a mask.
-    const auto visible = std::min<std::uint32_t>(kv_.max_context(), 262144U);
+    // launch promise, fixed across every replay, never a mask. It is taken from the cache the Ops
+    // actually address: a decode pass binds its tables through `batch_text_kv_` and leaves `kv_`
+    // empty, and a zero envelope would let the Ops size nothing and then score live blocks.
+    const auto visible =
+        std::min<std::uint32_t>(batch_text_kv_->max_context(), 262144U);
+    if (visible == 0) { throw std::logic_error("QSA envelope needs a resolved cache capacity"); }
     Tensor attention   = qsa.attention.view({head_dim, query_hd, T, batch});
     // The read-only dense Op takes one execution row's own table, which only a single-lane pass
     // carries; a batch traversal binds its tables through `batch_text_kv_` instead, so it stays on
