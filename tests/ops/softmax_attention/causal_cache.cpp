@@ -178,6 +178,13 @@ constexpr Geometry kGeometries[] = {
     {"d256-h16-kv2", 16, 2},
 };
 
+// Qwen4Exp's indexed (QSA) layers: 24 query heads over 2 KV heads at D256, so a GQA group of 12.
+// Only the BF16 KV family instantiates that pair (the quantized families are keyed by the same two
+// pairings they always had), so its cases run under BF16 storage and its storage scope is asserted
+// separately. The 4-head pairing of the same query head count stays kGeometries[0] with its own
+// full matrix.
+constexpr Geometry kQwen4Gqa12{"d256-h24-kv2", 24, 2};
+
 ops::AttentionHeadGeometry op_geometry(const Geometry& geometry) {
     return {kHeadDim, geometry.q_heads, geometry.kv_heads};
 }
@@ -3522,11 +3529,121 @@ int run_page_score_contract_cases(DeviceExecutionView execution, KvCacheStorage 
     return failures;
 }
 
+// Qwen4Exp GQA-12 (24 query heads over 2 KV heads at D256). The row axis of a grouped CTA is
+// `width * group`, so a group of 12 moves every rung of that family: a decode CTA packs 12 rows of
+// its 16, the 32-row instance ends at width 2, the 64-row one at width 5, and width 6 is the first
+// with two query tiles. The widths below sit on and between those edges, then move to the
+// batch-wide route (width > 16) and to production-length rows.
+int run_qwen4_gqa12_cases(DeviceExecutionView execution, KvCacheStorage storage) {
+    if (storage != KvCacheStorage::BFloat16) { return 0; }
+    const Geometry& geometry = kQwen4Gqa12;
+    int failures             = 0;
+
+    for (const int width : {1, 2, 3, 5, 6, 7, 15, 16, 17}) {
+        failures += run_a1_case(execution, geometry, storage, {width, 61, 192, 2300u + width},
+                                MappingPattern::Fragmented);
+    }
+    for (const int width : {1, 6, 16, 17}) {
+        failures += run_a3_case(execution, geometry, storage, {width, 63, 192, 2320u + width},
+                                MappingPattern::Offset);
+    }
+    // A single appended and a single cached token against a long prefix: the decode partition is
+    // built from the live row length, so this is where the split ladder meets 8192 keys.
+    failures += run_a1_case(execution, geometry, storage, {1, 8191, 8192, 2340u},
+                            MappingPattern::Fragmented);
+    failures += run_a3_case(execution, geometry, storage, {1, 8191, 8192, 2341u},
+                            MappingPattern::Fragmented);
+
+    // Prefill through the batch-wide kernel, including a partial last query tile.
+    const std::array<int, 4> prefill_queries{0, 63, 64, 127};
+    const std::array<int, 3> prefill_tail_queries{0, 127, 256};
+    failures += run_a1_case(execution, geometry, storage, {129, 2048, 3072, 2350u},
+                            MappingPattern::Fragmented, prefill_queries);
+    failures += run_a3_case(execution, geometry, storage, {257, 1024, 4096, 2351u},
+                            MappingPattern::Fragmented, prefill_tail_queries);
+
+    // 2048 new tokens over a 4096-token prefix: the longest row here sees 6144 keys, so the causal
+    // mask and the 12-way KV reuse are qualified at production context rather than near the frontier.
+    const std::array<int, 5> long_queries{0, 511, 1023, 1536, 2047};
+    failures += run_a1_case(execution, geometry, storage, {2048, 4096, 8192, 2360u},
+                            MappingPattern::Fragmented, long_queries);
+    failures += run_a3_case(execution, geometry, storage, {2048, 4093, 8192, 2361u},
+                            MappingPattern::Fragmented, long_queries);
+
+    // Graph replay on both routes: a grouped decode row and a batch-wide cached prefill.
+    const std::array<int, 3> wide_graph_queries{0, 63, 255};
+    failures += run_a1_case(execution, geometry, storage, {1, 63, 64, 2370u, false, true},
+                            MappingPattern::Fragmented);
+    failures += run_a1_case(execution, geometry, storage, {7, 511, 576, 2371u, false, true},
+                            MappingPattern::Fragmented);
+    failures += run_a3_case(execution, geometry, storage, {256, 8192, 9216, 2372u, false, true},
+                            MappingPattern::Fragmented, wide_graph_queries);
+
+    // The 32768-key rung: the split ladder switches to its long target there, and with 2 KV heads a
+    // group of 12 leaves half the independent tiles of the 4-head pairing, so the target and hence
+    // the partial capacity change. One row sits just below, one on and one above the rung; every
+    // width stays inside the grouped route (<= 16), which is the only one that splits.
+    failures += run_a1_case(execution, geometry, storage, {1, 32767, 32768, 2390u},
+                            MappingPattern::Fragmented);
+    failures += run_a3_case(execution, geometry, storage, {16, 32752, 32768, 2391u},
+                            MappingPattern::Fragmented);
+    failures += run_a3_case(execution, geometry, storage, {8, 40000, 41000, 2392u},
+                            MappingPattern::Fragmented);
+
+    // Two requests in one call: the group axis is per KV head, so a batch must keep every row's own
+    // KV head, table row and mask.
+    failures += run_batch_case(execution, geometry, storage,
+                               {16, {63}, {16}, {0}, MappingPattern::Identity, 2380u});
+    failures += run_batch_case(execution, geometry, storage,
+                               {8, {127, 63}, {8, 3}, {1, 0}, MappingPattern::Fragmented, 2381u});
+
+    // The capacity query and the allocation have to mirror for this group too: the interval answer
+    // must be the maximum of the per-width answers the grouped launch itself would allocate.
+    constexpr ops::CausalAttentionExecutionEnvelope capacity_envelope{1, 131072};
+    for (const int sm_count : {96, 128, 170, 192}) {
+        const DeviceExecutionView host_execution{nullptr, sm_count};
+        std::size_t largest = 0;
+        for (int width = 1; width <= 17; ++width)
+            largest = std::max(largest, ops::causal_softmax_attention_workspace_capacity_bytes(
+                                            op_geometry(geometry), storage, capacity_envelope, 1,
+                                            width, width, host_execution));
+        const auto capacity = ops::causal_softmax_attention_workspace_capacity_bytes(
+            op_geometry(geometry), storage, capacity_envelope, 1, 1, 17, host_execution);
+        if (capacity != largest) {
+            std::cerr << "causal_softmax_attention 24q/2kv capacity interval mismatch for SM="
+                      << sm_count << '\n';
+            ++failures;
+        }
+    }
+    return failures;
+}
+
+// The 24/2 pairing is a BF16-only instantiation, and the wider admission must not turn into "any
+// geometry passes": an uninstantiated pair still has to be rejected by name.
+int verify_gqa12_admission_scope(DeviceExecutionView execution) {
+    int failures = 0;
+    try {
+        (void)ops::causal_softmax_attention_workspace_capacity_bytes(
+            {kHeadDim, 24, 2}, KvCacheStorage::Int8Group64, {1, 64}, 1, 1, 1, execution);
+        std::cerr << "causal_softmax_attention accepted 24q/2kv on INT8 KV\n";
+        ++failures;
+    } catch (const std::invalid_argument&) {}
+    try {
+        (void)ops::causal_softmax_attention_workspace_capacity_bytes(
+            {kHeadDim, 24, 8}, KvCacheStorage::BFloat16, {1, 64}, 1, 1, 1, execution);
+        std::cerr << "causal_softmax_attention accepted an uninstantiated head geometry\n";
+        ++failures;
+    } catch (const std::invalid_argument&) {}
+    return failures;
+}
+
 int run_storage_cases(DeviceExecutionView execution, KvCacheStorage storage) {
     // Rank-compressed layouts run the same suite matrix: the layouts, names and tolerances
     // are registered, the cache is filled by the engine append op (append_rk_planes), and the
     // FP64 oracle decodes the packed planes read back from the device.
     int failures = verify_workspace_capacity_contract(execution, storage);
+    failures += run_qwen4_gqa12_cases(execution, storage);
+    if (storage == KvCacheStorage::BFloat16) failures += verify_gqa12_admission_scope(execution);
     if (storage == KvCacheStorage::Nvfp4Group16) {
         failures += run_nvfp4_cases(execution);
         failures += run_quantized_batch_cases(execution, storage, 720u);

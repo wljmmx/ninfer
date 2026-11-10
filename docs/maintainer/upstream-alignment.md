@@ -227,3 +227,43 @@ ok: every upstream commit up to the tip has a disposition row.
   `[budget][split] free=20478 MiB kv=3118 MiB pool=16336 MiB safety=1024 MiB by:curve: affordable`。
 - 归因：A2 时把 `expert_stream.{h,cpp}` 与 `ffn.cpp` 回退到基线 `98c3f24d` 重建，崩点与日志逐字相同 → **基线既有**，与 A1–A4 无关。
 - 处置：登记为本文件外的独立项（不阻塞 Qwen4Exp 路线），需要时按"最大配置 + host 专家回退"单独复现与定位。
+
+### 8.2 A6：dense 因果注意力接纳 24q/2kv@256（GQA-12，2026-11-10）
+
+Qwen4Exp 的 12 个 indexed 层是 `num_attention_heads=24, num_key_value_heads=2, head_dim=256`（组 12），
+而 dense 因果注意力只承认 `(24,4)`/`(16,2)`。真机第一处失败：
+
+```
+error: causal_softmax_attention workspace: unsupported head geometry
+```
+
+**根因不是白名单常量本身，而是四处独立假设连成的链**：
+
+1. `causal_softmax_attention.cpp:36` `require_causal_geometry` 只列了两对（容量查询和运行时共用）；
+2. `bf16/plan.cpp` 原来的 `const int kv_heads = heads == 24 ? 4 : 2` **由 q 头数反推 kv 头数**，规划永远描述不出 24q/2kv 的 cache；
+3. `bf16/launch.cu` / `bf16/batch_wide_launch.cu` 的模板分派只看 `p.query_heads == 24`，因此选到 `CausalD256H24Kv4`；
+4. `bf16/template_launch.cuh:18` 的 `cache.kv_heads != Geometry::KVHeads` 在最后一刻以 "operands do not match" 拒绝。
+
+内核本身与组大小**无关**：`grouped_mma.cuh` 的行轴是 `width * GroupSize`（token/组内头打成 packed row），
+kv 头数只进 `grid.x = KVHeads * ceil(width*GroupSize/M)` 与 `head = blockIdx.x % KVHeads`；
+`batch_wide_mma.cuh` 是一个 CTA 一个 `(query tile, query head)`，`kv_head = q_head / GroupSize`。
+共享内存与寄存器里都没有 group 项：grouped 固定 32 KiB（`union qkv[2*32*256]` 与 reduction 同尺寸，
+≤48 KiB 用静态 smem，`minBlocks=2`），batch-wide Tiled64 为 `(64+2*64)*256*2 = 96 KiB`/CTA、128 线程。
+所以 sm_89 不需要新 tile，只是同一 KV 头被 12 个 CTA 重读（24q/4kv 是 6 个），属带宽注记。
+
+改动：新增 `CausalD256H24Kv2`；`make_bf16_kv_causal_plan` 与 `bf16_kv_workspace_bytes` 改为
+**kv 头数与 q 头数分别来自 profile**（不再推导），plan 记录两者、`group()` 由二者求出；
+两处分派按 `(q 头数, kv 头数)` 选模板；几何白名单只加这一条，并在 24/2 时把非 BF16 KV 存储按名拒绝
+（int8/fp8/k8v4/nvfp4 的模板仍只有 `(24,4)`/`(16,2)`，不该走到 "invalid operands"）。
+
+验证（`--kv-dtype bf16`，`NINFER_OP_REPORT_STATS=1`，27 例）：最差 `rel_l2=1.694e-3`（上限 `2.8e-3`，
+ratio 0.605）、`max_abs` 3.06e-5…9.73e-4；既有 24q/4kv 的最差 ratio 0.624、16q/2kv 0.629 —— 同带，判据未放宽。
+覆盖 T=1/2/3/5/6/7/15/16/17、单 token 对 8192 keys、T=2048/keys=6144 前缀、32768 rung 上下沿与 40008 keys、
+graph 重放 3 例、双请求 batch、4 档 SM 的容量/分配镜像。
+
+真机第一处失败前移到 `error: q5 linear: unsupported shape`；临时探针（已完整回退并重编）显示为 LM head
+`n=248320, k=2560, T=1`：`startup.cpp:413-415 linear_scratch(output_head)` → `linear.cpp:124` →
+`q5_dispatch.cpp:117`。规划能走到 head，说明 48 层（含第 3 层 24q/2kv）的注意力容量查询全部通过。
+
+基线既有问题（与 A6 无关，A/B 复现）：`ninfer_softmax_attention_test` 的 packed 套件崩 `0xC0000409`，
+末两行为 `packed_softmax_attention T=11 / T=194 ... actual=3.38953e+38`。

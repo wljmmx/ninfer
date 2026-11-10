@@ -70,7 +70,13 @@ void execute_grouped(const Tensor& q, Input input, const Tensor& positions, floa
     const auto p = make_causal_operands(q, positions, out, scale, plan.envelope.max_visible_keys);
     const auto view    = bf16_kv_cache_view<Input::writes_cache>(cache, valid, rows);
     const auto partial = storage.view();
-    if (p.query_heads == 24)
+    // The template is keyed by the (query heads, KV heads) pair: 24 heads run with 4 KV heads in
+    // Qwen3.5 and with 2 in Qwen4Exp's indexed layers, so the query head count alone is ambiguous.
+    // The plan is the authority here - it sized the partials above from the same profile counts - so
+    // the dispatched template cannot disagree with the workspace.
+    if (p.query_heads == 24 && plan.kv_heads == 2)
+        grouped_instance<CausalD256H24Kv2>(p, view, input, plan, partial, stream);
+    else if (p.query_heads == 24)
         grouped_instance<CausalD256H24Kv4>(p, view, input, plan, partial, stream);
     else
         grouped_instance<CausalD256H16Kv2>(p, view, input, plan, partial, stream);
@@ -92,7 +98,8 @@ void bf16_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                                      out, execution, page_score);
         return;
     }
-    const auto plan           = make_bf16_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
+    const auto plan           = make_bf16_kv_causal_plan(q.ne[1], cache.num_kv_heads, q.ne[2],
+                                                         q.ne[3], envelope,
                                                          execution.multiprocessor_count);
     if (!plan.grouped()) {
         kv_cache_append_batch_launch(k, v, positions, valid_columns, table_rows, cache, stream);
@@ -122,8 +129,8 @@ void bf16_kv_cached_attention(const Tensor& q, const Tensor& positions, float sc
                                      execution, nullptr);
         return;
     }
-    const auto plan =
-        make_bf16_kv_causal_plan(q.ne[1], q.ne[2], 1, envelope, execution.multiprocessor_count);
+    const auto plan = make_bf16_kv_causal_plan(q.ne[1], view.num_kv_heads, q.ne[2], 1, envelope,
+                                               execution.multiprocessor_count);
     if (!plan.grouped()) {
         tiled(make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),
               bf16_kv_cache_view<false>(view), plan, nullptr, stream);

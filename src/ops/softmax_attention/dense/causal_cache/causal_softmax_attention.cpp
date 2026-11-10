@@ -29,11 +29,29 @@ constexpr float kExpectedScale              = 0.0625f;
 constexpr std::int32_t kMaximumVerifyTokens = 16;
 constexpr std::int32_t kMaximumBatchSize    = 8;
 
+// One geometry pair is admitted beyond the original two: 24 query heads over 2 KV heads at D256,
+// which is the GQA-12 pairing of Qwen4Exp's indexed (QSA) layers. Each admitted pair has a compiled
+// template instance in at least the BF16 KV family; anything else would be validated here and then
+// rejected deeper in as an operand mismatch.
 void require_causal_geometry(AttentionHeadGeometry geometry, const char* op) {
     if (!valid_attention_head_geometry(geometry) || geometry.head_dim != kHeadDim ||
         !((geometry.query_heads == 24 && geometry.kv_heads == 4) ||
-          (geometry.query_heads == 16 && geometry.kv_heads == 2))) {
+          (geometry.query_heads == 16 && geometry.kv_heads == 2) ||
+          (geometry.query_heads == 24 && geometry.kv_heads == 2))) {
         throw std::invalid_argument(std::string(op) + ": unsupported head geometry");
+    }
+}
+
+// The 24/2 pairing is instantiated by the BF16 KV family only (its grouped and batch-wide templates
+// are keyed by the pair), so the quantized families would reach a template their operands cannot
+// match. Reject it here, by name, instead of letting it surface as "invalid operands".
+void require_storage_supports_geometry(AttentionHeadGeometry geometry, KvCacheStorage storage,
+                                       const char* op) {
+    if (geometry.query_heads == 24 && geometry.kv_heads == 2 &&
+        storage != KvCacheStorage::BFloat16) {
+        throw std::invalid_argument(std::string(op) +
+                                    ": the 24q/2kv D256 head geometry is served by the BF16 KV "
+                                    "route only; use BF16 KV storage for this profile");
     }
 }
 
@@ -265,7 +283,10 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
     CausalAttentionExecutionEnvelope envelope, std::int32_t batch_size, std::int32_t min_width,
     std::int32_t max_width, DeviceExecutionView execution) {
     require_causal_geometry(geometry, "causal_softmax_attention workspace");
-    const std::int32_t q_heads = geometry.query_heads;
+    require_storage_supports_geometry(geometry, cache_storage,
+                                      "causal_softmax_attention workspace");
+    const std::int32_t q_heads  = geometry.query_heads;
+    const std::int32_t kv_heads = geometry.kv_heads;
     bool supported_dtype       = true;
     try {
         (void)paged_kv_storage_layout(cache_storage, kHeadDim);
@@ -300,8 +321,8 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
         break;
     }
     if (cache_storage == KvCacheStorage::BFloat16)
-        return detail::bf16_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
-                                               execution.multiprocessor_count);
+        return detail::bf16_kv_workspace_bytes(q_heads, kv_heads, batch_size, min_width, max_width,
+                                               envelope, execution.multiprocessor_count);
 
     if (cache_storage == KvCacheStorage::Fp8E4M3Row256)
         return detail::fp8_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
@@ -382,6 +403,7 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     require_shape(v, kHeadDim, kv_heads, width, batch, op, "v");
     require_contiguous_nonnull(k, op, "k");
     require_contiguous_nonnull(v, op, "v");
+    require_storage_supports_geometry(geometry, cache.storage, op);
     // P6 2c relevance counter (appendix BL/BM step 1.1). Optional, and inert until step 1.2.
     if (page_score != nullptr) {
         if (page_score->dtype != DType::I32) {
@@ -486,6 +508,7 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
         throw std::invalid_argument(std::string(op) + ": SM count must be positive");
     }
     validate_attention_tensors(q, positions, out, geometry, cache, envelope, scale, op);
+    require_storage_supports_geometry(geometry, cache.storage, op);
     // P6 2c relevance counter (appendix BL/BM step 1.1). Optional, and inert until step 1.2.
     if (page_score != nullptr) {
         if (page_score->dtype != DType::I32) {

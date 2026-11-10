@@ -7,25 +7,33 @@
 namespace ninfer::ops::detail {
 namespace {
 constexpr int kGroupedPrefillMaxWidth = 256;
+
+// The pairings this family instantiates as templates. A query head count alone does not identify
+// one - 24 heads run with 4 KV heads in Qwen3.5 and with 2 in Qwen4Exp's indexed layers - so the
+// plan takes both counts from the profile and accepts only pairs that have an instance.
+bool admitted_head_pair(int query_heads, int kv_heads) {
+    return (query_heads == 24 && (kv_heads == 4 || kv_heads == 2)) ||
+           (query_heads == 16 && kv_heads == 2);
+}
 } // namespace
 
-Bf16KvCausalPlan make_bf16_kv_causal_plan(int heads, int width, int batch,
+Bf16KvCausalPlan make_bf16_kv_causal_plan(int query_heads, int kv_heads, int width, int batch,
                                           CausalAttentionExecutionEnvelope envelope,
                                           int multiprocessor_count) {
-    if (multiprocessor_count <= 0 || (heads != 24 && heads != 16) || width < 1 || batch < 1 ||
-        batch > 8 || (batch > 1 && width > 16) || envelope.min_visible_keys == 0 ||
+    if (multiprocessor_count <= 0 || !admitted_head_pair(query_heads, kv_heads) || width < 1 ||
+        batch < 1 || batch > 8 || (batch > 1 && width > 16) || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
         envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys)
         throw std::invalid_argument("BF16 attention: invalid plan inputs");
-    const int kv_heads = heads == 24 ? 4 : 2, group = heads / kv_heads;
+    const int group     = query_heads / kv_heads;
     const auto ceil_div = [](int a, int b) { return (a + b - 1) / b; };
     const int visible   = envelope.max_visible_keys;
     if (width > kGroupedPrefillMaxWidth) {
         const auto instance =
-            heads == 16 && width >= 1024 && width % 128 == 0 && visible - width >= 8192
+            query_heads == 16 && width >= 1024 && width % 128 == 0 && visible - width >= 8192
                 ? Bf16KvInstance::Tiled128
                 : Bf16KvInstance::Tiled64;
-        return {instance, {}, heads, width, batch, envelope};
+        return {instance, {}, query_heads, kv_heads, width, batch, envelope};
     }
     const int rows                  = width * group;
     const auto instance             = width == 1   ? Bf16KvInstance::GroupedDecode
@@ -50,18 +58,18 @@ Bf16KvCausalPlan make_bf16_kv_causal_plan(int heads, int width, int batch,
     partition.capacity = std::max(
         partition.interval_capacity(low, std::min(visible, 32767), partition.normal_target),
         partition.interval_capacity(std::max(low, 32768), visible, partition.long_target));
-    return {instance, partition, heads, width, batch, envelope};
+    return {instance, partition, query_heads, kv_heads, width, batch, envelope};
 }
 
-std::size_t bf16_kv_workspace_bytes(int heads, int batch, int min_width, int max_width,
-                                    CausalAttentionExecutionEnvelope envelope,
+std::size_t bf16_kv_workspace_bytes(int query_heads, int kv_heads, int batch, int min_width,
+                                    int max_width, CausalAttentionExecutionEnvelope envelope,
                                     int multiprocessor_count) {
     std::size_t maximum = 0;
     for (int width = min_width; width <= std::min(max_width, kGroupedPrefillMaxWidth); ++width) {
-        const auto plan =
-            make_bf16_kv_causal_plan(heads, width, batch, envelope, multiprocessor_count);
+        const auto plan = make_bf16_kv_causal_plan(query_heads, kv_heads, width, batch, envelope,
+                                                   multiprocessor_count);
         WorkspaceLayoutBuilder layout;
-        (void)allocate_causal_partials(layout, heads, width, plan.partition.capacity, batch);
+        (void)allocate_causal_partials(layout, query_heads, width, plan.partition.capacity, batch);
         maximum = std::max(maximum, layout.peak_bytes(1));
     }
     return maximum;
