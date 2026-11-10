@@ -14,6 +14,7 @@
 #include "models/qwen3_5/state/decoder_state.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/round_buffers.h"
+#include "models/qwen3_5/execution/workspace.h"
 
 #include <array>
 #include <cstddef>
@@ -196,11 +197,26 @@ private:
         return mtp_kv_.valid() || batch_mtp_kv_ != nullptr;
     }
 
-    void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
-    void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
+    // A mixer reads its activation from `normalized` when the block's four-stream correction has
+    // already produced it, and leaves the residual to that correction. Otherwise it normalizes the
+    // residual in `x` itself and adds its output back into it.
+    void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase,
+                  const Tensor* normalized = nullptr);
+    void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase,
+                 const Tensor* normalized = nullptr);
     void mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
-                  const ops::SparseMoeHints& hints, int layer);
+                  const ops::SparseMoeHints& hints, int layer,
+                  const Tensor* normalized = nullptr);
     [[nodiscard]] ops::SparseMoeHints next_projection_hints(int layer) const;
+
+    // Qwen4Exp's four-stream residual: the embedding is expanded once, every block folds its
+    // normalized view to a single stream, and the correction splits the product back out.
+    [[nodiscard]] bool hc_enabled() const noexcept { return final_hc_ != nullptr; }
+    void hc_stem(Tensor& embedding, std::int32_t tokens);
+    void hc_mix_into(const HcParameters& weights, bool block_form, std::int32_t tokens);
+    void hc_combine(const Tensor& product, const Tensor& norm_weight, std::int32_t tokens);
+    // The last hidden the head reads: the final correction's fold, or the plain final norm.
+    void final_hidden(Tensor& x, Tensor& out, std::int32_t tokens);
     void run_layers(Tensor& x, Phase phase);
     template <class Tap>
     void run_layers(Tensor& x, Phase phase, Tap& tap);
@@ -290,6 +306,10 @@ private:
 
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;
+    const HcParameters* final_hc_               = nullptr;
+    // The live four-stream state of the current call. Allocated by run_layers from the same recipe
+    // the workspace plan uses, so the two reserve identical bytes.
+    workspace::TextHcRoots hc_{};
     const LinearParameters* lm_head_            = nullptr;
     const LinearParameters* proposal_head_      = nullptr;
     const std::int32_t* proposal_head_ids_      = nullptr;

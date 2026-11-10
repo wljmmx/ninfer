@@ -375,6 +375,22 @@ public:
                 linear(w.down)};
     }
 
+    // Qwen4Exp's low-rank residual correction. The mix Op reads the quantized planes directly, so
+    // each matrix is bound as a native Weight: a dequantized BF16 copy would be 6.5 MiB per matrix
+    // per layer and the artifact keeps none.
+    HcParameters hc(const HcWeights& w) const {
+        HcParameters out;
+        out.down = with_context(model_.weight(w.down).name,
+                                [&] { return native_weight(model_.weight(w.down).view); });
+        out.up   = with_context(model_.weight(w.up).name,
+                              [&] { return native_weight(model_.weight(w.up).view); });
+        if (w.inject)
+            out.inject = with_context(
+                model_.weight(*w.inject).name,
+                [&] { return native_weight(model_.weight(*w.inject).view); });
+        return out;
+    }
+
     // The fused [E+1,H] control rows, or nothing when the artifact keeps the router and the shared
     // logit in their own parents (Qwen4Exp). The shapes are always checked, so a caller that reads
     // the fused form never gets rows of the wrong width.
@@ -676,6 +692,8 @@ public:
         out.input_norm          = tensor(w.input_norm);
         out.post_attention_norm = tensor(w.post_attention_norm);
         out.ffn                 = ffn(w);
+        if (w.input_hc) out.input_hc = hc(*w.input_hc);
+        if (w.post_attention_hc) out.post_attention_hc = hc(*w.post_attention_hc);
         if (const auto* a = std::get_if<AttentionWeights>(&w.mixer)) {
             out.mixer = AttentionParameters{
                 ops::prepare_attn_input_proj_weights(model_.input(a->query), model_.input(a->key),
@@ -853,6 +871,9 @@ Parameters::Parameters(const Model& source) : model(source) {
     text.token_embedding = native_weight(model.weight(w.text.token_embedding).view);
     text.output_head     = prepare.linear(w.text.output_head_use);
     text.final_norm      = prepare.tensor(w.text.final_norm);
+    if (w.text.final_hc) {
+        text.final_hc = with_context("text/final_hc", [&] { return prepare.hc(*w.text.final_hc); });
+    }
     text.layers.reserve(w.text.layers.size());
     for (std::size_t i = 0; i < w.text.layers.size(); ++i) {
         text.layers.push_back(with_context("text/layers/" + std::to_string(i),

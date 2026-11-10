@@ -20,6 +20,8 @@
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/gdn_input_proj.h"
+#include "ninfer/ops/gdn_control.h"
+#include "ninfer/ops/gated_residual.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/w4a8.h"
 #include "ninfer/ops/kv_cache_append.h"
@@ -407,6 +409,7 @@ TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weight
     set_linear_state_slots(0, 0);
     embed_      = &parameters_.text.token_embedding;
     final_norm_ = &parameters_.text.final_norm;
+    final_hc_   = parameters_.text.final_hc ? &*parameters_.text.final_hc : nullptr;
     lm_head_    = &parameters_.text.output_head;
     mtp_        = parameters_.mtp ? &*parameters_.mtp : nullptr;
     if (mtp_enabled() && mtp_ == nullptr) {
@@ -907,7 +910,7 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         ops::embedding(ids, *embed_, x, stream);
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
-        ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, hidden, stream);
+        final_hidden(x, hidden, batch);
         // Q67: zero-weight scratch rows for the row-independent output projection. The class width
         // is the compiled shape; the extra rows read zero hidden and their logits are never sampled.
         // This is deliberately the first absorption site, not the whole batch: attention and the
@@ -993,7 +996,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_hidden = hidden.view({dimension(config_.hidden_size), columns});
         Tensor flat_logits = logits.view({dimension(config_.vocab_size), columns});
         Tensor flat_tokens = target_tokens.view({columns});
-        ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, flat_hidden, stream);
+        final_hidden(x, flat_hidden, columns);
         project(flat_hidden, *lm_head_, flat_logits, work_, stream);
         ops::argmax(flat_logits, flat_tokens,
                     dimension(parameters_.model.resources().public_token_count), stream);
@@ -1096,9 +1099,19 @@ void TextContext::prefill_batch(std::span<const std::int32_t> ids,
     run_layers(x, Phase::Verify);
     // Prefill only needs the token that follows each row's last prompt token, so the projection runs
     // over one column per row instead of the whole rectangle: a [vocab, width, batch] logits tensor
-    // at width 1024 would be hundreds of megabytes for one useful column.
+    // at width 1024 would be hundreds of megabytes for one useful column. With four residual streams
+    // the final correction folds the rectangle first: its fold is the head's input, so the tail
+    // columns are read from it and no separate final norm runs.
+    Tensor sampled;
+    if (hc_enabled()) {
+        sampled = work_.alloc(DType::BF16, {dimension(config_.hidden_size), columns});
+        final_hidden(x, sampled, columns);
+    }
+    const Tensor& source = hc_enabled() ? sampled : x;
     Tensor last   = work_.alloc(DType::BF16, {dimension(config_.hidden_size), batch});
-    Tensor normed = work_.alloc(DType::BF16, {dimension(config_.hidden_size), batch});
+    Tensor normed = hc_enabled() ? last
+                                 : work_.alloc(DType::BF16,
+                                               {dimension(config_.hidden_size), batch});
     for (std::int32_t row = 0; row < batch; ++row) {
         const std::int32_t column = valid_columns[static_cast<std::size_t>(row)] - 1;
         if (column < 0 || column >= width) {
@@ -1111,14 +1124,15 @@ void TextContext::prefill_batch(std::span<const std::int32_t> ids,
         // one helper - a private layout here would be the same bug the width-major fill was.
         CUDA_CHECK(cudaMemcpyAsync(
             static_cast<char*>(last.data) + static_cast<std::size_t>(row) * last.nb[1],
-            static_cast<const char*>(x.data) +
+            static_cast<const char*>(source.data) +
                 static_cast<std::size_t>(
                     models::qwen3_5::execution::prefill_batch_flat_column(column, row, width)) *
-                x.nb[1],
+                source.nb[1],
             static_cast<std::size_t>(dimension(config_.hidden_size)) * sizeof(std::uint16_t),
             cudaMemcpyDeviceToDevice, stream));
     }
-    ops::rmsnorm(last, *final_norm_, config_.rms_norm_eps, true, normed, stream);
+    if (!hc_enabled())
+        ops::rmsnorm(last, *final_norm_, config_.rms_norm_eps, true, normed, stream);
     // The single-lane path projects each chunk's last hidden column alone (prefill_impl: matrix
     // window at T=1, then project). A [vocab, batch] projection is a different column count and
     // therefore a different route, so the merged pass samples each row at T=1 too: the rows'
@@ -1288,7 +1302,62 @@ void TextContext::mtp_propose_topk_strided(const Tensor& hidden, Tensor& logits,
     }
 }
 
-void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph) {
+void TextContext::hc_stem(Tensor& embedding, std::int32_t tokens) {
+    const auto& hc = config_.hc.value();
+    // The stream width the artifact states, so a plan built from a different one is refused here
+    // rather than by a silent shape mismatch three ops later.
+    if (hc.count != 4 || hc.stream_width(config_.hidden_size) != 4 * config_.hidden_size) {
+        throw std::invalid_argument("Qwen4Exp hyper-connection requires four residual streams of "
+                                    "the hidden width");
+    }
+    const auto roots = workspace::text_hc_roots(work_, config_, tokens);
+    hc_              = roots;
+    const auto width = dimension(config_.hidden_size), streams = dimension(hc.count);
+    Tensor weight    = parameters_.text.layers.front().input_norm.view({width, streams});
+    Tensor residual  = hc_.residual.view({width, streams, tokens});
+    Tensor normed    = hc_.normalized.view({width, streams, tokens});
+    // The residual starts as the embedding, stream-replicated and stream-normed exactly once.
+    ops::hc_expand_norm(embedding, weight, config_.rms_norm_eps, residual, normed,
+                        ctx_.execution_view());
+}
+
+void TextContext::hc_mix_into(const HcParameters& weights, bool block_form, std::int32_t tokens) {
+    const auto normalized = hc_.normalized.view({dimension(config_.hidden_size),
+                                                 dimension(config_.hc->count), tokens});
+    if (block_form) {
+        ops::hc_mix(normalized, weights.block_form(), work_, hc_.input, hc_.injection,
+                    ctx_.execution_view());
+    } else {
+        ops::hc_mix(normalized, weights.final_form(), work_, hc_.input, ctx_.execution_view());
+    }
+}
+
+void TextContext::hc_combine(const Tensor& product, const Tensor& norm_weight,
+                             std::int32_t tokens) {
+    const auto width   = dimension(config_.hidden_size);
+    const auto streams = dimension(config_.hc->count);
+    Tensor residual    = hc_.residual.view({width, streams, tokens});
+    Tensor normed      = hc_.normalized.view({width, streams, tokens});
+    const auto weight  = norm_weight.view({width, streams});
+    // residual += injection * product, then the grouped norm of the result for the next block.
+    // The residual aliases itself in place, which the Op admits exactly.
+    ops::hc_combine_norm(residual, product, hc_.injection, weight, config_.rms_norm_eps, residual,
+                         normed, ctx_.execution_view());
+}
+
+void TextContext::final_hidden(Tensor& x, Tensor& out, std::int32_t tokens) {
+    if (!hc_enabled()) {
+        ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, out, ctx_.stream);
+        return;
+    }
+    const auto& weights = *final_hc_;
+    ops::hc_mix(hc_.normalized.view({dimension(config_.hidden_size),
+                                     dimension(config_.hc->count), tokens}),
+                weights.final_form(), work_, out, ctx_.execution_view());
+}
+
+void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph,
+                           const Tensor* normalized) {
     const auto& p  = std::get<AttentionParameters>(w.mixer);
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
@@ -1297,8 +1366,8 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     }
 
     const auto projection = workspace::text_attention_projection(work_, config_, T);
-    Tensor h              = projection.hidden;
-    ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s);
+    Tensor h              = normalized != nullptr ? *normalized : projection.hidden;
+    if (normalized == nullptr) ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s);
 
     Tensor q         = projection.query.view({dimension(config_.attention->head_dim),
                                               dimension(config_.attention->num_attention_heads), T});
@@ -1374,7 +1443,10 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
 
     {
         Tensor attn_out = a.view({dimension(config_.attention->query_width()), T});
-        if (ops::w4a8_supported(p.output.weight, T)) {
+        if (normalized != nullptr) {
+            // The four-stream correction owns the residual, so the projection is a pure write.
+            ops::linear(attn_out, p.output.weight, x, p.output.policy, work_, s);
+        } else if (ops::w4a8_supported(p.output.weight, T)) {
             ops::w4a8_linear_add(attn_out, p.output.weight, x, work_, s);
         } else {
             ops::linear_add(attn_out, p.output.weight, x, p.output.policy, work_, s);
@@ -1382,17 +1454,25 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     }
 }
 
-void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph) {
+void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph,
+                          const Tensor* normalized) {
     const auto& p  = std::get<GdnParameters>(w.mixer);
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
 
     const auto control = workspace::gdn_control(work_, config_, T);
-    Tensor h           = control.hidden;
+    Tensor h           = normalized != nullptr ? *normalized : control.hidden;
     Tensor g           = control.g;
     Tensor beta        = control.beta;
-    gdn_norm_control(x, w.input_norm, config_.rms_norm_eps, p, h, g, beta, work_,
-                     ctx_.execution_view());
+    if (normalized != nullptr) {
+        // The four-stream correction already produced the grouped norm, so only the two control
+        // projections remain.
+        ops::gdn_control_proj(h, p.control, p.a_log, p.dt_bias, {g, beta}, work_,
+                              ctx_.execution_view());
+    } else {
+        gdn_norm_control(x, w.input_norm, config_.rms_norm_eps, p, h, g, beta, work_,
+                         ctx_.execution_view());
+    }
 
     const auto projection = workspace::gdn_projection(work_, config_, T);
     Tensor z  = projection.output_gate.view({dimension(config_.gdn->linear_value_head_dim),
@@ -1571,7 +1651,9 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
 
     {
         Tensor gdn_out = on.view({dimension(config_.gdn->value_width()), T});
-        if (ops::w4a8_supported(p.output.weight, T)) {
+        if (normalized != nullptr) {
+            ops::linear(gdn_out, p.output.weight, x, p.output.policy, work_, s);
+        } else if (ops::w4a8_supported(p.output.weight, T)) {
             ops::w4a8_linear_add(gdn_out, p.output.weight, x, work_, s);
         } else {
             ops::linear_add(gdn_out, p.output.weight, x, p.output.policy, work_, s);
@@ -1586,9 +1668,12 @@ ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
 }
 
 void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase,
-                           const ops::SparseMoeHints& hints, int layer) {
-    Tensor h = workspace::post_mixer_hidden(work_, config_, x.ne[1]);
-    ops::rmsnorm(x, weights.post_attention_norm, config_.rms_norm_eps, true, h, ctx_.stream);
+                           const ops::SparseMoeHints& hints, int layer,
+                           const Tensor* normalized) {
+    Tensor h = normalized != nullptr ? *normalized
+                                     : workspace::post_mixer_hidden(work_, config_, x.ne[1]);
+    if (normalized == nullptr)
+        ops::rmsnorm(x, weights.post_attention_norm, config_.rms_norm_eps, true, h, ctx_.stream);
     // [P1 probe] optional per-token int8 activation round-trip (NINFER_ACT_A8)
     ops::act_quant_a8_roundtrip_bf16(h.data, h.ne[0], h.ne[1], ctx_.stream);
     // Q68b: hand the NEXT layer's routed block in, so the prediction computed after this layer's
@@ -1625,6 +1710,10 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase,
 template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     const bool prefill = ph == Phase::Prefill;
+    // Qwen4Exp: the embedding becomes four residual streams once, and every block reads a folded
+    // single-stream view of them. The tensors are roots of the call, so they are allocated here and
+    // live to its end; the plan reserves them from the same recipe in the same order.
+    if (hc_enabled()) hc_stem(x, x.ne[1]);
     for (std::size_t layer = 0; layer < parameters_.text.layers.size(); ++layer) {
         const auto& block = parameters_.text.layers[layer];
         // The config owns the dispatch: an indexed layer is a full-attention mixer whose softmax
@@ -1635,6 +1724,12 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
         const bool full     = attention_mixer(kind);
         const bool indexed  = kind == MixerKind::IndexedAttention;
         const auto compact  = dimension(config_.compact_layer_indices[layer]);
+        const bool hc       = hc_enabled();
+        const int tokens    = x.ne[1];
+        // With four streams the mixer and the FFN write their own product and the correction folds
+        // it in; otherwise both add straight into the residual `x`.
+        Tensor& product     = hc ? hc_.output : x;
+        const Tensor* folded = nullptr;
         nvtx::ScopedRange layer_range(
             full ? (prefill ? nvtx::Name::PrefillLayerFull : nvtx::Name::VerifyLayerFull)
                  : (prefill ? nvtx::Name::PrefillLayerGdn : nvtx::Name::VerifyLayerGdn),
@@ -1655,9 +1750,24 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 }
                 if (full) {
                     if (indexed) { note_indexed_mixer_deferred(); }
-                    attn_mix(block, x, compact, ph);
+                    if (hc) {
+                        hc_mix_into(*block.input_hc, true, tokens);
+                        folded = &hc_.input;
+                    }
+                    attn_mix(block, product, compact, ph, folded);
                 } else {
-                    gdn_mix(block, x, compact, ph);
+                    if (hc) {
+                        hc_mix_into(*block.input_hc, true, tokens);
+                        folded = &hc_.input;
+                    }
+                    gdn_mix(block, product, compact, ph, folded);
+                }
+                if (hc) {
+                    // The mixer's product goes back through the four streams behind the MoE norm,
+                    // then the MoE's own fold.
+                    hc_combine(product, block.post_attention_norm, tokens);
+                    hc_mix_into(*block.post_attention_hc, true, tokens);
+                    folded = &hc_.input;
                 }
                 if (trace_stage) {
                     std::fprintf(stderr, "[stage] layer %zu mixer end: used %zu\n", layer,
@@ -1683,8 +1793,13 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                                  work_.used());
                     std::fflush(stderr);
                 }
-                mlp_tail(block, x, ph, next_projection_hints(static_cast<int>(layer)),
-                         static_cast<int>(layer));
+                if (hc) {
+                    // The FFN family adds into its residual operand, so the product starts empty; a
+                    // write form would save this fill and is the next step for this path.
+                    CUDA_CHECK(cudaMemsetAsync(product.data, 0, product.bytes(), ctx_.stream));
+                }
+                mlp_tail(block, product, ph, next_projection_hints(static_cast<int>(layer)),
+                         static_cast<int>(layer), folded);
                 if (trace_stage) {
                     std::fprintf(stderr, "[stage] layer %zu post-mixer end: used %zu\n", layer,
                                  work_.used());
@@ -1697,8 +1812,18 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     std::fflush(stderr);
                 }
             }
+            if (hc) {
+                // The block that consumes the normalized view supplies the norm: the next block's
+                // attention correction, or the final one after the last block.
+                const auto next = layer + 1;
+                hc_combine(product,
+                           next < parameters_.text.layers.size()
+                               ? parameters_.text.layers[next].input_norm
+                               : *final_norm_,
+                           tokens);
+            }
             if constexpr (Tap::enabled) {
-                tap.capture_layer(static_cast<int>(layer), x, ctx_.stream);
+                tap.capture_layer(static_cast<int>(layer), hc ? hc_.input : x, ctx_.stream);
             }
         } catch (const std::exception& error) {
             // The arena state at the failure is the only thing that says whether the plan sized the
@@ -1871,7 +1996,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             Tensor xf = prefill_hidden_.data != nullptr
                             ? matrix_window(prefill_hidden_, len)
                             : work_.alloc(DType::BF16, {dimension(config_.hidden_size), len});
-            ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, xf, s);
+            final_hidden(x, xf, len);
 
             if (is_last) {
                 Tensor last_xf = xf.slice(1, len - 1, 1);

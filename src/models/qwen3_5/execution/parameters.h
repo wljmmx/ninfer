@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/qwen3_5/model.h"
+#include "ninfer/ops/gated_residual.h"
 #include "ninfer/ops/moe.h"
 #include "ninfer/ops/weight_input.h"
 
@@ -140,17 +141,34 @@ struct GdnParameters {
     LinearParameters output;
 };
 
+// Qwen4Exp's low-rank correction around one grouped stream norm. The artifact stores the down
+// projection and the four injection rows as separate regions of one quantized object, so they are
+// two matrices here; the mix Op takes them in that form. The norm itself is the block's
+// input_norm / post_attention_norm (the attention correction's norm is the former, the MoE
+// correction's the latter), and the final correction has no injection stream.
+struct HcParameters {
+    Weight down, up;
+    std::optional<Weight> inject;
+
+    [[nodiscard]] ops::HcSeparateMixWeights block_form() const {
+        return {down, *inject, up};
+    }
+    [[nodiscard]] ops::HcFinalSeparateMixWeights final_form() const { return {down, up}; }
+};
+
 struct BlockParameters {
     Tensor input_norm, post_attention_norm;
     std::variant<AttentionParameters, GdnParameters> mixer;
     FfnParameters ffn;
     ops::SparseMoeHints projection_prefetch;
+    std::optional<HcParameters> input_hc, post_attention_hc;
 };
 
 struct TextParameters {
     Weight token_embedding;
     LinearParameters output_head;
     Tensor final_norm;
+    std::optional<HcParameters> final_hc;
     std::vector<BlockParameters> layers;
 };
 

@@ -137,6 +137,32 @@ Tensor post_mixer_hidden(Allocator& allocator, const TextConfig& config, std::in
     return matrix(allocator, DType::BF16, dimension(config.hidden_size), tokens);
 }
 
+// Qwen4Exp's four-stream residual. The expanded streams and their grouped normalized view stay live
+// across every layer, so they are roots of the call rather than a stage: `residual` is the stream
+// the corrections accumulate into, `normalized` is what the next mixer reads, and `input`/`output`
+// are the single-stream pair a mixer or the FFN consumes and produces. `injection` is the four
+// coefficients the pending correction applies to that product. Every tensor is a view of the same
+// [hidden*streams, tokens] / [hidden, tokens] pair the dense form uses, so a plan built from this
+// recipe and the execution that calls it reserve identical bytes in the same order.
+struct TextHcRoots {
+    Tensor residual;
+    Tensor normalized;
+    Tensor input;
+    Tensor injection;
+    Tensor output;
+};
+
+template <class Allocator>
+TextHcRoots text_hc_roots(Allocator& allocator, const TextConfig& config, std::int32_t tokens) {
+    const auto& hc   = config.hc.value();
+    const auto width = dimension(hc.stream_width(config.hidden_size));
+    return {matrix(allocator, DType::BF16, width, tokens),
+            matrix(allocator, DType::BF16, width, tokens),
+            matrix(allocator, DType::BF16, dimension(config.hidden_size), tokens),
+            matrix(allocator, DType::FP32, dimension(hc.count), tokens),
+            matrix(allocator, DType::BF16, dimension(config.hidden_size), tokens)};
+}
+
 struct MtpStemRoots {
     Tensor embedding;
     Tensor normalized_embedding;

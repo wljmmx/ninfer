@@ -344,6 +344,18 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto text_common_root = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens) {
         (void)workspace::text_prefill_roots(layout, config, tokens, plan.features.vision ? 3 : 0,
                                             plan.features.vision ? tokens : 0);
+        if (config.hc) (void)workspace::text_hc_roots(layout, config, tokens);
+    };
+    // The four-stream state for a round that does not allocate text_prefill_roots: the residual the
+    // call expands into, which run_layers reserves right after the embedding buffer.
+    const auto text_hc_root = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens) {
+        if (config.hc) (void)workspace::text_hc_roots(layout, config, tokens);
+    };
+    // The low-rank pair's own scratch, sized by the same capacity query the Op calls.
+    const auto hc_mix_scratch = [&](WorkspaceLayoutBuilder& layout,
+                                    const execution::HcParameters& hc, int first, int last) {
+        scratch(layout, ops::hc_mix_workspace_capacity_bytes(hc.block_form(), first, last,
+                                                            device_execution));
     };
     const auto linear_scratch = [&](WorkspaceLayoutBuilder& layout,
                                     const execution::LinearParameters& p, int first, int last) {
@@ -363,6 +375,18 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                  std::int32_t max_width,
                                  ops::CausalAttentionExecutionEnvelope envelope) {
         for (const auto& block : parameters.text.layers) {
+            // The four-stream correction runs before and after every mixer and before every FFN, and
+            // its Down/Up scratch is the largest single reservation in the stage.
+            if (block.input_hc) {
+                {
+                    auto stage = layout.scope();
+                    hc_mix_scratch(layout, *block.input_hc, first, last);
+                }
+                {
+                    auto stage = layout.scope();
+                    hc_mix_scratch(layout, *block.post_attention_hc, first, last);
+                }
+            }
             {
                 auto stage = layout.scope();
                 if (const auto* attention =
@@ -412,6 +436,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         }
         if (!plan.causal_scoring) {
             linear_scratch(layout, parameters.text.output_head, first, last);
+            if (parameters.text.final_hc) {
+                auto stage = layout.scope();
+                scratch(layout, ops::hc_mix_workspace_capacity_bytes(
+                                    parameters.text.final_hc->final_form(), first, last,
+                                    device_execution));
+            }
         }
     };
     const auto mtp_post_mixer = [&](WorkspaceLayoutBuilder& layout, int first, int last) {
@@ -542,6 +572,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
              ++batch) {
             WorkspaceLayoutBuilder ordinary;
             matrix(ordinary, DType::BF16, dimension(config.hidden_size), batch);
+            text_hc_root(ordinary, batch);
             target_body(ordinary, batch, batch, qwen3_5::TextPhase::Verify,
                         GdnWorkspacePath::Snapshot, batch, 1, 1, text_envelope);
             scratch(ordinary,
