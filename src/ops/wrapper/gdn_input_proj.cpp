@@ -3,6 +3,7 @@
 #include "ninfer/ops/w4a8.h"
 
 #include "core/layout.h"
+#include "core/device.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan.h"
 #include "ops/gdn_input_proj/gdn_projected_conv.h"
@@ -795,20 +796,39 @@ void gdn_input_proj(const Tensor& x, const Weight& query, const Weight& key, con
     require_matrix(qkv, qkv_rows, cols, "qkv");
     require_matrix(z, z_weight.n, cols, "z");
     require_single_parent_nonoverlap(x, qkv, z);
-    // The row windows below start on a parent row, and a row is the projection's own width, so
-    // each window is 16-byte aligned exactly when its first row is. Every projection width here is
-    // a multiple of 8 columns.
-    const auto row_window = [](Tensor& source, std::int32_t first_row, std::int32_t rows) {
-        return Tensor(static_cast<char*>(source.data) +
-                          static_cast<std::size_t>(first_row) * source.nb[1],
-                      source.dtype, {rows, source.ne[1]});
+    // A projection writes a packed [n, T] rectangle: every kernel addresses its destination as
+    // `token * leading_dim + row`, with the leading dimension the projection's own row count. A row
+    // window of the shared qkv parent is therefore NOT a valid destination - that parent's column
+    // stride is the full channel count, so writing through a packed window places q/k/v into the
+    // first n*T elements of the parent and leaves the real columns untouched. Project into a packed
+    // scratch and place each result column by column at the parent's stride instead.
+    const std::int32_t widest = std::max(std::max(query.n, key.n), value.n);
+    auto scope                = workspace.scope();
+    Tensor scratch            = workspace.alloc(DType::BF16, {widest, cols});
+    const auto project        = [&](const Weight& weight, std::int32_t first_row) {
+        Tensor packed(scratch.data, DType::BF16, {weight.n, cols});
+        ops::linear(x, weight, packed, policy, workspace, stream);
+        const std::size_t row_bytes = static_cast<std::size_t>(weight.n) * sizeof(std::uint16_t);
+        if (std::getenv("NINFER_NAN_PROBE") != nullptr) {
+            std::fprintf(stderr,
+                         "[gdn-proj] n=%d cols=%d qkv_ne=(%d,%d) qkv_nb1=%lld src=%p dst=%p "
+                         "width=%zu height=%d dst_pitch=%lld\n",
+                         weight.n, cols, qkv.ne[0], qkv.ne[1],
+                         static_cast<long long>(qkv.nb[1]), packed.data,
+                         static_cast<char*>(qkv.data) +
+                             static_cast<std::size_t>(first_row) * sizeof(std::uint16_t),
+                         row_bytes, cols, static_cast<long long>(qkv.nb[1]));
+            std::fflush(stderr);
+        }
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            static_cast<char*>(qkv.data) +
+                static_cast<std::size_t>(first_row) * sizeof(std::uint16_t),
+            static_cast<std::size_t>(qkv.nb[1]), packed.data, row_bytes, row_bytes,
+            static_cast<std::size_t>(cols), cudaMemcpyDeviceToDevice, stream));
     };
-    Tensor q_out = row_window(qkv, 0, query.n);
-    Tensor k_out = row_window(qkv, query.n, key.n);
-    Tensor v_out = row_window(qkv, query.n + key.n, value.n);
-    ops::linear(x, query, q_out, policy, workspace, stream);
-    ops::linear(x, key, k_out, policy, workspace, stream);
-    ops::linear(x, value, v_out, policy, workspace, stream);
+    project(query, 0);
+    project(key, query.n);
+    project(value, query.n + key.n);
     ops::linear(x, z_weight, z, policy, workspace, stream);
 }
 

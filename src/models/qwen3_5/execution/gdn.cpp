@@ -28,7 +28,13 @@ std::size_t gdn_projection_workspace_bytes(const GdnParameters& parameters, std:
             bytes = std::max(bytes, ops::linear_workspace_capacity_bytes(w.qtype, w.n, w.k,
                                                                          row.policy, first, last));
         }
-        return bytes;
+        // The packed placement scratch: query/key/value project into it before their columns land
+        // in the shared qkv parent at that parent's stride.
+        std::size_t widest = 0;
+        for (std::size_t row = 0; row < 3 && row < separate->rows.size(); ++row) {
+            widest = std::max(widest, static_cast<std::size_t>(separate->rows[row].weight.n));
+        }
+        return std::max(bytes, widest * static_cast<std::size_t>(last) * sizeof(std::uint16_t));
     }
     const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection);
     return pair == nullptr ? 0
