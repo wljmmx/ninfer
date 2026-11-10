@@ -6,13 +6,11 @@
 
 namespace ninfer::test::qsa::sparse {
 
-// The E8 carriers are written by a device-only encoder, so the fixture fills their planes from a
-// deterministic code pattern instead: every eight-dim subspace gets a real (root, radial-axis) pair
-// and, on the 96-byte forms, a residual sign byte. The reference decodes those exact bytes, so the
-// oracle still checks the reader's parsing, subspace mapping, residual signs and scale indexing.
-inline bool is_e8(prepare::Encoding encoding) {
-    return encoding == prepare::Encoding::E8Cylinder || encoding == prepare::Encoding::E8Root;
-}
+using prepare::is_e8;
+
+// The sparse-Op suite keeps filling the E8 planes from a deterministic code pattern rather than
+// through the encoders: its oracle then compares the reader against exactly the bytes on the card,
+// independent of whether prepare and append agree about how to produce them.
 
 struct EncodedPlane {
     int leading, element;

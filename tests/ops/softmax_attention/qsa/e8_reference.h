@@ -114,4 +114,182 @@ inline void decode_8d(std::uint8_t root_code, std::uint8_t radial, bool value_pl
     }
 }
 
+// The subspace quantizer, one lane of the device's warp form. Every reduction below reproduces the
+// device's butterfly order exactly - `e8_encode_cylinder_8d_warp` reduces the squared norm, the
+// absolute sum, the primary-axis projection, the residual maximum and the type-B bit mask with XOR
+// masks 4,2,1, and the top-two selection with 1,2,4 - because a different order changes the last
+// float bits and can select a different radius index or root at a boundary.
+//
+// STATUS: not yet bit-identical to the device. On `exact_key_encoding`'s dyadic fixture (16 tokens
+// x 2 heads = 1024 subspace codes, inputs both sides represent exactly) 13 of 1024 codes still
+// differ, all in the (root, radial) pair bytes, so one discrete decision diverges somewhere in the
+// type-A/type-B selection or the residual axis. Until that is localized the three E8 carriers stay
+// out of `test_prepare`'s storage list, and their writer side is unverified.
+inline void encode_8d(const std::array<float, 8>& value, float ks, std::uint8_t& out_root,
+                      std::uint8_t& out_radial) {
+    constexpr float kInvSqrt2 = 0.7071067811865475f;
+    // A lane reads its partner's pre-step value, so each butterfly stage writes a fresh array.
+    const auto butterfly_sum = [](const std::array<float, 8>& start) {
+        std::array<float, 8> v = start;
+        for (int mask = 4; mask > 0; mask >>= 1) {
+            std::array<float, 8> next{};
+            for (int l = 0; l < 8; ++l) next[l] = v[l] + v[l ^ mask];
+            v = next;
+        }
+        return v;
+    };
+
+    std::array<float, 8> squares{};
+    for (int l = 0; l < 8; ++l) squares[l] = value[l] * value[l];
+    const float norm = std::sqrt(butterfly_sum(squares)[0]);
+
+    const float relative = norm / (ks * 2.82842712474619f + 1e-8f);
+    int radius_index     = 0;
+    if (relative >= 0.08f) {
+        const float log_value = 3.0f * (std::log(relative) * 1.4426950408889634f) + 8.0f;
+        const int rounded     = static_cast<int>(std::rint(log_value));
+        radius_index          = rounded < 1 ? 1 : (rounded > 15 ? 15 : rounded);
+    }
+
+    const float inverse = 1.0f / (norm + 1e-8f);
+    std::array<float, 8> unit{}, magnitude{}, sign{};
+    for (int l = 0; l < 8; ++l) {
+        unit[l]      = value[l] * inverse;
+        magnitude[l] = std::fabs(unit[l]);
+        sign[l]      = unit[l] >= 0.0f ? 1.0f : -1.0f;
+    }
+
+    // Type A: the two largest coordinates, selected by mask 1,2,4 with an index tie-break.
+    std::array<float, 8> top1 = magnitude;
+    std::array<float, 8> top2;
+    top2.fill(-1.0f);
+    std::array<int, 8> top1_index{}, top2_index{};
+    for (int l = 0; l < 8; ++l) {
+        top1_index[l] = l;
+        top2_index[l] = -1;
+    }
+    for (int mask = 1; mask <= 4; mask <<= 1) {
+        std::array<float, 8> next1 = top1, next2 = top2;
+        std::array<int, 8> next1i = top1_index, next2i = top2_index;
+        for (int l = 0; l < 8; ++l) {
+            const int p           = l ^ mask;
+            const float other1    = top1[p];
+            const int other1i     = top1_index[p];
+            const float other2    = top2[p];
+            const int other2i     = top2_index[p];
+            if (other1 > top1[l] || (other1 == top1[l] && other1i < top1_index[l])) {
+                next2[l]   = top1[l] > other2 ? top1[l] : other2;
+                next2i[l]  = top1[l] > other2 ? top1_index[l] : other2i;
+                next1[l]   = other1;
+                next1i[l]  = other1i;
+            } else if (other1 > top2[l] || (other1 == top2[l] && other1i < top2_index[l])) {
+                next2[l]  = other1;
+                next2i[l] = other1i;
+            }
+        }
+        top1 = next1;
+        top1_index = next1i;
+        top2 = next2;
+        top2_index = next2i;
+    }
+    const int first_index  = std::min(top1_index[0], top2_index[0]);
+    const int second_index = std::max(top1_index[0], top2_index[0]);
+    const int pair_index   = (first_index * (15 - first_index)) / 2 + (second_index - first_index - 1);
+    const int sign_first   = sign[first_index] > 0 ? 1 : 0;
+    const int sign_second  = sign[second_index] > 0 ? 1 : 0;
+    const std::uint32_t type_a_code =
+        (std::uint32_t(pair_index) << 2) | (std::uint32_t(sign_first) << 1) |
+        std::uint32_t(sign_second);
+    const float type_a_score = top1[0] + top2[0];
+
+    // Type B: the square-root-2 family, chosen by the summed magnitude, the parity of the negative
+    // coordinates and the smallest coordinate.
+    const float magnitude_sum = butterfly_sum(magnitude)[0];
+    int negative_count = 0;
+    for (int l = 0; l < 8; ++l) negative_count += sign[l] < 0 ? 1 : 0;
+    std::array<float, 8> smallest = magnitude;
+    std::array<int, 8> smallest_index{};
+    for (int l = 0; l < 8; ++l) smallest_index[l] = l;
+    for (int mask = 4; mask > 0; mask >>= 1) {
+        std::array<float, 8> next = smallest;
+        std::array<int, 8> next_index = smallest_index;
+        for (int l = 0; l < 8; ++l) {
+            const int p       = l ^ mask;
+            const float other = smallest[p];
+            const int other_i = smallest_index[p];
+            if (other < smallest[l] || (other == smallest[l] && other_i < smallest_index[l])) {
+                next[l]       = other;
+                next_index[l] = other_i;
+            }
+        }
+        smallest       = next;
+        smallest_index = next_index;
+    }
+    float type_b_score = 0.5f * magnitude_sum;
+    if ((negative_count & 1) != 0) type_b_score -= smallest[0];
+
+    std::array<float, 8> flipped{};
+    for (int l = 0; l < 8; ++l) {
+        float chosen = sign[l];
+        if (l == smallest_index[0] && (negative_count & 1) != 0) chosen = -chosen;
+        flipped[l] = chosen;
+    }
+    std::array<float, 8> mask_bits{};
+    for (int l = 0; l < 8; ++l) {
+        mask_bits[l] = (l < 7 && flipped[l] > 0) ? float(1u << l) : 0.0f;
+    }
+    const auto type_b_code =
+        static_cast<std::uint8_t>(std::uint32_t(butterfly_sum(mask_bits)[0] + 0.5f));
+
+    std::array<float, 8> primary{};
+    if (type_a_score >= type_b_score) {
+        out_root = static_cast<std::uint8_t>(type_a_code);
+        for (int l = 0; l < 8; ++l) {
+            if (l == first_index) primary[l] = sign_first ? 1.0f : -1.0f;
+            else if (l == second_index) primary[l] = sign_second ? 1.0f : -1.0f;
+            else primary[l] = 0.0f;
+        }
+    } else {
+        out_root = static_cast<std::uint8_t>(112 + type_b_code);
+        for (int l = 0; l < 8; ++l) primary[l] = flipped[l] > 0 ? 0.5f : -0.5f;
+    }
+
+    std::array<float, 8> projections{};
+    for (int l = 0; l < 8; ++l) projections[l] = unit[l] * (primary[l] * kInvSqrt2);
+    const float projection = butterfly_sum(projections)[0];
+    std::array<float, 8> residual{};
+    for (int l = 0; l < 8; ++l) residual[l] = unit[l] - projection * (primary[l] * kInvSqrt2);
+
+    std::array<float, 8> magnitude_residual{};
+    for (int l = 0; l < 8; ++l) magnitude_residual[l] = std::fabs(residual[l]);
+    std::array<float, 8> largest = magnitude_residual;
+    std::array<int, 8> largest_index{};
+    for (int l = 0; l < 8; ++l) largest_index[l] = l;
+    for (int mask = 4; mask > 0; mask >>= 1) {
+        std::array<float, 8> next = largest;
+        std::array<int, 8> next_index = largest_index;
+        for (int l = 0; l < 8; ++l) {
+            const int p       = l ^ mask;
+            const float other = largest[p];
+            const int other_i = largest_index[p];
+            if (other > largest[l] || (other == largest[l] && other_i < largest_index[l])) {
+                next[l]       = other;
+                next_index[l] = other_i;
+            }
+        }
+        largest       = next;
+        largest_index = next_index;
+    }
+    const int best_dimension = largest_index[0];
+    const int residual_sign  = residual[best_dimension] >= 0.0f ? 0 : 1;
+    const int axis_index     = (best_dimension << 1) | residual_sign;
+
+    if (radius_index == 0) {
+        out_root   = 0;
+        out_radial = 0;
+    } else {
+        out_radial = static_cast<std::uint8_t>((radius_index << 4) | (axis_index & 0x0F));
+    }
+}
+
 } // namespace ninfer::test::qsa::e8

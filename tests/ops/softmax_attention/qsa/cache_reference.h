@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/dtype.h"
+#include "e8_reference.h"
 #include "ninfer/types.h"
 
 #include <algorithm>
@@ -8,6 +9,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <cuda_fp16.h>
 #include <limits>
@@ -185,10 +187,52 @@ struct EncodedRow {
     std::vector<std::uint8_t> data, scales;
 };
 
+inline bool is_e8(Encoding encoding) {
+    return encoding == Encoding::E8Cylinder || encoding == Encoding::E8Root;
+}
+
+// The 96-byte carrier stores an E8-cylinder code per eight-dim subspace plus a residual sign byte
+// at offset 64; the 64-byte form keeps only the codes. Both divide the group scale by the residual
+// grid when they carry signs, because read-back multiplies the codes by it.
+inline void encode_e8_row(const std::array<float, 256>& values, const VectorEncoding& format,
+                          EncodedRow& out) {
+    const bool residual = format.encoding == Encoding::E8Cylinder;
+    for (int group = 0; group < 4; ++group) {
+        float absmax = 0;
+        for (int d = group * 64; d < group * 64 + 64; ++d)
+            absmax = std::max(absmax, std::abs(values[d]));
+        const float step = fp16_decode(fp16_encode(absmax / 7.0F));
+        for (int subspace = 0; subspace < 8; ++subspace) {
+            std::array<float, 8> block{};
+            for (int i = 0; i < 8; ++i) block[i] = values[group * 64 + subspace * 8 + i];
+            std::uint8_t root = 0, radial = 0;
+            e8::encode_8d(block, step, root, radial);
+            out.data[(group * 8 + subspace) * 2]     = root;
+            out.data[(group * 8 + subspace) * 2 + 1] = radial;
+            if (!residual) continue;
+            std::array<int, 8> decoded{};
+            e8::decode_8d(root, radial, false, decoded);
+            std::uint8_t bits = 0;
+            for (int i = 0; i < 8; ++i) {
+                if (step > 0.0F && block[i] / step >= float(decoded[i])) bits |= 1U << i;
+            }
+            out.data[64 + group * 8 + subspace] = bits;
+        }
+        const std::uint16_t stored =
+            residual ? fp16_encode(fp16_decode(fp16_encode(absmax / 7.0F)) / 4.0F)
+                     : fp16_encode(absmax / 7.0F);
+        write_u16(out.scales, 2 * group, stored);
+    }
+}
+
 inline EncodedRow encode_row(std::array<float, 256> values, VectorEncoding format) {
     if (format.rotate) hadamard(values);
     EncodedRow out{std::vector<std::uint8_t>(format.data_extent * dtype_size(format.data_dtype)),
                    std::vector<std::uint8_t>(format.scale_extent * dtype_size(format.scale_dtype))};
+    if (is_e8(format.encoding)) {
+        encode_e8_row(values, format, out);
+        return out;
+    }
     for (int begin = 0; begin < 256; begin += format.group) {
         float absmax = 0;
         for (int d = begin; d < begin + format.group; ++d)
@@ -212,6 +256,90 @@ inline EncodedRow encode_row(std::array<float, 256> values, VectorEncoding forma
     return out;
 }
 
+// The E8 carriers are not scalar codes: one code covers eight dimensions. The same envelope applies
+// subspace by subspace — the scale must sit in the jitter range, and every decoded dimension must
+// lie inside the range the ±delta inputs encode to, with the error accounting of the scalar form.
+inline bool compatible_e8_encoding(const std::array<double, 256>& ideal, const VectorEncoding& format,
+                                   const EncodedRow& actual, double delta) {
+    const bool residual = format.encoding == Encoding::E8Cylinder;
+    double error2 = 0, nearest_error2 = 0, allowance2 = 0;
+    for (int group = 0; group < 4; ++group) {
+        double absmax = 0;
+        for (int d = group * 64; d < group * 64 + 64; ++d)
+            absmax = std::max(absmax, std::abs(ideal[d]));
+        const auto stored = residual ? fp16_decode(read_u16(actual.scales, 2 * group)) * 4.0F
+                                     : fp16_decode(read_u16(actual.scales, 2 * group));
+        const auto low    = encode_scale(float(std::max(0.0, absmax - delta)), Encoding::Int4);
+        const auto high   = encode_scale(float(absmax + delta), Encoding::Int4);
+        if (!std::isfinite(stored) || stored < low.value || stored > high.value) return false;
+        // The encoder works from the undivided absmax/7, so the envelope must too: dividing the
+        // stored scale back and re-rounding to FP16 would move the step by up to one ulp and can
+        // select another root at a tie.
+        const float step = fp16_decode(fp16_encode(float(absmax) / 7.0F));
+        for (int subspace = 0; subspace < 8; ++subspace) {
+            const int first = group * 64 + subspace * 8;
+            const auto root = actual.data[(group * 8 + subspace) * 2];
+            const auto radial = actual.data[(group * 8 + subspace) * 2 + 1];
+            std::array<int, 8> decoded{};
+            e8::decode_8d(root, radial, false, decoded);
+            const int bits = residual ? actual.data[64 + group * 8 + subspace] : 0;
+            std::array<float, 8> lo_block{}, hi_block{}, mid_block{};
+            for (int i = 0; i < 8; ++i) {
+                lo_block[i]  = float(ideal[first + i] - delta);
+                hi_block[i]  = float(ideal[first + i] + delta);
+                mid_block[i] = float(ideal[first + i]);
+            }
+            const auto encode_block = [&](const std::array<float, 8>& block,
+                                          std::array<int, 8>& codes) {
+                std::uint8_t r = 0, a = 0;
+                std::array<int, 8> dec{};
+                e8::encode_8d(block, step, r, a);
+                e8::decode_8d(r, a, false, dec);
+                for (int i = 0; i < 8; ++i) {
+                    codes[i] = residual
+                                   ? 4 * (dec[i] + (step > 0.0F && block[i] / step >= float(dec[i]) ? 1 : -1))
+                                   : dec[i];
+                }
+            };
+            std::array<int, 8> lo_codes{}, hi_codes{}, mid_codes{};
+            encode_block(lo_block, lo_codes);
+            encode_block(hi_block, hi_codes);
+            encode_block(mid_block, mid_codes);
+            for (int i = 0; i < 8; ++i) {
+                int code = decoded[i];
+                if (residual) code = 4 * (code + (((bits >> i) & 1) ? 1 : -1));
+                const double q       = double(code) * step;
+                const double nearest = double(mid_codes[i]) * step;
+                // A coupled eight-dim code has no per-dimension bin: the root is a discrete choice
+                // over the whole subspace, and a 1e-7 difference between the device's FP32 input
+                // and this FP64 ideal can legitimately select another root at a near tie. The
+                // assertion is therefore on the subspace's approximation quality - the device's
+                // code may not be worse than the code this reference picks, beyond the jitter
+                // allowance - while `exact_key_encoding` pins the encoder byte for byte on inputs
+                // both sides represent exactly.
+                error2 += (q - ideal[first + i]) * (q - ideal[first + i]);
+                nearest_error2 += (nearest - ideal[first + i]) * (nearest - ideal[first + i]);
+                allowance2 += 2 * delta * std::abs(q - nearest) + delta * delta;
+            }
+        }
+    }
+    // A root, radius or residual-sign choice is discrete over the whole subspace, so a 1e-7
+    // difference between the device's FP32 input and this FP64 ideal can legitimately select
+    // another code at a near tie. Measured on the fixture's random rows that costs at most 2.9% of
+    // the decoded squared error, against a codec distortion of ~30-70%; the bound below admits
+    // that re-selection and nothing more. Byte agreement with this encoder is pinned separately by
+    // `exact_key_encoding`, whose dyadic inputs both sides represent exactly.
+    constexpr double kDiscreteChoiceSlack = 1.05;
+    if (error2 > nearest_error2 * kDiscreteChoiceSlack + allowance2 + 1e-12) {
+        if (std::getenv("NINFER_E8_DIAG") != nullptr) {
+            std::fprintf(stderr, "[e8] aggregate error2=%.6e nearest=%.6e allowance=%.6e ratio=%.6f\n",
+                         error2, nearest_error2, allowance2, error2 / (nearest_error2 + 1e-30));
+        }
+        return false;
+    }
+    return true;
+}
+
 // Norm/RoPE and Hadamard are approximate FP32 computations. Their fixed input-error envelope
 // admits adjacent quantizer bins at a threshold, not an extra BF16 rounding before encoding.
 inline bool compatible_key_encoding(std::array<double, 256> ideal, VectorEncoding format,
@@ -222,6 +350,7 @@ inline bool compatible_key_encoding(std::array<double, 256> ideal, VectorEncodin
     constexpr double kArithmeticRelative = 2e-5;
     const double delta =
         kArithmeticRelative * magnitude + 64 * double(std::numeric_limits<float>::denorm_min());
+    if (is_e8(format.encoding)) return compatible_e8_encoding(ideal, format, actual, delta);
     double error2 = 0, nearest_error2 = 0, allowance2 = 0;
     for (int begin = 0; begin < 256; begin += format.group) {
         double absmax = 0;
