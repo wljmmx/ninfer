@@ -1335,6 +1335,7 @@ void nan_probe_tensor(const char* tag, const Tensor& value, std::size_t layer, c
     std::size_t bad = 0, elements = 0;
     int first = -1;
     std::vector<std::size_t> row_hits(static_cast<std::size_t>(rows), 0);
+    std::vector<std::size_t> col_hits(static_cast<std::size_t>(cols), 0);
     for (int c = 0; c < cols; ++c) {
         std::size_t token_bad = 0;
         for (int r = 0; r < rows; ++r) {
@@ -1347,6 +1348,7 @@ void nan_probe_tensor(const char* tag, const Tensor& value, std::size_t layer, c
         }
         if (token_bad != 0) {
             ++bad;
+            col_hits[static_cast<std::size_t>(c)] = token_bad;
             if (first < 0) { first = c; }
         }
     }
@@ -1362,6 +1364,26 @@ void nan_probe_tensor(const char* tag, const Tensor& value, std::size_t layer, c
                  "bad_rows=%zu first_row=%lld\n",
                  layer, tag, cols, bad, first, elements, bad_rows,
                  static_cast<long long>(first_bad_row));
+    if (std::getenv("NINFER_NAN_PROBE") != nullptr &&
+        std::string(std::getenv("NINFER_NAN_PROBE")) == "2") {
+        std::fprintf(stderr, "[nan-probe]   %s per-column:", tag);
+        for (int c = 0; c < cols; ++c) {
+            std::fprintf(stderr, " %d:%zu", c, col_hits[static_cast<std::size_t>(c)]);
+        }
+        std::fprintf(stderr, "\n");
+    }
+    if (std::getenv("NINFER_NAN_PROBE") != nullptr &&
+        std::string(std::getenv("NINFER_NAN_PROBE")) == "3") {
+        std::fprintf(stderr, "[nan-probe]   %s sentinel-per-column (0x8080):", tag);
+        for (int c = 0; c < cols; ++c) {
+            std::size_t hits = 0;
+            for (int r = 0; r < rows; ++r) {
+                if (host[static_cast<std::size_t>(c) * rows + r] == 0x8080U) { ++hits; }
+            }
+            std::fprintf(stderr, " %d:%zu", c, hits);
+        }
+        std::fprintf(stderr, "\n");
+    }
     std::fflush(stderr);
 }
 } // namespace
@@ -1525,8 +1547,8 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                          ctx_.execution_view());
     }
 
-    const auto projection = workspace::gdn_projection(work_, config_, T);
-    Tensor z  = projection.output_gate.view({dimension(config_.gdn->linear_value_head_dim),
+    nan_probe_tensor("gdn-h-in", h, gidx, s);
+    const auto projection = workspace::gdn_projection(work_, config_, T);    Tensor z  = projection.output_gate.view({dimension(config_.gdn->linear_value_head_dim),
                                              dimension(config_.gdn->linear_num_value_heads), T});
     Tensor qc = projection.query;
     Tensor kc = projection.key;
@@ -1616,13 +1638,21 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     } else {
         Tensor qkv    = workspace::gdn_prefill_conv(work_, config_, T);
         Tensor z_flat = z.view({dimension(config_.gdn->value_width()), T});
+        // Diagnosis: a finite sentinel in the projection's destinations shows whether a token column
+        // the probe reports as NaN was computed or simply never written.
+        if (std::getenv("NINFER_NAN_PROBE_FILL") != nullptr) {
+            CUDA_CHECK(cudaMemsetAsync(qkv.data, 0x80, qkv.bytes(), s));
+        }
         gdn_projection(h, p, qkv, z_flat, work_, s);
         Tensor conv_state_in =
             state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_source_slot_);
         Tensor conv_state_out =
             state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_destination_slot_);
+        nan_probe_tensor("gdn-qkv-in", qkv, gidx, s);
+        nan_probe_tensor("gdn-conv-in-state", conv_state_in, gidx, s);
         ops::causal_conv1d_silu_split(qkv, p.convolution, conv_state_in, conv_state_out, qc, kc, vc,
                                       s);
+        nan_probe_tensor("gdn-kc", kc, gidx, s);
     }
     nan_probe_tensor("gdn-qc", qc, gidx, s);
     nan_probe_tensor("gdn-vc", vc, gidx, s);
@@ -1697,6 +1727,11 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                              /*normalize_qk=*/true, work_, recurrent_state_in, recurrent_state_out,
                              o, ctx_.execution_view());
     }
+
+    // Diagnosis (NINFER_NAN_PROBE only): re-read the conv outputs after the recurrence, so a NaN
+    // that only shows up here is an overwrite by the scan's own scratch rather than a conv result.
+    nan_probe_tensor("gdn-qc-post", qc, gidx, s);
+    nan_probe_tensor("gdn-vc-post", vc, gidx, s);
 
     Tensor on = workspace::gdn_normalized_output(work_, config_, T)
                     .view({dimension(config_.gdn->linear_value_head_dim),

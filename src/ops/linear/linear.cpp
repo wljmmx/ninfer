@@ -10,6 +10,8 @@
 #include "ops/linear/q8/q8_dispatch.h"
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -76,6 +78,12 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
 
 void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                      WorkspaceArena* workspace, cudaStream_t stream) {
+    if (std::getenv("NINFER_NAN_PROBE") != nullptr) {
+        std::fprintf(stderr, "[linear] qtype=%d n=%d k=%d T=%d policy=%d\n",
+                     static_cast<int>(w.qtype), w.n, w.k, x.ne[1],
+                     static_cast<int>(policy));
+        std::fflush(stderr);
+    }
     switch (w.qtype) {
     case QType::Q4_G64_FP16:
         detail::q4_dispatch(x, w, out, policy, stream);

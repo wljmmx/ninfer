@@ -6,6 +6,9 @@
 #include "ops/linear/q4/q4_operands.h"
 #include "ops/linear/q4/q4_a16_sliced_k_mma.cuh"
 
+#include <cstdio>
+#include <cstdlib>
+
 namespace ninfer::ops::detail {
 template <class Schedule, class Output, class Epilogue,
           class RowPolicy = Q4IdentityRows<Schedule::kBlockRows>>
@@ -20,6 +23,14 @@ void launch_q4_a16_sliced_k_mma(const Q4LinearOperands& operands, Output output,
         const int output_rows = row_policy.output_rows(operands.rows);
         const dim3 grid(div_up(output_rows, RowPolicy::kOutputRowsPerCta),
                         div_up(count, Schedule::kTokenCapacity));
+        if (std::getenv("NINFER_NAN_PROBE") != nullptr) {
+            std::fprintf(stderr,
+                         "[q4slice] rows=%d tokens=%d cap=%d blockT=%d offset=%d count=%d "
+                         "grid=(%u,%u)\n",
+                         operands.rows, operands.tokens, Schedule::kTokenCapacity,
+                         Schedule::kBlockTokens, offset, count, grid.x, grid.y);
+            std::fflush(stderr);
+        }
         const auto* x   = operands.x + static_cast<std::int64_t>(offset) * operands.k;
         const bool full = operands.rows % Schedule::kBlockRows == 0 &&
                           output_rows % RowPolicy::kOutputRowsPerCta == 0 &&

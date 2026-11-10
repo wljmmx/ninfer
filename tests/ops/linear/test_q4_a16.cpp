@@ -187,9 +187,10 @@ int q4_a16_conformance() {
     failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
                           {2048, 2560, 191U, Comparison::Full, true, kN2048K2560Full});
 
-    constexpr std::array kN2048K2560{a16(192),  a16(256),  a16(320), a16(321),  a16(384),
-                                     a16(512),  a16(576),  a16(577), a16(640),  a16(768),
-                                     a16(1024), a16(1280), a16(1281), a16(2048)};
+    constexpr std::array kN2048K2560{a16(40),   a16(51),   a16(63),   a16(192),  a16(256),
+                                     a16(320),  a16(321),  a16(384),  a16(512),  a16(576),
+                                     a16(577),  a16(640),  a16(768),  a16(1024), a16(1280),
+                                     a16(1281), a16(2048)};
     failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
                           {2048, 2560, 191U, Comparison::Sampled, false, kN2048K2560});
 
@@ -201,9 +202,9 @@ int q4_a16_conformance() {
     failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
                           {6144, 2560, 193U, Comparison::Full, true, kN6144K2560Full});
 
-    constexpr std::array kN6144K2560{a16(192),  a16(256),  a16(320), a16(384), a16(448),
-                                     a16(512),  a16(640),  a16(767), a16(768), a16(1024),
-                                     a16(2048)};
+    constexpr std::array kN6144K2560{a16(40),   a16(51),   a16(63),  a16(192),  a16(256),
+                                     a16(320),  a16(384),  a16(448), a16(512),  a16(640),
+                                     a16(767),  a16(768),  a16(1024), a16(2048)};
     failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
                           {6144, 2560, 193U, Comparison::Sampled, false, kN6144K2560});
 
