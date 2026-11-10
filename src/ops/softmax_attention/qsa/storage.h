@@ -11,15 +11,17 @@ namespace ninfer::ops::detail::qsa {
 // same representation, so the two lists cannot drift: both ask this table.
 //
 // The rk family (RotatedInt8KeyInt4ValueGroup64, RotatedInt4KeyInt4ValueGroup64, RK4V4E8, RK2V4E8,
-// RK4V2E8) is ported in the dense attention path only. Its planes mix an int4/int2 value packing
-// with the E8 lattice extents, and neither Op here has the matching encoder or reader yet, so every
-// one of them is refused by name instead of falling through a generic default. Adding one means
-// adding its encoder to `prepare_cache.cuh` and its decoder to `sparse_gqa_cache.cuh`, then moving
-// it into this table.
+// RK4V2E8) mirrors the append kernel's encoding one-to-one: a Hadamard-rotated K carrier (int8, int4,
+// or the E8 cylinder with its residual signs) and an int4 or 2-bit E8-cylinder V in the original
+// frame. Both Ops carry that arithmetic, so every enumerator is implemented.
 [[nodiscard]] inline constexpr bool qsa_storage_supported(KvCacheStorage storage) noexcept {
     return storage == KvCacheStorage::BFloat16 || storage == KvCacheStorage::Int8Group64 ||
            storage == KvCacheStorage::Fp8E4M3Row256 || storage == KvCacheStorage::Nvfp4Group16 ||
-           storage == KvCacheStorage::Fp8KeyNvfp4Value;
+           storage == KvCacheStorage::Fp8KeyNvfp4Value ||
+           storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
+           storage == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64 ||
+           storage == KvCacheStorage::RK4V4E8 || storage == KvCacheStorage::RK2V4E8 ||
+           storage == KvCacheStorage::RK4V2E8;
 }
 
 [[nodiscard]] inline constexpr const char* qsa_storage_name(KvCacheStorage storage) noexcept {

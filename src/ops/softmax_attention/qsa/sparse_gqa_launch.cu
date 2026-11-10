@@ -6,7 +6,9 @@ namespace ninfer::ops::detail::qsa {
 namespace {
 template <KvCacheStorage Storage, bool VectorCache>
 void launch(SparseGqaArguments a, SparseGqaPlan plan, int queries, DeviceExecutionView execution) {
-    constexpr bool Async = kSparseQuantized<Storage> && VectorCache;
+    // rk planes keep codes and scales in separate regions, so the packed-row staging routes do not
+    // describe them; the direct read path decodes straight from the two planes.
+    constexpr bool Async = kSparseQuantized<Storage> && VectorCache && !kSparseRk<Storage>;
     if (plan.instance == SparseGqaInstance::FullPrefix) {
         constexpr auto load   = Async ? SparseGqaLoad::InPlace : SparseGqaLoad::Direct;
         constexpr auto kernel = sparse_gqa_all_select_kernel<Storage, 64, 4, VectorCache, load>;
@@ -111,6 +113,21 @@ void launch_sparse_gqa(const Tensor& query, const Tensor& gate, const PagedKVBat
             break;
         case KvCacheStorage::Fp8KeyNvfp4Value:
             dispatch.template operator()<KvCacheStorage::Fp8KeyNvfp4Value>();
+            break;
+        case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
+            dispatch.template operator()<KvCacheStorage::RotatedInt8KeyInt4ValueGroup64>();
+            break;
+        case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
+            dispatch.template operator()<KvCacheStorage::RotatedInt4KeyInt4ValueGroup64>();
+            break;
+        case KvCacheStorage::RK4V4E8:
+            dispatch.template operator()<KvCacheStorage::RK4V4E8>();
+            break;
+        case KvCacheStorage::RK2V4E8:
+            dispatch.template operator()<KvCacheStorage::RK2V4E8>();
+            break;
+        case KvCacheStorage::RK4V2E8:
+            dispatch.template operator()<KvCacheStorage::RK4V2E8>();
             break;
         default:
             break; // Validated by the public wrapper.

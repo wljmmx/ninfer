@@ -138,6 +138,23 @@ void launch_prepare(const QsaProjectionView& projected, const QsaPrepareParamete
     case KvCacheStorage::Fp8KeyNvfp4Value:
         dispatch<KvCacheStorage::Fp8KeyNvfp4Value>(args, parameters.rope_theta, execution.stream);
         break;
+    case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
+        dispatch<KvCacheStorage::RotatedInt8KeyInt4ValueGroup64>(args, parameters.rope_theta,
+                                                                 execution.stream);
+        break;
+    case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
+        dispatch<KvCacheStorage::RotatedInt4KeyInt4ValueGroup64>(args, parameters.rope_theta,
+                                                                 execution.stream);
+        break;
+    case KvCacheStorage::RK4V4E8:
+        dispatch<KvCacheStorage::RK4V4E8>(args, parameters.rope_theta, execution.stream);
+        break;
+    case KvCacheStorage::RK2V4E8:
+        dispatch<KvCacheStorage::RK2V4E8>(args, parameters.rope_theta, execution.stream);
+        break;
+    case KvCacheStorage::RK4V2E8:
+        dispatch<KvCacheStorage::RK4V2E8>(args, parameters.rope_theta, execution.stream);
+        break;
     default:
         // Unreachable through the public entry, which refuses an unimplemented storage by name
         // before it gets here; kept so a new enumerator cannot be dispatched silently.

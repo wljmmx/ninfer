@@ -291,22 +291,12 @@ int validation(DeviceContext& device) {
             (void)capacity(KvCacheStorage::Fp8E4M3Row256, 24, 1, 1, 1, f.envelope,
                            device.execution_view());
         });
-    // Every enumerator is accounted for: the five implemented profiles reach the switch's own
-    // gate, and the five rk profiles the dense path owns are refused by name. A new enumerator
-    // lands in whichever arm it belongs to instead of falling through a generic default.
+    // Every enumerator is accounted for: all ten profiles are implemented now, so each one must
+    // pass its own gate rather than fall through a generic default.
     for (int raw = 0; raw <= static_cast<int>(KvCacheStorage::RK4V2E8); ++raw) {
         const auto storage = static_cast<KvCacheStorage>(raw);
-        const bool implemented = raw <= static_cast<int>(KvCacheStorage::Fp8KeyNvfp4Value);
-        if (!implemented) {
-            bool named = false;
-            try {
-                (void)capacity(storage, 24, 2, 1, 1, f.envelope, device.execution_view());
-            } catch (const std::exception& e) {
-                const std::string message = e.what();
-                named = message.find(ops::detail::qsa::qsa_storage_name(storage)) != std::string::npos;
-            }
-            failures += named ? 0 : 1;
-        }
+        const bool implemented = ops::detail::qsa::qsa_storage_supported(storage);
+        failures += implemented ? 0 : 1;
     }
     // Only the two local geometries are admitted; a mismatched pair is a contract error.
     failures += rejects([&] {
@@ -455,8 +445,17 @@ int main(int argc, char** argv) {
                 formats = {KvCacheStorage::Nvfp4Group16};
             else if (name == "k8v4")
                 formats = {KvCacheStorage::Fp8KeyNvfp4Value};
+            else if (name == "rk8v4")
+                formats = {KvCacheStorage::RotatedInt8KeyInt4ValueGroup64};
+            else if (name == "rk4v4")
+                formats = {KvCacheStorage::RotatedInt4KeyInt4ValueGroup64};
+            else if (name == "rk-all")
+                formats = {KvCacheStorage::RotatedInt8KeyInt4ValueGroup64,
+                           KvCacheStorage::RotatedInt4KeyInt4ValueGroup64};
             else
-                throw std::invalid_argument("unsupported test cache format");
+                throw std::invalid_argument(
+                    "unsupported test cache format (the E8 carriers have no host codec, so their "
+                    "oracle is the byte-identity gate against the append path)");
 #if defined(_WIN32)
             _putenv_s("NINFER_QSA_SPARSE_GQA_QUANT_KV", "1");
 #else

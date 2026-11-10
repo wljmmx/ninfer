@@ -1,14 +1,34 @@
 #pragma once
 
 #include "ninfer/types.h"
+#include "ops/kernel/e8_root_codec.cuh"
 #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
 #include "ops/kv_cache/int8_g64_codec.cuh"
 #include "ops/kv_cache/nvfp4_group16_codec.cuh"
+#include "ops/kv_cache/rk4_codec.cuh"
 #include "ops/softmax_attention/qsa/norm_rope.cuh"
 #include "ops/softmax_attention/qsa/prepare_arguments.cuh"
 
 namespace ninfer::ops::detail::qsa {
+
+// The rank-compressed family: the same Hadamard-rotated K as the int8 path, then an int8/int4 or
+// E8-cylinder carrier, with an int4 or 2-bit E8-cylinder V. V is written in the *original*
+// coordinate frame (the rk append path documents why: rotating it corrupted every appended token).
+template <KvCacheStorage Storage>
+inline constexpr bool kPrepareRk =
+    Storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
+    Storage == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64 || Storage == KvCacheStorage::RK4V4E8 ||
+    Storage == KvCacheStorage::RK2V4E8 || Storage == KvCacheStorage::RK4V2E8;
+
+// 96-byte E8-cylinder carrier with a per-element 1-bit residual (rk4v4-e8, rk4v2-e8 key plane).
+template <KvCacheStorage Storage>
+inline constexpr bool kPrepareRkE8Key =
+    Storage == KvCacheStorage::RK4V4E8 || Storage == KvCacheStorage::RK4V2E8;
+
+// 64-byte 2-bit E8-cylinder carrier without a residual (rk2v4-e8 key, rk4v2-e8 value).
+template <KvCacheStorage Storage>
+inline constexpr bool kPrepareRkRootValue = Storage == KvCacheStorage::RK4V2E8;
 
 __device__ __forceinline__ void store_int8(const float (&values)[8], std::uint8_t* data,
                                            std::uint8_t* scales, int lane) {
@@ -73,6 +93,127 @@ __device__ __forceinline__ void store_quantized(const float (&values)[8], std::u
     }
 }
 
+// ---------------------------------------------------------------------------
+// rk family. The arithmetic is the rk append kernel's, mirrored one-to-one so a prepare-written
+// token and an append-written token are the same bytes: per-group absmax scales, the int4 packing
+// pattern, and the E8-cylinder carrier with its residual sign bytes.
+constexpr unsigned kRkFullMask = 0xffffffffU;
+
+// 4-bit symmetric [-7, 7] plane, two dims per byte. Every lane holds dim lane + 32*r, so dims 2k and
+// 2k+1 sit in adjacent lanes: an even lane builds the byte and a leader lane gathers four of them.
+__device__ __forceinline__ void store_rk_int4(const float (&values)[8], std::uint8_t* data,
+                                              std::uint8_t* scales, int lane) {
+    for (int group = 0; group < 4; ++group) {
+        const float absmax =
+            warp_max(fmaxf(fabsf(values[2 * group]), fabsf(values[2 * group + 1])), kRkFullMask);
+        const __half scale = rk4_absmax_to_scale_h(absmax);
+        const float step   = __half2float(scale);
+        const float inverse = step > 0.0f ? 1.0f / step : 0.0f;
+        for (int half = 0; half < 2; ++half) {
+            const int code      = rk4_quant_code(values[2 * group + half], inverse);
+            const int neighbour = __shfl_xor_sync(kRkFullMask, code, 1);
+            std::uint32_t packed = 0;
+            if ((lane & 1) == 0) {
+                packed = rk4_pack(static_cast<std::int8_t>(code),
+                                  static_cast<std::int8_t>(neighbour));
+            }
+            const std::uint32_t b1 = __shfl_xor_sync(kRkFullMask, packed, 2);
+            const std::uint32_t b2 = __shfl_xor_sync(kRkFullMask, packed, 4);
+            const std::uint32_t b3 = __shfl_xor_sync(kRkFullMask, packed, 6);
+            if ((lane & 7) == 0) {
+                const int index = (group * 64 + half * 32 + lane) >> 1;
+                *reinterpret_cast<std::uint32_t*>(data + index) =
+                    packed | (b1 << 8) | (b2 << 16) | (b3 << 24);
+            }
+        }
+        if (lane == 0) { reinterpret_cast<__half*>(scales)[group] = scale; }
+    }
+}
+
+// E8-cylinder carrier: one (root, radial-axis) byte pair per eight-dim subspace, and — with a
+// residual — one sign byte per subspace at offset 64. The stored group scale is divided by the
+// residual grid because read-back multiplies the codes by it.
+template <bool Residual>
+__device__ __forceinline__ void store_rk_e8(const float (&values)[8], std::uint8_t* data,
+                                           std::uint8_t* scales, int lane) {
+    for (int group = 0; group < 4; ++group) {
+        const float absmax =
+            warp_max(fmaxf(fabsf(values[2 * group]), fabsf(values[2 * group + 1])), kRkFullMask);
+        const __half scale = rk4_absmax_to_scale_h(absmax);
+        const float step   = __half2float(scale);
+        std::uint8_t root0 = 0, rad0 = 0, root1 = 0, rad1 = 0;
+        e8_encode_cylinder_8d_warp(values[2 * group], step, root0, rad0, lane);
+        e8_encode_cylinder_8d_warp(values[2 * group + 1], step, root1, rad1, lane);
+        const std::uint32_t pair0      = root0 | (rad0 << 8);
+        const std::uint32_t pair1      = root1 | (rad1 << 8);
+        const std::uint32_t pair0_next = __shfl_xor_sync(kRkFullMask, pair0, 8);
+        const std::uint32_t pair1_next = __shfl_xor_sync(kRkFullMask, pair1, 8);
+        std::uint32_t up0 = 0, up1 = 0;
+        if constexpr (Residual) {
+            __align__(8) std::int8_t dec0[8];
+            __align__(8) std::int8_t dec1[8];
+            e8_root_decode_8d_fast(root0, rad0, dec0);
+            e8_root_decode_8d_fast(root1, rad1, dec1);
+            const bool over0 = values[2 * group] / step >= static_cast<float>(dec0[lane & 7]);
+            const bool over1 = values[2 * group + 1] / step >= static_cast<float>(dec1[lane & 7]);
+            up0 = __ballot_sync(kRkFullMask, over0);
+            up1 = __ballot_sync(kRkFullMask, over1);
+        }
+        // Lanes 0 and 16 own a four-byte window: the XOR-8 gather pairs each writer with the next
+        // subspace, so one writer covers subspaces {s, s+1} and {s+4, s+5}.
+        if ((lane & 15) == 0) {
+            const int first = lane >> 3;
+            *reinterpret_cast<std::uint32_t*>(data + (group * 8 + first) * 2) =
+                pair0 | (pair0_next << 16);
+            *reinterpret_cast<std::uint32_t*>(data + (group * 8 + first + 4) * 2) =
+                pair1 | (pair1_next << 16);
+        }
+        if constexpr (Residual) {
+            if (lane == 0) {
+                // One sign byte per subspace: ballot bits 8s..8s+7 are subspace s's eight dims.
+                const auto pack = [](std::uint32_t bits, int first) {
+                    return ((bits >> (8 * first)) & 0xffu) |
+                           (((bits >> (8 * (first + 1))) & 0xffu) << 8) |
+                           (((bits >> (8 * (first + 2))) & 0xffu) << 16) |
+                           (((bits >> (8 * (first + 3))) & 0xffu) << 24);
+                };
+                *reinterpret_cast<std::uint32_t*>(data + 64 + group * 8) = pack(up0, 0);
+                *reinterpret_cast<std::uint32_t*>(data + 64 + group * 8 + 4) = pack(up1, 0);
+            }
+        }
+        if (lane == 0) {
+            reinterpret_cast<__half*>(scales)[group] =
+                Residual ? __float2half_rn(step / static_cast<float>(kRkE8KFracGrid)) : scale;
+        }
+    }
+}
+
+template <KvCacheStorage Storage>
+__device__ __forceinline__ void store_rk_key(const float (&values)[8], std::uint8_t* data,
+                                             std::uint8_t* scales, int lane) {
+    if constexpr (Storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64) {
+        // 8-bit Hadamard key: the int8-group64 codec verbatim, 256 B of codes and four scales.
+        store_int8(values, data, scales, lane);
+    } else if constexpr (Storage == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64) {
+        store_rk_int4(values, data, scales, lane);
+    } else if constexpr (kPrepareRkE8Key<Storage>) {
+        store_rk_e8<true>(values, data, scales, lane);
+    } else {
+        static_assert(Storage == KvCacheStorage::RK2V4E8);
+        store_rk_e8<false>(values, data, scales, lane);
+    }
+}
+
+template <KvCacheStorage Storage>
+__device__ __forceinline__ void store_rk_value(const float (&values)[8], std::uint8_t* data,
+                                               std::uint8_t* scales, int lane) {
+    if constexpr (kPrepareRkRootValue<Storage>) {
+        store_rk_e8<false>(values, data, scales, lane);
+    } else {
+        store_rk_int4(values, data, scales, lane);
+    }
+}
+
 template <KvCacheStorage Storage, int KvHeads>
 __device__ __forceinline__ void prepare_kv(const PrepareArguments& a, int head, int t, int b,
                                            int lane, float2 sc, float* scratch = nullptr) {
@@ -101,14 +242,23 @@ __device__ __forceinline__ void prepare_kv(const PrepareArguments& a, int head, 
             Storage == KvCacheStorage::Fp8KeyNvfp4Value ? KvCacheStorage::Fp8E4M3Row256 : Storage;
         constexpr auto value_storage =
             Storage == KvCacheStorage::Fp8KeyNvfp4Value ? KvCacheStorage::Nvfp4Group16 : Storage;
-        store_quantized<key_storage>(values, key, a.key_scales.at(p % 64, head, page), lane,
-                                     scratch);
+        if constexpr (kPrepareRk<Storage>) {
+            store_rk_key<Storage>(values, key, a.key_scales.at(p % 64, head, page), lane);
+        } else {
+            store_quantized<key_storage>(values, key, a.key_scales.at(p % 64, head, page), lane,
+                                         scratch);
+        }
 #pragma unroll
         for (int j = 0; j < 8; ++j) values[j] = __bfloat162float(raw_value[lane + 32 * j]);
         if constexpr (value_storage == KvCacheStorage::Nvfp4Group16)
             normalized_hadamard_d256_inplace(values, lane);
-        store_quantized<value_storage>(values, value, a.value_scales.at(p % 64, head, page), lane,
-                                       scratch);
+        if constexpr (kPrepareRk<Storage>) {
+            // rk keeps V in the original coordinate frame, exactly as the append path does.
+            store_rk_value<Storage>(values, value, a.value_scales.at(p % 64, head, page), lane);
+        } else {
+            store_quantized<value_storage>(values, value, a.value_scales.at(p % 64, head, page),
+                                           lane, scratch);
+        }
     }
 }
 

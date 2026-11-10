@@ -16,7 +16,7 @@
 
 namespace ninfer::test::qsa::prepare {
 
-enum class Encoding { Bf16, Fp16, Int8, Fp8, Nvfp4 };
+enum class Encoding { Bf16, Fp16, Int8, Fp8, Nvfp4, Int4 };
 
 struct VectorEncoding {
     Encoding encoding;
@@ -33,6 +33,10 @@ inline CacheEncoding cache_encoding(KvCacheStorage storage) {
     const VectorEncoding i8{Encoding::Int8, DType::I8, DType::FP16, 256, 4, 64, true};
     const VectorEncoding fp8{Encoding::Fp8, DType::FP8_E4M3FN, DType::FP16, 256, 1, 256, true};
     const VectorEncoding nvfp4{Encoding::Nvfp4, DType::U8, DType::U8, 128, 16, 16, true};
+    // rk: 4-bit symmetric [-7, 7] with a per-group absmax/7 FP16 scale, two dims per byte. V keeps
+    // the original coordinate frame; only K carries the Hadamard rotation.
+    const VectorEncoding i4{Encoding::Int4, DType::U8, DType::FP16, 128, 4, 64, false};
+    const VectorEncoding i4_key{Encoding::Int4, DType::U8, DType::FP16, 128, 4, 64, true};
     switch (storage) {
     case KvCacheStorage::BFloat16:
         return {{Encoding::Bf16, DType::BF16, DType::U8, 256, 0, 0, false},
@@ -51,6 +55,17 @@ inline CacheEncoding cache_encoding(KvCacheStorage storage) {
         return {nvfp4, nvfp4};
     case KvCacheStorage::Fp8KeyNvfp4Value:
         return {fp8, nvfp4};
+    case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
+        return {i8, i4};
+    case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
+        return {i4_key, i4};
+    case KvCacheStorage::RK4V4E8:
+    case KvCacheStorage::RK2V4E8:
+    case KvCacheStorage::RK4V2E8:
+        // The E8-cylinder carriers decode through the root/radius constant tables, which live in
+        // device constant memory only; this host reference cannot model them, so their oracle is
+        // covered by the byte-identity gate against the append path instead.
+        throw std::invalid_argument("test cache storage: E8 carrier has no host codec");
     }
     throw std::invalid_argument("test cache storage");
 }
@@ -105,6 +120,10 @@ inline std::uint8_t encode_minifloat(float x, bool fp4) {
 
 inline double decode_code(std::uint8_t code, Encoding encoding) {
     if (encoding == Encoding::Int8) return std::bit_cast<std::int8_t>(code);
+    if (encoding == Encoding::Int4) {
+        const int nibble = code & 15;
+        return double(nibble >= 8 ? nibble - 16 : nibble);
+    }
     if (encoding == Encoding::Nvfp4) return (code & 8 ? -1 : 1) * positive_fp4(code);
     return (code & 128 ? -1 : 1) * positive_fp8(code & 127);
 }
@@ -135,8 +154,9 @@ inline ReferenceScale encode_scale(float absmax, Encoding encoding) {
         const auto bits     = encode_minifloat(bounded, false);
         return {bits, float(positive_fp8(bits))};
     }
-    const float raw = encoding == Encoding::Int8 ? absmax / 127.0F
-                                                 : std::clamp(absmax / 448.0F, 0x1p-24F, 65504.0F);
+    const float raw = encoding == Encoding::Int8    ? absmax / 127.0F
+                      : encoding == Encoding::Int4  ? absmax / 7.0F
+                                                    : std::clamp(absmax / 448.0F, 0x1p-24F, 65504.0F);
     const auto bits = fp16_encode(raw);
     return {bits, fp16_decode(bits)};
 }
@@ -144,6 +164,11 @@ inline ReferenceScale encode_scale(float absmax, Encoding encoding) {
 inline std::uint8_t encode_code(float x, float scale, Encoding encoding) {
     if (scale == 0) return 0;
     const float normalized = encoding == Encoding::Nvfp4 ? x / scale : x * (1.0F / scale);
+    if (encoding == Encoding::Int4) {
+        const float clamped = std::clamp(normalized, -7.0F, 7.0F);
+        const int rounded   = int(std::nearbyint(clamped));
+        return std::uint8_t(std::bit_cast<std::uint8_t>(std::int8_t(rounded)) & 0x0F);
+    }
     if (encoding != Encoding::Int8)
         return encode_minifloat(normalized, encoding == Encoding::Nvfp4);
     const float clamped   = std::clamp(normalized, -127.0F, 127.0F);
@@ -175,6 +200,8 @@ inline EncodedRow encode_row(std::array<float, 256> values, VectorEncoding forma
             const auto code = encode_code(values[d], scale.value, format.encoding);
             if (format.encoding == Encoding::Nvfp4)
                 out.data[d / 2] |= code << (4 * (d % 2));
+            else if (format.encoding == Encoding::Int4)
+                out.data[d / 2] |= std::uint8_t((code & 0x0F) << (4 * (d % 2)));
             else
                 out.data[d] = code;
         }

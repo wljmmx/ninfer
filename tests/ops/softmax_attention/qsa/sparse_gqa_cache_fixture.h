@@ -75,9 +75,11 @@ struct EncodedVector {
 
     double decode(int d, int h, int r, int p) const {
         const auto db = data.offset(r, h, p), sb = scales.offset(r, h, p);
-        const bool fp4  = format.encoding == prepare::Encoding::Nvfp4;
-        const int group = d / format.group;
-        const auto code = fp4 ? (data.host[db + d / 2] >> (4 * (d % 2))) & 15 : data.host[db + d];
+        const bool fp4    = format.encoding == prepare::Encoding::Nvfp4;
+        const bool nibble = fp4 || format.encoding == prepare::Encoding::Int4;
+        const int group   = d / format.group;
+        const auto code =
+            nibble ? (data.host[db + d / 2] >> (4 * (d % 2))) & 15 : data.host[db + d];
         const double scale =
             fp4 ? prepare::positive_fp8(scales.host[sb + group])
                 : prepare::fp16_decode(prepare::read_u16(scales.host, sb + 2 * group));

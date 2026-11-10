@@ -1,9 +1,11 @@
 #pragma once
 
 #include "ninfer/types.h"
+#include "ops/kernel/e8_root_codec.cuh"
 #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
 #include "ops/kv_cache/nvfp4_group16_codec.cuh"
+#include "ops/kv_cache/rk4_codec.cuh"
 #include "ops/softmax_attention/common/causal_tile_io.cuh"
 #include "ops/softmax_attention/qsa/sparse_gqa_arguments.cuh"
 
@@ -16,27 +18,81 @@ template <KvCacheStorage Storage>
 inline constexpr bool kSparseRotatedValue =
     Storage == KvCacheStorage::Nvfp4Group16 || Storage == KvCacheStorage::Fp8KeyNvfp4Value;
 
+// The rank-compressed family: an int8/int4 or E8-cylinder key carrier over the rotated K, and an
+// int4 or 2-bit E8-cylinder value plane in the original frame (so no inverse rotation). Its planes
+// keep data and scales in separate regions, so the packed-row staging route does not apply: these
+// storages always read with the direct path.
+template <KvCacheStorage Storage>
+inline constexpr bool kSparseRk =
+    Storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
+    Storage == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64 || Storage == KvCacheStorage::RK4V4E8 ||
+    Storage == KvCacheStorage::RK2V4E8 || Storage == KvCacheStorage::RK4V2E8;
+
 template <KvCacheStorage Storage, bool Key>
 struct SparseGqaCodec {
     static constexpr auto format =
         Storage == KvCacheStorage::Fp8KeyNvfp4Value
             ? (Key ? KvCacheStorage::Fp8E4M3Row256 : KvCacheStorage::Nvfp4Group16)
             : Storage;
-    static constexpr int code_bytes  = format == KvCacheStorage::BFloat16       ? 512
-                                       : format == KvCacheStorage::Nvfp4Group16 ? 128
-                                                                                : 256;
+    static constexpr int code_bytes =
+        format == KvCacheStorage::BFloat16       ? 512
+        : format == KvCacheStorage::Nvfp4Group16 ? 128
+        : kSparseRk<Storage>
+            ? (Key ? (format == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ? 256
+                      : format == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64 ? 128
+                      : format == KvCacheStorage::RK2V4E8                        ? 64
+                                                                                : 96)
+                   : (format == KvCacheStorage::RK4V2E8 ? 64 : 128))
+            : 256;
     static constexpr int scale_bytes = format == KvCacheStorage::BFloat16        ? 0
                                        : format == KvCacheStorage::Fp8E4M3Row256 ? 2
                                        : format == KvCacheStorage::Int8Group64   ? 8
+                                                                                 : kSparseRk<Storage> ? 8
                                                                                  : 16;
     static constexpr int packed_row  = (code_bytes + scale_bytes + 15) / 16 * 16;
 };
+
+// One dimension of an rk row. K is Hadamard-rotated at write time (and the query with it), V is not.
+template <KvCacheStorage Storage, bool Key>
+__device__ __forceinline__ float sparse_gqa_decode_rk(const std::uint8_t* data,
+                                                      const std::uint8_t* scales, int d) {
+    const int group         = d / 64;
+    const __half* row_scale = reinterpret_cast<const __half*>(scales);
+    if constexpr (Key && Storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64) {
+        return float(reinterpret_cast<const std::int8_t*>(data)[d]) *
+               __half2float(row_scale[group]);
+    } else if constexpr ((Key && Storage == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64) ||
+                         (!Key && Storage != KvCacheStorage::RK4V2E8)) {
+        return float(rk4_unpack(data[d >> 1], d & 1)) * __half2float(row_scale[group]);
+    } else {
+        // E8-cylinder carrier: one (root, radial-axis) byte pair per eight-dim subspace, and — on
+        // the 96-byte forms — one sign byte per subspace at offset 64.
+        const int subspace = (d / 64) * 8 + ((d % 64) / 8);
+        const auto root    = data[subspace * 2];
+        const auto radial  = data[subspace * 2 + 1];
+        __align__(8) std::int8_t decoded[8];
+        if constexpr (!Key) {
+            // The value plane uses the calibrated Type-B radius centre.
+            e8_root_decode_8d_fast_v(root, radial, decoded);
+        } else {
+            e8_root_decode_8d_fast(root, radial, decoded);
+        }
+        int code = decoded[d % 8];
+        if constexpr (Key && Storage != KvCacheStorage::RK2V4E8) {
+            const int sign = (data[64 + subspace] >> (d % 8)) & 1;
+            code = kRkE8KFracGrid * (code + (sign ? 1 : -1));
+        }
+        return float(code) * __half2float(row_scale[group]);
+    }
+}
 
 template <KvCacheStorage Storage, bool Key>
 __device__ __forceinline__ float sparse_gqa_decode(const std::uint8_t* data,
                                                    const std::uint8_t* scales, int d) {
     constexpr auto format = SparseGqaCodec<Storage, Key>::format;
-    if constexpr (format == KvCacheStorage::BFloat16) {
+    if constexpr (kSparseRk<Storage>) {
+        return sparse_gqa_decode_rk<Storage, Key>(data, scales, d);
+    } else if constexpr (format == KvCacheStorage::BFloat16) {
         const auto word = reinterpret_cast<const std::uint16_t*>(data)[d];
         if constexpr (Key)
             return __bfloat162float(__ushort_as_bfloat16(word));
@@ -64,7 +120,18 @@ template <KvCacheStorage Storage, bool Key, bool Vector>
 __device__ __forceinline__ int4 sparse_gqa_expand(const std::uint8_t* data,
                                                   const std::uint8_t* scales, int d) {
     constexpr auto format = SparseGqaCodec<Storage, Key>::format;
-    if constexpr (format == KvCacheStorage::BFloat16) {
+    if constexpr (kSparseRk<Storage>) {
+        // Eight dimensions of a rank-compressed row: the packed codes decode one at a time, so the
+        // generic pair-wise F16 pack below covers every rk variant.
+        unsigned out[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float x = sparse_gqa_decode_rk<Storage, Key>(data, scales, d + 2 * i);
+            const float y = sparse_gqa_decode_rk<Storage, Key>(data, scales, d + 2 * i + 1);
+            out[i]        = pack_f16x2(x, y);
+        }
+        return make_int4(out[0], out[1], out[2], out[3]);
+    } else if constexpr (format == KvCacheStorage::BFloat16) {
         if constexpr (Vector)
             return load_vec<int4>(data + 2 * d);
         else {
