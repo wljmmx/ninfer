@@ -25,10 +25,17 @@ using namespace ninfer::test;
 
 namespace {
 
-constexpr int kDim64    = 64;
-constexpr int kHeads    = 16;
-constexpr float kScale  = 0.125F;
+constexpr int kDim64   = 64;
+constexpr int kHeads   = 16;
+constexpr float kScale = 0.125F;
 constexpr ops::AttentionHeadGeometry kGeometry64{kDim64, kHeads, kHeads};
+
+// Same budget as the D72 packed suite (packed_softmax_attention in plain_and_packed.cpp).
+constexpr ReductionCriterion kNoncausal64Bf16Criterion{
+    .relative_l2                     = 2.5e-3,
+    .gross_absolute                  = 1e-3,
+    .gross_relative_to_max_reference = 2.8e-3,
+};
 
 std::size_t index_of(int token, int head, int d) {
     return (static_cast<std::size_t>(token) * kHeads + static_cast<std::size_t>(head)) * kDim64 +
@@ -66,6 +73,7 @@ void noncausal64_oracle(const std::vector<float>& q, const std::vector<float>& k
             });
     }
 }
+
 
 int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, bool single_key) {
     const int tokens              = cu_seqlens.back();
@@ -115,13 +123,10 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, bool single
     }
     cudaDeviceSynchronize();
 
-    std::vector<std::uint16_t> out_bits(value_count);
-    cudaMemcpy(out_bits.data(), out_tensor.data, value_count * sizeof(std::uint16_t),
-               cudaMemcpyDeviceToHost);
-
     // Softmax over a single key is exactly 1, so the D64 route must reproduce V bit-exactly
     // at the element level (V is already rounded to BF16).
     if (single_key) {
+        const auto out_bits    = from_device<std::uint16_t>(out_tensor.data, value_count);
         std::size_t mismatches = 0;
         for (std::size_t i = 0; i < value_count; ++i) {
             if (out_bits[i] != v_expected[i]) { ++mismatches; }
@@ -134,22 +139,17 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, bool single
         return 0;
     }
 
-    double worst_relative = 0.0;
-    double worst_absolute = 0.0;
-    for (std::size_t i = 0; i < value_count; ++i) {
-        const double expected = reference[i];
-        const double actual   = static_cast<double>(bf16_to_f32(out_bits[i]));
-        const double error    = std::abs(actual - expected);
-        const double relative = error / (std::abs(expected) + 1.0);
-        worst_absolute        = std::max(worst_absolute, error);
-        worst_relative        = std::max(worst_relative, relative);
-    }
-    if (worst_relative > 2.5e-3 || worst_absolute > 3.0e-3) {
-        std::cerr << "noncausal64 oracle: worst relative " << worst_relative << " absolute "
-                  << worst_absolute << "\n";
-        return 1;
-    }
-    return 0;
+    // The pointwise budget. The store is BF16, so even a kernel that is exact in FP32 lands on the
+    // nearest BF16 to the exact value and differs from an FP64 oracle by up to one quantization
+    // step of that result: at |out| = 1.09 one step is 2^-8 * 1.09 = 4.3e-3, which is above the
+    // flat 3e-3 this case used to carry, so that limit rejected exact arithmetic. Measured against
+    // a reference rounded through the same BF16 store, the widest disagreement over the three
+    // cases is 1.953e-3 = 2^-9, i.e. one LSB at |out| <= 1. The suite therefore holds D64 to the
+    // same reference-scaled budget as the D72 packed sibling (relative_l2 unchanged at 2.5e-3).
+    const std::vector<double> actual = from_device_bf16(out_tensor.data, value_count);
+    return verify_reduction(
+        "noncausal64 T=" + std::to_string(tokens) + " S=" + std::to_string(cu_seqlens.size() - 1),
+        actual, reference, kNoncausal64Bf16Criterion);
 }
 
 } // namespace
