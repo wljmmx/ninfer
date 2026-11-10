@@ -104,6 +104,46 @@ std::uint64_t fnv1a64(const void* data, std::size_t bytes) {
 }
 
 // `columns` is the pass's column extent, or zero for a plane that keeps one file per layer.
+// NINFER_QSA_SYNC: settle after each QSA Op so the first faulty submission names itself instead of
+// surfacing at whatever kernel syncs next.
+bool qsa_sync_probe() {
+    static const bool enabled = std::getenv("NINFER_QSA_SYNC") != nullptr;
+    return enabled;
+}
+
+void qsa_mark(cudaStream_t stream, const char* step, int layer) {
+    if (!qsa_sync_probe()) { return; }
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::fprintf(stderr, "[qsa] step ok layer=%d %s\n", layer, step);
+    std::fflush(stderr);
+}
+
+// NINFER_QSA_META: read the pass's device metadata back once per layer call. This is the one place
+// the wiring reads device state, and it exists only to attribute a fault to a bad selector.
+void qsa_meta_probe(const char* stage, int layer, const Tensor& positions, const Tensor& columns,
+                    const Tensor& base, const Tensor& offsets, const Tensor& source,
+                    const Tensor& destination, std::int32_t batch, cudaStream_t stream) {
+    if (std::getenv("NINFER_QSA_META") == nullptr) { return; }
+    std::array<std::int32_t, 8> meta{};
+    const auto read = [&](const Tensor& t, std::size_t slot) {
+        if (t.data == nullptr || batch <= 0) { return; }
+        CUDA_CHECK(cudaMemcpyAsync(&meta[slot], t.data, sizeof(std::int32_t),
+                                   cudaMemcpyDeviceToHost, stream));
+    };
+    read(positions, 0);
+    read(columns, 1);
+    read(base, 2);
+    read(offsets, 3);
+    read(source, 4);
+    read(destination, 5);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::fprintf(stderr,
+                 "[qsa] meta %s layer=%d pos=%d cols=%d base=%d off=%d src=%d dst=%d\n", stage,
+                 layer, meta[0], meta[1], meta[2], meta[3], meta[4], meta[5]);
+    std::fflush(stderr);
+}
+
 void qsa_dump_tensor(const char* variable, const char* name, const Tensor& value, int layer,
                      std::int32_t columns, cudaStream_t stream) {
     const char* directory = std::getenv(variable);
@@ -2046,6 +2086,9 @@ void TextContext::qsa_mix(const BlockParameters& w, Tensor& x, int fidx, Phase, 
     Tensor prepared_index_query = projected.index_query;
     ops::qsa_prepare(projected, prepare_parameters, batch_view, rope, before, cache, records,
                      prepared_query, prepared_index_query, execution);
+    qsa_meta_probe("after-prepare", fidx, positions, valid_columns, *active_qsa_base_positions_,
+                   *active_qsa_offsets_, source_slots, destination_slots, batch, s);
+    qsa_mark(s, "prepare", fidx);
     // Same names the dense arm writes: its post-norm/post-RoPE Q and its pre-append V.
     qsa_dump_tensor("NINFER_QSA_LAYER_DUMP", "query",
                     prepared_query.view({head_dim, query_hd, T}), fidx, T, s);
@@ -2090,17 +2133,20 @@ void TextContext::qsa_mix(const BlockParameters& w, Tensor& x, int fidx, Phase, 
         };
         ops::qsa_indexer(prepared_index_query, index_cache, batch_view, indexer_envelope, work_,
                          selected, execution);
+        qsa_mark(s, "indexer", fidx);
         // The sparse Op applies the output gate itself, so its output is already the gated
         // attention result the dense arm computes with sigmoid_mul.
         ops::qsa_sparse_gqa(prepared_query, gate_flat.view({head_dim, query_hd, T, batch}),
                             main_cache, batch_view, selected, gqa_envelope, work_, attention,
                             execution);
+        qsa_mark(s, "sparse_gqa", fidx);
     }
 
     ops::QsaRawRecordReadView read_records{
         records.raw_keys, records.rope_positions, *active_qsa_base_positions_, valid_columns};
     ops::qsa_tail_extract(before, read_records, valid_columns,
                           qsa_tail_view(fidx, destination_slots), execution);
+    qsa_mark(s, "tail_extract", fidx);
 
     qsa_dump_tensor("NINFER_QSA_KV_DUMP", "main_key", main_cache.k_pages, fidx, 0, s);
     qsa_dump_tensor("NINFER_QSA_KV_DUMP", "index_key", index_cache.keys, fidx, 0, s);
