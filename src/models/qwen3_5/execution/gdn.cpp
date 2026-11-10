@@ -30,11 +30,10 @@ std::size_t gdn_projection_workspace_bytes(const GdnParameters& parameters, std:
         }
         // The packed placement scratch: query/key/value project into it before their columns land
         // in the shared qkv parent at that parent's stride.
-        std::size_t widest = 0;
-        for (std::size_t row = 0; row < 3 && row < separate->rows.size(); ++row) {
-            widest = std::max(widest, static_cast<std::size_t>(separate->rows[row].weight.n));
-        }
-        return std::max(bytes, widest * static_cast<std::size_t>(last) * sizeof(std::uint16_t));
+        const std::int32_t widest = std::max(
+            std::max<std::int32_t>(separate->rows[0].weight.n, separate->rows[1].weight.n),
+            separate->rows[2].weight.n);
+        return std::max(bytes, ops::gdn_input_proj_placement_workspace_bytes(widest, last));
     }
     const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection);
     return pair == nullptr ? 0
@@ -46,26 +45,19 @@ std::size_t gdn_snapshot_workspace_bytes(const GdnParameters& parameters, const 
                                          std::int32_t batch, std::int32_t first_width,
                                          std::int32_t last_width) {
     if (const auto* separate = std::get_if<ops::SeparateProjectionWeights>(&parameters.projection)) {
-        // Composed route: the packed projection rectangle (channels x B*W) and the projection's own
-        // placement scratch are live together, and the four Linear calls may add scratch of their own.
-        const std::int32_t columns = batch * last_width;
-        const std::size_t channels = static_cast<std::size_t>(separate->rows[0].weight.n) +
-                                     static_cast<std::size_t>(separate->rows[1].weight.n) +
-                                     static_cast<std::size_t>(separate->rows[2].weight.n);
-        std::size_t widest = 0;
-        std::size_t bytes  = 0;
+        // Composed route: packed projection rectangle plus the projection's placement scratch, both
+        // live at once; the four Linear calls may add scratch of their own on top.
+        std::size_t linear_bytes = 0;
         for (const auto& row : separate->rows) {
-            widest = std::max(widest, static_cast<std::size_t>(row.weight.n));
-            bytes  = std::max(bytes, ops::linear_workspace_capacity_bytes(
+            linear_bytes = std::max(linear_bytes,
+                                    ops::linear_workspace_capacity_bytes(
                                         row.weight.qtype, row.weight.n, row.weight.k, row.policy,
                                         first_width, last_width));
         }
-        const std::size_t element_bytes = sizeof(std::uint16_t);
-        const std::size_t packed =
-            widest * static_cast<std::size_t>(columns) * element_bytes;
-        const std::size_t projected =
-            channels * static_cast<std::size_t>(columns) * element_bytes;
-        return std::max(bytes, packed) + projected;
+        return ops::gdn_input_proj_conv_snapshot_separate_workspace_capacity_bytes(
+                   separate->rows[0].weight.n, separate->rows[1].weight.n, separate->rows[2].weight.n,
+                   batch, first_width, last_width) +
+               linear_bytes;
     }
     const auto* single = std::get_if<LinearParameters>(&parameters.projection);
     std::size_t bytes;

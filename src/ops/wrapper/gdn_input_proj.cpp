@@ -1168,4 +1168,32 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
                                   value, z, LinearPolicy::A16Only, workspace, stream);
 }
 
+std::size_t gdn_input_proj_placement_workspace_bytes(std::int32_t widest_rows,
+                                                     std::int32_t max_tokens) {
+    if (widest_rows <= 0 || max_tokens <= 0) {
+        throw std::invalid_argument("gdn_input_proj placement scratch: invalid geometry");
+    }
+    return static_cast<std::size_t>(widest_rows) * static_cast<std::size_t>(max_tokens) *
+           sizeof(std::uint16_t);
+}
+
+std::size_t gdn_input_proj_conv_snapshot_separate_workspace_capacity_bytes(
+    std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows, std::int32_t batch_size,
+    std::int32_t min_width, std::int32_t max_width) {
+    constexpr std::int32_t kMaximumBatch          = 8;
+    constexpr std::int64_t kMaximumAggregateCols = 8192;
+    if (query_rows <= 0 || key_rows <= 0 || value_rows <= 0 || batch_size <= 0 ||
+        batch_size > kMaximumBatch || min_width <= 0 || max_width < min_width ||
+        static_cast<std::int64_t>(max_width) * batch_size > kMaximumAggregateCols) {
+        throw std::invalid_argument(
+            "gdn_input_proj_conv_snapshot workspace: invalid separate-parent B/W domain");
+    }
+    const std::int32_t channels = query_rows + key_rows + value_rows;
+    const std::int32_t widest   = std::max(std::max(query_rows, key_rows), value_rows);
+    const std::int32_t columns  = batch_size * max_width;
+    return gdn_input_proj_placement_workspace_bytes(widest, columns) +
+           static_cast<std::size_t>(channels) * static_cast<std::size_t>(columns) *
+               sizeof(std::uint16_t);
+}
+
 } // namespace ninfer::ops

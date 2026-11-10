@@ -97,11 +97,24 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
  * value projections in that row order and `z` receives the z projection; the row widths are the
  * parents' own, so `qkv` must be [query.n + key.n + value.n, T]. Each projection is an independent
  * Linear, which is the generic route whenever the parent geometry is not one of the compiled fused
- * forms above. `workspace` must cover the largest of their Linear capacities.
+ * forms above. `workspace` must cover the largest of their Linear capacities plus
+ * gdn_input_proj_placement_workspace_bytes() for the widest of the three q/k/value row counts: a
+ * Linear writes a packed rectangle, so each projection is placed into the shared parent at that
+ * parent's column stride through a private buffer.
  */
 void gdn_input_proj(const Tensor& x, const Weight& query, const Weight& key, const Weight& value,
                     const Weight& z_weight, Tensor& qkv, Tensor& z, LinearPolicy policy,
                     WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
+ * Placement scratch of the four-parent gdn_input_proj: `widest_rows` is the largest of the query,
+ * key and value row counts and `max_tokens` the widest call's column count. The projections write
+ * packed rectangles, so this buffer is the one they are projected into before being placed at the
+ * shared parent's column stride; the per-format Linear capacities are separate and stay the
+ * caller's.
+ */
+[[nodiscard]] std::size_t gdn_input_proj_placement_workspace_bytes(std::int32_t widest_rows,
+                                                                 std::int32_t max_tokens);
 
 /**
  * Returns the transient capacity required by the registered two-parent Q4/Q5 or single-parent Q8
@@ -183,6 +196,15 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_weight,
                                   const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
                                   Tensor& value, Tensor& z, LinearPolicy policy, WorkspaceArena& ws,
                                   cudaStream_t stream);
+
+/**
+ * Transient capacity of the four-parent gdn_input_proj_conv_snapshot composition: the packed
+ * projection rectangle (channels x B*max_width) and the projection's placement scratch, which are
+ * live at the same time. The caller still adds the largest Linear capacity of the four parents.
+ */
+[[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_separate_workspace_capacity_bytes(
+    std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows, std::int32_t batch_size,
+    std::int32_t min_width, std::int32_t max_width);
 
 /**
  * Single-parent form of gdn_input_proj_conv_snapshot. Registered parents are Q8_G32_FP16 RowSplit

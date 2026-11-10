@@ -466,6 +466,81 @@ int run_fp8() {
     return failures;
 }
 
+// The four-parent form projects each parent into a packed rectangle and then places it at the shared
+// qkv parent's column stride. A row `r` of `qkv` must therefore hold query row r, and the columns past
+// the first projection's own packed extent must still be written - the defect this case exists for
+// wrote q/k/v packed into the parent's first n*T elements and left the real columns untouched.
+int run_separate_case(DevicePackedWeight& query, DevicePackedWeight& key, DevicePackedWeight& value,
+                      DevicePackedWeight& z_weight, std::int32_t tokens) {
+    constexpr std::int32_t kHidden    = 2560;
+    constexpr std::int32_t kQRows     = 2048;
+    constexpr std::int32_t kKRows     = 2048;
+    constexpr std::int32_t kVRows     = 6144;
+    constexpr std::int32_t kZRows     = 6144;
+    constexpr std::int32_t kRows      = kQRows + kKRows + kVRows;
+    const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 907U + tokens);
+    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+    DeviceBuffer device_activation                   = to_device(activation_bits);
+    GuardedBf16Tensor qkv(kRows, tokens);
+    GuardedBf16Tensor z(kZRows, tokens);
+    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor output            = qkv.tensor();
+    Tensor z_output          = z.tensor();
+    const Weight q_weight    = query.view();
+    const Weight k_weight    = key.view();
+    const Weight v_weight    = value.view();
+    const Weight zz_weight   = z_weight.view();
+    WorkspaceArena workspace(
+        ops::gdn_input_proj_placement_workspace_bytes(kVRows, tokens));
+    ops::gdn_input_proj(x, q_weight, k_weight, v_weight, zz_weight, output, z_output,
+                        ops::LinearPolicy::A16Only, workspace, nullptr);
+    cuda_synchronize();
+
+    const std::string suffix = " separate A16 hidden=2560 T=" + std::to_string(tokens);
+    int failures             = qkv.verify_guards("gdn qkv" + suffix);
+    failures += z.verify_guards("gdn z" + suffix);
+    failures += qkv.verify_fully_written("gdn qkv" + suffix);
+    failures += z.verify_fully_written("gdn z" + suffix);
+    failures += verify_output_range("gdn query" + suffix, qkv, kRows, 0, kQRows, query.host, 0,
+                                    activation, kHidden, tokens);
+    failures += verify_output_range("gdn key" + suffix, qkv, kRows, kQRows, kKRows, key.host, 0,
+                                    activation, kHidden, tokens);
+    failures += verify_output_range("gdn value" + suffix, qkv, kRows, kQRows + kKRows, kVRows,
+                                    value.host, 0, activation, kHidden, tokens);
+    failures += verify_output_range("gdn z" + suffix, z, kZRows, 0, kZRows, z_weight.host, 0,
+                                    activation, kHidden, tokens);
+    failures += verify_preserved("gdn x" + suffix, device_activation, activation_bits);
+    failures += query.verify_preserved("gdn query weight" + suffix);
+    failures += key.verify_preserved("gdn key weight" + suffix);
+    failures += value.verify_preserved("gdn value weight" + suffix);
+    failures += z_weight.verify_preserved("gdn z weight" + suffix);
+    return failures;
+}
+
+int run_separate() {
+    constexpr std::int32_t kHidden = 2560;
+    // Qwen4Exp stores q and k as Q4 parents of their own, v as Q5, and z as Q4 - the mixed formats
+    // the artifact actually carries.
+    DevicePackedWeight query(quantized_weight::make_patterned_weight(QType::Q4_G64_FP16, 2048,
+                                                                    kHidden, 911U));
+    DevicePackedWeight key(
+        quantized_weight::make_patterned_weight(QType::Q4_G64_FP16, 2048, kHidden, 919U));
+    DevicePackedWeight value(
+        quantized_weight::make_patterned_weight(QType::Q5_G64_FP16, 6144, kHidden, 929U));
+    DevicePackedWeight z_weight(
+        quantized_weight::make_patterned_weight(QType::Q4_G64_FP16, 6144, kHidden, 937U));
+    int failures = 0;
+    // 51 is the model's own prompt width: its last column tile is partial with more than one token,
+    // which is the shape the packed-window defect corrupted first.
+    for (const std::int32_t tokens : {1, 8, 33, 40, 51, 63, 129}) {
+        const int case_failures = run_separate_case(query, key, value, z_weight, tokens);
+        std::cout << "gdn_input_proj separate hidden=2560 T=" << tokens << ": failures "
+                  << case_failures << '\n';
+        failures += case_failures;
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -476,6 +551,7 @@ int main() {
 
     int failures = 0;
     failures += run_q4_q5();
+    failures += run_separate();
     failures += run_q8();
     failures += run_nvfp4();
     failures += run_fp8();

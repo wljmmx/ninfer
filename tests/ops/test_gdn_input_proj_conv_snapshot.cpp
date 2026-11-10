@@ -776,6 +776,140 @@ int run_q4_q5() {
     return failures;
 }
 
+int run_separate_case(DevicePackedWeight& query_weight, DevicePackedWeight& key_weight,
+                      DevicePackedWeight& value_weight, DevicePackedWeight& z_weight,
+                      std::int32_t tokens, std::int32_t initial_slot) {
+    // The composed route's projection is the generic BF16-activation Linear, so the binding criterion
+    // is that route's own (one BF16 unit roundoff): the fused forms above carry a different one
+    // because there the projection shares the conv epilogue's arithmetic. The width-four convolution
+    // over BF16 history is exact, so it adds nothing to the projection's error here.
+    constexpr ReductionCriterion kSeparateA16Tolerance{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
+    constexpr std::int32_t kHidden           = 2560;
+    constexpr std::int32_t kValueRows        = 6144;
+    constexpr std::int32_t kZRows            = 6144;
+    constexpr std::int32_t kChannels         = kQueryRows + kKeyRows + kValueRows;
+    constexpr std::int32_t kSnapshotBaseSlot = 1;
+    const std::int32_t slots                 = std::max(tokens + 2, initial_slot + 1);
+    const std::vector<float> activation      = make_bf16_activation(kHidden, tokens, 941U + tokens);
+    const std::vector<std::uint16_t> activation_bits  = bf16_bits(activation);
+    const std::vector<float> conv_weight              = make_conv_weight(kChannels, 947U);
+    const std::vector<std::uint16_t> conv_weight_bits = bf16_bits(conv_weight);
+    const std::vector<std::uint16_t> state_before =
+        make_state(kChannels, slots, initial_slot, 953U + tokens);
+    const std::vector<std::int32_t> initial_value{initial_slot};
+    const std::vector<std::int32_t> snapshot_base_value{kSnapshotBaseSlot};
+
+    DeviceBuffer device_activation    = to_device(activation_bits);
+    DeviceBuffer device_conv_weight   = to_device(conv_weight_bits);
+    DeviceBuffer device_initial       = to_device(initial_value);
+    DeviceBuffer device_snapshot_base = to_device(snapshot_base_value);
+    GuardedBf16Tensor state(kChannels * 3, slots);
+    state.copy_from_bits(state_before);
+    GuardedBf16Tensor query(kQueryRows, tokens);
+    GuardedBf16Tensor key(kKeyRows, tokens);
+    GuardedBf16Tensor value(kValueRows, tokens);
+    GuardedBf16Tensor z(kZRows, tokens);
+    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor conv(device_conv_weight.p, DType::BF16, {kChannels, 4});
+    Tensor conv_state(state.data(), DType::BF16, {kChannels, 3, slots});
+    Tensor initial(device_initial.p, DType::I32, {1});
+    Tensor snapshot_base(device_snapshot_base.p, DType::I32, {1});
+    Tensor q        = query.tensor();
+    Tensor k        = key.tensor();
+    Tensor v        = value.tensor();
+    Tensor z_output = z.tensor();
+    // The composition's own capacity: the packed projection rectangle plus the placement scratch.
+    const std::size_t workspace_bytes =
+        ops::gdn_input_proj_conv_snapshot_separate_workspace_capacity_bytes(
+            kQueryRows, kKeyRows, kValueRows, 1, tokens, tokens);
+    WorkspaceArena workspace(std::max<std::size_t>(1, workspace_bytes));
+
+    ops::gdn_input_proj_conv_snapshot(x, query_weight.view(), key_weight.view(), value_weight.view(),
+                                      z_weight.view(), conv, conv_state, Tensor{}, initial,
+                                      snapshot_base, q, k, v, z_output,
+                                      ops::LinearPolicy::A16Only, workspace, nullptr);
+    cuda_synchronize();
+
+    const std::size_t initial_base = static_cast<std::size_t>(initial_slot) * 3 * kChannels;
+    const std::span<const std::uint16_t> initial_state(state_before.data() + initial_base,
+                                                       3 * kChannels);
+    const SnapshotOracle oracle = snapshot_oracle(
+        kValueRows, tokens, conv_weight, initial_state,
+        [&](std::int32_t row, std::int32_t token) {
+            const float* token_activation =
+                activation.data() + static_cast<std::size_t>(token) * kHidden;
+            if (row < kQueryRows) {
+                return quantized_weight::dot_fp64(query_weight.host, row, token_activation, kHidden);
+            }
+            if (row < kQueryRows + kKeyRows) {
+                return quantized_weight::dot_fp64(key_weight.host, row - kQueryRows, token_activation,
+                                                  kHidden);
+            }
+            return quantized_weight::dot_fp64(value_weight.host, row - kQueryRows - kKeyRows,
+                                              token_activation, kHidden);
+        },
+        false);
+    const std::int32_t sample_count              = snapshot_sample_count(tokens, false);
+    const std::vector<std::uint16_t> state_after = state.bits();
+    const std::string suffix                     = " separate A16 hidden=2560 T=" +
+                               std::to_string(tokens) + " initial=" + std::to_string(initial_slot) +
+                               " base=" + std::to_string(kSnapshotBaseSlot);
+    int failures = verify_snapshot_outputs(suffix, query, key, value, kValueRows, tokens, oracle,
+                                           kSeparateA16Tolerance);
+    failures += compare(
+        "snapshot state" + suffix,
+        gather_state(state_after, kChannels, kValueRows, tokens, kSnapshotBaseSlot, false),
+        oracle.state, kSeparateA16Tolerance);
+    failures += state.verify_guards("snapshot state" + suffix);
+    failures += verify_state_effects("snapshot state" + suffix, state_before, state_after,
+                                     kChannels, tokens, slots, kSnapshotBaseSlot);
+    failures += z.verify_guards("snapshot z" + suffix);
+    failures += z.verify_fully_written("snapshot z" + suffix);
+    failures += compare("snapshot z" + suffix,
+                        gather_rows(z.values(), kZRows, 0, kZRows, tokens, sample_count),
+                        projection_oracle(z_weight.host, 0, kZRows, activation, kHidden, tokens,
+                                          sample_count),
+                        kSeparateA16Tolerance);
+    failures += verify_preserved("snapshot x" + suffix, device_activation, activation_bits);
+    failures +=
+        verify_preserved("snapshot conv weight" + suffix, device_conv_weight, conv_weight_bits);
+    failures += query_weight.verify_preserved("snapshot query weight" + suffix);
+    failures += key_weight.verify_preserved("snapshot key weight" + suffix);
+    failures += value_weight.verify_preserved("snapshot value weight" + suffix);
+    failures += z_weight.verify_preserved("snapshot z weight" + suffix);
+    if (workspace.used() != 0 || workspace.peak_used() > workspace_bytes) {
+        std::cerr << "snapshot" << suffix << ": workspace query/execution high-water mismatch\n";
+        ++failures;
+    }
+    std::cout << "snapshot" << suffix << ": sampled FP64 reference, compared "
+              << (oracle.query.size() + oracle.key.size() + oracle.value.size())
+              << " output values + " << oracle.state.size() << " state values, workspace capacity "
+              << workspace_bytes << " peak " << workspace.peak_used() << ", failures " << failures
+              << '\n';
+    return failures;
+}
+
+int run_separate() {
+    constexpr std::int32_t kHidden = 2560;
+    DevicePackedWeight query(
+        quantized_weight::make_patterned_weight(QType::Q4_G64_FP16, kQueryRows, kHidden, 963U));
+    DevicePackedWeight key(
+        quantized_weight::make_patterned_weight(QType::Q4_G64_FP16, kKeyRows, kHidden, 967U));
+    DevicePackedWeight value(
+        quantized_weight::make_patterned_weight(QType::Q5_G64_FP16, 6144, kHidden, 971U));
+    DevicePackedWeight z_weight(
+        quantized_weight::make_patterned_weight(QType::Q4_G64_FP16, 6144, kHidden, 977U));
+    int failures = 0;
+    for (const std::int32_t tokens : {1, 2, 4, 7, 16}) {
+        failures += run_separate_case(query, key, value, z_weight, tokens, 0);
+    }
+    // A non-zero source slot: the composition must read that row's history, not slot 0.
+    for (const std::int32_t tokens : {1, 3}) {
+        failures += run_separate_case(query, key, value, z_weight, tokens, 3);
+    }
+    return failures;
+}
+
 int run_q8_case(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t initial_slot) {
     constexpr std::int32_t kHidden           = 2048;
     constexpr std::int32_t kValueRows        = 4096;
@@ -1272,6 +1406,7 @@ int main() {
         }
     }
     failures += run_q4_q5();
+    failures += run_separate();
     failures += run_q8();
     failures += run_nvfp4();
     failures += run_fp8();
