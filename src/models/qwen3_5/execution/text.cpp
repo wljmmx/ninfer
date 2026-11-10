@@ -85,10 +85,12 @@ void project(const Tensor& x, const LinearParameters& parameters, Tensor& out,
 // main K plane and the index plane prepare wrote; NINFER_QSA_LAYER_DUMP=dir writes the indexed
 // layer's attention output as the dense arm and the sparse arm produce it. Both dump one layer,
 // NINFER_QSA_DUMP_LAYER (default 3, the artifact's first indexed layer).
-int qsa_dump_layer() {
+// NINFER_QSA_DUMP_LAYER selects one indexed layer by its compact index, or every layer with -1.
+bool qsa_dump_wants_layer(int layer) {
     const char* value = std::getenv("NINFER_QSA_DUMP_LAYER");
-    if (value == nullptr || *value == '\0') { return 3; }
-    return static_cast<int>(std::strtol(value, nullptr, 10));
+    if (value == nullptr || *value == '\0') { return layer == 0; }
+    const long selected = std::strtol(value, nullptr, 10);
+    return selected < 0 || static_cast<int>(selected) == layer;
 }
 
 std::uint64_t fnv1a64(const void* data, std::size_t bytes) {
@@ -105,7 +107,7 @@ std::uint64_t fnv1a64(const void* data, std::size_t bytes) {
 void qsa_dump_tensor(const char* variable, const char* name, const Tensor& value, int layer,
                      std::int32_t columns, cudaStream_t stream) {
     const char* directory = std::getenv(variable);
-    if (directory == nullptr || *directory == '\0' || layer != qsa_dump_layer()) { return; }
+    if (directory == nullptr || *directory == '\0' || !qsa_dump_wants_layer(layer)) { return; }
     if (value.data == nullptr || !value.is_contiguous()) {
         throw std::logic_error("QSA dump needs a contiguous device tensor");
     }
@@ -2102,6 +2104,10 @@ void TextContext::qsa_mix(const BlockParameters& w, Tensor& x, int fidx, Phase, 
 
     qsa_dump_tensor("NINFER_QSA_KV_DUMP", "main_key", main_cache.k_pages, fidx, 0, s);
     qsa_dump_tensor("NINFER_QSA_KV_DUMP", "index_key", index_cache.keys, fidx, 0, s);
+    // The coverage check: after this call the written index blocks and the raw-key tail must tile
+    // 0..p with no hole. The tail plane is dumped whole so the check can address the row's slot.
+    qsa_dump_tensor("NINFER_QSA_KV_DUMP", "tail_keys",
+                    qsa_tail_view(fidx, destination_slots).raw_keys, fidx, 0, s);
     qsa_dump_tensor("NINFER_QSA_LAYER_DUMP", "attention", attention, fidx, T, s);
 
     {
