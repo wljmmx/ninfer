@@ -1,9 +1,18 @@
 #pragma once
 
 #include "cache_reference.h"
+#include "e8_reference.h"
 #include "ops/op_tester.h"
 
 namespace ninfer::test::qsa::sparse {
+
+// The E8 carriers are written by a device-only encoder, so the fixture fills their planes from a
+// deterministic code pattern instead: every eight-dim subspace gets a real (root, radial-axis) pair
+// and, on the 96-byte forms, a residual sign byte. The reference decodes those exact bytes, so the
+// oracle still checks the reader's parsing, subspace mapping, residual signs and scale indexing.
+inline bool is_e8(prepare::Encoding encoding) {
+    return encoding == prepare::Encoding::E8Cylinder || encoding == prepare::Encoding::E8Root;
+}
 
 struct EncodedPlane {
     int leading, element;
@@ -52,6 +61,11 @@ struct EncodedVector {
         for (int p = 0; p < data.view.ne[3]; ++p)
             for (int h = 0; h < data.view.ne[2]; ++h)
                 for (int r = 0; r < 64; ++r) {
+                    const auto db = data.offset(r, h, p), sb = scales.offset(r, h, p);
+                    if (is_e8(format.encoding)) {
+                        pattern(db, sb, r, h, p);
+                        continue;
+                    }
                     const auto first   = source.host[source.offset(0, h, r, p)];
                     const auto initial = source.view.dtype == DType::BF16
                                              ? bf16_to_f32(first)
@@ -73,17 +87,52 @@ struct EncodedVector {
         scales.upload();
     }
 
+    // A deterministic E8 row: eight real root codes per group with live radii, plus residual bits
+    // on the 96-byte carrier.
+    void pattern(std::size_t db, std::size_t sb, int r, int h, int p) {
+        static constexpr std::uint8_t kRoots[8]{0, 3, 17, 64, 112, 141, 200, 240};
+        const bool residual = format.encoding == prepare::Encoding::E8Cylinder;
+        for (int group = 0; group < 4; ++group) {
+            for (int s = 0; s < 8; ++s) {
+                const int seed = (r + h + p + group * 8 + s) % 8;
+                data.host[db + (group * 8 + s) * 2]     = kRoots[seed];
+                const int radius_index                  = 1 + (s % 3);
+                const int axis_index                    = (group * 5 + s * 3) & 0x0F;
+                data.host[db + (group * 8 + s) * 2 + 1] =
+                    std::uint8_t((radius_index << 4) | axis_index);
+                if (residual) {
+                    data.host[db + 64 + group * 8 + s] =
+                        std::uint8_t(0x5A ^ (seed * 37 + group * 11 + r));
+                }
+            }
+            prepare::write_u16(scales.host, sb + 2 * group,
+                               prepare::fp16_encode(0.02F + 0.01F * float(group)));
+        }
+    }
+
     double decode(int d, int h, int r, int p) const {
         const auto db = data.offset(r, h, p), sb = scales.offset(r, h, p);
+        const int group = d / format.group;
+        const double scale = prepare::fp16_decode(prepare::read_u16(scales.host, sb + 2 * group));
+        if (is_e8(format.encoding)) {
+            const int subspace = (d / 64) * 8 + ((d % 64) / 8);
+            std::array<int, 8> decoded{};
+            e8::decode_8d(data.host[db + subspace * 2], data.host[db + subspace * 2 + 1],
+                          !format.rotate, decoded);
+            int code = decoded[d % 8];
+            if (format.encoding == prepare::Encoding::E8Cylinder) {
+                const int sign = (data.host[db + 64 + subspace] >> (d % 8)) & 1;
+                code           = 4 * (code + (sign ? 1 : -1));
+            }
+            return double(code) * scale;
+        }
         const bool fp4    = format.encoding == prepare::Encoding::Nvfp4;
         const bool nibble = fp4 || format.encoding == prepare::Encoding::Int4;
-        const int group   = d / format.group;
         const auto code =
             nibble ? (data.host[db + d / 2] >> (4 * (d % 2))) & 15 : data.host[db + d];
-        const double scale =
-            fp4 ? prepare::positive_fp8(scales.host[sb + group])
-                : prepare::fp16_decode(prepare::read_u16(scales.host, sb + 2 * group));
-        return prepare::decode_code(code, format.encoding) * scale;
+        const double row_scale =
+            fp4 ? prepare::positive_fp8(scales.host[sb + group]) : scale;
+        return prepare::decode_code(code, format.encoding) * row_scale;
     }
 };
 

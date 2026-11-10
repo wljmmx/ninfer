@@ -16,7 +16,7 @@
 
 namespace ninfer::test::qsa::prepare {
 
-enum class Encoding { Bf16, Fp16, Int8, Fp8, Nvfp4, Int4 };
+enum class Encoding { Bf16, Fp16, Int8, Fp8, Nvfp4, Int4, E8Cylinder, E8Root };
 
 struct VectorEncoding {
     Encoding encoding;
@@ -59,13 +59,16 @@ inline CacheEncoding cache_encoding(KvCacheStorage storage) {
         return {i8, i4};
     case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
         return {i4_key, i4};
+    // E8 carriers: 96 B of (root, radial-axis) pairs plus 32 B of residual signs, or the 64 B
+    // two-bit form without them. The fixture fills these from a deterministic code pattern (the
+    // encoder itself is device-only), and the reference decodes them with the host table copies.
     case KvCacheStorage::RK4V4E8:
+        return {{Encoding::E8Cylinder, DType::U8, DType::FP16, 96, 4, 64, true}, i4};
     case KvCacheStorage::RK2V4E8:
+        return {{Encoding::E8Root, DType::U8, DType::FP16, 64, 4, 64, true}, i4};
     case KvCacheStorage::RK4V2E8:
-        // The E8-cylinder carriers decode through the root/radius constant tables, which live in
-        // device constant memory only; this host reference cannot model them, so their oracle is
-        // covered by the byte-identity gate against the append path instead.
-        throw std::invalid_argument("test cache storage: E8 carrier has no host codec");
+        return {{Encoding::E8Cylinder, DType::U8, DType::FP16, 96, 4, 64, true},
+                {Encoding::E8Root, DType::U8, DType::FP16, 64, 4, 64, false}};
     }
     throw std::invalid_argument("test cache storage");
 }
@@ -232,7 +235,7 @@ inline bool compatible_key_encoding(std::array<double, 256> ideal, VectorEncodin
                                 : fp16_decode(read_u16(actual.scales, 2 * group));
         if (!std::isfinite(scale) || scale < low.value || scale > high.value) return false;
         for (int d = begin; d < begin + format.group; ++d) {
-            const auto code  = format.encoding == Encoding::Nvfp4
+            const auto code  = (format.encoding == Encoding::Nvfp4 || format.encoding == Encoding::Int4)
                                    ? (actual.data[d / 2] >> (4 * (d % 2))) & 15
                                    : actual.data[d];
             const double q   = decode_code(code, format.encoding);

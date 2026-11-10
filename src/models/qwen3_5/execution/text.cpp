@@ -1725,6 +1725,9 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     qsa_dump_tensor("NINFER_QSA_KV_DUMP", "main_key",
                     batch_text_kv_->batch_layer_view(static_cast<std::uint32_t>(fidx)).k_pages, fidx,
                     0, s);
+    qsa_dump_tensor("NINFER_QSA_KV_DUMP", "main_value",
+                    batch_text_kv_->batch_layer_view(static_cast<std::uint32_t>(fidx)).v_pages, fidx,
+                    0, s);
 
     {
         Tensor attn_out = a.view({dimension(config_.attention->query_width()), T});
@@ -2153,6 +2156,7 @@ void TextContext::qsa_mix(const BlockParameters& w, Tensor& x, int fidx, Phase, 
     qsa_mark(s, "tail_extract", fidx);
 
     qsa_dump_tensor("NINFER_QSA_KV_DUMP", "main_key", main_cache.k_pages, fidx, 0, s);
+    qsa_dump_tensor("NINFER_QSA_KV_DUMP", "main_value", main_cache.v_pages, fidx, 0, s);
     qsa_dump_tensor("NINFER_QSA_KV_DUMP", "index_key", index_cache.keys, fidx, 0, s);
     // The coverage check: after this call the written index blocks and the raw-key tail must tile
     // 0..p with no hole. The tail plane is dumped whole so the check can address the row's slot.

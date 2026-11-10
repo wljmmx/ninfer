@@ -99,6 +99,19 @@ __device__ __forceinline__ void store_quantized(const float (&values)[8], std::u
 // pattern, and the E8-cylinder carrier with its residual sign bytes.
 constexpr unsigned kRkFullMask = 0xffffffffU;
 
+// Quantized planes promise natural byte alignment, including padded layer views, and the packed
+// writers assemble four bytes at a time: fall back to byte stores when the row is not four-aligned.
+__device__ __forceinline__ void store_rk_u32(std::uint8_t* address, std::uint32_t value) {
+    if ((reinterpret_cast<std::uintptr_t>(address) & 3U) == 0) {
+        *reinterpret_cast<std::uint32_t*>(address) = value;
+    } else {
+        address[0] = static_cast<std::uint8_t>(value);
+        address[1] = static_cast<std::uint8_t>(value >> 8);
+        address[2] = static_cast<std::uint8_t>(value >> 16);
+        address[3] = static_cast<std::uint8_t>(value >> 24);
+    }
+}
+
 // 4-bit symmetric [-7, 7] plane, two dims per byte. Every lane holds dim lane + 32*r, so dims 2k and
 // 2k+1 sit in adjacent lanes: an even lane builds the byte and a leader lane gathers four of them.
 __device__ __forceinline__ void store_rk_int4(const float (&values)[8], std::uint8_t* data,
@@ -122,8 +135,7 @@ __device__ __forceinline__ void store_rk_int4(const float (&values)[8], std::uin
             const std::uint32_t b3 = __shfl_xor_sync(kRkFullMask, packed, 6);
             if ((lane & 7) == 0) {
                 const int index = (group * 64 + half * 32 + lane) >> 1;
-                *reinterpret_cast<std::uint32_t*>(data + index) =
-                    packed | (b1 << 8) | (b2 << 16) | (b3 << 24);
+                store_rk_u32(data + index, packed | (b1 << 8) | (b2 << 16) | (b3 << 24));
             }
         }
         if (lane == 0) { reinterpret_cast<__half*>(scales)[group] = scale; }
@@ -163,10 +175,8 @@ __device__ __forceinline__ void store_rk_e8(const float (&values)[8], std::uint8
         // subspace, so one writer covers subspaces {s, s+1} and {s+4, s+5}.
         if ((lane & 15) == 0) {
             const int first = lane >> 3;
-            *reinterpret_cast<std::uint32_t*>(data + (group * 8 + first) * 2) =
-                pair0 | (pair0_next << 16);
-            *reinterpret_cast<std::uint32_t*>(data + (group * 8 + first + 4) * 2) =
-                pair1 | (pair1_next << 16);
+            store_rk_u32(data + (group * 8 + first) * 2, pair0 | (pair0_next << 16));
+            store_rk_u32(data + (group * 8 + first + 4) * 2, pair1 | (pair1_next << 16));
         }
         if constexpr (Residual) {
             if (lane == 0) {
@@ -177,8 +187,8 @@ __device__ __forceinline__ void store_rk_e8(const float (&values)[8], std::uint8
                            (((bits >> (8 * (first + 2))) & 0xffu) << 16) |
                            (((bits >> (8 * (first + 3))) & 0xffu) << 24);
                 };
-                *reinterpret_cast<std::uint32_t*>(data + 64 + group * 8) = pack(up0, 0);
-                *reinterpret_cast<std::uint32_t*>(data + 64 + group * 8 + 4) = pack(up1, 0);
+                store_rk_u32(data + 64 + group * 8, pack(up0, 0));
+                store_rk_u32(data + 64 + group * 8 + 4, pack(up1, 0));
             }
         }
         if (lane == 0) {

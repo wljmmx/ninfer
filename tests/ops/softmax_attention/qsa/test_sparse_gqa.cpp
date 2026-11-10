@@ -452,10 +452,14 @@ int main(int argc, char** argv) {
             else if (name == "rk-all")
                 formats = {KvCacheStorage::RotatedInt8KeyInt4ValueGroup64,
                            KvCacheStorage::RotatedInt4KeyInt4ValueGroup64};
+            else if (name == "rk4v4-e8")
+                formats = {KvCacheStorage::RK4V4E8};
+            else if (name == "rk2v4-e8")
+                formats = {KvCacheStorage::RK2V4E8};
+            else if (name == "rk4v2-e8")
+                formats = {KvCacheStorage::RK4V2E8};
             else
-                throw std::invalid_argument(
-                    "unsupported test cache format (the E8 carriers have no host codec, so their "
-                    "oracle is the byte-identity gate against the append path)");
+                throw std::invalid_argument("unsupported test cache format");
 #if defined(_WIN32)
             _putenv_s("NINFER_QSA_SPARSE_GQA_QUANT_KV", "1");
 #else
