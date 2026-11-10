@@ -1355,6 +1355,10 @@ private:
             bump_bank_generation(previous);
         }
         auto* base = arena();
+        // The band's slots are not necessarily filled yet: on a reserve-only arena (the Windows
+        // fallback when a large pinned request is refused) a slot's pages become writable only when
+        // it is committed, and a demotion into a never-filled slot would write into PAGE_NOACCESS.
+        commit(target);
         std::memcpy(base + std::uint64_t{target} * slot_bytes_,
                     base + std::uint64_t{slot} * slot_bytes_,
                     static_cast<std::size_t>(slot_bytes_));
@@ -1400,6 +1404,9 @@ private:
         bool moved_into_from    = false;
         if (used_dynamic_ < dynamic_capacity_) {
             target = dbase + used_dynamic_++;
+            // Same reason as demote_second_chance(): a slot this process never filled has no pages
+            // behind it on a reserve-only arena.
+            commit(target);
             std::memcpy(base + std::uint64_t{target} * slot_bytes_,
                         base + std::uint64_t{from} * slot_bytes_,
                         static_cast<std::size_t>(slot_bytes_));
