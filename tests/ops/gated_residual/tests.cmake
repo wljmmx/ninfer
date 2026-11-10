@@ -17,3 +17,7 @@ endforeach()
 ninfer_add_op_test(ninfer_hc_mix_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mix.cpp"
   LIBRARIES ninfer_hc_test_support)
+# The artifact's separate-weight Q5 form: down/inject as row regions of one quantized object.
+ninfer_add_op_test(ninfer_hc_mix_q5_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mix_q5.cpp"
+  LIBRARIES ninfer_hc_test_support)
