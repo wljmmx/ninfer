@@ -202,16 +202,24 @@ int exercise_maximum_configuration(const char* artifact) {
     // Same contract as verify_loaded_product: this artifact has no vision tower and the
     // options disable vision, so the summary must not report a vision workspace.
     const bool vision_absent = !memory.vision_workspace.has_value();
+    // A 256K plan on a device that cannot hold the resident tier runs with the routed experts in
+    // host RAM, which the engine can only do without graph capture (a streamed bank uploads and
+    // synchronizes inside the layer). The allowance is the plan's graph reservation, so it is zero
+    // exactly when no capture happened - report that as the contract instead of demanding graph
+    // memory the engine did not plan for.
+    const bool graph_budget_ok =
+        !memory.cuda_graph.has_value() || memory.cuda_graph_allowance_bytes != 0;
     if (memory.max_context != 262144 || memory.kv_cache != ninfer::KvCacheStorage::Int8Group64 ||
         memory.kv_payload_bytes == 0 || memory.sequence.capacity_bytes == 0 ||
         memory.sequence.used_bytes == 0 ||
         memory.sequence.used_bytes > memory.sequence.capacity_bytes ||
-        memory.workspace.capacity_bytes == 0 || !vision_absent ||
-        memory.cuda_graph_allowance_bytes == 0) {
+        memory.workspace.capacity_bytes == 0 || !vision_absent || !graph_budget_ok) {
         std::cerr << "35B maximum configuration does not match the planned 256K layout: context="
                   << memory.max_context << " kv_payload=" << memory.kv_payload_bytes
                   << " sequence=" << memory.sequence.capacity_bytes
-                  << " workspace=" << memory.workspace.capacity_bytes << '\n';
+                  << " workspace=" << memory.workspace.capacity_bytes
+                  << " graph_captured=" << (memory.cuda_graph.has_value() ? 1 : 0)
+                  << " graph_allowance=" << memory.cuda_graph_allowance_bytes << '\n';
         return 1;
     }
 

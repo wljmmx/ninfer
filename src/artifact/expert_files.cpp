@@ -212,4 +212,43 @@ ExpertFileBank describe_matrix_expert_files(const Reader& reader,
     return bank;
 }
 
+ExpertFileBank describe_matrix_expert_objects(std::span<const ObjectHandle> objects,
+                                             const WeightGeometry& matrix, std::uint32_t count,
+                                             std::uint32_t rows, const ExpertBankLayout& layout) {
+    if (!count || count != layout.count || !rows || matrix.shape.empty() ||
+        objects.size() != count) {
+        throw std::invalid_argument("single-matrix expert plan disagrees on the expert count");
+    }
+    // Same split as the reader-backed form: one object per expert carries the whole matrix, a
+    // bank-wide object keeps the experts in consecutive row blocks.
+    const bool per_expert = objects.front().index != objects.back().index;
+    const auto bank_geometry = [&] {
+        const std::uint64_t shape[2] = {static_cast<std::uint64_t>(count) * rows,
+                                        matrix.shape.back()};
+        return weight_geometry(matrix.format, matrix.layout, shape);
+    }();
+    ExpertFileBank bank;
+    bank.experts.reserve(count);
+    const auto chunk = [](ExpertFileEntry& target, const WeightBankPlane& plane,
+                          std::uint32_t object, std::uint64_t image_offset) {
+        if (!plane.expert_bytes) { return; }
+        target.chunks.push_back({object, plane.offset, plane.expert_bytes, image_offset});
+    };
+    for (std::uint32_t expert = 0; expert < count; ++expert) {
+        const auto slice = per_expert
+                               ? describe_weight_bank(matrix, {0, 1, rows, rows})
+                               : describe_weight_bank(
+                                     bank_geometry,
+                                     {static_cast<std::uint64_t>(expert) * rows, 1, rows, rows});
+        ExpertFileEntry entry;
+        entry.image_bytes = layout.entry_bytes;
+        const auto object_index = objects[per_expert ? expert : 0].index;
+        chunk(entry, slice.codes, object_index, layout.codes.offset);
+        chunk(entry, slice.high, object_index, layout.high.offset);
+        chunk(entry, slice.scales, object_index, layout.scales.offset);
+        bank.experts.push_back(std::move(entry));
+    }
+    return bank;
+}
+
 } // namespace ninfer::artifact

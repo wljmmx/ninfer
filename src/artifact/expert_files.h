@@ -55,5 +55,13 @@ namespace ninfer::artifact {
                                                           std::uint32_t count, std::uint32_t rows,
                                                           const ExpertBankLayout& layout);
 
+// port (sm_89): the same single-matrix mapping over a retained Host replica. A host tier has no
+// artifact reader, so this form names the object and the offset inside it directly; the chunks it
+// produces are the same entry image the reader-backed form builds.
+[[nodiscard]] ExpertFileBank describe_matrix_expert_objects(std::span<const ObjectHandle> objects,
+                                                            const WeightGeometry& matrix,
+                                                            std::uint32_t count, std::uint32_t rows,
+                                                            const ExpertBankLayout& layout);
+
 } // namespace ninfer::artifact
 

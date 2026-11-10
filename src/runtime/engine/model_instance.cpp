@@ -221,11 +221,21 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
                 for (const auto object : stream->split_objects(matrix_role)) {
                     objects.push_back(artifact::ObjectHandle{object});
                 }
-                files.push_back(artifact::describe_matrix_expert_files(
-                    instance.expert_source->reader(), objects,
-                    stream->split_expert_geometry(matrix_role), stream->count(),
-                    static_cast<std::uint32_t>(stream->split_layout(matrix_role).region.rows),
-                    requirements.banks[runs[i].first + role]));
+                // A host tier has no artifact reader (`instance.expert_source` is null), so the
+                // single-matrix plan has to be built from the object bytes the replica holds.
+                files.push_back(
+                    host_tier
+                        ? artifact::describe_matrix_expert_objects(
+                              objects, stream->split_expert_geometry(matrix_role), stream->count(),
+                              static_cast<std::uint32_t>(
+                                  stream->split_layout(matrix_role).region.rows),
+                              requirements.banks[runs[i].first + role])
+                        : artifact::describe_matrix_expert_files(
+                              instance.expert_source->reader(), objects,
+                              stream->split_expert_geometry(matrix_role), stream->count(),
+                              static_cast<std::uint32_t>(
+                                  stream->split_layout(matrix_role).region.rows),
+                              requirements.banks[runs[i].first + role]));
             }
             continue;
         }
@@ -266,10 +276,15 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
         // object-relative offsets while every consumer (spans, read_entry) reads them as file
         // absolute - which is why the fused artifact only scored correctly through the copying path
         // that happened to re-read by image offset. The per-expert plan was never affected.
-        files.push_back(artifact::describe_fused_expert_files(
-            instance.expert_source->reader(), gate_up, down, stream->gate_up_parent(),
-            stream->down_parent(), stream->count(), gu_rows, dn_rows,
-            requirements.banks[runs[i].first]));
+        files.push_back(host_tier
+                            ? artifact::describe_fused_expert_host(
+                                  gate_up, down, stream->gate_up_parent(), stream->down_parent(),
+                                  stream->count(), gu_rows, dn_rows,
+                                  requirements.banks[runs[i].first])
+                            : artifact::describe_fused_expert_files(
+                                  instance.expert_source->reader(), gate_up, down,
+                                  stream->gate_up_parent(), stream->down_parent(), stream->count(),
+                                  gu_rows, dn_rows, requirements.banks[runs[i].first]));
     }
     expert_debug("files", files.size(), requirements.banks.size());
     instance.expert_cache = std::make_unique<ExpertCache>(
