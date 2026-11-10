@@ -2,6 +2,7 @@
 #include "core/decode_graph.h"
 #include "ops/softmax_attention/qsa/storage.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 
@@ -27,6 +28,16 @@ int verify(Fixture& f, const std::string& label, bool preserved = true) {
     const auto reference = f.reference();
     const auto got       = from_device_bf16(f.out.data(), f.qhost.size());
     int failures         = verify_reduction(label, got, reference, kSparseA16Criterion);
+    // NINFER_QSA_ORACLE_REPORT: name the budget's headroom instead of only pass/fail, so a
+    // per-dtype record carries the element count and the worst deviation the Op actually reached.
+    if (std::getenv("NINFER_QSA_ORACLE_REPORT") != nullptr) {
+        double worst = 0.0;
+        for (std::size_t i = 0; i < got.size(); ++i) {
+            worst = std::max(worst, std::abs(double(got[i]) - double(reference[i])));
+        }
+        std::fprintf(stderr, "[oracle] %s elements=%zu max_abs_error=%.6e\n", label.c_str(),
+                     got.size(), worst);
+    }
     const auto words     = from_device<std::uint16_t>(f.out.data(), f.qhost.size());
     for (int m = 0; m < f.T * f.B; ++m)
         if (f.visible[m].empty())
