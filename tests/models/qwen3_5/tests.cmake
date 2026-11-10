@@ -223,3 +223,10 @@ add_test(NAME ninfer_qwen3_5_tool_schema_oracle_test
   COMMAND ${CMAKE_COMMAND} -E env
     "NINFER_TOOL_PROBE=$<TARGET_FILE:ninfer_qwen3_5_tool_constraints_test>"
     ${Python3_EXECUTABLE} -B "${CMAKE_CURRENT_LIST_DIR}/test_tool_schema.py")
+
+# S1 of the QSA wiring: the index plane, the tail state pool and the two stateful ops' scratch are
+# sized from one place, and the transient side is delegated to the ops' own capacity queries so a
+# controller dial that widens the interval can never leave the plan behind execution.
+ninfer_add_test(ninfer_qsa_plan_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qsa_plan.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_ops)

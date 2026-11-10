@@ -5,6 +5,7 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/execution/expert_stream.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/expert_prefetch.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/gdn.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/execution/qsa.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/mtp.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/text.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/vision.cpp"
