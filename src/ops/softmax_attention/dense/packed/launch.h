@@ -6,6 +6,11 @@
 
 namespace ninfer::ops::detail {
 
+// Query rows one descriptor covers. The scratch sizing in packed_softmax_attention.cpp and the
+// prepare kernel both derive their tile count from it, and the flash launch tiles queries by it,
+// so the three must be the same number.
+inline constexpr std::int32_t kPackedDescriptorRows = 64;
+
 void packed_attention_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                              const Tensor& cu_seqlens, Tensor* tiles, Tensor& out,
                              cudaStream_t stream);

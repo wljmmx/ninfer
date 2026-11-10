@@ -9,9 +9,11 @@
 namespace ninfer::ops::detail {
 namespace {
 
-// The packed tile ladder: 64 query rows per CTA, 64 keys per step (the same constants the
-// former local kernel carried; the shared noncausal kernel takes them as template arguments).
-inline constexpr int kPackedAttentionBr = 64;
+// The packed tile ladder: kPackedDescriptorRows query rows per CTA, 64 keys per step (the same
+// constants the former local kernel carried; the shared noncausal kernel takes them as template
+// arguments). The descriptor grid and the query tiling are the same axis: one CTA consumes
+// exactly one descriptor, so the prepare kernel must be instantiated with this row count.
+inline constexpr int kPackedAttentionBr = kPackedDescriptorRows;
 inline constexpr int kPackedAttentionBc = 64;
 
 std::int64_t stride_elements(const Tensor& tensor, int dim) {
@@ -52,7 +54,7 @@ void packed_attention_launch(const Tensor& q, const Tensor& k, const Tensor& v,
     const int max_tiles =
         packed_segments ? tiles->ne[1] : (q.ne[2] + kPackedAttentionBr - 1) / kPackedAttentionBr;
     if (packed_segments) {
-        packed_attention_prepare_tiles_kernel<1><<<1, 256, 0, stream>>>(
+        packed_attention_prepare_tiles_kernel<kPackedDescriptorRows><<<1, 256, 0, stream>>>(
             static_cast<const std::int32_t*>(cu_seqlens.data), cu_seqlens.ne[0] - 1,
             static_cast<PackedAttentionTile*>(tiles->data), max_tiles, q.ne[2]);
         CUDA_CHECK(cudaGetLastError());

@@ -13,19 +13,29 @@
 namespace ninfer::ops {
 namespace {
 
-constexpr std::int32_t kHeads   = 16;
+constexpr std::int32_t kHeads    = 16;
 constexpr float kExpectedScale64 = 0.125f;
-constexpr float kExpectedScale  = 0.11785113019775792073f;
+constexpr float kExpectedScale   = 0.11785113019775792073f;
 
-void require_profile(AttentionHeadGeometry geometry, float scale, const char* op) {
+void require_geometry(AttentionHeadGeometry geometry, const char* op) {
     if (!valid_attention_head_geometry(geometry) ||
-        (geometry.head_dim != 64 && geometry.head_dim != 72) ||
-        geometry.query_heads != kHeads || geometry.kv_heads != kHeads) {
+        (geometry.head_dim != 64 && geometry.head_dim != 72) || geometry.query_heads != kHeads ||
+        geometry.kv_heads != kHeads) {
         throw std::invalid_argument(std::string(op) + ": unsupported head geometry");
     }
+}
+
+float expected_scale(AttentionHeadGeometry geometry) {
     // T088 (upstream 6eb6056b): the noncausal profiles are D64 and D72, each with its own
     // 1/sqrt(D) scale. The text heads stay on 72; the vision heads run at 64.
-    const float expected = geometry.head_dim == 64 ? kExpectedScale64 : kExpectedScale;
+    return geometry.head_dim == 64 ? kExpectedScale64 : kExpectedScale;
+}
+
+// The capacity query carries no scale, so it validates only the geometry it prices. Assuming a
+// scale there rejected the D64 route before it could be sized.
+void require_profile(AttentionHeadGeometry geometry, float scale, const char* op) {
+    require_geometry(geometry, op);
+    const float expected = expected_scale(geometry);
     if (!std::isfinite(scale) || std::abs(scale - expected) > 1.0e-7f) {
         throw std::invalid_argument(std::string(op) + ": scale must be 1/sqrt(head_dim)");
     }
@@ -33,7 +43,7 @@ void require_profile(AttentionHeadGeometry geometry, float scale, const char* op
 
 std::int32_t scratch_tiles(std::int32_t tokens, std::int32_t segments) {
     if (segments == 1) { return 0; }
-    constexpr std::int64_t tile_rows = 64;
+    constexpr std::int64_t tile_rows = detail::kPackedDescriptorRows;
     const std::int64_t tiles =
         (static_cast<std::int64_t>(tokens) + tile_rows - 1) / tile_rows + segments - 1LL;
     if (tiles > std::numeric_limits<std::int32_t>::max()) {
@@ -86,7 +96,7 @@ std::size_t packed_softmax_attention_workspace_capacity_bytes(AttentionHeadGeome
                                                               std::int32_t max_tokens,
                                                               std::int32_t min_segments,
                                                               std::int32_t max_segments) {
-    require_profile(geometry, kExpectedScale, "packed_softmax_attention workspace");
+    require_geometry(geometry, "packed_softmax_attention workspace");
     if (min_tokens <= 0 || max_tokens < min_tokens || min_segments <= 0 ||
         max_segments < min_segments || min_segments > max_tokens) {
         throw std::invalid_argument(
