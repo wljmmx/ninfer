@@ -87,67 +87,59 @@ void launch_wide(const CausalAttentionOperands& p, Int8KvReadView cache, Tensor*
                                            cache.page_scores_peak, cache.page_scores_recent});
 }
 
+// The geometry is part of the kernel template, and the cache view is the only operand that knows
+// the KV head count: 24 query heads run either four (Qwen3.6 attention) or two (Qwen4Exp's indexed
+// layers) KV heads, and both pairings need their own instance.
+template <bool PackedV = false, bool PackedK = false, bool E8Root = false, bool V8Root = false,
+          bool E8Lattice = false>
+void launch_wide_by_geometry(const CausalAttentionOperands& p, Int8KvReadView cache,
+                             Tensor* page_score, cudaStream_t stream) {
+    if (p.query_heads == 24 && cache.kv_heads == 2)
+        launch_wide<CausalD256H24Kv2, Int8KvTiledInstance, PackedV, PackedK, E8Root, V8Root,
+                    E8Lattice>(p, cache, page_score, stream);
+    else if (p.query_heads == 24)
+        launch_wide<CausalD256H24Kv4, Int8KvTiledInstance, PackedV, PackedK, E8Root, V8Root,
+                    E8Lattice>(p, cache, page_score, stream);
+    else
+        launch_wide<CausalD256H16Kv2, Int8KvTiledInstance, PackedV, PackedK, E8Root, V8Root,
+                    E8Lattice>(p, cache, page_score, stream);
+}
+
 } // namespace
 
 void int8_kv_batch_wide_attention(const CausalAttentionOperands& p, Int8KvReadView cache,
                                   Tensor* page_score, cudaStream_t stream) {
-    if (p.query_heads == 24)
-        launch_wide<CausalD256H24Kv4, Int8KvTiledInstance>(p, cache, page_score, stream);
-    else
-        launch_wide<CausalD256H16Kv2, Int8KvTiledInstance>(p, cache, page_score, stream);
+    launch_wide_by_geometry(p, cache, page_score, stream);
 }
 
 // rk8v4: 8-bit K + int4 V (PackedV only).
 void rk8v4_kv_batch_wide_attention(const CausalAttentionOperands& p, Int8KvReadView cache,
                                    Tensor* page_score, cudaStream_t stream) {
-    if (p.query_heads == 24)
-        launch_wide<CausalD256H24Kv4, Int8KvTiledInstance, true>(p, cache, page_score, stream);
-    else
-        launch_wide<CausalD256H16Kv2, Int8KvTiledInstance, true>(p, cache, page_score, stream);
+    launch_wide_by_geometry<true>(p, cache, page_score, stream);
 }
 
 // rk4v4: int4 K + int4 V.
 void rk4v4_kv_batch_wide_attention(const CausalAttentionOperands& p, Int8KvReadView cache,
                                    Tensor* page_score, cudaStream_t stream) {
-    if (p.query_heads == 24)
-        launch_wide<CausalD256H24Kv4, Int8KvTiledInstance, true, true>(p, cache, page_score,
-                                                                      stream);
-    else
-        launch_wide<CausalD256H16Kv2, Int8KvTiledInstance, true, true>(p, cache, page_score,
-                                                                      stream);
+    launch_wide_by_geometry<true, true>(p, cache, page_score, stream);
 }
 
 // rk4v4-e8: int4 K carried as E8 lattice + residual (E8Lattice) + int4 V.
 void rk4v4e8_kv_batch_wide_attention(const CausalAttentionOperands& p, Int8KvReadView cache,
                                      Tensor* page_score, cudaStream_t stream) {
-    if (p.query_heads == 24)
-        launch_wide<CausalD256H24Kv4, Int8KvTiledInstance, true, true, false, false, true>(
-            p, cache, page_score, stream);
-    else
-        launch_wide<CausalD256H16Kv2, Int8KvTiledInstance, true, true, false, false, true>(
-            p, cache, page_score, stream);
+    launch_wide_by_geometry<true, true, false, false, true>(p, cache, page_score, stream);
 }
 
 // rk4v2-e8: int4 K + 2-bit E8 cylinder V (V8Root), both under the E8 lattice carrier.
 void rk4v2e8_kv_batch_wide_attention(const CausalAttentionOperands& p, Int8KvReadView cache,
                                      Tensor* page_score, cudaStream_t stream) {
-    if (p.query_heads == 24)
-        launch_wide<CausalD256H24Kv4, Int8KvTiledInstance, false, true, false, true, true>(
-            p, cache, page_score, stream);
-    else
-        launch_wide<CausalD256H16Kv2, Int8KvTiledInstance, false, true, false, true, true>(
-            p, cache, page_score, stream);
+    launch_wide_by_geometry<false, true, false, true, true>(p, cache, page_score, stream);
 }
 
 // rk2v4-e8: 2-bit E8 cylinder K (E8Root) + int4 V.
 void rk2v4e8_kv_batch_wide_attention(const CausalAttentionOperands& p, Int8KvReadView cache,
                                      Tensor* page_score, cudaStream_t stream) {
-    if (p.query_heads == 24)
-        launch_wide<CausalD256H24Kv4, Int8KvTiledInstance, true, false, true>(p, cache, page_score,
-                                                                            stream);
-    else
-        launch_wide<CausalD256H16Kv2, Int8KvTiledInstance, true, false, true>(p, cache, page_score,
-                                                                            stream);
+    launch_wide_by_geometry<true, false, true>(p, cache, page_score, stream);
 }
 
 } // namespace ninfer::ops::detail
