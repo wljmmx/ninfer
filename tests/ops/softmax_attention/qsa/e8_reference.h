@@ -9,6 +9,8 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 
 namespace ninfer::test::qsa::e8 {
 
@@ -258,7 +260,14 @@ inline void encode_8d(const std::array<float, 8>& value, float ks, std::uint8_t&
     for (int l = 0; l < 8; ++l) projections[l] = unit[l] * (primary[l] * kInvSqrt2);
     const float projection = butterfly_sum(projections)[0];
     std::array<float, 8> residual{};
-    for (int l = 0; l < 8; ++l) residual[l] = unit[l] - projection * (primary[l] * kInvSqrt2);
+    for (int l = 0; l < 8; ++l) {
+        // The device writes this as one expression, `u - dot * (v1 * kInvSqrt2)`, which nvcc
+        // contracts into a fused multiply-add. Splitting it into a multiply and a subtract rounds
+        // twice instead of once, and the residual axis is chosen by an argmax that flips on a
+        // one-ulp tie.
+        const float scale = primary[l] * kInvSqrt2;
+        residual[l]       = std::fma(-projection, scale, unit[l]);
+    }
 
     std::array<float, 8> magnitude_residual{};
     for (int l = 0; l < 8; ++l) magnitude_residual[l] = std::fabs(residual[l]);
@@ -289,6 +298,14 @@ inline void encode_8d(const std::array<float, 8>& value, float ks, std::uint8_t&
         out_radial = 0;
     } else {
         out_radial = static_cast<std::uint8_t>((radius_index << 4) | (axis_index & 0x0F));
+    }
+    if (std::getenv("NINFER_E8_HOST_DUMP") != nullptr) {
+        std::fprintf(stderr,
+                     "[e8host] rel=%.9g rad=%d a=%.9g b=%.9g i=%d j=%d dim=%d root=%u radb=%u "
+                     "base=%.9g\n",
+                     double(relative), radius_index, double(type_a_score), double(type_b_score),
+                     first_index, second_index, best_dimension, unsigned(out_root),
+                     unsigned(out_radial), double(norm));
     }
 }
 

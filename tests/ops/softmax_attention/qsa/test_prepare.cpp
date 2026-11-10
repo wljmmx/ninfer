@@ -141,6 +141,17 @@ int verify(Fixture& f, const std::string& label) {
                         std::array<float, 256> represented;
                         std::copy(key.begin(), key.end(), represented.begin());
                         const auto encoded = encode_row(represented, f.encoding.key);
+                        if (std::getenv("NINFER_E8_HOST_DUMP") != nullptr) {
+                            int shown = 0;
+                            for (std::size_t i = 0; i < got.data.size() && shown < 24; ++i) {
+                                if (got.data[i] == encoded.data[i]) continue;
+                                std::fprintf(stderr,
+                                             "[e8diff] b=%d t=%d h=%d byte=%zu device=%u host=%u\n",
+                                             b, t, h, i, unsigned(got.data[i]),
+                                             unsigned(encoded.data[i]));
+                                ++shown;
+                            }
+                        }
                         failures += verify_exact("exact K codes", got.data, encoded.data);
                         failures += verify_exact("exact K scales", got.scales, encoded.scales);
                     }
