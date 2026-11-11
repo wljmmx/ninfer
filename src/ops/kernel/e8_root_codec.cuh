@@ -211,13 +211,21 @@ __device__ __forceinline__ void e8_encode_cylinder_8d(
     out_rad_axis = static_cast<uint8_t>((rad_idx << 4) | (axis_idx & 0x0F));
 }
 
+// Optional per-subspace trace: with a non-null record the encoder prints its inputs and its
+// residual axis decision from one lane, which is the only way to line a host reference up with the
+// device when the two disagree on a discrete choice.
+struct E8Trace {
+    int row, head, group, subspace, plane;
+};
+
 // Warp-Cooperative 8-Lane Subspace Quantizer (100% Lane Occupancy, Zero Loop Divergence)
 __device__ __forceinline__ void e8_encode_cylinder_8d_warp(
     float val,
     float ks,
     uint8_t& out_root,
     uint8_t& out_rad_axis,
-    int lane
+    int lane,
+    const E8Trace* trace = nullptr
 ) {
     const int sub_lane = lane & 7;
     constexpr unsigned full_mask = 0xffffffffu;
@@ -383,6 +391,24 @@ __device__ __forceinline__ void e8_encode_cylinder_8d_warp(
         // out_root was already selected by the Type A/B decision above; only the
         // radius/axis byte depends on rad_idx.
         out_rad_axis = static_cast<uint8_t>((rad_idx << 4) | (axis_idx & 0x0F));
+    }
+    if (trace != nullptr) {
+        // Every lane of the subgroup joins these shuffles; only the subgroup's first lane prints.
+        float gathered[8];
+        for (int i = 0; i < 8; ++i)
+            gathered[i] = __shfl_sync(sub_mask, res, (lane & ~7) + i);
+        if ((lane & 7) == 0) {
+            printf("[e8dev] %d r=%d h=%d g=%d s=%d absmax=%.9g step=%.9g rel=%.9g rad=%u a=%.9g b=%.9g "
+                   "type=%c dim=%d root=%u rad_axis=%u res=%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g\n",
+                   trace->plane, trace->row, trace->head, trace->group, trace->subspace,
+                   double(ks * 7.0f), double(ks), double(r_rel), unsigned(rad_idx),
+                   double(best_type_a_score), double(best_type_b_score),
+                   (best_type_a_score >= best_type_b_score) ? 'A' : 'B', best_dim,
+                   unsigned(out_root), unsigned(out_rad_axis), double(gathered[0]),
+                   double(gathered[1]), double(gathered[2]), double(gathered[3]),
+                   double(gathered[4]), double(gathered[5]), double(gathered[6]),
+                   double(gathered[7]));
+        }
     }
 }
 

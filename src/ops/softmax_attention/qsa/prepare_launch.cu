@@ -71,6 +71,15 @@ PrepareArguments prepare_arguments(const QsaProjectionView& p, const QsaPrepareP
         a.frequency[i] = params.rope_theta == 1e7F
                              ? default_frequency[i]
                              : std::pow(double(params.rope_theta), -double(i) / 32);
+    if (const char* dump = std::getenv("NINFER_QSA_E8_DUMP"); dump != nullptr && *dump != '\0') {
+        a.e8_dump = 1;
+        if (const char* row = std::getenv("NINFER_QSA_E8_ROW"); row != nullptr) {
+            a.e8_dump_row = std::atoi(row);
+        }
+        if (const char* plane = std::getenv("NINFER_QSA_E8_PLANE"); plane != nullptr) {
+            a.e8_dump_plane = std::atoi(plane);
+        }
+    }
     return a;
 }
 

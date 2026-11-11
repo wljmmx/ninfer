@@ -98,6 +98,13 @@ inline constexpr float kRadius[16] = {
 inline constexpr float kValueRadiusCentreB = 1.115f;
 
 // One eight-dim subspace of the E8-cylinder carrier.
+struct EncodeDiag {
+    float a_score = 0.0f, b_score = 0.0f, norm = 0.0f;
+    int type = 0, best_dim = 0, first = 0, second = 0, radius = 0;
+    std::uint8_t root = 0, radial = 0;
+    std::array<float, 8> res{};
+};
+
 inline void decode_8d(std::uint8_t root_code, std::uint8_t radial, bool value_plane,
                       std::array<int, 8>& decoded) {
     const int radius_index = radial >> 4, axis_index = radial & 0x0F;
@@ -122,13 +129,19 @@ inline void decode_8d(std::uint8_t root_code, std::uint8_t radial, bool value_pl
 // masks 4,2,1, and the top-two selection with 1,2,4 - because a different order changes the last
 // float bits and can select a different radius index or root at a boundary.
 //
-// STATUS: not yet bit-identical to the device. On `exact_key_encoding`'s dyadic fixture (16 tokens
-// x 2 heads = 1024 subspace codes, inputs both sides represent exactly) 13 of 1024 codes still
-// differ, all in the (root, radial) pair bytes, so one discrete decision diverges somewhere in the
-// type-A/type-B selection or the residual axis. Until that is localized the three E8 carriers stay
-// out of `test_prepare`'s storage list, and their writer side is unverified.
+// STATUS (2026-11-11): the K side of the dyadic `exact_key_encoding` fixture is bit-identical
+// (1024/1024 subspace codes), and the earlier 13/1024 residue was the residual contraction, fixed
+// by the `std::fma` below. What is left is the V side: with `store_rk_value` -> `store_rk_e8<false>`
+// wired through the three carriers, `norm_alignment_and_phase` still reports one radial byte per
+// fixture (device 0xD7 vs host 0xD0 at row 199/head 1/group 0/subspace 0 of the 321-token case).
+// The device dump (`NINFER_QSA_E8_DUMP`) shows the same `absmax` (8), the same `step` (1.14257812),
+// the same radius index (13) and the same root (52), so the absmax scope and the scale landing
+// order are both ruled out; only the residual-axis argmax differs, and the host's own `res` has no
+// tie there (|res[0]| = 0.355 against |res[3]| = 0.211), so a near-tie re-selection is ruled out
+// too. Locating it needs the device's own `res` for that subspace, which the printf buffer drops at
+// the dump's volume; the carriers therefore stay out of `test_prepare`'s storage list.
 inline void encode_8d(const std::array<float, 8>& value, float ks, std::uint8_t& out_root,
-                      std::uint8_t& out_radial) {
+                      std::uint8_t& out_radial, EncodeDiag* diag = nullptr) {
     constexpr float kInvSqrt2 = 0.7071067811865475f;
     // A lane reads its partner's pre-step value, so each butterfly stage writes a fresh array.
     const auto butterfly_sum = [](const std::array<float, 8>& start) {
@@ -300,6 +313,19 @@ inline void encode_8d(const std::array<float, 8>& value, float ks, std::uint8_t&
         out_radial = static_cast<std::uint8_t>((radius_index << 4) | (axis_index & 0x0F));
     }
     if (std::getenv("NINFER_E8_HOST_DUMP") != nullptr) {
+        if (diag != nullptr) {
+            diag->a_score  = type_a_score;
+            diag->b_score  = type_b_score;
+            diag->norm     = norm;
+            diag->type     = type_a_score >= type_b_score ? 0 : 1;
+            diag->best_dim = best_dimension;
+            diag->first    = first_index;
+            diag->second   = second_index;
+            diag->radius   = radius_index;
+            diag->root     = out_root;
+            diag->radial   = out_radial;
+            diag->res      = residual;
+        }
         std::fprintf(stderr,
                      "[e8host] rel=%.9g rad=%d a=%.9g b=%.9g i=%d j=%d dim=%d root=%u radb=%u "
                      "base=%.9g\n",

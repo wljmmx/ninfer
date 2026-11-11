@@ -40,5 +40,10 @@ struct PrepareArguments {
     int tokens, batch, axes, kv_heads;
     float epsilon;
     double frequency[32];
+    // Default-off diagnostic (NINFER_QSA_E8_DUMP): print one line per E8 subspace with the values
+    // its residual-axis decision was made from, for the row `e8_dump_row` (-1 = the executing row).
+    int e8_dump     = 0;
+    int e8_dump_row = -1;
+    int e8_dump_plane = -1;
 };
 } // namespace ninfer::ops::detail::qsa

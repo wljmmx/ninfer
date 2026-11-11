@@ -147,15 +147,26 @@ __device__ __forceinline__ void store_rk_int4(const float (&values)[8], std::uin
 // residual grid because read-back multiplies the codes by it.
 template <bool Residual>
 __device__ __forceinline__ void store_rk_e8(const float (&values)[8], std::uint8_t* data,
-                                           std::uint8_t* scales, int lane) {
+                                           std::uint8_t* scales, int lane,
+                                           const E8Trace* trace_base = nullptr) {
     for (int group = 0; group < 4; ++group) {
         const float absmax =
             warp_max(fmaxf(fabsf(values[2 * group]), fabsf(values[2 * group + 1])), kRkFullMask);
         const __half scale = rk4_absmax_to_scale_h(absmax);
         const float step   = __half2float(scale);
         std::uint8_t root0 = 0, rad0 = 0, root1 = 0, rad1 = 0;
-        e8_encode_cylinder_8d_warp(values[2 * group], step, root0, rad0, lane);
-        e8_encode_cylinder_8d_warp(values[2 * group + 1], step, root1, rad1, lane);
+        E8Trace trace0{}, trace1{};
+        if (trace_base != nullptr) {
+            trace0           = *trace_base;
+            trace0.group     = group;
+            trace0.subspace  = group * 8 + int((lane >> 3) & 3);
+            trace1           = trace0;
+            trace1.subspace  = trace0.subspace + 4;
+        }
+        e8_encode_cylinder_8d_warp(values[2 * group], step, root0, rad0, lane,
+                                   trace_base != nullptr ? &trace0 : nullptr);
+        e8_encode_cylinder_8d_warp(values[2 * group + 1], step, root1, rad1, lane,
+                                   trace_base != nullptr ? &trace1 : nullptr);
         const std::uint32_t pair0      = root0 | (rad0 << 8);
         const std::uint32_t pair1      = root1 | (rad1 << 8);
         const std::uint32_t pair0_next = __shfl_xor_sync(kRkFullMask, pair0, 8);
@@ -200,25 +211,27 @@ __device__ __forceinline__ void store_rk_e8(const float (&values)[8], std::uint8
 
 template <KvCacheStorage Storage>
 __device__ __forceinline__ void store_rk_key(const float (&values)[8], std::uint8_t* data,
-                                             std::uint8_t* scales, int lane) {
+                                             std::uint8_t* scales, int lane,
+                                             const E8Trace* trace = nullptr) {
     if constexpr (Storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64) {
         // 8-bit Hadamard key: the int8-group64 codec verbatim, 256 B of codes and four scales.
         store_int8(values, data, scales, lane);
     } else if constexpr (Storage == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64) {
         store_rk_int4(values, data, scales, lane);
     } else if constexpr (kPrepareRkE8Key<Storage>) {
-        store_rk_e8<true>(values, data, scales, lane);
+        store_rk_e8<true>(values, data, scales, lane, trace);
     } else {
         static_assert(Storage == KvCacheStorage::RK2V4E8);
-        store_rk_e8<false>(values, data, scales, lane);
+        store_rk_e8<false>(values, data, scales, lane, trace);
     }
 }
 
 template <KvCacheStorage Storage>
 __device__ __forceinline__ void store_rk_value(const float (&values)[8], std::uint8_t* data,
-                                               std::uint8_t* scales, int lane) {
+                                               std::uint8_t* scales, int lane,
+                                               const E8Trace* trace = nullptr) {
     if constexpr (kPrepareRkRootValue<Storage>) {
-        store_rk_e8<false>(values, data, scales, lane);
+        store_rk_e8<false>(values, data, scales, lane, trace);
     } else {
         store_rk_int4(values, data, scales, lane);
     }
@@ -232,6 +245,9 @@ __device__ __forceinline__ void prepare_kv(const PrepareArguments& a, int head, 
     const int page        = a.tables[p / 64 + std::int64_t(a.table_rows[b]) * a.table_stride];
     auto* key             = a.keys.at(p % 64, head, page);
     auto* value           = a.values.at(p % 64, head, page);
+    const bool trace_row  = a.e8_dump != 0 && (a.e8_dump_row < 0 || a.e8_dump_row == int(m));
+    const bool trace_key  = trace_row && a.e8_dump_plane <= 0;
+    const bool trace_value = trace_row && (a.e8_dump_plane < 0 || a.e8_dump_plane == 1);
     const auto* raw_key   = a.k + (m * KvHeads + head) * 256;
     const auto* raw_value = a.v + (m * KvHeads + head) * 256;
     if constexpr (Storage == KvCacheStorage::BFloat16) {
@@ -253,7 +269,12 @@ __device__ __forceinline__ void prepare_kv(const PrepareArguments& a, int head, 
         constexpr auto value_storage =
             Storage == KvCacheStorage::Fp8KeyNvfp4Value ? KvCacheStorage::Nvfp4Group16 : Storage;
         if constexpr (kPrepareRk<Storage>) {
-            store_rk_key<Storage>(values, key, a.key_scales.at(p % 64, head, page), lane);
+            E8Trace trace{};
+            trace.row   = int(m);
+            trace.head  = head;
+            trace.plane = 0;
+            store_rk_key<Storage>(values, key, a.key_scales.at(p % 64, head, page), lane,
+                                  trace_key ? &trace : nullptr);
         } else {
             store_quantized<key_storage>(values, key, a.key_scales.at(p % 64, head, page), lane,
                                          scratch);
@@ -264,7 +285,12 @@ __device__ __forceinline__ void prepare_kv(const PrepareArguments& a, int head, 
             normalized_hadamard_d256_inplace(values, lane);
         if constexpr (kPrepareRk<Storage>) {
             // rk keeps V in the original coordinate frame, exactly as the append path does.
-            store_rk_value<Storage>(values, value, a.value_scales.at(p % 64, head, page), lane);
+            E8Trace trace{};
+            trace.row   = int(m);
+            trace.head  = head;
+            trace.plane = 1;
+            store_rk_value<Storage>(values, value, a.value_scales.at(p % 64, head, page), lane,
+                                    trace_value ? &trace : nullptr);
         } else {
             store_quantized<value_storage>(values, value, a.value_scales.at(p % 64, head, page),
                                            lane, scratch);

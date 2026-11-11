@@ -68,6 +68,7 @@ int verify(Fixture& f, const std::string& label) {
     const auto actual_q  = from_device<std::uint16_t>(f.query_output.data, f.q.host.size());
     const auto actual_iq = from_device<std::uint16_t>(f.iq_output.data, f.iq.host.size());
     const auto actual_k = f.keys.download(), actual_ks = f.key_scales.download();
+    const auto actual_v = f.values.download();
     const auto actual_ik = f.compressed.download();
     auto expected_k = f.keys.host, expected_v = f.values.host;
     auto expected_ks = f.key_scales.host, expected_vs = f.value_scales.host;
@@ -160,6 +161,42 @@ int verify(Fixture& f, const std::string& label) {
                     std::array<float, 256> raw_value;
                     for (int c = 0; c < 256; ++c) raw_value[c] = bf16_to_f32(f.v.at(c, h, t, b));
                     const auto value = encode_row(raw_value, f.encoding.value);
+                    if (is_e8(f.encoding.value.encoding) && std::getenv("NINFER_E8_HOST_DUMP") != nullptr) {
+                        const auto device_row = row(actual_v, f.values);
+                        if (device_row != value.data) {
+                            for (std::size_t i = 0; i < value.data.size(); ++i) {
+                                if (device_row[i] == value.data[i]) continue;
+                                const int g = int(i) / 16, within = int(i) % 16;
+                                const int subspace = within / 2, byte_of_pair = within % 2;
+                                float absmax = 0.0f;
+                                for (int d = g * 64; d < g * 64 + 64; ++d)
+                                    absmax = std::max(absmax, std::abs(raw_value[d]));
+                                const float step = fp16_decode(fp16_encode(absmax / 7.0F));
+                                std::array<float, 8> block{};
+                                for (int k = 0; k < 8; ++k)
+                                    block[k] = raw_value[g * 64 + subspace * 8 + k];
+                                std::uint8_t r = 0, a = 0;
+                                ninfer::test::qsa::e8::EncodeDiag diag{};
+                                ninfer::test::qsa::e8::encode_8d(block, step, r, a, &diag);
+                                std::fprintf(stderr,
+                                             "[e8v] b=%d t=%d h=%d g=%d s=%d byte=%s dev=%u host=%u "
+                                             "absmax=%.9g step=%.9g a=%.9g b=%.9g type=%d dim=%d "
+                                             "pair=%d,%d rad=%d root=%u radial=%u res=%.9g,%.9g,%.9g,%.9g,"
+                                             "%.9g,%.9g,%.9g,%.9g\n",
+                                             b, t, h, g, subspace,
+                                             byte_of_pair ? "radial" : "root",
+                                             unsigned(device_row[i]), unsigned(value.data[i]),
+                                             double(absmax), double(step), double(diag.a_score),
+                                             double(diag.b_score), diag.type, diag.best_dim,
+                                             diag.first, diag.second, diag.radius, unsigned(diag.root),
+                                             unsigned(diag.radial), double(diag.res[0]),
+                                             double(diag.res[1]), double(diag.res[2]),
+                                             double(diag.res[3]), double(diag.res[4]),
+                                             double(diag.res[5]), double(diag.res[6]),
+                                             double(diag.res[7]));
+                            }
+                        }
+                    }
                     put(expected_v, f.values, value.data);
                     put(expected_vs, f.value_scales, value.scales);
                 }
