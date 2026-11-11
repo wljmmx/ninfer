@@ -248,3 +248,18 @@ ids 门（`--prompt Hello --max-new 8 --greedy --print-token-ids`，各跑两次
 - 若 S1 的模板实例化不触发 tile 断言：约 0.5–1 天（机械实例 + 分派 + 复跑 golden）。
 - 若触发 tile 断言（GQA-12 vs tile 16）：另加 1–2 天用于 `grouped_mma.cuh`/`batch_wide_mma.cuh` 的分块改造与两套路径复验。
 - 前置：本项是 **rk 端到端门** 的唯一障碍（QSA 侧读侧 5/5 oracle 已过、写侧 2/5 逐字节已过、E8 写侧 K 平面 1024/1024 子空间码已对齐）；不解决它就无法在真实模型上验证 rk KV 的端到端正确性。
+
+### T204 S2 实测（2026-11-11，rk8v4 / rk4v4 端到端）
+
+放开的范围：`causal_softmax_attention.cpp` 的拒绝表只对 `rk8v4`、`rk4v4` 的 24Q/2KV/D256 放开；E8 三变体继续拒绝。跑量化臂需显式 opt-in `NINFER_QSA_SPARSE_GQA_QUANT_KV=1`（`qsa_sparse_gqa` 的既有约定）。
+
+| 项 | rk8v4 | rk4v4 |
+|---|---|---|
+| run1 ids | 8239 2780 39435 7520 55076 42228 37554 9825 | 97110 194972 4487 5936 33930 76336 1775 46849 |
+| run2 ids | 同上（逐位一致） | 同上（逐位一致） |
+| 主 K 平面落盘 | 1,048,576 B，sha256 3879A11E… | 524,288 B，sha256 6EAE562F… |
+| 相对 BF16（2,097,152 B，sha256 144F830A…） | 1/2 体积（1 B 码 + 32 KiB scale） | 1/4 体积（4 bit 码 + 32 KiB scale） |
+
+2200 前缀（`--max-context 8192 --kv-capacity 8192`）在 rk8v4 下正常出 token（`3141 64029`），S4 时代的 `cudaErrorIllegalAddress` 不再出现。BF16 基线不变（`160864 206077 99011 1525 90856 128702 186459 3794`）。
+
+未完成：E8 三变体的**写侧**验证（`test_prepare` 仍只含 rk8v4/rk4v4）；卡点为 `rk4v2-e8` 的 64 B 两比特 V 平面 `index 21474`，需 `store_rk_e8` 中间量 dump 与 host 参考逐项比对后才能进列表。
