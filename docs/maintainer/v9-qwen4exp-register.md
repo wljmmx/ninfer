@@ -335,3 +335,27 @@ E8 三变体在 24Q/2KV/D256 dense 路由上同时放行（`cd371261`）：rk4v4
 即：prefill 列的 scale 与自己的 absmax/7 完全一致（3e-5 量级＝FP16 半个 ulp），decode 列不一致。再在 slot 45–63 × 两个 head 里搜"存储 scale 最像谁"，最接近的也差 0.029–0.068 且落在 slot 46/48/49，**不是固定行偏移**（既非错一个 head、也非错一个槽）。
 
 结论：decode 列的 scale 与码都不是本列 V 的正确编码，也不是邻近某列的 scale；结合上一轮"入参与落点全对（`t=0, m=0, p=53, head 0/1`）"，剩余唯一解释是 **decode 那一步喂给编码器的 256 个 float 与 prefill/另一臂不同**。本轮未能抓到 decode 的入参（`v_trace_capacity=8` 被 prefill 占满、`TRACE_T=0` 又因前 8 条限制没轮到），因此未修；下一步唯一动作是把 `v_trace_capacity` 提到 ≥64（或加 skip），把 decode 那一步的入参抓出来与本列 BF16 值逐元素比。
+
+**T204 S3 收口（第七轮，2026-11-11）：decode 列不是缺陷，是跨臂比较口径错误**
+
+不需要新开关：`NINFER_QSA_LAYER_DUMP` 早就在 `qsa_mix` 里导出了 `value_in`（`projected.value`，即 `qsa_prepare` 的 V 入参本体），`NINFER_QSA_KV_DUMP` 导出主缓存平面，两者在同一 layer 调用内、同一 stream 上先后落盘，因此"那一列装的是不是这一 pass 的 V"可以在**同一次运行、同一条臂**内直接对账，不必跨臂。
+
+一次 `--max-new N` 运行会写 `N-1` 个单 token 的 decode pass。`--prompt Hello` 实测 prefill 为 53 token、分 51+2 两段（`T51`/`T2`，position 0–52；后者覆盖 51、52），故最后一个 decode pass 的 position 是 `52 + (N-1)`。
+
+1. **两臂从第一个采样就分叉**：rk8v4 `8239 2780 39435 7520 55076 42228 37554 9825`、BF16 `160864 206077 99011 1525 90856 128702 186459 3794`。prefill 的 0–52 列两臂一致（rk 存储 scale 对 BF16 列 `absmax/7`：0–50 列最大差 **2.1e-4**，51/52 列 1e-4），decode 的 53–59 列两臂必然不同 —— 这正是此前数出来的 **14 行 = 7 个 decode 列 × 2 head**。
+2. **同臂自洽（决定性）**：把最后一次 decode pass 的 `value_in` 与该 pass 自己写的列对账，四个不同步长、两个 head 全部落在自己的 position，残差是 FP16 半 ulp：
+
+| 运行 | 该 pass 的 position | 最匹配列 | head 0 / head 1 `max\|d\|` | 次佳列 `max\|d\|` |
+|---|---|---|---|---|
+| `--max-new 2` | 53 | 53 | 3.5e-5 / 5.2e-5 | 0.020 / 0.028 |
+| `--max-new 4` | 55 | 55 | 7.0e-5 / 7.0e-5 | 0.067 / 0.029 |
+| `--max-new 6` | 57 | 57 | 1.05e-4 / 1.05e-4 | 0.031 / 0.036 |
+| `--max-new 8` | 59 | 59 | 3.5e-5 / 3.5e-5 | 0.029 / 0.022 |
+
+3. **BF16 臂是同一判据的对照组**：其存储列与该 pass 的 `value_in` 逐元素**完全相同**（`max|d| = 0.000000`，prefill 的 0/17/50 与 decode 的 55/59 全是 0），证明 `value_in` 与缓存列的对应关系、以及写路径本身没有问题。同臂的 decode 列还跨运行逐字节相同：同一 prompt 下 `--max-new 2/4/6/8` 的 51/52/53/55 列（两个 head）字节一致（`rk2` 没有写 55 列，故该列不同）。
+4. **V 平面的"隐含除数"**（列 `absmax` / 存储 scale）在 prefill 的 0–52 列恒为 **7.00**（四个 group、两个 head 全部 7.00），decode 列散在 **2.7–18.3** —— 说明 decode 列装的是**另一个 token 的 V**，不是编码器或落点出错。
+5. **K 平面不能跨臂比**：BF16 键走 `norm_rotate`（RMS+weight+RoPE），rk 键在其后还要 `normalized_hadamard_d256_inplace`，两者不在同一基；实测同一 prefill 列的隐含除数在 36–65 之间波动。此前"K 平面同一批列同样超差"因此不构成证据。
+
+结论：`prepare` 在 decode 写 V 的位置、索引与量化入参全部正确（4 个 decode 步、两个 head、position 精确、ulp 级一致），**S3 剩下的 12/14 行是跨臂比较口径问题**（两臂 greedy 链已分叉，同一 position 装的是不同 token 的 V），不是缺陷、无需修改代码。判据更正为**同臂**：`存储列 vs 该 pass 的 value_in`；跨臂比较只在 token 相同的列（本例的 prefill 0–52）上有意义。上面"第六轮"的结论与"下一步唯一动作"据此作废。
+
+复现：同 prompt 跑 `--kv-dtype rk8v4`（另加 `NINFER_QSA_SPARSE_GQA_QUANT_KV=1`）与 `--kv-dtype bf16`，各带 `NINFER_QSA_LAYER_DUMP`/`NINFER_QSA_KV_DUMP`/`NINFER_QSA_DUMP_LAYER=0`；比较脚本见 `H:\TeleAgentWorks\.temp\s3_closure.py`、`lastpass_probe.py`、`implied_divisor.py`。本轮未改动任何源码（提交 `a7577a18` 起的构建，`.temp` 脚本不入库）。
