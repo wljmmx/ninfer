@@ -7,24 +7,25 @@
 # gate uses (4096/2048), and both are exact: the PPL must repeat to the printed 6 significant
 # digits and the eviction-score dump must hash to the same 16 hex digits.
 #
-# Golden, as recorded on 2026-11-04 (tools/../.temp/kv/regress.py):
-#   default PPL        7.441868
-#   selector-off dump  636e38de95046781
-# The `e7ceb89dff4eb40b` in the v9 quick-reference is the older value, superseded by T042/T002.
+# Golden, as re-recorded 2026-11-11 after the E8 top-2 tie-break fix:
+#   default PPL        7.445538
+#   selector-off dump  61bfd6e5efee6395  (4547 bytes)
+# The pair it replaces was 7.441868 / 636e38de95046781, and `e7ceb89dff4eb40b` in the v9
+# quick-reference is older still (T042/T002).
 #
-# Measured 2026-11-11 on CUDA 13.5.37 + MSVC 14.52 with the E8 top-2 tie-break fix in tree:
-#   PPL 7.445538, dump 61bfd6e5efee6395 (4547 bytes against 4548)
-# Attribution is measured, not assumed: the same two binaries with `--kv-dtype bf16`, which never
-# enters the E8 encoder, agree bit for bit (7.226977 both), so the toolchain is neutral and the
-# move comes from the tie-break fix changing codes at exact ties. Re-baselining is a separate,
-# explicit decision; this script never rewrites the expected values by itself.
+# Why the move is the fix and not the toolchain, measured both ways:
+#   build-win-old  7.441868 / 636e38de95046781 (4548 bytes)   reproduces the old golden exactly
+#   build-win      7.445538 / 61bfd6e5efee6395 (4547 bytes)
+#   both, --kv-dtype bf16: 7.226977 on each, bit for bit      so the dense path is unchanged
+# The only numeric change in between is e1d80007, which turned the E8 top-2 tie-break into a strict
+# total order; the old reduction let two lanes keep different pairs at an exact tie.
 param(
     [string]$Model = "R:\model\qwen3_8_27b_v3\qwen3_8_27b_v3.ninfer",
     [string]$PplCorpus = "D:\ninfer-rtx4090\ppl_corpus.txt",
     [string]$DumpText = "D:\ninfer-rtx4090\n4_q1.txt",
     [string]$KvDtype = "rk4v4-e8",
-    [double]$ExpectPpl = 7.441868,
-    [string]$ExpectDump = "636e38de95046781",
+    [double]$ExpectPpl = 7.445538,
+    [string]$ExpectDump = "61bfd6e5efee6395",
     [switch]$Record
 )
 

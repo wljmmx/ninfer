@@ -19,11 +19,12 @@
 |---|---|---|
 | 35B default 930 MiB PPL | 4801 / 2.051275 / 7.777808 逐位 | T002 基线 + T082/T153–T158/T167 复跑 |
 | 35B 冻结 12 GiB PPL | 4801 / 2.049253 / 7.762104 逐位 | T002 + T082 + T159–T164 引用 |
-| 27B regress fast | default PPL 7.441868、selector-off dump **636e38de95046781**、9 点 0 回归 | T082/T158/T167 |
+| 27B regress fast | default PPL **7.445538**、selector-off dump **61bfd6e5efee6395**、9 点 0 回归（2026-11-11 重录，旧值见下行） | T082/T158/T167 + 重录留档 |
 | 27B moe | 7.111129 / 7.777808 / 6.479183 + decode d093ac2070ab3292 逐位 | T082/T158 |
 | seam | ninfer_kv_seam_test Passed | T082/T167 |
 | regress | fast/moe 均 0 回归 | T082/T158/T167 |
-| dump 口径更正 | 当前 golden = **636e38de95046781**（2026-11-04 重录）；§11 速查写的 e7ceb89dff4eb40b 是旧值（T042/T002 已登记） | regress.py + 留档 |
+| dump 口径更正 | 旧 golden = **636e38de95046781**（2026-11-04 重录），更早的 e7ceb89dff4eb40b 是 §11 速查旧值（T042/T002 已登记） | regress.py + 留档 |
+| golden 重录（2026-11-11） | PPL **7.445538**、dump **61bfd6e5efee6395**（4547 B）。证据：旧树 `build-win-old` 复现 7.441868 / 636e38de95046781（4548 B）；新树为 7.445538 / 61bfd6e5efee6395；两树 `--kv-dtype bf16` 逐位相同（7.226977）⇒ 工具链中性。归因：`e1d80007` 的 E8 top-2 并列收敛修正（旧实现并列时不同 lane 留下不同 pair，属不确定行为）。复跑 `regress.py --tier fast`：gates PASS、regressions 0 | `tools/release/gate_ppl.ps1` + regress.py |
 | 868–2048 长前缀 | pp868+tg512 prefill 133.23 t/s / decode 44.17 t/s（min 44.45）；pp2048+tg1024 prefill 130.84 / decode 41.28（min 41.35） | T128 留档 |
 | KL 汇总表 | 本地无 KL 工具，按 T028 替代口径（PPL 逐位+任务套件+bench 三判据并列），见 v9-dashboard-register.md §9 | T094/T113/T119/T128 |
 | 构建 | 全量增量 ninja 零错（T153–T158 后） | 留档 |
