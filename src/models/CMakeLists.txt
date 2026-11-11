@@ -29,6 +29,7 @@ add_library(ninfer_ple STATIC
   qwen4_exp/ple/row_reader.cpp
   qwen4_exp/ple/prepare.cpp
   qwen4_exp/ple/gpu.cpp
+  qwen4_exp/execution/ple_layer.cpp
 )
 ninfer_internal_includes(ninfer_ple)
-target_link_libraries(ninfer_ple PUBLIC ninfer_artifact ninfer_core)
+target_link_libraries(ninfer_ple PUBLIC ninfer_artifact ninfer_core ninfer_ops)
