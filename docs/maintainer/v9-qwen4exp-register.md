@@ -323,3 +323,15 @@ E8 三变体在 24Q/2KV/D256 dense 路由上同时放行（`cd371261`）：rk4v4
 同一次运行把 `NINFER_QSA_V_SRC_TRACE` 以 `TRACE_T=0 / TRACE_HEAD=1`（以及 head=0）打开、两臂各跑一次，**一条记录都没有产生**；同一开关在 prefill（`TRACE_T=26`）能正常出记录。即 decode 那一步的 `prepare_kv` 没有被观测到 —— 这一点本身是未解释的（`t` 在 decode 应为 0，`valid[0]=1` 使其 live），因此"入参 vs 存储"这一跳还没做成，缺陷仍未修。
 
 下一步（唯一）: 在 trace 条件里加一个"不过滤 t"的模式，或在 decode 的 `prepare_kv` 入口打印 `(t, head, live, valid[b], m, p)`，先把 decode 步的实际参数看清楚。
+
+**decode 列的 scale 行实测（第六轮）**：把 V 平面按 FP16 正确解码后，逐列比 `存储 scale` 与 `该列 absmax/7`：
+
+| slot | 归属 | `max｜stored − absmax/7｜` |
+|---|---|---|
+| 52（prefill 末列） | head 0 | **0.00003** |
+| 52 | head 1 | **0.00007** |
+| 53–59（decode 列） | 两个 head | **0.029–0.40** |
+
+即：prefill 列的 scale 与自己的 absmax/7 完全一致（3e-5 量级＝FP16 半个 ulp），decode 列不一致。再在 slot 45–63 × 两个 head 里搜"存储 scale 最像谁"，最接近的也差 0.029–0.068 且落在 slot 46/48/49，**不是固定行偏移**（既非错一个 head、也非错一个槽）。
+
+结论：decode 列的 scale 与码都不是本列 V 的正确编码，也不是邻近某列的 scale；结合上一轮"入参与落点全对（`t=0, m=0, p=53, head 0/1`）"，剩余唯一解释是 **decode 那一步喂给编码器的 256 个 float 与 prefill/另一臂不同**。本轮未能抓到 decode 的入参（`v_trace_capacity=8` 被 prefill 占满、`TRACE_T=0` 又因前 8 条限制没轮到），因此未修；下一步唯一动作是把 `v_trace_capacity` 提到 ≥64（或加 skip），把 decode 那一步的入参抓出来与本列 BF16 值逐元素比。
