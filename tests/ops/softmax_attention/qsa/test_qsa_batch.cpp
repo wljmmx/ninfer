@@ -1,22 +1,20 @@
-// REPRODUCER, NOT YET IN THE SUITE. Both arms are now built with the same (tokens, batch, envelope),
-// so sparse_gqa_plan resolves one plan for both; the single-row arm's other columns are present but
-// inert (valid_columns = 0), which the Op turns into a per-query early return.
-//
-// With the plan pinned, five of the six cases agree exactly and the earlier divergence across all of
-// them disappears: those differences were the plan, not the batching (queries 408 took the direct
-// Mma path while queries 51 took the partial/split path). What is left is `past-512-blocks` row 1
-// (2048 live columns in a 2049-wide rectangle), which still differs with identical plans from
-// (query 2049, ordinal 0, head 0, channel 0) on, so that one is a real open case and the reason this
-// file stays out of tests.cmake.
-//
 // The QSA read side under a merged batch: the same rows must produce the same bytes whether they
 // are addressed as one (width x batch) rectangle or one row at a time. The per-row bindings - the
 // row's own table row, positions, live length and selected blocks - are what keeps the rows
 // block-diagonal without a mask, so this compares the Op against itself with only that geometry
 // changed: every host array holds the same values in both arms, and only `batch` differs.
 //
+// Both arms are built with the same (tokens, batch, envelope), so sparse_gqa_plan resolves one plan
+// for both; the single-row arm's other columns are present but inert (valid_columns = 0), which the
+// Op turns into a per-query early return. Without that pin the two sides run different schedules
+// (408 queries take the direct Mma path, 51 take the partial/split path) and the comparison measures
+// the plan instead of the row bindings - which is exactly how the token-32 boundary showed up first.
+// A row's physical page span is derived from the rectangle width, not from an arm's own maximum, so
+// an inert arm cannot shift a later row onto other pages.
+//
 // Coverage: B=2 and B=8, mixed lengths including a one-token row, equal lengths, a row that crosses
-// one 64-token index page, and a row past 2048 tokens (more than 512 index blocks).
+// one 64-token index page, and a row past 2048 tokens (more than 512 index blocks). All six cases
+// agree byte for byte.
 #include "core/arena.h"
 #include "core/device.h"
 
@@ -111,8 +109,10 @@ struct Harness {
         table_width  = (max_visible + 63) / 64;
         table_stride = table_width;
         // A row's physical pages are addressed by its logical row id, so a one-row arm reads exactly
-        // the pages the merged arm read for that row.
-        const int pages_per_row = (max_visible_width(lengths_in) + 63) / 64;
+        // the pages the merged arm read for that row. The per-row span is derived from the rectangle
+        // width, not from this arm's own maximum: an inert arm whose live row is shorter would
+        // otherwise shift every later row onto different physical pages.
+        const int pages_per_row = (T + 63) / 64;
         pages                   = 1 + std::max(1, row_slots) * pages_per_row + 1;
         std::vector<int> base_page(B, 0);
         for (int b = 0; b < B; ++b) base_page[b] = 1 + row_ids[b] * pages_per_row;

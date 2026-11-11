@@ -23,3 +23,9 @@ ninfer_add_op_test(ninfer_qsa_indexer_test
 ninfer_add_op_test(ninfer_qsa_sparse_gqa_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sparse_gqa.cpp"
   LIBRARIES ninfer_ops)
+
+# The merged batch's row equivalence: both arms are built with the same (tokens, batch, envelope)
+# so sparse_gqa_plan resolves one plan for both; the single-row arm's other columns are inert.
+ninfer_add_op_test(ninfer_qsa_batch_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qsa_batch.cpp"
+  LIBRARIES ninfer_ops)
