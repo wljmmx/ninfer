@@ -148,7 +148,9 @@ void qsa_dump_tensor(const char* variable, const char* name, const Tensor& value
                      std::int32_t columns, cudaStream_t stream) {
     const char* directory = std::getenv(variable);
     if (directory == nullptr || *directory == '\0' || !qsa_dump_wants_layer(layer)) { return; }
-    if (value.data == nullptr || !value.is_contiguous()) {
+    // A BF16 cache has no scale planes: an absent tensor is simply not dumped.
+    if (value.data == nullptr) { return; }
+    if (!value.is_contiguous()) {
         throw std::logic_error("QSA dump needs a contiguous device tensor");
     }
     std::vector<std::uint8_t> host(value.bytes());
@@ -2157,6 +2159,8 @@ void TextContext::qsa_mix(const BlockParameters& w, Tensor& x, int fidx, Phase, 
 
     qsa_dump_tensor("NINFER_QSA_KV_DUMP", "main_key", main_cache.k_pages, fidx, 0, s);
     qsa_dump_tensor("NINFER_QSA_KV_DUMP", "main_value", main_cache.v_pages, fidx, 0, s);
+    qsa_dump_tensor("NINFER_QSA_KV_DUMP", "main_key_scale", main_cache.k_scale_pages, fidx, 0, s);
+    qsa_dump_tensor("NINFER_QSA_KV_DUMP", "main_value_scale", main_cache.v_scale_pages, fidx, 0, s);
     qsa_dump_tensor("NINFER_QSA_KV_DUMP", "index_key", index_cache.keys, fidx, 0, s);
     // The coverage check: after this call the written index blocks and the raw-key tail must tile
     // 0..p with no hole. The tail plane is dumped whole so the check can address the row's slot.

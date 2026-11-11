@@ -42,16 +42,21 @@ void require_causal_geometry(AttentionHeadGeometry geometry, const char* op) {
     }
 }
 
-// The 24/2 pairing is instantiated by the BF16 KV family only (its grouped and batch-wide templates
-// are keyed by the pair), so the quantized families would reach a template their operands cannot
-// match. Reject it here, by name, instead of letting it surface as "invalid operands".
+// The 24/2 pairing is instantiated per storage family. BF16 and the two plain rank-compressed int8
+// and int4 profiles are wired end to end (decode and prefill); the rest would reach a template their
+// operands cannot match, so they are rejected here by name instead of surfacing as "invalid
+// operands".
 void require_storage_supports_geometry(AttentionHeadGeometry geometry, KvCacheStorage storage,
                                        const char* op) {
-    if (geometry.query_heads == 24 && geometry.kv_heads == 2 &&
-        storage != KvCacheStorage::BFloat16) {
-        throw std::invalid_argument(std::string(op) +
-                                    ": the 24q/2kv D256 head geometry is served by the BF16 KV "
-                                    "route only; use BF16 KV storage for this profile");
+    if (geometry.query_heads == 24 && geometry.kv_heads == 2) {
+        const bool admitted = storage == KvCacheStorage::BFloat16 ||
+                              storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
+                              storage == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64;
+        if (!admitted) {
+            throw std::invalid_argument(std::string(op) +
+                                        ": the 24q/2kv D256 head geometry is served by the BF16 and "
+                                        "rk8v4/rk4v4 KV routes only; use one of those storages");
+        }
     }
 }
 
