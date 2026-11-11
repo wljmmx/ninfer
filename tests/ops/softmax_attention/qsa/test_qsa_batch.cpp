@@ -1,10 +1,13 @@
-// REPRODUCER, NOT YET IN THE SUITE. The QSA read side does not agree between a merged batch and one
-// row per launch: with byte-identical per-row inputs, batch 8 and batch 1 differ from token 32 on -
-// the first token of the second 32-query tile - for every row including row 0, and with equal lengths
-// as well as mixed ones. Batch 1 against itself is exact, so this is not a race. The row's own table
-// row, positions, live length and block selection are reproduced identically in both arms, so the
-// divergence is in how the batched pass binds a tile that starts at token 32. This file stays out of
-// tests.cmake until the Op is fixed; the binary exits non-zero today.
+// REPRODUCER, NOT YET IN THE SUITE. Both arms are now built with the same (tokens, batch, envelope),
+// so sparse_gqa_plan resolves one plan for both; the single-row arm's other columns are present but
+// inert (valid_columns = 0), which the Op turns into a per-query early return.
+//
+// With the plan pinned, five of the six cases agree exactly and the earlier divergence across all of
+// them disappears: those differences were the plan, not the batching (queries 408 took the direct
+// Mma path while queries 51 took the partial/split path). What is left is `past-512-blocks` row 1
+// (2048 live columns in a 2049-wide rectangle), which still differs with identical plans from
+// (query 2049, ordinal 0, head 0, channel 0) on, so that one is a real open case and the reason this
+// file stays out of tests.cmake.
 //
 // The QSA read side under a merged batch: the same rows must produce the same bytes whether they
 // are addressed as one (width x batch) rectangle or one row at a time. The per-row bindings - the
@@ -222,17 +225,23 @@ struct Harness {
 struct ArmOut {
     std::vector<std::uint16_t> words;
     int tokens = 0;   // the arm's own rectangle width, which is the batch stride of its layout
+    int column = 0;   // which batch column carries the row under comparison
 };
 
 // Returns the arm's raw output words in the Op's own layout, `[dim, head, token, batch]`.
-ArmOut arm(DeviceContext& device, const Case& c,
-           const std::vector<int>& row_ids, int batch, bool merged, int forced_width = 0) {
+//
+// Both arms are built with the SAME (tokens, batch, envelope), so `sparse_gqa_plan` resolves the
+// same instance, key_rows, splits and partial flag on both. The single-row arm is not a batch of
+// one: the other columns are present but inert (`valid_columns = 0`, no positions, no blocks), which
+// the Op turns into an early return per query, so they cannot influence the column under test. Only
+// this construction isolates a row's result from the plan the pass happens to choose.
+ArmOut arm(DeviceContext& device, const Case& c, int batch, int live_column, bool merged,
+           int forced_width = 0) {
     Harness h;
-    std::vector<int> lengths;
-    if (merged) {
-        lengths = c.lengths;
-    } else {
-        lengths.assign(1, c.lengths[row_ids[0]]);
+    std::vector<int> lengths(batch, 0), row_ids(batch);
+    for (int i = 0; i < batch; ++i) {
+        row_ids[i] = i;
+        lengths[i] = merged ? c.lengths[i] : (i == live_column ? c.lengths[live_column] : 0);
     }
     h.envelope.max_visible_tokens = 8192;
     h.build(lengths, row_ids, c.query_heads, 8192, int(c.lengths.size()), forced_width);
@@ -244,7 +253,7 @@ ArmOut arm(DeviceContext& device, const Case& c,
     h.launch(workspace, device.execution_view());
     device.synchronize();
     CUDA_CHECK(cudaGetLastError());
-    return ArmOut{from_device<std::uint16_t>(h.out.p, h.qhost.size()), h.T};
+    return ArmOut{from_device<std::uint16_t>(h.out.p, h.qhost.size()), h.T, live_column};
 }
 
 bool all_finite(const std::vector<std::uint16_t>& words) {
@@ -257,9 +266,7 @@ int run_case(DeviceContext& device, const Case& c, const std::string& name) {
     int failures = 0;
     const int rows = int(c.lengths.size());
     const int width = *std::max_element(c.lengths.begin(), c.lengths.end());
-    std::vector<int> all_rows(rows);
-    for (int b = 0; b < rows; ++b) all_rows[b] = b;
-    const auto merged = arm(device, c, all_rows, rows, true);
+    const auto merged = arm(device, c, rows, 0, true);
     if (!all_finite(merged.words)) {
         std::fprintf(stderr, "%s: merged arm produced a non-finite value\n", name.c_str());
         ++failures;
@@ -274,7 +281,7 @@ int run_case(DeviceContext& device, const Case& c, const std::string& name) {
                                                                std::size_t(a.tokens) * b))];
     };
     for (int b = 0; b < rows; ++b) {
-        const auto alone = arm(device, c, {b}, 1, false, width);
+        const auto alone = arm(device, c, rows, b, false, width);
         if (!all_finite(alone.words)) {
             std::fprintf(stderr, "%s: row %d alone produced a non-finite value\n", name.c_str(), b);
             ++failures;
@@ -290,7 +297,7 @@ int run_case(DeviceContext& device, const Case& c, const std::string& name) {
                 for (int d = 0; d < kHeadDim; ++d) {
                     ++compared;
                     const auto got   = at(merged, d, h, t, b);
-                    const auto alone_word = at(alone, d, h, t, 0);
+                    const auto alone_word = at(alone, d, h, t, alone.column);
                     if (got != alone_word) {
                         ++differing;
                         max_ulp = std::max(max_ulp, std::abs(ordered_key(got) - ordered_key(alone_word)));
