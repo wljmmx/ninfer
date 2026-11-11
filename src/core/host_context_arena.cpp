@@ -1,8 +1,14 @@
 #include "core/host_context_arena.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
+
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
 
 namespace ninfer {
 
@@ -26,7 +32,7 @@ HostContextAllocation& HostContextAllocation::operator=(HostContextAllocation&& 
 }
 
 std::byte* HostContextAllocation::data() const noexcept {
-    return valid() ? static_cast<std::byte*>(owner_->backing_->data()) + offset_ : nullptr;
+    return valid() ? owner_->base() + offset_ : nullptr;
 }
 
 void HostContextAllocation::publish() noexcept {
@@ -61,8 +67,33 @@ HostContextArena::HostContextArena(std::size_t capacity_bytes, std::size_t minim
     // At most N allocated extents separate N+1 free runs; releases and splits never allocate
     // metadata. The unused trailing bytes remain part of the charged physical backing.
     free_extents_.reserve(capacity_bytes_ / minimum_bytes_ + 1);
-    backing_.emplace(capacity_bytes_);
+    try {
+        backing_.emplace(capacity_bytes_);
+    } catch (const std::exception& error) {
+        // A pinned request this size is not guaranteed: it competes with every other lock the
+        // process holds (the expert arena, the KV staging ring) and with the driver's own budget.
+        // The tier only needs addressable host memory - the copies become driver staged instead of
+        // DMA - so a refused pin degrades the tier instead of aborting a 256K plan.
+        std::fprintf(stderr,
+                     "[host-context] pinned %.0f MiB refused (%s); using pageable backing "
+                     "(host demotion copies will stage through the driver)\n",
+                     static_cast<double>(capacity_bytes_) / (1024.0 * 1024.0), error.what());
+        std::fflush(stderr);
+#if defined(_WIN32)
+        pageable_ = static_cast<std::byte*>(_aligned_malloc(capacity_bytes_, alignment));
+        if (pageable_ != nullptr) {
+            std::memset(pageable_, 0, capacity_bytes_);
+        }
+#endif
+        if (pageable_ == nullptr) { throw; }
+    }
     free_extents_.push_back({0, capacity_bytes_});
+}
+
+HostContextArena::~HostContextArena() {
+#if defined(_WIN32)
+    if (pageable_ != nullptr) { _aligned_free(pageable_); }
+#endif
 }
 
 std::size_t HostContextArena::allocation_bytes(std::size_t bytes) const noexcept {

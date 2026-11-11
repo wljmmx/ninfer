@@ -15,6 +15,12 @@ namespace {
 // exactly one descriptor, so the prepare kernel must be instantiated with this row count.
 inline constexpr int kPackedAttentionBr = kPackedDescriptorRows;
 inline constexpr int kPackedAttentionBc = 64;
+// The two numbers are one axis: the flash launch advances queries by Br and reads one descriptor per
+// CTA, while the prepare kernel writes descriptors that each cover kPackedDescriptorRows rows. A
+// mismatch (it was instantiated with 1 once) leaves every segment after the first unwritten, with no
+// error anywhere - so the tie is checked here, where both are visible.
+static_assert(kPackedAttentionBr == kPackedDescriptorRows,
+              "the packed flash tile and the descriptor row count must be the same axis");
 
 std::int64_t stride_elements(const Tensor& tensor, int dim) {
     return tensor.nb[dim] / static_cast<std::int64_t>(sizeof(__nv_bfloat16));

@@ -1310,9 +1310,11 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
         EngineOptions fallback      = options;
         fallback.expert_host_copy   = ram_fits;
         fallback.expert_cache_bytes = kExpertCacheAuto;
-        // The routed banks upload and synchronize inside each layer, which a captured graph
-        // cannot contain (normalize_engine_options sets the same constraint for the switch).
-        fallback.use_cuda_graph     = false;
+        // The graph decision stays with the controller and with the capture guard, even here: a
+        // tier that cannot hold every layer fails the guard inside construct_model_once() and says
+        // why ("layer needs host fetch"), while a tier that can hold every layer is capturable and
+        // keeps the caller's default-on graph. Forcing the flag off here made the fallback silently
+        // diverge from every other construction, with nothing in the log to explain it.
         std::fprintf(stderr,
                      "[fallback] resident weights leave no room for the requested KV capacity "
                      "(%s); retrying with the routed experts in %s - decode will be slower\n",

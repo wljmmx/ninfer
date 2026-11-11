@@ -210,9 +210,29 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
                               storage_name(storage_profile) + " " + entry_name(entry);
     const std::string qualified_label =
         input_profile == InputProfile::SegmentIsolation ? label + " segment-isolation" : label;
-    int failures =
+    const int criterion_failures =
         verify_reduction(qualified_label.c_str(), from_device_bf16(d_out.data(), value_count),
                          reference, kPackedAttentionBf16Criterion);
+    int failures = criterion_failures;
+    // Coverage, not just accuracy: the buffer is pre-filled with BF16 0x7f7f (3.38953e+38), so any
+    // survivor is a query row no descriptor covered. This is the shape a descriptor grid with the
+    // wrong row step takes (one segment's descriptors exhaust the table, the rest are skipped and
+    // the guard makes it silent), and it is invisible on single-segment input.
+    {
+        const auto out_bits   = from_device<std::uint16_t>(d_out.data(), value_count);
+        std::size_t unwritten = 0;
+        std::size_t first     = 0;
+        for (std::size_t i = 0; i < value_count; ++i) {
+            if (out_bits[i] != 0x7f7fu) { continue; }
+            if (unwritten == 0) { first = i; }
+            ++unwritten;
+        }
+        if (unwritten != 0) {
+            std::cerr << qualified_label << ": " << unwritten << " of " << value_count
+                      << " output elements were never written (first index " << first << ")\n";
+            ++failures;
+        }
+    }
     failures += d_out.verify_guards((qualified_label + " output guards").c_str());
     if (storage_profile == StorageProfile::Contiguous) {
         failures += verify_exact((qualified_label + " q unchanged").c_str(),
@@ -269,6 +289,21 @@ int run_softmax_attention_plain_and_packed_tests() {
         run_case({0, 68, 136}, 101u, StorageProfile::InterleavedQkv, PublicEntry::UniformSegments);
     failures +=
         run_case({0, 256}, 2026u, StorageProfile::InterleavedQkv, PublicEntry::CuSeqlensArena);
+    // Descriptor-grid coverage across segment shapes: lengths below, at and above one 64-row tile,
+    // on both storage forms. The contiguous multi-segment form was the one combination this suite
+    // never ran, and the grid that steps by the wrong row count only fails on multi-segment input.
+    failures += run_case({0, 3, 65, 130}, 41u, StorageProfile::Contiguous,
+                         PublicEntry::CuSeqlensArena);
+    failures += run_case({0, 7, 70, 129}, 43u, StorageProfile::InterleavedQkv,
+                         PublicEntry::CuSeqlensArena);
+    failures += run_case({0, 1, 65}, 47u, StorageProfile::InterleavedQkv,
+                         PublicEntry::CuSeqlensArena);
+    // The uniform entry has no descriptor table at all: it tiles each segment from blockIdx, so a
+    // segment shorter than one tile is the tail-masking case nobody ran (only 68-row segments were).
+    failures += run_case({0, 40, 80, 120}, 53u, StorageProfile::InterleavedQkv,
+                         PublicEntry::UniformSegments);
+    failures += run_case({0, 64, 128, 192}, 59u, StorageProfile::InterleavedQkv,
+                         PublicEntry::UniformSegments);
 
     if (failures != 0) {
         std::cerr << "packed_softmax_attention failures=" << failures << '\n';

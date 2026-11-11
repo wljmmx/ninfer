@@ -272,7 +272,8 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes, bool mapped) {
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message(mapped ? "cudaHostAlloc failed"
                                                            : "cudaMallocHost failed",
-                                                    err));
+                                                    err) +
+                                 " (" + std::to_string(size_bytes >> 20) + " MiB requested)");
     }
 
     data_   = ptr;

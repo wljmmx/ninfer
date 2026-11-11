@@ -64,10 +64,19 @@ public:
     static constexpr std::size_t alignment = 256;
 
     HostContextArena(std::size_t capacity_bytes, std::size_t minimum_allocation_bytes);
+    ~HostContextArena();
     HostContextArena(const HostContextArena&)            = delete;
     HostContextArena& operator=(const HostContextArena&) = delete;
     HostContextArena(HostContextArena&&)                 = delete;
     HostContextArena& operator=(HostContextArena&&)      = delete;
+
+    // False when the pinned request was refused and the arena fell back to pageable memory.
+    [[nodiscard]] bool pinned() const noexcept { return backing_.has_value(); }
+
+    // Base address of the backing (pinned or pageable); null before the first allocation.
+    [[nodiscard]] std::byte* base() const noexcept {
+        return backing_.has_value() ? static_cast<std::byte*>(backing_->data()) : pageable_;
+    }
 
     [[nodiscard]] std::size_t capacity_bytes() const noexcept { return capacity_bytes_; }
 
@@ -124,6 +133,11 @@ private:
                  HostConsumer consumer) noexcept;
 
     std::optional<PinnedHostBuffer> backing_;
+    // Pageable backing, used only when the pinned request is refused. The tier exists to hold KV
+    // pages and state images outside the Device, and every consumer needs addressable host memory,
+    // not DMA: a fallback here keeps a 256K plan on a box whose pinned budget is already spent
+    // instead of aborting startup. Reported as `pinned() == false`.
+    std::byte* pageable_              = nullptr;
     std::size_t capacity_bytes_      = 0;
     std::size_t minimum_bytes_       = 0;
     std::size_t occupied_bytes_      = 0;
