@@ -70,6 +70,26 @@ if(WIN32)
     list(APPEND NINFER_RUNTIME_DLLS ${NINFER_CURL_RUNTIME_DLLS})
   endif()
 
+  # libjpeg-turbo is linked as a shared library by the media decode path (src/media), so its DLL -
+  # and the vcpkg runtime it sits beside - must be deployed too. Without it an executable that pulls
+  # in the decoder imports jpeg62.dll and never starts (0xC0000135), which under CTest looks like a
+  # hang rather than a missing dependency. JPEG_ROOT is resolved in src/media, i.e. after this file,
+  # so the vendored tree is globbed directly and JPEG_ROOT is honoured when a caller pins it.
+  set(NINFER_JPEG_RUNTIME_DIRS "")
+  if(JPEG_ROOT)
+    list(APPEND NINFER_JPEG_RUNTIME_DIRS "${JPEG_ROOT}/bin")
+  endif()
+  foreach(triplet x64-windows x64-windows-static-md)
+    list(APPEND NINFER_JPEG_RUNTIME_DIRS
+      "${PROJECT_SOURCE_DIR}/../deps/vcpkg/installed/${triplet}/bin")
+  endforeach()
+  foreach(jpeg_dir IN LISTS NINFER_JPEG_RUNTIME_DIRS)
+    if(EXISTS "${jpeg_dir}")
+      file(GLOB NINFER_JPEG_RUNTIME_DLLS CONFIGURE_DEPENDS "${jpeg_dir}/*.dll")
+      list(APPEND NINFER_RUNTIME_DLLS ${NINFER_JPEG_RUNTIME_DLLS})
+    endif()
+  endforeach()
+
   list(REMOVE_DUPLICATES NINFER_RUNTIME_DLLS)
   if(NINFER_RUNTIME_DLLS)
     list(LENGTH NINFER_RUNTIME_DLLS NINFER_RUNTIME_DLL_COUNT)
@@ -137,8 +157,9 @@ if(NINFER_ZMQ_INCLUDE_DIR AND NINFER_ZMQ_LIBRARY)
   set(NINFER_ZMQ_RUNTIME_DLL "${PROJECT_SOURCE_DIR}/third_party/libzmq/bin/libzmq-mt-4_3_5.dll")
   if(EXISTS "${NINFER_ZMQ_RUNTIME_DLL}")
     list(APPEND NINFER_RUNTIME_DLLS "${NINFER_ZMQ_RUNTIME_DLL}")
-    list(REMOVE_DUPLICATES NINFER_RUNTIME_DLLS)
   endif()
+
+
 else()
   message(STATUS "NInfer: libzmq not found; the checkpoint cache stays disabled (set NINFER_ZMQ_ROOT)")
 endif()
