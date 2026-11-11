@@ -67,6 +67,24 @@ ninfer_add_test(ninfer_qwen3_5_moe_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_moe_real.cpp"
   LIBRARIES ninfer_engine)
 
+# port (sm_89): the dense counterpart of the 35B fixture - qwen3.8-27b
+# (architectures = ["Qwen3_5ForCausalLM"], 64 dense layers, text + vision + mtp + dflash2 in the
+# component table). It pins the construction contract (max_context 4096, KV Int8Group64, MTP-3),
+# the load/memory summaries against the artifact's own values, text generation at both ends of the
+# 1..5 token band, append/prefix reuse, and - with NINFER_TEST_VISION=1 - a PPM image through the
+# public Engine, asserting the startup-frozen vision workspace handoff.
+#
+# Run (from the build directory; the artifact is never hard-coded):
+#   $env:NINFER_TEST_ARTIFACT = 'R:\model\qwen3_8_27b_v3\qwen3_8_27b_v3.ninfer'
+#   ctest -R ninfer_qwen3_5_dense_real_test --output-on-failure
+#   $env:NINFER_TEST_VISION = '1'   # the vision arm, same artifact
+#   ctest -R ninfer_qwen3_5_dense_real_test --output-on-failure
+# Without NINFER_TEST_ARTIFACT the binary prints "skip: NINFER_TEST_ARTIFACT is not set" and exits
+# 77, which this registration maps to SKIP_RETURN_CODE.
+ninfer_add_test(ninfer_qwen3_5_dense_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_dense_real.cpp"
+  LIBRARIES ninfer_engine)
+
 ninfer_add_test(ninfer_qwen3_5_dflash_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_dflash_real.cpp"
   LIBRARIES ninfer_engine)
@@ -189,6 +207,7 @@ set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_dflash2_real_test
   ninfer_qwen3_5_dflash_prefill_real_test
   ninfer_qwen3_5_moe_real_test
+  ninfer_qwen3_5_dense_real_test
   ninfer_qwen3_5_dflash_real_test
   ninfer_qwen3_5_kv_tier_real_test
   ninfer_qwen3_5_expert_stream_real_test
@@ -208,6 +227,9 @@ set_tests_properties(ninfer_qwen3_5_resize_pinned_graph_real_test PROPERTIES
   TIMEOUT 1800)
 set_tests_properties(ninfer_qwen3_5_resize_handoff_real_test PROPERTIES
   TIMEOUT 1800)
+# A 19 GiB resident load plus the vision arm; the default timeout is not enough for the upload alone.
+set_tests_properties(ninfer_qwen3_5_dense_real_test PROPERTIES
+  TIMEOUT 3600)
 
 set_tests_properties(
   ninfer_qwen3_5_state_image_test
