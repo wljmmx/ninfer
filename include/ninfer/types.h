@@ -1330,6 +1330,10 @@ struct LoadSummary {
     std::uint32_t kv_resident_page_groups = 0;
     std::uint64_t kv_device_payload_bytes = 0;
     std::uint64_t kv_host_payload_bytes   = 0;
+    // port (sm_89): the Device memory the residency plan held back on purpose (default 2 GiB,
+    // NINFER_KV_RESIDENCY_SLACK_MB overrides). Priced out of the budget before the split is solved,
+    // so it is the margin that keeps the driver from paging the KV pool after startup.
+    std::uint64_t kv_residency_slack_bytes = 0;
 };
 
 } // namespace ninfer

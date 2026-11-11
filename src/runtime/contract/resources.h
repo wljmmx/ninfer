@@ -148,6 +148,11 @@ struct KvCapacityResolution {
     std::size_t free_after_startup_bytes             = 0;
     std::size_t automatic_headroom_bytes             = 0;
     std::size_t planned_slack_bytes                  = 0;
+    // port (sm_89): the Device memory the residency plan holds back on purpose (default 2 GiB,
+    // NINFER_KV_RESIDENCY_SLACK_MB overrides). It is priced out of the budget BEFORE the residency
+    // split is solved, so it is the margin that keeps the driver from paging the KV pool later.
+    // Reported so the startup line can say which value was actually used.
+    std::size_t residency_slack_bytes                = 0;
     // appendix IK: the eviction-contract decision taken at startup (0 off, 1 on) and the reason
     // bits that produced it (see MemorySummary). Stored here because this is the one struct the
     // engine already forwards to the server's startup log.

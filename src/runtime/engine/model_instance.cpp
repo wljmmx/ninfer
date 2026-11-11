@@ -775,8 +775,21 @@ bool kv_host_residency_requested(const EngineOptions& options) {
 // capture plus the driver's own storage are paid from that same budget afterwards - measured on this
 // card the capture alone adds ~54 MiB. A plan with zero slack dies inside the capture instead of
 // starting, so the reservation holds this much back (overridable for a sweep).
+//
+// port (sm_89): 512 MiB was the first value and it is too small on this card. This is not a capture
+// allowance: it is the room the process must still have AFTER the plan is priced, and everything the
+// desktop, the driver or a later allocation takes comes out of it. When it runs out, WDDM pages this
+// process's own allocations - the KV pool among them.
+//
+// Measured on the 256K dense arm (RTX 4090, 19 GiB of resident weights):
+//   * 512 MiB -> 1,610-1,633 resident page groups (39.3-39.9%), free_after_startup 0.61-0.65 GiB
+//   * 2 GiB   ->   910-932 resident page groups (22.2-22.8%), free_after_startup 2.23-2.29 GiB
+// The extra margin is what absorbs memory the process does not control. With a second process holding
+// Device memory (the "the desktop took it after startup" case) the 512 MiB arm is consistently slower:
+// 16K-token prefill 1,998 tok/s against 2,392 at 2 GiB held by that process, and 457 against 788 tok/s
+// at 12 GiB held. Hence 2 GiB as the default; NINFER_KV_RESIDENCY_SLACK_MB still overrides it.
 std::size_t kv_residency_slack_bytes() {
-    constexpr std::size_t kDefault = 512ULL << 20;
+    constexpr std::size_t kDefault = 2048ULL << 20;
     const char* value              = std::getenv("NINFER_KV_RESIDENCY_SLACK_MB");
     if (value == nullptr || *value == '\0') { return kDefault; }
     const auto mib = std::strtoull(value, nullptr, 10);
@@ -1055,6 +1068,7 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
             out.available_after_weights_bytes = usable;
             out.automatic_headroom_bytes      = options.kv_capacity.automatic_headroom_bytes;
             out.planned_slack_bytes           = usable - tiered.device_reservation_bytes;
+            out.residency_slack_bytes         = slack;
             return out;
         };
         // A tiered plan is priced against what the driver can give back WITHOUT taking pages away
@@ -1188,9 +1202,17 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
                               std::to_string(resolution.logical_page_groups));
         models::qwen3_5::install_kv_eviction_window(0, resolution.logical_page_groups);
         constexpr double kMib = 1024.0 * 1024.0;
+        // port (sm_89): say which slack produced the split. 512 MiB is a legal override and the arm
+        // that reproduces the paging collapse, so the log has to name the value in force rather than
+        // leave the reader to assume the default.
         std::fprintf(stderr,
-                     "[kv-residency] logical=%u page(s) resident=%u page(s) (%.1f%%) "
-                     "device_kv=%.1f MiB host_kv=%.1f MiB\n",
+                     "[kv-residency] slack=%.0f MiB (%s) usable=%.0f MiB logical=%u page(s) "
+                     "resident=%u page(s) (%.1f%%) device_kv=%.1f MiB host_kv=%.1f MiB\n",
+                     static_cast<double>(resolution.residency_slack_bytes) / kMib,
+                     std::getenv("NINFER_KV_RESIDENCY_SLACK_MB") != nullptr
+                         ? "NINFER_KV_RESIDENCY_SLACK_MB"
+                         : "default",
+                     static_cast<double>(resolution.available_after_weights_bytes) / kMib,
                      resolution.logical_page_groups, resolution.resident_page_groups,
                      100.0 * static_cast<double>(resolution.resident_page_groups) /
                          static_cast<double>(resolution.logical_page_groups),
@@ -1408,6 +1430,7 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
                                                      : resolution.main_page_groups;
     summary.kv_device_payload_bytes            = resolution.device_kv_payload_bytes;
     summary.kv_host_payload_bytes              = resolution.host_kv_payload_bytes;
+    summary.kv_residency_slack_bytes           = resolution.residency_slack_bytes;
     return {std::move(instance), std::move(summary), std::move(context_cost.model)};
 }
 
