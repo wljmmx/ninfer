@@ -14,6 +14,12 @@
 #include <variant>
 #include <vector>
 
+namespace ninfer::models::qwen4_exp {
+// The n-gram table's reader. Declared here so the executable parameter set can hold one without
+// pulling the disk layer's headers into every consumer of this file.
+class PleTableSource;
+} // namespace ninfer::models::qwen4_exp
+
 namespace ninfer::models::qwen3_5::execution {
 
 using LinearParameters = ops::SingleProjectionWeight;
@@ -167,12 +173,28 @@ struct HcParameters {
     [[nodiscard]] ops::HcFinalSeparateMixWeights final_form() const { return {down, up}; }
 };
 
+// Qwen4Exp's per-block n-gram embedding ("PLE"), in the form the PLE Ops consume.
+//
+// The artifact keeps the four key blocks and the shared value block in one quantized parent, so
+// `projection` is that whole matrix as a single Linear: rows [0,H*C) are the per-stream keys and
+// rows [H*C,H*C+H) the value every stream shares. `convolution` is the artifact's [4,D] tap bank
+// read as the Op's [D,4] - dimension zero fastest, i.e. channel fastest - which is the same bytes
+// in the same order, so no transpose copies it.
+struct PleParameters {
+    LinearParameters projection;
+    Tensor norm_key, norm_query, norm_conv; // BF16 [H,C], unit offset
+    Tensor convolution;                     // BF16 [D,4], channel c=d+H*s fastest
+};
+
 struct BlockParameters {
     Tensor input_norm, post_attention_norm;
     std::variant<AttentionParameters, GdnParameters> mixer;
     FfnParameters ffn;
     ops::SparseMoeHints projection_prefetch;
     std::optional<HcParameters> input_hc, post_attention_hc;
+    // Present on the blocks `ple_layer_ids` names; absent everywhere else, which is what keeps a
+    // model without PLE byte-identical to the path before this member existed.
+    std::optional<PleParameters> ple;
 };
 
 struct TextParameters {
@@ -181,6 +203,15 @@ struct TextParameters {
     Tensor final_norm;
     std::optional<HcParameters> final_hc;
     std::vector<BlockParameters> layers;
+    // The n-gram table's reader, when one exists for this model. It is 28.8 GiB at the supported
+    // NF4 encoding and 43.5 GiB at the encoding the current artifact ships, so it is never
+    // resident: PleTableSource owns its own read handles and hands out encoded rows. Building one
+    // needs an artifact::Reader, which only the load path has; a model whose config declares PLE
+    // is refused at startup until that wiring exists rather than running without its embeddings.
+    std::shared_ptr<const qwen4_exp::PleTableSource> ple_table;
+    // The token id the n-gram hash substitutes for missing history. The Program owns the
+    // request's stop ids, so it states this when it supplies the table.
+    std::int32_t ple_eos = -1;
 };
 
 struct MtpProjectionParameters {
@@ -274,3 +305,4 @@ public:
 };
 
 } // namespace ninfer::models::qwen3_5::execution
+

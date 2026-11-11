@@ -13,6 +13,7 @@
 #include "models/qwen3_5/execution/visual_scatter.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_control.h"
+#include "models/qwen4_exp/execution/ple_layer.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/act_quant_a8.h"
@@ -573,6 +574,45 @@ TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weight
             &p.head, p.token_ids ? static_cast<const std::int32_t*>(p.token_ids->data) : nullptr,
             dimension(p.rows));
     }
+    if (config_.ple) {
+        // A config that declares PLE layers gets a stage or an error: running the blocks without
+        // their n-gram embeddings would be a different model.
+        if (!parameters_.text.ple_table) {
+            throw std::invalid_argument(
+                "text: the config declares ple_layer_ids but no table source was provided; PLE "
+                "needs PleTableSource, which only the load path can build from a Reader");
+        }
+        if (parameters_.text.ple_eos < 0) {
+            throw std::invalid_argument(
+                "text: PLE requires the request's EOS id for the n-gram hash; the Program owns it");
+        }
+        std::vector<std::optional<qwen4_exp::PleLayerWeights>> layers;
+        layers.reserve(parameters_.text.layers.size());
+        for (const auto& block : parameters_.text.layers) {
+            if (!block.ple) {
+                layers.push_back(std::nullopt);
+                continue;
+            }
+            qwen4_exp::PleLayerWeights weights;
+            weights.projection  = block.ple->projection.weight;
+            weights.policy      = block.ple->projection.policy;
+            weights.norm_key    = block.ple->norm_key;
+            weights.norm_query  = block.ple->norm_query;
+            weights.norm_conv   = block.ple->norm_conv;
+            weights.convolution = block.ple->convolution;
+            weights.rms_epsilon = config_.rms_norm_eps;
+            layers.push_back(std::move(weights));
+        }
+        qwen4_exp::PlePrepareOptions options;
+        // One window per prefill chunk; the stage holds two so a step's reads overlap the next
+        // step's commit. A per-sequence history slot needs the Program's sequence identity, which
+        // this context does not own, so one sequence is driven at a time.
+        options.max_positions = prefill_chunk_;
+        options.windows       = 2;
+        ple_                  = std::make_unique<qwen4_exp::PleTextStage>(
+            *parameters_.text.ple_table, parameters_.text.ple_eos, ctx_, std::move(layers),
+            prefill_chunk_, 1, 1, options);
+    }
 }
 
 TextContext::~TextContext() = default;
@@ -1060,6 +1100,30 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
 
         Tensor x = work_.alloc(DType::BF16, {dimension(config_.hidden_size), batch});
         ops::embedding(ids, *embed_, x, stream);
+        if (ple_) {
+            // One sequence per window: this step's token is the window and the stage keeps the
+            // two-token hash tail from the window it saw last. The hash reads Host ids, so this
+            // single int is the only readback the PLE step adds.
+            if (batch != 1) {
+                throw std::invalid_argument(
+                    "text: PLE is driven one sequence at a time; a per-row history slot needs the "
+                    "Program's sequence identity");
+            }
+            std::int32_t token = 0;
+            CUDA_CHECK(cudaMemcpyAsync(&token, ids.data, sizeof(token), cudaMemcpyDeviceToHost,
+                                       stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            const std::array<std::int32_t, 1> slot{0};
+            const std::array<std::uint32_t, 1> live{1};
+            const qwen4_exp::PleStepWindow window{.ids           = std::span<const std::int32_t>(
+                                                       &token, 1),
+                                                  .slots         = slot,
+                                                  .valid_columns = live,
+                                                  .tokens        = 1};
+            ple_->begin(window, ctx_.execution_view());
+            ple_window_ = true;
+            ple_tokens_ = 1;
+        }
         // A decode column is one token, so the pass's live-column count is the pool's row of ones
         // and the record base is the row's own position; both stay device tensors, which keeps the
         // captured traversal replayable without a host read.
@@ -1081,6 +1145,11 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
                                                        qsa.active ? &qsa.offsets : nullptr);
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
+        if (ple_) {
+            ple_->end(ctx_.execution_view());
+            ple_window_ = false;
+            ple_tokens_ = 0;
+        }
         final_hidden(x, hidden, batch);
         // Q67: zero-weight scratch rows for the row-independent output projection. The class width
         // is the compiled shape; the extra rows read zero hidden and their logits are never sampled.
@@ -2291,6 +2360,30 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                                  work_.used());
                     std::fflush(stderr);
                 }
+                if (block.ple) {
+                    // Qwen4Exp's n-gram embedding runs here because this is the one point that
+                    // holds both the four-stream residual the layer writes and the token ids the
+                    // window was gathered from, and it precedes both mixer branches. PLE rewrites
+                    // `residual` and re-derives `normalized` from it with THIS block's input norm,
+                    // which is exactly what hc_mix_into consumes below.
+                    if (!ple_ || !ple_window_) {
+                        throw std::logic_error(
+                            "text: a PLE block ran without a table window; this pass does not "
+                            "drive PLE (only prefill and single-sequence ordinary decode do)");
+                    }
+                    if (tokens != ple_tokens_ || !hc) {
+                        throw std::logic_error(
+                            "text: the PLE window does not carry this block's columns");
+                    }
+                    const auto streams = dimension(config_.hc->count);
+                    const auto width   = dimension(config_.hidden_size);
+                    Tensor residual    = hc_.residual.view({width, streams, tokens, 1});
+                    Tensor normalized  = hc_.normalized.view({width, streams, tokens, 1});
+                    ple_->apply(static_cast<std::uint32_t>(layer), residual, normalized,
+                                block.input_norm.view({width, streams}), config_.rms_norm_eps,
+                                ctx_.execution_view());
+                    ple_->commit(static_cast<std::uint32_t>(layer), ctx_.execution_view());
+                }
                 if (full) {
                     if (hc) {
                         hc_mix_into(*block.input_hc, tokens);
@@ -2569,7 +2662,27 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             }
             chunk_probe.mark(ChunkProbe::kEmbed);
             if constexpr (Tap::enabled) { tap.begin(x); }
+            if (ple_) {
+                // One window per chunk: the chunk's own ids are the window, every column is live,
+                // and the sequence keeps one history slot. `ids` is the pass's Host view, which is
+                // what the n-gram hash needs; the Device ids below are a separate copy of it.
+                const std::array<std::int32_t, 1> slot{0};
+                const std::array<std::uint32_t, 1> live{static_cast<std::uint32_t>(len)};
+                const qwen4_exp::PleStepWindow window{
+                    .ids           = std::span<const std::int32_t>(ids.data(), std::size_t(len)),
+                    .slots         = slot,
+                    .valid_columns = live,
+                    .tokens        = len};
+                ple_->begin(window, ctx_.execution_view());
+                ple_window_ = true;
+                ple_tokens_ = len;
+            }
             run_layers(x, Phase::Prefill, tap);
+            if (ple_) {
+                ple_->end(ctx_.execution_view());
+                ple_window_ = false;
+                ple_tokens_ = 0;
+            }
             if constexpr (requires { tap.capture_positions(positions, s); }) {
                 tap.capture_positions(positions, s);
             }

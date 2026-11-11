@@ -3,9 +3,13 @@
 #include "ninfer/ops/ple.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 namespace ninfer::models::qwen4_exp {
 namespace {
@@ -201,5 +205,274 @@ std::size_t PleLayerRuntime::device_bytes() const noexcept {
     return (state_ ? state_->capacity() : 0) + (step_ ? step_->capacity() : 0) +
            (workspace_ ? workspace_->capacity() : 0);
 }
+
+
+namespace {
+
+const char* qtype_name(QType type) noexcept {
+    switch (type) {
+    case QType::BF16:
+        return "bf16";
+    case QType::FP32:
+        return "fp32";
+    case QType::INT32:
+        return "int32";
+    case QType::Q4_G64_FP16:
+        return "q4_g64_fp16";
+    case QType::Q5_G64_FP16:
+        return "q5_g64_fp16";
+    case QType::Q6_G64_FP16:
+        return "q6_g64_fp16";
+    case QType::Q8_G32_FP16:
+        return "q8_g32_fp16";
+    case QType::NF4_G16_E4M3FN:
+        return "nf4_g16_e4m3fn";
+    case QType::NVFP4:
+        return "nvfp4";
+    case QType::FP8_E4M3FN_ROW_BF16:
+        return "fp8_e4m3fn_row_bf16";
+    case QType::FP8_E4M3FN_BLOCK128X128_BF16:
+        return "fp8_e4m3fn_block128x128_bf16";
+    case QType::FP8_E4M3FN_BLOCK64X64_BF16:
+        return "fp8_e4m3fn_block64x64_bf16";
+    }
+    return "unknown";
+}
+
+const char* layout_name(QuantLayout layout) noexcept {
+    switch (layout) {
+    case QuantLayout::Contiguous:
+        return "contiguous_le_v1";
+    case QuantLayout::RowScale:
+        return "row_scale_v1";
+    case QuantLayout::BlockScaleK16M128x4:
+        return "block_scale_k16_m128x4_v1";
+    case QuantLayout::RowSplit:
+        return "row_split_k128_v1";
+    case QuantLayout::RowPagedG16_4K:
+        return "row_paged_g16_4k_v1";
+    case QuantLayout::BatchedBlockScaleK16M128x4:
+        return "batched_block_scale_k16_m128x4_v1";
+    case QuantLayout::BlockScaleM128K128:
+        return "block_scale_m128_k128_v1";
+    case QuantLayout::BlockScaleM64K64:
+        return "block_scale_m64_k64_v1";
+    }
+    return "unknown";
+}
+
+// Bounded Host wait for one window. The table lives on disk, so a PLE step cannot avoid it; the
+// bound is what keeps a stalled read from becoming a hang.
+constexpr auto kWindowDeadline = std::chrono::seconds(120);
+
+} // namespace
+
+void require_supported_ple_table(const PleTableRequirement& requirement) {
+    const bool supported =
+        supported_ple_table(requirement.format, requirement.layout, requirement.width);
+    std::fprintf(stderr, "[ple] table %s: encoding %s/%s, %llu rows x %llu, %s\n",
+                 requirement.parameter.c_str(), qtype_name(requirement.format),
+                 layout_name(requirement.layout), static_cast<unsigned long long>(requirement.rows),
+                 static_cast<unsigned long long>(requirement.width),
+                 supported ? "supported" : "unsupported");
+    std::fflush(stderr);
+    if (supported) return;
+    throw std::invalid_argument(
+        requirement.parameter + ": 表编码 " + qtype_name(requirement.format) + "/" +
+        layout_name(requirement.layout) + "（" + std::to_string(requirement.rows) + " 行 × " +
+        std::to_string(requirement.width) + "，每行 " + std::to_string(kPleRowElements) +
+        " 个特征）不受支持，可选：转码 / 加解码器（读取器只服务 nf4_g16_e4m3fn / "
+        "row_paged_g16_4k_v1，每行 90 B）");
+}
+
+PleTextStage::PleTextStage(const PleTableSource& table, std::int32_t eos,
+                           const DeviceContext& context,
+                           std::vector<std::optional<PleLayerWeights>> layers,
+                           std::uint32_t max_tokens, std::uint32_t max_batch, std::uint32_t slots,
+                           PlePrepareOptions options)
+    : eos_(eos), max_tokens_(max_tokens), max_batch_(max_batch), slots_(slots),
+      tail_(slots, std::array<std::int32_t, 2>{eos, eos}), started_(slots, false) {
+    if (eos < 0) throw std::invalid_argument("PLE stage: the hash's EOS token id is unknown");
+    if (!max_tokens || !max_batch || max_batch > 8 || !slots)
+        throw std::invalid_argument("PLE stage: invalid step capacity");
+    if (options.max_positions < max_tokens * max_batch || options.windows < 2)
+        throw std::invalid_argument(
+            "PLE stage: the window capacity must cover max_tokens*max_batch with two windows");
+    layers_.reserve(layers.size());
+    for (auto& layer : layers) {
+        if (!layer) {
+            layers_.push_back(nullptr);
+            continue;
+        }
+        layers_.push_back(std::make_unique<PleLayerRuntime>(*layer, max_tokens, max_batch, slots));
+    }
+    device_                    = Device::cuda(context.device);
+    gpu_                       = std::make_unique<PleGpuPreparation>(table, eos, context, options);
+    const std::size_t metadata = std::size_t(max_batch) * sizeof(std::int32_t);
+    live_mask_                 = DeviceBuffer(metadata);
+    slot_index_                = DeviceBuffer(metadata);
+    accept_mask_               = DeviceBuffer(metadata);
+}
+
+PleTextStage::~PleTextStage() = default;
+
+Tensor PleTextStage::live_columns() const {
+    return Tensor(live_mask_.p, device_, DType::I32, {batch_});
+}
+
+Tensor PleTextStage::slot_rows() const {
+    return Tensor(slot_index_.p, device_, DType::I32, {batch_});
+}
+
+Tensor PleTextStage::accepted_columns() const {
+    return Tensor(accept_mask_.p, device_, DType::I32, {batch_});
+}
+
+const Tensor& PleTextStage::gated(std::uint32_t layer) const {
+    if (!has_layer(layer)) throw std::invalid_argument("PLE stage: this block has no PLE layer");
+    return layers_[layer]->gated();
+}
+
+const Tensor& PleTextStage::records(std::uint32_t layer) const {
+    if (!has_layer(layer)) throw std::invalid_argument("PLE stage: this block has no PLE layer");
+    return layers_[layer]->records();
+}
+
+const Tensor& PleTextStage::history(std::uint32_t layer) const {
+    if (!has_layer(layer)) throw std::invalid_argument("PLE stage: this block has no PLE layer");
+    return layers_[layer]->history();
+}
+
+void PleTextStage::require_window(const PleStepWindow& window) const {
+    require(window.tokens >= 1 && std::uint32_t(window.tokens) <= max_tokens_,
+            "the window is wider than the stage's capacity");
+    require(!window.slots.empty() && window.slots.size() <= max_batch_ &&
+                window.valid_columns.size() == window.slots.size() &&
+                window.ids.size() == std::size_t(window.tokens) * window.slots.size(),
+            "the window's ids, slots and valid columns disagree");
+    for (const auto slot : window.slots)
+        require(slot >= 0 && std::uint32_t(slot) < slots_, "a slot is outside the history pool");
+    for (const auto valid : window.valid_columns)
+        require(valid <= std::uint32_t(window.tokens), "a live-column count exceeds the window");
+}
+
+void PleTextStage::begin(const PleStepWindow& window, CudaExecutionView execution) {
+    require(!ticket_.has_value(), "a PLE window is already open");
+    require_window(window);
+    retire();
+    const auto batch = std::uint32_t(window.slots.size());
+    // A window whose rows all reject their columns has nothing to hash; the reader would refuse
+    // it, so it is refused here with the reason instead of three calls later.
+    const bool any_live = std::any_of(window.valid_columns.begin(), window.valid_columns.end(),
+                                      [](std::uint32_t valid) { return valid != 0; });
+    if (!any_live) { throw std::invalid_argument("PLE stage: every row of the window is empty"); }
+
+    std::vector<PleInputRow> rows(batch);
+    for (std::uint32_t b = 0; b < batch; ++b) {
+        const auto slot  = std::uint32_t(window.slots[b]);
+        const auto& tail = started_[slot] ? tail_[slot] : std::array<std::int32_t, 2>{eos_, eos_};
+        rows[b]          = PleInputRow{PleSequenceIdentity{.sequence = slot,
+                                                           .epoch    = started_[slot] ? 1U : 0U,
+                                                           .frontier = std::uint64_t(window.tokens),
+                                                           .raw_tail = {tail[0], tail[1]}},
+                                       window.ids.subspan(std::size_t(b) * window.tokens,
+                                                          std::size_t(window.valid_columns[b]))};
+    }
+    auto ticket = gpu_->host().prepare(std::uint32_t(window.tokens), rows);
+    if (!ticket) {
+        // The retired window's worker reclamation is asynchronous; one step of slack is the
+        // documented capacity, so a second refusal is a real capacity error.
+        for (int attempt = 0; attempt < 2000 && !ticket; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::microseconds(500));
+            retire();
+            ticket = gpu_->host().prepare(std::uint32_t(window.tokens), rows);
+        }
+        if (!ticket) throw std::runtime_error("PLE stage: no free preparation window");
+    }
+    ticket_ = ticket;
+    tokens_ = window.tokens;
+    batch_  = static_cast<std::int32_t>(batch);
+    gpu_->host().seal(*ticket_, window.valid_columns);
+
+    const auto deadline = std::chrono::steady_clock::now() + kWindowDeadline;
+    for (;;) {
+        const auto state = gpu_->host().poll(*ticket_);
+        if (state.status == PlePrepareStatus::Failed) {
+            const auto error = state.error;
+            ticket_.reset();
+            if (error) { std::rethrow_exception(error); }
+            throw std::runtime_error("PLE stage: the window failed without a reason");
+        }
+        if (state.status == PlePrepareStatus::HostReady) break;
+        if (state.status == PlePrepareStatus::Cancelled)
+            throw std::runtime_error("PLE stage: the window was cancelled");
+        if (std::chrono::steady_clock::now() >= deadline) {
+            gpu_->host().cancel(*ticket_);
+            ticket_.reset();
+            throw std::runtime_error("PLE stage: the window did not reach the Host in time");
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+
+    live_mask_.copy_from_host(window.valid_columns.data(), window.valid_columns.size() * 4);
+    accept_mask_.copy_from_host(window.valid_columns.data(), window.valid_columns.size() * 4);
+    slot_index_.copy_from_host(window.slots.data(), window.slots.size() * 4);
+    gpu_->upload(*ticket_, execution);
+    embedding_ = gpu_->embedding(*ticket_, execution);
+    // The hash tail of the next window of each slot is the end of this one.
+    for (std::uint32_t b = 0; b < batch; ++b) {
+        const auto slot = std::uint32_t(window.slots[b]);
+        const auto live = window.valid_columns[b];
+        const auto* ids = window.ids.data() + std::size_t(b) * window.tokens;
+        if (live == 0) continue;
+        tail_[slot][1] = ids[live - 1];
+        tail_[slot][0] = live >= 2 ? ids[live - 2] : (started_[slot] ? tail_[slot][0] : eos_);
+        started_[slot] = true;
+    }
+}
+
+void PleTextStage::apply(std::uint32_t layer, Tensor& residual, Tensor& normalized,
+                         const Tensor& next_norm, float epsilon, CudaExecutionView execution) {
+    require(ticket_.has_value(), "apply has no open window");
+    require(has_layer(layer), "this block has no PLE layer");
+    require(residual.ne[2] == tokens_ && residual.ne[3] == batch_,
+            "the residual does not carry the open window's shape");
+    layers_[layer]->apply(embedding_, residual, normalized, next_norm, epsilon, live_columns(),
+                          slot_rows(), execution);
+}
+
+void PleTextStage::commit(std::uint32_t layer, CudaExecutionView execution) {
+    commit(layer, accepted_columns(), execution);
+}
+
+void PleTextStage::commit(std::uint32_t layer, const Tensor& accepted,
+                          CudaExecutionView execution) {
+    require(ticket_.has_value(), "commit has no open window");
+    require(has_layer(layer), "this block has no PLE layer");
+    layers_[layer]->commit(accepted, live_columns(), slot_rows(), execution);
+}
+
+void PleTextStage::end(CudaExecutionView execution) {
+    if (!ticket_) return;
+    gpu_->record_consumed(*ticket_, execution);
+    retired_ = ticket_;
+    ticket_.reset();
+}
+
+void PleTextStage::retire() {
+    if (!retired_) return;
+    if (gpu_->try_release(*retired_)) retired_.reset();
+}
+
+std::size_t PleTextStage::device_bytes() const noexcept {
+    std::size_t bytes = live_mask_.bytes + slot_index_.bytes + accept_mask_.bytes;
+    for (const auto& layer : layers_) bytes += layer ? layer->device_bytes() : 0;
+    if (gpu_) {
+        const auto memory = gpu_->memory();
+        bytes += memory.device_bytes;
+    }
+    return bytes;
+}
+
 
 } // namespace ninfer::models::qwen4_exp

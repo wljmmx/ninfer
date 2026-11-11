@@ -4,11 +4,19 @@
 #include "core/device.h"
 #include "core/tensor.h"
 #include "core/weight.h"
+#include "models/qwen4_exp/ple/gpu.h"
+#include "models/qwen4_exp/ple/prepare.h"
+#include "models/qwen4_exp/ple/table.h"
 #include "ninfer/ops/linear.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <span>
+#include <string>
+#include <vector>
 
 namespace ninfer::models::qwen4_exp {
 
@@ -112,5 +120,137 @@ private:
     Tensor history_;    // BF16 [H*C,9,slots]
     Tensor offsets_;    // I32 [max_batch], the records column every row starts at (always 0)
 };
+
+
+// What the artifact declares for one PLE layer's n-gram table. The reader (`PleTableSource`)
+// decodes exactly one encoding family, so the load path states the declared facts here and this
+// answers with the encoding's own name when it cannot be served. Nothing in this tree silently
+// skips a PLE layer: an unsupported table is a construction failure with the shapes in it.
+struct PleTableRequirement {
+    QType format        = QType::BF16;
+    QuantLayout layout  = QuantLayout::Contiguous;
+    std::uint64_t rows  = 0;
+    std::uint64_t width = 0;
+    std::string parameter; // the logical binding name, so a refusal names what to fix
+};
+
+// True when `PleRowSource`/`decode_nf4_row` can serve this table: one NF4 codebook against an
+// E4M3 scale byte per 16-wide group, rows of 160 words in 4096-byte pages. Logs the declared
+// encoding (and its row count) either way, then throws
+// "<parameter>: 表编码 <format>/<layout>（<rows> 行 × <width>）不受支持，可选：转码 / 加解码器"
+// when it cannot. `stderr` rather than an exception string alone, because a refusal at load time
+// is the only chance to say which encoding the artifact actually carries.
+void require_supported_ple_table(const PleTableRequirement& requirement);
+
+// The encoding `PleTableSource` serves, written once so the loader check and the reader cannot
+// drift apart.
+[[nodiscard]] constexpr bool supported_ple_table(QType format, QuantLayout layout,
+                                                 std::uint64_t width) noexcept {
+    return format == QType::NF4_G16_E4M3FN && layout == QuantLayout::RowPagedG16_4K &&
+           width == kPleRowElements;
+}
+
+// One column window of a text pass, as the PLE stage consumes it. `ids` is token-fastest
+// ([tokens*batch]) and `slots` names the history slot of every row: a row's slot must identify
+// its sequence, because the nine-column convolution history and the two-token hash tail live
+// there. The stage remembers each slot's tail from the window it last saw, so a caller only
+// states where a sequence starts.
+struct PleStepWindow {
+    std::span<const std::int32_t> ids;
+    std::span<const std::int32_t> slots;
+    std::span<const std::uint32_t> valid_columns;
+    std::int32_t tokens = 0;
+};
+
+// One text model's PLE: the n-gram table and its Host/Device preparation, plus one
+// PleLayerRuntime per text block that carries PLE. This is the model-side owner of everything
+// between "the pass knows its token ids" and "the block's four-stream residual is rewritten":
+//
+//   begin  -> hash, read, upload one window (the table is on disk, so the Host waits here)
+//   apply  -> per PLE block, residual += contribution and normalized := Norm(residual)
+//   commit -> per PLE block, advance each row's nine-column history by its accepted prefix
+//   end    -> retire the window once the consumer stream has passed its last reader
+//
+// Every buffer is sized at construction; a step wider than the capacity is refused, not
+// truncated. There is no per-call allocation and no Host read of Device state.
+class PleTextStage {
+public:
+    // `layers` is indexed by text block and holds an empty entry where that block has no PLE.
+    // `slots` is the history pool depth, i.e. the number of sequences that may be resident.
+    PleTextStage(const PleTableSource& table, std::int32_t eos, const DeviceContext& context,
+                 std::vector<std::optional<PleLayerWeights>> layers, std::uint32_t max_tokens,
+                 std::uint32_t max_batch, std::uint32_t slots, PlePrepareOptions options);
+    ~PleTextStage();
+    PleTextStage(const PleTextStage&)            = delete;
+    PleTextStage& operator=(const PleTextStage&) = delete;
+
+    // Opens one window. A row's `valid_columns[b]` in [0,tokens] bounds its live columns; every
+    // row of a window is prepared even when it rejects all of them (`PlePrepareService` requires
+    // at least one live column per sealed window, so an all-zero window is refused here).
+    void begin(const PleStepWindow& window, CudaExecutionView execution);
+    // residual and normalized are BF16 [H,C,T,B] with this window's T and B; `next_norm` is the
+    // norm of the block that consumes `normalized`.
+    void apply(std::uint32_t layer, Tensor& residual, Tensor& normalized, const Tensor& next_norm,
+               float epsilon, CudaExecutionView execution);
+    // Advances each row's history by the window's accepted columns. The two text entries this
+    // tree drives (prefill and ordinary decode) accept every live column, so the window's own
+    // valid columns are the accepted prefix; a speculative step whose acceptance is only known
+    // after the verifier runs must pass them explicitly.
+    void commit(std::uint32_t layer, CudaExecutionView execution);
+    void commit(std::uint32_t layer, const Tensor& accepted, CudaExecutionView execution);
+    // Retires the open window. Safe to call with no window open.
+    void end(CudaExecutionView execution);
+
+    [[nodiscard]] bool open() const noexcept { return ticket_.has_value(); }
+
+    [[nodiscard]] bool has_layer(std::uint32_t layer) const noexcept {
+        return layer < layers_.size() && layers_[layer] != nullptr;
+    }
+
+    // The open window's Device E, [H,T,B]; empty until begin.
+    [[nodiscard]] const Tensor& embedding() const noexcept { return embedding_; }
+
+    // One PLE block's last gated value, recorded normalized columns and nine-column pool. The
+    // numeric gates and the dump paths read these words instead of re-deriving them.
+    [[nodiscard]] const Tensor& gated(std::uint32_t layer) const;
+    [[nodiscard]] const Tensor& records(std::uint32_t layer) const;
+    [[nodiscard]] const Tensor& history(std::uint32_t layer) const;
+
+    [[nodiscard]] std::uint32_t max_tokens() const noexcept { return max_tokens_; }
+
+    [[nodiscard]] std::uint32_t max_batch() const noexcept { return max_batch_; }
+
+    [[nodiscard]] std::size_t device_bytes() const noexcept;
+
+private:
+    void retire();
+    void require_window(const PleStepWindow& window) const;
+    // The window metadata as the Ops' I32 [B] views over the stage's own storage.
+    [[nodiscard]] Tensor live_columns() const;
+    [[nodiscard]] Tensor slot_rows() const;
+    [[nodiscard]] Tensor accepted_columns() const;
+
+    std::int32_t eos_;
+    std::uint32_t max_tokens_;
+    std::uint32_t max_batch_;
+    std::uint32_t slots_;
+    std::vector<std::unique_ptr<PleLayerRuntime>> layers_;
+    std::unique_ptr<PleGpuPreparation> gpu_;
+    // The window that is open right now, and the one its consumer has released but whose slot the
+    // worker may not have reclaimed yet.
+    std::optional<PleTicket> ticket_;
+    std::optional<PleTicket> retired_;
+    Tensor embedding_;         // the open window's Device E, [H,T,B]
+    DeviceBuffer live_mask_;   // I32 [max_batch], the open window's live columns
+    DeviceBuffer slot_index_;  // I32 [max_batch], the open window's history slots
+    DeviceBuffer accept_mask_; // I32 [max_batch], the commit prefix (the valid columns by default)
+    Device device_;
+    // Per-slot hash context: the two tokens preceding each slot's next window, and whether the
+    // slot has seen a window at all (a fresh sequence hashes with EOS history).
+    std::vector<std::array<std::int32_t, 2>> tail_;
+    std::vector<bool> started_;
+    std::int32_t tokens_ = 0, batch_ = 0;
+};
+
 
 } // namespace ninfer::models::qwen4_exp

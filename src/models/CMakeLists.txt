@@ -7,7 +7,9 @@ add_library(ninfer_model_runtime STATIC)
 ninfer_internal_includes(ninfer_model_runtime)
 target_link_libraries(ninfer_model_runtime
   PUBLIC ninfer_model_loading ninfer_ops ninfer_runtime_support
-  PRIVATE ninfer_media_decode ninfer_jinja ninfer_grammar ninfer_xgrammar)
+  # The Qwen4Exp text path drives PLE from run_layers (text.cpp), so the disk layer's window
+  # owner is a link dependency of the runtime, not only of the PLE tests.
+  PRIVATE ninfer_ple ninfer_media_decode ninfer_jinja ninfer_grammar ninfer_xgrammar)
 target_include_directories(ninfer_model_runtime PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/xgrammar/cpp)
 target_include_directories(ninfer_model_runtime SYSTEM PRIVATE

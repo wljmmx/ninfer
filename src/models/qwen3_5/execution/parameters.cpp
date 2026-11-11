@@ -1,6 +1,7 @@
 #include "models/qwen3_5/execution/parameters.h"
 
 #include "models/qwen3_5/execution/expert_stream.h"
+#include "models/qwen4_exp/execution/ple_layer.h"
 
 #include "core/arena.h"
 #include "core/weight_view.h"
@@ -687,13 +688,103 @@ public:
         return routed_moe(moe);
     }
 
-    BlockParameters block(const BlockWeights& w) const {
+    // Qwen4Exp's per-block n-gram embedding. The keys and the value are two row blocks of ONE
+    // quantized parent, so the projection is that parent read as a single Linear instead of two
+    // matrices the gate would have to stitch; the Op's projection views are then those two halves.
+    PleParameters ple(const PleWeights& w, const std::string& parameter) const {
+        const auto& key   = model_.weight(w.key);
+        const auto& value = model_.weight(w.value);
+        const auto rows   = std::uint64_t(qwen4_exp::kPleProjectionRows);
+        const auto width  = std::uint64_t(qwen4_exp::kPleWidth);
+        if (key.view.shape != std::vector<std::uint64_t>{std::uint64_t(qwen4_exp::kPleChannels),
+                                                         width} ||
+            value.view.shape != std::vector<std::uint64_t>{width, width}) {
+            refuse(parameter, "PLE key/value are not [H*C,H] followed by [H,H]");
+        }
+        if (key.view.parts.size() != 1 || value.view.parts.size() != 1 ||
+            key.view.parts.front().parent == nullptr ||
+            key.view.parts.front().parent != value.view.parts.front().parent ||
+            key.view.parts.front().begin != 0 ||
+            key.view.parts.front().end != value.view.parts.front().begin ||
+            value.view.parts.front().end != rows * width) {
+            refuse(parameter,
+                   "the PLE key and value are not the two halves of one [H*C+H,H] parent, so the "
+                   "single-projection form the gate reads cannot be built");
+        }
+        PleParameters out;
+        // The union view: the same parent, rows [0, H*C+H), which is exactly the matrix the
+        // artifact stores for `ple/embedding`.
+        const WeightView parent{std::vector<std::uint64_t>{rows, width},
+                                {{key.view.parts.front().parent, 0, rows * width}}};
+        out.projection = with_context(parameter + "/projection", [&] {
+            return ops::prepare_linear_weight(ops::WeightInput{parent});
+        });
+        // The norms are the artifact's unit-offset gains, flattened stream-major, which is the
+        // [H,C] form with the feature axis fastest.
+        const auto norm = [&](WeightId id, const char* role) {
+            return with_context(parameter + "/" + role, [&] {
+                return tensor(id).view({std::int32_t(qwen4_exp::kPleWidth),
+                                        std::int32_t(qwen4_exp::kPleStreams)});
+            });
+        };
+        out.norm_key   = norm(w.norm_key, "norm_key");
+        out.norm_query = norm(w.norm_query, "norm_query");
+        out.norm_conv  = norm(w.norm_conv, "norm_conv");
+        // The artifact stores the tap bank as [4,D] with the channel axis innermost, which is the
+        // same bytes in the same order as the Op's contiguous [D,4] (dimension zero fastest):
+        // element (tap j, channel c) sits at c + D*j either way. `tensor()` reverses the declared
+        // shape onto the Tensor axes, so this view is the Op's form without a transpose copy. The
+        // stride check below is what makes that identity an assertion instead of a comment.
+        out.convolution = with_context(parameter + "/convolution", [&] {
+            const auto kernel = tensor(w.convolution);
+            if (kernel.dtype != DType::BF16 ||
+                kernel.ne[0] != std::int32_t(qwen4_exp::kPleChannels) ||
+                kernel.ne[1] != std::int32_t(qwen4_exp::kPleKernelTaps) || kernel.nb[0] != 2 ||
+                kernel.nb[1] != std::int64_t(qwen4_exp::kPleChannels) * 2) {
+                refuse(parameter + "/convolution",
+                       "the tap bank is not the artifact's [4,D] contiguous form the Op reads as "
+                       "[D,4]");
+            }
+            return kernel;
+        });
+        return out;
+    }
+
+    // The table's declared encoding, checked where the executable form is built: an encoding the
+    // disk reader cannot decode is a construction failure that names it, never a silent skip.
+    void require_table(const PleWeights& w, const std::string& parameter) const {
+        const auto& bound = model_.weight(w.table);
+        if (bound.view.parts.empty() || bound.view.parts.front().parent == nullptr) {
+            refuse(parameter, "the PLE table has no parent object to describe");
+        }
+        const auto& geometry = bound.view.parts.front().parent->geometry;
+        qwen4_exp::require_supported_ple_table(
+            {.format    = geometry.format,
+             .layout    = geometry.layout,
+             .rows      = geometry.shape.size() == 2 ? geometry.shape[0] : 0,
+             .width     = geometry.shape.size() == 2 ? geometry.shape[1] : 0,
+             .parameter = parameter});
+    }
+
+    BlockParameters block(const BlockWeights& w, std::size_t layer) const {
         BlockParameters out;
         out.input_norm          = tensor(w.input_norm);
         out.post_attention_norm = tensor(w.post_attention_norm);
         out.ffn                 = ffn(w);
         if (w.input_hc) out.input_hc = hc(*w.input_hc);
         if (w.post_attention_hc) out.post_attention_hc = hc(*w.post_attention_hc);
+        if (w.ple) {
+            const auto parameter = "text/layers/" + std::to_string(layer) + "/ple";
+            // The four-stream residual is the operand PLE rewrites; a block without it has
+            // nowhere to put the layer's contribution.
+            if (!model_.config().text.hc) {
+                refuse(parameter, "PLE writes the four-stream residual, which this block does not "
+                                  "carry");
+            }
+            require_table(*w.ple, parameter + "/table");
+            out.ple = with_context(parameter, [&] { return ple(*w.ple, parameter); });
+        }
+
         if (const auto* a = std::get_if<AttentionWeights>(&w.mixer)) {
             AttentionParameters attention{
                 ops::prepare_attn_input_proj_weights(model_.input(a->query), model_.input(a->key),
@@ -887,7 +978,7 @@ Parameters::Parameters(const Model& source) : model(source) {
     text.layers.reserve(w.text.layers.size());
     for (std::size_t i = 0; i < w.text.layers.size(); ++i) {
         text.layers.push_back(with_context("text/layers/" + std::to_string(i),
-                                           [&] { return prepare.block(w.text.layers[i]); }));
+                                           [&] { return prepare.block(w.text.layers[i], i); }));
     }
     if (w.mtp) {
         mtp = with_context("mtp", [&] { return prepare.mtp(*w.mtp); });

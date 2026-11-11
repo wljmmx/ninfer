@@ -102,6 +102,15 @@ Q5Launch select_q5_v2_prefill(std::int32_t n, std::int32_t k, std::int32_t t) {
             if (t <= 8) return launch_q5_simt_r8_c4;
             return launch_q5_mma_r64_c128;
         }
+        // Qwen4Exp PLE: the n-gram projection is one [12800,2560] parent whose first 10240 rows
+        // are the four key streams and whose last 2560 are the shared value. 12800 = 64 * 200 and
+        // K = 2560 is 40 whole 64-wide groups, so the same two shape-generic routes serve it with
+        // no partial row tile: SIMT at the small-T end (one column per decoded token) and the
+        // row-tiled MMA for prefill columns. No new kernel instance is involved.
+        if (n == 12800) {
+            if (t <= 8) return launch_q5_simt_r8_c4;
+            return launch_q5_mma_r64_c128;
+        }
         break;
     case 640:
         if (n == 2560) {

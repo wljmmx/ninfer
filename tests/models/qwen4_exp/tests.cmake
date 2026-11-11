@@ -16,6 +16,16 @@ set_tests_properties(ninfer_qwen4_exp_ple_layer_test PROPERTIES
   SKIP_RETURN_CODE 77
   LABELS "gpu")
 
+# port (sm_89): PLE wired into the text block. A two-block stack whose second block carries PLE,
+# driven through the owner text.cpp calls, with the embedding gathered from a real NF4 table on
+# disk; the off path (no PLE block) is the baseline it compares word for word.
+ninfer_add_test(ninfer_qwen4_exp_ple_block_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ple_block.cpp"
+  LIBRARIES ninfer_ple ninfer_ops ninfer::json)
+set_tests_properties(ninfer_qwen4_exp_ple_block_test PROPERTIES
+  SKIP_RETURN_CODE 77
+  LABELS "gpu")
+
 ninfer_add_test(ninfer_qwen4_exp_parameters_banked_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_parameters_banked.cpp"
   LIBRARIES ninfer_model_runtime)

@@ -21,8 +21,15 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <span>
 #include <vector>
+
+namespace ninfer::models::qwen4_exp {
+// The model-side PLE owner (table window, gate, convolution, history). Declared here so this
+// header stays free of the disk layer it borrows from.
+class PleTextStage;
+} // namespace ninfer::models::qwen4_exp
 
 namespace ninfer::models::qwen3_5::execution {
 
@@ -324,6 +331,13 @@ private:
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;
     const HcParameters* final_hc_               = nullptr;
+    // Qwen4Exp's n-gram embedding, when the model carries it. The stage owns the table window and
+    // one runtime per PLE block; `ple_window_`/`ple_tokens_` are the pass's open window, which is
+    // what a PLE block reads its embedding from. A PLE block that runs with no window is refused
+    // in run_layers instead of quietly skipping the layer.
+    std::unique_ptr<qwen4_exp::PleTextStage> ple_;
+    std::int32_t ple_tokens_ = 0;
+    bool ple_window_         = false;
     // The live four-stream state of the current call. Allocated by run_layers from the same recipe
     // the workspace plan uses, so the two reserve identical bytes.
     workspace::TextHcRoots hc_{};
@@ -336,3 +350,5 @@ private:
 };
 
 } // namespace ninfer::models::qwen3_5::execution
+
+
