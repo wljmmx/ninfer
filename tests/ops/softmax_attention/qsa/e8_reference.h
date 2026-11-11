@@ -192,15 +192,33 @@ inline void encode_8d(const std::array<float, 8>& value, float ks, std::uint8_t&
             const int other1i     = top1_index[p];
             const float other2    = top2[p];
             const int other2i     = top2_index[p];
-            if (other1 > top1[l] || (other1 == top1[l] && other1i < top1_index[l])) {
-                next2[l]   = top1[l] > other2 ? top1[l] : other2;
-                next2i[l]  = top1[l] > other2 ? top1_index[l] : other2i;
-                next1[l]   = other1;
-                next1i[l]  = other1i;
-            } else if (other1 > top2[l] || (other1 == top2[l] && other1i < top2_index[l])) {
-                next2[l]  = other1;
-                next2i[l] = other1i;
+            // The device breaks every tie by value then by index, which is a strict total order and
+            // therefore converges across lanes; the second place is the best of the losing first
+            // place and both second places. A plain `>` on the second place would let two lanes hold
+            // different pairs when two coordinates are exactly equal, and the device's root would
+            // then name one pair while its residual used another.
+            const bool peer1_wins = other1 > top1[l] || (other1 == top1[l] && other1i < top1_index[l]);
+            const float win1      = peer1_wins ? other1 : top1[l];
+            const int win1i       = peer1_wins ? other1i : top1_index[l];
+            const float lose1     = peer1_wins ? top1[l] : other1;
+            const int lose1i      = peer1_wins ? top1_index[l] : other1i;
+            const auto better     = [](float v, int i, float bv, int bi) {
+                return i >= 0 && (v > bv || (v == bv && (bi < 0 || i < bi)));
+            };
+            float second     = lose1;
+            int second_index_l = lose1i;
+            if (better(top2[l], top2_index[l], second, second_index_l)) {
+                second         = top2[l];
+                second_index_l = top2_index[l];
             }
+            if (better(other2, other2i, second, second_index_l)) {
+                second         = other2;
+                second_index_l = other2i;
+            }
+            next1[l]  = win1;
+            next1i[l] = win1i;
+            next2[l]  = second;
+            next2i[l] = second_index_l;
         }
         top1 = next1;
         top1_index = next1i;

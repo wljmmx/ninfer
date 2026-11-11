@@ -628,7 +628,9 @@ int main() {
         for (auto storage : {KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
                              KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value,
                              KvCacheStorage::RotatedInt8KeyInt4ValueGroup64,
-                             KvCacheStorage::RotatedInt4KeyInt4ValueGroup64}) {
+                             KvCacheStorage::RotatedInt4KeyInt4ValueGroup64,
+                             KvCacheStorage::RK4V4E8, KvCacheStorage::RK2V4E8,
+                             KvCacheStorage::RK4V2E8}) {
             for (int t : {1, 8, 17, 65, 319, 320, 321, 1024, 2048, 4096})
                 failures += run(device, t, 1, t % 3 ? 3 : 1, t % 4, t % 3, 0, storage);
             for (int t : {1, 8, 39, 40, 41}) failures += run(device, t, 8, 3, t % 4, 2, 0, storage);

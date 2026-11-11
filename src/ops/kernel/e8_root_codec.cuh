@@ -211,11 +211,24 @@ __device__ __forceinline__ void e8_encode_cylinder_8d(
     out_rad_axis = static_cast<uint8_t>((rad_idx << 4) | (axis_idx & 0x0F));
 }
 
-// Optional per-subspace trace: with a non-null record the encoder prints its inputs and its
-// residual axis decision from one lane, which is the only way to line a host reference up with the
-// device when the two disagree on a discrete choice.
+// Optional per-subspace trace: with a non-null record the encoder copies its inputs and its
+// residual axis decision into a caller-owned buffer. A kernel-wide printf is not usable here: at the
+// fixture's volume the device buffer drops lines (the first group of a row went missing), and the
+// whole point of the trace is to compare one specific subspace.
+struct E8TraceRecord {
+    int row, head, group, subspace, plane;
+    int type_flag, best_dim, axis;
+    unsigned root, radial;
+    float absmax, step, rel, a_score, b_score, dot;
+    float unit[8], projection[8], res[8];
+    float v1[8];
+};
+
 struct E8Trace {
     int row, head, group, subspace, plane;
+    E8TraceRecord* out     = nullptr;
+    int* count             = nullptr;
+    int capacity           = 0;
 };
 
 // Warp-Cooperative 8-Lane Subspace Quantizer (100% Lane Occupancy, Zero Loop Divergence)
@@ -279,16 +292,36 @@ __device__ __forceinline__ void e8_encode_cylinder_8d_warp(
         float other2_val = __shfl_xor_sync(full_mask, top2_val, mask);
         int   other2_idx = __shfl_xor_sync(full_mask, top2_idx, mask);
 
-        if (other1_val > top1_val || (other1_val == top1_val && other1_idx < top1_idx)) {
-            top2_val = (top1_val > other2_val) ? top1_val : other2_val;
-            top2_idx = (top1_val > other2_val) ? top1_idx : other2_idx;
-            top1_val = other1_val;
-            top1_idx = other1_idx;
-        } else {
-            if (other1_val > top2_val || (other1_val == top2_val && other1_idx < top2_idx)) {
-                top2_val = other1_val;
-                top2_idx = other1_idx;
+        // The ported branch broke a tie on the FIRST place by index but resolved the SECOND place
+        // with a plain `>`, so two lanes whose partial maxima are exactly equal could keep different
+        // second places. The stored root then named one pair while the residual below was built from
+        // another lane's `v1_coord`, landing on another axis. Both places are now broken by value
+        // then by index - a strict total order, so every lane converges: the second place is the
+        // best of the losing first place and both second places under that order.
+        {
+            const bool peer1_wins = other1_val > top1_val ||
+                                    (other1_val == top1_val && other1_idx < top1_idx);
+            const float win1_val  = peer1_wins ? other1_val : top1_val;
+            const int win1_idx    = peer1_wins ? other1_idx : top1_idx;
+            const float lose1_val = peer1_wins ? top1_val : other1_val;
+            const int lose1_idx   = peer1_wins ? top1_idx : other1_idx;
+            const auto better     = [](float v, int i, float bv, int bi) {
+                return i >= 0 && (v > bv || (v == bv && (bi < 0 || i < bi)));
+            };
+            float second_val = lose1_val;
+            int second_idx   = lose1_idx;
+            if (better(top2_val, top2_idx, second_val, second_idx)) {
+                second_val = top2_val;
+                second_idx = top2_idx;
             }
+            if (better(other2_val, other2_idx, second_val, second_idx)) {
+                second_val = other2_val;
+                second_idx = other2_idx;
+            }
+            top1_val = win1_val;
+            top1_idx = win1_idx;
+            top2_val = second_val;
+            top2_idx = second_idx;
         }
     }
 
@@ -393,21 +426,41 @@ __device__ __forceinline__ void e8_encode_cylinder_8d_warp(
         out_rad_axis = static_cast<uint8_t>((rad_idx << 4) | (axis_idx & 0x0F));
     }
     if (trace != nullptr) {
-        // Every lane of the subgroup joins these shuffles; only the subgroup's first lane prints.
-        float gathered[8];
-        for (int i = 0; i < 8; ++i)
-            gathered[i] = __shfl_sync(sub_mask, res, (lane & ~7) + i);
-        if ((lane & 7) == 0) {
-            printf("[e8dev] %d r=%d h=%d g=%d s=%d absmax=%.9g step=%.9g rel=%.9g rad=%u a=%.9g b=%.9g "
-                   "type=%c dim=%d root=%u rad_axis=%u res=%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g\n",
-                   trace->plane, trace->row, trace->head, trace->group, trace->subspace,
-                   double(ks * 7.0f), double(ks), double(r_rel), unsigned(rad_idx),
-                   double(best_type_a_score), double(best_type_b_score),
-                   (best_type_a_score >= best_type_b_score) ? 'A' : 'B', best_dim,
-                   unsigned(out_root), unsigned(out_rad_axis), double(gathered[0]),
-                   double(gathered[1]), double(gathered[2]), double(gathered[3]),
-                   double(gathered[4]), double(gathered[5]), double(gathered[6]),
-                   double(gathered[7]));
+        // Every lane of the subgroup joins these shuffles; only the subgroup's first lane writes.
+        float gathered_u[8], gathered_p[8], gathered_r[8], gathered_v[8];
+        for (int i = 0; i < 8; ++i) {
+            gathered_u[i] = __shfl_sync(sub_mask, u, (lane & ~7) + i);
+            gathered_p[i] = __shfl_sync(sub_mask, dot_u_v1_lane, (lane & ~7) + i);
+            gathered_r[i] = __shfl_sync(sub_mask, res, (lane & ~7) + i);
+            gathered_v[i] = __shfl_sync(sub_mask, v1_coord, (lane & ~7) + i);
+        }
+        if ((lane & 7) == 0 && trace->out != nullptr && trace->count != nullptr) {
+            const int slot = atomicAdd(trace->count, 1);
+            if (slot < trace->capacity) {
+                E8TraceRecord& r = trace->out[slot];
+                r.row             = trace->row;
+                r.head            = trace->head;
+                r.group           = trace->group;
+                r.subspace        = trace->subspace;
+                r.plane           = trace->plane;
+                r.type_flag       = (best_type_a_score >= best_type_b_score) ? 0 : 1;
+                r.best_dim        = best_dim;
+                r.axis            = int(axis_idx);
+                r.root            = out_root;
+                r.radial          = out_rad_axis;
+                r.absmax          = ks * 7.0f;
+                r.step            = ks;
+                r.rel             = r_rel;
+                r.a_score         = best_type_a_score;
+                r.b_score         = best_type_b_score;
+                r.dot             = dot_u_v1;
+                for (int i = 0; i < 8; ++i) {
+                    r.unit[i]       = gathered_u[i];
+                    r.projection[i] = gathered_p[i];
+                    r.res[i]        = gathered_r[i];
+                    r.v1[i]         = gathered_v[i];
+                }
+            }
         }
     }
 }

@@ -4,6 +4,8 @@
 #include <cuda_fp16.h>
 #include <cstdint>
 
+namespace ninfer::ops { struct E8TraceRecord; }
+
 namespace ninfer::ops::detail::qsa {
 
 template <class T>
@@ -26,6 +28,7 @@ struct PreparePage {
     }
 };
 
+// Defined by the E8 codec header (namespace ninfer::ops).
 struct PrepareArguments {
     const __nv_bfloat16 *q, *k, *v, *iq, *ik, *wq, *wk, *wiq, *wik;
     __nv_bfloat16 *out_q, *out_iq;
@@ -45,5 +48,9 @@ struct PrepareArguments {
     int e8_dump     = 0;
     int e8_dump_row = -1;
     int e8_dump_plane = -1;
+    int e8_dump_head  = -1;
+    ninfer::ops::E8TraceRecord* trace_out = nullptr;
+    int* trace_count         = nullptr;
+    int trace_capacity       = 0;
 };
 } // namespace ninfer::ops::detail::qsa

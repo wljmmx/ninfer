@@ -4,7 +4,10 @@
 
 #include <array>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
+#include <vector>
 
 namespace ninfer::ops::detail::qsa {
 namespace {
@@ -71,14 +74,19 @@ PrepareArguments prepare_arguments(const QsaProjectionView& p, const QsaPrepareP
         a.frequency[i] = params.rope_theta == 1e7F
                              ? default_frequency[i]
                              : std::pow(double(params.rope_theta), -double(i) / 32);
+    // The filters apply to both exports: the device printf form (NINFER_QSA_E8_DUMP) and the
+    // record-buffer form (NINFER_QSA_E8_TRACE), and the latter enables the trace from the launcher.
+    if (const char* row = std::getenv("NINFER_QSA_E8_ROW"); row != nullptr) {
+        a.e8_dump_row = std::atoi(row);
+    }
+    if (const char* plane = std::getenv("NINFER_QSA_E8_PLANE"); plane != nullptr) {
+        a.e8_dump_plane = std::atoi(plane);
+    }
+    if (const char* head = std::getenv("NINFER_QSA_E8_HEAD"); head != nullptr) {
+        a.e8_dump_head = std::atoi(head);
+    }
     if (const char* dump = std::getenv("NINFER_QSA_E8_DUMP"); dump != nullptr && *dump != '\0') {
         a.e8_dump = 1;
-        if (const char* row = std::getenv("NINFER_QSA_E8_ROW"); row != nullptr) {
-            a.e8_dump_row = std::atoi(row);
-        }
-        if (const char* plane = std::getenv("NINFER_QSA_E8_PLANE"); plane != nullptr) {
-            a.e8_dump_plane = std::atoi(plane);
-        }
     }
     return a;
 }
@@ -124,13 +132,79 @@ void dispatch(const PrepareArguments& args, float theta, cudaStream_t stream) {
 
 } // namespace
 
+// NINFER_QSA_E8_TRACE=<path>: a bounded, default-off export of the E8 subspace decisions. A
+// kernel-wide printf drops lines at the fixture's volume, so the records go through a device buffer
+// that the launch copies back once and appends to the file.
+namespace {
+
+constexpr int kE8TraceCapacity = 64;
+__device__ E8TraceRecord g_e8_trace[kE8TraceCapacity];
+__device__ int g_e8_trace_count;
+
+struct E8TraceSink {
+    E8TraceRecord* out = nullptr;
+    int* count         = nullptr;
+    const char* path   = nullptr;
+};
+
+E8TraceSink e8_trace_sink(cudaStream_t stream) {
+    E8TraceSink sink{};
+    const char* path = std::getenv("NINFER_QSA_E8_TRACE");
+    if (path == nullptr || *path == '\0') { return sink; }
+    void* out   = nullptr;
+    void* count = nullptr;
+    CUDA_CHECK(cudaGetSymbolAddress(&out, g_e8_trace));
+    CUDA_CHECK(cudaGetSymbolAddress(&count, g_e8_trace_count));
+    CUDA_CHECK(cudaMemsetAsync(count, 0, sizeof(int), stream));
+    sink.out   = static_cast<E8TraceRecord*>(out);
+    sink.count = static_cast<int*>(count);
+    sink.path  = path;
+    return sink;
+}
+
+void e8_trace_flush(const E8TraceSink& sink, cudaStream_t stream) {
+    if (sink.out == nullptr) { return; }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    int count = 0;
+    CUDA_CHECK(cudaMemcpy(&count, sink.count, sizeof(int), cudaMemcpyDeviceToHost));
+    if (count > kE8TraceCapacity) { count = kE8TraceCapacity; }
+    if (count <= 0) { return; }
+    std::vector<E8TraceRecord> records(static_cast<std::size_t>(count));
+    CUDA_CHECK(cudaMemcpy(records.data(), sink.out,
+                          static_cast<std::size_t>(count) * sizeof(E8TraceRecord),
+                          cudaMemcpyDeviceToHost));
+    if (std::FILE* file = std::fopen(sink.path, "a")) {
+        for (const E8TraceRecord& r : records) {
+            std::fprintf(file, "%d %d %d %d %d %d %d %d %u %u %.9g %.9g %.9g %.9g %.9g %.9g",
+                         r.plane, r.row, r.head, r.group, r.subspace, r.type_flag, r.best_dim,
+                         r.axis, r.root, r.radial, double(r.absmax), double(r.step), double(r.rel),
+                         double(r.a_score), double(r.b_score), double(r.dot));
+            for (int i = 0; i < 8; ++i) std::fprintf(file, " %.9g", double(r.unit[i]));
+            for (int i = 0; i < 8; ++i) std::fprintf(file, " %.9g", double(r.projection[i]));
+            for (int i = 0; i < 8; ++i) std::fprintf(file, " %.9g", double(r.res[i]));
+            for (int i = 0; i < 8; ++i) std::fprintf(file, " %.9g", double(r.v1[i]));
+            std::fprintf(file, "\n");
+        }
+        std::fclose(file);
+    }
+}
+
+} // namespace
+
 void launch_prepare(const QsaProjectionView& projected, const QsaPrepareParameters& parameters,
                     const QsaBatchView& batch, const Tensor& rope_positions,
                     const QsaTailStateView& before, QsaCacheView cache,
                     QsaRawRecordWriteView records, Tensor& query, Tensor& index_query,
                     DeviceExecutionView execution) {
-    const auto args = prepare_arguments(projected, parameters, batch, rope_positions, before, cache,
-                                        records, query, index_query);
+    auto args = prepare_arguments(projected, parameters, batch, rope_positions, before, cache,
+                                  records, query, index_query);
+    const E8TraceSink sink = e8_trace_sink(execution.stream);
+    if (sink.out != nullptr) {
+        args.trace_out      = sink.out;
+        args.trace_count    = sink.count;
+        args.trace_capacity = kE8TraceCapacity;
+        args.e8_dump        = 1;
+    }
     switch (cache.main.storage) {
     case KvCacheStorage::BFloat16:
         dispatch<KvCacheStorage::BFloat16>(args, parameters.rope_theta, execution.stream);
@@ -170,6 +244,7 @@ void launch_prepare(const QsaProjectionView& projected, const QsaPrepareParamete
         throw_unsupported_storage("qsa_prepare", cache.main.storage);
     }
     CUDA_CHECK(cudaGetLastError());
+    e8_trace_flush(sink, execution.stream);
 }
 
 } // namespace ninfer::ops::detail::qsa

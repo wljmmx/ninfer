@@ -245,7 +245,9 @@ __device__ __forceinline__ void prepare_kv(const PrepareArguments& a, int head, 
     const int page        = a.tables[p / 64 + std::int64_t(a.table_rows[b]) * a.table_stride];
     auto* key             = a.keys.at(p % 64, head, page);
     auto* value           = a.values.at(p % 64, head, page);
-    const bool trace_row  = a.e8_dump != 0 && (a.e8_dump_row < 0 || a.e8_dump_row == int(m));
+    const bool trace_row  = a.e8_dump != 0 && a.trace_out != nullptr &&
+                            (a.e8_dump_row < 0 || a.e8_dump_row == int(m)) &&
+                            (a.e8_dump_head < 0 || a.e8_dump_head == head);
     const bool trace_key  = trace_row && a.e8_dump_plane <= 0;
     const bool trace_value = trace_row && (a.e8_dump_plane < 0 || a.e8_dump_plane == 1);
     const auto* raw_key   = a.k + (m * KvHeads + head) * 256;
@@ -273,6 +275,9 @@ __device__ __forceinline__ void prepare_kv(const PrepareArguments& a, int head, 
             trace.row   = int(m);
             trace.head  = head;
             trace.plane = 0;
+            trace.out   = a.trace_out;
+            trace.count = a.trace_count;
+            trace.capacity = a.trace_capacity;
             store_rk_key<Storage>(values, key, a.key_scales.at(p % 64, head, page), lane,
                                   trace_key ? &trace : nullptr);
         } else {
@@ -289,6 +294,9 @@ __device__ __forceinline__ void prepare_kv(const PrepareArguments& a, int head, 
             trace.row   = int(m);
             trace.head  = head;
             trace.plane = 1;
+            trace.out   = a.trace_out;
+            trace.count = a.trace_count;
+            trace.capacity = a.trace_capacity;
             store_rk_value<Storage>(values, value, a.value_scales.at(p % 64, head, page), lane,
                                     trace_value ? &trace : nullptr);
         } else {
