@@ -242,6 +242,12 @@ __device__ __forceinline__ void prepare_kv(const PrepareArguments& a, int head, 
                                            int lane, float2 sc, float* scratch = nullptr) {
     const auto m          = t + std::int64_t(b) * a.tokens;
     const int p           = a.positions[m];
+    if (a.prep_entry_count != nullptr && lane == 0) {
+        const int slot = atomicAdd(a.prep_entry_count, 1);
+        if (slot < a.prep_entry_n)
+            printf("[prep] t=%d head=%d live=%d tokens=%d batch=%d m=%lld p=%d valid=%d\n", t, head,
+                   int(t < a.valid[b]), a.tokens, a.batch, (long long)m, p, a.valid[b]);
+    }
     const int page        = a.tables[p / 64 + std::int64_t(a.table_rows[b]) * a.table_stride];
     auto* key             = a.keys.at(p % 64, head, page);
     auto* value           = a.values.at(p % 64, head, page);

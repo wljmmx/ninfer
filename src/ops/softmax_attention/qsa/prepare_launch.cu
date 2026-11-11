@@ -157,6 +157,10 @@ constexpr int kVTraceRecords = 8, kVTraceStride = 260;
 __device__ float g_v_trace[kVTraceRecords * kVTraceStride];
 __device__ int g_v_trace_count;
 
+// NINFER_QSA_PREP_ENTRY: an unfiltered counter for the prepare_kv entry log. Not reset per launch,
+// so the cap bounds the whole run rather than one pass.
+__device__ int g_prep_entry_count;
+
 struct E8TraceSink {
     E8TraceRecord* out = nullptr;
     int* count         = nullptr;
@@ -277,6 +281,15 @@ void launch_prepare(const QsaProjectionView& projected, const QsaPrepareParamete
         }
         if (const char* h = std::getenv("NINFER_QSA_TRACE_HEAD"); h != nullptr) {
             args.v_trace_head = std::atoi(h);
+        }
+    }
+    if (const char* entry = std::getenv("NINFER_QSA_PREP_ENTRY"); entry != nullptr && *entry != '0') {
+        void* counter = nullptr;
+        CUDA_CHECK(cudaGetSymbolAddress(&counter, g_prep_entry_count));
+        args.prep_entry_count = static_cast<int*>(counter);
+        args.prep_entry_n     = 8;
+        if (const char* n = std::getenv("NINFER_QSA_PREP_ENTRY_N"); n != nullptr) {
+            args.prep_entry_n = std::atoi(n);
         }
     }
     switch (cache.main.storage) {

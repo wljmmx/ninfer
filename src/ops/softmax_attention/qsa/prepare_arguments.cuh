@@ -57,6 +57,10 @@ struct PrepareArguments {
     int v_trace_capacity = 0;
     int v_trace_t        = -1;
     int v_trace_head     = -1;
+    // Default-off entry log (NINFER_QSA_PREP_ENTRY): every (t, head) this kernel reaches, unfiltered,
+    // capped by NINFER_QSA_PREP_ENTRY_N. Answers whether a pass reaches prepare_kv at all.
+    int* prep_entry_count = nullptr;
+    int prep_entry_n      = 0;
     ninfer::ops::E8TraceRecord* trace_out = nullptr;
     int* trace_count         = nullptr;
     int trace_capacity       = 0;
