@@ -83,7 +83,10 @@ int run_suite(Form form) {
     DeviceContext device;
     const auto e = device.execution_view();
     int failed   = 0;
-    for (int m : {1, 3, 8, 16, 31, 32, 33, 127, 128, 129, 512, 2048})
+    // 40/51/63: widths whose last tile is partial with more than one token. Every width the list
+    // used to carry ended either on a tile boundary or on a one-token tail, and a one-token tail is
+    // exactly the case a guarded tail store can still get right by accident.
+    for (int m : {1, 3, 8, 16, 31, 32, 33, 40, 51, 63, 127, 128, 129, 512, 2048})
         failed += run(form, m, Pattern::Random, false, false, e);
     for (auto pattern : {Pattern::Affine, Pattern::Zero, Pattern::Constant, Pattern::Cancellation,
                          Pattern::Midpoint, Pattern::Small})

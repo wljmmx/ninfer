@@ -420,7 +420,7 @@ int main() {
     int failed = down.check("q5 down") + inject.check("q5 inject") + up.check("q5 up");
 
     // The catalog is BF16 before it reaches the Op, so the oracle sees the same values.
-    constexpr int kMaxColumns = 33;
+    constexpr int kMaxColumns = 64;
     std::vector<float> catalog(std::size_t(kTotal) * kMaxColumns);
     fill_uniform(catalog, 4242U, -1.F, 1.F);
     round_to_bf16(catalog);
@@ -434,7 +434,9 @@ int main() {
 
     failed += forge_checks(down, inject, up, catalog, execution);
 
-    for (int columns : {1, 8, 17, 32, 33}) {
+    // 51 is the shortest width whose last tile is partial with more than one token: 33 leaves a
+    // one-token tail, which the guarded stores already get right.
+    for (int columns : {1, 8, 17, 32, 33, 40, 51, 64}) {
         failed += run_case(down, &inject, up, catalog, block_ref, columns, execution, true);
         failed += run_case(down, &inject, up, catalog, final_ref, columns, execution, false);
     }
