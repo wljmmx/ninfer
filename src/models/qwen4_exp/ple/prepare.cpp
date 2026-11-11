@@ -4,12 +4,20 @@
 #include "models/qwen4_exp/ple/row_reader.h"
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
 
 namespace ninfer::models::qwen4_exp {
 namespace {
+
+using Clock = std::chrono::steady_clock;
+
+std::uint64_t elapsed_ns(Clock::time_point begin) {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - begin).count());
+}
 
 PlePrepareOptions checked_options(PlePrepareOptions options, std::span<const MemorySpan> outputs,
                                   std::int32_t eos) {
@@ -169,8 +177,10 @@ struct PlePrepareService::Impl {
                                                                    : w.identities[b].raw_tail[0]),
                                           start ? ids[start - 1] : w.identities[b].raw_tail[1]};
                     std::array<std::uint32_t, 32 * kPleHeads> rows;
+                    const auto hash_begin = Clock::now();
                     ple_hash({ids + start, count}, tail, eos, table.controls(),
                              std::span(rows).first(count * kPleHeads));
+                    reader.record_hash(elapsed_ns(hash_begin));
                     for (std::size_t r = 0; r < count * kPleHeads; ++r)
                         reader.request(i, (b * w.tokens + start) * kPleHeads + r, rows[r]);
                     w.planned[b] += count;

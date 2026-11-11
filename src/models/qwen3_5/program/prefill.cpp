@@ -76,13 +76,16 @@ void prefill_batch_pass(PrefillContext& state, const PrefillBatchPass& pass,
     TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
-                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
+                     state.execution.ple);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
+    card.set_ple_lane(state.lane);
     card.set_prefill_gpu_timer(state.prefill_gpu_timer);
     card.prefill_batch(pass.ids, pass.positions, pass.rope_positions, pass.valid_columns,
                        pass.kv_table_rows, pass.state_source_slots, pass.state_destination_slots,
-                       pass.width, pass.batch, envelope, next_tokens, tail_hidden_rows);
+                       pass.ple_slots, pass.width, pass.batch, envelope, next_tokens,
+                       tail_hidden_rows);
 }
 
 PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const TokenId> ids,
@@ -92,9 +95,11 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
-                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
+                     state.execution.ple);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
+    card.set_ple_lane(state.lane);
     card.set_prefill_gpu_timer(state.prefill_gpu_timer);
     card.set_rope_delta(state.rope_delta);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
@@ -117,9 +122,11 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
     TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
-                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
+                     state.execution.ple);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
+    card.set_ple_lane(state.lane);
     card.set_prefill_gpu_timer(state.prefill_gpu_timer);
     card.set_rope_delta(state.rope_delta);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
@@ -441,6 +448,8 @@ std::optional<Program::MergedPrefillResult> ProgramImpl::advance_prefill_batch()
     std::vector<std::int32_t> kv_rows(batch, 0);
     std::vector<std::int32_t> src(batch, 0);
     std::vector<std::int32_t> dst(batch, 0);
+    // One PLE lane per row, in the same row order as every other column of the rectangle.
+    std::vector<std::int32_t> ple_slots(batch, 0);
     std::vector<std::int32_t> next_tokens(batch, 0);
     std::array<Tensor*, kMaximumConcurrency> tails{};
     std::array<bool, kMaximumConcurrency> finishes{};
@@ -466,6 +475,7 @@ std::optional<Program::MergedPrefillResult> ProgramImpl::advance_prefill_batch()
         kv_rows[b]   = static_cast<std::int32_t>(row.kv_row);
         src[b]       = row.state_source;
         dst[b]       = row.state_destination;
+        ple_slots[b] = static_cast<std::int32_t>(row.lane);
         tails[b]     = &sequence.tail_hidden;
         finishes[b]  = row.base + row.count >= staged.prompt_tokens;
         for (std::uint32_t t = 0; t < row.count; ++t) {
@@ -484,7 +494,7 @@ std::optional<Program::MergedPrefillResult> ProgramImpl::advance_prefill_batch()
     execution::PrefillContext schedule_state{
         {device, parameters, work, state_images->linear(),
          replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-         proposal_head},
+         proposal_head, ple.get()},
         text_kv_view(first),
         {},
         decoder->text_kv,
@@ -501,7 +511,8 @@ std::optional<Program::MergedPrefillResult> ProgramImpl::advance_prefill_batch()
         0,
         &prefill_gpu_timer_};
 
-    execution::PrefillBatchPass pass{ids, positions, rope, valid, kv_rows, src, dst, width, rows_n};
+    execution::PrefillBatchPass pass{ids, positions, rope, valid, kv_rows, src, dst, ple_slots,
+                                     width, rows_n};
     mark_workspace_usage(workspace_plan.text_prefill);
     execution::prefill_batch_pass(schedule_state, pass,
                                   ops::CausalAttentionExecutionEnvelope{visible, visible},
@@ -892,7 +903,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         execution::PrefillContext schedule_state{
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, ple.get()},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,
@@ -907,7 +918,10 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             staged.initial_mtp_extent,
             0,
             dflash_prefill_host_ingress,
-            sequence.rope_delta};
+            sequence.rope_delta,
+            nullptr,
+            {},
+            static_cast<std::int32_t>(sequence.lane)};
         schedule_state.prefill_gpu_timer = &prefill_gpu_timer_;
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {

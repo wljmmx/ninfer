@@ -53,6 +53,9 @@ void ReadQueue::submit_locked() {
         slot.file      = request.file;
         slot.tag       = request.tag;
         slot.in_flight = true;
+        std::size_t in_flight = 0;
+        for (const auto& other : slots_) in_flight += other.in_flight ? 1U : 0U;
+        peak_outstanding_ = std::max(peak_outstanding_, in_flight);
     }
 }
 

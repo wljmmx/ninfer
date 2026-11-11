@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <numeric>
@@ -13,6 +14,13 @@ namespace ninfer::models::qwen4_exp::ple_detail {
 namespace {
 
 constexpr std::uint32_t none = std::numeric_limits<std::uint32_t>::max();
+
+using Clock = std::chrono::steady_clock;
+
+std::uint64_t since(Clock::time_point begin) {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - begin).count());
+}
 
 std::uint64_t mix(std::uint64_t word) {
     word ^= word >> 30;
@@ -328,13 +336,16 @@ struct RowReader::Impl {
                     throw std::logic_error("PLE read slot admission failed");
                 inflight[buffer] = id;
                 ++stats.reads;
+                ++stats.pages;
                 break;
             }
             if (skipped == 256) break;
         }
         queue->submit();
+        const auto decode_begin = Clock::now();
         for (std::size_t budget = 0; ready_begin != ready_end && budget < 128; ++budget)
             decode(ready_rows[ready_begin++ % ready_rows.size()]);
+        stats.decode_ns += since(decode_begin);
     }
 };
 
@@ -538,7 +549,18 @@ bool RowReader::runnable() const noexcept {
                                             p.queue->outstanding() < p.buffers.size());
 }
 
-void RowReader::wait() { impl_->queue->wait(); }
+void RowReader::wait() {
+    // Only a wait that is actually waiting for this reader's work is preparation time; the worker
+    // blocks here before its first window too, and that idle time belongs to nobody.
+    bool busy = false;
+    for (const auto page : impl_->inflight) busy = busy || page != none;
+    busy = busy || impl_->queue_head[0] != none || impl_->queue_head[1] != none;
+    const auto begin = Clock::now();
+    impl_->queue->wait();
+    if (busy) { impl_->stats.wait_ns += since(begin); }
+}
+
+void RowReader::record_hash(std::uint64_t nanoseconds) { impl_->stats.hash_ns += nanoseconds; }
 
 void RowReader::wake() { impl_->queue->wake(); }
 
@@ -548,7 +570,11 @@ bool RowReader::drained(std::uint32_t owner) const { return impl_->owner(owner).
 
 std::exception_ptr RowReader::error(std::uint32_t owner) const { return impl_->owner(owner).error; }
 
-PleReadStats RowReader::stats() const noexcept { return impl_->stats; }
+PleReadStats RowReader::stats() const noexcept {
+    auto stats             = impl_->stats;
+    stats.peak_inflight    = impl_->queue->peak_outstanding();
+    return stats;
+}
 
 std::size_t RowReader::memory_bytes() const noexcept {
     const auto& p = *impl_;

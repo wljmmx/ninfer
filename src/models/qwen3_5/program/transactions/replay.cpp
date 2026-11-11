@@ -201,7 +201,7 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
         execution::PrefillContext context{
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, ple.get()},
             text_kv_view(sequence),
             skip_mtp_alignment ? PagedKVCacheView{} : mtp_kv_view(sequence),
             decoder->text_kv,
@@ -215,7 +215,10 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
             0,
             sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0,
             dflash_prefill_host_ingress,
-            sequence.rope_delta};
+            sequence.rope_delta,
+            nullptr,
+            {},
+            static_cast<std::int32_t>(sequence.lane)};
         context.prefill_gpu_timer = &prefill_gpu_timer_;
         mark_workspace_usage(speculative_backend == SpeculativeBackend::Mtp
                                  ? workspace_plan.mtp_prefill

@@ -38,7 +38,8 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
         TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                          {}, state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
-                         &state.text_cache);
+                         &state.text_cache, nullptr, state.execution.ple);
+        card.set_ple_lane(state.host_ingress.ple_slots[0]);
 
         Tensor tokens             = ordinary.tokens.slice(0, 0, batch_size);
         Tensor cache_positions    = ordinary.cache_positions.slice(0, 0, batch_size);
@@ -205,7 +206,8 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
 
     execution::DFlashAppendContext state{{device, parameters, work, state_images->linear(),
                                           replay_records ? &*replay_records : nullptr, io,
-                                          prefill_hidden, prefill_chunk, proposal_head},
+                                          prefill_hidden, prefill_chunk, proposal_head,
+                                          ple.get()},
                                          *dflash};
     mark_workspace_usage(workspace_plan.dflash_context);
     execution::dflash_append_context(state, features, positions, device_counts,
@@ -303,6 +305,8 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
             const StateImageSelectors selectors                 = state_selectors(sequence);
             ordinary_host_ingress->state_source_slots[row]      = selectors.source;
             ordinary_host_ingress->state_destination_slots[row] = selectors.destination;
+            ordinary_host_ingress->ple_slots[row] =
+                static_cast<std::int32_t>(sequence.lane);
             // port (sm_89): whether an ordinary step already runs with the two state slots apart
             // decides how O1's replay is built: apart means "discard the step" is free, in place
             // means it has to put 61.4 MiB back first.
@@ -354,7 +358,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
         execution::OrdinaryBatchContext schedule_state{
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, ple.get()},
             decoder->text_kv,
             *io.ordinary,
             *ordinary_host_ingress,
@@ -638,6 +642,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
             const StateImageSelectors selectors            = state_selectors(sequence);
             mtp_host_ingress->state_source_slots[row]      = selectors.source;
             mtp_host_ingress->state_destination_slots[row] = selectors.destination;
+            mtp_host_ingress->ple_slots[row]               = static_cast<std::int32_t>(sequence.lane);
             mtp_host_ingress->rope_deltas[row]             = sequence.rope_delta;
             mtp_host_ingress->sampling[row]                = request.sampling_host;
             mtp_host_ingress->sampling[row].mask           = bind_grammar_mask(masks, row);
@@ -647,7 +652,8 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
 
         execution::MtpBatchContext schedule_state{{device, parameters, work, state_images->linear(),
                                                    replay_records ? &*replay_records : nullptr, io,
-                                                   prefill_hidden, prefill_chunk, proposal_head},
+                                                   prefill_hidden, prefill_chunk, proposal_head,
+                                                   ple.get()},
                                                   decoder->text_kv,
                                                   *decoder->mtp_cache(),
                                                   *io.mtp_decode,
@@ -854,7 +860,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         execution::DFlashBatchContext schedule_state{
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, ple.get()},
             decoder->text_kv,
             *dflash,
             *io.dflash_decode,

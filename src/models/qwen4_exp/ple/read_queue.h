@@ -50,6 +50,9 @@ public:
     void wait();
     void wake();
     [[nodiscard]] std::size_t outstanding() const noexcept;
+    // The most reads this queue has ever had in flight at once, and how many times a caller had to
+    // block for one. A depth that is never reached is a request-issuing bug, not a device limit.
+    std::size_t peak_outstanding() const noexcept { return peak_outstanding_; }
 
 private:
     struct Slot {
@@ -70,6 +73,7 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable wake_;
     bool woken_ = false;
+    std::size_t peak_outstanding_ = 0;
 };
 
 // Page-aligned staging storage for direct reads. The slab outlives every queued read.

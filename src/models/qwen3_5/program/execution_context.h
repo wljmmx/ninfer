@@ -10,6 +10,7 @@
 #include "ninfer/ops/sliding_window_attention.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
+#include "models/qwen3_5/program/storage/ple_state.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_prefill.h"
@@ -39,6 +40,10 @@ struct ExecutionCore {
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
+    // The Program's PLE state when the model carries n-gram layers, null otherwise. Every pass a
+    // Program drives borrows the same one: the nine-column history and the hash tails are sequence
+    // state, so they have to outlive the pass that advances them.
+    detail::PleProgramState* ple = nullptr;
 };
 
 // Q67/S1: one lane's place in a merged prefill pass (see prefill_row.h).
@@ -62,6 +67,9 @@ struct PrefillContext {
     // Q67/S1: empty for the single-request path, which keeps using the scalar members above and
     // must stay byte-identical. A merged pass fills these instead.
     std::span<const PrefillRow> rows;
+    // The lane this chunk's PLE window names (the identity a resident sequence holds). Last so the
+    // positional initializers above keep their meaning.
+    std::int32_t lane = 0;
 };
 
 struct OrdinaryBatchContext {
@@ -133,6 +141,9 @@ struct TargetVerifyFrameView {
     Tensor licensed_counts;
     Tensor accepted_drafts;
     Tensor selected_hidden;
+    // One PLE lane per row, Host-side: the slot a row's n-gram history continues. Empty on entries
+    // that do not carry the Program's PLE state (DFlash drafts), which PLE refuses by name.
+    std::span<const std::int32_t> ple_slots;
     const GdnReplayRecords* replay_records = nullptr;
     const ops::SamplingConfig* sampling    = nullptr;
     DFlashFeatureSink* feature_sink        = nullptr;
@@ -155,6 +166,9 @@ struct PrefillBatchPass {
     std::span<const std::int32_t> kv_table_rows;
     std::span<const std::int32_t> state_source_slots;
     std::span<const std::int32_t> state_destination_slots;
+    // One PLE lane per row: the row's n-gram history slot, which is the row's lane and not its
+    // physical state slot.
+    std::span<const std::int32_t> ple_slots;
     std::int32_t width = 0;
     std::int32_t batch = 0;
 };

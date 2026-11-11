@@ -13,6 +13,16 @@
 //      slot, and both pools must equal two single-sequence runs of three columns.
 //   3. The two slots' pools must differ, which is what "the convolution never reads one sequence's
 //      columns as another's past" means in numbers.
+//
+// It also drives the round sequence a speculative decode produces, which is the reason the pool is
+// owned by the Program and not by a pass:
+//
+//   4. Four verify rectangles over one sequence, each four candidate columns wide and each committing
+//      a different accepted prefix (2, 1, 3, 2). The older columns of the final pool come from
+//      earlier rounds, so a pool that restarted with each round would show exact +0 there. The final
+//      pool is compared, column by column, with the same tokens driven one per window - the
+//      no-speculation reference - using the linear Op's own A16 criterion.
+
 
 #include "models/qwen4_exp/execution/ple_layer.h"
 
@@ -254,15 +264,28 @@ public:
     // (row b owns ids[b*tokens, (b+1)*tokens)), `valid` bounds each row's live columns, and
     // `accepted` - when given - is the prefix the pass may commit (a verify rectangle); otherwise
     // every live column is accepted (a prefill).
+    //
+    // `uniform_residual` seeds every column with the same residual block. The default walks one
+    // pseudo-random stream across the whole [D,T,B] block, so a token's residual depends on the
+    // column it happens to sit in - which is fine when two passes put the same token in the same
+    // column, and wrong when a comparison runs a token alone (column 0) against the same token as a
+    // later column of a wider window. A cross-round comparison seeds uniformly, so the only
+    // difference left between a token run alone and the same token inside a verify rectangle is the
+    // projection's accumulation shape - the linear Op's own criterion.
     void run(const std::vector<std::int32_t>& ids, std::span<const std::int32_t> slots,
              std::span<const std::uint32_t> valid, std::int32_t tokens,
-             const std::vector<std::int32_t>* accepted) {
+             const std::vector<std::int32_t>* accepted, bool uniform_residual = false) {
         const auto batch   = std::int32_t(slots.size());
         const auto columns = std::size_t(tokens) * std::size_t(batch);
         DeviceBuffer residual(std::size_t(kD) * columns * 2);
         DeviceBuffer normalized(std::size_t(kD) * columns * 2);
         std::vector<std::uint16_t> seed(static_cast<std::size_t>(kD) * columns);
         fill(seed, 21, 1.0F);
+        if (uniform_residual) {
+            const std::vector<std::uint16_t> block(seed.begin(), seed.begin() + kD);
+            for (std::size_t column = 1; column < columns; ++column)
+                std::copy(block.begin(), block.end(), seed.begin() + std::ptrdiff_t(column) * kD);
+        }
         residual.copy_from_host(seed.data(), residual.bytes);
         normalized.fill(0);
 
@@ -282,6 +305,12 @@ public:
                                      {std::int32_t(accepted->size())}),
                            context_.execution_view());
         }
+        // The owner advances the hash tail by the same prefix, from the Host counts it holds: a
+        // multi-round sequence hashes its next window against the tokens it actually committed.
+        std::vector<std::uint32_t> committed(valid.size());
+        for (std::size_t b = 0; b < valid.size(); ++b)
+            committed[b] = accepted == nullptr ? valid[b] : std::uint32_t((*accepted)[b]);
+        stage_->advance_tail(committed);
         context_.synchronize();
         stage_->end(context_.execution_view());
         context_.synchronize();
@@ -469,6 +498,78 @@ void check_prefill_batch() {
     std::cout << "  prefill batch: 2 sequences x 3 columns, committed per slot\n";
 }
 
+// The round sequence a speculative decode drives over one sequence. Each round opens the rectangle
+// the verifier will run - the anchor column plus the draft columns - and commits only the prefix the
+// verifier licensed. The pool must therefore carry columns across round boundaries, and the whole
+// round sequence must land on the same words as the same tokens driven one per window.
+void check_speculative_rounds() {
+    const auto fixture = write_fixture();
+    artifact::Reader reader(fixture.entry);
+    const auto shard    = reader.find("ngram");
+    const auto controls = reader.find("controls");
+    PleTableSource table(reader, std::span(&shard, 1), controls);
+
+    constexpr std::int32_t kTokens      = 4; // candidate columns per verify rectangle
+    constexpr std::int32_t kRoundCount  = 4;
+    const std::array<std::int32_t, kRoundCount> accepted{2, 1, 3, 2};
+    // Sixteen distinct ids; the round sequence consumes the first eight of them.
+    std::vector<std::int32_t> stream;
+    for (std::int32_t i = 0; i < 16; ++i) stream.push_back(1 + i);
+    const std::array<std::int32_t, 1> slots{0};
+    const std::array<std::uint32_t, 1> valid{std::uint32_t(kTokens)};
+
+    Stage verify(table, kTokens, 1, kSlots);
+    std::int32_t start = 0;
+    for (std::int32_t round = 0; round < kRoundCount; ++round) {
+        std::vector<std::int32_t> window(stream.begin() + start, stream.begin() + start + kTokens);
+        const std::vector<std::int32_t> commit{accepted[std::size_t(round)]};
+        verify.run(window, slots, valid, kTokens, &commit, true);
+
+        // Inside this round: the pool's newest `accepted` columns are exactly this window's records
+        // for the committed columns, and nothing beyond them entered. One row, so the records tensor
+        // is [D,T] and a column is a contiguous D-word run.
+        const auto pool = verify.history(1);
+        const auto words = test::from_device<std::uint16_t>(verify.records(1).data,
+                                                            std::size_t(kD) * kTokens);
+        const std::size_t count = std::size_t(accepted[std::size_t(round)]);
+        std::size_t wrong = 0;
+        for (std::size_t j = 0; j < count; ++j) {
+            std::vector<std::uint16_t> expected(words.begin() + std::ptrdiff_t(j) * kD,
+                                                words.begin() + std::ptrdiff_t(j + 1) * kD);
+            wrong += column_of(pool, 0, kPleHistory - count + j) != expected;
+        }
+        check(wrong == 0, "a round's committed columns are exactly that round's records");
+        if (round + 1 < kRoundCount && count < kPleHistory) {
+            // The column just past the committed prefix is either an older round's (non-zero for a
+            // pool that crossed a boundary) or zero on the first round. Only the first round may be
+            // zero there; a later one being zero means the history restarted.
+            const auto older = column_of(pool, 0, kPleHistory - count - 1);
+            const bool all_zero = std::all_of(older.begin(), older.end(),
+                                              [](std::uint16_t w) { return w == 0; });
+            if (round == 0) {
+                check(all_zero, "a fresh pool's column before the first accepted prefix is +0");
+            } else {
+                check(!all_zero, "a later round's pool still holds the columns of the rounds before it");
+            }
+        }
+        start += accepted[std::size_t(round)];
+    }
+
+    // The same tokens, one per window: the no-speculation reference. Both runs start from an empty
+    // pool, so any difference is the history the speculative rounds did or did not carry over.
+    const std::vector<std::int32_t> reference(stream.begin(), stream.begin() + start);
+    Stage plain(table, 1, 1, kSlots);
+    for (const auto id : reference) {
+        const std::vector<std::int32_t> window{id};
+        const std::array<std::uint32_t, 1> one{1};
+        plain.run(window, slots, one, 1, nullptr, true);
+    }
+    check_within_criterion(slot_block(verify.history(1), 0), slot_block(plain.history(1), 0),
+                           "the speculative round sequence agrees with the same tokens run alone");
+    std::cout << "  speculative rounds: " << kRoundCount << " x " << kTokens
+              << " candidate columns, accepted 2/1/3/2, pool continuous across rounds\n";
+}
+
 } // namespace
 int main() {
     try {
@@ -479,13 +580,15 @@ int main() {
         }
         check_verify_prefix();
         check_prefill_batch();
+        check_speculative_rounds();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;
     }
     if (failures) return 1;
-    std::cout << "OK PLE multi-sequence: a verify rectangle commits its accepted prefix and a "
-                 "batch prefill advances each sequence's own history\n";
+    std::cout << "OK PLE multi-sequence: a verify rectangle commits its accepted prefix, a batch "
+                 "prefill advances each sequence's own history, and a sequence of speculative "
+                 "rounds keeps one continuous pool\n";
     return 0;
 }
 

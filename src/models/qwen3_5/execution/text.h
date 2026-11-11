@@ -31,6 +31,13 @@ namespace ninfer::models::qwen4_exp {
 class PleTextStage;
 } // namespace ninfer::models::qwen4_exp
 
+namespace ninfer::models::qwen3_5::detail {
+// The Program's PLE state: the table window, the per-lane nine-column history and the hash tails.
+// It outlives every pass, so a TextContext borrows it instead of building one.
+class PleProgramState;
+} // namespace ninfer::models::qwen3_5::detail
+
+
 namespace ninfer::models::qwen3_5::execution {
 
 using Phase = qwen3_5::TextPhase;
@@ -82,7 +89,8 @@ public:
                 std::uint32_t text_kv_base,
                 qwen3_5::PagedKVCacheView mtp_kv           = qwen3_5::PagedKVCacheView(),
                 const qwen3_5::PagedKVCache* batch_text_kv = nullptr,
-                const qwen3_5::PagedKVCache* batch_mtp_kv  = nullptr);
+                const qwen3_5::PagedKVCache* batch_mtp_kv  = nullptr,
+                qwen3_5::detail::PleProgramState* ple      = nullptr);
     ~TextContext();
 
     TextContext(const TextContext&)            = delete;
@@ -110,6 +118,13 @@ public:
     }
 
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
+
+    // The lane whose n-gram history this pass continues. A PLE window names its row's slot, and a
+    // slot is the lane: the identity a resident sequence holds for its whole life, unlike the
+    // physical StateImage slot it reads through. Multi-row passes carry one lane per row instead
+    // (the verify rectangle's frame and the merged prefill's pass).
+    void set_ple_lane(std::int32_t lane) noexcept { ple_lane_ = lane; }
+
 
     void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
@@ -147,11 +162,13 @@ public:
     void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
+                             std::span<const std::int32_t> ple_slots,
                              ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
                              Tensor& logits, Tensor& target_tokens);
     void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
+                             std::span<const std::int32_t> ple_slots,
                              ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
                              Tensor& logits, Tensor& target_tokens, DFlashFeatureSink& sink);
     // Qwen4Exp PLE after a verify rectangle: the window was opened over every candidate column and
@@ -173,7 +190,8 @@ public:
                        std::span<const std::int32_t> valid_columns,
                        std::span<const std::int32_t> kv_table_rows,
                        std::span<const std::int32_t> state_source_slots,
-                       std::span<const std::int32_t> state_destination_slots, std::int32_t width,
+                       std::span<const std::int32_t> state_destination_slots,
+                       std::span<const std::int32_t> ple_slots, std::int32_t width,
                        std::int32_t batch, ops::CausalAttentionExecutionEnvelope envelope,
                        std::span<std::int32_t> next_tokens,
                        std::span<Tensor* const> tail_hidden_rows);
@@ -246,6 +264,7 @@ private:
                                   const Tensor& rope_positions, const Tensor& valid_columns,
                                   const Tensor& kv_table_rows,
                                   const Tensor& linear_state_source_slots,
+                                  std::span<const std::int32_t> ple_slots,
                                   ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
                                   Tensor& logits, Tensor& target_tokens, Tap& tap);
 
@@ -338,18 +357,13 @@ private:
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;
     const HcParameters* final_hc_               = nullptr;
-    // Qwen4Exp's n-gram embedding, when the model carries it. The stage owns the table window and
-    // one runtime per PLE block; `ple_window_`/`ple_tokens_` are the pass's open window, which is
-    // what a PLE block reads its embedding from. A PLE block that runs with no window is refused
-    // in run_layers instead of quietly skipping the layer.
-    std::unique_ptr<qwen4_exp::PleTextStage> ple_;
-    std::int32_t ple_tokens_ = 0;
-    bool ple_window_         = false;
-    // The verify rectangle opens its window over every candidate column, but only the accepted
-    // prefix may advance the history pool, and acceptance is known after the verifier runs. The
-    // pass therefore applies the layer without committing and leaves the window open for
-    // `ple_commit_verify(accepted)`, which the caller that owns acceptance must issue.
-    bool ple_deferred_commit_ = false;
+    // Qwen4Exp's n-gram embedding, when the model carries it. The stage itself belongs to the
+    // Program (detail::PleProgramState): its nine-column history and hash tails are sequence state,
+    // so this pass borrows it and only the pass's own window bookkeeping lives beside it. A PLE
+    // block that runs with no window is refused in run_layers instead of quietly skipping the layer.
+    qwen3_5::detail::PleProgramState* ple_ = nullptr;
+    // The lane this pass's window names. Multi-row passes name one lane per row instead.
+    std::int32_t ple_lane_ = 0;
     // The live four-stream state of the current call. Allocated by run_layers from the same recipe
     // the workspace plan uses, so the two reserve identical bytes.
     workspace::TextHcRoots hc_{};

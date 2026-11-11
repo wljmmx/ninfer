@@ -559,6 +559,15 @@ void ProgramImpl::clear_lane(SequenceState& sequence, RequestControl& request) n
     sequence.lane = lane;
     request       = {};
     invalidate_lane(lane);
+    // The lane's n-gram history dies with the sequence that filled it: the next request to own this
+    // lane starts from an all-+0 nine-column pool and an EOS hash tail, which is what a freshly
+    // built pool holds. A window a failed pass left open is closed first, without committing it.
+    if (ple) {
+        try {
+            ple->abort_window(device.execution_view());
+            ple->reset_lane(static_cast<std::int32_t>(lane), device.execution_view());
+        } catch (...) {}
+    }
 }
 
 void ProgramImpl::clear_execution_failure_lanes(std::span<const std::uint32_t> lanes) noexcept {
@@ -626,6 +635,31 @@ struct HostKvMgmtTimer {
 void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& state, std::uint32_t main,
                                             std::uint32_t backend) {
     const HostKvMgmtTimer kv_mgmt_timer(kv_host_timing_enabled());
+    // port (sm_89): a residency Program keeps the Device pool at `kv_resident_page_groups`. A step
+    // whose live history is longer than that cannot be served by fetching: the full-attention layers
+    // read the whole history every step, so every live page has to be resident at once. Refuse here,
+    // with the numbers, rather than letting the append die inside the page pool - and far rather than
+    // letting attention read a block-table entry whose Device replica was already given back.
+    if (kv_resident_page_groups < kv_logical_page_groups && main != 0) {
+        const std::uint32_t page_tokens = static_cast<std::uint32_t>(kPagedKVPageSize);
+        const std::uint32_t needed      = 1U + (main - 1U) / page_tokens;
+        // The live edge, not the construction number: the control plane's KV dial can shrink the
+        // pool at runtime, and a guard that read the plan would then promise room that is gone.
+        const std::uint32_t resident_capacity =
+            text_kv_pages != nullptr ? text_kv_pages->physical_pool().capacity_pages()
+                                     : kv_resident_page_groups;
+        if (needed > resident_capacity) {
+            throw std::runtime_error(
+                "KV residency cannot serve this step: it needs " + std::to_string(needed) +
+                " resident page group(s) for " + std::to_string(main) + " token(s), but the Device "
+                "pool holds " + std::to_string(resident_capacity) + " of " +
+                std::to_string(kv_logical_page_groups) + " logical page group(s) (" +
+                std::to_string(host_kv_payload_bytes >> 20) + " MiB priced onto the Host tier). The " +
+                std::to_string(parameters.model.config().text.full_attention_layers) +
+                " full-attention layer(s) read the whole history every step, so the step needs all "
+                "of it resident at once; it cannot be streamed out of the Host tier.");
+        }
+    }
     text_kv_addresses->ensure_mapped_to_tokens(state.kv->text, main, device.stream);
     if (state.kv->backend) {
         backend_kv_addresses->ensure_mapped_to_tokens(*state.kv->backend, backend, device.stream);
@@ -898,6 +932,19 @@ void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, Paged
         // device.stream, so the read that follows is ordered after both.
         (void)restore_addressed_host_pages(addresses, cache, address, live, window.sink_pages,
                                            eff_window, keep);
+        // port (sm_89): under residency an addressed page that could not be brought back is not a
+        // miss to tolerate - the step is about to read it. Fail with the count instead of running the
+        // kernel against a block table entry whose replica is gone.
+        if (kv_resident_page_groups < kv_logical_page_groups && last_fetch_shortfall_ != 0) {
+            throw std::runtime_error(
+                "KV residency could not restore every addressed page before the step: addressed=" +
+                std::to_string(last_fetch_candidates_) +
+                " restored=" + std::to_string(last_fetched_pages_) +
+                " shortfall=" + std::to_string(last_fetch_shortfall_) + " (Device pool " +
+                std::to_string(kv_resident_page_groups) + " page group(s) of " +
+                std::to_string(kv_logical_page_groups) + " logical, Host payload " +
+                std::to_string(host_kv_payload_bytes >> 20) + " MiB)");
+        }
         dump_pool_account(cache);
         dump_page_placement(cache, addresses, address, device.stream, live, window.sink_pages,
                             eff_window, keep);

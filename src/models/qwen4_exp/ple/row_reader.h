@@ -27,6 +27,9 @@ public:
     [[nodiscard]] bool runnable() const noexcept;
     void wait();
     void wake();
+    // The owner hashes on its own thread; the nanoseconds it spends there are added to the stats so
+    // one record answers "where did the window's time go".
+    void record_hash(std::uint64_t nanoseconds);
 
     [[nodiscard]] std::size_t pending(std::uint32_t owner) const;
     [[nodiscard]] bool drained(std::uint32_t owner) const;

@@ -48,6 +48,10 @@ struct OrdinaryDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
     std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
+    // The lane each row belongs to. A PLE window names one slot per row and a slot is the lane -
+    // the identity a resident sequence holds - not the physical StateImage slot, which moves when a
+    // checkpoint forks or a demoted image is reloaded.
+    std::array<std::int32_t, kMaximumConcurrency> ple_slots{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
 };
 
@@ -70,6 +74,9 @@ struct MtpDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
     std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
     std::array<std::int32_t, kMaximumConcurrency> rope_deltas{};
+    // The lane each row belongs to: the slot a row's n-gram history continues (see
+    // OrdinaryDecodeIngress::ple_slots).
+    std::array<std::int32_t, kMaximumConcurrency> ple_slots{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
 };
 

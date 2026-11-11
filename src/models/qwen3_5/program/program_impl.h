@@ -16,6 +16,7 @@
 #include "models/qwen3_5/program/storage/host_kv_store.h"
 #include "models/qwen3_5/program/storage/kv_address_space.h"
 #include "models/qwen3_5/program/storage/state_store.h"
+#include "models/qwen3_5/program/storage/ple_state.h"
 #include "models/qwen3_5/program/storage/tier_source.h"
 #include "models/qwen3_5/program/prefix_identity.h"
 #include "core/host_context_arena.h"
@@ -442,6 +443,12 @@ public:
     const bool use_cuda_graph;
     const bool causal_scoring;
     const std::size_t kv_payload_bytes;
+    // port (sm_89): the residency split this Program was built with. `kv_resident_page_groups` is the
+    // Device pool's construction size, `host_kv_payload_bytes` the Host tier's claim; equal counts
+    // and a zero payload on a fully resident Program, which is every plan before residency existed.
+    const std::uint32_t kv_logical_page_groups;
+    const std::uint32_t kv_resident_page_groups;
+    const std::size_t host_kv_payload_bytes;
     const std::size_t graph_allowance_bytes;
     // Measured growth of prepare_graphs(); zero when this Program captures no graphs. Reported
     // through MemorySummary::cuda_graph as the observed counterpart of the static allowance.
@@ -466,6 +473,11 @@ public:
     std::unique_ptr<qwen3_5::StateImageDevicePool> state_images;
     std::unique_ptr<qwen3_5::HostStatePool> host_state_images;
     std::unique_ptr<StateImageStore> state_store;
+    // Qwen4Exp's n-gram state, when the model carries PLE: one stage (table window, per-block
+    // gate/convolution runtimes, the per-lane nine-column history and hash tails) for the whole
+    // Program. Null without PLE. Every TextContext borrows it through ExecutionCore, so the history
+    // is continuous across rounds and across the verify/accept split of a speculative round.
+    std::unique_ptr<detail::PleProgramState> ple;
     // port (sm_89): O1's replay keeps one destination slot aside as the pre-step image. Reserved on
     // the first decode step that asks for it; when the pool has no spare slot the reservation fails
     // and the skip stays off - a property of the pool, not a size written into the code.

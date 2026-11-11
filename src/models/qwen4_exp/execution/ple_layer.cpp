@@ -202,6 +202,16 @@ void PleLayerRuntime::commit(const Tensor& accepted_columns, const Tensor& valid
                            {history_, slots}, execution);
 }
 
+void PleLayerRuntime::reset_slot(std::int32_t slot, CudaExecutionView execution) {
+    require(slot >= 0 && std::uint32_t(slot) < slots_, "the slot is outside the history pool");
+    // The pool is [D,9,S], so one slot's nine columns are one contiguous run of nb[2] bytes. Zeroing
+    // it is the "a fresh sequence starts from an all-+0 history" rule, applied when the identity is
+    // reused rather than when the pool is built.
+    auto* base = static_cast<std::uint8_t*>(history_.data) + std::size_t(slot) * history_.nb[2];
+    CUDA_CHECK(cudaMemsetAsync(base, 0, std::size_t(history_.nb[2]), execution.stream));
+}
+
+
 std::size_t PleLayerRuntime::device_bytes() const noexcept {
     return (state_ ? state_->capacity() : 0) + (step_ ? step_->capacity() : 0) +
            (workspace_ ? workspace_->capacity() : 0);
@@ -368,6 +378,16 @@ void PleTextStage::begin(const PleStepWindow& window, CudaExecutionView executio
     require(!ticket_.has_value(), "a PLE window is already open");
     require_window(window);
     retire();
+    // Where a window's Host time goes, in the order it is spent: the hash and enqueue `prepare`
+    // does, the seal, the wait for the worker to publish, and the upload the consumer starts from.
+    // The worker's own split (hash / read wait / decode) travels with the reader's stats.
+    static const bool timing = std::getenv("NINFER_PLE_TIMING") != nullptr;
+    const auto window_begin = std::chrono::steady_clock::now();
+    const auto mark         = [&] {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                        window_begin)
+            .count();
+    };
     const auto batch = std::uint32_t(window.slots.size());
     // A window whose rows all reject their columns has nothing to hash; the reader would refuse
     // it, so it is refused here with the reason instead of three calls later.
@@ -376,6 +396,11 @@ void PleTextStage::begin(const PleStepWindow& window, CudaExecutionView executio
     if (!any_live) { throw std::invalid_argument("PLE stage: every row of the window is empty"); }
 
     std::vector<PleInputRow> rows(batch);
+    // The window's ids and live columns are kept on the Host: the hash tail advances by the accepted
+    // prefix of them at commit time, and a verify rectangle's ids include candidates nobody accepted.
+    window_ids_.assign(window.ids.begin(), window.ids.end());
+    window_live_.assign(window.valid_columns.begin(), window.valid_columns.end());
+    window_slots_.assign(window.slots.begin(), window.slots.end());
     for (std::uint32_t b = 0; b < batch; ++b) {
         const auto slot  = std::uint32_t(window.slots[b]);
         const auto& tail = started_[slot] ? tail_[slot] : std::array<std::int32_t, 2>{eos_, eos_};
@@ -401,6 +426,7 @@ void PleTextStage::begin(const PleStepWindow& window, CudaExecutionView executio
     tokens_ = window.tokens;
     batch_  = static_cast<std::int32_t>(batch);
     gpu_->host().seal(*ticket_, window.valid_columns);
+    const double prepared_ms = mark();
 
     const auto deadline = std::chrono::steady_clock::now() + kWindowDeadline;
     for (;;) {
@@ -421,12 +447,35 @@ void PleTextStage::begin(const PleStepWindow& window, CudaExecutionView executio
         }
         std::this_thread::sleep_for(std::chrono::microseconds(200));
     }
+    const double ready_ms = mark();
 
     live_mask_.copy_from_host(window.valid_columns.data(), window.valid_columns.size() * 4);
     accept_mask_.copy_from_host(window.valid_columns.data(), window.valid_columns.size() * 4);
     slot_index_.copy_from_host(window.slots.data(), window.slots.size() * 4);
     gpu_->upload(*ticket_, execution);
     embedding_ = gpu_->embedding(*ticket_, execution);
+    if (timing) {
+        const auto stats = gpu_->host().stats();
+        const auto count = [](std::uint64_t now, std::uint64_t before) {
+            return static_cast<unsigned long long>(now - before);
+        };
+        std::fprintf(stderr,
+                     "[ple-t] window tokens=%d batch=%u: prepare=%.3f ms seal+wait=%.3f ms "
+                     "upload=%.3f ms | rows=%llu pages=%llu bytes=%llu hits=%llu shared=%llu/%llu "
+                     "| hash=%.3f ms wait=%.3f ms decode=%.3f ms | inflight=%llu\n",
+                     window.tokens, batch, prepared_ms, ready_ms - prepared_ms, mark() - ready_ms,
+                     count(stats.rows, stats_seen_.rows), count(stats.pages, stats_seen_.pages),
+                     count(stats.read_bytes, stats_seen_.read_bytes),
+                     count(stats.cache_hits, stats_seen_.cache_hits),
+                     count(stats.shared_rows, stats_seen_.shared_rows),
+                     count(stats.shared_pages, stats_seen_.shared_pages),
+                     double(count(stats.hash_ns, stats_seen_.hash_ns)) / 1e6,
+                     double(count(stats.wait_ns, stats_seen_.wait_ns)) / 1e6,
+                     double(count(stats.decode_ns, stats_seen_.decode_ns)) / 1e6,
+                     static_cast<unsigned long long>(stats.peak_inflight));
+        std::fflush(stderr);
+        stats_seen_ = stats;
+    }
     // One line per window, once: what the n-gram stage gathered and for how many rows. It is the
     // evidence that a pass really drove PLE (an id, its slot and its live columns), and it is the
     // only Host read the stage adds beyond the ids the hash needs.
@@ -438,14 +487,27 @@ void PleTextStage::begin(const PleStepWindow& window, CudaExecutionView executio
                      static_cast<unsigned long long>(gpu_->host().stats().rows));
         std::fflush(stderr);
     }
-    // The hash tail of the next window of each slot is the end of this one.
+    // The hash tail of the next window of each slot is the end of the prefix this window commits,
+    // which is why `advance_tail` (not `begin`) moves it: the window's later columns are candidates
+    // a verifier may reject.
+}
+
+void PleTextStage::advance_tail(std::span<const std::uint32_t> accepted) {
+    if (!ticket_.has_value()) { throw std::logic_error("advance_tail has no open window"); }
+    const auto batch = std::uint32_t(batch_);
+    if (accepted.empty()) { accepted = window_live(); }
+    require(accepted.size() == batch, "advance_tail needs one accepted count per row");
     for (std::uint32_t b = 0; b < batch; ++b) {
-        const auto slot = std::uint32_t(window.slots[b]);
-        const auto live = window.valid_columns[b];
-        const auto* ids = window.ids.data() + std::size_t(b) * window.tokens;
-        if (live == 0) continue;
-        tail_[slot][1] = ids[live - 1];
-        tail_[slot][0] = live >= 2 ? ids[live - 2] : (started_[slot] ? tail_[slot][0] : eos_);
+        const auto slot = std::uint32_t(window_slots_[b]);
+        const auto live = window_live_[b];
+        const auto count = std::min(accepted[b], live);
+        if (count == 0) { continue; }
+        const auto* ids = window_ids_.data() + std::size_t(b) * tokens_;
+        auto& tail      = tail_[slot];
+        // The hash rolls `tail = {tail[1], ids[t]}` per token, so the tail after a committed prefix
+        // is the prefix's last two ids - or the previous window's newest id plus the prefix's first.
+        tail = count >= 2 ? std::array<std::int32_t, 2>{ids[count - 2], ids[count - 1]}
+                          : std::array<std::int32_t, 2>{tail[1], ids[0]};
         started_[slot] = true;
     }
 }
@@ -469,6 +531,16 @@ void PleTextStage::commit(std::uint32_t layer, const Tensor& accepted,
     require(ticket_.has_value(), "commit has no open window");
     require(has_layer(layer), "this block has no PLE layer");
     layers_[layer]->commit(accepted, live_columns(), slot_rows(), execution);
+}
+
+void PleTextStage::reset_slot(std::int32_t slot, CudaExecutionView execution) {
+    require(!ticket_.has_value(), "a slot cannot be reset under an open window");
+    require(slot >= 0 && std::uint32_t(slot) < slots_, "the slot is outside the history pool");
+    for (auto& layer : layers_)
+        if (layer) layer->reset_slot(slot, execution);
+    // A fresh sequence hashes with EOS history, exactly as a pool nobody has written yet does.
+    tail_[std::size_t(slot)]    = {eos_, eos_};
+    started_[std::size_t(slot)] = false;
 }
 
 void PleTextStage::end(CudaExecutionView execution) {

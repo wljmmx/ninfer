@@ -16,6 +16,18 @@ struct PleReadStats {
     std::uint64_t shared_pages = 0; // Fragments joining an already queued/in-flight page.
     std::uint64_t reads        = 0;
     std::uint64_t read_bytes   = 0; // Actual returned bytes, including alignment overhead.
+    // Where the preparation worker's wall time goes. The stage exists because the table is on
+    // disk, so a window's cost has to be attributable before it can be argued about: the hash
+    // (Host, per row), the blocking wait for a read to retire, and the decode that turns an
+    // arrived row into BF16 words. `pages` counts the aligned reads issued, which is what the
+    // read amplification of a two-plane row shows up in.
+    std::uint64_t pages     = 0;
+    std::uint64_t hash_ns   = 0;
+    std::uint64_t wait_ns   = 0;
+    std::uint64_t decode_ns = 0;
+    // The most reads this reader has ever had in flight. A window whose wall time looks like one
+    // read after another shows up here as a depth the queue never reached.
+    std::uint64_t peak_inflight = 0;
 };
 
 struct PlePrepareOptions {

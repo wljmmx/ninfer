@@ -80,6 +80,11 @@ public:
     void commit(const Tensor& accepted_columns, const Tensor& valid_columns, const Tensor& slots,
                 CudaExecutionView execution);
 
+    // Forgets one sequence's history: its nine columns become exact +0. A slot is the identity a
+    // resident sequence borrows, so a pool that outlives the sequence that filled it has to be
+    // cleared when the identity is handed to another one.
+    void reset_slot(std::int32_t slot, CudaExecutionView execution);
+
     // Intermediates, in the form the Op contract publishes them. The dump paths and the numeric
     // gates read these words instead of re-deriving them, which is the only way a comparison can
     // consume the declared BF16 seams.
@@ -199,6 +204,25 @@ public:
     // accepted prefix explicitly so unaccepted columns never enter the pool.
     void commit(std::uint32_t layer, CudaExecutionView execution);
     void commit(std::uint32_t layer, const Tensor& accepted, CudaExecutionView execution);
+    // Forgets one sequence's nine-column history and its two-token hash tail, so the slot can be
+    // handed to a different sequence. No window may be open: the caller resets a slot when the
+    // identity that filled it is gone, not while a pass is reading it.
+    void reset_slot(std::int32_t slot, CudaExecutionView execution);
+    // Advances each slot's two-token hash tail by the prefix the pool just advanced by. The n-gram
+    // hash of a window's first token continues from the two tokens before it, so a column the model
+    // rejected must not move the tail - which is why this is a commit-time step and not part of
+    // `begin`: a verify rectangle's ids include candidates nobody accepted. `accepted` is the Host
+    // form of the per-row accepted-column counts; an empty span means "the window's live columns".
+    void advance_tail(std::span<const std::uint32_t> accepted);
+
+    // The open window's live columns, as the Host counts `begin` was given.
+    [[nodiscard]] std::span<const std::uint32_t> window_live() const noexcept {
+        return std::span<const std::uint32_t>(window_live_.data(),
+                                              static_cast<std::size_t>(batch_));
+    }
+
+    [[nodiscard]] std::int32_t window_batch() const noexcept { return batch_; }
+
     // Retires the open window. Safe to call with no window open.
     void end(CudaExecutionView execution);
 
@@ -225,6 +249,7 @@ public:
 
 private:
     void retire();
+
     void require_window(const PleStepWindow& window) const;
     // The window metadata as the Ops' I32 [B] views over the stage's own storage.
     [[nodiscard]] Tensor live_columns() const;
@@ -252,6 +277,13 @@ private:
     // slot has seen a window at all (a fresh sequence hashes with EOS history).
     std::vector<std::array<std::int32_t, 2>> tail_;
     std::vector<bool> started_;
+    // The open window's ids and live columns, kept on the Host because the hash tail advances by
+    // the accepted prefix of them at commit time.
+    std::vector<std::int32_t> window_ids_;
+    std::vector<std::uint32_t> window_live_;
+    std::vector<std::int32_t> window_slots_;
+    // The reader counters as of the last window, so one window's share of them can be printed.
+    PleReadStats stats_seen_;
     std::int32_t tokens_ = 0, batch_ = 0;
 };
 

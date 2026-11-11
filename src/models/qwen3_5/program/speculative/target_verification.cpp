@@ -14,13 +14,13 @@ void target_verify_forward(ExecutionCore& execution, TextContext& card, TargetVe
     if (frame.feature_sink != nullptr) {
         card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
                                  frame.valid_columns, frame.kv_table_rows, frame.state_source_slots,
-                                 envelope, frame.target_hidden, frame.target_logits,
-                                 frame.target_tokens, *frame.feature_sink);
+                                 frame.ple_slots, envelope, frame.target_hidden,
+                                 frame.target_logits, frame.target_tokens, *frame.feature_sink);
     } else {
         card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
                                  frame.valid_columns, frame.kv_table_rows, frame.state_source_slots,
-                                 envelope, frame.target_hidden, frame.target_logits,
-                                 frame.target_tokens);
+                                 frame.ple_slots, envelope, frame.target_hidden,
+                                 frame.target_logits, frame.target_tokens);
     }
 }
 
@@ -45,6 +45,18 @@ void target_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                                             frame.selected_hidden, execution.device.stream);
     ops::scatter(frame.selected_hidden, frame.state_destination_slots, continuation_hidden_store,
                  execution.device.stream);
+    // PLE after a verify rectangle: the window was opened over every candidate column, and only the
+    // columns the verifier licensed may advance the nine-column history. `licensed_counts` is the
+    // accepted column count per row - the anchor plus the accepted drafts - which is exactly the
+    // prefix of the rectangle that became tokens. Without this the next round would convolve over a
+    // history that either skipped the round or kept a rejected draft.
+    if (execution.ple != nullptr && execution.ple->window_deferred()) {
+        if (!execution.ple->commit_verify(frame.licensed_counts,
+                                          execution.parameters.text.layers.size(),
+                                          execution.device.execution_view())) {
+            throw std::logic_error("speculative target accept found no PLE window to commit");
+        }
+    }
 }
 
 

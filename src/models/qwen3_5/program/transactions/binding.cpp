@@ -403,6 +403,18 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
         const bool host_state = source   ? !state_store->device_resident(checkpoint(*source).state)
                                 : tx.tier ? !state_store->device_resident(*tx.tier->state)
                                           : false;
+        // Qwen4Exp's n-gram history is not part of a StateImage: the nine normalized columns and
+        // the two-token hash tail live in the Program's PLE pool, keyed by lane. A request that
+        // resumes a captured prefix or imports a tier image would therefore continue a convolution
+        // whose past it does not have, and quietly start it at zero. Refusing names the missing
+        // piece; carrying the pool in the checkpoint is the work that would make this supported.
+        if (ple != nullptr && ple->present() &&
+            (source.has_value() || tx.borrow_state || tx.tier)) {
+            throw std::invalid_argument(
+                "text: PLE cannot resume a restored context; the nine-column n-gram history is not "
+                "part of a StateImage (run the request cold, or carry the PLE pool in the "
+                "checkpoint)");
+        }
         tx.reserved_state     = tx.borrow_state ? std::optional(checkpoint(*source).state)
                                 // The import's own image is the destination. It is already published
                                 // as a Host replica and promoting it is the whole restore; reserving

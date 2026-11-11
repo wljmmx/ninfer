@@ -14,6 +14,7 @@
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_control.h"
 #include "models/qwen4_exp/execution/ple_layer.h"
+#include "models/qwen3_5/program/storage/ple_state.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/act_quant_a8.h"
@@ -61,6 +62,37 @@
 
 namespace ninfer::models::qwen3_5::execution {
 namespace {
+
+// Closes the Program's PLE window if a pass unwinds before its normal end. The stage belongs to the
+// Program now, so a window a failed pass left open would refuse every later pass instead of dying
+// with the TextContext that opened it. A verify rectangle arms nothing: its window belongs to the
+// verifier, which closes it through commit_verify().
+class PlePassWindow {
+public:
+    PlePassWindow(qwen3_5::detail::PleProgramState* ple, CudaExecutionView view) noexcept
+        : ple_(ple), view_(view) {}
+    ~PlePassWindow() {
+        if (armed_ && ple_ != nullptr) { ple_->abort_window(view_); }
+    }
+    PlePassWindow(const PlePassWindow&)            = delete;
+    PlePassWindow& operator=(const PlePassWindow&) = delete;
+
+    void opened(std::int32_t tokens, bool deferred) noexcept {
+        if (ple_ != nullptr) { ple_->window_opened(tokens, deferred); }
+        armed_ = ple_ != nullptr && !deferred;
+    }
+
+    void close() {
+        if (!armed_) { return; }
+        armed_ = false;
+        ple_->close_window(view_);
+    }
+
+private:
+    qwen3_5::detail::PleProgramState* ple_ = nullptr;
+    CudaExecutionView view_;
+    bool armed_ = false;
+};
 
 // An indexed layer runs `qsa_mix` unless NINFER_QSA_FORCE_FULL asks for the dense mixer, which is
 // the reference arm the byte and output gates compare against. Saying so once keeps a reference run
@@ -547,7 +579,8 @@ TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weight
                          Tensor& prefill_hidden, std::uint32_t prefill_chunk,
                          std::uint32_t text_kv_base, qwen3_5::PagedKVCacheView mtp_kv,
                          const qwen3_5::PagedKVCache* batch_text_kv,
-                         const qwen3_5::PagedKVCache* batch_mtp_kv)
+                         const qwen3_5::PagedKVCache* batch_mtp_kv,
+                         qwen3_5::detail::PleProgramState* ple)
     : ctx_(ctx), parameters_(weights), config_(weights.model.config().text), work_(work), kv_(kv),
       mtp_kv_(mtp_kv), state_(state), io_(io), prefill_hidden_(prefill_hidden),
       prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base), batch_text_kv_(batch_text_kv),
@@ -575,46 +608,17 @@ TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weight
             dimension(p.rows));
     }
     if (config_.ple) {
-        // A config that declares PLE layers gets a stage or an error: running the blocks without
-        // their n-gram embeddings would be a different model.
-        if (!parameters_.text.ple_table) {
+        // A config that declares PLE layers gets a Program-owned stage or an error: running the
+        // blocks without their n-gram embeddings would be a different model, and a per-pass stage
+        // would restart the nine-column history at every round.
+        if (ple == nullptr || !ple->present()) {
             throw std::invalid_argument(
-                "text: the config declares ple_layer_ids but no table source was provided; PLE "
-                "needs PleTableSource, which only the load path can build from a Reader");
+                "text: the config declares ple_layer_ids but this entry has no Program PLE state; "
+                "PLE runs on the ordinary decode, the prefill chunk, the merged prefill batch and "
+                "the verify rectangle (DFlash drafts, the DFlash target card and causal scoring do "
+                "not carry it)");
         }
-        if (parameters_.text.ple_eos < 0) {
-            throw std::invalid_argument(
-                "text: PLE requires the request's EOS id for the n-gram hash; the Program owns it");
-        }
-        std::vector<std::optional<qwen4_exp::PleLayerWeights>> layers;
-        layers.reserve(parameters_.text.layers.size());
-        for (const auto& block : parameters_.text.layers) {
-            if (!block.ple) {
-                layers.push_back(std::nullopt);
-                continue;
-            }
-            qwen4_exp::PleLayerWeights weights;
-            weights.projection  = block.ple->projection.weight;
-            weights.policy      = block.ple->projection.policy;
-            weights.norm_key    = block.ple->norm_key;
-            weights.norm_query  = block.ple->norm_query;
-            weights.norm_conv   = block.ple->norm_conv;
-            weights.convolution = block.ple->convolution;
-            weights.rms_epsilon = config_.rms_norm_eps;
-            layers.push_back(std::move(weights));
-        }
-        qwen4_exp::PlePrepareOptions options;
-        // One window per pass, two so a step's reads overlap the next step's commit. The staging
-        // holds `prefill_chunk` prepared positions: one wide prefill row, or a batch rectangle of
-        // at most that many columns, and the stage refuses a window wider than that. The history
-        // pool is per resident sequence, so its depth is the Linear Attention state pool's - the one
-        // identity a batch pass already carries per row.
-        options.max_positions = prefill_chunk_;
-        options.windows       = 2;
-        const auto slots      = std::max<std::uint32_t>(1, state_.slot_count());
-        ple_                  = std::make_unique<qwen4_exp::PleTextStage>(
-            *parameters_.text.ple_table, parameters_.text.ple_eos, ctx_, std::move(layers),
-            prefill_chunk_, static_cast<std::uint32_t>(kMaximumConcurrency), slots, options);
+        ple_ = ple;
     }
 }
 
@@ -1103,30 +1107,30 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
 
         Tensor x = work_.alloc(DType::BF16, {dimension(config_.hidden_size), batch});
         ops::embedding(ids, *embed_, x, stream);
+        PlePassWindow ple_window(ple_, ctx_.execution_view());
         if (ple_) {
             // One sequence per window: this step's token is the window and the stage keeps the
             // two-token hash tail from the window it saw last. The hash reads Host ids, so this
             // single int is the only readback the PLE step adds. The row's slot is the sequence's
-            // Linear Attention state slot, the identity the engine already assigns per sequence.
+            // lane, the identity the engine already assigns per resident request.
             if (batch != 1) {
                 throw std::invalid_argument(
                     "text: PLE is driven one sequence at a time on this entry; a multi-row decode "
-                    "needs each row's sequence slot on the Host");
+                    "needs each row's lane on the Host");
             }
             std::int32_t token = 0;
             CUDA_CHECK(cudaMemcpyAsync(&token, ids.data, sizeof(token), cudaMemcpyDeviceToHost,
                                        stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
-            const std::array<std::int32_t, 1> slot{linear_state_source_slot_};
+            const std::array<std::int32_t, 1> slot{ple_lane_};
             const std::array<std::uint32_t, 1> live{1};
             const qwen4_exp::PleStepWindow window{.ids           = std::span<const std::int32_t>(
                                                        &token, 1),
-                                                  .slots         = slot,
-                                                  .valid_columns = live,
-                                                  .tokens        = 1};
-            ple_->begin(window, ctx_.execution_view());
-            ple_window_ = true;
-            ple_tokens_ = 1;
+                                                   .slots         = slot,
+                                                   .valid_columns = live,
+                                                   .tokens        = 1};
+            ple_->stage().begin(window, ctx_.execution_view());
+            ple_window.opened(1, false);
         }
         // A decode column is one token, so the pass's live-column count is the pool's row of ones
         // and the record base is the row's own position; both stay device tensors, which keeps the
@@ -1149,11 +1153,7 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
                                                        qsa.active ? &qsa.offsets : nullptr);
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
-        if (ple_) {
-            ple_->end(ctx_.execution_view());
-            ple_window_ = false;
-            ple_tokens_ = 0;
-        }
+        ple_window.close();
         final_hidden(x, hidden, batch);
         // Q67: zero-weight scratch rows for the row-independent output projection. The class width
         // is the compiled shape; the extra rows read zero hidden and their logits are never sampled.
@@ -1191,6 +1191,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
                                            const Tensor& rope_positions,
                                            const Tensor& valid_columns, const Tensor& kv_table_rows,
                                            const Tensor& linear_state_source_slots,
+                                           std::span<const std::int32_t> ple_slots,
                                            ops::CausalAttentionExecutionEnvelope envelope,
                                            Tensor& hidden, Tensor& logits, Tensor& target_tokens,
                                            Tap& tap) {
@@ -1232,6 +1233,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor x        = work_.alloc(DType::BF16, {dimension(config_.hidden_size), columns});
         Tensor flat_ids = ids.view({columns});
         ops::embedding(flat_ids, *embed_, x, stream);
+        PlePassWindow ple_window(ple_, ctx_.execution_view());
         // The verify rectangle's metadata is the pass's own: its live columns are `valid_columns`,
         // its record base is each row's first position, and the record offset is zero.
         QsaPassBinding qsa;
@@ -1251,21 +1253,21 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
             // needs each one's logits, so each one's embedding must be gathered - but only the
             // accepted prefix may advance the nine-column history, and that prefix is published
             // after the verifier runs. The window is therefore left open: the layers apply here,
-            // and `ple_commit_verify(accepted)` commits each block by the accepted columns.
+            // and `commit_verify(accepted)` (target_accept) commits each block by the accepted
+            // columns and closes it.
             //
             // The hash reads Host ids, and a window names each row's slot and live columns, so the
-            // rectangle's ids, its per-row sequence slot (the Linear Attention state slot, which is
-            // the identity the caller already assigned) and its live columns are copied back once.
-            // The flat layout is row-major by sequence (`b*width + t`), which is the layout both the
-            // embedding above and the window name.
+            // rectangle's ids, its per-row lane (the identity the Program already assigns per
+            // resident sequence) and its live columns are copied back once. The flat layout is
+            // row-major by sequence (`b*width + t`), which is the layout both the embedding above
+            // and the window name.
+            if (ple_slots.size() != static_cast<std::size_t>(batch)) {
+                throw std::invalid_argument("text: a verify rectangle needs one PLE lane per row");
+            }
             std::vector<std::int32_t> host_ids(static_cast<std::size_t>(columns));
-            std::vector<std::int32_t> host_slots(static_cast<std::size_t>(batch));
             std::vector<std::int32_t> host_valid(static_cast<std::size_t>(batch));
             CUDA_CHECK(cudaMemcpyAsync(host_ids.data(), flat_ids.data,
                                        host_ids.size() * sizeof(std::int32_t),
-                                       cudaMemcpyDeviceToHost, stream));
-            CUDA_CHECK(cudaMemcpyAsync(host_slots.data(), linear_state_source_slots.data,
-                                       host_slots.size() * sizeof(std::int32_t),
                                        cudaMemcpyDeviceToHost, stream));
             CUDA_CHECK(cudaMemcpyAsync(host_valid.data(), valid_columns.data,
                                        host_valid.size() * sizeof(std::int32_t),
@@ -1281,13 +1283,11 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
             }
             const qwen4_exp::PleStepWindow window{
                 .ids           = host_ids,
-                .slots         = std::span<const std::int32_t>(host_slots),
+                .slots         = ple_slots,
                 .valid_columns = std::span<const std::uint32_t>(live),
                 .tokens        = width};
-            ple_->begin(window, ctx_.execution_view());
-            ple_window_          = true;
-            ple_tokens_          = width;
-            ple_deferred_commit_ = true;
+            ple_->stage().begin(window, ctx_.execution_view());
+            ple_window.opened(width, true);
         }
         if constexpr (Tap::enabled) { tap.begin(x); }
         try {
@@ -1295,12 +1295,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         } catch (...) {
             // A half-run rectangle must not leave a window behind: the next pass's begin would be
             // refused with a message about this one.
-            if (ple_deferred_commit_) {
-                ple_->end(ctx_.execution_view());
-                ple_window_          = false;
-                ple_tokens_          = 0;
-                ple_deferred_commit_ = false;
-            }
+            if (ple_ && ple_->window_deferred()) { ple_->abort_window(ctx_.execution_view()); }
             throw;
         }
         if constexpr (requires { tap.capture_positions(cache_positions, stream); }) {
@@ -1321,28 +1316,30 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       const Tensor& rope_positions, const Tensor& valid_columns,
                                       const Tensor& kv_table_rows,
                                       const Tensor& linear_state_source_slots,
+                                      std::span<const std::int32_t> ple_slots,
                                       ops::CausalAttentionExecutionEnvelope envelope,
                                       Tensor& hidden, Tensor& logits, Tensor& target_tokens) {
     NullTap tap;
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
-                             linear_state_source_slots, envelope, hidden, logits, target_tokens,
-                             tap);
+                             linear_state_source_slots, ple_slots, envelope, hidden, logits,
+                             target_tokens, tap);
 }
 
 void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                                       const Tensor& rope_positions, const Tensor& valid_columns,
                                       const Tensor& kv_table_rows,
                                       const Tensor& linear_state_source_slots,
+                                      std::span<const std::int32_t> ple_slots,
                                       ops::CausalAttentionExecutionEnvelope envelope,
                                       Tensor& hidden, Tensor& logits, Tensor& target_tokens,
                                       DFlashFeatureSink& sink) {
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
-                             linear_state_source_slots, envelope, hidden, logits, target_tokens,
-                             sink);
+                             linear_state_source_slots, ple_slots, envelope, hidden, logits,
+                             target_tokens, sink);
 }
 
 void TextContext::ple_commit_verify(const Tensor& accepted_columns) {
-    if (!ple_ || !ple_window_ || !ple_deferred_commit_) {
+    if (!ple_ || !ple_->window_deferred()) {
         throw std::logic_error(
             "text: no verify rectangle is awaiting its PLE commit (the window is either closed or "
             "was opened by a pass whose acceptance is its live columns)");
@@ -1350,13 +1347,7 @@ void TextContext::ple_commit_verify(const Tensor& accepted_columns) {
     // The accepted prefix is the verifier's own I32 [batch]; an entry outside [0, live columns] is
     // refused where the layers check their operands, and an unaccepted column never reaches the
     // pool because commit only advances by this prefix.
-    for (std::uint32_t layer = 0; layer < parameters_.text.layers.size(); ++layer) {
-        if (ple_->has_layer(layer)) ple_->commit(layer, accepted_columns, ctx_.execution_view());
-    }
-    ple_->end(ctx_.execution_view());
-    ple_window_          = false;
-    ple_tokens_          = 0;
-    ple_deferred_commit_ = false;
+    ple_->commit_verify(accepted_columns, parameters_.text.layers.size(), ctx_.execution_view());
 }
 
 void TextContext::prefill_batch(std::span<const std::int32_t> ids,
@@ -1366,7 +1357,8 @@ void TextContext::prefill_batch(std::span<const std::int32_t> ids,
                                 std::span<const std::int32_t> kv_table_rows,
                                 std::span<const std::int32_t> state_source_slots,
                                 std::span<const std::int32_t> state_destination_slots,
-                                std::int32_t width, std::int32_t batch,
+                                std::span<const std::int32_t> ple_slots, std::int32_t width,
+                                std::int32_t batch,
                                 ops::CausalAttentionExecutionEnvelope envelope,
                                 std::span<std::int32_t> next_tokens,
                                 std::span<Tensor* const> tail_hidden_rows) {
@@ -1441,19 +1433,22 @@ void TextContext::prefill_batch(std::span<const std::int32_t> ids,
     ScopedValue<const Tensor*> qsa_offsets_binding(active_qsa_offsets_,
                                                    qsa.active ? &qsa.offsets : nullptr);
     if (prefill_gpu_timer_ != nullptr) { prefill_gpu_timer_->start(); }
+    PlePassWindow ple_window(ple_, ctx_.execution_view());
     if (ple_) {
         // PLE for a merged prefill rectangle: one window over every row's columns, each row naming
-        // its own history slot (the sequence's Linear Attention state slot, which the caller passes
-        // as `state_source_slots`). Every row accepts its live columns - a prefill has no verifier -
-        // so run_layers commits each of them as it applies the layer.
+        // its own lane. Every row accepts its live columns - a prefill has no verifier - so
+        // run_layers commits each of them as it applies the layer.
         //
-        // Host ids, slots and live columns are already at hand: `ids` is the caller's Host span in
-        // the same row-major order the Device copy uses, and the two metadata rows are the spans
-        // this entry validates above.
-        if (ple_deferred_commit_ || ple_window_) {
+        // Host ids and live columns are already at hand: `ids` is the caller's Host span in the
+        // same row-major order the Device copy uses, and the two metadata rows are the spans this
+        // entry validates above.
+        if (ple_->window_open()) {
             throw std::logic_error(
                 "text: a previous verify rectangle left its PLE window open; it must be committed "
                 "with ple_commit_verify before another pass can gather a table window");
+        }
+        if (ple_slots.size() != lane_count) {
+            throw std::invalid_argument("text: a prefill rectangle needs one PLE lane per row");
         }
         std::vector<std::uint32_t> live(static_cast<std::size_t>(batch));
         for (std::int32_t row = 0; row < batch; ++row) {
@@ -1466,28 +1461,14 @@ void TextContext::prefill_batch(std::span<const std::int32_t> ids,
         }
         const qwen4_exp::PleStepWindow window{
             .ids           = std::span<const std::int32_t>(ids.data(), std::size_t(columns)),
-            .slots         = state_source_slots,
+            .slots         = ple_slots,
             .valid_columns = std::span<const std::uint32_t>(live),
             .tokens        = width};
-        ple_->begin(window, ctx_.execution_view());
-        ple_window_ = true;
-        ple_tokens_ = width;
+        ple_->stage().begin(window, ctx_.execution_view());
+        ple_window.opened(width, false);
     }
-    try {
-        run_layers(x, Phase::Verify);
-    } catch (...) {
-        if (ple_window_) {
-            ple_->end(ctx_.execution_view());
-            ple_window_ = false;
-            ple_tokens_ = 0;
-        }
-        throw;
-    }
-    if (ple_window_) {
-        ple_->end(ctx_.execution_view());
-        ple_window_ = false;
-        ple_tokens_ = 0;
-    }
+    run_layers(x, Phase::Verify);
+    ple_window.close();
     // Prefill only needs the token that follows each row's last prompt token, so the projection runs
     // over one column per row instead of the whole rectangle: a [vocab, width, batch] logits tensor
     // at width 1024 would be hundreds of megabytes for one useful column. With four residual streams
@@ -2489,7 +2470,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     // window was gathered from, and it precedes both mixer branches. PLE rewrites
                     // `residual` and re-derives `normalized` from it with THIS block's input norm,
                     // which is exactly what hc_mix_into consumes below.
-                    if (!ple_ || !ple_window_) {
+                    if (!ple_ || !ple_->window_open()) {
                         throw std::logic_error(
                             "text: a PLE block ran without a table window; this pass does not "
                             "drive PLE (prefill, batch prefill, ordinary decode and the verify "
@@ -2514,20 +2495,21 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                         throw std::logic_error(
                             "text: the PLE block's columns do not factor into the pass's rows");
                     }
-                    if (seq_width != ple_tokens_) {
+                    if (seq_width != ple_->window_tokens()) {
                         throw std::logic_error(
                             "text: the PLE window's width differs from the block's columns");
                     }
                     Tensor residual = hc_.residual.view({width, streams, seq_width, seq_batch});
                     Tensor normalized = hc_.normalized.view({width, streams, seq_width, seq_batch});
-                    ple_->apply(static_cast<std::uint32_t>(layer), residual, normalized,
-                                block.input_norm.view({width, streams}), config_.rms_norm_eps,
-                                ctx_.execution_view());
+                    ple_->stage().apply(static_cast<std::uint32_t>(layer), residual, normalized,
+                                        block.input_norm.view({width, streams}),
+                                        config_.rms_norm_eps, ctx_.execution_view());
                     // A verify rectangle's acceptance is only known after the verifier runs, so its
-                    // window is committed by ple_commit_verify(); every other pass accepts the
-                    // columns it just ran.
-                    if (!ple_deferred_commit_)
-                        ple_->commit(static_cast<std::uint32_t>(layer), ctx_.execution_view());
+                    // window is committed by commit_verify(); every other pass accepts the columns
+                    // it just ran.
+                    if (!ple_->window_deferred())
+                        ple_->stage().commit(static_cast<std::uint32_t>(layer),
+                                             ctx_.execution_view());
                 }
                 if (full) {
                     if (hc) {
@@ -2807,28 +2789,23 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             }
             chunk_probe.mark(ChunkProbe::kEmbed);
             if constexpr (Tap::enabled) { tap.begin(x); }
+            PlePassWindow ple_window(ple_, ctx_.execution_view());
             if (ple_) {
                 // One window per chunk: the chunk's own ids are the window, every column is live,
-                // and the sequence keeps its own history slot (its Linear Attention state slot).
-                // `ids` is the pass's Host view, which is what the n-gram hash needs; the Device
-                // ids below are a separate copy of it.
-                const std::array<std::int32_t, 1> slot{linear_state_source_slot_};
+                // and the sequence keeps its own lane. `ids` is the pass's Host view, which is what
+                // the n-gram hash needs; the Device ids below are a separate copy of it.
+                const std::array<std::int32_t, 1> slot{ple_lane_};
                 const std::array<std::uint32_t, 1> live{static_cast<std::uint32_t>(len)};
                 const qwen4_exp::PleStepWindow window{
                     .ids           = std::span<const std::int32_t>(ids.data(), std::size_t(len)),
                     .slots         = slot,
                     .valid_columns = live,
                     .tokens        = len};
-                ple_->begin(window, ctx_.execution_view());
-                ple_window_ = true;
-                ple_tokens_ = len;
+                ple_->stage().begin(window, ctx_.execution_view());
+                ple_window.opened(len, false);
             }
             run_layers(x, Phase::Prefill, tap);
-            if (ple_) {
-                ple_->end(ctx_.execution_view());
-                ple_window_ = false;
-                ple_tokens_ = 0;
-            }
+            ple_window.close();
             if constexpr (requires { tap.capture_positions(positions, s); }) {
                 tap.capture_positions(positions, s);
             }

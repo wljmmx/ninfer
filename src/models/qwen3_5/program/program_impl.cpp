@@ -1,6 +1,11 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/storage/checkpoint_tier_adapter.h"
 #include "models/qwen3_5/program/context_work.h"
+#include "models/qwen3_5/program/storage/ple_state.h"
+// The factory hands back an owning stage, so this translation unit has to see the complete type to
+// destroy the argument the move leaves behind.
+#include "models/qwen4_exp/execution/ple_layer.h"
+#include "models/qwen3_5/program/kv_tier_stats.h"
 #include "models/qwen3_5/program/execution_context.h"
 #include "models/qwen3_5/execution/linear.h"
 #include "core/startup.h"
@@ -103,8 +108,17 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       context_cache(plan.context_cache), prefill_chunk(plan.prefill_chunk),
       draft_window(plan.draft_window), speculative_backend(plan.speculative_backend),
       kv_storage(plan.kv_storage), proposal_head(plan.proposal_head),
-      vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
+      vision_enabled(plan.features.vision),
+      // Qwen4Exp's n-gram embedding is Host-driven: a window hashes on the Host, reads the table
+      // from disk and uploads the result, so a captured graph would replay the first window's
+      // embedding for every step. A model that declares PLE therefore runs eager, and says so once.
+      use_cuda_graph(plan.use_cuda_graph && !parameters_in.model.config().text.ple),
       causal_scoring(plan.causal_scoring), kv_payload_bytes(plan.persistent.kv_payload_bytes),
+      kv_logical_page_groups(plan.logical_page_groups != 0 ? plan.logical_page_groups
+                                                          : plan.main_page_groups),
+      kv_resident_page_groups(plan.resident_page_groups != 0 ? plan.resident_page_groups
+                                                            : plan.main_page_groups),
+      host_kv_payload_bytes(plan.host_kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}),
@@ -158,6 +172,16 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     decoder      = std::make_unique<qwen3_5::DecoderState>(backing, plan.persistent.decoder);
     state_images = std::make_unique<StateImageDevicePool>(backing, plan.persistent.state_images);
     configure_kv_l2_residency(device_in, *decoder);
+    // Qwen4Exp's n-gram stage: one owner for the Program's lifetime, so a sequence's nine-column
+    // history and hash tail are continuous across rounds instead of restarting with each pass.
+    ple = std::make_unique<detail::PleProgramState>(
+        detail::make_ple_stage(parameters, device, prefill_chunk));
+    if (ple->present() && plan.use_cuda_graph) {
+        std::fprintf(stderr,
+                     "[ple] CUDA Graph capture stays off: PLE hashes, reads and uploads on the Host "
+                     "between launches\n");
+        std::fflush(stderr);
+    }
     if (plan.persistent.replay_records) {
         replay_records.emplace(backing, *plan.persistent.replay_records);
         replay_fold.emplace(*replay_records, state_images->linear().all_layers_view());
@@ -258,6 +282,22 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             }
         }
         phase.complete(host_bytes, host_bytes);
+        // port (sm_89): the Host tier the residency plan pays for, priced before any page moves into
+        // it. Printed for the same reason the expert tier prints its arena: a 256K plan that silently
+        // fell back to a smaller arena would only show up as a mid-flight "Host tier is full".
+        if (host_kv_payload_bytes != 0 || kv_resident_page_groups != kv_logical_page_groups) {
+            constexpr double kMib = 1024.0 * 1024.0;
+            std::fprintf(stderr,
+                         "[kv-host] arena=%.1f MiB %s occupied=%.1f MiB reserved=%.1f MiB "
+                         "payload=%.1f MiB resident=%u/%u page(s)\n",
+                         static_cast<double>(host_context_arena->capacity_bytes()) / kMib,
+                         host_context_arena->pinned() ? "pinned" : "pageable",
+                         static_cast<double>(host_context_arena->occupied_bytes()) / kMib,
+                         static_cast<double>(host_context_arena->reserved_bytes()) / kMib,
+                         static_cast<double>(host_kv_payload_bytes) / kMib,
+                         kv_resident_page_groups, kv_logical_page_groups);
+            std::fflush(stderr);
+        }
     }
     state_store =
         std::make_unique<StateImageStore>(*state_images, host_state_images.get(), logical_states);
@@ -505,7 +545,7 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             const std::uint32_t nominal = std::min(prefill_chunk, predictor_count - cursor);
             execution::PrefillContext schedule_state{
                 {device, parameters, work, state_images->linear(), nullptr, io, prefill_hidden,
-                 prefill_chunk, proposal_head},
+                 prefill_chunk, proposal_head, ple.get()},
                 decoder->text_kv.execution_view(text_kv_addresses->execution_row(*address)),
                 {},
                 decoder->text_kv,
@@ -654,6 +694,17 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
         };
     }
     out.kv_payload_bytes             = kv_payload_bytes;
+    // port (sm_89): the residency split, read back from the running Program. The swap counters are
+    // the same ones the tier dump prints, so a test can assert "a fetch happened" without parsing
+    // a log.
+    out.kv_logical_page_groups       = kv_logical_page_groups;
+    out.kv_resident_page_groups      = kv_resident_page_groups;
+    out.kv_host_payload_bytes        = host_kv_payload_bytes;
+    out.kv_fetched_pages             = kv_tier_stats().fetched_pages;
+    out.kv_spilled_pages             = kv_tier_stats().spilled_pages;
+    out.kv_fetched_bytes             = kv_tier_stats().fetched_bytes;
+    out.kv_spilled_bytes             = kv_tier_stats().spilled_bytes;
+    out.host_context_pinned          = host_context_arena != nullptr && host_context_arena->pinned();
     // 13.4: the LIVE capacity edge, not the construction-time resolution. A runtime shrink moves
     // the pool's edge (and a grow moves it back), so reporting the resolution here made the
     // console, the monitor and the controller's own read-back all name an upper bound the pool no
