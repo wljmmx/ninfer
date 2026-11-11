@@ -154,6 +154,13 @@ public:
                              const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
                              ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
                              Tensor& logits, Tensor& target_tokens, DFlashFeatureSink& sink);
+    // Qwen4Exp PLE after a verify rectangle: the window was opened over every candidate column and
+    // the layer applied to all of them (the verifier needs each column's logits), but the nine-column
+    // history may only advance by the prefix the verifier accepted. `accepted_columns` is the same
+    // I32 [batch] the acceptance op publishes, and each accepted value must not exceed that row's
+    // live columns. Without this call the next pass refuses to open a PLE window instead of running
+    // a history that silently skipped the round.
+    void ple_commit_verify(const Tensor& accepted_columns);
     // Q67/S1: one merged prefill pass. Same per-row bindings the verify path uses - per-row KV table
     // rows, per-row positions, per-row valid columns, per-row state slots - which is what keeps the
     // rows block-diagonal without a mask: row i only ever reads KV row i. Host spans are copied in
@@ -338,6 +345,11 @@ private:
     std::unique_ptr<qwen4_exp::PleTextStage> ple_;
     std::int32_t ple_tokens_ = 0;
     bool ple_window_         = false;
+    // The verify rectangle opens its window over every candidate column, but only the accepted
+    // prefix may advance the history pool, and acceptance is known after the verifier runs. The
+    // pass therefore applies the layer without committing and leaves the window open for
+    // `ple_commit_verify(accepted)`, which the caller that owns acceptance must issue.
+    bool ple_deferred_commit_ = false;
     // The live four-stream state of the current call. Allocated by run_layers from the same recipe
     // the workspace plan uses, so the two reserve identical bytes.
     workspace::TextHcRoots hc_{};

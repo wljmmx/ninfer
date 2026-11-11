@@ -36,6 +36,16 @@ set_tests_properties(ninfer_qwen4_exp_ple_block_test PROPERTIES
   SKIP_RETURN_CODE 77
   LABELS "gpu")
 
+# port (sm_89): multi-sequence passes. A verify rectangle applies the layer over every candidate
+# column but may only advance the history by the accepted prefix, and a merged prefill advances each
+# sequence's own slot; both are compared against the same sequences run alone.
+ninfer_add_test(ninfer_qwen4_exp_ple_multiseq_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ple_multiseq.cpp"
+  LIBRARIES ninfer_ple ninfer_ops ninfer::json)
+set_tests_properties(ninfer_qwen4_exp_ple_multiseq_test PROPERTIES
+  SKIP_RETURN_CODE 77
+  LABELS "gpu")
+
 ninfer_add_test(ninfer_qwen4_exp_parameters_banked_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_parameters_banked.cpp"
   LIBRARIES ninfer_model_runtime)
