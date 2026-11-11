@@ -236,7 +236,9 @@ void check_table_and_prepare() {    std::vector<std::byte> payload;
     check(c.vocab_sizes[0] == std::int64_t(kRows) && c.offsets[15] == 0, "hash head domain");
 
     for (std::uint32_t row = 0; row < kRows; ++row)
-        check(table.row(row).offset == row * kPleRowBytes, "paged row offset");
+        check(table.row(row).part_offsets[0] == row * kPleRowBytes &&
+                  table.row(row).parts == 1 && table.encoding() == PleRowEncoding::Nf4PagedG16,
+              "paged row offset");
 
     constexpr std::uint32_t max_positions = 8;
     std::vector<std::uint16_t> first(max_positions * kPleEmbeddingElements, 0x7fa1);

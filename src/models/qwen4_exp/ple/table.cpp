@@ -1,5 +1,7 @@
 #include "models/qwen4_exp/ple/table.h"
 
+#include "ops/linear/q4/q4_row_decode.h"
+
 #include <algorithm>
 #include <bit>
 #include <limits>
@@ -28,7 +30,43 @@ std::uint64_t paged_row_offset(const WeightGeometry& geometry, std::uint64_t row
                        (row % geometry.rows_per_page) * geometry.row_bytes, "PLE row offset");
 }
 
+// The encoding a shard's declared geometry names. One table is one encoding: the reader decodes
+// every row of every shard the same way, so a mixed table is refused here instead of half-decoded.
+PleRowEncoding row_encoding(const WeightGeometry& geometry) {
+    if (geometry.format == QType::NF4_G16_E4M3FN && geometry.layout == QuantLayout::RowPagedG16_4K)
+        return PleRowEncoding::Nf4PagedG16;
+    if (geometry.format == QType::Q4_G64_FP16 && geometry.layout == QuantLayout::RowSplit)
+        return PleRowEncoding::Q4G64RowSplit;
+    throw artifact::ArtifactError(
+        "PLE table: the declared encoding is neither nf4_g16_e4m3fn/row_paged_g16_4k_v1 nor "
+        "q4_g64_fp16/row_split_k128_v1");
+}
+
+std::size_t encoded_row_bytes(PleRowEncoding encoding) {
+    return encoding == PleRowEncoding::Q4G64RowSplit ? kPleQ4RowBytes : kPleRowBytes;
+}
+
 } // namespace
+
+void decode_ple_row(const PleRowSource& source, std::span<const std::byte> encoded,
+                    std::span<std::uint16_t> output) {
+    switch (source.encoding) {
+    case PleRowEncoding::Nf4PagedG16:
+        if (source.lut == nullptr) throw std::logic_error("PLE row: NF4 row has no codebook");
+        decode_nf4_row(encoded, *source.lut, output);
+        return;
+    case PleRowEncoding::Q4G64RowSplit: {
+        // The parts are concatenated in order, so the code plane is the row's first span and the
+        // binary16 scale plane the second.
+        const auto code_bytes = std::size_t(source.part_bytes[0]);
+        if (source.parts != 2 || encoded.size() < code_bytes)
+            throw std::logic_error("PLE row: q4 row is not a code plane followed by its scales");
+        ops::q4::decode_q4_g64_row(encoded.first(code_bytes), encoded.subspan(code_bytes), output);
+        return;
+    }
+    }
+    throw std::logic_error("PLE row: unknown encoding");
+}
 
 struct PleTableSource::Impl {
     struct Shard {
@@ -36,11 +74,14 @@ struct PleTableSource::Impl {
         WeightGeometry geometry;
         Nf4Bf16Lut lut;
         std::uint64_t row_end;
+        std::uint64_t row_begin;
+        PleRowEncoding encoding;
     };
 
     artifact::FileBacking backing;
     std::vector<Shard> shards;
     PleHashControls controls;
+    PleRowEncoding encoding = PleRowEncoding::Nf4PagedG16;
     std::uint64_t rows       = 0;
     std::size_t max_segments = 0;
 };
@@ -53,9 +94,15 @@ PleTableSource::PleTableSource(const artifact::Reader& reader,
     if (shard_objects.empty()) throw ArtifactError("PLE table has no shards");
     for (const auto object : shard_objects) {
         const auto& g = reader.geometry(object);
-        if (g.format != QType::NF4_G16_E4M3FN || g.layout != QuantLayout::RowPagedG16_4K ||
-            g.shape.size() != 2 || g.shape[1] != kPleRowElements) {
-            throw ArtifactError("PLE requires complete NF4 shards with width 160");
+        if (!supported_ple_table(g.format, g.layout, g.shape.size() == 2 ? g.shape[1] : 0) ||
+            g.shape.size() != 2) {
+            throw ArtifactError("PLE requires a supported encoding with width 160");
+        }
+        const auto encoding = row_encoding(g);
+        if (impl_->rows == 0) {
+            impl_->encoding = encoding;
+        } else if (encoding != impl_->encoding) {
+            throw ArtifactError("PLE table shards mix encodings");
         }
         impl_->rows = checked_add(impl_->rows, g.shape[0], "PLE rows");
     }
@@ -66,19 +113,31 @@ PleTableSource::PleTableSource(const artifact::Reader& reader,
     std::uint64_t row_end = 0;
     for (const auto object : shard_objects) {
         const auto& g = impl_->backing.geometry(object);
-        std::array<std::byte, 4> word{};
-        reader.read_into(checked_add(reader.directory().tensor(object).offset, g.divisor_offset,
-                                     "PLE divisor offset"),
-                         word);
-        const auto divisor  = std::bit_cast<float>(read_u32_le(word.data()));
+        const auto encoding = row_encoding(g);
+        Nf4Bf16Lut lut{};
+        if (encoding == PleRowEncoding::Nf4PagedG16) {
+            std::array<std::byte, 4> word{};
+            reader.read_into(checked_add(reader.directory().tensor(object).offset, g.divisor_offset,
+                                         "PLE divisor offset"),
+                             word);
+            const auto divisor = std::bit_cast<float>(read_u32_le(word.data()));
+            try {
+                lut = make_nf4_bf16_lut(divisor);
+            } catch (const std::invalid_argument& e) {
+                throw ArtifactError(reader.directory().tensor(object).id + ": " + e.what());
+            }
+        } else if (g.code_bytes_per_row != 128 || g.scale_bytes_per_row != 8 ||
+                   g.group_size != 64) {
+            // The decoder above is the G64/q4 row shape; anything else would silently read the
+            // wrong plane offsets, so it is refused with the geometry in the message.
+            throw ArtifactError(reader.directory().tensor(object).id +
+                                ": q4 PLE rows are not G64 rows of 128 code + 8 scale bytes");
+        }
         const auto view     = impl_->backing.object(object);
         impl_->max_segments = std::max(impl_->max_segments, view.segments.size());
         row_end += g.shape[0];
-        try {
-            impl_->shards.push_back({view, g, make_nf4_bf16_lut(divisor), row_end});
-        } catch (const std::invalid_argument& e) {
-            throw ArtifactError(reader.directory().tensor(object).id + ": " + e.what());
-        }
+        impl_->shards.push_back(
+            {view, g, lut, row_end, row_end - g.shape[0], encoding});
     }
     const auto& resource = reader.directory().object(controls);
     if (!std::holds_alternative<ResourceObject>(resource) || object_bytes(resource) != 280)
@@ -108,8 +167,36 @@ PleRowSource PleTableSource::row(std::uint32_t global_row) const {
     const auto it = std::upper_bound(
         impl_->shards.begin(), impl_->shards.end(), global_row,
         [](std::uint32_t row, const Impl::Shard& shard) { return row < shard.row_end; });
-    const auto local = global_row - (it->row_end - it->geometry.shape[0]);
-    return {it->object, paged_row_offset(it->geometry, local), &it->lut};
+    const auto local = global_row - it->row_begin;
+    PleRowSource out{it->object, it->encoding, nullptr, 0, {}, {}};
+    if (it->encoding == PleRowEncoding::Nf4PagedG16) {
+        out.lut              = &it->lut;
+        out.parts            = 1;
+        out.part_offsets[0]  = paged_row_offset(it->geometry, local);
+        out.part_bytes[0]    = std::uint32_t(kPleRowBytes);
+        return out;
+    }
+    // q4_g64 in row_split_k128_v1: the base-code plane then the binary16 scale plane, each row's
+    // slice a contiguous run because every G64 group is 32 code bytes and 2 scale bytes.
+    out.parts           = 2;
+    out.part_offsets[0] = checked_mul(local, it->geometry.code_bytes_per_row, "PLE row offset");
+    out.part_bytes[0]   = std::uint32_t(it->geometry.code_bytes_per_row);
+    out.part_offsets[1] = checked_add(it->geometry.scale_offset,
+                                      checked_mul(local, it->geometry.scale_bytes_per_row,
+                                                  "PLE row scale offset"),
+                                      "PLE row scale offset");
+    out.part_bytes[1]   = std::uint32_t(it->geometry.scale_bytes_per_row);
+    return out;
+}
+
+PleRowEncoding PleTableSource::encoding() const noexcept { return impl_->encoding; }
+
+std::size_t PleTableSource::row_encoded_bytes() const noexcept {
+    return encoded_row_bytes(impl_->encoding);
+}
+
+std::uint32_t PleTableSource::row_parts() const noexcept {
+    return impl_->encoding == PleRowEncoding::Q4G64RowSplit ? 2 : 1;
 }
 
 std::uint64_t PleTableSource::rows() const noexcept { return impl_->rows; }

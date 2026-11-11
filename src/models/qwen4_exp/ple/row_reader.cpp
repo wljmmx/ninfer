@@ -72,7 +72,7 @@ private:
 
 struct CacheEntry {
     std::uint32_t row = none;
-    std::array<std::byte, kPleRowBytes> bytes;
+    std::array<std::byte, kPleMaxRowBytes> bytes;
 };
 
 struct alignas(128) CacheSet {
@@ -90,8 +90,11 @@ struct RowReader::Impl {
 
     struct Row {
         std::uint32_t id = 0, head = none, parts = 0, active = 0;
-        const Nf4Bf16Lut* lut = nullptr;
-        std::array<std::byte, kPleRowBytes> bytes;
+        // The row's own source (object, encoding, per-part spans) so its decode never re-derives
+        // the geometry, and `encoded` bytes of it were actually copied in.
+        PleRowSource source;
+        std::size_t encoded = 0;
+        std::array<std::byte, kPleMaxRowBytes> bytes;
         std::exception_ptr error;
         bool ready = false, abandoned = false, indexed = false;
     };
@@ -137,9 +140,13 @@ struct RowReader::Impl {
     Impl(const PleTableSource& table, std::uint32_t count, std::uint32_t per_owner,
          std::uint32_t depth, std::size_t cache_bytes)
         : table(table), owner_rows(per_owner),
-          // Further segments start at a V3 file's 4 KiB-aligned payload prefix. Only the
-          // first segment can straddle a read page; each later segment is at most 90 bytes.
-          part_capacity(std::min<std::size_t>(kPleRowBytes, table.max_row_segments() + 1)),
+          // Further segments start at a V3 file's 4 KiB-aligned payload prefix, so only the
+          // first segment of one row can straddle a read page. A row is one span per encoding
+          // part (a row_split q4 row is a code plane plus a scale plane), and each part can span
+          // at most one page boundary in each of its segments.
+          part_capacity(std::min<std::size_t>(
+              kPleMaxRowBytes,
+              std::size_t(table.row_parts()) * (table.max_row_segments() + 1))),
           owners(count), targets(capacity(std::uint64_t(count) * per_owner)), rows(targets.size()),
           fragments(capacity(rows.size() * part_capacity)), pages(fragments.size()),
           inflight(depth, none), ready_rows(rows.size()), row_index(rows.size()),
@@ -270,7 +277,7 @@ struct RowReader::Impl {
         std::array<std::uint16_t, kPleRowElements> decoded;
         if (!row.abandoned && !row.error) {
             try {
-                decode_nf4_row(row.bytes, *row.lut, decoded);
+                decode_ple_row(row.source, std::span(row.bytes.data(), row.encoded), decoded);
                 cache_row(row);
             } catch (...) { row.error = std::current_exception(); }
         }
@@ -359,73 +366,27 @@ void RowReader::request(std::uint32_t owner_id, std::uint32_t destination, std::
     if (target.row != none) throw std::invalid_argument("PLE destination already requested");
     ++p.stats.rows;
     auto id = p.row_index.find(mix(row_id), [&](auto i) { return p.rows[i].id == row_id; });
-    if (id == none) {
+    // A row this request creates still needs its pages planned; a row it joins only needs the pages
+    // of the work already in flight promoted.
+    const bool fresh = id == none;
+    if (fresh) {
         if (p.free_rows.empty()) throw std::logic_error("PLE row capacity exhausted");
         id = p.free_rows.back();
         p.free_rows.pop_back();
         auto& row         = p.rows[id];
         const auto source = p.table.row(row_id);
         row.id            = row_id;
-        row.lut           = source.lut;
+        row.source        = source;
+        row.encoded       = source.encoded_bytes();
         row.indexed       = true;
         p.row_index.insert(mix(row_id), id);
         if (const auto* hit = p.cached(row_id)) {
             row.bytes = hit->bytes;
             row.ready = true;
             ++p.stats.cache_hits;
-        } else {
-            const auto count =
-                artifact::map_file_range(source.object, source.offset, kPleRowBytes, p.segments);
-            std::uint32_t part = 0;
-            for (std::size_t s = 0; s < count; ++s) {
-                const auto& segment  = p.segments[s];
-                std::uint64_t copied = 0;
-                while (copied < segment.bytes) {
-                    const auto position = segment.file_offset + copied;
-                    const auto offset   = position / p.read_bytes * p.read_bytes;
-                    const auto prefix   = std::uint32_t(position - offset);
-                    const auto bytes =
-                        std::min<std::uint64_t>(p.read_bytes - prefix, segment.bytes - copied);
-                    const auto hash = mix(offset ^ (std::uint64_t(segment.file_index) << 32));
-                    auto page       = p.page_index.find(hash, [&](auto i) {
-                        return p.pages[i].offset == offset && p.pages[i].file == segment.file_index;
-                    });
-                    if (page == none) {
-                        if (p.free_pages.empty())
-                            throw std::logic_error("PLE page capacity exhausted");
-                        page = p.free_pages.back();
-                        p.free_pages.pop_back();
-                        p.pages[page].offset   = offset;
-                        p.pages[page].file     = segment.file_index;
-                        p.pages[page].required = owner.required;
-                        p.page_index.insert(hash, page);
-                        p.queue_page(page);
-                    } else {
-                        ++p.stats.shared_pages;
-                        if (owner.required) p.promote(page);
-                    }
-                    if (part == p.part_capacity)
-                        throw std::logic_error("PLE row fragment capacity exceeded");
-                    const auto f       = id * p.part_capacity + part++;
-                    p.fragments[f]     = {page,
-                                          p.pages[page].head,
-                                          id,
-                                          prefix,
-                                          std::uint16_t(segment.destination_offset + copied),
-                                          std::uint16_t(bytes)};
-                    p.pages[page].head = f;
-                    ++row.parts;
-                    copied += bytes;
-                }
-            }
         }
     } else {
         ++p.stats.shared_rows;
-        if (owner.required)
-            for (std::uint32_t f = 0; f < p.part_capacity; ++f) {
-                const auto page = p.fragments[id * p.part_capacity + f].page;
-                if (page != none) p.promote(page);
-            }
     }
     auto& row = p.rows[id];
     target    = {id, none, row.head, !row.ready};
@@ -433,13 +394,77 @@ void RowReader::request(std::uint32_t owner_id, std::uint32_t destination, std::
     row.head = target_id;
     owner.targets.push_back(target_id);
     if (row.ready) {
-        decode_nf4_row(
-            row.bytes, *row.lut,
-            owner.output.subspan(std::size_t(destination) * kPleRowElements, kPleRowElements));
-    } else {
-        ++row.active;
-        ++owner.pending;
-        ++owner.unready;
+        decode_ple_row(row.source, std::span(row.bytes.data(), row.encoded),
+                       owner.output.subspan(std::size_t(destination) * kPleRowElements,
+                                            kPleRowElements));
+        return;
+    }
+    // This target waits for the row. The row must be visible as active BEFORE its pages are queued:
+    // the pump runs on the worker thread and retires a page whose rows are all inactive, which
+    // would leave this row to be decoded from bytes that never arrived. A row_split row queues two
+    // spans, so the window that one part left open is now wide enough to hit.
+    ++row.active;
+    ++owner.pending;
+    ++owner.unready;
+    if (!fresh) {
+        if (owner.required)
+            for (std::uint32_t f = 0; f < p.part_capacity; ++f) {
+                const auto page = p.fragments[id * p.part_capacity + f].page;
+                if (page != none) p.promote(page);
+            }
+        return;
+    }
+    // One row is one span per encoding part, and each span is planned for its own page boundary.
+    // The fragment's destination offset runs across the parts, so the row's bytes land in the order
+    // the decoder reads them: a row_split q4 row is its code plane followed by its scale plane.
+    std::uint32_t part       = 0;
+    std::uint32_t row_offset = 0;
+    for (std::uint32_t source_part = 0; source_part < row.source.parts; ++source_part) {
+        const auto count =
+            artifact::map_file_range(row.source.object, row.source.part_offsets[source_part],
+                                     row.source.part_bytes[source_part], p.segments);
+        for (std::size_t s = 0; s < count; ++s) {
+            const auto& segment  = p.segments[s];
+            std::uint64_t copied = 0;
+            while (copied < segment.bytes) {
+                const auto position = segment.file_offset + copied;
+                const auto offset   = position / p.read_bytes * p.read_bytes;
+                const auto prefix   = std::uint32_t(position - offset);
+                const auto bytes =
+                    std::min<std::uint64_t>(p.read_bytes - prefix, segment.bytes - copied);
+                const auto hash = mix(offset ^ (std::uint64_t(segment.file_index) << 32));
+                auto page       = p.page_index.find(hash, [&](auto i) {
+                    return p.pages[i].offset == offset && p.pages[i].file == segment.file_index;
+                });
+                if (page == none) {
+                    if (p.free_pages.empty())
+                        throw std::logic_error("PLE page capacity exhausted");
+                    page = p.free_pages.back();
+                    p.free_pages.pop_back();
+                    p.pages[page].offset   = offset;
+                    p.pages[page].file     = segment.file_index;
+                    p.pages[page].required = owner.required;
+                    p.page_index.insert(hash, page);
+                    p.queue_page(page);
+                } else {
+                    ++p.stats.shared_pages;
+                    if (owner.required) p.promote(page);
+                }
+                if (part == p.part_capacity)
+                    throw std::logic_error("PLE row fragment capacity exceeded");
+                const auto f   = id * p.part_capacity + part++;
+                p.fragments[f] = {page,
+                                  p.pages[page].head,
+                                  id,
+                                  prefix,
+                                  std::uint16_t(row_offset + segment.destination_offset + copied),
+                                  std::uint16_t(bytes)};
+                p.pages[page].head = f;
+                ++row.parts;
+                copied += bytes;
+            }
+        }
+        row_offset += row.source.part_bytes[source_part];
     }
 }
 

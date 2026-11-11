@@ -3,6 +3,7 @@
 #include "ninfer/ops/ple.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -281,8 +282,9 @@ void require_supported_ple_table(const PleTableRequirement& requirement) {
         requirement.parameter + ": 表编码 " + qtype_name(requirement.format) + "/" +
         layout_name(requirement.layout) + "（" + std::to_string(requirement.rows) + " 行 × " +
         std::to_string(requirement.width) + "，每行 " + std::to_string(kPleRowElements) +
-        " 个特征）不受支持，可选：转码 / 加解码器（读取器只服务 nf4_g16_e4m3fn / "
-        "row_paged_g16_4k_v1，每行 90 B）");
+        " 个特征）不受支持，可选：转码 / 加解码器（读取器服务 nf4_g16_e4m3fn / "
+        "row_paged_g16_4k_v1，每行 90 B；以及 q4_g64_fp16 / row_split_k128_v1，每行 "
+        "128 B 码平面 + 8 B fp16 尺度平面）");
 }
 
 PleTextStage::PleTextStage(const PleTableSource& table, std::int32_t eos,
@@ -291,13 +293,17 @@ PleTextStage::PleTextStage(const PleTableSource& table, std::int32_t eos,
                            std::uint32_t max_tokens, std::uint32_t max_batch, std::uint32_t slots,
                            PlePrepareOptions options)
     : eos_(eos), max_tokens_(max_tokens), max_batch_(max_batch), slots_(slots),
+      max_positions_(options.max_positions),
       tail_(slots, std::array<std::int32_t, 2>{eos, eos}), started_(slots, false) {
     if (eos < 0) throw std::invalid_argument("PLE stage: the hash's EOS token id is unknown");
     if (!max_tokens || !max_batch || max_batch > 8 || !slots)
         throw std::invalid_argument("PLE stage: invalid step capacity");
-    if (options.max_positions < max_tokens * max_batch || options.windows < 2)
+    // The window capacity is the number of prepared positions, i.e. the largest T*B one window may
+    // ask for - not max(T)*max(B). A pass that only ever runs one wide row (prefill) therefore costs
+    // one row's worth of staging, and a batch pass is bounded by the same number of positions.
+    if (!options.max_positions || options.max_positions < max_tokens || options.windows < 2)
         throw std::invalid_argument(
-            "PLE stage: the window capacity must cover max_tokens*max_batch with two windows");
+            "PLE stage: the window capacity must cover the widest step with two windows");
     layers_.reserve(layers.size());
     for (auto& layer : layers) {
         if (!layer) {
@@ -350,6 +356,8 @@ void PleTextStage::require_window(const PleStepWindow& window) const {
                 window.valid_columns.size() == window.slots.size() &&
                 window.ids.size() == std::size_t(window.tokens) * window.slots.size(),
             "the window's ids, slots and valid columns disagree");
+    require(std::uint64_t(window.tokens) * window.slots.size() <= max_positions_,
+            "the window asks for more prepared positions than the stage owns");
     for (const auto slot : window.slots)
         require(slot >= 0 && std::uint32_t(slot) < slots_, "a slot is outside the history pool");
     for (const auto valid : window.valid_columns)
@@ -419,6 +427,17 @@ void PleTextStage::begin(const PleStepWindow& window, CudaExecutionView executio
     slot_index_.copy_from_host(window.slots.data(), window.slots.size() * 4);
     gpu_->upload(*ticket_, execution);
     embedding_ = gpu_->embedding(*ticket_, execution);
+    // One line per window, once: what the n-gram stage gathered and for how many rows. It is the
+    // evidence that a pass really drove PLE (an id, its slot and its live columns), and it is the
+    // only Host read the stage adds beyond the ids the hash needs.
+    static std::atomic<bool> announced{false};
+    if (!announced.exchange(true)) {
+        std::fprintf(stderr,
+                     "[ple] window: tokens=%d batch=%u first id=%d slot=%d live=%u, table rows=%llu\n",
+                     window.tokens, batch, window.ids[0], window.slots[0], window.valid_columns[0],
+                     static_cast<unsigned long long>(gpu_->host().stats().rows));
+        std::fflush(stderr);
+    }
     // The hash tail of the next window of each slot is the end of this one.
     for (std::uint32_t b = 0; b < batch; ++b) {
         const auto slot = std::uint32_t(window.slots[b]);

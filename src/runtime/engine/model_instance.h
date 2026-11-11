@@ -69,7 +69,8 @@ struct ModelInstance {
     // and prints; the allocations still use their own estimates.
     core::MemoryLedger ledger;
 
-    ModelInstance(std::unique_ptr<models::qwen3_5::Model> model, const EngineOptions& options);
+    ModelInstance(std::unique_ptr<models::qwen3_5::Model> model, const EngineOptions& options,
+                  models::qwen3_5::execution::PleTableBinding ple = {});
     ~ModelInstance();
     ModelInstance(const ModelInstance&)            = delete;
     ModelInstance& operator=(const ModelInstance&) = delete;

@@ -54,7 +54,12 @@ public:
     // port (sm_89): entry path and an independently owned read handle, so a tier can keep
     // reading after the load-time Reader is gone.
     [[nodiscard]] const std::filesystem::path& path() const noexcept;
+    // A handle to the entry file, whatever index was asked for: the streaming tiers' existing
+    // meaning, kept as it is.
     [[nodiscard]] std::unique_ptr<InputFile> open_file(std::size_t file_index) const;
+    // A handle to the file `file_index` names (entry, or a continuation part opened beside it).
+    // Object reads that reach past the entry - the PLE table's rows do - need this one.
+    [[nodiscard]] std::unique_ptr<InputFile> open_part(std::size_t file_index) const;
 
 private:
     struct Impl;

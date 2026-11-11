@@ -11,6 +11,10 @@ class Reader;
 struct ParameterReference;
 } // namespace ninfer::artifact
 
+namespace ninfer::models::qwen4_exp {
+class PleTableSource;
+} // namespace ninfer::models::qwen4_exp
+
 namespace ninfer::models::qwen3_5 {
 
 // Cold load plan borrows its Reader until materialization. Its selected Host bytes and parsed
@@ -29,6 +33,12 @@ public:
     [[nodiscard]] const artifact::MaterializationPlan& materialization() const;
     [[nodiscard]] const artifact::ParameterReference& parameter(WeightId id) const;
     [[nodiscard]] std::span<const WeightUse> uses(WeightId id) const;
+    // The PLE n-gram table's disk source, built while the artifact was open; null when the config
+    // declares no PLE. It owns its read handles, so it stays valid after the Reader is gone, and
+    // the caller hands it to the Parameters the text context runs from.
+    [[nodiscard]] const std::shared_ptr<const qwen4_exp::PleTableSource>& ple_table() const;
+    // The token id the n-gram hash substitutes for missing history (-1 when undeclared).
+    [[nodiscard]] std::int32_t ple_eos() const;
 
 private:
     struct Impl;

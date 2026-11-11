@@ -966,7 +966,13 @@ private:
 
 } // namespace
 
-Parameters::Parameters(const Model& source) : model(source) {
+Parameters::Parameters(const Model& source, PleTableBinding ple) : model(source) {
+    // The n-gram bank's owner and the id its hash substitutes for missing history. Both come from
+    // the load plan, which is the only place that holds the artifact open and can read the EOS the
+    // artifact declares; a model that declares PLE without them is refused when the text context is
+    // built rather than run without its embeddings.
+    text.ple_table = std::move(ple.source);
+    text.ple_eos   = ple.eos;
     const Prepare prepare(model);
     const auto& w        = model.weights();
     text.token_embedding = native_weight(model.weight(w.text.token_embedding).view);

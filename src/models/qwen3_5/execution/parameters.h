@@ -285,12 +285,20 @@ struct ProposalParameters {
     std::uint32_t rows = 0;
 };
 
+// The PLE table the Process opened while the artifact was open. It is not a weight: the n-gram
+// bank is streamed from disk by its own reader, so the Parameters carry the owner rather than a
+// device pointer. `eos` is the id the hash substitutes for tokens before a sequence's start.
+struct PleTableBinding {
+    std::shared_ptr<const qwen4_exp::PleTableSource> source;
+    std::int32_t eos = -1;
+};
+
 // Cold native preparation for the fixed model implementation. This owner is stable before
 // startup sizing, execution, or Graph capture; all weight addresses borrow the source Model.
 // Shape-dependent kernel selection and scratch remain with the calling implementation and Op.
 class Parameters {
 public:
-    explicit Parameters(const Model& source);
+    explicit Parameters(const Model& source, PleTableBinding ple = {});
     Parameters(const Parameters&)            = delete;
     Parameters& operator=(const Parameters&) = delete;
     Parameters(Parameters&&)                 = delete;

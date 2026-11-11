@@ -832,8 +832,9 @@ EngineOptions normalize_engine_options(EngineOptions options) {
 }
 
 ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
-                             const EngineOptions& options)
-    : model(std::move(source)), parameters(*model),
+                             const EngineOptions& options,
+                             models::qwen3_5::execution::PleTableBinding ple)
+    : model(std::move(source)), parameters(*model, std::move(ple)),
       frontend(models::qwen3_5::make_frontend(
           model->resources(), {.chat_template_path       = options.chat_template_path,
                                .grammar_cache_bytes      = options.grammar_cache_bytes,
@@ -943,12 +944,24 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
     inspect.complete();
     StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
     auto plan = models::qwen3_5::plan_load(reader, models::load_options(options));
+    // The PLE table source is opened by the plan (it owns its read handles), so it survives both
+    // the Reader above and this function: the Parameters it is installed in live as long as the
+    // model. Keeping the shared_ptr here is only what carries it across materialization.
+    const auto ple_table = plan.ple_table();
+    const auto ple_eos   = plan.ple_eos();
     binding.complete();
     auto model =
         models::qwen3_5::materialize_model(std::move(plan), device, &options.startup_observer);
     device.synchronize();
     StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
-    auto instance = std::make_unique<ModelInstance>(std::move(model), options);
+    // Qwen4Exp's n-gram embedding reads its table from disk, so its owner belongs to the
+    // Parameters rather than to any pass: every text context this model builds hands the same
+    // source to its PLE stage, which is what keeps the nine-column history and the hash tail
+    // consistent across requests. The source owns its own read handles, so it outlives the Reader
+    // this function opened.
+    auto instance = std::make_unique<ModelInstance>(
+        std::move(model), options,
+        models::qwen3_5::execution::PleTableBinding{.source = ple_table, .eos = ple_eos});
     frontend.complete();
     StartupPhaseScope planning(options.startup_observer, StartupPhase::TargetFinalize);
     const auto signature = models::qwen3_5::prefill_signature(*instance->model);

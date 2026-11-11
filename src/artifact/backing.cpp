@@ -60,7 +60,10 @@ FileBacking prepare_file_backing(const Reader& reader, std::span<const ObjectHan
         if (std::holds_alternative<TensorObject>(object)) entry.geometry = reader.geometry(handle);
         for (auto& segment : entry.segments) {
             auto [it, inserted] = file_indices.try_emplace(segment.file_index, out.owners.size());
-            if (inserted) out.owners.push_back(reader.open_file(segment.file_index));
+            // The file the segment names, not the entry: a row-mapped object (the PLE n-gram table)
+            // spans continuation parts, and reading the entry at a part-relative offset returns
+            // bytes that belong to something else.
+            if (inserted) out.owners.push_back(reader.open_part(segment.file_index));
             segment.file_index = it->second;
         }
         out.objects.emplace(handle.index, std::move(entry));

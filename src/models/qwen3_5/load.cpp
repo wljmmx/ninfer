@@ -1,8 +1,10 @@
 #include "models/qwen3_5/load.h"
 #include "artifact/reader.h"
+#include "models/qwen4_exp/ple/table.h"
 #include "models/qwen3_5/load/bindings.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <utility>
 
 namespace ninfer::models::qwen3_5 {
@@ -15,6 +17,8 @@ struct LoadPlan::Impl {
     artifact::MaterializationPlan materialization;
     FrontendResources resources;
     InstanceInfo info;
+    std::shared_ptr<const qwen4_exp::PleTableSource> ple_table;
+    std::int32_t ple_eos = -1;
 };
 
 LoadPlan::LoadPlan(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -41,10 +45,28 @@ std::span<const WeightUse> LoadPlan::uses(WeightId id) const {
     return impl_->pending.at(id.index).uses;
 }
 
+const std::shared_ptr<const qwen4_exp::PleTableSource>& LoadPlan::ple_table() const {
+    return impl_->ple_table;
+}
+
+std::int32_t LoadPlan::ple_eos() const { return impl_->ple_eos; }
+
 LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     auto out     = std::make_unique<LoadPlan::Impl>();
     out->options = options;
     out->config  = parse_config(reader.directory(), options);
+    // The PLE-off arm. The n-gram embedding is a config feature, so the only honest way to measure
+    // "the model without it" is to drop the layers the config names - then nothing binds, no table
+    // is opened, no block carries a PLE parameter, and the text path is the one that shipped before
+    // PLE existed. Set NINFER_PLE_OFF=1 to select that arm; it is not a tuning knob.
+    const bool ple_off = [] {
+        const char* value = std::getenv("NINFER_PLE_OFF");
+        return value != nullptr && *value != '\0' && std::strtol(value, nullptr, 10) != 0;
+    }();
+    if (ple_off && out->config.text.ple) {
+        std::fprintf(stderr, "[ple] NINFER_PLE_OFF: running without the n-gram layers\n");
+        out->config.text.ple.reset();
+    }
     artifact::Binder binder(reader);
     out->resources = loading::bind_resources(binder, out->config);
     loading::Bindings bindings(binder);
@@ -93,6 +115,12 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
                          std::string(options.speculative_component()) + "/final_hidden");
     }
     out->pending         = std::move(bindings.weights);
+    // The PLE table is opened here, while the artifact's object tables are still reachable. The
+    // source owns its own read handles, so the plan - not the caller - decides its lifetime.
+    if (text.ple) {
+        out->ple_table = loading::open_ple_table(reader, binder, out->pending, out->weights.text, text);
+        out->ple_eos   = loading::ple_eos_token(reader.directory());
+    }
     out->materialization = std::move(binder).finish();
     out->info.name       = reader.directory().metadata.value(
         "name", std::string(architecture_name(text.architecture)));

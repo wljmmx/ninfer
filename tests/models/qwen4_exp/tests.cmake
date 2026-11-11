@@ -6,6 +6,16 @@ ninfer_add_test(ninfer_ple_disk_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ple_disk.cpp"
   LIBRARIES ninfer_ple ninfer::json)
 
+# port (sm_89): the q4_g64 table encoding the shipped artifact declares. The host row decoder is
+# checked word for word against the shipped q4 kernel (a one-hot linear) and against the artifact
+# codecs' independent logical decoder, then end to end through the disk table's two-row planes.
+ninfer_add_test(ninfer_qwen4_exp_ple_q4_row_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ple_q4_row.cpp"
+  LIBRARIES ninfer_ple ninfer_ops ninfer_linear_test_support ninfer::json)
+set_tests_properties(ninfer_qwen4_exp_ple_q4_row_test PROPERTIES
+  SKIP_RETURN_CODE 77
+  LABELS "gpu")
+
 # port (sm_89): the PLE layer end to end at the artifact's geometry - one [12800,2560] projection,
 # the per-stream gate, the four-tap convolution folded into the residual, and the history pool that
 # advances by the accepted prefix. Numeric gates reuse the Ops' own criteria.

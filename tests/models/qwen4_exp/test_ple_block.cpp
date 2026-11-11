@@ -325,11 +325,24 @@ std::uint32_t reference_hash(std::int32_t current, std::int32_t previous, std::i
 }
 
 void check_encoding_refusal() {
-    // The artifact this round ships: q4_g64_fp16 rows in row_split_k128_v1, 136 bytes a row.
+    // The artifact this round ships: q4_g64_fp16 rows in row_split_k128_v1, 136 bytes a row. The
+    // reader now serves that encoding, so the same declaration is admitted instead of refused;
+    // test_ple_q4_row.cpp proves the decoder against the kernel and the codecs' own oracle.
+    bool admitted_q4 = true;
+    try {
+        require_supported_ple_table({.format    = QType::Q4_G64_FP16,
+                                     .layout    = QuantLayout::RowSplit,
+                                     .rows      = 320001536,
+                                     .width     = 160,
+                                     .parameter = "text/layers/1/ple/table"});
+    } catch (const std::exception&) { admitted_q4 = false; }
+    check(admitted_q4, "the artifact's q4_g64/row_split table encoding is admitted");
+
+    // An encoding the reader does not serve is still refused, by name and with its extent.
     bool refused = false;
     std::string message;
     try {
-        require_supported_ple_table({.format    = QType::Q4_G64_FP16,
+        require_supported_ple_table({.format    = QType::Q5_G64_FP16,
                                      .layout    = QuantLayout::RowSplit,
                                      .rows      = 320001536,
                                      .width     = 160,
@@ -339,7 +352,7 @@ void check_encoding_refusal() {
         message = error.what();
     }
     check(refused, "an unsupported table encoding is refused");
-    check(message.find("q4_g64_fp16") != std::string::npos &&
+    check(message.find("q5_g64_fp16") != std::string::npos &&
               message.find("320001536") != std::string::npos,
           "the refusal names the encoding and the row count");
     check(message.find("不受支持") != std::string::npos &&

@@ -134,21 +134,19 @@ struct PleTableRequirement {
     std::string parameter; // the logical binding name, so a refusal names what to fix
 };
 
-// True when `PleRowSource`/`decode_nf4_row` can serve this table: one NF4 codebook against an
-// E4M3 scale byte per 16-wide group, rows of 160 words in 4096-byte pages. Logs the declared
-// encoding (and its row count) either way, then throws
+// True when `PleRowSource`/`decode_ple_row` can serve this table. Both supported encodings hold 160
+// words per row: one NF4 codebook against an E4M3 scale byte per 16-wide group, rows of 160 words
+// in 4096-byte pages; and `q4_g64_fp16` in the row-split planes, signed nibbles against one
+// binary16 scale per 64 lanes. Logs the declared encoding (and its row count) either way, then
+// throws
 // "<parameter>: 表编码 <format>/<layout>（<rows> 行 × <width>）不受支持，可选：转码 / 加解码器"
 // when it cannot. `stderr` rather than an exception string alone, because a refusal at load time
 // is the only chance to say which encoding the artifact actually carries.
 void require_supported_ple_table(const PleTableRequirement& requirement);
 
-// The encoding `PleTableSource` serves, written once so the loader check and the reader cannot
-// drift apart.
-[[nodiscard]] constexpr bool supported_ple_table(QType format, QuantLayout layout,
-                                                 std::uint64_t width) noexcept {
-    return format == QType::NF4_G16_E4M3FN && layout == QuantLayout::RowPagedG16_4K &&
-           width == kPleRowElements;
-}
+// The adapter between a declared table and the reader's encodings lives with the reader
+// (models/qwen4_exp/ple/table.h: supported_ple_table), so that this refusal cannot drift from what
+// PleTableSource actually decodes.
 
 // One column window of a text pass, as the PLE stage consumes it. `ids` is token-fastest
 // ([tokens*batch]) and `slots` names the history slot of every row: a row's slot must identify
@@ -176,7 +174,10 @@ struct PleStepWindow {
 class PleTextStage {
 public:
     // `layers` is indexed by text block and holds an empty entry where that block has no PLE.
-    // `slots` is the history pool depth, i.e. the number of sequences that may be resident.
+    // `slots` is the history pool depth, i.e. the number of sequences that may be resident; a
+    // window names each of its rows' slot, so a batch pass advances one row's history per sequence.
+    // A window may ask for any T <= max_tokens and B <= max_batch whose T*B is within
+    // `options.max_positions`, which is the number of positions the staging buffers hold.
     PleTextStage(const PleTableSource& table, std::int32_t eos, const DeviceContext& context,
                  std::vector<std::optional<PleLayerWeights>> layers, std::uint32_t max_tokens,
                  std::uint32_t max_batch, std::uint32_t slots, PlePrepareOptions options);
@@ -192,10 +193,10 @@ public:
     // norm of the block that consumes `normalized`.
     void apply(std::uint32_t layer, Tensor& residual, Tensor& normalized, const Tensor& next_norm,
                float epsilon, CudaExecutionView execution);
-    // Advances each row's history by the window's accepted columns. The two text entries this
-    // tree drives (prefill and ordinary decode) accept every live column, so the window's own
-    // valid columns are the accepted prefix; a speculative step whose acceptance is only known
-    // after the verifier runs must pass them explicitly.
+    // Advances each row's history by the window's accepted columns. The passes whose acceptance is
+    // their live columns (prefill chunks and the batch prefill rectangle) commit with no argument; a
+    // speculative verify rectangle, whose acceptance the verifier decides afterwards, passes the
+    // accepted prefix explicitly so unaccepted columns never enter the pool.
     void commit(std::uint32_t layer, CudaExecutionView execution);
     void commit(std::uint32_t layer, const Tensor& accepted, CudaExecutionView execution);
     // Retires the open window. Safe to call with no window open.
@@ -234,6 +235,8 @@ private:
     std::uint32_t max_tokens_;
     std::uint32_t max_batch_;
     std::uint32_t slots_;
+    // Prepared positions, i.e. the largest T*B a window may name (options.max_positions).
+    std::uint32_t max_positions_;
     std::vector<std::unique_ptr<PleLayerRuntime>> layers_;
     std::unique_ptr<PleGpuPreparation> gpu_;
     // The window that is open right now, and the one its consumer has released but whose slot the

@@ -9,6 +9,32 @@
 #include <limits>
 
 namespace ninfer::artifact {
+namespace {
+
+// One continuation part, opened and checked against the entry it continues. Both the Reader's own
+// cache and the owned handles a FileBacking keeps (Reader::open_file) go through this, so an
+// artifact whose parts disagree with its directory is refused the same way either way.
+[[nodiscard]] std::unique_ptr<InputFile> open_continuation(const Directory& directory,
+                                                           const ArtifactId& id,
+                                                           const std::filesystem::path& entry,
+                                                           std::size_t index) {
+    const auto& record = directory.files.at(index);
+    if (!record.path) throw ArtifactError("continuation file has no path");
+    auto input = std::make_unique<InputFile>(entry.parent_path() / *record.path);
+    std::array<std::byte, kHeaderBytes> header{};
+    input->read_exact(0, header);
+    if (!std::equal(kPartMagic.begin(), kPartMagic.end(), header.begin()) ||
+        read_u64_le(header.data() + 8) != index ||
+        !std::equal(id.begin(), id.end(), header.begin() + 16)) {
+        throw ArtifactError(*record.path + ": continuation header does not belong to this entry");
+    }
+    if (input->bytes() != checked_add(kPayloadAlignment, record.payload_bytes, "part length")) {
+        throw ArtifactError(*record.path + ": continuation length differs from directory");
+    }
+    return input;
+}
+
+} // namespace
 
 struct Reader::Impl {
     std::filesystem::path entry;
@@ -62,23 +88,7 @@ struct Reader::Impl {
 
     InputFile& file(std::size_t index) const {
         if (index >= files.size()) { throw ArtifactError("invalid continuation index"); }
-        if (!files[index]) {
-            const auto& record = directory.files[index];
-            auto input         = std::make_unique<InputFile>(entry.parent_path() / *record.path);
-            std::array<std::byte, kHeaderBytes> header{};
-            input->read_exact(0, header);
-            if (!std::equal(kPartMagic.begin(), kPartMagic.end(), header.begin()) ||
-                read_u64_le(header.data() + 8) != index ||
-                !std::equal(id.begin(), id.end(), header.begin() + 16)) {
-                throw ArtifactError(*record.path +
-                                    ": continuation header does not belong to this entry");
-            }
-            if (input->bytes() !=
-                checked_add(kPayloadAlignment, record.payload_bytes, "part length")) {
-                throw ArtifactError(*record.path + ": continuation length differs from directory");
-            }
-            files[index] = std::move(input);
-        }
+        if (!files[index]) { files[index] = open_continuation(directory, id, entry, index); }
         return *files[index];
     }
 };
@@ -188,11 +198,26 @@ std::size_t Reader::complete_direct_read(std::size_t file_index,
 
 const std::filesystem::path& Reader::path() const noexcept { return impl_->entry; }
 
+// A handle to the artifact's entry file. The streaming tiers have always taken this handle for any
+// index, so it keeps that meaning; a caller that needs the file an index names - the PLE table does,
+// because its rows live past the entry - asks for open_part() instead. (The expert reader passes a
+// file index here and therefore reads the entry: a pre-existing defect of that tier, left as it is
+// so its streamed bytes and the baselines measured against them do not change under this work.)
 std::unique_ptr<InputFile> Reader::open_file(std::size_t file_index) const {
     if (file_index >= impl_->files.size()) {
         throw ArtifactError("file index is outside the artifact file set");
     }
     return std::make_unique<InputFile>(impl_->entry);
+}
+
+// A handle to the file `file_index` names: index 0 is the entry, every later index one of its
+// continuation parts, opened beside it and checked against the entry it continues.
+std::unique_ptr<InputFile> Reader::open_part(std::size_t file_index) const {
+    if (file_index >= impl_->files.size()) {
+        throw ArtifactError("file index is outside the artifact file set");
+    }
+    if (file_index == 0) return std::make_unique<InputFile>(impl_->entry);
+    return open_continuation(impl_->directory, impl_->id, impl_->entry, file_index);
 }
 
 } // namespace ninfer::artifact
