@@ -217,9 +217,19 @@ public:
                 const auto& gu_layout = banks_[i].gate_up_layout;
                 const auto& dn_layout = banks_[i].down_layout;
                 const auto count      = static_cast<std::uint32_t>(entry.count);
-                bool usable           = !bank_files.experts.front().chunks.empty();
-                const std::uint32_t object_index =
+                // The two matrices may live in different objects (the 35B artifact keeps gate_up and
+                // down apart), so each is resolved from its own object and addressed from that
+                // object's base: a chunk's offset is object relative, never file relative.
+                bool usable = !bank_files.experts.front().chunks.empty();
+                const std::uint32_t gate_up_object =
                     usable ? bank_files.experts.front().chunks.front().file_index : 0;
+                std::uint32_t down_object = gate_up_object;
+                for (const auto& chunk : bank_files.experts.front().chunks) {
+                    if (chunk.image_offset >= entry.down_codes.offset) {
+                        down_object = chunk.file_index;
+                        break;
+                    }
+                }
                 // widest chunk seen per plane: the layout and the artifact do not agree on it.
                 std::uint64_t plane_bytes[6] = {};
                 for (std::uint32_t e = 0; e < count && usable; ++e) {
@@ -229,10 +239,6 @@ public:
                         break;
                     }
                     for (const auto& chunk : ex.chunks) {
-                        if (chunk.file_index != object_index) {
-                            usable = false;
-                            break;
-                        }
                         // Sort by the plane's image range, not by "before the next plane": a q4
                         // gate_up has no high plane, so its high offset equals its scales offset.
                         const struct {
@@ -260,6 +266,12 @@ public:
                             usable = false;
                             break;
                         }
+                        // A matrix is addressed from the base of the object that carries it, so a
+                        // chunk of one matrix never borrows the other's object.
+                        if (chunk.file_index != (index < 3 ? gate_up_object : down_object)) {
+                            usable = false;
+                            break;
+                        }
                         plane_bytes[index] = std::max(plane_bytes[index], chunk.bytes);
                         // Only a plane's first segment names its origin; the rest continue it.
                         if (chunk.image_offset == planes[index].begin) {
@@ -278,20 +290,24 @@ public:
                 reach(s.gu_high, std::max<std::uint64_t>(gu_layout.high.expert_bytes, plane_bytes[1]));
                 reach(s.gu_scales,
                       std::max<std::uint64_t>(gu_layout.scales.expert_bytes, plane_bytes[2]));
+                const auto gate_up_extent = extent;
+                extent                    = 0;
                 reach(s.dn_codes, std::max<std::uint64_t>(dn_layout.codes.expert_bytes, plane_bytes[3]));
                 reach(s.dn_high, std::max<std::uint64_t>(dn_layout.high.expert_bytes, plane_bytes[4]));
                 reach(s.dn_scales,
                       std::max<std::uint64_t>(dn_layout.scales.expert_bytes, plane_bytes[5]));
-                const auto* mapped = usable ? reader_->object_base(object_index) : nullptr;
-                if (mapped != nullptr) {
+                const auto down_extent = extent;
+                const auto* gate_up_base = usable ? reader_->object_base(gate_up_object) : nullptr;
+                const auto* down_base    = usable ? reader_->object_base(down_object) : nullptr;
+                if (gate_up_base != nullptr && down_base != nullptr) {
                     s.gate_up_parent.geometry       = banks_[i].gate_up_geometry;
-                    s.gate_up_parent.geometry.bytes = extent;
+                    s.gate_up_parent.geometry.bytes = gate_up_extent;
                     s.gate_up_parent.device         = Device::cpu();
-                    s.gate_up_parent.data           = mapped;
+                    s.gate_up_parent.data           = gate_up_base;
                     s.down_parent.geometry          = banks_[i].down_geometry;
-                    s.down_parent.geometry.bytes    = extent;
+                    s.down_parent.geometry.bytes    = down_extent;
                     s.down_parent.device            = Device::cpu();
-                    s.down_parent.data              = mapped;
+                    s.down_parent.data              = down_base;
                     s.gate_up.parent         = &s.gate_up_parent;
                     s.gate_up.layout         = with_zero_planes(gu_layout);
                     s.gate_up.codes_offsets  = s.gu_codes.data();
@@ -310,12 +326,14 @@ public:
                     if (std::getenv("NINFER_HOST_DEBUG") != nullptr && i < 2) {
                         std::fprintf(stderr,
                                      "[fused-in-place] bank=%zu experts=%u gu_codes=%llu "
-                                     "gu_scales=%llu dn_codes=%llu dn_scales=%llu extent=%llu\n",
+                                     "gu_scales=%llu dn_codes=%llu dn_scales=%llu gu_extent=%llu "
+                                     "dn_extent=%llu\n",
                                      i, count, (unsigned long long)s.gu_codes.front(),
                                      (unsigned long long)s.gu_scales.front(),
                                      (unsigned long long)s.dn_codes.front(),
                                      (unsigned long long)s.dn_scales.front(),
-                                     (unsigned long long)extent);
+                                     (unsigned long long)gate_up_extent,
+                                     (unsigned long long)down_extent);
                     }
                     continue;
                 }
