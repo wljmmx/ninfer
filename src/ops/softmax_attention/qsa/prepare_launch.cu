@@ -30,6 +30,17 @@ PrepareArguments prepare_arguments(const QsaProjectionView& p, const QsaPrepareP
                                    QsaRawRecordWriteView records, Tensor& q, Tensor& iq) {
     const auto bf  = [](const Tensor& t) { return static_cast<const __nv_bfloat16*>(t.data); };
     const auto i32 = [](const Tensor& t) { return static_cast<const std::int32_t*>(t.data); };
+    if (const char* shape = std::getenv("NINFER_QSA_PROJ_SHAPE"); shape != nullptr) {
+        const auto show = [](const char* name, const Tensor& t) {
+            std::fprintf(stderr, "[proj] %s ne=%d,%d,%d,%d nb=%lld,%lld,%lld,%lld\n", name,
+                         int(t.ne[0]), int(t.ne[1]), int(t.ne[2]), int(t.ne[3]),
+                         (long long)t.nb[0], (long long)t.nb[1], (long long)t.nb[2],
+                         (long long)t.nb[3]);
+        };
+        show("query", p.query);
+        show("key", p.key);
+        show("value", p.value);
+    }
     PrepareArguments a{bf(p.query),
                        bf(p.key),
                        bf(p.value),
