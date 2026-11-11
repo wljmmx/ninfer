@@ -24,6 +24,13 @@ namespace ninfer::runtime {
 struct KvResidencyStrides {
     std::size_t payload_bytes_per_resident_page_group = 0;
     std::size_t ledger_bytes_per_logical_page_group   = 0;
+    // port (sm_89): the original model only tiers the pages ABOVE the curve minimum, because the
+    // minimum is the fully-resident cost of max_context - so a 256K dense request could never be
+    // planned on a card that cannot hold its 9.4 GB KV. With this set the anchor is tiered too: the
+    // fixed part of the anchor (workspace, graph, the non-KV persistent layout) stays put, and the
+    // resident set falls to whatever the payload stride allows. Off by default, so every existing
+    // caller keeps the "planner only, minimum always resident" semantics byte for byte.
+    bool tier_minimum_residency = false;
 };
 
 struct KvResidencyResolution {
@@ -39,9 +46,20 @@ struct KvResidencyResolution {
     bool        residency_active                 = false;
 };
 
+// The one formula both the resolution and the built plan are priced with: the anchor (fully
+// resident at the curve minimum) plus payload for the pages resident beyond it plus ledger for every
+// logical page beyond it. With `tier_minimum_residency` the anchor's payload is repriced per resident
+// page, so `resident < curve.minimum_main_page_groups` is legal.
+[[nodiscard]] std::size_t residency_device_bytes(const SequenceCapacityCurve& curve,
+                                                 const KvResidencyStrides& strides,
+                                                 std::uint32_t logical_page_groups,
+                                                 std::uint32_t resident_page_groups);
+
 // Resolves an explicit logical capacity together with the residency the device budget can hold.
-// This is a planning model, not a runnable mode: it reports what tiering would need and never
-// relaxes the "physical pages >= logical pages" invariant of the decoder state.
+// Without `tier_minimum_residency` this is a planning model only: it reports what tiering would need
+// and never relaxes the "physical pages >= logical pages" invariant of the decoder state. With it,
+// the result IS runnable tiering and `resident_page_groups` is what the device pool must be built
+// with.
 [[nodiscard]] KvResidencyResolution resolve_kv_capacity_with_residency(
     const KvCapacityPolicy& policy, const SequenceCapacityCurve& curve,
     const KvResidencyStrides& strides, std::size_t available_runtime_bytes);

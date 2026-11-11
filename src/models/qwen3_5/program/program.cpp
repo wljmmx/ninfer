@@ -33,6 +33,10 @@ std::size_t SequencePlan::device_reservation_bytes() const noexcept {
     return impl_ != nullptr ? impl_->device_reservation_bytes : 0;
 }
 
+std::size_t SequencePlan::kv_payload_bytes() const noexcept {
+    return impl_ != nullptr ? impl_->persistent.kv_payload_bytes : 0;
+}
+
 std::size_t SequencePlan::workspace_capacity_bytes() const noexcept {
     return impl_ != nullptr ? impl_->workspace.capacity : 0;
 }
@@ -55,15 +59,23 @@ const runtime::SequenceCapacityCurve& SequencePlanner::capacity_curve() const no
     return impl_ != nullptr ? impl_->curve : empty;
 }
 
+const runtime::KvResidencyStrides& SequencePlanner::residency_strides() const noexcept {
+    static const runtime::KvResidencyStrides empty;
+    return impl_ != nullptr ? impl_->residency_strides : empty;
+}
+
 void SequencePlanner::set_use_cuda_graph(bool enabled) noexcept {
     if (impl_ == nullptr || impl_->minimum == nullptr) { return; }
     impl_->inputs.use_cuda_graph   = enabled;
     impl_->minimum->use_cuda_graph = enabled;
 }
 
-SequencePlan SequencePlanner::finalize(std::uint32_t main_page_groups) && {
+SequencePlan SequencePlanner::finalize(std::uint32_t main_page_groups,
+                                      std::uint32_t resident_page_groups,
+                                      std::size_t host_kv_payload_bytes) && {
     if (impl_ == nullptr) { throw std::logic_error("sequence planner is empty"); }
-    return SequencePlan(detail::finalize_sequence_plan_impl(std::move(impl_), main_page_groups));
+    return SequencePlan(detail::finalize_sequence_plan_impl(
+        std::move(impl_), main_page_groups, resident_page_groups, host_kv_payload_bytes));
 }
 
 RequestBasePlan::RequestBasePlan(std::shared_ptr<detail::RequestBasePlanImpl> impl) noexcept

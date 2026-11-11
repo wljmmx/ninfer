@@ -23,6 +23,7 @@
 #include <filesystem>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 #if defined(_WIN32)
@@ -751,8 +752,51 @@ std::uint64_t host_expert_arena_bytes(std::uint64_t want_bytes) {
     return budget;
 }
 
+// port (sm_89): is the KV residency model in force for this construction? It is OPT-IN, and only
+// for an Explicit capacity:
+//   * automatic already spends the leftover Device budget on pages, so it has nothing to tier;
+//   * tiering the curve minimum means the Device pool is deliberately smaller than max_context, and
+//     requests past it are refused with a diagnostic instead of served. That is the right trade for
+//     a 256K plan on a 24 GB card, and the wrong default for everyone else - without the switch every
+//     existing run keeps the fully resident plan (and the exact numbers) it had.
+// NINFER_KV_NO_HOST_RESIDENCY is the A/B arm: it wins over the request, which is also how the
+// historical "minimum Engine runtime reservation requires ..." failure is reproduced on demand.
+bool kv_host_residency_requested(const EngineOptions& options) {
+    if (options.kv_capacity.mode != KvCapacityMode::Explicit) { return false; }
+    if (const char* off = std::getenv("NINFER_KV_NO_HOST_RESIDENCY");
+        off != nullptr && *off != '\0' && std::strcmp(off, "0") != 0) {
+        return false;
+    }
+    const char* on = std::getenv("NINFER_KV_HOST_RESIDENCY");
+    return on != nullptr && *on != '\0' && std::strcmp(on, "0") != 0;
+}
+
+// Device memory a residency plan keeps free. It is priced from free-after-weights, and the graph
+// capture plus the driver's own storage are paid from that same budget afterwards - measured on this
+// card the capture alone adds ~54 MiB. A plan with zero slack dies inside the capture instead of
+// starting, so the reservation holds this much back (overridable for a sweep).
+std::size_t kv_residency_slack_bytes() {
+    constexpr std::size_t kDefault = 512ULL << 20;
+    const char* value              = std::getenv("NINFER_KV_RESIDENCY_SLACK_MB");
+    if (value == nullptr || *value == '\0') { return kDefault; }
+    const auto mib = std::strtoull(value, nullptr, 10);
+    return static_cast<std::size_t>(mib) << 20;
+}
+
+// The residency contract is read from the environment while the decoder layout is planned
+// (state/decoder_state.cpp owns that gate), so the plan has to declare the window it will install
+// before the layout is built rather than after.
+void set_environment_value(const char* name, const std::string& value) {
+#if defined(_WIN32)
+    (void)_putenv_s(name, value.c_str());
+#else
+    (void)setenv(name, value.c_str(), 1);
+#endif
+}
+
 std::size_t current_free_device_bytes(bool wddm_evictable_budget = false,
-                                     std::size_t weights_bytes = 0) {    std::size_t free_bytes  = 0;
+                                     std::size_t weights_bytes = 0) {
+    std::size_t free_bytes  = 0;
     std::size_t total_bytes = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
 #if defined(_WIN32)
@@ -977,9 +1021,51 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
         const auto weights_bytes = instance->model->storage_stats().device_capacity_bytes;
         const auto conservative = current_free_device_bytes(
             options.wddm_evictable_budget, weights_bytes);
+        // port (sm_89): the residency split measured from the real layout. A model with no
+        // full-attention pages reports a zero payload stride and keeps the fully resident plan.
+        KvResidencyStrides strides = planner.residency_strides();
+        strides.tier_minimum_residency = true;
+        const bool tiered_mode = kv_host_residency_requested(options) &&
+                                 strides.payload_bytes_per_resident_page_group != 0;
+        const std::size_t slack = tiered_mode ? kv_residency_slack_bytes() : 0;
+        const auto plan_at      = [&](std::size_t budget) -> KvCapacityResolution {
+            if (!tiered_mode) {
+                return resolve_kv_capacity(options.kv_capacity, capacity_curve, budget);
+            }
+            const std::size_t usable = budget > slack ? budget - slack : 0;
+            const auto tiered        = resolve_kv_capacity_with_residency(
+                options.kv_capacity, capacity_curve, strides, usable);
+            KvCapacityResolution out;
+            out.mode                     = options.kv_capacity.mode;
+            out.main_page_groups         = tiered.logical_page_groups;
+            out.maximum_main_page_groups = capacity_curve.maximum_main_page_groups;
+            out.resolved_tokens = capacity_curve.resolved_tokens(tiered.logical_page_groups);
+            out.logical_page_groups  = tiered.logical_page_groups;
+            out.resident_page_groups = tiered.resident_page_groups;
+            out.device_kv_payload_bytes =
+                strides.payload_bytes_per_resident_page_group *
+                static_cast<std::size_t>(tiered.resident_page_groups);
+            out.host_kv_payload_bytes = tiered.host_payload_bytes;
+            out.kv_host_residency_active =
+                tiered.residency_active && tiered.resident_page_groups != tiered.logical_page_groups;
+            out.minimum_runtime_reservation_bytes = capacity_curve.minimum_device_reservation_bytes;
+            out.bytes_per_additional_main_page_group =
+                capacity_curve.bytes_per_additional_main_page_group;
+            out.runtime_reservation_bytes     = tiered.device_reservation_bytes;
+            out.available_after_weights_bytes = usable;
+            out.automatic_headroom_bytes      = options.kv_capacity.automatic_headroom_bytes;
+            out.planned_slack_bytes           = usable - tiered.device_reservation_bytes;
+            return out;
+        };
+        // A tiered plan is priced against what the driver can give back WITHOUT taking pages away
+        // from somebody else. The WDDM evictable budget below deliberately plans into memory the
+        // driver then has to reclaim, and reclaiming it from this process means paging the KV pool -
+        // measured on the 256K dense arm as 18 tok/s prefill against 2,826. So the retry is for the
+        // fully resident plan only; a tiered plan that does not fit in the honest budget is a plan
+        // that would page.
+        if (tiered_mode) { return plan_at(conservative); }
         try {
-            return resolve_kv_capacity(options.kv_capacity, planner.capacity_curve(),
-                                       conservative);
+            return plan_at(conservative);
         } catch (const std::invalid_argument& error) {
             // The instantaneous free count is not what the driver can actually give back. When
             // the plan misses it, fall back once to the WDDM evictable budget (total minus the
@@ -997,7 +1083,7 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
                          "WDDM evictable budget (%zu bytes) - paging may slow decode\n",
                          conservative, optimistic);
             std::fflush(stderr);
-            return resolve_kv_capacity(options.kv_capacity, planner.capacity_curve(), optimistic);
+            return plan_at(optimistic);
         }
     }();
     // The same instant the plan was priced against: after the weights, before the expert pool and
@@ -1077,7 +1163,48 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
             std::fflush(stderr);
         }
     }
-    auto sequence = std::move(planner).finalize(resolution.main_page_groups);
+    // port (sm_89): a captured decode graph cannot contain a Host fetch - the copy is followed by a
+    // cudaStreamSynchronize, which a capture forbids - so a tiered plan must not freeze one. The
+    // graph allowance stays in the plan (it is what the curve priced) but no capture is requested,
+    // exactly as the streamed expert tier does for the same reason.
+    if (resolution.kv_host_residency_active && options.use_cuda_graph) {
+        std::fprintf(stderr,
+                     "[graph] skipped: KV residency may need a Host fetch inside the step (the "
+                     "fetch's stream sync is illegal inside a capture)\n");
+        std::fflush(stderr);
+        options.use_cuda_graph = false;
+        planner.set_use_cuda_graph(false);
+    }
+    // port (sm_89): a residency plan addresses EVERY logical page - the full-attention layers read
+    // the whole history - so nothing may be masked. The window therefore keeps everything: sink 0
+    // and a span as long as the logical address space, which makes eff_window == live on every
+    // round. What is left of the absent-page machinery is then a pure fetch path: a page that is not
+    // resident is copied back before the step reads it, and the append path refuses to grow past
+    // what the pool can hold. The decoder layout refuses a Device pool below the logical capacity
+    // unless a retention contract is in force, and that gate reads the environment at layout time
+    // (state/decoder_state.cpp), so the contract has to be declared before the plan is finalized.
+    if (resolution.kv_host_residency_active) {
+        set_environment_value("NINFER_KV_EVICT_WINDOW",
+                              std::to_string(resolution.logical_page_groups));
+        models::qwen3_5::install_kv_eviction_window(0, resolution.logical_page_groups);
+        constexpr double kMib = 1024.0 * 1024.0;
+        std::fprintf(stderr,
+                     "[kv-residency] logical=%u page(s) resident=%u page(s) (%.1f%%) "
+                     "device_kv=%.1f MiB host_kv=%.1f MiB\n",
+                     resolution.logical_page_groups, resolution.resident_page_groups,
+                     100.0 * static_cast<double>(resolution.resident_page_groups) /
+                         static_cast<double>(resolution.logical_page_groups),
+                     static_cast<double>(resolution.device_kv_payload_bytes) / kMib,
+                     static_cast<double>(resolution.host_kv_payload_bytes) / kMib);
+        std::fflush(stderr);
+    }
+    auto sequence = std::move(planner).finalize(resolution.main_page_groups,
+                                                resolution.resident_page_groups,
+                                                resolution.host_kv_payload_bytes);
+    // port (sm_89): the layout's own KV payload, not the stride estimate - the draft cache adds one
+    // page of its own, which a per-page stride cannot see. This is the Device side of the two-tier
+    // account the ledger and the summaries report.
+    resolution.device_kv_payload_bytes = sequence.kv_payload_bytes();
     if (sequence.device_reservation_bytes() != resolution.runtime_reservation_bytes ||
         sequence.kv_capacity() != resolution.resolved_tokens) {
         throw std::logic_error("resolved KV capacity does not match the finalized Program plan");
@@ -1229,6 +1356,21 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
         }
     }
     instance->kv_capacity_resolution.free_after_startup_bytes = current_free_device_bytes(options.wddm_evictable_budget);
+    // port (sm_89): the two KV tiers, itemised in the same ledger the expert tiers use. Device holds
+    // the resident page groups; the Host tier holds the payload of every logical page that is not
+    // resident. Reported only for a tiered plan - a fully resident engine has one tier and the old
+    // silence, so every recorded run keeps its log shape.
+    if (resolution.kv_host_residency_active) {
+        const auto runtime = instance->program->memory_summary();
+        instance->ledger.set_cap(core::Tier::Device, resolution.runtime_reservation_bytes);
+        (void)instance->ledger.reserve(core::Tier::Device, "kv-device",
+                                       resolution.device_kv_payload_bytes);
+        instance->ledger.set_cap(core::Tier::Host, runtime.host_context_capacity_bytes);
+        (void)instance->ledger.reserve(core::Tier::Host, "kv-host",
+                                       resolution.host_kv_payload_bytes);
+        instance->ledger.report(resolution.device_kv_payload_bytes +
+                                resolution.host_kv_payload_bytes);
+    }
     const auto& stats = instance->model->storage_stats();
     LoadSummary summary;
     summary.architecture = models::architecture_name(instance->model->config().text.architecture);
@@ -1258,6 +1400,14 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
     summary.kv_available_after_startup_bytes =
         instance->kv_capacity_resolution.available_after_startup_bytes;
     summary.kv_bytes_per_additional_page_group = resolution.bytes_per_additional_main_page_group;
+    summary.kv_logical_page_groups             = resolution.logical_page_groups != 0
+                                                     ? resolution.logical_page_groups
+                                                     : resolution.main_page_groups;
+    summary.kv_resident_page_groups            = resolution.resident_page_groups != 0
+                                                     ? resolution.resident_page_groups
+                                                     : resolution.main_page_groups;
+    summary.kv_device_payload_bytes            = resolution.device_kv_payload_bytes;
+    summary.kv_host_payload_bytes              = resolution.host_kv_payload_bytes;
     return {std::move(instance), std::move(summary), std::move(context_cost.model)};
 }
 

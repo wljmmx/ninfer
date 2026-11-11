@@ -302,6 +302,17 @@ public:
                                                      ? out.kv_capacity_page_groups
                                                      : resolution.main_page_groups;
         out.kv_capacity_max_page_groups        = resolution.maximum_main_page_groups;
+        // port (sm_89): the residency split. The Program reports what it was built with; the
+        // resolution is the fallback for a model without a paged text cache.
+        out.kv_logical_page_groups =
+            out.kv_logical_page_groups != 0 ? out.kv_logical_page_groups
+                                            : resolution.logical_page_groups;
+        out.kv_resident_page_groups =
+            out.kv_resident_page_groups != 0 ? out.kv_resident_page_groups
+                                             : resolution.resident_page_groups;
+        out.kv_host_payload_bytes = out.kv_host_payload_bytes != 0
+                                        ? out.kv_host_payload_bytes
+                                        : resolution.host_kv_payload_bytes;
         out.evict_contract_effective =
             resolution.evict_contract_effective != 0 ? EvictionContract::On : EvictionContract::Off;
         out.evict_contract_reasons = resolution.evict_contract_reasons;

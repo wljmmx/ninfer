@@ -151,8 +151,14 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     // here knows about the contract on purpose: capping below the logical capacity without one is
     // caught loudly by plan_cache()'s guard instead of degrading silently.
     const std::uint32_t fitted_pages = plan.main_page_groups;
+    // port (sm_89): a residency plan names its Device pool explicitly (the resolution's resident page
+    // count), so the pool is built at that size while the execution tables keep one row per LOGICAL
+    // page. Zero - every plan before residency existed - keeps the old rule: the declared eviction
+    // budget if there is one, otherwise the logical page count.
     const std::uint32_t physical_pages =
-        declared_resident_pages(fitted_pages).value_or(fitted_pages);
+        plan.resident_page_groups != 0
+            ? plan.resident_page_groups
+            : declared_resident_pages(fitted_pages).value_or(fitted_pages);
     const std::uint64_t mtp_extra_pages =
         plan.features.mtp()
             ? static_cast<std::uint64_t>(plan.max_concurrency) *
@@ -1001,7 +1007,8 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
 }
 
 std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlanningInputs& inputs,
-                                                           std::uint32_t main_page_groups) {
+                                                           std::uint32_t main_page_groups,
+                                                           std::uint32_t resident_page_groups) {
     if (main_page_groups == 0) {
         throw std::invalid_argument("Main KV physical page count must be positive");
     }
@@ -1009,6 +1016,10 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->parameters           = inputs.parameters;
     impl->capacity             = inputs.capacity;
     impl->main_page_groups     = main_page_groups;
+    // The execution table is sized by the logical count; only the Device page pool follows the
+    // resident one. Both zero means "fully resident", which is what the persistent layout then does.
+    impl->logical_page_groups  = main_page_groups;
+    impl->resident_page_groups = resident_page_groups;
     impl->kv_capacity          = static_cast<std::uint32_t>(checked_i32(
         static_cast<std::uint64_t>(main_page_groups) * static_cast<std::uint32_t>(kPagedKVPageSize),
         "resolved Paged KV capacity exceeds int32"));
@@ -1166,7 +1177,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
 
     auto planner     = std::make_unique<qwen3_5::detail::SequencePlannerImpl>();
     planner->inputs  = inputs;
-    planner->minimum = build_sequence_candidate(inputs, minimum_pages);
+    planner->minimum = build_sequence_candidate(inputs, minimum_pages, 0);
     planner->curve   = runtime::SequenceCapacityCurve{
           .main_page_tokens                     = static_cast<std::uint32_t>(kPagedKVPageSize),
           .minimum_main_page_groups             = minimum_pages,
@@ -1180,23 +1191,68 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
     // budget in force, requiring a positive stride made every max_concurrency > 1 fail at startup
     // ("nonpositive KV capacity stride"), which is precisely the multi-lane 1M case.
     if (!declared_resident_pages(minimum_pages).has_value() && minimum_pages < maximum_pages) {
-        auto adjacent = build_sequence_candidate(inputs, minimum_pages + 1U);
+        auto adjacent = build_sequence_candidate(inputs, minimum_pages + 1U, 0);
         if (adjacent->device_reservation_bytes <= planner->minimum->device_reservation_bytes) {
             throw std::logic_error("Qwen3.5 sequence layout has a nonpositive KV capacity stride");
         }
         planner->curve.bytes_per_additional_main_page_group =
             adjacent->device_reservation_bytes - planner->minimum->device_reservation_bytes;
     }
+    // port (sm_89): the residency split, measured from the same two-point step rather than assumed.
+    // A candidate with one more PHYSICAL page group at the same logical count prices the payload of a
+    // resident page; one with one more LOGICAL page at the same physical count prices the ledger
+    // (block table plus page-score planes) that exists for every logical page regardless of
+    // residency. Building both is layout arithmetic only - no allocation happens here. The pair is
+    // left at zero when the model keeps no full-attention pages (nothing to tier) and kv_capacity.cpp
+    // then keeps the fully resident path.
+    if (inputs.parameters != nullptr &&
+        inputs.parameters->model.config().text.full_attention_layers != 0) {
+        const std::size_t anchor = planner->minimum->device_reservation_bytes;
+        const std::uint32_t extra_physical =
+            minimum_pages < std::numeric_limits<std::uint32_t>::max() ? minimum_pages + 1U
+                                                                     : minimum_pages;
+        const auto with_payload = build_sequence_candidate(inputs, minimum_pages, extra_physical);
+        const auto with_ledger  = build_sequence_candidate(inputs, extra_physical, minimum_pages);
+        if (with_payload->device_reservation_bytes > anchor &&
+            with_ledger->device_reservation_bytes >= anchor) {
+            planner->residency_strides.payload_bytes_per_resident_page_group =
+                with_payload->device_reservation_bytes - anchor;
+            planner->residency_strides.ledger_bytes_per_logical_page_group =
+                with_ledger->device_reservation_bytes - anchor;
+        }
+    }
     return planner;
 }
 
 std::unique_ptr<SequencePlanImpl>
 finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl> planner,
-                            std::uint32_t main_page_groups) {
+                            std::uint32_t main_page_groups, std::uint32_t resident_page_groups,
+                            std::size_t host_kv_payload_bytes) {
     if (planner == nullptr || planner->minimum == nullptr) {
         throw std::invalid_argument("Qwen3.5 sequence planner is empty");
     }
-    const std::size_t expected = planner->curve.reservation_bytes(main_page_groups);
+    // port (sm_89): a residency plan is priced by the residency formula (the anchor's fixed part plus
+    // payload for the resident pages plus ledger for every logical page); the fully resident plan is
+    // the same formula with resident == logical, which is exactly curve.reservation_bytes().
+    const std::uint32_t resident_pages =
+        resident_page_groups != 0 ? resident_page_groups : main_page_groups;
+    if (resident_pages > main_page_groups) {
+        // Only the planner's own stride probes build a candidate with more physical than logical
+        // pages; a plan that would execute with one is a caller bug, not a layout.
+        throw std::invalid_argument("resident KV page groups exceed the logical page groups");
+    }
+    const bool tiered = resident_pages != main_page_groups;
+    // A plan that places fewer pages than the curve minimum is exactly the anchor-tiered plan; the
+    // resolution that produced it priced it with the same switch, so the check below is priced with
+    // it too.
+    runtime::KvResidencyStrides strides = planner->residency_strides;
+    if (resident_pages < planner->curve.minimum_main_page_groups) {
+        strides.tier_minimum_residency = true;
+    }
+    const std::size_t expected =
+        tiered ? runtime::residency_device_bytes(planner->curve, strides, main_page_groups,
+                                                 resident_pages)
+               : planner->curve.reservation_bytes(main_page_groups);
     // Read the minimum's numbers before it may be moved out below; the diagnostic must not touch a
     // plan it no longer owns.
     const std::size_t min_persistent = planner->minimum->persistent.bytes;
@@ -1204,7 +1260,7 @@ finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl
     const std::size_t min_graph      = planner->minimum->graph_allowance_bytes;
     const std::size_t min_actual     = planner->minimum->device_reservation_bytes;
     std::unique_ptr<SequencePlanImpl> plan;
-    if (main_page_groups == planner->curve.minimum_main_page_groups) {
+    if (main_page_groups == planner->curve.minimum_main_page_groups && !tiered) {
         plan = std::move(planner->minimum);
     } else {
         // port (sm_89): the curve was sized before the expert pool existed, so its allowance is the
@@ -1217,8 +1273,21 @@ finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl
         // the allowance the minimum plan actually carries.
         basis.use_cuda_graph = planner->minimum->graph_allowance_bytes != 0 ||
                                planner->minimum->use_cuda_graph;
-        plan                 = build_sequence_candidate(basis, main_page_groups);
+        plan                 = build_sequence_candidate(basis, main_page_groups, resident_pages);
         plan->use_cuda_graph = planner->inputs.use_cuda_graph;
+    }
+    plan->host_kv_payload_bytes = host_kv_payload_bytes;
+    if (tiered) {
+        // The Host tier has to be able to hold every logical page that is not resident; the default
+        // Host budget is "8 GiB of KV plus eight StateImages", which a 256K plan exceeds. Raise it
+        // to the payload the resolution priced, and keep the existing default when that is larger.
+        const std::size_t needed = checked_add(
+            host_kv_payload_bytes,
+            checked_mul(8, plan->persistent.state_images.host.image_bytes,
+                        "Host context state requirement overflow"),
+            "Host KV residency requirement overflow");
+        const auto current = plan->context_cache.host_capacity_bytes.value_or(0);
+        plan->context_cache.host_capacity_bytes = std::max(current, needed);
     }
     if (plan->device_reservation_bytes != expected) {
         // port (sm_89): the curve predicts the reservation from a two-point step, so any component
@@ -1227,10 +1296,15 @@ finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl
         throw std::logic_error(
             std::string("Qwen3.5 physical sequence layout is not affine in Main KV page capacity:") +
             " groups=" + std::to_string(main_page_groups) +
+            " resident=" + std::to_string(resident_pages) +
             " min_groups=" + std::to_string(planner->curve.minimum_main_page_groups) +
             " actual=" + std::to_string(plan->device_reservation_bytes) +
             " expected=" + std::to_string(expected) +
             " stride=" + std::to_string(planner->curve.bytes_per_additional_main_page_group) +
+            " payload_stride=" +
+            std::to_string(planner->residency_strides.payload_bytes_per_resident_page_group) +
+            " ledger_stride=" +
+            std::to_string(planner->residency_strides.ledger_bytes_per_logical_page_group) +
             " persistent=" + std::to_string(plan->persistent.bytes) +
             " workspace=" + std::to_string(plan->workspace.capacity) +
             " graph=" + std::to_string(plan->graph_allowance_bytes) +

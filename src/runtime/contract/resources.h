@@ -127,6 +127,15 @@ struct KvCapacityResolution {
     std::uint32_t main_page_groups                   = 0;
     std::uint32_t maximum_main_page_groups           = 0;
     std::uint32_t resolved_tokens                    = 0;
+    // port (sm_89): the residency split. `main_page_groups` is the LOGICAL capacity (execution
+    // tables, block table, resolved tokens); the Device page pool is built at `resident_page_groups`
+    // and the payload of the difference is what the Host KV tier holds. Equal counts and a zero
+    // payload on every fully resident plan, which is what the engine produced before residency.
+    std::uint32_t logical_page_groups                = 0;
+    std::uint32_t resident_page_groups               = 0;
+    std::size_t device_kv_payload_bytes              = 0;
+    std::size_t host_kv_payload_bytes                = 0;
+    bool kv_host_residency_active                    = false;
     std::size_t minimum_runtime_reservation_bytes    = 0;
     std::size_t bytes_per_additional_main_page_group = 0;
     std::size_t runtime_reservation_bytes            = 0;

@@ -159,6 +159,68 @@ int main() {
     failures += check(strides_rejected,
                       "residency strides inconsistent with the capacity stride were accepted");
 
+    // --- port (sm_89): tiering the anchor (the 256K dense case) --------------------------------
+    // The original model can only tier the pages ABOVE the curve minimum, and on this family the
+    // curve minimum IS one full max_context - so a 262,144-token request (9.4 GB of KV on a 24 GB
+    // card) had no plan at all. `tier_minimum_residency` prices the anchor's payload per resident
+    // page as well: the anchor's fixed part (workspace, graph, the non-KV persistent layout) plus
+    // payload per resident page group plus the ledger of every logical page group.
+    const ninfer::runtime::KvResidencyStrides tiering_strides{
+        .payload_bytes_per_resident_page_group = 983040,
+        .ledger_bytes_per_logical_page_group   = 4,
+        .tier_minimum_residency                = true,
+    };
+
+    // A budget above the anchor must produce the SAME plan as before: enabling the switch cannot
+    // move a configuration that already fit.
+    const auto tiered_above = ninfer::runtime::resolve_kv_capacity_with_residency(
+        ninfer::KvCapacityPolicy::explicit_capacity(1000000), measured_curve, tiering_strides,
+        7060000000ULL);
+    failures += check(tiered_above.resident_page_groups == 6486 &&
+                          tiered_above.device_reservation_bytes == 7059553828ULL &&
+                          tiered_above.host_payload_bytes == 8984002560ULL,
+                      "anchor tiering moved a plan whose fully resident footprint already fit");
+
+    // The real 256K shape: one page group per 64 tokens and the curve minimum at max_context, so
+    // the fully resident anchor alone is 4.71 GB - more than the whole post-weight budget.
+    const ninfer::runtime::SequenceCapacityCurve dense_256k_curve{
+        .main_page_tokens                     = 64,
+        .minimum_main_page_groups             = 4096,
+        .maximum_main_page_groups             = 4096,
+        .minimum_device_reservation_bytes     = 4710042112ULL,
+        .bytes_per_additional_main_page_group = 983044,
+    };
+    bool strict_rejected = false;
+    try {
+        (void)ninfer::runtime::resolve_kv_capacity_with_residency(
+            ninfer::KvCapacityPolicy::explicit_capacity(262144), dense_256k_curve, measured_strides,
+            3000000000ULL);
+    } catch (const std::invalid_argument&) { strict_rejected = true; }
+    failures += check(strict_rejected,
+                      "the strict residency model accepted a plan below its fully resident anchor");
+
+    const auto anchor_tiered = ninfer::runtime::resolve_kv_capacity_with_residency(
+        ninfer::KvCapacityPolicy::explicit_capacity(262144), dense_256k_curve, tiering_strides,
+        3000000000ULL);
+    // fixed = anchor - payload*4096 = 683,510,272; resident = (3 GB - fixed)/983,040 = 2356.
+    constexpr std::size_t kFixed = 683510272ULL;
+    failures += check(anchor_tiered.logical_page_groups == 4096 &&
+                          anchor_tiered.resident_page_groups == 2356 &&
+                          anchor_tiered.device_reservation_bytes ==
+                              kFixed + 983040ULL * 2356 + 4ULL * (4096 - 4096) &&
+                          anchor_tiered.host_payload_bytes == 983040ULL * (4096 - 2356) &&
+                          anchor_tiered.fully_resident_reservation_bytes == 4710042112ULL,
+                      "anchor tiering did not split 256K across Device and Host");
+
+    // A budget that cannot hold even one reseated page group is a hard failure, not a zero-page plan.
+    bool empty_rejected = false;
+    try {
+        (void)ninfer::runtime::resolve_kv_capacity_with_residency(
+            ninfer::KvCapacityPolicy::explicit_capacity(262144), dense_256k_curve, tiering_strides,
+            683510271ULL);
+    } catch (const std::invalid_argument&) { empty_rejected = true; }
+    failures += check(empty_rejected, "anchor tiering accepted a plan with no resident page group");
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

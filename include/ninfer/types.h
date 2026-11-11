@@ -1121,6 +1121,20 @@ struct MemorySummary {
     // minus the explicit reservation. Driver/module storage and delayed loading land here.
     std::int64_t startup_retained_bytes = 0;
     std::size_t kv_payload_bytes                  = 0;
+    // port (sm_89): the residency split as the running Program sees it. `kv_payload_bytes` above is
+    // the Device-side payload of the resident page groups; `kv_host_payload_bytes` is the payload of
+    // the logical pages that live in the Host tier. `kv_fetched_*` / `kv_spilled_*` are the live
+    // counters for the swap paths, so "did a fetch actually happen" is a number, not an inference.
+    std::uint32_t kv_logical_page_groups  = 0;
+    std::uint32_t kv_resident_page_groups = 0;
+    std::size_t kv_host_payload_bytes     = 0;
+    std::uint64_t kv_fetched_pages        = 0;
+    std::uint64_t kv_spilled_pages        = 0;
+    std::uint64_t kv_fetched_bytes        = 0;
+    std::uint64_t kv_spilled_bytes        = 0;
+    // True when the Host context backing is pinned (DMA-able). False is the documented pageable
+    // degradation, not a failure: the demotion/fetch copies then stage through the driver.
+    bool host_context_pinned = false;
     // One shared physical Host context backing. Reserved bytes are included in occupied bytes;
     // State/KV occupancy below is a breakdown and must not be added to this ledger again.
     std::size_t host_context_capacity_bytes = 0;
@@ -1310,6 +1324,12 @@ struct LoadSummary {
     std::uint64_t kv_available_after_weights_bytes   = 0;
     std::uint64_t kv_available_after_startup_bytes   = 0;
     std::uint64_t kv_bytes_per_additional_page_group = 0;
+    // port (sm_89): the residency split the plan was priced with - logical page groups (execution
+    // tables / resolved tokens) vs the resident Device page groups, plus the payload each tier holds.
+    std::uint32_t kv_logical_page_groups  = 0;
+    std::uint32_t kv_resident_page_groups = 0;
+    std::uint64_t kv_device_payload_bytes = 0;
+    std::uint64_t kv_host_payload_bytes   = 0;
 };
 
 } // namespace ninfer

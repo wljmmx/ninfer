@@ -228,8 +228,24 @@ set_tests_properties(ninfer_qwen3_5_resize_pinned_graph_real_test PROPERTIES
 set_tests_properties(ninfer_qwen3_5_resize_handoff_real_test PROPERTIES
   TIMEOUT 1800)
 # A 19 GiB resident load plus the vision arm; the default timeout is not enough for the upload alone.
+# port (sm_89): the fixture now also carries the 256K residency arm, which builds a second 19 GiB
+# engine in a process of its own (see the registration below), hence the larger ceiling.
 set_tests_properties(ninfer_qwen3_5_dense_real_test PROPERTIES
-  TIMEOUT 3600)
+  TIMEOUT 5400)
+
+# port (sm_89): the 256K arm of the same fixture - "logical KV capacity above what the Device can
+# hold resident, the rest on the Host". It is a separate ctest entry because it must own a fresh
+# process: two 19 GiB engines back to back left the second one seeing "0 bytes free" on WDDM even
+# though the first had been destroyed. Its own budget: one construction (~2 min), the one-token
+# contract, and - with NINFER_TEST_256K_BENCH/OVERRUN set - a 32K-token decode and the refusal arm.
+add_test(NAME ninfer_qwen3_5_dense_256k_residency_test
+  COMMAND ninfer_qwen3_5_dense_real_test)
+set_tests_properties(ninfer_qwen3_5_dense_256k_residency_test PROPERTIES
+  ENVIRONMENT "NINFER_TEST_DENSE_ARM=256k"
+  SKIP_RETURN_CODE 77
+  RUN_SERIAL TRUE
+  LABELS "gpu;real"
+  TIMEOUT 5400)
 
 set_tests_properties(
   ninfer_qwen3_5_state_image_test

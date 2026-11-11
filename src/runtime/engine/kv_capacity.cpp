@@ -20,6 +20,11 @@ std::size_t checked_mul(std::size_t a, std::size_t b, const char* label) {
     return a * b;
 }
 
+std::size_t checked_sub(std::size_t a, std::size_t b, const char* label) {
+    if (b > a) { throw std::overflow_error(label); }
+    return a - b;
+}
+
 void validate_curve(const SequenceCapacityCurve& curve) {
     if (curve.main_page_tokens == 0 || curve.minimum_main_page_groups == 0 ||
         curve.minimum_main_page_groups > curve.maximum_main_page_groups ||
@@ -50,23 +55,51 @@ bool residency_configured(const KvResidencyStrides& strides) {
            strides.ledger_bytes_per_logical_page_group != 0;
 }
 
-// Anchor + payload per resident page + ledger per logical page. Both page counts are expressed
-// relative to the curve minimum, where the anchor reservation is exact.
-std::size_t residency_reservation_bytes(const SequenceCapacityCurve& curve,
-                                        const KvResidencyStrides& strides, std::uint32_t logical,
-                                        std::uint32_t resident) {
-    const std::size_t payload = checked_mul(
-        static_cast<std::size_t>(resident - curve.minimum_main_page_groups),
-        strides.payload_bytes_per_resident_page_group, "KV residency payload overflows size_t");
-    const std::size_t ledger = checked_mul(
+// The anchor's non-payload part: everything the fully resident plan reserves at the curve minimum
+// except the KV payload itself (workspace, graph allowance, the non-KV persistent layout).
+std::size_t anchor_fixed_bytes(const SequenceCapacityCurve& curve,
+                               const KvResidencyStrides& strides) {
+    const std::size_t anchor_payload = checked_mul(
+        static_cast<std::size_t>(curve.minimum_main_page_groups),
+        strides.payload_bytes_per_resident_page_group, "KV residency anchor overflows size_t");
+    return checked_sub(curve.minimum_device_reservation_bytes, anchor_payload,
+                       "KV residency payload stride exceeds the fully resident anchor");
+}
+
+} // namespace
+
+std::size_t residency_device_bytes(const SequenceCapacityCurve& curve,
+                                   const KvResidencyStrides& strides, std::uint32_t logical,
+                                   std::uint32_t resident) {
+    if (logical < resident) {
+        throw std::invalid_argument("KV residency logical pages are below the resident set");
+    }
+    if (logical < curve.minimum_main_page_groups) {
+        throw std::invalid_argument("KV residency logical pages are below the capacity curve");
+    }
+    const std::size_t payload_stride = strides.payload_bytes_per_resident_page_group;
+    const std::size_t ledger         = checked_mul(
         static_cast<std::size_t>(logical - curve.minimum_main_page_groups),
         strides.ledger_bytes_per_logical_page_group, "KV residency ledger overflows size_t");
+    if (resident < curve.minimum_main_page_groups) {
+        if (!strides.tier_minimum_residency) {
+            throw std::invalid_argument(
+                "KV residency cannot place fewer pages than the curve minimum without tiering the "
+                "anchor");
+        }
+        const std::size_t payload = checked_mul(static_cast<std::size_t>(resident), payload_stride,
+                                                "KV residency payload overflows size_t");
+        return checked_add(checked_add(anchor_fixed_bytes(curve, strides), payload,
+                                       "KV residency reservation overflows size_t"),
+                           ledger, "KV residency reservation overflows size_t");
+    }
+    const std::size_t payload = checked_mul(
+        static_cast<std::size_t>(resident - curve.minimum_main_page_groups), payload_stride,
+        "KV residency payload overflows size_t");
     return checked_add(checked_add(curve.minimum_device_reservation_bytes, payload,
                                    "KV residency reservation overflows size_t"),
                        ledger, "KV residency reservation overflows size_t");
 }
-
-} // namespace
 
 std::size_t SequenceCapacityCurve::reservation_bytes(std::uint32_t main_page_groups) const {
     validate_curve(*this);
@@ -206,10 +239,15 @@ KvResidencyResolution resolve_kv_capacity_with_residency(const KvCapacityPolicy&
         return resolution;
     }
 
-    if (checked_add(strides.payload_bytes_per_resident_page_group,
+    // The two strides are the two halves of the curve's own step, so they have to reconstruct it.
+    // A FLAT curve (minimum == maximum, i.e. one lane at exactly max_context) has no step at all and
+    // reports zero - while the same strides still describe how its anchor decomposes, which is
+    // exactly what anchor tiering needs. So the identity is only required when there is a stride.
+    if (curve.bytes_per_additional_main_page_group != 0 &&
+        checked_add(strides.payload_bytes_per_resident_page_group,
                     strides.ledger_bytes_per_logical_page_group,
                     "KV residency strides overflow size_t") !=
-        curve.bytes_per_additional_main_page_group) {
+            curve.bytes_per_additional_main_page_group) {
         throw std::invalid_argument(
             "KV residency strides do not add up to the capacity curve stride");
     }
@@ -230,13 +268,17 @@ KvResidencyResolution resolve_kv_capacity_with_residency(const KvCapacityPolicy&
     resolution.fully_resident_reservation_bytes = curve.reservation_bytes(logical);
 
     // Ledger for every logical page exists regardless of residency; the largest residency that
-    // fits the budget then follows from the payload stride.
+    // fits the budget then follows from the payload stride. Tiering the anchor also withdraws the
+    // anchor's payload, so the floor becomes the anchor's fixed part plus the whole ledger.
+    const std::size_t ledger = checked_mul(
+        static_cast<std::size_t>(logical - curve.minimum_main_page_groups),
+        strides.ledger_bytes_per_logical_page_group, "KV residency ledger overflows size_t");
     const std::size_t with_ledger =
-        checked_add(curve.minimum_device_reservation_bytes,
-                    checked_mul(static_cast<std::size_t>(logical - curve.minimum_main_page_groups),
-                                strides.ledger_bytes_per_logical_page_group,
-                                "KV residency ledger overflows size_t"),
-                    "KV residency reservation overflows size_t");
+        strides.tier_minimum_residency
+            ? checked_add(anchor_fixed_bytes(curve, strides), ledger,
+                          "KV residency reservation overflows size_t")
+            : checked_add(curve.minimum_device_reservation_bytes, ledger,
+                          "KV residency reservation overflows size_t");
     if (available_runtime_bytes < with_ledger) {
         throw std::invalid_argument(
             "minimum Engine runtime reservation requires " + std::to_string(with_ledger) +
@@ -249,15 +291,27 @@ KvResidencyResolution resolve_kv_capacity_with_residency(const KvCapacityPolicy&
     if (strides.payload_bytes_per_resident_page_group != 0) {
         const std::size_t affordable =
             (available_runtime_bytes - with_ledger) / strides.payload_bytes_per_resident_page_group;
-        const std::uint64_t candidate =
-            static_cast<std::uint64_t>(curve.minimum_main_page_groups) + affordable;
+        const std::uint64_t floor_pages = strides.tier_minimum_residency
+                                              ? 0ULL
+                                              : static_cast<std::uint64_t>(
+                                                    curve.minimum_main_page_groups);
+        const std::uint64_t candidate = floor_pages + affordable;
         resident = static_cast<std::uint32_t>(
             std::min<std::uint64_t>(candidate, static_cast<std::uint64_t>(logical)));
     }
+    if (resident == 0) {
+        throw std::invalid_argument(
+            "KV residency budget holds no page group: the anchor needs " +
+            std::to_string(with_ledger) + " bytes plus " +
+            std::to_string(strides.payload_bytes_per_resident_page_group) +
+            " bytes per resident page group, but only " +
+            std::to_string(available_runtime_bytes) + " bytes are available");
+    }
 
-    resolution.resident_page_groups      = resident;
-    resolution.device_reservation_bytes  = residency_reservation_bytes(curve, strides, logical, resident);
-    resolution.host_payload_bytes        = checked_mul(
+    resolution.resident_page_groups = resident;
+    resolution.device_reservation_bytes =
+        residency_device_bytes(curve, strides, logical, resident);
+    resolution.host_payload_bytes = checked_mul(
         static_cast<std::size_t>(logical - resident),
         strides.payload_bytes_per_resident_page_group, "KV residency host payload overflows size_t");
     return resolution;

@@ -1,5 +1,6 @@
 #pragma once
 #include "models/qwen3_5/program/internal.h"
+#include "runtime/engine/kv_capacity.h"
 
 #include "core/cyclic_kv_cache.h"
 #include "core/dtype.h"
@@ -86,6 +87,11 @@ struct SequencePlanningInputs {
     int device                        = 0;
     std::int32_t multiprocessor_count = 0;
     ContextCacheOptions context_cache;
+    // port (sm_89): the Device page pool this plan is built with. Zero means "fully resident": the
+    // pool follows the logical page count, exactly as every pre-residency caller expects. A nonzero
+    // value builds the pool at that size while the execution tables stay logical, which is what lets
+    // logical capacity exceed what the Device can hold resident.
+    std::uint32_t resident_page_groups = 0;
 };
 
 struct SequencePlanImpl {
@@ -109,11 +115,21 @@ struct SequencePlanImpl {
     WorkspacePlan workspace;
     std::size_t graph_allowance_bytes    = 0;
     std::size_t device_reservation_bytes = 0;
+    // port (sm_89): logical (execution table) vs resident (Device page pool) page groups, and the
+    // payload the plan leaves on the Host side. Equal page counts and a zero payload when the plan
+    // is fully resident, which is the only shape a plan had before residency existed.
+    std::uint32_t logical_page_groups  = 0;
+    std::uint32_t resident_page_groups = 0;
+    std::size_t host_kv_payload_bytes  = 0;
 };
 
 struct SequencePlannerImpl {
     SequencePlanningInputs inputs;
     runtime::SequenceCapacityCurve curve;
+    // port (sm_89): measured from the real layout, not assumed - the payload a resident page group
+    // costs and the ledger every logical page group costs on top. The two must add up to the curve
+    // stride, and kv_capacity.cpp refuses the plan if they do not.
+    runtime::KvResidencyStrides residency_strides;
     std::unique_ptr<SequencePlanImpl> minimum;
 };
 
@@ -149,6 +165,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
                            const EngineOptions& options);
 [[nodiscard]] std::unique_ptr<SequencePlanImpl>
 finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl> planner,
-                            std::uint32_t main_page_groups);
+                            std::uint32_t main_page_groups, std::uint32_t resident_page_groups = 0,
+                            std::size_t host_kv_payload_bytes = 0);
 
 } // namespace ninfer::models::qwen3_5::detail

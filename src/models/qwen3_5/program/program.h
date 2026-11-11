@@ -2,6 +2,7 @@
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
+#include "runtime/engine/kv_capacity.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/prefill_row.h"
 #include <array>
@@ -66,6 +67,10 @@ public:
     [[nodiscard]] std::uint32_t kv_capacity() const noexcept;
     [[nodiscard]] std::uint32_t max_concurrency() const noexcept;
     [[nodiscard]] std::size_t device_reservation_bytes() const noexcept;
+    // port (sm_89): the KV payload the plan actually lays out on the Device (K/V planes of the
+    // resident page groups plus the draft cache's own pages). The resolution's stride-based estimate
+    // cannot know the draft's extra page, so this is what the ledger and the summary report.
+    [[nodiscard]] std::size_t kv_payload_bytes() const noexcept;
     [[nodiscard]] std::size_t workspace_capacity_bytes() const noexcept;
     [[nodiscard]] std::size_t host_capacity_bytes() const noexcept;
 
@@ -89,10 +94,19 @@ public:
     SequencePlanner& operator=(const SequencePlanner&) = delete;
 
     [[nodiscard]] const runtime::SequenceCapacityCurve& capacity_curve() const noexcept;
+    // port (sm_89): the measured split of the curve stride into "payload of a resident Device page
+    // group" and "ledger of a logical page group". Both zero when the model keeps no full-attention
+    // pages, and then the residency model stays inactive.
+    [[nodiscard]] const runtime::KvResidencyStrides& residency_strides() const noexcept;
     // port (sm_89): a captured decode graph is only valid while the expert resident set is fixed,
     // and that is known only after the pool is attached. Must be called before finalize().
     void set_use_cuda_graph(bool enabled) noexcept;
-    [[nodiscard]] SequencePlan finalize(std::uint32_t main_page_groups) &&;
+    // `resident_page_groups` (0 = fully resident) is the Device page pool the plan is built with, and
+    // `host_kv_payload_bytes` the payload the Host tier must be able to hold. Both come straight from
+    // the capacity resolution; passing the defaults reproduces the pre-residency plan exactly.
+    [[nodiscard]] SequencePlan finalize(std::uint32_t main_page_groups,
+                                        std::uint32_t resident_page_groups = 0,
+                                        std::size_t host_kv_payload_bytes  = 0) &&;
 
 private:
     explicit SequencePlanner(std::unique_ptr<detail::SequencePlannerImpl> impl) noexcept;
