@@ -272,6 +272,206 @@ int exercise_vision(ninfer::Engine& engine) {
 
 } // namespace
 
+// port (sm_89): the overrun arm of the KV residency contract.
+//
+// A prompt longer than the Device pool's resident page groups cannot be served at all: the
+// full-attention layers read the whole history every step, so nothing can be streamed from the Host
+// tier mid-step. The refusal must therefore arrive as an ERROR that names the two token counts, in
+// bounded time, and the engine must still serve the next request - not be a request that runs
+// forever. Measured by hand before this test existed: a 60,001-token prompt against a 59,648-token
+// resident set was still outstanding after an hour. The capacity path answered the shortfall at the
+// first bind (2 main + 1 backend page) by PAUSING the very lane that could never fit, and the request
+// then sat in the paused set with nothing driving it back (`paused=1 resident=0 pending=0`, still
+// true 240 s later), so neither the Program's own refusal nor any completion path was ever reached.
+// port (sm_89): the swap arm. The residency counters are only interesting if something actually
+// crosses the tier boundary, and a single short request never does: it touches one page group, which
+// is resident, so fetched_pages stays 0 by construction. This arm builds the one legal pressure
+// scenario the design has - a retained prefix that must give up its Device pages so a later request
+// can be prefilled, and a third request that reuses that prefix, which has to FETCH it back:
+//
+//   R1  prefix A (4K tokens), reuse on  -> its checkpoint is retained, Device-resident
+//   R2  filler B that fills the pool    -> the admission of B's last chunks runs out of Device pages,
+//                                          so the retained checkpoint is DEMOTED to the Host tier
+//   R3  prefix A again, reuse on        -> binding fetches those pages back (Host -> Device)
+//
+// The correctness check is the one the tier contract already uses: R3 must produce the same greedy
+// tokens as R1, because the KV it reads is the same KV.
+int exercise_256k_swap(ninfer::Engine& engine, std::uint32_t resident_pages,
+                       const std::vector<ninfer::TokenId>& sample) {
+    const std::uint64_t resident_tokens = static_cast<std::uint64_t>(resident_pages) * 64ULL;
+    if (resident_tokens < 8192ULL) {
+        std::cerr << "[256k] swap arm needs a pool of at least 8K resident tokens, has "
+                  << resident_tokens << '\n';
+        return 1;
+    }
+    const auto make_prompt = [&engine](std::uint32_t tokens, const char* seed) {
+        std::string text = seed;
+        while (text.size() <= static_cast<std::size_t>(tokens) * 8ULL) { text += seed; }
+        std::vector<ninfer::TokenId> prompt = engine.tokenize_text(text);
+        if (prompt.size() > tokens) { prompt.resize(tokens); }
+        return prompt;
+    };
+    const std::uint32_t prefix_tokens = 4096;
+    // Fill all but a few page groups: the last chunks of B are what force the demotion.
+    const std::uint64_t filler_tokens =
+        resident_tokens > 1024ULL ? resident_tokens - 512ULL : resident_tokens * 3ULL / 4ULL;
+    const std::vector<ninfer::TokenId> prefix = make_prompt(prefix_tokens, "Alpha bravo charlie delta echo foxtrot. ");
+    const std::vector<ninfer::TokenId> filler = make_prompt(
+        static_cast<std::uint32_t>(filler_tokens), "Zulu yankee xray whiskey victor uniform tango. ");
+
+    const auto counters = [&engine](const char* tag) {
+        const ninfer::MemorySummary memory = engine.memory_summary();
+        std::cerr << "[256k] swap " << tag << ": spilled_pages=" << memory.kv_spilled_pages
+                  << " fetched_pages=" << memory.kv_fetched_pages
+                  << " host_occupied=" << memory.host_context_occupied_bytes
+                  << " host_capacity=" << memory.host_context_capacity_bytes << std::endl;
+        return memory;
+    };
+    const auto clock = std::chrono::steady_clock::now();
+    const auto elapsed = [&clock] {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - clock).count();
+    };
+
+    (void)counters("before");
+    const ninfer::GenerationResult first =
+        engine.generate(engine.prepare_tokens(prefix), greedy_options(2, true));
+    std::cerr << "[256k] swap R1: prompt=" << first.prompt.prompt_tokens
+              << " reused=" << first.reused_prompt_tokens
+              << " outputs=" << first.generated_token_ids.size() << " t=" << elapsed() << " s"
+              << std::endl;
+    if (first.generated_token_ids.size() != 2) {
+        std::cerr << "[256k] swap R1 did not generate two tokens\n";
+        return 1;
+    }
+    const auto after_first = counters("R1");
+
+    const ninfer::GenerationResult filling =
+        engine.generate(engine.prepare_tokens(filler), greedy_options(1, false));
+    std::cerr << "[256k] swap R2: prompt=" << filling.prompt.prompt_tokens
+              << " prefill_s=" << filling.timings.prefill_seconds << " t=" << elapsed() << " s"
+              << std::endl;
+    const auto after_fill = counters("R2");
+
+    const ninfer::GenerationResult reused =
+        engine.generate(engine.prepare_tokens(prefix), greedy_options(2, true));
+    std::cerr << "[256k] swap R3: prompt=" << reused.prompt.prompt_tokens
+              << " reused=" << reused.reused_prompt_tokens
+              << " computed=" << reused.computed_prefill_tokens
+              << " ttft_s=" << reused.timings.first_token_seconds << " t=" << elapsed() << " s"
+              << std::endl;
+    const auto after_reuse = counters("R3");
+
+    if (after_reuse.kv_fetched_pages <= after_fill.kv_fetched_pages) {
+        std::cerr << "[256k] swap: no Host -> Device fetch was counted (" << after_fill.kv_fetched_pages
+                  << " -> " << after_reuse.kv_fetched_pages << ")\n";
+        return 1;
+    }
+    if (after_fill.host_context_occupied_bytes == 0 ||
+        after_reuse.host_context_occupied_bytes == 0) {
+        std::cerr << "[256k] swap: the Host KV tier never held the demoted pages\n";
+        return 1;
+    }
+    if (reused.reused_prompt_tokens == 0) {
+        std::cerr << "[256k] swap R3 did not reuse the retained prefix\n";
+        return 1;
+    }
+    if (reused.generated_token_ids != first.generated_token_ids) {
+        std::cerr << "[256k] swap R3 diverged from R1:";
+        for (const auto token : first.generated_token_ids) { std::cerr << ' ' << token; }
+        std::cerr << " vs";
+        for (const auto token : reused.generated_token_ids) { std::cerr << ' ' << token; }
+        std::cerr << '\n';
+        return 1;
+    }
+    std::cerr << "[256k] swap: spilled=" << after_fill.kv_spilled_pages
+              << " fetched=" << (after_reuse.kv_fetched_pages - after_fill.kv_fetched_pages)
+              << " pages, host_occupied=" << after_reuse.host_context_occupied_bytes
+              << " B, tokens identical, total=" << elapsed() << " s" << std::endl;
+    (void)after_first;
+    return 0;
+}
+
+int exercise_256k_overrun(ninfer::Engine& engine, std::uint32_t resident_pages,
+                          std::uint32_t resolved_tokens,
+                          const std::vector<ninfer::TokenId>& sample) {
+    constexpr double kRefusalBudgetSeconds = 60.0;
+    const std::uint64_t resident_tokens    = static_cast<std::uint64_t>(resident_pages) * 64ULL;
+    if (resident_tokens == 0 || resolved_tokens <= resident_tokens) {
+        std::cerr << "[256k] overrun arm needs a split plan: resident=" << resident_tokens
+                  << " resolved=" << resolved_tokens << '\n';
+        return 1;
+    }
+    // The prompt is one page group plus a little: enough to be refused, cheap enough that a refusal
+    // that has to walk the whole prefill still finishes.
+    const std::uint64_t wanted = resident_tokens + 353ULL;
+    const std::uint32_t overrun =
+        static_cast<std::uint32_t>(std::min<std::uint64_t>(wanted, resolved_tokens));
+    std::string text;
+    while (text.size() <= static_cast<std::size_t>(overrun) * 8ULL) {
+        text += "The quick brown fox jumps over the lazy dog. ";
+    }
+    std::vector<ninfer::TokenId> prompt = engine.tokenize_text(text);
+    if (prompt.size() > overrun) { prompt.resize(overrun); }
+    if (prompt.size() <= resident_tokens) {
+        std::cerr << "[256k] overrun arm could not build an over-limit prompt: tokens="
+                  << prompt.size() << " resident_tokens=" << resident_tokens << '\n';
+        return 1;
+    }
+
+    std::cerr << "[256k] overrun: prompt_tokens=" << prompt.size()
+              << " resident_tokens=" << resident_tokens << std::endl;
+    const auto started = std::chrono::steady_clock::now();
+    bool refused       = false;
+    std::string message;
+    try {
+        const ninfer::GenerationResult served =
+            engine.generate(engine.prepare_tokens(prompt), greedy_options(1, false));
+        std::cerr << "[256k] overrun was SERVED: outputs=" << served.generated_token_ids.size()
+                  << " finish=" << static_cast<int>(served.finish_reason) << std::endl;
+    } catch (const std::exception& error) {
+        refused = true;
+        message = error.what();
+    }
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    std::cerr << "[256k] overrun refusal: refused=" << (refused ? 1 : 0) << " seconds=" << seconds
+              << " message=\"" << message << "\"" << std::endl;
+
+    if (!refused) {
+        std::cerr << "[256k] an over-limit prompt was not refused\n";
+        return 1;
+    }
+    if (message.find("prompt_tokens=") == std::string::npos ||
+        message.find("resident_tokens=") == std::string::npos) {
+        std::cerr << "[256k] the refusal does not name the prompt/resident token counts: " << message
+                  << '\n';
+        return 1;
+    }
+    if (seconds > kRefusalBudgetSeconds) {
+        std::cerr << "[256k] the refusal took " << seconds << " s (budget "
+                  << kRefusalBudgetSeconds << " s)\n";
+        return 1;
+    }
+
+    // The engine still serves. Same session, same Program, a request inside the resident set.
+    const ninfer::GenerationResult after =
+        engine.generate(engine.prepare_tokens(sample), greedy_options(1, false));
+    std::cerr << "[256k] after the refusal: outputs=" << after.generated_token_ids.size()
+              << " finish=" << static_cast<int>(after.finish_reason) << std::endl;
+    if (after.generated_token_ids.size() != 1 ||
+        after.finish_reason != ninfer::FinishReason::OutputLimit) {
+        std::cerr << "[256k] the engine did not serve a normal request after the refusal: outputs="
+                  << after.generated_token_ids.size()
+                  << " finish=" << static_cast<int>(after.finish_reason) << '\n';
+        return 1;
+    }
+    const ninfer::MemorySummary summary = engine.memory_summary();
+    std::cerr << "[256k] after the refusal: resident_pages=" << summary.kv_resident_page_groups
+              << " logical_pages=" << summary.kv_logical_page_groups
+              << " host_occupied=" << summary.host_context_occupied_bytes << std::endl;
+    return 0;
+}
+
 // port (sm_89): the 256K arm - "logical capacity above the Device residency, the rest on the Host".
 //
 // The artifact's Int8Group64 KV costs 35,936 B/token, so 262,144 tokens are ~9.4 GB against the
@@ -422,6 +622,38 @@ int exercise_256k_residency(const char* artifact) {
               << " spilled_pages=" << after.kv_spilled_pages
               << " spilled_bytes=" << after.kv_spilled_bytes
               << " host_occupied=" << after.host_context_occupied_bytes << std::endl;
+    // The plan's own slack: the value in force, not the one the reader assumes. A run that exports
+    // NINFER_KV_RESIDENCY_SLACK_MB overrides it (that is how the 512 MiB paging arm is reproduced).
+    std::cerr << "[256k] residency slack=" << load.kv_residency_slack_bytes
+              << " B (" << (load.kv_residency_slack_bytes >> 20) << " MiB) default="
+              << ((std::getenv("NINFER_KV_RESIDENCY_SLACK_MB") == nullptr) ? 1 : 0) << std::endl;
+    if (std::getenv("NINFER_KV_RESIDENCY_SLACK_MB") == nullptr &&
+        load.kv_residency_slack_bytes != (2048ULL << 20)) {
+        std::cerr << "[256k] the default residency slack is not 2 GiB: " << load.kv_residency_slack_bytes
+                  << " B\n";
+        return 1;
+    }
+
+    // port (sm_89): the overrun arm - a prompt longer than the resident set must come back as an
+    // ERROR, in bounded time, and the engine must still serve afterwards. Measured by hand before the
+    // fix: a 60,001-token prompt against a 59,648-token resident set never returned (the request was
+    // still outstanding after an hour).
+    if (const int result = exercise_256k_overrun(*engine, load.kv_resident_page_groups,
+                                                 load.kv_resolved_tokens, prompt);
+        result != 0) {
+        return result;
+    }
+
+    // The swap arm is a pressure scenario, not a contract: it prefills almost the whole resident set
+    // to force the retained prefix onto the Host tier and then reuses it. Opt-in because it costs
+    // ~30 s of prefill that the residency contract itself does not need.
+    if (const char* swap = std::getenv("NINFER_TEST_256K_SWAP"); swap != nullptr && *swap != '\0' &&
+                                                                    std::string(swap) != "0") {
+        if (const int result = exercise_256k_swap(*engine, load.kv_resident_page_groups, prompt);
+            result != 0) {
+            return result;
+        }
+    }
 
     // Optional: a decode long enough for a rate. The 1-token contract above is what the fixture
     // pins; this arm is the measurement (min-of-N comes from repeating the binary).

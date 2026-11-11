@@ -237,7 +237,9 @@ set_tests_properties(ninfer_qwen3_5_dense_real_test PROPERTIES
 # hold resident, the rest on the Host". It is a separate ctest entry because it must own a fresh
 # process: two 19 GiB engines back to back left the second one seeing "0 bytes free" on WDDM even
 # though the first had been destroyed. Its own budget: one construction (~2 min), the one-token
-# contract, and - with NINFER_TEST_256K_BENCH/OVERRUN set - a 32K-token decode and the refusal arm.
+# contract, the overrun refusal (which must return in bounded time - measured inside the test) and,
+# with NINFER_TEST_256K_BENCH, a 32K-token decode. The 1800 s ceiling is deliberately tighter than
+# "an hour later": the overrun request used to hang forever, and this entry has to fail loudly.
 add_test(NAME ninfer_qwen3_5_dense_256k_residency_test
   COMMAND ninfer_qwen3_5_dense_real_test)
 set_tests_properties(ninfer_qwen3_5_dense_256k_residency_test PROPERTIES
@@ -245,7 +247,21 @@ set_tests_properties(ninfer_qwen3_5_dense_256k_residency_test PROPERTIES
   SKIP_RETURN_CODE 77
   RUN_SERIAL TRUE
   LABELS "gpu;real"
-  TIMEOUT 5400)
+  TIMEOUT 1800)
+
+# port (sm_89): the swap arm of the same fixture. It is the only scenario in which the Host KV tier
+# actually does work under residency: R1 retains a 4K-token prefix, R2 prefills almost the whole
+# resident set (which forces the retained prefix onto the Host tier), and R3 reuses the prefix so the
+# binding has to fetch it back. Asserts fetched_pages > 0, host_occupied > 0 and R3 == R1 token for
+# token. Its own process and its own budget: one construction (~2 min) plus ~25 s of prefills.
+add_test(NAME ninfer_qwen3_5_dense_256k_swap_test
+  COMMAND ninfer_qwen3_5_dense_real_test)
+set_tests_properties(ninfer_qwen3_5_dense_256k_swap_test PROPERTIES
+  ENVIRONMENT "NINFER_TEST_DENSE_ARM=256k;NINFER_TEST_256K_SWAP=1"
+  SKIP_RETURN_CODE 77
+  RUN_SERIAL TRUE
+  LABELS "gpu;real"
+  TIMEOUT 1800)
 
 set_tests_properties(
   ninfer_qwen3_5_state_image_test

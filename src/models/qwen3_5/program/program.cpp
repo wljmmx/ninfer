@@ -180,6 +180,18 @@ std::uint32_t Program::prefill_remaining(std::uint32_t lane) const {
     return impl_->prefill_remaining(lane);
 }
 
+std::uint32_t Program::kv_residency_token_limit() const noexcept {
+    return impl_->kv_residency_token_limit();
+}
+
+std::uint32_t Program::sequence_execution_frontier(SequenceHandle sequence) const noexcept {
+    return impl_->sequence_execution_frontier(sequence);
+}
+
+std::uint32_t Program::kv_residency_step_growth() const noexcept {
+    return impl_->kv_residency_step_growth();
+}
+
 std::size_t Program::prefill_batch_rows(std::span<const std::uint32_t> lanes,
                                         std::span<execution::PrefillRow> out) {
     return impl_->prefill_batch_rows(lanes, out);

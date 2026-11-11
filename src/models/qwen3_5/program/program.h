@@ -549,6 +549,20 @@ public:
     // cursor lives in the Program, not in the engine's request record, so the batch container asks
     // here for what a merged pass would be padded to.
     [[nodiscard]] std::uint32_t prefill_remaining(std::uint32_t lane) const;
+    // port (sm_89): the live edge of the KV residency contract, and how far one lane's KV has grown.
+    // Under residency the Device pool deliberately holds only a subset of the logical pages (the
+    // Host tier carries the rest), and the full-attention layers read the whole history every step,
+    // so a request whose live history exceeds the pool cannot be served at all - not by waiting and
+    // not by swapping. `kv_residency_token_limit()` is that bound in tokens as the LIVE pool edge
+    // (the control plane can shrink the pool at runtime), and 0 means "no residency contract: every
+    // logical page is resident". The Runtime asks the pair before it hands a lane an execution unit,
+    // so a request that can never fit is refused with its numbers instead of being paused and
+    // replayed against a bound it can never satisfy.
+    [[nodiscard]] std::uint32_t kv_residency_token_limit() const noexcept;
+    [[nodiscard]] std::uint32_t sequence_execution_frontier(SequenceHandle sequence) const noexcept;
+    // The most a single Decode step adds to that frontier (its token plus the draft window when a
+    // speculative backend runs). The Runtime prices a step's growth with it.
+    [[nodiscard]] std::uint32_t kv_residency_step_growth() const noexcept;
     // Q67/S1: name each lane's place in a merged prefill pass (build only; nothing executes).
     std::size_t prefill_batch_rows(std::span<const std::uint32_t> lanes,
                                    std::span<execution::PrefillRow> out);

@@ -632,6 +632,33 @@ struct HostKvMgmtTimer {
 };
 } // namespace
 
+// port (sm_89): the Device page pool's LIVE edge. The control plane's KV dial can shrink the pool at
+// runtime, so both the refusal below and the Runtime's pre-flight read this and not the plan.
+std::uint32_t ProgramImpl::residency_device_page_capacity() const noexcept {
+    return text_kv_pages != nullptr ? text_kv_pages->physical_pool().capacity_pages()
+                                    : kv_resident_page_groups;
+}
+
+std::uint32_t ProgramImpl::kv_residency_token_limit() const noexcept {
+    // No residency contract: the Device pool holds every logical page, so there is no bound to
+    // report (0 is the "unbounded" answer the Runtime tests for).
+    if (kv_resident_page_groups >= kv_logical_page_groups) { return 0; }
+    return residency_device_page_capacity() * static_cast<std::uint32_t>(kPagedKVPageSize);
+}
+
+std::uint32_t ProgramImpl::sequence_execution_frontier(SequenceHandle handle) const noexcept {
+    if (!valid_sequence(handle)) { return 0; }
+    return sequences[ContractAccess::lane(handle).value].execution_frontier;
+}
+
+std::uint32_t ProgramImpl::kv_residency_step_growth() const noexcept {
+    // The most a single Decode step can add to the main frontier: its own token, plus the draft
+    // window when a speculative backend appends ahead of the committed frontier. Prefill and Replay
+    // never grow past the prompt, which the Runtime already bounded against the same limit when it
+    // admitted the request.
+    return 1U + (backend_kv_cache() != nullptr ? draft_window : 0U);
+}
+
 void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& state, std::uint32_t main,
                                             std::uint32_t backend) {
     const HostKvMgmtTimer kv_mgmt_timer(kv_host_timing_enabled());
@@ -640,14 +667,14 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& state, std::uint32_t 
     // read the whole history every step, so every live page has to be resident at once. Refuse here,
     // with the numbers, rather than letting the append die inside the page pool - and far rather than
     // letting attention read a block-table entry whose Device replica was already given back.
+    // This is the LAST line of defence: the Runtime refuses such a request before it grants a unit
+    // (see kv_residency_token_limit()), because a refusal thrown out of a step fails every lane.
     if (kv_resident_page_groups < kv_logical_page_groups && main != 0) {
         const std::uint32_t page_tokens = static_cast<std::uint32_t>(kPagedKVPageSize);
         const std::uint32_t needed      = 1U + (main - 1U) / page_tokens;
         // The live edge, not the construction number: the control plane's KV dial can shrink the
         // pool at runtime, and a guard that read the plan would then promise room that is gone.
-        const std::uint32_t resident_capacity =
-            text_kv_pages != nullptr ? text_kv_pages->physical_pool().capacity_pages()
-                                     : kv_resident_page_groups;
+        const std::uint32_t resident_capacity = residency_device_page_capacity();
         if (needed > resident_capacity) {
             throw std::runtime_error(
                 "KV residency cannot serve this step: it needs " + std::to_string(needed) +

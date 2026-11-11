@@ -1000,6 +1000,35 @@ private:
         }
     }
 
+    // port (sm_89): refuse ONE request that the Device KV residency cannot hold.
+    //
+    // The pool is deliberately smaller than max_context - the Host tier prices the difference - and a
+    // full-attention layer reads its whole history every step, so "longer than the resident set" is a
+    // property of the request, not a transient shortage. Before this existed the capacity path treated
+    // it as a shortage: reserve_resident_units() paused the very lane that could never fit, and the
+    // request then stayed in the paused set with nothing driving it back (measured with the pre-flight
+    // disabled: `paused=1 resident=0 pending=0 tx=0` for as long as the run was observed, no
+    // completion, and the Program's own refusal at storage/sequence.cpp's ensure_sequence_kv_mapped()
+    // was never reached because the unit reservation refuses first). The numbers are part of the
+    // message because the caller's only remedy is to shorten the prompt or to plan more residency.
+    void refuse_kv_residency(const std::shared_ptr<Request>& request, std::uint32_t live_tokens,
+                             std::uint32_t resident_tokens) {
+        const std::uint32_t prompt_tokens =
+            request->base_plan ? request->base_plan->summary().prompt_tokens : live_tokens;
+        complete_error(
+            request,
+            std::make_exception_ptr(RequestError(
+                RequestErrorKind::ContextLengthExceeded,
+                "KV residency cannot serve this request: prompt_tokens=" +
+                    std::to_string(prompt_tokens) + " live_tokens=" + std::to_string(live_tokens) +
+                    " resident_tokens=" + std::to_string(resident_tokens) +
+                    " (the Device KV pool is tiered: it holds the resident part of max_context, and "
+                    "the full-attention layers read the whole history every step, so the history "
+                    "cannot be streamed from the Host tier). Shorten the prompt, or leave more "
+                    "Device memory to the pool (NINFER_KV_RESIDENCY_SLACK_MB, or a smaller "
+                    "max_context).")));
+    }
+
     [[nodiscard]] std::array<bool, kMaximumConcurrency> snapshot_cancellations() const noexcept {
         std::array<bool, kMaximumConcurrency> cancelled{};
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
@@ -2348,6 +2377,24 @@ private:
                     request->admission_generation = admission_generation_;
                 }
                 ensure_base_plan(request);
+                // port (sm_89): a prompt the residency contract can never hold is refused HERE, before
+                // any unit, snapshot or pause is booked for it. This is the only place with the whole
+                // answer: the prompt length, the live pool edge, and no execution state to unwind.
+                // The alternative was the pause-then-strand path described at refuse_kv_residency().
+                if (!restoring) {
+                    const std::uint32_t resident_limit =
+                        instance_.program->kv_residency_token_limit();
+                    const std::uint32_t prompt_tokens = request->base_plan->summary().prompt_tokens;
+                    if (resident_limit != 0 && prompt_tokens > resident_limit) {
+                        {
+                            std::lock_guard lock(queue_mutex_);
+                            std::erase(pending_, request);
+                        }
+                        refuse_kv_residency(request, prompt_tokens, resident_limit);
+                        request_admission_check();
+                        continue;
+                    }
+                }
                 const auto retained = resources_.retained_source(request->id);
                 const auto revoked  = resources_.source_revocations(request->id);
                 if (!restoring && revoked > request->admission.revoked_checkpoints) {
@@ -2675,6 +2722,24 @@ private:
                                                  : request->output.model_token_budget_remaining(
                                                        request->budget->remaining()))
                     : 0U};
+            // port (sm_89): the same bound the Program checks at the step, asked BEFORE the unit is
+            // reserved - so an overrun is refused as one request instead of entering the
+            // reclaim/pause path, where a request that can never obtain a legal unit ends up paused
+            // with nobody driving it back. Prefill/Replay grow at most to the prompt, which admission
+            // already bounded; a Control step grows by its own token count.
+            if (const std::uint32_t resident_limit = instance_.program->kv_residency_token_limit();
+                resident_limit != 0) {
+                const std::uint32_t live =
+                    instance_.program->sequence_execution_frontier(*request->sequence);
+                const std::uint32_t growth =
+                    request->is_control_ready()  ? unit.tokens
+                    : request->is_decode_ready() ? instance_.program->kv_residency_step_growth()
+                                                 : 0U;
+                if (live + growth > resident_limit) {
+                    refuse_kv_residency(request, live, resident_limit);
+                    continue;
+                }
+            }
             std::optional<typename ResourceManagement::ReclaimCursor> cursor;
             for (;;) {
                 const auto result = instance_.program->reserve_units({&unit, 1});

@@ -787,6 +787,14 @@ public:
     // The batch container needs it to decide what a merged pass would be padded to; the cursor lives
     // here, not in the engine's request record.
     [[nodiscard]] std::uint32_t prefill_remaining(std::uint32_t lane) const;
+    // port (sm_89): the live KV residency bound (0 = every logical page is resident) and how far a
+    // lane's KV has actually grown. ensure_sequence_kv_mapped() refuses against the first of these;
+    // the Runtime asks the pair before it grants a unit, so a request that can never fit under the
+    // contract never enters the pause/replay path.
+    [[nodiscard]] std::uint32_t kv_residency_token_limit() const noexcept;
+    [[nodiscard]] std::uint32_t sequence_execution_frontier(SequenceHandle) const noexcept;
+    [[nodiscard]] std::uint32_t kv_residency_step_growth() const noexcept;
+    [[nodiscard]] std::uint32_t residency_device_page_capacity() const noexcept;
     // Q67/S1 step 1: name each lane's place in a merged pass - its own KV address row, its absolute
     // base, how many prompt tokens it contributes, and the state slots it reads and writes. Builds
     // only; nothing executes until advance_prefill_batch exists.
