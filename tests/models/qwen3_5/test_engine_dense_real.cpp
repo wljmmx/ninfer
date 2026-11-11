@@ -75,6 +75,7 @@ int report_loaded_product(const ninfer::Engine& engine) {
               << memory.sequence.capacity_bytes << " workspace=" << memory.workspace.used_bytes
               << "/" << memory.workspace.capacity_bytes
               << " kv_payload=" << memory.kv_payload_bytes
+              << " kv_cache=" << static_cast<int>(memory.kv_cache)
               << " graph_allowance=" << memory.cuda_graph_allowance_bytes
               << " available_after_weights=" << memory.available_after_weights_bytes
               << " free_after_startup=" << memory.free_after_startup_bytes << std::endl;
@@ -85,6 +86,13 @@ int report_loaded_product(const ninfer::Engine& engine) {
                   << load.architecture << " model=" << load.model_name
                   << " artifact_bytes=" << load.artifact_bytes_read
                   << " h2d_bytes=" << load.host_to_device_bytes << '\n';
+        return 1;
+    }
+    // The construction contract this fixture asks for, read back from the engine's own report.
+    if (memory.max_context != 4096 || memory.kv_cache != ninfer::KvCacheStorage::Int8Group64) {
+        std::cerr << "27B dense Engine resolved a different cache contract: context="
+                  << memory.max_context
+                  << " kv_cache=" << static_cast<int>(memory.kv_cache) << '\n';
         return 1;
     }
     // The whole product is resident here (no routed-expert streaming), so the KV resolution has to
