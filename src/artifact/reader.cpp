@@ -202,7 +202,9 @@ const std::filesystem::path& Reader::path() const noexcept { return impl_->entry
 // index, so it keeps that meaning; a caller that needs the file an index names - the PLE table does,
 // because its rows live past the entry - asks for open_part() instead. (The expert reader passes a
 // file index here and therefore reads the entry: a pre-existing defect of that tier, left as it is
-// so its streamed bytes and the baselines measured against them do not change under this work.)
+// so its streamed bytes and the baselines measured against them do not change under this work. What
+// the entry-only handle does to a part-relative read is on record: the PLE table's scale plane came
+// back as zeros until open_part() existed.)
 std::unique_ptr<InputFile> Reader::open_file(std::size_t file_index) const {
     if (file_index >= impl_->files.size()) {
         throw ArtifactError("file index is outside the artifact file set");
