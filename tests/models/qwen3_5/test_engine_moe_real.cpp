@@ -11,10 +11,13 @@
 namespace {
 
 // Both shipped artifacts carry a vision component (441 vision bindings each), so the tower is in
-// the file; what decides whether this fixture exercises it is an explicit request. The fixture used
-// to pin enable_vision = false and then report "artifact has no vision tower", which named the wrong
-// cause for a missing workspace.
-bool vision_requested() { return std::getenv("NINFER_TEST_VISION") != nullptr; }
+// the file and the default arm exercises it. The fixture used to pin enable_vision = false and then
+// report "artifact has no vision tower", which named the artifact for a decision the fixture made.
+// NINFER_TEST_VISION=0 keeps a text-only arm for an artifact that has no tower.
+bool vision_requested() {
+    const char* value = std::getenv("NINFER_TEST_VISION");
+    return value == nullptr || *value == '\0' || (*value != '0' && *value != 'n' && *value != 'N');
+}
 
 ninfer::EngineOptions engine_options(const char* artifact) {
     ninfer::EngineOptions options;
@@ -286,7 +289,7 @@ int main() {
             if (const int result = exercise_vision(engine); result != 0) { return result; }
         } else {
             std::cerr << "[step] exercise_vision skipped: not requested by this fixture "
-                         "(set NINFER_TEST_VISION=1)\n";
+                         "(set NINFER_TEST_VISION=0 for a text-only arm)\n";
         }
     } catch (const std::exception& error) {
         const std::string message = error.what();

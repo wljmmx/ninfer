@@ -11,9 +11,12 @@
 namespace {
 
 // Port (sm_89): the dense counterpart of test_engine_moe_real.cpp. The shipped 27B artifact carries
-// a vision component (441 vision bindings), so the tower is in the file; what decides whether this
-// fixture exercises it is the explicit request, not the artifact.
-bool vision_requested() { return std::getenv("NINFER_TEST_VISION") != nullptr; }
+// a vision component (441 vision bindings), so the tower is in the file and the default arm exercises
+// it; NINFER_TEST_VISION=0 keeps a text-only arm for the release that has no tower.
+bool vision_requested() {
+    const char* value = std::getenv("NINFER_TEST_VISION");
+    return value == nullptr || *value == '\0' || (*value != '0' && *value != 'n' && *value != 'N');
+}
 
 // The artifact's text config declares architectures = ["Qwen3_5ForCausalLM"] and
 // model_type = "qwen3_5_text" (single dense stack, 64 layers, no routed experts). Asserting the name
@@ -288,7 +291,7 @@ int main() {
             if (const int result = exercise_vision(engine); result != 0) { return result; }
         } else {
             std::cerr << "[step] exercise_vision skipped: not requested by this fixture "
-                         "(set NINFER_TEST_VISION=1)\n";
+                         "(set NINFER_TEST_VISION=0 for a text-only arm)\n";
         }
     } catch (const std::exception& error) {
         const std::string message = error.what();
