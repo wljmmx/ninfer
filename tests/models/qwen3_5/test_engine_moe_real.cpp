@@ -10,6 +10,12 @@
 
 namespace {
 
+// Both shipped artifacts carry a vision component (441 vision bindings each), so the tower is in
+// the file; what decides whether this fixture exercises it is an explicit request. The fixture used
+// to pin enable_vision = false and then report "artifact has no vision tower", which named the wrong
+// cause for a missing workspace.
+bool vision_requested() { return std::getenv("NINFER_TEST_VISION") != nullptr; }
+
 ninfer::EngineOptions engine_options(const char* artifact) {
     ninfer::EngineOptions options;
     options.artifact_path             = artifact;
@@ -20,7 +26,7 @@ ninfer::EngineOptions engine_options(const char* artifact) {
     options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens  = 3;
     options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
-    options.enable_vision             = false;
+    options.enable_vision             = vision_requested();
     options.use_cuda_graph            = true;
     return options;
 }
@@ -67,17 +73,19 @@ int verify_loaded_product(const ninfer::Engine& engine) {
     }
 
     const ninfer::MemorySummary memory = engine.memory_summary();
-    // The fused text-only a3b artifact carries no vision tower and these engine options
-    // disable vision, so the real contract is an absent vision workspace
-    // (program_impl only reports it when the workspace plan built one). Asserting an
-    // absent workspace pins that contract instead of demanding fields a text model
-    // never materializes.
-    const bool vision_absent = !memory.vision_workspace.has_value();
+    // The vision workspace exists exactly when this construction planned for it, which follows the
+    // request, not the artifact.
+    if (memory.vision_workspace.has_value() != vision_requested()) {
+        std::cerr << "35B Engine vision workspace does not match the requested mode: requested="
+                  << (vision_requested() ? 1 : 0)
+                  << " reported=" << (memory.vision_workspace.has_value() ? 1 : 0) << '\n';
+        return 1;
+    }
     if (memory.weights.capacity_bytes == 0 || memory.weights.used_bytes == 0 ||
         memory.weights.used_bytes > memory.weights.capacity_bytes ||
         memory.sequence.capacity_bytes == 0 || memory.sequence.used_bytes == 0 ||
         memory.sequence.used_bytes > memory.sequence.capacity_bytes ||
-        memory.workspace.capacity_bytes == 0 || !vision_absent ||
+        memory.workspace.capacity_bytes == 0 ||
         memory.workspace_logical_peak_bytes != 0 || memory.cuda_graph_allowance_bytes == 0) {
         std::cerr << "35B Engine construction has an invalid memory summary\n";
         return 1;
@@ -199,9 +207,9 @@ int exercise_vision(ninfer::Engine& engine) {
 int exercise_maximum_configuration(const char* artifact) {
     ninfer::Engine engine(maximum_engine_options(artifact));
     const ninfer::MemorySummary memory = engine.memory_summary();
-    // Same contract as verify_loaded_product: this artifact has no vision tower and the
-    // options disable vision, so the summary must not report a vision workspace.
-    const bool vision_absent = !memory.vision_workspace.has_value();
+    // Same contract as verify_loaded_product: the vision workspace follows the request, not the
+    // artifact (both shipped artifacts carry the tower).
+    const bool vision_ok = memory.vision_workspace.has_value() == vision_requested();
     // A 256K plan on a device that cannot hold the resident tier runs with the routed experts in
     // host RAM, which the engine can only do without graph capture (a streamed bank uploads and
     // synchronizes inside the layer). The allowance is the plan's graph reservation, so it is zero
@@ -213,7 +221,7 @@ int exercise_maximum_configuration(const char* artifact) {
         memory.kv_payload_bytes == 0 || memory.sequence.capacity_bytes == 0 ||
         memory.sequence.used_bytes == 0 ||
         memory.sequence.used_bytes > memory.sequence.capacity_bytes ||
-        memory.workspace.capacity_bytes == 0 || !vision_absent || !graph_budget_ok) {
+        memory.workspace.capacity_bytes == 0 || !vision_ok || !graph_budget_ok) {
         std::cerr << "35B maximum configuration does not match the planned 256K layout: context="
                   << memory.max_context << " kv_payload=" << memory.kv_payload_bytes
                   << " sequence=" << memory.sequence.capacity_bytes
@@ -271,14 +279,14 @@ int main() {
         if (const int result = verify_loaded_product(engine); result != 0) { return result; }
         std::cerr << "[step] exercise_text_mtp_and_prefix" << std::endl;
         if (const int result = exercise_text_mtp_and_prefix(engine); result != 0) { return result; }
-        // The fused a3b artifact is text-only: no vision tower, no vision workspace, so
-        // the vision exercise has no contract to check against this artifact. Run it only
-        // when the workspace plan actually built vision backing.
+        // The artifact carries a vision component; the workspace exists exactly when the request
+        // asked for it. Say which of the two decided the skip instead of blaming the artifact.
         if (engine.memory_summary().vision_workspace.has_value()) {
             std::cerr << "[step] exercise_vision" << std::endl;
             if (const int result = exercise_vision(engine); result != 0) { return result; }
         } else {
-            std::cerr << "[step] exercise_vision skipped: artifact has no vision tower" << std::endl;
+            std::cerr << "[step] exercise_vision skipped: not requested by this fixture "
+                         "(set NINFER_TEST_VISION=1)\n";
         }
     } catch (const std::exception& error) {
         const std::string message = error.what();
