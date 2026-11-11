@@ -2,6 +2,14 @@ ninfer_add_test(ninfer_artifact_reader_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_reader.cpp"
   LIBRARIES ninfer_artifact)
 
+# port (sm_89): the expert reader's object resolution. A chunk names an object and an offset inside
+# it; the artifact's file table decides which file holds that byte. The fixture puts objects in the
+# continuation parts, so the bytes the old file-index lookup returned (the entry's, i.e. another
+# object's) and the bytes the object actually holds are both asserted.
+ninfer_add_test(ninfer_artifact_expert_reader_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_reader_objects.cpp"
+  LIBRARIES ninfer_artifact)
+
 # port (sm_89) T117: the closed format/layout registry, including the block-scaled FP8 names the
 # expert path needs. Host-only and cheap; it grades names, not payloads.
 ninfer_add_test(ninfer_artifact_formats_test

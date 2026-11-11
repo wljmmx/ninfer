@@ -1,5 +1,6 @@
 #pragma once
 
+#include "artifact/expert_reader.h"
 #include "core/expert_cache.h"
 #include "core/expert_file.h"
 #include "core/weight_bank.h"
@@ -208,7 +209,7 @@ public:
             // port (sm_89): a fused bank keeps codes, high and scales in three runs per matrix, far
             // apart inside one object, so one per-expert offset cannot name all three. Each plane
             // gets its own table (WeightBankView::codes_offsets and friends), filled from the chunk
-            // table - which is the authority on where a run starts, and is file absolute, the same
+            // table - which is the authority on where a run starts, and is object relative, the same
             // convention the per-expert plan below uses.
             if (allow_direct && !banks_[i].per_expert && reader_ != nullptr &&
                 !bank_files.experts.empty() && banks_[i].entry.count > 0) {
@@ -217,7 +218,7 @@ public:
                 const auto& dn_layout = banks_[i].down_layout;
                 const auto count      = static_cast<std::uint32_t>(entry.count);
                 bool usable           = !bank_files.experts.front().chunks.empty();
-                const std::uint32_t file_index =
+                const std::uint32_t object_index =
                     usable ? bank_files.experts.front().chunks.front().file_index : 0;
                 // widest chunk seen per plane: the layout and the artifact do not agree on it.
                 std::uint64_t plane_bytes[6] = {};
@@ -228,7 +229,7 @@ public:
                         break;
                     }
                     for (const auto& chunk : ex.chunks) {
-                        if (chunk.file_index != file_index) {
+                        if (chunk.file_index != object_index) {
                             usable = false;
                             break;
                         }
@@ -281,7 +282,7 @@ public:
                 reach(s.dn_high, std::max<std::uint64_t>(dn_layout.high.expert_bytes, plane_bytes[4]));
                 reach(s.dn_scales,
                       std::max<std::uint64_t>(dn_layout.scales.expert_bytes, plane_bytes[5]));
-                const auto* mapped = usable ? reader_->object_base(file_index) : nullptr;
+                const auto* mapped = usable ? reader_->object_base(object_index) : nullptr;
                 if (mapped != nullptr) {
                     s.gate_up_parent.geometry       = banks_[i].gate_up_geometry;
                     s.gate_up_parent.geometry.bytes = extent;
@@ -321,66 +322,101 @@ public:
             }
 
             // port (sm_89): a per-expert bank is addressable in place. Its experts are one object
-            // each, but those objects live in one container file and the chunk table already says
-            // where each image starts, so the per-expert offset table the arena path fills with a
-            // slot can name a place in the mapped file instead: no ensure, no arena bytes, no second
-            // pass over 2.8 MB per layer.
+            // each, so the bank needs one mapping per matrix plus each expert's object offset inside
+            // that mapping: the chunk table names objects and offsets inside them (object relative,
+            // the convention every reader now shares), and object_mapping_of() answers where an
+            // object sits in its file. No ensure, no arena bytes, no second pass over 2.8 MB per
+            // layer.
             //
             // The image is contiguous per matrix, not as a whole: on the 35B artifact an expert's
             // gate_up run sits at 3,383,009,792 and its down run 284 MB later (measured). Each
             // matrix has its own parent and its own offset table, so the two runs are resolved
             // independently - which is exactly why the single-parent form failed before. The offset
-            // stored is `run_base + plane_offset_in_image`, the same shape the arena branch stores
-            // as `slot * slot_bytes + plane_offset`, so the op cannot tell the two apart.
+            // stored is `object_offset_in_file + run_in_object + plane_offset_in_image`, the same
+            // shape the arena branch stores as `slot * slot_bytes + plane_offset`, so the op cannot
+            // tell the two apart. An object that crosses a part boundary has no single mapping, so
+            // such a bank keeps the arena path.
             if (allow_direct && banks_[i].per_expert && reader_ != nullptr &&
                 !bank_files.experts.empty() && !bank_files.experts.front().chunks.empty()) {
-                const auto file_index  = bank_files.experts.front().chunks.front().file_index;
-                const auto& entry      = banks_[i].entry;
-                const auto down_origin = entry.down_codes.offset;
-                bool usable            = true;
+                const auto& entry       = banks_[i].entry;
+                const auto down_origin  = entry.down_codes.offset;
+                const auto experts      = bank_files.experts.size();
+                bool usable             = true;
                 std::uint64_t widest_end = 0;
-                std::vector<std::uint64_t> gate_up_run(bank_files.experts.size(), 0);
-                std::vector<std::uint64_t> down_run(bank_files.experts.size(), 0);
+                std::vector<std::uint64_t> gate_up_run(experts, 0);
+                std::vector<std::uint64_t> down_run(experts, 0);
+                std::vector<std::uint32_t> gate_up_object(experts, 0);
+                std::vector<std::uint32_t> down_object(experts, 0);
+                const std::byte* gate_up_base = nullptr;
+                const std::byte* down_base    = nullptr;
+                std::uint64_t gate_up_place   = 0;
+                std::uint64_t down_place      = 0;
                 // The planes are stored plane-major across the bank, so each expert's run base
                 // differs (run_base + expert * stride). What has to hold is that, inside one expert
-                // and one matrix, every chunk names the same base: that is what makes the pair of
-                // pointers the op derives from `base + offset[e]` land on the right bytes.
-                for (std::size_t e = 0; e < bank_files.experts.size() && usable; ++e) {
+                // and one matrix, every chunk names the same object and the same run: that is what
+                // makes the pair of pointers the op derives from `base + offset[e]` land on the
+                // right bytes.
+                for (std::size_t e = 0; e < experts && usable; ++e) {
                     const auto& expert_entry = bank_files.experts[e];
                     if (expert_entry.chunks.empty()) { usable = false; break; }
                     bool have_gate_up = false, have_down = false;
                     for (const auto& chunk : expert_entry.chunks) {
-                        if (chunk.file_index != file_index) { usable = false; break; }
                         const auto run      = chunk.file_offset - chunk.image_offset;
                         const bool is_down  = chunk.image_offset >= down_origin;
                         auto& base          = is_down ? down_run[e] : gate_up_run[e];
+                        auto& object        = is_down ? down_object[e] : gate_up_object[e];
                         auto& seen          = is_down ? have_down : have_gate_up;
                         if (!seen) {
-                            base = run;
-                            seen = true;
-                        } else if (base != run) {
+                            base   = run;
+                            object = chunk.file_index;
+                            seen   = true;
+                        } else if (base != run || object != chunk.file_index) {
                             usable = false;
                             break;
                         }
                     }
                     if (!usable) { break; }
-                    widest_end = std::max<std::uint64_t>(widest_end, gate_up_run[e] + entry.entry_bytes);
-                    widest_end = std::max<std::uint64_t>(widest_end, down_run[e] + entry.entry_bytes);
+                    const auto gate_up_mapping = artifact::object_mapping_of(*reader_, gate_up_object[e]);
+                    const auto down_mapping    = artifact::object_mapping_of(*reader_, down_object[e]);
+                    if (!gate_up_mapping || !down_mapping) {
+                        usable = false;
+                        break;
+                    }
+                    // One base per matrix: the first expert names it, and every later expert has to
+                    // sit in the same mapping - a second file is a second address space, and offsets
+                    // from one do not address the other.
+                    if (e == 0) {
+                        gate_up_base  = gate_up_mapping->base;
+                        gate_up_place = gate_up_mapping->offset;
+                        down_base     = down_mapping->base;
+                        down_place    = down_mapping->offset;
+                    } else if (gate_up_mapping->base != gate_up_base ||
+                               down_mapping->base != down_base) {
+                        usable = false;
+                        break;
+                    }
+                    // Every chunk already lies inside the object it named (the loader built it from
+                    // the object's own payload range), so the run base is inside that object by
+                    // construction; what the mapping has to guarantee is only that the base pointer
+                    // comes from the file the object was solved in.
+                    widest_end = std::max<std::uint64_t>(
+                        widest_end, gate_up_place + gate_up_run[e] + entry.entry_bytes);
+                    widest_end = std::max<std::uint64_t>(
+                        widest_end, down_place + down_run[e] + entry.entry_bytes);
                 }
-                const auto* mapped = usable ? reader_->object_base(file_index) : nullptr;
-                if (mapped != nullptr) {
-                    for (std::size_t e = 0; e < bank_files.experts.size(); ++e) {
-                        s.gate_up_offsets[e] = gate_up_run[e] + entry.codes.offset;
-                        s.down_offsets[e]    = down_run[e] + entry.down_codes.offset;
+                if (usable) {
+                    for (std::size_t e = 0; e < experts; ++e) {
+                        s.gate_up_offsets[e] = gate_up_place + gate_up_run[e] + entry.codes.offset;
+                        s.down_offsets[e]    = down_place + down_run[e] + entry.down_codes.offset;
                     }
                     s.gate_up_parent.geometry       = banks_[i].gate_up_geometry;
                     s.gate_up_parent.geometry.bytes = widest_end;
                     s.gate_up_parent.device         = Device::cpu();
-                    s.gate_up_parent.data           = mapped;
+                    s.gate_up_parent.data           = gate_up_base;
                     s.down_parent.geometry          = banks_[i].down_geometry;
                     s.down_parent.geometry.bytes    = widest_end;
                     s.down_parent.device            = Device::cpu();
-                    s.down_parent.data              = mapped;
+                    s.down_parent.data              = down_base;
                     s.gate_up.parent         = &s.gate_up_parent;
                     s.gate_up.layout         = with_packed_planes(banks_[i].gate_up_layout);
                     s.gate_up.expert_offsets = s.gate_up_offsets.data();
@@ -392,13 +428,14 @@ public:
                     direct_[i]            = true;
                     if (std::getenv("NINFER_HOST_DEBUG") != nullptr && i < 2) {
                         std::fprintf(stderr,
-                                     "[in-place] bank=%zu file=%u experts=%zu gu_run=%llu "
-                                     "dn_run=%llu end=%llu mapped=%p\n",
-                                     i, file_index, bank_files.experts.size(),
+                                     "[in-place] bank=%zu object=%u experts=%zu gu_run=%llu "
+                                     "dn_run=%llu end=%llu mapped=%p/%p\n",
+                                     i, gate_up_object.front(), experts,
                                      (unsigned long long)gate_up_run.front(),
                                      (unsigned long long)down_run.front(),
                                      (unsigned long long)widest_end,
-                                     static_cast<const void*>(mapped));
+                                     static_cast<const void*>(gate_up_base),
+                                     static_cast<const void*>(down_base));
                     }
                     continue;
                 }

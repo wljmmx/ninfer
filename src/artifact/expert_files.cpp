@@ -13,10 +13,16 @@ void append_plane(ExpertFileEntry& entry, const Reader& reader, ObjectHandle obj
     if (!plane_bytes) { return; }
     const auto& descriptor = reader.directory().tensor(object);
     const auto logical     = descriptor.offset + plane_offset;
+    // A chunk names the object and the offset inside it - the same convention the retained Host
+    // replica reads (host_expert_reader.h) and the one the cache's cover read and in-place
+    // addressing expect. The reader resolves the object to the file that holds those bytes, so a
+    // chunk that lands in a continuation part is read from that part and never from the entry. The
+    // segment walk still splits a plane at the part boundary, so each chunk stays inside one file
+    // and can be named where it already is.
     for (const auto& segment : reader.segments(logical, plane_bytes)) {
         ExpertFileChunk chunk;
-        chunk.file_index   = static_cast<std::uint32_t>(segment.file_index);
-        chunk.file_offset  = segment.file_offset;
+        chunk.file_index   = static_cast<std::uint32_t>(object.index);
+        chunk.file_offset  = plane_offset + segment.destination_offset;
         chunk.bytes        = segment.bytes;
         chunk.image_offset = image_offset + segment.destination_offset;
         entry.chunks.push_back(chunk);
