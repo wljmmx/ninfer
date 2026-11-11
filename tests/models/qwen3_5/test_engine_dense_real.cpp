@@ -391,6 +391,367 @@ int exercise_256k_swap(ninfer::Engine& engine, std::uint32_t resident_pages,
     return 0;
 }
 
+// port (sm_89): the SHARED-pool arm (max_concurrency = 2). Under residency the Device pool holds
+// only the resident part of max_context, and that pool is ONE physical page pool for every lane:
+// two requests that each fit can still over-subscribe it together. Before the aggregate admission
+// rule the second lane was admitted on its own length alone, both lanes then failed to reserve a
+// page, each paused itself in reserve_resident_units(), and nothing ever drove either back - the
+// load was measured non-terminating.
+//
+// This arm is the acceptance for the aggregate rule, in the order a client meets it:
+//
+//   R1, R2  two lanes that fit TOGETHER (each ~40% of the resident set), submitted before either
+//           has finished, admitted, and both must complete;
+//   R3      one request that is legal on its own (~70% of the resident set, under the single-request
+//           bound) but does not fit beside R1+R2: it must be REFUSED at admission, in bounded time,
+//           with the per-lane and the aggregate numbers, while R1 and R2 keep running untouched;
+//   R4      a normal short request after the refusal: the engine still serves it.
+//
+// Correctness is pinned on the shape-independent property: the same two-lane batch run twice must
+// produce the same greedy tokens (the 1-row and 2-row decode compositions are known to differ - see
+// the merged-prefill fixture - so a cross-shape comparison would pin the composition, not the pool).
+int exercise_256k_lanes(const char* artifact) {
+    constexpr double kAggregateRefusalBudgetSeconds = 1.0;
+    // Enough outputs for an engine-reported decode rate per lane, short enough that the arm stays a
+    // contract test rather than a benchmark.
+    constexpr std::uint32_t kPairOutputs = 32;
+    ninfer::EngineOptions options                   = engine_options(artifact);
+    options.max_context                            = 262144;
+    options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(262144);
+    options.prefill_chunk                          = 1024;
+    options.max_concurrency                        = 2;
+    options.max_pending_requests                   = 4;
+    options.context_cache.device_state_slots       = 2;
+    // What this arm is about is the SHARED pool, so it buys room for the second lane by dropping the
+    // parts the contract does not need: the 19 GiB of weights plus TWO device state images leave
+    // too little for the tiered KV anchor with the vision tower, the capture allowance and the MTP
+    // backend pool all resident as well (measured: "0 bytes available for runtime capacity"). The
+    // MTP-3 residency path is the 256K arm's job; here a plain decode keeps the step growth at one
+    // token and the accounting easy to read.
+    options.speculative.backend                    = ninfer::SpeculativeBackend::None;
+    options.speculative.draft_tokens               = 0;
+    options.speculative.proposal_head              = ninfer::ProposalHead::Full;
+    options.enable_vision                          = false;
+    options.use_cuda_graph                         = false;
+
+#if defined(_WIN32)
+    (void)_putenv_s("NINFER_KV_HOST_RESIDENCY", "1");
+#else
+    (void)setenv("NINFER_KV_HOST_RESIDENCY", "1", 1);
+#endif
+    std::cerr << "[256k-lanes] constructing a two-lane 262144-token engine" << std::endl;
+    std::unique_ptr<ninfer::Engine> engine;
+    std::string failure;
+    for (int attempt = 1; attempt <= 3 && engine == nullptr; ++attempt) {
+        try {
+            engine = std::make_unique<ninfer::Engine>(options);
+        } catch (const std::exception& error) {
+            failure             = error.what();
+            const bool capacity = failure.find("reservation") != std::string::npos ||
+                                  failure.find("runtime capacity") != std::string::npos ||
+                                  failure.find("out of memory") != std::string::npos ||
+                                  failure.find("memory allocation") != std::string::npos;
+            if (!capacity) {
+                std::cerr << "[256k-lanes] construction failed: " << failure << '\n';
+                return 1;
+            }
+            std::cerr << "[256k-lanes] attempt " << attempt << " found no Device room: " << failure
+                      << std::endl;
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+        }
+    }
+    if (engine == nullptr) {
+        std::cerr << "[256k-lanes] INFEASIBLE: " << failure << '\n';
+        return 77;
+    }
+
+    const ninfer::LoadSummary load = engine->load_summary();
+    std::cerr << "[256k-lanes] logical_pages=" << load.kv_logical_page_groups
+              << " resident_pages=" << load.kv_resident_page_groups
+              << " resolved_tokens=" << load.kv_resolved_tokens
+              << " device_kv=" << load.kv_device_payload_bytes
+              << " host_kv=" << load.kv_host_payload_bytes << std::endl;
+    if (load.kv_resident_page_groups == 0 ||
+        load.kv_resident_page_groups >= load.kv_logical_page_groups) {
+        std::cerr << "[256k-lanes] no residency split to share: resident="
+                  << load.kv_resident_page_groups << " logical=" << load.kv_logical_page_groups
+                  << '\n';
+        return 1;
+    }
+    // The resident set in tokens, page-exact: this is the pool every lane shares.
+    const std::uint64_t resident_tokens =
+        static_cast<std::uint64_t>(load.kv_resident_page_groups) * 64ULL;
+    const auto prompt_of = [&engine](std::uint64_t tokens, const char* seed) {
+        std::string text = seed;
+        while (text.size() <= tokens * 8ULL) { text += seed; }
+        std::vector<ninfer::TokenId> prompt = engine->tokenize_text(text);
+        if (prompt.size() > tokens) { prompt.resize(static_cast<std::size_t>(tokens)); }
+        return prompt;
+    };
+    // Two lanes at 40% each leave ~20% of the pool free, so the pair fits and the pool can still
+    // absorb the one-step growth the admission rule charges for both lanes.
+    const std::uint64_t lane_tokens    = resident_tokens * 4ULL / 10ULL;
+    const std::uint64_t refused_tokens = resident_tokens * 7ULL / 10ULL;
+    const std::vector<ninfer::TokenId> lane_a = prompt_of(lane_tokens, "Alpha bravo charlie delta echo foxtrot golf hotel. ");
+    const std::vector<ninfer::TokenId> lane_b = prompt_of(lane_tokens, "India juliet kilo lima mike november oscar papa. ");
+    const std::vector<ninfer::TokenId> over   = prompt_of(refused_tokens, "The quick brown fox jumps over the lazy dog. ");
+    std::cerr << "[256k-lanes] resident_tokens=" << resident_tokens << " lane_tokens=" << lane_a.size()
+              << "/" << lane_b.size() << " refused_prompt_tokens=" << over.size() << std::endl;
+
+    const auto clock = std::chrono::steady_clock::now();
+    const auto elapsed = [&clock] {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - clock).count();
+    };
+    const auto pair = [&](const char* tag, std::vector<ninfer::TokenId>& first,
+                          std::vector<ninfer::TokenId>& second) {
+        auto a = engine->submit(engine->prepare_tokens(lane_a), greedy_options(kPairOutputs, false));
+        auto b = engine->submit(engine->prepare_tokens(lane_b), greedy_options(kPairOutputs, false));
+        a.wait_for_admission();
+        b.wait_for_admission();
+        const ninfer::GenerationResult ra = a.wait();
+        const ninfer::GenerationResult rb = b.wait();
+        std::cerr << "[256k-lanes] " << tag << ": A outputs=" << ra.generated_token_ids.size()
+                  << " prompt=" << ra.prompt.prompt_tokens
+                  << " prefill_s=" << ra.timings.prefill_seconds
+                  << " decode_s=" << ra.timings.decode_seconds << " | B outputs="
+                  << rb.generated_token_ids.size() << " prompt=" << rb.prompt.prompt_tokens
+                  << " prefill_s=" << rb.timings.prefill_seconds
+                  << " decode_s=" << rb.timings.decode_seconds << " t=" << elapsed() << " s"
+                  << std::endl;
+        if (ra.generated_token_ids.size() != kPairOutputs ||
+            rb.generated_token_ids.size() != kPairOutputs ||
+            ra.finish_reason != ninfer::FinishReason::OutputLimit ||
+            rb.finish_reason != ninfer::FinishReason::OutputLimit) {
+            std::cerr << "[256k-lanes] " << tag << ": a lane did not complete its token budget (A="
+                      << ra.generated_token_ids.size() << " B=" << rb.generated_token_ids.size()
+                      << ")\n";
+            return false;
+        }
+        first  = ra.generated_token_ids;
+        second = rb.generated_token_ids;
+        return true;
+    };
+
+    // --- two lanes that fit together, with the shared-pool refusal in the middle -----------------
+    std::vector<ninfer::TokenId> first_a, first_b, second_a, second_b;
+    {
+        auto a = engine->submit(engine->prepare_tokens(lane_a), greedy_options(kPairOutputs, false));
+        auto b = engine->submit(engine->prepare_tokens(lane_b), greedy_options(kPairOutputs, false));
+        a.wait_for_admission();
+        b.wait_for_admission();
+        // The refusal is delivered at the next scheduling boundary, so it is measured where the
+        // engine is busy with SHORT rounds - both lanes decoding. Waiting for prefill would measure
+        // the 1024-token chunk that happens to be in flight (~2 s observed) instead of the rule.
+        const auto decode_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(300);
+        while (engine->runtime_stats().decode_ready_requests < 2 &&
+               std::chrono::steady_clock::now() < decode_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        const ninfer::RuntimeStats busy = engine->runtime_stats();
+        std::cerr << "[256k-lanes] both lanes admitted: prefilling=" << busy.prefilling_requests
+                  << " decode_ready=" << busy.decode_ready_requests
+                  << " device_main_kv_occupied_pages=" << busy.device_main_kv_occupied_pages
+                  << " resident_pages=" << load.kv_resident_page_groups << std::endl;
+        if (busy.decode_ready_requests < 2) {
+            std::cerr << "[256k-lanes] the two lanes never reached a decode round together\n";
+            return 1;
+        }
+        std::cerr << "[256k-lanes] both lanes decoding; submitting the over-subscribing request"
+                  << std::endl;
+
+        const auto refusal_started = std::chrono::steady_clock::now();
+        bool refused               = false;
+        std::string message;
+        try {
+            auto c = engine->submit(engine->prepare_tokens(over), greedy_options(1, false));
+            (void)c.wait();
+            std::cerr << "[256k-lanes] the over-subscribing request was SERVED" << std::endl;
+        } catch (const std::exception& error) {
+            refused = true;
+            message = error.what();
+        }
+        const double refusal_seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - refusal_started)
+                .count();
+        std::cerr << "[256k-lanes] aggregate refusal: refused=" << (refused ? 1 : 0)
+                  << " seconds=" << refusal_seconds << " message=\"" << message << "\""
+                  << std::endl;
+        if (!refused) {
+            std::cerr << "[256k-lanes] two lanes over-subscribed the resident pool and the second "
+                         "request was not refused\n";
+            return 1;
+        }
+        // Both the per-lane numbers and the aggregate must be in the message: the caller's remedy
+        // depends on which lane holds what.
+        for (const char* field : {"prompt_tokens=", "request_tokens=", "live_lanes=",
+                                 "live_tokens=", "live_lane_tokens=", "aggregate_tokens=",
+                                 "resident_tokens="}) {
+            if (message.find(field) == std::string::npos) {
+                std::cerr << "[256k-lanes] the refusal does not name " << field << ": " << message
+                          << '\n';
+                return 1;
+            }
+        }
+        if (message.find("live_lanes=2") == std::string::npos) {
+            std::cerr << "[256k-lanes] the refusal did not count both resident lanes: " << message
+                      << '\n';
+            return 1;
+        }
+        if (refusal_seconds > kAggregateRefusalBudgetSeconds) {
+            std::cerr << "[256k-lanes] the aggregate refusal took " << refusal_seconds
+                      << " s (budget " << kAggregateRefusalBudgetSeconds << " s)\n";
+            return 1;
+        }
+
+        // The lane that was already resident must be untouched by the refusal: both complete.
+        const ninfer::GenerationResult ra = a.wait();
+        const ninfer::GenerationResult rb = b.wait();
+        std::cerr << "[256k-lanes] after the refusal: A outputs="
+                  << ra.generated_token_ids.size() << " prefill_s=" << ra.timings.prefill_seconds
+                  << " decode_s=" << ra.timings.decode_seconds << " | B outputs="
+                  << rb.generated_token_ids.size() << " prefill_s=" << rb.timings.prefill_seconds
+                  << " decode_s=" << rb.timings.decode_seconds << std::endl;
+        if (ra.generated_token_ids.size() != kPairOutputs ||
+            rb.generated_token_ids.size() != kPairOutputs ||
+            ra.finish_reason != ninfer::FinishReason::OutputLimit ||
+            rb.finish_reason != ninfer::FinishReason::OutputLimit) {
+            std::cerr << "[256k-lanes] the refusal disturbed the resident lanes (A="
+                      << ra.generated_token_ids.size() << " B=" << rb.generated_token_ids.size()
+                      << ")\n";
+            return 1;
+        }
+        const double decode_a = ra.timings.decode_seconds > 0.0
+                                    ? static_cast<double>(ra.generated_token_ids.size() - 1) /
+                                          ra.timings.decode_seconds
+                                    : 0.0;
+        const double decode_b = rb.timings.decode_seconds > 0.0
+                                    ? static_cast<double>(rb.generated_token_ids.size() - 1) /
+                                          rb.timings.decode_seconds
+                                    : 0.0;
+        std::cerr << "[256k-lanes] two-lane decode: A=" << decode_a << " tok/s, B=" << decode_b
+                  << " tok/s (engine-reported)" << std::endl;
+        if (decode_a <= 0.0 || decode_b <= 0.0) {
+            std::cerr << "[256k-lanes] no engine-reported decode rate for both lanes\n";
+            return 1;
+        }
+        first_a = ra.generated_token_ids;
+        first_b = rb.generated_token_ids;
+        if (first_a == first_b) {
+            std::cerr << "[256k-lanes] both lanes returned the same tokens for different prompts\n";
+            return 1;
+        }
+    }
+
+    // --- the same two-lane batch again: same shape, so the greedy tokens must be identical -------
+    if (!pair("pair#2", second_a, second_b)) { return 1; }
+    if (first_a != second_a || first_b != second_b) {
+        std::cerr << "[256k-lanes] the shared pool changed the tokens between two identical "
+                     "two-lane batches\n";
+        return 1;
+    }
+
+    // --- a normal request after the refusal: the engine still serves it --------------------------
+    const std::vector<ninfer::TokenId> sample =
+        engine->tokenize_text("The quick brown fox jumps over the lazy dog.");
+    const ninfer::GenerationResult after =
+        engine->generate(engine->prepare_tokens(sample), greedy_options(1, false));
+    std::cerr << "[256k-lanes] after the refusal, one lane: outputs="
+              << after.generated_token_ids.size()
+              << " finish=" << static_cast<int>(after.finish_reason) << std::endl;
+    if (after.generated_token_ids.size() != 1 ||
+        after.finish_reason != ninfer::FinishReason::OutputLimit) {
+        std::cerr << "[256k-lanes] the engine did not serve a normal request after the refusal\n";
+        return 1;
+    }
+    const ninfer::MemorySummary summary = engine->memory_summary();
+    std::cerr << "[256k-lanes] done: resident_pages=" << summary.kv_resident_page_groups
+              << " occupied_device_pages=" << engine->runtime_stats().device_main_kv_occupied_pages
+              << " total=" << elapsed() << " s" << std::endl;
+
+    // --- diagnostic: does the aggregate still hold once ADMITTED lanes grow? -------------------
+    // The admission rule prices live + one step, so two lanes are admitted while their FUTURE steps
+    // can still collide: with both at 49.8% of the pool there is room for ~190 tokens each before the
+    // sum reaches the edge, which is a few seconds of decode instead of an hour. Opt-in (the default
+    // arm stays a contract test), and it only OBSERVES: what the engine does at that edge is the
+    // reported finding. Termination within the watchdog is the one requirement - an unterminating
+    // load is a defect whether it ends in an error or in completed output.
+    if (const char* growth = std::getenv("NINFER_TEST_256K_LANES_GROWTH");
+        growth != nullptr && *growth != '\0' && std::string(growth) != "0") {
+        const std::uint64_t near = resident_tokens * 498ULL / 1000ULL;
+        const std::vector<ninfer::TokenId> tight_a =
+            prompt_of(near, "Sierra tango uniform victor whiskey xray yankee zulu. ");
+        const std::vector<ninfer::TokenId> tight_b =
+            prompt_of(near, "Quebec romeo sierra tango uniform victor whiskey xray. ");
+        std::cerr << "[256k-lanes] growth probe: two lanes at " << tight_a.size() << "/"
+                  << tight_b.size() << " tokens of a " << resident_tokens << "-token pool" << std::endl;
+        const auto started = std::chrono::steady_clock::now();
+        auto a = engine->submit(engine->prepare_tokens(tight_a), greedy_options(4000, false));
+        auto b = engine->submit(engine->prepare_tokens(tight_b), greedy_options(4000, false));
+        a.wait_for_admission();
+        b.wait_for_admission();
+        std::string outcome_a = "completed";
+        std::string outcome_b = "completed";
+        std::size_t tokens_a = 0;
+        std::size_t tokens_b = 0;
+        const auto drain = [&](ninfer::GenerationHandle& handle, std::string& outcome,
+                               std::size_t& tokens) {
+            try {
+                const ninfer::GenerationResult result = handle.wait();
+                tokens                                = result.generated_token_ids.size();
+                outcome = "outputs=" + std::to_string(tokens);
+            } catch (const std::exception& error) {
+                outcome = std::string("error: ") + error.what();
+            }
+        };
+        std::thread drain_a([&] { drain(a, outcome_a, tokens_a); });
+        std::thread drain_b([&] { drain(b, outcome_b, tokens_b); });
+        // The value is the watchdog in seconds ("1" keeps the default 300 s).
+        const unsigned long requested_watchdog = std::strtoul(growth, nullptr, 10);
+        const auto watchdog = std::chrono::seconds(requested_watchdog > 1 ? requested_watchdog : 300);
+        const auto deadline = std::chrono::steady_clock::now() + watchdog;
+        bool terminated     = false;
+        while (std::chrono::steady_clock::now() < deadline) {
+            const ninfer::RuntimeStats stats = engine->runtime_stats();
+            if (stats.running_requests == 0 && stats.prefilling_requests == 0 &&
+                stats.decode_ready_requests == 0 && stats.paused_requests == 0 &&
+                stats.replaying_requests == 0 && stats.waiting_requests == 0) {
+                terminated = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        const double seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        const ninfer::RuntimeStats stats = engine->runtime_stats();
+        std::cerr << "[256k-lanes] growth probe after " << seconds
+                  << " s: terminated=" << (terminated ? 1 : 0)
+                  << " running=" << stats.running_requests
+                  << " decode_ready=" << stats.decode_ready_requests
+                  << " paused=" << stats.paused_requests
+                  << " replaying=" << stats.replaying_requests
+                  << " waiting=" << stats.waiting_requests
+                  << " terminal_pending=" << stats.terminal_pending_requests
+                  << " preemptions=" << stats.preemptions
+                  << " occupied_pages=" << stats.device_main_kv_occupied_pages
+                  << " resident_pages=" << load.kv_resident_page_groups
+                  << " outstanding=" << engine->outstanding_requests() << std::endl;
+        if (!terminated) {
+            // Leave the watchdog's verdict in the log but do not wait on the engine's destructor:
+            // the two requests still own lanes. Exiting here is the finding, not a cleanup path.
+            std::cerr << "[256k-lanes] growth probe did not terminate within " << watchdog.count()
+                      << " s (the mutual-pause shape the aggregate admission does not reach)\n";
+            std::cerr.flush();
+            std::_Exit(3);
+        }
+        drain_a.join();
+        drain_b.join();
+        std::cerr << "[256k-lanes] growth probe done: A[" << outcome_a << "] B[" << outcome_b
+                  << "] tokens=" << tokens_a << "/" << tokens_b << std::endl;
+        return 0;
+    }
+    return 0;
+}
+
 int exercise_256k_overrun(ninfer::Engine& engine, std::uint32_t resident_pages,
                           std::uint32_t resolved_tokens,
                           const std::vector<ninfer::TokenId>& sample) {
@@ -721,8 +1082,12 @@ int main() {
     // for a full second after the destroy). Each arm therefore has its own registration and its own
     // process; "both" stays available for a one-shot local run.
     const char* arm    = std::getenv("NINFER_TEST_DENSE_ARM");
-    const bool want_4096 = arm == nullptr || *arm == '\0' || std::string(arm) != "256k";
+    const bool want_4096 = arm == nullptr || *arm == '\0' ||
+                           (std::string(arm) != "256k" && std::string(arm) != "256k-lanes");
     const bool want_256k = arm != nullptr && (std::string(arm) == "256k" || std::string(arm) == "both");
+    // port (sm_89): the two-lane shared-pool arm. Its own process for the same reason the 256K arm
+    // has one: a 19 GiB engine cannot be built twice in one process on this card.
+    const bool want_lanes = arm != nullptr && std::string(arm) == "256k-lanes";
 
     // port (sm_89): progress markers. Each step reports itself before running, and a construction
     // failure (memory budget, unsupported option) reports its message instead of terminating
@@ -762,6 +1127,9 @@ int main() {
     }
     if (want_256k) {
         if (const int result = exercise_256k_residency(artifact); result != 0) { return result; }
+    }
+    if (want_lanes) {
+        if (const int result = exercise_256k_lanes(artifact); result != 0) { return result; }
     }
     std::cout << "ok\n";
     return 0;

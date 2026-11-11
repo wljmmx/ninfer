@@ -221,6 +221,33 @@ int main() {
     } catch (const std::invalid_argument&) { empty_rejected = true; }
     failures += check(empty_rejected, "anchor tiering accepted a plan with no resident page group");
 
+    // --- port (sm_89): the aggregate (cross-lane) residency bound -------------------------------
+    // The Device pool is one physical page pool shared by every live lane. Both numbers arrive
+    // page-rounded per lane from the Program (each lane's address owns whole pages), so this is a
+    // pure sum test: the newcomer is admitted only when the lanes already resident plus the newcomer
+    // still fit the live edge. The single-lane rule is the same function with live_tokens = 0.
+    using ninfer::runtime::KvResidencyShare;
+    const auto fits = [](std::uint32_t capacity, std::uint32_t live, std::uint32_t request) {
+        return ninfer::runtime::kv_residency_share_fits(
+            KvResidencyShare{capacity, live, request});
+    };
+    failures += check(fits(0, 0, 262144), "0 capacity (no residency contract) bounded a request");
+    failures += check(fits(0, 100000, 262144),
+                      "0 capacity (no residency contract) bounded the aggregate");
+    failures += check(fits(59648, 0, 59648), "a request exactly at the pool edge was refused");
+    failures += check(!fits(59648, 0, 59712), "a request one page over the pool edge was admitted");
+    failures += check(fits(59648, 30016, 29632), "two lanes exactly filling the pool were refused");
+    failures += check(!fits(59648, 30016, 29696), "two lanes over the pool edge were admitted");
+    failures += check(!fits(59648, 59648, 64),
+                      "a newcomer was admitted beside a lane that already holds the whole pool");
+    // Under residency the failure is monotone in every lane's demand: more held room never helps.
+    for (std::uint32_t held = 0; held <= 59648; held += 4096) {
+        if (!fits(59648, held, 59648 - held)) {
+            std::cerr << "aggregate bound is not tight at live=" << held << '\n';
+            ++failures;
+        }
+    }
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

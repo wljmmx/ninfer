@@ -192,6 +192,14 @@ std::uint32_t Program::kv_residency_step_growth() const noexcept {
     return impl_->kv_residency_step_growth();
 }
 
+Program::KvResidencyBudget Program::kv_residency_budget() const noexcept {
+    return impl_->kv_residency_budget();
+}
+
+std::uint32_t Program::kv_residency_request_tokens(std::uint32_t prompt_tokens) const noexcept {
+    return impl_->kv_residency_request_tokens(prompt_tokens);
+}
+
 std::size_t Program::prefill_batch_rows(std::span<const std::uint32_t> lanes,
                                         std::span<execution::PrefillRow> out) {
     return impl_->prefill_batch_rows(lanes, out);

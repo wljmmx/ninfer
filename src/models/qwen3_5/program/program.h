@@ -563,6 +563,21 @@ public:
     // The most a single Decode step adds to that frontier (its token plus the draft window when a
     // speculative backend runs). The Runtime prices a step's growth with it.
     [[nodiscard]] std::uint32_t kv_residency_step_growth() const noexcept;
+    // port (sm_89): the pool is shared, so admission cannot price a request alone. This is what the
+    // lanes already resident hold: one entry per live lane, each rounded up to whole pages (a lane's
+    // address owns whole pages of the one physical pool) and already including one Decode step of
+    // growth, because that is the part every resident lane is guaranteed. `live_tokens` is their sum
+    // and `capacity_tokens` the same pool edge `kv_residency_token_limit()` reports (0 = no contract).
+    struct KvResidencyBudget {
+        std::uint32_t capacity_tokens = 0;
+        std::uint32_t live_tokens     = 0;
+        std::uint32_t lane_count      = 0;
+        std::array<std::uint32_t, kMaximumConcurrency> lane_tokens{};
+    };
+    [[nodiscard]] KvResidencyBudget kv_residency_budget() const noexcept;
+    // The same pricing for a request that is not live yet: its prompt plus one step of growth,
+    // rounded up to whole pages. 0 when there is no residency contract.
+    [[nodiscard]] std::uint32_t kv_residency_request_tokens(std::uint32_t prompt_tokens) const noexcept;
     // Q67/S1: name each lane's place in a merged prefill pass (build only; nothing executes).
     std::size_t prefill_batch_rows(std::span<const std::uint32_t> lanes,
                                    std::span<execution::PrefillRow> out);

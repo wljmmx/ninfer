@@ -64,4 +64,25 @@ struct KvResidencyResolution {
     const KvCapacityPolicy& policy, const SequenceCapacityCurve& curve,
     const KvResidencyStrides& strides, std::size_t available_runtime_bytes);
 
+// The Device residency pool is ONE physical page pool, and every live lane's KV address takes whole
+// pages out of it. A lane therefore cannot be judged alone: two requests that each fit the pool can
+// still over-subscribe it together, and under residency the history has to be resident for the whole
+// step (the full-attention layers read all of it), so the overflow has no streaming answer - the
+// capacity path answers it by pausing lanes that then pause each other, with nothing driving either
+// back. Admission is the one place where the whole answer exists before any execution state is
+// booked, so a newcomer that does not fit beside the lanes already resident is refused there.
+//
+// The three numbers are the page-exact ones: `capacity_tokens` is the live pool edge in tokens,
+// `live_tokens` the sum over the lanes already resident of their own page-rounded demand (each lane
+// rounds up on its own, because each lane's address owns whole pages - summing tokens first and
+// dividing once would under-count), and `request_tokens` the newcomer's page-rounded demand. A zero
+// capacity means there is no residency contract (every logical page is resident) and nothing to test.
+struct KvResidencyShare {
+    std::uint32_t capacity_tokens = 0;
+    std::uint32_t live_tokens     = 0;
+    std::uint32_t request_tokens  = 0;
+};
+
+[[nodiscard]] bool kv_residency_share_fits(const KvResidencyShare& share) noexcept;
+
 } // namespace ninfer::runtime

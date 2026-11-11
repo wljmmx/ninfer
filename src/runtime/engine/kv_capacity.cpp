@@ -317,4 +317,12 @@ KvResidencyResolution resolve_kv_capacity_with_residency(const KvCapacityPolicy&
     return resolution;
 }
 
+bool kv_residency_share_fits(const KvResidencyShare& share) noexcept {
+    // 0 is the "no residency contract" answer: every logical page is resident, so no aggregate bound
+    // exists and every request is judged by its own length alone (the pre-existing single-lane rule).
+    if (share.capacity_tokens == 0) { return true; }
+    if (share.request_tokens > share.capacity_tokens) { return false; }
+    return share.live_tokens <= share.capacity_tokens - share.request_tokens;
+}
+
 } // namespace ninfer::runtime

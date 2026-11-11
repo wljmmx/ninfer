@@ -795,6 +795,14 @@ public:
     [[nodiscard]] std::uint32_t sequence_execution_frontier(SequenceHandle) const noexcept;
     [[nodiscard]] std::uint32_t kv_residency_step_growth() const noexcept;
     [[nodiscard]] std::uint32_t residency_device_page_capacity() const noexcept;
+    // port (sm_89): the aggregate half of the residency contract. `lane_tokens` is one live lane's
+    // demand - its execution frontier, or the whole prompt while it prefills or replays, plus one
+    // Decode step of growth - rounded UP to whole pages, because each lane's address owns whole pages
+    // of the shared pool; `kv_residency_budget()` sums those and reports the live pool edge.
+    [[nodiscard]] std::uint32_t residency_lane_tokens(std::uint32_t lane,
+                                                     std::uint32_t growth) const noexcept;
+    [[nodiscard]] Program::KvResidencyBudget kv_residency_budget() const noexcept;
+    [[nodiscard]] std::uint32_t kv_residency_request_tokens(std::uint32_t prompt_tokens) const noexcept;
     // Q67/S1 step 1: name each lane's place in a merged pass - its own KV address row, its absolute
     // base, how many prompt tokens it contributes, and the state slots it reads and writes. Builds
     // only; nothing executes until advance_prefill_batch exists.

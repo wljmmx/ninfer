@@ -7,6 +7,7 @@
 #include <array>
 #include <chrono>
 #include <cstdlib>
+#include <limits>
 #include <numeric>
 #include <optional>
 #include <string>
@@ -657,6 +658,59 @@ std::uint32_t ProgramImpl::kv_residency_step_growth() const noexcept {
     // never grow past the prompt, which the Runtime already bounded against the same limit when it
     // admitted the request.
     return 1U + (backend_kv_cache() != nullptr ? draft_window : 0U);
+}
+
+// port (sm_89): one lane's share of the shared Device pool, in the units the Runtime compares.
+// Each lane's address owns whole pages, so the demand is rounded up HERE, per lane: two lanes at 63
+// and 1 tokens own two pages, not ceil(64 / 64) = 1 - summing tokens first and dividing once
+// under-counts the pool exactly at the edge.
+namespace {
+std::uint32_t page_rounded_tokens(std::uint32_t tokens) noexcept {
+    const auto page = static_cast<std::uint32_t>(kPagedKVPageSize);
+    if (tokens == 0) { return 0U; }
+    const std::uint32_t pages = 1U + (tokens - 1U) / page;
+    return pages * page;
+}
+} // namespace
+
+std::uint32_t ProgramImpl::residency_lane_tokens(std::uint32_t lane,
+                                                std::uint32_t growth) const noexcept {
+    if (lane >= max_concurrency) { return 0U; }
+    const auto& request = requests[lane];
+    const auto& state   = sequences[lane];
+    if (request.lifecycle == Lifecycle::Empty || !state.kv) { return 0U; }
+    // A lane that is still prefilling (or replaying) has to reach its own prompt, and that prompt
+    // was priced against this pool when it was admitted. Counting the cursor instead of the
+    // destination is what made a second lane look affordable and then collide later.
+    std::uint32_t demand = state.execution_frontier;
+    if (request.prefill) { demand = std::max(demand, request.prefill->prompt_tokens); }
+    if (request.replay) { demand = std::max(demand, request.replay->prompt_tokens); }
+    if (demand > std::numeric_limits<std::uint32_t>::max() - growth) { return demand; }
+    return page_rounded_tokens(demand + growth);
+}
+
+Program::KvResidencyBudget ProgramImpl::kv_residency_budget() const noexcept {
+    Program::KvResidencyBudget budget{};
+    // No residency contract: every logical page is resident, so there is no shared bound to report.
+    if (kv_resident_page_groups >= kv_logical_page_groups) { return budget; }
+    budget.capacity_tokens =
+        residency_device_page_capacity() * static_cast<std::uint32_t>(kPagedKVPageSize);
+    const std::uint32_t growth = kv_residency_step_growth();
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        const std::uint32_t tokens = residency_lane_tokens(lane, growth);
+        if (tokens == 0) { continue; }
+        budget.lane_tokens[lane] = tokens;
+        budget.live_tokens += tokens;
+        ++budget.lane_count;
+    }
+    return budget;
+}
+
+std::uint32_t ProgramImpl::kv_residency_request_tokens(std::uint32_t prompt_tokens) const noexcept {
+    if (kv_resident_page_groups >= kv_logical_page_groups) { return 0U; }
+    const std::uint32_t growth = kv_residency_step_growth();
+    if (prompt_tokens > std::numeric_limits<std::uint32_t>::max() - growth) { return prompt_tokens; }
+    return page_rounded_tokens(prompt_tokens + growth);
 }
 
 void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& state, std::uint32_t main,

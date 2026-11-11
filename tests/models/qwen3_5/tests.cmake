@@ -263,6 +263,24 @@ set_tests_properties(ninfer_qwen3_5_dense_256k_swap_test PROPERTIES
   LABELS "gpu;real"
   TIMEOUT 1800)
 
+# port (sm_89): the shared-pool admission arm - max_concurrency = 2 under residency. The Device pool
+# is one physical page pool for every lane, so two requests that each fit can still over-subscribe it
+# together; before the aggregate rule the second lane was admitted on its own length alone, both
+# lanes then failed to reserve a page, each paused itself, and the load never terminated. The arm
+# pins: two lanes that fit together both complete (twice, token-identically), a request that is legal
+# alone but not beside them is REFUSED at admission in under a second with the per-lane and the
+# aggregate numbers, and the engine still serves a normal request afterwards. Its own process, like
+# the other two arms: this card holds one 19 GiB engine at a time. The 1 s refusal budget is asserted
+# inside the binary; the ctest ceiling is the outer guard against a regression that never returns.
+add_test(NAME ninfer_qwen3_5_dense_256k_lanes_test
+  COMMAND ninfer_qwen3_5_dense_real_test)
+set_tests_properties(ninfer_qwen3_5_dense_256k_lanes_test PROPERTIES
+  ENVIRONMENT "NINFER_TEST_DENSE_ARM=256k-lanes"
+  SKIP_RETURN_CODE 77
+  RUN_SERIAL TRUE
+  LABELS "gpu;real"
+  TIMEOUT 1800)
+
 set_tests_properties(
   ninfer_qwen3_5_state_image_test
   ninfer_qwen3_5_context_store_test

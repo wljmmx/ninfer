@@ -11,7 +11,9 @@
 #include "runtime/engine/context_cache/resource_manager.h"
 #include "runtime/engine/scheduler.h"
 #include "runtime/engine/generation_budget.h"
+#include "runtime/engine/kv_capacity.h"
 #include "models/qwen3_5/execution/shape_class.h"
+#include "models/qwen3_5/program/program.h"
 #include "models/qwen3_5/execution/expert_path_control.h"
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/param_bus.h"
@@ -1027,6 +1029,43 @@ private:
                     "cannot be streamed from the Host tier). Shorten the prompt, or leave more "
                     "Device memory to the pool (NINFER_KV_RESIDENCY_SLACK_MB, or a smaller "
                     "max_context).")));
+    }
+
+    // port (sm_89): refuse a request that DOES fit on its own but not beside the lanes already
+    // resident. The Device pool is one physical page pool shared by every lane (LogicalKVPageStore's
+    // physical pool, sized `kv_resident_page_groups`), and under residency a lane's whole history has
+    // to stay in it for every step. So the aggregate is the admission question, and the per-request
+    // bound alone lets two legal requests over-subscribe the pool: each then fails to reserve a page,
+    // each pauses itself (reserve_resident_units), and neither is ever driven back - measured
+    // non-terminating. The numbers are per lane AND total, because the caller's remedy depends on
+    // which lane is holding what (shorten the prompt, lower max_concurrency, or plan more residency).
+    void refuse_kv_residency_shared(const std::shared_ptr<Request>& request,
+                                    std::uint32_t prompt_tokens, std::uint32_t request_tokens,
+                                    const models::qwen3_5::Program::KvResidencyBudget& budget) {
+        std::string lanes;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            const std::uint32_t held = budget.lane_tokens[lane];
+            if (held == 0) { continue; }
+            if (!lanes.empty()) { lanes += '+'; }
+            lanes += std::to_string(held);
+        }
+        complete_error(
+            request,
+            std::make_exception_ptr(RequestError(
+                RequestErrorKind::ContextLengthExceeded,
+                "KV residency cannot serve a request beside the lanes already resident: prompt_tokens=" +
+                    std::to_string(prompt_tokens) +
+                    " request_tokens=" + std::to_string(request_tokens) +
+                    " live_lanes=" + std::to_string(budget.lane_count) +
+                    " live_tokens=" + std::to_string(budget.live_tokens) +
+                    " live_lane_tokens=" + (lanes.empty() ? std::string("-") : lanes) +
+                    " aggregate_tokens=" + std::to_string(budget.live_tokens + request_tokens) +
+                    " resident_tokens=" + std::to_string(budget.capacity_tokens) +
+                    " (the Device KV pool is tiered and shared: it holds the resident part of "
+                    "max_context for EVERY live lane at once, and the full-attention layers read the "
+                    "whole history every step, so the lanes' histories cannot be streamed from the "
+                    "Host tier). Shorten the prompt, lower max_concurrency, or leave more Device "
+                    "memory to the pool (NINFER_KV_RESIDENCY_SLACK_MB, or a smaller max_context).")));
     }
 
     [[nodiscard]] std::array<bool, kMaximumConcurrency> snapshot_cancellations() const noexcept {
@@ -2393,6 +2432,29 @@ private:
                         refuse_kv_residency(request, prompt_tokens, resident_limit);
                         request_admission_check();
                         continue;
+                    }
+                    // port (sm_89): the pool is shared, so "this request fits" is not enough. Ask
+                    // the Program what the lanes already resident hold (page-exact per lane, one
+                    // Decode step of growth included - the part every resident lane is guaranteed),
+                    // add this request's own page-rounded prompt + step, and refuse here when the
+                    // sum does not fit the live pool edge. Without this, two legal requests could
+                    // each reserve against the whole pool and then pause each other forever.
+                    if (resident_limit != 0) {
+                        const auto budget = instance_.program->kv_residency_budget();
+                        const std::uint32_t request_tokens =
+                            instance_.program->kv_residency_request_tokens(prompt_tokens);
+                        const KvResidencyShare share{budget.capacity_tokens, budget.live_tokens,
+                                                     request_tokens};
+                        if (!kv_residency_share_fits(share)) {
+                            {
+                                std::lock_guard lock(queue_mutex_);
+                                std::erase(pending_, request);
+                            }
+                            refuse_kv_residency_shared(request, prompt_tokens, request_tokens,
+                                                       budget);
+                            request_admission_check();
+                            continue;
+                        }
                     }
                 }
                 const auto retained = resources_.retained_source(request->id);
