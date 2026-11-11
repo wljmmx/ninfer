@@ -252,6 +252,25 @@ __device__ __forceinline__ void prepare_kv(const PrepareArguments& a, int head, 
     const bool trace_value = trace_row && (a.e8_dump_plane < 0 || a.e8_dump_plane == 1);
     const auto* raw_key   = a.k + (m * KvHeads + head) * 256;
     const auto* raw_value = a.v + (m * KvHeads + head) * 256;
+    if (a.v_trace != nullptr && t == a.v_trace_t && head == a.v_trace_head) {
+        // Warp-local: `head` is derived from the warp, so this branch is not block-uniform and must
+        // not contain a block-wide barrier. Lane 0 takes the slot and broadcasts it.
+        int slot = 0;
+        if (lane == 0 && a.v_trace_count != nullptr) slot = atomicAdd(a.v_trace_count, 1);
+        slot = __shfl_sync(0xffffffffu, slot, 0);
+        if (slot < a.v_trace_capacity) {
+            float* record = a.v_trace + std::int64_t(slot) * 260;
+            if (lane == 0) {
+                record[0] = float(t);
+                record[1] = float(head);
+                record[2] = float(m);
+                record[3] = float(p);
+            }
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                record[4 + lane + 32 * j] = __bfloat162float(raw_value[lane + 32 * j]);
+        }
+    }
     if constexpr (Storage == KvCacheStorage::BFloat16) {
         prepare_head<256>(raw_key, a.wk, reinterpret_cast<__nv_bfloat16*>(key), a.epsilon, sc,
                           lane);

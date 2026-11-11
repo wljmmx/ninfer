@@ -49,6 +49,14 @@ struct PrepareArguments {
     int e8_dump_row = -1;
     int e8_dump_plane = -1;
     int e8_dump_head  = -1;
+    // Default-off input-side export (NINFER_QSA_V_SRC_TRACE): what prepare_kv actually read for one
+    // (t, head) - the row index `m` it derived, the position `p` it wrote to, and the 256 projection
+    // values it encoded.
+    float* v_trace       = nullptr;
+    int* v_trace_count   = nullptr;
+    int v_trace_capacity = 0;
+    int v_trace_t        = -1;
+    int v_trace_head     = -1;
     ninfer::ops::E8TraceRecord* trace_out = nullptr;
     int* trace_count         = nullptr;
     int trace_capacity       = 0;

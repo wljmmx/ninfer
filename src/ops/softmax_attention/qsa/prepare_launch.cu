@@ -141,12 +141,16 @@ constexpr int kE8TraceCapacity = 64;
 __device__ E8TraceRecord g_e8_trace[kE8TraceCapacity];
 __device__ int g_e8_trace_count;
 
+// NINFER_QSA_V_SRC_TRACE: four header floats (t, head, m, p) then the 256 values prepare_kv read.
+constexpr int kVTraceRecords = 8, kVTraceStride = 260;
+__device__ float g_v_trace[kVTraceRecords * kVTraceStride];
+__device__ int g_v_trace_count;
+
 struct E8TraceSink {
     E8TraceRecord* out = nullptr;
     int* count         = nullptr;
     const char* path   = nullptr;
 };
-
 E8TraceSink e8_trace_sink(cudaStream_t stream) {
     E8TraceSink sink{};
     const char* path = std::getenv("NINFER_QSA_E8_TRACE");
@@ -189,6 +193,53 @@ void e8_trace_flush(const E8TraceSink& sink, cudaStream_t stream) {
     }
 }
 
+// NINFER_QSA_V_SRC_TRACE: the input side of one (t, head). Where the E8 trace answers what the
+// encoder decided, this answers what prepare_kv was handed - the row index it derived, the position
+// it wrote to, and the 256 projection values - which is the only way to tell a wrong source column
+// apart from a wrong store.
+struct VTraceSink {
+    float* out       = nullptr;
+    int* count       = nullptr;
+    const char* path = nullptr;
+};
+
+VTraceSink v_trace_sink(cudaStream_t stream) {
+    VTraceSink sink{};
+    const char* path = std::getenv("NINFER_QSA_V_SRC_TRACE");
+    if (path == nullptr || *path == '\0') { return sink; }
+    void* out   = nullptr;
+    void* count = nullptr;
+    CUDA_CHECK(cudaGetSymbolAddress(&out, g_v_trace));
+    CUDA_CHECK(cudaGetSymbolAddress(&count, g_v_trace_count));
+    CUDA_CHECK(cudaMemsetAsync(count, 0, sizeof(int), stream));
+    sink.out   = static_cast<float*>(out);
+    sink.count = static_cast<int*>(count);
+    sink.path  = path;
+    return sink;
+}
+
+void v_trace_flush(const VTraceSink& sink, cudaStream_t stream) {
+    if (sink.out == nullptr) { return; }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    int count = 0;
+    CUDA_CHECK(cudaMemcpy(&count, sink.count, sizeof(int), cudaMemcpyDeviceToHost));
+    if (count > kVTraceRecords) { count = kVTraceRecords; }
+    if (count <= 0) { return; }
+    std::vector<float> records(std::size_t(count) * kVTraceStride);
+    CUDA_CHECK(cudaMemcpy(records.data(), sink.out, records.size() * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+    if (std::FILE* file = std::fopen(sink.path, "a")) {
+        for (int i = 0; i < count; ++i) {
+            const float* record = records.data() + std::size_t(i) * kVTraceStride;
+            std::fprintf(file, "t=%d head=%d m=%d p=%d", int(record[0]), int(record[1]),
+                         int(record[2]), int(record[3]));
+            for (int j = 0; j < 256; ++j) std::fprintf(file, " %.9g", double(record[4 + j]));
+            std::fprintf(file, "\n");
+        }
+        std::fclose(file);
+    }
+}
+
 } // namespace
 
 void launch_prepare(const QsaProjectionView& projected, const QsaPrepareParameters& parameters,
@@ -204,6 +255,18 @@ void launch_prepare(const QsaProjectionView& projected, const QsaPrepareParamete
         args.trace_count    = sink.count;
         args.trace_capacity = kE8TraceCapacity;
         args.e8_dump        = 1;
+    }
+    const VTraceSink v_sink = v_trace_sink(execution.stream);
+    if (v_sink.out != nullptr) {
+        args.v_trace       = v_sink.out;
+        args.v_trace_count = v_sink.count;
+        args.v_trace_capacity = kVTraceRecords;
+        if (const char* t = std::getenv("NINFER_QSA_TRACE_T"); t != nullptr) {
+            args.v_trace_t = std::atoi(t);
+        }
+        if (const char* h = std::getenv("NINFER_QSA_TRACE_HEAD"); h != nullptr) {
+            args.v_trace_head = std::atoi(h);
+        }
     }
     switch (cache.main.storage) {
     case KvCacheStorage::BFloat16:
@@ -245,6 +308,7 @@ void launch_prepare(const QsaProjectionView& projected, const QsaPrepareParamete
     }
     CUDA_CHECK(cudaGetLastError());
     e8_trace_flush(sink, execution.stream);
+    v_trace_flush(v_sink, execution.stream);
 }
 
 } // namespace ninfer::ops::detail::qsa
