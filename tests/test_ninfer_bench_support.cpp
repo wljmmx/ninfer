@@ -167,8 +167,8 @@ int test_cli_contract() {
         "optimized head without a backend");
     failures += expect_throws<std::invalid_argument>(
         [] {
-            (void)parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--spec", "mtp",
-                                  "--draft-tokens", "6"});
+                (void)parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--spec", "mtp",
+                                      "--draft-tokens", "16"});
         },
         "unsupported MTP window");
     failures += expect_throws<std::invalid_argument>(
