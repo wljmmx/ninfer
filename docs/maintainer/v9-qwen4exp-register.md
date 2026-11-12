@@ -415,3 +415,99 @@ fused parent`（GDN 的 q/k/v/z 各自独立父张量）。separate-parent 的 r
 复现命令：`NINFER_EXPERT_CACHE_MB=14000 build-win/apps/ninfer.exe <工件> --prompt "Hello"
 --max-context 8192 --kv-capacity 8192 --max-new 8 --greedy --print-token-ids [--spec mtp
 --draft-tokens 3]`；崩溃定位用 `NINFER_LAYER_TRACE=1`（本轮取证的临时探针已移除）。
+
+---
+
+## 附二：MTP 草稿头与官方参考逐算子对拍（2026-11-12，第二轮）
+
+本轮目标：拿 Qwen4Exp 官方的 MTP 参考把 `mtp_hc_stem` 的六步与块内 HC 链逐算子对拍，
+定位 flash_next「0/15 接受、ids 与 `--spec none` 不同」。结论先说：**草稿头的六步与参考逐算子一致
+（stem 达到 BF16 舍入级），0/15 不能归因于草稿头；判据被主模型的数值缺陷阻塞**（§4）。
+
+### 1. 参照清单（哪些能对拍、哪些只是描述）
+
+能直接对拍（有可执行的参考实现/数值路径）：
+
+| 来源 | 位置 | 覆盖 |
+|---|---|---|
+| vLLM NVIDIA 变体（commit `6fddc9b2`） | `vllm/models/qwen4_exp/nvidia/mtp.py:274-340` | MTP 前向（stem、层调用、双流出口） |
+| 同上 | `nvidia/hyperconnection.py:161-211` | HC mix / combine_and_mix 的精确顺序 |
+| 同上 | `nvidia/model.py:258-313`, `:485`, `:556-569` | 层序（mix→attn→combine→mix→mlp→combine）、初始四流复制、末端 |
+| llama.cpp（master） | `src/models/qwen4exp.cpp:309-322`, `:626-665` | GGUF 张量语义（`nextn.eh_proj/enorm/hnorm/hc_head_*`）、MTP 图 |
+| 上游 C++（port 目标） | `src/models/qwen4_exp/execution/mtp.cpp:11-36,45-70,72-83` | `stem`/`mtp_forward`/`mtp_history` |
+| 上游 C++ 驱动 | `src/models/qwen4_exp/program/mtp.cpp:61-83,85-150,152-183` | `draft_forward`/`align_mtp`/`accept_forward` |
+| 模型文档 | `docs/maintainer/qwen4_exp-model.md:99-112`（§2.3）、`:63-67`（conditioning 用哪个特征） | 公式与特征选择 |
+| 本地工件 | `qwen3_8_flash_next_mtp.ninfer` + `.conversion.json`（`methods[].sources` 给出每个逻辑参数的来源切分） | 参数身份/形状/格式 |
+
+只是描述、不能当数值样例：`docs/` 的其余章节、`model-cards/`、上游 `bench/` 的 `mtp_round`/
+`mtp_pack` 基准（只测算子吞吐，不含模型数值）；工件里没有 logits/ids 之类的期望输出。
+
+`hc_head_*` 三个张量 = 末端 final mixer（`hc_head_norm`→`hc_norm`、`hc_head_down/up`→
+`input_mix_weight_*`，无 injection），`hnorm` = `pre_fc_norm_hidden`，`eh_proj` = 官方
+`fc_embedding`|`fc_hidden` 的融合父张量。
+
+### 2. 差异表（参考 vs 我们）
+
+| # | 语义 | 参考 | 我们 | 结论 |
+|---|---|---|---|---|
+| 1 | `e = OffsetNorm_2560(emb)`（offset，即 gain=1+w） | vLLM `mtp.py:293-294`；llama.cpp `:632-634`；上游 `mtp.cpp:20` | `text.cpp:673-674` | 同 |
+| 2 | `v = OffsetNorm_10240(hidden)`：**整 10240 一次归约** | vLLM `mtp.py:302`（`GemmaRMSNorm(hidden*hc)`）；上游 `mtp.cpp:21-22`；文档 §3.1「对整个对应向量归约」 | `text.cpp:676-677` | 同。注意 llama.cpp `:629` 是 reshape 成 `[2560,4,T]` 后按 2560 归约，与官方两处不一致（llama.cpp 侧的口径差异，不采信） |
+| 3 | `h_init[s] = W_fc_hidden·v[s] + e`，e 作为**单位系数**残差加到四条流 | vLLM `mtp.py:305-307` + `hyperconnection.py:190-197`；上游 `mtp.cpp:28-35` | `text.cpp:686-719`（`e` 加在 706，分组 norm 在 727-730） | 同 |
+| 4 | `eh_proj` 分列顺序：**embedding 在前**（`concat(e_norm, h_norm)`） | llama.cpp `:636` `ggml_concat(e_norm, h_norm, 0)`；转换器 `tools/convert/gguf_qwen4exp.py:568-581` | `src/models/qwen3_5/load/mtp.cpp:21-27`（`fc_embedding=cols[0,h)`） | 同 |
+| 5 | 块序：`mix→attn→combine(post_attention moe_hc.norm)→mix→mlp→combine(final norm)` | vLLM `model.py:290-313`；上游 `mtp.cpp:52-65` | `text.cpp:733-842`（combine/fold 在 815-832） | 同 |
+| 6 | 末端：`combine(final_hc.norm)` → 无 injection 的 final `hc_mix` → sample；conditioning = **合并后、未归一**的四流 residual | vLLM `model.py:335-340`；llama.cpp `:650-658`；文档 `:63-67` | `text.cpp:828-841`（conditioning 直接拷 `roots.residual`） | 同 |
+| 7 | attention 形态：indexed（QSA，自带 indexer + kpool） | 上游 `mtp.cpp:54`（`qsa`）、`mtp_history:81`；llama.cpp `:641`（同一 `build_layer_attn` + kpool）；vLLM `mtp.py:210-217`（`layer_type="qwen_sparse_attention"`，且 `skip_topk` 复用 step0 的选择） | `load/mtp.cpp:33-38` 声明 MTP 走 **dense**；`text.cpp:802-809` 用 `causal_softmax_attention` 读 `mtp_kv_` | **差异（能力降级）**。预算 `indexer_budget=2048`（512 块）内块选择覆盖全部 ⇒ 与 dense 等价；历史 >2048 token 起不等价。短 prompt 不是 0/15 的原因 |
+| 8 | 位置/RoPE：cache 位置 = conditioning 位置，喂的是**下一个** token 的 embedding | 上游 `mtp.h:8-9`；`program/mtp.cpp:38-48` | `program/speculative/mtp_alignment.h:30-36`（`shifted_embedding_begin=chunk_begin+1`） | 同（与 27B/35B 共用同一驱动） |
+
+### 3. 对拍（`mtp_hc_stem` 六步，BF16 逐位级）
+
+方法：在 `mtp_hc_stem` 里加 env 门控临时探针（`NINFER_MTP_PROBE=<dir>`，只转储进程内第一次调用），
+导出 `ids / emb / conditioning / e / v / e_proj / h_init / xn / block_input / injection`；
+再用 `tools/artifact/reader.py` 从工件读**真实权重**（`mtp/*` 全是 bf16 或可原样使用的 offset 参数），
+按参考公式逐算子复算后逐元素比。（探针已移除，`git diff` 为空。脚本在 `.temp/mtp_stem_parity.py`。）
+
+T = 51（prompt "Hello" 的最后一个 prefill 块）。判据是「相对 max|Δ| / max|参考|」：
+
+| 步 | 参考公式复算 | 对照组 |
+|---|---|---|
+| `e = OffsetNorm_2560(emb)` | **1.41e-3** | gain 用 `w` 而漏 `1+w`：2.11 |
+| `v = OffsetNorm_10240(cond)` | **1.35e-3**（整 10240） | 按 4×2560 分组：**6.29e-1** |
+| `e_proj = fc_embedding·e` | **2.29e-3** | — |
+| `h_init[s] = fc_hidden·v[s] + e` | **4.55e-3** | fc_embedding/fc_hidden 互换：1.06；流错一位 `v[s+1]`：0.99 |
+| `xn = grouped_OffsetNorm(h_init)`（gain=`attention_hc/norm`） | **2.12e-3**（每流独立） | 整 10240 归约：3.96e-1 |
+
+1e-3 量级 = BF16 输出的半个 ulp 级（`2^-8=3.9e-3`），即六步与参考**一致到输出精度**；
+`[h,count,T]` 的流平面布局、`e` 的单位加、分组 norm 的 2560 分组都被这三组对照排除掉错法。
+`injection` 落在 `(0,2)` 内、`block_input` 的幅值与 `xn` 同量级，形态正常。
+
+### 4. 判据阻塞：主模型在 HEAD 上数值是坏的
+
+同一工件、同一 prompt（`NINFER_EXPERT_CACHE_MB` 之外参数全同），greedy：
+
+| 臂 | ids |
+|---|---|
+| `--spec none`，cache=14000 | `2708 24434 171665 186285 725 836 174818 5174` |
+| `--spec none`，cache=**8192** | `66097 41977 83764 29527 132518 3162 97389 1071` |
+| `--spec mtp --draft-tokens 3`，cache=14000 | `49438 9616 63 4958 45320 90070 98717 38036`（**15 drafted / 0 accepted**，按位 0,0,0） |
+| `--spec mtp --draft-tokens 1` | `49438 9616`（同前缀） |
+
+**只改专家驻留容量就换掉整条贪婪链**，说明主路径的数值本身不可信；配合
+
+- **PPL**：`ninfer-perplexity --text <114 token 普通英文> --context 512 --stride 256` → **PPL 1.49389e+06**
+  （mean NLL 14.217 nats，`ln 248320 = 12.42`，即**比均匀分布还差**）；
+- 生成文本是词形正确但语义不通的串（"clearhisgulirat's their Eroste_a(...) Michelin intake ..."）。
+
+在这两条下，「draft 与 target argmax 相同」不可能作为可判定的判据：target 的分布已退化到近均匀，
+argmax 由数值噪声决定（这正是 cache 一改 ids 全变的机制）。因此本轮的
+「两臂 ids 逐位相同 + accepted 进 57–83%」**无法靠草稿头侧的任何改动达成**，也不该拿它当草稿头的验收。
+
+### 5. 未闭环
+
+1. **主路径数值缺陷（阻塞判据，本轮未定位）**：无法在允许改动面内修。可复现的入口是
+   「同 prompt 改 `NINFER_EXPERT_CACHE_MB` → ids 全变」+ PPL 1.49e6；下一步应在这条上做二分
+   （`src/artifact` 的对象解析 / `src/runtime` 的驻留调度 / `execution/expert_stream.cpp`，
+   三者都在本轮禁改名单里）。注意 QSA 侧 S2/S3 与 HC stem 已有实测通过，嫌疑面因此更小。
+2. **MTP 层的 indexed 能力降级**（差异表 #7）：>2048 token 历史时 draft 会退化，属独立工作项。
+3. **verify 与 decode 不是同一数值路径**（前一轮已登记）：主模型修好前无法判定它是否还独立存在。
+4. 端到端 accepted 率、27B/35B 不回退复跑、`ctest` 全绿——本轮**未做**：草稿头无代码改动，
+   判据本身不可达（见 §4），不虚报。
