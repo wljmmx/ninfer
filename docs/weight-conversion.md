@@ -135,6 +135,31 @@ Running it: `--spec mtp --draft-tokens N` loads the component; without `--spec m
 is simply not materialized. `load/mtp.cpp` requires the component's `architectures` to match the
 target's mathematics (`Qwen3_5MTP`, `Qwen3_5MoeMTP` or `Qwen4ExpMTP`).
 
+Two boundaries follow from the runtime, and both are properties of the target it was built for
+rather than of the component's tensors:
+
+* **The replay fold is a registry of compile-time geometries, not a formula.** A speculative round
+  commits the accepted prefix through `gdn_replay_fold`, and that kernel is instantiated once per
+  `(linear layers, q/k heads, v heads, conv channels)` tuple (`FoldGeometry<...>` in
+  `ops/linear_attention/gated_delta_net/recurrent.cuh`): the four values are template constants that
+  the kernel folds into its strides and bounds, so they cannot be passed as run-time parameters.
+  The same tuple is listed twice and the two lists must agree — `is_registered_fold_geometry` in
+  `replay.cpp` is the start-up check and the dispatch in `recurrent.cu` is the launch, which throws
+  `unregistered geometry` if it is reached with a tuple the check let through. Only the tuples the
+  build instantiates are usable (`(48,16,48,10240)`, `(30,16,32,8192)`, `(36,8,24,5120)` today).
+  A hybrid target whose linear layers do not match one of them, e.g. 36 linear layers that keep the
+  16/48/10240 head geometry, is refused at start-up (`gdn_replay_fold: unsupported record
+  geometry`) with `--spec mtp`, while `--spec none` is unaffected because it never builds replay
+  records. Registering another shape is a kernel instantiation plus a dispatch branch, i.e. a build
+  change, and the conv channels are `2·key_width + value_width`, not `2·hidden`, so the same head
+  geometry at a narrower hidden width still lands on a different tuple.
+* **The draft layer runs dense full attention.** The source draft block is an indexed (QSA) block
+  (`compress_ratios[block] = 4`); the converter and the loader carry its indexer matrices and the
+  output-gate alias, but the runtime executes the mixer as dense full attention because QSA block
+  selection (*MTD*) is not wired on this layer. It is exact rather than an approximation of the
+  sparse path, and it costs a full-history attention read at every draft step. This is the declared
+  behavioural difference from the source.
+
 ## Upgrade an existing v2 artifact
 
 The offline upgrade tool supports the official Qwen3.6/3.8-27B groupwise-int and NVFP4 artifacts,
