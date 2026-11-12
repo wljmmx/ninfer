@@ -1,10 +1,10 @@
-#include "models/qwen3_5/execution/qsa.h"
+#include "models/qwen4_exp/execution/qsa.h"
 
 #include <limits>
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::models::qwen3_5::execution {
+namespace ninfer::models::qwen4_exp::execution {
 namespace {
 
 // This header is also used by the planner before any execution object exists, so it reads the
@@ -18,7 +18,7 @@ std::int32_t positive_dimension(std::uint64_t value, const char* label) {
 
 } // namespace
 
-QsaGeometry qsa_geometry(const TextConfig& config) {
+QsaGeometry qsa_geometry(const qwen3_5::TextConfig& config) {
     QsaGeometry geometry;
     if (config.indexed_attention_layers == 0) { return geometry; }
     if (!config.indexer || !config.attention) {
@@ -102,8 +102,8 @@ std::size_t qsa_sparse_gqa_workspace_bytes(const QsaPlanInputs& inputs) {
                                                         inputs.gqa, inputs.execution);
 }
 
-QsaPlanInputs qsa_plan_inputs(const TextConfig& config, std::int32_t first, std::int32_t last,
-                              std::int32_t batch, KvCacheStorage storage,
+QsaPlanInputs qsa_plan_inputs(const qwen3_5::TextConfig& config, std::int32_t first,
+                              std::int32_t last, std::int32_t batch, KvCacheStorage storage,
                               std::uint32_t visible_tokens, DeviceExecutionView execution) {
     if (!config.indexer) { throw std::invalid_argument("qsa plan: the layer has no indexer"); }
     QsaPlanInputs inputs;
@@ -122,4 +122,4 @@ QsaPlanInputs qsa_plan_inputs(const TextConfig& config, std::int32_t first, std:
     return inputs;
 }
 
-} // namespace ninfer::models::qwen3_5::execution
+} // namespace ninfer::models::qwen4_exp::execution

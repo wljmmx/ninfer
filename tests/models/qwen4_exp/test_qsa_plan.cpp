@@ -1,4 +1,5 @@
-#include "models/qwen3_5/execution/qsa.h"
+#include "models/qwen4_exp/execution/qsa.h"
+#include "models/qwen3_5/config.h"
 
 #include <cstdint>
 #include <exception>
@@ -7,7 +8,7 @@
 
 using namespace ninfer;
 using namespace ninfer::models::qwen3_5;
-using namespace ninfer::models::qwen3_5::execution;
+using namespace ninfer::models::qwen4_exp::execution;
 
 namespace {
 

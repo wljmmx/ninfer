@@ -19,6 +19,10 @@ include(qwen3_5/loading_sources.cmake)
 include(qwen3_5/frontend_sources.cmake)
 include(qwen3_5/execution_sources.cmake)
 include(qwen3_5/program_sources.cmake)
+# Each family's own loading and execution sources are listed by that family, so the shared text
+# engine never names a family's files.
+include(qwen4_exp/loading_sources.cmake)
+include(qwen4_exp/execution_sources.cmake)
 
 # port (sm_89): qwen4-exp PLE disk layer. The table/row-reader/prepare pipeline is CPU only;
 # the optional GPU staging owner still links CUDA through ninfer_core. Upstream reads through

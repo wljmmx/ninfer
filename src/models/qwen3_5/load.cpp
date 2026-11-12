@@ -1,6 +1,6 @@
 #include "models/qwen3_5/load.h"
 #include "artifact/reader.h"
-#include "models/qwen4_exp/ple/table.h"
+#include "models/qwen4_exp/load.h"
 #include "models/qwen3_5/load/bindings.h"
 
 #include <cstdio>
@@ -118,8 +118,9 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     // The PLE table is opened here, while the artifact's object tables are still reachable. The
     // source owns its own read handles, so the plan - not the caller - decides its lifetime.
     if (text.ple) {
-        out->ple_table = loading::open_ple_table(reader, binder, out->pending, out->weights.text, text);
-        out->ple_eos   = loading::ple_eos_token(reader.directory());
+        out->ple_table = qwen4_exp::loading::open_ple_table(
+            reader, binder, out->pending, out->weights.text, text);
+        out->ple_eos   = qwen4_exp::loading::ple_eos_token(reader.directory());
     }
     out->materialization = std::move(binder).finish();
     out->info.name       = reader.directory().metadata.value(

@@ -1,11 +1,11 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/attention.h"
+#include "models/qwen3_5/execution/diagnostics.h"
 #include "models/qwen3_5/execution/gdn.h"
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/expert_stream.h"
 #include "models/qwen3_5/execution/mtp.h"
-#include "models/qwen3_5/execution/qsa.h"
 #include "models/qwen3_5/execution/shape_class.h"
 #include "models/qwen3_5/execution/workspace.h"
 
@@ -113,117 +113,11 @@ void project(const Tensor& x, const LinearParameters& parameters, Tensor& out,
     ops::linear(x, parameters.weight, out, parameters.policy, workspace, stream);
 }
 
-// Diagnosis: the two QSA gates compare bytes produced by two different runs of the same prefix, so
-// the only usable evidence is a file dump plus a stream hash. NINFER_QSA_KV_DUMP=dir writes the
-// main K plane and the index plane prepare wrote; NINFER_QSA_LAYER_DUMP=dir writes the indexed
-// layer's attention output as the dense arm and the sparse arm produce it. Both dump one layer,
-// NINFER_QSA_DUMP_LAYER (default 3, the artifact's first indexed layer).
-// NINFER_QSA_DUMP_LAYER selects one indexed layer by its compact index, or every layer with -1.
-bool qsa_dump_wants_layer(int layer) {
-    const char* value = std::getenv("NINFER_QSA_DUMP_LAYER");
-    if (value == nullptr || *value == '\0') { return layer == 0; }
-    const long selected = std::strtol(value, nullptr, 10);
-    return selected < 0 || static_cast<int>(selected) == layer;
-}
-
-std::uint64_t fnv1a64(const void* data, std::size_t bytes) {
-    const auto* bytes_in = static_cast<const std::uint8_t*>(data);
-    std::uint64_t hash   = 1469598103934665603ULL;
-    for (std::size_t i = 0; i < bytes; ++i) {
-        hash ^= bytes_in[i];
-        hash *= 1099511628211ULL;
-    }
-    return hash;
-}
-
-// `columns` is the pass's column extent, or zero for a plane that keeps one file per layer.
-// NINFER_QSA_SYNC: settle after each QSA Op so the first faulty submission names itself instead of
-// surfacing at whatever kernel syncs next.
-bool qsa_sync_probe() {
-    static const bool enabled = std::getenv("NINFER_QSA_SYNC") != nullptr;
-    return enabled;
-}
-
-void qsa_mark(cudaStream_t stream, const char* step, int layer) {
-    if (!qsa_sync_probe()) { return; }
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    std::fprintf(stderr, "[qsa] step ok layer=%d %s\n", layer, step);
-    std::fflush(stderr);
-}
-
-// NINFER_QSA_META: read the pass's device metadata back once per layer call. This is the one place
-// the wiring reads device state, and it exists only to attribute a fault to a bad selector.
-void qsa_meta_probe(const char* stage, int layer, const Tensor& positions, const Tensor& columns,
-                    const Tensor& base, const Tensor& offsets, const Tensor& source,
-                    const Tensor& destination, std::int32_t batch, cudaStream_t stream) {
-    if (std::getenv("NINFER_QSA_META") == nullptr) { return; }
-    std::array<std::int32_t, 8> meta{};
-    const auto read = [&](const Tensor& t, std::size_t slot) {
-        if (t.data == nullptr || batch <= 0) { return; }
-        CUDA_CHECK(cudaMemcpyAsync(&meta[slot], t.data, sizeof(std::int32_t),
-                                   cudaMemcpyDeviceToHost, stream));
-    };
-    read(positions, 0);
-    read(columns, 1);
-    read(base, 2);
-    read(offsets, 3);
-    read(source, 4);
-    read(destination, 5);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    std::fprintf(stderr,
-                 "[qsa] meta %s layer=%d pos=%d cols=%d base=%d off=%d src=%d dst=%d\n", stage,
-                 layer, meta[0], meta[1], meta[2], meta[3], meta[4], meta[5]);
-    std::fflush(stderr);
-}
-
-void qsa_dump_tensor(const char* variable, const char* name, const Tensor& value, int layer,
-                     std::int32_t columns, cudaStream_t stream) {
-    const char* directory = std::getenv(variable);
-    if (directory == nullptr || *directory == '\0' || !qsa_dump_wants_layer(layer)) { return; }
-    // A BF16 cache has no scale planes: an absent tensor is simply not dumped.
-    if (value.data == nullptr) { return; }
-    if (!value.is_contiguous()) {
-        throw std::logic_error("QSA dump needs a contiguous device tensor");
-    }
-    std::vector<std::uint8_t> host(value.bytes());
-    CUDA_CHECK(cudaMemcpyAsync(host.data(), value.data, host.size(), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    std::string path(directory);
-    path += "\\";
-    path += name;
-    path += "_layer";
-    path += std::to_string(layer);
-    // The column extent names the call: a prefill chunk and a decode step write different files, so
-    // a comparison can pick the pass it means instead of racing the last write.
-    if (columns > 0) {
-        path += "_T";
-        path += std::to_string(columns);
-    }
-    path += ".bin";
-    if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
-        (void)std::fwrite(host.data(), 1, host.size(), file);
-        (void)std::fclose(file);
-    }
-    std::fprintf(stderr, "[qsa] dump %s layer=%d bytes=%zu fnv=%016llx path=%s\n", name, layer,
-                 host.size(), static_cast<unsigned long long>(fnv1a64(host.data(), host.size())),
-                 path.c_str());
-    std::fflush(stderr);
-}
-
 // NINFER_QSA_FORCE_FULL: the indexed layers run the dense mixer instead - its own KV append
 // included - which is the reference arm of both the byte gate and the long-context A/B. Read once,
 // because the startup plan follows the same switch.
 bool qsa_dense_arm() {
     static const bool dense = std::getenv("NINFER_QSA_FORCE_FULL") != nullptr;
-    return dense;
-}
-
-// NINFER_QSA_DENSE_READ: keep the read side dense (S2's own stage) - prepare still owns the cache,
-// and the attention reads it back through the read-only cached Op instead of the indexer. Only a
-// single-row traversal has a read-only dense form, so the batch paths stay on the sparse arm.
-bool qsa_dense_read() {
-    static const bool dense = std::getenv("NINFER_QSA_DENSE_READ") != nullptr;
     return dense;
 }
 
@@ -2044,126 +1938,59 @@ void TextContext::mtp_propose_topk_strided(const Tensor& hidden, Tensor& logits,
     }
 }
 
-void TextContext::hc_stem(Tensor& embedding, std::int32_t tokens) {
-    const auto& hc = config_.hc.value();
-    // The stream width the artifact states, so a plan built from a different one is refused here
-    // rather than by a silent shape mismatch three ops later.
-    if (hc.count != 4 || hc.stream_width(config_.hidden_size) != 4 * config_.hidden_size) {
-        throw std::invalid_argument("Qwen4Exp hyper-connection requires four residual streams of "
-                                    "the hidden width");
+namespace {
+// Diagnosis (NINFER_GDN_DUMP=<dir>): write one linear-attention layer's operands and results as
+// raw planes, so a recomputation from the artifact can be compared tensor by tensor against what
+// the engine actually computed. NINFER_GDN_DUMP_LAYERS selects layers by compact index (a comma
+// list, -1 for all, default "0"). A plane is [rows, cols] at the engine's own column pitch, which
+// is token-major: the feature axis is the contiguous one.
+bool gdn_dump_wants(std::int32_t layer) {
+    const char* dir = std::getenv("NINFER_GDN_DUMP");
+    if (dir == nullptr || *dir == '\0') { return false; }
+    const char* list = std::getenv("NINFER_GDN_DUMP_LAYERS");
+    if (list == nullptr || *list == '\0') { return layer == 0; }
+    const char* cursor = list;
+    while (*cursor != '\0') {
+        char* end        = nullptr;
+        const long value = std::strtol(cursor, &end, 10);
+        if (end == cursor) { break; }
+        if (value < 0 || static_cast<std::int32_t>(value) == layer) { return true; }
+        cursor = *end == ',' ? end + 1 : end;
     }
-    const auto roots = workspace::text_hc_roots(work_, config_, tokens);
-    hc_              = roots;
-    const auto width = dimension(config_.hidden_size), streams = dimension(hc.count);
-    Tensor weight    = parameters_.text.layers.front().input_norm.view({width, streams});
-    Tensor residual  = hc_.residual.view({width, streams, tokens});
-    Tensor normed    = hc_.normalized.view({width, streams, tokens});
-    // The residual starts as the embedding, stream-replicated and stream-normed exactly once.
-    ops::hc_expand_norm(embedding, weight, config_.rms_norm_eps, residual, normed,
-                        ctx_.execution_view());
+    return false;
 }
 
-namespace {
-void nan_probe_tensor(const char* tag, const Tensor& value, std::size_t layer, cudaStream_t stream) {
-    if (std::getenv("NINFER_NAN_PROBE") == nullptr || value.data == nullptr) { return; }
-    if (value.dtype != DType::BF16) { return; }
-    const auto rows = value.ne[0], cols = value.ne[1];
-    std::vector<std::uint16_t> host(static_cast<std::size_t>(rows) * cols);
-    if (cudaMemcpyAsync(host.data(), value.data, host.size() * sizeof(std::uint16_t),
-                        cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
+void gdn_dump_plane(const char* tag, const Tensor& value, std::int32_t rows, std::int32_t cols,
+                    std::int32_t layer, cudaStream_t stream) {
+    const char* dir = std::getenv("NINFER_GDN_DUMP");
+    if (dir == nullptr || *dir == '\0' || value.data == nullptr || rows <= 0 || cols <= 0) { return; }
+    if (value.ne[0] != rows) { return; }
+    const std::size_t item = value.dtype == DType::FP32 ? 4U : 2U;
+    if (value.dtype != DType::FP32 && value.dtype != DType::BF16) { return; }
+    const std::size_t pitch  = static_cast<std::size_t>(value.nb[1]);
+    const std::size_t run    = static_cast<std::size_t>(rows) * item;
+    if (pitch < run) { return; }
+    std::vector<std::uint8_t> host(run * static_cast<std::size_t>(cols));
+    if (cudaMemcpy2DAsync(host.data(), run, value.data, pitch, run,
+                          static_cast<std::size_t>(cols), cudaMemcpyDeviceToHost,
+                          stream) != cudaSuccess) {
+        std::fprintf(stderr, "[gdn-dump] %s copy failed\n", tag);
         return;
     }
     if (cudaStreamSynchronize(stream) != cudaSuccess) { return; }
-    std::size_t bad = 0, elements = 0;
-    int first = -1;
-    std::vector<std::size_t> row_hits(static_cast<std::size_t>(rows), 0);
-    std::vector<std::size_t> col_hits(static_cast<std::size_t>(cols), 0);
-    for (int c = 0; c < cols; ++c) {
-        std::size_t token_bad = 0;
-        for (int r = 0; r < rows; ++r) {
-            const auto bits = host[static_cast<std::size_t>(c) * rows + r];
-            if ((bits & 0x7f80U) == 0x7f80U && (bits & 0x7fU) != 0U) {
-                ++token_bad;
-                ++elements;
-                ++row_hits[static_cast<std::size_t>(r)];
-            }
-        }
-        if (token_bad != 0) {
-            ++bad;
-            col_hits[static_cast<std::size_t>(c)] = token_bad;
-            if (first < 0) { first = c; }
-        }
+    char path[1024];
+    std::snprintf(path, sizeof path, "%s/gdn-l%d-%s-%dx%d-%s.bin", dir, layer, tag, rows, cols,
+                  item == 4U ? "fp32" : "bf16");
+    if (FILE* file = std::fopen(path, "wb")) {
+        std::fwrite(host.data(), 1, host.size(), file);
+        std::fclose(file);
+    } else {
+        std::fprintf(stderr, "[gdn-dump] cannot open %s\n", path);
     }
-    std::size_t bad_rows = 0, first_bad_row = static_cast<std::size_t>(-1);
-    for (std::size_t r = 0; r < row_hits.size(); ++r) {
-        if (row_hits[r] != 0) {
-            ++bad_rows;
-            if (first_bad_row == static_cast<std::size_t>(-1)) { first_bad_row = r; }
-        }
-    }
-    std::fprintf(stderr,
-                 "[nan-probe] layer=%zu %s columns=%d bad_columns=%zu first=%d elements=%zu "
-                 "bad_rows=%zu first_row=%lld\n",
-                 layer, tag, cols, bad, first, elements, bad_rows,
-                 static_cast<long long>(first_bad_row));
-    if (std::getenv("NINFER_NAN_PROBE") != nullptr &&
-        std::string(std::getenv("NINFER_NAN_PROBE")) == "2") {
-        std::fprintf(stderr, "[nan-probe]   %s per-column:", tag);
-        for (int c = 0; c < cols; ++c) {
-            std::fprintf(stderr, " %d:%zu", c, col_hits[static_cast<std::size_t>(c)]);
-        }
-        std::fprintf(stderr, "\n");
-    }
-    if (std::getenv("NINFER_NAN_PROBE") != nullptr &&
-        std::string(std::getenv("NINFER_NAN_PROBE")) == "3") {
-        std::fprintf(stderr, "[nan-probe]   %s sentinel-per-column (0x8080):", tag);
-        for (int c = 0; c < cols; ++c) {
-            std::size_t hits = 0;
-            for (int r = 0; r < rows; ++r) {
-                if (host[static_cast<std::size_t>(c) * rows + r] == 0x8080U) { ++hits; }
-            }
-            std::fprintf(stderr, " %d:%zu", c, hits);
-        }
-        std::fprintf(stderr, "\n");
-    }
+    std::fprintf(stderr, "[gdn-dump] %s\n", path);
     std::fflush(stderr);
 }
 } // namespace
-
-void TextContext::hc_mix_into(const HcParameters& weights, std::int32_t tokens) {
-    const auto normalized = hc_.normalized.view({dimension(config_.hidden_size),
-                                                 dimension(config_.hc->count), tokens});
-    // Produces the block's single-stream input and the four coefficients its correction applies.
-    nan_probe_tensor("hc-mix-pre", hc_.input, 300, ctx_.stream);
-    nan_probe_tensor("hc-normed", hc_.normalized, 400, ctx_.stream);
-    ops::hc_mix(normalized, weights.block_form(), work_, hc_.input, hc_.injection,
-                ctx_.execution_view());
-    nan_probe_tensor("hc-mix-out", hc_.input, 200, ctx_.stream);
-}
-
-void TextContext::hc_combine(const Tensor& product, const Tensor& norm_weight,
-                             std::int32_t tokens) {
-    const auto width   = dimension(config_.hidden_size);
-    const auto streams = dimension(config_.hc->count);
-    Tensor residual    = hc_.residual.view({width, streams, tokens});
-    Tensor normed      = hc_.normalized.view({width, streams, tokens});
-    const auto weight  = norm_weight.view({width, streams});
-    // residual += injection * product, then the grouped norm of the result for the next block.
-    // The residual aliases itself in place, which the Op admits exactly.
-    ops::hc_combine_norm(residual, product, hc_.injection, weight, config_.rms_norm_eps, residual,
-                         normed, ctx_.execution_view());
-}
-
-void TextContext::final_hidden(Tensor& x, Tensor& out, std::int32_t tokens) {
-    if (!hc_enabled()) {
-        ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, out, ctx_.stream);
-        return;
-    }
-    const auto& weights = *final_hc_;
-    ops::hc_mix(hc_.normalized.view({dimension(config_.hidden_size),
-                                     dimension(config_.hc->count), tokens}),
-                weights.final_form(), work_, out, ctx_.execution_view());
-}
 
 void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph,
                            const Tensor* normalized) {
@@ -2309,6 +2136,12 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     }
 
     nan_probe_tensor("gdn-h-in", h, gidx, s);
+    const bool dump_gdn = gdn_dump_wants(gidx);
+    if (dump_gdn) {
+        gdn_dump_plane("h", h, dimension(config_.hidden_size), T, gidx, s);
+        gdn_dump_plane("g", g, dimension(config_.gdn->linear_num_value_heads), T, gidx, s);
+        gdn_dump_plane("beta", beta, dimension(config_.gdn->linear_num_value_heads), T, gidx, s);
+    }
     const auto projection = workspace::gdn_projection(work_, config_, T);    Tensor z  = projection.output_gate.view({dimension(config_.gdn->linear_value_head_dim),
                                              dimension(config_.gdn->linear_num_value_heads), T});
     Tensor qc = projection.query;
@@ -2405,6 +2238,12 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             CUDA_CHECK(cudaMemsetAsync(qkv.data, 0x80, qkv.bytes(), s));
         }
         gdn_projection(h, p, qkv, z_flat, work_, s);
+        if (dump_gdn) {
+            gdn_dump_plane("qkv", qkv,
+                           dimension(config_.gdn->key_width()) * 2 +
+                               dimension(config_.gdn->value_width()),
+                           T, gidx, s);
+        }
         Tensor conv_state_in =
             state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_source_slot_);
         Tensor conv_state_out =
@@ -2418,6 +2257,13 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     nan_probe_tensor("gdn-qc", qc, gidx, s);
     nan_probe_tensor("gdn-vc", vc, gidx, s);
     nan_probe_tensor("gdn-gate", z.view({dimension(config_.gdn->value_width()), T}), gidx, s);
+    if (dump_gdn) {
+        gdn_dump_plane("qc", qc, dimension(config_.gdn->key_width()), T, gidx, s);
+        gdn_dump_plane("kc", kc, dimension(config_.gdn->key_width()), T, gidx, s);
+        gdn_dump_plane("vc", vc, dimension(config_.gdn->value_width()), T, gidx, s);
+        gdn_dump_plane("z", z.view({dimension(config_.gdn->value_width()), T}),
+                       dimension(config_.gdn->value_width()), T, gidx, s);
+    }
 
     Tensor q_recurrent = qc.view({dimension(config_.gdn->linear_key_head_dim),
                                   dimension(config_.gdn->linear_num_key_heads), T});
@@ -2497,23 +2343,28 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     Tensor on = workspace::gdn_normalized_output(work_, config_, T)
                     .view({dimension(config_.gdn->linear_value_head_dim),
                            dimension(config_.gdn->linear_num_value_heads), T});
-    // The artifact names the output gate's activation. Qwen4Exp's text config carries
-    // `output_gate_type: sigmoid` and its reference (HF `Qwen4ExpTextRMSNormGated`, upstream
-    // execution/gdn.cpp) applies ACT2FN[output_gate_type] to the gate; the Qwen3.5 artifacts carry
-    // no such key and keep the SiLU gate this path shipped with. Reading the name here rather than
-    // assuming one form is what keeps a wrong gate from scaling every linear-attention layer.
-    if (config_.output_gate_type.empty() || config_.output_gate_type == "silu") {
+    // The artifact names the output gate's activation, and the parse already resolved that name
+    // against the family's identity: `sigmoid` for a family whose reference applies the sigmoid to
+    // the gate, the rectified gate this path has always used otherwise. Keeping the choice in the
+    // config means a wrong gate can never scale every linear-attention layer.
+    switch (config_.gdn_gate) {
+    case GdnGateKind::Silu:
         ops::silu_gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, ctx_.execution_view());
-    } else if (config_.output_gate_type == "sigmoid") {
+        break;
+    case GdnGateKind::Sigmoid:
         ops::sigmoid_gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, ctx_.execution_view());
-    } else {
-        throw std::invalid_argument("text/gdn: unsupported output_gate_type '" +
-                                    config_.output_gate_type + "'");
+        break;
     }
     nan_probe_tensor("gdn-recurrent-o",
                      o.view({dimension(config_.gdn->value_width()), T}), gidx, s);
     nan_probe_tensor("gdn-normed-on",
                      on.view({dimension(config_.gdn->value_width()), T}), gidx, s);
+    if (dump_gdn) {
+        gdn_dump_plane("o", o.view({dimension(config_.gdn->value_width()), T}),
+                       dimension(config_.gdn->value_width()), T, gidx, s);
+        gdn_dump_plane("on", on.view({dimension(config_.gdn->value_width()), T}),
+                       dimension(config_.gdn->value_width()), T, gidx, s);
+    }
 
     {
         Tensor gdn_out = on.view({dimension(config_.gdn->value_width()), T});
@@ -2523,216 +2374,6 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             ops::w4a8_linear_add(gdn_out, p.output.weight, x, work_, s);
         } else {
             ops::linear_add(gdn_out, p.output.weight, x, p.output.policy, work_, s);
-        }
-    }
-}
-
-ops::QsaTailStateView TextContext::qsa_tail_view(int index, const Tensor& slots) const {
-    if (batch_text_kv_ == nullptr || !batch_text_kv_->has_qsa()) {
-        throw std::logic_error("QSA tail state needs an indexed text cache");
-    }
-    const qwen3_5::QsaStateSlot layer =
-        batch_text_kv_->qsa_tail_layer(static_cast<std::uint32_t>(index));
-    return {layer.raw_keys, layer.first_rope, slots};
-}
-
-void TextContext::qsa_mix(const BlockParameters& w, Tensor& x, int fidx, Phase, const Tensor* normalized) {
-    const auto& p = std::get<AttentionParameters>(w.mixer);
-    if (!p.indexer) { throw std::logic_error("indexed mixer has no indexer weights"); }
-    if (batch_text_kv_ == nullptr || !batch_text_kv_->has_qsa()) {
-        throw std::logic_error("indexed mixer has no QSA cache planes");
-    }
-    if (active_qsa_columns_ == nullptr || active_qsa_base_positions_ == nullptr ||
-        active_qsa_offsets_ == nullptr) {
-        throw std::logic_error("QSA pass metadata is not bound");
-    }
-    const auto& indexer = *p.indexer;
-    cudaStream_t s      = ctx_.stream;
-    const int T         = x.ne[1];
-    // The same row/width/slot model every other mixer uses: a merged pass is one rectangle of
-    // `width x batch` columns, a decode is that rectangle at width one, a single-lane chunk is
-    // width T by one row.
-    const std::int32_t batch = active_sequence_batch_ != 0 ? active_sequence_batch_ : 1;
-    const std::int32_t width = active_sequence_batch_ != 0 ? active_sequence_width_ : T;
-    if (width <= 0 || width * batch != T) {
-        throw std::logic_error("QSA sequence batch binding does not match aggregate columns");
-    }
-
-    const auto head_dim  = dimension(config_.attention->head_dim);
-    const auto query_hd  = dimension(config_.attention->num_attention_heads);
-    const auto kv_heads  = dimension(config_.attention->num_key_value_heads);
-    const auto query_w   = dimension(config_.attention->query_width());
-    const auto key_w     = dimension(config_.attention->key_width());
-    if (!config_.indexer) { throw std::logic_error("indexed mixer has no indexer config"); }
-    const auto index_hd  = dimension(config_.indexer->head_dim);
-    const DeviceExecutionView execution = ctx_.execution_view();
-
-    // Positions, RoPE coordinates and the live-column count come from the pass, never from a host
-    // read of device state: this is what keeps a captured traversal replayable at another length.
-    const Tensor& cache_positions =
-        active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
-    const Tensor& rope_source =
-        active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
-    Tensor positions = active_sequence_batch_ != 0 ? cache_positions : cache_positions.view({T, 1});
-    Tensor rope;
-    if (active_sequence_batch_ != 0) {
-        rope = width == 1 ? rope_source.view({1, 1, batch})
-                          : rope_source.view({width, 1, batch});
-    } else {
-        rope = rope_source.ne[1] == 3 ? rope_source.view({T, 3, 1})
-                                      : rope_source.view({T, 1, 1});
-    }
-    const Tensor& valid_columns = *active_qsa_columns_;
-    const Tensor& kv_table_rows =
-        active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
-    const Tensor& source_slots =
-        active_linear_state_source_slots_ != nullptr ? *active_linear_state_source_slots_
-                                                     : *active_qsa_source_slots_;
-    const Tensor& destination_slots =
-        active_linear_state_destination_slots_ != nullptr ? *active_linear_state_destination_slots_
-                                                          : *active_qsa_destination_slots_;
-    if (valid_columns.ne[0] != batch || source_slots.ne[0] != batch ||
-        destination_slots.ne[0] != batch || kv_table_rows.ne[0] < batch) {
-        throw std::logic_error("QSA pass metadata does not match the bound batch");
-    }
-
-    const auto projection = workspace::text_attention_projection(work_, config_, T);
-    auto qsa              = workspace::qsa_roots(work_, config_, T);
-    Tensor h              = normalized != nullptr ? *normalized : projection.hidden;
-    if (normalized == nullptr) ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s);
-
-    Tensor q_flat    = projection.query.view({query_w, T});
-    Tensor gate_flat = projection.gate.view({query_w, T});
-    Tensor k_flat    = projection.key.view({key_w, T});
-    Tensor v_flat    = projection.value.view({key_w, T});
-    attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s);
-    // The artifact keeps the indexer's two matrices in their own parents, so each is one Linear
-    // segment instead of a merged parent no Op overload could take.
-    project(h, indexer.query, qsa.index_query, work_, s);
-    project(h, indexer.key, qsa.index_key, work_, s);
-    nan_probe_tensor("qsa-proj-q", q_flat, 100 + std::size_t(fidx), s);
-
-    ops::QsaProjectionView projected{
-        q_flat.view({head_dim, query_hd, T, batch}),
-        k_flat.view({head_dim, kv_heads, T, batch}),
-        v_flat.view({head_dim, kv_heads, T, batch}),
-        qsa.index_query.view({index_hd, 4, T, batch}),
-        qsa.index_key.view({index_hd, T, batch}),
-    };
-    const ops::QsaBatchView batch_view{positions, valid_columns, kv_table_rows};
-    // Two norms of 256 for the mixer's heads and two of 128 for the indexer's, all unit-offset.
-    const ops::QsaPrepareParameters prepare_parameters{
-        p.query_norm, p.key_norm, indexer.query_norm, indexer.key_norm,
-        config_.rms_norm_eps, config_.rope_parameters->rope_theta,
-    };
-    // One cache view for both planes: the index plane is addressed through the main cache's own
-    // block table, which prepare itself requires to be the identical tensor.
-    PagedKVBatchLayerView main_cache = batch_text_kv_->batch_layer_view(static_cast<std::uint32_t>(fidx));
-    const ops::QsaIndexCacheView index_cache{
-        batch_text_kv_->qsa_index_layer(static_cast<std::uint32_t>(fidx)),
-        main_cache.block_tables,
-    };
-    const ops::QsaCacheView cache{main_cache, index_cache};
-    const ops::QsaRawRecordWriteView records{
-        qsa.record_keys.view({index_hd, T, batch}),
-        qsa.record_rope.view({3, T, batch}),
-        *active_qsa_offsets_,
-    };
-    const ops::QsaTailStateView before = qsa_tail_view(fidx, source_slots);
-
-    // `query` and `index_query` exactly alias their projections, which prepare admits: it is the
-    // normalization and rotation of that same storage, not a second buffer.
-    Tensor prepared_query      = projected.query;
-    Tensor prepared_index_query = projected.index_query;
-    ops::qsa_prepare(projected, prepare_parameters, batch_view, rope, before, cache, records,
-                     prepared_query, prepared_index_query, execution);
-    qsa_meta_probe("after-prepare", fidx, positions, valid_columns, *active_qsa_base_positions_,
-                   *active_qsa_offsets_, source_slots, destination_slots, batch, s);
-    qsa_mark(s, "prepare", fidx);
-    // Same names the dense arm writes: its post-norm/post-RoPE Q and its pre-append V.
-    qsa_dump_tensor("NINFER_QSA_LAYER_DUMP", "query",
-                    prepared_query.view({head_dim, query_hd, T}), fidx, T, s);
-    qsa_dump_tensor("NINFER_QSA_LAYER_DUMP", "value_in",
-                    projected.value.view({head_dim, kv_heads, T}), fidx, T, s);
-
-    // The envelope is the resolved capacity, which is also what the startup plan priced: a host
-    // launch promise, fixed across every replay, never a mask. It is taken from the cache the Ops
-    // actually address: a decode pass binds its tables through `batch_text_kv_` and leaves `kv_`
-    // empty, and a zero envelope would let the Ops size nothing and then score live blocks.
-    const auto visible =
-        std::min<std::uint32_t>(batch_text_kv_->max_context(), 262144U);
-    if (visible == 0) { throw std::logic_error("QSA envelope needs a resolved cache capacity"); }
-    Tensor attention   = qsa.attention.view({head_dim, query_hd, T, batch});
-    // The read-only dense Op takes one execution row's own table, which only a single-lane pass
-    // carries; a batch traversal binds its tables through `batch_text_kv_` instead, so it stays on
-    // the sparse arm even under the switch.
-    const bool dense_read = qsa_dense_read() && batch == 1 && kv_.valid();
-    if (qsa_dense_read() && !dense_read) {
-        static const bool told = [] {
-            std::fprintf(stderr,
-                         "[qsa] NINFER_QSA_DENSE_READ has no read-only row for this pass; the "
-                         "layer runs the sparse arm\n");
-            std::fflush(stderr);
-            return true;
-        }();
-        (void)told;
-    }
-    if (dense_read) {
-        // S2's own stage: prepare owns the cache, and the dense Op reads that cache back without
-        // appending anything (`prepared_query` is already the normalized, rotated query).
-        Tensor dense_out = attention.view({head_dim, query_hd, T});
-        ops::causal_softmax_attention_cached(
-            prepared_query.view({head_dim, query_hd, T}), positions.view({T}),
-            {head_dim, query_hd, kv_heads},
-            static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_dim))),
-            kv_.layer_view(static_cast<std::uint32_t>(fidx)),
-            ops::CausalAttentionExecutionEnvelope{visible, visible}, work_, dense_out, execution);
-        ops::sigmoid_mul(gate_flat.view({head_dim, query_hd, T}), dense_out, s);
-    } else {
-        const ops::QsaIndexerExecutionEnvelope indexer_envelope{visible};
-        const ops::QsaSparseGqaExecutionEnvelope gqa_envelope{visible};
-        ops::QsaBlockSelection selected{
-            qsa.block_ids.view({512, T, batch}),
-            qsa.block_counts.view({T, batch}),
-        };
-        ops::qsa_indexer(prepared_index_query, index_cache, batch_view, indexer_envelope, work_,
-                         selected, execution);
-        qsa_mark(s, "indexer", fidx);
-        // The sparse Op applies the output gate itself, so its output is already the gated
-        // attention result the dense arm computes with sigmoid_mul.
-        ops::qsa_sparse_gqa(prepared_query, gate_flat.view({head_dim, query_hd, T, batch}),
-                            main_cache, batch_view, selected, gqa_envelope, work_, attention,
-                            execution);
-        qsa_mark(s, "sparse_gqa", fidx);
-    }
-
-    ops::QsaRawRecordReadView read_records{
-        records.raw_keys, records.rope_positions, *active_qsa_base_positions_, valid_columns};
-    ops::qsa_tail_extract(before, read_records, valid_columns,
-                          qsa_tail_view(fidx, destination_slots), execution);
-    qsa_mark(s, "tail_extract", fidx);
-
-    qsa_dump_tensor("NINFER_QSA_KV_DUMP", "main_key", main_cache.k_pages, fidx, 0, s);
-    qsa_dump_tensor("NINFER_QSA_KV_DUMP", "main_value", main_cache.v_pages, fidx, 0, s);
-    qsa_dump_tensor("NINFER_QSA_KV_DUMP", "main_key_scale", main_cache.k_scale_pages, fidx, 0, s);
-    qsa_dump_tensor("NINFER_QSA_KV_DUMP", "main_value_scale", main_cache.v_scale_pages, fidx, 0, s);
-    qsa_dump_tensor("NINFER_QSA_KV_DUMP", "index_key", index_cache.keys, fidx, 0, s);
-    // The coverage check: after this call the written index blocks and the raw-key tail must tile
-    // 0..p with no hole. The tail plane is dumped whole so the check can address the row's slot.
-    qsa_dump_tensor("NINFER_QSA_KV_DUMP", "tail_keys",
-                    qsa_tail_view(fidx, destination_slots).raw_keys, fidx, 0, s);
-    qsa_dump_tensor("NINFER_QSA_LAYER_DUMP", "attention", attention, fidx, T, s);
-
-    {
-        Tensor attn_out = qsa.attention.view({query_w, T});
-        nan_probe_tensor("qsa-attn", attn_out, 100 + std::size_t(fidx), s);
-        if (normalized != nullptr) {
-            // The four-stream correction owns the residual, so the projection is a pure write.
-            ops::linear(attn_out, p.output.weight, x, p.output.policy, work_, s);
-        } else if (ops::w4a8_supported(p.output.weight, T)) {
-            ops::w4a8_linear_add(attn_out, p.output.weight, x, work_, s);
-        } else {
-            ops::linear_add(attn_out, p.output.weight, x, p.output.policy, work_, s);
         }
     }
 }

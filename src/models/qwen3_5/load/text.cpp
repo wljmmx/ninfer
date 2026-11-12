@@ -1,6 +1,6 @@
 #include "models/qwen3_5/load/bindings.h"
 
-#include "models/qwen4_exp/ple/table.h"
+#include "models/load_rules.h"
 
 #include <algorithm>
 #include <limits>
@@ -10,43 +10,19 @@
 namespace ninfer::models::qwen3_5::loading {
 namespace {
 
-// Qwen4Exp normalizes the HC-expanded residual, so its stream norms cover every HC stream.
-std::uint64_t norm_width(const TextConfig& config) {
-    return config.hc ? config.hc->stream_width(config.hidden_size)
-                     : std::uint64_t(config.hidden_size);
-}
-
-// The n-gram table is paged from disk and never resident, so its binding needs no device bytes.
-PleWeights bind_ple(Bindings& b, const TextConfig& config, const std::string& p) {
-    const auto& ple    = config.ple.value();
-    const auto streams = std::uint64_t(config.hc ? config.hc->count : 1) * ple.embed_dim;
-    PleWeights out;
-    out.key         = b.parameter(p + "key", {streams, ple.embed_dim}, {p + "embedding"});
-    out.value       = b.parameter(p + "value", {ple.embed_dim, ple.embed_dim}, {p + "embedding"});
-    out.norm_key    = b.direct(p + "norm_key", {streams});
-    out.norm_query  = b.direct(p + "norm_query", {streams});
-    out.norm_conv   = b.direct(p + "norm_conv", {streams});
-    out.convolution = b.direct(p + "convolution", {ple.conv_kernel_size, streams});
-    out.table = b.parameter(p + "table", {ple.table_rows(), ple.table_width()}, {}, std::nullopt,
-                            artifact::Residency::Streamed);
-    return out;
+// The family's binding table, or a refusal: a streamed residual with no rules would bind names the
+// artifact does not carry, and the failure would surface as a missing parameter three steps later.
+const TextBindingRules& family_rules(const TextConfig& config) {
+    const auto* rules = ::ninfer::models::text_binding_rules(config.architecture);
+    if (rules == nullptr) {
+        throw artifact::ArtifactError(
+            std::string("no text binding rules for architecture ") +
+            std::string(::ninfer::models::architecture_name(config.architecture)));
+    }
+    return *rules;
 }
 
 } // namespace
-
-// The low-rank correction around one grouped norm. `inject` writes the streams back, which the
-// final correction does without: it feeds the head instead.
-HcWeights bind_hc(Bindings& b, const TextConfig& config, const std::string& p, bool inject) {
-    const auto& hc   = config.hc.value();
-    const auto width = hc.stream_width(config.hidden_size);
-    HcWeights out;
-    out.down = b.parameter(p + "down", {hc.lowrank, width}, {p + "normalized_streams"});
-    out.up   = b.parameter(p + "up", {width, hc.lowrank}, {p + "lowrank_activation"});
-    if (inject) {
-        out.inject = b.parameter(p + "inject", {hc.count, width}, {p + "normalized_streams"});
-    }
-    return out;
-}
 
 AttentionWeights bind_attention(Bindings& b, const TextConfig& config, const std::string& p,
                                 bool indexed) {
@@ -57,7 +33,7 @@ AttentionWeights bind_attention(Bindings& b, const TextConfig& config, const std
     AttentionWeights out;
     out.query = b.parameter(p + "attention/query", {q, h}, {p + "mixer_input"});
     out.key   = b.parameter(p + "attention/key", {k, h}, {p + "mixer_input"});
-    // Qwen4Exp keeps the output gate beside the query inside one fused parent and names it apart.
+    // The output gate sits beside the query inside one fused parent under the family's own name.
     out.gate       = indexed ? b.aliased(p + "attention/gate", p + "attention/output_gate", {q, h},
                                          {p + "mixer_input"})
                              : b.parameter(p + "attention/gate", {q, h}, {p + "mixer_input"});
@@ -118,9 +94,10 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& config, const std::string& pr
     const auto h      = config.hidden_size;
     const auto ir     = moe.moe_intermediate_size;
     const auto shared = moe.shared_expert_intermediate_size;
-    // Qwen4Exp packs every expert of a bank into one binding, so a per-expert parameter is a row
-    // block of that bank; the plan keeps the per-expert shape the execution path runs with.
-    const bool banked = config.architecture == Architecture::Qwen4Exp;
+    // A family that packs every expert of a bank into one binding states that in its registry
+    // identity, so a per-expert parameter is a row block of that bank; the plan keeps the
+    // per-expert shape the execution path runs with.
+    const bool banked = ::ninfer::models::identity(config.architecture).banked_experts;
     MoeWeights out;
     out.router       = b.parameter(p + "router", {moe.num_experts, h}, {input});
     out.shared_score = b.parameter(p + "shared_score", {1, h}, {input});
@@ -158,31 +135,36 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& config, const std::string& pr
 BlockWeights bind_block(Bindings& b, const TextConfig& config, const std::string& p,
                         MixerKind mixer) {
     BlockWeights out;
-    if (config.architecture == Architecture::Qwen4Exp) {
-        // Qwen4Exp names the activation the mixer and the MoE each read: `attention_input` for the
-        // mixer and `moe_input` for the FFN. The logical names stay the engine's; both spellings
+    if (::ninfer::models::identity(config.architecture).aliased_activations) {
+        // Such a family names the activation the mixer and the MoE each read: `attention_input`
+        // for the mixer and `moe_input` for the FFN. The logical names stay the engine's; both spellings
         // resolve, and a Use that matches both or neither is refused under the logical parameter.
         b.alias_input(p + "mixer_input", p + "attention_input");
         b.alias_input(p + "ffn_input", p + "moe_input");
     }
-    // Qwen4Exp folds the grouped stream norm into the HC binding that consumes it.
+    // A streamed residual folds its grouped norm into the correction that consumes it, so the two
+    // norms and their corrections are the family's to name.
     if (config.hc) {
-        out.input_norm =
-            b.aliased_direct(p + "input_norm", p + "attention_hc/norm", {norm_width(config)});
-        out.post_attention_norm =
-            b.aliased_direct(p + "post_attention_norm", p + "moe_hc/norm", {norm_width(config)});
+        const auto& rules = family_rules(config);
+        if (rules.block_norms == nullptr || rules.block_corrections == nullptr) {
+            throw artifact::ArtifactError(
+                "the family's rules do not bind a streamed residual's norms");
+        }
+        rules.block_norms(b, config, p, out);
+        if (attention_mixer(mixer)) {
+            out.mixer = bind_attention(b, config, p, mixer == MixerKind::IndexedAttention);
+        } else {
+            out.mixer = bind_gdn(b, config, p);
+        }
+        rules.block_corrections(b, config, p, out);
     } else {
         out.input_norm          = b.direct(p + "input_norm", {config.hidden_size});
         out.post_attention_norm = b.direct(p + "post_attention_norm", {config.hidden_size});
-    }
-    if (attention_mixer(mixer)) {
-        out.mixer = bind_attention(b, config, p, mixer == MixerKind::IndexedAttention);
-    } else {
-        out.mixer = bind_gdn(b, config, p);
-    }
-    if (config.hc) {
-        out.input_hc          = bind_hc(b, config, p + "attention_hc/", true);
-        out.post_attention_hc = bind_hc(b, config, p + "moe_hc/", true);
+        if (attention_mixer(mixer)) {
+            out.mixer = bind_attention(b, config, p, mixer == MixerKind::IndexedAttention);
+        } else {
+            out.mixer = bind_gdn(b, config, p);
+        }
     }
     if (const auto* dense = std::get_if<DenseConfig>(&config.ffn)) {
         out.ffn = bind_dense(b, config.hidden_size, dense->intermediate_size, p);
@@ -202,18 +184,29 @@ TextWeights bind_text(Bindings& b, const TextConfig& config, const LoadOptions& 
     }
     out.output_head = b.parameter("text/output_head", {config.vocab_size, config.hidden_size},
                                   std::move(head_inputs));
-    out.final_norm =
-        config.hc ? b.aliased_direct("text/final_norm", "text/final_hc/norm", {norm_width(config)})
-                  : b.direct("text/final_norm", {config.hidden_size});
-    if (config.hc) { out.final_hc = bind_hc(b, config, "text/final_hc/", false); }
+    if (config.hc) {
+        const auto& rules = family_rules(config);
+        if (rules.final_correction == nullptr) {
+            throw artifact::ArtifactError(
+                "the family's rules do not bind a streamed residual's final correction");
+        }
+        rules.final_correction(b, config, out);
+    } else {
+        out.final_norm = b.direct("text/final_norm", {config.hidden_size});
+    }
     out.layers.reserve(config.num_hidden_layers);
     for (std::uint32_t i = 0; i < config.num_hidden_layers; ++i) {
         const auto p = "text/layers/" + std::to_string(i) + "/";
         out.layers.push_back(bind_block(b, config, p, config.layer_types[i]));
-        // Qwen4Exp embeds n-grams on named blocks only.
+        // A block the config names carries the n-gram embedding, in the family's own spelling.
         if (config.ple && std::find(config.ple->layer_ids.begin(), config.ple->layer_ids.end(),
                                     i) != config.ple->layer_ids.end()) {
-            out.layers.back().ple = bind_ple(b, config, p + "ple/");
+            const auto& rules = family_rules(config);
+            if (rules.block_ple == nullptr) {
+                throw artifact::ArtifactError(
+                    "the family's rules do not bind the n-gram embedding");
+            }
+            rules.block_ple(b, config, p, out.layers.back());
         }
     }
     return out;
@@ -244,58 +237,6 @@ ProposalWeights bind_proposal(Bindings& b, const artifact::Proposal& proposal,
         }
     }
     return out;
-}
-
-std::shared_ptr<const qwen4_exp::PleTableSource>
-open_ple_table(const artifact::Reader& reader, artifact::Binder& binder,
-               std::span<const PendingWeight> pending, const TextWeights& weights,
-               const TextConfig& config) {
-    if (!config.ple) throw artifact::ArtifactError("PLE table requested for a model without PLE");
-    const auto& ple = *config.ple;
-    if (ple.layer_ids.empty()) {
-        throw artifact::ArtifactError("PLE declares no layer ids");
-    }
-    // Every PLE block gathers from the same n-gram bank, so its bound object ranges must be the
-    // same object set; two different tables would otherwise be read as one table's row space.
-    std::vector<artifact::ObjectHandle> shards;
-    const auto collect = [&](const PleWeights& w) {
-        if (std::size_t(w.table.index) >= pending.size())
-            throw artifact::ArtifactError("PLE table binding is not in the load plan");
-        const auto& reference = pending[std::size_t(w.table.index)].reference;
-        if (reference.binding.parts.empty())
-            throw artifact::ArtifactError(reference.name + ": PLE table has no object parts");
-        for (const auto& part : reference.binding.parts) {
-            if (std::find(shards.begin(), shards.end(), part.object) == shards.end())
-                shards.push_back(part.object);
-        }
-    };
-    collect(weights.layers.at(ple.layer_ids.front()).ple.value());
-    const auto first = shards;
-    for (const auto layer : ple.layer_ids) {
-        shards.clear();
-        collect(weights.layers.at(layer).ple.value());
-        if (shards != first) {
-            throw artifact::ArtifactError(
-                "PLE layer " + std::to_string(layer) +
-                " reads a different table object set than layer " +
-                std::to_string(ple.layer_ids.front()) +
-                "; one n-gram stage cannot gather from two banks");
-        }
-    }
-    shards = first;
-    // The controls are a resource of the text component; the hash cannot be evaluated without
-    // them, so a PLE artifact that omits them fails here, naming the resource.
-    const auto controls = binder.resource("text", "ple_hash_controls");
-    return std::make_shared<qwen4_exp::PleTableSource>(reader, shards, controls);
-}
-
-std::int32_t ple_eos_token(const artifact::Directory& directory) {
-    const auto& config = directory.component("text").config;
-    const auto found   = config.find("eos_token_id");
-    if (found == config.end() || !found->is_number_integer()) return -1;
-    const auto id = found->get<std::int64_t>();
-    if (id < 0 || id > std::numeric_limits<std::int32_t>::max()) return -1;
-    return static_cast<std::int32_t>(id);
 }
 
 } // namespace ninfer::models::qwen3_5::loading

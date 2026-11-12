@@ -65,6 +65,20 @@ const artifact::Component& companion(const artifact::Directory& directory, std::
     return component;
 }
 
+// The artifact names the activation its linear attention gates with (HF: `output_gate_type`, falling
+// back to `hidden_act`). A family states the one its artifacts declare; an artifact that names
+// another one belongs to a different mathematics.
+GdnGateKind gdn_gate(const std::string& declared, std::string_view family) {
+    const std::string_view name = declared.empty() ? family : declared;
+    if (!declared.empty() && !family.empty() && declared != family) {
+        throw ArtifactError("output_gate_type '" + declared + "' is not the '" + std::string(family) +
+                            "' gate this architecture declares");
+    }
+    if (name.empty() || name == "silu") { return GdnGateKind::Silu; }
+    if (name == "sigmoid") { return GdnGateKind::Sigmoid; }
+    throw ArtifactError("unsupported output_gate_type '" + std::string(name) + "'");
+}
+
 AttentionConfig attention(const Json& value) {
     AttentionConfig out{dimension(value, "num_attention_heads"),
                         dimension(value, "num_key_value_heads"), dimension(value, "head_dim")};
@@ -249,7 +263,8 @@ TextConfig text(const Json& value, bool mtp) {
     }
     out.attention_bias   = flag(value, "attention_bias", false);
     out.norm_topk_prob   = flag(value, "norm_topk_prob", false);
-    out.output_gate_type = name(value, "output_gate_type");
+    out.gdn_gate         = gdn_gate(name(value, "output_gate_type"),
+                                    ::ninfer::models::identity(out.architecture).output_gate);
     out.mamba_ssm_dtype  = name(value, "mamba_ssm_dtype");
     if (value.contains("hc_count") || value.contains("hc_lowrank")) {
         HcConfig hc{dimension(value, "hc_count"), dimension(value, "hc_lowrank")};
@@ -302,7 +317,7 @@ TextConfig text(const Json& value, bool mtp) {
             dimension(value, "vision_start_token_id"), dimension(value, "vision_end_token_id")};
         out.multimodal_token_ids = ids;
     }
-    if (moe_text(out.architecture)) {
+    if (::ninfer::models::identity(out.architecture).moe) {
         if (value.contains("intermediate_size")) {
             throw ArtifactError("MoE config carries Dense FFN width");
         }
@@ -475,6 +490,8 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
         Config out;
         out.mtp  = options.speculative == SpeculativeBackend::Mtp;
         out.text = text(directory.component("text").config, out.mtp);
+        const auto family = ::ninfer::models::identity(out.text.architecture);
+        if (family.complete != nullptr) { family.complete(out.text); }
         if (options.vision) { out.vision = vision(companion(directory, "vision").config); }
         if (out.mtp) {
             const auto& config = companion(directory, "mtp").config;
@@ -486,12 +503,9 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
                              "rope_theta", "mtp_use_hidden_state_from_layer",
                              "mtp_use_dedicated_embeddings"},
                             "MTP config");
-            // The draft head must be the same mathematics as the target: one Qwen3.5 block, one
-            // sparse-MoE block, or Qwen4Exp's four-stream HC/QSA block.
-            const std::string expected =
-                out.text.architecture == Architecture::Qwen3_5Moe ? "Qwen3_5MoeMTP"
-                : out.text.architecture == Architecture::Qwen4Exp ? "Qwen4ExpMTP"
-                                                                  : "Qwen3_5MTP";
+            // The draft head must be the same mathematics as the target: the family states the
+            // architecture name its MTP companion declares.
+            const std::string expected{family.mtp_architecture};
             if (architecture(config) != expected) {
                 throw ArtifactError("MTP architecture differs from target mathematics: expected " +
                                     expected);
@@ -506,6 +520,13 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
     } catch (const std::exception& error) {
         throw ArtifactError(std::string("Qwen3.5 config: ") + error.what());
     }
+}
+
+Identity identity(Architecture architecture) noexcept {
+    const bool moe = architecture == Architecture::Qwen3_5Moe;
+    return Identity{.mtp_architecture = moe ? "Qwen3_5MoeMTP" : "Qwen3_5MTP",
+                    .moe             = moe,
+                    .output_gate     = "silu"};
 }
 
 } // namespace ninfer::models::qwen3_5

@@ -1,4 +1,8 @@
 #include "models/registry.h"
+#include "models/load_rules.h"
+#include "models/qwen3_5/config.h"
+#include "models/qwen4_exp/config.h"
+#include "models/qwen4_exp/load/text.h"
 
 #include <stdexcept>
 #include <string>
@@ -32,6 +36,28 @@ std::string_view architecture_name(Architecture architecture) noexcept {
         return "Qwen4ExpForCausalLM";
     }
     return {};
+}
+
+Identity identity(Architecture architecture) noexcept {
+    switch (architecture) {
+    case Architecture::Qwen3_5:
+    case Architecture::Qwen3_5Moe:
+        return qwen3_5::identity(architecture);
+    case Architecture::Qwen4Exp:
+        return qwen4_exp::identity();
+    }
+    return {};
+}
+
+const TextBindingRules* text_binding_rules(Architecture architecture) noexcept {
+    switch (architecture) {
+    case Architecture::Qwen3_5:
+    case Architecture::Qwen3_5Moe:
+        return nullptr;
+    case Architecture::Qwen4Exp:
+        return &qwen4_exp::loading::binding_rules();
+    }
+    return nullptr;
 }
 
 } // namespace ninfer::models

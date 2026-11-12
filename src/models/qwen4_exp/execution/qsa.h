@@ -8,12 +8,12 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::models::qwen3_5::execution {
+namespace ninfer::models::qwen4_exp::execution {
 
-// Qwen4Exp QSA layer geometry, in the units the ops take: 24 query heads over 2 KV heads of 256,
-// four index heads of 128, and one compressed index key per four tokens. The index cache is addressed
-// in the main cache's page space - sixteen four-token blocks to one 64-token page - so a QSA layer
-// needs no table of its own.
+// This family's QSA layer geometry, in the units the ops take: 24 query heads over 2 KV heads of
+// 256, four index heads of 128, and one compressed index key per four tokens. The index cache is
+// addressed in the main cache's page space - sixteen four-token blocks to one 64-token page - so a
+// QSA layer needs no table of its own.
 struct QsaGeometry {
     std::int32_t head_dim       = 0;  // 256, main cache feature extent
     std::int32_t kv_heads       = 0;  // 2
@@ -26,7 +26,7 @@ struct QsaGeometry {
 
 // The artifact's declared geometry, or a zero `layers` when this model line has no indexed mixer.
 // Every number comes from the config, so a plan can never outlive the geometry it was sized for.
-[[nodiscard]] QsaGeometry qsa_geometry(const TextConfig& config);
+[[nodiscard]] QsaGeometry qsa_geometry(const qwen3_5::TextConfig& config);
 
 // Everything the transient side depends on, taken from the controller's resolved dial values rather
 // than compiled-in caps: `min_tokens`/`max_tokens` are the prefill chunk interval the plan resolved
@@ -65,9 +65,9 @@ struct QsaPlanInputs {
 // are the layer's column interval (a prefill chunk, or a decode width) and `batch` its concurrency;
 // `visible_tokens` is the host-side upper bound on any live p+1, which both Ops use as their
 // envelope and which therefore has to be the same number at plan time and at execution time.
-[[nodiscard]] QsaPlanInputs qsa_plan_inputs(const TextConfig& config, std::int32_t first,
+[[nodiscard]] QsaPlanInputs qsa_plan_inputs(const qwen3_5::TextConfig& config, std::int32_t first,
                                             std::int32_t last, std::int32_t batch,
                                             KvCacheStorage storage, std::uint32_t visible_tokens,
                                             DeviceExecutionView execution);
 
-} // namespace ninfer::models::qwen3_5::execution
+} // namespace ninfer::models::qwen4_exp::execution

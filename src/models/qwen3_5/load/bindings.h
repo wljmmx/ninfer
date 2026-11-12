@@ -98,10 +98,7 @@ private:
 
 [[nodiscard]] AttentionWeights bind_attention(Bindings& bindings, const TextConfig& config,
                                               const std::string& prefix, bool indexed);
-// Qwen4Exp's low-rank correction around one grouped stream norm. `inject` is false for the head's
-// final correction, which has no injection stream.
-[[nodiscard]] HcWeights bind_hc(Bindings& bindings, const TextConfig& config,
-                                const std::string& prefix, bool inject);[[nodiscard]] DenseWeights bind_dense(Bindings& bindings, std::uint64_t hidden,
+[[nodiscard]] DenseWeights bind_dense(Bindings& bindings, std::uint64_t hidden,
                                       std::uint64_t intermediate, const std::string& prefix,
                                       bool draft = false);
 [[nodiscard]] BlockWeights bind_block(Bindings& bindings, const TextConfig& config,
@@ -123,23 +120,5 @@ void bind_dflash2(Bindings& bindings, DraftWeights& weights, const DraftConfig& 
 [[nodiscard]] std::vector<BoundWeight>
 resolve_weights(std::vector<PendingWeight>&& pending,
                 const artifact::MaterializedArtifact& materialized);
-
-// The PLE n-gram table's disk source, built while the artifact is still open. It owns its own
-// read handles (artifact::prepare_file_backing), so it outlives the Reader that described it; the
-// load plan keeps it until the Parameters it belongs to are built.
-//
-// One table serves every PLE block - the stage gathers each block's embedding from the same
-// n-gram bank - so a model whose `ple_layer_ids` name blocks over different objects is refused
-// instead of silently running two of them against one bank. `pending` supplies the bound object
-// ranges, and the 280-byte hash controls are the artifact's `text/ple_hash_controls` resource.
-[[nodiscard]] std::shared_ptr<const qwen4_exp::PleTableSource>
-open_ple_table(const artifact::Reader& reader, artifact::Binder& binder,
-               std::span<const PendingWeight> pending, const TextWeights& weights,
-               const TextConfig& config);
-
-// The n-gram hash substitutes this id for tokens before a sequence's start, so it is the token the
-// artifact declares as end-of-sequence. -1 when the artifact does not declare one, which the text
-// context refuses by name rather than hashing with a made-up id.
-[[nodiscard]] std::int32_t ple_eos_token(const artifact::Directory& directory);
 
 } // namespace ninfer::models::qwen3_5::loading

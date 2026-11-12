@@ -3,7 +3,7 @@
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/gdn.h"
 #include "models/qwen3_5/execution/mtp.h"
-#include "models/qwen3_5/execution/qsa.h"
+#include "models/qwen4_exp/execution/qsa.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/planning/startup.h"
@@ -189,12 +189,13 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     {
         // QSA: the index plane and the raw-index-key tail live in the text cache's page space, so
         // they are planned beside it and in the same slot space the Linear Attention states use.
-        const execution::QsaGeometry geometry = execution::qsa_geometry(config);
+        const qwen4_exp::execution::QsaGeometry geometry =
+            qwen4_exp::execution::qsa_geometry(config);
         if (geometry.layers != 0) {
             decoder_spec.qsa = qwen3_5::QsaCacheSpec{
                 .indexed_layers        = static_cast<std::uint32_t>(geometry.layers),
                 .index_head_dim        = geometry.index_head_dim,
-                .index_blocks_per_page = execution::qsa_index_blocks_per_page(geometry),
+                .index_blocks_per_page = qwen4_exp::execution::qsa_index_blocks_per_page(geometry),
                 .tail_columns          = geometry.tail_columns,
                 .state_slots           = state_image_slots,
             };
@@ -431,11 +432,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         const std::int32_t qsa_batch =
             phase == qwen3_5::TextPhase::Prefill ? static_cast<std::int32_t>(plan.max_concurrency)
                                                  : batch_size;
-        const execution::QsaPlanInputs qsa_inputs =
+        const qwen4_exp::execution::QsaPlanInputs qsa_inputs =
             qsa_enabled
-                ? execution::qsa_plan_inputs(config, first, last, qsa_batch, plan.kv_storage,
+                ? qwen4_exp::execution::qsa_plan_inputs(config, first, last, qsa_batch, plan.kv_storage,
                                              qsa_visible, device_execution)
-                : execution::QsaPlanInputs{};
+                : qwen4_exp::execution::QsaPlanInputs{};
         if (qsa_enabled) { (void)workspace::qsa_pass_bindings(layout); }
         for (const auto& block : parameters.text.layers) {
             // The four-stream correction runs before and after every mixer and before every FFN, and
@@ -478,8 +479,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                         linear_scratch(layout, attention->indexer->query, first, last);
                         linear_scratch(layout, attention->indexer->key, first, last);
                         (void)workspace::qsa_roots(layout, config, last);
-                        scratch(layout, execution::qsa_indexer_workspace_bytes(qsa_inputs));
-                        scratch(layout, execution::qsa_sparse_gqa_workspace_bytes(qsa_inputs));
+                        scratch(layout, qwen4_exp::execution::qsa_indexer_workspace_bytes(qsa_inputs));
+                        scratch(layout, qwen4_exp::execution::qsa_sparse_gqa_workspace_bytes(qsa_inputs));
                     }
                     add_scratch(layout, attention->output, first, last);
                 } else {

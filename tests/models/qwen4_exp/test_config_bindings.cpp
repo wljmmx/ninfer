@@ -479,7 +479,8 @@ void check_config_and_bindings() {
     check(text.rope_parameters && text.rope_parameters->mrope_interleaved &&
               !text.rope_parameters->yarn && text.rope_parameters->rotary_dim == 64,
           "rope_type default keeps the trained frequencies");
-    check(!text.attention_bias && text.norm_topk_prob && text.output_gate_type == "sigmoid" &&
+    check(!text.attention_bias && text.norm_topk_prob &&
+              text.gdn_gate == qwen::GdnGateKind::Sigmoid &&
               text.mamba_ssm_dtype == "float32",
           "the flags the artifact spells out are stored");
     check(text.multimodal_token_ids && text.multimodal_token_ids->image == 248056 &&

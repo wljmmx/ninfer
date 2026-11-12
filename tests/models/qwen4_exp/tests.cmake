@@ -1,3 +1,11 @@
+# port (sm_89): the QSA block-selection plan. The index plane, the tail state pool and the two
+# stateful ops' scratch are sized from one place, and the transient side is delegated to the ops'
+# own capacity queries so a controller dial that widens the interval can never leave the plan
+# behind execution. It lives with the family because only this family has indexed layers.
+ninfer_add_test(ninfer_qsa_plan_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qsa_plan.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_ops)
+
 ninfer_add_test(ninfer_qwen4_exp_config_bindings_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_config_bindings.cpp"
   LIBRARIES ninfer_model_runtime)

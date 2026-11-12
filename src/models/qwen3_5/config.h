@@ -19,6 +19,10 @@ namespace ninfer::models::qwen3_5 {
 
 enum class MixerKind { FullAttention, LinearAttention, IndexedAttention };
 enum class DraftAttentionKind { FullAttention, SlidingAttention };
+// The activation a linear attention's output gate applies. Qwen3.5 artifacts state none and run the
+// rectified gate this engine has always used; a family whose artifacts name `sigmoid` states that in
+// its registry identity, and the artifact's own name is checked against it.
+enum class GdnGateKind { Silu, Sigmoid };
 
 // An indexed layer is a full-attention mixer whose softmax runs over the indexer's selected KV
 // blocks instead of the whole history.
@@ -161,10 +165,11 @@ struct TextConfig {
     std::optional<RopeConfig> rope_parameters;
     std::optional<GdnConfig> gdn;
     std::variant<DenseConfig, MoeConfig> ffn;
-    // Qwen4Exp-only structure. Absent keeps the qwen3_5 layout these fields were appended to.
+    // Structure a family's artifacts may declare. Absent keeps the qwen3_5 layout these fields were
+    // appended to.
     bool attention_bias = false;
     bool norm_topk_prob = false;
-    std::string output_gate_type;
+    GdnGateKind gdn_gate = GdnGateKind::Silu;
     std::string mamba_ssm_dtype;
     std::optional<HcConfig> hc;
     std::optional<IndexerConfig> indexer;
@@ -230,5 +235,9 @@ struct Config {
 };
 
 [[nodiscard]] Config parse_config(const artifact::Directory& directory, const LoadOptions& options);
+
+// The Qwen3.5 rows of the registry's identity table. Both architectures share the dense/GDN/MoE
+// text mathematics and name their binding and activation vocabulary with one spelling.
+[[nodiscard]] Identity identity(Architecture architecture) noexcept;
 
 } // namespace ninfer::models::qwen3_5
