@@ -35,8 +35,8 @@ What the GGUF supplies, and what it does not:
 
 Scope and mapping notes:
 
-* The text component only. Vision ships as a separate mmproj GGUF and MTP has its own MTP-only
-  conversion; `--components` other than `text` is refused for a `.gguf` input.
+* The text component, plus the draft head when `--mtp-gguf` names it (below). Vision ships as a
+  separate mmproj GGUF; `--components` other than `text`/`mtp` is refused for a `.gguf` input.
 * GGUF uses llama.cpp's `blk.N.*` names; the inverse of llama.cpp's QWEN4EXP tensor map is
   applied in `tools/convert/gguf_qwen4exp.py`. Tensors llama.cpp fuses for one matmul (expert
   gate|up, the indexer q|k projection, the linear-attention qkv|z pair, beta|alpha, the
@@ -66,6 +66,75 @@ Verification: `tests/convert/test_gguf_qwen4exp.py` checks the container and eve
 against gguf-py's own writer/dequantizers on random blocks, asserts the Qwen4Exp name/shape
 mapping, and runs the real converter on a synthetic Qwen4Exp GGUF, comparing the artifact's PLE
 controls byte for byte and a bf16 tensor word for word.
+
+## Convert a Qwen4Exp draft head (`--mtp-gguf`)
+
+llama.cpp writes the next-token-prediction head of a Qwen4Exp checkpoint as one extra block: the
+GGUF's `block_count` counts the draft block, and `blk.<block_count-1>` holds `nextn.*` plus a copy
+of `token_embd` and `output`. Such a file is **not** a text checkpoint. Passing it as `--model` is
+refused by name; it is converted as the `mtp` component of the text artifact:
+
+```bash
+python -m tools.convert \
+  --model /path/to/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+  --mtp-gguf /path/to/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf \
+  --recipe qwen4_exp \
+  --components text,mtp \
+  --gguf-config /path/to/config.json --gguf-root /path/to/hf \
+  --device cpu \
+  --name Qwen3.8-Flash-Next \
+  --out models/qwen3_8_flash_next.ninfer
+```
+
+`--components text,mtp` with a source present is the only accepted form; naming `--mtp-gguf` is
+what produces the component, and the text side is converted exactly as it would be without it.
+`GGUFSource.for_mtp` presents the draft block as the HF `mtp.*` names the builder reads and derives
+its geometry from the target's `text_config` (the MTP GGUF's own `block_count` is never read as a
+text layer count).
+
+Mapping notes specific to the draft head:
+
+* **`eh_proj` is split at the artifact, fused at the source.** llama.cpp stores the HF pair
+  `fc_embedding`/`fc_hidden` as one `nextn.eh_proj.weight [h,2h]`; the converter splits it by
+  column into `mtp/fc_embedding` (`[0,h)`) and `mtp/fc_hidden` (`[h,2h)`), which is the HF
+  checkpoint's own form and the only one with a registered kernel geometry at `h = 2560` (the
+  linear shape registry has `[2560,2560]` but no `[2560,5120]`). Both are stored bf16, as the
+  source keeps them; the block's other projections follow the text recipe.
+* **The gate is `attention/output_gate`.** Q and the output gate are llama.cpp's interleaved
+  `blk.N.attn_q` parent; the builder splits them by head-interleaved rows into
+  `attention/query` + `attention/output_gate`, and the loader binds the latter under the engine's
+  `attention/gate` name for an indexed layer.
+* **The shared-expert router is a vector** (`ffn_gate_inp_shexp`, `[h]`); it is reshaped to the
+  `[1,h]` matrix `moe/shared_score` the routing Op reads.
+* **`token_embd` and `output` are dropped.** The engine reuses the text component's embedding and
+  LM head for the draft head (`src/models/qwen3_5/load/mtp.cpp`), so the component stores neither;
+  keeping them would duplicate about 1.3 GB of identical BF16 words at this vocabulary.
+* **Widths follow the target.** `hidden_norm` is `[h*hc_count]` (10240 here): it normalizes the
+  target's four-stream residual along the whole width. The head's final correction
+  (`nextn.hc_head_{norm,down,up}`) becomes `mtp/final_hc/*`, and `mtp/final_norm` aliases its
+  norm.
+* **Capability downgrade — the draft layer runs dense attention.** The source draft layer is an
+  indexed (QSA) block (`compress_ratios[block] = 4`). The converter and loader carry its indexer
+  matrices and the output-gate alias, but the runtime executes the draft mixer as **dense full
+  attention**: QSA block selection (*MTD*) is not wired on this layer. The draft side therefore
+  costs a full-history attention read at every draft step; it is exact, not an approximation of the
+  sparse path, and it is the one declared behavioural difference from the source.
+
+Two shapes of the same component exist, and the artifact states which one it is:
+
+| Form | Target | Draft stem | Draft block | Head |
+|---|---|---|---|---|
+| Qwen3.5 single stream | one residual stream of width `h` | `e = RMSNorm(embed)`, `h = RMSNorm(hidden)`, `x = fc_hidden(h) + fc_embedding(e)` | ordinary block, `mtp/final_norm` is `[h]` | plain final RMSNorm |
+| Qwen4Exp four streams (HC) | four residual streams of width `4h`; the draft head conditions on the **pre-final-mixer residual** | `v = offsetRMSNorm_10240(hidden)`, `h_init[s] = fc_hidden(v[s]) + fc_embedding(e)` | HC block: `hc_mix` → attention → `hc_combine_norm` → `hc_mix` → MoE → `hc_combine_norm` | `hc_head_norm` then the final HC mixer (`down`/`up`), no extra RMSNorm |
+
+The HC recipe keeps the mixers at Q5 (`q5_g64_fp16`), because the separate-form HC mix Op admits
+only Q5 row-split planes; every other draft projection follows the text rules. An unassigned draft
+projection would be stored at a width the runtime refuses by name, so `official_recipes.py`
+treats `mtp/` exactly like `text/` (except the two bf16 stem matrices, which stay bf16).
+
+Running it: `--spec mtp --draft-tokens N` loads the component; without `--spec mtp` the component
+is simply not materialized. `load/mtp.cpp` requires the component's `architectures` to match the
+target's mathematics (`Qwen3_5MTP`, `Qwen3_5MoeMTP` or `Qwen4ExpMTP`).
 
 ## Upgrade an existing v2 artifact
 
