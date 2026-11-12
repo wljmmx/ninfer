@@ -135,6 +135,10 @@ TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
 PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     const auto& parameters = *plan.parameters;
     const auto& config     = parameters.model.config().text;
+    // The continuation frame: hidden*count when the residual is four streams, hidden otherwise.
+    const auto frame_width =
+        config.hc ? dimension(config.hc->stream_width(config.hidden_size))
+                  : dimension(config.hidden_size);
 
     if (!plan.context_cache.device_state_slots) {
         throw std::logic_error("Qwen3.5 context cache options are not normalized");
@@ -209,7 +213,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 .slot_count     = state_image_slots,
                 .conv_dtype     = DType::BF16,
             },
-        .hidden = dimension(config.hidden_size),
+        .hidden = frame_width,
     };
     {
         const auto* draft =
@@ -295,7 +299,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     }
 
     out.round = qwen3_5::begin_round_state_layout(
-        builder, qwen3_5::RoundStateSpec{.hidden         = dimension(config.hidden_size),
+        builder, qwen3_5::RoundStateSpec{.hidden         = frame_width,
+                                         .sample_hidden  = dimension(config.hidden_size),
                                          .output_rows    = dimension(config.vocab_size),
                                          .batch_capacity = plan.max_concurrency,
                                          .draft_window   = plan.draft_window,
@@ -305,7 +310,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                              draft_needs_ordinary_fallback(parameters,
                                                                            plan.capacity)});
     out.prefill_hidden =
-        add_tensor(builder, DType::BF16, {dimension(config.hidden_size), effective_prefill_chunk},
+        add_tensor(builder, DType::BF16, {frame_width, effective_prefill_chunk},
                    "step prefill hidden");
     if (plan.causal_scoring) {
         out.score_hidden =
@@ -351,6 +356,15 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto chunk  = static_cast<std::int32_t>(chunk_u32);
     const auto drafts = static_cast<std::int32_t>(plan.draft_window);
     const auto verify = drafts + 1;
+    // The continuation frame every MTP entry point carries. A four-stream model conditions its draft
+    // head on the pre-final-mixer residual (hidden*count wide); the head's 2560-wide sample cannot
+    // reproduce it, so the frame, the state image's per-slot copy and the round buffers all widen
+    // together. On the single-stream form the number is the hidden width and nothing moves.
+    const auto mtp_frame =
+        config.hc ? dimension(config.hc->stream_width(config.hidden_size))
+                  : dimension(config.hidden_size);
+    const bool mtp_hc = config.hc.has_value() && parameters.mtp.has_value() &&
+                        parameters.mtp->final_hc.has_value();
     const ops::CausalAttentionExecutionEnvelope text_envelope{1, plan.capacity};
 
     const auto matrix  = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,
@@ -518,8 +532,44 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     };
     const auto mtp_stem = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
                               bool preembedded) {
+        const auto stem_scratch = [&](int first, int last) {
+            if (parameters.mtp->fc_embedding) {
+                linear_scratch(layout, *parameters.mtp->fc_embedding, first, last);
+                linear_scratch(layout, *parameters.mtp->fc_hidden, first, last);
+            } else {
+                linear_scratch(layout, parameters.mtp->input_projection, first, last);
+            }
+        };
+        if (mtp_hc) {
+            // The four-stream stem's buffers are the block's own roots (see mtp_hc_roots): the
+            // per-stream projection runs at `tokens` columns once per stream.
+            (void)workspace::mtp_hc_roots(layout, config, tokens);
+            stem_scratch(tokens, tokens);
+            return;
+        }
         (void)workspace::mtp_stem(layout, config, tokens, !preembedded);
-        linear_scratch(layout, parameters.mtp->input_projection, 1, tokens);
+        stem_scratch(1, tokens);
+    };
+    const auto mtp_hc_mix_scratch = [&](WorkspaceLayoutBuilder& layout, int first, int last) {
+        if (!mtp_hc) { return; }
+        {
+            auto stage = layout.scope();
+            scratch(layout, ops::hc_mix_workspace_capacity_bytes(
+                                parameters.mtp->input_hc->block_form(), first, last,
+                                device_execution));
+        }
+        {
+            auto stage = layout.scope();
+            scratch(layout, ops::hc_mix_workspace_capacity_bytes(
+                                parameters.mtp->post_attention_hc->block_form(), first, last,
+                                device_execution));
+        }
+        {
+            auto stage = layout.scope();
+            scratch(layout, ops::hc_mix_workspace_capacity_bytes(
+                                parameters.mtp->final_hc->final_form(), first, last,
+                                device_execution));
+        }
     };
     const auto mtp_full_core = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
                                    ops::CausalAttentionExecutionEnvelope envelope) {
@@ -534,8 +584,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                              dimension(config.attention->num_attention_heads),
                              dimension(config.attention->num_key_value_heads)},
                             plan.kv_storage, envelope, 1, tokens, tokens, device_execution));
-        (void)workspace::mtp_post_attention(layout, config, tokens);
+        if (!mtp_hc) { (void)workspace::mtp_post_attention(layout, config, tokens); }
         mtp_post_mixer(layout, tokens, tokens);
+        mtp_hc_mix_scratch(layout, 1, tokens);
     };
     const auto mtp_full_call = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
                                    ops::CausalAttentionExecutionEnvelope envelope,
@@ -551,8 +602,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto mtp_prefill_chunk = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                        std::int32_t last, bool preembedded) {
         auto call = layout.scope();
-        matrix(layout, DType::BF16, dimension(config.hidden_size), 1);
-        matrix(layout, DType::BF16, dimension(config.hidden_size), 1);
+        if (mtp_hc) {
+            (void)workspace::mtp_hc_tail_column(layout, config);
+        } else {
+            matrix(layout, DType::BF16, dimension(config.hidden_size), 1);
+            matrix(layout, DType::BF16, dimension(config.hidden_size), 1);
+        }
         {
             auto bulk = layout.scope();
             mtp_stem(layout, last, preembedded);
@@ -577,6 +632,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         matrix(layout, DType::BF16, dimension(config.hidden_size), 1);
         matrix(layout, DType::BF16, dimension(config.hidden_size), 1);
         mtp_post_mixer(layout, 1, 1);
+        mtp_hc_mix_scratch(layout, 1, 1);
         proposal_scratch(layout, 1);
     };
 
@@ -676,7 +732,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
              ++batch) {
             const std::int32_t aggregate = batch * verify;
             WorkspaceLayoutBuilder target;
-            matrix(target, DType::BF16, dimension(config.hidden_size), aggregate);
+            matrix(target, DType::BF16, mtp_frame, aggregate);
             target_body(target, aggregate, aggregate, qwen3_5::TextPhase::Verify,
                         GdnWorkspacePath::ReplayRecord, batch, verify, verify, text_envelope);
 
@@ -694,8 +750,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                              dimension(config.attention->num_attention_heads),
                              dimension(config.attention->num_key_value_heads)},
                             plan.kv_storage, text_envelope, batch, width, width, device_execution));
-                (void)workspace::mtp_post_attention(layout, config, tokens);
+                if (!mtp_hc) { (void)workspace::mtp_post_attention(layout, config, tokens); }
                 mtp_post_mixer(layout, tokens, tokens);
+                mtp_hc_mix_scratch(layout, 1, tokens);
             };
 
             WorkspaceLayoutBuilder alignment;

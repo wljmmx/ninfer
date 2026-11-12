@@ -110,8 +110,9 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
 }
 
 void ProgramImpl::copy_tail(SequenceState& sequence, const Tensor& source) {
-    if (source.dtype != DType::BF16 ||
-        source.ne[0] != dimension(parameters.model.config().text.hidden_size) ||
+    // The tail is the lane's continuation frame, whose width the state image fixes (the model's
+    // hidden size, or its four-stream residual width); the source has to be that same frame.
+    if (source.dtype != DType::BF16 || source.ne[0] != sequence.tail_hidden.ne[0] ||
         source.ne[1] != 1) {
         throw std::logic_error("target tail hidden has an invalid shape");
     }

@@ -130,6 +130,7 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
     const std::int32_t columns =
         checked_i32(static_cast<std::uint64_t>(layout.spec.draft_window) + 1ULL,
                     "RoundState columns exceed int32");
+    const std::int32_t sample = layout.spec.sample_width();
     const std::int32_t drafts = checked_i32(std::max<std::uint64_t>(1ULL, layout.spec.draft_window),
                                             "RoundState drafts exceed int32");
     const auto i32            = [&](std::int32_t count, const char* label) {
@@ -141,8 +142,10 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
             checked_i32(std::max<std::uint64_t>(1ULL, layout.spec.draft_window - 1ULL),
                         "RoundState MTP AR steps exceed int32");
         layout.mtp->position         = i32(1, "MTP prefill autoregressive position");
-        layout.mtp->ar_hidden        = add_tensor(builder, DType::BF16, {layout.spec.hidden, 1},
+        layout.mtp->ar_hidden        = add_tensor(builder, DType::BF16, {sample, 1},
                                                   "MTP prefill autoregressive hidden");
+        layout.mtp->ar_conditioning  = add_tensor(builder, DType::BF16, {layout.spec.hidden, 1},
+                                                  "MTP prefill autoregressive conditioning");
         layout.mtp->draft_tokens     = i32(drafts, "MTP prefill draft tokens");
         layout.mtp->target_input_ids = i32(columns, "MTP prefill target input ids");
         layout.mtp->target_positions = i32(columns, "MTP prefill target positions");
@@ -178,12 +181,17 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
         decode.alignment_ids =
             add_tensor(builder, DType::I32, {columns, batch}, "MTP decode alignment ids");
         decode.alignment_hidden =
-            add_tensor(builder, DType::BF16, {layout.spec.hidden, columns, batch},
+            add_tensor(builder, DType::BF16, {sample, columns, batch},
                        "MTP decode alignment hidden");
-        decode.ar_hidden = add_tensor(builder, DType::BF16, {layout.spec.hidden, batch},
+        decode.alignment_conditioning =
+            add_tensor(builder, DType::BF16, {layout.spec.hidden, columns, batch},
+                       "MTP decode alignment conditioning");
+        decode.ar_hidden = add_tensor(builder, DType::BF16, {sample, batch},
                                       "MTP decode autoregressive hidden");
+        decode.ar_conditioning = add_tensor(builder, DType::BF16, {layout.spec.hidden, batch},
+                                            "MTP decode autoregressive conditioning");
         decode.next_hidden =
-            add_tensor(builder, DType::BF16, {layout.spec.hidden, batch}, "MTP decode next hidden");
+            add_tensor(builder, DType::BF16, {sample, batch}, "MTP decode next hidden");
         decode.ar_positions      = add_tensor(builder, DType::I32, {batch, ar_steps},
                                               "MTP decode autoregressive positions");
         decode.ar_rope_positions = add_tensor(builder, DType::I32, {batch, ar_steps},
@@ -237,6 +245,7 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
 
 MtpPrefillState::MtpPrefillState(DeviceSpan backing, const MtpPrefillStateLayout& layout)
     : position(layout.position.bind(backing)), ar_hidden(layout.ar_hidden.bind(backing)),
+      ar_conditioning(layout.ar_conditioning.bind(backing)),
       draft_tokens(layout.draft_tokens.bind(backing)),
       target_input_ids(layout.target_input_ids.bind(backing)),
       target_positions(layout.target_positions.bind(backing)) {}
@@ -320,7 +329,9 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     proposal_q                 = layout.proposal_q.bind(backing);
     alignment_ids              = layout.alignment_ids.bind(backing);
     alignment_hidden           = layout.alignment_hidden.bind(backing);
+    alignment_conditioning     = layout.alignment_conditioning.bind(backing);
     ar_hidden                  = layout.ar_hidden.bind(backing);
+    ar_conditioning            = layout.ar_conditioning.bind(backing);
     next_hidden                = layout.next_hidden.bind(backing);
     ar_positions               = layout.ar_positions.bind(backing);
     ar_rope_positions          = layout.ar_rope_positions.bind(backing);

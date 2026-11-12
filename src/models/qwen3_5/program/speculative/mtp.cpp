@@ -32,6 +32,7 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
     Tensor position_view = state.execution.io.mtp->target_positions.slice(0, 0, 1);
     ops::set_i32_scalar(position_view, position, state.execution.device.stream);
     Tensor mtp_hidden         = state.execution.io.mtp->ar_hidden;
+    Tensor conditioning       = state.execution.io.mtp->ar_conditioning;
     Tensor logits             = state.execution.io.logits.slice(1, 0, 1);
     Tensor draft0             = state.execution.io.mtp->draft_tokens.slice(0, 0, 1);
     Tensor rope_position_view = state.execution.work.alloc(DType::I32, {1, 3});
@@ -42,7 +43,8 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
     const ops::CausalAttentionExecutionEnvelope bridge_envelope{bridge_visible, bridge_visible};
     card.mtp_forward_batch(next_token, previous_hidden, position_view, bridge_envelope, mtp_hidden,
                            build_proposal ? 0 : -1, build_proposal ? &logits : nullptr,
-                           build_proposal ? &draft0 : nullptr, &rope_position_view, next_embedding);
+                           build_proposal ? &draft0 : nullptr, &rope_position_view, next_embedding,
+                           &conditioning);
     if (!build_proposal) { return; }
 
     if (state.mtp_proposal_extent == 0 ||
@@ -56,14 +58,13 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
     for (int i = 1; i < static_cast<int>(state.mtp_proposal_extent); ++i) {
         Tensor previous_token = state.execution.io.mtp->draft_tokens.slice(0, i - 1, 1);
         Tensor next_draft     = state.execution.io.mtp->draft_tokens.slice(0, i, 1);
-        Tensor next_hidden    = state.execution.prefill_hidden.slice(1, i, 1);
         const auto visible    = static_cast<std::uint32_t>(position + i + 1);
         const ops::CausalAttentionExecutionEnvelope envelope{visible, visible};
-        card.mtp_forward_ar_step(previous_token, state.execution.io.mtp->ar_hidden, ar_position,
-                                 envelope, next_hidden, logits, next_draft);
-        CUDA_CHECK(cudaMemcpyAsync(state.execution.io.mtp->ar_hidden.data, next_hidden.data,
-                                   state.execution.io.mtp->ar_hidden.bytes(),
-                                   cudaMemcpyDeviceToDevice, state.execution.device.stream));
+        // The step conditions on the previous step's residual (the four-stream form's pre-final-mixer
+        // feature) and publishes the head's sample for the proposal; the two are one tensor on a
+        // single-stream model.
+        card.mtp_forward_ar_step(previous_token, conditioning, ar_position, envelope, mtp_hidden,
+                                 logits, next_draft, {}, &conditioning);
         ops::increment_i32_scalar(ar_position, state.execution.device.stream);
     }
 }
@@ -78,6 +79,13 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
 
         qwen3_5::MtpDecodeState& frame = state.frame;
         const std::int32_t width       = static_cast<std::int32_t>(k) + 1;
+        // Two widths: the conditioning frame the draft block reads (hidden*count on a four-stream
+        // model, hidden otherwise) and the head's 2560-wide sample.
+        const auto& text_config = state.execution.parameters.model.config().text;
+        const std::int32_t frame_width =
+            text_config.hc ? dimension(text_config.hc->stream_width(text_config.hidden_size))
+                           : dimension(text_config.hidden_size);
+        const std::int32_t sample_width = dimension(text_config.hidden_size);
         state.execution.work.reset();
         // Round merges the Forward and Finish phases into one captured graph so the
         // engine submits one cudaGraphLaunch per decode round instead of two (each
@@ -128,8 +136,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         Tensor candidate_ids      = frame.candidate_ids.slice(2, 0, batch_size);
         Tensor proposal_q         = frame.proposal_q.slice(2, 0, batch_size);
 
-        TargetVerifyFrameView verify{
-            .ids                     = verify_ids,
+        TargetVerifyFrameView verify{            .ids                     = verify_ids,
             .cache_positions         = target_positions,
             .rope_positions          = target_rope,
             .valid_columns           = target_valid,
@@ -163,7 +170,14 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                                    state.execution.device.stream);
             nvtx::ScopedRange target_range(nvtx::Name::DecodeMtpTarget, nvtx::Category::Mtp,
                                            static_cast<std::uint64_t>(width) * batch_size);
-            target_verify_forward(state.execution, card, verify, envelopes.target_verify);
+            // Name the frame the target verify ran with: a shape failure here is otherwise a bare
+            // Op message, and the frame width is the one property this file widens for HC models.
+            try {
+                target_verify_forward(state.execution, card, verify, envelopes.target_verify);
+            } catch (const std::exception& error) {
+                throw std::runtime_error(std::string("MTP target verify (frame ") +
+                                         std::to_string(frame_width) + "): " + error.what());
+            }
             return;
         }
         if (round) {
@@ -190,8 +204,11 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                         state.execution.device.stream);
             card.mtp_forward_decode_batch(alignment_ids, target_hidden, target_positions,
                                           target_rope, licensed_counts, mtp_rows, envelopes.batch,
-                                          alignment_hidden);
+                                          alignment_hidden, &frame.alignment_conditioning);
             ops::speculative_select_accepted_hidden(alignment_hidden, accepted, ar_hidden,
+                                                    state.execution.device.stream);
+            ops::speculative_select_accepted_hidden(frame.alignment_conditioning, accepted,
+                                                    frame.ar_conditioning,
                                                     state.execution.device.stream);
 
             Tensor proposal_logits = frame.proposal_logits.slice(1, 0, batch_size);
@@ -244,14 +261,11 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                 Tensor valid = ar_valid_columns.slice(1, static_cast<std::int32_t>(step), 1)
                                    .view({batch_size});
                 Tensor previous_batch = previous.view({1, batch_size});
-                Tensor hidden_batch   = ar_hidden.view(
-                    {dimension(state.execution.parameters.model.config().text.hidden_size), 1,
-                       batch_size});
-                Tensor next_hidden_batch = next_hidden.view(
-                    {dimension(state.execution.parameters.model.config().text.hidden_size), 1,
-                     batch_size});
+                Tensor hidden_batch   = frame.ar_conditioning.view({frame_width, 1, batch_size});
+                Tensor next_hidden_batch = next_hidden.view({sample_width, 1, batch_size});
                 card.mtp_forward_decode_batch(previous_batch, hidden_batch, position, rope, valid,
-                                              mtp_rows, envelopes.ar[step], next_hidden_batch);
+                                              mtp_rows, envelopes.ar[step], next_hidden_batch,
+                                              &frame.ar_conditioning);
                 Tensor step_ids   = step_candidate_view(static_cast<std::int32_t>(step) + 1);
                 Tensor step_probs = step_proposal_view(static_cast<std::int32_t>(step) + 1);
                 card.mtp_propose_topk_strided(next_hidden, proposal_logits, next, step_ids,

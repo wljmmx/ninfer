@@ -95,9 +95,14 @@ struct TextWeights {
 
 struct MtpWeights {
     WeightId input_projection, embedding_norm, hidden_norm, final_norm;
+    // The split stem: `fc_hidden(v) + fc_embedding(e)` instead of one fused [h,2h] projection.
+    std::optional<WeightId> fc_embedding, fc_hidden;
     BlockWeights layer;
     WeightId token_embedding, output_head;
     WeightUseId output_head_use;
+    // Qwen4Exp's MTP head is a full hyper-connection correction (norm + low-rank pair, no
+    // injection): it folds the draft block's four residual streams into the head's single stream.
+    std::optional<HcWeights> final_hc;
 };
 
 struct NormWeights {

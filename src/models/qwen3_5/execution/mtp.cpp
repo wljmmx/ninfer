@@ -11,6 +11,15 @@ namespace ninfer::models::qwen3_5::execution {
 
 std::size_t mtp_projection_workspace_bytes(const MtpProjectionParameters& parameters,
                                            std::int32_t first, std::int32_t last) {
+    if (parameters.rows && parameters.packed.weight.n == 0) {
+        // Four independent Linears: each one's own transient capacity, taken as the peak.
+        std::size_t peak = 0;
+        for (const auto& p : *parameters.rows) {
+            peak = std::max(peak, ops::linear_workspace_capacity_bytes(
+                                      p.weight.qtype, p.weight.n, p.weight.k, p.policy, first, last));
+        }
+        return peak;
+    }
     const auto& p = parameters.packed;
     const auto& w = p.weight;
     if (!parameters.rows) {
@@ -27,9 +36,15 @@ std::size_t mtp_projection_workspace_bytes(const MtpProjectionParameters& parame
 std::size_t mtp_kv_workspace_bytes(const MtpProjectionParameters& parameters,
                                    const AttentionConfig& config, std::int32_t first,
                                    std::int32_t last) {
-    if (parameters.rows) {
-        return ops::linear_pair_workspace_capacity_bytes((*parameters.rows)[1].weight,
-                                                         (*parameters.rows)[3].weight, first, last);
+    if (parameters.rows && parameters.packed.weight.n == 0) {
+        // Two independent Linears (K then V), not linear_pair: that Op's registration is Q8 with
+        // K in {5120,2048} and 1024 rows, which no Qwen4Exp draft projection matches.
+        const auto bytes = [&](std::size_t index) {
+            const auto& p = (*parameters.rows)[index];
+            const auto& w = p.weight;
+            return ops::linear_workspace_capacity_bytes(w.qtype, w.n, w.k, p.policy, first, last);
+        };
+        return std::max(bytes(1), bytes(3));
     }
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {dimension(config.query_width()), last});
@@ -59,6 +74,27 @@ std::size_t mtp_query_gate_workspace_bytes(const MtpProjectionParameters& parame
 void mtp_projection(const Tensor& hidden, const MtpProjectionParameters& parameters,
                     const AttentionConfig& config, Tensor& query, Tensor& gate, Tensor& key,
                     Tensor& value, WorkspaceArena& workspace, cudaStream_t stream) {
+    if (parameters.rows && parameters.packed.weight.n == 0) {
+        // Four independent Q/K/gate/V matrices: one Linear each, in the Op's own order.
+        const auto& q = (*parameters.rows)[0];
+        const auto& k = (*parameters.rows)[1];
+        const auto& g = (*parameters.rows)[2];
+        const auto& v = (*parameters.rows)[3];
+        {
+            auto scope = workspace.scope();
+            ops::linear(hidden, q.weight, query, q.policy, workspace, stream);
+        }
+        {
+            auto scope = workspace.scope();
+            ops::linear(hidden, k.weight, key, k.policy, workspace, stream);
+        }
+        {
+            auto scope = workspace.scope();
+            ops::linear(hidden, g.weight, gate, g.policy, workspace, stream);
+        }
+        ops::linear(hidden, v.weight, value, v.policy, workspace, stream);
+        return;
+    }
     const auto& p = parameters.packed;
     if (!parameters.rows) {
         ops::attn_input_proj(hidden, p.weight, query, gate, key, value, p.policy, workspace,
@@ -83,9 +119,14 @@ void mtp_projection(const Tensor& hidden, const MtpProjectionParameters& paramet
 void mtp_kv_projection(const Tensor& hidden, const MtpProjectionParameters& parameters,
                        const AttentionConfig& config, Tensor& key, Tensor& value,
                        WorkspaceArena& workspace, cudaStream_t stream) {
-    if (parameters.rows) {
-        ops::linear_pair(hidden, (*parameters.rows)[1].weight, (*parameters.rows)[3].weight, key,
-                         value, stream);
+    if (parameters.rows && parameters.packed.weight.n == 0) {
+        const auto& k = (*parameters.rows)[1];
+        const auto& v = (*parameters.rows)[3];
+        {
+            auto scope = workspace.scope();
+            ops::linear(hidden, k.weight, key, k.policy, workspace, stream);
+        }
+        ops::linear(hidden, v.weight, value, v.policy, workspace, stream);
         return;
     }
     auto scope   = workspace.scope();
@@ -97,7 +138,7 @@ void mtp_kv_projection(const Tensor& hidden, const MtpProjectionParameters& para
 void mtp_query_gate_projection(const Tensor& hidden, const MtpProjectionParameters& parameters,
                                const AttentionConfig& config, Tensor& query, Tensor& gate,
                                WorkspaceArena& workspace, cudaStream_t stream) {
-    if (parameters.rows) {
+    if (parameters.rows && parameters.packed.weight.n == 0) {
         const auto& q = (*parameters.rows)[0];
         const auto& g = (*parameters.rows)[2];
         {

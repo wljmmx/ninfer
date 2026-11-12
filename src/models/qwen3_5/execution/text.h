@@ -199,7 +199,7 @@ public:
                                   const Tensor& cache_positions, const Tensor& rope_positions,
                                   const Tensor& valid_columns, const Tensor& kv_table_rows,
                                   ops::CausalAttentionExecutionEnvelope envelope,
-                                  Tensor& mtp_hidden);
+                                  Tensor& mtp_hidden, Tensor* conditioning = nullptr);
     void mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens);
     // `mask` carries one constraint bitmap per proposal column. When set, the top-k candidates are
     // taken from a masked copy of the logits so a constrained request never proposes a token the
@@ -220,11 +220,12 @@ public:
                            ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden,
                            int logits_column, Tensor* logits, Tensor* draft_token,
                            const Tensor* explicit_rope_positions = nullptr,
-                           const Tensor* input_embeddings        = nullptr);
+                           const Tensor* input_embeddings        = nullptr,
+                           Tensor* conditioning                 = nullptr);
     void mtp_forward_ar_step(const Tensor& token, const Tensor& previous_hidden,
                              const Tensor& position, ops::CausalAttentionExecutionEnvelope envelope,
                              Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token,
-                             ops::SamplingMask mask = {});
+                             ops::SamplingMask mask = {}, Tensor* conditioning = nullptr);
 private:
     [[nodiscard]] bool mtp_enabled() const noexcept {
         return mtp_kv_.valid() || batch_mtp_kv_ != nullptr;
@@ -272,14 +273,36 @@ private:
                           Tensor& x, Tensor& ah);    void mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& positions,
                           const Tensor& rope_positions,
                           ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden);
+    // Qwen4Exp's four-stream draft head: the stem builds the block's initial four-stream residual
+    // from the target's pre-final-mixer residual, the tail runs the block's two corrections and the
+    // head's fold. `conditioning` receives the residual the NEXT draft step conditions on, which is
+    // the pre-final-mixer residual rather than the head's 2560-wide sample.
+    [[nodiscard]] bool mtp_hc() const noexcept {
+        return mtp_ != nullptr && mtp_->final_hc.has_value();
+    }
+    // Width of the continuation frame every pass publishes, independent of whether a draft head is
+    // loaded: the round buffers and the state image are sized from the config, and the frame is the
+    // model's pre-final-mixer residual whenever the residual has four streams.
+    [[nodiscard]] std::uint32_t mtp_frame_width() const noexcept {
+        return config_.hc ? static_cast<std::uint32_t>(
+                                config_.hc->stream_width(config_.hidden_size))
+                          : config_.hidden_size;
+    }
+    void mtp_hc_stem(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
+                     workspace::MtpHcRoots& roots);
+    void mtp_hc_tail(workspace::MtpHcRoots& roots, const Tensor& positions,
+                     const Tensor& rope_positions,
+                     ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden,
+                     Tensor* conditioning);
     void mtp_forward_core(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                           const Tensor& rope_positions,
                           ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden,
-                          const Tensor* input_embeddings);
+                          Tensor* conditioning, const Tensor* input_embeddings);
     void mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
                            const Tensor& positions, const Tensor& rope_positions,
                            ops::CausalAttentionExecutionEnvelope envelope, bool final_chunk,
-                           Tensor* final_hidden, Tensor* logits, Tensor* draft_token);
+                           Tensor* final_hidden, Tensor* conditioning, Tensor* logits,
+                           Tensor* draft_token);
     // `mask` carries one constraint bitmap per proposal position (stride apart). When it is null the
     // proposal is a plain argmax; when it is set the proposal is drawn greedily through the sampling
     // op, which excludes forbidden vocabulary rows, so a constrained request does not propose

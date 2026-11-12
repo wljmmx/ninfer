@@ -219,7 +219,6 @@ struct MtpStemRoots {
     Tensor residual;
     Tensor attention_hidden;
 };
-
 template <class Allocator>
 MtpStemRoots mtp_stem(Allocator& allocator, const TextConfig& config, std::int32_t tokens,
                       bool allocate_embedding) {
@@ -234,6 +233,64 @@ MtpStemRoots mtp_stem(Allocator& allocator, const TextConfig& config, std::int32
     out.residual     = matrix(allocator, DType::BF16, dimension(config.hidden_size), tokens);
     out.attention_hidden = matrix(allocator, DType::BF16, dimension(config.hidden_size), tokens);
     return out;
+}
+
+// Qwen4Exp's four-stream draft head, from the initial feature to the head's input.
+//
+// The artifact states the whole stem (docs/maintainer/qwen4_exp-model.md §2.3):
+//
+//   e        = W_fc_embedding * OffsetNorm_2560(token_embedding)
+//   v        = OffsetNorm_10240(multistream_hidden), i.e. ONE reduction over all h*count entries
+//   h_init[s]= W_fc_hidden * v[s] + e                     (s = 0..count-1)
+//
+// The runtime stores `eh_proj` as the single [h,2h] matrix it is (W_fc_embedding and W_fc_hidden
+// side by side), so h_init[s] = eh_proj * [e; v[s]] and the fused form is the artifact's own
+// arithmetic, not a re-derivation. `residual`/`normalized` are the [h*count, T] pair the block's
+// two corrections act on, `input`/`product` the single-stream pair the mixer and the FFN consume and
+// produce, and `injection` the four coefficients the pending correction applies. The four staging
+// tensors hold one stream at a time: `packed_input` is that stream's [e; v[s]] pack, `stream_input`
+// a contiguous copy of its 2560-wide slice of the h*count norm, and `stream_output` the projection
+// that slice produces before it is scattered into its own plane of `residual`.
+struct MtpHcRoots {
+    Tensor residual, normalized, input, injection, product;
+    Tensor normalized_embedding, normalized_hidden, embedding, packed_input, stream_input,
+        stream_output;
+};
+
+template <class Allocator>
+MtpHcRoots mtp_hc_roots(Allocator& allocator, const TextConfig& config, std::int32_t tokens) {
+    const auto& hc      = config.hc.value();
+    const auto streams  = dimension(hc.stream_width(config.hidden_size));
+    const auto hidden   = dimension(config.hidden_size);
+    return {matrix(allocator, DType::BF16, streams, tokens),
+            matrix(allocator, DType::BF16, streams, tokens),
+            matrix(allocator, DType::BF16, hidden, tokens),
+            matrix(allocator, DType::FP32, dimension(hc.count), tokens),
+            matrix(allocator, DType::BF16, hidden, tokens),
+            matrix(allocator, DType::BF16, hidden, tokens),
+            matrix(allocator, DType::BF16, streams, tokens),
+            matrix(allocator, DType::BF16, hidden, tokens),
+            matrix(allocator, DType::BF16, 2ULL * config.hidden_size, tokens),
+            matrix(allocator, DType::BF16, hidden, tokens),
+            matrix(allocator, DType::BF16, hidden, tokens)};
+}
+
+// The single column a prefill chunk runs after its KV bulk pass: the same four pieces the stem
+// produced for the whole chunk, narrowed to the chunk's last column.
+struct MtpHcTailColumn {
+    Tensor residual, normalized, input, injection, product;
+};
+
+template <class Allocator>
+MtpHcTailColumn mtp_hc_tail_column(Allocator& allocator, const TextConfig& config) {
+    const auto& hc     = config.hc.value();
+    const auto streams = dimension(hc.stream_width(config.hidden_size));
+    const auto hidden  = dimension(config.hidden_size);
+    return {matrix(allocator, DType::BF16, streams, 1),
+            matrix(allocator, DType::BF16, streams, 1),
+            matrix(allocator, DType::BF16, hidden, 1),
+            matrix(allocator, DType::FP32, dimension(hc.count), 1),
+            matrix(allocator, DType::BF16, hidden, 1)};
 }
 
 struct MtpAttentionProjectionRoots {

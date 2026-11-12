@@ -642,6 +642,197 @@ void TextContext::set_gdn_state_action(GdnStateAction action,
     replay_records_   = replay_records;
 }
 
+void TextContext::mtp_hc_stem(const Tensor& ids, const Tensor& hidden,
+                              const Tensor* input_embeddings, workspace::MtpHcRoots& roots) {
+    cudaStream_t s          = ctx_.stream;
+    const int T             = ids.ne[0] * ids.ne[1];
+    const auto hidden_width = dimension(config_.hidden_size);
+    const auto streams      = dimension(config_.hc->count);
+    const auto stream_width = dimension(config_.hc->stream_width(config_.hidden_size));
+    const std::size_t row   = std::size_t(hidden_width) * sizeof(std::uint16_t);
+    const std::size_t pitch = std::size_t(stream_width) * sizeof(std::uint16_t);
+
+    Tensor flat_ids = ids.view({T});
+    Tensor emb;
+    if (input_embeddings != nullptr) {
+        if (input_embeddings->dtype != DType::BF16 ||
+            input_embeddings->ne[0] != hidden_width || input_embeddings->numel() !=
+                static_cast<std::int64_t>(hidden_width) * T ||
+            !input_embeddings->is_contiguous() || input_embeddings->data == nullptr) {
+            throw std::invalid_argument("MTP input embeddings shape mismatch");
+        }
+        emb = input_embeddings->view({hidden_width, T});
+    } else {
+        emb = roots.embedding;
+        ops::embedding(flat_ids, *embed_, emb, s);
+    }
+
+    // e = OffsetNorm_2560(embedding); v = OffsetNorm_10240(multistream_hidden). The second reduction
+    // spans every h*count entry ONCE (not one reduction per stream): the artifact's `hnorm` is a
+    // 10240-wide offset norm over the whole conditioning vector.
+    ops::rmsnorm(emb, mtp_->embedding_norm, config_.rms_norm_eps, true,
+                 roots.normalized_embedding, s);
+    Tensor flat_hidden = hidden.view({stream_width, T});
+    ops::rmsnorm(flat_hidden, mtp_->hidden_norm, config_.rms_norm_eps, true,
+                 roots.normalized_hidden, s);
+
+    // h_init[s] = W_fc_hidden * v[s] + e, one stream at a time. The four streams of the residual are
+    // planes of ONE [h,count,T] tensor (element d + h*(s + count*m)), so a stream's slice is a
+    // strided view: it is staged into a contiguous [h,T] for the projection and scattered back with
+    // the same pitch. The artifact decides the stem's shape: the checkpoint's split pair projects
+    // each term on its own (the fused [h,2h] geometry has no registered kernel route here), while a
+    // fused `eh_proj` holds W_fc_embedding over [0,h) and W_fc_hidden over [h,2h) and is fed the
+    // packed [e; v[s]] instead. Both compute the artifact's own sum.
+    Tensor embedding_term = roots.stream_output;
+    const bool split_stem = mtp_->fc_embedding.has_value();
+    if (split_stem) {
+        project(roots.normalized_embedding, *mtp_->fc_embedding, embedding_term, work_, s);
+    }
+    for (int stream = 0; stream < streams; ++stream) {
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            roots.stream_input.data, row,
+            static_cast<const char*>(roots.normalized_hidden.data) +
+                std::size_t(stream) * row,
+            pitch, row, T, cudaMemcpyDeviceToDevice, s));
+        {
+            auto scope = work_.scope();
+            if (split_stem) {
+                Tensor stream_out = roots.packed_input.slice(0, 0, hidden_width);
+                project(roots.stream_input, *mtp_->fc_hidden, stream_out, work_, s);
+                ops::residual_add(embedding_term, stream_out, s);
+                CUDA_CHECK(cudaMemcpy2DAsync(
+                    static_cast<char*>(roots.residual.data) + std::size_t(stream) * row, pitch,
+                    stream_out.data, row, row, T, cudaMemcpyDeviceToDevice, s));
+            } else {
+                ops::mtp_pack_fc_input(roots.normalized_embedding, roots.stream_input,
+                                       roots.packed_input, s);
+                project(roots.packed_input, mtp_->input_projection, roots.stream_output, work_, s);
+                CUDA_CHECK(cudaMemcpy2DAsync(
+                    static_cast<char*>(roots.residual.data) + std::size_t(stream) * row, pitch,
+                    roots.stream_output.data, row, row, T, cudaMemcpyDeviceToDevice, s));
+            }
+        }
+    }
+
+    // The block's own grouped offset norm of those four streams, then the attention correction's fold
+    // to the single-stream block input and its four injection coefficients.
+    ops::hc_grouped_rmsnorm(roots.residual, mtp_->input_norm.view({hidden_width, streams}),
+                            config_.rms_norm_eps, roots.normalized, ctx_.execution_view());
+    ops::hc_mix(roots.normalized.view({hidden_width, streams, T}),
+                mtp_->input_hc->block_form(), work_, roots.input, roots.injection,
+                ctx_.execution_view());
+}
+
+void TextContext::mtp_hc_tail(workspace::MtpHcRoots& roots, const Tensor& positions,
+                              const Tensor& rope_positions,
+                              ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden,
+                              Tensor* conditioning) {
+    cudaStream_t s          = ctx_.stream;
+    const int T             = roots.residual.ne[1];
+    const auto hidden_width = dimension(config_.hidden_size);
+    const auto streams      = dimension(config_.hc->count);
+
+    const auto projection = workspace::mtp_attention_projection(work_, config_, T);
+    Tensor q              = projection.query.view({dimension(config_.attention->head_dim),
+                                                   dimension(config_.attention->num_attention_heads), T});
+    Tensor k              = projection.key.view({dimension(config_.attention->head_dim),
+                                                 dimension(config_.attention->num_key_value_heads), T});
+    Tensor gate           = projection.gate.view({dimension(config_.attention->head_dim),
+                                                  dimension(config_.attention->num_attention_heads), T});
+    Tensor v              = projection.value.view({dimension(config_.attention->head_dim),
+                                                   dimension(config_.attention->num_key_value_heads), T});
+    Tensor q_flat         = q.view({dimension(config_.attention->query_width()), T});
+    Tensor gate_flat      = gate.view({dimension(config_.attention->query_width()), T});
+    Tensor k_flat         = k.view({dimension(config_.attention->key_width()), T});
+    Tensor v_flat         = v.view({dimension(config_.attention->key_width()), T});
+    mtp_projection(roots.input, mtp_->projection, *config_.attention, q_flat, gate_flat, k_flat,
+                   v_flat, work_, s);
+
+    const auto results = workspace::mtp_attention_results(work_, config_, T);
+    Tensor qn =
+        results.normalized_query.view({dimension(config_.attention->head_dim),
+                                       dimension(config_.attention->num_attention_heads), T});
+    Tensor kn = results.normalized_key.view({dimension(config_.attention->head_dim),
+                                             dimension(config_.attention->num_key_value_heads), T});
+    ops::rmsnorm(q, mtp_->query_norm, config_.rms_norm_eps, true, qn, s);
+    ops::rmsnorm(k, mtp_->key_norm, config_.rms_norm_eps, true, kn, s);
+    Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
+    text_rope(rope_for_op, *config_.rope_parameters, qn, kn, ctx_.execution_view());
+
+    Tensor a = results.attention.view({dimension(config_.attention->head_dim),
+                                       dimension(config_.attention->num_attention_heads), T});
+    if (active_sequence_batch_ != 0) {
+        const std::int32_t width = active_sequence_width_;
+        if (width <= 0 || width * active_sequence_batch_ != T ||
+            active_backend_kv_table_rows_ == nullptr || active_valid_columns_ == nullptr) {
+            throw std::logic_error("MTP sequence batch binding is incomplete");
+        }
+        Tensor q_batch = qn.view({dimension(config_.attention->head_dim),
+                                  dimension(config_.attention->num_attention_heads), width,
+                                  active_sequence_batch_});
+        Tensor k_batch = kn.view({dimension(config_.attention->head_dim),
+                                  dimension(config_.attention->num_key_value_heads), width,
+                                  active_sequence_batch_});
+        Tensor v_batch = v.view({dimension(config_.attention->head_dim),
+                                 dimension(config_.attention->num_key_value_heads), width,
+                                 active_sequence_batch_});
+        Tensor a_batch = a.view({dimension(config_.attention->head_dim),
+                                 dimension(config_.attention->num_attention_heads), width,
+                                 active_sequence_batch_});
+        Tensor position_batch = positions.view({width, active_sequence_batch_});
+        ops::causal_softmax_attention(
+            q_batch, k_batch, v_batch, position_batch, *active_valid_columns_,
+            *active_backend_kv_table_rows_,
+            {dimension(config_.attention->head_dim),
+             dimension(config_.attention->num_attention_heads),
+             dimension(config_.attention->num_key_value_heads)},
+            static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
+            batch_mtp_kv_->batch_layer_view(0), envelope, work_, a_batch, ctx_.execution_view());
+    } else {
+        ops::causal_softmax_attention(
+            qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row,
+            {dimension(config_.attention->head_dim),
+             dimension(config_.attention->num_attention_heads),
+             dimension(config_.attention->num_key_value_heads)},
+            static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
+            batch_mtp_kv_->batch_layer_view(0), envelope, work_, a, ctx_.execution_view());
+    }
+    ops::sigmoid_mul(gate, a, s);
+
+    // The block output is a product, not a residual add: the correction injects it into the four
+    // streams with the coefficients the input fold published, then re-norms the BF16 result for the
+    // next fold. This is exactly the text block's mixer sequence (text.cpp run_layers).
+    project(a.view({dimension(config_.attention->query_width()), T}), mtp_->output, roots.product,
+            work_, s);
+    ops::hc_combine_norm(roots.residual, roots.product, roots.injection,
+                         mtp_->post_attention_norm.view({hidden_width, streams}),
+                         config_.rms_norm_eps, roots.residual, roots.normalized,
+                         ctx_.execution_view());
+    ops::hc_mix(roots.normalized.view({hidden_width, streams, T}),
+                mtp_->post_attention_hc->block_form(), work_, roots.input, roots.injection,
+                ctx_.execution_view());
+
+    CUDA_CHECK(cudaMemsetAsync(roots.product.data, 0, roots.product.bytes(), s));
+    {
+        auto post_mixer_scope = work_.scope();
+        ffn(roots.input, mtp_->ffn, roots.product, {}, work_, ctx_.execution_view(), true);
+    }
+    ops::hc_combine_norm(roots.residual, roots.product, roots.injection,
+                         mtp_->final_norm.view({hidden_width, streams}), config_.rms_norm_eps,
+                         roots.residual, roots.normalized, ctx_.execution_view());
+    ops::hc_mix(roots.normalized.view({hidden_width, streams, T}),
+                mtp_->final_hc->final_form(), work_, mtp_hidden, ctx_.execution_view());
+    // The next draft step conditions on the pre-final-mixer residual, which is the model's second
+    // tail feature; the head's 2560-wide sample cannot produce it.
+    if (conditioning != nullptr && conditioning->data != nullptr) {
+        if (conditioning->numel() != roots.residual.numel() || !conditioning->is_contiguous()) {
+            throw std::invalid_argument("MTP conditioning frame shape mismatch");
+        }
+        CUDA_CHECK(cudaMemcpyAsync(conditioning->data, roots.residual.data, roots.residual.bytes(),
+                                   cudaMemcpyDeviceToDevice, s));
+    }
+}
+
 void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
                                    const Tensor* input_embeddings, Tensor& x, Tensor& ah) {
     cudaStream_t s     = ctx_.stream;
@@ -671,10 +862,18 @@ void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
     ops::rmsnorm(flat_hidden, mtp_->hidden_norm, config_.rms_norm_eps, true, h, s);
 
     Tensor fc_in = roots.packed_input;
-    ops::mtp_pack_fc_input(e, h, fc_in, s);
-
-    x = roots.residual;
-    project(fc_in, mtp_->input_projection, x, work_, s);
+    if (mtp_->fc_embedding && mtp_->fc_hidden) {
+        // The artifact keeps the stem's two matrices apart: x = fc_hidden(h) + fc_embedding(e).
+        x = roots.residual;
+        project(e, *mtp_->fc_embedding, x, work_, s);
+        Tensor hidden_term = roots.packed_input.slice(0, 0, dimension(config_.hidden_size));
+        project(h, *mtp_->fc_hidden, hidden_term, work_, s);
+        ops::residual_add(hidden_term, x, s);
+    } else {
+        ops::mtp_pack_fc_input(e, h, fc_in, s);
+        x = roots.residual;
+        project(fc_in, mtp_->input_projection, x, work_, s);
+    }
 
     ah = roots.attention_hidden;
     ops::rmsnorm(x, mtp_->input_norm, config_.rms_norm_eps, true, ah, s);
@@ -774,23 +973,39 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
 void TextContext::mtp_forward_core(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                                    const Tensor& rope_positions,
                                    ops::CausalAttentionExecutionEnvelope envelope,
-                                   Tensor& mtp_hidden, const Tensor* input_embeddings) {
+                                   Tensor& mtp_hidden, Tensor* conditioning,
+                                   const Tensor* input_embeddings) {
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
     nvtx::ScopedRange forward_range(nvtx::Name::MtpForward, nvtx::Category::Mtp,
                                     static_cast<std::uint64_t>(ids.numel()));
     auto scratch_scope = work_.scope();
+    if (mtp_hc()) {
+        auto roots = workspace::mtp_hc_roots(work_, config_, ids.ne[0] * ids.ne[1]);
+        mtp_hc_stem(ids, hidden, input_embeddings, roots);
+        mtp_hc_tail(roots, positions, rope_positions, envelope, mtp_hidden, conditioning);
+        return;
+    }
     Tensor x;
     Tensor ah;
     mtp_forward_stem(ids, hidden, input_embeddings, x, ah);
     mtp_forward_tail(x, ah, positions, rope_positions, envelope, mtp_hidden);
+    // The single-stream form's head input IS its conditioning; carrying it to `conditioning` keeps
+    // the caller's AR loop uniform without changing a single value it produced before.
+    if (conditioning != nullptr && conditioning->data != nullptr) {
+        if (conditioning->numel() != mtp_hidden.numel() || !conditioning->is_contiguous()) {
+            throw std::invalid_argument("MTP conditioning frame shape mismatch");
+        }
+        CUDA_CHECK(cudaMemcpyAsync(conditioning->data, mtp_hidden.data, mtp_hidden.bytes(),
+                                   cudaMemcpyDeviceToDevice, ctx_.stream));
+    }
 }
 
 void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
                                     const Tensor* input_embeddings, const Tensor& positions,
                                     const Tensor& rope_positions,
                                     ops::CausalAttentionExecutionEnvelope envelope,
-                                    bool final_chunk, Tensor* final_hidden, Tensor* logits,
-                                    Tensor* draft_token) {
+                                    bool final_chunk, Tensor* final_hidden, Tensor* conditioning,
+                                    Tensor* logits, Tensor* draft_token) {
     if (!mtp_kv_.valid()) { throw std::runtime_error("MTP prefill is not enabled"); }
     const int T = ids.ne[0];
     if (T <= 0 || static_cast<std::uint32_t>(T) > prefill_chunk_) {
@@ -799,7 +1014,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
     nvtx::ScopedRange mtp_prefill_range(nvtx::Name::PrefillMtpChunk, nvtx::Category::Mtp,
                                         static_cast<std::uint64_t>(T));
     require_tensor_shape(ids, DType::I32, {T}, "MTP prefill ids");
-    require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), T},
+    require_tensor_shape(hidden, DType::BF16, {dimension(mtp_frame_width()), T},
                          "MTP prefill hidden");
     require_tensor_shape(positions, DType::I32, {T}, "MTP prefill positions");
     if (rope_positions.dtype != DType::I32 || rope_positions.ne[0] != T ||
@@ -821,22 +1036,27 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
 
     cudaStream_t s     = ctx_.stream;
     auto scratch_scope = work_.scope();
+    const bool hc      = mtp_hc();
+    const auto width   = dimension(config_.hidden_size);
+    workspace::MtpHcTailColumn tail_column;
     Tensor x_last;
     Tensor ah_last;
     if (final_chunk) {
-        x_last  = work_.alloc(DType::BF16, {dimension(config_.hidden_size), 1});
-        ah_last = work_.alloc(DType::BF16, {dimension(config_.hidden_size), 1});
+        if (hc) {
+            tail_column = workspace::mtp_hc_tail_column(work_, config_);
+        } else {
+            x_last  = work_.alloc(DType::BF16, {width, 1});
+            ah_last = work_.alloc(DType::BF16, {width, 1});
+        }
     }
 
-    {
-        auto bulk_scope = work_.scope();
-        Tensor x;
-        Tensor ah;
-        mtp_forward_stem(ids, hidden, input_embeddings, x, ah);
-
+    // The KV bulk pass consumes the folded block input, so both forms share it: the draft mixer's
+    // K/V pair is projected from the single 2560-wide stream, never from the four residual streams.
+    const auto kv_bulk = [&](const Tensor& block_input) {
         Tensor k_flat = work_.alloc(DType::BF16, {dimension(config_.attention->key_width()), T});
         Tensor v_flat = work_.alloc(DType::BF16, {dimension(config_.attention->key_width()), T});
-        mtp_kv_projection(ah, mtp_->projection, *config_.attention, k_flat, v_flat, work_, s);
+        mtp_kv_projection(block_input, mtp_->projection, *config_.attention, k_flat, v_flat, work_,
+                          s);
         Tensor k = k_flat.view({dimension(config_.attention->head_dim),
                                 dimension(config_.attention->num_key_value_heads), T});
         Tensor v = v_flat.view({dimension(config_.attention->head_dim),
@@ -847,41 +1067,80 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         ops::rmsnorm(k, mtp_->key_norm, config_.rms_norm_eps, true, kn, s);
         text_rope(rope_positions, *config_.rope_parameters, kn, ctx_.execution_view());
         ops::kv_cache_append(kn, v, positions, mtp_kv_.layer_view(0), s);
+    };
 
-        if (final_chunk) {
-            const std::size_t column_bytes =
-                static_cast<std::size_t>(dimension(config_.hidden_size)) * dtype_size(DType::BF16);
-            const auto* x_src = static_cast<const unsigned char*>(x.data) +
-                                static_cast<std::size_t>(T - 1) * column_bytes;
-            const auto* ah_src = static_cast<const unsigned char*>(ah.data) +
-                                 static_cast<std::size_t>(T - 1) * column_bytes;
-            // port (sm_89): the two slices are independent and share a stream, so one batch
-            // submission replaces two. Both are sub-megabyte, which is where the submission cost
-            // dominates the transfer.
-            void* const       destinations[2] = {x_last.data, ah_last.data};
-            const void* const sources[2]      = {x_src, ah_src};
-            const std::size_t sizes[2]        = {column_bytes, column_bytes};
-            cudaMemcpyAttributes attributes{};
-            attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
-            attributes.flags          = 0;
-            std::size_t attribute_index = 0;
-            const auto submitted        = cudaMemcpyBatchAsync(destinations, sources, sizes, 2,
-                                                               &attributes, &attribute_index, 1, s);
-            if (submitted != cudaSuccess) {
-                CUDA_CHECK(
-                    cudaMemcpyAsync(x_last.data, x_src, column_bytes, cudaMemcpyDeviceToDevice, s));
-                CUDA_CHECK(
-                    cudaMemcpyAsync(ah_last.data, ah_src, column_bytes, cudaMemcpyDeviceToDevice, s));
+    {
+        auto bulk_scope = work_.scope();
+        if (hc) {
+            auto roots = workspace::mtp_hc_roots(work_, config_, T);
+            mtp_hc_stem(ids, hidden, input_embeddings, roots);
+            kv_bulk(roots.input);
+            if (final_chunk) {
+                const std::size_t residual_column =
+                    static_cast<std::size_t>(
+                        dimension(config_.hc->stream_width(config_.hidden_size))) *
+                    dtype_size(DType::BF16);
+                const std::size_t hidden_column = static_cast<std::size_t>(width) *
+                                                  dtype_size(DType::BF16);
+                const std::size_t injection_column =
+                    static_cast<std::size_t>(dimension(config_.hc->count)) * sizeof(float);
+                CUDA_CHECK(cudaMemcpyAsync(
+                    tail_column.residual.data,
+                    static_cast<const char*>(roots.residual.data) +
+                        static_cast<std::size_t>(T - 1) * residual_column,
+                    residual_column, cudaMemcpyDeviceToDevice, s));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    tail_column.input.data,
+                    static_cast<const char*>(roots.input.data) +
+                        static_cast<std::size_t>(T - 1) * hidden_column,
+                    hidden_column, cudaMemcpyDeviceToDevice, s));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    tail_column.injection.data,
+                    static_cast<const char*>(roots.injection.data) +
+                        static_cast<std::size_t>(T - 1) * injection_column,
+                    injection_column, cudaMemcpyDeviceToDevice, s));
+            }
+        } else {
+            Tensor x;
+            Tensor ah;
+            mtp_forward_stem(ids, hidden, input_embeddings, x, ah);
+            kv_bulk(ah);
+            if (final_chunk) {
+                const std::size_t column_bytes = static_cast<std::size_t>(width) *
+                                                 dtype_size(DType::BF16);
+                const auto* x_src = static_cast<const unsigned char*>(x.data) +
+                                    static_cast<std::size_t>(T - 1) * column_bytes;
+                const auto* ah_src = static_cast<const unsigned char*>(ah.data) +
+                                     static_cast<std::size_t>(T - 1) * column_bytes;
+                // port (sm_89): the two slices are independent and share a stream, so one batch
+                // submission replaces two. Both are sub-megabyte, which is where the submission cost
+                // dominates the transfer.
+                void* const       destinations[2] = {x_last.data, ah_last.data};
+                const void* const sources[2]      = {x_src, ah_src};
+                const std::size_t sizes[2]        = {column_bytes, column_bytes};
+                cudaMemcpyAttributes attributes{};
+                attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+                attributes.flags          = 0;
+                std::size_t attribute_index = 0;
+                const auto submitted        = cudaMemcpyBatchAsync(destinations, sources, sizes, 2,
+                                                                   &attributes, &attribute_index, 1, s);
+                if (submitted != cudaSuccess) {
+                    CUDA_CHECK(cudaMemcpyAsync(x_last.data, x_src, column_bytes,
+                                               cudaMemcpyDeviceToDevice, s));
+                    CUDA_CHECK(cudaMemcpyAsync(ah_last.data, ah_src, column_bytes,
+                                               cudaMemcpyDeviceToDevice, s));
+                }
             }
         }
     }
 
     if (final_chunk) {
+        const Tensor& column_input = hc ? tail_column.input : ah_last;
         Tensor q_flat = work_.alloc(DType::BF16, {dimension(config_.attention->query_width()), 1});
         Tensor gate_flat =
             work_.alloc(DType::BF16, {dimension(config_.attention->query_width()), 1});
-        mtp_query_gate_projection(ah_last, mtp_->projection, *config_.attention, q_flat, gate_flat,
-                                  work_, s);
+        mtp_query_gate_projection(column_input, mtp_->projection, *config_.attention, q_flat,
+                                  gate_flat, work_, s);
         Tensor q    = q_flat.view({dimension(config_.attention->head_dim),
                                    dimension(config_.attention->num_attention_heads), 1});
         Tensor gate = gate_flat.view({dimension(config_.attention->head_dim),
@@ -915,20 +1174,55 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
              dimension(config_.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
             mtp_kv_.layer_view(0), envelope, work_, a, ctx_.execution_view());
-    ops::sigmoid_mul(gate, a, s);
+        ops::sigmoid_mul(gate, a, s);
 
-        Tensor o = work_.alloc(DType::BF16, {dimension(config_.hidden_size), 1});
-        project(a.view({dimension(config_.attention->query_width()), 1}), mtp_->output, o, work_,
-                s);
-        ops::residual_add(o, x_last, s);
+        if (hc) {
+            const auto streams = dimension(config_.hc->count);
+            project(a.view({dimension(config_.attention->query_width()), 1}), mtp_->output,
+                    tail_column.product, work_, s);
+            ops::hc_combine_norm(tail_column.residual, tail_column.product,
+                                 tail_column.injection,
+                                 mtp_->post_attention_norm.view({width, streams}),
+                                 config_.rms_norm_eps, tail_column.residual,
+                                 tail_column.normalized, ctx_.execution_view());
+            ops::hc_mix(tail_column.normalized.view({width, streams, 1}),
+                        mtp_->post_attention_hc->block_form(), work_, tail_column.input,
+                        tail_column.injection, ctx_.execution_view());
+            CUDA_CHECK(cudaMemsetAsync(tail_column.product.data, 0, tail_column.product.bytes(), s));
+            {
+                auto post_mixer_scope = work_.scope();
+                ffn(tail_column.input, mtp_->ffn, tail_column.product, {}, work_,
+                    ctx_.execution_view(), true);
+            }
+            ops::hc_combine_norm(tail_column.residual, tail_column.product,
+                                 tail_column.injection, mtp_->final_norm.view({width, streams}),
+                                 config_.rms_norm_eps, tail_column.residual,
+                                 tail_column.normalized, ctx_.execution_view());
+            ops::hc_mix(tail_column.normalized.view({width, streams, 1}),
+                        mtp_->final_hc->final_form(), work_, *final_hidden,
+                        ctx_.execution_view());
+            if (conditioning != nullptr && conditioning->data != nullptr) {
+                if (conditioning->numel() != tail_column.residual.numel()) {
+                    throw std::invalid_argument("MTP conditioning frame shape mismatch");
+                }
+                CUDA_CHECK(cudaMemcpyAsync(conditioning->data, tail_column.residual.data,
+                                           tail_column.residual.bytes(),
+                                           cudaMemcpyDeviceToDevice, s));
+            }
+        } else {
+            Tensor o = work_.alloc(DType::BF16, {width, 1});
+            project(a.view({dimension(config_.attention->query_width()), 1}), mtp_->output, o,
+                    work_, s);
+            ops::residual_add(o, x_last, s);
 
-        Tensor mh = work_.alloc(DType::BF16, {dimension(config_.hidden_size), 1});
-        ops::rmsnorm(x_last, mtp_->post_attention_norm, config_.rms_norm_eps, true, mh, s);
-        {
-            auto post_mixer_scope = work_.scope();
-            ffn(mh, mtp_->ffn, x_last, {}, work_, ctx_.execution_view(), true);
+            Tensor mh = work_.alloc(DType::BF16, {width, 1});
+            ops::rmsnorm(x_last, mtp_->post_attention_norm, config_.rms_norm_eps, true, mh, s);
+            {
+                auto post_mixer_scope = work_.scope();
+                ffn(mh, mtp_->ffn, x_last, {}, work_, ctx_.execution_view(), true);
+            }
+            ops::rmsnorm(x_last, mtp_->final_norm, config_.rms_norm_eps, true, *final_hidden, s);
         }
-        ops::rmsnorm(x_last, mtp_->final_norm, config_.rms_norm_eps, true, *final_hidden, s);
         proposal_argmax(*final_hidden, *logits, *draft_token);
     }
 }
@@ -1000,7 +1294,7 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
                                     ops::CausalAttentionExecutionEnvelope envelope,
                                     Tensor& mtp_hidden, int logits_column, Tensor* logits,
                                     Tensor* draft_token, const Tensor* explicit_rope_positions,
-                                    const Tensor* input_embeddings) {
+                                    const Tensor* input_embeddings, Tensor* conditioning) {
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
     const int T = ids.ne[0];
     if (T <= 0 || static_cast<std::uint32_t>(T) > prefill_chunk_) {
@@ -1008,9 +1302,13 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
     }
     require_tensor_shape(ids, DType::I32, {T}, "MTP ids");
     require_tensor_shape(positions, DType::I32, {T}, "MTP positions");
-    require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), T}, "MTP hidden");
+    require_tensor_shape(hidden, DType::BF16, {dimension(mtp_frame_width()), T}, "MTP hidden");
     require_tensor_shape(mtp_hidden, DType::BF16, {dimension(config_.hidden_size), T},
                          "MTP output hidden");
+    if (conditioning != nullptr && conditioning->data != nullptr) {
+        require_tensor_shape(*conditioning, DType::BF16, {dimension(mtp_frame_width()), T},
+                             "MTP conditioning");
+    }
     if (logits_column >= T) { throw std::invalid_argument("MTP logits column out of range"); }
     if (logits_column >= 0) {
         if (logits == nullptr || draft_token == nullptr) {
@@ -1034,7 +1332,7 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
                !rope_positions->is_contiguous() || rope_positions->data == nullptr) {
         throw std::invalid_argument("MTP explicit rope positions must be [T] or [T,3]");
     }
-    mtp_forward_core(ids, hidden, positions, *rope_positions, envelope, mtp_hidden,
+    mtp_forward_core(ids, hidden, positions, *rope_positions, envelope, mtp_hidden, conditioning,
                      input_embeddings);
 
     if (logits_column >= 0) {
@@ -1048,22 +1346,26 @@ void TextContext::mtp_forward_ar_step(const Tensor& token, const Tensor& previou
                                       const Tensor& position,
                                       ops::CausalAttentionExecutionEnvelope envelope,
                                       Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token,
-                                      ops::SamplingMask mask) {
+                                      ops::SamplingMask mask, Tensor* conditioning) {
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
     require_tensor_shape(token, DType::I32, {1}, "MTP AR token");
     require_tensor_shape(position, DType::I32, {1}, "MTP AR position");
-    require_tensor_shape(previous_hidden, DType::BF16, {dimension(config_.hidden_size), 1},
+    require_tensor_shape(previous_hidden, DType::BF16, {dimension(mtp_frame_width()), 1},
                          "MTP AR previous hidden");
     require_tensor_shape(mtp_hidden, DType::BF16, {dimension(config_.hidden_size), 1},
                          "MTP AR output hidden");
     require_tensor_shape(logits, DType::BF16, {dimension(config_.vocab_size), 1}, "MTP AR logits");
     require_tensor_shape(draft_token, DType::I32, {1}, "MTP AR draft token");
+    if (conditioning != nullptr && conditioning->data != nullptr) {
+        require_tensor_shape(*conditioning, DType::BF16, {dimension(mtp_frame_width()), 1},
+                             "MTP AR conditioning");
+    }
 
     auto position_scope  = work_.scope();
     Tensor rope_position = work_.alloc(DType::I32, {1});
     ops::offset_i32_positions(position, io_.rope_delta, rope_position, ctx_.stream);
     mtp_forward_core(token, previous_hidden, position, rope_position, envelope, mtp_hidden,
-                     nullptr);
+                     conditioning, nullptr);
     auto logits_scope = work_.scope();
     proposal_argmax(mtp_hidden, logits, draft_token, mask);
 }
@@ -1086,7 +1388,7 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
                          "ordinary decode Linear Attention source slots");
     require_tensor_shape(linear_state_destination_slots, DType::I32, {batch},
                          "ordinary decode Linear Attention destination slots");
-    require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), batch},
+    require_tensor_shape(hidden, DType::BF16, {dimension(mtp_frame_width()), batch},
                          "ordinary decode hidden");
     require_tensor_shape(logits, DType::BF16, {dimension(config_.vocab_size), batch},
                          "ordinary decode logits");
@@ -1154,7 +1456,20 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
         ple_window.close();
-        final_hidden(x, hidden, batch);
+        // The frame the caller keeps is the MTP conditioning feature. With four residual streams that
+        // is the pre-final-mixer residual (the head's 2560-wide sample cannot be inverted into it),
+        // so the sample is computed into a scratch tensor for the logits and the residual is copied
+        // out. Without streams the two are the same tensor and nothing moves.
+        const bool streams = mtp_frame_width() != config_.hidden_size;
+        Tensor sample      = streams ? work_.alloc(DType::BF16,
+                                                    {dimension(config_.hidden_size), batch})
+                                     : hidden;
+        final_hidden(x, sample, batch);
+        if (streams) {
+            const Tensor residual = hc_.residual.view({dimension(mtp_frame_width()), batch});
+            CUDA_CHECK(cudaMemcpyAsync(hidden.data, residual.data, residual.bytes(),
+                                       cudaMemcpyDeviceToDevice, stream));
+        }
         // Q67: zero-weight scratch rows for the row-independent output projection. The class width
         // is the compiled shape; the extra rows read zero hidden and their logits are never sampled.
         // This is deliberately the first absorption site, not the whole batch: attention and the
@@ -1168,8 +1483,8 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         if (width > batch) {
             Tensor padded_hidden = work_.alloc(DType::BF16, {dimension(config_.hidden_size), width});
             CUDA_CHECK(cudaMemsetAsync(padded_hidden.data, 0, padded_hidden.bytes(), stream));
-            CUDA_CHECK(cudaMemcpy2DAsync(padded_hidden.data, padded_hidden.nb[1], hidden.data,
-                                         hidden.nb[1], hidden.bytes() / static_cast<std::size_t>(batch),
+            CUDA_CHECK(cudaMemcpy2DAsync(padded_hidden.data, padded_hidden.nb[1], sample.data,
+                                         sample.nb[1], sample.bytes() / static_cast<std::size_t>(batch),
                                          static_cast<std::size_t>(batch), cudaMemcpyDeviceToDevice,
                                          stream));
             Tensor padded_logits = work_.alloc(DType::BF16, {dimension(config_.vocab_size), width});
@@ -1180,7 +1495,7 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
                                          static_cast<std::size_t>(batch), cudaMemcpyDeviceToDevice,
                                          stream));
         } else {
-            project(hidden, *lm_head_, logits, work_, stream);
+            project(sample, *lm_head_, logits, work_, stream);
         }
     }
     work_.reset();
@@ -1211,7 +1526,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
     require_tensor_shape(kv_table_rows, DType::I32, {batch}, "target verify batch KV rows");
     require_tensor_shape(linear_state_source_slots, DType::I32, {batch},
                          "target verify batch Linear Attention slots");
-    require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), width, batch},
+    require_tensor_shape(hidden, DType::BF16, {dimension(mtp_frame_width()), width, batch},
                          "target verify batch hidden");
     require_tensor_shape(logits, DType::BF16, {dimension(config_.vocab_size), width, batch},
                          "target verify batch logits");
@@ -1301,11 +1616,22 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         if constexpr (requires { tap.capture_positions(cache_positions, stream); }) {
             tap.capture_positions(cache_positions, stream);
         }
-        Tensor flat_hidden = hidden.view({dimension(config_.hidden_size), columns});
+        Tensor flat_hidden = hidden.view({dimension(mtp_frame_width()), columns});
         Tensor flat_logits = logits.view({dimension(config_.vocab_size), columns});
         Tensor flat_tokens = target_tokens.view({columns});
-        final_hidden(x, flat_hidden, columns);
-        project(flat_hidden, *lm_head_, flat_logits, work_, stream);
+        // Same split as the ordinary decode step: the head reads the final mixer's 2560-wide sample,
+        // the caller keeps the pre-final-mixer residual the MTP head conditions on.
+        const bool streams = flat_hidden.ne[0] != dimension(config_.hidden_size);
+        Tensor sample      = streams ? work_.alloc(DType::BF16,
+                                                    {dimension(config_.hidden_size), columns})
+                                     : flat_hidden;
+        final_hidden(x, sample, columns);
+        if (streams) {
+            const Tensor residual = hc_.residual.view({dimension(mtp_frame_width()), columns});
+            CUDA_CHECK(cudaMemcpyAsync(flat_hidden.data, residual.data, residual.bytes(),
+                                       cudaMemcpyDeviceToDevice, stream));
+        }
+        project(sample, *lm_head_, flat_logits, work_, stream);
         ops::argmax(flat_logits, flat_tokens,
                     dimension(parameters_.model.resources().public_token_count), stream);
     }
@@ -1521,9 +1847,21 @@ void TextContext::prefill_batch(std::span<const std::int32_t> ids,
                     dimension(parameters_.model.resources().public_token_count), stream);
     }
     // Each row's own tail hidden: the next decode step reads it, so it has to land in that lane's
-    // sequence rather than in a shared scratch tensor.
+    // sequence rather than in a shared scratch tensor. A four-stream model keeps the
+    // pre-final-mixer residual there (the MTP head's conditioning), not the head's sample.
     for (std::int32_t row = 0; row < batch; ++row) {
         Tensor* target = tail_hidden_rows[static_cast<std::size_t>(row)];
+        if (hc_enabled() && mtp_frame_width() != config_.hidden_size) {
+            const Tensor residual = hc_.residual.view({dimension(mtp_frame_width()), columns});
+            const auto column     = valid_columns[static_cast<std::size_t>(row)] - 1;
+            const auto flat       = models::qwen3_5::execution::prefill_batch_flat_column(
+                column, row, width);
+            CUDA_CHECK(cudaMemcpyAsync(target->data,
+                                       static_cast<const char*>(residual.data) +
+                                           static_cast<std::size_t>(flat) * residual.nb[1],
+                                       target->bytes(), cudaMemcpyDeviceToDevice, stream));
+            continue;
+        }
         CUDA_CHECK(cudaMemcpyAsync(target->data,
                                    static_cast<const char*>(last.data) +
                                        static_cast<std::size_t>(row) * last.nb[1],
@@ -1541,7 +1879,7 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
                                            const Tensor& rope_positions,
                                            const Tensor& valid_columns, const Tensor& kv_table_rows,
                                            ops::CausalAttentionExecutionEnvelope envelope,
-                                           Tensor& mtp_hidden) {
+                                           Tensor& mtp_hidden, Tensor* conditioning) {
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
@@ -1550,7 +1888,7 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
         throw std::invalid_argument("MTP decode batch shape is outside the supported domain");
     }
     require_tensor_shape(ids, DType::I32, {width, batch}, "MTP decode batch ids");
-    require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), width, batch},
+    require_tensor_shape(hidden, DType::BF16, {dimension(mtp_frame_width()), width, batch},
                          "MTP decode batch target hidden");
     require_tensor_shape(cache_positions, DType::I32, {width, batch},
                          "MTP decode batch cache positions");
@@ -1560,12 +1898,18 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
     require_tensor_shape(kv_table_rows, DType::I32, {batch}, "MTP decode batch KV rows");
     require_tensor_shape(mtp_hidden, DType::BF16, {dimension(config_.hidden_size), width, batch},
                          "MTP decode batch hidden");
+    if (conditioning != nullptr && conditioning->data != nullptr) {
+        require_tensor_shape(*conditioning, DType::BF16,
+                             {dimension(mtp_frame_width()), width, batch},
+                             "MTP decode batch conditioning");
+    }
 
     ScopedValue<const Tensor*> backend_binding(active_backend_kv_table_rows_, &kv_table_rows);
     ScopedValue<const Tensor*> valid_binding(active_valid_columns_, &valid_columns);
     ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
     ScopedValue<std::int32_t> width_binding(active_sequence_width_, width);
-    mtp_forward_core(ids, hidden, cache_positions, rope_positions, envelope, mtp_hidden, nullptr);
+    mtp_forward_core(ids, hidden, cache_positions, rope_positions, envelope, mtp_hidden,
+                     conditioning, nullptr);
 }
 
 void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens) {
@@ -2811,13 +3155,26 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             }
             chunk_probe.mark(ChunkProbe::kLayers);
 
+            // The frame the Program keeps per column is the MTP conditioning feature: the
+            // pre-final-mixer residual on a four-stream model, the head's sample otherwise. The
+            // sample is still needed for the sampled token and for the checkpoint's hidden, so both
+            // are produced (and coincide on the single-stream form).
+            const bool streams = mtp_frame_width() != config_.hidden_size;
             Tensor xf = prefill_hidden_.data != nullptr
                             ? matrix_window(prefill_hidden_, len)
-                            : work_.alloc(DType::BF16, {dimension(config_.hidden_size), len});
-            final_hidden(x, xf, len);
+                            : work_.alloc(DType::BF16, {dimension(mtp_frame_width()), len});
+            Tensor sample = streams ? work_.alloc(DType::BF16,
+                                                   {dimension(config_.hidden_size), len})
+                                     : xf;
+            final_hidden(x, sample, len);
+            if (streams) {
+                const Tensor residual = hc_.residual.view({dimension(mtp_frame_width()), len});
+                CUDA_CHECK(cudaMemcpyAsync(xf.data, residual.data, residual.bytes(),
+                                           cudaMemcpyDeviceToDevice, s));
+            }
 
             if (is_last) {
-                Tensor last_xf = xf.slice(1, len - 1, 1);
+                Tensor last_xf = sample.slice(1, len - 1, 1);
                 Tensor logits  = matrix_window(io_.logits, 1);
                 project(last_xf, *lm_head_, logits, work_, s);
                 // Set io_.pos to the bonus token's absolute position (base + T) before picking so
@@ -2891,7 +3248,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                     Tensor draft0 = io_.mtp->draft_tokens.slice(0, 0, 1);
                     mtp_prefill_chunk(mtp_ids, xf, mtp_input_embeddings_ptr, positions,
                                       rope_positions, chunk_envelope, true, &io_.mtp->ar_hidden,
-                                      &logits, &draft0);
+                                      &io_.mtp->ar_conditioning, &logits, &draft0);
 
                     Tensor ar_position = io_.mtp->position.slice(0, 0, 1);
                     ops::set_i32_scalar(ar_position, base_i + T, s);
@@ -2903,8 +3260,9 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                         const auto ar_visible = static_cast<std::uint32_t>(base_i + T + i);
                         const ops::CausalAttentionExecutionEnvelope ar_envelope{ar_visible,
                                                                                 ar_visible};
-                        mtp_forward_ar_step(prev_token, io_.mtp->ar_hidden, ar_position,
-                                            ar_envelope, next_hidden, logits, next_token);
+                        mtp_forward_ar_step(prev_token, io_.mtp->ar_conditioning, ar_position,
+                                            ar_envelope, next_hidden, logits, next_token, {},
+                                            &io_.mtp->ar_conditioning);
                         CUDA_CHECK(cudaMemcpyAsync(io_.mtp->ar_hidden.data, next_hidden.data,
                                                    io_.mtp->ar_hidden.bytes(),
                                                    cudaMemcpyDeviceToDevice, s));
@@ -2913,7 +3271,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 } else {
                     mtp_prefill_chunk(mtp_ids, xf, mtp_input_embeddings_ptr, positions,
                                       rope_positions, chunk_envelope, false, nullptr, nullptr,
-                                      nullptr);
+                                      nullptr, nullptr);
                 }
             }
             chunk_probe.mark(ChunkProbe::kMtp);
@@ -2921,7 +3279,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             if (split_rel > 0 && t0 + len == split_rel &&
                 rewrite_checkpoint_hidden_output_ != nullptr) {
                 require_tensor_shape(*rewrite_checkpoint_hidden_output_, DType::BF16,
-                                     {dimension(config_.hidden_size), 1},
+                                     {dimension(mtp_frame_width()), 1},
                                      "rewrite checkpoint hidden output");
                 const Tensor checkpoint_hidden = xf.slice(1, len - 1, 1);
                 CUDA_CHECK(cudaMemcpyAsync(rewrite_checkpoint_hidden_output_->data,

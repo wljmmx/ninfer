@@ -838,14 +838,39 @@ public:
         const std::array inputs{model_.input(a.query), model_.input(a.key), model_.input(a.gate),
                                 model_.input(a.value)};
         MtpParameters out;
-        out.input_projection    = linear(w.input_projection);
+        if (w.fc_embedding && w.fc_hidden) {
+            out.fc_embedding = linear(*w.fc_embedding);
+            out.fc_hidden    = linear(*w.fc_hidden);
+        } else {
+            out.input_projection = linear(w.input_projection);
+        }
         out.embedding_norm      = tensor(w.embedding_norm);
         out.hidden_norm         = tensor(w.hidden_norm);
         out.input_norm          = tensor(w.layer.input_norm);
         out.post_attention_norm = tensor(w.layer.post_attention_norm);
         out.final_norm          = tensor(w.final_norm);
-        out.projection.packed   = ops::prepare_linear_weight(inputs);
-        if (model_.config().text.architecture == Architecture::Qwen3_5) {
+        // The draft block's Q/K/gate/V are four row blocks of one fused parent on the Qwen3.5 form
+        // (the mtp_split_attn_in and attn_input_proj ops read that single matrix), but Qwen4Exp keeps
+        // them in their own objects - and its Q and output gate are two halves of one parent. The
+        // artifact decides: one contiguous parent runs the packed projection, anything else runs the
+        // four independent Linears `rows` names.
+        const bool fused_inputs = [&] {
+            const WeightView* views[4] = {&model_.weight(a.query).view, &model_.weight(a.key).view,
+                                          &model_.weight(a.gate).view, &model_.weight(a.value).view};
+            const auto* parent = views[0]->parts.size() == 1 ? views[0]->parts[0].parent : nullptr;
+            if (parent == nullptr) { return false; }
+            for (std::size_t i = 1; i < 4; ++i) {
+                if (views[i]->parts.size() != 1 || views[i]->parts[0].parent != parent ||
+                    views[i]->parts[0].begin != views[i - 1]->parts[0].end) {
+                    return false;
+                }
+            }
+            return true;
+        }();
+        if (fused_inputs) {
+            out.projection.packed = ops::prepare_linear_weight(inputs);
+        }
+        if (model_.config().text.architecture == Architecture::Qwen3_5 || !fused_inputs) {
             out.projection.rows = {linear(a.query), linear(a.key), linear(a.gate), linear(a.value)};
         }
         out.query_norm  = tensor(a.query_norm);
@@ -853,6 +878,19 @@ public:
         out.output      = linear(a.output);
         out.ffn         = ffn(w.layer);
         out.output_head = linear(w.output_head_use);
+        // Qwen4Exp's four-stream draft head: the block carries the same two corrections a text block
+        // does, and the head folds the streams through the final correction instead of a final norm.
+        if (const auto& hc_config = model_.config().text.hc; hc_config) {
+            if (!w.layer.input_hc || !w.layer.post_attention_hc || !w.final_hc) {
+                refuse("mtp", "a four-stream draft head needs both block corrections and the head "
+                              "correction");
+            }
+            out.input_hc          = with_context("mtp/layers/0/attention_hc",
+                                                 [&] { return hc(*w.layer.input_hc); });
+            out.post_attention_hc = with_context("mtp/layers/0/moe_hc",
+                                                 [&] { return hc(*w.layer.post_attention_hc); });
+            out.final_hc = with_context("mtp/final_hc", [&] { return hc(*w.final_hc); });
+        }
         return out;
     }
 

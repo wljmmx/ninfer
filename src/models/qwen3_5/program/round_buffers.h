@@ -23,6 +23,10 @@ inline constexpr std::uint32_t kDFlashDecodeMaximumWidth  = kDFlashDecodeMaximum
 
 struct RoundStateSpec {
     std::int32_t hidden          = 0;
+    // Width of the tensors the proposal head reads: the draft block's single-stream sample. It equals
+    // `hidden` on every single-stream model; on a four-stream one `hidden` is the conditioning frame
+    // (the pre-final-mixer residual) and this stays the model's hidden size.
+    std::int32_t sample_hidden   = 0;
     std::int32_t output_rows     = 0;
     std::uint32_t batch_capacity = 1;
     std::uint32_t draft_window   = 0;
@@ -32,6 +36,10 @@ struct RoundStateSpec {
     // None - past the draft's trained range decode_raw submits those batches to the ordinary round.
     // Set from the same predicate the router and graphs.cpp use, so the three agree by construction.
     bool ordinary_fallback       = false;
+
+    [[nodiscard]] std::int32_t sample_width() const noexcept {
+        return sample_hidden > 0 ? sample_hidden : hidden;
+    }
 };
 
 struct PrefillRoundHost {
@@ -133,6 +141,7 @@ struct OrdinaryDecodeStateLayout {
 struct MtpPrefillStateLayout {
     TensorRegion position;
     TensorRegion ar_hidden;
+    TensorRegion ar_conditioning;
     TensorRegion draft_tokens;
     TensorRegion target_input_ids;
     TensorRegion target_positions;
@@ -157,7 +166,9 @@ struct MtpDecodeStateLayout {
     TensorRegion proposal_q;
     TensorRegion alignment_ids;
     TensorRegion alignment_hidden;
+    TensorRegion alignment_conditioning;
     TensorRegion ar_hidden;
+    TensorRegion ar_conditioning;
     TensorRegion next_hidden;
     TensorRegion ar_positions;
     TensorRegion ar_rope_positions;
@@ -228,6 +239,10 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
 struct MtpPrefillState {
     Tensor position;
     Tensor ar_hidden;
+    // The feature the next draft step conditions on. On the single-stream form it is the same
+    // tensor's contents; on a four-stream model it is the pre-final-mixer residual, which the head's
+    // sample cannot reproduce.
+    Tensor ar_conditioning;
     Tensor draft_tokens;
     Tensor target_input_ids;
     Tensor target_positions;
@@ -280,7 +295,11 @@ struct MtpDecodeState {
     Tensor proposal_q;
     Tensor alignment_ids;
     Tensor alignment_hidden;
+    // The alignment rectangle's conditioning frame: only the accepted column's residual is read, but
+    // it has to be produced for every candidate column because acceptance is decided afterwards.
+    Tensor alignment_conditioning;
     Tensor ar_hidden;
+    Tensor ar_conditioning;
     Tensor next_hidden;
     Tensor ar_positions;
     Tensor ar_rope_positions;

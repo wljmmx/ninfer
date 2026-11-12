@@ -16,20 +16,6 @@ std::uint64_t norm_width(const TextConfig& config) {
                      : std::uint64_t(config.hidden_size);
 }
 
-// The low-rank correction around one grouped norm. `inject` writes the streams back, which the
-// final correction does without: it feeds the head instead.
-HcWeights bind_hc(Bindings& b, const TextConfig& config, const std::string& p, bool inject) {
-    const auto& hc   = config.hc.value();
-    const auto width = hc.stream_width(config.hidden_size);
-    HcWeights out;
-    out.down = b.parameter(p + "down", {hc.lowrank, width}, {p + "normalized_streams"});
-    out.up   = b.parameter(p + "up", {width, hc.lowrank}, {p + "lowrank_activation"});
-    if (inject) {
-        out.inject = b.parameter(p + "inject", {hc.count, width}, {p + "normalized_streams"});
-    }
-    return out;
-}
-
 // The n-gram table is paged from disk and never resident, so its binding needs no device bytes.
 PleWeights bind_ple(Bindings& b, const TextConfig& config, const std::string& p) {
     const auto& ple    = config.ple.value();
@@ -47,6 +33,20 @@ PleWeights bind_ple(Bindings& b, const TextConfig& config, const std::string& p)
 }
 
 } // namespace
+
+// The low-rank correction around one grouped norm. `inject` writes the streams back, which the
+// final correction does without: it feeds the head instead.
+HcWeights bind_hc(Bindings& b, const TextConfig& config, const std::string& p, bool inject) {
+    const auto& hc   = config.hc.value();
+    const auto width = hc.stream_width(config.hidden_size);
+    HcWeights out;
+    out.down = b.parameter(p + "down", {hc.lowrank, width}, {p + "normalized_streams"});
+    out.up   = b.parameter(p + "up", {width, hc.lowrank}, {p + "lowrank_activation"});
+    if (inject) {
+        out.inject = b.parameter(p + "inject", {hc.count, width}, {p + "normalized_streams"});
+    }
+    return out;
+}
 
 AttentionWeights bind_attention(Bindings& b, const TextConfig& config, const std::string& p,
                                 bool indexed) {

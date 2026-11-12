@@ -478,11 +478,23 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
         if (options.vision) { out.vision = vision(companion(directory, "vision").config); }
         if (out.mtp) {
             const auto& config = companion(directory, "mtp").config;
-            require_members(config, {"architectures"}, {}, "MTP config");
-            if (architecture(config) != (out.text.architecture == Architecture::Qwen3_5Moe
-                                             ? "Qwen3_5MoeMTP"
-                                             : "Qwen3_5MTP")) {
-                throw ArtifactError("MTP architecture differs from target mathematics");
+            // The draft component states its own architecture and the source's structural hints; the
+            // block itself is described by the target's text config, so those hints are accepted
+            // without a consumer rather than silently dropped.
+            require_members(config, {"architectures"},
+                            {"model_type", "num_hidden_layers", "layer_types", "hybrid",
+                             "rope_theta", "mtp_use_hidden_state_from_layer",
+                             "mtp_use_dedicated_embeddings"},
+                            "MTP config");
+            // The draft head must be the same mathematics as the target: one Qwen3.5 block, one
+            // sparse-MoE block, or Qwen4Exp's four-stream HC/QSA block.
+            const std::string expected =
+                out.text.architecture == Architecture::Qwen3_5Moe ? "Qwen3_5MoeMTP"
+                : out.text.architecture == Architecture::Qwen4Exp ? "Qwen4ExpMTP"
+                                                                  : "Qwen3_5MTP";
+            if (architecture(config) != expected) {
+                throw ArtifactError("MTP architecture differs from target mathematics: expected " +
+                                    expected);
             }
         }
         if (options.speculative == SpeculativeBackend::DFlash ||

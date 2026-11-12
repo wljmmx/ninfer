@@ -223,12 +223,21 @@ struct MtpProjectionParameters {
 
 struct MtpParameters {
     LinearParameters input_projection;
+    // The artifact's own split stem (Qwen4Exp): x = fc_hidden(v) + fc_embedding(e). Present when the
+    // checkpoint keeps the two matrices apart - and required when the fused [h,2h] geometry has no
+    // registered kernel route, which is the 2560-wide case.
+    std::optional<LinearParameters> fc_embedding, fc_hidden;
     Tensor embedding_norm, hidden_norm, input_norm, post_attention_norm, final_norm;
     MtpProjectionParameters projection;
     Tensor query_norm, key_norm;
     LinearParameters output;
     FfnParameters ffn;
     LinearParameters output_head;
+    // Qwen4Exp's four-stream MTP head. The draft block is an ordinary HC block (its two corrections)
+    // and the head folds the four streams with the final correction instead of a final RMSNorm, so
+    // `final_norm` above aliases `final_hc/norm` exactly as the text stack's does. Absent on the
+    // Qwen3.5 single-stream form, whose fields above keep their original meaning.
+    std::optional<HcParameters> input_hc, post_attention_hc, final_hc;
 };
 
 struct NormParameters {

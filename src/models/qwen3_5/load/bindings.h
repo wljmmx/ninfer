@@ -53,6 +53,12 @@ public:
                                   std::vector<std::string> inputs = {},
                                   artifact::Residency residency   = artifact::Residency::Device);
 
+    // Whether the artifact carries a binding under this name. Used where one component has two
+    // legitimate layouts (a fused draft stem or the checkpoint's split pair).
+    [[nodiscard]] bool artifact_has(const std::string& binding) const {
+        return binder.contains(binding);
+    }
+
     // Qwen4Exp spells the activation each projection consumes in its own vocabulary: the mixer
     // reads `attention_input` where the engine says `mixer_input`, and the MoE reads `moe_input`
     // where it says `ffn_input`. Registering the pair keeps the logical name as the engine's
@@ -92,7 +98,10 @@ private:
 
 [[nodiscard]] AttentionWeights bind_attention(Bindings& bindings, const TextConfig& config,
                                               const std::string& prefix, bool indexed);
-[[nodiscard]] DenseWeights bind_dense(Bindings& bindings, std::uint64_t hidden,
+// Qwen4Exp's low-rank correction around one grouped stream norm. `inject` is false for the head's
+// final correction, which has no injection stream.
+[[nodiscard]] HcWeights bind_hc(Bindings& bindings, const TextConfig& config,
+                                const std::string& prefix, bool inject);[[nodiscard]] DenseWeights bind_dense(Bindings& bindings, std::uint64_t hidden,
                                       std::uint64_t intermediate, const std::string& prefix,
                                       bool draft = false);
 [[nodiscard]] BlockWeights bind_block(Bindings& bindings, const TextConfig& config,
