@@ -281,3 +281,33 @@ regressions: 0
   T124b 的本地 Q8 共享 GU tile 重挑（需先给该 op 建 bench）。
 
 ---
+
+## 附：greedy ids 依赖 `NINFER_EXPERT_CACHE_MB`（2026-11-12 实测）
+
+Qwen4Exp（`qwen3.8-flash-next`，h2560/e512/k10 的 gate/up/down 三分量专家）在
+`--spec none --greedy --print-token-ids`、同 prompt、同 `--max-context 8192 --kv-capacity 8192`、
+`--max-new 16`、同 RTX 4090 下，两档缓存给出的 ids 完全不同：
+
+| `NINFER_EXPERT_CACHE_MB` | 驻留专家 | ids |
+|---|---|---|
+| 14000 | 14112 / 73728 | `7755 49978 8565 82773 40716 75183 182707 97484 135309 97319 476 39240 102677 170750 6299 12174` |
+| 8192 | 8304 / 73728 | `821 172399 139242 488 248044`（第 5 枚即 eos 248044） |
+
+两档各自复跑一次都逐位复现，所以这不是竞态或非确定：它是缓存尺寸的**确定性函数**。
+
+代码层结论（`src/models/qwen3_5/execution/ffn.cpp:986–1035` 的容量口径、
+`:1036–1188` 的 split 执行体）：
+
+- 这一形态的**每一层**都可能拆成「设备半边 + 主机半边」（本工件两档都远未全驻留：
+  14112 与 8304 / 73728），两边各写一份 FP32 路由项，最后由
+  `residual_bf16 + host_term + device_term` 一次 RNE 合回 BF16 —— 设备合并版是
+  `ops::moe_merge_host_term`（`ffn.cpp:1139`），主机合并版在 `:1176–1182`。
+- 因此缓存大小改变的是**每层 top-k 路由和的结合顺序**：哪几条 route 落在哪个半边随驻留变化，
+  FP32 加法不满足结合律；两半又分别由不同内核算（设备分组 GEMM / CPU AVX2），同一条 route 的
+  k 累加次序也不同。`split_host_routed_ffn` 的注释（`:1034–1035`）说「主机半边必须给出设备半边
+  会给的值」，那是设计意图，**不是逐位保证**。
+- 合并后那一次 BF16 RNE 把末位差异放大成可选的 token：该模型 logits 平坦，实测第 1 枚就分叉。
+
+**裁决：属既定行为，不是 bug。** 逐位类基线（PPL 门禁、ids 对照、decode 哈希）必须钉死
+`NINFER_EXPERT_CACHE_MB`（以及任何改变专家驻留集合的开关，如 pool 上限/host 槽位），并在记录里
+写明该值；跨缓存档比较 ids 没有意义，跨档只能比分布类指标（KL / PPL 容差）。
