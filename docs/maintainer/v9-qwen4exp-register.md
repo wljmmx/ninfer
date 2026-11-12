@@ -493,8 +493,9 @@ T = 51（prompt "Hello" 的最后一个 prefill 块）。判据是「相对 max|
 
 **只改专家驻留容量就换掉整条贪婪链**，说明主路径的数值本身不可信；配合
 
-- **PPL**：`ninfer-perplexity --text <114 token 普通英文> --context 512 --stride 256` → **PPL 1.49389e+06**
-  （mean NLL 14.217 nats，`ln 248320 = 12.42`，即**比均匀分布还差**）；
+- **PPL**：`ninfer-perplexity --text <114 token 普通英文> --context 512 --stride 256` → **PPL 1.48457e+06**
+  （bf16 KV；fp8 KV 臂 1.49389e+06，两臂同量级）。mean NLL 14.217 nats，而 `ln 248320 = 12.42`，
+  即**比均匀分布还差**；
 - 生成文本是词形正确但语义不通的串（"clearhisgulirat's their Eroste_a(...) Michelin intake ..."）。
 
 在这两条下，「draft 与 target argmax 相同」不可能作为可判定的判据：target 的分布已退化到近均匀，
