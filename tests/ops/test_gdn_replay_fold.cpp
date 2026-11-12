@@ -798,6 +798,12 @@ int main() {
         for (int row = 0; row < 8; ++row) commits[row] = first + row;
         failures += run_case({36, 24, 5120, 8}, 16, 8, commits, 4400U + first, true);
     }
+    // Flash-Next hybrid (36 GDN layers, 16 Q/K heads, 48 V heads, 10240 conv channels).
+    failures += run_case({36, 48, 10240}, 2, 1, {2}, 5201U, true);
+    failures += run_case({36, 48, 10240}, 6, 2, {2, 5}, 5203U);
+    failures += run_case({36, 48, 10240}, 16, 8, {0, 1, 2, 3, 16, 7, 12, 5}, 5209U);
+    failures += run_case({36, 48, 10240}, 16, 8, {16, 15, 14, 13, 12, 11, 10, 9}, 5221U, true);
+    failures += run_case({36, 48, 10240}, 16, 1, {16}, 5237U, true);
     failures += run_record_fold_rounds();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_replay_fold\n";
     return failures == 0 ? 0 : 1;
