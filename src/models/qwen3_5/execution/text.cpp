@@ -2497,7 +2497,19 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     Tensor on = workspace::gdn_normalized_output(work_, config_, T)
                     .view({dimension(config_.gdn->linear_value_head_dim),
                            dimension(config_.gdn->linear_num_value_heads), T});
-    ops::silu_gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, ctx_.execution_view());
+    // The artifact names the output gate's activation. Qwen4Exp's text config carries
+    // `output_gate_type: sigmoid` and its reference (HF `Qwen4ExpTextRMSNormGated`, upstream
+    // execution/gdn.cpp) applies ACT2FN[output_gate_type] to the gate; the Qwen3.5 artifacts carry
+    // no such key and keep the SiLU gate this path shipped with. Reading the name here rather than
+    // assuming one form is what keeps a wrong gate from scaling every linear-attention layer.
+    if (config_.output_gate_type.empty() || config_.output_gate_type == "silu") {
+        ops::silu_gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, ctx_.execution_view());
+    } else if (config_.output_gate_type == "sigmoid") {
+        ops::sigmoid_gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, ctx_.execution_view());
+    } else {
+        throw std::invalid_argument("text/gdn: unsupported output_gate_type '" +
+                                    config_.output_gate_type + "'");
+    }
     nan_probe_tensor("gdn-recurrent-o",
                      o.view({dimension(config_.gdn->value_width()), T}), gidx, s);
     nan_probe_tensor("gdn-normed-on",
