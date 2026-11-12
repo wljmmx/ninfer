@@ -142,3 +142,100 @@ GGUF 验证、输入已与引擎导出逐字节相同，因此这一处要么是
    `program/program_impl.cpp`（+ 可能 `program/planning/startup.cpp`），本轮授权面外。
 3. **`--spec none` vs `--spec mtp` 的 ids 判据**：主路径修好前不可判定。
 4. 27B 同语料跑分未完成（进程在 `weights ready` 后退出）。
+
+## 9. 第二轮（2026-11-12 晚）：打分缺陷已修，`hc_mix` 嫌疑被否证
+
+### 9.1 `causal_score` 的 frame/hidden 混用（已修，PPL 1.09633e5 → 2.56558e5）
+
+**实现**（选"execution 侧第二出口"）
+
+- `program/execution_context.h`：`PrefillContext::head_sample`（默认 `nullptr`，最后一个字段）。
+- `execution/text.h|text.cpp`：`set_head_sample_output(Tensor*)`；`prefill_impl` 里
+  `sample = !streams ? xf : (head_sample_output_ ? matrix_window(*head_sample_output_, len)
+  : work_.alloc(...))`。
+- `program/planning/startup.{h,cpp}`：`PersistentLayout::score_sample`，仅当
+  `causal_scoring && frame_width != hidden` 时按 `[hidden, effective_prefill_chunk]` 建。
+- `program/program_impl.{h,cpp}`：绑定 `score_sample`，打分循环
+  `schedule_state.head_sample = &*score_sample`，列拷贝改从它取（同宽、连续，`source.bytes()`
+  不再跨列越界）。
+
+**为什么这样不破坏 MTP 帧**：`prefill_hidden` 仍是 `frame_width`(=10240) 的续接帧，MTP 的
+`mtp_prefill_chunk(…, xf, …)` 与 `residual → xf` 拷贝一行未改；只有调用方显式命名 `head_sample`
+时才把 head 的 2560 输出写进那块缓冲，生成路径（`nullptr`）保持原 scratch 分配，逐位不变
+（35B 同语料 PPL 9.61965 未变即证）。
+
+**为什么 program 侧"按 pitch 取列"不行**：`prefill_hidden` 的每列是 final mixer **之前**的四流
+residual，按 10240 pitch 取前 2560 列拿到的是 residual，不是打分要的 `final_hidden` 输出。上一轮
+"诊断补丁"给的 2.56558e5 正是读 residual 的值；本轮正规实现给出**同一个数**，说明打分链路现在
+读的是真 sample，而剩余误差不在打分。
+
+**改前/改后**：PPL 1.09633e5（NLL 11.6049）→ **2.56558e5**（NLL **12.4551**）。旧值来自错列/越界
+缓冲，属虚高；2.56558e5 是本目标当前**诚实**分数。
+
+### 9.2 `hc_mix` 与注入系数：上一轮"对不上"是复算侧布局误读（引擎正确）
+
+上一轮"用引擎自己的 `normalized` 复算 `hc_mix` 仍差 1.7×、注入 b 差 20+"已被推翻。原因是
+**把 `[10240, m]` 的 dump 当 `[m, 10240]` 读**（numpy 行主序默认最后一维连续）。引擎的连续维
+是特征、列是 token；`injection`、rank 激活、`product` 也都是 token-major。
+
+用正确布局复算 layer 0（同一次 dump，同一份工件权重）：
+
+| 量 | rel | corr |
+|---|---|---|
+| `attention_hc` mix vs 引擎 | **1.7e-3** | 1.00000 |
+| `attention_hc` injection vs 引擎 | **3e-4** | 1.00000 |
+| `moe_hc` mix vs 引擎 | **2.3e-3** | 1.00000 |
+| `moe_hc` injection vs 引擎 | **7e-4** | 1.00000 |
+| `final_hc` mix vs 引擎 `sample` | **1.7e-3** | — |
+
+另证 combine 恒等式 `respost = respre + injection·product` 在 L0/L1/L2/L3/L47 的两个 block 上
+rel 1.0e-3–1.7e-3（BF16 舍入级）。
+
+**权重形态确认**（对 `src/ops/gated_residual/mix/*`、`include/ninfer/ops/gated_residual.h`、
+HF `.temp/hf_qwen4_exp.py:995-1023`、上游 `qwen4_exp/execution/text.cpp:54-108` 逐项核对）：
+
+- 三个矩阵都是 `q5_g64_fp16 / row_split_k128_v1`：`down[320,10240]`、`inject[4,10240]`、
+  `up[10240,320]`；`down` 与 `inject` 是同一个 324 行对象的两段行区间（`weight/000000`），
+  `weight_row_planes` 按父几何给出各平面指针；实测三平面字节与工件逐字节相同（down/inject/up 全 True）。
+- `a = down·flatten(normalized)`，`u = silu(a/4)`，`g = up·u`（`up` 行序 `row=s*2560+d`），
+  `block_input = mean_s(σ(g[s*H+d])·normalized[s])`，`injection = 2σ(b/4)`；**没有** temperature、
+  没有 softmax 维度、没有 per-position 变体，`/4` 不折进权重。
+- 组合是 `x += injection·y`（无 offset），与 HF `hyper_input + injection.flatten(-2)` 一致。
+- 注入系数随深度增长是真的（L0 均值 0.007 → L47 均值 1.35–1.96），残差随之为 0.005 → 1.5；
+  上一轮"注入≈0 导致残差不积累"的推测不成立。
+
+### 9.3 剩余误差：最大三项与证据
+
+现状：PPL **2.56558e5**（mean NLL 12.4551）；同语料 35B **9.61965**（NLL 2.2638）。目标 ≤20 未达成。
+
+**证据 1（"置信地错"）**：把 dump 的 `sample`（2560 宽 final mixer 输出）用工件 head 重算，
+每列 logits 的熵均值 **8.96 nats**（均匀是 12.4229），max prob 均值 0.070；但真值 token 的 NLL
+是 12.455 —— 比自己的熵还差 3.5 nats，即模型输出了有形状、却稳定指向错误 token 的分布。
+
+**证据 2（尾部无罪）**：`sample` 与工件 `final_hc` 复算 rel 1.7e-3；head 形状 `[248320,2560]`、
+rms 0.0115、logits rms 2.39；48 层残差 rms 0.005→1.5、stream 间相关 0.69；无 NaN、无塌陷
+（列间余弦均值 0.164）。误差只能落在 48 层主干内部。
+
+**证据 3（仍有信号）**：熵 8.96 < ln V，说明不是"logits 全零/错位"，而是主干的语义算错。
+
+剩余最大三项（按嫌疑排序）：
+
+1. **GDN（36 层）**：本轮只修了输出门激活（sigmoid）。conv 状态沿列推进、`A_log/dt_bias` 的
+   decay、`q/k` L2 归一与前缀和、以及门的组合，都还没有"从 dump 的 block input 用工件 Q8 权重
+   复算整层"的对拍。
+2. **PLE（零基第 1 层）**：`ple_layer_ids=[1]`，窗口把该 chunk 的 ids 当历史；ids 与激活列的
+   对齐现在只能通过 `NINFER_PLE_OFF` 的"关掉更差"间接判定，还没有逐列对拍。
+3. **QSA（12 层）**：4:1 压缩 indexer 的选块集合、稀疏 GQA 的可见尾块、`sigmoid` 门控都未与
+   工件复算对拍；`NINFER_QSA_FORCE_FULL` 只能证明 indexer 不是唯一主因。
+
+**未做（不做虚报）**：`--spec none` vs `--spec mtp -d3` 的 ids 逐位一致 + accepted 50%+，以及
+14000/8192 两档 cache 的 ids 一致——主路径 PPL 未达标前这两条不可判定，按任务要求跳过。
+
+### 9.4 本轮回归
+
+| 项 | 结果 |
+|---|---|
+| `ctest -R "gdn\|qwen3_5_dense\|kv_capacity\|expert_cache\|softmax_attention\|bench_support\|mtp_stem"` | **19/19 通过**（5 个 dense 真机用例按设计 skip，需 `NINFER_TEST_ARTIFACT`） |
+| 35B 同语料 PPL | **9.61965**（NLL 2.263808，未变） |
+| 本目标 PPL（14000 / bf16 KV / ctx512 stride256） | **2.56558e5**（NLL 12.455110） |
+| 探针 | 临时 dump 与权重平面导出全部删净；`git diff` 只剩打分出口与文档 |
