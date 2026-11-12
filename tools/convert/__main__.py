@@ -163,6 +163,9 @@ def main(argv=None):
     components = tuple(args.components.split(","))
     if len(components) != len(set(components)):
         raise ValueError("components must not repeat")
+    if args.mtp_gguf is not None and "mtp" not in components:
+        # A named draft source is the component: asking for it is enough.
+        components = (*components, "mtp")
     gguf_extra = set(components) - {"text", "mtp"} if Path(args.model).suffix.lower() == ".gguf" else set()
     if gguf_extra or (Path(args.model).suffix.lower() == ".gguf" and "mtp" in components
                       and args.mtp_gguf is None):
@@ -170,8 +173,8 @@ def main(argv=None):
             "a .gguf source converts the text component, plus mtp when --mtp-gguf names the draft "
             "head (vision ships as a separate mmproj)"
         )
-    if args.mtp_gguf is not None and "mtp" not in components:
-        raise ValueError("--mtp-gguf requires --components text,mtp")
+    if args.mtp_gguf is None and "mtp" in components and Path(args.model).suffix.lower() == ".gguf":
+        raise ValueError("a .gguf source has no draft head; pass --mtp-gguf with the MTP GGUF")
     paths = _pairs(args.source, "source")
     if "base" in paths:
         raise ValueError("select the base source with --model")

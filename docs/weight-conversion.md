@@ -86,11 +86,10 @@ python -m tools.convert \
   --out models/qwen3_8_flash_next.ninfer
 ```
 
-`--components text,mtp` with a source present is the only accepted form; naming `--mtp-gguf` is
-what produces the component, and the text side is converted exactly as it would be without it.
-`GGUFSource.for_mtp` presents the draft block as the HF `mtp.*` names the builder reads and derives
-its geometry from the target's `text_config` (the MTP GGUF's own `block_count` is never read as a
-text layer count).
+Naming `--mtp-gguf` is what produces the component (it adds `mtp` to `--components` when it is not
+given), and the text side is converted exactly as it would be without it. `GGUFSource.for_mtp`
+presents the draft block as the HF `mtp.*` names the builder reads and derives its geometry from the
+target's `text_config` (the MTP GGUF's own `block_count` is never read as a text layer count).
 
 Mapping notes specific to the draft head:
 
