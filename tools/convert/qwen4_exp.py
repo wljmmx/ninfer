@@ -134,8 +134,11 @@ def bank_source(store, name, shape, role):
 
 
 class Builder:
-    def __init__(self, model, base, cfg):
+    def __init__(self, model, base, cfg, store=None):
         self.model, self.base, self.cfg = model, base, cfg
+        # One component may read a different store than the checkpoint the build started from: a
+        # standalone MTP GGUF carries the draft head's tensors alone.
+        self.store = store if store is not None else base
         self.consumed = set()
 
     def add(
@@ -184,7 +187,7 @@ class Builder:
             Parameter(
                 name,
                 shape,
-                factory(self.base),
+                factory(self.store),
                 source_factory=factory,
                 inputs=tuple(inputs),
                 direct_format=direct,
@@ -370,7 +373,7 @@ class Builder:
                 s + "mlp.experts." + ("down_proj" if role == "down" else "gate_up_proj")
             )
             self.consumed.add(source)
-            ref = bank_source(self.base, source, shape, role)
+            ref = bank_source(self.store, source, shape, role)
             inp = p + "moe/experts/product" if role == "down" else p + "moe_input"
             name = p + "moe/experts/" + role
             self.model.add(
@@ -401,11 +404,11 @@ class Builder:
             s + f"ple.ple_embedding.ngram_embedding.shard_{j}.weight"
             for j in range(self.cfg["split_ngram_parts"])
         ]
-        shard_shape = self.base.describe(names[0]).shape
+        shard_shape = self.store.describe(names[0]).shape
         for name in names:
             if (
-                self.base.describe(name).shape != shard_shape
-                or self.base.describe(name).dtype != "BF16"
+                self.store.describe(name).shape != shard_shape
+                or self.store.describe(name).dtype != "BF16"
             ):
                 raise ValueError("inconsistent PLE shards")
         width = prod(shard_shape)
@@ -416,7 +419,7 @@ class Builder:
                 j, local = divmod(begin, width)
                 stop = min(end, (j + 1) * width)
                 chunks.append(
-                    self.base.read_flat(names[j], local, local + stop - begin)
+                    self.store.read_flat(names[j], local, local + stop - begin)
                 )
                 begin = stop
             return torch.cat(chunks) if chunks else torch.empty(0, dtype=torch.bfloat16)
@@ -441,11 +444,11 @@ class Builder:
             ),
         ]:
             name = s + "ple.ple_embedding." + role
-            info = self.base.describe(name)
+            info = self.store.describe(name)
             if info.dtype != "I64" or info.shape != (n,):
                 raise ValueError(f"{name}: invalid hash control")
             controls.append(
-                self.base.read_flat(name).view(torch.uint8).numpy().tobytes()
+                self.store.read_flat(name).view(torch.uint8).numpy().tobytes()
             )
             self.consumed.add(name)
         rid = "resource/text/ple_hash_controls"
@@ -527,7 +530,7 @@ class Builder:
 
 
 def build_model(
-    base, *, components=("text",), companions=None, resource_overrides=None
+    base, *, components=("text",), companions=None, resource_overrides=None, mtp_source=None
 ):
     selected = set(components)
     if "text" not in selected or selected - {"text", "vision", "mtp"}:
@@ -590,7 +593,11 @@ def build_model(
         "text/output_head",
         "lm_head.weight",
         (cfg["vocab_size"], h),
-        inputs=("text/final_hidden",),
+        # The draft head shares this LM head, so the artifact must carry the Use the MTP path
+        # declares for it (load/text.cpp bind_text adds exactly this input for a speculative build).
+        inputs=("text/final_hidden", "mtp/final_hidden")
+        if "mtp" in selected
+        else ("text/final_hidden",),
     )
     b.hc("text/final_hc/", "model.language_model.hyper_connection_mixer.", False)
     for l, kind in enumerate(cfg["layer_types"]):
@@ -606,39 +613,30 @@ def build_model(
         if l in cfg["ple_layer_ids"]:
             b.ple(p, s)
     if "mtp" in selected:
-        for role, target in [
-            ("token_embedding", "text/token_embedding"),
-            ("output_head", "text/output_head"),
-        ]:
-            original = model.parameters[target]
-            model.add(
-                Parameter(
-                    "mtp/" + role,
-                    original.shape,
-                    original.source,
-                    inputs=("mtp/final_hidden",) if role == "output_head" else (),
-                    residency="mtp",
-                )
-            )
-        b.hc("mtp/final_hc/", "mtp.hyper_connection_mixer.", False)
+        # The draft head's own parameters. The engine reuses the text component's token embedding and
+        # LM head (`load/mtp.cpp`), so neither is emitted here: a private copy would store the same
+        # BF16 words twice (about 1.3 GB at this vocabulary). `mtp_source` is the standalone MTP GGUF
+        # when the checkpoint ships the head separately.
+        mtp_builder = Builder(model, base, cfg, store=mtp_source) if mtp_source else b
+        # The draft stem is two [h,h] projections: llama.cpp's fused `eh_proj` [h,2h] has no
+        # registered kernel geometry in this engine, and the source's own mathematics is
+        # x = fc_hidden(v) + fc_embedding(e) anyway.
+        mtp_builder.add("mtp/fc_embedding", "mtp.fc_embedding.weight", (h, h),
+                        inputs=("mtp/normalized_embedding",))
+        mtp_builder.add("mtp/fc_hidden", "mtp.fc_hidden.weight", (h, h),
+                        inputs=("mtp/normalized_hidden",))
+        mtp_builder.hc("mtp/final_hc/", "mtp.hyper_connection_mixer.", False)
         for role, field, n in [
-            ("pre_fc_embedding_norm", "pre_fc_norm_embedding", h),
-            ("pre_fc_hidden_norm", "pre_fc_norm_hidden", h * cfg["hc_count"]),
+            ("embedding_norm", "pre_fc_norm_embedding", h),
+            ("hidden_norm", "pre_fc_norm_hidden", h * cfg["hc_count"]),
         ]:
-            b.add("mtp/" + role, "mtp." + field + ".weight", (n,))
-        for role, inp in [
-            ("fc_embedding", "normalized_embedding"),
-            ("fc_hidden", "normalized_hidden_streams"),
-        ]:
-            b.add(
-                "mtp/" + role, "mtp." + role + ".weight", (h, h), inputs=("mtp/" + inp,)
-            )
+            mtp_builder.add("mtp/" + role, "mtp." + field + ".weight", (n,))
         p = "mtp/layers/0/"
         s = "mtp.layers.0."
-        b.hc(p + "attention_hc/", s + "attn_hyper_connection.")
-        b.hc(p + "moe_hc/", s + "mlp_hyper_connection.")
-        b.qsa(p, s, True)
-        b.moe(p, s)
+        mtp_builder.hc(p + "attention_hc/", s + "attn_hyper_connection.")
+        mtp_builder.hc(p + "moe_hc/", s + "mlp_hyper_connection.")
+        mtp_builder.qsa(p, s, True)
+        mtp_builder.moe(p, s)
     if "vision" in selected:
         b.vision(records["vision"]["config"])
     expected = {
@@ -651,4 +649,15 @@ def build_model(
         raise ValueError(
             f"Qwen4Exp source coverage differs: missing {sorted(expected-b.consumed)}, extra {sorted(b.consumed-expected)}"
         )
+    if mtp_source is not None and "mtp" in selected:
+        # The draft GGUF also carries the token embedding and the output head, which the engine takes
+        # from the text component instead; every other tensor of the head must be consumed here.
+        ignored = {"token_embd.weight", "output.weight"}
+        expected_mtp = set(mtp_source.weight_map) - ignored
+        if mtp_builder.consumed != expected_mtp:
+            raise ValueError(
+                "Qwen4Exp MTP source coverage differs: missing "
+                f"{sorted(expected_mtp-mtp_builder.consumed)}, extra "
+                f"{sorted(mtp_builder.consumed-expected_mtp)}"
+            )
     return model

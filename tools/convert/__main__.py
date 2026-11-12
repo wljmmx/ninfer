@@ -13,7 +13,7 @@ from .official_recipes import RECIPES
 from .pipeline import convert
 from .proposal import DEFAULT_RANKING, add_official_proposal
 from . import qwen3_5, qwen4_exp
-from .gguf_qwen4exp import open_source as open_gguf_source
+from .gguf_qwen4exp import GGUFSource, open_source as open_gguf_source
 from .recipe import Recipe
 from .sources.safetensors import SafetensorsSource
 
@@ -157,15 +157,21 @@ def main(argv=None):
                         help="config.json sidecar for a .gguf input")
     parser.add_argument("--gguf-root", type=Path,
                         help="resource directory for a .gguf input (defaults to its folder)")
+    parser.add_argument("--mtp-gguf", type=Path,
+                        help="standalone MTP GGUF (llama.cpp --nextn head) added as the mtp component")
     args = parser.parse_args(argv)
     components = tuple(args.components.split(","))
     if len(components) != len(set(components)):
         raise ValueError("components must not repeat")
-    if Path(args.model).suffix.lower() == ".gguf" and components != ("text",):
+    gguf_extra = set(components) - {"text", "mtp"} if Path(args.model).suffix.lower() == ".gguf" else set()
+    if gguf_extra or (Path(args.model).suffix.lower() == ".gguf" and "mtp" in components
+                      and args.mtp_gguf is None):
         raise ValueError(
-            "a .gguf source converts the text component only (vision ships as a separate "
-            "mmproj and MTP has its own conversion); use --components text"
+            "a .gguf source converts the text component, plus mtp when --mtp-gguf names the draft "
+            "head (vision ships as a separate mmproj)"
         )
+    if args.mtp_gguf is not None and "mtp" not in components:
+        raise ValueError("--mtp-gguf requires --components text,mtp")
     paths = _pairs(args.source, "source")
     if "base" in paths:
         raise ValueError("select the base source with --model")
@@ -178,11 +184,22 @@ def main(argv=None):
         companions = {
             key: sources[key] for key in ("dflash", "dflash2") if key in components
         }
+        extra_builder = {}
+        if args.mtp_gguf is not None:
+            arch = [str(item) for item in (base.config.get("architectures") or [])]
+            if not any(item.startswith("Qwen4Exp") for item in arch):
+                raise ValueError("--mtp-gguf is implemented for the Qwen4Exp draft head")
+            extra_builder["mtp_source"] = GGUFSource.for_mtp(
+                args.mtp_gguf, base.config["text_config"],
+                root=args.gguf_root or args.model.parent,
+            )
+            stack.callback(extra_builder["mtp_source"].close)
         model = _builder(base.config)(
             base,
             components=components,
             companions=companions,
             resource_overrides=overrides,
+            **extra_builder,
         )
         recipe = Recipe(model)
         _function(args.recipe)(model, recipe, sources)

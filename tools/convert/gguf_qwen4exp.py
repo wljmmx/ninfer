@@ -112,6 +112,34 @@ class _Rows(View):
         return block[low : low + (end - begin)]
 
 
+class _Cols(View):
+    """Columns [start, start+cols) of a matrix, row by row."""
+
+    def __init__(self, inner: View, start: int, cols: int, total: int | None = None) -> None:
+        if len(inner.shape) != 2:
+            raise ValueError("column selection requires a matrix")
+        self.inner = inner
+        self.start = start
+        self.cols = cols
+        self.total = int(total if total is not None else inner.shape[1])
+        if start < 0 or cols <= 0 or start + cols > self.total:
+            raise ValueError("column range is outside the matrix")
+        self.shape = (int(inner.shape[0]), cols)
+        self.dtype = inner.dtype
+
+    def read(self, begin: int, end: int) -> np.ndarray:
+        if begin == end:
+            return _empty(self.dtype)
+        first = begin // self.cols
+        last = (end - 1) // self.cols + 1
+        rows = self.inner.read(first * self.total, last * self.total).reshape(
+            last - first, self.total
+        )
+        block = rows[:, self.start : self.start + self.cols].reshape(-1)
+        low = begin - first * self.cols
+        return block[low : low + (end - begin)]
+
+
 class _ConcatRows(View):
     """Row-wise concatenation of views; each part contributes whole rows."""
 
@@ -308,6 +336,29 @@ class GGUFSource:
         self._attach_ple_table()
         self.weight_map = {name: name for name in self._views}
 
+    @classmethod
+    def for_mtp(cls, path: str | Path, text_config: dict, *,
+                root: str | Path | None = None) -> "GGUFSource":
+        """A standalone MTP GGUF presented as HF `mtp.*` names.
+
+        llama.cpp writes the next-token-prediction head as one extra block (`blk.<block_count-1>`,
+        with the `nextn.*` tensors) plus a copy of the token embedding and the output head. `block_count`
+        therefore counts that block, so reading the file as a text model would invent `block_count`
+        text layers and find neither PLE nor GDN geometry. This view exposes only the draft head,
+        under the target's own derived geometry, and deliberately omits `token_embd`/`output`: the
+        engine reuses the text component's embedding and LM head, so keeping them would store ~1.3 GB
+        of the same BF16 words twice.
+        """
+        source = cls.__new__(cls)
+        source.path = Path(path)
+        source.file = open_gguf(source.path)
+        source.config = {"text_config": dict(text_config)}
+        source.root = Path(root) if root else source.path.parent
+        source._views = {}
+        source._build_mtp_views()
+        source.weight_map = {name: name for name in source._views}
+        return source
+
     # -- lifecycle ------------------------------------------------------
     def close(self) -> None:
         self.file.close()
@@ -428,7 +479,6 @@ class GGUFSource:
             down_name = prefix + "ffn_down_exps.weight"
             if self._has(down_name):
                 self._add(target + "mlp.experts.down_proj", self._direct(down_name))
-
             if linear:
                 self._gdn(prefix, target, cfg, tiled, nk, nv, dk, dv)
             else:
@@ -457,6 +507,92 @@ class GGUFSource:
             if self._has(prefix + inject + ".weight"):
                 self._add(target + "block_inject_weight.weight",
                           self._direct(prefix + inject + ".weight"))
+
+    def _moe(self, prefix: str, target: str, cfg: dict, hidden: int) -> None:
+        """The routed/shared FFN of one block, in the HF spelling `qwen4_exp.Builder.moe` reads."""
+        experts = cfg["num_experts"]
+        inter = cfg["moe_intermediate_size"]
+        for gguf_name, suffix in (
+            ("ffn_gate_inp", "mlp.gate"),
+            ("ffn_gate_inp_shexp", "mlp.shared_expert_gate"),
+            ("ffn_gate_shexp", "mlp.shared_expert.gate_proj"),
+            ("ffn_up_shexp", "mlp.shared_expert.up_proj"),
+            ("ffn_down_shexp", "mlp.shared_expert.down_proj"),
+        ):
+            if self._has(prefix + gguf_name + ".weight"):
+                view = self._direct(prefix + gguf_name + ".weight")
+                if suffix == "mlp.shared_expert_gate" and len(view.shape) == 1:
+                    # llama.cpp stores this router bias as a vector; the builder wants the 1xH
+                    # matrix the HF checkpoint carries.
+                    view = _Reshape(view, (1, view.shape[0]))
+                self._add(target + suffix + ".weight", view)
+        fused_name = prefix + "ffn_gate_up_exps.weight"
+        gate_name = prefix + "ffn_gate_exps.weight"
+        up_name = prefix + "ffn_up_exps.weight"
+        if self._has(fused_name) or (self._has(gate_name) and self._has(up_name)):
+            self._add(target + "mlp.experts.gate_up_proj",
+                      _FusedExperts(
+                          self._direct(fused_name) if self._has(fused_name) else None,
+                          self._direct(gate_name) if self._has(gate_name) else None,
+                          self._direct(up_name) if self._has(up_name) else None,
+                          experts, inter, hidden,
+                      ))
+        down_name = prefix + "ffn_down_exps.weight"
+        if self._has(down_name):
+            self._add(target + "mlp.experts.down_proj", self._direct(down_name))
+
+    def _build_mtp_views(self) -> None:
+        cfg = self.config["text_config"]
+        hidden = int(cfg["hidden_size"])
+        block = None
+        for name in self.file.tensors:
+            if name.endswith(".nextn.eh_proj.weight"):
+                block = name.rsplit(".nextn.", 1)[0]
+                break
+        if block is None:
+            raise ValueError(f"{self.path}: GGUF carries no nextn draft block")
+        prefix = block + "."
+        target = "mtp.layers.0."
+        self._hc_pair(prefix, target + "attn_hyper_connection.", hidden, cfg,
+                      down="hc_attn_down", up="hc_attn_up", norm="hc_attn_norm",
+                      inject="hc_attn_inject", merged="hc_attn_down_inject")
+        self._hc_pair(prefix, target + "mlp_hyper_connection.", hidden, cfg,
+                      down="hc_ffn_down", up="hc_ffn_up", norm="hc_ffn_norm",
+                      inject="hc_ffn_inject", merged="hc_ffn_down_inject")
+        self._qsa(prefix, target, cfg)
+        self._moe(prefix, target, cfg, hidden)
+        # eh_proj is the fused [h,2h] matrix of the HF pair: llama.cpp writes one parent, the HF
+        # checkpoint (and the engine's stem, whose registered kernels stop at [h,h]) keeps
+        # fc_embedding over columns [0,h) and fc_hidden over [h,2h).
+        for gguf_name, suffix, start in (
+            ("nextn.eh_proj", "fc_embedding", 0),
+            ("nextn.enorm", "pre_fc_norm_embedding", None),
+            ("nextn.hnorm", "pre_fc_norm_hidden", None),
+        ):
+            if not self._has(prefix + gguf_name + ".weight"):
+                raise ValueError(f"{self.path}: {prefix}{gguf_name}.weight is missing; the draft "
+                                 "head needs its whole stem")
+            view = self._direct(prefix + gguf_name + ".weight")
+            if suffix == "fc_embedding":
+                fused = self._direct(prefix + "nextn.eh_proj.weight")
+                if len(fused.shape) != 2 or fused.shape[1] != 2 * hidden:
+                    raise ValueError(f"{self.path}: {prefix}nextn.eh_proj.weight is not [h,2h]")
+                self._add("mtp.fc_embedding.weight", _Cols(fused, 0, hidden, 2 * hidden))
+                self._add("mtp.fc_hidden.weight", _Cols(fused, hidden, hidden, 2 * hidden))
+                continue
+            self._add(f"mtp.{suffix}.weight", view)
+        # The head's final correction is the same norm+pair shape a block carries, without an
+        # injection stream.
+        for gguf_name, suffix in (
+            ("nextn.hc_head_norm", "hc_norm"),
+            ("nextn.hc_head_down", "input_mix_weight_down"),
+            ("nextn.hc_head_up", "input_mix_weight_up"),
+        ):
+            if not self._has(prefix + gguf_name + ".weight"):
+                raise ValueError(f"{self.path}: {prefix}{gguf_name}.weight is missing; the draft "
+                                 "head needs its final hyper-connection mixer")
+            self._add(f"mtp.hyper_connection_mixer.{suffix}.weight",
+                      self._direct(prefix + gguf_name + ".weight"))
 
     def _qsa(self, prefix: str, target: str, cfg: dict) -> None:
         hidden = cfg["hidden_size"]
@@ -690,6 +826,13 @@ def build_config(file: GGUFFile, sidecar: Path | None) -> dict:
     compression ratio, vision/mtp subtrees) comes from the optional sidecar config.json. A field
     neither source supplies is a refusal - never a default that would silently change the math.
     """
+    for name in file.tensors:
+        if name.endswith(".nextn.eh_proj.weight"):
+            raise ValueError(
+                f"{file.path}: this GGUF carries llama.cpp's next-token-prediction head "
+                f"({name.rsplit('.nextn.', 1)[0]}); its block_count counts the draft block, so it "
+                "is not a text checkpoint - pass it with --mtp-gguf instead"
+            )
     arch = str(file.get("general.architecture", ""))
     if arch and arch != _TEXT_ARCH:
         raise ValueError(

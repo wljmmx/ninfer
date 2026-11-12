@@ -33,6 +33,10 @@ def _optional(model, recipe):
                 format = Q5
             _assign(recipe, name, format)
         elif name.startswith(("mtp/", "dflash/", "dflash2/")):
+            if name in ("mtp/fc_embedding", "mtp/fc_hidden"):
+                # The draft stem's two [h,h] matrices stay bf16, as the checkpoint keeps them: the
+                # linear shape registry has [2560,2560] in bf16 only, and no [2560,5120] at all.
+                continue
             if name.endswith(
                 (
                     "/moe/router",
@@ -187,8 +191,17 @@ def qwen4_exp(model, recipe, sources):
     _optional(model, recipe)
     _assign(recipe, "text/token_embedding", Q8)
     _assign(recipe, "text/output_head", Q8)
+    # The draft head follows the text rules verbatim. It must: the HC mix Op admits only
+    # Q5_G64_FP16 row-split planes, so an unassigned `.../attention_hc/down` would be stored at a
+    # width the runtime refuses by name rather than a merely larger one.
     for name, parameter in model.parameters.items():
-        if not name.startswith("text/") or (not parameter.projection and "/ple/table" not in name):
+        if not name.startswith(("text/", "mtp/")) or (
+            not parameter.projection and "/ple/table" not in name
+        ):
+            continue
+        if name in ("mtp/fc_embedding", "mtp/fc_hidden"):
+            # bf16: these are the draft stem's two [h,h] projections, and bf16 is the only
+            # registered [2560,2560] route (the checkpoint keeps them unquantized too).
             continue
         if name.endswith(
             ("/gdn/a_projection", "/gdn/b_projection", "/moe/router", "/moe/shared_score")
