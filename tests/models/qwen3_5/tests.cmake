@@ -1,3 +1,12 @@
+# The four-stream MTP stem's staging buffers, at T = 1, 2 and 5: the per-stream projection's input
+# and output are [h, T] contiguous (a projection refuses anything else), while the [2h, T] pack's
+# first half is contiguous only at T == 1 - that alias is what the split arm used to project into,
+# which is why `--spec mtp` failed on every prefill chunk and not on a one-token decode step.
+# Host-only, no GPU, no artifact.
+ninfer_add_test(ninfer_qwen3_5_mtp_stem_layout_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mtp_stem_layout.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_core)
+
 ninfer_add_test(ninfer_qwen3_5_loading_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loading_real.cpp"
   LIBRARIES ninfer_model_loading)

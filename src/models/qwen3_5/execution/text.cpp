@@ -697,12 +697,16 @@ void TextContext::mtp_hc_stem(const Tensor& ids, const Tensor& hidden,
         {
             auto scope = work_.scope();
             if (split_stem) {
-                Tensor stream_out = roots.packed_input.slice(0, 0, hidden_width);
-                project(roots.stream_input, *mtp_->fc_hidden, stream_out, work_, s);
-                ops::residual_add(embedding_term, stream_out, s);
+                // The per-stream term is the projection's OUTPUT, so it needs a contiguous [h,T]:
+                // the packed [2h,T] buffer's first half is a strided view (row pitch 2h) and
+                // `linear` refuses it once T>1, while at T==1 its single row happens to be
+                // contiguous and the alias looked correct. `input` is that contiguous buffer: the
+                // fold at the end of the stem is the only writer of it, and it runs after the loop.
+                project(roots.stream_input, *mtp_->fc_hidden, roots.input, work_, s);
+                ops::residual_add(embedding_term, roots.input, s);
                 CUDA_CHECK(cudaMemcpy2DAsync(
                     static_cast<char*>(roots.residual.data) + std::size_t(stream) * row, pitch,
-                    stream_out.data, row, row, T, cudaMemcpyDeviceToDevice, s));
+                    roots.input.data, row, row, T, cudaMemcpyDeviceToDevice, s));
             } else {
                 ops::mtp_pack_fc_input(roots.normalized_embedding, roots.stream_input,
                                        roots.packed_input, s);
@@ -715,11 +719,14 @@ void TextContext::mtp_hc_stem(const Tensor& ids, const Tensor& hidden,
     }
 
     // The block's own grouped offset norm of those four streams, then the attention correction's fold
-    // to the single-stream block input and its four injection coefficients.
-    ops::hc_grouped_rmsnorm(roots.residual, mtp_->input_norm.view({hidden_width, streams}),
-                            config_.rms_norm_eps, roots.normalized, ctx_.execution_view());
-    ops::hc_mix(roots.normalized.view({hidden_width, streams, T}),
-                mtp_->input_hc->block_form(), work_, roots.input, roots.injection,
+    // to the single-stream block input and its four injection coefficients. The two planes are
+    // [h*count, T] row-major, which is the [h, count, T] geometry the HC ops take - the view is the
+    // same bytes, not a re-layout.
+    Tensor residual   = roots.residual.view({hidden_width, streams, T});
+    Tensor normalized = roots.normalized.view({hidden_width, streams, T});
+    ops::hc_grouped_rmsnorm(residual, mtp_->input_norm.view({hidden_width, streams}),
+                            config_.rms_norm_eps, normalized, ctx_.execution_view());
+    ops::hc_mix(normalized, mtp_->input_hc->block_form(), work_, roots.input, roots.injection,
                 ctx_.execution_view());
 }
 
@@ -731,6 +738,9 @@ void TextContext::mtp_hc_tail(workspace::MtpHcRoots& roots, const Tensor& positi
     const int T             = roots.residual.ne[1];
     const auto hidden_width = dimension(config_.hidden_size);
     const auto streams      = dimension(config_.hc->count);
+    // The HC ops take the [h, count, T] geometry; the stem allocated the same bytes as [h*count, T].
+    Tensor residual   = roots.residual.view({hidden_width, streams, T});
+    Tensor normalized = roots.normalized.view({hidden_width, streams, T});
 
     const auto projection = workspace::mtp_attention_projection(work_, config_, T);
     Tensor q              = projection.query.view({dimension(config_.attention->head_dim),
@@ -804,24 +814,22 @@ void TextContext::mtp_hc_tail(workspace::MtpHcRoots& roots, const Tensor& positi
     // next fold. This is exactly the text block's mixer sequence (text.cpp run_layers).
     project(a.view({dimension(config_.attention->query_width()), T}), mtp_->output, roots.product,
             work_, s);
-    ops::hc_combine_norm(roots.residual, roots.product, roots.injection,
+    ops::hc_combine_norm(residual, roots.product, roots.injection,
                          mtp_->post_attention_norm.view({hidden_width, streams}),
-                         config_.rms_norm_eps, roots.residual, roots.normalized,
-                         ctx_.execution_view());
-    ops::hc_mix(roots.normalized.view({hidden_width, streams, T}),
-                mtp_->post_attention_hc->block_form(), work_, roots.input, roots.injection,
-                ctx_.execution_view());
+                         config_.rms_norm_eps, residual, normalized, ctx_.execution_view());
+    ops::hc_mix(normalized, mtp_->post_attention_hc->block_form(), work_, roots.input,
+                roots.injection, ctx_.execution_view());
 
     CUDA_CHECK(cudaMemsetAsync(roots.product.data, 0, roots.product.bytes(), s));
     {
         auto post_mixer_scope = work_.scope();
         ffn(roots.input, mtp_->ffn, roots.product, {}, work_, ctx_.execution_view(), true);
     }
-    ops::hc_combine_norm(roots.residual, roots.product, roots.injection,
+    ops::hc_combine_norm(residual, roots.product, roots.injection,
                          mtp_->final_norm.view({hidden_width, streams}), config_.rms_norm_eps,
-                         roots.residual, roots.normalized, ctx_.execution_view());
-    ops::hc_mix(roots.normalized.view({hidden_width, streams, T}),
-                mtp_->final_hc->final_form(), work_, mtp_hidden, ctx_.execution_view());
+                         residual, normalized, ctx_.execution_view());
+    ops::hc_mix(normalized, mtp_->final_hc->final_form(), work_, mtp_hidden,
+                ctx_.execution_view());
     // The next draft step conditions on the pre-final-mixer residual, which is the model's second
     // tail feature; the head's 2560-wide sample cannot produce it.
     if (conditioning != nullptr && conditioning->data != nullptr) {
@@ -1178,15 +1186,16 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
 
         if (hc) {
             const auto streams = dimension(config_.hc->count);
+            // Same [h, count, 1] view of the column buffers the beam copy above filled.
+            Tensor residual   = tail_column.residual.view({width, streams, 1});
+            Tensor normalized = tail_column.normalized.view({width, streams, 1});
             project(a.view({dimension(config_.attention->query_width()), 1}), mtp_->output,
                     tail_column.product, work_, s);
-            ops::hc_combine_norm(tail_column.residual, tail_column.product,
-                                 tail_column.injection,
+            ops::hc_combine_norm(residual, tail_column.product, tail_column.injection,
                                  mtp_->post_attention_norm.view({width, streams}),
-                                 config_.rms_norm_eps, tail_column.residual,
-                                 tail_column.normalized, ctx_.execution_view());
-            ops::hc_mix(tail_column.normalized.view({width, streams, 1}),
-                        mtp_->post_attention_hc->block_form(), work_, tail_column.input,
+                                 config_.rms_norm_eps, residual, normalized,
+                                 ctx_.execution_view());
+            ops::hc_mix(normalized, mtp_->post_attention_hc->block_form(), work_, tail_column.input,
                         tail_column.injection, ctx_.execution_view());
             CUDA_CHECK(cudaMemsetAsync(tail_column.product.data, 0, tail_column.product.bytes(), s));
             {
@@ -1194,12 +1203,10 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
                 ffn(tail_column.input, mtp_->ffn, tail_column.product, {}, work_,
                     ctx_.execution_view(), true);
             }
-            ops::hc_combine_norm(tail_column.residual, tail_column.product,
-                                 tail_column.injection, mtp_->final_norm.view({width, streams}),
-                                 config_.rms_norm_eps, tail_column.residual,
-                                 tail_column.normalized, ctx_.execution_view());
-            ops::hc_mix(tail_column.normalized.view({width, streams, 1}),
-                        mtp_->final_hc->final_form(), work_, *final_hidden,
+            ops::hc_combine_norm(residual, tail_column.product, tail_column.injection,
+                                 mtp_->final_norm.view({width, streams}), config_.rms_norm_eps,
+                                 residual, normalized, ctx_.execution_view());
+            ops::hc_mix(normalized, mtp_->final_hc->final_form(), work_, *final_hidden,
                         ctx_.execution_view());
             if (conditioning != nullptr && conditioning->data != nullptr) {
                 if (conditioning->numel() != tail_column.residual.numel()) {
