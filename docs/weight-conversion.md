@@ -146,13 +146,15 @@ rather than of the component's tensors:
   The same tuple is listed twice and the two lists must agree — `is_registered_fold_geometry` in
   `replay.cpp` is the start-up check and the dispatch in `recurrent.cu` is the launch, which throws
   `unregistered geometry` if it is reached with a tuple the check let through. Only the tuples the
-  build instantiates are usable (`(48,16,48,10240)`, `(30,16,32,8192)`, `(36,8,24,5120)` today).
-  A hybrid target whose linear layers do not match one of them, e.g. 36 linear layers that keep the
-  16/48/10240 head geometry, is refused at start-up (`gdn_replay_fold: unsupported record
-  geometry`) with `--spec mtp`, while `--spec none` is unaffected because it never builds replay
-  records. Registering another shape is a kernel instantiation plus a dispatch branch, i.e. a build
-  change, and the conv channels are `2·key_width + value_width`, not `2·hidden`, so the same head
-  geometry at a narrower hidden width still lands on a different tuple.
+  build instantiates are usable (`(48,16,48,10240)`, `(30,16,32,8192)`, `(36,8,24,5120)` and
+  `(36,16,48,10240)` today — the last one is the 36-linear-layer hybrid that keeps the 16/48/10240
+  head geometry, i.e. `qwen3.8-flash-next`).
+  A target whose linear layers do not match one of them is refused at start-up
+  (`gdn_replay_fold: unsupported record geometry`) with `--spec mtp`, while `--spec none` is
+  unaffected because it never builds replay records. Registering another shape is a kernel
+  instantiation plus a dispatch branch, i.e. a build change, and the conv channels are
+  `2·key_width + value_width`, not `2·hidden`, so the same head geometry at a narrower hidden width
+  still lands on a different tuple.
 * **The draft layer runs dense full attention.** The source draft block is an indexed (QSA) block
   (`compress_ratios[block] = 4`); the converter and the loader carry its indexer matrices and the
   output-gate alias, but the runtime executes the mixer as dense full attention because QSA block
