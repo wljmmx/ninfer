@@ -3,6 +3,13 @@
 #include "ninfer/ops/gdn_control.h"
 #include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/w4a8.h"
+// The separate-parent record route finishes with the projected-conv kernel the composed record
+// routes inside gdn_input_proj already use (`compose_record` in src/ops/wrapper/gdn_input_proj.cpp
+// calls exactly this launch). It stays private to ninfer_ops because the fused parents reach it
+// through that wrapper; the model layer needs it because a separate-parent artifact has no fused
+// parent to route through. Same kernel, same publish-less record form, so the record and snapshot
+// outputs stay bit-identical by construction rather than by a second implementation agreeing.
+#include "ops/gdn_input_proj/gdn_projected_conv.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -78,6 +85,27 @@ std::size_t gdn_snapshot_workspace_bytes(const GdnParameters& parameters, const 
 std::size_t gdn_record_workspace_bytes(const GdnParameters& parameters, const GdnConfig& config,
                                        std::int32_t batch, std::int32_t first_width,
                                        std::int32_t last_width) {
+    if (const auto* separate = std::get_if<ops::SeparateProjectionWeights>(&parameters.projection)) {
+        // Composition route: the projection writes conv_record at that record's own channel stride
+        // through the placement scratch of gdn_input_proj's four-parent form, and each of those
+        // four Linear calls may add its own transient bytes (zero for the groupwise formats,
+        // nonzero for the block-scaled ones). Both are live at the same time. The convolution that
+        // follows needs no arena at all - it reads conv_record and the state pool in place.
+        const std::int32_t columns = batch * last_width;
+        std::size_t linear_bytes   = 0;
+        for (const auto& row : separate->rows) {
+            linear_bytes =
+                std::max(linear_bytes, ops::linear_workspace_capacity_bytes(
+                                           row.weight.qtype, row.weight.n, row.weight.k, row.policy,
+                                           first_width, last_width));
+        }
+        const std::int32_t widest = std::max(
+            std::max<std::int32_t>(separate->rows[0].weight.n, separate->rows[1].weight.n),
+            separate->rows[2].weight.n);
+        return std::max(std::size_t{1},
+                        ops::gdn_input_proj_placement_workspace_bytes(widest, columns) +
+                            linear_bytes);
+    }
     const auto* single = std::get_if<LinearParameters>(&parameters.projection);
     std::size_t bytes;
     if (single && single->weight.qtype != QType::Q8_G32_FP16) {
@@ -160,10 +188,39 @@ void gdn_projection_record(const Tensor& hidden, const GdnParameters& parameters
     auto scope = workspace.scope();
     WorkspaceArena scratch(workspace.alloc_bytes(
         gdn_record_workspace_bytes(parameters, config, hidden.ne[2], hidden.ne[1], hidden.ne[1])));
-    if (std::holds_alternative<ops::SeparateProjectionWeights>(parameters.projection)) {
-        throw std::invalid_argument(
-            "GDN projection record: this artifact keeps q, k, v and z in their own parents; the "
-            "record-producing form needs a fused parent");
+    if (const auto* separate = std::get_if<ops::SeparateProjectionWeights>(&parameters.projection)) {
+        // Separate parents carry no fused row order, so the record-producing form runs as the
+        // composition the fused routes fall back to on their non-fused widths: project the whole
+        // [C, T*B] rectangle into conv_record itself - which is exactly the packed record plane the
+        // contract defines, oldest tap first, one column per physical token - then run the same
+        // width-four convolution that the state-writing form runs, with the publish arm that leaves
+        // the history alone. Z is projected for every physical column, like the fused forms.
+        //
+        // Numerically this is not a second implementation: the projection is the four-parent
+        // gdn_input_proj the prefill and snapshot routes already call, and the convolution is
+        // gdn_projected_conv_kernel with NoHistoryPublish - the template instance
+        // gdn_projection_snapshot reaches through the snapshot form. Record and snapshot therefore
+        // agree bit-for-bit from the same initial history, which is the record Op's contract.
+        const std::int32_t width   = hidden.ne[1];
+        const std::int32_t batch   = hidden.ne[2];
+        const std::int32_t columns = width * batch;
+        const std::int32_t channels = separate->rows[0].weight.n + separate->rows[1].weight.n +
+                                      separate->rows[2].weight.n;
+        if (conv_record.ne[0] != channels || conv_record.ne[1] != width ||
+            conv_record.ne[2] != batch) {
+            throw std::invalid_argument(
+                "GDN projection record: the record plane must be [query+key+value, T, B]");
+        }
+        Tensor hidden_flat(hidden.data, hidden.dtype, {hidden.ne[0], columns});
+        Tensor record_flat(conv_record.data, conv_record.dtype, {channels, columns});
+        Tensor gate_flat(z.data, z.dtype, {separate->rows[3].weight.n, columns});
+        ops::gdn_input_proj(hidden_flat, separate->rows[0].weight, separate->rows[1].weight,
+                            separate->rows[2].weight, separate->rows[3].weight, record_flat,
+                            gate_flat, separate->rows[0].policy, scratch, stream);
+        ops::detail::gdn_projected_conv_record_launch(conv_record, parameters.convolution,
+                                                      conv_states, valid_columns, initial_slots,
+                                                      query, key, value, stream);
+        return;
     }
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
         ops::gdn_input_proj_conv_record(hidden, pair->first, pair->second, parameters.convolution,
