@@ -314,6 +314,37 @@ deterministic floating-point transition，并消费相同的 record bits。
 prefill 分块或另一套数值实现产生相同 inputs、logits 或 state。Record 之前的计算已确定本轮输入；
 Fold 要忠实提交这些输入形成的轨迹。
 
+### 3.5 投影层的 separate-parent 形态（Qwen4Exp / Qwen3.8-Flash-Next）
+
+Qwen4Exp 的工件把 GDN 的 q/k/v/z 各自放在独立父张量里（`ops::SeparateProjectionWeights`），
+没有可沿行走的 fused 行序。record 生产形的 fused 父张量注册项因此一条都不适用，模型层
+（`src/models/qwen3_5/execution/gdn.cpp` 的 `gdn_projection_record`）走与 snapshot 相同的组合：
+
+1. 四父张量形态的 `gdn_input_proj` 把整个 `[C, B*W]` 矩形直接投影进 `conv_record` 本体 ——
+   record 契约里“最旧 tap 在前、每个物理 token 一列”的排布正好就是这个 packed 矩形；
+2. `gdn_projected_conv_record_launch` 在这块矩形上跑宽度 4 卷积，publish 臂是
+   `NoHistoryPublish`：只写 q/k/v，不写任何历史列。
+
+数值口径（为什么这不是第二套实现）：
+
+- 投影就是 prefill/snapshot 两条线路本来就在调用的同一个四父 `gdn_input_proj`（每父一次
+  `ops::linear`，再按父张量的列距 `memcpy2D` 摆放），不是新算子；
+- 卷积是 `gdn_projected_conv_kernel` 的同一模板实例，与 snapshot 只差 publish 臂（写不写
+  `conv_states` 的新历史列），因此**同一初始历史、同一输入列、同一宽度**下 record 与 snapshot
+  逐位相同 —— 这正是 record 算子契约要求的那一条；
+- 与 fused 父张量（Q4/Q5 pair、Q8 单父、FP8/NVFP4 单父）不是逐位关系：那条走格式自带的融合核，
+  reduction 次序不同，差异归各自 A16 判据；跨形态只能比判据内的量，不能拿 ids 当逐位证据。
+- record 平面几何不变（`[channels, T, B]` BF16，每列一个物理 token），所以 (36,16,48,10240)
+  的 fold 实例照旧可用。
+
+工作区：组合路线要求 arena 同时容纳四父投影的摆放暂存
+（`gdn_input_proj_placement_workspace_bytes(widest, B*W)`）与最宽那次 `ops::linear` 自己的暂存
+（groupwise 格式为 0，block-scaled 格式非 0），`gdn_record_workspace_bytes` 按二者之和报容量。
+
+这里还有一个不可替换性：verify 的 state pool 只按槽位数分配（`[C,3,S]`），没有 snapshot 形态
+借用的“列暂存”区间，所以 verify 里 snapshot 形态根本不可调用（实测报
+`invalid convolution snapshot state`）。separate-parent 的 record 组合是这条路上唯一能跑的形态。
+
 ---
 
 ## 4. 数值核心：为什么“代数等价”仍会产生 state drift

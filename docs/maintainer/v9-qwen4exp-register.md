@@ -359,3 +359,59 @@ E8 三变体在 24Q/2KV/D256 dense 路由上同时放行（`cd371261`）：rk4v4
 结论：`prepare` 在 decode 写 V 的位置、索引与量化入参全部正确（4 个 decode 步、两个 head、position 精确、ulp 级一致），**S3 剩下的 12/14 行是跨臂比较口径问题**（两臂 greedy 链已分叉，同一 position 装的是不同 token 的 V），不是缺陷、无需修改代码。判据更正为**同臂**：`存储列 vs 该 pass 的 value_in`；跨臂比较只在 token 相同的列（本例的 prefill 0–52）上有意义。上面"第六轮"的结论与"下一步唯一动作"据此作废。
 
 复现：同 prompt 跑 `--kv-dtype rk8v4`（另加 `NINFER_QSA_SPARSE_GQA_QUANT_KV=1`）与 `--kv-dtype bf16`，各带 `NINFER_QSA_LAYER_DUMP`/`NINFER_QSA_KV_DUMP`/`NINFER_QSA_DUMP_LAYER=0`；比较脚本见 `H:\TeleAgentWorks\.temp\s3_closure.py`、`lastpass_probe.py`、`implied_divisor.py`。本轮未改动任何源码（提交 `a7577a18` 起的构建，`.temp` 脚本不入库）。
+
+---
+
+## 附：MTP verify 在 Flash-Next 上第一次跑通（2026-11-12，RTX 4090 / sm_89 / CUDA 13.5）
+
+`--spec mtp` 在这个工件上此前停在 `gdn_projection_record: ... the record-producing form needs a
+fused parent`（GDN 的 q/k/v/z 各自独立父张量）。separate-parent 的 record 组合（实现与数值口径见
+`replayssm-gdn.md` §3.5）落地后，下一个门是**崩溃**，不是能力门：
+
+- 位置：verify 矩形第一个 indexed 层（layer 3）的 `qsa_mix`，`ninfer.exe+0x248954`，`0xc0000005`，
+  三次运行同一 RVA。
+- 根因（`NINFER_LAYER_TRACE` 探针实测）：`target_verify_batch_impl` 只绑了 `active_qsa_columns_ /
+  base_positions / offsets`，没绑 `active_qsa_source_slots_ / destination_slots`；`qsa_mix` 的
+  slot 取值是 `active_linear_state_destination_slots_ != nullptr ? ... : *active_qsa_destination_slots_`，
+  而 MTP verifier 只绑 GDN 的 **source** slots（record 形态不需要 destination），于是 fallback 解引用
+  了空指针（探针值：`lin_src` 非空、`lin_dst`/`qsa_src`/`qsa_dst` 全空）。
+- 修复：verify 矩形把 QSA 的 source 与 destination 都绑到本 pass 的 `linear_state_source_slots`
+  （同槽原地发布）。`qsa_tail_extract` 契约明确允许 destination 平面精确别名 source 平面并读原始
+  source words，所以这是算子允许的形态，不需要第二个槽位。
+
+修复后 `--spec mtp --draft-tokens 3` 能完整跑完（`--max-new 8`：6 轮、15 个 draft、0 accepted、
+1 次 fallback；`--max-new 1` 不产生 verify 轮）。**但 ids 判据没有通过**：
+
+| 臂 | ids（prompt "Hello"，greedy） |
+|---|---|
+| `--spec none --max-new 8`（`NINFER_EXPERT_CACHE_MB=14000`） | `2708 24434 171665 186285 725 836 174818 5174` |
+| `--spec mtp --draft-tokens 3` | `49438 9616 63 4958 45320 90070 98717 38036` |
+| `--spec mtp --draft-tokens 1`（verify 宽 2） | `49438 9616 63 4958`（与上面同前缀） |
+| 27B dense 对照（fused GDN，无 PLE/QSA/HC） none vs mtp | `760 1156 1018 328 9419 3158 1061 369`，**两臂逐位相同**，accepted 4/7 |
+| 35B MoE 对照（fused GDN，无 PLE/QSA） none vs mtp | `8160 579 264 7047 1817 25 271 16`，**两臂逐位相同**，accepted 4 |
+
+读数：
+
+- verify 自己跨宽度自洽（宽 2 与宽 4 的前四枚完全一致），所以不是"record 在某个宽度算错"；
+- 两个没有 PLE/QSA/HC 的对照模型两臂逐位相同 ⇒ 判据本身可达，缺口的范围是 Flash-Next 独有部件；
+- `NINFER_QSA_FORCE_FULL=1`（indexed 层走 dense 参考臂，绕过 indexer）时首枚**仍**不同
+  （`1371 162284`），所以不是 indexer 选择的问题；
+- 0/15 accepted 是"draft 头本身没有产出正确提案"的典型（248k 词表下随机命中≈0），与 verify 的
+  数值缺口是两个独立缺陷。
+
+未闭环（本轮到此为止，均需单独开工）：
+
+1. **QSA 没有 record 形态**：`qsa_prepare` 直接写主/索引缓存，`qsa_tail_extract` 用本 pass 的
+   `valid_columns`（verify 里=整宽）就地发布 tail。draft 被拒时 tail 会停在"最后一个候选列"，
+   缺一个像 PLE `commit_verify` 那样的延迟发布（需要让每层 raw record 平面跨 pass 存活，再在
+   accept 时以 accepted 列重发）。这是 verify/rollback 语义缺口，不是本地修补。
+2. **verify 与 decode 不是同一数值路径**：Flash-Next 的 GDN 投影走 `ops::linear`（T=1 与 T=2/4
+   选不同 T 路线），PLE 的 verify 窗口（deferred commit）与 decode 单列窗口是两套驱动；两者都会
+   让首枚 token 分叉（该模型 logits 平坦，见 `v9-moe-execution-register.md` 附的 ids 敏感性）。
+   要么把投影路线做成 T 不变，要么证明 PLE verify 窗口逐位复现 decode 窗口。
+3. 27B/35B 的 accepted 50%+ 与 Flash-Next 的 0% 说明 draft 头（stem/tail/conditioning 帧）在
+   Qwen4Exp 形态下仍未验证正确。
+
+复现命令：`NINFER_EXPERT_CACHE_MB=14000 build-win/apps/ninfer.exe <工件> --prompt "Hello"
+--max-context 8192 --kv-capacity 8192 --max-new 8 --greedy --print-token-ids [--spec mtp
+--draft-tokens 3]`；崩溃定位用 `NINFER_LAYER_TRACE=1`（本轮取证的临时探针已移除）。
