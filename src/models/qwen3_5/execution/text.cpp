@@ -874,9 +874,14 @@ void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
         // The artifact keeps the stem's two matrices apart: x = fc_hidden(h) + fc_embedding(e).
         x = roots.residual;
         project(e, *mtp_->fc_embedding, x, work_, s);
-        Tensor hidden_term = roots.packed_input.slice(0, 0, dimension(config_.hidden_size));
-        project(h, *mtp_->fc_hidden, hidden_term, work_, s);
-        ops::residual_add(hidden_term, x, s);
+        // The per-stream term is the projection's OUTPUT, so it needs a contiguous [h,T]: the packed
+        // [2h,T] buffer's first half is a strided view (row pitch 2h) and `linear` refuses it once
+        // T>1, while at T==1 its single row happens to be contiguous and the alias looked correct.
+        // `attention_hidden` is that contiguous buffer - nothing reads it between here and the
+        // grouped norm that overwrites it two lines after the residual add. This is the same defect
+        // and the same remedy as the four-stream stem's split arm (71667fa7).
+        project(h, *mtp_->fc_hidden, roots.attention_hidden, work_, s);
+        ops::residual_add(roots.attention_hidden, x, s);
     } else {
         ops::mtp_pack_fc_input(e, h, fc_in, s);
         x = roots.residual;
@@ -1570,6 +1575,20 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
                                                     qsa.active ? &qsa.base : nullptr);
         ScopedValue<const Tensor*> qsa_offsets_binding(active_qsa_offsets_,
                                                        qsa.active ? &qsa.offsets : nullptr);
+        // An indexed layer reads its raw-key tail from the sequence's state slot and publishes the
+        // tail of this rectangle's live prefix back into the SAME slot: QSA has no record form of
+        // its own (unlike the GDN conv plane, whose verify pass writes records and lets the fold
+        // commit the accepted prefix), so the rectangle's slot binding is source == destination.
+        // `qsa_tail_extract` admits exactly that alias and reads the original source words, so the
+        // pass neither needs a second slot nor leaves the pool half-written. Without this binding
+        // the verify rectangle fell through to `*active_qsa_destination_slots_` - a null pointer,
+        // since the MTP verifier binds only the GDN source slots - and the first indexed layer
+        // crashed on the metadata check in `qsa_mix`.
+        ScopedValue<const Tensor*> qsa_source_binding(active_qsa_source_slots_,
+                                                      qsa.active ? &linear_state_source_slots
+                                                                 : nullptr);
+        ScopedValue<const Tensor*> qsa_destination_binding(
+            active_qsa_destination_slots_, qsa.active ? &linear_state_source_slots : nullptr);
         if (ple_) {
             // PLE for a verify rectangle. The window holds EVERY candidate column - the verifier
             // needs each one's logits, so each one's embedding must be gathered - but only the

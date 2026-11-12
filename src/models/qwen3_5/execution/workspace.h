@@ -247,10 +247,13 @@ MtpStemRoots mtp_stem(Allocator& allocator, const TextConfig& config, std::int32
 // side by side), so h_init[s] = eh_proj * [e; v[s]] and the fused form is the artifact's own
 // arithmetic, not a re-derivation. `residual`/`normalized` are the [h*count, T] pair the block's
 // two corrections act on, `input`/`product` the single-stream pair the mixer and the FFN consume and
-// produce, and `injection` the four coefficients the pending correction applies. The four staging
-// tensors hold one stream at a time: `packed_input` is that stream's [e; v[s]] pack, `stream_input`
-// a contiguous copy of its 2560-wide slice of the h*count norm, and `stream_output` the projection
-// that slice produces before it is scattered into its own plane of `residual`.
+// produce, and `injection` the four coefficients the pending correction applies. The staging tensors
+// hold one stream at a time: `packed_input` is that stream's [e; v[s]] pack, `stream_input` a
+// contiguous copy of its 2560-wide slice of the h*count norm, and `input` is where that slice's
+// projection lands before it is scattered into its own plane of `residual`. `stream_output` no
+// longer carries that per-stream projection: it holds the stem's shared `e` term (the one
+// [h,T] the split pair projects once for all four streams) and, on the fused arm, the [h,2h]
+// projection's own output before it is scattered; both are contiguous [h,T] buffers like `input`.
 struct MtpHcRoots {
     Tensor residual, normalized, input, injection, product;
     Tensor normalized_embedding, normalized_hidden, embedding, packed_input, stream_input,
