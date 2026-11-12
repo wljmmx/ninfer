@@ -573,6 +573,12 @@ public:
         std::uint32_t live_tokens     = 0;
         std::uint32_t lane_count      = 0;
         std::array<std::uint32_t, kMaximumConcurrency> lane_tokens{};
+        // The same pricing in the pool's own unit - whole resident page groups - so a refusal can say
+        // what the growth asked for and what the pool holds. `lane_pages` is each lane's demand after
+        // one Decode step of growth, the quantity the Runtime compares with `capacity_pages`.
+        std::uint32_t capacity_pages = 0;
+        std::uint32_t live_pages     = 0;
+        std::array<std::uint32_t, kMaximumConcurrency> lane_pages{};
     };
     [[nodiscard]] KvResidencyBudget kv_residency_budget() const noexcept;
     // The same pricing for a request that is not live yet: its prompt plus one step of growth,

@@ -1068,6 +1068,61 @@ private:
                     "memory to the pool (NINFER_KV_RESIDENCY_SLACK_MB, or a smaller max_context).")));
     }
 
+    // port (sm_89): refuse ONE lane whose GROWTH has nothing left to preempt.
+    //
+    // The aggregate admission rule prices `live + one step`, which is what makes a pair of lanes
+    // admissible. A later step of the SAME round can still cross the edge (two lanes at 49.8% of the
+    // pool have ~190 tokens each before their sum reaches it), and then reserve_units() fails for a
+    // lane that the pool cannot grow: the only resident candidates are the requester itself and its
+    // own round batch, so the preemption that would follow pauses someone who is executing this very
+    // pass. The paused lane is never driven back (the other one keeps decode_ready), and the load
+    // never terminates - measured as `paused=1 running=1 decode_ready=1 preemptions=48` for 120 s.
+    //
+    // Pausing is therefore the wrong answer exactly when no OTHER lane can give its pages back. The
+    // request is refused as the length property it is (its history no longer fits beside its peers),
+    // the other lanes keep running, and the engine keeps serving new requests.
+    void refuse_kv_residency_growth(std::uint32_t lane, const std::shared_ptr<Request>& request) {
+        // The numbers describe the state the step failed in, so they are read BEFORE the abort below
+        // gives this lane's pages back.
+        const auto budget = instance_.program->kv_residency_budget();
+        const std::uint32_t needed_pages =
+            lane < budget.lane_pages.size() ? budget.lane_pages[lane] : 0U;
+        std::string lanes;
+        for (std::uint32_t other = 0; other < max_concurrency_; ++other) {
+            const std::uint32_t held = budget.lane_pages[other];
+            if (held == 0) { continue; }
+            if (!lanes.empty()) { lanes += '+'; }
+            lanes += std::to_string(held);
+        }
+        // The native sequence owns the lane's Device KV, and completing the request does not release
+        // it by itself: without the abort the pages stay mapped, the next pass still finds the pool
+        // over its edge, and every other lane of the batch is refused in turn.
+        if (request->sequence) {
+            auto aborted                = instance_.program->abort(*request->sequence);
+            request->generation_timings = aborted.timings;
+            request->speculative_stats  = std::move(aborted.speculative);
+        }
+        complete_error(
+            request,
+            std::make_exception_ptr(RequestError(
+                RequestErrorKind::ContextLengthExceeded,
+                "KV residency cannot grow this lane beside the lanes already resident: "
+                "growth_pages_needed=" +
+                    std::to_string(needed_pages) + " capacity_pages=" +
+                    std::to_string(budget.capacity_pages) + " live_lanes=" +
+                    std::to_string(budget.lane_count) + " live_pages=" +
+                    std::to_string(budget.live_pages) + " live_lane_pages=" +
+                    (lanes.empty() ? std::string("-") : lanes) + " live_tokens=" +
+                    std::to_string(budget.live_tokens) + " resident_tokens=" +
+                    std::to_string(budget.capacity_tokens) +
+                    " (growth_pages_needed is this lane's whole demand after the step, in the pool's "
+                    "page groups; the Device KV pool is tiered and shared, and every live lane's "
+                    "history has to stay in it at every step, so the growth cannot be served by "
+                    "pausing a lane of the same batch. Shorten the prompt, lower max_concurrency, or "
+                    "leave more Device memory to the pool (NINFER_KV_RESIDENCY_SLACK_MB, or a smaller "
+                    "max_context).")));
+    }
+
     [[nodiscard]] std::array<bool, kMaximumConcurrency> snapshot_cancellations() const noexcept {
         std::array<bool, kMaximumConcurrency> cancelled{};
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
@@ -2273,6 +2328,29 @@ private:
         return pause_resident(*victim);
     }
 
+    // port (sm_89): is there a lane whose pages could be given back to grow `lane`? A candidate has
+    // to sit OUTSIDE this round's batch - a batch member is executing the same pass, so pausing it
+    // only moves the shortage to the next row of the same pass - and it has to hold resident KV at
+    // all. When nothing answers, the shortage is not transient and pausing is the wrong answer (see
+    // refuse_kv_residency_growth()).
+    [[nodiscard]] bool resident_growth_can_preempt(
+        std::uint32_t lane, std::span<const std::uint32_t> batch) const {
+        for (std::uint32_t other = 0; other < max_concurrency_; ++other) {
+            if (other == lane) { continue; }
+            if (std::find(batch.begin(), batch.end(), other) != batch.end()) { continue; }
+            const auto& candidate = slots_[other];
+            if (!candidate || !candidate->sequence || candidate->is_model_finished() ||
+                candidate->model_state == EngineRequestState::Pausing) {
+                continue;
+            }
+            if (instance_.program->sequence_execution_frontier(*candidate->sequence) == 0) {
+                continue;
+            }
+            return true;
+        }
+        return false;
+    }
+
     bool pause_resident(std::uint32_t lane) {
         if (instance_.program->has_context_transaction()) { return false; }
         auto request       = slots_[lane];
@@ -2760,7 +2838,12 @@ private:
             if (recovering == a || recovering == b) { return recovering == a; }
             return slots_[a]->id < slots_[b]->id;
         });
+        // port (sm_89): at most ONE growth refusal per pass. A refusal frees that lane's pages, so the
+        // lanes still waiting in this list have room again on the next pass; refusing them all here
+        // would answer a shared edge by failing every participant.
+        bool refused_lane = false;
         for (const auto lane : candidates) {
+            if (refused_lane) { break; }
             const auto request = slots_[lane];
             // Reclaiming for an earlier row may already have paused this candidate.
             if (!request || !request->sequence || request->capture_pending ||
@@ -2826,6 +2909,20 @@ private:
                 }
                 if (request->recovery_pending) {
                     throw std::logic_error("protected recovery exceeded its Native reservation");
+                }
+                // port (sm_89): under a residency contract a growth with no candidate to preempt is
+                // not a shortage - it is this request's history no longer fitting beside its peers.
+                // Only the Device KV pool turns a shortage into that property; a state-slot or Host
+                // shortage is transient, and preemption stays the answer there.
+                if (result.shortage.main_kv_pages != 0 &&
+                    instance_.program->kv_residency_token_limit() != 0 &&
+                    !resident_growth_can_preempt(lane, candidates)) {
+                    refuse_kv_residency_growth(lane, request);
+                    if (priority == lane) { return; }
+                    // Leave the retry loop for this candidate (not the pass): the next lane gets its
+                    // own turn, and the refused one is already finished.
+                    refused_lane = true;
+                    break;
                 }
                 scheduler_.require_progress(request->id);
                 if (pause_resident(lane) || pause_reclaim_victim()) { return; }

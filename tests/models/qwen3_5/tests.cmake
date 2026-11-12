@@ -281,6 +281,26 @@ set_tests_properties(ninfer_qwen3_5_dense_256k_lanes_test PROPERTIES
   LABELS "gpu;real"
   TIMEOUT 1800)
 
+# port (sm_89): the growth arm - the load the aggregate ADMISSION rule cannot see. Two lanes are
+# admitted together at ~49.8% of the resident pool each (legal: the rule prices live + one step), and
+# a few hundred decode tokens later their sum crosses the edge. The round that cannot reserve a page
+# used to pause one of the two lanes while the other kept decode_ready; nothing drove the paused lane
+# back and the load never terminated (`paused=1 running=1 decode_ready=1 preemptions=48` at 120 s).
+# The rule now REFUSES the lane whose growth has no candidate to preempt, so this arm asserts a
+# bounded outcome: both lanes complete, or one is refused with growth_pages_needed=/capacity_pages=/
+# live_lanes= while the other finishes - and the engine still serves a normal request afterwards.
+# Its own process (one 19 GiB engine per card) and its own budget: construction, two ~59K prompts and
+# up to 400 decode tokens. The 180 s ceiling is the outer guard against the unterminating shape; the
+# binary also carries its own 45 s watchdog for the probe itself.
+add_test(NAME ninfer_qwen3_5_dense_256k_growth_test
+  COMMAND ninfer_qwen3_5_dense_real_test)
+set_tests_properties(ninfer_qwen3_5_dense_256k_growth_test PROPERTIES
+  ENVIRONMENT "NINFER_TEST_DENSE_ARM=256k-growth"
+  SKIP_RETURN_CODE 77
+  RUN_SERIAL TRUE
+  LABELS "gpu;real"
+  TIMEOUT 180)
+
 set_tests_properties(
   ninfer_qwen3_5_state_image_test
   ninfer_qwen3_5_context_store_test

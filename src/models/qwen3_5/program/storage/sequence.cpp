@@ -695,12 +695,16 @@ Program::KvResidencyBudget ProgramImpl::kv_residency_budget() const noexcept {
     if (kv_resident_page_groups >= kv_logical_page_groups) { return budget; }
     budget.capacity_tokens =
         residency_device_page_capacity() * static_cast<std::uint32_t>(kPagedKVPageSize);
+    budget.capacity_pages = residency_device_page_capacity();
     const std::uint32_t growth = kv_residency_step_growth();
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
         const std::uint32_t tokens = residency_lane_tokens(lane, growth);
         if (tokens == 0) { continue; }
         budget.lane_tokens[lane] = tokens;
+        // `residency_lane_tokens()` already rounded to whole pages, so this division is exact.
+        budget.lane_pages[lane] = tokens / static_cast<std::uint32_t>(kPagedKVPageSize);
         budget.live_tokens += tokens;
+        budget.live_pages += budget.lane_pages[lane];
         ++budget.lane_count;
     }
     return budget;
