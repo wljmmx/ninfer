@@ -70,6 +70,10 @@ struct PrefillContext {
     // The lane this chunk's PLE window names (the identity a resident sequence holds). Last so the
     // positional initializers above keep their meaning.
     std::int32_t lane = 0;
+    // Where a four-stream prefill chunk publishes the head's `hidden`-wide sample. Left null by every
+    // generation pass, which keeps its own scratch sample; the causal-scoring pass names the
+    // persistent buffer it scores from, because its frame carries the 10240-wide residual instead.
+    Tensor* head_sample = nullptr;
 };
 
 struct OrdinaryBatchContext {

@@ -362,6 +362,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (plan.persistent.score_hidden) {
         score_hidden = plan.persistent.score_hidden->bind(backing);
     }
+    if (plan.persistent.score_sample) {
+        score_sample = plan.persistent.score_sample->bind(backing);
+    }
     if (plan.persistent.token_counts) {
         token_counts = plan.persistent.token_counts->bind(backing);
     }
@@ -559,6 +562,9 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
                 0,
                 0,
                 nullptr};
+            // The chunk publishes its head-wide sample here when the frame is wider than `hidden`;
+            // the frame itself stays the four-stream residual it is for every other pass.
+            if (score_sample) { schedule_state.head_sample = &*score_sample; }
             mark_workspace_usage(workspace_plan.text_prefill);
             const execution::PrefillChunkResult result = execution::prefill_text_chunk(
                 schedule_state, std::span<const TokenId>(prompt.token_ids), nominal, std::nullopt,
@@ -577,9 +583,15 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
                 const std::uint32_t available = cursor - selected;
                 const std::uint32_t room      = kCausalScoreTile - staged_columns;
                 const std::uint32_t count     = std::min(available, room);
+                // From the head-wide outlet when the plan has one: a four-stream frame is count*hidden
+                // wide, and reading a `hidden`-wide staging tile out of it copies neighbouring streams
+                // into the projection. The sample is contiguous, so this is a plain block copy.
                 Tensor source =
-                    prefill_hidden.slice(1, static_cast<std::int32_t>(selected - chunk_begin),
-                                         static_cast<std::int32_t>(count));
+                    score_sample
+                        ? score_sample->slice(1, static_cast<std::int32_t>(selected - chunk_begin),
+                                              static_cast<std::int32_t>(count))
+                        : prefill_hidden.slice(1, static_cast<std::int32_t>(selected - chunk_begin),
+                                               static_cast<std::int32_t>(count));
                 Tensor destination = score_hidden->slice(
                     1, static_cast<std::int32_t>(staged_columns), static_cast<std::int32_t>(count));
                 CUDA_CHECK(cudaMemcpyAsync(destination.data, source.data, source.bytes(),

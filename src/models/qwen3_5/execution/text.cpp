@@ -3201,9 +3201,15 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             Tensor xf = prefill_hidden_.data != nullptr
                             ? matrix_window(prefill_hidden_, len)
                             : work_.alloc(DType::BF16, {dimension(mtp_frame_width()), len});
-            Tensor sample = streams ? work_.alloc(DType::BF16,
-                                                   {dimension(config_.hidden_size), len})
-                                     : xf;
+            // With four streams the frame and the head's sample are different tensors: the frame is the
+            // pre-final-mixer residual (MTP's conditioning) and the sample is the final mixer's 2560
+            // output. A caller that asked for the sample by name gets it written here; otherwise it is
+            // the pass's own scratch, exactly as before. Publishing it does not touch the frame.
+            Tensor sample =
+                !streams    ? xf
+                : head_sample_output_ != nullptr
+                    ? matrix_window(*head_sample_output_, len)
+                    : work_.alloc(DType::BF16, {dimension(config_.hidden_size), len});
             final_hidden(x, sample, len);
             if (streams) {
                 const Tensor residual = hc_.residual.view({dimension(mtp_frame_width()), len});

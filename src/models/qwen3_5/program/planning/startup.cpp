@@ -317,6 +317,12 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             add_tensor(builder, DType::BF16,
                        {dimension(config.hidden_size), static_cast<std::int32_t>(kCausalScoreTile)},
                        "causal score hidden staging");
+        if (frame_width != dimension(config.hidden_size)) {
+            out.score_sample =
+                add_tensor(builder, DType::BF16,
+                           {dimension(config.hidden_size), effective_prefill_chunk},
+                           "causal score head sample");
+        }
     }
     qwen3_5::complete_round_state_layout(builder, out.round);
     if (!plan.causal_scoring) {

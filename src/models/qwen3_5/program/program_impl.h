@@ -488,6 +488,8 @@ public:
     qwen3_5::RoundState io;
     Tensor prefill_hidden;
     std::optional<Tensor> score_hidden;
+    // The head-wide prefill outlet the scoring pass reads (see PersistentLayout::score_sample).
+    std::optional<Tensor> score_sample;
     Tensor sampling_config;
     Tensor grammar_masks_device;
     std::optional<PinnedHostBuffer> grammar_masks_host;

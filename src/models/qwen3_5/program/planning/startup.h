@@ -42,6 +42,10 @@ struct PersistentLayout {
     qwen3_5::RoundStateLayout round;
     TensorLayout prefill_hidden;
     std::optional<TensorLayout> score_hidden;
+    // A four-stream model's prefill frame is count*hidden wide, so the scoring pass cannot read its
+    // per-position block output out of it; this is the head-wide outlet it reads instead. Absent on a
+    // single-stream model, where the frame already is the sample.
+    std::optional<TensorLayout> score_sample;
     std::optional<TensorLayout> token_counts;
     std::optional<TensorLayout> sampling_config;
     std::optional<TensorLayout> grammar_masks;

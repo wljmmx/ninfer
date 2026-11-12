@@ -117,6 +117,13 @@ public:
         rewrite_checkpoint_hidden_output_ = output;
     }
 
+    // The second prefill outlet: the head's `hidden`-wide sample, published when the caller needs the
+    // per-position block output rather than the continuation frame. `prefill_hidden` stays the
+    // four-stream frame (`frame_width` = count*hidden) because MTP's next step consumes that; a
+    // scoring pass reads this instead of reinterpreting the frame. Null keeps every generation pass
+    // on the old allocation (a scratch sample) bit for bit.
+    void set_head_sample_output(Tensor* output) noexcept { head_sample_output_ = output; }
+
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
 
     // The lane whose n-gram history this pass continues. A PLE window names its row's slot, and a
@@ -375,6 +382,8 @@ private:
     const GdnReplayRecords* replay_records_   = nullptr;
     std::int64_t prefill_split_frontier_      = -1;
     Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
+    // The head's `hidden`-wide sample outlet of a prefill chunk (see set_head_sample_output).
+    Tensor* head_sample_output_               = nullptr;
     std::uint32_t mtp_proposal_extent_        = 0;
 
     const Weight* embed_                        = nullptr;
