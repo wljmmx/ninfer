@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <set>
 #include <string>
@@ -90,6 +91,24 @@ AttentionConfig attention(const Json& value) {
 
 constexpr double kYarnPi = 3.14159265358979323846;
 
+enum class RopeScalingMode { Native, Yarn };
+
+// NINFER_ROPE_SCALING selects whether the artifact's YaRN table is applied. `native` (the default)
+// runs the trained theta^(-2*i/rotary_dim) frequencies and the trained position capacity even when
+// the file carries a yarn table; `yarn` applies the table and extends the capacity by its factor.
+// The same weights serve both windows, so the choice belongs to the run, not to the file.
+RopeScalingMode rope_scaling_mode() {
+    static const RopeScalingMode mode = [] {
+        const char* value = std::getenv("NINFER_ROPE_SCALING");
+        if (value == nullptr || *value == '\0') { return RopeScalingMode::Native; }
+        const std::string name{value};
+        if (name == "native") { return RopeScalingMode::Native; }
+        if (name == "yarn") { return RopeScalingMode::Yarn; }
+        throw ArtifactError("NINFER_ROPE_SCALING must be native or yarn, got '" + name + "'");
+    }();
+    return mode;
+}
+
 // YaRN (Peng et al. 2023) per-pair inverse frequencies: a linear ramp between the trained
 // extrapolated frequency and the 1/factor interpolated one, bounded by the two correction
 // dimensions derived from the trained position capacity.
@@ -164,31 +183,42 @@ RopeConfig rope(const Json& value, std::uint32_t head_dim) {
     }
     out.mrope_interleaved = flag(value, "mrope_interleaved", true);
     if (!out.mrope_interleaved) { throw ArtifactError("non-interleaved MRoPE is not implemented"); }
-    if (value.contains("rope_type")) {
-        const auto type = artifact::require_id(value.at("rope_type"), "rope_type");
-        // "default" is the trained theta^(-2*i/rotary_dim) table this engine always uses.
-        if (type != "yarn" && type != "default") {
-            throw ArtifactError("unsupported rope_type " + type);
-        }
-        if (type == "default") { return out; }
-        if (!value.contains("factor") || !value.contains("original_max_position_embeddings")) {
-            throw ArtifactError("yarn requires factor and original_max_position_embeddings");
-        }
-        out.yarn                                  = true;
-        out.yarn_factor                           = positive_float(value, "factor");
-        out.yarn_original_max_position_embeddings =
+    // The rope subtree is read whatever it declares, so the startup line can report it. Whether the
+    // table is USED is decided below by NINFER_ROPE_SCALING: a default artifact and a yarn artifact
+    // are the same weights, and the extended window is a deployment choice.
+    const std::string declared =
+        value.contains("rope_type") ? artifact::require_id(value.at("rope_type"), "rope_type")
+                                    : std::string{"default"};
+    if (declared != "yarn" && declared != "default") {
+        throw ArtifactError("unsupported rope_type " + declared);
+    }
+    out.declared_rope_type = declared;
+    out.yarn_declared      = declared == "yarn" || value.contains("factor") ||
+                        value.contains("original_max_position_embeddings");
+    if (value.contains("factor")) { out.yarn_declared_factor = positive_float(value, "factor"); }
+    if (value.contains("original_max_position_embeddings")) {
+        out.yarn_declared_original_max_position_embeddings =
             integer(value.at("original_max_position_embeddings"),
                     "original_max_position_embeddings");
-        const double beta_fast =
-            value.contains("beta_fast") ? positive_float(value, "beta_fast") : 32.0;
-        const double beta_slow =
-            value.contains("beta_slow") ? positive_float(value, "beta_slow") : 1.0;
-        out.yarn_attention_factor =
-            value.contains("attention_factor")
-                ? positive_float(value, "attention_factor")
-                : static_cast<float>(0.1 * std::log(static_cast<double>(out.yarn_factor)) + 1.0);
-        compute_yarn_frequencies(out, beta_fast, beta_slow);
     }
+    if (rope_scaling_mode() != RopeScalingMode::Yarn) { return out; }
+    if (!value.contains("factor") || !value.contains("original_max_position_embeddings")) {
+        throw ArtifactError("NINFER_ROPE_SCALING=yarn requires the artifact to carry "
+                            "rope_parameters.factor and original_max_position_embeddings");
+    }
+    out.yarn                                  = true;
+    out.yarn_factor                           = out.yarn_declared_factor;
+    out.yarn_original_max_position_embeddings =
+        out.yarn_declared_original_max_position_embeddings;
+    const double beta_fast =
+        value.contains("beta_fast") ? positive_float(value, "beta_fast") : 32.0;
+    const double beta_slow =
+        value.contains("beta_slow") ? positive_float(value, "beta_slow") : 1.0;
+    out.yarn_attention_factor =
+        value.contains("attention_factor")
+            ? positive_float(value, "attention_factor")
+            : static_cast<float>(0.1 * std::log(static_cast<double>(out.yarn_factor)) + 1.0);
+    compute_yarn_frequencies(out, beta_fast, beta_slow);
     return out;
 }
 
@@ -344,8 +374,12 @@ VisionConfig vision(const Json& value) {
                      "patch_size", "temporal_patch_size", "spatial_merge_size",
                      "num_position_embeddings"},
                     {}, "vision config");
+    // `qwen4_exp_vision` is the name the Qwen4Exp converter writes for the same tower
+    // mathematics: an mmproj carries its own geometry, so the tower is family-independent and one
+    // parser serves every family.
     if (value.at("model_type") != "qwen3_5_vision" &&
-        value.at("model_type") != "qwen3_5_moe_vision") {
+        value.at("model_type") != "qwen3_5_moe_vision" &&
+        value.at("model_type") != "qwen4_exp_vision") {
         throw ArtifactError("unknown Vision model_type");
     }
     VisionConfig out;

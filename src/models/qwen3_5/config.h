@@ -62,6 +62,18 @@ struct RopeConfig {
     std::uint32_t yarn_pair_count    = 0;
     std::array<float, 128> yarn_inv_frequency{};
 
+    // What the artifact itself declared, kept whether or not the scaling is applied: the choice
+    // between the trained table and the extended one is made at runtime (NINFER_ROPE_SCALING), so
+    // the startup report can say "the file carries yarn, this run uses the trained table".
+    std::string declared_rope_type{"default"};
+    bool yarn_declared                                           = false;
+    float yarn_declared_factor                                   = 1.0f;
+    std::uint32_t yarn_declared_original_max_position_embeddings = 0;
+
+    [[nodiscard]] const char* applied_rope_type() const noexcept {
+        return yarn ? "yarn" : "default";
+    }
+
     // Position capacity implied by the scaling: the trained capacity times the factor.
     [[nodiscard]] std::uint64_t scaled_position_capacity(std::uint32_t trained) const noexcept {
         if (!yarn) { return trained; }

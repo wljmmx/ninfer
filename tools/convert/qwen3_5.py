@@ -1036,3 +1036,15 @@ def build_model(
                 companions[backend], records[backend]["config"], config, backend
             )
     return model
+
+
+def attach_draft(model: Model, store, config: dict, target: dict, backend: str):
+    """Emit one DFlash/DFlash2 component into `model` from its own source.
+
+    The draft head is text-family neutral: its conditioning, selector and conv kernels read the
+    companion store and the target's geometry only, so a second family (Qwen4Exp) attaches the same
+    parameters through this entry point instead of a copy of `_Builder.draft`.
+    """
+    builder = _Builder(model)
+    builder.draft(store, config, target, backend)
+    return builder

@@ -55,6 +55,24 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     auto out     = std::make_unique<LoadPlan::Impl>();
     out->options = options;
     out->config  = parse_config(reader.directory(), options);
+    // The rotary window this run will actually use. The artifact states what it was trained with
+    // and may carry a YaRN table; NINFER_ROPE_SCALING picks between them (native is the trained
+    // theta table and the trained capacity, yarn applies the table and multiplies the capacity by
+    // its factor). Printed so a run is never ambiguous about which window it ran.
+    if (const auto& rope = out->config.text.rope_parameters) {
+        const auto capacity = rope->scaled_position_capacity(out->config.text.max_position_embeddings);
+        std::fprintf(stderr,
+                     "[rope] scaling=%s type=%s factor=%g original_max=%u capacity=%llu "
+                     "declared=%s declared_factor=%g declared_original_max=%u\n",
+                     rope->yarn ? "yarn" : "native", rope->applied_rope_type(),
+                     static_cast<double>(rope->yarn ? rope->yarn_factor : 1.0f),
+                     rope->yarn ? rope->yarn_original_max_position_embeddings
+                                : out->config.text.max_position_embeddings,
+                     static_cast<unsigned long long>(capacity), rope->declared_rope_type.c_str(),
+                     static_cast<double>(rope->yarn_declared_factor),
+                     rope->yarn_declared_original_max_position_embeddings);
+        std::fflush(stderr);
+    }
     // The PLE-off arm. The n-gram embedding is a config feature, so the only honest way to measure
     // "the model without it" is to drop the layers the config names - then nothing binds, no table
     // is opened, no block carries a PLE parameter, and the text path is the one that shipped before

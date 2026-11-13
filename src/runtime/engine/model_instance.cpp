@@ -1397,6 +1397,20 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
     LoadSummary summary;
     summary.architecture = models::architecture_name(instance->model->config().text.architecture);
     summary.model_name   = instance->model->info().name;
+    // The memory summary's rotary facts: the window every pool below was sized against. Reported
+    // here (with the rest of the startup ledger) because the reported capacity - not the trained
+    // one - is what max_context is checked against.
+    if (const auto& rope = instance->model->config().text.rope_parameters) {
+        const auto capacity =
+            rope->scaled_position_capacity(instance->model->config().text.max_position_embeddings);
+        std::fprintf(stderr, "[mem] rope=%s factor=%g original_max=%u capacity=%llu\n",
+                     rope->applied_rope_type(),
+                     static_cast<double>(rope->yarn ? rope->yarn_factor : 1.0f),
+                     rope->yarn ? rope->yarn_original_max_position_embeddings
+                                : instance->model->config().text.max_position_embeddings,
+                     static_cast<unsigned long long>(capacity));
+        std::fflush(stderr);
+    }
     summary.prefill_signature = signature;
     std::set<std::string> formats;
     for (const auto& weight : instance->model->weight_data()) {

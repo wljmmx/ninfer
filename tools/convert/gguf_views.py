@@ -267,20 +267,60 @@ class _Reshape(View):
         return self.inner.read(begin, end)
 
 
+class _LogOfNegative(View):
+    """`log(-ssm_a)`: llama.cpp writes GDN's decay as `-exp(A_log)`, the artifact keeps `A_log`.
+
+    Read out of llama.cpp's own converters (`conversion/qwen.py` folds `A_log -> -exp(A_log)`)
+    and its runtime comments (`ssm_a holds -exp(A_log), so exp(A_log) == -ssm_a`). The engine's GDN
+    decay is `-expf(A_log) * softplus(...)`, so the log domain is the only admissible one; an
+    artifact that stores `ssm_a` verbatim keeps a decay of `-exp(-A)` instead of `-A`, which for
+    A >> 1 is a state that never decays at all.
+    """
+
+    def __init__(self, inner: View) -> None:
+        if len(inner.shape) != 1:
+            raise ValueError("A_log view requires a vector")
+        self.inner = inner
+        self.shape = inner.shape
+        self.dtype = inner.dtype
+
+    def read(self, begin: int, end: int) -> np.ndarray:
+        values = self.inner.read(begin, end)
+        if not np.all(values < 0):
+            raise ValueError(
+                f"{self.inner.shape}: ssm_a is not negative; it is not -exp(A_log) in this file"
+            )
+        return np.log(-values)
+
 
 # ------------------------------------------------------------------- head-order permutation
 
+def grouped_from_tiled(count: int, key_heads: int, per_key: int, head_dim: int) -> np.ndarray:
+    """Index map that reads llama.cpp's tiled V-head axis back into HF's grouped order.
 
-def tiled_to_grouped(count: int, key_heads: int, per_key: int, head_dim: int) -> np.ndarray:
-    """Inverse of llama.cpp's V-head tiling.
+    llama.cpp's `_LinearAttentionVReorderBase._reorder_v_heads` (conversion/qwen.py) reshapes the
+    grouped axis to `[key_head, head_in_group, head_dim]`, transposes the first two axes and
+    flattens, so the GGUF position `t` of the head whose grouped position is `g = key_head *
+    per_key + head_in_group` is
 
-    GGUF (tiled): position = head_in_group * key_heads + key_head.
-    HF  (grouped): position = key_head * heads_per_group + head_in_group.
+        t(g) = (g % per_key) * key_heads + g / per_key.
+
+    The GGUF therefore holds `gguf[t(g)] = grouped[g]`, and a reader that wants the grouped order
+    needs `out[g] = in[t(g)]`, i.e. `perm[g] = t(g)` - exactly the array returned here (every view
+    in this module reads `out[i] = inner[perm[i]]`).
+
+    The other direction, `perm[g] = t^-1(g)` (which is what a "tiled to grouped" index map looks
+    like if the data flow is confused with the index map), leaves the axis tiled twice and is the
+    defect that made the Qwen4Exp artifact read every value head against the wrong key head.
+    Criterion for a finished artifact: `artifact[g] == gguf[t(g)]` for the V rows, the z rows, the
+    a/b control rows, A_log, dt_bias, the conv V channels and the out_proj columns - all seven,
+    one direction.
     """
     if key_heads * per_key * head_dim != count:
         raise ValueError(
             f"V-head order: {key_heads} key heads x {per_key} value heads x {head_dim} does not "
             f"cover {count} rows"
         )
-    grouped = np.arange(count).reshape(key_heads, per_key, head_dim)
-    return np.transpose(grouped, (1, 0, 2)).reshape(-1)
+    tiled = np.arange(count).reshape(per_key, key_heads, head_dim)
+    return np.transpose(tiled, (1, 0, 2)).reshape(-1)
+

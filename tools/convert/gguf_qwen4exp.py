@@ -18,7 +18,11 @@ Three things make that non-trivial, and each is answered here rather than in the
   row range here.
 * Head order. For linear attention llama.cpp stores V heads in *tiled* order
   (`_LinearAttentionVReorderBase`), while NInfer's kernels read the HF *grouped* order. The
-  inverse permutation is applied whenever `linear_num_key_heads != linear_num_value_heads`.
+  permutation is applied whenever `linear_num_key_heads != linear_num_value_heads`, in the one
+  direction `grouped_from_tiled` documents (`artifact[g] == gguf[t(g)]`); applying its inverse - or
+  applying any V-head permutation twice - reads every value head against the wrong key head.
+* Decay. llama.cpp writes `ssm_a = -exp(A_log)`; the engine's GDN applies `-expf(A_log)`, so the
+  stored decay has to come back into the log domain.
 
 Scope: text. Vision lives in a separate mmproj and MTP has its own MTP-only conversion; asking
 for those components from a GGUF is refused with that reason instead of producing a silently
@@ -44,15 +48,18 @@ _TEXT_ARCH = "qwen4exp"
 from .gguf_views import (  # noqa: E402  (after the architecture constant, with the other tables)
     View,
     _ArrayView,
+    _ColPermute,
     _Cols,
     _ConcatRows,
     _Direct,
     _FlatPermute,
+    _FusedExperts,
+    _LogOfNegative,
     _Reshape,
     _RowPermute,
     _Rows,
     _empty,
-    tiled_to_grouped,
+    grouped_from_tiled,
 )
 
 # ------------------------------------------------------------------- head-order permutation
@@ -389,7 +396,7 @@ class GGUFSource:
         v = nv * dv
         c = 2 * q + v
         per_key = nv // nk if nk else 1
-        perm_v = tiled_to_grouped(v, nk, per_key, dv) if tiled else None
+        perm_v = grouped_from_tiled(v, nk, per_key, dv) if tiled else None
         name = target + "linear_attn."
         merged_name = prefix + "attn_qkv_gate.weight"
         qkv_name = prefix + "attn_qkv.weight"
@@ -420,7 +427,7 @@ class GGUFSource:
             if self._has(prefix + gguf_name + ".weight"):
                 weight = self._direct(prefix + gguf_name + ".weight")
                 if tiled:
-                    weight = _RowPermute(weight, tiled_to_grouped(nv, nk, per_key, 1))
+                    weight = _RowPermute(weight, grouped_from_tiled(nv, nk, per_key, 1))
                 self._add(name + f"{suffix}.weight", weight)
         if self._has(prefix + "ssm_conv1d.weight"):
             raw = self._direct(prefix + "ssm_conv1d.weight")
@@ -442,7 +449,10 @@ class GGUFSource:
                 if self._has(prefix + candidate):
                     weight = self._direct(prefix + candidate)
                     if tiled:
-                        weight = _FlatPermute(weight, tiled_to_grouped(nv, nk, per_key, 1))
+                        weight = _FlatPermute(weight, grouped_from_tiled(nv, nk, per_key, 1))
+                    if gguf_name == "ssm_a":
+                        # llama.cpp folds A_log into -exp(A_log); the engine applies -exp(A_log).
+                        weight = _LogOfNegative(weight)
                     self._add(name + suffix, weight)
                     break
             else:
@@ -452,7 +462,7 @@ class GGUFSource:
         if self._has(prefix + "ssm_out.weight"):
             out = self._direct(prefix + "ssm_out.weight")
             if tiled:
-                out = _ColPermute(out, tiled_to_grouped(v, nk, per_key, dv))
+                out = _ColPermute(out, grouped_from_tiled(v, nk, per_key, dv))
             self._add(name + "out_proj.weight", out)
 
     def _ple(self, prefix: str, target: str, cfg: dict) -> None:

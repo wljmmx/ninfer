@@ -43,8 +43,10 @@ from .gguf_views import (
     _Direct,
     _FlatPermute,
     _Info,
+    _LogOfNegative,
     _RowPermute,
     _Rows,
+    grouped_from_tiled,
 )
 from .sources.gguf import QUANT_NAMES, GGUFFile, open_gguf
 
@@ -85,40 +87,14 @@ class _Minus1(View):
         return self.inner.read(begin, end) - 1.0
 
 
-class _LogOfNegative(View):
-    """`log(-ssm_a)`: llama.cpp writes GDN's decay as `-exp(A_log)`."""
-
-    def __init__(self, inner: View) -> None:
-        if len(inner.shape) != 1:
-            raise ValueError("A_log view requires a vector")
-        self.inner = inner
-        self.shape = inner.shape
-        self.dtype = inner.dtype
-
-    def read(self, begin: int, end: int) -> np.ndarray:
-        values = self.inner.read(begin, end)
-        if not np.all(values < 0):
-            raise ValueError(
-                f"{self.inner.shape}: ssm_a is not negative; it is not -exp(A_log) in this file"
-            )
-        return np.log(-values)
-
-
 def value_head_order(count: int, key_heads: int, per_key: int, head_dim: int) -> np.ndarray:
     """GGUF (tiled) -> HF (grouped) index map for every V-head-carrying axis.
 
-    GGUF position = head_in_group * key_heads + key_head; HF position = key_head * per_key +
-    head_in_group. Measured on the existing artifact: applying this map gives a relative error of
-    0.00-0.09 against its weights, while the other direction gives 1.2-1.4 (i.e. a different
-    tensor). `tiled_to_grouped` is the other direction and is what the Qwen4Exp file needed.
+    The map itself, and the criterion it satisfies on a finished artifact, live in
+    `gguf_views.grouped_from_tiled`; it is re-exported here under the name the Qwen3.5 builder
+    reads, and it is the same one the Qwen4Exp adapter uses.
     """
-    if key_heads * per_key * head_dim != count:
-        raise ValueError(
-            f"V-head order: {key_heads} x {per_key} x {head_dim} does not cover {count}"
-        )
-    return np.transpose(
-        np.arange(count).reshape(per_key, key_heads, head_dim), (1, 0, 2)
-    ).reshape(-1)
+    return grouped_from_tiled(count, key_heads, per_key, head_dim)
 
 
 # ------------------------------------------------------------------------------------ metadata

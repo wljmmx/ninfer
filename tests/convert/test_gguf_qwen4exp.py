@@ -28,7 +28,7 @@ from tools.convert.sources.gguf import GGUFFile  # noqa: E402
 HIDDEN, VOCAB, LAYERS = 64, 32, 2
 HEADS, KV_HEADS, HEAD_DIM = 2, 1, 8
 HC_COUNT, HC_RANK = 2, 4
-NK, NV, DK, DV = 2, 4, 4, 4
+NK, NV, DK, DV = 2, 6, 4, 4
 CONV_K = 3
 EXPERTS, INTER, SHARED = 4, 16, 8
 IDX_HEADS, IDX_KV, IDX_DIM, IDX_TOPK = 2, 1, 4, 4
@@ -118,7 +118,7 @@ def _write_tiny(dir_path: Path) -> tuple[Path, dict[str, np.ndarray]]:
             add(p + "ssm_alpha.weight", _t(rng, (NV, HIDDEN)))
             add(p + "ssm_beta.weight", _t(rng, (NV, HIDDEN)))
             add(p + "ssm_conv1d.weight", _t(rng, (C, CONV_K)))
-            add(p + "ssm_a.weight", _t(rng, (NV,)))
+            add(p + "ssm_a.weight", -np.exp(rng.standard_normal(NV) * 2.0).astype(np.float16))
             add(p + "ssm_dt.weight", _t(rng, (NV,)))
             add(p + "ssm_norm.weight", _t(rng, (DV,)))
             add(p + "ssm_out.weight", _t(rng, (HIDDEN, V)))
@@ -151,6 +151,11 @@ def _write_tiny(dir_path: Path) -> tuple[Path, dict[str, np.ndarray]]:
     }))
     (dir_path / "tokenizer_config.json").write_text(json.dumps({"model_max_length": 128}))
     (dir_path / "generation_config.json").write_text(json.dumps({"eos_token_id": 1}))
+    # The engine's config parse requires `indexer_compress_ratio`, which llama.cpp does not write
+    # into the GGUF hyperparameters; a real conversion passes the checkpoint's config.json for it.
+    (dir_path / "config.json").write_text(json.dumps({
+        "text_config": {"indexer_compress_ratio": 8},
+    }))
     return model, tensors
 
 
@@ -263,14 +268,22 @@ def test_merged_tensors_are_split_back(tmp_path):
             "model.language_model.layers.0.linear_attn.in_proj_z.weight").reshape(V, HIDDEN)
         merged = torch.from_numpy(
             tensors["blk.0.attn_qkv_gate.weight"].astype(np.float32)).to(torch.bfloat16)
-        from tools.convert.gguf_qwen4exp import tiled_to_grouped
+        from tools.convert.gguf_views import grouped_from_tiled
 
-        perm = tiled_to_grouped(V, NK, NV // NK, DV)
-        # Head-level map (head_dim=1): [v0 of k0, v0 of k1, v1 of k0, v1 of k1].
-        assert tiled_to_grouped(NV, NK, NV // NK, 1).tolist() == [0, 2, 1, 3]
+        perm = grouped_from_tiled(V, NK, NV // NK, DV)
+        # Head-level map (head_dim=1), non-square on purpose: NV=6 over NK=2 rules out the
+        # self-inverse case (NK == per_key) that hides a reversed direction.
+        assert grouped_from_tiled(NV, NK, NV // NK, 1).tolist() == [0, 2, 4, 1, 3, 5]
         assert torch.equal(qkv[: 2 * Q], merged[: 2 * Q])
         assert torch.equal(qkv[2 * Q :], merged[2 * Q :][torch.from_numpy(perm)])
         assert torch.equal(z, merged[C:][torch.from_numpy(perm)])
+        # The decay comes back in the log domain: llama.cpp stores ssm_a = -exp(A_log).
+        a_log = source.read_flat(
+            "model.language_model.layers.0.linear_attn.A_log").float().numpy()
+        ssm_a = tensors["blk.0.ssm_a.weight"].reshape(-1)
+        assert np.all(ssm_a < 0)
+        flat = grouped_from_tiled(NV, NK, NV // NK, 1)
+        assert np.allclose(a_log, np.log(-ssm_a[flat]), rtol=0, atol=0.02), a_log
 
 
 def test_conversion_from_gguf(tmp_path, monkeypatch):
