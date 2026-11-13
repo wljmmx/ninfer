@@ -11,8 +11,12 @@ struct Plan {
 };
 
 Plan resolve_plan(int input_rows, int width, int batch) {
-    if (input_rows != 4096 && input_rows != 17408)
-        throw std::invalid_argument("linear dynamic grouped conv add: C must be 4096 or 17408");
+    // port (sm_89): C is the layer's channel count, and the schedules tile it by 128 - the old
+    // 4096/17408 whitelist was the 35B pair. Qwen3.8-Flash-Next's draft head is C 15360 (and its
+    // smaller sibling 7680), which is also a multiple of the tile.
+    if (input_rows % 128 != 0)
+        throw std::invalid_argument(
+            "linear dynamic grouped conv add: C must be a multiple of 128");
     if (width < 2 || width > 16 || batch < 1 || batch > 8)
         throw std::invalid_argument("linear dynamic grouped conv add: invalid W/B profile");
     const int columns = width * batch;

@@ -71,8 +71,12 @@ bool is_companion_shape(const Q8LinearSwiGluProblem& problem) noexcept {
 }
 
 bool is_dflash2_shape(const Q8LinearSwiGluProblem& problem) noexcept {
-    return problem.gate_up_rows == 34816 && problem.output_rows == 17408 && problem.k == 5120 &&
-           problem.padded_k == 5120;
+    // port (sm_89): the relation, not the 35B constants. 35B is gate_up 34816 = 2 x 17408 at
+    // k 5120; Qwen3.8-Flash-Next's draft head is 15360 = 2 x 7680 at k 2560. The DFlash2 schedules
+    // tile K by 128 at run time (Q8A16MmaSchedule<..., 128, ...>), so any K that divides by the tile
+    // is servable - the old constant refused the draft head before its weights were read.
+    return problem.gate_up_rows == 2 * problem.output_rows && problem.k == problem.padded_k &&
+           problem.k % 128 == 0;
 }
 
 bool supported_shape(const Q8LinearSwiGluProblem& problem) noexcept {
