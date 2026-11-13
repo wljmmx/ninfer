@@ -23,6 +23,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -300,6 +301,21 @@ void add_resources(ModelFile& file) {
     file.resource("tokenizer_config.json", Json{{"added_tokens_decoder", Json::object()}}.dump());
     file.resource("generation_config.json", Json{{"eos_token_id", 1}}.dump());
     file.resource("chat_template.jinja", "{{ prompt }}");
+    // The PLE hash controls: three layer multipliers, then the sixteen head vocabularies and their
+    // row offsets, as int64 words. A PLE artifact without them cannot hash at all - the loader
+    // names the missing resource - so the fixture must carry them like a real one does.
+    std::array<std::int64_t, 3 + 16 + 16> controls{};
+    controls[0] = 23703573157769;
+    controls[1] = 20109073645365;
+    controls[2] = 8052911324071;
+    constexpr std::int64_t per_head = 20000000;
+    for (std::size_t head = 0; head < 16; ++head) {
+        controls[3 + head]      = per_head + std::int64_t(head);
+        controls[3 + 16 + head] = std::int64_t(head) * per_head;
+    }
+    std::string bytes(sizeof(controls), '\0');
+    std::memcpy(bytes.data(), controls.data(), sizeof(controls));
+    file.resource("ple_hash_controls", bytes);
 }
 
 void build(ModelFile& file) {
