@@ -1847,8 +1847,17 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
     // of a layer would otherwise replace the decode set with experts decode never asks for; a pool
     // that cannot hold a layer gains nothing from protecting it, so the floor is the same one the
     // fused path uses.
-    const bool refresh = !set_initialised_ || tokens <= kSplitSetUpdateTokens ||
-                         narrowest < kSplitPrefillProtectMin;
+    // port (sm_89): a decode step no longer rebuilds the set from scratch.
+    //
+    // `tokens <= 8` used to force refresh, so every token took "this step's 10 routes + the
+    // decayed-score top 118" as the new set. Those 118 come from a score that only looks at the
+    // last few steps, so the previous step's routes fell out of the set and had to be installed
+    // again the step after - measured as 22 of 30 routes newly installed per layer, 1.32 GiB of
+    // upload per token, and 6.8 tok/s. Holding the set and adding the routes is the path the
+    // !refresh branch below already took during prefill; decode takes it too now.
+    const bool refresh = !set_initialised_ || narrowest < kSplitPrefillProtectMin;
+    // A decode step still has to install the routes it just saw; it just does not discard the rest.
+    const bool install = refresh || tokens <= kSplitSetUpdateTokens;
 
     std::array<std::vector<std::uint32_t>, 3> wanted;
     std::vector<std::uint32_t> ranked; // built once: the ranking is per expert, not per run
@@ -1862,31 +1871,37 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
             continue;
         }
         std::fill(chosen.begin(), chosen.end(), false);
-        if (!refresh) {
-            // Hold the set: the pool keeps what it holds, and only the seats it leaves go to this
-            // layer's demand.
-            for (std::uint32_t expert = 0; expert < count_ && set.size() < capacity[index];
-                 ++expert) {
-                if (cache_->expert_slot(split_[index].bank, expert)) {
-                    chosen[expert] = true;
-                    set.push_back(expert);
-                }
-            }
-        }
+        // Routes first, then what the pool already holds. The order is the difference between a
+        // set that converges and one that thrashes: filling the held set first let 128 residents
+        // take every seat, so this step's own routes did not fit and fell to the CPU half
+        // (host_routes 7 of 10). Routes first keeps them addressable and still retains the rest.
         for (std::size_t i = 0; i < values && set.size() < capacity[index]; ++i) {
             const auto expert = static_cast<std::uint32_t>(route_ids[i]);
             if (chosen[expert]) { continue; }
             chosen[expert] = true;
             set.push_back(expert);
         }
-        if (set.size() < capacity[index]) {
-            if (ranked.empty()) {
-                ranked.resize(count_);
-                std::iota(ranked.begin(), ranked.end(), 0U);
-                std::stable_sort(ranked.begin(), ranked.end(), [&](std::uint32_t a, std::uint32_t b) {
-                    return hot_score_[a] > hot_score_[b];
-                });
+        if (ranked.empty()) {
+            ranked.resize(count_);
+            std::iota(ranked.begin(), ranked.end(), 0U);
+            std::stable_sort(ranked.begin(), ranked.end(), [&](std::uint32_t a, std::uint32_t b) {
+                return hot_score_[a] > hot_score_[b];
+            });
+        }
+        if (!refresh) {
+            // Hold the set in score order, not id order. Keeping the lowest ids filled all 128
+            // seats from the bottom of the expert range, so a high-id route was evicted the step
+            // after it arrived and uploaded again - the 22-of-30 reinstall the counter showed.
+            for (const auto expert : ranked) {
+                if (set.size() >= capacity[index]) { break; }
+                if (chosen[expert]) { continue; }
+                if (cache_->expert_slot(split_[index].bank, expert)) {
+                    chosen[expert] = true;
+                    set.push_back(expert);
+                }
             }
+        }
+        if (set.size() < capacity[index]) {
             for (const auto expert : ranked) {
                 if (set.size() >= capacity[index]) { break; }
                 if (chosen[expert]) { continue; }
@@ -1953,7 +1968,7 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
 
     // Install each run's set, then publish all three.
     demoted_.clear();
-    for (std::size_t index = 0; index < split_.size(); ++index) {
+    for (std::size_t index = 0; index < split_.size() && install; ++index) {
         (void)cache_->set_resident_experts(split_[index].bank,
                                            std::span<const std::uint32_t>(wanted[index]),
                                            static_cast<std::uint32_t>(wanted[index].size()));
