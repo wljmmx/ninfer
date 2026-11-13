@@ -39,6 +39,47 @@ std::size_t step_bytes(std::uint32_t tokens, std::uint32_t batch) {
            sizeof(std::uint16_t);
 }
 
+// Diagnosis (NINFER_PLE_DUMP=<dir>): write the PLE stage's operands and results as raw planes so a
+// recomputation from the artifact can be compared column by column. A plane is [rows, cols] at the
+// engine's own pitch - the feature axis is the contiguous one, exactly like the GDN probe.
+void ple_dump_plane(const char* tag, const Tensor& value, std::int32_t rows, std::int32_t cols,
+                    cudaStream_t stream) {
+    const char* dir = std::getenv("NINFER_PLE_DUMP");
+    if (dir == nullptr || *dir == '\0' || value.data == nullptr || rows <= 0 || cols <= 0) {
+        return;
+    }
+    if (value.dtype != DType::BF16) { return; }
+    const std::size_t bytes = std::size_t(rows) * std::size_t(cols) * sizeof(std::uint16_t);
+    std::vector<std::uint8_t> host(bytes);
+    if (cudaMemcpyAsync(host.data(), value.data, bytes, cudaMemcpyDeviceToHost, stream) !=
+        cudaSuccess) {
+        return;
+    }
+    if (cudaStreamSynchronize(stream) != cudaSuccess) { return; }
+    char path[1024];
+    std::snprintf(path, sizeof path, "%s/ple-%s-%dx%d-bf16.bin", dir, tag, rows, cols);
+    if (FILE* file = std::fopen(path, "wb")) {
+        std::fwrite(host.data(), 1, host.size(), file);
+        std::fclose(file);
+    }
+    std::fprintf(stderr, "[ple-dump] %s\n", path);
+    std::fflush(stderr);
+}
+
+void ple_dump_i32(const char* tag, const std::int32_t* values, std::size_t count) {
+    const char* dir = std::getenv("NINFER_PLE_DUMP");
+    if (dir == nullptr || *dir == '\0' || values == nullptr || count == 0) { return; }
+    char path[1024];
+    std::snprintf(path, sizeof path, "%s/ple-%s-%llu-i32.bin", dir, tag,
+                  static_cast<unsigned long long>(count));
+    if (FILE* file = std::fopen(path, "wb")) {
+        std::fwrite(values, sizeof(std::int32_t), count, file);
+        std::fclose(file);
+    }
+    std::fprintf(stderr, "[ple-dump] %s\n", path);
+    std::fflush(stderr);
+}
+
 } // namespace
 
 PleLayerRuntime::PleLayerRuntime(const PleLayerWeights& weights, std::uint32_t max_tokens,
@@ -163,6 +204,11 @@ void PleLayerRuntime::apply(const Tensor& embedding, Tensor& residual, Tensor& n
     Tensor projected   = projection_.view({std::int32_t(kPleProjectionRows), columns});
     ops::linear(input, weights_.projection, projected, weights_.policy, *workspace_,
                 execution.stream);
+    ple_dump_plane("residual-in", residual4, std::int32_t(kPleChannels), columns,
+                   execution.stream);
+    ple_dump_plane("embedding", input.view({width, columns}), width, columns, execution.stream);
+    ple_dump_plane("projected", projected, std::int32_t(kPleProjectionRows), columns,
+                   execution.stream);
 
     // `projection` is [key rows (H per stream); value rows], so the two Op views are the two
     // slices of one contiguous parent that the Op contract documents as an example. Their column
@@ -184,9 +230,14 @@ void PleLayerRuntime::apply(const Tensor& embedding, Tensor& residual, Tensor& n
                                                  weights_.norm_conv, weights_.rms_epsilon};
     ops::ple_gate({key, value}, residual4, gate_parameters, batch_view,
                   {records_, record_offsets}, gated_, execution);
+    ple_dump_plane("gated", gated_, std::int32_t(kPleChannels), columns, execution.stream);
     ops::ple_conv_add_norm(residual4, gated_, weights_.convolution, batch_view, {history_, slots},
                            {records_, record_offsets}, next_norm_weight, next_epsilon, residual4,
                            normalized4, execution);
+    ple_dump_plane("residual-out", residual4, std::int32_t(kPleChannels), columns,
+                   execution.stream);
+    ple_dump_plane("normalized", normalized4, std::int32_t(kPleChannels), columns,
+                   execution.stream);
 }
 
 void PleLayerRuntime::commit(const Tensor& accepted_columns, const Tensor& valid_columns,
@@ -401,6 +452,7 @@ void PleTextStage::begin(const PleStepWindow& window, CudaExecutionView executio
     window_ids_.assign(window.ids.begin(), window.ids.end());
     window_live_.assign(window.valid_columns.begin(), window.valid_columns.end());
     window_slots_.assign(window.slots.begin(), window.slots.end());
+    ple_dump_i32("ids", window_ids_.data(), window_ids_.size());
     for (std::uint32_t b = 0; b < batch; ++b) {
         const auto slot  = std::uint32_t(window.slots[b]);
         const auto& tail = started_[slot] ? tail_[slot] : std::array<std::int32_t, 2>{eos_, eos_};

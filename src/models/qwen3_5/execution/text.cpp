@@ -1990,6 +1990,105 @@ void gdn_dump_plane(const char* tag, const Tensor& value, std::int32_t rows, std
     std::fprintf(stderr, "[gdn-dump] %s\n", path);
     std::fflush(stderr);
 }
+
+// Diagnosis (NINFER_RESIDUAL_DUMP=<dir>): one plane per layer and stage, [streams*hidden, T] at
+// the engine's own column pitch, so a recomputation can name the step that first diverges.
+void residual_dump(const char* stage, const Tensor& value, std::int32_t rows, std::int32_t cols,
+                   int layer, cudaStream_t stream) {
+    const char* dir = std::getenv("NINFER_RESIDUAL_DUMP");
+    if (dir == nullptr || *dir == '\0' || value.data == nullptr || rows <= 0 || cols <= 0) { return; }
+    if (const char* list = std::getenv("NINFER_RESIDUAL_DUMP_LAYERS")) {
+        bool wanted = false;
+        for (const char* cursor = list; *cursor != '\0';) {
+            char* end        = nullptr;
+            const long entry = std::strtol(cursor, &end, 10);
+            if (end == cursor) { break; }
+            if (entry < 0 || static_cast<int>(entry) == layer) { wanted = true; break; }
+            cursor = *end == ',' ? end + 1 : end;
+        }
+        if (!wanted) { return; }
+    }
+    if (value.ne[0] != rows) { return; }
+    const std::size_t item = value.dtype == DType::FP32 ? 4U : 2U;
+    const std::size_t pitch = static_cast<std::size_t>(value.nb[1]);
+    const std::size_t run   = static_cast<std::size_t>(rows) * item;
+    if (pitch < run) { return; }
+    std::vector<std::uint8_t> host(run * static_cast<std::size_t>(cols));
+    if (cudaMemcpy2DAsync(host.data(), run, value.data, pitch, run,
+                          static_cast<std::size_t>(cols), cudaMemcpyDeviceToHost,
+                          stream) != cudaSuccess) {
+        return;
+    }
+    if (cudaStreamSynchronize(stream) != cudaSuccess) { return; }
+    char path[1024];
+    std::snprintf(path, sizeof path, "%s/res-l%d-%s-%dx%d-%s.bin", dir, layer, stage, rows, cols,
+                  item == 4U ? "fp32" : "bf16");
+    if (FILE* file = std::fopen(path, "wb")) {
+        std::fwrite(host.data(), 1, host.size(), file);
+        std::fclose(file);
+    } else {
+        std::fprintf(stderr, "[res-dump] cannot open %s\n", path);
+    }
+    std::fprintf(stderr, "[res-dump] %s\n", path);
+    std::fflush(stderr);
+}
+
+// The GDN value-head axis can arrive in either of two orders. HF (and this engine's delta rule)
+// groups the 48 value heads by key head - value head v belongs to key head v/(VH/KH) - while
+// llama.cpp's converter stores them tiled for ggml's broadcast, i.e. tiled head t is HF head
+// (t%KH)*(VH/KH) + t/KH. `NINFER_GDN_V_TILED` says the artifact on disk carries the tiled order, so
+// the value-space activations are gathered into the grouped order around the recurrence and the
+// product is scattered back before its output projection.
+bool gdn_v_tiled() {
+    static const bool on = std::getenv("NINFER_GDN_V_TILED") != nullptr;
+    return on;
+}
+
+// How many tiled permutations the artifact's value-head axis carries (0 = the documented grouped
+// order, 1 = tiled once, 2 = tiled twice).
+int gdn_v_tiling() {
+    static const int times = [] {
+        const char* value = std::getenv("NINFER_GDN_V_TILED");
+        if (value == nullptr || *value == '\0') { return 0; }
+        const long parsed = std::strtol(value, nullptr, 10);
+        return parsed == 0 ? 1 : static_cast<int>(parsed);
+    }();
+    return times;
+}
+
+// grouped[g] = tiled[KH*(g%R) + g/R]; the inverse is tiled[t] = R*(t%KH) + t/KH. The artifact on
+// disk carries the tiled order twice (the GGUF's own tiling plus the conversion's), so the gather
+// composes the map with itself: `NINFER_GDN_V_TILED=2` asks for that composition.
+int gdn_grouped_source(int head, int key_heads, int per_key, int times = 1) {
+    for (int i = 0; i < times; ++i)
+        head = key_heads * (head % per_key) + head / per_key;
+    return head;
+}
+
+int gdn_tiled_source(int head, int key_heads, int per_key, int times = 1) {
+    for (int i = 0; i < times; ++i)
+        head = per_key * (head % key_heads) + head / key_heads;
+    return head;
+}
+
+// Gather whole value heads. Every plane here is feature-contiguous per column, so one head is a
+// `rows_per_head * item` byte run inside each of the `columns` columns: one 2D copy per head.
+void gather_heads(Tensor& destination, const Tensor& source, int heads, int rows_per_head,
+                  int columns, int key_heads, int per_key, bool to_grouped, cudaStream_t stream,
+                  int times = 1) {
+    const std::size_t item  = destination.dtype == DType::FP32 ? 4U : 2U;
+    const std::size_t pitch = static_cast<std::size_t>(destination.nb[1]);
+    const std::size_t run   = static_cast<std::size_t>(rows_per_head) * item;
+    for (int head = 0; head < heads; ++head) {
+        const int from = to_grouped ? gdn_grouped_source(head, key_heads, per_key, times)
+                                    : gdn_tiled_source(head, key_heads, per_key, times);
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            static_cast<std::uint8_t*>(destination.data) + std::size_t(head) * run, pitch,
+            static_cast<const std::uint8_t*>(source.data) + std::size_t(from) * run, pitch, run,
+            static_cast<std::size_t>(columns), cudaMemcpyDeviceToDevice, stream));
+    }
+}
+
 } // namespace
 
 void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph,
@@ -2270,6 +2369,32 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     Tensor k_recurrent = kc.view({dimension(config_.gdn->linear_key_head_dim),
                                   dimension(config_.gdn->linear_num_key_heads), T});
 
+    // A tiled artifact is gathered into the grouped order the delta rule's head pairing assumes.
+    if (gdn_v_tiling() != 0) {
+        const int tiling      = gdn_v_tiling();
+        const int key_heads   = int(dimension(config_.gdn->linear_num_key_heads));
+        const int value_heads = int(dimension(config_.gdn->linear_num_value_heads));
+        const int per_key     = value_heads / key_heads;
+        const int head_dim    = int(dimension(config_.gdn->linear_value_head_dim));
+        Tensor v_grouped = work_.alloc(DType::BF16, {dimension(config_.gdn->value_width()), T});
+        Tensor z_grouped = work_.alloc(DType::BF16, {dimension(config_.gdn->value_width()), T});
+        Tensor g_grouped = work_.alloc(DType::FP32, {std::int32_t(value_heads), T});
+        Tensor b_grouped = work_.alloc(DType::FP32, {std::int32_t(value_heads), T});
+        gather_heads(v_grouped, vc, value_heads, head_dim, T, key_heads, per_key, true, s, tiling);
+        gather_heads(z_grouped, z.view({dimension(config_.gdn->value_width()), T}), value_heads,
+                     head_dim, T, key_heads, per_key, true, s, tiling);
+        gather_heads(g_grouped, g, value_heads, 1, T, key_heads, per_key, true, s, tiling);
+        gather_heads(b_grouped, beta, value_heads, 1, T, key_heads, per_key, true, s, tiling);
+        CUDA_CHECK(cudaMemcpyAsync(vc.data, v_grouped.data, v_grouped.bytes(),
+                                   cudaMemcpyDeviceToDevice, s));
+        CUDA_CHECK(cudaMemcpyAsync(z.data, z_grouped.data, z_grouped.bytes(),
+                                   cudaMemcpyDeviceToDevice, s));
+        CUDA_CHECK(cudaMemcpyAsync(g.data, g_grouped.data, g_grouped.bytes(),
+                                   cudaMemcpyDeviceToDevice, s));
+        CUDA_CHECK(cudaMemcpyAsync(beta.data, b_grouped.data, b_grouped.bytes(),
+                                   cudaMemcpyDeviceToDevice, s));
+    }
+
     Tensor vv = vc.view({dimension(config_.gdn->linear_value_head_dim),
                          dimension(config_.gdn->linear_num_value_heads), T});
     Tensor o  = workspace::gdn_recurrent_output(work_, config_, T)
@@ -2368,6 +2493,16 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
 
     {
         Tensor gdn_out = on.view({dimension(config_.gdn->value_width()), T});
+        if (gdn_v_tiling() != 0) {
+            // The output projection's columns follow the artifact's tiled value-head order.
+            const int key_heads   = int(dimension(config_.gdn->linear_num_key_heads));
+            const int value_heads = int(dimension(config_.gdn->linear_num_value_heads));
+            Tensor tiled = work_.alloc(DType::BF16, {dimension(config_.gdn->value_width()), T});
+            gather_heads(tiled, gdn_out, value_heads,
+                         int(dimension(config_.gdn->linear_value_head_dim)), T, key_heads,
+                         value_heads / key_heads, false, s, gdn_v_tiling());
+            gdn_out = tiled;
+        }
         if (normalized != nullptr) {
             ops::linear(gdn_out, p.output.weight, x, p.output.policy, work_, s);
         } else if (ops::w4a8_supported(p.output.weight, T)) {
@@ -2558,7 +2693,26 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 if (hc) {
                     nan_probe("pre-combine-residual", hc_.residual, layer);
                     nan_probe("pre-combine-product", hc_.output, layer);
+                    residual_dump("pre-mixer-combine", hc_.residual, 10240, tokens,
+                                  static_cast<int>(layer), ctx_.stream);
+                    residual_dump("mixer-product", hc_.output, 2560, tokens,
+                                  static_cast<int>(layer), ctx_.stream);
+                    residual_dump("mixer-block-input", hc_.input, 2560, tokens,
+                                  static_cast<int>(layer), ctx_.stream);
+                    residual_dump("mixer-inject", hc_.injection, 4, tokens,
+                                  static_cast<int>(layer), ctx_.stream);
+                    residual_dump("mixer-input-normed", hc_.normalized, 10240, tokens,
+                                  static_cast<int>(layer), ctx_.stream);
                     hc_combine(product, block.post_attention_norm, tokens);
+                    residual_dump("post-mixer-combine", hc_.residual, 10240, tokens,
+                                  static_cast<int>(layer), ctx_.stream);
+                    residual_dump("post-mixer-normed", hc_.normalized, 10240, tokens,
+                                  static_cast<int>(layer), ctx_.stream);
+                    if (std::getenv("NINFER_RESIDUAL_DUMP_ONLY") != nullptr && layer > 2) {
+                        std::fprintf(stderr, "[res-dump] stopping after layer %zu\n", layer);
+                        std::fflush(stderr);
+                        std::exit(0);
+                    }
                     nan_probe("post-combine-residual", hc_.residual, layer);
                     nan_probe("post-combine-normed", hc_.normalized, layer);
                     nan_probe("post-mixer-combine", hc_.input, layer);
@@ -2614,11 +2768,21 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 // The block that consumes the normalized view supplies the norm: the next block's
                 // attention correction, or the final one after the last block.
                 const auto next = layer + 1;
+                residual_dump("pre-moe-combine", hc_.residual, 10240, tokens,
+                              static_cast<int>(layer), ctx_.stream);
+                residual_dump("moe-product", hc_.output, 2560, tokens,
+                              static_cast<int>(layer), ctx_.stream);
+                residual_dump("moe-inject", hc_.injection, 4, tokens,
+                              static_cast<int>(layer), ctx_.stream);
                 hc_combine(product,
                            next < parameters_.text.layers.size()
                                ? parameters_.text.layers[next].input_norm
                                : *final_norm_,
                            tokens);
+                residual_dump("post-moe-combine", hc_.residual, 10240, tokens,
+                              static_cast<int>(layer), ctx_.stream);
+                residual_dump("post-moe-normed", hc_.normalized, 10240, tokens,
+                              static_cast<int>(layer), ctx_.stream);
                 nan_probe("pre-next-input", hc_.input, layer);
             }
             if constexpr (Tap::enabled) {
@@ -2852,6 +3016,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                     ? matrix_window(*head_sample_output_, len)
                     : work_.alloc(DType::BF16, {dimension(config_.hidden_size), len});
             final_hidden(x, sample, len);
+            residual_dump("sample", sample, 2560, len, -100, s);
             if (streams) {
                 const Tensor residual = hc_.residual.view({dimension(mtp_frame_width()), len});
                 CUDA_CHECK(cudaMemcpyAsync(xf.data, residual.data, residual.bytes(),
