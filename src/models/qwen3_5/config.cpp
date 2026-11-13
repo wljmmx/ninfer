@@ -203,8 +203,26 @@ RopeConfig rope(const Json& value, std::uint32_t head_dim) {
     }
     if (rope_scaling_mode() != RopeScalingMode::Yarn) { return out; }
     if (!value.contains("factor") || !value.contains("original_max_position_embeddings")) {
-        throw ArtifactError("NINFER_ROPE_SCALING=yarn requires the artifact to carry "
-                            "rope_parameters.factor and original_max_position_embeddings");
+        // The served window is a deployment choice, and a checkpoint exported without
+        // `rope_scaling` still has the trained window to scale from. Let the run name the two
+        // numbers it wants instead of requiring them to travel inside the file.
+        const char* factor_env   = std::getenv("NINFER_ROPE_YARN_FACTOR");
+        const char* original_env = std::getenv("NINFER_ROPE_YARN_ORIGINAL_MAX");
+        if (factor_env == nullptr || *factor_env == '\0' || original_env == nullptr ||
+            *original_env == '\0') {
+            throw ArtifactError(
+                "NINFER_ROPE_SCALING=yarn needs factor and original_max_position_embeddings, "
+                "either in the artifact's rope_parameters or as NINFER_ROPE_YARN_FACTOR / "
+                "NINFER_ROPE_YARN_ORIGINAL_MAX");
+        }
+        const double factor = std::strtod(factor_env, nullptr);
+        const std::uint64_t original = std::strtoull(original_env, nullptr, 10);
+        if (!(factor > 1.0) || original == 0) {
+            throw ArtifactError("NINFER_ROPE_YARN_FACTOR must exceed 1 and "
+                                "NINFER_ROPE_YARN_ORIGINAL_MAX must be positive");
+        }
+        out.yarn_declared_factor = static_cast<float>(factor);
+        out.yarn_declared_original_max_position_embeddings = original;
     }
     out.yarn                                  = true;
     out.yarn_factor                           = out.yarn_declared_factor;
