@@ -131,8 +131,13 @@ bool q8_linear_swiglu_admits(const Q8LinearSwiGluProblem& problem) noexcept {
 
 Q8LinearSwiGluPlan q8_linear_swiglu_resolve_plan(const Q8LinearSwiGluProblem& problem) {
     if (!q8_linear_swiglu_admits(problem)) {
-        throw std::invalid_argument(
-            "Q8 LinearSwiGLU: exact problem or column count is not admitted");
+        char message[224];
+        std::snprintf(message, sizeof(message),
+                      "Q8 LinearSwiGLU: not admitted (gate_up_rows=%d output_rows=%d k=%d "
+                      "padded_k=%d cols=%d)",
+                      problem.gate_up_rows, problem.output_rows, problem.k, problem.padded_k,
+                      problem.cols);
+        throw std::invalid_argument(message);
     }
     const auto resolve_from = [&](const auto& routes) -> Q8LinearSwiGluPlan {
         for (const RouteSpec& route : routes) {
