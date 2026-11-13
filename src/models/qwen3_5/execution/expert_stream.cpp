@@ -2467,7 +2467,14 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         // measured 5.2 tok/s at eight lanes against 50 for the same structure with the lanes
         // counted. It is sized from the widest step seen so far, so it does not resize per step
         // (a region that changes size republishes the table, see section forty-one).
-        if (tokens > 0) {
+        // port (sm_89): only a decode-sized step is a lane count. A 512-token prefill is one lane
+        // with 512 rows; counting it here latched lanes_seen_ at 512 for the rest of the run, which
+        // put the pool on the pure-SLRU branch (`slru_active`) and let the prefill's 512 experts
+        // evict the decode hot set - the 1440 experts a token needs all live in a 18528-seat pool,
+        // yet decode measured 3.6 tok/s. The widest step still sizes the spill ring, so it keeps
+        // being tracked, but only from steps that can actually be concurrent lanes.
+        constexpr std::int32_t kLaneSampleTokens = 8;
+        if (tokens > 0 && tokens <= kLaneSampleTokens) {
             lanes_seen_ = std::max<std::uint32_t>(lanes_seen_, static_cast<std::uint32_t>(tokens));
         }
         // Width-based policy: from six lanes up the whole-pool 50/50 SLRU measured 52 tok/s at
