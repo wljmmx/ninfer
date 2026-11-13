@@ -215,10 +215,11 @@ std::string timestamp() {
 
 std::filesystem::path prepare_output_directory(const Options& options,
                                                const ninfer::LoadSummary& load,
-                                               const CorpusSelection& corpus) {
+                                               const CorpusSelection& corpus,
+                                               ninfer::KvCacheStorage kv) {
     std::filesystem::path output = options.output.value_or(
         std::filesystem::path("profiles/perplexity") / safe_component(load.model_name) /
-        safe_component(load.prefill_signature) / kv_name(options.kv) /
+        safe_component(load.prefill_signature) / kv_name(kv) /
         safe_component(corpus.corpus_id) / safe_component(corpus.mode) / timestamp());
     if (std::filesystem::exists(output)) {
         if (!std::filesystem::is_directory(output) ||
@@ -267,6 +268,10 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     }
     engine_options.startup_observer = startup_log.observer();
     ninfer::Engine engine(std::move(engine_options));
+    // The engine owns the storage the run actually uses: a model whose indexed layers only admit
+    // one profile substitutes it at load time, so every label below names the effective choice
+    // rather than the request that was overruled.
+    const ninfer::KvCacheStorage kv_used = engine.options().kv_cache;
     const ninfer::LoadSummary load = engine.load_summary();
     startup_log.engine_ready(load);
     logger->info("kv capacity | pages {} of {} max | tokens {} | reservation {} B | slack after "
@@ -307,7 +312,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                  ninfer::product::format_pretty_count(total_windows),
                  ninfer::product::format_pretty_duration(preflight_seconds));
 
-    const std::filesystem::path output_directory = prepare_output_directory(options, load, corpus);
+    const std::filesystem::path output_directory = prepare_output_directory(options, load, corpus, kv_used);
     std::ofstream token_logprob_file;
     if (options.token_logprobs) {
         token_logprob_file.open(*options.token_logprobs, std::ios::binary | std::ios::trunc);
@@ -457,7 +462,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"stride_tokens", options.stride},
           {"prefill_chunk_tokens", 1024},
           {"score_tile_tokens", 1024},
-          {"kv_dtype", kv_name(options.kv)}}},
+          {"kv_dtype", kv_name(kv_used)}}},
         {"kv_capacity",
          {{"page_tokens", 64},
           {"main_page_groups", load.kv_main_page_groups},
@@ -493,7 +498,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
 
     std::cout << "Perplexity result\n"
               << "artifact: " << load.model_name << '\n'
-              << "kv: " << kv_name(options.kv) << ", corpus: " << corpus.corpus_id << " / "
+              << "kv: " << kv_name(kv_used) << ", corpus: " << corpus.corpus_id << " / "
               << corpus.mode << ", context/stride: " << options.context << '/' << options.stride
               << "\n\n";
     std::cout << std::left << std::setw(24) << "domain" << std::right << std::setw(16) << "tokens"
