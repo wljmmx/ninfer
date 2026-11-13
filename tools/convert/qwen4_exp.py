@@ -10,6 +10,7 @@ import torch
 
 from .model import Model, Parameter
 from .qwen_resources import load_qwen_resources
+from . import qwen3_5
 from .sources.logical import LogicalSource, select_rows, transpose_source
 from .sources.safetensors import SafetensorsSource, tensor_source
 
@@ -530,16 +531,32 @@ class Builder:
 
 
 def build_model(
-    base, *, components=("text",), companions=None, resource_overrides=None, mtp_source=None
+    base,
+    *,
+    components=("text",),
+    companions=None,
+    resource_overrides=None,
+    mtp_source=None,
+    vision_source=None,
 ):
     selected = set(components)
-    if "text" not in selected or selected - {"text", "vision", "mtp"}:
-        raise ValueError("Qwen4Exp supports text, vision and mtp components")
+    if "text" not in selected or selected - {"text", "vision", "mtp", "dflash2"}:
+        raise ValueError("Qwen4Exp supports text, vision, mtp and dflash2 components")
+    companions = {} if companions is None else companions
     cfg = text_config(base.config)
     records = {"text": {"config": cfg}}
     if "vision" in selected:
-        v = deepcopy(base.config["vision_config"])
-        v["model_type"] = "qwen4_exp_vision"
+        # A GGUF text file carries no tower, so the vision component may read its own source - the
+        # mmproj, which is llama.cpp's `clip` tower and is not specific to a text architecture.
+        tower = vision_source or base
+        if "vision_config" not in tower.config:
+            raise ValueError(
+                f"{tower.path}: the vision component needs a tower; pass --mmproj"
+            )
+        v = deepcopy(tower.config["vision_config"])
+        # The runtime's vision() accepts the Qwen3.5 tower spelling (and its MoE variant): the
+        # mmproj's block layout is that tower's, whichever text family it projects into.
+        v["model_type"] = "qwen3_5_vision"
         if (
             v.get("deepstack_visual_indexes", [])
             or v["out_hidden_size"] != cfg["hidden_size"]
@@ -561,6 +578,15 @@ def build_model(
             layer_types=["indexed_attention"],
         )
         records["mtp"] = {"config": m, "target": "text"}
+    if "dflash2" in selected:
+        if "dflash2" not in companions:
+            raise ValueError("selected dflash2 requires its source")
+        # The draft is Qwen3.5's DFlash2 head verbatim: its config and its parameter mapping do not
+        # read the text family, so the shared adapter builds the component for this text config.
+        records["dflash2"] = {
+            "config": qwen3_5.draft_config(companions["dflash2"].config, cfg, "dflash2"),
+            "target": "text",
+        }
     overrides = {
         "chat_template.jinja": Path(__file__).resolve().parents[1]
         / "chat_templates"
@@ -593,11 +619,13 @@ def build_model(
         "text/output_head",
         "lm_head.weight",
         (cfg["vocab_size"], h),
-        # The draft head shares this LM head, so the artifact must carry the Use the MTP path
-        # declares for it (load/text.cpp bind_text adds exactly this input for a speculative build).
+        # The draft head shares this LM head, so the artifact must carry the Use the draft path
+        # declares for it (load/text.cpp binds exactly these inputs for a speculative build).
         inputs=("text/final_hidden", "mtp/final_hidden")
-        if "mtp" in selected
-        else ("text/final_hidden",),
+        + (("dflash2/final_hidden",) if "dflash2" in selected else ()),
+    ) if "mtp" in selected or "dflash2" in selected else b.add(
+        "text/output_head", "lm_head.weight", (cfg["vocab_size"], h),
+        inputs=("text/final_hidden",),
     )
     b.hc("text/final_hc/", "model.language_model.hyper_connection_mixer.", False)
     for l, kind in enumerate(cfg["layer_types"]):
@@ -638,7 +666,18 @@ def build_model(
         mtp_builder.qsa(p, s, True)
         mtp_builder.moe(p, s)
     if "vision" in selected:
-        b.vision(records["vision"]["config"])
+        # The tower's tensors live in the mmproj, not in the text GGUF: read them from the tower's
+        # own source. A safetensors checkpoint carries both, so there `tower is base` and this is the
+        # plain builder.
+        vision_builder = Builder(model, base, cfg, store=tower) if vision_source else b
+        vision_builder.vision(records["vision"]["config"])
+    if "dflash2" in selected:
+        # The draft head's own parameters. Its mathematics is Qwen3.5's DFlash2 head verbatim, so
+        # the shared adapter emits it; the component reads the companion store for every tensor and
+        # the target text config for its width and vocabulary.
+        qwen3_5.attach_draft(
+            model, companions["dflash2"], records["dflash2"]["config"], cfg, "dflash2"
+        )
     expected = {
         key
         for key in base.weight_map

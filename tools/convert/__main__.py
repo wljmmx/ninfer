@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from contextlib import ExitStack
 import importlib.util
+from math import prod
 from pathlib import Path
 import sys
 from collections.abc import Mapping
@@ -12,7 +13,7 @@ from collections.abc import Mapping
 from .official_recipes import RECIPES
 from .pipeline import convert
 from .proposal import DEFAULT_RANKING, add_official_proposal
-from . import gguf_qwen3_5, qwen3_5, qwen4_exp
+from . import gguf_dflash, gguf_qwen3_5, qwen3_5, qwen4_exp
 from .gguf_qwen4exp import GGUFSource, open_source as open_gguf_source
 from .recipe import Recipe
 from .sources.gguf import open_gguf
@@ -54,12 +55,32 @@ def _builder(config):
 
 
 class SourceInputs(Mapping):
-    """Named optional sources are opened only when a recipe or component requests one."""
+    """Named optional sources are opened only when a recipe or component requests one.
 
-    def __init__(self, base, paths, stack):
+    A named source may be a `.gguf`: a draft head ships that way when only a GGUF distribution of
+    the target exists, and its reader differs per architecture (`dflash` here). The dispatch is by
+    extension, so `--source dflash2=X.gguf` and `--source dflash2=X.safetensors-dir` are the same
+    command with different files.
+    """
+
+    def __init__(self, base, paths, stack, *, text_config, root):
         self._sources = {"base": base}
         self._paths = dict(paths)
         self._stack = stack
+        self._text_config = text_config
+        self._root = root
+
+    def _open(self, name, path):
+        if Path(path).suffix.lower() != ".gguf":
+            return SafetensorsSource(path)
+        if name not in ("dflash", "dflash2"):
+            raise ValueError(
+                f"--source {name}={path}: a .gguf named source is a draft head (dflash/dflash2); "
+                "the text and vision GGUF files travel through --model, --mtp-gguf and --mmproj"
+            )
+        return gguf_dflash.open_companion(
+            path, self._text_config, backend=name, root=self._root
+        )
 
     def __getitem__(self, name):
         if name not in self._sources:
@@ -68,7 +89,7 @@ class SourceInputs(Mapping):
                     f"selected recipe requires source {name!r}; provide --source {name}=PATH"
                 )
             self._sources[name] = self._stack.enter_context(
-                SafetensorsSource(self._paths[name])
+                self._open(name, self._paths[name])
             )
         return self._sources[name]
 
@@ -119,6 +140,65 @@ def _function(value: str):
     if not callable(result):
         raise TypeError(f"{value}: recipe entry must be callable")
     return result
+
+
+def _report_plan(model, sources, components):
+    """Print what a conversion would write: component geometry, counts, and source mapping.
+
+    A 122 GiB conversion is not something to discover after the fact: this prints the component
+    configs, the parameter/element count per component, and - for every GGUF draft - the tensor
+    mapping that the artifact would take, then stops before touching the output path.
+    """
+    print(f"[dry-run] components: {', '.join(components)}")
+    counts: dict[str, list[int]] = {}
+    for name, parameter in model.parameters.items():
+        component = name.split("/", 1)[0]
+        entry = counts.setdefault(component, [0, 0])
+        entry[0] += 1
+        entry[1] += prod(parameter.shape)
+    for component in components:
+        count, elements = counts.get(component, [0, 0])
+        geometry = ""
+        config = model.components.get(component, {}).get("config", {})
+        if component in ("dflash", "dflash2"):
+            draft = config.get("dflash_config", {})
+            geometry = (
+                f" layers={config.get('num_hidden_layers')}"
+                f" heads={config.get('num_attention_heads')}/{config.get('num_key_value_heads')}"
+                f" head_dim={config.get('head_dim')}"
+                f" inter={config.get('intermediate_size')}"
+                f" ctx={config.get('max_position_embeddings')}"
+                f" theta={config.get('rope_parameters', {}).get('rope_theta')}"
+                f" taps={draft.get('target_layer_ids')}"
+            )
+            if "selector_rank" in draft:
+                geometry += (
+                    f" conv={draft.get('conv_kernel_size')}/{draft.get('conv_group_size')}"
+                    f" selector={draft.get('selector_rank')}/{draft.get('selector_top_k')}"
+                )
+        print(
+            f"[dry-run] {component}: {count} parameters, {elements:,} elements{geometry}"
+        )
+    for backend in ("dflash", "dflash2"):
+        if backend not in components:
+            continue
+        source = sources[backend]
+        pairs = getattr(source, "pairs", None)
+        if pairs is None:
+            print(
+                f"[dry-run] {backend} source: {source.path} "
+                f"({len(getattr(source, 'weight_map', {}))} tensors, HF names)"
+            )
+            continue
+        print(f"[dry-run] {backend} source: {source.path} ({len(pairs)} tensors)")
+        for logical, tensor in pairs.items():
+            shape = tuple(source.file.tensors[tensor].shape)
+            print(
+                f"[dry-run]   {logical} <- {tensor} {shape} "
+                f"{source.code_format(logical) or 'bf16'}"
+            )
+    total = sum(value[0] for value in counts.values())
+    print(f"[dry-run] would write {total} parameters; nothing written")
 
 
 def main(argv=None):
@@ -181,6 +261,15 @@ def main(argv=None):
                         help="standalone MTP GGUF (llama.cpp --nextn head) added as the mtp component")
     parser.add_argument("--mmproj", type=Path,
                         help="mmproj GGUF (llama.cpp vision projector) added as the vision component")
+    parser.add_argument("--dflash2-gguf", type=Path,
+                        help="standalone DFlash2 draft GGUF (llama.cpp `dflash` architecture) added "
+                             "as the dflash2 component")
+    parser.add_argument("--dflash-gguf", type=Path,
+                        help="standalone DFlash draft GGUF (llama.cpp `dflash` architecture) added "
+                             "as the dflash component")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="build and report the plan (components, counts, source mapping) without "
+                             "writing the artifact")
     args = parser.parse_args(argv)
     components = tuple(args.components.split(","))
     if len(components) != len(set(components)):
@@ -190,29 +279,54 @@ def main(argv=None):
         components = (*components, "mtp")
     if args.mmproj is not None and "vision" not in components:
         components = (*components, "vision")
+    paths = _pairs(args.source, "source")
+    if "base" in paths:
+        raise ValueError("select the base source with --model")
+    for backend, named in (
+        ("dflash", args.dflash_gguf),
+        ("dflash2", args.dflash2_gguf),
+    ):
+        if named is None:
+            continue
+        if backend in paths and paths[backend] != named:
+            raise ValueError(
+                f"--source {backend}={paths[backend]} and --{backend}-gguf={named} name two files"
+            )
+        paths[backend] = named
+        if backend not in components:
+            components = (*components, backend)
     is_gguf = Path(args.model).suffix.lower() == ".gguf"
     if is_gguf:
-        gguf_extra = set(components) - {"text", "mtp", "vision"}
+        gguf_extra = set(components) - {"text", "mtp", "vision", "dflash", "dflash2"}
         if gguf_extra:
             raise ValueError(
                 f"a .gguf source converts {sorted(gguf_extra)} only when their own GGUF is named "
-                "(--mtp-gguf, --mmproj); DFlash weights travel as an artifact component"
+                "(--mtp-gguf, --mmproj, --dflash2-gguf)"
             )
         if "mtp" in components and args.mtp_gguf is None:
             raise ValueError("a .gguf source has no standalone draft head; pass --mtp-gguf")
         if "vision" in components and args.mmproj is None:
             raise ValueError("a .gguf source carries no tower; pass --mmproj")
+        for backend in ("dflash", "dflash2"):
+            if backend in components and backend not in paths:
+                raise ValueError(
+                    f"a .gguf text file carries no {backend} weights; pass their own draft GGUF "
+                    f"with --{backend}-gguf PATH or --source {backend}=PATH"
+                )
     elif args.mmproj is not None:
         raise ValueError("--mmproj applies to a .gguf source; a Safetensors checkpoint has the tower")
-    paths = _pairs(args.source, "source")
-    if "base" in paths:
-        raise ValueError("select the base source with --model")
     overrides = _pairs(args.resource, "resource")
     with ExitStack() as stack:
         base = stack.enter_context(
             _open_base(args.model, gguf_config=args.gguf_config, gguf_root=args.gguf_root)
         )
-        sources = SourceInputs(base, paths, stack)
+        sources = SourceInputs(
+            base,
+            paths,
+            stack,
+            text_config=base.config.get("text_config") or base.config,
+            root=args.gguf_root or args.model.parent,
+        )
         companions = {
             key: sources[key] for key in ("dflash", "dflash2") if key in components
         }
@@ -228,8 +342,10 @@ def main(argv=None):
             )
             stack.callback(extra_builder["mtp_source"].close)
         if args.mmproj is not None:
-            if is_qwen4exp:
-                raise ValueError("--mmproj is not wired for the Qwen4Exp tower yet")
+            # An mmproj is a llama.cpp `clip` file: it describes the tower, not the text
+            # architecture, so the same reader serves both families. qwen4_exp's builder already
+            # accepts a `vision_source` (qwen4_exp.py:539, `tower = vision_source or base`); the
+            # family check that used to reject it here was the only thing blocking the conversion.
             hidden = int(base.config["text_config"]["hidden_size"])
             extra_builder["vision_source"] = gguf_qwen3_5.open_vision_source(
                 args.mmproj, hidden, root=args.gguf_root or args.model.parent
@@ -248,6 +364,9 @@ def main(argv=None):
             add_official_proposal(recipe, ranking=args.ranking, rows=args.proposal_rows)
         if args.override:
             _function(args.override)(model, recipe, sources)
+        if args.dry_run:
+            _report_plan(model, sources, components)
+            return
 
         def progress(index, total, job):
             label = job.parameters[0]
