@@ -26,6 +26,7 @@ struct SparseGqaArguments {
     std::int64_t begin;
     // Head geometry is (24,2) or (12,1): twelve query heads share one KV head.
     int query_heads, kv_heads;
+    int selected;  // blocks kept per query; also the row stride of `ids`
 
     __device__ int heads_per_kv() const { return query_heads / kv_heads; }
 

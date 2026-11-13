@@ -11,6 +11,9 @@ void profile(int lo, int hi, int batch, QsaIndexerExecutionEnvelope envelope,
     v.require(lo > 0 && hi >= lo && batch >= 1 && batch <= 8, "T/B interval");
     v.require(envelope.max_visible_tokens <= detail::qsa::kIndexerMaxVisibleTokens,
               "visible-token capacity");
+    v.require(envelope.selected_blocks > 0 &&
+                  envelope.selected_blocks <= detail::qsa::kIndexerSelectedMax,
+              "selected blocks must lie in (0, kIndexerSelectedMax]");
     v.require(execution.multiprocessor_count > 0, "SM count");
 }
 
@@ -24,7 +27,9 @@ std::size_t qsa_indexer_workspace_capacity_bytes(std::int32_t min_tokens, std::i
     // The allocation grows monotonically with T until the bounded window is full.
     WorkspaceLayoutBuilder layout;
     detail::qsa::allocate_indexer_workspace(
-        layout, detail::qsa::indexer_plan(max_tokens, batch_size, envelope.max_visible_tokens),
+        layout,
+        detail::qsa::indexer_plan(max_tokens, batch_size, envelope.max_visible_tokens,
+                                  static_cast<int>(envelope.selected_blocks)),
         batch_size);
     return layout.peak_bytes(1);
 }
@@ -43,14 +48,18 @@ void qsa_indexer(const Tensor& query, const QsaIndexCacheView& cache, const QsaB
             {cache.block_tables.ne[0], cache.block_tables.ne[1], 1, 1}, "block tables");
     v.require(std::uint64_t(cache.block_tables.ne[0]) * 64 >= envelope.max_visible_tokens,
               "table capacity");
-    v.dense(out.block_ids, DType::I32, {512, tokens, rows, 1}, 4, "block ids");
+    const int selected = static_cast<int>(out.block_ids.ne[0]);
+    v.dense(out.block_ids, DType::I32, {selected, tokens, rows, 1}, 4, "block ids");
     v.dense(out.block_counts, DType::I32, {tokens, rows, 1, 1}, 4, "block counts");
     const Tensor* inputs[]{&query,           &cache.keys,          &cache.block_tables,
                            &batch.positions, &batch.valid_columns, &batch.table_rows};
     v.require(!v.overlap(out.block_ids, out.block_counts), "output overlap");
     for (const auto* dst : {&out.block_ids, &out.block_counts})
         for (const auto* src : inputs) v.require(!v.overlap(*dst, *src), "output/input overlap");
-    const auto plan    = detail::qsa::indexer_plan(tokens, rows, envelope.max_visible_tokens);
+    v.require(selected == static_cast<int>(envelope.selected_blocks),
+              "block-id width agrees with the envelope's selected blocks");
+    const auto plan    = detail::qsa::indexer_plan(tokens, rows, envelope.max_visible_tokens,
+                                                   selected);
     auto scope         = workspace.scope();
     const auto scratch = detail::qsa::allocate_indexer_workspace(workspace, plan, rows);
     for (const auto* work : {&scratch.scores, &scratch.candidates}) {

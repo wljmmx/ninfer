@@ -119,12 +119,14 @@ struct QsaRawRecordWriteView {
 };
 
 struct QsaBlockSelection {
-    Tensor block_ids;    // Device I32 [512,T,B], logical four-token block ids.
+    Tensor block_ids;    // Device I32 [S,T,B], logical four-token block ids; S = envelope.selected_blocks.
     Tensor block_counts; // Device I32 [T,B].
 };
 
 struct QsaIndexerExecutionEnvelope {
     std::uint32_t max_visible_tokens = 0; // Fixed capture capacity, in original tokens.
+    // Blocks the selection keeps per query: the model's indexer budget divided by its block size.
+    std::uint32_t selected_blocks = 0;
 };
 
 /** Capacity over every positive T in [min_tokens,max_tokens], with fixed B and envelope.
@@ -143,10 +145,10 @@ struct QsaIndexerExecutionEnvelope {
  * For each live (t,b), p=positions[t,b], C=floor((p+1)/4), and g in [0,C):
  *   score[g] = sum_{h=0..3} max(0, sum_{d=0..127} index_query[d,h,t,b]*index.K[d,g]).
  * The common positive 1/sqrt(128) factor is omitted because only ranking is observable.
- * Select min(512,C) highest computed scores; exact numeric ties prefer smaller logical g.
+ * Select min(S,C) highest computed scores; exact numeric ties prefer smaller logical g.
  * Index g addresses block_tables[g/16,table_rows[b]], row g%16 of the index plane.
  * Four heads produce one shared selection. The incomplete token tail is not included here.
- * C<=512 selects every g without reading Q, keys or page-table contents.
+ * C<=S selects every g without reading Q, keys or page-table contents.
  *
  * Domain / numeric:
  * T>0, B=1..8. index_query is contiguous, 16-byte-aligned BF16 [128,4,T,B]. Cache keys
@@ -163,7 +165,7 @@ struct QsaIndexerExecutionEnvelope {
  *
  * Effects / output:
  * Outputs are naturally aligned, contiguous I32 with the shapes above. Each live count is
- * min(512,C); its first count ids are distinct and in [0,C), in unspecified order. Inert counts
+ * min(S,C); its first count ids are distinct and in [0,C), in unspecified order. Inert counts
  * are zero and do not read positions, Q, keys or table selectors. Ids beyond count are undefined.
  * Inputs and caches are preserved. Outputs, inputs and used workspace must not write/read
  * overlap; read-only views may share storage. There is no persistent state or publication.
@@ -223,8 +225,8 @@ struct QsaSparseGqaExecutionEnvelope {
  * Tables have contiguous I32 entries and a non-overlapping row stride. Positions are contiguous
  * I32 [T,B]; valid_columns/table_rows are contiguous Device I32 [B]. Each row has 0<=n<=T,
  * with consecutive nonnegative live positions satisfying p+1<=envelope.max_visible_tokens<=262144,
- * covered by its table. Selection is contiguous I32 [512,T,B] and [T,B]; each live c lies in
- * [0,min(512,C)], with distinct ids in [0,C). Id order is unspecified; the set need not be an
+ * covered by its table. Selection is contiguous I32 [S,T,B] and [T,B]; each live c lies in
+ * [0,min(S,C)], with distinct ids in [0,C). Id order is unspecified; the set need not be an
  * Indexer's actual TopK. Device metadata and readable selected pages are caller guarantees. Live
  * mathematical operands/results are finite. The independent oracle decodes the actual stored
  * codes/scales and evaluates basis transforms, dot, stable softmax, PV and sigmoid in FP64,
@@ -239,7 +241,7 @@ struct QsaSparseGqaExecutionEnvelope {
  * allocation. Fixed T/B, storage, views and device facts keep node count/order compatible across
  * envelope updates. The Host bound selects launch/workspace configuration without reading Device
  * metadata. Within a captured bound, per-query lengths, selections and mixed/all-select/inert
- * cases remain Device inputs during replay. Each query attends at most 512*4+3 tokens.
+ * cases remain Device inputs during replay. Each query attends at most S*4+3 tokens.
  * Same-stream ordering consumes Prepare/Indexer output directly; readiness/lifetime belong to the
  * caller.
  */

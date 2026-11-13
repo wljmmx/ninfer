@@ -325,4 +325,20 @@ def test_conversion_from_gguf(tmp_path, monkeypatch):
             .numpy()
         )
         assert np.array_equal(stored, source_words)
+        # Every other `*norm.weight` is folded: upstream writes `1 + w` (conversion/qwen.py's rule,
+        # plus the PLE and indexer gammas that do not end in `norm.weight`), and the engine's
+        # unit-offset rmsnorm adds the one back. The GDN norm above is the one exception.
+        for parameter, tensor in (
+            ("text/layers/1/attention/query_norm", "blk.1.attn_q_norm.weight"),
+            ("text/layers/1/ple/norm_key", "blk.1.ple_norm_key.weight"),
+        ):
+            folded = by_param[parameter]
+            stored = np.frombuffer(artifact.read_object(folded["object"]), dtype="<u2")
+            expected_folded = (
+                torch.from_numpy(tensors[tensor].astype(np.float32) - 1.0)
+                .to(torch.bfloat16)
+                .view(torch.uint16)
+                .numpy()
+            )
+            assert np.array_equal(stored, expected_folded), parameter
     assert report["objects"] > 50

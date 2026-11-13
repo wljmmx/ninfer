@@ -56,7 +56,8 @@ void launch_indexer(const Tensor& query, const QsaIndexCacheView& cache, const Q
                        0,
                        plan.window_tokens,
                        plan.columns,
-                       plan.partitions};
+                       plan.partitions,
+                       plan.selected};
     const bool vector_cache = reinterpret_cast<std::uintptr_t>(cache.keys.data) % 16 == 0 &&
                               cache.keys.nb[1] % 16 == 0 && cache.keys.nb[3] % 16 == 0;
     for (std::int64_t begin = 0; begin < a.tokens; begin += plan.window_tokens) {

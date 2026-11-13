@@ -120,6 +120,13 @@ struct IndexerConfig {
     std::uint32_t compress_ratio = 0;
     std::uint32_t budget         = 0;
 
+    // How many pooled blocks one query may keep. Upstream requires the budget to be a multiple of
+    // the block size (`top_k % kpool == 0` in qwen4exp.cpp), so the plan, the workspace and the
+    // kernel stride all read this one number rather than assuming the 2048/4 of any checkpoint.
+    [[nodiscard]] std::uint32_t selection_blocks() const noexcept {
+        return compress_ratio ? budget / compress_ratio : 0;
+    }
+
     [[nodiscard]] std::uint64_t query_width() const noexcept {
         return std::uint64_t(num_heads) * head_dim;
     }

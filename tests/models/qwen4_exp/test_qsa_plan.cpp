@@ -92,7 +92,8 @@ int main() {
         .query_heads = 24,
         .kv_heads    = 2,
         .storage     = KvCacheStorage::BFloat16,
-        .indexer     = ops::QsaIndexerExecutionEnvelope{.max_visible_tokens = 2048},
+        .indexer     = ops::QsaIndexerExecutionEnvelope{.max_visible_tokens = 2048,
+                                                         .selected_blocks = 512},
         .gqa         = ops::QsaSparseGqaExecutionEnvelope{.max_visible_tokens = 2048},
         .execution   = DeviceExecutionView{nullptr, 128, Device{}},
     };

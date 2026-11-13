@@ -1,4 +1,5 @@
 #include "ninfer/ops/qsa.h"
+#include "ops/softmax_attention/qsa/indexer_plan.h"
 #include "ops/softmax_attention/qsa/sparse_gqa_plan.h"
 #include "ops/softmax_attention/qsa/storage.h"
 #include "ops/softmax_attention/qsa/validation.h"
@@ -83,7 +84,10 @@ void qsa_sparse_gqa(const Tensor& query, const Tensor& gate, const PagedKVBatchL
     v.dense(batch.positions, DType::I32, {tokens, rows, 1, 1}, 4, "positions");
     v.metadata(batch.valid_columns, rows, "valid columns");
     v.metadata(batch.table_rows, rows, "table rows");
-    v.dense(selected.block_ids, DType::I32, {512, tokens, rows, 1}, 4, "block ids");
+    const int selected_blocks = static_cast<int>(selected.block_ids.ne[0]);
+    v.require(selected_blocks > 0 && selected_blocks <= detail::qsa::kIndexerSelectedMax,
+              "selected blocks must lie in (0, kIndexerSelectedMax]");
+    v.dense(selected.block_ids, DType::I32, {selected_blocks, tokens, rows, 1}, 4, "block ids");
     v.dense(selected.block_counts, DType::I32, {tokens, rows, 1, 1}, 4, "block counts");
     const Tensor* inputs[]{&query,
                            &gate,

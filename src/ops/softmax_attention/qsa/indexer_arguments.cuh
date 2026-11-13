@@ -14,7 +14,7 @@ struct IndexerArguments {
     float* scores;
     std::uint64_t* candidates;
     std::int32_t *ids, *counts;
-    int tokens, batch, begin, width, columns, partitions;
+    int tokens, batch, begin, width, columns, partitions, selected;
 
     __device__ std::int64_t column(int slot) const {
         return begin + slot % width + std::int64_t(slot / width) * tokens;
@@ -50,7 +50,7 @@ struct IndexerJobs {
         const int tid    = threadIdx.x;
         const int length = tid < a.width * a.batch ? a.visible(tid) : 0;
         if (tid < a.width * a.batch) visible[tid] = length;
-        if (!__syncthreads_or(length > kIndexerSelected)) return false;
+        if (!__syncthreads_or(length > a.selected)) return false;
         if (tid < 32) {
             const int per_row = (a.width + QueryTile - 1) / QueryTile;
             const int count   = per_row * a.batch;
@@ -61,7 +61,7 @@ struct IndexerJobs {
                 const int n =
                     g < count ? tile_visible(a, g / per_row, (g % per_row) * QueryTile, QueryTile)
                               : 0;
-                int sum = n > kIndexerSelected ? (n + KeyTile - 1) / KeyTile : 0;
+                int sum = n > a.selected ? (n + KeyTile - 1) / KeyTile : 0;
 #pragma unroll
                 for (int offset = 1; offset < 32; offset *= 2) {
                     const int previous = __shfl_up_sync(0xffffffffu, sum, offset);

@@ -202,7 +202,7 @@ int read_footprint(DeviceContext& device) {
 // all-select and inert bounds, without re-instantiating.
 int graph_update(DeviceContext& device) {
     Fixture f(65, 1, 262144, 1, Pattern::Dyadic);
-    const ops::QsaIndexerExecutionEnvelope envelope{262144};
+    const ops::QsaIndexerExecutionEnvelope envelope{262144, 512};
     const auto bytes = ops::qsa_indexer_workspace_capacity_bytes(65, 65, 1, envelope,
                                                                  device.execution_view());
     GuardedDeviceBuffer scratch(std::max<std::size_t>(256, bytes));

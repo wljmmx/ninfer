@@ -33,7 +33,7 @@ __global__ __launch_bounds__((QueryTile > 16 ? QueryTile * 8 : 128)) void indexe
             const int row = chunk / 16, d = (chunk % 16) * 8;
             const int t = q0 + row / 4, slot = b * a.width + t;
             auto* dst = qs + row * 128 + indexer_swizzle(row, d);
-            if (t < a.width && jobs.visible[slot] > kIndexerSelected) {
+            if (t < a.width && jobs.visible[slot] > a.selected) {
                 const auto* src = a.query + a.column(slot) * 512 + (row % 4) * 128 + d;
                 cp_async<16, Cache::cg>(dst, src);
             } else
@@ -86,7 +86,7 @@ __global__ __launch_bounds__((QueryTile > 16 ? QueryTile * 8 : 128)) void indexe
                 const int row = (warp / KeyGroups) * 16 + lane / 4 + (j / 2) * 8;
                 const int t = q0 + row / 4, slot = b * a.width + t;
                 const int g = g0 + (warp % KeyGroups) * WarpKeys + nt * 8 + (lane % 4) * 2 + j % 2;
-                if (row % 4 == 0 && t < a.width && jobs.visible[slot] > kIndexerSelected &&
+                if (row % 4 == 0 && t < a.width && jobs.visible[slot] > a.selected &&
                     g < jobs.visible[slot])
                     a.scores[std::int64_t(slot) * a.columns + g] = value;
             }

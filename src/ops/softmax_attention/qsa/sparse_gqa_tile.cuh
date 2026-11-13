@@ -49,7 +49,7 @@ sparse_gqa_addresses(const SparseGqaArguments& a, SparseGqaStorage<Storage, N, W
         const int ordinal = start / 4 + i;
         // Distinct ids covering every complete block denote the full prefix in any order.
         const int g          = ordinal < work.count
-                                   ? (work.count == work.complete ? ordinal : a.ids[q * 512 + ordinal])
+                                   ? (work.count == work.complete ? ordinal : a.ids[q * a.selected + ordinal])
                                    : work.complete;
         const int table_row  = a.table_rows[q / a.tokens];
         const int page       = a.tables[std::int64_t(table_row) * a.table_stride + g / 16],

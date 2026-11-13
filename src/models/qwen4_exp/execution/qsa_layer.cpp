@@ -249,10 +249,13 @@ void TextContext::qsa_mix(const BlockParameters& w, Tensor& x, int fidx, Phase, 
             ops::CausalAttentionExecutionEnvelope{visible, visible}, work_, dense_out, execution);
         ops::sigmoid_mul(gate_flat.view({head_dim, query_hd, T}), dense_out, s);
     } else {
-        const ops::QsaIndexerExecutionEnvelope indexer_envelope{visible};
+        const auto selection_blocks =
+            static_cast<std::int32_t>(config_.indexer->selection_blocks());
+        const ops::QsaIndexerExecutionEnvelope indexer_envelope{visible,
+                                                                config_.indexer->selection_blocks()};
         const ops::QsaSparseGqaExecutionEnvelope gqa_envelope{visible};
         ops::QsaBlockSelection selected{
-            qsa.block_ids.view({512, T, batch}),
+            qsa.block_ids.view({selection_blocks, T, batch}),
             qsa.block_counts.view({T, batch}),
         };
         ops::qsa_indexer(prepared_index_query, index_cache, batch_view, indexer_envelope, work_,

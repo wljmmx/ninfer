@@ -11,18 +11,23 @@ inline constexpr int kIndexerMaxVisibleTokens = 262144;
 inline constexpr int kIndexerMaxBlocks        = kIndexerMaxVisibleTokens / 4;
 inline constexpr int kIndexerWindowQueries    = 64;
 inline constexpr int kIndexerPartition        = 4096;
-inline constexpr int kIndexerSelected         = 512;
+// The selection kernel keeps one candidate per partition in a fixed per-thread array, so the
+// selected count has a compile-time bound. The count actually used is `IndexerPlan::selected`,
+// which the caller derives from the model's indexer budget and block size; a request above this
+// bound is rejected in `qsa_indexer` instead of being silently truncated.
+inline constexpr int kIndexerSelectedMax      = 512;
 inline constexpr int kIndexerKeyTile          = 64;
 
 struct IndexerPlan {
-    int window_tokens, columns, partitions;
+    int window_tokens, columns, partitions, selected;
 };
 
-inline IndexerPlan indexer_plan(int tokens, int batch, std::uint32_t visible_tokens) {
+inline IndexerPlan indexer_plan(int tokens, int batch, std::uint32_t visible_tokens,
+                               int selected) {
     const int blocks = visible_tokens / 4;
     return {std::min(tokens, kIndexerWindowQueries / batch),
             (blocks + kIndexerKeyTile - 1) / kIndexerKeyTile * kIndexerKeyTile,
-            (blocks + kIndexerPartition - 1) / kIndexerPartition};
+            (blocks + kIndexerPartition - 1) / kIndexerPartition, selected};
 }
 
 struct IndexerWorkspace {
@@ -32,10 +37,10 @@ struct IndexerWorkspace {
 template <class Allocator>
 IndexerWorkspace allocate_indexer_workspace(Allocator& allocator, IndexerPlan plan, int batch) {
     IndexerWorkspace out;
-    if (plan.columns <= kIndexerSelected) return out;
+    if (plan.columns <= plan.selected) return out;
     const int rows = plan.window_tokens * batch;
     out.scores     = allocator.alloc(DType::FP32, {plan.columns, rows}, 256);
-    out.candidates = allocator.alloc(DType::I64, {kIndexerSelected, plan.partitions, rows}, 256);
+    out.candidates = allocator.alloc(DType::I64, {plan.selected, plan.partitions, rows}, 256);
     return out;
 }
 

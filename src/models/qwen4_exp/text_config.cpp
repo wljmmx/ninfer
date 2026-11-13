@@ -92,6 +92,12 @@ qwen3_5::TextConfig parse_text_config(Architecture architecture, const artifact:
         if (indexer.num_heads % indexer.num_kv_heads) {
             throw ArtifactError("indexer heads must be divisible by KV heads");
         }
+        if (indexer.compress_ratio == 0 || indexer.budget % indexer.compress_ratio) {
+            throw ArtifactError("indexer budget must be a positive multiple of the compress ratio");
+        }
+        if (indexer.selection_blocks() == 0) {
+            throw ArtifactError("indexer budget is smaller than one pooled block");
+        }
         out.indexer = indexer;
     }
     if (out.indexed_attention_layers && !out.indexer) {

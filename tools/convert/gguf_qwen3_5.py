@@ -36,6 +36,7 @@ from pathlib import Path
 import numpy as np
 
 from .gguf_views import (
+    Minus1,
     View,
     _ArrayView,
     _ColPermute,
@@ -73,18 +74,8 @@ _VISION_HIDDEN_ACT = "gelu_pytorch_tanh"
 # ------------------------------------------------------------------------------------- views
 
 
-class _Minus1(View):
-    """`w - 1`: llama.cpp writes unit-offset RMSNorm weights, the artifact stores the offset."""
-
-    def __init__(self, inner: View) -> None:
-        if len(inner.shape) != 1:
-            raise ValueError("offset-norm view requires a vector")
-        self.inner = inner
-        self.shape = inner.shape
-        self.dtype = inner.dtype
-
-    def read(self, begin: int, end: int) -> np.ndarray:
-        return self.inner.read(begin, end) - 1.0
+# `_Minus1` is the shared `gguf_views.Minus1`; the alias keeps this adapter's older spelling.
+_Minus1 = Minus1
 
 
 def value_head_order(count: int, key_heads: int, per_key: int, head_dim: int) -> np.ndarray:

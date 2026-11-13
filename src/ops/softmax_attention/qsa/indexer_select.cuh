@@ -49,12 +49,12 @@ struct IndexerStoreIds {
 };
 
 // Full radix selection over a unique score/id total order. Prefix refinement stops only
-// when exactly 512 keys are >= the prefix. No approximate local candidate truncation.
+// when exactly `selected` keys are >= the prefix. No approximate local candidate truncation.
 template <int Items, class Store>
-__device__ void indexer_select_512(std::uint64_t (&keys)[Items], int count, IndexerRadixStorage& s,
-                                   Store store) {
+__device__ void indexer_select_topk(std::uint64_t (&keys)[Items], int count, int selected,
+                                    IndexerRadixStorage& s, Store store) {
     const int tid = threadIdx.x;
-    if (count <= kIndexerSelected) {
+    if (count <= selected) {
 #pragma unroll
         for (int j = 0; j < Items; ++j)
             if (j * 256 + tid < count) store(j * 256 + tid, keys[j]);
@@ -74,7 +74,7 @@ __device__ void indexer_select_512(std::uint64_t (&keys)[Items], int count, Inde
         s.shift     = ((63 - __clzll(s.low ^ hi)) / 8) * 8;
         s.mask      = s.shift == 56 ? 0 : (~std::uint64_t(0) << (s.shift + 8));
         s.prefix    = hi & s.mask;
-        s.remaining = kIndexerSelected;
+        s.remaining = selected;
     }
     __syncthreads();
     for (int shift = s.shift; shift >= 0; shift -= 8) {
@@ -138,10 +138,10 @@ __launch_bounds__(256) void indexer_partition_kernel(const __grid_constant__ Ind
                                                    first + i)
                               : 0;
         }
-        // A discarded key already has 512 better keys in its own partition, so it cannot
-        // belong to the global Top512. Only the final partition can emit fewer than 512.
-        auto* out = a.candidates + (std::int64_t(slot) * a.partitions + part) * kIndexerSelected;
-        indexer_select_512(keys, count, radix, IndexerStoreKeys{out});
+        // A discarded key already has `selected` better keys in its own partition, so it cannot
+        // belong to the global selection. Only the final partition can emit fewer.
+        auto* out = a.candidates + (std::int64_t(slot) * a.partitions + part) * a.selected;
+        indexer_select_topk(keys, count, a.selected, radix, IndexerStoreKeys{out});
         __syncthreads();
     }
 }
@@ -152,23 +152,23 @@ __launch_bounds__(256) void indexer_finish_kernel(const __grid_constant__ Indexe
     __shared__ IndexerRadixStorage radix;
     const int slot = blockIdx.x, tid = threadIdx.x, visible = a.visible(slot);
     const auto column = a.column(slot);
-    auto* out         = a.ids + column * kIndexerSelected;
-    if (tid == 0) a.counts[column] = min(visible, kIndexerSelected);
-    if (visible <= kIndexerSelected) {
+    auto* out         = a.ids + column * a.selected;
+    if (tid == 0) a.counts[column] = min(visible, a.selected);
+    if (visible <= a.selected) {
         for (int i = tid; i < visible; i += 256) out[i] = i;
         return;
     }
     const int parts = (visible + Partition - 1) / Partition;
     const int count =
-        (parts - 1) * kIndexerSelected + min(kIndexerSelected, visible - (parts - 1) * Partition);
-    const auto* input   = a.candidates + std::int64_t(slot) * a.partitions * kIndexerSelected;
-    constexpr int Items = (kIndexerMaxBlocks / Partition) * kIndexerSelected / 256;
+        (parts - 1) * a.selected + min(a.selected, visible - (parts - 1) * Partition);
+    const auto* input   = a.candidates + std::int64_t(slot) * a.partitions * a.selected;
+    constexpr int Items = (kIndexerMaxBlocks / Partition) * kIndexerSelectedMax / 256;
     std::uint64_t keys[Items];
 #pragma unroll
     for (int j = 0; j < Items; ++j) {
         const int i = j * 256 + tid;
         keys[j]     = i < count ? input[i] : 0;
     }
-    indexer_select_512(keys, count, radix, IndexerStoreIds{out});
+    indexer_select_topk(keys, count, a.selected, radix, IndexerStoreIds{out});
 }
 } // namespace ninfer::ops::detail::qsa

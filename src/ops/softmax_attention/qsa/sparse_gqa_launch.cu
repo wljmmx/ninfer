@@ -83,8 +83,9 @@ void launch_sparse_gqa(const Tensor& query, const Tensor& gate, const PagedKVBat
                          plan.splits,
                          plan.key_rows,
                          0,
-                         query.ne[1],
-                         cache.num_kv_heads};
+                          query.ne[1],
+                          cache.num_kv_heads,
+                          static_cast<int>(selected.block_ids.ne[0])};
     const bool vector_cache = aligned(cache.k_pages) && aligned(cache.v_pages);
     const auto queries      = std::int64_t(a.tokens) * a.batch;
     // This slab only bounds grid.x (including the per-head merge); scratch/output indexing

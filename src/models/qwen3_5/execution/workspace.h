@@ -125,7 +125,7 @@ QsaRoots qsa_roots(Allocator& allocator, const TextConfig& config, std::int32_t 
     out.index_query = matrix(allocator, DType::BF16, dimension(indexer.query_width()), tokens);
     out.index_key   = matrix(allocator, DType::BF16, dimension(indexer.key_width()), tokens);
     out.attention   = matrix(allocator, DType::BF16, query_width, tokens);
-    out.block_ids   = matrix(allocator, DType::I32, 512, tokens);
+    out.block_ids   = matrix(allocator, DType::I32, dimension(indexer.selection_blocks()), tokens);
     out.block_counts = vector(allocator, DType::I32, tokens);
     out.record_keys  = matrix(allocator, DType::BF16, dimension(indexer.head_dim), tokens);
     out.record_rope  = matrix(allocator, DType::I32, 3, tokens);

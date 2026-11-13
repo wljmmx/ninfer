@@ -46,6 +46,7 @@ _TEXT_ARCH = "qwen4exp"
 # sources read tensor ranges the same way.
 
 from .gguf_views import (  # noqa: E402  (after the architecture constant, with the other tables)
+    Minus1,
     View,
     _ArrayView,
     _ColPermute,
@@ -163,6 +164,16 @@ class GGUFSource:
     def _add(self, name: str, view: View) -> None:
         self._views[name] = view
 
+    def _norm(self, name: str, gguf_name: str) -> None:
+        """A folded norm: the GGUF holds `1 + w`, the artifact stores the offset.
+
+        Upstream folds every `*norm.weight` (`conversion/qwen.py:431-432`) except
+        `linear_attn.norm.weight`, and adds the PLE and indexer gammas the suffix rule misses
+        (`conversion/qwen4exp.py:162-166`). qwen4exp sorts its GDN norm under `ssm_norm`, which is
+        the exception, so it must go through `_direct` and not here.
+        """
+        self._add(name, Minus1(self._direct(gguf_name)))
+
     def _build_views(self) -> None:
         cfg = self.config["text_config"]
         layers = cfg["num_hidden_layers"]
@@ -185,8 +196,10 @@ class GGUFSource:
                 "own physical parameter and a tied head is not accepted by the converter"
             )
         self._add("lm_head.weight", self._direct("output.weight"))
+        if self._has("output_hc_norm.weight"):
+            self._norm("model.language_model.hyper_connection_mixer.hc_norm.weight",
+                       "output_hc_norm.weight")
         for gguf_name, suffix in (
-            ("output_hc_norm", "hc_norm"),
             ("output_hc_down", "input_mix_weight_down"),
             ("output_hc_up", "input_mix_weight_up"),
         ):
@@ -249,7 +262,7 @@ class GGUFSource:
         c = cfg["hc_count"]
         r = cfg["hc_lowrank"]
         if self._has(prefix + norm + ".weight"):
-            self._add(target + "hc_norm.weight", self._direct(prefix + norm + ".weight"))
+            self._norm(target + "hc_norm.weight", prefix + norm + ".weight")
         if self._has(prefix + up + ".weight"):
             self._add(target + "input_mix_weight_up.weight",
                       self._direct(prefix + up + ".weight"))
@@ -329,7 +342,6 @@ class GGUFSource:
             if not self._has(prefix + gguf_name + ".weight"):
                 raise ValueError(f"{self.path}: {prefix}{gguf_name}.weight is missing; the draft "
                                  "head needs its whole stem")
-            view = self._direct(prefix + gguf_name + ".weight")
             if suffix == "fc_embedding":
                 fused = self._direct(prefix + "nextn.eh_proj.weight")
                 if len(fused.shape) != 2 or fused.shape[1] != 2 * hidden:
@@ -337,7 +349,8 @@ class GGUFSource:
                 self._add("mtp.fc_embedding.weight", _Cols(fused, 0, hidden, 2 * hidden))
                 self._add("mtp.fc_hidden.weight", _Cols(fused, hidden, hidden, 2 * hidden))
                 continue
-            self._add(f"mtp.{suffix}.weight", view)
+            # enorm/hnorm are folded like every other `*norm.weight` of this arch.
+            self._norm(f"mtp.{suffix}.weight", prefix + gguf_name + ".weight")
         # The head's final correction is the same norm+pair shape a block carries, without an
         # injection stream.
         for gguf_name, suffix in (
@@ -348,8 +361,12 @@ class GGUFSource:
             if not self._has(prefix + gguf_name + ".weight"):
                 raise ValueError(f"{self.path}: {prefix}{gguf_name}.weight is missing; the draft "
                                  "head needs its final hyper-connection mixer")
-            self._add(f"mtp.hyper_connection_mixer.{suffix}.weight",
-                      self._direct(prefix + gguf_name + ".weight"))
+            if suffix == "hc_norm":
+                self._norm("mtp.hyper_connection_mixer.hc_norm.weight",
+                           prefix + gguf_name + ".weight")
+            else:
+                self._add(f"mtp.hyper_connection_mixer.{suffix}.weight",
+                          self._direct(prefix + gguf_name + ".weight"))
 
     def _qsa(self, prefix: str, target: str, cfg: dict) -> None:
         hidden = cfg["hidden_size"]
@@ -370,8 +387,7 @@ class GGUFSource:
                           self._direct(prefix + gguf_name + ".weight"))
         for suffix, gguf_name in (("q_norm", "attn_q_norm"), ("k_norm", "attn_k_norm")):
             if self._has(prefix + gguf_name + ".weight"):
-                self._add(target + f"self_attn.{suffix}.weight",
-                          self._direct(prefix + gguf_name + ".weight"))
+                self._norm(target + f"self_attn.{suffix}.weight", prefix + gguf_name + ".weight")
         # The indexer q|k projection is one logical tensor in the HF checkpoint; llama.cpp
         # splits it into indexer.q_proj / indexer.k_proj, so it is fused back here.
         q_name = prefix + "indexer.q_proj.weight"
@@ -385,8 +401,8 @@ class GGUFSource:
         for suffix, gguf_name in (("q_layernorm", "indexer.q_norm"),
                                   ("k_layernorm", "indexer.k_norm")):
             if self._has(prefix + gguf_name + ".weight"):
-                self._add(target + f"self_attn.indexer.{suffix}.weight",
-                          self._direct(prefix + gguf_name + ".weight"))
+                self._norm(target + f"self_attn.indexer.{suffix}.weight",
+                           prefix + gguf_name + ".weight")
 
     def _gdn(self, prefix: str, target: str, cfg: dict, tiled: bool, nk: int, nv: int, dk: int,
              dv: int) -> None:
@@ -458,6 +474,9 @@ class GGUFSource:
             else:
                 raise ValueError(f"{self.path}: {prefix}{gguf_name} is missing")
         if self._has(prefix + "ssm_norm.weight"):
+            # Not folded: upstream adds one to every `*norm.weight` except
+            # `linear_attn.norm.weight` (conversion/qwen.py:431-432), which is this tensor's HF
+            # name. The GGUF already holds the zero-centred w the engine's `1 + w` expects.
             self._add(name + "norm.weight", self._direct(prefix + "ssm_norm.weight"))
         if self._has(prefix + "ssm_out.weight"):
             out = self._direct(prefix + "ssm_out.weight")
@@ -473,13 +492,19 @@ class GGUFSource:
         for suffix, gguf_name in (
             ("key_proj", "ple_key"),
             ("value_proj", "ple_value"),
+        ):
+            if self._has(prefix + gguf_name + ".weight"):
+                self._add(name + suffix + ".weight",
+                          self._direct(prefix + gguf_name + ".weight"))
+        # The PLE gammas are zero-centred in HF and upstream folds them explicitly, because
+        # `ple_norm_*` does not end in `norm.weight` (conversion/qwen4exp.py:162-166).
+        for suffix, gguf_name in (
             ("norm_key", "ple_norm_key"),
             ("norm_query", "ple_norm_query"),
             ("norm_conv", "ple_norm_conv"),
         ):
             if self._has(prefix + gguf_name + ".weight"):
-                self._add(name + suffix + ".weight",
-                          self._direct(prefix + gguf_name + ".weight"))
+                self._norm(name + suffix + ".weight", prefix + gguf_name + ".weight")
         if self._has(prefix + "ple_conv1d.weight"):
             self._add(name + "conv1d.weight",
                       _Reshape(self._direct(prefix + "ple_conv1d.weight"),

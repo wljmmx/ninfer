@@ -37,7 +37,7 @@ struct Fixture {
     ops::QsaBatchView batch;
     ops::QsaBlockSelection selected;
     Tensor query;
-    ops::QsaIndexerExecutionEnvelope envelope{262144};
+    ops::QsaIndexerExecutionEnvelope envelope{262144, 512};
 
     Fixture(int tokens, int batch_size, int max_history, int layout, Pattern values)
         : T(tokens), B(batch_size), history(max_history), pages_per_row((history + 63) / 64),

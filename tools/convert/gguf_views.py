@@ -8,7 +8,7 @@ Moved out of the Qwen4Exp adapter when the Qwen3.5 dense adapter arrived; both p
 the duck-typed source the architecture builders already consume, and both need the same range
 views. Three transforms answer an encoding whose convention differs from the checkpoint's own:
 
-* ``_Minus1`` - llama.cpp writes offset RMSNorm weights (``w + 1``), the artifact stores ``w``.
+* ``Minus1`` - llama.cpp folds offset RMSNorm gammas (``1 + w``), the artifact stores ``w``.
 * ``_LogOfNegative`` - GDN keeps ``A_log``; llama.cpp writes ``ssm_a = -exp(A_log)``.
 * ``_Transpose`` - the GDN conv kernel is ``[channels, taps]``, HF keeps ``[channels, 1, taps]``.
 """
@@ -291,6 +291,26 @@ class _LogOfNegative(View):
                 f"{self.inner.shape}: ssm_a is not negative; it is not -exp(A_log) in this file"
             )
         return np.log(-values)
+
+
+class Minus1(View):
+    """`w - 1`: llama.cpp folds unit-offset RMSNorm gammas to `1 + w`, the artifact stores `w`.
+
+    Both families that read a GGUF through this module (Qwen3.5 and Qwen4Exp) fold the gamma in
+    their converter, so the GGUF holds the final gain and the engine's `unit_offset` rmsnorm
+    (`gain = 1 + weight`) only agrees after the one is taken back out. llama.cpp then multiplies
+    the stored value directly, which is why the folded form is the one on disk.
+    """
+
+    def __init__(self, inner: View) -> None:
+        if len(inner.shape) != 1:
+            raise ValueError("offset-norm view requires a vector")
+        self.inner = inner
+        self.shape = inner.shape
+        self.dtype = inner.dtype
+
+    def read(self, begin: int, end: int) -> np.ndarray:
+        return self.inner.read(begin, end) - 1.0
 
 
 # ------------------------------------------------------------------- head-order permutation

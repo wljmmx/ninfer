@@ -1,6 +1,5 @@
 #include "models/qwen4_exp/ple/hash.h"
 
-#include <bit>
 #include <limits>
 #include <stdexcept>
 
@@ -25,10 +24,14 @@ void ple_hash(std::span<const std::int32_t> ids, std::array<std::int32_t, 2> tai
                           std::uint64_t(tail[1]) * std::uint64_t(controls.multipliers[1]);
         const auto triple = pair ^ std::uint64_t(older) * std::uint64_t(controls.multipliers[2]);
         for (std::size_t h = 0; h < kPleHeads; ++h) {
-            const auto word = std::bit_cast<std::int64_t>(h < 8 ? pair : triple);
-            auto index      = word % controls.vocab_sizes[h];
-            if (index < 0) index += controls.vocab_sizes[h];
-            output[t * kPleHeads + h] = static_cast<std::uint32_t>(index + controls.offsets[h]);
+            // The reference (llama.cpp's qwen4exp graph) reduces the mixed word modulo 2^64 and
+            // takes an unsigned remainder; reinterpreting the word as signed and re-basing the
+            // negative result is only equal while the top bit never sets. Keep the unsigned form.
+            const std::uint64_t word = h < 8 ? pair : triple;
+            const std::uint64_t index =
+                word % static_cast<std::uint64_t>(controls.vocab_sizes[h]);
+            output[t * kPleHeads + h] =
+                static_cast<std::uint32_t>(index + std::uint64_t(controls.offsets[h]));
         }
         tail = {tail[1], ids[t]};
     }

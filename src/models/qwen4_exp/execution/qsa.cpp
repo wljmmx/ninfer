@@ -117,6 +117,10 @@ QsaPlanInputs qsa_plan_inputs(const qwen3_5::TextConfig& config, std::int32_t fi
     // name. It is a resource promise over the batch maximum, never a mask, and it fixes the launch
     // topology and the scratch size - hence one number for plan and execution.
     inputs.indexer.max_visible_tokens = visible_tokens;
+    // The selection keeps `indexer_budget / compress_ratio` blocks per query. It is a config
+    // number, so the scratch this plan reserves and the width the layer allocates agree with any
+    // checkpoint instead of the 2048 token budget of this one.
+    inputs.indexer.selected_blocks    = config.indexer->selection_blocks();
     inputs.gqa.max_visible_tokens     = visible_tokens;
     inputs.execution                  = execution;
     return inputs;
