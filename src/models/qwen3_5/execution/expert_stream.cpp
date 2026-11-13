@@ -1465,6 +1465,18 @@ constexpr std::uint32_t kSplitPrefillProtectMin = 96;
 // names. The held set (`hold_slots`) is exactly the slots this layer's table names.
 void ExpertStream::publish_split_run(std::size_t index, cudaStream_t stream, bool placement_mode) {
     auto& run = split_[index];
+    // Diagnostic: one marker per call, so a trace can be read per token instead of as one stream.
+    if (const char* wanted = std::getenv("NINFER_SLOT_TRACE")) {
+        if (static_cast<std::uint32_t>(std::atoi(wanted)) == run.bank) {
+            static std::FILE* calls = std::fopen((std::string(wanted) + ".calls").c_str(), "wb");
+            if (calls != nullptr) {
+                static std::uint64_t seq = 0;
+                std::fprintf(calls, "%llu %u %u\n", static_cast<unsigned long long>(++seq),
+                             run.bank, count_);
+                std::fflush(calls);
+            }
+        }
+    }
     if (run.pool_slot.size() != count_) { run.pool_slot.assign(count_, -1); }
     for (std::uint32_t expert = 0; expert < count_; ++expert) {
         const auto slot       = cache_->expert_slot(run.bank, expert);
@@ -1511,6 +1523,21 @@ void ExpertStream::publish_split_run(std::size_t index, cudaStream_t stream, boo
         }
         if (placement != run.placement_published[expert]) { changed = true; }
         run.placement[expert] = placement;
+        // Diagnostic: NINFER_SLOT_TRACE=<bank> records every placement change of one bank, so two
+        // artifacts that upload identical images can be compared on what the kernel is told.
+        if (const char* wanted = std::getenv("NINFER_SLOT_TRACE")) {
+            if (static_cast<std::uint32_t>(std::atoi(wanted)) == run.bank &&
+                placement != run.placement_published[expert]) {
+                static std::FILE* trace = std::fopen(
+                    (std::string(wanted) + ".slots").c_str(), "wb");
+                if (trace != nullptr) {
+                    std::fprintf(trace, "%u %u %d %d\n", run.bank, expert,
+                                 static_cast<int>(run.placement_published[expert]),
+                                 static_cast<int>(placement));
+                    std::fflush(trace);
+                }
+            }
+        }
         const bool absent     = placement == ops::kExpertPlacementAbsent;
         const bool on_host    = !absent && (placement & ops::kExpertPlacementHost) != 0;
         run.host_flags[expert] = on_host ? 1 : 0;
@@ -1750,6 +1777,27 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
         const auto expert = route_ids[i];
         if (expert < 0 || static_cast<std::uint32_t>(expert) >= count_) {
             throw std::out_of_range("expert stream received a route outside its bank");
+        }
+    }
+    // port (sm_89): the three-run form has no route trace of its own, so a divergence between two
+    // artifacts that carry identical weights cannot be attributed to routing at all. Same shape as
+    // the fused trace: one line per (bank, token) with the experts that token routed to.
+    if (const char* dump = std::getenv("NINFER_EXPERT_ROUTE_DUMP")) {
+        static std::FILE* trace = std::fopen(dump, "wb");
+        if (trace != nullptr) {
+            for (std::size_t token = 0; token < static_cast<std::size_t>(tokens); ++token) {
+                for (std::size_t index = 0; index < split_.size(); ++index) {
+                    std::fprintf(trace, "%u %zu", split_[index].bank, token);
+                    for (std::int32_t k = 0; k < top_k; ++k) {
+                        std::fprintf(
+                            trace, " %d",
+                            route_ids[static_cast<std::size_t>(k) * static_cast<std::size_t>(tokens) +
+                                      token]);
+                    }
+                    std::fputc('\n', trace);
+                }
+            }
+            std::fflush(trace);
         }
     }
     const auto layout_begin = std::chrono::steady_clock::now();

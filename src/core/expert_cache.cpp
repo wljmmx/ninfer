@@ -1043,6 +1043,70 @@ std::vector<std::uint64_t> bank_generation;
         return static_cast<const std::byte*>(cover->data());
     }
 
+    // Diagnostic: NINFER_DUMP_ENTRY=<bank>:<expert> writes the assembled entry image and the chunk
+    // list that produced it. `bank` may be `all`, and `expert` may be `*` (the first few experts of
+    // that bank actually routed by this run) or `first` (the first routed expert of every bank).
+    // Only routed experts are ever uploaded, so a fixed index may never appear. Comparing the same
+    // bank/expert across two artifacts tells a reader that lands on the wrong bytes apart from a
+    // mapping that copies the right bytes to the wrong place.
+    void dump_entry(const ExpertCacheKey& key, const ExpertFileEntry& file,
+                    const std::byte* image) const {
+        static const char* wanted = std::getenv("NINFER_DUMP_ENTRY");
+        if (wanted == nullptr) { return; }
+        char bank_field[16] = {};
+        char expert_field[16] = {};
+        if (std::sscanf(wanted, "%15[^:]:%15s", bank_field, expert_field) != 2) { return; }
+        const bool any_bank = std::strcmp(bank_field, "all") == 0;
+        if (!any_bank && key.bank != static_cast<std::uint32_t>(std::atoi(bank_field))) {
+            return;
+        }
+        const bool any_expert = std::strcmp(expert_field, "*") == 0;
+        const bool first_expert = std::strcmp(expert_field, "first") == 0;
+        if (!any_expert && !first_expert &&
+            key.expert != static_cast<std::uint32_t>(std::atoi(expert_field))) {
+            return;
+        }
+        if (first_expert) {
+            static std::vector<std::uint32_t> banks_done;
+            for (const auto bank : banks_done) {
+                if (bank == key.bank) { return; }
+            }
+            banks_done.push_back(key.bank);
+        } else if (any_expert) {
+            static std::vector<std::pair<std::uint32_t, std::uint32_t>> seen;
+            constexpr std::size_t kLimit = 4096;
+            std::size_t same_bank = 0;
+            for (const auto& entry : seen) {
+                if (entry.first != key.bank) { continue; }
+                ++same_bank;
+                if (entry.second == key.expert) { return; }
+            }
+            if (same_bank >= (any_bank ? 8u : 4096u)) { return; }
+            seen.emplace_back(key.bank, key.expert);
+        }
+        char path[256];
+        std::snprintf(path, sizeof(path), "entry-%u-%u.bin", key.bank, key.expert);
+        if (FILE* out = std::fopen(path, "wb")) {
+            std::fwrite(image, 1, static_cast<std::size_t>(file.image_bytes), out);
+            std::fclose(out);
+        }
+        std::snprintf(path, sizeof(path), "entry-%u-%u.chunks", key.bank, key.expert);
+        if (FILE* out = std::fopen(path, "w")) {
+            std::fprintf(out, "image_bytes %llu\n",
+                         static_cast<unsigned long long>(file.image_bytes));
+            for (const auto& chunk : file.chunks) {
+                std::fprintf(out, "chunk %llu %llu %llu %llu\n",
+                             static_cast<unsigned long long>(chunk.file_index),
+                             static_cast<unsigned long long>(chunk.file_offset),
+                             static_cast<unsigned long long>(chunk.bytes),
+                             static_cast<unsigned long long>(chunk.image_offset));
+            }
+            std::fclose(out);
+        }
+        std::fprintf(stderr, "[dump] bank=%u expert=%u image=%llu bytes\n", key.bank, key.expert,
+                     static_cast<unsigned long long>(file.image_bytes));
+    }
+
     void upload_one(ExpertCacheKey key, cudaStream_t stream, bool settle = true,
                     std::size_t staging_slot = 0, std::vector<UploadOp>* batch = nullptr,
                     const std::byte* cover_base = nullptr, std::uint64_t cover_lo = 0,
@@ -1193,6 +1257,7 @@ std::vector<std::uint64_t> bank_generation;
                     std::memcpy(host_base + span.image_offset, span.source,
                                 static_cast<std::size_t>(span.bytes));
                 }
+                dump_entry(key, *file, host_base);
                 if (batch != nullptr) {
                     ++stat_push;
                     staging_used.push_back(staging_slot);
@@ -1263,7 +1328,7 @@ std::vector<std::uint64_t> bank_generation;
                                         .count();
                     ++stat_file_experts;
                 }
-                ++stat_staged;
+                dump_entry(key, *file, host_base);
                 if (batch != nullptr) {
                     ++stat_push;
                     staging_used.push_back(staging_slot);
