@@ -367,8 +367,12 @@ public:
                 std::vector<std::uint32_t> down_object(experts, 0);
                 const std::byte* gate_up_base = nullptr;
                 const std::byte* down_base    = nullptr;
-                std::uint64_t gate_up_place   = 0;
-                std::uint64_t down_place      = 0;
+                // Each expert's matrix is its own object, so each has its own offset inside the
+                // solved mapping. One offset for the whole bank addresses every expert inside the
+                // first expert's object - the run below is object relative, so it cannot carry the
+                // per-expert part.
+                std::vector<std::uint64_t> gate_up_place(experts, 0);
+                std::vector<std::uint64_t> down_place(experts, 0);
                 // The planes are stored plane-major across the bank, so each expert's run base
                 // differs (run_base + expert * stride). What has to hold is that, inside one expert
                 // and one matrix, every chunk names the same object and the same run: that is what
@@ -404,28 +408,28 @@ public:
                     // sit in the same mapping - a second file is a second address space, and offsets
                     // from one do not address the other.
                     if (e == 0) {
-                        gate_up_base  = gate_up_mapping->base;
-                        gate_up_place = gate_up_mapping->offset;
-                        down_base     = down_mapping->base;
-                        down_place    = down_mapping->offset;
+                        gate_up_base = gate_up_mapping->base;
+                        down_base    = down_mapping->base;
                     } else if (gate_up_mapping->base != gate_up_base ||
                                down_mapping->base != down_base) {
                         usable = false;
                         break;
                     }
+                    gate_up_place[e] = gate_up_mapping->offset;
+                    down_place[e]    = down_mapping->offset;
                     // Every chunk already lies inside the object it named (the loader built it from
                     // the object's own payload range), so the run base is inside that object by
                     // construction; what the mapping has to guarantee is only that the base pointer
                     // comes from the file the object was solved in.
                     widest_end = std::max<std::uint64_t>(
-                        widest_end, gate_up_place + gate_up_run[e] + entry.entry_bytes);
+                        widest_end, gate_up_place[e] + gate_up_run[e] + entry.entry_bytes);
                     widest_end = std::max<std::uint64_t>(
-                        widest_end, down_place + down_run[e] + entry.entry_bytes);
+                        widest_end, down_place[e] + down_run[e] + entry.entry_bytes);
                 }
                 if (usable) {
                     for (std::size_t e = 0; e < experts; ++e) {
-                        s.gate_up_offsets[e] = gate_up_place + gate_up_run[e] + entry.codes.offset;
-                        s.down_offsets[e]    = down_place + down_run[e] + entry.down_codes.offset;
+                        s.gate_up_offsets[e] = gate_up_place[e] + gate_up_run[e] + entry.codes.offset;
+                        s.down_offsets[e]    = down_place[e] + down_run[e] + entry.down_codes.offset;
                     }
                     s.gate_up_parent.geometry       = banks_[i].gate_up_geometry;
                     s.gate_up_parent.geometry.bytes = widest_end;
