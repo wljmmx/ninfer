@@ -3,6 +3,7 @@
 
 #include <array>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -39,7 +40,8 @@ Q8Launch select_q8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     for (const auto& entry : kShapes) {
         if (entry.n == n && entry.k == k) return entry.select(t);
     }
-    throw std::invalid_argument("q8 linear: unsupported shape");
+    throw std::invalid_argument("q8 linear: unsupported shape n=" + std::to_string(n) + " k=" +
+                                std::to_string(k) + " t=" + std::to_string(t));
 }
 
 Q8Launch select_q8_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {

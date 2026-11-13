@@ -174,10 +174,15 @@ SingleProjectionWeight prepare_attn_input_proj_weights(const WeightInput& query,
                                                        const WeightInput& key,
                                                        const WeightInput& value) {
     const auto& q = matrix(query);
-    require((q == std::vector<std::uint64_t>{4096, 2048} ||
-             q == std::vector<std::uint64_t>{4096, 5120}) &&
-                matrix(key) == std::vector<std::uint64_t>{1024, q[1]} &&
-                matrix(value) == matrix(key),
+    const auto& k = matrix(key);
+    const auto& v = matrix(value);
+    // port (sm_89): checked against each other, not against the 35B constants. The old whitelist
+    // ({4096, 2048} / {4096, 5120} with kv 1024) was the only geometry that existed when it was
+    // written; Qwen3.8-Flash-Next is hidden 2560, 24 heads x 256 = 6144 and 2 kv heads x 256 = 512,
+    // so a draft head that shares its attention form was refused before its weights were even read
+    // ("QKV input projection: unsupported logical geometry").
+    require(q.size() == 2 && k.size() == 2 && v.size() == 2 && k == v && q[1] == k[1] &&
+                k[0] != 0 && q[0] % k[0] == 0,
             "QKV input projection: unsupported logical geometry");
     const std::array inputs{query, key, value};
     auto result = single(inputs);
