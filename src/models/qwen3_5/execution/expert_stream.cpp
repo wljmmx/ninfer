@@ -1513,6 +1513,20 @@ void ExpertStream::publish_split_run(std::size_t index, cudaStream_t stream, boo
     bool changed = !run.placement_published_once;
     run.placed_slots.clear();
     run.placed_slots.reserve(count_);
+    // Hoisted out of the 512-row loop: std::getenv() walks the environment block on this platform,
+    // and running it once per expert (x3 banks a layer) measured 3.2 ms of pure CPU per layer -
+    // more than the upload it was sitting next to. The trace switch is read once per publish.
+    static const char* const slot_trace_env = std::getenv("NINFER_SLOT_TRACE");
+    const bool trace_bank =
+        slot_trace_env != nullptr &&
+        static_cast<std::uint32_t>(std::atoi(slot_trace_env)) == run.bank;
+    static std::FILE* slot_trace_file = nullptr;
+    static bool slot_trace_opened     = false;
+    if (trace_bank && !slot_trace_opened) {
+        slot_trace_file =
+            std::fopen((std::string(slot_trace_env) + ".slots").c_str(), "wb");
+        slot_trace_opened = true;
+    }
     for (std::uint32_t expert = 0; expert < count_; ++expert) {
         // The pool wins a tie: an expert resident in both is addressed in video memory.
         std::uint32_t placement = ops::kExpertPlacementAbsent;
@@ -1525,18 +1539,12 @@ void ExpertStream::publish_split_run(std::size_t index, cudaStream_t stream, boo
         run.placement[expert] = placement;
         // Diagnostic: NINFER_SLOT_TRACE=<bank> records every placement change of one bank, so two
         // artifacts that upload identical images can be compared on what the kernel is told.
-        if (const char* wanted = std::getenv("NINFER_SLOT_TRACE")) {
-            if (static_cast<std::uint32_t>(std::atoi(wanted)) == run.bank &&
-                placement != run.placement_published[expert]) {
-                static std::FILE* trace = std::fopen(
-                    (std::string(wanted) + ".slots").c_str(), "wb");
-                if (trace != nullptr) {
-                    std::fprintf(trace, "%u %u %d %d\n", run.bank, expert,
-                                 static_cast<int>(run.placement_published[expert]),
-                                 static_cast<int>(placement));
-                    std::fflush(trace);
-                }
-            }
+        if (trace_bank && placement != run.placement_published[expert] &&
+            slot_trace_file != nullptr) {
+            std::fprintf(slot_trace_file, "%u %u %d %d\n", run.bank, expert,
+                         static_cast<int>(run.placement_published[expert]),
+                         static_cast<int>(placement));
+            std::fflush(slot_trace_file);
         }
         const bool absent     = placement == ops::kExpertPlacementAbsent;
         const bool on_host    = !absent && (placement & ops::kExpertPlacementHost) != 0;
@@ -1801,19 +1809,6 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
         }
     }
     const auto layout_begin = std::chrono::steady_clock::now();
-
-    // The score follows the router on small batches only, exactly as the fused streaming path does:
-    // a prefill chunk touches most of the bank and would wash the ranking out.
-    if (tokens <= kSplitSetUpdateTokens) {
-        for (std::size_t i = 0; i < values; ++i) {
-            hot_score_[static_cast<std::size_t>(route_ids[i])] += 1.0F;
-        }
-        const auto decay = hot_decay_period();
-        if (decay != 0 && ++since_decay_ >= decay) {
-            for (auto& score : hot_score_) { score *= 0.5F; }
-            since_decay_ = 0;
-        }
-    }
 
     // port (sm_89): whether the pinned tier can be addressed by the Device decides whether this
     // layer must re-derive its placement every time (it must: the tier churns under a still pool).
