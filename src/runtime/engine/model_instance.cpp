@@ -342,6 +342,8 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     std::uint64_t host_layer = 0;
     std::uint64_t widest_count = 0;
     std::uint64_t streamed_banks = 0;
+    std::uint64_t complement_slots = 0;
+    std::uint64_t layer_slots = 0;
     for (std::size_t index = 0; index < requirements.banks.size(); ++index) {
         const auto& bank = requirements.banks[index];
         if (bank.resident) { continue; }
@@ -350,14 +352,37 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
         // Each bank is charged only the seats the pool gives it. Per-bank pricing means one bank may
         // be much wider than the rest, so the pool-wide number understates the narrower banks' share
         // and would size the host tier for a tier that is not actually short.
-        const auto kept = std::min<std::uint64_t>(
-            instance.expert_cache->resident_capacity(static_cast<std::uint32_t>(index)),
-            static_cast<std::uint64_t>(routed_top_k));
+        const auto seats =
+            instance.expert_cache->resident_capacity(static_cast<std::uint32_t>(index));
+        const auto kept = std::min<std::uint64_t>(seats, static_cast<std::uint64_t>(routed_top_k));
         host_kept += kept;
+        // The tier's real complement: what the pool has no seat for at all. `kept` above is the
+        // decode working set (top_k), which is the right number for "is the pool warm enough" but
+        // not for "how much RAM would hold the rest" - the pool keeps seats beyond top_k.
+        const auto missing = bank.count > seats ? static_cast<std::uint64_t>(bank.count) - seats : 0;
+        layer_slots = std::max(layer_slots, missing);
+        complement_slots += missing;
         host_layer = std::max<std::uint64_t>(host_layer, std::uint64_t{bank.count} - kept);
     }
-    constexpr std::uint64_t kLayerHeadroom = 2;
-    host_want = host_layer * kLayerHeadroom * instance.expert_cache->slot_bytes();
+    // port (sm_89): the warm budget is the model's own complement, not a two-layer guess.
+    //
+    // The old formula was `host_layer * 2 * slot_bytes`, which says "keep two layers of headroom
+    // so a fill cannot evict itself". That is the right size for a model the Device mostly holds
+    // (35B: complement 0, so the tier is not allocated at all), and the wrong size for one it does
+    // not: Flash-Next's complement is 55200 of 73728 experts (67.5 GiB), and two layers buy a 2/48
+    // hit window - measured 5.84 tok/s prefill, 3.16 tok/s decode, with 91 GiB of the RAM partition
+    // unused. What the tier needs is what would hold the complement; what it may take is bounded by
+    // RAM in host_expert_arena_bytes(). The layer floor stays so one prefill fill always fits (a
+    // fill larger than the stripe throws, see HostExpertResidency::fill_locked).
+    const auto banks_per_layer =
+        streams.empty() ? std::uint64_t{1}
+                        : std::max<std::uint64_t>(
+                              1, static_cast<std::uint64_t>(requirements.banks.size()) /
+                                     static_cast<std::uint64_t>(streams.size()));
+    const auto slot_bytes = instance.expert_cache->slot_bytes();
+    const auto layer_bytes    = layer_slots * banks_per_layer * slot_bytes;
+    const auto complement_bytes = complement_slots * slot_bytes;
+    host_want = std::max(layer_bytes, complement_bytes);
     // P1: the per-layer frozen set is a placement, so its capacity is a formula rather than a
     // working-set estimate. S is the complement of what the pool holds; D is whatever is left of
     // that complement, with at least one decode step's routes as headroom. S+D covers every expert
@@ -746,16 +771,23 @@ std::uint64_t second_chance_budget_bytes(std::span<const ExpertBankLayout> banks
 std::uint64_t host_expert_arena_bytes(std::uint64_t want_bytes) {
     const auto share = [&] {
         const auto free_bytes = current_free_host_bytes();
-        return free_bytes == 0 ? want_bytes : free_bytes / 4;
+        return free_bytes == 0 ? want_bytes : free_bytes / 2;
     }();
-    // port (sm_89): a working-set bound, not just a RAM-share bound. A split layer touches a few
-    // experts per layer and the same ones come back within the next tokens, so a few GiB hold every
-    // byte the CPU half reads. Sizing the arena to a quarter of RAM instead (14.5 GiB here) spreads
-    // that working set over four times the pages, and the split path then measures 0.43 ms per
-    // expert against 0.041 ms for the same kernel on a warm one - 10.6 tok/s against 28.7 on the
-    // same pool. Anything colder than the working set belongs to the artifact, not to more arena.
-    constexpr std::uint64_t kWorkingSetCap = 4ull << 30;
-    std::uint64_t budget = std::min<std::uint64_t>({want_bytes, share, kWorkingSetCap});
+    // port (sm_89): the 4 GiB working-set cap is gone, and the RAM share is now half instead of a
+    // quarter.
+    //
+    // That cap was measured on the 35B split path, whose complement is a few GiB: there, a larger
+    // arena spread the same working set over more pages and cost 0.43 ms per expert against
+    // 0.041 ms - "more arena" really was worse. It does not transfer to an artifact whose
+    // complement is 67.5 GiB: capping at 4 GiB keeps 63 GiB of experts on the artifact and turns
+    // every CPU-half fill into a physical read (measured: 55200 unslotted experts, 1004 slots of
+    // tier, 3.16 tok/s decode). The cap is therefore a function of the ask: a small complement is
+    // still bounded by it, a large one is bounded by RAM instead.
+    constexpr std::uint64_t kSmallWorkingSetCap = 4ull << 30;
+    std::uint64_t budget = std::min<std::uint64_t>(want_bytes, share);
+    if (want_bytes <= kSmallWorkingSetCap) {
+        budget = std::min<std::uint64_t>({want_bytes, share, kSmallWorkingSetCap});
+    }
     if (const char* value = std::getenv("NINFER_EXPERT_HOST_ARENA_MB"); value != nullptr && *value) {
         const auto mib = std::strtoull(value, nullptr, 10);
         // An explicit budget replaces the RAM share rather than tightening it, so a run can ask for
