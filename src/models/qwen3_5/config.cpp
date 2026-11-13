@@ -1,4 +1,6 @@
 #include "models/qwen3_5/config.h"
+#include "models/qwen3_5/text_config.h"
+#include "models/qwen4_exp/text_config.h"
 
 #include "artifact/schema.h"
 
@@ -66,19 +68,9 @@ const artifact::Component& companion(const artifact::Directory& directory, std::
     return component;
 }
 
-// The artifact names the activation its linear attention gates with (HF: `output_gate_type`, falling
+// The artifact names the activation its linear attention gates with (the checkpoint's gate name, falling
 // back to `hidden_act`). A family states the one its artifacts declare; an artifact that names
 // another one belongs to a different mathematics.
-GdnGateKind gdn_gate(const std::string& declared, std::string_view family) {
-    const std::string_view name = declared.empty() ? family : declared;
-    if (!declared.empty() && !family.empty() && declared != family) {
-        throw ArtifactError("output_gate_type '" + declared + "' is not the '" + std::string(family) +
-                            "' gate this architecture declares");
-    }
-    if (name.empty() || name == "silu") { return GdnGateKind::Silu; }
-    if (name == "sigmoid") { return GdnGateKind::Sigmoid; }
-    throw ArtifactError("unsupported output_gate_type '" + std::string(name) + "'");
-}
 
 AttentionConfig attention(const Json& value) {
     AttentionConfig out{dimension(value, "num_attention_heads"),
@@ -240,151 +232,6 @@ RopeConfig rope(const Json& value, std::uint32_t head_dim) {
     return out;
 }
 
-TextConfig text(const Json& value, bool mtp) {
-    require_members(
-        value,
-        {"architectures", "model_type", "hidden_size", "vocab_size", "num_hidden_layers",
-         "max_position_embeddings", "tie_word_embeddings", "rms_norm_eps", "layer_types"},
-        {"num_attention_heads", "num_key_value_heads", "head_dim", "rope_parameters",
-         "linear_num_key_heads", "linear_key_head_dim", "linear_num_value_heads",
-         "linear_value_head_dim", "linear_conv_kernel_dim", "intermediate_size", "num_experts",
-         "num_experts_per_tok", "moe_intermediate_size", "shared_expert_intermediate_size",
-         "attention_bias", "output_gate_type", "mamba_ssm_dtype", "norm_topk_prob", "hc_count",
-         "hc_lowrank", "indexer_n_heads", "indexer_kv_heads", "indexer_head_dim",
-         "indexer_compress_ratio", "indexer_budget", "ple_embed_dim", "ngram_size",
-         "heads_per_ngram", "split_ngram_parts", "ple_conv_kernel_size", "ple_layer_ids",
-         "ple_shard_shape", "ple_conv_dilation", "image_token_id", "video_token_id",
-         "vision_start_token_id", "vision_end_token_id",
-         // Tolerated without a consumer: hidden_act is the only activation this engine
-         // implements, and the sampler takes its stop IDs from generation_config.json.
-         "hidden_act", "eos_token_id"},
-        "text config");
-    TextConfig out;
-    out.architecture = resolve_architecture(
-        architecture(value), artifact::require_id(value.at("model_type"), "model_type"));
-    out.hidden_size             = dimension(value, "hidden_size");
-    out.vocab_size              = dimension(value, "vocab_size");
-    out.num_hidden_layers       = dimension(value, "num_hidden_layers");
-    out.max_position_embeddings = dimension(value, "max_position_embeddings");
-    out.rms_norm_eps            = positive_float(value, "rms_norm_eps");
-    if (!value.at("tie_word_embeddings").is_boolean()) {
-        throw ArtifactError("tie_word_embeddings must be boolean");
-    }
-    out.tie_word_embeddings = value.at("tie_word_embeddings").get<bool>();
-    const auto& layers      = value.at("layer_types");
-    if (!layers.is_array() || layers.size() != out.num_hidden_layers) {
-        throw ArtifactError("layer_types must cover every text block");
-    }
-    for (const auto& layer : layers) {
-        if (layer == "full_attention") {
-            out.layer_types.push_back(MixerKind::FullAttention);
-            out.compact_layer_indices.push_back(out.full_attention_layers++);
-        } else if (layer == "indexed_attention") {
-            out.layer_types.push_back(MixerKind::IndexedAttention);
-            out.compact_layer_indices.push_back(out.full_attention_layers++);
-            ++out.indexed_attention_layers;
-        } else if (layer == "linear_attention") {
-            out.layer_types.push_back(MixerKind::LinearAttention);
-            out.compact_layer_indices.push_back(out.linear_attention_layers++);
-        } else {
-            throw ArtifactError("unknown text layer_type");
-        }
-    }
-    if (out.full_attention_layers || mtp || value.contains("head_dim") ||
-        value.contains("rope_parameters") || value.contains("num_attention_heads") ||
-        value.contains("num_key_value_heads")) {
-        out.attention       = attention(value);
-        out.rope_parameters = rope(value.at("rope_parameters"), out.attention->head_dim);
-    }
-    if (out.linear_attention_layers || value.contains("linear_num_key_heads") ||
-        value.contains("linear_key_head_dim") || value.contains("linear_num_value_heads") ||
-        value.contains("linear_value_head_dim") || value.contains("linear_conv_kernel_dim")) {
-        GdnConfig gdn{
-            dimension(value, "linear_num_key_heads"), dimension(value, "linear_key_head_dim"),
-            dimension(value, "linear_num_value_heads"), dimension(value, "linear_value_head_dim"),
-            dimension(value, "linear_conv_kernel_dim")};
-        if (gdn.linear_num_value_heads % gdn.linear_num_key_heads) {
-            throw ArtifactError("GDN value heads must be divisible by key heads");
-        }
-        (void)gdn.conv_channels();
-        out.gdn = gdn;
-    }
-    out.attention_bias   = flag(value, "attention_bias", false);
-    out.norm_topk_prob   = flag(value, "norm_topk_prob", false);
-    out.gdn_gate         = gdn_gate(name(value, "output_gate_type"),
-                                    ::ninfer::models::identity(out.architecture).output_gate);
-    out.mamba_ssm_dtype  = name(value, "mamba_ssm_dtype");
-    if (value.contains("hc_count") || value.contains("hc_lowrank")) {
-        HcConfig hc{dimension(value, "hc_count"), dimension(value, "hc_lowrank")};
-        (void)hc.stream_width(out.hidden_size);
-        out.hc = hc;
-    }
-    if (value.contains("indexer_n_heads") || value.contains("indexer_kv_heads") ||
-        value.contains("indexer_head_dim") || value.contains("indexer_compress_ratio") ||
-        value.contains("indexer_budget")) {
-        IndexerConfig indexer{
-            dimension(value, "indexer_n_heads"), dimension(value, "indexer_kv_heads"),
-            dimension(value, "indexer_head_dim"), dimension(value, "indexer_compress_ratio"),
-            dimension(value, "indexer_budget")};
-        if (indexer.num_heads % indexer.num_kv_heads) {
-            throw ArtifactError("indexer heads must be divisible by KV heads");
-        }
-        out.indexer = indexer;
-    }
-    if (out.indexed_attention_layers && !out.indexer) {
-        throw ArtifactError("indexed layer_type requires the indexer geometry");
-    }
-    if (value.contains("ple_embed_dim") || value.contains("ple_shard_shape")) {
-        PleConfig ple{
-            dimension(value, "ple_embed_dim"),        dimension(value, "ngram_size"),
-            dimension(value, "heads_per_ngram"),      dimension(value, "split_ngram_parts"),
-            dimension(value, "ple_conv_kernel_size"), dimension(value, "ple_conv_dilation")};
-        const auto& ids = value.at("ple_layer_ids");
-        if (!ids.is_array() || ids.empty()) {
-            throw ArtifactError("ple_layer_ids must name at least one text block");
-        }
-        for (const auto& id : ids) {
-            const auto layer = integer(id, "ple layer index", false);
-            if (layer >= out.num_hidden_layers) {
-                throw ArtifactError("ple_layer_ids index exceeds the text blocks");
-            }
-            ple.layer_ids.push_back(layer);
-        }
-        const auto& shard = value.at("ple_shard_shape");
-        if (!shard.is_array() || shard.size() != 2) {
-            throw ArtifactError("ple_shard_shape must hold rows and width");
-        }
-        ple.shard_shape[0] = integer(shard[0], "ple shard rows");
-        ple.shard_shape[1] = integer(shard[1], "ple shard width");
-        (void)ple.table_rows();
-        out.ple = ple;
-    }
-    if (value.contains("image_token_id")) {
-        MultimodalTokenIds ids{
-            dimension(value, "image_token_id"), dimension(value, "video_token_id"),
-            dimension(value, "vision_start_token_id"), dimension(value, "vision_end_token_id")};
-        out.multimodal_token_ids = ids;
-    }
-    if (::ninfer::models::identity(out.architecture).moe) {
-        if (value.contains("intermediate_size")) {
-            throw ArtifactError("MoE config carries Dense FFN width");
-        }
-        MoeConfig moe{dimension(value, "num_experts"), dimension(value, "num_experts_per_tok"),
-                      dimension(value, "moe_intermediate_size"),
-                      dimension(value, "shared_expert_intermediate_size")};
-        if (moe.num_experts_per_tok > moe.num_experts) {
-            throw ArtifactError("selected experts exceed expert count");
-        }
-        out.ffn = moe;
-    } else {
-        for (const auto* key : {"num_experts", "num_experts_per_tok", "moe_intermediate_size",
-                                "shared_expert_intermediate_size"}) {
-            if (value.contains(key)) { throw ArtifactError("Dense config carries MoE fields"); }
-        }
-        out.ffn = DenseConfig{dimension(value, "intermediate_size")};
-    }
-    return out;
-}
 
 VisionConfig vision(const Json& value) {
     require_members(value,
@@ -541,7 +388,13 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
         }
         Config out;
         out.mtp  = options.speculative == SpeculativeBackend::Mtp;
-        out.text = text(directory.component("text").config, out.mtp);
+        const auto& text_json = directory.component("text").config;
+        const auto text_architecture = resolve_architecture(
+            artifact::require_id(text_json.at("architectures").at(0), "architectures"),
+            artifact::require_id(text_json.at("model_type"), "model_type"));
+        out.text = text_architecture == Architecture::Qwen4Exp
+                       ? qwen4_exp::parse_text_config(text_architecture, text_json, out.mtp)
+                       : qwen3_5::parse_text_config(text_architecture, text_json, out.mtp);
         const auto family = ::ninfer::models::identity(out.text.architecture);
         if (family.complete != nullptr) { family.complete(out.text); }
         if (options.vision) { out.vision = vision(companion(directory, "vision").config); }
