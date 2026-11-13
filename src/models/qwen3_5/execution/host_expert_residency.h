@@ -1667,18 +1667,20 @@ private:
     // counter read hits=0 misses=0 - which is exactly how "the tier is never filled" survived a
     // switch that looked connected.
     static bool managed_even_in_place() {
-        // port (sm_89): 2026-10-31 - NOT bound to NINFER_HOST_TIER any more.
+        // port (sm_89): back on by default, with the 2026-10-31 hang accounted for.
         //
-        // Binding them made the switch reach an arena-backed path on an artifact whose every bank is
-        // addressed in place, and a decode request with the switch on then failed to return (no
-        // exception, connection reset, process alive). Prefill was fine, which is why it looked
-        // verified: perplexity is a prefill path.
-        //
-        // Until that failure is diagnosed, the switch stays inert on this artifact - a direct_ bank
-        // returns before touching the arena - rather than reachable and broken. The managed copy is
-        // opt-in again through NINFER_ARENA_MANAGED, which is what it was before, and the decode
-        // failure is recorded with it.
-        static const bool value = std::getenv("NINFER_ARENA_MANAGED") != nullptr;
+        // That failure was reached with a 1.25 GiB tier (1004 slots over 144 banks, ~7 per bank)
+        // while the Device uploader read the arena through arena_image(). Two things have changed
+        // since: claim() now refuses to evict a slot that is in flight or held by a queued GEMM
+        // (in_flight_ / device_held_ / device_held_prev_, see claim() and begin_layer()), and the
+        // budget is sized from the model's complement rather than two layers. A bank addressed in
+        // place still means the CPU half reads file pages the OS may evict at any time - the exact
+        // "cold tier wearing a warm tier's address" this switch exists to end - so the default is
+        // the controlled tier. NINFER_ARENA_MANAGED=0 restores the old behaviour for an A/B arm.
+        static const bool value = [] {
+            const char* off = std::getenv("NINFER_ARENA_MANAGED");
+            return !(off != nullptr && off[0] == '0');
+        }();
         return value;
     }
     std::vector<std::uint32_t> slot_bank_, slot_expert_;
