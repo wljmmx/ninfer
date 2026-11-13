@@ -20,6 +20,9 @@ class Parameter:
     inputs: tuple[str, ...] = ()
     direct_format: str = "bf16"
     residency: str = "text"
+    # The checkpoint tensor this parameter reads, when it differs from the logical name (a GGUF
+    # source resolves widths by its own spelling).
+    source_name: str | None = None
 
     @property
     def projection(self) -> bool:

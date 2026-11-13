@@ -12,16 +12,36 @@ from collections.abc import Mapping
 from .official_recipes import RECIPES
 from .pipeline import convert
 from .proposal import DEFAULT_RANKING, add_official_proposal
-from . import qwen3_5, qwen4_exp
+from . import gguf_qwen3_5, qwen3_5, qwen4_exp
 from .gguf_qwen4exp import GGUFSource, open_source as open_gguf_source
 from .recipe import Recipe
+from .sources.gguf import open_gguf
 from .sources.safetensors import SafetensorsSource
 
 
+def _gguf_architecture(path):
+    """The file's `general.architecture`, read without materializing any tensor."""
+    file = open_gguf(path)
+    try:
+        return str(file.get("general.architecture", ""))
+    finally:
+        file.close()
+
+
 def _open_base(path, *, gguf_config=None, gguf_root=None):
-    """Open the primary checkpoint. A .gguf file is presented through the GGUF source layer."""
+    """Open the primary checkpoint. A .gguf file is presented through its own source layer."""
     if Path(path).suffix.lower() == ".gguf":
-        return open_gguf_source(path, config_path=gguf_config, root=gguf_root)
+        architecture = _gguf_architecture(path)
+        if architecture == "qwen35":
+            return gguf_qwen3_5.open_source(
+                path, config_path=gguf_config, root=gguf_root
+            )
+        if architecture == "qwen4exp":
+            return open_gguf_source(path, config_path=gguf_config, root=gguf_root)
+        raise ValueError(
+            f"{path}: GGUF architecture is {architecture!r}; this converter reads qwen4exp and "
+            "qwen35 text sources (plus qwen35 mmproj vision)"
+        )
     return SafetensorsSource(path)
 
 
@@ -159,6 +179,8 @@ def main(argv=None):
                         help="resource directory for a .gguf input (defaults to its folder)")
     parser.add_argument("--mtp-gguf", type=Path,
                         help="standalone MTP GGUF (llama.cpp --nextn head) added as the mtp component")
+    parser.add_argument("--mmproj", type=Path,
+                        help="mmproj GGUF (llama.cpp vision projector) added as the vision component")
     args = parser.parse_args(argv)
     components = tuple(args.components.split(","))
     if len(components) != len(set(components)):
@@ -166,15 +188,22 @@ def main(argv=None):
     if args.mtp_gguf is not None and "mtp" not in components:
         # A named draft source is the component: asking for it is enough.
         components = (*components, "mtp")
-    gguf_extra = set(components) - {"text", "mtp"} if Path(args.model).suffix.lower() == ".gguf" else set()
-    if gguf_extra or (Path(args.model).suffix.lower() == ".gguf" and "mtp" in components
-                      and args.mtp_gguf is None):
-        raise ValueError(
-            "a .gguf source converts the text component, plus mtp when --mtp-gguf names the draft "
-            "head (vision ships as a separate mmproj)"
-        )
-    if args.mtp_gguf is None and "mtp" in components and Path(args.model).suffix.lower() == ".gguf":
-        raise ValueError("a .gguf source has no draft head; pass --mtp-gguf with the MTP GGUF")
+    if args.mmproj is not None and "vision" not in components:
+        components = (*components, "vision")
+    is_gguf = Path(args.model).suffix.lower() == ".gguf"
+    if is_gguf:
+        gguf_extra = set(components) - {"text", "mtp", "vision"}
+        if gguf_extra:
+            raise ValueError(
+                f"a .gguf source converts {sorted(gguf_extra)} only when their own GGUF is named "
+                "(--mtp-gguf, --mmproj); DFlash weights travel as an artifact component"
+            )
+        if "mtp" in components and args.mtp_gguf is None:
+            raise ValueError("a .gguf source has no standalone draft head; pass --mtp-gguf")
+        if "vision" in components and args.mmproj is None:
+            raise ValueError("a .gguf source carries no tower; pass --mmproj")
+    elif args.mmproj is not None:
+        raise ValueError("--mmproj applies to a .gguf source; a Safetensors checkpoint has the tower")
     paths = _pairs(args.source, "source")
     if "base" in paths:
         raise ValueError("select the base source with --model")
@@ -188,15 +217,24 @@ def main(argv=None):
             key: sources[key] for key in ("dflash", "dflash2") if key in components
         }
         extra_builder = {}
+        architectures = [str(item) for item in (base.config.get("architectures") or [])]
+        is_qwen4exp = any(item.startswith("Qwen4Exp") for item in architectures)
         if args.mtp_gguf is not None:
-            arch = [str(item) for item in (base.config.get("architectures") or [])]
-            if not any(item.startswith("Qwen4Exp") for item in arch):
-                raise ValueError("--mtp-gguf is implemented for the Qwen4Exp draft head")
-            extra_builder["mtp_source"] = GGUFSource.for_mtp(
-                args.mtp_gguf, base.config["text_config"],
+            text_config = base.config["text_config"]
+            source_type = GGUFSource if is_qwen4exp else gguf_qwen3_5.GGUFSource
+            extra_builder["mtp_source"] = source_type.for_mtp(
+                args.mtp_gguf, text_config,
                 root=args.gguf_root or args.model.parent,
             )
             stack.callback(extra_builder["mtp_source"].close)
+        if args.mmproj is not None:
+            if is_qwen4exp:
+                raise ValueError("--mmproj is not wired for the Qwen4Exp tower yet")
+            hidden = int(base.config["text_config"]["hidden_size"])
+            extra_builder["vision_source"] = gguf_qwen3_5.open_vision_source(
+                args.mmproj, hidden, root=args.gguf_root or args.model.parent
+            )
+            stack.callback(extra_builder["vision_source"].close)
         model = _builder(base.config)(
             base,
             components=components,

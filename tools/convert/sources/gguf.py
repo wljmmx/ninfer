@@ -8,8 +8,9 @@ and every dequantizer are numpy, so they can be checked without the conversion s
 (see tests/convert/test_gguf.py, which cross-checks against gguf-py's own writer/dequantizer).
 
 Quantization code is a port of gguf-py's numpy dequantizers (llama.cpp, MIT). The block layouts
-are the format, not an implementation detail: F32/F16/BF16, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 and the
-K-quants Q2_K/Q3_K/Q4_K/Q5_K/Q6_K. Anything else is refused by name instead of being guessed at.
+are the format, not an implementation detail: F32/F16/BF16, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, IQ4_NL,
+IQ4_XS and the K-quants Q2_K/Q3_K/Q4_K/Q5_K/Q6_K. Anything else is refused by name instead of
+being guessed at.
 
 GGUF stores the fastest dimension first (`ne[0]`), while numpy/torch are row-major (last axis
 fastest), so a stored shape is reversed on the way in. Elements keep their original flat order:
@@ -289,6 +290,33 @@ def _iq4_nl(blocks: np.ndarray) -> np.ndarray:
     return d * qs
 
 
+def _iq4_xs(blocks: np.ndarray) -> np.ndarray:
+    """4-bit non-linear codes with 6-bit sub-scales: one fp16 super-scale, then per 32 values a
+    6-bit signed scale and 16 packed nibbles (ggml block_iq4_xs: d, scales_h, scales_l[4],
+    qs[128]).
+
+    The reference is llama.cpp's dequantize_row_iq4_xs; group ib's sub-scale is
+    ``((scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((scales_h >> 2*ib) & 3) << 4)``, biased by 32.
+    """
+    n_blocks = blocks.shape[0]
+    d = blocks[:, 0:2].view(np.float16).astype(np.float32)
+    scales_h = blocks[:, 2:4].view(np.uint16).astype(np.int32)
+    scales_l = blocks[:, 4:8].astype(np.int32)
+    qs = blocks[:, 8:136].reshape(n_blocks, 8, 16)
+    values = _IQ4_NL_VALUES.reshape((1, 1, 1, 16))
+    low = np.take_along_axis(values, (qs & 0x0F).astype(np.int64)[..., None], axis=-1)[..., 0]
+    high = np.take_along_axis(values, (qs >> 4).astype(np.int64)[..., None], axis=-1)[..., 0]
+    # The reference emits y[j] from the low nibble and y[j+16] from the high one, so a 32-value
+    # group is the 16 low values followed by the 16 high ones.
+    pair = np.concatenate([low, high], axis=-1).astype(np.float32)
+    shifts = np.array([0, 4, 0, 4, 0, 4, 0, 4], dtype=np.int32)
+    scale = ((scales_l[:, [0, 0, 1, 1, 2, 2, 3, 3]] >> shifts) & 0xF) | (
+        ((scales_h >> (2 * np.arange(8, dtype=np.int32))) & 3) << 4
+    )
+    dl = d * (scale - 32).astype(np.float32)
+    return (pair * dl[:, :, None]).reshape(n_blocks, 256)
+
+
 _DEQUANT = {
     GGML_Q4_0: _q4_0,
     GGML_Q4_1: _q4_1,
@@ -296,6 +324,7 @@ _DEQUANT = {
     GGML_Q5_1: _q5_1,
     GGML_Q8_0: _q8_0,
     GGML_IQ4_NL: _iq4_nl,
+    GGML_IQ4_XS: _iq4_xs,
     GGML_Q2_K: _q2_k,
     GGML_Q3_K: _q3_k,
     GGML_Q4_K: _q4_k,

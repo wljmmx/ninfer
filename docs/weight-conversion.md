@@ -162,6 +162,76 @@ rather than of the component's tensors:
   sparse path, and it costs a full-history attention read at every draft step. This is the declared
   behavioural difference from the source.
 
+## Convert a Qwen3.5 dense GGUF (Qwen3.8-27B)
+
+A `qwen35` distribution ships three files: the text GGUF (its `block_count` counts the trailing
+draft block), a standalone MTP GGUF with the same `blk.<last>.nextn.*` block, and a `clip`
+`mmproj` for the tower. Name all three and the converter fills the text, `mtp` and `vision`
+components:
+
+```bash
+python -m tools.convert \
+  --model /path/to/Qwen3.8-27B-UD-Q4_K_XL.gguf \
+  --recipe qwen3_8_27b_gguf \
+  --components text,vision,mtp \
+  --mtp-gguf /path/to/mtp-Qwen3.8-27B-Q4_0.gguf \
+  --mmproj /path/to/mmproj-BF16.gguf \
+  --gguf-root /path/to/resources \
+  --proposal \
+  --device cpu \
+  --name qwen3.8-27b \
+  --out models/qwen3_8_27b_v3_gguf.ninfer
+```
+
+`--gguf-root` must hold the frontend resources a GGUF cannot carry: `tokenizer.json`,
+`tokenizer_config.json`, `chat_template.jinja`, `generation_config.json` and - because the tower is
+selected - `preprocessor_config.json` and `video_preprocessor_config.json`. Their `patch_size`,
+`temporal_patch_size` and `merge_size` are checked against the mmproj's own geometry.
+
+Mapping notes, all of them measured against an existing 27B artifact rather than assumed:
+
+* **Geometry** comes from `qwen35.*`: the dense/linear layout from `full_attention_interval`, the
+  text layer count from `block_count - nextn_predict_layers`, the GDN widths from `ssm.*`, and the
+  rotary width from `rope.dimension_count` (the partial-rotary factor is that width over
+  `attention.key_length`).
+* **Norms are stored zero-centred.** llama.cpp writes every `*norm.weight` as `w + 1` (except
+  `linear_attn.norm.weight`), because HF's Qwen3.5 norms are unit-offset; the runtime adds the one
+  back. Read as-is, every such vector would be off by exactly `-1.000`.
+* **`A_log` is `log(-ssm_a)`.** llama.cpp stores the decay already exponentiated.
+* **The GDN value heads are tiled in the file.** One permutation restores HF order for the qkv V
+  rows, `in_proj_z`, `in_proj_a`/`in_proj_b`, `A_log`, `dt_bias`, the convolution's V channels and
+  `out_proj`'s columns. Its direction is a property of the file, not of the format: this one needs
+  `(per_key, key_heads, head_dim)` transposed, the opposite of what the Qwen4Exp file needed.
+* **Attention Q and its output gate are one parent** (`attn_q`, head-interleaved rows); the builder
+  splits them by row range. The convolution is `[channels, taps]` in the file and `[taps, channels]`
+  in the artifact, so it is transposed while the V channels are re-ordered.
+* **Vision**: `v.patch_embd.weight[.1]` are the temporal frames of one conv3d kernel and are
+  stacked back along the third axis; `v.post_ln` is the merger's norm; `mm.0`/`mm.2` are
+  `merger.linear_fc1/fc2`; `v.blk.N.attn_qkv` is the fused q|k|v the builder splits.
+* **`--recipe qwen3_8_27b_gguf` follows the source's widths where a kernel admits them.** The
+  admitted sets come from the consumers, not from taste: the attention and GDN input projections
+  are the paired native form (Q and K at Q4, the gate and V at Q5), `linear_swiglu` takes Q4 or Q8,
+  `linear_add` registers Q4 only at `5120x6144` (the MLP down matrix is `5120x17408`, so it stays
+  Q5), the vocabulary gather has no Q4 path, and the draft's `linear_topk` reduces the *full*
+  248320-row head only at Q8/FP8 (Q4 exists for the 131072-row proposal head). In practice the
+  embedding is the one tensor that follows the source: Q6, because the file stores it at Q4_K and
+  the gather's narrowest path is Q6. The artifact therefore lands about 0.33 GiB *below* the file it
+  replaces. A Q5/Q6 MLP gate|up cannot be kept at all: the SwiGLU parent admits only Q4 or Q8, and
+  Q8 would add roughly 3 GiB.
+
+DFlash/DFlash2 weights are their own checkpoints, so a GGUF distribution of the target cannot
+supply them. Carry them from the artifact that already holds them, byte for byte:
+
+```bash
+python -m tools.artifact.carry new.ninfer \
+  --source old.ninfer --component dflash2 --out final.ninfer
+```
+
+The carried objects are copied as payload ranges (never decoded), renamed under
+`carried/<component>/`, and the use records that name them - including the text output head's
+`dflash2/final_hidden` input - are carried with them. The tool refuses to carry a component the
+target already has.
+
 ## Upgrade an existing v2 artifact
 
 The offline upgrade tool supports the official Qwen3.6/3.8-27B groupwise-int and NVFP4 artifacts,

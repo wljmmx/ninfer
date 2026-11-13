@@ -60,10 +60,18 @@ def _rope_source(raw: dict, label: str) -> dict:
             continue
         if not isinstance(value, dict):
             raise ValueError(f"{label}.{field}: expected an object")
+        kind = "default"
         for alias in ("type", "rope_type"):
-            _fixed(value, alias, "default", label + "." + field)
-        if "factor" in value and _f32(value["factor"], label + ".factor") != 1.0:
-            raise ValueError(f"{label}: scaled RoPE is not implemented")
+            if alias in value:
+                if value[alias] not in ("default", "yarn"):
+                    raise ValueError(
+                        f"{label}.{field}.{alias}: unsupported scaling {value[alias]!r}"
+                    )
+                kind = value[alias]
+        if "factor" in value:
+            factor = _f32(value["factor"], label + ".factor")
+            if factor != 1.0 and kind != "yarn":
+                raise ValueError(f"{label}: scaled RoPE is not implemented for {kind!r}")
         for key, item in value.items():
             if key in rope and rope[key] != item:
                 raise ValueError(f"{label}: conflicting RoPE field {key}")
@@ -155,6 +163,22 @@ def text_config(source: dict, *, mtp: bool) -> dict:
             "partial_rotary_factor": factor,
             "mrope_section": list(sections),
         }
+        # YaRN is a property of the checkpoint, not of the artifact layout: the runtime rebuilds
+        # its per-pair inverse frequencies from these three fields, so a scaled checkpoint keeps
+        # them instead of silently falling back to plain rotary.
+        if rope.get("rope_type", rope.get("type")) == "yarn":
+            result["rope_parameters"]["rope_type"] = "yarn"
+            result["rope_parameters"]["factor"] = _f32(rope.get("factor"), "text.factor")
+            result["rope_parameters"]["original_max_position_embeddings"] = _positive(
+                rope.get("original_max_position_embeddings"),
+                "text.original_max_position_embeddings",
+            )
+            if "beta_fast" in rope:
+                result["rope_parameters"]["beta_fast"] = float(rope["beta_fast"])
+            if "beta_slow" in rope:
+                result["rope_parameters"]["beta_slow"] = float(rope["beta_slow"])
+            if "attention_factor" in rope:
+                result["rope_parameters"]["attention_factor"] = float(rope["attention_factor"])
     if "linear_attention" in layers:
         _fixed(raw, "mamba_ssm_dtype", "float32", "text")
         for key in (
@@ -487,6 +511,7 @@ class _Builder:
                 tuple(inputs),
                 direct,
                 residency=name.split("/", 1)[0],
+                source_name=source_name,
             )
         )
 
@@ -913,6 +938,8 @@ def build_model(
     components: tuple[str, ...] = ("text",),
     companions: Mapping[str, SafetensorsSource] | None = None,
     resource_overrides: Mapping[str, str | Path] | None = None,
+    mtp_source: SafetensorsSource | None = None,
+    vision_source: SafetensorsSource | None = None,
 ) -> Model:
     selected = set(components)
     if "text" not in selected or selected - {
@@ -927,8 +954,10 @@ def build_model(
     config = text_config(base.config, mtp="mtp" in selected)
     records = {"text": {"config": config}}
     if "vision" in selected:
+        # A GGUF source cannot carry the tower, so the vision component may be built from its own
+        # source (an mmproj) while the frontend resources still come from the base directory.
         records["vision"] = {
-            "config": vision_config(base.config, config),
+            "config": vision_config((vision_source or base).config, config),
             "target": "text",
         }
     if "mtp" in selected:
@@ -974,9 +1003,12 @@ def build_model(
             f"text/layers/{i}/", text_prefix + f"layers.{i}.", base, config, kind
         )
     if "mtp" in selected:
+        # The draft head may come from its own source (a standalone MTP GGUF) while the text
+        # component stays on the base.
+        mtp_store = mtp_source or base
         builder.add(
             "mtp/input_projection",
-            base,
+            mtp_store,
             "mtp.fc.weight",
             (h, 2 * h),
             inputs=("mtp/stem_input",),
@@ -986,10 +1018,12 @@ def build_model(
             ("hidden_norm", "pre_fc_norm_hidden"),
             ("final_norm", "norm"),
         ):
-            builder.add("mtp/" + role, base, "mtp." + field + ".weight", (h,))
-        builder.block("mtp/layers/0/", "mtp.layers.0.", base, config, "full_attention")
+            builder.add("mtp/" + role, mtp_store, "mtp." + field + ".weight", (h,))
+        builder.block(
+            "mtp/layers/0/", "mtp.layers.0.", mtp_store, config, "full_attention"
+        )
     if "vision" in selected:
-        builder.vision(base, records["vision"]["config"], h)
+        builder.vision(vision_source or base, records["vision"]["config"], h)
     for backend in ("dflash", "dflash2"):
         if backend in selected:
             if (
