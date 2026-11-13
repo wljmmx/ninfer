@@ -110,7 +110,11 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& config, const std::string& pr
     const auto product = banked ? p + "experts/product" : std::string{};
     for (std::uint32_t e = 0; e < moe.num_experts; ++e) {
         const auto ep = p + "experts/" + std::to_string(e) + "/";
-        if (banked) {
+        // A banked family's artifact normally carries one matrix per (layer, matrix); after
+        // repack_experts_v3 it carries one object per expert instead, and each expert then reads
+        // its own planes rather than a row slice of the bank. The per-expert names are the same
+        // either way, so the artifact itself says which shape this is.
+        if (banked && !b.artifact_has(ep + "gate")) {
             out.experts.push_back({b.banked(ep + "gate", p + "experts/gate", {ir, h},
                                             std::uint64_t(e) * ir, ir, {input}, residency),
                                    b.banked(ep + "up", p + "experts/up", {ir, h},
@@ -118,10 +122,13 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& config, const std::string& pr
                                    b.banked(ep + "down", p + "experts/down", {h, ir},
                                             std::uint64_t(e) * h, h, {product}, residency)});
         } else {
+            // The banked families keep one product activation for the whole layer, so a per-expert
+            // object layout still reads the fused name; the MoE families give each expert its own.
             out.experts.push_back(
                 {b.parameter(ep + "gate", {ir, h}, {input}, std::nullopt, residency),
                  b.parameter(ep + "up", {ir, h}, {input}, std::nullopt, residency),
-                 b.parameter(ep + "down", {h, ir}, {ep + "product"}, std::nullopt, residency)});
+                 b.parameter(ep + "down", {h, ir}, {banked ? product : ep + "product"},
+                             std::nullopt, residency)});
         }
     }
     out.shared = {b.parameter(p + "shared/gate", {shared, h}, {input}),

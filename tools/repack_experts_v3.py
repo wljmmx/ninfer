@@ -42,6 +42,7 @@ from tools.artifact.schema import (  # noqa: E402
 from tools.artifact.writer import layout_directory  # noqa: E402
 
 EXPERT_BINDING = re.compile(r"^(?P<prefix>.*?/experts/)(?P<expert>\d+)/(?P<role>gate|up|down)$")
+FUSED_EXPERT_BINDING = re.compile(r"^(?P<prefix>.*?/experts/)(?P<role>gate|up|down)$")
 MAGIC = b"NINFER\x00\x03"
 
 
@@ -69,6 +70,68 @@ def planes_of(shape, fmt: str, layout: str):
     return [plane for plane in planes if plane[1]]
 
 
+def synthesize_expert_bindings(description: dict) -> int:
+    """Fan a fused expert binding out into one binding per expert.
+
+    The Qwen3.5 MoE adapter writes `experts/<i>/<role>`, one binding per expert; the Qwen4Exp
+    adapter writes one binding per (layer, matrix) over a bank holding every expert's rows. Both
+    load - the binder tries the per-expert name and falls back to the fused one - but only the
+    per-expert form names the blocks this tool splits, so a fused artifact fans out first.
+
+    The ranges are exact row blocks of the same object: every expert owns `rows/experts` rows, and
+    the object's row-split layout is row-major over that block, which is what the split below
+    copies plane by plane.
+    """
+    config = description.get("components", {}).get("text", {}).get("config", {})
+    experts = int(config.get("num_experts") or 0)
+    if experts <= 0:
+        return 0
+    bindings = description["bindings"]
+    added = 0
+    fanned: dict[str, tuple[list[str], str, str]] = {}
+    for name, binding in list(bindings.items()):
+        match = FUSED_EXPERT_BINDING.match(name)
+        if match is None:
+            continue
+        parts = binding["parts"]
+        if len(parts) != 1:
+            raise SystemExit(f"{name}: fused expert weight spans several objects")
+        begin, end = parts[0]["range"]
+        total = end - begin
+        if total % experts:
+            raise SystemExit(f"{name}: {total} elements do not divide into {experts} experts")
+        block = total // experts
+        names: list[str] = []
+        for expert in range(experts):
+            per_expert = f"{match.group('prefix')}{expert}/{match.group('role')}"
+            bindings[per_expert] = {
+                "parts": [{"object": parts[0]["object"],
+                           "range": [begin + expert * block, begin + (expert + 1) * block]}]
+            }
+            names.append(per_expert)
+            added += 1
+        fanned[name] = (names, match.group("prefix"), match.group("role"))
+        # The fused object is split away below, so the fused binding that names it cannot survive:
+        # every reader that resolves this matrix now goes through the per-expert names.
+        del bindings[name]
+
+    # `uses` names parameters, so every entry that named a fused expert bank has to name the experts
+    # instead; the directory parser refuses a use whose parameter is not a binding. The down matrix
+    # also reads its own expert's product, which the fused artifact spells once for the whole bank.
+    if fanned and description.get("uses"):
+        expanded = []
+        for use in description["uses"]:
+            entry = fanned.get(use["parameter"])
+            if entry is None:
+                expanded.append(use)
+                continue
+            names, prefix, role = entry
+            for expert, name in enumerate(names):
+                expanded.append({**use, "parameter": name})
+        description["uses"] = expanded
+    return added
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path)
@@ -78,6 +141,11 @@ def main() -> int:
 
     description = read_description(args.source)
     objects = {obj["id"]: obj for obj in description["objects"]}
+
+    if not any(EXPERT_BINDING.match(name) for name in description["bindings"]):
+        fanned = synthesize_expert_bindings(description)
+        if fanned:
+            print(f"fused expert bindings fanned out into {fanned} per-expert bindings")
 
     # object -> expert -> role -> (element begin, element end, binding name)
     grouped: dict[str, dict[int, dict[str, tuple[int, int, str]]]] = {}
