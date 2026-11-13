@@ -14,6 +14,7 @@
 #include "models/qwen3_5/execution/host_expert_residency.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/measurement.h"
+#include "models/qwen4_exp/execution/qsa.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -224,6 +225,21 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
                 }
                 // A host tier has no artifact reader (`instance.expert_source` is null), so the
                 // single-matrix plan has to be built from the object bytes the replica holds.
+                if (const char* debug = std::getenv("NINFER_EXPERT_DEBUG"); debug != nullptr) {
+                    const auto& shape = stream->split_expert_geometry(matrix_role).shape;
+                    std::fprintf(stderr,
+                                 "[expert-files] stream=%zu role=%zu rows=%u count=%u objects=%llu,%llu,%llu shape=%llu,%llu",
+                                 i, role,
+                                 static_cast<unsigned>(
+                                     stream->split_layout(matrix_role).region.rows),
+                                 stream->count(),
+                                 objects.empty() ? 0ULL : objects[0].index,
+                                 objects.size() < 2 ? 0ULL : objects[1].index,
+                                 objects.size() < 3 ? 0ULL : objects[2].index,
+                                 shape.empty() ? 0ULL : shape[0],
+                                 shape.size() < 2 ? 0ULL : shape[1]);
+                    std::fprintf(stderr, "\n");
+                }
                 files.push_back(
                     host_tier
                         ? artifact::describe_matrix_expert_objects(
@@ -990,6 +1006,48 @@ bool ModelInstance::expert_frozen() const noexcept {
 
 namespace {
 
+// port (sm_89): the KV storage the run will actually use.
+//
+// The perplexity app defaults to fp8 because the low-bit routes are what it measures, and a Qwen4Exp
+// artifact runs its indexed layers through qsa_sparse_gqa, whose low-bit profiles are still behind
+// NINFER_QSA_SPARSE_GQA_QUANT_KV on this port. The default therefore used to end at
+//   "error: qsa_sparse_gqa: invalid cache storage (NINFER_QSA_SPARSE_GQA_QUANT_KV)"
+// after the run had already printed the storage it was going to use. BF16 is the one profile this
+// port has qualified, so that is what an inadmissible request becomes - printed with the reason, and
+// only for a model that has QSA layers (no QSA layer, no QSA storage constraint). The knob is still
+// the way to ask for a low-bit run, so an operator who sets it is not overruled by this.
+void resolve_kv_storage(EngineOptions& options, const models::qwen3_5::TextConfig& text) {
+    if (text.indexed_attention_layers == 0) { return; }
+    if (models::qwen4_exp::execution::qsa_kv_storage_admitted(options.kv_cache)) { return; }
+    const auto requested = options.kv_cache;
+    options.kv_cache     = KvCacheStorage::BFloat16;
+    std::fprintf(stderr,
+                 "[kv] this artifact's indexed layers do not admit '%s' on this port (only bf16 is "
+                 "enabled; NINFER_QSA_SPARSE_GQA_QUANT_KV=1 opts into the ported low-bit routes); "
+                 "using bf16 for this run\n",
+                 models::qwen4_exp::execution::qsa_kv_storage_name(requested));
+    std::fflush(stderr);
+}
+
+// port (sm_89): whether a budget for the routed experts was NAMED. Unset is the controller's
+// decision; "0" is a named budget (it asks for the weights resident), and so is any MiB value or
+// "auto" - normalize_engine_options has already turned those into expert_cache_bytes.
+[[nodiscard]] bool expert_budget_unnamed(const EngineOptions& options) noexcept {
+    if (options.expert_cache_bytes != 0) { return false; }
+    const char* value = std::getenv("NINFER_EXPERT_CACHE_MB");
+    return value == nullptr || *value == '\0';
+}
+
+// The resident weight plan is priced before a byte is allocated (materializer.cpp), so "will it fit"
+// is answerable here instead of by a cudaMalloc failure halfway through the upload. The startup
+// allowance is the caller's own figure; the KV arena is NOT subtracted because it is planned from
+// what is left AFTER the weights, and a plan that leaves too little for it is the existing
+// "Engine runtime reservation requires ..." fallback's case, not this one.
+[[nodiscard]] bool resident_plan_fits(std::uint64_t plan_bytes, std::size_t free_bytes,
+                                      std::size_t headroom_bytes) noexcept {
+    return plan_bytes <= free_bytes && free_bytes - plan_bytes >= headroom_bytes;
+}
+
 ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& device) {
     validate_options(options);
     // port (sm_89): the pool layout decides whether a captured decode graph is valid, so the
@@ -1001,6 +1059,51 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
     inspect.complete();
     StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
     auto plan = models::qwen3_5::plan_load(reader, models::load_options(options));
+    resolve_kv_storage(options, plan.config().text);
+    // port (sm_89): a resident MoE plan that cannot fit the card is a decision, not a crash. This
+    // artifact is 115 GiB with 72.4 GiB of Device-resident weights against a 24 GiB card, and the
+    // old default (no pool, experts resident) died in cudaMalloc while "loading weights". Re-plan
+    // with the experts streamed; the pool and the Host arena are then sized by
+    // attach_expert_cache()/plan_device_split() from the Device left after the KV arena, and the
+    // measured 3.24 GiB resident plan is what loads. A named budget is never second-guessed.
+    if (expert_budget_unnamed(options)) {
+        // Query the free count rather than the WDDM evictable budget: this is a "cannot possibly
+        // fit" gate, and overstating the Device would put the decision back where it was - in a
+        // failed allocation.
+        const auto free_bytes = current_free_device_bytes();
+        const auto resident   = plan.materialization().device_capacity_bytes;
+        if (!resident_plan_fits(resident, free_bytes, options.startup_planning_headroom_bytes)) {
+            EngineOptions streamed      = options;
+            streamed.expert_cache_bytes = kExpertCacheAuto;
+            auto streamed_plan = models::qwen3_5::plan_load(reader, models::load_options(streamed));
+            const auto streamed_bytes = streamed_plan.materialization().device_capacity_bytes;
+            const auto to_gib         = [](std::uint64_t bytes) {
+                return static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
+            };
+            if (resident_plan_fits(streamed_bytes, free_bytes,
+                                   options.startup_planning_headroom_bytes)) {
+                std::fprintf(stderr,
+                             "[budget] resident weights need %.1f GiB of Device memory, %.1f GiB "
+                             "is free (%.1f GiB is held back for startup); streaming the routed "
+                             "experts keeps %.1f GiB resident and sizes the pool from what is left\n",
+                             to_gib(resident), to_gib(free_bytes),
+                             to_gib(options.startup_planning_headroom_bytes), to_gib(streamed_bytes));
+                std::fflush(stderr);
+                plan    = std::move(streamed_plan);
+                options = streamed;
+            } else {
+                // Moving the experts out did not help (a dense artifact has none to move), so the
+                // run is left exactly as it was asked for: no silent downgrade, and the failure
+                // that follows is the one the caller's request earns.
+                std::fprintf(stderr,
+                             "[budget] this artifact does not fit this Device: resident weights "
+                             "need %.1f GiB, streaming the routed experts still needs %.1f GiB, "
+                             "%.1f GiB is free\n",
+                             to_gib(resident), to_gib(streamed_bytes), to_gib(free_bytes));
+                std::fflush(stderr);
+            }
+        }
+    }
     // The PLE table source is opened by the plan (it owns its read handles), so it survives both
     // the Reader above and this function: the Parameters it is installed in live as long as the
     // model. Keeping the shared_ptr here is only what carries it across materialization.

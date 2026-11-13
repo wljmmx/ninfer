@@ -28,6 +28,19 @@ struct QsaGeometry {
 // Every number comes from the config, so a plan can never outlive the geometry it was sized for.
 [[nodiscard]] QsaGeometry qsa_geometry(const qwen3_5::TextConfig& config);
 
+// What this family's QSA Ops will accept as the main KV cache in THIS build: the set the Op family
+// implements (ops/softmax_attention/qsa/storage.h) minus the low-bit routes the port still keeps
+// behind NINFER_QSA_SPARSE_GQA_QUANT_KV (sparse_gqa.cpp refuses anything but BF16 until then), so
+// today the answer is BF16 alone unless that variable is set.
+//
+// Exported so the controller can pick a storage the Op will accept instead of starting a run whose
+// first qsa_sparse_gqa call throws "invalid cache storage" - the gate itself stays where it is
+// enforced, and this predicate is only its read side. The knob is the way to ask for a low-bit run.
+[[nodiscard]] bool qsa_kv_storage_admitted(KvCacheStorage storage) noexcept;
+
+// The name the Op family reports for a storage, so a substitution can name what it replaced.
+[[nodiscard]] const char* qsa_kv_storage_name(KvCacheStorage storage) noexcept;
+
 // Everything the transient side depends on, taken from the controller's resolved dial values rather
 // than compiled-in caps: `min_tokens`/`max_tokens` are the prefill chunk interval the plan resolved
 // (or a decode width) and `batch_size` is its concurrency.

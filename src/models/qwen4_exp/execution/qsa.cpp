@@ -1,5 +1,8 @@
 #include "models/qwen4_exp/execution/qsa.h"
+#include "ops/softmax_attention/qsa/storage.h"
 
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -39,6 +42,20 @@ QsaGeometry qsa_geometry(const qwen3_5::TextConfig& config) {
         throw std::invalid_argument("qsa plan: the index block size is not usable");
     }
     return geometry;
+}
+
+// The Op family's implemented set is authoritative for "which storages exist"; the port's low-bit
+// gate is the second half. Both are read here rather than re-stated, so a route that starts
+// qualifying on this port shows up in the controller's choice automatically.
+bool qsa_kv_storage_admitted(KvCacheStorage storage) noexcept {
+    if (!ops::detail::qsa::qsa_storage_supported(storage)) { return false; }
+    if (storage == KvCacheStorage::BFloat16) { return true; }
+    const char* value = std::getenv("NINFER_QSA_SPARSE_GQA_QUANT_KV");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+const char* qsa_kv_storage_name(KvCacheStorage storage) noexcept {
+    return ops::detail::qsa::qsa_storage_name(storage);
 }
 
 std::int32_t qsa_index_blocks_per_page(const QsaGeometry& geometry) {
