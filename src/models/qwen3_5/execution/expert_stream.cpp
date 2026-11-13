@@ -1881,7 +1881,7 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
             chosen[expert] = true;
             set.push_back(expert);
         }
-        if (ranked.empty()) {
+        if (ranked.empty() && refresh) {
             ranked.resize(count_);
             std::iota(ranked.begin(), ranked.end(), 0U);
             std::stable_sort(ranked.begin(), ranked.end(), [&](std::uint32_t a, std::uint32_t b) {
@@ -1889,19 +1889,24 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
             });
         }
         if (!refresh) {
-            // Hold the set in score order, not id order. Keeping the lowest ids filled all 128
-            // seats from the bottom of the expert range, so a high-id route was evicted the step
-            // after it arrived and uploaded again - the 22-of-30 reinstall the counter showed.
-            for (const auto expert : ranked) {
+            // port (sm_89): last layer's set, in place. Rescanning the cache's 512 slots and
+            // re-sorting the score every layer was what was left in the layout window after the
+            // upload fell to 0.4 ms; a decode step only changes by the routes that arrived.
+            for (const auto expert : split_prev_[index]) {
                 if (set.size() >= capacity[index]) { break; }
-                if (chosen[expert]) { continue; }
-                if (cache_->expert_slot(split_[index].bank, expert)) {
-                    chosen[expert] = true;
-                    set.push_back(expert);
-                }
+                if (expert >= chosen.size() || chosen[expert]) { continue; }
+                chosen[expert] = true;
+                set.push_back(expert);
             }
         }
         if (set.size() < capacity[index]) {
+            if (ranked.empty()) {
+                ranked.resize(count_);
+                std::iota(ranked.begin(), ranked.end(), 0U);
+                std::stable_sort(ranked.begin(), ranked.end(), [&](std::uint32_t a, std::uint32_t b) {
+                    return hot_score_[a] > hot_score_[b];
+                });
+            }
             for (const auto expert : ranked) {
                 if (set.size() >= capacity[index]) { break; }
                 if (chosen[expert]) { continue; }
@@ -1909,6 +1914,7 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
                 set.push_back(expert);
             }
         }
+        split_prev_[index] = wanted[index];
         if (index == 0) {
             for (std::size_t i = 0; i < values; ++i) {
                 if (chosen[static_cast<std::size_t>(route_ids[i])]) { ++inside_gate; }

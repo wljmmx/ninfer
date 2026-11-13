@@ -519,6 +519,9 @@ private:
     // attached. Filled by ensure_split, consumed by the fill.
     std::array<std::vector<std::int32_t>, 3> split_host_targets_;
     std::array<std::vector<std::uint32_t>, 3> split_frozen_; // per run, when frozen_
+    // port (sm_89): last layer's installed set, per run. A decode step starts from it and adds this
+    // step's routes, rather than re-scanning 512 slots per run and re-sorting the score every layer.
+    std::array<std::vector<std::uint32_t>, 3> split_prev_;
     std::uint32_t split_host_routes_ = 0;
 
     ExpertCache* cache_ = nullptr;
