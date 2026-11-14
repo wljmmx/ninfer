@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_topk.h"
 
 #include "core/device.h"
@@ -11,6 +12,9 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <cstdlib>
+#include <limits>
+#include <numeric>
 #include <string>
 #include <vector>
 
@@ -474,6 +478,253 @@ int run_q4(const DeviceBuffer& hidden, const std::vector<double>& base_score) {
     return failures;
 }
 
+// Q5 draft head: the Qwen3.8-Flash-Next output head is Q5_G64_FP16 [248320, 2560], and the DFlash2
+// candidate selection is the only reader of it in this geometry. Three planes (codes, one bit per
+// value, one fp16 scale per 64 values) are staged exactly as the dense Q5 GEMMs stage them, and the
+// oracle decodes the represented values on the host in FP64 - independent of every device decode -
+// so a wrong high-plane bit or a scale landing on the wrong group shows up as a different id.
+constexpr std::int32_t kDraftK        = 2560;
+constexpr std::int32_t kDraftGroupK   = 64;
+constexpr std::int32_t kDraftGroups   = kDraftK / kDraftGroupK;
+constexpr std::int32_t kDraftCodeRow  = kDraftK / 2;
+constexpr std::int32_t kDraftHighRow  = kDraftK / 8;
+constexpr std::int32_t kDraftScaleRow = kDraftGroups * 2;
+
+// Every winner stays below kValidRows: the full head masks the reserved tail, so a fixture row there
+// is dropped by design and would look like a kernel failure.
+const std::array<std::int32_t, 18> kQ5WinnerRows{
+    5,     128,   511,   512,   1023,   4095,   8191,   15872,  196607,
+    16383, 16384, 16895, 32767, 65535, 131071, 247806, 248075, 248076,
+};
+
+struct Q5Fixture {
+    DeviceBuffer payload;
+    Weight weight;
+    std::uint64_t high_offset  = 0;
+    std::uint64_t scale_offset = 0;
+};
+
+Q5Fixture make_q5_full() {
+    const std::uint64_t code_bytes  = static_cast<std::uint64_t>(kFullRows) * kDraftCodeRow;
+    const std::uint64_t high_bytes  = static_cast<std::uint64_t>(kFullRows) * kDraftHighRow;
+    const std::uint64_t scale_bytes = static_cast<std::uint64_t>(kFullRows) * kDraftScaleRow;
+    const std::uint64_t high_offset  = align_up(code_bytes, 256);
+    const std::uint64_t scale_offset = align_up(high_offset + high_bytes, 256);
+    Q5Fixture result{DeviceBuffer(static_cast<std::size_t>(scale_offset + scale_bytes) + 256), {},
+                     0, 0};
+    result.payload.fill(0);
+    result.high_offset  = high_offset;
+    result.scale_offset = scale_offset;
+    auto* base          = static_cast<std::uint8_t*>(result.payload.p);
+    result.weight.payload          = result.payload.p;
+    result.weight.payload_bytes    = result.payload.bytes;
+    result.weight.high_plane_bytes = high_bytes;
+    result.weight.qtype            = QType::Q5_G64_FP16;
+    result.weight.group_size       = kDraftGroupK;
+    result.weight.shape[0]         = kFullRows;
+    result.weight.shape[1]         = kDraftK;
+    result.weight.padded_shape[0]  = kFullRows;
+    result.weight.padded_shape[1]  = kDraftK;
+    result.weight.ndim             = 2;
+    result.weight.qdata            = base;
+    result.weight.qhigh            = base + high_offset;
+    result.weight.scales           = base + scale_offset;
+    result.weight.n                = kFullRows;
+    result.weight.k                = kDraftK;
+    result.weight.group            = kDraftGroupK;
+    result.weight.layout           = QuantLayout::RowSplit;
+    result.weight.scale_dtype      = DType::FP16;
+    return result;
+}
+
+// Five-bit signed value at (group, lane): the low four bits live in the code plane, the fifth in the
+// high plane, and the value is sign-extended from bit 4. The pattern is row independent, so a row's
+// score is its scale factor times one fixed projection - which is what makes the ranking below
+// exact - while still using both signs, all five bits and every group.
+std::int32_t q5_value(std::int32_t group, std::int32_t lane) {
+    const std::int32_t span = 1 + (group * 3 + lane * 5) % 15;
+    return (group + lane) % 7 == 0 ? -span : span;
+}
+
+void patch_q5_row(Q5Fixture& fixture, std::int32_t row, float factor) {
+    auto* base = static_cast<std::uint8_t*>(fixture.payload.p);
+    std::vector<std::uint8_t> codes(kDraftCodeRow, 0);
+    std::vector<std::uint8_t> high(kDraftHighRow, 0);
+    for (std::int32_t group = 0; group < kDraftGroups; ++group) {
+        for (std::int32_t lane_pair = 0; lane_pair < kDraftGroupK / 2; ++lane_pair) {
+            const std::int32_t v0 = q5_value(group, lane_pair * 2);
+            const std::int32_t v1 = q5_value(group, lane_pair * 2 + 1);
+            const std::uint8_t low0 = static_cast<std::uint8_t>(v0 & 0x0f);
+            const std::uint8_t low1 = static_cast<std::uint8_t>(v1 & 0x0f);
+            const std::uint8_t high0 = static_cast<std::uint8_t>((v0 >> 4) & 1);
+            const std::uint8_t high1 = static_cast<std::uint8_t>((v1 >> 4) & 1);
+            codes[static_cast<std::size_t>(group) * 32 + lane_pair] =
+                static_cast<std::uint8_t>(low0 | (low1 << 4));
+            const std::int32_t high_byte = group * 8 + (lane_pair * 2) / 8;
+            high[static_cast<std::size_t>(high_byte)] |= static_cast<std::uint8_t>(
+                (high0 << ((lane_pair * 2) % 8)) | (high1 << ((lane_pair * 2 + 1) % 8)));
+        }
+    }
+    std::vector<std::uint16_t> scales(kDraftGroups);
+    for (std::int32_t group = 0; group < kDraftGroups; ++group) {
+        scales[static_cast<std::size_t>(group)] =
+            quantized_weight::detail::f32_to_f16(factor * group_base_scale(group));
+    }
+    fixture.payload.copy_from_host(codes.data(), codes.size(),
+                                   static_cast<std::size_t>(row) * kDraftCodeRow);
+    fixture.payload.copy_from_host(high.data(), high.size(),
+                                   static_cast<std::size_t>(fixture.high_offset) +
+                                       static_cast<std::size_t>(row) * kDraftHighRow);
+    fixture.payload.copy_from_host(scales.data(), scales.size() * sizeof(std::uint16_t),
+                                   static_cast<std::size_t>(fixture.scale_offset) +
+                                       static_cast<std::size_t>(row) * kDraftScaleRow);
+    (void)base;
+}
+
+// FP64 scores of the represented weights against one hidden vector, for the rows that are not zero.
+std::vector<double> q5_base_scores(const std::vector<std::uint16_t>& hidden) {
+    std::vector<double> scores(kQ5WinnerRows.size());
+    for (std::size_t index = 0; index < kQ5WinnerRows.size(); ++index) {
+        double sum = 0;
+        for (std::int32_t group = 0; group < kDraftGroups; ++group) {
+            const auto scale_bits = quantized_weight::detail::f32_to_f16(
+                static_cast<float>(index + 1) * group_base_scale(group));
+            const double scale = quantized_weight::detail::f16_to_f32(scale_bits);
+            for (std::int32_t lane = 0; lane < kDraftGroupK; ++lane) {
+                const std::int32_t value = q5_value(group, lane);
+                const double weight      = static_cast<double>(value) * scale;
+                sum += weight * bf16_to_f32(
+                                   hidden[static_cast<std::size_t>(group * kDraftGroupK + lane)]);
+            }
+        }
+        scores[index] = sum;
+    }
+    return scores;
+}
+
+// Deterministic BF16 hidden of the draft width, positive like a real residual stream (a random-sign
+// vector would cancel a five-bit projection down to noise); three seeds stand in for three decode
+// steps.
+std::vector<std::uint16_t> make_draft_hidden(std::int32_t seed, std::int32_t columns) {
+    std::vector<std::uint16_t> hidden(static_cast<std::size_t>(kDraftK) * columns);
+    std::uint32_t state = 0x9e3779b9u ^ static_cast<std::uint32_t>(seed * 2654435761u);
+    for (std::size_t index = 0; index < hidden.size(); ++index) {
+        state = state * 1664525u + 1013904223u;
+        const float unit = static_cast<float>(state >> 8) / static_cast<float>(1u << 24);
+        hidden[index]    = f32_to_bf16(0.25F + unit * 1.5F);
+    }
+    return hidden;
+}
+
+int run_q5_draft_head() {
+    Q5Fixture fixture = make_q5_full();
+    for (std::size_t index = 0; index < kQ5WinnerRows.size(); ++index) {
+        patch_q5_row(fixture, kQ5WinnerRows[index], static_cast<float>(index + 1));
+    }
+
+    int failures = 0;
+    for (std::int32_t seed = 0; seed < 3; ++seed) {
+        const std::vector<std::uint16_t> host_hidden = make_draft_hidden(seed, 1);
+        const auto base                              = q5_base_scores(host_hidden);
+        std::vector<std::pair<double, std::int32_t>> ranked;
+        for (std::size_t index = 0; index < kQ5WinnerRows.size(); ++index) {
+            ranked.emplace_back(base[index], kQ5WinnerRows[index]);
+        }
+        std::sort(ranked.begin(), ranked.end(), [](const auto& lhs, const auto& rhs) {
+            return lhs.first > rhs.first || (lhs.first == rhs.first && lhs.second < rhs.second);
+        });
+        ranked.resize(kTopK);
+
+        DeviceBuffer hidden(host_hidden.size() * sizeof(std::uint16_t));
+        hidden.copy_from_host(host_hidden.data(), hidden.bytes);
+        GuardedDeviceBuffer out_ids(static_cast<std::size_t>(kTopK) * sizeof(std::int32_t));
+        GuardedDeviceBuffer out_scores(static_cast<std::size_t>(kTopK) * sizeof(float));
+        const std::size_t capacity = ops::linear_topk_workspace_capacity_bytes(
+            QType::Q5_G64_FP16, kFullRows, kDraftK, 1, 1);
+        GuardedDeviceBuffer scratch(capacity);
+        WorkspaceArena workspace(DeviceSpan{scratch.data(), capacity});
+        Tensor x(hidden.p, DType::BF16, {kDraftK, 1});
+        Tensor ids_tensor(out_ids.data(), DType::I32, {kTopK, 1});
+        Tensor scores_tensor(out_scores.data(), DType::FP32, {kTopK, 1});
+        ops::linear_topk(x, fixture.weight, kValidRows, ids_tensor, scores_tensor, workspace, nullptr);
+        cuda_synchronize();
+
+        const auto ids    = from_device<std::int32_t>(out_ids.data(), kTopK);
+        const auto scores = from_device<float>(out_scores.data(), kTopK);
+
+        // The dense Q5 head is the path the ordinary decode samples from; its logits are the second
+        // opinion, so the top-1 id and the top-8 set are compared against it as well.
+        std::vector<float> logits(static_cast<std::size_t>(kFullRows));
+        {
+            // The public activation and output of every Linear route are BF16, so the second opinion
+            // is read back in BF16 and widened here.
+            DeviceBuffer dense(static_cast<std::size_t>(kFullRows) * sizeof(std::uint16_t));
+            Tensor dense_tensor(dense.p, DType::BF16, {kFullRows, 1});
+            ops::linear(x, fixture.weight, dense_tensor, nullptr);
+            cuda_synchronize();
+            const auto wide = from_device<std::uint16_t>(dense.p, kFullRows);
+            for (std::size_t index = 0; index < wide.size(); ++index) {
+                logits[index] = bf16_to_f32(wide[index]);
+            }
+        }
+        std::vector<std::int32_t> order(kFullRows);
+        std::iota(order.begin(), order.end(), 0);
+        std::partial_sort(order.begin(), order.begin() + 8, order.end(),
+                          [&](std::int32_t lhs, std::int32_t rhs) {
+                              return logits[static_cast<std::size_t>(lhs)] >
+                                         logits[static_cast<std::size_t>(rhs)] ||
+                                     (logits[static_cast<std::size_t>(lhs)] ==
+                                          logits[static_cast<std::size_t>(rhs)] &&
+                                      lhs < rhs);
+                          });
+
+        int matched_ids = 0;
+        for (std::int32_t rank = 0; rank < kTopK; ++rank) {
+            if (ids[rank] == ranked[static_cast<std::size_t>(rank)].second) {
+                ++matched_ids;
+            } else {
+                std::cerr << "q5-draft seed=" << seed << " rank=" << rank << " id got=" << ids[rank]
+                          << " oracle=" << ranked[static_cast<std::size_t>(rank)].second << '\n';
+                ++failures;
+            }
+        }
+        int dense_top8 = 0;
+        {
+            std::vector<double> actual_scores(kTopK);
+            std::vector<double> reference_scores(kTopK);
+            for (std::int32_t rank = 0; rank < kTopK; ++rank) {
+                actual_scores[static_cast<std::size_t>(rank)] = scores[rank];
+                reference_scores[static_cast<std::size_t>(rank)] =
+                    ranked[static_cast<std::size_t>(rank)].first;
+            }
+            failures += verify_reduction("q5-draft scores seed=" + std::to_string(seed),
+                                         actual_scores, reference_scores, kA16ScoreCriterion);
+        }        for (int rank = 0; rank < 8; ++rank) {
+            if (std::find(ids.begin(), ids.begin() + 8, order[static_cast<std::size_t>(rank)]) !=
+                ids.begin() + 8) {
+                ++dense_top8;
+            }
+        }
+        const bool dense_top1 = ids[0] == order[0];
+        std::cout << "q5-draft seed=" << seed << " top1-vs-dense=" << (dense_top1 ? 1 : 0)
+                  << " top8-intersection=" << dense_top8 << "/8 ranks-matching-oracle="
+                  << matched_ids << "/" << kTopK << '\n';
+        if (!dense_top1) {
+            std::cerr << "q5-draft seed=" << seed << " dense top1=" << order[0]
+                      << " topk top1=" << ids[0] << '\n';
+            ++failures;
+        }
+        if (dense_top8 < 8) {
+            std::cerr << "q5-draft seed=" << seed << " dense top8 intersection " << dense_top8
+                      << "/8\n";
+            ++failures;
+        }
+        failures += out_ids.verify_guards("q5 ids tail");
+        failures += out_scores.verify_guards("q5 scores tail");
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -492,6 +743,7 @@ int main() {
         failures += run_full(QType::FP8_E4M3FN_ROW_BF16, "fp8-full", hidden,
                              base_scores(QType::FP8_E4M3FN_ROW_BF16, host_hidden));
         failures += run_q4(hidden, base_scores(QType::Q4_G64_FP16, host_hidden));
+        failures += run_q5_draft_head();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " linear_topk\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
@@ -499,3 +751,6 @@ int main() {
         return 1;
     }
 }
+
+
+
