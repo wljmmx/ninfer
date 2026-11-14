@@ -40,6 +40,10 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache, nullptr, state.execution.ple);
         card.set_ple_lane(state.host_ingress.ple_slots[0]);
+        // A multi-row step names every row's lane: each row's n-gram history is its own, and the
+        // window the PLE stage builds is one column wide across these rows.
+        card.set_ple_lanes(std::span<const std::int32_t>(
+            state.host_ingress.ple_slots.data(), static_cast<std::size_t>(batch_size)));
 
         Tensor tokens             = ordinary.tokens.slice(0, 0, batch_size);
         Tensor cache_positions    = ordinary.cache_positions.slice(0, 0, batch_size);

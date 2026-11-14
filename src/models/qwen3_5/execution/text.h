@@ -131,6 +131,9 @@ public:
     // physical StateImage slot it reads through. Multi-row passes carry one lane per row instead
     // (the verify rectangle's frame and the merged prefill's pass).
     void set_ple_lane(std::int32_t lane) noexcept { ple_lane_ = lane; }
+    // The rows of a multi-row decode, one lane each. The span borrows the caller's Host array for
+    // the duration of the call; a single-row pass keeps set_ple_lane and never reads it.
+    void set_ple_lanes(std::span<const std::int32_t> lanes) noexcept { ple_lanes_ = lanes; }
 
 
     void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
@@ -396,6 +399,7 @@ private:
     qwen3_5::detail::PleProgramState* ple_ = nullptr;
     // The lane this pass's window names. Multi-row passes name one lane per row instead.
     std::int32_t ple_lane_ = 0;
+    std::span<const std::int32_t> ple_lanes_{};
     // The live four-stream state of the current call. Allocated by run_layers from the same recipe
     // the workspace plan uses, so the two reserve identical bytes.
     workspace::TextHcRoots hc_{};

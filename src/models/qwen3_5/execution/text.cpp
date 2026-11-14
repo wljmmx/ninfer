@@ -1317,26 +1317,33 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         ops::embedding(ids, *embed_, x, stream);
         PlePassWindow ple_window(ple_, ctx_.execution_view());
         if (ple_) {
-            // One sequence per window: this step's token is the window and the stage keeps the
-            // two-token hash tail from the window it saw last. The hash reads Host ids, so this
-            // single int is the only readback the PLE step adds. The row's slot is the sequence's
-            // lane, the identity the engine already assigns per resident request.
-            if (batch != 1) {
+            // One window for the whole decode row set: width 1, one lane per row. A single-row pass
+            // keeps the lane set_ple_lane names; a multi-row one names each row's lane from the
+            // ingress, which is the same shape the merged prefill window uses - so every row keeps
+            // its own nine-column history and no row can read another's. Nothing about the layer
+            // math changes with the row count, which is why N rows and N single-row passes agree.
+            if (batch != 1 &&
+                ple_lanes_.size() < static_cast<std::size_t>(batch)) {
                 throw std::invalid_argument(
-                    "text: PLE is driven one sequence at a time on this entry; a multi-row decode "
-                    "needs each row's lane on the Host");
+                    "text: a multi-row decode needs each row's PLE lane on the Host");
             }
-            std::int32_t token = 0;
-            CUDA_CHECK(cudaMemcpyAsync(&token, ids.data, sizeof(token), cudaMemcpyDeviceToHost,
-                                       stream));
+            std::array<std::int32_t, kMaximumConcurrency> tokens{};
+            CUDA_CHECK(cudaMemcpyAsync(tokens.data(), ids.data,
+                                       static_cast<std::size_t>(batch) * sizeof(std::int32_t),
+                                       cudaMemcpyDeviceToHost, stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
-            const std::array<std::int32_t, 1> slot{ple_lane_};
-            const std::array<std::uint32_t, 1> live{1};
-            const qwen4_exp::PleStepWindow window{.ids           = std::span<const std::int32_t>(
-                                                       &token, 1),
-                                                   .slots         = slot,
-                                                   .valid_columns = live,
-                                                   .tokens        = 1};
+            std::array<std::int32_t, kMaximumConcurrency> lanes{};
+            std::array<std::uint32_t, kMaximumConcurrency> live{};
+            for (std::int32_t row = 0; row < batch; ++row) {
+                lanes[static_cast<std::size_t>(row)] =
+                    batch == 1 ? ple_lane_ : ple_lanes_[static_cast<std::size_t>(row)];
+                live[static_cast<std::size_t>(row)] = 1;
+            }
+            const qwen4_exp::PleStepWindow window{
+                .ids           = std::span<const std::int32_t>(tokens.data(), batch),
+                .slots         = std::span<const std::int32_t>(lanes.data(), batch),
+                .valid_columns = std::span<const std::uint32_t>(live.data(), batch),
+                .tokens        = 1};
             ple_->stage().begin(window, ctx_.execution_view());
             ple_window.opened(1, false);
         }
