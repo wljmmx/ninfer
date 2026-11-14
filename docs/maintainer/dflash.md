@@ -494,3 +494,22 @@ candidate list at column j comes from `linear_topk` over `rmsnorm_pack_tail`'s o
 sequential - so the remaining question is whether the *masked-row state* the head sees corresponds to
 the row the training conditioned it on. Comparing that needs the draft's teacher conditioning, which
 this tree cannot produce: it has to come from the reference implementation (strata's DFlash2 path).
+The dynamic convolution probe finally lands on something. `NINFER_DFLASH2_ROW_PROBE` now also prints
+`branch.prepared` per column for the first draft layer, and on v5_e2 with k=8 it reads:
+
+  c0 6.5851 | c1 0.6424 | c2 0.4694 | c3 0.4694 | c4 0.4694 | c5 0.4694 | c6 0.4694 | c7 0.4694 | c8 0.4694
+
+Columns 2..8 are equal to four decimals. The masked rows all carry the same input token (the mask id),
+so after the input norm they are identical, and the op adds nothing that separates them: the prepare
+side (`ops::rmsnorm_dynamic_grouped_conv_prepare`, `dynamic_grouped_conv/bf16/...prepare_partial.cu`)
+is per-column in its GEMM but its per-column input is the column's own masked embedding, which is the
+same for every masked column. The attention half then gives every masked row the same key set (the
+committed context, block rows are never in the ring), so **all masked rows compute the same state** -
+and the dump shows the consequence directly: in a round where the head was read, columns 2..7 all
+proposed the same candidate id (3709).
+
+That is the mechanism behind "column 1 at 0%": one token per round is proposed for every masked
+position, so at most one position can ever be right, and the acceptance length cannot exceed one. The
+fix has to make the masked rows differ - the convolution has to consume the preceding *block* rows (the
+draft's own columns), which is the same missing key set the earlier experiments pointed at from the
+attention side, not a change to any single column's addressing.

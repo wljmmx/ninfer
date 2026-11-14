@@ -432,6 +432,16 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                 auto branch = workspace::dflash2_branch(work, target, config, width, batch);
                 prepare_dynamic_branch(state.execution, residual, layer.input_norm,
                                        config.rms_norm_eps, *layer.attention_conv, branch);
+                {
+                    static const bool conv_probe =
+                        std::getenv("NINFER_DFLASH2_ROW_PROBE") != nullptr;
+                    if (conv_probe && layer_index == 0) {
+                        verify_column_probe("dconv-prepared", branch.prepared,
+                                            dimension(target.hidden_size),
+                                            static_cast<std::int32_t>(branch.prepared.nb[1]), width,
+                                            0, state.execution.device.stream);
+                    }
+                }
                 Tensor query = work.alloc(
                     DType::BF16, {dimension(config.attention.head_dim),
                                   dimension(config.attention.num_attention_heads), width, batch});
