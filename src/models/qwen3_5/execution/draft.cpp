@@ -860,16 +860,27 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                     std::vector<float> logits(words);
                     std::vector<std::int32_t> order(words);
                     std::vector<std::int32_t> candidates(static_cast<std::size_t>(kCandidates));
-                    for (std::int32_t column = 0; column < static_cast<std::int32_t>(k); ++column) {
-                        const Tensor candidate_column =
-                            frame.candidate_ids.slice(1, column, 1).slice(2, 0, 1).view({kCandidates});
+                    for (std::int32_t column = 0; column <= static_cast<std::int32_t>(k); ++column) {
+                        // The last rectangle column has no proposal of its own (candidate_ids holds
+                        // one per draft), but its target distribution is still the only way to see
+                        // what a short extent does to a column the anchor does not border.
+                        const bool has_candidates = column < static_cast<std::int32_t>(k);
+                        const Tensor candidate_column = has_candidates
+                                                            ? frame.candidate_ids.slice(1, column, 1)
+                                                                  .slice(2, 0, 1)
+                                                                  .view({kCandidates})
+                                                            : Tensor{};
                         const Tensor target_column = frame.target_logits.slice(1, column, 1)
                                                          .slice(2, 0, 1)
                                                          .view({vocab});
                         std::int32_t selected = 0;
-                        CUDA_CHECK(cudaMemcpyAsync(candidates.data(), candidate_column.data,
-                                                   candidates.size() * sizeof(std::int32_t),
-                                                   cudaMemcpyDeviceToHost, s));
+                        if (has_candidates) {
+                            CUDA_CHECK(cudaMemcpyAsync(candidates.data(), candidate_column.data,
+                                                       candidates.size() * sizeof(std::int32_t),
+                                                       cudaMemcpyDeviceToHost, s));
+                        } else {
+                            std::fill(candidates.begin(), candidates.end(), -1);
+                        }
                         CUDA_CHECK(cudaMemcpyAsync(raw.data(), target_column.data,
                                                    raw.size() * sizeof(std::uint16_t),
                                                    cudaMemcpyDeviceToHost, s));
@@ -897,16 +908,23 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                              logits[static_cast<std::size_t>(rhs)];
                                   });
                         const std::int32_t argmax = order.front();
-                        int overlap = 0;
-                        for (std::int32_t id : candidates) {
-                            overlap += std::find(order.begin(), order.end(), id) != order.end() ? 1
-                                                                                             : 0;
+                        int overlap               = -1;
+                        int hit                   = -1;
+                        if (has_candidates) {
+                            overlap = 0;
+                            for (std::int32_t id : candidates) {
+                                overlap += std::find(order.begin(), order.end(), id) != order.end()
+                                               ? 1
+                                               : 0;
+                            }
+                            hit = std::find(order.begin(), order.end(), candidates.front()) !=
+                                          order.end()
+                                      ? 1
+                                      : 0;
                         }
-                        const bool hit = std::find(order.begin(), order.end(), candidates.front()) !=
-                                         order.end();
                         std::fprintf(file, "%llu,%d,%d,%d,%d,%d,%d,%d",
                                      static_cast<unsigned long long>(step), column, anchor,
-                                     candidates.front(), selected, argmax, hit ? 1 : 0, overlap);
+                                     candidates.front(), selected, argmax, hit, overlap);
                         for (std::int32_t id : candidates) { std::fprintf(file, ",%d", id); }
                         for (std::int32_t id : order) { std::fprintf(file, ",%d", id); }
                         // Where this column thinks it is, and what the target actually wrote there:
