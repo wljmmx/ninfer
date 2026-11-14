@@ -392,6 +392,31 @@ but the runs-vs-runs figures above are same-session and say a replay costs 10% a
 so the next revision should default the stack to a single causal pass (`draft.cpp:495`, `return 2`
 to `return 1`).
 
+**Per-row RoPE is not the gap either (probed).** The identical `prepared` columns are the
+dynamic-convolution output, which is *before* RoPE, so they say nothing about the rotation - exactly as
+the reference has it. `NINFER_DFLASH2_ROPE_PROBE` (`draft.cpp:414`, off by default) prints what
+`ops::rmsnorm_rope` (`draft.cpp:537`) receives and returns, on the first draft layer. The positions
+tensor is per column, not per request: shape `[9,1,1,1]`, `nb=[4,36]`, values `64..72` at
+`--draft-tokens 8` and `[5,1,1,1]`, `nb=[4,20]`, values `64..68` at `--draft-tokens 4` - anchor at
+`F`, masks at `F+1..F+K`, which is the reference's `pos0+1 .. pos0+7`. What comes back is rotated per
+column, with the first four components of head 0 of `k` reading
+
+  col 0 `[0.37109 0.17090 0.87500 -0.94531]`   col 1 `[1.51562 1.30469 1.65625 -0.41992]`
+  col 2 `[1.41406 0.13770 1.23438 -1.22656]`   col 3 `[-0.43750 -0.45703 -0.42969 -1.43750]`
+
+and column RMS `1.28016 / 1.28502 / 1.27651 / 1.27665 / ...` for `k`, `1.30472 / 1.28840 / 1.30589 /
+...` for `q`. Equal norms, different components: the columns carry one content in different
+rotations, which is the design. So neither `prepare_masked_block` nor `rmsnorm_rope` is mis-shaped,
+and the "every masked column is one row" reading is closed on the RoPE side as well as on the K/V
+side.
+
+What the reference does *not* do, and this tree still does, is admit block rows as keys at all: Strata's
+attention reads the ring only, so no block row sees the anchor or its siblings. Here the partial body
+lets the query tile admit its whole self - `current_is_query` with `col >= query_first_row` at
+`src/ops/softmax_attention/common/context_query.cuh:469,483-490` (causal since the bound landed,
+unconditional before it). That is one mask expression, identical for every column, which is what makes
+the columns agree; it is the next candidate and not this round's change.
+
 What that leaves is the one input the block never has: the token each column *selected*. The planes
 carry the mask row's own state for every column, so conditioning needs the head's output fed back -
 after `ops::candidate_selector_path` (`draft.cpp:657`) walk one column per pass, embedding the

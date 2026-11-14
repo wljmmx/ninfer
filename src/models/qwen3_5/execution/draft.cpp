@@ -411,6 +411,63 @@ void probe_block_plane(const Tensor& plane, const Tensor& positions, int width) 
     std::fflush(stderr);
 }
 
+// NINFER_DFLASH2_ROPE_PROBE: what the block hands RoPE and what comes back, column by column. The
+// block's whole per-column difference rests on `positions`, so its shape and values are printed
+// before the call and the rotated q/k after it: a positions tensor with one value per request (or a
+// whole block sharing pos0) would leave every column's RoPE identical, which is indistinguishable
+// from a head problem once only the proposals are read.
+void probe_rope_columns(const Tensor& positions, const Tensor& query, const Tensor& key, int width,
+                        int batch, int layer) {
+    const auto bits_to_float = [](std::uint16_t bits) {
+        const std::uint32_t wide = static_cast<std::uint32_t>(bits) << 16;
+        float value;
+        std::memcpy(&value, &wide, sizeof(value));
+        return value;
+    };
+    std::vector<std::int32_t> host_positions(static_cast<std::size_t>(positions.ne[0]) *
+                                             static_cast<std::size_t>(positions.ne[1]));
+    cudaDeviceSynchronize();
+    if (cudaMemcpy(host_positions.data(), positions.data,
+                   host_positions.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost) !=
+        cudaSuccess) {
+        std::fprintf(stderr, "[rope-probe] positions readback failed\n");
+        return;
+    }
+    std::fprintf(stderr, "[rope-probe] layer=%d positions shape=[%d,%d,%d,%d] nb=[%lld,%lld] vals=[",
+                 layer, positions.ne[0], positions.ne[1], positions.ne[2], positions.ne[3],
+                 static_cast<long long>(positions.nb[0]), static_cast<long long>(positions.nb[1]));
+    for (int col = 0; col < positions.ne[0]; ++col) {
+        std::fprintf(stderr, "%s%d", col == 0 ? "" : ",", host_positions[static_cast<std::size_t>(col)]);
+    }
+    std::fprintf(stderr, "]\n");
+
+    const auto print_columns = [&](const char* name, const Tensor& tensor) {
+        const std::int64_t column_elements = tensor.nb[2] / static_cast<std::int64_t>(sizeof(std::uint16_t));
+        std::vector<std::uint16_t> host(static_cast<std::size_t>(column_elements) * width);
+        if (cudaMemcpy(host.data(), tensor.data, host.size() * sizeof(std::uint16_t),
+                       cudaMemcpyDeviceToHost) != cudaSuccess) {
+            std::fprintf(stderr, "[rope-probe] %s readback failed\n", name);
+            return;
+        }
+        for (int col = 0; col < width; ++col) {
+            const std::uint16_t* base = host.data() + col * column_elements;
+            double sum = 0.0;
+            for (std::int64_t i = 0; i < column_elements; ++i) {
+                const double v = bits_to_float(base[i]);
+                sum += v * v;
+            }
+            std::fprintf(stderr,
+                         "[rope-probe] layer=%d %s col=%d rms=%.5f first=[%.5f %.5f %.5f %.5f]\n", layer,
+                         name, col, std::sqrt(sum / static_cast<double>(column_elements)),
+                         bits_to_float(base[0]), bits_to_float(base[1]), bits_to_float(base[2]),
+                         bits_to_float(base[3]));
+        }
+    };
+    print_columns("q", query);
+    print_columns("k", key);
+    std::fflush(stderr);
+}
+
 void prepare_dynamic_branch(ExecutionCore& execution, const Tensor& residual, const Tensor& norm,
                             float eps, const DynamicConvParameters& weights,
                             workspace::DFlash2BranchRoots& branch) {
@@ -536,6 +593,10 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                         layer.query_key_value.weight, query_flat, key_flat, value_flat, stream);
                     ops::rmsnorm_rope(positions, layer.query_norm, layer.key_norm, query, key,
                                       config.rope_theta, stream);
+                    if (std::getenv("NINFER_DFLASH2_ROPE_PROBE") != nullptr && layer_index == 0) {
+                        probe_rope_columns(positions, query, key, width, batch,
+                                           static_cast<int>(layer_index));
+                    }
                     Tensor attention = work.alloc(
                         DType::BF16, {dimension(config.attention.head_dim),
                                       dimension(config.attention.num_attention_heads), width, batch});
