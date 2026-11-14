@@ -453,3 +453,22 @@ the same shared verify code produces sharp columns under MTP on this artifact
 (`accepted_per_position = [14, 10, 6, 4, 4, 4, 1]`) and flat ones under DFlash2, so what has to be
 compared next is the two paths' *inputs* to that rectangle - `state_source_slots`, `kv_table_rows`,
 `valid_columns` and the ingress sampling config - not the rectangle itself.
+The ingress comparison is the one that had to be made last, and it comes out identical. With
+`NINFER_VERIFY_INGRESS_PROBE`, one round of the same prompt at frontier 64 with `--draft-tokens 8`
+prints, for DFlash2 and MTP respectively:
+
+  anchor 3709 / 3709, frontier 64 / 64, extent 7 / 7, valid columns 8 / 8,
+  state src 0 / 0, state dst 0 / 0, text kv row 0 / 0, rope delta 0 / 0,
+  temperature 0.000 / 0.000, top_k 20 / 20, top_p 1.000 / 1.000
+
+The only field one path fills and the other does not is DFlash2's `context_frontiers` (64, equal to
+the frontier). So `state_source_slots`, `kv_table_rows`, `valid_columns` and `sampling` are ruled out
+as the difference, and every per-column mechanism on the draft side is now excluded by measurement or
+by reading the code.
+
+What that leaves is the one comparison nobody has made: the target's own per-column logits under MTP
+against the same columns under DFlash2 at the same frontier and the same ids. MTP accepts at position 1
+on this artifact, DFlash2 never does, and both hand the rectangle the same ingress - so the remaining
+difference has to be state the rectangle *reads* rather than the fields it is given. The repository's
+dump exists only on the DFlash2 path (`NINFER_DFLASH2_DUMP` in `execution/draft.cpp`), so the next
+step is the same block in `program/speculative/mtp.cpp` and a side-by-side column table.

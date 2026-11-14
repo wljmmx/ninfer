@@ -652,6 +652,27 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
             mtp_host_ingress->rope_deltas[row]             = sequence.rope_delta;
             mtp_host_ingress->sampling[row]                = request.sampling_host;
             mtp_host_ingress->sampling[row].mask           = bind_grammar_mask(masks, row);
+            if (const char* probe = std::getenv("NINFER_VERIFY_INGRESS_PROBE")) {
+                static bool told = false;
+                if (!told) {
+                    told = true;
+                    std::fprintf(stderr,
+                                 "[ingress %s] %s row=%zu anchor=%d frontier=%d extent=%d vslots=%d "
+                                 "src=%d dst=%d text_row=%d rope_delta=%d temp=%.3f top_k=%d "
+                                 "top_p=%.3f mask=%p\n",
+                                 probe, "mtp", row, mtp_host_ingress->anchors[row], int(frontier),
+                                 int(extent), mtp_host_ingress->target_valid_columns[row],
+                                 mtp_host_ingress->state_source_slots[row],
+                                 mtp_host_ingress->state_destination_slots[row],
+                                 mtp_host_ingress->text_kv_table_rows[row],
+                                 mtp_host_ingress->rope_deltas[row],
+                                 double(request.sampling_host.temperature),
+                                 int(request.sampling_host.top_k),
+                                 double(request.sampling_host.top_p),
+                                 mtp_host_ingress->sampling[row].mask);
+                    std::fflush(stderr);
+                }
+            }
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1,
                                       std::min(capacity, frontier + extent + draft_window));
         }
@@ -860,6 +881,28 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
             dflash_host_ingress->ple_slots[row] = static_cast<std::int32_t>(sequence.lane);
             dflash_host_ingress->sampling[row]                = request.sampling_host;
             dflash_host_ingress->sampling[row].mask           = bind_grammar_mask(masks, row);
+            if (const char* probe = std::getenv("NINFER_VERIFY_INGRESS_PROBE")) {
+                static bool told = false;
+                if (!told) {
+                    told = true;
+                    std::fprintf(stderr,
+                                 "[ingress %s] %s row=%zu anchor=%d frontier=%d extent=%d vslots=%d "
+                                 "src=%d dst=%d text_row=%d ctx_frontier=%d rope_delta=%d temp=%.3f "
+                                 "top_k=%d top_p=%.3f mask=%p\n",
+                                 probe, "dflash2", row, dflash_host_ingress->anchors[row],
+                                 int(frontier), int(extent),
+                                 dflash_host_ingress->target_valid_columns[row],
+                                 dflash_host_ingress->state_source_slots[row],
+                                 dflash_host_ingress->state_destination_slots[row],
+                                 dflash_host_ingress->text_kv_table_rows[row],
+                                 dflash_host_ingress->context_frontiers[row],
+                                 sequence.rope_delta, double(request.sampling_host.temperature),
+                                 int(request.sampling_host.top_k),
+                                 double(request.sampling_host.top_p),
+                                 dflash_host_ingress->sampling[row].mask);
+                    std::fflush(stderr);
+                }
+            }
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1U,
                                       backend_kv_cache() ? frontier : 0U);
         }
