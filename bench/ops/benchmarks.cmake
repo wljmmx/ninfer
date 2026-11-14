@@ -67,6 +67,8 @@ ninfer_add_op_bench(ninfer_context_kv_materialize_bench
 ninfer_add_op_bench(ninfer_mtp_pack_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/mtp_pack_bench.cu")
 ninfer_add_op_bench(ninfer_proposal_remap_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/proposal_remap_bench.cu")
 ninfer_add_op_bench(ninfer_moe_cpu_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/moe_cpu_bench.cpp")
+ninfer_add_op_bench(ninfer_moe_cpu_expert_bench
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/moe_cpu_expert_bench.cpp")
 ninfer_add_op_bench(ninfer_fused_rmsnorm_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/fused_rmsnorm_bench.cu")
 ninfer_add_op_bench(ninfer_hc_gated_residual_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/hc_gated_residual_bench.cu")
 include("${CMAKE_CURRENT_LIST_DIR}/rmsnorm/benchmarks.cmake")
