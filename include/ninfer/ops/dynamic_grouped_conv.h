@@ -13,18 +13,20 @@ namespace ninfer::ops {
 
 /**
  * Returns the transient capacity required by rmsnorm_dynamic_grouped_conv_prepare for every
- * width/batch pair in the inclusive intervals. Width endpoints lie in [2,16], batch endpoints
- * in [1,8]. Capacity covers every shape-selected route in the requested domain.
+ * width/batch pair in the inclusive intervals. rows is the residual's channel count (the registered
+ * instances are 2560 and 5120). Width endpoints lie in [2,16], batch endpoints in [1,8]. Capacity
+ * covers every shape-selected route in the requested domain.
  */
 [[nodiscard]] std::size_t rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
-    std::int32_t min_width, std::int32_t max_width, std::int32_t min_batch_size,
-    std::int32_t max_batch_size);
+    std::int32_t rows, std::int32_t min_width, std::int32_t max_width,
+    std::int32_t min_batch_size, std::int32_t max_batch_size);
 
 /**
  * Op: rmsnorm_dynamic_grouped_conv_prepare
  *
  * Math / indexing:
- *   H=5120, W=2..16, group width 16, G=320, sides=2, taps=2. For h=16*g+j:
+ *   H is the residual's channel count (2560 or 5120), W=2..16, group width 16,
+ *   G=H/16, sides=2, taps=2. For h=16*g+j:
  *
  *     inv[i,b] = rsqrt(sum_h residual[h,i,b]^2 / H + eps)
  *     n[h,i,b] = residual[h,i,b] * inv[i,b] * norm_weight[h]
@@ -38,10 +40,10 @@ namespace ninfer::ops {
  *     finish_delta[g,t,i,b] = d[1,t,g,i,b].
  *
  * Logical shapes / supported domain:
- *   residual/prepared are contiguous BF16 [5120,W,B], W is in [2,16] and B in [1,8];
- *   norm_weight is contiguous BF16 [5120]. base_kernel is the runtime view BF16 [5120,2,2] with
- * axes [channel,tap,side]; kernel_projection_weight is contiguous BF16 [1280,5120]; and
- *   finish_delta is contiguous BF16 [320,2,W,B]. eps is positive and finite. Position zero has
+ *   residual/prepared are contiguous BF16 [H,W,B], W is in [2,16] and B in [1,8];
+ *   norm_weight is contiguous BF16 [H]. base_kernel is the runtime view BF16 [H,2,2] with
+ * axes [channel,tap,side]; kernel_projection_weight is contiguous BF16 [H/4,H]; and
+ *   finish_delta is contiguous BF16 [H/16,2,W,B]. eps is positive and finite. Position zero has
  *   no previous-tap contribution: the Op never reads another request or an earlier round.
  *
  * Numeric:
@@ -68,18 +70,20 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
 
 /**
  * Returns the transient capacity required by linear_dynamic_grouped_conv_add for every width/batch
- * pair in the inclusive intervals. input_rows is 4096 or 17408, widths lie in [2,16], and batch
- * sizes in [1,8]. Capacity follows every shape-selected production route.
+ * pair in the inclusive intervals. rows is the residual's channel count (2560 or 5120), input_rows
+ * is the projection's input width with an instantiated launcher (4096, 7680, 17408), widths lie in
+ * [2,16], and batch sizes in [1,8]. Capacity follows every shape-selected production route.
  */
 [[nodiscard]] std::size_t linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-    std::int32_t input_rows, std::int32_t min_width, std::int32_t max_width,
+    std::int32_t rows, std::int32_t input_rows, std::int32_t min_width, std::int32_t max_width,
     std::int32_t min_batch_size, std::int32_t max_batch_size);
 
 /**
  * Op: linear_dynamic_grouped_conv_add
  *
  * Math / indexing:
- *   H=5120, W=2..16, group width 16, G=320. Let C be 4096 or 17408 and h=16*g+j:
+ *   H is the residual's channel count (2560 or 5120), W=2..16, group width 16, G=H/16. Let C be the
+ *   projection's input width and h=16*g+j:
  *
  *     z[h,i,b] = sum_c projection_weight[h,c] * x[c,i,b]
  *
@@ -88,11 +92,11 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
  *       + I(i>0) * (base_kernel[h,1,1] + finish_delta[g,1,i,b]) * z[h,i-1,b].
  *
  * Logical shapes / supported domain:
- *   x is contiguous BF16 [C,W,B]; projection_weight is Q8_G32_FP16 RowSplit [5120,C] with
- *   unpadded C; base_kernel is contiguous BF16 [5120,2,2] with axes [channel,tap,side];
- *   finish_delta is contiguous BF16 [320,2,W,B]; and residual is contiguous BF16 [5120,W,B].
+ *   x is contiguous BF16 [C,W,B]; projection_weight is Q8_G32_FP16 RowSplit [H,C] with
+ *   unpadded C; base_kernel is contiguous BF16 [H,2,2] with axes [channel,tap,side];
+ *   finish_delta is contiguous BF16 [H/16,2,W,B]; and residual is contiguous BF16 [H,W,B].
  *   W is in [2,16] and B in [1,8]. Position zero has no previous-tap contribution: the Op never
- * reads another request or an earlier round.
+ *   reads another request or an earlier round.
  *
  * Numeric:
  *   The oracle decodes each signed Q8 value with its stored FP16 group scale and evaluates the

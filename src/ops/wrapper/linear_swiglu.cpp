@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::ops {
 namespace {
@@ -88,9 +89,19 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     const bool q8_shape = x.ne[0] == 2048 && out.ne[0] == 6144 && gate_up_weight.n == 12288 &&
                           gate_up_weight.k == 2048 && gate_up_weight.padded_shape[0] == 12288 &&
                           gate_up_weight.padded_shape[1] == 2048;
+    // port (sm_89): the Q8 draft head is gate_up = 2 x out at the draft width. The schedule tiles K by
+    // 128 at run time, so the relation is what admits it - the constant pair below is the 35B view.
+    const bool draft_q8_shape = out.ne[0] % 128 == 0 && x.ne[0] % 128 == 0 &&
+                                gate_up_weight.n == 2 * out.ne[0] &&
+                                gate_up_weight.k == x.ne[0];
     if (t <= 0 || x.ne[2] != 1 || x.ne[3] != 1 || out.ne[1] != t || out.ne[2] != 1 ||
-        out.ne[3] != 1 || (!large_shape && !q8_shape)) {
-        throw std::invalid_argument("linear_swiglu: invalid tensor shape");
+        out.ne[3] != 1 || (!large_shape && !q8_shape && !draft_q8_shape)) {
+        throw std::invalid_argument("linear_swiglu: invalid tensor shape (k=" +
+                                    std::to_string(x.ne[0]) + " out=" +
+                                    std::to_string(out.ne[0]) + " gate_up=" +
+                                    std::to_string(gate_up_weight.n) + " weight_k=" +
+                                    std::to_string(gate_up_weight.k) + " qtype=" +
+                                    std::to_string(static_cast<int>(gate_up_weight.qtype)) + ")");
     }
     if (!x.is_contiguous() || !out.is_contiguous()) {
         throw std::invalid_argument("linear_swiglu: x/out must be contiguous");
@@ -119,7 +130,7 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
                            gate_up_weight.group_size == 64 && gate_up_weight.group == 64 &&
                            high_plane;
     const bool q8_weight =
-        (q8_shape || large_shape) && gate_up_weight.qtype == QType::Q8_G32_FP16 &&
+        (q8_shape || large_shape || draft_q8_shape) && gate_up_weight.qtype == QType::Q8_G32_FP16 &&
         gate_up_weight.group_size == 32 && gate_up_weight.group == 32 &&
         gate_up_weight.qhigh == nullptr && gate_up_weight.high_plane_bytes == 0 && common_row_split;
     const bool nvfp4_weight = large_shape && gate_up_weight.qtype == QType::NVFP4;

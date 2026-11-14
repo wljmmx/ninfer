@@ -5,8 +5,9 @@
 
 namespace ninfer::ops::detail {
 struct DynamicConvPrepareRoute {
-    int rows;
-    int columns;
+    int hidden_rows; // channel count of the residual (2560 or 5120): the reduction's K extent
+    int rows;        // tile rows per CTA
+    int columns;     // tile columns per CTA
     int split_k;
 };
 

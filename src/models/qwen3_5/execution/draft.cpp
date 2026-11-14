@@ -366,8 +366,8 @@ void prepare_dynamic_branch(ExecutionCore& execution, const Tensor& residual, co
     auto scope      = execution.work.scope();
     const int width = residual.ne[1], batch = residual.ne[2];
     WorkspaceArena scratch(execution.work.alloc_bytes(
-        ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(width, width, batch,
-                                                                           batch)));
+        ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
+            residual.ne[0], width, width, batch, batch)));
     ops::rmsnorm_dynamic_grouped_conv_prepare(
         residual, norm, eps, weights.base_kernel, weights.kernel_projection.weight, branch.prepared,
         branch.finish_delta, scratch, execution.device.stream);
@@ -380,7 +380,7 @@ void finish_dynamic_branch(ExecutionCore& execution, const Tensor& input,
     const int width = input.ne[1], batch = input.ne[2];
     WorkspaceArena scratch(
         execution.work.alloc_bytes(ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-            input.ne[0], width, width, batch, batch)));
+            residual.ne[0], input.ne[0], width, width, batch, batch)));
     ops::linear_dynamic_grouped_conv_add(input, projection.weight, weights.base_kernel,
                                          finish_delta, residual, scratch, execution.device.stream);
 }
@@ -764,7 +764,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                          {}, state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
-                         &state.text_cache);
+                         &state.text_cache, nullptr, state.execution.ple);
         DFlashFeatureSink sink =
             batch_feature_sink_impl(state, active_lanes, valid_columns, width, batch_size);
         {
@@ -794,15 +794,35 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                 .licensed_counts = licensed_counts,
                 .accepted_drafts = accepted,
                 .selected_hidden = selected_hidden,
+                .ple_slots = std::span<const std::int32_t>(state.host_ingress.ple_slots.data(),
+                                                          static_cast<std::size_t>(batch_size)),
                 .replay_records  = state.execution.replay_records,
                 .sampling        = frame.sampling,
                 .feature_sink    = &sink,
             };
             if (phase == SpeculativePhase::Forward) {
+                if (std::getenv("NINFER_DFLASH_TRACE") != nullptr) {
+                    std::fprintf(stderr, "[dfl] verify phase forward batch=%d k=%d lanes=%d,%d\n",
+                                 batch_size, k, state.host_ingress.ple_slots[0],
+                                 state.host_ingress.ple_slots[1]);
+                    std::fflush(stderr);
+                }
                 target_verify_forward(state.execution, card, verify, target_envelope);
+                if (std::getenv("NINFER_DFLASH_TRACE") != nullptr) {
+                    std::fprintf(stderr, "[dfl] verify forward done\n");
+                    std::fflush(stderr);
+                }
                 return;
             }
+            if (std::getenv("NINFER_DFLASH_TRACE") != nullptr) {
+                std::fprintf(stderr, "[dfl] accept phase\n");
+                std::fflush(stderr);
+            }
             target_accept(state.execution, state.continuation_hidden_store, verify);
+            if (std::getenv("NINFER_DFLASH_TRACE") != nullptr) {
+                std::fprintf(stderr, "[dfl] accept done\n");
+                std::fflush(stderr);
+            }
         }
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
                                    sizeof(qwen3_5::DFlashDecodeEgress), cudaMemcpyDeviceToHost,

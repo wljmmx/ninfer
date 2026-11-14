@@ -122,6 +122,9 @@ struct DFlashDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> active_lanes{};
     std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
     std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
+    // The lane each row belongs to, exactly as the ordinary and MTP ingress carry it: a PLE window
+    // names one slot per row, and a slot is the sequence's lane, not its StateImage slot.
+    std::array<std::int32_t, kMaximumConcurrency> ple_slots{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
 };
 

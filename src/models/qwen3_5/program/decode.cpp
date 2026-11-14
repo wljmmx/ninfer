@@ -169,6 +169,7 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
         const StateImageSelectors selectors               = state_selectors(sequence);
         dflash_host_ingress->state_source_slots[row]      = selectors.source;
         dflash_host_ingress->state_destination_slots[row] = selectors.destination;
+        dflash_host_ingress->ple_slots[row]               = static_cast<std::int32_t>(lane);
         // Context append writes only the draft caches. Target execution owns Main KV
         // coverage, including any uncommitted suffix that survives until the round is settled.
         // DFlash2 has only fixed cyclic state; DFlash also grows its Full backend KV here.
@@ -852,6 +853,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
             const StateImageSelectors selectors          = state_selectors(sequence);
             dflash_host_ingress->state_source_slots[row] = selectors.source;
             dflash_host_ingress->state_destination_slots[row] = selectors.destination;
+            dflash_host_ingress->ple_slots[row] = static_cast<std::int32_t>(sequence.lane);
             dflash_host_ingress->sampling[row]                = request.sampling_host;
             dflash_host_ingress->sampling[row].mask           = bind_grammar_mask(masks, row);
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1U,

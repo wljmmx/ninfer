@@ -11,17 +11,31 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string>
 
 namespace ninfer::ops {
 namespace {
 
-constexpr std::int32_t kHidden          = 5120;
-constexpr std::int32_t kGroups          = 320;
+constexpr std::int32_t kGroupWidth      = 16;
 constexpr std::int32_t kTaps            = 2;
 constexpr std::int32_t kSides           = 2;
-constexpr std::int32_t kCoefficientRows = kGroups * kTaps * kSides;
+constexpr std::int32_t kRowsPerGroup    = kTaps * kSides;
 constexpr const char* kPrepareOp        = "dynamic grouped conv prepare";
 constexpr const char* kAddOp            = "linear dynamic grouped conv add";
+
+// The channel count is a per-checkpoint geometry with a compiled instance behind it, not a model
+// identity: the 35B draft projects 5120 channels through this Op, the Qwen3.8-Flash-Next draft 2560.
+constexpr bool rows_supported(std::int32_t rows) { return rows == 2560 || rows == 5120; }
+constexpr std::int32_t groups_of(std::int32_t rows) { return rows / kGroupWidth; }
+constexpr std::int32_t coefficient_rows_of(std::int32_t rows) {
+    return groups_of(rows) * kRowsPerGroup;
+}
+// The channel count of the projection's input side: the layer's Q width, its I width, and the two
+// shapes the routes carry bakes. The schedules tile it by 128 and by 8 columns; these are the ones
+// with an instantiated launcher.
+constexpr bool input_rows_supported(std::int32_t input_rows) {
+    return input_rows == 4096 || input_rows == 7680 || input_rows == 17408;
+}
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
@@ -35,40 +49,39 @@ void require_tensor(const Tensor& tensor, DType dtype, std::int32_t d0, std::int
     }
 }
 
-void require_kernel_projection_weight(const Weight& weight) {
-    constexpr std::uint64_t kPayloadBytes =
-        static_cast<std::uint64_t>(kCoefficientRows) * kHidden * sizeof(std::uint16_t);
+void require_kernel_projection_weight(const Weight& weight, std::int32_t rows) {
+    const std::int32_t coefficient_rows = coefficient_rows_of(rows);
+    const std::uint64_t payload_bytes =
+        static_cast<std::uint64_t>(coefficient_rows) * rows * sizeof(std::uint16_t);
     if (weight.qtype != QType::BF16 || weight.layout != QuantLayout::Contiguous ||
-        weight.payload_bytes < kPayloadBytes || weight.high_plane_bytes != 0 || weight.ndim != 2 ||
-        weight.n != kCoefficientRows || weight.k != kHidden ||
-        weight.shape[0] != kCoefficientRows || weight.shape[1] != kHidden ||
-        weight.padded_shape[0] != kCoefficientRows || weight.padded_shape[1] != kHidden ||
-        weight.qhigh != nullptr || weight.scales != nullptr || weight.group_size != 0 ||
-        weight.group != 0 || !aligned_to(weight.qdata, 16)) {
+        weight.payload_bytes < payload_bytes || weight.high_plane_bytes != 0 || weight.ndim != 2 ||
+        weight.n != coefficient_rows || weight.k != rows || weight.shape[0] != coefficient_rows ||
+        weight.shape[1] != rows || weight.padded_shape[0] != coefficient_rows ||
+        weight.padded_shape[1] != rows || weight.qhigh != nullptr || weight.scales != nullptr ||
+        weight.group_size != 0 || weight.group != 0 || !aligned_to(weight.qdata, 16)) {
         throw std::invalid_argument(
             "dynamic grouped conv prepare: invalid kernel_projection_weight");
     }
 }
 
-std::uint64_t required_q8_payload_bytes(std::int32_t input_rows) {
-    const std::uint64_t rows       = kHidden;
-    const std::uint64_t columns    = static_cast<std::uint64_t>(input_rows);
-    const std::uint64_t code_bytes = rows * columns;
-    const std::uint64_t groups     = columns / 32U;
+std::uint64_t required_q8_payload_bytes(std::int32_t rows, std::int32_t input_rows) {
+    const std::uint64_t code_bytes =
+        static_cast<std::uint64_t>(rows) * static_cast<std::uint64_t>(input_rows);
+    const std::uint64_t groups = static_cast<std::uint64_t>(input_rows) / 32U;
     return code_bytes + rows * groups * sizeof(std::uint16_t);
 }
 
-void require_finish_projection_weight(const Weight& weight, std::int32_t input_rows) {
-    const std::uint64_t payload_bytes = required_q8_payload_bytes(input_rows);
+void require_finish_projection_weight(const Weight& weight, std::int32_t rows,
+                                      std::int32_t input_rows) {
+    const std::uint64_t payload_bytes = required_q8_payload_bytes(rows, input_rows);
     if (weight.qtype != QType::Q8_G32_FP16 || weight.layout != QuantLayout::RowSplit ||
         weight.scale_dtype != DType::FP16 || weight.group_size != 32 || weight.group != 32 ||
-        weight.ndim != 2 || weight.n != kHidden || weight.k != input_rows ||
-        weight.shape[0] != kHidden || weight.shape[1] != input_rows || weight.shape[2] != 1 ||
-        weight.shape[3] != 1 || weight.padded_shape[0] != kHidden ||
-        weight.padded_shape[1] != input_rows || weight.padded_shape[2] != 1 ||
-        weight.padded_shape[3] != 1 || weight.qhigh != nullptr || weight.high_plane_bytes != 0 ||
-        weight.payload_bytes < payload_bytes || !aligned_to(weight.qdata, 16) ||
-        !aligned_to(weight.scales, 16)) {
+        weight.ndim != 2 || weight.n != rows || weight.k != input_rows || weight.shape[0] != rows ||
+        weight.shape[1] != input_rows || weight.shape[2] != 1 || weight.shape[3] != 1 ||
+        weight.padded_shape[0] != rows || weight.padded_shape[1] != input_rows ||
+        weight.padded_shape[2] != 1 || weight.padded_shape[3] != 1 || weight.qhigh != nullptr ||
+        weight.high_plane_bytes != 0 || weight.payload_bytes < payload_bytes ||
+        !aligned_to(weight.qdata, 16) || !aligned_to(weight.scales, 16)) {
         throw std::invalid_argument("linear dynamic grouped conv add: invalid projection_weight");
     }
 }
@@ -95,10 +108,10 @@ bool overlaps(const Range& lhs, const Range& rhs) {
 void require_finish_nonoverlap(const Tensor& x, const Weight& projection_weight,
                                const Tensor& base_kernel, const Tensor& finish_delta,
                                const Tensor& residual, const WorkspaceArena& workspace) {
-    const std::size_t code_bytes =
-        static_cast<std::size_t>(kHidden) * static_cast<std::size_t>(x.ne[0]);
-    const std::size_t scale_bytes = static_cast<std::size_t>(kHidden) *
-                                    static_cast<std::size_t>(x.ne[0] / 32) * sizeof(std::uint16_t);
+    const std::size_t rows = static_cast<std::size_t>(residual.ne[0]);
+    const std::size_t code_bytes = rows * static_cast<std::size_t>(x.ne[0]);
+    const std::size_t scale_bytes =
+        rows * static_cast<std::size_t>(x.ne[0] / 32) * sizeof(std::uint16_t);
     const std::array<Range, 7> ranges{{
         {x.data, x.bytes(), "x"},
         {projection_weight.qdata, code_bytes, "projection codes"},
@@ -122,13 +135,14 @@ void require_nonoverlap(const Tensor& residual, const Tensor& norm_weight,
                         const Tensor& base_kernel, const Weight& kernel_projection_weight,
                         const Tensor& prepared, const Tensor& finish_delta,
                         const WorkspaceArena& workspace) {
-    constexpr std::size_t kWeightBytes =
-        static_cast<std::size_t>(kCoefficientRows) * kHidden * sizeof(std::uint16_t);
+    const std::size_t weight_bytes =
+        static_cast<std::size_t>(coefficient_rows_of(residual.ne[0])) *
+        static_cast<std::size_t>(residual.ne[0]) * sizeof(std::uint16_t);
     const std::array<Range, 7> ranges{{
         {residual.data, residual.bytes(), "residual"},
         {norm_weight.data, norm_weight.bytes(), "norm_weight"},
         {base_kernel.data, base_kernel.bytes(), "base_kernel"},
-        {kernel_projection_weight.qdata, kWeightBytes, "kernel_projection_weight"},
+        {kernel_projection_weight.qdata, weight_bytes, "kernel_projection_weight"},
         {prepared.data, prepared.bytes(), "prepared"},
         {finish_delta.data, finish_delta.bytes(), "finish_delta"},
         {workspace.base(), workspace.capacity(), "workspace"},
@@ -147,10 +161,14 @@ void require_nonoverlap(const Tensor& residual, const Tensor& norm_weight,
 } // namespace
 
 std::size_t rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
-    std::int32_t min_width, std::int32_t max_width, std::int32_t min_batch_size,
-    std::int32_t max_batch_size) {
+    std::int32_t rows, std::int32_t min_width, std::int32_t max_width,
+    std::int32_t min_batch_size, std::int32_t max_batch_size) {
+    if (!rows_supported(rows)) {
+        throw std::invalid_argument(
+            "dynamic grouped conv prepare workspace: no instance for the channel count");
+    }
     return detail::bf16_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
-        min_width, max_width, min_batch_size, max_batch_size);
+        rows, min_width, max_width, min_batch_size, max_batch_size);
 }
 
 void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& norm_weight,
@@ -160,6 +178,12 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
                                           cudaStream_t stream) {
     const std::int32_t batch_size = residual.ne[2];
     const std::int32_t width      = residual.ne[1];
+    const std::int32_t rows       = residual.ne[0];
+    const std::int32_t groups     = groups_of(rows);
+    if (!rows_supported(rows)) {
+        throw std::invalid_argument(
+            "dynamic grouped conv prepare: no instance for the channel count");
+    }
     if (width < 2 || width > 16) {
         throw std::invalid_argument("dynamic grouped conv prepare: W must be in [2,16]");
     }
@@ -170,13 +194,13 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
     if (batch_size < 1 || batch_size > 8) {
         throw std::invalid_argument("dynamic grouped conv prepare: B must be in [1,8]");
     }
-    require_tensor(residual, DType::BF16, kHidden, width, batch_size, 1, kPrepareOp, "residual");
-    require_tensor(norm_weight, DType::BF16, kHidden, 1, 1, 1, kPrepareOp, "norm_weight");
-    require_tensor(base_kernel, DType::BF16, kHidden, kTaps, kSides, 1, kPrepareOp, "base_kernel");
-    require_tensor(prepared, DType::BF16, kHidden, width, batch_size, 1, kPrepareOp, "prepared");
-    require_tensor(finish_delta, DType::BF16, kGroups, kTaps, width, batch_size, kPrepareOp,
+    require_tensor(residual, DType::BF16, rows, width, batch_size, 1, kPrepareOp, "residual");
+    require_tensor(norm_weight, DType::BF16, rows, 1, 1, 1, kPrepareOp, "norm_weight");
+    require_tensor(base_kernel, DType::BF16, rows, kTaps, kSides, 1, kPrepareOp, "base_kernel");
+    require_tensor(prepared, DType::BF16, rows, width, batch_size, 1, kPrepareOp, "prepared");
+    require_tensor(finish_delta, DType::BF16, groups, kTaps, width, batch_size, kPrepareOp,
                    "finish_delta");
-    require_kernel_projection_weight(kernel_projection_weight);
+    require_kernel_projection_weight(kernel_projection_weight, rows);
     require_nonoverlap(residual, norm_weight, base_kernel, kernel_projection_weight, prepared,
                        finish_delta, workspace);
 
@@ -185,13 +209,15 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
                                                        finish_delta, workspace, stream);
 }
 
-std::size_t linear_dynamic_grouped_conv_add_workspace_capacity_bytes(std::int32_t input_rows,
-                                                                     std::int32_t min_width,
-                                                                     std::int32_t max_width,
-                                                                     std::int32_t min_batch_size,
-                                                                     std::int32_t max_batch_size) {
+std::size_t linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+    std::int32_t rows, std::int32_t input_rows, std::int32_t min_width, std::int32_t max_width,
+    std::int32_t min_batch_size, std::int32_t max_batch_size) {
+    if (!rows_supported(rows) || !input_rows_supported(input_rows)) {
+        throw std::invalid_argument(
+            "linear dynamic grouped conv add workspace: no instance for the geometry");
+    }
     return detail::q8_linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-        input_rows, min_width, max_width, min_batch_size, max_batch_size);
+        rows, input_rows, min_width, max_width, min_batch_size, max_batch_size);
 }
 
 void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_weight,
@@ -201,20 +227,24 @@ void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_w
     const std::int32_t input_rows = x.ne[0];
     const std::int32_t batch_size = x.ne[2];
     const std::int32_t width      = x.ne[1];
+    const std::int32_t rows       = residual.ne[0];
+    const std::int32_t groups     = groups_of(rows);
     if (width < 2 || width > 16)
         throw std::invalid_argument("linear dynamic grouped conv add: W must be in [2,16]");
-    if (input_rows != 4096 && input_rows != 17408) {
-        throw std::invalid_argument("linear dynamic grouped conv add: C must be 4096 or 17408");
+    if (!rows_supported(rows) || !input_rows_supported(input_rows)) {
+        throw std::invalid_argument(
+            "linear dynamic grouped conv add: no instance for the geometry (rows=" +
+            std::to_string(rows) + " input_rows=" + std::to_string(input_rows) + ")");
     }
     if (batch_size < 1 || batch_size > 8) {
         throw std::invalid_argument("linear dynamic grouped conv add: B must be in [1,8]");
     }
     require_tensor(x, DType::BF16, input_rows, width, batch_size, 1, kAddOp, "x");
-    require_tensor(base_kernel, DType::BF16, kHidden, kTaps, kSides, 1, kAddOp, "base_kernel");
-    require_tensor(finish_delta, DType::BF16, kGroups, kTaps, width, batch_size, kAddOp,
+    require_tensor(base_kernel, DType::BF16, rows, kTaps, kSides, 1, kAddOp, "base_kernel");
+    require_tensor(finish_delta, DType::BF16, groups, kTaps, width, batch_size, kAddOp,
                    "finish_delta");
-    require_tensor(residual, DType::BF16, kHidden, width, batch_size, 1, kAddOp, "residual");
-    require_finish_projection_weight(projection_weight, input_rows);
+    require_tensor(residual, DType::BF16, rows, width, batch_size, 1, kAddOp, "residual");
+    require_finish_projection_weight(projection_weight, rows, input_rows);
     require_finish_nonoverlap(x, projection_weight, base_kernel, finish_delta, residual, workspace);
 
     detail::q8_linear_dynamic_grouped_conv_add_dispatch(x, projection_weight, base_kernel,

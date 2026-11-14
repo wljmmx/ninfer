@@ -9,7 +9,10 @@
 
 namespace ninfer::ops::detail {
 namespace {
-constexpr int kHidden = 5120, kCoefficientRows = 1280, kBlockK = 64, kStages = 2;
+constexpr int kBlockK = 64, kStages = 2;
+
+// coefficient_rows = hidden_rows * 2 / 8: one row per (side, tap, group) with 16 channels a group.
+constexpr int coefficient_rows_of(int hidden_rows) { return hidden_rows / 4; }
 
 __device__ __forceinline__ int shared_col(int row, int col) { return gemm_swz64(row, col); }
 
@@ -20,14 +23,15 @@ struct Tile {
     static constexpr int mmas         = Columns / column_warps / 8;
 };
 
-template <int Rows, int Columns, int SplitK>
+template <int Hidden, int Rows, int Columns, int SplitK>
 __global__
 __launch_bounds__(Tile<Rows, Columns>::threads, 1) void dynamic_grouped_conv_prepare_partial_kernel(
     const __nv_bfloat16* __restrict__ input, const __nv_bfloat16* __restrict__ weight,
     float* __restrict__ partial, int tokens) {
     constexpr int threads         = Tile<Rows, Columns>::threads;
     constexpr int mmas            = Tile<Rows, Columns>::mmas;
-    constexpr int tiles_per_split = kHidden / kBlockK / SplitK;
+    constexpr int kCoefficientRows = Hidden / 4;
+    constexpr int tiles_per_split = Hidden / kBlockK / SplitK;
     __shared__ __align__(16) __nv_bfloat16 ws[kStages][Rows * kBlockK];
     __shared__ __align__(16) __nv_bfloat16 xs[kStages][Columns * kBlockK];
     const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, gid = lane / 4, lid = lane % 4;
@@ -40,14 +44,14 @@ __launch_bounds__(Tile<Rows, Columns>::threads, 1) void dynamic_grouped_conv_pre
         for (int item = tid; item < Rows * (kBlockK / 8); item += threads) {
             int row = item / (kBlockK / 8), kk = item % (kBlockK / 8) * 8;
             cp_async<16, Cache::cg>(&ws[stage][row * kBlockK + shared_col(row, kk)],
-                                     weight + static_cast<std::int64_t>(row0 + row) * kHidden +
+                                     weight + static_cast<std::int64_t>(row0 + row) * Hidden +
                                          kt * kBlockK + kk);
         }
         for (int item = tid; item < Columns * (kBlockK / 8); item += threads) {
             int col = item / (kBlockK / 8), kk = item % (kBlockK / 8) * 8;
             const int safe_col = col0 + col < tokens ? col0 + col : 0;
             cp_async_zfill<16, Cache::cg>(&xs[stage][col * kBlockK + shared_col(col, kk)],
-                                           input + static_cast<std::int64_t>(safe_col) * kHidden +
+                                           input + static_cast<std::int64_t>(safe_col) * Hidden +
                                                kt * kBlockK + kk,
                                           col0 + col < tokens ? 16 : 0);
         }
@@ -102,25 +106,25 @@ __launch_bounds__(Tile<Rows, Columns>::threads, 1) void dynamic_grouped_conv_pre
     }
 }
 
-template <int R, int C, int S>
+template <int Hidden, int R, int C, int S>
 void launch(const Tensor& input, const Weight& weight, float* partial, cudaStream_t stream) {
     const int tokens = input.ne[1] * input.ne[2];
-    const dim3 grid(kCoefficientRows / R, (tokens + C - 1) / C, S);
-    dynamic_grouped_conv_prepare_partial_kernel<R, C, S><<<grid, Tile<R, C>::threads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(input.data),
-        static_cast<const __nv_bfloat16*>(weight.qdata), partial, tokens);
+    const dim3 grid((Hidden / 4) / R, (tokens + C - 1) / C, S);
+    dynamic_grouped_conv_prepare_partial_kernel<Hidden, R, C, S>
+        <<<grid, Tile<R, C>::threads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(input.data),
+            static_cast<const __nv_bfloat16*>(weight.qdata), partial, tokens);
     CUDA_CHECK(cudaGetLastError());
 }
-} // namespace
 
-void bf16_dynamic_grouped_conv_prepare_partial_launch(DynamicConvPrepareRoute route,
-                                                      const Tensor& input, const Weight& weight,
-                                                      float* partial, cudaStream_t stream) {
+template <int Hidden>
+void launch_hidden(DynamicConvPrepareRoute route, const Tensor& input, const Weight& weight,
+                   float* partial, cudaStream_t stream) {
     if (route.rows == 16 && route.split_k == 8) {
         switch (route.columns) {
 #define COL(C)                                                                                     \
     case C:                                                                                        \
-        return launch<16, C, 8>(input, weight, partial, stream)
+        return launch<Hidden, 16, C, 8>(input, weight, partial, stream)
             COL(8);
             COL(16);
             COL(32);
@@ -129,9 +133,22 @@ void bf16_dynamic_grouped_conv_prepare_partial_launch(DynamicConvPrepareRoute ro
         }
     }
     if (route.rows == 32 && route.split_k == 4) {
-        if (route.columns == 32) return launch<32, 32, 4>(input, weight, partial, stream);
-        if (route.columns == 64) return launch<32, 64, 4>(input, weight, partial, stream);
+        if (route.columns == 32) return launch<Hidden, 32, 32, 4>(input, weight, partial, stream);
+        if (route.columns == 64) return launch<Hidden, 32, 64, 4>(input, weight, partial, stream);
     }
     throw std::logic_error("dynamic grouped conv prepare: invalid production tile");
+}
+} // namespace
+
+void bf16_dynamic_grouped_conv_prepare_partial_launch(DynamicConvPrepareRoute route,
+                                                      const Tensor& input, const Weight& weight,
+                                                      float* partial, cudaStream_t stream) {
+    switch (route.hidden_rows) {
+    case 2560:
+        return launch_hidden<2560>(route, input, weight, partial, stream);
+    case 5120:
+        return launch_hidden<5120>(route, input, weight, partial, stream);
+    }
+    throw std::logic_error("dynamic grouped conv prepare: no instance for the channel count");
 }
 } // namespace ninfer::ops::detail

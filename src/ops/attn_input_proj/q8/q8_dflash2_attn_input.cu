@@ -27,12 +27,18 @@ using Output                            = LinearBf16SegmentedOutput<kQueryRows, 
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&, cudaStream_t);
 
 // Exact input-load unrolling matters in the first two MMA column tiles. Wider blocks use
-// runtime live columns with one specialization per accumulator capacity.
-template <int Columns, bool Exact>
+// runtime live columns with one specialization per accumulator capacity. The draft width is a
+// template parameter: the 35B draft projects from 5120, the Qwen3.8-Flash-Next draft from 2560.
+template <int InputRows, int Columns, bool Exact>
 void launch_small(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, Tensor& v,
                   cudaStream_t stream) {
+    using Geometry         = Q8LinearGeometry<6144, InputRows>;
     constexpr int Capacity = (Columns + 7) / 8 * 8;
-    constexpr int Warps    = Columns <= 4 ? 16 : Columns <= 16 ? 8 : 4;
+    // The static-K specialization requires KWarps * 64 to divide the draft width: 5120 = 5 * 1024
+    // admits 16 K warps, 2560 = 5 * 512 admits 8, so the widest four-column tile takes 8 there.
+    constexpr int Warps = Columns <= 4 ? (InputRows % 1024 == 0 ? 16 : 8)
+                          : Columns <= 16 ? 8
+                                          : 4;
     constexpr auto Scales  = Columns <= 4 || (Columns > 8 && Columns <= 16) ? Q8ScaleAccess::Direct
                                                                             : Q8ScaleAccess::Shared;
     using Schedule         = Q8A16SlicedKMmaSchedule<Capacity, Warps, 1, 2, Scales>;
@@ -49,15 +55,17 @@ void launch_small(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, T
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <bool Exact, std::size_t... I>
+template <int InputRows, bool Exact, std::size_t... I>
 constexpr auto make_small_launchers(std::index_sequence<I...>) {
-    return std::array<Launch, sizeof...(I)>{&launch_small < Exact ? 1 + static_cast<int>(I)
-                                                                  : 24 + 8 * static_cast<int>(I),
-                                            Exact > ...};
+    return std::array<Launch, sizeof...(I)>{
+        &launch_small<InputRows,
+                      Exact ? 1 + static_cast<int>(I) : 24 + 8 * static_cast<int>(I), Exact>...};
 }
 
-constexpr auto kExactLaunchers = make_small_launchers<true>(std::make_index_sequence<16>{});
-constexpr auto kTileLaunchers  = make_small_launchers<false>(std::make_index_sequence<4>{});
+constexpr auto kWideExactLaunchers = make_small_launchers<5120, true>(std::make_index_sequence<16>{});
+constexpr auto kWideTileLaunchers  = make_small_launchers<5120, false>(std::make_index_sequence<4>{});
+constexpr auto kDraftExactLaunchers = make_small_launchers<2560, true>(std::make_index_sequence<16>{});
+constexpr auto kDraftTileLaunchers  = make_small_launchers<2560, false>(std::make_index_sequence<4>{});
 
 template <class Schedule>
 void launch_mma(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, Tensor& v,
@@ -75,10 +83,16 @@ void q8_dflash2_attn_input_small_t_launch(const Tensor& x, const Weight& weight,
     if (x.ne[1] < 1 || x.ne[1] > kLastSmallTokens) {
         throw std::invalid_argument("Q8 DFlash2 attention input small-T: unsupported T");
     }
+    const bool draft_width = x.ne[0] == 2560;
+    if (x.ne[0] != 5120 && !draft_width) {
+        throw std::invalid_argument("Q8 DFlash2 attention input small-T: unsupported input rows");
+    }
+    const auto& exact = draft_width ? kDraftExactLaunchers : kWideExactLaunchers;
+    const auto& tile  = draft_width ? kDraftTileLaunchers : kWideTileLaunchers;
     if (x.ne[1] <= 16)
-        kExactLaunchers[x.ne[1] - 1](x, weight, q, k, v, stream);
+        exact[x.ne[1] - 1](x, weight, q, k, v, stream);
     else
-        kTileLaunchers[(x.ne[1] - 17) / 8](x, weight, q, k, v, stream);
+        tile[(x.ne[1] - 17) / 8](x, weight, q, k, v, stream);
 }
 
 void q8_dflash2_attn_input_mma_r32_c64_launch(const Tensor& x, const Weight& weight, Tensor& q,

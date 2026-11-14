@@ -7,15 +7,17 @@
 
 namespace ninfer::ops::detail {
 namespace {
-DynamicConvPrepareRoute resolve_route(int tokens) {
+DynamicConvPrepareRoute resolve_route(int rows, int tokens) {
     // Complete cold-cache Graph timings favor split-8 R16 through 48 columns.
     // R32 halves split scratch and avoids the repeated wide tile above that range.
-    if (tokens <= 48) return {16, tokens <= 8 ? 8 : tokens <= 16 ? 16 : tokens <= 32 ? 32 : 48, 8};
-    return {32, tokens <= 96 ? 32 : 64, 4};
+    if (tokens <= 48)
+        return {rows, 16, tokens <= 8 ? 8 : tokens <= 16 ? 16 : tokens <= 32 ? 32 : 48, 8};
+    return {rows, 32, tokens <= 96 ? 32 : 64, 4};
 }
 
 std::size_t capacity(DynamicConvPrepareRoute route, int tokens) {
-    return static_cast<std::size_t>(1280) * tokens * route.split_k * sizeof(float);
+    // partial is [split_k, tokens, coefficient_rows] floats; coefficient_rows = rows / 4.
+    return static_cast<std::size_t>(route.hidden_rows / 4) * tokens * route.split_k * sizeof(float);
 }
 
 void execute(DynamicConvPrepareRoute route, const Tensor& residual, const Tensor& norm, float eps,
@@ -30,7 +32,8 @@ void execute(DynamicConvPrepareRoute route, const Tensor& residual, const Tensor
 }
 } // namespace
 
-std::size_t bf16_dynamic_grouped_conv_prepare_workspace_capacity_bytes(int min_width, int max_width,
+std::size_t bf16_dynamic_grouped_conv_prepare_workspace_capacity_bytes(int rows, int min_width,
+                                                                       int max_width,
                                                                        int min_batch,
                                                                        int max_batch) {
     if (min_width < 2 || max_width > 16 || min_width > max_width || min_batch < 1 ||
@@ -39,7 +42,7 @@ std::size_t bf16_dynamic_grouped_conv_prepare_workspace_capacity_bytes(int min_w
     std::size_t maximum = 0;
     for (int w = min_width; w <= max_width; ++w)
         for (int b = min_batch; b <= max_batch; ++b)
-            maximum = std::max(maximum, capacity(resolve_route(w * b), w * b));
+            maximum = std::max(maximum, capacity(resolve_route(rows, w * b), w * b));
     return maximum;
 }
 
@@ -47,7 +50,7 @@ void bf16_dynamic_grouped_conv_prepare_dispatch(const Tensor& residual, const Te
                                                 float eps, const Tensor& base, const Weight& weight,
                                                 Tensor& prepared, Tensor& finish,
                                                 WorkspaceArena& workspace, cudaStream_t stream) {
-    execute(resolve_route(residual.ne[1] * residual.ne[2]), residual, norm, eps, base, weight,
-            prepared, finish, workspace, stream);
+    execute(resolve_route(residual.ne[0], residual.ne[1] * residual.ne[2]), residual, norm, eps, base,
+            weight, prepared, finish, workspace, stream);
 }
 } // namespace ninfer::ops::detail

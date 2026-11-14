@@ -70,8 +70,11 @@ bool is_companion_shape(const Q8AttnInputProblem& problem) noexcept {
 }
 
 bool is_dflash2_shape(const Q8AttnInputProblem& problem) noexcept {
-    return problem.input_rows == 5120 && problem.query_rows == 4096 && problem.kv_rows == 1024 &&
-           problem.parent_rows == 6144 && problem.padded_k == 5120;
+    // The draft width is per-checkpoint: the 35B draft projects from 5120, the
+    // Qwen3.8-Flash-Next draft from 2560. The route catalog is keyed on columns only.
+    const bool draft_width = problem.input_rows == 5120 || problem.input_rows == 2560;
+    return draft_width && problem.query_rows == 4096 && problem.kv_rows == 1024 &&
+           problem.parent_rows == 6144 && problem.padded_k == problem.input_rows;
 }
 
 bool supported_shape(const Q8AttnInputProblem& problem) noexcept {
