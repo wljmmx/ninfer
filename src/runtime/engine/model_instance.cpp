@@ -304,6 +304,26 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
                                   gu_rows, dn_rows, requirements.banks[runs[i].first]));
     }
     expert_debug("files", files.size(), requirements.banks.size());
+    // The prediction region's budget, from the routing width: one decoded token asks a bank for
+    // top_k experts, and the delta a prediction can add over the resident set is at most that set,
+    // so two tokens' worth is the ceiling that still leaves the hot set its share (the pool clamps
+    // it to a quarter of a bank's window anyway). This must run before the pool is built: the region
+    // is carved at construction, and the host tier's read-ahead keys off the same number.
+    if (std::getenv("NINFER_PREFETCH_SLOTS") == nullptr) {
+        const char* flag    = std::getenv("NINFER_PREFETCH");
+        const bool enabled  = flag != nullptr && *flag != '\0' && flag[0] != '0';
+        if (enabled && routed_top_k > 0) {
+            const auto slots = std::min<std::uint32_t>(2U * routed_top_k, 64U);
+            char text[16];
+            std::snprintf(text, sizeof(text), "%u", slots);
+            _putenv_s("NINFER_PREFETCH_SLOTS", text);
+            std::fprintf(stderr,
+                         "[ctl] prefetch budget: %u slot(s)/bank = 2 x top_k %u (source=routing "
+                         "width; miss_hist is a run-time signal)\n",
+                         slots, routed_top_k);
+            std::fflush(stderr);
+        }
+    }
     instance.expert_cache = std::make_unique<ExpertCache>(
         specs, requirements, device, std::span<const ExpertBankPair>{}, files,
         source);

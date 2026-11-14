@@ -226,7 +226,10 @@ std::vector<std::uint64_t> bank_generation;
     // misses (C1) and is sized from the widest step (B4), while predictions belong to the NEXT layer;
     // sharing would make them the oldest arrivals, i.e. the first thing FIFO drops.
     std::uint32_t prefetch_per_bank = 0;
-    std::uint32_t prefetch_base     = 0; // region is [base, slots_live)
+    // The prediction region, per bank: the slot ids this bank reserved for it, carved exactly the way
+    // the ring is (each bank from its own free list). A slot id therefore always belongs to one bank,
+    // which is what lets a per-bank stride address it without a global region base.
+    std::vector<std::vector<std::uint32_t>> prefetch_slots;
     std::vector<std::vector<std::uint32_t>> prefetch_owner;   // bank -> region index -> expert
     std::vector<std::uint32_t> prefetch_cursor;               // bank -> next region index to reuse
     // Q20: fixed ring slots per bank, taken from the bank's own free list by configure_ring().
@@ -456,16 +459,11 @@ std::vector<std::uint64_t> bank_generation;
             const auto room = static_cast<std::uint32_t>(slot_cap / 4);
             prefetch_per_bank = std::min(prefetch_per_bank, room);
         }
-        if (per_bank_layout && (ring_per_bank != 0 || prefetch_per_bank != 0)) {
-            // Both experiments assume one global slot stride: the ring hands a slot id to a Device
-            // kernel that indexes the pool by it, and the prediction region is carved out of the top
-            // of a flat slot space. Neither has been re-derived for per-bank strides, so they are
-            // refused rather than silently mis-addressing.
-            std::fprintf(stderr,
-                         "[pool] per-bank slot pricing disables the ring/prefetch experiments\n");
-            std::fflush(stderr);
-            ring_per_bank     = 0;
-            prefetch_per_bank = 0;
+        if (per_bank_layout && ring_per_bank != 0 && prefetch_per_bank != 0) {
+            // Both regions are carved per bank now, so the only thing that could mis-address is a
+            // consumer that assumed the global region base - and there is none left: the ring hands
+            // out slot ids it reserved, and so does the prediction region. Kept as a named refusal
+            // only if a future region reintroduces a global base.
         }
         for (std::size_t b = 0; b < banks.size() && ring_per_bank != 0; ++b) {
             auto& list = free_list(static_cast<std::uint32_t>(b));
@@ -483,6 +481,35 @@ std::vector<std::uint64_t> bank_generation;
         if (ring_per_bank != 0) {
             std::fprintf(stderr, "[ring] fixed slots=%u/bank (%u total), hot seed reduced\n",
                          ring_per_bank, ring_per_bank * static_cast<std::uint32_t>(banks.size()));
+            std::fflush(stderr);
+        }
+        // The prediction region comes out of each bank's own window, before the seed is taken: the
+        // same shape as the ring above, and the reason a per-bank stride needs no global space.
+        if (prefetch_per_bank != 0) {
+            prefetch_owner.assign(banks.size(),
+                                  std::vector<std::uint32_t>(prefetch_per_bank, kAbsentSlot));
+            prefetch_cursor.assign(banks.size(), 0);
+            prefetch_gen.assign(banks.size(), 0);
+            prefetch_slots.assign(banks.size(), {});
+            for (std::size_t b = 0; b < banks.size(); ++b) {
+                if (banks[b].resident) { continue; }
+                auto& list = free_list(static_cast<std::uint32_t>(b));
+                if (list.size() < prefetch_per_bank) {
+                    throw std::invalid_argument(
+                        "expert pool cannot reserve a prediction region for every bank");
+                }
+                prefetch_slots[b].reserve(prefetch_per_bank);
+                for (std::uint32_t index = 0; index < prefetch_per_bank; ++index) {
+                    const std::uint32_t slot = list.back();
+                    list.pop_back();
+                    slot_role[slot] = kRolePrefetch;
+                    prefetch_slots[b].push_back(slot);
+                }
+            }
+            std::fprintf(stderr,
+                         "[pool] prefetch region: %u slot(s)/bank, carved per bank like the "
+                         "ring\n",
+                         prefetch_per_bank);
             std::fflush(stderr);
         }
         const std::uint32_t reserved_per_bank = prefetch_per_bank + ring_per_bank;
@@ -508,23 +535,6 @@ std::vector<std::uint64_t> bank_generation;
                 list.pop_back();
                 ++resident_count[b];
             }
-        }
-        if (prefetch_per_bank != 0) {
-            const auto per_bank = static_cast<std::uint64_t>(prefetch_per_bank);
-            prefetch_base       = static_cast<std::uint32_t>(
-                slots_live - per_bank * static_cast<std::uint64_t>(banks.size()));
-            std::erase_if(free_slots, [&](std::uint32_t slot) { return slot >= prefetch_base; });
-            for (std::uint32_t slot = prefetch_base; slot < slots_live; ++slot) {
-                slot_role[slot] = kRolePrefetch;
-            }
-            prefetch_owner.assign(banks.size(),
-                                  std::vector<std::uint32_t>(prefetch_per_bank, kAbsentSlot));
-            prefetch_cursor.assign(banks.size(), 0);
-            prefetch_gen.assign(banks.size(), 0);
-            std::fprintf(stderr, "[pool] prefetch region: %u slot(s)/bank, %u total, hot seed %u\n",
-                         prefetch_per_bank,
-                         prefetch_per_bank * static_cast<std::uint32_t>(banks.size()), seed);
-            std::fflush(stderr);
         }
         if (heterogeneous) {
             // The one line that says which pricing is in force and what it bought: a width
@@ -568,7 +578,7 @@ std::vector<std::uint64_t> bank_generation;
             if (expert >= slots.size()) { continue; }
             if (slots[expert] != kAbsentSlot) { continue; } // already in the pool: nothing to do
             const std::uint32_t region = cursor++ % prefetch_per_bank;
-            const std::uint32_t slot   = prefetch_base + bank * prefetch_per_bank + region;
+            const std::uint32_t slot   = prefetch_slots[bank][region];
             const std::uint32_t old    = owner[region];
             if (old != kAbsentSlot && old < slots.size() && slots[old] == slot) {
                 slots[old]                       = kAbsentSlot;
