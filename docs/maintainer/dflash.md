@@ -269,6 +269,65 @@ F while target state advances to F+N. Before the next proposal, or before retain
 fork or Host replica, those features are materialized and context catches up. N=0 cancellation
 commits no new state and releases the sequence; it does not undo earlier adopted commits.
 
+## Open items register
+
+Work this tree has decided not to finish yet, with the measurement that says why. Every entry is
+"known unfinished", not "known good".
+
+**Verify rectangle columns 1..K (open, measured).** On v5_e2 with `--spec dflash2
+--draft-tokens 8`, the target's own distribution collapses for every column after the anchor while
+column 0 stays healthy:
+
+| column | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| draft top-1 inside target top-16 | 85.7% | 0.0% | 8.6% | 22.9% | 20.0% | 14.3% | 22.9% | 28.6% |
+| draft top-1 == target argmax | 71.4% | 0.0% | 5.7% | 17.1% | 11.4% | 8.6% | 11.4% | 11.4% |
+| top-1 logit | 25.1 | 9.2 | 8.8 | 9.1 | 10.8 | 9.1 | 9.5 | 8.6 |
+
+Two things are ruled out by measurement rather than argument. The columns are addressed correctly:
+`NINFER_DFLASH2_DUMP` shows cache and RoPE positions stepping `F, F+1, ... F+7` and each column's
+first residual words at O(1), so neither a broadcast column nor a wrong position is the cause. And
+the sparse indexer is not the cause: `NINFER_QSA_FORCE_FULL=1` (the dense arm, a different mixer for
+every indexed layer) shows the same collapse (column 1: 0.0%, columns 2..7: 0.0-4.3%) while column 0
+stays at 73.9/30.4%. What remains is the shared verify path between columns 0 and 1 - the per-column
+live extent the mixers read, or the head's input for columns whose source is a proposal rather than
+the anchor. Accepted run length never exceeds one token (histogram `0:10, 1:25` over 35 rounds), so
+`k` currently buys overhead and no extra acceptance.
+
+**Layer-major + double-buffered prefill (open).** `ExpertStream::ensure` still publishes and waits
+inside the layer, one staging ring of 32 slots, so the PCIe traffic that a prefill needs is serial
+with the SMs. The sizing is measured: a 512-token prefill touches up to the layer's expert count
+(73728/40 = 1843) per layer, about 2.25 GiB per layer and 90 GiB per pass, which at 12-20 GB/s is
+4.5-7.5 s - a 70-110 tok/s ceiling for this box against a measured 9.24 tok/s at `-pg 512,32`.
+Raising the warm tier does not help: `NINFER_EXPERT_HOST_ARENA_MB=46080` (36,864 slots, mapped and
+device-addressable) measured prefill 8.69 / decode 1.59 against 9.24 / 1.59 at the default 27.7 GiB.
+The work is to split `ensure` into publish and wait and move the wait one layer down; it touches the
+`in_flight_` / `device_held_` release points, which is why it is not a small change.
+
+**CPU cooperative execution (open, blocked on numerics).** `cpu_path_policy.h` decides, nothing
+executes. On v5_e2 the CPU half is never asked: `[split-form] addressable=10.00 of 10.00
+routes/layer` with `host_routes=0.00` and `[host] cpu=0.00ms`, because a pool of 21,697 slots always
+admits a layer's ten routes, so the split ratio is decided by capacity and not by cost. Decode pays
+500 MiB per token (40 layers x 10 routes x 1.25 MiB) at 24.16 tok/s, i.e. 12.1 GB/s of a ~20-25 GB/s
+link; 50-60 tok/s needs 220-364 MiB per token, so 27-56% of the routes must skip the link entirely.
+Turning the half on changes numerics by construction (FP32 host term, different activation
+precision), so it moves `pplT128` off its recorded value; a one-layer forced-CPU A/B is the missing
+measurement before it can be registered.
+
+**Three-tier expert activation prediction (open).** The controller prices a step from what it has
+already seen (miss counters, cold-read and upload EWMAs). A static hot set (Ostinato-style) or a
+layer-ahead predictor (LayerScope-style) that decides what to keep warm before the route arrives is
+not implemented; the prefetch region that exists is reactive.
+
+**Prefetch under per-bank carving (shipped, off by default).** The prediction region is carved per
+bank and works, but single-stream decode measures 8.22 tok/s with it on against 19.62 off, so it is
+off by default and is only meaningful under concurrency.
+
+**35B `pplT128` registration (open).** This tree measures 20.205381 for
+`qwen3_6_35b_a3b.ninfer` over `pplT128.txt` (38 scored tokens, context 4096 / stride 2048), before
+and after the four-stream tap change. An older register entry records 20.594978, which no run in
+this tree reproduces; the two numbers need one agreed corpus before either is quoted as the gate.
+
 ## Backend storage and lifecycle
 
 Local draft layers store K/V in cyclic rings; full draft layers use paged KV. A full pool exists
