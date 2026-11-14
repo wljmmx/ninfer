@@ -7,6 +7,7 @@
 #include "models/qwen3_5/execution/text.h"
 
 #include "models/qwen3_5/execution/diagnostics.h"
+#include "models/qwen3_5/execution/verify_probe.h"
 #include "models/qwen3_5/execution/workspace.h"
 #include "ninfer/ops/gated_residual.h"
 #include "ninfer/ops/rmsnorm.h"
@@ -98,6 +99,13 @@ void TextContext::final_hidden(Tensor& x, Tensor& out, std::int32_t tokens) {
     ops::hc_mix(hc_.normalized.view({dimension(config_.hidden_size),
                                      dimension(config_.hc->count), tokens}),
                 weights.final_form(), work_, out, ctx_.execution_view());
+    // The head's own input per rectangle column. Every mixer output on this pass measured healthy,
+    // so if this fold is flat for the columns after the anchor the collapse is here, before the
+    // projection, and not in any layer.
+    if (tokens > 1 && tokens <= 16) {
+        verify_column_probe("final-fold", out, dimension(config_.hidden_size),
+                            static_cast<std::int32_t>(out.nb[1]), tokens, tokens, ctx_.stream);
+    }
 }
 
 } // namespace ninfer::models::qwen3_5::execution

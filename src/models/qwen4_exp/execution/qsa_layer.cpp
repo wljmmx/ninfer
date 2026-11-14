@@ -7,6 +7,7 @@
 
 #include "models/qwen3_5/execution/attention.h"
 #include "models/qwen3_5/execution/diagnostics.h"
+#include "models/qwen3_5/execution/verify_probe.h"
 #include "models/qwen3_5/execution/workspace.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
@@ -270,6 +271,14 @@ void TextContext::qsa_mix(const BlockParameters& w, Tensor& x, int fidx, Phase, 
                             main_cache, batch_view, selected, gqa_envelope, work_, attention,
                             execution);
         qsa_mark(s, "sparse_gqa", fidx);
+    }
+
+    // The mixer's own output per rectangle column: both arms write the same tensor, so one probe
+    // covers the sparse and the dense reading of the same pass.
+    if (active_sequence_batch_ != 0) {
+        verify_column_probe("attn-out", attention, head_dim * query_hd,
+                            static_cast<std::int32_t>(attention.nb[2]), width,
+                            static_cast<std::int32_t>(fidx), s);
     }
 
     ops::QsaRawRecordReadView read_records{

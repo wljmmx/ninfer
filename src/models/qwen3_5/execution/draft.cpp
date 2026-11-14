@@ -922,9 +922,18 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                       ? 1
                                       : 0;
                         }
-                        std::fprintf(file, "%llu,%d,%d,%d,%d,%d,%d,%d",
+                        // What the target was actually fed in this column: the proposal it should
+                        // carry, or something else (mask id, zero, the anchor again).
+                        std::int32_t fed = 0;
+                        CUDA_CHECK(cudaMemcpyAsync(&fed,
+                                                   frame.verify_ids.slice(0, column, 1)
+                                                       .slice(1, 0, 1)
+                                                       .data,
+                                                   sizeof(fed), cudaMemcpyDeviceToHost, s));
+                        CUDA_CHECK(cudaStreamSynchronize(s));
+                        std::fprintf(file, "%llu,%d,%d,%d,%d,%d,%d,%d,%d",
                                      static_cast<unsigned long long>(step), column, anchor,
-                                     candidates.front(), selected, argmax, hit, overlap);
+                                     candidates.front(), selected, argmax, hit, overlap, fed);
                         for (std::int32_t id : candidates) { std::fprintf(file, ",%d", id); }
                         for (std::int32_t id : order) { std::fprintf(file, ",%d", id); }
                         // Where this column thinks it is, and what the target actually wrote there:

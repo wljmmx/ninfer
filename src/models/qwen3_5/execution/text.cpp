@@ -2,6 +2,7 @@
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/attention.h"
 #include "models/qwen3_5/execution/diagnostics.h"
+#include "models/qwen3_5/execution/verify_probe.h"
 #include "models/qwen3_5/execution/gdn.h"
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/expert_stream.h"
@@ -2387,6 +2388,18 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                                                           config_.gdn->linear_key_head_dim))),
                              /*normalize_qk=*/true, work_, recurrent_state_in, recurrent_state_out,
                              o, ctx_.execution_view());
+    }
+    if (ph == Phase::Verify && active_sequence_batch_ > 0) {
+        // The recurrence's own output per column: a column that did not start from its predecessor's
+        // state reads at the noise floor here, before any gate or projection can hide it.
+        Tensor o4 = o.view({dimension(config_.gdn->linear_value_head_dim),
+                            dimension(config_.gdn->linear_num_value_heads), active_sequence_width_,
+                            active_sequence_batch_});
+        verify_column_probe("gdn-out", o4,
+                            dimension(config_.gdn->linear_value_head_dim) *
+                                dimension(config_.gdn->linear_num_value_heads),
+                            static_cast<std::int32_t>(o4.nb[2]), active_sequence_width_,
+                            static_cast<std::int32_t>(gidx), s);
     }
 
     // Diagnosis (NINFER_NAN_PROBE only): re-read the conv outputs after the recurrence, so a NaN
