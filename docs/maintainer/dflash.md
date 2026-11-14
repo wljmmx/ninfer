@@ -308,7 +308,20 @@ went from 33.7% to 0 - because this op reads only the committed context ring (`k
 append, key set `[length - window, length)`), and the drafter's ring ends at `F - 1`: the slot at `F`
 holds whatever position `F - window` left there. Making the anchor visible therefore needs the anchor's
 row appended to the draft context first (the `context_frontiers` to `frontiers` bookkeeping in
-`program/decode.cpp:842`), not a change to the visible end. Accepted run length never exceeds one
+`program/decode.cpp:842`), not a change to the visible end.
+
+That next step was checked against the append accounting before writing it, and the accounting closes
+the entry instead: `prepare_ragged_prefix_kernel:21,32` appends `[starts, ends)` with `ends` the
+execution frontier and writes `positions = starts + column`, so the draft ring covers `[0, F)` and its
+last committed row is position `F-1` - the anchor itself. The key set is `[length - window, length)`
+with `length = positions[0] = F` (`kernel.cuh:95,104`), so **every draft column already sees the
+anchor's row at `F-1`**, and the block's own rows are simply not part of that ring. Appending the
+feature at `F` would duplicate the row at `F-1` and desync the frontier bookkeeping, and `+1` would
+then read a slot no pass ever wrote - which is the failure that was measured (acceptance 33.7% to 0,
+first candidate token 0). The masked-row mask is therefore not the open item: DFlash2's masked rows are
+trained not to see each other, and they already see the anchor and the context. What is still open is
+what the *draft head* does with a masked row's state, which needs a comparison against the draft's own
+teacher conditioning rather than another change to this rectangle. Accepted run length never exceeds one
 token (histogram `0:10, 1:25` over 35 rounds), so `k` currently buys overhead and no extra acceptance.
 
 **Layer-major + double-buffered prefill (last resort, measured).** `ExpertStream::ensure` still
