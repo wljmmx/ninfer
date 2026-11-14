@@ -369,6 +369,9 @@ public:
     // of the pool over-reserves badly at the large end - 15% of 163 is 24 slots for a p99 of 3 -
     // while a fixed few is enough everywhere. This is the p99 of the tracked distribution.
     [[nodiscard]] std::uint32_t spill_slots(std::uint32_t capacity) const noexcept;
+    // One window of samples moves the measured size, and only when it differs by more than a quarter
+    // of the current value. Called where the histogram is sampled (once per decode layer).
+    void refresh_spill_measure(std::uint32_t capacity) noexcept;
     void reset_coverage() noexcept { coverage_ = Coverage{}; }
     // P1: the freeze is a placement policy, not a constant. These are the knobs a controller will
     // drive; the environment only sets their initial values.
@@ -723,8 +726,18 @@ private:
     // sample per step: the spill region holds every lane's miss at once (8 lanes x 8 experts).
     std::array<std::uint32_t, 33> miss_hist_{};
     std::uint32_t miss_samples_ = 0;
-    std::vector<std::uint32_t> miss_scratch_;
-    std::uint32_t miss_generation_ = 0;
+    // The histogram's p99 over the last window, clamped to [2, capacity/2]. Diagnostics only: the
+    // placement keeps its fixed eight (see spill_slots), because the measured p99 on the 35B at a
+    // 12 GiB pool is exactly eight, and a rule that reproduces the constant is not worth the risk of
+    // a region that resizes (a resize republishes the table and re-uploads what the last size placed).
+    std::uint32_t spill_measured_       = 0;
+    std::uint32_t spill_window_samples_ = 0;
+    std::uint32_t spill_windows_        = 0;
+    // A step's ownership of the histogram: `chosen` is this step's own placement, so counting misses
+    // against it can only ever read zero. The ring exists to seat the experts a step needs that the
+    // previous step's set did not hold, so that - the churn against the last installed set - is what
+    // the histogram samples.
+    std::vector<std::uint8_t> miss_last_owner_;
     // widest step this stream has served, so the spill ring can hold one of them
     std::uint32_t lanes_seen_ = 0;
     std::uint64_t coverage_calls_ = 0;
@@ -888,5 +901,6 @@ private:
 void note_expert_request_begin();
 
 } // namespace ninfer::models::qwen3_5::execution
+
 
 

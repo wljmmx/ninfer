@@ -733,15 +733,48 @@ std::uint32_t ExpertStream::split_resident_capacity(ExpertMatrixRole role) const
 }
 
 std::uint32_t ExpertStream::spill_slots(std::uint32_t capacity) const noexcept {
-    // A fixed eight, not a measured p99. Under four concurrent lanes the measured p99 of a step's
-    // misses is six at 163 slots, and sizing to that measured 63-68 tok/s against 82-86 for eight:
-    // a region that changes size moves the resident set every step, which republishes the offset
-    // table and re-uploads slots the previous size had just placed. Eight is also one full token's
-    // routing, which is the granularity the tail actually arrives in.
-    // The miss histogram is still sampled: it is reported as diagnostics, and it is what a future
-    // per-generation (not per-step) decision would read.
+    // Still a fixed eight, and the measurement below says why: on the 35B at a 12 GiB pool the
+    // measured p99 of a decode step's churn against the previous set is exactly eight - one token's
+    // routing - so a quantile rule reproduces the constant and buys nothing, and the earlier report
+    // measured a *smaller* measured size (six) at 63-68 tok/s against 82-86 for eight. The histogram
+    // is therefore a diagnostic: it now holds real counts (it used to read zero by construction, see
+    // the sampling site), and a future decision - for example one per generation rather than per step
+    // - can read it without changing this placement.
     return std::min<std::uint32_t>(8U, std::max<std::uint32_t>(2U, capacity / 3));
 }
+
+void ExpertStream::refresh_spill_measure(std::uint32_t capacity) noexcept {
+    // Sixteen decode layers per window; the histogram itself decays by halves every 256 samples, so a
+    // window reads the recent tail rather than the whole run.
+    constexpr std::uint32_t kWindow = 16;
+    if (++spill_window_samples_ < kWindow) { return; }
+    spill_window_samples_ = 0;
+    ++spill_windows_;
+    std::uint64_t total = 0;
+    for (const auto bucket : miss_hist_) { total += bucket; }
+    if (total < kWindow) { return; }
+    // p99, not p95: the region has to hold the tail of a step, and the two quantiles differ by one
+    // slot while getting it wrong costs a host read per miss.
+    const auto threshold =
+        static_cast<std::uint64_t>(static_cast<double>(total) * 0.99 + 0.5);
+    std::uint64_t cumulative = 0;
+    std::uint32_t p99        = 0;
+    for (std::uint32_t bucket = 0; bucket < miss_hist_.size(); ++bucket) {
+        cumulative += miss_hist_[bucket];
+        if (cumulative >= threshold) {
+            p99 = bucket;
+            break;
+        }
+    }
+    const std::uint32_t upper = std::max<std::uint32_t>(2U, capacity / 2);
+    spill_measured_           = std::min(std::max<std::uint32_t>(2U, p99), upper);
+    if (bank_ == 0 && std::getenv("NINFER_SPILL_TRACE") != nullptr) {
+        std::fprintf(stderr, "[spill] window=%u p99=%u (ring stays %u, capacity %u)\n",
+                     spill_windows_, p99, spill_slots(capacity), capacity);
+        std::fflush(stderr);
+    }
+}
+
 bool ExpertStream::fully_resident() const noexcept {
     // This stream's own bank, not the narrowest one: a wider bank may hold its whole layer while a
     // narrower one cannot, and the answer decides whether this layer needs the split path at all.
@@ -2988,22 +3021,24 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             // One sample per decode token: the spill region has to hold what a token misses, so
             // the tail of this distribution - not its mean - is the number of slots it needs.
             if (tokens <= 8 && capacity < count_) {
-                if (miss_scratch_.size() != count_) { miss_scratch_.assign(count_, 0); }
-                if (++miss_generation_ == 0) {
-                    std::fill(miss_scratch_.begin(), miss_scratch_.end(), 0);
-                    miss_generation_ = 1;
-                }
-                // Distinct experts this step needs that the set does not hold. Counted per step,
-                // not per lane: the spill region has to serve every lane at once, so a four-lane
-                // step misses about twice as many experts as a single one (measured).
+                if (miss_last_owner_.size() != count_) { miss_last_owner_.assign(count_, 0); }
+                // Distinct routes the previous set did not hold. `chosen` cannot answer this: it
+                // already contains every route of this step by construction, which is exactly why the
+                // histogram read zero for the whole run before.
                 std::uint32_t miss = 0;
                 for (std::size_t i = 0; i < values; ++i) {
                     const auto expert = static_cast<std::size_t>(route_ids[i]);
-                    if (chosen[expert] || miss_scratch_[expert] == miss_generation_) { continue; }
-                    miss_scratch_[expert] = miss_generation_;
+                    if (miss_last_owner_[expert] != 0) { continue; }
+                    miss_last_owner_[expert] = 1;
                     ++miss;
                 }
                 miss_hist_[std::min<std::uint32_t>(miss, 32)] += 1;
+                refresh_spill_measure(capacity);
+                // This step's set becomes the reference for the next one.
+                std::fill(miss_last_owner_.begin(), miss_last_owner_.end(), std::uint8_t{0});
+                for (const auto expert : wanted) {
+                    if (expert < miss_last_owner_.size()) { miss_last_owner_[expert] = 1; }
+                }
                 if (++miss_samples_ >= 256) {
                     for (auto& bucket : miss_hist_) { bucket /= 2; }
                     miss_samples_ = 0;
@@ -4560,6 +4595,7 @@ bool o1_skip_requested() {
 }
 
 } // namespace ninfer::models::qwen3_5::execution
+
 
 
 
