@@ -340,6 +340,42 @@ teacher-conditioned comparison needs the draft's training-time conditioning, and
 tensor for it, so it would have to come from the reference implementation, not from another probe. Accepted run length never exceeds one
 token (histogram `0:10, 1:25` over 35 rounds), so `k` currently buys overhead and no extra acceptance.
 
+**Block-causal two-pass (ruled out, measured).** The fix the masked-row mechanism pointed at - let each
+column see the block rows before it instead of the siblings' shared input - was implemented end to end
+and changed no acceptance. The op gained a block tile (`block_key`/`block_value`/`block_width` at
+`include/ninfer/ops/sliding_window_attention.h`, staged by `context_query_stage_block_tile` in
+`src/ops/softmax_attention/common/context_query.cuh`, consumed as a trailing iteration owned by the
+last split), the query tile was put under the same `key < query` bound, and `draft.cpp` ran the stack
+twice: the first pass with committed context alone in view, the second with the first pass's per-layer
+K/V planes as block rows. A masked row's K/V are the same row for every masked column, because every
+masked column embeds one `mask_token_id` and normalizes it identically (`prepared` 0.4694 for c2..c8),
+so replaying the planes changes nothing: one earlier pass and two earlier passes measure *identically*
+at both widths. `accepted_per_position` on v5_e2, `pp64+tg32 --warmup 1 -r 1 --no-cuda-graph`:
+
+| draft width | passes | acceptance | accepted per position |
+|---|---:|---:|---|
+| K=4 | 1 (before) | 0.1806 / 1.72 | 8, 4, 1, 0 over 18 rounds |
+| K=4 | 2 | 0.1622 / 1.63 | 8, 4, 0, 0 over 19 rounds |
+| K=4 | 3 | 0.1622 / 1.63 | identical to the two-pass row |
+| K=8 | 1 (before) | 0.0542 / 1.39 | 8, 1, 0, ... over 23 rounds |
+| K=8 | 2 | 0.0563 / 1.41 | 7, 2, 0, ... over 22 rounds |
+| K=8 | 3 | 0.0563 / 1.41 | identical to the two-pass row |
+
+The causal bound itself is not free of effect - it moves the K=4 walk from `8,4,1,0` to `8,4,0,0` - but
+it moves it in both directions (K=8 gains one token at position 1), so the net is a wash while the
+draft costs two full passes. The gates it ran under were unchanged: v5_e2 20.394196, 35B 20.205381.
+The change was reverted; the patch is `H:\TeleAgentWorks\.temp\dflash2_two_pass_block.patch`. Decode
+throughput could not price the extra pass in this session (no-spec decode measured 8.38 tok/s against
+the 24-25 on record, so the box was disk-bound throughout), which is why the revert rests on the
+acceptance, not on the timing.
+
+What that leaves is the one input the block never has: the token each column *selected*. The planes
+carry the mask row's own state for every column, so conditioning needs the head's output fed back -
+after `ops::candidate_selector_path` (`draft.cpp:566-570`) walk one column per pass, embedding the
+previous column's `draft_tokens` value in place of the mask id (`prepare_masked_block` at
+`draft.cpp:420`, rows `1..k`), which costs one stack pass per column and is the only remaining
+mechanism that can make a column differ from its siblings.
+
 **Layer-major + double-buffered prefill (last resort, measured).** `ExpertStream::ensure` still
 publishes and waits inside the layer, one staging ring of 32 slots, so the PCIe traffic a prefill
 needs is serial with the SMs. The sizing is measured: a 512-token prefill touches up to the layer's
