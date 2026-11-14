@@ -12,7 +12,9 @@
 #include "ninfer/ops/rmsnorm.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::models::qwen3_5::execution {
 
@@ -64,13 +66,27 @@ void TextContext::hc_tap_publish(std::size_t layer, std::int32_t tokens) {
     const auto streams = dimension(config_.hc->count);
     // What a one-stream target hands its drafter is the block's raw residual, not the normalized
     // view its own attention consumes, and not the same view taken before the FFN add. The
-    // four-stream family has no single residual, so the fold stands in for it: the block's own
-    // rank pair over the post-FFN residual, unmixed with any norm. Measured on v5_e2, folding the
+    // four-stream family has no single residual, so the fold stands in for it: a block's rank pair
+    // over the post-FFN residual, unmixed with any norm. Measured on v5_e2, folding the
     // normalized view instead costs the drafter's first-token agreement 43.5 of 100 rounds against
     // this view's 69.2 (k=4), and the pre-FFN view lands at 52.3.
+    //
+    // Which of the block's two pairs folds is not decided by the model: the pair names which
+    // branch's input the fold is for, and the tap is neither branch. NINFER_DFLASH2_TAP_PAIR picks
+    // between the block's own post-attention pair (default), its attention pair, and the next
+    // block's attention pair, so one artifact can A/B them.
     const auto& block = parameters_.text.layers[layer];
-    ops::hc_mix(hc_.residual.view({width, streams, tokens}), block.post_attention_hc->block_form(),
-                work_, hc_.input, hc_.injection, ctx_.execution_view());
+    const HcParameters* tap_weights = &*block.post_attention_hc;
+    if (const char* pair = std::getenv("NINFER_DFLASH2_TAP_PAIR"); pair != nullptr) {
+        const std::string named(pair);
+        if (named == "input") {
+            tap_weights = &*block.input_hc;
+        } else if (named == "next" && layer + 1 < parameters_.text.layers.size()) {
+            tap_weights = &*parameters_.text.layers[layer + 1].input_hc;
+        }
+    }
+    ops::hc_mix(hc_.residual.view({width, streams, tokens}), tap_weights->block_form(), work_,
+                hc_.input, hc_.injection, ctx_.execution_view());
 }
 
 void TextContext::final_hidden(Tensor& x, Tensor& out, std::int32_t tokens) {

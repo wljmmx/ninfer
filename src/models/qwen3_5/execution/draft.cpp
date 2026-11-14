@@ -832,77 +832,85 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                 std::fflush(stderr);
             }
         }
-        // NINFER_DFLASH2_DUMP=<path>: one line per decode round with what the draft proposed and what
-        // the target's own logits at the same position say, so "the draft is wrong" and "the selector
-        // is wrong" can be told apart without guessing. Only a pass that is not being captured may
-        // read these back (the copies need the stream to drain), so the switch is eager-only: a
-        // captured round runs exactly as before.
+        // NINFER_DFLASH2_DUMP=<path>: one line per (round, draft column) with what the draft
+        // proposed at that column and what the target's own logits at the same position say, so
+        // "the draft is wrong", "the selector is wrong" and "column j is worse than column 0" can be
+        // told apart without guessing. Column i of the verify rectangle predicts the token draft i
+        // has to guess, so the comparison at column i is exactly the acceptance test for that
+        // column. Only a pass that is not being captured may read these back (the copies need the
+        // stream to drain), so the switch is eager-only: a captured round runs exactly as before.
         if (!capturing && frame.candidate_ids.data != nullptr) {
             if (const char* dump = std::getenv("NINFER_DFLASH2_DUMP")) {
                 constexpr std::int32_t kCandidates = 16;
                 constexpr std::int32_t kTop        = 16;
                 cudaStream_t s                     = state.execution.device.stream;
-                static std::FILE* file =
-                    std::fopen(dump, "wb");
+                static std::FILE* file = std::fopen(dump, "wb");
                 if (file != nullptr) {
                     static std::atomic<std::uint64_t> steps{0};
                     const std::uint64_t step = steps.fetch_add(1);
-                    const auto vocab = static_cast<std::size_t>(dimension(
-                        state.execution.parameters.model.config().text.vocab_size));
-                    std::vector<std::int32_t> candidates(static_cast<std::size_t>(kCandidates));
-                    std::int32_t selected = 0;
-                    std::int32_t anchor   = 0;
-                    const Tensor candidate_step =
-                        frame.candidate_ids.slice(1, 0, 1).slice(2, 0, 1).view({kCandidates});
-                    const Tensor draft_step = frame.draft_tokens.slice(1, 0, 1).slice(0, 0, 1);
-                    // Column zero of the verify rectangle is the anchor: its logits are the target's
-                    // prediction for the token the first draft tries to guess.
-                    const Tensor target_column = frame.target_logits.slice(1, 0, 1)
-                                                     .slice(2, 0, 1)
-                                                     .view({dimension(vocab)});
-                    // The target publishes BF16 logits; widening here keeps the comparison in the
-                    // dtype the head actually wrote instead of reading bit patterns as floats.
-                    std::vector<std::uint16_t> raw(vocab);
-                    CUDA_CHECK(cudaMemcpyAsync(candidates.data(), candidate_step.data,
-                                               candidates.size() * sizeof(std::int32_t),
-                                               cudaMemcpyDeviceToHost, s));
-                    CUDA_CHECK(cudaMemcpyAsync(&selected, draft_step.data, sizeof(selected),
-                                               cudaMemcpyDeviceToHost, s));
+                    const auto vocab         = dimension(
+                        state.execution.parameters.model.config().text.vocab_size);
+                    const std::size_t words = static_cast<std::size_t>(vocab);
+                    std::int32_t anchor     = 0;
                     CUDA_CHECK(cudaMemcpyAsync(&anchor, frame.anchors.data, sizeof(anchor),
                                                cudaMemcpyDeviceToHost, s));
-                    CUDA_CHECK(cudaMemcpyAsync(raw.data(), target_column.data,
-                                               raw.size() * sizeof(std::uint16_t),
-                                               cudaMemcpyDeviceToHost, s));
-                    CUDA_CHECK(cudaStreamSynchronize(s));
-                    std::vector<float> logits(vocab);
-                    for (std::size_t i = 0; i < vocab; ++i) {
-                        const std::uint32_t bits = static_cast<std::uint32_t>(raw[i]) << 16U;
-                        std::memcpy(&logits[i], &bits, sizeof(float));
-                    }
-                    std::vector<std::int32_t> order(vocab);
-                    std::iota(order.begin(), order.end(), 0);
-                    std::nth_element(order.begin(), order.begin() + kTop, order.end(),
-                                     [&](std::int32_t lhs, std::int32_t rhs) {
-                                         return logits[static_cast<std::size_t>(lhs)] >
-                                                logits[static_cast<std::size_t>(rhs)];
-                                     });
-                    order.resize(kTop);
-                    std::sort(order.begin(), order.end(), [&](std::int32_t lhs, std::int32_t rhs) {
-                        return logits[static_cast<std::size_t>(lhs)] >
-                               logits[static_cast<std::size_t>(rhs)];
-                    });
-                    std::int32_t argmax = 0;
-                    for (std::int32_t id : order) {
-                        if (logits[static_cast<std::size_t>(id)] >
-                            logits[static_cast<std::size_t>(argmax)]) {
-                            argmax = id;
+                    // The target publishes BF16 logits; widen them here instead of reading the bit
+                    // patterns as floats.
+                    std::vector<std::uint16_t> raw(words);
+                    std::vector<float> logits(words);
+                    std::vector<std::int32_t> order(words);
+                    std::vector<std::int32_t> candidates(static_cast<std::size_t>(kCandidates));
+                    for (std::int32_t column = 0; column < static_cast<std::int32_t>(k); ++column) {
+                        const Tensor candidate_column =
+                            frame.candidate_ids.slice(1, column, 1).slice(2, 0, 1).view({kCandidates});
+                        const Tensor target_column = frame.target_logits.slice(1, column, 1)
+                                                         .slice(2, 0, 1)
+                                                         .view({vocab});
+                        std::int32_t selected = 0;
+                        CUDA_CHECK(cudaMemcpyAsync(candidates.data(), candidate_column.data,
+                                                   candidates.size() * sizeof(std::int32_t),
+                                                   cudaMemcpyDeviceToHost, s));
+                        CUDA_CHECK(cudaMemcpyAsync(raw.data(), target_column.data,
+                                                   raw.size() * sizeof(std::uint16_t),
+                                                   cudaMemcpyDeviceToHost, s));
+                        if (column == 0) {
+                            const Tensor draft_step =
+                                frame.draft_tokens.slice(1, 0, 1).slice(0, 0, 1);
+                            CUDA_CHECK(cudaMemcpyAsync(&selected, draft_step.data, sizeof(selected),
+                                                       cudaMemcpyDeviceToHost, s));
                         }
+                        CUDA_CHECK(cudaStreamSynchronize(s));
+                        for (std::size_t i = 0; i < words; ++i) {
+                            const std::uint32_t bits = static_cast<std::uint32_t>(raw[i]) << 16U;
+                            std::memcpy(&logits[i], &bits, sizeof(float));
+                        }
+                        std::iota(order.begin(), order.end(), 0);
+                        std::nth_element(order.begin(), order.begin() + kTop, order.end(),
+                                         [&](std::int32_t lhs, std::int32_t rhs) {
+                                             return logits[static_cast<std::size_t>(lhs)] >
+                                                    logits[static_cast<std::size_t>(rhs)];
+                                         });
+                        order.resize(kTop);
+                        std::sort(order.begin(), order.end(),
+                                  [&](std::int32_t lhs, std::int32_t rhs) {
+                                      return logits[static_cast<std::size_t>(lhs)] >
+                                             logits[static_cast<std::size_t>(rhs)];
+                                  });
+                        const std::int32_t argmax = order.front();
+                        int overlap = 0;
+                        for (std::int32_t id : candidates) {
+                            overlap += std::find(order.begin(), order.end(), id) != order.end() ? 1
+                                                                                             : 0;
+                        }
+                        const bool hit = std::find(order.begin(), order.end(), candidates.front()) !=
+                                         order.end();
+                        std::fprintf(file, "%llu,%d,%d,%d,%d,%d,%d,%d",
+                                     static_cast<unsigned long long>(step), column, anchor,
+                                     candidates.front(), selected, argmax, hit ? 1 : 0, overlap);
+                        for (std::int32_t id : candidates) { std::fprintf(file, ",%d", id); }
+                        for (std::int32_t id : order) { std::fprintf(file, ",%d", id); }
+                        std::fputc('\n', file);
                     }
-                    std::fprintf(file, "%llu,%d,%d,%d", static_cast<unsigned long long>(step),
-                                 anchor, selected, argmax);
-                    for (std::int32_t id : candidates) { std::fprintf(file, ",%d", id); }
-                    for (std::int32_t id : order) { std::fprintf(file, ",%d", id); }
-                    std::fputc('\n', file);
                     std::fflush(file);
                 }
             }
