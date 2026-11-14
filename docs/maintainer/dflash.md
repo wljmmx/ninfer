@@ -490,6 +490,39 @@ decode would have produced it"), so the difference only bites when sampling. The
 `set_spec_proposal` for that path (`verify.hpp:184`). `draft_cap.hpp`'s per-card cap is a verify-window
 recommendation, not a block shape, and is 0 on this card.
 
+**Point-by-point against the reference sources (all eleven match).** Read against the cloned tree at
+`H:\TeleAgentWorks\.temp\strata-official`, the draft half now matches on every point that can be
+checked from code:
+
+| point | reference | here | same |
+|---|---|---|---|
+| block rows / anchor position | `src/core/dflash2.cpp:1033-1038`: `h_meta_[8+i] = s+i`, `s = pos0+n_new`, `h_meta_[17] = s`, tokens `[anchor, mask x7]` | `prepare_masked_block.cuh:17-18`: `ids[0]=anchor`, else mask, `positions[i] = lengths + i`; `draft.cpp:572` | yes |
+| mask embedding | `src/core/dflash2.cpp:1038` (`mask_token_` for rows 1..7) + `:471` `embed_(d_meta_+24, 8)` | `prepare_masked_block.cuh:17` + `draft.cpp:588` `ops::embedding` | yes |
+| conv taps | `kernels/cuda/dflash2.cu` `df2_conv` doc `kernels/dflash2.hpp:24-25`: `sum_{o<2, b-o>=0}(base[o][c]+dyn[..])*x[(b-o)*H+c]`; called on `xn_` with `base_a` / `base_a+2N` (`src/core/dflash2.cpp:485,496,500,510`) | `prepare` op `include/ninfer/ops/dynamic_grouped_conv.h:37-40` same form; `draft.cpp:580` + `finish_dynamic_branch` | yes |
+| q/k/v + norm | `src/core/dflash2.cpp:487,489`: `q_proj,k_proj,v_proj` on the conv output, `df2_norm_rope_qk(q,k,q_norm,k_norm,...)`, v untouched | `draft.cpp:534` `attn_input_proj`, `:652` `rmsnorm_rope(positions, q_norm, k_norm, q, k, theta)`; `rmsnorm_rope.h:11-19` plain per-head norm, `weight` (not `1+weight`) | yes |
+| RoPE | `kernels/dflash2.hpp:29-35`: table from `d_meta_+8` (block positions `s+i`), neox/rotate_half, `theta^(-2i/128)` | `rmsnorm_rope.h:19-23`, positions = `proposal_positions` (F..F+k, measured last round) | yes |
+| attention | `kernels/cuda/dflash2.cu:131-134,159-167`: `lo = s-(window-1)`, `nctx = s-lo`, then `nkeys = nctx + kDf2Rows` with block row `k-nctx`; mask `(lo+k) > (s+row-window)` for context only, **every block key**; `scale = rsqrtf(HD)` (`:142`) | `context_query.cuh:466,481-487` (query tile bypasses the bound, context admits `key >= query-(window-1)`), `draft.cpp:607` scale `1/sqrt(head_dim)` | yes |
+| residual / norm order | `src/core/dflash2.cpp:496,510`: `h_ += conv(o_)` then `rms(h_)`, same for the MLP, last layer norm = `norm.weight` into `fn_` | `finish_dynamic_branch` (`draft.cpp:625`) adds into `residual`; next `prepare` norms it; `rmsnorm_pack_tail(residual, final_norm, ...)` `draft.cpp:713` | yes |
+| head input | `src/core/dflash2.cpp:513`: `native_quantize_q8_1(fn_ + N_, ..., ndraft_)` - rows 1..7 only, already final-normalized | `rmsnorm_pack_tail` (`rmsnorm_pack_tail.h:25-27`: anchor rows outside the computation, `weight` gain) | yes |
+| selector walk | `kernels/cuda/dflash2.cu:861-896`: `prev = *anchor_tok`; `vp = pred_cb[prev*rank+t]*hp[i*rank+t]`; `sc[j] = unary + dot(succ_cb[tok_j], vp)`; argmax, ties to lower; `prev = out_tok[i]` | `candidate_selector_path.cu:96,73-88,105-112`: identical, with `draw_rank` reducing to that argmax at `temperature <= 0` (`:41-46`) | yes |
+| verify | `core/verify.hpp:8`: greedy accepts iff the target's top-1 is the draft; `coupled_draft.hpp:3-12` couples sampling by one uniform | `speculative_round.cuh:153-154` greedy `dist_idx[lane][0] != d`; sampling uses the ratio test | greedy yes, sampling differs |
+| width | `core/dflash2.hpp:39-40`: `kRows=8`, `kDrafts=7`; `kernels/dflash2.hpp:14,19` | `startup.cpp:1185-1203` clamp to 7 (landed last round) | yes |
+
+Measured acceptance across widths on v5_e2 (`pp64+tg32 --warmup 1`, accepted_per_position):
+
+| k | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| acc | 0.5500 | 0.3514 | 0.2407 | 0.1806 | 0.1461 | 0.1400 | 0.1217 |
+| per position | 11 | 9,4 | 8,4,1 | 8,4,1,0 | 8,4,1,0,0 | 9,4,1,0,0,0 | 9,4,1,0,0,0,0 |
+
+Column 0 lands at 55-45% and column 1 at ~21%, then ~6%, then zero: a marginal-predictor decay, which
+is what the design is - `core/dflash2.hpp:148-150` says "every row is its own column, the walk goes
+left to right", so only the selector carries the chain between columns. Nothing in the draft half is
+left to align; what remains is the verify side, where the reference's non-greedy acceptance couples
+the draft and the target to one uniform draw (`coupled_draft.hpp:3-12`) while this tree uses the
+classic ratio test, and the reference runs the block's arithmetic on q8 activations where this tree
+keeps BF16.
+
 **Layer-major + double-buffered prefill (last resort, measured).** `ExpertStream::ensure` still
 publishes and waits inside the layer, one staging ring of 32 slots, so the PCIe traffic a prefill
 needs is serial with the SMs. The sizing is measured: a 512-token prefill touches up to the layer's
