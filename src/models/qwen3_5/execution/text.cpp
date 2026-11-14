@@ -2706,6 +2706,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 nan_probe("pre-next-input", hc_.input, layer);
             }
             if constexpr (Tap::enabled) {
+                if (hc) { hc_tap_publish(layer, tokens); }
                 tap.capture_layer(static_cast<int>(layer), hc ? hc_.input : x, ctx_.stream);
             }
         } catch (const std::exception& error) {

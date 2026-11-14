@@ -2,6 +2,14 @@
 #include "models/qwen3_5/execution/linear.h"
 #include <cmath>
 #include <string>
+
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <numeric>
+#include <vector>
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/execution_context.h"
 #include "models/qwen3_5/execution/workspace.h"
@@ -822,6 +830,81 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             if (std::getenv("NINFER_DFLASH_TRACE") != nullptr) {
                 std::fprintf(stderr, "[dfl] accept done\n");
                 std::fflush(stderr);
+            }
+        }
+        // NINFER_DFLASH2_DUMP=<path>: one line per decode round with what the draft proposed and what
+        // the target's own logits at the same position say, so "the draft is wrong" and "the selector
+        // is wrong" can be told apart without guessing. Only a pass that is not being captured may
+        // read these back (the copies need the stream to drain), so the switch is eager-only: a
+        // captured round runs exactly as before.
+        if (!capturing && frame.candidate_ids.data != nullptr) {
+            if (const char* dump = std::getenv("NINFER_DFLASH2_DUMP")) {
+                constexpr std::int32_t kCandidates = 16;
+                constexpr std::int32_t kTop        = 16;
+                cudaStream_t s                     = state.execution.device.stream;
+                static std::FILE* file =
+                    std::fopen(dump, "wb");
+                if (file != nullptr) {
+                    static std::atomic<std::uint64_t> steps{0};
+                    const std::uint64_t step = steps.fetch_add(1);
+                    const auto vocab = static_cast<std::size_t>(dimension(
+                        state.execution.parameters.model.config().text.vocab_size));
+                    std::vector<std::int32_t> candidates(static_cast<std::size_t>(kCandidates));
+                    std::int32_t selected = 0;
+                    std::int32_t anchor   = 0;
+                    const Tensor candidate_step =
+                        frame.candidate_ids.slice(1, 0, 1).slice(2, 0, 1).view({kCandidates});
+                    const Tensor draft_step = frame.draft_tokens.slice(1, 0, 1).slice(0, 0, 1);
+                    // Column zero of the verify rectangle is the anchor: its logits are the target's
+                    // prediction for the token the first draft tries to guess.
+                    const Tensor target_column = frame.target_logits.slice(1, 0, 1)
+                                                     .slice(2, 0, 1)
+                                                     .view({dimension(vocab)});
+                    // The target publishes BF16 logits; widening here keeps the comparison in the
+                    // dtype the head actually wrote instead of reading bit patterns as floats.
+                    std::vector<std::uint16_t> raw(vocab);
+                    CUDA_CHECK(cudaMemcpyAsync(candidates.data(), candidate_step.data,
+                                               candidates.size() * sizeof(std::int32_t),
+                                               cudaMemcpyDeviceToHost, s));
+                    CUDA_CHECK(cudaMemcpyAsync(&selected, draft_step.data, sizeof(selected),
+                                               cudaMemcpyDeviceToHost, s));
+                    CUDA_CHECK(cudaMemcpyAsync(&anchor, frame.anchors.data, sizeof(anchor),
+                                               cudaMemcpyDeviceToHost, s));
+                    CUDA_CHECK(cudaMemcpyAsync(raw.data(), target_column.data,
+                                               raw.size() * sizeof(std::uint16_t),
+                                               cudaMemcpyDeviceToHost, s));
+                    CUDA_CHECK(cudaStreamSynchronize(s));
+                    std::vector<float> logits(vocab);
+                    for (std::size_t i = 0; i < vocab; ++i) {
+                        const std::uint32_t bits = static_cast<std::uint32_t>(raw[i]) << 16U;
+                        std::memcpy(&logits[i], &bits, sizeof(float));
+                    }
+                    std::vector<std::int32_t> order(vocab);
+                    std::iota(order.begin(), order.end(), 0);
+                    std::nth_element(order.begin(), order.begin() + kTop, order.end(),
+                                     [&](std::int32_t lhs, std::int32_t rhs) {
+                                         return logits[static_cast<std::size_t>(lhs)] >
+                                                logits[static_cast<std::size_t>(rhs)];
+                                     });
+                    order.resize(kTop);
+                    std::sort(order.begin(), order.end(), [&](std::int32_t lhs, std::int32_t rhs) {
+                        return logits[static_cast<std::size_t>(lhs)] >
+                               logits[static_cast<std::size_t>(rhs)];
+                    });
+                    std::int32_t argmax = 0;
+                    for (std::int32_t id : order) {
+                        if (logits[static_cast<std::size_t>(id)] >
+                            logits[static_cast<std::size_t>(argmax)]) {
+                            argmax = id;
+                        }
+                    }
+                    std::fprintf(file, "%llu,%d,%d,%d", static_cast<unsigned long long>(step),
+                                 anchor, selected, argmax);
+                    for (std::int32_t id : candidates) { std::fprintf(file, ",%d", id); }
+                    for (std::int32_t id : order) { std::fprintf(file, ",%d", id); }
+                    std::fputc('\n', file);
+                    std::fflush(file);
+                }
             }
         }
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,

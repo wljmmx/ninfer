@@ -264,6 +264,11 @@ private:
     [[nodiscard]] bool hc_enabled() const noexcept { return final_hc_ != nullptr; }
     void hc_stem(Tensor& embedding, std::int32_t tokens);
     void hc_mix_into(const HcParameters& weights, std::int32_t tokens);
+    // What a one-stream target hands its drafter is the block's raw residual, not the normalized
+    // view this family's own attention consumes; the four-stream family has no single residual, so
+    // this folds the post-FFN four-stream residual through the block's own rank pair and leaves it
+    // in `hc_.input`, which no later step of this block reads.
+    void hc_tap_publish(std::size_t layer, std::int32_t tokens);
     void hc_combine(const Tensor& product, const Tensor& norm_weight, std::int32_t tokens);
     // The last hidden the head reads: the final correction's fold, or the plain final norm.
     void final_hidden(Tensor& x, Tensor& out, std::int32_t tokens);

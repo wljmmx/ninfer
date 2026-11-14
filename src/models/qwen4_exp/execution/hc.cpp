@@ -59,6 +59,20 @@ void TextContext::hc_combine(const Tensor& product, const Tensor& norm_weight,
                          normed, ctx_.execution_view());
 }
 
+void TextContext::hc_tap_publish(std::size_t layer, std::int32_t tokens) {
+    const auto width   = dimension(config_.hidden_size);
+    const auto streams = dimension(config_.hc->count);
+    // What a one-stream target hands its drafter is the block's raw residual, not the normalized
+    // view its own attention consumes, and not the same view taken before the FFN add. The
+    // four-stream family has no single residual, so the fold stands in for it: the block's own
+    // rank pair over the post-FFN residual, unmixed with any norm. Measured on v5_e2, folding the
+    // normalized view instead costs the drafter's first-token agreement 43.5 of 100 rounds against
+    // this view's 69.2 (k=4), and the pre-FFN view lands at 52.3.
+    const auto& block = parameters_.text.layers[layer];
+    ops::hc_mix(hc_.residual.view({width, streams, tokens}), block.post_attention_hc->block_form(),
+                work_, hc_.input, hc_.injection, ctx_.execution_view());
+}
+
 void TextContext::final_hidden(Tensor& x, Tensor& out, std::int32_t tokens) {
     if (!hc_enabled()) {
         ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, out, ctx_.stream);
