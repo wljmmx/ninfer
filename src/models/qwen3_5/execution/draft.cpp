@@ -10,6 +10,7 @@
 #include <cstring>
 #include <numeric>
 #include <vector>
+#include "models/qwen3_5/execution/verify_probe.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/execution_context.h"
 #include "models/qwen3_5/execution/workspace.h"
@@ -483,6 +484,27 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
         }
         Tensor hidden = work.alloc(DType::BF16, {dimension(target.hidden_size), mask_columns});
         ops::rmsnorm_pack_tail(residual, weights.final_norm, hidden, stream);
+        // NINFER_DFLASH2_ROW_PROBE: what each masked row hands the head, per column. A head that is
+        // only valid for the first row would show one column with an ordinary magnitude and the
+        // rest collapsing, which is the same signature an input-side error would have.
+        {
+            static const bool row_probe = std::getenv("NINFER_DFLASH2_ROW_PROBE") != nullptr;
+            if (row_probe) {
+                static const bool told = [&] {
+                    std::fprintf(stderr,
+                                 "[row-probe] mask_token_id=%d selector_top_k=%d selector_rank=%d "
+                                 "rows=%d\n",
+                                 dimension(config.mask_token_id),
+                                 dimension(config.dflash2->selector_top_k),
+                                 dimension(config.dflash2->selector_rank), int(mask_columns));
+                    std::fflush(stderr);
+                    return true;
+                }();
+                (void)told;
+                verify_column_probe("draft-head-in", hidden, dimension(target.hidden_size),
+                                    static_cast<std::int32_t>(hidden.nb[1]), mask_columns, 0, stream);
+            }
+        }
         Tensor candidates = frame.candidate_ids.slice(2, 0, batch);
         Tensor ids_flat =
             candidates.view({dimension(config.dflash2->selector_top_k), mask_columns});

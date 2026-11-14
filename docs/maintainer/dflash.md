@@ -321,7 +321,23 @@ then read a slot no pass ever wrote - which is the failure that was measured (ac
 first candidate token 0). The masked-row mask is therefore not the open item: DFlash2's masked rows are
 trained not to see each other, and they already see the anchor and the context. What is still open is
 what the *draft head* does with a masked row's state, which needs a comparison against the draft's own
-teacher conditioning rather than another change to this rectangle. Accepted run length never exceeds one
+teacher conditioning rather than another change to this rectangle.
+
+That was probed too, and the probe cannot answer it: `NINFER_DFLASH2_ROW_PROBE` prints the head's
+per-row input after `rmsnorm_pack_tail` - 3.58 / 3.59 / 3.53 / 3.50 / 3.50 / 3.51 / 3.50 / 3.50 across
+the eight masked rows - and a final norm sets that magnitude by construction, so it says nothing about
+whether the rows are the same class. What the probe does confirm: `mask_token_id = 248077`,
+`selector_top_k = 16`, `selector_rank = 256`, and the head runs on `k` columns with one row per masked
+slot (`draft.cpp:484-488`, `hidden` is `{hidden_size, k}`), so no row is shared and no column reads
+another's row.
+
+Combined with the behavioural record - column 0 at 57-71% of the target's own argmax, column 1 at 0.0%
+in every measured round, acceptance never above one token, and `--draft-tokens 1` reaching 60% - the
+honest reading is that **DFlash2 in this tree effectively supports k = 1** on this artifact. The next
+attempt should therefore either (a) default `--draft-tokens 1` for a DFlash2 qwen4exp artifact so the
+shipped path stops paying for columns it cannot accept, or (b) build the missing measurement: a
+teacher-conditioned comparison needs the draft's training-time conditioning, and this tree has no
+tensor for it, so it would have to come from the reference implementation, not from another probe. Accepted run length never exceeds one
 token (histogram `0:10, 1:25` over 35 rounds), so `k` currently buys overhead and no extra acceptance.
 
 **Layer-major + double-buffered prefill (last resort, measured).** `ExpertStream::ensure` still
