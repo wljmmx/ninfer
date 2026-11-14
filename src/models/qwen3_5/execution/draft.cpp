@@ -468,6 +468,59 @@ void probe_rope_columns(const Tensor& positions, const Tensor& query, const Tens
     std::fflush(stderr);
 }
 
+// NINFER_DFLASH2_CONV_PROBE: the two-tap dynamic convolution, in and out, column by column. The
+// Op's contract is (base[h,0,s] + d[0,s])*n[h,i] + I(i>0)*(base[h,1,s] + d[1,s])*n[h,i-1], so the
+// printed pair answers which tap each column actually consumes: column 0 can only consume its own,
+// column 1 the anchor's, and every later column the masked row before it.
+void probe_conv_taps(const Tensor& residual, const Tensor& prepared, const Tensor& base_kernel,
+                     int projection_rows, int projection_columns, int width, int layer) {
+    const auto bits_to_float = [](std::uint16_t bits) {
+        const std::uint32_t wide = static_cast<std::uint32_t>(bits) << 16;
+        float value;
+        std::memcpy(&value, &wide, sizeof(value));
+        return value;
+    };
+    const auto print_columns = [&](const char* name, const Tensor& tensor) {
+        const std::int64_t column_elements =
+            tensor.nb[1] / static_cast<std::int64_t>(sizeof(std::uint16_t));
+        std::vector<std::uint16_t> host(static_cast<std::size_t>(column_elements) * width);
+        if (cudaMemcpy(host.data(), tensor.data, host.size() * sizeof(std::uint16_t),
+                       cudaMemcpyDeviceToHost) != cudaSuccess) {
+            std::fprintf(stderr, "[conv-probe] %s readback failed\n", name);
+            return;
+        }
+        for (int col = 0; col < width; ++col) {
+            const std::uint16_t* base = host.data() + col * column_elements;
+            double sum                = 0.0;
+            for (std::int64_t i = 0; i < column_elements; ++i) {
+                const double v = bits_to_float(base[i]);
+                sum += v * v;
+            }
+            std::fprintf(stderr,
+                         "[conv-probe] layer=%d %s col=%d rms=%.5f first=[%.5f %.5f %.5f %.5f]\n",
+                         layer, name, col, std::sqrt(sum / static_cast<double>(column_elements)),
+                         bits_to_float(base[0]), bits_to_float(base[1]), bits_to_float(base[2]),
+                         bits_to_float(base[3]));
+        }
+    };
+    std::vector<std::uint16_t> host_base(static_cast<std::size_t>(base_kernel.numel()));
+    cudaDeviceSynchronize();
+    if (cudaMemcpy(host_base.data(), base_kernel.data, host_base.size() * sizeof(std::uint16_t),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+        std::fprintf(stderr, "[conv-probe] base kernel readback failed\n");
+        return;
+    }
+    std::fprintf(stderr,
+                 "[conv-probe] layer=%d base_kernel shape=[%d,%d,%d] proj=[%d,%d] "
+                 "h0 tap0/1 side0=[%.5f %.5f] side1=[%.5f %.5f]\n",
+                 layer, base_kernel.ne[0], base_kernel.ne[1], base_kernel.ne[2], projection_rows,
+                 projection_columns, bits_to_float(host_base[0]), bits_to_float(host_base[1]),
+                 bits_to_float(host_base[2]), bits_to_float(host_base[3]));
+    print_columns("in", residual);
+    print_columns("out", prepared);
+    std::fflush(stderr);
+}
+
 void prepare_dynamic_branch(ExecutionCore& execution, const Tensor& residual, const Tensor& norm,
                             float eps, const DynamicConvParameters& weights,
                             workspace::DFlash2BranchRoots& branch) {
@@ -520,37 +573,36 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                                   dimension(config.mask_token_id), ids, positions, stream);
         Tensor residual = work.alloc(DType::BF16, {dimension(target.hidden_size), width, batch});
         Tensor flat_residual = residual.view({dimension(target.hidden_size), columns});
-        // The block's own K/V, one plane per layer. A pass reads the live prefix (the rows earlier
-        // passes fixed) and leaves its own rows behind for the next one; the attention above already
-        // read the plane, so rewriting it afterwards is stream-ordered after that read.
-        std::vector<Tensor> block_keys;
-        std::vector<Tensor> block_values;
-        block_keys.reserve(weights.layers.size());
-        block_values.reserve(weights.layers.size());
-        for (std::size_t layer_index = 0; layer_index < weights.layers.size(); ++layer_index) {
-            block_keys.push_back(work.alloc(DType::BF16,
-                                            {dimension(config.attention.head_dim),
-                                             dimension(config.attention.num_key_value_heads), width,
-                                             batch}));
-            block_values.push_back(work.alloc(DType::BF16,
-                                              {dimension(config.attention.head_dim),
-                                               dimension(config.attention.num_key_value_heads),
-                                               width, batch}));
-        }
-
-        // Two passes by default: the first replays the block with committed context alone in view
-        // and leaves its rows in the planes; the second admits them causally, so column j sees
-        // columns 0..j-1 as the rows an earlier pass computed for them. NINFER_DFLASH2_BLOCK_PASSES
-        // widens that to one plane row per pass (up to width runs), and NINFER_DFLASH2_BLOCK_LEGACY
-        // keeps the single pass this tree had before the bound existed, for the A/B. Both are
-        // diagnostics; the default is the two-pass form.
+        // NINFER_DFLASH2_BLOCK_PASSES > 1 only: per-layer K/V planes so a later pass can read the
+        // rows an earlier one fixed. The reference block reads the ring alone, so the default path
+        // allocates nothing here; see the register entry for why the replay is kept at all.
         const std::int32_t stack_runs = [&] {
             if (std::getenv("NINFER_DFLASH2_BLOCK_LEGACY") != nullptr) { return 1; }
             if (const char* widened = std::getenv("NINFER_DFLASH2_BLOCK_PASSES")) {
                 return std::clamp(std::atoi(widened), 1, width);
             }
-            return 2;
+            return 1;
         }();
+        const bool stage_planes = stack_runs > 1;
+        std::vector<Tensor> block_keys;
+        std::vector<Tensor> block_values;
+        if (stage_planes) {
+            block_keys.reserve(weights.layers.size());
+            block_values.reserve(weights.layers.size());
+            for (std::size_t layer_index = 0; layer_index < weights.layers.size(); ++layer_index) {
+                block_keys.push_back(work.alloc(DType::BF16,
+                                                {dimension(config.attention.head_dim),
+                                                 dimension(config.attention.num_key_value_heads),
+                                                 width, batch}));
+                block_values.push_back(work.alloc(DType::BF16,
+                                                  {dimension(config.attention.head_dim),
+                                                   dimension(config.attention.num_key_value_heads),
+                                                   width, batch}));
+            }
+        }
+
+        // NINFER_DFLASH2_BLOCK_LEGACY drops the bound, which is what this tree did before it
+        // existed; kept only so the A/B can name both sides from one binary.
         const bool causal = std::getenv("NINFER_DFLASH2_BLOCK_LEGACY") == nullptr;
         const auto run_stack = [&](std::int32_t live_block_rows) {
             ops::embedding(ids.view({columns}), state.execution.parameters.text.token_embedding,
@@ -573,6 +625,12 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                                                 static_cast<std::int32_t>(branch.prepared.nb[1]),
                                                 width, 0, state.execution.device.stream);
                         }
+                    }
+                    if (std::getenv("NINFER_DFLASH2_CONV_PROBE") != nullptr && layer_index == 0) {
+                        probe_conv_taps(residual, branch.prepared, layer.attention_conv->base_kernel,
+                                        layer.attention_conv->kernel_projection.weight.n,
+                                        layer.attention_conv->kernel_projection.weight.k, width,
+                                        static_cast<int>(layer_index));
                     }
                     Tensor query = work.alloc(
                         DType::BF16, {dimension(config.attention.head_dim),
@@ -609,11 +667,10 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                         static_cast<float>(1.0 / std::sqrt(double(config.attention.head_dim))),
                         state.dflash.local_layer(static_cast<std::uint32_t>(layer_index)),
                         envelopes.local, work, attention, stream,
-                        // DFlash2 only: the block's rows are [anchor, mask, mask, ...], and a
-                        // masked row has to see the rows before it and nothing after it. The rows
-                        // an earlier pass already computed stay in the planes and are read from
-                        // there, so each column sees its own causal prefix instead of its
-                        // siblings' shared input. The v1 path below keeps the default.
+                        // DFlash2 only: the block's rows are [anchor, mask, mask, ...], and the
+                        // reference block reads the committed ring alone - no block row sees the
+                        // anchor or its siblings. The planes below exist only for the diagnostic
+                        // replay (NINFER_DFLASH2_BLOCK_PASSES > 1); the v1 path keeps the default.
                         /*block_causal=*/causal,
                         live_block_rows > 0 ? &block_keys[layer_index] : nullptr,
                         live_block_rows > 0 ? &block_values[layer_index] : nullptr,
@@ -622,10 +679,12 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                         state.execution,
                         attention.view({dimension(config.attention.query_width()), width, batch}),
                         layer.output, *layer.attention_conv, branch.finish_delta, residual);
-                    CUDA_CHECK(cudaMemcpyAsync(block_keys[layer_index].data, key.data, key.bytes(),
-                                               cudaMemcpyDeviceToDevice, stream));
-                    CUDA_CHECK(cudaMemcpyAsync(block_values[layer_index].data, value.data,
-                                               value.bytes(), cudaMemcpyDeviceToDevice, stream));
+                    if (stage_planes) {
+                        CUDA_CHECK(cudaMemcpyAsync(block_keys[layer_index].data, key.data,
+                                                   key.bytes(), cudaMemcpyDeviceToDevice, stream));
+                        CUDA_CHECK(cudaMemcpyAsync(block_values[layer_index].data, value.data,
+                                                   value.bytes(), cudaMemcpyDeviceToDevice, stream));
+                    }
                 }
                 {
                     auto scope  = work.scope();
@@ -647,7 +706,7 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
         // its rows in the planes; the second admits them causally, so column j sees columns 0..j-1
         // as the values the pass before computed for them.
         for (std::int32_t pass = 0; pass < stack_runs; ++pass) { run_stack(pass); }
-        if (std::getenv("NINFER_DFLASH2_BLOCK_PROBE") != nullptr) {
+        if (std::getenv("NINFER_DFLASH2_BLOCK_PROBE") != nullptr && !block_keys.empty()) {
             probe_block_plane(block_keys.front(), positions, width);
         }
         Tensor hidden = work.alloc(DType::BF16, {dimension(target.hidden_size), mask_columns});

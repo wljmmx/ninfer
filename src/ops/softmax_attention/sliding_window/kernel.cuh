@@ -10,9 +10,9 @@ struct SlidingWindowAttentionPolicy {
     const std::int32_t* positions;
     int padded_context;
     int window_mask;
-    // When set, a key is visible only if it sits strictly before its query's own position. The
-    // committed ring never holds such a key, so every pass that reads only the context keeps its
-    // exact result; the bound only bites once a caller puts a block's own rows in the ring.
+    // When set, a key is visible only if it sits strictly before its query's own position, and the
+    // pass's own rows stop being keys altogether: the block reads the committed ring only. The ring
+    // never holds such a key, so every pass that reads only the context keeps its exact result.
     bool block_causal;
 
     __device__ __forceinline__ int context_count(int value) const { return min(value, window_mask); }
@@ -22,6 +22,11 @@ struct SlidingWindowAttentionPolicy {
     __device__ __forceinline__ bool allow_context(int query, int key) const {
         return key >= query - (window_mask) && (!block_causal || key < query);
     }
+
+    // The block reads the committed ring only: under the bound its own rows are not keys at all, so
+    // no block row sees the anchor or its siblings. Every other caller keeps the unconditional
+    // allow the body applied before the bound existed.
+    __device__ __forceinline__ bool block_rows_are_keys() const { return !block_causal; }
 
     __device__ __forceinline__ std::int64_t context_tile(int kv_head, int, int) const {
         return static_cast<std::int64_t>(kContextQueryHeadDim) * padded_context * kv_head;

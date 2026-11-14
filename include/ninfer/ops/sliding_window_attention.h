@@ -61,22 +61,20 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
 /**
  * `block_key` / `block_value` name a block's own K and V ({head_dim, kv_heads, width, batch}) that
  * the pass may attend to in addition to the committed context, and `block_width` is how many of
- * those columns are live. They are read only under `block_causal`, which bounds each query row to
- * the block rows strictly before it; with the default (null pointers, width 0) nothing is read and
- * the result is bit-identical to a pass that never passed them.
+ * those columns are live. They are read only under `block_causal`; with the default (null pointers,
+ * width 0) nothing is read and the result is bit-identical to a pass that never passed them.
  *
  * A block plane's row r is the block's own column r, so it is keyed at `positions[r]` and the live
- * prefix may not exceed the query width. Rows `[0,block_width)` come from the plane, and the query
- * tile's rows below `block_width` are then not read at all: they are the same rows, and a pass that
- * supplies them as a block would otherwise see each of them twice. That is what lets a second pass
- * replay a block whose leading rows the first pass already fixed.
+ * prefix may not exceed the query width.
  */
 
 /**
- * `block_causal` bounds visibility by the query's own position (`key < query`). Every pass that only
- * reads committed context keeps its exact result, because such keys always sit before the query.
- * It exists for a block whose own rows are in the ring: then a column sees the columns before it and
- * nothing after it.
+ * `block_causal` makes the pass read the committed context only: the pass's own rows are not keys at
+ * all, and a context key is visible when it sits strictly before the query. Every other pass keeps
+ * the unconditional allow it always had, and a pass that reads only committed context also keeps its
+ * exact result, because such keys always sit before the query. It exists for the draft block, whose
+ * rows are [anchor, mask, ...]: there the ring holds committed rows only, so no block row sees the
+ * anchor or its siblings, and the columns differ by their own positions rather than by each other.
  */
 
 /**

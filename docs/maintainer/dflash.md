@@ -340,7 +340,9 @@ teacher-conditioned comparison needs the draft's training-time conditioning, and
 tensor for it, so it would have to come from the reference implementation, not from another probe. Accepted run length never exceeds one
 token (histogram `0:10, 1:25` over 35 rounds), so `k` currently buys overhead and no extra acceptance.
 
-**Block-causal two-pass (open, probed and inert).** The fix the masked-row record pointed at - let each
+**Block-causal two-pass (superseded, kept for the numbers).** The entry below implements the
+ring-only form the reference actually has; everything here was measured against the causal and
+replay variants before that. The fix the masked-row record pointed at - let each
 column see the block rows before it instead of its siblings' shared input - is implemented end to end
 and moves nothing. The op gained a block tile (`block_key`/`block_value`/`block_width` at
 `include/ninfer/ops/sliding_window_attention.h`, staged by `context_query_stage_block_tile` in
@@ -395,7 +397,7 @@ to `return 1`).
 **Per-row RoPE is not the gap either (probed).** The identical `prepared` columns are the
 dynamic-convolution output, which is *before* RoPE, so they say nothing about the rotation - exactly as
 the reference has it. `NINFER_DFLASH2_ROPE_PROBE` (`draft.cpp:414`, off by default) prints what
-`ops::rmsnorm_rope` (`draft.cpp:537`) receives and returns, on the first draft layer. The positions
+`ops::rmsnorm_rope` (`draft.cpp:652`) receives and returns, on the first draft layer. The positions
 tensor is per column, not per request: shape `[9,1,1,1]`, `nb=[4,36]`, values `64..72` at
 `--draft-tokens 8` and `[5,1,1,1]`, `nb=[4,20]`, values `64..68` at `--draft-tokens 4` - anchor at
 `F`, masks at `F+1..F+K`, which is the reference's `pos0+1 .. pos0+7`. What comes back is rotated per
@@ -419,10 +421,60 @@ the columns agree; it is the next candidate and not this round's change.
 
 What that leaves is the one input the block never has: the token each column *selected*. The planes
 carry the mask row's own state for every column, so conditioning needs the head's output fed back -
-after `ops::candidate_selector_path` (`draft.cpp:657`) walk one column per pass, embedding the
+after `ops::candidate_selector_path` (`draft.cpp:777`) walk one column per pass, embedding the
 previous column's `draft_tokens` value in place of the mask id (`prepare_masked_block` at
-`draft.cpp:462`, rows `1..k`), which costs one stack pass per column and is the only remaining
+`draft.cpp:572`, rows `1..k`), which costs one stack pass per column and is the only remaining
 mechanism that can make a column differ from its siblings.
+
+**Ring-only block visibility (implemented) and the two-tap conv (probed).** The reference's block
+reads the committed ring alone: no block row is a key, so no masked column sees the anchor or its
+siblings. That is now what the op does when `block_causal` is set - the query tile contributes no keys
+(`context_query.cuh:467`, `self_is_key`, with `block_rows_are_keys()` on both policies, `true` for the
+dense context policy so nothing else moves) - and the draft runs a single pass by default again
+(`draft.cpp:584`), with the planes allocated only for the diagnostic replay. Measured on v5_e2,
+`pp64+tg32 --warmup 1 -r 1 --no-cuda-graph`:
+
+| draft width | visibility | acceptance | accepted per position | decode |
+|---|---|---:|---|---:|
+| K=4 | siblings visible (before) | 0.1806 / 1.72 | 8, 4, 1, 0 over 18 rounds | 2.83 |
+| K=4 | causal (previous round) | 0.1622 / 1.63 | 8, 4, 0, 0 over 19 rounds | 2.29 |
+| K=4 | ring only (now) | 0.1644 / 1.63 | 8, 4, 0, 0 over 19 rounds | 2.46 |
+| K=8 | siblings visible (before) | 0.0542 / 1.39 | 8, 1, 0, ... over 23 rounds | 2.33 |
+| K=8 | causal (previous round) | 0.0563 / 1.41 | 7, 2, 0, ... over 22 rounds | 1.92 |
+| K=8 | ring only (now) | 0.0400 / 1.29 | 6, 1, 0, ... over 24 rounds | 1.88 |
+
+Column 1 stays at one acceptance in 24 rounds at K=8 and two in 19 at K=4, so the key set was not
+the cause either: the columns are still one content in seven rotations, and the reference's own block
+has the same property.
+
+Width matters more than visibility does. The reference block is eight rows (anchor plus seven masks),
+while `--draft-tokens 8` asks for nine columns, so its last column sits outside the block the draft
+was trained on. At the trained width - `--draft-tokens 7`, eight columns - the same build measures
+acceptance 0.0968 with `[8,4,0,0,0,0,0]` over 19 rounds at decode 1.91, against 0.0400 with
+`[6,1,0,...]` at `--draft-tokens 8`. Column 1 is accepted four times of nineteen there, the same walk
+`--draft-tokens 4` takes, so a shipped width should not exceed the block the model was built for.
+
+The dynamic convolution is the last piece of the layer the block rows could differ through, and it is
+correct. `NINFER_DFLASH2_CONV_PROBE` (`draft.cpp:468`) prints the Op's input and output per column for
+the first draft layer: `base_kernel` is `[2560,2,2]` with `kernel_projection` `[640,2560]`, and head 0
+reads tap0/tap1 `1.01562/1.09375` on side 0, `0.95703/0.99219` on side 1. The `in` residual is
+`col0 rms 0.00167`, `col1..col8 rms 0.00519` with identical components (one mask embedding), and the
+`out` is `col0 6.58507`, `col1 0.64240`, `col2..col8 0.46942` with identical components. So column 1
+consumes the anchor's normalized input through the second tap - the only column that can - and
+columns 2..8 consume the masked row before them, which is the same row they are. That is exactly the
+Op's documented form, `(base[h,0,s]+d[0,s])*n[h,i] + I(i>0)*(base[h,1,s]+d[1,s])*n[h,i-1]`.
+
+The one divergence left in the conv is row 0, which has no previous tap at all while the reference
+fills an accepted row's taps after the verify window. It is unobservable here: row 0's output is not
+in the head's input (`rmsnorm_pack_tail` takes columns 1..k, `draft.cpp:590`) and, under ring-only
+visibility, it is not a key either - only its *input* matters, as column 1's second tap.
+
+Checked against the quoted reference, the rest of the draft layer matches: one shared mask token for
+every masked row (`prepare_masked_block`, `draft.cpp:572`), norm then two-tap conv then q/k/v then q/k
+norm and RoPE (one call, `draft.cpp:537`), attention over the ring only, and a head that reads the
+masked columns alone. The verify window is unchanged by any of this: it still routes the target over
+`[anchor, d1..dk]` per token, so its expert union is a property of the draft's width, not of the
+draft's attention.
 
 **Layer-major + double-buffered prefill (last resort, measured).** `ExpertStream::ensure` still
 publishes and waits inside the layer, one staging ring of 32 slots, so the PCIe traffic a prefill
