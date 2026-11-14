@@ -419,3 +419,21 @@ The finite model implementation is in
 [`program/storage/draft_context.cpp`](../../src/models/qwen3_5/program/storage/draft_context.cpp).
 Workspace planners and CUDA Graph profiles use the selected parameters and startup widths. Native
 Ops retain their own format, shape, numerical and state-transition contracts.
+
+The per-column state/slot question was the next suspect and it closes the same way. The draft has
+`layers=5` and its rings map identically (`compact_layer_index` = 0,1,2,3,4 for layers 0..4), so the
+attention call's raw layer index (`draft.cpp:463`) and the append path's compacted index
+(`draft.cpp:357`) address the same ring for every layer - no layer aliases another. Within a layer the
+columns are addressed by absolute position (`slot = p mod capacity`) with the measured positions
+64..71, and the op only reads committed context: a masked row never writes K/V, so one column cannot
+overwrite another's. One lane per sequence row is passed as `lanes`, which is what the op's batch
+dimension means.
+
+With rings, slots, positions, ids, buffers and mixers all closed by measurement, the only per-column
+mechanism left is the selector's sequential conditioning: `candidate_selector_path` receives
+`predecessor_codebook` / `successor_codebook` with per-column candidates, scores and the rank-256
+projection (`draft.cpp:508-517`). Column 0 is conditioned on the anchor through the predecessor
+codebook, and every later column has to be conditioned on the token the previous column selected. A
+cliff at column 1 - 0.0% in every round while columns 2..7 sit at 5-17% - is what a selector that never
+applies the successor codebook would look like: the later columns' own `selected` values then drift
+towards whatever the plain head produced, which is why they are not zero.

@@ -501,6 +501,21 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                     return true;
                 }();
                 (void)told;
+                // Which ring each layer addresses: the append path compacts the layer index by
+                // kind, this attention call does not, so a draft with mixed layer kinds would have
+                // the two disagree. Print both for every layer once.
+                static const bool told_layers = [&] {
+                    std::fprintf(stderr, "[row-probe] layers=%zu ring_map=",
+                                 size_t(dimension(config.num_hidden_layers)));
+                    for (std::int32_t l = 0; l < dimension(config.num_hidden_layers); ++l) {
+                        std::fprintf(stderr, "%d:%u-", l,
+                                     config.compact_layer_index(static_cast<std::uint32_t>(l)));
+                    }
+                    std::fputc('\n', stderr);
+                    std::fflush(stderr);
+                    return true;
+                }();
+                (void)told_layers;
                 verify_column_probe("draft-head-in", hidden, dimension(target.hidden_size),
                                     static_cast<std::int32_t>(hidden.nb[1]), mask_columns, 0, stream);
             }
