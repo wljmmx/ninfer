@@ -289,20 +289,31 @@ Two things are ruled out by measurement rather than argument. The columns are ad
 first residual words at O(1), so neither a broadcast column nor a wrong position is the cause. And
 the sparse indexer is not the cause: `NINFER_QSA_FORCE_FULL=1` (the dense arm, a different mixer for
 every indexed layer) shows the same collapse (column 1: 0.0%, columns 2..7: 0.0-4.3%) while column 0
-stays at 73.9/30.4%. What remains is the shared verify path between columns 0 and 1 - the per-column
-live extent the mixers read, or the head's input for columns whose source is a proposal rather than
-the anchor. Accepted run length never exceeds one token (histogram `0:10, 1:25` over 35 rounds), so
-`k` currently buys overhead and no extra acceptance.
+stays at 73.9/30.4%.
 
-**Layer-major + double-buffered prefill (open).** `ExpertStream::ensure` still publishes and waits
-inside the layer, one staging ring of 32 slots, so the PCIe traffic that a prefill needs is serial
-with the SMs. The sizing is measured: a 512-token prefill touches up to the layer's expert count
-(73728/40 = 1843) per layer, about 2.25 GiB per layer and 90 GiB per pass, which at 12-20 GB/s is
-4.5-7.5 s - a 70-110 tok/s ceiling for this box against a measured 9.24 tok/s at `-pg 512,32`.
-Raising the warm tier does not help: `NINFER_EXPERT_HOST_ARENA_MB=46080` (36,864 slots, mapped and
-device-addressable) measured prefill 8.69 / decode 1.59 against 9.24 / 1.59 at the default 27.7 GiB.
-The work is to split `ensure` into publish and wait and move the wait one layer down; it touches the
-`in_flight_` / `device_held_` release points, which is why it is not a small change.
+A per-column magnitude probe (`NINFER_VERIFY_COLUMN_PROBE`, `verify_probe.h`) adds a third exclusion:
+the rectangle's state is carried, column by column. On the same artifact the GDN recurrence, the
+attention mixer and the final fold all report ordinary per-column magnitudes - GDN output 0.0111 /
+0.0115 / 0.0111 / ... / 0.0116, attention output 0.0713 / 0.0676 / 0.0647 / ... / 0.0668, final fold
+4.31 / 3.79 / 3.41 / ... / 3.30 - so no column is reading a state that never advanced. What is left is
+the draft block's own mask: `draft.cpp:455` gives every column the same `valid_columns = width` and
+`positions = F + i`, and the op takes one shared length for the whole block (`sliding_window/launch.cu:60`
+passes `positions[0]`, `kernel.cuh:95` reads `length = positions[0]`, then tiles only `[0, length)`).
+That excludes the anchor at position F from every column's visible set while also excluding the block's
+own columns from each other, which is isolation without the one piece the proposals need. Accepted run
+length never exceeds one token (histogram `0:10, 1:25` over 35 rounds), so `k` currently buys overhead
+and no extra acceptance.
+
+**Layer-major + double-buffered prefill (last resort, measured).** `ExpertStream::ensure` still
+publishes and waits inside the layer, one staging ring of 32 slots, so the PCIe traffic a prefill
+needs is serial with the SMs. The sizing is measured: a 512-token prefill touches up to the layer's
+expert count (73728/40 = 1843) per layer, about 2.25 GiB per layer and 90 GiB per pass, which at
+12-20 GB/s is 4.5-7.5 s - a 70-110 tok/s ceiling for this box against a measured 9.24 tok/s at
+`-pg 512,32`. Raising the warm tier does not help: `NINFER_EXPERT_HOST_ARENA_MB=46080` (36,864
+slots, mapped and device-addressable) measured prefill 8.69 / decode 1.59 against 9.24 / 1.59 at the
+default 27.7 GiB. **Ranked last**: double buffering, in-place CPU compute and the coordination
+between them, if they land, remove the need for layer-major restaging entirely - the 90 GiB and the
+70-110 tok/s ceiling above stay as the background that says which of the three has to carry it.
 
 **CPU cooperative execution (open, blocked on numerics).** `cpu_path_policy.h` decides, nothing
 executes. On v5_e2 the CPU half is never asked: `[split-form] addressable=10.00 of 10.00
