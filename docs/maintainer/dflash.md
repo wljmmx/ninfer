@@ -437,3 +437,19 @@ codebook, and every later column has to be conditioned on the token the previous
 cliff at column 1 - 0.0% in every round while columns 2..7 sit at 5-17% - is what a selector that never
 applies the successor codebook would look like: the later columns' own `selected` values then drift
 towards whatever the plain head produced, which is why they are not zero.
+The selector was checked at its kernel and it is not the gap either. `selector_walk_kernel`
+(`candidate_selector/bf16/candidate_selector_path.cu:92-115`) starts `shared.predecessor` at the
+anchor, walks `step = 0..steps-1` in order, and after each column sets
+`shared.predecessor = a.ids[column * kCandidates + selected]` - the next column is conditioned on the
+token this one selected. Both codebooks are applied on every column, not one per side: `score_row`
+adds the predecessor row dotted with that column's hidden (`:76-77`) and the successor row for each
+candidate (`:84-87`), then the walk writes that column's `q` at `q + column * kCandidates` (`:107-108`).
+So "the successor codebook is never read" and "the predecessor stays at the anchor" are both false by
+construction, and the per-column ids/scores/hidden index by `column` in the same {candidates, steps,
+batch} layout the buffers use.
+
+That leaves the target-side rectangle as the only place a per-column difference can still come from:
+the same shared verify code produces sharp columns under MTP on this artifact
+(`accepted_per_position = [14, 10, 6, 4, 4, 4, 1]`) and flat ones under DFlash2, so what has to be
+compared next is the two paths' *inputs* to that rectangle - `state_source_slots`, `kv_table_rows`,
+`valid_columns` and the ingress sampling config - not the rectangle itself.
