@@ -909,6 +909,50 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                      candidates.front(), selected, argmax, hit ? 1 : 0, overlap);
                         for (std::int32_t id : candidates) { std::fprintf(file, ",%d", id); }
                         for (std::int32_t id : order) { std::fprintf(file, ",%d", id); }
+                        // Where this column thinks it is, and what the target actually wrote there:
+                        // the first four words of the column's hidden plus its norm, and how peaked
+                        // the column's logits are. A column whose prediction is merely wrong still
+                        // has a peaked distribution; a column whose write never landed reads flat.
+                        std::int32_t cache_position = 0;
+                        std::int32_t rope_position  = 0;
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            &cache_position,
+                            frame.verify_positions.slice(0, column, 1).slice(1, 0, 1).data,
+                            sizeof(cache_position), cudaMemcpyDeviceToHost, s));
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            &rope_position,
+                            frame.target_rope_positions.slice(0, column, 1).slice(1, 0, 1).data,
+                            sizeof(rope_position), cudaMemcpyDeviceToHost, s));
+                        constexpr std::int32_t kHeadWords = 4;
+                        std::vector<std::uint16_t> head(static_cast<std::size_t>(kHeadWords));
+                        const auto* hidden_base = static_cast<const char*>(frame.target_hidden.data) +
+                                                  static_cast<std::size_t>(column) *
+                                                      frame.target_hidden.nb[1];
+                        CUDA_CHECK(cudaMemcpyAsync(head.data(), hidden_base,
+                                                   head.size() * sizeof(std::uint16_t),
+                                                   cudaMemcpyDeviceToHost, s));
+                        const auto head_value = [](std::uint16_t bits16) {
+                            const std::uint32_t bits = static_cast<std::uint32_t>(bits16) << 16U;
+                            float value              = 0.0F;
+                            std::memcpy(&value, &bits, sizeof(float));
+                            return value;
+                        };
+                        CUDA_CHECK(cudaStreamSynchronize(s));
+                        double logit_mean = 0.0;
+                        double logit_var  = 0.0;
+                        for (const float value : logits) { logit_mean += double(value); }
+                        logit_mean /= double(words);
+                        for (const float value : logits) {
+                            const double d = double(value) - logit_mean;
+                            logit_var += d * d;
+                        }
+                        logit_var /= double(words);
+                        const float top1 = logits[static_cast<std::size_t>(argmax)];
+                        const float top2 = logits[static_cast<std::size_t>(order[1])];
+                        std::fprintf(file, ",%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f",
+                                     cache_position, rope_position, head_value(head[0]),
+                                     head_value(head[1]), head_value(head[2]), head_value(head[3]),
+                                     std::sqrt(logit_var), double(top1 - top2), double(top1));
                         std::fputc('\n', file);
                     }
                     std::fflush(file);
