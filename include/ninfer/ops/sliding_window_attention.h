@@ -54,7 +54,15 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
                               std::uint32_t window, float scale,
                               const CyclicKVCacheLayerView& context,
                               SlidingWindowAttentionExecutionEnvelope envelope,
-                              WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+                              WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
+                              bool block_causal = false);
+
+/**
+ * `block_causal` bounds visibility by the query's own position (`key < query`). Every pass that only
+ * reads committed context keeps its exact result, because such keys always sit before the query.
+ * It exists for a block whose own rows are in the ring: then a column sees the columns before it and
+ * nothing after it.
+ */
 
 /**
  * Return transient capacity for every T in the inclusive optimized interval at the exact batch

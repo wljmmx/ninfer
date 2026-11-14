@@ -10,13 +10,17 @@ struct SlidingWindowAttentionPolicy {
     const std::int32_t* positions;
     int padded_context;
     int window_mask;
+    // When set, a key is visible only if it sits strictly before its query's own position. The
+    // committed ring never holds such a key, so every pass that reads only the context keeps its
+    // exact result; the bound only bites once a caller puts a block's own rows in the ring.
+    bool block_causal;
 
     __device__ __forceinline__ int context_count(int value) const { return min(value, window_mask); }
 
     __device__ __forceinline__ int query_position(int token) const { return positions[token]; }
 
     __device__ __forceinline__ bool allow_context(int query, int key) const {
-        return key >= query - (window_mask);
+        return key >= query - (window_mask) && (!block_causal || key < query);
     }
 
     __device__ __forceinline__ std::int64_t context_tile(int kv_head, int, int) const {
@@ -42,7 +46,7 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
         const __nv_bfloat16* __restrict__ context_k, const __half* __restrict__ context_v,
         int padded_context, int window_mask, int max_context, int split_capacity, float scale,
         float* __restrict__ partial_acc, float* __restrict__ partial_m,
-        float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
+        float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out, int block_causal) {
     const int batch = static_cast<int>(blockIdx.z);
     const std::int64_t lane_elements =
         static_cast<std::int64_t>(kContextQueryHeadDim) * padded_context * kContextQueryKVHeads;
@@ -52,7 +56,8 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
     SlidingWindowAttentionPolicy policy{
         .positions      = batch_positions,
         .padded_context = padded_context,
-        .window_mask = window_mask,
+        .window_mask  = window_mask,
+        .block_causal = block_causal != 0,
     };
     context_query_split_partial_body<SlidingWindowAttentionPolicy, Tokens, WarpsPerCta,
                                      KeyBlock, DirectOutput>(

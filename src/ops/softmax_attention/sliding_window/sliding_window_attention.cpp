@@ -116,7 +116,8 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
                               std::uint32_t window, float scale,
                               const CyclicKVCacheLayerView& context,
                               SlidingWindowAttentionExecutionEnvelope envelope,
-                              WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+                              WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
+                              bool block_causal) {
     constexpr const char* op = "sliding_window_attention";
     require_profile(geometry, window, op);
     if (q.dtype != DType::BF16 || query_k.dtype != DType::BF16 || query_v.dtype != DType::BF16 ||
@@ -169,7 +170,7 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
     }
     detail::sliding_window_attention_launch(q, query_k, query_v, positions, valid_columns, lanes,
                                             scale, context, plan, partial.acc, partial.m, partial.l,
-                                            out, stream);
+                                            out, stream, block_causal);
 }
 
 } // namespace ninfer::ops

@@ -471,7 +471,12 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                     dimension(config.sliding_window.value_or(0)),
                     static_cast<float>(1.0 / std::sqrt(double(config.attention.head_dim))),
                     state.dflash.local_layer(static_cast<std::uint32_t>(layer_index)),
-                    envelopes.local, work, attention, stream);
+                    envelopes.local, work, attention, stream,
+                    // DFlash2 only: the block's rows are [anchor, mask, mask, ...], so a masked row
+                    // has to see the rows before it and nothing after it. The bound is inert for a
+                    // pass that reads only committed context, which is why the v1 path keeps the
+                    // default below.
+                    /*block_causal=*/true);
                 finish_dynamic_branch(
                     state.execution,
                     attention.view({dimension(config.attention.query_width()), width, batch}),
