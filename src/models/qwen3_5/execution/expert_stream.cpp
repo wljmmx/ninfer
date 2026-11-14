@@ -224,6 +224,18 @@ std::vector<ExpertStream*>& request_boundary_streams() {
     static auto* streams = new std::vector<ExpertStream*>();
     return *streams;
 }
+
+// One freeze-window resolver per form, declared here because the stream's own defaults are read by
+// init_stream_state(). The split form owns three per-run sets, so a short warm-up window is what
+// stops each run from re-scanning its slots; the fused form owns one set and its measured default is
+// always-rerank, because a frozen single set cannot admit a new route without a host read.
+// NINFER_EXPERT_FREEZE overrides either default.
+std::uint32_t freeze_after_for_form(bool split) {
+    if (const char* value = std::getenv("NINFER_EXPERT_FREEZE"); value != nullptr && *value != '\0') {
+        return static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
+    }
+    return split ? std::uint32_t{4} : std::uint32_t{0};
+}
 } // namespace
 
 void note_expert_request_begin() {
@@ -379,13 +391,12 @@ void ExpertStream::init_stream_state() {
     if (freeze_mode_) { static_warm_ = true; }
     freeze_after_ = [] {
         const char* value = std::getenv("NINFER_EXPERT_FREEZE");
-        if (value != nullptr && *value != '\0') {
-            return static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
-        }
-        // Four ensure() calls: one layer has decided nothing yet, and a single decode token routes
-        // eight experts. A gate pins the number explicitly; a serving run that wants a converged set
-        // should raise it.
-        return std::uint32_t{4};
+        // The form is not known until attach_split(), so the default is the split form's window
+        // here and the fused form's zero is applied at its own use site
+        // (freeze_after_for_form(/*split=*/false)). An explicit value applies to both.
+        return value != nullptr && *value != '\0'
+                   ? static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10))
+                   : freeze_after_for_form(/*split=*/true);
     }();
     freeze_refresh_ = [] {
         const char* value = std::getenv("NINFER_FREEZE_REFRESH");
@@ -1453,8 +1464,12 @@ std::size_t ExpertStream::device_admit_ring(const void* device_ids, std::int32_t
 // is "neither leg has this expert", not "the pool lacks it".
 namespace {
 // The layer policy constants, shared with the fused path (see the notes at their use sites there).
-constexpr std::int32_t kSplitSetUpdateTokens    = 8;
-constexpr std::uint32_t kSplitPrefillProtectMin = 96;
+constexpr std::int32_t kSplitSetUpdateTokens = 8;
+// One criterion instead of two constants: a pool that seats fewer than this many experts of a layer
+// cannot hold a layer's working set, so a set built from a prefill is a set decode did not ask for
+// and neither form protects it. Both forms used to spell this number out separately.
+constexpr std::uint32_t kPoolCoversLayerSlots = 96;
+constexpr bool pool_covers_layer(std::uint32_t slots) { return slots >= kPoolCoversLayerSlots; }
 } // namespace
 
 // port (sm_89): one run's tables, from one placement word.
@@ -1855,7 +1870,7 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
     // again the step after - measured as 22 of 30 routes newly installed per layer, 1.32 GiB of
     // upload per token, and 6.8 tok/s. Holding the set and adding the routes is the path the
     // !refresh branch below already took during prefill; decode takes it too now.
-    const bool refresh = !set_initialised_ || narrowest < kSplitPrefillProtectMin;
+    const bool refresh = !set_initialised_ || !pool_covers_layer(narrowest);
     // A decode step still has to install the routes it just saw; it just does not discard the rest.
     const bool install = refresh || tokens <= kSplitSetUpdateTokens;
 
@@ -2455,11 +2470,11 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         // every step keeps reshuffling the tail while the scores are still being learned, so the
         // set is frozen after a warm-up window: the first N tokens decide it and the rest of the
         // request keeps it, sending a miss to the host tier instead of triggering an upload.
-        // NINFER_EXPERT_FREEZE=0 keeps the always-rerank behaviour.
-        static const int freeze_after = [] {
-            const char* value = std::getenv("NINFER_EXPERT_FREEZE");
-            return value != nullptr && *value ? std::atoi(value) : 0;
-        }();
+        // This is the fused form's half of freeze_after_for_form(): the split form's default is a
+        // window, the fused form's is none, and NINFER_EXPERT_FREEZE=0 keeps the always-rerank
+        // behaviour here.
+        static const int freeze_after =
+            static_cast<int>(freeze_after_for_form(/*split=*/false));
         std::vector<std::uint32_t> wanted;
         std::vector<bool> chosen(count_, false);
         wanted.reserve(capacity);
@@ -3099,8 +3114,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         // 24.3 tok/s and prefill 3.4 -> 5.0 s. Above roughly a hundred slots a layer the prefill
         // set is broad enough to be a good decode set, and the same change measured 59-62 -> 72.5
         // at 12 GiB.
-        constexpr std::int32_t kSetUpdateTokens   = 8;
-        constexpr std::uint32_t kPrefillProtectMin = 96;
+        constexpr std::int32_t kSetUpdateTokens = 8;
         // port (sm_89): Q20a - the pool keeps a stable hot set, and this layer's misses become the
         // overflow's job.
         //
@@ -3175,7 +3189,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         // right only if the set is held. Getting this backwards leaves routes with no address on
         // either leg (measured: ~190 routes a layer on a prefill).
         const bool refresh = !set_initialised_ || tokens <= kSetUpdateTokens ||
-                             capacity < kPrefillProtectMin;
+                             !pool_covers_layer(static_cast<std::uint32_t>(capacity));
         if (host_tier && host_ != nullptr && route_ids != nullptr &&
             std::getenv("NINFER_SKIP_HOST_FILL") == nullptr) {
             static thread_local std::vector<std::int32_t> host_distinct;
