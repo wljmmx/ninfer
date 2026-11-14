@@ -369,6 +369,48 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
     }
 }
 
+// NINFER_DFLASH2_BLOCK_PROBE: what a block plane actually holds after the last pass captured it.
+// One line per plane column - its absolute position and the first four components of kv head 0 -
+// so a width dimension that was written once, or a column that carries another column's row, reads
+// as a number. Off unless the caller saw the switch.
+void probe_block_plane(const Tensor& plane, const Tensor& positions, int width) {
+    const int head_dim = plane.ne[0];
+    const int kv_heads = plane.ne[1];
+    const std::int64_t column_elements = static_cast<std::int64_t>(head_dim) * kv_heads;
+    std::vector<std::uint16_t> host(static_cast<std::size_t>(column_elements) * width);
+    std::vector<std::int32_t> host_positions(static_cast<std::size_t>(width));
+    // Probe only: the pass loop queues the plane writes on the model stream, and pageable host
+    // memory is not ordered against that stream, so the readback waits for the device first.
+    cudaDeviceSynchronize();
+    // Probe only: pageable host memory, so the synchronous forms are the ones that are defined here.
+    const cudaError_t plane_status =
+        cudaMemcpy2D(host.data(), static_cast<std::size_t>(column_elements) * 2, plane.data,
+                     static_cast<std::size_t>(plane.nb[2]),
+                     static_cast<std::size_t>(column_elements) * 2, static_cast<std::size_t>(width),
+                     cudaMemcpyDeviceToHost);
+    const cudaError_t position_status =
+        cudaMemcpy(host_positions.data(), positions.data, static_cast<std::size_t>(width) * sizeof(std::int32_t),
+                   cudaMemcpyDeviceToHost);
+    if (plane_status != cudaSuccess || position_status != cudaSuccess) {
+        std::fprintf(stderr, "[blk-probe] plane readback failed: %s / %s\n",
+                     cudaGetErrorName(plane_status), cudaGetErrorName(position_status));
+        return;
+    }
+    const auto to_float = [](std::uint16_t bits) {
+        const std::uint32_t wide = static_cast<std::uint32_t>(bits) << 16;
+        float value;
+        std::memcpy(&value, &wide, sizeof(value));
+        return value;
+    };
+    for (int col = 0; col < width; ++col) {
+        const std::uint16_t* base = host.data() + col * column_elements;
+        std::fprintf(stderr, "[blk-probe] plane col=%d pos=%d k=[%.5f %.5f %.5f %.5f]\n", col,
+                     host_positions[static_cast<std::size_t>(col)], to_float(base[0]),
+                     to_float(base[1]), to_float(base[2]), to_float(base[3]));
+    }
+    std::fflush(stderr);
+}
+
 void prepare_dynamic_branch(ExecutionCore& execution, const Tensor& residual, const Tensor& norm,
                             float eps, const DynamicConvParameters& weights,
                             workspace::DFlash2BranchRoots& branch) {
@@ -421,82 +463,131 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                                   dimension(config.mask_token_id), ids, positions, stream);
         Tensor residual = work.alloc(DType::BF16, {dimension(target.hidden_size), width, batch});
         Tensor flat_residual = residual.view({dimension(target.hidden_size), columns});
-        ops::embedding(ids.view({columns}), state.execution.parameters.text.token_embedding,
-                       flat_residual, stream);
+        // The block's own K/V, one plane per layer. A pass reads the live prefix (the rows earlier
+        // passes fixed) and leaves its own rows behind for the next one; the attention above already
+        // read the plane, so rewriting it afterwards is stream-ordered after that read.
+        std::vector<Tensor> block_keys;
+        std::vector<Tensor> block_values;
+        block_keys.reserve(weights.layers.size());
+        block_values.reserve(weights.layers.size());
         for (std::size_t layer_index = 0; layer_index < weights.layers.size(); ++layer_index) {
-            const auto& layer = weights.layers[layer_index];
-            nvtx::ScopedRange layer_range(nvtx::Name::DFlashLayer, nvtx::Category::DFlash,
-                                          layer_index);
-            {
-                auto scope  = work.scope();
-                auto branch = workspace::dflash2_branch(work, target, config, width, batch);
-                prepare_dynamic_branch(state.execution, residual, layer.input_norm,
-                                       config.rms_norm_eps, *layer.attention_conv, branch);
+            block_keys.push_back(work.alloc(DType::BF16,
+                                            {dimension(config.attention.head_dim),
+                                             dimension(config.attention.num_key_value_heads), width,
+                                             batch}));
+            block_values.push_back(work.alloc(DType::BF16,
+                                              {dimension(config.attention.head_dim),
+                                               dimension(config.attention.num_key_value_heads),
+                                               width, batch}));
+        }
+
+        // Two passes by default: the first replays the block with committed context alone in view
+        // and leaves its rows in the planes; the second admits them causally, so column j sees
+        // columns 0..j-1 as the rows an earlier pass computed for them. NINFER_DFLASH2_BLOCK_PASSES
+        // widens that to one plane row per pass (up to width runs), and NINFER_DFLASH2_BLOCK_LEGACY
+        // keeps the single pass this tree had before the bound existed, for the A/B. Both are
+        // diagnostics; the default is the two-pass form.
+        const std::int32_t stack_runs = [&] {
+            if (std::getenv("NINFER_DFLASH2_BLOCK_LEGACY") != nullptr) { return 1; }
+            if (const char* widened = std::getenv("NINFER_DFLASH2_BLOCK_PASSES")) {
+                return std::clamp(std::atoi(widened), 1, width);
+            }
+            return 2;
+        }();
+        const bool causal = std::getenv("NINFER_DFLASH2_BLOCK_LEGACY") == nullptr;
+        const auto run_stack = [&](std::int32_t live_block_rows) {
+            ops::embedding(ids.view({columns}), state.execution.parameters.text.token_embedding,
+                           flat_residual, stream);
+            for (std::size_t layer_index = 0; layer_index < weights.layers.size(); ++layer_index) {
+                const auto& layer = weights.layers[layer_index];
+                nvtx::ScopedRange layer_range(nvtx::Name::DFlashLayer, nvtx::Category::DFlash,
+                                              layer_index);
                 {
-                    static const bool conv_probe =
-                        std::getenv("NINFER_DFLASH2_ROW_PROBE") != nullptr;
-                    if (conv_probe && layer_index == 0) {
-                        verify_column_probe("dconv-prepared", branch.prepared,
-                                            dimension(target.hidden_size),
-                                            static_cast<std::int32_t>(branch.prepared.nb[1]), width,
-                                            0, state.execution.device.stream);
+                    auto scope  = work.scope();
+                    auto branch = workspace::dflash2_branch(work, target, config, width, batch);
+                    prepare_dynamic_branch(state.execution, residual, layer.input_norm,
+                                           config.rms_norm_eps, *layer.attention_conv, branch);
+                    {
+                        static const bool conv_probe =
+                            std::getenv("NINFER_DFLASH2_ROW_PROBE") != nullptr;
+                        if (conv_probe && layer_index == 0) {
+                            verify_column_probe("dconv-prepared", branch.prepared,
+                                                dimension(target.hidden_size),
+                                                static_cast<std::int32_t>(branch.prepared.nb[1]),
+                                                width, 0, state.execution.device.stream);
+                        }
                     }
+                    Tensor query = work.alloc(
+                        DType::BF16, {dimension(config.attention.head_dim),
+                                      dimension(config.attention.num_attention_heads), width, batch});
+                    Tensor key = work.alloc(
+                        DType::BF16, {dimension(config.attention.head_dim),
+                                      dimension(config.attention.num_key_value_heads), width, batch});
+                    Tensor value = work.alloc(
+                        DType::BF16, {dimension(config.attention.head_dim),
+                                      dimension(config.attention.num_key_value_heads), width, batch});
+                    Tensor query_flat =
+                        query.view({dimension(config.attention.query_width()), columns});
+                    Tensor key_flat = key.view({dimension(config.attention.key_width()), columns});
+                    Tensor value_flat =
+                        value.view({dimension(config.attention.key_width()), columns});
+                    ops::attn_input_proj(
+                        branch.prepared.view({dimension(target.hidden_size), columns}),
+                        layer.query_key_value.weight, query_flat, key_flat, value_flat, stream);
+                    ops::rmsnorm_rope(positions, layer.query_norm, layer.key_norm, query, key,
+                                      config.rope_theta, stream);
+                    Tensor attention = work.alloc(
+                        DType::BF16, {dimension(config.attention.head_dim),
+                                      dimension(config.attention.num_attention_heads), width, batch});
+                    ops::sliding_window_attention(
+                        query, key, value, positions, valid_columns, state_slots,
+                        {dimension(config.attention.head_dim),
+                         dimension(config.attention.num_attention_heads),
+                         dimension(config.attention.num_key_value_heads)},
+                        dimension(config.sliding_window.value_or(0)),
+                        static_cast<float>(1.0 / std::sqrt(double(config.attention.head_dim))),
+                        state.dflash.local_layer(static_cast<std::uint32_t>(layer_index)),
+                        envelopes.local, work, attention, stream,
+                        // DFlash2 only: the block's rows are [anchor, mask, mask, ...], and a
+                        // masked row has to see the rows before it and nothing after it. The rows
+                        // an earlier pass already computed stay in the planes and are read from
+                        // there, so each column sees its own causal prefix instead of its
+                        // siblings' shared input. The v1 path below keeps the default.
+                        /*block_causal=*/causal,
+                        live_block_rows > 0 ? &block_keys[layer_index] : nullptr,
+                        live_block_rows > 0 ? &block_values[layer_index] : nullptr,
+                        live_block_rows);
+                    finish_dynamic_branch(
+                        state.execution,
+                        attention.view({dimension(config.attention.query_width()), width, batch}),
+                        layer.output, *layer.attention_conv, branch.finish_delta, residual);
+                    CUDA_CHECK(cudaMemcpyAsync(block_keys[layer_index].data, key.data, key.bytes(),
+                                               cudaMemcpyDeviceToDevice, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(block_values[layer_index].data, value.data,
+                                               value.bytes(), cudaMemcpyDeviceToDevice, stream));
                 }
-                Tensor query = work.alloc(
-                    DType::BF16, {dimension(config.attention.head_dim),
-                                  dimension(config.attention.num_attention_heads), width, batch});
-                Tensor key = work.alloc(
-                    DType::BF16, {dimension(config.attention.head_dim),
-                                  dimension(config.attention.num_key_value_heads), width, batch});
-                Tensor value = work.alloc(
-                    DType::BF16, {dimension(config.attention.head_dim),
-                                  dimension(config.attention.num_key_value_heads), width, batch});
-                Tensor query_flat =
-                    query.view({dimension(config.attention.query_width()), columns});
-                Tensor key_flat   = key.view({dimension(config.attention.key_width()), columns});
-                Tensor value_flat = value.view({dimension(config.attention.key_width()), columns});
-                ops::attn_input_proj(branch.prepared.view({dimension(target.hidden_size), columns}),
-                                     layer.query_key_value.weight, query_flat, key_flat, value_flat,
-                                     stream);
-                ops::rmsnorm_rope(positions, layer.query_norm, layer.key_norm, query, key,
-                                  config.rope_theta, stream);
-                Tensor attention = work.alloc(
-                    DType::BF16, {dimension(config.attention.head_dim),
-                                  dimension(config.attention.num_attention_heads), width, batch});
-                ops::sliding_window_attention(
-                    query, key, value, positions, valid_columns, state_slots,
-                    {dimension(config.attention.head_dim),
-                     dimension(config.attention.num_attention_heads),
-                     dimension(config.attention.num_key_value_heads)},
-                    dimension(config.sliding_window.value_or(0)),
-                    static_cast<float>(1.0 / std::sqrt(double(config.attention.head_dim))),
-                    state.dflash.local_layer(static_cast<std::uint32_t>(layer_index)),
-                    envelopes.local, work, attention, stream,
-                    // DFlash2 only: the block's rows are [anchor, mask, mask, ...], so a masked row
-                    // has to see the rows before it and nothing after it. The bound is inert for a
-                    // pass that reads only committed context, which is why the v1 path keeps the
-                    // default below. The block's own K/V travel alongside so the pass can read them
-                    // once the tail tile lands; block_width is how many rows are live.
-                    /*block_causal=*/true, &key, &value, width);
-                finish_dynamic_branch(
-                    state.execution,
-                    attention.view({dimension(config.attention.query_width()), width, batch}),
-                    layer.output, *layer.attention_conv, branch.finish_delta, residual);
+                {
+                    auto scope  = work.scope();
+                    auto branch = workspace::dflash2_branch(work, target, config, width, batch);
+                    prepare_dynamic_branch(state.execution, residual, layer.post_attention_norm,
+                                           config.rms_norm_eps, *layer.mlp_conv, branch);
+                    Tensor intermediate =
+                        work.alloc(DType::BF16, {dimension(config.intermediate_size), width, batch});
+                    Tensor intermediate_flat =
+                        intermediate.view({dimension(config.intermediate_size), columns});
+                    project_swiglu(branch.prepared.view({dimension(target.hidden_size), columns}),
+                                   layer.mlp.gate_up, intermediate_flat, work, stream);
+                    finish_dynamic_branch(state.execution, intermediate, layer.mlp.down,
+                                          *layer.mlp_conv, branch.finish_delta, residual);
+                }
             }
-            {
-                auto scope  = work.scope();
-                auto branch = workspace::dflash2_branch(work, target, config, width, batch);
-                prepare_dynamic_branch(state.execution, residual, layer.post_attention_norm,
-                                       config.rms_norm_eps, *layer.mlp_conv, branch);
-                Tensor intermediate =
-                    work.alloc(DType::BF16, {dimension(config.intermediate_size), width, batch});
-                Tensor intermediate_flat =
-                    intermediate.view({dimension(config.intermediate_size), columns});
-                project_swiglu(branch.prepared.view({dimension(target.hidden_size), columns}),
-                               layer.mlp.gate_up, intermediate_flat, work, stream);
-                finish_dynamic_branch(state.execution, intermediate, layer.mlp.down,
-                                      *layer.mlp_conv, branch.finish_delta, residual);
-            }
+        };
+        // Two passes: the first replays the block with committed context alone in view and leaves
+        // its rows in the planes; the second admits them causally, so column j sees columns 0..j-1
+        // as the values the pass before computed for them.
+        for (std::int32_t pass = 0; pass < stack_runs; ++pass) { run_stack(pass); }
+        if (std::getenv("NINFER_DFLASH2_BLOCK_PROBE") != nullptr) {
+            probe_block_plane(block_keys.front(), positions, width);
         }
         Tensor hidden = work.alloc(DType::BF16, {dimension(target.hidden_size), mask_columns});
         ops::rmsnorm_pack_tail(residual, weights.final_norm, hidden, stream);

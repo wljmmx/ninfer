@@ -340,40 +340,63 @@ teacher-conditioned comparison needs the draft's training-time conditioning, and
 tensor for it, so it would have to come from the reference implementation, not from another probe. Accepted run length never exceeds one
 token (histogram `0:10, 1:25` over 35 rounds), so `k` currently buys overhead and no extra acceptance.
 
-**Block-causal two-pass (ruled out, measured).** The fix the masked-row mechanism pointed at - let each
-column see the block rows before it instead of the siblings' shared input - was implemented end to end
-and changed no acceptance. The op gained a block tile (`block_key`/`block_value`/`block_width` at
+**Block-causal two-pass (open, probed and inert).** The fix the masked-row record pointed at - let each
+column see the block rows before it instead of its siblings' shared input - is implemented end to end
+and moves nothing. The op gained a block tile (`block_key`/`block_value`/`block_width` at
 `include/ninfer/ops/sliding_window_attention.h`, staged by `context_query_stage_block_tile` in
 `src/ops/softmax_attention/common/context_query.cuh`, consumed as a trailing iteration owned by the
-last split), the query tile was put under the same `key < query` bound, and `draft.cpp` ran the stack
-twice: the first pass with committed context alone in view, the second with the first pass's per-layer
-K/V planes as block rows. A masked row's K/V are the same row for every masked column, because every
-masked column embeds one `mask_token_id` and normalizes it identically (`prepared` 0.4694 for c2..c8),
-so replaying the planes changes nothing: one earlier pass and two earlier passes measure *identically*
-at both widths. `accepted_per_position` on v5_e2, `pp64+tg32 --warmup 1 -r 1 --no-cuda-graph`:
+last split), the query tile was put under the same `key < query` bound, and `draft.cpp` runs the
+stack twice: the first pass with committed context alone in view and leaves its per-layer K/V in the
+planes, the second admits those rows causally.
 
-| draft width | passes | acceptance | accepted per position |
-|---|---:|---:|---|
-| K=4 | 1 (before) | 0.1806 / 1.72 | 8, 4, 1, 0 over 18 rounds |
-| K=4 | 2 | 0.1622 / 1.63 | 8, 4, 0, 0 over 19 rounds |
-| K=4 | 3 | 0.1622 / 1.63 | identical to the two-pass row |
-| K=8 | 1 (before) | 0.0542 / 1.39 | 8, 1, 0, ... over 23 rounds |
-| K=8 | 2 | 0.0563 / 1.41 | 7, 2, 0, ... over 22 rounds |
-| K=8 | 3 | 0.0563 / 1.41 | identical to the two-pass row |
+Three probes (`NINFER_DFLASH2_BLOCK_PROBE`, off by default) settle where the mechanism actually
+stands, on v5_e2 at frontier 64 with `--draft-tokens 8`:
 
-The causal bound itself is not free of effect - it moves the K=4 walk from `8,4,1,0` to `8,4,0,0` - but
-it moves it in both directions (K=8 gains one token at position 1), so the net is a wash while the
-draft costs two full passes. The gates it ran under were unchanged: v5_e2 20.394196, 35B 20.205381.
-The change was reverted; the patch is `H:\TeleAgentWorks\.temp\dflash2_two_pass_block.patch`. Decode
-throughput could not price the extra pass in this session (no-spec decode measured 8.38 tok/s against
-the 24-25 on record, so the box was disk-bound throughout), which is why the revert rests on the
-acceptance, not on the timing.
+- *Staging row*: the block tile stages `block_width` rows, row `r` reads plane column `r` at
+  `positions[r]`. With `block_width=2` it stages `row=0 pos=64 k=[0.37109 0.17090 0.87500 -0.94531]`
+  and `row=1 pos=65 k=[1.51562 1.30469 1.65625 -0.41992]` - the two rows the one-pass run produced for
+  those columns, and different from each other. Not a fixed row.
+- *Plane writes*: after the last pass the plane reads back nine columns at positions `F..F+8`, each
+  with its own K (e.g. cols 0..3 `[-0.09473 0.43750 1.10156 -0.37109]`,
+  `[0.30859 1.07812 1.04688 -0.29883]`, `[0.12793 0.29297 2.31250 0.95312]`,
+  `[-1.61719 -0.32031 1.73438 0.10596]`). The width dimension is written per column, so the columns
+  differ by position and by state, exactly as the design says.
+- *Visible set*: the block-internal key tally per query column is `[0,1,2,3,4,5,6,7,8]` for every
+  pass and every layer - column `j` is offered exactly `j` block keys, never 0 across the board.
+
+So none of the three is broken, and the second pass still buys nothing. `accepted_per_position` on
+v5_e2, `pp64+tg32 --warmup 1 -r 1 --no-cuda-graph` (deterministic; repeats are identical):
+
+| draft width | stack runs | acceptance | accepted per position | decode |
+|---|---:|---:|---|---:|
+| K=4 | 1, no bound (before) | 0.1806 / 1.72 | 8, 4, 1, 0 over 18 rounds | 2.83 |
+| K=4 | 1, causal | 0.1622 / 1.63 | 8, 4, 0, 0 over 19 rounds | 2.29 |
+| K=4 | 2, causal + plane | 0.1622 / 1.63 | identical | 2.45 |
+| K=4 | 3, causal + plane | 0.1622 / 1.63 | identical | 2.62 |
+| K=8 | 1, no bound (before) | 0.0542 / 1.39 | 8, 1, 0, ... over 23 rounds | 2.33 |
+| K=8 | 1, causal | 0.0563 / 1.41 | 7, 2, 0, ... over 22 rounds | 1.92 |
+| K=8 | 2, causal + plane | 0.0563 / 1.41 | identical | 2.06 |
+| K=8 | 3, causal + plane | 0.0563 / 1.41 | identical | 2.04 |
+
+The planes are not a no-op to the last bit - the head's input per column moves in the fourth digit
+(`draft-head-in` c1 3.7007 with one run against 3.7011 with two, c4 3.5734 against 3.5790) because the
+same row arrives from a different tile and the softmax accumulates in a different order - but the keys
+they add are rows the same pass already had, so the acceptance cannot move. The probes also correct
+the earlier reading of this table: what an earlier revision of this entry called "passes" was the
+number of stack runs, and a two-run form is one causal pass plus one replay, not two independent
+estimates.
+
+The gates are unchanged under all of it: v5_e2 20.394196, 35B 20.205381. Decode cannot price the
+extra runs today (no-spec decode 8.38 tok/s against the 24-25 on record, so the box is disk-bound),
+but the runs-vs-runs figures above are same-session and say a replay costs 10% at K=8 for nothing,
+so the next revision should default the stack to a single causal pass (`draft.cpp:495`, `return 2`
+to `return 1`).
 
 What that leaves is the one input the block never has: the token each column *selected*. The planes
 carry the mask row's own state for every column, so conditioning needs the head's output fed back -
-after `ops::candidate_selector_path` (`draft.cpp:566-570`) walk one column per pass, embedding the
+after `ops::candidate_selector_path` (`draft.cpp:657`) walk one column per pass, embedding the
 previous column's `draft_tokens` value in place of the mask id (`prepare_masked_block` at
-`draft.cpp:420`, rows `1..k`), which costs one stack pass per column and is the only remaining
+`draft.cpp:462`, rows `1..k`), which costs one stack pass per column and is the only remaining
 mechanism that can make a column differ from its siblings.
 
 **Layer-major + double-buffered prefill (last resort, measured).** `ExpertStream::ensure` still

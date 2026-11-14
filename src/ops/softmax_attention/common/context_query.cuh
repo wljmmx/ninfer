@@ -120,6 +120,46 @@ context_query_stage_v_tile(__half* dst, const __half* context, const __nv_bfloat
     }
 }
 
+// The block tile holds the pass's own rows in the caller's block layout {head_dim, kv_heads, width,
+// batch}. It is neither the ring (no slot arithmetic) nor the query tile (which is packed by token),
+// so it addresses a row by its explicit stride and takes the batch offset from the caller.
+template <int KeyBlock, int Threads>
+__device__ __forceinline__ void
+context_query_stage_block_tile(__nv_bfloat16* dst, const __nv_bfloat16* block, int valid_rows,
+                               int kv_head, std::int64_t row_stride, int tid) {
+    constexpr int VecsPerRow = kContextQueryHeadDim / 8;
+    const std::int64_t head_base = static_cast<std::int64_t>(kv_head) * kContextQueryHeadDim;
+    for (int chunk = tid; chunk < KeyBlock * VecsPerRow; chunk += Threads) {
+        const int row      = chunk / VecsPerRow;
+        const int d        = (chunk - row * VecsPerRow) * 8;
+        const bool live    = row < valid_rows;
+        const int safe_row = live ? row : 0;
+        const std::int64_t src_index =
+            head_base + d + static_cast<std::int64_t>(safe_row) * row_stride;
+        __nv_bfloat16* smem = &dst[row * kContextQueryHeadDim + context_query_swz(row, d)];
+        cp_async_zfill<16, Cache::cg>(smem, block + src_index, live ? 16 : 0);
+    }
+}
+
+template <int KeyBlock, int Threads>
+__device__ __forceinline__ void
+context_query_stage_block_v_tile(__half* dst, const __nv_bfloat16* block, int valid_rows,
+                                 int kv_head, std::int64_t row_stride, int tid) {
+    constexpr int VecsPerRow = kContextQueryHeadDim / 8;
+    const std::int64_t head_base = static_cast<std::int64_t>(kv_head) * kContextQueryHeadDim;
+    for (int chunk = tid; chunk < KeyBlock * VecsPerRow; chunk += Threads) {
+        const int row      = chunk / VecsPerRow;
+        const int d        = (chunk - row * VecsPerRow) * 8;
+        const bool live    = row < valid_rows;
+        const int safe_row = live ? row : 0;
+        const std::int64_t src_index =
+            head_base + d + static_cast<std::int64_t>(safe_row) * row_stride;
+        const int4 values = live ? bf16x8_bits_to_f16x8_bits(load_vec<int4>(block + src_index))
+                                 : make_int4(0, 0, 0, 0);
+        store_vec(&dst[row * kContextQueryHeadDim + context_query_swz(row, d)], values);
+    }
+}
+
 template <typename ContextPolicy, int Tokens, int WarpsPerCta, int KeyBlock, bool DirectOutput,
           typename Partial>
 __device__ __forceinline__ void context_query_split_partial_body(
@@ -128,7 +168,9 @@ __device__ __forceinline__ void context_query_split_partial_body(
     const __nv_bfloat16* __restrict__ context_k, const __half* __restrict__ context_v,
     ContextPolicy policy, int length, int max_context, int split_capacity, float scale,
     Partial* __restrict__ partial_acc, float* __restrict__ partial_m, float* __restrict__ partial_l,
-    __nv_bfloat16* __restrict__ out) {
+    __nv_bfloat16* __restrict__ out, const __nv_bfloat16* __restrict__ block_k,
+    const __nv_bfloat16* __restrict__ block_v, int block_width, std::int64_t block_row_stride,
+    std::int64_t block_batch_stride, int probe) {
     static_assert(std::is_same_v<Partial, float> || std::is_same_v<Partial, __nv_bfloat16>);
     static_assert(Tokens >= 1 && Tokens <= 16);
     static_assert(WarpsPerCta == (Tokens + 3) / 4);
@@ -176,6 +218,13 @@ __device__ __forceinline__ void context_query_split_partial_body(
         length > max_context || valid < 0 || valid > Tokens) {
         return;
     }
+    // The block tile is the pass's own rows, so only the last split owns it; that keeps its
+    // contribution inside the same partial the query tile already writes.
+    const bool has_block = block_width > 0 && block_k != nullptr;
+    if (has_block) {
+        block_k += block_batch_stride * batch;
+        block_v += block_batch_stride * batch;
+    }
     if (valid == 0) {
         if constexpr (DirectOutput) {
             constexpr int VecsPerKVHead = D * kContextQueryGroup / 8;
@@ -205,7 +254,10 @@ __device__ __forceinline__ void context_query_split_partial_body(
         static_cast<int>((static_cast<std::int64_t>(context_tiles) * (split + 1)) / active_splits);
     const bool owns_query        = split == active_splits - 1;
     const int context_tile_count = tile_end - tile_begin;
-    const int iterations         = context_tile_count + (owns_query ? 1 : 0);
+    const int query_iteration    = context_tile_count;
+    const int block_iteration    = context_tile_count + (owns_query ? 1 : 0);
+    const int iterations =
+        context_tile_count + (owns_query ? 1 : 0) + (owns_query && has_block ? 1 : 0);
 
     policy.template prime<Tokens, KeyBlock>(context_tile_count, context_start, tile_begin, lane);
 
@@ -272,37 +324,91 @@ __device__ __forceinline__ void context_query_split_partial_body(
     const unsigned v_as = static_cast<unsigned>((lane >> 4) << 4);
     const unsigned v_r  = static_cast<unsigned>(b_rin << 4);
 
-    auto tile_metadata = [&](int iteration, bool& is_query, int& key0, int& valid_keys) {
-        is_query = iteration >= context_tile_count;
+    auto tile_metadata = [&](int iteration, bool& is_query, bool& is_block, int& key0,
+                             int& valid_keys) {
+        is_query = owns_query && iteration == query_iteration;
+        is_block = owns_query && has_block && iteration == block_iteration;
         if (is_query) {
             key0       = 0;
             valid_keys = valid;
+        } else if (is_block) {
+            key0       = 0;
+            valid_keys = block_width;
         } else {
             key0       = context_start + (tile_begin + iteration) * KeyBlock;
             valid_keys = min(KeyBlock, length - key0);
         }
     };
     bool current_is_query = false;
+    bool current_is_block = false;
     int current_key0      = 0;
     int current_valid     = 0;
-    tile_metadata(0, current_is_query, current_key0, current_valid);
+    tile_metadata(0, current_is_query, current_is_block, current_key0, current_valid);
     int current_page = 0;
     if constexpr (ContextPolicy::PageMapped) {
-        current_page =
-            current_is_query ? 0 : policy.template page<Tokens>(current_key0, lane, FullMask);
+        current_page = (current_is_query || current_is_block)
+                           ? 0
+                           : policy.template page<Tokens>(current_key0, lane, FullMask);
     }
-    context_query_stage_tile<ContextPolicy, KeyBlock, Threads>(
-        k_s, context_k, query_k, current_key0, current_valid, current_is_query, kv_head,
-        current_page, policy, tid);
+    if (current_is_block) {
+        context_query_stage_block_tile<KeyBlock, Threads>(k_s, block_k, current_valid, kv_head,
+                                                         block_row_stride, tid);
+    } else {
+        context_query_stage_tile<ContextPolicy, KeyBlock, Threads>(
+            k_s, context_k, query_k, current_key0, current_valid, current_is_query, kv_head,
+            current_page, policy, tid);
+    }
     cp_commit();
+
+    // Block-internal key tally for NINFER_DFLASH2_BLOCK_PROBE, one bucket per query column.
+    __shared__ int probe_keys[16];
+    if (probe != 0 && tid == 0) {
+        for (int i = 0; i < 16; ++i) { probe_keys[i] = 0; }
+    }
+    __syncthreads();
 
     for (int iteration = 0; iteration < iterations; ++iteration) {
         cp_wait<0>();
         __syncthreads();
 
-        context_query_stage_v_tile<ContextPolicy, KeyBlock, Threads>(
-            v_s, context_v, query_v, current_key0, current_valid, current_is_query, kv_head,
-            current_page, policy, tid);
+        // NINFER_DFLASH2_BLOCK_PROBE: what this pass's own tiles actually hand the mask. One line
+        // per admitted key row - its plane row, its absolute position and the first four K
+        // components as staged - so a staging or key-position error reads as a number instead of an
+        // acceptance rate. The per-column tally of admitted keys is printed after the loop. Off
+        // unless the launcher was given the switch.
+        if (probe != 0 && tid == 0 && owns_query && (current_is_query || current_is_block) &&
+            kv_head == 0 && batch == 0) {
+            printf("[blk-probe] tile=%s rows=%d block_width=%d\n",
+                   current_is_block ? "block" : "query", current_valid, block_width);
+            for (int row = 0; row < current_valid && row < Tokens; ++row) {
+                printf("[blk-probe]   row=%d pos=%d k=[%.5f %.5f %.5f %.5f]\n", row,
+                       policy.query_position(row),
+                       __bfloat162float(k_s[row * D + context_query_swz(row, 0)]),
+                       __bfloat162float(k_s[row * D + context_query_swz(row, 1)]),
+                       __bfloat162float(k_s[row * D + context_query_swz(row, 2)]),
+                       __bfloat162float(k_s[row * D + context_query_swz(row, 3)]));
+            }
+            for (int token = 0; token < valid && token < Tokens; ++token) {
+                const int query = policy.query_position(token);
+                int keys        = 0;
+                for (int col = 0; col < current_valid; ++col) {
+                    const bool admitted =
+                        policy.allow_context(query, policy.query_position(col)) &&
+                        !(current_is_query && col < block_width);
+                    keys += admitted ? 1 : 0;
+                }
+                probe_keys[token] += keys;
+            }
+        }
+
+        if (current_is_block) {
+            context_query_stage_block_v_tile<KeyBlock, Threads>(v_s, block_v, current_valid, kv_head,
+                                                               block_row_stride, tid);
+        } else {
+            context_query_stage_v_tile<ContextPolicy, KeyBlock, Threads>(
+                v_s, context_v, query_v, current_key0, current_valid, current_is_query, kv_head,
+                current_page, policy, tid);
+        }
         cp_commit();
 
         float score[QKNt][4];
@@ -325,23 +431,42 @@ __device__ __forceinline__ void context_query_split_partial_body(
         __syncthreads();
 
         bool next_is_query = false;
+        bool next_is_block = false;
         int next_key0      = 0;
         int next_valid     = 0;
         int next_page      = 0;
         if (iteration + 1 < iterations) {
-            tile_metadata(iteration + 1, next_is_query, next_key0, next_valid);
+            tile_metadata(iteration + 1, next_is_query, next_is_block, next_key0, next_valid);
             if constexpr (ContextPolicy::PageMapped) {
-                next_page = next_is_query
+                const bool own_tile = next_is_query || next_is_block;
+                next_page = own_tile
                                 ? 0
-                                : (!current_is_query && (next_key0 >> 6) == (current_key0 >> 6)
-                                       ? current_page
-                                       : policy.template page<Tokens>(next_key0, lane, FullMask));
+                                : (current_is_query || current_is_block
+                                       ? policy.template page<Tokens>(next_key0, lane, FullMask)
+                                       : ((next_key0 >> 6) == (current_key0 >> 6)
+                                              ? current_page
+                                              : policy.template page<Tokens>(next_key0, lane,
+                                                                             FullMask)));
             }
-            context_query_stage_tile<ContextPolicy, KeyBlock, Threads>(
-                k_s, context_k, query_k, next_key0, next_valid, next_is_query, kv_head, next_page,
-                policy, tid);
+            if (next_is_block) {
+                context_query_stage_block_tile<KeyBlock, Threads>(k_s, block_k, next_valid, kv_head,
+                                                                 block_row_stride, tid);
+            } else {
+                context_query_stage_tile<ContextPolicy, KeyBlock, Threads>(
+                    k_s, context_k, query_k, next_key0, next_valid, next_is_query, kv_head,
+                    next_page, policy, tid);
+            }
             cp_commit();
         }
+
+        // The pass's own rows (query tile, block tile) carry their own absolute positions; a ring
+        // tile is contiguous from its key0. The query tile still goes through the policy: with no
+        // causal bound the window alone admits every sibling, which is the unconditional allow it
+        // had before, and with one a row sees only the block rows strictly before it.
+        const bool own_tile = current_is_query || current_is_block;
+        // Under a block tile the query tile's leading rows are the same rows the block plane
+        // already supplies, so they are read once, from the plane, and never from here.
+        const int query_first_row = current_is_query ? block_width : 0;
 
         float block_m0 = -CUDART_INF_F;
         float block_m1 = -CUDART_INF_F;
@@ -351,18 +476,18 @@ __device__ __forceinline__ void context_query_split_partial_body(
             const int col1       = col0 + 1;
             const bool row0_live = row0 < RowCount && row0 / kContextQueryGroup < valid;
             const bool row1_live = row1 < RowCount && row1 / kContextQueryGroup < valid;
-            const bool allow00 =
-                row0_live && col0 < current_valid &&
-                (current_is_query || policy.allow_context(q_position0, current_key0 + col0));
-            const bool allow01 =
-                row0_live && col1 < current_valid &&
-                (current_is_query || policy.allow_context(q_position0, current_key0 + col1));
-            const bool allow10 =
-                row1_live && col0 < current_valid &&
-                (current_is_query || policy.allow_context(q_position1, current_key0 + col0));
-            const bool allow11 =
-                row1_live && col1 < current_valid &&
-                (current_is_query || policy.allow_context(q_position1, current_key0 + col1));
+            const int kp00 =
+                own_tile ? policy.query_position(col0 < current_valid ? col0 : 0) : current_key0 + col0;
+            const int kp01 =
+                own_tile ? policy.query_position(col1 < current_valid ? col1 : 0) : current_key0 + col1;
+            const bool allow00 = row0_live && col0 < current_valid && col0 >= query_first_row &&
+                                 policy.allow_context(q_position0, kp00);
+            const bool allow01 = row0_live && col1 < current_valid && col1 >= query_first_row &&
+                                 policy.allow_context(q_position0, kp01);
+            const bool allow10 = row1_live && col0 < current_valid && col0 >= query_first_row &&
+                                 policy.allow_context(q_position1, kp00);
+            const bool allow11 = row1_live && col1 < current_valid && col1 >= query_first_row &&
+                                 policy.allow_context(q_position1, kp01);
             score[nt][0] = allow00 ? score[nt][0] * scale : -CUDART_INF_F;
             score[nt][1] = allow01 ? score[nt][1] * scale : -CUDART_INF_F;
             score[nt][2] = allow10 ? score[nt][2] * scale : -CUDART_INF_F;
@@ -446,9 +571,18 @@ __device__ __forceinline__ void context_query_split_partial_body(
         }
 
         current_is_query = next_is_query;
+        current_is_block = next_is_block;
         current_key0     = next_key0;
         current_valid    = next_valid;
         current_page     = next_page;
+    }
+
+    if (probe != 0 && tid == 0 && owns_query && kv_head == 0 && batch == 0) {
+        printf("[blk-probe] block keys per column: [");
+        for (int t = 0; t < valid && t < Tokens; ++t) {
+            printf("%s%d", t == 0 ? "" : ",", probe_keys[t]);
+        }
+        printf("] width=%d block_width=%d\n", Tokens, block_width);
     }
 
     if constexpr (!DirectOutput) {

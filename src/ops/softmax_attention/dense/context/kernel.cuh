@@ -85,7 +85,8 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void context_attention_split_p
     context_query_split_partial_body<ContextAttentionPolicy, Tokens, WarpsPerCta, KeyBlock,
                                      DirectOutput>(
         q, query_k, query_v, valid_columns, context_k, context_v, policy, context_length[batch],
-        max_context, split_capacity, scale, partial_acc, partial_m, partial_l, out);
+        max_context, split_capacity, scale, partial_acc, partial_m, partial_l, out, nullptr, nullptr,
+        0, 0, 0, 0);
 }
 
 template <int Tokens, int KeyBlock>

@@ -813,6 +813,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 const std::int32_t tokens = width * batch;
                 matrix(layout, DType::BF16, dimension(config.hidden_size), tokens);
                 if (draft->dflash2.has_value()) {
+                    // The block's own K/V planes outlive every pass (one pair per draft layer), so
+                    // they are allocated beside the residual and outside the per-layer scope.
+                    for (std::size_t i = 0; i < parameters.draft->layers.size(); ++i) {
+                        matrix(layout, DType::BF16, dimension(draft->attention.key_width()), tokens);
+                        matrix(layout, DType::BF16, dimension(draft->attention.key_width()), tokens);
+                    }
                     const auto prepare = [&] {
                         (void)workspace::dflash2_branch(layout, config, *draft, width, batch);
                         scratch(layout,

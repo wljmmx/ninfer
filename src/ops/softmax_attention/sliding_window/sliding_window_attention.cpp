@@ -152,6 +152,33 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
     require_contiguous_nonnull(valid_columns, op, "valid columns");
     require_contiguous_nonnull(lanes, op, "lanes");
     require_contiguous_nonnull(out, op, "out");
+    // The block tile is the pass's own rows: the two planes travel together, are read only under
+    // the causal bound, and their live prefix may not exceed the pass's own column count.
+    if (block_key != nullptr || block_value != nullptr) {
+        if (block_key == nullptr || block_value == nullptr) {
+            throw std::invalid_argument(std::string(op) + ": block k and block v are passed together");
+        }
+        if (!block_causal) {
+            throw std::invalid_argument(std::string(op) + ": block k/v are read only under block_causal");
+        }
+        if (block_width < 1 || block_width > tokens) {
+            throw std::invalid_argument(std::string(op) + ": block width must be 1..T");
+        }
+        const auto require_block_plane = [&](const Tensor& plane, const char* name) {
+            if (plane.dtype != DType::BF16) {
+                throw std::invalid_argument(std::string(op) + ": " + name + " must be BF16");
+            }
+            if (plane.ne[0] != kHeadDim || plane.ne[1] != kKVHeads || plane.ne[2] < block_width ||
+                plane.ne[3] != batch) {
+                throw std::invalid_argument(std::string(op) + ": invalid shape for " + name);
+            }
+            require_contiguous_nonnull(plane, op, name);
+        };
+        require_block_plane(*block_key, "block k");
+        require_block_plane(*block_value, "block v");
+    } else if (block_width != 0) {
+        throw std::invalid_argument(std::string(op) + ": block width without block k/v");
+    }
     validate_context(context, window, op);
     if (envelope.min_context > envelope.max_context ||
         envelope.max_context >

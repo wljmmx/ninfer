@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -122,6 +123,16 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
         plan.split_capacity < 1 || plan.split_capacity > kSlidingWindowMaxSplits ||
         (direct && plan.split_capacity != 1))
         throw std::invalid_argument("sliding_window_attention: inconsistent plan");
+    // The block tile addresses a row by its own stride, so its planes may be wider than the live
+    // prefix; only the live rows are staged.
+    const std::int64_t block_row_stride =
+        block_key != nullptr ? block_key->nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16))
+                             : 0;
+    const std::int64_t block_batch_stride =
+        block_key != nullptr ? block_key->nb[3] / static_cast<std::int64_t>(sizeof(__nv_bfloat16))
+                             : 0;
+    // NINFER_DFLASH2_BLOCK_PROBE: read once per launch; the kernel prints the block tile's rows.
+    static const int block_probe = std::getenv("NINFER_DFLASH2_BLOCK_PROBE") != nullptr ? 1 : 0;
     dispatch_tokens(q.ne[2], [&]<int Tokens, int Warps>() {
         constexpr int KeyBlock = 32;
         constexpr std::size_t SmemBytes =
@@ -148,7 +159,7 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
                     block_causal ? 1 : 0,
                     block_key != nullptr ? static_cast<const __nv_bfloat16*>(block_key->data) : nullptr,
                     block_value != nullptr ? static_cast<const __nv_bfloat16*>(block_value->data) : nullptr,
-                    block_width);
+                    block_width, block_row_stride, block_batch_stride, block_probe);
             CUDA_CHECK(cudaGetLastError());
         };
         if (direct) {

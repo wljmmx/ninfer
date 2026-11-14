@@ -48,10 +48,8 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
         float* __restrict__ partial_acc, float* __restrict__ partial_m,
         float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out, int block_causal,
         const __nv_bfloat16* __restrict__ block_k, const __nv_bfloat16* __restrict__ block_v,
-        int block_width) {
-    (void)block_k;
-    (void)block_v;
-    (void)block_width;
+        int block_width, std::int64_t block_row_stride, std::int64_t block_batch_stride,
+        int block_probe) {
     const int batch = static_cast<int>(blockIdx.z);
     const std::int64_t lane_elements =
         static_cast<std::int64_t>(kContextQueryHeadDim) * padded_context * kContextQueryKVHeads;
@@ -68,7 +66,8 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
                                      KeyBlock, DirectOutput>(
         q, query_k, query_v, valid_columns, context_k, context_v, policy,
         DirectOutput && valid_columns[batch] == 0 ? 0 : batch_positions[0], max_context,
-        split_capacity, scale, partial_acc, partial_m, partial_l, out);
+        split_capacity, scale, partial_acc, partial_m, partial_l, out, block_k, block_v,
+        block_width, block_row_stride, block_batch_stride, block_probe);
 }
 
 template <int Tokens, int KeyBlock, int WarpsPerBlock>

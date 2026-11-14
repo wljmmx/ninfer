@@ -64,6 +64,12 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
  * those columns are live. They are read only under `block_causal`, which bounds each query row to
  * the block rows strictly before it; with the default (null pointers, width 0) nothing is read and
  * the result is bit-identical to a pass that never passed them.
+ *
+ * A block plane's row r is the block's own column r, so it is keyed at `positions[r]` and the live
+ * prefix may not exceed the query width. Rows `[0,block_width)` come from the plane, and the query
+ * tile's rows below `block_width` are then not read at all: they are the same rows, and a pass that
+ * supplies them as a block would otherwise see each of them twice. That is what lets a second pass
+ * replay a block whose leading rows the first pass already fixed.
  */
 
 /**
