@@ -55,7 +55,16 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
                               const CyclicKVCacheLayerView& context,
                               SlidingWindowAttentionExecutionEnvelope envelope,
                               WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
-                              bool block_causal = false);
+                              bool block_causal = false, const Tensor* block_key = nullptr,
+                              const Tensor* block_value = nullptr, std::int32_t block_width = 0);
+
+/**
+ * `block_key` / `block_value` name a block's own K and V ({head_dim, kv_heads, width, batch}) that
+ * the pass may attend to in addition to the committed context, and `block_width` is how many of
+ * those columns are live. They are read only under `block_causal`, which bounds each query row to
+ * the block rows strictly before it; with the default (null pointers, width 0) nothing is read and
+ * the result is bit-identical to a pass that never passed them.
+ */
 
 /**
  * `block_causal` bounds visibility by the query's own position (`key < query`). Every pass that only

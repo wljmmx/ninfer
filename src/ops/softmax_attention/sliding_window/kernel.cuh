@@ -46,7 +46,12 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
         const __nv_bfloat16* __restrict__ context_k, const __half* __restrict__ context_v,
         int padded_context, int window_mask, int max_context, int split_capacity, float scale,
         float* __restrict__ partial_acc, float* __restrict__ partial_m,
-        float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out, int block_causal) {
+        float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out, int block_causal,
+        const __nv_bfloat16* __restrict__ block_k, const __nv_bfloat16* __restrict__ block_v,
+        int block_width) {
+    (void)block_k;
+    (void)block_v;
+    (void)block_width;
     const int batch = static_cast<int>(blockIdx.z);
     const std::int64_t lane_elements =
         static_cast<std::int64_t>(kContextQueryHeadDim) * padded_context * kContextQueryKVHeads;

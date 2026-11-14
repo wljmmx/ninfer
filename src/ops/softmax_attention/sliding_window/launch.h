@@ -33,6 +33,9 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
                                      const CyclicKVCacheLayerView& context,
                                      const SlidingWindowAttentionPlan& plan, Tensor& partial_acc,
                                      Tensor& partial_m, Tensor& partial_l, Tensor& out,
-                                     cudaStream_t stream, bool block_causal = false);
+                                     cudaStream_t stream, bool block_causal = false,
+                                     const Tensor* block_key = nullptr,
+                                     const Tensor* block_value = nullptr,
+                                     std::int32_t block_width = 0);
 
 } // namespace ninfer::ops::detail

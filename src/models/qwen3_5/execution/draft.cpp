@@ -475,8 +475,9 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                     // DFlash2 only: the block's rows are [anchor, mask, mask, ...], so a masked row
                     // has to see the rows before it and nothing after it. The bound is inert for a
                     // pass that reads only committed context, which is why the v1 path keeps the
-                    // default below.
-                    /*block_causal=*/true);
+                    // default below. The block's own K/V travel alongside so the pass can read them
+                    // once the tail tile lands; block_width is how many rows are live.
+                    /*block_causal=*/true, &key, &value, width);
                 finish_dynamic_branch(
                     state.execution,
                     attention.view({dimension(config.attention.query_width()), width, batch}),

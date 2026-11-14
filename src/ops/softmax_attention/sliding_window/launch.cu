@@ -112,7 +112,9 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
                                      const CyclicKVCacheLayerView& context,
                                      const SlidingWindowAttentionPlan& plan, Tensor& partial_acc,
                                      Tensor& partial_m, Tensor& partial_l, Tensor& out,
-                                     cudaStream_t stream, bool block_causal) {
+                                     cudaStream_t stream, bool block_causal,
+                                     const Tensor* block_key, const Tensor* block_value,
+                                     std::int32_t block_width) {
     const bool direct = plan.route == SlidingWindowAttentionRoute::Direct;
     if ((plan.window != 2048 && plan.window != 4096) ||
         context.capacity != static_cast<std::uint32_t>(plan.window) ||
@@ -143,7 +145,10 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
                     Direct ? 1 : plan.split_capacity, scale,
                     static_cast<float*>(partial_acc.data), static_cast<float*>(partial_m.data),
                     static_cast<float*>(partial_l.data), static_cast<__nv_bfloat16*>(out.data),
-                    block_causal ? 1 : 0);
+                    block_causal ? 1 : 0,
+                    block_key != nullptr ? static_cast<const __nv_bfloat16*>(block_key->data) : nullptr,
+                    block_value != nullptr ? static_cast<const __nv_bfloat16*>(block_value->data) : nullptr,
+                    block_width);
             CUDA_CHECK(cudaGetLastError());
         };
         if (direct) {
