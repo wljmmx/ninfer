@@ -460,11 +460,10 @@ __device__ __forceinline__ void context_query_split_partial_body(
         }
 
         // The pass's own rows (query tile, block tile) carry their own absolute positions; a ring
-        // tile is contiguous from its key0. Under the block bound the query tile is not a key source
-        // at all - the block reads the committed ring only - so the predicate below is the ring's
-        // alone for it; every other caller keeps the unconditional allow it always had.
+        // tile is contiguous from its key0. The block's own keys are keys to every one of its rows -
+        // the reference's block attention reads "the ring + the block's own keys" and each row sees
+        // every block key - so the query tile bypasses the position bound entirely.
         const bool own_tile = current_is_query || current_is_block;
-        const bool self_is_key = !(current_is_query && !policy.block_rows_are_keys());
 
         float block_m0 = -CUDART_INF_F;
         float block_m1 = -CUDART_INF_F;
@@ -478,14 +477,14 @@ __device__ __forceinline__ void context_query_split_partial_body(
                 own_tile ? policy.query_position(col0 < current_valid ? col0 : 0) : current_key0 + col0;
             const int kp01 =
                 own_tile ? policy.query_position(col1 < current_valid ? col1 : 0) : current_key0 + col1;
-            const bool allow00 = row0_live && self_is_key && col0 < current_valid &&
-                                 policy.allow_context(q_position0, kp00);
-            const bool allow01 = row0_live && self_is_key && col1 < current_valid &&
-                                 policy.allow_context(q_position0, kp01);
-            const bool allow10 = row1_live && self_is_key && col0 < current_valid &&
-                                 policy.allow_context(q_position1, kp00);
-            const bool allow11 = row1_live && self_is_key && col1 < current_valid &&
-                                 policy.allow_context(q_position1, kp01);
+            const bool allow00 = row0_live && col0 < current_valid &&
+                                 (current_is_query || policy.allow_context(q_position0, kp00));
+            const bool allow01 = row0_live && col1 < current_valid &&
+                                 (current_is_query || policy.allow_context(q_position0, kp01));
+            const bool allow10 = row1_live && col0 < current_valid &&
+                                 (current_is_query || policy.allow_context(q_position1, kp00));
+            const bool allow11 = row1_live && col1 < current_valid &&
+                                 (current_is_query || policy.allow_context(q_position1, kp01));
             score[nt][0] = allow00 ? score[nt][0] * scale : -CUDART_INF_F;
             score[nt][1] = allow01 ? score[nt][1] * scale : -CUDART_INF_F;
             score[nt][2] = allow10 ? score[nt][2] * scale : -CUDART_INF_F;

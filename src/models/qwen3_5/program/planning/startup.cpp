@@ -1177,6 +1177,31 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
 
 } // namespace
 
+// The DFlash2 artifact's block is eight rows (anchor plus seven masks). A draft window past seven
+// asks for a column the block was never trained on, and it measured worse: eight draft tokens gave
+// acceptance 0.0400 with 6 and 1 accepted at positions 0 and 1, seven gave 0.0968 with 8 and 4. The
+// window is clamped here because every ingress shape below - the block width, the live column count
+// and the verified extent - derives from this one number.
+constexpr std::uint32_t kDFlash2MaximumDraftTokens = 7;
+
+std::uint32_t clamped_draft_window(const execution::Parameters& parameters,
+                                   const EngineOptions& options) {
+    const std::uint32_t requested = options.speculative.draft_tokens;
+    if (options.speculative.backend != SpeculativeBackend::DFlash2 ||
+        requested <= kDFlash2MaximumDraftTokens) {
+        return requested;
+    }
+    static const bool told = [] {
+        std::fprintf(stderr,
+                     "[dflash2] the block is eight rows: draft window clamped to %u draft tokens\n",
+                     kDFlash2MaximumDraftTokens);
+        std::fflush(stderr);
+        return true;
+    }();
+    (void)told;
+    return kDFlash2MaximumDraftTokens;
+}
+
 std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
 make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContext& device,
                            const EngineOptions& options) {
@@ -1218,7 +1243,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .capacity             = options.max_context,
         .max_concurrency      = options.max_concurrency,
         .prefill_chunk        = std::min(options.prefill_chunk, options.max_context),
-        .draft_window         = options.speculative.draft_tokens,
+        .draft_window         = clamped_draft_window(parameters, options),
         .speculative_backend  = options.speculative.backend,
         .kv_storage           = options.kv_cache,
         .proposal_head        = options.speculative.proposal_head,

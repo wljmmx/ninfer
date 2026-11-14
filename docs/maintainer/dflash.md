@@ -426,33 +426,41 @@ previous column's `draft_tokens` value in place of the mask id (`prepare_masked_
 `draft.cpp:572`, rows `1..k`), which costs one stack pass per column and is the only remaining
 mechanism that can make a column differ from its siblings.
 
-**Ring-only block visibility (implemented) and the two-tap conv (probed).** The reference's block
-reads the committed ring alone: no block row is a key, so no masked column sees the anchor or its
-siblings. That is now what the op does when `block_causal` is set - the query tile contributes no keys
-(`context_query.cuh:467`, `self_is_key`, with `block_rows_are_keys()` on both policies, `true` for the
-dense context policy so nothing else moves) - and the draft runs a single pass by default again
-(`draft.cpp:584`), with the planes allocated only for the diagnostic replay. Measured on v5_e2,
-`pp64+tg32 --warmup 1 -r 1 --no-cuda-graph`:
+**Block visibility: the reference keeps the block's own keys (corrected here).** The tree's ring-only
+form was a misreading of a paraphrase. The reference file says the opposite in two places:
+`core/dflash2.hpp:10` reads "attention over the ring + the block's own keys", and
+`kernels/dflash2.hpp:43-45` spells the mask out - "Row i at position s + i sees context position j when
+s + i - j < window ... and every block key". The block's keys stay outside the ring (so a rejected
+draft leaves nothing to roll back, `core/dflash2.hpp:14-15`), but every block row sees all of them,
+including itself and the rows after it. That is what the op does again: the query tile bypasses the
+position bound (`context_query.cuh:466,481-487`), and `block_causal` is back to bounding context keys
+only. Measured on v5_e2, `pp64+tg32 --warmup 1 -r 1 --no-cuda-graph`, accepted_per_position:
 
-| draft width | visibility | acceptance | accepted per position | decode |
+| draft width | block keys | acceptance | accepted per position | decode |
 |---|---|---:|---|---:|
-| K=4 | siblings visible (before) | 0.1806 / 1.72 | 8, 4, 1, 0 over 18 rounds | 2.83 |
-| K=4 | causal (previous round) | 0.1622 / 1.63 | 8, 4, 0, 0 over 19 rounds | 2.29 |
-| K=4 | ring only (now) | 0.1644 / 1.63 | 8, 4, 0, 0 over 19 rounds | 2.46 |
-| K=8 | siblings visible (before) | 0.0542 / 1.39 | 8, 1, 0, ... over 23 rounds | 2.33 |
-| K=8 | causal (previous round) | 0.0563 / 1.41 | 7, 2, 0, ... over 22 rounds | 1.92 |
-| K=8 | ring only (now) | 0.0400 / 1.29 | 6, 1, 0, ... over 24 rounds | 1.88 |
+| K=4 | visible (reference, now) | 0.1806 / 1.72 | 8, 4, 1, 0 over 18 rounds | 2.81 |
+| K=4 | causal (two rounds ago) | 0.1622 / 1.63 | 8, 4, 0, 0 over 19 rounds | 2.29 |
+| K=4 | ring only (previous round) | 0.1644 / 1.63 | 8, 4, 0, 0 over 19 rounds | 2.46 |
+| K=7 | visible (reference, now) | 0.1217 / 1.82 | 9, 4, 1, 0, ... over 17 rounds | 1.84 |
+| K=7 | ring only (previous round) | 0.0968 / 1.63 | 8, 4, 0, 0, ... over 19 rounds | 1.91 |
+| K=8 (clamped to 7) | visible | 0.0968 / 1.63 | 8, 4, 0, ... over 19 rounds | 1.71 |
 
-Column 1 stays at one acceptance in 24 rounds at K=8 and two in 19 at K=4, so the key set was not
-the cause either: the columns are still one content in seven rotations, and the reference's own block
-has the same property.
+The clamp is the reference's own shape: `core/dflash2.hpp:39-40` fixes the block at `kRows = 8` and
+`kDrafts = kRows - 1 = 7`, and `kernels/dflash2.hpp:14,19` sizes the attention ring for 8 block keys,
+so a ninth column cannot exist. `draft_cap.hpp:21-25` caps the *verify window* per card class (0 on a
+4090, "--spec as given"), which is a different number from the block's row count. Any request wider
+than seven is clamped at plan time (`startup.cpp:1185-1203`, used at `:1246`) with one line on stderr.
 
-Width matters more than visibility does. The reference block is eight rows (anchor plus seven masks),
-while `--draft-tokens 8` asks for nine columns, so its last column sits outside the block the draft
-was trained on. At the trained width - `--draft-tokens 7`, eight columns - the same build measures
-acceptance 0.0968 with `[8,4,0,0,0,0,0]` over 19 rounds at decode 1.91, against 0.0400 with
-`[6,1,0,...]` at `--draft-tokens 8`. Column 1 is accepted four times of nineteen there, the same walk
-`--draft-tokens 4` takes, so a shipped width should not exceed the block the model was built for.
+Width and the block's keys together are what moved column 2: at `--draft-tokens 7` with the block's
+keys visible, the walk is `[9,4,1,0,0,0,0]` over 17 rounds - column 2 accepts for the first time in
+any configuration measured so far, against 0 in every ring-only or causal run.
+
+Feeding each column its predecessor's *selected* token into the block input was tried and is worse:
+at K=7 the walk went from `[8,4,0,...]` / 0.0968 to `[10,1,0,...]` / 0.0840, and at K=4 from
+`[8,4,0,0]` / 0.1644 to `[10,1,0,0]` / 0.1410. The reference does condition per column, but through
+the selector walk (`kernels/dflash2.hpp:96-102`, `df2_select`: unary plus a bilinear score between
+the previous pick and each candidate), not through the model input, and the mask rows keep the mask
+embedding. The experiment was removed.
 
 The dynamic convolution is the last piece of the layer the block rows could differ through, and it is
 correct. `NINFER_DFLASH2_CONV_PROBE` (`draft.cpp:468`) prints the Op's input and output per column for
@@ -464,17 +472,23 @@ consumes the anchor's normalized input through the second tap - the only column 
 columns 2..8 consume the masked row before them, which is the same row they are. That is exactly the
 Op's documented form, `(base[h,0,s]+d[0,s])*n[h,i] + I(i>0)*(base[h,1,s]+d[1,s])*n[h,i-1]`.
 
-The one divergence left in the conv is row 0, which has no previous tap at all while the reference
-fills an accepted row's taps after the verify window. It is unobservable here: row 0's output is not
-in the head's input (`rmsnorm_pack_tail` takes columns 1..k, `draft.cpp:590`) and, under ring-only
-visibility, it is not a key either - only its *input* matters, as column 1's second tap.
+The convolution matches the reference exactly, including row 0: `kernels/dflash2.hpp:24-25` defines
+`out[b][c] = sum_{o < 2, b - o >= 0} (base[o][c] + dyn[...]) * x[(b - o) * H + c]`, so row 0 also has
+a single tap there, and the reference's remark about an accepted row's taps arriving after the verify
+window (`core/dflash2.hpp:14`) is about the ring's rows being written late, not about the block's
+formula. The same line is what our Op documents as `I(i>0)`.
 
-Checked against the quoted reference, the rest of the draft layer matches: one shared mask token for
+Checked against the reference file, the rest of the draft layer matches: one shared mask token for
 every masked row (`prepare_masked_block`, `draft.cpp:572`), norm then two-tap conv then q/k/v then q/k
-norm and RoPE (one call, `draft.cpp:537`), attention over the ring only, and a head that reads the
-masked columns alone. The verify window is unchanged by any of this: it still routes the target over
-`[anchor, d1..dk]` per token, so its expert union is a property of the draft's width, not of the
-draft's attention.
+norm and rope (one call, `draft.cpp:652`), attention over the ring plus the block's own keys, and a
+head that reads the masked columns alone (`kernels/dflash2.hpp:12`: "final norm -> head over the draft
+vocabulary (rows 1..7) -> top-16 -> walk"). What is still different is on the verify side, not the
+draft layer: the reference accepts a draft only when it equals the target's pick from the *same*
+uniform draw (`coupled_draft.hpp:3-12`, `STRATA_SPEC_COUPLED`), while this tree compares against the
+target's argmax; under greedy the two agree (`verify.hpp:8`: "a draft is accepted exactly when greedy
+decode would have produced it"), so the difference only bites when sampling. The reference also stages
+`set_spec_proposal` for that path (`verify.hpp:184`). `draft_cap.hpp`'s per-card cap is a verify-window
+recommendation, not a block shape, and is 0 on this card.
 
 **Layer-major + double-buffered prefill (last resort, measured).** `ExpertStream::ensure` still
 publishes and waits inside the layer, one staging ring of 32 slots, so the PCIe traffic a prefill

@@ -69,12 +69,11 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
  */
 
 /**
- * `block_causal` makes the pass read the committed context only: the pass's own rows are not keys at
- * all, and a context key is visible when it sits strictly before the query. Every other pass keeps
- * the unconditional allow it always had, and a pass that reads only committed context also keeps its
- * exact result, because such keys always sit before the query. It exists for the draft block, whose
- * rows are [anchor, mask, ...]: there the ring holds committed rows only, so no block row sees the
- * anchor or its siblings, and the columns differ by their own positions rather than by each other.
+ * `block_causal` bounds a *context* key by the query's own position (`key < query`). The pass's own
+ * rows are outside that bound: they are keys to every one of the pass's rows, as the reference's
+ * block attention reads "the ring + the block's own keys" and each row sees every block key. Every
+ * pass that only reads committed context keeps its exact result either way, because such keys always
+ * sit before the query.
  */
 
 /**

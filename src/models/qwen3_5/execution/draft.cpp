@@ -747,38 +747,45 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                                     static_cast<std::int32_t>(hidden.nb[1]), mask_columns, 0, stream);
             }
         }
-        Tensor candidates = frame.candidate_ids.slice(2, 0, batch);
-        Tensor ids_flat =
-            candidates.view({dimension(config.dflash2->selector_top_k), mask_columns});
-        Tensor scores =
-            work.alloc(DType::FP32, {dimension(config.dflash2->selector_top_k), mask_columns});
-        if (state.execution.proposal_head == ProposalHead::Full) {
-            ops::linear_topk(
-                hidden, state.execution.parameters.draft->output_head.weight,
-                dimension(state.execution.parameters.model.resources().public_token_count),
-                ids_flat, scores, work, stream);
-        } else {
-            const auto& head = *state.execution.parameters.proposal;
-            if (head.token_ids) {
-                ops::linear_topk(hidden, head.head.weight, *head.token_ids, ids_flat, scores, work,
-                                 stream);
-            } else {
+        // The head, and the selector walk that turns its top-k into one token per column. Each run
+        // owns its own scratch so the block can be replayed after the walk without the two peaks
+        // overlapping in the arena.
+        const auto run_head = [&] {
+            auto scope        = work.scope();
+            Tensor candidates = frame.candidate_ids.slice(2, 0, batch);
+            Tensor ids_flat =
+                candidates.view({dimension(config.dflash2->selector_top_k), mask_columns});
+            Tensor scores =
+                work.alloc(DType::FP32, {dimension(config.dflash2->selector_top_k), mask_columns});
+            if (state.execution.proposal_head == ProposalHead::Full) {
                 ops::linear_topk(
-                    hidden, head.head.weight,
+                    hidden, state.execution.parameters.draft->output_head.weight,
                     dimension(state.execution.parameters.model.resources().public_token_count),
                     ids_flat, scores, work, stream);
+            } else {
+                const auto& head = *state.execution.parameters.proposal;
+                if (head.token_ids) {
+                    ops::linear_topk(hidden, head.head.weight, *head.token_ids, ids_flat, scores,
+                                     work, stream);
+                } else {
+                    ops::linear_topk(
+                        hidden, head.head.weight,
+                        dimension(state.execution.parameters.model.resources().public_token_count),
+                        ids_flat, scores, work, stream);
+                }
             }
-        }
-        Tensor projected =
-            work.alloc(DType::BF16, {dimension(config.dflash2->selector_rank), mask_columns});
-        project(hidden, weights.selector->hidden_projection, projected, work, stream);
-        Tensor drafts     = frame.draft_tokens.slice(1, 0, batch);
-        Tensor proposal_q = frame.proposal_q.slice(2, 0, batch);
-        ops::candidate_selector_path(
-            candidates, scores.view({dimension(config.dflash2->selector_top_k), k, batch}),
-            projected.view({dimension(config.dflash2->selector_rank), k, batch}), anchors,
-            weights.selector->predecessor_codebook, weights.selector->successor_codebook, frontiers,
-            frame.sampling, drafts, proposal_q, work, stream);
+            Tensor projected =
+                work.alloc(DType::BF16, {dimension(config.dflash2->selector_rank), mask_columns});
+            project(hidden, weights.selector->hidden_projection, projected, work, stream);
+            Tensor drafts     = frame.draft_tokens.slice(1, 0, batch);
+            Tensor proposal_q = frame.proposal_q.slice(2, 0, batch);
+            ops::candidate_selector_path(
+                candidates, scores.view({dimension(config.dflash2->selector_top_k), k, batch}),
+                projected.view({dimension(config.dflash2->selector_rank), k, batch}), anchors,
+                weights.selector->predecessor_codebook, weights.selector->successor_codebook,
+                frontiers, frame.sampling, drafts, proposal_q, work, stream);
+        };
+        run_head();
         work.reset();
     }
 }
