@@ -133,7 +133,10 @@ void TextContext::qsa_mix(const BlockParameters& w, Tensor& x, int fidx, Phase, 
         active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
     const Tensor& rope_source =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
-    Tensor positions = active_sequence_batch_ != 0 ? cache_positions : cache_positions.view({T, 1});
+    // The Op family names a pass as a [tokens, rows] rectangle, so a bound batch is that rectangle
+    // rather than the row vector a single-lane pass passes through.
+    Tensor positions = active_sequence_batch_ != 0 ? cache_positions.view({width, batch})
+                                                   : cache_positions.view({T, 1});
     Tensor rope;
     if (active_sequence_batch_ != 0) {
         rope = width == 1 ? rope_source.view({1, 1, batch})
@@ -173,11 +176,11 @@ void TextContext::qsa_mix(const BlockParameters& w, Tensor& x, int fidx, Phase, 
     nan_probe_tensor("qsa-proj-q", q_flat, 100 + std::size_t(fidx), s);
 
     ops::QsaProjectionView projected{
-        q_flat.view({head_dim, query_hd, T, batch}),
-        k_flat.view({head_dim, kv_heads, T, batch}),
-        v_flat.view({head_dim, kv_heads, T, batch}),
-        qsa.index_query.view({index_hd, 4, T, batch}),
-        qsa.index_key.view({index_hd, T, batch}),
+        q_flat.view({head_dim, query_hd, width, batch}),
+        k_flat.view({head_dim, kv_heads, width, batch}),
+        v_flat.view({head_dim, kv_heads, width, batch}),
+        qsa.index_query.view({index_hd, 4, width, batch}),
+        qsa.index_key.view({index_hd, width, batch}),
     };
     const ops::QsaBatchView batch_view{positions, valid_columns, kv_table_rows};
     // Two norms of 256 for the mixer's heads and two of 128 for the indexer's, all unit-offset.
@@ -194,8 +197,8 @@ void TextContext::qsa_mix(const BlockParameters& w, Tensor& x, int fidx, Phase, 
     };
     const ops::QsaCacheView cache{main_cache, index_cache};
     const ops::QsaRawRecordWriteView records{
-        qsa.record_keys.view({index_hd, T, batch}),
-        qsa.record_rope.view({3, T, batch}),
+        qsa.record_keys.view({index_hd, width, batch}),
+        qsa.record_rope.view({3, width, batch}),
         *active_qsa_offsets_,
     };
     const ops::QsaTailStateView before = qsa_tail_view(fidx, source_slots);
@@ -222,7 +225,7 @@ void TextContext::qsa_mix(const BlockParameters& w, Tensor& x, int fidx, Phase, 
     const auto visible =
         std::min<std::uint32_t>(batch_text_kv_->max_context(), 262144U);
     if (visible == 0) { throw std::logic_error("QSA envelope needs a resolved cache capacity"); }
-    Tensor attention   = qsa.attention.view({head_dim, query_hd, T, batch});
+    Tensor attention   = qsa.attention.view({head_dim, query_hd, width, batch});
     // The read-only dense Op takes one execution row's own table, which only a single-lane pass
     // carries; a batch traversal binds its tables through `batch_text_kv_` instead, so it stays on
     // the sparse arm even under the switch.
@@ -255,15 +258,15 @@ void TextContext::qsa_mix(const BlockParameters& w, Tensor& x, int fidx, Phase, 
                                                                 config_.indexer->selection_blocks()};
         const ops::QsaSparseGqaExecutionEnvelope gqa_envelope{visible};
         ops::QsaBlockSelection selected{
-            qsa.block_ids.view({selection_blocks, T, batch}),
-            qsa.block_counts.view({T, batch}),
+            qsa.block_ids.view({selection_blocks, width, batch}),
+            qsa.block_counts.view({width, batch}),
         };
         ops::qsa_indexer(prepared_index_query, index_cache, batch_view, indexer_envelope, work_,
                          selected, execution);
         qsa_mark(s, "indexer", fidx);
         // The sparse Op applies the output gate itself, so its output is already the gated
         // attention result the dense arm computes with sigmoid_mul.
-        ops::qsa_sparse_gqa(prepared_query, gate_flat.view({head_dim, query_hd, T, batch}),
+        ops::qsa_sparse_gqa(prepared_query, gate_flat.view({head_dim, query_hd, width, batch}),
                             main_cache, batch_view, selected, gqa_envelope, work_, attention,
                             execution);
         qsa_mark(s, "sparse_gqa", fidx);
