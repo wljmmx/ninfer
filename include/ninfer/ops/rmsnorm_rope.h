@@ -16,9 +16,12 @@ namespace ninfer::ops {
  *
  *   inv       = 1 / sqrt(sum_d x[d]^2 / 128 + 1e-6)
  *   n[d]      = x[d] * inv * norm_weight[d]
- *   angle(i)  = position * (1e7)^(-2*i/128), 0<=i<64
+ *   angle(i)  = position * (rope_theta)^(-2*i/128), 0<=i<64
  *   out[i]    = n[i]    * cos(angle(i)) - n[i+64] * sin(angle(i))
  *   out[i+64] = n[i+64] * cos(angle(i)) + n[i]    * sin(angle(i)).
+ *
+ * rope_theta is the model's base frequency (positive and finite); the tabulated 1e7 coefficients
+ * are reused exactly when it is 1e7, so models on that base keep their bitwise rounding path.
  *
  * Normalization and rotation form one semantic operation: there is no observable BF16
  * materialization of n. q and k are completely overwritten in place and must not overlap each
@@ -30,14 +33,14 @@ namespace ninfer::ops {
  * owns no workspace or persistent state.
  */
 void rmsnorm_rope(const Tensor& positions, const Tensor& q_norm_weight, const Tensor& k_norm_weight,
-                  Tensor& q, Tensor& k, cudaStream_t stream);
+                  Tensor& q, Tensor& k, float rope_theta, cudaStream_t stream);
 
 /**
  * Single-K form of the same formula and effects. x is BF16 [128,8,T], norm_weight is BF16 [128],
  * and positions is I32 [T], with T=1..2048. x is completely overwritten in place and must not
  * overlap either read-only input.
  */
-void rmsnorm_rope(const Tensor& positions, const Tensor& norm_weight, Tensor& x,
+void rmsnorm_rope(const Tensor& positions, const Tensor& norm_weight, Tensor& x, float rope_theta,
                   cudaStream_t stream);
 
 /**

@@ -11,7 +11,7 @@ template <bool Pair>
 __global__ __launch_bounds__(256) void rmsnorm_rope_d128_kernel(
     const std::int32_t* __restrict__ positions, const __nv_bfloat16* __restrict__ q_norm,
     const __nv_bfloat16* __restrict__ k_norm, __nv_bfloat16* __restrict__ q,
-    __nv_bfloat16* __restrict__ k) {
+    __nv_bfloat16* __restrict__ k, float rope_theta) {
     constexpr int kPairs = 64;
     const int token      = blockIdx.x;
     const bool query     = Pair && blockIdx.y < 4;
@@ -25,7 +25,8 @@ __global__ __launch_bounds__(256) void rmsnorm_rope_d128_kernel(
     __shared__ __nv_bfloat162 weight_cache[kPairs];
     if (threadIdx.x < kPairs) {
         const int pair = threadIdx.x;
-        dflash_rope_sincos(positions, token, pair, &sin_cache[pair], &cos_cache[pair]);
+        dflash_rope_sincos(positions, token, pair, rope_theta, &sin_cache[pair],
+                           &cos_cache[pair]);
         weight_cache[pair] = weight[pair];
     }
     __syncthreads();

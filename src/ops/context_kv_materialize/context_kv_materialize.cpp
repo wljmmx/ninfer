@@ -14,13 +14,19 @@
 namespace ninfer::ops {
 namespace {
 
-constexpr std::int32_t kHidden     = 5120;
+constexpr std::int32_t kMaxHidden = 5120;
 constexpr std::int32_t kKVSize     = 1024;
 constexpr std::int32_t kHeadDim    = 128;
 constexpr std::int32_t kKVHeads    = 8;
 constexpr std::int32_t kCapacity   = 2048;
 constexpr std::int32_t kBlockWidth = 16;
 constexpr const char* kOp          = "context_kv_materialize";
+
+// The draft width is a per-checkpoint geometry with a compiled instance behind it, not a model
+// identity: the 35B draft projects from 5120 and the Qwen3.8-Flash-Next draft from 2560.
+constexpr bool input_rows_supported(std::int32_t rows) {
+    return rows == 2560 || rows == kMaxHidden;
+}
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
@@ -34,18 +40,18 @@ void require_tensor(const Tensor& tensor, DType dtype, std::int32_t n0, std::int
     }
 }
 
-void require_weight(const Weight& weight, const char* name) {
-    constexpr std::uint64_t kCodeBytes =
-        static_cast<std::uint64_t>(kKVSize) * static_cast<std::uint64_t>(kHidden);
-    constexpr std::uint64_t kScaleBytes =
-        static_cast<std::uint64_t>(kKVSize) * static_cast<std::uint64_t>(kHidden / 32) * 2U;
+void require_weight(const Weight& weight, std::int32_t hidden, const char* name) {
+    const std::uint64_t code_bytes =
+        static_cast<std::uint64_t>(kKVSize) * static_cast<std::uint64_t>(hidden);
+    const std::uint64_t scale_bytes =
+        static_cast<std::uint64_t>(kKVSize) * static_cast<std::uint64_t>(hidden / 32) * 2U;
     if (weight.qtype != QType::Q8_G32_FP16 || weight.layout != QuantLayout::RowSplit ||
         weight.scale_dtype != DType::FP16 || weight.group != 32 || weight.group_size != 32 ||
-        weight.ndim != 2 || weight.n != kKVSize || weight.k != kHidden ||
-        weight.shape[0] != kKVSize || weight.shape[1] != kHidden ||
-        weight.padded_shape[0] != kKVSize || weight.padded_shape[1] != kHidden ||
+        weight.ndim != 2 || weight.n != kKVSize || weight.k != hidden ||
+        weight.shape[0] != kKVSize || weight.shape[1] != hidden ||
+        weight.padded_shape[0] != kKVSize || weight.padded_shape[1] != hidden ||
         weight.qhigh != nullptr || weight.high_plane_bytes != 0 ||
-        weight.payload_bytes < kCodeBytes + kScaleBytes || !aligned_to(weight.qdata, 16) ||
+        weight.payload_bytes < code_bytes + scale_bytes || !aligned_to(weight.qdata, 16) ||
         !aligned_to(weight.scales, 4)) {
         throw std::invalid_argument(std::string(kOp) + ": invalid " + name);
     }
@@ -120,12 +126,19 @@ std::size_t context_kv_materialize_workspace_capacity_bytes(std::int32_t batch_s
 void context_kv_materialize(
     const Tensor& context, const Tensor& positions, const Tensor& counts, const Tensor& state_slots,
     const std::array<ContextKVMaterializeLayerView, kContextKVMaterializeLayers>& layers,
-    ContextKVMaterializeExecutionEnvelope envelope, WorkspaceArena& workspace,
+    ContextKVMaterializeExecutionEnvelope envelope, float rope_theta, WorkspaceArena& workspace,
     cudaStream_t stream) {
     const std::int32_t width = context.ne[1];
     const std::int32_t batch = context.ne[2];
+    const std::int32_t hidden = layers.front().key_weight.k;
     require_profile(width, batch);
-    require_tensor(context, DType::BF16, kHidden, width, batch, 1, 16, "context");
+    if (!input_rows_supported(hidden) || context.ne[0] != hidden) {
+        throw std::invalid_argument("context_kv_materialize: unsupported context width");
+    }
+    if (!(rope_theta > 0.0F)) {
+        throw std::invalid_argument("context_kv_materialize: invalid rope theta");
+    }
+    require_tensor(context, DType::BF16, hidden, width, batch, 1, 16, "context");
     require_tensor(positions, DType::I32, width, batch, 1, 1, alignof(std::int32_t), "positions");
     require_tensor(counts, DType::I32, batch, 1, 1, 1, alignof(std::int32_t), "counts");
     require_tensor(state_slots, DType::I32, batch, 1, 1, 1, alignof(std::int32_t), "state slots");
@@ -143,8 +156,8 @@ void context_kv_materialize(
     const std::int32_t lane_capacity = layers.front().cache.lane_capacity;
     for (std::size_t index = 0; index < layers.size(); ++index) {
         const ContextKVMaterializeLayerView& layer = layers[index];
-        require_weight(layer.key_weight, "key weight");
-        require_weight(layer.value_weight, "value weight");
+        require_weight(layer.key_weight, hidden, "key weight");
+        require_weight(layer.value_weight, hidden, "value weight");
         require_tensor(layer.key_norm_weight, DType::BF16, kHeadDim, 1, 1, 1, 4, "key norm weight");
         validate_cache(layer.cache, padded, lane_capacity);
     }
@@ -157,7 +170,7 @@ void context_kv_materialize(
     if (detail::context_kv_materialize_uses_scratch(route))
         key_scratch = allocate_key_scratch(workspace, columns);
     detail::context_kv_materialize_launch(context, positions, counts, state_slots, layers, envelope,
-                                          route, key_scratch, stream);
+                                          rope_theta, route, key_scratch, stream);
 }
 
 } // namespace ninfer::ops

@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/graph_execution.h"
 #include "models/qwen3_5/execution/linear.h"
 #include <cmath>
+#include <string>
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/execution_context.h"
 #include "models/qwen3_5/execution/workspace.h"
@@ -254,11 +255,32 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
 
         if (config.dflash2) {
             std::array<ops::ContextKVMaterializeLayerView, ops::kContextKVMaterializeLayers> layers;
+            // The fused path is a geometry contract, not a model identity: five fully local
+            // layers, the D128/H8 context head, a Q8 kernel projection at the target width, and
+            // the eps the fused norm uses. The RoPE base is an argument, so drafts whose config
+            // carries another base still take this path.
+            const auto& head = state.execution.parameters.draft->layers.front().context_key.weight;
             if (config.num_hidden_layers != layers.size() ||
                 config.local_layer_count() != layers.size() || config.rms_norm_eps != 1e-6F ||
-                config.rope_theta != 1e7F) {
-                throw std::invalid_argument(
-                    "masked draft context: config is outside the fused materialization contract");
+                dimension(config.attention.key_width()) != 1024 ||
+                dimension(config.attention.num_key_value_heads) != 8 ||
+                dimension(config.attention.head_dim) != 128 ||
+                head.qtype != QType::Q8_G32_FP16 || head.k != dimension(target.hidden_size)) {
+                const std::string text =
+                    std::string("masked draft context: config is outside the fused materialization"
+                                " contract (layers=") +
+                    std::to_string(dimension(config.num_hidden_layers)) +
+                    " local=" + std::to_string(dimension(config.local_layer_count())) +
+                    " fused=" + std::to_string(layers.size()) +
+                    " eps=" + std::to_string(static_cast<double>(config.rms_norm_eps)) +
+                    " theta=" + std::to_string(static_cast<double>(config.rope_theta)) +
+                    " hidden=" + std::to_string(dimension(target.hidden_size)) +
+                    " kv_size=" + std::to_string(dimension(config.attention.key_width())) +
+                    " kv_heads=" + std::to_string(dimension(config.attention.num_key_value_heads)) +
+                    " head_dim=" + std::to_string(dimension(config.attention.head_dim)) +
+                    " context_key_qtype=" + std::to_string(static_cast<int>(head.qtype)) +
+                    " context_key_k=" + std::to_string(head.k);
+                throw std::invalid_argument(text);
             }
             for (int layer = 0; layer < dimension(config.num_hidden_layers); ++layer) {
                 const auto& weights = state.execution.parameters.draft->layers[layer];
@@ -270,7 +292,7 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
             ops::context_kv_materialize(
                 context.view({dimension(target.hidden_size), local_width, batch}), local_positions,
                 local_counts, lanes, layers, {local_envelope.min_count, local_envelope.max_count},
-                state.execution.work, state.execution.device.stream);
+                config.rope_theta, state.execution.work, state.execution.device.stream);
             timing.mark(AppendTiming::kContextMaterialize);
         } else {
             for (int layer = 0; layer < dimension(config.num_hidden_layers); ++layer) {
@@ -368,9 +390,9 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
     if (state.execution.parameters.model.config().draft->dflash2) {
         const auto& target = state.execution.parameters.model.config().text;
         const auto& config = *state.execution.parameters.model.config().draft;
-        if (config.rms_norm_eps != 1e-6F || config.rope_theta != 1e7F) {
+        if (config.rms_norm_eps != 1e-6F) {
             throw std::invalid_argument(
-                "DFlash2: fused norm/RoPE requires epsilon=1e-6 and theta=1e7");
+                "DFlash2: fused norm/RoPE requires epsilon=1e-6");
         }
 
         const int width                = k + 1;
@@ -417,7 +439,8 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                 ops::attn_input_proj(branch.prepared.view({dimension(target.hidden_size), columns}),
                                      layer.query_key_value.weight, query_flat, key_flat, value_flat,
                                      stream);
-                ops::rmsnorm_rope(positions, layer.query_norm, layer.key_norm, query, key, stream);
+                ops::rmsnorm_rope(positions, layer.query_norm, layer.key_norm, query, key,
+                                  config.rope_theta, stream);
                 Tensor attention = work.alloc(
                     DType::BF16, {dimension(config.attention.head_dim),
                                   dimension(config.attention.num_attention_heads), width, batch});

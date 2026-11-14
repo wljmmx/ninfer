@@ -18,6 +18,7 @@ enum class HeadProfile : std::uint8_t {
     Q8Full,
     Fp8Full,
     Q4Optimized,
+    Q5Full,
 };
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
@@ -35,9 +36,22 @@ bool overlaps(const Tensor& lhs, const Tensor& rhs) {
     return overlaps(lhs.data, lhs.bytes(), rhs.data, rhs.bytes());
 }
 
+std::string profile_text(QType qtype, std::int32_t head_rows, std::int32_t input_rows) {
+    return std::string(" (qtype=") + std::to_string(static_cast<int>(qtype)) +
+           " head_rows=" + std::to_string(head_rows) +
+           " input_rows=" + std::to_string(input_rows) + ")";
+}
+
 HeadProfile resolve_profile(QType qtype, std::int32_t head_rows, std::int32_t input_rows) {
+    // The Q5 full head is K-parametric: the draft head runs at the draft width (2560 on the
+    // Qwen3.8-Flash-Next draft), while the 35B target runs at 5120.
+    if (qtype == QType::Q5_G64_FP16 && head_rows == detail::kLinearTopKFullRows &&
+        detail::linear_topk_input_rows_supported(input_rows)) {
+        return HeadProfile::Q5Full;
+    }
     if (input_rows != detail::kLinearTopKHidden) {
-        throw std::invalid_argument("linear_topk: unsupported head profile");
+        throw std::invalid_argument("linear_topk: unsupported head profile" +
+                                    profile_text(qtype, head_rows, input_rows));
     }
     if (head_rows == detail::kLinearTopKFullRows && qtype == QType::Q8_G32_FP16) {
         return HeadProfile::Q8Full;
@@ -48,7 +62,8 @@ HeadProfile resolve_profile(QType qtype, std::int32_t head_rows, std::int32_t in
     if (head_rows == detail::kLinearTopKOptimizedRows && qtype == QType::Q4_G64_FP16) {
         return HeadProfile::Q4Optimized;
     }
-    throw std::invalid_argument("linear_topk: unsupported head profile");
+    throw std::invalid_argument("linear_topk: unsupported head profile" +
+                                profile_text(qtype, head_rows, input_rows));
 }
 
 struct Plan {
@@ -58,6 +73,21 @@ struct Plan {
 };
 
 Plan plan_for(HeadProfile profile, int columns) {
+    if (profile == HeadProfile::Q5Full) {
+        // One 64-row producer per step, MMA column tiles on 8-column granularity, 128-wide K
+        // stages; the column count is the proposal width, so small tiles are the decode case.
+        if (columns <= 8) return {64, 8};
+        if (columns <= 16) return {64, 16};
+        if (columns <= 24) return {64, 24};
+        if (columns <= 32) return {64, 32};
+        if (columns <= 40) return {64, 40};
+        if (columns <= 48) return {64, 48};
+        if (columns <= 64) return {64, 64};
+        if (columns <= 80) return {64, 80};
+        if (columns <= 96) return {64, 96};
+        if (columns <= 112) return {64, 112};
+        return {64, 128};
+    }
     if (profile == HeadProfile::Q4Optimized) {
         if (columns <= 16) return {16, 0};
         if (columns <= 32) return {64, 32};
@@ -87,7 +117,7 @@ void require_matrix(const Tensor& tensor, DType dtype, std::int32_t rows, std::i
 
 void validate_io(const Tensor& hidden, const Tensor& candidate_ids,
                  const Tensor& candidate_scores) {
-    if (hidden.dtype != DType::BF16 || hidden.ne[0] != detail::kLinearTopKHidden ||
+    if (hidden.dtype != DType::BF16 || !detail::linear_topk_input_rows_supported(hidden.ne[0]) ||
         hidden.ne[1] <= 0 || hidden.ne[2] != 1 || hidden.ne[3] != 1 || !hidden.is_contiguous() ||
         !aligned_to(hidden.data, 16)) {
         throw std::invalid_argument("linear_topk: invalid hidden");
@@ -130,18 +160,40 @@ void require_q4(const Weight& head) {
     if (!common) { throw std::invalid_argument("linear_topk: invalid Q4 optimized head"); }
 }
 
+void require_q5(const Weight& head, std::int32_t input_rows) {
+    const std::uint64_t code_bytes = static_cast<std::uint64_t>(head.n) *
+                                     static_cast<std::uint64_t>(head.k) / 2;
+    const std::uint64_t high_bytes = static_cast<std::uint64_t>(head.n) *
+                                     static_cast<std::uint64_t>(head.k) / 8;
+    const bool common =
+        head.qtype == QType::Q5_G64_FP16 && head.layout == QuantLayout::RowSplit &&
+        head.scale_dtype == DType::FP16 && head.group_size == 64 && head.group == 64 &&
+        head.ndim == 2 && head.n == detail::kLinearTopKFullRows && head.k == input_rows &&
+        head.shape[0] == head.n && head.shape[1] == head.k &&
+        head.padded_shape[0] == head.n && head.padded_shape[1] == head.k &&
+        head.qhigh != nullptr && head.payload_bytes >= code_bytes &&
+        head.high_plane_bytes >= high_bytes && aligned_to(head.qdata, 16) &&
+        aligned_to(head.qhigh, 16) && aligned_to(head.scales, 4);
+    if (!common) { throw std::invalid_argument("linear_topk: invalid Q5 full head"); }
+}
+
 void require_no_weight_overlap(const Weight& head, const Tensor& hidden,
                                const Tensor& candidate_ids, const Tensor& candidate_scores,
                                const Tensor* id_map, const detail::LinearTopKWorkspace& scratch) {
-    const std::size_t code_bytes = head.qtype == QType::Q4_G64_FP16
+    const std::size_t code_bytes = head.qtype == QType::Q4_G64_FP16 ||
+                                           head.qtype == QType::Q5_G64_FP16
                                        ? static_cast<std::size_t>(head.n) * head.k / 2
                                        : static_cast<std::size_t>(head.n) * head.k;
     const std::size_t scale_bytes =
         head.qtype == QType::Q8_G32_FP16
             ? static_cast<std::size_t>(head.n) * (head.k / 32) * sizeof(std::uint16_t)
-        : head.qtype == QType::Q4_G64_FP16
+        : head.qtype == QType::Q4_G64_FP16 || head.qtype == QType::Q5_G64_FP16
             ? static_cast<std::size_t>(head.n) * (head.k / 64) * sizeof(std::uint16_t)
             : static_cast<std::size_t>(head.n) * sizeof(std::uint16_t);
+    const std::size_t high_bytes =
+        head.qtype == QType::Q5_G64_FP16
+            ? static_cast<std::size_t>(head.n) * (head.k / 8)
+            : 0;
     const Tensor* tensors[]{&hidden,
                             &candidate_ids,
                             &candidate_scores,
@@ -153,7 +205,9 @@ void require_no_weight_overlap(const Weight& head, const Tensor& hidden,
     for (const Tensor* tensor : tensors) {
         if (tensor == nullptr) { continue; }
         if (overlaps(head.qdata, code_bytes, tensor->data, tensor->bytes()) ||
-            overlaps(head.scales, scale_bytes, tensor->data, tensor->bytes())) {
+            overlaps(head.scales, scale_bytes, tensor->data, tensor->bytes()) ||
+            (high_bytes != 0 &&
+             overlaps(head.qhigh, high_bytes, tensor->data, tensor->bytes()))) {
             throw std::invalid_argument("linear_topk: weight plane overlaps a live tensor");
         }
     }
@@ -201,6 +255,9 @@ void execute(const Tensor& hidden, const Weight& head, const Tensor* id_map, Ten
         else if (profile == HeadProfile::Fp8Full)
             detail::linear_topk_fp8_launch(x, head, detail::kLinearTopKFullValidRows, scratch,
                                            stream);
+        else if (profile == HeadProfile::Q5Full)
+            detail::linear_topk_q5_m64_launch(x, head, detail::kLinearTopKFullValidRows, scratch,
+                                              stream);
         else
             detail::linear_topk_q4_launch(x, head, *id_map, scratch, stream);
         detail::linear_topk_merge_launch(scratch, out_ids, out_scores, stream);
@@ -248,6 +305,8 @@ void linear_topk(const Tensor& hidden, const Weight& head, std::int32_t valid_ro
     }
     if (profile == HeadProfile::Q8Full) {
         require_q8(head);
+    } else if (profile == HeadProfile::Q5Full) {
+        require_q5(head, hidden.ne[0]);
     } else {
         (void)detail::validate_fp8_weight(head, "linear_topk FP8 full head");
     }

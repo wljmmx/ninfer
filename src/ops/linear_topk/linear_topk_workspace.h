@@ -17,6 +17,12 @@ inline constexpr std::int32_t kLinearTopKFullValidRows   = 248077;
 inline constexpr std::int32_t kLinearTopKOptimizedRows   = 131072;
 inline constexpr std::int32_t kLinearTopKHidden          = 5120;
 
+// The K extent is a geometry, not a model identity: any 128-aligned width up to the 35B width is
+// admissible, and each kernel dispatches on the instance it was compiled with.
+inline constexpr bool linear_topk_input_rows_supported(std::int32_t rows) {
+    return rows >= 128 && rows <= kLinearTopKHidden && rows % 128 == 0;
+}
+
 struct LinearTopKWorkspace {
     std::int32_t tile_columns = 0;
     std::int32_t block_k      = 128;

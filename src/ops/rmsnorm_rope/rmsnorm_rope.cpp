@@ -60,34 +60,36 @@ void require_single_nonoverlap(const Tensor& positions, const Tensor& norm_weigh
 } // namespace
 
 void rmsnorm_rope(const Tensor& positions, const Tensor& q_norm_weight, const Tensor& k_norm_weight,
-                  Tensor& q, Tensor& k, cudaStream_t stream) {
+                  Tensor& q, Tensor& k, float rope_theta, cudaStream_t stream) {
     const std::int32_t batch = q.ne[3];
     const std::int32_t width = q.ne[2];
     if (width < 2 || width > 16) throw std::invalid_argument("rmsnorm_rope: pair W must be 2..16");
     if (batch < 1 || batch > kMaximumBatch) {
         throw std::invalid_argument("rmsnorm_rope: pair B must be 1..8");
     }
+    if (!(rope_theta > 0.0F)) throw std::invalid_argument("rmsnorm_rope: invalid rope theta");
     require_tensor(q, DType::BF16, {kHeadDim, kQueryHeads, width, batch}, "q");
     require_tensor(k, DType::BF16, {kHeadDim, kKeyHeads, width, batch}, "k");
     require_tensor(q_norm_weight, DType::BF16, {kHeadDim, 1, 1, 1}, "q norm weight");
     require_tensor(k_norm_weight, DType::BF16, {kHeadDim, 1, 1, 1}, "k norm weight");
     require_tensor(positions, DType::I32, {width, batch, 1, 1}, "positions");
     require_pair_nonoverlap(positions, q_norm_weight, k_norm_weight, q, k);
-    detail::rmsnorm_rope_pair_launch(positions, q_norm_weight, k_norm_weight, q, k, width * batch,
-                                     stream);
+    detail::rmsnorm_rope_pair_launch(positions, q_norm_weight, k_norm_weight, q, k, rope_theta,
+                                     width * batch, stream);
 }
 
-void rmsnorm_rope(const Tensor& positions, const Tensor& norm_weight, Tensor& x,
+void rmsnorm_rope(const Tensor& positions, const Tensor& norm_weight, Tensor& x, float rope_theta,
                   cudaStream_t stream) {
     const std::int32_t tokens = x.ne[2];
     if (tokens < 1 || tokens > kMaximumSingle) {
         throw std::invalid_argument("rmsnorm_rope: single T must be 1..2048");
     }
+    if (!(rope_theta > 0.0F)) throw std::invalid_argument("rmsnorm_rope: invalid rope theta");
     require_tensor(x, DType::BF16, {kHeadDim, kKeyHeads, tokens, 1}, "x");
     require_tensor(norm_weight, DType::BF16, {kHeadDim, 1, 1, 1}, "norm weight");
     require_tensor(positions, DType::I32, {tokens, 1, 1, 1}, "positions");
     require_single_nonoverlap(positions, norm_weight, x);
-    detail::rmsnorm_rope_single_launch(positions, norm_weight, x, tokens, stream);
+    detail::rmsnorm_rope_single_launch(positions, norm_weight, x, rope_theta, tokens, stream);
 }
 
 } // namespace ninfer::ops

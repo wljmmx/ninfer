@@ -2,6 +2,7 @@
 #include "ops/linear/bf16/bf16_shapes.h"
 #include <array>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -32,6 +33,7 @@ constexpr std::array kShapes{
     ShapeEntry{4608, 4608, select_bf16_n4608_k4608},
     ShapeEntry{2560, 4608, select_bf16_n2560_k4608},
     ShapeEntry{256, 5120, select_bf16_n256_k5120},
+    ShapeEntry{256, 2560, select_bf16_n256_k2560},
 };
 } // namespace
 
@@ -40,7 +42,8 @@ Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t
     for (const auto& entry : kShapes) {
         if (entry.n == n && entry.k == k) return entry.select(t);
     }
-    throw std::invalid_argument("bf16 linear: unsupported shape");
+    throw std::invalid_argument("bf16 linear: unsupported shape (n=" + std::to_string(n) +
+                                " k=" + std::to_string(k) + " t=" + std::to_string(t) + ")");
 }
 
 Bf16Launch select_bf16_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {

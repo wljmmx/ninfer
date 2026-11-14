@@ -22,6 +22,8 @@ void linear_topk_q4_launch(const Tensor& hidden, const Weight& head,
 void linear_topk_q4_m64_launch(const Tensor& hidden, const Weight& head,
                                const Tensor& row_to_global_ids,
                                const LinearTopKWorkspace& workspace, cudaStream_t stream);
+void linear_topk_q5_m64_launch(const Tensor& hidden, const Weight& head, std::int32_t valid_rows,
+                               const LinearTopKWorkspace& workspace, cudaStream_t stream);
 void linear_topk_merge_launch(const LinearTopKWorkspace& workspace, Tensor& candidate_ids,
                               Tensor& candidate_scores, cudaStream_t stream);
 
