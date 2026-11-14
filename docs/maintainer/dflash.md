@@ -472,3 +472,25 @@ on this artifact, DFlash2 never does, and both hand the rectangle the same ingre
 difference has to be state the rectangle *reads* rather than the fields it is given. The repository's
 dump exists only on the DFlash2 path (`NINFER_DFLASH2_DUMP` in `execution/draft.cpp`), so the next
 step is the same block in `program/speculative/mtp.cpp` and a side-by-side column table.
+The side-by-side column comparison is done, and it overturns the reference point rather than the code.
+`NINFER_MTP_COLUMN_PROBE` prints MTP's target top-1 and top1-top2 gap per column; on the same artifact
+at frontier 64 with `--draft-tokens 8`:
+
+  column     0      1      2      3      4      5      6      7
+  top-1   102134   220    220     16     23  95839  95839  95932
+  gap       0.69   0.19   0.44   1.00   0.75   2.69   3.06   0.75
+
+MTP's own column 1 has a 0.19 gap - flatter than DFlash2's 0.77-1.06 - and MTP still accepts at
+position 1 (`accepted_per_position = [14, 10, 6, 4, 4, 4, 1]`). So a low gap is this model's normal
+state on this prompt, and the earlier reading "DFlash2's target columns are degenerate" was measuring
+a property the working path shares. The target is out of the picture; the difference is on the proposal
+side, where DFlash2's masked-row candidates land at ids (102134, 3709, 169237, ...) that the target's
+own continuation (220, 16, 23, 95839, ...) does not contain - measured as 0% overlap with the target's
+top-16 in every round.
+
+That is where the next check belongs: the proposal's own per-column state, not the rectangle. The
+candidate list at column j comes from `linear_topk` over `rmsnorm_pack_tail`'s output at that column
+(`execution/draft.cpp:484-495`), the masked rows read only committed context, and the selector walk is
+sequential - so the remaining question is whether the *masked-row state* the head sees corresponds to
+the row the training conditioned it on. Comparing that needs the draft's teacher conditioning, which
+this tree cannot produce: it has to come from the reference implementation (strata's DFlash2 path).

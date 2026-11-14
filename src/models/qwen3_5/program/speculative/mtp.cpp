@@ -194,6 +194,48 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         }
         target_accept(state.execution, state.continuation_hidden_store, verify);
 
+        // NINFER_MTP_COLUMN_PROBE=<tag>: the same per-column read-out the DFlash2 path publishes,
+        // so the two backends' verify rectangles can be compared column by column on one artifact.
+        // One round only - the read-back is a full column of the vocabulary per column.
+        if (const char* tag = std::getenv("NINFER_MTP_COLUMN_PROBE")) {
+            static bool told = false;
+            if (!told) {
+                told = true;
+                cudaStream_t s = state.execution.device.stream;
+                const auto vocab = dimension(
+                    state.execution.parameters.model.config().text.vocab_size);
+                const auto width = verify_ids.ne[0];
+                std::vector<std::uint16_t> raw(static_cast<std::size_t>(vocab));
+                std::vector<float> logits(static_cast<std::size_t>(vocab));
+                std::fprintf(stderr, "[mtp-cols %s]", tag);
+                for (std::int32_t column = 0; column < width; ++column) {
+                    const Tensor logit_column =
+                        target_logits.slice(1, column, 1).slice(2, 0, 1).view({vocab});
+                    CUDA_CHECK(cudaMemcpyAsync(raw.data(), logit_column.data,
+                                               raw.size() * sizeof(std::uint16_t),
+                                               cudaMemcpyDeviceToHost, s));
+                    CUDA_CHECK(cudaStreamSynchronize(s));
+                    float top1 = -1e30F, top2 = -1e30F;
+                    std::int32_t best = 0;
+                    for (std::size_t i = 0; i < raw.size(); ++i) {
+                        const std::uint32_t bits = static_cast<std::uint32_t>(raw[i]) << 16U;
+                        float value              = 0.0F;
+                        std::memcpy(&value, &bits, sizeof(float));
+                        if (value > top1) {
+                            top2 = top1;
+                            top1 = value;
+                            best = static_cast<std::int32_t>(i);
+                        } else if (value > top2) {
+                            top2 = value;
+                        }
+                    }
+                    std::fprintf(stderr, " c%d=(%d,%.2f)", column, best, double(top1 - top2));
+                }
+                std::fputc('\n', stderr);
+                std::fflush(stderr);
+            }
+        }
+
         {
             nvtx::ScopedRange draft_range(nvtx::Name::DecodeMtpDraft, nvtx::Category::Mtp,
                                           static_cast<std::uint64_t>(k) * batch_size);
