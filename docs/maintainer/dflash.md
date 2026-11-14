@@ -295,14 +295,21 @@ A per-column magnitude probe (`NINFER_VERIFY_COLUMN_PROBE`, `verify_probe.h`) ad
 the rectangle's state is carried, column by column. On the same artifact the GDN recurrence, the
 attention mixer and the final fold all report ordinary per-column magnitudes - GDN output 0.0111 /
 0.0115 / 0.0111 / ... / 0.0116, attention output 0.0713 / 0.0676 / 0.0647 / ... / 0.0668, final fold
-4.31 / 3.79 / 3.41 / ... / 3.30 - so no column is reading a state that never advanced. What is left is
-the draft block's own mask: `draft.cpp:455` gives every column the same `valid_columns = width` and
-`positions = F + i`, and the op takes one shared length for the whole block (`sliding_window/launch.cu:60`
-passes `positions[0]`, `kernel.cuh:95` reads `length = positions[0]`, then tiles only `[0, length)`).
-That excludes the anchor at position F from every column's visible set while also excluding the block's
-own columns from each other, which is isolation without the one piece the proposals need. Accepted run
-length never exceeds one token (histogram `0:10, 1:25` over 35 rounds), so `k` currently buys overhead
-and no extra acceptance.
+4.31 / 3.79 / 3.41 / ... / 3.30 - so no column is reading a state that never advanced.
+
+The draft block is the remaining suspect, and its mask was tried: `draft.cpp:455` gives every column
+the same `valid_columns = width` and `positions = F + i`, and the op takes one shared visible end for
+the whole block (`sliding_window/launch.cu:60` passes `positions[0]`, `kernel.cuh:95` reads
+`length = positions[0]`, then tiles only `[0, length)`). That end is `F`, so the anchor at `F` is
+outside every draft column's key set. Admitting it by moving the end to `F + 1` was implemented,
+measured and reverted: the proposal collapsed instead of improving - the first candidate became token
+0 in most rounds, column 0's agreement with the target argmax fell from 90% to 0.0%, and k=4 acceptance
+went from 33.7% to 0 - because this op reads only the committed context ring (`kernel.cuh:21-33`, no
+append, key set `[length - window, length)`), and the drafter's ring ends at `F - 1`: the slot at `F`
+holds whatever position `F - window` left there. Making the anchor visible therefore needs the anchor's
+row appended to the draft context first (the `context_frontiers` to `frontiers` bookkeeping in
+`program/decode.cpp:842`), not a change to the visible end. Accepted run length never exceeds one
+token (histogram `0:10, 1:25` over 35 rounds), so `k` currently buys overhead and no extra acceptance.
 
 **Layer-major + double-buffered prefill (last resort, measured).** `ExpertStream::ensure` still
 publishes and waits inside the layer, one staging ring of 32 slots, so the PCIe traffic a prefill
