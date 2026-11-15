@@ -14,9 +14,19 @@ namespace ninfer::ops::detail::moe_cpu::groupwise_int {
 // Instantiated only in an ISA-specific C++ object. A decode feeds up to four columns;
 // group scales are applied to vector partials, with one horizontal reduction per output.
 // port (sm_89): five-bit codes through the 32-wide decoder. Same arithmetic as dot(), one pass per
-// 32 weights instead of four passes of eight. NINFER_MOE_CPU_NODECODE puts the decode at 32% of this
-// kernel, and this is the only cut available without changing the activation precision - int8
-// activations for this projection were rejected at 12.3% PPL, so the dot stays in float.
+// 32 weights instead of four passes of eight. NINFER_MOE_CPU_NODECODE puts the decode at 32-44% of
+// this kernel, and this is the only cut available without changing the activation precision.
+//
+// The activation precision is NOT the wall, and the number that used to be quoted here (12.3% PPL)
+// is stale: it was measured on Q6 down while down actually runs Q5, and its own note asked for a
+// re-measurement that never happened. Measured 2026-11-15 on this box at the decode shape, four
+// lanes, one expert, NINFER_MOE_CPU_INT8 on and off: 28.3 us/expert (347 GFLOPS) against 28.0 us
+// (351) - the int8 tier buys nothing at all, because what stops this kernel is the per-thread
+// load -> maddubs -> madd -> cvt dependency chain (IPC 1.3, measured 2026-10-24), not its
+// instruction count. Two accumulators, prefetch and manual unrolling were all measured to make it
+// worse (register pressure). So converting down to int8 activations, or reaching for a wider dot
+// (vpdpbusd - which MSVC cannot emit without an AVX-VNNI target this toolchain does not have),
+// changes the instruction mix without touching the stall that sets the rate.
 template <class Simd, int K, int Rows, int Columns, class Input>
 inline void dot_wide32(const Matrix& matrix, const int (&rows)[Rows],
                        const Input* const (&x)[Columns], float (&out)[Rows][Columns]) noexcept {
