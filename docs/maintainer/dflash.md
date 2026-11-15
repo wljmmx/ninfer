@@ -590,6 +590,26 @@ registry - weeks, not hours. The cheap slice that actually tests the hypothesis 
 ranking against the target's argmax - a distribution disagreement, not a 1e-3 numerics gap - the
 recommendation is to do the head-only A/B if anything, and not to rebuild the whole draft in BF16.
 
+**Raising `selector_top_k` past 16 (assessed, not done).** The config path is already dynamic - the
+artifact's `selector_top_k` reaches `DraftConfig` (`config.cpp:313,337`) and the plan sizes the score
+matrix and candidates from it (`draft.cpp:757-794`, `startup.cpp:869`) - but five consumers pin the
+number to sixteen at compile time or in a buffer shape:
+
+| site | what pins 16 |
+|---|---|
+| `src/ops/linear_topk/linear_topk_workspace.h:10` | `kLinearTopK = 16`: the op's contract is `[16,U]` output, and its merge kernel tiles by 16 |
+| `src/ops/candidate_selector/bf16/candidate_selector_path.cu:11` | `kCandidates = 16` |
+| `.../candidate_selector_path.cu:85,97,183` | `score_row` uses `warp = tid>>5` **as the candidate index**, and the walk launches 512 threads (16 warps) with `__launch_bounds__(512,1)`; 24/32 candidates need 768/1024 threads and a templated block size |
+| `src/ops/kernel/speculative_round.cuh:18` + `src/ops/wrapper/speculative_round.cpp:17` | `kSparseSpeculativeCandidates = 16`: the accept path's `proposal_q` width and `speculative_sparse_probability` loop |
+| `src/models/qwen3_5/program/round_buffers.cpp:175-180` (and the DFlash sibling at `:221`) | `candidate_ids`/`proposal_q` allocated `{16, columns-1, batch}` |
+
+Cost: each op carries this repo's oracle, numerical criterion and profile registry, so `linear_topk`
+plus `candidate_selector` template instances plus the sparse accept is roughly one to two weeks.
+Payoff bound: recall at column 0 is already 93.5% at top-16, so a wider candidate set can add at most
+6.5 points of recall, and the selector converts only 13% of its fixable mistakes into hits - the
+expected column-0 gain is a few points, i.e. far below the 42-point ranking gap. Recommendation: leave
+the candidate count alone; the lever is the head's ranking, not the width.
+
 **Layer-major + double-buffered prefill (last resort, measured).** `ExpertStream::ensure` still
 publishes and waits inside the layer, one staging ring of 32 slots, so the PCIe traffic a prefill
 needs is serial with the SMs. The sizing is measured: a 512-token prefill touches up to the layer's
