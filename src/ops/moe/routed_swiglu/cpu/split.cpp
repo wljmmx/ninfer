@@ -938,11 +938,14 @@ float* partial_plane(std::size_t count) {
 
 // Fold every token's slots into the output, ascending, once the tasks above have all finished.
 //
-// The row-split path adds expert by expert into the output, so a token that holds three experts is
-// three roundings of one accumulator. Here each slot rounds its own term into its own plane and the
-// merge adds the three rounded terms - two different summations of the same numbers, and the reason
-// the flattened path is no longer bit-identical to the row split. The terms and their order are the
-// same; the intermediate rounding points are not.
+// This is where a re-association would normally cost bits, and it does not: both sides are one
+// ascending accumulation chain from a zero accumulator. The row split adds expert by expert straight
+// into the output, (((0 + t1) + t2) + t3); the merge adds the same terms in the same order into its
+// own zero, ((0 + t1) + t2) + t3, and adds that once to an output that this path starts at zero.
+// Same terms, same order, same roundings - measured on the forced CPU half, where every token holds
+// several of a layer's experts, the flattened perplexity is the row split's to fifteen significant
+// digits. A non-zero destination would break the identity, which is why the last step is an
+// accumulate and not a store.
 void merge_partial(Work& w, const CpuWorkerContext& worker) {
     const auto hidden = static_cast<std::size_t>(w.hidden);
     const auto tokens = static_cast<std::size_t>(w.tokens);
@@ -1274,10 +1277,14 @@ void split_launch(const Tensor& x, const CpuSwiGLUExperts& experts, const Expert
     // unwritten slots are never initialised (so they must not be read at all), and a token holds two
     // to four of a layer's twenty experts, not twenty.
     //
+    // Only for the call that can use it: with NINFER_SPLIT_FLATTEN off and one lane the table above
+    // never runs, and the shipped row split should not pay an allocation for a switch that is off.
+    //
     // A repeated route id would put one token twice in one expert's list, and one slot can hold only
     // one value per element. The row-split path would add that term twice; a plane cannot, so the
     // repeated case keeps the serial table rather than silently dropping a term.
-    if (!work.flatten_disjoint) {
+    static const bool flatten_single = std::getenv("NINFER_SPLIT_FLATTEN") != nullptr;
+    if (!work.flatten_disjoint && (work.lanes > 1 || flatten_single)) {
         const auto slots       = work.experts.size();
         const auto flat_tokens = static_cast<std::size_t>(work.lanes) * static_cast<std::size_t>(tokens);
         work.token_begin.assign(flat_tokens + 1, 0);
