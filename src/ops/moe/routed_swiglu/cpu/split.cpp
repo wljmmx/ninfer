@@ -843,6 +843,14 @@ void run(void* arguments, const CpuWorkerContext& worker) noexcept {
         scratch.q8_scale.resize(room);
         scratch.q6_cont.resize(room);
         scratch.q6_scale.resize(room);
+        // The down pass keeps its own pointer tables: its width is the intermediate dimension, not
+        // the hidden one, and an un-resized table here was a null dereference the first time the
+        // sixteen-bit arm ran.
+        scratch.q16_cont.resize(room);
+        scratch.down_even.resize(room);
+        scratch.down_odd.resize(room);
+        scratch.down_sum.resize(room);
+        scratch.down_scale.resize(room);
         // One lane reserves the plane; an assign() in every lane would have each zero it under the
         // others' writes.
         if (worker.rank() == 0) {
