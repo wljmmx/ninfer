@@ -254,11 +254,18 @@ inline void quantise_floats(const float* x, std::int32_t tokens, std::int32_t wi
         const float inverse = scale > 0.0F ? 1.0F / scale : 0.0F;
         q8.scale[static_cast<std::size_t>(token) * groups + group] = scale;
         auto* cont = q8.cont.data() + static_cast<std::size_t>(token) * width + group * 64;
+        auto* even = q8.even.data() + static_cast<std::size_t>(token) * width + group * 64;
+        auto* odd  = q8.odd.data() + static_cast<std::size_t>(token) * width + group * 64;
         int sum = 0;
         for (int i = 0; i < 64; ++i) {
             const int value = std::clamp(
                 static_cast<int>(std::lrint(source[i] * inverse)), -127, 127);
             cont[i] = static_cast<std::int8_t>(value);
+            if ((i & 1) == 0) {
+                even[i / 2] = static_cast<std::int8_t>(value);
+            } else {
+                odd[i / 2] = static_cast<std::int8_t>(value);
+            }
             sum += value;
         }
         q8.sum[static_cast<std::size_t>(token) * groups + group] = sum;
@@ -618,6 +625,11 @@ struct Scratch {
     std::vector<const std::int8_t*> q6_cont;
     std::vector<const float*> q6_scale;
     std::vector<const std::int16_t*> q16_cont;
+    // The down pass reads a different width than the gate, so it needs its own quantised plane.
+    std::vector<const std::int8_t*> down_even;
+    std::vector<const std::int8_t*> down_odd;
+    std::vector<const std::int32_t*> down_sum;
+    std::vector<const float*> down_scale;
     std::vector<float> gate, up, down;
 };
 
@@ -722,15 +734,29 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext& worker, std::size_t
         }
     }
     worker.barrier();
-    // The down pass reads what gate/up just wrote, so its activation can only be quantised after the
-    // barrier - and per expert, because each expert produces its own rows.
-    if (w.down_bits == 6 && w.q6_path) {
-        quantise_floats_i16(w.activation, w.tokens, w.intermediate, w.q8_act, worker);
+    // The down projection is four-bit on this artifact (conversion.json: q5_g64_fp16 501 objects,
+    // q6_g64_fp16 50, and code_bits() refuses Q5 - so the MoE down matrix is Q4). The six-bit arm is
+    // kept for an artifact that carries one; the four-bit arm is what this model actually runs, and
+    // until now it decoded down in bf16 while gate/up already had the int8 path.
+    const bool down_int16 = w.down_bits == 6 && w.q6_path;
+    const bool down_int8  = w.down_bits == 4 && w.int8_path;
+    if (down_int16 || down_int8) {
+        if (down_int16) {
+            quantise_floats_i16(w.activation, w.tokens, w.intermediate, w.q8_act, worker);
+        } else {
+            quantise_floats(w.activation, w.tokens, w.intermediate, w.q8_act, worker);
+        }
         worker.barrier();
         const int act_groups = w.intermediate / 64;
         for (std::size_t m = 0; m < count; ++m) {
             const auto token = static_cast<std::size_t>(members[m].token);
-            s.q16_cont[m] = w.q8_act.cont16.data() + token * w.intermediate;
+            if (down_int16) {
+                s.q16_cont[m] = w.q8_act.cont16.data() + token * w.intermediate;
+            } else {
+                s.down_even[m] = w.q8_act.even.data() + token * w.intermediate;
+                s.down_odd[m]  = w.q8_act.odd.data() + token * w.intermediate;
+                s.down_sum[m]  = w.q8_act.sum.data() + token * act_groups;
+            }
             s.q6_scale[m] = w.q8_act.scale.data() + token * act_groups;
         }
     }
@@ -777,6 +803,9 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext& worker, std::size_t
                 }
                 std::fflush(stderr);
             }
+        } else if (down_int8) {
+            row_all_tokens_q4_q8(down_row, w.intermediate, s.down_even.data(), s.down_odd.data(),
+                                 s.down_sum.data(), s.q6_scale.data(), count, s.down.data());
         } else if (w.down_bits == 6) {
             row_all_tokens<6>(down_row, w.intermediate, s.activations.data(), count, s.down.data());
         } else {
@@ -824,8 +853,9 @@ void run(void* arguments, const CpuWorkerContext& worker) noexcept {
             work.q8.cont.assign(static_cast<std::size_t>(work.tokens) * work.hidden, 0);
             work.q8.scale.assign(static_cast<std::size_t>(work.tokens) * groups, 0.0F);
             work.q8.sum.assign(static_cast<std::size_t>(work.tokens) * groups, 0);
-            work.q8_act.cont.assign(static_cast<std::size_t>(work.tokens) * work.intermediate, 0);
             work.q8_act.cont16.assign(static_cast<std::size_t>(work.tokens) * work.intermediate, 0);
+            work.q8_act.even.assign(static_cast<std::size_t>(work.tokens) * work.intermediate, 0);
+            work.q8_act.odd.assign(static_cast<std::size_t>(work.tokens) * work.intermediate, 0);
             work.q8_act.scale.assign(static_cast<std::size_t>(work.tokens) * act_groups, 0.0F);
             work.q8_act.sum.assign(static_cast<std::size_t>(work.tokens) * act_groups, 0);
         }
