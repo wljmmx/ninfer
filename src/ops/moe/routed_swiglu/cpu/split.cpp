@@ -17,7 +17,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
@@ -168,6 +170,149 @@ struct Member {
     float coefficient  = 0.0F;
 };
 
+// The int8 activation plane, laid out the way the q4 nibble dot consumes it: even indices first, then
+// odd, so each nibble half meets its own half of the row with no shuffle. One group is 64 values with
+// its own peak scale, which is the same grouping the device W4A8 path uses.
+struct Q8Input {
+    std::vector<std::int8_t> even; // [token][hidden]
+    std::vector<std::int8_t> odd;  // [token][hidden]
+    std::vector<float> scale;      // [token][groups]
+    std::vector<std::int32_t> sum; // [token][groups]: sum of the quantised values, for the bias term
+};
+
+// The activation plane is BF16, whose bits are the top half of an FP32 word - not the 5/10 split that
+// fp16_to_f32 reads. Feeding BF16 through the fp16 decoder turns every value into a different number
+// while still looking plausible, which is exactly the kind of error an IMPROVING perplexity hides.
+inline float bf16_value(std::uint16_t bits) noexcept {
+    const std::uint32_t wide = static_cast<std::uint32_t>(bits) << 16;
+    float out;
+    std::memcpy(&out, &wide, sizeof(out));
+    return out;
+}
+
+// Quantise every token's activation row once per collective. The dot then reads int8 instead of bf16,
+// which is what lets the weights meet `maddubs` 32 codes at a time instead of eight. Takes the three
+// scalars it needs rather than Work, so it does not depend on the struct's layout. Sizes are assumed
+// already reserved by the caller: every worker runs this over its own slice, and an assign() here
+// would have each lane zero the whole plane under the others.
+inline void quantise_inputs(const std::uint16_t* x, std::int32_t tokens, std::int32_t hidden,
+                            Q8Input& q8, const CpuWorkerContext& worker) {
+    const int groups = hidden / 64;
+    const auto range = worker.range(static_cast<std::size_t>(tokens) * groups);
+    for (auto g = range.begin; g < range.end; ++g) {
+        const auto token   = static_cast<std::int32_t>(g / static_cast<std::size_t>(groups));
+        const auto group   = static_cast<std::int32_t>(g % static_cast<std::size_t>(groups));
+        const auto* source = x + static_cast<std::size_t>(token) * hidden + group * 64;
+        float peak = 0.0F;
+        for (int i = 0; i < 64; ++i) {
+            peak = std::max(peak, std::fabs(bf16_value(source[i])));
+        }
+        const float scale   = peak > 0.0F ? peak / 127.0F : 0.0F;
+        const float inverse = scale > 0.0F ? 1.0F / scale : 0.0F;
+        q8.scale[static_cast<std::size_t>(token) * groups + group] = scale;
+        auto* even = q8.even.data() + static_cast<std::size_t>(token) * hidden + group * 64;
+        auto* odd  = q8.odd.data() + static_cast<std::size_t>(token) * hidden + group * 64;
+        int sum = 0;
+        for (int i = 0; i < 32; ++i) {
+            const int lo = std::clamp(
+                static_cast<int>(std::lrint(bf16_value(source[2 * i]) * inverse)), -127, 127);
+            const int hi = std::clamp(
+                static_cast<int>(std::lrint(bf16_value(source[2 * i + 1]) * inverse)), -127, 127);
+            even[i] = static_cast<std::int8_t>(lo);
+            odd[i]  = static_cast<std::int8_t>(hi);
+            sum += lo + hi;
+        }
+        q8.sum[static_cast<std::size_t>(token) * groups + group] = sum;
+    }
+}
+
+// The q4 nibble dot: 32 codes per instruction pair against an int8 activation plane, instead of eight
+// float codes per step. The packed nibble u is two's complement, so flipping bit 3 turns it into the
+// offset-by-8 form b = u ^ 8 with w = b - 8, and one correction per 64-value group - 8 * sum(x) -
+// restores the true sum. The scale chain keeps the device's order: weight scale first, activation
+// scale second, one add at the end.
+template <int Columns>
+inline void row_dot_q4_q8(const Row& row, std::int32_t k, const std::int8_t* const* even,
+                          const std::int8_t* const* odd, const std::int32_t* const* sum,
+                          const float* const* scale, float (&out)[Columns]) noexcept {
+    const auto ones       = _mm256_set1_epi16(1);
+    const auto nibble     = _mm256_set1_epi8(0x0F);
+    const auto bias       = _mm256_set1_epi8(static_cast<char>(0x88));
+    __m256 total[Columns];
+    for (int c = 0; c < Columns; ++c) { total[c] = _mm256_setzero_ps(); }
+    const auto groups = k / 64;
+    for (std::int32_t group = 0; group < groups; ++group) {
+        __m256i even_v[Columns];
+        __m256i odd_v[Columns];
+        __m256i correction[Columns];
+        float act_scale[Columns];
+        for (int c = 0; c < Columns; ++c) {
+            const auto* e = even[c] + group * 64;
+            const auto* o = odd[c] + group * 64;
+            even_v[c]     = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(e));
+            odd_v[c]      = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(o));
+            // One lane carries the whole bias: the group's 8 * sum(x) is subtracted once, not once
+            // per lane, because the lanes are summed at the end of the group.
+            correction[c] = _mm256_setr_epi32(8 * sum[c][group], 0, 0, 0, 0, 0, 0, 0);
+            act_scale[c]  = scale[c][group];
+        }
+        const auto packed  = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(row.codes + group * 32));
+        const auto flipped = _mm256_xor_si256(packed, bias);
+        const auto low     = _mm256_and_si256(flipped, nibble);
+        const auto high    = _mm256_and_si256(_mm256_srli_epi16(flipped, 4), nibble);
+        const auto weight  = _mm256_set1_ps(ax::fp16_to_f32(row.scales[group]));
+        for (int c = 0; c < Columns; ++c) {
+            const auto pairs = _mm256_sub_epi32(
+                _mm256_add_epi32(
+                    _mm256_madd_epi16(_mm256_maddubs_epi16(low, even_v[c]), ones),
+                    _mm256_madd_epi16(_mm256_maddubs_epi16(high, odd_v[c]), ones)),
+                correction[c]);
+            const auto scaled = _mm256_mul_ps(_mm256_cvtepi32_ps(pairs), weight);
+            total[c] = _mm256_add_ps(_mm256_mul_ps(scaled, _mm256_set1_ps(act_scale[c])), total[c]);
+        }
+    }
+    for (int c = 0; c < Columns; ++c) { out[c] = ax::reduce_sum(total[c]); }
+}
+
+inline void row_all_tokens_q4_q8(const Row& row, std::int32_t k, const std::int8_t* const* even,
+                                 const std::int8_t* const* odd, const std::int32_t* const* sum,
+                                 const float* const* scale, std::size_t count,
+                                 float* out) noexcept {
+    std::size_t at = 0;
+    while (at < count) {
+        const auto left = count - at;
+        if (left >= 4) {
+            const std::int8_t* es[4] = {even[at], even[at + 1], even[at + 2], even[at + 3]};
+            const std::int8_t* os[4] = {odd[at], odd[at + 1], odd[at + 2], odd[at + 3]};
+            const std::int32_t* ss[4] = {sum[at], sum[at + 1], sum[at + 2], sum[at + 3]};
+            const float* sc[4] = {scale[at], scale[at + 1], scale[at + 2], scale[at + 3]};
+            float values[4];
+            row_dot_q4_q8<4>(row, k, es, os, ss, sc, values);
+            for (int c = 0; c < 4; ++c) { out[at + c] = values[c]; }
+            at += 4;
+        } else if (left >= 2) {
+            const std::int8_t* es[2] = {even[at], even[at + 1]};
+            const std::int8_t* os[2] = {odd[at], odd[at + 1]};
+            const std::int32_t* ss[2] = {sum[at], sum[at + 1]};
+            const float* sc[2] = {scale[at], scale[at + 1]};
+            float values[2];
+            row_dot_q4_q8<2>(row, k, es, os, ss, sc, values);
+            for (int c = 0; c < 2; ++c) { out[at + c] = values[c]; }
+            at += 2;
+        } else {
+            const std::int8_t* es[1] = {even[at]};
+            const std::int8_t* os[1] = {odd[at]};
+            const std::int32_t* ss[1] = {sum[at]};
+            const float* sc[1] = {scale[at]};
+            float values[1];
+            row_dot_q4_q8<1>(row, k, es, os, ss, sc, values);
+            out[at] = values[0];
+            at += 1;
+        }
+    }
+}
+
 struct Work {
     const std::uint16_t* x = nullptr;
     float* output          = nullptr;
@@ -177,6 +322,12 @@ struct Work {
     Matrix gate, up, down;
     std::vector<std::int32_t> experts;
     std::vector<std::vector<Member>> members;
+    // NINFER_MOE_CPU_INT8: the same switch the fused form reads, now honoured here. Off keeps the bf16
+    // decode this form has always used; on routes the four-bit gate/up pass through the q4 nibble dot.
+    // The six-bit down pass stays on bf16 either way - its decode has a high plane the q4 path does
+    // not cover, and it is a third of the arithmetic rather than two thirds.
+    bool int8_path = false;
+    Q8Input q8;
 };
 
 // Per-worker buffers, allocated once per collective: the rows of one expert are split across the
@@ -184,6 +335,10 @@ struct Work {
 struct Scratch {
     std::vector<const std::uint16_t*> inputs;
     std::vector<const float*> activations;
+    std::vector<const std::int8_t*> q8_even;
+    std::vector<const std::int8_t*> q8_odd;
+    std::vector<const std::int32_t*> q8_sum;
+    std::vector<const float*> q8_scale;
     std::vector<float> gate, up, down;
 };
 
@@ -250,10 +405,18 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext& worker, std::size_t
     const auto& members = w.members[expert];
     if (members.empty()) { return; }
     const auto count = members.size();
+    const int groups = w.hidden / 64;
     for (std::size_t m = 0; m < count; ++m) {
         s.inputs[m] = w.x + static_cast<std::size_t>(members[m].token) * w.hidden;
         s.activations[m] =
             w.activation + static_cast<std::size_t>(members[m].token) * w.intermediate;
+        if (w.int8_path) {
+            const auto token = static_cast<std::size_t>(members[m].token);
+            s.q8_even[m]  = w.q8.even.data() + token * w.hidden;
+            s.q8_odd[m]   = w.q8.odd.data() + token * w.hidden;
+            s.q8_sum[m]   = w.q8.sum.data() + token * groups;
+            s.q8_scale[m] = w.q8.scale.data() + token * groups;
+        }
     }
     const auto gate_base = w.gate.expert(expert);
     const auto up_base   = w.up.expert(expert);
@@ -262,7 +425,12 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext& worker, std::size_t
         const auto row = static_cast<std::int32_t>(i);
         const auto gate_row = row_at(gate_base, row, w.hidden, w.gate_bits);
         const auto up_row   = row_at(up_base, row, w.hidden, w.gate_bits);
-        if (w.gate_bits == 4) {
+        if (w.gate_bits == 4 && w.int8_path) {
+            row_all_tokens_q4_q8(gate_row, w.hidden, s.q8_even.data(), s.q8_odd.data(),
+                                 s.q8_sum.data(), s.q8_scale.data(), count, s.gate.data());
+            row_all_tokens_q4_q8(up_row, w.hidden, s.q8_even.data(), s.q8_odd.data(),
+                                 s.q8_sum.data(), s.q8_scale.data(), count, s.up.data());
+        } else if (w.gate_bits == 4) {
             row_all_tokens<4>(gate_row, w.hidden, s.inputs.data(), count, s.gate.data());
             row_all_tokens<4>(up_row, w.hidden, s.inputs.data(), count, s.up.data());
         } else {
@@ -313,6 +481,24 @@ void run(void* arguments, const CpuWorkerContext& worker) noexcept {
     scratch.gate.resize(room);
     scratch.up.resize(room);
     scratch.down.resize(room);
+    if (work.int8_path) {
+        scratch.q8_even.resize(room);
+        scratch.q8_odd.resize(room);
+        scratch.q8_sum.resize(room);
+        scratch.q8_scale.resize(room);
+        // One lane reserves the plane; an assign() in every lane would have each zero it under the
+        // others' writes.
+        if (worker.rank() == 0) {
+            const int groups = work.hidden / 64;
+            work.q8.even.assign(static_cast<std::size_t>(work.tokens) * work.hidden, 0);
+            work.q8.odd.assign(static_cast<std::size_t>(work.tokens) * work.hidden, 0);
+            work.q8.scale.assign(static_cast<std::size_t>(work.tokens) * groups, 0.0F);
+            work.q8.sum.assign(static_cast<std::size_t>(work.tokens) * groups, 0);
+        }
+        worker.barrier();
+        quantise_inputs(work.x, work.tokens, work.hidden, work.q8, worker);
+        worker.barrier();
+    }
     const bool phase_probe = split_phase_probe();
     const auto phase_begin = split_phase_mark(phase_probe);
     for (std::size_t index = 0; index < work.experts.size(); ++index) {
@@ -392,6 +578,13 @@ void split_launch(const Tensor& x, const CpuSwiGLUExperts& experts, const Expert
     work.down_bits    = code_bits(experts.down.layout.format);
     if (code_bits(experts.up.layout.format) != work.gate_bits) {
         throw std::invalid_argument("routed_swiglu CPU: split gate and up differ in code width");
+    }
+    // The same knob the fused form reads. Until now this form ignored it entirely, which is why an
+    // A/B of the int8 tier came back identical: the switch was being flipped on a path that never
+    // consulted it.
+    {
+        static const char* value = std::getenv("NINFER_MOE_CPU_INT8");
+        work.int8_path = value == nullptr || std::strcmp(value, "0") != 0;
     }
     work.members.resize(static_cast<std::size_t>(experts_count));
     for (std::int32_t expert = 0; expert < experts_count; ++expert) {
