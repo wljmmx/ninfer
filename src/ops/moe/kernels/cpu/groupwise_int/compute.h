@@ -523,6 +523,48 @@ template <class Simd, int K, int Rows, int Columns>
     }
 }
 
+// port (sm_89): quantise the SwiGLU activation plane to int16 in the same 64-value groups the
+// six-bit down weights carry. This is the split form's quantise_floats_i16 (routed_swiglu/cpu/
+// split.cpp:306) over this form's slot addressing: the plane is per (token, route) slot, and only
+// the slots this chunk actually fills are quantised - the rest of it is uninitialised on purpose.
+//
+// The source is FLOAT. This form keeps the activation plane in FP32 (bf16-rounded when the device
+// regime asks for it, work.plane_round), so nothing in here decodes anything: reading a BF16 plane
+// as if it were FP16 is the mistake that once made a perplexity look 8.3% better, and passing the
+// float plane straight through the same peak/scale rule is what keeps that class of bug out.
+// Out of line so it cannot change the layout of the vector loop that runs when it is disabled.
+template <class Simd>
+[[gnu::noinline]] void quantise_activation_i16(Work& work, const CpuWorkerContext& worker,
+                                                const int* slots, int count) noexcept {
+    static_assert(std::is_base_of_v<common::cpu::avx2::F32, Simd>,
+                  "the int16 plane is written against AVX2 registers");
+    constexpr int kGroups = intermediate / 64;
+    const auto range      = worker.range(static_cast<std::size_t>(kGroups) * count);
+    for (auto g = range.begin; g < range.end; ++g) {
+        const int index     = static_cast<int>(g) / kGroups;
+        const int group     = static_cast<int>(g) % kGroups;
+        const int slot      = slots[index];
+        const float* source = work.scratch.activation + std::size_t(slot) * intermediate + group * 64;
+        float peak          = 0.0F;
+        for (int i = 0; i < 64; ++i) { peak = std::max(peak, std::fabs(source[i])); }
+        const float scale   = peak > 0.0F ? peak / 32767.0F : 0.0F;
+        const float inverse = scale > 0.0F ? 1.0F / scale : 0.0F;
+        work.scratch.activation_scale[std::size_t(slot) * kGroups + group] = scale;
+        auto* out = work.scratch.activation_q16 + std::size_t(slot) * intermediate + group * 64;
+        const auto factor = _mm256_set1_ps(inverse);
+        for (int i = 0; i < 64; i += 16) {
+            const auto first  = _mm256_mul_ps(_mm256_loadu_ps(source + i), factor);
+            const auto second = _mm256_mul_ps(_mm256_loadu_ps(source + i + 8), factor);
+            // packs_epi32 joins two epi32 vectors as [a0..a3 b0..b3 | a4..a7 b4..b7]; the
+            // permute restores natural order, 16 codes to one unaligned store. Every product
+            // stays within half an ulp of 32767, so the saturating pack can never clamp.
+            const auto packed = _mm256_permute4x64_epi64(
+                _mm256_packs_epi32(_mm256_cvtps_epi32(first), _mm256_cvtps_epi32(second)), 0xD8);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + i), packed);
+        }
+    }
+}
+
 // channel_block (the maximum unit width) lives in work.h.
 //
 // GateBits selects the gate/up plane's code width: 4 for the q4 family (q4_q5 / q4_q6), 8 for
@@ -608,7 +650,20 @@ inline void down(Work& work, const Group& group, int first, int channel,
         int indices[rows];
         for (int r = 0; r < rows; ++r) { indices[r] = channel + i + r; }
         float values[rows][Columns];
-        dot<Simd, DownBits, intermediate>(group.down, indices, input, values);
+        if constexpr (DownBits == 6 && std::is_base_of_v<common::cpu::avx2::F32, Simd>) {
+            // port (sm_89): the down pass's int16 tier. It reads the plane quantise_activation_i16
+            // filled between the two passes, and the slots its columns belong to (the same
+            // `slots + first` window gate_up uses through `tokens + first`), so the dot never has to
+            // re-derive which row of the plane this route owns.
+            if (work.down16_path) {
+                dot_q6_q16<Simd, intermediate, rows, Columns>(work, group.down, indices,
+                                                              group.slots + first, values);
+            } else {
+                dot<Simd, DownBits, intermediate>(group.down, indices, input, values);
+            }
+        } else {
+            dot<Simd, DownBits, intermediate>(group.down, indices, input, values);
+        }
         for (int r = 0; r < rows; ++r) {
             for (int c = 0; c < Columns; ++c) {
                 // port (sm_89): the grouped device kernel stores the per-expert down values as
@@ -686,6 +741,21 @@ template <class Simd, int DownBits, int GateBits, bool FourColumns>
         for (int member = 0; member < group.count; ++member) {
             present[group.slots[member]]       = true;
             coefficients[group.slots[member]] = group.coefficients[member];
+        }
+    }
+    if constexpr (std::is_base_of_v<common::cpu::avx2::F32, Simd>) {
+        if (work.down16_path) {
+            // One quantisation per chunk, not per output block: the down pass below reads the whole
+            // activation plane once per block, and re-quantising it there would multiply the peak
+            // scans by the number of blocks. Only the slots this chunk holds are touched - the rest
+            // of the plane is uninitialised on purpose and nothing reads it.
+            int quantised_slots[max_token_block * top_k];
+            int quantised_count = 0;
+            for (int slot = 0; slot < columns * top_k; ++slot) {
+                if (present[slot]) { quantised_slots[quantised_count++] = slot; }
+            }
+            quantise_activation_i16<Simd>(work, worker, quantised_slots, quantised_count);
+            worker.barrier();
         }
     }
     const auto outputs = worker.range(hidden / work.block);
@@ -821,48 +891,6 @@ template <class Simd>
             const auto second = _mm256_mul_ps(_mm256_loadu_ps(source + i + 8), factor);
             // packs_epi32 joins two epi32 vectors as [a0..a3 b0..b3 | a4..a7 b4..b7]; the
             // permute restores natural order, 16 codes to one unaligned store.
-            const auto packed = _mm256_permute4x64_epi64(
-                _mm256_packs_epi32(_mm256_cvtps_epi32(first), _mm256_cvtps_epi32(second)), 0xD8);
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + i), packed);
-        }
-    }
-}
-
-// port (sm_89): quantise the SwiGLU activation plane to int16 in the same 64-value groups the
-// six-bit down weights carry. This is the split form's quantise_floats_i16 (routed_swiglu/cpu/
-// split.cpp:306) over this form's slot addressing: the plane is per (token, route) slot, and only
-// the slots this chunk actually fills are quantised - the rest of it is uninitialised on purpose.
-//
-// The source is FLOAT. This form keeps the activation plane in FP32 (bf16-rounded when the device
-// regime asks for it, work.plane_round), so nothing in here decodes anything: reading a BF16 plane
-// as if it were FP16 is the mistake that once made a perplexity look 8.3% better, and passing the
-// float plane straight through the same peak/scale rule is what keeps that class of bug out.
-// Out of line so it cannot change the layout of the vector loop that runs when it is disabled.
-template <class Simd>
-[[gnu::noinline]] void quantise_activation_i16(Work& work, const CpuWorkerContext& worker,
-                                                const int* slots, int count) noexcept {
-    static_assert(std::is_base_of_v<common::cpu::avx2::F32, Simd>,
-                  "the int16 plane is written against AVX2 registers");
-    constexpr int kGroups = intermediate / 64;
-    const auto range      = worker.range(static_cast<std::size_t>(kGroups) * count);
-    for (auto g = range.begin; g < range.end; ++g) {
-        const int index     = static_cast<int>(g) / kGroups;
-        const int group     = static_cast<int>(g) % kGroups;
-        const int slot      = slots[index];
-        const float* source = work.scratch.activation + std::size_t(slot) * intermediate + group * 64;
-        float peak          = 0.0F;
-        for (int i = 0; i < 64; ++i) { peak = std::max(peak, std::fabs(source[i])); }
-        const float scale   = peak > 0.0F ? peak / 32767.0F : 0.0F;
-        const float inverse = scale > 0.0F ? 1.0F / scale : 0.0F;
-        work.scratch.activation_scale[std::size_t(slot) * kGroups + group] = scale;
-        auto* out = work.scratch.activation_q16 + std::size_t(slot) * intermediate + group * 64;
-        const auto factor = _mm256_set1_ps(inverse);
-        for (int i = 0; i < 64; i += 16) {
-            const auto first  = _mm256_mul_ps(_mm256_loadu_ps(source + i), factor);
-            const auto second = _mm256_mul_ps(_mm256_loadu_ps(source + i + 8), factor);
-            // packs_epi32 joins two epi32 vectors as [a0..a3 b0..b3 | a4..a7 b4..b7]; the
-            // permute restores natural order, 16 codes to one unaligned store. Every product
-            // stays within half an ulp of 32767, so the saturating pack can never clamp.
             const auto packed = _mm256_permute4x64_epi64(
                 _mm256_packs_epi32(_mm256_cvtps_epi32(first), _mm256_cvtps_epi32(second)), 0xD8);
             _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + i), packed);
