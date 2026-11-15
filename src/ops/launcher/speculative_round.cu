@@ -6,6 +6,8 @@
 
 #include "ops/common/math.h"
 #include "ops/kernel/speculative_round.cuh"
+
+#include <cstdlib>
 #include "core/device.h"
 
 #include <algorithm>
@@ -95,7 +97,7 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
             static_cast<std::int32_t*>(licensed_tokens.data),
             static_cast<std::int32_t*>(licensed_counts.data),
             static_cast<std::int32_t*>(accepted.data), configs, token_domain, cols, partial_blocks,
-            groups, scratch, layout.bytes);
+            groups, scratch, layout.bytes, 0);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -105,6 +107,8 @@ void speculative_accept_sparse_drafts_launch(
     Tensor& round_lengths, Tensor& round_anchors, Tensor& licensed_tokens, Tensor& licensed_counts,
     Tensor& accepted_drafts, std::int32_t token_domain, const SamplingConfig* configs,
     bool raw_greedy, DeviceSpan workspace, cudaStream_t stream) {
+    // NINFER_COUPLED_DRAFT: one uniform for the draft's pick and the target's pick of the same row.
+    static const int coupled = std::getenv("NINFER_COUPLED_DRAFT") != nullptr ? 1 : 0;
     const std::int32_t batch = drafts.ne[1];
     const std::int32_t k     = drafts.ne[0];
     const std::int32_t cols  = k + 1;
@@ -145,7 +149,7 @@ void speculative_accept_sparse_drafts_launch(
         static_cast<std::int32_t*>(licensed_tokens.data),
         static_cast<std::int32_t*>(licensed_counts.data),
         static_cast<std::int32_t*>(accepted_drafts.data), configs, token_domain, cols,
-        partial_blocks, groups, scratch, layout.bytes);
+        partial_blocks, groups, scratch, layout.bytes, coupled);
 
     CUDA_CHECK(cudaGetLastError());
 }

@@ -518,10 +518,18 @@ Measured acceptance across widths on v5_e2 (`pp64+tg32 --warmup 1`, accepted_per
 Column 0 lands at 55-45% and column 1 at ~21%, then ~6%, then zero: a marginal-predictor decay, which
 is what the design is - `core/dflash2.hpp:148-150` says "every row is its own column, the walk goes
 left to right", so only the selector carries the chain between columns. Nothing in the draft half is
-left to align; what remains is the verify side, where the reference's non-greedy acceptance couples
-the draft and the target to one uniform draw (`coupled_draft.hpp:3-12`) while this tree uses the
-classic ratio test, and the reference runs the block's arithmetic on q8 activations where this tree
-keeps BF16.
+left to align.
+
+The verify side's coupled acceptance is implemented too, and it measures worse here:
+`NINFER_COUPLED_DRAFT` makes the draft and the target share one uniform per row (counter = the row's
+absolute position, `coupled_draft.hpp:3-12`), so a draft is kept only when it equals the target's own
+pick (`speculative_round.cuh:197`, `coupled_target_pick` at `:183`). On v5_e2 at `--sampling-preset
+community` (temperature 0.6) that gives acceptance 0.0435 with `[6,1,0,...]` and 161 drafts over 25
+rounds, against 0.0719 with `[5,4,1,0,...]` and 139 drafts over 21 rounds for the classic ratio test -
+exact match is simply stricter than a probability ratio when the draft's sixteen candidates and the
+target's full distribution differ. It is therefore off by default (the ratio test is untouched, and
+greedy never enters either branch), and the only other numeric difference left is that the reference
+runs the block on q8 activations where this tree keeps BF16.
 
 **Layer-major + double-buffered prefill (last resort, measured).** `ExpertStream::ensure` still
 publishes and waits inside the layer, one staging ring of 32 slots, so the PCIe traffic a prefill

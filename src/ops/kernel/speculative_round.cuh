@@ -176,10 +176,29 @@ __global__ __launch_bounds__(256) void speculative_accept_sparse_warp_greedy_ker
                                    licensed_counts, accepted, row, extent, k);
 }
 
+// The target's own pick at one row: the inverse CDF of that row's truncated target distribution at
+// the caller's uniform. The coupled route draws the draft and the target with ONE uniform (counter =
+// the row's absolute position), so a draft is kept exactly when it equals this pick - the emitted
+// token is then the target's own sample whatever the draft was, and a weak draft only costs yield.
+__device__ __forceinline__ int coupled_target_pick(SamplingWorkspace workspace, int row_index,
+                                                   float u) {
+    const int support = workspace.dist_support[row_index];
+    int last          = 0;
+    float cumulative  = 0.0f;
+    for (int j = 0; j < support; ++j) {
+        const int at = sampling_dist_offset(row_index, j);
+        last         = workspace.dist_idx[at];
+        cumulative += workspace.dist_prob[at];
+        if (u < cumulative) { return last; }
+    }
+    return last;
+}
+
 __device__ __forceinline__ void speculative_sparse_warp_accept(
     SamplingWorkspace workspace, const int* drafts, const int* candidate_ids,
     const float* proposal_q, const SamplingConfig& cfg, int k, int row, int extent, bool greedy,
-    int* lengths, int* anchors, int* licensed_tokens, int* licensed_counts, int* accepted) {
+    bool coupled, int* lengths, int* anchors, int* licensed_tokens, int* licensed_counts,
+    int* accepted) {
     const int lane       = threadIdx.x & 31;
     const int old_length = lengths[row];
     bool reject          = false;
@@ -187,7 +206,14 @@ __device__ __forceinline__ void speculative_sparse_warp_accept(
         const int d = drafts[row * k + lane];
         if (greedy)
             reject = workspace.dist_idx[sampling_dist_offset(lane, 0)] != d;
-        else {
+        else if (coupled) {
+            // Coupled sampling (NINFER_COUPLED_DRAFT): the draft at this cell drew with the uniform of
+            // counter (old_length + lane) - the row that verifies it - so the same uniform decides
+            // the target's pick here and the draft is kept exactly when it equals that pick.
+            const float u =
+                sampling_uniform(cfg.seed, old_length + lane, kSamplePurposeDFlash2Proposal, 0);
+            reject = coupled_target_pick(workspace, lane, u) != d;
+        } else {
             const int support = workspace.dist_support[lane];
             float pd          = 0.0f;
             for (int j = 0; j < support; ++j) {
@@ -209,7 +235,12 @@ __device__ __forceinline__ void speculative_sparse_warp_accept(
     int terminal;
     if (greedy)
         terminal = workspace.dist_idx[sampling_dist_offset(a, 0)];
-    else {
+    else if (coupled) {
+        // The correction (or bonus) token is the same pick at row a: one target draw per row.
+        const float u =
+            sampling_uniform(cfg.seed, old_length + a, kSamplePurposeDFlash2Proposal, 0);
+        terminal = coupled_target_pick(workspace, a, u);
+    } else {
         const int n  = workspace.dist_support[a];
         int token    = 0;
         float weight = 0.0f;
@@ -502,7 +533,8 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     std::int32_t* lengths, std::int32_t* anchors, std::int32_t* licensed_tokens,
     std::int32_t* licensed_counts, std::int32_t* accepted, const SamplingConfig* configs,
     std::int32_t token_domain, std::int32_t cols, std::int32_t partial_blocks,
-    std::int32_t group_count, SamplingWorkspace workspace, std::size_t workspace_row_stride) {
+    std::int32_t group_count, SamplingWorkspace workspace, std::size_t workspace_row_stride,
+    int coupled) {
     const int row   = static_cast<int>(blockIdx.z);
     const int group = static_cast<int>(blockIdx.x);
     const int col   = static_cast<int>(blockIdx.y);
@@ -620,8 +652,8 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
             __syncthreads();
             if (last_column && tid < 32)
                 speculative_sparse_warp_accept(workspace, drafts, candidate_ids, proposal_q, cfg, k,
-                                               row, extent, true, lengths, anchors, licensed_tokens,
-                                               licensed_counts, accepted);
+                                               row, extent, true, coupled, lengths, anchors,
+                                               licensed_tokens, licensed_counts, accepted);
             if (last_column && tid == 0) *workspace.speculative_finalize_count = 0;
             return;
         }
@@ -640,8 +672,8 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
         __syncthreads();
         if (last_column && tid < 32)
             speculative_sparse_warp_accept(workspace, drafts, candidate_ids, proposal_q, cfg, k,
-                                           row, extent, false, lengths, anchors, licensed_tokens,
-                                           licensed_counts, accepted);
+                                           row, extent, false, coupled, lengths, anchors,
+                                           licensed_tokens, licensed_counts, accepted);
         if (last_column && tid == 0) *workspace.speculative_finalize_count = 0;
         return;
     } else {
