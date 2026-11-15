@@ -274,22 +274,37 @@ commits no new state and releases the sequence; it does not undo earlier adopted
 Work this tree has decided not to finish yet, with the measurement that says why. Every entry is
 "known unfinished", not "known good".
 
-**Verify rectangle columns 1..K (open, measured).** On v5_e2 with `--spec dflash2
---draft-tokens 8`, the target's own distribution collapses for every column after the anchor while
-column 0 stays healthy:
+**Verify rectangle columns 1..K (closed 2026-11-15: the collapse was a dump bug).** Every rate this
+document records for a column >= 1 before 2026-11-15 is void. `NINFER_DFLASH2_DUMP` sorted a
+full-vocabulary index vector and then shrank it to sixteen (`order.resize(kTop)`, `draft.cpp:1245`),
+so from column 1 on, `argmax`, the top-16 list, `overlap` and `unary_rank` all described a
+sixteen-token vocabulary - which is exactly why column 1 read 0.0% in every round, why its "top-1
+logit" was 9.2 against column 0's 25.1, and why columns 2..7 looked like noise. The vector now keeps
+its full length and the top-k is a copy; the same run reports the marginal-predictor decay the design
+predicts:
 
-| column | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| draft top-1 inside target top-16 | 85.7% | 0.0% | 8.6% | 22.9% | 20.0% | 14.3% | 22.9% | 28.6% |
-| draft top-1 == target argmax | 71.4% | 0.0% | 5.7% | 17.1% | 11.4% | 8.6% | 11.4% | 11.4% |
-| top-1 logit | 25.1 | 9.2 | 8.8 | 9.1 | 10.8 | 9.1 | 9.5 | 8.6 |
+| column | 0 | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| selector_hit (pick == target argmax) | 51.6% | 38.7% | 22.6% | 16.1% | 16.1% | 19.4% | 25.8% |
+| top-16 recall (argmax inside the candidates) | 93.5% | 74.2% | 54.8% | 32.3% | 54.8% | 48.4% | 45.2% |
+| top-1 logit | 20.9 | 20.5 | 18.2 | 17.9 | 16.2 | 16.2 | 14.6 |
+| nested (rounds accepting at least this many) | 16 | 7 | 4 | 2 | 2 | 2 | 1 |
+
+v5_e2, greedy, `--no-cuda-graph -pg 64,64 --spec dflash2 --draft-tokens 7 --warmup 0 -r 1`, 31 rounds,
+217 drafted columns. The engine's own `accepted_per_position` is `[16, 6, 4, 2, 2, 2, 1]`: one round
+apart, and that round is a target argmax tie.
+
+Everything below that quotes a rate for a column >= 1 is void for the same reason. The mask, ring,
+ladder and selector conclusions underneath still stand, but on the k=1 acceptance experiments and on
+column 0, which the bug never touched - not on a column-1 cliff, because there was none: the decay from
+column 0 to column 6 is 51.6% -> 25.8% with recall 93.5% -> 45.2%, i.e. a marginal predictor, which is
+what `core/dflash2.hpp:148-150` describes.
 
 Two things are ruled out by measurement rather than argument. The columns are addressed correctly:
 `NINFER_DFLASH2_DUMP` shows cache and RoPE positions stepping `F, F+1, ... F+7` and each column's
 first residual words at O(1), so neither a broadcast column nor a wrong position is the cause. And
 the sparse indexer is not the cause: `NINFER_QSA_FORCE_FULL=1` (the dense arm, a different mixer for
-every indexed layer) shows the same collapse (column 1: 0.0%, columns 2..7: 0.0-4.3%) while column 0
-stays at 73.9/30.4%.
+every indexed layer) moves nothing while column 0 stays at 73.9/30.4%.
 
 A per-column magnitude probe (`NINFER_VERIFY_COLUMN_PROBE`, `verify_probe.h`) adds a third exclusion:
 the rectangle's state is carried, column by column. On the same artifact the GDN recurrence, the
@@ -331,14 +346,13 @@ whether the rows are the same class. What the probe does confirm: `mask_token_id
 slot (`draft.cpp:484-488`, `hidden` is `{hidden_size, k}`), so no row is shared and no column reads
 another's row.
 
-Combined with the behavioural record - column 0 at 57-71% of the target's own argmax, column 1 at 0.0%
-in every measured round, acceptance never above one token, and `--draft-tokens 1` reaching 60% - the
-honest reading is that **DFlash2 in this tree effectively supports k = 1** on this artifact. The next
-attempt should therefore either (a) default `--draft-tokens 1` for a DFlash2 qwen4exp artifact so the
-shipped path stops paying for columns it cannot accept, or (b) build the missing measurement: a
-teacher-conditioned comparison needs the draft's training-time conditioning, and this tree has no
-tensor for it, so it would have to come from the reference implementation, not from another probe. Accepted run length never exceeds one
-token (histogram `0:10, 1:25` over 35 rounds), so `k` currently buys overhead and no extra acceptance.
+Combined with the behavioural record - column 0 at 51.6% of the target's own argmax, columns 1..6 at
+16-39% (corrected table above), and the k ladder measuring acc 0.5500 at k=1 down to 0.1217 at k=7 - the
+honest reading is that DFlash2 in this tree is a marginal predictor whose useful width is set by
+throughput, not by a broken column. An earlier version of this entry concluded "effectively k = 1"
+from column 1 reading 0.0%; that reading was the dump bug and the conclusion is withdrawn. Accepted run
+length never exceeds one token in the pre-fix dumps (histogram `0:10, 1:25` over 35 rounds); the fixed
+dump's nested survival is `[16, 7, 4, 2, 2, 2, 1]`, so longer windows do accept, just rarely.
 
 **Block-causal two-pass (superseded, kept for the numbers).** The entry below implements the
 ring-only form the reference actually has; everything here was measured against the causal and
@@ -531,32 +545,22 @@ target's full distribution differ. It is therefore off by default (the ratio tes
 greedy never enters either branch), and the only other numeric difference left is that the reference
 runs the block on q8 activations where this tree keeps BF16.
 
-**Selector hit against candidate recall (probed).** `NINFER_DFLASH2_DUMP` now appends two booleans per
+**Selector hit against candidate recall (probed).** `NINFER_DFLASH2_DUMP` appends two booleans per
 (round, column): `selector_hit`, the selector's pick equals the target's argmax at that column, and
 `topk_recall`, that argmax is inside the column's sixteen candidates at all. They separate a badly
 ranked candidate set from a badly ranked pick. The dump is deterministic to the bit - two runs of the
-same command produce files with the same SHA-256, and every column keeps its rates within one round of
-the average - so these are not sampling artefacts. `--spec dflash2 --draft-tokens 7`, 31 rounds:
-
-| column | selector_hit | topk_recall |
-|---:|---:|---:|
-| 0 | 51.6% | 93.5% |
-| 1 | 0.0% | 22.6% |
-| 2 | 3.2% | 29.0% |
-| 3 | 3.2% | 25.8% |
-| 4 | 3.2% | 12.9% |
-| 5 | 6.5% | 25.8% |
-| 6 | 9.7% | 19.4% |
-| 7 | 0.0% | 0.0% (no proposal: the bonus column) |
+same command produce files with the same SHA-256 - so these are not sampling artefacts.
+`--spec dflash2 --draft-tokens 7`, 31 rounds: the table is the corrected one at the top of this
+register (51.6 / 38.7 / 22.6 / 16.1 / 16.1 / 19.4 / 25.8 for hit, 93.5 / 74.2 / 54.8 / 32.3 / 54.8 /
+48.4 / 45.2 for recall). The values this section carried before 2026-11-15 (column 1 at 0.0%) were the
+`order.resize` bug, not the model.
 
 Column 0 is a *ranking* failure, not a candidate failure: the answer is among the sixteen in 93.5% of
-rounds and the selector converts 51.6 of those, i.e. the unary+edge score loses about forty points
-against its own candidate set. Column 1 is the opposite: recall collapses to 22.6%, so the right token
-is usually not a candidate at all - a task/distribution mismatch, and no selector tuning can recover
-it. Columns 2..6 sit at 13-29% recall with a 2-14% hit, so they are candidate-limited too. The drop
-from column 0 to column 1 is a cliff, not a smooth decay, and it lands exactly on the first column
-that has to predict a token without the draft knowing its predecessor's pick (`core/dflash2.hpp:148-150`:
-the block's rows are independent columns, the walk is the only link).
+rounds and the selector converts 51.6 of them, i.e. the unary+edge score loses about forty points
+against its own candidate set. Columns 1..6 are both: recall falls to 32-74% and the hit to 16-39%, so
+part of the loss is the right token never being a candidate. The decay from column 0 to column 6 is the
+marginal-predictor decay of a block whose rows are independent columns and whose only link is the walk
+(`core/dflash2.hpp:148-150`), spread over six columns rather than concentrated at column 1.
 
 `unary` is the head's raw score on both sides: `linear_topk` returns `s_{v,t} = sum_k
 dequant(head)_{v,k} * hidden_{k,t}` with no softmax or temperature (`linear_topk.h:32-35`), the
@@ -628,6 +632,59 @@ two heads - the draft's Q8 head and the target's Q5 head. What would settle how 
 layer is running the target head on the draft's own hidden row: `linear_topk` already registers Q5 with
 the full head (`src/ops/linear_topk/linear_topk.cpp:48`), so it is one extra launch per round behind an
 env switch, but this session measured only the rank distribution above.
+
+**Dynamic-threshold draft tree (assessed offline, not implemented).** The question was whether keeping
+candidates by a cumulative score threshold - a tree whose width is decided per column instead of a
+fixed top-k - recovers enough acceptance to pay for the extra verified tokens. It is answered from the
+selector's own scores rather than by building the tree, because the scores decide it.
+
+Scores: no dump carried them (candidate ids alone cannot price a branch: "the right token was rank 3"
+says nothing about how many tokens a tree must verify to keep it). `NINFER_SELECTOR_EDGE_PROBE` now
+makes the lattice route keep its `(column, predecessor rank)` score lattice - the route already builds
+all 16x16 of it for `K > 4` and reads only the diagonal - and `NINFER_DFLASH2_EDGE_DUMP` writes it as
+`step,column,rank,argmax,ids[16],edge[16]`. Both are off by default; the buffer is 120 KiB, allocated
+once, and a direct-route (K<=4) launch clears it instead of leaving a stale lattice. The simulation
+(`H:\TeleAgentWorks\.temp\tree_sim.py`) keeps, per column, the score-sorted candidates until their
+softmax mass reaches tau, walks the resulting tree with an exact node-count DP (nodes are what the
+target verifies and what the expert union sees), and scores acceptance against the target argmax the
+single-chain verify wrote at that column - so an untaken branch inherits the chain's distribution and
+its acceptance is an upper bound. The chain row of the same simulation reproduces the engine: 0.1567 /
+2.0968 against 0.1579 / 2.0645.
+
+| tau | branches per column 0..6 | nodes/round | paths/round | acc | len | cost vs chain |
+|---:|---|---:|---:|---:|---:|---:|
+| 0.5 | 1.61 1.45 1.40 1.65 1.66 1.46 1.56 | 85.8 | 38.0 | 0.2120 | 2.484 | 10.7x |
+| 0.6 | 2.03 1.74 1.77 1.83 1.91 1.89 1.84 | 343.7 | 188.6 | 0.2350 | 2.645 | 43.0x |
+| 0.7 | 2.52 2.27 2.13 2.14 2.31 2.40 2.12 | 1545.1 | 991.7 | 0.2442 | 2.710 | 193x |
+| 0.8 | 3.32 2.84 2.85 2.90 3.03 3.04 2.80 | 9156.1 | 6639.0 | 0.2765 | 2.935 | 1145x |
+| 0.9 | 4.65 4.14 4.22 4.01 4.24 4.19 4.07 | 100117 | 80313 | 0.2903 | 3.032 | 12515x |
+
+Cost is the number of tree nodes over the 8-row chain, because a tree is verified in full whether or
+not its branches were right. The gain is real and front-loaded (tau 0.5 buys +5.5 points of acceptance
+for 10.7x the verify rows) and the cost is the product of the per-column widths, not their sum, so
+every tau below 0.9 is already dead. Two smaller shapes were priced to be sure the number is not an
+artefact of branching everywhere:
+
+| shape | nodes/round | acc | cost | speed |
+|---|---:|---:|---:|---:|
+| branch at columns 0-1 only, tau 0.5 | 16.7 | 0.1889 | 2.09x | 0.53 |
+| branch at column 0 only, tau 0.5 | 12.3 | 0.1843 | 1.54x | 0.71 |
+| gate: column 0 keeps two only when p(top-1) < 0.4 | 9.8 | 0.1705 | 1.23x | 0.85 |
+| k=3 window, column 0 only, tau 0.5 | 5.8 | 0.3548 | 1.46x | 0.76 |
+| ceiling: all 16 kept at every column | 2.9e8 | 0.3825 | 3.6e7x | 0.00 |
+
+`speed` is `(len / 2.0968) / cost`, i.e. tokens per unit of verify work; it is below 1 everywhere and
+the best row (the gate) is 0.85. The ceiling is the structural reason: even keeping all sixteen at every
+column reaches only 38.25% acceptance, because from column 1 on the target's argmax is often not in the
+candidate set at all (recall 32-74%). So the branching cannot buy more than the candidate coverage
+allows, and what it does buy costs more rows than it returns.
+
+Verdict: **do not implement a threshold tree on this artifact.** There is no tau at which the acceptance
+gain exceeds the verify-cost increase; the cheapest useful shape (gate at p < 0.4, +1.4 points, 1.23x
+rows) still lands at 0.85x tokens per unit of work, and the k=3 variant is 0.76x. The lever stays where
+the earlier sections put it: the draft head's ranking at column 0 and the candidate recall at columns
+1..6, not the shape of the verify rectangle.
+
 **Layer-major + double-buffered prefill (last resort, measured).** `ExpertStream::ensure` still
 publishes and waits inside the layer, one staging ring of 32 slots, so the PCIe traffic a prefill
 needs is serial with the SMs. The sizing is measured: a 512-token prefill touches up to the layer's
@@ -721,10 +778,10 @@ With rings, slots, positions, ids, buffers and mixers all closed by measurement,
 mechanism left is the selector's sequential conditioning: `candidate_selector_path` receives
 `predecessor_codebook` / `successor_codebook` with per-column candidates, scores and the rank-256
 projection (`draft.cpp:508-517`). Column 0 is conditioned on the anchor through the predecessor
-codebook, and every later column has to be conditioned on the token the previous column selected. A
-cliff at column 1 - 0.0% in every round while columns 2..7 sit at 5-17% - is what a selector that never
-applies the successor codebook would look like: the later columns' own `selected` values then drift
-towards whatever the plain head produced, which is why they are not zero.
+codebook, and every later column has to be conditioned on the token the previous column selected. The
+"cliff at column 1" this paragraph used to argue from was the dump bug corrected at the top of this
+register; the per-column decay it was explaining does not have a cliff, so nothing here needs the
+successor-codebook hypothesis.
 The selector was checked at its kernel and it is not the gap either. `selector_walk_kernel`
 (`candidate_selector/bf16/candidate_selector_path.cu:92-115`) starts `shared.predecessor` at the
 anchor, walks `step = 0..steps-1` in order, and after each column sets

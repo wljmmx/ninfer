@@ -32,4 +32,10 @@ void candidate_selector_path_dispatch(const Tensor& candidate_ids, const Tensor&
                                       const Tensor& base_positions, const SamplingConfig* configs,
                                       Tensor& drafts, Tensor& proposal_q, WorkspaceArena& workspace,
                                       cudaStream_t stream);
+
+// Probe, off by default (NINFER_SELECTOR_EDGE_PROBE): the last lattice-route launch's scores, one
+// [16 candidates, 16 predecessor ranks] block per column, flat as ((column*16)+rank)*16+candidate.
+// `columns` is steps*batch; it reads 0 when the probe is off or the last launch took the direct
+// route, which leaves the buffer stale rather than wrong.
+const float* candidate_selector_edge_probe(std::int32_t& columns, std::int32_t& batch);
 } // namespace ninfer::ops::detail

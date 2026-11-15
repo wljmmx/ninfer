@@ -9,6 +9,39 @@
 namespace ninfer::ops::detail {
 namespace {
 constexpr int kCandidates = 16, kRank = 256;
+// Probe ceiling: every legal K/B pair the route accepts (K<=15, B<=8). 120 KiB, allocated once and
+// only when NINFER_SELECTOR_EDGE_PROBE asks for it.
+constexpr int kProbeSteps = 15, kProbeBatch = 8;
+
+// NINFER_SELECTOR_EDGE_PROBE: keep the lattice route's scores. The walk itself only reads the
+// diagonal, but a branched tree has to know what a column would have scored under a predecessor the
+// walk did not take, and that is exactly the (column, predecessor rank) lattice this route already
+// builds (selector_lattice_kernel). Off by default: with the variable unset the launch is unchanged.
+float* g_edge_probe          = nullptr;
+std::int32_t g_probe_columns = 0;
+std::int32_t g_probe_batch   = 0;
+
+bool edge_probe_enabled() {
+    const char* env = std::getenv("NINFER_SELECTOR_EDGE_PROBE");
+    return env != nullptr && *env != '\0' && *env != '0';
+}
+
+void publish_edge_probe(const float* edges, int columns, int batch, cudaStream_t stream) {
+    if (g_edge_probe == nullptr) {
+        const std::size_t floats = std::size_t{kProbeSteps} * kProbeBatch * kCandidates * kCandidates;
+        if (cudaMalloc(&g_edge_probe, floats * sizeof(float)) != cudaSuccess) {
+            g_edge_probe = nullptr;
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    }
+    if (columns < 1 || columns > kProbeSteps * kProbeBatch || batch < 1 || batch > kProbeBatch)
+        return;
+    const std::size_t bytes = std::size_t{columns} * kCandidates * kCandidates * sizeof(float);
+    CUDA_CHECK(cudaMemcpyAsync(g_edge_probe, edges, bytes, cudaMemcpyDeviceToDevice, stream));
+    g_probe_columns = columns;
+    g_probe_batch   = batch;
+}
 
 struct DeviceArgs {
     const std::int32_t* ids;
@@ -179,6 +212,8 @@ void candidate_selector_path_launch(SelectorRoute route, const Tensor& candidate
                               const char* env = std::getenv("NINFER_SELECTOR_EDGE_SCALE");
                               return env != nullptr && *env != '\0' ? std::atof(env) : 1.0F;
                           }()};
+    const bool probe = edge_probe_enabled();
+    if (probe) g_probe_columns = 0;
     if (route == SelectorRoute::Direct) {
         selector_walk_kernel<<<candidate_ids.ne[2], 512, 0, stream>>>(args);
     } else {
@@ -187,7 +222,15 @@ void candidate_selector_path_launch(SelectorRoute route, const Tensor& candidate
                                   stream>>>(args, edges);
         CUDA_CHECK(cudaGetLastError());
         selector_lattice_walk_kernel<<<candidate_ids.ne[2], 32, 0, stream>>>(args, edges);
+        if (probe) publish_edge_probe(edges, args.steps * candidate_ids.ne[2], candidate_ids.ne[2],
+                                      stream);
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+const float* candidate_selector_edge_probe(std::int32_t& columns, std::int32_t& batch) {
+    columns = g_probe_columns;
+    batch   = g_probe_batch;
+    return g_probe_columns > 0 ? g_edge_probe : nullptr;
 }
 } // namespace ninfer::ops::detail

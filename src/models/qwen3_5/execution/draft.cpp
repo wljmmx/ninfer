@@ -1169,6 +1169,22 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                 if (file != nullptr) {
                     static std::atomic<std::uint64_t> steps{0};
                     const std::uint64_t step = steps.fetch_add(1);
+                    // NINFER_DFLASH2_EDGE_DUMP=<path>: the selector's own scores, which no other dump
+                    // carries - ids alone cannot price a branch, because "the right token was rank 3 in
+                    // this column" says nothing about how many tokens a tree would have to verify to
+                    // keep it. The k=7 window takes the lattice route, so all sixteen predecessor rows
+                    // exist and a tree can be priced offline instead of guessed. One line per (column,
+                    // predecessor rank): step, column, rank, target argmax, 16 ids, 16 scores. Empty
+                    // when the probe is off or the round ran a short direct-route window.
+                    const char* edge_path       = std::getenv("NINFER_DFLASH2_EDGE_DUMP");
+                    static std::FILE* edge_file = edge_path != nullptr ? std::fopen(edge_path, "wb")
+                                                                       : nullptr;
+                    std::int32_t probe_columns  = 0;
+                    std::int32_t probe_batch    = 0;
+                    const float* probe_scores =
+                        edge_file != nullptr
+                            ? ops::candidate_selector_edge_probe(probe_columns, probe_batch)
+                            : nullptr;
                     const auto vocab         = dimension(
                         state.execution.parameters.model.config().text.vocab_size);
                     const std::size_t words = static_cast<std::size_t>(vocab);
@@ -1226,24 +1242,26 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                              return logits[static_cast<std::size_t>(lhs)] >
                                                     logits[static_cast<std::size_t>(rhs)];
                                          });
-                        order.resize(kTop);
-                        std::sort(order.begin(), order.end(),
+                        // `order` stays full length: shrinking it to kTop made every column after the
+                        // first sort tokens 0..15 only, so argmax, top-16 and overlap described a
+                        // sixteen-token vocabulary from column 1 on. The top-k copy is what is read.
+                        std::vector<std::int32_t> top(order.begin(), order.begin() + kTop);
+                        std::sort(top.begin(), top.end(),
                                   [&](std::int32_t lhs, std::int32_t rhs) {
                                       return logits[static_cast<std::size_t>(lhs)] >
                                              logits[static_cast<std::size_t>(rhs)];
                                   });
-                        const std::int32_t argmax = order.front();
+                        const std::int32_t argmax = top.front();
                         int overlap               = -1;
                         int hit                   = -1;
                         if (has_candidates) {
                             overlap = 0;
                             for (std::int32_t id : candidates) {
-                                overlap += std::find(order.begin(), order.end(), id) != order.end()
+                                overlap += std::find(top.begin(), top.end(), id) != top.end()
                                                ? 1
                                                : 0;
                             }
-                            hit = std::find(order.begin(), order.end(), candidates.front()) !=
-                                          order.end()
+                            hit = std::find(top.begin(), top.end(), candidates.front()) != top.end()
                                       ? 1
                                       : 0;
                         }
@@ -1260,7 +1278,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                      static_cast<unsigned long long>(step), column, anchor,
                                      candidates.front(), selected, argmax, hit, overlap, fed);
                         for (std::int32_t id : candidates) { std::fprintf(file, ",%d", id); }
-                        for (std::int32_t id : order) { std::fprintf(file, ",%d", id); }
+                        for (std::int32_t id : top) { std::fprintf(file, ",%d", id); }
                         // Where this column thinks it is, and what the target actually wrote there:
                         // the first four words of the column's hidden plus its norm, and how peaked
                         // the column's logits are. A column whose prediction is merely wrong still
@@ -1300,7 +1318,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                         }
                         logit_var /= double(words);
                         const float top1 = logits[static_cast<std::size_t>(argmax)];
-                        const float top2 = logits[static_cast<std::size_t>(order[1])];
+                        const float top2 = logits[static_cast<std::size_t>(top[1])];
                         std::fprintf(file, ",%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f",
                                      cache_position, rope_position, head_value(head[0]),
                                      head_value(head[1]), head_value(head[2]), head_value(head[3]),
@@ -1334,6 +1352,33 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                         }
                         std::fprintf(file, ",%d,%d,%d,%.6f", selector_hit, topk_recall, unary_rank,
                                      logit_gap);
+                        if (probe_scores != nullptr && has_candidates && probe_batch == 1 &&
+                            probe_columns == static_cast<std::int32_t>(k)) {
+                            std::vector<float> edge(
+                                static_cast<std::size_t>(kCandidates) * kCandidates);
+                            CUDA_CHECK(cudaMemcpyAsync(
+                                edge.data(),
+                                probe_scores + static_cast<std::size_t>(column) * kCandidates *
+                                                   kCandidates,
+                                edge.size() * sizeof(float), cudaMemcpyDeviceToHost, s));
+                            CUDA_CHECK(cudaStreamSynchronize(s));
+                            for (std::int32_t rank = 0; rank < kCandidates; ++rank) {
+                                std::fprintf(edge_file, "%llu,%d,%d,%d",
+                                             static_cast<unsigned long long>(step), column, rank,
+                                             argmax);
+                                for (std::int32_t id : candidates) {
+                                    std::fprintf(edge_file, ",%d", id);
+                                }
+                                for (std::int32_t c = 0; c < kCandidates; ++c) {
+                                    std::fprintf(
+                                        edge_file, ",%.6f",
+                                        double(edge[static_cast<std::size_t>(rank) * kCandidates +
+                                                    c]));
+                                }
+                                std::fputc('\n', edge_file);
+                            }
+                            std::fflush(edge_file);
+                        }
                         std::fputc('\n', file);
                     }
                     std::fflush(file);

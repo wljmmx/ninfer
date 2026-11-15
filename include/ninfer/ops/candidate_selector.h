@@ -32,9 +32,7 @@ namespace ninfer::ops {
  *                   * successor_codebook[r,candidate_ids[c,i,b]].
  *
  * A row with configs[b].temperature<=0 selects the lowest candidate rank attaining max(edge) and
- * writes the temperature-1 softmax of edge - the pick's probability, which is what a confidence
- * floor reads; the draw below is the only consumer of proposal_q, so this changes no decision. A
- * positive-temperature row writes the FP32 softmax of
+ * writes its exact one-hot distribution. A positive-temperature row writes the FP32 softmax of
  * edge/temperature, then draws a candidate with counter key
  * (configs[b].seed,base_positions[b]+i,kSamplePurposeDFlash2Proposal). The selected global id is
  * written to drafts[i,b] and becomes the next predecessor. The Op ignores all other
@@ -44,6 +42,10 @@ namespace ninfer::ops {
  * completely overwritten. Inputs, outputs, codebooks, and the config array must be pairwise
  * non-overlapping. The Op has no persistent state or internal allocation. Caller workspace is
  * transient and must not overlap any input or output.
+ *
+ * Probe, off unless NINFER_SELECTOR_EDGE_PROBE is set: a lattice-route launch then also keeps its
+ * score lattice in a 120 KiB device buffer owned by the Op, which candidate_selector_edge_probe
+ * reads back. A direct-route launch allocates nothing and clears what a previous lattice launch left.
  */
 void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_scores,
                              const Tensor& projected_hidden, const Tensor& anchors,
@@ -51,5 +53,15 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
                              const Tensor& base_positions, const SamplingConfig* configs,
                              Tensor& drafts, Tensor& proposal_q, WorkspaceArena& workspace,
                              cudaStream_t stream);
+
+/**
+ * The probe behind NINFER_SELECTOR_EDGE_PROBE. Returns the last lattice-route launch's scores, one
+ * [16 candidates, 16 predecessor ranks] block per column, flat as
+ * ((column * 16 + predecessor_rank) * 16 + candidate_rank), which is the kernel's own indexing.
+ * `columns` is steps * batch and `batch` the launch's batch. Returns nullptr, with `columns` 0, when
+ * the probe is off or the last launch took the direct route (K<=4), so a caller never reads a stale
+ * lattice as if it belonged to the round it just ran.
+ */
+const float* candidate_selector_edge_probe(std::int32_t& columns, std::int32_t& batch);
 
 } // namespace ninfer::ops

@@ -125,4 +125,8 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
         successor_codebook, base_positions, configs, drafts, proposal_q, workspace, stream);
 }
 
+const float* candidate_selector_edge_probe(std::int32_t& columns, std::int32_t& batch) {
+    return detail::candidate_selector_edge_probe(columns, batch);
+}
+
 } // namespace ninfer::ops
