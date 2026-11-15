@@ -304,9 +304,17 @@ inline void quantise_floats_i16_groups(const float* x, std::int32_t width, Q8Inp
 // collective, which is how the row-split path pays it in parallel with the row split itself.
 inline void quantise_floats_i16(const float* x, std::int32_t tokens, std::int32_t width,
                                 Q8Input& q8, const CpuWorkerContext& worker) {
-    const int groups = width / 64;
-    const auto range = worker.range(static_cast<std::size_t>(tokens) * groups);
+    const int groups  = width / 64;
+    const auto range  = worker.range(static_cast<std::size_t>(tokens) * groups);
     quantise_floats_i16_groups(x, width, q8, range.begin, range.end);
+}
+
+// And over the whole plane, for the flattened path: the thread that owns an expert quantises that
+// expert's activation itself, because there is no collective to share it with.
+inline void quantise_floats_i16_all(const float* x, std::int32_t tokens, std::int32_t width,
+                                    Q8Input& q8) {
+    const int groups = width / 64;
+    quantise_floats_i16_groups(x, width, q8, 0, static_cast<std::size_t>(tokens) * groups);
 }
 
 // The q4 nibble dot: 32 codes per instruction pair against an int8 activation plane, instead of eight
@@ -623,7 +631,8 @@ struct Work {
     int gate_bits = 4, down_bits = 6;
     Matrix gate, up, down;
     std::vector<std::int32_t> experts;
-    // [lane][expert]. Each lane carries its own route table: two lanes never share a member list.
+    // [lane][expert]. Each lane carries its own route table: two lanes never share a member list,
+    // which is what makes a flattened (lane, expert) task table race-free across lanes.
     std::vector<std::vector<std::vector<Member>>> members;
     // NINFER_MOE_CPU_INT8: the same switch the fused form reads, now honoured here. Off keeps the bf16
     // decode this form has always used; on routes the four-bit gate/up through the q4 nibble dot and
@@ -635,6 +644,10 @@ struct Work {
     // switch so the finding is reproducible, not deleted so the vectorised version has somewhere to
     // land.
     bool q6_path = false;
+    // True when no token of a lane appears in more than one of that call's experts. Two experts that
+    // share a token fold into the same output element, so only the disjoint case may run its tasks on
+    // several threads at once.
+    bool flatten_disjoint = false;
     std::vector<Q8Input> q8;     // [lane] gate/up: the bf16 input, quantised once per collective
     std::vector<Q8Input> q8_act; // [lane] down: the SwiGLU activation, quantised once per expert
 };
@@ -712,22 +725,32 @@ inline std::chrono::steady_clock::time_point split_phase_mark(bool probe) {
     return probe ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 }
 
-void run_expert(Work& w, Scratch& s, const CpuWorkerContext& worker, std::size_t index) noexcept {
+// One unit of work for the flattened table: a lane, one of that lane's experts, and the buffers that
+// task owns. A task is the whole expert, so two tasks never meet inside one expert's rows.
+struct ExpertJob {
+    std::int32_t lane       = 0;
+    std::size_t index       = 0;          // position in work.experts
+    float* activation       = nullptr;    // [token][intermediate] for this task alone
+    Q8Input* activation_q8  = nullptr;    // the down pass's quantised copy of it
+};
+
+// worker == nullptr is the flattened mode: this thread owns every row of the expert, so the two
+// barriers the row split needs between its passes have nothing to synchronise and are dropped.
+void run_expert(Work& w, Scratch& s, const CpuWorkerContext* worker,
+                const ExpertJob& job) noexcept {
     const bool phase_probe = split_phase_probe();
     const auto phase_begin = split_phase_mark(phase_probe);
-    const auto expert = static_cast<std::uint32_t>(w.experts[index]);
+    const auto expert = static_cast<std::uint32_t>(w.experts[job.index]);
     // The member table is indexed by expert id, not by the position in `experts`: the two part
     // company whenever the subset skips an expert, and reading the position applies the previous
     // expert's routes (and their coefficients) to this one's weights.
-    // lanes == 1 on this path, so each table holds one element and these are the same addresses the
-    // scalar fields named before the lane dimension existed.
-    const auto* lane_x      = w.x[0];
-    float* const lane_out   = w.output[0];
-    float* const activation = w.activation[0];
-    auto& q8_in             = w.q8[0];
-    auto& q8_act            = w.q8_act[0];
-    const auto& members = w.members[0][expert];
+    const auto& members = w.members[static_cast<std::size_t>(job.lane)][expert];
     if (members.empty()) { return; }
+    const auto* lane_x      = w.x[static_cast<std::size_t>(job.lane)];
+    float* const lane_out   = w.output[static_cast<std::size_t>(job.lane)];
+    float* const activation = job.activation;
+    auto& q8_in             = w.q8[static_cast<std::size_t>(job.lane)];
+    auto& q8_act            = *job.activation_q8;
     const auto count = members.size();
     const int groups = w.hidden / 64;
     for (std::size_t m = 0; m < count; ++m) {
@@ -741,9 +764,14 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext& worker, std::size_t
             s.q8_scale[m] = q8_in.scale.data() + token * groups;
         }
     }
+    // The row range of one pass: the team's slice, or the whole plane when this thread owns the
+    // expert. Expressed once so the two modes cannot drift apart.
+    const auto rows = [worker](std::size_t items) {
+        return worker != nullptr ? worker->range(items) : CpuWorkRange{0, items};
+    };
     const auto gate_base = w.gate.expert(expert);
     const auto up_base   = w.up.expert(expert);
-    const auto gate_rows = worker.range(static_cast<std::size_t>(w.intermediate));
+    const auto gate_rows = rows(static_cast<std::size_t>(w.intermediate));
     for (auto i = gate_rows.begin; i < gate_rows.end; ++i) {
         const auto row = static_cast<std::int32_t>(i);
         const auto gate_row = row_at(gate_base, row, w.hidden, w.gate_bits);
@@ -765,7 +793,7 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext& worker, std::size_t
                 common::silu_stable(s.gate[m]) * s.up[m];
         }
     }
-    worker.barrier();
+    if (worker != nullptr) { worker->barrier(); }
     // The MoE down matrix on this artifact is SIX-bit (measured: only this arm's branch responds,
     // and code_bits() refuses Q5, so the 501 q5 objects in conversion.json belong to other
     // projections). It decoded in bf16 until now while gate/up already had the int8 path.
@@ -775,8 +803,15 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext& worker, std::size_t
     // fine-grained int8 plane is not shipped. Both arms stay behind switches for further work.
     const bool down_int16 = w.down_bits == 6 && w.q6_path;
     if (down_int16) {
-        quantise_floats_i16(activation, w.tokens, w.intermediate, q8_act, worker);
-        worker.barrier();
+        if (worker != nullptr) {
+            quantise_floats_i16(activation, w.tokens, w.intermediate, q8_act, *worker);
+            worker->barrier();
+        } else {
+            // One thread owns the whole expert, so it also owns the whole quantisation: leaving this
+            // on a worker.range would have every thread quantise a slice of a plane only one of them
+            // is computing.
+            quantise_floats_i16_all(activation, w.tokens, w.intermediate, q8_act);
+        }
         const int act_groups = w.intermediate / 64;
         for (std::size_t m = 0; m < count; ++m) {
             const auto token = static_cast<std::size_t>(members[m].token);
@@ -788,7 +823,7 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext& worker, std::size_t
 
     // down_h . a_t folded in with the member's coefficient; the output is [hidden, tokens].
     const auto down_base = w.down.expert(expert);
-    const auto out_rows  = worker.range(static_cast<std::size_t>(w.hidden));
+    const auto out_rows  = rows(static_cast<std::size_t>(w.hidden));
     for (auto h = out_rows.begin; h < out_rows.end; ++h) {
         const auto row      = static_cast<std::int32_t>(h);
         const auto down_row = row_at(down_base, row, w.intermediate, w.down_bits);
@@ -840,7 +875,7 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext& worker, std::size_t
                 members[m].coefficient * s.down[m];
         }
     }
-    worker.barrier();
+    if (worker != nullptr) { worker->barrier(); }
     if (phase_probe) {
         const auto phase_end = std::chrono::steady_clock::now();
         auto& totals         = split_phase_totals();
@@ -849,6 +884,56 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext& worker, std::size_t
         totals.down_us += std::chrono::duration<double, std::micro>(phase_end - phase_gate_end).count();
         ++totals.experts;
     }
+}
+
+// The flattened table: one task per (lane, expert), where a task is a whole expert - every row of both
+// passes on the thread that owns it - so the two barriers the row split needs between its passes have
+// nothing left to synchronise.
+//
+// Two experts of one lane can be in flight on two threads (they share that lane's activation plane and
+// its quantised copy), so each task carries both buffers itself. The lane's output slice is the only
+// thing tasks have in common, and that is why the table may only run in parallel when no token of a
+// lane belongs to two of this call's experts: two such tasks would accumulate the same element.
+void run_flattened(Work& work, Scratch& scratch, const CpuWorkerContext& worker) {
+    std::vector<std::pair<std::int32_t, std::size_t>> tasks;
+    tasks.reserve(static_cast<std::size_t>(work.lanes) * work.experts.size());
+    for (std::int32_t lane = 0; lane < work.lanes; ++lane) {
+        for (std::size_t index = 0; index < work.experts.size(); ++index) {
+            const auto expert = static_cast<std::uint32_t>(work.experts[index]);
+            if (work.members[static_cast<std::size_t>(lane)][expert].empty()) { continue; }
+            tasks.emplace_back(lane, index);
+        }
+    }
+    if (tasks.empty()) { return; }
+    const auto plane =
+        static_cast<std::size_t>(work.tokens) * static_cast<std::size_t>(work.intermediate);
+    std::vector<float> activations(tasks.size() * plane);
+    std::vector<Q8Input> planes(tasks.size());
+    if (work.int8_path) {
+        const auto act_groups = static_cast<std::size_t>(work.tokens) *
+                                static_cast<std::size_t>(work.intermediate / 64);
+        for (auto& one : planes) {
+            one.cont16.assign(plane, 0);
+            one.scale.assign(act_groups, 0.0F);
+        }
+    }
+    const auto run_one = [&](std::size_t at) {
+        ExpertJob job;
+        job.lane          = tasks[at].first;
+        job.index         = tasks[at].second;
+        job.activation    = activations.data() + at * plane;
+        job.activation_q8 = &planes[at];
+        run_expert(work, scratch, nullptr, job);
+    };
+    if (!work.flatten_disjoint) {
+        // The call still owes the same value the row-split path produces, so a table whose tasks share
+        // a token runs in table order on one rank: no barrier, no race, same accumulation order.
+        if (worker.rank() != 0) { return; }
+        for (std::size_t at = 0; at < tasks.size(); ++at) { run_one(at); }
+        return;
+    }
+    const auto range = worker.range(tasks.size());
+    for (auto at = range.begin; at < range.end; ++at) { run_one(at); }
 }
 
 void run(void* arguments, const CpuWorkerContext& worker) noexcept {
@@ -905,8 +990,34 @@ void run(void* arguments, const CpuWorkerContext& worker) noexcept {
     }
     const bool phase_probe = split_phase_probe();
     const auto phase_begin = split_phase_mark(phase_probe);
-    for (std::size_t index = 0; index < work.experts.size(); ++index) {
-        run_expert(work, scratch, worker, index);
+    // Two task tables for two shapes of caller.
+    //
+    // lanes == 1 is what this build is actually asked for, and it is not one lane's worth of work:
+    // split_moe_ffn() is called once per layer with the whole decode batch in the T dimension of one
+    // tensor, so eight concurrent sequences arrive here as tokens == 8 in a single call, one expert per
+    // route and two or three experts per layer. Rows are the only parallelism that shape offers, hence
+    // the row split with a barrier between the passes.
+    //
+    // lanes > 1 is the shape the flattened table was designed for - one (lane, expert) task per
+    // thread, every row on that thread, no barrier - and nothing in this build produces it, because
+    // the batching happens upstream in the token axis rather than here. It is kept because the task
+    // table is also what a future caller that hands several lanes in separately would need, and
+    // because NINFER_SPLIT_FLATTEN measures it against the row split on the shape that does exist.
+    // Measured on this box, one expert, eight tokens: row split 92 us, flattened 277-309 us (one
+    // thread owns 640 rows, three sit idle), decode 6.99 against 6.32 tok/s per request. The
+    // flattening needs at least one expert per thread to pay, and the production call has one or three.
+    static const bool flatten_single = std::getenv("NINFER_SPLIT_FLATTEN") != nullptr;
+    if (work.lanes == 1 && !flatten_single) {
+        for (std::size_t index = 0; index < work.experts.size(); ++index) {
+            ExpertJob job;
+            job.lane          = 0;
+            job.index         = index;
+            job.activation    = work.activation[0];
+            job.activation_q8 = &work.q8_act[0];
+            run_expert(work, scratch, &worker, job);
+        }
+    } else {
+        run_flattened(work, scratch, worker);
     }
     if (phase_probe) {
         const auto phase_end = std::chrono::steady_clock::now();
@@ -971,13 +1082,13 @@ void split_launch(const Tensor& x, const CpuSwiGLUExperts& experts, const Expert
     Work work;
     // One lane, one entry per table: the shape this call has always had. The tables are local to this
     // frame and the collective below blocks, so their lifetime is the call's.
-    const std::uint16_t* lane_x[1] = {static_cast<const std::uint16_t*>(x.data)};
-    float* lane_out[1]             = {static_cast<float*>(destination.data)};
-    float* lane_activation[1]      = {static_cast<float*>(scratch.storage().data)};
-    work.x                         = lane_x;
-    work.output                    = lane_out;
-    work.activation                = lane_activation;
-    work.lanes                     = 1;
+    const std::uint16_t* lane_x[1]   = {static_cast<const std::uint16_t*>(x.data)};
+    float* lane_out[1]               = {static_cast<float*>(destination.data)};
+    float* lane_activation[1]        = {static_cast<float*>(scratch.storage().data)};
+    work.x                           = lane_x;
+    work.output                      = lane_out;
+    work.activation                  = lane_activation;
+    work.lanes                       = 1;
     work.tokens       = tokens;
     work.hidden       = hidden;
     work.intermediate = intermediate;
@@ -1014,6 +1125,27 @@ void split_launch(const Tensor& x, const CpuSwiGLUExperts& experts, const Expert
             if (selected[static_cast<std::size_t>(expert)] == 0) { continue; }
             work.members[0][static_cast<std::size_t>(expert)].push_back(
                 Member{t, coefficients[static_cast<std::size_t>(t) * top_k + j]});
+        }
+    }
+    // Whether the flattened table may put its tasks on several threads: two of this call's experts
+    // that hold the same token both fold into that token's output element, and doing so from two
+    // threads at once is a lost update. One pass over the member lists answers it for the whole call,
+    // so nothing has to be decided inside the collective.
+    {
+        std::vector<std::int32_t> held(static_cast<std::size_t>(tokens), 0);
+        work.flatten_disjoint = true;
+        for (std::int32_t lane = 0; lane < work.lanes && work.flatten_disjoint; ++lane) {
+            std::fill(held.begin(), held.end(), 0);
+            for (const auto expert : work.experts) {
+                for (const auto& member : work.members[static_cast<std::size_t>(lane)]
+                                                      [static_cast<std::size_t>(expert)]) {
+                    if (++held[static_cast<std::size_t>(member.token)] > 1) {
+                        work.flatten_disjoint = false;
+                        break;
+                    }
+                }
+                if (!work.flatten_disjoint) { break; }
+            }
         }
     }
     execution.run(run, &work);
