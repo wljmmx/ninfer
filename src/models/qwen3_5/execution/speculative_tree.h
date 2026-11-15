@@ -77,6 +77,38 @@ struct SpeculativeTree {
         }
     }
 
+    // The verify pass's positions: base + depth(c). build_speculative_tree emits columns in BFS order,
+    // so these are non-decreasing and positions[columns-1] is the deepest column - which is what keeps
+    // the attention geometry's two derivations (base_pos = positions[0], window = positions[last] + 1)
+    // exactly what they already are for a chain. Positions alone do not make a tree verifiable: a
+    // triangle mask over these would let a column read its siblings, which is why the visibility below
+    // has to travel with them.
+    [[nodiscard]] std::vector<std::int32_t> depth_positions(std::int32_t base) const {
+        std::vector<std::int32_t> out(static_cast<std::size_t>(columns()), base);
+        for (std::int32_t c = 0; c < columns(); ++c) {
+            out[static_cast<std::size_t>(c)] = base + depth(c);
+        }
+        return out;
+    }
+
+    // build_mask, packed one word per column: bit k of row c is set when column k is an ancestor-or-self
+    // of column c. Eight verify columns is the small-T band, so the whole visibility is eight words - a
+    // shape a decode kernel can stage in one small buffer, unlike an n*n byte matrix. Empty when the
+    // tree outgrows one word per column (> 64), which the policy's max_columns never asks for.
+    [[nodiscard]] std::vector<std::uint64_t> visibility_bits() const {
+        const auto n = columns();
+        if (n <= 0 || n > 64) { return {}; }
+        std::vector<std::uint64_t> out(static_cast<std::size_t>(n), 0);
+        for (std::int32_t c = 0; c < n; ++c) {
+            for (std::int32_t cursor = c; cursor >= 0;) {
+                out[static_cast<std::size_t>(c)] |= std::uint64_t{1} << static_cast<unsigned>(cursor);
+                if (cursor == 0) { break; }
+                cursor = parent[static_cast<std::size_t>(cursor)];
+            }
+        }
+        return out;
+    }
+
     // The number of leaves: the paths a verifier can accept, i.e. the tree's whole point. One leaf
     // means the "tree" is a chain and the extra columns bought nothing.
     [[nodiscard]] std::int32_t paths() const noexcept {

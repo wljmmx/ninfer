@@ -189,6 +189,80 @@ void unbounded_input_is_refused() {
     require(flat.columns() == 1, "no depth means no drafted nodes");
 }
 
+// A chain is the shape every existing verify kernel already implements, so it is the shape the new
+// positions and visibility must degrade into bit for bit: positions base + c, and a visibility that is
+// exactly the lower triangle. If this ever fails, the tree path is not a generalisation of the chain -
+// it is a different computation wearing the same name.
+void chain_positions_and_bits_reduce_to_the_chain() {
+    SpeculativeTree chain;
+    constexpr int kColumns = 5;
+    chain.parent.assign({-1, 0, 1, 2, 3});
+    chain.path_probability.assign(kColumns, 1.0F);
+
+    const auto positions = chain.depth_positions(7);
+    require(static_cast<int>(positions.size()) == kColumns, "one position per column");
+    for (int c = 0; c < kColumns; ++c) {
+        require(positions[static_cast<std::size_t>(c)] == 7 + c,
+                "a chain advances one position per column, as the chain kernel does");
+    }
+
+    const auto bits = chain.visibility_bits();
+    require(static_cast<int>(bits.size()) == kColumns, "one word per column");
+    for (int c = 0; c < kColumns; ++c) {
+        const std::uint64_t expected = (std::uint64_t{1} << static_cast<unsigned>(c + 1)) - 1;
+        require(bits[static_cast<std::size_t>(c)] == expected,
+                "a chain's visibility is the lower triangle, exactly");
+    }
+}
+
+// The property the mask exists for: a sibling was never generated after this token, so it must not be
+// readable. A triangle over depth positions would make siblings visible; the bits must not.
+void siblings_are_not_visible() {
+    SpeculativeTree tree;
+    // 0 -> {1, 2}, then 1 -> 3, 2 -> 4: two siblings at depth 1, one leaf each below them.
+    tree.parent.assign({-1, 0, 0, 1, 2});
+    tree.path_probability.assign(5, 1.0F);
+
+    const auto positions = tree.depth_positions(100);
+    require(positions[1] == 101 && positions[2] == 101, "siblings share one position");
+
+    const auto bits = tree.visibility_bits();
+    require((bits[1] & (std::uint64_t{1} << 2)) == 0, "column 1 must not read its sibling 2");
+    require((bits[2] & (std::uint64_t{1} << 1)) == 0, "column 2 must not read its sibling 1");
+    require((bits[3] & (std::uint64_t{1} << 2)) == 0, "column 3 must not read its uncle 2");
+    require((bits[3] & (std::uint64_t{1} << 1)) != 0, "column 3 reads its parent 1");
+    require((bits[3] & (std::uint64_t{1} << 0)) != 0, "column 3 reads the anchor");
+    require((bits[4] & (std::uint64_t{1} << 2)) != 0, "column 4 reads its parent 2");
+    require((bits[4] & (std::uint64_t{1} << 3)) == 0, "column 4 must not read its cousin 3");
+}
+
+// The build's own ordering is what keeps the attention geometry valid: base_pos = positions[0] and
+// window = positions[last] + 1 both assume the last column is the deepest. Assert it rather than
+// assume it, because a build that emitted a deep column early would silently shrink the window and
+// blind every column after it.
+void build_emits_columns_in_depth_order() {
+    constexpr int kColumns = 8;
+    constexpr int kCandidates = 4;
+    std::vector<float> scores(static_cast<std::size_t>(kColumns) * kCandidates, -60.0F);
+    for (int c = 0; c < kColumns; ++c) { fill_column(scores, c, kCandidates, 2); }
+
+    TreeBuildPolicy policy;
+    policy.max_depth    = 3;
+    policy.max_columns  = 8;
+    policy.branch_width = 2;
+    policy.threshold    = 0.10F;
+    const SpeculativeTree tree =
+        build_speculative_tree(scores.data(), kColumns, kCandidates, policy);
+
+    const auto positions = tree.depth_positions(1000);
+    for (std::size_t c = 1; c < positions.size(); ++c) {
+        require(positions[c] >= positions[c - 1], "columns are non-decreasing in depth");
+    }
+    require(positions.back() == 1000 + tree.longest_path() - 1,
+            "the last column is one of the deepest, so window = positions[last] + 1 is the whole tree");
+    require(tree.columns() <= 8, "the small-T band fits one visibility word per column");
+}
+
 } // namespace
 
 int main() {
@@ -199,10 +273,13 @@ int main() {
     accumulation_is_the_product();
     column_cap_truncates();
     unbounded_input_is_refused();
+    chain_positions_and_bits_reduce_to_the_chain();
+    siblings_are_not_visible();
+    build_emits_columns_in_depth_order();
     if (failures != 0) {
         std::cerr << failures << " failure(s)\n";
         return 1;
     }
-    std::cout << "speculative tree: shape and mask ok\n";
+    std::cout << "speculative tree: shape, mask and the chain's own reduction ok\n";
     return 0;
 }

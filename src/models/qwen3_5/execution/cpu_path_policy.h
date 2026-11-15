@@ -306,27 +306,35 @@ enum class CpuExpertLeg : std::uint8_t {
 //
 // NOT IMPLEMENTED, AND IT IS THE ONE DECISION THE MODEL CURRENTLY GETS WRONG BY CONSTRUCTION.
 //
-// Both sides of the comparison are per ROUTE while one layer's work is per TOKEN, and only one of the
-// two costs repeats per token:
+// Both sides of the comparison are per ROUTE while one layer's work is per TOKEN, and the two sides do
+// not repeat the same way:
 //   * the tier read (and the upload the CPU half spares the Device) happens once per expert and serves
 //     every token of the batch - so per token it is 1/T of the bill;
 //   * the arithmetic repeats per token - so per token it is flat.
 // The model holds a single scalar, `rate.compute_us_per_expert`, and once note_cpu_half has filled it
 // the per-token `flops_per_expert` term is not consulted at all: whichever shape the rate was last
-// measured at becomes the price of every shape. Measured on this box (moe_cpu_expert_bench, 256
-// experts, all tiers fixed): 6.2 us/expert-token at tokens=1 against 4.0 us at tokens=512 - a batch
-// is 35% cheaper per token, which the scalar cannot express.
+// measured at becomes the price of every shape.
 //
-// The shape that fits both ends is two terms, and it is what a batch-aware model needs:
-//     cost_cpu_per_token(T) = read_us_per_expert / T + compute_us_per_token
-//     cost_gpu_per_token(T) = 3 * upload_us_per_entry / T
-// With compute = 4.0 us and read = 2.2 us the fit reproduces both measurements (2.2 + 4.0 = 6.2 at
-// T=1; 4.0 + ~0 at T=512). CpuHalfRate should therefore carry those two numbers instead of one
-// `span_us_per_expert`, and note_cpu_half should record the token count it measured at.
+// THERE IS A CROSSOVER, AND IT IS WHY "just amortise" IS THE WRONG ANSWER. What is shared is not only
+// the tier read; it is every fixed cost of serving the route at all - the per-task quantisation, the
+// barrier round, the tier fill - and those are shared only while there are few enough routes to share
+// them. The measurements bracket both regimes:
+//   * amortised: moe_cpu_expert_bench, 256 experts, one shape - 6.2 us/expert-token at tokens=1
+//     against 4.0 us at tokens=512, i.e. 35% cheaper per token once one task serves a real batch;
+//   * contended: 8-way concurrency, gate/up per expert 92.8 us at one forced route against 175.4 us
+//     at ten (+89%), i.e. per-route cost RISES once the routes compete for the same team.
+// So the price is not one of the two forms but a switch between them, and the switch is a threshold
+// this header does not have yet:
+//     while the half is under its layer budget:  cost_cpu_per_token(T) = read/T + compute
+//     once it saturates (kCpuBusyShare already trims the count): cost_cpu_per_route = the whole bill
+// The two-term fit reproduces the amortised end alone (compute 4.0 us, read 2.2 us: 2.2 + 4.0 = 6.2 at
+// T=1, 4.0 + ~0 at T=512); the whole-bill form is what `span_us_per_expert` measures today, and it is
+// right below the crossover - which is most of the decode traffic this port actually serves.
 //
-// Deliberately not wired now: structured speculation changes T itself (a verify pass is a batch of
-// tree nodes), and a model calibrated on today's T would be re-fitted the moment the tree lands. This
-// decision is upstream of that work, not beside it.
+// Deliberately not wired now: the crossover depends on T and on how many routes the layer gives the
+// half, and structured speculation changes both (a verify pass is a batch of tree nodes). A threshold
+// fitted on today's shapes would be re-fitted the moment the tree lands. This decision is upstream of
+// that work, not beside it.
 inline constexpr double kCpuGflopsCalibrated = 778.0; // the benchmark's own effective rate
 inline constexpr double kCpuLayerFloorUs     = 250.0; // a layer shorter than this still gets a floor
 inline constexpr double kLinkBusyShare       = 0.10;  // upload/wall under this: the link is idle
