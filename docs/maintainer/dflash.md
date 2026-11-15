@@ -531,6 +531,39 @@ target's full distribution differ. It is therefore off by default (the ratio tes
 greedy never enters either branch), and the only other numeric difference left is that the reference
 runs the block on q8 activations where this tree keeps BF16.
 
+**Selector hit against candidate recall (probed).** `NINFER_DFLASH2_DUMP` now appends two booleans per
+(round, column): `selector_hit`, the selector's pick equals the target's argmax at that column, and
+`topk_recall`, that argmax is inside the column's sixteen candidates at all. They separate a badly
+ranked candidate set from a badly ranked pick. The dump is deterministic to the bit - two runs of the
+same command produce files with the same SHA-256, and every column keeps its rates within one round of
+the average - so these are not sampling artefacts. `--spec dflash2 --draft-tokens 7`, 31 rounds:
+
+| column | selector_hit | topk_recall |
+|---:|---:|---:|
+| 0 | 51.6% | 93.5% |
+| 1 | 0.0% | 22.6% |
+| 2 | 3.2% | 29.0% |
+| 3 | 3.2% | 25.8% |
+| 4 | 3.2% | 12.9% |
+| 5 | 6.5% | 25.8% |
+| 6 | 9.7% | 19.4% |
+| 7 | 0.0% | 0.0% (no proposal: the bonus column) |
+
+Column 0 is a *ranking* failure, not a candidate failure: the answer is among the sixteen in 93.5% of
+rounds and the selector converts 51.6 of those, i.e. the unary+edge score loses about forty points
+against its own candidate set. Column 1 is the opposite: recall collapses to 22.6%, so the right token
+is usually not a candidate at all - a task/distribution mismatch, and no selector tuning can recover
+it. Columns 2..6 sit at 13-29% recall with a 2-14% hit, so they are candidate-limited too. The drop
+from column 0 to column 1 is a cliff, not a smooth decay, and it lands exactly on the first column
+that has to predict a token without the draft knowing its predecessor's pick (`core/dflash2.hpp:148-150`:
+the block's rows are independent columns, the walk is the only link).
+
+`unary` is the head's raw score on both sides: `linear_topk` returns `s_{v,t} = sum_k
+dequant(head)_{v,k} * hidden_{k,t}` with no softmax or temperature (`linear_topk.h:32-35`), the
+selector adds it to the edge dot product unchanged (`candidate_selector_path.cu:87`), and the
+reference's `df2_topk` hands the walk its top-16 **logits** the same way (`kernels/dflash2.hpp:93-102`,
+used at `src/core/dflash2.cpp:532`). No change was needed there.
+
 **Layer-major + double-buffered prefill (last resort, measured).** `ExpertStream::ensure` still
 publishes and waits inside the layer, one staging ring of 32 slots, so the PCIe traffic a prefill
 needs is serial with the SMs. The sizing is measured: a 512-token prefill touches up to the layer's

@@ -1162,6 +1162,10 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                         } else {
                             std::fill(candidates.begin(), candidates.end(), -1);
                         }
+                        // The selector's own pick for this column (not just the first candidate):
+                        // selector_hit is pick == target argmax, topk_recall is argmax inside the
+                        // column's sixteen candidates. They separate "the edge score ranks the right
+                        // token badly" from "the right token was never a candidate".
                         CUDA_CHECK(cudaMemcpyAsync(raw.data(), target_column.data,
                                                    raw.size() * sizeof(std::uint16_t),
                                                    cudaMemcpyDeviceToHost, s));
@@ -1261,6 +1265,22 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                      cache_position, rope_position, head_value(head[0]),
                                      head_value(head[1]), head_value(head[2]), head_value(head[3]),
                                      std::sqrt(logit_var), double(top1 - top2), double(top1));
+                        std::int32_t pick = -1;
+                        if (has_candidates) {
+                            CUDA_CHECK(cudaMemcpyAsync(&pick,
+                                                       frame.draft_tokens.slice(0, column, 1)
+                                                           .slice(1, 0, 1)
+                                                           .data,
+                                                       sizeof(pick), cudaMemcpyDeviceToHost, s));
+                        }
+                        CUDA_CHECK(cudaStreamSynchronize(s));
+                        const int selector_hit = has_candidates && pick == argmax ? 1 : 0;
+                        const int topk_recall  = has_candidates &&
+                                                        std::find(candidates.begin(), candidates.end(),
+                                                                  argmax) != candidates.end()
+                                                    ? 1
+                                                    : 0;
+                        std::fprintf(file, ",%d,%d", selector_hit, topk_recall);
                         std::fputc('\n', file);
                     }
                     std::fflush(file);
