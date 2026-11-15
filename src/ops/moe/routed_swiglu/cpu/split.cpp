@@ -630,6 +630,10 @@ struct Work {
     std::int32_t lanes          = 1;
     std::int32_t tokens = 0, hidden = 0, intermediate = 0;
     int gate_bits = 4, down_bits = 6;
+    // Which rounding the device's down pass used for this shape, mirrored here so the two halves
+    // compute the same arithmetic: the grouped (multi-token) kernel stores BF16, the token kernel
+    // FP32. groupwise_int names the same threshold in work.h as grouped_first.
+    bool plane_round = false;
     Matrix gate, up, down;
     std::vector<std::int32_t> experts;
     // [lane][expert]. Each lane carries its own route table: two lanes never share a member list,
@@ -908,13 +912,20 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext* worker,
         }
         for (std::size_t m = 0; m < count; ++m) {
             const auto token = static_cast<std::size_t>(members[m].token);
+            // The down result takes the GPU's own rounding for this shape. The device's grouped kernel
+            // stores its down values as BF16 and only the token kernel keeps FP32 (plane_round in
+            // groupwise_int: tokens >= 47), so a CPU half that always kept FP32 was not measuring the
+            // same arithmetic - and every activation-quantisation cost it reported was inflated by the
+            // difference. matching the device here is what makes a CPU/GPU comparison mean anything.
+            const float down_value =
+                w.plane_round ? common::bf16_round(s.down[m]) : s.down[m];
             if (slot_out != nullptr) {
                 // Nothing else writes this element: the slot belongs to one expert and one token, and
                 // the row loop visits each row once. Hence a store, not an accumulate - which is what
                 // makes two experts holding the same token safe to run on two threads.
-                slot_out[token * w.hidden + row] = members[m].coefficient * s.down[m];
+                slot_out[token * w.hidden + row] = members[m].coefficient * down_value;
             } else {
-                lane_out[token * w.hidden + row] += members[m].coefficient * s.down[m];
+                lane_out[token * w.hidden + row] += members[m].coefficient * down_value;
             }
         }
     }
@@ -1221,6 +1232,9 @@ void split_launch(const Tensor& x, const CpuSwiGLUExperts& experts, const Expert
     work.activation                  = lane_activation;
     work.lanes                       = 1;
     work.tokens       = tokens;
+    // Same threshold the device uses (groupwise_int work.h: grouped_first = 47): at or above it the
+    // grouped kernel runs and its down plane is BF16; below it the token kernel keeps FP32.
+    work.plane_round  = tokens >= 47;
     work.hidden       = hidden;
     work.intermediate = intermediate;
     work.gate         = matrix_of(experts.gate);
