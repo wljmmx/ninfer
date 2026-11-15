@@ -75,11 +75,18 @@ inline constexpr double kCpuKvPartialH16Kv2NsPerTok = 5658.4;
 // = 258 FP32 words per query head per token (causal_operands.h allocate_causal_partials), so
 // 258 * 4 B per (head, token) - the call multiplies by q_heads * width (cpu_partial_upload_bytes).
 inline constexpr double kCpuPartialUploadBPerTok = 1032.0;
-// The CPU half's per-expert compute, measured on this box at Columns=1 (8d07afe3, 2026-11-07):
-// int8 tier 0.0484 ms (NINFER_MOE_CPU_INT8 default), int16 tier 0.0504 ms (the =16 gate, A/B
-// 96.0%/94.1% of int8 - the default tier stays int8).
-inline constexpr double kCpuMoeExpertInt8Ms  = 0.0484;
-inline constexpr double kCpuMoeExpertInt16Ms = 0.0504;
+// The CPU half's per-expert compute, measured on this box at Columns=1. 2026-11-07 (8d07afe3):
+// int8 tier 0.0484 ms, int16 tier 0.0504 ms. Re-measured 2026-11-16 (moe_cpu_bench, 200 iterations,
+// 96 MiB flush, six interleaved rounds, min ms/expert at misses=1) and the ORDER differs by form and
+// by shape, so a single pair of numbers cannot be right for both:
+//   fused form, int8 gate/up 0.0569 vs int16 gate/up 0.0452 - int16 is the faster tier here;
+//   split form, one row at a time, 0.395 ms int8 against 0.451 ms int16 at tokens=1 - int8 wins;
+//   the same split form at tokens=512 reverses by ~4%.
+// These rows still feed decision 2 only, and decision 2 does not actuate (see its comment), so the
+// numbers below are a recorded prior rather than a live input. Do not quote them as "the CPU half
+// costs 48 us" without the form and the column count beside them.
+inline constexpr double kCpuMoeExpertInt8Ms  = 0.0569;
+inline constexpr double kCpuMoeExpertInt16Ms = 0.0452;
 
 // ---- the forced switch --------------------------------------------------------------------
 enum class CpuPathSwitch : std::uint8_t { Off = 0, On = 1 };
@@ -173,6 +180,8 @@ inline void register_cpu_path_params(ParamBus& bus) {
 // handing its (acc, maximum, sum) buffers back for the GPU merge (partial.h's contract). No
 // caller exists in the tree yet, so this seam's counters stay at zero until it lands; the
 // function, its registered rates and the observation below are what that batch will call.
+// READ THE PANEL ACCORDINGLY: `[ctl] cpu: kv: cpu-partial=0/0` is the absence of a call site, not a
+// measured zero. Nothing has ever chosen a leg here, so it cannot be evidence that the leg loses.
 struct CpuKvSplitQuery {
     std::uint64_t partition_bytes = 0; // host-resident page bytes the split would copy in
     int keys                      = 0; // the split's key tokens (range.end - range.begin)
@@ -292,6 +301,32 @@ enum class CpuExpertLeg : std::uint8_t {
 //
 // Every term is either calibrated-and-named or measured; none is a guess wearing a constant's
 // clothes. The result is reported per layer ([cpu-path]) and per token ([host] share).
+//
+// ---- decision 4: one route of a batch, are the shared costs spread or kept whole? ----------------
+//
+// NOT IMPLEMENTED, AND IT IS THE ONE DECISION THE MODEL CURRENTLY GETS WRONG BY CONSTRUCTION.
+//
+// Both sides of the comparison are per ROUTE while one layer's work is per TOKEN, and only one of the
+// two costs repeats per token:
+//   * the tier read (and the upload the CPU half spares the Device) happens once per expert and serves
+//     every token of the batch - so per token it is 1/T of the bill;
+//   * the arithmetic repeats per token - so per token it is flat.
+// The model holds a single scalar, `rate.compute_us_per_expert`, and once note_cpu_half has filled it
+// the per-token `flops_per_expert` term is not consulted at all: whichever shape the rate was last
+// measured at becomes the price of every shape. Measured on this box (moe_cpu_expert_bench, 256
+// experts, all tiers fixed): 6.2 us/expert-token at tokens=1 against 4.0 us at tokens=512 - a batch
+// is 35% cheaper per token, which the scalar cannot express.
+//
+// The shape that fits both ends is two terms, and it is what a batch-aware model needs:
+//     cost_cpu_per_token(T) = read_us_per_expert / T + compute_us_per_token
+//     cost_gpu_per_token(T) = 3 * upload_us_per_entry / T
+// With compute = 4.0 us and read = 2.2 us the fit reproduces both measurements (2.2 + 4.0 = 6.2 at
+// T=1; 4.0 + ~0 at T=512). CpuHalfRate should therefore carry those two numbers instead of one
+// `span_us_per_expert`, and note_cpu_half should record the token count it measured at.
+//
+// Deliberately not wired now: structured speculation changes T itself (a verify pass is a batch of
+// tree nodes), and a model calibrated on today's T would be re-fitted the moment the tree lands. This
+// decision is upstream of that work, not beside it.
 inline constexpr double kCpuGflopsCalibrated = 778.0; // the benchmark's own effective rate
 inline constexpr double kCpuLayerFloorUs     = 250.0; // a layer shorter than this still gets a floor
 inline constexpr double kLinkBusyShare       = 0.10;  // upload/wall under this: the link is idle
