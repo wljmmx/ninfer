@@ -19,6 +19,12 @@ Scratch allocate(Arena& arena, int tokens, int token_block) {
     // fp32 per 64-value group and are shared by both tiers.
     auto* quantised = static_cast<std::int16_t*>(
         arena.alloc_bytes(sizeof(std::int16_t) * hidden * columns).data);
+    // port (sm_89): the down pass's int16 plane, one row per (token, route) slot rather than one
+    // row per column, because two routes of the same token hold different activations. Its scale
+    // row is one float per 64-value group, the grouping the six-bit weight scales already use.
+    const int activation_groups = intermediate / 64;
+    auto* activation_q16        = static_cast<std::int16_t*>(
+        arena.alloc_bytes(sizeof(std::int16_t) * intermediate * top_k * columns).data);
     return {static_cast<Group*>(arena.alloc_bytes(sizeof(Group) * top_k * columns).data),
             static_cast<Task*>(arena.alloc_bytes(sizeof(Task) * top_k * columns).data),
             static_cast<float*>(arena.alloc(DType::FP32, {hidden, columns}).data),
@@ -27,7 +33,10 @@ Scratch allocate(Arena& arena, int tokens, int token_block) {
             quantised,
             static_cast<float*>(arena.alloc_bytes(sizeof(float) * groups * columns).data),
             static_cast<std::int32_t*>(
-                arena.alloc_bytes(sizeof(std::int32_t) * groups * columns).data)};
+                arena.alloc_bytes(sizeof(std::int32_t) * groups * columns).data),
+            activation_q16,
+            static_cast<float*>(arena.alloc_bytes(sizeof(float) * activation_groups * top_k *
+                                                 columns).data)};
 }
 
 MatrixBank matrix_bank(const WeightBankView& bank) {
@@ -85,6 +94,10 @@ void launch(const Invocation& args, const Plan& plan, MemoryArena& arena,
     const char* int8_switch = std::getenv("NINFER_MOE_CPU_INT8");
     work.int16_path = int8_switch == nullptr || std::strcmp(int8_switch, "16") == 0;
     work.int8_path  = !work.int16_path && std::strcmp(int8_switch, "0") != 0;
+    // port (sm_89): an explicit "16" also selects the int16 tier of the DOWN projection. The
+    // gate/up tier's default is not shared with it on purpose - no earlier build had an integer
+    // down pass, so an unset switch has to keep the float decode there byte for byte.
+    work.down16_path = int8_switch != nullptr && std::strcmp(int8_switch, "16") == 0;
     // port (sm_89): mirror the device plane regime - grouped stores BF16 planes from
     // grouped_first tokens up (see work.h), token keeps FP32.
     work.plane_round = args.tokens >= grouped_first;

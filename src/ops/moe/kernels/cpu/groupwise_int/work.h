@@ -104,6 +104,12 @@ struct Scratch {
     // Integer sum of each group's quantised values, so the offset-by-8 nibble product can undo its
     // bias once per group: sum(b * x) = sum(w * x) + 8 * sum(x).
     std::int32_t* input_sum;
+    // port (sm_89): the DOWN pass's own quantised plane. input_q16 above is hidden-wide and keyed by
+    // column, because it feeds the gate/up dot; the down pass reads the SwiGLU activation, which is
+    // intermediate-wide and lives per (token, route) slot, so it needs a plane and a scale row of
+    // its own. Filled once per chunk, between the gate/up barrier and the down pass.
+    std::int16_t* activation_q16; // [slot][intermediate]
+    float* activation_scale;      // [slot][intermediate / 64]
 };
 
 struct Work {
@@ -126,6 +132,12 @@ struct Work {
     // and the default since the 2026-11-07 A/B put it at 97.2%/100.2%/98.1% of the int8 speed
     // (launch.cpp). NINFER_MOE_CPU_INT8=8 still selects int8. Same once-per-launch discipline.
     bool int16_path       = false;
+    // port (sm_89): the int16 tier of the DOWN projection. Unlike the gate/up tier above - which has
+    // been the default since 2026-11-07 - this one is armed only when NINFER_MOE_CPU_INT8 is written
+    // out as "16". The down pass has no integer tier in any earlier build, so letting the same
+    // default pick it up would silently move every existing gate; "unset" therefore keeps the float
+    // decode of the down plane, bit for bit.
+    bool down16_path      = false;
     bool has_four_columns = false;
     // port (sm_89): mirror of the device plane regime: the grouped path stores the activation
     // and value planes as BF16 from grouped_first tokens up, the token path stores FP32.
