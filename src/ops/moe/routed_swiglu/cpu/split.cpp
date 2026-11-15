@@ -178,6 +178,10 @@ struct Q8Input {
     std::vector<std::int8_t> odd;  // [token][hidden]
     std::vector<float> scale;      // [token][groups]
     std::vector<std::int32_t> sum; // [token][groups]: sum of the quantised values, for the bias term
+    // Natural order, one byte per value. The six-bit pass needs the row as stored: its codes are
+    // magnitudes indexed by weight, where the four-bit path deliberately interleaves even and odd so
+    // each nibble half meets its own half of the row without a shuffle.
+    std::vector<std::int8_t> cont; // [token][width]
 };
 
 // The activation plane is BF16, whose bits are the top half of an FP32 word - not the 5/10 split that
@@ -212,15 +216,45 @@ inline void quantise_inputs(const std::uint16_t* x, std::int32_t tokens, std::in
         q8.scale[static_cast<std::size_t>(token) * groups + group] = scale;
         auto* even = q8.even.data() + static_cast<std::size_t>(token) * hidden + group * 64;
         auto* odd  = q8.odd.data() + static_cast<std::size_t>(token) * hidden + group * 64;
+        auto* cont = q8.cont.data() + static_cast<std::size_t>(token) * hidden + group * 64;
         int sum = 0;
         for (int i = 0; i < 32; ++i) {
             const int lo = std::clamp(
                 static_cast<int>(std::lrint(bf16_value(source[2 * i]) * inverse)), -127, 127);
             const int hi = std::clamp(
                 static_cast<int>(std::lrint(bf16_value(source[2 * i + 1]) * inverse)), -127, 127);
-            even[i] = static_cast<std::int8_t>(lo);
-            odd[i]  = static_cast<std::int8_t>(hi);
+            even[i]     = static_cast<std::int8_t>(lo);
+            odd[i]      = static_cast<std::int8_t>(hi);
+            cont[2 * i] = static_cast<std::int8_t>(lo);
+            cont[2 * i + 1] = static_cast<std::int8_t>(hi);
             sum += lo + hi;
+        }
+        q8.sum[static_cast<std::size_t>(token) * groups + group] = sum;
+    }
+}
+
+// The same quantisation for an FP32 row: the down pass reads the SwiGLU activation, which this form
+// keeps in float. Identical grouping and scale rule, so the two planes are the same arithmetic.
+inline void quantise_floats(const float* x, std::int32_t tokens, std::int32_t width, Q8Input& q8,
+                            const CpuWorkerContext& worker) {
+    const int groups = width / 64;
+    const auto range = worker.range(static_cast<std::size_t>(tokens) * groups);
+    for (auto g = range.begin; g < range.end; ++g) {
+        const auto token   = static_cast<std::int32_t>(g / static_cast<std::size_t>(groups));
+        const auto group   = static_cast<std::int32_t>(g % static_cast<std::size_t>(groups));
+        const auto* source = x + static_cast<std::size_t>(token) * width + group * 64;
+        float peak = 0.0F;
+        for (int i = 0; i < 64; ++i) { peak = std::max(peak, std::fabs(source[i])); }
+        const float scale   = peak > 0.0F ? peak / 127.0F : 0.0F;
+        const float inverse = scale > 0.0F ? 1.0F / scale : 0.0F;
+        q8.scale[static_cast<std::size_t>(token) * groups + group] = scale;
+        auto* cont = q8.cont.data() + static_cast<std::size_t>(token) * width + group * 64;
+        int sum = 0;
+        for (int i = 0; i < 64; ++i) {
+            const int value = std::clamp(
+                static_cast<int>(std::lrint(source[i] * inverse)), -127, 127);
+            cont[i] = static_cast<std::int8_t>(value);
+            sum += value;
         }
         q8.sum[static_cast<std::size_t>(token) * groups + group] = sum;
     }
@@ -313,6 +347,101 @@ inline void row_all_tokens_q4_q8(const Row& row, std::int32_t k, const std::int8
     }
 }
 
+// The six-bit plane, as 32 unsigned codes. A six-bit weight is nibble + 16 * upper, where upper is the
+// two bits this row stores separately, so the unsigned code is exactly (nibble + upper * 16) in
+// [0, 63] - no bias flip is needed the way the four-bit path needs one, because the six-bit code is
+// already stored as an unsigned magnitude offset by 32. The bias enters once per group as 32 * sum(x),
+// the mirror of the four-bit path's 8 * sum(x).
+inline __m256i decode_q6_unsigned32(const std::uint8_t* codes, const std::uint8_t* high) noexcept {
+    alignas(32) std::uint8_t raw[32];
+    for (int i = 0; i < 32; ++i) {
+        const int byte = i >> 1;
+        const int nibble =
+            (i & 1) ? static_cast<int>((codes[byte] >> 4) & 0x0F)
+                    : static_cast<int>(codes[byte] & 0x0F);
+        const int bit_at   = i * 2;                                  // two bits per weight
+        const int upper    = (high[bit_at >> 3] >> (bit_at & 7)) & 0x03;
+        raw[i]             = static_cast<std::uint8_t>(nibble + upper * 16);
+    }
+    return _mm256_load_si256(reinterpret_cast<const __m256i*>(raw));
+}
+
+template <int Columns>
+inline void row_dot_q6_q8(const Row& row, std::int32_t k, const std::int8_t* const* cont,
+                          const std::int32_t* const* sum,
+                          const float* const* scale, float (&out)[Columns]) noexcept {
+    const auto ones = _mm256_set1_epi16(1);
+    __m256 total[Columns];
+    for (int c = 0; c < Columns; ++c) { total[c] = _mm256_setzero_ps(); }
+    const auto groups = k / 64;
+    for (std::int32_t group = 0; group < groups; ++group) {
+        __m256i correction[Columns];
+        float act_scale[Columns];
+        for (int c = 0; c < Columns; ++c) {
+            // 32 * sum(x): the six-bit code is a magnitude, so the group's bias is the offset 32 the
+            // codes were stored above the signed value.
+            correction[c] = _mm256_setr_epi32(32 * sum[c][group], 0, 0, 0, 0, 0, 0, 0);
+            act_scale[c]  = scale[c][group];
+        }
+        const auto* codes = row.codes + group * 32;
+        const auto* high  = row.high + group * 16;
+        const auto weight = _mm256_set1_ps(ax::fp16_to_f32(row.scales[group]));
+        for (int half = 0; half < 2; ++half) {
+            const auto codes_v = decode_q6_unsigned32(codes + half * 16, high + half * 8);
+            for (int c = 0; c < Columns; ++c) {
+                // One maddubs per 32 values, not two: the six-bit code is already the unsigned
+                // magnitude the activation multiplies directly, where the four-bit path had to split
+                // even and odd indices to meet its two nibble planes.
+                const auto* act_half = cont[c] + group * 64 + half * 32;
+                const auto act_v =
+                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(act_half));
+                const auto pairs = _mm256_sub_epi32(
+                    _mm256_madd_epi16(_mm256_maddubs_epi16(codes_v, act_v), ones),
+                    half == 0 ? correction[c] : _mm256_setzero_si256());
+                const auto scaled = _mm256_mul_ps(_mm256_cvtepi32_ps(pairs), weight);
+                total[c] =
+                    _mm256_add_ps(_mm256_mul_ps(scaled, _mm256_set1_ps(act_scale[c])), total[c]);
+            }
+        }
+    }
+    for (int c = 0; c < Columns; ++c) { out[c] = ax::reduce_sum(total[c]); }
+}
+
+inline void row_all_tokens_q6_q8(const Row& row, std::int32_t k, const std::int8_t* const* cont,
+                                 const std::int32_t* const* sum,
+                                 const float* const* scale, std::size_t count,
+                                 float* out) noexcept {
+    std::size_t at = 0;
+    while (at < count) {
+        const auto left = count - at;
+        if (left >= 4) {
+            const std::int8_t* cs[4] = {cont[at], cont[at + 1], cont[at + 2], cont[at + 3]};
+            const std::int32_t* ss[4] = {sum[at], sum[at + 1], sum[at + 2], sum[at + 3]};
+            const float* sc[4] = {scale[at], scale[at + 1], scale[at + 2], scale[at + 3]};
+            float values[4];
+            row_dot_q6_q8<4>(row, k, cs, ss, sc, values);
+            for (int c = 0; c < 4; ++c) { out[at + c] = values[c]; }
+            at += 4;
+        } else if (left >= 2) {
+            const std::int8_t* cs[2] = {cont[at], cont[at + 1]};
+            const std::int32_t* ss[2] = {sum[at], sum[at + 1]};
+            const float* sc[2] = {scale[at], scale[at + 1]};
+            float values[2];
+            row_dot_q6_q8<2>(row, k, cs, ss, sc, values);
+            for (int c = 0; c < 2; ++c) { out[at + c] = values[c]; }
+            at += 2;
+        } else {
+            const std::int8_t* cs[1] = {cont[at]};
+            const std::int32_t* ss[1] = {sum[at]};
+            const float* sc[1] = {scale[at]};
+            float values[1];
+            row_dot_q6_q8<1>(row, k, cs, ss, sc, values);
+            out[at] = values[0];
+            at += 1;
+        }
+    }
+}
+
 struct Work {
     const std::uint16_t* x = nullptr;
     float* output          = nullptr;
@@ -323,11 +452,17 @@ struct Work {
     std::vector<std::int32_t> experts;
     std::vector<std::vector<Member>> members;
     // NINFER_MOE_CPU_INT8: the same switch the fused form reads, now honoured here. Off keeps the bf16
-    // decode this form has always used; on routes the four-bit gate/up pass through the q4 nibble dot.
-    // The six-bit down pass stays on bf16 either way - its decode has a high plane the q4 path does
-    // not cover, and it is a third of the arithmetic rather than two thirds.
+    // decode this form has always used; on routes the four-bit gate/up through the q4 nibble dot and
+    // the six-bit down through the q6 one.
     bool int8_path = false;
-    Q8Input q8;
+    // NINFER_SPLIT_Q6: the six-bit down pass through the q6 nibble dot. OFF by default and measured
+    // SLOWER than the bf16 decode it replaces (277 us against 148 us per expert): the 32-value unpack
+    // here is a scalar loop, and the eight-value decoder it competes with is vectorised. Kept behind a
+    // switch so the finding is reproducible, not deleted so the vectorised version has somewhere to
+    // land.
+    bool q6_path = false;
+    Q8Input q8;     // gate/up: the bf16 input, quantised once per collective
+    Q8Input q8_act; // down: the SwiGLU activation, quantised once per expert
 };
 
 // Per-worker buffers, allocated once per collective: the rows of one expert are split across the
@@ -339,6 +474,9 @@ struct Scratch {
     std::vector<const std::int8_t*> q8_odd;
     std::vector<const std::int32_t*> q8_sum;
     std::vector<const float*> q8_scale;
+    std::vector<const std::int8_t*> q6_cont;
+    std::vector<const std::int32_t*> q6_sum;
+    std::vector<const float*> q6_scale;
     std::vector<float> gate, up, down;
 };
 
@@ -443,6 +581,19 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext& worker, std::size_t
         }
     }
     worker.barrier();
+    // The down pass reads what gate/up just wrote, so its activation can only be quantised after the
+    // barrier - and per expert, because each expert produces its own rows.
+    if (w.down_bits == 6 && w.q6_path) {
+        quantise_floats(w.activation, w.tokens, w.intermediate, w.q8_act, worker);
+        worker.barrier();
+        const int act_groups = w.intermediate / 64;
+        for (std::size_t m = 0; m < count; ++m) {
+            const auto token = static_cast<std::size_t>(members[m].token);
+            s.q6_cont[m]  = w.q8_act.cont.data() + token * w.intermediate;
+            s.q6_sum[m]   = w.q8_act.sum.data() + token * act_groups;
+            s.q6_scale[m] = w.q8_act.scale.data() + token * act_groups;
+        }
+    }
     const auto phase_gate_end = split_phase_mark(phase_probe);
 
     // down_h . a_t folded in with the member's coefficient; the output is [hidden, tokens].
@@ -451,7 +602,10 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext& worker, std::size_t
     for (auto h = out_rows.begin; h < out_rows.end; ++h) {
         const auto row      = static_cast<std::int32_t>(h);
         const auto down_row = row_at(down_base, row, w.intermediate, w.down_bits);
-        if (w.down_bits == 6) {
+        if (w.down_bits == 6 && w.q6_path) {
+            row_all_tokens_q6_q8(down_row, w.intermediate, s.q6_cont.data(), s.q6_sum.data(),
+                                 s.q6_scale.data(), count, s.down.data());
+        } else if (w.down_bits == 6) {
             row_all_tokens<6>(down_row, w.intermediate, s.activations.data(), count, s.down.data());
         } else {
             row_all_tokens<4>(down_row, w.intermediate, s.activations.data(), count, s.down.data());
@@ -486,14 +640,22 @@ void run(void* arguments, const CpuWorkerContext& worker) noexcept {
         scratch.q8_odd.resize(room);
         scratch.q8_sum.resize(room);
         scratch.q8_scale.resize(room);
+        scratch.q6_cont.resize(room);
+        scratch.q6_sum.resize(room);
+        scratch.q6_scale.resize(room);
         // One lane reserves the plane; an assign() in every lane would have each zero it under the
         // others' writes.
         if (worker.rank() == 0) {
-            const int groups = work.hidden / 64;
+            const int groups     = work.hidden / 64;
+            const int act_groups = work.intermediate / 64;
             work.q8.even.assign(static_cast<std::size_t>(work.tokens) * work.hidden, 0);
             work.q8.odd.assign(static_cast<std::size_t>(work.tokens) * work.hidden, 0);
+            work.q8.cont.assign(static_cast<std::size_t>(work.tokens) * work.hidden, 0);
             work.q8.scale.assign(static_cast<std::size_t>(work.tokens) * groups, 0.0F);
             work.q8.sum.assign(static_cast<std::size_t>(work.tokens) * groups, 0);
+            work.q8_act.cont.assign(static_cast<std::size_t>(work.tokens) * work.intermediate, 0);
+            work.q8_act.scale.assign(static_cast<std::size_t>(work.tokens) * act_groups, 0.0F);
+            work.q8_act.sum.assign(static_cast<std::size_t>(work.tokens) * act_groups, 0);
         }
         worker.barrier();
         quantise_inputs(work.x, work.tokens, work.hidden, work.q8, worker);
@@ -585,6 +747,7 @@ void split_launch(const Tensor& x, const CpuSwiGLUExperts& experts, const Expert
     {
         static const char* value = std::getenv("NINFER_MOE_CPU_INT8");
         work.int8_path = value == nullptr || std::strcmp(value, "0") != 0;
+        work.q6_path   = std::getenv("NINFER_SPLIT_Q6") != nullptr;
     }
     work.members.resize(static_cast<std::size_t>(experts_count));
     for (std::int32_t expert = 0; expert < experts_count; ++expert) {
