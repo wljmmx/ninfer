@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <type_traits>
 
 namespace ninfer::ops::detail::moe_cpu::groupwise_int {
@@ -649,9 +650,22 @@ void compute(void* argument, const CpuWorkerContext& worker) noexcept {
         // the team gets 32 units per expert - one or two each, with a barrier on both sides.
         // Halving the unit doubles the units and lets the same team work; with eight experts the
         // wider unit wins instead. Sizes measured with bench/ops/moe_cpu_bench.
+        //
+        // NINFER_CPU_UNIT_BIAS is a measurement switch on the threshold, not a policy: the default
+        // is the measured eight. A decode route is one expert on one column, which is forty units
+        // for a four-lane team - right at the boundary - so which side it lands on decides how much
+        // of the team is ever busy.
+        static const int unit_bias = [] {
+            const char* value = std::getenv("NINFER_CPU_UNIT_BIAS");
+            if (value != nullptr && *value != '\0') {
+                const long bias = std::strtol(value, nullptr, 10);
+                return bias > 0 ? static_cast<int>(bias) : 8;
+            }
+            return 8;
+        }();
         const int units = work.task_count * (intermediate / channel_block);
-        work.block = (work.workers > 1 && units < work.workers * 8) ? channel_block / 2
-                                                                   : channel_block;
+        work.block = (work.workers > 1 && units < work.workers * unit_bias) ? channel_block / 2
+                                                                          : channel_block;
         unsigned bf16_columns = 0;
         if constexpr (Simd::bf16_gate && GateBits == 4) {
             bf16_columns = Simd::safe_columns(

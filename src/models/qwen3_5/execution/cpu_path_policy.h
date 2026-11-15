@@ -371,6 +371,21 @@ inline void note_cpu_half(int experts, double span_ms, double compute_ms,
     }
 }
 
+// Probe (default off, NINFER_CPU_PATH_FORCE=N): pin the ratio instead of letting the cost model
+// decide it, so the tier fill and the two arms can be compared at a fixed count. A measurement
+// switch, not a policy: the default path never reads it, and no value of it is a default. Without
+// it the half never runs at all at this pool size (the copy wins), which means a change to its
+// kernel shape has no way to be measured.
+[[nodiscard]] inline int cpu_path_forced_count() {
+    static const int value = [] {
+        const char* env = std::getenv("NINFER_CPU_PATH_FORCE");
+        if (env == nullptr || *env == '\0') { return -1; }
+        const long count = std::strtol(env, nullptr, 10);
+        return count < 0 ? -1 : static_cast<int>(count);
+    }();
+    return value;
+}
+
 [[nodiscard]] inline CpuLayerBudget decide_cpu_layer_budget(const CpuLayerQuery& query) noexcept {
     CpuLayerBudget out;
     if (cpu_path_switch() == CpuPathSwitch::Off) {
@@ -379,6 +394,17 @@ inline void note_cpu_half(int experts, double span_ms, double compute_ms,
     }
     if (query.routes <= 0) {
         out.why = "no routes";
+        return out;
+    }
+    // The probe bypasses the model but not the switch: it exists to measure a fixed ratio.
+    if (const int forced = cpu_path_forced_count(); forced > 0) {
+        out.count       = std::min(forced, query.routes);
+        out.why         = "forced";
+        out.cost_gpu_us = -1.0;
+        out.cost_cpu_us = -1.0;
+        out.budget_us   = -1.0;
+        cpu_half_rate().last_count  = out.count;
+        cpu_half_rate().idle_layers = 0;
         return out;
     }
     if (!(query.link_gbps > 0.0)) {
