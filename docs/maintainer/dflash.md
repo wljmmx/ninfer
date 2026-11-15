@@ -685,6 +685,75 @@ rows) still lands at 0.85x tokens per unit of work, and the k=3 variant is 0.76x
 the earlier sections put it: the draft head's ranking at column 0 and the candidate recall at columns
 1..6, not the shape of the verify rectangle.
 
+**Depth cap, measured row cost, and where the three backends stand (still not implemented).** The table
+above prices tau with no depth limit, so the only shape a per-round controller would ever pick - a tree
+that stops after two or three columns - was never the row under test. Re-run with the cap and with the
+row cost measured instead of assumed (`H:\TeleAgentWorks\.temp\tree_depth_sim.py`,
+`tree_budget_frontier.py`; same dumps). A tree of depth D keeps, per column, children in edge-score
+order until the kept set's softmax mass reaches tau; a node is a verify row; the chain at the same D is
+the baseline. Two independent datasets, because the dump's own acceptance depends on which corpus
+window the rep landed on:
+
+| shape | nodes/rd | acc | len | chain D / len | rows ratio | tokens per row |
+|---|---:|---:|---:|---|---:|---:|
+| chain, register dump | 4.00 | 0.2903 | 1.871 | 3 / 1.871 | 1.00 | 1.00 |
+| D=2, tau 0.3 | 3.61 | 0.4032 | 1.806 | 2 / 1.742 | 1.20 | 0.86 |
+| D=2, tau 0.5 | 4.97 | 0.4839 | 1.968 | 2 / 1.742 | 1.66 | 0.68 |
+| D=3, tau 0.5 | 8.68 | 0.3763 | 2.129 | 3 / 1.871 | 2.17 | 0.53 |
+| chain, warm dump | 3.00 | 0.4397 | 1.879 | 2 / 1.879 | 1.00 | 1.00 |
+| D=2, tau 0.5, warm | 4.41 | 0.5172 | 2.034 | 2 / 1.879 | 1.47 | 0.74 |
+| D=3, tau 0.5, warm | 7.67 | 0.4195 | 2.259 | 3 / 2.052 | 1.92 | 0.57 |
+
+At equal verify rows the best tree over (tau, D) is break-even: +1.7% at 5 rows and -3.1% at 8 rows on
+the register dump, 0% at 3-6 rows and +1.6% at 8 rows on the warm dump. Every shape that keeps a branch
+past its budget returns 0.53-0.86 tokens per unit of work, because one added branch row buys less
+acceptance than one added chain column: on the register dump the chain's own marginal is +0.226 tokens
+per row from D=1 to D=2, +0.129 from 2 to 3 and +0.065 from 3 to 4, while a branch row at tau 0.5 buys
+0.115 (D=2) and 0.055 (D=3); the warm dump widens the chain side further (+0.293, +0.172, +0.052).
+Branching is dominated by deepening, everywhere measured.
+
+Rows are the cost unit and the unit is measured (DFlash2, v5_e2, pp64+tg64, graph path, one rep per k;
+round time is the engine's own acceptance length over decode t/s): 0.358 / 0.522 / 0.582 / 0.702 / 0.739 /
+0.894 / 0.922 s for 2..8 rows, i.e. **0.093 s per verified row over a 0.20 s floor**. The best tree
+(warm, D=2, tau 0.5, 4.41 rows, 2.034 tokens) therefore prices at 0.61 s/round = 3.33 tok/s against the
+engine's measured 3.77 tok/s at k=2 and 3.73 at k=3 - a 11-12% decode loss. The model does not credit the
+tree for its shorter draft (3 columns against 8), which is a few percent the other way and does not move
+the sign.
+
+Reach across the three backends, from the sources rather than from a build:
+
+- **Candidates.** DFlash2 has sixteen per column plus the selector's pick, and the edge lattice behind
+  `NINFER_SELECTOR_EDGE_PROBE` (`candidate_selector_path`, draft.cpp:782). MTP already has sixteen per
+  step with a full-vocabulary softmax (`mtp_propose_topk_strided` -> `logits_topk_softmax`,
+  mtp.cpp:263-317). DFlash v1 has none: the head's full `[vocab, k*batch]` logits are reduced by
+  `ops::argmax` alone (draft.cpp:994-1011), so `logits_topk_softmax` is a drop-in, but there is no
+  selector and no edge score, and the branch score would have to be the head's own top-sixteen mass.
+- **Accept.** All three call `target_accept`, so the accept side is one place
+  (target_verification.cpp:27-43). DFlash2 and MTP take the sparse kernel; v1 takes the greedy one.
+- **Forward verify is the wall, not the accept.** The rectangle is not a passive attention block: the
+  forty-eight linear-attention layers (of sixty-four) run a per-row recurrence that is sequential in
+  columns (`gated_delta_net_batch`, text.cpp:2361-2380) over one state slot per row. A tree node needs
+  its own post-parent state, i.e. a KV prefix fork (`KVPrefixForkReservation`, kv_address_space.h:76-123)
+  and a state fork (`HostToFork`, state_store.h:53) wired through the speculative round plus a winner
+  commit - the engine has both mechanisms, the spec path uses neither, and the sequence footprint is
+  174.9 MiB, so a five-row verify holds ~875 MiB. That is affordable; the plumbing is the work, and it
+  buys a shape that is break-even at equal rows.
+- **MTP specifically.** Even with candidates free, its column-0 acceptance is 88.2% (35B, k=1,
+  pp64+tg64; k=2 0.76, k=3 0.5417, k=4 0.4659), so at most 11.8% of rounds leave anything for a
+  column-0 branch to rescue, and an AR drafter pays one extra draft forward per node (mtp.cpp:294-321)
+  where DFlash2's block pass is shared by every node at a depth.
+- **DFlash v1 does not run on this build.** Both 35B artifacts abort at `--spec dflash` with
+  `Q8 DFlash2 LinearSwiGLU small-T: no instance for gate_up=12288 k=2048`; the small-T table
+  specializes 34816/5120 and 15360/2560 only (src/ops/linear_swiglu/q8/q8_dflash2_linear_swiglu.cu:61-73).
+  There is no v1 baseline to A/B until that instance exists.
+
+Consequence for a per-round controller: the (tau, D) decision it was meant to make has nothing to gate -
+at equal rows every tree is within +-2% of the chain, and past the budget 25-45% down. What the same
+numbers do support is a dynamic *draft depth*: on the warm dump the chain's marginal falls from +0.293
+to +0.017 tokens per row between D=1 and D=7 while the row cost stays 0.093 s, so the exchange rate
+between draft depth and link/pool pressure is where a controller has room. The tree stays unbuilt, and
+`NINFER_SPEC_TREE` has no implementation behind it.
+
 **Layer-major + double-buffered prefill (last resort, measured).** `ExpertStream::ensure` still
 publishes and waits inside the layer, one staging ring of 32 slots, so the PCIe traffic a prefill
 needs is serial with the SMs. The sizing is measured: a 512-token prefill touches up to the layer's
