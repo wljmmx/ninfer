@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <vector>
 
@@ -648,6 +649,23 @@ struct Work {
     // share a token fold into the same output element, so only the disjoint case may run its tasks on
     // several threads at once.
     bool flatten_disjoint = false;
+    // The overlapping case, made parallel: a task writes its own plane at [lane][slot][token][hidden]
+    // instead of accumulating into the output, and one merge folds the slots a token actually holds
+    // back in. `slot` is the expert's position in `experts`, and the merge walks those positions in
+    // ascending order - the same order the row-split path accumulates in.
+    //
+    // The plane is allocated once per team member and reused across layers (partial_plane below), and
+    // it is never initialised: a task writes every row of every slot it owns, and the merge only reads
+    // the slots a token is a member of, so no unwritten element is ever read.
+    float* partial      = nullptr; // [lane][slot][token][hidden]
+    bool partial_output = false;
+    // Whether one expert's member list names the same token twice, which only a route table with
+    // repeated ids can do. Such a slot contributes twice on the row-split path and its plane can hold
+    // only one value, so the repeated case keeps the serial table.
+    bool members_repeat = false;
+    // The merge's map: for each flat (lane, token), the slots it holds, ascending. Built once per call.
+    std::vector<std::uint32_t> token_begin;
+    std::vector<std::int32_t> token_slots;
     std::vector<Q8Input> q8;     // [lane] gate/up: the bf16 input, quantised once per collective
     std::vector<Q8Input> q8_act; // [lane] down: the SwiGLU activation, quantised once per expert
 };
@@ -708,6 +726,10 @@ inline void row_all_tokens(const Row& row, std::int32_t k, const Input* const* i
 struct SplitPhaseTotals {
     double gate_up_us = 0.0;
     double down_us    = 0.0;
+    // The merge the partial planes add: per worker, over the share of the output it folds. Reported
+    // per call, because the merge is spread across the team instead of being one expert's cost.
+    double reduce_us  = 0.0;
+    std::uint64_t calls   = 0;
     std::uint64_t experts = 0;
 };
 
@@ -748,6 +770,13 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext* worker,
     if (members.empty()) { return; }
     const auto* lane_x      = w.x[static_cast<std::size_t>(job.lane)];
     float* const lane_out   = w.output[static_cast<std::size_t>(job.lane)];
+    // Where this expert's rows go: its own slot of the partial plane, or the shared output.
+    float* const slot_out =
+        w.partial_output ? w.partial + (static_cast<std::size_t>(job.lane) * w.experts.size() +
+                                        job.index) *
+                                          (static_cast<std::size_t>(w.tokens) *
+                                           static_cast<std::size_t>(w.hidden))
+                         : nullptr;
     float* const activation = job.activation;
     auto& q8_in             = w.q8[static_cast<std::size_t>(job.lane)];
     auto& q8_act            = *job.activation_q8;
@@ -871,8 +900,15 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext* worker,
             row_all_tokens<4>(down_row, w.intermediate, s.activations.data(), count, s.down.data());
         }
         for (std::size_t m = 0; m < count; ++m) {
-            lane_out[static_cast<std::size_t>(members[m].token) * w.hidden + row] +=
-                members[m].coefficient * s.down[m];
+            const auto token = static_cast<std::size_t>(members[m].token);
+            if (slot_out != nullptr) {
+                // Nothing else writes this element: the slot belongs to one expert and one token, and
+                // the row loop visits each row once. Hence a store, not an accumulate - which is what
+                // makes two experts holding the same token safe to run on two threads.
+                slot_out[token * w.hidden + row] = members[m].coefficient * s.down[m];
+            } else {
+                lane_out[token * w.hidden + row] += members[m].coefficient * s.down[m];
+            }
         }
     }
     if (worker != nullptr) { worker->barrier(); }
@@ -886,14 +922,57 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext* worker,
     }
 }
 
+// One partial plane per worker thread, grown in place and never freed: the flattened path allocates it
+// on rank 0 and the whole team reads it, so it has to outlive the collective, and a layer that
+// allocated it again would pay a fresh mapping (1.6 MB at eight tokens, 33 MB at one hundred and
+// sixty-one) on every layer. Uninitialised on purpose - see Work::partial.
+float* partial_plane(std::size_t count) {
+    static thread_local std::unique_ptr<float[]> plane;
+    static thread_local std::size_t capacity = 0;
+    if (count > capacity) {
+        plane    = std::make_unique_for_overwrite<float[]>(count);
+        capacity = count;
+    }
+    return plane.get();
+}
+
+// Fold every token's slots into the output, ascending, once the tasks above have all finished.
+//
+// The row-split path adds expert by expert into the output, so a token that holds three experts is
+// three roundings of one accumulator. Here each slot rounds its own term into its own plane and the
+// merge adds the three rounded terms - two different summations of the same numbers, and the reason
+// the flattened path is no longer bit-identical to the row split. The terms and their order are the
+// same; the intermediate rounding points are not.
+void merge_partial(Work& w, const CpuWorkerContext& worker) {
+    const auto hidden = static_cast<std::size_t>(w.hidden);
+    const auto tokens = static_cast<std::size_t>(w.tokens);
+    const auto plane  = tokens * hidden; // one slot's worth
+    const auto total  = static_cast<std::size_t>(w.lanes) * plane;
+    const auto range  = worker.range(total);
+    for (auto at = range.begin; at < range.end; ++at) {
+        const auto row  = at % hidden;
+        const auto flat = at / hidden; // lane * tokens + token
+        if (w.token_begin[flat] == w.token_begin[flat + 1]) { continue; }
+        const auto* from = w.partial + (flat % tokens) * hidden + row;
+        float sum        = 0.0F;
+        for (auto k = w.token_begin[flat]; k < w.token_begin[flat + 1]; ++k) {
+            sum += from[static_cast<std::size_t>(w.token_slots[k]) * plane];
+        }
+        // A store plus the term the output already held, which is zero on this path: the arena's CPU
+        // half starts from a cleared tensor. Written as an accumulate so a caller that hands in a
+        // non-zero destination still gets the value the row split would have produced.
+        w.output[flat / tokens][flat % tokens * hidden + row] += sum;
+    }
+}
+
 // The flattened table: one task per (lane, expert), where a task is a whole expert - every row of both
 // passes on the thread that owns it - so the two barriers the row split needs between its passes have
 // nothing left to synchronise.
 //
 // Two experts of one lane can be in flight on two threads (they share that lane's activation plane and
-// its quantised copy), so each task carries both buffers itself. The lane's output slice is the only
-// thing tasks have in common, and that is why the table may only run in parallel when no token of a
-// lane belongs to two of this call's experts: two such tasks would accumulate the same element.
+// its quantised copy), so each task carries both buffers itself. The lane's output slice used to be
+// the one thing tasks had in common, which confined the table to the disjoint case; with the partial
+// planes each task now owns its own slot, and the merge below is the only step that touches the output.
 void run_flattened(Work& work, Scratch& scratch, const CpuWorkerContext& worker) {
     std::vector<std::pair<std::int32_t, std::size_t>> tasks;
     tasks.reserve(static_cast<std::size_t>(work.lanes) * work.experts.size());
@@ -925,6 +1004,24 @@ void run_flattened(Work& work, Scratch& scratch, const CpuWorkerContext& worker)
         job.activation_q8 = &planes[at];
         run_expert(work, scratch, nullptr, job);
     };
+    if (!work.flatten_disjoint && work.partial_output) {
+        // Overlapping routes, but each task owns a slot: the table runs on the whole team, one
+        // barrier waits for the last task, and the merge folds the slots in expert order.
+        const auto across = worker.range(tasks.size());
+        for (auto at = across.begin; at < across.end; ++at) { run_one(at); }
+        worker.barrier();
+        const auto merge_begin = split_phase_mark(split_phase_probe());
+        merge_partial(work, worker);
+        if (split_phase_probe()) {
+            auto& totals = split_phase_totals();
+            totals.reduce_us +=
+                std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() -
+                                                          merge_begin)
+                    .count();
+            ++totals.calls;
+        }
+        return;
+    }
     if (!work.flatten_disjoint) {
         // The call still owes the same value the row-split path produces, so a table whose tasks share
         // a token runs in table order on one rank: no barrier, no race, same accumulation order.
@@ -1007,7 +1104,19 @@ void run(void* arguments, const CpuWorkerContext& worker) noexcept {
     // thread owns 640 rows, three sit idle), decode 6.99 against 6.32 tok/s per request. The
     // flattening needs at least one expert per thread to pay, and the production call has one or three.
     static const bool flatten_single = std::getenv("NINFER_SPLIT_FLATTEN") != nullptr;
-    if (work.lanes == 1 && !flatten_single) {
+    const bool flatten_path          = work.lanes > 1 || flatten_single;
+    // The partial planes exist only for the case the flattened table could not parallelise before:
+    // overlapping routes. The row split never allocates them and never sets partial_output, so its
+    // accumulation order - and every bit of its result - is what it was.
+    if (flatten_path && !work.flatten_disjoint && !work.members_repeat) {
+        const auto plane = static_cast<std::size_t>(work.lanes) * work.experts.size() *
+                           static_cast<std::size_t>(work.tokens) *
+                           static_cast<std::size_t>(work.hidden);
+        if (worker.rank() == 0) { work.partial = partial_plane(plane); }
+        worker.barrier(); // publish the plane before any task writes it
+        work.partial_output = true;
+    }
+    if (!flatten_path) {
         for (std::size_t index = 0; index < work.experts.size(); ++index) {
             ExpertJob job;
             job.lane          = 0;
@@ -1024,11 +1133,13 @@ void run(void* arguments, const CpuWorkerContext& worker) noexcept {
         const auto& totals   = split_phase_totals();
         const double experts = totals.experts > 0 ? static_cast<double>(totals.experts) : 1.0;
         const double wall = std::chrono::duration<double, std::micro>(phase_end - phase_begin).count();
+        const double merge = totals.calls > 0 ? totals.reduce_us / static_cast<double>(totals.calls)
+                                             : 0.0;
         std::fprintf(stderr,
                      "[cpu-phase-split] experts=%llu tokens=%d | per expert: gate_up=%.1f "
-                     "down=%.1f us | wall=%.1f us (%.0f%% accounted)\n",
+                     "down=%.1f us | merge=%.1f us/call | wall=%.1f us (%.0f%% accounted)\n",
                      static_cast<unsigned long long>(totals.experts), work.tokens,
-                     totals.gate_up_us / experts, totals.down_us / experts, wall,
+                     totals.gate_up_us / experts, totals.down_us / experts, merge, wall,
                      wall > 0.0 ? 100.0 * (totals.gate_up_us + totals.down_us) / wall : 0.0);
         std::fflush(stderr);
     }
@@ -1145,6 +1256,51 @@ void split_launch(const Tensor& x, const CpuSwiGLUExperts& experts, const Expert
                     }
                 }
                 if (!work.flatten_disjoint) { break; }
+            }
+        }
+    }
+    // The merge's map, built once per call: for each flat (lane, token), the slots it holds in
+    // `experts` order. Two reasons to build it instead of walking every slot per token - the plane's
+    // unwritten slots are never initialised (so they must not be read at all), and a token holds two
+    // to four of a layer's twenty experts, not twenty.
+    //
+    // A repeated route id would put one token twice in one expert's list, and one slot can hold only
+    // one value per element. The row-split path would add that term twice; a plane cannot, so the
+    // repeated case keeps the serial table rather than silently dropping a term.
+    if (!work.flatten_disjoint) {
+        const auto slots       = work.experts.size();
+        const auto flat_tokens = static_cast<std::size_t>(work.lanes) * static_cast<std::size_t>(tokens);
+        work.token_begin.assign(flat_tokens + 1, 0);
+        for (std::int32_t lane = 0; lane < work.lanes; ++lane) {
+            for (std::size_t index = 0; index < slots; ++index) {
+                const auto expert = static_cast<std::uint32_t>(work.experts[index]);
+                const auto& list  = work.members[static_cast<std::size_t>(lane)][expert];
+                for (std::size_t m = 0; m < list.size(); ++m) {
+                    if (m > 0 && list[m - 1].token == list[m].token) { work.members_repeat = true; }
+                    ++work.token_begin[static_cast<std::size_t>(lane) * static_cast<std::size_t>(tokens) +
+                                       static_cast<std::size_t>(list[m].token) + 1];
+                }
+            }
+        }
+        if (work.members_repeat) {
+            work.token_begin.clear();
+        } else {
+            for (std::size_t at = 1; at < work.token_begin.size(); ++at) {
+                work.token_begin[at] += work.token_begin[at - 1];
+            }
+            work.token_slots.assign(work.token_begin.back(), 0);
+            std::vector<std::uint32_t> cursor(work.token_begin.begin(), work.token_begin.end() - 1);
+            for (std::int32_t lane = 0; lane < work.lanes; ++lane) {
+                for (std::size_t index = 0; index < slots; ++index) {
+                    const auto expert = static_cast<std::uint32_t>(work.experts[index]);
+                    for (const auto& member : work.members[static_cast<std::size_t>(lane)][expert]) {
+                        const auto flat =
+                            static_cast<std::size_t>(lane) * static_cast<std::size_t>(tokens) +
+                            static_cast<std::size_t>(member.token);
+                        work.token_slots[cursor[flat]++] = static_cast<std::int32_t>(
+                            static_cast<std::size_t>(lane) * slots + index);
+                    }
+                }
             }
         }
     }
