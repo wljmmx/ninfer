@@ -43,6 +43,7 @@
 
 #include "models/qwen3_5/execution/param_bus.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -261,6 +262,201 @@ enum class CpuExpertLeg : std::uint8_t {
     return copy_us_per_expert > cpu_ms * 1000.0 ? CpuExpertLeg::CpuHalf : CpuExpertLeg::PoolCopy;
 }
 
+// ---- decision 3: one layer's CPU share - the ratio, which is a RESULT ---------------------------
+//
+// The two decisions above answer "may this seam move at all". This one answers "how much of one
+// layer", and it is the only place the port's ratio exists: nothing here writes a percentage and
+// nothing reads a fraction from the environment. A layer asks with the facts that have been
+// measured and gets a COUNT back.
+//
+//   cost_gpu(e) = bytes(e) / link_gbps + slack
+//   cost_cpu(e) = flops(e) / cpu_gflops + (1 - tier_warm) * cold_read_us
+//
+// `slack` is not invented. The controller already measures what one expert upload costs end to end
+// (PolicyController::signals.upload_us_per_expert: read, staging and DMA as the pool actually pays
+// them), so the copy side is that measurement when it exists and the bare link time when it does
+// not - a route moves three entries, hence the x3. The compute side is the calibrated 778 GFLOPS
+// (bench/ops/moe_cpu_expert_bench.cpp, i9-14900K AVX2, 12.6 us per expert at the L3-hot tier) until
+// the [host] line has timed this box's own half; after that it is that measurement
+// (note_cpu_half), so the rate follows the machine instead of a constant. The tier read is charged
+// only for the share of experts the pinned tier does not already hold: a warm slot costs the CPU
+// nothing, a cold one costs a measured read.
+//
+// The count is then capped and trimmed by the two queues this box actually has:
+//   * one layer may spend at most max(the Device critical path, kCpuLayerFloorUs) on the CPU, and
+//     lanes share that budget - two lanes buy half each, because the team is the same team;
+//   * a link with nothing queued has nothing to take back: the previous layer's upload is compared
+//     against the wall it happened in, and a copy that took under kLinkBusyShare of it is idle;
+//   * a CPU half that cost more than kCpuBusyShare of that same wall last layer IS the critical
+//     path, so the count halves instead of growing.
+//
+// Every term is either calibrated-and-named or measured; none is a guess wearing a constant's
+// clothes. The result is reported per layer ([cpu-path]) and per token ([host] share).
+inline constexpr double kCpuGflopsCalibrated = 778.0; // the benchmark's own effective rate
+inline constexpr double kCpuLayerFloorUs     = 250.0; // a layer shorter than this still gets a floor
+inline constexpr double kLinkBusyShare       = 0.10;  // upload/wall under this: the link is idle
+inline constexpr double kCpuBusyShare        = 0.50;  // cpu/wall over this: the half is the path
+inline constexpr int    kCpuRampStep         = 2;     // routes the count may grow per layer
+inline constexpr int    kCpuReprobeLayers    = 40;    // idle layers before one route is re-measured
+
+struct CpuLayerQuery {
+    int    routes              = 0; // distinct routes this layer would otherwise upload
+    double bytes_per_expert    = 0.0; // every run of the layer summed: one route's link traffic
+    double flops_per_expert    = 0.0; // the CPU half's arithmetic for one route
+    double link_gbps           = 0.0; // PolicyController::link_gbps (probed, never assumed)
+    double upload_us_per_entry = 0.0; // PolicyController::signals.upload_us_per_expert
+    double cold_read_us        = 0.0; // measured read of one cold expert (0: none measured yet)
+    double tier_warm           = -1.0; // share of tier fills answered without a read; <0 unknown
+    double gpu_layer_ms        = 0.0; // the Device critical path (0: unmeasured)
+    double upload_ms           = 0.0; // the previous layer's upload (the link's queue depth)
+    double cpu_ms              = 0.0; // the previous layer's CPU half
+    double wall_ms             = 0.0; // ... and both were measured against this wall
+    int    lanes               = 1;
+};
+
+struct CpuLayerBudget {
+    int    count       = 0;
+    double cost_gpu_us = -1.0;
+    double cost_cpu_us = -1.0; // compute + the cold read the tier would charge
+    double budget_us   = -1.0;
+    double cpu_gflops  = 0.0;
+    const char* why    = "off";
+};
+
+// The CPU rate this box has measured. Thread-local like the bus and the ledger: the half runs on
+// the engine worker, so its rate belongs to that worker's measurement, not to the process.
+struct CpuHalfRate {
+    // Two rates, because the two questions are different:
+    //   compute  - what one route costs the arithmetic alone (the marginal side of the comparison);
+    //   span     - what one route costs the CPU side of the layer end to end, tier fill included
+    //              (the number the layer budget is divided by).
+    // The span is the BEST observed, not an average: the first fill of a process pays arena and
+    // page first-touch that never comes back, and a policy that priced its steady state on that
+    // would never run again. Re-probes (kCpuReprobeLayers) keep the estimate from going stale.
+    double compute_us_per_expert = -1.0;
+    double span_us_per_expert    = -1.0;
+    double cpu_gflops            = kCpuGflopsCalibrated;
+    int    last_count            = 0;  // the count the previous layer ran with (the ramp's anchor)
+    int    idle_layers           = 0;  // layers since the CPU half last took a route (re-probe clock)
+};
+
+inline CpuHalfRate& cpu_half_rate() {
+    static thread_local CpuHalfRate rate;
+    return rate;
+}
+
+// One measured CPU half: `experts` routes in `cpu_ms`. The effective per-route time is what the
+// next budget is priced with; the GFLOPS figure is printed beside it so the calibration can be
+// checked against the benchmark's 778 rather than trusted.
+// One measured CPU half: `experts` routes, `span_ms` from the tier fill to the end of the
+// arithmetic, `compute_ms` the arithmetic alone. The compute rate is an EWMA; the span is the best
+// observed, and the printed GFLOPS figure is read off the compute rate so the calibration can be
+// checked against the benchmark's 778 rather than trusted.
+inline void note_cpu_half(int experts, double span_ms, double compute_ms,
+                          double flops_per_expert) noexcept {
+    if (experts <= 0) { return; }
+    auto& rate = cpu_half_rate();
+    const double span = span_ms * 1000.0 / static_cast<double>(experts);
+    if (span > 0.0 && (rate.span_us_per_expert < 0.0 || span < rate.span_us_per_expert)) {
+        rate.span_us_per_expert = span;
+    }
+    if (compute_ms > 0.0) {
+        const double per = compute_ms * 1000.0 / static_cast<double>(experts);
+        rate.compute_us_per_expert = rate.compute_us_per_expert > 0.0
+                                         ? rate.compute_us_per_expert + (per - rate.compute_us_per_expert) / 8.0
+                                         : per;
+        if (flops_per_expert > 0.0) {
+            rate.cpu_gflops = flops_per_expert / (rate.compute_us_per_expert * 1e-6) / 1e9;
+        }
+    }
+}
+
+[[nodiscard]] inline CpuLayerBudget decide_cpu_layer_budget(const CpuLayerQuery& query) noexcept {
+    CpuLayerBudget out;
+    if (cpu_path_switch() == CpuPathSwitch::Off) {
+        out.why = "policy off";
+        return out;
+    }
+    if (query.routes <= 0) {
+        out.why = "no routes";
+        return out;
+    }
+    if (!(query.link_gbps > 0.0)) {
+        out.why = "no link probe";
+        return out;
+    }
+    auto& rate         = cpu_half_rate();
+    out.cpu_gflops     = rate.cpu_gflops > 0.0 ? rate.cpu_gflops : kCpuGflopsCalibrated;
+    // The two sides are MARGINAL, and both pay one trip through the tier's entry image, so the read
+    // is charged to both and cancels - what is left is the comparison the port is built on: one PCIe
+    // trip versus one CPU compute. (An earlier draft charged the read to the CPU alone, which made
+    // every comparison read "the copy is cheaper" as soon as the tier went cold - a modelling error,
+    // not a measurement: the pool reads the same bytes to fill the same seat.)
+    const double link_us = query.bytes_per_expert / (query.link_gbps * 1e9) * 1e6;
+    const double cold_share =
+        query.tier_warm < 0.0 ? 1.0 : std::max(0.0, 1.0 - query.tier_warm);
+    const double read_us = cold_share * query.cold_read_us;
+    // The copy side: what one route costs over the link, plus the slack the measured upload shows
+    // above the bare transfer. With no measurement the read the pool also pays is priced in, so the
+    // number stays comparable instead of silently dropping the I/O.
+    const double gpu_us  = query.upload_us_per_entry > 0.0
+                               ? std::max(link_us, 3.0 * query.upload_us_per_entry)
+                               : link_us + read_us;
+    // The compute side: measured rate when this box has one, the calibrated rate otherwise.
+    const double compute_us = rate.compute_us_per_expert > 0.0
+                                  ? rate.compute_us_per_expert
+                                  : query.flops_per_expert / (out.cpu_gflops * 1e9) * 1e6;
+    const double cpu_us     = compute_us + read_us;
+    out.cost_gpu_us         = gpu_us;
+    out.cost_cpu_us         = cpu_us;
+    if (!(gpu_us > cpu_us)) {
+        out.why = "copy already cheaper";
+        return out;
+    }
+    double budget_us = std::max(query.gpu_layer_ms > 0.0 ? query.gpu_layer_ms * 1000.0 : 0.0,
+                                kCpuLayerFloorUs);
+    if (query.lanes > 1) { budget_us /= static_cast<double>(query.lanes); }
+    out.budget_us = budget_us;
+    // How many routes fit: the CPU half's own measured span per route when this box has timed one -
+    // that span includes the tier fill, which is serial on this thread and is precisely what makes
+    // the half the critical path when it grows past the copy it is meant to overlap.
+    const double per_route_us = rate.span_us_per_expert > 0.0 ? rate.span_us_per_expert : cpu_us;
+    int count = per_route_us > 0.0 ? static_cast<int>(budget_us / per_route_us) : 0;
+    // Queue depth, both sides, from the previous layer of this same stream. An upload nobody has
+    // timed yet (-1/0 ms) is not an idle link: the trim only fires on a measurement.
+    if (query.wall_ms > 0.0 && query.upload_ms > 0.0 &&
+        query.upload_ms < kLinkBusyShare * query.wall_ms) {
+        out.why = "link idle";
+        count   = 0;
+    } else if (query.wall_ms > 0.0 && query.cpu_ms > kCpuBusyShare * query.wall_ms) {
+        out.why = "cpu half busy";
+        count   = count / 2;
+    } else {
+        out.why = "cost model";
+    }
+    out.count = std::min(count, query.routes);
+    // The re-probe. A count of zero ends the measurement, and a measurement that can never be
+    // retaken is a latch, not a policy: after kCpuReprobeLayers idle layers the actuator takes ONE
+    // route back, so a regime that was priced on a cold start gets re-measured at its own cost. One
+    // route in forty is the price of not being wrong forever.
+    if (out.count == 0) {
+        if (++rate.idle_layers >= kCpuReprobeLayers) {
+            rate.idle_layers = 0;
+            out.count        = std::min(1, query.routes);
+            out.why          = "re-probe";
+        }
+    } else {
+        rate.idle_layers = 0;
+    }
+    // The ramp. A count is a result, but it is reached one layer at a time: a model that has only
+    // ever seen a small half cannot say what a large one costs, and the first layer that guesses
+    // "all of them" pays the guess in full. Additive here, multiplicative in the trims above -
+    // classic AIMD, and the reason a bad first estimate costs a couple of layers instead of a run.
+    out.count = std::min(out.count, rate.last_count + kCpuRampStep);
+    rate.last_count = out.count;
+    return out;
+}
+
 // ---- read-only observation: the [ctl] panel's cpu line ----------------------------------------
 //
 // The counts ARE the hit/hit-rate observables: kv_host_partial/expert_cpu_half are the hits,
@@ -280,6 +476,17 @@ struct CpuPathLedger {
     double last_kv_cpu_ms     = -1.0;
     double last_expert_copy_us = -1.0;
     double last_expert_cpu_us  = -1.0;
+    // Decision 3's ledger: the ratio the actuator actually applied. `cpu_routes` is the numerator
+    // (routes the CPU half computed), `routes_seen` the denominator (routes the layers had), and the
+    // two are counted at different points of one layer - routes in ensure(), cpu routes in the CPU
+    // half - so `note_layer_cpu` is what closes a layer and prints it.
+    std::uint64_t cpu_routes    = 0;
+    std::uint64_t routes_seen   = 0;
+    std::uint64_t layer_cpu     = 0;
+    double last_layer_cpu_ms    = 0.0;
+    double last_cost_gpu_us     = -1.0;
+    double last_cost_cpu_us     = -1.0;
+    double last_budget_us       = -1.0;
 
     void note_kv(CpuKvSplitLeg leg, double copy_ms, double cpu_ms) noexcept {
         last_kv_copy_ms = copy_ms;
@@ -300,6 +507,28 @@ struct CpuPathLedger {
         case CpuExpertLeg::NoData: ++expert_nodata; return;
         }
     }
+
+    // One closed layer: what the ratio cost and what it bought. The two halves are counted where
+    // each exists - routes at the decision (ensure_split), experts and ms at the CPU half - which is
+    // why there are two notes instead of one.
+    void note_layer_routes(int routes) noexcept {
+        if (routes > 0) { routes_seen += static_cast<std::uint64_t>(routes); }
+    }
+    void note_layer_cpu(int experts, double span_ms, double compute_ms) noexcept {
+        layer_cpu = static_cast<std::uint64_t>(experts < 0 ? 0 : experts);
+        cpu_routes += layer_cpu;
+        last_layer_cpu_ms = span_ms;
+        if (layer_cpu != 0) {
+            note_cpu_half(experts, span_ms, compute_ms, last_flops_per_expert);
+        }
+    }
+    // The cost model's own two sides for the decision in force, set where it was taken.
+    void note_budget(double gpu_us, double cpu_us, double budget_us) noexcept {
+        last_cost_gpu_us = gpu_us;
+        last_cost_cpu_us = cpu_us;
+        last_budget_us   = budget_us;
+    }
+    double last_flops_per_expert = 0.0;
 
     // Printed by PolicyController::report() with the rest of the panel (same cadence, same
     // NINFER_SPLIT_TIMING gate). Read-only: with no actuator wired this line IS the whole
@@ -329,6 +558,27 @@ struct CpuPathLedger {
         } else {
             std::fprintf(stderr, "; no est)\n");
         }
+        // Decision 3's share: the routes the CPU half took over the routes the layers had, with the
+        // rate the model priced them at. Printed even at zero, because "the actuator never fired"
+        // and "the actuator fired and did nothing" are different statements.
+        std::fprintf(stderr,
+                     "[ctl] cpu share: routes cpu=%llu/%llu (%.1f%%) last=%llu experts | "
+                     "rate compute=%.1fus span=%.1fus per exp (%.0f GFLOPS) | est copy=%.0f us vs "
+                     "cpu=%.0f us, budget=%.0f us\n",
+                     static_cast<unsigned long long>(cpu_routes),
+                     static_cast<unsigned long long>(routes_seen),
+                     routes_seen == 0 ? 0.0
+                                      : 100.0 * static_cast<double>(cpu_routes) /
+                                            static_cast<double>(routes_seen),
+                     static_cast<unsigned long long>(layer_cpu),
+                     cpu_half_rate().compute_us_per_expert < 0.0
+                         ? 0.0
+                         : cpu_half_rate().compute_us_per_expert,
+                     cpu_half_rate().span_us_per_expert < 0.0
+                         ? 0.0
+                         : cpu_half_rate().span_us_per_expert,
+                     cpu_half_rate().cpu_gflops, last_cost_gpu_us, last_cost_cpu_us,
+                     last_budget_us);
         std::fflush(stderr);
     }
 };

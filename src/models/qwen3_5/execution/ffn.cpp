@@ -1130,6 +1130,14 @@ void split_host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParamete
                                                           cpu_begin)
                      .count();
     }
+    // The span the ratio is judged by: the fill plus the arithmetic, i.e. everything this layer did
+    // on the CPU side of the split. Recorded even when it is zero, so "the half did nothing" is said
+    // out loud instead of being indistinguishable from "the half was not measured".
+    const double cpu_span_ms = ensure_ms + cpu_ms;
+    if (cpu_path_switch() == CpuPathSwitch::On) {
+        auto& ledger = cpu_path_ledger();
+        ledger.note_layer_cpu(static_cast<int>(wanted.size()), cpu_span_ms, cpu_ms);
+    }
     (void)ensure_ms;
     if (host_term_device != nullptr) {
         const auto write_begin = std::chrono::steady_clock::now();
@@ -1157,6 +1165,27 @@ void split_host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParamete
                              static_cast<unsigned long long>(stats.hits),
                              static_cast<unsigned long long>(stats.misses),
                              static_cast<unsigned long long>(stats.evictions));
+                // P3: the ratio this actuator reached, on its own line. The numerator is the routes
+                // the CPU half computed, the denominator the routes the layers had; `span` and
+                // `upload` are per token (40 layers), the two numbers the next decision is priced
+                // with - what the CPU side cost and what the link was relieved of.
+                static double acc_span = 0.0;
+                static std::uint64_t acc_up = 0;
+                acc_span += cpu_span_ms;
+                acc_up += moe.stream->last_cost().upload_bytes;
+                const auto& ledger = cpu_path_ledger();
+                std::fprintf(stderr,
+                             "[host] cpu share=%.1f%% (%llu/%llu routes) span=%.2fms/token "
+                             "upload=%llu KiB/token\n",
+                             ledger.routes_seen == 0
+                                 ? 0.0
+                                 : 100.0 * static_cast<double>(ledger.cpu_routes) /
+                                       static_cast<double>(ledger.routes_seen),
+                             static_cast<unsigned long long>(ledger.cpu_routes),
+                             static_cast<unsigned long long>(ledger.routes_seen), acc_span,
+                             static_cast<unsigned long long>(acc_up / 1024U));
+                acc_span = 0.0;
+                acc_up   = 0;
                 acc[0] = acc[1] = 0.0;
             }
         }

@@ -1,6 +1,7 @@
 #include "models/qwen3_5/execution/expert_stream.h"
 #include "models/qwen3_5/execution/expert_prefetch.h"
 #include "models/qwen3_5/execution/expert_path_control.h"
+#include "models/qwen3_5/execution/cpu_path_policy.h"
 #include "models/qwen3_5/execution/host_expert_residency.h"
 #include "core/memory_budget.h"
 
@@ -1577,11 +1578,21 @@ void ExpertStream::publish_split_run(std::size_t index, cudaStream_t stream, boo
     }
     for (std::uint32_t expert = 0; expert < count_; ++expert) {
         // The pool wins a tie: an expert resident in both is addressed in video memory.
+        //
+        // P3: an expert the layer's CPU half owns is absent as far as this publication is
+        // concerned - even if a pool seat still happens to hold it, and even if the pinned tier
+        // does. The mask is what the GEMM's MaskOnes subset reads, so marking it absent here is
+        // what makes the CPU half's half of the routes the CPU's: one place decides, and the
+        // Device never sees an address for a route it is not supposed to compute.
+        const bool cpu_half =
+            !split_cpu_only_[index].empty() && split_cpu_only_[index][expert] != 0;
         std::uint32_t placement = ops::kExpertPlacementAbsent;
-        if (run.pool_slot[expert] >= 0) {
-            placement = static_cast<std::uint32_t>(run.pool_slot[expert]);
-        } else if (tier_usable && run.host_slots[expert] != HostExpertResidency::kAbsentSlot) {
-            placement = ops::kExpertPlacementHost | run.host_slots[expert];
+        if (!cpu_half) {
+            if (run.pool_slot[expert] >= 0) {
+                placement = static_cast<std::uint32_t>(run.pool_slot[expert]);
+            } else if (tier_usable && run.host_slots[expert] != HostExpertResidency::kAbsentSlot) {
+                placement = ops::kExpertPlacementHost | run.host_slots[expert];
+            }
         }
         if (placement != run.placement_published[expert]) { changed = true; }
         run.placement[expert] = placement;
@@ -1907,6 +1918,140 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
     // A decode step still has to install the routes it just saw; it just does not discard the rest.
     const bool install = refresh || tokens <= kSplitSetUpdateTokens;
 
+    // ---- P3: the layer's CPU share, decided here and acted on in exactly two places ------------
+    //
+    // The ratio is a result. One layer asks the cost model (cpu_path_policy.h decision 3) with the
+    // three facts only this scope has - what a route costs over the link (three entry images), what
+    // it costs the CPU half (the run geometry), and what this layer may spend on the CPU (its own
+    // wall and the Device critical path) - and gets a COUNT back. Nothing in its path reads a
+    // fraction from the environment.
+    //
+    // The experts it names are the coldest of this layer's routes, because the choice is not "may
+    // this expert wait" but "which of the ten is least likely to be wanted again next step": the
+    // decayed score is the same ranking the pool itself fills its remaining seats from, so a route
+    // it prefers to keep is a route sent to the pool.
+    //
+    // The membership then does exactly two things, both applied once below: the route is left off
+    // the upload list (no PCIe traffic for it), and publish_split_run keeps it out of the placement
+    // word, so neither the pool nor the pinned tier offers the Device an address for it. The CPU
+    // half reads the same entry images from the tier - which is why the tier must still hold them,
+    // and why the fill below is unchanged: it is asked for the complement either way.
+    //
+    // With the switch off nothing here runs, `split_cpu_only_` stays empty, every branch that reads
+    // it degenerates to "not a member", and the layer is bit for bit the pre-P3 layer.
+    std::vector<std::int32_t> distinct; // this layer's routes, deduplicated and sorted
+    if (host_ != nullptr || cpu_path_switch() == CpuPathSwitch::On) {
+        distinct.assign(route_ids, route_ids + values);
+        std::sort(distinct.begin(), distinct.end());
+        distinct.erase(std::unique(distinct.begin(), distinct.end()), distinct.end());
+    }
+    // One layer's wall, measured the way the [ctl] decode estimator measures it: the interval
+    // between this call and this stream's previous one. Nothing else in this path stamps a whole
+    // layer, and both queue-depth trims are ratios against exactly this interval.
+    static thread_local std::chrono::steady_clock::time_point last_ensure_at{};
+    double layer_wall_ms = 0.0;
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (last_ensure_at.time_since_epoch().count() != 0) {
+            layer_wall_ms =
+                std::chrono::duration<double, std::milli>(now - last_ensure_at).count();
+        }
+        last_ensure_at = now;
+    }
+    int cpu_routes_this_layer = 0;
+    for (auto& set : split_cpu_only_) { set.clear(); }
+    if (cpu_path_switch() == CpuPathSwitch::On && host_ != nullptr && !distinct.empty()) {
+        auto& control = policy_controller();
+        if (!(control.link_gbps > 0.0)) {
+            // One 32 MiB mapped copy, best of three: the link this decision divides by. Probed here
+            // because the split form is its own call path and the controller's probe otherwise
+            // lives in the fused one.
+            control.probe_link(static_cast<std::uint64_t>(2U << 20));
+        }
+        CpuLayerQuery query;
+        query.routes = static_cast<int>(distinct.size());
+        for (const auto& run : split_) {
+            query.bytes_per_expert += static_cast<double>(run.entry.entry_bytes);
+        }
+        // The half's arithmetic for one route: gate + up + down, two FLOPs per MAC (the same
+        // convention the benchmark's 778 GFLOPS is quoted in), times the columns this layer runs.
+        // The column factor is not optional: a prefill tile is 64-128 rows per route, so a cost that
+        // ignored it would price a prefill route at a decode route's price and buy a 128x mistake.
+        double macs = 0.0;
+        for (const auto& run : split_) { macs += static_cast<double>(run.expert.elements); }
+        query.flops_per_expert    = 2.0 * macs * static_cast<double>(tokens);
+        query.link_gbps           = control.link_gbps;
+        query.upload_us_per_entry = control.signals.upload_us_per_expert;
+        query.cold_read_us        = control.signals.cold_read_us_per_expert;
+        // The critical path this layer's CPU half has to fit under. On this form the copy IS the
+        // critical path - the layer waits on the pool's fill - so the measured copy time is the
+        // number the Device path needs anyway, and the CPU half may take as long as it does.
+        query.gpu_layer_ms        = last_cost_.upload_ms;
+        query.upload_ms           = last_cost_.upload_ms;
+        query.cpu_ms              = cpu_path_ledger().last_layer_cpu_ms;
+        query.wall_ms             = layer_wall_ms;
+        query.lanes               = static_cast<int>(std::max<std::uint32_t>(1U, control.signals.lanes_busy));
+        // How much of the tier the CPU half would find warm: the residency's own fill counters,
+        // differenced per layer. Unknown on the first layer, which the model reads as "cold".
+        {
+            const auto& stats = host_->stats();
+            static thread_local std::uint64_t seen_hits = 0, seen_misses = 0;
+            const std::uint64_t hits   = stats.hits - seen_hits;
+            const std::uint64_t misses = stats.misses - seen_misses;
+            seen_hits   = stats.hits;
+            seen_misses = stats.misses;
+            if (hits + misses > 0) {
+                query.tier_warm = static_cast<double>(hits) /
+                                  static_cast<double>(hits + misses);
+            }
+        }
+        const auto budget = decide_cpu_layer_budget(query);
+        cpu_path_ledger().note_budget(budget.cost_gpu_us, budget.cost_cpu_us, budget.budget_us);
+        cpu_path_ledger().note_layer_routes(static_cast<int>(distinct.size()));
+        cpu_path_ledger().last_flops_per_expert = query.flops_per_expert;
+        if (budget.count > 0) {
+            std::vector<std::int32_t> picked = distinct;
+            std::stable_sort(picked.begin(), picked.end(), [&](std::int32_t a, std::int32_t b) {
+                const auto sa = hot_score_[static_cast<std::size_t>(a)];
+                const auto sb = hot_score_[static_cast<std::size_t>(b)];
+                if (sa != sb) { return sa < sb; }
+                return a < b;
+            });
+            picked.resize(std::min<std::size_t>(static_cast<std::size_t>(budget.count),
+                                                picked.size()));
+            for (auto& set : split_cpu_only_) { set.assign(count_, 0); }
+            for (const auto expert : picked) {
+                for (auto& set : split_cpu_only_) {
+                    set[static_cast<std::size_t>(expert)] = 1;
+                }
+            }
+            cpu_routes_this_layer = static_cast<int>(picked.size());
+        }
+        // Per layer, as the ratio is taken: what the model charged on each side, the cap it was cut
+        // to, why, and the two rates the count was divided by (span = tier fill + arithmetic,
+        // compute = the arithmetic alone).
+        std::fprintf(stderr,
+                     "[cpu-path] layer=%llu routes=%zu cpu=%d (%.0f%%) | est copy=%.0fus cpu=%.0fus "
+                     "cap=%.0fus why=%s | link=%.1fGB/s span=%.1fus compute=%.1fus per exp "
+                     "(%.0f GFLOPS)\n",
+                     static_cast<unsigned long long>(control.layers + 1), distinct.size(),
+                     cpu_routes_this_layer,
+                     distinct.empty() ? 0.0
+                                      : 100.0 * cpu_routes_this_layer /
+                                            static_cast<double>(distinct.size()),
+                     budget.cost_gpu_us, budget.cost_cpu_us, budget.budget_us, budget.why,
+                     control.link_gbps,
+                     cpu_half_rate().span_us_per_expert < 0.0
+                         ? 0.0
+                         : cpu_half_rate().span_us_per_expert,
+                     cpu_half_rate().compute_us_per_expert < 0.0
+                         ? 0.0
+                         : cpu_half_rate().compute_us_per_expert,
+                     cpu_half_rate().cpu_gflops);
+        std::fflush(stderr);
+    }
+    split_cpu_routes_ = static_cast<std::uint32_t>(cpu_routes_this_layer);
+
     std::array<std::vector<std::uint32_t>, 3> wanted;
     std::vector<std::uint32_t> ranked; // built once: the ranking is per expert, not per run
     std::vector<bool> chosen(count_, false);
@@ -1927,6 +2072,13 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
             const auto expert = static_cast<std::uint32_t>(route_ids[i]);
             if (chosen[expert]) { continue; }
             chosen[expert] = true;
+            // P3: a route the CPU half owns keeps no pool seat. It is marked chosen so neither the
+            // held set below nor the ranking hands it a seat back; the next-best expert takes the
+            // seat instead, and nothing is staged for it (only the routes above are uploaded), so
+            // the seat costs no traffic - it is a placement, not a copy.
+            if (!split_cpu_only_[index].empty() && split_cpu_only_[index][expert] != 0) {
+                continue;
+            }
             set.push_back(expert);
         }
         if (ranked.empty() && refresh) {
@@ -1944,6 +2096,10 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
                 if (set.size() >= capacity[index]) { break; }
                 if (expert >= chosen.size() || chosen[expert]) { continue; }
                 chosen[expert] = true;
+                if (!split_cpu_only_[index].empty() &&
+                    split_cpu_only_[index][static_cast<std::size_t>(expert)] != 0) {
+                    continue; // P3: the CPU half's expert holds no seat, see the routes loop
+                }
                 set.push_back(expert);
             }
         }
@@ -1959,13 +2115,22 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
                 if (set.size() >= capacity[index]) { break; }
                 if (chosen[expert]) { continue; }
                 chosen[expert] = true;
+                if (!split_cpu_only_[index].empty() && split_cpu_only_[index][expert] != 0) {
+                    continue; // P3: the CPU half's expert holds no seat, see the routes loop
+                }
                 set.push_back(expert);
             }
         }
         split_prev_[index] = wanted[index];
         if (index == 0) {
             for (std::size_t i = 0; i < values; ++i) {
-                if (chosen[static_cast<std::size_t>(route_ids[i])]) { ++inside_gate; }
+                const auto expert = static_cast<std::size_t>(route_ids[i]);
+                // P3: a route the CPU half owns is not "inside" anything the pool covers, so it is
+                // not counted towards the coverage the panel reports.
+                if (!split_cpu_only_[index].empty() && split_cpu_only_[index][expert] != 0) {
+                    continue;
+                }
+                if (chosen[expert]) { ++inside_gate; }
             }
         }
     }
@@ -1973,10 +2138,6 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
     // Q20 second leg, filled BEFORE the tables are built: a slot claimed after them still holds the
     // previous expert. Per run: each run's pool set is different, so its complement is too.
     if (host_ != nullptr && std::getenv("NINFER_SKIP_HOST_FILL") == nullptr) {
-        static thread_local std::vector<std::int32_t> distinct;
-        distinct.assign(route_ids, route_ids + values);
-        std::sort(distinct.begin(), distinct.end());
-        distinct.erase(std::unique(distinct.begin(), distinct.end()), distinct.end());
         static thread_local std::vector<std::uint8_t> in_wanted;
         if (in_wanted.size() != count_) { in_wanted.assign(count_, 0); }
         for (std::size_t index = 0; index < split_.size(); ++index) {
@@ -2043,11 +2204,21 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
     }
 
     // One upload turn for all three runs: the routed keys of each run, deduplicated per bank.
+    //
+    // P3: a route the CPU half owns is left off this list, and that is the whole bandwidth saving -
+    // the link no longer carries an entry image the CPU is about to compute over. The CPU reads the
+    // same image from the pinned tier instead (one read, no DMA), which is what the compute side of
+    // the cost model prices.
     required_.clear();
     required_.reserve(values * split_.size());
-    for (const auto& run : split_) {
+    for (std::size_t index = 0; index < split_.size(); ++index) {
+        const auto& run = split_[index];
         for (std::size_t i = 0; i < values; ++i) {
-            required_.push_back(ExpertCacheKey{run.bank, static_cast<std::uint32_t>(route_ids[i])});
+            const auto expert = static_cast<std::uint32_t>(route_ids[i]);
+            if (!split_cpu_only_[index].empty() && split_cpu_only_[index][expert] != 0) {
+                continue;
+            }
+            required_.push_back(ExpertCacheKey{run.bank, expert});
         }
     }
     std::sort(required_.begin(), required_.end(), [](const ExpertCacheKey& a, const ExpertCacheKey& b) {
@@ -2058,6 +2229,21 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
                                     return a.bank == b.bank && a.expert == b.expert;
                                 }),
                     required_.end());
+    // The bytes this layer will actually put on the link: an entry only moves when its image is not
+    // already ready. Counted in both arms - a counter that only runs when the policy is on cannot
+    // say what the policy saved, which is the one comparison it exists for.
+    std::uint64_t upload_bytes = 0;
+    for (const auto& key : required_) {
+        if (cache_->offset(key)) { continue; }
+        for (const auto& run : split_) {
+            if (run.bank != key.bank) { continue; }
+            upload_bytes += run.entry.entry_bytes;
+            break;
+        }
+    }
+
+    // What this layer will actually put on the link: an entry only moves when its image is not
+    // already ready. Counted before the copy, priced with each run's own entry image.
     const auto upload_begin = std::chrono::steady_clock::now();
     cache_->prepare(required_, stream);
     try {
@@ -2075,6 +2261,33 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - upload_begin)
             .count();
     last_cost_.uploaded = cache_->last_uploaded();
+    last_cost_.upload_bytes = upload_bytes;
+
+    // P3: the split form is its own call path, so it feeds the controller nodes the cost model reads
+    // (the fused path feeds them from streamed_ffn). Gated on the switch: with the policy down none
+    // of this runs, no probe is taken, and the panel is exactly what it was.
+    if (cpu_path_switch() == CpuPathSwitch::On) {
+        auto& control = policy_controller();
+        control.observe_upload(last_cost_.upload_ms * 1000.0, last_cost_.uploaded);
+        control.observe_misses(last_cost_.uploaded);
+        // The Device critical path is not measured separately on this path; passing the current
+        // EWMA back into observe_layer leaves it untouched and still records the layer's wall.
+        control.observe_layer(last_cost_.route_ms + last_cost_.layout_ms + last_cost_.upload_ms,
+                              control.signals.gpu_ms, layer_wall_ms);
+        control.observe_prefill(tokens > 8);
+        const auto sources = cache_->upload_sources();
+        if (sources.file_experts > 0) {
+            const double cold = sources.read_us / static_cast<double>(sources.file_experts);
+            control.signals.cold_read_us_per_expert +=
+                (cold - control.signals.cold_read_us_per_expert) / 16.0;
+        }
+        if (const auto total = sources.arena_experts + sources.file_experts; total > 0) {
+            const double ratio =
+                static_cast<double>(sources.arena_experts) / static_cast<double>(total);
+            control.signals.mirror_hit_ratio +=
+                (ratio - control.signals.mirror_hit_ratio) / 16.0;
+        }
+    }
 
     // A3b per run: the tables the kernels are about to read must be the ones this run's set now is.
     for (const auto& run : split_) {

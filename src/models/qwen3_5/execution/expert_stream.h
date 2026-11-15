@@ -212,6 +212,9 @@ public:
     // port (sm_89): how many of this layer's gate-run routes the pinned tier served. The gate run is
     // the router's own matrix, so it is the one the [experts] line reports.
     [[nodiscard]] std::uint32_t split_host_routes() const noexcept { return split_host_routes_; }
+    // P3: of this layer's gate-run routes, how many the CPU half owns (the cost model's answer on
+    // the last ensure_split). Zero whenever NINFER_CPU_PATH_POLICY is off.
+    [[nodiscard]] std::uint32_t split_cpu_routes() const noexcept { return split_cpu_routes_; }
     // What one run is described by: the artifact bank, its parent (metadata for a loader that names
     // the expert objects) and the per-expert geometry the operator sizes against.
     [[nodiscard]] const WeightBankLayout& split_layout(ExpertMatrixRole role) const {
@@ -362,6 +365,10 @@ public:
         double layout_ms = 0.0; // hot set, slot publish, mask and offset tables
         double upload_ms = 0.0; // prepare + wait_for_progress
         std::uint32_t uploaded = 0; // experts actually moved into the pool on this layer
+        // P3: the PCIe bytes this layer actually moved (the routes left out for the CPU half are
+        // subtracted by construction, because they are never put on the upload list). Printed per
+        // layer by the [cpu-path] line; zero whenever the path is off.
+        std::uint64_t upload_bytes = 0;
     };
     [[nodiscard]] StepCost last_cost() const noexcept { return last_cost_; }
     // port (sm_89): how many slots a frozen set must leave free. Measured on real text, a token
@@ -521,6 +528,17 @@ private:
     // Tier routes per run: the distinct routes this run's pool will not hold. Empty when no tier is
     // attached. Filled by ensure_split, consumed by the fill.
     std::array<std::vector<std::int32_t>, 3> split_host_targets_;
+    // port (sm_89), P3: the experts the layer's CPU half owns this step, one flag per expert. The
+    // ratio that fills it is a result of the cost model (cpu_path_policy.h decision 3), not a
+    // constant: ensure_split asks, and the answer is a count of this layer's routes. Membership has
+    // exactly two consequences, both applied at one place each - the route is left out of the
+    // upload list (no PCIe traffic), and publish_split_run keeps it out of the placement word (so
+    // neither the pool nor the pinned tier hands the Device an address for it). The CPU half reads
+    // the same entry images from the tier, which is why the entry must still be filled there.
+    // Empty when the policy is off, and every branch that reads it is written so empty means the
+    // pre-P3 behaviour bit for bit.
+    std::array<std::vector<std::uint8_t>, 3> split_cpu_only_;
+    std::uint32_t split_cpu_routes_ = 0;
     std::array<std::vector<std::uint32_t>, 3> split_frozen_; // per run, when frozen_
     // port (sm_89): last layer's installed set, per run. A decode step starts from it and adds this
     // step's routes, rather than re-scanning 512 slots per run and re-sorting the score every layer.
