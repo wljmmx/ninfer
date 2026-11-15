@@ -794,6 +794,46 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                     scores.view({dimension(config.dflash2->selector_top_k), k, batch}), extents,
                     static_cast<std::int32_t>(k), state.execution.draft_conf, stream);
             }
+            // NINFER_DFLASH2_HEAD_AB=<path>: the same draft hidden row (column 0) through the target's
+            // own LM head as well, so "the two heads disagree on one hidden" and "the draft hidden
+            // ranks badly whatever head reads it" stop looking alike. One line per round:
+            // step, q8 argmax, q5 argmax, top-16 intersection, q8 unary of its own top-1.
+            if (const char* ab = std::getenv("NINFER_DFLASH2_HEAD_AB")) {
+                static std::FILE* file = std::fopen(ab, "wb");
+                if (file != nullptr) {
+                    static std::atomic<std::uint64_t> head_steps{0};
+                    const std::uint64_t step   = head_steps.fetch_add(1);
+                    const auto vocab_rows      = dimension(
+                        state.execution.parameters.model.resources().public_token_count);
+                    Tensor column = hidden.slice(1, 0, 1);
+                    Tensor ab_ids =
+                        work.alloc(DType::I32, {dimension(config.dflash2->selector_top_k), 1});
+                    Tensor ab_scores =
+                        work.alloc(DType::FP32, {dimension(config.dflash2->selector_top_k), 1});
+                    ops::linear_topk(column, state.execution.parameters.text.output_head.weight,
+                                     vocab_rows, ab_ids, ab_scores, work, stream);
+                    std::vector<std::int32_t> q5(16), q8(16);
+                    std::vector<float> q5_scores(16);
+                    CUDA_CHECK(cudaMemcpyAsync(q8.data(), candidates.slice(1, 0, 1).data,
+                                               q8.size() * sizeof(std::int32_t),
+                                               cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(q5.data(), ab_ids.data,
+                                               q5.size() * sizeof(std::int32_t),
+                                               cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(q5_scores.data(), ab_scores.data,
+                                               q5_scores.size() * sizeof(float),
+                                               cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    int overlap = 0;
+                    for (std::int32_t id : q8) {
+                        overlap += std::find(q5.begin(), q5.end(), id) != q5.end() ? 1 : 0;
+                    }
+                    std::fprintf(file, "%llu,%d,%d,%d,%.6f\n",
+                                 static_cast<unsigned long long>(step), q8.front(), q5.front(),
+                                 overlap, double(q5_scores.front()));
+                    std::fflush(file);
+                }
+            }
         };
         run_head();
         work.reset();
