@@ -16,6 +16,8 @@
 #include "ops/common/numeric/math.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
@@ -213,7 +215,34 @@ inline void row_all_tokens(const Row& row, std::int32_t k, const Input* const* i
     }
 }
 
+// NINFER_CPU_PHASE: where a split route's time goes. The groupwise_int kernel's dot measured 0.075 us
+// for two rows in isolation, which cannot account for a route costing hundreds of microseconds, so
+// the split is what says whether the time is the gate/up pass, the down pass, or neither. Totals are
+// per worker thread and the barriers sit inside the measured spans, so a span already includes the
+// wait for the slowest lane - which is what the layer pays.
+struct SplitPhaseTotals {
+    double gate_up_us = 0.0;
+    double down_us    = 0.0;
+    std::uint64_t experts = 0;
+};
+
+inline SplitPhaseTotals& split_phase_totals() {
+    static thread_local SplitPhaseTotals totals;
+    return totals;
+}
+
+inline bool split_phase_probe() {
+    static const bool enabled = std::getenv("NINFER_CPU_PHASE") != nullptr;
+    return enabled;
+}
+
+inline std::chrono::steady_clock::time_point split_phase_mark(bool probe) {
+    return probe ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+}
+
 void run_expert(Work& w, Scratch& s, const CpuWorkerContext& worker, std::size_t index) noexcept {
+    const bool phase_probe = split_phase_probe();
+    const auto phase_begin = split_phase_mark(phase_probe);
     const auto expert = static_cast<std::uint32_t>(w.experts[index]);
     // The member table is indexed by expert id, not by the position in `experts`: the two part
     // company whenever the subset skips an expert, and reading the position applies the previous
@@ -246,6 +275,7 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext& worker, std::size_t
         }
     }
     worker.barrier();
+    const auto phase_gate_end = split_phase_mark(phase_probe);
 
     // down_h . a_t folded in with the member's coefficient; the output is [hidden, tokens].
     const auto down_base = w.down.expert(expert);
@@ -264,6 +294,14 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext& worker, std::size_t
         }
     }
     worker.barrier();
+    if (phase_probe) {
+        const auto phase_end = std::chrono::steady_clock::now();
+        auto& totals         = split_phase_totals();
+        totals.gate_up_us +=
+            std::chrono::duration<double, std::micro>(phase_gate_end - phase_begin).count();
+        totals.down_us += std::chrono::duration<double, std::micro>(phase_end - phase_gate_end).count();
+        ++totals.experts;
+    }
 }
 
 void run(void* arguments, const CpuWorkerContext& worker) noexcept {
@@ -275,8 +313,23 @@ void run(void* arguments, const CpuWorkerContext& worker) noexcept {
     scratch.gate.resize(room);
     scratch.up.resize(room);
     scratch.down.resize(room);
+    const bool phase_probe = split_phase_probe();
+    const auto phase_begin = split_phase_mark(phase_probe);
     for (std::size_t index = 0; index < work.experts.size(); ++index) {
         run_expert(work, scratch, worker, index);
+    }
+    if (phase_probe) {
+        const auto phase_end = std::chrono::steady_clock::now();
+        const auto& totals   = split_phase_totals();
+        const double experts = totals.experts > 0 ? static_cast<double>(totals.experts) : 1.0;
+        const double wall = std::chrono::duration<double, std::micro>(phase_end - phase_begin).count();
+        std::fprintf(stderr,
+                     "[cpu-phase-split] experts=%llu tokens=%d | per expert: gate_up=%.1f "
+                     "down=%.1f us | wall=%.1f us (%.0f%% accounted)\n",
+                     static_cast<unsigned long long>(totals.experts), work.tokens,
+                     totals.gate_up_us / experts, totals.down_us / experts, wall,
+                     wall > 0.0 ? 100.0 * (totals.gate_up_us + totals.down_us) / wall : 0.0);
+        std::fflush(stderr);
     }
 }
 

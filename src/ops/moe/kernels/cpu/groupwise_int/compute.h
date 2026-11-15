@@ -4,8 +4,10 @@
 #include "ops/common/numeric/math.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <type_traits>
 
@@ -452,10 +454,32 @@ inline void down(Work& work, const Group& group, int first, int channel,
     }
 }
 
+// Where a route's time goes, per worker thread. Totals rather than averages: the caller divides once
+// at print time, and because a barrier sits inside the measured region the gate/up number already
+// includes the wait for the slowest lane - which is what the layer actually pays.
+struct PhaseTotals {
+    double gate_up_us    = 0.0;
+    double down_us       = 0.0;
+    std::uint64_t routes = 0;
+    std::uint64_t chunks = 0;
+};
+
+inline PhaseTotals& phase_totals() {
+    static thread_local PhaseTotals totals;
+    return totals;
+}
+
 template <class Simd, int DownBits, int GateBits, bool FourColumns>
 [[gnu::always_inline]] inline void compute_chunk(Work& work, const CpuWorkerContext& worker,
                                                  int begin, int columns,
                                                  unsigned bf16_columns) noexcept {
+    // NINFER_CPU_PHASE: where a route's time actually goes. The dot itself measured 0.075 us for two
+    // rows in isolation, three orders below what a route costs here, so the split below is what says
+    // whether the remaining time is the weights coming out of memory, the quantisation, or the
+    // arithmetic - three different fixes.
+    static const bool phase_probe = std::getenv("NINFER_CPU_PHASE") != nullptr;
+    const auto phase_begin = phase_probe ? std::chrono::steady_clock::now()
+                                         : std::chrono::steady_clock::time_point{};
     const int blocks = intermediate / work.block;
     const auto tasks     = worker.range(work.task_count * blocks);
     for (auto index = tasks.begin; index < tasks.end; ++index) {
@@ -478,6 +502,8 @@ template <class Simd, int DownBits, int GateBits, bool FourColumns>
         }
     }
     worker.barrier();
+    const auto phase_gate = phase_probe ? std::chrono::steady_clock::now()
+                                        : std::chrono::steady_clock::time_point{};
     // port (sm_89): the merge runs per token in route order, not in expert-group order: the
     // token device kernel sums values[p] for p ascending (token_swiglu.cu) and the grouped
     // reducer walks route 0..top_k (grouped_swiglu.cu reduce_assignments). slot = t * top_k + j
@@ -543,6 +569,15 @@ template <class Simd, int DownBits, int GateBits, bool FourColumns>
                 work.args.output + static_cast<std::size_t>(begin + t) * hidden + channel;
             for (int i = 0; i < work.block; ++i) { output[i] = accumulated[t][i]; }
         }
+    }
+    if (phase_probe) {
+        const auto phase_end = std::chrono::steady_clock::now();
+        auto& totals         = phase_totals();
+        totals.gate_up_us +=
+            std::chrono::duration<double, std::micro>(phase_gate - phase_begin).count();
+        totals.down_us += std::chrono::duration<double, std::micro>(phase_end - phase_gate).count();
+        totals.routes += static_cast<std::uint64_t>(work.task_count);
+        ++totals.chunks;
     }
 }
 
@@ -627,13 +662,28 @@ template <class Simd>
 template <class Simd, int DownBits, int GateBits>
 void compute(void* argument, const CpuWorkerContext& worker) noexcept {
     auto& work = *static_cast<Work*>(argument);
+    static const bool phase_probe = std::getenv("NINFER_CPU_PHASE") != nullptr;
+    const auto mark = [] {
+        return phase_probe ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+    };
+    const auto since = [](const auto& a, const auto& b) {
+        return phase_probe ? std::chrono::duration<double, std::micro>(b - a).count() : 0.0;
+    };
+    double prep_us = 0.0;
+    double convert_us = 0.0;
+    double quantise_us = 0.0;
+    const auto wall_begin = mark();
     for (int begin = 0; begin < work.args.tokens;) {
         const int columns = std::min(work.plan.token_block, work.args.tokens - begin);
+        const auto phase_prep = mark();
         // Caller-prepared metadata is published with run(); worker-prepared metadata
         // is published with the input barrier. Later chunks reuse joined scratch.
         if (begin != 0 || Simd::first_chunk == FirstChunkPreparation::Worker) {
             if (worker.rank() == 0) { prepare_chunk(work, begin, columns); }
         }
+        const auto phase_convert = mark();
+        prep_us += since(phase_prep, phase_convert);
         if constexpr (!Simd::bf16_gate) {
             const auto input_range = worker.range(hidden * columns / Simd::lanes);
             for (auto v = input_range.begin; v < input_range.end; ++v) {
@@ -643,6 +693,8 @@ void compute(void* argument, const CpuWorkerContext& worker) noexcept {
                     Simd::bf16(work.args.input + static_cast<std::size_t>(begin) * hidden + index));
             }
         }
+        const auto phase_quantise = mark();
+        convert_us += since(phase_convert, phase_quantise);
         if (begin != 0 || !Simd::bf16_gate) { worker.barrier(); }
         // port (sm_89, P4-B): the quantised activation tiers feed the q4 gate's nibble dot
         // only — a Q8 gate decodes float codes and never reads the plane.
@@ -656,6 +708,8 @@ void compute(void* argument, const CpuWorkerContext& worker) noexcept {
                 worker.barrier();
             }
         }
+        const auto phase_chunk = mark();
+        quantise_us += since(phase_quantise, phase_chunk);
         // port (sm_89): a split layer routes to a handful of experts, so at 16 channels per unit
         // the team gets 32 units per expert - one or two each, with a barrier on both sides.
         // Halving the unit doubles the units and lets the same team work; with eight experts the
@@ -696,6 +750,26 @@ void compute(void* argument, const CpuWorkerContext& worker) noexcept {
         begin += columns;
         // Protect shared scratch before the next chunk; the final join is provided by run().
         if (begin < work.args.tokens) { worker.barrier(); }
+    }
+    if (phase_probe) {
+        const auto wall_end = mark();
+        const auto& totals  = phase_totals();
+        const double chunks = totals.chunks > 0 ? static_cast<double>(totals.chunks) : 1.0;
+        const double wall   = since(wall_begin, wall_end) / chunks;
+        const double prep   = prep_us / chunks;
+        const double cv     = convert_us / chunks;
+        const double qu     = quantise_us / chunks;
+        const double gate   = totals.gate_up_us / chunks;
+        const double down   = totals.down_us / chunks;
+        const double known  = gate + down + prep + cv + qu;
+        std::fprintf(
+            stderr,
+            "[cpu-phase] routes=%llu chunks=%llu | per chunk: prep=%.1f convert=%.1f "
+            "quantise=%.1f gate_up=%.1f down=%.1f us | accounted=%.0f%% of %.1f us wall\n",
+            static_cast<unsigned long long>(totals.routes),
+            static_cast<unsigned long long>(totals.chunks), prep, cv, qu, gate, down,
+            wall > 0.0 ? 100.0 * known / wall : 0.0, wall);
+        std::fflush(stderr);
     }
 }
 
