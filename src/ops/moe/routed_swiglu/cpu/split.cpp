@@ -958,7 +958,7 @@ void split_launch(const Tensor& x, const CpuSwiGLUExperts& experts, const Expert
         static const char* value = std::getenv("NINFER_MOE_CPU_INT8");
         work.int8_path = value == nullptr || std::strcmp(value, "0") != 0;
         const char* q6 = std::getenv("NINFER_SPLIT_Q6");
-        work.q6_path   = q6 != nullptr && std::strcmp(q6, "0") != 0;
+        work.q6_path   = q6 == nullptr || std::strcmp(q6, "0") != 0;
     }
     work.members.resize(static_cast<std::size_t>(experts_count));
     for (std::int32_t expert = 0; expert < experts_count; ++expert) {
