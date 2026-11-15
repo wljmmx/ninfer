@@ -36,6 +36,10 @@ struct Options {
     std::uint32_t draft_tokens     = 15;
     std::uint32_t batch_size       = 1;
     ninfer::ProposalHead proposal  = ninfer::ProposalHead::Optimized;
+    // DFlash v1 is the backend this bench was written for; an artifact whose draft block is the
+    // masked DFlash2 one is rejected by name ("missing component dflash"), so the backend has to be
+    // sayable. The default keeps the original entry.
+    ninfer::SpeculativeBackend backend = ninfer::SpeculativeBackend::DFlash;
     bool use_cuda_graph            = true;
 };
 
@@ -80,6 +84,17 @@ Options parse_options(int argc, char** argv) {
             options.draft_tokens = parse_u32(value("--draft-tokens"), "draft-tokens");
         } else if (argument == "--batch") {
             options.batch_size = parse_u32(value("--batch"), "batch");
+        } else if (argument == "--spec") {
+            const std::string_view backend(value("--spec"));
+            if (backend == "dflash") {
+                options.backend = ninfer::SpeculativeBackend::DFlash;
+            } else if (backend == "dflash2") {
+                options.backend = ninfer::SpeculativeBackend::DFlash2;
+            } else if (backend == "mtp") {
+                options.backend = ninfer::SpeculativeBackend::Mtp;
+            } else {
+                throw std::invalid_argument("--spec must be dflash, dflash2 or mtp");
+            }
         } else if (argument == "--proposal-head") {
             const std::string_view head(value("--proposal-head"));
             if (head == "full") {
@@ -212,7 +227,7 @@ int run(const Options& options) {
         ninfer::KvCapacityPolicy::explicit_capacity(static_cast<std::uint32_t>(capacity));
     engine.prefill_chunk             = 128;
     engine.kv_cache                  = ninfer::KvCacheStorage::BFloat16;
-    engine.speculative.backend       = ninfer::SpeculativeBackend::DFlash;
+    engine.speculative.backend       = options.backend;
     engine.speculative.draft_tokens  = options.draft_tokens;
     engine.speculative.proposal_head = options.proposal;
     engine.use_cuda_graph            = options.use_cuda_graph;

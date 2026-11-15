@@ -1027,6 +1027,37 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             k == 0 || k > kDFlashDecodeMaximumDrafts) {
             throw std::logic_error("DFlash decode batch state is incomplete");
         }
+        // NINFER_DFLASH_PHASE_TIMER=<path>: the round split into proposal / verify / accept, in GPU
+        // milliseconds, one CSV line per round. The tree question is whether a verified row costs the
+        // same when its state comes from a sibling fork as when it comes from the row before it, and
+        // that cannot be read out of a round total that also carries the draft. Off by default, and
+        // eager only: an event record inside a captured round is illegal, so a captured round runs
+        // exactly as before.
+        struct PhaseTimer {
+            cudaEvent_t begin = nullptr, split = nullptr, end = nullptr;
+            cudaEvent_t accept_begin = nullptr, accept_end = nullptr;
+            std::FILE* file     = nullptr;
+            std::uint64_t round = 0;
+            bool active         = false;
+
+            PhaseTimer() {
+                const char* path = std::getenv("NINFER_DFLASH_PHASE_TIMER");
+                if (path == nullptr) return;
+                file = std::fopen(path, "wb");
+                if (file == nullptr) return;
+                if (cudaEventCreate(&begin) != cudaSuccess || cudaEventCreate(&split) != cudaSuccess ||
+                    cudaEventCreate(&end) != cudaSuccess ||
+                    cudaEventCreate(&accept_begin) != cudaSuccess ||
+                    cudaEventCreate(&accept_end) != cudaSuccess) {
+                    CUDA_CHECK(cudaGetLastError());
+                    return;
+                }
+                active = true;
+            }
+        };
+        static PhaseTimer timer;
+        const bool timing = timer.active && !capturing;
+
         state.execution.work.reset();
         qwen3_5::DFlashDecodeState& frame = state.frame;
         const std::int32_t width          = static_cast<std::int32_t>(k) + 1;
@@ -1060,6 +1091,30 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         Tensor licensed_counts    = frame.licensed_counts.slice(0, 0, batch_size);
         Tensor accepted           = frame.accepted_drafts.slice(0, 0, batch_size);
 
+        static bool told_lanes[kMaximumConcurrency + 1] = {};
+        if (timing && phase == SpeculativePhase::Forward && !told_lanes[batch_size]) {
+            told_lanes[batch_size] = true;
+            // Deliverable of the probe: which state image and which KV table row each lane's whole
+            // rectangle runs on. One pair per LANE, not per column - every column of the rectangle
+            // shares its lane's source and destination, which is what makes the columns a chain
+            // inside gated_delta_net_batch and not siblings of one parent.
+            for (std::int32_t row = 0; row < batch_size; ++row) {
+                std::fprintf(stderr,
+                             "[phase-timer] lane=%d/%d width=%d k=%u state_source=%d state_dest=%d "
+                             "text_kv_row=%d valid_columns=%d extent=%d anchor=%d\n",
+                             row, batch_size, width, k, state.host_ingress.state_source_slots[row],
+                             state.host_ingress.state_destination_slots[row],
+                             state.host_ingress.text_kv_table_rows[row],
+                             state.host_ingress.target_valid_columns[row],
+                             state.host_ingress.proposal_extents[row],
+                             state.host_ingress.anchors[row]);
+            }
+            std::fflush(stderr);
+        }
+        if (timing && phase == SpeculativePhase::Forward) {
+            CUDA_CHECK(cudaEventRecord(timer.begin, state.execution.device.stream));
+        }
+
         if (phase == SpeculativePhase::Forward) {
             state.execution.work.reset();
             Tensor compact_features = state.execution.work.alloc(
@@ -1087,6 +1142,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             }
             ops::speculative_prepare_verify_inputs(anchors, drafts, frontiers, extents, verify_ids,
                                                    target_positions, state.execution.device.stream);
+            if (timing) CUDA_CHECK(cudaEventRecord(timer.split, state.execution.device.stream));
         }
 
 
@@ -1137,6 +1193,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                     std::fflush(stderr);
                 }
                 target_verify_forward(state.execution, card, verify, target_envelope);
+                if (timing) CUDA_CHECK(cudaEventRecord(timer.end, state.execution.device.stream));
                 if (std::getenv("NINFER_DFLASH_TRACE") != nullptr) {
                     std::fprintf(stderr, "[dfl] verify forward done\n");
                     std::fflush(stderr);
@@ -1147,7 +1204,24 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                 std::fprintf(stderr, "[dfl] accept phase\n");
                 std::fflush(stderr);
             }
+            if (timing) CUDA_CHECK(cudaEventRecord(timer.accept_begin, state.execution.device.stream));
             target_accept(state.execution, state.continuation_hidden_store, verify);
+            if (timing) {
+                CUDA_CHECK(cudaEventRecord(timer.accept_end, state.execution.device.stream));
+                CUDA_CHECK(cudaEventSynchronize(timer.accept_end));
+                float draft_ms = 0.0F, verify_ms = 0.0F, accept_ms = 0.0F;
+                // begin/split/end belong to this round's forward pass, which is upstream of this
+                // accept on the same stream, so all three are already complete here.
+                CUDA_CHECK(cudaEventElapsedTime(&draft_ms, timer.begin, timer.split));
+                CUDA_CHECK(cudaEventElapsedTime(&verify_ms, timer.split, timer.end));
+                CUDA_CHECK(cudaEventElapsedTime(&accept_ms, timer.accept_begin, timer.accept_end));
+                std::fprintf(timer.file, "%llu,%u,%d,%d,%.3f,%.3f,%.3f\n",
+                             static_cast<unsigned long long>(timer.round), k, batch_size,
+                             static_cast<std::int32_t>(width), double(draft_ms), double(verify_ms),
+                             double(accept_ms));
+                std::fflush(timer.file);
+                ++timer.round;
+            }
             if (std::getenv("NINFER_DFLASH_TRACE") != nullptr) {
                 std::fprintf(stderr, "[dfl] accept done\n");
                 std::fflush(stderr);

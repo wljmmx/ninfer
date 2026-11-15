@@ -712,13 +712,55 @@ per row from D=1 to D=2, +0.129 from 2 to 3 and +0.065 from 3 to 4, while a bran
 0.115 (D=2) and 0.055 (D=3); the warm dump widens the chain side further (+0.293, +0.172, +0.052).
 Branching is dominated by deepening, everywhere measured.
 
-Rows are the cost unit and the unit is measured (DFlash2, v5_e2, pp64+tg64, graph path, one rep per k;
-round time is the engine's own acceptance length over decode t/s): 0.358 / 0.522 / 0.582 / 0.702 / 0.739 /
-0.894 / 0.922 s for 2..8 rows, i.e. **0.093 s per verified row over a 0.20 s floor**. The best tree
-(warm, D=2, tau 0.5, 4.41 rows, 2.034 tokens) therefore prices at 0.61 s/round = 3.33 tok/s against the
-engine's measured 3.77 tok/s at k=2 and 3.73 at k=3 - a 11-12% decode loss. The model does not credit the
-tree for its shorter draft (3 columns against 8), which is a few percent the other way and does not move
-the sign.
+Rows are *not* the cost unit, and the unit was re-measured (2026-11-15, see the next entry): 0.358 / 0.522 /
+0.582 / 0.702 / 0.739 / 0.894 / 0.922 s for 2..8 rows is a *chain* ladder - the same lane, one more
+column each time. Reading it as "0.093 s per verified row" was wrong: a column costs ~0.09 s while a
+sibling row costs ~0. The best tree (warm, D=2, tau 0.5, 4.41 rows, 2.034 tokens) therefore does not
+price at 0.61 s/round; the -11% verdict built on that model is withdrawn below.
+
+**What a verify row actually costs: columns, not rows (measured).** `NINFER_DFLASH_PHASE_TIMER=<path>`
+records the round's proposal / verify / accept intervals as CUDA events and, once per shape, the state
+image slot and KV table row each lane's rectangle runs on. Off by default, eager only (an event record
+inside a captured round is illegal). Two facts come out of it.
+
+*State is per lane, not per column.* Every column of a rectangle runs on its lane's single
+`state_source` / `state_destination` pair - the loop prints `lane=0/1 state_source=0 state_dest=0
+text_kv_row=0` and `lane=1/2 state_source=1 state_dest=1 text_kv_row=1` - and the columns chain
+*inside* `gated_delta_net_batch`'s inner loop over `valid` columns. `gated_delta_net_batch` takes one
+slot per row of its B dimension, but in this pass B is the *lane* count (W is the rectangle width), so a
+tree's P siblings still need the fork plumbing: a state fork per path and a KV prefix fork
+(`KVPrefixForkReservation`, `HostToFork`), as this register already says.
+
+*Cost follows the width.* v5_e2, greedy, `--no-cuda-graph -pg 64,64`, warmup 1, one rep; verify ms is
+the 10th percentile of the per-round events (the median sits 1.5-3x higher because a round that misses
+the expert pool stalls):
+
+| shape | width | lanes | rows | verify p10 (ms) | round (s) | tok/s at len 2.03 |
+|---|---:|---:|---:|---:|---:|---:|
+| chain k=1 | 2 | 1 | 2 | 209 | 0.411 | 4.94 |
+| chain k=2 | 3 | 1 | 3 | 222 | 0.595 | 3.41 |
+| chain k=3 | 4 | 1 | 4 | 309 | 0.779 | 2.61 |
+| chain k=5 | 6 | 1 | 6 | 341 | 0.780 | 2.60 |
+| chain k=7 | 8 | 1 | 8 | 383 | 0.999 | 2.03 |
+| siblings P=2 | 2 | 2 | 4 | 152 | 0.273 | 7.44 |
+| siblings P=3 | 2 | 3 | 6 | 133 | 0.224 | 9.05 |
+| siblings P=4 | 2 | 4 | 8 | 166 | 0.260 | 7.82 |
+| siblings P=4, warm | 2 | 4 | 8 | 97 | 0.121 | 16.7 |
+
+At equal rows the two families differ by 3-4x: 8 rows cost 0.999 s as eight chained columns and 0.121-0.260 s
+as four lanes of two. Adding a lane is free to within noise (4 -> 6 -> 8 rows at width 2: 0.273 / 0.224 /
+0.260 s), while adding a column costs ~0.09 s at one lane and ~0.25 s at two (width 2 vs 3, 2 lanes: 0.273
+vs 0.515 s). Reading the ladder that way, a chain column buys its 0.09 s from *block-wide* work - the
+rectangle's own attention over W columns, the W-deep recurrence, and the W-row KV suffix - not from
+carrying another token. The measurement cannot apportion those three, and it does not need to: the shape a
+tree needs is the wide-shallow one, and that shape is the cheap one.
+
+So the parallel premise holds inside the envelope measured here: P siblings at one depth cost about one
+width-2 pass, not P x 0.093 s. The tree verdict below is rewritten on this basis. Two limits bound it: the
+engine admits at most four concurrent requests on this artifact (`--concurrency 5` dies with "inference
+request expired while waiting for admission", with and without the probe, so P > 4 is neither measurable
+here nor runnable), and a five-lane attempt sometimes aborts in `qsa/prepare_launch.cu:333` with
+`cudaErrorLaunchOutOfResources`, so the path count has to stay at four until that kernel admits more rows.
 
 Reach across the three backends, from the sources rather than from a build:
 
@@ -732,12 +774,14 @@ Reach across the three backends, from the sources rather than from a build:
   (target_verification.cpp:27-43). DFlash2 and MTP take the sparse kernel; v1 takes the greedy one.
 - **Forward verify is the wall, not the accept.** The rectangle is not a passive attention block: the
   forty-eight linear-attention layers (of sixty-four) run a per-row recurrence that is sequential in
-  columns (`gated_delta_net_batch`, text.cpp:2361-2380) over one state slot per row. A tree node needs
-  its own post-parent state, i.e. a KV prefix fork (`KVPrefixForkReservation`, kv_address_space.h:76-123)
-  and a state fork (`HostToFork`, state_store.h:53) wired through the speculative round plus a winner
-  commit - the engine has both mechanisms, the spec path uses neither, and the sequence footprint is
-  174.9 MiB, so a five-row verify holds ~875 MiB. That is affordable; the plumbing is the work, and it
-  buys a shape that is break-even at equal rows.
+  columns (`gated_delta_net_batch`, text.cpp:2361-2380) over one state slot per lane, shared by every
+  column of that lane. A tree node needs its own post-parent state, i.e. a KV prefix fork
+  (`KVPrefixForkReservation`, kv_address_space.h:76-123) and a state fork (`HostToFork`, state_store.h:53)
+  wired through the speculative round plus a winner commit - the engine has both mechanisms, the spec path
+  uses neither, and the sequence footprint is 174.9 MiB, so a five-row verify holds ~875 MiB. That is
+  affordable, and after the width-not-rows measurement above the shape is no longer break-even: a
+  depth-2 tree is a width-2 pass, which the timer prices at 0.121-0.260 s against 0.595 s for the k=2
+  chain at the same row count.
 - **MTP specifically.** Even with candidates free, its column-0 acceptance is 88.2% (35B, k=1,
   pp64+tg64; k=2 0.76, k=3 0.5417, k=4 0.4659), so at most 11.8% of rounds leave anything for a
   column-0 branch to rescue, and an AR drafter pays one extra draft forward per node (mtp.cpp:294-321)
@@ -747,12 +791,32 @@ Reach across the three backends, from the sources rather than from a build:
   specializes 34816/5120 and 15360/2560 only (src/ops/linear_swiglu/q8/q8_dflash2_linear_swiglu.cu:61-73).
   There is no v1 baseline to A/B until that instance exists.
 
-Consequence for a per-round controller: the (tau, D) decision it was meant to make has nothing to gate -
-at equal rows every tree is within +-2% of the chain, and past the budget 25-45% down. What the same
-numbers do support is a dynamic *draft depth*: on the warm dump the chain's marginal falls from +0.293
-to +0.017 tokens per row between D=1 and D=7 while the row cost stays 0.093 s, so the exchange rate
-between draft depth and link/pool pressure is where a controller has room. The tree stays unbuilt, and
-`NINFER_SPEC_TREE` has no implementation behind it.
+Consequence for a per-round controller: the (tau, D) decision has nothing to gate *if* rows are the cost
+unit - at equal rows every tree is within +-2% of the chain and past the budget 25-45% down. That premise
+is what the width-not-rows measurement removed: a depth-2 tree is a width-2 rectangle, and a width-2
+rectangle with four lanes measures 0.121-0.260 s where the k=2 chain (width 3, one lane) measures 0.595 s,
+so the tree's rows are close to free as long as they stay siblings. The tree is therefore *re-opened*,
+not built: with `tau=0.10 / D=2` (4.71 nodes, len ~2.03 from the simulated 0.5161 acceptance) it prices at
+~0.26 s/round = ~7.8 tok/s against 2.93 tok/s measured at k=2, and what stands between the two is the
+fork plumbing plus the accept side for P paths ({2,3,4} paths measured; 5 is blocked by the four-request
+admission limit above). `NINFER_SPEC_TREE` still has no implementation behind it.
+
+If it is built, the landing point the measurement points at is *one lane per path*, not a widened
+rectangle: `tau=0.10 / D=2` keeps ~3 children at depth 1 and ~1-2 at depth 2, so the tree is three
+width-1 paths plus two width-2 paths, i.e. a `width = D = 2` rectangle with `batch = paths <= 4`, each
+lane's `valid_columns` its own path length. That shape needs four things wired, in this order:
+
+1. `KVPrefixForkReservation` per path: every lane's text KV row aliases the anchor's pages and owns only
+   its suffix page, so the fork costs one row per path rather than a page copy (`kv_address_space.h:76`).
+2. Per-lane `state_source_slots` all pointing at the anchor's image and `state_destination_slots` at one
+   spare image per path - already expressible: `gated_delta_net_batch` documents equal sources with
+   distinct destinations (`include/ninfer/ops/gated_delta_net.h:102-107`), and the frame's selectors are
+   per lane (`decode.cpp:878-880`). `HostToFork` (`state_store.h:53`) is the spare-image allocator.
+3. The verifier's per-column argmax compared along each path instead of along the chain
+   (`speculative_round.cuh:153-154` walks `lane < extent`), plus a winner pick that commits the winning
+   path's state image and drops the others.
+4. The draft side needs no change: the selector already yields sixteen candidates per column, and one
+   block pass covers every depth the tree uses.
 
 **Layer-major + double-buffered prefill (last resort, measured).** `ExpertStream::ensure` still
 publishes and waits inside the layer, one staging ring of 32 slots, so the PCIe traffic a prefill
