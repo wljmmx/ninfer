@@ -564,6 +564,32 @@ selector adds it to the edge dot product unchanged (`candidate_selector_path.cu:
 reference's `df2_topk` hands the walk its top-16 **logits** the same way (`kernels/dflash2.hpp:93-102`,
 used at `src/core/dflash2.cpp:532`). No change was needed there.
 
+**What the edge term actually corrects (measured), and the BF16-draft question.** Column 0 splits the
+selector's contribution exactly: the head's own top-16 argmax equals the target's argmax in 14 of 31
+rounds (45.2%), the selector's pick does in 16 (51.6%), and on the 17 rounds the head was wrong the
+correct token was still among the sixteen in 15 of them - of which the edge term fixed 2, i.e. 13.3%
+of the fixable mistakes (58-round repeat: 3 of 23, 13.0%). So the +6.4 points are a real but weak
+correction, not just stability, and the remaining ~42 points sit in the head's own ranking.
+
+That bounds what a BF16 draft head could buy, and the cost of finding out is asymmetric. The recipe
+pins every `dflash2/*` projection to Q8 except the ones it leaves alone (`kernel_projection`,
+`candidate_selector/hidden_projection`, `tools/convert/official_recipes.py:35-50`), so a BF16 draft
+needs a BF16 route for five op families:
+
+| op | current | BF16 route needed | reuse |
+|---|---|---|---|
+| `linear_topk` (head) | Q8_G32_FP16 or FP8 only (`include/ninfer/ops/linear_topk.h:28-29`) | new profile over BF16 weights | `ops::linear` has registered contiguous BF16 problems (`linear.h:72-74`); `logits_topk_softmax` gives top-k but softmaxed |
+| `linear_swiglu` (mlp gate/up) | Q8/FP8/NVFP4 profiles (`linear_swiglu.h:50-53`) | new profile | `linear_pair` + `silu_mul` compose it |
+| `attn_input_proj` (q/k/v) | BF16 profile exists for the target shape `[14336,5120]` only (`attn_input_proj.h:62-65`) | register the draft geometry (N=5120, no gate) | three `ops::linear` calls |
+| `dynamic_grouped_conv_add` (o_proj/down/fc finish) | projection is Q8_G32_FP16 RowSplit (`dynamic_grouped_conv.h:95-96`) | new profile | the prepare side is already BF16 (`:44-46`) |
+| `ops::linear` (o_proj, down, fc) | BF16 registered | none | - |
+
+That is five op-level contracts, each carrying this repo's oracle, numerical criterion and profile
+registry - weeks, not hours. The cheap slice that actually tests the hypothesis is the *head alone*
+(`ops::linear` into a logits tensor plus a top-k): days. Given that column 0 is limited by the head's
+ranking against the target's argmax - a distribution disagreement, not a 1e-3 numerics gap - the
+recommendation is to do the head-only A/B if anything, and not to rebuild the whole draft in BF16.
+
 **Layer-major + double-buffered prefill (last resort, measured).** `ExpertStream::ensure` still
 publishes and waits inside the layer, one staging ring of 32 slots, so the PCIe traffic a prefill
 needs is serial with the SMs. The sizing is measured: a 512-token prefill touches up to the layer's
