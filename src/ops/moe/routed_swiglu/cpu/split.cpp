@@ -832,16 +832,23 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext* worker,
     // fine-grained int8 plane is not shipped. Both arms stay behind switches for further work.
     const bool down_int16 = w.down_bits == 6 && w.q6_path;
     if (down_int16) {
+        const int act_groups = w.intermediate / 64;
         if (worker != nullptr) {
             quantise_floats_i16(activation, w.tokens, w.intermediate, q8_act, *worker);
             worker->barrier();
         } else {
-            // One thread owns the whole expert, so it also owns the whole quantisation: leaving this
-            // on a worker.range would have every thread quantise a slice of a plane only one of them
-            // is computing.
-            quantise_floats_i16_all(activation, w.tokens, w.intermediate, q8_act);
+            // One thread owns the whole expert, so it also owns that expert's quantisation. Only the
+            // tokens this expert actually serves are quantised: the plane is per token, and a task
+            // that serves one token was previously quantising all eight of them - ten tasks over eight
+            // tokens is eight times the work anyone consumes. quantise_floats_i16_groups takes a range
+            // of (token, group) pairs, so a task's own tokens are one contiguous run each.
+            for (std::size_t m = 0; m < count; ++m) {
+                const auto token = static_cast<std::size_t>(members[m].token);
+                quantise_floats_i16_groups(activation, w.intermediate, q8_act,
+                                           token * static_cast<std::size_t>(act_groups),
+                                           (token + 1) * static_cast<std::size_t>(act_groups));
+            }
         }
-        const int act_groups = w.intermediate / 64;
         for (std::size_t m = 0; m < count; ++m) {
             const auto token = static_cast<std::size_t>(members[m].token);
             s.q16_cont[m] = q8_act.cont16.data() + token * w.intermediate;
