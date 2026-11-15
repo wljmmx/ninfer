@@ -1135,11 +1135,21 @@ void run(void* arguments, const CpuWorkerContext& worker) noexcept {
         const double wall = std::chrono::duration<double, std::micro>(phase_end - phase_begin).count();
         const double merge = totals.calls > 0 ? totals.reduce_us / static_cast<double>(totals.calls)
                                              : 0.0;
+        // How much the merge actually has to re-associate: a token holding one slot is the same
+        // summation the row split makes, so only tokens holding two or more can move a bit.
+        std::size_t overlapped = 0, widest = 0;
+        for (std::size_t at = 0; at + 1 < work.token_begin.size(); ++at) {
+            const auto held = static_cast<std::size_t>(work.token_begin[at + 1] - work.token_begin[at]);
+            if (held > 1) { ++overlapped; }
+            widest = std::max(widest, held);
+        }
         std::fprintf(stderr,
                      "[cpu-phase-split] experts=%llu tokens=%d | per expert: gate_up=%.1f "
-                     "down=%.1f us | merge=%.1f us/call | wall=%.1f us (%.0f%% accounted)\n",
+                     "down=%.1f us | merge=%.1f us/call | overlap=%zu/%zu widest=%zu | wall=%.1f us "
+                     "(%.0f%% accounted)\n",
                      static_cast<unsigned long long>(totals.experts), work.tokens,
-                     totals.gate_up_us / experts, totals.down_us / experts, merge, wall,
+                     totals.gate_up_us / experts, totals.down_us / experts, merge, overlapped,
+                     work.token_begin.empty() ? 0 : work.token_begin.size() - 1, widest, wall,
                      wall > 0.0 ? 100.0 * (totals.gate_up_us + totals.down_us) / wall : 0.0);
         std::fflush(stderr);
     }
