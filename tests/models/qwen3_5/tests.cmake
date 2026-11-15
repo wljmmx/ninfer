@@ -320,6 +320,13 @@ ninfer_add_test(ninfer_qwen3_5_tool_constraints_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_tool_constraints.cpp"
   LIBRARIES ninfer_model_runtime ninfer_grammar ninfer::json)
 
+# The tree's shape, host-only: which column continues from which, which columns a column may read,
+# and where the accumulated-probability floor cuts the product. A wrong mask does not crash - it
+# verifies a sequence that was never generated - so the relation is pinned before any kernel reads it.
+ninfer_add_test(ninfer_qwen3_5_speculative_tree_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_speculative_tree.cpp"
+  LIBRARIES ninfer_core)
+
 add_test(NAME ninfer_qwen3_5_tool_schema_oracle_test
   COMMAND ${CMAKE_COMMAND} -E env
     "NINFER_TOOL_PROBE=$<TARGET_FILE:ninfer_qwen3_5_tool_constraints_test>"
