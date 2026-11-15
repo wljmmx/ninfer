@@ -280,11 +280,10 @@ inline void quantise_floats(const float* x, std::int32_t tokens, std::int32_t wi
 // Sixteen-bit twin of the quantisation above: same grouping, same peak rule, 32767 levels instead of
 // 127. Used only by the down pass, where the coarser plane cost +2.78% perplexity. No sum is kept -
 // a signed sixteen-bit plane needs no bias term, unlike the four-bit nibble.
-inline void quantise_floats_i16(const float* x, std::int32_t tokens, std::int32_t width,
-                                Q8Input& q8, const CpuWorkerContext& worker) {
+inline void quantise_floats_i16_groups(const float* x, std::int32_t width, Q8Input& q8,
+                                        std::size_t begin, std::size_t end) {
     const int groups = width / 64;
-    const auto range = worker.range(static_cast<std::size_t>(tokens) * groups);
-    for (auto g = range.begin; g < range.end; ++g) {
+    for (auto g = begin; g < end; ++g) {
         const auto token   = static_cast<std::int32_t>(g / static_cast<std::size_t>(groups));
         const auto group   = static_cast<std::int32_t>(g % static_cast<std::size_t>(groups));
         const auto* source = x + static_cast<std::size_t>(token) * width + group * 64;
@@ -299,6 +298,15 @@ inline void quantise_floats_i16(const float* x, std::int32_t tokens, std::int32_
                 std::clamp(static_cast<int>(std::lrint(source[i] * inverse)), -32767, 32767));
         }
     }
+}
+
+// The same body over the team's slice of the plane: every worker quantises its own share inside one
+// collective, which is how the row-split path pays it in parallel with the row split itself.
+inline void quantise_floats_i16(const float* x, std::int32_t tokens, std::int32_t width,
+                                Q8Input& q8, const CpuWorkerContext& worker) {
+    const int groups = width / 64;
+    const auto range = worker.range(static_cast<std::size_t>(tokens) * groups);
+    quantise_floats_i16_groups(x, width, q8, range.begin, range.end);
 }
 
 // The q4 nibble dot: 32 codes per instruction pair against an int8 activation plane, instead of eight
@@ -604,14 +612,19 @@ inline void row_all_tokens_q6_q8(const Row& row, std::int32_t k, const std::int8
 }
 
 struct Work {
-    const std::uint16_t* x = nullptr;
-    float* output          = nullptr;
-    float* activation      = nullptr;
+    // One entry per lane. lanes == 1 is the shape this form has always had: the tables then hold a
+    // single element, and every read below names the same address in the same order as the scalar
+    // fields they replaced, so the single-lane path stays bit-identical.
+    const std::uint16_t* const* x = nullptr; // [lane] -> [token][hidden]
+    float* const* output          = nullptr; // [lane] -> [token][hidden]
+    float* const* activation      = nullptr; // [lane] -> [token][intermediate]
+    std::int32_t lanes          = 1;
     std::int32_t tokens = 0, hidden = 0, intermediate = 0;
     int gate_bits = 4, down_bits = 6;
     Matrix gate, up, down;
     std::vector<std::int32_t> experts;
-    std::vector<std::vector<Member>> members;
+    // [lane][expert]. Each lane carries its own route table: two lanes never share a member list.
+    std::vector<std::vector<std::vector<Member>>> members;
     // NINFER_MOE_CPU_INT8: the same switch the fused form reads, now honoured here. Off keeps the bf16
     // decode this form has always used; on routes the four-bit gate/up through the q4 nibble dot and
     // the six-bit down through the q6 one.
@@ -622,8 +635,8 @@ struct Work {
     // switch so the finding is reproducible, not deleted so the vectorised version has somewhere to
     // land.
     bool q6_path = false;
-    Q8Input q8;     // gate/up: the bf16 input, quantised once per collective
-    Q8Input q8_act; // down: the SwiGLU activation, quantised once per expert
+    std::vector<Q8Input> q8;     // [lane] gate/up: the bf16 input, quantised once per collective
+    std::vector<Q8Input> q8_act; // [lane] down: the SwiGLU activation, quantised once per expert
 };
 
 // Per-worker buffers, allocated once per collective: the rows of one expert are split across the
@@ -706,20 +719,26 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext& worker, std::size_t
     // The member table is indexed by expert id, not by the position in `experts`: the two part
     // company whenever the subset skips an expert, and reading the position applies the previous
     // expert's routes (and their coefficients) to this one's weights.
-    const auto& members = w.members[expert];
+    // lanes == 1 on this path, so each table holds one element and these are the same addresses the
+    // scalar fields named before the lane dimension existed.
+    const auto* lane_x      = w.x[0];
+    float* const lane_out   = w.output[0];
+    float* const activation = w.activation[0];
+    auto& q8_in             = w.q8[0];
+    auto& q8_act            = w.q8_act[0];
+    const auto& members = w.members[0][expert];
     if (members.empty()) { return; }
     const auto count = members.size();
     const int groups = w.hidden / 64;
     for (std::size_t m = 0; m < count; ++m) {
-        s.inputs[m] = w.x + static_cast<std::size_t>(members[m].token) * w.hidden;
-        s.activations[m] =
-            w.activation + static_cast<std::size_t>(members[m].token) * w.intermediate;
+        s.inputs[m] = lane_x + static_cast<std::size_t>(members[m].token) * w.hidden;
+        s.activations[m] = activation + static_cast<std::size_t>(members[m].token) * w.intermediate;
         if (w.int8_path) {
             const auto token = static_cast<std::size_t>(members[m].token);
-            s.q8_even[m]  = w.q8.even.data() + token * w.hidden;
-            s.q8_odd[m]   = w.q8.odd.data() + token * w.hidden;
-            s.q8_sum[m]   = w.q8.sum.data() + token * groups;
-            s.q8_scale[m] = w.q8.scale.data() + token * groups;
+            s.q8_even[m]  = q8_in.even.data() + token * w.hidden;
+            s.q8_odd[m]   = q8_in.odd.data() + token * w.hidden;
+            s.q8_sum[m]   = q8_in.sum.data() + token * groups;
+            s.q8_scale[m] = q8_in.scale.data() + token * groups;
         }
     }
     const auto gate_base = w.gate.expert(expert);
@@ -742,7 +761,7 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext& worker, std::size_t
             row_all_tokens<6>(up_row, w.hidden, s.inputs.data(), count, s.up.data());
         }
         for (std::size_t m = 0; m < count; ++m) {
-            w.activation[static_cast<std::size_t>(members[m].token) * w.intermediate + row] =
+            activation[static_cast<std::size_t>(members[m].token) * w.intermediate + row] =
                 common::silu_stable(s.gate[m]) * s.up[m];
         }
     }
@@ -756,13 +775,13 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext& worker, std::size_t
     // fine-grained int8 plane is not shipped. Both arms stay behind switches for further work.
     const bool down_int16 = w.down_bits == 6 && w.q6_path;
     if (down_int16) {
-        quantise_floats_i16(w.activation, w.tokens, w.intermediate, w.q8_act, worker);
+        quantise_floats_i16(activation, w.tokens, w.intermediate, q8_act, worker);
         worker.barrier();
         const int act_groups = w.intermediate / 64;
         for (std::size_t m = 0; m < count; ++m) {
             const auto token = static_cast<std::size_t>(members[m].token);
-            s.q16_cont[m] = w.q8_act.cont16.data() + token * w.intermediate;
-            s.q6_scale[m] = w.q8_act.scale.data() + token * act_groups;
+            s.q16_cont[m] = q8_act.cont16.data() + token * w.intermediate;
+            s.q6_scale[m] = q8_act.scale.data() + token * act_groups;
         }
     }
     const auto phase_gate_end = split_phase_mark(phase_probe);
@@ -817,7 +836,7 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext& worker, std::size_t
             row_all_tokens<4>(down_row, w.intermediate, s.activations.data(), count, s.down.data());
         }
         for (std::size_t m = 0; m < count; ++m) {
-            w.output[static_cast<std::size_t>(members[m].token) * w.hidden + row] +=
+            lane_out[static_cast<std::size_t>(members[m].token) * w.hidden + row] +=
                 members[m].coefficient * s.down[m];
         }
     }
@@ -856,25 +875,32 @@ void run(void* arguments, const CpuWorkerContext& worker) noexcept {
         scratch.down_odd.resize(room);
         scratch.down_sum.resize(room);
         scratch.down_scale.resize(room);
-        // One lane reserves the plane; an assign() in every lane would have each zero it under the
+        // One lane reserves the planes; an assign() in every lane would have each zero it under the
         // others' writes.
         if (worker.rank() == 0) {
             const int groups     = work.hidden / 64;
             const int act_groups = work.intermediate / 32;
-            work.q8.even.assign(static_cast<std::size_t>(work.tokens) * work.hidden, 0);
-            work.q8.odd.assign(static_cast<std::size_t>(work.tokens) * work.hidden, 0);
-            work.q8.cont.assign(static_cast<std::size_t>(work.tokens) * work.hidden, 0);
-            work.q8.scale.assign(static_cast<std::size_t>(work.tokens) * groups, 0.0F);
-            work.q8.sum.assign(static_cast<std::size_t>(work.tokens) * groups, 0);
-            work.q8_act.cont.assign(static_cast<std::size_t>(work.tokens) * work.intermediate, 0);
-            work.q8_act.cont16.assign(static_cast<std::size_t>(work.tokens) * work.intermediate, 0);
-            work.q8_act.even.assign(static_cast<std::size_t>(work.tokens) * work.intermediate, 0);
-            work.q8_act.odd.assign(static_cast<std::size_t>(work.tokens) * work.intermediate, 0);
-            work.q8_act.scale.assign(static_cast<std::size_t>(work.tokens) * act_groups, 0.0F);
-            work.q8_act.sum.assign(static_cast<std::size_t>(work.tokens) * act_groups, 0);
+            for (auto& plane : work.q8) {
+                plane.even.assign(static_cast<std::size_t>(work.tokens) * work.hidden, 0);
+                plane.odd.assign(static_cast<std::size_t>(work.tokens) * work.hidden, 0);
+                plane.cont.assign(static_cast<std::size_t>(work.tokens) * work.hidden, 0);
+                plane.scale.assign(static_cast<std::size_t>(work.tokens) * groups, 0.0F);
+                plane.sum.assign(static_cast<std::size_t>(work.tokens) * groups, 0);
+            }
+            for (auto& plane : work.q8_act) {
+                plane.cont.assign(static_cast<std::size_t>(work.tokens) * work.intermediate, 0);
+                plane.cont16.assign(static_cast<std::size_t>(work.tokens) * work.intermediate, 0);
+                plane.even.assign(static_cast<std::size_t>(work.tokens) * work.intermediate, 0);
+                plane.odd.assign(static_cast<std::size_t>(work.tokens) * work.intermediate, 0);
+                plane.scale.assign(static_cast<std::size_t>(work.tokens) * act_groups, 0.0F);
+                plane.sum.assign(static_cast<std::size_t>(work.tokens) * act_groups, 0);
+            }
         }
         worker.barrier();
-        quantise_inputs(work.x, work.tokens, work.hidden, work.q8, worker);
+        for (std::int32_t lane = 0; lane < work.lanes; ++lane) {
+            quantise_inputs(work.x[lane], work.tokens, work.hidden,
+                            work.q8[static_cast<std::size_t>(lane)], worker);
+        }
         worker.barrier();
     }
     const bool phase_probe = split_phase_probe();
@@ -943,9 +969,15 @@ void split_launch(const Tensor& x, const CpuSwiGLUExperts& experts, const Expert
     }
 
     Work work;
-    work.x            = static_cast<const std::uint16_t*>(x.data);
-    work.output       = static_cast<float*>(destination.data);
-    work.activation   = static_cast<float*>(scratch.storage().data);
+    // One lane, one entry per table: the shape this call has always had. The tables are local to this
+    // frame and the collective below blocks, so their lifetime is the call's.
+    const std::uint16_t* lane_x[1] = {static_cast<const std::uint16_t*>(x.data)};
+    float* lane_out[1]             = {static_cast<float*>(destination.data)};
+    float* lane_activation[1]      = {static_cast<float*>(scratch.storage().data)};
+    work.x                         = lane_x;
+    work.output                    = lane_out;
+    work.activation                = lane_activation;
+    work.lanes                     = 1;
     work.tokens       = tokens;
     work.hidden       = hidden;
     work.intermediate = intermediate;
@@ -966,7 +998,9 @@ void split_launch(const Tensor& x, const CpuSwiGLUExperts& experts, const Expert
         const char* q6 = std::getenv("NINFER_SPLIT_Q6");
         work.q6_path   = q6 == nullptr || std::strcmp(q6, "0") != 0;
     }
-    work.members.resize(static_cast<std::size_t>(experts_count));
+    work.members.assign(1, std::vector<std::vector<Member>>(static_cast<std::size_t>(experts_count)));
+    work.q8.resize(1);
+    work.q8_act.resize(1);
     for (std::int32_t expert = 0; expert < experts_count; ++expert) {
         if (selected[static_cast<std::size_t>(expert)] != 0) { work.experts.push_back(expert); }
     }
@@ -978,7 +1012,7 @@ void split_launch(const Tensor& x, const CpuSwiGLUExperts& experts, const Expert
         for (std::int32_t j = 0; j < top_k; ++j) {
             const auto expert = ids[static_cast<std::size_t>(t) * top_k + j];
             if (selected[static_cast<std::size_t>(expert)] == 0) { continue; }
-            work.members[static_cast<std::size_t>(expert)].push_back(
+            work.members[0][static_cast<std::size_t>(expert)].push_back(
                 Member{t, coefficients[static_cast<std::size_t>(t) * top_k + j]});
         }
     }
