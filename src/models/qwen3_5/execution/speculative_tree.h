@@ -24,6 +24,21 @@ namespace ninfer::models::qwen3_5::execution {
 
 // One node per verify column. Column 0 is the anchor: the token the previous round emitted, which
 // every path continues from. It has no parent and its probability is 1 by definition.
+//
+// READ THIS BEFORE WIRING A TREE INTO THE VERIFY PASS. The reduce-from-chain shape below is not the
+// whole prerequisite. Two verify columns at the same depth are ALTERNATIVE tokens for the SAME
+// position, and this engine's KV append is position-indexed:
+//
+//     ops/kv_cache/append/kernel.cuh:88   const int position = positions[0] + token;
+//     ops/kv_cache/append/kernel.cuh:91   paged_kv_physical_page(block_table, position)
+//
+// so a chain (positions base, base+1, ...) lands one column per slot, and a tree would have every
+// sibling write the same slot - the last column wins and the earlier sibling's K/V is simply gone.
+// Attention would then read a cache that never held two of the sequences it is verifying, and the
+// mask would be deciding visibility over keys that no longer exist. So depth_positions() is
+// necessary and not sufficient: the round needs column-addressed K/V (a per-row window for the
+// round's T columns, committed at acceptance to the positions the path actually claims) before any
+// of this reaches a kernel. Until then the chain is the only shape this cache can verify.
 struct SpeculativeTree {
     // parent[c] = the column c continues from, or -1 for the anchor.
     std::vector<std::int32_t> parent;
