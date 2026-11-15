@@ -23,8 +23,9 @@ constexpr std::int32_t kLastSmallT  = 40;
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
 // The draft head is gate_up = 2 x out at the draft width: 34816 = 2 x 17408 at k 5120 for the 35B
-// draft, 15360 = 2 x 7680 at k 2560 for the Qwen3.8-Flash-Next draft. Both the paired-row policy
-// and the static-K specialization follow the two numbers, so they are template parameters.
+// draft, 15360 = 2 x 7680 at k 2560 for the Qwen3.8-Flash-Next draft, and 12288 = 2 x 6144 at k 2048
+// for the 35B A3B draft. Both the paired-row policy and the static-K specialization follow the
+// numbers, so they are template parameters.
 template <int GateUpRows, int InputRows, int Capacity>
 void launch_tile(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     using Geometry      = Q8LinearGeometry<GateUpRows, InputRows>;
@@ -52,6 +53,10 @@ constexpr auto make_launchers(std::index_sequence<Offsets...>) {
 
 constexpr auto kWideLaunchers  = make_launchers<34816, 5120>(std::make_index_sequence<kLastSmallT / 8>{});
 constexpr auto kDraftLaunchers = make_launchers<15360, 2560>(std::make_index_sequence<kLastSmallT / 8>{});
+// The 35B A3B draft. Its k is 2048, so the 256-wide K tile divides it exactly (and the 512-wide one
+// the twenty-four token shape uses does too); without this family the DFlash v1 head aborted on its
+// first token with "no instance", which is the whole reason it could not run on this build.
+constexpr auto kA3bLaunchers = make_launchers<12288, 2048>(std::make_index_sequence<kLastSmallT / 8>{});
 
 } // namespace
 
@@ -67,6 +72,10 @@ void q8_dflash2_linear_swiglu_small_t_launch(const Tensor& x, const Weight& weig
     }
     if (weight.n == 15360 && x.ne[0] == 2560) {
         kDraftLaunchers[index](x, weight, out, stream);
+        return;
+    }
+    if (weight.n == 12288 && x.ne[0] == 2048) {
+        kA3bLaunchers[index](x, weight, out, stream);
         return;
     }
     throw std::invalid_argument(
