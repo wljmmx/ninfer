@@ -182,6 +182,11 @@ struct Q8Input {
     // magnitudes indexed by weight, where the four-bit path deliberately interleaves even and odd so
     // each nibble half meets its own half of the row without a shuffle.
     std::vector<std::int8_t> cont; // [token][width]
+    // The sixteen-bit plane, for the down pass only. madd_epi16 takes sixteen values per instruction
+    // where maddubs takes thirty-two, so this costs throughput - but a six-bit weight carries 64 codes
+    // and an int8 activation only 127 levels, and on this projection that showed up as +2.78% perplexity
+    // against the same-config bf16 reference. Sixteen bits buys that back at half the instruction count.
+    std::vector<std::int16_t> cont16; // [token][width]
 };
 
 // The activation plane is BF16, whose bits are the top half of an FP32 word - not the 5/10 split that
@@ -257,6 +262,30 @@ inline void quantise_floats(const float* x, std::int32_t tokens, std::int32_t wi
             sum += value;
         }
         q8.sum[static_cast<std::size_t>(token) * groups + group] = sum;
+    }
+}
+
+// Sixteen-bit twin of the quantisation above: same grouping, same peak rule, 32767 levels instead of
+// 127. Used only by the down pass, where the coarser plane cost +2.78% perplexity. No sum is kept -
+// a signed sixteen-bit plane needs no bias term, unlike the four-bit nibble.
+inline void quantise_floats_i16(const float* x, std::int32_t tokens, std::int32_t width,
+                                Q8Input& q8, const CpuWorkerContext& worker) {
+    const int groups = width / 64;
+    const auto range = worker.range(static_cast<std::size_t>(tokens) * groups);
+    for (auto g = range.begin; g < range.end; ++g) {
+        const auto token   = static_cast<std::int32_t>(g / static_cast<std::size_t>(groups));
+        const auto group   = static_cast<std::int32_t>(g % static_cast<std::size_t>(groups));
+        const auto* source = x + static_cast<std::size_t>(token) * width + group * 64;
+        float peak = 0.0F;
+        for (int i = 0; i < 64; ++i) { peak = std::max(peak, std::fabs(source[i])); }
+        const float scale   = peak > 0.0F ? peak / 32767.0F : 0.0F;
+        const float inverse = scale > 0.0F ? 1.0F / scale : 0.0F;
+        q8.scale[static_cast<std::size_t>(token) * groups + group] = scale;
+        auto* cont = q8.cont16.data() + static_cast<std::size_t>(token) * width + group * 64;
+        for (int i = 0; i < 64; ++i) {
+            cont[i] = static_cast<std::int16_t>(
+                std::clamp(static_cast<int>(std::lrint(source[i] * inverse)), -32767, 32767));
+        }
     }
 }
 
@@ -454,6 +483,75 @@ inline void row_dot_q6_q8(const Row& row, std::int32_t k, const std::int8_t* con
     for (int c = 0; c < Columns; ++c) { out[c] = ax::reduce_sum(total[c]); }
 }
 
+// The sixteen-bit down dot. A six-bit code decoded to a signed byte is already the exact weight, and
+// madd_epi16 multiplies signed by signed, so this needs neither the sign trick nor the bias term the
+// two byte paths carry - only twice the instructions per value, which is the trade the down pass
+// makes for its precision.
+template <int Columns>
+inline void row_dot_q6_q16(const Row& row, std::int32_t k, const std::int16_t* const* cont,
+                           const float* const* scale, float (&out)[Columns]) noexcept {
+    __m256 total[Columns];
+    for (int c = 0; c < Columns; ++c) { total[c] = _mm256_setzero_ps(); }
+    const auto groups = k / 64;
+    for (std::int32_t group = 0; group < groups; ++group) {
+        const auto* codes  = row.codes + group * 32;
+        const auto* high   = row.high + group * 16;
+        const auto weight  = _mm256_set1_ps(ax::fp16_to_f32(row.scales[group]));
+        __m256i acc[Columns];
+        for (int c = 0; c < Columns; ++c) { acc[c] = _mm256_setzero_si256(); }
+        // Sixty-four values as four sixteen-wide parts: part/2 picks the 32-code half, part%2 picks
+        // one 128-bit lane of it, and cvtepi8_epi16 widens that lane to sixteen signed shorts.
+        for (int part = 0; part < 4; ++part) {
+            const auto w8 = decode_q6_signed32(codes + (part / 2) * 16, high + (part / 2) * 8);
+            const auto lane = (part % 2) == 0 ? _mm256_castsi256_si128(w8)
+                                             : _mm256_extracti128_si256(w8, 1);
+            const auto w16  = _mm256_cvtepi8_epi16(lane);
+            for (int c = 0; c < Columns; ++c) {
+                const auto x16 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
+                    cont[c] + group * 64 + part * 16));
+                acc[c] = _mm256_add_epi32(acc[c], _mm256_madd_epi16(w16, x16));
+            }
+        }
+        for (int c = 0; c < Columns; ++c) {
+            const auto scaled = _mm256_mul_ps(_mm256_cvtepi32_ps(acc[c]), weight);
+            total[c] =
+                _mm256_add_ps(_mm256_mul_ps(scaled, _mm256_set1_ps(scale[c][group])), total[c]);
+        }
+    }
+    for (int c = 0; c < Columns; ++c) { out[c] = ax::reduce_sum(total[c]); }
+}
+
+inline void row_all_tokens_q6_q16(const Row& row, std::int32_t k, const std::int16_t* const* cont,
+                                  const float* const* scale, std::size_t count,
+                                  float* out) noexcept {
+    std::size_t at = 0;
+    while (at < count) {
+        const auto left = count - at;
+        if (left >= 4) {
+            const std::int16_t* cs[4] = {cont[at], cont[at + 1], cont[at + 2], cont[at + 3]};
+            const float* sc[4] = {scale[at], scale[at + 1], scale[at + 2], scale[at + 3]};
+            float values[4];
+            row_dot_q6_q16<4>(row, k, cs, sc, values);
+            for (int c = 0; c < 4; ++c) { out[at + c] = values[c]; }
+            at += 4;
+        } else if (left >= 2) {
+            const std::int16_t* cs[2] = {cont[at], cont[at + 1]};
+            const float* sc[2] = {scale[at], scale[at + 1]};
+            float values[2];
+            row_dot_q6_q16<2>(row, k, cs, sc, values);
+            for (int c = 0; c < 2; ++c) { out[at + c] = values[c]; }
+            at += 2;
+        } else {
+            const std::int16_t* cs[1] = {cont[at]};
+            const float* sc[1] = {scale[at]};
+            float values[1];
+            row_dot_q6_q16<1>(row, k, cs, sc, values);
+            out[at] = values[0];
+            at += 1;
+        }
+    }
+}
+
 inline void row_all_tokens_q6_q8(const Row& row, std::int32_t k, const std::int8_t* const* cont,
                                  const float* const* scale, std::size_t count,
                                  float* out) noexcept {
@@ -519,6 +617,7 @@ struct Scratch {
     std::vector<const float*> q8_scale;
     std::vector<const std::int8_t*> q6_cont;
     std::vector<const float*> q6_scale;
+    std::vector<const std::int16_t*> q16_cont;
     std::vector<float> gate, up, down;
 };
 
@@ -626,12 +725,12 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext& worker, std::size_t
     // The down pass reads what gate/up just wrote, so its activation can only be quantised after the
     // barrier - and per expert, because each expert produces its own rows.
     if (w.down_bits == 6 && w.q6_path) {
-        quantise_floats(w.activation, w.tokens, w.intermediate, w.q8_act, worker);
+        quantise_floats_i16(w.activation, w.tokens, w.intermediate, w.q8_act, worker);
         worker.barrier();
         const int act_groups = w.intermediate / 64;
         for (std::size_t m = 0; m < count; ++m) {
             const auto token = static_cast<std::size_t>(members[m].token);
-            s.q6_cont[m]  = w.q8_act.cont.data() + token * w.intermediate;
+            s.q16_cont[m] = w.q8_act.cont16.data() + token * w.intermediate;
             s.q6_scale[m] = w.q8_act.scale.data() + token * act_groups;
         }
     }
@@ -644,8 +743,8 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext& worker, std::size_t
         const auto row      = static_cast<std::int32_t>(h);
         const auto down_row = row_at(down_base, row, w.intermediate, w.down_bits);
         if (w.down_bits == 6 && w.q6_path) {
-            row_all_tokens_q6_q8(down_row, w.intermediate, s.q6_cont.data(), s.q6_scale.data(),
-                                 count, s.down.data());
+            row_all_tokens_q6_q16(down_row, w.intermediate, s.q16_cont.data(), s.q6_scale.data(),
+                                  count, s.down.data());
             // NINFER_Q6_PROBE: the same row through the reference decoder, on the same activation, so
             // a disagreement can be read off directly instead of inferred from perplexity.
             static const bool probe = std::getenv("NINFER_Q6_PROBE") != nullptr;
@@ -726,6 +825,7 @@ void run(void* arguments, const CpuWorkerContext& worker) noexcept {
             work.q8.scale.assign(static_cast<std::size_t>(work.tokens) * groups, 0.0F);
             work.q8.sum.assign(static_cast<std::size_t>(work.tokens) * groups, 0);
             work.q8_act.cont.assign(static_cast<std::size_t>(work.tokens) * work.intermediate, 0);
+            work.q8_act.cont16.assign(static_cast<std::size_t>(work.tokens) * work.intermediate, 0);
             work.q8_act.scale.assign(static_cast<std::size_t>(work.tokens) * act_groups, 0.0F);
             work.q8_act.sum.assign(static_cast<std::size_t>(work.tokens) * act_groups, 0);
         }
