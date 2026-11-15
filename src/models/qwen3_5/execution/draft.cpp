@@ -1280,7 +1280,20 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                                                   argmax) != candidates.end()
                                                     ? 1
                                                     : 0;
-                        std::fprintf(file, ",%d,%d", selector_hit, topk_recall);
+                        // Where the draft's own top candidate lands in the target's FULL distribution,
+                        // and its logit distance from the target's argmax. Rank 2-3 means the two heads
+                        // are close and the argmax flips; a deep rank means the distributions disagree.
+                        int unary_rank   = 0;
+                        double logit_gap = 0.0;
+                        if (has_candidates) {
+                            const float unary_top = logits[static_cast<std::size_t>(candidates.front())];
+                            for (const float value : logits) { unary_rank += value > unary_top ? 1 : 0; }
+                            ++unary_rank;
+                            logit_gap = double(logits[static_cast<std::size_t>(argmax)]) -
+                                        double(unary_top);
+                        }
+                        std::fprintf(file, ",%d,%d,%d,%.6f", selector_hit, topk_recall, unary_rank,
+                                     logit_gap);
                         std::fputc('\n', file);
                     }
                     std::fflush(file);

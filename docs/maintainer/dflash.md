@@ -610,6 +610,24 @@ Payoff bound: recall at column 0 is already 93.5% at top-16, so a wider candidat
 expected column-0 gain is a few points, i.e. far below the 42-point ranking gap. Recommendation: leave
 the candidate count alone; the lever is the head's ranking, not the width.
 
+**Why column 0 stops at 45-52% (measured rank distribution).** The dump now also records where the
+draft's own top candidate lands in the target's FULL distribution and its logit distance from the
+target's argmax. Over 31 rounds at `--draft-tokens 7`, column 0 reads: rank 1 in 14 rounds (45.2%),
+rank 2 in 8 (25.8%), rank 3 in 2 (6.5%), rank 4-8 in 1 (3.2%), rank 9-16 in 0, rank >16 in 6 (19.4%).
+On the 17 wrong rounds the split is 8 at rank 2 (47.1%), 2 at rank 3, 1 at rank 4-8 and 6 beyond 16
+(35.3%), with a logit gap to the target's argmax of median 2.63 and p90 17.3 (0.50 / 4.38 over all
+rounds). So most failures are near-ties - the draft's top token is the target's runner-up, a couple of
+logits away - and the rest is deep disagreement. The two heads are not far apart in the large: the
+draft's sixteen candidates share 6.9 ids with the target's top sixteen on average, and no round had an
+empty intersection, which is why recall sits at 93.5%.
+
+Reading: the 45.2% is a *head ranking* limit, not a candidate or layer limit. The selector converts
+13% of the fixable mistakes (measured earlier), widening the candidate set can add at most 6.5 recall
+points, and the near-tie mass (59% of errors within rank 3) is a precision/calibration question between
+two heads - the draft's Q8 head and the target's Q5 head. What would settle how much is head versus
+layer is running the target head on the draft's own hidden row: `linear_topk` already registers Q5 with
+the full head (`src/ops/linear_topk/linear_topk.cpp:48`), so it is one extra launch per round behind an
+env switch, but this session measured only the rank distribution above.
 **Layer-major + double-buffered prefill (last resort, measured).** `ExpertStream::ensure` still
 publishes and waits inside the layer, one staging ring of 32 slots, so the PCIe traffic a prefill
 needs is serial with the SMs. The sizing is measured: a 512-token prefill touches up to the layer's
