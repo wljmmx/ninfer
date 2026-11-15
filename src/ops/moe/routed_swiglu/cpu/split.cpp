@@ -494,10 +494,19 @@ inline void row_dot_q6_q8(const Row& row, std::int32_t k, const std::int8_t* con
 template <int Columns>
 inline void row_dot_q6_q16(const Row& row, std::int32_t k, const std::int16_t* const* cont,
                            const float* const* scale, float (&out)[Columns]) noexcept {
-    __m256 total[Columns];
-    for (int c = 0; c < Columns; ++c) { total[c] = _mm256_setzero_ps(); }
+    // Four independent accumulators over the group loop, folded pairwise at the end. The chain being
+    // broken is the reduction across ten groups, not the decode - and int16 has half the work per
+    // group that int8 has (sixteen products a lane against thirty-two), so the reduction is a larger
+    // share of this pass than it was there. Four ways is the most that still fits sixteen YMM
+    // registers once Columns is taken into account, which is why the split narrows with Columns.
+    constexpr int kAccums = Columns <= 2 ? 4 : 2;
+    __m256 total[kAccums][Columns];
+    for (int a = 0; a < kAccums; ++a) {
+        for (int c = 0; c < Columns; ++c) { total[a][c] = _mm256_setzero_ps(); }
+    }
     const auto groups = k / 64;
     for (std::int32_t group = 0; group < groups; ++group) {
+        const int slot     = group % kAccums;
         const auto* codes  = row.codes + group * 32;
         const auto* high   = row.high + group * 16;
         const auto weight  = _mm256_set1_ps(ax::fp16_to_f32(row.scales[group]));
@@ -518,11 +527,18 @@ inline void row_dot_q6_q16(const Row& row, std::int32_t k, const std::int16_t* c
         }
         for (int c = 0; c < Columns; ++c) {
             const auto scaled = _mm256_mul_ps(_mm256_cvtepi32_ps(acc[c]), weight);
-            total[c] =
-                _mm256_add_ps(_mm256_mul_ps(scaled, _mm256_set1_ps(scale[c][group])), total[c]);
+            total[slot][c] =
+                _mm256_add_ps(_mm256_mul_ps(scaled, _mm256_set1_ps(scale[c][group])), total[slot][c]);
         }
     }
-    for (int c = 0; c < Columns; ++c) { out[c] = ax::reduce_sum(total[c]); }
+    for (int span = kAccums / 2; span > 0; span /= 2) {
+        for (int a = 0; a < span; ++a) {
+            for (int c = 0; c < Columns; ++c) {
+                total[a][c] = _mm256_add_ps(total[a][c], total[a + span][c]);
+            }
+        }
+    }
+    for (int c = 0; c < Columns; ++c) { out[c] = ax::reduce_sum(total[0][c]); }
 }
 
 inline void row_all_tokens_q6_q16(const Row& row, std::int32_t k, const std::int16_t* const* cont,
