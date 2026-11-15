@@ -91,13 +91,19 @@ void launch(const Invocation& args, const Plan& plan, MemoryArena& arena,
     // 96.0%/94.1% on 2026-11-07 8d07afe3) to int16. The 258x finer codes come with the
     // package: 1.46e-5 vs 3.58e-3 relative against the float reference, still opt-out-able.
     // unset or "16" -> int16; "0" -> float; anything else ("8", "1", ...) -> int8.
+    // "24" is 8|16: the int8 gate/up the split form ships together with the int16 down pass, so
+    // this form can be made to compute the split form's arithmetic exactly. It exists because the
+    // two halves of the CPU path have to agree on what a "CPU tier" is - the split form's default
+    // was unreachable here, which made a cross-form comparison measure the tier difference.
     const char* int8_switch = std::getenv("NINFER_MOE_CPU_INT8");
-    work.int16_path = int8_switch == nullptr || std::strcmp(int8_switch, "16") == 0;
-    work.int8_path  = !work.int16_path && std::strcmp(int8_switch, "0") != 0;
+    const bool split_pair   = int8_switch != nullptr && std::strcmp(int8_switch, "24") == 0;
+    work.int16_path = !split_pair &&
+                      (int8_switch == nullptr || std::strcmp(int8_switch, "16") == 0);
+    work.int8_path  = split_pair || (!work.int16_path && std::strcmp(int8_switch, "0") != 0);
     // port (sm_89): an explicit "16" also selects the int16 tier of the DOWN projection. The
     // gate/up tier's default is not shared with it on purpose - no earlier build had an integer
     // down pass, so an unset switch has to keep the float decode there byte for byte.
-    work.down16_path = int8_switch != nullptr && std::strcmp(int8_switch, "16") == 0;
+    work.down16_path = split_pair || (int8_switch != nullptr && std::strcmp(int8_switch, "16") == 0);
     // port (sm_89): mirror the device plane regime - grouped stores BF16 planes from
     // grouped_first tokens up (see work.h), token keeps FP32.
     work.plane_round = args.tokens >= grouped_first;

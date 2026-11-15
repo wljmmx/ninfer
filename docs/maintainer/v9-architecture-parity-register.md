@@ -110,7 +110,12 @@
   - `src/core/cpu/executor.h:39` `CpuExecutionView`、`:61` `keep_active()`、`CpuWorkerContext::barrier`（`:28`）、`task_pool.{h,cpp}`。
   - `src/ops/moe/routed_swiglu/cpu/{q4_q5,q4_q6,q8_q8}/shapes/h2048_i512_e256_k8/dispatch.cpp` 与上游**同路径**；本地另加 `nvfp4/shapes/h2560_i640_e512_k10`（qwen4-exp 几何）与 CUDA 侧同构 dispatch。
 - 差异：
-  1. 数值档：上游 q4/q5/q6（int4 权重）；本地 `moe/kernels/cpu/groupwise_int` 支持 int8/**int16 默认**（`launch.cpp:85` 读 `NINFER_MOE_CPU_INT8`：未设/16 → int16，`=8` → int8，`=0` → float），精度收益与性能见 v9 C04 记录。
+  1. 数值档：上游 q4/q5/q6（int4 权重）；本地两套 CPU 形式各有自己的整数档，`NINFER_MOE_CPU_INT8` 在两边是**同一套取值**：
+     - 取值：未设 / `16` / `8` / `24` / `0`。`24` 即 `8|16`（int8 gate/up + int16 down），2026-11-16 新增，让 fused 形式能跑出 split 形式原本唯一可达的那一对档位，跨形式对比才不是「档位差」。
+     - `moe/kernels/cpu/groupwise_int`（fused，`launch.cpp`）：未设 → int16 up + float down；`16` → int16 up + int16 down；`8`/其他 → int8 up + float down；`24` → int8 up + int16 down；`0` → 全 float。
+     - `routed_swiglu/cpu/split.cpp`（split，125B 解码走这条）：`NINFER_MOE_CPU_INT8` 只选 gate/up（未设/`8`/`24` → int8，`16` → int16，`0` → float），down 档仍由 `NINFER_SPLIT_Q6` 决定（默认 int16）。
+     - 实测（2026-11-16，moe_cpu_bench/`moe_cpu_expert_bench`，交错 5–6 轮取 min）：fused 形式 int16 up 比 int8 up **快 2.5–5.5%**（`16` 对 `24`），int16 down 比 float down **快 19–25%**；split 形式反过来，int8 up 在 tokens=1 上比 int16 up **快 13%**（tokens=512 时 int16 快 ~4%）。
+     - 精度上「更精确 ≠ PPL 更低」：split 形式 100% CPU、ppl114 实测 int8 6.012279 / int16 6.149038 / bf16 6.122722，而一层后的输出 abs 和 int16 与 bf16 只差 2e-7、int8 差 1e-4 —— 设备侧该投影是 **A8（int8 激活）** 算术，复现设备算术的档位才是 PPL 最低的那个。故 split 默认保持 int8，int16 留在 `=16` 开关后。
   2. 旧线程池仍在：`src/core/host_worker_pool.{h,cpp}` 只服务 `frontend/media_cache.cpp:3`（上游 74671a4e 已删）；属**叶节点**，不参与数值路径。
   3. 选择策略：本地 `src/models/qwen3_5/execution/cpu_path_policy.h`（代价决策 + 开关）比上游"按列数选混合/整层"更硬，且有实测。
 - 判定：**等价 + 本地领先**。建议记录，不重实现；`host_worker_pool` 可在 media singleflight 改造时并入 `TaskPool`（非本批）。
