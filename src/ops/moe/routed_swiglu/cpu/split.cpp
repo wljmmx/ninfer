@@ -738,15 +738,14 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext& worker, std::size_t
     // axes - faster and no worse - so int16 survives only as a reference for the probe.
     // G32 measured +3.07% against G64's +2.78% and int16's +1.14%, reproducibly, so the
     // fine-grained int8 plane is not shipped. Both arms stay behind switches for further work.
-    const bool down_int8  = false;
     const bool down_int16 = w.down_bits == 6 && w.q6_path;
-    if (down_int8) {
-        quantise_floats(w.activation, w.tokens, w.intermediate, w.q8_act, worker);
+    if (down_int16) {
+        quantise_floats_i16(w.activation, w.tokens, w.intermediate, w.q8_act, worker);
         worker.barrier();
-        const int act_groups = w.intermediate / 32;
+        const int act_groups = w.intermediate / 64;
         for (std::size_t m = 0; m < count; ++m) {
             const auto token = static_cast<std::size_t>(members[m].token);
-            s.q6_cont[m]  = w.q8_act.cont.data() + token * w.intermediate;
+            s.q16_cont[m] = w.q8_act.cont16.data() + token * w.intermediate;
             s.q6_scale[m] = w.q8_act.scale.data() + token * act_groups;
         }
     }
@@ -758,9 +757,9 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext& worker, std::size_t
     for (auto h = out_rows.begin; h < out_rows.end; ++h) {
         const auto row      = static_cast<std::int32_t>(h);
         const auto down_row = row_at(down_base, row, w.intermediate, w.down_bits);
-        if (down_int8) {
-            row_all_tokens_q6_q8(down_row, w.intermediate, s.q6_cont.data(), s.q6_scale.data(),
-                                 count, s.down.data());
+        if (down_int16) {
+            row_all_tokens_q6_q16(down_row, w.intermediate, s.q16_cont.data(), s.q6_scale.data(),
+                                  count, s.down.data());
             // NINFER_Q6_PROBE: the same row through the reference decoder, on the same activation, so
             // a disagreement can be read off directly instead of inferred from perplexity.
             static const bool probe = std::getenv("NINFER_Q6_PROBE") != nullptr;
@@ -793,7 +792,7 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext& worker, std::size_t
                 }
                 std::fflush(stderr);
             }
-        } else if (down_int8) {
+        } else if (false) { /* four-bit down arm retired on this artifact */
             row_all_tokens_q4_q8(down_row, w.intermediate, s.down_even.data(), s.down_odd.data(),
                                  s.down_sum.data(), s.q6_scale.data(), count, s.down.data());
         } else if (w.down_bits == 6) {
