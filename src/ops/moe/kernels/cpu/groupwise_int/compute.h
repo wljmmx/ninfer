@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <type_traits>
 
 namespace ninfer::ops::detail::moe_cpu::groupwise_int {
@@ -351,6 +352,174 @@ template <class Simd, int K, int Rows, int Columns>
     }
     for (int r = 0; r < Rows; ++r) {
         for (int c = 0; c < Columns; ++c) { out[r][c] = common::cpu::avx2::reduce_sum(total[r][c]); }
+    }
+}
+
+// port (sm_89): the six-bit plane as 32 SIGNED codes. The split form's down pass carries this
+// decoder already (routed_swiglu/cpu/split.cpp, decode_q6_signed32) and the two forms do not share
+// a translation unit, so it is restated here rather than re-derived - the arithmetic is the
+// device's, not this port's invention.
+//
+// A six-bit weight is nibble + 16 * upper, where `upper` is the two bits the row stores separately -
+// and those two bits are the HIGH bits of a signed six-bit code, not an unsigned magnitude. The
+// device decoder reads the assembled byte back as (v ^ 0x20) - 0x20 (ops/common/quant/integer.cuh,
+// `unpack_q6_code`), so the code lands in [-32, 31]. Reading the same bits as an unsigned 0..63 and
+// paying a flat 32 * sum(x) bias for it is the mistake the split form's history records: only the
+// codes whose high field is 0 or 1 sit 32 below their value, so the correction leaves every weight
+// with a 32-sized error whose sign follows the high field. Sign-extending bit 5 is the whole step,
+// and with it the weights are exact and the group needs no bias term at all.
+inline __m256i decode_q6_signed32(const std::uint8_t* codes, const std::uint8_t* high) noexcept {
+    // Thirty-two nibbles out of sixteen bytes, in natural order - weight 2b from the low nibble of
+    // byte b and weight 2b+1 from the high one.
+    const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(codes));
+    const __m128i nibble = _mm_set1_epi8(0x0F);
+    const __m128i low    = _mm_and_si128(packed, nibble);
+    const __m128i high_n = _mm_and_si128(_mm_srli_epi16(packed, 4), nibble);
+    const __m256i values =
+        _mm256_set_m128i(_mm_unpackhi_epi8(low, high_n), _mm_unpacklo_epi8(low, high_n));
+
+    // Eight bytes of two-bit planes, each byte holding four codes. Gather the byte that owns each
+    // output position four times over, so the four positions become four different shifts.
+    std::uint64_t bits;
+    std::memcpy(&bits, high, sizeof(bits));
+    alignas(32) static const std::uint8_t kGather[32] = {
+        0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3,
+        4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7};
+    const __m256i shuffled = _mm256_shuffle_epi8(
+        _mm256_set1_epi64x(static_cast<long long>(bits)),
+        _mm256_load_si256(reinterpret_cast<const __m256i*>(kGather)));
+
+    // A byte mask decides which of the four shifts applies to which output byte, so the packed value
+    // lands in natural order without an interleave step. The mask's low two bits are also the value
+    // mask, which is why the shifts can use srli_epi16: any bit that crosses a byte boundary falls
+    // outside those two bits and is masked away.
+    alignas(32) static const std::uint8_t kPick[4][32] = {
+        {3, 0, 0, 0, 3, 0, 0, 0, 3, 0, 0, 0, 3, 0, 0, 0,
+         3, 0, 0, 0, 3, 0, 0, 0, 3, 0, 0, 0, 3, 0, 0, 0},
+        {0, 3, 0, 0, 0, 3, 0, 0, 0, 3, 0, 0, 0, 3, 0, 0,
+         0, 3, 0, 0, 0, 3, 0, 0, 0, 3, 0, 0, 0, 3, 0, 0},
+        {0, 0, 3, 0, 0, 0, 3, 0, 0, 0, 3, 0, 0, 0, 3, 0,
+         0, 0, 3, 0, 0, 0, 3, 0, 0, 0, 3, 0, 0, 0, 3, 0},
+        {0, 0, 0, 3, 0, 0, 0, 3, 0, 0, 0, 3, 0, 0, 0, 3,
+         0, 0, 0, 3, 0, 0, 0, 3, 0, 0, 0, 3, 0, 0, 0, 3}};
+    __m256i upper = _mm256_setzero_si256();
+    {
+        // Four independent shift/mask pairs folded as a tree: the reference writes this as one
+        // accumulating OR, which chains four dependent operations per decode and the decode is what
+        // this dot's latency is made of. OR is associative, so the bytes are the same either way.
+        const auto p0 = _mm256_and_si256(_mm256_srli_epi16(shuffled, 0),
+                                         _mm256_load_si256(reinterpret_cast<const __m256i*>(kPick[0])));
+        const auto p1 = _mm256_and_si256(_mm256_srli_epi16(shuffled, 2),
+                                         _mm256_load_si256(reinterpret_cast<const __m256i*>(kPick[1])));
+        const auto p2 = _mm256_and_si256(_mm256_srli_epi16(shuffled, 4),
+                                         _mm256_load_si256(reinterpret_cast<const __m256i*>(kPick[2])));
+        const auto p3 = _mm256_and_si256(_mm256_srli_epi16(shuffled, 6),
+                                         _mm256_load_si256(reinterpret_cast<const __m256i*>(kPick[3])));
+        upper = _mm256_or_si256(_mm256_or_si256(p0, p1), _mm256_or_si256(p2, p3));
+    }
+    // Two bits of upper are worth sixteen each, and the mask keeps the shift inside the byte: the
+    // assembled code is nibble + upper * 16 in [0, 63], whose bit 5 is the sign of the six-bit value.
+    const auto assembled = _mm256_add_epi8(
+        values, _mm256_and_si256(_mm256_slli_epi16(upper, 4),
+                                 _mm256_set1_epi8(static_cast<char>(0xF0))));
+    // (v ^ 0x20) - 0x20 is the device decoder's own expression: it sign-extends bit 5 into the byte,
+    // so 0..31 stay put and 32..63 become -32..-1.
+    const auto sign = _mm256_set1_epi8(static_cast<char>(0x20));
+    return _mm256_sub_epi8(_mm256_xor_si256(assembled, sign), sign);
+}
+
+// port (sm_89): int16 dot product for the six-bit down projection - the split form's
+// row_dot_q6_q16 (routed_swiglu/cpu/split.cpp:512) in this form's shape. A six-bit code decoded to a
+// signed byte IS the exact weight and madd_epi16 multiplies signed by signed, so this carries
+// neither the bias term the four-bit nibble pays nor the sign trick the six-bit byte path pays: one
+// group is sixty-four values as four sixteen-wide segments, four madds, and the group's two scales
+// applied once at the end in the device order - weight scale first, activation scale second, one
+// add - so the rounding order matches dot_q4_q16 and dot_q4_q8.
+//
+// Four independent accumulators over the group loop break the reduction chain rather than the
+// decode, and - as in the split form - they narrow with the output count, because the float totals
+// must not own more than eight vector registers once Rows * Columns is taken into account. The
+// activation plane is L1-hot right after quantise_activation_i16, so the madds keep their loads as
+// fused memory operands and the rows never occupy a vector register.
+//
+// Overflow: |w| <= 32 and |x| <= 32767 bound one group's partial sum at 64 * 32 * 32767 = 6.7e7,
+// well inside the int32 lanes, so the accumulator is exact.
+// Out of line like dot_q4_q8 / dot_q4_q16: this only runs when the path is enabled, and inlining it
+// would let it change the layout of the vector loop that runs when it is not.
+template <class Simd, int K, int Rows, int Columns>
+[[gnu::noinline]] void dot_q6_q16(Work& work, const Matrix& matrix, const int (&rows)[Rows],
+                                  const int* columns, float (&out)[Rows][Columns]) noexcept {
+    static_assert(std::is_base_of_v<common::cpu::avx2::F32, Simd>,
+                  "the int16 path is written against AVX2 registers");
+    static_assert(K % 64 == 0, "the six-bit plane groups sixty-four values");
+    constexpr int kGroups = K / 64;
+    constexpr int kAccums = Rows * Columns <= 2 ? 4 : 2;
+    __m256 total[kAccums][Rows][Columns];
+    for (int a = 0; a < kAccums; ++a) {
+        for (int r = 0; r < Rows; ++r) {
+            for (int c = 0; c < Columns; ++c) { total[a][r][c] = _mm256_setzero_ps(); }
+        }
+    }
+    for (int group = 0; group < kGroups; ++group) {
+        // One int32 accumulator per output, only inside the group: the scale application would have
+        // to be a multiply per group either way, and the narrow lifetime keeps the registers free.
+        __m256i acc[Rows][Columns];
+        for (int r = 0; r < Rows; ++r) {
+            for (int c = 0; c < Columns; ++c) { acc[r][c] = _mm256_setzero_si256(); }
+        }
+        for (int r = 0; r < Rows; ++r) {
+            const auto* codes = matrix.codes + std::size_t(rows[r]) * (K / 2) + group * 32;
+            // The two-bit plane sits beside the nibbles: eight bytes a row per sixty-four values
+            // for the four-bit weight, two bytes a value's worth more for the six-bit one - so the
+            // row stride is (K / 8) * (Bits - 4) = K / 4 here, and a group takes 16 bytes.
+            const auto* high = matrix.high + std::size_t(rows[r]) * (K / 4) + group * 16;
+            // Half a group at a time: one 32-code decode holds two sixteen-value segments - its low
+            // 128-bit lane is values [32h .. 32h+15] and its high lane the next sixteen - so the
+            // decode is paid twice per group instead of four times. Integer adds are associative, so
+            // folding the two segments one after the other lands on the same int32 partial the
+            // reference's pairwise expression does.
+            for (int half = 0; half < 2; ++half) {
+                const auto decoded = decode_q6_signed32(codes + half * 16, high + half * 8);
+                const auto front   = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(decoded));
+                const auto back    = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(decoded, 1));
+                for (int c = 0; c < Columns; ++c) {
+                    const auto* activation =
+                        reinterpret_cast<const __m256i*>(work.scratch.activation_q16 +
+                                                         std::size_t(columns[c]) * K + group * 64 +
+                                                         half * 32);
+                    acc[r][c] = _mm256_add_epi32(
+                        acc[r][c],
+                        _mm256_add_epi32(_mm256_madd_epi16(front, _mm256_loadu_si256(activation)),
+                                         _mm256_madd_epi16(back, _mm256_loadu_si256(activation + 1))));
+                }
+            }
+        }
+        const int slot = group % kAccums;
+        for (int r = 0; r < Rows; ++r) {
+            const auto weight_vector = _mm256_set1_ps(common::cpu::avx2::fp16_to_f32(
+                matrix.scales[std::size_t(rows[r]) * kGroups + group]));
+            for (int c = 0; c < Columns; ++c) {
+                const auto activation_scale = _mm256_set1_ps(
+                    work.scratch.activation_scale[std::size_t(columns[c]) * kGroups + group]);
+                const auto scaled = _mm256_mul_ps(_mm256_cvtepi32_ps(acc[r][c]), weight_vector);
+                total[slot][r][c] =
+                    _mm256_add_ps(_mm256_mul_ps(scaled, activation_scale), total[slot][r][c]);
+            }
+        }
+    }
+    for (int span = kAccums / 2; span > 0; span /= 2) {
+        for (int a = 0; a < span; ++a) {
+            for (int r = 0; r < Rows; ++r) {
+                for (int c = 0; c < Columns; ++c) {
+                    total[a][r][c] = _mm256_add_ps(total[a][r][c], total[a + span][r][c]);
+                }
+            }
+        }
+    }
+    for (int r = 0; r < Rows; ++r) {
+        for (int c = 0; c < Columns; ++c) {
+            out[r][c] = common::cpu::avx2::reduce_sum(total[0][r][c]);
+        }
     }
 }
 
