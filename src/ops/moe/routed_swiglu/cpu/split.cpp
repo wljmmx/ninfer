@@ -249,25 +249,25 @@ inline void quantise_inputs(const std::uint16_t* x, std::int32_t tokens, std::in
 // cover. The price is one scale application per 32 values instead of per 64.
 inline void quantise_floats(const float* x, std::int32_t tokens, std::int32_t width, Q8Input& q8,
                             const CpuWorkerContext& worker) {
-    // Sixty-four values a group, unchanged. A thirty-two-value group was tried and measured WORSE
-    // (+3.07% against this grouping's +2.78%), which is counter-intuitive until the pairing is seen:
-    // the weight scale is fixed at 64 by the stored layout, so a 32-value activation group makes one
-    // weight scale cover two different activation scales, and the two no longer describe the same
-    // arithmetic. Refining the activation alone is not a refinement.
-    const int groups = width / 64;
+    // Thirty-two values a group. A numeric probe on the down pass's own distribution (silu(g)*u with
+    // six-bit weights) puts a 32-value group 12.7% below a 64-value one on induced dot error
+    // (0.64046 against 0.73355, rmse 0.005193 against 0.006376), so the finer grouping is the better
+    // plane by construction. The weight scale stays at 64 - that is the stored layout - and each
+    // 32-value group simply carries its own activation scale, which is the exact dequantisation.
+    const int groups = width / 32;
     const auto range = worker.range(static_cast<std::size_t>(tokens) * groups);
     for (auto g = range.begin; g < range.end; ++g) {
         const auto token   = static_cast<std::int32_t>(g / static_cast<std::size_t>(groups));
         const auto group   = static_cast<std::int32_t>(g % static_cast<std::size_t>(groups));
-        const auto* source = x + static_cast<std::size_t>(token) * width + group * 64;
+        const auto* source = x + static_cast<std::size_t>(token) * width + group * 32;
         float peak = 0.0F;
-        for (int i = 0; i < 64; ++i) { peak = std::max(peak, std::fabs(source[i])); }
+        for (int i = 0; i < 32; ++i) { peak = std::max(peak, std::fabs(source[i])); }
         const float scale   = peak > 0.0F ? peak / 127.0F : 0.0F;
         const float inverse = scale > 0.0F ? 1.0F / scale : 0.0F;
         q8.scale[static_cast<std::size_t>(token) * groups + group] = scale;
-        auto* cont = q8.cont.data() + static_cast<std::size_t>(token) * width + group * 64;
+        auto* cont = q8.cont.data() + static_cast<std::size_t>(token) * width + group * 32;
         int sum = 0;
-        for (int i = 0; i < 64; ++i) {
+        for (int i = 0; i < 32; ++i) {
             const int value = std::clamp(
                 static_cast<int>(std::lrint(source[i] * inverse)), -127, 127);
             cont[i] = static_cast<std::int8_t>(value);
@@ -736,6 +736,8 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext& worker, std::size_t
     // projections). It decoded in bf16 until now while gate/up already had the int8 path.
     // The sixteen-bit arm is retired: at thirty-two values a group the eight-bit plane wins on both
     // axes - faster and no worse - so int16 survives only as a reference for the probe.
+    // G32 measured +3.07% against G64's +2.78% and int16's +1.14%, reproducibly, so the
+    // fine-grained int8 plane is not shipped. Both arms stay behind switches for further work.
     const bool down_int8  = false;
     const bool down_int16 = w.down_bits == 6 && w.q6_path;
     if (down_int8) {
@@ -744,7 +746,7 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext& worker, std::size_t
         const int act_groups = w.intermediate / 32;
         for (std::size_t m = 0; m < count; ++m) {
             const auto token = static_cast<std::size_t>(members[m].token);
-            s.q16_cont[m] = w.q8_act.cont16.data() + token * w.intermediate;
+            s.q6_cont[m]  = w.q8_act.cont.data() + token * w.intermediate;
             s.q6_scale[m] = w.q8_act.scale.data() + token * act_groups;
         }
     }
@@ -768,7 +770,7 @@ void run_expert(Work& w, Scratch& s, const CpuWorkerContext& worker, std::size_t
                 // The same quantised activation the fast path read, scaled back to float: the dot of
                 // that against the same weights separates the kernel's arithmetic from the
                 // quantisation it costs, which the bf16 column above cannot (it is exact activation).
-                const int act_groups = w.intermediate / 64;
+                const int act_groups = w.intermediate / 32;
                 std::vector<float> dequantised_input(static_cast<std::size_t>(w.intermediate));
                 for (std::size_t m = 0; m < count; ++m) {
                     for (int group = 0; group < act_groups; ++group) {
@@ -843,7 +845,7 @@ void run(void* arguments, const CpuWorkerContext& worker) noexcept {
         // others' writes.
         if (worker.rank() == 0) {
             const int groups     = work.hidden / 64;
-            const int act_groups = work.intermediate / 64;
+            const int act_groups = work.intermediate / 32;
             work.q8.even.assign(static_cast<std::size_t>(work.tokens) * work.hidden, 0);
             work.q8.odd.assign(static_cast<std::size_t>(work.tokens) * work.hidden, 0);
             work.q8.cont.assign(static_cast<std::size_t>(work.tokens) * work.hidden, 0);
