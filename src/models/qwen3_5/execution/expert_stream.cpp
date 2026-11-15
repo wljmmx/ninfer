@@ -2009,9 +2009,25 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
         cpu_path_ledger().note_budget(budget.cost_gpu_us, budget.cost_cpu_us, budget.budget_us);
         cpu_path_ledger().note_layer_routes(static_cast<int>(distinct.size()));
         cpu_path_ledger().last_flops_per_expert = query.flops_per_expert;
+        // Does the tier already hold this expert on every run the CPU half will read? A route it
+        // holds costs a memcpy out of the arena; one it does not costs a physical read, measured at
+        // 4.5 ms an entry on this box against the pool's 42 us when the pages are already warm. The
+        // ratio is after one saving either way - the upload the Device is spared - so among routes
+        // equally cold to the pool the resident ones are free and the others are not.
+        const auto tier_holds = [this](std::int32_t expert) {
+            if (split_.empty()) { return false; }
+            const auto id = static_cast<std::uint32_t>(expert);
+            for (const auto& run : split_) {
+                if (!host_->holds(run.bank, id)) { return false; }
+            }
+            return true;
+        };
         if (budget.count > 0) {
             std::vector<std::int32_t> picked = distinct;
             std::stable_sort(picked.begin(), picked.end(), [&](std::int32_t a, std::int32_t b) {
+                const bool held_a = tier_holds(a);
+                const bool held_b = tier_holds(b);
+                if (held_a != held_b) { return held_a; }
                 const auto sa = hot_score_[static_cast<std::size_t>(a)];
                 const auto sb = hot_score_[static_cast<std::size_t>(b)];
                 if (sa != sb) { return sa < sb; }
@@ -2029,9 +2045,17 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
         }
         // Per layer, as the ratio is taken: what the model charged on each side, the cap it was cut
         // to, why, and the two rates the count was divided by (span = tier fill + arithmetic,
-        // compute = the arithmetic alone).
+        // compute = the arithmetic alone). `held` is the residency the CPU half would have found:
+        // the read the model prices at `cold_read_us` is only paid for the routes outside it, so the
+        // ratio cannot reach its own steady state until this number is high - a ratio priced on a
+        // tier that holds nothing is priced on a physical read per route.
+        std::size_t held_candidates = 0;
+        for (const auto expert : distinct) {
+            if (tier_holds(expert)) { ++held_candidates; }
+        }
         std::fprintf(stderr,
-                     "[cpu-path] layer=%llu routes=%zu cpu=%d (%.0f%%) | est copy=%.0fus cpu=%.0fus "
+                     "[cpu-path] layer=%llu routes=%zu cpu=%d (%.0f%%) held=%zu/%zu | est "
+                     "copy=%.0fus cpu=%.0fus "
                      "cap=%.0fus why=%s | link=%.1fGB/s span=%.1fus compute=%.1fus per exp "
                      "(%.0f GFLOPS)\n",
                      static_cast<unsigned long long>(control.layers + 1), distinct.size(),
@@ -2039,6 +2063,7 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
                      distinct.empty() ? 0.0
                                       : 100.0 * cpu_routes_this_layer /
                                             static_cast<double>(distinct.size()),
+                     held_candidates, distinct.size(),
                      budget.cost_gpu_us, budget.cost_cpu_us, budget.budget_us, budget.why,
                      control.link_gbps,
                      cpu_half_rate().span_us_per_expert < 0.0

@@ -1058,8 +1058,20 @@ void split_host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParamete
     static CpuTopology topology;
     static CpuExecutor executor(topology,
                                 plan_cpu_team(topology.info(), static_cast<std::uint32_t>(cpu_team)));
-    static constexpr std::size_t kSmallTeam    = 4;
+    // The wide team is sized for the prefill form (many routes per layer), the small one for the
+    // decode half (a route or two). On this box the split makes the small team the common case, so
+    // its width is the number the CPU half's whole cost is made of: measured 297.7 us per expert at
+    // four lanes (33 GFLOPS) against 126 us for the upload it would replace. NINFER_CPU_SMALL_TEAM
+    // is a measurement switch, not a policy - the default stays four.
     static constexpr std::size_t kSmallExperts = 4;
+    static const std::size_t kSmallTeam        = [] {
+        const char* value = std::getenv("NINFER_CPU_SMALL_TEAM");
+        if (value != nullptr && *value != '\0') {
+            const auto wanted = static_cast<std::size_t>(std::strtoul(value, nullptr, 10));
+            return std::max<std::size_t>(1, wanted);
+        }
+        return std::size_t{4};
+    }();
     static CpuExecutor small_executor(
         topology, plan_cpu_team(topology.info(),
                                 static_cast<std::uint32_t>(std::min(kSmallTeam, cpu_team))));
@@ -1174,16 +1186,24 @@ void split_host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParamete
                 acc_span += cpu_span_ms;
                 acc_up += moe.stream->last_cost().upload_bytes;
                 const auto& ledger = cpu_path_ledger();
+                // `upload` is what the pool still moved, and it is a window figure. The relief is
+                // CUMULATIVE, because the ratio takes a route about once in five hundred: a route
+                // the CPU half computed never reaches the uploader, so a window of forty tokens
+                // reads zero whether the half relieved a kilobyte or a gigabyte. One route is the
+                // gate, up and down image, so it is three slots of the tier.
+                const auto relieved = static_cast<std::uint64_t>(ledger.cpu_routes) * 3U *
+                                      host->slot_bytes();
                 std::fprintf(stderr,
                              "[host] cpu share=%.1f%% (%llu/%llu routes) span=%.2fms/token "
-                             "upload=%llu KiB/token\n",
+                             "upload=%llu KiB/token relieved=%llu MiB total\n",
                              ledger.routes_seen == 0
                                  ? 0.0
                                  : 100.0 * static_cast<double>(ledger.cpu_routes) /
                                        static_cast<double>(ledger.routes_seen),
                              static_cast<unsigned long long>(ledger.cpu_routes),
                              static_cast<unsigned long long>(ledger.routes_seen), acc_span,
-                             static_cast<unsigned long long>(acc_up / 1024U));
+                             static_cast<unsigned long long>(acc_up / 1024U),
+                             static_cast<unsigned long long>(relieved >> 20U));
                 acc_span = 0.0;
                 acc_up   = 0;
                 acc[0] = acc[1] = 0.0;
