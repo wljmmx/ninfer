@@ -22,6 +22,10 @@ struct DeviceArgs {
     std::int32_t* drafts;
     float* q;
     int steps;
+    // Weight on the successor/predecessor bilinear term: the reference's 1.0. Measured on v5_e2 at
+    // col0, the unary argmax alone hits 45.2% of the target's argmax and the edge term lifts it to
+    // 51.6%, so 1.0 is kept; NINFER_SELECTOR_EDGE_SCALE moves it for A/Bs.
+    float edge_scale;
 };
 
 struct alignas(16) SelectorShared {
@@ -84,7 +88,8 @@ __device__ void score_row(const DeviceArgs& a, int column, SelectorShared& share
         for (int r = lane; r < kRank; r += 32)
             sum = fmaf(shared.product[r], __bfloat162float(shared.successors[c * kRank + r]), sum);
         sum = warp_reduce_sum(sum);
-        if (lane == 0) shared.edge[c] = a.unary[column * kCandidates + c] + sum;
+        if (lane == 0)
+            shared.edge[c] = a.unary[column * kCandidates + c] + a.edge_scale * sum;
     }
     __syncthreads();
 }
@@ -169,7 +174,11 @@ void candidate_selector_path_launch(SelectorRoute route, const Tensor& candidate
                           configs,
                           static_cast<std::int32_t*>(drafts.data),
                           static_cast<float*>(proposal_q.data),
-                          candidate_ids.ne[1]};
+                          candidate_ids.ne[1],
+                          [] {
+                              const char* env = std::getenv("NINFER_SELECTOR_EDGE_SCALE");
+                              return env != nullptr && *env != '\0' ? std::atof(env) : 1.0F;
+                          }()};
     if (route == SelectorRoute::Direct) {
         selector_walk_kernel<<<candidate_ids.ne[2], 512, 0, stream>>>(args);
     } else {
