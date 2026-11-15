@@ -58,6 +58,30 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
                                     cudaStream_t stream);
 
 /**
+ * Op: speculative_draft_conf_extent
+ *
+ * Algorithm:
+ *   For each row b, walk the produced columns in order and stop at the first column whose pick is
+ *   less confident than `threshold`; write extents[b] = min(extents[b], that column). A column's
+ *   confidence is the top-1 probability of its sixteen unary scores, a temperature-1 softmax over
+ *   the head's top sixteen (the reference's floor is a probability; a top1-top2 gap has no scale).
+ *
+ *   The rule truncates a *prefix*, not a set: acceptance is a prefix chain, so a confident column
+ *   behind an unconfident one could never be reached anyway, and the tail spends no verify work.
+ *   Threshold 0 keeps every column. proposal_q is never the input - it is a distribution other code
+ *   walks to 1.0, and a softmax written there instead of the greedy one-hot hangs that walk.
+ *
+ * Logical shapes:
+ *   scores is contiguous FP32 [16,K,B] (candidate fastest) with K>=1, B>=1; extents is contiguous
+ *   I32 [B] in [0,K]. `threshold` is finite and in [0,1].
+ *
+ * Effects:
+ *   Updates extents in place and preserves scores. No workspace, no other state.
+ */
+void speculative_draft_conf_extent(const Tensor& scores, Tensor& extents, std::int32_t steps,
+                                   float threshold, cudaStream_t stream);
+
+/**
  * Op: speculative_accept_greedy_drafts
  *
  * Algorithm:

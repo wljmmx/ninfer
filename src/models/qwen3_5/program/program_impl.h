@@ -439,6 +439,8 @@ public:
     const SpeculativeBackend speculative_backend;
     const KvCacheStorage kv_storage;
     const ProposalHead proposal_head;
+    // Per-column draft confidence floor carried from the plan (0 keeps every column).
+    const float draft_conf;
     const bool vision_enabled;
     const bool use_cuda_graph;
     const bool causal_scoring;

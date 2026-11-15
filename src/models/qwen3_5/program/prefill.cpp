@@ -495,7 +495,7 @@ std::optional<Program::MergedPrefillResult> ProgramImpl::advance_prefill_batch()
     execution::PrefillContext schedule_state{
         {device, parameters, work, state_images->linear(),
          replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-         proposal_head, ple.get()},
+         proposal_head, ple.get(), draft_conf},
         text_kv_view(first),
         {},
         decoder->text_kv,
@@ -904,7 +904,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         execution::PrefillContext schedule_state{
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, ple.get()},
+             proposal_head, ple.get(), draft_conf},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,

@@ -180,7 +180,7 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
 
 void speculative_accept_sparse_drafts(
     const Tensor& target_tokens, const Tensor& logits, const Tensor& drafts,
-    const Tensor& candidate_ids, const Tensor& proposal_q, const Tensor& current_extents,
+    const Tensor& candidate_ids, const Tensor& scores, const Tensor& current_extents,
     Tensor& round_lengths, Tensor& round_anchors, Tensor& licensed_tokens, Tensor& licensed_counts,
     Tensor& accepted_drafts, std::int32_t token_domain, const SamplingConfig* configs,
     SpeculativeAcceptExecutionEnvelope envelope, WorkspaceArena& workspace, cudaStream_t stream) {
@@ -201,7 +201,7 @@ void speculative_accept_sparse_drafts(
     require_tensor3(logits, DType::BF16, kSparsePhysicalRows, columns, batch, op, "logits");
     require_matrix(drafts, DType::I32, k, batch, op, "drafts");
     require_tensor3(candidate_ids, DType::I32, kSparseCandidates, k, batch, op, "candidate_ids");
-    require_tensor3(proposal_q, DType::FP32, kSparseCandidates, k, batch, op, "proposal_q");
+    require_tensor3(scores, DType::FP32, kSparseCandidates, k, batch, op, "scores");
     require_vector(current_extents, DType::I32, batch, op, "current_extents");
     require_vector(round_lengths, DType::I32, batch, op, "round_lengths");
     require_vector(round_anchors, DType::I32, batch, op, "round_anchors");
@@ -217,7 +217,7 @@ void speculative_accept_sparse_drafts(
         token_domain, envelope, k, k, batch, batch);
     const DeviceSpan scratch = bytes == 0 ? DeviceSpan{} : workspace.alloc_bytes(bytes);
     detail::speculative_accept_sparse_drafts_launch(
-        target_tokens, logits, drafts, candidate_ids, proposal_q, current_extents, round_lengths,
+        target_tokens, logits, drafts, candidate_ids, scores, current_extents, round_lengths,
         round_anchors, licensed_tokens, licensed_counts, accepted_drafts, token_domain, configs,
         envelope.all_rows_greedy_without_penalties, scratch, stream);
 }
@@ -279,4 +279,21 @@ void apply_sampling_mask(const Tensor& logits, Tensor& masked, SamplingMask mask
                                 column_stride_words, stream);
 }
 
+void speculative_draft_conf_extent(const Tensor& scores, Tensor& extents, std::int32_t steps,
+                                   float threshold, cudaStream_t stream) {
+    if (scores.dtype != DType::FP32 || scores.ne[0] != kSparseCandidates || scores.ne[1] != steps ||
+        steps < 1 || !scores.is_contiguous() || scores.data == nullptr) {
+        throw std::invalid_argument(
+            "speculative_draft_conf_extent: scores must be contiguous FP32 [16,K,B]");
+    }
+    if (extents.dtype != DType::I32 || extents.ne[0] != scores.ne[2] || extents.ne[1] != 1 ||
+        !extents.is_contiguous() || extents.data == nullptr) {
+        throw std::invalid_argument(
+            "speculative_draft_conf_extent: extents must be contiguous I32 [B]");
+    }
+    if (!(threshold >= 0.0F && threshold <= 1.0F)) {
+        throw std::invalid_argument("speculative_draft_conf_extent: threshold must be in [0,1]");
+    }
+    detail::speculative_draft_conf_extent_launch(scores, extents, steps, threshold, stream);
+}
 } // namespace ninfer::ops

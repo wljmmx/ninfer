@@ -108,6 +108,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       context_cache(plan.context_cache), prefill_chunk(plan.prefill_chunk),
       draft_window(plan.draft_window), speculative_backend(plan.speculative_backend),
       kv_storage(plan.kv_storage), proposal_head(plan.proposal_head),
+      draft_conf(plan.draft_conf),  // NINFER_DRAFT_CONF travels plan -> Program -> ExecutionCore
       vision_enabled(plan.features.vision),
       // Qwen4Exp's n-gram embedding is Host-driven: a window hashes on the Host, reads the table
       // from disk and uploads the result, so a captured graph would replay the first window's
@@ -548,7 +549,7 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             const std::uint32_t nominal = std::min(prefill_chunk, predictor_count - cursor);
             execution::PrefillContext schedule_state{
                 {device, parameters, work, state_images->linear(), nullptr, io, prefill_hidden,
-                 prefill_chunk, proposal_head, ple.get()},
+                 prefill_chunk, proposal_head, ple.get(), draft_conf},
                 decoder->text_kv.execution_view(text_kv_addresses->execution_row(*address)),
                 {},
                 decoder->text_kv,

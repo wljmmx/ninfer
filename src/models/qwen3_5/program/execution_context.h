@@ -44,6 +44,9 @@ struct ExecutionCore {
     // Program drives borrows the same one: the nine-column history and the hash tails are sequence
     // state, so they have to outlive the pass that advances them.
     detail::PleProgramState* ple = nullptr;
+    // Per-column draft confidence floor; 0 keeps every column (see SpeculativeOptions::draft_conf).
+    // Last member so the aggregate initializers that stop at `ple` keep compiling.
+    float draft_conf = 0.0F;
 };
 
 // Q67/S1: one lane's place in a merged prefill pass (see prefill_row.h).

@@ -174,4 +174,17 @@ void proposal_remap_token_ids_launch(Tensor& proposal_tokens, const std::int32_t
     CUDA_CHECK(cudaGetLastError());
 }
 
+void speculative_draft_conf_extent_launch(const Tensor& scores, Tensor& extents,
+                                          std::int32_t steps, float threshold,
+                                          cudaStream_t stream) {
+    const int batch = extents.ne[0];
+    if (batch < 1) { return; }
+    // NINFER_DRAFT_CONF_PROBE: print each column's top-1 probability and its two leading scores.
+    static const int probe = std::getenv("NINFER_DRAFT_CONF_PROBE") != nullptr ? 1 : 0;
+    speculative_draft_conf_extent_kernel<<<static_cast<unsigned int>(batch), 32, 0, stream>>>(
+        static_cast<const float*>(scores.data), static_cast<std::int32_t*>(extents.data), steps,
+        kSparseSpeculativeCandidates, threshold, probe);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail

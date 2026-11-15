@@ -1100,6 +1100,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->draft_window         = inputs.draft_window;
     impl->speculative_backend  = inputs.speculative_backend;
     impl->proposal_head        = inputs.proposal_head;
+    impl->draft_conf           = inputs.draft_conf;
     impl->features             = inputs.features;
     impl->use_cuda_graph       = inputs.use_cuda_graph;
     impl->causal_scoring       = inputs.causal_scoring;
@@ -1202,6 +1203,29 @@ std::uint32_t clamped_draft_window(const execution::Parameters& parameters,
     return kDFlash2MaximumDraftTokens;
 }
 
+// The draft-confidence floor is a per-round policy rather than a plan shape, so it rides the plan to
+// the round instead of resizing anything. NINFER_DRAFT_CONF overrides the option for A/Bs; zero keeps
+// every column, which is the shipped behaviour and leaves every number unchanged.
+float resolved_draft_conf(const EngineOptions& options) {
+    float value = options.speculative.draft_conf;
+    if (const char* env = std::getenv("NINFER_DRAFT_CONF"); env != nullptr && *env != '\0') {
+        value = static_cast<float>(std::atof(env));
+    }
+    if (!(value >= 0.0F && value <= 1.0F)) {
+        throw std::invalid_argument("draft confidence must be within [0,1]");
+    }
+    if (value > 0.0F) {
+        static const bool told = [&] {
+            std::fprintf(stderr, "[draft] confidence floor %.3f: columns below it end the window\n",
+                         value);
+            std::fflush(stderr);
+            return true;
+        }();
+        (void)told;
+    }
+    return value;
+}
+
 std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
 make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContext& device,
                            const EngineOptions& options) {
@@ -1247,6 +1271,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .speculative_backend  = options.speculative.backend,
         .kv_storage           = options.kv_cache,
         .proposal_head        = options.speculative.proposal_head,
+        .draft_conf           = resolved_draft_conf(options),
         .features             = models::load_options(options),
         .use_cuda_graph       = options.use_cuda_graph,
         .causal_scoring       = options.purpose == EnginePurpose::CausalScoring,

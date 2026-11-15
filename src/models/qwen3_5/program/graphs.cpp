@@ -314,7 +314,8 @@ void ProgramImpl::prepare_graphs() {
                                         prefill_hidden,
                                         prefill_chunk,
                                         proposal_head,
-                                        ple.get()};
+                                        ple.get(),
+                                        draft_conf};
     };
 
     // appendix FS: the ordinary family is built for the ordinary backend, and ALSO when the masked

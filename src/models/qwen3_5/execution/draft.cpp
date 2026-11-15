@@ -784,6 +784,16 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                 projected.view({dimension(config.dflash2->selector_rank), k, batch}), anchors,
                 weights.selector->predecessor_codebook, weights.selector->successor_codebook,
                 frontiers, frame.sampling, drafts, proposal_q, work, stream);
+            // NINFER_DRAFT_CONF / --draft-conf: the first column whose pick is below the floor ends
+            // the verified prefix, so the target never spends a column on a suffix the draft itself
+            // does not believe. This score tensor is the head's own top sixteen - the one place a
+            // per-column confidence exists here - and zero (the shipped default) runs nothing.
+            if (state.execution.draft_conf > 0.0F) {
+                Tensor extents = frame.proposal_extents.slice(0, 0, batch);
+                ops::speculative_draft_conf_extent(
+                    scores.view({dimension(config.dflash2->selector_top_k), k, batch}), extents,
+                    static_cast<std::int32_t>(k), state.execution.draft_conf, stream);
+            }
         };
         run_head();
         work.reset();

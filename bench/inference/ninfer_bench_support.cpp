@@ -349,6 +349,7 @@ std::string usage_text(std::string_view program) {
            "(default: bf16)\n"
         << "  --spec <mtp|dflash|dflash2> speculative backend (default: none)\n"
         << "  --draft-tokens <n>         MTP 1..5; DFlash/DFlash2 1..15\n"
+        << "  --draft-conf <0..1>         drop draft columns below this confidence (default 0)\n"
         << "  --lm-head-draft             use the optimized proposal head; requires a speculative "
            "backend\n"
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
@@ -426,6 +427,9 @@ BenchOptions parse_args(int argc, char** argv) {
             options.speculative.backend = product::parse_speculative_backend(value("--spec"));
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value("--draft-tokens"), "draft-tokens");
+        } else if (arg == "--draft-conf") {
+            options.speculative.draft_conf =
+                static_cast<float>(std::atof(value("--draft-conf").c_str()));
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--device") {

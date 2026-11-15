@@ -127,6 +127,10 @@ struct SpeculativeOptions {
     // Startup-fixed K: MTP 1..5; DFlash and DFlash2 1..15 (query width K+1).
     std::uint32_t draft_tokens = 0;
     ProposalHead proposal_head = ProposalHead::Full;
+    // Per-column draft confidence floor: a column whose pick scores below it stops the window at
+    // that column, so the target never verifies a suffix the draft itself does not believe.
+    // 0 disables, which is the shipped default.
+    float draft_conf = 0.0F;
 };
 
 enum class StartupPhase : std::uint8_t {

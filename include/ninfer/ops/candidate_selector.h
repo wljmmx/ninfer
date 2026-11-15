@@ -32,7 +32,9 @@ namespace ninfer::ops {
  *                   * successor_codebook[r,candidate_ids[c,i,b]].
  *
  * A row with configs[b].temperature<=0 selects the lowest candidate rank attaining max(edge) and
- * writes its exact one-hot distribution. A positive-temperature row writes the FP32 softmax of
+ * writes the temperature-1 softmax of edge - the pick's probability, which is what a confidence
+ * floor reads; the draw below is the only consumer of proposal_q, so this changes no decision. A
+ * positive-temperature row writes the FP32 softmax of
  * edge/temperature, then draws a candidate with counter key
  * (configs[b].seed,base_positions[b]+i,kSamplePurposeDFlash2Proposal). The selected global id is
  * written to drafts[i,b] and becomes the next predecessor. The Op ignores all other

@@ -17,6 +17,41 @@ namespace ninfer::ops {
 
 inline constexpr int kSparseSpeculativeCandidates = 16;
 
+// One thread per request: the first column whose pick is below the floor ends the window. The
+// confidence is the top-1 probability of the column's 16 unary scores (a temperature-1 softmax over
+// the head's top sixteen) rather than a gap, because the reference's floor is a probability and a gap
+// has no scale. proposal_q is deliberately not the input: it is a distribution other code walks to
+// 1.0, and a softmax written there instead of the greedy one-hot hangs that walk.
+__global__ __launch_bounds__(32) void speculative_draft_conf_extent_kernel(
+    const float* __restrict__ scores, std::int32_t* __restrict__ extents, std::int32_t steps,
+    std::int32_t candidates, float threshold, int probe) {
+    const int row = static_cast<int>(blockIdx.x);
+    if (threadIdx.x != 0) { return; }
+    int extent = extents[row];
+    extent     = extent < 0 ? 0 : (extent > steps ? steps : extent);
+    int keep   = extent;
+    if (probe != 0 && row == 0) {
+        printf("[conf-probe] extent=%d steps=%d threshold=%.4f\n", extent, steps, threshold);
+    }
+    for (int step = 0; step < extent; ++step) {
+        const float* s = scores + static_cast<std::int64_t>(row * steps + step) * candidates;
+        float best     = s[0];
+        for (int c = 1; c < candidates; ++c) { best = fmaxf(best, s[c]); }
+        double mass = 0.0;
+        for (int c = 0; c < candidates; ++c) { mass += static_cast<double>(__expf(s[c] - best)); }
+        const float top1 = static_cast<float>(1.0 / mass);
+        if (probe != 0 && row == 0) {
+            printf("[conf-probe] col=%d top1=%.9f best=%.5f s1=%.5f s2=%.5f\n", step, top1, best,
+                   s[0], s[1]);
+        }
+        if (!(top1 >= threshold)) {
+            keep = step;
+            break;
+        }
+    }
+    extents[row] = keep;
+}
+
 __global__ void speculative_prepare_verify_inputs_kernel(const std::int32_t* anchors,
                                                          const std::int32_t* drafts,
                                                          const std::int32_t* base_positions,
