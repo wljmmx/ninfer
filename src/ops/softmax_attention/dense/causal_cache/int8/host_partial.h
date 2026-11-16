@@ -44,6 +44,7 @@
 #include "ops/softmax_attention/common/causal_operands.h"
 #include "ops/softmax_attention/common/causal_partition.h"
 #include "ops/softmax_attention/cpu/partial.h"
+#include "ops/softmax_attention/dense/causal_cache/int8/plan_probe.h"
 
 #include <algorithm>
 #include <atomic>
@@ -420,6 +421,18 @@ void rk_host_partial_stage(const RkHostPartialView& view, float scale, int width
 template <class G, bool Masked, RkHostKvDType DType>
 void rk_kv_cpu_split_gate(const CausalAttentionOperands& p, CausalKvPartition partition,
                           CausalPartialView partial, int key_tile, cudaStream_t stream) {
+    // P4.2: hand out the geometry of THIS call before anything else. `partition` and `key_tile` are
+    // the launch's own arguments (this gate runs inside the per-instance lambda that launched the
+    // grouped MMA with them), and the family is this instance's template dtype - so the record is
+    // composed from what ran, and the knob below cannot change what it says. Read-only for everyone
+    // else; int8/plan_probe.h states who writes it and when it goes stale.
+    note_int8_kv_plan(Int8KvPlanRecord{.partition     = partition,
+                                       .key_rows      = key_tile,
+                                       .query_heads   = G::QHeads,
+                                       .kv_heads      = G::KVHeads,
+                                       .width         = p.width,
+                                       .batch         = p.batch,
+                                       .family        = rk_host_kv_codecs(DType).name});
     const int split = rk_kv_cpu_partition_split();
     if (split < 0) { return; }  // default off: the whole seam is one compare on this path
     namespace detail = rk_host_partial_detail;

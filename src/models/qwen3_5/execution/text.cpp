@@ -45,6 +45,7 @@
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/silu_mul.h"
 #include "ninfer/ops/softmax_attention.h"
+#include "ops/softmax_attention/dense/causal_cache/int8/plan_probe.h"
 
 #include <cuda_runtime.h>
 
@@ -2041,6 +2042,28 @@ void residual_dump(const char* stage, const Tensor& value, std::int32_t rows, st
     std::fflush(stderr);
 }
 
+// Diagnosis (NINFER_SPLIT_TIMING): what split geometry the attention call just made ACTUALLY
+// dispatched. The values come from the ops-side channel (int8/plan_probe.h), which the gate fills
+// from the launch's own partition and key tile - so this is the models side reading the dispatch,
+// not a second computation of it. Printed once per process, and only when the record belongs to a
+// gated call (`sequence != 0`); a path with no record leaves this silent rather than printing a
+// geometry nobody used.
+void kv_plan_report(int layer) {
+    if (std::getenv("NINFER_SPLIT_TIMING") == nullptr) { return; }
+    static bool printed = false;
+    if (printed) { return; }
+    const auto& plan = ops::detail::int8_kv_plan_last();
+    if (plan.sequence == 0) { return; }
+    printed = true;
+    std::fprintf(stderr,
+                 "[kv-plan] layer %d: partition(capacity=%d target=%d key_shift=%d) key_rows=%d "
+                 "family=%s q_heads=%d kv_heads=%d width=%d batch=%d\n",
+                 layer, plan.partition.capacity, plan.partition.target, plan.partition.key_shift,
+                 plan.key_rows, plan.family, plan.query_heads, plan.kv_heads, plan.width,
+                 plan.batch);
+    std::fflush(stderr);
+}
+
 } // namespace
 
 void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph,
@@ -2149,6 +2172,10 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
             ctx_.execution_view());
     }
     if (mirror_ready) { detail::KvHostSplitMirror::install(nullptr); }
+    // P4.2: read back the geometry the call above dispatched (read-only channel; one line under
+    // NINFER_SPLIT_TIMING). Placed here because this is the only place a model can say "this
+    // attention call's partition", and the record is written by that very call.
+    kv_plan_report(fidx);
     ops::sigmoid_mul(gate, a, s);
     // The same file the sparse arm writes: the two arms' attention outputs are the S3 gate.
     qsa_dump_tensor("NINFER_QSA_LAYER_DUMP", "attention",
