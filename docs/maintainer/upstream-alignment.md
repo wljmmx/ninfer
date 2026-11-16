@@ -368,3 +368,115 @@ graph 重放 3 例、双请求 batch、4 档 SM 的容量/分配镜像。
 2. `dead` 的 4 条都来自多 rank 封口池；若将来单卡线要接 NCCL/rank，这 4 条与 T001 需一起复议，不是永久不可逆。
 3. `deferred` 的 23 条都带解锁判据，**判据不出现就不开工**；其中 14 条 qwen4_exp 运行时是同一条外部依赖，
    应作为一个批次（T192–T198）处理，不要逐条 cherry-pick。
+
+## 10. 2026-11-16 增量 64 条（`77c2e5e2..454b922f`）
+
+上游前移到 `454b922f`（2026-11-16）。本轮只做**增量登记**：把 `77c2e5e2..454b922f` 的 64 条按 §7.1/§7.2
+同一口径补进台账，**不改代码、不编译、不运行程序**；`git` 只用 `log/show/rev-list` 只读。
+
+> §1/§2 的"上游基线"行仍写 `77c2e5e2`，本轮不改写旧表（避免与 §9 的计数口径打架）；
+> 台账已覆盖到 `454b922f`，基线改写与 `alignment_report.ps1` 复跑放到下一次对齐时一次做完。
+
+### 10.1 计数（before → after）
+
+| class | §9 后 | 本轮 | 合计 | 说明 |
+|---|---|---|---|---|
+| absorbed | 1313 | 0 | **1313** | 本轮没有一条能给出本地等价物证据（见 10.4） |
+| dead | 155 | +15 | **170** | Spark/GLM 线 11 条 + 多 rank 通信 4 条 |
+| deferred | 23 | +19 | **42** | 每条 note 都写了解锁判据（10.5） |
+| na-arch | 62 | +14 | **76** | NVFP4/A16/FP8-A8/mhc/FP4 流水 |
+| na-doc | 9 | +3 | **12** | 上游 docs 提交 |
+| na-hardware | 2 | +11 | **13** | 5090 形状/变体目录 |
+| todo | 1 | +2 | **3** | 新增 `8e464812`、`4461c968`（见 10.2） |
+| needs-review | 0 | 0 | **0** | 无不可定级条目 |
+| 合计 | 1565 | +64 | **1629** | 文件 1630 行（表头 + 1629 行） |
+
+新 64 条：`dead 15 / deferred 19 / na-arch 14 / na-hardware 11 / na-doc 3 / todo 2`。
+
+### 10.2 必须吸收（本轮 `todo`，缺口已定位到文件/行）
+
+| 提交 | 为什么必须吸收 | 建议落点 |
+|---|---|---|
+| `8e464812` `fix(grammar)` backport #1003/#942 | 修正两处语法缓存/ token 边界缺陷：① 字符预算路径下 `has_token_edges_` 只在 `has_char_budget_rules_` 时计算（`grammar_matcher.cc:508`），token 边存在但被漏判；② 字面量后紧跟 token 级自由文本区（如 `"\n\n"` 后 `any_tokens`）时，整 token 被拒（新增 `FindMidTokenExcludeEdgeRow`，回移边界）。**本地 9 个改动文件与提交前像逐字节相同**（`git hash-object` 对比 `8e464812^`：`grammar_matcher.cc c85497c1`、`earley_parser.h a3ef3e71`、`earley_parser.cc`、`grammar_impl.h a2045b40`、`grammar_compiler.cc 0acf00cf`、`grammar_functor.cc 661348c8`、`container.h`、`json_serializer.h`、`tests/test_grammar.cpp` 全 SAME），因此可原样打补丁 | `third_party/xgrammar/cpp/{grammar_matcher.cc,earley_parser.{h,cc},grammar_impl.h,grammar_compiler.cc,grammar_functor.cc,support/{container.h,json_serializer.h}}` + `tests/test_grammar.cpp` |
+| `4461c968` `fix(frontend)` 非法工具历史 | 历史里的 `tool_calls[].arguments` 目前**直接 `Json::parse`**（本地 `src/models/qwen3_5/frontend/chat_template.cpp:227-228`），坏 JSON 抛的是 nlohmann 异常而不是带 `messages[i].tool_calls[j]` 身份的 `invalid_argument`，落不到 400 `invalid_prompt`。上游把它做成共享解析（空参数保留为空对象、非对象拒绝、报告字节位置），并补 5 个坏例用例 | `src/models/qwen3_5/frontend/chat_template.{h,cpp}`（本地无 `models/common/frontend` 共享层，先落在 qwen 前端，等共享层建立再上提）+ `tests/models/qwen3_5/test_frontend.cpp` |
+
+### 10.3 建议吸收（`deferred` 里优先级最高的 7 组）
+
+| 提交 | 为什么 | 建议落点 | 解锁判据 |
+|---|---|---|---|
+| `54466d12` 并发执行容量 | 本地并发被硬钉在 **8**（`include/ninfer/types.h:23 kMaximumConcurrency = 8`，`src/runtime/engine/scheduler.h:27-29/48-49` 用它开数组，`model_instance.cpp:899` 校验上限）。上游删掉固定行上限，改为 C（驻留）/B（本轮成员）/P（物理行）/L（ADP 局部行）/W（阶段列）合同 + 共享 `models/common/batch`（新增 `batch.{h,cpp}`，桶 `1..8,10,12,14,16,20,…`），padding 语义写进新 `docs/designs/concurrency-contract.md`。**单卡 >8 并发是本地 serving 的直接上限**，但它一次改 651 文件（+14602/−5994） | 新增 `src/models/common/batch.{h,cpp}`；`types.h`、`scheduler.h`、`engine_core.h`、`src/models/qwen3_5/{program,session}/*` | 先有 `models/common` 层与 Work/Decision/Commit 分层；建议切片顺序：① batch 桶+padding 表 → ② 容量改配置校验 → ③ C>8 的 Graph 桶 |
+| `3b76b98c` 回收/保留代价记账 | 单卡显存压力下的核心决策（删 checkpoint / Host 保留 / capture / pause 用同一代价模型比较）。上游新增 `context_cache/recovery_cost.h`(636 行) + `recovery_value.h`(193) + `runtime/contract/recovery.h`(90) + `models/common/context/identity.h`(73)，+4516/−505 | `src/runtime/engine/context_cache/recovery_cost.h`、`resource_manager.h`、`src/models/qwen3_5/program/checkpoint*` | 现有单文件 `context_cache/resource_manager.h`（91 KB）先拆出 ReclaimSelection 与代价模型；否则无处安放 |
+| `e8059c32` 压力下保留当前输入 | 输入 checkpoint 被冷历史挤掉就退化为整段重算。上游加 `CaptureStorage{Automatic,Device,Host}`、`protected_points`、`replaces_input` 与专用 `less_rank`（`reclaim_selection.h`） | 同上；`src/models/qwen3_5/program/checkpoint_export.cpp` | 与 `3b76b98c` 同批（同一文件的同一决策点），不要单独 cherry-pick |
+| `77418cfe` 去除重复 prompt 工作与 prefill 分裂 | 本地**确有**该机制：`rewrite_execution_frontiers` 分布在 10 个文件（9 个源文件 + 1 个测试；`src/models/qwen3_5/frontend/processor.h:113/133`、`prepared_prompt.h:91`、`program/prefix_identity.*`、`program/prefill.cpp`、`planning/request_plan.cpp` 等），强制 prefill 在重写前沿分裂；上游整条删掉（69 文件，−867 行） | `src/models/qwen3_5/frontend/{processor,prepared_prompt,prompt_layout}.*`、`src/models/qwen3_5/program/prefix_identity.*` | 本地前端与 identity 结构对齐后再删；删前先量一次同会话交错 A/B（prefill 分块数） |
+| `13ebb92f` + `52e7cd7e` Jinja 生命周期/渲染开销 | 每条请求都渲染 chat template，Windows 单线程 CPU 上是真实成本。上游把异常 break/continue 换成 `loop_flow`、帧改成池化 `render_scopes`、`render()` 直写字符串，并修了捕获悬垂/迭代器关闭/`divisibleby` 零除与 INT64_MIN 取模。**本地已分叉**：`runtime.h:64` 用 `value_object` 环境、`capture_scope` 返回 `weak_ptr`（`:80`），`break_statement` 仍抛异常（`:262-279`），全树无 `scope_analysis`/`render_scopes` | `third_party/llama-jinja/jinja/{parser,runtime,value,string,json,unicode}.cpp`、`tests/text/test_jinja.cpp` | 按本地分叉重写（不能 `git show \| patch`）；先把上游新增的语义用例（宏捕获/loop 元数据/零除与 INT64_MIN 取模）在本地补齐再动结构 |
+| `0386059d` JSONL 饱和负载 | 本地并发压测的饱和夹具仍是 `long_decode_aime26_15`（`tools/bench/run_serve_concurrency.py:34`），上游换成结构化 JSONL 场景并扩容种子（`saturation_seeds`），更贴近 grammar 约束下的 decode 饱和 | `tools/bench/run_serve_concurrency.py` | 与 `54466d12` 同批改口径；否则点集与并发能力不匹配（本地 C≤8，上游无上限） |
+| `1fdb3716` 多模态前缀查找/恢复 | ① 视觉单元在部分重放时按整图计 `vision_items/vision_patches`；② 前缀短名单键不再要求 `can_checkpoint(f)`（分支可以落在 media 中间）。本地两个对象都缺：无 `src/models/glm5next`，也无 `src/models/qwen4_exp/session/`（qwen3_5 走自己的 `program/vision_control.cpp`，未触及） | qwen4_exp 运行时批次（T192–T198）内一并吸收 | qwen4_exp 工件与主路径数值缺陷关闭（同 §9 的 14 条 deferred） |
+
+### 10.4 特别判断的 13 条：本地现状 → 结论
+
+| 提交 | 本地现状（可核证据） | 结论 |
+|---|---|---|
+| `54466d12` | `types.h:23 = 8`；`scheduler.h:27-29`；无 `src/models/common` | 相关（卡吞吐上限），**deferred**；整包 651 文件不能当补丁 |
+| `3b76b98c` | 无 `context_cache/reclaim_selection.h`、`recovery_cost.h`；`resource_manager.h` 单文件 91 KB | 相关，**deferred**（先拆代价模型） |
+| `1fdb3716` | 无 `glm5next`、无 `qwen4_exp/session`；qwen3_5 有 `program/vision_control.*` 与 `prefix_identity.*` 但未被该提交触及 | **deferred**（qwen4_exp 批次） |
+| `77418cfe` | 本地保留 `rewrite_execution_frontiers`（10 文件，`processor.h:113`） | 相关，**deferred**（删机制需先对齐前端） |
+| `8e464812` | 9 个文件与 `8e464812^` 逐字节相同（`hash-object` 全 SAME） | 相关，**todo**（可直接打） |
+| `13ebb92f` | `runtime.h:80` weak 捕获、`:262` 异常 break；与 `13ebb92f^` 全 DIFF | 相关，**deferred**（重写非搬运） |
+| `52e7cd7e` | 无 `render_scopes`/帧池；`runtime.h` 仍是 `deque` 之外的旧分叉形态 | 相关，**deferred**（与上条同一改造） |
+| `4461c968` | `chat_template.cpp:227` 直接 `Json::parse`；无 `models/common/frontend` | 相关，**todo**（小改，落 qwen 前端） |
+| `e8059c32` | 无 `reclaim_selection.h`/`CaptureStorage`/`protected_points` | 相关，**deferred**（随 `3b76b98c`） |
+| `0d32c2a6` | 只改 `replay/rtx5090/record.cu`；本地 `gated_delta_net/` 只有 `chunked/` + 单层 `replay.cpp`（无 `record/` 子目录），全树 `rtx5090`/`dgx_spark` 目录各 **0** 个 | 不适用，**na-hardware**；`cp.async` 窗口预取思路可作 sm_89 参考，本轮不排期 |
+| `51e30a8c` | `WarpAddresses` 的 `static_assert` 要求 `Fp8E4m3fnGroup128Ue8m0`；本地 QSA 白名单无该格式（`qsa/storage.h:17-25`），`sparse_gqa_tile.cuh:32-40/74-93` 仍走共享内存地址数组 | 不适用，**na-hardware** |
+| `d01e04ba` | 上游四头 = 27B-5090 设计（`docs/designs/qwen4-27b-rtx5090.md:41` "24 query / 4 KV"）；本地产物 `num_key_value_heads=2`（`R:\model\qwen3_8_flash_next_v5\*conversion.json`），`qsa/sparse_gqa.cpp:23` 只收 (24,2)/(12,1) | 不适用，**na-hardware**；其中的 compact/merge 长序列内核若要在 24/2 上要收益，需单独立项评估 |
+| `0386059d` | `run_serve_concurrency.py:34` 仍是 `long_decode_aime26_15`；语料侧已有 `scenario_structured_jsonl`（`run_serve_corpus.py:79`） | 相关，**deferred**（与并发容量同批） |
+
+### 10.5 `deferred` 19 条的挂起条件分组
+
+判据不出现就不开工；同一组按批推进，不逐条 cherry-pick。
+
+| 组 | 条数 | 提交 | 共同解锁判据 |
+|---|---|---|---|
+| 并发容量 | 2 | `54466d12`、`0386059d` | `models/common/batch` + C/B/P/L/W 合同落地 |
+| 上下文记账 | 3 | `3b76b98c`、`e8059c32`、`1fdb3716` | `resource_manager.h` 拆出 ReclaimSelection/代价模型；qwen4_exp 批次开工 |
+| 前端/文本 | 3 | `13ebb92f`、`52e7cd7e`、`77418cfe` | 本地 Jinja 分叉重写完成 + 前端 identity 对齐 |
+| draft/采样算子 | 8 | `2366b2a2`、`b5008303`、`6a753af3`、`ad49b325`、`31198bbd`、`dc4e789b`、`8c713a83`、`bf74f1cf` | 本地 draft 切到上游 dflash2 形态（bf16 finish / H4096 prepare / gathered 候选） |
+| 滑窗几何 | 1 | `9be36f5d` | draft 改用 16q/4kv（本地现为 32q/8kv，`sliding_window_attention.cpp:17`） |
+| 运行时/bench | 2 | `41da21f4`、`9eff5314` | 本地 `engine_core.h` 单体拆分 + bench 结构与上游 `bench/inference/options.cpp` 对齐 |
+
+### 10.6 定级存疑/混合提交
+
+`needs-review` 仍为 **0**：64 条都命中 §7.2 规则。但有 3 条是**混合提交**，按规则表先命中 `na-hardware`，
+其中夹着一段对本地可能有用的共享改动，已在台账 note 里点名，合并时不要整包丢弃：
+
+1. `f918cbdf`：除 5090 FP8 形状外，放宽了 row-scaled FP8 的 partial 父视图（上游 `weight_view.cpp:495` 删除
+   "requires a complete parent"）；本地 `src/core/weight_view.cpp:315-319` **仍拒绝** partial RowScale/BlockScale 父视图。
+2. `d01e04ba`：四头几何外，`compact.cuh`/`merge.cuh` 是通用的长序列 split 合并内核。
+3. `0d32c2a6`：5090 变体外，`RecordWindow` + `cp_async` 的"取状态时顺带取记录输入"是通用写法（sm_89 支持 `cp.async`）。
+
+### 10.7 下一次 fetch 之后的流程
+
+1. `git fetch upstream` → `git log --format="%h%x09%ad%x09%s" --date=short <pinned>..upstream/master` 取全量；
+   **目标冻结在"最近一次已核对且含需吸收项"的提交，不追 HEAD**（§3 的启动条件）。
+2. 逐条 `git show --stat`；触及 runtime/context/frontend/grammar/bench 的必须看实质 diff，不按标题定级。
+   涉及第三方树的，先 `git hash-object` 对比前像，逐字节相同才允许写"可直接打补丁"。
+3. 按 §7.2 规则表定级；新类别先补 §7.1 判据再落行。`todo` 只用于"必须本批吸收且缺口已定位"，
+   其余一律 `deferred` + 解锁判据。
+4. 新行插在表头之后、保持上游日志新→旧、每行 6 列、note ≤200 字符、不改旧行。
+5. 跑 `tools/upstream/alignment_report.ps1`：`NO ROW` 必须为空、退出码回 0；
+   本轮未跑（只改文档），预期输出应等于 §10.1 的七类计数。
+6. 复跑 `docs/maintainer/upstream-dispositions.tsv` 的自制校验（行数、6 列、无重复、note 长度、
+   新旧行字节不变）——本轮结果见 10.8。
+7. 收口：把本轮 `todo` 的落点并进 v10/v10.1 立项，或按 §9.4 的先例降级为 `deferred` 并写判据。
+
+### 10.8 本轮校验结果
+
+```
+file   : docs/maintainer/upstream-dispositions.tsv
+lines  : 1630  (header + 1629 rows) = 1566 + 64  ✅
+cols   : 每行 6 列，tab 分隔，UTF-8 无 BOM，LF 换行  ✅
+dup    : 0（1629 个 commit 唯一）  ✅
+order  : 前 64 行 = `git log 77c2e5e2..454b922f` 逐行同序  ✅
+old    : 既有 1565 行与 HEAD 版本逐字节相同  ✅
+class  : dead 170 / absorbed 1313 / na-arch 76 / na-hardware 13 / na-doc 12 / deferred 42 / todo 3
+```
+

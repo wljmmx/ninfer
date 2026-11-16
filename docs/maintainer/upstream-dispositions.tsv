@@ -1,4 +1,68 @@
 commit	date	subject	class	evidence	note
+454b922f	2026-11-16	docs: publish Flash Next Spark performance	na-doc	upstream-alignment#9.3	上游性能文档(Flash Next/Spark)；本地对应 docs/maintainer/linear-benchmark.md
+0386059d	2026-11-16	feat(bench): use JSONL decode saturation workloads	deferred	local:tools/bench/run_serve_concurrency.py:34	本地仍用 long_decode_aime26_15；解锁=与 54466d12 并发口径同批改
+a107b983	2026-11-15	perf(moe): optimize Spark block-scaled execution	dead	v9-closeout-register#T214:T001	dgx_spark block_scaled 全套；Spark 已判死
+d9ad9dea	2026-11-14	docs: consolidate architecture and usage guides	na-doc	upstream-alignment#9.3	上游 docs 合并改名(concurrency-contract→maintainer/concurrent-execution)
+54466d12	2026-11-14	feat(runtime): expand concurrent execution capacity	deferred	local:include/ninfer/types.h:23	本地 kMaximumConcurrency=8；C/B/P/L/W 合同与 models/common/batch 缺口；解锁=先落 models/common/batch
+bea6de86	2026-11-13	test(gdn): verify NVFP4 A16 state and benchmark contracts	na-arch	upstream-alignment#2:perf(moe)	NVFP4 A16 状态契约测试；sm_89 无 FP4 张量核
+b9907b64	2026-11-13	test(linear): cover NVFP4 A16 prefill contracts	na-arch	upstream-alignment#2:perf(linear)	NVFP4 A16 prefill 用例
+7b87d895	2026-11-13	feat(linear): extend 28672-row NVFP4 A16 SwiGLU	na-arch	upstream-alignment#2:perf(linear)	NVFP4 A16 28672 行 SwiGLU
+9dd11157	2026-11-13	feat(linear): extend 34816-row NVFP4 A16 SwiGLU	na-arch	upstream-alignment#2:perf(linear)	NVFP4 A16 34816 行 SwiGLU
+8e464812	2026-11-12	fix(grammar): backport cache and token boundary fixes	todo	local:third_party/xgrammar/cpp/grammar_matcher.cc:508	本地 9 文件与提交前像逐字节相同，可直接打 backport(#1003/#942)
+bc72f853	2026-11-12	perf(linear): overlap NVFP4 activation quantization	na-arch	upstream-alignment#2:perf(linear)	NVFP4 A4 激活量化重叠
+ca2c80da	2026-11-12	perf(linear): specialize Q4 draft head geometry	na-hardware	upstream-alignment#6.1	rtx5090 q4 n248320_k5120；本地 q4 无该形状(有 q8/q6)
+dc2a56fb	2026-11-12	perf(linear): reduce NVFP4 decode staging overhead	na-arch	upstream-alignment#2:perf(linear)	NVFP4 decode staging
+b31539c3	2026-11-12	perf(hc): overlap small-token mix stages	na-arch	upstream-alignment#2:perf(hc)	本地 gated_residual 无 fp8 路径
+0d32c2a6	2026-11-12	perf(gdn): prefetch ReplaySSM record inputs	na-hardware	upstream-alignment#6.1	仅 replay/rtx5090/record.cu；本地无 rtx5090 变体目录
+83fad460	2026-11-12	perf(linear): tune RTX 5090 FP8 vocabulary projection	na-hardware	upstream-alignment#6.1	5090 FP8 词表投影形状
+3fb2bd62	2026-11-12	perf(gdn): tune RTX 5090 control projection tiles	na-hardware	upstream-alignment#6.1	5090 GDN control 投影 tile
+d076a505	2026-11-12	perf(hc): pipeline small-token FP8 mix kernels	na-arch	upstream-alignment#2:perf(hc)	fp8 mix 小 token 流水
+47bfd71a	2026-11-12	perf(ops): improve qwen4 dense decode kernels	na-arch	upstream-alignment#2:perf(ops)	gated_residual fp8 + replay record；本地无 fp8 mix
+3b76b98c	2026-11-12	fix(context): unify reclamation and retention cost accounting	deferred	local:src/runtime/engine/context_cache/resource_manager.h	本地无 reclaim_selection/recovery_cost，记账仍是单文件；解锁=先拆代价模型
+1fdb3716	2026-11-11	fix(context): correct multimodal prefix lookup and recovery work	deferred	v9-qwen4exp-register#T192-T198	glm5next(binding,已判死)+qwen4_exp/session；本地缺该目录；解锁=qwen4_exp 运行时立项
+51e30a8c	2026-11-11	perf(qsa): keep decode tile addresses in warp registers	na-hardware	local:src/ops/softmax_attention/qsa/storage.h:17	WarpAddresses 要求 FP8-group128/E8M0，本地无该缓存格式
+0ae2e301	2026-11-11	perf(linear): tune RTX 5090 NVFP4 FFN decode tiles	na-arch	upstream-alignment#2:perf(linear)	5090 NVFP4 FFN decode tile
+8c1e0c00	2026-11-11	perf(hc): accelerate small-column FP8 residual mixing	na-arch	upstream-alignment#2:perf(hc)	fp8 小列 residual mixing
+d01e04ba	2026-11-11	feat(qsa): add and tune four-head sparse GQA for current KV formats	na-hardware	local:src/ops/softmax_attention/qsa/sparse_gqa.cpp:23	4 KV 头=27B-5090 设计；本地工件 24/2，白名单仅(24,2)/(12,1)
+676e119c	2026-11-11	feat(qsa): add RTX 5090 four-head cache preparation	na-hardware	upstream-alignment#6.1	5090 四头 cache 制备
+016b93ba	2026-11-11	perf(rmsnorm): specialize RTX 5090 whole-vector 20480 reduction	na-hardware	upstream-alignment#6.1	5090 20480 整向量 rmsnorm
+3b7229da	2026-11-11	feat(gated-residual): add RTX 5090 H5120 and FP8 mixing	na-hardware	upstream-alignment#6.1	5090 H5120 mix/FP8 + norm_combine 形状
+31a338eb	2026-11-11	feat(linear): add RTX 5090 Q4 full-vocabulary projection	na-hardware	upstream-alignment#6.1	5090 q4 全词表；本地 LM head 缺口是 q5 n248320
+f918cbdf	2026-11-11	feat(linear): add RTX 5090 FP8 projections and shared row views	na-hardware	local:src/core/weight_view.cpp:315	含共享放宽(partial RowScale 父视图)；本地仍拒绝，需单独提取
+2ebf2937	2026-11-11	feat(linear): add tuned RTX 5090 NVFP4 dense FFN shapes	na-arch	upstream-alignment#2:perf(linear)	5090 NVFP4 dense FFN 形状
+13ebb92f	2026-11-11	fix(text): correct Jinja capture lifetimes and iteration	deferred	local:third_party/llama-jinja/jinja/runtime.h:262	本地 llama-jinja 已分叉(value_object 环境/异常 break)，需重写非搬运；解锁=按本地分叉重写 Jinja 帧
+4461c968	2026-11-10	fix(frontend): reject malformed tool history as invalid input	todo	local:src/models/qwen3_5/frontend/chat_template.cpp:227	本地直接 Json::parse，缺 400 行号上下文；落点 qwen3_5 frontend
+e8059c32	2026-11-10	fix(cache): preserve current input recovery under pressure	deferred	local:src/runtime/engine/context_cache/reclaim_selection.h	本地无该文件与 CaptureStorage；随 3b76b98c 同批；解锁=同 3b76b98c
+52e7cd7e	2026-11-10	perf(text): reduce Jinja rendering overhead	deferred	local:third_party/llama-jinja/jinja/runtime.h:80	帧池/渲染直写未落地；与 13ebb92f 同一改造；解锁=同 13ebb92f
+77418cfe	2026-11-10	fix(inference): eliminate redundant prompt work and prefill splits	deferred	local:src/models/qwen3_5/frontend/processor.h:113	本地仍保留 rewrite_execution_frontiers(10 文件)，但前端结构不同；解锁=前端/identity 对齐
+92835052	2026-11-09	feat(glm5next): integrate dflash2 execution	dead	v9-closeout-register#T214:T001	glm5next dflash2 执行；GLM 已判死
+18601ff1	2026-11-09	style(ops): normalize imported dflash2 code formatting	dead	v9-closeout-register#T214:T001	dflash2 导入代码格式整理(dgx_spark)
+bf74f1cf	2026-11-09	test(ops): cover sparse gathered selector paths	deferred	upstream-alignment#9.3	解锁=随 dc4e789b/8c713a83 落地
+63de5419	2026-11-09	test(ops): cover glm drafter helper workloads	dead	v9-closeout-register#T214:T001	glm drafter 辅助负载
+0f986892	2026-11-09	feat(ops): capture post-bf16 means in mhc post pre	na-arch	upstream-alignment#2:perf(mhc)	mhc post-pre 均值；本地无 mhc
+8c713a83	2026-11-09	feat(ops): accept gathered vocabulary with sparse proposals	deferred	local:src/ops/candidate_selector	本地无 sampling/ 目录与 sparse proposal 词表入口；解锁=draft 切 dflash2 gathered 形态
+dc4e789b	2026-11-09	feat(ops): merge gathered candidates in selector paths	deferred	local:src/ops/candidate_selector	本地 candidate_selector 无 gathered 合并路径；解锁=同上
+9be36f5d	2026-11-09	feat(ops): extend sliding attention head geometry	deferred	local:src/ops/softmax_attention/sliding_window/sliding_window_attention.cpp:17	本地仅 32q/8kv；16q/4kv(w2048) 未注册；解锁=draft 改 16q/4kv
+6a753af3	2026-11-09	feat(ops): materialize bf16 draft context kv prefixes	deferred	local:src/ops/context_kv_materialize/context_kv_materialize.cpp:49	本地只收量化权重(scale FP16/g32)，无 bf16 物化；解锁=draft 切 bf16 投影
+31198bbd	2026-11-09	feat(ops): fuse gathered feature layout and rmsnorm	deferred	local:src/ops/normalization	本地无 rmsnorm_gathered_features 融合入口；解锁=draft 切 dflash2 形态
+ad49b325	2026-11-09	feat(ops): extend fused draft normalization profiles	deferred	local:src/ops/rmsnorm_rope	本地 draft 归一化无这些 profile；解锁=draft 切 bf16 finish
+4d5e1659	2026-11-09	perf(ops): tune Spark DFlash2 projection workloads	dead	v9-closeout-register#T214:T001	Spark DFlash2 投影调优
+4ac06e5a	2026-11-09	feat(ops): add Spark vocabulary shard top-k keys	dead	v9-closeout-register#T214:T001	Spark 词表分片 top-k keys
+2366b2a2	2026-11-09	feat(ops): fuse BF16 dynamic finish without residual	deferred	local:src/models/qwen3_5/execution/draft.cpp:545	本地只有 prepare+q8 add，无 bf16 finish；解锁=draft 切 bf16 finish
+b5008303	2026-11-09	feat(ops): extend dynamic prepare to H4096 with fused input convolution	deferred	local:src/ops/dynamic_grouped_conv	本地 prepare 为 two-pass，无 H4096 融合输入卷积；解锁=draft 切 dflash2 形态
+983461e9	2026-11-09	feat(ops): add Spark DFlash2 split and SwiGLU projections	dead	v9-closeout-register#T214:T001	Spark DFlash2 split/SwiGLU
+12d5b72a	2026-11-09	perf(ops): refine Spark DFlash2 BF16 projection tiles	dead	v9-closeout-register#T214:T001	Spark BF16 投影 tile
+e871c41b	2026-11-09	feat(ops): add Spark BF16 DFlash2 projections	dead	v9-closeout-register#T214:T001	Spark BF16 DFlash2 投影
+d5d53595	2026-11-09	feat(glm5next): add dflash2 weight conversion and loading	dead	v9-closeout-register#T214:T001	dflash2 转换/加载；dflash 抽到 models/common(本地无该层)
+41da21f4	2026-11-09	fix(runtime): unblock prefill capture under context fragmentation	deferred	local:src/runtime/engine/engine_core.h	本地 engine 单体、无 models/common/context 目录层；解锁=engine 层拆分后
+9eff5314	2026-11-08	fix(bench): warm all decode inputs before measurement	deferred	local:bench/inference/ninfer_bench_support.cpp:639	本地无 C-1 逐行预热；bench 结构与上游不同；解锁=bench 结构对齐
+d6c26471	2026-11-08	feat(distributed): enable automatic native communication	dead	v9-closeout-register#T214:T001	多 rank 自动通信
+fff36c40	2026-11-08	perf(distributed): expand native communication coverage	dead	v9-closeout-register#T214:T001	原生通信覆盖扩展
+a1df8b38	2026-11-08	feat(distributed): add native Spark collectives	dead	v9-closeout-register#T214:T001	Spark 集合通信
+23d6de50	2026-11-08	refactor(distributed): separate communication backends	dead	v9-closeout-register#T214:T001	通信后端拆分(多 rank)
+9d06bec9	2026-11-07	fix(moe): synchronize native FP4 pipeline handoffs	na-arch	upstream-alignment#2:perf(moe)	原生 FP4 流水 handoff 同步
+5fb5529f	2026-11-07	perf(ops): optimize Spark decode projections and sparse MLA	dead	v9-closeout-register#T214:T001	Spark decode 投影 + sparse MLA
+68a02c25	2026-11-07	docs: remove completed fp4-local op checklist	na-doc	upstream-alignment#9.3	上游删除已完成 fp4-local 清单 docs
 77c2e5e2	2026-11-07	fix(runtime): recover preempted requests without stalling	todo	upstream-alignment#3	v10 target: preemption recovery + shutdown order + telemetry
 62674bae	2026-11-07	style(ops): format merged native projection coverage	na-arch	upstream-alignment#2:style(ops)	formatting only, nothing to align
 361dbbd1	2026-11-06	perf(rmsnorm): specialize Spark plain normalization widths	na-arch	upstream-alignment#2:perf(rmsnorm)	SM100-only (upstream-alignment#2 row perf(rmsnorm))
