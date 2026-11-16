@@ -1568,13 +1568,25 @@ void ExpertStream::stage_predicted(cudaStream_t stream) {
     // One line for the first few calls, whatever the reason: "no placement happened" and "the region
     // is off" look identical in the counters, and that ambiguity already cost a measurement round.
     static std::uint64_t calls = 0;
+    // Entry trace, deliberately NOT gated on the bank: the per-call trace below only speaks for the
+    // first four banks, so "every bank says nothing" and "stage_predicted is never called" read the
+    // same. This line answers the second question first, with the bank that asked.
+    static std::uint64_t entries = 0;
+    if (std::getenv("NINFER_EXPERT_TIMING") != nullptr && ++entries <= 8) {
+        std::fprintf(stderr,
+                     "[pfv] enter #%llu bank=%u vram=%d cache=%d predicted=%zu device=%d region=%u\n",
+                     (unsigned long long)entries, bank_, vram ? 1 : 0, cache_ != nullptr ? 1 : 0,
+                     predicted_.size(), int(predicted_is_device()),
+                     cache_ != nullptr ? cache_->prefetch_slots_per_bank() : 0U);
+        std::fflush(stderr);
+    }
     const bool trace =
         bank_ < 4 && std::getenv("NINFER_EXPERT_TIMING") != nullptr && ++calls <= 6;
     const auto say = [&](const char* why) {
         if (!trace) { return; }
         std::fprintf(stderr,
-                     "[pfv] skip bank=0: %s (vram=%d cache=%d predicted=%zu device=%d region=%u)\n",
-                     why, vram ? 1 : 0, cache_ != nullptr ? 1 : 0, predicted_.size(),
+                     "[pfv] skip bank=%u: %s (vram=%d cache=%d predicted=%zu device=%d region=%u)\n",
+                     bank_, why, vram ? 1 : 0, cache_ != nullptr ? 1 : 0, predicted_.size(),
                      int(predicted_is_device()),
                      cache_ != nullptr ? cache_->prefetch_slots_per_bank() : 0U);
         std::fflush(stderr);
