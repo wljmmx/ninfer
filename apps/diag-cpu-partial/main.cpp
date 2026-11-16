@@ -1,25 +1,36 @@
 // port (sm_89), engine-integration P3 Phase E: repository-level CPU-partial verification
 // harness for the KV-partition seam (int8/host_partial.h + ops/softmax_attention/cpu/partial.h).
 //
+// Family axis (P5.2): every loop below runs over the five rk families the CPU partial covers
+// (rk4v4 / rk8v4 / rk4v4-e8 / rk2v4-e8 / rk4v2-e8). The family identity is host_partial.h's
+// single mapping (rk_host_kv_codecs / rk_host_kv_dtype_of); the fixture only supplies the
+// KvCacheStorage whose append writer produces that family's planes, and every plane extent and
+// dtype is read back from core/paged_kv_storage.h instead of being restated here.
+//
 // Two modes:
-//   partial (default) - builds random and deterministic rk4v4 / rk8v4 paged caches (the engine
-//     append op writes the packed planes, exactly like the causal-cache test fixture), runs the
-//     PRODUCTION grouped instance through ops::causal_softmax_attention_cached, reads the call's
-//     per-split partial buffers back from its own workspace arena, and compares them with the
-//     CPU partial (partial.h) split by split, head by head, column by column. It then merges
-//     the GPU partials and the CPU partials with partial.h's host merge mirror and checks both
-//     against the production bf16 output.
+//   partial (default) - builds one random and one deterministic paged cache per rk family (the
+//     engine append op writes the packed planes, exactly like the causal-cache test fixture),
+//     runs the PRODUCTION grouped instance through ops::causal_softmax_attention_cached, reads
+//     the call's per-split partial buffers back from its own workspace arena, and compares them
+//     with the CPU partial (partial.h) split by split, head by head, column by column. It then
+//     merges the GPU partials and the CPU partials with partial.h's host merge mirror and checks
+//     both against the production bf16 output.
 //   ab - long-workload A/B THROUGH THE SEAM: a filled prefix (868 and 2048 tokens) plus 512
 //     production-shaped decode steps (the fused append+attention entry), each run twice with
 //     identical inputs - once all-GPU (no host view installed) and once with
 //     NINFER_KV_CPU_PARTITION forcing one split's partial through the CPU leg - and the merged
-//     bf16 outputs compared element by element.
+//     bf16 outputs compared element by element. Both modes end with a per-family table, so a
+//     family the seam cannot serve shows up as a row (and as the criterion that blocked it),
+//     never as a silently skipped case.
 //
 // Bars (stated once, enforced per element):
 //   acc     |cpu-gpu| <= max(1e-5*|gpu|, 1e-6*acc_scale, 2^-10*v_bound)
 //           (the relative channel, the ulp-noise channel for cancelled elements, and the
 //            single-FP16-quantum channel of one key's contribution - the Phase B "1e-5 relative
-//            or one 2^-11 quantum" rule with the ulp padded across the binade)
+//            or one 2^-11 quantum" rule with the ulp padded across the binade). v_bound is
+//            max|V code| * max|V scale| over the pages the window actually wrote, and the code
+//            range comes from the family's V codec (int4 clamps at 7; the rk4v2-e8 E8-cylinder
+//            V can decode past 7, so it is measured, not assumed).
 //   maximum |cpu-gpu| <= max(1e-5*|gpu|, 1e-6*scale)  (scores are integer-exact per group; the
 //           expected diff is zero, so this channel also catches real drift)
 //   sum     |cpu-gpu| <= max(1e-5*|gpu|, 1e-6*scale)
@@ -31,6 +42,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/dtype.h"
+#include "core/paged_kv_storage.h"
 #include "core/tensor.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/softmax_attention.h"
@@ -119,18 +131,45 @@ constexpr Geometry kGeometries[] = {
 
 enum class FixtureKind { Random, Deterministic };
 
+// --- family axis (FIXTURE, NOT POLICY) ---------------------------------------------------------
+// Which KvCacheStorage the engine's append op has to write for a family's pages to exist. The
+// family identity itself is host_partial.h's rk_host_kv_codecs / rk_host_kv_dtype_of and is not
+// restated here; this table only binds a family to a writer. Plane extents and dtypes are read
+// back from paged_kv_storage_layout(storage, kHeadDim) - no carrier size is spelled in this file.
+struct FamilyFixture {
+    seam::RkHostKvDType dtype;
+    KvCacheStorage storage;
+};
+
+constexpr FamilyFixture kFamilyFixtures[] = {
+    {seam::RkHostKvDType::Rk4v4, KvCacheStorage::RotatedInt4KeyInt4ValueGroup64},
+    {seam::RkHostKvDType::Rk8v4, KvCacheStorage::RotatedInt8KeyInt4ValueGroup64},
+    {seam::RkHostKvDType::Rk4v4E8, KvCacheStorage::RK4V4E8},
+    {seam::RkHostKvDType::Rk2v4E8, KvCacheStorage::RK2V4E8},
+    {seam::RkHostKvDType::Rk4v2E8, KvCacheStorage::RK4V2E8},
+};
+constexpr int kFamilyCount =
+    static_cast<int>(sizeof(kFamilyFixtures) / sizeof(kFamilyFixtures[0]));
+static_assert(kFamilyCount == 5, "the CPU partial covers five rk families");
+
+[[nodiscard]] const char* family_name(seam::RkHostKvDType dtype) {
+    return seam::rk_host_kv_codecs(dtype).name;
+}
+
 // --- the device fixture ------------------------------------------------------------------------
 
 struct Fixture {
     Geometry geometry{};
     seam::RkHostKvDType dtype{};
     KvCacheStorage storage{};
+    PagedKVStorageLayout layout{};  // paged_kv_storage.h: the only source of plane extents/dtypes
     int window         = 0;  // populated context tokens
     int width          = 0;  // query tile
     int envelope_min   = 0;
     int envelope_max   = 0;  // envelope.max_visible_keys used by every call
     int logical_pages  = 0;
     int physical_pages = 0;
+    int populated_pages = 0;
     std::vector<std::int32_t> table_host{};
 
     DeviceBuffer k_pages{};
@@ -151,21 +190,21 @@ struct Fixture {
     std::vector<std::uint16_t> q_bits{};
     std::vector<std::int32_t> positions{};
 
-    [[nodiscard]] int key_extent() const {
-        return dtype == seam::RkHostKvDType::Rk4v4 ? kHeadDim / 2 : kHeadDim;
-    }
+    [[nodiscard]] int key_extent() const { return layout.key.data_leading_extent; }
+    [[nodiscard]] int value_extent() const { return layout.value.data_leading_extent; }
 
     [[nodiscard]] PagedKVLayerView view() const {
         PagedKVLayerView result;
-        const DType key_code = dtype == seam::RkHostKvDType::Rk4v4 ? DType::U8 : DType::I8;
-        result.k_pages = Tensor(k_pages.p, key_code,
+        result.k_pages = Tensor(k_pages.p, layout.key.data_dtype,
                                 {key_extent(), kPageSize, geometry.kv_heads, physical_pages});
-        result.v_pages = Tensor(v_pages.p, DType::U8,
-                                {kHeadDim / 2, kPageSize, geometry.kv_heads, physical_pages});
-        result.k_scale_pages =
-            Tensor(k_scales.p, DType::FP16, {4, kPageSize, geometry.kv_heads, physical_pages});
-        result.v_scale_pages =
-            Tensor(v_scales.p, DType::FP16, {4, kPageSize, geometry.kv_heads, physical_pages});
+        result.v_pages = Tensor(v_pages.p, layout.value.data_dtype,
+                                {value_extent(), kPageSize, geometry.kv_heads, physical_pages});
+        result.k_scale_pages = Tensor(k_scales.p, DType::FP16,
+                                      {layout.key.scale_leading_extent, kPageSize,
+                                       geometry.kv_heads, physical_pages});
+        result.v_scale_pages = Tensor(v_scales.p, DType::FP16,
+                                      {layout.value.scale_leading_extent, kPageSize,
+                                       geometry.kv_heads, physical_pages});
         result.block_table  = Tensor(table.p, DType::I32, {logical_pages});
         result.head_dim     = kHeadDim;
         result.num_kv_heads = geometry.kv_heads;
@@ -207,22 +246,24 @@ std::size_t plane_bytes(int extent, int kv_heads, int physical_pages) {
 
 // Builds a paged cache filled by the ENGINE append op (the harness owns no codec), with a
 // fragmented block table (logical page -> 2*page+1) and evicted logical pages marked absent in
-// the device table, exactly like the causal-cache test fixture does.
-Fixture build_fixture(Geometry geometry, seam::RkHostKvDType dtype, int window, int width,
+// the device table, exactly like the causal-cache test fixture does. `family` selects the writer;
+// everything about the planes follows from paged_kv_storage_layout, so one body serves all five
+// rk families.
+Fixture build_fixture(Geometry geometry, const FamilyFixture& family, int window, int width,
                       int envelope_min, int envelope_max, FixtureKind kind, std::uint64_t seed,
                       std::span<const int> absent_pages) {
     Fixture f;
     f.geometry      = geometry;
-    f.dtype         = dtype;
-    f.storage       = dtype == seam::RkHostKvDType::Rk4v4
-                          ? KvCacheStorage::RotatedInt4KeyInt4ValueGroup64
-                          : KvCacheStorage::RotatedInt8KeyInt4ValueGroup64;
+    f.dtype         = family.dtype;
+    f.storage       = family.storage;
+    f.layout        = paged_kv_storage_layout(f.storage, kHeadDim);
     f.window        = window;
     f.width         = width;
     f.envelope_min  = envelope_min;
     f.envelope_max  = envelope_max;
     f.logical_pages  = (std::max(std::max(window, envelope_max), width) + kPageSize - 1) / kPageSize;
     const int populated = (window + kPageSize - 1) / kPageSize;
+    f.populated_pages   = populated;
     // Every logical page up to the envelope is mapped to its own physical page: the decode
     // steps of ab mode append into the tail pages, and the append op's caller contract
     // requires a materialized table entry for every appended position (an unmapped -1 entry
@@ -260,11 +301,13 @@ Fixture build_fixture(Geometry geometry, seam::RkHostKvDType dtype, int window, 
         }
     }
 
-    f.k_pages  = DeviceBuffer(plane_bytes(f.key_extent(), geometry.kv_heads, f.physical_pages));
-    f.v_pages  = DeviceBuffer(plane_bytes(kHeadDim / 2, geometry.kv_heads, f.physical_pages));
+    f.k_pages = DeviceBuffer(plane_bytes(f.key_extent(), geometry.kv_heads, f.physical_pages));
+    f.v_pages = DeviceBuffer(plane_bytes(f.value_extent(), geometry.kv_heads, f.physical_pages));
     // scale planes are FP16: plane_bytes counts elements, the buffer wants bytes
-    f.k_scales = DeviceBuffer(plane_bytes(4, geometry.kv_heads, f.physical_pages) * 2);
-    f.v_scales = DeviceBuffer(plane_bytes(4, geometry.kv_heads, f.physical_pages) * 2);
+    f.k_scales = DeviceBuffer(
+        plane_bytes(f.layout.key.scale_leading_extent, geometry.kv_heads, f.physical_pages) * 2);
+    f.v_scales = DeviceBuffer(
+        plane_bytes(f.layout.value.scale_leading_extent, geometry.kv_heads, f.physical_pages) * 2);
     f.table    = DeviceBuffer(f.table_host.size() * sizeof(std::int32_t));
     f.table_row = DeviceBuffer(sizeof(std::int32_t));
     const std::int32_t row_value = 0;
@@ -333,27 +376,58 @@ void set_query_tile(Fixture& f, std::vector<std::uint16_t> q_bits,
     return static_cast<std::size_t>(kHeadDim) * f.geometry.q_heads * f.width;
 }
 
-// |v16| upper bound over the PRESENT pages only: |fp16(code*vs)| <= 7*max|vs| with one fp16
-// rounding pad. Unpopulated/absent pages keep uninitialized bytes neither side ever reads.
-double v_plane_bound(const Fixture& f) {
-    double max_scale = 0.0;
+// The largest |int8 code| the V codec can decode to (FIXTURE bound only, not a policy). Int4 V
+// is clamped to [-7, 7] by the append writer; the E8-cylinder V of rk4v2-e8 is a per-root sphere
+// decode whose codes are not clamped, so its range is measured over every reachable
+// (root, rad_axis) byte pair with the same CPU substrate the partial uses.
+[[nodiscard]] int max_v_code(softmax_cpu::RkVCodec codec) {
+    if (codec == softmax_cpu::RkVCodec::Int4) { return 7; }
+    static const int measured = [] {
+        int best = 0;
+        for (int root = 0; root < 256; ++root) {
+            for (int rad = 0; rad < 256; ++rad) {
+                std::int8_t codes[8];
+                softmax_cpu::e8_root_decode_8d_v(static_cast<std::uint8_t>(root),
+                                                 static_cast<std::uint8_t>(rad), codes);
+                for (int i = 0; i < 8; ++i) { best = std::max(best, std::abs(int(codes[i]))); }
+            }
+        }
+        return best;
+    }();
+    return measured;
+}
+
+// |v16| upper bound over the (page, tip) entries the call window actually wrote:
+// |fp16(code*vs)| <= max|code| * max|vs| with one fp16 rounding pad. The scale plane is read
+// back from the device because ab mode's decode steps append real rows into pages the fixture
+// built empty; entries past the window (and absent pages) keep bytes neither leg reads. The code
+// range follows the family's V codec (see max_v_code) instead of assuming int4.
+double v_plane_bound(const Fixture& f, int window) {
+    std::vector<std::uint16_t> scales(f.v_scales_host.size());
+    f.v_scales.copy_to_host(scales.data(), scales.size() * 2);
     const int kv_heads = f.geometry.kv_heads;
-    for (const std::int32_t entry : f.table_host) {
+    const int groups   = f.layout.value.scale_leading_extent;
+    const int pages    = (window + kPageSize - 1) / kPageSize;
+    double max_scale   = 0.0;
+    for (int page = 0; page < pages && page < f.logical_pages; ++page) {
+        const std::int32_t entry = f.table_host[static_cast<std::size_t>(page)];
         if (entry < 0) { continue; }
+        const int filled = std::min(kPageSize, window - page * kPageSize);
         for (int head = 0; head < kv_heads; ++head) {
-            for (int tip = 0; tip < kPageSize; ++tip) {
-                for (int g = 0; g < 4; ++g) {
+            for (int tip = 0; tip < filled; ++tip) {
+                for (int g = 0; g < groups; ++g) {
                     const std::int64_t index =
-                        softmax_cpu::plane_offset(4, kv_heads, entry, head, tip, g);
-                    max_scale = std::max(max_scale, std::abs(static_cast<double>(softmax_cpu::
-                                                    fp16_bits_to_f32(
-                                                        f.v_scales_host[static_cast<std::size_t>(
-                                                            index)]))));
+                        softmax_cpu::plane_offset(groups, kv_heads, entry, head, tip, g);
+                    max_scale = std::max(max_scale, std::abs(static_cast<double>(
+                                                           softmax_cpu::fp16_bits_to_f32(
+                                                               scales[static_cast<std::size_t>(
+                                                                   index)]))));
                 }
             }
         }
     }
-    return 7.0 * max_scale * (1.0 + kQuantumPad);
+    return static_cast<double>(max_v_code(seam::rk_host_kv_codecs(f.dtype).v)) * max_scale *
+           (1.0 + kQuantumPad);
 }
 
 // --- comparison helpers ------------------------------------------------------------------------
@@ -362,6 +436,7 @@ struct PartialCheck {
     long elements     = 0;
     long failures     = 0;
     long quantum_hits = 0;  // passed only through the fp16-quantum channel
+    long rel_over     = 0;  // |d| above the 1e-5 relative channel (quantum-only or failing)
     double max_rel    = 0.0;  // max rel over elements with |gpu| >= 1% of the array scale
     double worst_diff = 0.0;
 };
@@ -377,6 +452,7 @@ struct PartialCheck {
         check.max_rel = std::max(check.max_rel, diff / std::max(std::abs(gpu), 1e-300));
     }
     check.worst_diff = std::max(check.worst_diff, diff);
+    if (diff > rel_channel) { ++check.rel_over; }
     if (diff <= pass_bar) {
         if (has_quantum_channel && diff > rel_channel) { ++check.quantum_hits; }
         return true;
@@ -630,6 +706,41 @@ ProductionRun run_production_cached(Fixture& f, DeviceExecutionView execution) {
     return run;
 }
 
+// One family's CPU partial over the fixture's host pages. The codec pair is the seam's single
+// mapping (rk_host_kv_codecs) - no spelling of K/V codecs lives beside it - and the fixture only
+// guarantees the pages were written by that family's append writer.
+template <int QueryHeads, int KVHeads, seam::RkHostKvDType DType>
+void cpu_partial_family(const Fixture& f, const softmax_cpu::RkPartialRequest& request,
+                        const softmax_cpu::RkPartialOutput& out) {
+    constexpr seam::RkHostKvCodecs codecs = seam::rk_host_kv_codecs(DType);
+    softmax_cpu::rk_attention_partial<QueryHeads, KVHeads, codecs.k, codecs.v>(f.host_pages(),
+                                                                              request, out);
+}
+
+template <int QueryHeads, int KVHeads>
+void cpu_partial_dispatch(seam::RkHostKvDType dtype, const Fixture& f,
+                          const softmax_cpu::RkPartialRequest& request,
+                          const softmax_cpu::RkPartialOutput& out) {
+    switch (dtype) {
+    case seam::RkHostKvDType::Rk4v4:
+        cpu_partial_family<QueryHeads, KVHeads, seam::RkHostKvDType::Rk4v4>(f, request, out);
+        return;
+    case seam::RkHostKvDType::Rk8v4:
+        cpu_partial_family<QueryHeads, KVHeads, seam::RkHostKvDType::Rk8v4>(f, request, out);
+        return;
+    case seam::RkHostKvDType::Rk4v4E8:
+        cpu_partial_family<QueryHeads, KVHeads, seam::RkHostKvDType::Rk4v4E8>(f, request, out);
+        return;
+    case seam::RkHostKvDType::Rk2v4E8:
+        cpu_partial_family<QueryHeads, KVHeads, seam::RkHostKvDType::Rk2v4E8>(f, request, out);
+        return;
+    case seam::RkHostKvDType::Rk4v2E8:
+        cpu_partial_family<QueryHeads, KVHeads, seam::RkHostKvDType::Rk4v2E8>(f, request, out);
+        return;
+    }
+    throw std::logic_error("cpu partial: this family has no codec pair");
+}
+
 void cpu_partials(const Fixture& f, int capacity, int active, int key_tile,
                   std::vector<float>& acc, std::vector<float>& maximum,
                   std::vector<float>& sum) {
@@ -650,21 +761,11 @@ void cpu_partials(const Fixture& f, int capacity, int active, int key_tile,
         request.range     = softmax_cpu::rk_partial_split_range(window, split, active, key_tile);
         request.key_tile  = key_tile;
         const softmax_cpu::RkPartialOutput out{acc.data(), maximum.data(), sum.data()};
-        // P4 codec axis: spell the K codec enum (the bool template form was removed).
+        // P4 codec axis: the codec pair is spelled by the family mapping only.
         if (q_heads == 24) {
-            if (f.dtype == seam::RkHostKvDType::Rk4v4)
-                softmax_cpu::rk_attention_partial<24, 4, softmax_cpu::RkKCodec::Int4>(
-                    f.host_pages(), request, out);
-            else
-                softmax_cpu::rk_attention_partial<24, 4, softmax_cpu::RkKCodec::Int8>(
-                    f.host_pages(), request, out);
+            cpu_partial_dispatch<24, 4>(f.dtype, f, request, out);
         } else {
-            if (f.dtype == seam::RkHostKvDType::Rk4v4)
-                softmax_cpu::rk_attention_partial<16, 2, softmax_cpu::RkKCodec::Int4>(
-                    f.host_pages(), request, out);
-            else
-                softmax_cpu::rk_attention_partial<16, 2, softmax_cpu::RkKCodec::Int8>(
-                    f.host_pages(), request, out);
+            cpu_partial_dispatch<16, 2>(f.dtype, f, request, out);
         }
     }
 }
@@ -674,19 +775,23 @@ int run_partial_mode(DeviceExecutionView execution) {
         std::string label;
         bool pass;
         double acc_max_rel;
+        double acc_worst;
+        long acc_over_rel;
+        long acc_elements;
+        long acc_quantum_only;
         double stat_max_rel;
+        double stat_worst;
+        long stat_over_rel;
+        long stat_elements;
         double merge_l2;
         long merge_beyond_ulp;
     };
     std::vector<CaseResult> results;
-    const char* dtype_names[] = {"rk4v4", "rk8v4"};
     const int windows[]       = {64, 320, 2048};
     const int widths[]        = {1, 8};
 
-    for (const auto& geometry : kGeometries) {
-        for (int dtype_index = 0; dtype_index < 2; ++dtype_index) {
-            const auto dtype =
-                dtype_index == 0 ? seam::RkHostKvDType::Rk4v4 : seam::RkHostKvDType::Rk8v4;
+    for (const FamilyFixture& family : kFamilyFixtures) {
+        for (const auto& geometry : kGeometries) {
             for (int kind_index = 0; kind_index < 2; ++kind_index) {
                 const FixtureKind kind =
                     kind_index == 0 ? FixtureKind::Random : FixtureKind::Deterministic;
@@ -699,16 +804,14 @@ int run_partial_mode(DeviceExecutionView execution) {
                                       std::min(window / 128 + 3, populated - 1)};
                         }
                         Fixture f = build_fixture(
-                            geometry, dtype, window, width, window, window, kind,
+                            geometry, family, window, width, window, window, kind,
                             0x9E3779B9u + static_cast<std::uint64_t>(window) * 131u + kind_index,
                             absent);
                         ProductionRun run = run_production_cached(f, execution);
                         std::vector<float> cpu_acc, cpu_max, cpu_sum;
                         cpu_partials(f, run.capacity, run.active, run.key_tile, cpu_acc, cpu_max,
                                      cpu_sum);
-                const double bound = v_plane_bound(f);
-                // The bound is computed from the prefix snapshot; the decode steps append V rows
-                // of the same +-1 bf16 distribution, so the prefix's absmax already saturates it.
+                        const double bound = v_plane_bound(f, window);
                         const PartialCheck acc_check = compare_partials(
                             run.acc, cpu_acc, geometry.q_heads, width, run.active, bound, true);
                         const PartialCheck max_check = compare_partials(
@@ -742,25 +845,32 @@ int run_partial_mode(DeviceExecutionView execution) {
                             run.out_bits, merged_cpu, geometry.q_heads, &gpu_weights, bound);
 
                         char label[96];
-                        std::snprintf(label, sizeof label, "%s %s T=%-5d W=%d %s", dtype_names[dtype_index],
-                                      geometry.name, window, width,
+                        std::snprintf(label, sizeof label, "%s %s T=%-5d W=%d %s",
+                                      family_name(f.dtype), geometry.name, window, width,
                                       kind_index == 0 ? "rand" : "det ");
                         const bool pass = acc_check.failures == 0 && max_check.failures == 0 &&
                                           sum_check.failures == 0 && gpu_merge.beyond == 0 &&
                                           cpu_merge.beyond == 0;
                         std::printf("%s active=%-3d key_tile=%d %s\n", label, run.active,
                                     run.key_tile, pass ? "PASS" : "FAIL");
-                        std::printf("  acc : max_rel=%.2e worst_abs=%.2e fail=%ld quantum=%ld\n",
-                                    acc_check.max_rel, acc_check.worst_diff, acc_check.failures,
+                        std::printf("  acc : max_rel=%.2e max|d|=%.2e over_1e-5=%ld/%ld fail=%ld "
+                                    "quantum_bar=%.2e quantum_only=%ld\n",
+                                    acc_check.max_rel, acc_check.worst_diff, acc_check.rel_over,
+                                    acc_check.elements, acc_check.failures, kQuantumPad * bound,
                                     acc_check.quantum_hits);
-                        std::printf("  stat: max_rel(max)=%.2e max_rel(sum)=%.2e fail=%ld+%ld\n",
-                                    max_check.max_rel, sum_check.max_rel, max_check.failures,
-                                    sum_check.failures);
+                        std::printf("  stat: maximum max|d|=%.2e over_1e-5=%ld/%ld fail=%ld | sum "
+                                    "max|d|=%.2e over_1e-5=%ld/%ld fail=%ld\n",
+                                    max_check.worst_diff, max_check.rel_over, max_check.elements,
+                                    max_check.failures, sum_check.worst_diff, sum_check.rel_over,
+                                    sum_check.elements, sum_check.failures);
                         report_merge("merge gpu-vs-device", gpu_merge);
                         report_merge("merge cpu-vs-device", cpu_merge);
-                        results.push_back({label, pass,
-                                           acc_check.max_rel,
-                                           std::max(max_check.max_rel, sum_check.max_rel),
+                        results.push_back({label, pass, acc_check.max_rel, acc_check.worst_diff,
+                                           acc_check.rel_over, acc_check.elements,
+                                           acc_check.quantum_hits, max_check.max_rel,
+                                           std::max(max_check.worst_diff, sum_check.worst_diff),
+                                           max_check.rel_over + sum_check.rel_over,
+                                           max_check.elements + sum_check.elements,
                                            std::max(gpu_merge.l2_rel, cpu_merge.l2_rel),
                                            gpu_merge.beyond + cpu_merge.beyond});
                     }
@@ -769,31 +879,45 @@ int run_partial_mode(DeviceExecutionView execution) {
         }
     }
 
-    std::printf("\n== per-dtype summary (partial mode; element rule: rel<=1e-5 or one fp16 quantum "
+    std::printf("\n== per-family summary (partial mode; element rule: rel<=1e-5 or one fp16 quantum "
                 "for acc, rel<=1e-5 for stats; merge: one ulp or 1e-5-scale floor) ==\n");
-    int failing_dtypes = 0;
-    for (int dtype_index = 0; dtype_index < 2; ++dtype_index) {
-        double acc_rel = 0.0, stat_rel = 0.0, merge_l2 = 0.0;
-        long cases = 0, passed = 0, merge_beyond = 0, element_fails = 0;
+    int failing_families = 0;
+    for (const FamilyFixture& family : kFamilyFixtures) {
+        const char* name = family_name(family.dtype);
+        double acc_rel = 0.0, acc_worst = 0.0, stat_rel = 0.0, stat_worst = 0.0, merge_l2 = 0.0;
+        long cases = 0, passed = 0, merge_beyond = 0;
+        long acc_over = 0, acc_elements = 0, acc_quantum_only = 0;
+        long stat_over = 0, stat_elements = 0;
         for (const auto& r : results) {
-            if (r.label.rfind(dtype_names[dtype_index], 0) == 0) {
-                ++cases;
-                passed += r.pass ? 1 : 0;
-                acc_rel  = std::max(acc_rel, r.acc_max_rel);
-                stat_rel = std::max(stat_rel, r.stat_max_rel);
-                merge_l2 = std::max(merge_l2, r.merge_l2);
-                merge_beyond += r.merge_beyond_ulp;
-                element_fails += r.pass ? 0 : 1;
+            // exact family token: "rk4v4" must not also count "rk4v4-e8"
+            const std::size_t name_length = std::strlen(name);
+            if (r.label.compare(0, name_length, name) != 0 || r.label[name_length] != ' ') {
+                continue;
             }
+            ++cases;
+            passed += r.pass ? 1 : 0;
+            acc_rel   = std::max(acc_rel, r.acc_max_rel);
+            acc_worst = std::max(acc_worst, r.acc_worst);
+            stat_rel  = std::max(stat_rel, r.stat_max_rel);
+            stat_worst = std::max(stat_worst, r.stat_worst);
+            merge_l2  = std::max(merge_l2, r.merge_l2);
+            merge_beyond += r.merge_beyond_ulp;
+            acc_over += r.acc_over_rel;
+            acc_elements += r.acc_elements;
+            acc_quantum_only += r.acc_quantum_only;
+            stat_over += r.stat_over_rel;
+            stat_elements += r.stat_elements;
         }
-        const bool pass = passed == cases && stat_rel < kRelBar && merge_beyond == 0;
-        failing_dtypes += pass ? 0 : 1;
-        std::printf("%s: cases=%ld pass=%ld acc_max_rel=%.2e (quantum-channel deviations) "
-                    "stat_max_rel=%.2e merge_l2(max case)=%.3e merge_beyond_bar=%ld -> %s\n",
-                    dtype_names[dtype_index], cases, passed, acc_rel, stat_rel, merge_l2,
+        const bool pass = cases > 0 && passed == cases && stat_rel < kRelBar && merge_beyond == 0;
+        failing_families += pass ? 0 : 1;
+        std::printf("%s: cases=%ld pass=%ld acc max_rel=%.2e max|d|=%.2e over_1e-5=%ld/%ld "
+                    "quantum_only=%ld | stat max_rel=%.2e max|d|=%.2e over_1e-5=%ld/%ld | "
+                    "merge_l2(max case)=%.3e merge_beyond_bar=%ld -> %s\n",
+                    name, cases, passed, acc_rel, acc_worst, acc_over, acc_elements,
+                    acc_quantum_only, stat_rel, stat_worst, stat_over, stat_elements, merge_l2,
                     merge_beyond, pass ? "PASS" : "FAIL");
     }
-    return failing_dtypes == 0 ? 0 : 1;
+    return failing_families == 0 ? 0 : 1;
 }
 
 // --- ab mode ------------------------------------------------------------------------------------
@@ -901,197 +1025,288 @@ void accumulate_slot0(const StepSnoop& gpu, const StepSnoop& cpu, int q_heads, d
     }
 }
 
+// One row of the per-family ab table. A family the seam cannot serve keeps its row (with the
+// criterion that blocked it) instead of vanishing from the output.
+struct FamilyRow {
+    std::string name;
+    std::string blocked;
+    long cases        = 0;
+    long passed       = 0;
+    long steps        = 0;
+    long engaged      = 0;
+    long acc_elements = 0;
+    long acc_over_rel = 0;
+    long acc_quantum_only = 0;
+    long acc_fail     = 0;
+    long max_over_rel = 0;
+    long max_fail     = 0;
+    long sum_over_rel = 0;
+    long sum_fail     = 0;
+    long merge_elements = 0;
+    long merge_one_ulp  = 0;
+    long merge_floor    = 0;
+    long merge_beyond   = 0;
+    long integrity      = 0;
+    double acc_rel      = 0.0;
+    double acc_worst    = 0.0;
+    double max_worst    = 0.0;
+    double sum_worst    = 0.0;
+    double quantum_bar  = 0.0;
+    double merge_l2     = 0.0;
+};
+
 int run_ab_mode(DeviceExecutionView execution, int seam_split) {
     set_env("NINFER_KV_CPU_PARTITION=" + std::to_string(seam_split));
     constexpr int kSteps = 512;
     const int prefixes[] = {868, 2048};
-    const char* dtype_names[] = {"rk4v4", "rk8v4"};
     int failing_cases = 0;
+    FamilyRow rows[kFamilyCount];
+    for (int i = 0; i < kFamilyCount; ++i) { rows[i].name = family_name(kFamilyFixtures[i].dtype); }
     std::printf("== ab mode: seam split %d, %d decode steps per case, fused append+attention "
                 "entry ==\n", seam_split, kSteps);
 
-    for (const auto& geometry : kGeometries) {
-        for (int dtype_index = 0; dtype_index < 2; ++dtype_index) {
-            const auto dtype =
-                dtype_index == 0 ? seam::RkHostKvDType::Rk4v4 : seam::RkHostKvDType::Rk8v4;
+    for (int family_index = 0; family_index < kFamilyCount; ++family_index) {
+        const FamilyFixture& family = kFamilyFixtures[family_index];
+        FamilyRow& row = rows[family_index];
+        for (const auto& geometry : kGeometries) {
             const std::size_t q_count = static_cast<std::size_t>(kHeadDim) * geometry.q_heads;
             const std::size_t kv_count = static_cast<std::size_t>(kHeadDim) * geometry.kv_heads;
             const std::uint64_t seed_base =
                 0xC0FFEE00u + static_cast<std::uint64_t>(geometry.q_heads) * 7919u;
 
             for (const int prefix : prefixes) {
-                const int envelope_max = prefix + kSteps;
-                const int populated = (prefix + kPageSize - 1) / kPageSize;
-                std::vector<int> absent{std::min(prefix / 128, populated - 2),
-                                        std::min(prefix / 128 + 3, populated - 1)};
-                Fixture f = build_fixture(geometry, dtype, prefix, 1, prefix, envelope_max,
-                                          FixtureKind::Random, seed_base + prefix, absent);
+                ++row.cases;
+                try {
+                    const int envelope_max = prefix + kSteps;
+                    const int populated = (prefix + kPageSize - 1) / kPageSize;
+                    std::vector<int> absent{std::min(prefix / 128, populated - 2),
+                                            std::min(prefix / 128 + 3, populated - 1)};
+                    Fixture f = build_fixture(geometry, family, prefix, 1, prefix, envelope_max,
+                                              FixtureKind::Random, seed_base + prefix, absent);
 
-                // The seam's CPU leg reads the host mirror of the prefix planes; the decode
-                // steps append to later pages only, so for split 0 (the earliest 64 keys) the
-                // mirror stays valid for the whole run. Verified below before the loop.
-                const ops::CausalAttentionExecutionEnvelope envelope{
-                    static_cast<std::uint32_t>(f.envelope_min),
-                    static_cast<std::uint32_t>(f.envelope_max)};
-                const auto plan = seam::make_int8_kv_causal_plan(
-                    geometry.q_heads, 1, 1, envelope, execution.multiprocessor_count);
-                if (plan.family != seam::Int8KvFamily::Grouped) {
-                    throw std::logic_error("ab decode step did not route to the grouped family");
-                }
-                const int capacity = plan.partition.capacity;
-                const int window_last = prefix + kSteps;
-                const int active_last  = plan.partition.active(window_last);
-                const auto probe = softmax_cpu::rk_partial_split_range(window_last, seam_split,
-                                                                       active_last, 32);
-                if (seam_split != 0 || probe.end > 64) {
-                    std::fprintf(stderr, "diag-cpu-partial: ab case needs a mirror covering "
-                                         "appended pages (split range [%d,%d)); out of scope\n",
-                                 probe.begin, probe.end);
-                    return 2;
-                }
-
-                // workspace sized once for the whole decode loop (fixed envelope, width 1)
-                const ops::AttentionHeadGeometry geometry_spec{kHeadDim, geometry.q_heads,
-                                                               geometry.kv_heads};
-                const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
-                    geometry_spec, f.storage, envelope, 1, 1, 1, execution);
-                DeviceBuffer workspace(std::max<std::size_t>(workspace_bytes, 256));
-                WorkspaceArena arena(DeviceSpan{workspace.p, workspace.bytes});
-
-                seam::RkHostPartialView view{};
-                view.dtype       = dtype;
-                view.query_heads  = geometry.q_heads;
-                view.pages        = f.host_pages();
-                view.q_bf16       = f.q_bits.data();
-                view.positions    = f.positions.data();
-                // NOTE: set_query_tile replaces f.q_bits / f.positions each step (move-assign
-                // swaps the heap buffer), so the view's mirrors are REBOUND after every upload -
-                // a pointer captured once would dangle and the CPU leg would read freed memory.
-
-                DeviceBuffer step_k(kv_count * sizeof(std::uint16_t));
-                DeviceBuffer step_v(kv_count * sizeof(std::uint16_t));
-
-                std::vector<StepSnoop> gpu_steps(kSteps), cpu_steps(kSteps);
-                const auto prepare_step = [&](int step) {
-                    const auto k_bits =
-                        random_bf16(kv_count, seed_base + 100u + step, -0.25f, 0.25f);
-                    const auto v_bits =
-                        random_bf16(kv_count, seed_base + 200u + step, -1.0f, 1.0f);
-                    set_query_tile(f, random_bf16(q_count, seed_base + step, -0.25f, 0.25f),
-                                   {prefix + step});
-                    view.q_bf16    = f.q_bits.data();
-                    view.positions = f.positions.data();
-                    step_k.copy_from_host(k_bits.data(), k_bits.size() * sizeof(std::uint16_t));
-                    step_v.copy_from_host(v_bits.data(), v_bits.size() * sizeof(std::uint16_t));
-                };
-
-                // leg A: all GPU (the knob is armed but no view is installed, so the gate
-                // falls back once and every split runs on the device)
-                seam::rk_host_partial_install(nullptr);
-                for (int step = 0; step < kSteps; ++step) {
-                    prepare_step(step);
-                    gpu_steps[step] =
-                        run_decode_step(f, execution, arena, step_k, step_v, workspace, capacity,
-                                        step == 0);
-                }
-
-                // leg B: identical inputs, the seam forces split `seam_split` through the CPU
-                seam::rk_host_partial_install(&view);
-                const std::uint64_t engaged_before = seam::rk_host_partial_engagements();
-                for (int step = 0; step < kSteps; ++step) {
-                    prepare_step(step);
-                    cpu_steps[step] =
-                        run_decode_step(f, execution, arena, step_k, step_v, workspace, capacity,
-                                        step == 0);
-                }
-                const std::uint64_t engaged =
-                    seam::rk_host_partial_engagements() - engaged_before;
-                seam::rk_host_partial_install(nullptr);
-
-                const double bound = v_plane_bound(f);
-                // deep integrity: the GPU slots the kernel actually WROTE this step (split <
-                // active) must be bit-identical between the legs; slots >= active are never
-                // written and hold stale bytes from earlier calls, so they are not comparable.
-                long deep_diffs = 0;
-                const int active_step0 = plan.partition.active(prefix + 1);
-                if (!gpu_steps[0].full_acc.empty()) {
-                    const std::size_t written =
-                        256 * static_cast<std::size_t>(geometry.q_heads) *
-                        static_cast<std::size_t>(active_step0);
-                    for (std::size_t i = 256 * static_cast<std::size_t>(geometry.q_heads);
-                         i < written; ++i) {
-                        const bool same = gpu_steps[0].full_acc[i] == cpu_steps[0].full_acc[i];
-                        if (!same && deep_diffs < 3) {
-                            std::printf("    integrity probe: full_acc[%zu] leg_a=%.6e "
-                                        "leg_b=%.6e\n",
-                                        i,
-                                        static_cast<double>(gpu_steps[0].full_acc[i]),
-                                        static_cast<double>(cpu_steps[0].full_acc[i]));
-                        }
-                        deep_diffs += same ? 0 : 1;
+                    // The seam's CPU leg reads the host mirror of the prefix planes; the decode
+                    // steps append to later pages only, so for split 0 (the earliest 64 keys) the
+                    // mirror stays valid for the whole run. Verified below before the loop.
+                    const ops::CausalAttentionExecutionEnvelope envelope{
+                        static_cast<std::uint32_t>(f.envelope_min),
+                        static_cast<std::uint32_t>(f.envelope_max)};
+                    const auto plan = seam::make_int8_kv_causal_plan(
+                        geometry.q_heads, 1, 1, envelope, execution.multiprocessor_count);
+                    if (plan.family != seam::Int8KvFamily::Grouped) {
+                        throw std::logic_error("ab decode step did not route to the grouped family");
                     }
-                }
+                    const int capacity = plan.partition.capacity;
+                    const int window_last = prefix + kSteps;
+                    const int active_last  = plan.partition.active(window_last);
+                    const auto probe = softmax_cpu::rk_partial_split_range(window_last, seam_split,
+                                                                           active_last, 32);
+                    if (seam_split != 0 || probe.end > 64) {
+                        std::fprintf(stderr, "diag-cpu-partial: ab case needs a mirror covering "
+                                             "appended pages (split range [%d,%d)); out of scope\n",
+                                     probe.begin, probe.end);
+                        return 2;
+                    }
 
-                PartialCheck acc_check, max_check, sum_check;
-                long elements = 0, exact = 0, one_ulp = 0, floor_pass = 0, beyond = 0;
-                long stat_mismatch = 0;
-                double l2_num = 0.0, l2_den = 0.0;
-                for (int step = 0; step < kSteps; ++step) {
-                    const int window = prefix + step + 1;
-                    const int active = plan.partition.active(window);
-                    accumulate_slot0(gpu_steps[step], cpu_steps[step], geometry.q_heads, bound,
-                                    acc_check, max_check, sum_check);
-                    // stats of the splits the kernel wrote this step (1..active); slots >=
-                    // active hold stale bytes and are not comparable between the legs
-                    for (int s = 1; s < active; ++s) {
-                        for (int head = 0; head < geometry.q_heads; ++head) {
-                            const std::size_t stat =
-                                static_cast<std::size_t>(head + geometry.q_heads * s);
-                            stat_mismatch += gpu_steps[step].maximum[stat] ==
-                                                    cpu_steps[step].maximum[stat]
-                                                ? 0
-                                                : 1;
-                            stat_mismatch += gpu_steps[step].sum[stat] == cpu_steps[step].sum[stat]
-                                                ? 0
-                                                : 1;
+                    // workspace sized once for the whole decode loop (fixed envelope, width 1)
+                    const ops::AttentionHeadGeometry geometry_spec{kHeadDim, geometry.q_heads,
+                                                                   geometry.kv_heads};
+                    const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
+                        geometry_spec, f.storage, envelope, 1, 1, 1, execution);
+                    DeviceBuffer workspace(std::max<std::size_t>(workspace_bytes, 256));
+                    WorkspaceArena arena(DeviceSpan{workspace.p, workspace.bytes});
+
+                    seam::RkHostPartialView view{};
+                    view.dtype       = f.dtype;
+                    view.query_heads  = geometry.q_heads;
+                    view.pages        = f.host_pages();
+                    view.q_bf16       = f.q_bits.data();
+                    view.positions    = f.positions.data();
+                    // NOTE: set_query_tile replaces f.q_bits / f.positions each step (move-assign
+                    // swaps the heap buffer), so the view's mirrors are REBOUND after every upload -
+                    // a pointer captured once would dangle and the CPU leg would read freed memory.
+
+                    DeviceBuffer step_k(kv_count * sizeof(std::uint16_t));
+                    DeviceBuffer step_v(kv_count * sizeof(std::uint16_t));
+
+                    std::vector<StepSnoop> gpu_steps(kSteps), cpu_steps(kSteps);
+                    const auto prepare_step = [&](int step) {
+                        const auto k_bits =
+                            random_bf16(kv_count, seed_base + 100u + step, -0.25f, 0.25f);
+                        const auto v_bits =
+                            random_bf16(kv_count, seed_base + 200u + step, -1.0f, 1.0f);
+                        set_query_tile(f, random_bf16(q_count, seed_base + step, -0.25f, 0.25f),
+                                       {prefix + step});
+                        view.q_bf16    = f.q_bits.data();
+                        view.positions = f.positions.data();
+                        step_k.copy_from_host(k_bits.data(), k_bits.size() * sizeof(std::uint16_t));
+                        step_v.copy_from_host(v_bits.data(), v_bits.size() * sizeof(std::uint16_t));
+                    };
+
+                    // leg A: all GPU (the knob is armed but no view is installed, so the gate
+                    // falls back once and every split runs on the device)
+                    seam::rk_host_partial_install(nullptr);
+                    for (int step = 0; step < kSteps; ++step) {
+                        prepare_step(step);
+                        gpu_steps[step] =
+                            run_decode_step(f, execution, arena, step_k, step_v, workspace, capacity,
+                                            step == 0);
+                    }
+
+                    // leg B: identical inputs, the seam forces split `seam_split` through the CPU
+                    seam::rk_host_partial_install(&view);
+                    const std::uint64_t engaged_before = seam::rk_host_partial_engagements();
+                    for (int step = 0; step < kSteps; ++step) {
+                        prepare_step(step);
+                        cpu_steps[step] =
+                            run_decode_step(f, execution, arena, step_k, step_v, workspace, capacity,
+                                            step == 0);
+                    }
+                    const std::uint64_t engaged =
+                        seam::rk_host_partial_engagements() - engaged_before;
+                    seam::rk_host_partial_install(nullptr);
+
+                    const double bound = v_plane_bound(f, window_last);
+                    // deep integrity: the GPU slots the kernel actually WROTE this step (split <
+                    // active) must be bit-identical between the legs; slots >= active are never
+                    // written and hold stale bytes from earlier calls, so they are not comparable.
+                    long deep_diffs = 0;
+                    const int active_step0 = plan.partition.active(prefix + 1);
+                    if (!gpu_steps[0].full_acc.empty()) {
+                        const std::size_t written =
+                            256 * static_cast<std::size_t>(geometry.q_heads) *
+                            static_cast<std::size_t>(active_step0);
+                        for (std::size_t i = 256 * static_cast<std::size_t>(geometry.q_heads);
+                             i < written; ++i) {
+                            const bool same = gpu_steps[0].full_acc[i] == cpu_steps[0].full_acc[i];
+                            if (!same && deep_diffs < 3) {
+                                std::printf("    integrity probe: full_acc[%zu] leg_a=%.6e "
+                                            "leg_b=%.6e\n",
+                                            i,
+                                            static_cast<double>(gpu_steps[0].full_acc[i]),
+                                            static_cast<double>(cpu_steps[0].full_acc[i]));
+                            }
+                            deep_diffs += same ? 0 : 1;
                         }
                     }
-                    const auto weights = max_split_weights(gpu_steps[step].maximum,
-                                                           gpu_steps[step].sum, geometry.q_heads,
-                                                           1, active);
-                    const MergeCheck check = compare_merged(gpu_steps[step].out_bits,
-                                                           cpu_steps[step].out_bits, geometry.q_heads,
-                                                           &weights, bound);
-                    elements += check.elements;
-                    exact += check.exact;
-                    one_ulp += check.one_ulp;
-                    floor_pass += check.floor_pass;
-                    beyond += check.beyond;
-                    l2_num += check.l2_num;
-                    l2_den += check.l2_den;
+
+                    PartialCheck acc_check, max_check, sum_check;
+                    long elements = 0, exact = 0, one_ulp = 0, floor_pass = 0, beyond = 0;
+                    long stat_mismatch = 0;
+                    double l2_num = 0.0, l2_den = 0.0;
+                    for (int step = 0; step < kSteps; ++step) {
+                        const int window = prefix + step + 1;
+                        const int active = plan.partition.active(window);
+                        accumulate_slot0(gpu_steps[step], cpu_steps[step], geometry.q_heads, bound,
+                                        acc_check, max_check, sum_check);
+                        // stats of the splits the kernel wrote this step (1..active); slots >=
+                        // active hold stale bytes and are not comparable between the legs
+                        for (int s = 1; s < active; ++s) {
+                            for (int head = 0; head < geometry.q_heads; ++head) {
+                                const std::size_t stat =
+                                    static_cast<std::size_t>(head + geometry.q_heads * s);
+                                stat_mismatch += gpu_steps[step].maximum[stat] ==
+                                                        cpu_steps[step].maximum[stat]
+                                                    ? 0
+                                                    : 1;
+                                stat_mismatch += gpu_steps[step].sum[stat] == cpu_steps[step].sum[stat]
+                                                    ? 0
+                                                    : 1;
+                            }
+                        }
+                        const auto weights = max_split_weights(gpu_steps[step].maximum,
+                                                               gpu_steps[step].sum, geometry.q_heads,
+                                                               1, active);
+                        const MergeCheck check = compare_merged(gpu_steps[step].out_bits,
+                                                               cpu_steps[step].out_bits, geometry.q_heads,
+                                                               &weights, bound);
+                        elements += check.elements;
+                        exact += check.exact;
+                        one_ulp += check.one_ulp;
+                        floor_pass += check.floor_pass;
+                        beyond += check.beyond;
+                        l2_num += check.l2_num;
+                        l2_den += check.l2_den;
+                    }
+                    const double l2_rel = l2_den > 0.0 ? std::sqrt(l2_num / l2_den) : 0.0;
+                    const bool cpu_leg = engaged == static_cast<std::uint64_t>(kSteps);
+                    const bool pass = cpu_leg && beyond == 0 && deep_diffs == 0 && stat_mismatch == 0 &&
+                                      acc_check.failures == 0 && max_check.failures == 0 &&
+                                      sum_check.failures == 0;
+                    failing_cases += pass ? 0 : 1;
+                    std::printf("%s %s prefix=%-5d steps=%d window=%d..%d capacity=%d engaged=%llu/%d "
+                                "cpu-leg=%s\n",
+                                row.name.c_str(), geometry.name, prefix, kSteps, prefix + 1,
+                                window_last, capacity, static_cast<unsigned long long>(engaged),
+                                kSteps, cpu_leg ? "YES" : "NO");
+                    std::printf("  seam acc: max|d|=%.3e max_rel=%.2e over_1e-5=%ld/%ld "
+                                "quantum_bar=%.3e quantum_only=%ld fail=%ld\n",
+                                acc_check.worst_diff, acc_check.max_rel, acc_check.rel_over,
+                                acc_check.elements, kQuantumPad * bound, acc_check.quantum_hits,
+                                acc_check.failures);
+                    std::printf("  seam stat: maximum max|d|=%.3e over_1e-5=%ld/%ld fail=%ld | sum "
+                                "max|d|=%.3e over_1e-5=%ld/%ld fail=%ld | gpu-slot integrity=%ld\n",
+                                max_check.worst_diff, max_check.rel_over, max_check.elements,
+                                max_check.failures, sum_check.worst_diff, sum_check.rel_over,
+                                sum_check.elements, sum_check.failures, deep_diffs + stat_mismatch);
+                    std::printf("  merged output: exact=%.4f%% one-ulp=%ld floor=%ld beyond=%ld "
+                                "l2_rel=%.3e -> %s\n",
+                                100.0 * static_cast<double>(exact) / static_cast<double>(elements),
+                                one_ulp, floor_pass, beyond, l2_rel, pass ? "PASS" : "FAIL");
+
+                    row.steps += kSteps;
+                    row.engaged += static_cast<long>(engaged);
+                    row.passed += pass ? 1 : 0;
+                    row.acc_elements += acc_check.elements;
+                    row.acc_over_rel += acc_check.rel_over;
+                    row.acc_quantum_only += acc_check.quantum_hits;
+                    row.acc_fail += acc_check.failures;
+                    row.acc_rel   = std::max(row.acc_rel, acc_check.max_rel);
+                    row.acc_worst = std::max(row.acc_worst, acc_check.worst_diff);
+                    row.max_over_rel += max_check.rel_over;
+                    row.max_fail += max_check.failures;
+                    row.sum_over_rel += sum_check.rel_over;
+                    row.sum_fail += sum_check.failures;
+                    row.max_worst = std::max(row.max_worst, max_check.worst_diff);
+                    row.sum_worst = std::max(row.sum_worst, sum_check.worst_diff);
+                    row.quantum_bar = std::max(row.quantum_bar, kQuantumPad * bound);
+                    row.merge_elements += elements;
+                    row.merge_one_ulp += one_ulp;
+                    row.merge_floor += floor_pass;
+                    row.merge_beyond += beyond;
+                    row.merge_l2 = std::max(row.merge_l2, l2_rel);
+                    row.integrity += deep_diffs + stat_mismatch;
+                } catch (const std::exception& error) {
+                    // "Cannot be equipped" is reported as the criterion that refused, never as a
+                    // missing row: the family keeps its place in the table and exits non-zero.
+                    ++failing_cases;
+                    if (row.blocked.empty()) { row.blocked = error.what(); }
+                    std::printf("%s %s prefix=%-5d NOT RUN: %s\n", row.name.c_str(),
+                                geometry.name, prefix, error.what());
                 }
-                const double l2_rel = l2_den > 0.0 ? std::sqrt(l2_num / l2_den) : 0.0;
-                const bool pass = engaged == static_cast<std::uint64_t>(kSteps) &&
-                                  beyond == 0 && deep_diffs == 0 && stat_mismatch == 0 &&
-                                  acc_check.failures == 0 && max_check.failures == 0 &&
-                                  sum_check.failures == 0;
-                failing_cases += pass ? 0 : 1;
-                std::printf("%s %s prefix=%-5d steps=%d window=%d..%d capacity=%d engaged=%llu/%d\n",
-                            dtype_names[dtype_index], geometry.name, prefix, kSteps, prefix + 1,
-                            window_last, capacity, static_cast<unsigned long long>(engaged),
-                            kSteps);
-                std::printf("  seam slot partial: acc_max_rel=%.2e fail=%ld quantum=%ld; "
-                            "max_rel(max)=%.2e max_rel(sum)=%.2e fail=%ld+%ld; "
-                            "gpu-slot integrity=%ld\n",
-                            acc_check.max_rel, acc_check.failures, acc_check.quantum_hits,
-                            max_check.max_rel, sum_check.max_rel, max_check.failures,
-                            sum_check.failures, deep_diffs + stat_mismatch);
-                std::printf("  merged output: exact=%.4f%% one-ulp=%ld floor=%ld beyond=%ld "
-                            "l2_rel=%.3e -> %s\n",
-                            100.0 * static_cast<double>(exact) / static_cast<double>(elements),
-                            one_ulp, floor_pass, beyond, l2_rel, pass ? "PASS" : "FAIL");
             }
         }
+    }
+
+    std::printf("\n== per-family summary (ab mode; seam split %d, %d decode steps/case) ==\n",
+                seam_split, kSteps);
+    for (const FamilyRow& row : rows) {
+        if (!row.blocked.empty()) {
+            std::printf("%s: NOT RUN: %s (cases=%ld)\n", row.name.c_str(), row.blocked.c_str(),
+                        row.cases);
+            continue;
+        }
+        const bool cpu_leg = row.steps > 0 && row.engaged == row.steps;
+        const bool pass = row.cases > 0 && row.passed == row.cases && cpu_leg;
+        std::printf("%s: cases=%ld pass=%ld engages=%ld/%ld cpu-leg=%s | acc max|d|=%.3e "
+                    "quantum_bar<=%.3e over_1e-5=%ld/%ld quantum_only=%ld fail=%ld | maximum "
+                    "max|d|=%.3e over_1e-5=%ld fail=%ld | sum max|d|=%.3e over_1e-5=%ld fail=%ld | "
+                    "merged beyond=%ld one-ulp=%ld l2(max case)=%.3e integrity=%ld -> %s\n",
+                    row.name.c_str(), row.cases, row.passed, row.engaged, row.steps,
+                    cpu_leg ? "YES" : "NO", row.acc_worst, row.quantum_bar, row.acc_over_rel,
+                    row.acc_elements, row.acc_quantum_only, row.acc_fail, row.max_worst,
+                    row.max_over_rel, row.max_fail, row.sum_worst, row.sum_over_rel, row.sum_fail,
+                    row.merge_beyond, row.merge_one_ulp, row.merge_l2, row.integrity,
+                    pass ? "PASS" : "FAIL");
     }
     return failing_cases == 0 ? 0 : 1;
 }

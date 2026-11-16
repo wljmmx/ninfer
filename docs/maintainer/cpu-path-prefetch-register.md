@@ -101,7 +101,7 @@
 | ID | 任务 | 验收 | 状态 | 证据 |
 |---|---|---|---|---|
 | P5.1 | `ctest` 全量跑一次（注册 208，`build-win` 只有部分可执行） | 给出通过/失败清单 | ⬜ | — |
-| P5.2 | `diag-cpu-partial` A/B 扩到 5 族 | 每族 engage + 偏差 | ⬜ | — |
+| P5.2 | `diag-cpu-partial` A/B 扩到 5 族 | 每族 engage + 偏差 | ✅ | 五族全闭环，无一族被挡。**ab 模式**（seam split 0，512 步/例，2 几何 × 2 前缀 = 4 例/族，`runs/2026-11-16/p5b/ab.log`）：`rk4v4` / `rk8v4` / `rk4v4-e8` / `rk2v4-e8` / `rk4v2-e8` 各 `cases=4 pass=4 engages=2048/2048 cpu-leg=YES`；acc `max\|d\|` = 9.692e-04 / 4.911e-04 / 4.911e-04 / 4.902e-04 / 5.593e-04，`quantum_bar`(2^-10·v_bound) = 9.773e-04 ×4 族、rk4v2-e8 = 1.815e-03，超 1e-5 的元素**全部**落在量子通道内（`fail=0`，`quantum_only`= 60290/64776/63552/61860/48303 of 10485760）；`maximum` max\|d\| ≤ 1.49e-08、`sum` ≤ 1.53e-05（`over_1e-5=0`，`fail=0/0`）；merged 输出 `beyond=0`、l2 最大 1.94e-05；`gpu-slot integrity=0`（同 split 逐位）。**partial 模式**（120 例 = 5 族 × 24，`partial.log`）全 PASS，acc max\|d\| ≤ 9.57e-04、stat `max_rel` ≤ 2.03e-07、merge `beyond=0`。夹具侧：族→storage 表只在 diag 内部（注释写明 FIXTURE, NOT POLICY），plane extent/dtype 全部取自 `paged_kv_storage_layout`，codec 对取自 `rk_host_kv_codecs()`；`v_bound` 改为"V codec 的最大码 × 窗口内实际写入的 (page,tip) 的 max\|vs\|"，rk4v2-e8 的 E8-cylinder V 实测最大码 **14**（量子界 1.815e-03 = 2×9.773e-04；沿用 int4 的 7 会过紧）。默认门禁逐位 `6.024313` / `20.673595` |
 | P5.3 | `host_pages.h` 的 `packed_k` 已无生产消费者 | 删除或标注"仅测试用" | ✅ | **删除**（不是标注）。`RkHostKvPlanes::packed_k` 与 `rk_host_pages_detail::Candidate::packed_k` 一并去掉，五条候选表少一列；生产侧本来就只读 `k_codec`/`v_codec` →`rk_host_kv_dtype_of` → `rk_host_kv_codecs`。单测 `family_identification()` 改成对 `(K codec, V codec, 派生 RkHostKvDType)` 三元组逐族断言（dtype 轴，正是生产消费者的轴）：`build-win\tests\infer_kv_host_partial_mirror_test.exe` → `OK host page mirror`、exit=0，五族 `rows 27/27 equal`（rk4v4 / rk8v4 / rk4v4-e8 / rk2v4-e8 / rk4v2-e8 全 PASS）。删除理由不只是"没人读"：这个布尔对 E8 载体不成立（96 B / 64 B 既非 128 也非 256），留着就是第二套说法。默认门禁逐位 `6.024313` / `20.673595` |
 
 ---
@@ -129,6 +129,7 @@
 9. ✅ P5.3 `host_pages.h` 的 `packed_k` 清理（删掉布尔，单测改走 dtype 轴）
 10. ✅ P2.2 device 端放置件（`e1776dcb`）：放置决策上 device，`hits` 0 → 0.83%，`[pf-mirror] region` uploads 144 → 3383，`[plan] prefetch_mb=1440*`
 11. ✅ P3.1 统一 CPU 半两侧定价 scope（`f0ddf640`）：冷段 `est copy` 与 `span` 同量级，`m*` 不再随冷热翻转；`m*` 实测 0.2–1.6（不是 4.8，理由见该行）
+12. ✅ P5.2 `diag-cpu-partial` 两模式扩到 5 族：A/B 每族 `engages=2048/2048 cpu-leg=YES`，acc 偏差全部落在量子通道内（`fail=0`），partial 120 例全 PASS
 
 待关账：
 
@@ -165,5 +166,6 @@
 | 2026-11-16 | P5.3 关账：删除 `RkHostKvPlanes::packed_k` 与候选表的同名列（生产侧只走 `rk_host_kv_dtype_of`/`rk_host_kv_codecs`），单测 `family_identification()` 改为 `(K codec, V codec, 派生 dtype)` 三元组。`infer_kv_host_partial_mirror_test.exe` → `OK host page mirror`、exit=0、五族 27/27 行相等；默认门禁逐位 |
 | 2026-11-16 | P2.2 关账（`e1776dcb`）：预取区有了 device 端放置件。`ops::moe_prefetch_select` 在 device 上做两个决定（哪个专家、哪个区槽位）并把 `(expert, region)` 对写回，环游标是 device 字；host 只应用（`ExpertCache::adopt_prefetch_placements`，越界/非区槽位 fail-loud）并把字节交给池自己的上传路（唯一 device 可寻址源是 tier，而 tier 命中的专家本来就不需要拷贝；artifact 是 host 映射）。drain 搭在 `fetch_host_routed` 那次同步上，0 次新增同步。实测 `hits=447 calls=54010 (0.83%)`、`placed=20948 applied=19365`、`[pf-mirror] region uploads 144 → 3383`、`[plan] prefetch_mb=1440*`；默认门禁逐位 |
 | 2026-11-16 | P3.1 关账（`f0ddf640`）：CPU 半两侧同口径。copy 侧 `gpu_us = max(link + read, 3×upload)`（read 与 span 付的是同一次实测读），除数与决策 2 的 CPU 侧都改回尺寸对应的实测 span。冷段同层 `est copy=317us` 对 `span=414.7us`（改前 12.6 对 8186），`m*` 冷 1.3–1.6 / 暖 0.2–0.3 不再随冷热翻转；**`m*` 不是 4.8**：4.8 假设的 147 us span，本机在 5–8 与 100+ 路由实测 356–542 us。默认门禁逐位 |
+| 2026-11-16 | P5.2 关账：`diag-cpu-partial` 的 A/B 与模板实例化都从 2 族扩到 5 族，族信息只走 `rk_host_kv_codecs()`/`rk_host_kv_dtype_of()`（diag 内部仅保留"族→写入器 storage"的夹具表，注释标注 FIXTURE, NOT POLICY；plane extent/dtype 读 `paged_kv_storage_layout`）。ab 模式五族 `engages=2048/2048 cpu-leg=YES`，acc `max|d|` 4.90e-04–9.69e-04 全部 ≤ 量子界（rk4v2-e8 的 E8-cylinder V 最大码实测 14，界 1.815e-03），`over_1e-5` 全在量子通道内、`fail=0`；`maximum` ≤1.49e-08、`sum` ≤1.53e-05、merged `beyond=0`、同 split 逐位 `integrity=0`。`v_bound` 顺带从"全表映射页的 max|vs|"改成"窗口内实际写入的 (page,tip)"，去掉未初始化页参与定界。默认门禁逐位 `6.024313` / `20.673595` |
 
 
