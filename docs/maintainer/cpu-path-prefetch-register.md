@@ -28,7 +28,7 @@
 
 | 格 | 预测器 | 端口 | 命中率可读 | 本机可达 |
 |---|---|---|---|---|
-| **e2 × 流式** | 🟡 有信号无放置件：`[pf-pred] written=64 ids=640 drained=64 dropped=0`（环完整），但 `[pf-region] hits=0 calls=640 (0.0%)`；`[pf-ctl] cutoff=0 armed=N reason=depth`（8 槽）/ `armed=Y`（16 槽） | ✅ `[ctl] prefetch port` 正常打印 cold/hit/cpu/runs/banks/slots→N | 🟡 计数器可读（`hits/calls`），但恒 0-0.2%，**语义上等于不可读** | ✅ 可达 |
+| **e2 × 流式** | 🟡 有信号无放置件：`[pf-pred] written=64 ids=640 drained=64 dropped=0`（环完整），但 `[pf-region] hits=0 calls=640 (0.0%)`；`[pf-ctl] cutoff=0 armed=N reason=depth`（8 槽）/ `armed=Y`（16 槽）。**P2.2 后**：放置件在（`fill=dev(select=… placed=20948 applied=19365)`），`hits=447 calls=54010 (0.83%)`（48 层流按 bank 求和，见 P2.2 行） | ✅ `[ctl] prefetch port` 正常打印 cold/hit/cpu/runs/banks/slots→N | 🟡 计数器可读且**不再恒 0**（0.83%），限速项是预测精度而不是放置（放置 19365 次只换来 447 次命中，与 P2.4 的 0.2–0.8% 同量级） | ✅ 可达 |
 | **e2 × 驻留** | — 无需预测（整层驻留） | ✅ 同一端口 | — | **本机不可达，两个独立原因**：① 125B 上 `count_` = 512 专家/bank，整层驻留需 73728 slot × 1.25 MiB ≈ 88 GiB；② 35B-e2 现在能跑了（P6.1 已修，`overall 6.701375`），但池只装 **10040/10240** 专家（池 18879 MiB，每 bank 差 5 槽 × 1920 KiB = 375 MiB），`fully_resident()` 仍为 false |
 | **非 e2 × 流式** | ⬜ "层元数据"信号没有生产：`predict_next_layer` 只有 residual(28.8%) / prev(49.4%) 两条 | ✅ | 🟡 同左（无填充→0） | ❓ 35B plain 能跑（`overall 6.701375`），但它无池行、未确认有专家路由；验法：同命令加 `[pf-pred]`/`[gh1]` 观察是否有 ids |
 | **非 e2 × 驻留** | ⬜ 双缓冲换层未实现；"换层窗口内无 miss"这个前提本身未验证 | ✅ | — | ❓ 验法：35B plain + `[gh1] no_miss_pct` 是否 100%，否则这一格的前提不成立 |
@@ -66,7 +66,7 @@
 | ID | 任务 | 验收 | 状态 | 证据 |
 |---|---|---|---|---|
 | P1.1 | 列名/列序改成 `*_mb` 与规格一致（`prefetch_readahead`） | `[plan]` 三行与规格逐列对应 | ✅ | 现为 device `expert_pool_mb \| kv_pages_mb \| prefetch_mb \| slru_band_mb \| staging_mb \| claimed`；host `expert_arena_mb \| kv_host_mb \| prefetch_readahead_mb \| second_chance_mb \| claimed`（主机列序按规格）；默认门禁仍 `6.024313` / `20.673595` |
-| P1.2 | **prefetch 未接通强制 0** 落成规则（消费者未接通 → 恒 0 并在行内标注原因） | 默认 `[plan] prefetch=0*` 且 `[pf-region]` 不再被 carve | ✅ | 规则在 `core::device_prefetch_consumer_present()`（恒 false，依据 `[pf-pred] Device form: ... fill=host-only (0 placed by the Device)`），`TierPlan::set` 对 `prefetch_mb` 强制 0；行内原因 `prefetch_mb=0*(no consumer: device-side placement absent ...)`；`NINFER_PREFETCH_SLOTS=16` 单独设置 → exit=1 `cannot arm the Device prefetch region: it has no consumer`；默认门禁 `6.024313` / `20.673595` |
+| P1.2 | **prefetch 未接通强制 0** 落成规则（消费者未接通 → 恒 0 并在行内标注原因） | 默认 `[plan] prefetch=0*` 且 `[pf-region]` 不再被 carve | ✅ | 规则在 `core::device_prefetch_consumer_present()`（当时恒 false，依据 `[pf-pred] Device form: ... fill=host-only (0 placed by the Device)`），`TierPlan::set` 对 `prefetch_mb` 强制 0；行内原因 `prefetch_mb=0*(no consumer: device-side placement absent ...)`；`NINFER_PREFETCH_SLOTS=16` 单独设置 → exit=1 `cannot arm the Device prefetch region: it has no consumer`；默认门禁 `6.024313` / `20.673595`。**P2.2 起该谓词为 true（填充件存在），行的零值原因改成 `kDevicePrefetchUnasked`（本次没人要区），本行其余结论不变** |
 | P1.3 | `kv_spill = {enabled, 上限, 重读计数}` | `[plan] ssd` 行给出三元组 | ✅ | `[plan] ssd cap=none \| kv_spill={enabled=0, cap=none, reread=none}`；`enabled` 取唯一创建该 tier 的开关（`program_impl.cpp` 只在 `NINFER_KV_SPILL_MB` 设置时挂文件），`cap` 无文件即 none、有文件时给文件 extent 容量并标"not a plan claim"，`reread` 写 none 并说明树里只有 `kv_tier_stats()` 的 spilled/fetched 页（另一个问题），不编 0 |
 | P1.4 | `cold_range` 进表 | `[plan]` 出现 `cold_range=NN`（= 总专家 − 池 − 暖区） | ✅ | `[plan] ssd ... \| cold_range=38415 experts (73728 - 18000 - 17313)`；三项同取 `attach_expert_cache` 的 placement（与 `[budget] experts: ... unslotted=55728 of 73728` 同源），故 `[plan]` 报告点移到 placement 定稿之后 |
 
@@ -75,7 +75,7 @@
 | ID | 任务 | 验收 | 状态 | 证据 |
 |---|---|---|---|---|
 | P2.1 | 按 P1.2 强制 0，删掉"env 能武装一个没消费者的区" | 默认 0 槽，无 `[pf-region]` carve 行 | ✅ | 同 P1.2：`device_prefetch_consumer_present()` 恒 false，`TierPlan::set` 强制 0；`NINFER_PREFETCH_SLOTS=16` 单独设置 → exit=1 `cannot arm the Device prefetch region: it has no consumer`，不再静默武装 |
-| P2.2 | device 端放置件（原 S4/S5）：放置状态机上 device，填充不回 host | `hits/calls` 从 0 抬起；`[pf-mirror] region uploads` 随 `prefetch_generation` 收敛 | ⬜ | `[pf-region] hits=0/640`；`region uploads=144`（仅镜像） |
+| P2.2 | device 端放置件（原 S4/S5）：放置状态机上 device，填充不回 host | `hits/calls` 从 0 抬起；`[pf-mirror] region uploads` 随 `prefetch_generation` 收敛 | ✅ | `e1776dcb`。**决策上 device**：`ops::moe_prefetch_select`（`kernels/cuda/prefetch_select.cu`）拿预测 id（device，不经 host）、对**本 run 的 placement 镜像**判"池里已有"、按 device 游标 `atomicAdd` 取环位，写出 `(expert, region)` 对；**应用在 host**（`ExpertCache::adopt_prefetch_placements`，无自己的判断），区域索引越界或指向"不是本 bank 区槽"的池槽位 → 带两个数字抛错（两套槽号混用 fail-loud）。**字节仍走池自己的上传路**：唯一 device 可寻址的源是 pinned tier，而 tier 里有的专家本来就被需求路径直接寻址（`kExpertPlacementHost`，不需要拷贝），真正要读的是 artifact——它是 host 映射，只有上传器能 DMA，所以搬的是决策不是拷贝。实测（8B e2 / `--no-cuda-graph` / 解码 24 token / `NINFER_PREFETCH_PREDICT=1 NINFER_PREFETCH_MODE=vram NINFER_PREFETCH_SLOTS=8`）：`[pf-region] bank=141 8 slot(s)/bank \| form=vram(explicit) staged=1 \| hits=7 calls=1130 (0.6%) \| fill=dev(select=69 placed=390 applied=352 already=300 ring-full=0 undrained=0)`；48 条层流按 bank 取末行求和 = `hits=447 calls=54010 (0.83%)`、`select=3243 placed=20948 applied=19365 already=10648`；`[pf-mirror] region` 由 `upload(s)=144 / entries=1152`（每 bank 一次后不再动）变为 `uploads=3383 / entries=27064`（随 `prefetch_generation` 动）；`[plan] device ... prefetch_mb=1440*`（此前 `0*(no consumer …)`），消费者即上面两支。代价（每层每 token，3 runs）：3 次 select 启动（每次 10 block×32 线程）、3 次 24 B `cudaMemsetAsync`、3×(24 B counts + 64 B pairs) D2H 搭在 `fetch_host_routed` 那次同步上、**0 次新增 stream 同步**；每层约 19.6 次采纳，最终仍被本层需要的每条付一次 1280 KiB 上传（该轮收益 = 447 次命中）。默认门禁逐位 `6.024313` / `20.673595`，默认 0 行 `[pf-region]`、`prefetch_mb=0` |
 | P2.3 | 形态与策略解耦：`NINFER_PREFETCH_MODE=vram` 与武装分离会漏（有槽无填充看起来像"没有调用者"） | 不设 MODE 时 `[pf-ctl]` 仍说清 armed | ✅ | `PrefetchForm{Vram,Fill,Warm}`；形态默认 vram（唯一会 stage 的形态），存在性仍由控制器/显式 override 决定。武装 16 槽但不设 MODE：`[pf-region] 16 slot(s)/bank \| form=vram(default) staged=1 \| hits=0 calls=640`（此前是静默跳过、只剩 hits=0）；显式 fill/warm 时打 `[pf-ctl] region armed=N slot(s)/bank but form=none ...`。`NINFER_PREFETCH_SLOTS` 单独设置仍 exit=1 `cannot arm ... no consumer`。遗留矛盾已记：`NINFER_PREFETCH=1` 下 cache 会 carve 而 `[plan]` 仍 `prefetch_mb=0*` |
 | P2.4 | 复活判据重测：`prev` ≥66%（现 49.4%）、每节点 ≤0.0117 s（现 0.0162 s） | 达标则开，否则写"永久关闭" | ⬜ | 16 槽武装：命中 0.2%、速度 −40% |
 
@@ -83,8 +83,8 @@
 
 | ID | 任务 | 验收 | 状态 | 证据 |
 |---|---|---|---|---|
-| P3.1 | 统一 scope：copy 侧也记 tier 读，或从 span 减掉读 | 冷 tier 下 `est copy` 与 `span` 同量级，`m*` 回到 ~4.8 | ⬜ | span 8186 us/路由 vs copy 12.6 us/路由（4 路由层） |
-| P3.2 | 只有 P3.1 之后才允许实测速率接回决策 | `leg=half` 比例不随冷热翻转 | 🟡 | 已接、默认 `NINFER_CPU_LEG_ACT=off`；`leg=half` 1389→5 |
+| P3.1 | 统一 scope：copy 侧也记 tier 读，或从 span 减掉读 | 冷 tier 下 `est copy` 与 `span` 同量级，`m*` 回到 ~4.8 | ✅（含一条与验收不符的实测） | `f0ddf640`。取 A：`decide_cpu_layer_budget` 的 `gpu_us = max(link + read, 3×upload)`，`read = (1−tier_warm) × cold_read_us`（就是 span 付的那次读的同一个实测；用 max 不用加法，因为实测 upload 里可能已经含这次读）。除数量回**按尺寸**的 span（`cpu_sample_for(routes)`，回退到 best span）——它当初被撤回正是因为这个口径分歧；决策 2 的 CPU 侧也按 miss 数取（`cpu_route_us_estimate(misses)`）。实测（8B e2 / 613 层带 `[cpu-path]` / `NINFER_CPU_PATH_POLICY=on NINFER_CPU_LEG_ACT=on NINFER_SPLIT_TIMING=1`）：冷段同层 `est copy=317us cpu=356us \| span=414.7us`（同量级；改前是 12.6 vs 8186），暖段同层 `est copy=130us cpu=1561us \| span=78.5us`；`m*` = 冷 1.3–1.6 / 暖 0.2–0.3，**不再随冷热翻转**；实际动用 CPU 半的层 233/613（最多 29 路由/层）。**不符处**：`m*` 不是 ~4.8。4.8 来自「span=147us、upload=42us」的假设，本机在 5–8 与 100+ 路由的尺寸上实测 span 是 356–542 us/路由，故交叉点落在 0.2–1.6；这与执行器当初测到的**掉速**同向，而不是它口径不一致时给出的反向结论。默认门禁逐位 `6.024313` / `20.673595`，默认 0 行 `[cpu-path]` |
+| P3.2 | 只有 P3.1 之后才允许实测速率接回决策 | `leg=half` 比例不随冷热翻转 | 🟡 | P3.1（`f0ddf640`）之后已接线：决策 2 的 CPU 侧与决策 3 的除数都取**尺寸对应**的实测 span，copy 侧同口径带 tier 读。默认仍 `NINFER_CPU_LEG_ACT=off`；打开后 613 层里 233 层真的动了路由（每层 ≤29），而 `leg=half` 的*判决*仍多于*动作*（`cpu=0` 的层是决策 3 已经把 `budget_us` 判成 −1，腿自己不再加码）。待办：把「判决/动作」两个数并排打在一行，再决定要不要复测速度 |
 | P3.3 | 面板可达：`[ctl] cpu share` / `[ctl] cpu leg` 在 e2 路径一次都没打出来 | `NINFER_SPLIT_TIMING=1` 下 e2 路径可见 | ✅ | 面板在 split 入口可达：`[ctl] cpu share: routes cpu=532/13818 (3.9%) last=0 experts \| rate span=440.1us@1 compute=236.2us@1 ...`、`[ctl] cpu leg: layer-level=0/0 (half=0 copy=0 nodata=0) \| acted=0 layer(s)/0 route(s) \| last m=0 m*=-1.0`；同一次 e2 运行 `NINFER_CPU_PATH_POLICY=on NINFER_SPLIT_TIMING=1` 下 `[ctl] fetch=` 20 行 / `[ctl] cpu share` 20 行 / `[ctl] cpu leg` 20 行 对 816 行 `[cpu-path]`（此前 0 行）；`PolicyController::layers` 现在每条 FFN 路径每层恰好自增一次（融合走 `step()`、split 走 `note_layer()`），默认门禁 `6.024313` / `20.673595` 且 0 行面板（只剩载入期的 `[ctl] prefetch:` / `[ctl] host split:` 两行） |
 
 ### P4 决策 1（KV split）
@@ -127,6 +127,8 @@
 7. ✅ P4.1 E8/parallel 的 4 处 gate 调用点（三族 E8 均 engage）
 8. ✅ P4.4 "恒为 DeviceCopy"的算术落文（`paged-kv-cache.md` §14.7）
 9. ✅ P5.3 `host_pages.h` 的 `packed_k` 清理（删掉布尔，单测改走 dtype 轴）
+10. ✅ P2.2 device 端放置件（`e1776dcb`）：放置决策上 device，`hits` 0 → 0.83%，`[pf-mirror] region` uploads 144 → 3383，`[plan] prefetch_mb=1440*`
+11. ✅ P3.1 统一 CPU 半两侧定价 scope（`f0ddf640`）：冷段 `est copy` 与 `span` 同量级，`m*` 不再随冷热翻转；`m*` 实测 0.2–1.6（不是 4.8，理由见该行）
 
 待关账：
 
@@ -161,4 +163,6 @@
 | 2026-11-16 | P4.2 通道关账（决策仍未接）：新增 `int8/plan_probe.h`（thread-local 一槽，唯一写入点 `rk_kv_cpu_split_gate`，参数即 launch 的 partition 与 `Schedule::kKeyRows`），`text.cpp::attn_mix` 在 `NINFER_SPLIT_TIMING` 下只读打印一次 `[kv-plan]`。实测两行对齐（`capacity=2`=`active=2`、`key_rows=32`=`key_tile=32`、`family=rk4v4`=`dtype=rk4v4`）；默认门禁逐位 `6.024313` / `20.673595`。`decide_cpu_kv_split` 仍零调用：缺的是宿主驻留页与"从这个通道之外的 window/字节"两件事，见 P4.2 行 |
 | 2026-11-16 | P4.4 关账：`paged-kv-cache.md` §14.7 把"恒为 DeviceCopy"的算术落文。33,792 B（`keys=32 / kv_heads=4 / packed_k`，`cost.h:76-77`）在数十 GB/s 上约 1.35 µs，CPU 侧 275.15 µs（与 `cost.h` 分项和 0.02% 一致）；翻转门槛 0.123 GB/s（或含上传时 0.033 GB/s），比值与 keys 无关。全部按已注册常量算，不是实测 |
 | 2026-11-16 | P5.3 关账：删除 `RkHostKvPlanes::packed_k` 与候选表的同名列（生产侧只走 `rk_host_kv_dtype_of`/`rk_host_kv_codecs`），单测 `family_identification()` 改为 `(K codec, V codec, 派生 dtype)` 三元组。`infer_kv_host_partial_mirror_test.exe` → `OK host page mirror`、exit=0、五族 27/27 行相等；默认门禁逐位 |
+| 2026-11-16 | P2.2 关账（`e1776dcb`）：预取区有了 device 端放置件。`ops::moe_prefetch_select` 在 device 上做两个决定（哪个专家、哪个区槽位）并把 `(expert, region)` 对写回，环游标是 device 字；host 只应用（`ExpertCache::adopt_prefetch_placements`，越界/非区槽位 fail-loud）并把字节交给池自己的上传路（唯一 device 可寻址源是 tier，而 tier 命中的专家本来就不需要拷贝；artifact 是 host 映射）。drain 搭在 `fetch_host_routed` 那次同步上，0 次新增同步。实测 `hits=447 calls=54010 (0.83%)`、`placed=20948 applied=19365`、`[pf-mirror] region uploads 144 → 3383`、`[plan] prefetch_mb=1440*`；默认门禁逐位 |
+| 2026-11-16 | P3.1 关账（`f0ddf640`）：CPU 半两侧同口径。copy 侧 `gpu_us = max(link + read, 3×upload)`（read 与 span 付的是同一次实测读），除数与决策 2 的 CPU 侧都改回尺寸对应的实测 span。冷段同层 `est copy=317us` 对 `span=414.7us`（改前 12.6 对 8186），`m*` 冷 1.3–1.6 / 暖 0.2–0.3 不再随冷热翻转；**`m*` 不是 4.8**：4.8 假设的 147 us span，本机在 5–8 与 100+ 路由实测 356–542 us。默认门禁逐位 |
 
