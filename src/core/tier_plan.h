@@ -66,6 +66,22 @@ struct BudgetSlot {
     bool        planned;     // shown, not claimed
 };
 
+// Does anything consume a Device prefetch region? The Device form of `ExpertStream::stage_predicted`
+// resolves the predicted ids against the pool's own mirror and counts them, and states in its own
+// panel that it placed nothing: `[pf-pred] Device form: ... fill=host-only (0 placed by the Device)`
+// (expert_stream.cpp). The placement half - the words set_prefetch_experts() writes and the bytes
+// that then have to leave the artifact - only exists on the host form. So the region has no Device
+// consumer today, and the line is zero BY RULE rather than because a controller computed zero:
+// before this, `[ctl] prefetch port ... -> 0 slot(s)/bank` made "nobody is connected" look like "the
+// policy chose nothing", and `NINFER_PREFETCH_SLOTS` could still carve a region no one filled
+// (measured: 20 slots/bank = 3.6 GiB = 30% of the pool, 1.54 tok/s against 8.28 without).
+inline constexpr bool device_prefetch_consumer_present() noexcept { return false; }
+
+// The reason string the Device prefetch line carries when it is zero, so "the policy took nothing"
+// and "there is nobody to take it" cannot be read the same way. Kept beside the predicate it explains.
+inline constexpr const char* kDevicePrefetchNoConsumer =
+    "no consumer: device-side placement absent (stage_predicted resolves and counts, fill=host-only)";
+
 inline constexpr std::array<BudgetSlot, kBudgetCount> kBudgetSlots{{
     // Name and order follow the capacity spec: device expert_pool_mb | kv_pages_mb | prefetch_mb |
     // slru_band_mb, then the startup allowance the cap carries (not part of the spec's four, so it
@@ -73,7 +89,7 @@ inline constexpr std::array<BudgetSlot, kBudgetCount> kBudgetSlots{{
     {Budget::DeviceExpertPool, Tier::Device, "expert_pool_mb", Budget::DeviceExpertPool, nullptr, false},
     {Budget::DeviceKvPages, Tier::Device, "kv_pages_mb", Budget::DeviceKvPages, nullptr, false},
     {Budget::DevicePrefetch, Tier::Device, "prefetch_mb", Budget::DeviceExpertPool,
-     "no claim of its own - carved out of expert_pool_mb, per bank", false},
+     kDevicePrefetchNoConsumer, false},
     {Budget::DeviceSlruBand, Tier::Device, "slru_band_mb", Budget::DeviceExpertPool,
      "no claim of its own - SLRU segments expert_pool_mb at policy time", false},
     {Budget::DeviceStartup, Tier::Device, "staging_mb", Budget::DeviceStartup,
@@ -105,6 +121,9 @@ public:
     // A claim that does not fit its tier is refused and nothing is recorded - the caller lowers the
     // ask, the same contract as the ledger's.
     bool set(Budget id, std::uint64_t bytes) noexcept {
+        // A line whose consumer does not exist is zero, whatever the caller computed: the table owns
+        // that rule, so no controller number and no override can put bytes on it again.
+        if (id == Budget::DevicePrefetch && !device_prefetch_consumer_present()) { bytes = 0; }
         const auto& row = slot(id);
         if (row.carved_from != id) {
             const auto parent = bytes_of(row.carved_from);

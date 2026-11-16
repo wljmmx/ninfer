@@ -337,7 +337,35 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
                                     asked("NINFER_PREFETCH_SIGNAL");
         note_prefetch_signals(signals);
         const auto sizing = decide_prefetch_slots();
-        region_slots      = static_cast<std::uint32_t>(sizing.slots_per_bank);
+        // P1.2: the region is zero BY RULE when its consumer does not exist, not "zero because the
+        // controller happened to compute zero". `core::device_prefetch_consumer_present()` is the
+        // code-level predicate (see tier_plan.h): the Device form of stage_predicted resolves and
+        // counts, it never places, so a carved region has nobody to fill it and only takes routed
+        // slots away.
+        region_slots = core::device_prefetch_consumer_present()
+                           ? static_cast<std::uint32_t>(sizing.slots_per_bank)
+                           : 0;
+        // The old escape hatch is gone: NINFER_PREFETCH_SLOTS used to carve a region with no
+        // consumer, which then read as "the policy chose nothing". It still sizes the host
+        // read-ahead band when the read-ahead is on (host_expert_residency.h), but on its own it can
+        // only mean "arm the Device region" - so say so instead of quietly doing nothing.
+        if (const char* slots = std::getenv("NINFER_PREFETCH_SLOTS");
+            slots != nullptr && *slots != '\0' && std::strtoul(slots, nullptr, 10) != 0) {
+            if (!core::device_prefetch_consumer_present() &&
+                std::getenv("NINFER_PREFETCH") == nullptr) {
+                throw std::runtime_error(
+                    std::string("NINFER_PREFETCH_SLOTS=") + slots +
+                    " cannot arm the Device prefetch region: it has no consumer (" +
+                    core::kDevicePrefetchNoConsumer +
+                    "). The region is zero by rule; set NINFER_PREFETCH too if you meant the host "
+                    "read-ahead band.");
+            }
+            std::fprintf(stderr,
+                         "[ctl] prefetch: NINFER_PREFETCH_SLOTS=%s sizes the host read-ahead band "
+                         "only; the Device region stays 0 by rule (%s)\n",
+                         slots, core::kDevicePrefetchNoConsumer);
+            std::fflush(stderr);
+        }
         std::fprintf(stderr,
                      "[ctl] prefetch: region=%u slot(s)/bank reason=%d (top_k=%d pool=%u/bank "
                      "runs=%d layers=%d staging=%d) - carved from the routed set, not extra memory\n",

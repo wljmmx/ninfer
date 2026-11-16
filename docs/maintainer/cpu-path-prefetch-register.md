@@ -56,7 +56,7 @@
 | ID | 任务 | 验收 | 状态 | 证据 |
 |---|---|---|---|---|
 | P1.1 | 列名/列序改成 `*_mb` 与规格一致（`prefetch_readahead`） | `[plan]` 三行与规格逐列对应 | ✅ | 现为 device `expert_pool_mb \| kv_pages_mb \| prefetch_mb \| slru_band_mb \| staging_mb \| claimed`；host `expert_arena_mb \| kv_host_mb \| prefetch_readahead_mb \| second_chance_mb \| claimed`（主机列序按规格）；默认门禁仍 `6.024313` / `20.673595` |
-| P1.2 | **prefetch 未接通强制 0** 落成规则（消费者未接通 → 恒 0 并在行内标注原因） | 默认 `[plan] prefetch=0*` 且 `[pf-region]` 不再被 carve | 🟡 | 现在"是 0"来自控制器算出来（`[ctl] prefetch port ... -> 0 slot(s)/bank`），不是规则 |
+| P1.2 | **prefetch 未接通强制 0** 落成规则（消费者未接通 → 恒 0 并在行内标注原因） | 默认 `[plan] prefetch=0*` 且 `[pf-region]` 不再被 carve | ✅ | 规则在 `core::device_prefetch_consumer_present()`（恒 false，依据 `[pf-pred] Device form: ... fill=host-only (0 placed by the Device)`），`TierPlan::set` 对 `prefetch_mb` 强制 0；行内原因 `prefetch_mb=0*(no consumer: device-side placement absent ...)`；`NINFER_PREFETCH_SLOTS=16` 单独设置 → exit=1 `cannot arm the Device prefetch region: it has no consumer`；默认门禁 `6.024313` / `20.673595` |
 | P1.3 | `kv_spill = {enabled, 上限, 重读计数}` | `[plan] ssd` 行给出三元组 | ⬜ | 现在只有 `kv-spill=0(no size knob - ...)` |
 | P1.4 | `cold_range` 进表 | `[plan]` 出现 `cold_range=NN`（= 总专家 − 池 − 暖区） | 🟡 | 数据已在 `[budget] experts: ... unslotted=55728 of 73728`，未进表未命名 |
 
