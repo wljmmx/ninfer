@@ -792,6 +792,24 @@ bool ExpertStream::fully_resident() const noexcept {
 }
 
 void ExpertStream::gh1_report() {
+    // The prediction region's own hit rate. `[pf]`'s `hit=` is the WARM TIER's, a different question:
+    // this one is "of the experts this layer routed to, how many did the region already hold", which
+    // is the only number that says whether the slots it took are earning their keep. The consumer is
+    // real and per layer (fill path -> cache_->prefetch_slot() -> prefetch_hits_), so the region is
+    // never "staged into a void"; what is unknown without this line is whether its size is right.
+    if (cache_ != nullptr && cache_->prefetch_slots_per_bank() != 0) {
+        std::fprintf(stderr,
+                     "[pf-region] %u slot(s)/bank | hits=%llu calls=%llu (%.1f%%) | a low rate here "
+                     "means the size is wrong, not that the region is unused\n",
+                     cache_->prefetch_slots_per_bank(),
+                     static_cast<unsigned long long>(prefetch_hits_),
+                     static_cast<unsigned long long>(prefetch_calls_),
+                     prefetch_calls_ != 0
+                         ? 100.0 * static_cast<double>(prefetch_hits_) /
+                               static_cast<double>(prefetch_calls_)
+                         : 0.0);
+        std::fflush(stderr);
+    }
     if (std::getenv("NINFER_EXPERT_TIMING") == nullptr || gh1_calls_ % 8 != 0) { return; }
     const auto pct = [](std::uint64_t part, std::uint64_t all) {
         return all == 0 ? 0.0 : 100.0 * static_cast<double>(part) / static_cast<double>(all);
