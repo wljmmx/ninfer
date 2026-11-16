@@ -7,6 +7,7 @@
 #include "core/memory_budget.h"
 #include "core/startup.h"
 #include "runtime/engine/context_cache/joint_planning.h"
+#include "models/qwen3_5/execution/cpu_path_policy.h"
 #include "models/qwen3_5/execution/expert_prefetch.h"
 #include "models/qwen3_5/execution/expert_path_control.h"
 #include "models/qwen3_5/execution/expert_stream.h"
@@ -203,10 +204,9 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     const auto capacity_limit = std::max<std::uint64_t>(
         capacity, static_cast<std::uint64_t>(pool_limit) / entry * entry);
     expert_debug("capacity", capacity, entry);
-    const auto requirements =
+    auto requirements =
         describe_expert_cache(specs, {.capacity_bytes = capacity,
                                       .capacity_limit_bytes = capacity_limit});
-
     std::vector<ExpertFileBank> files;
     files.reserve(streams.size() * 3);
     // port (sm_89): the bank description must match the reader that was created above. A host
@@ -305,33 +305,45 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
                                   gu_rows, dn_rows, requirements.banks[runs[i].first]));
     }
     expert_debug("files", files.size(), requirements.banks.size());
-    // The prediction region's budget, from the routing width: one decoded token asks a bank for
-    // top_k experts, and the delta a prediction can add over the resident set is at most that set,
-    // so two tokens' worth is the ceiling that still leaves the hot set its share (the pool clamps
-    // it to a quarter of a bank's window anyway). This must run before the pool is built: the region
-    // is carved at construction, and the host tier's read-ahead keys off the same number.
+    // The prediction region's budget: a DECISION (C4), taken here because the region is carved at
+    // construction and the numbers it needs are the model's own geometry - the routing width, the
+    // number of layers, the runs a layer has and the pool's window per bank. The size is
+    // decision 5's answer, not a constant and not a default: `decide_prefetch_slots()` scales the
+    // prior by the cold share and the measured rate, and returns 0 when nothing stages on this path.
     //
-    // NOT armed implicitly. The region is CARVED FROM THE POOL'S OWN SLOTS
-    // (core/expert_cache.cpp: carve runs `free_list(b).pop_back()` and then reserves
-    // `prefetch + ring` per bank), so turning it on with `NINFER_PREFETCH=1` shrinks the routed
-    // working set by banks*slots*entry_bytes - 20 x 144 x 1.25 MB = 3.6 GiB, THIRTY percent of the pool - and
-    // nothing consumes what it stages (`expert_prefetch` has no reader on the verify path). Measured
-    // 2026-11-16: 1.54 tok/s with the region armed against 8.28 without, same shape, same box. So the
-    // region now arms only when a caller states its size explicitly; the separate-space change (a
-    // device-tier grant, mirroring the host tier's routed-first-then-auxiliaries rule at
-    // `grant_routed`/`grant_prefetch` below) is what has to land before auto-arming can come back.
-    if (std::getenv("NINFER_PREFETCH_SLOTS") == nullptr) {
-        const char* flag   = std::getenv("NINFER_PREFETCH");
-        const bool enabled = flag != nullptr && *flag != '\0' && flag[0] != '0';
-        if (enabled) {
-            std::fprintf(stderr,
-                         "[ctl] prefetch: region NOT armed - no explicit NINFER_PREFETCH_SLOTS, and "
-                         "the region would carve %u x banks slots out of the routed working set "
-                         "with no consumer\n",
-                         routed_top_k > 0 ? 2U * routed_top_k : 0U);
-            std::fflush(stderr);
-        }
+    // Why 0 by default, stated once more because the carve is not free: the region is taken from the
+    // pool's own slots (core/expert_cache.cpp pops them off each bank's free list and reserves
+    // `prefetch + ring` per bank), so an armed region shrinks the routed working set by
+    // banks*slots*entry_bytes - 20 x 144 x 1.25 MB = 3.6 GiB, thirty percent of the pool, measured
+    // 2026-11-16 at 1.54 tok/s against 8.28 without. A region with no prediction source has nothing to
+    // stage, so `staging_reachable` is false unless THIS run asked for a source (vram / ring / signal),
+    // and decision 5 then answers 0 - which is a result, not a switch.
+    std::uint32_t region_slots = 0;
+    {
+        using namespace models::qwen3_5::execution;
+        PrefetchSignals signals;
+        signals.top_k       = static_cast<int>(routed_top_k);
+        signals.runs_per_layer =
+            streams.empty() ? 1 : static_cast<int>(requirements.banks.size() / streams.size());
+        signals.pool_slots_per_bank = entry != 0 ? static_cast<int>(capacity / entry) : 0;
+        signals.layers              = static_cast<int>(streams.size());
+        const auto asked = [](const char* name) {
+            const char* value = std::getenv(name);
+            return value != nullptr && *value != '\0' && value[0] != '0';
+        };
+        signals.staging_reachable = asked("NINFER_PREFETCH_MODE") || asked("NINFER_PRED_RING") ||
+                                    asked("NINFER_PREFETCH_SIGNAL");
+        note_prefetch_signals(signals);
+        const auto sizing = decide_prefetch_slots();
+        region_slots      = static_cast<std::uint32_t>(sizing.slots_per_bank);
+        std::fprintf(stderr,
+                     "[ctl] prefetch: region=%u slot(s)/bank reason=%d (top_k=%d pool=%u/bank "
+                     "runs=%d layers=%d staging=%d) - carved from the routed set, not extra memory\n",
+                     region_slots, sizing.reason, signals.top_k, signals.pool_slots_per_bank,
+                     signals.runs_per_layer, signals.layers, int(signals.staging_reachable));
+        std::fflush(stderr);
     }
+    requirements.config.prefetch_slots_per_bank = region_slots;
     instance.expert_cache = std::make_unique<ExpertCache>(
         specs, requirements, device, std::span<const ExpertBankPair>{}, files,
         source);

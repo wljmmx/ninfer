@@ -36,6 +36,12 @@ struct ExpertCacheConfig {
     std::uint64_t capacity_limit_bytes = 0;
     std::size_t max_batch_bytes   = 32U * 1024U * 1024U;
     std::uint32_t upload_slots    = 2;
+    // Q30/P6, C4: slots per bank the controller's decision asked the prediction region to carve.
+    // Zero means "no region" (the default: nothing on this path stages a prediction, and a region
+    // carved out of the routed working set with no consumer is a measured 30% residency loss with no
+    // gain). NINFER_PREFETCH_SLOTS overrides it for an experiment; the value is still clamped by the
+    // pool's own geometry below, so a caller cannot ask for more than a bank's window can hold.
+    std::uint32_t prefetch_slots_per_bank = 0;
 
     friend bool operator==(const ExpertCacheConfig&, const ExpertCacheConfig&) = default;
 };
@@ -173,6 +179,23 @@ void prepare(std::span<const ExpertCacheKey> required, cudaStream_t stream = nul
     // return how many entries were written. The device-side placement needs exactly this table; it
     // cannot be uploaded before it can be extracted, which is why the export comes first.
     [[nodiscard]] std::uint32_t export_slots(std::uint32_t bank, std::span<std::uint32_t> out) const;
+    // C1: the PREDICTION REGION's own table, in its own space. `out[region]` is the expert occupying
+    // region slot `region` (kAbsentSlot where the ring has never been written or was recycled), and
+    // the return value is the number of entries written. It is the forward form of
+    // prefetch_owners(bank) - deliberately not the placement table: a region index is not a pool slot,
+    // and the two spaces have different sizes on every bank that has a region at all.
+    [[nodiscard]] std::uint32_t export_prefetch_owners(std::uint32_t bank,
+                                                       std::span<std::uint32_t> out) const;
+    // The pool slot a region index names. A region index is an index into this bank's region, not an
+    // address; anything that needs bytes asks here. Nullopt for an index outside the region, so a
+    // caller that mixed the two spaces is refused rather than handed a plausible slot number.
+    [[nodiscard]] std::optional<std::uint32_t> prefetch_region_slot(std::uint32_t bank,
+                                                                    std::uint32_t index) const noexcept;
+    // The region index an expert currently occupies, or nullopt. The inverse of the table above, and
+    // the number that makes the two spaces comparable: a check that compares this against
+    // expert_slot() can tell a mixed-up caller from a correct one.
+    [[nodiscard]] std::optional<std::uint32_t> prefetch_region_index(std::uint32_t bank,
+                                                                     std::uint32_t expert) const;
     [[nodiscard]] std::uint32_t slots_per_bank() const noexcept;
 
     // port (sm_89): the pinned RAM tier the host half keeps its working set in. When set, an upload

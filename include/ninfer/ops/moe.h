@@ -311,6 +311,35 @@ void moe_route_slots(const std::int32_t* ids, int count, const std::uint32_t* sl
                      std::uint32_t experts, std::uint32_t* slots, std::uint32_t* misses,
                      cudaStream_t stream);
 
+// C2: WHICH table an id->slot query is against. The two are different spaces and must never be read
+// through one another: a placement slot is a pool slot (the address of an expert's bytes), while a
+// region index is a position inside one bank's prediction ring (0..prefetch_slots_per_bank-1). The
+// kernel takes the kind explicitly so a caller cannot pick the wrong one by passing a table it has.
+enum class RouteTableKind : std::uint32_t {
+    Placement        = 0, // table[expert] = pool slot   (export_slots)
+    PrefetchRegion   = 1, // table[region] = expert      (export_prefetch_owners), searched backwards
+};
+
+// The region form of the same query (kernels/cuda/route_slots.cu). `table` here is the region's
+// OWNER table - `table[region] = expert`, kAbsentSlot for a hole - and the result is the REGION INDEX
+// that holds `id`, or kAbsentSlot when the region does not hold it. It is deliberately not the same
+// arithmetic as the placement form: the region is indexed by slot, so the answer is a search over it.
+//
+// A mixed-up caller is refused rather than served a plausible number: `regions` (the region's length)
+// and `experts` (the bank's width) are different numbers on every bank with a region, and the host-side
+// caller checks the answer against prefetch_region_slot() before it is used as an address.
+void moe_route_region_slots(const std::int32_t* ids, int count,
+                            const std::uint32_t* region_owners, std::uint32_t regions,
+                            std::uint32_t* region_indices, std::uint32_t* misses,
+                            cudaStream_t stream);
+
+// One entry point for a caller that already has the kind in hand: dispatches to the two above. Passing
+// Placement with a region owner table (or the reverse) is caught downstream, not here - the kind is the
+// caller's statement about the table it is holding.
+void moe_route_slots(const std::int32_t* ids, int count, const std::uint32_t* table,
+                     std::uint32_t entries, RouteTableKind kind, std::uint32_t* slots,
+                     std::uint32_t* misses, cudaStream_t stream);
+
 // port (sm_89): P1 - the prediction hand-off as a ring the Device writes and the host drains
 // (kernels/cuda/pred_ring.cu).
 //

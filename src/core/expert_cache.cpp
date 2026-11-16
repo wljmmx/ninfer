@@ -18,13 +18,20 @@ namespace ninfer {
 namespace {
 
 constexpr std::uint64_t kAbsent = std::numeric_limits<std::uint64_t>::max();
-// Q30/P6: slots per bank in the prediction region. Off unless asked for. The caller sizes it from the
-// measured delta between "predicted for the next layer" and "already in the pool", which is much
-// smaller than top-k - about one expert a layer on this artifact, not eight.
-std::uint32_t prefetch_slots_from_env() {
+// Q30/P6, C4: slots per bank in the prediction region. The controller decides the number and hands it
+// in through ExpertCacheConfig; NINFER_PREFETCH_SLOTS stays as the experiment override, because an A/B
+// that has to rebuild the decision in the environment would measure the environment instead.
+//
+// `ask` is an out-param so the caller can print which of the two sources was in force: a run that says
+// "region: 8 slot(s)" without saying who asked for eight cannot be told from a default that grew.
+std::uint32_t prefetch_slots_from_env(const ExpertCacheConfig& config, const char** ask) {
     const char* value = std::getenv("NINFER_PREFETCH_SLOTS");
-    if (value == nullptr || *value == '\0') { return 0; }
-    return static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
+    if (value != nullptr && *value != '\0') {
+        if (ask != nullptr) { *ask = "NINFER_PREFETCH_SLOTS"; }
+        return static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
+    }
+    if (ask != nullptr) { *ask = "controller"; }
+    return config.prefetch_slots_per_bank;
 }
 
 std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
@@ -449,11 +456,12 @@ std::vector<std::uint64_t> bank_generation;
             }
             ring_per_bank = std::min<std::uint32_t>(ring_per_bank, slot_cap / 2);
         }
-        // Q30/P6: size the prediction region BEFORE seeding and take it out of each bank's seed
-        // (hot = capacity - S_p, the same shape B4 uses for the ring). Taking it from the leftovers
-        // was tried first and never produced a region: the pool seeds every bank to its cap, so
-        // nothing is left to carve.
-        prefetch_per_bank = prefetch_slots_from_env();
+        // Q30/P6, C4: size the prediction region BEFORE seeding and take it out of each bank's seed
+        // (hot = capacity - S_p, the same shape B4 uses for the ring). The number now comes from the
+        // controller's decision (ExpertCacheConfig::prefetch_slots_per_bank); the environment is an
+        // override for an experiment, and the source is printed with the size.
+        const char* region_source = "controller";
+        prefetch_per_bank = prefetch_slots_from_env(config, &region_source);
         if (prefetch_per_bank != 0 && !banks.empty()) {
             const auto room = static_cast<std::uint32_t>(slot_cap / 4);
             prefetch_per_bank = std::min(prefetch_per_bank, room);
@@ -506,9 +514,9 @@ std::vector<std::uint64_t> bank_generation;
                 }
             }
             std::fprintf(stderr,
-                         "[pool] prefetch region: %u slot(s)/bank, carved per bank like the "
+                         "[pool] prefetch region: %u slot(s)/bank (source=%s), carved per bank like the "
                          "ring - %llu MiB of residency, not extra memory\n",
-                         prefetch_per_bank,
+                         prefetch_per_bank, region_source,
                          static_cast<unsigned long long>(
                              (static_cast<std::uint64_t>(prefetch_per_bank) *
                               static_cast<std::uint64_t>(banks.size()) * slot_bytes) >> 20));
@@ -1825,6 +1833,35 @@ std::uint32_t ExpertCache::export_slots(std::uint32_t bank, std::span<std::uint3
     const auto count  = std::min<std::size_t>(table.size(), out.size());
     for (std::size_t i = 0; i < count; ++i) { out[i] = table[i]; }
     return static_cast<std::uint32_t>(count);
+}
+
+// C1: the region's own table. It is exactly prefetch_owners(bank) - the ring's slot -> expert word,
+// kAbsentSlot for a hole - so the mirror that the fill path resolves against cannot drift from the
+// table the pool places into. The placement table above is a different space (expert -> pool slot) and
+// a different generation (step_generation); nothing shares either.
+std::uint32_t ExpertCache::export_prefetch_owners(std::uint32_t bank,
+                                                  std::span<std::uint32_t> out) const {
+    const auto& owners = prefetch_owners(bank);
+    const auto count   = std::min<std::size_t>(owners.size(), out.size());
+    for (std::size_t i = 0; i < count; ++i) { out[i] = owners[i]; }
+    return static_cast<std::uint32_t>(count);
+}
+
+std::optional<std::uint32_t> ExpertCache::prefetch_region_slot(std::uint32_t bank,
+                                                               std::uint32_t index) const noexcept {
+    if (bank >= impl_->prefetch_slots.size() || index >= impl_->prefetch_slots[bank].size()) {
+        return std::nullopt;
+    }
+    return impl_->prefetch_slots[bank][index];
+}
+
+std::optional<std::uint32_t> ExpertCache::prefetch_region_index(std::uint32_t bank,
+                                                                std::uint32_t expert) const {
+    const auto& owners = prefetch_owners(bank);
+    for (std::size_t index = 0; index < owners.size(); ++index) {
+        if (owners[index] == expert) { return static_cast<std::uint32_t>(index); }
+    }
+    return std::nullopt;
 }
 
 std::uint32_t ExpertCache::bank_count() const noexcept {

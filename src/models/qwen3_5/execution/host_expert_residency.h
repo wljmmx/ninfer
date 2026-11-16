@@ -584,6 +584,30 @@ public:
         return taken;
     }
 
+    // C5: the other consumer of the same evidence. On the split path the predicted experts go to the
+    // Device pool, not to the CPU half, so no route ever reads their tier slot - the read-ahead's
+    // bytes are used by the POOL's upload (ExpertCache::upload_one copies out of the arena when it
+    // holds the expert) and `take_prefetch_hits()` therefore never sees them. This reports the same
+    // fact from that consumer: of `experts`, how many sit in a slot the read-ahead filled. The mark is
+    // cleared so one fill is credited once, exactly as a routed hit clears it.
+    [[nodiscard]] std::uint32_t take_prefetch_marks(std::uint32_t bank,
+                                                   std::span<const std::uint32_t> experts) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (bank >= state_.size()) { return 0; }
+        auto& slots = state_[bank].slot_of;
+        std::uint32_t used = 0;
+        for (const auto expert : experts) {
+            if (expert >= slots.size()) { continue; }
+            const auto slot = slots[expert];
+            if (slot == kNone || slot >= prefetched_.size()) { continue; }
+            if (prefetched_[slot] != 0) {
+                prefetched_[slot] = 0;
+                ++used;
+            }
+        }
+        return used;
+    }
+
     // Q69: the read-ahead's other target, and the reason it exists.
     //
     // The tier is 930 MiB of arena carved into slots, and a read-ahead that fills them competes with

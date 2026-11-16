@@ -6,6 +6,7 @@
 #include "core/expert_file.h"
 #include "core/ring_admission.h"
 #include "core/weight_bank.h"
+#include "models/qwen3_5/execution/cpu_path_policy.h"
 #include "ninfer/ops/moe.h"
 
 #include <array>
@@ -137,20 +138,28 @@ public:
     [[nodiscard]] std::uint32_t pool_slots_per_bank() const noexcept {
         return cache_ != nullptr ? cache_->slots_per_bank() : 0;
     }
-    // S2: the Device mirror of the pool's slot tables - one contiguous uint32_t array, banks in pool
-    // order, segment `bank` starting at the sum of the preceding segments' lengths (the layout the host
-    // staging accumulated in).
+    // S2/C1: the Device mirrors of the pool's tables. There are TWO, because the two tables are in
+    // different spaces and move on different events:
     //
-    // Only the banks this stream resolves are kept current in it: its own run banks (one for a fused
-    // layer, three for the gate/up/down form). The image spans every bank of the pool, but the segments
-    // of other layers' banks are never uploaded - the pool holds a bank per layer, so copying them all
-    // from every layer would repeat the same bytes once per layer per step for tables nothing here
-    // reads. `slot_mirror_segment()` therefore returns null for a bank this stream does not serve, and
-    // for one whose Device copy is not its current generation - the honest answer instead of a pointer
-    // to stale bytes.
-    [[nodiscard]] const std::uint32_t* slot_mirror_device() const noexcept { return slot_mirror_dev_; }
+    //   * the PLACEMENT mirror is expert -> pool slot (export_slots), versioned by step_generation -
+    //     the id->address table the demand path resolves through. It legitimately moves whenever the
+    //     resident set does;
+    //   * the PREDICTION REGION mirror is region slot -> expert (export_prefetch_owners), versioned by
+    //     prefetch_generation - the table the FILL path resolves through. It moves only when a
+    //     prediction is placed, which is the point: with nothing staging, it never re-uploads.
+    //
+    // One image, banks in pool order, each segment `host[bank].size()` entries long. Only the banks
+    // this stream serves are kept current: copying all of them from every layer would repeat the same
+    // bytes once per layer per step for tables nothing here reads.
+    [[nodiscard]] const std::uint32_t* slot_mirror_device() const noexcept {
+        return placement_mirror_.dev;
+    }
+    [[nodiscard]] const std::uint32_t* prefetch_mirror_device() const noexcept {
+        return prefetch_mirror_.dev;
+    }
     [[nodiscard]] const std::uint32_t* slot_mirror_segment(std::uint32_t bank,
-                                                          std::uint32_t* entries) const noexcept;
+                                                          std::uint32_t* entries,
+                                                          ops::RouteTableKind kind) const noexcept;
     // Read-only, for the controller's prefetch port: the two rates the sizing decision is a function
     // of, plus the stream's own frozen state. -1.0 means "no sample yet", never 0 by default - a
     // decision must be able to tell "measured zero" from "nothing measured".
@@ -700,6 +709,17 @@ private:
     std::uint64_t predicted_runs_filled_      = 0;
     std::uint64_t predicted_fill_failures_    = 0;
     std::uint64_t predicted_run_mismatches_   = 0;
+    // C3/C4: layers whose prediction was REFUSED because the controller's plan said so (slots
+    // computed to zero, or a cutoff of zero layers). Counted apart from a fill that failed, because
+    // "the region was shut" and "the region was open and could not place" are different findings.
+    std::uint64_t predicted_shut_layers_      = 0;
+    // C2: a region owner that names an expert whose placement slot has since moved or gone. That is a
+    // stale region row (normal: the resident set is recomputed every layer and a prediction is not a
+    // member of it), not two spaces used as one - counted apart so the mix counter means what it says.
+    std::uint64_t prefetch_region_stale_      = 0;
+    // The model's routing width, recorded by the last ensure(). Used by the prefetch port, which runs
+    // outside the layer that knows it; 0 means "no layer has run yet".
+    std::int32_t  top_k_ = 0;
     std::uint64_t prefetch_out_of_range_      = 0;
     std::weak_ptr<HostExpertResidency> host_weak_;
     std::uint32_t bank_ = 0;
@@ -743,6 +763,10 @@ private:
     // asked. Together with `prefetch_calls_` this gives the per-layer ask, which is the number the
     // job granularity and the budget have to be sized from.
     std::uint64_t prefetch_target_ = 0;
+    // C5: experts whose read the prediction's fill handed to the read-ahead worker (`queue_prefetch_fill`).
+    // It is the delta the fill would otherwise have read in front of the copy, so the queue's own
+    // enqueue/ran/expired counters can be read against a number this path produced.
+    std::uint64_t prefetch_queued_ = 0;
     // P6/step 5: routes served by each structure. They sum to the routed experts counted, which is
     // what makes the split checkable instead of decorative.
     std::uint64_t route_hot_      = 0; // the epoch's hot set
@@ -868,19 +892,61 @@ private:
     std::uint32_t last_host_routes_ = 0;
     // Prints the GH1 panel; one place so the pinned fast path and the normal path cannot drift.
     void gh1_report(cudaStream_t stream = nullptr);
-    // Stage the slot-table mirror for every bank whose placement generation moved (S1).
+    // C1: stage both mirrors. `placement` is re-exported when step_generation(bank) moved and
+    // `prefetch` when prefetch_generation(bank) moved - two tables, two generations, never one table
+    // wearing two names.
     void sync_slot_mirror(cudaStream_t stream = nullptr);
-    // S2-5: resolve this layer's routed ids to pool slots against that mirror, on the Device, and count
-    // what the table could not answer. Explicit switch only (NINFER_SLOT_LOOKUP) on the demand path;
-    // `armed` lets S3's Device-form prediction use the same resolver without inventing a second one,
-    // because the demand path's default has to stay bit-identical.
+    // S2-5/C2: resolve this layer's routed ids on the Device against ONE of the two mirrors, named by
+    // the caller. `Placement` yields pool slots (addresses); `PrefetchRegion` yields region indices
+    // (positions in the bank's prediction ring). Explicit switch only (NINFER_SLOT_LOOKUP) on the
+    // demand path; `armed` lets the prediction path use the same resolver without inventing a second
+    // one, because the demand path's default has to stay bit-identical.
     void lookup_routed_slots(const void* device_ids, std::int32_t id_values, cudaStream_t stream,
-                             bool armed = false);
-    // Frees the Device mirror (a new bank geometry makes the old image unreadable).
+                             ops::RouteTableKind kind, bool armed = false);
+    // The region's own two-space check: an index that the region does not hold, or a placement slot
+    // that turns out to be a region slot, is a caller using one space as the other. Counted and
+    // printed with both numbers, because "it resolved" and "it resolved to something plausible" are
+    // different statements and only the first is a hit.
+    void note_slot_space(std::uint32_t bank, ops::RouteTableKind kind, std::uint32_t value);
+    // Frees a mirror's Device image (a new bank geometry makes the old one unreadable).
     void release_slot_mirror_device() noexcept;
     // S2: whether `bank` is one of this stream's own runs, i.e. whether its segment is kept current on
     // the Device. Shared by the upload and the lookup so the two cannot disagree.
     [[nodiscard]] bool serves_bank(std::uint32_t bank) const noexcept;
+    // One contiguous Device image per table, with the bookkeeping that has to move with it: the
+    // staged host rows, the generation they were exported at, the bank order inside the image, and the
+    // per-mirror counters. Kept as a struct rather than a second set of `_p`-suffixed members because
+    // the two mirrors must be identical in shape and different in every number.
+    struct SlotMirror {
+        std::vector<std::uint64_t>              gen;      // generation the host rows were exported at
+        std::vector<std::vector<std::uint32_t>> host;     // staged rows, one vector per bank
+        std::uint32_t*                          dev      = nullptr;
+        std::size_t                             bytes    = 0;
+        std::vector<std::uint32_t>              off;      // entry offset of each bank in the image
+        std::vector<std::uint64_t>              dev_gen;  // generation the Device copy holds
+        std::vector<std::uint32_t>              dev_off;  // ... and the offset it was written at
+        std::uint64_t                           uploads     = 0; // host re-exports
+        std::uint64_t                           entries     = 0; // rows exported, cumulative
+        std::uint64_t                           dev_uploads = 0;
+        std::uint64_t                           dev_bytes   = 0;
+        std::uint64_t                           dev_fails   = 0;
+    };
+    void sync_mirror(SlotMirror& mirror, ops::RouteTableKind kind, cudaStream_t stream);
+    void release_mirror_device(SlotMirror& mirror) noexcept;
+    [[nodiscard]] const std::uint32_t* mirror_segment(const SlotMirror& mirror, std::uint32_t bank,
+                                                      std::uint32_t* entries) const noexcept;
+    // C5: hand one fill's byte source to the process-wide read-ahead worker, so the artifact read
+    // happens under the layer that is computing instead of in front of the layer that needs it. The
+    // region's placement and the Device copy stay on the calling thread (they must be ordered before
+    // the consuming GEMMs); what moves is the read. Returns how many experts were offered.
+    std::size_t queue_prefetch_fill(std::span<const std::uint32_t> experts, std::uint32_t bank,
+                                   std::uint64_t tick, std::uint64_t window);
+    // C3/C4: assemble the port from what this layer measured and ask the controller for the plan. One
+    // function so the arming decision and the printed line cannot disagree. The routing width is the
+    // model's own (`top_k_`, recorded by the last ensure): the WIDTH OF A GUESS is a different number -
+    // a prefill guess is forty ids and a decode guess is ten - and pricing the region at the guess's
+    // width would make the cutoff depend on the prompt length.
+    [[nodiscard]] PrefetchPlan prefetch_plan() const;
     std::uint64_t entered_steps_ = 0;
     // port (sm_26): whether this bank's resident set has ever been built. A prefill is not allowed to
     // choose the set, but the first call has to, or a cold start would route everything to the host
@@ -908,40 +974,40 @@ private:
     Coverage coverage_{};
     std::uint64_t residency_routes_ = 0;
     std::uint64_t residency_inside_ = 0;
-    // S1: the expert->slot table mirror, staged per bank and versioned by step_generation(bank) -
-    // the counter the pool already bumps whenever a bank's set changes. Re-export happens only when
-    // that generation moves, so the mirror cannot map through a stale table and does not re-upload
-    // every step. The device pointer lands with the id->slot kernel (S2), which is what reads it.
-    std::vector<std::uint64_t> slot_mirror_gen_;
-    std::vector<std::vector<std::uint32_t>> slot_mirror_host_;
-    std::uint64_t mirror_uploads_ = 0;
-    std::size_t   mirror_entries_ = 0;
-    // S2-1: the Device copy of the staged tables - one contiguous array, banks in pool order, each
-    // bank's segment `slot_mirror_host_[bank].size()` entries long. A raw cudaMalloc on purpose: this
-    // is Device memory that the id->slot kernel indexes, so it must not be a host-side container and
-    // it must be freed by this object. `slot_mirror_off_` is the entry offset of each bank inside it,
-    // which is also the layout the host staging was accumulated in - the two cannot disagree because
-    // both are derived from the same per-bank lengths.
-    std::uint32_t* slot_mirror_dev_       = nullptr;
-    std::size_t    slot_mirror_bytes_     = 0;
-    std::vector<std::uint32_t> slot_mirror_off_;
-    std::vector<std::uint64_t> slot_mirror_dev_gen_; // generation the Device copy holds, stale = ~0
-    // The entry offset each Device copy was written at. A bank whose own length changed moves every
-    // later segment, so "same generation" alone is not enough to trust a pointer: the offset must match.
-    std::vector<std::uint32_t> slot_mirror_dev_off_;
-    std::uint64_t mirror_dev_uploads_ = 0;
-    std::uint64_t mirror_dev_bytes_   = 0;
-    std::uint64_t mirror_dev_fails_   = 0;
+    // C1: two mirrors, two spaces, two generations.
+    //
+    //   placement_ - expert -> pool slot (export_slots), versioned by step_generation(bank). This is
+    //                the demand path's id -> address table; it moves whenever the resident set does,
+    //                which on a streaming pool is every layer - by design, because the addresses
+    //                really did move.
+    //   prefetch_  - region slot -> expert (export_prefetch_owners), versioned by
+    //                prefetch_generation(bank). This is the FILL path's table; it moves only when a
+    //                prediction is actually placed, so a run that stages nothing re-uploads nothing.
+    //
+    // Before this split the mirror was the placement table versioned by step_generation and was used
+    // for both questions, which is why the region's lookups could only ever be as fresh as the last
+    // resident-set move and the upload count was one per bank per layer (measured 9921 re-exports on
+    // a decode run). The two are kept apart in the type, not in a comment.
+    SlotMirror placement_mirror_;
+    SlotMirror prefetch_mirror_;
     // The upload's source: pinned, because a pageable source makes cudaMemcpyAsync a synchronous copy
     // (the driver stages it through its own buffer and the call waits), which would put a host stall on
-    // every layer whose placement moved. Sized to the widest bank segment.
+    // every layer whose placement moved. Sized to the widest bank segment, shared by both mirrors
+    // because they are staged one after the other on the same thread.
     std::unique_ptr<PinnedHostBuffer> slot_mirror_stage_;
-    // S2-5: the staging path's id->slot check. Off unless NINFER_SLOT_LOOKUP is set: the result has no
-    // consumer in the shipped placement yet, so the switch is what keeps the default path untouched.
-    std::uint32_t* lookup_slots_dev_  = nullptr;
-    std::uint32_t* lookup_misses_dev_ = nullptr;
-    std::size_t    lookup_capacity_   = 0;
-    std::uint64_t  lookup_calls_      = 0;
+    // S2-5/C2: the id->slot check. Off unless NINFER_SLOT_LOOKUP is set on the demand path: the result
+    // has no consumer in the shipped placement yet, so the switch is what keeps the default path
+    // untouched. `lookup_region_*` is the region form's own output and counter - a different question
+    // with a different answer space, so it does not share either.
+    std::uint32_t* lookup_slots_dev_        = nullptr;
+    std::uint32_t* lookup_misses_dev_       = nullptr;
+    std::uint32_t* lookup_region_dev_       = nullptr;
+    std::uint32_t* lookup_region_misses_dev_ = nullptr;
+    std::size_t    lookup_capacity_         = 0;
+    std::uint64_t  lookup_calls_            = 0;
+    std::uint64_t  lookup_region_calls_     = 0;
+    std::uint64_t  slot_space_mixes_        = 0; // C2: one space used as the other
+    std::uint64_t  pf_ctl_reports_          = 0;
     // P1: the prediction ring. Allocated on the first guess handed to this stream, and sized from that
     // guess (id capacity) and from the pool's layer count (depth) - see pred_ring_write. `tail_` is the
     // only host-side cursor; the producer's head is a Device word, so nothing here is written by the

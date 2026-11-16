@@ -485,6 +485,18 @@ struct PrefetchSignals {
     int    top_k               = 0;
     int    runs_per_layer      = 1;
     int    pool_slots_per_bank = 0;
+    // C3: the model's own depth, so the cutoff below can be derived instead of chosen. `layers` is how
+    // many layers the pool holds (banks / runs_per_layer, i.e. the length of a step on this model);
+    // `ring_depth` is the prediction ring's depth when one is allocated (0 = none), because a guess
+    // older than the ring can never arrive; `max_layers_ahead` is the controller's own cap, 0 meaning
+    // "derive it from the two above".
+    int    layers              = 0;
+    int    ring_depth          = 0;
+    int    max_layers_ahead    = 0;
+    // C4: the region the pool actually carved (0 = none). The plan cannot ask for more slots than
+    // exist: a decision that outvoted the carve would arm fills into a ring that has no room, and the
+    // pool's own set_prefetch_experts() would drop the difference silently.
+    int    region_slots        = 0;
 };
 
 inline PrefetchSignals& prefetch_signals() {
@@ -508,6 +520,92 @@ inline void note_prefetch_signals(const PrefetchSignals& signals) { prefetch_sig
     query.hit_rate          = signals.hit_rate;
     query.staging_reachable = signals.staging_reachable;
     return decide_prefetch_slots(query);
+}
+
+// ---- C3: how far ahead the region may fill -------------------------------------------------------
+//
+// Decision 5 answers "how many slots". This answers "how many LAYERS those slots may be spent on", and
+// it is the same kind of question: a cost divided by a demand, with both sides read from the model and
+// from a measurement.
+//
+//   demand(layer) = cold_share x top_k          (one bank's expected fill for one layer: the routes
+//                                                that are cold, which is exactly what a prediction
+//                                                of that layer would add to the region)
+//   affordable    = slots / max(1, demand)      (how many layers the region can hold at once)
+//   budget        = the controller's cap, else the ring's depth when one exists, else the model's own
+//                   layer count (a ring cannot deliver a guess older than its depth, and a fill for a
+//                   layer past the end of a step is a guess about the next token)
+//   cutoff        = min(affordable, budget, layers)
+//
+// A cutoff of 0 means the region cannot hold even one layer's cold delta: nothing may be filled, and
+// that is a RESULT of the arithmetic, not a switch. This is what makes "armed" a number rather than a
+// policy flag - a 4-slot region on a 42.5%-cold, top_k=8 layer has demand 4, so it may run one layer
+// ahead; a 2-slot region has cutoff 0 and stays shut.
+struct PrefetchPlan {
+    int         slots_per_bank  = 0;  // decision 5's answer
+    int         delta_per_layer = 0;  // one bank's expected cold delta (demand above)
+    int         cutoff          = 0;  // layers ahead the region may be filled for
+    bool        armed           = false;
+    int         reason          = 0;  // PrefetchSizing::reason, or the C3 refusal below
+    const char* why             = "no staging";
+};
+
+// The experiment override, read the same way NINFER_CPU_PATH_FORCE is: an A/B that had to beat the
+// measured rate before it could measure anything would measure the rate, not the mechanism. 0/unset
+// means "no override" - the controller's decision governs. The value still cannot exceed the region
+// that was carved, so an override cannot name slots that do not exist.
+[[nodiscard]] inline int prefetch_slots_forced() {
+    static const int value = [] {
+        const char* env = std::getenv("NINFER_PREFETCH_SLOTS");
+        if (env == nullptr || *env == '\0') { return 0; }
+        const long asked = std::strtol(env, nullptr, 10);
+        return asked <= 0 ? 0 : static_cast<int>(asked);
+    }();
+    return value;
+}
+
+[[nodiscard]] inline PrefetchPlan decide_prefetch_plan() noexcept {
+    const auto& signals = prefetch_signals();
+    const auto  sizing  = decide_prefetch_slots();
+    PrefetchPlan plan;
+    plan.slots_per_bank = sizing.slots_per_bank;
+    plan.reason         = sizing.reason;
+    const int forced    = prefetch_slots_forced();
+    if (forced > 0) {
+        plan.slots_per_bank = forced;
+    }
+    if (signals.region_slots > 0) {
+        // The carve is the physical ceiling. A decision above it would name slots the ring does not
+        // have; the pool would place what fits and the rest would silently be a demand miss.
+        plan.slots_per_bank = std::min(plan.slots_per_bank, signals.region_slots);
+    }
+    if (!signals.staging_reachable) {
+        plan.why = "staging not reachable";
+        return plan;
+    }
+    if (signals.top_k <= 0) {
+        plan.why = "no routing width";
+        return plan;
+    }
+    if (plan.slots_per_bank <= 0) {
+        plan.why = "no slots";
+        return plan;
+    }
+    const double cold = signals.cold_share >= 0.0 ? signals.cold_share : 1.0;
+    plan.delta_per_layer =
+        std::max(1, static_cast<int>(cold * static_cast<double>(signals.top_k) + 0.5));
+    const int affordable = plan.slots_per_bank / plan.delta_per_layer;
+    int budget = signals.max_layers_ahead > 0
+                     ? signals.max_layers_ahead
+                     : (signals.ring_depth > 0 ? signals.ring_depth : signals.layers);
+    if (signals.layers > 0 && budget > signals.layers) { budget = signals.layers; }
+    plan.cutoff = std::min(std::max(0, affordable), std::max(0, budget));
+    plan.armed  = plan.cutoff > 0;
+    plan.why    = plan.armed
+                      ? (forced > 0 ? "env override"
+                                    : (sizing.reason == 3 ? "rate-scaled" : "cost model"))
+                      : "depth";
+    return plan;
 }
 
 inline constexpr double kCpuGflopsCalibrated = 778.0; // the benchmark's own effective rate

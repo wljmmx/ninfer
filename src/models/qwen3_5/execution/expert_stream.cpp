@@ -814,35 +814,76 @@ bool ExpertStream::fully_resident() const noexcept {
     return cache_ != nullptr && cache_->resident_capacity(bank_) >= count_;
 }
 
-// S1: stage each bank's expert->slot table, re-exporting only when step_generation(bank) moved. This
-// is the mirror the id->slot kernel reads; the generation is the pool's own, so a placement change is
-// noticed without inventing a second notion of "the table changed".
+// S1/C1: two mirrors, one per table, each with its own generation.
 //
-// S2: the staging is also uploaded to one contiguous Device image, in the same bank order the host
-// accumulated it in, so `slot_mirror_dev_ + slot_mirror_off_[bank]` is exactly the table
-// export_slots(bank, ...) returned. Nothing here decides placement or size: the bank count comes from
-// the pool, each segment's length from the export's return value, and the offsets from those lengths.
+// The PLACEMENT mirror (expert -> pool slot, export_slots) is versioned by step_generation(bank): the
+// counter the pool bumps whenever a bank's set changes. It legitimately re-exports every layer on a
+// streaming pool, because the addresses really did move - that table answers "where are this expert's
+// bytes", which is a question about the resident set.
+//
+// The REGION mirror (region slot -> expert, export_prefetch_owners) is versioned by
+// prefetch_generation(bank): the counter the pool bumps only when set_prefetch_experts() places
+// something. That table answers "what is in the prediction ring", which is a question about a
+// placement, not about residency. Before this split both questions read the placement table with the
+// step generation, so the fill path's view of the region was only as fresh as the last residency move
+// and the mirror re-exported once per bank per layer (measured 9921 re-exports on a decode run).
+//
+// S2: each mirror is also uploaded to one contiguous Device image, in the same bank order the host
+// accumulated it in, so `mirror.dev + mirror.off[bank]` is exactly the table the export returned.
+// Nothing here decides placement or size: the bank count comes from the pool, each segment's length
+// from the export's return value, and the offsets from those lengths.
 namespace {
 // `~0` is never a generation the pool reports (they start at 0 and only move up), so it means "the
 // Device copy is not the staged generation" for both "never uploaded" and "the buffer was rebuilt".
 constexpr std::uint64_t kMirrorStaleGeneration = std::numeric_limits<std::uint64_t>::max();
 constexpr std::size_t   kMirrorProbeEntries   = 4096; // export reports the real count and we resize
+
+// C5: the read-ahead's logical clock. One tick per offer and ONE clock for the process, because the
+// forty banks are forty layers of the same step: a per-bank clock would let one bank's backlog expire
+// against another's progress. Both the demand path's offer (ensure) and the prediction's fill ask for
+// it here, so the two cannot drift into two windows.
+std::atomic<std::uint64_t>& prefetch_layer_tick() {
+    static std::atomic<std::uint64_t> tick{0};
+    return tick;
+}
+std::uint64_t prefetch_window() {
+    static const std::uint64_t window = [] {
+        const char* value = std::getenv("NINFER_PREFETCH_WINDOW");
+        if (value != nullptr && *value != '\0') {
+            return static_cast<std::uint64_t>(std::strtoull(value, nullptr, 10));
+        }
+        return std::uint64_t{40};
+    }();
+    return window;
+}
+// Defined with the prediction ring below; declared here because stage_predicted() asks whether the
+// `prev` signal owns this hand-off (it does, and stage_history() already offered the read).
+bool history_signal_switched();
+// The mode in which a prediction region is actually staged. Read here as well as in stage_predicted()
+// because the offer of a read is only worth making on a path that will place the bytes: a read-ahead
+// into a region nothing stages is pure I/O.
+bool prefetch_vram_mode();
 } // namespace
 
-void ExpertStream::release_slot_mirror_device() noexcept {
-    if (slot_mirror_dev_ != nullptr) {
-        const auto status = cudaFree(slot_mirror_dev_);
+void ExpertStream::release_mirror_device(SlotMirror& mirror) noexcept {
+    if (mirror.dev != nullptr) {
+        const auto status = cudaFree(mirror.dev);
         if (status != cudaSuccess) {
-            std::fprintf(stderr, "[pf-mirror] cudaFree(%zu bytes) failed: %s\n", slot_mirror_bytes_,
+            std::fprintf(stderr, "[pf-mirror] cudaFree(%zu bytes) failed: %s\n", mirror.bytes,
                          cudaGetErrorString(status));
             std::fflush(stderr);
-            ++mirror_dev_fails_;
+            ++mirror.dev_fails;
         }
-        slot_mirror_dev_ = nullptr;
+        mirror.dev = nullptr;
     }
-    slot_mirror_bytes_ = 0;
-    std::fill(slot_mirror_dev_gen_.begin(), slot_mirror_dev_gen_.end(), kMirrorStaleGeneration);
-    std::fill(slot_mirror_dev_off_.begin(), slot_mirror_dev_off_.end(), 0U);
+    mirror.bytes = 0;
+    std::fill(mirror.dev_gen.begin(), mirror.dev_gen.end(), kMirrorStaleGeneration);
+    std::fill(mirror.dev_off.begin(), mirror.dev_off.end(), 0U);
+}
+
+void ExpertStream::release_slot_mirror_device() noexcept {
+    release_mirror_device(placement_mirror_);
+    release_mirror_device(prefetch_mirror_);
 }
 
 bool ExpertStream::serves_bank(std::uint32_t bank) const noexcept {
@@ -853,77 +894,101 @@ bool ExpertStream::serves_bank(std::uint32_t bank) const noexcept {
     return false;
 }
 
-const std::uint32_t* ExpertStream::slot_mirror_segment(std::uint32_t bank,
-                                                       std::uint32_t* entries) const noexcept {
+const std::uint32_t* ExpertStream::mirror_segment(const SlotMirror& mirror, std::uint32_t bank,
+                                                  std::uint32_t* entries) const noexcept {
     if (entries != nullptr) { *entries = 0; }
-    if (slot_mirror_dev_ == nullptr || !serves_bank(bank) || bank >= slot_mirror_off_.size()) {
+    if (mirror.dev == nullptr || !serves_bank(bank) || bank >= mirror.off.size()) {
         return nullptr;
     }
     // Also require the Device copy to be this bank's current generation: a pointer to bytes that the
     // last upload left behind would answer every id with the previous placement's slot, which is worse
     // than no answer at all.
-    if (bank >= slot_mirror_dev_gen_.size() || slot_mirror_dev_gen_[bank] != slot_mirror_gen_[bank]) {
+    if (bank >= mirror.dev_gen.size() || mirror.dev_gen[bank] != mirror.gen[bank]) {
         return nullptr;
     }
     if (entries != nullptr) {
-        *entries = bank < slot_mirror_host_.size()
-                       ? static_cast<std::uint32_t>(slot_mirror_host_[bank].size())
-                       : 0U;
+        *entries = bank < mirror.host.size() ? static_cast<std::uint32_t>(mirror.host[bank].size())
+                                             : 0U;
     }
-    return slot_mirror_dev_ + slot_mirror_off_[bank];
+    return mirror.dev + mirror.off[bank];
 }
 
-void ExpertStream::sync_slot_mirror(cudaStream_t stream) {
+const std::uint32_t* ExpertStream::slot_mirror_segment(std::uint32_t bank, std::uint32_t* entries,
+                                                       ops::RouteTableKind kind) const noexcept {
+    return kind == ops::RouteTableKind::PrefetchRegion
+               ? mirror_segment(prefetch_mirror_, bank, entries)
+               : mirror_segment(placement_mirror_, bank, entries);
+}
+
+void ExpertStream::sync_mirror(SlotMirror& mirror, ops::RouteTableKind kind, cudaStream_t stream) {
     if (cache_ == nullptr) { return; }
-    const auto banks = cache_->bank_count();
-    if (slot_mirror_gen_.size() != banks) {
-        // A different bank count means every offset below is invalid, so the Device image goes too.
-        release_slot_mirror_device();
-        slot_mirror_gen_.assign(banks, kMirrorStaleGeneration);
-        slot_mirror_host_.assign(banks, {});
-        slot_mirror_dev_gen_.assign(banks, kMirrorStaleGeneration);
-        slot_mirror_dev_off_.assign(banks, 0);
-        mirror_entries_ = 0;
+    const bool region = kind == ops::RouteTableKind::PrefetchRegion;
+    if (region && cache_->prefetch_slots_per_bank() == 0) {
+        // No region was carved, so there is no table to mirror. Staging one empty row per bank and
+        // counting that as an upload would put 144 meaningless re-exports on the panel and make the
+        // region's upload count unreadable exactly when it should read zero.
+        release_mirror_device(mirror);
+        mirror.gen.clear();
+        mirror.host.clear();
+        mirror.dev_gen.clear();
+        mirror.dev_off.clear();
+        mirror.off.clear();
+        return;
     }
-    // 1) Re-export the banks whose placement generation moved, and only those.
+    const auto banks = cache_->bank_count();
+    if (mirror.gen.size() != banks) {
+        // A different bank count means every offset below is invalid, so the Device image goes too.
+        release_mirror_device(mirror);
+        mirror.gen.assign(banks, kMirrorStaleGeneration);
+        mirror.host.assign(banks, {});
+        mirror.dev_gen.assign(banks, kMirrorStaleGeneration);
+        mirror.dev_off.assign(banks, 0);
+        mirror.entries = 0;
+    }
+    // 1) Re-export the banks whose own generation moved, and only those. The generation is the pool's,
+    //    and it is the one that belongs to THIS table: step_generation for the placement table,
+    //    prefetch_generation for the region's.
     for (std::uint32_t bank = 0; bank < banks; ++bank) {
-        const auto generation = cache_->step_generation(bank);
-        if (slot_mirror_gen_[bank] == generation && !slot_mirror_host_[bank].empty()) { continue; }
-        auto& staged = slot_mirror_host_[bank];
+        const auto generation = region ? cache_->prefetch_generation(bank)
+                                       : cache_->step_generation(bank);
+        if (mirror.gen[bank] == generation) { continue; }
+        auto& staged = mirror.host[bank];
         staged.assign(kMirrorProbeEntries, 0);   // probe buffer: the real count comes back from the export
-        const auto entries = cache_->export_slots(bank, staged);
+        const auto entries = region ? cache_->export_prefetch_owners(bank, staged)
+                                    : cache_->export_slots(bank, staged);
         staged.resize(entries);
-        slot_mirror_gen_[bank] = generation;
-        ++mirror_uploads_;
-        mirror_entries_ += entries;
+        mirror.gen[bank] = generation;
+        ++mirror.uploads;
+        mirror.entries += entries;
     }
     // 2) The Device layout: bank order, each segment as long as that bank's export. Recomputed rather
     //    than cached, because an export that returns a different length must move every later segment.
-    slot_mirror_off_.assign(banks, 0);
+    mirror.off.assign(banks, 0);
     std::size_t total = 0;
     for (std::uint32_t bank = 0; bank < banks; ++bank) {
-        slot_mirror_off_[bank] = static_cast<std::uint32_t>(total);
-        total += slot_mirror_host_[bank].size();
+        mirror.off[bank] = static_cast<std::uint32_t>(total);
+        total += mirror.host[bank].size();
     }
     if (total == 0) { return; }
     // 3) (Re)allocate when the image is absent or a bank outgrew it. A rebuild makes every segment's
     //    Device copy stale, so each one is uploaded again below.
-    if (slot_mirror_dev_ == nullptr || total > slot_mirror_bytes_ / sizeof(std::uint32_t)) {
-        release_slot_mirror_device();
+    if (mirror.dev == nullptr || total > mirror.bytes / sizeof(std::uint32_t)) {
+        release_mirror_device(mirror);
         const std::size_t bytes = total * sizeof(std::uint32_t);
         void*  allocated        = nullptr;
         const auto status       = cudaMalloc(&allocated, bytes);
         if (status != cudaSuccess) {
-            ++mirror_dev_fails_;
+            ++mirror.dev_fails;
             std::fprintf(stderr,
-                         "[pf-mirror] cudaMalloc(%zu bytes for %zu entries over %u banks) failed: "
-                         "%s\n",
-                         bytes, total, banks, cudaGetErrorString(status));
+                         "[pf-mirror] cudaMalloc(%zu bytes for %zu entries over %u banks, %s) "
+                         "failed: %s\n",
+                         bytes, total, banks, region ? "region" : "placement",
+                         cudaGetErrorString(status));
             std::fflush(stderr);
             return;
         }
-        slot_mirror_dev_   = static_cast<std::uint32_t*>(allocated);
-        slot_mirror_bytes_ = bytes;
+        mirror.dev   = static_cast<std::uint32_t*>(allocated);
+        mirror.bytes = bytes;
     }
     // 4) Upload the segments whose Device copy is not the staged generation - but only the banks this
     //    stream resolves (its own runs). The image is per stream and the pool has banks for every layer
@@ -932,10 +997,9 @@ void ExpertStream::sync_slot_mirror(cudaStream_t stream) {
     //    lookup uses, so "current" and "readable" cannot drift apart.
     for (std::uint32_t bank = 0; bank < banks; ++bank) {
         if (!serves_bank(bank)) { continue; }
-        const auto& staged = slot_mirror_host_[bank];
+        const auto& staged = mirror.host[bank];
         if (staged.empty()) { continue; }
-        if (slot_mirror_dev_gen_[bank] == slot_mirror_gen_[bank] &&
-            slot_mirror_dev_off_[bank] == slot_mirror_off_[bank]) {
+        if (mirror.dev_gen[bank] == mirror.gen[bank] && mirror.dev_off[bank] == mirror.off[bank]) {
             continue;
         }
         const auto bytes = staged.size() * sizeof(std::uint32_t);
@@ -943,7 +1007,7 @@ void ExpertStream::sync_slot_mirror(cudaStream_t stream) {
             try {
                 slot_mirror_stage_ = std::make_unique<PinnedHostBuffer>(bytes);
             } catch (const std::exception& error) {
-                ++mirror_dev_fails_;
+                ++mirror.dev_fails;
                 std::fprintf(stderr, "[pf-mirror] pinned staging (%zu bytes) failed: %s\n", bytes,
                              error.what());
                 std::fflush(stderr);
@@ -951,89 +1015,136 @@ void ExpertStream::sync_slot_mirror(cudaStream_t stream) {
             }
         }
         std::memcpy(slot_mirror_stage_->data(), staged.data(), bytes);
-        const auto status = cudaMemcpyAsync(slot_mirror_dev_ + slot_mirror_off_[bank],
+        const auto status = cudaMemcpyAsync(mirror.dev + mirror.off[bank],
                                             slot_mirror_stage_->data(), bytes,
                                             cudaMemcpyHostToDevice, stream);
         if (status != cudaSuccess) {
             // Leave the generation stale: the next pass retries instead of trusting a short copy.
-            ++mirror_dev_fails_;
+            ++mirror.dev_fails;
             std::fprintf(stderr,
-                         "[pf-mirror] cudaMemcpyAsync bank=%u entries=%zu -> dev+%u (%zu bytes) "
+                         "[pf-mirror] cudaMemcpyAsync bank=%u entries=%zu -> dev+%u (%zu bytes, %s) "
                          "failed: %s\n",
-                         bank, staged.size(), slot_mirror_off_[bank], bytes,
-                         cudaGetErrorString(status));
+                         bank, staged.size(), mirror.off[bank], bytes,
+                         region ? "region" : "placement", cudaGetErrorString(status));
             std::fflush(stderr);
             continue;
         }
-        slot_mirror_dev_gen_[bank] = slot_mirror_gen_[bank];
-        slot_mirror_dev_off_[bank] = slot_mirror_off_[bank];
-        ++mirror_dev_uploads_;
-        mirror_dev_bytes_ += bytes;
+        mirror.dev_gen[bank] = mirror.gen[bank];
+        mirror.dev_off[bank] = mirror.off[bank];
+        ++mirror.dev_uploads;
+        mirror.dev_bytes += bytes;
     }
 }
 
+void ExpertStream::sync_slot_mirror(cudaStream_t stream) {
+    sync_mirror(placement_mirror_, ops::RouteTableKind::Placement, stream);
+    sync_mirror(prefetch_mirror_, ops::RouteTableKind::PrefetchRegion, stream);
+}
 
-// S2-5: the staging path's own consumer of the mirror. Each route the layer just produced is resolved
-// to the slot the pool holds it in, on the Device, against the segment sync_slot_mirror() staged; the
-// routes the table cannot answer (id outside the bank, or no slot held) are counted where they happen
-// and shown in the [pf-mirror] line.
+
+// S2-5/C2: the staging path's own consumer of the mirrors. The caller names WHICH table it is
+// resolving against, because the two answers are in different spaces:
 //
-// Explicit switch only. The shipped placement does not consume these slots yet, so the switch is the
-// only thing that makes the lookup run - and that is what keeps the default path bit-identical to S1.
+//   Placement      - pool slots (addresses). "Where are this expert's bytes."
+//   PrefetchRegion - region indices (positions in this bank's ring, 0..slots-1). "Does the fill's
+//                    target already hold this expert, and in which region slot."
+//
+// The routes the table cannot answer (id outside the bank, or nothing held) are counted where they
+// happen and shown in the [pf-mirror] line. Explicit switch only on the demand path: the shipped
+// placement does not consume the pool slots yet, so NINFER_SLOT_LOOKUP is the only thing that makes
+// the placement lookup run - and that is what keeps the default path bit-identical to S1.
 void ExpertStream::lookup_routed_slots(const void* device_ids, std::int32_t id_values,
-                                       cudaStream_t stream, bool armed) {
+                                       cudaStream_t stream, ops::RouteTableKind kind, bool armed) {
     static const bool switched = std::getenv("NINFER_SLOT_LOOKUP") != nullptr;
     const bool enabled         = switched || armed;
-    if (!enabled || device_ids == nullptr || id_values <= 0 || slot_mirror_dev_ == nullptr) { return; }
+    if (!enabled || device_ids == nullptr || id_values <= 0) { return; }
+    const bool region = kind == ops::RouteTableKind::PrefetchRegion;
+    SlotMirror& mirror = region ? prefetch_mirror_ : placement_mirror_;
+    if (mirror.dev == nullptr) {
+        // No image means there is nothing to resolve against. Said out loud once, because a silently
+        // skipped lookup reads exactly like a lookup that found every id.
+        static bool said[2] = {false, false};
+        if (!said[region ? 1 : 0]) {
+            said[region ? 1 : 0] = true;
+            std::fprintf(stderr,
+                         "[pf-mirror] id->%s lookup armed with no Device image (region slots=%u)\n",
+                         region ? "region" : "slot",
+                         cache_ != nullptr ? cache_->prefetch_slots_per_bank() : 0U);
+            std::fflush(stderr);
+        }
+        return;
+    }
     const auto values = static_cast<std::size_t>(id_values);
-    // Output scratch: one slot per id. Grown, never shrunk, and freed with the stream.
+    // Output scratch: one word per id, per space. Grown, never shrunk, freed with the stream.
     if (lookup_capacity_ < values) {
-        if (lookup_slots_dev_ != nullptr) {
-            const auto free_status = cudaFree(lookup_slots_dev_);
-            lookup_slots_dev_     = nullptr;
-            lookup_capacity_      = 0;
+        for (auto** pointer : {&lookup_slots_dev_, &lookup_region_dev_}) {
+            if (*pointer == nullptr) { continue; }
+            const auto free_status = cudaFree(*pointer);
+            *pointer              = nullptr;
             if (free_status != cudaSuccess) {
-                ++mirror_dev_fails_;
+                ++mirror.dev_fails;
                 std::fprintf(stderr, "[pf-mirror] cudaFree(id->slot scratch) failed: %s\n",
                              cudaGetErrorString(free_status));
                 std::fflush(stderr);
                 return;
             }
         }
-        void*      allocated = nullptr;
-        const auto bytes     = values * sizeof(std::uint32_t);
-        const auto status    = cudaMalloc(&allocated, bytes);
-        if (status != cudaSuccess) {
-            ++mirror_dev_fails_;
-            std::fprintf(stderr, "[pf-mirror] cudaMalloc(%zu bytes, id->slot scratch) failed: %s\n",
-                         bytes, cudaGetErrorString(status));
-            std::fflush(stderr);
-            return;
+        lookup_capacity_ = 0;
+        const auto bytes = values * sizeof(std::uint32_t);
+        for (auto** pointer : {&lookup_slots_dev_, &lookup_region_dev_}) {
+            void*      allocated = nullptr;
+            const auto status    = cudaMalloc(&allocated, bytes);
+            if (status != cudaSuccess) {
+                ++mirror.dev_fails;
+                std::fprintf(stderr,
+                             "[pf-mirror] cudaMalloc(%zu bytes, id->%s scratch) failed: %s\n", bytes,
+                             pointer == &lookup_region_dev_ ? "region" : "slot",
+                             cudaGetErrorString(status));
+                std::fflush(stderr);
+                return;
+            }
+            *pointer = static_cast<std::uint32_t*>(allocated);
         }
-        lookup_slots_dev_ = static_cast<std::uint32_t*>(allocated);
-        lookup_capacity_  = values;
+        lookup_capacity_ = values;
     }
-    // One cumulative miss counter for the run: zeroed once so the print can report a total, and never
+    // One cumulative miss counter per space: zeroed once so the print can report a total, and never
     // reset, which keeps the read-back off the layer path.
-    if (lookup_misses_dev_ == nullptr) {
+    auto& miss_counter = region ? lookup_region_misses_dev_ : lookup_misses_dev_;
+    if (miss_counter == nullptr) {
         void*      allocated = nullptr;
         const auto status    = cudaMalloc(&allocated, sizeof(std::uint32_t));
         if (status != cudaSuccess) {
-            ++mirror_dev_fails_;
-            std::fprintf(stderr, "[pf-mirror] cudaMalloc(miss counter) failed: %s\n",
-                         cudaGetErrorString(status));
+            ++mirror.dev_fails;
+            std::fprintf(stderr, "[pf-mirror] cudaMalloc(%s miss counter) failed: %s\n",
+                         region ? "region" : "slot", cudaGetErrorString(status));
             std::fflush(stderr);
             return;
         }
-        lookup_misses_dev_ = static_cast<std::uint32_t*>(allocated);
-        if (const auto zeroed = cudaMemset(lookup_misses_dev_, 0, sizeof(std::uint32_t));
+        miss_counter = static_cast<std::uint32_t*>(allocated);
+        if (const auto zeroed = cudaMemset(miss_counter, 0, sizeof(std::uint32_t));
             zeroed != cudaSuccess) {
-            ++mirror_dev_fails_;
-            std::fprintf(stderr, "[pf-mirror] cudaMemset(miss counter) failed: %s\n",
-                         cudaGetErrorString(zeroed));
+            ++mirror.dev_fails;
+            std::fprintf(stderr, "[pf-mirror] cudaMemset(%s miss counter) failed: %s\n",
+                         region ? "region" : "slot", cudaGetErrorString(zeroed));
             std::fflush(stderr);
             return;
         }
+    }
+    auto& out    = region ? lookup_region_dev_ : lookup_slots_dev_;
+    auto& calls  = region ? lookup_region_calls_ : lookup_calls_;
+    // C2: the two spaces are stated once, at the point where their sizes are known, so a reader of the
+    // panel can see that a region index is not a pool slot on this bank rather than take it on trust.
+    static bool spaces_said = false;
+    if (region && !spaces_said && cache_ != nullptr) {
+        spaces_said = true;
+        const auto first = split_.empty() ? bank_ : split_.front().bank;
+        const auto slot0 = cache_->prefetch_region_slot(first, 0);
+        std::fprintf(stderr,
+                     "[pf-space] bank=%u region index space 0..%u | it is NOT a pool slot space "
+                     "(region slot 0 names pool slot %u; this bank has %u experts)\n",
+                     first, cache_->prefetch_slots_per_bank() - 1,
+                     slot0 ? *slot0 : kAbsentSlot, count_);
+        std::fflush(stderr);
     }
     // One lookup per matrix run of this layer: the three runs place independently, so an id can have a
     // slot in one and none in another - resolving only the gate run would hide exactly that. The
@@ -1041,20 +1152,26 @@ void ExpertStream::lookup_routed_slots(const void* device_ids, std::int32_t id_v
     // is reported rather than read as stale bytes.
     std::size_t resolved_runs = 0;
     const auto resolve = [&](std::uint32_t bank) {
-        std::uint32_t       experts = 0;
-        const std::uint32_t* table  = slot_mirror_segment(bank, &experts);
-        if (table == nullptr || experts == 0) {
-            ++mirror_dev_fails_;
+        std::uint32_t       entries = 0;
+        const std::uint32_t* table  = mirror_segment(mirror, bank, &entries);
+        if (table == nullptr || entries == 0) {
+            ++mirror.dev_fails;
             std::fprintf(stderr,
-                         "[pf-mirror] id->slot skipped for bank %u: no current Device segment "
-                         "(served=%d)\n",
-                         bank, int(serves_bank(bank)));
+                         "[pf-mirror] id->%s skipped for bank %u: no current Device segment "
+                         "(served=%d, entries=%u)\n",
+                         region ? "region" : "slot", bank, int(serves_bank(bank)), entries);
             std::fflush(stderr);
             return;
         }
-        ops::moe_route_slots(static_cast<const std::int32_t*>(device_ids), static_cast<int>(values),
-                             table, experts, lookup_slots_dev_, lookup_misses_dev_, stream);
-        ++lookup_calls_;
+        if (region) {
+            ops::moe_route_region_slots(static_cast<const std::int32_t*>(device_ids),
+                                        static_cast<int>(values), table, entries, out, miss_counter,
+                                        stream);
+        } else {
+            ops::moe_route_slots(static_cast<const std::int32_t*>(device_ids),
+                                 static_cast<int>(values), table, entries, out, miss_counter, stream);
+        }
+        ++calls;
     };
     if (split_.empty()) {
         resolve(bank_);
@@ -1080,9 +1197,52 @@ void ExpertStream::lookup_routed_slots(const void* device_ids, std::int32_t id_v
         }
     }
     if (const auto status = cudaGetLastError(); status != cudaSuccess) {
-        ++mirror_dev_fails_;
-        std::fprintf(stderr, "[pf-mirror] id->slot launch (bank=%u, %zu ids) failed: %s\n", bank_,
-                     values, cudaGetErrorString(status));
+        ++mirror.dev_fails;
+        std::fprintf(stderr, "[pf-mirror] id->%s launch (bank=%u, %zu ids) failed: %s\n",
+                     region ? "region" : "slot", bank_, values, cudaGetErrorString(status));
+        std::fflush(stderr);
+    }
+}
+
+// C2: one space used as the other. The check needs both numbers, so it runs where both are on the
+// host: `value` is a region index and `cache_->prefetch_region_slot(bank, value)` is the pool slot it
+// names. Equal is the only correct answer for a value that came from the region table; anything else
+// (an index outside the region, an index whose slot is not a region slot, or a pool slot passed where
+// an index was expected) is counted and printed with both values.
+void ExpertStream::note_slot_space(std::uint32_t bank, ops::RouteTableKind kind, std::uint32_t value) {
+    if (cache_ == nullptr || value == kAbsentSlot) { return; }
+    if (kind == ops::RouteTableKind::PrefetchRegion) {
+        const auto region = cache_->prefetch_slots_per_bank();
+        const auto slot   = cache_->prefetch_region_slot(bank, value);
+        if (value >= region || !slot) {
+            ++slot_space_mixes_;
+            std::fprintf(stderr,
+                         "[pf-space] MIX bank=%u: %u is not a region index (region holds %u slot(s)); "
+                         "as a pool slot it would be %s\n",
+                         bank, value, region,
+                         cache_->prefetch_slot(value) ? "a region slot" : "a non-region slot");
+            std::fflush(stderr);
+            return;
+        }
+        if (!cache_->prefetch_slot(*slot)) {
+            ++slot_space_mixes_;
+            std::fprintf(stderr,
+                         "[pf-space] MIX bank=%u: region index %u names pool slot %u, which is not a "
+                         "region slot (region=%u)\n",
+                         bank, value, *slot, region);
+            std::fflush(stderr);
+        }
+        return;
+    }
+    // A placement slot that turns out to be a region slot means the region's numbers were read as the
+    // placement's. The region index is printed beside it, because that is the value that was meant.
+    if (cache_->prefetch_slot(value)) {
+        const auto index = cache_->prefetch_region_index(bank, value);
+        ++slot_space_mixes_;
+        std::fprintf(stderr,
+                     "[pf-space] MIX bank=%u: placement slot %u is a REGION slot (region holds %u "
+                     "slot(s), region index %d)\n",
+                     bank, value, cache_->prefetch_slots_per_bank(), index ? int(*index) : -1);
         std::fflush(stderr);
     }
 }
@@ -1104,15 +1264,40 @@ void ExpertStream::gh1_report(cudaStream_t stream) {
                     std::fflush(stderr);
                 }
             }
+            std::uint32_t region_misses = 0;
+            if (lookup_region_misses_dev_ != nullptr) {
+                const auto status = cudaMemcpy(&region_misses, lookup_region_misses_dev_,
+                                               sizeof(region_misses), cudaMemcpyDeviceToHost);
+                if (status != cudaSuccess) {
+                    std::fprintf(stderr,
+                                 "[pf-mirror] read-back of the region miss counter failed: %s\n",
+                                 cudaGetErrorString(status));
+                    std::fflush(stderr);
+                }
+            }
+            // C1's two rows: the placement mirror and the region mirror, side by side because their
+            // upload counts are the evidence that they are driven by different events. `uploads` is a
+            // host re-export, so it is the number that used to be one per bank per layer.
             std::fprintf(stderr,
-                         "[pf-mirror] banks=%u entries=%zu uploads=%llu | dev_upload=%llu "
-                         "dev_bytes=%llu dev_fails=%llu | lookup calls=%llu absent=%u\n",
-                         cache_ != nullptr ? cache_->bank_count() : 0U, mirror_entries_,
-                         static_cast<unsigned long long>(mirror_uploads_),
-                         static_cast<unsigned long long>(mirror_dev_uploads_),
-                         static_cast<unsigned long long>(mirror_dev_bytes_),
-                         static_cast<unsigned long long>(mirror_dev_fails_),
-                         static_cast<unsigned long long>(lookup_calls_), lookup_misses);
+                         "[pf-mirror] banks=%u | placement(entries=%llu uploads=%llu dev_upload=%llu "
+                         "dev_bytes=%llu fails=%llu) | region(entries=%llu uploads=%llu "
+                         "dev_upload=%llu dev_bytes=%llu fails=%llu) | lookup calls=%llu absent=%u "
+                         "region_calls=%llu region_absent=%u region_stale=%llu space_mix=%llu\n",
+                         cache_ != nullptr ? cache_->bank_count() : 0U,
+                         static_cast<unsigned long long>(placement_mirror_.entries),
+                         static_cast<unsigned long long>(placement_mirror_.uploads),
+                         static_cast<unsigned long long>(placement_mirror_.dev_uploads),
+                         static_cast<unsigned long long>(placement_mirror_.dev_bytes),
+                         static_cast<unsigned long long>(placement_mirror_.dev_fails),
+                         static_cast<unsigned long long>(prefetch_mirror_.entries),
+                         static_cast<unsigned long long>(prefetch_mirror_.uploads),
+                         static_cast<unsigned long long>(prefetch_mirror_.dev_uploads),
+                         static_cast<unsigned long long>(prefetch_mirror_.dev_bytes),
+                         static_cast<unsigned long long>(prefetch_mirror_.dev_fails),
+                         static_cast<unsigned long long>(lookup_calls_), lookup_misses,
+                         static_cast<unsigned long long>(lookup_region_calls_), region_misses,
+                         static_cast<unsigned long long>(prefetch_region_stale_),
+                         static_cast<unsigned long long>(slot_space_mixes_));
             std::fflush(stderr);
         }
     }
@@ -1307,10 +1492,79 @@ bool ExpertStream::set_predicted_device(const std::int32_t* ids, std::int32_t co
     return true;
 }
 
-void ExpertStream::stage_predicted(cudaStream_t stream) {    static const bool vram = [] {
-        const char* value = std::getenv("NINFER_PREFETCH_MODE");
-        return value != nullptr && std::strcmp(value, "vram") == 0;
-    }();
+// C5: hand one fill's BYTE SOURCE to the process-wide read-ahead worker. What moves is the artifact
+// read (the slow part: a pageable read is measured at 8.6 ms an expert on this box, a page-cache hit at
+// 0.2 ms). The region's placement and the Device copy stay on the calling thread, because they must be
+// ordered before the GEMM that consumes them - a stream is a queue, and a copy submitted from another
+// thread is not ordered against this one without an event and a wait, which is exactly the per-layer
+// synchronise this path does not have. So the worker fills the pinned tier under the layer that is
+// computing, and `cache_->prepare()` then finds the bytes in pinned memory instead of behind a read.
+//
+// The offer goes through the existing queue, so the budget, the deadline and the usefulness counters
+// are the ones that were already measured (`[pf] ... ran= expired= useful=`). A closed gate or a full
+// window refuses the offer; a refused read-ahead is simply not done (the fill that follows reads the
+// artifact, which is what it did before this existed).
+std::size_t ExpertStream::queue_prefetch_fill(std::span<const std::uint32_t> experts,
+                                              std::uint32_t bank, std::uint64_t tick,
+                                              std::uint64_t window) {
+    if (host_ == nullptr || experts.empty()) { return 0; }
+    auto& queue = ExpertPrefetchQueue::instance();
+    if (!queue.gate_open()) { return 0; }
+    std::size_t offered = 0;
+    const auto  tick_at = tick == 0 ? prefetch_layer_tick().load() : tick;
+    const auto  due     = tick_at + (window == 0 ? prefetch_window() : window);
+    for (const auto expert : experts) {
+        if (expert > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
+            continue;
+        }
+        const std::int32_t one[1] = {static_cast<std::int32_t>(expert)};
+        if (queue.enqueue(host_weak_, bank, std::span<const std::int32_t>(one, 1),
+                          static_cast<std::size_t>(host_->slot_bytes()), due, tick_at)) {
+            ++offered;
+        }
+    }
+    return offered;
+}
+
+// C3/C4: the port, assembled from what this stream measured. One function so the arming decision and
+// the line printed beside it cannot disagree - the same rule the controller's other ports follow
+// (nothing on the prediction side decides its own size).
+PrefetchPlan ExpertStream::prefetch_plan() const {
+    PrefetchSignals signals;
+    signals.cold_share = residency_rate(); // 1 - residency: the share a prediction would have to add
+    // The region's own rate, from the population the panel counts (routes examined), not the warm
+    // tier's ask count - that one is zero on this path and would leave the rate permanently unknown.
+    signals.hit_rate = prefetch_route_samples_ == 0
+                           ? -1.0
+                           : static_cast<double>(prefetch_hits_) /
+                                 static_cast<double>(prefetch_route_samples_);
+    const auto& ledger = cpu_path_ledger();
+    signals.cpu_share  = ledger.routes_seen == 0
+                             ? -1.0
+                             : static_cast<double>(ledger.cpu_routes) /
+                                   static_cast<double>(ledger.routes_seen);
+    signals.staging_reachable =
+        cache_ != nullptr && cache_->prefetch_slots_per_bank() != 0 && prefetch_vram_mode();
+    signals.freeze_active       = frozen_;
+    signals.lanes               = 1;
+    // The model's routing width, not this guess's width: a prefill guess is tens of ids and a decode
+    // guess is ten, and the region's demand must not change with the prompt length.
+    signals.top_k               = static_cast<int>(top_k_);
+    signals.runs_per_layer      = static_cast<int>(runs());
+    signals.pool_slots_per_bank = static_cast<int>(pool_slots_per_bank());
+    signals.region_slots = cache_ != nullptr ? static_cast<int>(cache_->prefetch_slots_per_bank()) : 0;
+    const int per_layer = std::max(1, static_cast<int>(runs()));
+    signals.layers      = pool_banks() != 0 ? static_cast<int>(pool_banks()) / per_layer : 0;
+    signals.ring_depth  = static_cast<int>(ring_depth_);
+    // 0: the controller derives the depth cap from the model's layer count and the ring, which is what
+    // C3 asks for - a caller-chosen number here would be the magic constant the cutoff exists to avoid.
+    signals.max_layers_ahead = 0;
+    note_prefetch_signals(signals);
+    return decide_prefetch_plan();
+}
+
+void ExpertStream::stage_predicted(cudaStream_t stream) {
+    const bool vram = prefetch_vram_mode();
     // One line for the first few calls, whatever the reason: "no placement happened" and "the region
     // is off" look identical in the counters, and that ambiguity already cost a measurement round.
     static std::uint64_t calls = 0;
@@ -1345,7 +1599,8 @@ void ExpertStream::stage_predicted(cudaStream_t stream) {    static const bool v
         const auto count = predicted_device_count();
         ++predicted_layers_;
         if (cache_->prefetch_slots_per_bank() != 0) {
-            lookup_routed_slots(predicted_device_ids(), count, stream, /*armed=*/true);
+            lookup_routed_slots(predicted_device_ids(), count, stream,
+                                ops::RouteTableKind::PrefetchRegion, /*armed=*/true);
         }
         static std::uint64_t reports = 0;
         if (bank_ < 4 && (++reports % 40) == 0) {
@@ -1365,6 +1620,32 @@ void ExpertStream::stage_predicted(cudaStream_t stream) {    static const bool v
 
     if (predicted_.empty()) { say("predicted_ is empty"); return; }
     if (cache_->prefetch_slots_per_bank() == 0) { say("no region"); return; }
+    // C3/C4: the arm/cutoff decision, taken once per call from what this stream measured. `armed` is
+    // a RESULT (slots x cold delta x measured rate), not a switch: a region whose rate does not clear
+    // the bar computes zero slots, and a region too small to hold one layer's cold delta computes a
+    // zero cutoff. Both are printed with the reason, on the same line as the numbers they came from.
+    const auto plan = prefetch_plan();
+    {
+        const auto& port = prefetch_signals();
+        if (pf_ctl_reports_++ % 64 == 0) {
+            std::fprintf(stderr,
+                         "[pf-ctl] cutoff=%d armed=%s slots=%d reason=%s | cold=%.1f%% hit=%.1f%% "
+                         "cpu=%.1f%% delta=%d layer(s)=%d ring=%d top_k=%d region=%u/bank\n",
+                         plan.cutoff, plan.armed ? "Y" : "N", plan.slots_per_bank, plan.why,
+                         port.cold_share >= 0.0 ? 100.0 * port.cold_share : -1.0,
+                         port.hit_rate >= 0.0 ? 100.0 * port.hit_rate : -1.0,
+                         port.cpu_share >= 0.0 ? 100.0 * port.cpu_share : -1.0,
+                         plan.delta_per_layer, port.layers, port.ring_depth, port.top_k,
+                         cache_->prefetch_slots_per_bank());
+            std::fflush(stderr);
+        }
+        if (!plan.armed) {
+            // A shut region is a decision, not an absence: the fill is refused and counted, and the
+            // reason is on the line above. Nothing is staged, so the next layer stays a demand miss.
+            ++predicted_shut_layers_;
+            return;
+        }
+    }
     // port (sm_89): the prediction region exists per bank, so the three-run form stages the same
     // predicted set into each of its runs. One run's region is sized per bank by the cache, so a run
     // that cannot take the whole set takes what fits and the rest stays a demand miss next layer.
@@ -1400,10 +1681,42 @@ void ExpertStream::stage_predicted(cudaStream_t stream) {    static const bool v
                 continue;
             }
             const auto id = static_cast<std::uint32_t>(expert);
+            // C2: the two spaces, checked where both numbers are on the host. An expert the region
+            // already holds has a region index AND a pool slot. If the index names no slot at all, or
+            // names a pool slot that is not a region slot, the two spaces have been used as one -
+            // counted and printed, never smoothed over. A row whose expert the placement has since
+            // moved is NOT a mix: a prediction is not a member of the resident set, so the resident set
+            // recomputes every layer and leaves the region row behind. That case gets its own counter
+            // (`prefetch_region_stale_`) so the mix count stays meaningful.
+            if (const auto region_index = cache_->prefetch_region_index(bank, id); region_index) {
+                note_slot_space(bank, ops::RouteTableKind::PrefetchRegion, *region_index);
+                const auto from_index = cache_->prefetch_region_slot(bank, *region_index);
+                const auto direct     = cache_->expert_slot(bank, id);
+                if (from_index && (!direct || *direct != *from_index)) {
+                    ++prefetch_region_stale_;
+                }
+            }
             if (cache_->expert_slot(bank, id)) { continue; } // already resident: not a prediction
             absent.push_back(id);
         }
         prefetch_delta_ += absent.size();
+        // C5: the read ahead of the copy. Offered to the process-wide worker first, so the artifact
+        // read happens under this layer's compute; the placement and the Device copy stay ordered on
+        // `stream` below. A closed gate refuses and nothing changes - the copy then reads the artifact
+        // exactly as it did before this existed.
+        //
+        // Not offered here on the `prev` path: stage_history() already offered the same set one hook
+        // earlier (before this layer's GEMM), and offering it twice would spend the window's budget on
+        // a read that is then immediately duplicated by the inline one this call still does.
+        const bool offered_early = history_signal_switched() && !history_.empty();
+        if (!absent.empty() && !offered_early) {
+            const auto tick = prefetch_layer_tick().fetch_add(1) + 1;
+            const auto window = prefetch_window();
+            if (window != 0 && (tick % window) == 0) { ExpertPrefetchQueue::instance().advance(tick); }
+            const auto offered = queue_prefetch_fill(
+                std::span<const std::uint32_t>(absent), bank, tick, window);
+            prefetch_queued_ += offered;
+        }
         std::vector<ExpertCacheKey> placed;
         const auto filled = absent.empty()
                                 ? 0U
@@ -1413,6 +1726,16 @@ void ExpertStream::stage_predicted(cudaStream_t stream) {    static const bool v
             (void)cache_->progress(stream);
             prefetch_placed_ += placed.size();
             ++predicted_runs_filled_;
+            // C5/D4: the read-ahead's bytes that the copy actually used. The pool prefers the pinned
+            // tier when it holds an expert, so a slot the worker filled before this call shows up here
+            // - and on this path that is the ONLY consumer of those bytes (the experts go to the
+            // Device, not to the CPU half), which is why the routed-hit counter reads zero.
+            if (host_ != nullptr) {
+                if (const auto marks = host_->take_prefetch_marks(bank, absent); marks != 0) {
+                    ExpertPrefetchQueue::instance().note_used(
+                        static_cast<std::size_t>(marks) * host_->slot_bytes());
+                }
+            }
         } else if (!absent.empty()) {
             // A non-empty delta that placed nothing is a refusal (no region on this bank, or the bank
             // is outside the pool), and it has to be visible rather than read as "nothing to do".
@@ -1426,24 +1749,34 @@ void ExpertStream::stage_predicted(cudaStream_t stream) {    static const bool v
     }
     static std::uint64_t reports = 0;
     if (bank_ < 4 && (++reports % 40) == 0) {
+        // C5: the read-ahead's own counters, on the line the fill produces them from. The split path
+        // never reaches the fused path's `[pf]` panel, so without this the queue could run, expire and
+        // be useful without a single number saying so.
+        const auto queued = ExpertPrefetchQueue::instance().stats();
         std::fprintf(stderr,
-                     "[pfv] bank=%u delta=%llu placed=%llu hits=%llu region=%u/bank | runs=%zu "
-                     "filled=%llu fill_fail=%llu out_of_range=%llu mismatch=%llu | guess "
-                     "ids=%llu hit=%llu over=%llu layer(s) (%.1f%%)\n",
+                     "[pfv] bank=%u delta=%llu queued=%llu placed=%llu hits=%llu region=%u/bank | "
+                     "runs=%zu filled=%llu fill_fail=%llu out_of_range=%llu mismatch=%llu shut=%llu | "
+                     "guess ids=%llu hit=%llu over=%llu layer(s) (%.1f%%) | q enq=%llu ran=%llu "
+                     "expired=%llu useful=%.2f pending=%zu\n",
                      bank_, (unsigned long long)prefetch_delta_,
+                     (unsigned long long)prefetch_queued_,
                      (unsigned long long)prefetch_placed_,
                      (unsigned long long)prefetch_hits_, cache_->prefetch_slots_per_bank(),
                      expected_runs, (unsigned long long)predicted_runs_filled_,
                      (unsigned long long)predicted_fill_failures_,
                      (unsigned long long)prefetch_out_of_range_,
                      (unsigned long long)predicted_run_mismatches_,
+                     (unsigned long long)predicted_shut_layers_,
                      (unsigned long long)prediction_ids_seen_,
                      (unsigned long long)prediction_overlap_,
                      (unsigned long long)prediction_layers_checked_,
                      prediction_ids_seen_ != 0
                          ? 100.0 * static_cast<double>(prediction_overlap_) /
                                static_cast<double>(prediction_ids_seen_)
-                         : 0.0);
+                         : 0.0,
+                     (unsigned long long)queued.queue.enqueued, (unsigned long long)queued.ran,
+                     (unsigned long long)queued.expired, queued.queue.usefulness(),
+                     queued.pending);
         std::fflush(stderr);
     }
 }
@@ -1476,6 +1809,15 @@ bool pred_ring_switched() {
     static const bool value = [] {
         const char* v = std::getenv("NINFER_PRED_RING");
         return v != nullptr && *v != '\0' && std::strtol(v, nullptr, 10) != 0;
+    }();
+    return value;
+}
+// The mode in which the region is staged: NINFER_PREFETCH_MODE=vram. Everything else (including the
+// default) leaves stage_predicted() a no-op, so no read is worth offering.
+bool prefetch_vram_mode() {
+    static const bool value = [] {
+        const char* v = std::getenv("NINFER_PREFETCH_MODE");
+        return v != nullptr && std::strcmp(v, "vram") == 0;
     }();
     return value;
 }
@@ -1818,13 +2160,46 @@ void ExpertStream::note_routes(std::span<const std::int32_t> ids) {
 
 void ExpertStream::stage_history(cudaStream_t stream) {
     if (!history_signal_switched() || history_.empty()) { return; }
-    // The same host-form fill stage_predicted() runs for a residual guess: predicted-and-not-resident
-    // goes to the region, and the copies are queued on the stream here - one layer of compute before
-    // the layer that reads them is placed.
     predicted_               = history_;
     predicted_device_active_ = false;
     predicted_device_count_  = 0;
-    stage_predicted(stream);
+    // C5: the READ, and only the read, is offered here - this hook runs BEFORE the layer's routed
+    // GEMM (text.cpp's first call), which is the one interval where a cold read can hide. The
+    // placement and the Device copy stay at the post-GEMM stage_predicted() call, because the copy
+    // must be ordered before the layer that reads it while the read must not be in front of anything.
+    //
+    // The old shape did the whole fill here, and that is the serialisation the worker exists to remove:
+    // set_prefetch_experts() + prepare() + progress() read the artifact on the calling thread in the
+    // same breath, so the copy's source could never be a read-ahead that had not happened yet
+    // (measured: `ran` climbed while `useful` stayed 0.00).
+    if (host_ != nullptr && cache_ != nullptr && cache_->prefetch_slots_per_bank() != 0 &&
+        prefetch_vram_mode()) {
+        const auto plan = prefetch_plan();
+        if (plan.armed) {
+            std::vector<std::uint32_t> absent;
+            absent.reserve(predicted_.size());
+            for (const auto expert : predicted_) {
+                if (expert < 0 || static_cast<std::uint32_t>(expert) >= count_) { continue; }
+                const auto id = static_cast<std::uint32_t>(expert);
+                if (cache_->expert_slot(bank_, id)) { continue; }
+                // NOT filtered by "the tier already holds it": a re-offer of an expert the arena
+                // already holds costs no read (fill_locked's hit path) and is the same evidence -
+                // those bytes were fetched ahead and are being used. Filtering here made the offer
+                // disappear exactly when the read-ahead was working, which left `queued=0` and
+                // `useful` undefined (a ratio with a zero denominator).
+                absent.push_back(id);
+            }
+            if (!absent.empty()) {
+                const auto tick = prefetch_layer_tick().fetch_add(1) + 1;
+                const auto window = prefetch_window();
+                if (window != 0 && (tick % window) == 0) {
+                    ExpertPrefetchQueue::instance().advance(tick);
+                }
+                prefetch_queued_ += queue_prefetch_fill(std::span<const std::uint32_t>(absent),
+                                                        bank_, tick, window);
+            }
+        }
+    }
 }
 
 std::uint32_t ExpertStream::publish_static_table() {
@@ -2614,6 +2989,9 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
     }
     const auto values = static_cast<std::size_t>(top_k) * static_cast<std::size_t>(tokens);
     const bool timing = std::getenv("NINFER_SPLIT_TIMING") != nullptr;
+    // The model's routing width, for the prefetch port (see prefetch_plan): recorded here because this
+    // is the one place that is told it, and the port runs outside the layer.
+    top_k_ = top_k;
 
     std::uint32_t capacity[3] = {};
     bool fully                = true;
@@ -3310,7 +3688,8 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
     // S2-5: the tables this layer is about to read were just staged into the Device mirror, so this is
     // the one place where "the ids of this layer, resolved against the tables of the same generation"
     // is answerable without a second staging pass. No-op unless NINFER_SLOT_LOOKUP is set.
-    lookup_routed_slots(device_ids, static_cast<std::int32_t>(values), stream);
+    lookup_routed_slots(device_ids, static_cast<std::int32_t>(values), stream,
+                        ops::RouteTableKind::Placement);
     if (timing) {
         static std::uint64_t calls = 0;
         static double route_total = 0.0, layout_total = 0.0;
@@ -3335,6 +3714,9 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
 
 bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32_t tokens,
                           cudaStream_t stream, const std::int32_t* host_ids, bool assume_covered) {    if (cache_ == nullptr) { throw std::logic_error("expert stream is not attached"); }
+    // The model's routing width, for the prefetch port: the fused path never enters ensure_split(),
+    // so it has to record it here or the port would price the region at zero width.
+    if (top_k > 0) { top_k_ = top_k; }
     // port (sm_89): the gate/up/down form is a different placement problem (three runs, three
     // tables, three masks), so it has its own body. The fused path below is not touched by it: a
     // fused stream never enters ensure_split() and the three-run stream never falls through here.
@@ -5248,6 +5630,20 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         }
     }
     last_host_routes_ = host_resolved;
+    // C5/D4: the read-ahead's numerator on the SPLIT path. The tier is the only place that knows a
+    // route was served from a slot the read-ahead filled, and until now only the fused path asked it -
+    // so on a gate/up/down artifact the queue could fetch bytes nobody ever reported using, which
+    // reads as a mechanism that does not pay when it is really a counter that was never read.
+    if (host_ != nullptr) {
+        if (const auto hits = host_->take_prefetch_hits(); hits != 0) {
+            ExpertPrefetchQueue::instance().note_used(static_cast<std::size_t>(hits) *
+                                                       host_->slot_bytes());
+        }
+        if (const auto warm_hits = host_->take_warm_hits(); warm_hits != 0) {
+            ExpertPrefetchQueue::instance().note_used(static_cast<std::size_t>(warm_hits) *
+                                                       host_->slot_bytes());
+        }
+    }
     const bool all_addressable = host_resolved + pool_resolved >= values;
     const bool host_bound = host_upload || host_publish || (host_fetch && !all_addressable);
     if (!host_bound) { ++gh1_capt_free_calls_; }
@@ -5458,16 +5854,11 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 // per-bank clock would let one bank's backlog expire against another's progress.
                 // The window is NINFER_PREFETCH_WINDOW batches (default 40, one token's worth on
                 // this model) and advance() is what drops the jobs that could not start inside it.
-                static std::atomic<std::uint64_t> layer_tick{0};
-                static const std::uint64_t window = [] {
-                    const char* value = std::getenv("NINFER_PREFETCH_WINDOW");
-                    if (value != nullptr && *value != '\0') {
-                        return static_cast<std::uint64_t>(std::strtoull(value, nullptr, 10));
-                    }
-                    return std::uint64_t{40};
-                }();
+                // C5: the same clock the prediction's fill uses (prefetch_layer_tick), so the two
+                // offers share one window instead of each owning half of it.
                 auto& queue     = ExpertPrefetchQueue::instance();
-                const auto tick = ++layer_tick;
+                const auto tick = prefetch_layer_tick().fetch_add(1) + 1;
+                const auto window = prefetch_window();
                 if (window != 0 && (tick % window) == 0) { queue.advance(tick); }
                 // One job per expert, not one job per bank. A job is a disk read and the buffered
                 // reader serialises concurrent reads on one handle by design (a single file pointer),
