@@ -26,7 +26,6 @@ std::uint32_t prefetch_slots_from_env() {
     if (value == nullptr || *value == '\0') { return 0; }
     return static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
 }
-constexpr std::uint32_t kAbsentSlot = std::numeric_limits<std::uint32_t>::max();
 
 std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
     return (value + alignment - 1) / alignment * alignment;

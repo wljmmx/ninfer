@@ -8,6 +8,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/routing/route.cu"
   "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/host_handoff.cu"
   "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/expert_table.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/route_slots.cu"
   "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/ring_admission.cu"
   "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/groupwise_int/token_swiglu.cu"
   "${CMAKE_CURRENT_LIST_DIR}/topk_softmax_route/bf16/shapes/h2048_e256_k8.cpp"

@@ -37,6 +37,12 @@ ninfer_add_op_test(ninfer_candidate_selector_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_candidate_selector.cpp"
   LIBRARIES ninfer_ops)
 
+# S2-4: the id->slot kernel, against a host scan of the same table.
+ninfer_add_op_test(ninfer_route_slots_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_route_slots.cpp"
+  LIBRARIES ninfer_ops)
+
+
 ninfer_add_op_test(ninfer_softmax_attention_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/main.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/causal_cache.cpp"

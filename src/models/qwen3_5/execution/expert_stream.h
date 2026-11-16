@@ -137,6 +137,20 @@ public:
     [[nodiscard]] std::uint32_t pool_slots_per_bank() const noexcept {
         return cache_ != nullptr ? cache_->slots_per_bank() : 0;
     }
+    // S2: the Device mirror of the pool's slot tables - one contiguous uint32_t array, banks in pool
+    // order, segment `bank` starting at the sum of the preceding segments' lengths (the layout the host
+    // staging accumulated in).
+    //
+    // Only the banks this stream resolves are kept current in it: its own run banks (one for a fused
+    // layer, three for the gate/up/down form). The image spans every bank of the pool, but the segments
+    // of other layers' banks are never uploaded - the pool holds a bank per layer, so copying them all
+    // from every layer would repeat the same bytes once per layer per step for tables nothing here
+    // reads. `slot_mirror_segment()` therefore returns null for a bank this stream does not serve, and
+    // for one whose Device copy is not its current generation - the honest answer instead of a pointer
+    // to stale bytes.
+    [[nodiscard]] const std::uint32_t* slot_mirror_device() const noexcept { return slot_mirror_dev_; }
+    [[nodiscard]] const std::uint32_t* slot_mirror_segment(std::uint32_t bank,
+                                                          std::uint32_t* entries) const noexcept;
     // Read-only, for the controller's prefetch port: the two rates the sizing decision is a function
     // of, plus the stream's own frozen state. -1.0 means "no sample yet", never 0 by default - a
     // decision must be able to tell "measured zero" from "nothing measured".
@@ -743,9 +757,17 @@ private:
     // host-free layer, so it is reported with the rate rather than inferred from it.
     std::uint32_t last_host_routes_ = 0;
     // Prints the GH1 panel; one place so the pinned fast path and the normal path cannot drift.
-    void gh1_report();
+    void gh1_report(cudaStream_t stream = nullptr);
     // Stage the slot-table mirror for every bank whose placement generation moved (S1).
-    void sync_slot_mirror();
+    void sync_slot_mirror(cudaStream_t stream = nullptr);
+    // S2-5: resolve this layer's routed ids to pool slots against that mirror, on the Device, and count
+    // what the table could not answer. Explicit switch only (NINFER_SLOT_LOOKUP) - see the .cpp.
+    void lookup_routed_slots(const void* device_ids, std::int32_t id_values, cudaStream_t stream);
+    // Frees the Device mirror (a new bank geometry makes the old image unreadable).
+    void release_slot_mirror_device() noexcept;
+    // S2: whether `bank` is one of this stream's own runs, i.e. whether its segment is kept current on
+    // the Device. Shared by the upload and the lookup so the two cannot disagree.
+    [[nodiscard]] bool serves_bank(std::uint32_t bank) const noexcept;
     std::uint64_t entered_steps_ = 0;
     // port (sm_26): whether this bank's resident set has ever been built. A prefill is not allowed to
     // choose the set, but the first call has to, or a cold start would route everything to the host
@@ -781,6 +803,32 @@ private:
     std::vector<std::vector<std::uint32_t>> slot_mirror_host_;
     std::uint64_t mirror_uploads_ = 0;
     std::size_t   mirror_entries_ = 0;
+    // S2-1: the Device copy of the staged tables - one contiguous array, banks in pool order, each
+    // bank's segment `slot_mirror_host_[bank].size()` entries long. A raw cudaMalloc on purpose: this
+    // is Device memory that the id->slot kernel indexes, so it must not be a host-side container and
+    // it must be freed by this object. `slot_mirror_off_` is the entry offset of each bank inside it,
+    // which is also the layout the host staging was accumulated in - the two cannot disagree because
+    // both are derived from the same per-bank lengths.
+    std::uint32_t* slot_mirror_dev_       = nullptr;
+    std::size_t    slot_mirror_bytes_     = 0;
+    std::vector<std::uint32_t> slot_mirror_off_;
+    std::vector<std::uint64_t> slot_mirror_dev_gen_; // generation the Device copy holds, stale = ~0
+    // The entry offset each Device copy was written at. A bank whose own length changed moves every
+    // later segment, so "same generation" alone is not enough to trust a pointer: the offset must match.
+    std::vector<std::uint32_t> slot_mirror_dev_off_;
+    std::uint64_t mirror_dev_uploads_ = 0;
+    std::uint64_t mirror_dev_bytes_   = 0;
+    std::uint64_t mirror_dev_fails_   = 0;
+    // The upload's source: pinned, because a pageable source makes cudaMemcpyAsync a synchronous copy
+    // (the driver stages it through its own buffer and the call waits), which would put a host stall on
+    // every layer whose placement moved. Sized to the widest bank segment.
+    std::unique_ptr<PinnedHostBuffer> slot_mirror_stage_;
+    // S2-5: the staging path's id->slot check. Off unless NINFER_SLOT_LOOKUP is set: the result has no
+    // consumer in the shipped placement yet, so the switch is what keeps the default path untouched.
+    std::uint32_t* lookup_slots_dev_  = nullptr;
+    std::uint32_t* lookup_misses_dev_ = nullptr;
+    std::size_t    lookup_capacity_   = 0;
+    std::uint64_t  lookup_calls_      = 0;
     StepCost last_cost_{};
     // Misses per step, histogram 0..32, decayed so a new workload is not held hostage. One
     // sample per step: the spill region holds every lane's miss at once (8 lanes x 8 experts).

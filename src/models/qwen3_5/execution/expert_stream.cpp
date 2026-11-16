@@ -439,6 +439,26 @@ ExpertStream::~ExpertStream() {
             ++it;
         }
     }
+    // S2: the slot-table mirror and the lookup scratch are this object's own cudaMalloc'd memory, so
+    // they go with it (the registries above never reference them).
+    release_slot_mirror_device();
+    if (lookup_slots_dev_ != nullptr) {
+        if (const auto status = cudaFree(lookup_slots_dev_); status != cudaSuccess) {
+            std::fprintf(stderr, "[pf-mirror] cudaFree(id->slot scratch) failed: %s\n",
+                         cudaGetErrorString(status));
+            std::fflush(stderr);
+        }
+        lookup_slots_dev_ = nullptr;
+        lookup_capacity_  = 0;
+    }
+    if (lookup_misses_dev_ != nullptr) {
+        if (const auto status = cudaFree(lookup_misses_dev_); status != cudaSuccess) {
+            std::fprintf(stderr, "[pf-mirror] cudaFree(miss counter) failed: %s\n",
+                         cudaGetErrorString(status));
+            std::fflush(stderr);
+        }
+        lookup_misses_dev_ = nullptr;
+    }
 }
 
 void ExpertStream::attach_host(std::shared_ptr<HostExpertResidency> host) noexcept {
@@ -792,37 +812,284 @@ bool ExpertStream::fully_resident() const noexcept {
 }
 
 // S1: stage each bank's expert->slot table, re-exporting only when step_generation(bank) moved. This
-// is the mirror the id->slot kernel (S2) will read; the generation is the pool's own, so a placement
-// change is noticed without inventing a second notion of "the table changed".
-void ExpertStream::sync_slot_mirror() {
+// is the mirror the id->slot kernel reads; the generation is the pool's own, so a placement change is
+// noticed without inventing a second notion of "the table changed".
+//
+// S2: the staging is also uploaded to one contiguous Device image, in the same bank order the host
+// accumulated it in, so `slot_mirror_dev_ + slot_mirror_off_[bank]` is exactly the table
+// export_slots(bank, ...) returned. Nothing here decides placement or size: the bank count comes from
+// the pool, each segment's length from the export's return value, and the offsets from those lengths.
+namespace {
+// `~0` is never a generation the pool reports (they start at 0 and only move up), so it means "the
+// Device copy is not the staged generation" for both "never uploaded" and "the buffer was rebuilt".
+constexpr std::uint64_t kMirrorStaleGeneration = std::numeric_limits<std::uint64_t>::max();
+constexpr std::size_t   kMirrorProbeEntries   = 4096; // export reports the real count and we resize
+} // namespace
+
+void ExpertStream::release_slot_mirror_device() noexcept {
+    if (slot_mirror_dev_ != nullptr) {
+        const auto status = cudaFree(slot_mirror_dev_);
+        if (status != cudaSuccess) {
+            std::fprintf(stderr, "[pf-mirror] cudaFree(%zu bytes) failed: %s\n", slot_mirror_bytes_,
+                         cudaGetErrorString(status));
+            std::fflush(stderr);
+            ++mirror_dev_fails_;
+        }
+        slot_mirror_dev_ = nullptr;
+    }
+    slot_mirror_bytes_ = 0;
+    std::fill(slot_mirror_dev_gen_.begin(), slot_mirror_dev_gen_.end(), kMirrorStaleGeneration);
+    std::fill(slot_mirror_dev_off_.begin(), slot_mirror_dev_off_.end(), 0U);
+}
+
+bool ExpertStream::serves_bank(std::uint32_t bank) const noexcept {
+    if (split_.empty()) { return bank == bank_; }
+    for (const auto& run : split_) {
+        if (run.bank == bank) { return true; }
+    }
+    return false;
+}
+
+const std::uint32_t* ExpertStream::slot_mirror_segment(std::uint32_t bank,
+                                                       std::uint32_t* entries) const noexcept {
+    if (entries != nullptr) { *entries = 0; }
+    if (slot_mirror_dev_ == nullptr || !serves_bank(bank) || bank >= slot_mirror_off_.size()) {
+        return nullptr;
+    }
+    // Also require the Device copy to be this bank's current generation: a pointer to bytes that the
+    // last upload left behind would answer every id with the previous placement's slot, which is worse
+    // than no answer at all.
+    if (bank >= slot_mirror_dev_gen_.size() || slot_mirror_dev_gen_[bank] != slot_mirror_gen_[bank]) {
+        return nullptr;
+    }
+    if (entries != nullptr) {
+        *entries = bank < slot_mirror_host_.size()
+                       ? static_cast<std::uint32_t>(slot_mirror_host_[bank].size())
+                       : 0U;
+    }
+    return slot_mirror_dev_ + slot_mirror_off_[bank];
+}
+
+void ExpertStream::sync_slot_mirror(cudaStream_t stream) {
     if (cache_ == nullptr) { return; }
     const auto banks = cache_->bank_count();
     if (slot_mirror_gen_.size() != banks) {
-        slot_mirror_gen_.assign(banks, 0);
+        // A different bank count means every offset below is invalid, so the Device image goes too.
+        release_slot_mirror_device();
+        slot_mirror_gen_.assign(banks, kMirrorStaleGeneration);
         slot_mirror_host_.assign(banks, {});
+        slot_mirror_dev_gen_.assign(banks, kMirrorStaleGeneration);
+        slot_mirror_dev_off_.assign(banks, 0);
         mirror_entries_ = 0;
     }
+    // 1) Re-export the banks whose placement generation moved, and only those.
     for (std::uint32_t bank = 0; bank < banks; ++bank) {
         const auto generation = cache_->step_generation(bank);
         if (slot_mirror_gen_[bank] == generation && !slot_mirror_host_[bank].empty()) { continue; }
         auto& staged = slot_mirror_host_[bank];
-        staged.assign(4096, 0);   // probe buffer: the real count comes back from the export
+        staged.assign(kMirrorProbeEntries, 0);   // probe buffer: the real count comes back from the export
         const auto entries = cache_->export_slots(bank, staged);
         staged.resize(entries);
         slot_mirror_gen_[bank] = generation;
         ++mirror_uploads_;
         mirror_entries_ += entries;
     }
+    // 2) The Device layout: bank order, each segment as long as that bank's export. Recomputed rather
+    //    than cached, because an export that returns a different length must move every later segment.
+    slot_mirror_off_.assign(banks, 0);
+    std::size_t total = 0;
+    for (std::uint32_t bank = 0; bank < banks; ++bank) {
+        slot_mirror_off_[bank] = static_cast<std::uint32_t>(total);
+        total += slot_mirror_host_[bank].size();
+    }
+    if (total == 0) { return; }
+    // 3) (Re)allocate when the image is absent or a bank outgrew it. A rebuild makes every segment's
+    //    Device copy stale, so each one is uploaded again below.
+    if (slot_mirror_dev_ == nullptr || total > slot_mirror_bytes_ / sizeof(std::uint32_t)) {
+        release_slot_mirror_device();
+        const std::size_t bytes = total * sizeof(std::uint32_t);
+        void*  allocated        = nullptr;
+        const auto status       = cudaMalloc(&allocated, bytes);
+        if (status != cudaSuccess) {
+            ++mirror_dev_fails_;
+            std::fprintf(stderr,
+                         "[pf-mirror] cudaMalloc(%zu bytes for %zu entries over %u banks) failed: "
+                         "%s\n",
+                         bytes, total, banks, cudaGetErrorString(status));
+            std::fflush(stderr);
+            return;
+        }
+        slot_mirror_dev_   = static_cast<std::uint32_t*>(allocated);
+        slot_mirror_bytes_ = bytes;
+    }
+    // 4) Upload the segments whose Device copy is not the staged generation - but only the banks this
+    //    stream resolves (its own runs). The image is per stream and the pool has banks for every layer
+    //    in it, so uploading the whole pool from each of them would copy the same bytes once per layer
+    //    per step for tables no consumer of this stream ever reads. `serves_bank()` is the same test the
+    //    lookup uses, so "current" and "readable" cannot drift apart.
+    for (std::uint32_t bank = 0; bank < banks; ++bank) {
+        if (!serves_bank(bank)) { continue; }
+        const auto& staged = slot_mirror_host_[bank];
+        if (staged.empty()) { continue; }
+        if (slot_mirror_dev_gen_[bank] == slot_mirror_gen_[bank] &&
+            slot_mirror_dev_off_[bank] == slot_mirror_off_[bank]) {
+            continue;
+        }
+        const auto bytes = staged.size() * sizeof(std::uint32_t);
+        if (!slot_mirror_stage_ || slot_mirror_stage_->size() < bytes) {
+            try {
+                slot_mirror_stage_ = std::make_unique<PinnedHostBuffer>(bytes);
+            } catch (const std::exception& error) {
+                ++mirror_dev_fails_;
+                std::fprintf(stderr, "[pf-mirror] pinned staging (%zu bytes) failed: %s\n", bytes,
+                             error.what());
+                std::fflush(stderr);
+                return;
+            }
+        }
+        std::memcpy(slot_mirror_stage_->data(), staged.data(), bytes);
+        const auto status = cudaMemcpyAsync(slot_mirror_dev_ + slot_mirror_off_[bank],
+                                            slot_mirror_stage_->data(), bytes,
+                                            cudaMemcpyHostToDevice, stream);
+        if (status != cudaSuccess) {
+            // Leave the generation stale: the next pass retries instead of trusting a short copy.
+            ++mirror_dev_fails_;
+            std::fprintf(stderr,
+                         "[pf-mirror] cudaMemcpyAsync bank=%u entries=%zu -> dev+%u (%zu bytes) "
+                         "failed: %s\n",
+                         bank, staged.size(), slot_mirror_off_[bank], bytes,
+                         cudaGetErrorString(status));
+            std::fflush(stderr);
+            continue;
+        }
+        slot_mirror_dev_gen_[bank] = slot_mirror_gen_[bank];
+        slot_mirror_dev_off_[bank] = slot_mirror_off_[bank];
+        ++mirror_dev_uploads_;
+        mirror_dev_bytes_ += bytes;
+    }
 }
 
-void ExpertStream::gh1_report() {
-    sync_slot_mirror();
+
+// S2-5: the staging path's own consumer of the mirror. Each route the layer just produced is resolved
+// to the slot the pool holds it in, on the Device, against the segment sync_slot_mirror() staged; the
+// routes the table cannot answer (id outside the bank, or no slot held) are counted where they happen
+// and shown in the [pf-mirror] line.
+//
+// Explicit switch only. The shipped placement does not consume these slots yet, so the switch is the
+// only thing that makes the lookup run - and that is what keeps the default path bit-identical to S1.
+void ExpertStream::lookup_routed_slots(const void* device_ids, std::int32_t id_values,
+                                       cudaStream_t stream) {
+    static const bool enabled = std::getenv("NINFER_SLOT_LOOKUP") != nullptr;
+    if (!enabled || device_ids == nullptr || id_values <= 0 || slot_mirror_dev_ == nullptr) { return; }
+    const auto values = static_cast<std::size_t>(id_values);
+    // Output scratch: one slot per id. Grown, never shrunk, and freed with the stream.
+    if (lookup_capacity_ < values) {
+        if (lookup_slots_dev_ != nullptr) {
+            const auto free_status = cudaFree(lookup_slots_dev_);
+            lookup_slots_dev_     = nullptr;
+            lookup_capacity_      = 0;
+            if (free_status != cudaSuccess) {
+                ++mirror_dev_fails_;
+                std::fprintf(stderr, "[pf-mirror] cudaFree(id->slot scratch) failed: %s\n",
+                             cudaGetErrorString(free_status));
+                std::fflush(stderr);
+                return;
+            }
+        }
+        void*      allocated = nullptr;
+        const auto bytes     = values * sizeof(std::uint32_t);
+        const auto status    = cudaMalloc(&allocated, bytes);
+        if (status != cudaSuccess) {
+            ++mirror_dev_fails_;
+            std::fprintf(stderr, "[pf-mirror] cudaMalloc(%zu bytes, id->slot scratch) failed: %s\n",
+                         bytes, cudaGetErrorString(status));
+            std::fflush(stderr);
+            return;
+        }
+        lookup_slots_dev_ = static_cast<std::uint32_t*>(allocated);
+        lookup_capacity_  = values;
+    }
+    // One cumulative miss counter for the run: zeroed once so the print can report a total, and never
+    // reset, which keeps the read-back off the layer path.
+    if (lookup_misses_dev_ == nullptr) {
+        void*      allocated = nullptr;
+        const auto status    = cudaMalloc(&allocated, sizeof(std::uint32_t));
+        if (status != cudaSuccess) {
+            ++mirror_dev_fails_;
+            std::fprintf(stderr, "[pf-mirror] cudaMalloc(miss counter) failed: %s\n",
+                         cudaGetErrorString(status));
+            std::fflush(stderr);
+            return;
+        }
+        lookup_misses_dev_ = static_cast<std::uint32_t*>(allocated);
+        if (const auto zeroed = cudaMemset(lookup_misses_dev_, 0, sizeof(std::uint32_t));
+            zeroed != cudaSuccess) {
+            ++mirror_dev_fails_;
+            std::fprintf(stderr, "[pf-mirror] cudaMemset(miss counter) failed: %s\n",
+                         cudaGetErrorString(zeroed));
+            std::fflush(stderr);
+            return;
+        }
+    }
+    // One lookup per matrix run of this layer: the three runs place independently, so an id can have a
+    // slot in one and none in another - resolving only the gate run would hide exactly that. The
+    // segment comes from the accessor, so a bank this stream does not keep current resolves to null and
+    // is reported rather than read as stale bytes.
+    const auto resolve = [&](std::uint32_t bank) {
+        std::uint32_t       experts = 0;
+        const std::uint32_t* table  = slot_mirror_segment(bank, &experts);
+        if (table == nullptr || experts == 0) {
+            ++mirror_dev_fails_;
+            std::fprintf(stderr,
+                         "[pf-mirror] id->slot skipped for bank %u: no current Device segment "
+                         "(served=%d)\n",
+                         bank, int(serves_bank(bank)));
+            std::fflush(stderr);
+            return;
+        }
+        ops::moe_route_slots(static_cast<const std::int32_t*>(device_ids), static_cast<int>(values),
+                             table, experts, lookup_slots_dev_, lookup_misses_dev_, stream);
+        ++lookup_calls_;
+    };
+    if (split_.empty()) {
+        resolve(bank_);
+    } else {
+        for (const auto& run : split_) { resolve(run.bank); }
+    }
+    if (const auto status = cudaGetLastError(); status != cudaSuccess) {
+        ++mirror_dev_fails_;
+        std::fprintf(stderr, "[pf-mirror] id->slot launch (bank=%u, %zu ids) failed: %s\n", bank_,
+                     values, cudaGetErrorString(status));
+        std::fflush(stderr);
+    }
+}
+
+void ExpertStream::gh1_report(cudaStream_t stream) {
+    sync_slot_mirror(stream);
     {
         static std::uint64_t reported = 0;
         if (++reported % 8 == 0) {
-            std::fprintf(stderr, "[pf-mirror] banks=%u entries=%zu uploads=%llu\n",
+            // The id->slot misses are counted where they happen (an atomic add in the kernel), so the
+            // only read-back is here, once per print. Nothing else touches this counter.
+            std::uint32_t lookup_misses = 0;
+            if (lookup_misses_dev_ != nullptr) {
+                const auto status = cudaMemcpy(&lookup_misses, lookup_misses_dev_,
+                                               sizeof(lookup_misses), cudaMemcpyDeviceToHost);
+                if (status != cudaSuccess) {
+                    std::fprintf(stderr, "[pf-mirror] read-back of the id->slot miss counter failed: %s\n",
+                                 cudaGetErrorString(status));
+                    std::fflush(stderr);
+                }
+            }
+            std::fprintf(stderr,
+                         "[pf-mirror] banks=%u entries=%zu uploads=%llu | dev_upload=%llu "
+                         "dev_bytes=%llu dev_fails=%llu | lookup calls=%llu absent=%u\n",
                          cache_ != nullptr ? cache_->bank_count() : 0U, mirror_entries_,
-                         static_cast<unsigned long long>(mirror_uploads_));
+                         static_cast<unsigned long long>(mirror_uploads_),
+                         static_cast<unsigned long long>(mirror_dev_uploads_),
+                         static_cast<unsigned long long>(mirror_dev_bytes_),
+                         static_cast<unsigned long long>(mirror_dev_fails_),
+                         static_cast<unsigned long long>(lookup_calls_), lookup_misses);
             std::fflush(stderr);
         }
     }
@@ -2438,7 +2705,11 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
     last_host_routes_    = host_routes_gate;
     split_host_routes_   = host_routes_gate;
     set_initialised_     = true;
-    gh1_report();
+    gh1_report(stream);
+    // S2-5: the tables this layer is about to read were just staged into the Device mirror, so this is
+    // the one place where "the ids of this layer, resolved against the tables of the same generation"
+    // is answerable without a second staging pass. No-op unless NINFER_SLOT_LOOKUP is set.
+    lookup_routed_slots(device_ids, static_cast<std::int32_t>(values), stream);
     if (timing) {
         static std::uint64_t calls = 0;
         static double route_total = 0.0, layout_total = 0.0;
@@ -2535,7 +2806,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             // no copy. It is the one path where both rates are honest 100%.
             ++gh1_capt_free_calls_;
             ++gh1_capt_ready_calls_;
-            gh1_report();
+            gh1_report(stream);
             return true;
         }
         // A resize dropped this window; fall through so the normal path allocates a new one.
@@ -2596,7 +2867,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         ++gh1_no_miss_calls_;
         ++gh1_static_calls_;
     }
-    gh1_report();
+    gh1_report(stream);
     // Q11/Q12: the window the freeze rule reads. Counted here so a layer that returns through the
     // covered fast path is still part of the window - that is exactly the layer the rule is looking
     // for, and counting only the split path would make "32 clean layers" unreachable by construction.

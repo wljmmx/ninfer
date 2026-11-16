@@ -293,4 +293,22 @@ void moe_expand_expert_placements(const std::uint32_t* placements, int count,
                                   std::uint64_t* host_offsets, std::int32_t* host_flags,
                                   cudaStream_t stream);
 
+// port (sm_89): S2 - expert id -> pool slot, on the Device (kernels/cuda/route_slots.cu).
+//
+// `slot_table` is one bank's exported table (ExpertCache::export_slots) as it sits in the Device
+// mirror; `experts` is that bank's entry count, i.e. the table's length. For each of the `count` ids
+// this writes
+//
+//   slots[i] = slot_table[ids[i]]              when 0 <= ids[i] < experts and the slot is live
+//   slots[i] = kAbsentSlot                     otherwise (id out of range, or the bank holds no slot)
+//
+// and adds one to `*misses` (atomically, Device memory) for every i that lands on the second line.
+// kAbsentSlot is the pool's own marker (core/expert_cache.h) - the same word export_slots() writes -
+// so a caller can compare against the table it staged without translating between two encodings.
+// `misses` may be null, in which case nothing is counted. Enqueues on `stream`; no host
+// synchronisation.
+void moe_route_slots(const std::int32_t* ids, int count, const std::uint32_t* slot_table,
+                     std::uint32_t experts, std::uint32_t* slots, std::uint32_t* misses,
+                     cudaStream_t stream);
+
 } // namespace ninfer::ops

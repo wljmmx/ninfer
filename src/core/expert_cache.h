@@ -9,12 +9,18 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
 #include <vector>
 
 namespace ninfer {
+
+// The pool's "this expert holds no slot" marker. export_slots() writes it wherever a bank does not
+// hold an expert, and anything that turns an expert id into a slot has to produce the same word, so
+// the value is stated once, here, instead of in a second constant that could drift from this one.
+inline constexpr std::uint32_t kAbsentSlot = std::numeric_limits<std::uint32_t>::max();
 
 // port (sm_89): the expert cache planned on the bench line, expressed against master's
 // "one 2D parent per expert" bank shape.
