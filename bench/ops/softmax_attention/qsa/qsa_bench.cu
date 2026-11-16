@@ -294,13 +294,13 @@ public:
                                 physical_pages_,
                             409U, -1.F, 1.F)),
           table_(std::size_t(pages_) * batch_ * sizeof(std::int32_t)),
-          query_(bench::make_bf16(std::size_t{kHeadDim} * geometry.q_heads * tokens_ * batch_,
+          query_(bench::make_bf16(std::size_t{kHeadDim} * geometry.query_heads * tokens_ * batch_,
                                   101U)),
-          gate_(bench::make_bf16(std::size_t{kHeadDim} * geometry.q_heads * tokens_ * batch_,
+          gate_(bench::make_bf16(std::size_t{kHeadDim} * geometry.query_heads * tokens_ * batch_,
                                  103U)),
           index_query_(bench::make_bf16(
               std::size_t{kIndexDim} * kIndexHeads * tokens_ * batch_, 107U)),
-          out_(bench::make_zeros(std::size_t{kHeadDim} * geometry.q_heads * tokens_ * batch_ * 2)),
+          out_(bench::make_zeros(std::size_t{kHeadDim} * geometry.query_heads * tokens_ * batch_ * 2)),
           positions_(std::size_t(tokens_) * batch_ * sizeof(std::int32_t)),
           valid_(std::size_t(batch_) * sizeof(std::int32_t)),
           rows_(std::size_t(batch_) * sizeof(std::int32_t)),
@@ -312,7 +312,7 @@ public:
           index_capacity_(ops::qsa_indexer_workspace_capacity_bytes(tokens_, tokens_, batch_,
                                                                     index_envelope_, execution_)),
           sparse_capacity_(ops::qsa_sparse_gqa_workspace_capacity_bytes(
-              KvCacheStorage::BFloat16, geometry.q_heads, geometry.kv_heads, tokens_, tokens_,
+              KvCacheStorage::BFloat16, geometry.query_heads, geometry.kv_heads, tokens_, tokens_,
               batch_, sparse_envelope_, execution_)),
           index_workspace_(std::max<std::size_t>(index_capacity_, 256)),
           sparse_workspace_(std::max<std::size_t>(sparse_capacity_, 256)),
@@ -324,11 +324,11 @@ public:
                          {kHeadDim, kPagedKVPageSize, geometry.kv_heads, physical_pages_}),
           table_tensor_(table_.p, DType::I32, {pages_, batch_}),
           query_tensor_(query_.p, DType::BF16,
-                        {kHeadDim, geometry.q_heads, tokens_, batch_}),
-          gate_tensor_(gate_.p, DType::BF16, {kHeadDim, geometry.q_heads, tokens_, batch_}),
+                        {kHeadDim, geometry.query_heads, tokens_, batch_}),
+          gate_tensor_(gate_.p, DType::BF16, {kHeadDim, geometry.query_heads, tokens_, batch_}),
           index_query_tensor_(index_query_.p, DType::BF16,
                               {kIndexDim, kIndexHeads, tokens_, batch_}),
-          out_tensor_(out_.p, DType::BF16, {kHeadDim, geometry.q_heads, tokens_, batch_}),
+          out_tensor_(out_.p, DType::BF16, {kHeadDim, geometry.query_heads, tokens_, batch_}),
           positions_tensor_(positions_.p, DType::I32, {tokens_, batch_}),
           valid_tensor_(valid_.p, DType::I32, {batch_}),
           rows_tensor_(rows_.p, DType::I32, {batch_}),
@@ -412,20 +412,20 @@ public:
         const double rows = double(batch_);
         const double vectors_bytes = 2.0 * kHeadDim * 2.0;  // BF16 K + FP16 V per token, per KV head
         const double qsa_io_bytes =
-            3.0 * double(kHeadDim) * double(geometry_.q_heads) * 2.0 * double(tokens_) * rows;
+            3.0 * double(kHeadDim) * double(geometry_.query_heads) * 2.0 * double(tokens_) * rows;
         const double selector_bytes =
             rows * (index_key_bytes + double(tokens_) *
                                           (double(kIndexHeads) * kIndexDim * 2.0 +
                                            double(selected_) * 4.0 + 4.0));
         const double attention_kv_bytes = sparse_keys * rows * geometry_.kv_heads * vectors_bytes;
         const double attention_flops =
-            sparse_keys * rows * 4.0 * double(kHeadDim) * double(geometry_.q_heads);
+            sparse_keys * rows * 4.0 * double(kHeadDim) * double(geometry_.query_heads);
         const double selector_flops = rows * index_flops;
 
         result.dense_kv_bytes = dense_keys * rows * geometry_.kv_heads * vectors_bytes;
         result.full_bytes     = result.dense_kv_bytes + qsa_io_bytes;
         result.full_flops =
-            dense_keys * rows * 4.0 * double(kHeadDim) * double(geometry_.q_heads);
+            dense_keys * rows * 4.0 * double(kHeadDim) * double(geometry_.query_heads);
         result.attended_keys = entry == Entry::Indexer ? 0.0 : sparse_keys / double(tokens_);
         result.scoped_blocks = blocks / double(tokens_);
         switch (entry) {
