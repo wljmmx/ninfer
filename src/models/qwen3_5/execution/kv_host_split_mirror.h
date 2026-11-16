@@ -114,14 +114,13 @@ public:
         if (!cpu_partial::plan_rk_host_kv_planes(layout, 0, page_planes)) {
             return fail("the layer's KV storage is not one the CPU partial decodes");
         }
-        // The gate's codec axis knows exactly two families; the E8 carriers decode to the same
-        // numeric form but are not what RkHostKvDType names, so they stay on the GPU for now.
-        if (page_planes.k_codec != cpu_partial::RkKCodec::Int4 &&
-            page_planes.k_codec != cpu_partial::RkKCodec::Int8) {
-            return fail("the K codec is an E8 carrier, which the view's dtype axis cannot name");
-        }
-        if (page_planes.v_codec != cpu_partial::RkVCodec::Int4) {
-            return fail("the V codec is an E8 carrier, which the view's dtype axis cannot name");
+        // The page family names the view's dtype through the ONE mapping in host_partial.h;
+        // every family host_pages.h identifies has a value on that axis, and the E8 carriers
+        // decode to the same int8/FP16-G64 form (cpu/e8_codec.h), so no carrier is refused here.
+        // A pair no family names still fails rather than being guessed.
+        ops::detail::RkHostKvDType dtype{};
+        if (!ops::detail::rk_host_kv_dtype_of(page_planes.k_codec, page_planes.v_codec, dtype)) {
+            return fail("the layer's (K, V) codec pair names no rk host dtype");
         }
 
         const auto logical_pages = static_cast<std::int32_t>(cache.block_tables.ne[0]);
@@ -206,8 +205,7 @@ public:
         }
         table_.swap(mirrored_table);
 
-        view_.dtype       = page_planes.packed_k ? ops::detail::RkHostKvDType::Rk4v4
-                                                 : ops::detail::RkHostKvDType::Rk8v4;
+        view_.dtype       = dtype;
         view_.query_heads = q.ne[1];
         view_.pages = cpu_partial::rk_host_partial_pages(mirror_.data(), mirror_layout,
                                                                      table_.data(), cache.num_kv_heads);

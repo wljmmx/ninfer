@@ -62,9 +62,10 @@ void rk_grouped(const CausalAttentionOperands& p, Int8KvCacheView<Writable> cach
                                    Input, false, true, false, false>(p, cache, input, partition,
                                                                      partial, stream);
         // P3 Phase C seam: optionally replace one split's partial with the CPU result before
-        // the merge (default off; host_partial.h owns the knob, the view and the staging).
-        rk_kv_cpu_split_gate<G, Masked, false>(p, partition, partial, Instance::Schedule::kKeyRows,
-                                              stream);
+        // the merge (default off; host_partial.h owns the knob, the view and the staging). This
+        // instance reads a plain int8 K plane, so the view's family must be rk8v4.
+        rk_kv_cpu_split_gate<G, Masked, RkHostKvDType::Rk8v4>(
+            p, partition, partial, Instance::Schedule::kKeyRows, stream);
         launch_causal_natural_merge<G, typename Instance::Merge, MultiBatch, Masked, false>(
             p, cache.valid_columns, partition, partial, stream);
     };
@@ -96,9 +97,10 @@ void rk_packedk_grouped(const CausalAttentionOperands& p, Int8KvCacheView<Writab
                                    Input, false, true, true, false, false>(p, cache, input,
                                                                           partition, partial,
                                                                           stream);
-        // P3 Phase C seam: same knob as rk_grouped, with PackedK=true for this codec.
-        rk_kv_cpu_split_gate<G, Masked, true>(p, partition, partial, Instance::Schedule::kKeyRows,
-                                             stream);
+        // P3 Phase C seam: same knob as rk_grouped, with this instance's packed int4 K plane
+        // (family rk4v4).
+        rk_kv_cpu_split_gate<G, Masked, RkHostKvDType::Rk4v4>(
+            p, partition, partial, Instance::Schedule::kKeyRows, stream);
         launch_causal_natural_merge<G, typename Instance::Merge, MultiBatch, Masked, false>(
             p, cache.valid_columns, partition, partial, stream);
     };

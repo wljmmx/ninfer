@@ -3,7 +3,8 @@
 // port (sm_89), engine-integration P3 Phase C: the KV-partition CPU-partial seam (default off).
 //
 // Scope of this header: export ONE small interface that lets a caller run a single split's
-// attention partial on the CPU over HOST-RESIDENT rk4v4 / rk8v4 KV pages and land the result in
+// attention partial on the CPU over HOST-RESIDENT rk-family KV pages (all five families of
+// core/paged_kv_storage.h: rk4v4, rk8v4, rk4v4-e8, rk2v4-e8, rk4v2-e8) and land the result in
 // the device partial buffers the production merge kernel consumes, plus the knob-gated branch
 // int8/launch.cu installs between the grouped MMA launch and the merge launch.
 //
@@ -26,8 +27,9 @@
 //
 // Preconditions the gate enforces (each miss = GPU fallback + one log line): view installed;
 // unmasked single-batch call (batch==1, no valid_columns); view geometry matches the dispatched
-// G; view dtype matches the dispatched codec (PackedK); window from the host positions mirror
-// fits the call's visible capacity; knob split < active splits; the stream is not capturing.
+// G; view dtype (family) equals the dispatched instance's family; window from the host positions
+// mirror fits the call's visible capacity; knob split < active splits; the stream is not
+// capturing.
 // The first engage also logs one line; the thread-local engage counter lets a harness assert
 // the seam actually fired instead of silently falling back to two identical GPU runs.
 //
@@ -54,10 +56,64 @@ namespace ninfer::ops::detail {
 
 // --- the caller-supplied host view -----------------------------------------------------------
 
-// K codec identity of the mirrored planes. Rk4v4 = packed int4 K (the PackedK=true grouped
-// instance), Rk8v4 = plain int8 K (PackedK=false). V is int4-packed with FP16 G64 scales in
-// both, which is why partial.h covers exactly these two dtypes.
-enum class RkHostKvDType : std::uint8_t { Rk4v4 = 0, Rk8v4 = 1 };
+// Family identity of the mirrored planes: one value per rk layout paged_kv_storage_layout()
+// resolves (the same five cpu/host_pages.h identifies from a layer's plane inventory). The
+// first two are the families the int8 attention paths have always been able to serve; the three
+// E8 carriers below them decode to the same int8 codes over FP16 G64 scales (cpu/e8_codec.h),
+// so the operator's numeric form does not change - only the code fetch does.
+enum class RkHostKvDType : std::uint8_t {
+    Rk4v4   = 0,  // RotatedInt4KeyInt4ValueGroup64: packed int4 K + packed int4 V
+    Rk8v4   = 1,  // RotatedInt8KeyInt4ValueGroup64: int8 K + packed int4 V
+    Rk4v4E8 = 2,  // RK4V4E8: E8-lattice K (96 B cylinder + residual) + packed int4 V
+    Rk2v4E8 = 3,  // RK2V4E8: E8-root cylinder K (64 B) + packed int4 V
+    Rk4v2E8 = 4,  // RK4V2E8: E8-lattice K (96 B) + calibrated E8-root cylinder V (64 B)
+};
+
+// dtype -> (K codec, V codec), THE ONLY such mapping: the gate, the stage and the mirror all
+// come through here, so a family cannot be named on one side and decoded on another.
+struct RkHostKvCodecs {
+    softmax_cpu::RkKCodec k;
+    softmax_cpu::RkVCodec v;
+    const char* name;  // the family's spelling in the engage line
+};
+
+[[nodiscard]] constexpr RkHostKvCodecs rk_host_kv_codecs(RkHostKvDType dtype) noexcept {
+    switch (dtype) {
+    case RkHostKvDType::Rk4v4:
+        return {softmax_cpu::RkKCodec::Int4, softmax_cpu::RkVCodec::Int4, "rk4v4"};
+    case RkHostKvDType::Rk8v4:
+        return {softmax_cpu::RkKCodec::Int8, softmax_cpu::RkVCodec::Int4, "rk8v4"};
+    case RkHostKvDType::Rk4v4E8:
+        return {softmax_cpu::RkKCodec::E8Lattice, softmax_cpu::RkVCodec::Int4, "rk4v4-e8"};
+    case RkHostKvDType::Rk2v4E8:
+        return {softmax_cpu::RkKCodec::E8Root, softmax_cpu::RkVCodec::Int4, "rk2v4-e8"};
+    case RkHostKvDType::Rk4v2E8:
+        return {softmax_cpu::RkKCodec::E8Lattice, softmax_cpu::RkVCodec::E8Root, "rk4v2-e8"};
+    }
+    return {softmax_cpu::RkKCodec::Int4, softmax_cpu::RkVCodec::Int4, "unknown"};
+}
+
+// Every value of the axis, so the inverse below and the tests iterate it instead of repeating it.
+inline constexpr RkHostKvDType kRkHostKvDTypes[] = {
+    RkHostKvDType::Rk4v4, RkHostKvDType::Rk8v4, RkHostKvDType::Rk4v4E8, RkHostKvDType::Rk2v4E8,
+    RkHostKvDType::Rk4v2E8,
+};
+
+// The inverse mapping: which family a (K codec, V codec) pair is. Every pair is unique, and the
+// scan is derived from rk_host_kv_codecs, so there is no second table to keep in sync. Returns
+// false for a pair no family names (the mirror then keeps the layer on the GPU).
+[[nodiscard]] constexpr bool rk_host_kv_dtype_of(softmax_cpu::RkKCodec k,
+                                                 softmax_cpu::RkVCodec v,
+                                                 RkHostKvDType& out) noexcept {
+    for (const RkHostKvDType dtype : kRkHostKvDTypes) {
+        const RkHostKvCodecs codecs = rk_host_kv_codecs(dtype);
+        if (codecs.k == k && codecs.v == v) {
+            out = dtype;
+            return true;
+        }
+    }
+    return false;
+}
 
 // One layer's host-resident mirror the later KV-tiering batch will own: the page code/scale
 // planes and the row's block table (physical ids, negative = absent page), plus THIS call's
@@ -279,7 +335,7 @@ inline void log_engage(const RkHostPartialView& view, int split, int window, int
                  "[kv-cpu] split %d -> CPU partial (dtype=%s q_heads=%d kv_heads=%d width=%d "
                  "window=%d active=%d range=[%d,%d) key_tile=%d); the GPU slot is overwritten "
                  "before the merge\n",
-                 split, view.dtype == RkHostKvDType::Rk4v4 ? "rk4v4" : "rk8v4", view.query_heads,
+                 split, rk_host_kv_codecs(view.dtype).name, view.query_heads,
                  view.pages.kv_heads, width, window, active, range.begin, range.end, key_tile);
     std::fflush(stderr);
 }
@@ -299,7 +355,7 @@ inline void log_engage(const RkHostPartialView& view, int split, int window, int
 // `width`/`tokens` follow partial.h's unmasked-decode contract (tokens == width here);
 // `range`/`key_tile` must mirror the dispatched instance (rk_partial_split_range and
 // Schedule::kKeyRows).
-template <int QueryHeads, int KVHeads, bool PackedK>
+template <int QueryHeads, int KVHeads, RkHostKvDType DType>
 void rk_host_partial_stage(const RkHostPartialView& view, float scale, int width, int split,
                            softmax_cpu::RkPartialTokenRange range, int key_tile,
                            CausalPartialView partial, cudaStream_t stream) {
@@ -326,14 +382,11 @@ void rk_host_partial_stage(const RkHostPartialView& view, float scale, int width
     request.key_tile = key_tile;
     const softmax_cpu::RkPartialOutput out{st.acc, st.maximum, st.sum};
     // P4 codec axis: the partial's bool template form was removed (an enum spelling silently
-    // bound to the bool overload), so the seam spells the codec explicitly per PackedK.
-    if constexpr (PackedK) {
-        softmax_cpu::rk_attention_partial<QueryHeads, KVHeads, softmax_cpu::RkKCodec::Int4>(
-            view.pages, request, out);
-    } else {
-        softmax_cpu::rk_attention_partial<QueryHeads, KVHeads, softmax_cpu::RkKCodec::Int8>(
-            view.pages, request, out);
-    }
+    // bound to the bool overload), so the seam spells the codec pair the family names - both
+    // sides of it, which is what carries the rk4v2-e8 calibrated E8-root V read-back.
+    constexpr RkHostKvCodecs codecs = rk_host_kv_codecs(DType);
+    softmax_cpu::rk_attention_partial<QueryHeads, KVHeads, codecs.k, codecs.v>(view.pages, request,
+                                                                               out);
 
     const auto slot_acc  = static_cast<std::int64_t>(256) * QueryHeads * width * split;
     const auto slot_stat = static_cast<std::int64_t>(QueryHeads) * width * split;
@@ -362,7 +415,7 @@ void rk_host_partial_stage(const RkHostPartialView& view, float scale, int width
 // positions mirror, revalidates every precondition against the dispatched instance, and hands
 // the CPU leg its inputs. The discarded-GPU-slot and page-score-counter caveats are inherent
 // to the validation-seam shape (the counters still record the GPU block's pass over the split).
-template <class G, bool Masked, bool PackedK>
+template <class G, bool Masked, RkHostKvDType DType>
 void rk_kv_cpu_split_gate(const CausalAttentionOperands& p, CausalKvPartition partition,
                           CausalPartialView partial, int key_tile, cudaStream_t stream) {
     const int split = rk_kv_cpu_partition_split();
@@ -401,8 +454,8 @@ void rk_kv_cpu_split_gate(const CausalAttentionOperands& p, CausalKvPartition pa
         log_fallback(detail::kGeometry, "host view geometry does not match the dispatched G");
         return;
     }
-    if ((view->dtype == RkHostKvDType::Rk4v4) != PackedK) {
-        log_fallback(detail::kDType, "host view dtype does not match the dispatched codec");
+    if (view->dtype != DType) {
+        log_fallback(detail::kDType, "host view family does not match the dispatched instance");
         return;
     }
     if (view->positions == nullptr || view->q_bf16 == nullptr) {
@@ -445,8 +498,8 @@ void rk_kv_cpu_split_gate(const CausalAttentionOperands& p, CausalKvPartition pa
     }
     detail::log_engage(*view, split, window, active, range, key_tile, width);
     ++detail::engage_slot();
-    rk_host_partial_stage<G::QHeads, G::KVHeads, PackedK>(*view, p.scale, width, split, range,
-                                                          key_tile, partial, stream);
+    rk_host_partial_stage<G::QHeads, G::KVHeads, DType>(*view, p.scale, width, split, range,
+                                                        key_tile, partial, stream);
 }
 
 } // namespace ninfer::ops::detail
