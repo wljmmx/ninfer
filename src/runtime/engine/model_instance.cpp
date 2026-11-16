@@ -553,9 +553,7 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
         std::fflush(stderr);
         return false;
     };
-    (void)admit(core::Tier::Device, "expert-pool", instance.expert_cache->capacity_bytes());
-    (void)admit(core::Tier::Device, "kv-pages", kv_reserve_bytes);
-    (void)admit(core::Tier::Device, "staging", startup_headroom);
+    (void)admit; // every admission below is read out of the plan, not written here
     // The warm tier's ceiling is the budget it just computed, not "a quarter of free RAM": the
     // partition is what the scheduler grants, and a module may not widen it on its own. The override
     // exists so a caller can grant less - and then the arena is what actually shrinks, rather than
@@ -586,11 +584,41 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
                      static_cast<unsigned long long>(grant_second_chance >> 20));
         std::fflush(stderr);
     }
-    (void)admit(core::Tier::Host, "expert-warm", grant_routed);
-    if (grant_prefetch != 0) { (void)admit(core::Tier::Host, "expert-prefetch", grant_prefetch); }
-    if (grant_second_chance != 0) {
-        (void)admit(core::Tier::Host, "expert-second-chance", grant_second_chance);
+    // ---- the plan, then the ledger as its projection -------------------------------------------
+    //
+    // Every tier is divided here, once, among a closed list of consumers (core/tier_plan.h). The
+    // ledger below is told these numbers and no others, so "who took the bytes" and "what was the
+    // plan" cannot disagree. Three of the device figures are slices rather than claims (the
+    // prediction region and the SLRU band are carved out of the pool; the startup allowance is what
+    // the cap carries), and the KV host figure is a planning input the context planner claims for
+    // itself - the table shows it without claiming it, which is what that split has always been.
+    auto& plan = instance.tier_plan;
+    plan.set_cap(core::Tier::Device, device_cap);
+    plan.set_cap(core::Tier::Host, host_cap);
+    const std::uint64_t region_bytes =
+        static_cast<std::uint64_t>(instance.expert_cache->prefetch_slots_per_bank()) *
+        instance.expert_cache->bank_count() * instance.expert_cache->slot_bytes();
+    plan.set(core::Budget::DeviceExpertPool, instance.expert_cache->capacity_bytes());
+    plan.set(core::Budget::DeviceKvPages, kv_reserve_bytes);
+    plan.set(core::Budget::DevicePrefetch, region_bytes);
+    // No bytes: SLRU chooses which half of a slot's life an expert is in, it does not hold memory of
+    // its own (expert_stream.cpp, the 50/50 branch). A number here would be invented.
+    plan.set(core::Budget::DeviceSlruBand, 0);
+    plan.set(core::Budget::DeviceStartup, startup_headroom);
+    plan.set(core::Budget::HostExpertArena, grant_routed);
+    plan.set(core::Budget::HostReadahead, grant_prefetch);
+    plan.set(core::Budget::HostSecondChance, grant_second_chance);
+    plan.set(core::Budget::HostKvHost, options.context_cache.host_capacity_bytes.value_or(0));
+    // SSD keeps no experts: the cold range is the complement of what the two warm tiers held, so it
+    // is a result. The KV spill has no cap either - it is read back to be judged (re-read count).
+    plan.set(core::Budget::DiskKvSpill, 0);
+    for (const auto id : {core::Budget::DeviceExpertPool, core::Budget::DeviceKvPages,
+                          core::Budget::DeviceStartup, core::Budget::HostExpertArena,
+                          core::Budget::HostReadahead, core::Budget::HostSecondChance}) {
+        const auto& row = core::TierPlan::slot(id);
+        if (plan.bytes_of(id) != 0) { (void)admit(row.tier, row.name, plan.bytes_of(id)); }
     }
+    plan.report();
     std::fprintf(stderr,
                  "[experts] banks=%zu slot=%llu windows=%llu pool=%lluMiB host=%d arena=%lluMiB "
                  "(routed=%llu prefetch=%llu second-chance=%llu) want=%lluMiB top_k=%u kept=%llu "

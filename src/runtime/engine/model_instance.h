@@ -6,6 +6,7 @@
 #include "runtime/engine/context_cache/context_cost.h"
 #include "core/expert_file.h"
 #include "core/memory_ledger.h"
+#include "core/tier_plan.h"
 #include "runtime/engine/kv_capacity.h"
 
 #include <memory>
@@ -68,6 +69,9 @@ struct ModelInstance {
     // port (sm_89): the one place that knows what each tier holds (1y.7). Step two only registers
     // and prints; the allocations still use their own estimates.
     core::MemoryLedger ledger;
+    // The decision the ledger above is a projection of: one named line per consumer, per tier. Kept on
+    // the instance because the tiered-KV path re-reads it when the host KV owner activates.
+    core::TierPlan tier_plan;
 
     ModelInstance(std::unique_ptr<models::qwen3_5::Model> model, const EngineOptions& options,
                   models::qwen3_5::execution::PleTableBinding ple = {});
