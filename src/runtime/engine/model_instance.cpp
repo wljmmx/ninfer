@@ -38,6 +38,7 @@ namespace ninfer::runtime {
 namespace {
 
 std::uint64_t host_expert_arena_bytes(std::uint64_t want_bytes);
+std::uint64_t current_free_host_bytes();
 std::uint64_t readahead_bytes(std::span<const ExpertBankLayout> banks);
 std::uint64_t second_chance_budget_bytes(std::span<const ExpertBankLayout> banks);
 using Clock = std::chrono::steady_clock;
@@ -462,6 +463,32 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
         }
         return host_expert_arena_bytes(host_want);
     }();
+    // The host tier has TWO consumers that size themselves independently: this warm arena, and the
+    // KV pages a tiered context keeps in RAM (`context_cache.host_capacity_bytes`, which the context
+    // planner owns and this ledger does not admit - the Host tier here holds only the three expert
+    // owners). They must not each take "half of free" and then discover the overlap at run time, so
+    // the two ask-sizes and the RAM they are asking against are printed together. Nothing is
+    // enforced at this point on purpose: the KV figure is a planning input that is only final once a
+    // sequence exists, and inventing a reduction from a number that is about to change would be
+    // worse than showing the overlap. A controller that divides the host budget needs exactly this
+    // line to divide it against.
+    {
+        const std::uint64_t free_now   = current_free_host_bytes();
+        const std::uint64_t kv_host    = options.context_cache.host_capacity_bytes.value_or(0);
+        const std::uint64_t reserve_mib = static_cast<std::uint64_t>(8ull << 30);
+        const std::uint64_t reserve_live = free_now / 8 > reserve_mib ? free_now / 8 : reserve_mib;
+        const std::uint64_t total_host = routed_bytes + kv_host;
+        std::fprintf(stderr,
+                     "[ctl] host split: free=%llu MiB | kv-host=%llu MiB | expert-arena=%llu MiB "
+                     "(reserve %llu MiB) | combined=%llu MiB%s\n",
+                     static_cast<unsigned long long>(free_now >> 20),
+                     static_cast<unsigned long long>(kv_host >> 20),
+                     static_cast<unsigned long long>(routed_bytes >> 20),
+                     static_cast<unsigned long long>(reserve_live >> 20),
+                     static_cast<unsigned long long>(total_host >> 20),
+                     (free_now != 0 && total_host > free_now) ? " - OVERCOMMITS FREE RAM" : "");
+        std::fflush(stderr);
+    }
     const auto prefetch_bytes      = readahead_bytes(requirements.banks);
     const auto second_chance_ask = second_chance_budget_bytes(requirements.banks);
     const auto host_ask            = routed_bytes + prefetch_bytes + second_chance_ask;
