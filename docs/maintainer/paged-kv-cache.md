@@ -841,6 +841,16 @@ gate 同时补上 `kNoPages`（四个平面或 block table 为空即回落，而
 
 - 镜像页的归属仍是测试性的：真正的宿主驻留页（demote 后由注意力直接回读）未接入，因此决策 1 的
   "避免 copy-in"侧仍无输入；`decide_cpu_kv_split` 仍无调用者（刀 4 未做，见下）。
+  **这一格已被实测关掉而不是留着待做**（`cpu-path-prefetch-register.md` 的 P4.3 = 🟡 需 KV 分层批次）：
+  现有分层里 demote 集合与掩码集合是同一个（`sequence.cpp:948` 先掩、`:968` 再搬同一批），缺席落成
+  `-1`（`paged_kv_cache.cpp:1284/1304`），而镜像只搬被表引用的页，所以被搬上宿主的页根本进不了镜像；
+  反向的"被寻址但无 Device 副本"又被 `restore_addressed_host_pages` 立即取回（`sequence.cpp:1225-1281`，
+  残差非零则抛）。实测（8B e2 / `--context 1024 --stride 512 --host-kv-mib 128` / `NINFER_KV_EVICT_WINDOW=4`
+  + `NINFER_KV_EVICT_HOST_DEMOTE=1`）：`host_occupied=1`、`spilled_pages=12 spilled_bytes=18,874,368`，
+  而 `addressed_absent=0`、`fetched_pages=0` —— 宿主页与注意力寻址页的交集为空。要打通需先给
+  "宿主为唯一副本"的页一个合法状态（`logical_kv_store.h:123-126` 的 `create_host_backed_page` 已删，
+  `can_pin_source`/`can_pin_active_source` 都要求 Device 副本），再给注意力一张"这些 key 由 CPU 腿拥有"
+  的行级集合，接口清单见台账该行。
 - 最后一个 split 永远被 `kAppendLag` 排除（它含当前 token）。真实宿主层把 append 交回宿主侧后，这条
   限制自然消失。
 - E8 家族（rk4v4-e8 / rk2v4-e8 / rk4v2-e8）此前留在 GPU，是因为 `RkHostKvDType` 只有
