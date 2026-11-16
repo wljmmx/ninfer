@@ -1,9 +1,12 @@
 # RTX 4090 (sm_89) performance baseline — Qwen3.8-27B
 
 Build: **wljmmx/ninfer `ba33b85a`** — the shipped release binaries (`R:\infer`,
-`v1.0.0-rtx4090`; `ninfer_bench.exe`), CUDA 13.4, Windows 11, single 24 GB RTX 4090 with the
-desktop sharing the card.
+`v1.0.0-rtx4090`; `ninfer_bench.exe`), CUDA 13.5 (V13.5.37), driver 621.14, Windows 11, single 24 GB
+RTX 4090 with the desktop sharing the card.
 Artifact: `qwen3_8_27b_v3.ninfer` (20,437,521,664 bytes, container v3); engine-reported weights 15.92 GiB.
+
+CUDA 13.5 gate status: gates must be re-run on CUDA 13.5 (V13.5.37) / driver 621.14; the values on
+this page are 13.4-era records. 门禁需在 13.5 上重跑，当前值为 13.4 时期记录。
 
 Method follows the [UDPSendToFailed/ninfer-4090](https://github.com/UDPSendToFailed/ninfer-4090) standard
 product benchmark matrix (`ninfer_bench`) and its `--wddm-evictable-budget` context-ceiling procedure.

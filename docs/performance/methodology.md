@@ -16,7 +16,8 @@ These are recorded experimental settings, not promises about current executable 
 | Setting | Value |
 |---|---|
 | GPU | One NVIDIA GeForce RTX 5090, 32 GiB |
-| CUDA compile/runtime | Qwen3.8: 13.4 / 13.4; Qwen3.6: 13.1 / 13.1 |
+| CUDA compile/runtime | Current toolchain: 13.5 (V13.5.37) / 13.5 (V13.5.37). The published runs below were recorded on 13.4 / 13.4 (Qwen3.8) and 13.1 / 13.1 (Qwen3.6) |
+| NVIDIA driver | Current: 621.14. The Qwen3.8 campaign records driver 617.14 |
 | Route | Persistent `ninfer-serve`, loopback OpenAI Chat Completions, `stream=false` |
 | Prefill chunk | 1,024 tokens |
 | KV cache | Qwen3.8: FP8 E4M3 row-256; Qwen3.6: INT8 group-64 |
@@ -35,6 +36,9 @@ These are recorded experimental settings, not promises about current executable 
 
 `K` denotes draft tokens; block size is `K+1`. Weight format, backend, draft count, and proposal
 head are separate experimental dimensions.
+
+CUDA 13.5 gate status: gates must be re-run on CUDA 13.5 (V13.5.37) / driver 621.14; the measured
+values published in this directory are 13.4-era records. 门禁需在 13.5 上重跑，当前值为 13.4 时期记录。
 
 ## Workloads and measurement boundaries
 
@@ -136,6 +140,13 @@ suite/profile baseline. Distinguish fixed-request workloads with varying output 
 fixed-token measurements. Historical comparisons do not isolate a backend change. MTP0 context
 profiles and speculative scenario suites use different workloads and cannot establish per-scenario
 baseline/speculative speedups.
+
+Per-token likelihood differences are a diagnostic, not a published rate. The evaluator's
+`--token-logprobs` option writes one target logprob per scored token, and
+[tools/perplexity/kl_compare.py](../../tools/perplexity/kl_compare.py) compares two such logs per
+position bucket. It reports the cross-entropy difference those records support and prints `n/a` for
+KL(P||Q) and top-1 disagreement, which the target-only format cannot produce; see its README for the
+supported fields.
 
 ## Publishing and updating results
 

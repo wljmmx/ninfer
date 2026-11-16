@@ -1,10 +1,13 @@
 # RTX 4090 (sm_89) performance baseline — Qwen3.6-35B-A3B
 
 Build: **wljmmx/ninfer `ba33b85a`** — the shipped release binaries (`R:\infer`,
-`v1.0.0-rtx4090`; `ninfer_bench.exe`), CUDA 13.4, Windows 11, single 24 GB RTX 4090 with the
-desktop sharing the card.
+`v1.0.0-rtx4090`; `ninfer_bench.exe`), CUDA 13.5 (V13.5.37), driver 621.14, Windows 11, single 24 GB
+RTX 4090 with the desktop sharing the card.
 Artifact: `qwen3_6_35b_a3b_e2.ninfer` (`R:\model`), 2.49 GB read; engine weights 2.49 GB;
 MoE 40 banks × 256 experts, top-8, DFlash draft model.
+
+CUDA 13.5 gate status: gates must be re-run on CUDA 13.5 (V13.5.37) / driver 621.14; the values on
+this page are 13.4-era records. 门禁需在 13.5 上重跑，当前值为 13.4 时期记录。
 
 This page is the 35B-A3B counterpart of the [Qwen3.8-27B baseline](rtx-4090-sm89-baseline.md)
 and follows the same matrix, method and reporting rules.

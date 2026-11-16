@@ -9,12 +9,15 @@ On this page: [run records](#scope-and-run-records), [context profile](#no-specu
 
 ## Scope and run records
 
-Measured on September 28–29, 2026 (Asia/Shanghai), using one RTX 5090, NVIDIA driver 617.14,
-CUDA 13.4 compile/runtime/driver API, and NInfer revision
+Measured on September 28–29, 2026 (Asia/Shanghai), using one RTX 5090, NVIDIA driver 621.14,
+CUDA 13.5 (V13.5.37) compile/runtime/driver API, and NInfer revision
 `7f6aafedb5f20200def820cfe51ab81c09c20eeb`. The serving binary was fixed for the entire campaign.
 All runs use FP8 E4M3 row-256 KV, a 1,024-token prefill chunk, CUDA Graphs, disabled prefix reuse,
 and the [common stochastic sampling profile](methodology.md#common-serving-profile).
 MTP3 and DFlash2 K=7 use the optimized proposal head. Startup and warmup are outside measurement.
+
+CUDA 13.5 gate status: gates must be re-run on CUDA 13.5 (V13.5.37) / driver 621.14; the values on
+this page are 13.4-era records. 门禁需在 13.5 上重跑，当前值为 13.4 时期记录。
 
 The artifacts are `out/qwen3_8_27b.ninfer` (`groupwise-int`) and
 `out/qwen3_8_27b_nvfp4.ninfer` (`nvfp4`), including their selected speculative companion weights.

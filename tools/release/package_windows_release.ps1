@@ -150,7 +150,7 @@ NInfer release for RTX 4090 (sm_89), Windows 11 x64
 version:  $describe
 commit:   $commit
 built:    $((Get-Item (Join-Path $apps 'ninfer.exe')).LastWriteTime.ToString('yyyy-MM-dd HH:mm'))
-toolchain CUDA 13.4 / MSVC / CMake Release / sm_89
+toolchain CUDA 13.5 (V13.5.37) / driver 621.14 / MSVC / CMake Release / sm_89
 "@ | ForEach-Object { Write-NoBom (Join-Path $Root 'VERSION') $_ }
 
 Get-ChildItem $Root -Recurse -File |

@@ -6,6 +6,10 @@
 // The "bus GB/s" column counts logical streaming traffic: N bytes for a
 // read or write and 2N bytes for a copy (N read + N written). This is the
 // rate to compare with the advertised bandwidth; it is not a measured DRAM counter.
+//
+// The advertised peak comes from the device itself (memory clock x bus width / 8), not from a
+// constant: no fixed number is correct on more than one board. --peak-gbps overrides it, and when
+// the device does not report the attributes the "of peak" column prints "n/a".
 
 #include <cuda_runtime.h>
 #include "../bench/common/fixture_data.cuh"
@@ -34,7 +38,7 @@
 namespace {
 
 constexpr int kThreads                 = 256;
-constexpr double kDefaultPeakGBps      = 1792.0;
+constexpr double kDefaultPeakGBps      = 0.0; // 0 = unknown; query the device instead of guessing
 constexpr double kDefaultTrialSeconds  = 0.25;
 constexpr int kDefaultTrials           = 5;
 constexpr std::size_t kDefaultMaxBytes = std::size_t{4} << 30;
@@ -192,9 +196,10 @@ void print_help(const char* argv0) {
                 "  --size-gib N    bytes per large buffer (default: min(4, 20%% free))\n"
                 "  --seconds N     target duration of each timed trial (default: %.2f)\n"
                 "  --trials N      timed trials per method (default: %d)\n"
-                "  --peak-gbps N   advertised bus bandwidth (default: %.0f)\n"
+                "  --peak-gbps N   advertised bus bandwidth in GB/s (default: derived from the "
+                "device)\n"
                 "  --help          show this text\n",
-                argv0, kDefaultTrialSeconds, kDefaultTrials, kDefaultPeakGBps);
+                argv0, kDefaultTrialSeconds, kDefaultTrials);
 }
 
 Options parse_options(int argc, char** argv) {
@@ -224,6 +229,23 @@ Options parse_options(int argc, char** argv) {
         }
     }
     return options;
+}
+
+// This probe is standalone (it is not part of the engine's CMake target list), so it repeats the
+// query from src/core/device_roofline.h rather than including it: GDDR/HBM move two transfers per
+// memory clock, so GB/s = clock_khz * bus_bits / 4e6. Zero means the device did not answer and the
+// caller must print "n/a" instead of inventing a peak.
+double query_peak_gbps(int device) {
+    int clock_khz = 0;
+    int bus_bits  = 0;
+    if (cudaDeviceGetAttribute(&clock_khz, cudaDevAttrMemoryClockRate, device) != cudaSuccess) {
+        return 0.0;
+    }
+    if (cudaDeviceGetAttribute(&bus_bits, cudaDevAttrGlobalMemoryBusWidth, device) != cudaSuccess) {
+        return 0.0;
+    }
+    if (clock_khz <= 0 || bus_bits <= 0) { return 0.0; }
+    return static_cast<double>(clock_khz) * static_cast<double>(bus_bits) / 4.0e6;
 }
 
 template <typename Launch>
@@ -266,8 +288,10 @@ Result benchmark(const char* name, std::size_t payload_bytes, double traffic_mul
     const double bus_gbps     = payload_gbps * traffic_multiplier;
     const double median_bus_gbps =
         static_cast<double>(payload_bytes) / median_ns * traffic_multiplier;
-    return Result{name,    payload_gbps, bus_gbps, median_bus_gbps, bus_gbps / peak_gbps,
-                  best_ns, iterations};
+    const double peak_fraction = peak_gbps > 0.0 ? bus_gbps / peak_gbps
+                                                 : std::numeric_limits<double>::quiet_NaN();
+    return Result{name, payload_gbps, bus_gbps, median_bus_gbps, peak_fraction, best_ns,
+                  iterations};
 }
 
 template <typename Kernel>
@@ -278,9 +302,14 @@ int resident_grid(Kernel kernel, int sm_count) {
 }
 
 void print_result(const Result& result) {
-    std::printf("%-28s %12.1f %12.1f %12.1f %9.1f%% %10.3f\n", result.name, result.payload_gbps,
-                result.bus_gbps, result.median_bus_gbps, result.peak_fraction * 100.0,
-                result.ns / 1.0e6);
+    char of_peak[16];
+    if (std::isfinite(result.peak_fraction)) {
+        std::snprintf(of_peak, sizeof(of_peak), "%.1f%%", result.peak_fraction * 100.0);
+    } else {
+        std::snprintf(of_peak, sizeof(of_peak), "n/a");
+    }
+    std::printf("%-28s %12.1f %12.1f %12.1f %10s %10.3f\n", result.name, result.payload_gbps,
+                result.bus_gbps, result.median_bus_gbps, of_peak, result.ns / 1.0e6);
 }
 
 } // namespace
@@ -328,13 +357,18 @@ int main(int argc, char** argv) {
     std::printf("SMs / L2:          %d / %.1f MiB\n", prop.multiProcessorCount,
                 static_cast<double>(prop.l2CacheSize) / (1 << 20));
     std::printf("Memory bus width:  %d bits\n", prop.memoryBusWidth);
+    const double peak_gbps = options.peak_gbps > 0.0 ? options.peak_gbps : query_peak_gbps(device);
     std::printf("VRAM total/free:   %.2f / %.2f GiB\n",
                 static_cast<double>(total_bytes) / (std::size_t{1} << 30),
                 static_cast<double>(free_bytes) / (std::size_t{1} << 30));
     std::printf("Working set:       %.2f GiB per buffer (%.1fx L2)\n",
                 static_cast<double>(bytes) / (std::size_t{1} << 30),
                 static_cast<double>(bytes) / prop.l2CacheSize);
-    std::printf("Advertised peak:   %.1f GB/s\n", options.peak_gbps);
+    if (peak_gbps > 0.0) {
+        std::printf("Advertised peak:   %.1f GB/s (2 x memory clock x bus width / 8)\n", peak_gbps);
+    } else {
+        std::printf("Advertised peak:   peak n/a (device reported no memory clock or bus width)\n");
+    }
     std::printf("Trial policy:      %d trials, >= %.2f s each, best + median\n", options.trials,
                 options.seconds);
     std::printf("Resident grids:    write=%d read=%d copy=%d copy-x4=%d blocks x %d threads\n\n",
@@ -361,36 +395,36 @@ int main(int argc, char** argv) {
     results.reserve(6);
 
     results.push_back(benchmark(
-        "cudaMemsetAsync (write)", bytes, 1.0, options.peak_gbps, options.seconds, options.trials,
-        stream, [&] { CUDA_CHECK(cudaMemsetAsync(destination.get(), 0xa5, bytes, stream)); }));
+        "cudaMemsetAsync (write)", bytes, 1.0, peak_gbps, options.seconds, options.trials, stream,
+        [&] { CUDA_CHECK(cudaMemsetAsync(destination.get(), 0xa5, bytes, stream)); }));
 
     const uint4 write_value = make_uint4(0x55aa55aau, 0xaa55aa55u, 0x31415926u, 0x27182818u);
-    results.push_back(benchmark("kernel uint4 write", bytes, 1.0, options.peak_gbps,
-                                options.seconds, options.trials, stream, [&] {
+    results.push_back(benchmark("kernel uint4 write", bytes, 1.0, peak_gbps, options.seconds,
+                                options.trials, stream, [&] {
                                     write_u128_kernel<<<write_grid, kThreads, 0, stream>>>(
                                         destination.get(), vector_count, write_value);
                                 }));
 
-    results.push_back(benchmark("kernel uint4 read", bytes, 1.0, options.peak_gbps, options.seconds,
+    results.push_back(benchmark("kernel uint4 read", bytes, 1.0, peak_gbps, options.seconds,
                                 options.trials, stream, [&] {
                                     read_u128_kernel<<<read_grid, kThreads, 0, stream>>>(
                                         source.get(), checksums.get(), vector_count);
                                 }));
 
-    results.push_back(benchmark("kernel uint4 copy", bytes, 2.0, options.peak_gbps, options.seconds,
+    results.push_back(benchmark("kernel uint4 copy", bytes, 2.0, peak_gbps, options.seconds,
                                 options.trials, stream, [&] {
                                     copy_u128_kernel<<<copy_grid, kThreads, 0, stream>>>(
                                         source.get(), destination.get(), vector_count);
                                 }));
 
-    results.push_back(benchmark("kernel uint4x4 copy", bytes, 2.0, options.peak_gbps,
-                                options.seconds, options.trials, stream, [&] {
+    results.push_back(benchmark("kernel uint4x4 copy", bytes, 2.0, peak_gbps, options.seconds,
+                                options.trials, stream, [&] {
                                     copy_u128x4_kernel<<<copy_x4_grid, kThreads, 0, stream>>>(
                                         source.get(), destination.get(), vector_count);
                                 }));
 
-    results.push_back(benchmark("cudaMemcpyAsync D2D", bytes, 2.0, options.peak_gbps,
-                                options.seconds, options.trials, stream, [&] {
+    results.push_back(benchmark("cudaMemcpyAsync D2D", bytes, 2.0, peak_gbps, options.seconds,
+                                options.trials, stream, [&] {
                                     CUDA_CHECK(cudaMemcpyAsync(destination.get(), source.get(),
                                                                bytes, cudaMemcpyDeviceToDevice,
                                                                stream));
@@ -409,8 +443,13 @@ int main(int argc, char** argv) {
     const auto best =
         std::max_element(results.begin(), results.end(),
                          [](const Result& a, const Result& b) { return a.bus_gbps < b.bus_gbps; });
-    std::printf("\nBest sustained bus rate: %.1f GB/s (%.1f%% of %.1f GB/s), %s\n", best->bus_gbps,
-                best->peak_fraction * 100.0, options.peak_gbps, best->name);
+    if (std::isfinite(best->peak_fraction)) {
+        std::printf("\nBest sustained bus rate: %.1f GB/s (%.1f%% of %.1f GB/s), %s\n",
+                    best->bus_gbps, best->peak_fraction * 100.0, peak_gbps, best->name);
+    } else {
+        std::printf("\nBest sustained bus rate: %.1f GB/s (peak n/a), %s\n", best->bus_gbps,
+                    best->name);
+    }
     std::printf("Read checksum witness:   %08x:%08x:%08x:%08x\n", checksum.x, checksum.y,
                 checksum.z, checksum.w);
     std::printf("Note: copy payload is half its bus rate because every copied byte is "

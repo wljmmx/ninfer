@@ -76,3 +76,9 @@ aggregate.
 
 The schema-v2 report identifies the artifact's architecture, public name, actual weight formats
 and prefill signature alongside the workload and numerical results.
+
+`--token-logprobs FILE` additionally writes one row per scored token (`# index`, `token`, `logprob`).
+That column is `log p(x[i] | x[0..i))` for the observed corpus token, so it supports per-position
+likelihood comparisons but not a divergence over alternatives. [kl_compare.py](../tools/perplexity/README.md)
+compares two such files per position bucket and prints `n/a` for the quantities the format cannot
+produce.
