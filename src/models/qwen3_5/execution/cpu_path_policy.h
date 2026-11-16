@@ -181,14 +181,31 @@ inline void register_cpu_path_params(ParamBus& bus) {
 
 // ---- decision 1: one KV split, retrieve-copy vs CPU partial --------------------------------
 //
-// The call site is the KV tiering controller's split dispatch (the later batch cost.h names):
-// a split whose pages are host-resident either gets its pages copied in - the GPU grouped
-// instance then reads them like any device page - or runs as a CPU partial over the host pages,
-// handing its (acc, maximum, sum) buffers back for the GPU merge (partial.h's contract). No
-// caller exists in the tree yet, so this seam's counters stay at zero until it lands; the
-// function, its registered rates and the observation below are what that batch will call.
-// READ THE PANEL ACCORDINGLY: `[ctl] cpu: kv: cpu-partial=0/0` is the absence of a call site, not a
-// measured zero. Nothing has ever chosen a leg here, so it cannot be evidence that the leg loses.
+// The call site existed all along and is NOT the missing piece: `rk_kv_cpu_split_gate`
+// (ops/softmax_attention/dense/causal_cache/int8/host_partial.h:269) runs between the grouped MMA
+// and the merge on every int8 attention call (int8/launch.cu:66,100), and it already takes a split
+// index from a switch (NINFER_KV_CPU_PARTITION) and hands that split to the CPU leg. What it cannot
+// do is DECIDE, and the reason is not this function: its inputs have no producer.
+//
+//   * the gate's first precondition is `rk_host_partial_active() != nullptr`, and
+//     `rk_host_partial_install()` has NO caller anywhere in the tree (checked 2026-11-16, src and
+//     apps) - so every call falls back at `kNoView` and the seam is unreachable, not merely off;
+//   * the window the split geometry is priced over is `view->positions[width - 1] + 1`, i.e. it is
+//     read FROM the host mirror. Without a mirror there is no per-split key range, and
+//     `partition.active(window)` cannot be evaluated;
+//   * a split's copy-in bytes are that range's plane bytes (`rk_partial_count_ops().kv_bytes`),
+//     which is again a function of the range.
+//
+// And the engine has nothing that could be mirrored: its Host KV tier holds demoted extents that no
+// attention path ever reads back (demote -> spill -> ensure_host_resident in
+// program/storage/sequence.cpp and host_kv_store.h), so there are no "host-resident split pages"
+// whose copy-in this decision would replace. The host partial op itself is exercised only by
+// apps/diag-cpu-partial.
+//
+// So this seam needs the KV-tiering batch to build the mirror and the split ownership first - the
+// gate, the op, the merge contract and this decision are all waiting for that, and wiring the
+// decision anywhere today would feed it a range it invented. READ THE PANEL ACCORDINGLY:
+// `[ctl] cpu: kv: cpu-partial=0/0` is the absence of a producer, not a measured zero.
 struct CpuKvSplitQuery {
     std::uint64_t partition_bytes = 0; // host-resident page bytes the split would copy in
     int keys                      = 0; // the split's key tokens (range.end - range.begin)
