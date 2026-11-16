@@ -121,6 +121,13 @@ public:
     // For the split form this is the gate run: it identifies the layer, and the three runs are
     // reachable through split_bank(role). The fused form has exactly one bank.
     [[nodiscard]] std::uint32_t bank_index() const noexcept { return bank_; }
+    // How many matrix runs this layer's split has: 3 for a gate/up/down artifact, 1 for a fused one.
+    // Reported rather than assumed, because a prediction set has to be handed to every run the layer
+    // actually has - a hard-coded 3 would feed a fused artifact two runs that do not exist, and a
+    // hard-coded 1 would leave two thirds of a split layer cold.
+    [[nodiscard]] std::uint32_t runs() const noexcept {
+        return static_cast<std::uint32_t>(split_.empty() ? 1 : split_.size());
+    }
     // Device-side int32 array, one entry per expert: 1 when the route resolves to an address.
     //
     // port (sm_89): in the split form this is the GATE run's mask. Three runs can hold different
