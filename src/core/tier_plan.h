@@ -67,20 +67,25 @@ struct BudgetSlot {
 };
 
 inline constexpr std::array<BudgetSlot, kBudgetCount> kBudgetSlots{{
-    {Budget::DeviceExpertPool, Tier::Device, "expert-pool", Budget::DeviceExpertPool, nullptr, false},
-    {Budget::DeviceKvPages, Tier::Device, "kv-pages", Budget::DeviceKvPages, nullptr, false},
-    {Budget::DevicePrefetch, Tier::Device, "prefetch", Budget::DeviceExpertPool,
-     "no claim of its own - carved out of expert-pool, per bank", false},
-    {Budget::DeviceSlruBand, Tier::Device, "slru-band", Budget::DeviceExpertPool,
-     "no claim of its own - SLRU segments expert-pool at policy time", false},
-    {Budget::DeviceStartup, Tier::Device, "staging", Budget::DeviceStartup,
+    // Name and order follow the capacity spec: device expert_pool_mb | kv_pages_mb | prefetch_mb |
+    // slru_band_mb, then the startup allowance the cap carries (not part of the spec's four, so it
+    // sits last and keeps its own line).
+    {Budget::DeviceExpertPool, Tier::Device, "expert_pool_mb", Budget::DeviceExpertPool, nullptr, false},
+    {Budget::DeviceKvPages, Tier::Device, "kv_pages_mb", Budget::DeviceKvPages, nullptr, false},
+    {Budget::DevicePrefetch, Tier::Device, "prefetch_mb", Budget::DeviceExpertPool,
+     "no claim of its own - carved out of expert_pool_mb, per bank", false},
+    {Budget::DeviceSlruBand, Tier::Device, "slru_band_mb", Budget::DeviceExpertPool,
+     "no claim of its own - SLRU segments expert_pool_mb at policy time", false},
+    {Budget::DeviceStartup, Tier::Device, "staging_mb", Budget::DeviceStartup,
      "the planning allowance the cap carries", false},
-    {Budget::HostExpertArena, Tier::Host, "expert-warm", Budget::HostExpertArena, nullptr, false},
-    {Budget::HostReadahead, Tier::Host, "expert-prefetch", Budget::HostReadahead, nullptr, false},
-    {Budget::HostSecondChance, Tier::Host, "second-chance", Budget::HostSecondChance, nullptr, false},
-    {Budget::HostKvHost, Tier::Host, "kv-host", Budget::HostKvHost,
+    // host expert_arena_mb | kv_host_mb | prefetch_readahead_mb | second_chance_mb, in that order.
+    {Budget::HostExpertArena, Tier::Host, "expert_arena_mb", Budget::HostExpertArena, nullptr, false},
+    {Budget::HostKvHost, Tier::Host, "kv_host_mb", Budget::HostKvHost,
      "planned here; the context planner claims it when the tiered KV mode activates", true},
-    {Budget::DiskKvSpill, Tier::Disk, "kv-spill", Budget::DiskKvSpill,
+    {Budget::HostReadahead, Tier::Host, "prefetch_readahead_mb", Budget::HostReadahead, nullptr, false},
+    {Budget::HostSecondChance, Tier::Host, "second_chance_mb", Budget::HostSecondChance, nullptr, false},
+    // ssd: no expert budget, no size knob. Judged by its re-read count, see the footer.
+    {Budget::DiskKvSpill, Tier::Disk, "kv_spill", Budget::DiskKvSpill,
      "no size knob - the tier is judged by its re-read count", false},
 }};
 
