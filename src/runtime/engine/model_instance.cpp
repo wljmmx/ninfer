@@ -855,16 +855,27 @@ std::uint64_t host_expert_arena_bytes(std::uint64_t want_bytes) {
         const std::uint64_t usable = free_bytes > reserve ? free_bytes - reserve : 0;
         return usable / 2;
     }();
-    // ... and a hard ceiling, because on this box the MAPPED allocation stops working long before
-    // free RAM runs out. Measured 2026-11-16 with 53.6 GiB free: an arena of 23032 MiB maps and the
-    // run completes (ppl114, 6.024313), an arena of 23130 MiB - 98 MiB more - fails with
+    // ... and a ceiling, because on this box the MAPPED allocation stops working long before free
+    // RAM runs out. Measured 2026-11-16 with 53.6 GiB free: an arena of 23032 MiB maps and the run
+    // completes (ppl114, 6.024313), an arena of 23130 MiB - 98 MiB more - fails with
     // `[host] mapped allocation of 23130 MiB failed: out of memory - trying a registered fallback`
     // and then dies at the first attention launch. The share above lands at 22.5 GiB when free RAM is
-    // ~52 GiB, i.e. exactly on that cliff, which is why identical commands alternated between running
-    // and crashing. A ceiling of 22 GiB sits below the observed success point with ~490 MiB to spare,
-    // and it makes the size a function of this box instead of of a noisy free-memory reading.
+    // ~52 GiB, i.e. exactly on that cliff.
+    //
+    // The ceiling is a measurement, not a guess, and a probe is not a substitute for it: asking the
+    // box first with the same byte count and the same flags is NOT a valid preview. Tried it - a
+    // probe of 22528 MiB succeeded and the tier's own 22527 MiB request milliseconds later was
+    // refused, and the probe also cost 3.7 s of startup to map and unmap 22 GiB. The refusal is a
+    // property of the whole process at the moment of allocation (standalone: 24576 MiB maps with
+    // 19 GiB of Device memory held; in-engine: 22 GiB does not), so the size is chosen below the
+    // measured flip with real margin instead of being probed for.
+    //
+    // 21 GiB: the flip sits at ~22527 MiB on this box, so 21504 MiB keeps a full GiB of margin and
+    // measured 4/4 clean runs (ppl114 6.024313 each) where 22 GiB measured 0/3. The tier's size is a
+    // cache, not a computation: 21504, 22016 and 22500 MiB all reproduce 6.024313 exactly, so the
+    // margin costs no numerics and only a few hundred slots of warm set.
     // NINFER_EXPERT_HOST_ARENA_MB still overrides everything for a deliberate experiment.
-    constexpr std::uint64_t kMappedArenaCeiling = 22ull << 30;
+    constexpr std::uint64_t kMappedArenaCeiling = 21ull << 30;
     // port (sm_89): the 4 GiB working-set cap is gone, and the RAM share is now half instead of a
     // quarter.
     //
@@ -877,8 +888,8 @@ std::uint64_t host_expert_arena_bytes(std::uint64_t want_bytes) {
     // still bounded by it, a large one is bounded by RAM instead.
     constexpr std::uint64_t kSmallWorkingSetCap = 4ull << 30;
     std::uint64_t budget = std::min<std::uint64_t>(want_bytes, share);
-    // Hard ceiling (see above): the mapped allocation stops working ~23 GiB in on this box, and the
-    // share lands right on that cliff when free RAM is ~52 GiB. NINFER_EXPERT_HOST_ARENA_MB still wins.
+    // Ceiling (see above): the mapped allocation stops working just under 22 GiB in this process, so
+    // the ask stays a GiB below that. NINFER_EXPERT_HOST_ARENA_MB still wins.
     budget = std::min(budget, kMappedArenaCeiling);
     if (want_bytes <= kSmallWorkingSetCap) {
         budget = std::min<std::uint64_t>({want_bytes, share, kSmallWorkingSetCap});
@@ -891,6 +902,7 @@ std::uint64_t host_expert_arena_bytes(std::uint64_t want_bytes) {
         // silent no-op, which is why earlier sweeps measured 600 MiB and 4 GiB as identical and
         // concluded the arena size did not matter.
         if (mib != 0) { budget = mib << 20; }
+        return budget;
     }
     return budget;
 }
