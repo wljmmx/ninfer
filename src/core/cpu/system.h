@@ -17,6 +17,12 @@ struct CpuProcessor {
     std::uint32_t cpu = 0;
     std::optional<std::uint32_t> core;
     std::optional<std::uint32_t> cache;
+    // Windows' EfficiencyClass for the core this logical CPU belongs to: 1 on a performance core, 0 on
+    // an efficiency core, and 1 everywhere on a non-hybrid part. Kept because a team that lands on
+    // E-cores costs 2x per route (measured 2026-11-16, equal team width: 6.9 us/expert on cpus 0-15
+    // against 14.0 us on 16-31, and 3.0 against 8.0 us/expert-token at tokens=512), while the ordering
+    // below used to have no way to see the difference.
+    std::uint8_t efficiency = 1;
 };
 
 struct CpuCache {
@@ -56,7 +62,8 @@ struct CpuTeamPlan {
     CpuAffinity worker_cpus; // One fixed CPU per worker; order defines rank.
 };
 
-// Physical cores first, ordered by visible cache/core; optional SMT siblings follow.
+// Physical cores first, ordered by efficiency class (performance cores before efficiency cores),
+// then by visible cache/core. Optional SMT siblings follow.
 // Unknown core identities remain independent CPUs. These helpers do not create threads.
 [[nodiscard]] CpuAffinity cpu_worker_order(const CpuTopologyInfo&, bool use_smt = false);
 [[nodiscard]] CpuTeamPlan plan_cpu_team(const CpuTopologyInfo&, std::uint32_t workers,

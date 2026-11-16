@@ -105,6 +105,10 @@ CpuTopology::CpuTopology() : impl_(std::make_unique<Impl>()) {
                     if (!seen.insert(cpu).second) continue;
                     CpuProcessor processor{.cpu = cpu};
                     processor.core = core_index;
+                    // 1 = performance core, 0 = efficiency core (Windows' EfficiencyClass). A
+                    // non-hybrid part reports 1 for every core, so the ordering below is unchanged
+                    // there.
+                    processor.efficiency = entry->Processor.EfficiencyClass >= 1 ? 1 : 0;
                     // Like hwloc's deepest data cache: the last-level cache this processor is in.
                     if (!info.caches.empty()) processor.cache = deepest;
                     info.processors.push_back(processor);
@@ -153,7 +157,12 @@ void bind_current_thread(const CpuTopology& topology, std::span<const std::uint3
 
 CpuAffinity cpu_worker_order(const CpuTopologyInfo& topology, bool use_smt) {
     auto processors = topology.processors;
+    // Efficiency class first, descending: on a hybrid part the rest of this key is a cache id, and a
+    // cache id says nothing about how fast a core is. Measured at equal team width on this box, an
+    // efficiency core costs 2x per route at decode (14.0 against 6.9 us/expert), and the controller
+    // prices every route with that number - so a team that sorted E-first would silently double it.
     std::sort(processors.begin(), processors.end(), [](const auto& a, const auto& b) {
+        if (a.efficiency != b.efficiency) { return a.efficiency > b.efficiency; }
         return std::tie(a.cache, a.core, a.cpu) < std::tie(b.cache, b.core, b.cpu);
     });
     CpuAffinity result, siblings;
