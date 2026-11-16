@@ -739,6 +739,8 @@ private:
     std::uint64_t steps_ = 0;
     // Routed entries published so far and how many were already resident (see Coverage).
     Coverage coverage_{};
+    std::uint64_t residency_routes_ = 0;
+    std::uint64_t residency_inside_ = 0;
     StepCost last_cost_{};
     // Misses per step, histogram 0..32, decayed so a new workload is not held hostage. One
     // sample per step: the spill region holds every lane's miss at once (8 lanes x 8 experts).

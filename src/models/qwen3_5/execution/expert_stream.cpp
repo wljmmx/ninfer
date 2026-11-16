@@ -828,9 +828,9 @@ void ExpertStream::gh1_report() {
     std::fprintf(stderr,
                  "[gh1] bank=%u calls=%llu static=%.1f%% no_miss=%.1f%% capturable=%.1f%% "
                  "capt_free=%.1f%% capt_ready=%.1f%% fail_unaddr=%llu fail_publish=%llu "
-                 "fail_upload=%llu published_slot=%.1f%% (%llu/%llu published routes had "
-                 "slot+offset - NOT the residency rate: the denominator is the published subset, so "
-                 "it reads 100%% by construction while the pool holds kept/73728 experts)\n",
+                 "fail_upload=%llu residency=%.1f%% (%llu/%llu routed experts were held by every "
+                 "run) | published_slot=%.1f%% (%llu/%llu published routes had slot+offset - a publish "
+                 "rate, not residency)\n",
                   bank_, static_cast<unsigned long long>(gh1_calls_),
                   pct(gh1_static_calls_, gh1_calls_), pct(gh1_no_miss_calls_, gh1_calls_),
                   pct(gh1_calls_ - gh1_split_calls_, gh1_calls_),
@@ -839,6 +839,9 @@ void ExpertStream::gh1_report() {
                   static_cast<unsigned long long>(gh1_captfail_unaddressable_),
                   static_cast<unsigned long long>(gh1_captfail_publish_),
                   static_cast<unsigned long long>(gh1_captfail_upload_),
+                  pct(residency_inside_, residency_routes_),
+                  static_cast<unsigned long long>(residency_inside_),
+                  static_cast<unsigned long long>(residency_routes_),
                   pct(coverage_.inside, coverage_.routes),
                   static_cast<unsigned long long>(coverage_.inside),
                   static_cast<unsigned long long>(coverage_.routes));
@@ -1902,6 +1905,26 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
     // property of the tier and not of the pool. So the covered shortcut is taken on the pool-only
     // path and nowhere else.
     bool covered = !placement_mode;
+    // Count residency over EVERY route against EVERY run before the shortcut above can return: the
+    // loop below breaks at the first route that is not held, which is what the shortcut needs but not
+    // what a rate needs.
+    if (!split_.empty()) {
+        std::uint32_t held_routes = 0;
+        for (std::size_t i = 0; i < values; ++i) {
+            const auto expert = static_cast<std::uint32_t>(route_ids[i]);
+            bool held = true;
+            for (const auto& run : split_) {
+                if (!cache_->expert_slot(run.bank, expert) ||
+                    !cache_->offset(ExpertCacheKey{run.bank, expert})) {
+                    held = false;
+                    break;
+                }
+            }
+            if (held) { ++held_routes; }
+        }
+        residency_routes_ += values;
+        residency_inside_ += held_routes;
+    }
     for (std::size_t index = 0; index < split_.size() && covered; ++index) {
         const auto bank = split_[index].bank;
         for (std::size_t i = 0; i < values; ++i) {
