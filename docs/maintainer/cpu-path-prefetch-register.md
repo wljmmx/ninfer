@@ -43,9 +43,9 @@
 
 | ID | 任务 | 验收 | 状态 | 证据 |
 |---|---|---|---|---|
-| P0.1 | 竞技场改成"分配成功多少就按多少定槽数"，删掉固定的 21 GiB 上限（`model_instance.cpp` `kMappedArenaCeiling`） | 默认门禁连跑 3 次都过 `6.024313` / `20.673595` | ✅ | 分配在前、定尺寸在后：`allocate_host_arena()` 按 GiB 步退让，块字节数交给 tier，slot 由块推。默认 3×2 全逐位（`6.024313` ×3、`20.673595` ×3，exit=0），竞技场 22093–22200 MiB 漂移不影响数值；回执 `[host] arena allocated 22100 MiB (asked 22100, 0 refusals) device_accessible=1 - the tier is sized from this`；显式 `NINFER_EXPERT_HOST_ARENA_MB=16384` → 13107 slots，仍 `6.024313` |
-| P0.2 | 若单块映射不可行：分块注册（每块 `cudaHostRegister` + 设备地址表），把"块"变成 tier 的显式概念 | 同上，且 20 GiB 级竞技场可用 | N/A | 不需要（P0.1 已达标）：单块 `cudaHostAllocMapped` 在 22093–22200 MiB 上 6/6 成功（`[host] arena allocated 22100 MiB (asked 22100, 0 refusals)`），未触发过退让；分块注册与设备地址表按任务约定不动 |
-| P0.3 | 分配失败在分配点就 fail-loud（现在会跑到 `qsa/prepare_launch.cu:333` 伪装成 kernel bug） | 日志首行指名 arena 与尺寸 | ✅ | `NINFER_EXPERT_HOST_ARENA_MB=60000` → 首行 `[host] arena allocation failed: asked 60000 MiB, refused at every step down to 60000 MiB after 1 attempt(s) (out of memory) - the host expert tier cannot exist, and there is no pageable stand-in for it`，exit=1，13 行日志里无 `prepare_launch.cu:333`；`arena()` 里 registered/pageable 兜底全部删除 |
+| P0.1 | 竞技场改成"分配成功多少就按多少定槽数"，删掉固定的 21 GiB 上限（`model_instance.cpp` `kMappedArenaCeiling`） | 默认门禁连跑 3 次都过 `6.024313` / `20.673595` | ✅ | 分配在前、定尺寸在后：`allocate_host_arena()` 先按 commit 余额夹取候选，一次 `cudaHostAlloc(Mapped)` 成功多少就是多少，块字节数交给 tier，slot 由块推。默认 3×2 全逐位（`6.024313` ×3、`20.673595` ×3，exit=0）；回执 `[host] arena allocated 22351 MiB (asked 22351, commit headroom 23449) device_accessible=1 - the tier is sized from this`；夹取实例：`NINFER_PREFETCH=1 NINFER_PREFETCH_SLOTS=8192`（候选 32657）→ `allocated 23385 MiB (asked 32657, commit headroom 23385)`；显式 `NINFER_EXPERT_HOST_ARENA_MB=16384` → 13107 slots，仍 `6.024313` |
+| P0.2 | 若单块映射不可行：分块注册（每块 `cudaHostRegister` + 设备地址表），把"块"变成 tier 的显式概念 | 同上，且 20 GiB 级竞技场可用 | N/A | 不需要（P0.1 已达标）：单块 `cudaHostAllocMapped` 在默认 22331–22538 MiB 上 6/6 成功（`[host] arena allocated 22538 MiB (asked 22538, commit headroom 23325)`），退让与分块都未需要；且探针显示失败后 VirtualAlloc 也拿不到 commit（1455），分块不解决根因（见陷阱 7） |
+| P0.3 | 分配失败在分配点就 fail-loud（现在会跑到 `qsa/prepare_launch.cu:333` 伪装成 kernel bug） | 日志首行指名 arena 与尺寸 | ✅ | `NINFER_EXPERT_HOST_ARENA_MB=60000` → `[host] arena allocation failed: asked 60000 MiB (committed ask 60000 MiB, headroom 23408 MiB) (out of memory) - the host expert tier cannot exist, there is no pageable stand-in for it, and no smaller retry after a refusal`，exit=1，13 行日志里无 `prepare_launch.cu:333`；`arena()` 里 registered/pageable 兜底全部删除 |
 
 ### P1 容量规划对齐规格
 
@@ -114,6 +114,8 @@
 4. **span 与 copy 不同口径**：span 含 tier fill，copy 侧把这次读约掉了；不统一 scope 之前，任何"用实测速率定价"的结论都不成立。
 5. **`[ctl]` 面板在 e2 路径不打印**：`report()` 只在 `streamed_ffn` 被调用，看到 0 行不等于"值为 0"。
 6. **设备别名早一层就换数值**：`arena_device_base()` 非空决定 split 路径走"Device 直读 host tier"还是第一层走 CPU 腿。块预先分配但别名在构造时就发布，ppl114 给 `6.017490`（17203 slots 与基线同）；别名等到第一次 `arena()` 再发布，回到 `6.024313`。所以"竞技场尺寸不影响数值"成立的前提是**别名的可见时机也不变**。
+7. **一次被拒的映射是这个进程的终点**：钉住内存由系统 commit 担保，WDDM 还把 Device 分配记进同一份账。实测（独立探针，持 21.5 GiB Device 内存）：avail commit 23.3 GiB，请求 44 GiB 失败后 commit `used=limit=91.1 GiB`、avail 0，之后 40/32/24/20/16/12 GiB **全部** `resource already mapped`；引擎内同样表现是 42 次尝试全败。"失败再逐级退让"因此不成立，只能**先按 `ullAvailPageFile`（减 1 GiB）夹取再请求一次**；`NINFER_EXPERT_HOST_ARENA_MB` 是显式值，不夹取，拒了就报错。
+8. **主机读-ahead 武装会换 PPL**：`NINFER_PREFETCH=1 NINFER_PREFETCH_SLOTS=8192` 下 ppl114 = `6.063844`（默认 `6.024313`）。与第 6 条同源：tier 内容改变哪些专家走 CPU 腿。预取线的 A/B 必须以 `6.024313` 臂为准，不能跨臂比数值。
 
 ## 5. 变更记录
 
@@ -122,3 +124,4 @@
 | 2026-11-16 | 建表。矩阵：1 格实测、1 格 N/A（硬件）、2 格待验。P0 由当晚 `mapped allocation of 20941 MiB failed` 升级为最高优先级 |
 | 2026-11-16 | P0.1 关账（`cbc2ad49`）：分配在前、定尺寸在后，默认 3×2 门禁逐位。P0.2 记 N/A（单块在 22 GiB 上 6/6 成功）。P0.3 关账：失败在分配点抛出，pageable/registered 兜底删除 |
 | 2026-11-16 | P1 四项关账：P1.1 列名/列序（`aea2b93c`）、P1.2 无消费者强制 0 + env fail-loud（`b9f557e9`）、P1.3 `kv_spill` 三元组（`54568858`）、P1.4 `cold_range` 进表。`[plan]` 三行逐列对齐规格，跨架构不变（只读 `Instance` 几何与 placement） |
+| 2026-11-16 | 修正两处被证据推翻的实现：P1.1 只调表行没调枚举，`slot()` 按枚举索引，`prefetch_readahead` 的 160 MiB grant 被当作"从别行 carve"静默拒绝（已按规格顺序重排枚举 + 编译期 `static_assert`）；P0.1 的"失败后按 GiB 退让"被探针证明不可恢复（见陷阱 7），改为按 `ullAvailPageFile` 夹取后单次请求 |

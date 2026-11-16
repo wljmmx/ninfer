@@ -36,6 +36,11 @@
 
 namespace ninfer::core {
 
+// The order of this enum IS the order of kBudgetSlots: `slot()` indexes the array with it, so a row
+// out of place would hand out another line's row - which is not a cosmetic problem, because a row
+// whose `carved_from` differs makes set() treat the grant as a slice of that other line and refuse
+// it. That is how a 160 MiB read-ahead grant was silently dropped once. The compile-time check below
+// keeps the two in step; the host order is the capacity spec's.
 enum class Budget : std::uint8_t {
     DeviceExpertPool = 0,
     DeviceKvPages,
@@ -43,9 +48,9 @@ enum class Budget : std::uint8_t {
     DeviceSlruBand,
     DeviceStartup,
     HostExpertArena,
+    HostKvHost,
     HostReadahead,
     HostSecondChance,
-    HostKvHost,
     DiskKvSpill,
     Count,
 };
@@ -118,6 +123,20 @@ inline constexpr std::array<BudgetSlot, kBudgetCount> kBudgetSlots{{
     {Budget::DiskKvSpill, Tier::Disk, "kv_spill", Budget::DiskKvSpill,
      "no size knob - the tier is judged by its re-read count", false},
 }};
+
+// The invariant `slot()` and `set()` both rely on: row i belongs to Budget(i). A row out of place
+// hands out a different line's `carved_from`/`planned` and the grant is filed under another name - so
+// this is checked at compile time rather than trusted.
+namespace detail {
+constexpr bool budget_rows_in_order() noexcept {
+    for (std::size_t i = 0; i < kBudgetSlots.size(); ++i) {
+        if (static_cast<std::size_t>(kBudgetSlots[i].id) != i) { return false; }
+    }
+    return true;
+}
+} // namespace detail
+static_assert(detail::budget_rows_in_order(),
+              "kBudgetSlots must be in Budget order: slot() indexes it with the enum value");
 
 class TierPlan {
 public:

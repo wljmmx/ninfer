@@ -42,6 +42,7 @@ std::uint64_t host_expert_arena_bytes(std::uint64_t want_bytes);
 std::uint64_t current_free_host_bytes();
 models::qwen3_5::execution::HostArenaBlock allocate_host_arena(std::uint64_t want_bytes,
                                                                bool          exact);
+std::uint64_t current_commit_headroom_bytes();
 std::uint64_t readahead_bytes(std::span<const ExpertBankLayout> banks);
 std::uint64_t second_chance_budget_bytes(std::span<const ExpertBankLayout> banks);
 using Clock = std::chrono::steady_clock;
@@ -917,6 +918,26 @@ std::uint64_t current_free_host_bytes() {
     return 0;
 }
 
+// What a pinned (and mapped) block can actually be backed by. Pinned memory is committed to the page
+// file, and on WDDM the Device allocations are charged to the same budget: measured on this box with
+// the 17.5 GiB pool held, `GlobalMemoryStatusEx` reported avail commit 23.3 GiB before the arena and
+// the 22.4 GiB default arena succeeded. Physical RAM alone is not this number, which is why the
+// arena's share of free RAM overshoots on a machine that also holds a 22 GiB expert pool.
+std::uint64_t current_commit_headroom_bytes() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status) != 0) {
+        // Keep a gigabyte for what the process still has to allocate after the tier (staging, the
+        // run's own host buffers). Without it the request lands on the edge, and the edge is not a
+        // smaller tier - see allocate_host_arena.
+        constexpr std::uint64_t kReserve = 1ull << 30;
+        return status.ullAvailPageFile > kReserve ? status.ullAvailPageFile - kReserve : 0;
+    }
+#endif
+    return 0;
+}
+
 // port (sm_89): R3's bytes, asked for before the arena exists so the ledger is told the truth
 // rather than discovering the pool afterwards. Zero unless the read-ahead is on - an off switch
 // must not move the arena size, or "prefetch off" stops being the baseline it is compared against.
@@ -941,72 +962,88 @@ std::uint64_t second_chance_budget_bytes(std::span<const ExpertBankLayout> banks
 // 16384 accepted). A probe is not a substitute - the same bytes were accepted by a probe and then
 // refused by the real request milliseconds later, and the probe cost 3.7 s to map and unmap 22 GiB.
 //
-// So: ask for the candidate, and step down one GiB at a time until an allocation SUCCEEDS. The
-// bytes that succeeded are the arena. The property is fixed by the call - locked (the CPU half
-// streams through it) and mapped (the Device addresses it directly) - because that is the only form
-// whose absence this tier can be judged on: a pageable block still runs, and silently turns every
+// So: ask for the candidate, but never for more than the commit headroom can back, and size the tier
+// from the bytes that were granted. The property is fixed by the call - locked (the CPU half streams
+// through it) and mapped (the Device addresses it directly) - because that is the only form whose
+// absence this tier can be judged on: a pageable block still runs, and silently turns every
 // Device-side route into an upload. There is no fallback below this point.
 //
+// Why the clamp instead of "fail, then step down one GiB and try again": a refused mapped allocation
+// is TERMINAL in this process, so the step-down only ever produced a fake second chance. Measured
+// (standalone probe on this box, RTX 4090 / Win11): with 21.5 GiB of Device memory held, avail commit
+// was 23.3 GiB; asking 44 GiB failed, and the failed request left commit used=91.1 GiB of a
+// 91.1 GiB limit - avail 0 - after which every later request in that process (40, 32, 24, 20, 16,
+// 12 GiB) failed with `resource already mapped`. In the engine the same pattern printed 42 attempts
+// and no success. So the size is chosen from the budget that actually backs pinned memory before
+// the first call, not discovered by breaking the process.
+//
 // `exact` is the explicit-override form (NINFER_EXPERT_HOST_ARENA_MB): a size the caller named is
-// asked for as named. Stepping it down would report a successful run at a size the experiment did
-// not ask for, so a refusal there is an error the caller has to see.
+// asked for as named, with no clamp - otherwise an impossible experiment would silently run at a
+// smaller arena and the numbers would not be comparable. A refusal there is the caller's error.
 models::qwen3_5::execution::HostArenaBlock allocate_host_arena(std::uint64_t want_bytes,
                                                                bool          exact) {
     models::qwen3_5::execution::HostArenaBlock block;
     if (want_bytes == 0) { return block; }
-    constexpr std::uint64_t kStepBytes  = 1ull << 30;
-    constexpr std::uint64_t kFloorBytes = 1ull << 30;
-    const std::uint64_t     asked       = want_bytes;
-    unsigned                refusals    = 0;
-    std::uint64_t           len         = want_bytes;
-    cudaError_t             last        = cudaSuccess;
-    for (;;) {
-        void*      locked = nullptr;
-        const auto status =
-            cudaHostAlloc(&locked, static_cast<std::size_t>(len), cudaHostAllocMapped);
-        if (status == cudaSuccess) {
-            void*      device = nullptr;
-            const auto alias  = cudaHostGetDevicePointer(&device, locked, 0);
-            if (alias != cudaSuccess) {
-                // The mapping was granted but the alias was not: the bytes are real, the Device
-                // just cannot name them. Clear the error so it cannot surface at the next launch
-                // and report the state on the same line as the size.
-                (void)cudaGetLastError();
-                device = nullptr;
-            }
-            block.host   = locked;
-            block.device = device;
-            block.bytes  = len;
-            std::fprintf(stderr,
-                         "[host] arena allocated %llu MiB (asked %llu, %u refusals) "
-                         "device_accessible=%d - the tier is sized from this\n",
-                         static_cast<unsigned long long>(len >> 20),
-                         static_cast<unsigned long long>(asked >> 20), refusals,
-                         device != nullptr ? 1 : 0);
-            std::fflush(stderr);
-            return block;
-        }
-        last = status;
-        (void)cudaGetLastError();
-        ++refusals;
-        if (exact || len <= kFloorBytes) { break; }
-        len = len > kFloorBytes + kStepBytes ? len - kStepBytes : kFloorBytes;
+    const std::uint64_t asked    = want_bytes;
+    const std::uint64_t headroom = current_commit_headroom_bytes();
+    const std::uint64_t len      = (!exact && headroom != 0)
+                                       ? std::min<std::uint64_t>(asked, headroom)
+                                       : asked;
+    if (len == 0) {
+        std::fprintf(stderr,
+                     "[host] arena allocation failed: asked %llu MiB, but no commit headroom is left "
+                     "(%llu bytes available, a reserved gigabyte is not subtracted here) - the host "
+                     "expert tier cannot exist\n",
+                     static_cast<unsigned long long>(asked >> 20),
+                     static_cast<unsigned long long>(headroom));
+        std::fflush(stderr);
+        throw std::runtime_error("expert host arena: no commit headroom for " +
+                                 std::to_string(asked >> 20) + " MiB");
     }
+    void*      locked = nullptr;
+    const auto status =
+        cudaHostAlloc(&locked, static_cast<std::size_t>(len), cudaHostAllocMapped);
+    if (status == cudaSuccess) {
+        void*      device = nullptr;
+        const auto alias  = cudaHostGetDevicePointer(&device, locked, 0);
+        if (alias != cudaSuccess) {
+            // The mapping was granted but the alias was not: the bytes are real, the Device just
+            // cannot name them. Clear the error so it cannot surface at the next launch and report
+            // the state on the same line as the size.
+            (void)cudaGetLastError();
+            device = nullptr;
+        }
+        block.host   = locked;
+        block.device = device;
+        block.bytes  = len;
+        std::fprintf(stderr,
+                     "[host] arena allocated %llu MiB (asked %llu, commit headroom %llu) "
+                     "device_accessible=%d - the tier is sized from this\n",
+                     static_cast<unsigned long long>(len >> 20),
+                     static_cast<unsigned long long>(asked >> 20),
+                     static_cast<unsigned long long>(headroom >> 20), device != nullptr ? 1 : 0);
+        std::fflush(stderr);
+        return block;
+    }
+    (void)cudaGetLastError();
     // Fail at the allocation point. The alternative is what this replaces: a pageable stand-in that
     // still runs, keeps every Device-side route an upload, and surfaces at the first attention
     // launch as `cudaErrorLaunchOutOfResources` at qsa/prepare_launch.cu:333 - a sizing failure that
-    // reads as a kernel bug. The first line names the arena, the bytes asked for and the driver's
-    // own reason; the throw stops construction before any of that can be misattributed.
+    // reads as a kernel bug. The first line names the arena, the bytes asked for and the driver's own
+    // reason; the throw stops construction before any of that can be misattributed. No smaller
+    // attempt follows: see the note above - a refusal has already spent the process's commit.
     std::fprintf(stderr,
-                 "[host] arena allocation failed: asked %llu MiB, refused at every step down to "
-                 "%llu MiB after %u attempt(s) (%s) - the host expert tier cannot exist, and there "
-                 "is no pageable stand-in for it\n",
+                 "[host] arena allocation failed: asked %llu MiB (committed ask %llu MiB, headroom "
+                 "%llu MiB) (%s) - the host expert tier cannot exist, there is no pageable stand-in "
+                 "for it, and no smaller retry after a refusal\n",
                  static_cast<unsigned long long>(asked >> 20),
-                 static_cast<unsigned long long>(len >> 20), refusals, cudaGetErrorString(last));
+                 static_cast<unsigned long long>(len >> 20),
+                 static_cast<unsigned long long>(headroom >> 20), cudaGetErrorString(status));
     std::fflush(stderr);
     throw std::runtime_error("expert host arena: cudaHostAlloc(Mapped) refused " +
-                             std::to_string(asked >> 20) + " MiB and every step down to " +
-                             std::to_string(len >> 20) + " MiB (" + cudaGetErrorString(last) + ")");
+                             std::to_string(len >> 20) + " MiB of the " +
+                             std::to_string(asked >> 20) + " MiB asked for (" +
+                             cudaGetErrorString(status) + ")");
 }
 
 // Host-side arena for experts the Device pool cannot hold. It takes what the caller says the host
