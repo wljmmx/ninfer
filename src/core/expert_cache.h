@@ -163,6 +163,10 @@ void prepare(std::span<const ExpertCacheKey> required, cudaStream_t stream = nul
     // instead of a guessed one: how many banks the cache was built with, and the widest live slot
     // run any of them backs. Read-only.
     [[nodiscard]] std::uint32_t bank_count() const noexcept;
+    // Copy one bank's expert->slot table (kAbsentSlot where an expert has no slot) into out, and
+    // return how many entries were written. The device-side placement needs exactly this table; it
+    // cannot be uploaded before it can be extracted, which is why the export comes first.
+    [[nodiscard]] std::uint32_t export_slots(std::uint32_t bank, std::span<std::uint32_t> out) const;
     [[nodiscard]] std::uint32_t slots_per_bank() const noexcept;
 
     // port (sm_89): the pinned RAM tier the host half keeps its working set in. When set, an upload

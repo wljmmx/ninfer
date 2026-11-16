@@ -1820,6 +1820,14 @@ std::uint64_t ExpertCache::used_bytes() const noexcept {
 std::uint64_t ExpertCache::capacity_bytes() const noexcept { return impl_->live_bytes(); }
 std::uint64_t ExpertCache::slot_bytes() const { return impl_->slot_bytes; }
 
+std::uint32_t ExpertCache::export_slots(std::uint32_t bank, std::span<std::uint32_t> out) const {
+    if (bank >= impl_->slot_of.size()) { return 0; }
+    const auto& table = impl_->slot_of[bank];
+    const auto count  = std::min<std::size_t>(table.size(), out.size());
+    for (std::size_t i = 0; i < count; ++i) { out[i] = table[i]; }
+    return static_cast<std::uint32_t>(count);
+}
+
 std::uint32_t ExpertCache::bank_count() const noexcept {
     return static_cast<std::uint32_t>(impl_->banks.size());
 }
