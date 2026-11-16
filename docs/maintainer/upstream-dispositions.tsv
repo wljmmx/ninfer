@@ -84,9 +84,9 @@ a062e016	2026-10-29	fix(serve): allow port reuse after listener shutdown	absorbe
 6dd2b1b4	2026-10-29	feat(config): make startup memory headroom configurable	absorbed	local:e850f892	local port: port(config): make the startup planning headroom configurable, split from KV sizing headroom [upstream 6dd2b1b4]
 45f74287	2026-10-29	fix(serve): wait for admission before starting streams	absorbed	local:d8e1f171	local port: port(serve): wait for admission before starting streams [upstream 45f74287]
 c7ca0958	2026-10-29	fix(qsa): disambiguate dependent member template call	absorbed	local:82ec8462	local port: port(ops-qsa): disambiguate dependent member template calls [upstream c7ca0958]
-b963bf96	2026-10-29	docs: refresh public guides and model cards	needs-review		upstream documentation commit; no code object
-19c3a2ae	2026-10-29	docs(architecture): consolidate internal documentation	needs-review		upstream documentation commit; no code object
-2cf04452	2026-10-29	fix(runtime): separate planning and allocation budgets	todo	upstream-alignment#6.3	touches the missing qwen4_exp / QSA / gated_residual tree
+b963bf96	2026-10-29	docs: refresh public guides and model cards	na-doc	README.md;model-cards/	上游公开指南/模型卡文档；本地 README.md、README.zh-CN.md、model-cards 独立演进，无 code object
+19c3a2ae	2026-10-29	docs(architecture): consolidate internal documentation	na-doc	docs/maintainer/engine-architecture.md	上游架构文档整理；本地以 engine-architecture.md 独立成文，无逐篇搬运
+2cf04452	2026-10-29	fix(runtime): separate planning and allocation budgets	absorbed	include/ninfer/types.h:80-93	planning allowance 与 sizing reserve 分账（T020 J3），另有 memory_budget 决策层；无同名 StartupMemoryBudget 类
 d0077333	2026-10-29	fix(distributed): forward startup progress and preserve failures	dead	v9-closeout-register#T214:T001	TP2 / multi-rank sealed dead group
 bfd41ea5	2026-10-28	feat(perplexity): integrate shared startup and distributed scoring	dead	v9-closeout-register#T214:T001	TP2 / multi-rank sealed dead group
 e5e18b97	2026-10-28	feat(observability): show estimated context token capacity	absorbed	v9-obs-parity-register#T166	resolved_tokens existed; display wired in e4d769d6
@@ -104,13 +104,13 @@ b71f318e	2026-10-28	feat(ops): add TP2 clamped FP8 MoE	dead	v9-closeout-register
 ba959c4b	2026-10-27	feat(glm5next): use fp8 kpool indexer by default	dead	v9-closeout-register#T214:T001	GLM5Next sealed dead group
 451c1ed9	2026-10-27	perf(attention): streamline bf16 kpool indexer addressing	na-arch	upstream-alignment#2:perf(kpool)	SM100-only path (\bkpool\b)
 824bd3a4	2026-10-27	refactor(cache): unify fp8 cache encoding	absorbed	local:a63e5401	parity record: docs(kv): record why the unified FP8 cache encoding is not adopted yet [upstream 824bd3a4] (T118)
-b281592d	2026-10-27	fix(runtime): calibrate graph rebuilds and bound NCCL memory	todo	upstream-alignment#6.3	touches the missing qwen4_exp / QSA / gated_residual tree
+b281592d	2026-10-27	fix(runtime): calibrate graph rebuilds and bound NCCL memory	dead	v9-closeout-register#T214:T001	NCCL 显存上界只在多 rank 执行成立；单卡无 NCCL/rank，多 rank 已封口
 04d0d15b	2026-10-27	docs(qwen4): define RTX 5090 preparation requirements	na-hardware	upstream-alignment#6.1	RTX 5090 / sm_120a documentation only
-e0114c70	2026-10-27	fix(runtime): bound and compact execution messages	todo	upstream-alignment#6.3	touches the missing qwen4_exp / QSA / gated_residual tree
+e0114c70	2026-10-27	fix(runtime): bound and compact execution messages	deferred	v9-qwen4exp-register#T192-T198	执行消息缓冲属 qwen4_exp program 层，本地无该对象；挂起=工件+可行性，解锁=T192–T198 就绪
 bea5a04e	2026-10-26	refactor(context): compact shared metadata storage	absorbed	v9-context-parity-register#T157	partial: metadata compaction not absorbed
-996d9214	2026-10-26	refactor(runtime): streamline decode dataflow and state commits	todo	upstream-alignment#6.3	touches the missing qwen4_exp / QSA / gated_residual tree
-d4a78e03	2026-10-26	fix(bench): align decode fixtures and traffic accounting	todo	upstream-alignment#6	no local landing record; the 305-commit absorption claim does not hold
-1b6c7232	2026-10-25	fix(runtime): synchronize measurement boundaries across ranks	todo	upstream-alignment#6.3	touches the missing qwen4_exp / QSA / gated_residual tree
+996d9214	2026-10-26	refactor(runtime): streamline decode dataflow and state commits	deferred	v9-qwen4exp-register#T192-T198	qwen4_exp decode/state 提交层；本地在 qwen3_5 树自研（state_image 提交路径）；挂起=工件，解锁=T192–T198
+d4a78e03	2026-10-26	fix(bench): align decode fixtures and traffic accounting	deferred	bench/inference/infer_bench_support.cpp	serving bench 只报 prefill/decode 时间，无流量账（ops bench 才有 effective_gbs）；解锁=需跨机对比时按 linear-benchmark.md §4 补
+1b6c7232	2026-10-25	fix(runtime): synchronize measurement boundaries across ranks	dead	v9-closeout-register#T214:T001	跨 rank 测量边界：单卡无 rank（tp/ep/dp/adp 均 size=1），多 rank 已封口
 afa8f641	2026-10-25	feat(glm5next): integrate decode CUDA graphs	dead	v9-closeout-register#T214:T001	GLM5Next sealed dead group
 047bf7bd	2026-10-25	feat(glm5next): integrate eager MTP execution	dead	v9-closeout-register#T214:T001	GLM5Next sealed dead group
 91d4ea92	2026-10-25	feat(glm5next): integrate eager vision execution	dead	v9-closeout-register#T214:T001	GLM5Next sealed dead group
@@ -157,43 +157,43 @@ ee9ab4bd	2026-10-24	perf(linear): port Spark Q8 4096x1024 projection	dead	v9-clo
 54075616	2026-10-23	feat(normalization): add paired and residual RMSNorm	absorbed	local:18cf1bdf	local port: port(ops-hc): add paired-concat and residual-add RMSNorm [upstream 54075616]
 acc6fcab	2026-10-23	feat(mhc): add optimized Spark op family	dead	v9-closeout-register#T214:T001	Spark/DGX (GB10) sealed dead group
 ecacdcad	2026-10-24	feat(glm5next): add conversion and sharded weight loading	dead	v9-closeout-register#T214:T001	GLM5Next sealed dead group
-637cf4a4	2026-10-24	refactor(config): standardize adp naming	todo	upstream-alignment#6.3	touches the missing qwen4_exp / QSA / gated_residual tree
-5cc161ca	2026-10-24	feat(context): add attention DP placement foundations	todo	upstream-alignment#6.3	touches the missing qwen4_exp / QSA / gated_residual tree
+637cf4a4	2026-10-24	refactor(config): standardize adp naming	absorbed	src/serve/monitor.cpp:288	adp 已在 /monitor/info 的 ranks 与 distributed-execution.md:19-26 统一命名；实现为 size=1 占位
+5cc161ca	2026-10-24	feat(context): add attention DP placement foundations	dead	v9-closeout-register#T214:T001	attention DP 放置需多 rank/多副本；本地 placements 恒空、adp size=1，多 rank 已封口
 525ec328	2026-10-23	fix(frontend): complete GLM5Next frontend contracts	dead	v9-closeout-register#T214:T001	GLM5Next sealed dead group
 c0fecc66	2026-10-23	feat(frontend): add GLM5Next media preprocessing	dead	v9-closeout-register#T214:T001	GLM5Next sealed dead group
 f6e8f9b8	2026-10-23	feat(frontend): add GLM5Next output and tool constraints	dead	v9-closeout-register#T214:T001	GLM5Next sealed dead group
 216fa76d	2026-10-23	feat(frontend): add GLM5Next prompt preparation and cache identity	dead	v9-closeout-register#T214:T001	GLM5Next sealed dead group
 5e9507e8	2026-10-23	feat(frontend): add GLM5Next chat template adaptation	dead	v9-closeout-register#T214:T001	GLM5Next sealed dead group
 7c583c75	2026-10-23	feat(frontend): add GLM5Next tokenizer and resource support	dead	v9-closeout-register#T214:T001	GLM5Next sealed dead group
-5551d9b1	2026-10-23	refactor(frontend): separate shared infrastructure from Qwen policy	todo	upstream-alignment#6.3	touches the missing qwen4_exp / QSA / gated_residual tree
-2c94555b	2026-10-23	feat(ops): implement KDA input preparation and ReplaySSM	todo	upstream-alignment#6	no local landing record; the 305-commit absorption claim does not hold
+5551d9b1	2026-10-23	refactor(frontend): separate shared infrastructure from Qwen policy	deferred	v9-architecture-parity-register#T149	公共前端抽取本地不跟随（仅一条 Qwen 前端）；挂起=qwen4-exp 前端立项，解锁=第二个前端开工（T191 前置）
+2c94555b	2026-10-23	feat(ops): implement KDA input preparation and ReplaySSM	deferred	src/ops/linear_attention/kimi_delta_attention/chunked/prepare.cu	KDA 输入准备已在 sources.cmake；ReplaySSM 只接 GDN（gdn_replay.h），KDA 无消费方（GLM5Next 判死）；解锁=出现 KDA 模型
 5404b972	2026-10-23	docs(glm5next): align operator designs with unified context storage	dead	v9-closeout-register#T214:T001	GLM5Next sealed dead group
 54b7f3c2	2026-10-23	fix(bench): align serving reports with production logs	absorbed	local:f392dd9a	local port: port(bench): align serial serving TTFT with the production log [upstream 54b7f3c2]
 1fcc6dc5	2026-10-23	perf(context): reduce admission and reclaim overhead	absorbed	v9-context-parity-register#T157	partial: metadata compaction not absorbed
 2705a728	2026-10-23	refactor(context): unify state and kv storage	absorbed	v9-context-parity-register#T154	equivalent: unified state/kv storage
-a78bf9ec	2026-10-22	docs(context): refine unified pool design	needs-review		upstream documentation commit; no code object
+a78bf9ec	2026-10-22	docs(context): refine unified pool design	na-doc	docs/maintainer/resource-scheduling-and-context-cache.md	上游统一池设计文档；本地对应文档独立成文，无 code object
 ac53965e	2026-10-22	perf(moe): integrate Spark clamped NVFP4 schedules	dead	v9-closeout-register#T214:T001	Spark/DGX (GB10) sealed dead group
 77241ffb	2026-10-22	fix(cache): honor host placement before context migration	absorbed	v9-context-parity-register#T155	equivalent and finer
-af26313c	2026-10-22	docs(context): clarify migration placement contracts	needs-review		upstream documentation commit; no code object
+af26313c	2026-10-22	docs(context): clarify migration placement contracts	na-doc	docs/maintainer/paged-kv-cache.md	迁移放置契约文档；本地在 paged-kv-cache.md 独立描述，无 code object
 4ec903a0	2026-10-22	fix(artifact): honor direct I/O alignment during materialization	absorbed	v9-frontend-serving-register#T074	layout exception safety + direct IO alignment
-c72ba1b9	2026-10-22	docs: define unified context pool and resource lifecycle	needs-review		upstream documentation commit; no code object
+c72ba1b9	2026-10-22	docs: define unified context pool and resource lifecycle	na-doc	docs/maintainer/resource-scheduling-and-context-cache.md	统一 context 池与生命周期文档；本地同名主题文档独立演进，无 code object
 9822c38d	2026-10-22	fix(grammar): allow whitespace in JSON output	absorbed	local:75c2796f	local port: port(constrained): allow whitespace in JSON output [upstream 9822c38d]
 1e902680	2026-10-22	fix(build): complete container dependencies	absorbed	local:4099d321	local port: port(build): adopt serving header hygiene and agent temp-file rules [upstream 1e902680 93fb1874]
 58733a86	2026-10-22	fix(media): align JPEG decoding with Pillow	absorbed	v9-frontend-serving-register#T072	partial: JPEG via libjpeg-turbo (76293d9c)
 e8c223d7	2026-10-22	chore(eval): reduce AIME26 repeats to three	absorbed	local:68e3a635	local port: port(eval): reduce AIME26 repeats to three [upstream e8c223d7]
 6bb0e85d	2026-10-22	docs(glm5next): finalize operator designs	dead	v9-closeout-register#T214:T001	GLM5Next sealed dead group
-5e581e92	2026-10-21	fix(qwen4-exp): bound execution by reserved frontier	todo	v9-qwen4exp-register#T192-T198	qwen4-exp suspended: artifact + feasibility; see upstream-alignment#6.3
+5e581e92	2026-10-21	fix(qwen4-exp): bound execution by reserved frontier	deferred	v9-qwen4exp-register#T196	qwen4-exp「frontier 上界」；本地按 qwen3_5 树自研（M1/M2）而非上游树；挂起=工件+可行性，解锁=T192–T198
 a928f899	2026-10-21	feat(eval): support repeated long-running accuracy campaigns	absorbed	local:e671e006	local port: port(eval): support repeated long-running accuracy campaigns [upstream a928f899]
 049d5fb4	2026-10-21	feat(context): jointly plan cache capacity and retain prefix checkpoints	absorbed	v9-context-parity-register#T156	joint capacity planning + prefix checkpoints
 34c48e01	2026-10-20	perf(qsa): optimize Spark indexer scoring and selection	dead	v9-closeout-register#T214:T001	Spark/DGX (GB10) sealed dead group
 b5a546f1	2026-10-20	perf(gdn): optimize Spark fold for host and device rows	dead	v9-closeout-register#T214:T001	Spark/DGX (GB10) sealed dead group
 90a61a76	2026-10-20	perf(hc): import Spark small-column mix optimizations	dead	v9-closeout-register#T214:T001	Spark/DGX (GB10) sealed dead group
-7131c0b9	2026-10-20	perf(qwen4exp): streamline MTP history and unify commit execution	todo	v9-qwen4exp-register#T192-T198	qwen4-exp suspended: artifact + feasibility; see upstream-alignment#6.3
-e07307e0	2026-10-20	refactor(qwen4exp): make MTP KV projections a contiguous prefix	todo	v9-qwen4exp-register#T192-T198	qwen4-exp suspended: artifact + feasibility; see upstream-alignment#6.3
-2507d770	2026-10-20	feat(qwen4exp): add optimized Q4 MTP head	todo	v9-qwen4exp-register#T192-T198	qwen4-exp suspended: artifact + feasibility; see upstream-alignment#6.3
+7131c0b9	2026-10-20	perf(qwen4exp): streamline MTP history and unify commit execution	deferred	v9-qwen4exp-register#T197	qwen4-exp「MTP 历史/提交统一」；本地 MTP 历史在 mtp_alignment.h 自研；挂起=工件，解锁=T192–T198
+e07307e0	2026-10-20	refactor(qwen4exp): make MTP KV projections a contiguous prefix	deferred	v9-qwen4exp-register#T197	qwen4-exp「MTP KV 连续前缀」；本地 MTP KV 走 qwen3_5 dense 路径（text.cpp:541 mtp_hc_stem）；挂起=工件，解锁=T192–T198
+2507d770	2026-10-20	feat(qwen4exp): add optimized Q4 MTP head	deferred	v9-qwen4exp-register#T197	qwen4-exp「Q4 MTP 头」；本地 MTP 头按工件 q4 走 qwen3_5 加载路径；挂起=工件，解锁=T192–T198
 46ee5c3b	2026-10-19	perf(moe): import spark nvfp4 load-aware schedules	dead	v9-closeout-register#T214:T001	Spark/DGX (GB10) sealed dead group
-81671499	2026-10-19	feat(bench): group decode timing and prime request prefixes	todo	upstream-alignment#6	no local landing record; the 305-commit absorption claim does not hold
-76c39559	2026-10-19	refactor(bench): report native prefill and decode timing	todo	upstream-alignment#6	no local landing record; the 305-commit absorption claim does not hold
+81671499	2026-10-19	feat(bench): group decode timing and prime request prefixes	absorbed	bench/inference/infer_bench_support.cpp:639-704	decode graph prime 即前缀预热（graph_prime 字段入报告），decode 计时分组在同文件
+76c39559	2026-10-19	refactor(bench): report native prefill and decode timing	absorbed	bench/inference/infer_bench_support.cpp:298	原生 prefill_seconds/decode 分组计时（GenerationTimings，support.h:33）
 697979a4	2026-10-19	refactor(observability): unify engine statistics and reporting	absorbed	v9-obs-parity-register#T165	request vs cached context + unified statistics
 56a8cf90	2026-10-19	feat(qwen4exp): enable two-rank inference and decode graphs	dead	v9-qwen4exp-register#T199	two-rank qwen4exp; merged into the T001 dead pool
 dcc576ba	2026-10-19	feat(distributed): activate prepared qwen4exp rank programs	dead	v9-qwen4exp-register#T199	two-rank qwen4exp; merged into the T001 dead pool
@@ -230,15 +230,15 @@ ca6a8b90	2026-10-19	feat(conv): support local split convolution geometry	absorbe
 25bd3120	2026-10-19	feat(linear): add spark segmented projection shapes	dead	v9-closeout-register#T214:T001	Spark/DGX (GB10) sealed dead group
 68a20575	2026-10-19	feat(linear): add spark parallel projection shapes	dead	v9-closeout-register#T214:T001	Spark/DGX (GB10) sealed dead group
 95a651aa	2026-10-19	feat(moe): support expert subsets in complete execution	dead	v9-moe-execution-register#T120	registered not absorbed (sigmoid/clamped family, expert subset)
-05327b22	2026-10-19	docs: clarify ownership and documentation policies	needs-review		upstream documentation commit; no code object
+05327b22	2026-10-19	docs: clarify ownership and documentation policies	na-doc	AGENTS.md;CONTRIBUTING.md	归属与文档政策为上游文档提交；本地 AGENTS.md/CONTRIBUTING.md 独立成文，无 code object
 fd1baa04	2026-10-19	feat(distributed): add multi-rank execution foundations	dead	v9-closeout-register#T214:T001	TP2 / multi-rank sealed dead group
 4126ecf4	2026-10-18	feat(config): unify cli and serve startup configuration	absorbed	local:f1dd374c	local port: port(config): unify cli/serve startup configuration [upstream 4126ecf4]
-f8790a78	2026-10-18	build: vendor tomlplusplus 3.4.0	todo	upstream-alignment#6	no local landing record; the 305-commit absorption claim does not hold
+f8790a78	2026-10-18	build: vendor tomlplusplus 3.4.0	absorbed	third_party/tomlplusplus/toml.hpp:1154-1156	已 vendor 3.4.0（cmake/Dependencies.cmake:118 引用头目录）
 0a239945	2026-10-18	docs: organize glm5next references and implementation designs	dead	v9-closeout-register#T214:T001	GLM5Next sealed dead group
-71cdd615	2026-10-18	refactor(runtime): separate native sessions and rank execution	todo	upstream-alignment#6.3	touches the missing qwen4_exp / QSA / gated_residual tree
+71cdd615	2026-10-18	refactor(runtime): separate native sessions and rank execution	dead	v9-closeout-register#T214:T001	session 与 rank 执行分离：rank 执行为多 rank 设施，单卡无对象
 1693a6e5	2026-10-18	docs(glm5next): define model quantization and spark op requirements	dead	v9-closeout-register#T214:T001	Spark/DGX (GB10) sealed dead group
 598285a0	2026-10-18	docs: settle dual-spark execution and parallel strategy	dead	v9-closeout-register#T214:T001	Spark/DGX (GB10) sealed dead group
-1408277a	2026-10-18	feat(qwen4-exp): compose resident main and draft graphs	todo	v9-qwen4exp-register#T192-T198	qwen4-exp suspended: artifact + feasibility; see upstream-alignment#6.3
+1408277a	2026-10-18	feat(qwen4-exp): compose resident main and draft graphs	deferred	v9-qwen4exp-register#T195	qwen4-exp「resident main/draft 图」；本地专家流式与草稿头分属自研路径；挂起=工件，解锁=T192–T198
 452c3f5f	2026-10-18	fix(cache): unify recovery scoring and incremental reclaim	absorbed	v9-context-parity-register#T155	equivalent and finer
 bc70d7c8	2026-10-18	feat(tools): stream native tool call arguments	absorbed	v9-frontend-serving-register#T071	native tool-call argument stream followed
 438ae67c	2026-10-17	perf(qsa): tune spark indexer and sparse attention execution	dead	v9-closeout-register#T214:T001	Spark/DGX (GB10) sealed dead group
@@ -285,20 +285,20 @@ d0f87935	2026-10-17	perf(linear): import spark bf16 2560x2560 route	dead	v9-clos
 54d5619b	2026-10-17	feat(bench): import explicit linear token lists	absorbed	local:fe288e8e	local port: port(bench): import explicit linear token lists [upstream 54d5619b]
 c827ac62	2026-10-17	perf(linear): import initial spark bf16 routes	dead	v9-closeout-register#T214:T001	Spark/DGX (GB10) sealed dead group
 f30e661f	2026-10-17	refactor(tests): reorganize op qualification suites	dead	v9-architecture-parity-register#T151	test suite reorganisation not followed
-35aede69	2026-10-17	refactor(build): share ops and core libraries	todo	upstream-alignment#6	no local landing record; the 305-commit absorption claim does not hold
+35aede69	2026-10-17	refactor(build): share ops and core libraries	absorbed	src/core/CMakeLists.txt:12	已按组件分库：ninfer_core / ninfer_ops / ninfer_runtime_support，apps 直接链接
 91972187	2026-10-17	refactor(tests): consolidate linear family suites	dead	v9-architecture-parity-register#T151	test suite reorganisation not followed
-066714cc	2026-10-17	refactor(platform): unify target capabilities and roofline references	todo	v9-architecture-parity-register#T150	capability/roofline unified layer missing
+066714cc	2026-10-17	refactor(platform): unify target capabilities and roofline references	absorbed	src/core/device_roofline.h	roofline 改设备查询（V10-11），bench 内 1792 常量清零；能力位宏单 target 树不采用
 f3ae9a44	2026-10-16	feat(engine): support native dgx spark execution	dead	v9-closeout-register#T214:T001	Spark/DGX (GB10) sealed dead group
 8ed68325	2026-10-16	build: separate native rtx5090 and dgx spark targets	absorbed	local:2995fe0d	local port: port(build): separate rtx4090 and rtx5090 build targets [upstream 8ed68325]
 64d10fbf	2026-10-16	docs(qwen4-exp): consolidate model and execution references	absorbed	v9-qwen4exp-register#T200	doc conclusions tabulated in T013 (qwen4_exp-model.md)
 93fb1874	2026-10-16	chore: standardize agent temporary file storage	absorbed	local:4099d321	local port: port(build): adopt serving header hygiene and agent temp-file rules [upstream 1e902680 93fb1874]
-f8a774f7	2026-10-16	perf(qwen4-exp): apply calibrated expert cache priorities	todo	v9-qwen4exp-register#T192-T198	qwen4-exp suspended: artifact + feasibility; see upstream-alignment#6.3
-3444964f	2026-10-16	feat(qwen4-exp): integrate cuda graph execution	todo	v9-qwen4exp-register#T192-T198	qwen4-exp suspended: artifact + feasibility; see upstream-alignment#6.3
-439e1075	2026-10-15	feat(qwen4-exp): integrate eager mtp execution	todo	v9-qwen4exp-register#T192-T198	qwen4-exp suspended: artifact + feasibility; see upstream-alignment#6.3
-afe43480	2026-10-15	feat(qwen4-exp): integrate eager vision execution	todo	v9-qwen4exp-register#T192-T198	qwen4-exp suspended: artifact + feasibility; see upstream-alignment#6.3
-4f31ad4a	2026-10-15	chore(profiling): trace qwen4-exp execution costs	todo	v9-qwen4exp-register#T192-T198	qwen4-exp suspended: artifact + feasibility; see upstream-alignment#6.3
-985121d4	2026-10-15	feat(qwen4-exp): integrate eager text execution	todo	v9-qwen4exp-register#T192-T198	qwen4-exp suspended: artifact + feasibility; see upstream-alignment#6.3
-088e8da4	2026-10-15	feat(qwen4-exp): add loading and execution resources	todo	v9-qwen4exp-register#T192-T198	qwen4-exp suspended: artifact + feasibility; see upstream-alignment#6.3
+f8a774f7	2026-10-16	perf(qwen4-exp): apply calibrated expert cache priorities	deferred	v9-moe-parity-register#T161	qwen4-exp「应用标定专家优先级」；本地无 model 侧默认序注入点；挂起=与 c996baa8 同源表整理，解锁=T198
+3444964f	2026-10-16	feat(qwen4-exp): integrate cuda graph execution	deferred	v9-qwen4exp-register#T195	qwen4-exp「CUDA graph」；本地图经验只在 qwen3_5 LayerGraphs，未接 qwen4-exp 树；挂起=工件，解锁=T192–T198
+439e1075	2026-10-15	feat(qwen4-exp): integrate eager mtp execution	deferred	v9-qwen4exp-register#T194	qwen4-exp「eager MTP」；本地 MTP 走 text.cpp + mtp_alignment（--spec mtp 已跑通）；挂起=0 accepted 缺陷，解锁=T192–T198
+afe43480	2026-10-15	feat(qwen4-exp): integrate eager vision execution	deferred	v9-qwen4exp-register#T194	qwen4-exp「eager vision」；本地未接 qwen4-exp 视觉（只有 qwen3_5 vision）；挂起=工件+显存核对，解锁=T192–T198
+4f31ad4a	2026-10-15	chore(profiling): trace qwen4-exp execution costs	deferred	v9-qwen4exp-register#T193	qwen4-exp「执行成本 trace」；本地用 NINFER_LAYER_TRACE 等探针自建；挂起=工件+可行性，解锁=T192–T198
+985121d4	2026-10-15	feat(qwen4-exp): integrate eager text execution	deferred	v9-qwen4exp-register#T194	qwen4-exp「eager text」；本地 text.cpp 已跑 Flash-Next 文本路径（MTP verify 实测）；挂起=主路径数值缺陷，解锁=T192–T198
+088e8da4	2026-10-15	feat(qwen4-exp): add loading and execution resources	deferred	v9-qwen4exp-register#T193	qwen4-exp「加载/执行资源」；本地以 M1/M2 绑定+加载计划实现（1308 绑定实测）；挂起=工件，解锁=T192–T198
 4423e0ac	2026-10-15	refactor(context): finish state migration cleanup	absorbed	v9-context-parity-register#T153	functionally equivalent; ownership registered
 ee5a5ffa	2026-10-15	refactor(context): own asynchronous migration and pool resources	absorbed	v9-context-parity-register#T153	functionally equivalent; ownership registered
 e9a7de36	2026-10-15	refactor(context): own kv prefixes and complete snapshots	absorbed	v9-context-parity-register#T153	functionally equivalent; ownership registered
@@ -310,7 +310,7 @@ e9a7de36	2026-10-15	refactor(context): own kv prefixes and complete snapshots	ab
 7e691b0b	2026-10-14	feat(ops): add cpu nvfp4 moe and organize moe kernels	absorbed	local:afa4f455	local port: port(moe-cpu): grade the CPU NVFP4 expert kernel on the AVX2 half [upstream 7e691b0b] (T115)
 df4ff5fe	2026-10-14	feat(ops): implement block-fp8 moe	absorbed	local:98474d0f	local port: port(ops-moe): prove block-FP8 experts run on Ada and pin the NVFP4 verdict [upstream 69c098bf df4ff5fe] (T114)
 69c098bf	2026-10-14	feat(ops): implement nvfp4 moe	absorbed	local:98474d0f	local port: port(ops-moe): prove block-FP8 experts run on Ada and pin the NVFP4 verdict [upstream 69c098bf df4ff5fe] (T114)
-9cdbf221	2026-10-13	fix(convert): allow a8 for qwen4exp mtp experts	todo	v9-qwen4exp-register#T192-T198	qwen4-exp suspended: artifact + feasibility; see upstream-alignment#6.3
+9cdbf221	2026-10-13	fix(convert): allow a8 for qwen4exp mtp experts	deferred	v9-qwen4exp-register#T196	qwen4-exp「MTP 专家 A8 转换」；本地转换器走 q4/q5/q8 与 fp8 块缩放；挂起=工件 recipe 定稿，解锁=T192–T198
 569861a3	2026-10-13	perf(ops): specialize 10240-wide offset rmsnorm	absorbed	local:32f069a5	local port: port(ops-hc): specialize the 10240-wide offset RMSNorm [upstream 569861a3]
 1b50c72d	2026-10-13	feat(ops): implement fused ple gate	absorbed	local:34f249de	local port: port(ops-ple): add the fused PLE gate [upstream 1b50c72d]
 333b4808	2026-10-13	feat(ple): add asynchronous embedding preparation	absorbed	local:191c01f7	local port: port(ops-ple): add asynchronous embedding preparation and NF4 disk reads [upstream 333b4808 8cea711b]
@@ -319,7 +319,7 @@ df4ff5fe	2026-10-14	feat(ops): implement block-fp8 moe	absorbed	local:98474d0f	l
 17bea0bc	2026-10-14	feat(moe): support cuda graphs for offloaded execution	dead	v9-moe-parity-register#T163	offload CUDA graph not absorbed
 545a171a	2026-10-14	refactor(moe): share execution and offload infrastructure	absorbed	v9-moe-parity-register#T162	equivalent (epoch + one-kernel merge already local)
 7ff78ee8	2026-10-14	perf(moe): reduce cpu offload scheduling overhead	absorbed	v9-moe-parity-register#T162	equivalent (epoch + one-kernel merge already local)
-c996baa8	2026-10-13	perf(moe): calibrate default 35b expert priorities	todo	v9-moe-parity-register#T161	35B priority data usable but no injection point
+c996baa8	2026-10-13	perf(moe): calibrate default 35b expert priorities	deferred	v9-moe-parity-register#T161	标定表可用但本地只有热序（expert_stream 的 hot_score），无 model 侧默认序注入；解锁=T161 最小注入点并入
 fddba033	2026-10-13	fix(artifact): load offloaded weights directly into host backing	absorbed	v9-moe-parity-register#T160	window differs; host backing rework closed
 c7c36e88	2026-10-13	feat(moe): integrate eager offload with reusable expert windows	absorbed	v9-moe-parity-register#T160	window differs; host backing rework closed
 8e3dff94	2026-10-12	feat(ops): add cpu routed swiglu for q4 experts	absorbed	v9-architecture-parity-register#T148	equivalent, local platform layer ahead
@@ -328,9 +328,9 @@ c7c36e88	2026-10-13	feat(moe): integrate eager offload with reusable expert wind
 c18d72db	2026-10-12	feat(core): add expert weight sources and gpu replica cache	absorbed	v9-moe-parity-register#T159	equivalent weight source; cache registered as difference
 7c4c5e3e	2026-10-12	feat(artifact): add nvfp4 banks and block-fp8 mtp import	absorbed	local:dd13c459	local port: port(artifact): name the block-scaled expert encodings [upstream 7c4c5e3e] (T117)
 74671a4e	2026-10-12	feat(core): add unified cpu execution foundations	absorbed	v9-architecture-parity-register#T148	equivalent, local platform layer ahead
-6a42de35	2026-10-11	refactor(core): separate memory ownership and cuda execution	todo	v9-architecture-parity-register#T147	partial: unified copy_bytes transfer layer not closed
-6e772ee3	2026-10-11	docs(ops): consolidate refactoring guidance	needs-review		upstream documentation commit; no code object
-ae54c1a9	2026-10-11	refactor(ops): finish family migration cleanup	todo	v9-architecture-parity-register#T145	7 flat headers still present; ~120 includes to rewrite
+6a42de35	2026-10-11	refactor(core): separate memory ownership and cuda execution	deferred	v9-architecture-parity-register#T147	传输层未收口：src 内无 copy_bytes/CudaCopyBatch，cudaMemcpyAsync 直连；解锁=A2（多 stream 或审计需求）
+6e772ee3	2026-10-11	docs(ops): consolidate refactoring guidance	na-doc	docs/maintainer/op-development.md	上游 ops 重构指南；本地 op-development.md 独立成文，无 code object
+ae54c1a9	2026-10-11	refactor(ops): finish family migration cleanup	deferred	v9-architecture-parity-register#T145	7 个扁平头仍在 src/ops/common（math/memory/mma/warp/score_id_order/token_slices）；解锁=A5 重组前置（约 120 include）
 e6585d15	2026-10-11	refactor(ops): organize sparse moe execution	absorbed	v9-architecture-parity-register#T145	equivalent family layout already local
 8cc45088	2026-10-11	refactor(ops): organize sampling and sequence operations	dead	v9-architecture-parity-register#T145	mapping only; reorganisation not followed
 4366c7b6	2026-10-11	refactor(ops): organize linear attention family	absorbed	v9-architecture-parity-register#T145	equivalent family layout already local
@@ -343,7 +343,7 @@ d53eb7ae	2026-10-11	refactor(ops): organize remaining linear variants	absorbed	v
 7ee63999	2026-10-10	refactor(ops): consolidate shared implementation primitives	absorbed	v9-architecture-parity-register#T145	equivalent family layout already local
 90d25edd	2026-10-10	refactor(ops): establish family organization and independent linear split	dead	v9-architecture-parity-register#T145	mapping only; reorganisation not followed
 3124dffe	2026-10-10	refactor: streamline execution and op tooling	dead	v9-architecture-parity-register#T145	mapping only; reorganisation not followed
-f1ace85e	2026-10-10	docs: consolidate model and maintenance references	needs-review		upstream documentation commit; no code object
+f1ace85e	2026-10-10	docs: consolidate model and maintenance references	na-doc	docs/maintainer/qwen3_5-model.md	上游模型与维护参考合并；本地按主题分文（qwen3_5-model.md 等），无 code object
 642d588f	2026-10-10	fix(tests): synchronize hc mix fixture initialization	absorbed	local:86540317	local port: fix(tests): settle the legacy stream before capturing the conv split graph [upstream ca6a8b90]
 5989682a	2026-10-09	feat: add optimized hc block and final mix	absorbed	local:370df44d	local port: port(ops-hc): import the four-stream HC residual and low-rank mix Ops [upstream 70a11f12 5989682a]
 70a11f12	2026-10-09	feat: add optimized hc residual ops	absorbed	local:370df44d	local port: port(ops-hc): import the four-stream HC residual and low-rank mix Ops [upstream 70a11f12 5989682a]
@@ -359,9 +359,9 @@ d02703e2	2026-10-09	docs(qsa): remove intermediate bf16 key rounding	absorbed	lo
 1a9d676e	2026-10-09	feat(ops): add qsa tail extraction	absorbed	local:f899eda5	local port: port(ops-qsa): add the raw index-key tail extraction [upstream 1a9d676e]
 d6a8de0e	2026-10-09	feat(ops): add qsa split input projections	absorbed	local:993a32a8	local port: port(ops-qsa): add the split input projections [upstream d6a8de0e]
 be12563a	2026-10-08	feat(ops): implement ple convolution and state extraction	absorbed	upstream-alignment#6	src/ops/ple is 8/8 ported locally
-fbd285b5	2026-10-08	docs: define expert weight cache and offload design	needs-review		upstream documentation commit; no code object
-f2620157	2026-10-08	feat(ops): add qwen4exp gdn shapes and reorganize gdn operators	todo	v9-qwen4exp-register#T192-T198	qwen4-exp suspended: artifact + feasibility; see upstream-alignment#6.3
-a0d27b22	2026-10-08	feat: support mixed row spans in paged kv	todo	v9-architecture-parity-register#T146	paged KV mixed row span: absorb with QSA host wiring
+fbd285b5	2026-10-08	docs: define expert weight cache and offload design	na-doc	docs/maintainer/storage-layouts.md	上游专家权重缓存/offload 设计文档；本地在 storage-layouts.md 与 moe register 独立描述
+f2620157	2026-10-08	feat(ops): add qwen4exp gdn shapes and reorganize gdn operators	deferred	v9-qwen4exp-register#T192	qwen4-exp「GDN 形状」；本地按 qwen3_5 树自研（M1/M2），GDN 已有 96x2560 control；挂起=工件+可行性，解锁=T192–T198
+a0d27b22	2026-10-08	feat: support mixed row spans in paged kv	deferred	v9-architecture-parity-register#T146	本地无 tokens_per_row（paged_kv_cache.cpp:39 固定 64 页）；QSA 索引页 4 token/行是硬编码；解锁=A1（index 页接 Host context）
 be9ad8a3	2026-10-08	feat: define ple shared op contracts	absorbed	local:bf859f94	local port: port(ops-ple): PLE shared op contract with convolution and state extraction [upstream be9ad8a3+be12563a]
 30e3a92f	2026-10-08	docs: plan main workspace qwen4exp tasks	absorbed	v9-qwen4exp-register#T200	doc conclusions tabulated in T013 (qwen4_exp-model.md)
 dc8b58fb	2026-10-08	docs: define independent qwen4exp op tasks	absorbed	v9-qwen4exp-register#T200	doc conclusions tabulated in T013 (qwen4_exp-model.md)

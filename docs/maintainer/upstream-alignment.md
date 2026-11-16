@@ -125,14 +125,14 @@ MTP experts Block-FP8 A8；GDN/QSA 大投影 Q8 A16；PLE 表 NF4。
 
 **固定基线＝`77c2e5e2`（`upstream/master`，2026-11-07）。** 基线以内的 1565 条上游提交已逐条写入台账：
 这是**已逐条核对（triaged）**，**不是逐条吸收（absorbed）**——`absorbed` 只表示"有书面依据说明内容已在本地"，
-其余五条分级各自带原因。此后每一轮只看基线之后的新提交，旧的 1565 条不再重读。
+其余七条分级各自带原因。此后每一轮只看基线之后的新提交，旧的 1565 条不再重读。
 
 | 项 | 值 |
 |---|---|
 | 台账 | `docs/maintainer/upstream-dispositions.tsv` |
 | 列 | `commit`（8 位短哈希）/ `date`（`%ad --date=short`）/ `subject`（原样，去制表符，超 120 字符截断并以 `...` 结尾）/ `class` / `evidence` / `note`；UTF-8 无 BOM、制表符分隔、首行表头 |
-| 行数 | **1565**，与 `git rev-list upstream/master` 逐条对应（无重复、无遗漏） |
-| 分级 | absorbed **1306** / dead **151** / na-arch **62** / todo **35** / needs-review **9** / na-hardware **2** |
+| 行数 | **1565**，与 `git rev-list upstream/master` 逐条对应（无重复、无遗漏）；2026-11-16 销账只改 44 行的 class，行数不变 |
+| 分级（2026-11-16 销账后） | absorbed **1313** / dead **155** / deferred **23** / na-arch **62** / na-doc **9** / na-hardware **2** / todo **1**（销账前：1306 / 151 / 0 / 62 / 0 / 2 / 35 + needs-review 9，见 §9） |
 | 生成方式 | 先 `git log upstream/master --format="%h%x09%ad%x09%s" --date=short` 取全量行，再按 §7.2 规则表顺序匹配、先命中先用地打级；证据列只引用下列文档或本地提交号，不自造哈希 |
 | 报告脚本 | `powershell -NoProfile -ExecutionPolicy Bypass -File tools/upstream/alignment_report.ps1` |
 
@@ -140,6 +140,9 @@ MTP experts Block-FP8 A8；GDN/QSA 大投影 Q8 A16；PLE 表 NF4。
 `baseline..upstream/master` 只要有一条缺处置记录就以退出码 **1** 退出并打印 `NO ROW` 清单，因此可以直接当对齐门禁用（0＝干净）。
 
 **规则：每一轮只处理 `baseline..upstream/master` 中缺处置记录的新提交，旧提交不再重读。**
+
+> 2026-11-16 销账（§9）只重定 44 行的 `class`（35 todo + 9 needs-review），**基线仍 `77c2e5e2`、行数仍 1565、
+> baseline 之后新增提交仍为 0**；因此"每个基线后新提交都必须有处置行"这条门禁的语义不变，变的只是旧行的分级。
 
 ### 7.1 分级口径
 
@@ -150,7 +153,9 @@ MTP experts Block-FP8 A8；GDN/QSA 大投影 Q8 A16；PLE 表 NF4。
 | na-hardware | 只有 sm_120a（RTX 5090）才有的对象 | §6.1 |
 | dead | 判死不吸收 | T001 封口池（Spark 96 / GLM 18 / TP2 18）、T013/T108（FP4-Local），以及 register 明写「不搬入 / 不跟随」的条目 |
 | todo | 待吸收，缺口已定位 | §3 的 `77c2e5e2`、§6.3 的 `qwen4_exp`/QSA/`gated_residual` 缺口、qwen4exp 挂起项（T192–T198）、§6 的 305 条内查不到落地依据者 |
-| needs-review | 规则表放不下，需人工定处置 | 证据列**留空** |
+| deferred | **确实未做，且被外部条件挂起**——note 必须写出挂起条件与解锁判据；条件不出现就不开工 | 2026-11-16 新增：qwen4_exp 运行时 14 条、KDA/预算/传输/夹具类 9 条（§9） |
+| na-doc | **上游 docs-only 提交**，本地文档集独立演进，无代码对象可吸收 | 2026-11-16 新增：原 needs-review 的 9 条上游 `docs` 提交（§9） |
+| needs-review | 规则表放不下，需人工定处置 | 证据列**留空**；2026-11-16 后该列为 0 条 |
 
 ### 7.2 规则表（前缀 / 路径 -> 分级 -> 证据）
 
@@ -165,12 +170,12 @@ MTP experts Block-FP8 A8；GDN/QSA 大投影 Q8 A16；PLE 表 NF4。
 | 主题含 `spark` / `dgx` / `glm` / `tp2` / `distributed` / `tensor-parallel` / `sharded` / `partitioned vocab` | dead | `v9-closeout-register#T214:T001` |
 | 主题含 `FP4-Local` | dead | `v9-closeout-register#T214:T013/T108` |
 | 触及 `src/ops/ple` | absorbed | `upstream-alignment#6`（8/8 已移植） |
-| 触及 `src/models/qwen4_exp`、`src/ops/softmax_attention/qsa`、`src/ops/gated_residual` | todo | `upstream-alignment#6.3` |
+| 触及 `src/models/qwen4_exp` 运行时（program/execution/state/parallel） | deferred | `v9-qwen4exp-register#T192-T198`（QSA/gated_residual 算子按 §8 已移植，走 absorbed） |
 | 主题含 `mxfp8` / `nvfp4` / `block-fp8` / `tma` / `cluster` / `a16` / `csf` / `mla` / `kpool` / `a8 ffn` | na-arch | `upstream-alignment#2:perf(<area>)` |
 | `perf(linear\|moe\|swiglu\|kpool\|kda\|mhc\|rmsnorm\|embedding)`、`style(ops)` | na-arch | `upstream-alignment#2:<原行名>` |
 | `q5090` 前缀、`docs` 提交里提到的 RTX 5090 | na-hardware | `upstream-alignment#6.1` |
 | 在 `81c8ce09..a754fcf3` 内且以上皆不命中 | todo | `upstream-alignment#6` |
-| 其余（当前全部是上游 `docs` 提交） | needs-review | 空 |
+| 其余（上游 `docs` 提交） | na-doc | 本地同主题文档（§9.3 逐条对应） |
 
 ### 7.3 当前实测（2026-11-09 跑 `tools/upstream/alignment_report.ps1`）
 
@@ -194,12 +199,15 @@ classes over the whole register:
 ok: every upstream commit up to the tip has a disposition row.
 ```
 
+> 以上是 **2026-11-09 的运行快照**（六类）。2026-11-16 销账后为七类，数字以 §7 表与 §9 为准；
+> 本轮只改台账、未重跑脚本，脚本复跑放到下一次对齐时执行（预期输出应与 §9 的计数逐项相等）。
+
 读法：
 
 - 63 条 `a754fcf3..77c2e5e2` 的 class 与 §2 完全对齐（60 na-arch / 2 dead / 1 todo＝`77c2e5e2`）。其中 `361dbbd1`、`4441cf47` 两条 Spark 提交在 §2 里按 `perf(rmsnorm)`、`perf(embedding)` 记为不适用，故落 na-arch 而非 305 段里 Spark 惯用的 dead——以 §2 为准。
-- `absorbed` 1306＝`cc3938c9` 合并带入的 1197 条 + 109 条有本地移植/对表依据的条目。**这仍然是 `cc3938c9` 的口径，不重新主张 §6 已否定的「305 条已吸收」。**
-- `needs-review` 9 条全部是上游 `docs` 提交（`b963bf96`、`19c3a2ae`、`a78bf9ec`、`af26313c`、`c72ba1b9`、`05327b22`、`6e772ee3`、`f1ace85e`、`fbd285b5`），证据列留空，等人工一次性定处置。
-- `dead` 151＝T001 封口池与 T013/T108，加 register 明写「不搬入 / 不跟随」的条目（T120、T123、T124、T145 五条、T149、T151、T163、T127 的 Docker 条）。
+- `absorbed` 1306（销账后 1313，见 §9）＝`cc3938c9` 合并带入的 1197 条 + 109 条有本地移植/对表依据的条目。**这仍然是 `cc3938c9` 的口径，不重新主张 §6 已否定的「305 条已吸收」。**
+- `needs-review` 9 条全部是上游 `docs` 提交（`b963bf96`、`19c3a2ae`、`a78bf9ec`、`af26313c`、`c72ba1b9`、`05327b22`、`6e772ee3`、`f1ace85e`、`fbd285b5`）；2026-11-16 一次性落 `na-doc`，该列清零（§9）。
+- `dead` 151（销账后 155，见 §9）＝T001 封口池与 T013/T108，加 register 明写「不搬入 / 不跟随」的条目（T120、T123、T124、T145 五条、T149、T151、T163、T127 的 Docker 条）。
 - 每次上游前移，先跑脚本拿 `NO ROW` 清单，补行（同一规则表），再看退出码是否回到 0。
 
 ## 8. 更正 6.1 的两行：QSA/HC 内核**本地已有**，缺的是格式与接线（2026-11-10）
@@ -267,3 +275,96 @@ graph 重放 3 例、双请求 batch、4 档 SM 的容量/分配镜像。
 
 基线既有问题（与 A6 无关，A/B 复现）：`ninfer_softmax_attention_test` 的 packed 套件崩 `0xC0000409`，
 末两行为 `packed_softmax_attention T=11 / T=194 ... actual=3.38953e+38`。
+
+## 9. 2026-11-16 销账结果
+
+目的：在"按祖先合并上游"之前，把台账里 35 条 `todo` 与 9 条 `needs-review` 一次性落到终态，使每一行都能回答
+"合并时要不要为它单独做一次内容对齐"。
+
+### 9.1 口径与边界（先写清楚，避免把"定级"读成"已实测"）
+
+- 本轮**只改两份文档**（本文件 + `upstream-dispositions.tsv`）：不改代码、不编译、不运行程序、不执行 git 命令。
+- 定级依据 = **本地树可核事实**（文件路径/行号、各 v9 register 的判定）+ 提交 subject。
+  **commit→path 明细本机不可得**（本轮禁止 git：`infer-upstream` 虽有 `.git` 也不读其历史，只用它的工作树核对对象存在性），
+  因此不能落到具体本地文件的判定，一律按 subject + register 给出机制原因与解锁判据，不虚构文件归属与哈希。
+- 行数仍 **1565**、基线仍 `77c2e5e2`；`baseline..upstream/master` 新提交 **0**。本轮只重定 44 行的 `class`
+  （35 `todo` + 9 `needs-review`），其余 **1521 行一字未动**，顺序未重排。
+- 新增两个 class（`deferred`、`na-doc`），§7.1 已各补一行判据，因此**分级从六类变七类，计数必然变化**。
+
+### 9.2 before / after
+
+| class | before | after | 变化 | 说明 |
+|---|---|---|---|---|
+| absorbed | 1306 | **1313** | +7 | 本轮找到本地等价物（见 9.3） |
+| dead | 151 | **155** | +4 | 多 rank / NCCL / rank 执行 / attention DP 放置 |
+| deferred | 0 | **23** | +23（新类） | qwen4_exp 运行时 14 + 其余 9；每条都带挂起条件与解锁判据 |
+| na-arch | 62 | **62** | 0 | 未触碰 |
+| na-doc | 0 | **9** | +9（新类） | 原 `needs-review` 的 9 条上游 docs 提交 |
+| na-hardware | 2 | **2** | 0 | 未触碰 |
+| todo | 35 | **1** | −34 | 仅剩 `77c2e5e2`（见 9.4） |
+| needs-review | 9 | **0** | −9 | 本类清空 |
+| 合计 | 1565 | **1565** | 0 | 行数不变 |
+
+### 9.3 每类代表条目（证据都在本地树内，路径可 rg 到）
+
+**absorbed +7**
+
+| 提交 | 本地依据 | 判据 |
+|---|---|---|
+| `f8790a78` vendor tomlplusplus 3.4.0 | `third_party/tomlplusplus/toml.hpp:1154-1156`（`TOML_LIB_MAJOR/MINOR/PATCH = 3/4/0`）、`cmake/Dependencies.cmake:118` | 版本逐位相同 |
+| `35aede69` share ops and core libraries | `src/core/CMakeLists.txt:12`（`ninfer_core`）、`src/ops/CMakeLists.txt:2`（`ninfer_ops`）、`apps/CMakeLists.txt:3` | 共享库分层已在，apps 直接链接 |
+| `066714cc` unify target capabilities / roofline | `src/core/device_roofline.h:1-71`、`bench/ops/ninfer_bench_common.h:87-101`（`device_peak_bw_gbs`） | roofline 从"固定 1792"改为**设备查询**（V10-11），11 处 bench 已改用；能力位宏在单 target 树不采用 |
+| `2cf04452` separate planning and allocation budgets | `include/ninfer/types.h:80-93`（planning allowance / KV sizing reserve 两账分立）、`src/core/memory_budget.h:1-29`、`src/runtime/engine/context_cache/joint_planning.h:11` | 概念等价；**无同名 `StartupMemoryBudget` 类**（上游 `src/runtime/engine/startup_memory.h`），合并时按语义而非文件名对 |
+| `637cf4a4` standardize adp naming | `src/serve/monitor.cpp:288`（`{"adp", ...}`）、`docs/maintainer/distributed-execution.md:19-26` | 命名已在；实现是 `size=1` 占位 |
+| `76c39559` / `81671499` bench 原生 prefill/decode 计时与前缀预热 | `bench/inference/infer_bench_support.cpp:298`（`prefill_seconds`）、`:639-704`（`decode_graph_prime`）、`infer_bench_support.h:33/126-127` | decode 计时分组 + `graph_prime` 字段入报告 |
+
+**dead +4**（全部并入 `v9-closeout-register#T214:T001` 的多 rank 封口池）
+
+| 提交 | 机制原因 |
+|---|---|
+| `b281592d` bound NCCL memory | NCCL 显存上界只在多 rank 执行存在；单卡无 NCCL |
+| `1b6c7232` measurement boundaries across ranks | "across ranks" 无对象：本地 `tp/ep/dp/adp` 在 `monitor.cpp:279-288` 恒 `size=1` |
+| `5cc161ca` attention DP placement foundations | attention DP 放置需要多 rank/多副本；本地 `placements` 恒空 |
+| `71cdd615` separate native sessions and rank execution | rank 执行是多 rank 设施，单卡无该层 |
+
+**deferred +23**（每条 note 都写了挂起条件 + 解锁判据）
+
+- qwen4_exp 运行时 **14 条**：`f2620157`、`088e8da4`、`4f31ad4a`、`985121d4`、`afe43480`、`439e1075`、
+  `3444964f`、`1408277a`、`9cdbf221`、`5e581e92`、`2507d770`、`e07307e0`、`7131c0b9`、`f8a774f7`。
+  统一口径：上游 `src/models/qwen4_exp/` 是 75 文件整层（`infer-upstream` 工作树），本地只有 **28** 个文件
+  （`rg --files src/models/qwen4_exp` 口径：config、text_config、load（含 load/text）、execution{qsa,hc,ple_layer}、ple），
+  **缺 program/、state/、startup、model、weights.h**；本地运行走的是 qwen3_5 树上的自研
+  M1/M2 外挂（`v9-qwen4exp-register` §"M1/M2 已落地"、`text.cpp:541` 的 `mtp_hc_stem`）；解锁 =
+  qwen4exp 工件就绪 + T013 可行性账通过 + 主路径数值缺陷（PPL 1.49e6，同 register §4）关闭，即 T192–T198 复评。
+- 其余 9 条：`2c94555b`（KDA 输入准备已在 `src/ops/linear_attention/kimi_delta_attention/chunked/prepare.cu`，
+  但 ReplaySSM 只接 GDN（`include/ninfer/ops/gdn_replay.h`），KDA 无消费方——GLM5Next 已判死）、
+  `5551d9b1`（公共前端抽取，T149 不跟随，等 qwen4-exp 前端立项）、`e0114c70`/`996d9214`（qwen4_exp program 层，
+  本地无该对象）、`d4a78e03`（serving bench 无流量账，只 ops bench 有 `effective_gbs`）、`c996baa8`（标定表可用但
+  本地只有热序，无 model 侧默认序注入，T161）、`6a42de35`（`copy_bytes` 传输层未收口，register A2）、
+  `ae54c1a9`（7 个扁平头仍在 `src/ops/common/`，register A5 前置）、`a0d27b22`（无 `tokens_per_row`，
+  `src/core/paged_kv_cache.cpp:39-41` 固定 64 页，register A1）。
+
+**na-doc +9**：`b963bf96`、`19c3a2ae`、`a78bf9ec`、`af26313c`、`c72ba1b9`、`05327b22`、`6e772ee3`、
+`f1ace85e`、`fbd285b5`。全部是上游 `docs` 提交（无代码对象），本地文档集独立演进；台账已逐条指向本地的
+同主题文档（`README.md`/`model-cards/`、`engine-architecture.md`、`resource-scheduling-and-context-cache.md`、
+`paged-kv-cache.md`、`AGENTS.md`/`CONTRIBUTING.md`、`op-development.md`、`qwen3_5-model.md`、`storage-layouts.md`）。
+
+### 9.4 仍留在 `todo` 的唯一一条：`77c2e5e2`
+
+不落终态的理由（不是漏做，是**按现有定义落不进去**）：
+
+- `deferred` 要求"被**外部条件**挂起"，而 §3 明确写"启动条件：无外部依赖，可立即开工"——它是排期问题，不是阻塞问题。
+- `absorbed` 要求"内容已在本地"：本地确有 preemption 恢复的骨架（`include/ninfer/types.h:823`
+  `GenerationRecoveryRoute{None,Snapshot,Replay}`、`src/runtime/engine/engine_core.h:2245-2246/2313/2402`、
+  `src/serve/request_log.cpp:347/655` 的 `preemptions`/`preemption_index` 遥测），但 §3 的四条子项里
+  "零 frontier 请求直接恢复（`Direct` 路由不存在）""关闭顺序""d 回归夹具"都还没落地，写 `absorbed` 会掩盖 v10 的
+  实际工作量。
+- 结论：**留 `todo`，由用户决定是并入 v10 立项还是明确降级为 `deferred`（若决定降级，解锁判据＝§3 的 DoD 六条）。**
+
+### 9.5 合并前的读法（给"按祖先合并"用）
+
+1. `absorbed` 只保证"内容等价"，**不保证同文件同形态**——`2cf04452`/`066714cc`/`637cf4a4` 是概念等价、无同名对象，
+   合并时按语义判断，不要按路径覆盖。
+2. `dead` 的 4 条都来自多 rank 封口池；若将来单卡线要接 NCCL/rank，这 4 条与 T001 需一起复议，不是永久不可逆。
+3. `deferred` 的 23 条都带解锁判据，**判据不出现就不开工**；其中 14 条 qwen4_exp 运行时是同一条外部依赖，
+   应作为一个批次（T192–T198）处理，不要逐条 cherry-pick。
