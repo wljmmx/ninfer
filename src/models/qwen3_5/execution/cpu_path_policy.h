@@ -461,6 +461,55 @@ struct PrefetchSizing {
     return out;
 }
 
+// ---- the prefetch port: what the controller needs to size a prediction region -------------------
+//
+// The strategies all live here, in the controller, and the prediction side only REPORTS. That is the
+// same shape as the budget question for KV and the expert pool: every consumer states what it asks
+// for and what was observed, one place divides. Nothing on the prediction side decides its own size.
+//
+// Signals come from code that already counts them:
+//   cold_share  [gh1] residency   (residency_inside_/residency_routes_, dynamic per layer)
+//   hit_rate    [pf-region] hits/calls
+//   cpu_share   [ctl] cpu share   (a route the half took never needs a prediction)
+//   freeze      the stream's own frozen state (a pinned set shrinks what prefetch can add)
+//   lanes       control.signals.lanes_busy (>= 6 switches the replacement policy wholesale)
+// and the geometry (top_k, runs_per_layer, slot bytes) is read from the artifact layout, never from
+// a name: the same model packaged two ways has the same geometry.
+struct PrefetchSignals {
+    double cold_share          = -1.0;
+    double hit_rate            = -1.0;
+    double cpu_share           = -1.0;
+    bool   staging_reachable   = false;
+    bool   freeze_active       = false;
+    int    lanes               = 1;
+    int    top_k               = 0;
+    int    runs_per_layer      = 1;
+    int    pool_slots_per_bank = 0;
+};
+
+inline PrefetchSignals& prefetch_signals() {
+    static thread_local PrefetchSignals signals;
+    return signals;
+}
+
+inline void note_prefetch_signals(const PrefetchSignals& signals) { prefetch_signals() = signals; }
+
+// The port itself: no arguments, because the numbers must be the ones that were measured, not the
+// ones a caller would like to state. A route the CPU half took is removed from the cold set first -
+// prefetching for it would be paying twice.
+[[nodiscard]] inline PrefetchSizing decide_prefetch_slots() noexcept {
+    const auto& signals = prefetch_signals();
+    PrefetchSizingQuery query;
+    query.top_k               = signals.top_k;
+    query.pool_slots_per_bank = signals.pool_slots_per_bank;
+    query.cold_share = signals.cold_share >= 0.0
+                           ? signals.cold_share * std::max(0.0, 1.0 - std::max(0.0, signals.cpu_share))
+                           : -1.0;
+    query.hit_rate          = signals.hit_rate;
+    query.staging_reachable = signals.staging_reachable;
+    return decide_prefetch_slots(query);
+}
+
 inline constexpr double kCpuGflopsCalibrated = 778.0; // the benchmark's own effective rate
 inline constexpr double kCpuLayerFloorUs     = 250.0; // a layer shorter than this still gets a floor
 inline constexpr double kLinkBusyShare       = 0.10;  // upload/wall under this: the link is idle
