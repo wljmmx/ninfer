@@ -44,6 +44,7 @@
 #include "models/qwen3_5/execution/param_bus.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -675,6 +676,24 @@ struct CpuHalfRate {
     // would never run again. Re-probes (kCpuReprobeLayers) keep the estimate from going stale.
     double compute_us_per_expert = -1.0;
     double span_us_per_expert    = -1.0;
+    // The two rates above are per-expert figures measured at SOME route count, and the two were not
+    // the same one: `span` kept the best (smallest) observation while `compute` ran an EWMA over
+    // every observation, so on 2026-11-16 a run read span=57.8 us against compute=1401 us - a 24x
+    // disagreement between two numbers that describe the same kernel. Any crossing derived from them
+    // (m* = readback/(span - copy)) was therefore arithmetic on mismatched sizes, which is how a
+    // 12-miss threshold landed on layers that only ever had 8. The pair is now kept PER SIZE, both
+    // halves from the same layer observation, and the decisions price a layer at the size it has.
+    struct Sample {
+        int    count                = 0;   // routes the CPU half actually computed
+        int    tokens               = 0;   // columns that layer verified
+        double span_us_per_expert   = -1.0;
+        double compute_us_per_expert = -1.0;
+    };
+    // route counts 1, 2, 3-4, 5-8, 9-16, 17-32, 33-64, 65+ (bucket = ceil(log2(count))).
+    static constexpr int kSampleBins = 8;
+    std::array<Sample, kSampleBins> samples{};
+    int    span_count            = 0;  // the size `span_us_per_expert` was measured at
+    int    compute_count         = 0;
     // Decision 4's two terms. `compute_us_per_token` is the arithmetic per token (what repeats for a
     // batch) and `measured_tokens` is the column count it was measured at, so a rate measured at one
     // shape is not silently reused as the price of another. Both stay -1 until a batch has actually
@@ -691,6 +710,51 @@ inline CpuHalfRate& cpu_half_rate() {
     return rate;
 }
 
+// The bucket a route count falls in. Both halves of one observation are stored under the same
+// bucket, which is what makes a sampled pair a same-size pair by construction.
+[[nodiscard]] inline int cpu_sample_bin(int count) noexcept {
+    int bin = 0;
+    while ((1 << bin) < count && bin + 1 < CpuHalfRate::kSampleBins) { ++bin; }
+    return bin;
+}
+
+// The observation that prices `count` routes: the same bucket when this box has run that size,
+// otherwise the nearest SMALLER one. Smaller is the conservative direction - it amortises the fixed
+// part over fewer routes, so its per-expert figure is the larger one - and "nearest larger" is only
+// used when nothing small exists. -1 means this box has never timed a comparable size, and a caller
+// must then say NoData rather than reuse a rate measured somewhere else.
+[[nodiscard]] inline const CpuHalfRate::Sample* cpu_sample_for(int count) noexcept {
+    if (count <= 0) { return nullptr; }
+    const auto& rate = cpu_half_rate();
+    const int   bin  = cpu_sample_bin(count);
+    for (int i = bin; i >= 0; --i) {
+        if (rate.samples[static_cast<std::size_t>(i)].count > 0) { return &rate.samples[static_cast<std::size_t>(i)]; }
+    }
+    for (int i = bin + 1; i < CpuHalfRate::kSampleBins; ++i) {
+        if (rate.samples[static_cast<std::size_t>(i)].count > 0) { return &rate.samples[static_cast<std::size_t>(i)]; }
+    }
+    return nullptr;
+}
+
+// One route's span at this layer's size, -1 when the box has not run a comparable size yet.
+[[nodiscard]] inline double cpu_route_us_for(int count) noexcept {
+    if (const auto* sample = cpu_sample_for(count); sample != nullptr) {
+        return sample->span_us_per_expert;
+    }
+    return -1.0;
+}
+
+// One route's arithmetic per token at this layer's size, read off the same observation as the span
+// above. Priced per token because a verify pass repeats the arithmetic T times and pays the tier
+// read once - the decision-4 shape term, now with a size attached.
+[[nodiscard]] inline double cpu_route_us_per_token_for(int count) noexcept {
+    const auto* sample = cpu_sample_for(count);
+    if (sample == nullptr || sample->compute_us_per_expert <= 0.0 || sample->tokens <= 0) {
+        return -1.0;
+    }
+    return sample->compute_us_per_expert / static_cast<double>(sample->tokens);
+}
+
 // One measured CPU half: `experts` routes in `cpu_ms`. The effective per-route time is what the
 // next budget is priced with; the GFLOPS figure is printed beside it so the calibration can be
 // checked against the benchmark's 778 rather than trusted.
@@ -705,12 +769,23 @@ inline void note_cpu_half(int experts, int tokens, double span_ms, double comput
     const double span = span_ms * 1000.0 / static_cast<double>(experts);
     if (span > 0.0 && (rate.span_us_per_expert < 0.0 || span < rate.span_us_per_expert)) {
         rate.span_us_per_expert = span;
+        rate.span_count         = experts;
     }
     if (compute_ms > 0.0) {
         const double per = compute_ms * 1000.0 / static_cast<double>(experts);
+        // The same-size record: this observation's span AND its compute, filed under the count that
+        // produced both. The pair is not averaged across sizes on purpose - an average over 1-route
+        // and 64-route layers is a rate no layer ever ran at, and it is what made the two printed
+        // figures disagree by 24x.
+        auto& sample = rate.samples[static_cast<std::size_t>(cpu_sample_bin(experts))];
+        sample.count                 = experts;
+        sample.tokens                = tokens > 0 ? tokens : 1;
+        sample.span_us_per_expert    = span > 0.0 ? span : -1.0;
+        sample.compute_us_per_expert = per;
         rate.compute_us_per_expert = rate.compute_us_per_expert > 0.0
                                          ? rate.compute_us_per_expert + (per - rate.compute_us_per_expert) / 8.0
                                          : per;
+        rate.compute_count = experts;
         // Decision 4: the same measurement read per TOKEN. A layer that verified T columns paid for T
         // tokens of arithmetic, so dividing by T is what makes two shapes comparable; without it the
         // measured per-route rate becomes the price of every shape (the bug decision 4 names).
@@ -727,14 +802,22 @@ inline void note_cpu_half(int experts, int tokens, double span_ms, double comput
     }
 }
 
-// One route's price on the CPU half, for a caller that has no layer query to hand (decision 2's layer
-// form). The measured span when this box has one - it includes the tier fill, which a layer-level
-// comparison has to pay - and the recorded prior otherwise.
+// One route's price on the CPU half for a caller that knows how many routes it is about to move.
+// The measured span AT THAT SIZE when this box has run a comparable one - it includes the tier fill,
+// which a layer-level comparison has to pay - and -1 ("no data") otherwise. Deliberately no
+// cross-size fallback: the 24x disagreement between a 1-route span and a 64-route EWMA is exactly
+// what a fallback to "whatever was measured somewhere" produces.
+[[nodiscard]] inline double cpu_route_us_estimate(int routes) noexcept {
+    return cpu_route_us_for(routes);
+}
+
+// One route's price with no size to name - the shape ffn.cpp's post-fetch note still asks for. Falls
+// back to the calibrated per-expert prior, never to a span measured at an unknown size.
 [[nodiscard]] inline double cpu_route_us_estimate() noexcept {
     const auto& rate = cpu_half_rate();
-    if (rate.span_us_per_expert > 0.0) { return rate.span_us_per_expert; }
-    const double ms = param_bus().get(kCpuMoeExpertRow);
-    return ms > 0.0 ? ms * 1000.0 : -1.0;
+    const double prior = param_bus().get(kCpuMoeExpertRow);
+    if (prior > 0.0) { return prior * 1000.0; }
+    return rate.span_us_per_expert > 0.0 ? rate.span_us_per_expert : -1.0;
 }
 
 // Probe (default off, NINFER_CPU_PATH_FORCE=N): pin the ratio instead of letting the cost model
@@ -803,11 +886,13 @@ inline void note_cpu_half(int experts, int tokens, double span_ms, double comput
     // has always been priced with.
     const double tokens   = static_cast<double>(std::max(1, query.tokens));
     const double compute_us =
-        rate.compute_us_per_token > 0.0
-            ? tokens * rate.compute_us_per_token
-            : (rate.compute_us_per_expert > 0.0
-                   ? rate.compute_us_per_expert
-                   : query.flops_per_expert / (out.cpu_gflops * 1e9) * 1e6);
+        cpu_route_us_per_token_for(query.routes) > 0.0
+            ? tokens * cpu_route_us_per_token_for(query.routes)
+            : (rate.compute_us_per_token > 0.0
+                   ? tokens * rate.compute_us_per_token
+                   : (rate.compute_us_per_expert > 0.0
+                          ? rate.compute_us_per_expert
+                          : query.flops_per_expert / (out.cpu_gflops * 1e9) * 1e6));
     const double cpu_us     = compute_us + read_us / tokens;
     out.cost_gpu_us         = gpu_us;
     out.cost_cpu_us         = cpu_us;
@@ -819,10 +904,13 @@ inline void note_cpu_half(int experts, int tokens, double span_ms, double comput
                                 kCpuLayerFloorUs);
     if (query.lanes > 1) { budget_us /= static_cast<double>(query.lanes); }
     out.budget_us = budget_us;
-    // How many routes fit: the CPU half's own measured span per route when this box has timed one -
-    // that span includes the tier fill, which is serial on this thread and is precisely what makes
-    // the half the critical path when it grows past the copy it is meant to overlap.
-    const double per_route_us = rate.span_us_per_expert > 0.0 ? rate.span_us_per_expert : cpu_us;
+    // How many routes fit: the CPU half's own measured span per route AT THIS LAYER'S SIZE - that
+    // span includes the tier fill, which is serial on this thread and is precisely what makes the
+    // half the critical path when it grows past the copy it is meant to overlap. Pricing the layer
+    // at its own size is the point: a count derived from a rate measured at another size is a
+    // fixed point of nothing (see CpuHalfRate::Sample).
+    const double sampled_us   = cpu_route_us_for(query.routes);
+    const double per_route_us = sampled_us > 0.0 ? sampled_us : cpu_us;
     int count = per_route_us > 0.0 ? static_cast<int>(budget_us / per_route_us) : 0;
     // Queue depth, both sides, from the previous layer of this same stream. An upload nobody has
     // timed yet (-1/0 ms) is not an idle link: the trim only fires on a measurement.
@@ -1003,7 +1091,7 @@ struct CpuPathLedger {
         // and "the actuator fired and did nothing" are different statements.
         std::fprintf(stderr,
                      "[ctl] cpu share: routes cpu=%llu/%llu (%.1f%%) last=%llu experts | "
-                     "rate compute=%.1fus span=%.1fus per exp (%.0f GFLOPS) | est copy=%.0f us vs "
+                     "rate span=%.1fus@%d compute=%.1fus@%d per exp (%.0f GFLOPS) | est copy=%.0f us vs "
                      "cpu=%.0f us, budget=%.0f us\n",
                      static_cast<unsigned long long>(cpu_routes),
                      static_cast<unsigned long long>(routes_seen),
@@ -1011,12 +1099,14 @@ struct CpuPathLedger {
                                       : 100.0 * static_cast<double>(cpu_routes) /
                                             static_cast<double>(routes_seen),
                      static_cast<unsigned long long>(layer_cpu),
-                     cpu_half_rate().compute_us_per_expert < 0.0
-                         ? 0.0
-                         : cpu_half_rate().compute_us_per_expert,
                      cpu_half_rate().span_us_per_expert < 0.0
                          ? 0.0
                          : cpu_half_rate().span_us_per_expert,
+                     cpu_half_rate().span_count,
+                     cpu_half_rate().compute_us_per_expert < 0.0
+                         ? 0.0
+                         : cpu_half_rate().compute_us_per_expert,
+                     cpu_half_rate().compute_count,
                      cpu_half_rate().cpu_gflops, last_cost_gpu_us, last_cost_cpu_us,
                      last_budget_us);
         // Decision 2's layer form, printed next to the per-expert line on purpose: the two disagree
