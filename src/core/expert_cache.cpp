@@ -508,8 +508,20 @@ std::vector<std::uint64_t> bank_generation;
             }
             std::fprintf(stderr,
                          "[pool] prefetch region: %u slot(s)/bank, carved per bank like the "
-                         "ring\n",
-                         prefetch_per_bank);
+                         "ring - %llu MiB of residency, not extra memory\n",
+                         prefetch_per_bank,
+                         static_cast<unsigned long long>(
+                             (static_cast<std::uint64_t>(prefetch_per_bank) *
+                              static_cast<std::uint64_t>(banks.size()) * slot_bytes) >> 20));
+            // Zero-sum on a box where the pool already took every byte above the KV reservation
+            // (model_instance.cpp sizes `requested` from plan_device_split, and the split gives the
+            // pool everything that is left). So this region is not "an extra cache": it is residency
+            // the hot set no longer has, and the ledger's pool bytes do not move while the usable
+            // slot count falls by exactly this much. Measured 2026-11-16 with 20 slots/bank:
+            // pool=11856 MiB unchanged in the ledger, 1.44 tok/s against 7.52 without the region.
+            // Making it a separate allocation would change the labels, not the arithmetic, unless
+            // the pool's share is lowered by the same amount - which is why this line states the
+            // cost instead of implying the region is free.
             std::fflush(stderr);
         }
         const std::uint32_t reserved_per_bank = prefetch_per_bank + ring_per_bank;

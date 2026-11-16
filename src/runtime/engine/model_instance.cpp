@@ -313,7 +313,7 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     // NOT armed implicitly. The region is CARVED FROM THE POOL'S OWN SLOTS
     // (core/expert_cache.cpp: carve runs `free_list(b).pop_back()` and then reserves
     // `prefetch + ring` per bank), so turning it on with `NINFER_PREFETCH=1` shrinks the routed
-    // working set by banks*slots*entry_bytes - 20 x 48 x 1.25 MB = 1.2 GB, a tenth of the pool - and
+    // working set by banks*slots*entry_bytes - 20 x 144 x 1.25 MB = 3.6 GiB, THIRTY percent of the pool - and
     // nothing consumes what it stages (`expert_prefetch` has no reader on the verify path). Measured
     // 2026-11-16: 1.54 tok/s with the region armed against 8.28 without, same shape, same box. So the
     // region now arms only when a caller states its size explicitly; the separate-space change (a
