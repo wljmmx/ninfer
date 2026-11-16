@@ -25,11 +25,13 @@
 //     GPU slot is the validation-seam shape: the later tiering batch that actually owns the
 //     split (host pages, no device copy) replaces the whole leg.
 //
-// Preconditions the gate enforces (each miss = GPU fallback + one log line): view installed;
-// unmasked single-batch call (batch==1, no valid_columns); view geometry matches the dispatched
-// G; view dtype (family) equals the dispatched instance's family; window from the host positions
-// mirror fits the call's visible capacity; knob split < active splits; the stream is not
-// capturing.
+// Preconditions the gate enforces (each miss = GPU fallback + one log line): the call's token
+// width (the staging holds 8); view installed; unmasked single-batch call (batch==1, no
+// valid_columns); view geometry matches the dispatched G; view dtype (family) equals the dispatched
+// instance's family; window from the host positions mirror fits the call's visible capacity; knob
+// split < active splits; the stream is not capturing. The width test comes first because it is a
+// property of the call, not of the view: the width 9..16 kernel reaches this gate only to be told
+// that its tile is past the staging.
 // The first engage also logs one line; the thread-local engage counter lets a harness assert
 // the seam actually fired instead of silently falling back to two identical GPU runs.
 //
@@ -423,6 +425,15 @@ void rk_kv_cpu_split_gate(const CausalAttentionOperands& p, CausalKvPartition pa
     namespace detail = rk_host_partial_detail;
     using detail::log_fallback;
 
+    // The call's own bound first: a tile wider than the pinned staging can never use the seam, and
+    // that is true whatever the view says. It is also the only line the width 9..16 kernel (which
+    // had no gate at all before P4.1) can print - the producer refuses the same tile size, so a
+    // view-less call would otherwise look like "no producer" when the answer is "this width".
+    if (p.width > detail::kStageWidth) {
+        log_fallback(detail::kWidth,
+                     "this call's width exceeds the CPU leg's pinned staging (8 tokens)");
+        return;
+    }
     const RkHostPartialView* view = rk_host_partial_active();
     if (view == nullptr) {
         log_fallback(detail::kNoView, "no host view installed");
@@ -444,10 +455,6 @@ void rk_kv_cpu_split_gate(const CausalAttentionOperands& p, CausalKvPartition pa
     }
     if (p.batch != 1) {
         log_fallback(detail::kMultiBatch, "batch > 1 is out of the seam's v1 scope");
-        return;
-    }
-    if (p.width > detail::kStageWidth) {
-        log_fallback(detail::kWidth, "the token tile is wider than the pinned staging");
         return;
     }
     if (view->query_heads != G::QHeads || view->pages.kv_heads != G::KVHeads) {

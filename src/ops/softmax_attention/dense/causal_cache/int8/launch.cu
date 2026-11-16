@@ -126,6 +126,12 @@ void rk_e8_grouped(const CausalAttentionOperands& p, Int8KvCacheView<Writable> c
         launch_int8_kv_grouped_mma<G, typename Instance::Schedule, MultiBatch, Masked, Writable,
                                    Input, false, true, true, true, false>(p, cache, input, partition,
                                                                     partial, stream);
+        // P4.1: the E8 carriers get the same seam as rk4v4/rk8v4. The family is the gate's dtype
+        // axis, and the (K, V) codecs behind it are the ONE mapping in host_partial.h - so a host
+        // view whose pages are this family engages, and one that is not falls back with its own
+        // line instead of decoding E8 bytes through an int4 codec.
+        rk_kv_cpu_split_gate<G, Masked, RkHostKvDType::Rk4v4E8>(
+            p, partition, partial, Instance::Schedule::kKeyRows, stream);
         launch_causal_natural_merge<G, typename Instance::Merge, MultiBatch, Masked, false>(
             p, cache.valid_columns, partition, partial, stream);
     };
@@ -154,6 +160,10 @@ void rk_e8v2_grouped(const CausalAttentionOperands& p, Int8KvCacheView<Writable>
         launch_int8_kv_grouped_mma<G, typename Instance::Schedule, MultiBatch, Masked, Writable,
                                    Input, false, false, true, true, false, true>(
             p, cache, input, partition, partial, stream);
+        // P4.1: this family's V plane is the E8 cylinder, so its gate dtype is rk4v2-e8 - the
+        // mapping carries BOTH sides of the codec pair, which is what a V-axis family needs.
+        rk_kv_cpu_split_gate<G, Masked, RkHostKvDType::Rk4v2E8>(
+            p, partition, partial, Instance::Schedule::kKeyRows, stream);
         launch_causal_natural_merge<G, typename Instance::Merge, MultiBatch, Masked, false>(
             p, cache.valid_columns, partition, partial, stream);
     };
@@ -180,6 +190,9 @@ void rk_root_grouped(const CausalAttentionOperands& p, Int8KvCacheView<Writable>
                                    Input, false, true, false, false, true>(p, cache, input,
                                                                             partition, partial,
                                                                             stream);
+        // P4.1: 2-bit E8-cylinder K + int4 V (rk2v4-e8). Same seam, different dtype axis value.
+        rk_kv_cpu_split_gate<G, Masked, RkHostKvDType::Rk2v4E8>(
+            p, partition, partial, Instance::Schedule::kKeyRows, stream);
         launch_causal_natural_merge<G, typename Instance::Merge, MultiBatch, Masked, false>(
             p, cache.valid_columns, partition, partial, stream);
     };
@@ -384,6 +397,31 @@ void execute_parallel(const CausalAttentionOperands& p, Int8KvReadView cache,
 
 enum class RkVariant { Plain, PackedKOnly, E8Lattice, E8Root, E8LatticeV2 };
 
+// P4.1: the width 9..16 kernel takes no family parameter - one instance serves every rk layout,
+// selected by exactly the codec flags below (see the MMA launch for the parameter order). So the
+// gate's dtype axis is derived from those flags through the same (K, V) -> family mapping the
+// grouped paths name explicitly, and a family cannot be reported as one codec pair while the
+// instance decodes another.
+//
+// Worth stating because it was the gap: this segment (width 9..16) had NO gate at all, for ANY
+// family, so a prefill-shaped rk call could never reach the CPU leg. It still cannot engage - the
+// leg's pinned staging is 8 tokens wide (rk_host_partial_detail::kStageWidth) - but it now reaches
+// the gate and says so on its own fallback line instead of silently having no seam.
+template <bool PackedK, bool E8Lattice, bool E8Root, bool V8Root>
+[[nodiscard]] constexpr RkHostKvDType rk_parallel_host_dtype() {
+    if constexpr (V8Root) {
+        return RkHostKvDType::Rk4v2E8;   // int4 E8-lattice K + 2-bit E8-cylinder V
+    } else if constexpr (E8Root) {
+        return RkHostKvDType::Rk2v4E8;   // 2-bit E8-cylinder K + int4 V
+    } else if constexpr (E8Lattice) {
+        return RkHostKvDType::Rk4v4E8;   // int4 E8-lattice K + int4 V
+    } else if constexpr (PackedK) {
+        return RkHostKvDType::Rk4v4;     // int4 K + int4 V
+    } else {
+        return RkHostKvDType::Rk8v4;     // int8 K + int4 V
+    }
+}
+
 // rk parallel: same as execute_parallel but with PackedV=true (and optionally PackedK/E8Root).
 template <class G, int Tokens, bool PackedK = false, bool E8Lattice = false, bool E8Root = false,
           bool V8Root = false>
@@ -396,6 +434,8 @@ void rk_parallel_grouped(const CausalAttentionOperands& p, Int8KvReadView cache,
                                    CausalCachedInput, true, !V8Root, PackedK, E8Lattice, E8Root,
                                    V8Root>(
             p, cache, {}, partition, partial, stream);
+        rk_kv_cpu_split_gate<G, Masked, rk_parallel_host_dtype<PackedK, E8Lattice, E8Root, V8Root>()>(
+            p, partition, partial, Instance::Schedule::kKeyRows, stream);
         launch_causal_natural_merge<G, typename Instance::Merge, MultiBatch, Masked, false>(
             p, cache.valid_columns, partition, partial, stream);
     };
