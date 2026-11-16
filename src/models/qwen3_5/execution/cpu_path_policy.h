@@ -809,7 +809,18 @@ inline void note_cpu_half(int experts, int tokens, double span_ms, double comput
 // One route's price on the CPU half, for a caller that has no layer query to hand (decision 2's layer
 // form). The measured span when this box has one - it includes the tier fill, which a layer-level
 // comparison has to pay - and the recorded prior otherwise.
-[[nodiscard]] inline double cpu_route_us_estimate() noexcept {
+// One route's price on the CPU half, for a caller that has no layer query to hand (decision 2's layer
+// form). The measured span when this box has one - it includes the tier fill, which a layer-level
+// comparison has to pay - and the recorded prior otherwise. `count` asks for the size-scoped sample
+// when the box has timed that size (P3.1: legitimate now that both sides of every comparison carry the
+// same tier read; a rate fitted at one size is not the price of another).
+[[nodiscard]] inline double cpu_route_us_estimate(int count = 0) noexcept {
+    if (count > 0) {
+        if (const auto* sample = cpu_sample_for(count);
+            sample != nullptr && sample->span_us_per_expert > 0.0) {
+            return sample->span_us_per_expert;
+        }
+    }
     const auto& rate = cpu_half_rate();
     if (rate.span_us_per_expert > 0.0) { return rate.span_us_per_expert; }
     const double ms = param_bus().get(kCpuMoeExpertRow);
@@ -858,21 +869,31 @@ inline void note_cpu_half(int experts, int tokens, double span_ms, double comput
     }
     auto& rate         = cpu_half_rate();
     out.cpu_gflops     = rate.cpu_gflops > 0.0 ? rate.cpu_gflops : kCpuGflopsCalibrated;
-    // The two sides are MARGINAL, and both pay one trip through the tier's entry image, so the read
-    // is charged to both and cancels - what is left is the comparison the port is built on: one PCIe
-    // trip versus one CPU compute. (An earlier draft charged the read to the CPU alone, which made
-    // every comparison read "the copy is cheaper" as soon as the tier went cold - a modelling error,
-    // not a measurement: the pool reads the same bytes to fill the same seat.)
+    // The two sides are MARGINAL, and BOTH pay one trip through the tier's entry image: the CPU half
+    // fills the entry it computes over, and the pool reads the same bytes to fill the seat it copies
+    // into. So the read is charged to both and cancels in the difference, which is what makes the
+    // comparison the port is built on: one PCIe trip versus one CPU compute.
+    //
+    // P3.1: the copy side used to drop that read whenever an upload measurement existed (the 3x form
+    // below), while the CPU side's span - the number it is divided by - measures the fill from end to
+    // end. Two scopes, one comparison: on a cold tier the span read 8186 us/route while the copy side
+    // read 12.6 us/route, and the crossing m* = readback/(span - copy) moved with the tier's
+    // temperature instead of with the work. Both sides now carry the same read, from the same
+    // measurement (`cold_read_us`, the uploader's own observed per-expert read scaled by the cold
+    // share), so what is left in the difference is compute - transfer, which is a property of the box.
     const double link_us = query.bytes_per_expert / (query.link_gbps * 1e9) * 1e6;
     const double cold_share =
         query.tier_warm < 0.0 ? 1.0 : std::max(0.0, 1.0 - query.tier_warm);
     const double read_us = cold_share * query.cold_read_us;
-    // The copy side: what one route costs over the link, plus the slack the measured upload shows
-    // above the bare transfer. With no measurement the read the pool also pays is priced in, so the
-    // number stays comparable instead of silently dropping the I/O.
-    const double gpu_us  = query.upload_us_per_entry > 0.0
-                               ? std::max(link_us, 3.0 * query.upload_us_per_entry)
-                               : link_us + read_us;
+    // The copy side: the transfer, the read the fill needs, and the slack a measured upload shows
+    // above the bare transfer. The second form is a MAX and not a sum because the measured upload may
+    // already contain the read (it timed a real copy out of whatever the tier held); adding the model
+    // term on top of it would charge the same bytes twice, and the max keeps the estimate honest on
+    // both regimes - cold (the model term dominates) and warm (the measured copy dominates).
+    const double gpu_us  = std::max(link_us + read_us,
+                                    query.upload_us_per_entry > 0.0
+                                        ? 3.0 * query.upload_us_per_entry
+                                        : 0.0);
     // The compute side, priced for the shape this layer actually runs (decision 4). The tier read is
     // paid once per expert and serves every token of the layer, the arithmetic repeats per token, so
     // the read is charged per token as read/T while the compute is charged as T * per-token. Without
@@ -900,11 +921,20 @@ inline void note_cpu_half(int experts, int tokens, double span_ms, double comput
     out.budget_us = budget_us;
     // How many routes fit: the CPU half's own measured span per route when this box has timed one -
     // that span includes the tier fill, which is serial on this thread and is precisely what makes
-    // the half the critical path when it grows past the copy it is meant to overlap. Kept as the
-    // best-observed span rather than the per-size sample below: the size-scoped rate was tried and
-    // withdrawn, because the span it measures charges the tier read to the CPU side only while the
-    // copy side cancels that same read - two scopes, one comparison.
-    const double per_route_us = rate.span_us_per_expert > 0.0 ? rate.span_us_per_expert : cpu_us;
+    // the half the critical path when it grows past the copy it is meant to overlap.
+    //
+    // P3.1: the SIZE-SCOPED rate is used again, which is why the note that used to stand here is gone.
+    // It was withdrawn because the span it measures charged the tier read to the CPU side while the
+    // copy side cancelled that same read - so a size whose fill was cold was divided by a cold span
+    // and compared against a warm copy. Both sides now carry the read (see gpu_us above), so the
+    // per-size sample is the right divisor and the fallback is the best-observed span, not a rate
+    // fitted at another size.
+    const auto* scoped_sample = cpu_sample_for(query.routes);
+    const double scoped_us    = scoped_sample != nullptr ? scoped_sample->span_us_per_expert : -1.0;
+    const double per_route_us = scoped_us > 0.0
+                                    ? scoped_us
+                                    : (rate.span_us_per_expert > 0.0 ? rate.span_us_per_expert
+                                                                     : cpu_us);
     int count = per_route_us > 0.0 ? static_cast<int>(budget_us / per_route_us) : 0;
     // Queue depth, both sides, from the previous layer of this same stream. An upload nobody has
     // timed yet (-1/0 ms) is not an idle link: the trim only fires on a measurement.

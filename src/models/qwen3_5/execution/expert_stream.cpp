@@ -3743,7 +3743,10 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
                 CpuLayerLegQuery leg;
                 leg.misses  = static_cast<int>(misses.size());
                 leg.copy_us = control.signals.upload_us_per_expert;
-                leg.cpu_us  = cpu_route_us_estimate();
+                // P3.1: the same size-scoped rate the budget's divisor uses. The crossing this feeds
+                // is readback/(cpu - copy), so a span measured at another size moves m* by that ratio
+                // alone - which is how a 12-miss threshold landed on layers that only ever had 8.
+                leg.cpu_us  = cpu_route_us_estimate(leg.misses);
                 const auto verdict = decide_cpu_layer_leg(leg);
                 cpu_path_ledger().note_layer_leg(verdict, leg.misses);
                 leg_miss  = leg.misses;
