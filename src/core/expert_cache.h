@@ -159,6 +159,11 @@ void prepare(std::span<const ExpertCacheKey> required, cudaStream_t stream = nul
                                        std::vector<ExpertCacheKey>& placed);
     [[nodiscard]] bool prefetch_slot(std::uint32_t slot) const noexcept;
     [[nodiscard]] std::uint32_t prefetch_slots_per_bank() const noexcept;
+    // The pool's own geometry, for a caller that has to clamp a region against the real window
+    // instead of a guessed one: how many banks the cache was built with, and the widest live slot
+    // run any of them backs. Read-only.
+    [[nodiscard]] std::uint32_t bank_count() const noexcept;
+    [[nodiscard]] std::uint32_t slots_per_bank() const noexcept;
 
     // port (sm_89): the pinned RAM tier the host half keeps its working set in. When set, an upload
     // of an expert that tier already holds copies from locked memory instead of the pageable artifact

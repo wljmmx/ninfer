@@ -1819,6 +1819,16 @@ std::uint64_t ExpertCache::used_bytes() const noexcept {
 }
 std::uint64_t ExpertCache::capacity_bytes() const noexcept { return impl_->live_bytes(); }
 std::uint64_t ExpertCache::slot_bytes() const { return impl_->slot_bytes; }
+
+std::uint32_t ExpertCache::bank_count() const noexcept {
+    return static_cast<std::uint32_t>(impl_->banks.size());
+}
+
+std::uint32_t ExpertCache::slots_per_bank() const noexcept {
+    std::uint32_t widest = 0;
+    for (const auto live : impl_->bank_slot_live) { widest = std::max(widest, live); }
+    return widest;
+}
 std::uint64_t ExpertCache::resize(std::uint64_t target_bytes) { return impl_->resize(target_bytes); }
 std::uint64_t ExpertCache::window_origin(std::uint32_t bank) const {
     // port (sm_89): the pool is a flat slot space, so a bank's plane bases are already absolute and
