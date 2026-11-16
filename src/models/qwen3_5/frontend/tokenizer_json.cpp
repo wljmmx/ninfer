@@ -52,7 +52,15 @@ public:
     }
 
     bool boolean(bool value) override {
-        if (added_element()) { record_added_bool(value); }
+        if (added_element()) { record_added_bool(value); return true; }
+        if (model_member("ignore_merges")) {
+            out_.has_ignore_merges = true;
+            out_.ignore_merges     = value;
+        } else if (under_path(path_, {"", "pre_tokenizer"}) &&
+                   pending_key_ == "add_prefix_space") {
+            out_.has_add_prefix_space = true;
+            out_.add_prefix_space     = value;
+        }
         return true;
     }
 
@@ -86,6 +94,10 @@ public:
             out_.post_processor_type = value;
         } else if (under_path(path_, {"", "pre_tokenizer"}) && pending_key_ == "type") {
             out_.pre_tokenizer_types.push_back(value);
+        } else if (under_path(path_, {"", "pre_tokenizer"}) && pending_key_ == "Regex") {
+            // A Split preconditioner's pattern object: {"Regex": "..."}.
+            out_.has_split_pattern = true;
+            out_.split_pattern     = value;
         } else if (merge_element()) {
             MergeEntry entry;
             entry.pair_form = false;
@@ -180,9 +192,12 @@ private:
         return path_.size() == 4 && path_[0].empty() && path_[1] == "model" &&
                path_[2] == "merges" && path_[3].empty();
     }
+    // A merge spelled as ["left", "right"]: the strings inside that inner array carry the same
+    // path as the array itself (SAX pushes the key on start_array, not on each string), so this
+    // predicate is the container's depth, not one deeper.
     [[nodiscard]] bool merge_pair_element() const {
-        return path_.size() == 5 && path_[0].empty() && path_[1] == "model" &&
-               path_[2] == "merges" && path_[3].empty() && path_[4].empty();
+        return path_.size() == 4 && path_[0].empty() && path_[1] == "model" &&
+               path_[2] == "merges" && path_[3].empty();
     }
 
     bool leave() {

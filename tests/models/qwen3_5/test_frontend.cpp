@@ -501,12 +501,16 @@ int test_declared_frontend_semantics() {
         auto changed                                = tokenizer;
         changed[nlohmann::json::json_pointer(path)] = value;
         source.tokenizer_json                       = changed.dump();
+        // The path belongs in the message: six mutations share one assertion, and a bare failure
+        // does not say which declaration was accepted.
+        const std::string message =
+            std::string("unsupported declared tokenizer algorithm was accepted: ") + path;
         failures +=
             check(throws_invalid_argument([&] {
                       (void)fi::Tokenizer({source.tokenizer_json, source.tokenizer_config_json,
                                            source.generation_config_json});
                   }),
-                  "unsupported declared tokenizer algorithm was accepted");
+                  message.c_str());
     }
     source.tokenizer_json = tokenizer.dump();
     for (auto member : {&FrontendResources::preprocessor_config_json,
@@ -2677,6 +2681,7 @@ int test_media_preparation_cancellation() {
 } // namespace
 
 int main() {
+  try {
     const FrontendResources owned = resources();
     const Frontend frontend       = make_frontend(owned);
     int failures                  = 0;
@@ -2731,4 +2736,12 @@ int main() {
     failures += test_invalid_media_classification();
     failures += test_disabled_vision();
     return failures == 0 ? 0 : 1;
+  } catch (const std::exception& ex) {
+    // An uncaught throw used to surface as 0xC0000409 with no text; name it instead.
+    std::fprintf(stderr, "uncaught exception: %s\n", ex.what());
+    return 2;
+  } catch (...) {
+    std::fprintf(stderr, "uncaught non-std exception\n");
+    return 3;
+  }
 }

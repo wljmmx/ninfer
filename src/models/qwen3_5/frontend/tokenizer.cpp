@@ -30,10 +30,10 @@ constexpr std::int64_t kMaxTokenId = 1'000'000;
 constexpr std::string_view kQwenSplitPattern =
     R"qwen((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)qwen";
 
-// The pipeline description is checked for its shape only: the field-level comparison the DOM
-// version performed (Split's regex, ByteLevel's flags) is not worth carrying field by field
-// through the SAX reader for an artifact whose tokenizer is fixed. A missing or foreign pipeline
-// still fails, because the required component types have to be present.
+// The pipeline description is checked for its shape and for the two fields that change token
+// boundaries: Split's regex and ByteLevel's add_prefix_space. Other flags stay unmodelled (they do
+// not move boundaries for this artifact), but a missing or foreign pipeline still fails because the
+// required component types have to be present.
 void validate_pipeline(const detail::TokenizerJson& document) {
     const auto require = [](bool valid, const char* field) {
         if (!valid) {
@@ -54,6 +54,13 @@ void validate_pipeline(const detail::TokenizerJson& document) {
         require(sequence, "pre_tokenizer");
         require(split, "pre_tokenizer.Split");
         require(bytes, "pre_tokenizer.ByteLevel");
+    }
+    if (document.has_split_pattern) {
+        require(std::string_view(document.split_pattern) == kQwenSplitPattern,
+                "pre_tokenizer.Split.pattern");
+    }
+    if (document.has_add_prefix_space) {
+        require(!document.add_prefix_space, "pre_tokenizer.add_prefix_space");
     }
     if (document.has_decoder) { require(document.decoder_type == "ByteLevel", "decoder"); }
     if (document.has_post_processor) {

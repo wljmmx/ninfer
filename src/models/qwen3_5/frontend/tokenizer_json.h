@@ -61,6 +61,11 @@ struct TokenizerJson {
     std::string normalizer_type;
     bool has_pre_tokenizer = false;
     std::vector<std::string> pre_tokenizer_types;
+    // The Split pattern decides token boundaries; a different regex is a different tokenizer.
+    bool has_split_pattern = false;
+    std::string split_pattern;
+    bool has_add_prefix_space = false;
+    bool add_prefix_space     = false;
     bool has_decoder = false;
     std::string decoder_type;
     bool has_post_processor = false;
