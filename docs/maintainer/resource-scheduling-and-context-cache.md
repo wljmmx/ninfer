@@ -485,3 +485,21 @@ Sequence、checkpoint 和 pending handle 的 owner/generation 检查防止迟到
 - [EngineCore](../../src/runtime/engine/engine_core.h)：事务编排、生命周期与发布。
 - [Program](../../src/models/qwen3_5/program/program.h)：模型恢复与资源操作合同。
 - [Native 源码组织](../../src/models/qwen3_5/program_sources.cmake)：规划、存储、绑定和各事务实现。
+
+### 11.x KV 分部的 CPU 腿：现在的成本口径
+
+`NINFER_KV_CPU_PARTITION=<split>` 现在能真正跑通（见 [Paged KV](paged-kv-cache.md) 第 14 节），
+但要按它的口径读成本：
+
+- **这段页的归属是测试性的**。生产者把页 D2H 到 Host 再算，所以这一步的"copy-in"并没有被省掉，
+  只是从"拷进来给 GPU 算"变成"拷进来给 CPU 算"。因此这条腿当前**必然净亏**，它的数字只能用来判断
+  "算得对不对"，不能用来判断"该不该"。
+- 每次镜像调用的字节量 = 被引用的物理页数 × 该层页记录负载（rk4v4 / D256 / 4 KV heads 为
+  69,632 B/页），外加上一次 Q tile（`width × q_heads × 256 × 2 B`）与行 block table；宿主侧还有一次
+  同量的重排复制，并需要一次流同步（CPU 要读这些字节）。
+- 观测点：`[kv-cpu] split N -> CPU partial (...)`（首次 engage，带 dtype/头数/width/window/active/
+  range/key_tile）与 `[kv-cpu] partial check ...`（`NINFER_KV_CPU_PARTIAL_CHECK=1` 时把同一 split 的
+  GPU 分部读回逐元素比对）。面板的 `[ctl] cpu: kv: cpu-partial=N/M` 仍然只由策略记账驱动——决策 1
+  没有接线（刀 4 未做），所以那一行仍是"没有生产者"，**不是**实测的 0。
+- 与调度层的关系：这条腿只影响单个注意力调用内的一段 split，不改变 reservation、checkpoint、
+  release 或 Host extent 的成员关系；它读的是 Device 页的一份副本，页生命周期不变。

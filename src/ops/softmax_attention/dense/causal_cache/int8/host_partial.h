@@ -41,11 +41,14 @@
 #include "ops/softmax_attention/common/causal_partition.h"
 #include "ops/softmax_attention/cpu/partial.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
+#include <vector>
 
 namespace ninfer::ops::detail {
 
@@ -137,6 +140,14 @@ enum Fallback : unsigned {
     kCapacity,
     kSplitRange,
     kCapture,
+    // A view that names no page planes or no block table would fault inside the operator instead
+    // of falling back, so it is refused here like every other precondition.
+    kNoPages,
+    // The call's token tile is wider than the pinned staging this seam was built for.
+    kWidth,
+    // The producer's pages are authoritative only below `page_filled_keys`, and this split's key
+    // range reaches past that (the fused append writes the tokens being scored).
+    kAppendLag,
     kFallbackCount
 };
 
@@ -183,6 +194,81 @@ inline Staging& staging() {
         return s;
     }();
     return value;
+}
+
+// NINFER_KV_CPU_PARTIAL_CHECK=1: report the CPU partial's deviation from the GPU partial the grouped
+// MMA just wrote for the SAME split over the SAME pages. This is the one moment both values exist:
+// the CPU leg overwrites the slot, so without this the only observable is the final output. The
+// comparison is the operator's own contract audited directly (acc / maximum / sum, per element),
+// measured rather than inferred from a PPL or a token match.
+inline bool partial_check_enabled() {
+    static const bool on = [] {
+        const char* value = std::getenv("NINFER_KV_CPU_PARTIAL_CHECK");
+        return value != nullptr && *value != '\0' && std::strtol(value, nullptr, 10) != 0;
+    }();
+    return on;
+}
+
+template <int QueryHeads>
+inline void compare_with_device(int width, int split, softmax_cpu::RkPartialTokenRange range,
+                                CausalPartialView partial, const Staging& st,
+                                cudaStream_t stream) {
+    static bool reported = false;
+    if (reported) { return; }
+    reported = true;
+    const std::size_t acc_n  = static_cast<std::size_t>(256) * QueryHeads * width;
+    const std::size_t stat_n = static_cast<std::size_t>(QueryHeads) * width;
+    const std::int64_t slot_acc  = static_cast<std::int64_t>(acc_n) * split;
+    const std::int64_t slot_stat = static_cast<std::int64_t>(stat_n) * split;
+    std::vector<float> gpu_acc(acc_n), gpu_max(stat_n), gpu_sum(stat_n);
+    if (cudaMemcpyAsync(gpu_acc.data(), partial.acc + slot_acc, acc_n * sizeof(float),
+                        cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+        cudaMemcpyAsync(gpu_max.data(), partial.maximum + slot_stat, stat_n * sizeof(float),
+                        cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+        cudaMemcpyAsync(gpu_sum.data(), partial.sum + slot_stat, stat_n * sizeof(float),
+                        cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+        cudaStreamSynchronize(stream) != cudaSuccess) {
+        (void)cudaGetLastError();
+        std::fprintf(stderr, "[kv-cpu] partial check: the GPU slot could not be read back\n");
+        std::fflush(stderr);
+        return;
+    }
+    double acc_max_abs = 0.0, acc_max_rel = 0.0, acc_magnitude = 0.0;
+    std::size_t over = 0;
+    for (std::size_t i = 0; i < acc_n; ++i) {
+        const double a = st.acc[i];
+        const double b = gpu_acc[i];
+        const double d = std::fabs(a - b);
+        const double scale = std::max(std::fabs(a), std::fabs(b));
+        acc_magnitude = std::max(acc_magnitude, scale);
+        acc_max_abs   = std::max(acc_max_abs, d);
+        if (scale > 0.0) { acc_max_rel = std::max(acc_max_rel, d / scale); }
+        if (scale > 0.0 && d / scale > 1e-5) { ++over; }
+    }
+    // The operator's own bar (partial.h): 1e-5 relative, OR inside one FP16 quantum of the
+    // accumulator's magnitude (2^-11), because acc is built from FP16-rounded p and V.
+    const double quantum = std::ldexp(1.0, -11) * acc_magnitude;
+    std::size_t outside = 0;
+    for (std::size_t i = 0; i < acc_n; ++i) {
+        const double a = st.acc[i];
+        const double b = gpu_acc[i];
+        const double d = std::fabs(a - b);
+        const double scale = std::max(std::fabs(a), std::fabs(b));
+        if (d > quantum && (scale == 0.0 || d / scale > 1e-5)) { ++outside; }
+    }
+    double stat_max_abs[2] = {0.0, 0.0};
+    for (std::size_t i = 0; i < stat_n; ++i) {
+        stat_max_abs[0] = std::max(stat_max_abs[0], std::fabs(static_cast<double>(st.maximum[i]) - gpu_max[i]));
+        stat_max_abs[1] = std::max(stat_max_abs[1], std::fabs(static_cast<double>(st.sum[i]) - gpu_sum[i]));
+    }
+    std::fprintf(stderr,
+                 "[kv-cpu] partial check split %d: range=[%d,%d) width=%d | "
+                 "acc max|d|=%.3e max|acc|=%.3e (quantum %.3e) rel=%.3e | "
+                 "over 1e-5: %zu/%zu | outside the quantum bar: %zu | "
+                 "maximum max|d|=%.3e | sum max|d|=%.3e\n",
+                 split, range.begin, range.end, width, acc_max_abs, acc_magnitude, quantum,
+                 acc_max_rel, over, acc_n, outside, stat_max_abs[0], stat_max_abs[1]);
+    std::fflush(stderr);
 }
 
 inline void log_engage(const RkHostPartialView& view, int split, int window, int active,
@@ -251,6 +337,11 @@ void rk_host_partial_stage(const RkHostPartialView& view, float scale, int width
 
     const auto slot_acc  = static_cast<std::int64_t>(256) * QueryHeads * width * split;
     const auto slot_stat = static_cast<std::int64_t>(QueryHeads) * width * split;
+    // Before the overwrite: the GPU's own value for this split is still in the slot.
+    if (rk_host_partial_detail::partial_check_enabled()) {
+        rk_host_partial_detail::compare_with_device<QueryHeads>(width, split, range, partial, st,
+                                                               stream);
+    }
     const std::size_t acc_bytes =
         static_cast<std::size_t>(256) * QueryHeads * width * sizeof(float);
     const std::size_t stat_bytes = static_cast<std::size_t>(QueryHeads) * width * sizeof(float);
@@ -284,12 +375,26 @@ void rk_kv_cpu_split_gate(const CausalAttentionOperands& p, CausalKvPartition pa
         log_fallback(detail::kNoView, "no host view installed");
         return;
     }
+    // Before anything dereferences the view: a view that names no planes or no block table would
+    // fault inside the operator (partial.h's own operand check is an exception, but on this path
+    // that is a crash inside a CUDA launch sequence, not a fallback).
+    if (view->pages.k_codes == nullptr || view->pages.v_codes == nullptr ||
+        view->pages.k_scales == nullptr || view->pages.v_scales == nullptr ||
+        view->pages.block_table == nullptr || view->pages.kv_heads <= 0 ||
+        view->query_heads <= 0) {
+        log_fallback(detail::kNoPages, "the host view names no page planes or block table");
+        return;
+    }
     if constexpr (Masked) {
         log_fallback(detail::kMasked, "masked call (valid_columns) is out of the seam's v1 scope");
         return;
     }
     if (p.batch != 1) {
         log_fallback(detail::kMultiBatch, "batch > 1 is out of the seam's v1 scope");
+        return;
+    }
+    if (p.width > detail::kStageWidth) {
+        log_fallback(detail::kWidth, "the token tile is wider than the pinned staging");
         return;
     }
     if (view->query_heads != G::QHeads || view->pages.kv_heads != G::KVHeads) {
@@ -330,6 +435,14 @@ void rk_kv_cpu_split_gate(const CausalAttentionOperands& p, CausalKvPartition pa
     }
 
     const auto range = softmax_cpu::rk_partial_split_range(window, split, active, key_tile);
+    // The producer states how far its pages are authoritative (see page_filled_keys): a split whose
+    // range reaches into the tokens this call is still appending would be scored against stale
+    // bytes, which looks like a numeric bug rather than the logical one it is.
+    if (view->page_filled_keys > 0 && range.end > view->page_filled_keys) {
+        log_fallback(detail::kAppendLag,
+                     "the split's range reaches past the host pages' append frontier");
+        return;
+    }
     detail::log_engage(*view, split, window, active, range, key_tile, width);
     ++detail::engage_slot();
     rk_host_partial_stage<G::QHeads, G::KVHeads, PackedK>(*view, p.scale, width, split, range,

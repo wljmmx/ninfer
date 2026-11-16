@@ -756,3 +756,93 @@ Exact model state 和 backend mathematics 见
 [Qwen3.5 model](qwen3_5-model.md)与 [DFlash](dflash.md)；persistent KV codec 和 causal consumer
 numerical contract 由上表中的 growing-cache Ops 定义。路径用于定位当前实现，不把文件或类名本身提升为
 外部接口。
+
+---
+
+## 14. Host 页镜像与 split 归属（CPU 分部腿）
+
+`rk_kv_cpu_split_gate`（`src/ops/softmax_attention/dense/causal_cache/int8/host_partial.h`）一直能在
+int8 注意力调用之间把某个 split 的分部交给 CPU，但它第一道前置条件（已安装的 host view）此前没有任何
+生产者，因此每次都在 `kNoView` 回落。本节记录这条腿现在的实现口径与实测边界。
+
+### 14.1 两套寻址及其唯一差异
+
+| 侧 | 布局 |
+|---|---|
+| CPU 分部算子（`src/ops/softmax_attention/cpu/partial.h`） | 每个通道一段连续 `[page][head][token][leading]`，`plane_offset()` 的页步长 = `leading × page_tokens × kv_heads` |
+| Host 页记录（`src/core/host_kv_arena.h`） | 每页一条记录 `[page][plane][head][token][leading]`，页步长 = `page_stride`（含 plane 间 256 B 对齐） |
+
+两者在**页内**一致，在**跨页**不一致；所以一个页集合不能以基址偏移交给算子，必须重排成算子的四个平面块。
+重排即镜像，代价是显式的：每页 `layout.page_stride` 的负载（rk4v4 / D256 / 4 KV heads 为 69,632 B），
+每次镜像调用按页计一次。
+
+### 14.2 镜像的推导口径（无固定索引）
+
+`plan_rk_host_kv_planes` 不假定"第 0 个平面是 K codes"。它把五个 rk 家族的
+`paged_kv_storage_layout()`（rk4v4、rk8v4、rk4v4-e8、rk2v4-e8、rk4v2-e8）逐层与布局的 plane dtype、
+`leading_extent`、`head_payload_bytes`/`page_payload_bytes` 比对；命中后才命名 K codes / V codes /
+K scales / V scales，并给出编解码器身份。匹配不上的布局被拒绝（返回 false），而不是按索引误读。
+
+镜像头文件是 `src/ops/softmax_attention/cpu/host_pages.h`：`rk_host_mirror_layout`（平面块尺寸与总字节）、
+`rk_host_mirror_pages`（页重排，逐字节复制、不改编码）、`rk_host_mirror_block_table`（逻辑页 → 镜像内
+页号，缺页为 -1，越界抛出而不是钳到别的页）、`rk_host_partial_pages`（算子的四个基址）。
+
+### 14.3 引擎侧生产者与两条合同
+
+`src/models/qwen3_5/execution/kv_host_split_mirror.h` 在 `TextContext::attn_mix` 的注意力调用处安装视图
+（`rk_host_partial_install`，thread-local 通道），由 `NINFER_KV_CPU_PARTITION=<split>` 或镜像自检
+`NINFER_KV_CPU_MIRROR_CHECK=1` 激活；未激活时只花一次缓存的 bool 判断。
+
+- **归属是测试性的，不是策略性的**：引擎的 Host KV 层目前只放"降级后没有注意力路径回读"的 extent，
+  因此本生产者是**把页拷到 Host**（D2H）。这正是决策 1 要避开的那笔复制，所以这条腿的定位是
+  "能否算对、能否跑通"，不是收益。
+- **append 滞后必须声明**：生产 decode 调用把当前 token 的 append 融进打分同一个 kernel，所以调用边界
+  处取到的镜像不含最新 token 的编码。`RkHostPartialView::page_filled_keys` 声明"镜像页对多少前缀位置
+  权威"，gate 对 `range.end > page_filled_keys` 的 split 回落到 GPU（`kAppendLag`）。真实宿主层拥有
+  这些页时置 0（无上界）。
+- **两条注意力调用形态**：decode 走 `attn_mix` 的 batch 形态（`ordinary_decode_batch` 绑 width=1、无
+  valid columns），因此安装覆盖整个调用而不只是非 batch 分支。
+
+gate 同时补上 `kNoPages`（四个平面或 block table 为空即回落，而不是在算子内崩溃）与 `kWidth`
+（token tile 超过固定 staging）两条兜底。
+
+### 14.4 实测（RTX 4090 / Win11 / CUDA 13.5，qwen3_8_27b_v3，rk4v4，`--no-cuda-graph`）
+
+`NINFER_QSA_FORCE_FULL=1` 让 indexed 层走这条 dense 臂；`NINFER_KV_CPU_PARTIAL_CHECK=1` 在 CPU 覆盖
+该 split 之前把 GPU 刚写好的同一 split 分部读回，逐元素比对（acc / maximum / sum）。
+
+```
+[kv-cpu] split 0 -> CPU partial (dtype=rk4v4 q_heads=24 kv_heads=4 width=1 window=65 active=2
+        range=[0,32) key_tile=32)
+[kv-cpu] partial check split 0: range=[0,32) width=1 | acc max|d|=3.815e-06 max|acc|=2.364e+01
+        (quantum 1.154e-02) rel=8.993e-05 | over 1e-5: 8/6144 | outside the quantum bar: 0
+        | maximum max|d|=9.537e-07 | sum max|d|=7.629e-06
+```
+
+同一提示下 32 token 贪心解码（`--print-token-ids`）两臂逐 token 相同（32/32）。
+
+2 列 tile（prefill 尾部 batch 形态、`window=213 active=4`）的 split 1：
+
+```
+[kv-cpu] split 1 -> CPU partial (dtype=rk4v4 q_heads=24 kv_heads=4 width=2 window=213 active=4
+        range=[32,96) key_tile=32)
+[kv-cpu] partial check split 1: acc max|d|=7.277e-04 max|acc|=2.945e+01 (quantum 1.438e-02)
+        rel=4.924e-02 | over 1e-5: 249/12288 | outside the quantum bar: 0
+        | maximum max|d|=9.537e-07 | sum max|d|=3.815e-06
+```
+
+偏差类判断：maximum 与 sum 差 ~1e-7 相对（分数路径一致），acc 的最大差 7.3e-4 相对规模 29 为 2.5e-5，
+**全部落在 2^-11 一个 FP16 量子内**（outside-the-quantum = 0）；超 1e-5 相对的 249 个元素 ≈ 一整行
+（一个 token×head 的 256 个维度），即"某个 key 的 p 跨过一个 FP16 舍入边界"这一类，与
+`cpu/partial.h` 头部自述的偏差类一致。同一提示的贪心解码在该配置下第 3 个 token 起分叉——近 tie 被这一
+量子级移动翻转；这是该偏差类的可观测后果，不是镜像错误（max/sum 与页内容一致，自检也一致）。
+
+### 14.5 未闭环
+
+- 镜像页的归属仍是测试性的：真正的宿主驻留页（demote 后由注意力直接回读）未接入，因此决策 1 的
+  "避免 copy-in"侧仍无输入；`decide_cpu_kv_split` 仍无调用者（刀 4 未做，见下）。
+- 最后一个 split 永远被 `kAppendLag` 排除（它含当前 token）。真实宿主层把 append 交回宿主侧后，这条
+  限制自然消失。
+- E8 家族（rk4v4-e8 / rk2v4-e8 / rk4v2-e8）能被镜像识别，但 `RkHostKvDType` 只有 rk4v4/rk8v4 两个
+  取值，gate 的 dtype 轴无法命名它们，故仍留在 GPU。算子本身支持这些编解码器
+  （`RkKCodec::E8Lattice` 等），缺的是视图的 dtype 轴扩展。
