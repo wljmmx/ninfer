@@ -791,7 +791,41 @@ bool ExpertStream::fully_resident() const noexcept {
     return cache_ != nullptr && cache_->resident_capacity(bank_) >= count_;
 }
 
+// S1: stage each bank's expert->slot table, re-exporting only when step_generation(bank) moved. This
+// is the mirror the id->slot kernel (S2) will read; the generation is the pool's own, so a placement
+// change is noticed without inventing a second notion of "the table changed".
+void ExpertStream::sync_slot_mirror() {
+    if (cache_ == nullptr) { return; }
+    const auto banks = cache_->bank_count();
+    if (slot_mirror_gen_.size() != banks) {
+        slot_mirror_gen_.assign(banks, 0);
+        slot_mirror_host_.assign(banks, {});
+        mirror_entries_ = 0;
+    }
+    for (std::uint32_t bank = 0; bank < banks; ++bank) {
+        const auto generation = cache_->step_generation(bank);
+        if (slot_mirror_gen_[bank] == generation && !slot_mirror_host_[bank].empty()) { continue; }
+        auto& staged = slot_mirror_host_[bank];
+        staged.assign(4096, 0);   // probe buffer: the real count comes back from the export
+        const auto entries = cache_->export_slots(bank, staged);
+        staged.resize(entries);
+        slot_mirror_gen_[bank] = generation;
+        ++mirror_uploads_;
+        mirror_entries_ += entries;
+    }
+}
+
 void ExpertStream::gh1_report() {
+    sync_slot_mirror();
+    {
+        static std::uint64_t reported = 0;
+        if (++reported % 8 == 0) {
+            std::fprintf(stderr, "[pf-mirror] banks=%u entries=%zu uploads=%llu\n",
+                         cache_ != nullptr ? cache_->bank_count() : 0U, mirror_entries_,
+                         static_cast<unsigned long long>(mirror_uploads_));
+            std::fflush(stderr);
+        }
+    }
     // The prediction region's own hit rate. `[pf]`'s `hit=` is the WARM TIER's, a different question:
     // this one is "of the experts this layer routed to, how many did the region already hold", which
     // is the only number that says whether the slots it took are earning their keep. The consumer is

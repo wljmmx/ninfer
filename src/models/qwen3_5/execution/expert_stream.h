@@ -744,6 +744,8 @@ private:
     std::uint32_t last_host_routes_ = 0;
     // Prints the GH1 panel; one place so the pinned fast path and the normal path cannot drift.
     void gh1_report();
+    // Stage the slot-table mirror for every bank whose placement generation moved (S1).
+    void sync_slot_mirror();
     std::uint64_t entered_steps_ = 0;
     // port (sm_26): whether this bank's resident set has ever been built. A prefill is not allowed to
     // choose the set, but the first call has to, or a cold start would route everything to the host
@@ -771,6 +773,14 @@ private:
     Coverage coverage_{};
     std::uint64_t residency_routes_ = 0;
     std::uint64_t residency_inside_ = 0;
+    // S1: the expert->slot table mirror, staged per bank and versioned by step_generation(bank) -
+    // the counter the pool already bumps whenever a bank's set changes. Re-export happens only when
+    // that generation moves, so the mirror cannot map through a stale table and does not re-upload
+    // every step. The device pointer lands with the id->slot kernel (S2), which is what reads it.
+    std::vector<std::uint64_t> slot_mirror_gen_;
+    std::vector<std::vector<std::uint32_t>> slot_mirror_host_;
+    std::uint64_t mirror_uploads_ = 0;
+    std::size_t   mirror_entries_ = 0;
     StepCost last_cost_{};
     // Misses per step, histogram 0..32, decayed so a new workload is not held hostage. One
     // sample per step: the spill region holds every lane's miss at once (8 lanes x 8 experts).
