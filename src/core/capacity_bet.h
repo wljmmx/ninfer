@@ -1,0 +1,320 @@
+#pragma once
+
+// P7.1 (v10 8.4, V10-55): a capacity refusal is a bet, not a verdict.
+//
+// The 24 GB card has three consumers that compete for the same bytes when a run is tight: the
+// expert pool, the KV pages every decode step reads, and the Host leg that can take either one's
+// overflow. Today a run that cannot seat both ends dies at `attach_expert_cache()` with "expert
+// cache holds less than one expert window", and a KV ask that misses its budget simply throws.
+// Neither answer is the useful one: the question is WHICH consumer gets the Device, and that is a
+// controller decision.
+//
+// The three bets (V10-55's A/B/C):
+//   A  ExpertResident  the pool takes what it asks; KV takes the remainder (possibly zero, i.e. the
+//                      whole KV leg moves to Host). Right when residency is what the run is short of.
+//   B  KvFirst         the KV target is met first; the pool takes the remainder (it may then hold a
+//                      partial layer, which the Host tier already covers). Right when locality is.
+//   C  BothGive        neither gets its whole ask: the bytes above a floor are shared in proportion
+//                      to the two remaining asks. Both sides miss a little; neither is starved.
+// `choice` names the PRIORITY that was applied, not the shape that fell out. When both asks fit,
+// every mode returns A (experts fully resident) with `bet_exercised == false`, because there is no
+// bet to take - that case is reported, not silently relabelled.
+//
+// The three modes are three different rules, not one formula renamed:
+//   performance  experts first: pool = min(ask, budget); KV takes what is left.
+//   stable       KV first:      kv = min(ask, budget - one slot); pool takes what is left.
+//                (one slot, not one window: a partial pool is legal here - the Host tier covers the
+//                rest of the layer, and refusing it would turn a workable run into a startup fault)
+//   auto         KV first, gated by a coverage floor: KV gets its target only if the pool would
+//                still reach `expert_usable_ratio` of its window; otherwise the bytes above that
+//                floor are shared in proportion to the two remaining asks. Measured evidence
+//                outranks the structural rule and only when it exists: a high miss rate ranks
+//                residency first (the performance rule), a high p99 ranks KV first (the stable one).
+//
+// Every rule is a function of the budget and the fixed asks, and every rule is monotone in the
+// budget: a bigger Device never shrinks either side. That is a property of the arithmetic, not of
+// the caller - `tests/runtime/test_capacity_bet.cpp` sweeps it. A mode CHANGE may move bytes,
+// because that is what changing the bet means.
+//
+// Thresholds. `kDefaultCapacityBetThresholds` is a DEFAULT, not a measurement of this build: the
+// numbers below are conservative round values chosen so the default bet behaves like the old
+// KV-first split wherever the two overlap. They live in one struct so a run can replace all of them
+// from one place, and so no branch below carries a number of its own.
+//
+// This header is intentionally pure: no CUDA, no allocation, no logging, no globals. The caller
+// owns the Device query, the mode, the observed signals and the printing.
+
+#include "core/controller_mode.h"
+
+#include <algorithm>
+#include <cstdint>
+
+namespace ninfer::core {
+
+enum class CapacityBet : std::uint8_t {
+    ExpertResident = 0, // A: the pool wins, the KV leg gives way (possibly all the way to Host)
+    KvFirst        = 1, // B: the KV target wins, the pool takes the remainder
+    BothGive       = 2, // C: neither gets its whole ask; the surplus above a floor is shared
+};
+
+[[nodiscard]] inline constexpr const char* capacity_bet_name(CapacityBet bet) {
+    switch (bet) {
+    case CapacityBet::ExpertResident: return "A";
+    case CapacityBet::KvFirst: return "B";
+    case CapacityBet::BothGive: break;
+    }
+    return "C";
+}
+
+// The word the log uses next to the letter, so a reader does not have to hold the legend in mind.
+[[nodiscard]] inline constexpr const char* capacity_bet_label(CapacityBet bet) {
+    switch (bet) {
+    case CapacityBet::ExpertResident: return "expert-resident";
+    case CapacityBet::KvFirst: return "kv-first";
+    case CapacityBet::BothGive: break;
+    }
+    return "both-give";
+}
+
+// What the controller has already measured. Negative means "not measured on this path" for every
+// field - never zero, which would read as a measurement of failure (the same convention
+// PolicySignals uses in models/qwen3_5/execution/expert_path_control.h).
+struct CapacitySignals {
+    double decode_tps    = -1.0;
+    // Carried for the caller's log line. The ranking below uses the two costs a bet can move;
+    // tps is the OUTCOME both of them move, so ranking on it would only restate the winner.
+    double lambda_p99_ms = -1.0;
+    double miss_rate     = -1.0;
+
+    [[nodiscard]] bool has_miss_rate() const noexcept { return miss_rate >= 0.0; }
+    [[nodiscard]] bool has_latency() const noexcept { return lambda_p99_ms >= 0.0; }
+};
+
+// The whole tuning surface of the bet. DEFAULT VALUES - see the header comment: conservative round
+// numbers, not measurements of this build. `expert_usable_ratio` is the coverage below which a pool
+// is not worth its bytes (a pool that misses most routes pays the PCIe leg anyway); 0.90 keeps the
+// auto default close to the old KV-first split. The two evidence thresholds are the points where a
+// measurement outranks the structural rule.
+struct CapacityBetThresholds {
+    // Share of one layer window the pool must reach for `auto` to accept a KV-first split.
+    double expert_usable_ratio = 0.90;
+    // Route-miss rate (0..1) above which residency is the binding constraint for `auto`.
+    double auto_miss_rate_high = 0.20;
+    // Decode p99 (ms) above which KV locality is the binding constraint for `auto`.
+    double auto_latency_high_ms = 60.0;
+};
+inline constexpr CapacityBetThresholds kDefaultCapacityBetThresholds{};
+
+// Everything the decision is allowed to read. Byte counts, not MiB: the caller already has bytes and
+// a second unit is a second chance to be wrong by 1024.
+struct CapacityBetRequest {
+    // What the Device can give the pool and the KV pages TOGETHER, before the startup allowance.
+    std::uint64_t device_budget_bytes = 0;
+    // The planning allowance the device cap carries (Graph capture, weight staging). Deducted first,
+    // exactly as `plan_device_split()` deducts it, so the two cannot disagree about the ceiling.
+    std::uint64_t startup_headroom_bytes = 0;
+    // One expert slot: the pool holds whole slots, and this is also the pool's alignment.
+    std::uint64_t expert_slot_bytes = 0;
+    // Slots one whole layer window needs (the widest bank). Zero means "no layer shape known": the
+    // ask is then one slot, which makes the decision degenerate but never wrong.
+    std::uint64_t expert_window_slots = 0;
+    // The KV price the arena already resolved, expressed per token and per target.
+    std::uint64_t kv_bytes_per_token = 0;
+    std::uint64_t kv_target_tokens   = 0;
+    // KV page granularity, for the KV figure's alignment. Zero means "do not align".
+    std::uint64_t kv_alignment_bytes = 0;
+    ControllerMode  mode             = ControllerMode::Auto;
+    CapacitySignals signals{};
+
+    [[nodiscard]] std::uint64_t expert_ask_bytes() const noexcept {
+        const std::uint64_t slots = expert_window_slots != 0 ? expert_window_slots : 1;
+        return expert_slot_bytes * slots;
+    }
+    [[nodiscard]] std::uint64_t kv_ask_bytes() const noexcept {
+        return kv_bytes_per_token * kv_target_tokens;
+    }
+};
+
+struct CapacityBetPlan {
+    std::uint64_t expert_pool_bytes = 0;
+    std::uint64_t kv_pages_bytes    = 0;
+    CapacityBet   choice            = CapacityBet::ExpertResident;
+    // False only when the Device cannot hold even one expert slot after the startup allowance.
+    // Everything else is answerable: a bet is exactly the statement that a tight budget has an
+    // answer that is not "refuse".
+    bool        feasible      = false;
+    // True when the budget could not seat both asks, i.e. when a bet was actually taken. A caller
+    // that only wants to log a tight run can gate on this instead of re-deriving it.
+    bool        bet_exercised = false;
+    const char* reason        = "no request";
+
+    [[nodiscard]] std::uint64_t device_total_bytes() const noexcept {
+        return expert_pool_bytes + kv_pages_bytes;
+    }
+};
+
+namespace detail {
+
+// (a * b) / d with the guarantee b <= d, which is all this decision needs: the split shares are
+// both at most the sum they are divided by. Written this way because the 64-bit product would
+// overflow long before the quotient does (24 GiB x 24 GiB), and because a double round-trip would
+// make a one-byte jitter visible in the monotonicity sweep.
+[[nodiscard]] inline std::uint64_t muldiv_le(std::uint64_t a, std::uint64_t b,
+                                             std::uint64_t d) noexcept {
+    if (d == 0) { return 0; }
+    return (a / d) * b + ((a % d) * b) / d;
+}
+
+[[nodiscard]] inline std::uint64_t round_down(std::uint64_t bytes, std::uint64_t unit) noexcept {
+    return unit == 0 ? bytes : bytes / unit * unit;
+}
+
+// Ratios are quantised to 1e-4 so the decision is integer-exact: `0.90 * bytes` through a double is
+// one ulp away from a different byte count, and the tests assert byte counts.
+[[nodiscard]] inline std::uint64_t ratio_bp(double ratio) noexcept {
+    const double clamped = std::min(1.0, std::max(0.0, ratio));
+    return static_cast<std::uint64_t>(clamped * 10000.0 + 0.5);
+}
+
+} // namespace detail
+
+// The decision. Pure, monotone in the budget, and the only place the three rules exist.
+[[nodiscard]] inline CapacityBetPlan
+plan_capacity_bet(const CapacityBetRequest& request,
+                  const CapacityBetThresholds& thresholds = kDefaultCapacityBetThresholds) {
+    CapacityBetPlan plan;
+    if (request.expert_slot_bytes == 0) {
+        plan.reason = "no expert slot price: the pool cannot be sized";
+        return plan;
+    }
+    const std::uint64_t headroom =
+        std::min(request.startup_headroom_bytes, request.device_budget_bytes);
+    const std::uint64_t budget  = request.device_budget_bytes - headroom;
+    const std::uint64_t experts = request.expert_ask_bytes();
+    const std::uint64_t kv      = request.kv_ask_bytes();
+    if (budget < request.expert_slot_bytes) {
+        plan.reason = "the Device cannot hold one expert slot after the startup allowance";
+        return plan;
+    }
+    plan.feasible = true;
+    if (experts + kv <= budget) {
+        // Nothing is scarce, so nothing is bet. Reported as A because "the experts are resident" is
+        // exactly what A names, and because returning a mode-dependent answer here would turn a
+        // tautology into a preference.
+        plan.expert_pool_bytes = experts;
+        plan.kv_pages_bytes    = kv;
+        plan.choice            = CapacityBet::ExpertResident;
+        plan.bet_exercised     = false;
+        plan.reason            = "the whole ask fits: experts and KV are both resident, nothing"
+                                 " spills";
+        plan.expert_pool_bytes =
+            detail::round_down(plan.expert_pool_bytes, request.expert_slot_bytes);
+        plan.kv_pages_bytes =
+            detail::round_down(plan.kv_pages_bytes, request.kv_alignment_bytes);
+        return plan;
+    }
+    plan.bet_exercised = true;
+
+    const auto experts_first = [&] {
+        // performance: the pool takes its ask if it fits, and KV takes the remainder. When the ask
+        // does not fit, KV keeps nothing but the bytes the pool cannot use - which is the same rule,
+        // applied to a smaller pool.
+        plan.expert_pool_bytes = std::min(experts, budget);
+        plan.kv_pages_bytes    = std::min(kv, budget - plan.expert_pool_bytes);
+        plan.choice = plan.expert_pool_bytes >= experts ? CapacityBet::ExpertResident
+                                                        : CapacityBet::BothGive;
+        plan.reason = plan.choice == CapacityBet::ExpertResident
+                          ? "experts first: the pool seats its whole window, KV takes the remainder"
+                          : "experts first: the window does not fit, so KV keeps only the leftovers";
+    };
+    const auto kv_first = [&] {
+        // stable: the KV target is met first, leaving one expert slot - a pool of one slot is still
+        // a pool (the Host tier serves the rest of the layer), and refusing it would be the startup
+        // fault this decision exists to avoid.
+        const std::uint64_t reserve = std::min(budget, request.expert_slot_bytes);
+        plan.kv_pages_bytes        = std::min(kv, budget - reserve);
+        plan.expert_pool_bytes     = std::min(experts, budget - plan.kv_pages_bytes);
+        plan.choice = plan.kv_pages_bytes >= kv ? CapacityBet::KvFirst : CapacityBet::BothGive;
+        plan.reason = plan.choice == CapacityBet::KvFirst
+                          ? "KV first: the pages keep their target, the pool streams the remainder"
+                          : "KV first: even one expert slot is taken from the KV target";
+    };
+
+    switch (request.mode) {
+    case ControllerMode::Performance:
+        experts_first();
+        break;
+    case ControllerMode::Stable:
+        kv_first();
+        break;
+    case ControllerMode::Auto: {
+        // Evidence outranks the structural rule, and only when it exists. Both measured and both
+        // high: the larger relative excess wins, because that is the one more likely to be the
+        // actual limit; a tie goes to latency, which is the SLO.
+        const bool miss_high = request.signals.has_miss_rate() &&
+                               request.signals.miss_rate >= thresholds.auto_miss_rate_high;
+        const bool latency_high = request.signals.has_latency() &&
+                                  request.signals.lambda_p99_ms >= thresholds.auto_latency_high_ms;
+        if (miss_high && (!latency_high || request.signals.miss_rate / thresholds.auto_miss_rate_high >=
+                                               request.signals.lambda_p99_ms /
+                                                   thresholds.auto_latency_high_ms)) {
+            experts_first();
+            plan.reason =
+                "auto: the measured miss rate ranks residency first, so the pool takes its window";
+            break;
+        }
+        if (latency_high) {
+            kv_first();
+            plan.reason = "auto: the measured p99 ranks KV locality first, so the pages keep their "
+                          "target";
+            break;
+        }
+        // The structural rule: KV may have its target only if what is left still reaches the usable
+        // expert floor. Below that floor the bytes above it are shared in proportion to the two
+        // remaining asks - which is what makes "both give a little" a rule and not a slogan.
+        const std::uint64_t usable =
+            detail::muldiv_le(experts, detail::ratio_bp(thresholds.expert_usable_ratio), 10000);
+        if (budget <= usable) {
+            plan.expert_pool_bytes = std::min(experts, budget);
+            plan.kv_pages_bytes    = budget - plan.expert_pool_bytes;
+            plan.choice            = plan.kv_pages_bytes == 0 ? CapacityBet::ExpertResident
+                                                               : CapacityBet::BothGive;
+            plan.reason = "auto: the KV target cannot be met without dropping the pool below the "
+                          "usable floor, so the pool keeps what it can and KV takes the rest";
+            break;
+        }
+        const std::uint64_t surplus       = budget - usable;
+        const std::uint64_t expert_remain = experts > usable ? experts - usable : 0;
+        const std::uint64_t share_total   = expert_remain + kv;
+        const std::uint64_t pool_share =
+            detail::muldiv_le(surplus, expert_remain, share_total);
+        plan.expert_pool_bytes = usable + pool_share;
+        plan.kv_pages_bytes    = budget - plan.expert_pool_bytes;
+        plan.choice = plan.kv_pages_bytes == 0   ? CapacityBet::ExpertResident
+                      : plan.kv_pages_bytes >= kv ? CapacityBet::KvFirst
+                                                  : CapacityBet::BothGive;
+        plan.reason = plan.choice == CapacityBet::KvFirst
+                          ? "auto: the pool clears its usable floor, so KV keeps its target"
+                          : "auto: each side keeps its floor and the surplus is shared in proportion";
+        break;
+    }
+    }
+    plan.expert_pool_bytes = std::min(experts, detail::round_down(plan.expert_pool_bytes,
+                                                                 request.expert_slot_bytes));
+    plan.kv_pages_bytes    = std::min(kv, detail::round_down(plan.kv_pages_bytes,
+                                                          request.kv_alignment_bytes));
+    // Rounding must not take the pool below one slot when the Device can hold one: the caller turns
+    // "less than a slot" into a startup failure, and that failure is what this decision is for.
+    if (plan.expert_pool_bytes < request.expert_slot_bytes &&
+        budget >= request.expert_slot_bytes) {
+        plan.expert_pool_bytes = request.expert_slot_bytes;
+        plan.kv_pages_bytes    = budget > request.expert_slot_bytes ? budget - request.expert_slot_bytes
+                                                                    : 0;
+    }
+    // After rounding the two claims may leave a byte or two unclaimed (an eight-byte alignment).
+    // That is reported as a smaller total, never silently handed to the other consumer: both lines
+    // are printed, so the difference stays visible.
+    return plan;
+}
+
+} // namespace ninfer::core

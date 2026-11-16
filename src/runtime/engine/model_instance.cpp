@@ -3,6 +3,7 @@
 #include "artifact/expert_reader.h"
 #include "artifact/reader.h"
 #include "artifact/formats.h"
+#include "core/capacity_bet.h"
 #include "core/expert_cache.h"
 #include "core/memory_budget.h"
 #include "core/startup.h"
@@ -94,6 +95,63 @@ struct ExpertPlacement {
 // pinned split says so when it does not fit.
 
 [[nodiscard]] bool kv_capacity_shortage(const std::invalid_argument& error) noexcept;
+
+// P7.1 (v10 8.4, V10-55): a refusal that can be re-solved. Thrown by attach_expert_cache() when the
+// pool would hold less than one slot AND the controller's bet says the KV leg can give way.
+// construct_model_once() catches it, prices the arena again against the released bytes, and attaches
+// a second time; a second refusal is an ordinary invalid_argument - the startup fault this replaces.
+struct CapacityRebindRequest {
+    std::uint64_t        kv_release_bytes = 0;
+    core::CapacityBetPlan plan{};
+};
+
+// One builder for the bet, so the tight-run report and the rebind attempt cannot describe the same
+// Device with two different requests. `free_bytes` is the free count the split used, so the bet's
+// budget and plan_device_split()'s budget are the same number.
+[[nodiscard]] core::CapacityBetRequest capacity_bet_request(std::size_t free_bytes,
+                                                           std::size_t kv_reserve_bytes,
+                                                           std::size_t headroom_bytes,
+                                                           std::uint64_t slot_bytes,
+                                                           std::uint64_t window_slots,
+                                                           std::size_t target_tokens) {
+    core::CapacityBetRequest request;
+    request.device_budget_bytes    = free_bytes;
+    request.startup_headroom_bytes = headroom_bytes;
+    request.expert_slot_bytes      = slot_bytes;
+    request.expert_window_slots    = window_slots;
+    request.kv_target_tokens       = target_tokens;
+    // The KV arena was priced for exactly this context, so the price per token is the resolved
+    // reservation divided by the tokens it serves: a derivation of the number the arena already
+    // charged, not a second estimate of it.
+    request.kv_bytes_per_token = target_tokens != 0 ? kv_reserve_bytes / target_tokens : 0;
+    request.mode               = controller_mode();
+    // The controller's own observations, with its "not measured" sentinels preserved: policy signals
+    // use -1 (and 0 for the latency proxy before a layer has run), and a zero reaching the decision
+    // would read as a measurement of a perfect run.
+    auto& controller           = models::qwen3_5::execution::policy_controller();
+    request.signals.decode_tps = controller.signals.decode_tps;
+    request.signals.miss_rate  = controller.signals.no_miss_pct >= 0.0
+                                     ? 1.0 - controller.signals.no_miss_pct / 100.0
+                                     : -1.0;
+    const double latency          = controller.latency_ms_per_token();
+    request.signals.lambda_p99_ms = latency > 0.0 ? latency : -1.0;
+    return request;
+}
+
+// One line for the plan, whichever way the bet went: the letter, the reason and the two sizes it
+// names. `achieved_pool_bytes` is what the split actually handed the pool, so a target that could
+// not be reached is visible instead of being printed as if it had been.
+void report_capacity_bet(const char* what, const core::CapacityBetPlan& plan,
+                         std::uint64_t achieved_pool_bytes) {
+    std::fprintf(stderr,
+                 "[plan] capacity %s: choice=%s(%s) reason=%s expert_pool_mb=%llu kv_pages_mb=%llu "
+                 "achieved_pool_mb=%llu\n",
+                 what, core::capacity_bet_name(plan.choice), core::capacity_bet_label(plan.choice),
+                 plan.reason, static_cast<unsigned long long>(plan.expert_pool_bytes >> 20),
+                 static_cast<unsigned long long>(plan.kv_pages_bytes >> 20),
+                 static_cast<unsigned long long>(achieved_pool_bytes >> 20));
+    std::fflush(stderr);
+}
 
 ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions& options,
                                     DeviceContext& device, std::size_t kv_reserve_bytes) {
@@ -199,9 +257,46 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     if (widest != 0 && capacity / entry >= widest) {
         capacity = capacity / (entry * widest) * (entry * widest);
     }
+    // P7.1 (V10-55): a capacity that cannot seat the pool is a bet, not a verdict.
+    //
+    // Two different tight states reach this point, and only one of them is a fault:
+    //   * the pool holds some slots but not a whole window - legal today (the Host tier serves the
+    //     rest of the layer), and the run only needs the decision written down, so a `[plan]` line
+    //     explains why the split went the way it did;
+    //   * the pool holds less than one slot - the pool cannot exist at all, which is the startup
+    //     fault this decision replaces. If the controller's bet moves Device bytes from the KV leg
+    //     to the Host leg, the caller is asked to re-price the arena once and attach again; only a
+    //     second refusal is an error.
+    if (widest != 0 && capacity / entry < widest) {
+        const auto bet = core::plan_capacity_bet(capacity_bet_request(
+            free_bytes, kv_reserve_bytes, options.startup_planning_headroom_bytes, entry, widest,
+            options.max_context));
+        if (capacity != 0) {
+            report_capacity_bet("tight", bet, capacity);
+        } else if (bet.feasible && bet.expert_pool_bytes >= entry &&
+                   bet.kv_pages_bytes < kv_reserve_bytes) {
+            const std::uint64_t release =
+                static_cast<std::uint64_t>(kv_reserve_bytes) - bet.kv_pages_bytes;
+            std::fprintf(stderr,
+                         "[plan] capacity REJECTED owner=expert_pool asked=%llu MiB cap=%llu MiB "
+                         "(free=%llu MiB kv=%llu MiB startup=%llu MiB) - re-solving once\n",
+                         static_cast<unsigned long long>((entry * widest) >> 20),
+                         static_cast<unsigned long long>(capacity >> 20),
+                         static_cast<unsigned long long>(free_bytes >> 20),
+                         static_cast<unsigned long long>(kv_reserve_bytes >> 20),
+                         static_cast<unsigned long long>(
+                             options.startup_planning_headroom_bytes >> 20));
+            report_capacity_bet("rebound", bet, bet.expert_pool_bytes);
+            throw CapacityRebindRequest{release, bet};
+        } else {
+            // No bet frees a slot: say which one was taken and let the check below fail loud.
+            report_capacity_bet("no rebound", bet, 0);
+        }
+    }
     if (capacity == 0) {
         throw std::invalid_argument("expert cache holds less than one expert window (" +
-                                    std::to_string(entry * widest) + " bytes)");
+                                    std::to_string(entry * widest) +
+                                    " bytes) and the capacity re-solve freed none");
     }
     // The ceiling is aligned like the live capacity so slots_max is always a whole slot count.
     const auto capacity_limit = std::max<std::uint64_t>(
@@ -1498,57 +1593,60 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
         options.context_cost.preset_path);
     auto planner    = models::qwen3_5::make_sequence_planner(instance->parameters, device, options);
     const auto capacity_curve = planner.capacity_curve();
-    auto resolution =
-        [&]() -> KvCapacityResolution {
-        const auto weights_bytes = instance->model->storage_stats().device_capacity_bytes;
-        const auto conservative = current_free_device_bytes(
-            options.wddm_evictable_budget, weights_bytes);
-        // port (sm_89): the residency split measured from the real layout. A model with no
-        // full-attention pages reports a zero payload stride and keeps the fully resident plan.
-        KvResidencyStrides strides = planner.residency_strides();
-        strides.tier_minimum_residency = true;
-        const bool tiered_mode = kv_host_residency_requested(options) &&
-                                 strides.payload_bytes_per_resident_page_group != 0;
-        const std::size_t slack = tiered_mode ? kv_residency_slack_bytes() : 0;
-        const auto plan_at      = [&](std::size_t budget) -> KvCapacityResolution {
-            if (!tiered_mode) {
-                return resolve_kv_capacity(options.kv_capacity, capacity_curve, budget);
-            }
-            const std::size_t usable = budget > slack ? budget - slack : 0;
-            const auto tiered        = resolve_kv_capacity_with_residency(
-                options.kv_capacity, capacity_curve, strides, usable);
-            KvCapacityResolution out;
-            out.mode                     = options.kv_capacity.mode;
-            out.main_page_groups         = tiered.logical_page_groups;
-            out.maximum_main_page_groups = capacity_curve.maximum_main_page_groups;
-            out.resolved_tokens = capacity_curve.resolved_tokens(tiered.logical_page_groups);
-            out.logical_page_groups  = tiered.logical_page_groups;
-            out.resident_page_groups = tiered.resident_page_groups;
-            out.device_kv_payload_bytes =
-                strides.payload_bytes_per_resident_page_group *
-                static_cast<std::size_t>(tiered.resident_page_groups);
-            out.host_kv_payload_bytes = tiered.host_payload_bytes;
-            out.kv_host_residency_active =
-                tiered.residency_active && tiered.resident_page_groups != tiered.logical_page_groups;
-            out.minimum_runtime_reservation_bytes = capacity_curve.minimum_device_reservation_bytes;
-            out.bytes_per_additional_main_page_group =
-                capacity_curve.bytes_per_additional_main_page_group;
-            out.runtime_reservation_bytes     = tiered.device_reservation_bytes;
-            out.available_after_weights_bytes = usable;
-            out.automatic_headroom_bytes      = options.kv_capacity.automatic_headroom_bytes;
-            out.planned_slack_bytes           = usable - tiered.device_reservation_bytes;
-            out.residency_slack_bytes         = slack;
-            return out;
-        };
+    // P7.1 (V10-55): the KV plan is a named function rather than a lambda inside a lambda, because
+    // the capacity re-solve below has to price the arena a SECOND time - against the budget the
+    // expert pool just won - and it must use the same curve, the same residency strides and the same
+    // slack as the first attempt. Two pricing paths would make the two plans incomparable.
+    const auto weights_bytes = instance->model->storage_stats().device_capacity_bytes;
+    const auto conservative =
+        current_free_device_bytes(options.wddm_evictable_budget, weights_bytes);
+    // port (sm_89): the residency split measured from the real layout. A model with no
+    // full-attention pages reports a zero payload stride and keeps the fully resident plan.
+    KvResidencyStrides strides = planner.residency_strides();
+    strides.tier_minimum_residency = true;
+    const bool tiered_mode = kv_host_residency_requested(options) &&
+                             strides.payload_bytes_per_resident_page_group != 0;
+    const std::size_t residency_slack = tiered_mode ? kv_residency_slack_bytes() : 0;
+    const auto plan_kv_at             = [&](std::size_t budget) -> KvCapacityResolution {
+        if (!tiered_mode) {
+            return resolve_kv_capacity(options.kv_capacity, capacity_curve, budget);
+        }
+        const std::size_t usable = budget > residency_slack ? budget - residency_slack : 0;
+        const auto tiered        = resolve_kv_capacity_with_residency(
+            options.kv_capacity, capacity_curve, strides, usable);
+        KvCapacityResolution out;
+        out.mode                     = options.kv_capacity.mode;
+        out.main_page_groups         = tiered.logical_page_groups;
+        out.maximum_main_page_groups = capacity_curve.maximum_main_page_groups;
+        out.resolved_tokens = capacity_curve.resolved_tokens(tiered.logical_page_groups);
+        out.logical_page_groups  = tiered.logical_page_groups;
+        out.resident_page_groups = tiered.resident_page_groups;
+        out.device_kv_payload_bytes =
+            strides.payload_bytes_per_resident_page_group *
+            static_cast<std::size_t>(tiered.resident_page_groups);
+        out.host_kv_payload_bytes = tiered.host_payload_bytes;
+        out.kv_host_residency_active =
+            tiered.residency_active && tiered.resident_page_groups != tiered.logical_page_groups;
+        out.minimum_runtime_reservation_bytes = capacity_curve.minimum_device_reservation_bytes;
+        out.bytes_per_additional_main_page_group =
+            capacity_curve.bytes_per_additional_main_page_group;
+        out.runtime_reservation_bytes     = tiered.device_reservation_bytes;
+        out.available_after_weights_bytes = usable;
+        out.automatic_headroom_bytes      = options.kv_capacity.automatic_headroom_bytes;
+        out.planned_slack_bytes           = usable - tiered.device_reservation_bytes;
+        out.residency_slack_bytes         = residency_slack;
+        return out;
+    };
+    auto resolution = [&]() -> KvCapacityResolution {
         // A tiered plan is priced against what the driver can give back WITHOUT taking pages away
         // from somebody else. The WDDM evictable budget below deliberately plans into memory the
         // driver then has to reclaim, and reclaiming it from this process means paging the KV pool -
         // measured on the 256K dense arm as 18 tok/s prefill against 2,826. So the retry is for the
         // fully resident plan only; a tiered plan that does not fit in the honest budget is a plan
         // that would page.
-        if (tiered_mode) { return plan_at(conservative); }
+        if (tiered_mode) { return plan_kv_at(conservative); }
         try {
-            return plan_at(conservative);
+            return plan_kv_at(conservative);
         } catch (const std::invalid_argument& error) {
             // The instantaneous free count is not what the driver can actually give back. When
             // the plan misses it, fall back once to the WDDM evictable budget (total minus the
@@ -1566,7 +1664,7 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
                          "WDDM evictable budget (%zu bytes) - paging may slow decode\n",
                          conservative, optimistic);
             std::fflush(stderr);
-            return plan_at(optimistic);
+            return plan_kv_at(optimistic);
         }
     }();
     // The same instant the plan was priced against: after the weights, before the expert pool and
@@ -1588,8 +1686,57 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
     // The KV plan is settled before the expert pool is sized, so the pool can take everything the
     // arena does not need instead of holding back a fixed amount.
     if (options.expert_cache_bytes != 0) {
-        const auto placement = attach_expert_cache(*instance, options, device,
-                                                   resolution.runtime_reservation_bytes);
+        // P7.1 (V10-55): the pool gets one chance to be re-solved instead of refused. The request
+        // carries the Device bytes the controller's bet moves to the Host KV leg; the arena is
+        // priced again against the smaller budget, and only then is the pool attached. Every other
+        // refusal (a dense artifact, a re-plan that claims more or cannot serve max_context) keeps
+        // the first plan and fails in the second attach with the caller's own numbers.
+        ExpertPlacement placement;
+        try {
+            placement = attach_expert_cache(*instance, options, device,
+                                            resolution.runtime_reservation_bytes);
+        } catch (const CapacityRebindRequest& rebind) {
+            const auto released = rebind.kv_release_bytes;
+            const auto budget   = conservative > released ? conservative - released : 0;
+            bool       rebound  = false;
+            if (budget != 0 && budget < conservative) {
+                try {
+                    const auto replanned = plan_kv_at(budget);
+                    // A re-plan may only give bytes back, and it may not trade the configured
+                    // context for them: both are the arena's contract, not the bet's.
+                    if (replanned.resolved_tokens >= options.max_context &&
+                        replanned.runtime_reservation_bytes < resolution.runtime_reservation_bytes) {
+                        resolution = replanned;
+                        rebound    = true;
+                    }
+                } catch (const std::invalid_argument& error) {
+                    std::fprintf(stderr,
+                                 "[plan] capacity: the KV leg cannot give up %llu MiB (%s)\n",
+                                 static_cast<unsigned long long>(released >> 20), error.what());
+                    std::fflush(stderr);
+                }
+            }
+            if (rebound) {
+                resolution.available_after_startup_bytes = current_free_device_bytes(
+                    options.wddm_evictable_budget,
+                    instance->model->storage_stats().device_capacity_bytes);
+                std::fprintf(stderr,
+                             "[plan] capacity: KV pages lowered to %llu MiB (%u of %u page(s) "
+                             "resident) - the pool takes the %llu MiB the bet released\n",
+                             static_cast<unsigned long long>(
+                                 resolution.runtime_reservation_bytes >> 20),
+                             resolution.resident_page_groups, resolution.main_page_groups,
+                             static_cast<unsigned long long>(released >> 20));
+                std::fflush(stderr);
+            } else {
+                std::fprintf(stderr,
+                             "[plan] capacity: the re-solve kept the KV plan; the pool is still one "
+                             "window short and this second attach is the failure\n");
+                std::fflush(stderr);
+            }
+            placement = attach_expert_cache(*instance, options, device,
+                                            resolution.runtime_reservation_bytes);
+        }
         // One window per bank means no layer ever evicts another, so the resident set is fixed and
         // the decode graph may be captured. Uploading the whole set first keeps the capture from
         // recording an upload that a later step would then repeat with the wrong experts.

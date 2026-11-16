@@ -51,3 +51,10 @@ add_test(NAME ninfer_json_schema_oracle_test
   COMMAND ${CMAKE_COMMAND} -E env
     "NINFER_SCHEMA_PROBE=$<TARGET_FILE:ninfer_json_schema_test>"
     ${Python3_EXECUTABLE} -B ${PROJECT_SOURCE_DIR}/tests/text/test_json_schema.py)
+
+# P7.1 (V10-55): the capacity bet. Pure (core/capacity_bet.h), so no Device and no fixture: the
+# test is the decision's whole contract - which bet each mode takes at a tight budget, that no bet
+# claims more than the Device has, and that a bigger Device never shrinks either side.
+ninfer_add_test(ninfer_capacity_bet_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_capacity_bet.cpp"
+  LIBRARIES ninfer_core)
