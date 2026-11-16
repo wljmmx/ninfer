@@ -2300,7 +2300,12 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
         // a policy that only exists while someone is watching is not a policy.
         {
             auto& control = policy_controller();
-            if (control.layers == 0) {
+            // Guarded by the value, not by a layer counter: `control.layers` is only advanced on this
+            // path (the split form is a different entry), so keying the probe on it would probe every
+            // layer of a split run and never re-probe a fused one. A probed link is a fact until the
+            // process changes it, and `probe_link` already returns without setting it on failure - so
+            // "not probed yet" is exactly `link_gbps == 0`.
+            if (!(control.link_gbps > 0.0)) {
                 control.probe_link(static_cast<std::uint64_t>(2U << 20));
             }
             control.observe_fetch(fetch_ms * 1000.0);

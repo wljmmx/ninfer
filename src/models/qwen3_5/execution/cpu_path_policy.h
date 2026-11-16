@@ -33,10 +33,10 @@
 // the parser does not recognise (typos included) hold the existing legs: every answerable query
 // reads DeviceCopy / PoolCopy, so nothing about how a layer runs changes. A typo may silently
 // disable a default-off path, but must never silently arm one. "on" arms the cost model only:
-// the runtime legs a verdict names (ExpertStream::ensure leaving an expert for the CPU half;
-// the KV tiering controller dispatching a split as a host partial) are later batches - verdicts
-// are recorded and printed, not acted on, which is the framework's own shadow rule ("print what
-// it would do and why, and change nothing").
+// the two runtime legs exist now (ExpertStream::ensure leaving a miss for the CPU half, behind
+// NINFER_CPU_LEG_ACT=on; the KV host-partial gate, behind NINFER_KV_CPU_PARTITION=<split>), and
+// both are off by default, so a verdict changes nothing until one of those is named. The shadow
+// rule still governs what ships: a leg that has not been measured as a win stays unarmed.
 //
 // The three deployment modes (v8 12.4) are untouched: these hooks neither read nor move the
 // mode, and a verdict costs the same in auto, stable and performance.
@@ -274,11 +274,12 @@ enum class CpuKvSplitLeg : std::uint8_t {
 // Asked only about experts OUTSIDE the hot region - the caller's precondition: the pool's
 // placement has already decided they are not resident. The copy side is the measured upload
 // (PolicyController::signals.upload_us_per_expert, the EWMA of the read-plus-DMA the pool
-// actually pays, already observed and printed by the controller); the compute side is the
-// calibrated CPU half rate. The runtime leg a cpu-half verdict names - ensure() leaving the
-// expert for host_routed_ffn's CPU half instead of uploading it - is the actuator a later batch
-// wires; today ffn.cpp records the verdict at the decision point that already feeds the
-// controller, and the [ctl] cpu line prints it.
+// actually pays); the compute side is the calibrated CPU half rate. The runtime leg exists:
+// ExpertStream::ensure_split asks this question BEFORE the copy and puts the misses on the same
+// CPU mask decision 3 uses, so an expert that would have been fetched is computed on the half
+// instead. It is armed by NINFER_CPU_LEG_ACT=on and off by default, because at today's rates it
+// measured no win (see the switch's own note) - a leg that is wired is not the same as a leg that
+// pays, and only the second one may ship armed.
 enum class CpuExpertLeg : std::uint8_t {
     PoolCopy = 0, // upload the expert into the pool (the in-force behaviour)
     CpuHalf  = 1, // compute it in the CPU half, merge the term on the GPU

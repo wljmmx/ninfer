@@ -878,9 +878,12 @@ public:
                          static_cast<unsigned long long>(dial.blocked_period),
                          static_cast<unsigned long long>(dial.blocked_occupancy));
         }
-        // P2 (cpu in-place path): the CPU-leg decision observation - verdict counts, hit rates
-        // and the cost model's last two sides, shadow until an actuator lands (the runtime legs
-        // the verdicts name are later batches; NINFER_CPU_PATH_POLICY defaults them off).
+        // P2 (cpu in-place path): the CPU-leg decision observation - verdict counts, what the
+        // actuator did about them (`acted=N layer(s)/M route(s)`), and the cost model's last two
+        // sides. Both legs exist now (expert half behind NINFER_CPU_LEG_ACT, KV host split behind
+        // NINFER_KV_CPU_PARTITION) and both are off by default, so this line's job is to say which
+        // of the two statements is true: "no verdict was ever asked for" or "verdicts were answered
+        // and nothing followed".
         cpu_path_ledger().report();
         std::fflush(stderr);
     }
