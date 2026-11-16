@@ -350,14 +350,16 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
                            : 0;
         // NINFER_PREFETCH_SLOTS was the escape hatch that used to carve a region with no consumer
         // (which then read as "the policy chose nothing"). With a consumer present it names the
-        // region's size, clamped the way the controller clamps its own answer - a quarter of a bank's
-        // window - so an override cannot name slots the pool does not have. It also still sizes the
-        // host read-ahead band (host_expert_residency.h), which is why the line says both.
+        // region's size, clamped by the CONTROLLER's own ceiling (prefetch_slot_ceiling) so an
+        // override cannot name slots the pool does not have - and so the override and the policy
+        // cannot drift apart about what that ceiling is. It also still sizes the host read-ahead
+        // band (host_expert_residency.h), which is why the line says both.
         if (const char* slots = std::getenv("NINFER_PREFETCH_SLOTS");
             slots != nullptr && *slots != '\0' && std::strtoul(slots, nullptr, 10) != 0) {
             const auto forced = prefetch_slots_forced();
             if (core::device_prefetch_consumer_present() && forced > 0) {
-                const auto ceiling = std::max(1, signals.pool_slots_per_bank / 4);
+                const auto ceiling =
+                    models::qwen3_5::execution::prefetch_slot_ceiling(signals.pool_slots_per_bank);
                 region_slots = static_cast<std::uint32_t>(std::min(forced, ceiling));
             }
             std::fprintf(stderr,

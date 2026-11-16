@@ -458,10 +458,19 @@ struct PrefetchSizing {
     int reason         = 0; // 0 no staging, 1 prior, 2 cold-scaled, 3 rate-scaled
 };
 
+// The region may never take more than a quarter of a bank's window: past that it stops being a
+// prediction stripe and starts being a second working set, paid for by the routes that would have
+// been resident. ONE function, because two callers need it - decision 5 sizes the region, and the
+// experiment override has to be clamped the same way. A copy of this rule at the second call site is
+// how a policy and its override end up disagreeing about the same geometry.
+[[nodiscard]] inline int prefetch_slot_ceiling(int pool_slots_per_bank) noexcept {
+    return pool_slots_per_bank > 0 ? std::max(1, pool_slots_per_bank / 4) : 0;
+}
+
 [[nodiscard]] inline PrefetchSizing decide_prefetch_slots(const PrefetchSizingQuery& query) noexcept {
     PrefetchSizing out;
     if (!query.staging_reachable || query.top_k <= 0 || query.pool_slots_per_bank <= 0) { return out; }
-    const int ceiling = std::max(1, query.pool_slots_per_bank / 4);
+    const int ceiling = prefetch_slot_ceiling(query.pool_slots_per_bank);
     int want          = 2 * query.top_k;
     out.reason        = 1;
     if (query.cold_share >= 0.0) {
