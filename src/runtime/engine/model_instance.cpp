@@ -667,8 +667,28 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     plan.set(core::Budget::HostSecondChance, grant_second_chance);
     plan.set(core::Budget::HostKvHost, options.context_cache.host_capacity_bytes.value_or(0));
     // SSD keeps no experts: the cold range is the complement of what the two warm tiers held, so it
-    // is a result. The KV spill has no cap either - it is read back to be judged (re-read count).
+    // is a result. The KV spill has no planning cap either - it is read back to be judged (re-read
+    // count) - but the spec asks for a triple, and the file that exists does have a capacity, so all
+    // three facts are recorded instead of one zero.
     plan.set(core::Budget::DiskKvSpill, 0);
+    {
+        core::KvSpillView spill;
+        // The only thing that creates this tier: program_impl.cpp attaches a spill file when
+        // NINFER_KV_SPILL_MB is set, and nothing else does. `enabled` is that switch, read here from
+        // the same variable rather than inferred from a counter that would be zero before the run.
+        const char* mb  = std::getenv("NINFER_KV_SPILL_MB");
+        const auto  mib = (mb != nullptr && *mb != '\0') ? std::strtoull(mb, nullptr, 10) : 0ull;
+        spill.enabled   = mib != 0;
+        // cap: the only capacity that exists is the file's extent count, which the file's own attach
+        // line reports. It is not a planning knob (a cap would only decide which pages get read cold
+        // twice), so nothing is divided here; with no file there is nothing to cap.
+        spill.cap = mib != 0 ? std::to_string(mib) + " MiB (file extents, not a plan claim)" : "none";
+        // reread: there is no per-page re-read counter in the tree. kv_tier_stats() counts
+        // spilled/fetched pages over the Host leg, which is a different question - so "none" here
+        // rather than an invented 0 that would read as "measured, and it is fine".
+        spill.reread = "none";
+        plan.set_kv_spill(spill);
+    }
     for (const auto id : {core::Budget::DeviceExpertPool, core::Budget::DeviceKvPages,
                           core::Budget::DeviceStartup, core::Budget::HostExpertArena,
                           core::Budget::HostReadahead, core::Budget::HostSecondChance}) {

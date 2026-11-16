@@ -32,6 +32,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <string>
 
 namespace ninfer::core {
 
@@ -64,6 +65,19 @@ struct BudgetSlot {
     Budget      carved_from; // == id when the line is a claim of its own
     const char* note;        // printed when the line is zero; may be nullptr
     bool        planned;     // shown, not claimed
+};
+
+// What the SSD tier reports about KV spill: the spec's triple, because there is nothing here to size.
+// No expert budget lives on this tier (the cold range is an outcome), and the spill is NOT judged by
+// a cap - a cap only decides which pages are read cold twice and calls it a policy - so it is judged
+// by its RE-READ count. `cap` says "none" when no file exists, and names the file's extent capacity
+// when one does (a capacity, not a plan claim). `reread` says "none" when no per-page re-read counter
+// exists; the nearest real counters are kv_tier_stats()' spilled/fetched pages, which the `kv tiers`
+// panel prints at the end of a run.
+struct KvSpillView {
+    bool        enabled = false;
+    std::string cap     = "none";
+    std::string reread  = "none";
 };
 
 // Does anything consume a Device prefetch region? The Device form of `ExpertStream::stage_predicted`
@@ -148,6 +162,11 @@ public:
         return bytes_[static_cast<std::size_t>(id)];
     }
 
+    // The SSD tier's non-byte facts: the spill's own triple, recorded by the owner that sees the
+    // switch, and printed on the ssd line because that is where the tier lives.
+    void set_kv_spill(const KvSpillView& view) noexcept { kv_spill_ = view; }
+    [[nodiscard]] const KvSpillView& kv_spill() const noexcept { return kv_spill_; }
+
     // Bytes this tier has actually claimed: carved lines are excluded, because they are slices of a
     // line already counted.
     [[nodiscard]] std::uint64_t total(Tier tier) const noexcept {
@@ -173,6 +192,14 @@ public:
             }
             for (const auto& row : kBudgetSlots) {
                 if (row.tier != tier) { continue; }
+                if (row.id == Budget::DiskKvSpill) {
+                    // The spec's triple, not a byte count: the tier has no budget to divide, and a
+                    // `=0` here would read as "measured and empty" rather than "a shape".
+                    std::fprintf(stderr, " | %s={enabled=%d, cap=%s, reread=%s}", row.name,
+                                 kv_spill_.enabled ? 1 : 0, kv_spill_.cap.c_str(),
+                                 kv_spill_.reread.c_str());
+                    continue;
+                }
                 const auto bytes = bytes_of(row.id);
                 std::fprintf(stderr, " | %s=%llu", row.name,
                              static_cast<unsigned long long>(bytes >> 20));
@@ -191,7 +218,8 @@ public:
         std::fprintf(stderr,
                      "[plan] * = a slice of another line, not a claim; ~ = planned here, claimed by "
                      "its own owner; ssd holds no expert budget (the cold range is what the warm "
-                     "tiers did not keep, not a knob)\n");
+                     "tiers did not keep, not a knob) and its kv_spill is judged by re-reads, not by "
+                     "a cap\n");
         std::fflush(stderr);
     }
 
@@ -202,6 +230,7 @@ private:
 
     std::array<std::uint64_t, 3>            caps_{0, 0, kNoCap};
     std::array<std::uint64_t, kBudgetCount> bytes_{};
+    KvSpillView                             kv_spill_{};
 };
 
 } // namespace ninfer::core
