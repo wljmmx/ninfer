@@ -37,6 +37,12 @@ ninfer_add_op_test(ninfer_candidate_selector_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_candidate_selector.cpp"
   LIBRARIES ninfer_ops)
 
+# P1: the prediction ring's contract - one head per write, the newest `depth` entries readable in
+# sequence order, and an oversized guess refused as a whole.
+ninfer_add_op_test(ninfer_pred_ring_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_pred_ring.cpp"
+  LIBRARIES ninfer_ops)
+
 # S2-4: the id->slot kernel, against a host scan of the same table.
 ninfer_add_op_test(ninfer_route_slots_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_route_slots.cpp"

@@ -459,6 +459,9 @@ ExpertStream::~ExpertStream() {
         }
         lookup_misses_dev_ = nullptr;
     }
+    // P1: the prediction ring is this object's own Device memory too, and it is read by a kernel, so it
+    // goes with the stream rather than with any host container.
+    release_pred_ring();
 }
 
 void ExpertStream::attach_host(std::shared_ptr<HostExpertResidency> host) noexcept {
@@ -1445,6 +1448,385 @@ void ExpertStream::stage_predicted(cudaStream_t stream) {    static const bool v
     }
 }
 
+// port (sm_89): P1 - the prediction hand-off as a ring the Device writes and the host drains.
+//
+// What this is for. The prediction is made by a kernel at the end of layer L-1 and consumed by the
+// host at layer L. S3's hand-off is one Device buffer, which answers "the last ids the producer
+// wrote" - enough for one reader that always wants the latest, and blind to the two things a pipeline
+// needs: whether the entry the host read is the one produced for the layer it is placing, and whether
+// it missed one. The ring answers both with one monotonic counter (moe_pred_ring_write, ops level) and
+// three consequences for the host:
+//
+//   * the drain issues its copies in `begin_fetch`, in front of the layer's own existing
+//     cudaStreamSynchronize (ensure_split, the route read-back). Nothing here waits: the copies ride
+//     the same stream, ordered behind the producer's kernel and in front of nothing but the call the
+//     layer already makes. That is the constructive half of "no new per-layer synchronise" - the layer
+//     had a synchronise before this change and has exactly one after it;
+//   * `complete` reads the pinned bytes and says what it got: entries drained, ids drained, entries it
+//     never saw (a producer that outran the consumer), entries whose slot was overwritten, entries
+//     addressed to another layer, and a guess wider than an entry. Every one of those is a refusal to
+//     place, counted where it is detected;
+//   * nothing is written down: the id capacity is the guess's own length (a layer's top_k times the
+//     tokens it ran), the depth is what the in-flight bound allows (see ensure_pred_ring).
+//
+// Explicit switch only. The shipped path (no NINFER_PREFETCH*/SLOT_LOOKUP) never allocates here, so
+// the gate's numbers cannot move because of this file.
+namespace {
+bool pred_ring_switched() {
+    static const bool value = [] {
+        const char* v = std::getenv("NINFER_PRED_RING");
+        return v != nullptr && *v != '\0' && std::strtol(v, nullptr, 10) != 0;
+    }();
+    return value;
+}
+// P2: the signal source. `residual` is the default and the only one that needs a kernel; `prev` is
+// this layer's own routes from the previous step, which the host already holds. `mtp` has no source on
+// this artifact (see predict_next_layer in ffn.cpp) and parses here only so the two sites agree on the
+// spelling instead of one silently treating it as the default.
+bool history_signal_switched() {
+    static const bool value = [] {
+        const char* v = std::getenv("NINFER_PREFETCH_SIGNAL");
+        return v != nullptr && std::strcmp(v, "prev") == 0;
+    }();
+    return value;
+}
+} // namespace
+
+bool ExpertStream::pred_ring_armed() const noexcept { return pred_ring_switched(); }
+
+void ExpertStream::release_pred_ring() noexcept {
+    const auto drop = [](auto*& pointer, const char* what) {
+        if (pointer == nullptr) { return; }
+        const auto status = cudaFree(pointer);
+        if (status != cudaSuccess) {
+            std::fprintf(stderr, "[pf-pred] cudaFree(%s) failed: %s\n", what,
+                         cudaGetErrorString(status));
+            std::fflush(stderr);
+        }
+        pointer = nullptr;
+    };
+    drop(ring_headers_dev_, "ring headers");
+    drop(ring_ids_dev_, "ring ids");
+    drop(ring_head_dev_, "ring head");
+    ring_depth_       = 0;
+    ring_id_capacity_ = 0;
+    ring_tail_        = 0;
+}
+
+// The ring's two dimensions, both derived rather than chosen:
+//
+//   * id capacity = the guess's own length. The producer knows it (top_k times the tokens the layer
+//     ran), and it is the only number that changes with the model - a top_k of 10 and an eight-token
+//     verify rectangle need 80 ids, a single decode token needs 10, and neither is a constant here;
+//   * depth = one entry in flight plus the one being drained. The in-flight bound is structural, not
+//     a policy: the consumer drains at its own ensure(), and that call synchronises for the route
+//     read-back (ensure_split), so at most one produced entry can be waiting to be drained. Two is
+//     therefore the smallest depth at which head and tail never alias, and a "full" ring is
+//     detectable instead of being read as an empty one. NINFER_PRED_RING_DEPTH widens it for an
+//     experiment; it is clamped to the pool's own layer count, because a ring deeper than the pool
+//     has banks cannot be filled by a walk over them.
+bool ExpertStream::ensure_pred_ring(std::int32_t ids) noexcept {
+    if (ids <= 0) { return false; }
+    const auto capacity = static_cast<std::uint32_t>(ids);
+    if (ring_headers_dev_ != nullptr && ring_id_capacity_ >= capacity) { return true; }
+    // A wider guess rebuilds the ring: the entry stride changes, so the old image cannot be reused
+    // with a new `id_capacity` (that is exactly the mixture the sequence check exists to catch).
+    release_pred_ring();
+    std::uint32_t depth = 2;
+    if (const char* value = std::getenv("NINFER_PRED_RING_DEPTH");
+        value != nullptr && *value != '\0') {
+        const auto asked = std::strtoul(value, nullptr, 10);
+        if (asked != 0) { depth = static_cast<std::uint32_t>(asked); }
+    }
+    if (cache_ != nullptr) {
+        const auto layers = cache_->bank_count();
+        if (layers != 0 && depth > layers) { depth = layers; }
+    }
+    if (depth < 2) { depth = 2; }
+    void* headers = nullptr;
+    void* entry   = nullptr;
+    void* head    = nullptr;
+    auto status   = cudaMalloc(&headers, static_cast<std::size_t>(depth) *
+                                             sizeof(ops::PredRingHeader));
+    if (status == cudaSuccess) {
+        status = cudaMalloc(&entry, static_cast<std::size_t>(depth) * capacity * sizeof(std::int32_t));
+    }
+    if (status == cudaSuccess) { status = cudaMalloc(&head, sizeof(unsigned long long)); }
+    if (status != cudaSuccess) {
+        ++ring_stats_.copy_failures;
+        std::fprintf(stderr,
+                     "[pf-pred] ring cudaMalloc(depth=%u ids=%u, %zu bytes) failed: %s\n", depth,
+                     capacity,
+                     static_cast<std::size_t>(depth) * capacity * sizeof(std::int32_t),
+                     cudaGetErrorString(status));
+        std::fflush(stderr);
+        if (headers != nullptr) { (void)cudaFree(headers); }
+        if (entry != nullptr) { (void)cudaFree(entry); }
+        return false;
+    }
+    // The head starts at zero, and that is the only host write into the ring's Device memory - it
+    // happens once, at construction, never on a layer.
+    if (const auto zeroed = cudaMemset(head, 0, sizeof(unsigned long long)); zeroed != cudaSuccess) {
+        ++ring_stats_.copy_failures;
+        std::fprintf(stderr, "[pf-pred] ring cudaMemset(head) failed: %s\n",
+                     cudaGetErrorString(zeroed));
+        std::fflush(stderr);
+        (void)cudaFree(headers);
+        (void)cudaFree(entry);
+        (void)cudaFree(head);
+        return false;
+    }
+    ring_headers_dev_  = static_cast<ops::PredRingHeader*>(headers);
+    ring_ids_dev_      = static_cast<std::int32_t*>(entry);
+    ring_head_dev_     = static_cast<unsigned long long*>(head);
+    ring_depth_        = depth;
+    ring_id_capacity_  = capacity;
+    ring_tail_         = 0;
+    ring_fetch_armed_  = false;
+    return true;
+}
+
+bool ExpertStream::pred_ring_write(const std::int32_t* ids, std::int32_t count,
+                                   std::uint32_t source_bank, std::uint32_t layer,
+                                   cudaStream_t stream) {
+    if (!pred_ring_switched()) { return false; }
+    if (!ensure_pred_ring(count)) { return false; }
+    if (static_cast<std::uint32_t>(count) > ring_id_capacity_) {
+        ++ring_stats_.truncated;
+        std::fprintf(stderr,
+                     "[pf-pred] ring refuses %d id(s): the entry holds %u (bank=%u layer=%u)\n",
+                     count, ring_id_capacity_, bank_, layer);
+        std::fflush(stderr);
+        return false;
+    }
+    ops::moe_pred_ring_write(ids, count, source_bank, bank_, layer, ring_headers_dev_,
+                             ring_ids_dev_, ring_id_capacity_, ring_depth_, ring_head_dev_, stream);
+    if (const auto status = cudaGetLastError(); status != cudaSuccess) {
+        ++ring_stats_.copy_failures;
+        std::fprintf(stderr, "[pf-pred] ring write launch (bank=%u, %d ids) failed: %s\n", bank_,
+                     count, cudaGetErrorString(status));
+        std::fflush(stderr);
+        return false;
+    }
+    ++ring_stats_.entries_written;
+    ring_stats_.ids_written += static_cast<std::uint64_t>(count);
+    if (ring_stats_.entries_written == 1) {
+        // Once per stream: which bank owns the ring, how deep it is and what one entry holds. The
+        // whole hand-off is invisible otherwise - a consumer that never sees a write and a producer
+        // that wrote into nothing look the same in the drain counts.
+        std::fprintf(stderr, "[pf-pred] ring armed bank=%u depth=%u capacity=%u ids=%d from bank=%u\n",
+                     bank_, ring_depth_, ring_id_capacity_, count, source_bank);
+        std::fflush(stderr);
+    }
+    static std::uint64_t reports = 0;
+    if ((++reports % 64) == 0) {
+        std::fprintf(stderr,
+                     "[pf-pred] written=%llu ids=%llu (bank=%u) | drained=%llu ids=%llu empty=%llu "
+                     "dropped=%llu\n",
+                     static_cast<unsigned long long>(ring_stats_.entries_written),
+                     static_cast<unsigned long long>(ring_stats_.ids_written), bank_,
+                     static_cast<unsigned long long>(ring_stats_.entries_drained),
+                     static_cast<unsigned long long>(ring_stats_.ids_drained),
+                     static_cast<unsigned long long>(ring_stats_.empty_fetches),
+                     static_cast<unsigned long long>(ring_stats_.dropped));
+        std::fflush(stderr);
+    }
+    return true;
+}
+
+void ExpertStream::pred_ring_begin_fetch(cudaStream_t stream) {
+    ring_fetch_armed_ = false;
+    if (!pred_ring_switched() || ring_head_dev_ == nullptr || ring_headers_dev_ == nullptr) {
+        if (pred_ring_switched() && ring_head_dev_ == nullptr) {
+            // A consumer with no ring has nothing to drain: either no layer has predicted into this
+            // one yet (the first layer), or the producer wrote elsewhere. Printed once so the two are
+            // distinguishable from a drain that found an empty ring.
+            static bool said = false;
+            if (!said) {
+                said = true;
+                std::fprintf(stderr,
+                             "[pf-pred] drain armed with no ring on bank=%u (no entry has been "
+                             "written for this stream yet)\n",
+                             bank_);
+                std::fflush(stderr);
+            }
+        }
+        return;
+    }
+    const std::size_t header_bytes =
+        static_cast<std::size_t>(ring_depth_) * sizeof(ops::PredRingHeader);
+    const std::size_t id_bytes = static_cast<std::size_t>(ring_depth_) * ring_id_capacity_ *
+                                 sizeof(std::int32_t);
+    const std::size_t total = sizeof(unsigned long long) + header_bytes + id_bytes;
+    if (!ring_stage_ || ring_stage_->size() < total) {
+        try {
+            ring_stage_ = std::make_unique<PinnedHostBuffer>(total);
+        } catch (const std::exception& error) {
+            ++ring_stats_.copy_failures;
+            std::fprintf(stderr, "[pf-pred] ring pinned staging (%zu bytes) failed: %s\n", total,
+                         error.what());
+            std::fflush(stderr);
+            return;
+        }
+    }
+    auto* base = static_cast<std::byte*>(ring_stage_->data());
+    const auto copy = [&](void* destination, const void* source, std::size_t bytes) {
+        const auto status =
+            cudaMemcpyAsync(destination, source, bytes, cudaMemcpyDeviceToHost, stream);
+        if (status != cudaSuccess) {
+            ++ring_stats_.copy_failures;
+            std::fprintf(stderr, "[pf-pred] ring drain copy (%zu bytes) failed: %s\n", bytes,
+                         cudaGetErrorString(status));
+            std::fflush(stderr);
+            return false;
+        }
+        return true;
+    };
+    if (!copy(base, ring_head_dev_, sizeof(unsigned long long))) { return; }
+    if (!copy(base + sizeof(unsigned long long), ring_headers_dev_, header_bytes)) { return; }
+    if (!copy(base + sizeof(unsigned long long) + header_bytes, ring_ids_dev_, id_bytes)) { return; }
+    ring_fetch_armed_ = true;
+}
+
+std::int32_t ExpertStream::pred_ring_complete(std::vector<std::int32_t>& ids,
+                                              std::int32_t expected) {
+    ids.clear();
+    if (!ring_fetch_armed_) { return 0; }
+    ring_fetch_armed_ = false;
+    const auto* base = static_cast<const std::byte*>(ring_stage_->data());
+    unsigned long long head = 0;
+    std::memcpy(&head, base, sizeof(head));
+    const auto* headers =
+        reinterpret_cast<const ops::PredRingHeader*>(base + sizeof(unsigned long long));
+    const auto* entry_ids = reinterpret_cast<const std::int32_t*>(
+        base + sizeof(unsigned long long) + static_cast<std::size_t>(ring_depth_) *
+                                                sizeof(ops::PredRingHeader));
+    ring_stats_.head = static_cast<std::uint64_t>(head);
+    if (head == ring_tail_) {
+        ++ring_stats_.empty_fetches;
+        return 0;
+    }
+    // A producer that outran this consumer left entries in slots that have since been reused. Those
+    // entries are gone, not stale-but-readable, so they are counted and skipped rather than placed.
+    if (head - ring_tail_ > ring_depth_) {
+        // The entries between `tail_` and `head - depth` left no slot behind: their count is what the
+        // pipeline lost, so it is added as a count, not as "this drain found one problem".
+        ring_stats_.dropped += head - ring_tail_ - ring_depth_;
+        ring_tail_ = head - ring_depth_;
+    }
+    std::int32_t delivered = 0;
+    for (auto sequence = ring_tail_; sequence < head; ++sequence) {
+        const auto slot = static_cast<std::uint32_t>(sequence % ring_depth_);
+        const auto& header = headers[slot];
+        if (header.sequence != sequence) {
+            // The slot was overwritten between the producer's write and this drain: the entry the
+            // ticket named is not there any more.
+            ++ring_stats_.stale;
+            continue;
+        }
+        if (header.target_bank != bank_) {
+            ++ring_stats_.wrong_target;
+            std::fprintf(stderr,
+                         "[pf-pred] ring entry seq=%llu was addressed to bank %u, drained by bank "
+                         "%u\n",
+                         static_cast<unsigned long long>(sequence), header.target_bank, bank_);
+            std::fflush(stderr);
+            continue;
+        }
+        if (header.truncated != 0) {
+            ++ring_stats_.truncated;
+            std::fprintf(stderr,
+                         "[pf-pred] ring entry seq=%llu dropped: %u id(s) did not fit %u\n",
+                         static_cast<unsigned long long>(sequence), header.count, header.capacity);
+            std::fflush(stderr);
+            continue;
+        }
+        if (header.count > ring_id_capacity_) {
+            ++ring_stats_.count_mismatch;
+            std::fprintf(stderr,
+                         "[pf-pred] ring entry seq=%llu claims %u id(s), the entry holds %u\n",
+                         static_cast<unsigned long long>(sequence), header.count,
+                         ring_id_capacity_);
+            std::fflush(stderr);
+            continue;
+        }
+        const auto* source = entry_ids + static_cast<std::size_t>(slot) * ring_id_capacity_;
+        for (std::uint32_t i = 0; i < header.count; ++i) {
+            const auto expert = source[i];
+            if (expert < 0 || static_cast<std::uint32_t>(expert) >= count_) {
+                // The producer and this bank disagree about the bank's width: counted, not used.
+                ++ring_stats_.out_of_range;
+                continue;
+            }
+            ids.push_back(expert);
+        }
+        ++ring_stats_.entries_drained;
+        ring_stats_.ids_drained += header.count;
+        delivered += static_cast<std::int32_t>(header.count);
+    }
+    ring_tail_ = static_cast<std::uint64_t>(head);
+    // The acceptance question for the hand-off, asked where the answer is: did every id the producer
+    // wrote arrive? A short delivery is a lost prediction, not a wrong one, so it is counted apart
+    // from the guess's own precision.
+    if (expected > 0 && delivered != expected) {
+        ++ring_stats_.count_mismatch;
+        std::fprintf(stderr,
+                     "[pf-pred] drain count mismatch bank=%u: %d id(s) arrived, this layer's route "
+                     "grid is %d (depth=%u capacity=%u)\n",
+                     bank_, delivered, expected, ring_depth_, ring_id_capacity_);
+        std::fflush(stderr);
+    }
+    // One line per 8 drains: entries in and out, ids in and out, and the two failure kinds that mean
+    // the pipeline lost a prediction rather than that the guess was wrong.
+    static std::uint64_t reports = 0;
+    if ((++reports % 8) == 0) {
+        std::fprintf(stderr,
+                     "[pf-pred] drained=%llu ids=%llu dropped=%llu gen=%llu | written=%llu "
+                     "ids=%llu empty=%llu stale=%llu truncated=%llu target=%llu range=%llu "
+                     "depth=%u capacity=%u\n",
+                     static_cast<unsigned long long>(ring_stats_.entries_drained),
+                     static_cast<unsigned long long>(ring_stats_.ids_drained),
+                     static_cast<unsigned long long>(ring_stats_.dropped),
+                     static_cast<unsigned long long>(ring_stats_.head),
+                     static_cast<unsigned long long>(ring_stats_.entries_written),
+                     static_cast<unsigned long long>(ring_stats_.ids_written),
+                     static_cast<unsigned long long>(ring_stats_.empty_fetches),
+                     static_cast<unsigned long long>(ring_stats_.stale),
+                     static_cast<unsigned long long>(ring_stats_.truncated),
+                     static_cast<unsigned long long>(ring_stats_.wrong_target),
+                     static_cast<unsigned long long>(ring_stats_.out_of_range), ring_depth_,
+                     ring_id_capacity_);
+        std::fflush(stderr);
+    }
+    return delivered;
+}
+
+// P2: `prev` - the signal that can actually be prefetched. A layer's routes on the previous step are
+// on the host before the current layer runs, so the fill can be queued while the PREVIOUS layer's
+// kernels execute (text.cpp, before ffn()). That is the one placement order the pool rewards: the
+// bytes are already in the slot by the time the route asks for it. The residual signal cannot be
+// staged that way by construction - it is produced at the end of the layer it predicts for, and the
+// host cannot read it before that layer's own synchronise without adding one.
+void ExpertStream::note_routes(std::span<const std::int32_t> ids) {
+    if (!history_signal_switched()) { return; }
+    history_.assign(ids.begin(), ids.end());
+    std::sort(history_.begin(), history_.end());
+    history_.erase(std::unique(history_.begin(), history_.end()), history_.end());
+    ++history_notes_;
+    history_ids_ += history_.size();
+}
+
+void ExpertStream::stage_history(cudaStream_t stream) {
+    if (!history_signal_switched() || history_.empty()) { return; }
+    // The same host-form fill stage_predicted() runs for a residual guess: predicted-and-not-resident
+    // goes to the region, and the copies are queued on the stream here - one layer of compute before
+    // the layer that reads them is placed.
+    predicted_               = history_;
+    predicted_device_active_ = false;
+    predicted_device_count_  = 0;
+    stage_predicted(stream);
+}
+
 std::uint32_t ExpertStream::publish_static_table() {
     ring_snapshot_host_.assign(count_, ops::kRingAdmitAbsent);
     host_->snapshot_slots(bank_, ring_snapshot_host_);
@@ -2306,6 +2688,10 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
         if (status != cudaSuccess) {
             throw std::runtime_error(std::string("route copy: ") + cudaGetErrorString(status));
         }
+        // P1: the prediction ring's copies are queued in the same breath, so the one synchronise below
+        // covers both reads. This is the whole "no new per-layer synchronise" claim: the layer had one
+        // route read-back and still has exactly one, and the ring rides it.
+        pred_ring_begin_fetch(stream);
         const auto sync = cudaStreamSynchronize(stream);
         if (sync != cudaSuccess) {
             throw std::runtime_error(std::string("route sync: ") + cudaGetErrorString(sync));
@@ -2313,6 +2699,12 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
         route_ms  = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
                                                              begin).count();
         route_ids = static_cast<const std::int32_t*>(route_staging_->data());
+    } else {
+        // The caller handed the routes over already read, and this path does not synchronise at all
+        // (it is the prefill/static one). Draining the ring here would need a wait this path does not
+        // have, so it is left alone: the entry stays in the ring and is counted as dropped when the
+        // consumer next runs. Adding a synchronise to keep a prediction would be a worse trade than
+        // losing the prediction, and the count says which happened.
     }
     for (std::size_t i = 0; i < values; ++i) {
         const auto expert = route_ids[i];
@@ -2320,6 +2712,11 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
             throw std::out_of_range("expert stream received a route outside its bank");
         }
     }
+    // P2/`prev`: record this layer's set for the NEXT step's prediction. Recorded here, where the ids
+    // are already on the host, and read by the previous layer's stage_history() - which is the entry
+    // that puts the fill one layer EARLY instead of one layer late. A no-op unless the signal says
+    // prev, so the residual path and the default path are untouched.
+    note_routes(std::span<const std::int32_t>(route_ids, values));
     // S3-4: the prediction region's numerator, counted where the routes are - and only when EVERY run
     // holds the expert in its region, because a route one run cannot address is the CPU half's
     // whatever the other two hold. Until S3 this loop existed only on the fused path, so
@@ -2334,6 +2731,30 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
                 if (!slot || !cache_->prefetch_slot(*slot)) { all_runs = false; break; }
             }
             if (all_runs) { ++prefetch_hits_; }
+        }
+    }
+    // P1: drain the prediction ring here. The order is the measurement's correctness:
+    //
+    //   * after the region's hit count above, so that rate measures what the region held when the layer
+    //     ARRIVED - filling first would make every route a hit and the number meaningless (the mistake
+    //     GH1's `no_miss` made once already);
+    //   * before the precision count below, so a drained guess is attributed to the layer that used it.
+    //
+    // The drain itself waits for nothing: its copies were queued in front of the layer's own route
+    // synchronise, and this reads the pinned landing bytes that call already ordered.
+    if (pred_ring_switched()) {
+        std::vector<std::int32_t> drained;
+        const auto delivered =
+            pred_ring_complete(drained, static_cast<std::int32_t>(values));
+        if (delivered > 0) {
+            set_predicted(std::move(drained));
+            // The fill, through the same host-form path a residual guess uses: predicted-and-not-
+            // resident goes into the region and the copies are queued on this stream, in front of the
+            // layer's own GEMMs. It is queued here, at the ensure of the layer that was predicted -
+            // which is the honest place for a signal produced at the end of the layer before it.
+            if (cache_ != nullptr && cache_->prefetch_slots_per_bank() != 0) {
+                stage_predicted(stream);
+            }
         }
     }
     // S3-4: how good the guess was, independent of whether it was placed. The region's hit rate

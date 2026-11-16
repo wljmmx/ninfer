@@ -165,6 +165,12 @@ public:
                                     : static_cast<double>(prefetch_hits_) /
                                           static_cast<double>(prefetch_calls_);
     }
+    // Slots the pool carved for predictions on this stream's banks (0 when no region exists). Exposed
+    // because the caller that drains the ring has to decide whether a fill has anywhere to go without
+    // reaching into the cache itself.
+    [[nodiscard]] std::uint32_t prefetch_region_slots() const noexcept {
+        return cache_ != nullptr ? cache_->prefetch_slots_per_bank() : 0;
+    }
     // Device-side int32 array, one entry per expert: 1 when the route resolves to an address.
     //
     // port (sm_89): in the split form this is the GATE run's mask. Three runs can hold different
@@ -500,6 +506,55 @@ public:
     // are known, so "predicted and not resident" is just the demand set. Here the copy is queued
     // between the layers, and the next layer's table publish picks the new rows up.
     void stage_predicted(cudaStream_t stream);
+
+    // port (sm_89): P1 - the prediction hand-off as a ring (ops::moe_pred_ring_write).
+    //
+    // S3's single buffer answers "what did the producer last write"; a pipeline needs "which entry is
+    // the one produced for the layer I am placing". The ring adds the head counter and the entry's own
+    // sequence, so the host can tell an entry it already drained from a new one, and can count what it
+    // missed instead of placing a stale set.
+    //
+    // Armed by NINFER_PRED_RING=1 only: the S3 arms stay the A/B, and the default path (no
+    // NINFER_PREFETCH*/SLOT_LOOKUP) never allocates, copies or launches anything here.
+    [[nodiscard]] bool pred_ring_armed() const noexcept;
+    // Producer side, called on the layer that made the guess with the entry's target = this stream.
+    // The ring's geometry comes from the guess itself (its id count) and from the pool's layer count
+    // (depth), so neither is written down. Returns false and counts when the entry cannot be written.
+    bool pred_ring_write(const std::int32_t* ids, std::int32_t count, std::uint32_t source_bank,
+                         std::uint32_t layer, cudaStream_t stream);
+    // Consumer side, split in two halves so the read costs no synchronise of its own: the copies are
+    // enqueued here, in front of the layer's own existing cudaStreamSynchronize, and `complete()` reads
+    // the pinned landing bytes after that call. Nothing waits on the ring itself.
+    void pred_ring_begin_fetch(cudaStream_t stream);
+    // Returns how many ids the ring delivered, and appends them to `ids`. Zero means "no entry"
+    // (first layer, producer off, or the ring was drained empty). `expected` is what this layer's own
+    // route grid says a guess carries (top_k times the tokens it ran); a delivery that disagrees is
+    // counted as a lost id, separately from the guess being wrong.
+    std::int32_t pred_ring_complete(std::vector<std::int32_t>& ids, std::int32_t expected);
+    // P2: the second signal source - this layer's own routes on the previous step, available on the
+    // host before the layer runs, which is what lets the fill be queued while the PREVIOUS layer's
+    // kernels execute. `note_routes` records a layer's set (deduplicated, sorted) at its ensure();
+    // `stage_history` hands the recorded set to the region through the existing host-form fill.
+    void note_routes(std::span<const std::int32_t> ids);
+    void stage_history(cudaStream_t stream);
+    struct PredRingStats {
+        std::uint64_t entries_written = 0;
+        std::uint64_t ids_written     = 0;
+        std::uint64_t entries_drained = 0;
+        std::uint64_t ids_drained     = 0;
+        std::uint64_t empty_fetches   = 0; // layers that found no entry to drain
+        std::uint64_t dropped         = 0; // entries the consumer never saw (producer outran it)
+        std::uint64_t stale           = 0; // slots whose sequence no longer matches the ticket
+        std::uint64_t truncated       = 0; // a guess wider than an entry
+        std::uint64_t wrong_target    = 0; // an entry addressed to another layer
+        std::uint64_t out_of_range    = 0; // an id outside this bank's expert range
+        std::uint64_t count_mismatch  = 0; // drained ids != what this layer expects to predict
+        std::uint64_t copy_failures   = 0;
+        std::uint64_t head            = 0; // the producer's counter as last read
+    };
+    [[nodiscard]] PredRingStats pred_ring_stats() const noexcept { return ring_stats_; }
+    [[nodiscard]] std::uint32_t pred_ring_depth() const noexcept { return ring_depth_; }
+    [[nodiscard]] std::uint32_t pred_ring_id_capacity() const noexcept { return ring_id_capacity_; }
 
     // Routes a layer actually found in the region since the last call (the prediction's numerator).
     [[nodiscard]] std::uint64_t take_prefetch_hits() noexcept {
@@ -887,6 +942,26 @@ private:
     std::uint32_t* lookup_misses_dev_ = nullptr;
     std::size_t    lookup_capacity_   = 0;
     std::uint64_t  lookup_calls_      = 0;
+    // P1: the prediction ring. Allocated on the first guess handed to this stream, and sized from that
+    // guess (id capacity) and from the pool's layer count (depth) - see pred_ring_write. `tail_` is the
+    // only host-side cursor; the producer's head is a Device word, so nothing here is written by the
+    // producer's thread and nothing there is written by this one.
+    ops::PredRingHeader*  ring_headers_dev_ = nullptr;
+    std::int32_t*         ring_ids_dev_     = nullptr;
+    unsigned long long*   ring_head_dev_    = nullptr;
+    std::unique_ptr<PinnedHostBuffer> ring_stage_; // head, headers, ids: the drain's landing bytes
+    std::uint32_t ring_depth_         = 0;
+    std::uint32_t ring_id_capacity_   = 0;
+    std::uint64_t ring_tail_          = 0;
+    bool          ring_fetch_armed_   = false;
+    PredRingStats ring_stats_{};
+    void release_pred_ring() noexcept;
+    bool ensure_pred_ring(std::int32_t ids) noexcept;
+    // P2: `prev` signal - the routes this layer took on the previous step. Empty until the layer has
+    // run once, which is also why the first step prefetches nothing.
+    std::vector<std::int32_t> history_;
+    std::uint64_t history_notes_ = 0;
+    std::uint64_t history_ids_   = 0;
     StepCost last_cost_{};
     // Misses per step, histogram 0..32, decayed so a new workload is not held hostage. One
     // sample per step: the spill region holds every lane's miss at once (8 lanes x 8 experts).

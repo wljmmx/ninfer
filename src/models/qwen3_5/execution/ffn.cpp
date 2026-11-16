@@ -930,8 +930,33 @@ bool predict_enabled() {
     return value;
 }
 
+// P2: which signal names the experts to prefetch. One spelling, one default:
+//
+//   residual  the next layer's router applied to the residual this layer just produced (the S3 source,
+//             and the default - a run that sets nothing measures what was measured before);
+//   prev      the next layer's own routes from the previous step (ExpertStream::stage_history). No
+//             kernel, no Device signal, and the only one that can be filled a layer early;
+//   mtp       the MTP candidate head. NOT AVAILABLE on this artifact: the 125B e2 stream carries no
+//             MTP block, and the routing parameters have no probe for one, so this name selects
+//             nothing and says so once instead of silently falling back to `residual`.
+enum class PrefetchSignal { Residual, Previous, Mtp, Unknown };
+
+PrefetchSignal prefetch_signal() {
+    static const auto value = [] {
+        const char* v = std::getenv("NINFER_PREFETCH_SIGNAL");
+        if (v == nullptr || *v == '\0') { return PrefetchSignal::Residual; }
+        if (std::strcmp(v, "residual") == 0) { return PrefetchSignal::Residual; }
+        if (std::strcmp(v, "prev") == 0) { return PrefetchSignal::Previous; }
+        if (std::strcmp(v, "draft") == 0) { return PrefetchSignal::Residual; }
+        if (std::strcmp(v, "mtp") == 0) { return PrefetchSignal::Mtp; }
+        return PrefetchSignal::Unknown;
+    }();
+    return value;
+}
+
 void predict_next_layer(const Tensor& residual, const RoutedMoeParameters& next,
-                        WorkspaceArena& workspace, DeviceExecutionView execution) {
+                        WorkspaceArena& workspace, DeviceExecutionView execution,
+                        const ExpertStream* source) {
     // The trace is deliberately outside the enable check: "the switch is off" and "the guess was not
     // produced" must not look the same in a log.
     static std::uint64_t calls = 0;
@@ -947,11 +972,49 @@ void predict_next_layer(const Tensor& residual, const RoutedMoeParameters& next,
         if (trace) { std::fprintf(stderr, "[pred] no stream for the next layer\n"); }
         return;
     }
+    // P2: the signal source. `prev` is produced and consumed entirely on the host (stage_history, called
+    // from the layer boundary), so this hook has nothing to add and must not clear the set stage_history
+    // installed. `mtp` has no source here at all.
+    switch (prefetch_signal()) {
+        case PrefetchSignal::Previous:
+            if (trace) { std::fprintf(stderr, "[pred] signal=prev (host history, no kernel)\n"); }
+            return;
+        case PrefetchSignal::Mtp: {
+            static bool said = false;
+            if (!said) {
+                said = true;
+                std::fprintf(stderr,
+                             "[pred] signal=mtp is NOT TESTED on this artifact: the 125B e2 stream "
+                             "carries no MTP block (parameters.h RoutedMoeParameters has no MTP "
+                             "probe), so no candidate router is reachable. Nothing is prefetched.\n");
+                std::fflush(stderr);
+            }
+            return;
+        }
+        case PrefetchSignal::Unknown: {
+            static bool said = false;
+            if (!said) {
+                said = true;
+                std::fprintf(stderr,
+                             "[pred] unknown NINFER_PREFETCH_SIGNAL (residual|prev|mtp); using "
+                             "residual\n");
+                std::fflush(stderr);
+            }
+            break;
+        }
+        case PrefetchSignal::Residual:
+        default:
+            break;
+    }
     // A prediction is for one layer, so "this layer produced none" has to be said. A prefill chunk is
-    // wider than one token and never predicts, and the next layer's stage_predicted would otherwise
-    // place a set that no one produced for it. Clearing costs nothing when there is nothing to clear,
-    // and it keeps a spent guess from being applied twice.
-    if (residual.ne[1] != 1) {
+    // wider than the decode rectangle and never predicts (the caller passes no `predict_next` there),
+    // and the next layer's stage_predicted would otherwise place a set that no one produced for it.
+    // The old form required `ne[1] == 1`, which also switched the chain off on every DFlash2 verify
+    // pass (seven draft tokens plus the anchor is `ne[1] == 8`): the speculative path had no prediction
+    // source at all. The width is the guess's own width now - the router writes one row per token and
+    // the hand-off carries all of them - so nothing below depends on the token count being one.
+    const auto tokens = residual.ne[1];
+    if (tokens <= 0) {
         if (next.stream->predicted_is_device() || !next.stream->predicted_empty()) {
             next.stream->set_predicted({});
         }
@@ -959,15 +1022,42 @@ void predict_next_layer(const Tensor& residual, const RoutedMoeParameters& next,
     }
     const auto& routed = next.profile.routed;
     const ops::RouteProfile route_profile{routed.ffn.hidden, routed.experts, routed.top_k};
-    auto guess_ids     = workspace.alloc(DType::I32, {routed.top_k, 1});
-    auto guess_coeffs  = workspace.alloc(DType::FP32, {routed.top_k, 1});
-    auto guess_shared  = workspace.alloc(DType::FP32, {1});
-    auto guess_scratch = workspace.alloc_bytes(stream_route_bytes(next, 1, 1));
+    auto guess_ids     = workspace.alloc(DType::I32, {routed.top_k, tokens});
+    auto guess_coeffs  = workspace.alloc(DType::FP32, {routed.top_k, tokens});
+    auto guess_shared  = workspace.alloc(DType::FP32, {tokens});
+    auto guess_scratch = workspace.alloc_bytes(stream_route_bytes(next, tokens, tokens));
     MemoryArena guess_arena(MemorySpan{guess_scratch.data, guess_scratch.bytes, execution.device()});
     ops::ExpertRoutes guessed{guess_ids, guess_coeffs};
     ops::topk_softmax_route(residual, route_profile, next.fused_control(), guessed,
                             guess_shared,
                             guess_arena, execution);
+    const auto guess_count = routed.top_k * tokens;
+    // P1: the ring. The ids stay on the Device, an entry is written there (moe_pred_ring_write), and the
+    // host drains it behind the layer's own route synchronise - so the hand-off costs one kernel and no
+    // host wait. The S3 forms below stay as the A/B arms.
+    static const bool ring_form = [] {
+        const char* v = std::getenv("NINFER_PRED_RING");
+        return v != nullptr && *v != '\0' && std::strtol(v, nullptr, 10) != 0;
+    }();
+    if (ring_form && next.stream->pred_ring_armed()) {
+        const auto source_bank = source != nullptr ? source->bank_index() : 0xffffffffu;
+        if (!next.stream->pred_ring_write(static_cast<const std::int32_t*>(guess_ids.data),
+                                          guess_count, source_bank, source_bank,
+                                          execution.stream)) {
+            if (trace) {
+                std::fprintf(stderr, "[pred] ring refused (top_k=%d tokens=%d); no prediction\n",
+                             routed.top_k, tokens);
+                std::fflush(stderr);
+            }
+            return;
+        }
+        if (trace) {
+            std::fprintf(stderr, "[pred] bank -> next stream, top_k=%d tokens=%d ring entry\n",
+                         routed.top_k, tokens);
+            std::fflush(stderr);
+        }
+        return;
+    }
     // S3-1: the ids stay where they were produced. Reading them back needs a `cudaStreamSynchronize`
     // per layer, which waits for the whole layer to drain and stops the host running ahead - the
     // single reason this chain measured ~1.5 tok/s when it was last exercised (streamed_ffn). The
@@ -984,7 +1074,7 @@ void predict_next_layer(const Tensor& residual, const RoutedMoeParameters& next,
     }();
     if (!sync_form) {
         if (!next.stream->set_predicted_device(
-                static_cast<const std::int32_t*>(guess_ids.data), routed.top_k, execution.stream)) {
+                static_cast<const std::int32_t*>(guess_ids.data), guess_count, execution.stream)) {
             if (trace) {
                 std::fprintf(stderr, "[pred] Device hand-off refused (top_k=%d); no prediction\n",
                              routed.top_k);
@@ -998,12 +1088,12 @@ void predict_next_layer(const Tensor& residual, const RoutedMoeParameters& next,
         }
         return;
     }
-    std::vector<std::int32_t> guess(routed.top_k);
-    const std::size_t bytes = static_cast<std::size_t>(routed.top_k) * sizeof(std::int32_t);
+    std::vector<std::int32_t> guess(static_cast<std::size_t>(guess_count));
+    const std::size_t bytes = static_cast<std::size_t>(guess_count) * sizeof(std::int32_t);
     (void)cudaMemcpyAsync(guess.data(), guess_ids.data, bytes, cudaMemcpyDeviceToHost,
                           execution.stream);
     (void)cudaStreamSynchronize(execution.stream);
-    next.stream->set_predicted(guess);
+    next.stream->set_predicted(std::move(guess));
     if (trace) {
         std::fprintf(stderr, "[pred] bank -> next stream, top_k=%d host ids (NINFER_PREDICT_SYNC)\n",
                      routed.top_k);
@@ -1483,12 +1573,31 @@ void split_moe_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor&
             void* host_term_device = std::getenv("NINFER_HOST_MERGE_CPU") != nullptr
                                          ? nullptr
                                          : host_term_span.data;
+            // P1: the prediction ring's copies are queued before the read-back below, so its
+            // synchronise covers them and the drain needs no wait of its own.
+            const bool ring_armed = moe.stream->pred_ring_armed();
+            if (ring_armed) { moe.stream->pred_ring_begin_fetch(stream); }
             auto fetch = fetch_host_routed(hidden, routes, residual, stream,
                                            pack_read_back ? pack_span.data : nullptr);
             if (!moe.stream->ensure(ids.data, top_k, columns, stream, fetch.ids.data())) {
                 throw std::runtime_error(moe.split->parameter +
                                          ": the expert pool refused this layer's placement "
                                          "(gate/up/down form)");
+            }
+            // P1: drain behind the layer's own ids read-back, after ensure() so the region's hit count
+            // (taken at the top of ensure_split) still measures what the region held when the layer
+            // arrived, and before the routed GEMM so a fill is ordered in front of it. No new
+            // synchronise: the copies were queued before fetch_host_routed()'s own wait.
+            if (ring_armed) {
+                std::vector<std::int32_t> drained;
+                const auto delivered =
+                    moe.stream->pred_ring_complete(drained, top_k * columns);
+                if (delivered > 0) {
+                    moe.stream->set_predicted(std::move(drained));
+                    if (moe.stream->prefetch_region_slots() != 0) {
+                        moe.stream->stage_predicted(stream);
+                    }
+                }
             }
             // Addressable = every run has it. A route whose gate is in the pool and whose down is
             // not has no address for the down GEMM, so the expert is the CPU half's - and the CPU
@@ -1574,7 +1683,7 @@ void split_moe_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor&
     // can be scored against it. Until S3 this hook existed only on the streamed (fused) path, so the
     // 125B split form produced no prediction at all: `[pf-region] hits=0 calls=0` and every
     // `[pfv] skip ... predicted_ is empty` came from that, not from a wrong region size.
-    if (predict_next != nullptr) { predict_next_layer(residual, *predict_next, workspace, execution); }
+    if (predict_next != nullptr) { predict_next_layer(residual, *predict_next, workspace, execution, moe.stream.get()); }
 }
 
 void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& residual,
@@ -1792,6 +1901,11 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
         // for whoever wants to chase that difference down.
         static const bool ids_requested = std::getenv("NINFER_FETCH_IDS") != nullptr;
         const bool ids_only = ids_requested && misses >= 0.0 && misses < 0.20;
+        // P1: the ring's three copies are queued here, in front of the read-back this branch is about
+        // to do anyway, so the synchronise inside fetch_host_routed() covers them too. The drain
+        // (pred_ring_complete) happens after ensure(), where the pinned bytes are final.
+        const bool ring_armed = moe.stream->pred_ring_armed();
+        if (ring_armed) { moe.stream->pred_ring_begin_fetch(execution.stream); }
         early.emplace(ids_only
                           ? fetch_ids_only(routes, execution.stream)
                           : fetch_host_routed(hidden, routes, residual, execution.stream,
@@ -1872,6 +1986,24 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
         }
     } catch (const std::exception& error) {
         throw std::invalid_argument(std::string("expert stream upload: ") + error.what());
+    }
+    // P1: the prediction ring's entry, read where the layer's own ids were just read. The order is the
+    // measurement's correctness, and it is the same order ensure_split uses:
+    //
+    //   * after ensure(), so the region's hit count (taken at the top of ensure_split) measures what the
+    //     region held when the layer ARRIVED, and does not count the bytes this very call just queued;
+    //   * before the routed GEMM is launched, so the fill's copies are ordered in front of the kernels
+    //     that would otherwise read a cold slot.
+    //
+    // It adds no synchronise: the copies were enqueued before fetch_host_routed()'s own wait.
+    if (moe.stream->pred_ring_armed()) {
+        std::vector<std::int32_t> drained;
+        const auto delivered =
+            moe.stream->pred_ring_complete(drained, routed.top_k * columns);
+        if (delivered > 0) {
+            moe.stream->set_predicted(std::move(drained));
+            if (moe.stream->prefetch_region_slots() != 0) { moe.stream->stage_predicted(execution.stream); }
+        }
     }
     // port (sm_89): O1's verdict, written after ensure() so it describes the mask this layer will run
     // under. The word is mapped, so the host reads it a step later at a synchronise it already pays -
@@ -2434,7 +2566,7 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
             }
             // The covered-layer fast path finishes here too, and it is the one most layers take: a
             // prediction hook only on the split branch would run on the minority of layers.
-            if (predict_next != nullptr) { predict_next_layer(residual, *predict_next, workspace, execution); }
+            if (predict_next != nullptr) { predict_next_layer(residual, *predict_next, workspace, execution, moe.stream.get()); }
             return;
         }
         auto mixed_f32 = workspace.alloc(DType::FP32, {hidden.ne[0], columns});
@@ -2516,7 +2648,7 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
                         ops::ExpertSubset{ops::ExpertSubsetKind::MaskZeros, host_mask}, mixed_f32,
                         residual, execution, host_term_device);
         // The residual for this layer is final: score the next layer's router on it and hand it over.
-        if (predict_next != nullptr) { predict_next_layer(residual, *predict_next, workspace, execution); }
+        if (predict_next != nullptr) { predict_next_layer(residual, *predict_next, workspace, execution, moe.stream.get()); }
         if (std::getenv("NINFER_SPLIT_TIMING") != nullptr) {
             // Where the split path's per-layer time actually goes. Without this the 4x gap against
             // full residency could only be guessed at: the expert bookkeeping measures ~0.01 ms, so
@@ -2547,7 +2679,7 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
                            ops::ScaledSwiGLUTerm{moe.fused_shared(), shared_coefficients},
                            ops::MoeEpilogue::AddResidual, residual, arena, execution);
         // Same hand-over on the streamed path: the residual is final here too.
-        if (predict_next != nullptr) { predict_next_layer(residual, *predict_next, workspace, execution); }
+        if (predict_next != nullptr) { predict_next_layer(residual, *predict_next, workspace, execution, moe.stream.get()); }
     } catch (const std::exception& error) {
         throw std::invalid_argument(std::string("expert stream run: ") + error.what());
     }

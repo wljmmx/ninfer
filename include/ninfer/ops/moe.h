@@ -311,4 +311,38 @@ void moe_route_slots(const std::int32_t* ids, int count, const std::uint32_t* sl
                      std::uint32_t experts, std::uint32_t* slots, std::uint32_t* misses,
                      cudaStream_t stream);
 
+// port (sm_89): P1 - the prediction hand-off as a ring the Device writes and the host drains
+// (kernels/cuda/pred_ring.cu).
+//
+// S3 hands a prediction over as one Device buffer that the next layer overwrites. That is enough for
+// a single reader that always consumes what the last producer wrote, and it is not enough for a
+// pipeline: the host has no way to tell "the entry I read is the one produced for the layer I am
+// placing" from "the producer has already moved on", and it has no way to tell that it missed one.
+// The ring makes both answerable with one monotonic counter and no host write into Device memory.
+//
+// One entry is a header plus `id_capacity` ids. `head` is a single Device word the producer bumps;
+// the entry lands in slot `index % depth`, so a consumer that has fallen behind reads the newest
+// entries rather than a mixture of two. `truncated` is written instead of being assumed away: a
+// caller that hands over more ids than an entry holds gets the count it asked for recorded, so the
+// consumer can refuse the entry instead of placing half a prediction.
+//
+// Nothing here synchronises. The producer runs on `stream` after the router that produced `ids`, and
+// the consumer's read-back is ordered behind it by the same stream (see ExpertStream::
+// pred_ring_begin_fetch, which issues its copy before the layer's own existing synchronise).
+struct PredRingHeader {
+    std::uint32_t source_bank = 0; // the layer that made the guess
+    std::uint32_t target_bank = 0; // the layer that consumes it
+    std::uint32_t layer       = 0; // source layer ordinal, for attribution
+    std::uint32_t count       = 0; // ids written, <= capacity
+    std::uint32_t capacity    = 0; // the entry's id capacity, echoed so a reader can refuse
+    std::uint32_t truncated   = 0; // 1 when `count` exceeded `capacity` (no ids were written)
+    std::uint64_t sequence    = 0; // the head value this entry was written under
+};
+
+void moe_pred_ring_write(const std::int32_t* ids, int count, std::uint32_t source_bank,
+                         std::uint32_t target_bank, std::uint32_t layer,
+                         PredRingHeader* headers, std::int32_t* entry_ids,
+                         std::uint32_t id_capacity, std::uint32_t depth,
+                         unsigned long long* head, cudaStream_t stream);
+
 } // namespace ninfer::ops

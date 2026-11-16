@@ -2452,7 +2452,7 @@ ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
                                                  : ops::SparseMoeHints{};
 }
 
-void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase,
+void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
                            const ops::SparseMoeHints& hints, int layer,
                            const Tensor* normalized) {
     Tensor h = normalized != nullptr ? *normalized
@@ -2477,6 +2477,19 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase,
                          predict_next != nullptr && predict_next->stream != nullptr ? 1 : 0);
             std::fflush(stderr);
         }
+    }
+    // P2: a prefill chunk is hundreds of tokens wide. Scoring the next layer's router on it would cost
+    // a full routing pass per layer to produce a set that the layer it is for will overrun in the same
+    // call, so no prediction is requested there. Before P2 the width test inside predict_next_layer
+    // did this by accident (`ne[1] != 1`); making it explicit is what allows the decode and verify
+    // rectangles - one token, or one anchor plus the draft window - to predict at all.
+    if (phase == Phase::Prefill) { predict_next = nullptr; }
+    // P2/`prev`: this layer's neighbours were recorded by their own ensure(). Hand the next layer's
+    // recorded set to its region NOW - before this layer's routed GEMM is queued - so the copies run
+    // under this layer's compute instead of after it. This is the one placement order that can beat
+    // the demand path, and the reason the signal switch exists.
+    if (predict_next != nullptr && predict_next->stream) {
+        predict_next->stream->stage_history(ctx_.stream);
     }
     ffn(h, weights.ffn, x, hints, work_, ctx_.execution_view(), false,
         // Q68b probe: score this layer's router against the residual stream the previous layer left
