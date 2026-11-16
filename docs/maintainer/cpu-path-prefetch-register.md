@@ -43,7 +43,7 @@
 
 | ID | 任务 | 验收 | 状态 | 证据 |
 |---|---|---|---|---|
-| P0.1 | 竞技场改成"分配成功多少就按多少定槽数"，删掉固定的 21 GiB 上限（`model_instance.cpp` `kMappedArenaCeiling`） | 默认门禁连跑 3 次都过 `6.024313` / `20.673595` | ⬜ | 悬崖实测：早上 22527 MiB 拒/21504 过；今晚 **20941 MiB 拒**、18432 与 16384 都过且 PPL 相同（`6.024313`） |
+| P0.1 | 竞技场改成"分配成功多少就按多少定槽数"，删掉固定的 21 GiB 上限（`model_instance.cpp` `kMappedArenaCeiling`） | 默认门禁连跑 3 次都过 `6.024313` / `20.673595` | ✅ | 分配在前、定尺寸在后：`allocate_host_arena()` 按 GiB 步退让，块字节数交给 tier，slot 由块推。默认 3×2 全逐位（`6.024313` ×3、`20.673595` ×3，exit=0），竞技场 22093–22200 MiB 漂移不影响数值；回执 `[host] arena allocated 22100 MiB (asked 22100, 0 refusals) device_accessible=1 - the tier is sized from this`；显式 `NINFER_EXPERT_HOST_ARENA_MB=16384` → 13107 slots，仍 `6.024313` |
 | P0.2 | 若单块映射不可行：分块注册（每块 `cudaHostRegister` + 设备地址表），把"块"变成 tier 的显式概念 | 同上，且 20 GiB 级竞技场可用 | ⬜ | — |
 | P0.3 | 分配失败在分配点就 fail-loud（现在会跑到 `qsa/prepare_launch.cu:333` 伪装成 kernel bug） | 日志首行指名 arena 与尺寸 | ⬜ | `[host] mapped allocation of 20941 MiB failed` → `cudaErrorLaunchOutOfResources` |
 
@@ -113,6 +113,7 @@
 3. **tok/s 双模态**：臂内散布可大于臂间差；速度结论必须 min-of-N + 同会话交错，且不能单独作回归证据。
 4. **span 与 copy 不同口径**：span 含 tier fill，copy 侧把这次读约掉了；不统一 scope 之前，任何"用实测速率定价"的结论都不成立。
 5. **`[ctl]` 面板在 e2 路径不打印**：`report()` 只在 `streamed_ffn` 被调用，看到 0 行不等于"值为 0"。
+6. **设备别名早一层就换数值**：`arena_device_base()` 非空决定 split 路径走"Device 直读 host tier"还是第一层走 CPU 腿。块预先分配但别名在构造时就发布，ppl114 给 `6.017490`（17203 slots 与基线同）；别名等到第一次 `arena()` 再发布，回到 `6.024313`。所以"竞技场尺寸不影响数值"成立的前提是**别名的可见时机也不变**。
 
 ## 5. 变更记录
 

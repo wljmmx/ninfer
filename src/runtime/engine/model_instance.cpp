@@ -40,6 +40,7 @@ namespace {
 
 std::uint64_t host_expert_arena_bytes(std::uint64_t want_bytes);
 std::uint64_t current_free_host_bytes();
+models::qwen3_5::execution::HostArenaBlock allocate_host_arena(std::uint64_t want_bytes);
 std::uint64_t readahead_bytes(std::span<const ExpertBankLayout> banks);
 std::uint64_t second_chance_budget_bytes(std::span<const ExpertBankLayout> banks);
 using Clock = std::chrono::steady_clock;
@@ -465,7 +466,7 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     // Routed is granted first; prefetch and the second-chance band get what is left. Enabling either
     // auxiliary therefore cannot shrink the routed working set - the failure mode that made "more
     // cache" mean "less warm tier".
-    const auto routed_bytes = [&] {
+    const auto routed_ask = [&] {
         // The freeze formula is the budget: bypass the working-set clamp, which would cut a
         // complement-sized tier (about 12 GiB here) down to 4 GiB and silently turn the static set
         // back into a churning one. An explicit override still wins, so an experiment can ask for
@@ -475,6 +476,27 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
         }
         return host_expert_arena_bytes(host_want);
     }();
+    const auto prefetch_bytes      = readahead_bytes(requirements.banks);
+    const auto second_chance_ask = second_chance_budget_bytes(requirements.banks);
+    // P0.1: allocate first, size second. A model whose Device pool holds every layer never builds a
+    // host tier, so it must not hold a mapping it will not use - hence the same `short_pool` test
+    // the attach below uses, asked before the block exists rather than after.
+    bool short_pool = false;
+    for (std::size_t index = 0; index < requirements.banks.size(); ++index) {
+        const auto& bank = requirements.banks[index];
+        if (bank.resident) { continue; }
+        if (instance.expert_cache->resident_capacity(static_cast<std::uint32_t>(index)) <
+            bank.count) {
+            short_pool = true;
+        }
+    }
+    const bool host_tier_wanted = short_pool && !streams.empty();
+    const std::uint64_t host_ask = routed_ask + prefetch_bytes + second_chance_ask;
+    models::qwen3_5::execution::HostArenaBlock host_block;
+    if (host_tier_wanted) { host_block = allocate_host_arena(host_ask); }
+    // The block is the arena, so the line below quotes what the allocator granted - not what was
+    // asked for. `asked` is on the [host] line above beside the refusal count.
+    const std::uint64_t arena_held = host_block.bytes != 0 ? host_block.bytes : host_ask;
     // The host tier has TWO consumers that size themselves independently: this warm arena, and the
     // KV pages a tiered context keeps in RAM (`context_cache.host_capacity_bytes`, which the context
     // planner owns and this ledger does not admit - the Host tier here holds only the three expert
@@ -489,21 +511,18 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
         const std::uint64_t kv_host    = options.context_cache.host_capacity_bytes.value_or(0);
         const std::uint64_t reserve_mib = static_cast<std::uint64_t>(8ull << 30);
         const std::uint64_t reserve_live = free_now / 8 > reserve_mib ? free_now / 8 : reserve_mib;
-        const std::uint64_t total_host = routed_bytes + kv_host;
+        const std::uint64_t total_host = arena_held + kv_host;
         std::fprintf(stderr,
                      "[ctl] host split: free=%llu MiB | kv-host=%llu MiB | expert-arena=%llu MiB "
                      "(reserve %llu MiB) | combined=%llu MiB%s\n",
                      static_cast<unsigned long long>(free_now >> 20),
                      static_cast<unsigned long long>(kv_host >> 20),
-                     static_cast<unsigned long long>(routed_bytes >> 20),
+                     static_cast<unsigned long long>(arena_held >> 20),
                      static_cast<unsigned long long>(reserve_live >> 20),
                      static_cast<unsigned long long>(total_host >> 20),
                      (free_now != 0 && total_host > free_now) ? " - OVERCOMMITS FREE RAM" : "");
         std::fflush(stderr);
     }
-    const auto prefetch_bytes      = readahead_bytes(requirements.banks);
-    const auto second_chance_ask = second_chance_budget_bytes(requirements.banks);
-    const auto host_ask            = routed_bytes + prefetch_bytes + second_chance_ask;
     // port (sm_89): Q51 - the two levels of budget meet the three-tier ledger here, and a refusal
     // is a number instead of silence.
     //
@@ -557,16 +576,18 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     // The warm tier's ceiling is the budget it just computed, not "a quarter of free RAM": the
     // partition is what the scheduler grants, and a module may not widen it on its own. The override
     // exists so a caller can grant less - and then the arena is what actually shrinks, rather than
-    // the ledger being told a smaller number than the arena takes.
+    // the ledger being told a smaller number than the arena takes. The allocated block is the last
+    // word: a grant larger than the bytes that exist would name slots the tier cannot fill.
     std::uint64_t host_cap = host_ask;
     if (const char* value = std::getenv("NINFER_BUDGET_RAM_MB"); value != nullptr && *value != '\0') {
         const auto pinned = static_cast<std::uint64_t>(std::strtoull(value, nullptr, 10)) << 20;
         if (pinned != 0 && pinned < host_cap) { host_cap = pinned; }
     }
+    if (host_block.bytes != 0 && host_block.bytes < host_cap) { host_cap = host_block.bytes; }
     instance.ledger.set_cap(core::Tier::Host, host_cap);
     // Routed first, then prefetch, then the second-chance band. A tight cap drops the auxiliaries
     // before it touches the working set; it never takes a routed slot to pay for a cache.
-    const std::uint64_t grant_routed = std::min(routed_bytes, host_cap);
+    const std::uint64_t grant_routed = std::min(routed_ask, host_cap);
     std::uint64_t remaining          = host_cap - grant_routed;
     const std::uint64_t grant_prefetch = std::min(prefetch_bytes, remaining);
     remaining -= grant_prefetch;
@@ -667,19 +688,10 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
                                                 instance.expert_cache->slot_bytes();
         instance.ledger.report(payload);
     }
-    // A pool that cannot hold a layer hands the remainder to the host tier: one arena, the same
-    // uniform slot images the Device pool uses, filled on demand.
-    bool short_pool = false;
-    for (std::size_t index = 0; index < requirements.banks.size(); ++index) {
-        const auto& bank = requirements.banks[index];
-        if (bank.resident) { continue; }
-        // This bank's own seats, not the narrowest bank's: with per-bank pricing a wide bank can fit
-        // entirely while the sibling that set the pool-wide number does not.
-        if (instance.expert_cache->resident_capacity(static_cast<std::uint32_t>(index)) <
-            bank.count) {
-            short_pool = true;
-        }
-    }
+    // short_pool was decided before the arena was allocated: the same test, asked where the block is
+    // requested rather than only here, so a fully resident pool never holds a mapping it cannot use.
+    // This bank's own seats, not the narrowest bank's: with per-bank pricing a wide bank can fit
+    // entirely while the sibling that set the pool-wide number does not.
     // port (sm_89): the host tier backs both forms. The fused form describes one bank per layer; the
     // gate/up/down form describes THREE - one per matrix - because each run's pool set, tier slot
     // table and GH3 placement word are its own. A split run's entry image carries that one matrix in
@@ -687,7 +699,7 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     // ExpertMatrixSpec above), so the tier is told exactly what the pool was told.
     const bool any_split = std::any_of(runs.begin(), runs.end(),
                                        [](const StreamRuns& entry) { return entry.split; });
-    if (short_pool && !streams.empty()) {
+    if (host_tier_wanted) {
         std::vector<models::qwen3_5::execution::HostExpertBankDesc> descs;
         descs.reserve(streams.size() * 3);
         // port (sm_89): the host arena describes a whole bank, but a per-expert artifact gives
@@ -726,7 +738,8 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
             models::qwen3_5::execution::HostWarmBudget{
                 .routed_bytes = grant_routed,
                 .prefetch_bytes = grant_prefetch,
-                .second_chance_bytes = grant_second_chance});
+                .second_chance_bytes = grant_second_chance},
+            host_block);
         for (std::size_t i = 0; i < streams.size(); ++i) {
             streams[i]->attach_host(residency);
         }
@@ -858,10 +871,77 @@ std::uint64_t second_chance_budget_bytes(std::span<const ExpertBankLayout> banks
     return models::qwen3_5::execution::HostExpertResidency::second_chance_bytes_for(widest);
 }
 
+// The host tier's block, allocated before its size is decided.
+//
+// The old shape decided a byte budget first (an estimate, a share of free RAM and a fixed `21 GiB`
+// ceiling) and allocated it lazily at first use. That orders the two facts backwards: only the
+// allocator knows how much of this box can be mapped right now, and on this machine the answer
+// moves (22527 MiB refused / 21504 accepted in the morning; 20941 refused in the evening, 18432 and
+// 16384 accepted). A probe is not a substitute - the same bytes were accepted by a probe and then
+// refused by the real request milliseconds later, and the probe cost 3.7 s to map and unmap 22 GiB.
+//
+// So: ask for the candidate, and step down one GiB at a time until an allocation SUCCEEDS. The
+// bytes that succeeded are the arena. The property is fixed by the call - locked (the CPU half
+// streams through it) and mapped (the Device addresses it directly) - because that is the only form
+// whose absence this tier can be judged on; a pageable block would still run and quietly turn every
+// Device-side route into an upload.
+models::qwen3_5::execution::HostArenaBlock allocate_host_arena(std::uint64_t want_bytes) {
+    models::qwen3_5::execution::HostArenaBlock block;
+    if (want_bytes == 0) { return block; }
+    constexpr std::uint64_t kStepBytes  = 1ull << 30;
+    constexpr std::uint64_t kFloorBytes = 1ull << 30;
+    const std::uint64_t     asked       = want_bytes;
+    unsigned                refusals    = 0;
+    std::uint64_t           len         = want_bytes;
+    for (;;) {
+        void*      locked = nullptr;
+        const auto status =
+            cudaHostAlloc(&locked, static_cast<std::size_t>(len), cudaHostAllocMapped);
+        if (status == cudaSuccess) {
+            void*      device = nullptr;
+            const auto alias  = cudaHostGetDevicePointer(&device, locked, 0);
+            if (alias != cudaSuccess) {
+                // The mapping was granted but the alias was not: the bytes are real, the Device
+                // just cannot name them. Clear the error so it cannot surface at the next launch
+                // and report the state on the same line as the size.
+                (void)cudaGetLastError();
+                device = nullptr;
+            }
+            block.host   = locked;
+            block.device = device;
+            block.bytes  = len;
+            std::fprintf(stderr,
+                         "[host] arena allocated %llu MiB (asked %llu, %u refusals) "
+                         "device_accessible=%d - the tier is sized from this\n",
+                         static_cast<unsigned long long>(len >> 20),
+                         static_cast<unsigned long long>(asked >> 20), refusals,
+                         device != nullptr ? 1 : 0);
+            std::fflush(stderr);
+            return block;
+        }
+        (void)cudaGetLastError();
+        ++refusals;
+        if (len <= kFloorBytes) { break; }
+        len = len > kFloorBytes + kStepBytes ? len - kStepBytes : kFloorBytes;
+    }
+    // P0.3's fail-loud lands here; P0.1 keeps the pre-existing behaviour (no block handed to the
+    // tier, which then tries the same allocation once at its full size) so the ordering change can
+    // be judged on its own.
+    std::fprintf(stderr,
+                 "[host] arena allocation refused at every step: asked %llu MiB, down to %llu MiB "
+                 "(%u attempts) - the tier falls back to its own attempt at %llu MiB\n",
+                 static_cast<unsigned long long>(asked >> 20),
+                 static_cast<unsigned long long>(kFloorBytes >> 20), refusals,
+                 static_cast<unsigned long long>(want_bytes >> 20));
+    std::fflush(stderr);
+    return block;
+}
+
 // Host-side arena for experts the Device pool cannot hold. It takes what the caller says the host
 // tier could usefully hold, capped by a share of free RAM so one process cannot claim the box.
 // Anything past that streams in from the artifact: RAM first, SSD only when it does not fit.
-// NINFER_EXPERT_HOST_ARENA_MB overrides the result when a fixed budget is wanted.
+// NINFER_EXPERT_HOST_ARENA_MB overrides the result when a fixed budget is wanted. The result is a
+// CANDIDATE now: allocate_host_arena() above is what turns it into bytes the tier can address.
 std::uint64_t host_expert_arena_bytes(std::uint64_t want_bytes) {
     const auto share = [&] {
         const auto free_bytes = current_free_host_bytes();
@@ -883,27 +963,11 @@ std::uint64_t host_expert_arena_bytes(std::uint64_t want_bytes) {
         const std::uint64_t usable = free_bytes > reserve ? free_bytes - reserve : 0;
         return usable / 2;
     }();
-    // ... and a ceiling, because on this box the MAPPED allocation stops working long before free
-    // RAM runs out. Measured 2026-11-16 with 53.6 GiB free: an arena of 23032 MiB maps and the run
-    // completes (ppl114, 6.024313), an arena of 23130 MiB - 98 MiB more - fails with
-    // `[host] mapped allocation of 23130 MiB failed: out of memory - trying a registered fallback`
-    // and then dies at the first attention launch. The share above lands at 22.5 GiB when free RAM is
-    // ~52 GiB, i.e. exactly on that cliff.
-    //
-    // The ceiling is a measurement, not a guess, and a probe is not a substitute for it: asking the
-    // box first with the same byte count and the same flags is NOT a valid preview. Tried it - a
-    // probe of 22528 MiB succeeded and the tier's own 22527 MiB request milliseconds later was
-    // refused, and the probe also cost 3.7 s of startup to map and unmap 22 GiB. The refusal is a
-    // property of the whole process at the moment of allocation (standalone: 24576 MiB maps with
-    // 19 GiB of Device memory held; in-engine: 22 GiB does not), so the size is chosen below the
-    // measured flip with real margin instead of being probed for.
-    //
-    // 21 GiB: the flip sits at ~22527 MiB on this box, so 21504 MiB keeps a full GiB of margin and
-    // measured 4/4 clean runs (ppl114 6.024313 each) where 22 GiB measured 0/3. The tier's size is a
-    // cache, not a computation: 21504, 22016 and 22500 MiB all reproduce 6.024313 exactly, so the
-    // margin costs no numerics and only a few hundred slots of warm set.
-    // NINFER_EXPERT_HOST_ARENA_MB still overrides everything for a deliberate experiment.
-    constexpr std::uint64_t kMappedArenaCeiling = 21ull << 30;
+    // There used to be a fixed `21 GiB` ceiling here. It is gone: a constant that has to track a
+    // refusal cliff which moves within one day (22527 MiB in the morning, 20941 MiB at night) is a
+    // guess with a date on it, and it was the reason "how much the tier may hold" and "how much
+    // could actually be allocated" disagreed. The candidate below is an ASK; allocate_host_arena()
+    // discovers the answer and the tier is sized from it.
     // port (sm_89): the 4 GiB working-set cap is gone, and the RAM share is now half instead of a
     // quarter.
     //
@@ -916,9 +980,6 @@ std::uint64_t host_expert_arena_bytes(std::uint64_t want_bytes) {
     // still bounded by it, a large one is bounded by RAM instead.
     constexpr std::uint64_t kSmallWorkingSetCap = 4ull << 30;
     std::uint64_t budget = std::min<std::uint64_t>(want_bytes, share);
-    // Ceiling (see above): the mapped allocation stops working just under 22 GiB in this process, so
-    // the ask stays a GiB below that. NINFER_EXPERT_HOST_ARENA_MB still wins.
-    budget = std::min(budget, kMappedArenaCeiling);
     if (want_bytes <= kSmallWorkingSetCap) {
         budget = std::min<std::uint64_t>({want_bytes, share, kSmallWorkingSetCap});
     }

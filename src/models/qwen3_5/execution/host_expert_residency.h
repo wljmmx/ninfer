@@ -54,10 +54,20 @@ struct HostWarmBudget {
     std::uint64_t second_chance_bytes = 0;
 };
 
-// The host half of a split expert tier. It reserves one arena up front, commits it slot by slot,
-// and holds one uniform slot per expert using the same entry image the Device pool stores. A slot
-// is evicted coldest-first when the arena fills, so RAM holds what fits and everything else keeps
-// streaming in from the artifact.
+// The block the tier is built on. It is allocated by the caller BEFORE the tier exists, because the
+// allocator is the only thing that knows how much of this box can be mapped at this instant: asking
+// for a number and hoping it holds was the failure this replaces (a 21 GiB ceiling, then 20941 MiB
+// refused underneath it). `bytes` is the authority on how many slots exist - the tier derives its
+// capacity from it instead of the other way round.
+struct HostArenaBlock {
+    void*         host   = nullptr;
+    void*         device = nullptr; // Device-visible alias of `host`, null when the alias was refused
+    std::uint64_t bytes  = 0;
+};
+
+// The host half of a split expert tier. It holds one uniform slot per expert using the same entry
+// image the Device pool stores. A slot is evicted coldest-first when the arena fills, so RAM holds
+// what fits and everything else keeps streaming in from the artifact.
 //
 // The CPU op validates a host-packed bank: planes start at 0, at codes_bytes and at
 // codes_bytes + high_bytes, and expert_offsets name each expert's segment. Gate/up and down begin
@@ -66,7 +76,7 @@ class HostExpertResidency final : public HostResidency, public ExpertArenaSource
 public:
     HostExpertResidency(std::span<const HostExpertBankDesc> banks,
                         std::span<const ExpertFileBank> files, const ExpertBlobReader* reader,
-                        HostWarmBudget budget)
+                        HostWarmBudget budget, HostArenaBlock block = {})
         : banks_(banks.begin(), banks.end()), files_(files.begin(), files.end()), reader_(reader) {
         std::uint64_t widest = 0;
         for (const auto& bank : banks_) {
@@ -87,10 +97,40 @@ public:
         // 41-route prefill layer.
         const auto bank_count = std::max<std::uint32_t>(1U, static_cast<std::uint32_t>(banks_.size()));
         const auto slots = [&](std::uint64_t bytes) { return slots_for(bytes); };
-        const auto routed_slots = slots(budget.routed_bytes);
-        routed_capacity_ = std::max<std::uint32_t>(1U, routed_slots);
-        prefetch_per_bank_       = slots(budget.prefetch_bytes) / bank_count;
-        second_chance_per_bank_  = slots(budget.second_chance_bytes) / bank_count;
+        // The bytes this tier may address. When the caller hands a block, its byte count is the
+        // authority: the grants are trimmed to it (auxiliaries first - routed is the working set) so
+        // no slot table can ever name a slot outside the block. Without a block the grants are the
+        // whole answer, which is the pre-P0.1 path and only reachable when the allocator was never
+        // asked.
+        std::uint32_t routed_slots    = std::max<std::uint32_t>(1U, slots(budget.routed_bytes));
+        std::uint32_t prefetch_bank   = slots(budget.prefetch_bytes) / bank_count;
+        std::uint32_t second_bank     = slots(budget.second_chance_bytes) / bank_count;
+        if (block.bytes != 0) {
+            if (block.bytes < slot_bytes_) {
+                throw std::runtime_error(
+                    "host expert arena: the allocated block is smaller than one slot (" +
+                    std::to_string(block.bytes) + " < " + std::to_string(slot_bytes_) + " bytes)");
+            }
+            const auto fits = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                block.bytes / slot_bytes_, std::numeric_limits<std::uint32_t>::max()));
+            const auto asked = routed_slots + (prefetch_bank + second_bank) * bank_count;
+            if (fits < asked) {
+                routed_slots        = std::max<std::uint32_t>(1U, std::min(routed_slots, fits));
+                std::uint32_t rest  = fits - routed_slots;
+                second_bank         = std::min<std::uint32_t>(second_bank, rest / bank_count);
+                rest -= second_bank * bank_count;
+                prefetch_bank       = std::min<std::uint32_t>(prefetch_bank, rest / bank_count);
+                std::fprintf(stderr,
+                             "[warm] arena block trims the tier: block=%llu MiB holds %u slot(s), "
+                             "the grants asked %u (routed %u, second-chance %u, read-ahead %u)\n",
+                             static_cast<unsigned long long>(block.bytes >> 20), fits, asked,
+                             routed_slots, second_bank * bank_count, prefetch_bank * bank_count);
+                std::fflush(stderr);
+            }
+        }
+        routed_capacity_         = routed_slots;
+        prefetch_per_bank_       = prefetch_bank;
+        second_chance_per_bank_  = second_bank;
         // The static stripe is configured later (it is a policy decision, not a budget); until
         // then every routed slot is dynamic and the tier behaves as a single-segment arena.
         static_per_bank_     = 0;
@@ -102,6 +142,24 @@ public:
         prefetch_base_       = second_chance_base_ + second_chance_slots_;
         slot_capacity_       = prefetch_base_ + prefetch_slots_;
         arena_bytes_         = static_cast<std::uint64_t>(slot_capacity_) * slot_bytes_;
+        // The block already exists, so the tier starts from it: every byte it addresses is inside
+        // what the allocator granted, and `arena()` has nothing left to allocate. The DEVICE ALIAS is
+        // published on the first `arena()` call, not here - the split path asks
+        // `arena_device_base()` before the layer's first fill, and an alias that appears one layer
+        // early turns that layer's routes into Device-direct placements instead of CPU-leg ones.
+        // That is a real change of arithmetic order (measured: ppl114 6.017490 with the alias early
+        // vs 6.024313 with it published at first use, same 17203 slots), so the timing is kept.
+        if (block.bytes != 0) {
+            arena_                = static_cast<std::byte*>(block.host);
+            arena_device_pending_ = static_cast<std::byte*>(block.device);
+            pinned_               = true;
+            std::fprintf(stderr,
+                         "[warm] arena block taken: bytes=%llu slots=%u routed=%u "
+                         "device_alias=%s (published on first use)\n",
+                         static_cast<unsigned long long>(arena_bytes_), slot_capacity_,
+                         routed_capacity_, block.device != nullptr ? "pending" : "absent");
+            std::fflush(stderr);
+        }
         used_dynamic_ = 0;
         static_used_.assign(bank_count, 0);
         used_prefetch_.assign(bank_count, 0);
@@ -785,6 +843,10 @@ public:
         const auto slot = s.slot_of[expert];
         if (slot == kNone) { return nullptr; }
         if (arena_ == nullptr) { return nullptr; }
+        // A preallocated block exists before the tier's first use, but nothing has been written
+        // through `arena()` yet, so the uploader must see exactly what it saw when the arena did not
+        // exist: nothing. Without this the first layer reads slots the fill path has not committed.
+        if (arena_device_pending_ != nullptr) { return nullptr; }
         if (bank >= files_.size()) { return nullptr; }
         const auto& bank_files = files_[bank];
         if (expert >= bank_files.experts.size()) { return nullptr; }
@@ -1235,6 +1297,24 @@ private:
             }
 #endif
         }
+        // The Device alias of a block the caller allocated is published here, on the tier's first
+        // use - the same moment the lazy path above would have created it. Publishing it at
+        // construction instead is measurable: see the note on `arena_device_pending_`.
+        if (arena_device_pending_ != nullptr) {
+            arena_device_         = arena_device_pending_;
+            arena_device_pending_ = nullptr;
+            bool known            = false;
+            cudaPointerAttributes attributes{};
+            known = cudaPointerGetAttributes(&attributes, arena_device_) == cudaSuccess;
+            if (!known) { (void)cudaGetLastError(); }
+            std::fprintf(stderr,
+                         "[host] arena mapped bytes=%llu host=%p dev=%p device_accessible=%d "
+                         "(preallocated)\n",
+                         static_cast<unsigned long long>(arena_bytes_),
+                         static_cast<const void*>(arena_),
+                         static_cast<const void*>(arena_device_), known ? 1 : 0);
+            std::fflush(stderr);
+        }
         return arena_;
     }
 
@@ -1644,6 +1724,13 @@ private:
     // Device-visible alias of `arena_`, same bytes (cudaHostGetDevicePointer). Null on the pageable
     // fallback; see arena_device_base().
     std::byte* arena_device_     = nullptr;
+    // A block handed in by the caller carries its alias here until the tier's first use. The split
+    // path decides "Device can address this tier" from `arena_device_base()` BEFORE a layer fills, so
+    // an alias that is already visible at construction makes that layer's routes Device-direct
+    // instead of CPU-leg ones - a different accumulation order, and a different PPL (measured
+    // 6.017490 vs 6.024313 on ppl114 at the same 17203 slots). Publishing it in `arena()` keeps the
+    // timing the lazy allocation always had.
+    std::byte* arena_device_pending_ = nullptr;
     bool pinned_                 = false;
     std::uint32_t slot_capacity_ = 0;
     // Four ranges. S [0, banks*s) is per bank and frozen; D [dynamic_base_, routed_capacity_) is one
