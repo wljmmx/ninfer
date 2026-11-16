@@ -135,6 +135,26 @@ bool real_user(const ChatMessage& message) {
 
 } // namespace
 
+Json parse_tool_history_arguments(std::string_view arguments, std::string_view name,
+                                  std::size_t message_index, std::size_t call_index) {
+    if (arguments.empty()) return Json::object();
+    const auto invalid = [&](std::string_view reason) {
+        return std::invalid_argument("messages[" + std::to_string(message_index) + "].tool_calls[" +
+                                     std::to_string(call_index) + "] ('" + std::string(name) +
+                                     "'): arguments " + std::string(reason));
+    };
+    Json value;
+    try {
+        value = Json::parse(arguments);
+    } catch (const Json::parse_error& error) {
+        throw invalid("contain invalid JSON at byte " + std::to_string(error.byte));
+    } catch (const Json::exception& error) {
+        throw invalid("cannot be represented as JSON: " + std::string(error.what()));
+    }
+    if (!value.is_object()) throw invalid("must contain a JSON object");
+    return value;
+}
+
 bool ChatMessage::has_media() const noexcept {
     return std::any_of(parts.begin(), parts.end(),
                        [](const ChatPart& part) { return part.kind != ChatPartKind::Text; });
@@ -217,15 +237,14 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         }
         if (!message.tool_calls.empty()) {
             value["tool_calls"] = Json::array();
-            for (const auto& call : message.tool_calls) {
+            for (std::size_t j = 0; j < message.tool_calls.size(); ++j) {
+                const auto& call = message.tool_calls[j];
+                auto arguments =
+                    parse_tool_history_arguments(call.arguments_json, call.name, i, j);
                 value["tool_calls"].push_back(
                     {{"id", call.id},
                      {"type", "function"},
-                     {"function",
-                      {{"name", call.name},
-                       {"arguments",
-                        (call.arguments_json.empty() ? Json::object()
-                                                     : Json::parse(call.arguments_json))}}}});
+                     {"function", {{"name", call.name}, {"arguments", std::move(arguments)}}}});
             }
         }
         if (!message.tool_call_id.empty()) value["tool_call_id"] = message.tool_call_id;

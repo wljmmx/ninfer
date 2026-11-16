@@ -91,6 +91,13 @@ struct ChatMessage {
     [[nodiscard]] bool has_media() const noexcept;
 };
 
+// Request history carries tool arguments as an opaque JSON string. Empty arguments mean an empty
+// object; anything that is not one JSON object is invalid input, reported with its history path.
+[[nodiscard]] nlohmann::ordered_json parse_tool_history_arguments(std::string_view arguments,
+                                                                  std::string_view name,
+                                                                  std::size_t message_index,
+                                                                  std::size_t call_index);
+
 struct ChatRenderOptions {
     PromptContinuationMode continuation = PromptContinuationMode::NewAssistantTurn;
     // Internal renderer control used by frontend qualification. Product PromptInput always
