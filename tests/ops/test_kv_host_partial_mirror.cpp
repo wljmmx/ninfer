@@ -255,21 +255,29 @@ int wrong_page_size_refused() {
                   refused ? 1 : 0, 1);
 }
 
-// The five rk families are told apart by their plane inventory, not by an index.
+// The five rk families are told apart by their plane inventory, not by an index. What is graded is
+// the axis production consumes: the (K, V) codec pair the inventory yields, and the RkHostKvDType
+// that pair names (host_partial.h's single mapping). A former `packed_k` boolean is gone - it was a
+// coarse int4-vs-int8 flag with no production reader, and it could not describe the E8 carriers.
 int family_identification() {
     int failures = 0;
     struct Case {
         KvCacheStorage storage;
         RkKCodec k;
         RkVCodec v;
-        bool packed;
+        ops::detail::RkHostKvDType dtype;
     };
     const Case cases[] = {
-        {KvCacheStorage::RotatedInt4KeyInt4ValueGroup64, RkKCodec::Int4, RkVCodec::Int4, true},
-        {KvCacheStorage::RotatedInt8KeyInt4ValueGroup64, RkKCodec::Int8, RkVCodec::Int4, false},
-        {KvCacheStorage::RK2V4E8, RkKCodec::E8Root, RkVCodec::Int4, false},
-        {KvCacheStorage::RK4V4E8, RkKCodec::E8Lattice, RkVCodec::Int4, true},
-        {KvCacheStorage::RK4V2E8, RkKCodec::E8Lattice, RkVCodec::E8Root, true},
+        {KvCacheStorage::RotatedInt4KeyInt4ValueGroup64, RkKCodec::Int4, RkVCodec::Int4,
+         ops::detail::RkHostKvDType::Rk4v4},
+        {KvCacheStorage::RotatedInt8KeyInt4ValueGroup64, RkKCodec::Int8, RkVCodec::Int4,
+         ops::detail::RkHostKvDType::Rk8v4},
+        {KvCacheStorage::RK2V4E8, RkKCodec::E8Root, RkVCodec::Int4,
+         ops::detail::RkHostKvDType::Rk2v4E8},
+        {KvCacheStorage::RK4V4E8, RkKCodec::E8Lattice, RkVCodec::Int4,
+         ops::detail::RkHostKvDType::Rk4v4E8},
+        {KvCacheStorage::RK4V2E8, RkKCodec::E8Lattice, RkVCodec::E8Root,
+         ops::detail::RkHostKvDType::Rk4v2E8},
     };
     for (const Case& one : cases) {
         const PagedKVStorageLayout storage = paged_kv_storage_layout(one.storage, kHeadDim);
@@ -283,11 +291,15 @@ int family_identification() {
         const HostKVPageLayout layout = plan_host_kv_page_layout(geometry);
         RkHostKvPlanes planes;
         const bool identified = plan_rk_host_kv_planes(layout, 0, planes);
-        failures += expect("family " + std::to_string(static_cast<int>(one.storage)), 
+        ops::detail::RkHostKvDType derived{};
+        const bool named =
+            identified && ops::detail::rk_host_kv_dtype_of(planes.k_codec, planes.v_codec, derived);
+        failures += expect("family " + std::to_string(static_cast<int>(one.storage)),
                            {identified ? static_cast<std::int64_t>(planes.k_codec) : -1,
-                            static_cast<std::int64_t>(planes.v_codec), planes.packed_k ? 1 : 0},
+                            static_cast<std::int64_t>(planes.v_codec),
+                            named ? static_cast<std::int64_t>(derived) : -1},
                            {static_cast<std::int64_t>(one.k), static_cast<std::int64_t>(one.v),
-                            one.packed ? 1 : 0});
+                            static_cast<std::int64_t>(one.dtype)});
     }
     return failures;
 }

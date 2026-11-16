@@ -44,6 +44,12 @@
 namespace ninfer::ops::detail::softmax_cpu {
 
 // The four planes of one layer, named, plus the codec identity they carry.
+//
+// The identity is the (K, V) codec PAIR and nothing else. A `packed_k` boolean used to sit beside
+// it as a coarse "int4 vs int8 K" flag; it had no production reader (the seam goes
+// `rk_host_kv_dtype_of(k_codec, v_codec)` -> RkHostKvDType -> `rk_host_kv_codecs`), and it was not
+// even faithful for the E8 carriers, which are neither 128 B nor 256 B. The pair is the axis: it
+// names exactly one family per row and one carrier size per side.
 struct RkHostKvPlanes {
     int k_codes    = -1;
     int v_codes    = -1;
@@ -53,7 +59,6 @@ struct RkHostKvPlanes {
     int layers     = 0;
     RkKCodec k_codec = RkKCodec::Int4;
     RkVCodec v_codec = RkVCodec::Int4;
-    bool packed_k    = true;
 };
 
 namespace rk_host_pages_detail {
@@ -62,17 +67,16 @@ struct Candidate {
     KvCacheStorage storage;
     RkKCodec k_codec;
     RkVCodec v_codec;
-    bool packed_k;
 };
 
 // The five families partial.h decodes; the list, not the order, is what makes the probe a
 // derivation rather than an index guess.
 inline constexpr Candidate kCandidates[] = {
-    {KvCacheStorage::RotatedInt4KeyInt4ValueGroup64, RkKCodec::Int4, RkVCodec::Int4, true},
-    {KvCacheStorage::RotatedInt8KeyInt4ValueGroup64, RkKCodec::Int8, RkVCodec::Int4, false},
-    {KvCacheStorage::RK4V4E8, RkKCodec::E8Lattice, RkVCodec::Int4, true},
-    {KvCacheStorage::RK2V4E8, RkKCodec::E8Root, RkVCodec::Int4, false},
-    {KvCacheStorage::RK4V2E8, RkKCodec::E8Lattice, RkVCodec::E8Root, true},
+    {KvCacheStorage::RotatedInt4KeyInt4ValueGroup64, RkKCodec::Int4, RkVCodec::Int4},
+    {KvCacheStorage::RotatedInt8KeyInt4ValueGroup64, RkKCodec::Int8, RkVCodec::Int4},
+    {KvCacheStorage::RK4V4E8, RkKCodec::E8Lattice, RkVCodec::Int4},
+    {KvCacheStorage::RK2V4E8, RkKCodec::E8Root, RkVCodec::Int4},
+    {KvCacheStorage::RK4V2E8, RkKCodec::E8Lattice, RkVCodec::E8Root},
 };
 
 // One plane of one page in the Host records: payload bytes and dtype must both match, so a
@@ -148,7 +152,6 @@ inline bool plane_matches(const HostKVPageLayout& layout, int index, const KVPla
                 out.layers    = layers;
                 out.k_codec   = candidate.k_codec;
                 out.v_codec   = candidate.v_codec;
-                out.packed_k  = candidate.packed_k;
                 return out.k_scales >= 0 && out.v_scales >= 0;  // the partial needs both
             }
         }

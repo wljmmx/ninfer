@@ -98,11 +98,11 @@
 
 ### P5 测试与清理
 
-| ID | 任务 | 验收 | 状态 |
-|---|---|---|---|
-| P5.1 | `ctest` 全量跑一次（注册 208，`build-win` 只有部分可执行） | 给出通过/失败清单 | ⬜ |
-| P5.2 | `diag-cpu-partial` A/B 扩到 5 族 | 每族 engage + 偏差 | ⬜ |
-| P5.3 | `host_pages.h` 的 `packed_k` 已无生产消费者 | 删除或标注"仅测试用" | ⬜ |
+| ID | 任务 | 验收 | 状态 | 证据 |
+|---|---|---|---|---|
+| P5.1 | `ctest` 全量跑一次（注册 208，`build-win` 只有部分可执行） | 给出通过/失败清单 | ⬜ | — |
+| P5.2 | `diag-cpu-partial` A/B 扩到 5 族 | 每族 engage + 偏差 | ⬜ | — |
+| P5.3 | `host_pages.h` 的 `packed_k` 已无生产消费者 | 删除或标注"仅测试用" | ✅ | **删除**（不是标注）。`RkHostKvPlanes::packed_k` 与 `rk_host_pages_detail::Candidate::packed_k` 一并去掉，五条候选表少一列；生产侧本来就只读 `k_codec`/`v_codec` →`rk_host_kv_dtype_of` → `rk_host_kv_codecs`。单测 `family_identification()` 改成对 `(K codec, V codec, 派生 RkHostKvDType)` 三元组逐族断言（dtype 轴，正是生产消费者的轴）：`build-win\tests\infer_kv_host_partial_mirror_test.exe` → `OK host page mirror`、exit=0，五族 `rows 27/27 equal`（rk4v4 / rk8v4 / rk4v4-e8 / rk2v4-e8 / rk4v2-e8 全 PASS）。删除理由不只是"没人读"：这个布尔对 E8 载体不成立（96 B / 64 B 既非 128 也非 256），留着就是第二套说法。默认门禁逐位 `6.024313` / `20.673595` |
 
 ---
 
@@ -125,13 +125,16 @@
 5. ✅ P3.3 `[ctl] cpu` 面板在 e2 路径可达
 6. ✅ P6.1 35B-e2 建池/挂载（repack 布局没有驻留 bank 视图，改为强制流式 + auto 池）
 7. ✅ P4.1 E8/parallel 的 4 处 gate 调用点（三族 E8 均 engage）
+8. ✅ P4.4 "恒为 DeviceCopy"的算术落文（`paged-kv-cache.md` §14.7）
+9. ✅ P5.3 `host_pages.h` 的 `packed_k` 清理（删掉布尔，单测改走 dtype 轴）
 
 待关账：
 
 1. ~~P4.1 E8/parallel 的 4 处 gate 调用点~~（本轮关账）
-2. P5.3 `packed_k` 清理
+2. ~~P5.3 `packed_k` 清理~~（本轮关账）
 3. P2.3 形态与策略解耦（`[pfv]/[pf-ctl]` 说清楚缺哪一半）
 4. ~~P6.1 35B-e2 为何不建池 / 流未挂载~~（本轮关账）
+5. P4.2 决策 1 接选择者（通道已通、`decide_cpu_kv_split` 仍零调用，见该行）
 
 ## 4. 口径与陷阱（写下来，避免下一轮再踩）
 
@@ -157,3 +160,4 @@
 | 2026-11-16 | P4.1 关账：`launch.cu` 四处 gate 调用点补齐（`rk_e8_grouped` / `rk_e8v2_grouped` / `rk_root_grouped` 直接传家族，`rk_parallel_grouped` 用 `rk_parallel_host_dtype` 从 codec 布尔推出家族）。三族 E8 在 35B-e2 上实测 engage（`dtype=rk4v4-e8/rk4v2-e8/rk2v4-e8`，各 exit=0）；width 9..16 段历史上对所有家族都没有 gate，现在会到 gate 并按 8-token staging 边界拒绝。gate 的 width 判决移到 view 判决之前并改写措辞，使 producer 与 gate 的拒绝可分辨。默认门禁逐位，默认 0 行 `[kv-cpu]` |
 | 2026-11-16 | P4.2 通道关账（决策仍未接）：新增 `int8/plan_probe.h`（thread-local 一槽，唯一写入点 `rk_kv_cpu_split_gate`，参数即 launch 的 partition 与 `Schedule::kKeyRows`），`text.cpp::attn_mix` 在 `NINFER_SPLIT_TIMING` 下只读打印一次 `[kv-plan]`。实测两行对齐（`capacity=2`=`active=2`、`key_rows=32`=`key_tile=32`、`family=rk4v4`=`dtype=rk4v4`）；默认门禁逐位 `6.024313` / `20.673595`。`decide_cpu_kv_split` 仍零调用：缺的是宿主驻留页与"从这个通道之外的 window/字节"两件事，见 P4.2 行 |
 | 2026-11-16 | P4.4 关账：`paged-kv-cache.md` §14.7 把"恒为 DeviceCopy"的算术落文。33,792 B（`keys=32 / kv_heads=4 / packed_k`，`cost.h:76-77`）在数十 GB/s 上约 1.35 µs，CPU 侧 275.15 µs（与 `cost.h` 分项和 0.02% 一致）；翻转门槛 0.123 GB/s（或含上传时 0.033 GB/s），比值与 keys 无关。全部按已注册常量算，不是实测 |
+| 2026-11-16 | P5.3 关账：删除 `RkHostKvPlanes::packed_k` 与候选表的同名列（生产侧只走 `rk_host_kv_dtype_of`/`rk_host_kv_codecs`），单测 `family_identification()` 改为 `(K codec, V codec, 派生 dtype)` 三元组。`infer_kv_host_partial_mirror_test.exe` → `OK host page mirror`、exit=0、五族 27/27 行相等；默认门禁逐位 |
