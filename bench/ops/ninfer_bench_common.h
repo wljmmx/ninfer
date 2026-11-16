@@ -14,6 +14,7 @@
 #include "../common/fixture_data.cuh"
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/device_roofline.h"
 
 #include <cuda_runtime.h>
 
@@ -28,8 +29,6 @@
 #include <vector>
 
 namespace ninfer::bench {
-
-constexpr double kRooflineGBs = 1792.0; // RTX 5090 GDDR7 bandwidth roofline.
 
 inline std::uint16_t f32_to_bf16(float f) {
     std::uint32_t u;
@@ -85,10 +84,21 @@ inline DeviceBuffer make_zeros(std::size_t bytes) {
     return d;
 }
 
-// cudaDeviceProp memory-clock fields were removed in CUDA 13; the in-process
-// GB/s is informational anyway (ncu is the acceptance gate), so report against
-// the known RTX 5090 roofline constant.
-inline double device_peak_bw_gbs(int /*dev*/ = 0) { return kRooflineGBs; }
+// The nominal DRAM bandwidth comes from the device (V10-11): CUDA 13 removed the
+// cudaDeviceProp clock field but the attributes remain. A fixed 1792 GB/s constant is the RTX
+// 5090's number, so on a 4090 every "% of roofline" readout was ~44% low. Zero means the device
+// did not answer; callers then print "n/a" instead of a fraction of a guess.
+inline const ninfer::core::DeviceRoofline& device_roofline(int dev = 0) {
+    static thread_local int cached_device = -1;
+    static thread_local ninfer::core::DeviceRoofline cached{};
+    if (cached_device != dev) {
+        cached        = ninfer::core::query_device_roofline(dev);
+        cached_device = dev;
+    }
+    return cached;
+}
+
+inline double device_peak_bw_gbs(int dev = 0) { return device_roofline(dev).dram_gbs; }
 
 struct ColdTiming {
     double median_us = 0.0;
@@ -528,10 +538,17 @@ inline Result bench_loop_prepared(const launch_fn& prepare, const launch_fn& lau
 }
 
 inline void print_result(const char* tag, const Result& r) {
-    std::printf(
-        "%-32s median=%8.2f us  min=%8.2f us  p95=%8.2f us  %8.1f GB/s  (%.1f%% of %.0f GB/s "
-        "roofline)\n",
-        tag, r.median_us, r.min_us, r.p95_us, r.gbs, r.gbs / kRooflineGBs * 100.0, kRooflineGBs);
+    const double roofline = device_peak_bw_gbs();
+    if (roofline > 0.0) {
+        std::printf(
+            "%-32s median=%8.2f us  min=%8.2f us  p95=%8.2f us  %8.1f GB/s  (%.1f%% of %.0f GB/s "
+            "roofline)\n",
+            tag, r.median_us, r.min_us, r.p95_us, r.gbs, r.gbs / roofline * 100.0, roofline);
+    } else {
+        std::printf(
+            "%-32s median=%8.2f us  min=%8.2f us  p95=%8.2f us  %8.1f GB/s  (roofline n/a)\n",
+            tag, r.median_us, r.min_us, r.p95_us, r.gbs);
+    }
 }
 
 } // namespace ninfer::bench

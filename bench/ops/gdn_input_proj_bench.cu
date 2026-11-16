@@ -31,7 +31,7 @@ using namespace ninfer;
 namespace {
 
 constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
-constexpr double kRtx5090DramGBs  = 1792.0;
+// Nominal DRAM bandwidth is queried from the device (V10-11); see ninfer_bench_common.h.
 
 enum class Format : std::uint8_t { Q4Q5, Q8, Nvfp4, Fp8, All };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
@@ -259,7 +259,7 @@ void report(const Result& result) {
                 result.format, result.policy, cache_name(result.cache),
                 result.graph_nodes ? "graph" : "eager", result.graph_nodes, result.tokens,
                 result.workspace_bytes, result.timing.median_us, result.timing.min_us,
-                result.timing.p95_us, gbps, gbps / kRtx5090DramGBs * 100.0, kRtx5090DramGBs,
+                result.timing.p95_us, gbps, gbps / bench::device_peak_bw_gbs() * 100.0, bench::device_peak_bw_gbs(),
                 tflops);
 }
 

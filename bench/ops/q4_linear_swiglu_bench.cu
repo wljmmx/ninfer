@@ -134,7 +134,7 @@ void write_csv(const std::string& path, const std::vector<Result>& results) {
                      result.tokens, result.execution, result.graph_nodes, result.median_us,
                      result.min_us, result.p95_us, result.weight_bytes, result.logical_bytes,
                      result.projection_flops, result.logical_bytes / seconds / 1.0e9,
-                     result.logical_bytes / seconds / 1.0e9 / 1792.0 * 100.0,
+                     result.logical_bytes / seconds / 1.0e9 / bench::device_peak_bw_gbs() * 100.0,
                      result.projection_flops / seconds / 1.0e12, result.workspace_sweep_bytes,
                      result.workspace_exact_bytes);
     }

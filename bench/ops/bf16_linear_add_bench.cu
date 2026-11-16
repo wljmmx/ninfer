@@ -30,7 +30,7 @@ namespace {
 
 constexpr std::int32_t kRows               = 5120;
 constexpr std::int32_t kHidden             = 6144;
-constexpr double kRtx5090DramGBs           = 1792.0;
+// Nominal DRAM bandwidth is queried from the device (V10-11); see ninfer_bench_common.h.
 constexpr double kRtx5090SustainedReadGBs  = 1674.5;
 constexpr double kRtx5090DenseBf16Tflops   = 209.5;
 constexpr std::uint64_t kDefaultFlushBytes = 256ULL << 20;
@@ -232,7 +232,7 @@ Result make_result(std::string route, std::int32_t tokens, const bench::ColdTimi
         2.0 * static_cast<double>(kRows) * static_cast<double>(kHidden) * tokens;
     const double seconds = timing.median_us * 1.0e-6;
     const double memory_floor_us =
-        static_cast<double>(logical_bytes) / (kRtx5090DramGBs * 1.0e9) * 1.0e6;
+        static_cast<double>(logical_bytes) / (bench::device_peak_bw_gbs() * 1.0e9) * 1.0e6;
     const double compute_floor_us  = useful_flops / (kRtx5090DenseBf16Tflops * 1.0e12) * 1.0e6;
     const double roofline_floor_us = std::max(memory_floor_us, compute_floor_us);
 
