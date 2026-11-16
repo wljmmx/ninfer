@@ -29,11 +29,21 @@
 | 格 | 预测器 | 端口 | 命中率可读 | 本机可达 |
 |---|---|---|---|---|
 | **e2 × 流式** | 🟡 有信号无放置件：`[pf-pred] written=64 ids=640 drained=64 dropped=0`（环完整），但 `[pf-region] hits=0 calls=640 (0.0%)`；`[pf-ctl] cutoff=0 armed=N reason=depth`（8 槽）/ `armed=Y`（16 槽） | ✅ `[ctl] prefetch port` 正常打印 cold/hit/cpu/runs/banks/slots→N | 🟡 计数器可读（`hits/calls`），但恒 0-0.2%，**语义上等于不可读** | ✅ 可达 |
-| **e2 × 驻留** | — 无需预测（整层驻留） | ✅ 同一端口 | — | **N/A（硬件）**：`count_` = 73728/144 = 512 专家/bank；整层驻留需 73728 slot × 1.25 MiB ≈ 90,000 MiB ≈ 88 GiB，24 GB 卡不可达 |
-| **非 e2 × 流式** | ⬜ "层元数据"信号没有生产：`predict_next_layer` 只有 residual(28.8%) / prev(49.4%) 两条 | ✅ | 🟡 同左（无填充→0） | ❓ 本轮未跑非 e2 制品（`R:\model\qwen3_6_35b_a3b`）；验法：同命令换权重，看 `[pf-pred]` 是否有 ids |
-| **非 e2 × 驻留** | ⬜ 双缓冲换层未实现；"换层窗口内无 miss"这个前提本身未验证 | ✅ | — | ❓ 验法：35B 权重 + `[gh1] no_miss_pct` 是否 100%，否则这一格的前提不成立 |
+| **e2 × 驻留** | — 无需预测（整层驻留） | ✅ 同一端口 | — | **本机不可达，两个独立原因**：① 125B 上 `count_` = 512 专家/bank，整层驻留需 73728 slot × 1.25 MiB ≈ 88 GiB；② 唯一可能装下整层的 **35B-e2 制品本身跑不起来**（见 P6）：`text/layers/0` 抛 `expert stream is not attached`，11 行日志里没有任何 `[pool]`/`[budget]`/`[experts]` 行 |
+| **非 e2 × 流式** | ⬜ "层元数据"信号没有生产：`predict_next_layer` 只有 residual(28.8%) / prev(49.4%) 两条 | ✅ | 🟡 同左（无填充→0） | ❓ 35B plain 能跑（`overall 6.701375`），但它无池行、未确认有专家路由；验法：同命令加 `[pf-pred]`/`[gh1]` 观察是否有 ids |
+| **非 e2 × 驻留** | ⬜ 双缓冲换层未实现；"换层窗口内无 miss"这个前提本身未验证 | ✅ | — | ❓ 验法：35B plain + `[gh1] no_miss_pct` 是否 100%，否则这一格的前提不成立 |
 
 **结论一句话**：四格里只有 1 格在本机可达且有实测；1 格是硬件不可达；2 格没有验证过（不是"未实现"就等于"不可能"）。
+
+---
+
+## 1.5 工作目录约定（2026-11-16 立，避免再出现"找不到文件"）
+
+- 仓库唯一入口：`H:\TeleAgentWorks\.temp\r` —— 它是 **junction**，指向 `H:\TeleAgentWorks\ninfer-4090-port\infer`。
+  两条路径是同一个仓库；**命令与编辑一律用 junction 路径**，因为原始路径在卷视图里会间歇性只显示成 `.temp`（Storage Space 池的已知现象：`Test-Path .git` 为真而 `dir` 里没有）。
+- 命名别混：项目叫 **ninfer**，仓库目录名是 **infer**，上层目录是 **ninfer-4090-port**。写路径逐段核对，别漏 `n`。
+- 临时产物**只放一处**：`H:\TeleAgentWorks\.temp\runs\<YYYY-MM-DD>\<项名>\`。不要再往 `.temp` 根或别处摊 `out-*` / `gate*` / `p*.log`。
+- 当日已清理：`.temp` 根下 **796** 个散落条目移入 `runs\2026-11-16\`；一次性探针可执行与 70 MB 级 `.obj` 已删除；根目录现在只剩原有工具/语料与 `runs\`。
 
 ---
 
@@ -64,7 +74,7 @@
 
 | ID | 任务 | 验收 | 状态 | 证据 |
 |---|---|---|---|---|
-| P2.1 | 按 P1.2 强制 0，删掉"env 能武装一个没消费者的区" | 默认 0 槽，无 `[pf-region]` carve 行 | ⬜ | 现在 `NINFER_PREFETCH_SLOTS=16` 仍能武装 |
+| P2.1 | 按 P1.2 强制 0，删掉"env 能武装一个没消费者的区" | 默认 0 槽，无 `[pf-region]` carve 行 | ✅ | 同 P1.2：`device_prefetch_consumer_present()` 恒 false，`TierPlan::set` 强制 0；`NINFER_PREFETCH_SLOTS=16` 单独设置 → exit=1 `cannot arm the Device prefetch region: it has no consumer`，不再静默武装 |
 | P2.2 | device 端放置件（原 S4/S5）：放置状态机上 device，填充不回 host | `hits/calls` 从 0 抬起；`[pf-mirror] region uploads` 随 `prefetch_generation` 收敛 | ⬜ | `[pf-region] hits=0/640`；`region uploads=144`（仅镜像） |
 | P2.3 | 形态与策略解耦：`NINFER_PREFETCH_MODE=vram` 与武装分离会漏（有槽无填充看起来像"没有调用者"） | 不设 MODE 时 `[pf-ctl]` 仍说清 armed | 🟡 | `[pfv] enter #1 bank=3 vram=0` → `skip: mode is not vram` |
 | P2.4 | 复活判据重测：`prev` ≥66%（现 49.4%）、每节点 ≤0.0117 s（现 0.0162 s） | 达标则开，否则写"永久关闭" | ⬜ | 16 槽武装：命中 0.2%、速度 −40% |
@@ -96,15 +106,30 @@
 
 ---
 
-## 3. 可独立关账的 7 项（做完即划掉，互不依赖）
+### P6 35B-e2 制品跑不起来（2026-11-16 新发现，阻塞 e2×驻留验证）
 
-1. P1.1 列名对齐 `*_mb`
-2. P1.4 `cold_range` 进表（取 `unslotted`）
-3. P1.3 `kv_spill` 三元组
-4. P1.2/P2.1 prefetch 强制 0
-5. P4.1 E8/parallel 的 4 处 gate 调用点
-6. P3.3 `[ctl] cpu` 面板在 e2 路径可达
-7. P5.3 `packed_k` 清理
+| ID | 任务 | 验收 | 状态 | 证据 |
+|---|---|---|---|---|
+| P6.1 | 查清 35B-e2 为何构造期没有建池 / 流未挂载 | 该制品能跑到 `overall` 行且 `[experts] runs=3` | ⬜ | `R:\model\qwen3_6_35b_a3b_e2`（19.6 GiB 权重，24 GB 卡上余量 ~2.2 GiB）→ `error: ... text/layers/0 prefill columns=161: expert stream upload: expert stream is not attached`；日志仅 11 行，无 `[device split]` / `[pool]` / `[budget]` / `[experts]`；同目录 plain 35B `overall 6.701375`、27B `overall 5.393824`（两者都无池行 → 非 e2） |
+
+---
+
+## 3. 可独立关账的项目（做完即划掉，互不依赖）
+
+已关账（本轮）：
+
+1. ✅ P1.1 列名对齐 `*_mb`
+2. ✅ P1.4 `cold_range` 进表
+3. ✅ P1.3 `kv_spill` 三元组
+4. ✅ P1.2 prefetch 强制 0（`NINFER_PREFETCH_SLOTS` 单独设置已 fail-loud）
+5. ✅ P3.3 `[ctl] cpu` 面板在 e2 路径可达
+
+待关账：
+
+1. P4.1 E8/parallel 的 4 处 gate 调用点
+2. P5.3 `packed_k` 清理
+3. P2.3 形态与策略解耦（`[pfv]/[pf-ctl]` 说清楚缺哪一半）
+4. P6.1 35B-e2 为何不建池 / 流未挂载
 
 ## 4. 口径与陷阱（写下来，避免下一轮再踩）
 
