@@ -1319,11 +1319,27 @@ void ExpertStream::gh1_report(cudaStream_t stream) {
         // something stages into it. With no form (explicit fill/warm) the zero is a property of the
         // switch, and saying so here is what keeps the reading from blaming the caller.
         const auto form = prefetch_region_form();
+        // P2.2: the fill's own numbers, because a hit rate cannot say whether a zero came from a guess
+        // that was wrong or a placement that never happened. `select` counts the layers a selection was
+        // launched for, `placed` the pairs the Device wrote, `applied` the ones the pool took; the gap
+        // between the last two is a prediction for an expert that turned out to be resident already.
+        std::uint64_t fill_launched = 0, fill_placed = 0, fill_applied = 0, fill_skipped = 0;
+        std::uint64_t fill_failed = 0, fill_overflow = 0;
+        for (const auto& fill : fill_) {
+            fill_launched += fill.launched;
+            fill_placed += fill.requested;
+            fill_applied += fill.applied;
+            fill_skipped += fill.skipped;
+            fill_failed += fill.failed;
+            fill_overflow += fill.overflow;
+        }
         std::fprintf(stderr,
-                     "[pf-region] %u slot(s)/bank | form=%s%s staged=%d | hits=%llu calls=%llu "
-                     "(%.1f%%) | routes examined, "
+                     "[pf-region] bank=%u %u slot(s)/bank | form=%s%s staged=%d | hits=%llu calls=%llu "
+                     "(%.1f%%) | fill=dev(select=%llu placed=%llu applied=%llu already=%llu "
+                     "ring-full=%llu undrained=%llu) | "
+                     "routes examined, "
                      "all runs must hold the expert in a region slot\n",
-                     cache_->prefetch_slots_per_bank(), prefetch_form_name(form),
+                     bank_, cache_->prefetch_slots_per_bank(), prefetch_form_name(form),
                      prefetch_region_form_defaulted() ? "(default)" : "(explicit)",
                      form == PrefetchForm::Vram ? 1 : 0,
                      static_cast<unsigned long long>(prefetch_hits_),
@@ -1331,7 +1347,13 @@ void ExpertStream::gh1_report(cudaStream_t stream) {
                      prefetch_route_samples_ != 0
                          ? 100.0 * static_cast<double>(prefetch_hits_) /
                                static_cast<double>(prefetch_route_samples_)
-                         : 0.0);
+                         : 0.0,
+                     static_cast<unsigned long long>(fill_launched),
+                     static_cast<unsigned long long>(fill_placed),
+                     static_cast<unsigned long long>(fill_applied),
+                     static_cast<unsigned long long>(fill_skipped),
+                     static_cast<unsigned long long>(fill_overflow),
+                     static_cast<unsigned long long>(fill_failed));
         std::fflush(stderr);
     }
     if (std::getenv("NINFER_EXPERT_TIMING") == nullptr || gh1_calls_ % 8 != 0) { return; }
@@ -1629,33 +1651,56 @@ void ExpertStream::stage_predicted(cudaStream_t stream) {
     //
     // Device form (S3-1): the ids never crossed PCIe. S3-2's resolution half runs where they are -
     // moe_route_slots() against the pool's own slot mirror, once per matrix run, so an expert's slot in
-    // the gate run and its absence from the down run are both visible. The placement half - the words
-    // set_prefetch_experts() writes (owner, region cursor, generation, entry readiness) and the bytes
-    // that then have to leave the artifact - cannot be applied from the Device, and the reason is not
-    // a missing kernel: the pool's tables are host-authoritative (every publication reads
-    // cache_->expert_slot()), and the only Device-addressable source of an expert's bytes is the
-    // pinned tier, so a kernel-side fill would have to read PCIe at SM rates. The house precedent for
-    // "the Device decides, the host applies" is device_admit_ring(), which drains its descriptors
-    // with cudaStreamSynchronize and issues cudaMemcpyAsync itself. So this form resolves and counts,
-    // and says that the fill did not happen instead of pretending it did.
+    // the gate run and its absence from the down run are both visible.
+    //
+    // P2.2 closes the placement half the same way. The words set_prefetch_experts() writes (owner,
+    // region cursor, generation, entry readiness) are the pool's own tables, and every publication
+    // reads them on the host - that half cannot move, and the house precedent for "the Device decides,
+    // the host applies" is device_admit_ring(). What was missing was a decision maker for it: the host
+    // cannot say which predicted expert is already resident without the ids, so the region was never
+    // filled. ops::moe_prefetch_select is that decision - it resolves the ids against this run's
+    // placement mirror and this bank's ring cursor, both on the Device, and leaves (expert, region)
+    // pairs behind. The host applies them at the next layer's own synchronise; the byte copy stays on
+    // the pool's upload path, because the only Device-addressable source is the pinned tier and an
+    // expert the tier holds is already addressed without a copy.
     if (predicted_is_device()) {
         const auto count = predicted_device_count();
         ++predicted_layers_;
         if (cache_->prefetch_slots_per_bank() != 0) {
             lookup_routed_slots(predicted_device_ids(), count, stream,
                                 ops::RouteTableKind::PrefetchRegion, /*armed=*/true);
+            stage_predicted_device(stream);
         }
         static std::uint64_t reports = 0;
-        if (bank_ < 4 && (++reports % 40) == 0) {
+        // One line per eight hand-offs on the first stream, behind the region being armed: a run short
+        // enough to be read (a 24-token generation) still gets the fill's accounting out.
+        if (bank_ == 0 && (++reports % 8) == 0) {
+            std::uint64_t launched = 0, requested = 0, applied = 0, skipped = 0, overflow = 0;
+            std::uint64_t out_of_range = 0, duplicates = 0, failed = 0;
+            for (const auto& fill : fill_) {
+                launched += fill.launched;
+                requested += fill.requested;
+                applied += fill.applied;
+                skipped += fill.skipped;
+                overflow += fill.overflow;
+                out_of_range += fill.out_of_range;
+                duplicates += fill.duplicates;
+                failed += fill.failed;
+            }
             std::fprintf(stderr,
                          "[pf-pred] Device form: layers=%llu handoffs=%llu handoff_fail=%llu | "
-                         "runs_resolved=%llu run_mismatch=%llu | ids/layer=%d fill=host-only "
-                         "(0 placed by the Device)\n",
+                         "runs_resolved=%llu run_mismatch=%llu | ids/layer=%d | "
+                         "fill=dev(select=%llu placed=%llu applied=%llu already=%llu ring-full=%llu "
+                         "oob=%llu dup=%llu failed=%llu) bytes via the pool's upload path\n",
                          (unsigned long long)predicted_layers_,
                          (unsigned long long)predicted_device_handoffs_,
                          (unsigned long long)predicted_device_failures_,
                          (unsigned long long)predicted_runs_resolved_,
-                         (unsigned long long)predicted_run_mismatches_, int(count));
+                         (unsigned long long)predicted_run_mismatches_, int(count),
+                         (unsigned long long)launched, (unsigned long long)requested,
+                         (unsigned long long)applied, (unsigned long long)skipped,
+                         (unsigned long long)overflow, (unsigned long long)out_of_range,
+                         (unsigned long long)duplicates, (unsigned long long)failed);
             std::fflush(stderr);
         }
         return;
@@ -1679,6 +1724,7 @@ void ExpertStream::stage_predicted(cudaStream_t stream) {
                          prefetch_form_name(form),
                          prefetch_region_form_defaulted() ? "(default)" : "(explicit)",
                          std::getenv("NINFER_PREFETCH_SLOTS") != nullptr ? "env" : "controller",
+                         cache_ != nullptr ? cache_->prefetch_slots_per_bank() : 0U,
                          port.cold_share >= 0.0 ? 100.0 * port.cold_share : -1.0,
                          port.hit_rate >= 0.0 ? 100.0 * port.hit_rate : -1.0,
                          port.cpu_share >= 0.0 ? 100.0 * port.cpu_share : -1.0,
@@ -1826,6 +1872,182 @@ void ExpertStream::stage_predicted(cudaStream_t stream) {
         std::fflush(stderr);
     }
 }
+
+// ---- P2.2: the prediction region's placement, decided on the Device -------------------------------
+//
+// The three calls below are one hand-off, split the same way the prediction ring is split: the launch
+// happens where the guess is made (stage_predicted, at the end of the layer that produced it), the
+// drain's copies are queued in front of the consumer layer's own route synchronise, and the adoption
+// reads them after it. Nothing here adds a synchronise, and nothing here reads the ids on the host.
+//
+// Why the ring position has to live on the Device: it is the one value that decides WHERE a placement
+// goes, and if the host supplied it the "which region slot" decision would be back on the host - the
+// pair list would then be the host's own answer written down twice. `fill_[i].cursor` is advanced by
+// the selector kernel (atomicAdd), so the host learns the positions only by reading the result.
+bool ExpertStream::ensure_fill(std::size_t index) {
+    if (cache_ == nullptr || index >= fill_.size()) { return false; }
+    const auto regions = cache_->prefetch_slots_per_bank();
+    if (regions == 0) { return false; }
+    auto& fill = fill_[index];
+    if (fill.cursor == nullptr || fill.counts == nullptr) {
+        try {
+            fill.cursor = std::make_unique<DeviceBuffer>(sizeof(std::uint32_t));
+            fill.counts = std::make_unique<DeviceBuffer>(6 * sizeof(std::uint32_t));
+        } catch (const std::exception& error) {
+            ++fill.failed;
+            std::fprintf(stderr, "[pf-fill] run %zu Device buffers failed: %s\n", index, error.what());
+            std::fflush(stderr);
+            return false;
+        }
+        if (const auto status = cudaMemset(fill.cursor->p, 0, sizeof(std::uint32_t));
+            status != cudaSuccess) {
+            ++fill.failed;
+            std::fprintf(stderr, "[pf-fill] cursor reset failed: %s\n", cudaGetErrorString(status));
+            std::fflush(stderr);
+            return false;
+        }
+    }
+    if (fill.capacity < regions || fill.pairs == nullptr || fill.stage == nullptr) {
+        fill.capacity = regions;
+        try {
+            fill.pairs = std::make_unique<DeviceBuffer>(2 * std::size_t{regions} * sizeof(std::uint32_t));
+            fill.stage = std::make_unique<PinnedHostBuffer>(6 * sizeof(std::uint32_t) +
+                                                           2 * std::size_t{regions} * sizeof(std::uint32_t));
+        } catch (const std::exception& error) {
+            ++fill.failed;
+            fill.pairs.reset();
+            fill.stage.reset();
+            std::fprintf(stderr, "[pf-fill] run %zu pair buffers (%u slot(s)) failed: %s\n", index,
+                         regions, error.what());
+            std::fflush(stderr);
+            return false;
+        }
+    }
+    fill.regions = regions;
+    return true;
+}
+
+void ExpertStream::stage_predicted_device(cudaStream_t stream) {
+    if (cache_ == nullptr) { return; }
+    const auto ids = predicted_device_ids();
+    if (ids == nullptr || predicted_device_count() <= 0) { return; }
+    // The fused form's ensure() has no unconditional synchronise to drain behind, so its fill would be
+    // applied a layer late; the split form (the artifacts this port targets) has exactly one. Said
+    // here rather than left to a hit count: a region that stages on one form and not the other is a
+    // fact a reader of `[pf-region]` needs.
+    if (!split_banks_) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            std::fprintf(stderr,
+                         "[pf-fill] bank=%u: the Device fill is wired on the gate/up/down form only "
+                         "(its ensure() has the route synchronise the drain rides); this fused stream "
+                         "resolves and counts, and places nothing\n",
+                         bank_);
+            std::fflush(stderr);
+        }
+        return;
+    }
+    const auto count = static_cast<int>(predicted_device_count());
+    for (std::size_t index = 0; index < split_.size(); ++index) {
+        if (!ensure_fill(index)) { continue; }
+        auto& fill = fill_[index];
+        const auto bank = split_[index].bank;
+        // A selection whose drain never happened is dropped here rather than applied now: the pairs
+        // buffer is about to be overwritten, and a placement applied a layer late would be counted as
+        // a hit for a layer that never predicted it.
+        if (fill.pending) {
+            ++fill.failed;
+            fill.pending = false;
+        }
+        if (const auto cleared = cudaMemsetAsync(fill.counts->p, 0, 6 * sizeof(std::uint32_t), stream);
+            cleared != cudaSuccess) {
+            ++fill.failed;
+            std::fprintf(stderr, "[pf-fill] bank=%u counts reset failed: %s\n", bank,
+                         cudaGetErrorString(cleared));
+            std::fflush(stderr);
+            continue;
+        }
+        // The placement mirror is the same table the demand path resolves through: "does the pool
+        // already hold this expert" is read where that answer lives, not reconstructed. A null
+        // segment (no current image) degrades to "assume absent": the adoption below still refuses a
+        // duplicate, so a degraded run places fewer, never wrong ones.
+        std::uint32_t entries     = 0;
+        const auto* placement     = slot_mirror_segment(bank, &entries, ops::RouteTableKind::Placement);
+        ops::moe_prefetch_select(ids, count, placement, count_,
+                                 static_cast<std::uint32_t*>(fill.cursor->p), fill.regions,
+                                 static_cast<std::uint32_t*>(fill.pairs->p), fill.capacity,
+                                 static_cast<std::uint32_t*>(fill.counts->p), stream);
+        if (const auto status = cudaGetLastError(); status != cudaSuccess) {
+            ++fill.failed;
+            std::fprintf(stderr, "[pf-fill] bank=%u select launch (%d ids) failed: %s\n", bank, count,
+                         cudaGetErrorString(status));
+            std::fflush(stderr);
+            continue;
+        }
+        fill.pending = true;
+        ++fill.launched;
+    }
+}
+
+void ExpertStream::prefetch_fill_begin_fetch(cudaStream_t stream) {
+    if (cache_ == nullptr || !split_banks_) {
+        for (auto& fill : fill_) { fill.pending = false; }
+        return;
+    }
+    for (std::size_t index = 0; index < split_.size(); ++index) {
+        auto& fill = fill_[index];
+        if (!fill.pending || fill.stage == nullptr || fill.counts == nullptr) {
+            fill.pending = false;
+            continue;
+        }
+        const std::size_t counts_bytes = 6 * sizeof(std::uint32_t);
+        const std::size_t pairs_bytes  = 2 * std::size_t{fill.capacity} * sizeof(std::uint32_t);
+        auto* landing = static_cast<char*>(fill.stage->data());
+        if (cudaMemcpyAsync(landing, fill.counts->p, counts_bytes, cudaMemcpyDeviceToHost, stream) !=
+                cudaSuccess ||
+            cudaMemcpyAsync(landing + counts_bytes, fill.pairs->p, pairs_bytes,
+                            cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
+            ++fill.failed;
+            fill.pending = false;
+            std::fprintf(stderr, "[pf-fill] run %zu drain copy failed: %s\n", index,
+                         cudaGetErrorString(cudaGetLastError()));
+            std::fflush(stderr);
+        }
+    }
+}
+
+void ExpertStream::prefetch_fill_apply() {
+    if (cache_ == nullptr || !split_banks_) { return; }
+    for (std::size_t index = 0; index < split_.size(); ++index) {
+        auto& fill = fill_[index];
+        if (!fill.pending || fill.stage == nullptr) { continue; }
+        fill.pending = false;
+        const auto* counts = static_cast<const std::uint32_t*>(fill.stage->data());
+        const auto placed  = std::min<std::uint32_t>(counts[0], fill.capacity);
+        fill.requested += placed;
+        fill.skipped += counts[1];
+        fill.overflow += counts[2];
+        fill.out_of_range += counts[4];
+        fill.duplicates += counts[5];
+        if (placed == 0) { continue; }
+        const auto* words = reinterpret_cast<const std::uint32_t*>(
+            static_cast<const char*>(fill.stage->data()) + 6 * sizeof(std::uint32_t));
+        fill_pairs_.resize(placed);
+        for (std::uint32_t i = 0; i < placed; ++i) {
+            fill_pairs_[i] = PrefetchPlacement{words[2 * i], words[2 * i + 1]};
+        }
+        // The pairs are in the region's space; the pool converts them (and refuses anything that is
+        // not one of its own region slots). The keys come back because the bytes are not in the pool
+        // yet - the copy is the layer's own upload turn.
+        fill_applied_.clear();
+        const auto adopted = cache_->adopt_prefetch_placements(
+            split_[index].bank, std::span<const PrefetchPlacement>(fill_pairs_), fill_applied_);
+        fill.applied += adopted;
+        for (const auto& key : fill_applied_) { fill_upload_keys_.push_back(key); }
+    }
+}
+
 
 // port (sm_89): P1 - the prediction hand-off as a ring the Device writes and the host drains.
 //
@@ -3157,6 +3379,9 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
         // covers both reads. This is the whole "no new per-layer synchronise" claim: the layer had one
         // route read-back and still has exactly one, and the ring rides it.
         pred_ring_begin_fetch(stream);
+        // P2.2: the same for the fill's (expert, region) pairs - queued here, read after the sync, so
+        // the Device's placement costs no wait of its own.
+        prefetch_fill_begin_fetch(stream);
         const auto sync = cudaStreamSynchronize(stream);
         if (sync != cudaSuccess) {
             throw std::runtime_error(std::string("route sync: ") + cudaGetErrorString(sync));
@@ -3164,12 +3389,20 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
         route_ms  = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
                                                              begin).count();
         route_ids = static_cast<const std::int32_t*>(route_staging_->data());
+        prefetch_fill_apply();
     } else {
         // The caller handed the routes over already read, and this path does not synchronise at all
         // (it is the prefill/static one). Draining the ring here would need a wait this path does not
         // have, so it is left alone: the entry stays in the ring and is counted as dropped when the
         // consumer next runs. Adding a synchronise to keep a prediction would be a worse trade than
         // losing the prediction, and the count says which happened.
+        //
+        // P2.2: the fill's drain rides the same wait, so it is the CALLER's to issue on this path -
+        // and it does: ffn's split layer queues the pair copies before fetch_host_routed() and applies
+        // them after it, which is the only synchronise this layer performs. A pending selection is
+        // therefore left alone here; the next launch for the same bank drops it if it is still
+        // unapplied (a placement that arrives with a later layer's routes would read as a hit it never
+        // earned).
     }
     for (std::size_t i = 0; i < values; ++i) {
         const auto expert = route_ids[i];
@@ -3769,6 +4002,24 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
                                     return a.bank == b.bank && a.expert == b.expert;
                                 }),
                     required_.end());
+    // P2.2: the region's placements are part of the same upload turn. The adoption above only recorded
+    // WHICH expert the Device put in WHICH region slot; the pool's tables stay host-authoritative, so
+    // the bytes still move here - through the one uploader, on the layer's own stream, ordered before
+    // the GEMM that reads them. A placement whose expert the resident set dropped in the meantime has
+    // no slot any more and is refused by the uploader, which is why merging is safe unconditionally.
+    if (!fill_upload_keys_.empty()) {
+        required_.insert(required_.end(), fill_upload_keys_.begin(), fill_upload_keys_.end());
+        fill_upload_keys_.clear();
+        std::sort(required_.begin(), required_.end(),
+                  [](const ExpertCacheKey& a, const ExpertCacheKey& b) {
+                      return a.bank != b.bank ? a.bank < b.bank : a.expert < b.expert;
+                  });
+        required_.erase(std::unique(required_.begin(), required_.end(),
+                                    [](const ExpertCacheKey& a, const ExpertCacheKey& b) {
+                                        return a.bank == b.bank && a.expert == b.expert;
+                                    }),
+                        required_.end());
+    }
     // The bytes this layer will actually put on the link: an entry only moves when its image is not
     // already ready. Counted in both arms - a counter that only runs when the policy is on cannot
     // say what the policy saved, which is the one comparison it exists for.

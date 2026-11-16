@@ -340,6 +340,34 @@ void moe_route_slots(const std::int32_t* ids, int count, const std::uint32_t* ta
                      std::uint32_t entries, RouteTableKind kind, std::uint32_t* slots,
                      std::uint32_t* misses, cudaStream_t stream);
 
+// port (sm_89), P2.2: the prediction region's PLACEMENT, decided on the Device
+// (kernels/cuda/prefetch_select.cu).
+//
+// The Device form of the prediction hand-off keeps the ids off the host (`set_predicted_device`), so
+// the region's fill had no decision maker: nothing on the host could say which predicted expert was
+// already resident, and the placement never happened (`[pf-region] hits=0`). This kernel is that
+// decision. For each of the `count` ids it writes, in the region's own space,
+//
+//   pairs[2*k]   = expert           pairs[2*k+1] = region index (0 .. regions-1)
+//
+// for the ids that are neither out of range nor already addressable (`placement_table[id] ==
+// kAbsentSlot`, i.e. the pool holds no slot for them - `placement_table` is one bank's exported table
+// as it sits in the Device mirror, and may be null when no mirror exists), and advances `*cursor`.
+// `cursor` is a Device word: the ring position is a Device fact, which is what lets the host apply a
+// placement the Device chose instead of re-deriving it.
+//
+// `counts` is six Device words, zeroed by the caller before the launch:
+//   [0] placements written   [1] already addressable   [2] ring full (over `capacity`)
+//   [3] reserved            [4] id outside the bank     [5] duplicate id inside one guess
+//
+// The bytes are not copied here - see the kernel's own note: the source that matters (the artifact) is
+// host-only, so the copy stays on the pool's upload path. Nothing synchronises; the caller reads the
+// result at the synchronise the layer already performs.
+void moe_prefetch_select(const std::int32_t* ids, int count, const std::uint32_t* placement_table,
+                         std::uint32_t experts, std::uint32_t* cursor, std::uint32_t regions,
+                         std::uint32_t* pairs, std::uint32_t capacity, std::uint32_t* counts,
+                         cudaStream_t stream);
+
 // port (sm_89): P1 - the prediction hand-off as a ring the Device writes and the host drains
 // (kernels/cuda/pred_ring.cu).
 //

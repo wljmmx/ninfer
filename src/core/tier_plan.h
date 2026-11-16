@@ -85,21 +85,30 @@ struct KvSpillView {
     std::string reread  = "none";
 };
 
-// Does anything consume a Device prefetch region? The Device form of `ExpertStream::stage_predicted`
-// resolves the predicted ids against the pool's own mirror and counts them, and states in its own
-// panel that it placed nothing: `[pf-pred] Device form: ... fill=host-only (0 placed by the Device)`
-// (expert_stream.cpp). The placement half - the words set_prefetch_experts() writes and the bytes
-// that then have to leave the artifact - only exists on the host form. So the region has no Device
-// consumer today, and the line is zero BY RULE rather than because a controller computed zero:
-// before this, `[ctl] prefetch port ... -> 0 slot(s)/bank` made "nobody is connected" look like "the
-// policy chose nothing", and `NINFER_PREFETCH_SLOTS` could still carve a region no one filled
-// (measured: 20 slots/bank = 3.6 GiB = 30% of the pool, 1.54 tok/s against 8.28 without).
-inline constexpr bool device_prefetch_consumer_present() noexcept { return false; }
+// Does anything consume a Device prefetch region? Until P2.2 the answer was no, and this predicate was
+// the rule that kept the line at zero: the Device form of `ExpertStream::stage_predicted` resolved the
+// predicted ids against the pool's own mirror, counted them, and stated in its own panel that it had
+// placed nothing (`fill=host-only (0 placed by the Device)`), because the placement decision needed the
+// ids on the host and the Device form keeps them on the Device.
+//
+// P2.2 supplies exactly that decision: `ops::moe_prefetch_select` resolves the ids against this run's
+// placement mirror and this bank's ring cursor on the Device, writes the (expert, region) pairs it
+// chose, and the pool applies them at the layer's own existing synchronise
+// (`ExpertCache::adopt_prefetch_placements`). So a region now has a consumer, and this predicate says
+// so. The line can still be zero - but for the other reason, which now has its own sentence: no
+// staging source was requested on this run, so decision 5 asked for no slots (`kDevicePrefetchUnasked`).
+//
+// The size is still not a constant and still not a switch: `decide_prefetch_slots()` scales the prior
+// by the cold share and the measured rate, and the carve is taken from the pool's own slots - which is
+// why an armed region is a measured 30% residency cost and why the default run (nothing asked for)
+// must keep computing zero.
+inline constexpr bool device_prefetch_consumer_present() noexcept { return true; }
 
 // The reason string the Device prefetch line carries when it is zero, so "the policy took nothing"
-// and "there is nobody to take it" cannot be read the same way. Kept beside the predicate it explains.
-inline constexpr const char* kDevicePrefetchNoConsumer =
-    "no consumer: device-side placement absent (stage_predicted resolves and counts, fill=host-only)";
+// and "nobody asked for a region" cannot be read the same way. Kept beside the predicate it explains.
+inline constexpr const char* kDevicePrefetchUnasked =
+    "no region asked for: no staging source on this run (NINFER_PREFETCH_MODE / PRED_RING / "
+    "PREFETCH_SIGNAL), so decision 5 sized zero - the region is a slice of the pool's own slots";
 
 inline constexpr std::array<BudgetSlot, kBudgetCount> kBudgetSlots{{
     // Name and order follow the capacity spec: device expert_pool_mb | kv_pages_mb | prefetch_mb |
@@ -108,7 +117,7 @@ inline constexpr std::array<BudgetSlot, kBudgetCount> kBudgetSlots{{
     {Budget::DeviceExpertPool, Tier::Device, "expert_pool_mb", Budget::DeviceExpertPool, nullptr, false},
     {Budget::DeviceKvPages, Tier::Device, "kv_pages_mb", Budget::DeviceKvPages, nullptr, false},
     {Budget::DevicePrefetch, Tier::Device, "prefetch_mb", Budget::DeviceExpertPool,
-     kDevicePrefetchNoConsumer, false},
+     kDevicePrefetchUnasked, false},
     {Budget::DeviceSlruBand, Tier::Device, "slru_band_mb", Budget::DeviceExpertPool,
      "no claim of its own - SLRU segments expert_pool_mb at policy time", false},
     {Budget::DeviceStartup, Tier::Device, "staging_mb", Budget::DeviceStartup,

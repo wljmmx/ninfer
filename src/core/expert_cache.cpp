@@ -617,11 +617,74 @@ std::vector<std::uint64_t> bank_generation;
         return count;
     }
 
+    // P2.2: the placement the DEVICE chose, applied by the host. Same bookkeeping as set_prefetch()
+    // above, except that the two decisions it takes (which experts, which region slot) arrive as
+    // arguments. Everything the pool owes afterwards is identical: the region index names this bank's
+    // reserved slot, the previous owner of that slot loses its row, the arriving expert's image is
+    // marked unready so the uploader moves the bytes, and the region's generation moves so the Device
+    // mirror is re-exported.
+    //
+    // The region index is checked against this bank's own region and against the pool's slot roles.
+    // A pair that fails either test is a caller using one slot space as the other, and the two numbers
+    // are printed before the throw: a wrong slot is not a miss, it is another expert's weights.
+    std::uint32_t adopt_prefetch(std::uint32_t bank, std::span<const PrefetchPlacement> placements,
+                                 std::vector<ExpertCacheKey>& placed) {
+        if (prefetch_per_bank == 0 || bank >= banks.size()) { return 0; }
+        auto& slots  = slot_of[bank];
+        auto& owner  = prefetch_owner[bank];
+        std::uint32_t count = 0;
+        for (const auto& placement : placements) {
+            if (placement.region >= prefetch_per_bank ||
+                bank >= prefetch_slots.size() || placement.region >= prefetch_slots[bank].size()) {
+                throw std::runtime_error(
+                    "prefetch region index " + std::to_string(placement.region) +
+                    " is outside bank " + std::to_string(bank) + "'s region (" +
+                    std::to_string(prefetch_per_bank) + " slot(s)); the Device named a region slot " +
+                    "the pool did not reserve");
+            }
+            if (placement.expert >= slots.size()) {
+                throw std::runtime_error(
+                    "prefetch placement names expert " + std::to_string(placement.expert) +
+                    " outside bank " + std::to_string(bank) + " (width " +
+                    std::to_string(slots.size()) + ")");
+            }
+            const std::uint32_t slot = prefetch_slots[bank][placement.region];
+            if (!prefetch_slot(slot)) {
+                throw std::runtime_error(
+                    "prefetch region index " + std::to_string(placement.region) + " of bank " +
+                    std::to_string(bank) + " names pool slot " + std::to_string(slot) +
+                    ", which is not a region slot - a pool slot was passed where a region index "
+                    "was expected");
+            }
+            if (slots[placement.expert] != kAbsentSlot) {
+                // Already resident (or already placed in this region): nothing to do, and nothing to
+                // upload. The Device filters these too; the check is repeated because the device
+                // reads a mirror and this is the table the run will actually address.
+                continue;
+            }
+            const std::uint32_t old = owner[placement.region];
+            if (old != kAbsentSlot && old < slots.size() && slots[old] == slot) {
+                slots[old]                       = kAbsentSlot;
+                entries[first[bank] + old].ready = false;
+                ++evictions;
+            }
+            owner[placement.region]                      = placement.expert;
+            slots[placement.expert]                      = slot;
+            entries[first[bank] + placement.expert].ready = false;
+            placed.push_back(ExpertCacheKey{bank, placement.expert});
+            ++count;
+        }
+        if (count != 0) {
+            if (prefetch_gen.size() <= bank) { prefetch_gen.resize(bank + 1, 0); }
+            ++prefetch_gen[bank];
+        }
+        return count;
+    }
+
     // True when this global slot belongs to a bank's prediction region.
     [[nodiscard]] bool prefetch_slot(std::uint32_t slot) const noexcept {
         return slot < slot_role.size() && slot_role[slot] == kRolePrefetch;
     }
-
     [[nodiscard]] bool ring_slot(std::uint32_t slot) const noexcept {
         return slot < slot_role.size() && slot_role[slot] == kRoleRing;
     }
@@ -1845,6 +1908,26 @@ std::uint32_t ExpertCache::export_prefetch_owners(std::uint32_t bank,
     const auto count   = std::min<std::size_t>(owners.size(), out.size());
     for (std::size_t i = 0; i < count; ++i) { out[i] = owners[i]; }
     return static_cast<std::uint32_t>(count);
+}
+
+// P2.2: the region's pool slots, one word per region index. The fill computes a destination from this
+// table and never from the index itself: a region index and a pool slot are different spaces, and the
+// only thing that may convert one into the other is the pool that reserved the slots.
+std::uint32_t ExpertCache::export_prefetch_slots(std::uint32_t bank,
+                                                 std::span<std::uint32_t> out) const {
+    if (bank >= impl_->prefetch_slots.size()) { return 0; }
+    const auto& slots = impl_->prefetch_slots[bank];
+    const auto count  = std::min<std::size_t>(slots.size(), out.size());
+    for (std::size_t i = 0; i < count; ++i) { out[i] = slots[i]; }
+    return static_cast<std::uint32_t>(count);
+}
+
+// P2.2: apply what the Device decided. This is the host half of the fill and it takes no decision of
+// its own - the expert and the region index are the caller's, in the region's space.
+std::uint32_t ExpertCache::adopt_prefetch_placements(
+    std::uint32_t bank, std::span<const PrefetchPlacement> placements,
+    std::vector<ExpertCacheKey>& placed) {
+    return impl_->adopt_prefetch(bank, placements, placed);
 }
 
 std::optional<std::uint32_t> ExpertCache::prefetch_region_slot(std::uint32_t bank,

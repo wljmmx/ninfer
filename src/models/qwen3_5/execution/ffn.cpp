@@ -1577,8 +1577,15 @@ void split_moe_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor&
             // synchronise covers them and the drain needs no wait of its own.
             const bool ring_armed = moe.stream->pred_ring_armed();
             if (ring_armed) { moe.stream->pred_ring_begin_fetch(stream); }
+            // P2.2: the fill's (expert, region) pairs ride the same wait. On this path the routes are
+            // already read back by fetch_host_routed(), so that call - not ensure_split's own copy -
+            // is the one synchronise the layer actually performs; the placement is applied right
+            // after it, which is before ensure_split counts the region's hits and before it publishes
+            // the tables the GEMM reads.
+            moe.stream->prefetch_fill_begin_fetch(stream);
             auto fetch = fetch_host_routed(hidden, routes, residual, stream,
                                            pack_read_back ? pack_span.data : nullptr);
+            moe.stream->prefetch_fill_apply();
             if (!moe.stream->ensure(ids.data, top_k, columns, stream, fetch.ids.data())) {
                 throw std::runtime_error(moe.split->parameter +
                                          ": the expert pool refused this layer's placement "

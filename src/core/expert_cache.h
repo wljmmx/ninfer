@@ -92,6 +92,17 @@ struct ExpertCacheKey {
     friend bool operator==(const ExpertCacheKey&, const ExpertCacheKey&) = default;
 };
 
+// P2.2: one placement of the prediction region, as the DEVICE decided it.
+//
+// `region` is an index into this bank's region (0..prefetch_slots_per_bank-1), not a pool slot: the
+// device picks the ring position (its own cursor), the pool answers which bytes that position is
+// (`prefetch_region_slot`). Keeping the pair in the region's space is what makes a mixed-up caller
+// detectable at the adoption below instead of silently addressing another expert's slot.
+struct PrefetchPlacement {
+    std::uint32_t expert = 0;
+    std::uint32_t region = 0;
+};
+
 // Where one expert currently lives in the pool.
 struct ExpertSlot {
     ExpertCacheKey key;
@@ -169,6 +180,26 @@ void prepare(std::span<const ExpertCacheKey> required, cudaStream_t stream = nul
     // a prediction that is already there is not a prediction, and the delta is what sizes the region.
     std::uint32_t set_prefetch_experts(std::uint32_t bank, std::span<const std::uint32_t> experts,
                                        std::vector<ExpertCacheKey>& placed);
+    // P2.2: the same placement, with the two decisions the host used to take - WHICH experts and
+    // WHICH region slot - already made on the Device (ops::moe_prefetch_select). The host only
+    // applies: it records the pair the Device names and returns the keys whose bytes still have to
+    // move, because the pool's tables stay host-authoritative and every publication reads them.
+    //
+    // The region index is validated here, against this bank's own region: an index outside
+    // `prefetch_slots_per_bank`, or one that does not name a region slot of THIS bank, throws with
+    // both numbers. That is the fail-loud rule for the two slot spaces - a Device that handed back a
+    // pool slot where a region index was expected must stop the run, not address another expert.
+    //
+    // Experts the pool already holds are skipped (a prediction that is already resident is not a
+    // prediction), and the region slot's previous owner loses its row exactly as set_prefetch does.
+    std::uint32_t adopt_prefetch_placements(std::uint32_t bank,
+                                            std::span<const PrefetchPlacement> placements,
+                                            std::vector<ExpertCacheKey>& placed);
+    // P2.2: the region's POOL slots, one word per region index. This is the table the Device fill
+    // computes its destination from: a second slot space (a second numbering of the ring) is what the
+    // two-space rule forbids, so the Device is handed this bank's own reserved slots instead of
+    // deriving addresses from an index.
+    std::uint32_t export_prefetch_slots(std::uint32_t bank, std::span<std::uint32_t> out) const;
     [[nodiscard]] bool prefetch_slot(std::uint32_t slot) const noexcept;
     [[nodiscard]] std::uint32_t prefetch_slots_per_bank() const noexcept;
     // The pool's own geometry, for a caller that has to clamp a region against the real window

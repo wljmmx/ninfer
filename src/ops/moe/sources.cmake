@@ -9,6 +9,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/host_handoff.cu"
   "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/expert_table.cu"
   "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/route_slots.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/prefetch_select.cu"
   "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/pred_ring.cu"
   "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/ring_admission.cu"
   "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/groupwise_int/token_swiglu.cu"

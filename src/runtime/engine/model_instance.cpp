@@ -338,33 +338,33 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
                                     asked("NINFER_PREFETCH_SIGNAL");
         note_prefetch_signals(signals);
         const auto sizing = decide_prefetch_slots();
-        // P1.2: the region is zero BY RULE when its consumer does not exist, not "zero because the
-        // controller happened to compute zero". `core::device_prefetch_consumer_present()` is the
-        // code-level predicate (see tier_plan.h): the Device form of stage_predicted resolves and
-        // counts, it never places, so a carved region has nobody to fill it and only takes routed
-        // slots away.
+        // P1.2/P2.2: the region is zero when the plan asked for nothing, and that is the only reason
+        // it can be zero now. `core::device_prefetch_consumer_present()` used to be the rule that held
+        // the line at zero because the Device form placed nothing; P2.2 gave the region a real
+        // consumer (`ops::moe_prefetch_select` + the pool's adoption), so the predicate is true and
+        // the carve follows decision 5 like any other line - which means "nothing asked to stage" is
+        // still zero, twice over: `staging_reachable` gates the ask, and the size is the model's
+        // geometry times the measured rate.
         region_slots = core::device_prefetch_consumer_present()
                            ? static_cast<std::uint32_t>(sizing.slots_per_bank)
                            : 0;
-        // The old escape hatch is gone: NINFER_PREFETCH_SLOTS used to carve a region with no
-        // consumer, which then read as "the policy chose nothing". It still sizes the host
-        // read-ahead band when the read-ahead is on (host_expert_residency.h), but on its own it can
-        // only mean "arm the Device region" - so say so instead of quietly doing nothing.
+        // NINFER_PREFETCH_SLOTS was the escape hatch that used to carve a region with no consumer
+        // (which then read as "the policy chose nothing"). With a consumer present it names the
+        // region's size, clamped the way the controller clamps its own answer - a quarter of a bank's
+        // window - so an override cannot name slots the pool does not have. It also still sizes the
+        // host read-ahead band (host_expert_residency.h), which is why the line says both.
         if (const char* slots = std::getenv("NINFER_PREFETCH_SLOTS");
             slots != nullptr && *slots != '\0' && std::strtoul(slots, nullptr, 10) != 0) {
-            if (!core::device_prefetch_consumer_present() &&
-                std::getenv("NINFER_PREFETCH") == nullptr) {
-                throw std::runtime_error(
-                    std::string("NINFER_PREFETCH_SLOTS=") + slots +
-                    " cannot arm the Device prefetch region: it has no consumer (" +
-                    core::kDevicePrefetchNoConsumer +
-                    "). The region is zero by rule; set NINFER_PREFETCH too if you meant the host "
-                    "read-ahead band.");
+            const auto forced = prefetch_slots_forced();
+            if (core::device_prefetch_consumer_present() && forced > 0) {
+                const auto ceiling = std::max(1, signals.pool_slots_per_bank / 4);
+                region_slots = static_cast<std::uint32_t>(std::min(forced, ceiling));
             }
             std::fprintf(stderr,
-                         "[ctl] prefetch: NINFER_PREFETCH_SLOTS=%s sizes the host read-ahead band "
-                         "only; the Device region stays 0 by rule (%s)\n",
-                         slots, core::kDevicePrefetchNoConsumer);
+                         "[ctl] prefetch: NINFER_PREFETCH_SLOTS=%s -> region=%u slot(s)/bank "
+                         "(clamped to a quarter of a bank's window; a region index names one of the "
+                         "pool's own slots), and the host read-ahead band\n",
+                         slots, region_slots);
             std::fflush(stderr);
         }
         std::fprintf(stderr,

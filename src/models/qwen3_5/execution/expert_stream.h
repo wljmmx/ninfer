@@ -520,6 +520,24 @@ public:
     // between the layers, and the next layer's table publish picks the new rows up.
     void stage_predicted(cudaStream_t stream);
 
+    // P2.2: the Device half of the same hand-off. `set_predicted_device` keeps the ids off the host, so
+    // the region's fill had no decision maker and placed nothing (`[pf-region] hits=0`); this launches
+    // the selector that decides which predicted experts are worth a region slot and which slot each
+    // one takes, and leaves the answer in Device memory. The host applies it at the next layer's own
+    // synchronise (`prefetch_fill_apply`), so the hand-off costs no new wait.
+    //
+    // What is Device-side: the ids (never copied), the "already addressable" test (against this run's
+    // placement mirror), the ring cursor (a Device word), and the pair list. What is not: the byte
+    // copy, which stays on the pool's upload path - the only Device-addressable source is the pinned
+    // host tier, and an expert the tier holds is already addressed without a copy.
+    void stage_predicted_device(cudaStream_t stream);
+    // The drain, split like the prediction ring's: the copies are queued in front of the layer's own
+    // route synchronise, and the adoption reads the pinned landing bytes after it.
+    void prefetch_fill_begin_fetch(cudaStream_t stream);
+    // Records what the Device decided and returns the keys whose bytes still have to move (the caller
+    // merges them into its upload list). Refuses a pair that names anything but this bank's own
+    // region slot - see ExpertCache::adopt_prefetch_placements.
+    void prefetch_fill_apply();
     // port (sm_89): P1 - the prediction hand-off as a ring (ops::moe_pred_ring_write).
     //
     // S3's single buffer answers "what did the producer last write"; a pipeline needs "which entry is
@@ -918,6 +936,36 @@ private:
     void note_slot_space(std::uint32_t bank, ops::RouteTableKind kind, std::uint32_t value);
     // Frees a mirror's Device image (a new bank geometry makes the old one unreadable).
     void release_slot_mirror_device() noexcept;
+    // P2.2: one run's Device-side fill. Indexed by run (0 is the fused form's single run), because the
+    // region, the placement table and the ring cursor are all per bank.
+    //
+    // `cursor` is the one piece of state that has to live on the Device: it is the ring position the
+    // NEXT placement takes, and the host must not re-derive it - if it did, the "which slot" decision
+    // would be back on the host and the pair list would be a formality.
+    struct PrefetchFill {
+        std::unique_ptr<DeviceBuffer>     pairs;   // 2 * capacity words: {expert, region}
+        std::unique_ptr<DeviceBuffer>     counts;  // 6 words, zeroed per launch
+        std::unique_ptr<DeviceBuffer>     cursor;  // 1 word: the ring position
+        std::unique_ptr<PinnedHostBuffer> stage;   // counts then pairs, the drain's landing bytes
+        std::uint32_t regions  = 0;
+        std::uint32_t capacity = 0;
+        bool          pending  = false; // a select has been launched and not yet applied
+        std::uint64_t launched      = 0; // layers a selection was launched for
+        std::uint64_t requested     = 0; // placements the Device wrote
+        std::uint64_t applied       = 0; // placements the pool took (the rest were already resident)
+        std::uint64_t skipped       = 0; // ids the Device found already addressable
+        std::uint64_t overflow      = 0; // ids the ring had no room for
+        std::uint64_t out_of_range  = 0; // ids outside this bank
+        std::uint64_t duplicates    = 0; // repeated ids inside one guess
+        std::uint64_t failed        = 0; // a buffer, a launch or a copy failed
+    };
+    std::array<PrefetchFill, 3> fill_;
+    [[nodiscard]] bool ensure_fill(std::size_t index);
+    // The keys an applied placement still owes bytes for, merged into the layer's upload list.
+    std::vector<ExpertCacheKey> fill_upload_keys_;
+    // Scratch for one adoption: the pairs read back from the Device, and the keys the pool took.
+    std::vector<PrefetchPlacement> fill_pairs_;
+    std::vector<ExpertCacheKey>    fill_applied_;
     // S2: whether `bank` is one of this stream's own runs, i.e. whether its segment is kept current on
     // the Device. Shared by the upload and the lookup so the two cannot disagree.
     [[nodiscard]] bool serves_bank(std::uint32_t bank) const noexcept;
