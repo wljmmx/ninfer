@@ -128,6 +128,15 @@ public:
     [[nodiscard]] std::uint32_t runs() const noexcept {
         return static_cast<std::uint32_t>(split_.empty() ? 1 : split_.size());
     }
+    // The pool's geometry, forwarded from the cache the layer is attached to, so a caller sizing a
+    // prediction region reads the model's actual numbers instead of a constant. Both are 0 when no
+    // cache is attached (a resident-only path), which the sizing decision treats as "no region".
+    [[nodiscard]] std::uint32_t pool_banks() const noexcept {
+        return cache_ != nullptr ? cache_->bank_count() : 0;
+    }
+    [[nodiscard]] std::uint32_t pool_slots_per_bank() const noexcept {
+        return cache_ != nullptr ? cache_->slots_per_bank() : 0;
+    }
     // Device-side int32 array, one entry per expert: 1 when the route resolves to an address.
     //
     // port (sm_89): in the split form this is the GATE run's mask. Three runs can hold different
