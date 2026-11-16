@@ -18,7 +18,8 @@ struct LoadPlan::Impl {
     FrontendResources resources;
     InstanceInfo info;
     std::shared_ptr<const qwen4_exp::PleTableSource> ple_table;
-    std::int32_t ple_eos = -1;
+    std::int32_t ple_eos         = -1;
+    bool experts_per_object      = false;
 };
 
 LoadPlan::LoadPlan(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -44,6 +45,8 @@ const artifact::ParameterReference& LoadPlan::parameter(WeightId id) const {
 std::span<const WeightUse> LoadPlan::uses(WeightId id) const {
     return impl_->pending.at(id.index).uses;
 }
+
+bool LoadPlan::experts_per_object() const { return impl_->experts_per_object; }
 
 const std::shared_ptr<const qwen4_exp::PleTableSource>& LoadPlan::ple_table() const {
     return impl_->ple_table;
@@ -132,6 +135,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
             bindings.use(out->weights.draft->output_head,
                          std::string(options.speculative_component()) + "/final_hidden");
     }
+    out->experts_per_object = bindings.experts_per_object;
     out->pending         = std::move(bindings.weights);
     // The PLE table is opened here, while the artifact's object tables are still reachable. The
     // source owns its own read handles, so the plan - not the caller - decides its lifetime.

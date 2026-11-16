@@ -33,6 +33,10 @@ public:
     [[nodiscard]] const artifact::MaterializationPlan& materialization() const;
     [[nodiscard]] const artifact::ParameterReference& parameter(WeightId id) const;
     [[nodiscard]] std::span<const WeightUse> uses(WeightId id) const;
+    // port (sm_89): the plan binds the routed experts as one object per expert, so the FFN's
+    // resident form has no bank parent to read and the run needs a pool. False for a banked
+    // artifact, whose experts can be read resident.
+    [[nodiscard]] bool experts_per_object() const;
     // The PLE n-gram table's disk source, built while the artifact was open; null when the config
     // declares no PLE. It owns its read handles, so it stays valid after the Reader is gone, and
     // the caller hands it to the Parameters the text context runs from.

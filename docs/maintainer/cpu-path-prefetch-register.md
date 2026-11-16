@@ -29,7 +29,7 @@
 | 格 | 预测器 | 端口 | 命中率可读 | 本机可达 |
 |---|---|---|---|---|
 | **e2 × 流式** | 🟡 有信号无放置件：`[pf-pred] written=64 ids=640 drained=64 dropped=0`（环完整），但 `[pf-region] hits=0 calls=640 (0.0%)`；`[pf-ctl] cutoff=0 armed=N reason=depth`（8 槽）/ `armed=Y`（16 槽） | ✅ `[ctl] prefetch port` 正常打印 cold/hit/cpu/runs/banks/slots→N | 🟡 计数器可读（`hits/calls`），但恒 0-0.2%，**语义上等于不可读** | ✅ 可达 |
-| **e2 × 驻留** | — 无需预测（整层驻留） | ✅ 同一端口 | — | **本机不可达，两个独立原因**：① 125B 上 `count_` = 512 专家/bank，整层驻留需 73728 slot × 1.25 MiB ≈ 88 GiB；② 唯一可能装下整层的 **35B-e2 制品本身跑不起来**（见 P6）：`text/layers/0` 抛 `expert stream is not attached`，11 行日志里没有任何 `[pool]`/`[budget]`/`[experts]` 行 |
+| **e2 × 驻留** | — 无需预测（整层驻留） | ✅ 同一端口 | — | **本机不可达，两个独立原因**：① 125B 上 `count_` = 512 专家/bank，整层驻留需 73728 slot × 1.25 MiB ≈ 88 GiB；② 35B-e2 现在能跑了（P6.1 已修，`overall 6.701375`），但池只装 **10040/10240** 专家（池 18879 MiB，每 bank 差 5 槽 × 1920 KiB = 375 MiB），`fully_resident()` 仍为 false |
 | **非 e2 × 流式** | ⬜ "层元数据"信号没有生产：`predict_next_layer` 只有 residual(28.8%) / prev(49.4%) 两条 | ✅ | 🟡 同左（无填充→0） | ❓ 35B plain 能跑（`overall 6.701375`），但它无池行、未确认有专家路由；验法：同命令加 `[pf-pred]`/`[gh1]` 观察是否有 ids |
 | **非 e2 × 驻留** | ⬜ 双缓冲换层未实现；"换层窗口内无 miss"这个前提本身未验证 | ✅ | — | ❓ 验法：35B plain + `[gh1] no_miss_pct` 是否 100%，否则这一格的前提不成立 |
 
@@ -110,7 +110,7 @@
 
 | ID | 任务 | 验收 | 状态 | 证据 |
 |---|---|---|---|---|
-| P6.1 | 查清 35B-e2 为何构造期没有建池 / 流未挂载 | 该制品能跑到 `overall` 行且 `[experts] runs=3` | ⬜ | `R:\model\qwen3_6_35b_a3b_e2`（19.6 GiB 权重，24 GB 卡上余量 ~2.2 GiB）→ `error: ... text/layers/0 prefill columns=161: expert stream upload: expert stream is not attached`；日志仅 11 行，无 `[device split]` / `[pool]` / `[budget]` / `[experts]`；同目录 plain 35B `overall 6.701375`、27B `overall 5.393824`（两者都无池行 → 非 e2） |
+| P6.1 | 查清 35B-e2 为何构造期没有建池 / 流未挂载 | 该制品能跑到 `overall` 行且 `[experts] runs=3` | ✅ | 断点：**加载计划与 FFN 视图判据不一致**。该制品是 repack 布局（一个专家一个对象：`text/layers/0/moe/experts/0/gate` → `weight/expert/000003/000/gate_up` 行 [0,I)、`up` 同一对象行 [I,2I)；对照 plain 35B 的 `experts/0/gate` → `weight/000003` 行 [0,I)、专家 1 的 gate 在同一对象行 [2I,3I)）。于是 `parameters.cpp:524` 的 `resident`（`banks.whole_bank()`）为 false，层里**必然**建 `ExpertStream`（`:571`）；而 `load_options.h:64` 的 `stream_experts = expert_cache_bytes != 0` 因为 19.6 GiB 驻留计划装得下、`expert_cache_bytes` 仍为 0，`model_instance.cpp:1589` 的 `if (options.expert_cache_bytes != 0)` 整段不执行 → 无池、无 attach。修法：`bind_moe` 用专家 0 与专家 1 的**对象身份**判定布局（`text.cpp`，`Bindings::experts_per_object`），`LoadPlan::experts_per_object()` 透出，`model_instance.cpp:1416` 在该判据为真时先按 `kExpertCacheAuto` 重规划再加载。实测：`[budget] experts: this artifact keeps one object per expert, so no parent holds a resident bank view; the run streams them (19.6 GiB resident -> 2.3 GiB)`，`[experts] banks=40 slot=1966080 windows=40 pool=18879MiB`，`overall 1.902313 6.701375`（exit=0，与 plain 35B 逐位相同 → 同一权重、只换对象布局）。**与验收口径的差异**：本制品 `runs=1` 不是 3，因为 repack 里 gate/up 在每个专家对象内是融合的（`fused_form()` 为真）；`runs=3` 的三bank形态是 8B 制品（`experts/gate\|up\|down` 三个 bank 对象，`[experts] host tier ... form=gate/up/down (one tier bank per run)`）。plain 35B 不受影响：仍 `weights ready \| 19.6 GiB`、无新行、`6.701375`；默认两道门禁逐位 `6.024313` / `20.673595`。**驻留仍未达**：池 18879 MiB 只装 10040/10240 专家（每 bank 差 5 槽 × 1920 KiB），故 e2×整层驻留这一格仍不可达 |
 
 ---
 
@@ -123,13 +123,14 @@
 3. ✅ P1.3 `kv_spill` 三元组
 4. ✅ P1.2 prefetch 强制 0（`NINFER_PREFETCH_SLOTS` 单独设置已 fail-loud）
 5. ✅ P3.3 `[ctl] cpu` 面板在 e2 路径可达
+6. ✅ P6.1 35B-e2 建池/挂载（repack 布局没有驻留 bank 视图，改为强制流式 + auto 池）
 
 待关账：
 
 1. P4.1 E8/parallel 的 4 处 gate 调用点
 2. P5.3 `packed_k` 清理
 3. P2.3 形态与策略解耦（`[pfv]/[pf-ctl]` 说清楚缺哪一半）
-4. P6.1 35B-e2 为何不建池 / 流未挂载
+4. ~~P6.1 35B-e2 为何不建池 / 流未挂载~~（本轮关账）
 
 ## 4. 口径与陷阱（写下来，避免下一轮再踩）
 
@@ -151,3 +152,4 @@
 | 2026-11-16 | P1 四项关账：P1.1 列名/列序（`aea2b93c`）、P1.2 无消费者强制 0 + env fail-loud（`b9f557e9`）、P1.3 `kv_spill` 三元组（`54568858`）、P1.4 `cold_range` 进表。`[plan]` 三行逐列对齐规格，跨架构不变（只读 `Instance` 几何与 placement） |
 | 2026-11-16 | 修正两处被证据推翻的实现：P1.1 只调表行没调枚举，`slot()` 按枚举索引，`prefetch_readahead` 的 160 MiB grant 被当作"从别行 carve"静默拒绝（已按规格顺序重排枚举 + 编译期 `static_assert`）；P0.1 的"失败后按 GiB 退让"被探针证明不可恢复（见陷阱 7），改为按 `ullAvailPageFile` 夹取后单次请求 |
 | 2026-11-16 | P3.3 关账：`PolicyController::note_layer()` 成为"不跑 step() 的路径"的唯一计数入口，split 入口每层调用一次并在 `NINFER_SPLIT_TIMING` 下调用 `report()`。e2 实测 20/20/20 行（fetch/cpu share/cpu leg）对 816 行 `[cpu-path]`；默认门禁逐位，面板 0 行。`report()` 的数字语义未改，`[ctl] cpu share` 的 `rate span=..@N compute=..@M` 与 `acted=N 层/M 路由` 原样可读 |
+| 2026-11-16 | P6.1 关账：35B-e2 是 repack 布局（每专家一个对象 `weight/expert/<layer>/<e>/gate_up`），`parameters.cpp` 因此必建 `ExpertStream`，而加载计划按"装得下就驻留"给了 0 池 → 层 0 抛 `expert stream is not attached`。新增 `Bindings::experts_per_object`（用专家 0/1 的对象身份判定，而不是绑定名——两种布局都有 `experts/<e>/gate` 名字）+ `LoadPlan::experts_per_object()`，`construct_model_once` 在该判据为真时按 auto 重规划。实测 `19.6 GiB resident -> 2.3 GiB`、`[experts] ... pool=18879MiB`、`overall 6.701375`（与 plain 逐位相同）；plain 35B 仍 19.6 GiB 驻留；默认门禁 `6.024313` / `20.673595` |

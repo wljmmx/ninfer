@@ -1404,6 +1404,33 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
     // attach_expert_cache()/plan_device_split() from the Device left after the KV arena, and the
     // measured 3.24 GiB resident plan is what loads. A named budget is never second-guessed.
     if (expert_budget_unnamed(options)) {
+        // port (sm_89) P6: a repacked artifact keeps ONE OBJECT PER EXPERT
+        // (`weight/expert/<layer>/<expert>/gate_up`), so no parent holds a whole bank and the FFN's
+        // resident form has no view to read: parameters.cpp builds an ExpertStream for every layer
+        // of such an artifact whatever the load plan decided. If the resident plan fits, no pool is
+        // created and layer 0 dies with "expert stream is not attached" - which is what
+        // qwen3_6_35b_a3b_e2 did on 2026-11-16 (19.6 GiB resident, 2.19 GiB of slack, eleven lines
+        // of log with no [experts] line to say why). The stream and the pool are one decision, so it
+        // is taken here, before anything is materialized: stream the experts and let the pool be
+        // sized from what the KV arena leaves. A named budget is never second-guessed.
+        if (plan.experts_per_object()) {
+            const auto to_gib = [](std::uint64_t bytes) {
+                return static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
+            };
+            const auto resident         = plan.materialization().device_capacity_bytes;
+            EngineOptions streamed      = options;
+            streamed.expert_cache_bytes = kExpertCacheAuto;
+            auto streamed_plan = models::qwen3_5::plan_load(reader, models::load_options(streamed));
+            const auto streamed_bytes = streamed_plan.materialization().device_capacity_bytes;
+            std::fprintf(stderr,
+                         "[budget] experts: this artifact keeps one object per expert, so no parent "
+                         "holds a resident bank view; the run streams them (%.1f GiB resident -> "
+                         "%.1f GiB) and sizes the pool from what the KV arena leaves\n",
+                         to_gib(resident), to_gib(streamed_bytes));
+            std::fflush(stderr);
+            plan    = std::move(streamed_plan);
+            options = streamed;
+        }
         // Query the free count rather than the WDDM evictable budget: this is a "cannot possibly
         // fit" gate, and overstating the Device would put the decision back where it was - in a
         // failed allocation.

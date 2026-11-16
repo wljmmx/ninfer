@@ -3,6 +3,7 @@
 #include "models/load_rules.h"
 
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <set>
 #include <string>
@@ -108,29 +109,59 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& config, const std::string& pr
                                                : artifact::Residency::Streamed)
                          : artifact::Residency::Device;
     const auto product = banked ? p + "experts/product" : std::string{};
+    // port (sm_89) P6: one object per BANK (readable resident) or one object per EXPERT (repacked -
+    // the FFN can only reach those through a pool)? The binding NAMES do not answer it: a banked
+    // artifact also carries `experts/<e>/gate` per expert, each a row slice of the bank's object,
+    // while a repacked one points each expert at an object of its own. Measured 2026-11-16 on the two
+    // 35B artifacts (same weights - both score 6.701375): plain binds all experts into weight/000003,
+    // the `_e2` repack binds expert e into weight/expert/000003/<e>/gate_up. So the object identity
+    // of expert 0 against expert 1 is the answer, and it is the same test parameters.cpp applies to
+    // the materialized parents (whole_bank): one object spanning the bank can be read resident, an
+    // object per expert cannot.
+    const auto object_of = [&b](WeightId id) {
+        const auto& parts = b.at(id).reference.binding.parts;
+        return parts.empty() ? artifact::ObjectHandle{} : parts.front().object;
+    };
+    std::array<artifact::ObjectHandle, 3> bank_object{};
+    bool bank_objects = true;
     for (std::uint32_t e = 0; e < moe.num_experts; ++e) {
         const auto ep = p + "experts/" + std::to_string(e) + "/";
         // A banked family's artifact normally carries one matrix per (layer, matrix); after
         // repack_experts_v3 it carries one object per expert instead, and each expert then reads
         // its own planes rather than a row slice of the bank. The per-expert names are the same
         // either way, so the artifact itself says which shape this is.
+        DenseWeights expert;
         if (banked && !b.artifact_has(ep + "gate")) {
-            out.experts.push_back({b.banked(ep + "gate", p + "experts/gate", {ir, h},
-                                            std::uint64_t(e) * ir, ir, {input}, residency),
-                                   b.banked(ep + "up", p + "experts/up", {ir, h},
-                                            std::uint64_t(e) * ir, ir, {input}, residency),
-                                   b.banked(ep + "down", p + "experts/down", {h, ir},
-                                            std::uint64_t(e) * h, h, {product}, residency)});
+            expert = {b.banked(ep + "gate", p + "experts/gate", {ir, h}, std::uint64_t(e) * ir, ir,
+                               {input}, residency),
+                      b.banked(ep + "up", p + "experts/up", {ir, h}, std::uint64_t(e) * ir, ir,
+                               {input}, residency),
+                      b.banked(ep + "down", p + "experts/down", {h, ir}, std::uint64_t(e) * h, h,
+                               {product}, residency)};
         } else {
             // The banked families keep one product activation for the whole layer, so a per-expert
             // object layout still reads the fused name; the MoE families give each expert its own.
-            out.experts.push_back(
-                {b.parameter(ep + "gate", {ir, h}, {input}, std::nullopt, residency),
-                 b.parameter(ep + "up", {ir, h}, {input}, std::nullopt, residency),
-                 b.parameter(ep + "down", {h, ir}, {banked ? product : ep + "product"},
-                             std::nullopt, residency)});
+            expert = {b.parameter(ep + "gate", {ir, h}, {input}, std::nullopt, residency),
+                      b.parameter(ep + "up", {ir, h}, {input}, std::nullopt, residency),
+                      b.parameter(ep + "down", {h, ir}, {banked ? product : ep + "product"},
+                                  std::nullopt, residency)};
         }
+        const std::array<artifact::ObjectHandle, 3> objects{object_of(expert.gate),
+                                                           object_of(expert.up),
+                                                           object_of(expert.down)};
+        if (e == 0) {
+            bank_object = objects;
+            // No object to compare (a binding that named none) is not a bank this engine can read
+            // resident, so it takes the streamed answer rather than the optimistic one.
+            if (objects[0].index == std::numeric_limits<std::size_t>::max()) { bank_objects = false; }
+        } else if (objects != bank_object) {
+            bank_objects = false;
+        }
+        out.experts.push_back(expert);
     }
+    // One object per expert: the FFN has no resident bank view, so the plan says so and the run has
+    // to own a pool.
+    if (!bank_objects) { b.experts_per_object = true; }
     out.shared = {b.parameter(p + "shared/gate", {shared, h}, {input}),
                   b.parameter(p + "shared/up", {shared, h}, {input}),
                   b.parameter(p + "shared/down", {h, shared}, {p + "shared/product"})};

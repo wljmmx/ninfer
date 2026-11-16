@@ -75,6 +75,11 @@ public:
     // port (sm_89): routed experts are declared without materializing them.
     bool stream_experts = false;
     bool expert_host_copy = false;
+    // port (sm_89): the artifact keeps one object per expert (the repacked `weight/expert/<layer>/
+    // <expert>/gate_up` layout), so no parent holds a whole bank. Set by bind_moe where it chooses
+    // that form; the load plan reports it because the FFN has no resident view for such a bank and
+    // the run must therefore own a pool.
+    bool experts_per_object = false;
 
 private:
     struct Alias {
