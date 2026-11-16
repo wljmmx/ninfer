@@ -309,18 +309,25 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     // so two tokens' worth is the ceiling that still leaves the hot set its share (the pool clamps
     // it to a quarter of a bank's window anyway). This must run before the pool is built: the region
     // is carved at construction, and the host tier's read-ahead keys off the same number.
+    //
+    // NOT armed implicitly. The region is CARVED FROM THE POOL'S OWN SLOTS
+    // (core/expert_cache.cpp: carve runs `free_list(b).pop_back()` and then reserves
+    // `prefetch + ring` per bank), so turning it on with `NINFER_PREFETCH=1` shrinks the routed
+    // working set by banks*slots*entry_bytes - 20 x 48 x 1.25 MB = 1.2 GB, a tenth of the pool - and
+    // nothing consumes what it stages (`expert_prefetch` has no reader on the verify path). Measured
+    // 2026-11-16: 1.54 tok/s with the region armed against 8.28 without, same shape, same box. So the
+    // region now arms only when a caller states its size explicitly; the separate-space change (a
+    // device-tier grant, mirroring the host tier's routed-first-then-auxiliaries rule at
+    // `grant_routed`/`grant_prefetch` below) is what has to land before auto-arming can come back.
     if (std::getenv("NINFER_PREFETCH_SLOTS") == nullptr) {
-        const char* flag    = std::getenv("NINFER_PREFETCH");
-        const bool enabled  = flag != nullptr && *flag != '\0' && flag[0] != '0';
-        if (enabled && routed_top_k > 0) {
-            const auto slots = std::min<std::uint32_t>(2U * routed_top_k, 64U);
-            char text[16];
-            std::snprintf(text, sizeof(text), "%u", slots);
-            _putenv_s("NINFER_PREFETCH_SLOTS", text);
+        const char* flag   = std::getenv("NINFER_PREFETCH");
+        const bool enabled = flag != nullptr && *flag != '\0' && flag[0] != '0';
+        if (enabled) {
             std::fprintf(stderr,
-                         "[ctl] prefetch budget: %u slot(s)/bank = 2 x top_k %u (source=routing "
-                         "width; miss_hist is a run-time signal)\n",
-                         slots, routed_top_k);
+                         "[ctl] prefetch: region NOT armed - no explicit NINFER_PREFETCH_SLOTS, and "
+                         "the region would carve %u x banks slots out of the routed working set "
+                         "with no consumer\n",
+                         routed_top_k > 0 ? 2U * routed_top_k : 0U);
             std::fflush(stderr);
         }
     }
