@@ -274,6 +274,67 @@ commits no new state and releases the sequence; it does not undo earlier adopted
 Work this tree has decided not to finish yet, with the measurement that says why. Every entry is
 "known unfinished", not "known good".
 
+**A branched verify cannot pay on this candidate set (closed 2026-11-16, after the conditions were
+met).** The tree line was re-priced three times: first with a builder that pruned by absolute
+accumulated probability (which kills the deep spine and keeps shallow branches - a tree worse than the
+chain by construction, and where an early "+0.4%" came from), then depth-first with the threshold on
+one branch point, then with the ancestor-conditioned selector lattice and an online node budget. The
+last one is the shape the argument asks for: spine first, side branches only where the selector is
+uncertain, added one node at a time by marginal gain per node. It buys real length and still loses:
+
+| shape (v5_e2, DFlash2, 29 rounds, measured floor 0.1132 s/round + 0.0162 s/node) | len | nodes | tok/s | speed |
+|---|---:|---:|---:|---:|
+| chain | 2.241 | 8.00 | 9.23 | 1.000 |
+| +1 branch, tail included (+20.0% length) | 2.690 | 14.83 | 7.61 | 0.824 |
+| +2 branches | 2.724 | 20.79 | 6.05 | 0.656 |
+| wide at column 0, top-2 | 2.379 | 15.00 | 6.68 | 0.724 |
+| wide at columns 0-1, top-4 | 2.793 | 63.76 | 2.44 | 0.264 |
+| tail-less: one extra candidate at column 0, re-enter | 2.344 | 9.00 | 9.05 | 0.981 |
+
+A branch is not a node, it is a TAIL: k-c nodes for the candidate it opens. Which is why widening is
+worse than deepening, and why the cheapest form (tail-less, one extra candidate at the earliest
+column) is the only one within 2% of the chain.
+
+The reason is structural and the constant is measurable. With the chain's per-position acceptance p =
+0.558 (from the accepted column count, not from the length - the length carries the anchor), a chain
+node buys p^j and a branch node buys p^(j-1)(1-p)p, i.e. a ratio of 1/(1-p) = 2.26x at EVERY position.
+Measured efficiency ratio 0.1773/0.0657 = 2.36x: within 4% of the constant, so there is no
+implementation loss left to find in this line - the earlier 4.3x was an averaging artifact (the anchor
+counted as a node gain).
+
+The candidate set puts a ceiling on any shape built on it (203 columns, `NINFER_DFLASH2_DUMP` +
+`NINFER_DFLASH2_EDGE_DUMP`, H:\TeleAgentWorks\.temp\rank_now.csv / edge_now.csv):
+
+| k | 2 | 3 | 4 | 6 | 8 | 12 | 16 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| P(target argmax is in the selector's top k) | 0.370 | 0.409 | 0.438 | 0.468 | 0.503 | 0.532 | 0.537 |
+| P(that, given the top-1 missed) | 0.141 | 0.195 | 0.235 | 0.275 | 0.322 | 0.362 | 0.369 |
+
+Verifying all sixteen candidates recovers 36.9% of the spine's misses: in 63% of them the target's
+token is not in the candidate set at all. That is a draft-head property, not a tree or mask property.
+
+So the line reopens only if one of these two numbers moves, and either one alone makes the tail-less
+form break even:
+
+* **P(top-2 | top-1 missed) >= 0.203** (now 0.141, +44%) - a stronger selector, or DForkTree-style
+  re-anchoring of a fork's own prefix instead of scoring it against the greedy prefix;
+* **per-node cost <= 0.0117 s** (now 0.0162, -28%) - the MoE side, see the prefetch entry below.
+
+A standing in-engine version of the curve above needs a DEVICE histogram: the read-back path that
+feeds `NINFER_DFLASH2_DUMP` is eager-only (it drains the stream per column, `draft.cpp`), and decode
+runs captured. The landing point is the target verify accept step, where `candidate_ids` and the
+target's argmax are both device-resident; 17 counters (rank 0..15 plus "outside") and one enum switch
+are enough, and the host then prints the same two rows this register records.
+
+**Expert prefetch is the cost-side lever, and its ceiling is already observable (open).** The per-node
+price above is 0.0162 s because every verify column pulls its own experts: the union of experts a tree
+touches grows with nodes even though only a path is accepted. Prefetch (draft-side routing signal
+before the verify pass, cutoff depth, async fill) can only convert the MISSING fraction into hidden
+time, and that fraction is already on the panel: `gh1_rates().no_miss_pct` / `capt_free_pct`
+(`expert_stream.h`), plus `miss_tally()` for the per-layer distribution. The target to beat is
+-28% on the per-node price; a prefetch that only covers half the misses cannot reach it, so the entry
+stays open until a measurement says which fraction it converts.
+
 **Verify rectangle columns 1..K (closed 2026-11-15: the collapse was a dump bug).** Every rate this
 document records for a column >= 1 before 2026-11-15 is void. `NINFER_DFLASH2_DUMP` sorted a
 full-vocabulary index vector and then shrank it to sixteen (`order.resize(kTop)`, `draft.cpp:1245`),
