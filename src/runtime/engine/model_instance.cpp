@@ -695,7 +695,6 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
         const auto& row = core::TierPlan::slot(id);
         if (plan.bytes_of(id) != 0) { (void)admit(row.tier, row.name, plan.bytes_of(id)); }
     }
-    plan.report();
     std::fprintf(stderr,
                  "[experts] banks=%zu slot=%llu windows=%llu pool=%lluMiB host=%d arena=%lluMiB "
                  "(routed=%llu prefetch=%llu second-chance=%llu) want=%lluMiB top_k=%u kept=%llu "
@@ -856,6 +855,12 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
         placement.host_experts =
             static_cast<std::uint64_t>(instance.expert_host_residency->slot_capacity());
     }
+    // P1.4: the cold range is an OBSERVATION - what neither warm tier holds - and all three terms
+    // come from this placement, the same source the `[budget] experts: ... unslotted=NN of MM` line
+    // prints, not a second calculation. That is why the plan is reported here and not where it was
+    // decided: its last line needs an answer only the attach knows.
+    plan.set_cold_range(placement.total_experts, placement.gpu_experts, placement.host_experts);
+    plan.report();
     return placement;
 }
 

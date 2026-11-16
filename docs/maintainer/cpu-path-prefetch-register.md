@@ -58,7 +58,7 @@
 | P1.1 | 列名/列序改成 `*_mb` 与规格一致（`prefetch_readahead`） | `[plan]` 三行与规格逐列对应 | ✅ | 现为 device `expert_pool_mb \| kv_pages_mb \| prefetch_mb \| slru_band_mb \| staging_mb \| claimed`；host `expert_arena_mb \| kv_host_mb \| prefetch_readahead_mb \| second_chance_mb \| claimed`（主机列序按规格）；默认门禁仍 `6.024313` / `20.673595` |
 | P1.2 | **prefetch 未接通强制 0** 落成规则（消费者未接通 → 恒 0 并在行内标注原因） | 默认 `[plan] prefetch=0*` 且 `[pf-region]` 不再被 carve | ✅ | 规则在 `core::device_prefetch_consumer_present()`（恒 false，依据 `[pf-pred] Device form: ... fill=host-only (0 placed by the Device)`），`TierPlan::set` 对 `prefetch_mb` 强制 0；行内原因 `prefetch_mb=0*(no consumer: device-side placement absent ...)`；`NINFER_PREFETCH_SLOTS=16` 单独设置 → exit=1 `cannot arm the Device prefetch region: it has no consumer`；默认门禁 `6.024313` / `20.673595` |
 | P1.3 | `kv_spill = {enabled, 上限, 重读计数}` | `[plan] ssd` 行给出三元组 | ✅ | `[plan] ssd cap=none \| kv_spill={enabled=0, cap=none, reread=none}`；`enabled` 取唯一创建该 tier 的开关（`program_impl.cpp` 只在 `NINFER_KV_SPILL_MB` 设置时挂文件），`cap` 无文件即 none、有文件时给文件 extent 容量并标"not a plan claim"，`reread` 写 none 并说明树里只有 `kv_tier_stats()` 的 spilled/fetched 页（另一个问题），不编 0 |
-| P1.4 | `cold_range` 进表 | `[plan]` 出现 `cold_range=NN`（= 总专家 − 池 − 暖区） | 🟡 | 数据已在 `[budget] experts: ... unslotted=55728 of 73728`，未进表未命名 |
+| P1.4 | `cold_range` 进表 | `[plan]` 出现 `cold_range=NN`（= 总专家 − 池 − 暖区） | ✅ | `[plan] ssd ... \| cold_range=38415 experts (73728 - 18000 - 17313)`；三项同取 `attach_expert_cache` 的 placement（与 `[budget] experts: ... unslotted=55728 of 73728` 同源），故 `[plan]` 报告点移到 placement 定稿之后 |
 
 ### P2 预取（先定生死，再谈优化）
 
@@ -121,3 +121,4 @@
 |---|---|
 | 2026-11-16 | 建表。矩阵：1 格实测、1 格 N/A（硬件）、2 格待验。P0 由当晚 `mapped allocation of 20941 MiB failed` 升级为最高优先级 |
 | 2026-11-16 | P0.1 关账（`cbc2ad49`）：分配在前、定尺寸在后，默认 3×2 门禁逐位。P0.2 记 N/A（单块在 22 GiB 上 6/6 成功）。P0.3 关账：失败在分配点抛出，pageable/registered 兜底删除 |
+| 2026-11-16 | P1 四项关账：P1.1 列名/列序（`aea2b93c`）、P1.2 无消费者强制 0 + env fail-loud（`b9f557e9`）、P1.3 `kv_spill` 三元组（`54568858`）、P1.4 `cold_range` 进表。`[plan]` 三行逐列对齐规格，跨架构不变（只读 `Instance` 几何与 placement） |

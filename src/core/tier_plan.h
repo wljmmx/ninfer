@@ -166,6 +166,17 @@ public:
     // switch, and printed on the ssd line because that is where the tier lives.
     void set_kv_spill(const KvSpillView& view) noexcept { kv_spill_ = view; }
     [[nodiscard]] const KvSpillView& kv_spill() const noexcept { return kv_spill_; }
+    // The cold range is an OBSERVATION, not a knob: what neither warm tier holds. It is printed with
+    // its own arithmetic so the number can be checked on the line (total - pool - warm), and the
+    // three come from one placement - the same source `[budget] experts` prints - never from a second
+    // calculation. A negative difference is reported as zero.
+    void set_cold_range(std::uint64_t total, std::uint64_t pool, std::uint64_t warm) noexcept {
+        cold_total_ = total;
+        cold_pool_  = pool;
+        cold_warm_  = warm;
+        cold_range_ = total > pool + warm ? total - pool - warm : 0;
+    }
+    [[nodiscard]] std::uint64_t cold_range() const noexcept { return cold_range_; }
 
     // Bytes this tier has actually claimed: carved lines are excluded, because they are slices of a
     // line already counted.
@@ -209,6 +220,15 @@ public:
                     std::fprintf(stderr, "(%s)", row.note);
                 }
             }
+            if (tier == Tier::Disk) {
+                // The cold range sits on the tier that has to serve it, with the subtraction that
+                // produced it: total experts - pool - warm tier.
+                std::fprintf(stderr, " | cold_range=%llu experts (%llu - %llu - %llu)",
+                             static_cast<unsigned long long>(cold_range_),
+                             static_cast<unsigned long long>(cold_total_),
+                             static_cast<unsigned long long>(cold_pool_),
+                             static_cast<unsigned long long>(cold_warm_));
+            }
             if (cap(tier) != kNoCap) {
                 std::fprintf(stderr, " | claimed=%llu MiB",
                              static_cast<unsigned long long>(total(tier) >> 20));
@@ -231,6 +251,10 @@ private:
     std::array<std::uint64_t, 3>            caps_{0, 0, kNoCap};
     std::array<std::uint64_t, kBudgetCount> bytes_{};
     KvSpillView                             kv_spill_{};
+    std::uint64_t                           cold_range_ = 0;
+    std::uint64_t                           cold_total_ = 0;
+    std::uint64_t                           cold_pool_  = 0;
+    std::uint64_t                           cold_warm_  = 0;
 };
 
 } // namespace ninfer::core
