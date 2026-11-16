@@ -1,4 +1,5 @@
 #include "models/qwen3_5/execution/expert_stream.h"
+#include "models/qwen3_5/expert_priority.h"
 #include "models/qwen3_5/execution/expert_prefetch.h"
 #include "models/qwen3_5/execution/expert_path_control.h"
 #include "models/qwen3_5/execution/cpu_path_policy.h"
@@ -409,6 +410,39 @@ void ExpertStream::init_stream_state() {
         const char* value = std::getenv("NINFER_FREEZE_THAW_REQUEST");
         return value != nullptr && value[0] != '\0' && value[0] != '0';
     }();
+}
+
+// V10-14: the cold-start prior, in the model's own form (a permutation of every logical expert id,
+// highest priority first) turned into the rank row the seat comparator reads. The validation here is
+// belt-and-braces - the loader's parser refuses anything that is not a permutation before a row ever
+// reaches a stream - but a stream is also a public model-side object, and a bad row must degrade to
+// "no prior" instead of seating an expert twice.
+void ExpertStream::set_cold_expert_priority(std::span<const std::uint32_t> order) {
+    cold_rank_.clear();
+    if (order.empty()) { return; }
+    if (order.size() != count_) {
+        std::fprintf(stderr,
+                     "[experts] bank=%u: cold priority row has %zu entries for %u experts - ignored\n",
+                     bank_, order.size(), count_);
+        std::fflush(stderr);
+        return;
+    }
+    std::vector<std::uint8_t> seen(count_, 0);
+    std::vector<std::uint32_t> rank(count_, kNoColdPriority);
+    for (std::size_t position = 0; position < order.size(); ++position) {
+        const auto expert = order[position];
+        if (expert >= count_ || seen[expert] != 0) {
+            std::fprintf(stderr,
+                         "[experts] bank=%u: cold priority row is not a permutation of %u experts "
+                         "(entry %zu is expert %u) - ignored\n",
+                         bank_, count_, position, expert);
+            std::fflush(stderr);
+            return;
+        }
+        seen[expert] = 1;
+        rank[expert] = static_cast<std::uint32_t>(position);
+    }
+    cold_rank_ = std::move(rank);
 }
 
 ExpertStream::~ExpertStream() {
@@ -2581,7 +2615,9 @@ void ExpertStream::refresh_static_candidates() {
     std::vector<std::uint32_t> ranked(count_);
     std::iota(ranked.begin(), ranked.end(), 0U);
     std::stable_sort(ranked.begin(), ranked.end(),
-                     [&](std::uint32_t a, std::uint32_t b) { return hot_score_[a] > hot_score_[b]; });
+                     [&](std::uint32_t a, std::uint32_t b) {
+                         return precedes(a, b, hot_score_, cold_rank_);
+                     });
     // P3: the host set is the complement of the Device set, not another copy of it. Both were taking
     // the top of the same score, so the 12 host slots named experts the pool already held and served
     // none of the routes that actually reached the host (measured: static_present=12, route_static=0).
@@ -2728,8 +2764,8 @@ void ExpertStream::freeze_now(std::uint32_t /*tokens*/, cudaStream_t stream) {
     std::vector<std::uint32_t> ranked(count_);
     std::iota(ranked.begin(), ranked.end(), 0U);
     std::stable_sort(ranked.begin(), ranked.end(), [&](std::uint32_t a, std::uint32_t b) {
-        if (hot_score_[a] != hot_score_[b]) { return hot_score_[a] > hot_score_[b]; }
-        return a < b; // a deterministic tie-break: the same run must freeze the same set
+        // V10-14: heat first, the cold-start prior breaking the tie, the id keeping a run reproducible.
+        return precedes(a, b, hot_score_, cold_rank_);
     });
     // The frozen Device set is this bank's seats, so it is this bank's capacity that sizes it.
     const auto capacity = std::min<std::size_t>(cache_->resident_capacity(bank_), ranked.size());
@@ -3253,8 +3289,8 @@ void ExpertStream::freeze_split(cudaStream_t stream) {
     std::vector<std::uint32_t> ranked(count_);
     std::iota(ranked.begin(), ranked.end(), 0U);
     std::stable_sort(ranked.begin(), ranked.end(), [&](std::uint32_t a, std::uint32_t b) {
-        if (hot_score_[a] != hot_score_[b]) { return hot_score_[a] > hot_score_[b]; }
-        return a < b; // deterministic: the same run must freeze the same set
+        // V10-14: heat first, the cold-start prior breaking the tie, the id keeping a run reproducible.
+        return precedes(a, b, hot_score_, cold_rank_);
     });
     std::vector<ExpertCacheKey> preload;
     for (std::size_t index = 0; index < split_.size(); ++index) {
@@ -3861,7 +3897,7 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
             ranked.resize(count_);
             std::iota(ranked.begin(), ranked.end(), 0U);
             std::stable_sort(ranked.begin(), ranked.end(), [&](std::uint32_t a, std::uint32_t b) {
-                return hot_score_[a] > hot_score_[b];
+                return precedes(a, b, hot_score_, cold_rank_);
             });
         }
         if (!refresh) {
@@ -3884,7 +3920,7 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
                 ranked.resize(count_);
                 std::iota(ranked.begin(), ranked.end(), 0U);
                 std::stable_sort(ranked.begin(), ranked.end(), [&](std::uint32_t a, std::uint32_t b) {
-                    return hot_score_[a] > hot_score_[b];
+                    return precedes(a, b, hot_score_, cold_rank_);
                 });
             }
             for (const auto expert : ranked) {
@@ -3939,10 +3975,10 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
             if (const auto room = host_->routed_capacity(); targets.size() > room) {
                 std::stable_sort(targets.begin(), targets.end(),
                                  [&](std::int32_t a, std::int32_t b) {
-                                     const auto sa = hot_score_[static_cast<std::size_t>(a)];
-                                     const auto sb = hot_score_[static_cast<std::size_t>(b)];
-                                     if (sa != sb) { return sa > sb; }
-                                     return a < b;
+                                     // V10-14: the same seat order the pool uses, prior included.
+                                     return precedes(static_cast<std::uint32_t>(a),
+                                                     static_cast<std::uint32_t>(b), hot_score_,
+                                                     cold_rank_);
                                  });
                 targets.resize(room);
                 std::sort(targets.begin(), targets.end());
@@ -4830,7 +4866,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                 std::iota(ranked.begin(), ranked.end(), 0U);
                 std::stable_sort(ranked.begin(), ranked.end(),
                                  [&](std::uint32_t a, std::uint32_t b) {
-                                     return hot_score_[a] > hot_score_[b];
+                                     return precedes(a, b, hot_score_, cold_rank_);
                                  });
                 for (const auto expert : ranked) {
                     if (wanted.size() >= capacity) { break; }
@@ -4895,7 +4931,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                     std::iota(ranked.begin(), ranked.end(), 0U);
                     std::stable_sort(ranked.begin(), ranked.end(),
                                      [&](std::uint32_t a, std::uint32_t b) {
-                                         return hot_score_[a] > hot_score_[b];
+                                         return precedes(a, b, hot_score_, cold_rank_);
                                      });
                     for (const auto expert : ranked) {
                         if (wanted.size() >= hot_cap) { break; }
@@ -5187,7 +5223,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             std::vector<std::uint32_t> ranked(count_);
             std::iota(ranked.begin(), ranked.end(), 0U);
             std::stable_sort(ranked.begin(), ranked.end(), [&](std::uint32_t a, std::uint32_t b) {
-                return hot_score_[a] > hot_score_[b];
+                return precedes(a, b, hot_score_, cold_rank_);
             });
             // Q20: the fixed S ring, finally active on the path that has a device-side second leg.
             //

@@ -15,6 +15,13 @@ ninfer_add_test(ninfer_qwen3_5_loading_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loading.cpp"
   LIBRARIES ninfer_model_loading)
 
+# V10-14: the cold-start expert prior - where it comes from (artifact metadata, conversion report,
+# explicit override) and the ordering it produces. Host only: the parser, the row-level merge and the
+# seat comparator, with no CUDA and no artifact file.
+ninfer_add_test(ninfer_qwen3_5_expert_priority_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_priority.cpp"
+  LIBRARIES ninfer_model_loading ninfer::json)
+
 ninfer_add_test(ninfer_qwen3_5_frontend_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_frontend.cpp"
   NEEDS_SOURCE_DIR

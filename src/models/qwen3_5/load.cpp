@@ -1,6 +1,7 @@
 #include "models/qwen3_5/load.h"
 #include "artifact/reader.h"
 #include "models/qwen4_exp/load.h"
+#include "models/qwen3_5/expert_priority_source.h"
 #include "models/qwen3_5/load/bindings.h"
 
 #include <cstdio>
@@ -20,6 +21,7 @@ struct LoadPlan::Impl {
     std::shared_ptr<const qwen4_exp::PleTableSource> ple_table;
     std::int32_t ple_eos         = -1;
     bool experts_per_object      = false;
+    ExpertPriorityTable expert_priority;
 };
 
 LoadPlan::LoadPlan(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -87,6 +89,26 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     if (ple_off && out->config.text.ple) {
         std::fprintf(stderr, "[ple] NINFER_PLE_OFF: running without the n-gram layers\n");
         out->config.text.ple.reset();
+    }
+    // V10-14 (upstream c996baa8): the cold-start expert prior. Resolved here because this is the one
+    // place that holds both the artifact's metadata (already parsed) and the geometry every row has to
+    // describe; the parameter mapping then hands each layer its row to the stream, which reads it only
+    // while the observed heat is tied. An artifact with no calibration and no override resolves to an
+    // empty table, and the stream keeps the id order - there is no compiled-in table to fall back to.
+    if (const auto* moe = std::get_if<MoeConfig>(&out->config.text.ffn)) {
+        auto override_file = out->options.expert_priority_file;
+        if (override_file.empty()) { override_file = expert_priority_override_path(); }
+        auto prior = resolve_expert_priority(reader.directory(), reader.path(), override_file,
+                                             out->config.text.num_hidden_layers, moe->num_experts);
+        if (prior.source != ExpertPrioritySource::None) {
+            std::fprintf(stderr,
+                         "[priority] cold-start expert prior: source=%s rows=%zu experts=%u origin=%s\n",
+                         prior.source == ExpertPrioritySource::Override ? "override" : "artifact",
+                         prior.table.layers(), static_cast<unsigned>(moe->num_experts),
+                         prior.origin.c_str());
+            std::fflush(stderr);
+        }
+        out->expert_priority = std::move(prior.table);
     }
     artifact::Binder binder(reader);
     out->resources = loading::bind_resources(binder, out->config);
@@ -162,7 +184,8 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     auto bound   = loading::resolve_weights(std::move(data->pending), backing);
     auto model = std::unique_ptr<Model>(new Model(
         std::move(data->config), data->options, std::move(data->weights), std::move(bound),
-        std::move(data->resources), std::move(data->info), std::move(backing)));
+        std::move(data->resources), std::move(data->info), std::move(data->expert_priority),
+        std::move(backing)));
     return model;
 }
 

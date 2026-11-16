@@ -10,6 +10,7 @@
 
 #include <cstdlib>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -489,7 +490,19 @@ public:
                                                               ops::LinearPolicy::A16Only}};
     }
 
-    RoutedMoeParameters routed_moe(const MoeWeights& moe) const {
+    // V10-14: hand a newly built expert stream this block's cold-start prior, when the model has one.
+    // Nothing is installed when the table is absent or the block is a draft/MTP layer, which is what
+    // keeps the stream on the id order every earlier measurement was taken with.
+    void install_expert_priority(ExpertStream& stream, std::optional<std::size_t> layer) const {
+        if (!layer) { return; }
+        const auto row = model_.expert_priority_row(*layer);
+        if (!row.empty()) { stream.set_cold_expert_priority(row); }
+    }
+
+    // V10-14: `layer` is the text block this MoE belongs to, and it is what selects the block's row
+    // of the model's cold-start expert prior. A draft/MTP MoE passes nullopt: its experts are their
+    // own bank, and a Main-layer calibration says nothing about their order.
+    RoutedMoeParameters routed_moe(const MoeWeights& moe, std::optional<std::size_t> layer) const {
         const auto count = static_cast<std::uint32_t>(moe.experts.size());
         if (count == 0) { throw std::invalid_argument("MoE has no experts"); }
         const auto top_k = static_cast<std::int32_t>(
@@ -571,6 +584,7 @@ public:
             streamed.stream = std::make_shared<ExpertStream>(
                 count, gate_up_layout, down_layout, gate_parent.geometry, down_parent.geometry,
                 std::move(gate_up_objects), std::move(down_objects));
+            install_expert_priority(*streamed.stream, layer);
             streamed.profile = {
                 ops::routed_swiglu_profile(gate_up_layout, down_layout, top_k,
                                            ops::LinearPolicy::A16Only, ops::LinearPolicy::A16Only),
@@ -672,10 +686,11 @@ public:
             ExpertMatrixBankDesc{up_layout, up_parent.geometry, objects_of(&DenseWeights::up)},
             ExpertMatrixBankDesc{down_layout, down_parent.geometry,
                                  objects_of(&DenseWeights::down)});
+        install_expert_priority(*out.stream, layer);
         return out;
     }
 
-    FfnParameters ffn(const BlockWeights& w) const {
+    FfnParameters ffn(const BlockWeights& w, std::optional<std::size_t> layer) const {
         if (const auto* d = std::get_if<DenseWeights>(&w.ffn)) { return dense(*d); }
         const auto& moe = std::get<MoeWeights>(w.ffn);
         // The route width is the config's: qwen3_5 routes 8, Qwen4Exp 10, and the routing Op
@@ -685,7 +700,7 @@ public:
         // zero routed term and the layer silently degenerates to the shared expert alone
         // (perplexity ~1.2e3 on ordinary text). The groupwise-int path is the only implementation
         // wired for this model.
-        return routed_moe(moe);
+        return routed_moe(moe, layer);
     }
 
     // Qwen4Exp's per-block n-gram embedding. The keys and the value are two row blocks of ONE
@@ -770,7 +785,7 @@ public:
         BlockParameters out;
         out.input_norm          = tensor(w.input_norm);
         out.post_attention_norm = tensor(w.post_attention_norm);
-        out.ffn                 = ffn(w);
+        out.ffn                 = ffn(w, layer);
         if (w.input_hc) out.input_hc = hc(*w.input_hc);
         if (w.post_attention_hc) out.post_attention_hc = hc(*w.post_attention_hc);
         if (w.ple) {
@@ -876,7 +891,8 @@ public:
         out.query_norm  = tensor(a.query_norm);
         out.key_norm    = tensor(a.key_norm);
         out.output      = linear(a.output);
-        out.ffn         = ffn(w.layer);
+        // V10-14: the draft block is not a Main block, so it takes no row of the Main calibration.
+        out.ffn         = ffn(w.layer, std::nullopt);
         out.output_head = linear(w.output_head_use);
         // Qwen4Exp's four-stream draft head: the block carries the same two corrections a text block
         // does, and the head folds the streams through the final correction instead of a final norm.

@@ -12,6 +12,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <vector>
 
 namespace ninfer::models::qwen3_5::execution {
@@ -91,6 +92,19 @@ public:
     void attach_split(ExpertCache& cache, std::uint32_t gate_bank, const ExpertBankLayout& gate_entry,
                       std::uint32_t up_bank, const ExpertBankLayout& up_entry,
                       std::uint32_t down_bank, const ExpertBankLayout& down_entry);
+
+    // V10-14 (upstream c996baa8): the model's cold-start prior for THIS layer - a permutation of every
+    // logical expert id, highest cache priority first, as the artifact's calibration (or an explicit
+    // override) states it. Empty clears it and reproduces the id order exactly.
+    //
+    // It is a prior, not a policy: the seat ranking reads it only to break a tie in the observed
+    // decayed score, so an expert the router has actually used always outranks a table entry, and the
+    // measured hot order still decides every placement once heat exists. The single field it writes
+    // (`cold_rank_`) is what "turn it off" means: clear it, or never set it.
+    void set_cold_expert_priority(std::span<const std::uint32_t> order);
+    [[nodiscard]] std::span<const std::uint32_t> cold_expert_priority() const noexcept {
+        return cold_rank_;
+    }
 
     // Publishes the experts the next call routes to, then republishes the offset table. Returns
     // false when the pool cannot hold one whole layer at all; the caller then owns the decision
@@ -837,6 +851,10 @@ private:
     // the top entries of this instead of whatever the current step happened to route to, which
     // used to replace all eight experts on every token and make the hot set useless.
     std::vector<float> hot_score_;
+    // V10-14: the same prior, as ranks (`cold_rank_[expert]` = position in the model's row,
+    // kNoColdPriority when the model carries none). Read only by `precedes()`'s tie-break, so it can
+    // never move an expert that has been observed. Empty on every model without a calibration.
+    std::vector<std::uint32_t> cold_rank_;
     std::vector<std::int32_t> demoted_;
     // Predictor scoreboard for O1's speculative skip: if the previous layer was fully covered, how
     // often is this one too? That ratio is the repair rate a speculative design would pay, and it is

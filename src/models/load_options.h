@@ -15,6 +15,12 @@ struct LoadOptions {
     bool stream_experts            = false;
     // port (sm_89): keep a Host replica as the streamed tier's source.
     bool expert_host_copy          = false;
+    // V10-14: explicit cold-start expert-priority override, a JSON file with the artifact table's
+    // shape (see models/qwen3_5/expert_priority_source.h). It wins over the artifact's own table,
+    // row by row. Left empty, an override can still be named through NINFER_EXPERT_PRIORITY_FILE -
+    // the load resolves that fallback itself, so this field stays empty in the options a caller
+    // compares against, and the two never disagree about what was loaded.
+    std::filesystem::path expert_priority_file;
 
     bool operator==(const LoadOptions&) const = default;
 
