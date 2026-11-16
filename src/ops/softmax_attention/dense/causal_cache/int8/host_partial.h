@@ -68,6 +68,12 @@ struct RkHostPartialView {
     softmax_cpu::RkPartialKvPages pages;
     const std::uint16_t* q_bf16   = nullptr;
     const std::int32_t* positions = nullptr;
+    // APPEND FRONTIER. The production decode call fuses the current token's append into the same
+    // kernel that scores it, so a producer that mirrors at the call boundary cannot hold the newest
+    // token's codes. `page_filled_keys` states how many leading positions the mirrored pages are
+    // authoritative for; the gate refuses a split whose range reaches past it. 0 means "no bound" -
+    // a producer whose pages are authoritative everywhere (a real Host tier that owns them).
+    int page_filled_keys = 0;
 };
 
 namespace rk_host_partial_detail {

@@ -2100,6 +2100,17 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
                                        dimension(config_.attention->num_attention_heads), T});
     const Tensor& kv_table_rows =
         active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
+    // Split ownership (default off): mirror this layer's pages, Q/positions and the row's block
+    // table so the CPU-partial gate has a view to read. Armed by the gate's own knob
+    // (NINFER_KV_CPU_PARTITION) or by the mirror's consistency check; unarmed costs one cached bool,
+    // and nothing is installed. Both call shapes below are covered because the decode pass runs the
+    // batch form with batch == 1 (ordinary_decode_batch binds width 1, no valid columns) - the same
+    // unmasked single-batch call the gate admits.
+    const bool mirror_ready =
+        detail::kv_host_split_mirror_armed() &&
+        kv_split_mirror_.prepare(qn, cache_positions, kv_table_rows,
+                                 batch_text_kv_->batch_layer_view(fidx), fidx, s);
+    if (mirror_ready) { detail::KvHostSplitMirror::install(&kv_split_mirror_.view()); }
     if (active_sequence_batch_ != 0) {
         const std::int32_t width = active_sequence_width_;
         if (width <= 0 || width * active_sequence_batch_ != T) {
@@ -2137,6 +2148,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
             batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_, a,
             ctx_.execution_view());
     }
+    if (mirror_ready) { detail::KvHostSplitMirror::install(nullptr); }
     ops::sigmoid_mul(gate, a, s);
     // The same file the sparse arm writes: the two arms' attention outputs are the S3 gate.
     qsa_dump_tensor("NINFER_QSA_LAYER_DUMP", "attention",

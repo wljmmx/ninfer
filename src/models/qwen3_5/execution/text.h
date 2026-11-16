@@ -15,6 +15,7 @@
 #include "models/qwen3_5/state/decoder_state.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/round_buffers.h"
+#include "models/qwen3_5/execution/kv_host_split_mirror.h"
 #include "models/qwen3_5/execution/workspace.h"
 
 #include <array>
@@ -414,6 +415,10 @@ private:
     int proposal_head_n_                        = 0;
     const ops::SamplingConfig* sampling_config_ = nullptr;
     const MtpParameters* mtp_                   = nullptr;
+    // The CPU-partial producer (default off): mirrors one layer's pages, Q/positions and the row's
+    // block table for the int8 attention gate. Reused layer to layer; its buffers are host memory
+    // and are only touched when the gate's knob or the mirror check arms it.
+    qwen3_5::detail::KvHostSplitMirror kv_split_mirror_;
 };
 
 } // namespace ninfer::models::qwen3_5::execution
