@@ -153,6 +153,224 @@ void test_activation_scale_round_trip() {
     expect(weight_scale_offset(g, 0, 1) == g.scale_offset + 2, "one BF16 word per K tile");
 }
 
+// port (sm_89) V10-13: a batched NVFP4 parent keeps one matrix per expert behind a leading axis.
+// The scale plane repeats once per matrix and a declared divisor array adds one word per expert.
+// Every number below is derived by hand from the layout, not from the implementation.
+void test_batched_geometry() {
+    constexpr std::uint64_t experts = 3, rows = 256, columns = 128;
+    const auto g = weight_geometry(QType::NVFP4, QuantLayout::BatchedBlockScaleK16M128x4,
+                                   std::vector<std::uint64_t>{experts, rows, columns},
+                                   WeightDivisors{experts});
+    const auto elements         = experts * rows * columns;
+    const auto scale_row_bytes  = columns / 16;
+    const auto scale_per_matrix = rows * scale_row_bytes;
+    expect(g.shape.size() == 3 && g.shape[0] == experts && g.shape[1] == rows &&
+               g.shape[2] == columns,
+           "batched geometry keeps its [E, N, K] shape");
+    expect(g.elements == elements, "batched geometry covers every expert element");
+    expect(g.code_bytes_per_row == columns / 2 && g.code_bytes == elements / 2,
+           "the code plane packs every expert");
+    expect(g.scale_bytes_per_row == scale_row_bytes && g.scale_block_rows == 1,
+           "one E4M3 word per K group, one scale row per matrix row");
+    expect(g.matrix_rows == rows && g.scale_bytes_per_matrix == scale_per_matrix,
+           "one expert matrix owns its own scale block");
+    expect(g.scale_bytes == experts * scale_per_matrix, "the scale plane repeats per expert");
+    expect(g.scale_offset == (elements / 2 + 255) / 256 * 256,
+           "codes then 256-byte aligned scales");
+    expect(g.divisor_offset == g.scale_offset + g.scale_bytes, "divisors follow the scale plane");
+    expect(g.divisor_count == experts, "a declared array counts one divisor per expert");
+    expect(g.divisor_rows == rows, "one divisor word covers one expert matrix");
+    expect(g.bytes == g.divisor_offset + experts * 4, "the payload ends after the divisor array");
+    // Each expert's scale block starts where the swizzle helper resolves its first row; that is the
+    // property an expert bank split relies on.
+    for (std::uint64_t expert = 1; expert < experts; ++expert) {
+        expect(weight_scale_offset(g, expert * rows, 0) ==
+                   g.scale_offset + expert * g.scale_bytes_per_matrix,
+               "expert scale blocks are independently addressable");
+    }
+    // ...and inside one expert the swizzle is the rank-two one, unchanged.
+    expect(weight_scale_offset(g, rows + 1, 1) ==
+               g.scale_offset + g.scale_bytes_per_matrix + 16 + 1,
+           "the swizzle inside an expert repeats the rank-two plane");
+}
+
+// A block-scale layout may state its leading matrix axis by shape too: the tile plane then repeats
+// once per matrix, exactly as the NVFP4 batched bank repeats its scale plane.
+void test_tiled_block_rank_three() {
+    constexpr std::uint64_t matrices = 4, rows = 128, columns = 128, tile = 64;
+    const auto g = weight_geometry(QType::FP8_E4M3FN_BLOCK64X64_BF16, QuantLayout::BlockScaleM64K64,
+                                   std::vector<std::uint64_t>{matrices, rows, columns});
+    const auto scale_per_matrix = rows / tile * (columns / tile * 2);
+    expect(g.matrix_rows == rows && g.scale_bytes_per_matrix == scale_per_matrix,
+           "one matrix owns one tile plane");
+    expect(g.code_bytes == matrices * rows * columns, "the code plane covers every matrix");
+    expect(g.scale_bytes == matrices * scale_per_matrix, "the tile plane repeats per matrix");
+    expect(g.divisor_count == 0 && g.divisor_rows == 0, "block FP8 still has no divisor plane");
+    expect(weight_scale_offset(g, rows, 0) == g.scale_offset + g.scale_bytes_per_matrix,
+           "the second matrix's tile plane starts after the first");
+}
+
+// The expert-file form packs the same experts as consecutive row blocks of one rank-two matrix.
+// Both carriers must describe the same bytes, or an artifact and a batched bank would disagree
+// about where an expert's scales and divisor begin.
+void test_stacked_per_expert_divisors() {
+    constexpr std::uint64_t experts = 3, rows = 256, columns = 128;
+    const auto batched = weight_geometry(QType::NVFP4, QuantLayout::BatchedBlockScaleK16M128x4,
+                                         std::vector<std::uint64_t>{experts, rows, columns},
+                                         WeightDivisors{experts});
+    const auto stacked = weight_geometry(QType::NVFP4, QuantLayout::BlockScaleK16M128x4,
+                                         std::vector<std::uint64_t>{experts * rows, columns},
+                                         WeightDivisors{experts});
+    expect(stacked.divisor_count == experts && stacked.divisor_rows == rows,
+           "a rank-two stack declares the same per-expert domains");
+    expect(stacked.matrix_rows == experts * rows,
+           "the rank-two shape names one matrix over every expert");
+    expect(stacked.scale_bytes / stacked.divisor_count == batched.scale_bytes_per_matrix,
+           "one expert's slice of the stacked plane is the batched scale block");
+    expect(stacked.scale_bytes == batched.scale_bytes &&
+               stacked.divisor_offset == batched.divisor_offset && stacked.bytes == batched.bytes,
+           "the two expert carriers describe the same bytes");
+}
+
+// The undeclared default is still one matrix divisor, so a rank-two NVFP4 parent keeps exactly the
+// payload it had before a divisor array could be declared.
+void test_single_divisor_unchanged() {
+    constexpr std::uint64_t rows = 256, columns = 128;
+    const auto g = weight_geometry(QType::NVFP4, QuantLayout::BlockScaleK16M128x4,
+                                   std::vector<std::uint64_t>{rows, columns});
+    const auto codes = rows * columns / 2;
+    expect(g.divisor_count == 1 && g.divisor_rows == rows, "the default is one matrix divisor");
+    expect(g.divisor_offset == (codes + 255) / 256 * 256 + rows * (columns / 16),
+           "the divisor follows the scale plane");
+    expect(g.bytes == g.divisor_offset + 4, "the default payload ends after one word");
+    expect(g.matrix_rows == rows && g.scale_bytes_per_matrix == g.scale_bytes,
+           "one matrix owns the whole scale plane");
+}
+
+void test_format_rejections() {
+    expect_throws(
+        [] {
+            (void)weight_geometry(QType::NVFP4, QuantLayout::BatchedBlockScaleK16M128x4,
+                                  std::vector<std::uint64_t>{256, 128});
+        },
+        "a batched layout with rank two");
+    expect_throws(
+        [] {
+            (void)weight_geometry(QType::NVFP4, QuantLayout::BatchedBlockScaleK16M128x4,
+                                  std::vector<std::uint64_t>{2, 2, 256, 128});
+        },
+        "a batched layout with rank four");
+    expect_throws(
+        [] {
+            (void)weight_geometry(QType::NVFP4, QuantLayout::BlockScaleK16M128x4,
+                                  std::vector<std::uint64_t>{3, 256, 128});
+        },
+        "a rank-three tensor under the rank-two NVFP4 layout");
+    expect_throws(
+        [] {
+            (void)weight_geometry(QType::NVFP4, QuantLayout::BatchedBlockScaleK16M128x4,
+                                  std::vector<std::uint64_t>{2, 96, 128});
+        },
+        "a batched N that is not a whole 128-row tile");
+    expect_throws(
+        [] {
+            (void)weight_geometry(QType::NVFP4, QuantLayout::BatchedBlockScaleK16M128x4,
+                                  std::vector<std::uint64_t>{2, 256, 96});
+        },
+        "a batched K that is not a multiple of the 16-group times four");
+    expect_throws(
+        [] {
+            (void)weight_geometry(QType::FP8_E4M3FN_BLOCK128X128_BF16,
+                                  QuantLayout::BatchedBlockScaleK16M128x4,
+                                  std::vector<std::uint64_t>{2, 256, 128});
+        },
+        "a batched layout carrying a non-NVFP4 format");
+    expect_throws(
+        [] {
+            (void)weight_geometry(QType::NVFP4, QuantLayout::BatchedBlockScaleK16M128x4,
+                                  std::vector<std::uint64_t>{3, 256, 128}, WeightDivisors{2});
+        },
+        "a per-expert array whose count differs from the expert axis");
+    expect_throws(
+        [] {
+            (void)weight_geometry(QType::NVFP4, QuantLayout::BlockScaleK16M128x4,
+                                  std::vector<std::uint64_t>{256, 128}, WeightDivisors{3});
+        },
+        "a rank-two stack whose rows do not divide by the declared count");
+    expect_throws(
+        [] {
+            (void)weight_geometry(QType::NVFP4, QuantLayout::BlockScaleK16M128x4,
+                                  std::vector<std::uint64_t>{384, 128}, WeightDivisors{2});
+        },
+        "a declared divisor domain that is not a whole 128-row tile");
+    expect_throws(
+        [] {
+            (void)weight_geometry(QType::Q4_G64_FP16, QuantLayout::RowSplit,
+                                  std::vector<std::uint64_t>{2, 256, 128});
+        },
+        "a grouped integer layout with a leading matrix axis");
+    expect_throws(
+        [] {
+            (void)weight_geometry(QType::FP8_E4M3FN_BLOCK64X64_BF16, QuantLayout::BlockScaleM64K64,
+                                  std::vector<std::uint64_t>{2, 2, 128, 128});
+        },
+        "a block-scaled FP8 layout with rank four");
+    expect_throws(
+        [] {
+            (void)weight_geometry(QType::Q4_G64_FP16, QuantLayout::RowSplit,
+                                  std::vector<std::uint64_t>{256, 128}, WeightDivisors{2});
+        },
+        "a per-expert array on a layout that has no divisor plane");
+    expect_throws(
+        [] {
+            (void)weight_geometry(QType::NVFP4, QuantLayout::BlockScaleK16M128x4,
+                                  std::vector<std::uint64_t>{256, 128}, WeightDivisors{0});
+        },
+        "a declared empty divisor array");
+}
+
+void test_batched_native_weight() {
+    constexpr std::uint64_t experts = 2, rows = 256, columns = 128;
+    const auto geometry = weight_geometry(QType::NVFP4, QuantLayout::BatchedBlockScaleK16M128x4,
+                                          std::vector<std::uint64_t>{experts, rows, columns},
+                                          WeightDivisors{experts});
+    std::vector<std::byte> storage(geometry.bytes);
+    std::memset(storage.data(), 0, storage.size());
+    const std::vector<float> divisors{2.0F, 5.0F};
+    WeightParent parent{geometry, storage.data()};
+    parent.weight_divisors = divisors;
+
+    WeightView second;
+    second.shape = {rows, columns};
+    second.parts.push_back({&parent, rows * columns, 2 * rows * columns});
+    const auto weight = native_weight(second);
+    expect(weight.layout == QuantLayout::BlockScaleK16M128x4,
+           "a matrix view reports the rank-two layout");
+    expect(weight.scales ==
+               storage.data() + geometry.scale_offset + geometry.scale_bytes_per_matrix,
+           "the scale plane rebases to the expert's own block");
+    expect(weight.weight_scale_divisor == 5.0F, "the expert's own divisor is reported");
+
+    WeightView first;
+    first.shape = {rows, columns};
+    first.parts.push_back({&parent, 0, rows * columns});
+    expect(native_weight(first).weight_scale_divisor == 2.0F, "the first expert keeps its word");
+
+    // A view that runs from one expert domain into the next has no single divisor to report.
+    WeightView crossed;
+    crossed.shape = {rows, columns};
+    crossed.parts.push_back(
+        {&parent, rows / 2 * columns, rows / 2 * columns + rows * columns});
+    expect_throws([&] { (void)native_weight(crossed); }, "a view across two divisor domains");
+
+    // Without the declared array there is nothing to read, so the view must not inherit a zero.
+    WeightParent bare{geometry, storage.data()};
+    WeightView third;
+    third.shape = {rows, columns};
+    third.parts.push_back({&bare, rows * columns, 2 * rows * columns});
+    expect_throws([&] { (void)native_weight(third); }, "a missing per-expert divisor array");
+}
+
 } // namespace
 
 int main() {
@@ -163,6 +381,12 @@ int main() {
         test_native_weight(QType::FP8_E4M3FN_BLOCK64X64_BF16, QuantLayout::BlockScaleM64K64, 64);
         test_native_weight(QType::FP8_E4M3FN_BLOCK128X128_BF16, QuantLayout::BlockScaleM128K128, 128);
         test_activation_scale_round_trip();
+        test_batched_geometry();
+        test_tiled_block_rank_three();
+        test_stacked_per_expert_divisors();
+        test_single_divisor_unchanged();
+        test_format_rejections();
+        test_batched_native_weight();
     } catch (const std::exception& error) {
         std::cerr << "weight view test exception: " << error.what() << '\n';
         return 1;

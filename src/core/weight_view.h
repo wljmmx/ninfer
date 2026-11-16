@@ -28,6 +28,13 @@ inline Tensor as_dense(const Weight& weight) {
     }
 }
 
+// A quantized payload may end in one FP32 divisor word per declared domain. The default is the
+// single matrix divisor every NVFP4 parent has always stored; a descriptor that keeps one divisor
+// per expert declares that array here, so the count, the plane offset and the payload follow.
+struct WeightDivisors {
+    std::uint64_t count = 1;
+};
+
 // Geometry describes one complete encoded parent. Regions address its logical elements;
 // padding and scale words do not belong to that element domain.
 struct WeightGeometry {
@@ -55,10 +62,20 @@ struct WeightGeometry {
     std::uint64_t row_bytes        = 0;
     std::uint64_t rows_per_page    = 0;
     std::uint64_t page_count       = 0;
+    // port (sm_89) V10-13: the expert face of a quantized parent. `matrix_rows` is the row count of
+    // one matrix the shape names and `scale_bytes_per_matrix` the scale bytes that matrix owns, so
+    // for a batched [E, N, K] parent expert e's scale block starts at scale_offset +
+    // e * scale_bytes_per_matrix. `divisor_rows` is the number of logical rows one divisor word
+    // covers, so a declared array names the expert rows even when the shape is one stacked matrix;
+    // it is 0 when the payload has no divisor plane.
+    std::uint64_t matrix_rows            = 0;
+    std::uint64_t scale_bytes_per_matrix = 0;
+    std::uint64_t divisor_rows           = 0;
 };
 
 [[nodiscard]] WeightGeometry weight_geometry(QType format, QuantLayout layout,
-                                             std::span<const std::uint64_t> shape);
+                                             std::span<const std::uint64_t> shape,
+                                             WeightDivisors divisors = {});
 [[nodiscard]] std::uint64_t weight_element_count(std::span<const std::uint64_t> shape);
 
 struct WeightParent {

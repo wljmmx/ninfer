@@ -1,6 +1,7 @@
 #include "core/weight_view.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <stdexcept>
 
@@ -77,7 +78,15 @@ std::uint64_t weight_element_count(std::span<const std::uint64_t> shape) {
 }
 
 WeightGeometry weight_geometry(QType format, QuantLayout layout,
-                               std::span<const std::uint64_t> shape) {
+                               std::span<const std::uint64_t> shape, WeightDivisors divisors) {
+    if (!divisors.count) {
+        throw std::invalid_argument("weight divisor plane needs at least one word");
+    }
+    if (divisors.count != 1 &&
+        (format != QType::NVFP4 || (layout != QuantLayout::BlockScaleK16M128x4 &&
+                                    layout != QuantLayout::BatchedBlockScaleK16M128x4))) {
+        throw std::invalid_argument("per-expert divisors require a block-scaled NVFP4 layout");
+    }
     WeightGeometry out;
     out.format = format;
     out.layout = layout;
@@ -91,10 +100,29 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         }
         return out;
     }
-    if (shape.size() != 2) { throw std::invalid_argument("quantized weight must be a matrix"); }
-    const auto n       = shape[0];
-    const auto k       = shape[1];
+    // Rank is part of a quantized layout's identity. A block-scale layout may carry one leading
+    // matrix axis ([E, N, K] and nothing else); the batched NVFP4 layout is that form by name, the
+    // FP8 block layouts accept the rank the shape actually states. Every other layout is one
+    // matrix, so any other rank is a mislabelled tensor and must fail here rather than be
+    // reinterpreted by a consumer.
+    const bool batched = layout == QuantLayout::BatchedBlockScaleK16M128x4;
+    const bool tiled   = layout == QuantLayout::BlockScaleM128K128 ||
+                       layout == QuantLayout::BlockScaleM64K64;
+    const bool rank_ok = batched ? shape.size() == 3
+                                 : tiled ? shape.size() == 2 || shape.size() == 3
+                                         : shape.size() == 2;
+    if (!rank_ok) {
+        throw std::invalid_argument("quantized weight rank differs from its layout");
+    }
+    const auto n       = shape[shape.size() - 2];
+    const auto k       = shape.back();
+    const auto rows    = out.elements / k;
     out.padded_columns = k;
+    // The matrix the shape names, whether or not the layout repeats it along a leading axis.
+    out.matrix_rows = n;
+    if (divisors.count > 1 && (batched ? divisors.count != shape[0] : rows % divisors.count)) {
+        throw std::invalid_argument("per-expert divisor count differs from the expert count");
+    }
     if (layout == QuantLayout::RowPagedG16_4K) {
         // port (sm_89): bench's 4 KiB paged NF4 expert bank.
         if (format != QType::NF4_G16_E4M3FN || k % 16) {
@@ -153,7 +181,11 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         out.scale_bytes_per_row = 2;
         out.code_bytes          = out.elements;
         out.scale_offset        = aligned(out.code_bytes, 256);
-    } else if (layout == QuantLayout::BlockScaleK16M128x4) {
+    } else if (layout == QuantLayout::BlockScaleK16M128x4 ||
+               layout == QuantLayout::BatchedBlockScaleK16M128x4) {
+        // port (sm_89) V10-13: the batched form is the same plane repeated once per expert matrix
+        // behind one leading axis, so N and K keep their rank-two meaning and only the scale plane
+        // grows with the expert count.
         if (format != QType::NVFP4 || n % 128 || k % 64) {
             throw std::invalid_argument("NVFP4 BlockScale requires N%128=0 and K%64=0");
         }
@@ -184,12 +216,21 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
     } else {
         throw std::invalid_argument("unknown quantized weight layout");
     }
-    out.scale_bytes = mul(n / out.scale_block_rows, out.scale_bytes_per_row);
-    out.bytes       = add(out.scale_offset, out.scale_bytes);
+    // One scale plane per matrix the shape names: the first is the rank-two plane, and every further
+    // leading matrix repeats it byte for byte.
+    out.scale_bytes_per_matrix = mul(n / out.scale_block_rows, out.scale_bytes_per_row);
+    out.scale_bytes            = mul(rows / n, out.scale_bytes_per_matrix);
+    out.bytes                  = add(out.scale_offset, out.scale_bytes);
     if (format == QType::NVFP4) {
+        // One word per declared domain. An undeclared array is still the single matrix divisor, so
+        // every existing rank-two parent keeps its byte count exactly.
+        if (divisors.count > 1 && rows / divisors.count % 128) {
+            throw std::invalid_argument("per-expert divisor domains must be whole NVFP4 row tiles");
+        }
         out.divisor_offset = out.bytes;
-        out.divisor_count  = 1;
-        out.bytes          = add(out.bytes, 4);
+        out.divisor_count  = divisors.count;
+        out.divisor_rows   = rows / divisors.count;
+        out.bytes          = add(out.bytes, mul(divisors.count, 4));
     }
     return out;
 }
@@ -226,14 +267,19 @@ bool is_complete_weight(const WeightView& view) {
 
 std::uint64_t weight_scale_offset(const WeightGeometry& geometry, std::uint64_t row,
                                   std::uint64_t group) {
-    if (geometry.shape.size() != 2 || !geometry.group_size || row >= geometry.shape[0] ||
+    if (geometry.shape.size() < 2 || !geometry.group_size ||
+        row >= geometry.elements / geometry.shape.back() ||
         group >= geometry.padded_columns / geometry.group_size) {
         throw std::invalid_argument("weight scale coordinate exceeds its parent");
     }
-    if (geometry.layout == QuantLayout::BlockScaleK16M128x4) {
+    if (geometry.layout == QuantLayout::BlockScaleK16M128x4 ||
+        geometry.layout == QuantLayout::BatchedBlockScaleK16M128x4) {
+        // The row coordinate is global over every matrix, so expert e's scale block starts at row
+        // e * matrix_rows and the swizzle below repeats the rank-two plane for it unchanged.
         const auto inner = row % 128;
-        return geometry.scale_offset + (row / 128 * (geometry.shape[1] / 64) + group / 4) * 512 +
-               inner % 32 * 16 + inner / 32 * 4 + group % 4;
+        return geometry.scale_offset +
+               (row / 128 * (geometry.shape.back() / 64) + group / 4) * 512 + inner % 32 * 16 +
+               inner / 32 * 4 + group % 4;
     }
     if (geometry.layout == QuantLayout::BlockScaleM128K128 ||
         geometry.layout == QuantLayout::BlockScaleM64K64) {
@@ -249,13 +295,13 @@ WeightRowPlanes weight_row_planes(const WeightRegion& region) {
     validate_region(region);
     const auto& parent = *region.parent;
     const auto& g      = parent.geometry;
-    if (!parent.data || g.shape.size() != 2 || region.begin % g.shape[1] ||
-        region.end % g.shape[1]) {
+    if (!parent.data || g.shape.size() < 2 || region.begin % g.shape.back() ||
+        region.end % g.shape.back()) {
         throw std::invalid_argument("row view requires resident complete logical rows");
     }
     WeightRowPlanes out;
-    out.row_begin       = region.begin / g.shape[1];
-    out.row_count       = (region.end - region.begin) / g.shape[1];
+    out.row_begin       = region.begin / g.shape.back();
+    out.row_count       = (region.end - region.begin) / g.shape.back();
     out.code_row_bytes  = g.code_bytes_per_row;
     out.high_row_bytes  = g.high_bytes_per_row;
     out.scale_row_bytes = g.scale_bytes_per_row;
@@ -263,7 +309,8 @@ WeightRowPlanes weight_row_planes(const WeightRegion& region) {
     if (g.high_bytes) {
         out.high = parent.data + g.high_offset + out.row_begin * out.high_row_bytes;
     }
-    out.swizzled_scales = g.layout == QuantLayout::BlockScaleK16M128x4;
+    out.swizzled_scales = g.layout == QuantLayout::BlockScaleK16M128x4 ||
+                          g.layout == QuantLayout::BatchedBlockScaleK16M128x4;
     if (g.scale_bytes) {
         // port (sm_89) T116: a scale row covers scale_block_rows matrix rows, so a block-scaled
         // view advances by whole tiles. Every other layout stores scale_block_rows = 1.
@@ -308,7 +355,7 @@ Weight native_weight(const WeightView& view, float input_divisor) {
         out.qdata = region.parent->data + mul(region.begin, word_bytes(g.format));
         return out;
     }
-    if (g.shape.size() != 2 || view.shape[1] != g.shape[1]) {
+    if (g.shape.size() < 2 || view.shape[1] != g.shape.back()) {
         throw std::invalid_argument("quantized native Weight requires unchanged parent K");
     }
     const auto planes = weight_row_planes(region);
@@ -323,8 +370,25 @@ Weight native_weight(const WeightView& view, float input_divisor) {
     out.scales               = planes.scales;
     out.group_size           = static_cast<std::uint32_t>(g.group_size);
     out.group                = g.group_size ? dimension(g.group_size) : 0;
-    out.weight_scale_divisor = region.parent->weight_scale_divisor;
     out.input_scale_divisor  = input_divisor;
+    if (g.divisor_count > 1) {
+        // A declared per-expert array names one word per expert domain, so the view has to sit
+        // inside one of them: the single scalar a Weight carries cannot describe a mixture.
+        const auto per_domain = g.divisor_rows ? g.divisor_rows : g.matrix_rows;
+        const auto first      = planes.row_begin;
+        const auto last       = planes.row_begin + planes.row_count - 1;
+        if (!per_domain || first / per_domain != last / per_domain ||
+            region.parent->weight_divisors.size() != g.divisor_count) {
+            throw std::invalid_argument(
+                "native weight needs one complete per-expert divisor domain");
+        }
+        out.weight_scale_divisor = region.parent->weight_divisors[first / per_domain];
+        if (!std::isfinite(out.weight_scale_divisor) || out.weight_scale_divisor <= 0) {
+            throw std::invalid_argument("native weight requires a positive finite divisor");
+        }
+    } else {
+        out.weight_scale_divisor = region.parent->weight_scale_divisor;
+    }
     if (g.layout == QuantLayout::RowSplit) {
         out.scale_dtype = DType::FP16;
         out.scale_ne[0] = dimension(g.padded_columns / g.group_size);
@@ -337,15 +401,24 @@ Weight native_weight(const WeightView& view, float input_divisor) {
         out.scale_ne[0] = out.n;
         out.scale_nb[0] = 2;
         out.scale_nb[1] = out.scale_nb[2] = out.scale_nb[3] = static_cast<std::int64_t>(out.n) * 2;
-    } else if (g.layout == QuantLayout::BlockScaleK16M128x4) {
+    } else if (planes.swizzled_scales) {
+        // port (sm_89) V10-13: a matrix view rebases the swizzled plane to its own first row. The
+        // 512-byte tile is 128 rows of scale words, so a view may only start on a whole tile; a
+        // complete rank-two parent starts at zero and keeps the parent origin unchanged.
+        if (planes.row_begin % 128 || planes.row_count % 128) {
+            throw std::invalid_argument("NVFP4 view splits a 128-row scale tile");
+        }
+        out.layout      = QuantLayout::BlockScaleK16M128x4;
         out.scale_dtype = DType::FP8_E4M3FN;
+        out.scales =
+            region.parent->data + g.scale_offset + planes.row_begin * g.scale_bytes_per_row;
     } else if (g.layout == QuantLayout::BlockScaleM128K128 ||
                g.layout == QuantLayout::BlockScaleM64K64) {
         // port (sm_89) T116: the block-scaled FP8 planes. A partial view may only start on a scale
         // tile: the scale plane is indexed per tile row, so a region that began mid-tile would
         // silently read its neighbour's scales (weight_row_planes advances by whole tile rows).
-        if (region.begin / g.shape[1] % g.scale_block_rows ||
-            (region.end - region.begin) / g.shape[1] % g.scale_block_rows) {
+        if (region.begin / g.shape.back() % g.scale_block_rows ||
+            (region.end - region.begin) / g.shape.back() % g.scale_block_rows) {
             throw std::invalid_argument("block-scaled FP8 view splits a scale tile");
         }
         out.scale_dtype = DType::BF16;

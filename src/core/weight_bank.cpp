@@ -46,7 +46,9 @@ WeightBankLayout describe_weight_bank(const WeightGeometry& g, const WeightBankR
         out.scales = plane(g.scale_offset, g.scale_bytes_per_row, g.scale_block_rows);
     }
     if (g.divisor_count) {
-        const auto domain      = g.shape[g.shape.size() - 2];
+        // port (sm_89) V10-13: a declared divisor array names the rows one word covers; without
+        // one, the whole rank-two matrix is the domain, exactly as before.
+        const auto domain      = g.divisor_rows ? g.divisor_rows : g.shape[g.shape.size() - 2];
         const auto last        = r.row_begin + (r.count - 1) * r.row_stride + r.rows - 1;
         const bool same_domain = r.row_begin / domain == last / domain;
         if (r.row_begin % domain + r.rows > domain || (!same_domain && r.row_stride % domain)) {
