@@ -843,6 +843,37 @@ gate 同时补上 `kNoPages`（四个平面或 block table 为空即回落，而
   "避免 copy-in"侧仍无输入；`decide_cpu_kv_split` 仍无调用者（刀 4 未做，见下）。
 - 最后一个 split 永远被 `kAppendLag` 排除（它含当前 token）。真实宿主层把 append 交回宿主侧后，这条
   限制自然消失。
-- E8 家族（rk4v4-e8 / rk2v4-e8 / rk4v2-e8）能被镜像识别，但 `RkHostKvDType` 只有 rk4v4/rk8v4 两个
-  取值，gate 的 dtype 轴无法命名它们，故仍留在 GPU。算子本身支持这些编解码器
-  （`RkKCodec::E8Lattice` 等），缺的是视图的 dtype 轴扩展。
+- E8 家族（rk4v4-e8 / rk2v4-e8 / rk4v2-e8）此前留在 GPU，是因为 `RkHostKvDType` 只有
+  rk4v4/rk8v4 两个取值；该轴已扩到五族，现在它们缺的不是解码语义而是 `launch.cu` 的调用点，
+  见 14.6。
+
+### 14.6 家族覆盖（CPU 分部腿）
+
+`RkHostKvDType` 现在是五族，且 dtype → `(RkKCodec, RkVCodec)` 只有一处映射
+（`host_partial.h` 的 `rk_host_kv_codecs`；反向的 `rk_host_kv_dtype_of` 由它扫出，没有第二张表）。
+gate 的模板轴、stage 的算子实例、镜像的 dtype 推导都走这一个映射，所以一族不可能在某一侧被叫成
+另一个名字、又被另一侧按别的 codec 解码。
+
+| 家族 | K 载体 | V 载体 | CPU 分部可达性 |
+|---|---|---|---|
+| rk4v4 | 128 B int4-packed | 128 B int4-packed | 可走：`rk_packedk_grouped` 已带 gate（`Rk4v4`） |
+| rk8v4 | 256 B int8 | 128 B int4-packed | 可走：`rk_grouped` 已带 gate（`Rk8v4`） |
+| rk4v4-e8 | 96 B E8-lattice（64 B 圆柱 + 32 B 残差符号） | 128 B int4-packed | 镜像/门/算子都支持（`E8Lattice`），但 `launch.cu` 的 `rk_e8_grouped` 没有 gate 调用 |
+| rk2v4-e8 | 64 B E8 圆柱 | 128 B int4-packed | 同上（K 用 `E8Root`） |
+| rk4v2-e8 | 96 B E8-lattice | 64 B E8 圆柱（校准半径 centre 1.115） | 同上（`E8Lattice` K + `E8Root` V） |
+
+载体本身没有任何一族被拒绝：`cpu/e8_codec.h` 的圆柱/晶格平面与 `paged_kv_storage_layout()` 的
+`leading_extent` 一一对应（64 / 96 / 128 / 256 B），scale 平面一律 FP16 G64，且 lattice 的
+`absmax/7/Grid` 与 `code' = Grid*(code ± 1)` 使 `code' * stored_scale` 仍是同一解码契约——所以
+E8 分支拿到的是与 int4/int8 完全相同的 int8 点积数值形式，差异只在取码。
+
+真正缺的是调用点，而且是**所有人的**缺口，不是 E8 独有的：带 gate 的只有 grouped/融合路径
+（width ≤ 8）里的 `rk_grouped`（rk8v4）与 `rk_packedk_grouped`（rk4v4）；
+`rk_execute_parallel`（width 9..16 的 parallel 路径）与三个 E8 grouped 分支
+（`rk_e8_grouped` / `rk_root_grouped` / `rk_e8v2_grouped`）都没有 `rk_kv_cpu_split_gate` 调用。
+因此在引擎里打开 `NINFER_KV_CPU_PARTITION` 目前只对 rk4v4 / rk8v4 的 grouped 形态生效。
+
+单测 `ninfer_kv_host_partial_mirror_test` 对五族逐一断言：镜像推导出的 dtype、dtype → codec 对、
+载体字节数，以及用算子自己的解码路径读回页内 256 个码与 scale 平面（rk4v4/rk8v4 还对到夹具码值本身；
+E8 族对到按算子寻址独立铺出的参考平面，并要求码值离开 int4 值域、rk4v2-e8 的 V 走校准半径）。
+
