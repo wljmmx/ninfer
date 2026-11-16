@@ -1212,93 +1212,20 @@ private:
         ops::CpuSwiGLUExperts view;
     };
 
+    // The tier does NOT allocate. Its block is allocated by the caller before the tier exists (see
+    // HostArenaBlock), because the allocator is the only thing that knows what this box can map, and
+    // the slot count is derived from the bytes it granted. A tier without a block is a construction
+    // bug; the stand-ins this used to fall back to are gone on purpose - a pageable or unmapped
+    // arena still runs, keeps every Device-side route an upload, and surfaces at the first attention
+    // launch as cudaErrorLaunchOutOfResources, which reads as a kernel bug. Fail where the mistake is.
     std::byte* arena() {
         if (arena_ == nullptr) {
-            // port (sm_89): the arena is the source of every Device upload and the memory the CPU
-            // kernels stream through, so it is page-locked when the driver allows it. Two measured
-            // reasons: a batch of pinned slices submits 3.5-16x cheaper than the same slices from
-            // pageable memory, and a pageable working set gets trimmed, which cost the split path
-            // 0.43 ms per expert against 0.041 ms on warm pages. Pageable reservation stays as the
-            // fallback, because a locked allocation can fail on a busy box.
-            void* locked = nullptr;
-            // port (sm_89): mapped as well as locked. Q20 needs the Device to address this tier
-            // directly - that is what makes a route the pool cannot hold resolvable inside the layer
-            // without a host upload, and therefore what `capt_free` is a measurement of. Mapping does
-            // not change the upload path: `arena_image()` still hands the host address to the
-            // uploader, and the Device address is only read by callers that ask for it.
-            if (cudaHostAlloc(&locked, arena_bytes_, cudaHostAllocMapped) == cudaSuccess) {
-                arena_  = static_cast<std::byte*>(locked);
-                pinned_ = true;
-                void* device = nullptr;
-                if (cudaHostGetDevicePointer(&device, locked, 0) == cudaSuccess) {
-                    arena_device_ = static_cast<std::byte*>(device);
-                } else {
-                    // A refused mapping must not stay in the error state: the next CUDA_CHECK in the
-                    // model would report it at an unrelated call site. This is expected on a large
-                    // request (the mapped range is limited on WDDM), not a fatal condition.
-                    (void)cudaGetLastError();
-                }
-                // One line, once: whether the Device can address this tier at all is the premise
-                // Q20 rests on, and a silent fallback to "not mapped" would turn the second
-                // addressing leg into a host round trip that no counter would blame.
-                bool known = false;
-                if (arena_device_ != nullptr) {
-                    cudaPointerAttributes attributes{};
-                    known = cudaPointerGetAttributes(&attributes, arena_device_) == cudaSuccess;
-                    if (!known) { (void)cudaGetLastError(); }
-                }
-                std::fprintf(stderr,
-                             "[host] arena mapped bytes=%llu host=%p dev=%p device_accessible=%d\n",
-                             static_cast<unsigned long long>(arena_bytes_),
-                             static_cast<const void*>(arena_), static_cast<const void*>(arena_device_),
-                             known ? 1 : 0);
-                std::fflush(stderr);
-                return arena_;
-            }
-            // The mapped request was refused. Its error is still the last error CUDA recorded;
-            // clear it before the fallback so it cannot surface at the next kernel launch.
-            const auto mapped_error = cudaGetLastError();
-            std::fprintf(stderr,
-                         "[host] mapped allocation of %llu MiB failed: %s - trying a registered "
-                         "fallback\n",
-                         static_cast<unsigned long long>(arena_bytes_ >> 20),
-                         cudaGetErrorString(mapped_error));
-            std::fflush(stderr);
-            // A second route to the same property: allocate locked, then register the range as
-            // mapped. cudaHostAllocMapped can refuse a large request where the two-step form
-            // succeeds, and the Device only needs the alias, not how it was produced.
-            if (cudaHostAlloc(&locked, arena_bytes_, cudaHostAllocDefault) == cudaSuccess) {
-                void* device = nullptr;
-                if (cudaHostRegister(locked, arena_bytes_, cudaHostRegisterMapped) == cudaSuccess &&
-                    cudaHostGetDevicePointer(&device, locked, 0) == cudaSuccess) {
-                    arena_        = static_cast<std::byte*>(locked);
-                    arena_device_ = static_cast<std::byte*>(device);
-                    pinned_       = true;
-                    std::fprintf(stderr,
-                                 "[host] arena mapped bytes=%llu host=%p dev=%p "
-                                 "device_accessible=1 (registered)\n",
-                                 static_cast<unsigned long long>(arena_bytes_),
-                                 static_cast<const void*>(arena_),
-                                 static_cast<const void*>(arena_device_));
-                    std::fflush(stderr);
-                    return arena_;
-                }
-                (void)cudaGetLastError();
-                arena_  = static_cast<std::byte*>(locked);
-                pinned_ = true;
-                return arena_;
-            }
-            (void)cudaGetLastError();
-#if defined(_WIN32)
-            arena_ = static_cast<std::byte*>(
-                VirtualAlloc(nullptr, arena_bytes_, MEM_RESERVE, PAGE_NOACCESS));
-            if (arena_ == nullptr) {
-                throw std::runtime_error("host expert arena: reserve failed");
-            }
-#endif
+            throw std::runtime_error(
+                "host expert arena: the tier was built without an allocated block (the caller owns "
+                "the cudaHostAlloc; see allocate_host_arena in the engine)");
         }
         // The Device alias of a block the caller allocated is published here, on the tier's first
-        // use - the same moment the lazy path above would have created it. Publishing it at
+        // use - the same moment the lazy allocation used to create it. Publishing it at
         // construction instead is measurable: see the note on `arena_device_pending_`.
         if (arena_device_pending_ != nullptr) {
             arena_device_         = arena_device_pending_;

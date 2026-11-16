@@ -44,8 +44,8 @@
 | ID | 任务 | 验收 | 状态 | 证据 |
 |---|---|---|---|---|
 | P0.1 | 竞技场改成"分配成功多少就按多少定槽数"，删掉固定的 21 GiB 上限（`model_instance.cpp` `kMappedArenaCeiling`） | 默认门禁连跑 3 次都过 `6.024313` / `20.673595` | ✅ | 分配在前、定尺寸在后：`allocate_host_arena()` 按 GiB 步退让，块字节数交给 tier，slot 由块推。默认 3×2 全逐位（`6.024313` ×3、`20.673595` ×3，exit=0），竞技场 22093–22200 MiB 漂移不影响数值；回执 `[host] arena allocated 22100 MiB (asked 22100, 0 refusals) device_accessible=1 - the tier is sized from this`；显式 `NINFER_EXPERT_HOST_ARENA_MB=16384` → 13107 slots，仍 `6.024313` |
-| P0.2 | 若单块映射不可行：分块注册（每块 `cudaHostRegister` + 设备地址表），把"块"变成 tier 的显式概念 | 同上，且 20 GiB 级竞技场可用 | ⬜ | — |
-| P0.3 | 分配失败在分配点就 fail-loud（现在会跑到 `qsa/prepare_launch.cu:333` 伪装成 kernel bug） | 日志首行指名 arena 与尺寸 | ⬜ | `[host] mapped allocation of 20941 MiB failed` → `cudaErrorLaunchOutOfResources` |
+| P0.2 | 若单块映射不可行：分块注册（每块 `cudaHostRegister` + 设备地址表），把"块"变成 tier 的显式概念 | 同上，且 20 GiB 级竞技场可用 | N/A | 不需要（P0.1 已达标）：单块 `cudaHostAllocMapped` 在 22093–22200 MiB 上 6/6 成功（`[host] arena allocated 22100 MiB (asked 22100, 0 refusals)`），未触发过退让；分块注册与设备地址表按任务约定不动 |
+| P0.3 | 分配失败在分配点就 fail-loud（现在会跑到 `qsa/prepare_launch.cu:333` 伪装成 kernel bug） | 日志首行指名 arena 与尺寸 | ✅ | `NINFER_EXPERT_HOST_ARENA_MB=60000` → 首行 `[host] arena allocation failed: asked 60000 MiB, refused at every step down to 60000 MiB after 1 attempt(s) (out of memory) - the host expert tier cannot exist, and there is no pageable stand-in for it`，exit=1，13 行日志里无 `prepare_launch.cu:333`；`arena()` 里 registered/pageable 兜底全部删除 |
 
 ### P1 容量规划对齐规格
 
@@ -120,3 +120,4 @@
 | 日期 | 事件 |
 |---|---|
 | 2026-11-16 | 建表。矩阵：1 格实测、1 格 N/A（硬件）、2 格待验。P0 由当晚 `mapped allocation of 20941 MiB failed` 升级为最高优先级 |
+| 2026-11-16 | P0.1 关账（`cbc2ad49`）：分配在前、定尺寸在后，默认 3×2 门禁逐位。P0.2 记 N/A（单块在 22 GiB 上 6/6 成功）。P0.3 关账：失败在分配点抛出，pageable/registered 兜底删除 |

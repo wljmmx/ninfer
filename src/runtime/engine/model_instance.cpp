@@ -40,7 +40,8 @@ namespace {
 
 std::uint64_t host_expert_arena_bytes(std::uint64_t want_bytes);
 std::uint64_t current_free_host_bytes();
-models::qwen3_5::execution::HostArenaBlock allocate_host_arena(std::uint64_t want_bytes);
+models::qwen3_5::execution::HostArenaBlock allocate_host_arena(std::uint64_t want_bytes,
+                                                               bool          exact);
 std::uint64_t readahead_bytes(std::span<const ExpertBankLayout> banks);
 std::uint64_t second_chance_budget_bytes(std::span<const ExpertBankLayout> banks);
 using Clock = std::chrono::steady_clock;
@@ -493,7 +494,14 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     const bool host_tier_wanted = short_pool && !streams.empty();
     const std::uint64_t host_ask = routed_ask + prefetch_bytes + second_chance_ask;
     models::qwen3_5::execution::HostArenaBlock host_block;
-    if (host_tier_wanted) { host_block = allocate_host_arena(host_ask); }
+    if (host_tier_wanted) {
+        // An explicitly named size is asked for as named (P0.3: a refusal there is the caller's
+        // error, not something to step around). Everything else steps down until it fits.
+        const char* explicit_mb = std::getenv("NINFER_EXPERT_HOST_ARENA_MB");
+        const bool  exact_size  = explicit_mb != nullptr && *explicit_mb != '\0' &&
+                                 std::strtoull(explicit_mb, nullptr, 10) != 0;
+        host_block = allocate_host_arena(host_ask, exact_size);
+    }
     // The block is the arena, so the line below quotes what the allocator granted - not what was
     // asked for. `asked` is on the [host] line above beside the refusal count.
     const std::uint64_t arena_held = host_block.bytes != 0 ? host_block.bytes : host_ask;
@@ -883,9 +891,14 @@ std::uint64_t second_chance_budget_bytes(std::span<const ExpertBankLayout> banks
 // So: ask for the candidate, and step down one GiB at a time until an allocation SUCCEEDS. The
 // bytes that succeeded are the arena. The property is fixed by the call - locked (the CPU half
 // streams through it) and mapped (the Device addresses it directly) - because that is the only form
-// whose absence this tier can be judged on; a pageable block would still run and quietly turn every
-// Device-side route into an upload.
-models::qwen3_5::execution::HostArenaBlock allocate_host_arena(std::uint64_t want_bytes) {
+// whose absence this tier can be judged on: a pageable block still runs, and silently turns every
+// Device-side route into an upload. There is no fallback below this point.
+//
+// `exact` is the explicit-override form (NINFER_EXPERT_HOST_ARENA_MB): a size the caller named is
+// asked for as named. Stepping it down would report a successful run at a size the experiment did
+// not ask for, so a refusal there is an error the caller has to see.
+models::qwen3_5::execution::HostArenaBlock allocate_host_arena(std::uint64_t want_bytes,
+                                                               bool          exact) {
     models::qwen3_5::execution::HostArenaBlock block;
     if (want_bytes == 0) { return block; }
     constexpr std::uint64_t kStepBytes  = 1ull << 30;
@@ -893,6 +906,7 @@ models::qwen3_5::execution::HostArenaBlock allocate_host_arena(std::uint64_t wan
     const std::uint64_t     asked       = want_bytes;
     unsigned                refusals    = 0;
     std::uint64_t           len         = want_bytes;
+    cudaError_t             last        = cudaSuccess;
     for (;;) {
         void*      locked = nullptr;
         const auto status =
@@ -919,22 +933,27 @@ models::qwen3_5::execution::HostArenaBlock allocate_host_arena(std::uint64_t wan
             std::fflush(stderr);
             return block;
         }
+        last = status;
         (void)cudaGetLastError();
         ++refusals;
-        if (len <= kFloorBytes) { break; }
+        if (exact || len <= kFloorBytes) { break; }
         len = len > kFloorBytes + kStepBytes ? len - kStepBytes : kFloorBytes;
     }
-    // P0.3's fail-loud lands here; P0.1 keeps the pre-existing behaviour (no block handed to the
-    // tier, which then tries the same allocation once at its full size) so the ordering change can
-    // be judged on its own.
+    // Fail at the allocation point. The alternative is what this replaces: a pageable stand-in that
+    // still runs, keeps every Device-side route an upload, and surfaces at the first attention
+    // launch as `cudaErrorLaunchOutOfResources` at qsa/prepare_launch.cu:333 - a sizing failure that
+    // reads as a kernel bug. The first line names the arena, the bytes asked for and the driver's
+    // own reason; the throw stops construction before any of that can be misattributed.
     std::fprintf(stderr,
-                 "[host] arena allocation refused at every step: asked %llu MiB, down to %llu MiB "
-                 "(%u attempts) - the tier falls back to its own attempt at %llu MiB\n",
+                 "[host] arena allocation failed: asked %llu MiB, refused at every step down to "
+                 "%llu MiB after %u attempt(s) (%s) - the host expert tier cannot exist, and there "
+                 "is no pageable stand-in for it\n",
                  static_cast<unsigned long long>(asked >> 20),
-                 static_cast<unsigned long long>(kFloorBytes >> 20), refusals,
-                 static_cast<unsigned long long>(want_bytes >> 20));
+                 static_cast<unsigned long long>(len >> 20), refusals, cudaGetErrorString(last));
     std::fflush(stderr);
-    return block;
+    throw std::runtime_error("expert host arena: cudaHostAlloc(Mapped) refused " +
+                             std::to_string(asked >> 20) + " MiB and every step down to " +
+                             std::to_string(len >> 20) + " MiB (" + cudaGetErrorString(last) + ")");
 }
 
 // Host-side arena for experts the Device pool cannot hold. It takes what the caller says the host
