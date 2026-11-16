@@ -143,7 +143,9 @@ Write-Launcher 'serve_27b_v3_128k_c8.bat' 'ninfer-serve 27B v3 128K C=8 rk4v4-e8
     '--host 0.0.0.0 --port 9908 --max-context 131072 --kv-capacity auto --max-concurrency 8 --max-pending-requests 16 --prefill-chunk 1024 --kv-dtype rk4v4-e8 --spec dflash2 --draft-tokens 7 --lm-head-draft --kv-evict auto --kv-idle-reclaim-ms 60000 --wddm-evictable-budget'
 
 
-$describe = & git -C $Repo describe --tags --always
+# Match only the product tags: the ancestry tag `upstream-triaged/<sha>` is also reachable, and a
+# plain `describe --tags` would report it as the version.
+$describe = & git -C $Repo describe --tags --always --match "v*"
 $commit = & git -C $Repo rev-parse HEAD
 @"
 NInfer release for RTX 4090 (sm_89), Windows 11 x64

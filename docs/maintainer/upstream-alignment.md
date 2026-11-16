@@ -480,3 +480,33 @@ old    : 既有 1565 行与 HEAD 版本逐字节相同  ✅
 class  : dead 170 / absorbed 1313 / na-arch 76 / na-hardware 13 / na-doc 12 / deferred 42 / todo 3
 ```
 
+## 11. 2026-11-16 祖先跟进（behind=0）
+
+上一节把台账补齐到 `454b922f` 之后，本轮把“已逐条处置”这件事**写进历史**，使下一次 `git fetch` 只显示真正新增的提交，而不是几百条已经核对过的旧账。
+
+| 项 | 值 |
+|---|---|
+| 上游 tip | `454b922f`（2026-11-16，`docs: publish Flash Next Spark performance`） |
+| 合并方式 | `git merge -s ours --no-ff upstream/master`：**树不变**，只把上游变成祖先（本地是 Windows/sm_89 移植，不能取上游的树） |
+| 合并提交 | `695ab26e` |
+| 标签 | `upstream-triaged/454b922f`（指向合并提交） |
+| 合并后关系 | `behind=0`；`ahead=1088`；`merge-base=454b922f` |
+| 台账 | 1629 行：absorbed 1313 / dead 170 / na-arch 76 / deferred 42 / na-hardware 13 / na-doc 12 / **todo 3** |
+
+**读法（与 §7 一致）**：祖先＝已逐条处置，不等于已逐条吸收。合并提交的信息里写了 register 计数与剩余 todo，因此 `behind=0` 不会被误读成“内容全对齐”。剩余 3 条是内容项，不是版本关系问题：
+
+- `77c2e5e2` preemption 恢复 + 关闭顺序 + 观测字段（v10 的 V10-20；骨架在、四条子项未落）；
+- `8e464812` grammar 缓存与 token 边界回移（本地 9 个文件与父提交逐字节相同，补丁就绪，V10-57）；
+- `4461c968` 非法工具历史返回 400（本地 `chat_template.cpp:227` 直接解析 JSON，V10-58）。
+
+**下一轮流程（一条命令）**：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\upstream\catch_up.ps1
+```
+
+脚本依次做：检查工作树干净 → `fetch` → 跑 `alignment_report.ps1`（缺行即退出 1，作为门禁）→ 统计 register（`todo>0` 默认拒绝，确认后可 `-AllowTodo`，合并信息会记录计数）→ `merge -s ours --no-ff` → 打 `upstream-triaged/<sha>` 标签 → 复核 `behind=0`。
+
+注意：`upstream-triaged/*` 也是可达标签，`package_windows_release.ps1` 的 `git describe` 已改为 `--match "v*"`，避免 VERSION 变成 `upstream-triaged/...`。
+
+
