@@ -274,6 +274,10 @@ public:
     // P3: of this layer's gate-run routes, how many the CPU half owns (the cost model's answer on
     // the last ensure_split). Zero whenever NINFER_CPU_PATH_POLICY is off.
     [[nodiscard]] std::uint32_t split_cpu_routes() const noexcept { return split_cpu_routes_; }
+    // Decision 2's actuator spoke for this layer: its misses are on the CPU mask, so the copy the
+    // layer would have paid does not happen. Read once by ffn.cpp so the same event is not counted
+    // twice (its own note is the shadow of a decision the stream has already taken).
+    [[nodiscard]] bool layer_leg_acted() const noexcept { return layer_leg_acted_; }
     // What one run is described by: the artifact bank, its parent (metadata for a loader that names
     // the expert objects) and the per-expert geometry the operator sizes against.
     [[nodiscard]] const WeightBankLayout& split_layout(ExpertMatrixRole role) const {
@@ -677,6 +681,10 @@ private:
     // pre-P3 behaviour bit for bit.
     std::array<std::vector<std::uint8_t>, 3> split_cpu_only_;
     std::uint32_t split_cpu_routes_ = 0;
+    // Decision 2's actuator answered for THIS layer: the misses were put on the mask above, so the
+    // layer's copy bill is already zero for them. ffn.cpp reads this to know that its own shadow note
+    // would be the same event counted twice, and the panel reads the ledger's acted counters instead.
+    bool layer_leg_acted_ = false;
     std::array<std::vector<std::uint32_t>, 3> split_frozen_; // per run, when frozen_
     // port (sm_89): last layer's installed set, per run. A decode step starts from it and adds this
     // step's routes, rather than re-scanning 512 slots per run and re-sorting the score every layer.

@@ -3384,6 +3384,103 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
             }
             cpu_routes_this_layer = static_cast<int>(picked.size());
         }
+        // ---- decision 2's actuator: the misses, uploaded or answered on the half ------------------
+        //
+        // Until this line existed, decision 2 was a shadow: ffn.cpp priced it AFTER the fetch, when
+        // the bytes had already moved, so its "cpu-half" answer could never change anything and the
+        // seam's only witness was a printed verdict. Asked here it has a leg, and the leg is the
+        // mechanism decision 3 already owns - membership of split_cpu_only_: a route that is not a
+        // member is left off the upload list and out of the placement word, so it keeps no pool seat
+        // and host_routed_ffn computes it against the pinned tier.
+        //
+        // The two decisions are complementary by construction, which is why they share one mask:
+        // decision 3 names routes the tier ALREADY holds (their half costs no read, their copy costs
+        // the transfer), decision 2 names the ones that would have to be fetched (their half costs a
+        // read and saves the transfer). The second set is the only one whose copy bill starts with
+        // m * transfer, so it is the only one where the layer form's read-back term can be paid off.
+        //
+        // Nothing runs with the policy off: the verdict is PoolCopy by the switch, misses are
+        // collected and priced but never masked, and the layer is bit for bit the pre-decision-2 one.
+        layer_leg_acted_ = false;
+        const char* leg_name = "off";
+        int         leg_miss = 0;
+        double      leg_cross = -1.0;
+        // A/B switch for the actuator alone, so its contribution can be measured apart from decision
+        // 3's (which shares the mask). DEFAULT OFF, because it measured a loss: three arms of the same
+        // command (-pg 64,32, decode 32) gave 6.38 tok/s with the policy off, 5.75 with the policy on
+        // and this actuator off, and 2.48 with it on - 1389 of ~1550 layers answered "half". The
+        // reason is in the rates it reads, not in the mask: `span_us_per_expert` is the BEST observed
+        // span (57.8 us here) while `compute_us_per_expert` is an EWMA that had climbed to 1401 us, so
+        // the crossing m* = readback/(span - copy) lands at 12 misses and every 8-10 miss layer is
+        // judged "half cheaper" by a span that never applies at that size. Turning it on is a
+        // measurement (NINFER_CPU_LEG_ACT=on), not a policy.
+        static const bool leg_act = [] {
+            const char* v = std::getenv("NINFER_CPU_LEG_ACT");
+            return v != nullptr && std::strcmp(v, "on") == 0;
+        }();
+        if (cpu_path_switch() == CpuPathSwitch::On && leg_act) {
+            std::vector<std::uint32_t> misses;
+            for (const auto expert : distinct) {
+                const auto id = static_cast<std::uint32_t>(expert);
+                bool would_move = false;
+                for (const auto& run : split_) {
+                    if (!cache_->offset(ExpertCacheKey{run.bank, id}).has_value()) {
+                        would_move = true;
+                        break;
+                    }
+                }
+                if (would_move) { misses.push_back(id); }
+            }
+            if (!misses.empty()) {
+                CpuLayerLegQuery leg;
+                leg.misses  = static_cast<int>(misses.size());
+                leg.copy_us = control.signals.upload_us_per_expert;
+                leg.cpu_us  = cpu_half_rate().span_us_per_expert;
+                const auto verdict = decide_cpu_layer_leg(leg);
+                cpu_path_ledger().note_layer_leg(verdict, leg.misses);
+                leg_miss  = leg.misses;
+                leg_cross = verdict.threshold;
+                leg_name  = verdict.leg == CpuExpertLeg::CpuHalf   ? "half"
+                            : verdict.leg == CpuExpertLeg::PoolCopy ? "copy"
+                                                                    : "nodata";
+                if (verdict.leg == CpuExpertLeg::CpuHalf && !budget.link_idle) {
+                    // Two refusals, both measured rather than argued:
+                    //   * an idle link makes the copy free, so there is nothing to save (the first
+                    //     run of this actuator took all ten routes on `why=link idle` and bought
+                    //     1.5 tok/s against 2.0 before it);
+                    //   * the layer's CPU time is one budget, not two - whatever decision 3 already
+                    //     spent comes off the same wall, so the misses only take the room that is
+                    //     left (`budget_us / span` routes, decision 3's own divisor).
+                    const double span_us = cpu_half_rate().span_us_per_expert;
+                    std::size_t  extra   = misses.size();
+                    if (budget.budget_us > 0.0 && span_us > 0.0) {
+                        const auto fits = static_cast<long>(budget.budget_us / span_us) -
+                                          static_cast<long>(budget.count);
+                        extra = std::min<std::size_t>(extra, static_cast<std::size_t>(std::max<long>(0, fits)));
+                    }
+                    if (extra != 0) {
+                        // The coldest first: the same ranking the pool fills its spare seats from, so
+                        // the experts left to the half are the ones least likely to be wanted again.
+                        std::stable_sort(misses.begin(), misses.end(),
+                                         [&](std::uint32_t a, std::uint32_t b) {
+                                             return hot_score_[a] < hot_score_[b];
+                                         });
+                        for (auto& set : split_cpu_only_) {
+                            // Decision 3 may have left the mask unallocated; a mask with no bits set
+                            // reads as "no member" everywhere, so allocating it here changes nothing
+                            // by itself - the misses below are what it is for.
+                            if (set.empty()) { set.assign(count_, 0); }
+                            for (std::size_t i = 0; i < extra; ++i) {
+                                set[static_cast<std::size_t>(misses[i])] = 1;
+                            }
+                        }
+                        cpu_routes_this_layer += static_cast<int>(extra);
+                        cpu_path_ledger().note_layer_leg_acted(static_cast<int>(extra));
+                        layer_leg_acted_ = true;
+                    }
+                }
+            }
+        }
         // Per layer, as the ratio is taken: what the model charged on each side, the cap it was cut
         // to, why, and the two rates the count was divided by (span = tier fill + arithmetic,
         // compute = the arithmetic alone). `held` is the residency the CPU half would have found:
@@ -3397,7 +3494,8 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
         std::fprintf(stderr,
                      "[cpu-path] layer=%llu routes=%zu cpu=%d (%.0f%%) held=%zu/%zu | est "
                      "copy=%.0fus cpu=%.0fus "
-                     "cap=%.0fus why=%s | link=%.1fGB/s span=%.1fus compute=%.1fus per exp "
+                     "cap=%.0fus why=%s | leg=%s(m=%d m*=%.1f) | link=%.1fGB/s span=%.1fus "
+                     "compute=%.1fus per exp "
                      "(%.0f GFLOPS)\n",
                      static_cast<unsigned long long>(control.layers + 1), distinct.size(),
                      cpu_routes_this_layer,
@@ -3406,6 +3504,7 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
                                             static_cast<double>(distinct.size()),
                      held_candidates, distinct.size(),
                      budget.cost_gpu_us, budget.cost_cpu_us, budget.budget_us, budget.why,
+                     leg_name, leg_miss, leg_cross,
                      control.link_gbps,
                      cpu_half_rate().span_us_per_expert < 0.0
                          ? 0.0

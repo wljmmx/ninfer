@@ -2310,16 +2310,18 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
             control.observe_upload(moe.stream->last_cost().upload_ms * 1000.0, moved);
             control.observe_misses(moved);
             // P2 (cpu in-place path): the expert copy-vs-CPU-half decision point, fed by the
-            // same measured upload the panel prints. The verdict is recorded, not acted on:
-            // NINFER_CPU_PATH_POLICY (default off) holds the pool-copy leg, and the runtime leg
-            // a cpu-half verdict names (ensure() leaving the expert for the CPU half) is a
-            // later batch. Only a layer that actually moved experts in faced the choice.
+            // same measured upload the panel prints.
             // Decision 2, layer form: the copy-versus-half choice priced the way a layer pays it -
             // the transfer per miss plus the route read-back a clean layer would have skipped. The
             // per-expert form that used to sit here compared 42 us against 45 us and could never see
-            // that crossing; the layer form puts it at the p99 of the miss histogram. Still a shadow
-            // verdict: ensure() has no host-half leg, so nothing acts on it yet.
-            if (moved > 0) {
+            // that crossing; the layer form puts it at the p99 of the miss histogram.
+            //
+            // The actuator sits in ensure_split, BEFORE the copy, because the question only has two
+            // possible answers if it is asked before the bytes move. So this is now the shadow of a
+            // decision the stream may already have taken: when it acted, the misses are on the CPU
+            // mask and the ledger's own note came from there - counting this one too would be the
+            // same layer twice.
+            if (moved > 0 && !moe.stream->layer_leg_acted()) {
                 CpuLayerLegQuery leg;
                 leg.misses  = static_cast<int>(moved);
                 leg.copy_us = control.signals.upload_us_per_expert;

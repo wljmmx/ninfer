@@ -638,6 +638,12 @@ struct CpuLayerBudget {
     double budget_us   = -1.0;
     double cpu_gflops  = 0.0;
     const char* why    = "off";
+    // The link was measured idle this layer (`why` says so in words). Exposed as a flag because
+    // decision 2 has to agree with it: its copy side prices one marginal transfer, and when the link
+    // has spare capacity that transfer is already paid for. A second decision that moved routes off
+    // an idle link would save nothing and buy CPU time - which is exactly what it measured when it
+    // was first allowed to act (all ten routes to the half, 1.5 tok/s).
+    bool link_idle = false;
 };
 
 // The CPU rate this box has measured. Thread-local like the bus and the ledger: the half runs on
@@ -806,6 +812,7 @@ inline void note_cpu_half(int experts, int tokens, double span_ms, double comput
     if (query.wall_ms > 0.0 && query.upload_ms > 0.0 &&
         query.upload_ms < kLinkBusyShare * query.wall_ms) {
         out.why = "link idle";
+        out.link_idle = true;
         count   = 0;
     } else if (query.wall_ms > 0.0 && query.cpu_ms > kCpuBusyShare * query.wall_ms) {
         out.why = "cpu half busy";
@@ -872,6 +879,12 @@ struct CpuPathLedger {
     std::uint64_t leg_cpu_half  = 0;
     std::uint64_t leg_pool_copy = 0;
     std::uint64_t leg_nodata    = 0;
+    // ... and what the actuator DID about it. Separate from the three above on purpose: the verdict
+    // counters say what the model answered, these say how often the answer was acted on and over how
+    // many routes. A verdict that is answered but never acted on is the failure the shadow rule
+    // allows and this pair is what makes it visible.
+    std::uint64_t leg_acted_layers = 0;
+    std::uint64_t leg_acted_routes = 0;
     int    last_leg_misses     = 0;
     double last_leg_threshold  = -1.0;
     double last_leg_copy_us    = -1.0;
@@ -924,6 +937,13 @@ struct CpuPathLedger {
         case CpuExpertLeg::PoolCopy: ++leg_answered; ++leg_pool_copy; return;
         case CpuExpertLeg::NoData: ++leg_nodata; return;
         }
+    }
+    // The layer leg was not only answered but applied: these routes left the upload list and the
+    // placement word. `routes` is the count that moved, not the count that was asked about.
+    void note_layer_leg_acted(int routes) noexcept {
+        if (routes <= 0) { return; }
+        ++leg_acted_layers;
+        leg_acted_routes += static_cast<std::uint64_t>(routes);
     }
     // The cost model's own two sides for the decision in force, set where it was taken.
     void note_budget(double gpu_us, double cpu_us, double budget_us) noexcept {
@@ -988,12 +1008,15 @@ struct CpuPathLedger {
         // span is under the transfer and there is no crossing at any count.
         std::fprintf(stderr,
                      "[ctl] cpu leg: layer-level=%llu/%llu (half=%llu copy=%llu nodata=%llu) | "
+                     "acted=%llu layer(s)/%llu route(s) | "
                      "last m=%d m*=%.1f t=%d | copy=%.0f us half=%.0f us (readback %.0f us)\n",
                      static_cast<unsigned long long>(leg_cpu_half),
                      static_cast<unsigned long long>(leg_answered),
                      static_cast<unsigned long long>(leg_cpu_half),
                      static_cast<unsigned long long>(leg_pool_copy),
-                     static_cast<unsigned long long>(leg_nodata), last_leg_misses,
+                     static_cast<unsigned long long>(leg_nodata),
+                     static_cast<unsigned long long>(leg_acted_layers),
+                     static_cast<unsigned long long>(leg_acted_routes), last_leg_misses,
                      last_leg_threshold, cpu_half_rate().measured_tokens, last_leg_copy_us,
                      last_leg_cpu_us, kCpuReadbackUs);
         std::fflush(stderr);
