@@ -21,6 +21,8 @@ ninfer_add_op_bench(ninfer_scatter_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/scat
 ninfer_add_op_bench(ninfer_scatter_bf16_batch_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/scatter_bf16_batch_bench.cu")
 ninfer_add_op_bench(ninfer_packed_softmax_attention_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/packed_softmax_attention_bench.cu")
+ninfer_add_op_bench(ninfer_qsa_bench
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/qsa/qsa_bench.cu")
 ninfer_add_op_bench(ninfer_prepare_ragged_prefix_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/prepare_ragged_prefix_bench.cu")
 ninfer_add_op_bench(ninfer_embedding_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/embedding_bench.cu")

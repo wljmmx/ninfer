@@ -295,10 +295,13 @@ Every ordinary sample is cold-cache: a 256 MiB L2 eviction read completes before
 interval. Reported effective bandwidth uses the encoded weight planes once, one BF16 activation
 read, and one BF16 output write. Reported FLOPs are the mathematical `2*N*K*T`; neither metric
 copies route-private tile, replay, padding, split, schedule, host-launcher, or kernel-instance
-behavior. The fixed RTX 5090 memory reference is `1792 GB/s` DRAM bandwidth. Tensor Core utilization
-is reported only for registered shape/policy/extent combinations with a known MMA profile; the
-activation policy alone does not identify that profile. MXFP8 with FP32 accumulation uses the
-`838 TFLOP/s` dense reference. `READ_%` additionally compares the same one-read model
+behavior. The memory reference is derived from the device's own memory clock and bus width
+(`src/core/device_roofline.h`), not a fixed constant, so a 4090 is not divided by a 5090 number; when
+the device does not report those attributes the roofline is unknown and the `DRAM_%` / `mem_%`
+columns are not comparable (`tools/hbm_bandwidth_probe.cu` prints `peak n/a` in that case). Tensor
+Core utilization is reported only for registered shape/policy/extent combinations with a known MMA
+profile; the activation policy alone does not identify that profile. MXFP8 with FP32 accumulation uses
+the `838 TFLOP/s` dense reference. `READ_%` additionally compares the same one-read model
 bytes with the measured `1674.5 GB/s` pure-read ceiling from `tools/hbm_bandwidth_probe.cu`; it is
 the practical utilization measure for read-dominated points. Physical traffic and instruction
 utilization still require NCU.
@@ -607,7 +610,7 @@ exceed nominal bandwidth, and cold samples evict before the body without flushin
 
 ## Softmax Attention Op benchmarks
 
-The four Softmax Attention executables share one harness rule: fixture setup, public workspace
+The five Softmax Attention executables share one harness rule: fixture setup, public workspace
 capacity queries, L2 conditioning, graph capture, and synchronization stay outside the timed
 interval. An eager interval contains one public Op call; a captured graph contains that same one
 public call. `--profile` likewise brackets one complete public call and requires one exact semantic
@@ -727,6 +730,33 @@ cmake --build build --parallel --target ninfer_packed_softmax_attention_bench
 The bandwidth and FLOP fields are semantic useful-work models. They do not infer private scratch
 traffic, launch decomposition, or selected implementation from kernel names; physical traffic and
 instruction utilization require a profiler capture of the complete public call.
+
+`ninfer_qsa_bench` measures the QSA family: the block indexer/selector, the sparse grouped-query
+attention that consumes its selection, and the chain of the two calls one model layer runs.
+`--geometry` selects the registered `[256,24,2]` query/KV head pair (default) or `[256,12,1]`;
+`--tokens 1,8,64,2048` and `--kv 2048,8192,32768` sweep decode through long prefill,
+`--selected-blocks S` sets the model's indexer budget, and `--batch 1..8` covers batched rows. One
+row is one public `qsa_indexer` call (`--entry indexer`), one public `qsa_sparse_gqa` call
+(`--entry sparse`), or both back to back (`--entry chain`); the default `--entry all` prints every
+entry. The fixture keeps one paged BFloat16-K/FP16-V main cache plus the index cache, maps every
+logical page to a reversed physical page, and gives each query `min(S, floor((p+1)/4))` distinct
+four-token blocks plus its incomplete tail, so both the selected prefix and the tail suffix are
+exercised.
+
+The `full_ref` columns are an analytic dense causal cost over the same visible set, not a second
+measurement: the dense public causal contract registers only `[256,24,4]` and `[256,16,2]`, and QSA
+admits only `[256,24,2]` and `[256,12,1]`, so no dense profile shares the QSA geometry. `kv_share`
+divides the cache bytes a row actually touches by the dense KV bytes of its visible set; for the
+selector it mixes 128-wide index keys with 256-wide attention vectors.
+
+```bash
+cmake --build build --parallel --target ninfer_qsa_bench
+./build/bench/ninfer_qsa_bench --warmup 3 --repeat 20 \
+  --csv-out profiles/bench/qsa_bf16.csv
+./build/bench/ninfer_qsa_bench --entry sparse --geometry d256-h24-kv2 \
+  --tokens 1,8,64,2048 --kv 2048,8192,32768 --cache cold
+./build/bench/ninfer_qsa_bench --entry indexer --tokens 1 --kv 32768 --profile
+```
 
 ## KV cache append Op benchmark
 
