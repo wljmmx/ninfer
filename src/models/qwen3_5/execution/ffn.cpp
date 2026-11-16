@@ -947,7 +947,16 @@ void predict_next_layer(const Tensor& residual, const RoutedMoeParameters& next,
         if (trace) { std::fprintf(stderr, "[pred] no stream for the next layer\n"); }
         return;
     }
-    if (residual.ne[1] != 1) { return; }
+    // A prediction is for one layer, so "this layer produced none" has to be said. A prefill chunk is
+    // wider than one token and never predicts, and the next layer's stage_predicted would otherwise
+    // place a set that no one produced for it. Clearing costs nothing when there is nothing to clear,
+    // and it keeps a spent guess from being applied twice.
+    if (residual.ne[1] != 1) {
+        if (next.stream->predicted_is_device() || !next.stream->predicted_empty()) {
+            next.stream->set_predicted({});
+        }
+        return;
+    }
     const auto& routed = next.profile.routed;
     const ops::RouteProfile route_profile{routed.ffn.hidden, routed.experts, routed.top_k};
     auto guess_ids     = workspace.alloc(DType::I32, {routed.top_k, 1});
@@ -959,6 +968,36 @@ void predict_next_layer(const Tensor& residual, const RoutedMoeParameters& next,
     ops::topk_softmax_route(residual, route_profile, next.fused_control(), guessed,
                             guess_shared,
                             guess_arena, execution);
+    // S3-1: the ids stay where they were produced. Reading them back needs a `cudaStreamSynchronize`
+    // per layer, which waits for the whole layer to drain and stops the host running ahead - the
+    // single reason this chain measured ~1.5 tok/s when it was last exercised (streamed_ffn). The
+    // guess is handed over as a Device pointer instead; the stream copies it into a buffer it owns,
+    // so the workspace arena the router wrote into may be recycled by the next layer freely, and no
+    // copy crosses PCIe.
+    static const bool sync_form = [] {
+        // The A/B arm, and - today - the only form whose ids the host can read without a stall. Kept
+        // as a switch rather than deleted because it is the reference the Device form is measured
+        // against, and because the VRAM region's fill is still host-side (see S3-2 in
+        // stage_predicted).
+        const char* value = std::getenv("NINFER_PREDICT_SYNC");
+        return value != nullptr && *value != '\0' && std::strtol(value, nullptr, 10) != 0;
+    }();
+    if (!sync_form) {
+        if (!next.stream->set_predicted_device(
+                static_cast<const std::int32_t*>(guess_ids.data), routed.top_k, execution.stream)) {
+            if (trace) {
+                std::fprintf(stderr, "[pred] Device hand-off refused (top_k=%d); no prediction\n",
+                             routed.top_k);
+            }
+            return;
+        }
+        if (trace) {
+            std::fprintf(stderr, "[pred] bank -> next stream, top_k=%d Device ids, no read-back\n",
+                         routed.top_k);
+            std::fflush(stderr);
+        }
+        return;
+    }
     std::vector<std::int32_t> guess(routed.top_k);
     const std::size_t bytes = static_cast<std::size_t>(routed.top_k) * sizeof(std::int32_t);
     (void)cudaMemcpyAsync(guess.data(), guess_ids.data, bytes, cudaMemcpyDeviceToHost,
@@ -966,7 +1005,8 @@ void predict_next_layer(const Tensor& residual, const RoutedMoeParameters& next,
     (void)cudaStreamSynchronize(execution.stream);
     next.stream->set_predicted(guess);
     if (trace) {
-        std::fprintf(stderr, "[pred] bank=0 -> next stream, top_k=%d\n", routed.top_k);
+        std::fprintf(stderr, "[pred] bank -> next stream, top_k=%d host ids (NINFER_PREDICT_SYNC)\n",
+                     routed.top_k);
         std::fflush(stderr);
     }
 }
@@ -1316,7 +1356,8 @@ void split_host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParamete
 // and it is stated here rather than hidden. It is also the same in all three shapes, which is why a
 // route computed on the CPU and one computed on the Device still land in the same layer arithmetic.
 void split_moe_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& residual,
-                   WorkspaceArena& workspace, DeviceExecutionView execution) {
+                   WorkspaceArena& workspace, DeviceExecutionView execution,
+                   const RoutedMoeParameters* predict_next) {
     const auto stream       = execution.stream;
     const auto columns      = hidden.ne[1];
     const auto& routed      = moe.profile.routed;
@@ -1528,6 +1569,12 @@ void split_moe_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor&
     ops::silu_mul(gate, up, act, stream);
     ops::linear(act, shared_down.weight, term, stream);
     ops::scaled_add(term, shared_coeff, residual, stream);
+    // The residual is final here - the routed term, the CPU half and the shared pair have all been
+    // folded in - so this is the only place on the gate/up/down path where the next layer's router
+    // can be scored against it. Until S3 this hook existed only on the streamed (fused) path, so the
+    // 125B split form produced no prediction at all: `[pf-region] hits=0 calls=0` and every
+    // `[pfv] skip ... predicted_ is empty` came from that, not from a wrong region size.
+    if (predict_next != nullptr) { predict_next_layer(residual, *predict_next, workspace, execution); }
 }
 
 void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& residual,
@@ -2637,7 +2684,7 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
         // resident, but its layer is not the fused one streamed_ffn() runs: three pool runs, a
         // separate routing call and the shared expert as its own projection pair.
         if (moe->split) {
-            split_moe_ffn(hidden, *moe, residual, workspace, execution);
+            split_moe_ffn(hidden, *moe, residual, workspace, execution, predict_next);
             return;
         }
         if (moe->stream) {

@@ -978,8 +978,9 @@ void ExpertStream::sync_slot_mirror(cudaStream_t stream) {
 // Explicit switch only. The shipped placement does not consume these slots yet, so the switch is the
 // only thing that makes the lookup run - and that is what keeps the default path bit-identical to S1.
 void ExpertStream::lookup_routed_slots(const void* device_ids, std::int32_t id_values,
-                                       cudaStream_t stream) {
-    static const bool enabled = std::getenv("NINFER_SLOT_LOOKUP") != nullptr;
+                                       cudaStream_t stream, bool armed) {
+    static const bool switched = std::getenv("NINFER_SLOT_LOOKUP") != nullptr;
+    const bool enabled         = switched || armed;
     if (!enabled || device_ids == nullptr || id_values <= 0 || slot_mirror_dev_ == nullptr) { return; }
     const auto values = static_cast<std::size_t>(id_values);
     // Output scratch: one slot per id. Grown, never shrunk, and freed with the stream.
@@ -1035,6 +1036,7 @@ void ExpertStream::lookup_routed_slots(const void* device_ids, std::int32_t id_v
     // slot in one and none in another - resolving only the gate run would hide exactly that. The
     // segment comes from the accessor, so a bank this stream does not keep current resolves to null and
     // is reported rather than read as stale bytes.
+    std::size_t resolved_runs = 0;
     const auto resolve = [&](std::uint32_t bank) {
         std::uint32_t       experts = 0;
         const std::uint32_t* table  = slot_mirror_segment(bank, &experts);
@@ -1053,8 +1055,26 @@ void ExpertStream::lookup_routed_slots(const void* device_ids, std::int32_t id_v
     };
     if (split_.empty()) {
         resolve(bank_);
+        resolved_runs = 1;
     } else {
         for (const auto& run : split_) { resolve(run.bank); }
+        resolved_runs = split_.size();
+    }
+    // S3-3: a prediction set has to reach every matrix run the layer has, so the number of runs that
+    // were actually fed is checked against what the layout reports instead of being assumed. A fused
+    // layer has one run, the gate/up/down form three; a disagreement means a run is cold that the
+    // layer will read, and it is said out loud rather than left to a hit rate.
+    if (armed) {
+        ++predicted_runs_resolved_;
+        const auto expected = static_cast<std::size_t>(runs());
+        if (resolved_runs != expected) {
+            ++predicted_run_mismatches_;
+            std::fprintf(stderr,
+                         "[pf-pred] run mismatch on bank %u: fed %zu run(s), layout reports %u "
+                         "(split=%d, ids=%zu)\n",
+                         bank_, resolved_runs, runs(), int(split_banks_), values);
+            std::fflush(stderr);
+        }
     }
     if (const auto status = cudaGetLastError(); status != cudaSuccess) {
         ++mirror_dev_fails_;
@@ -1094,20 +1114,23 @@ void ExpertStream::gh1_report(cudaStream_t stream) {
         }
     }
     // The prediction region's own hit rate. `[pf]`'s `hit=` is the WARM TIER's, a different question:
-    // this one is "of the experts this layer routed to, how many did the region already hold", which
-    // is the only number that says whether the slots it took are earning their keep. The consumer is
-    // real and per layer (fill path -> cache_->prefetch_slot() -> prefetch_hits_), so the region is
-    // never "staged into a void"; what is unknown without this line is whether its size is right.
+    // this one is "of the routes this layer had, how many the region already held", which is the only
+    // number that says whether the slots it took are earning their keep.
+    //
+    // S3-4 fixes the denominator: it used to be `prefetch_calls_`, the warm tier's ask count, which is
+    // zero unless NINFER_PREFETCH attaches a queue - so the percentage printed 0/0 as 0.0% and read as
+    // "the region never hits" on runs where it was never even asked. It now counts the routes the hit
+    // loop examined (`prefetch_route_samples_`), which is the same population as the numerator.
     if (cache_ != nullptr && cache_->prefetch_slots_per_bank() != 0) {
         std::fprintf(stderr,
-                     "[pf-region] %u slot(s)/bank | hits=%llu calls=%llu (%.1f%%) | a low rate here "
-                     "means the size is wrong, not that the region is unused\n",
+                     "[pf-region] %u slot(s)/bank | hits=%llu calls=%llu (%.1f%%) | routes examined, "
+                     "all runs must hold the expert in a region slot\n",
                      cache_->prefetch_slots_per_bank(),
                      static_cast<unsigned long long>(prefetch_hits_),
-                     static_cast<unsigned long long>(prefetch_calls_),
-                     prefetch_calls_ != 0
+                     static_cast<unsigned long long>(prefetch_route_samples_),
+                     prefetch_route_samples_ != 0
                          ? 100.0 * static_cast<double>(prefetch_hits_) /
-                               static_cast<double>(prefetch_calls_)
+                               static_cast<double>(prefetch_route_samples_)
                          : 0.0);
         std::fflush(stderr);
     }
@@ -1238,8 +1261,50 @@ void static_probe(std::uint32_t bank, std::int32_t tokens, bool covered, std::ui
 }
 } // namespace
 
-void ExpertStream::stage_predicted(cudaStream_t stream) {
-    static const bool vram = [] {
+bool ExpertStream::set_predicted_device(const std::int32_t* ids, std::int32_t count,
+                                        cudaStream_t stream) {
+    // A prediction that cannot be stored must not linger: the previous layer's ids would be placed as
+    // if they were this one's, which is a silently wrong placement rather than a missing one.
+    predicted_device_active_ = false;
+    predicted_device_count_  = 0;
+    predicted_.clear();
+    if (ids == nullptr || count <= 0) {
+        ++predicted_device_failures_;
+        std::fprintf(stderr, "[pf-pred] hand-off refused: %s (count=%d)\n",
+                     ids == nullptr ? "no Device ids" : "empty id list", count);
+        std::fflush(stderr);
+        return false;
+    }
+    const std::size_t bytes = static_cast<std::size_t>(count) * sizeof(std::int32_t);
+    if (!predicted_ids_device_ || predicted_ids_device_->bytes < bytes) {
+        try {
+            predicted_ids_device_ = std::make_unique<DeviceBuffer>(bytes);
+        } catch (const std::exception& error) {
+            ++predicted_device_failures_;
+            std::fprintf(stderr, "[pf-pred] Device buffer (%zu bytes) failed: %s\n", bytes,
+                         error.what());
+            std::fflush(stderr);
+            return false;
+        }
+    }
+    // Device-to-Device on the caller's stream, so the ids are ready for the layer that consumes them
+    // and the workspace arena the router wrote into can be recycled in the meantime. No host wait.
+    const auto status = cudaMemcpyAsync(predicted_ids_device_->p, ids, bytes,
+                                       cudaMemcpyDeviceToDevice, stream);
+    if (status != cudaSuccess) {
+        ++predicted_device_failures_;
+        std::fprintf(stderr, "[pf-pred] Device hand-off copy (%zu bytes) failed: %s\n", bytes,
+                     cudaGetErrorString(status));
+        std::fflush(stderr);
+        return false;
+    }
+    predicted_device_count_  = count;
+    predicted_device_active_ = true;
+    ++predicted_device_handoffs_;
+    return true;
+}
+
+void ExpertStream::stage_predicted(cudaStream_t stream) {    static const bool vram = [] {
         const char* value = std::getenv("NINFER_PREFETCH_MODE");
         return value != nullptr && std::strcmp(value, "vram") == 0;
     }();
@@ -1250,13 +1315,51 @@ void ExpertStream::stage_predicted(cudaStream_t stream) {
         bank_ < 4 && std::getenv("NINFER_EXPERT_TIMING") != nullptr && ++calls <= 6;
     const auto say = [&](const char* why) {
         if (!trace) { return; }
-        std::fprintf(stderr, "[pfv] skip bank=0: %s (vram=%d cache=%d predicted=%zu region=%u)\n", why,
-                     vram ? 1 : 0, cache_ != nullptr ? 1 : 0, predicted_.size(),
+        std::fprintf(stderr,
+                     "[pfv] skip bank=0: %s (vram=%d cache=%d predicted=%zu device=%d region=%u)\n",
+                     why, vram ? 1 : 0, cache_ != nullptr ? 1 : 0, predicted_.size(),
+                     int(predicted_is_device()),
                      cache_ != nullptr ? cache_->prefetch_slots_per_bank() : 0U);
         std::fflush(stderr);
     };
     if (!vram) { say("mode is not vram"); return; }
     if (cache_ == nullptr) { say("no cache"); return; }
+
+    // S3: the two forms of the same hand-off.
+    //
+    // Device form (S3-1): the ids never crossed PCIe. S3-2's resolution half runs where they are -
+    // moe_route_slots() against the pool's own slot mirror, once per matrix run, so an expert's slot in
+    // the gate run and its absence from the down run are both visible. The placement half - the words
+    // set_prefetch_experts() writes (owner, region cursor, generation, entry readiness) and the bytes
+    // that then have to leave the artifact - cannot be applied from the Device, and the reason is not
+    // a missing kernel: the pool's tables are host-authoritative (every publication reads
+    // cache_->expert_slot()), and the only Device-addressable source of an expert's bytes is the
+    // pinned tier, so a kernel-side fill would have to read PCIe at SM rates. The house precedent for
+    // "the Device decides, the host applies" is device_admit_ring(), which drains its descriptors
+    // with cudaStreamSynchronize and issues cudaMemcpyAsync itself. So this form resolves and counts,
+    // and says that the fill did not happen instead of pretending it did.
+    if (predicted_is_device()) {
+        const auto count = predicted_device_count();
+        ++predicted_layers_;
+        if (cache_->prefetch_slots_per_bank() != 0) {
+            lookup_routed_slots(predicted_device_ids(), count, stream, /*armed=*/true);
+        }
+        static std::uint64_t reports = 0;
+        if (bank_ < 4 && (++reports % 40) == 0) {
+            std::fprintf(stderr,
+                         "[pf-pred] Device form: layers=%llu handoffs=%llu handoff_fail=%llu | "
+                         "runs_resolved=%llu run_mismatch=%llu | ids/layer=%d fill=host-only "
+                         "(0 placed by the Device)\n",
+                         (unsigned long long)predicted_layers_,
+                         (unsigned long long)predicted_device_handoffs_,
+                         (unsigned long long)predicted_device_failures_,
+                         (unsigned long long)predicted_runs_resolved_,
+                         (unsigned long long)predicted_run_mismatches_, int(count));
+            std::fflush(stderr);
+        }
+        return;
+    }
+
     if (predicted_.empty()) { say("predicted_ is empty"); return; }
     if (cache_->prefetch_slots_per_bank() == 0) { say("no region"); return; }
     // port (sm_89): the prediction region exists per bank, so the three-run form stages the same
@@ -1269,31 +1372,75 @@ void ExpertStream::stage_predicted(cudaStream_t stream) {
         bank_count = split_.size();
         for (std::size_t index = 0; index < split_.size(); ++index) { banks[index] = split_[index].bank; }
     }
+    // S3-3: every run the layer has is fed, and the count is checked against the layout instead of
+    // assumed - a fused layer has one run, gate/up/down has three, and a disagreement leaves a run
+    // cold that this layer will read.
+    const std::size_t expected_runs = static_cast<std::size_t>(runs());
+    if (bank_count != expected_runs) {
+        ++predicted_run_mismatches_;
+        std::fprintf(stderr,
+                     "[pf-pred] run mismatch on bank %u: feeding %zu run(s), layout reports %zu "
+                     "(split=%d, top_k=%d)\n",
+                     bank_, bank_count, expected_runs, int(split_banks_),
+                     static_cast<int>(predicted_.size()));
+        std::fflush(stderr);
+    }
     for (std::size_t index = 0; index < bank_count; ++index) {
         const auto bank = banks[index];
         std::vector<std::uint32_t> absent;
         absent.reserve(predicted_.size());
         for (const auto expert : predicted_) {
-            if (expert < 0 || static_cast<std::uint32_t>(expert) >= count_) { continue; }
+            if (expert < 0 || static_cast<std::uint32_t>(expert) >= count_) {
+                // Out of this bank's range: a prediction that cannot be placed is counted, not dropped
+                // silently - it means the router and the pool disagree about the bank's width.
+                ++prefetch_out_of_range_;
+                continue;
+            }
             const auto id = static_cast<std::uint32_t>(expert);
             if (cache_->expert_slot(bank, id)) { continue; } // already resident: not a prediction
             absent.push_back(id);
         }
         prefetch_delta_ += absent.size();
         std::vector<ExpertCacheKey> placed;
-        if (!absent.empty() && cache_->set_prefetch_experts(bank, absent, placed) != 0) {
+        const auto filled = absent.empty()
+                                ? 0U
+                                : cache_->set_prefetch_experts(bank, absent, placed);
+        if (filled != 0) {
             cache_->prepare(std::span<const ExpertCacheKey>(placed), stream);
             (void)cache_->progress(stream);
             prefetch_placed_ += placed.size();
+            ++predicted_runs_filled_;
+        } else if (!absent.empty()) {
+            // A non-empty delta that placed nothing is a refusal (no region on this bank, or the bank
+            // is outside the pool), and it has to be visible rather than read as "nothing to do".
+            ++predicted_fill_failures_;
+            std::fprintf(stderr,
+                         "[pf-pred] fill refused bank=%u: %zu absent expert(s), name no slot "
+                         "(region=%u)\n",
+                         bank, absent.size(), cache_->prefetch_slots_per_bank());
+            std::fflush(stderr);
         }
     }
     static std::uint64_t reports = 0;
     if (bank_ < 4 && (++reports % 40) == 0) {
-        std::fprintf(stderr, "[pfv] bank=%u delta=%llu placed=%llu hits=%llu region=%u/bank\n", bank_,
-                     (unsigned long long)prefetch_delta_,
+        std::fprintf(stderr,
+                     "[pfv] bank=%u delta=%llu placed=%llu hits=%llu region=%u/bank | runs=%zu "
+                     "filled=%llu fill_fail=%llu out_of_range=%llu mismatch=%llu | guess "
+                     "ids=%llu hit=%llu over=%llu layer(s) (%.1f%%)\n",
+                     bank_, (unsigned long long)prefetch_delta_,
                      (unsigned long long)prefetch_placed_,
-                     (unsigned long long)prefetch_hits_,
-                     cache_->prefetch_slots_per_bank());
+                     (unsigned long long)prefetch_hits_, cache_->prefetch_slots_per_bank(),
+                     expected_runs, (unsigned long long)predicted_runs_filled_,
+                     (unsigned long long)predicted_fill_failures_,
+                     (unsigned long long)prefetch_out_of_range_,
+                     (unsigned long long)predicted_run_mismatches_,
+                     (unsigned long long)prediction_ids_seen_,
+                     (unsigned long long)prediction_overlap_,
+                     (unsigned long long)prediction_layers_checked_,
+                     prediction_ids_seen_ != 0
+                         ? 100.0 * static_cast<double>(prediction_overlap_) /
+                               static_cast<double>(prediction_ids_seen_)
+                         : 0.0);
         std::fflush(stderr);
     }
 }
@@ -2173,6 +2320,39 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
             throw std::out_of_range("expert stream received a route outside its bank");
         }
     }
+    // S3-4: the prediction region's numerator, counted where the routes are - and only when EVERY run
+    // holds the expert in its region, because a route one run cannot address is the CPU half's
+    // whatever the other two hold. Until S3 this loop existed only on the fused path, so
+    // `[pf-region] hits=0` on the gate/up/down form was a property of the counter, not of the region.
+    if (cache_ != nullptr && cache_->prefetch_slots_per_bank() != 0) {
+        for (std::size_t i = 0; i < values; ++i) {
+            ++prefetch_route_samples_;
+            const auto expert = static_cast<std::uint32_t>(route_ids[i]);
+            bool all_runs    = true;
+            for (const auto& run : split_) {
+                const auto slot = cache_->expert_slot(run.bank, expert);
+                if (!slot || !cache_->prefetch_slot(*slot)) { all_runs = false; break; }
+            }
+            if (all_runs) { ++prefetch_hits_; }
+        }
+    }
+    // S3-4: how good the guess was, independent of whether it was placed. The region's hit rate
+    // confounds two questions - "was the router predicted" and "did the fill survive to the layer that
+    // reads it" - and a hit rate near zero cannot say which failed. This counts the first directly:
+    // predicted id set against the routes this layer actually produced. Host form only (the Device
+    // form's ids never land here by construction).
+    if (!predicted_.empty()) {
+        ++prediction_layers_checked_;
+        prediction_ids_seen_ += predicted_.size();
+        for (const auto expert : predicted_) {
+            for (std::size_t i = 0; i < values; ++i) {
+                if (route_ids[i] == expert) {
+                    ++prediction_overlap_;
+                    break;
+                }
+            }
+        }
+    }
     // port (sm_89): the three-run form has no route trace of its own, so a divergence between two
     // artifacts that carry identical weights cannot be attributed to routing at all. Same shape as
     // the fused trace: one line per (bank, token) with the experts that token routed to.
@@ -2980,9 +3160,12 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
         }
     }
     // Q30/P6: how much of this layer the prediction region actually served. A placement is work; this
-    // is the only number that says whether the region is worth its slots.
+    // is the only number that says whether the region is worth its slots. The denominator is the same
+    // population as the numerator (S3-4: it used to be the warm tier's ask count, so the printed rate
+    // was 0/0 on every run without NINFER_PREFETCH).
     if (cache_ != nullptr && cache_->prefetch_slots_per_bank() != 0) {
         for (std::size_t i = 0; i < values; ++i) {
+            ++prefetch_route_samples_;
             const auto slot = cache_->expert_slot(bank_, static_cast<std::uint32_t>(route_ids[i]));
             if (slot && cache_->prefetch_slot(*slot)) { ++prefetch_hits_; }
         }

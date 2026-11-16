@@ -463,7 +463,37 @@ public:
     // port (sm_89): Q68b. The experts this layer's router would pick if it saw the previous layer's
     // residual stream. The prediction is made where the router lives (ffn), and this is where it is
     // consumed: the read-ahead asks for "predicted and not resident" instead of "historically hot".
-    void set_predicted(std::vector<std::int32_t> ids) { predicted_ = std::move(ids); }
+    void set_predicted(std::vector<std::int32_t> ids) {
+        predicted_               = std::move(ids);
+        predicted_device_active_ = false;
+        predicted_device_count_  = 0;
+    }
+
+    // S3-1: the same hand-off without the host ever seeing the ids. The router already wrote them on
+    // the Device, and reading them back costs a `cudaStreamSynchronize` per layer - which waits for
+    // the whole layer to drain, so the host cannot run ahead into the next one. The copy below is
+    // Device-to-Device on the caller's stream into a buffer this stream owns, which is what makes the
+    // hand-off valid: the workspace arena the router wrote into is recycled by the next layer, and the
+    // ids have to outlive that.
+    //
+    // Returns false (and counts it) when the buffer cannot be had or the copy is refused; the caller
+    // then has no prediction rather than a stale one.
+    bool set_predicted_device(const std::int32_t* ids, std::int32_t count, cudaStream_t stream);
+    [[nodiscard]] bool predicted_is_device() const noexcept { return predicted_device_active_; }
+    [[nodiscard]] bool predicted_empty() const noexcept { return predicted_.empty(); }
+    [[nodiscard]] std::int32_t predicted_device_count() const noexcept {
+        return predicted_device_count_;
+    }
+    [[nodiscard]] std::uint64_t predicted_device_handoffs() const noexcept {
+        return predicted_device_handoffs_;
+    }
+    [[nodiscard]] std::uint64_t predicted_device_failures() const noexcept {
+        return predicted_device_failures_;
+    }
+    [[nodiscard]] const std::int32_t* predicted_device_ids() const noexcept {
+        return predicted_ids_device_ ? static_cast<const std::int32_t*>(predicted_ids_device_->p)
+                                     : nullptr;
+    }
 
     // Q30/P6: put the prediction into the Device region NOW, at the end of the layer that made it.
     // Placing it at the next layer's ensure() is structurally useless - by then that layer's routes
@@ -600,6 +630,22 @@ private:
     // again after an eviction, and they are the ones a read-ahead should fetch.
     std::vector<std::int32_t> prev_routes_;
     std::vector<std::int32_t> predicted_;
+    // S3-1: the prediction as produced, before any host sees it. Owned here rather than borrowed from
+    // the layer's workspace arena, whose lifetime is the layer that computed it.
+    std::unique_ptr<DeviceBuffer> predicted_ids_device_;
+    std::int32_t predicted_device_count_      = 0;
+    bool predicted_device_active_             = false;
+    std::uint64_t predicted_device_handoffs_  = 0;
+    std::uint64_t predicted_device_failures_  = 0;
+    // What the Device form actually managed to do with a prediction, per layer that had one. These
+    // are the numbers S3-4 reports: resolving the ids against the pool's mirror is on the Device, and
+    // the fill is counted separately because on this form it does not happen (see stage_predicted).
+    std::uint64_t predicted_layers_           = 0;
+    std::uint64_t predicted_runs_resolved_    = 0;
+    std::uint64_t predicted_runs_filled_      = 0;
+    std::uint64_t predicted_fill_failures_    = 0;
+    std::uint64_t predicted_run_mismatches_   = 0;
+    std::uint64_t prefetch_out_of_range_      = 0;
     std::weak_ptr<HostExpertResidency> host_weak_;
     std::uint32_t bank_ = 0;
     // A1: the three segments' versions as this bank's Device tables hold them. The check at the end
@@ -629,6 +675,15 @@ private:
     // Routes served from the prediction region. Placements count work; this counts value, and it is
     // the number that decides whether the region is sized right (or should be zero).
     std::uint64_t prefetch_hits_ = 0;
+    // S3-4: the denominator of the region's hit rate - the routes the hit loop actually examined. It
+    // is not `prefetch_calls_` (that is the warm tier's ask count, zero unless NINFER_PREFETCH is on),
+    // which is why the printed rate used to be 0/0.
+    std::uint64_t prefetch_route_samples_ = 0;
+    // S3-4: how often the guess itself was right (predicted ids that this layer then routed to), so a
+    // near-zero region hit rate can be attributed to the prediction or to the fill.
+    std::uint64_t prediction_layers_checked_ = 0;
+    std::uint64_t prediction_ids_seen_       = 0;
+    std::uint64_t prediction_overlap_        = 0;
     // Q30/P6: how many experts one read-ahead was asked for (the delta), summed over the layers that
     // asked. Together with `prefetch_calls_` this gives the per-layer ask, which is the number the
     // job granularity and the budget have to be sized from.
@@ -761,8 +816,11 @@ private:
     // Stage the slot-table mirror for every bank whose placement generation moved (S1).
     void sync_slot_mirror(cudaStream_t stream = nullptr);
     // S2-5: resolve this layer's routed ids to pool slots against that mirror, on the Device, and count
-    // what the table could not answer. Explicit switch only (NINFER_SLOT_LOOKUP) - see the .cpp.
-    void lookup_routed_slots(const void* device_ids, std::int32_t id_values, cudaStream_t stream);
+    // what the table could not answer. Explicit switch only (NINFER_SLOT_LOOKUP) on the demand path;
+    // `armed` lets S3's Device-form prediction use the same resolver without inventing a second one,
+    // because the demand path's default has to stay bit-identical.
+    void lookup_routed_slots(const void* device_ids, std::int32_t id_values, cudaStream_t stream,
+                             bool armed = false);
     // Frees the Device mirror (a new bank geometry makes the old image unreadable).
     void release_slot_mirror_device() noexcept;
     // S2: whether `bank` is one of this stream's own runs, i.e. whether its segment is kept current on
