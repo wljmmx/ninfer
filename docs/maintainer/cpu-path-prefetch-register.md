@@ -76,7 +76,7 @@
 |---|---|---|---|---|
 | P2.1 | 按 P1.2 强制 0，删掉"env 能武装一个没消费者的区" | 默认 0 槽，无 `[pf-region]` carve 行 | ✅ | 同 P1.2：`device_prefetch_consumer_present()` 恒 false，`TierPlan::set` 强制 0；`NINFER_PREFETCH_SLOTS=16` 单独设置 → exit=1 `cannot arm the Device prefetch region: it has no consumer`，不再静默武装 |
 | P2.2 | device 端放置件（原 S4/S5）：放置状态机上 device，填充不回 host | `hits/calls` 从 0 抬起；`[pf-mirror] region uploads` 随 `prefetch_generation` 收敛 | ⬜ | `[pf-region] hits=0/640`；`region uploads=144`（仅镜像） |
-| P2.3 | 形态与策略解耦：`NINFER_PREFETCH_MODE=vram` 与武装分离会漏（有槽无填充看起来像"没有调用者"） | 不设 MODE 时 `[pf-ctl]` 仍说清 armed | 🟡 | `[pfv] enter #1 bank=3 vram=0` → `skip: mode is not vram` |
+| P2.3 | 形态与策略解耦：`NINFER_PREFETCH_MODE=vram` 与武装分离会漏（有槽无填充看起来像"没有调用者"） | 不设 MODE 时 `[pf-ctl]` 仍说清 armed | ✅ | `PrefetchForm{Vram,Fill,Warm}`；形态默认 vram（唯一会 stage 的形态），存在性仍由控制器/显式 override 决定。武装 16 槽但不设 MODE：`[pf-region] 16 slot(s)/bank \| form=vram(default) staged=1 \| hits=0 calls=640`（此前是静默跳过、只剩 hits=0）；显式 fill/warm 时打 `[pf-ctl] region armed=N slot(s)/bank but form=none ...`。`NINFER_PREFETCH_SLOTS` 单独设置仍 exit=1 `cannot arm ... no consumer`。遗留矛盾已记：`NINFER_PREFETCH=1` 下 cache 会 carve 而 `[plan]` 仍 `prefetch_mb=0*` |
 | P2.4 | 复活判据重测：`prev` ≥66%（现 49.4%）、每节点 ≤0.0117 s（现 0.0162 s） | 达标则开，否则写"永久关闭" | ⬜ | 16 槽武装：命中 0.2%、速度 −40% |
 
 ### P3 CPU 半定价（决策 2/3）
@@ -161,3 +161,4 @@
 | 2026-11-16 | P4.2 通道关账（决策仍未接）：新增 `int8/plan_probe.h`（thread-local 一槽，唯一写入点 `rk_kv_cpu_split_gate`，参数即 launch 的 partition 与 `Schedule::kKeyRows`），`text.cpp::attn_mix` 在 `NINFER_SPLIT_TIMING` 下只读打印一次 `[kv-plan]`。实测两行对齐（`capacity=2`=`active=2`、`key_rows=32`=`key_tile=32`、`family=rk4v4`=`dtype=rk4v4`）；默认门禁逐位 `6.024313` / `20.673595`。`decide_cpu_kv_split` 仍零调用：缺的是宿主驻留页与"从这个通道之外的 window/字节"两件事，见 P4.2 行 |
 | 2026-11-16 | P4.4 关账：`paged-kv-cache.md` §14.7 把"恒为 DeviceCopy"的算术落文。33,792 B（`keys=32 / kv_heads=4 / packed_k`，`cost.h:76-77`）在数十 GB/s 上约 1.35 µs，CPU 侧 275.15 µs（与 `cost.h` 分项和 0.02% 一致）；翻转门槛 0.123 GB/s（或含上传时 0.033 GB/s），比值与 keys 无关。全部按已注册常量算，不是实测 |
 | 2026-11-16 | P5.3 关账：删除 `RkHostKvPlanes::packed_k` 与候选表的同名列（生产侧只走 `rk_host_kv_dtype_of`/`rk_host_kv_codecs`），单测 `family_identification()` 改为 `(K codec, V codec, 派生 dtype)` 三元组。`infer_kv_host_partial_mirror_test.exe` → `OK host page mirror`、exit=0、五族 27/27 行相等；默认门禁逐位 |
+
