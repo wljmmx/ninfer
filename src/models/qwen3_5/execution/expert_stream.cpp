@@ -828,7 +828,9 @@ void ExpertStream::gh1_report() {
     std::fprintf(stderr,
                  "[gh1] bank=%u calls=%llu static=%.1f%% no_miss=%.1f%% capturable=%.1f%% "
                  "capt_free=%.1f%% capt_ready=%.1f%% fail_unaddr=%llu fail_publish=%llu "
-                 "fail_upload=%llu cov=%.1f%% (%llu/%llu routes already resident)\n",
+                 "fail_upload=%llu published_slot=%.1f%% (%llu/%llu published routes had "
+                 "slot+offset - NOT the residency rate: the denominator is the published subset, so "
+                 "it reads 100%% by construction while the pool holds kept/73728 experts)\n",
                   bank_, static_cast<unsigned long long>(gh1_calls_),
                   pct(gh1_static_calls_, gh1_calls_), pct(gh1_no_miss_calls_, gh1_calls_),
                   pct(gh1_calls_ - gh1_split_calls_, gh1_calls_),
