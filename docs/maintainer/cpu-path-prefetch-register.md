@@ -75,7 +75,7 @@
 |---|---|---|---|---|
 | P3.1 | 统一 scope：copy 侧也记 tier 读，或从 span 减掉读 | 冷 tier 下 `est copy` 与 `span` 同量级，`m*` 回到 ~4.8 | ⬜ | span 8186 us/路由 vs copy 12.6 us/路由（4 路由层） |
 | P3.2 | 只有 P3.1 之后才允许实测速率接回决策 | `leg=half` 比例不随冷热翻转 | 🟡 | 已接、默认 `NINFER_CPU_LEG_ACT=off`；`leg=half` 1389→5 |
-| P3.3 | 面板可达：`[ctl] cpu share` / `[ctl] cpu leg` 在 e2 路径一次都没打出来 | `NINFER_SPLIT_TIMING=1` 下 e2 路径可见 | ⬜ | 816 行 `[cpu-path]` vs 0 行 `[ctl] fetch=/cpu share` |
+| P3.3 | 面板可达：`[ctl] cpu share` / `[ctl] cpu leg` 在 e2 路径一次都没打出来 | `NINFER_SPLIT_TIMING=1` 下 e2 路径可见 | ✅ | 面板在 split 入口可达：`[ctl] cpu share: routes cpu=532/13818 (3.9%) last=0 experts \| rate span=440.1us@1 compute=236.2us@1 ...`、`[ctl] cpu leg: layer-level=0/0 (half=0 copy=0 nodata=0) \| acted=0 layer(s)/0 route(s) \| last m=0 m*=-1.0`；同一次 e2 运行 `NINFER_CPU_PATH_POLICY=on NINFER_SPLIT_TIMING=1` 下 `[ctl] fetch=` 20 行 / `[ctl] cpu share` 20 行 / `[ctl] cpu leg` 20 行 对 816 行 `[cpu-path]`（此前 0 行）；`PolicyController::layers` 现在每条 FFN 路径每层恰好自增一次（融合走 `step()`、split 走 `note_layer()`），默认门禁 `6.024313` / `20.673595` 且 0 行面板（只剩载入期的 `[ctl] prefetch:` / `[ctl] host split:` 两行） |
 
 ### P4 决策 1（KV split）
 
@@ -125,3 +125,4 @@
 | 2026-11-16 | P0.1 关账（`cbc2ad49`）：分配在前、定尺寸在后，默认 3×2 门禁逐位。P0.2 记 N/A（单块在 22 GiB 上 6/6 成功）。P0.3 关账：失败在分配点抛出，pageable/registered 兜底删除 |
 | 2026-11-16 | P1 四项关账：P1.1 列名/列序（`aea2b93c`）、P1.2 无消费者强制 0 + env fail-loud（`b9f557e9`）、P1.3 `kv_spill` 三元组（`54568858`）、P1.4 `cold_range` 进表。`[plan]` 三行逐列对齐规格，跨架构不变（只读 `Instance` 几何与 placement） |
 | 2026-11-16 | 修正两处被证据推翻的实现：P1.1 只调表行没调枚举，`slot()` 按枚举索引，`prefetch_readahead` 的 160 MiB grant 被当作"从别行 carve"静默拒绝（已按规格顺序重排枚举 + 编译期 `static_assert`）；P0.1 的"失败后按 GiB 退让"被探针证明不可恢复（见陷阱 7），改为按 `ullAvailPageFile` 夹取后单次请求 |
+| 2026-11-16 | P3.3 关账：`PolicyController::note_layer()` 成为"不跑 step() 的路径"的唯一计数入口，split 入口每层调用一次并在 `NINFER_SPLIT_TIMING` 下调用 `report()`。e2 实测 20/20/20 行（fetch/cpu share/cpu leg）对 816 行 `[cpu-path]`；默认门禁逐位，面板 0 行。`report()` 的数字语义未改，`[ctl] cpu share` 的 `rate span=..@N compute=..@M` 与 `acted=N 层/M 路由` 原样可读 |

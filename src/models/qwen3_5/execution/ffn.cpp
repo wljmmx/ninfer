@@ -1684,6 +1684,17 @@ void split_moe_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor&
     // 125B split form produced no prediction at all: `[pf-region] hits=0 calls=0` and every
     // `[pfv] skip ... predicted_ is empty` came from that, not from a wrong region size.
     if (predict_next != nullptr) { predict_next_layer(residual, *predict_next, workspace, execution, moe.stream.get()); }
+    // P3.3: the panel was unreachable on this form. `report()` is only ever called from
+    // streamed_ffn(), and `PolicyController::layers` was only advanced by step() on the same fused
+    // path - so an e2 run printed 816 `[cpu-path]` lines and zero `[ctl] fetch=/cpu share` lines.
+    // One layer is finished at this point on BOTH branches above (resident and split), so this is
+    // the single place it is counted, exactly once per layer. Printing stays behind the same
+    // NINFER_SPLIT_TIMING switch the fused path uses; report() itself is read-only.
+    {
+        auto& control = policy_controller();
+        control.note_layer();
+        if (std::getenv("NINFER_SPLIT_TIMING") != nullptr) { control.report(); }
+    }
 }
 
 void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& residual,

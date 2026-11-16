@@ -157,6 +157,13 @@ public:
 
     void observe_decode(double tps) { signals.decode_tps = tps; }
 
+    // One FFN layer is fully observed, on whichever path ran it. Every path increments this
+    // exactly once per layer: the fused form through step(), the split form (e2's gate/up/down
+    // entry) through here. It is the panel's window arithmetic that depends on it - `layers % 40`
+    // in report() and `layers % 32` in step() - so a path that never advances it either prints
+    // every layer (counter stuck at 0) or never prints at all.
+    void note_layer() noexcept { ++layers; }
+
     // v8 9.3: the engine's live lane count, one observation per scheduling pass.
     void observe_lanes(std::uint32_t busy) { signals.lanes_busy = busy; }
 
@@ -721,6 +728,8 @@ public:
 
     void step(bool device_path_ready, bool prefetch_wired, bool graph_wired, bool freeze_wired,
               bool concurrency_wired = false) {
+        // The fused path's one increment per layer; a path that does not step() (the split form)
+        // calls note_layer() instead, so a layer is counted once and only once either way.
         ++layers;
         auto& bus = param_bus();
         // performance mode keeps exploring the read-ahead (v8 9.2, prefetch row): once the park
