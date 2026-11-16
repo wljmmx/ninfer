@@ -828,7 +828,7 @@ void ExpertStream::gh1_report() {
     std::fprintf(stderr,
                  "[gh1] bank=%u calls=%llu static=%.1f%% no_miss=%.1f%% capturable=%.1f%% "
                  "capt_free=%.1f%% capt_ready=%.1f%% fail_unaddr=%llu fail_publish=%llu "
-                 "fail_upload=%llu\n",
+                 "fail_upload=%llu cov=%.1f%% (%llu/%llu routes already resident)\n",
                   bank_, static_cast<unsigned long long>(gh1_calls_),
                   pct(gh1_static_calls_, gh1_calls_), pct(gh1_no_miss_calls_, gh1_calls_),
                   pct(gh1_calls_ - gh1_split_calls_, gh1_calls_),
@@ -836,7 +836,10 @@ void ExpertStream::gh1_report() {
                   pct(gh1_capt_ready_calls_, gh1_calls_),
                   static_cast<unsigned long long>(gh1_captfail_unaddressable_),
                   static_cast<unsigned long long>(gh1_captfail_publish_),
-                  static_cast<unsigned long long>(gh1_captfail_upload_));
+                  static_cast<unsigned long long>(gh1_captfail_upload_),
+                  pct(coverage_.inside, coverage_.routes),
+                  static_cast<unsigned long long>(coverage_.inside),
+                  static_cast<unsigned long long>(coverage_.routes));
     std::fflush(stderr);
 
 }
