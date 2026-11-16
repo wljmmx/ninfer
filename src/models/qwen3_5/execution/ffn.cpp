@@ -2325,7 +2325,7 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
                 CpuLayerLegQuery leg;
                 leg.misses  = static_cast<int>(moved);
                 leg.copy_us = control.signals.upload_us_per_expert;
-                leg.cpu_us  = cpu_route_us_estimate(static_cast<int>(moved));
+                leg.cpu_us  = cpu_route_us_estimate();
                 cpu_path_ledger().note_layer_leg(decide_cpu_layer_leg(leg), leg.misses);
             }
             // Layer cost, for the actuator guardrail: a change that costs >3% gets reverted.

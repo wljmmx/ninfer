@@ -3435,7 +3435,7 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
                 CpuLayerLegQuery leg;
                 leg.misses  = static_cast<int>(misses.size());
                 leg.copy_us = control.signals.upload_us_per_expert;
-                leg.cpu_us  = cpu_route_us_estimate(leg.misses);
+                leg.cpu_us  = cpu_route_us_estimate();
                 const auto verdict = decide_cpu_layer_leg(leg);
                 cpu_path_ledger().note_layer_leg(verdict, leg.misses);
                 leg_miss  = leg.misses;
@@ -3506,9 +3506,9 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
                      budget.cost_gpu_us, budget.cost_cpu_us, budget.budget_us, budget.why,
                      leg_name, leg_miss, leg_cross,
                      control.link_gbps,
-                     cpu_route_us_for(static_cast<int>(distinct.size())) < 0.0
+                     cpu_half_rate().span_us_per_expert < 0.0
                          ? 0.0
-                         : cpu_route_us_for(static_cast<int>(distinct.size())),
+                         : cpu_half_rate().span_us_per_expert,
                      cpu_half_rate().compute_us_per_expert < 0.0
                          ? 0.0
                          : cpu_half_rate().compute_us_per_expert,
