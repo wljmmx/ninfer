@@ -816,6 +816,16 @@ std::uint64_t host_expert_arena_bytes(std::uint64_t want_bytes) {
         const std::uint64_t usable = free_bytes > reserve ? free_bytes - reserve : 0;
         return usable / 2;
     }();
+    // ... and a hard ceiling, because on this box the MAPPED allocation stops working long before
+    // free RAM runs out. Measured 2026-11-16 with 53.6 GiB free: an arena of 23032 MiB maps and the
+    // run completes (ppl114, 6.024313), an arena of 23130 MiB - 98 MiB more - fails with
+    // `[host] mapped allocation of 23130 MiB failed: out of memory - trying a registered fallback`
+    // and then dies at the first attention launch. The share above lands at 22.5 GiB when free RAM is
+    // ~52 GiB, i.e. exactly on that cliff, which is why identical commands alternated between running
+    // and crashing. A ceiling of 22 GiB sits below the observed success point with ~490 MiB to spare,
+    // and it makes the size a function of this box instead of of a noisy free-memory reading.
+    // NINFER_EXPERT_HOST_ARENA_MB still overrides everything for a deliberate experiment.
+    constexpr std::uint64_t kMappedArenaCeiling = 22ull << 30;
     // port (sm_89): the 4 GiB working-set cap is gone, and the RAM share is now half instead of a
     // quarter.
     //
@@ -828,6 +838,9 @@ std::uint64_t host_expert_arena_bytes(std::uint64_t want_bytes) {
     // still bounded by it, a large one is bounded by RAM instead.
     constexpr std::uint64_t kSmallWorkingSetCap = 4ull << 30;
     std::uint64_t budget = std::min<std::uint64_t>(want_bytes, share);
+    // Hard ceiling (see above): the mapped allocation stops working ~23 GiB in on this box, and the
+    // share lands right on that cliff when free RAM is ~52 GiB. NINFER_EXPERT_HOST_ARENA_MB still wins.
+    budget = std::min(budget, kMappedArenaCeiling);
     if (want_bytes <= kSmallWorkingSetCap) {
         budget = std::min<std::uint64_t>({want_bytes, share, kSmallWorkingSetCap});
     }
