@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -1944,6 +1945,137 @@ void test_consuming_rewind_resets_proven_progress_to_the_adopted_prefix() {
             "an abandoned deep branch remained the proof after a consuming rewind");
 }
 
+// ---------------------------------------------------------------------------------------------
+// V10-02 (upstream T156/T157 retention half): the prefix-retention policy on the reclaim cursor.
+//
+// NINFER_PREFIX_RETENTION is read ONCE, when the manager is constructed, so every scenario below
+// sets the variable first, builds its own fixture second, and the scope guard restores the default
+// (off) on the way out. That is also why the "off" tests cannot simply re-use a fixture built by an
+// "on" test: a live manager keeps the decision it was constructed with.
+// ---------------------------------------------------------------------------------------------
+
+void set_prefix_retention(bool on) {
+#ifdef _WIN32
+    _putenv_s("NINFER_PREFIX_RETENTION", on ? "1" : "");
+#else
+    if (on) {
+        setenv("NINFER_PREFIX_RETENTION", "1", 1);
+    } else {
+        unsetenv("NINFER_PREFIX_RETENTION");
+    }
+#endif
+}
+
+struct RetentionScope {
+    explicit RetentionScope(bool on) { set_prefix_retention(on); }
+    ~RetentionScope() { set_prefix_retention(false); }
+    RetentionScope(const RetentionScope&)            = delete;
+    RetentionScope& operator=(const RetentionScope&) = delete;
+};
+
+// The shared state of the three retention scenarios: four retained candidates, eight Main KV pages
+// of footprint against a pool of eight, i.e. a budget of six (protected_pool_budget). Two pages each
+// means the pinned point and two of the three optional points fit, and exactly one is dropped.
+// The used point is deliberately the SHORTEST of the three, so the dropped one says which rank the
+// policy really applied: reuse first keeps it and drops a longer cold point, frontier first would
+// drop it and keep the two cold ones.
+struct RetentionFixture {
+    Fixture f;
+    Handle in_flight;
+    Handle reused;
+    Handle cold_long;
+    Handle cold_short;
+
+    RetentionFixture() : f(0) {
+        f.program.main_capacity = 8;
+        // Distinct token streams: the fixture keys checkpoints by their prompt tokens, so reusing
+        // one stream would make two candidates look like the same prefix.
+        in_flight  = f.program.add(tokens(100), {}, Role::Continuation);
+        reused     = f.program.add(tokens(5, 4000));
+        cold_long  = f.program.add(tokens(60, 2000), {}, Role::Continuation);
+        cold_short = f.program.add(tokens(10, 3000), {}, Role::Continuation);
+        for (const auto handle : {in_flight, reused, cold_long, cold_short}) {
+            f.program.contents[handle.index].main_pages = 2;
+        }
+        f.publish(in_flight);
+        f.publish(reused);
+        f.publish(cold_long);
+        f.publish(cold_short);
+        f.use_shared(reused);
+        // A source a request is still holding is in flight, and the policy must never offer it.
+        f.cache.retain_source(f.program, 10, f.source(Base{.tokens = tokens(100)}, in_flight));
+    }
+};
+
+void test_prefix_retention_keeps_the_pinned_set_and_drops_the_least_valuable() {
+    RetentionScope scope(true);
+    RetentionFixture state;
+    const auto cursor = state.f.cache.begin_reclaim(state.f.program);
+    require(cursor.victims.size() == 1 && cursor.victims.front().handle == state.cold_short,
+            "prefix retention neither protected the pinned and best optional points nor left "
+            "exactly the coldest optional point as the only eviction candidate");
+    // The dropped point is the longer cold one, not the shorter used one: reuse outranks frontier,
+    // so a selection that ranked frontier first would have dropped `reused` here instead.
+    require(std::none_of(cursor.victims.begin(), cursor.victims.end(),
+                         [&](const auto& victim) {
+                             return victim.handle == state.reused ||
+                                    victim.handle == state.cold_long ||
+                                    victim.handle == state.in_flight;
+                         }),
+            "a retained point reappeared in the eviction candidates");
+}
+
+void test_prefix_retention_fails_loudly_when_pinned_alone_exceeds_the_pool() {
+    RetentionScope scope(true);
+    Fixture f(0);
+    f.program.main_capacity = 4;  // budget: three pages
+    const auto in_flight    = f.program.add(tokens(100), {}, Role::Continuation);
+    f.program.contents[in_flight.index].main_pages = 4;
+    f.publish(in_flight);
+    f.cache.retain_source(f.program, 10, f.source(Base{.tokens = tokens(100)}, in_flight));
+
+    std::string message;
+    bool refused = false;
+    try {
+        (void)f.cache.begin_reclaim(f.program);
+    } catch (const std::runtime_error& error) {
+        refused = true;
+        message = error.what();
+    }
+    require(refused, "a pinned set above the pool budget was silently dropped instead of refused");
+    require(message.find("pinned") != std::string::npos &&
+                message.find("NINFER_PREFIX_RETENTION") != std::string::npos,
+            "the refusal did not name the pinned set and the switch that enabled it");
+}
+
+void test_prefix_retention_defaults_off_and_keeps_the_legacy_cursor() {
+    set_prefix_retention(false);
+    RetentionFixture state;
+    const auto cursor = state.f.cache.begin_reclaim(state.f.program);
+    // Every retained point stays a candidate, including the in-flight one: the default path is the
+    // pre-policy one, and nothing is protected by a policy that was never asked for.
+    require(cursor.victims.size() == 4,
+            "the default reclaim cursor stopped offering retained points");
+    require(std::any_of(cursor.victims.begin(), cursor.victims.end(),
+                        [&](const auto& victim) { return victim.handle == state.in_flight; }),
+            "the default reclaim cursor started protecting an in-flight point");
+}
+
+void test_prefix_retention_off_does_not_check_the_budget() {
+    set_prefix_retention(false);
+    Fixture f(0);
+    f.program.main_capacity = 4;
+    const auto in_flight    = f.program.add(tokens(100), {}, Role::Continuation);
+    f.program.contents[in_flight.index].main_pages = 4;  // above the same waterline as above
+    f.publish(in_flight);
+    f.cache.retain_source(f.program, 10, f.source(Base{.tokens = tokens(100)}, in_flight));
+    // Same state that throws when the policy is on: off it must behave exactly as before, which is
+    // "no budget is consulted and the point stays an ordinary candidate".
+    const auto cursor = f.cache.begin_reclaim(f.program);
+    require(cursor.victims.size() == 1 && cursor.victims.front().handle == in_flight,
+            "the disabled policy still refused or filtered a reclaim decision");
+}
+
 } // namespace
 
 int main() {
@@ -2000,6 +2132,10 @@ int main() {
         test_reclaim_cursor_keeps_host_writeback_permissions();
         test_failed_demotion_keeps_scanning_independent_history();
         test_failed_demotion_reports_prior_host_release();
+        test_prefix_retention_keeps_the_pinned_set_and_drops_the_least_valuable();
+        test_prefix_retention_fails_loudly_when_pinned_alone_exceeds_the_pool();
+        test_prefix_retention_defaults_off_and_keeps_the_legacy_cursor();
+        test_prefix_retention_off_does_not_check_the_budget();
         std::cout << "ok\n";
         return 0;
     } catch (const std::exception& error) {

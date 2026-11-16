@@ -3,16 +3,20 @@
 #include "core/prefetch.h"
 #include "runtime/contract/resources.h"
 #include "runtime/engine/context_cache/context_cost.h"
+#include "runtime/engine/context_cache/joint_planning.h"
 #include "runtime/engine/context_cache/prefix_index.h"
 #include "runtime/engine/context_cache/types.h"
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -83,7 +87,8 @@ public:
     explicit ResourceManager(bool enabled, ContextMachineCostModel costs,
                              std::shared_ptr<CheckpointCacheBackend> checkpoint_cache = nullptr)
         : enabled_(enabled), costs_(std::move(costs)),
-          checkpoint_cache_(std::move(checkpoint_cache)) {
+          checkpoint_cache_(std::move(checkpoint_cache)),
+          prefix_retention_(prefix_retention_requested()) {
         // Publishing costs about 1.5 s of transport for a 640-token prefix, on the path that just
         // finished capturing. Exporting stays on the calling thread (it touches Program), the
         // transfer does not. Three prefixes in flight is the budget: beyond that enqueue() refuses
@@ -91,6 +96,20 @@ public:
         if (checkpoint_cache_ != nullptr) {
             publish_worker_ = std::make_unique<core::Prefetcher>(256ULL * 1024 * 1024);
         }
+    }
+
+    // V10-02 (T156/T157, retention half): the explicit opt-in for `retained_prefixes()` below.
+    //
+    // Off unless NINFER_PREFIX_RETENTION names a true value; unset, empty, "0", "off", "false" and
+    // "no" all mean off. Read once, in the constructor, unlike the numeric override further down
+    // (which is read where each decision is taken): the policy is a property of this manager for
+    // the whole run, so an A/B is "start the process with the variable", never "the policy changed
+    // underneath a live cache". Nothing in this class reads it again.
+    [[nodiscard]] static bool prefix_retention_requested() {
+        const char* value = std::getenv("NINFER_PREFIX_RETENTION");
+        if (value == nullptr || *value == '\0') { return false; }
+        return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
+               std::strcmp(value, "false") != 0 && std::strcmp(value, "no") != 0;
     }
 
     [[nodiscard]] std::vector<SourceChoice>
@@ -1299,7 +1318,12 @@ private:
 
     [[nodiscard]] ReclaimCursor reclaim_order(Program& program) const {
         ReclaimCursor cursor;
+        const auto retained = retained_prefixes(program);
         for (const auto handle : victims()) {
+            // V10-02: the selected retention set is what this decision may not offer for release
+            // or demotion. Empty when the policy is off, which is why the default path is the
+            // old loop with one extra `contains` over an empty vector, not a different decision.
+            if (contains(retained, handle)) { continue; }
             const auto frontier = program.checkpoint_metadata(handle).frontier;
             cursor.victims.push_back({handle, priority_for(handle),
                                       demand_priority(program.checkpoint_key(handle, frontier))});
@@ -1311,6 +1335,136 @@ private:
         return cursor;
     }
 
+    // V10-02: the retained prefix set, in the units `select_prefix_checkpoints` ranks.
+    //
+    // Called from `reclaim_order`, i.e. from the single place every release and demotion decision
+    // takes its candidate list, so "retained" means exactly "not offered to Native for release or
+    // demotion". The handles themselves stay owned by the catalog: this selects, it never mutates.
+    //
+    // Pinned = in flight: a source a request is still holding (`waiting_.held`) or a checkpoint
+    // Native has pinned (leased). Those are always kept, whatever the budget, because dropping one
+    // would break a request that is already running. Everything else - published continuations,
+    // shared prefixes - competes for the budget by the policy's own ranking (reuse evidence, then
+    // frontier, then recency), so a cold one-off loses to a reused one. A pinned set that alone
+    // exceeds the budget is a pool that cannot honour its own in-flight work: it throws instead of
+    // silently dropping a pinned checkpoint.
+    //
+    // The budget is not a new number. It is `protected_pool_budget` of the pool class the set
+    // occupies the larger share of, so the waterline and the accounting both come from budgets the
+    // manager already reads; there is no retention constant anywhere. The ranked set decides ORDER;
+    // the pool's own deduped `checkpoint_footprint` decides BYTES, because two roles over one
+    // history share pages and a per-holder sum counts them twice.
+    [[nodiscard]] std::vector<Handle> retained_prefixes(const Program& program) const {
+        if (!enabled_ || !prefix_retention_) { return {}; }
+
+        struct Entry {
+            Handle handle;
+            bool pinned = false;
+        };
+        std::vector<Entry> entries;
+        const auto add = [&](Handle handle, bool in_flight) {
+            if (!program.valid_checkpoint(handle)) { return; }
+            const bool pinned = in_flight || program.checkpoint_metadata(handle).leased;
+            const auto found =
+                std::find_if(entries.begin(), entries.end(),
+                             [&](const auto& entry) { return entry.handle == handle; });
+            if (found == entries.end()) {
+                entries.push_back({handle, pinned});
+            } else {
+                found->pinned = found->pinned || pinned;
+            }
+        };
+        for (const auto& owner : owners_) {
+            for (const auto& point : owner.points) { add(point.handle, false); }
+        }
+        for (const auto& shared : shared_) { add(shared.handle, false); }
+        for (const auto& waiting : waiting_) {
+            for (const auto handle : waiting.held) { add(handle, true); }
+        }
+        if (entries.empty()) { return {}; }
+
+        std::vector<Handle> handles;
+        handles.reserve(entries.size());
+        for (const auto& entry : entries) { handles.push_back(entry.handle); }
+
+        // The class the retained set is accounted in: the one it occupies the larger share of. Both
+        // sides are the pool's own capacities, so this introduces no constant; a set that sits in
+        // Host is budgeted in Host bytes, one that is still Device-resident in Main KV pages, and
+        // the ratio comparison is exact (cross-multiplied through wide_mul_compare, no floats).
+        // Known limitation, stated rather than hidden: one scalar budget cannot cover both classes,
+        // so a candidate that occupies none of the accounted class costs nothing in this ledger.
+        const auto usage    = program.physical_usage();
+        const auto occupied = program.checkpoint_footprint(handles);
+        // Main KV pages unless the Host quota is the pool the set fills more of.
+        bool by_main = usage.capacity.main_kv_pages != 0;
+        if (by_main && usage.capacity.host_bytes != 0) {
+            by_main = wide_mul_compare(occupied.main_kv_pages, usage.capacity.host_bytes,
+                                       occupied.host_bytes,
+                                       usage.capacity.main_kv_pages) >= 0;
+        }
+        const std::uint64_t capacity =
+            by_main ? usage.capacity.main_kv_pages : usage.capacity.host_bytes;
+        if (capacity == 0) { return {}; }  // nothing to account the set against
+        const std::uint64_t budget = protected_pool_budget(capacity);
+        const auto cost            = [&](std::span<const Handle> subset) -> std::uint64_t {
+            const auto footprint = program.checkpoint_footprint(subset);
+            return by_main ? static_cast<std::uint64_t>(footprint.main_kv_pages)
+                           : static_cast<std::uint64_t>(footprint.host_bytes);
+        };
+
+        // `PrefixCandidate::handle` is a plain ordinal, not a model handle: CheckpointHandle is
+        // model-owned and carries an owner pointer, so the selection addresses entries by position
+        // and the mapping back is `handles`.
+        std::vector<Handle> pinned_handles;
+        std::vector<context_cache::PrefixCandidate> candidates;
+        candidates.reserve(entries.size());
+        for (std::size_t index = 0; index < entries.size(); ++index) {
+            const auto priority = priority_for(entries[index].handle);
+            candidates.push_back(
+                {.handle      = static_cast<std::uint64_t>(index),
+                 .frontier    = program.checkpoint_metadata(entries[index].handle).frontier,
+                 .bytes       = cost({&entries[index].handle, 1}),
+                 .reused      = priority.reused,
+                 .last_demand = priority.last_demand,
+                 .pinned      = entries[index].pinned});
+            if (entries[index].pinned) { pinned_handles.push_back(entries[index].handle); }
+        }
+
+        const auto picked =
+            context_cache::select_prefix_checkpoints(std::move(candidates), budget);
+        // `over_budget` is decided on the per-holder sum above, which over-counts aliases; the
+        // deduped footprint below is authoritative for both the refusal and the trimming.
+        const auto pinned_cost =
+            pinned_handles.empty() ? std::uint64_t{0} : cost(pinned_handles);
+        if (pinned_cost > budget) {
+            throw std::runtime_error(
+                "pinned prefix retention exceeds the checkpoint pool budget: " +
+                std::to_string(pinned_cost) + " of " + std::to_string(budget) +
+                (by_main ? " main-KV pages" : " Host bytes") + " (NINFER_PREFIX_RETENTION)");
+        }
+
+        std::vector<Handle> kept;
+        kept.reserve(picked.handles.size());
+        for (const auto index : picked.handles) {
+            kept.push_back(handles[static_cast<std::size_t>(index)]);
+        }
+        // Trim from the tail - the policy's own lowest-ranked optional entries - so the kept set is
+        // "pinned plus the best of the rest that really fits", never "whatever summed small enough
+        // per holder".
+        while (!kept.empty() && cost(kept) > budget) {
+            std::size_t drop = kept.size();
+            for (std::size_t index = kept.size(); index != 0; --index) {
+                if (!contains(pinned_handles, kept[index - 1])) {
+                    drop = index - 1;
+                    break;
+                }
+            }
+            if (drop == kept.size()) { break; }  // only pinned left, and it fits
+            kept.erase(kept.begin() + static_cast<std::ptrdiff_t>(drop));
+        }
+        return kept;
+    }
+
     static std::uint64_t useful(ContextResourceUsage released, ContextResourceUsage shortage) {
         if (shortage.state_slots) { return std::min(released.state_slots, shortage.state_slots); }
         if (shortage.main_kv_pages) {
@@ -1320,6 +1474,16 @@ private:
             return std::min(released.backend_kv_pages, shortage.backend_kv_pages);
         }
         return std::min(released.host_bytes, shortage.host_bytes);
+    }
+
+    // The share of one pool class a protected set may occupy before the rest loses protection.
+    // One definition because there are two callers: `balance_reused`'s demotion waterline (which
+    // had this arithmetic inline) and the prefix-retention budget in `retained_prefixes`. Keeping
+    // them equal is the point - a retention policy that protected more than the demotion waterline
+    // would fight it.
+    [[nodiscard]] static constexpr std::uint64_t
+    protected_pool_budget(std::uint64_t capacity) noexcept {
+        return capacity * 3ULL / 4ULL;
     }
 
     [[nodiscard]] std::vector<Handle> surviving(Program& program,
@@ -1720,7 +1884,7 @@ private:
             const auto usage       = amounts(program.checkpoint_footprint(reused));
             ProtectedEntry* demote = nullptr;
             for (std::size_t resource = 0; resource < usage.size() && !demote; ++resource) {
-                if (usage[resource] <= capacities[resource] * 3ULL / 4ULL) { continue; }
+                if (usage[resource] <= protected_pool_budget(capacities[resource])) { continue; }
                 ProtectedEntry* newest = nullptr;
                 ProtectedEntry* oldest = nullptr;
                 for (auto& entry : entries) {
@@ -1752,6 +1916,8 @@ private:
     bool enabled_;
     ContextMachineCostModel costs_;
     std::shared_ptr<CheckpointCacheBackend> checkpoint_cache_;
+    // V10-02: fixed at construction from NINFER_PREFIX_RETENTION, never re-read (see the reader).
+    bool prefix_retention_ = false;
     std::unique_ptr<core::Prefetcher> publish_worker_;
     PrefixIndex<Model> index_;
     std::vector<Owner> owners_;
