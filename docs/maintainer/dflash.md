@@ -335,6 +335,30 @@ time, and that fraction is already on the panel: `gh1_rates().no_miss_pct` / `ca
 -28% on the per-node price; a prefetch that only covers half the misses cannot reach it, so the entry
 stays open until a measurement says which fraction it converts.
 
+What the region/table pass measured (2026-11-16, v5_e2, `--no-cuda-graph -pg 64,64 --warmup 0 -r 1`,
+`NINFER_PREFETCH=1 NINFER_PREFETCH_PREDICT=1 NINFER_PREFETCH_MODE=vram`, decode 64):
+
+| region slots/bank | `[pf-ctl]` | decode tok/s | `[pf-region]` hits |
+|---:|---|---:|---:|
+| 8 (forced) | `cutoff=0 armed=N reason=depth` | 7.28 | 0-1 / 1280 |
+| 16 (forced) | `cutoff=1 armed=Y reason=env override` | 4.33 | 1 / 650 |
+| 0 (controller) | nothing carved, nothing armed | 7.3-8 | 0 |
+
+So the cutoff is a result and it behaves: `delta = cold_share x top_k = 10`, `affordable = slots/delta`,
+8 slots cannot hold one layer's cold delta and the fill is refused by the arithmetic rather than by a
+switch. Two consequences worth keeping: an armed region costs 40% of decode speed at 16 slots/bank for
+a 0.2% hit rate - the region is still a zero-sum carve out of the routed pool - and the fill is gated
+on `NINFER_PREFETCH_MODE=vram` independently of arming, which is why a run with slots but no mode reads
+`[pf-region] hits=0` and looks like a missing caller (the entry line in `stage_predicted` now prints
+the bank for exactly this reason).
+
+The host tier that feeds those copies has its own cliff, measured the same day: a MAPPED arena of
+22527 MiB is refused in-process (0/3) while 22500 (1/1), 22016 (2/2) and 21504 (5/5) map, although a
+standalone allocation probe maps 24576 MiB - so the refusal is a property of the process, not of the
+request, and a preview probe does not predict it (a probe at 22528 succeeded and the tier's own 22527
+request failed milliseconds later). The ceiling is therefore 21 GiB, which is also why the gate runs
+five for five instead of crashing three in eight.
+
 **Verify rectangle columns 1..K (closed 2026-11-15: the collapse was a dump bug).** Every rate this
 document records for a column >= 1 before 2026-11-15 is void. `NINFER_DFLASH2_DUMP` sorted a
 full-vocabulary index vector and then shrank it to sixteen (`order.resize(kTop)`, `draft.cpp:1245`),
