@@ -28,7 +28,7 @@
 
 | 格 | 预测器 | 端口 | 命中率可读 | 本机可达 |
 |---|---|---|---|---|
-| **e2 × 流式** | 🟡 有信号无放置件：`[pf-pred] written=64 ids=640 drained=64 dropped=0`（环完整），但 `[pf-region] hits=0 calls=640 (0.0%)`；`[pf-ctl] cutoff=0 armed=N reason=depth`（8 槽）/ `armed=Y`（16 槽）。**P2.2 后**：放置件在（`fill=dev(select=… placed=20948 applied=19365)`），`hits=447 calls=54010 (0.83%)`（48 层流按 bank 求和，见 P2.2 行） | ✅ `[ctl] prefetch port` 正常打印 cold/hit/cpu/runs/banks/slots→N | 🟡 计数器可读且**不再恒 0**（0.83%），限速项是预测精度而不是放置（放置 19365 次只换来 447 次命中，与 P2.4 的 0.2–0.8% 同量级） | ✅ 可达 |
+| **e2 × 流式** | 🟡→ 放置件已在（P2.2 `e1776dcb`），预测器按 run 循环 `split_.size()`，**不假设 3**：`[pf-region] bank=141 hits=7 calls=1130 (0.6%)`，48 bank 合计 `hits=447 calls=54010 (0.83%)` | ✅ `[ctl] prefetch port` | ✅ 可读且非零（此前 0/640 是“没有放置件”，现在是“放进去但命中低”——两件事必须分开说） | ✅ 可达 |
 | **e2 × 驻留** | — 无需预测（整层驻留） | ✅ 同一端口 | — | **本机不可达，两个独立原因**：① 125B 上 `count_` = 512 专家/bank，整层驻留需 73728 slot × 1.25 MiB ≈ 88 GiB；② 35B-e2 现在能跑了（P6.1 已修，`overall 6.701375`），但池只装 **10040/10240** 专家（池 18879 MiB，每 bank 差 5 槽 × 1920 KiB = 375 MiB），`fully_resident()` 仍为 false |
 | **非 e2 × 流式** | ⬜ "层元数据"信号没有生产：`predict_next_layer` 只有 residual(28.8%) / prev(49.4%) 两条 | ✅ | 🟡 同左（无填充→0） | ❓ 35B plain 能跑（`overall 6.701375`），但它无池行、未确认有专家路由；验法：同命令加 `[pf-pred]`/`[gh1]` 观察是否有 ids |
 | **非 e2 × 驻留** | ⬜ 双缓冲换层未实现；"换层窗口内无 miss"这个前提本身未验证 | ✅ | — | ❓ 验法：35B plain + `[gh1] no_miss_pct` 是否 100%，否则这一格的前提不成立 |
@@ -106,7 +106,33 @@
 
 ---
 
-### P6 35B-e2 制品跑不起来（2026-11-16 新发现，阻塞 e2×驻留验证）
+### P7 容量重分配由控制器按模式决策（2026-11-16 立项，来自 35B-e2 差 375 MiB 的观察）
+"@
+
+设备的 24 GB 不是“够/不够”的二值，而是三个互相争抢的消费者：专家池、KV 页、以及可以溢出到内存的那部分。
+35B-e2 的池只装 10040/10240 专家（每 bank 差 5 槽 × 1920 KiB ≈ 375 MiB），这件事的正确答案不是“启动失败”，
+也不是“再多给池 375 MiB”，而是**由控制器在三种下注之间选一个**：
+
+| 下注 | 显存给谁 | 代价 | 什么时候对 |
+|---|---|---|---|
+| A 专家全驻留 | 池吃满、KV 全部溢出到内存 | KV 每次缺页要回读；长上下文时延迟抖动 | 稳定档、短上下文、decode 主导 |
+| B KV 优先 | KV 页留在显存、专家流式 | 每 token 读专家；带宽是瓶颈 | 长上下文、prefill 主导 |
+| C 各溢出一部分 | 池与 KV 各让一点 | 两边都有 miss，但两边都不致命 | auto：按实测 miss 率与 p99 选 |
+
+判据必须来自现有控制器（`expert_path_control.h` 的 `ControllerMode` = auto / stable / performance，
+以及它已经在观察的 `decode_tps`、`lambda_p99`、`miss_rate`），**不要新造控制器**；`TierPlan`
+（`core/tier_plan.h`）的三行就是这条决策的输出，`device: expert_pool_mb | kv_pages_mb` 与
+`host: expert_arena_mb | kv_host_mb` 之间怎么切，是这个决策的结果。
+
+| ID | 任务 | 验收 | 状态 |
+|---|---|---|---|
+| P7.1 | **拒绝即重解，不是即失败**：`MemoryLedger` 的 REJECTED 现在只打印；改成把被拒的申请量回报给容量求解器，重新在 A/B/C 之间选一次（最多两级），并把选择理由打进 `[plan]` | 把 KV 需求人为抬高，使池装不下整层：进程仍能起，`[plan]` 说明“因 XX 把 KV 溢出、专家全驻留”之类 | ⬜ |
+| P7.2 | 模式目标函数接线：performance / stable / auto 三个档对 A/B/C 的偏好写进控制器（参数不写死，从已测的 tps/p99/miss 推） | 同一制品在三个档下 `[plan]` 给出不同切分，且每个档的判据可读 | ⬜ |
+| P7.3 | 35B-e2 作为验收用例：差 375 MiB 时按模式给出“让 KV 让位 / 让专家流式 / 各让一点”三种可运行方案，不拒绝启动 | 三个档都能跑到 `overall`，并给出各自的 miss/命中与 p99 | ⬜ |
+
+---
+
+### P6 35B-e2### P6 35B-e2 制品跑不起来（2026-11-16 新发现，阻塞 e2×驻留验证）
 
 | ID | 任务 | 验收 | 状态 | 证据 |
 |---|---|---|---|---|
@@ -167,5 +193,7 @@
 | 2026-11-16 | P2.2 关账（`e1776dcb`）：预取区有了 device 端放置件。`ops::moe_prefetch_select` 在 device 上做两个决定（哪个专家、哪个区槽位）并把 `(expert, region)` 对写回，环游标是 device 字；host 只应用（`ExpertCache::adopt_prefetch_placements`，越界/非区槽位 fail-loud）并把字节交给池自己的上传路（唯一 device 可寻址源是 tier，而 tier 命中的专家本来就不需要拷贝；artifact 是 host 映射）。drain 搭在 `fetch_host_routed` 那次同步上，0 次新增同步。实测 `hits=447 calls=54010 (0.83%)`、`placed=20948 applied=19365`、`[pf-mirror] region uploads 144 → 3383`、`[plan] prefetch_mb=1440*`；默认门禁逐位 |
 | 2026-11-16 | P3.1 关账（`f0ddf640`）：CPU 半两侧同口径。copy 侧 `gpu_us = max(link + read, 3×upload)`（read 与 span 付的是同一次实测读），除数与决策 2 的 CPU 侧都改回尺寸对应的实测 span。冷段同层 `est copy=317us` 对 `span=414.7us`（改前 12.6 对 8186），`m*` 冷 1.3–1.6 / 暖 0.2–0.3 不再随冷热翻转；**`m*` 不是 4.8**：4.8 假设的 147 us span，本机在 5–8 与 100+ 路由实测 356–542 us。默认门禁逐位 |
 | 2026-11-16 | P5.2 关账：`diag-cpu-partial` 的 A/B 与模板实例化都从 2 族扩到 5 族，族信息只走 `rk_host_kv_codecs()`/`rk_host_kv_dtype_of()`（diag 内部仅保留"族→写入器 storage"的夹具表，注释标注 FIXTURE, NOT POLICY；plane extent/dtype 读 `paged_kv_storage_layout`）。ab 模式五族 `engages=2048/2048 cpu-leg=YES`，acc `max|d|` 4.90e-04–9.69e-04 全部 ≤ 量子界（rk4v2-e8 的 E8-cylinder V 最大码实测 14，界 1.815e-03），`over_1e-5` 全在量子通道内、`fail=0`；`maximum` ≤1.49e-08、`sum` ≤1.53e-05、merged `beyond=0`、同 split 逐位 `integrity=0`。`v_bound` 顺带从"全表映射页的 max|vs|"改成"窗口内实际写入的 (page,tip)"，去掉未初始化页参与定界。默认门禁逐位 `6.024313` / `20.673595` |
+
+
 
 
