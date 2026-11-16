@@ -403,6 +403,64 @@ struct CpuLayerLegVerdict {
 // half, and structured speculation changes both (a verify pass is a batch of tree nodes). A threshold
 // fitted on today's shapes would be re-fitted the moment the tree lands. This decision is upstream of
 // that work, not beside it.
+
+// ---- decision 5: how many prediction slots the region gets, if it exists at all ------------------
+//
+// The size is a MODEL fact times a MEASURED fact, never a constant: it scales with top_k, with the
+// number of runs a split layer has (three), and with how much of the layer is actually cold. Measured
+// on the 125B decode path, 2026-11-16:
+//
+//   residency 57.5% of routed experts held by every run  ->  cold share 42.5%   ([gh1] residency)
+//   [pf-region] hits=0 calls=0 with PREFETCH, with PREFETCH_PREDICT, and with both: the split decode
+//   path never calls set_predicted/stage_predicted - those live on the fused path (ffn.cpp:967,
+//   ffn.cpp:1564, text.cpp:2491) - so a carved region pays its residency cost and stages nothing
+//   (1.5 tok/s against 7.5 with the region off).
+//
+// So the rules encoded here, in order:
+//   * nothing stages on this path -> 0 slots, whatever anyone asks for;
+//   * staging present, no rate yet -> the historical prior (2 x top_k), because a region that has
+//     never been measured is not worth more than the one that was;
+//   * cold share known -> scale the prior by it (a layer that is mostly resident wants a small
+//     region);
+//   * hit rate known -> scale by cold_share x hit_rate, which is the slots that will actually be
+//     used. The -28% per-node target needs 28/42.5 ~= 66% of the cold set caught, so a poor rate
+//     shrinks the region instead of paying for slots nobody reads.
+//   * the pool clamps it to a quarter of a bank's window, and so does this.
+struct PrefetchSizingQuery {
+    int    top_k               = 0;
+    int    pool_slots_per_bank = 0;
+    double cold_share          = -1.0; // 1 - residency; <0 unknown
+    double hit_rate            = -1.0; // [pf-region] hits/calls; <0 unknown
+    bool   staging_reachable   = false;
+};
+
+struct PrefetchSizing {
+    int slots_per_bank = 0;
+    int reason         = 0; // 0 no staging, 1 prior, 2 cold-scaled, 3 rate-scaled
+};
+
+[[nodiscard]] inline PrefetchSizing decide_prefetch_slots(const PrefetchSizingQuery& query) noexcept {
+    PrefetchSizing out;
+    if (!query.staging_reachable || query.top_k <= 0 || query.pool_slots_per_bank <= 0) { return out; }
+    const int ceiling = std::max(1, query.pool_slots_per_bank / 4);
+    int want          = 2 * query.top_k;
+    out.reason        = 1;
+    if (query.cold_share >= 0.0) {
+        want       = static_cast<int>(query.cold_share * static_cast<double>(want) + 0.5);
+        out.reason = 2;
+    }
+    if (query.hit_rate >= 0.0) {
+        // Only the slots that the measured hit rate will actually serve are worth holding.
+        want       = static_cast<int>(query.cold_share > 0.0
+                                          ? query.hit_rate * query.cold_share *
+                                                static_cast<double>(2 * query.top_k) + 0.5
+                                          : static_cast<double>(want));
+        out.reason = 3;
+    }
+    out.slots_per_bank = std::min(std::max(want, 0), ceiling);
+    return out;
+}
+
 inline constexpr double kCpuGflopsCalibrated = 778.0; // the benchmark's own effective rate
 inline constexpr double kCpuLayerFloorUs     = 250.0; // a layer shorter than this still gets a floor
 inline constexpr double kLinkBusyShare       = 0.10;  // upload/wall under this: the link is idle
