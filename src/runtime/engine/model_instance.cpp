@@ -791,7 +791,23 @@ std::uint64_t second_chance_budget_bytes(std::span<const ExpertBankLayout> banks
 std::uint64_t host_expert_arena_bytes(std::uint64_t want_bytes) {
     const auto share = [&] {
         const auto free_bytes = current_free_host_bytes();
-        return free_bytes == 0 ? want_bytes : free_bytes / 2;
+        if (free_bytes == 0) { return want_bytes; }
+        // Leave the box room to breathe before taking a share. "Half of free" does not reserve any:
+        // the arena is MAPPED (and on the fallback path PINNED), so the mapping itself needs headroom
+        // on top of the arena it is mapping. Measured on this box, 2026-11-16: with ~52 GiB free the
+        // arena came out at 26 GiB, `[host] mapped allocation of 26073 MiB failed: out of memory -
+        // trying a registered fallback` followed, the registered fallback succeeded, and the run then
+        // died at the first attention launch (`qsa/prepare_launch.cu:333`,
+        // cudaErrorLaunchOutOfResources) - a sizing failure that reads exactly like a kernel bug, and
+        // that a reserve of this kind prevents.
+        //
+        // The reserve is max(8 GiB, 1/8 of free): the constant covers a desktop that grows while the
+        // model loads (a browser tab is a gigabyte), the fraction scales with the box. The share is
+        // still a half of what REMAINS, so the arena does not grow into the reserve.
+        const std::uint64_t reserve =
+            std::max<std::uint64_t>(8ull << 30, free_bytes / 8);
+        const std::uint64_t usable = free_bytes > reserve ? free_bytes - reserve : 0;
+        return usable / 2;
     }();
     // port (sm_89): the 4 GiB working-set cap is gone, and the RAM share is now half instead of a
     // quarter.
