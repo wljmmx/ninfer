@@ -1149,6 +1149,43 @@ void split_host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParamete
     if (cpu_path_switch() == CpuPathSwitch::On) {
         auto& ledger = cpu_path_ledger();
         ledger.note_layer_cpu(static_cast<int>(wanted.size()), tokens, cpu_span_ms, cpu_ms);
+        // Decision 5's port, assembled from what was measured THIS layer: the region is sized for the
+        // shape the model actually has (banks, slots per bank, runs) and the share that is actually
+        // cold. Nothing here is a constant, and nothing on the prediction side decides its own size -
+        // the same rule as the KV and expert-pool budgets.
+        {
+            PrefetchSignals signals;
+            signals.cold_share     = moe.stream->residency_rate();
+            signals.hit_rate       = moe.stream->prefetch_rate();
+            signals.cpu_share      = ledger.routes_seen != 0
+                                         ? static_cast<double>(ledger.cpu_routes) /
+                                               static_cast<double>(ledger.routes_seen)
+                                         : -1.0;
+            // False until the device-side placement exists: a region that nothing stages into earns
+            // nothing, and the decisions below say so instead of paying for it.
+            signals.staging_reachable   = false;
+            signals.freeze_active       = moe.stream->frozen();
+            signals.lanes               = 1;
+            signals.top_k               = top_k;
+            signals.runs_per_layer      = static_cast<int>(moe.stream->runs());
+            signals.pool_slots_per_bank = static_cast<int>(moe.stream->pool_slots_per_bank());
+            note_prefetch_signals(signals);
+            const auto sizing = decide_prefetch_slots();
+            static int reports = 0;
+            if (++reports % 64 == 0) {
+                std::fprintf(stderr,
+                             "[ctl] prefetch port: cold=%.1f%% hit=%.1f%% cpu=%.1f%% runs=%d "
+                             "banks=%u slots_bank=%u -> %d slot(s)/bank (reason=%d)\n",
+                             signals.cold_share >= 0.0 ? 100.0 * signals.cold_share : -1.0,
+                             signals.hit_rate >= 0.0 ? 100.0 * signals.hit_rate : -1.0,
+                             signals.cpu_share >= 0.0 ? 100.0 * signals.cpu_share : -1.0,
+                             signals.runs_per_layer,
+                             static_cast<unsigned>(moe.stream->pool_banks()),
+                             static_cast<unsigned>(moe.stream->pool_slots_per_bank()),
+                             sizing.slots_per_bank, sizing.reason);
+                std::fflush(stderr);
+            }
+        }
     }
     (void)ensure_ms;
     if (host_term_device != nullptr) {

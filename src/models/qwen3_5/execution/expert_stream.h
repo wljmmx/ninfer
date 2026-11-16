@@ -137,6 +137,20 @@ public:
     [[nodiscard]] std::uint32_t pool_slots_per_bank() const noexcept {
         return cache_ != nullptr ? cache_->slots_per_bank() : 0;
     }
+    // Read-only, for the controller's prefetch port: the two rates the sizing decision is a function
+    // of, plus the stream's own frozen state. -1.0 means "no sample yet", never 0 by default - a
+    // decision must be able to tell "measured zero" from "nothing measured".
+    [[nodiscard]] double residency_rate() const noexcept {
+        return residency_routes_ == 0
+                   ? -1.0
+                   : 1.0 - static_cast<double>(residency_inside_) /
+                               static_cast<double>(residency_routes_);
+    }
+    [[nodiscard]] double prefetch_rate() const noexcept {
+        return prefetch_calls_ == 0 ? -1.0
+                                    : static_cast<double>(prefetch_hits_) /
+                                          static_cast<double>(prefetch_calls_);
+    }
     // Device-side int32 array, one entry per expert: 1 when the route resolves to an address.
     //
     // port (sm_89): in the split form this is the GATE run's mask. Three runs can hold different
@@ -757,20 +771,6 @@ private:
     Coverage coverage_{};
     std::uint64_t residency_routes_ = 0;
     std::uint64_t residency_inside_ = 0;
-    // Read-only, for the controller's prefetch port: the two rates the sizing decision is a function
-    // of, plus the stream's own frozen state. -1.0 means "no sample yet", never 0 by default - a
-    // decision must be able to tell "measured zero" from "nothing measured".
-    [[nodiscard]] double residency_rate() const noexcept {
-        return residency_routes_ == 0
-                   ? -1.0
-                   : 1.0 - static_cast<double>(residency_inside_) /
-                               static_cast<double>(residency_routes_);
-    }
-    [[nodiscard]] double prefetch_rate() const noexcept {
-        return prefetch_calls_ == 0 ? -1.0
-                                    : static_cast<double>(prefetch_hits_) /
-                                          static_cast<double>(prefetch_calls_);
-    }
     StepCost last_cost_{};
     // Misses per step, histogram 0..32, decayed so a new workload is not held hostage. One
     // sample per step: the spill region holds every lane's miss at once (8 lanes x 8 experts).
