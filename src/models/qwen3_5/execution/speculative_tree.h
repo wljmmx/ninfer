@@ -155,6 +155,29 @@ struct SpeculativeTree {
 // How much of the draft's candidate list becomes columns. The draft half already produces sixteen
 // candidates per column (kSparseSpeculativeCandidates); a tree only decides how many of them are
 // worth a column of their own.
+//
+// THIS BUILDER IS NOT THE SHAPE THAT WAS PRICED, AND IT SHOULD NOT BE THE ONE THAT SHIPS. It admits
+// children by ABSOLUTE accumulated probability (parent path probability x the column's unconditional
+// marginal), which is two mistakes at once:
+//   * the score is not ancestor-CONDITIONED - the marginal at column i+1 was computed without knowing
+//     which token column i took, and the information that makes a branch meaningful is the selector's
+//     pair score (score(child rank | predecessor rank), the edge lattice), not that marginal;
+//   * pruning by an absolute product kills the DEEP SPINE while keeping SHALLOW BRANCHES (at p=0.5 and
+//     tau=0.1 the spine dies at depth 4 while a depth-1 branch at 0.15 survives and takes a column),
+//     so the result is worse than the chain it was supposed to extend - the "mutually inconsistent
+//     branches" failure, produced by the pruning rule rather than by the tree idea.
+//
+// The priced shape is depth-first with a spine guarantee and an online budget; it lives in
+// H:\TeleAgentWorks\.temp\tree_budget.py and reads the same two dumps. Its answer (2026-11-16, 29
+// rounds, v5_e2 DFlash2):
+//
+//   chain     len 2.241  nodes 8.00   9.23 tok/s
+//   +1 branch len 2.690  nodes 14.83  7.61 tok/s   speed 0.824   (+20.0% length, +85.3% nodes)
+//
+// and the reason no budget policy rescues it is an exchange rate, not a shape: a branch node costs the
+// same as a spine node but buys 0.066 columns against the spine's 0.280, because a branch is a whole
+// TAIL (k - c nodes), not one node. Break-even would need +20% length for three nodes; a tail costs
+// 6.8. Kept here only as the data contract (visibility/positions) that work would need.
 struct TreeBuildPolicy {
     std::int32_t max_depth   = 2;    // drafted layers below the anchor; depth 2 is the measured knee
     std::int32_t max_columns = 8;    // the small-T band the verify row is shaped for
