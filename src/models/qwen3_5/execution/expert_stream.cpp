@@ -1980,6 +1980,9 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
         double macs = 0.0;
         for (const auto& run : split_) { macs += static_cast<double>(run.expert.elements); }
         query.flops_per_expert    = 2.0 * macs * static_cast<double>(tokens);
+        // Decision 4's shape term: the columns this layer verifies. A decode layer passes 1; a verify
+        // pass passes its T, which is what makes the read amortise and the arithmetic not.
+        query.tokens              = tokens;
         query.link_gbps           = control.link_gbps;
         query.upload_us_per_entry = control.signals.upload_us_per_expert;
         query.cold_read_us        = control.signals.cold_read_us_per_expert;

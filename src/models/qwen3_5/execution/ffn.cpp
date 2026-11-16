@@ -1148,7 +1148,7 @@ void split_host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParamete
     const double cpu_span_ms = ensure_ms + cpu_ms;
     if (cpu_path_switch() == CpuPathSwitch::On) {
         auto& ledger = cpu_path_ledger();
-        ledger.note_layer_cpu(static_cast<int>(wanted.size()), cpu_span_ms, cpu_ms);
+        ledger.note_layer_cpu(static_cast<int>(wanted.size()), tokens, cpu_span_ms, cpu_ms);
     }
     (void)ensure_ms;
     if (host_term_device != nullptr) {
@@ -2098,12 +2098,17 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
             // NINFER_CPU_PATH_POLICY (default off) holds the pool-copy leg, and the runtime leg
             // a cpu-half verdict names (ensure() leaving the expert for the CPU half) is a
             // later batch. Only a layer that actually moved experts in faced the choice.
+            // Decision 2, layer form: the copy-versus-half choice priced the way a layer pays it -
+            // the transfer per miss plus the route read-back a clean layer would have skipped. The
+            // per-expert form that used to sit here compared 42 us against 45 us and could never see
+            // that crossing; the layer form puts it at the p99 of the miss histogram. Still a shadow
+            // verdict: ensure() has no host-half leg, so nothing acts on it yet.
             if (moved > 0) {
-                double cpu_us = 0.0;
-                const auto cpu_leg =
-                    decide_cpu_expert_half(control.signals.upload_us_per_expert, &cpu_us);
-                cpu_path_ledger().note_expert(cpu_leg, control.signals.upload_us_per_expert,
-                                             cpu_us);
+                CpuLayerLegQuery leg;
+                leg.misses  = static_cast<int>(moved);
+                leg.copy_us = control.signals.upload_us_per_expert;
+                leg.cpu_us  = cpu_route_us_estimate();
+                cpu_path_ledger().note_layer_leg(decide_cpu_layer_leg(leg), leg.misses);
             }
             // Layer cost, for the actuator guardrail: a change that costs >3% gets reverted.
             control.observe_layer(moe.stream->last_cost().route_ms +

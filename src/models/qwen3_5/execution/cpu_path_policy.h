@@ -88,6 +88,13 @@ inline constexpr double kCpuPartialUploadBPerTok = 1032.0;
 inline constexpr double kCpuMoeExpertInt8Ms  = 0.0569;
 inline constexpr double kCpuMoeExpertInt16Ms = 0.0452;
 
+// What one clean layer saves: the route read-back ffn skips when the placement covers every route
+// (expert_stream.h's static_covered() - "the only place the ~0.5 ms read-back can be removed"). It is
+// a LAYER cost, not a per-route one: a single route fetched from the host forfeits all of it. That
+// asymmetry is the whole of decision 2's layer form below, and it is why the per-expert comparison
+// could never see the crossing.
+inline constexpr double kCpuReadbackUs = 500.0;
+
 // ---- the forced switch --------------------------------------------------------------------
 enum class CpuPathSwitch : std::uint8_t { Off = 0, On = 1 };
 
@@ -262,6 +269,11 @@ enum class CpuExpertLeg : std::uint8_t {
 
 // Pure; `copy_us_per_expert` is the caller's measured upload. `est_cpu_us` (optional) carries
 // the calibrated CPU-side rate so the observation line can print both sides.
+//
+// SUPERSEDED by the layer form below, and kept only because the panel's per-expert counters name it.
+// The comparison here charges one transfer against one route and concludes "copy" at 42 us against
+// 45 us - which is right about those two numbers and wrong about the layer, because the copy also
+// forfeits kCpuReadbackUs for a layer that would otherwise have been clean. Do not wire this one.
 [[nodiscard]] inline CpuExpertLeg decide_cpu_expert_half(double copy_us_per_expert,
                                                          double* est_cpu_us = nullptr) noexcept {
     const double cpu_ms = param_bus().get(kCpuMoeExpertRow);
@@ -269,6 +281,62 @@ enum class CpuExpertLeg : std::uint8_t {
     if (!(copy_us_per_expert > 0.0) || !(cpu_ms > 0.0)) { return CpuExpertLeg::NoData; }
     if (cpu_path_switch() == CpuPathSwitch::Off) { return CpuExpertLeg::PoolCopy; }
     return copy_us_per_expert > cpu_ms * 1000.0 ? CpuExpertLeg::CpuHalf : CpuExpertLeg::PoolCopy;
+}
+
+// ---- decision 2, layer form: this layer's misses, copy them in or answer them on the half --------
+//
+// The question is per LAYER, not per expert, because everything the copy costs that is not the
+// transfer is layer-shaped:
+//
+//   copy_us(layer, m) = m * transfer_us + (m > 0 ? kCpuReadbackUs : 0)
+//                       + the spill slots the frozen set reserved (p99 3-4, expert_stream.h:374-380)
+//                       + a vote against the freeze rule (it counts clean layers)
+//                       + a captured expert table that can no longer be captured ("a capture cannot
+//                         read a host tally", expert_stream.h:~415)
+//   cpu_us(layer, m)  = m * span_us          (no pool state is touched at all)
+//
+// The first line is the one the arithmetic can settle, and it crosses where
+//     m* = kCpuReadbackUs / (span_us - transfer_us)
+// With the split form's measured span (~147 us: 71 gate/up + 76 down) and a 42 us upload this is
+// m* = 4.8 - the p99 of the miss histogram, i.e. exactly the few misses a frozen layer already
+// reserves slots for. With the fused form's ~45 us it is ~167, which is why the fused form should
+// keep copying and why nothing was ever wired to this seam before.
+//
+// The terms below the first line are real but not additive in microseconds here; they are the reason
+// m* is an UPPER bound on where the half starts to pay rather than a break-even, and they are
+// observable on the stream's own counters (gh1 no_miss/capt_free, miss_tally), not invented here.
+struct CpuLayerLegQuery {
+    int    misses      = 0;   // routes this layer would otherwise fetch
+    double copy_us     = 0.0; // one entry's transfer, as the pool measures it
+    double cpu_us      = -1.0; // one route on the CPU half (span, tier fill included)
+    double readback_us = kCpuReadbackUs;
+};
+
+struct CpuLayerLegVerdict {
+    CpuExpertLeg leg  = CpuExpertLeg::NoData;
+    double threshold  = -1.0; // m*; < 0 means "no crossing at this span"
+    double copy_us    = -1.0; // the layer's copy bill at this miss count
+    double cpu_us     = -1.0; // the layer's half bill at the same count
+    const char* why   = "no data";
+};
+
+[[nodiscard]] inline CpuLayerLegVerdict decide_cpu_layer_leg(const CpuLayerLegQuery& query) noexcept {
+    CpuLayerLegVerdict out;
+    if (query.misses <= 0 || !(query.copy_us > 0.0) || !(query.cpu_us > 0.0)) { return out; }
+    const double m = static_cast<double>(query.misses);
+    out.copy_us    = m * query.copy_us + (query.readback_us > 0.0 ? query.readback_us : 0.0);
+    out.cpu_us     = m * query.cpu_us;
+    if (query.cpu_us > query.copy_us && query.readback_us > 0.0) {
+        out.threshold = query.readback_us / (query.cpu_us - query.copy_us);
+    }
+    if (cpu_path_switch() == CpuPathSwitch::Off) {
+        out.leg = CpuExpertLeg::PoolCopy;
+        out.why = "policy off";
+        return out;
+    }
+    out.leg = out.cpu_us < out.copy_us ? CpuExpertLeg::CpuHalf : CpuExpertLeg::PoolCopy;
+    out.why = out.leg == CpuExpertLeg::CpuHalf ? "half cheaper than copy + read-back" : "copy cheaper";
+    return out;
 }
 
 // ---- decision 3: one layer's CPU share - the ratio, which is a RESULT ---------------------------
@@ -344,6 +412,7 @@ inline constexpr int    kCpuReprobeLayers    = 40;    // idle layers before one 
 
 struct CpuLayerQuery {
     int    routes              = 0; // distinct routes this layer would otherwise upload
+    int    tokens              = 1; // columns this layer verifies (decode: 1; a verify pass: T)
     double bytes_per_expert    = 0.0; // every run of the layer summed: one route's link traffic
     double flops_per_expert    = 0.0; // the CPU half's arithmetic for one route
     double link_gbps           = 0.0; // PolicyController::link_gbps (probed, never assumed)
@@ -378,6 +447,12 @@ struct CpuHalfRate {
     // would never run again. Re-probes (kCpuReprobeLayers) keep the estimate from going stale.
     double compute_us_per_expert = -1.0;
     double span_us_per_expert    = -1.0;
+    // Decision 4's two terms. `compute_us_per_token` is the arithmetic per token (what repeats for a
+    // batch) and `measured_tokens` is the column count it was measured at, so a rate measured at one
+    // shape is not silently reused as the price of another. Both stay -1 until a batch has actually
+    // run through the half.
+    double compute_us_per_token  = -1.0;
+    int    measured_tokens       = 0;
     double cpu_gflops            = kCpuGflopsCalibrated;
     int    last_count            = 0;  // the count the previous layer ran with (the ramp's anchor)
     int    idle_layers           = 0;  // layers since the CPU half last took a route (re-probe clock)
@@ -395,7 +470,7 @@ inline CpuHalfRate& cpu_half_rate() {
 // arithmetic, `compute_ms` the arithmetic alone. The compute rate is an EWMA; the span is the best
 // observed, and the printed GFLOPS figure is read off the compute rate so the calibration can be
 // checked against the benchmark's 778 rather than trusted.
-inline void note_cpu_half(int experts, double span_ms, double compute_ms,
+inline void note_cpu_half(int experts, int tokens, double span_ms, double compute_ms,
                           double flops_per_expert) noexcept {
     if (experts <= 0) { return; }
     auto& rate = cpu_half_rate();
@@ -408,10 +483,30 @@ inline void note_cpu_half(int experts, double span_ms, double compute_ms,
         rate.compute_us_per_expert = rate.compute_us_per_expert > 0.0
                                          ? rate.compute_us_per_expert + (per - rate.compute_us_per_expert) / 8.0
                                          : per;
+        // Decision 4: the same measurement read per TOKEN. A layer that verified T columns paid for T
+        // tokens of arithmetic, so dividing by T is what makes two shapes comparable; without it the
+        // measured per-route rate becomes the price of every shape (the bug decision 4 names).
+        if (tokens > 0) {
+            const double per_token = per / static_cast<double>(tokens);
+            rate.compute_us_per_token = rate.compute_us_per_token > 0.0
+                                            ? rate.compute_us_per_token + (per_token - rate.compute_us_per_token) / 8.0
+                                            : per_token;
+            rate.measured_tokens = tokens;
+        }
         if (flops_per_expert > 0.0) {
             rate.cpu_gflops = flops_per_expert / (rate.compute_us_per_expert * 1e-6) / 1e9;
         }
     }
+}
+
+// One route's price on the CPU half, for a caller that has no layer query to hand (decision 2's layer
+// form). The measured span when this box has one - it includes the tier fill, which a layer-level
+// comparison has to pay - and the recorded prior otherwise.
+[[nodiscard]] inline double cpu_route_us_estimate() noexcept {
+    const auto& rate = cpu_half_rate();
+    if (rate.span_us_per_expert > 0.0) { return rate.span_us_per_expert; }
+    const double ms = param_bus().get(kCpuMoeExpertRow);
+    return ms > 0.0 ? ms * 1000.0 : -1.0;
 }
 
 // Probe (default off, NINFER_CPU_PATH_FORCE=N): pin the ratio instead of letting the cost model
@@ -471,11 +566,21 @@ inline void note_cpu_half(int experts, double span_ms, double compute_ms,
     const double gpu_us  = query.upload_us_per_entry > 0.0
                                ? std::max(link_us, 3.0 * query.upload_us_per_entry)
                                : link_us + read_us;
-    // The compute side: measured rate when this box has one, the calibrated rate otherwise.
-    const double compute_us = rate.compute_us_per_expert > 0.0
-                                  ? rate.compute_us_per_expert
-                                  : query.flops_per_expert / (out.cpu_gflops * 1e9) * 1e6;
-    const double cpu_us     = compute_us + read_us;
+    // The compute side, priced for the shape this layer actually runs (decision 4). The tier read is
+    // paid once per expert and serves every token of the layer, the arithmetic repeats per token, so
+    // the read is charged per token as read/T while the compute is charged as T * per-token. Without
+    // the T the measured per-route scalar silently became the price of every shape - a rate fitted at
+    // decode would overprice a verify pass by T, and one fitted at a batch would underprice decode.
+    // At T == 1 this reduces to the whole-bill form (compute + read), which is what the decode path
+    // has always been priced with.
+    const double tokens   = static_cast<double>(std::max(1, query.tokens));
+    const double compute_us =
+        rate.compute_us_per_token > 0.0
+            ? tokens * rate.compute_us_per_token
+            : (rate.compute_us_per_expert > 0.0
+                   ? rate.compute_us_per_expert
+                   : query.flops_per_expert / (out.cpu_gflops * 1e9) * 1e6);
+    const double cpu_us     = compute_us + read_us / tokens;
     out.cost_gpu_us         = gpu_us;
     out.cost_cpu_us         = cpu_us;
     if (!(gpu_us > cpu_us)) {
@@ -556,6 +661,16 @@ struct CpuPathLedger {
     double last_cost_gpu_us     = -1.0;
     double last_cost_cpu_us     = -1.0;
     double last_budget_us       = -1.0;
+    // Decision 2's layer form: how often a layer was offered the choice and what it said, plus the
+    // crossing the model derived for the last layer's span.
+    std::uint64_t leg_answered  = 0;
+    std::uint64_t leg_cpu_half  = 0;
+    std::uint64_t leg_pool_copy = 0;
+    std::uint64_t leg_nodata    = 0;
+    int    last_leg_misses     = 0;
+    double last_leg_threshold  = -1.0;
+    double last_leg_copy_us    = -1.0;
+    double last_leg_cpu_us     = -1.0;
 
     void note_kv(CpuKvSplitLeg leg, double copy_ms, double cpu_ms) noexcept {
         last_kv_copy_ms = copy_ms;
@@ -583,12 +698,26 @@ struct CpuPathLedger {
     void note_layer_routes(int routes) noexcept {
         if (routes > 0) { routes_seen += static_cast<std::uint64_t>(routes); }
     }
-    void note_layer_cpu(int experts, double span_ms, double compute_ms) noexcept {
+    void note_layer_cpu(int experts, int tokens, double span_ms, double compute_ms) noexcept {
         layer_cpu = static_cast<std::uint64_t>(experts < 0 ? 0 : experts);
         cpu_routes += layer_cpu;
         last_layer_cpu_ms = span_ms;
         if (layer_cpu != 0) {
-            note_cpu_half(experts, span_ms, compute_ms, last_flops_per_expert);
+            note_cpu_half(experts, tokens, span_ms, compute_ms, last_flops_per_expert);
+        }
+    }
+    // Decision 2's layer form. Counted beside the per-expert counters rather than replacing them:
+    // the per-expert line says what one route compares like, this one says what the layer costs once
+    // the read-back is in it, and the two disagreeing is the finding, not a bug.
+    void note_layer_leg(const CpuLayerLegVerdict& verdict, int misses) noexcept {
+        last_leg_misses    = misses;
+        last_leg_threshold = verdict.threshold;
+        last_leg_copy_us   = verdict.copy_us;
+        last_leg_cpu_us    = verdict.cpu_us;
+        switch (verdict.leg) {
+        case CpuExpertLeg::CpuHalf: ++leg_answered; ++leg_cpu_half; return;
+        case CpuExpertLeg::PoolCopy: ++leg_answered; ++leg_pool_copy; return;
+        case CpuExpertLeg::NoData: ++leg_nodata; return;
         }
     }
     // The cost model's own two sides for the decision in force, set where it was taken.
@@ -616,7 +745,7 @@ struct CpuPathLedger {
         } else {
             std::fprintf(stderr, "; no est)");
         }
-        std::fprintf(stderr, " | expert: cpu-half=%llu/%llu (pool-copy=%llu nodata=%llu",
+        std::fprintf(stderr, " | expert (superseded by the leg line): cpu-half=%llu/%llu (pool-copy=%llu nodata=%llu",
                      static_cast<unsigned long long>(expert_cpu_half),
                      static_cast<unsigned long long>(expert_answered),
                      static_cast<unsigned long long>(expert_pool_copy),
@@ -648,6 +777,20 @@ struct CpuPathLedger {
                          : cpu_half_rate().span_us_per_expert,
                      cpu_half_rate().cpu_gflops, last_cost_gpu_us, last_cost_cpu_us,
                      last_budget_us);
+        // Decision 2's layer form, printed next to the per-expert line on purpose: the two disagree
+        // whenever the read-back matters, and that disagreement is the whole reason the layer form
+        // exists. `m*` is the miss count at which the half starts to pay at this span; -1 means the
+        // span is under the transfer and there is no crossing at any count.
+        std::fprintf(stderr,
+                     "[ctl] cpu leg: layer-level=%llu/%llu (half=%llu copy=%llu nodata=%llu) | "
+                     "last m=%d m*=%.1f t=%d | copy=%.0f us half=%.0f us (readback %.0f us)\n",
+                     static_cast<unsigned long long>(leg_cpu_half),
+                     static_cast<unsigned long long>(leg_answered),
+                     static_cast<unsigned long long>(leg_cpu_half),
+                     static_cast<unsigned long long>(leg_pool_copy),
+                     static_cast<unsigned long long>(leg_nodata), last_leg_misses,
+                     last_leg_threshold, cpu_half_rate().measured_tokens, last_leg_copy_us,
+                     last_leg_cpu_us, kCpuReadbackUs);
         std::fflush(stderr);
     }
 };
