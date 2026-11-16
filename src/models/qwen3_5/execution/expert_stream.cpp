@@ -859,9 +859,14 @@ std::uint64_t prefetch_window() {
 // Defined with the prediction ring below; declared here because stage_predicted() asks whether the
 // `prev` signal owns this hand-off (it does, and stage_history() already offered the read).
 bool history_signal_switched();
-// The mode in which a prediction region is actually staged. Read here as well as in stage_predicted()
-// because the offer of a read is only worth making on a path that will place the bytes: a read-ahead
-// into a region nothing stages is pure I/O.
+// The form in which a prediction region is actually staged. Read here as well as in
+// stage_predicted() because the offer of a read is only worth making on a path that will place the
+// bytes: a read-ahead into a region nothing stages is pure I/O.
+enum class PrefetchForm { Vram, Fill, Warm };
+PrefetchForm prefetch_region_form();
+const char* prefetch_form_name(PrefetchForm form);
+const char* prefetch_region_mode_text();
+bool prefetch_region_form_defaulted();
 bool prefetch_vram_mode();
 } // namespace
 
@@ -1310,10 +1315,17 @@ void ExpertStream::gh1_report(cudaStream_t stream) {
     // "the region never hits" on runs where it was never even asked. It now counts the routes the hit
     // loop examined (`prefetch_route_samples_`), which is the same population as the numerator.
     if (cache_ != nullptr && cache_->prefetch_slots_per_bank() != 0) {
+        // The form belongs on this line: `hits=0` means "the region never held the route" only when
+        // something stages into it. With no form (explicit fill/warm) the zero is a property of the
+        // switch, and saying so here is what keeps the reading from blaming the caller.
+        const auto form = prefetch_region_form();
         std::fprintf(stderr,
-                     "[pf-region] %u slot(s)/bank | hits=%llu calls=%llu (%.1f%%) | routes examined, "
+                     "[pf-region] %u slot(s)/bank | form=%s%s staged=%d | hits=%llu calls=%llu "
+                     "(%.1f%%) | routes examined, "
                      "all runs must hold the expert in a region slot\n",
-                     cache_->prefetch_slots_per_bank(),
+                     cache_->prefetch_slots_per_bank(), prefetch_form_name(form),
+                     prefetch_region_form_defaulted() ? "(default)" : "(explicit)",
+                     form == PrefetchForm::Vram ? 1 : 0,
                      static_cast<unsigned long long>(prefetch_hits_),
                      static_cast<unsigned long long>(prefetch_route_samples_),
                      prefetch_route_samples_ != 0
@@ -1564,7 +1576,8 @@ PrefetchPlan ExpertStream::prefetch_plan() const {
 }
 
 void ExpertStream::stage_predicted(cudaStream_t stream) {
-    const bool vram = prefetch_vram_mode();
+    const PrefetchForm form = prefetch_region_form();
+    const bool vram         = form == PrefetchForm::Vram;
     // One line for the first few calls, whatever the reason: "no placement happened" and "the region
     // is off" look identical in the counters, and that ambiguity already cost a measurement round.
     static std::uint64_t calls = 0;
@@ -1591,7 +1604,25 @@ void ExpertStream::stage_predicted(cudaStream_t stream) {
                      cache_ != nullptr ? cache_->prefetch_slots_per_bank() : 0U);
         std::fflush(stderr);
     };
-    if (!vram) { say("mode is not vram"); return; }
+    if (!vram) {
+        // Armed but no staging form. This branch used to be timing-gated only, so outside
+        // NINFER_EXPERT_TIMING the run said nothing here and `[pf-region] hits=0` carried the whole
+        // verdict - which reads as "no caller" when the truth is "no form". One line, rate-limited,
+        // names the switch that is missing and what the counters will look like without it.
+        static std::uint64_t form_said = 0;
+        if (++form_said <= 3) {
+            std::fprintf(stderr,
+                         "[pf-ctl] region armed=%u slot(s)/bank but form=none "
+                         "(NINFER_PREFETCH_MODE=%s -> %s): the region stages only in vram, so nothing "
+                         "is placed and [pf-region] hits stay 0 by construction. Set "
+                         "NINFER_PREFETCH_MODE=vram to give the armed region a form.\n",
+                         cache_ != nullptr ? cache_->prefetch_slots_per_bank() : 0U,
+                         prefetch_region_mode_text(), prefetch_form_name(form));
+            std::fflush(stderr);
+        }
+        say("form is not vram");
+        return;
+    }
     if (cache_ == nullptr) { say("no cache"); return; }
 
     // S3: the two forms of the same hand-off.
@@ -1641,14 +1672,17 @@ void ExpertStream::stage_predicted(cudaStream_t stream) {
         const auto& port = prefetch_signals();
         if (pf_ctl_reports_++ % 64 == 0) {
             std::fprintf(stderr,
-                         "[pf-ctl] cutoff=%d armed=%s slots=%d reason=%s | cold=%.1f%% hit=%.1f%% "
-                         "cpu=%.1f%% delta=%d layer(s)=%d ring=%d top_k=%d region=%u/bank\n",
+                         "[pf-ctl] cutoff=%d armed=%s slots=%d reason=%s | form=%s%s "
+                         "armed_by=%s region=%u/bank | cold=%.1f%% hit=%.1f%% "
+                         "cpu=%.1f%% delta=%d layer(s)=%d ring=%d top_k=%d\n",
                          plan.cutoff, plan.armed ? "Y" : "N", plan.slots_per_bank, plan.why,
+                         prefetch_form_name(form),
+                         prefetch_region_form_defaulted() ? "(default)" : "(explicit)",
+                         std::getenv("NINFER_PREFETCH_SLOTS") != nullptr ? "env" : "controller",
                          port.cold_share >= 0.0 ? 100.0 * port.cold_share : -1.0,
                          port.hit_rate >= 0.0 ? 100.0 * port.hit_rate : -1.0,
                          port.cpu_share >= 0.0 ? 100.0 * port.cpu_share : -1.0,
-                         plan.delta_per_layer, port.layers, port.ring_depth, port.top_k,
-                         cache_->prefetch_slots_per_bank());
+                         plan.delta_per_layer, port.layers, port.ring_depth, port.top_k);
             std::fflush(stderr);
         }
         if (!plan.armed) {
@@ -1824,15 +1858,56 @@ bool pred_ring_switched() {
     }();
     return value;
 }
-// The mode in which the region is staged: NINFER_PREFETCH_MODE=vram. Everything else (including the
-// default) leaves stage_predicted() a no-op, so no read is worth offering.
-bool prefetch_vram_mode() {
-    static const bool value = [] {
+// The prediction region's FORM. One variable used to answer two different questions - which stripe a
+// demand fill lands in (fill / warm) and whether the region stages at all (vram) - and "unset" meant
+// "fill" to the fill path and "no staging" here. That is how `NINFER_PREFETCH_SLOTS=16` carved 16
+// slot(s)/bank, staged nothing, and printed `[pf-region] hits=0 calls=640 (0.0%)`: a reading that
+// blames the caller for a missing form.
+//
+// The merge: the region's EXISTENCE is the decision (the controller's slots, or the experiment
+// override that sets them), the mode only selects the form, and the form defaults to vram because it
+// is the only one the region stages in. An explicit fill/warm says the DEMAND path wants that stripe
+// and leaves the region alone - which stage_predicted() now states on its own line instead of
+// skipping under a counter that reads as zero.
+const char* prefetch_form_name(PrefetchForm form) {
+    switch (form) {
+        case PrefetchForm::Vram: return "vram";
+        case PrefetchForm::Warm: return "warm";
+        case PrefetchForm::Fill: return "fill";
+    }
+    return "fill";
+}
+
+// The raw spelling, for the diagnostic: which value is actually in the environment is the half of the
+// answer a reader cannot infer from a resolved form.
+const char* prefetch_region_mode_text() {
+    const char* v = std::getenv("NINFER_PREFETCH_MODE");
+    return v == nullptr || *v == '\0' ? "unset" : v;
+}
+
+bool prefetch_region_form_defaulted() {
+    const char* v = std::getenv("NINFER_PREFETCH_MODE");
+    return v == nullptr || *v == '\0';
+}
+
+PrefetchForm prefetch_region_form() {
+    static const PrefetchForm value = [] {
         const char* v = std::getenv("NINFER_PREFETCH_MODE");
-        return v != nullptr && std::strcmp(v, "vram") == 0;
+        if (v == nullptr || *v == '\0') { return PrefetchForm::Vram; } // default: the region's only form
+        if (std::strcmp(v, "vram") == 0) { return PrefetchForm::Vram; }
+        if (std::strcmp(v, "warm") == 0) { return PrefetchForm::Warm; }
+        if (std::strcmp(v, "fill") == 0) { return PrefetchForm::Fill; }
+        // The numeric spellings param_bus documents (0=fill 1=warm 2=vram), so the two readers of the
+        // same variable cannot disagree about what "2" means.
+        const double numeric = std::strtod(v, nullptr);
+        if (numeric == 2.0) { return PrefetchForm::Vram; }
+        if (numeric == 1.0) { return PrefetchForm::Warm; }
+        return PrefetchForm::Fill;
     }();
     return value;
 }
+
+bool prefetch_vram_mode() { return prefetch_region_form() == PrefetchForm::Vram; }
 // P2: the signal source. `residual` is the default and the only one that needs a kernel; `prev` is
 // this layer's own routes from the previous step, which the host already holds. `mtp` has no source on
 // this artifact (see predict_next_layer in ffn.cpp) and parses here only so the two sites agree on the
