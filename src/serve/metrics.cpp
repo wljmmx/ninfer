@@ -193,6 +193,8 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
             "(appendix IE, criterion 5).");
     COUNTER(snapshot_restores, "snapshot_restores_total",
             "Restores from complete paused snapshots.");
+    COUNTER(direct_restores, "direct_restores_total",
+            "Restores with no committed history to rebuild (paused before the first unit).");
     COUNTER(replay_restores, "replay_restores_total", "Recovery operations that rebuild history.");
     COUNTER(root_selections, "root_selections_total", "Initial bindings without checkpoint reuse.");
     COUNTER(checkpoint_selections, "checkpoint_selections_total",

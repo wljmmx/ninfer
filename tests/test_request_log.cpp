@@ -435,6 +435,7 @@ int main() {
         check(done.at("generation").at("engine_request_id") == 991 &&
                   done.at("generation").at("scheduling") == Json{{"preemptions", 3},
                                                                  {"snapshot_restores", 1},
+                                                                 {"direct_restores", 0},
                                                                  {"replay_restores", 2},
                                                                  {"replayed_tokens", 640},
                                                                  {"paused_ns", 123456789012345ULL},
@@ -812,6 +813,7 @@ int main() {
                       "context scheduler gauges missing");
     failures += check(throughput_json.at("scheduling") == Json{{"preemptions", 3},
                                                                {"snapshot_restores", 1},
+                                                               {"direct_restores", 0},
                                                                {"replay_restores", 2},
                                                                {"replayed_tokens", 768}},
                       "scheduling counters were not reported as interval deltas");

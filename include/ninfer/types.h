@@ -820,7 +820,21 @@ enum class GenerationSchedulingTransition : std::uint8_t {
     Terminal,
 };
 
-enum class GenerationRecoveryRoute : std::uint8_t { None, Snapshot, Replay };
+enum class GenerationRecoveryRoute : std::uint8_t { None, Direct, Snapshot, Replay };
+
+// Session-owned mathematical frontiers for one restoration. A replay rebuilds
+// [begin_frontier, target_frontier); `frontier` advances only with completed work. Completing that
+// range does not release recovery protection: the first NEW unit must commit.
+//
+// Direct is the zero-history case: a request paused before its first committed unit has nothing to
+// rebuild, so it resumes into its saved lifecycle instead of entering Replay with an empty range -
+// a replay whose target equals its cursor can never complete, and that was the stall.
+struct RecoveryProgress {
+    GenerationRecoveryRoute route = GenerationRecoveryRoute::None;
+    std::uint32_t begin_frontier  = 0;
+    std::uint32_t frontier        = 0;
+    std::uint32_t target_frontier = 0;
+};
 
 // Sparse lifecycle observations captured by the Engine worker and delivered by wait() on the
 // consumer thread. Counter deltas between boundaries, less the request's own deltas, measure
@@ -930,6 +944,7 @@ struct GenerationSchedulingStats {
     std::uint64_t preemptions          = 0;
     std::uint64_t snapshot_restores    = 0;
     std::uint64_t replay_restores      = 0;
+    std::uint64_t direct_restores      = 0;
     std::uint64_t replayed_tokens      = 0;
     std::uint64_t paused_ns            = 0;
     std::uint64_t device_to_host_bytes = 0;
@@ -1208,6 +1223,8 @@ struct RuntimeStats {
     std::uint64_t preemptions               = 0;
     std::uint64_t snapshot_restores         = 0;
     std::uint64_t replay_restores           = 0;
+    // Restorations that had no committed history to rebuild (paused before the first unit).
+    std::uint64_t direct_restores = 0;
     std::uint64_t replayed_tokens           = 0;
     // appendix HX (plan item 9b; the counter itself dates from appendix HJ plan item 4): the idle
     // trigger is a SEPARATE trigger from the capacity path, so it gets its own counters.

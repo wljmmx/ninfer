@@ -449,6 +449,8 @@ struct ReplayProgress {
     bool capture_ready             = false;
     std::uint32_t processed_tokens = 0;
     bool complete                  = false;
+    // The completed frontier after this step, so a caller can report how far the replay got.
+    std::uint32_t frontier = 0;
     runtime::ExecutionTiming timing;
 };
 
@@ -467,7 +469,8 @@ struct ContextProgress {
     bool published            = false;
     std::optional<SequenceHandle> sequence;
     std::optional<ResumeState> paused;
-    bool replaying = false;
+    // Which route restored this binding and the frontiers it must rebuild. `None` for a fresh bind.
+    RecoveryProgress recovery;
     std::vector<CheckpointHandle> private_points;
     std::vector<CheckpointHandle> retired_checkpoints;
     std::vector<CheckpointHandle> captured_checkpoints;

@@ -568,7 +568,11 @@ public:
         std::vector<CheckpointHandle> retired_points;
         std::shared_ptr<const RequestBasePlanImpl> base;
         ResumeState* resume  = nullptr;
-        bool resume_snapshot = false;
+        // The resumed reuse frontier already equals the saved one: nothing to rebuild, so the
+        // binding never enters Replay. True for a snapshot restore AND for a request paused before
+        // its first committed unit (frontier 0, no snapshot) - the latter used to enter Replay with
+        // an empty range and never complete.
+        bool resume_without_replay = false;
         std::optional<ResumeState> paused;
         std::optional<StateImageTransfer> state_transfer;
         std::vector<KVTransfer> kv_transfers;

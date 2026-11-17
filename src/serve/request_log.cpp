@@ -346,6 +346,7 @@ Json speculative_json(const GenerationMetrics& metrics) {
 Json scheduling_json(const ninfer::GenerationSchedulingStats& stats) {
     return Json{{"preemptions", stats.preemptions},
                 {"snapshot_restores", stats.snapshot_restores},
+                {"direct_restores", stats.direct_restores},
                 {"replay_restores", stats.replay_restores},
                 {"replayed_tokens", stats.replayed_tokens},
                 {"paused_ns", stats.paused_ns},
@@ -773,6 +774,7 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
         {"preemptions", monotonic_delta(previous.preemptions, current.preemptions)},
         {"snapshot_restores",
          monotonic_delta(previous.snapshot_restores, current.snapshot_restores)},
+        {"direct_restores", monotonic_delta(previous.direct_restores, current.direct_restores)},
         {"replay_restores", monotonic_delta(previous.replay_restores, current.replay_restores)},
         {"replayed_tokens", monotonic_delta(previous.replayed_tokens, current.replayed_tokens)}};
     record["decode_batch"] = Json{{"rounds", report.decode_rounds},

@@ -121,7 +121,10 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
                                      : tier   ? tier->backend_frontier
                                               : 0;
     transaction.source_tail_hidden = source && checkpoint(*source).tail_hidden_valid;
-    transaction.resume_snapshot    = own_snapshot;
+    // Root at frontier zero already covers a request paused before its first chunk, and a snapshot
+    // restore covers the rest: in both cases the reuse frontier equals the saved one, so there is no
+    // missing committed history and Replay must not be entered. Only a shorter reuse frontier does.
+    transaction.resume_without_replay = resume && transaction.reuse_frontier == resume->frontier();
     transaction.retired_points.reserve(candidate.retired_points.size() + 1);
     const auto select_source = [&](const SourceCandidate& actual) {
         transaction.take_private   = candidate.take_private;
@@ -193,7 +196,7 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
     if (!resume) {
         first = prefill_unit(base.summary().prompt_tokens, transaction.reuse_frontier,
                              initial_mtp_extent(*base.impl_));
-    } else if (!own_snapshot) {
+    } else if (!transaction.resume_without_replay) {
         first                  = {.kind = ExecutionUnitKind::Replay,
                                   .main_frontier =
                                       std::min(transaction.reuse_frontier + prefill_chunk, resume->frontier())};
@@ -476,7 +479,10 @@ void ProgramImpl::install_binding(ContextTransaction& tx) {
         state.state           = binding;
         state.lane            = tx.lane;
         state.mtp_draft_count = 0;
-        if (!tx.resume_snapshot) {
+        if (!tx.resume_without_replay) {
+            if (tx.reuse_frontier >= saved.frontier) {
+                throw std::logic_error("replay binding has no missing committed history");
+            }
             request.resume_lifecycle      = request.lifecycle;
             request.lifecycle             = Lifecycle::Replaying;
             request.replay_target         = saved.frontier;
@@ -595,6 +601,18 @@ void ProgramImpl::prepare_binding(ContextTransaction& tx) {
 }
 
 void ProgramImpl::complete_binding(ContextTransaction& tx, ContextProgress& out) {
+    // The route is decided by the binding plan, before any state moves: a snapshot restore and a
+    // zero-history resume both skip replay, and only the source tells them apart.
+    if (tx.resume) {
+        out.recovery = {
+            .route = !tx.resume_without_replay ? GenerationRecoveryRoute::Replay
+                     : tx.source               ? GenerationRecoveryRoute::Snapshot
+                                               : GenerationRecoveryRoute::Direct,
+            .begin_frontier  = tx.reuse_frontier,
+            .frontier        = tx.reuse_frontier,
+            .target_frontier = tx.resume->frontier(),
+        };
+    }
     // All allocating request installation happens before the irreversible ownership handoff.
     sequences[tx.lane].kv = tx.binding_history;
     install_binding(tx);
@@ -710,7 +728,6 @@ void ProgramImpl::complete_binding(ContextTransaction& tx, ContextProgress& out)
     out.private_points      = std::move(tx.carried_points);
     out.retired_checkpoints = std::move(tx.retired_points);
     out.sequence            = sequence_handle(tx.lane);
-    out.replaying           = requests[tx.lane].lifecycle == Lifecycle::Replaying;
 }
 
 } // namespace ninfer::models::qwen3_5::detail

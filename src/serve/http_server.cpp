@@ -77,6 +77,7 @@ bool report_has_activity(const ThroughputReport& report) {
            // suppressed in exactly the case the guard acted.
            report.current.idle_reclaims_deferred != report.previous.idle_reclaims_deferred ||
            report.current.snapshot_restores != report.previous.snapshot_restores ||
+           report.current.direct_restores != report.previous.direct_restores ||
            report.current.replay_restores != report.previous.replay_restores ||
            report.current.replayed_tokens != report.previous.replayed_tokens ||
            report.current.root_selections != report.previous.root_selections ||

@@ -99,6 +99,7 @@ Json runtime_json(const RuntimeStats& stats, const ServiceSnapshot& service) {
                 {"active_captures_aborted", stats.active_captures_aborted},
                 {"preemptions", stats.preemptions},
                 {"snapshot_restores", stats.snapshot_restores},
+                {"direct_restores", stats.direct_restores},
                 {"replay_restores", stats.replay_restores},
                 {"replayed_tokens", stats.replayed_tokens},
                 {"idle_reclaims", stats.idle_reclaims},

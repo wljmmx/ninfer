@@ -153,7 +153,8 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
         if (request.replay_cursor == request.replay_target && !bridge_mtp) {
             complete_replay();
             settle_unit(lane);
-            return ReplayProgress{.complete = true, .timing = timing.finish()};
+                return ReplayProgress{.complete = true, .frontier = sequence.mtp_kv_valid,
+                                      .timing = timing.finish()};
         }
         const UnitDemand permit = *request.permit;
         if (permit.main_frontier < request.replay_cursor ||
@@ -301,7 +302,8 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
                 work.reset();
                 complete_replay();
                 settle_unit(lane);
-                return ReplayProgress{.complete = true, .timing = timing.finish()};
+            return ReplayProgress{.complete = true, .frontier = request.replay_cursor,
+                                  .timing = timing.finish()};
             }
         }
 
@@ -355,6 +357,7 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
         return ReplayProgress{.capture_ready    = capture_ready,
                               .processed_tokens = result.processed_tokens,
                               .complete         = complete,
+                              .frontier         = end,
                               .timing           = timing.finish()};
     } catch (...) {
         timing.begin_wait();

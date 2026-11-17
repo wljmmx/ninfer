@@ -208,6 +208,9 @@ struct RequestRecord {
     std::uint64_t preemption_count         = 0;
     std::uint64_t replay_restores          = 0;
     std::uint64_t snapshot_restores        = 0;
+    std::uint64_t direct_restores          = 0;
+    // Which route restored this request and how far its rebuild has got. None before any resume.
+    RecoveryProgress recovery;
     std::uint64_t replayed_tokens          = 0;
     std::uint64_t paused_ns                = 0;
     std::optional<Clock::time_point> paused_at;

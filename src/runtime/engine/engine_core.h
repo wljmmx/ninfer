@@ -2203,13 +2203,20 @@ private:
             if (!request->sequence) {
                 throw std::logic_error("binding completed without a native sequence");
             }
-            request->model_state = progress.replaying ? EngineRequestState::Replay
-                                   : control.resumed  ? request->resume_phase
-                                                      : EngineRequestState::Prefill;
+            request->model_state = progress.recovery.route == GenerationRecoveryRoute::Replay
+                                   ? EngineRequestState::Replay
+                               : control.resumed ? request->resume_phase
+                                                 : EngineRequestState::Prefill;
             if (control.resumed) {
-                if (!progress.replaying) {
+                // Report the route the session actually took. Direct (no committed history) and
+                // Snapshot are both non-replay restorations, and they used to be counted as one.
+                request->recovery = progress.recovery;
+                if (progress.recovery.route == GenerationRecoveryRoute::Snapshot) {
                     ++cumulative_stats_.snapshot_restores;
                     ++request->snapshot_restores;
+                } else if (progress.recovery.route == GenerationRecoveryRoute::Direct) {
+                    ++cumulative_stats_.direct_restores;
+                    ++request->direct_restores;
                 }
                 request->suspended.reset();
                 request->recovery_pending = instance_.program->recovery_pending(*request->sequence);
@@ -3623,6 +3630,9 @@ private:
                         }
                         request->replayed_tokens += progress.processed_tokens;
                         cumulative_stats_.replayed_tokens += progress.processed_tokens;
+                        // The frontier advances only with completed work, and it is what a monitor
+                        // reports as "how far the rebuild has got".
+                        request->recovery.frontier = progress.frontier;
                         if (progress.capture_ready) {
                             reserve_active_capture(request, EngineRequestState::Replay);
                         }
