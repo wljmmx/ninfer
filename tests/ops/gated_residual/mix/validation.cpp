@@ -1,5 +1,6 @@
 #include "oracle.h"
 #include <array>
+#include "core/transfer.h"
 
 namespace ninfer::test::hc::mix {
 namespace {
@@ -146,8 +147,9 @@ int validate(Weights& w, std::span<const Column> ref, DeviceExecutionView e) {
     WorkspaceArena nested(DeviceSpan{nested_storage.data(), nested_storage.bytes()});
     const auto prefix = nested.alloc_bytes(prefix_bytes, 256);
     std::vector<std::uint16_t> prefix_words(prefix_bytes / 2, 0x4261);
-    cuda_check(cudaMemcpyAsync(prefix.data, prefix_words.data(), prefix_bytes,
-                               cudaMemcpyHostToDevice, e.stream),
+    cuda_check(ninfer::core::copy_bytes_status(prefix.data, prefix_words.data(), prefix_bytes,
+                                               ninfer::core::TransferDirection::HostToDevice,
+                                               e.stream),
                "Mix enclosing allocation");
     if (w.kind == Kind::Block)
         ops::hc_mix(f.z, ops::HcMixWeights{w.down, w.up}, nested, f.x, f.j, e);

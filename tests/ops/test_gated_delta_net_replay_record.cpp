@@ -1,6 +1,7 @@
 #include "ninfer/ops/gated_delta_net.h"
 
 #include "core/device.h"
+#include "core/transfer.h"
 #include "ops/linear_attention/gated_delta_net/launch.h"
 
 #include "ops/op_tester.h"
@@ -178,12 +179,12 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
         CUDA_CHECK(cudaGraphLaunch(executable, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         for (auto& bits : q_bits) bits ^= 0x8000U;
-        CUDA_CHECK(cudaMemcpyAsync(device_q.p, q_bits.data(), device_q.bytes,
-                                   cudaMemcpyHostToDevice, stream));
+        ninfer::core::copy_bytes(device_q.p, q_bits.data(), device_q.bytes,
+                                 ninfer::core::TransferDirection::HostToDevice, stream);
         if (!dense) {
             for (auto& count : valid_columns) count = 1 + count % width;
-            CUDA_CHECK(cudaMemcpyAsync(device_valid.p, valid_columns.data(), device_valid.bytes,
-                                       cudaMemcpyHostToDevice, stream));
+            ninfer::core::copy_bytes(device_valid.p, valid_columns.data(), device_valid.bytes,
+                                     ninfer::core::TransferDirection::HostToDevice, stream);
         }
         CUDA_CHECK(cudaMemsetAsync(key_record.p, 0xff, key_record.bytes, stream));
         CUDA_CHECK(cudaMemsetAsync(value_record.p, 0xff, value_record.bytes, stream));

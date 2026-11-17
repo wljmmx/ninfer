@@ -1,6 +1,7 @@
 #include "core/device.h"
 #include "core/host_kv_arena.h"
 #include "core/paged_kv_cache.h"
+#include "core/transfer.h"
 
 #include <cuda_runtime.h>
 
@@ -93,7 +94,8 @@ fill_device_pool(ninfer::DeviceKVPagePool& pool, cudaStream_t stream, unsigned c
                                            0xffU);
         }
         const cudaError_t err =
-            cudaMemcpyAsync(plane.data, host.data(), host.size(), cudaMemcpyHostToDevice, stream);
+            ninfer::core::copy_bytes_status(plane.data, host.data(), host.size(),
+                                            ninfer::core::TransferDirection::HostToDevice, stream);
         if (err != cudaSuccess) {
             throw std::runtime_error(std::string("device pool fill failed: ") +
                                      cudaGetErrorString(err));
@@ -411,8 +413,8 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
             const auto& plane = destination.plane(index);
             auto& observed    = observed_device[index];
             observed.resize(plane.bytes());
-            CUDA_CHECK(cudaMemcpyAsync(observed.data(), plane.data, observed.size(),
-                                       cudaMemcpyDeviceToHost, context.stream));
+            ninfer::core::copy_bytes(observed.data(), plane.data, observed.size(),
+                                     ninfer::core::TransferDirection::DeviceToHost, context.stream);
         }
         context.synchronize();
 

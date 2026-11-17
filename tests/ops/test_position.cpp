@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "core/transfer.h"
 #include "ninfer/ops/position.h"
 #include "ops/op_tester.h"
 
@@ -110,8 +111,10 @@ int lane_offset_case(int width, int batch, int axes, bool in_place) {
         CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
         for (int replay = 0; replay < 2; ++replay) {
             for (auto& value : delta) value += 7;
-            CUDA_CHECK(cudaMemcpyAsync(input.data(), source.data(), input.bytes(), cudaMemcpyHostToDevice, stream));
-            CUDA_CHECK(cudaMemcpyAsync(offsets.data(), delta.data(), offsets.bytes(), cudaMemcpyHostToDevice, stream));
+            ninfer::core::copy_bytes(input.data(), source.data(), input.bytes(),
+                                     ninfer::core::TransferDirection::HostToDevice, stream);
+            ninfer::core::copy_bytes(offsets.data(), delta.data(), offsets.bytes(),
+                                     ninfer::core::TransferDirection::HostToDevice, stream);
             CUDA_CHECK(cudaGraphLaunch(executable, stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
         }

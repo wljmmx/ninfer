@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "core/transfer.h"
 #include "models/qwen3_5/program/storage/host_kv_store.h"
 #include "models/qwen3_5/program/storage/kv_address_space.h"
 #include "models/qwen3_5/program/storage/state_store.h"
@@ -124,8 +125,8 @@ void test_state_store(ninfer::DeviceContext& device) {
         const auto source_slot = images.physical_slot(*shared);
         const std::array<std::uint16_t, 8> content{1, 3, 5, 7, 9, 11, 13, 15};
         const auto hidden = physical.continuation_hidden_slot(source_slot);
-        CUDA_CHECK(cudaMemcpyAsync(hidden.data, content.data(), sizeof(content),
-                                   cudaMemcpyHostToDevice, device.stream));
+        ninfer::core::copy_bytes(hidden.data, content.data(), sizeof(content),
+                                 ninfer::core::TransferDirection::HostToDevice, device.stream);
         images.freeze(*shared);
         images.retain_checkpoint_reference(*shared); // Cache checkpoint.
         images.retain_checkpoint_reference(*shared); // Paused request snapshot.
@@ -147,8 +148,8 @@ void test_state_store(ninfer::DeviceContext& device) {
         std::array<std::uint16_t, 8> observed{};
         const auto last_hidden =
             physical.continuation_hidden_slot(images.physical_slot(*last_reader));
-        CUDA_CHECK(cudaMemcpyAsync(observed.data(), last_hidden.data, sizeof(observed),
-                                   cudaMemcpyDeviceToHost, device.stream));
+        ninfer::core::copy_bytes(observed.data(), last_hidden.data, sizeof(observed),
+                                 ninfer::core::TransferDirection::DeviceToHost, device.stream);
         device.synchronize();
         expect(observed == content, "remaining State reader retains the exact source content");
         if (cancel_last_reader) {
@@ -1078,7 +1079,8 @@ std::vector<std::vector<unsigned char>> fill_device_pool(ninfer::DeviceKVPagePoo
                 static_cast<unsigned char>((index * 29U + plane_index * 61U + 17U) & 0xffU);
         }
         const cudaError_t err =
-            cudaMemcpyAsync(plane.data, host.data(), host.size(), cudaMemcpyHostToDevice, stream);
+            ninfer::core::copy_bytes_status(plane.data, host.data(), host.size(),
+                                            ninfer::core::TransferDirection::HostToDevice, stream);
         if (err != cudaSuccess) {
             throw std::runtime_error(std::string("device pool fill failed: ") +
                                      cudaGetErrorString(err));

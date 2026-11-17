@@ -1,5 +1,6 @@
 #include "sparse_gqa_fixture.h"
 #include "core/decode_graph.h"
+#include "core/transfer.h"
 #include "ops/softmax_attention/qsa/storage.h"
 
 #include <cstdio>
@@ -201,7 +202,8 @@ int read_footprint(DeviceContext& device, KvCacheStorage storage = KvCacheStorag
     f.selected.block_ids.data    = ids.p;
     f.selected.block_counts.data = counts.p;
     const auto copy              = [&](void* dst, const void* src, std::size_t n) {
-        CUDA_CHECK(cudaMemcpyAsync(dst, src, n, cudaMemcpyHostToDevice, device.stream));
+        ninfer::core::copy_bytes(dst, src, n, ninfer::core::TransferDirection::HostToDevice,
+                                 device.stream);
     };
     for (int b = 0; b < f.B; ++b)
         for (int t = 0; t < f.valid[b]; ++t) {

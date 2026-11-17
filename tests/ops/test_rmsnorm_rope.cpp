@@ -1,5 +1,6 @@
 #include "ninfer/ops/rmsnorm_rope.h"
 #include "core/decode_graph.h"
+#include "core/transfer.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -211,11 +212,13 @@ int run_pair_case(int width, int batch, int first_position, std::uint32_t seed,
                               static_cast<float>(kTheta), stream);
         },
         [&](cudaStream_t stream) {
-            cuda_check(cudaMemcpyAsync(q_device.data(), q_bits.data(), q_device.bytes(),
-                                       cudaMemcpyHostToDevice, stream),
+            cuda_check(ninfer::core::copy_bytes_status(
+                           q_device.data(), q_bits.data(), q_device.bytes(),
+                           ninfer::core::TransferDirection::HostToDevice, stream),
                        "reset q");
-            cuda_check(cudaMemcpyAsync(k_device.data(), k_bits.data(), k_device.bytes(),
-                                       cudaMemcpyHostToDevice, stream),
+            cuda_check(ninfer::core::copy_bytes_status(
+                           k_device.data(), k_bits.data(), k_device.bytes(),
+                           ninfer::core::TransferDirection::HostToDevice, stream),
                        "reset k");
         },
         graph);
@@ -263,8 +266,9 @@ int run_single_case(int tokens, int first_position, std::uint32_t seed, bool gra
                               static_cast<float>(kTheta), stream);
         },
         [&](cudaStream_t stream) {
-            cuda_check(cudaMemcpyAsync(input_device.data(), input_bits.data(), input_device.bytes(),
-                                       cudaMemcpyHostToDevice, stream),
+            cuda_check(ninfer::core::copy_bytes_status(
+                           input_device.data(), input_bits.data(), input_device.bytes(),
+                           ninfer::core::TransferDirection::HostToDevice, stream),
                        "reset K");
         },
         graph);

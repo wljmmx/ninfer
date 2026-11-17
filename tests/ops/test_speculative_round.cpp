@@ -2,6 +2,7 @@
 #include "ops/op_tester.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
+#include "core/transfer.h"
 #include <string_view>
 
 #include <algorithm>
@@ -64,7 +65,8 @@ int prepare_verify_case(int k, int batch) {
     int failures = 0;
     for (int phase = 0; phase <= k; ++phase) {
         for (int b = 0; b < batch; ++b) extents[b] = (phase + 3 * b) % width;
-        CUDA_CHECK(cudaMemcpyAsync(d_extents.p, extents.data(), d_extents.bytes, cudaMemcpyHostToDevice, context.stream));
+        ninfer::core::copy_bytes(d_extents.p, extents.data(), d_extents.bytes,
+                                 ninfer::core::TransferDirection::HostToDevice, context.stream);
         if (graph.ready()) graph.launch(context.stream); else launch();
         context.synchronize();
         std::vector<std::int32_t> expected_ids(width * batch), expected_positions(width * batch);
@@ -1208,7 +1210,8 @@ int batched_select_hidden_case(int width, int batch) {
             std::copy_n(hidden.begin() + static_cast<std::size_t>(b * width + selectors[b]) * rows,
                          rows, expected.begin() + b * rows);
         }
-        CUDA_CHECK(cudaMemcpyAsync(indices.p, selectors.data(), indices.bytes, cudaMemcpyHostToDevice, context.stream));
+        ninfer::core::copy_bytes(indices.p, selectors.data(), indices.bytes,
+                                 ninfer::core::TransferDirection::HostToDevice, context.stream);
         if (graph.ready()) graph.launch(context.stream); else launch();
         context.synchronize();
         failures += verify_exact("committed hidden N-1", read<std::uint16_t>(output, expected.size()), expected);

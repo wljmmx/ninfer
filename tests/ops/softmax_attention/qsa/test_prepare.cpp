@@ -1,5 +1,6 @@
 #include "prepare_fixture.h"
 #include "core/decode_graph.h"
+#include "core/transfer.h"
 
 #include <array>
 #include <bit>
@@ -490,17 +491,17 @@ int read_footprint(DeviceContext& device, KvCacheStorage storage = KvCacheStorag
                        &f.projected.index_query, &f.projected.index_key}) {
         const int width = view->ne[0] * (view == &f.projected.index_key ? 1 : view->ne[1]);
         inputs.emplace_back(view->bytes());
-        CUDA_CHECK(cudaMemcpyAsync(inputs.back().p, view->data, width * 2, cudaMemcpyDeviceToDevice,
-                                   device.stream));
+        ninfer::core::copy_bytes(inputs.back().p, view->data, width * 2,
+                                 ninfer::core::TransferDirection::DeviceToDevice, device.stream);
         view->data = inputs.back().p;
     }
     DeviceBuffer pos(f.positions.view.bytes()), rope(f.rope.view.bytes());
-    CUDA_CHECK(
-        cudaMemcpyAsync(pos.p, f.positions.view.data, 4, cudaMemcpyDeviceToDevice, device.stream));
+    ninfer::core::copy_bytes(pos.p, f.positions.view.data, 4,
+                             ninfer::core::TransferDirection::DeviceToDevice, device.stream);
     for (int a = 0; a < 3; ++a)
-        CUDA_CHECK(cudaMemcpyAsync(static_cast<int*>(rope.p) + a * f.T,
-                                   static_cast<int*>(f.rope.view.data) + a * f.T, 4,
-                                   cudaMemcpyDeviceToDevice, device.stream));
+        ninfer::core::copy_bytes(static_cast<int*>(rope.p) + a * f.T,
+                                 static_cast<int*>(f.rope.view.data) + a * f.T, 4,
+                                 ninfer::core::TransferDirection::DeviceToDevice, device.stream);
     f.batch.positions.data = pos.p;
     auto saved             = f.rope.view;
     f.rope.view.data       = rope.p;

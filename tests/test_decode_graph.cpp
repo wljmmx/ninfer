@@ -1,6 +1,7 @@
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
+#include "core/transfer.h"
 
 #include <cuda_runtime.h>
 
@@ -36,8 +37,8 @@ int check_external_event(ninfer::DeviceContext& device) {
         definitions[i].capture(device.stream, [&] {
             CUDA_CHECK(
                 cudaMemsetAsync(storage.base(), i + 1, sizeof(std::uint32_t), device.stream));
-            CUDA_CHECK(cudaMemcpyAsync(host.data(), storage.base(), sizeof(std::uint32_t),
-                                       cudaMemcpyDeviceToHost, device.stream));
+            ninfer::core::copy_bytes(host.data(), storage.base(), sizeof(std::uint32_t),
+                                     ninfer::core::TransferDirection::DeviceToHost, device.stream);
             ready.record_external(device.stream);
             // The handoff exposes the prefix, even though later graph nodes overwrite the source.
             CUDA_CHECK(cudaMemsetAsync(storage.base(), 0xff, sizeof(std::uint32_t), device.stream));

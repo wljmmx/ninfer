@@ -1,5 +1,6 @@
 #include "core/weight.h"
 #include "core/device.h"
+#include "core/transfer.h"
 #include "ops/linear_add/linear_add_test_common.h"
 
 #include "ninfer/ops/linear_add.h"
@@ -380,11 +381,12 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
                     if (replay == 1) {
                         CUDA_CHECK(cudaMemsetAsync(input.data, 0, input.bytes(), stream));
                     } else {
-                        CUDA_CHECK(cudaMemcpyAsync(input.data, activation.data(), input.bytes(),
-                                                   cudaMemcpyHostToDevice, stream));
+                        ninfer::core::copy_bytes(input.data, activation.data(), input.bytes(),
+                                                 ninfer::core::TransferDirection::HostToDevice,
+                                                 stream);
                     }
-                    CUDA_CHECK(cudaMemcpyAsync(output.data(), residual.data(), output.bytes(),
-                                               cudaMemcpyHostToDevice, stream));
+                    ninfer::core::copy_bytes(output.data(), residual.data(), output.bytes(),
+                                             ninfer::core::TransferDirection::HostToDevice, stream);
                     CUDA_CHECK(cudaGraphLaunch(executable, stream));
                     CUDA_CHECK(cudaStreamSynchronize(stream));
                     if (replay != 1) { verify_result(); }

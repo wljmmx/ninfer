@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "core/transfer.h"
 #include "ninfer/ops/sparse_moe.h"
 
 #include "ops/op_tester.h"
@@ -554,8 +555,9 @@ public:
                        "create SparseMoe graph stream");
             cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
                        "begin SparseMoe graph capture");
-            cuda_check(cudaMemcpyAsync(destination.data, residual_seed.p, destination.bytes(),
-                                       cudaMemcpyDeviceToDevice, stream),
+            cuda_check(ninfer::core::copy_bytes_status(
+                           destination.data, residual_seed.p, destination.bytes(),
+                           ninfer::core::TransferDirection::DeviceToDevice, stream),
                        "capture SparseMoe residual seed");
             ops::sparse_moe(x, weights, ops::SparseMoeEpilogue::AddResidual, destination, workspace,
                             execution.on_stream(stream));

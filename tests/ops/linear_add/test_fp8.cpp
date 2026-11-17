@@ -1,6 +1,7 @@
 #include "core/weight.h"
 #include "ninfer/ops/linear_add.h"
 #include "core/device.h"
+#include "core/transfer.h"
 
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
@@ -164,11 +165,11 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
             for (auto& value : negative_activation) value ^= 0x8000;
             for (int replay = 0; replay < 2; ++replay) {
                 const auto& input = replay ? negative_activation : activation;
-                CUDA_CHECK(cudaMemcpyAsync(device_activation.data(), input.data(),
-                                           device_activation.bytes(), cudaMemcpyHostToDevice,
-                                           stream));
-                CUDA_CHECK(cudaMemcpyAsync(output.data(), initial_residual.data(), output.bytes(),
-                                           cudaMemcpyHostToDevice, stream));
+                ninfer::core::copy_bytes(device_activation.data(), input.data(),
+                                         device_activation.bytes(),
+                                         ninfer::core::TransferDirection::HostToDevice, stream);
+                ninfer::core::copy_bytes(output.data(), initial_residual.data(), output.bytes(),
+                                         ninfer::core::TransferDirection::HostToDevice, stream);
                 CUDA_CHECK(cudaGraphLaunch(executable, stream));
                 CUDA_CHECK(cudaStreamSynchronize(stream));
             }

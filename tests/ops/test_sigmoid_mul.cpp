@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "core/transfer.h"
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ops/op_tester.h"
 
@@ -63,8 +64,8 @@ int run_case(const char* label, std::int32_t rows, std::int32_t columns, std::ui
         CUDA_CHECK(cudaStreamEndCapture(stream, &captured));
         CUDA_CHECK(cudaGraphInstantiate(&executable, captured, nullptr, nullptr, 0));
         for (int replay = 0; replay < 2; ++replay) {
-            CUDA_CHECK(cudaMemcpyAsync(device_x.data(), x_bits.data(), device_x.bytes(),
-                cudaMemcpyHostToDevice, stream));
+            ninfer::core::copy_bytes(device_x.data(), x_bits.data(), device_x.bytes(),
+                                     ninfer::core::TransferDirection::HostToDevice, stream);
             CUDA_CHECK(cudaGraphLaunch(executable, stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
         }

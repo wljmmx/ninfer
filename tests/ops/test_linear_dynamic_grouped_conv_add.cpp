@@ -1,6 +1,7 @@
 #include "core/weight.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 #include "core/decode_graph.h"
+#include "core/transfer.h"
 
 #include "ops/input_projection_test_common.h"
 #include "ops/op_tester.h"
@@ -242,8 +243,9 @@ int run_profile(std::int32_t input_rows) {
                         definition.capture(stream, [&] { launch(stream); });
                         executable.instantiate(definition);
                         for (int iteration = 0; iteration < 2; ++iteration) {
-                            cuda_check(cudaMemcpyAsync(residual_device.data(), residual.data(),
-                                                       bytes, cudaMemcpyHostToDevice, stream),
+                            cuda_check(ninfer::core::copy_bytes_status(
+                                           residual_device.data(), residual.data(), bytes,
+                                           ninfer::core::TransferDirection::HostToDevice, stream),
                                        "reset graph residual");
                             executable.launch(stream);
                             cuda_check(cudaStreamSynchronize(stream), "graph synchronize");

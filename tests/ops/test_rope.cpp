@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "core/transfer.h"
 #include "ninfer/ops/rope.h"
 #include "ops/op_tester.h"
 
@@ -288,10 +289,10 @@ int run_pair_case(DeviceExecutionView execution, const Geometry& geometry, int q
         CUDA_CHECK(cudaStreamEndCapture(stream, &captured));
         CUDA_CHECK(cudaGraphInstantiate(&executable, captured, nullptr, nullptr, 0));
         for (int replay = 0; replay < 2; ++replay) {
-            CUDA_CHECK(cudaMemcpyAsync(q_device.data(), q_storage.data(), q_device.bytes(),
-                                       cudaMemcpyHostToDevice, stream));
-            CUDA_CHECK(cudaMemcpyAsync(k_device.data(), k_storage.data(), k_device.bytes(),
-                                       cudaMemcpyHostToDevice, stream));
+            ninfer::core::copy_bytes(q_device.data(), q_storage.data(), q_device.bytes(),
+                                     ninfer::core::TransferDirection::HostToDevice, stream);
+            ninfer::core::copy_bytes(k_device.data(), k_storage.data(), k_device.bytes(),
+                                     ninfer::core::TransferDirection::HostToDevice, stream);
             CUDA_CHECK(cudaGraphLaunch(executable, stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
         }

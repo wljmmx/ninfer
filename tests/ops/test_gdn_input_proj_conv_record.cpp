@@ -1,5 +1,6 @@
 #include "core/weight.h"
 #include "core/device.h"
+#include "core/transfer.h"
 #include "ninfer/ops/gdn_input_proj.h"
 
 #include "ops/input_projection_test_common.h"
@@ -186,9 +187,9 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
         CUDA_CHECK(cudaStreamSynchronize(stream));
         // The same graph must consume changed inputs at the captured addresses.
         activation_bits = bf16_bits(make_bf16_activation(hidden, aggregate_columns, seed + 19));
-        CUDA_CHECK(cudaMemcpyAsync(device_x.p, activation_bits.data(),
-                                   activation_bits.size() * sizeof(std::uint16_t),
-                                   cudaMemcpyHostToDevice, stream));
+        ninfer::core::copy_bytes(device_x.p, activation_bits.data(),
+                                 activation_bits.size() * sizeof(std::uint16_t),
+                                 ninfer::core::TransferDirection::HostToDevice, stream);
         CUDA_CHECK(cudaGraphLaunch(executable, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaGraphExecDestroy(executable));

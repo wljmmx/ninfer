@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "core/transfer.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/program/execution_context.h"
 #include "models/qwen3_5/program/program_impl.h"
@@ -185,9 +186,9 @@ void run(const char* artifact, SpeculativeBackend backend) {
         *program.dflash_host_ingress                            = {};
         program.dflash_host_ingress->state_destination_slots[0] = slot;
         program.dflash_host_ingress->dflash_kv_table_rows[0]    = row;
-        CUDA_CHECK(cudaMemcpyAsync(program.io.dflash_decode->ingress.data,
-                                   program.dflash_host_ingress, sizeof(qwen::DFlashDecodeIngress),
-                                   cudaMemcpyHostToDevice, device.stream));
+        ninfer::core::copy_bytes(program.io.dflash_decode->ingress.data,
+                                 program.dflash_host_ingress, sizeof(qwen::DFlashDecodeIngress),
+                                 ninfer::core::TransferDirection::HostToDevice, device.stream);
     };
     const auto prefill = [&](std::uint32_t nominal, std::optional<std::uint32_t> split = {}) {
         const auto result   = execution::prefill_text_chunk(context, tokens, nominal, split, false);

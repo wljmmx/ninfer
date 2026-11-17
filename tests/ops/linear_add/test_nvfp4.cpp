@@ -1,6 +1,7 @@
 #include "core/weight.h"
 #include "ninfer/ops/linear_add.h"
 #include "core/device.h"
+#include "core/transfer.h"
 
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
@@ -171,8 +172,8 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
             CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
             CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
             for (int replay = 0; replay < 2; ++replay) {
-                CUDA_CHECK(cudaMemcpyAsync(output.data(), initial_residual.data(), output.bytes(),
-                                           cudaMemcpyHostToDevice, stream));
+                ninfer::core::copy_bytes(output.data(), initial_residual.data(), output.bytes(),
+                                         ninfer::core::TransferDirection::HostToDevice, stream);
                 CUDA_CHECK(cudaGraphLaunch(executable, stream));
                 CUDA_CHECK(cudaStreamSynchronize(stream));
             }

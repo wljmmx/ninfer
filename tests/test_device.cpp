@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "core/transfer.h"
 
 #include <cuda_runtime.h>
 
@@ -97,8 +98,8 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMallocHost(&host_value, sizeof(int)));
     *host_value = 0;
     CUDA_CHECK(cudaMemsetAsync(device_value, 0x5a, sizeof(int), ctx.stream));
-    CUDA_CHECK(
-        cudaMemcpyAsync(host_value, device_value, sizeof(int), cudaMemcpyDeviceToHost, ctx.stream));
+    ninfer::core::copy_bytes(host_value, device_value, sizeof(int),
+                             ninfer::core::TransferDirection::DeviceToHost, ctx.stream);
     ctx.synchronize();
     const bool transfer_complete = *host_value == 0x5a5a5a5a;
     CUDA_CHECK(cudaFreeHost(host_value));

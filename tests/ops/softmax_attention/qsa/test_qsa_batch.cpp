@@ -17,6 +17,7 @@
 // agree byte for byte.
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/transfer.h"
 
 #include "ninfer/ops/qsa.h"
 #include "ops/softmax_attention/qsa/storage.h"
@@ -184,9 +185,10 @@ struct Harness {
         table_dev = DeviceBuffer(tables.size() * 4);
         ids_dev   = DeviceBuffer(ids.size() * 4);
         counts_dev = DeviceBuffer(counts.size() * 4);
-        const auto to_device = [&](DeviceBuffer& buffer, const auto& host) {
-            CUDA_CHECK(cudaMemcpyAsync(buffer.p, host.data(), host.size() * sizeof(host[0]),
-                                       cudaMemcpyHostToDevice, execution.stream));
+        const auto to_device   = [&](DeviceBuffer& buffer, const auto& host) {
+            ninfer::core::copy_bytes(buffer.p, host.data(), host.size() * sizeof(host[0]),
+                                     ninfer::core::TransferDirection::HostToDevice,
+                                     execution.stream);
         };
         to_device(keys, keys_host);
         to_device(values, values_host);

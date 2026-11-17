@@ -1,5 +1,6 @@
 #include "ninfer/ops/argmax.h"
 #include "core/device.h"
+#include "core/transfer.h"
 #include <algorithm>
 #include "ops/op_tester.h"
 
@@ -98,8 +99,8 @@ int run_case(std::int32_t physical_rows, std::int32_t valid_rows, std::int32_t t
         CUDA_CHECK(cudaStreamSynchronize(stream));
         for (int t = 0; t < tokens; ++t)
             logits[static_cast<std::size_t>(t) * physical_rows + valid_rows - 1] = f32_to_bf16(8192.0f);
-        CUDA_CHECK(cudaMemcpyAsync(device_logits.data(), logits.data(), device_logits.bytes(),
-            cudaMemcpyHostToDevice, stream));
+        ninfer::core::copy_bytes(device_logits.data(), logits.data(), device_logits.bytes(),
+                                 ninfer::core::TransferDirection::HostToDevice, stream);
         CUDA_CHECK(cudaGraphLaunch(executable, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaGraphExecDestroy(executable));

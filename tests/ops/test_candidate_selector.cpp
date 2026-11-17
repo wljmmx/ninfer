@@ -2,6 +2,7 @@
 
 #include "ops/op_tester.h"
 #include "core/decode_graph.h"
+#include "core/transfer.h"
 
 #include <algorithm>
 #include <array>
@@ -509,13 +510,15 @@ int run(bool ties = false, bool dependent = false) {
                         choose_configs(candidate_ids, lattice, next_positions);
                     const auto next_expected =
                         walk_oracle(candidate_ids, lattice, next_configs, next_positions);
-                    cuda_check(cudaMemcpyAsync(position_device.p, next_positions.data(),
-                                               next_positions.size() * sizeof(int),
-                                               cudaMemcpyHostToDevice, stream),
+                    cuda_check(ninfer::core::copy_bytes_status(
+                                   position_device.p, next_positions.data(),
+                                   next_positions.size() * sizeof(int),
+                                   ninfer::core::TransferDirection::HostToDevice, stream),
                                "update graph positions");
-                    cuda_check(cudaMemcpyAsync(config_device.p, next_configs.data(),
-                                               next_configs.size() * sizeof(ops::SamplingConfig),
-                                               cudaMemcpyHostToDevice, stream),
+                    cuda_check(ninfer::core::copy_bytes_status(
+                                   config_device.p, next_configs.data(),
+                                   next_configs.size() * sizeof(ops::SamplingConfig),
+                                   ninfer::core::TransferDirection::HostToDevice, stream),
                                "update graph configs");
                     executable.launch(stream);
                     cuda_synchronize(stream);
@@ -529,13 +532,15 @@ int run(bool ties = false, bool dependent = false) {
                                          next_expected.probabilities, kProbabilityCriterion);
                     failures += verify_draws("selector graph updated q", batch_size, candidate_ids,
                                              next_configs, next_positions, next_drafts, next_q);
-                    cuda_check(cudaMemcpyAsync(position_device.p, base_positions.data(),
-                                               base_positions.size() * sizeof(int),
-                                               cudaMemcpyHostToDevice, stream),
+                    cuda_check(ninfer::core::copy_bytes_status(
+                                   position_device.p, base_positions.data(),
+                                   base_positions.size() * sizeof(int),
+                                   ninfer::core::TransferDirection::HostToDevice, stream),
                                "restore graph positions");
-                    cuda_check(cudaMemcpyAsync(config_device.p, configs.data(),
-                                               configs.size() * sizeof(ops::SamplingConfig),
-                                               cudaMemcpyHostToDevice, stream),
+                    cuda_check(ninfer::core::copy_bytes_status(
+                                   config_device.p, configs.data(),
+                                   configs.size() * sizeof(ops::SamplingConfig),
+                                   ninfer::core::TransferDirection::HostToDevice, stream),
                                "restore graph configs");
                     executable.launch(stream);
                     cuda_synchronize(stream);

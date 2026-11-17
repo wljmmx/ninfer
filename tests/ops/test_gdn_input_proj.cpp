@@ -1,6 +1,7 @@
 #include "core/weight.h"
 #include "core/device.h"
 #include "core/decode_graph.h"
+#include "core/transfer.h"
 #include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/w4a8.h"
 
@@ -147,9 +148,9 @@ int run_q4_q5_graph_case(DevicePackedWeight& query_key, DevicePackedWeight& valu
     z.repaint(stream);
     activation      = make_bf16_activation(kHidden, tokens, 811U + tokens);
     activation_bits = bf16_bits(activation);
-    CUDA_CHECK(cudaMemcpyAsync(device_activation.p, activation_bits.data(),
-                               activation_bits.size() * sizeof(std::uint16_t),
-                               cudaMemcpyHostToDevice, stream));
+    ninfer::core::copy_bytes(device_activation.p, activation_bits.data(),
+                             activation_bits.size() * sizeof(std::uint16_t),
+                             ninfer::core::TransferDirection::HostToDevice, stream);
     CUDA_CHECK(cudaGraphLaunch(executable, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaGraphExecDestroy(executable));

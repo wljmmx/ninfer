@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "core/transfer.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/execution/vision.h"
@@ -79,8 +80,8 @@ void test_handoff_lifetime(ninfer::DeviceContext& device,
     const auto read = [&](const qwen::execution::VisionChunk& chunk) {
         require(chunk.control != nullptr, "Vision replay omitted its item");
         std::vector<std::uint16_t> output(chunk.embeddings.bytes() / sizeof(std::uint16_t));
-        CUDA_CHECK(cudaMemcpyAsync(output.data(), chunk.embeddings.data, chunk.embeddings.bytes(),
-                                   cudaMemcpyDeviceToHost, device.stream));
+        ninfer::core::copy_bytes(output.data(), chunk.embeddings.data, chunk.embeddings.bytes(),
+                                 ninfer::core::TransferDirection::DeviceToHost, device.stream);
         device.synchronize();
         return output;
     };

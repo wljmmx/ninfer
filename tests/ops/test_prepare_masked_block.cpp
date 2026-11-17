@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "core/transfer.h"
 #include <algorithm>
 #include "ninfer/ops/prepare_masked_block.h"
 #include "ops/op_tester.h"
@@ -106,9 +107,12 @@ int run_batch_case(int width, int batch, bool dense) {
         CUDA_CHECK(cudaGraphLaunch(executable, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         for (int b = 0; b < batch; ++b) { anchors[b] += 11; lengths[b] += 7; valid[b] = 1 + valid[b] % width; }
-        CUDA_CHECK(cudaMemcpyAsync(device_anchors.p, anchors.data(), device_anchors.bytes, cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(device_lengths.p, lengths.data(), device_lengths.bytes, cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(device_valid.p, valid.data(), device_valid.bytes, cudaMemcpyHostToDevice, stream));
+        ninfer::core::copy_bytes(device_anchors.p, anchors.data(), device_anchors.bytes,
+                                 ninfer::core::TransferDirection::HostToDevice, stream);
+        ninfer::core::copy_bytes(device_lengths.p, lengths.data(), device_lengths.bytes,
+                                 ninfer::core::TransferDirection::HostToDevice, stream);
+        ninfer::core::copy_bytes(device_valid.p, valid.data(), device_valid.bytes,
+                                 ninfer::core::TransferDirection::HostToDevice, stream);
         CUDA_CHECK(cudaGraphLaunch(executable, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaGraphExecDestroy(executable));

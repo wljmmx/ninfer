@@ -1,5 +1,6 @@
 #include "indexer_fixture.h"
 #include "core/decode_graph.h"
+#include "core/transfer.h"
 
 #include <numeric>
 #include <string>
@@ -167,28 +168,28 @@ int read_footprint(DeviceContext& device) {
     for (int b = 0; b < f.B; ++b) {
         const int n = f.valid[b];
         if (!n) continue;
-        CUDA_CHECK(cudaMemcpyAsync(static_cast<int*>(positions.p) + b * f.T,
-                                   f.positions.data() + b * f.T, n * 4, cudaMemcpyHostToDevice,
-                                   device.stream));
+        ninfer::core::copy_bytes(static_cast<int*>(positions.p) + b * f.T,
+                                 f.positions.data() + b * f.T, n * 4,
+                                 ninfer::core::TransferDirection::HostToDevice, device.stream);
         for (int t = 0; t < n; ++t) {
             if ((f.positions[b * f.T + t] + 1) / 4 <= 512) continue;
             const auto m = std::size_t(b * f.T + t) * 512;
-            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint16_t*>(query.p) + m,
-                                       f.q_host.data() + m, 1024, cudaMemcpyHostToDevice,
-                                       device.stream));
+            ninfer::core::copy_bytes(static_cast<std::uint16_t*>(query.p) + m, f.q_host.data() + m,
+                                     1024, ninfer::core::TransferDirection::HostToDevice,
+                                     device.stream);
         }
         const int c = (f.positions[b * f.T + n - 1] + 1) / 4;
         if (c <= 512) continue;
         const int page_count = (c + 15) / 16, row = f.table_rows[b];
-        CUDA_CHECK(cudaMemcpyAsync(static_cast<int*>(table.p) + row * f.table_stride,
-                                   f.tables.data() + row * f.table_stride, page_count * 4,
-                                   cudaMemcpyHostToDevice, device.stream));
+        ninfer::core::copy_bytes(static_cast<int*>(table.p) + row * f.table_stride,
+                                 f.tables.data() + row * f.table_stride, page_count * 4,
+                                 ninfer::core::TransferDirection::HostToDevice, device.stream);
         for (int p = 0; p < page_count; ++p) {
             const auto offset =
                 std::int64_t(f.tables[row * f.table_stride + p]) * f.key_page_stride;
-            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint16_t*>(keys.p) + offset,
-                                       f.k_host.data() + offset, std::min(16, c - p * 16) * 256,
-                                       cudaMemcpyHostToDevice, device.stream));
+            ninfer::core::copy_bytes(static_cast<std::uint16_t*>(keys.p) + offset,
+                                     f.k_host.data() + offset, std::min(16, c - p * 16) * 256,
+                                     ninfer::core::TransferDirection::HostToDevice, device.stream);
         }
     }
     WorkspaceArena workspace(

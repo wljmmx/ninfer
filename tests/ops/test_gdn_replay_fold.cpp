@@ -8,6 +8,7 @@
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
 #include "core/weight.h"
+#include "core/transfer.h"
 #include "ops/input_projection_test_common.h"
 #include "ops/linear_attention/gated_delta_net/launch.h"
 #include "ops/op_tester.h"
@@ -337,8 +338,9 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                     query, key, value, g_tensor, beta_tensor, kScale, true, local_state_tensor,
                     output_token, nullptr);
                 if (token + 1 == commit)
-                    cuda_check(cudaMemcpyAsync(expected, local_state.p, recurrent_slot_bytes,
-                                               cudaMemcpyDeviceToDevice, nullptr),
+                    cuda_check(ninfer::core::copy_bytes_status(
+                                   expected, local_state.p, recurrent_slot_bytes,
+                                   ninfer::core::TransferDirection::DeviceToDevice, nullptr),
                                "save Nth snapshot");
             }
         }
@@ -369,8 +371,9 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
         for (auto& row : fold_rows) row.commit_columns = 0;
         // Restore GPU state between replays.
         for (int replay = 0; replay < 2; ++replay) {
-            cuda_check(cudaMemcpyAsync(state_base, original.p, state_bytes,
-                                       cudaMemcpyDeviceToDevice, context.stream),
+            cuda_check(ninfer::core::copy_bytes_status(
+                           state_base, original.p, state_bytes,
+                           ninfer::core::TransferDirection::DeviceToDevice, context.stream),
                        "restore graph state");
             graph.launch(context.stream);
             context.synchronize();
