@@ -392,6 +392,15 @@ admission 推迟，不再与已接纳请求争夺容量；取消与终态按正�
 真实容量，Runtime 以 `recovery_pending` 判断保护结束。到达旧 frontier、完成 MTP bridge 或单纯
 回读 Snapshot 都不算新进展；新 prefill、生成/control 提交或终态才结束保护。
 
+**与上游 fixture 的口径差异（2026-11-17 实测）**：上游 `test_engine_preemption_real` 的取消场景断言
+"最老常驻受保护，因此只有新来那条会被暂停"。本仓库的策略正相反，而且就是本节写明的设计：压力下
+**本轮 owner 先暂停自身**（"只有 owner 可以在压力下改变容量所有权"），随后才轮到最年轻的非 owner；
+于是两条请求同时受压时**最老那条也可以是受害者**。实测（27B、Host=0、两请求）：
+`[pause] direct lane=0 id=1`（老的自暂停）→ `[pause] reclaim victim lane=1 id=2`，
+`first preemptions=1 paused_ns≈3.4 ms`、`second preemptions=1`，两者都被恢复、前者 replay 256 token、
+无 stall。测试因此按本地策略断言（被取消的请求确实被暂停；本阶段既有抢占也有恢复；replay 取消时
+用**引擎**已回放量覆盖取消前的观测量，实测 256 ≥ 128），不再沿用上游的受害者身份前提。
+
 Prefill chunk 的边界为已经驻留的请求提供轮转机会。全部 lane 被占用时，新请求仍要等到某个
 resident 结束、取消或因资源压力暂停；缩短 chunk 本身不会使它提前进入。因此，短请求排队可能
 跨过长请求的多个 chunk，分析这类时延要分别检查 lane 准入和每个执行单元的耗时。
