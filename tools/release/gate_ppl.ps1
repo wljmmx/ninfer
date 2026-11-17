@@ -7,25 +7,31 @@
 # gate uses (4096/2048), and both are exact: the PPL must repeat to the printed 6 significant
 # digits and the eviction-score dump must hash to the same 16 hex digits.
 #
-# Golden, as re-recorded 2026-11-11 after the E8 top-2 tie-break fix:
-#   default PPL        7.445538
-#   selector-off dump  61bfd6e5efee6395  (4547 bytes)
-# The pair it replaces was 7.441868 / 636e38de95046781, and `e7ceb89dff4eb40b` in the v9
-# quick-reference is older still (T042/T002).
+# Golden, as re-recorded 2026-11-17 after ad1dc4a1 made YaRN a run-time choice (native default):
+#   default PPL        7.359779
+#   selector-off dump  e95cacb864d8b1ab  (4540 bytes)
+# The pair it replaces (2026-11-11, E8 tie-break) was 7.445538 / 61bfd6e5efee6395 (4547 bytes);
+# before that, 7.441868 / 636e38de95046781; e7ceb89dff4eb40b in the v9 quick-reference is older
+# still (T042/T002).
 #
-# Why the move is the fix and not the toolchain, measured both ways:
-#   build-win-old  7.441868 / 636e38de95046781 (4548 bytes)   reproduces the old golden exactly
+# Why this move (bisected, not inferred): 54f2624f rebuilds to 7.445538 PASS; the first bad commit
+# is ad1dc4a1, which keeps the declared rope_parameters but makes NINFER_ROPE_SCALING=native the
+# default, so the 27B's trained frequencies drive the model instead of the extended YaRN table.
+# The same step moves --kv-dtype bf16 (7.226977 -> 7.167743), so it is a shared numeric path, not
+# the rk4v4-e8 codec. The 11-16 batches' gate numbers were measured after this commit and already
+# reflect native.
+#
+# Previous toolchain check (2026-11-11), kept as history:
+#   build-win-old  7.441868 / 636e38de95046781 (4548 bytes)
 #   build-win      7.445538 / 61bfd6e5efee6395 (4547 bytes)
-#   both, --kv-dtype bf16: 7.226977 on each, bit for bit      so the dense path is unchanged
-# The only numeric change in between is e1d80007, which turned the E8 top-2 tie-break into a strict
-# total order; the old reduction let two lanes keep different pairs at an exact tie.
+#   both, --kv-dtype bf16: 7.226977 on each, bit for bit
 param(
     [string]$Model = "R:\model\qwen3_8_27b_v3\qwen3_8_27b_v3.ninfer",
     [string]$PplCorpus = "D:\ninfer-rtx4090\ppl_corpus.txt",
     [string]$DumpText = "D:\ninfer-rtx4090\n4_q1.txt",
     [string]$KvDtype = "rk4v4-e8",
-    [double]$ExpectPpl = 7.445538,
-    [string]$ExpectDump = "61bfd6e5efee6395",
+    [double]$ExpectPpl = 7.359779,
+    [string]$ExpectDump = "e95cacb864d8b1ab",
     [switch]$Record
 )
 
