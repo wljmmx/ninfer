@@ -1,6 +1,6 @@
 #include "ops/launcher/vision_pos_embed.h"
 
-#include "ops/common/math.h"
+#include "ops/common/numeric/math.h"
 #include "ops/kernel/vision_pos_embed.cuh"
 #include "core/device.h"
 

@@ -6,8 +6,10 @@
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 
 #include "core/device.h"
-#include "ops/common/math.cuh"
-#include "ops/common/memory.cuh"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
 #include "ops/linear/nvfp4/nvfp4_schedule.cuh"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/common/vector_output.cuh"

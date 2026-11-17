@@ -4,8 +4,8 @@
 // zero-initialized atomic winners across route-selected row tiles.
 #include "ops/launcher/argmax.h"
 
-#include "ops/common/math.h"
-#include "ops/common/token_slices.h"
+#include "ops/common/numeric/math.h"
+#include "ops/common/host/launch.h"
 #include "ops/kernel/argmax.cuh"
 #include "core/device.h" // CUDA_CHECK
 

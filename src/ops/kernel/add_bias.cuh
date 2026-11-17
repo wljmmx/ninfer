@@ -6,7 +6,8 @@
 // BF16x2 stream, and scalar indexing covers odd/unaligned storage.
 
 #include "ops/common/bf16_vector.cuh"
-#include "ops/common/memory.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
 
 #include <cuda_bf16.h>
 

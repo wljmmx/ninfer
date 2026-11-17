@@ -1,7 +1,7 @@
 #include "ops/launcher/cast.h"
 
 #include "core/device.h"
-#include "ops/common/math.h"
+#include "ops/common/numeric/math.h"
 #include "ops/kernel/cast.cuh"
 
 #include <algorithm>

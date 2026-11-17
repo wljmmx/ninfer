@@ -65,4 +65,13 @@ NINFER_KERNEL_HD constexpr int sign_extend(int x) {
 
 } // namespace ninfer::ops::common
 
+// Callers that predate the family split resolve these names in ninfer::ops.
+namespace ninfer::ops {
+using common::align_up;
+using common::div_up;
+using common::kLog2E;
+using common::round_up;
+using common::sign_extend;
+} // namespace ninfer::ops
+
 #undef NINFER_KERNEL_HD

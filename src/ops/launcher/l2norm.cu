@@ -1,7 +1,7 @@
 // ninfer::ops - L2Norm launcher.
 #include "ops/launcher/l2norm.h"
 
-#include "ops/common/math.h"
+#include "ops/common/numeric/math.h"
 #include "ops/kernel/l2norm.cuh"
 #include "core/device.h"
 

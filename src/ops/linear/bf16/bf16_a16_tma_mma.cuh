@@ -8,8 +8,8 @@
 #include "ops/common/mbarrier.cuh"
 #include "ops/linear/bf16/bf16_mma_common.cuh"
 #include "ops/linear/bf16/bf16_operands.h"
-#include "ops/common/token_slices.h"
-#include "ops/common/math.h"
+#include "ops/common/host/launch.h"
+#include "ops/common/numeric/math.h"
 #include <cuda.h>
 #include <stdexcept>
 #include <string>

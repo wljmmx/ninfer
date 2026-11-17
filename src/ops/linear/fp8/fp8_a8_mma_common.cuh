@@ -1,8 +1,10 @@
 #pragma once
 
-#include "ops/common/math.cuh"
-#include "ops/common/memory.cuh"
-#include "ops/common/mma.cuh"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
+#include "ops/common/cuda/mma.cuh"
 #include "ops/linear/common/vector_output.cuh"
 #include "ops/linear/fp8/fp8_schedule.cuh"
 

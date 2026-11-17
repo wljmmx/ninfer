@@ -3,7 +3,7 @@
 // crosses a token, so its coefficient is uniform), the scalar route otherwise.
 #include "ops/launcher/scaled_add.h"
 
-#include "ops/common/math.h"
+#include "ops/common/numeric/math.h"
 #include "ops/kernel/scaled_add.cuh"
 #include "core/device.h" // CUDA_CHECK
 

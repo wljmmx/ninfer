@@ -1,6 +1,6 @@
 #pragma once
 #include "core/device.h"
-#include "ops/common/mma.cuh"
+#include "ops/common/cuda/mma.cuh"
 #include "ops/linear/bf16/bf16_schedule.cuh"
 #include "ops/linear/common/epilogue.cuh"
 

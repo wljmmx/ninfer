@@ -2,7 +2,7 @@
 
 // ninfer::ops - L2Norm kernels over contiguous BF16 rows.
 
-#include "ops/common/warp.cuh"
+#include "ops/common/cuda/reduce.cuh"
 
 #include <cuda_bf16.h>
 

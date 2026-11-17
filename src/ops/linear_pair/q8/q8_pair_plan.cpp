@@ -2,7 +2,7 @@
 #include "ops/linear_pair/q8/q8_pair_plan.h"
 
 #include "ops/linear_pair/q8/q8_pair_kernels.h"
-#include "ops/common/token_slices.h"
+#include "ops/common/host/launch.h"
 
 #include <array>
 #include <cstdint>

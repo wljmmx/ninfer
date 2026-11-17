@@ -6,8 +6,9 @@
 // codes are widened exactly to BF16 MMA operands; the represented BF16 row multiplier is applied
 // once to the complete FP32 dot product. The public activation is never quantized.
 
-#include "ops/common/mma.cuh"
-#include "ops/common/memory.cuh"
+#include "ops/common/cuda/mma.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
 #include "ops/linear/fp8/fp8_a16_codec.cuh"
 #include "ops/linear/fp8/fp8_schedule.cuh"
 #include "ops/linear/common/epilogue.cuh"

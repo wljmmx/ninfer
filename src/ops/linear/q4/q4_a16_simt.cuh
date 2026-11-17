@@ -1,7 +1,7 @@
 #pragma once
 
 #include "core/pdl.cuh"
-#include "ops/common/warp.cuh"
+#include "ops/common/cuda/reduce.cuh"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/q4/q4_schedule.cuh"
 

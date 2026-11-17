@@ -2,9 +2,10 @@
 #include "ops/linear_topk/linear_topk_launch.h"
 
 #include "core/device.h"
-#include "ops/common/memory.cuh"
-#include "ops/common/mma.cuh"
-#include "ops/common/score_id_order.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
+#include "ops/common/cuda/mma.cuh"
+#include "ops/common/cuda/reduce.cuh"
 #include "ops/linear/q8/q8_sliced_k_launch.cuh"
 #include "ops/linear_topk/linear_topk_workspace.h"
 

@@ -2,8 +2,9 @@
 #include "ops/linear/fp8/fp8_a8_plan.h"
 
 #include "core/device.h"
-#include "ops/common/math.cuh"
-#include "ops/common/warp.cuh"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
+#include "ops/common/cuda/reduce.cuh"
 #include "ops/linear/fp8/fp8_instances.cuh"
 #include "ops/linear/fp8/fp8_schedule.cuh"
 #include "ops/linear/common/epilogue.cuh"

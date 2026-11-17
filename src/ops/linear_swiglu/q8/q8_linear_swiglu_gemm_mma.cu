@@ -3,7 +3,7 @@
 #include "ops/linear_swiglu/q8/q8_linear_swiglu_kernels.h"
 
 #include "core/device.h"
-#include "ops/common/math.h"
+#include "ops/common/numeric/math.h"
 #include "ops/linear/q8/q8_mma_launch.cuh"
 
 namespace ninfer::ops::detail {

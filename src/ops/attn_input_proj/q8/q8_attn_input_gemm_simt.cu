@@ -2,7 +2,7 @@
 #include "ops/attn_input_proj/q8/q8_attn_input_kernels.h"
 
 #include "core/device.h"
-#include "ops/common/math.h"
+#include "ops/common/numeric/math.h"
 #include "ops/linear/q8/q8_simt_launch.cuh"
 
 namespace ninfer::ops::detail {

@@ -6,8 +6,10 @@
 // smaller alignments and odd tails. Sigmoid remains FP32 expf, not a fit.
 
 #include "ops/common/bf16_vector.cuh"
-#include "ops/common/math.cuh"
-#include "ops/common/memory.cuh"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
 
 #include <cuda_bf16.h>
 

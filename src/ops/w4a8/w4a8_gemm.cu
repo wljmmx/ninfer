@@ -1,7 +1,8 @@
 #include "ninfer/ops/w4a8.h"
 
 #include "core/device.h"
-#include "ops/common/math.cuh"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>

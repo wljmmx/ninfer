@@ -1,6 +1,6 @@
 #pragma once
 #include "ops/gated_residual/kernel/combine.cuh"
-#include "ops/common/warp.cuh"
+#include "ops/common/cuda/reduce.cuh"
 
 namespace ninfer::ops::detail::hc {
 __device__ __forceinline__ uint4 streaming_load(const uint4* input) {

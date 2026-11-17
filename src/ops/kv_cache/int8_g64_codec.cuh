@@ -4,8 +4,10 @@
 // This header owns index math, vectorized decode, and scalar encode; there is deliberately no
 // standalone transcode kernel in the production path.
 
-#include "ops/common/math.cuh"
-#include "ops/common/memory.cuh"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
 

@@ -1,9 +1,10 @@
 #pragma once
 #include "ops/softmax_attention/common/causal_tile_io.cuh"
 
-#include "ops/common/math.cuh"
-#include "ops/common/mma.cuh"
-#include "ops/common/warp.cuh"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
+#include "ops/common/cuda/mma.cuh"
+#include "ops/common/cuda/reduce.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/kv_cache/int8_g64_codec.cuh"
 #include "ops/softmax_attention/dense/causal_cache/int8/operands.h"

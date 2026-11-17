@@ -4,7 +4,7 @@
 // the same layout authority, so exactly one finite route owns each shape.
 #include "ops/launcher/sampling.h"
 
-#include "ops/common/math.h"
+#include "ops/common/numeric/math.h"
 #include "ops/kernel/sampling.cuh"
 #include "core/device.h"
 

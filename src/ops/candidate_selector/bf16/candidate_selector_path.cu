@@ -1,7 +1,8 @@
 #include "ops/candidate_selector/bf16/candidate_selector_path_kernels.h"
 #include "core/device.h"
-#include "ops/common/memory.cuh"
-#include "ops/common/warp.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
+#include "ops/common/cuda/reduce.cuh"
 #include "ops/kernel/sampling_device.cuh"
 #include <cuda_bf16.h>
 #include <stdexcept>

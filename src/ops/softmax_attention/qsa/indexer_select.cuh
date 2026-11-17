@@ -1,7 +1,7 @@
 #pragma once
 
 #include "ops/softmax_attention/qsa/indexer_arguments.cuh"
-#include "ops/common/score_id_order.cuh"
+#include "ops/common/cuda/reduce.cuh"
 
 #include <cub/block/block_reduce.cuh>
 #include <cub/block/block_scan.cuh>

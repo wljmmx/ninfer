@@ -1,6 +1,6 @@
 #include "ops/launcher/add_bias.h"
 
-#include "ops/common/math.h"
+#include "ops/common/numeric/math.h"
 #include "ops/kernel/add_bias.cuh"
 #include "core/device.h"
 

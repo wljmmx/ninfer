@@ -1,7 +1,7 @@
 #include "ops/launcher/position.h"
 
 #include "core/device.h"
-#include "ops/common/math.h"
+#include "ops/common/numeric/math.h"
 #include "ops/kernel/position.cuh"
 
 namespace ninfer::ops::detail {

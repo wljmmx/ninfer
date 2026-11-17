@@ -1,8 +1,10 @@
 #pragma once
 
-#include "ops/common/math.cuh"
-#include "ops/common/memory.cuh"
-#include "ops/common/warp.cuh"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
+#include "ops/common/cuda/reduce.cuh"
 #include "ops/linear_attention/kimi_delta_attention/launch.h"
 
 #include <cuda_bf16.h>

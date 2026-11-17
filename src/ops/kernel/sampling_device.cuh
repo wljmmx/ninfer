@@ -5,9 +5,9 @@
 // logits (including numeric-zero ties); candidate storage is bounded by the
 // semantic top-20 cap and all global staging is supplied by the caller.
 
-#include "ops/common/math.h"
+#include "ops/common/numeric/math.h"
 #include "ops/common/sampling_workspace.h"
-#include "ops/common/score_id_order.cuh"
+#include "ops/common/cuda/reduce.cuh"
 #include "ninfer/ops/sampling.h"
 
 #include <cub/block/block_merge_sort.cuh>

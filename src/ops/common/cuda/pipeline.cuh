@@ -117,4 +117,29 @@ __device__ __forceinline__ void tma_load_4d(void* destination, const CUtensorMap
                  : "memory");
 }
 
+template <int Bytes>
+__device__ __forceinline__ void pipe_copy(void* smem_dst, const void* gmem_src) {
+    static_assert(Bytes == 4 || Bytes == 8 || Bytes == 16, "pipe_copy supports 4, 8, or 16 bytes");
+    __pipeline_memcpy_async(smem_dst, gmem_src, Bytes);
+}
+
+__device__ __forceinline__ void pipe_commit() { __pipeline_commit(); }
+
+template <int Groups>
+__device__ __forceinline__ void pipe_wait() {
+    static_assert(Groups >= 0 && Groups <= 7, "pipe_wait group count must fit the PTX immediate");
+    __pipeline_wait_prior(Groups);
+}
+
 } // namespace ninfer::ops::common
+
+// Callers that predate the family split resolve these names in ninfer::ops.
+namespace ninfer::ops {
+using common::cp_async;
+using common::cp_async_zfill;
+using common::cp_commit;
+using common::cp_wait;
+using common::pipe_commit;
+using common::pipe_copy;
+using common::pipe_wait;
+} // namespace ninfer::ops

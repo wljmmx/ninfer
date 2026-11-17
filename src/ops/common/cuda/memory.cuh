@@ -76,3 +76,11 @@ __device__ __forceinline__ unsigned char* shared_storage() {
 }
 
 } // namespace ninfer::ops::common
+
+// Callers that predate the family split resolve these names in ninfer::ops.
+namespace ninfer::ops {
+using common::load_ldg;
+using common::load_vec;
+using common::smem_addr;
+using common::store_vec;
+} // namespace ninfer::ops

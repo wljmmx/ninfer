@@ -5,8 +5,10 @@
 // instructions on sm_100+ and to the toolkit's emulation elsewhere; the K8V4 KV cache
 // uses this codec on every supported architecture. Only the block-scaled weight decode
 // (nvfp4_scaled_pair_bf16) keeps a native-Blackwell asm path for sm_120a builds.
-#include "ops/common/math.cuh"
-#include "ops/common/memory.cuh"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp4.h>

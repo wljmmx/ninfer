@@ -1,9 +1,11 @@
 #include "core/weight.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_kernels.h"
 
-#include "ops/common/math.cuh"
-#include "ops/common/memory.cuh"
-#include "ops/common/warp.cuh"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
+#include "ops/common/cuda/reduce.cuh"
 #include "core/device.h" // CUDA_CHECK
 #include "ops/linear/q4/q4_sliced_k_launch.cuh"
 #include "ops/linear/q4/q4_small_t_mma.cuh"

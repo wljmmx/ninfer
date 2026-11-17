@@ -1,7 +1,7 @@
 #pragma once
 
 #include "core/layout.h"
-#include "ops/common/math.h"
+#include "ops/common/numeric/math.h"
 
 #include <cstdint>
 

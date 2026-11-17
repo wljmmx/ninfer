@@ -1,6 +1,7 @@
 #pragma once
 #include "ops/rmsnorm/types.h"
-#include "ops/common/math.cuh"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
 
 namespace ninfer::ops::detail::rmsnorm {
 template <Epilogue Kind>

@@ -2,9 +2,9 @@
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
 
 #include "core/device.h"
-#include "ops/common/math.h"
+#include "ops/common/numeric/math.h"
 #include "ops/common/rowsplit_grouped_mma.cuh"
-#include "ops/common/token_slices.h"
+#include "ops/common/host/launch.h"
 
 #include <cstdint>
 #include <stdexcept>

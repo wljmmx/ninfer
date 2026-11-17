@@ -1,5 +1,6 @@
 #pragma once
-#include "ops/common/math.cuh"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
 #include "ops/linear/q8/q8_a16_mma.cuh"
 
 namespace ninfer::ops::detail {

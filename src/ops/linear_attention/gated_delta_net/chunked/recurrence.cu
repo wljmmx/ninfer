@@ -1,6 +1,7 @@
 #include "ops/linear_attention/gated_delta_net/chunked/launch.h"
-#include "ops/common/math.cuh"
-#include "ops/common/mma.cuh"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
+#include "ops/common/cuda/mma.cuh"
 
 namespace ninfer::ops::detail::gated_delta_net::chunked {
 namespace {

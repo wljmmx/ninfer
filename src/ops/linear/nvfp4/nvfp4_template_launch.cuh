@@ -5,8 +5,8 @@
 // compiled out on other architectures; dispatch rejects NVFP4 weights there.
 #if defined(NINFER_ENABLE_NVFP4)
 #include "core/device.h"
-#include "ops/common/math.h"
-#include "ops/common/token_slices.h"
+#include "ops/common/numeric/math.h"
+#include "ops/common/host/launch.h"
 #include "ops/linear/nvfp4/nvfp4_a16_gemv.cuh"
 #include "ops/linear/nvfp4/nvfp4_a16_simt.cuh"
 #include "ops/linear/nvfp4/nvfp4_a16_mma.cuh"

@@ -2,8 +2,8 @@
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_kernels.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_gemm_mma.cuh"
 #include "core/device.h"
-#include "ops/common/math.h"
-#include "ops/common/token_slices.h"
+#include "ops/common/numeric/math.h"
+#include "ops/common/host/launch.h"
 #include <cstdlib>
 #include <cstdint>
 

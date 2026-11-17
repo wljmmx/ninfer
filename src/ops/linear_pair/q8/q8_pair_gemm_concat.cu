@@ -3,7 +3,7 @@
 #include "ops/linear_pair/q8/q8_pair_plan.h"
 
 #include "core/device.h"
-#include "ops/common/math.h"
+#include "ops/common/numeric/math.h"
 #include "ops/linear/q8/q8_mma_launch.cuh"
 
 #include <cstdint>

@@ -8,9 +8,11 @@
 // shared tile; x uses a two-stage cp.async pipeline. Tensor Cores execute
 // m16n8k16 BF16 MMA with FP32 accumulation.
 
-#include "ops/common/mma.cuh"
-#include "ops/common/math.cuh"
-#include "ops/common/memory.cuh"
+#include "ops/common/cuda/mma.cuh"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
 #include "ops/linear/q8/q8_schedule.cuh"
 #include "ops/linear/q8/q8_operands.h"
 #include "ops/linear/q8/q8_shared.cuh"

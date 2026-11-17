@@ -10,7 +10,8 @@
 // up half rather than a contiguous WM-row span: accumulator entries [0, MT/2)
 // hold gate rows and [MT/2, MT) hold their matching up rows for every WM.
 
-#include "ops/common/math.cuh"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
 #include "ops/common/rowsplit_mma.cuh"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
 

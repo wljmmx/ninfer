@@ -1,7 +1,8 @@
 #pragma once
 
-#include "ops/common/mma.cuh"
-#include "ops/common/memory.cuh"
+#include "ops/common/cuda/mma.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
 #include "ops/linear/q5/q5_rowsplit_storage.cuh"
 
 #include <cuda_bf16.h>

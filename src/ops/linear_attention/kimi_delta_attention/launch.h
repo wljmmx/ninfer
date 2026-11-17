@@ -2,7 +2,7 @@
 
 #include "core/device.h"
 #include "core/tensor.h"
-#include "ops/common/math.h"
+#include "ops/common/numeric/math.h"
 
 #include <cuda_bf16.h>
 #include <cstddef>

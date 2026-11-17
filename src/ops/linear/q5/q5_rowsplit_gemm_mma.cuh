@@ -14,7 +14,7 @@
 // remain runtime dimensions; registered shapes select a closed schedule and a
 // statically compiled boundary variant outside the kernel.
 
-#include "ops/common/mma.cuh"
+#include "ops/common/cuda/mma.cuh"
 #include "ops/common/bf16_vector.cuh"
 #include "ops/linear/q5/q5_rowsplit_storage.cuh"
 

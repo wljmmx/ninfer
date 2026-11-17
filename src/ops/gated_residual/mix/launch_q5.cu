@@ -4,7 +4,7 @@
 #include "ops/linear/q5/q5_operands.h"
 #include "ops/linear/q5/q5_schedule.cuh"
 #include "ops/linear/q5/q5_simt_launch.cuh"
-#include "ops/common/token_slices.h"
+#include "ops/common/host/launch.h"
 
 namespace ninfer::ops::detail::hc::mix {
 namespace {

@@ -4,7 +4,7 @@
 // Match: contiguous BF16 [physical_rows,C], I32 [C], and FP32 [C].
 // Algorithm assumptions: one 256-thread CTA performs a stable two-pass logsumexp per column.
 
-#include "ops/common/warp.cuh"
+#include "ops/common/cuda/reduce.cuh"
 
 #include <cuda_bf16.h>
 #include <math_constants.h>

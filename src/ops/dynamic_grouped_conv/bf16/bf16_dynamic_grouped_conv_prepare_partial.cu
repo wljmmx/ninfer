@@ -1,8 +1,9 @@
 #include "core/weight.h"
 #include "ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_kernels.h"
 #include "core/device.h"
-#include "ops/common/memory.cuh"
-#include "ops/common/mma.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
+#include "ops/common/cuda/mma.cuh"
 #include "ops/common/rowsplit_mma.cuh"
 #include <cuda_bf16.h>
 #include <stdexcept>

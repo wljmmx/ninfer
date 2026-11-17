@@ -2,7 +2,7 @@
 
 // Row/tokens tiled Q4 x BF16 MMA. Scaled weights are materialized as BF16;
 // accumulation is FP32. N/K/T stay runtime values and the launcher owns bounds.
-#include "ops/common/mma.cuh"
+#include "ops/common/cuda/mma.cuh"
 #include "ops/linear/q4/q4_schedule.cuh"
 
 namespace ninfer::ops::detail {

@@ -1,6 +1,7 @@
 #pragma once
-#include "ops/common/warp.cuh"
-#include "ops/common/math.cuh"
+#include "ops/common/cuda/reduce.cuh"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/q8/q8_schedule.cuh"
 #include "ops/linear/q8/q8_operands.h"

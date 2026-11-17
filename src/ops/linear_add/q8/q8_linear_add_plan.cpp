@@ -2,7 +2,7 @@
 #include "ops/linear_add/q8/q8_linear_add_plan.h"
 
 #include "ops/linear_add/q8/q8_linear_add_kernels.h"
-#include "ops/common/token_slices.h"
+#include "ops/common/host/launch.h"
 
 #include <array>
 #include <limits>

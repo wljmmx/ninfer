@@ -7,8 +7,10 @@
 // quantize helper they share. There is deliberately no standalone quant/dequant
 // kernel: that would defeat the halved-bandwidth goal.
 
-#include "ops/common/math.cuh"
-#include "ops/common/memory.cuh"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 
 #include <cuda_bf16.h>

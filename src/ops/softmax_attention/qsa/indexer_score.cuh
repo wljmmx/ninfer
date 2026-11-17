@@ -1,7 +1,7 @@
 #pragma once
 
 #include "ops/softmax_attention/qsa/indexer_arguments.cuh"
-#include "ops/common/mma.cuh"
+#include "ops/common/cuda/mma.cuh"
 
 namespace ninfer::ops::detail::qsa {
 

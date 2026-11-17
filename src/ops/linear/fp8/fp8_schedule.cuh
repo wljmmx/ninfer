@@ -1,6 +1,7 @@
 #pragma once
 #include "ops/linear/fp8/fp8_geometry.h"
-#include "ops/common/memory.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
 #include <cstddef>
 #include <cuda_bf16.h>
 

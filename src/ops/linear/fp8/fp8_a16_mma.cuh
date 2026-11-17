@@ -8,8 +8,9 @@
 // remain BF16. Tensor Cores accumulate the complete K reduction in FP32, then the represented BF16
 // row scale is applied once before BF16 output storage.
 
-#include "ops/common/memory.cuh"
-#include "ops/common/mma.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
+#include "ops/common/cuda/mma.cuh"
 #include "ops/linear/fp8/fp8_a16_codec.cuh"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/fp8/fp8_schedule.cuh"

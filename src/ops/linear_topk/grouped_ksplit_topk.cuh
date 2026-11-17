@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ops/common/score_id_order.cuh"
+#include "ops/common/cuda/reduce.cuh"
 #include "ops/linear_topk/linear_topk_workspace.h"
 
 #include <cub/warp/warp_merge_sort.cuh>

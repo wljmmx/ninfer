@@ -7,8 +7,9 @@
 // stride 128 (head_dim/2). K is int8 (rk8v4), int4 RTN (rk4v4), int4 with E8 lattice
 // projection (rk4v4-e8), or the 2-bit E8 cylinder (rk2v4-e8, stride 64).
 
-#include "ops/common/memory.cuh"
-#include "ops/common/warp.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
+#include "ops/common/cuda/reduce.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/kernel/e8_lattice.cuh"
 #include "ops/kernel/e8_root_codec.cuh"

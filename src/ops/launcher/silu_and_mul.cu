@@ -3,8 +3,8 @@
 // See docs/op-development.md §2.
 #include "ops/launcher/silu_and_mul.h"
 
-#include "ops/common/math.h"
-#include "ops/common/token_slices.h"
+#include "ops/common/numeric/math.h"
+#include "ops/common/host/launch.h"
 #include "ops/kernel/silu_and_mul.cuh"
 #include "core/device.h" // CUDA_CHECK
 

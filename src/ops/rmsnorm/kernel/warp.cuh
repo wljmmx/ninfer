@@ -1,6 +1,6 @@
 #pragma once
 #include "ops/rmsnorm/kernel/epilogue.cuh"
-#include "ops/common/warp.cuh"
+#include "ops/common/cuda/reduce.cuh"
 #include <cuda_bf16.h>
 #include <cstdint>
 

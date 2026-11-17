@@ -1,7 +1,8 @@
 #pragma once
 
-#include "ops/common/math.cuh"
-#include "ops/common/warp.cuh"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
+#include "ops/common/cuda/reduce.cuh"
 #include <math_constants.h>
 
 namespace ninfer::ops::detail {

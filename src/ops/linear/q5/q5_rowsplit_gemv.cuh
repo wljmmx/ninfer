@@ -19,9 +19,10 @@
 // loads, so the kernel runs DRAM-bound instead of L1/LSU- or latency-bound.
 
 #include "core/pdl.cuh"
-#include "ops/common/math.h"
-#include "ops/common/memory.cuh"
-#include "ops/common/warp.cuh"
+#include "ops/common/numeric/math.h"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
+#include "ops/common/cuda/reduce.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>

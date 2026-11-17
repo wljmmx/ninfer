@@ -1,6 +1,6 @@
 #include "ops/launcher/gelu.h"
 
-#include "ops/common/math.h"
+#include "ops/common/numeric/math.h"
 #include "ops/kernel/gelu.cuh"
 #include "core/device.h"
 

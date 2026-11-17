@@ -1,7 +1,8 @@
 #include "ops/linear_attention/kimi_delta_attention/launch.h"
-#include "ops/common/math.cuh"
-#include "ops/common/mma.cuh"
-#include "ops/common/warp.cuh"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
+#include "ops/common/cuda/mma.cuh"
+#include "ops/common/cuda/reduce.cuh"
 
 namespace ninfer::ops::detail::kimi_delta_attention {
 namespace {

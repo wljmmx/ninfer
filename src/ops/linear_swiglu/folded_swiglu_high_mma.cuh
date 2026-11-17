@@ -13,7 +13,8 @@
 // `(staged_codes, staged_high, scale_ptr, staged_group_index, lane)` and return the bf16 pair.
 // `HB` is the plane's bytes per group per row (8 for Q5, 16 for Q6).
 
-#include "ops/common/math.cuh"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
 #include "ops/common/rowsplit_mma.cuh"
 
 #include <cuda_bf16.h>

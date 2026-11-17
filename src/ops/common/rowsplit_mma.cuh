@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ops/common/mma.cuh"
+#include "ops/common/cuda/mma.cuh"
 
 #include <cuda_bf16.h>
 

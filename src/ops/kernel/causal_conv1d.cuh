@@ -3,7 +3,8 @@
 // ninfer::ops - causal_conv1d kernel: depthwise causal k=4 with fused SiLU.
 // SiLU is computed as x / (1 + exp(-x)) in fp32, with no polynomial approximation.
 
-#include "ops/common/math.cuh"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
 
 #include <cuda_bf16.h>
 

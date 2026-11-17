@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
 
 namespace ninfer::ops::common {
 
@@ -125,3 +126,18 @@ __device__ __forceinline__ void mma_nvfp4_e4m3(float& c0, float& c1, float& c2, 
 }
 
 } // namespace ninfer::ops::common
+
+// Callers that predate the family split resolve these names in ninfer::ops.
+namespace ninfer::ops {
+using common::ldmatrix_x2;
+using common::ldmatrix_x2_t;
+using common::ldmatrix_x4;
+using common::ldmatrix_x4_t;
+using common::mma_bf16;
+using common::mma_f16;
+using common::mma_fp8_e4m3;
+using common::mma_nvfp4_e4m3;
+using common::mma_s8;
+using common::mma_tf32;
+using common::mma_tf32_bits;
+} // namespace ninfer::ops

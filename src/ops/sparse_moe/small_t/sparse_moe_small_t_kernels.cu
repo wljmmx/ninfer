@@ -2,8 +2,9 @@
 
 #include "core/device.h"
 #include "core/pdl.cuh"
-#include "ops/common/memory.cuh"
-#include "ops/common/warp.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
+#include "ops/common/cuda/reduce.cuh"
 #include "ops/sparse_moe/decode/sparse_moe_decode.h"
 #include "ops/sparse_moe/sparse_moe_route.cuh"
 

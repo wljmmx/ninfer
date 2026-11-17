@@ -2,8 +2,9 @@
 #include "ops/linear_topk/linear_topk_launch.h"
 
 #include "core/device.h"
-#include "ops/common/memory.cuh"
-#include "ops/common/mma.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
+#include "ops/common/cuda/mma.cuh"
 #include "ops/linear/fp8/fp8_a16_codec.cuh"
 #include "ops/linear/fp8/fp8_schedule.cuh"
 #include "ops/linear_topk/grouped_ksplit_topk.cuh"

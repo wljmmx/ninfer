@@ -4,7 +4,8 @@
 // and the E2M1 hardware codecs) require Blackwell sm_120a. This translation unit is
 // compiled out on other architectures; dispatch rejects NVFP4 weights there.
 #if defined(NINFER_ENABLE_NVFP4)
-#include "ops/common/memory.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/kv_cache/append/geometry.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"

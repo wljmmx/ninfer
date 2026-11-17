@@ -43,3 +43,9 @@ void for_each_token_slice(std::int32_t tokens, std::int32_t columns_per_block, L
 }
 
 } // namespace ninfer::ops::common
+
+// Callers that predate the family split resolve these names in ninfer::ops.
+namespace ninfer::ops {
+using common::for_each_token_slice;
+using common::kCudaGridYLimit;
+} // namespace ninfer::ops

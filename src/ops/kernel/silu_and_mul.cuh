@@ -5,7 +5,8 @@
 // Vectorized over bf16 pairs; included only by its launcher. See
 // docs/op-development.md §6 (no math approximation).
 
-#include "ops/common/math.cuh"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
 
 #include <cuda_bf16.h>
 

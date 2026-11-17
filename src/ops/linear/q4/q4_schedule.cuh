@@ -1,6 +1,7 @@
 #pragma once
 
-#include "ops/common/memory.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
 
 namespace ninfer::ops::detail {

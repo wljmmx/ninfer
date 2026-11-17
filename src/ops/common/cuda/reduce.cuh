@@ -211,3 +211,18 @@ __device__ __forceinline__ float block_max_broadcast(float value) {
 }
 
 } // namespace ninfer::ops::common
+
+// Callers that predate the family split resolve these names in ninfer::ops.
+namespace ninfer::ops {
+using common::block_reduce_sum;
+using common::id_from_order_key;
+using common::kFullWarpMask;
+using common::kWarpSize;
+using common::ordered_score_bits;
+using common::ScoreIdOrderGreater;
+using common::score_from_order_key;
+using common::score_id_order_key;
+using common::warp_max;
+using common::warp_reduce_sum;
+using common::warp_sum;
+} // namespace ninfer::ops

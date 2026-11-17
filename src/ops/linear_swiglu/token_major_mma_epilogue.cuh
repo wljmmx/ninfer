@@ -1,6 +1,7 @@
 #pragma once
 
-#include "ops/common/math.cuh"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
 #include "ops/linear/common/vector_output.cuh"
 
 namespace ninfer::ops::detail {

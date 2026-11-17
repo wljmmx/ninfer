@@ -1,6 +1,7 @@
 #pragma once
 
-#include "ops/common/math.cuh"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
 
 namespace ninfer::ops::detail::hc::mix {
 // Fast tanh is qualified for the BF16 mixing output and its private low-rank operands.

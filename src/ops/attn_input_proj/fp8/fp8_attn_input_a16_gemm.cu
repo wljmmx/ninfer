@@ -4,7 +4,7 @@
 #include "ops/attn_input_proj/fp8/fp8_attn_input_output.cuh"
 #include "ops/linear/fp8/fp8_a16_mma.cuh"
 #include "ops/linear/fp8/fp8_schedule.cuh"
-#include "ops/common/token_slices.h"
+#include "ops/common/host/launch.h"
 #include "core/device.h"
 
 namespace ninfer::ops::detail {

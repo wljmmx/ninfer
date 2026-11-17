@@ -122,3 +122,16 @@ __device__ __forceinline__ float load_fp16_unaligned(const std::uint8_t* source)
 }
 
 } // namespace ninfer::ops::common
+
+// Callers that predate the family split resolve these names in ninfer::ops.
+namespace ninfer::ops {
+using common::bf16x2_bits_to_f16x2_bits;
+using common::bf16x2_bits_to_float2;
+using common::bf16x2_to_float2;
+using common::bf16x8_bits_to_f16x8_bits;
+using common::half2_from_bits;
+using common::load_bf16x4;
+using common::pack_bf16x2;
+using common::pack_f16x2;
+using common::unpack_bf16x2_to_fp32_bits;
+} // namespace ninfer::ops

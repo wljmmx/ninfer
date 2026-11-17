@@ -6,7 +6,8 @@
 // smaller alignments and odd tails.
 
 #include "ops/common/bf16_vector.cuh"
-#include "ops/common/memory.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
 
 #include <cuda_bf16.h>
 

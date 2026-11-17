@@ -1,6 +1,7 @@
 #pragma once
 #include "ops/linear/nvfp4/nvfp4_layout.h"
-#include "ops/common/memory.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
 #include <cuda.h>
 #include <cuda_bf16.h>
 

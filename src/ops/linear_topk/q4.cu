@@ -2,7 +2,7 @@
 #include "ops/linear_topk/linear_topk_launch.h"
 
 #include "core/device.h"
-#include "ops/common/score_id_order.cuh"
+#include "ops/common/cuda/reduce.cuh"
 #include "ops/linear/q4/q4_sliced_k_launch.cuh"
 
 #include <cstdint>

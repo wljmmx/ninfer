@@ -6,9 +6,10 @@
 #if defined(NINFER_ENABLE_NVFP4)
 #include "ops/softmax_attention/common/causal_tile_io.cuh"
 
-#include "ops/common/math.cuh"
-#include "ops/common/mma.cuh"
-#include "ops/common/warp.cuh"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
+#include "ops/common/cuda/mma.cuh"
+#include "ops/common/cuda/reduce.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/kv_cache/nvfp4_group16_codec.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"

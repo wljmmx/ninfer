@@ -1,7 +1,7 @@
 // ninfer::ops - causal_conv1d launcher: grid/block/stream configuration + kernel launch.
 #include "ops/launcher/causal_conv1d.h"
 
-#include "ops/common/math.h"
+#include "ops/common/numeric/math.h"
 #include "ops/kernel/causal_conv1d.cuh"
 #include "core/device.h" // CUDA_CHECK
 

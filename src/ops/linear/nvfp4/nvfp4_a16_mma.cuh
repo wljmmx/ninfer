@@ -8,8 +8,9 @@
 // in BF16. The global weight divisor is applied to the complete FP32 reduction.
 // Activations remain the represented public BF16 inputs.
 
-#include "ops/common/memory.cuh"
-#include "ops/common/mma.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
+#include "ops/common/cuda/mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/nvfp4/nvfp4_schedule.cuh"

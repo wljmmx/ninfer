@@ -5,8 +5,10 @@
 // (hadamard_d256.cuh); this header only adds the int4 pack/unpack and the /7 scale
 // convention that the 4-bit symmetric [-7, 7] range requires.
 
-#include "ops/common/math.cuh"
-#include "ops/common/memory.cuh"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
 

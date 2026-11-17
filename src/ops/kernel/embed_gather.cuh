@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ops/common/math.h"
+#include "ops/common/numeric/math.h"
 
 // ninfer::ops - embedding kernels. Dense copies BF16 rows; quantized variants decode only the
 // selected rows into contiguous BF16 output columns.

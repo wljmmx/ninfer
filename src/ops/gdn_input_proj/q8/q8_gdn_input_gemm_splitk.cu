@@ -5,8 +5,9 @@
 #include "ops/gdn_input_proj/q8/q8_gdn_input_kernels.h"
 
 #include "core/device.h"
-#include "ops/common/mma.cuh"
-#include "ops/common/memory.cuh"
+#include "ops/common/cuda/mma.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
 #include "ops/gdn_input_proj/gdn_conv.cuh"
 #include "ops/linear/q8/q8_sliced_k_launch.cuh"
 #include "ops/linear/common/output.cuh"

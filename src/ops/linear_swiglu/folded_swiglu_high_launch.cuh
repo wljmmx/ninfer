@@ -5,7 +5,7 @@
 #include "core/device.h"
 #include "core/tensor.h"
 #include "core/weight.h"
-#include "ops/common/token_slices.h"
+#include "ops/common/host/launch.h"
 #include "ops/linear_swiglu/folded_swiglu_high_mma.cuh"
 
 #include <cstdint>

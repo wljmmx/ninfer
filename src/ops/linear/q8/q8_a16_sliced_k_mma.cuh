@@ -8,8 +8,9 @@
 // the CTA reduces FP32 partials in shared memory. Output owns physical row/token addressing; an
 // optional caller epilogue may instead consume the FP32 tile.
 
-#include "ops/common/mma.cuh"
-#include "ops/common/memory.cuh"
+#include "ops/common/cuda/mma.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
 #include "ops/linear/q8/q8_schedule.cuh"
 #include "ops/linear/q8/q8_operands.h"
 #include "ops/linear/q8/q8_shared.cuh"

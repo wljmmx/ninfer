@@ -5,7 +5,8 @@
 // BF16x8/BF16x2/scalar storage routes but remain separate compile-time math.
 
 #include "ops/common/bf16_vector.cuh"
-#include "ops/common/memory.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
 
 #include <cuda_bf16.h>
 

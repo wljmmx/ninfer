@@ -1,7 +1,7 @@
 #include "ops/linear_add/q8/q8_linear_add_kernels.h"
 
 #include "core/device.h"
-#include "ops/common/math.h"
+#include "ops/common/numeric/math.h"
 #include "ops/linear/q8/q8_grouped_sliced_k_launch.cuh"
 
 namespace ninfer::ops::detail {

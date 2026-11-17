@@ -4,7 +4,7 @@
 // or a two-launch partial/group pipeline without host reads of device config.
 #include "ops/launcher/speculative_round.h"
 
-#include "ops/common/math.h"
+#include "ops/common/numeric/math.h"
 #include "ops/kernel/speculative_round.cuh"
 
 #include <cstdlib>

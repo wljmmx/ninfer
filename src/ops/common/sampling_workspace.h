@@ -4,7 +4,7 @@
 // The same builder supplies the public sizing query and launcher-side binding.
 
 #include "core/layout.h"
-#include "ops/common/math.h"
+#include "ops/common/numeric/math.h"
 
 #include <cuda_runtime.h>
 

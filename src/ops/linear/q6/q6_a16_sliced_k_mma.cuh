@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ops/common/mma.cuh"
+#include "ops/common/cuda/mma.cuh"
 #include "ops/linear/q6/q6_schedule.cuh"
 
 namespace ninfer::ops::detail {

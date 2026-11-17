@@ -2,7 +2,7 @@
 #include "core/weight.h"
 #include "ops/launcher/embed_gather.h"
 
-#include "ops/common/math.h"
+#include "ops/common/numeric/math.h"
 #include "ops/kernel/embed_gather.cuh"
 #include "core/device.h" // CUDA_CHECK
 

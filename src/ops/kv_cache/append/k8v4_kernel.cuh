@@ -7,8 +7,9 @@
 // Asymmetric K8V4 append kernel. K uses the existing row-256 E4M3 cache codec; V uses the
 // group-16 packed E2M1 cache codec. Both operands receive the fixed FP32 D256 Hadamard rotation.
 
-#include "ops/common/memory.cuh"
-#include "ops/common/warp.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
+#include "ops/common/cuda/reduce.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/kv_cache/append/geometry.cuh"
 #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"

@@ -72,3 +72,14 @@ __device__ __forceinline__ float gelu(float value) {
 }
 
 } // namespace ninfer::ops::common
+
+// Callers that predate the family split resolve these names in ninfer::ops.
+namespace ninfer::ops {
+using common::exp2_approx;
+using common::exp2_approx_ftz;
+using common::exp_approx_ftz;
+using common::sigmoid;
+using common::sigmoid_approx;
+using common::silu;
+using common::softplus;
+} // namespace ninfer::ops

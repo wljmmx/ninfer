@@ -1,7 +1,7 @@
 #include "ops/launcher/mtp_pack.h"
 
-#include "ops/common/math.h"
-#include "ops/common/token_slices.h"
+#include "ops/common/numeric/math.h"
+#include "ops/common/host/launch.h"
 #include "ops/kernel/mtp_pack.cuh"
 #include "core/device.h"
 

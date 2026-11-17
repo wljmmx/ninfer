@@ -1,6 +1,6 @@
 #pragma once
 #include "core/device.h"
-#include "ops/common/math.h"
+#include "ops/common/numeric/math.h"
 #include "ops/linear/q5/q5_a16_gemv.cuh"
 #include "ops/linear/q5/q5_operands.h"
 

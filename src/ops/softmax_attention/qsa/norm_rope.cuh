@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ops/common/warp.cuh"
+#include "ops/common/cuda/reduce.cuh"
 
 #include <cuda_bf16.h>
 #include <cmath>

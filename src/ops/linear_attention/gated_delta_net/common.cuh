@@ -4,7 +4,7 @@
 // live under ops/common and are included only where this header uses them.
 
 #include "ops/common/bf16_vector.cuh"
-#include "ops/common/math.h"
+#include "ops/common/numeric/math.h"
 #include "ops/linear_attention/gated_delta_net/common.h"
 
 #include <cuda_runtime.h>
@@ -14,9 +14,11 @@
 #include <cstdlib>
 
 #ifdef __CUDACC__
-#    include "ops/common/math.cuh"
-#    include "ops/common/memory.cuh"
-#    include "ops/common/warp.cuh"
+#    include "ops/common/numeric/math.cuh"
+#    include "ops/common/numeric/convert.cuh"
+#    include "ops/common/cuda/memory.cuh"
+#    include "ops/common/cuda/pipeline.cuh"
+#    include "ops/common/cuda/reduce.cuh"
 #    include <cuda_bf16.h>
 #    define NINFER_KERNELS_HOST_DEVICE __host__ __device__
 #else

@@ -5,13 +5,14 @@
 // compiled out on other architectures; dispatch rejects NVFP4 weights there.
 #if defined(NINFER_ENABLE_NVFP4)
 #include "ops/common/mbarrier.cuh"
-#include "ops/common/memory.cuh"
-#include "ops/common/mma.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
+#include "ops/common/cuda/mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_schedule.cuh"
 #include "ops/linear/nvfp4/nvfp4_operands.h"
 #include "ops/linear/nvfp4/nvfp4_shared.cuh"
-#include "ops/common/token_slices.h"
-#include "ops/common/math.h"
+#include "ops/common/host/launch.h"
+#include "ops/common/numeric/math.h"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/common/vector_output.cuh"
 

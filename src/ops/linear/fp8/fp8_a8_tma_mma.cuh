@@ -6,8 +6,8 @@
 #if defined(NINFER_ENABLE_TMA)
 
 #include "ops/common/mbarrier.cuh"
-#include "ops/common/math.h"
-#include "ops/common/token_slices.h"
+#include "ops/common/numeric/math.h"
+#include "ops/common/host/launch.h"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/fp8/fp8_a8_mma_common.cuh"
 #include "ops/linear/fp8/fp8_operands.h"

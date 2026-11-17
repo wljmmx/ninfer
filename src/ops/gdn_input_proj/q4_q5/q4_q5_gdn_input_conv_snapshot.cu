@@ -5,7 +5,7 @@
 
 #include "core/device.h"
 #include "core/pdl.cuh"
-#include "ops/common/math.h"
+#include "ops/common/numeric/math.h"
 #include "ops/gdn_input_proj/gdn_conv.cuh"
 #include "ops/gdn_input_proj/gdn_projected_conv.h"
 #include "ops/linear/q4/q4_simt_launch.cuh"

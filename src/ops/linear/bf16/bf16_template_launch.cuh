@@ -1,7 +1,7 @@
 #pragma once
 
-#include "ops/common/math.h"
-#include "ops/common/token_slices.h"
+#include "ops/common/numeric/math.h"
+#include "ops/common/host/launch.h"
 #include "ops/linear/bf16/bf16_operands.h"
 #include "ops/linear/bf16/bf16_a16_gemv.cuh"
 #include "ops/linear/bf16/bf16_a16_simt.cuh"

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ops/common/warp.cuh"
+#include "ops/common/cuda/reduce.cuh"
 #include "ops/linear/q6/q6_schedule.cuh"
 
 namespace ninfer::ops::detail {

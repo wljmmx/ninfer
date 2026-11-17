@@ -4,7 +4,8 @@
 // and the E2M1 hardware codecs) require Blackwell sm_120a. This translation unit is
 // compiled out on other architectures; dispatch rejects NVFP4 weights there.
 #if defined(NINFER_ENABLE_NVFP4)
-#include "ops/common/math.cuh"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
 #include "ops/linear_swiglu/token_major_mma_epilogue.cuh"
 
 namespace ninfer::ops::detail {

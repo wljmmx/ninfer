@@ -6,9 +6,11 @@
 // owning BF16 row multiplier. Output owns the physical row mapping so fused projections reuse the
 // same weight/decode mainloop without materializing a packed parent output.
 
-#include "ops/common/math.cuh"
-#include "ops/common/memory.cuh"
-#include "ops/common/warp.cuh"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/pipeline.cuh"
+#include "ops/common/cuda/reduce.cuh"
 #include "ops/linear/fp8/fp8_schedule.cuh"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/fp8/fp8_operands.h"

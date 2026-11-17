@@ -5,7 +5,7 @@
 
 #include "core/device.h"
 #include "core/pdl.cuh"
-#include "ops/common/math.h"
+#include "ops/common/numeric/math.h"
 #include "ops/linear/q4/q4_sliced_k_launch.cuh"
 #include "ops/linear/q4/q4_simt_launch.cuh"
 #include "ops/linear/q4/q4_gemv_launch.cuh"

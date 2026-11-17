@@ -2,7 +2,7 @@
 
 #include "core/device.h"
 #include "core/layout.h"
-#include "ops/common/math.h"
+#include "ops/common/numeric/math.h"
 #include "ops/linear_attention/gated_delta_net/common.h"
 
 #include <cuda_bf16.h>

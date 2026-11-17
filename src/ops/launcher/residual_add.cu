@@ -3,7 +3,7 @@
 // scalar fallback for two-byte-aligned sliced storage.
 #include "ops/launcher/residual_add.h"
 
-#include "ops/common/math.h"
+#include "ops/common/numeric/math.h"
 #include "ops/kernel/residual_add.cuh"
 #include "core/device.h" // CUDA_CHECK
 

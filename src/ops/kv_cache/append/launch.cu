@@ -1,7 +1,7 @@
 #include "ops/kv_cache/append/launch.h"
 
 #include "core/device.h"
-#include "ops/common/math.h"
+#include "ops/common/numeric/math.h"
 #include "ops/kv_cache/append/kernel.cuh"
 
 #include <cstdint>

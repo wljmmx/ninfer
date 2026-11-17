@@ -3,7 +3,7 @@
 // scalar fallback for two-byte-aligned sliced storage.
 #include "ops/launcher/sigmoid_gate_mul.h"
 
-#include "ops/common/math.h"
+#include "ops/common/numeric/math.h"
 #include "ops/kernel/sigmoid_gate_mul.cuh"
 #include "core/device.h" // CUDA_CHECK
 
