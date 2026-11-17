@@ -143,7 +143,14 @@ struct PrefixExecutionTracker {
 struct DecoderState {
     std::string utf8_pending;
     std::string think_marker_pending;
+    // Content bytes held while deciding whether they are one redundant reasoning-close
+    // serialization. Only used while `swallow_close_once` is set - right after an injected thinking
+    // control - and only until the first content byte is emitted.
+    std::string content_prefix_pending;
     std::array<std::string, 2> stop_pending;
+    bool swallow_close_once        = false;
+    // After swallowing the redundant close, the framing's trailing newlines are dropped too.
+    bool drop_framing_newlines     = false;
     bool in_reasoning              = false;
     bool strip_content_leading     = false;
     bool exact_reasoning_framing   = false;
@@ -250,6 +257,47 @@ void close_channel(DecoderState& state, OutputChannel channel, DecodedOutput& em
 
 void feed_content(DecoderState& state, std::string text, const StopPolicy& policy,
                   DecodedOutput& emitted, std::uint32_t committed_tokens, StopMatch* best_match) {
+    // One redundant reasoning-close serialization is tolerated at the START of content when a
+    // thinking control was injected. The control already closed the phase, but a model trained to
+    // finish that framing itself emits it again; publishing those bytes puts framing into the
+    // answer and out of a choice/regex language (measured on the 27B artifact: content became
+    // "</think>\n\nroute_answer"). The tolerance is exactly one marker, only while nothing has been
+    // published yet, and only after an injected control.
+    if (state.swallow_close_once) {
+        state.content_prefix_pending += text;
+        const std::string& pending = state.content_prefix_pending;
+        constexpr std::string_view kClose = kThinkClose;
+        // The canonical serialization starts with a newline; the model may repeat it or not.
+        const std::size_t start = (!pending.empty() && pending[0] == '\n') ? 1 : 0;
+        const std::string_view after_lead(pending.data() + start, pending.size() - start);
+        if (after_lead.size() >= kClose.size() && after_lead.compare(0, kClose.size(), kClose) == 0) {
+            std::size_t cut = start + kClose.size();
+            while (cut < pending.size() && (pending[cut] == '\n' || pending[cut] == '\r')) { ++cut; }
+            std::string rest = pending.substr(cut);
+            state.content_prefix_pending.clear();
+            state.swallow_close_once   = false;
+            // The framing's own trailing newlines may arrive in later tokens; drop them, but not
+            // spaces (a choice value may legitimately begin with one).
+            state.drop_framing_newlines = true;
+            if (!rest.empty()) {
+                feed_content(state, std::move(rest), policy, emitted, committed_tokens, best_match);
+            }
+            return;
+        }
+        // A possible prefix of the marker: hold it rather than publishing framing early.
+        if (kClose.substr(0, std::min(kClose.size(), after_lead.size())) == after_lead) { return; }
+        // Not the marker after all: publish what was held and stop tolerating.
+        text = std::move(state.content_prefix_pending);
+        state.content_prefix_pending.clear();
+        state.swallow_close_once = false;
+    }
+    if (state.drop_framing_newlines) {
+        std::size_t begin = 0;
+        while (begin < text.size() && (text[begin] == '\n' || text[begin] == '\r')) { ++begin; }
+        text.erase(0, begin);
+        if (text.empty()) { return; }
+        state.drop_framing_newlines = false;
+    }
     if (state.strip_content_leading) {
         std::size_t begin = 0;
         while (begin < text.size() && std::isspace(static_cast<unsigned char>(text[begin])) != 0) {
@@ -318,6 +366,13 @@ void terminalize(DecoderState& state, const StopPolicy& policy, DecodedOutput& e
         state.think_marker_pending.clear();
         close_channel(state, OutputChannel::Reasoning, emitted);
     } else {
+        // A held content prefix is not the redundant close after all: publish it before closing.
+        if (!state.content_prefix_pending.empty()) {
+            feed_channel(state, OutputChannel::Content, std::move(state.content_prefix_pending),
+                         policy, emitted, committed_tokens, nullptr);
+            state.content_prefix_pending.clear();
+        }
+        state.swallow_close_once = false;
         close_channel(state, OutputChannel::Content, emitted);
     }
     state.stop_pending = {};
@@ -641,6 +696,9 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     impl_->preview_semantic.control_pending = false;
     impl_->preview_semantic.applied         = true;
     impl_->preview_semantic.injected_tokens = static_cast<std::uint32_t>(tokens.size());
+    // The control IS the framing close. If the model repeats it before its answer (measured), it is
+    // swallowed once rather than published as content; see feed_content.
+    impl_->preview_state.swallow_close_once = true;
     impl_->accept_grammar(tokens);
     impl_->preview_finish_reason = FinishReason::None;
     impl_->preview_ready         = true;

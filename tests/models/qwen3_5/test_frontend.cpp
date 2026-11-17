@@ -2191,6 +2191,14 @@ int test_choice_thinking_control(const Frontend& frontend) {
     auto closed = session.commit_preview();
     failures += check(channel_text(closed, ninfer::OutputChannel::Content).empty(),
                       "choice thinking framing leaked into content");
+    // The 27B artifact answers an injected control by repeating the close framing itself before its
+    // actual answer (measured: content became "</think>\n\nroute_answer"). That repetition is
+    // swallowed once - it is the same framing, not content - and its trailing newlines with it.
+    (void)session.preview_model(frontend.tokenize_text("</think>\n\n"), 512,
+                                ninfer::FinishReason::OutputLimit);
+    const auto echo = session.commit_preview();
+    failures += check(channel_text(echo, ninfer::OutputChannel::Content).empty(),
+                      "repeated close framing leaked into content");
     (void)session.preview_model(frontend.tokenize_text(" yes"), 512,
                                 ninfer::FinishReason::OutputLimit);
     failures += check(channel_text(session.commit_preview(), ninfer::OutputChannel::Content) ==
