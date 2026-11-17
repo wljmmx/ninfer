@@ -54,6 +54,15 @@
 `trailing_content` 取值和 `empty_arguments_omitted` 计数（请求日志 schema 仍为 29），
 新 decoder 不再产生这两个 fallback；其余语义与 `bc70d7c8` 一致。
 
+**2026-11-17 收尾（V10-60）**：前端套件的 `test_structured_tool_output` 一直沿用移植前的
+样本（`<parameter=enabled>` 空值 + 整型参数裸 `many`），而新 decoder 与
+`test_tool_call_parser` / `test_tool_constraints` 都要求 JSON 编码参数是合法 JSON，空 JSON
+值直接判非法——这正是该用例长期红的原因。此前把它记成「TagDispatch 自由文本前缀不接受
+换行」是误判：加临时追踪（已撤回）可见拒绝点在 **JSON 值位置**，被接受的前缀已含换行与完整
+`<tool_call>` / `<function=…>` 框架，xgrammar 的 tag-dispatch 从未拒绝 `0x0a`。已按上游同
+用例改为 `false` / `"many"` 并去掉 omit 断言（`f3788115`），grammar / parser / frontend /
+constraints / streaming 五套测试全绿。
+
 ## T072 `58733a86` — JPEG 解码对齐 Pillow
 
 三方比对：本地 `src/media/decode/decode.cpp` 与上游父版本同构（自建 AVIO + FFmpeg

@@ -8,7 +8,7 @@ bea6de86	2026-11-13	test(gdn): verify NVFP4 A16 state and benchmark contracts	na
 b9907b64	2026-11-13	test(linear): cover NVFP4 A16 prefill contracts	na-arch	upstream-alignment#2:perf(linear)	NVFP4 A16 prefill 用例
 7b87d895	2026-11-13	feat(linear): extend 28672-row NVFP4 A16 SwiGLU	na-arch	upstream-alignment#2:perf(linear)	NVFP4 A16 28672 行 SwiGLU
 9dd11157	2026-11-13	feat(linear): extend 34816-row NVFP4 A16 SwiGLU	na-arch	upstream-alignment#2:perf(linear)	NVFP4 A16 34816 行 SwiGLU
-8e464812	2026-11-12	fix(grammar): backport cache and token boundary fixes	todo	local:third_party/xgrammar/cpp/grammar_matcher.cc:508	本地 9 文件与提交前像逐字节相同，可直接打 backport(#1003/#942)
+8e464812	2026-11-12	fix(grammar): backport cache and token boundary fixes	absorbed	local:63b3dbf1	已回移（V10-57）：9 文件与提交前像逐字节一致，ninfer_grammar_test 通过
 bc72f853	2026-11-12	perf(linear): overlap NVFP4 activation quantization	na-arch	upstream-alignment#2:perf(linear)	NVFP4 A4 激活量化重叠
 ca2c80da	2026-11-12	perf(linear): specialize Q4 draft head geometry	na-hardware	upstream-alignment#6.1	rtx5090 q4 n248320_k5120；本地 q4 无该形状(有 q8/q6)
 dc2a56fb	2026-11-12	perf(linear): reduce NVFP4 decode staging overhead	na-arch	upstream-alignment#2:perf(linear)	NVFP4 decode staging
@@ -31,7 +31,7 @@ d01e04ba	2026-11-11	feat(qsa): add and tune four-head sparse GQA for current KV 
 f918cbdf	2026-11-11	feat(linear): add RTX 5090 FP8 projections and shared row views	na-hardware	local:src/core/weight_view.cpp:315	含共享放宽(partial RowScale 父视图)；本地仍拒绝，需单独提取
 2ebf2937	2026-11-11	feat(linear): add tuned RTX 5090 NVFP4 dense FFN shapes	na-arch	upstream-alignment#2:perf(linear)	5090 NVFP4 dense FFN 形状
 13ebb92f	2026-11-11	fix(text): correct Jinja capture lifetimes and iteration	deferred	local:third_party/llama-jinja/jinja/runtime.h:262	本地 llama-jinja 已分叉(value_object 环境/异常 break)，需重写非搬运；解锁=按本地分叉重写 Jinja 帧
-4461c968	2026-11-10	fix(frontend): reject malformed tool history as invalid input	todo	local:src/models/qwen3_5/frontend/chat_template.cpp:227	本地直接 Json::parse，缺 400 行号上下文；落点 qwen3_5 frontend
+4461c968	2026-11-10	fix(frontend): reject malformed tool history as invalid input	absorbed	local:14cd87be	已实现（V10-58）：逐消息/逐调用解析，报 messages[i].tool_calls[j] 与字节偏移，invalid_argument 映射 invalid_prompt
 e8059c32	2026-11-10	fix(cache): preserve current input recovery under pressure	deferred	local:src/runtime/engine/context_cache/reclaim_selection.h	本地无该文件与 CaptureStorage；随 3b76b98c 同批；解锁=同 3b76b98c
 52e7cd7e	2026-11-10	perf(text): reduce Jinja rendering overhead	deferred	local:third_party/llama-jinja/jinja/runtime.h:80	帧池/渲染直写未落地；与 13ebb92f 同一改造；解锁=同 13ebb92f
 77418cfe	2026-11-10	fix(inference): eliminate redundant prompt work and prefill splits	deferred	local:src/models/qwen3_5/frontend/processor.h:113	本地仍保留 rewrite_execution_frontiers(10 文件)，但前端结构不同；解锁=前端/identity 对齐
