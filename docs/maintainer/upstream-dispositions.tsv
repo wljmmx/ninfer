@@ -63,7 +63,7 @@ a1df8b38	2026-11-08	feat(distributed): add native Spark collectives	dead	v9-clos
 9d06bec9	2026-11-07	fix(moe): synchronize native FP4 pipeline handoffs	na-arch	upstream-alignment#2:perf(moe)	原生 FP4 流水 handoff 同步
 5fb5529f	2026-11-07	perf(ops): optimize Spark decode projections and sparse MLA	dead	v9-closeout-register#T214:T001	Spark decode 投影 + sparse MLA
 68a02c25	2026-11-07	docs: remove completed fp4-local op checklist	na-doc	upstream-alignment#9.3	上游删除已完成 fp4-local 清单 docs
-77c2e5e2	2026-11-07	fix(runtime): recover preempted requests without stalling	todo	local:80d7eddf	2026-11-17 部分吸收：关闭顺序已完成并实测（引擎先停→HTTP 再 join；信号交给 10ms 监控线程；Windows 补 SIGBREAK；27B 上 0.672s 退出、在飞请求 503）。余：zero-frontier 直恢复、恢复容量保留到首个提交单元、direct/snapshot/replay 计数与 replay 速率
+77c2e5e2	2026-11-07	fix(runtime): recover preempted requests without stalling	todo	local:80d7eddf,47726dc1	2026-11-17 部分吸收：① 关闭顺序（引擎先停→HTTP 再 join；信号交给 10ms 监控线程；Windows 补 SIGBREAK；27B 上 0.672s 退出、在飞请求 503）；② zero-frontier 直恢复（resume_without_replay 按 frontier 判定，新增 Direct 路由；Direct/snapshot/replay 分别计数并进 /monitor/snapshot、/metrics、请求日志；native_transactions 新用例在旧逻辑下失败、修后通过）。余：恢复容量保留到首个提交单元的显式验收、replay 速率进操作日志
 62674bae	2026-11-07	style(ops): format merged native projection coverage	na-arch	upstream-alignment#2:style(ops)	formatting only, nothing to align
 361dbbd1	2026-11-06	perf(rmsnorm): specialize Spark plain normalization widths	na-arch	upstream-alignment#2:perf(rmsnorm)	SM100-only (upstream-alignment#2 row perf(rmsnorm))
 4441cf47	2026-11-06	perf(embedding): vectorize Spark BF16 4096 gathers	na-arch	upstream-alignment#2:perf(embedding)	SM100-only (upstream-alignment#2 row perf(embedding))
