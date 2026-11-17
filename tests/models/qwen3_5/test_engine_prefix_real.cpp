@@ -1300,7 +1300,12 @@ int exercise_agent_continuation(const char* artifact) {
     request.execution.requested_output_tokens = 4;
     request.execution.sampling.temperature    = 0.0F;
     request.execution.allow_prefix_reuse      = true;
-    request.stop.include_model_defaults       = false;
+    // This fixture offers one non-parallel tool, so the tool contract constrains the output, and a
+    // constrained request must keep the model-default EOS (frontend.cpp: "constraints require
+    // default EOS, text output, no custom stops, and one output language"). Turning the defaults
+    // off here - written before constrained decoding existed - made every round throw, and because
+    // main() had no catch the scenario died as 0xc0000409 with no output rather than reporting it
+    // (V10-70). This case is about prefix ownership, not about stop policy, so it keeps defaults.
     const auto opener_tokens =
         static_cast<std::uint32_t>(engine.tokenize_text("<|im_start|>assistant\n<think>\n").size());
     const auto closing_tokens =
@@ -2538,7 +2543,17 @@ int main() {
     } else if (scenario == "late-instructions") {
         result = exercise_late_instructions(artifact);
     } else if (scenario == "agent-continuation") {
-        result = exercise_agent_continuation(artifact);
+        // Same reasoning as the "all" chain below: a refusal must name itself instead of leaving
+        // main() through terminate() as 0xc0000409 with no output (V10-70).
+        try {
+            result = exercise_agent_continuation(artifact);
+        } catch (const std::exception& error) {
+            std::cerr << "agent continuation failed: " << error.what() << '\n';
+            return 1;
+        } catch (...) {
+            std::cerr << "agent continuation failed: unknown exception\n";
+            return 1;
+        }
     } else if (scenario == "merged-prefill") {
         try {
             result = exercise_merged_prefill_tail(artifact);
