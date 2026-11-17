@@ -19,6 +19,7 @@
 |---|---|---|
 | 35B default 930 MiB PPL | 4801 / 2.051275 / 7.777808 逐位 | T002 基线 + T082/T153–T158/T167 复跑 |
 | 35B 冻结 12 GiB PPL | 4801 / 2.049253 / 7.762104 逐位 | T002 + T082 + T159–T164 引用 |
+| 35B MoE 门禁复跑（2026-11-17，13.5） | **4801 / 2.055310 / 7.809254**，对 `gate.cmd` 的 7.776858 偏差 **+0.417%**（容差 0.5%）→ **PASS**；seam `ninfer_kv_seam_test` PASS；Track A golden 文件不存在 → SKIP。**说明**：与上两行的“逐位”值已不同（与 27B 同源的 YaRN native 默认，见下一条），此处门禁是容差判定而非逐位；默认 930 MiB 档因构建树短暂不可执行未复测 | `tools/gate.cmd`（`NINFER_GATE_MODEL=R:\model\qwen3_6_35b_a3b_e2\...`） |
 | 27B regress fast | default PPL **7.445538**、selector-off dump **61bfd6e5efee6395**、9 点 0 回归（2026-11-11 重录，旧值见下行） | T082/T158/T167 + 重录留档 |
 | 27B moe | 7.111129 / 7.777808 / 6.479183 + decode d093ac2070ab3292 逐位 | T082/T158 |
 | seam | ninfer_kv_seam_test Passed | T082/T167 |
