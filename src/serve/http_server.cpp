@@ -574,6 +574,11 @@ bool HttpServer::listen() {
 }
 
 void HttpServer::stop() {
+    // Wake every generation handler BEFORE cpp-httplib joins its HTTP worker queue: a handler
+    // blocked in an engine wait must be able to return on its own, and the join cannot finish until
+    // it does. Stopping the engine first also makes late submissions fail fast instead of queueing
+    // behind a worker that is about to exit.
+    if (service_) { service_->request_stop(); }
     observations_.stop();
     server_.stop();
 }

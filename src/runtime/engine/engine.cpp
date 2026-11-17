@@ -322,6 +322,12 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             runtime::context_length_error_message(prompt_summary.prompt_tokens,
                                                   impl_->options.max_context));
     }
+    // A stop that has already been requested must refuse new work here rather than let it queue
+    // behind a worker that is about to terminate: the serve layer calls request_stop() before it
+    // joins its HTTP workers, so this is the window in which a late request arrives.
+    if (!is_available()) {
+        throw RequestError(RequestErrorKind::Unavailable, "inference engine is unavailable");
+    }
     // 13.4: SLO admission. The counters are sampled here rather than in a background thread: a
     // process with no traffic has no service rate to estimate, and its last rate is the best one.
     if (impl_->slo.enabled()) {
@@ -700,6 +706,18 @@ bool Engine::is_available() const {
                 return false;
             } else {
                 return core != nullptr && core->is_available();
+            }
+        },
+        impl_->core);
+}
+
+void Engine::request_stop() noexcept {
+    if (impl_ == nullptr) { return; }
+    std::visit(
+        [](auto& core) {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (!std::is_same_v<CoreState, std::monostate>) {
+                if (core != nullptr) { core->request_stop(); }
             }
         },
         impl_->core);

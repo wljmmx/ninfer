@@ -145,12 +145,20 @@ public:
     }
 
     ~EngineCore() noexcept {
+        request_stop();
+        if (worker_.joinable()) { worker_.join(); }
+    }
+
+    // May be called while consumers are waiting; only the worker releases model resources. Split out
+    // of the destructor so the serve layer can stop the engine BEFORE joining its HTTP workers: a
+    // generation handler blocked in a wait has to see "stopping" and return, and it cannot do that
+    // while the join in the destructor is the only place the flag is raised.
+    void request_stop() noexcept {
         {
             std::lock_guard lock(queue_mutex_);
             stopping_ = true;
         }
         queue_cv_.notify_all();
-        if (worker_.joinable()) { worker_.join(); }
     }
 
     EngineCore(const EngineCore&)            = delete;

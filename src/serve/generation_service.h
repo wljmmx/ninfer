@@ -183,6 +183,11 @@ public:
 
     void warmup();
 
+    // Wakes every handler blocked on the engine and refuses new work. Called by HttpServer::stop()
+    // BEFORE it joins its HTTP workers, so a connected streaming client can finish on its own terms
+    // instead of waiting for the join to complete first.
+    void request_stop() noexcept { engine_->request_stop(); }
+
     // Attaches the LMCache checkpoint cache when NINFER_LMCACHE_RESTORE is set and the library was
     // built in. Returns false when it is off, not configured, or failed to connect -- the server runs
     // either way, because the cache is an accelerator and not a dependency.
@@ -194,6 +199,13 @@ public:
     void stop_checkpoint_cache();
 
 private:
+    // Wraps a caller's cancellation predicate with the engine's own availability, so work that was
+    // admitted before stop() and is still being prepared stops at its next poll instead of running
+    // to completion. A stopped engine is reported as Unavailable, which the adapters already map to
+    // 503 rather than a client error.
+    [[nodiscard]] std::function<bool()>
+    preparation_cancellation(std::function<bool()> external) const;
+
     enum class CacheParticipation : std::uint8_t {
         Disabled,
         ReadWrite,

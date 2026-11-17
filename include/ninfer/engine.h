@@ -140,6 +140,12 @@ public:
     [[nodiscard]] std::size_t resize_accepted_inflight() const;
     [[nodiscard]] bool is_available() const;
 
+    // Idempotent, thread-safe stop request. Rejects new work immediately; the worker terminates
+    // generation requests after draining their device consumers, and accepted scoring work finishes
+    // before the worker exits. Handles stay valid for collecting results. Split out of the
+    // destructor so the serve layer can raise it BEFORE joining its HTTP workers.
+    void request_stop() noexcept;
+
     // 13.4: runtime pool resize. Only legal while the engine is idle: an expert window a running
     // layer is addressing cannot be unmapped, and a captured graph froze the window offsets. The
     // call synchronizes the device after checking both, and returns the capacity actually reached

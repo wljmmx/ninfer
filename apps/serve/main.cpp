@@ -15,16 +15,18 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 
 namespace {
 
-std::atomic<ninfer::serve::HttpServer*> g_server{nullptr};
+// The handler only raises a flag: everything it could reach from a signal context is a lock or a
+// socket operation, and neither belongs there. A monitor thread performs the stop, which keeps the
+// ordering (engine first, then the HTTP worker join) in one place.
+static_assert(std::atomic<bool>::is_always_lock_free);
+std::atomic<bool> g_stop_requested{false};
 
-void handle_signal(int) {
-    ninfer::serve::HttpServer* server = g_server.load();
-    if (server != nullptr) { server->stop(); }
-}
+void handle_signal(int) { g_stop_requested.store(true, std::memory_order_relaxed); }
 
 } // namespace
 
@@ -94,16 +96,31 @@ int main(int argc, char** argv) {
             std::chrono::duration<double>(Clock::now() - warmup_started).count());
         server.attach(service);
 
-        g_server.store(&server);
         std::signal(SIGINT, handle_signal);
         std::signal(SIGTERM, handle_signal);
+#ifdef SIGBREAK
+        // Windows has no SIGTERM: CTRL_BREAK_EVENT is the console equivalent, and the runtime maps it
+        // to SIGBREAK. Without it a Windows server can only be killed, never drained.
+        std::signal(SIGBREAK, handle_signal);
+#endif
 
         serving = true;
         operational_log.server_ready(options.host, options.port, server.public_model_id(),
                                      !options.api_key.empty());
 
+        // 10 ms is the cost of a shutdown request waiting behind a sleep, and this is one thread
+        // that does nothing else; a condition variable would make the handler take a lock.
+        std::jthread stop_monitor([&server](std::stop_token stop) {
+            while (!stop.stop_requested()) {
+                if (g_stop_requested.load(std::memory_order_relaxed)) {
+                    server.stop();
+                    return;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        });
         const bool ok = server.listen();
-        g_server.store(nullptr);
+        stop_monitor.request_stop();
         if (!ok) {
             operational_log.listen_failure(options.host, options.port);
             return 1;
@@ -111,7 +128,6 @@ int main(int argc, char** argv) {
         operational_log.server_stopped();
         return 0;
     } catch (const std::exception& exception) {
-        g_server.store(nullptr);
         operational_log.server_failure(serving, exception.what());
         return 1;
     }

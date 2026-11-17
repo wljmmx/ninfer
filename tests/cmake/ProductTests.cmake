@@ -69,3 +69,10 @@ ninfer_add_test(ninfer_http_error_handler_test
 ninfer_add_test(ninfer_http_transport_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_transport.cpp"
   LIBRARIES ninfer_serve)
+
+# Needs a real artifact and a Device; the script returns 77 (CTest SKIP) when
+# NINFER_TEST_ARTIFACT is not set, like the other _real tests.
+add_test(NAME ninfer_serve_shutdown_real_test
+  COMMAND ${Python3_EXECUTABLE} -B ${PROJECT_SOURCE_DIR}/tests/test_serve_shutdown_real.py
+          $<TARGET_FILE:ninfer-serve>)
+set_tests_properties(ninfer_serve_shutdown_real_test PROPERTIES SKIP_RETURN_CODE 77)
