@@ -16,6 +16,14 @@ ninfer_add_test(ninfer_artifact_formats_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_formats.cpp"
   LIBRARIES ninfer_artifact)
 
+# port (sm_89) V10-13: a rank-3 batched block-scale bank with one FP32 divisor per expert, read from
+# a synthetic artifact and addressed one expert matrix at a time. The fixture writes the planes the
+# layout names by hand, so the test grades decoding, not the writer.
+ninfer_add_test(ninfer_artifact_weight_bank_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_weight_bank.cpp"
+  LIBRARIES ninfer_artifact)
+set_tests_properties(ninfer_artifact_weight_bank_test PROPERTIES SKIP_RETURN_CODE 77)
+
 # This test injects CUDA allocation failures by intercepting cudaMalloc and friends through
 # GNU ld's --wrap. MSVC's linker has no equivalent, so the target is GNU/ELF-hosted only.
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT MSVC)

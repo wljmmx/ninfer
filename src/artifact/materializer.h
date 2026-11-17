@@ -90,6 +90,9 @@ private:
         std::optional<WeightParent> device;
         std::optional<WeightParent> host;
         std::vector<std::byte> host_data;
+        // port (sm_89) V10-13: the divisors a block-scaled parent stores, one per declared domain.
+        // Owned here so the Host and the device parent borrow the same span.
+        std::vector<float> weight_divisors;
     };
 
     std::unique_ptr<DeviceArena> arena_;

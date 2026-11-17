@@ -37,6 +37,11 @@ struct TensorObject {
     std::string layout;
     std::uint64_t offset = 0;
     std::uint64_t bytes  = 0;
+    // port (sm_89) V10-13: how many FP32 divisor words the payload ends with. Zero means the object
+    // does not state a count: a batched block-scale layout then means one per expert matrix and
+    // every other layout the single matrix divisor it has always stored. A nonzero count is the
+    // only way a rank-two stack can say that each expert row block owns its own word.
+    std::uint64_t divisors = 0;
 };
 
 struct ResourceObject {

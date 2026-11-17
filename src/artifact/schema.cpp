@@ -218,7 +218,7 @@ void parse_objects(Directory& out, const Json& objects) {
         const auto kind = require_id(value.at("kind"), "object kind");
         if (kind == "tensor") {
             require_members(value, {"id", "kind", "shape", "format", "layout", "offset", "bytes"},
-                            {}, "tensor");
+                            {"divisors"}, "tensor");
         } else if (kind == "resource") {
             require_members(value, {"id", "kind", "encoding", "offset", "bytes"}, {}, "resource");
         } else {
@@ -236,9 +236,15 @@ void parse_objects(Directory& out, const Json& objects) {
         }
         previous_end = end;
         if (kind == "tensor") {
+            // port (sm_89) V10-13: an object may state how many FP32 divisor words end its payload.
+            // Absent keeps the historical single-word meaning, so every rank-two descriptor written
+            // before a divisor array existed describes exactly the bytes it used to.
+            const auto divisors = value.contains("divisors")
+                                      ? require_u64(value.at("divisors"), id + ": divisors", true)
+                                      : 0;
             out.objects.emplace_back(TensorObject{
                 id, parse_shape(value.at("shape"), id), require_id(value.at("format"), id),
-                require_id(value.at("layout"), id), offset, bytes});
+                require_id(value.at("layout"), id), offset, bytes, divisors});
         } else {
             out.objects.emplace_back(
                 ResourceObject{id, require_id(value.at("encoding"), id), offset, bytes});

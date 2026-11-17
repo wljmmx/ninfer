@@ -9,7 +9,6 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
-#include <array>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -83,24 +82,44 @@ struct ReadSpan {
     std::uint64_t end   = 0;
 };
 
-float read_divisor(const Reader& reader, ObjectHandle handle, const WeightGeometry& geometry,
-                   std::span<const std::byte> host, MaterializationStats& stats) {
-    if (geometry.format != QType::NVFP4) { return 0.0F; }
-    std::array<std::byte, 4> word{};
+// One FP32 word per declared divisor domain: a batched or stacked bank declares one per expert, so
+// every word is checked here rather than only the first - a mixture with one bad expert would
+// otherwise run that expert at a silent 1.0 multiplier.
+std::vector<float> read_divisors(const Reader& reader, ObjectHandle handle,
+                                 const WeightGeometry& geometry, std::span<const std::byte> host,
+                                 MaterializationStats& stats) {
+    std::vector<float> out;
+    if (geometry.format != QType::NVFP4 || !geometry.divisor_count) { return out; }
+    const auto bytes = checked_mul(geometry.divisor_count, 4, "weight divisor plane");
+    if (bytes > std::numeric_limits<std::size_t>::max()) {
+        throw ArtifactError("weight divisor plane exceeds size_t");
+    }
+    std::vector<std::byte> words(static_cast<std::size_t>(bytes));
     if (!host.empty()) {
-        std::copy_n(host.data() + geometry.divisor_offset, word.size(), word.data());
+        std::copy_n(host.data() + geometry.divisor_offset, words.size(), words.data());
     } else {
         const auto& object = reader.directory().tensor(handle);
         reader.read_into(checked_add(object.offset, geometry.divisor_offset, "weight divisor"),
-                         word);
-        stats.read_bytes = checked_add(stats.read_bytes, word.size(), "read bytes");
+                         words);
+        stats.read_bytes = checked_add(stats.read_bytes, bytes, "read bytes");
     }
-    const auto value = std::bit_cast<float>(read_u32_le(word.data()));
-    if (!std::isfinite(value) || value <= 0) {
-        throw ArtifactError(reader.directory().tensor(handle).id +
-                            ": invalid NVFP4 weight divisor");
+    out.reserve(static_cast<std::size_t>(geometry.divisor_count));
+    for (std::uint64_t index = 0; index < geometry.divisor_count; ++index) {
+        const auto value = std::bit_cast<float>(read_u32_le(words.data() + index * 4));
+        if (!std::isfinite(value) || value <= 0) {
+            throw ArtifactError(reader.directory().tensor(handle).id +
+                                ": invalid NVFP4 weight divisor " + std::to_string(index) + " of " +
+                                std::to_string(geometry.divisor_count));
+        }
+        out.push_back(value);
     }
-    return value;
+    return out;
+}
+
+// The single scalar the native ABI carries, or zero when the parent holds a mixture of domains and
+// no one value describes it; the per-expert array above is what a bank reads.
+float scalar_divisor(const std::vector<float>& divisors) {
+    return divisors.size() == 1 ? divisors.front() : 0.0F;
 }
 
 } // namespace
@@ -189,13 +208,15 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             checked_add(out.stats_.retained_host_bytes, storage.host_data.size(), "retained bytes");
         if (std::holds_alternative<TensorObject>(object)) {
             const auto& geometry = reader.geometry(placement.object);
-            const auto divisor =
-                read_divisor(reader, placement.object, geometry, storage.host_data, out.stats_);
-            storage.host = WeightParent{geometry, storage.host_data.data(), divisor};
-        storage.host->device = Device::cpu();
-        // port (sm_89): a Host-resident object names itself, so a host-backed tier can map a
-        // bank chunk back to this payload instead of assuming object 0.
-        storage.host->source_object = placement.object.index;
+            storage.weight_divisors =
+                read_divisors(reader, placement.object, geometry, storage.host_data, out.stats_);
+            storage.host                  = WeightParent{geometry, storage.host_data.data(),
+                                                         scalar_divisor(storage.weight_divisors)};
+            storage.host->weight_divisors = storage.weight_divisors;
+            storage.host->device          = Device::cpu();
+            // port (sm_89): a Host-resident object names itself, so a host-backed tier can map a
+            // bank chunk back to this payload instead of assuming object 0.
+            storage.host->source_object = placement.object.index;
         }
     }
     std::vector<CopyRange> ranges;
@@ -212,13 +233,15 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         if (offset != placement.offset) {
             throw ArtifactError("device offset differs from materialization plan");
         }
-        const auto divisor = object.host
-                                 ? object.host->weight_scale_divisor
-                                 : read_divisor(reader, placement.object, geometry, {}, out.stats_);
-        object.device =
-            WeightParent{geometry, static_cast<const std::byte*>(storage.data), divisor};
-        object.device->device = Device::cuda(device.device);
-        const auto& descriptor = reader.directory().tensor(placement.object);
+        if (!object.host) {
+            object.weight_divisors =
+                read_divisors(reader, placement.object, geometry, {}, out.stats_);
+        }
+        object.device = WeightParent{geometry, static_cast<const std::byte*>(storage.data),
+                                     scalar_divisor(object.weight_divisors)};
+        object.device->weight_divisors = object.weight_divisors;
+        object.device->device          = Device::cuda(device.device);
+        const auto& descriptor         = reader.directory().tensor(placement.object);
         for (const auto& segment : reader.segments(descriptor.offset, descriptor.bytes)) {
             ranges.push_back({segment.file_index, segment.file_offset,
                               checked_add(segment.file_offset, segment.bytes, "copy range"),
