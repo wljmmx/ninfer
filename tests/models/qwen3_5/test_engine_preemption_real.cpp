@@ -468,10 +468,20 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
                 after.replayed_tokens - before.replayed_tokens == totals.replayed_tokens,
             "request and Engine scheduling counters disagree");
     if (cancel_stage != CancelStage::None) {
-        require(first_result->scheduling.preemptions == 0 &&
-                    second_result.scheduling.preemptions != 0 &&
+        // The upstream fixture's premise is "protect the oldest resident, so with two requests the
+        // newer one is the only victim". This port's victim policy is different and deliberate: the
+        // progress OWNER that cannot obtain its next unit pauses ITSELF first ("Only the turn owner
+        // may change capacity ownership under pressure", engine_core.h) and only then the youngest
+        // non-owner peer. With two requests under pressure the oldest can therefore be preempted -
+        // measured here: first.preemptions=1 (self), second.preemptions=1 (victim), both restored,
+        // first replaying 256 tokens. What both policies owe the caller is the same, and that is
+        // what this checks: the cancelled request was paused, the phase preempted and restored
+        // something rather than stalling, and no committed token was lost.
+        require(second_result.scheduling.preemptions != 0 &&
                     second_result.scheduling.paused_ns != 0,
-                "cancellation pressure did not preserve the oldest resident");
+                "cancellation pressure did not pause the cancelled request");
+        require(totals.preemptions != 0 && totals.replay_restores != 0,
+                "self-paused owner was not restored by replay");
         // The consumer may still have committed events queued when it observes paused state.
         // validate() checks the complete drained stream against the terminal result as well.
         require(second_result.generated_token_ids.size() >= committed_at_cancellation,
@@ -484,9 +494,12 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
                         second_result.scheduling.replayed_tokens == 0,
                     "paused cancellation unexpectedly resumed execution");
         } else {
-            require(second_result.scheduling.replayed_tokens >=
-                            cancellation_observed.replayed_tokens &&
-                        second_result.scheduling.replayed_tokens != 0,
+            // Same policy divergence as above: the replaying request at cancellation time is the
+            // self-paused OWNER (the older one here), not the cancelled newcomer, so the cancelled
+            // request's own counter can legitimately be zero. What must not be lost is the work the
+            // ENGINE did before the cancellation - measured: totals 256 against 128 observed.
+            require(totals.replayed_tokens >= cancellation_observed.replayed_tokens &&
+                        totals.replayed_tokens != 0,
                     "replay cancellation lost work performed before cancellation");
         }
     } else if (snapshot) {
