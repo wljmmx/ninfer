@@ -60,13 +60,22 @@ inline void copy_bytes(void* destination, const void* source, std::size_t bytes,
 // void. Same call and same direction argument; only the error shape differs. A null operand reports
 // failure rather than throwing, and a zero-byte copy is a success that touches nothing, so both
 // guards behave exactly like their thrown counterparts before CUDA is asked anything.
+//
+// This is the primitive; the two views below are what call sites ask for. A site that prints or
+// rethrows the driver's code needs the code itself (copy_bytes_status), and a site that only asks
+// "did it land" reads better as a bool (try_copy_bytes).
+[[nodiscard]] inline cudaError_t copy_bytes_status(void* destination, const void* source,
+                                                   std::size_t bytes, TransferDirection direction,
+                                                   cudaStream_t stream) noexcept {
+    if (bytes == 0) { return cudaSuccess; }
+    if (destination == nullptr || source == nullptr) { return cudaErrorInvalidValue; }
+    return cudaMemcpyAsync(destination, source, bytes, transfer_kind(direction), stream);
+}
+
 [[nodiscard]] inline bool try_copy_bytes(void* destination, const void* source, std::size_t bytes,
                                          TransferDirection direction,
                                          cudaStream_t stream) noexcept {
-    if (bytes == 0) { return true; }
-    if (destination == nullptr || source == nullptr) { return false; }
-    return cudaMemcpyAsync(destination, source, bytes, transfer_kind(direction), stream) ==
-           cudaSuccess;
+    return copy_bytes_status(destination, source, bytes, direction, stream) == cudaSuccess;
 }
 
 } // namespace ninfer::core

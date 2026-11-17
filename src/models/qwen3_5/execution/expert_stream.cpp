@@ -5,6 +5,7 @@
 #include "models/qwen3_5/execution/cpu_path_policy.h"
 #include "models/qwen3_5/execution/host_expert_residency.h"
 #include "core/memory_budget.h"
+#include "core/transfer.h"
 
 #include <cuda_runtime.h>
 
@@ -1054,9 +1055,11 @@ void ExpertStream::sync_mirror(SlotMirror& mirror, ops::RouteTableKind kind, cud
             }
         }
         std::memcpy(slot_mirror_stage_->data(), staged.data(), bytes);
-        const auto status = cudaMemcpyAsync(mirror.dev + mirror.off[bank],
-                                            slot_mirror_stage_->data(), bytes,
-                                            cudaMemcpyHostToDevice, stream);
+        // V10-12: the direction is an argument. The sites that report the driver's code keep it
+        // (copy_bytes_status); the ones that only branch on the outcome use try_copy_bytes.
+        const auto status = core::copy_bytes_status(mirror.dev + mirror.off[bank],
+                                                    slot_mirror_stage_->data(), bytes,
+                                                    core::TransferDirection::HostToDevice, stream);
         if (status != cudaSuccess) {
             // Leave the generation stale: the next pass retries instead of trusting a short copy.
             ++mirror.dev_fails;
@@ -1545,8 +1548,8 @@ bool ExpertStream::set_predicted_device(const std::int32_t* ids, std::int32_t co
     }
     // Device-to-Device on the caller's stream, so the ids are ready for the layer that consumes them
     // and the workspace arena the router wrote into can be recycled in the meantime. No host wait.
-    const auto status = cudaMemcpyAsync(predicted_ids_device_->p, ids, bytes,
-                                       cudaMemcpyDeviceToDevice, stream);
+    const auto status = core::copy_bytes_status(predicted_ids_device_->p, ids, bytes,
+                                                core::TransferDirection::DeviceToDevice, stream);
     if (status != cudaSuccess) {
         ++predicted_device_failures_;
         std::fprintf(stderr, "[pf-pred] Device hand-off copy (%zu bytes) failed: %s\n", bytes,
@@ -2038,10 +2041,10 @@ void ExpertStream::prefetch_fill_begin_fetch(cudaStream_t stream) {
         const std::size_t counts_bytes = 6 * sizeof(std::uint32_t);
         const std::size_t pairs_bytes  = 2 * std::size_t{fill.capacity} * sizeof(std::uint32_t);
         auto* landing = static_cast<char*>(fill.stage->data());
-        if (cudaMemcpyAsync(landing, fill.counts->p, counts_bytes, cudaMemcpyDeviceToHost, stream) !=
-                cudaSuccess ||
-            cudaMemcpyAsync(landing + counts_bytes, fill.pairs->p, pairs_bytes,
-                            cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
+        if (!core::try_copy_bytes(landing, fill.counts->p, counts_bytes,
+                                  core::TransferDirection::DeviceToHost, stream) ||
+            !core::try_copy_bytes(landing + counts_bytes, fill.pairs->p, pairs_bytes,
+                                  core::TransferDirection::DeviceToHost, stream)) {
             ++fill.failed;
             fill.pending = false;
             std::fprintf(stderr, "[pf-fill] run %zu drain copy failed: %s\n", index,
@@ -2356,8 +2359,8 @@ void ExpertStream::pred_ring_begin_fetch(cudaStream_t stream) {
     }
     auto* base = static_cast<std::byte*>(ring_stage_->data());
     const auto copy = [&](void* destination, const void* source, std::size_t bytes) {
-        const auto status =
-            cudaMemcpyAsync(destination, source, bytes, cudaMemcpyDeviceToHost, stream);
+        const auto status = core::copy_bytes_status(destination, source, bytes,
+                                                    core::TransferDirection::DeviceToHost, stream);
         if (status != cudaSuccess) {
             ++ring_stats_.copy_failures;
             std::fprintf(stderr, "[pf-pred] ring drain copy (%zu bytes) failed: %s\n", bytes,
@@ -3014,8 +3017,8 @@ std::size_t ExpertStream::device_admit_ring(const void* device_ids, std::int32_t
         // The copy reads the pinned slot asynchronously; keep the tier from handing it out until a
         // later layer has waited on the stream.
         host_->hold_for_device(bank_, descriptor.expert);
-        if (cudaMemcpyAsync(destination, source, slot_bytes, cudaMemcpyDeviceToDevice, stream) !=
-            cudaSuccess) {
+        if (!core::try_copy_bytes(destination, source, slot_bytes,
+                                  core::TransferDirection::DeviceToDevice, stream)) {
             throw std::runtime_error(std::string("ring admission copy: ") +
                                      cudaGetErrorString(cudaGetLastError()));
         }
@@ -3246,9 +3249,9 @@ void ExpertStream::publish_split_run(std::size_t index, cudaStream_t stream, boo
         auto& stage = run.placement_stage[run.placement_stage_next];
         run.placement_stage_next ^= 1;
         std::memcpy(stage->data(), run.placement.data(), count_ * sizeof(std::uint32_t));
-        if (cudaMemcpyAsync(run.placement_device->p, stage->data(),
-                            count_ * sizeof(std::uint32_t), cudaMemcpyHostToDevice, stream) !=
-            cudaSuccess) {
+        if (!core::try_copy_bytes(run.placement_device->p, stage->data(),
+                                  count_ * sizeof(std::uint32_t),
+                                  core::TransferDirection::HostToDevice, stream)) {
             throw std::runtime_error(std::string("expert split placement copy: ") +
                                      cudaGetErrorString(cudaGetLastError()));
         }
@@ -3406,8 +3409,8 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
             route_staging_ = std::make_unique<PinnedHostBuffer>(bytes);
         }
         const auto begin  = std::chrono::steady_clock::now();
-        const auto status = cudaMemcpyAsync(route_staging_->data(), device_ids, bytes,
-                                            cudaMemcpyDeviceToHost, stream);
+        const auto status = core::copy_bytes_status(route_staging_->data(), device_ids, bytes,
+                                                    core::TransferDirection::DeviceToHost, stream);
         if (status != cudaSuccess) {
             throw std::runtime_error(std::string("route copy: ") + cudaGetErrorString(status));
         }
@@ -4415,8 +4418,9 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
     const std::int32_t* route_ids = host_ids;
     if (route_ids == nullptr) {
         const auto stage_begin = std::chrono::steady_clock::now();
-        const auto status     = cudaMemcpyAsync(route_staging_->data(), device_ids, bytes,
-                                                cudaMemcpyDeviceToHost, stream);
+        const auto status     = core::copy_bytes_status(route_staging_->data(), device_ids, bytes,
+                                                        core::TransferDirection::DeviceToHost,
+                                                        stream);
         if (status != cudaSuccess) {
             throw std::runtime_error(std::string("route copy: ") + cudaGetErrorString(status));
         }
@@ -5180,7 +5184,7 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                         if (static_warm_) {
                             std::fprintf(stderr,
                                          "[warm-static] table refreshes=%llu candidates=%u "
-                                         "set=%u/bank\n",
+                                         "set=%zu/bank\n",
                                          (unsigned long long)static_table_refreshes_,
                                          static_candidates_count_, hot_cap_);
                         }
@@ -5739,9 +5743,10 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                             // A driver that rejects the batch still has to get the word across, or the
                             // layer would run on the previous placement - the exact failure this
                             // rewrite exists to make impossible. The full copy is 1 KiB.
-                            (void)cudaMemcpyAsync(placement_device_->p, stage->data(),
-                                                  count_ * sizeof(std::uint32_t),
-                                                  cudaMemcpyHostToDevice, stream);
+                            (void)core::try_copy_bytes(placement_device_->p, stage->data(),
+                                                       count_ * sizeof(std::uint32_t),
+                                                       core::TransferDirection::HostToDevice,
+                                                       stream);
                         }
                         ops::moe_expand_expert_placements(
                             static_cast<const std::uint32_t*>(placement_device_->p),
@@ -5917,10 +5922,10 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
                     // A driver that rejects the batch still has to get the tables across: fall back
                     // to the two copies rather than leaving the layer with a stale resident set.
                     if (submitted != cudaSuccess) {
-                        (void)cudaMemcpyAsync(offsets_device_->p, offsets_.data(), table_bytes,
-                                              cudaMemcpyHostToDevice, stream);
-                        (void)cudaMemcpyAsync(mask_device_->p, mask_host_.data(), mask_bytes,
-                                              cudaMemcpyHostToDevice, stream);
+                        (void)core::try_copy_bytes(offsets_device_->p, offsets_.data(), table_bytes,
+                                                   core::TransferDirection::HostToDevice, stream);
+                        (void)core::try_copy_bytes(mask_device_->p, mask_host_.data(), mask_bytes,
+                                                   core::TransferDirection::HostToDevice, stream);
                     }
                     publish_bytes_ += static_cast<std::uint64_t>(table_bytes + mask_bytes);
                     publish_bytes_max_ = std::max(publish_bytes_max_,
