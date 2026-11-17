@@ -11,6 +11,7 @@
 #include "models/qwen3_5/execution/workspace.h"
 
 #include "core/nvtx.h"
+#include "core/transfer.h"
 #include "models/qwen3_5/execution/visual_scatter.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_control.h"
@@ -139,8 +140,8 @@ void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stre
         destination.data == nullptr) {
         throw std::invalid_argument("copy_i32: invalid host source or I32 destination");
     }
-    CUDA_CHECK(cudaMemcpyAsync(destination.data, source, destination.bytes(),
-                               cudaMemcpyHostToDevice, stream));
+    core::copy_bytes(destination.data, source, destination.bytes(),
+                     core::TransferDirection::HostToDevice, stream);
 }
 
 void zero_i32(Tensor& destination, cudaStream_t stream) {
@@ -454,9 +455,11 @@ void DFlashFeatureSink::capture_positions(const Tensor& source, cudaStream_t str
         positions == nullptr || active_tokens > positions->ne[0]) {
         throw std::logic_error("DFlash feature positions are invalid");
     }
-    CUDA_CHECK(cudaMemcpyAsync(positions->data, source.data,
-                               static_cast<std::size_t>(active_tokens) * sizeof(std::int32_t),
-                               cudaMemcpyDeviceToDevice, stream));
+    // V10-12: direction is an argument here too, so every copy in this file names d2d / h2d / d2h
+    // at the call site. Pitched (cudaMemcpy2DAsync) and batch transfers are a different API and stay.
+    core::copy_bytes(positions->data, source.data,
+                     static_cast<std::size_t>(active_tokens) * sizeof(std::int32_t),
+                     core::TransferDirection::DeviceToDevice, stream);
 }
 
 void DFlashFeatureSink::consume_prefill_chunk(std::int32_t tokens, bool rewrite_checkpoint) {
@@ -732,8 +735,8 @@ void TextContext::mtp_hc_tail(workspace::MtpHcRoots& roots, const Tensor& positi
         if (conditioning->numel() != roots.residual.numel() || !conditioning->is_contiguous()) {
             throw std::invalid_argument("MTP conditioning frame shape mismatch");
         }
-        CUDA_CHECK(cudaMemcpyAsync(conditioning->data, roots.residual.data, roots.residual.bytes(),
-                                   cudaMemcpyDeviceToDevice, s));
+        core::copy_bytes(conditioning->data, roots.residual.data, roots.residual.bytes(),
+                         core::TransferDirection::DeviceToDevice, s);
     }
 }
 
@@ -904,8 +907,8 @@ void TextContext::mtp_forward_core(const Tensor& ids, const Tensor& hidden, cons
         if (conditioning->numel() != mtp_hidden.numel() || !conditioning->is_contiguous()) {
             throw std::invalid_argument("MTP conditioning frame shape mismatch");
         }
-        CUDA_CHECK(cudaMemcpyAsync(conditioning->data, mtp_hidden.data, mtp_hidden.bytes(),
-                                   cudaMemcpyDeviceToDevice, ctx_.stream));
+        core::copy_bytes(conditioning->data, mtp_hidden.data, mtp_hidden.bytes(),
+                         core::TransferDirection::DeviceToDevice, ctx_.stream);
     }
 }
 
@@ -993,21 +996,21 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
                                                   dtype_size(DType::BF16);
                 const std::size_t injection_column =
                     static_cast<std::size_t>(dimension(config_.hc->count)) * sizeof(float);
-                CUDA_CHECK(cudaMemcpyAsync(
+                core::copy_bytes(
                     tail_column.residual.data,
                     static_cast<const char*>(roots.residual.data) +
                         static_cast<std::size_t>(T - 1) * residual_column,
-                    residual_column, cudaMemcpyDeviceToDevice, s));
-                CUDA_CHECK(cudaMemcpyAsync(
+                    residual_column, core::TransferDirection::DeviceToDevice, s);
+                core::copy_bytes(
                     tail_column.input.data,
                     static_cast<const char*>(roots.input.data) +
                         static_cast<std::size_t>(T - 1) * hidden_column,
-                    hidden_column, cudaMemcpyDeviceToDevice, s));
-                CUDA_CHECK(cudaMemcpyAsync(
+                    hidden_column, core::TransferDirection::DeviceToDevice, s);
+                core::copy_bytes(
                     tail_column.injection.data,
                     static_cast<const char*>(roots.injection.data) +
                         static_cast<std::size_t>(T - 1) * injection_column,
-                    injection_column, cudaMemcpyDeviceToDevice, s));
+                    injection_column, core::TransferDirection::DeviceToDevice, s);
             }
         } else {
             Tensor x;
@@ -1034,10 +1037,10 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
                 const auto submitted        = cudaMemcpyBatchAsync(destinations, sources, sizes, 2,
                                                                    &attributes, &attribute_index, 1, s);
                 if (submitted != cudaSuccess) {
-                    CUDA_CHECK(cudaMemcpyAsync(x_last.data, x_src, column_bytes,
-                                               cudaMemcpyDeviceToDevice, s));
-                    CUDA_CHECK(cudaMemcpyAsync(ah_last.data, ah_src, column_bytes,
-                                               cudaMemcpyDeviceToDevice, s));
+                    core::copy_bytes(x_last.data, x_src, column_bytes,
+                                     core::TransferDirection::DeviceToDevice, s);
+                    core::copy_bytes(ah_last.data, ah_src, column_bytes,
+                                     core::TransferDirection::DeviceToDevice, s);
                 }
             }
         }
@@ -1113,9 +1116,9 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
                 if (conditioning->numel() != tail_column.residual.numel()) {
                     throw std::invalid_argument("MTP conditioning frame shape mismatch");
                 }
-                CUDA_CHECK(cudaMemcpyAsync(conditioning->data, tail_column.residual.data,
-                                           tail_column.residual.bytes(),
-                                           cudaMemcpyDeviceToDevice, s));
+                core::copy_bytes(conditioning->data, tail_column.residual.data,
+                                 tail_column.residual.bytes(),
+                                 core::TransferDirection::DeviceToDevice, s);
             }
         } else {
             Tensor o = work_.alloc(DType::BF16, {width, 1});
@@ -1164,14 +1167,14 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
         }
         const auto config_bytes = sizeof(ops::SamplingConfig) * static_cast<std::size_t>(T);
         auto config_span        = work_.alloc_bytes(config_bytes);
-        CUDA_CHECK(cudaMemcpyAsync(config_span.data, configs.data(), config_bytes,
-                                   cudaMemcpyHostToDevice, ctx_.stream));
+        core::copy_bytes(config_span.data, configs.data(), config_bytes,
+                         core::TransferDirection::HostToDevice, ctx_.stream);
         std::vector<std::int32_t> positions(static_cast<std::size_t>(T));
         for (int t = 0; t < T; ++t) { positions[static_cast<std::size_t>(t)] = t; }
         Tensor position_tensor = work_.alloc(DType::I32, {T});
-        CUDA_CHECK(cudaMemcpyAsync(position_tensor.data, positions.data(),
-                                   sizeof(std::int32_t) * static_cast<std::size_t>(T),
-                                   cudaMemcpyHostToDevice, ctx_.stream));
+        core::copy_bytes(position_tensor.data, positions.data(),
+                         sizeof(std::int32_t) * static_cast<std::size_t>(T),
+                         core::TransferDirection::HostToDevice, ctx_.stream);
         ops::sample(output_logits, proposal_tokens, token_domain,
                     static_cast<const ops::SamplingConfig*>(config_span.data), position_tensor,
                     ops::kSamplePurposeDecode, work_, ctx_.stream);
@@ -1330,9 +1333,9 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
                     "text: a multi-row decode needs each row's PLE lane on the Host");
             }
             std::array<std::int32_t, kMaximumConcurrency> tokens{};
-            CUDA_CHECK(cudaMemcpyAsync(tokens.data(), ids.data,
-                                       static_cast<std::size_t>(batch) * sizeof(std::int32_t),
-                                       cudaMemcpyDeviceToHost, stream));
+            core::copy_bytes(tokens.data(), ids.data,
+                             static_cast<std::size_t>(batch) * sizeof(std::int32_t),
+                             core::TransferDirection::DeviceToHost, stream);
             CUDA_CHECK(cudaStreamSynchronize(stream));
             std::array<std::int32_t, kMaximumConcurrency> lanes{};
             std::array<std::uint32_t, kMaximumConcurrency> live{};
@@ -1356,10 +1359,10 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         begin_qsa_pass(work_, config_, batch, qsa);
         if (qsa.active) {
             const Tensor ones = batch_text_kv_->qsa_decode_columns(batch);
-            CUDA_CHECK(cudaMemcpyAsync(qsa.columns.data, ones.data, qsa.columns.bytes(),
-                                       cudaMemcpyDeviceToDevice, stream));
-            CUDA_CHECK(cudaMemcpyAsync(qsa.base.data, cache_positions.data, qsa.base.bytes(),
-                                       cudaMemcpyDeviceToDevice, stream));
+            core::copy_bytes(qsa.columns.data, ones.data, qsa.columns.bytes(),
+                             core::TransferDirection::DeviceToDevice, stream);
+            core::copy_bytes(qsa.base.data, cache_positions.data, qsa.base.bytes(),
+                             core::TransferDirection::DeviceToDevice, stream);
             zero_i32(qsa.offsets, stream);
         }
         ScopedValue<const Tensor*> qsa_columns_binding(active_qsa_columns_,
@@ -1382,8 +1385,8 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         final_hidden(x, sample, batch);
         if (streams) {
             const Tensor residual = hc_.residual.view({dimension(mtp_frame_width()), batch});
-            CUDA_CHECK(cudaMemcpyAsync(hidden.data, residual.data, residual.bytes(),
-                                       cudaMemcpyDeviceToDevice, stream));
+            core::copy_bytes(hidden.data, residual.data, residual.bytes(),
+                             core::TransferDirection::DeviceToDevice, stream);
         }
         // Q67: zero-weight scratch rows for the row-independent output projection. The class width
         // is the compiled shape; the extra rows read zero hidden and their logits are never sampled.
@@ -1510,12 +1513,12 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
             }
             std::vector<std::int32_t> host_ids(static_cast<std::size_t>(columns));
             std::vector<std::int32_t> host_valid(static_cast<std::size_t>(batch));
-            CUDA_CHECK(cudaMemcpyAsync(host_ids.data(), flat_ids.data,
-                                       host_ids.size() * sizeof(std::int32_t),
-                                       cudaMemcpyDeviceToHost, stream));
-            CUDA_CHECK(cudaMemcpyAsync(host_valid.data(), valid_columns.data,
-                                       host_valid.size() * sizeof(std::int32_t),
-                                       cudaMemcpyDeviceToHost, stream));
+            core::copy_bytes(host_ids.data(), flat_ids.data,
+                             host_ids.size() * sizeof(std::int32_t),
+                             core::TransferDirection::DeviceToHost, stream);
+            core::copy_bytes(host_valid.data(), valid_columns.data,
+                             host_valid.size() * sizeof(std::int32_t),
+                             core::TransferDirection::DeviceToHost, stream);
             CUDA_CHECK(cudaStreamSynchronize(stream));
             std::vector<std::uint32_t> live(host_valid.size());
             for (std::size_t b = 0; b < live.size(); ++b) {
@@ -1557,8 +1560,8 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         final_hidden(x, sample, columns);
         if (streams) {
             const Tensor residual = hc_.residual.view({dimension(mtp_frame_width()), columns});
-            CUDA_CHECK(cudaMemcpyAsync(flat_hidden.data, residual.data, residual.bytes(),
-                                       cudaMemcpyDeviceToDevice, stream));
+            core::copy_bytes(flat_hidden.data, residual.data, residual.bytes(),
+                             core::TransferDirection::DeviceToDevice, stream);
         }
         project(sample, *lm_head_, flat_logits, work_, stream);
         ops::argmax(flat_logits, flat_tokens,
@@ -1749,14 +1752,14 @@ void TextContext::prefill_batch(std::span<const std::int32_t> ids,
         // b*width + t. The fill, every batched kernel the pass feeds (attention positions, the GDN
         // conv column walk, the delta net's record mapping) and this tail-column read share the
         // one helper - a private layout here would be the same bug the width-major fill was.
-        CUDA_CHECK(cudaMemcpyAsync(
+        core::copy_bytes(
             static_cast<char*>(last.data) + static_cast<std::size_t>(row) * last.nb[1],
             static_cast<const char*>(source.data) +
                 static_cast<std::size_t>(
                     models::qwen3_5::execution::prefill_batch_flat_column(column, row, width)) *
                 source.nb[1],
             static_cast<std::size_t>(dimension(config_.hidden_size)) * sizeof(std::uint16_t),
-            cudaMemcpyDeviceToDevice, stream));
+            core::TransferDirection::DeviceToDevice, stream);
     }
     if (!hc_enabled())
         ops::rmsnorm(last, *final_norm_, config_.rms_norm_eps, true, normed, stream);
@@ -1785,19 +1788,19 @@ void TextContext::prefill_batch(std::span<const std::int32_t> ids,
             const auto column     = valid_columns[static_cast<std::size_t>(row)] - 1;
             const auto flat       = models::qwen3_5::execution::prefill_batch_flat_column(
                 column, row, width);
-            CUDA_CHECK(cudaMemcpyAsync(target->data,
-                                       static_cast<const char*>(residual.data) +
-                                           static_cast<std::size_t>(flat) * residual.nb[1],
-                                       target->bytes(), cudaMemcpyDeviceToDevice, stream));
+            core::copy_bytes(target->data,
+                             static_cast<const char*>(residual.data) +
+                                 static_cast<std::size_t>(flat) * residual.nb[1],
+                             target->bytes(), core::TransferDirection::DeviceToDevice, stream);
             continue;
         }
-        CUDA_CHECK(cudaMemcpyAsync(target->data,
-                                   static_cast<const char*>(last.data) +
-                                       static_cast<std::size_t>(row) * last.nb[1],
-                                   target->bytes(), cudaMemcpyDeviceToDevice, stream));
+        core::copy_bytes(target->data,
+                         static_cast<const char*>(last.data) +
+                             static_cast<std::size_t>(row) * last.nb[1],
+                         target->bytes(), core::TransferDirection::DeviceToDevice, stream);
     }
-    CUDA_CHECK(cudaMemcpyAsync(next_tokens.data(), tokens.data,
-                               lane_count * sizeof(std::int32_t), cudaMemcpyDeviceToHost, stream));
+    core::copy_bytes(next_tokens.data(), tokens.data, lane_count * sizeof(std::int32_t),
+                     core::TransferDirection::DeviceToHost, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     if (prefill_gpu_timer_ != nullptr) { prefill_gpu_timer_->record_stop(); }
     work_.reset();
@@ -2551,8 +2554,8 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
         if (std::getenv("NINFER_NAN_PROBE") == nullptr || value.data == nullptr) { return; }
         const auto rows = value.ne[0], cols = value.ne[1];
         std::vector<std::uint16_t> host(static_cast<std::size_t>(rows) * cols);
-        CUDA_CHECK(cudaMemcpyAsync(host.data(), value.data, host.size() * sizeof(std::uint16_t),
-                                   cudaMemcpyDeviceToHost, ctx_.stream));
+        core::copy_bytes(host.data(), value.data, host.size() * sizeof(std::uint16_t),
+                         core::TransferDirection::DeviceToHost, ctx_.stream);
         CUDA_CHECK(cudaStreamSynchronize(ctx_.stream));
         std::size_t bad = 0;
         int first = -1;
@@ -3005,8 +3008,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             residual_dump("sample", sample, 2560, len, -100, s);
             if (streams) {
                 const Tensor residual = hc_.residual.view({dimension(mtp_frame_width()), len});
-                CUDA_CHECK(cudaMemcpyAsync(xf.data, residual.data, residual.bytes(),
-                                           cudaMemcpyDeviceToDevice, s));
+                core::copy_bytes(xf.data, residual.data, residual.bytes(),
+                                 core::TransferDirection::DeviceToDevice, s);
             }
 
             if (is_last) {
@@ -3056,8 +3059,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 }
                 if (mtp_window.final_column_uses_generated_token) {
                     Tensor generated_mtp_id = mtp_ids.slice(0, len - 1, 1);
-                    CUDA_CHECK(cudaMemcpyAsync(generated_mtp_id.data, io_.token.data,
-                                               sizeof(std::int32_t), cudaMemcpyDeviceToDevice, s));
+                    core::copy_bytes(generated_mtp_id.data, io_.token.data, sizeof(std::int32_t),
+                                     core::TransferDirection::DeviceToDevice, s);
                 }
 
                 Tensor mtp_input_embeddings;
@@ -3099,9 +3102,9 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                         mtp_forward_ar_step(prev_token, io_.mtp->ar_conditioning, ar_position,
                                             ar_envelope, next_hidden, logits, next_token, {},
                                             &io_.mtp->ar_conditioning);
-                        CUDA_CHECK(cudaMemcpyAsync(io_.mtp->ar_hidden.data, next_hidden.data,
-                                                   io_.mtp->ar_hidden.bytes(),
-                                                   cudaMemcpyDeviceToDevice, s));
+                        core::copy_bytes(io_.mtp->ar_hidden.data, next_hidden.data,
+                                         io_.mtp->ar_hidden.bytes(),
+                                         core::TransferDirection::DeviceToDevice, s);
                         ops::increment_i32_scalar(ar_position, s);
                     }
                 } else {
@@ -3118,9 +3121,9 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                                      {dimension(mtp_frame_width()), 1},
                                      "rewrite checkpoint hidden output");
                 const Tensor checkpoint_hidden = xf.slice(1, len - 1, 1);
-                CUDA_CHECK(cudaMemcpyAsync(rewrite_checkpoint_hidden_output_->data,
-                                           checkpoint_hidden.data, checkpoint_hidden.bytes(),
-                                           cudaMemcpyDeviceToDevice, s));
+                core::copy_bytes(rewrite_checkpoint_hidden_output_->data, checkpoint_hidden.data,
+                                 checkpoint_hidden.bytes(),
+                                 core::TransferDirection::DeviceToDevice, s);
             }
         }
 
