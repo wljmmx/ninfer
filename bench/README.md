@@ -27,6 +27,39 @@ workload. These changes establish a new input/timing baseline: older constant or
 fixtures and repeated in-place chains are not directly comparable. Compare implementations using
 the same fixture, seed, cache policy, and timing mode.
 
+## Byte accounting
+
+Every byte column is contract-derived unless its name says otherwise. Three calibers appear and
+they are not interchangeable:
+
+- `logical_*` / `semantic_bytes` / `model_bytes` — one count per contract operand reference of the
+  complete public Op (weights, activations, residual/state, records, output). Aliased operands are
+  still counted per reference, so `--alias inplace` rows report the residual block a second time
+  even though it is the input buffer. DRAM sectors, allocator padding, L2 reuse and
+  route-private re-reads are not modeled.
+- `workspace_*_request_bytes` / `modeled_request_bytes` — the request traffic implied by the
+  measured implementation's CTA/tile geometry. These describe requests, not memory transfers.
+- `physical_bytes` (softmax attention, context cost) — the page/copy geometry the launcher issues
+  in `cudaMemcpy*` calls. Still not measured DRAM traffic.
+
+Production's request log (`src/serve/request_log.cpp`) has no logical-byte counter. Its byte fields
+are counted physical transfers, so a bench logical column is never comparable with them:
+
+| Production field | Meaning |
+|---|---|
+| `context_cache.state_transfers.{d2h,h2d,d2d}.bytes` | counted device↔host state copies |
+| `context_cache.main_kv_transfers.{d2h,h2d,d2d}.bytes` | counted main-KV page transfers |
+| `context_cache.backend_kv_transfers.{d2h,h2d,d2d}.bytes` | counted backend-KV page transfers |
+| `context_cache.occupancy.host_kv_bytes`, `memory.kv_payload_bytes` | occupancy, not traffic |
+| `result.computed_prefill_tokens`, `result.prefix_cache_hit_tokens`, `result.completion_tokens` | token-side demand |
+
+The defensible comparison is the token side: a bench row's `tokens`/`batch` decides the same
+operands that production reports as `computed_prefill_tokens`/`completion_tokens`, and
+`timings_seconds.prefill|decode` is the closest latency counterpart. When a byte quantity has no
+derivation in a row the CSV field stays empty (null) rather than a zero that would read as "no
+traffic". Measured DRAM/L2 traffic requires NCU; `--profile 1` brackets one prepared post-warmup
+call so the profiler sees exactly the timed body.
+
 ## Build
 
 `CMakeLists.txt` includes explicit registrations from `ops/`, `inference/`, `context_cost/`
@@ -411,8 +444,11 @@ geometry, execution/cache mode, GPU and host median/min/p95 microseconds, `works
 RMSNorm uses zero workspace. These measurements establish Op latency, not Engine latency.
 
 Both benchmarks accept `--execution graph|eager|both`, `--cache cold|warm|both`, `--warmup N`,
-`--repeat N`, `--flush-mib N` and `--csv-out PATH`. Defaults are Graph, both cache modes,
-10 warmups, 100 samples and a 256 MiB cold-cache flush; CSV goes to stdout unless a path is supplied.
+`--repeat N`, `--flush-mib N`, `--csv-out PATH` and `--profile 0|1`. Defaults are Graph, both
+cache modes, 10 warmups, 100 samples and a 256 MiB cold-cache flush; CSV goes to stdout unless a
+path is supplied. `--profile 1` runs preparation, warmup and the L2 flush, then brackets one
+complete public call with `cudaProfilerStart/Stop` so a profiler sees only the timed body
+(upstream d4a78e03); it is a setup boundary, not a measurement column.
 
 ```bash
 cmake --build build -j --target ninfer_rmsnorm_bench
@@ -426,6 +462,38 @@ cmake --build build -j --target ninfer_rmsnorm_bench
 ./build/bench/ninfer_rmsnorm_bench \
   --op sigmoid-gated --dim 128 --heads 48 --batch 8 --tokens 1,7,16 \
   --execution both --cache both
+```
+
+## Fused normalization Op benchmark
+
+`ninfer_fused_rmsnorm_bench` measures the public `paired_rmsnorm_concat` and
+`residual_add_rmsnorm` Ops. `--op paired|residual` selects the contract, `--dim D` the row width,
+`--columns M[,M...]` the column sweep, `--calls N` repeats the call inside one sample (requires
+`--cache warm`), and `--execution graph|eager --cache cold|warm --warmup N --repeat N` select the
+timing mode. `paired` produces BF16 `[2D,M]` from x/y BF16 `[D,M]`, one gain vector each and an
+I32 `[M]` enable mask; `residual` produces BF16 `[D,M]` from x/y plus a BF16 `[D,M]` residual and
+one gain vector.
+
+`--alias disjoint|inplace` (residual only, exactly one call) selects whether the residual operand
+is its own buffer or the input `x` itself. The in-place form snapshots `x` and restores it before
+every warmup and sample; the restore and the L2 eviction stay outside the timed interval, so each
+sample starts from the same operand (upstream d4a78e03).
+
+CSV: `dim,columns,execution,cache,alias,median_us,min_us,p95_us,semantic_bytes,logical_gb_s,
+bandwidth_reference_us,calls`. Cold rows evict L2 through a fixed 96 MiB read-eviction buffer before
+every sample (local measurement discipline; upstream uses the shared 256 MiB default).
+`semantic_bytes` counts the contract operands once per reference: x, y, the residual (the same
+buffer as x under `inplace`), the output, and one gain vector for `residual` or two gains plus the
+M-element mask for `paired`,
+i.e. `D*M*8 + D*(paired?4:2) + (paired?M*4:0)` — the gain term was `2D` for both Ops before the
+upstream port. `logical_gb_s` divides it by the per-call median. `bandwidth_reference_us` is the
+same byte count at the device's nominal DRAM bandwidth from `core/device_roofline.h`; it is a
+scale, never a measurement, and prints `null` when the device reports no roofline.
+
+```bash
+cmake --build build -j --target ninfer_fused_rmsnorm_bench
+./build/bench/ninfer_fused_rmsnorm_bench --op paired --dim 4096 --columns 1,16,128,4096
+./build/bench/ninfer_fused_rmsnorm_bench --op residual --dim 4096 --columns 128 --alias inplace
 ```
 
 ## GDN control Op benchmark

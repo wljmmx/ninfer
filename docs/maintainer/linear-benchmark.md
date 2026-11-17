@@ -349,6 +349,25 @@ traffic。它不计：
 可达利用率，不替换 fixed-spec 指标，也不改变一遍 logical weight read 的
 `model_bytes` 口径。copy probe 同时读写，不是这类 GEMV 的适用上限。
 
+### 4.1 与生产日志字节口径的对应
+
+生产侧唯一记录的字节计数是 `src/serve/request_log.cpp` 的**实测传输量**，按方向累加：
+
+| 生产字段 | 含义 |
+|---|---|
+| `context_cache.state_transfers.{d2h,h2d,d2d}.bytes` | 状态页的设备↔主机 `cudaMemcpy*` 实际字节 |
+| `context_cache.main_kv_transfers.{d2h,h2d,d2d}.bytes` | 主 KV 页的实际传输字节（另有 `pages`、`seconds`） |
+| `context_cache.backend_kv_transfers.{d2h,h2d,d2d}.bytes` | 后端 KV 页的实际传输字节 |
+| `context_cache.occupancy.host_kv_bytes`、`memory.kv_payload_bytes` | 占用，不是流量 |
+| `result.computed_prefill_tokens`、`result.prefix_cache_hit_tokens`、`result.completion_tokens` | token 侧需求 |
+
+本文的 `model_bytes`、bench 的 `logical_bytes`/`semantic_bytes`，以及
+`workspace_*_request_bytes`，都是 contract 推导值，与上表的 physical 计数不同量纲：前者计
+操作数各一次（含 alias 的重复引用），后者计实际拷贝。二者不能直接相减或相除；可对照的只有
+token 侧（bench 行的 `tokens`/`batch` 对应生产的 prefill/completion token 计数）与延迟
+（`timings_seconds.prefill|decode`）。无推导依据的字节列在 CSV 中留空（null），不写 0。
+
+
 ## 5. 数学工作量与 route-neutral 指标
 
 所有 weight types 使用同一个数学 GEMM 工作量：

@@ -8,6 +8,16 @@
 //   records  - the raw key/value/gate and convolution records, also a logical subset.
 // `modeled_request_bytes` is opt-in and only filled where the measured implementation has a
 // real request model; unique logical bytes are never substituted for it.
+//
+// Accounting caliber (upstream d4a78e03): every column here is a logical/modeled byte count
+// derived from the public Op contract, not observed memory traffic. Production's only byte
+// counters are the counted physical transfers in src/serve/request_log.cpp:
+//   context_cache.state_transfers.{d2h,h2d,d2d}.bytes,
+//   context_cache.main_kv_transfers.{d2h,h2d,d2d}.bytes,
+//   context_cache.backend_kv_transfers.{d2h,h2d,d2d}.bytes,
+// with occupancy (not traffic) in context_cache.occupancy.host_kv_bytes and
+// memory.kv_payload_bytes. Do not compare a bench logical column against those counters. A
+// bench value without a derivation stays null (empty CSV field), never a fabricated zero.
 
 #include <algorithm>
 #include <cstdint>

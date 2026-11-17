@@ -2,6 +2,8 @@
 
 #include "ninfer_bench_common.h"
 
+#include <cuda_profiler_api.h>
+
 #include <charconv>
 #include <chrono>
 #include <filesystem>
@@ -16,6 +18,7 @@ struct Options {
     int warmup = 10, repeat = 100;
     std::size_t flush_bytes = 256ULL << 20;
     std::string execution = "graph", cache = "both", csv_out;
+    bool profile = false;
 };
 
 inline int integer(std::string_view text, int minimum = 1) {
@@ -72,7 +75,11 @@ inline bool parse(Options& o, std::string_view flag, std::string_view value) {
         o.cache = value;
     } else if (flag == "--csv-out")
         o.csv_out = value;
-    else
+    else if (flag == "--profile") {
+        const int enabled = integer(value, 0);
+        if (enabled > 1) throw std::invalid_argument("profile: 0|1");
+        o.profile = enabled != 0;
+    } else
         return false;
     return true;
 }
@@ -80,10 +87,11 @@ inline bool parse(Options& o, std::string_view flag, std::string_view value) {
 inline void help() {
     std::cout
         << "  --execution graph|eager|both  --cache cold|warm|both\n"
-           "  --warmup N --repeat N --flush-mib N --csv-out PATH\n"
+           "  --warmup N --repeat N --flush-mib N --csv-out PATH --profile 0|1\n"
            "Graph GPU timing brackets the captured Op body. Eager timing includes launch gaps.\n"
            "State restore and cold-cache eviction precede the timer. Host submission is "
-           "separate.\n";
+           "separate. --profile 1 brackets one prepared post-warmup call. Only the traffic "
+           "columns are logical/modeled bytes; measured DRAM traffic needs NCU.\n";
 }
 
 inline std::vector<std::string> selections(const std::string& value, const char* a, const char* b) {
@@ -183,6 +191,19 @@ Result measure(Launch&& launch, Restore&& restore, L2FlushBuffer& flush, cudaStr
         invoke();
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (options.profile) {
+        prepare();
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaProfilerStart());
+        try {
+            invoke();
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        } catch (...) {
+            (void)cudaProfilerStop();
+            throw;
+        }
+        CUDA_CHECK(cudaProfilerStop());
+    }
     cudaEvent_t start, stop;
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));

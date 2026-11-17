@@ -339,7 +339,9 @@ graph 重放 3 例、双请求 batch、4 档 SM 的容量/分配镜像。
 - 其余 9 条：`2c94555b`（KDA 输入准备已在 `src/ops/linear_attention/kimi_delta_attention/chunked/prepare.cu`，
   但 ReplaySSM 只接 GDN（`include/ninfer/ops/gdn_replay.h`），KDA 无消费方——GLM5Next 已判死）、
   `5551d9b1`（公共前端抽取，T149 不跟随，等 qwen4-exp 前端立项）、`e0114c70`/`996d9214`（qwen4_exp program 层，
-  本地无该对象）、`d4a78e03`（serving bench 无流量账，只 ops bench 有 `effective_gbs`）、`c996baa8`（标定表可用但
+  本地无该对象）、  `d4a78e03`（serving bench 无流量账，只 ops bench 有 `effective_gbs`；2026-11-17 复核后改记 `todo`：
+  可移植的 2 个文件已落 —— `op_measurement --profile 0|1`、`rmsnorm/fused.cu`→`fused_rmsnorm_bench`
+  的 `--alias` 与字节口径，其余 8 个文件本地无落点），`c996baa8`（标定表可用但
   本地只有热序，无 model 侧默认序注入，T161）、`6a42de35`（`copy_bytes` 传输层未收口，register A2）、
   `ae54c1a9`（7 个扁平头仍在 `src/ops/common/`，register A5 前置）、`a0d27b22`（无 `tokens_per_row`，
   `src/core/paged_kv_cache.cpp:39-41` 固定 64 页，register A1）。
