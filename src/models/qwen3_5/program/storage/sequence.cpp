@@ -2,6 +2,7 @@
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/kv_tier_stats.h"
 #include "core/device.h"
+#include "core/transfer.h"
 
 #include <algorithm>
 #include <array>
@@ -275,12 +276,12 @@ std::vector<std::uint32_t> keep_pages_from_scores(const KVExecutionTablePool& ta
         const auto submitted        = cudaMemcpyBatchAsync(destinations, sources, sizes, 3,
                                                            &attributes, &attribute_index, 1, stream);
         if (submitted != cudaSuccess) {
-            CUDA_CHECK(
-                cudaMemcpyAsync(host_counts.data(), counts.data, bytes, cudaMemcpyDeviceToHost, stream));
-            CUDA_CHECK(cudaMemcpyAsync(host_recents.data(), recents.data, bytes,
-                                       cudaMemcpyDeviceToHost, stream));
-            CUDA_CHECK(
-                cudaMemcpyAsync(host_peaks.data(), peaks.data, bytes, cudaMemcpyDeviceToHost, stream));
+            core::copy_bytes(host_counts.data(), counts.data, bytes,
+                             core::TransferDirection::DeviceToHost, stream);
+            core::copy_bytes(host_recents.data(), recents.data, bytes,
+                             core::TransferDirection::DeviceToHost, stream);
+            core::copy_bytes(host_peaks.data(), peaks.data, bytes,
+                             core::TransferDirection::DeviceToHost, stream);
         }
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -799,9 +800,9 @@ static void dump_page_placement(PagedKVCache& cache, KVAddressSpaceStore& addres
     if (end == 0) { return; }
     std::vector<std::int32_t> table(static_cast<std::size_t>(end), -1);
     const Tensor row = cache.execution_tables().row(addresses.execution_row(address).handle());
-    CUDA_CHECK(cudaMemcpyAsync(table.data(), row.data,
-                               static_cast<std::size_t>(end) * sizeof(std::int32_t),
-                               cudaMemcpyDeviceToHost, stream));
+    core::copy_bytes(table.data(), row.data,
+                     static_cast<std::size_t>(end) * sizeof(std::int32_t),
+                     core::TransferDirection::DeviceToHost, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     const std::uint32_t window_begin = end > window_pages ? end - window_pages : 0;
     std::vector<std::int32_t> ids;
@@ -1364,12 +1365,12 @@ void ProgramImpl::dump_page_scores(KVAddressSpaceStore& addresses, PagedKVCache&
     std::vector<std::uint32_t> host_recents(static_cast<std::size_t>(rows), 0u);
     if (rows != 0) {
         const std::size_t bytes = static_cast<std::size_t>(rows) * sizeof(std::uint32_t);
-        CUDA_CHECK(cudaMemcpyAsync(host_counts.data(), counts.data, bytes,
-                                   cudaMemcpyDeviceToHost, device.stream));
-        CUDA_CHECK(cudaMemcpyAsync(host_peaks.data(), peaks.data, bytes,
-                                   cudaMemcpyDeviceToHost, device.stream));
-        CUDA_CHECK(cudaMemcpyAsync(host_recents.data(), recents.data, bytes,
-                                   cudaMemcpyDeviceToHost, device.stream));
+        core::copy_bytes(host_counts.data(), counts.data, bytes,
+                         core::TransferDirection::DeviceToHost, device.stream);
+        core::copy_bytes(host_peaks.data(), peaks.data, bytes,
+                         core::TransferDirection::DeviceToHost, device.stream);
+        core::copy_bytes(host_recents.data(), recents.data, bytes,
+                         core::TransferDirection::DeviceToHost, device.stream);
         CUDA_CHECK(cudaStreamSynchronize(device.stream));
     }
     // Append with a call marker: the number of markers says how often the decision point ran, and
@@ -1460,8 +1461,8 @@ PagedKVCacheView ProgramImpl::mtp_kv_view(const SequenceState& state) const {
 }
 
 void ProgramImpl::set_device_i32(Tensor& tensor, std::int32_t value) {
-    CUDA_CHECK(
-        cudaMemcpyAsync(tensor.data, &value, sizeof(value), cudaMemcpyHostToDevice, device.stream));
+    core::copy_bytes(tensor.data, &value, sizeof(value), core::TransferDirection::HostToDevice,
+                     device.stream);
 }
 
 void ProgramImpl::ordered_reset(SequenceState& state) {

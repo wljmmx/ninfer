@@ -442,33 +442,31 @@ void StateImageDevicePool::copy_to_host(std::int32_t source, HostStateImageView 
     validate_host_layout(destination.layout, destination.data);
     for (std::uint32_t layer = 0; layer < linear_.layer_count(); ++layer) {
         const Tensor conv = linear_.conv_slot(layer, source);
-        CUDA_CHECK(cudaMemcpyAsync(
-            byte_offset(destination.data, host_layout_.linear_conv.offset +
-                                              layer * host_layout_.linear_conv_layer_bytes),
-            conv.data, conv.bytes(), cudaMemcpyDeviceToHost, stream));
+        core::copy_bytes(byte_offset(destination.data, host_layout_.linear_conv.offset +
+                                                           layer * host_layout_.linear_conv_layer_bytes),
+                         conv.data, conv.bytes(), core::TransferDirection::DeviceToHost, stream);
         const Tensor recurrent = linear_.recurrent_slot(layer, source);
-        CUDA_CHECK(cudaMemcpyAsync(
+        core::copy_bytes(
             byte_offset(destination.data, host_layout_.linear_recurrent.offset +
                                               layer * host_layout_.linear_recurrent_layer_bytes),
-            recurrent.data, recurrent.bytes(), cudaMemcpyDeviceToHost, stream));
+            recurrent.data, recurrent.bytes(), core::TransferDirection::DeviceToHost, stream);
     }
     const Tensor hidden = continuation_hidden_slot(source);
-    CUDA_CHECK(
-        cudaMemcpyAsync(byte_offset(destination.data, host_layout_.continuation_hidden.offset),
-                        hidden.data, hidden.bytes(), cudaMemcpyDeviceToHost, stream));
+    core::copy_bytes(byte_offset(destination.data, host_layout_.continuation_hidden.offset),
+                     hidden.data, hidden.bytes(), core::TransferDirection::DeviceToHost, stream);
     if (dflash_local_) {
         for (std::uint32_t layer = 0; layer < dflash_local_->layer_count(); ++layer) {
             const CyclicKVCacheLayerView view = dflash_local_->layer_view(layer);
             const Tensor k                    = view.k.slice(3, source, 1);
             const Tensor v                    = view.v.slice(3, source, 1);
-            CUDA_CHECK(cudaMemcpyAsync(
+            core::copy_bytes(
                 byte_offset(destination.data, host_layout_.dflash_local_k->offset +
                                                   layer * host_layout_.dflash_local_layer_bytes),
-                k.data, k.bytes(), cudaMemcpyDeviceToHost, stream));
-            CUDA_CHECK(cudaMemcpyAsync(
+                k.data, k.bytes(), core::TransferDirection::DeviceToHost, stream);
+            core::copy_bytes(
                 byte_offset(destination.data, host_layout_.dflash_local_v->offset +
                                                   layer * host_layout_.dflash_local_layer_bytes),
-                v.data, v.bytes(), cudaMemcpyDeviceToHost, stream));
+                v.data, v.bytes(), core::TransferDirection::DeviceToHost, stream);
         }
     }
 }
@@ -480,37 +478,36 @@ void StateImageDevicePool::copy_from_host(HostStateImageConstView source, std::i
     validate_host_layout(source.layout, source.data);
     for (std::uint32_t layer = 0; layer < linear_.layer_count(); ++layer) {
         const Tensor conv = linear_.conv_slot(layer, destination);
-        CUDA_CHECK(cudaMemcpyAsync(
-            conv.data,
-            byte_offset(source.data, host_layout_.linear_conv.offset +
-                                         layer * host_layout_.linear_conv_layer_bytes),
-            conv.bytes(), cudaMemcpyHostToDevice, stream));
+        core::copy_bytes(conv.data,
+                         byte_offset(source.data, host_layout_.linear_conv.offset +
+                                                      layer * host_layout_.linear_conv_layer_bytes),
+                         conv.bytes(), core::TransferDirection::HostToDevice, stream);
         const Tensor recurrent = linear_.recurrent_slot(layer, destination);
-        CUDA_CHECK(cudaMemcpyAsync(
+        core::copy_bytes(
             recurrent.data,
             byte_offset(source.data, host_layout_.linear_recurrent.offset +
                                          layer * host_layout_.linear_recurrent_layer_bytes),
-            recurrent.bytes(), cudaMemcpyHostToDevice, stream));
+            recurrent.bytes(), core::TransferDirection::HostToDevice, stream);
     }
     const Tensor hidden = continuation_hidden_slot(destination);
-    CUDA_CHECK(cudaMemcpyAsync(hidden.data,
-                               byte_offset(source.data, host_layout_.continuation_hidden.offset),
-                               hidden.bytes(), cudaMemcpyHostToDevice, stream));
+    core::copy_bytes(hidden.data,
+                     byte_offset(source.data, host_layout_.continuation_hidden.offset),
+                     hidden.bytes(), core::TransferDirection::HostToDevice, stream);
     if (dflash_local_) {
         for (std::uint32_t layer = 0; layer < dflash_local_->layer_count(); ++layer) {
             const CyclicKVCacheLayerView view = dflash_local_->layer_view(layer);
             const Tensor k                    = view.k.slice(3, destination, 1);
             const Tensor v                    = view.v.slice(3, destination, 1);
-            CUDA_CHECK(cudaMemcpyAsync(
+            core::copy_bytes(
                 k.data,
                 byte_offset(source.data, host_layout_.dflash_local_k->offset +
                                              layer * host_layout_.dflash_local_layer_bytes),
-                k.bytes(), cudaMemcpyHostToDevice, stream));
-            CUDA_CHECK(cudaMemcpyAsync(
+                k.bytes(), core::TransferDirection::HostToDevice, stream);
+            core::copy_bytes(
                 v.data,
                 byte_offset(source.data, host_layout_.dflash_local_v->offset +
                                              layer * host_layout_.dflash_local_layer_bytes),
-                v.bytes(), cudaMemcpyHostToDevice, stream));
+                v.bytes(), core::TransferDirection::HostToDevice, stream);
         }
     }
 }
