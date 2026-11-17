@@ -208,7 +208,7 @@ int run_pair_case(int width, int batch, int first_position, std::uint32_t seed,
     execute(
         [&](cudaStream_t stream) {
             ops::rmsnorm_rope(position_tensor, q_weight_tensor, k_weight_tensor, q_tensor, k_tensor,
-                              stream);
+                              static_cast<float>(kTheta), stream);
         },
         [&](cudaStream_t stream) {
             cuda_check(cudaMemcpyAsync(q_device.data(), q_bits.data(), q_device.bytes(),
@@ -259,7 +259,8 @@ int run_single_case(int tokens, int first_position, std::uint32_t seed, bool gra
     Tensor position_tensor(position_device.p, DType::I32, {tokens});
     execute(
         [&](cudaStream_t stream) {
-            ops::rmsnorm_rope(position_tensor, weight_tensor, input_tensor, stream);
+            ops::rmsnorm_rope(position_tensor, weight_tensor, input_tensor,
+                              static_cast<float>(kTheta), stream);
         },
         [&](cudaStream_t stream) {
             cuda_check(cudaMemcpyAsync(input_device.data(), input_bits.data(), input_device.bytes(),

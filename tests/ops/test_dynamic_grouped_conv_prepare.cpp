@@ -237,7 +237,7 @@ int run() {
     DeviceBuffer residual_device = to_device(residual_host), norm_device = to_device(norm_host),
                  base_device = to_device(base_host);
     const auto capacity =
-        ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(2, 16, 1, 8);
+        ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(kHidden, 2, 16, 1, 8);
     WorkspaceArena workspace(capacity);
     cudaStream_t stream = nullptr;
     cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create stream");
@@ -292,7 +292,7 @@ int run() {
                 failures += fd.verify_guards(label);
                 const auto exact =
                     ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
-                        width, width, batch, batch);
+                        kHidden, width, width, batch, batch);
                 if (workspace.used() != 0 || workspace.peak_used() != exact) {
                     std::cerr << label << ": workspace mismatch\n";
                     ++failures;

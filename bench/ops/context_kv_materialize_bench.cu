@@ -30,6 +30,8 @@ constexpr int kValueRow     = 5120;
 constexpr int kHidden       = 5120;
 constexpr int kRows         = 1024;
 constexpr int kHeadDim      = 128;
+// The fixture's base frequency; the op takes it per call since 581d08f7.
+constexpr float kBenchTheta = 1.0e7F;
 constexpr int kHeads        = 8;
 constexpr int kCapacity     = 2048;
 constexpr int kLaneCapacity = 8;
@@ -192,7 +194,8 @@ struct Fixture {
         Tensor pos(positions.p, DType::I32, {width, batch});
         Tensor count(counts.p, DType::I32, {batch});
         Tensor lane(slots.p, DType::I32, {batch});
-        ops::context_kv_materialize(x, pos, count, lane, layers, envelope, direct_arena, stream);
+        ops::context_kv_materialize(x, pos, count, lane, layers, envelope, kBenchTheta,
+                                    direct_arena, stream);
     }
 };
 

@@ -200,7 +200,7 @@ int run_profile(std::int32_t input_rows) {
     DeviceBuffer base_device       = to_device(base_kernel);
     DeviceBuffer delta_device      = to_device(finish_delta);
     const std::size_t capacity     = ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-        input_rows, 2, 16, 1, kMaximumBatch);
+        kHidden, input_rows, 2, 16, 1, kMaximumBatch);
 
     Tensor base(base_device.p, DType::BF16, {kHidden, kTaps, kSides});
     const Weight weight = projection_weight.view();
@@ -210,7 +210,7 @@ int run_profile(std::int32_t input_rows) {
             const std::size_t bytes =
                 static_cast<std::size_t>(kHidden) * width * batch_size * sizeof(std::uint16_t);
             const auto exact = ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-                input_rows, width, width, batch_size, batch_size);
+                kHidden, input_rows, width, width, batch_size, batch_size);
             if (exact > capacity)
                 throw std::runtime_error("workspace interval does not cover exact shape");
             GuardedDeviceBuffer scratch(exact);

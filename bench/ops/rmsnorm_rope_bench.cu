@@ -21,6 +21,8 @@ namespace {
 constexpr int kHeadDim    = 128;
 constexpr int kQueryHeads = 32;
 constexpr int kKeyHeads   = 8;
+// The fixture's base frequency; the op takes it per call since 581d08f7 (DFlash-2 needed 1e7).
+constexpr float kBenchTheta = 1.0e7F;
 
 enum class Form : std::uint8_t { Pair, Single };
 enum class Execution : std::uint8_t { Eager, Graph };
@@ -167,7 +169,10 @@ void run_pair(const Options& options, int width, int batch, cudaStream_t stream)
     Tensor t_q_weight(q_weight.p, DType::BF16, {kHeadDim});
     Tensor t_k_weight(k_weight.p, DType::BF16, {kHeadDim});
     const auto launch = [&](cudaStream_t launch_stream) {
-        ops::rmsnorm_rope(t_positions, t_q_weight, t_k_weight, t_q, t_k, launch_stream);
+        // The base frequency is a model constant since the DFlash-2 draft geometry admitted 1e7
+        // (581d08f7); this benchmark measures throughput, so it uses the fixture's value.
+        ops::rmsnorm_rope(t_positions, t_q_weight, t_k_weight, t_q, t_k, kBenchTheta,
+                          launch_stream);
     };
     if (options.profile) {
         for (int index = 0; index < options.warmup; ++index) {
@@ -205,7 +210,7 @@ void run_single(const Options& options, int tokens, cudaStream_t stream) {
     Tensor t_x(x.p, DType::BF16, {kHeadDim, kKeyHeads, tokens});
     Tensor t_weight(weight.p, DType::BF16, {kHeadDim});
     const auto launch = [&](cudaStream_t launch_stream) {
-        ops::rmsnorm_rope(t_positions, t_weight, t_x, launch_stream);
+        ops::rmsnorm_rope(t_positions, t_weight, t_x, kBenchTheta, launch_stream);
     };
     if (options.profile) {
         for (int index = 0; index < options.warmup; ++index) {

@@ -331,7 +331,8 @@ int run_case(Fixture& fixture, const std::string& label, int width, int batch,
                : static_cast<std::uint32_t>(width)};
     const auto launch = [&](cudaStream_t stream) {
         ops::context_kv_materialize(context_tensor, positions_tensor, counts_tensor, slots_tensor,
-                                    fixture.views, envelope, workspace, stream);
+                                    fixture.views, envelope, static_cast<float>(kTheta), workspace,
+                                    stream);
     };
     launch(nullptr);
     cuda_synchronize();
