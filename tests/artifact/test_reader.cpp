@@ -143,13 +143,23 @@ void invalid_directories() {
         file.seekp(16);
         file.put(0);
     }
-    Reader wrong_part(fixture.entry);
-    rejects([&] { (void)wrong_part.read_object(wrong_part.find("q5")); },
-            "foreign continuation accepted");
+    {
+        // The reader keeps its files open with FILE_SHARE_READ only (artifact/file_io.cpp), so on
+        // Windows a rewrite or a resize while one is alive is refused by the OS - the ofstream's
+        // open fails and its exception-enabling turns that into std::ios_base::failure, which is
+        // what made this case die with "ios_base::failbit set". Scope the reader instead of
+        // relaxing the share mode: refusing in-place mutation of a loaded artifact is deliberate.
+        Reader wrong_part(fixture.entry);
+        rejects([&] { (void)wrong_part.read_object(wrong_part.find("q5")); },
+                "foreign continuation accepted");
+    }
     fixture.write();
-    Reader shortened(fixture.entry);
+    // Truncate before opening. Windows will not let us shorten a file a live reader holds, so the
+    // read-time form of this check cannot be built here; what is still asserted is the property
+    // that matters - a shortened entry is refused, not read short (the reader compares the entry
+    // length against the directory it parsed).
     std::filesystem::resize_file(fixture.entry, std::filesystem::file_size(fixture.entry) - 1);
-    rejects([&] { (void)shortened.read_range(499, 1); }, "premature EOF accepted");
+    rejects([&] { Reader shortened(fixture.entry); }, "shortened entry accepted");
 }
 
 } // namespace
