@@ -8,6 +8,13 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Sequence
 
+from tools.bench.run_serve_corpus import SERVER_LOG_SCHEMA_VERSIONS
+
+# request_scheduling events exist from schema 24 onward; older logs keep their per-request
+# counters readable but cannot prove a Replay interval.
+SCHEDULING_EVENT_SCHEMA_VERSIONS = frozenset(
+    version for version in SERVER_LOG_SCHEMA_VERSIONS if version >= 24
+)
 
 SCHEDULING_FIELDS = (
     "preemptions", "snapshot_restores", "replay_restores", "replayed_tokens",
@@ -165,7 +172,7 @@ def _global_runtime_observations(events: Sequence[dict[str, Any]]) -> dict[str, 
     servers = {event.get("server_instance_id") for event in events}
     if len(servers) != 1 or not all(isinstance(server, str) and server for server in servers):
         return {"status": "unavailable", "reason": "ambiguous_server_instance"}
-    if any(event.get("schema_version") not in (23, 24, 25) for event in intervals):
+    if any(event.get("schema_version") not in SERVER_LOG_SCHEMA_VERSIONS for event in intervals):
         return {"status": "unavailable", "reason": "unsupported_runtime_schema"}
 
     def values_at(path: Sequence[str]) -> list[int | float] | None:
@@ -253,7 +260,9 @@ def _scheduling_observations(
     intervals = []
     incomplete_requests = []
     unavailable = False
-    supported = any(event.get("schema_version") in (24, 25) for event in events)
+    supported = any(
+        event.get("schema_version") in SCHEDULING_EVENT_SCHEMA_VERSIONS for event in events
+    )
     for request in requests:
         diagnostic = request.get("diagnostics", {})
         engine_id = diagnostic.get("engine_request_id")
@@ -402,7 +411,7 @@ def attach_generation_diagnostics(run: dict[str, Any], path: Path | None) -> str
             "matched_by": [field for field, value in wire.items() if value in identities[field]],
         }
         starts = [item for item in events if item.get("event") == "request_start"
-                  and item.get("schema_version") in (23, 24, 25)]
+                  and item.get("schema_version") in SERVER_LOG_SCHEMA_VERSIONS]
         preparation = starts[0].get("preparation_seconds") if len(starts) == 1 else None
         identity.update(
             preparation_seconds=preparation,
@@ -418,7 +427,7 @@ def attach_generation_diagnostics(run: dict[str, Any], path: Path | None) -> str
         scheduling = generation.get("scheduling") if isinstance(generation, dict) else None
         engine_id = generation.get("engine_request_id") if isinstance(generation, dict) else None
         if (
-            event.get("schema_version") not in (23, 24, 25)
+            event.get("schema_version") not in SERVER_LOG_SCHEMA_VERSIONS
             or type(engine_id) is not int or engine_id <= 0
             or not isinstance(scheduling, dict)
             or any(type(scheduling.get(field)) is not int or scheduling[field] < 0

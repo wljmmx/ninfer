@@ -86,7 +86,12 @@ WARMUP_FIXTURE = "text_smoke_zh"
 RUN_ARTIFACT_TYPE = "ninfer_serve_corpus_result"
 RUN_SCHEMA_VERSION = 9
 SERVER_LOG_ARTIFACT_TYPE = "ninfer_serve_request_log"
-SERVER_LOG_SCHEMA_VERSION = 24
+# Canonical current version, mirrored from src/serve/request_log.h (kRequestLogSchemaVersion).
+SERVER_LOG_SCHEMA_VERSION = 26
+# Archived campaigns stay readable: 23 predates request_scheduling, 24 predates
+# request_done.generation.admission, and 25 predates the startup_config event. Those additions are
+# additive, so one identity gate serves both fresh and recorded runs.
+SERVER_LOG_SCHEMA_VERSIONS = frozenset({23, 24, 25, SERVER_LOG_SCHEMA_VERSION})
 STARTUP_TIMEOUT_SECONDS = 1800.0
 REQUEST_TIMEOUT_SECONDS = 24.0 * 60.0 * 60.0
 LOG_EVENT_TIMEOUT_SECONDS = 10.0
@@ -468,9 +473,16 @@ def require_server_log_identity(event: dict[str, Any], event_name: str) -> None:
         event.get("schema_version"),
         event.get("event"),
     )
-    expected = (SERVER_LOG_ARTIFACT_TYPE, SERVER_LOG_SCHEMA_VERSION, event_name)
-    if identity != expected:
-        raise CampaignError(f"unexpected serving log identity {identity!r}; expected {expected!r}")
+    if (
+        identity[0] != SERVER_LOG_ARTIFACT_TYPE
+        or identity[2] != event_name
+        or identity[1] not in SERVER_LOG_SCHEMA_VERSIONS
+    ):
+        raise CampaignError(
+            f"unexpected serving log identity {identity!r}; expected "
+            f"{SERVER_LOG_ARTIFACT_TYPE!r} event {event_name!r} with schema_version in "
+            f"{sorted(SERVER_LOG_SCHEMA_VERSIONS)!r}"
+        )
 
 
 def validate_server_start(event: dict[str, Any], spec: RunSpec, device: int) -> tuple[str, str]:

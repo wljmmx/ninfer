@@ -215,6 +215,12 @@ Missing observations remain unavailable, and negative residuals remain visible a
 measurements. Aggregate responses finish at a different boundary and do not receive this streaming
 attribution.
 
+Accepted request-log schemas are listed in [`../README.md`](../README.md#request-log-schema). The
+analysis reads 23 through the current 26: 23 has no `request_scheduling` events, 24 has no
+`request_done.generation.admission`, and 26 adds a `startup_config` event that this analysis ignores.
+A version outside that set makes the affected block `unavailable` with an explicit reason rather than
+a zero counter, and fields absent from an accepted older log stay `null`.
+
 Separate columns report Host exposure, this request's prefill/replay submission, completion wait,
 postprocessing and GPU stream intervals, plus completed context-transfer time and bytes. These
 overlapping measurements explain work within the wall-time stages; adding them together would

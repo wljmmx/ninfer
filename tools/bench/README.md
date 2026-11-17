@@ -201,3 +201,27 @@ python3 tools/bench/run_serve_concurrency.py \
 Use `--kv-capacity auto` when the fixed corpus needs more shared KV than the default 262,144-token
 pool. A point is intentionally not resumable: combining fragments from separate server processes
 would not preserve either a steady interval or one continuous makespan.
+
+## Request log schema
+
+Both serving runners and the TTFT analysis consume `ninfer_serve_request_log` records; none of them
+writes or rewrites a request log. The canonical version lives in
+[`src/serve/request_log.h`](../../src/serve/request_log.h) (`kRequestLogSchemaVersion`), and
+`run_serve_corpus.SERVER_LOG_SCHEMA_VERSION` mirrors it. `SERVER_LOG_SCHEMA_VERSIONS` is the set the
+runners and analysis still accept, so archived campaigns stay readable:
+
+| Version | Added | Read |
+|---|---|---|
+| 23 | per-request scheduling counters, `first_output_timing`, prefix-reuse path | readable; no `request_scheduling` events, so Replay intervals stay unavailable |
+| 24 | `request_scheduling` events (pause/restore/recovery transitions and progress counters) | readable |
+| 25 | `request_done.generation.admission` | readable |
+| 26 | `startup_config` event; existing events keep their fields | readable |
+
+Any other version fails loudly instead of parsing partially: a stale pin in the tooling and a log
+from a newer, unmodelled Server are both errors, not silent `null`s. Fields an older-but-readable log
+cannot supply are reported as `null` or `unavailable` with a reason and are never replaced by `0`.
+For 23/24 campaigns that means the admission columns (`preferred_reused_tokens`, `source_wait_ms`,
+`revoked_checkpoints`, `admission_fallback_reason`) and, for 23, `replay_with_other_progress` remain
+unavailable; they cannot be reconstructed from the remaining records. Schema 26 adds no required
+field to existing events, so a campaign recorded under 25 stays numerically comparable; only the
+startup provenance it lacks (effective configuration and per-key sources) is absent.
