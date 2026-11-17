@@ -1,6 +1,7 @@
 #include "models/qwen3_5/state/state_image.h"
 
 #include "core/device.h"
+#include "core/transfer.h"
 
 #include <chrono>
 #include <cstdio>
@@ -409,8 +410,10 @@ void StateImageDevicePool::copy_slot(std::int32_t source, std::int32_t destinati
     linear_.copy_slot(source, destination, stream);
     const Tensor source_hidden      = continuation_hidden_slot(source);
     const Tensor destination_hidden = continuation_hidden_slot(destination);
-    CUDA_CHECK(cudaMemcpyAsync(destination_hidden.data, source_hidden.data,
-                               destination_hidden.bytes(), cudaMemcpyDeviceToDevice, stream));
+    // One helper names the direction, so a reader of the call site does not have to decode the
+    // cudaMemcpyKind argument (V10-12's first slice; the rest of this file follows).
+    core::copy_bytes(destination_hidden.data, source_hidden.data, destination_hidden.bytes(),
+                     core::TransferDirection::DeviceToDevice, stream);
     if (dflash_local_) {
         dflash_local_->copy_slot_from(*dflash_local_, source, destination, stream);
     }
