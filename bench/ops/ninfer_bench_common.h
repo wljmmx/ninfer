@@ -14,6 +14,7 @@
 #include "../common/fixture_data.cuh"
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/transfer.h"
 #include "core/device_roofline.h"
 
 #include <cuda_runtime.h>
@@ -70,8 +71,8 @@ public:
     }
 
     void restore(cudaStream_t stream) const {
-        CUDA_CHECK(cudaMemcpyAsync(destination_, initial_.p, initial_.bytes,
-                                   cudaMemcpyDeviceToDevice, stream));
+        core::copy_bytes(destination_, initial_.p, initial_.bytes,
+                         core::TransferDirection::DeviceToDevice, stream);
     }
 private:
     void* destination_;

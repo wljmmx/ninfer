@@ -4,6 +4,7 @@
 // local tree does not carry; this file reproduces the same Op coverage on ninfer_bench_common.h.
 #include "ninfer/ops/gated_residual.h"
 #include "core/device.h"
+#include "core/transfer.h"
 #include "ninfer_bench_common.h"
 
 #include <cstdio>
@@ -174,8 +175,8 @@ struct Fixture {
 
     void restore(cudaStream_t stream) {
         if (in_place)
-            CUDA_CHECK(
-                cudaMemcpyAsync(input.p, backup.p, input.bytes, cudaMemcpyDeviceToDevice, stream));
+            core::copy_bytes(input.p, backup.p, input.bytes,
+                             core::TransferDirection::DeviceToDevice, stream);
     }
 
     void launch(DeviceExecutionView e) {

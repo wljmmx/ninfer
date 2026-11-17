@@ -8,6 +8,7 @@
 #include "ninfer/ops/sparse_moe.h"
 
 #include "core/device.h"
+#include "core/transfer.h"
 #include "ninfer_bench_common.h"
 #include "quantized_weight.cuh"
 
@@ -598,8 +599,8 @@ public:
 
     void prepare(CacheState cache, cudaStream_t stream) {
         if (cache == CacheState::Cold) { fixture_.flush(stream); }
-        CUDA_CHECK(cudaMemcpyAsync(destination_.p, residual_.p, destination_.bytes,
-                                   cudaMemcpyDeviceToDevice, stream));
+        core::copy_bytes(destination_.p, residual_.p, destination_.bytes,
+                         core::TransferDirection::DeviceToDevice, stream);
     }
 
     void launch(cudaStream_t stream) {

@@ -7,6 +7,7 @@
 #include "core/host_kv_arena.h"
 #include "core/layout.h"
 #include "core/paged_kv_cache.h"
+#include "core/transfer.h"
 #include "core/wide_mul.h"
 #include "ninfer/engine.h"
 
@@ -345,10 +346,9 @@ void measure_contiguous_d2d(DeviceContext& device, const MeasurementOptions& opt
         timer.start();
         for (std::uint32_t operation = 0; operation < test.copy_operations; ++operation) {
             const std::size_t offset = static_cast<std::size_t>(operation) * operation_bytes;
-            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(destination.p) + offset,
-                                       static_cast<const std::byte*>(source.p) + offset,
-                                       operation_bytes, cudaMemcpyDeviceToDevice,
-                                       device.transfer_stream));
+            core::copy_bytes(static_cast<std::byte*>(destination.p) + offset,
+                             static_cast<const std::byte*>(source.p) + offset, operation_bytes,
+                             core::TransferDirection::DeviceToDevice, device.transfer_stream);
         }
         return elapsed_ns(timer.stop_ms());
     };

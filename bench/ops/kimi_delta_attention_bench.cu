@@ -2,6 +2,7 @@
 #include "ninfer/ops/kimi_delta_attention.h"
 #include "ops/linear_attention/kimi_delta_attention/launch.h"
 #include "ninfer_bench_common.h"
+#include "core/transfer.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -233,8 +234,8 @@ void run(Profile p, int t, int b, const Options& o, DeviceContext& ctx,
     const int tile = chunked ? kda::chunk_value_tile(p.value, ex.multiprocessor_count) : 0;
     auto reset     = [&](cudaStream_t s) {
         if (o.batch_update)
-            CUDA_CHECK(cudaMemcpyAsync(f.final.p, f.initial.p, f.initial.bytes,
-                                           cudaMemcpyDeviceToDevice, s));
+            core::copy_bytes(f.final.p, f.initial.p, f.initial.bytes,
+                             core::TransferDirection::DeviceToDevice, s);
     };
     auto measure = [&](const char* name, std::string_view kind, auto&& body) {
         reset(ex.stream);
