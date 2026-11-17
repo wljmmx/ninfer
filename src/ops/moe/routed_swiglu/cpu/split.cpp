@@ -1377,7 +1377,7 @@ std::size_t split_capacity(std::int32_t intermediate, std::int32_t tokens) {
 void split_launch(const Tensor& x, const CpuSwiGLUExperts& experts, const ExpertRoutes& routes,
                   ExpertSubset subset, Tensor& destination, MemoryArena& scratch,
                   CpuExecutionView execution, std::int32_t hidden, std::int32_t intermediate,
-                  std::int32_t experts_count, std::int32_t top_k) {
+                  std::int32_t experts_count, std::int32_t top_k, bool a8_allowed) {
     const auto tokens = x.ne[1];
     if (tokens <= 0 || hidden <= 0 || intermediate <= 0 || experts_count <= 0 || top_k <= 0) {
         throw std::invalid_argument("routed_swiglu CPU: invalid split invocation");
@@ -1435,14 +1435,22 @@ void split_launch(const Tensor& x, const CpuSwiGLUExperts& experts, const Expert
     // The same knob the fused form reads. Until now this form ignored it entirely, which is why an
     // A/B of the int8 tier came back identical: the switch was being flipped on a path that never
     // consulted it.
+    //
+    // The int8 tier is also gated by the caller's LinearPolicy, which is the other half of the same
+    // story: the tier exists to reproduce the DEVICE's arithmetic (w4a8_gemm: int8 activations), so
+    // it may only be selected when the profile admits A8. A caller that pins A16Only asks for a
+    // 16-bit activation on both legs; handing it int8 on the CPU half silently made the two halves
+    // compute different arithmetic (measured: CPU half 9.08e-3 against the FP64 oracle at int8,
+    // 5.12e-5 at int16, while the A16 device half sits at 2e-7). A16Only therefore lands on the
+    // int16 tier - the tier that reproduces the exact bf16 decode to 2e-7 - and only AllowA8/A4
+    // keep the shipped int8 default. The env asks for a tier; the policy caps it.
     {
         static const char* value = std::getenv("NINFER_MOE_CPU_INT8");
         const bool float_all      = value != nullptr && std::strcmp(value, "0") == 0;
-        // Same value names as the fused form: "0" float, "16" int16, anything else int8. Unset keeps
-        // this form's shipped tier (int8) because every gate below it is recorded against that
-        // arithmetic - the switch moves on evidence, not on tidiness.
-        work.int16_path = value != nullptr && std::strcmp(value, "16") == 0;
-        work.int8_path  = !work.int16_path && !float_all;
+        const bool int16_asked    = value != nullptr && std::strcmp(value, "16") == 0;
+        // Same value names as the fused form: "0" float, "16" int16, anything else int8.
+        work.int16_path = !float_all && (int16_asked || !a8_allowed);
+        work.int8_path  = a8_allowed && !float_all && !work.int16_path;
         const char* q6 = std::getenv("NINFER_SPLIT_Q6");
         work.q6_path   = q6 == nullptr || std::strcmp(q6, "0") != 0;
     }

@@ -24,6 +24,6 @@ namespace ninfer::ops::detail::moe_routed_cpu {
 void split_launch(const Tensor& x, const CpuSwiGLUExperts& experts, const ExpertRoutes& routes,
                   ExpertSubset subset, Tensor& destination, MemoryArena& scratch,
                   CpuExecutionView execution, std::int32_t hidden, std::int32_t intermediate,
-                  std::int32_t experts_count, std::int32_t top_k);
+                  std::int32_t experts_count, std::int32_t top_k, bool a8_allowed);
 
 } // namespace ninfer::ops::detail::moe_routed_cpu

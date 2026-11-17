@@ -793,6 +793,51 @@ int main() {
                          reference_values[0], reference_values[1], reference_values[2], oracle[0],
                          oracle[1], oracle[2]);
         }
+        // The tier is the POLICY's choice, not the CPU's: this profile pins A16Only, so the CPU half
+        // must run the int16 tier; an AllowA8 profile must still land on int8, which is the tier that
+        // reproduces the Device's own w4a8 arithmetic. Both numbers are the same call, one field
+        // apart, which is the only way to prove the policy is consulted rather than the env.
+        {
+            std::vector<float> cpu_a8(cpu_all.size(), 0.0F);
+            auto profile_a8              = profile;
+            profile_a8.ffn.gate_up_policy = ops::LinearPolicy::AllowA8;
+            profile_a8.ffn.down_policy    = ops::LinearPolicy::AllowA8;
+            Tensor cpu_a8_tensor(cpu_a8.data(), Device::cpu(), DType::FP32, {kHidden, kTokens});
+            ops::ExpertRoutes routes_a8{
+                Tensor(const_cast<std::int32_t*>(fixture.ids.data()), Device::cpu(), DType::I32,
+                       {kTopK, kTokens}),
+                Tensor(const_cast<float*>(fixture.coefficients.data()), Device::cpu(), DType::FP32,
+                       {kTopK, kTokens})};
+            Tensor x_a8(const_cast<std::uint16_t*>(fixture.input.data()), Device::cpu(),
+                        DType::BF16, {kHidden, kTokens});
+            std::vector<std::byte> a8_scratch(cpu_capacity_all + 256);
+            const auto a8_base   = reinterpret_cast<std::uintptr_t>(a8_scratch.data());
+            const auto a8_align  = (256 - (a8_base & 255)) & 255;
+            MemoryArena a8_arena(MemorySpan{a8_scratch.data() + a8_align, cpu_capacity_all,
+                                            Device::cpu()});
+            static CpuTopology topology3;
+            static CpuExecutor executor3(topology3, plan_cpu_team(topology3.info(), 8));
+            ops::routed_swiglu(x_a8, profile_a8, cpu_views, routes_a8, ops::ExpertSubset{},
+                               cpu_a8_tensor, a8_arena, executor3.execution_view());
+            std::vector<double> cpu_a8_double(cpu_a8.size());
+            for (std::size_t i = 0; i < cpu_a8.size(); ++i) { cpu_a8_double[i] = cpu_a8[i]; }
+            std::vector<double> cpu_a16_double(cpu_all.size());
+            for (std::size_t i = 0; i < cpu_all.size(); ++i) { cpu_a16_double[i] = cpu_all[i]; }
+            const auto a8_error    = rel_l2(cpu_a8_double, oracle);
+            const auto a16_error   = rel_l2(cpu_a16_double, oracle);
+            const auto tier_spread = rel_l2(cpu_a8_double, cpu_a16_double);
+            std::fprintf(stderr,
+                         "expert stream split layers: tier by policy | A16Only cpu=%.3e "
+                         "AllowA8 cpu=%.3e spread=%.3e\n",
+                         a16_error, a8_error, tier_spread);
+            if (!(tier_spread > 1e-3)) {
+                fail("the CPU half ignored the profile's LinearPolicy (same output for A16Only and "
+                     "AllowA8)");
+            }
+            if (!(a8_error > a16_error)) {
+                fail("the AllowA8 tier is not the coarser one: the int8 default was not selected");
+            }
+        }
         // Half-by-half: which leg disagrees with the oracle, if either does.
         {
             std::vector<double> oracle_device(oracle.size(), 0.0), oracle_cpu(oracle.size(), 0.0);

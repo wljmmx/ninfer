@@ -273,7 +273,7 @@ void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
         auto scope = scratch.scope();
         impl::split_launch(x, experts, routes, subset, destination, scratch, execution,
                            profile.ffn.hidden, profile.ffn.intermediate, profile.experts,
-                           profile.top_k);
+                           profile.top_k, allows_a8(profile.ffn.gate_up_policy));
         if (timing) {
             const auto launch_ms = std::chrono::duration<double, std::milli>(
                                        std::chrono::steady_clock::now() - started).count();
