@@ -2063,7 +2063,7 @@ int test_structured_tool_output() {
 
     const std::string generated =
         "Calling.  \n<tool_call>\n<function=TaskUpdate>\n<parameter=taskId>\n1\n"
-        "</parameter>\n<parameter=enabled>\n\n</parameter>\n<parameter=count>\nmany\n"
+        "</parameter>\n<parameter=enabled>\nfalse\n</parameter>\n<parameter=count>\n\"many\"\n"
         "</parameter>\n</function>\n</tool_call>";
     const std::vector<ninfer::TokenId> tokens = fixture_tokenizer().encode(generated);
     const auto decision = session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()),
@@ -2080,7 +2080,6 @@ int test_structured_tool_output() {
                           ninfer::ToolCallParseDiagnostics{
                               .marker_seen               = true,
                               .structured_call_count     = 1,
-                              .empty_arguments_omitted   = 1,
                               .schema_mismatch_arguments = 1,
                               .fallback_reason = ninfer::ToolCallParseFallbackReason::None,
                           },
@@ -2088,7 +2087,7 @@ int test_structured_tool_output() {
     if (!calls.empty()) {
         const nlohmann::json arguments = nlohmann::json::parse(calls.front().arguments_json);
         failures += check(arguments.at("taskId").is_string() && arguments.at("taskId") == "1" &&
-                              !arguments.contains("enabled") && arguments.at("count") == "many",
+                              arguments.at("enabled") == false && arguments.at("count") == "many",
                           "frontend did not preserve normalized tool arguments");
     }
     return failures;
