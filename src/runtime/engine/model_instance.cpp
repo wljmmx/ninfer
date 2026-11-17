@@ -1740,7 +1740,14 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
         // One window per bank means no layer ever evicts another, so the resident set is fixed and
         // the decode graph may be captured. Uploading the whole set first keeps the capture from
         // recording an upload that a later step would then repeat with the wrong experts.
-        const bool every_layer = instance->expert_cache->can_hold_every_layer();
+        //
+        // A DENSE artifact never gets a pool: attach_expert_cache() returns before creating one
+        // when the model has no routed bank, so naming a budget for it is a no-op, not an error -
+        // the same invariant the pool-capacity read below already relies on. Reading through the
+        // pointer unconditionally is what turned "NINFER_EXPERT_CACHE_MB set on a dense model"
+        // into a null dereference (V10-68, measured with the 27B and any non-zero value).
+        const bool every_layer =
+            instance->expert_cache != nullptr && instance->expert_cache->can_hold_every_layer();
         if (every_layer) { instance->expert_cache->preload_all(); }
         // P6/step 4 + the default-on rule: the construction decision asks the controller's rule
         // (PolicyController::want_graph) instead of hard-coding a capacity or profit threshold.
