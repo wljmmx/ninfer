@@ -2170,6 +2170,35 @@ int test_constrained_thinking_control(const Frontend& frontend) {
     return failures;
 }
 
+// The same budget path under a CHOICE constraint. The real-model grammar suite failed this shape
+// ("choice constrained the thinking channel or lost the content boundary", with </think> published
+// as content), while the grammar form above stayed green - so the two constraint kinds have to be
+// distinguished here, at the session, before blaming the model.
+int test_choice_thinking_control(const Frontend& frontend) {
+    auto prompt           = thinking_prompt(frontend);
+    const auto bare_close = frontend.tokenize_text("</think>");
+    auto session          = frontend.make_output_session(
+        prompt, {}, {}, {.budget = static_cast<std::uint32_t>(bare_close.size())},
+        ninfer::OutputConstraint::choice({" yes"}));
+    const auto decision = session.preview_model(bare_close, 512, ninfer::FinishReason::OutputLimit);
+    int failures =
+        check(decision.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl,
+              "choice constraint disabled the thinking budget");
+    (void)session.commit_preview();
+    const auto control = session.pending_control_tokens();
+    if (control.empty()) return failures + check(false, "choice thinking control is missing");
+    (void)session.preview_control(control, 512);
+    auto closed = session.commit_preview();
+    failures += check(channel_text(closed, ninfer::OutputChannel::Content).empty(),
+                      "choice thinking framing leaked into content");
+    (void)session.preview_model(frontend.tokenize_text(" yes"), 512,
+                                ninfer::FinishReason::OutputLimit);
+    failures += check(channel_text(session.commit_preview(), ninfer::OutputChannel::Content) ==
+                              " yes",
+                      "choice content after thinking was not the constrained value");
+    return failures;
+}
+
 int test_thinking_accounting(const Frontend& frontend) {
     int failures     = 0;
     const auto word  = frontend.tokenize_text("x");
@@ -2724,6 +2753,7 @@ int main() {
     failures += test_thinking_accounting(frontend);
     failures += test_thinking_budget_control(frontend);
     failures += test_constrained_thinking_control(frontend);
+    failures += test_choice_thinking_control(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
     failures += test_media_cache_reuses_immutable_payload();
     failures += test_media_payload_outlives_frontend_cache();
