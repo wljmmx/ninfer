@@ -1,6 +1,7 @@
 #include "models/qwen4_exp/execution/ple_layer.h"
 
 #include "ninfer/ops/ple.h"
+#include "core/transfer.h"
 
 #include <algorithm>
 #include <atomic>
@@ -51,8 +52,8 @@ void ple_dump_plane(const char* tag, const Tensor& value, std::int32_t rows, std
     if (value.dtype != DType::BF16) { return; }
     const std::size_t bytes = std::size_t(rows) * std::size_t(cols) * sizeof(std::uint16_t);
     std::vector<std::uint8_t> host(bytes);
-    if (cudaMemcpyAsync(host.data(), value.data, bytes, cudaMemcpyDeviceToHost, stream) !=
-        cudaSuccess) {
+    if (!core::try_copy_bytes(host.data(), value.data, bytes,
+                              core::TransferDirection::DeviceToHost, stream)) {
         return;
     }
     if (cudaStreamSynchronize(stream) != cudaSuccess) { return; }

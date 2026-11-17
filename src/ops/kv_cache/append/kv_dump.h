@@ -8,6 +8,7 @@
 // analysis can apply any candidate rotation itself.
 
 #include "core/tensor.h"
+#include "core/transfer.h"
 
 #include <cuda_runtime.h>
 
@@ -55,12 +56,12 @@ inline void kv_dump_capture(const Tensor& k, const Tensor& v, cudaStream_t strea
 
     const std::size_t plane = static_cast<std::size_t>(dim) * heads * tokens * 2u;
     std::vector<unsigned char> host(2u * plane);
-    if (cudaMemcpyAsync(host.data(), k.data, plane, cudaMemcpyDeviceToHost, stream) !=
-        cudaSuccess) {
+    if (!core::try_copy_bytes(host.data(), k.data, plane, core::TransferDirection::DeviceToHost,
+                              stream)) {
         return;
     }
-    if (cudaMemcpyAsync(host.data() + plane, v.data, plane, cudaMemcpyDeviceToHost, stream) !=
-        cudaSuccess) {
+    if (!core::try_copy_bytes(host.data() + plane, v.data, plane,
+                              core::TransferDirection::DeviceToHost, stream)) {
         return;
     }
     if (cudaStreamSynchronize(stream) != cudaSuccess) { return; }

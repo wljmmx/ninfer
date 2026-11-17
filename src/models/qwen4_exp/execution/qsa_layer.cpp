@@ -6,6 +6,7 @@
 #include "models/qwen3_5/execution/text.h"
 
 #include "models/qwen3_5/execution/attention.h"
+#include "core/transfer.h"
 #include "models/qwen3_5/execution/diagnostics.h"
 #include "models/qwen3_5/execution/verify_probe.h"
 #include "models/qwen3_5/execution/workspace.h"
@@ -61,8 +62,8 @@ void qsa_meta_probe(const char* stage, int layer, const Tensor& positions, const
     std::array<std::int32_t, 8> meta{};
     const auto read = [&](const Tensor& t, std::size_t slot) {
         if (t.data == nullptr || batch <= 0) { return; }
-        CUDA_CHECK(cudaMemcpyAsync(&meta[slot], t.data, sizeof(std::int32_t),
-                                   cudaMemcpyDeviceToHost, stream));
+        core::copy_bytes(&meta[slot], t.data, sizeof(std::int32_t),
+                         core::TransferDirection::DeviceToHost, stream);
     };
     read(positions, 0);
     read(columns, 1);

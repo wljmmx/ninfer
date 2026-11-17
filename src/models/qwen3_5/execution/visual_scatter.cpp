@@ -1,6 +1,7 @@
 #include "models/qwen3_5/execution/visual_scatter.h"
 
 #include "core/device.h"
+#include "core/transfer.h"
 #include "ninfer/ops/scatter.h"
 
 #include <stdexcept>
@@ -13,8 +14,8 @@ void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stre
         destination.data == nullptr) {
         throw std::invalid_argument("copy_i32: invalid host source or I32 destination");
     }
-    CUDA_CHECK(cudaMemcpyAsync(destination.data, source, destination.bytes(),
-                               cudaMemcpyHostToDevice, stream));
+    core::copy_bytes(destination.data, source, destination.bytes(),
+                     core::TransferDirection::HostToDevice, stream);
 }
 
 } // namespace

@@ -41,6 +41,7 @@
 // flips of one key's contribution), which is what the P3 harness's 1e-5 bar audits.
 
 #include "core/device.h"
+#include "core/transfer.h"
 #include "ops/softmax_attention/common/causal_operands.h"
 #include "ops/softmax_attention/common/causal_partition.h"
 #include "ops/softmax_attention/cpu/partial.h"
@@ -280,12 +281,13 @@ inline void compare_with_device(int width, int split, softmax_cpu::RkPartialToke
     const std::int64_t slot_acc  = static_cast<std::int64_t>(acc_n) * split;
     const std::int64_t slot_stat = static_cast<std::int64_t>(stat_n) * split;
     std::vector<float> gpu_acc(acc_n), gpu_max(stat_n), gpu_sum(stat_n);
-    if (cudaMemcpyAsync(gpu_acc.data(), partial.acc + slot_acc, acc_n * sizeof(float),
-                        cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
-        cudaMemcpyAsync(gpu_max.data(), partial.maximum + slot_stat, stat_n * sizeof(float),
-                        cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
-        cudaMemcpyAsync(gpu_sum.data(), partial.sum + slot_stat, stat_n * sizeof(float),
-                        cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+    if (!core::try_copy_bytes(gpu_acc.data(), partial.acc + slot_acc, acc_n * sizeof(float),
+                              core::TransferDirection::DeviceToHost, stream) ||
+        !core::try_copy_bytes(gpu_max.data(), partial.maximum + slot_stat,
+                              stat_n * sizeof(float), core::TransferDirection::DeviceToHost,
+                              stream) ||
+        !core::try_copy_bytes(gpu_sum.data(), partial.sum + slot_stat, stat_n * sizeof(float),
+                              core::TransferDirection::DeviceToHost, stream) ||
         cudaStreamSynchronize(stream) != cudaSuccess) {
         (void)cudaGetLastError();
         std::fprintf(stderr, "[kv-cpu] partial check: the GPU slot could not be read back\n");
@@ -401,12 +403,12 @@ void rk_host_partial_stage(const RkHostPartialView& view, float scale, int width
     const std::size_t acc_bytes =
         static_cast<std::size_t>(256) * QueryHeads * width * sizeof(float);
     const std::size_t stat_bytes = static_cast<std::size_t>(QueryHeads) * width * sizeof(float);
-    CUDA_CHECK(cudaMemcpyAsync(partial.acc + slot_acc, st.acc, acc_bytes, cudaMemcpyHostToDevice,
-                               stream));
-    CUDA_CHECK(cudaMemcpyAsync(partial.maximum + slot_stat, st.maximum, stat_bytes,
-                               cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(partial.sum + slot_stat, st.sum, stat_bytes,
-                               cudaMemcpyHostToDevice, stream));
+    core::copy_bytes(partial.acc + slot_acc, st.acc, acc_bytes,
+                     core::TransferDirection::HostToDevice, stream);
+    core::copy_bytes(partial.maximum + slot_stat, st.maximum, stat_bytes,
+                     core::TransferDirection::HostToDevice, stream);
+    core::copy_bytes(partial.sum + slot_stat, st.sum, stat_bytes,
+                     core::TransferDirection::HostToDevice, stream);
     CUDA_CHECK(cudaEventRecord(st.copied, stream));
     st.copied_valid = true;
 }

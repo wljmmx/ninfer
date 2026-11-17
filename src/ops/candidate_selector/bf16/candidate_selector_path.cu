@@ -1,5 +1,6 @@
 #include "ops/candidate_selector/bf16/candidate_selector_path_kernels.h"
 #include "core/device.h"
+#include "core/transfer.h"
 #include "ops/common/cuda/memory.cuh"
 #include "ops/common/cuda/pipeline.cuh"
 #include "ops/common/cuda/reduce.cuh"
@@ -39,7 +40,8 @@ void publish_edge_probe(const float* edges, int columns, int batch, cudaStream_t
     if (columns < 1 || columns > kProbeSteps * kProbeBatch || batch < 1 || batch > kProbeBatch)
         return;
     const std::size_t bytes = std::size_t{columns} * kCandidates * kCandidates * sizeof(float);
-    CUDA_CHECK(cudaMemcpyAsync(g_edge_probe, edges, bytes, cudaMemcpyDeviceToDevice, stream));
+    core::copy_bytes(g_edge_probe, edges, bytes, core::TransferDirection::DeviceToDevice,
+                     stream);
     g_probe_columns = columns;
     g_probe_batch   = batch;
 }

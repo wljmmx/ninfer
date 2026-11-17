@@ -1,6 +1,7 @@
 #include "ops/launcher/logits_topk_softmax.h"
 
 #include "core/device.h"
+#include "core/transfer.h"
 #include "ops/kernel/logits_topk_softmax.cuh"
 
 #include <cuda_bf16.h>
@@ -138,8 +139,8 @@ void apply_sampling_mask(const void* source, void* destination, std::int32_t row
                          std::int32_t column_stride_words, cudaStream_t stream) {
     const auto total_bytes = static_cast<std::size_t>(rows) * columns * sizeof(__nv_bfloat16);
     if (mask.words == nullptr) {
-        CUDA_CHECK(cudaMemcpyAsync(destination, source, total_bytes, cudaMemcpyDeviceToDevice,
-                                   stream));
+        core::copy_bytes(destination, source, total_bytes,
+                         core::TransferDirection::DeviceToDevice, stream);
         return;
     }
     const auto stride = column_stride_words > 0 ? column_stride_words : mask.stride;

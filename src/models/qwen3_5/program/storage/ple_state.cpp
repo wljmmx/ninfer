@@ -2,6 +2,7 @@
 
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen4_exp/execution/ple_layer.h"
+#include "core/transfer.h"
 #include "ninfer/types.h"
 
 #include <algorithm>
@@ -105,8 +106,8 @@ bool PleProgramState::commit_verify(const Tensor& accepted, std::size_t layers,
     // for its licensed tokens, and this one is [batch] ints behind the same stream.
     const auto batch = static_cast<std::size_t>(stage_->window_batch());
     std::array<std::uint32_t, kMaximumConcurrency> host{};
-    CUDA_CHECK(cudaMemcpyAsync(host.data(), accepted.data, batch * sizeof(std::int32_t),
-                               cudaMemcpyDeviceToHost, execution.stream));
+    core::copy_bytes(host.data(), accepted.data, batch * sizeof(std::int32_t),
+                     core::TransferDirection::DeviceToHost, execution.stream);
     CUDA_CHECK(cudaStreamSynchronize(execution.stream));
     stage_->advance_tail(std::span<const std::uint32_t>(host.data(), batch));
     stage_->end(execution);

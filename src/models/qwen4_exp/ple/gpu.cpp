@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "core/device_scope.h"
+#include "core/transfer.h"
 
 #include <cuda_runtime.h>
 
@@ -108,8 +109,8 @@ void PleGpuPreparation::upload(PleTicket ticket, CudaExecutionView transfer) {
     slot.active     = true;
     slot.transfer   = transfer.stream;
     try {
-        CUDA_CHECK(cudaMemcpyAsync(slot.device.p, input.values.data, input.values.bytes,
-                                   cudaMemcpyHostToDevice, transfer.stream));
+        core::copy_bytes(slot.device.p, input.values.data, input.values.bytes,
+                         core::TransferDirection::HostToDevice, transfer.stream);
         slot.uploaded.record(transfer.stream);
         slot.upload_recorded = true;
     } catch (...) { p.submission_failed(ticket, slot); }

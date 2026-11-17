@@ -9,6 +9,7 @@
 // captured pass, and the whole path is off unless the variable is set.
 
 #include "core/device.h"
+#include "core/transfer.h"
 #include "core/tensor.h"
 
 #include <cmath>
@@ -34,11 +35,12 @@ inline void verify_column_probe(const char* label, const Tensor& tensor, std::in
     std::vector<std::uint8_t> host(static_cast<std::size_t>(elements) * w *
                                    static_cast<std::size_t>(width));
     for (std::int32_t column = 0; column < width; ++column) {
-        const auto status = cudaMemcpyAsync(
+        const auto status = core::copy_bytes_status(
             host.data() + static_cast<std::size_t>(column) * elements * w,
             static_cast<const std::uint8_t*>(tensor.data) +
                 static_cast<std::size_t>(column) * static_cast<std::size_t>(column_stride_bytes),
-            static_cast<std::size_t>(elements) * w, cudaMemcpyDeviceToHost, stream);
+            static_cast<std::size_t>(elements) * w, core::TransferDirection::DeviceToHost,
+            stream);
         if (status != cudaSuccess) { return; }
     }
     if (cudaStreamSynchronize(stream) != cudaSuccess) { return; }

@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include "core/transfer.h"
+
 // port (sm_89): the runtime policy controller - the one place that decides how a running instance
 // serves experts, whether it prefetches, whether it may capture graphs, whether it keeps a frozen
 // set, and (v8 9.3) how many lanes the scheduler may fill. Every decision is taken from
@@ -200,7 +202,8 @@ public:
         float best = 1e9F;
         for (int round = 0; round < 3; ++round) {
             (void)cudaEventRecord(begin);
-            (void)cudaMemcpyAsync(device, host, kBytes, cudaMemcpyHostToDevice);
+            (void)core::try_copy_bytes(device, host, kBytes, core::TransferDirection::HostToDevice,
+                                       nullptr /* legacy default stream, as before */);
             (void)cudaEventRecord(end);
             (void)cudaEventSynchronize(end);
             float ms = 0.0F;

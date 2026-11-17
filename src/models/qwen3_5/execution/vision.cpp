@@ -4,6 +4,7 @@
 #include "core/device.h"
 #include "core/layout.h"
 #include "core/nvtx.h"
+#include "core/transfer.h"
 #include "models/qwen3_5/program/vision_control.h"
 #include "ninfer/ops/add_bias.h"
 #include "ninfer/ops/gelu.h"
@@ -216,7 +217,7 @@ std::size_t merger_hidden_bytes(const VisionConfig& config, std::size_t merged_t
 
 void copy_host(const void* src, Tensor& dst, cudaStream_t stream) {
     if (dst.bytes() == 0) { return; }
-    CUDA_CHECK(cudaMemcpyAsync(dst.data, src, dst.bytes(), cudaMemcpyHostToDevice, stream));
+    core::copy_bytes(dst.data, src, dst.bytes(), core::TransferDirection::HostToDevice, stream);
 }
 
 } // namespace

@@ -203,8 +203,9 @@ void dump_exported_checkpoint(ProgramImpl& program, CheckpointHandle handle, con
         std::fwrite(state->bytes.data(), 1, state->bytes.size(), state_file);
         std::fclose(state_file);
         std::fprintf(stderr,
-                     "[ckpt] state %s (%u B, layers=%u hidden=%d, host_copy_materialised=%d)\n",
-                     path, state->image_bytes, static_cast<unsigned>(state->layers), state->hidden,
+                     "[ckpt] state %s (%llu B, layers=%u hidden=%d, host_copy_materialised=%d)\n",
+                     path, static_cast<unsigned long long>(state->image_bytes),
+                     static_cast<unsigned>(state->layers), state->hidden,
                      state->materialised_host_copy ? 1 : 0);
     {
         // The state half of the fingerprint, read from the live layout. Printed so the region sizes

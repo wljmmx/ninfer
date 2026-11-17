@@ -2,6 +2,7 @@
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/execution_context.h"
 #include "core/device.h"
+#include "core/transfer.h"
 #include "ninfer/ops/sampling.h"
 
 #include <algorithm>
@@ -197,8 +198,8 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
         Tensor forced_ids =
             work.alloc(DType::I32, {checked_i32(static_cast<std::uint32_t>(row_major_tokens.size()),
                                                 "forced-token batch exceeds int32")});
-        CUDA_CHECK(cudaMemcpyAsync(forced_ids.data, row_major_tokens.data(), forced_ids.bytes(),
-                                   cudaMemcpyHostToDevice, device.stream));
+        core::copy_bytes(forced_ids.data, row_major_tokens.data(), forced_ids.bytes(),
+                         core::TransferDirection::HostToDevice, device.stream);
         for (std::size_t row = 0; row < members.size(); ++row) {
             const std::uint32_t lane = lanes[row];
             if (requests[lane].sampling_host.token_counts == nullptr) { continue; }

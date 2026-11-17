@@ -4,6 +4,7 @@
 #include "artifact/framing.h"
 #include "artifact/reader.h"
 #include "core/startup.h"
+#include "core/transfer.h"
 
 #include <cuda_runtime.h>
 
@@ -314,11 +315,12 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             const auto begin  = std::max(chunk.source, range.begin);
             const auto end    = std::min(chunk_end, range.end);
             if (begin < end) {
-                check_cuda(cudaMemcpyAsync(range.destination + (begin - range.begin),
-                                           static_cast<const std::byte*>(slot.buffer.data()) +
-                                               (begin - chunk.source),
-                                           static_cast<std::size_t>(end - begin),
-                                           cudaMemcpyHostToDevice, device.transfer_stream),
+                check_cuda(core::copy_bytes_status(
+                               range.destination + (begin - range.begin),
+                               static_cast<const std::byte*>(slot.buffer.data()) +
+                                   (begin - chunk.source),
+                               static_cast<std::size_t>(end - begin),
+                               core::TransferDirection::HostToDevice, device.transfer_stream),
                            "upload weight bytes");
                 copied = checked_add(copied, end - begin, "copied bytes");
             }

@@ -1,6 +1,7 @@
 #include "ops/launcher/scalar.h"
 
 #include "core/device.h"
+#include "core/transfer.h"
 #include "ops/kernel/scalar.cuh"
 
 namespace ninfer::ops::detail {
@@ -11,8 +12,8 @@ void set_i32_scalar_launch(Tensor& destination, std::int32_t value, cudaStream_t
 }
 
 void assign_i32_scalar_launch(const Tensor& source, Tensor& destination, cudaStream_t stream) {
-    CUDA_CHECK(cudaMemcpyAsync(destination.data, source.data, sizeof(std::int32_t),
-                               cudaMemcpyDeviceToDevice, stream));
+    core::copy_bytes(destination.data, source.data, sizeof(std::int32_t),
+                     core::TransferDirection::DeviceToDevice, stream);
 }
 
 void add_i32_scalars_launch(const Tensor& lhs, const Tensor& rhs, Tensor& destination,

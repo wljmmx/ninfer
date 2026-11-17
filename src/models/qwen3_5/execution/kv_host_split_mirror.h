@@ -30,6 +30,7 @@
 #include "core/paged_kv_cache.h"
 #include "core/paged_kv_storage.h"
 #include "core/tensor.h"
+#include "core/transfer.h"
 #include "ops/softmax_attention/cpu/host_pages.h"
 #include "ops/softmax_attention/dense/causal_cache/int8/host_partial.h"
 
@@ -130,8 +131,8 @@ public:
 
         // --- the row's block table, host side -------------------------------------------------
         std::int32_t row = 0;
-        if (cudaMemcpyAsync(&row, kv_table_rows.data, sizeof row, cudaMemcpyDeviceToHost, stream) !=
-            cudaSuccess) {
+        if (!core::try_copy_bytes(&row, kv_table_rows.data, sizeof row,
+                                  core::TransferDirection::DeviceToHost, stream)) {
             (void)cudaGetLastError();
             return fail("the row index could not be read back");
         }
@@ -139,10 +140,10 @@ public:
         const auto row_offset =
             static_cast<std::size_t>(row) * static_cast<std::size_t>(logical_pages) * sizeof(std::int32_t);
         if (row < 0 || row >= cache.block_tables.ne[1] ||
-            cudaMemcpyAsync(table_.data(),
-                            static_cast<const std::byte*>(cache.block_tables.data) + row_offset,
-                            table_.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost,
-                            stream) != cudaSuccess) {
+            !core::try_copy_bytes(table_.data(),
+                                  static_cast<const std::byte*>(cache.block_tables.data) + row_offset,
+                                  table_.size() * sizeof(std::int32_t),
+                                  core::TransferDirection::DeviceToHost, stream)) {
             (void)cudaGetLastError();
             return fail("the row's block table could not be read back");
         }
@@ -162,11 +163,12 @@ public:
             const auto bytes    = layout.planes[static_cast<std::size_t>(index)].page_payload_bytes;
             for (std::int32_t page = 0; page < physical_pages; ++page) {
                 if (!page_referenced(page)) { continue; }
-                if (cudaMemcpyAsync(record_ + static_cast<std::size_t>(page) * layout.page_stride +
-                                        layout.planes[static_cast<std::size_t>(index)].offset,
-                                    static_cast<const std::byte*>(plane.data) +
-                                        static_cast<std::size_t>(page) * plane.nb[3],
-                                    bytes, cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
+                if (!core::try_copy_bytes(
+                        record_ + static_cast<std::size_t>(page) * layout.page_stride +
+                            layout.planes[static_cast<std::size_t>(index)].offset,
+                        static_cast<const std::byte*>(plane.data) +
+                            static_cast<std::size_t>(page) * plane.nb[3],
+                        bytes, core::TransferDirection::DeviceToHost, stream)) {
                     (void)cudaGetLastError();
                     return fail("a page's plane payload could not be read back");
                 }
@@ -178,11 +180,11 @@ public:
             static_cast<std::size_t>(q.ne[2]) * q.ne[1] * cpu_partial::kHeadDim;  // tokens x heads x D
         q_.resize(q_terms);
         positions_.assign(static_cast<std::size_t>(q.ne[2]), 0);
-        if (cudaMemcpyAsync(q_.data(), q.data, q_terms * sizeof(std::uint16_t),
-                            cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
-            cudaMemcpyAsync(positions_.data(), positions.data,
-                            positions_.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost,
-                            stream) != cudaSuccess) {
+        if (!core::try_copy_bytes(q_.data(), q.data, q_terms * sizeof(std::uint16_t),
+                                  core::TransferDirection::DeviceToHost, stream) ||
+            !core::try_copy_bytes(positions_.data(), positions.data,
+                                  positions_.size() * sizeof(std::int32_t),
+                                  core::TransferDirection::DeviceToHost, stream)) {
             (void)cudaGetLastError();
             return fail("the Q tile or positions could not be read back");
         }

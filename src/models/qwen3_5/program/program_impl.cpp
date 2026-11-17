@@ -10,6 +10,7 @@
 #include "models/qwen3_5/execution/linear.h"
 #include "core/startup.h"
 #include "core/device.h"
+#include "core/transfer.h"
 #include "ninfer/ops/target_logprobs.h"
 
 #include <algorithm>
@@ -167,7 +168,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         kv_tier = std::make_unique<core::DiskKvTier>(std::filesystem::path(tier_dir));
         std::fprintf(stderr, "[kvt] tier dir=%s\n", tier_dir);
         std::fflush(stderr);
-        tier_selftest();
+        // The function reports its own OK/FAIL line; the bool only serves callers that act on it.
+        (void)tier_selftest();
     }
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
     decoder      = std::make_unique<qwen3_5::DecoderState>(backing, plan.persistent.decoder);
@@ -529,13 +531,13 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             Tensor logprobs   = work.alloc(DType::FP32, {columns});
             Tensor hidden     = score_hidden->slice(1, 0, columns);
             execution::project(hidden, parameters.text.output_head, logits, work, device.stream);
-            CUDA_CHECK(cudaMemcpyAsync(target_ids.data, staged_targets.data(), target_ids.bytes(),
-                                                    cudaMemcpyHostToDevice, device.stream));
+            core::copy_bytes(target_ids.data, staged_targets.data(), target_ids.bytes(),
+                             core::TransferDirection::HostToDevice, device.stream);
             ops::target_logprobs(logits, target_ids,
                                               dimension(parameters.model.resources().public_token_count),
                                               logprobs, device.stream);
-            CUDA_CHECK(cudaMemcpyAsync(score_logprobs_host->data(), logprobs.data, logprobs.bytes(),
-                                                    cudaMemcpyDeviceToHost, device.stream));
+            core::copy_bytes(score_logprobs_host->data(), logprobs.data, logprobs.bytes(),
+                             core::TransferDirection::DeviceToHost, device.stream);
             device.synchronize();
             const auto* host = static_cast<const float*>(score_logprobs_host->data());
             output.insert(output.end(), host, host + staged_columns);
@@ -595,8 +597,8 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
                                                static_cast<std::int32_t>(count));
                 Tensor destination = score_hidden->slice(
                     1, static_cast<std::int32_t>(staged_columns), static_cast<std::int32_t>(count));
-                CUDA_CHECK(cudaMemcpyAsync(destination.data, source.data, source.bytes(),
-                                           cudaMemcpyDeviceToDevice, device.stream));
+                core::copy_bytes(destination.data, source.data, source.bytes(),
+                                 core::TransferDirection::DeviceToDevice, device.stream);
                 for (std::uint32_t column = 0; column < count; ++column) {
                     staged_targets.push_back(prompt.token_ids[selected + column + 1U]);
                 }

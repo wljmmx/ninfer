@@ -1,5 +1,6 @@
 #include "models/qwen3_5/execution/diagnostics.h"
 
+#include "core/transfer.h"
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -16,8 +17,8 @@ void nan_probe_tensor(const char* tag, const Tensor& value, std::size_t layer, c
     if (value.dtype != DType::BF16) { return; }
     const auto rows = value.ne[0], cols = value.ne[1];
     std::vector<std::uint16_t> host(static_cast<std::size_t>(rows) * cols);
-    if (cudaMemcpyAsync(host.data(), value.data, host.size() * sizeof(std::uint16_t),
-                        cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
+    if (!core::try_copy_bytes(host.data(), value.data, host.size() * sizeof(std::uint16_t),
+                              core::TransferDirection::DeviceToHost, stream)) {
         return;
     }
     if (cudaStreamSynchronize(stream) != cudaSuccess) { return; }
@@ -108,8 +109,8 @@ void qsa_dump_tensor(const char* variable, const char* name, const Tensor& value
         throw std::logic_error("QSA dump needs a contiguous device tensor");
     }
     std::vector<std::uint8_t> host(value.bytes());
-    if (cudaMemcpyAsync(host.data(), value.data, host.size(), cudaMemcpyDeviceToHost, stream) !=
-        cudaSuccess) {
+    if (!core::try_copy_bytes(host.data(), value.data, host.size(),
+                              core::TransferDirection::DeviceToHost, stream)) {
         return;
     }
     if (cudaStreamSynchronize(stream) != cudaSuccess) { return; }

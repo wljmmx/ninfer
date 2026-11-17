@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/execution_context.h"
 #include "core/device.h"
+#include "core/transfer.h"
 #include "ninfer/ops/sampling.h"
 
 #include <algorithm>
@@ -83,17 +84,15 @@ void ProgramImpl::install_resume_sampling(SequenceState& sequence, RequestContro
                     const auto count = static_cast<std::int32_t>(
                         std::min<std::size_t>(chunk, generated.size() - begin));
                     Tensor current = ids.slice(0, 0, count);
-                    CUDA_CHECK(cudaMemcpyAsync(current.data, generated.data() + begin,
-                                               current.bytes(), cudaMemcpyHostToDevice,
-                                               device.stream));
+                    core::copy_bytes(current.data, generated.data() + begin, current.bytes(),
+                                     core::TransferDirection::HostToDevice, device.stream);
                     ops::increment_token_counts(current, counts, device.stream);
                 }
             }
         }
         Tensor config = sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1);
-        CUDA_CHECK(cudaMemcpyAsync(config.data, &request.sampling_host,
-                                   sizeof(request.sampling_host), cudaMemcpyHostToDevice,
-                                   device.stream));
+        core::copy_bytes(config.data, &request.sampling_host, sizeof(request.sampling_host),
+                         core::TransferDirection::HostToDevice, device.stream);
         // Later workspace users and sampling execute on this same ordered compute stream.
         work.reset();
     } catch (...) {
@@ -287,8 +286,8 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
                                                  *request.replay->vision, bridge);
             } else {
                 Tensor token = io.mtp->target_input_ids.slice(0, 0, 1);
-                CUDA_CHECK(cudaMemcpyAsync(token.data, sequence.ledger.data() + cursor,
-                                           sizeof(TokenId), cudaMemcpyHostToDevice, device.stream));
+                core::copy_bytes(token.data, sequence.ledger.data() + cursor, sizeof(TokenId),
+                                 core::TransferDirection::HostToDevice, device.stream);
                 execution::mtp_bridge_and_propose(context, token, sequence.tail_hidden,
                                                   bridge.position, rope, false);
             }

@@ -1,5 +1,6 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "core/device.h"
+#include "core/transfer.h"
 
 namespace ninfer::models::qwen3_5::detail {
 
@@ -23,8 +24,8 @@ ops::SamplingMask ProgramImpl::fill_grammar_mask(runtime::TokenMaskProvider* pro
                                   (drafts.size() + 1) * words);
     grammar_dead_positions[row] = provider->fill(row, drafts, host);
     auto* device_words          = static_cast<std::uint32_t*>(grammar_masks_device.data) + offset;
-    CUDA_CHECK(cudaMemcpyAsync(device_words, host.data(), host.size_bytes(), cudaMemcpyHostToDevice,
-                               device.stream));
+    core::copy_bytes(device_words, host.data(), host.size_bytes(),
+                     core::TransferDirection::HostToDevice, device.stream);
     provider->uploaded(row, host.size_bytes());
     return {device_words, static_cast<std::int32_t>(words)};
 }
