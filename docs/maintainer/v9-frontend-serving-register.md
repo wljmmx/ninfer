@@ -63,6 +63,14 @@
 用例改为 `false` / `"many"` 并去掉 omit 断言（`f3788115`），grammar / parser / frontend /
 constraints / streaming 五套测试全绿。
 
+**2026-11-17 追加（V10-65，`f3dfd40b`）**：注入 thinking control 之后，27B 工件会**自己再发一遍**
+`</think>\n\n` 再给答案（token 级实测：`510 "</"`、`26003 "think"`、`29 ">"`、`271 "\n\n"` 之后才是
+`route_answer`），此前这些字节被当正文发布，choice 约束下正文变成 `"</think>\n\nroute_answer"`
+——既越界又丢了内容边界。修法只在解码器内容路径：**仅当 control 已应用**时暂存起始字节判断该
+close，命中吞一次（允许一个前导换行）、丢掉 framing 的尾随换行但**不吞空格**，随后立即停用；
+未设预算的运行、tool/JSON 分支、reasoning 文本不受影响，`terminalize()` 会发布未命中的暂存前缀。
+判据是双向的：前端 choice 预算用例新增「重复 close」断言，旧代码下失败、修后通过。
+
 ## T072 `58733a86` — JPEG 解码对齐 Pillow
 
 三方比对：本地 `src/media/decode/decode.cpp` 与上游父版本同构（自建 AVIO + FFmpeg
