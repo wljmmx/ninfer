@@ -151,6 +151,9 @@ struct DecoderState {
     bool swallow_close_once        = false;
     // After swallowing the redundant close, the framing's trailing newlines are dropped too.
     bool drop_framing_newlines     = false;
+    // Right after an injected thinking control the first content token must not be whitespace-only;
+    // see grammar_masks. Cleared as soon as content is published.
+    bool filter_leading_whitespace = false;
     bool in_reasoning              = false;
     bool strip_content_leading     = false;
     bool exact_reasoning_framing   = false;
@@ -306,6 +309,7 @@ void feed_content(DecoderState& state, std::string text, const StopPolicy& polic
         text.erase(0, begin);
         if (!text.empty()) { state.strip_content_leading = false; }
     }
+    if (!text.empty()) { state.filter_leading_whitespace = false; }
     feed_channel(state, OutputChannel::Content, text, policy, emitted, committed_tokens,
                  best_match);
 }
@@ -514,7 +518,38 @@ std::optional<ConstraintObservation> OutputSession::constraint_observation() con
 std::uint32_t OutputSession::grammar_masks(std::span<const TokenId> drafts,
                                            std::span<std::uint32_t> words) {
     if (!constrained()) { throw std::logic_error("mask requested for unconstrained output"); }
-    return impl_->grammar->masks(drafts, words);
+    const std::uint32_t dead = impl_->grammar->masks(drafts, words);
+    // Right after an injected thinking control, the framing ends with newlines and a grammar that
+    // permits leading whitespace lets the model continue whitespace instead of answering: measured
+    // on the 27B artifact, a JSON-schema request spent its entire 160-token budget on 1003 bytes of
+    // spaces and tabs and returned nothing. So the FIRST content token after a control must be real
+    // content when the language has such a token available - the mask is only narrowed, never
+    // emptied, and only at position zero (no lookahead drafts).
+    if (impl_->state.filter_leading_whitespace && drafts.empty() && !words.empty()) {
+        bool has_non_space = false;
+        for (std::size_t id = 0; id < impl_->tokenizer->vocab_size(); ++id) {
+            if ((words[id / 32] & (1u << (id % 32))) == 0) { continue; }
+            const auto bytes = impl_->tokenizer->decoded_token(id).bytes;
+            if (std::any_of(bytes.begin(), bytes.end(), [](char c) {
+                    return std::isspace(static_cast<unsigned char>(c)) == 0;
+                })) {
+                has_non_space = true;
+                break;
+            }
+        }
+        if (has_non_space) {
+            for (std::size_t id = 0; id < impl_->tokenizer->vocab_size(); ++id) {
+                if ((words[id / 32] & (1u << (id % 32))) == 0) { continue; }
+                const auto bytes = impl_->tokenizer->decoded_token(id).bytes;
+                if (std::all_of(bytes.begin(), bytes.end(), [](char c) {
+                        return std::isspace(static_cast<unsigned char>(c)) != 0;
+                    })) {
+                    words[id / 32] &= ~(1u << (id % 32));
+                }
+            }
+        }
+    }
+    return dead;
 }
 
 void OutputSession::discard_preview() {
@@ -699,6 +734,8 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     // The control IS the framing close. If the model repeats it before its answer (measured), it is
     // swallowed once rather than published as content; see feed_content.
     impl_->preview_state.swallow_close_once = true;
+    // ...and the answer's first token must be content, not more whitespace; see grammar_masks.
+    impl_->preview_state.filter_leading_whitespace = true;
     impl_->accept_grammar(tokens);
     impl_->preview_finish_reason = FinishReason::None;
     impl_->preview_ready         = true;
