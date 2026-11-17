@@ -23,6 +23,17 @@ using namespace ninfer::test;
 
 namespace {
 
+// The NVFP4 KV append path is compiled only for sm_120a (CMake defines NINFER_ENABLE_NVFP4 there);
+// on an sm_89 build Nvfp4Group16 is a documented refusal, so this case skips it instead of asking
+// for a path the binary does not carry (V10-69: the refusal used to escape main as an uncaught
+// exception, which surfaced as 0xC0000409 with no message at all).
+constexpr bool kNvfp4KvCompiled =
+#if defined(NINFER_ENABLE_NVFP4)
+    true;
+#else
+    false;
+#endif
+
 constexpr int kHeadDim            = 128;
 constexpr int kKVHeads            = 8;
 constexpr int kPage               = 64;
@@ -1376,58 +1387,74 @@ int main(int argc, char** argv) {
     }
 
     int failures = 0;
-    if (nvfp4_only || k8v4_only) {
-        const KvCacheStorage storage =
-            nvfp4_only ? KvCacheStorage::Nvfp4Group16 : KvCacheStorage::Fp8KeyNvfp4Value;
-        for (const int kv_heads : {4, 2}) { failures += full_append_case(kv_heads, storage); }
-        failures += full_append_case(2, storage, 129);
+    try {
+        if (nvfp4_only || k8v4_only) {
+            const KvCacheStorage storage =
+                nvfp4_only ? KvCacheStorage::Nvfp4Group16 : KvCacheStorage::Fp8KeyNvfp4Value;
+            if (!kNvfp4KvCompiled && storage == KvCacheStorage::Nvfp4Group16) {
+                std::cout << "nvfp4 kv_cache_append: SKIP (this build has no NVFP4 KV; sm_89)\n";
+                return 77;
+            }
+            for (const int kv_heads : {4, 2}) { failures += full_append_case(kv_heads, storage); }
+            failures += full_append_case(2, storage, 129);
+            if (failures != 0) {
+                std::cerr << (nvfp4_only ? "nvfp4" : "k8v4")
+                          << " kv_cache_append failures=" << failures << '\n';
+                return 1;
+            }
+            std::cout << (nvfp4_only ? "nvfp4" : "k8v4") << " kv_cache_append independent: PASS\n";
+            return 0;
+        }
+
+        for (const int kv_heads : {4, 2}) {
+            failures += full_append_case(kv_heads, KvCacheStorage::BFloat16);
+            failures += full_append_case(kv_heads, KvCacheStorage::Int8Group64);
+            failures += full_append_case(kv_heads, KvCacheStorage::Fp8E4M3Row256);
+            if constexpr (kNvfp4KvCompiled) {
+                failures += full_append_case(kv_heads, KvCacheStorage::Nvfp4Group16);
+            }
+            failures += full_append_case(kv_heads, KvCacheStorage::Fp8KeyNvfp4Value);
+        }
+        failures += full_append_case(2, KvCacheStorage::Int8Group64, 129);
+        failures += full_append_case(2, KvCacheStorage::Fp8E4M3Row256, 129);
+        if constexpr (kNvfp4KvCompiled) {
+            failures += full_append_case(2, KvCacheStorage::Nvfp4Group16, 129);
+        }
+        failures += full_append_case(2, KvCacheStorage::Fp8KeyNvfp4Value, 129);
+        failures += run_case(1, 0, 0, false, {0, 1, 2});
+        failures += run_case(1, 1, 63, false, {2, 3, 4});
+        failures += run_case(16, 7, 60, false, {5, 1, 4}, 5);
+        failures += run_case(16, 16, 120, false, {2, 5, 0});
+        failures += run_case(1, 0, kDFlashWindow - 1, true);
+        failures += run_case(1, 1, 2 * kDFlashWindow - 1, true);
+        failures += run_case(16, 7, 2 * kDFlashWindow - 2, true);
+        failures += run_case(16, 16, 3 * kDFlashWindow - 8, true, {}, 16);
+        failures += run_case(1, 0, kDFlash2Window - 1, true, {}, 0, kDFlash2Window);
+        failures += run_case(1, 1, 2 * kDFlash2Window - 1, true, {}, 0, kDFlash2Window);
+        failures += run_case(8, 7, 2 * kDFlash2Window - 2, true, {}, 0, kDFlash2Window);
+        failures += run_case(8, 8, 3 * kDFlash2Window - 4, true, {}, 8, kDFlash2Window);
+        failures +=
+            run_case(kDFlash2Window, kDFlash2Window, 3 * kDFlash2Window - kDFlash2Window / 2, true,
+                     {}, kDFlash2Window, kDFlash2Window);
+        failures += cyclic_graph_replay_case(kDFlashWindow, 16);
+        failures += cyclic_graph_replay_case(kDFlash2Window, 8);
+        failures += paged_graph_replay_case();
+        failures += batch_selector_case(true, kDFlashWindow);
+        failures += batch_selector_case(false);
+        failures += cyclic_decode_batch_case(kDFlashWindow);
+        failures += cyclic_decode_batch_case(kDFlash2Window);
+        failures += cyclic_variable_prefix_tests();
+
         if (failures != 0) {
-            std::cerr << (nvfp4_only ? "nvfp4" : "k8v4") << " kv_cache_append failures=" << failures
-                      << '\n';
+            std::cerr << "kv_cache_append failures=" << failures << '\n';
             return 1;
         }
-        std::cout << (nvfp4_only ? "nvfp4" : "k8v4") << " kv_cache_append independent: PASS\n";
+        std::cout << "kv_cache_append: PASS\n";
         return 0;
-    }
-
-    for (const int kv_heads : {4, 2}) {
-        failures += full_append_case(kv_heads, KvCacheStorage::BFloat16);
-        failures += full_append_case(kv_heads, KvCacheStorage::Int8Group64);
-        failures += full_append_case(kv_heads, KvCacheStorage::Fp8E4M3Row256);
-        failures += full_append_case(kv_heads, KvCacheStorage::Nvfp4Group16);
-        failures += full_append_case(kv_heads, KvCacheStorage::Fp8KeyNvfp4Value);
-    }
-    failures += full_append_case(2, KvCacheStorage::Int8Group64, 129);
-    failures += full_append_case(2, KvCacheStorage::Fp8E4M3Row256, 129);
-    failures += full_append_case(2, KvCacheStorage::Nvfp4Group16, 129);
-    failures += full_append_case(2, KvCacheStorage::Fp8KeyNvfp4Value, 129);
-    failures += run_case(1, 0, 0, false, {0, 1, 2});
-    failures += run_case(1, 1, 63, false, {2, 3, 4});
-    failures += run_case(16, 7, 60, false, {5, 1, 4}, 5);
-    failures += run_case(16, 16, 120, false, {2, 5, 0});
-    failures += run_case(1, 0, kDFlashWindow - 1, true);
-    failures += run_case(1, 1, 2 * kDFlashWindow - 1, true);
-    failures += run_case(16, 7, 2 * kDFlashWindow - 2, true);
-    failures += run_case(16, 16, 3 * kDFlashWindow - 8, true, {}, 16);
-    failures += run_case(1, 0, kDFlash2Window - 1, true, {}, 0, kDFlash2Window);
-    failures += run_case(1, 1, 2 * kDFlash2Window - 1, true, {}, 0, kDFlash2Window);
-    failures += run_case(8, 7, 2 * kDFlash2Window - 2, true, {}, 0, kDFlash2Window);
-    failures += run_case(8, 8, 3 * kDFlash2Window - 4, true, {}, 8, kDFlash2Window);
-    failures += run_case(kDFlash2Window, kDFlash2Window, 3 * kDFlash2Window - kDFlash2Window / 2,
-                         true, {}, kDFlash2Window, kDFlash2Window);
-    failures += cyclic_graph_replay_case(kDFlashWindow, 16);
-    failures += cyclic_graph_replay_case(kDFlash2Window, 8);
-    failures += paged_graph_replay_case();
-    failures += batch_selector_case(true, kDFlashWindow);
-    failures += batch_selector_case(false);
-    failures += cyclic_decode_batch_case(kDFlashWindow);
-    failures += cyclic_decode_batch_case(kDFlash2Window);
-    failures += cyclic_variable_prefix_tests();
-
-    if (failures != 0) {
-        std::cerr << "kv_cache_append failures=" << failures << '\n';
+    } catch (const std::exception& error) {
+        // A storage this build does not carry, or a CUDA call that failed: report it as a failed
+        // case instead of letting terminate() turn main into 0xC0000409 with no message (V10-69).
+        std::cerr << "kv_cache_append: exception: " << error.what() << '\n';
         return 1;
     }
-    std::cout << "kv_cache_append: PASS\n";
-    return 0;
 }
