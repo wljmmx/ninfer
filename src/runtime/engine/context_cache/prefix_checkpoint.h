@@ -57,6 +57,14 @@ enum class PrefixCheckpointReason : std::uint8_t {
     // T010 conclusion 4: the tier payload carries Main KV + one state image, but no MTP KV span,
     // no mtp frontier and no tail hidden row. A checkpoint taken while MTP is on would restore a
     // draft context that never saw the prefix; fail closed until T197 adds the span.
+    //
+    // The LIVE refusal is not this struct: nothing constructs a PrefixCheckpointPolicy (verified
+    // 2026-11-17 - the type is referenced only by its own declaration and the decision function
+    // below). The tier path refuses a speculative request itself, in ProgramImpl::tier_open
+    // (program_impl.cpp: "the third tier holds no draft/backend KV" -> no TierSource), and in-process
+    // checkpoints DO carry the draft span (CheckpointState::backend_frontier / tail_hidden_valid,
+    // written by capture.cpp with the MTP frontier-1 rule). Keep this enum value as the vocabulary a
+    // future caller should use rather than as evidence that the gap is open.
     DraftStateAbsent,
 };
 
