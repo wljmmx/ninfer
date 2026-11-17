@@ -148,6 +148,33 @@ void test_a_device_that_cannot_hold_one_slot_is_infeasible() {
     check(one.kv_pages_bytes == 0, "at the floor KV gets nothing");
 }
 
+void test_the_ask_is_the_whole_set_not_one_window() {
+    // A routed set of 20480 slots (40 banks) behind a 256-slot window: the whole set is 20 GiB, the
+    // window is 256 MiB. Naming only the window makes a 21 GiB Device look slack, which is the
+    // reading V10-55 exists to correct - "experts fully resident" is the set, not one bank.
+    auto request                = canonical(21 * kGib, ControllerMode::Stable);
+    request.expert_window_slots = 256;
+    request.expert_full_slots   = 20 * 1024;
+    const auto whole            = plan_capacity_bet(request);
+    check(whole.bet_exercised, "the whole routed set does not fit even though one window would");
+    check(whole.kv_pages_bytes == 6 * kGib, "stable keeps the KV target");
+    check(whole.expert_pool_bytes == 15 * kGib, "the pool streams the rest of the set");
+
+    request.expert_full_slots = 0;
+    check(!plan_capacity_bet(request).bet_exercised, "one window alone is not the ask");
+
+    // The same shape under the three modes: the bet still has to separate them.
+    auto full              = request;
+    full.expert_full_slots = 20 * 1024;
+    full.mode              = ControllerMode::Performance;
+    check(plan_capacity_bet(full).choice == CapacityBet::ExpertResident,
+          "performance seats the whole set");
+    full.mode = ControllerMode::Stable;
+    check(plan_capacity_bet(full).choice == CapacityBet::KvFirst, "stable keeps the pages");
+    full.mode = ControllerMode::Auto;
+    check(plan_capacity_bet(full).choice == CapacityBet::BothGive, "auto splits the surplus");
+}
+
 void test_measured_evidence_steers_auto() {
     // Nothing measured: the structural rule (C at 21 GiB).
     const auto unknown = plan_capacity_bet(canonical(21 * kGib, ControllerMode::Auto));
@@ -217,6 +244,7 @@ int main() {
     test_sizes_are_monotone_in_the_budget();
     test_headroom_is_deducted_before_the_bet();
     test_a_device_that_cannot_hold_one_slot_is_infeasible();
+    test_the_ask_is_the_whole_set_not_one_window();
     test_measured_evidence_steers_auto();
     test_the_pool_stays_slot_aligned();
     test_kv_alignment_when_a_page_size_is_named();

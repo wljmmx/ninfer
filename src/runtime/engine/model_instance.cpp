@@ -113,13 +113,18 @@ struct CapacityRebindRequest {
                                                            std::size_t headroom_bytes,
                                                            std::uint64_t slot_bytes,
                                                            std::uint64_t window_slots,
+                                                           std::uint64_t full_slots,
                                                            std::size_t target_tokens) {
     core::CapacityBetRequest request;
     request.device_budget_bytes    = free_bytes;
     request.startup_headroom_bytes = headroom_bytes;
     request.expert_slot_bytes      = slot_bytes;
     request.expert_window_slots    = window_slots;
-    request.kv_target_tokens       = target_tokens;
+    // The ask is the whole routed set (every bank's window): "experts fully resident" in the bet's
+    // own words. Naming only one window here would make a card that is a gigabyte short of the set
+    // answer "both asks fit" - the exact run V10-55 is about.
+    request.expert_full_slots = full_slots;
+    request.kv_target_tokens  = target_tokens;
     // The KV arena was priced for exactly this context, so the price per token is the resolved
     // reservation divided by the tokens it serves: a derivation of the number the arena already
     // charged, not a second estimate of it.
@@ -138,23 +143,28 @@ struct CapacityRebindRequest {
     return request;
 }
 
-// One line for the plan, whichever way the bet went: the letter, the reason and the two sizes it
-// names. `achieved_pool_bytes` is what the split actually handed the pool, so a target that could
-// not be reached is visible instead of being printed as if it had been.
-void report_capacity_bet(const char* what, const core::CapacityBetPlan& plan,
-                         std::uint64_t achieved_pool_bytes) {
+// One line for the plan, whichever way the bet went: the letter, what the two consumers asked for,
+// the reason and the two sizes it names. `achieved_pool_bytes` is what the split actually handed
+// the pool, so a target that could not be reached is visible instead of being printed as if it had
+// been. The ask is printed because the whole decision is a comparison, and a reader who cannot see
+// both sides cannot check the answer.
+void report_capacity_bet(const char* what, const core::CapacityBetRequest& request,
+                         const core::CapacityBetPlan& plan, std::uint64_t achieved_pool_bytes) {
     std::fprintf(stderr,
-                 "[plan] capacity %s: choice=%s(%s) reason=%s expert_pool_mb=%llu kv_pages_mb=%llu "
-                 "achieved_pool_mb=%llu\n",
+                 "[plan] capacity %s: choice=%s(%s) asked=%llu+%llu MiB reason=%s "
+                 "expert_pool_mb=%llu kv_pages_mb=%llu achieved_pool_mb=%llu\n",
                  what, core::capacity_bet_name(plan.choice), core::capacity_bet_label(plan.choice),
-                 plan.reason, static_cast<unsigned long long>(plan.expert_pool_bytes >> 20),
+                 static_cast<unsigned long long>(request.expert_ask_bytes() >> 20),
+                 static_cast<unsigned long long>(request.kv_ask_bytes() >> 20), plan.reason,
+                 static_cast<unsigned long long>(plan.expert_pool_bytes >> 20),
                  static_cast<unsigned long long>(plan.kv_pages_bytes >> 20),
                  static_cast<unsigned long long>(achieved_pool_bytes >> 20));
     std::fflush(stderr);
 }
 
 ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions& options,
-                                    DeviceContext& device, std::size_t kv_reserve_bytes) {
+                                    DeviceContext& device, std::size_t kv_reserve_bytes,
+                                    std::size_t kv_floor_bytes, bool rebind_allowed) {
     ExpertPlacement placement;
     std::vector<ExpertStream*> streams;
     std::uint32_t routed_top_k = 0;
@@ -238,7 +248,11 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     // resolve_kv_capacity already left free when the arena was planned).
     const auto split = core::plan_device_split(free_bytes, kv_reserve_bytes,
                                                options.startup_planning_headroom_bytes);
-    if (requested == kExpertCacheAuto) {
+    // Whether the SPLIT sized this pool, captured before `requested` is overwritten below: the bet
+    // may only move Device bytes for a pool the split chose itself. A named budget is never
+    // second-guessed - the caller asked for that number, and a tight one is its own decision.
+    const bool pool_from_split = requested == kExpertCacheAuto;
+    if (pool_from_split) {
         core::report_device_split(split, free_bytes);
         requested = split.pool_bytes;
     }
@@ -249,51 +263,82 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     // own number as the ceiling.
     const std::size_t pool_limit = std::max<std::size_t>(requested, split.pool_bytes);
     // Whole windows only: a partial window is dead space and would make the slot count odd.
-    std::uint64_t widest = 0;
-    for (const auto& spec : specs) { widest = std::max<std::uint64_t>(widest, spec.count); }
+    // `widest` is the FLOOR (one bank's window) and `routed_slots` is the ASK (every bank's window,
+    // i.e. "experts fully resident"); the two are different questions and are kept apart.
+    std::uint64_t widest       = 0;
+    std::uint64_t routed_slots = 0;
+    for (const auto& spec : specs) {
+        widest = std::max<std::uint64_t>(widest, spec.count);
+        routed_slots += spec.count;
+    }
     auto capacity = requested / entry * entry;
     // A pool that cannot hold a whole layer keeps whatever slots fit and the host tier covers the
     // rest of the layer; rounding to zero here would refuse a pool that is perfectly usable.
     if (widest != 0 && capacity / entry >= widest) {
         capacity = capacity / (entry * widest) * (entry * widest);
     }
-    // P7.1 (V10-55): a capacity that cannot seat the pool is a bet, not a verdict.
+    // P7.1/P7.2 (V10-55): the capacity bet is the controller's decision, and it is taken on every
+    // run that creates a pool - not only on the ones that would have refused. The line is printed
+    // either way, because "no bet was taken" is information: it says the whole ask fits.
     //
-    // Two different tight states reach this point, and only one of them is a fault:
+    // Two tight states reach this point, and only one of them is a fault:
     //   * the pool holds some slots but not a whole window - legal today (the Host tier serves the
-    //     rest of the layer), and the run only needs the decision written down, so a `[plan]` line
-    //     explains why the split went the way it did;
+    //     rest of the layer), and the run only needs the decision written down;
     //   * the pool holds less than one slot - the pool cannot exist at all, which is the startup
     //     fault this decision replaces. If the controller's bet moves Device bytes from the KV leg
-    //     to the Host leg, the caller is asked to re-price the arena once and attach again; only a
+    //     to the pool, the caller is asked to re-price the arena once and attach again; only a
     //     second refusal is an error.
-    if (widest != 0 && capacity / entry < widest) {
-        const auto bet = core::plan_capacity_bet(capacity_bet_request(
-            free_bytes, kv_reserve_bytes, options.startup_planning_headroom_bytes, entry, widest,
-            options.max_context));
-        if (capacity != 0) {
-            report_capacity_bet("tight", bet, capacity);
-        } else if (bet.feasible && bet.expert_pool_bytes >= entry &&
-                   bet.kv_pages_bytes < kv_reserve_bytes) {
-            const std::uint64_t release =
-                static_cast<std::uint64_t>(kv_reserve_bytes) - bet.kv_pages_bytes;
-            std::fprintf(stderr,
-                         "[plan] capacity REJECTED owner=expert_pool asked=%llu MiB cap=%llu MiB "
-                         "(free=%llu MiB kv=%llu MiB startup=%llu MiB) - re-solving once\n",
-                         static_cast<unsigned long long>((entry * widest) >> 20),
-                         static_cast<unsigned long long>(capacity >> 20),
-                         static_cast<unsigned long long>(free_bytes >> 20),
-                         static_cast<unsigned long long>(kv_reserve_bytes >> 20),
-                         static_cast<unsigned long long>(
-                             options.startup_planning_headroom_bytes >> 20));
-            report_capacity_bet("rebound", bet, bet.expert_pool_bytes);
-            throw CapacityRebindRequest{release, bet};
-        } else {
-            // No bet frees a slot: say which one was taken and let the check below fail loud.
-            report_capacity_bet("no rebound", bet, 0);
-        }
+    const auto request =
+        capacity_bet_request(free_bytes, kv_reserve_bytes, options.startup_planning_headroom_bytes,
+                             entry, widest, routed_slots, options.max_context);
+    const auto bet   = core::plan_capacity_bet(request);
+    const bool tight = widest != 0 && capacity / entry < widest;
+    if (tight && capacity != 0) {
+        report_capacity_bet("tight", request, bet, capacity);
+    } else if (!tight) {
+        report_capacity_bet("plan", request, bet, capacity);
+    } else {
+        std::fprintf(
+            stderr,
+            "[plan] capacity REJECTED owner=expert_pool asked=%llu MiB cap=%llu MiB "
+            "(free=%llu MiB kv=%llu MiB startup=%llu MiB)\n",
+            static_cast<unsigned long long>((entry * widest) >> 20),
+            static_cast<unsigned long long>(capacity >> 20),
+            static_cast<unsigned long long>(free_bytes >> 20),
+            static_cast<unsigned long long>(kv_reserve_bytes >> 20),
+            static_cast<unsigned long long>(options.startup_planning_headroom_bytes >> 20));
+        std::fflush(stderr);
+    }
+    // The bet is not advisory: when it says the pool should hold more Device memory than the split
+    // gave it, and the KV leg still has bytes above its own target to give, the caller is asked to
+    // price the arena again. One attempt only (rebind_allowed), and only for a pool the split sized
+    // itself - a pinned pool is the caller's number. A re-plan that cannot serve max_context is
+    // refused by the caller's own check, so this cannot trade the configured context for the pool.
+    const std::uint64_t release =
+        bet.kv_pages_bytes < kv_reserve_bytes
+            ? static_cast<std::uint64_t>(kv_reserve_bytes) - bet.kv_pages_bytes
+            : 0;
+    // One expert slot is the smallest release that can seat another expert: a KV figure a few bytes
+    // below the reservation is alignment noise, and re-pricing the arena for it would be a re-plan
+    // that buys nothing. The second bound is the arena's own contract: a plan below its floor
+    // cannot serve max_context, so asking the caller for one is asking for a refusal that costs a
+    // second attach. A tiered KV leg names a floor of zero - pages may leave the Device there.
+    const bool moves_bytes = bet.feasible && bet.expert_pool_bytes > capacity && release >= entry &&
+                             bet.kv_pages_bytes >= kv_floor_bytes &&
+                             (pool_from_split || capacity == 0);
+    if (rebind_allowed && moves_bytes) {
+        std::fprintf(stderr,
+                     "[plan] capacity: choice=%s(%s) moves %llu MiB from the KV leg to the pool - "
+                     "re-solving once\n",
+                     core::capacity_bet_name(bet.choice), core::capacity_bet_label(bet.choice),
+                     static_cast<unsigned long long>(release >> 20));
+        std::fflush(stderr);
+        report_capacity_bet("rebound", request, bet, bet.expert_pool_bytes);
+        throw CapacityRebindRequest{release, bet};
     }
     if (capacity == 0) {
+        // No bet frees a slot: say which one was taken and let the check below fail loud.
+        report_capacity_bet("no rebound", request, bet, 0);
         throw std::invalid_argument("expert cache holds less than one expert window (" +
                                     std::to_string(entry * widest) +
                                     " bytes) and the capacity re-solve freed none");
@@ -1717,14 +1762,21 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
     // arena does not need instead of holding back a fixed amount.
     if (options.expert_cache_bytes != 0) {
         // P7.1 (V10-55): the pool gets one chance to be re-solved instead of refused. The request
-        // carries the Device bytes the controller's bet moves to the Host KV leg; the arena is
+        // carries the Device bytes the controller's bet moves out of the KV leg; the arena is
         // priced again against the smaller budget, and only then is the pool attached. Every other
         // refusal (a dense artifact, a re-plan that claims more or cannot serve max_context) keeps
-        // the first plan and fails in the second attach with the caller's own numbers.
+        // the first plan and attaches again with the caller's own numbers.
         ExpertPlacement placement;
+        // A KV leg that must stay on the Device can only give up the bytes above its own floor; a
+        // tiered leg moves pages to the Host, so it names no floor here. Read per call, because a
+        // successful re-solve replaces `resolution`.
+        const auto kv_floor = [&]() -> std::size_t {
+            return tiered_mode ? 0 : resolution.minimum_runtime_reservation_bytes;
+        };
         try {
             placement = attach_expert_cache(*instance, options, device,
-                                            resolution.runtime_reservation_bytes);
+                                            resolution.runtime_reservation_bytes, kv_floor(),
+                                            /*rebind_allowed=*/true);
         } catch (const CapacityRebindRequest& rebind) {
             const auto released = rebind.kv_release_bytes;
             const auto budget   = conservative > released ? conservative - released : 0;
@@ -1760,12 +1812,15 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
                 std::fflush(stderr);
             } else {
                 std::fprintf(stderr,
-                             "[plan] capacity: the re-solve kept the KV plan; the pool is still one "
-                             "window short and this second attach is the failure\n");
+                             "[plan] capacity: the re-solve kept the KV plan; the pool keeps the "
+                             "bytes the split already gave it\n");
                 std::fflush(stderr);
             }
+            // The second attach never re-throws the bet: one re-solve is the contract, and a pool
+            // that still does not fit after it is the fault the caller asked for.
             placement = attach_expert_cache(*instance, options, device,
-                                            resolution.runtime_reservation_bytes);
+                                            resolution.runtime_reservation_bytes, kv_floor(),
+                                            /*rebind_allowed=*/false);
         }
         // One window per bank means no layer ever evicts another, so the resident set is fixed and
         // the decode graph may be captured. Uploading the whole set first keeps the capture from

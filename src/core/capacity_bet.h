@@ -16,6 +16,15 @@
 //                      partial layer, which the Host tier already covers). Right when locality is.
 //   C  BothGive        neither gets its whole ask: the bytes above a floor are shared in proportion
 //                      to the two remaining asks. Both sides miss a little; neither is starved.
+//
+// WHAT THE POOL ASKS FOR. "Experts fully resident" (A) means every bank's window, i.e. the whole
+// routed set - not one window. One window is the pool's FLOOR (below it no routed layer can be
+// served from the Device at all), and the two are separate fields for that reason: a request that
+// named only the widest bank would report "both asks fit" on a card that is a gigabyte short of the
+// expert set, which is exactly the run this decision exists for. `expert_window_slots` is the floor
+// (and the alignment); `expert_full_slots` is the ask. A caller that only knows the window may
+// leave the full count zero, and the ask then falls back to one window - degenerate, never wrong.
+//
 // `choice` names the PRIORITY that was applied, not the shape that fell out. When both asks fit,
 // every mode returns A (experts fully resident) with `bet_exercised == false`, because there is no
 // bet to take - that case is reported, not silently relabelled.
@@ -26,7 +35,7 @@
 //                (one slot, not one window: a partial pool is legal here - the Host tier covers the
 //                rest of the layer, and refusing it would turn a workable run into a startup fault)
 //   auto         KV first, gated by a coverage floor: KV gets its target only if the pool would
-//                still reach `expert_usable_ratio` of its window; otherwise the bytes above that
+//                still reach `expert_usable_ratio` of its ask; otherwise the bytes above that
 //                floor are shared in proportion to the two remaining asks. Measured evidence
 //                outranks the structural rule and only when it exists: a high miss rate ranks
 //                residency first (the performance rule), a high p99 ranks KV first (the stable one).
@@ -115,9 +124,12 @@ struct CapacityBetRequest {
     std::uint64_t startup_headroom_bytes = 0;
     // One expert slot: the pool holds whole slots, and this is also the pool's alignment.
     std::uint64_t expert_slot_bytes = 0;
-    // Slots one whole layer window needs (the widest bank). Zero means "no layer shape known": the
-    // ask is then one slot, which makes the decision degenerate but never wrong.
+    // Slots one bank's window needs (the widest bank). This is the pool's FLOOR, not its ask: a
+    // Device that cannot hold one window cannot serve a routed layer from video memory at all.
     std::uint64_t expert_window_slots = 0;
+    // Slots the whole routed set needs, i.e. every bank's window - the pool's ASK, and what
+    // "experts fully resident" means. Zero means "no set shape known": the ask is then one window.
+    std::uint64_t expert_full_slots = 0;
     // The KV price the arena already resolved, expressed per token and per target.
     std::uint64_t kv_bytes_per_token = 0;
     std::uint64_t kv_target_tokens   = 0;
@@ -127,7 +139,11 @@ struct CapacityBetRequest {
     CapacitySignals signals{};
 
     [[nodiscard]] std::uint64_t expert_ask_bytes() const noexcept {
-        const std::uint64_t slots = expert_window_slots != 0 ? expert_window_slots : 1;
+        // The whole set when it is known, one window when it is not, one slot when neither is: each
+        // fallback is the smallest claim that still lets the decision be taken.
+        const std::uint64_t slots = expert_full_slots != 0     ? expert_full_slots
+                                    : expert_window_slots != 0 ? expert_window_slots
+                                                               : 1;
         return expert_slot_bytes * slots;
     }
     [[nodiscard]] std::uint64_t kv_ask_bytes() const noexcept {
@@ -277,10 +293,18 @@ plan_capacity_bet(const CapacityBetRequest& request,
         if (budget <= usable) {
             plan.expert_pool_bytes = std::min(experts, budget);
             plan.kv_pages_bytes    = budget - plan.expert_pool_bytes;
-            plan.choice            = plan.kv_pages_bytes == 0 ? CapacityBet::ExpertResident
-                                                               : CapacityBet::BothGive;
-            plan.reason = "auto: the KV target cannot be met without dropping the pool below the "
-                          "usable floor, so the pool keeps what it can and KV takes the rest";
+            plan.choice =
+                plan.kv_pages_bytes == 0 ? CapacityBet::ExpertResident : CapacityBet::BothGive;
+            // Zero is its own answer, not a small number: a KV leg with no Device bytes has to live
+            // on the Host, and the reason says so instead of claiming it "takes the rest".
+            plan.reason =
+                plan.kv_pages_bytes == 0
+                    ? "auto: the whole budget is under the pool's usable floor, so the pool "
+                      "takes it all and KV is left nothing - only a Host-resident KV leg "
+                      "could take this answer"
+                    : "auto: the KV target cannot be met without dropping the pool below "
+                      "the usable floor, so the pool keeps what it can and KV takes the "
+                      "rest";
             break;
         }
         const std::uint64_t surplus       = budget - usable;
