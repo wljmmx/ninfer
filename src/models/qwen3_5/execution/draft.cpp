@@ -16,6 +16,7 @@
 #include "models/qwen3_5/execution/workspace.h"
 
 #include "core/nvtx.h"
+#include "core/transfer.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 #include "ninfer/ops/context_kv_materialize.h"
@@ -680,10 +681,13 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                         attention.view({dimension(config.attention.query_width()), width, batch}),
                         layer.output, *layer.attention_conv, branch.finish_delta, residual);
                     if (stage_planes) {
-                        CUDA_CHECK(cudaMemcpyAsync(block_keys[layer_index].data, key.data,
-                                                   key.bytes(), cudaMemcpyDeviceToDevice, stream));
-                        CUDA_CHECK(cudaMemcpyAsync(block_values[layer_index].data, value.data,
-                                                   value.bytes(), cudaMemcpyDeviceToDevice, stream));
+                        // V10-12: every plain cudaMemcpyAsync in this file names its direction here.
+                        // The blocking cudaMemcpy/cudaMemcpy2D probe reads further down branch on the
+                        // result and stay as they are (no stream, different call).
+                        core::copy_bytes(block_keys[layer_index].data, key.data, key.bytes(),
+                                         core::TransferDirection::DeviceToDevice, stream);
+                        core::copy_bytes(block_values[layer_index].data, value.data, value.bytes(),
+                                         core::TransferDirection::DeviceToDevice, stream);
                     }
                 }
                 {
@@ -814,15 +818,14 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                                      vocab_rows, ab_ids, ab_scores, work, stream);
                     std::vector<std::int32_t> q5(16), q8(16);
                     std::vector<float> q5_scores(16);
-                    CUDA_CHECK(cudaMemcpyAsync(q8.data(), candidates.slice(1, 0, 1).data,
-                                               q8.size() * sizeof(std::int32_t),
-                                               cudaMemcpyDeviceToHost, stream));
-                    CUDA_CHECK(cudaMemcpyAsync(q5.data(), ab_ids.data,
-                                               q5.size() * sizeof(std::int32_t),
-                                               cudaMemcpyDeviceToHost, stream));
-                    CUDA_CHECK(cudaMemcpyAsync(q5_scores.data(), ab_scores.data,
-                                               q5_scores.size() * sizeof(float),
-                                               cudaMemcpyDeviceToHost, stream));
+                    core::copy_bytes(q8.data(), candidates.slice(1, 0, 1).data,
+                                     q8.size() * sizeof(std::int32_t),
+                                     core::TransferDirection::DeviceToHost, stream);
+                    core::copy_bytes(q5.data(), ab_ids.data, q5.size() * sizeof(std::int32_t),
+                                     core::TransferDirection::DeviceToHost, stream);
+                    core::copy_bytes(q5_scores.data(), ab_scores.data,
+                                     q5_scores.size() * sizeof(float),
+                                     core::TransferDirection::DeviceToHost, stream);
                     CUDA_CHECK(cudaStreamSynchronize(stream));
                     int overlap = 0;
                     for (std::int32_t id : q8) {
@@ -1062,9 +1065,10 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         qwen3_5::DFlashDecodeState& frame = state.frame;
         const std::int32_t width          = static_cast<std::int32_t>(k) + 1;
         if (phase == SpeculativePhase::Forward) {
-            CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
-                                       sizeof(qwen3_5::DFlashDecodeIngress), cudaMemcpyHostToDevice,
-                                       state.execution.device.stream));
+            core::copy_bytes(frame.ingress.data, &state.host_ingress,
+                             sizeof(qwen3_5::DFlashDecodeIngress),
+                             core::TransferDirection::HostToDevice,
+                             state.execution.device.stream);
         }
 
         Tensor anchors            = frame.anchors.slice(0, 0, batch_size);
@@ -1132,9 +1136,9 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             if (state.host_drafts.size() < draft_count) {
                 throw std::logic_error("DFlash host draft buffer is too small");
             }
-            CUDA_CHECK(cudaMemcpyAsync(state.host_drafts.data(), drafts.data,
-                                       draft_count * sizeof(TokenId), cudaMemcpyDeviceToHost,
-                                       state.execution.device.stream));
+            core::copy_bytes(state.host_drafts.data(), drafts.data, draft_count * sizeof(TokenId),
+                             core::TransferDirection::DeviceToHost,
+                             state.execution.device.stream);
             if (capturing) {
                 state.drafts_ready.record_external(state.execution.device.stream);
             } else {
@@ -1263,8 +1267,8 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                         state.execution.parameters.model.config().text.vocab_size);
                     const std::size_t words = static_cast<std::size_t>(vocab);
                     std::int32_t anchor     = 0;
-                    CUDA_CHECK(cudaMemcpyAsync(&anchor, frame.anchors.data, sizeof(anchor),
-                                               cudaMemcpyDeviceToHost, s));
+                    core::copy_bytes(&anchor, frame.anchors.data, sizeof(anchor),
+                                     core::TransferDirection::DeviceToHost, s);
                     // The target publishes BF16 logits; widen them here instead of reading the bit
                     // patterns as floats.
                     std::vector<std::uint16_t> raw(words);
@@ -1286,9 +1290,9 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                                          .view({vocab});
                         std::int32_t selected = 0;
                         if (has_candidates) {
-                            CUDA_CHECK(cudaMemcpyAsync(candidates.data(), candidate_column.data,
-                                                       candidates.size() * sizeof(std::int32_t),
-                                                       cudaMemcpyDeviceToHost, s));
+                            core::copy_bytes(candidates.data(), candidate_column.data,
+                                             candidates.size() * sizeof(std::int32_t),
+                                             core::TransferDirection::DeviceToHost, s);
                         } else {
                             std::fill(candidates.begin(), candidates.end(), -1);
                         }
@@ -1296,14 +1300,14 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                         // selector_hit is pick == target argmax, topk_recall is argmax inside the
                         // column's sixteen candidates. They separate "the edge score ranks the right
                         // token badly" from "the right token was never a candidate".
-                        CUDA_CHECK(cudaMemcpyAsync(raw.data(), target_column.data,
-                                                   raw.size() * sizeof(std::uint16_t),
-                                                   cudaMemcpyDeviceToHost, s));
+                        core::copy_bytes(raw.data(), target_column.data,
+                                         raw.size() * sizeof(std::uint16_t),
+                                         core::TransferDirection::DeviceToHost, s);
                         if (column == 0) {
                             const Tensor draft_step =
                                 frame.draft_tokens.slice(1, 0, 1).slice(0, 0, 1);
-                            CUDA_CHECK(cudaMemcpyAsync(&selected, draft_step.data, sizeof(selected),
-                                                       cudaMemcpyDeviceToHost, s));
+                            core::copy_bytes(&selected, draft_step.data, sizeof(selected),
+                                             core::TransferDirection::DeviceToHost, s);
                         }
                         CUDA_CHECK(cudaStreamSynchronize(s));
                         for (std::size_t i = 0; i < words; ++i) {
@@ -1342,11 +1346,8 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                         // What the target was actually fed in this column: the proposal it should
                         // carry, or something else (mask id, zero, the anchor again).
                         std::int32_t fed = 0;
-                        CUDA_CHECK(cudaMemcpyAsync(&fed,
-                                                   frame.verify_ids.slice(0, column, 1)
-                                                       .slice(1, 0, 1)
-                                                       .data,
-                                                   sizeof(fed), cudaMemcpyDeviceToHost, s));
+                        core::copy_bytes(&fed, frame.verify_ids.slice(0, column, 1).slice(1, 0, 1).data,
+                                         sizeof(fed), core::TransferDirection::DeviceToHost, s);
                         CUDA_CHECK(cudaStreamSynchronize(s));
                         std::fprintf(file, "%llu,%d,%d,%d,%d,%d,%d,%d,%d",
                                      static_cast<unsigned long long>(step), column, anchor,
@@ -1359,22 +1360,22 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                         // has a peaked distribution; a column whose write never landed reads flat.
                         std::int32_t cache_position = 0;
                         std::int32_t rope_position  = 0;
-                        CUDA_CHECK(cudaMemcpyAsync(
+                        core::copy_bytes(
                             &cache_position,
                             frame.verify_positions.slice(0, column, 1).slice(1, 0, 1).data,
-                            sizeof(cache_position), cudaMemcpyDeviceToHost, s));
-                        CUDA_CHECK(cudaMemcpyAsync(
+                            sizeof(cache_position), core::TransferDirection::DeviceToHost, s);
+                        core::copy_bytes(
                             &rope_position,
                             frame.target_rope_positions.slice(0, column, 1).slice(1, 0, 1).data,
-                            sizeof(rope_position), cudaMemcpyDeviceToHost, s));
+                            sizeof(rope_position), core::TransferDirection::DeviceToHost, s);
                         constexpr std::int32_t kHeadWords = 4;
                         std::vector<std::uint16_t> head(static_cast<std::size_t>(kHeadWords));
                         const auto* hidden_base = static_cast<const char*>(frame.target_hidden.data) +
                                                   static_cast<std::size_t>(column) *
                                                       frame.target_hidden.nb[1];
-                        CUDA_CHECK(cudaMemcpyAsync(head.data(), hidden_base,
-                                                   head.size() * sizeof(std::uint16_t),
-                                                   cudaMemcpyDeviceToHost, s));
+                        core::copy_bytes(head.data(), hidden_base,
+                                         head.size() * sizeof(std::uint16_t),
+                                         core::TransferDirection::DeviceToHost, s);
                         const auto head_value = [](std::uint16_t bits16) {
                             const std::uint32_t bits = static_cast<std::uint32_t>(bits16) << 16U;
                             float value              = 0.0F;
@@ -1399,11 +1400,10 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                      std::sqrt(logit_var), double(top1 - top2), double(top1));
                         std::int32_t pick = -1;
                         if (has_candidates) {
-                            CUDA_CHECK(cudaMemcpyAsync(&pick,
-                                                       frame.draft_tokens.slice(0, column, 1)
-                                                           .slice(1, 0, 1)
-                                                           .data,
-                                                       sizeof(pick), cudaMemcpyDeviceToHost, s));
+                            core::copy_bytes(&pick, frame.draft_tokens.slice(0, column, 1)
+                                                       .slice(1, 0, 1)
+                                                       .data,
+                                             sizeof(pick), core::TransferDirection::DeviceToHost, s);
                         }
                         CUDA_CHECK(cudaStreamSynchronize(s));
                         const int selector_hit = has_candidates && pick == argmax ? 1 : 0;
@@ -1430,11 +1430,12 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                             probe_columns == static_cast<std::int32_t>(k)) {
                             std::vector<float> edge(
                                 static_cast<std::size_t>(kCandidates) * kCandidates);
-                            CUDA_CHECK(cudaMemcpyAsync(
+                            core::copy_bytes(
                                 edge.data(),
                                 probe_scores + static_cast<std::size_t>(column) * kCandidates *
                                                    kCandidates,
-                                edge.size() * sizeof(float), cudaMemcpyDeviceToHost, s));
+                                edge.size() * sizeof(float), core::TransferDirection::DeviceToHost,
+                                s);
                             CUDA_CHECK(cudaStreamSynchronize(s));
                             for (std::int32_t rank = 0; rank < kCandidates; ++rank) {
                                 std::fprintf(edge_file, "%llu,%d,%d,%d",
@@ -1459,9 +1460,9 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                 }
             }
         }
-        CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
-                                   sizeof(qwen3_5::DFlashDecodeEgress), cudaMemcpyDeviceToHost,
-                                   state.execution.device.stream));
+        core::copy_bytes(&state.host_egress, frame.egress.data,
+                         sizeof(qwen3_5::DFlashDecodeEgress),
+                         core::TransferDirection::DeviceToHost, state.execution.device.stream);
     };
 }
 
