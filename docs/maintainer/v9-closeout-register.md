@@ -20,6 +20,7 @@
 | 35B default 930 MiB PPL | 4801 / 2.051275 / 7.777808 逐位 | T002 基线 + T082/T153–T158/T167 复跑 |
 | 35B 冻结 12 GiB PPL | 4801 / 2.049253 / 7.762104 逐位 | T002 + T082 + T159–T164 引用 |
 | 35B MoE 门禁复跑（2026-11-17，13.5） | **4801 / 2.055310 / 7.809254**，对 `gate.cmd` 的 7.776858 偏差 **+0.417%**（容差 0.5%）→ **PASS**；seam `ninfer_kv_seam_test` PASS；Track A golden 文件不存在 → SKIP。**说明**：与上两行的“逐位”值已不同（与 27B 同源的 YaRN native 默认，见下一条），此处门禁是容差判定而非逐位；默认 930 MiB 档因构建树短暂不可执行未复测 | `tools/gate.cmd`（`NINFER_GATE_MODEL=R:\model\qwen3_6_35b_a3b_e2\...`） |
+| 35B 默认档补测（2026-11-17，13.5） | **4801 / 2.051987 / 7.783353**（383.4 tok/s），对旧“默认 930 MiB”7.777808 偏差 **+0.071%**，对 `gate.cmd` 的 7.776858 偏差 **+0.083%** → 容差内。<b>口径变化</b>：不钉 `NINFER_EXPERT_CACHE_MB` 时已不再走 930 MiB，而是设备切分 `[budget][split] free=20668 MiB kv=557 pool=19087`、实测 `[experts] pool=18879MiB slot=1966080 windows=40 host=0`，与 12 GiB 档的差异正是池大小差异（7.783353 vs 7.809254：驻留更多 → PPL 更低）。<b>未归因</b>：35B 的位移没有做 bisect，不能直接搬 27B 的 YaRN 结论 | `ninfer-perplexity.exe`（`--context 512 --stride 256`，`NINFER_EXPERT_CACHE_MB` 未设）+ `.temp/gate_default_35b2.log` |
 | 27B regress fast | default PPL **7.445538**、selector-off dump **61bfd6e5efee6395**、9 点 0 回归（2026-11-11 重录，旧值见下行） | T082/T158/T167 + 重录留档 |
 | 27B moe | 7.111129 / 7.777808 / 6.479183 + decode d093ac2070ab3292 逐位 | T082/T158 |
 | seam | ninfer_kv_seam_test Passed | T082/T167 |
