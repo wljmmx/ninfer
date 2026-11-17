@@ -13,7 +13,7 @@
 //     grow->shrink round trip must produce the SAME greedy tokens as a control engine that
 //     never resized at all. The round trip is slot-neutral by construction: growth only
 //     appends free slots above the live edge, the shrink back removes exactly those, and no
-//     occupied slot crosses the 8 GiB edge because the batch ran inside it.
+//     occupied slot crosses the tier edge because the batch ran inside it.
 //   * frozen graph - with NINFER_GRAPH_BUDGET=1 and use_cuda_graph the pool is pinned at
 //     construction; resize must throw "cannot resize once a decode graph captured its
 //     offsets", twice, with a healthy generation in between proving the refusal had no side
@@ -24,10 +24,10 @@
 //     batch after the round trip still completes and matches the control engine token for
 //     token - page capacity does not change page bytes.
 //
-// Cross-tier token identity (12 GiB batch vs 8 GiB control) is deliberately NOT asserted: a
+// Cross-tier token identity (construction tier vs tight tier) is deliberately NOT asserted: a
 // wider pool changes how much of a layer the host tier has to cover (slot_cap is decided at
 // construction and resident_capacity() = min(slots_live, slot_cap)), so a different tier is a
-// different numeric route by design. The 12 GiB batch asserts completion only.
+// different numeric route by design. The construction tier asserts completion only.
 //
 // Timings are the engine's own reports (decode_seconds etc.); [set] misses come from
 // NINFER_EXPERT_TIMING on stderr. Every batch runs under a hard watchdog: a hung wait fails
@@ -50,8 +50,6 @@
 
 namespace {
 
-constexpr std::size_t kTierFullBytes  = 12288ULL << 20;  // the 12 GiB construction tier
-constexpr std::size_t kTierSmallBytes = 8192ULL << 20;   // the 8 GiB operating tier
 constexpr std::uint32_t kLanes        = 4;
 constexpr std::uint32_t kOutputs      = 24;
 constexpr std::uint32_t kPromptTokens = 180;
@@ -77,7 +75,7 @@ ninfer::EngineOptions base_options(const char* artifact) {
     options.use_cuda_graph                   = false;
     options.max_concurrency                  = kLanes;
     options.max_pending_requests             = 2 * kLanes;
-    options.expert_cache_bytes               = kTierFullBytes;
+    options.expert_cache_bytes               = 0;   // unnamed: the engine sizes the pool itself
     options.context_cache.device_state_slots = kLanes;
     options.context_cache.host_capacity_bytes = 2ULL << 30;
     return options;
@@ -348,6 +346,12 @@ int main() {
     // Four different natural-text subjects, one per lane: unique prefixes whose expert
     // routes genuinely differ, so the batch exercises a real hot set.
     std::vector<std::vector<ninfer::TokenId>> prompts;
+    // The tiers come from the model, not from a constant: one decode step routes this many bytes of
+    // experts (Engine::expert_step_bytes - routed top-k x lanes per bank x slot), so "the tight
+    // tier" is exactly one step's activation and "the construction tier" is two of them. An
+    // artifact whose activation cannot be placed at all is skipped rather than failed.
+    std::uint64_t tier_small = 0;
+    std::uint64_t tier_full  = 0;
     {
         ninfer::Engine tokenizer(base_options(artifact));
         for (const std::string& text : fixture_prompts()) {
@@ -359,7 +363,15 @@ int main() {
             }
             prompts.emplace_back(stream.begin(), stream.begin() + kPromptTokens);
         }
+        tier_small = tokenizer.expert_step_bytes();
+        tier_full  = tier_small * 2;
     }
+    if (tier_small == 0) {
+        std::cout << "skip: the artifact routes no experts (dense model); resize is a no-op\n";
+        return 77;
+    }
+    std::cerr << "[tier] one step's activation = " << tier_small / (1024.0 * 1024.0)
+              << " MiB, construction tier = " << tier_full / (1024.0 * 1024.0) << " MiB\n";
 
     // ------------------------------------------------------------------ pinned graph ------
     // The frozen-graph refusal: with the graph budget paid the pool is pinned at construction,
@@ -370,6 +382,7 @@ int main() {
     if (pinned_scenario) {
         std::cerr << "[step] graph-pinned engine (resize must be refused)\n";
         ninfer::EngineOptions pinned_options = base_options(artifact);
+        pinned_options.expert_cache_bytes    = tier_full;
         pinned_options.use_cuda_graph        = true;
         ninfer::Engine engine(pinned_options);
         // The construction has two legal outcomes on a streamed artifact:
@@ -382,7 +395,7 @@ int main() {
         // that each branch behaves as its own rule demands and the engine survives either way.
         bool pinned = false;
         try {
-            const auto shrunk = engine.resize_expert_pool(kTierSmallBytes);
+            const auto shrunk = engine.resize_expert_pool(tier_small);
             std::cerr << "[pinned-skip] graph capture skipped (a layer needs host fetch); "
                          "resize accepted on the ordinary path: "
                       << shrunk << " bytes\n";
@@ -404,7 +417,7 @@ int main() {
             // The no-side-effect probe: the engine surviving the refusal (still available,
             // still pinned) is the side-effect question the arm owns.
             (void)expect_throw("pinned pool shrink, second attempt",
-                              [&] { return engine.resize_expert_pool(kTierSmallBytes); },
+                              [&] { return engine.resize_expert_pool(tier_small); },
                               "cannot resize once a decode graph captured its offsets");
             if (!engine.is_available()) {
                 fail("the graph-pinned engine became unavailable after refusing a resize");
@@ -417,13 +430,18 @@ int main() {
     }
 
     // ------------------------------------------------------------------ control engine ----
-    // Never resizes after the initial pin to the 8 GiB tier. Its three batches are the token
+    // Never resizes after the initial pin to the construction tier. Its three batches are the token
     // oracle the treatment engine has to reproduce after its resize events.
     std::vector<Batch> control(3);
     {
-        std::cerr << "[step] control engine (8 GiB tier, no resize)\n";
-        ninfer::Engine control_engine(base_options(artifact));
-        const std::uint64_t control_full  = control_engine.resize_expert_pool(kTierFullBytes);
+        std::cerr << "[step] control engine (construction tier, no resize)\n";
+        // Named, not the default: a named pool turns on the admission-deadline scaling a streaming
+        // tier needs (normalize_engine_options), and tier_full is still the model's own two-step
+        // activation rather than a constant.
+        ninfer::EngineOptions control_options = base_options(artifact);
+        control_options.expert_cache_bytes    = tier_full;
+        ninfer::Engine control_engine(control_options);
+        const std::uint64_t control_full  = control_engine.resize_expert_pool(tier_full);
         // One warm-up request at the construction tier, so the shrink hits a pool that has
         // published its tables once - the serving-shaped order (resize between requests, not
         // before the first one) and the harsher one for the stale-table contract.
@@ -435,11 +453,17 @@ int main() {
             }
             std::cerr << "[warm] control warm-up completed at the construction tier\n";
         }
-        const std::uint64_t control_small = control_engine.resize_expert_pool(kTierSmallBytes);
+        const std::uint64_t control_small = control_engine.resize_expert_pool(tier_small);
         if (control_small == 0 || control_small >= control_full ||
-            control_small < kTierSmallBytes - (kTierSmallBytes / 8)) {
-            fail("control engine could not pin the 8 GiB tier: full=" +
-                 std::to_string(control_full) + " small=" + std::to_string(control_small));
+            control_small < tier_small - (tier_small / 8)) {
+            // The tight tier is one step's routed activation, so failing to reach it means the pool
+            // cannot hold what a single step needs on this card - the case that skips rather than
+            // fails (a smaller activation or a larger card is the acceptance, not this machine).
+            std::cout << "skip: the pool cannot hold one step's activation (asked "
+                      << tier_small / (1024.0 * 1024.0) << " MiB, got "
+                      << control_small / (1024.0 * 1024.0) << " MiB of "
+                      << control_full / (1024.0 * 1024.0) << " MiB)\n";
+            return 77;
         }
         std::cerr << "[tier] control pinned at " << control_small / (1024.0 * 1024.0) << " MiB ("
                   << "construction tier " << control_full / (1024.0 * 1024.0) << " MiB)\n";
@@ -457,8 +481,10 @@ int main() {
     // The acceptance run: refusal under load, the grow->shrink round trip, and a KV tier move.
     {
         std::cerr << "[step] treatment engine (resize events between batches)\n";
-        ninfer::Engine engine(base_options(artifact));
-        const std::uint64_t full  = engine.resize_expert_pool(kTierFullBytes);
+        ninfer::EngineOptions treatment_options = base_options(artifact);
+        treatment_options.expert_cache_bytes    = tier_full;
+        ninfer::Engine engine(treatment_options);
+        const std::uint64_t full  = engine.resize_expert_pool(tier_full);
         {
             const ninfer::GenerationResult warm =
                 engine.generate(engine.prepare_tokens(prompts[0]), greedy_options(1));
@@ -466,7 +492,7 @@ int main() {
                 fail("treatment warm-up request did not complete");
             }
         }
-        const std::uint64_t small = engine.resize_expert_pool(kTierSmallBytes);
+        const std::uint64_t small = engine.resize_expert_pool(tier_small);
         if (full == 0 || small == 0 || small >= full) {
             fail("treatment engine could not establish its tiers: full=" +
                  std::to_string(full) + " small=" + std::to_string(small));
@@ -475,7 +501,7 @@ int main() {
         std::cerr << "[tier] treatment small=" << small / (1024.0 * 1024.0) << " MiB full="
                   << full / (1024.0 * 1024.0) << " MiB\n";
 
-        // Batch 1 runs on the 8 GiB tier. While it is in flight, both resize entries must be
+        // Batch 1 runs on the tight tier. While it is in flight, both resize entries must be
         // refused and the batch must finish as if nothing had happened.
         bool kv_slipped = false;
         {
@@ -545,14 +571,14 @@ int main() {
 
         // Idle boundary: grow to the construction tier and back. The round trip must return
         // the exact tier bytes both ways - whole slots, no drift.
-        const std::uint64_t grown = engine.resize_expert_pool(kTierFullBytes);
+        const std::uint64_t grown = engine.resize_expert_pool(tier_full);
         if (grown != full) {
             fail("the idle grow did not reach the construction tier: " + std::to_string(grown) +
                  " instead of " + std::to_string(full));
         }
-        const std::uint64_t back = engine.resize_expert_pool(kTierSmallBytes);
+        const std::uint64_t back = engine.resize_expert_pool(tier_small);
         if (back != small) {
-            fail("the shrink back did not return to the 8 GiB tier: " + std::to_string(back) +
+            fail("the shrink back did not return to the tight tier: " + std::to_string(back) +
                  " instead of " + std::to_string(small));
         }
         std::cerr << "[tier] round trip ok: " << small / (1024.0 * 1024.0) << " -> "
@@ -628,7 +654,7 @@ int main() {
         // One batch on the wide tier. Completion only: a wider pool shifts how much of each
         // layer the host tier covers, so cross-tier token identity is not a contract.
         {
-            const std::uint64_t wide = engine.resize_expert_pool(kTierFullBytes);
+            const std::uint64_t wide = engine.resize_expert_pool(tier_full);
             if (wide != full) {
                 fail("the second grow did not reach the construction tier: " +
                      std::to_string(wide) + " instead of " + std::to_string(full));
