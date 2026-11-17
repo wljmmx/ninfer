@@ -78,12 +78,23 @@ def main() -> int:
                             engine = json.load(r)["engine"]
                     except OSError:
                         engine = {}
-                    # The counters live under engine.runtime; the snapshot has no per-request
-                    # "resident" flag in this port.
+                    # The counters live under engine.runtime; the per-request rows under
+                    # engine.requests, which is what this fixture also pins: a live request must
+                    # publish its state and its restoration fields, or an operator cannot tell a
+                    # slow request from a rebuilding one.
                     runtime = engine.get("runtime", {})
+                    rows = engine.get("requests", [])
                     busy = (runtime.get("running_requests", 0) +
                             runtime.get("prefilling_requests", 0))
                     if busy:
+                        resident = [row for row in rows if row.get("resident")]
+                        assert resident, "engine.requests published no resident row"
+                        row = resident[0]
+                        assert row["state"] in ("prefill", "decode", "control", "replay"), row
+                        assert row["owner"] == "generation", row
+                        assert set(row["recovery"]) == {
+                            "route", "begin_frontier", "frontier", "target_frontier"}, row
+                        assert row["last_progress_ns"] >= 0, row
                         break
                     if time.monotonic() > deadline:
                         raise AssertionError("shutdown fixture never became resident")

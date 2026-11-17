@@ -141,6 +141,12 @@ public:
 
     [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
 
+    // The engine's per-request projection, for the monitor. See RequestSnapshot: state, identity,
+    // restoration route/frontiers and last progress, copied under the engine lock.
+    [[nodiscard]] std::vector<ninfer::RequestSnapshot> request_snapshots() const {
+        return engine_->request_snapshots();
+    }
+
     [[nodiscard]] bool is_available() const { return engine_->is_available(); }
 
     [[nodiscard]] ninfer::MediaCacheSummary media_cache_summary() const {

@@ -343,6 +343,13 @@ public:
         return published_stats_;
     }
 
+    // The per-request projection published with the last stats snapshot. Copied under the same lock
+    // as the stats: a reader gets a consistent row set, never a half-built one.
+    [[nodiscard]] std::vector<RequestSnapshot> request_snapshots() const {
+        std::lock_guard lock(stats_mutex_);
+        return published_requests_;
+    }
+
     [[nodiscard]] bool is_available() const {
         std::lock_guard lock(queue_mutex_);
         return !stopping_ && !failed_;
@@ -3779,6 +3786,7 @@ private:
     std::size_t current_decode_lane_count_ = 0;
     RuntimeStats cumulative_stats_;
     RuntimeStats published_stats_;
+    std::vector<RequestSnapshot> published_requests_;
     bool stopping_ = false;
     bool failed_   = false;
     std::thread worker_;

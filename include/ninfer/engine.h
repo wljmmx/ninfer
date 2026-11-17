@@ -129,6 +129,10 @@ public:
     [[nodiscard]] CacheGeometry cache_geometry() const;
     [[nodiscard]] MemorySummary memory_summary() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;
+    // One row per live request: state, identity, restoration route and frontiers, and when it last
+    // committed a token. Copied under the engine lock, so a monitor can read it at any time; the
+    // list is empty for an Engine whose core is a scoring core (it publishes no request rows).
+    [[nodiscard]] std::vector<RequestSnapshot> request_snapshots() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     // The request-lifecycle counter the resize idle contract is built on: requests exist from
     // submission (before they are queued) until their consumer releases them. Exposed so an

@@ -836,6 +836,32 @@ struct RecoveryProgress {
     std::uint32_t target_frontier = 0;
 };
 
+// One live request, as the Engine publishes it for monitoring. A PROJECTION, not the record: only
+// the fields an operator can act on, copied under the engine's own lock so a reader never touches
+// worker state. `state` and `owner` are static strings, never per-call allocations.
+struct RequestSnapshot {
+    std::uint64_t id                = 0;
+    std::uint32_t prompt_tokens     = 0;
+    std::uint32_t generated_tokens  = 0;
+    std::uint64_t preemptions       = 0;
+    std::uint64_t snapshot_restores = 0;
+    std::uint64_t direct_restores   = 0;
+    std::uint64_t replay_restores   = 0;
+    std::uint64_t replayed_tokens   = 0;
+    // Which route restored this request and how far its rebuild has got. None before any resume.
+    RecoveryProgress recovery;
+    // True while the request still holds the recovery capacity of its last restoration, i.e. until
+    // the first NEW unit commits.
+    bool recovery_pending = false;
+    bool resident         = false;
+    // "waiting" / "materializing" / "prefill" / "decode" / "replay" / "paused" / "finishing".
+    const char* state = "waiting";
+    // Which service owns the request: "generation" or "scoring".
+    const char* owner = "generation";
+    // Steady-clock time of the last committed token, 0 when nothing has committed yet.
+    std::uint64_t last_progress_ns = 0;
+};
+
 // Sparse lifecycle observations captured by the Engine worker and delivered by wait() on the
 // consumer thread. Counter deltas between boundaries, less the request's own deltas, measure
 // other requests' completed work during recovery. Decode includes forced control tokens.

@@ -504,6 +504,24 @@ RuntimeStats Engine::runtime_stats() const {
         impl_->core);
 }
 
+std::vector<RequestSnapshot> Engine::request_snapshots() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [](const auto& core) -> std::vector<RequestSnapshot> {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+                throw std::logic_error("Engine core is unavailable");
+            } else if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
+                // The scoring core has no request lifecycle to project: it runs one synchronous
+                // call and owns no lane.
+                return {};
+            } else {
+                return core->request_snapshots();
+            }
+        },
+        impl_->core);
+}
+
 std::uint64_t Engine::resize_expert_pool(std::uint64_t target_bytes) {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     // v8 12.5 step 4 / 13.5-5: for the generation core the idle contract (nine gauges + live

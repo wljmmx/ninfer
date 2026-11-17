@@ -178,9 +178,54 @@ void EngineCore<Instance>::publish_runtime_stats() {
         if (occupancy > kv_window_peak_) { kv_window_peak_ = occupancy; }
     }
 
+    // Per-request projection: gathered at the gauge moment so one reader sees one consistent set.
+    std::vector<RequestSnapshot> rows;
+    rows.reserve(pending_.size() + paused_.size() + max_concurrency_);
+    const auto row_for = [](const std::shared_ptr<Request>& request, bool resident,
+                            const char* state) {
+        RequestSnapshot row;
+        row.id                   = request->id;
+        row.prompt_tokens        = request->prompt_summary.prompt_tokens;
+        row.generated_tokens     = static_cast<std::uint32_t>(request->generated.size());
+        row.preemptions          = request->preemption_count;
+        row.snapshot_restores    = request->snapshot_restores;
+        row.direct_restores      = request->direct_restores;
+        row.replay_restores      = request->replay_restores;
+        row.replayed_tokens      = request->replayed_tokens;
+        row.recovery             = request->recovery;
+        row.recovery_pending     = request->recovery_pending;
+        row.resident             = resident;
+        row.state                = state;
+        row.owner                = "generation";
+        if (request->last_token) {
+            row.last_progress_ns = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    request->last_token->time_since_epoch())
+                    .count());
+        }
+        return row;
+    };
+    const auto state_name = [](EngineRequestState state) -> const char* {
+        switch (state) {
+        case EngineRequestState::Waiting: return "waiting";
+        case EngineRequestState::Materializing: return "materializing";
+        case EngineRequestState::Prefill: return "prefill";
+        case EngineRequestState::Replay: return "replay";
+        case EngineRequestState::Pausing: return "pausing";
+        case EngineRequestState::Paused: return "paused";
+        case EngineRequestState::DecodeReady: return "decode";
+        case EngineRequestState::ControlReady: return "control";
+        case EngineRequestState::ModelFinished: return "finishing";
+        }
+        return "waiting";
+    };
+
     {
         std::lock_guard lock(queue_mutex_);
         snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
+        for (const auto& request : pending_) {
+            if (request != nullptr) { rows.push_back(row_for(request, false, "waiting")); }
+        }
     }
     snapshot.prefilling_requests              = 0;
     snapshot.paused_requests                  = static_cast<std::uint32_t>(paused_.size());
@@ -199,6 +244,10 @@ void EngineCore<Instance>::publish_runtime_stats() {
         if (slots_[lane]->is_decode_ready()) { ++snapshot.decode_ready_requests; }
         if (slots_[lane]->capture_pending) { ++snapshot.capture_pending_requests; }
         if (slots_[lane]->terminal_reason) { ++snapshot.terminal_pending_requests; }
+        rows.push_back(row_for(slots_[lane], true, state_name(slots_[lane]->model_state)));
+    }
+    for (const auto& request : paused_) {
+        if (request != nullptr) { rows.push_back(row_for(request, false, "paused")); }
     }
     detail_range.reset();
     record_detail(&RuntimeHostWorkStats::stats_publication_ns,
@@ -207,7 +256,8 @@ void EngineCore<Instance>::publish_runtime_stats() {
     finish_engine_phase(measurement, EngineHostPhase::Maintenance);
     snapshot.host_work = cumulative_stats_.host_work;
     std::lock_guard lock(stats_mutex_);
-    published_stats_ = snapshot;
+    published_stats_    = snapshot;
+    published_requests_ = std::move(rows);
 }
 
 template <class Instance>

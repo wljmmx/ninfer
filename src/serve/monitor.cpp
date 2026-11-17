@@ -64,6 +64,44 @@ Json host_work_json(const RuntimeHostWorkStats& work) {
                 {"stats_publication_invocations", work.stats_publication_invocations}};
 }
 
+Json request_rows_json(const std::vector<ninfer::RequestSnapshot>& rows) {
+    // One row per live request. The restoration fields are the point of the projection: an operator
+    // matching a slow request to a rebuild needs the route and BOTH frontiers, because "replaying 7
+    // of 12" and "replaying 7 of 7" are the same number with different meanings.
+    const auto route_name = [](ninfer::GenerationRecoveryRoute route) -> const char* {
+        switch (route) {
+        case ninfer::GenerationRecoveryRoute::None: return "none";
+        case ninfer::GenerationRecoveryRoute::Direct: return "direct";
+        case ninfer::GenerationRecoveryRoute::Snapshot: return "snapshot";
+        case ninfer::GenerationRecoveryRoute::Replay: return "replay";
+        }
+        return "unknown";
+    };
+    Json out = Json::array();
+    for (const auto& row : rows) {
+        out.push_back(
+            Json{{"id", row.id},
+                 {"owner", row.owner},
+                 {"state", row.state},
+                 {"resident", row.resident},
+                 {"prompt_tokens", row.prompt_tokens},
+                 {"generated_tokens", row.generated_tokens},
+                 {"preemptions", row.preemptions},
+                 {"snapshot_restores", row.snapshot_restores},
+                 {"direct_restores", row.direct_restores},
+                 {"replay_restores", row.replay_restores},
+                 {"replayed_tokens", row.replayed_tokens},
+                 {"recovery_pending", row.recovery_pending},
+                 {"recovery",
+                  Json{{"route", route_name(row.recovery.route)},
+                       {"begin_frontier", row.recovery.begin_frontier},
+                       {"frontier", row.recovery.frontier},
+                       {"target_frontier", row.recovery.target_frontier}}},
+                 {"last_progress_ns", row.last_progress_ns}});
+    }
+    return out;
+}
+
 Json runtime_json(const RuntimeStats& stats, const ServiceSnapshot& service) {
     // Every number below is a value this Engine actually publishes. Host phases stay separate from
     // device waits and from Context transfer time per docs/performance/methodology.md; nothing is
@@ -302,8 +340,7 @@ void HttpServer::register_monitor_routes() {
     server_.Get("/monitor/snapshot", [this](const httplib::Request&, httplib::Response& res) {
         const auto stats    = service_->runtime_stats();
         const auto memory   = service_->memory_summary();
-        const auto media    = service_->media_cache_summary();
-        const auto service  = observations_.snapshot(true);
+        const auto media    = service_->media_cache_summary();        const auto service  = observations_.snapshot(true);
         auto out            = identity(observations_);
         out["engine"]       = Json{{"sequence", observations_.next_sample_sequence()},
                                    {"sampled_ns", steady_ns()},
@@ -327,7 +364,7 @@ void HttpServer::register_monitor_routes() {
                                    {"placements", Json::array()},
                                    {"ranks", Json::array({rank_json(memory, stats)})},
                                    {"media", media_json(media)},
-                                   {"requests", Json::array()}};
+                                   {"requests", request_rows_json(service_->request_snapshots())}};
         out["service"] = service_observation_json(service);
         res.set_header("Cache-Control", "no-store");
         res.set_content(out.dump(), "application/json");
