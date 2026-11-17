@@ -1013,6 +1013,42 @@ public:
         next_request();
     }
 
+    // The recovery capacity a resumed binding keeps is released by the first NEW committed unit,
+    // not by the replay that rebuilt the old history. Completing the rebuild is exactly the point
+    // where a premature release would be invisible: the request looks recovered either way until
+    // the next preemption forces it to rebuild again.
+    void recovery_capacity_survives_replay_completion() {
+        auto base           = request(kPromptTokens);
+        const auto original = bind(base);
+        prefill_prefix(original, kPauseFrontier);
+        require(program_.start_pause(original, false), "replay fixture could not pause prefill");
+        auto paused = settle();
+        require(paused.paused && paused.paused->frontier() == kPauseFrontier,
+                "replay fixture lost its saved frontier");
+        const auto resumed = bind(base, 0, &*paused.paused, qwen::ExecutionUnitKind::Prefill);
+        paused.paused.reset();
+        require(program_.recovery_pending(resumed),
+                "resumed binding did not retain recovery capacity");
+        bool complete = false;
+        for (unsigned step = 0; step < kPauseFrontier / kChunk + 1; ++step) {
+            reserve(resumed, qwen::ExecutionUnitKind::Replay);
+            const auto progress = program_.advance_replay(resumed);
+            if (progress.complete) {
+                complete = true;
+                break;
+            }
+        }
+        require(complete, "replay did not reach its saved frontier");
+        require(program_.recovery_pending(resumed),
+                "completing the replay released recovery capacity before a new unit committed");
+        finish_prefill(resumed, kPromptTokens - kPauseFrontier, false);
+        require(!program_.recovery_pending(resumed),
+                "the first committed unit after recovery did not release the retained capacity");
+        decode_and_finish(resumed);
+        expect_empty("recovery-capacity fixture retained resources after finishing");
+        next_request();
+    }
+
     void retired_host_image_preserves_input() {
         auto base         = request(65, true);
         const auto active = bind(base);
@@ -2078,6 +2114,7 @@ int main(int argc, char** argv) {
             fixture.cancel_and_destroy_paused_prefill();
             fixture.replay_pause_and_resume();
             fixture.pause_before_first_prefill_chunk();
+            fixture.recovery_capacity_survives_replay_completion();
             fixture.independent_physical_demotions();
             fixture.demotion_holder_changes();
             fixture.batched_physical_demotions();
