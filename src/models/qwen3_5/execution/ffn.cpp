@@ -12,6 +12,7 @@
 
 #include "core/layout.h"
 #include "core/arena.h"
+#include "core/transfer.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/act_quant_a8.h"
 #include <cstdio>
@@ -305,9 +306,10 @@ HostRoutedFetch fetch_ids_only(const ops::ExpertRoutes& routes, cudaStream_t str
     HostRoutedFetch fetch;
     fetch.ids_only = true;
     fetch.ids.resize(static_cast<std::size_t>(top_k) * tokens);
-    CUDA_CHECK(cudaMemcpyAsync(fetch.ids.data(), routes.ids.data,
-                               fetch.ids.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost,
-                               stream));
+    // V10-12: the direction is an argument, not a cudaMemcpyKind a reader has to decode. The probe
+    // read-backs below use core::try_copy_bytes, which is the same call with the outcome reported.
+    core::copy_bytes(fetch.ids.data(), routes.ids.data, fetch.ids.size() * sizeof(std::int32_t),
+                     core::TransferDirection::DeviceToHost, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     return fetch;
 }
@@ -339,8 +341,8 @@ HostRoutedFetch fetch_host_routed(const Tensor& hidden, const ops::ExpertRoutes&
         // alignment the pack kernel uses (16 bytes), so the slices land where it wrote them.
         static thread_local std::vector<std::byte> staging;
         staging.resize(total);
-        CUDA_CHECK(cudaMemcpyAsync(staging.data(), packed_device, total, cudaMemcpyDeviceToHost,
-                                   stream));
+        core::copy_bytes(staging.data(), packed_device, total, core::TransferDirection::DeviceToHost,
+                         stream);
         // port (sm_89): polling cudaStreamQuery instead of blocking on the stream was measured and
         // changed nothing (fetch 0.072-0.075 ms/layer either way, decode 152.9 vs 152.9 at 16 GiB).
         // The 10 KiB copy itself is ~3 us at 3 GB/s, so the cost is not the bytes and not the wait
@@ -422,18 +424,16 @@ HostRoutedFetch fetch_host_routed(const Tensor& hidden, const ops::ExpertRoutes&
         CUDA_CHECK(cudaMemcpyBatchAsync(destinations, sources, sizes, 4, &attributes,
                                         &attribute_index, 1, stream));
     } else {
-        CUDA_CHECK(cudaMemcpyAsync(fetch.x.data(), hidden.data,
-                                   fetch.x.size() * sizeof(std::uint16_t),
-                                   cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaMemcpyAsync(fetch.residual.data(), residual.data,
-                                   fetch.residual.size() * sizeof(std::uint16_t),
-                                   cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaMemcpyAsync(fetch.ids.data(), routes.ids.data,
-                                   fetch.ids.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost,
-                                   stream));
-        CUDA_CHECK(cudaMemcpyAsync(fetch.coefficients.data(), routes.coefficients.data,
-                                   fetch.coefficients.size() * sizeof(float),
-                                   cudaMemcpyDeviceToHost, stream));
+        core::copy_bytes(fetch.x.data(), hidden.data, fetch.x.size() * sizeof(std::uint16_t),
+                         core::TransferDirection::DeviceToHost, stream);
+        core::copy_bytes(fetch.residual.data(), residual.data,
+                         fetch.residual.size() * sizeof(std::uint16_t),
+                         core::TransferDirection::DeviceToHost, stream);
+        core::copy_bytes(fetch.ids.data(), routes.ids.data, fetch.ids.size() * sizeof(std::int32_t),
+                         core::TransferDirection::DeviceToHost, stream);
+        core::copy_bytes(fetch.coefficients.data(), routes.coefficients.data,
+                         fetch.coefficients.size() * sizeof(float),
+                         core::TransferDirection::DeviceToHost, stream);
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     if (std::getenv("NINFER_SPLIT_TIMING") != nullptr) {
@@ -583,9 +583,8 @@ void host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParameters& mo
         // loop below uses, so the result is the same value without a read-back of the device term
         // and without a second synchronise: the next layer's read-back waits on this stream anyway.
         const auto write_begin = std::chrono::steady_clock::now();
-        CUDA_CHECK(cudaMemcpyAsync(host_term_device, host_out.data(),
-                                   host_out.size() * sizeof(float), cudaMemcpyHostToDevice,
-                                   stream));
+        core::copy_bytes(host_term_device, host_out.data(), host_out.size() * sizeof(float),
+                         core::TransferDirection::HostToDevice, stream);
         ops::moe_merge_host_term(host_term_device, gpu_term.data, residual.data,
                                  static_cast<int>(host_out.size()), stream);
         if (timing) {
@@ -614,8 +613,8 @@ void host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParameters& mo
         return;
     }
     const auto join_begin = std::chrono::steady_clock::now();
-    CUDA_CHECK(cudaMemcpyAsync(host_gpu.data(), gpu_term.data, host_gpu.size() * sizeof(float),
-                               cudaMemcpyDeviceToHost, stream));
+    core::copy_bytes(host_gpu.data(), gpu_term.data, host_gpu.size() * sizeof(float),
+                     core::TransferDirection::DeviceToHost, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     const auto join_ms = std::chrono::duration<double, std::milli>(
                              std::chrono::steady_clock::now() - join_begin).count();
@@ -637,8 +636,8 @@ void host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParameters& mo
     const auto merge_ms = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - merge_begin).count();
     const auto write_begin = std::chrono::steady_clock::now();
-    CUDA_CHECK(cudaMemcpyAsync(residual.data, packed.data(), packed.size() * sizeof(std::uint16_t),
-                               cudaMemcpyHostToDevice, stream));
+    core::copy_bytes(residual.data, packed.data(), packed.size() * sizeof(std::uint16_t),
+                     core::TransferDirection::HostToDevice, stream);
     if (timing) {
         static std::uint64_t calls = 0;
         static double acc[5]       = {0.0, 0.0, 0.0, 0.0, 0.0};
@@ -1090,8 +1089,8 @@ void predict_next_layer(const Tensor& residual, const RoutedMoeParameters& next,
     }
     std::vector<std::int32_t> guess(static_cast<std::size_t>(guess_count));
     const std::size_t bytes = static_cast<std::size_t>(guess_count) * sizeof(std::int32_t);
-    (void)cudaMemcpyAsync(guess.data(), guess_ids.data, bytes, cudaMemcpyDeviceToHost,
-                          execution.stream);
+    (void)core::try_copy_bytes(guess.data(), guess_ids.data, bytes,
+                               core::TransferDirection::DeviceToHost, execution.stream);
     (void)cudaStreamSynchronize(execution.stream);
     next.stream->set_predicted(std::move(guess));
     if (trace) {
@@ -1320,9 +1319,8 @@ void split_host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParamete
     (void)ensure_ms;
     if (host_term_device != nullptr) {
         const auto write_begin = std::chrono::steady_clock::now();
-        CUDA_CHECK(cudaMemcpyAsync(host_term_device, host_out.data(),
-                                   host_out.size() * sizeof(float), cudaMemcpyHostToDevice,
-                                   stream));
+        core::copy_bytes(host_term_device, host_out.data(), host_out.size() * sizeof(float),
+                         core::TransferDirection::HostToDevice, stream);
         ops::moe_merge_host_term(host_term_device, gpu_term.data, residual.data,
                                  static_cast<int>(host_out.size()), stream);
         if (timing) {
@@ -1381,8 +1379,8 @@ void split_host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParamete
     // No device merge: bring the Device term down and fold it here, in the same order the device
     // epilogue uses (BF16 residual, then the host term, then the Device term, one RNE rounding).
     const auto join_begin = std::chrono::steady_clock::now();
-    CUDA_CHECK(cudaMemcpyAsync(host_gpu.data(), gpu_term.data, host_gpu.size() * sizeof(float),
-                               cudaMemcpyDeviceToHost, stream));
+    core::copy_bytes(host_gpu.data(), gpu_term.data, host_gpu.size() * sizeof(float),
+                     core::TransferDirection::DeviceToHost, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     const auto join_ms = std::chrono::duration<double, std::milli>(
                              std::chrono::steady_clock::now() - join_begin).count();
@@ -1400,8 +1398,8 @@ void split_host_routed_ffn(const HostRoutedFetch& fetch, const RoutedMoeParamete
     const auto merge_ms = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - merge_begin).count();
     const auto write_begin = std::chrono::steady_clock::now();
-    CUDA_CHECK(cudaMemcpyAsync(residual.data, packed.data(), packed.size() * sizeof(std::uint16_t),
-                               cudaMemcpyHostToDevice, stream));
+    core::copy_bytes(residual.data, packed.data(), packed.size() * sizeof(std::uint16_t),
+                     core::TransferDirection::HostToDevice, stream);
     if (timing) {
         static std::uint64_t calls = 0;
         static double acc[5]       = {0.0, 0.0, 0.0, 0.0, 0.0};
@@ -1469,8 +1467,8 @@ void split_moe_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor&
     if (route_debug) {
         // Entry probe: is the MoE input already non-finite before this layer touches the arena?
         std::vector<std::uint16_t> entry(static_cast<std::size_t>(hidden.ne[0]) * columns);
-        CUDA_CHECK(cudaMemcpyAsync(entry.data(), hidden.data, entry.size() * sizeof(std::uint16_t),
-                                   cudaMemcpyDeviceToHost, execution.stream));
+        core::copy_bytes(entry.data(), hidden.data, entry.size() * sizeof(std::uint16_t),
+                         core::TransferDirection::DeviceToHost, execution.stream);
         CUDA_CHECK(cudaStreamSynchronize(execution.stream));
         int first_bad = -1;
         std::size_t bad_tokens = 0;
@@ -1495,12 +1493,10 @@ void split_moe_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor&
         // router wrote a non-finite number": 12345 cannot come out of a softmax.
         const std::vector<float> sentinel(static_cast<std::size_t>(top_k) * columns, 12345.0F);
         const std::vector<std::int32_t> sentinel_ids(static_cast<std::size_t>(top_k) * columns, -777);
-        CUDA_CHECK(cudaMemcpyAsync(coefficients.data, sentinel.data(),
-                                   sentinel.size() * sizeof(float), cudaMemcpyHostToDevice,
-                                   execution.stream));
-        CUDA_CHECK(cudaMemcpyAsync(ids.data, sentinel_ids.data(),
-                                   sentinel_ids.size() * sizeof(std::int32_t),
-                                   cudaMemcpyHostToDevice, execution.stream));
+        core::copy_bytes(coefficients.data, sentinel.data(), sentinel.size() * sizeof(float),
+                         core::TransferDirection::HostToDevice, execution.stream);
+        core::copy_bytes(ids.data, sentinel_ids.data(), sentinel_ids.size() * sizeof(std::int32_t),
+                         core::TransferDirection::HostToDevice, execution.stream);
         CUDA_CHECK(cudaStreamSynchronize(execution.stream));
     }
     {
@@ -1514,13 +1510,12 @@ void split_moe_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor&
         std::vector<std::int32_t> h_ids(static_cast<std::size_t>(top_k) * columns);
         std::vector<float> h_coef(static_cast<std::size_t>(top_k) * columns);
         std::vector<std::uint16_t> h_x(static_cast<std::size_t>(hidden.ne[0]) * columns);
-        CUDA_CHECK(cudaMemcpyAsync(h_ids.data(), ids.data, h_ids.size() * sizeof(std::int32_t),
-                                   cudaMemcpyDeviceToHost, execution.stream));
-        CUDA_CHECK(cudaMemcpyAsync(h_coef.data(), coefficients.data,
-                                   h_coef.size() * sizeof(float), cudaMemcpyDeviceToHost,
-                                   execution.stream));
-        CUDA_CHECK(cudaMemcpyAsync(h_x.data(), hidden.data, h_x.size() * sizeof(std::uint16_t),
-                                   cudaMemcpyDeviceToHost, execution.stream));
+        core::copy_bytes(h_ids.data(), ids.data, h_ids.size() * sizeof(std::int32_t),
+                         core::TransferDirection::DeviceToHost, execution.stream);
+        core::copy_bytes(h_coef.data(), coefficients.data, h_coef.size() * sizeof(float),
+                         core::TransferDirection::DeviceToHost, execution.stream);
+        core::copy_bytes(h_x.data(), hidden.data, h_x.size() * sizeof(std::uint16_t),
+                         core::TransferDirection::DeviceToHost, execution.stream);
         CUDA_CHECK(cudaStreamSynchronize(execution.stream));
         for (int t = 0; t < columns; ++t) {
             const auto row = static_cast<std::size_t>(t) * top_k;
@@ -1632,9 +1627,9 @@ void split_moe_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor&
             const auto mask_span = workspace.alloc_bytes(addressable.size() * sizeof(std::int32_t));
             Tensor addressable_device(mask_span.data, execution.device(), DType::I32,
                                       {static_cast<std::int32_t>(addressable.size())});
-            CUDA_CHECK(cudaMemcpyAsync(addressable_device.data, addressable.data(),
-                                       addressable.size() * sizeof(std::int32_t),
-                                       cudaMemcpyHostToDevice, stream));
+            core::copy_bytes(addressable_device.data, addressable.data(),
+                             addressable.size() * sizeof(std::int32_t),
+                             core::TransferDirection::HostToDevice, stream);
             // The Device half writes the routed term of the experts it can address (FP32, no
             // residual); the CPU half computes the rest; one merge folds both into the residual.
             auto mixed_f32 = workspace.alloc(DType::FP32, {hidden.ne[0], columns});
@@ -1768,8 +1763,8 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
                                 guess_arena, execution);
         std::vector<std::int32_t> guess(routed.top_k);
         const std::size_t bytes = static_cast<std::size_t>(routed.top_k) * sizeof(std::int32_t);
-        (void)cudaMemcpyAsync(guess.data(), guess_ids.data, bytes, cudaMemcpyDeviceToHost,
-                              execution.stream);
+        (void)core::try_copy_bytes(guess.data(), guess_ids.data, bytes,
+                                   core::TransferDirection::DeviceToHost, execution.stream);
         if (predict_routes) {
             (void)cudaStreamSynchronize(execution.stream);
             moe.stream->set_predicted(guess);
@@ -1778,8 +1773,8 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
             // Diagnostic: two 32-byte read-backs and a sync per layer, which is why the probe is not
             // the mechanism.
             std::vector<std::int32_t> actual(routed.top_k);
-            (void)cudaMemcpyAsync(actual.data(), ids.data, bytes, cudaMemcpyDeviceToHost,
-                                  execution.stream);
+            (void)core::try_copy_bytes(actual.data(), ids.data, bytes,
+                                       core::TransferDirection::DeviceToHost, execution.stream);
             (void)cudaStreamSynchronize(execution.stream);
             std::size_t hit = 0;
             for (const auto id : actual) {
@@ -1832,8 +1827,8 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
             const auto bytes = static_cast<std::size_t>(hidden.ne[0]) *
                                static_cast<std::size_t>(hidden.ne[1]) * 2U;
             std::vector<std::uint8_t> host(bytes);
-            if (cudaMemcpyAsync(host.data(), hidden.data, bytes, cudaMemcpyDeviceToHost,
-                                execution.stream) == cudaSuccess) {
+            if (core::try_copy_bytes(host.data(), hidden.data, bytes,
+                                     core::TransferDirection::DeviceToHost, execution.stream)) {
                 (void)cudaStreamSynchronize(execution.stream);
                 std::uint64_t h = 1469598103934665603ULL;
                 for (const auto byte : host) {
@@ -1858,10 +1853,10 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
                     }
                     return value;
                 };
-                if (cudaMemcpyAsync(res_host.data(), residual.data, res_bytes,
-                                    cudaMemcpyDeviceToHost, execution.stream) == cudaSuccess &&
-                    cudaMemcpyAsync(id_host.data(), routes.ids.data, id_bytes,
-                                    cudaMemcpyDeviceToHost, execution.stream) == cudaSuccess) {
+                if (core::try_copy_bytes(res_host.data(), residual.data, res_bytes,
+                                         core::TransferDirection::DeviceToHost, execution.stream) &&
+                    core::try_copy_bytes(id_host.data(), routes.ids.data, id_bytes,
+                                         core::TransferDirection::DeviceToHost, execution.stream)) {
                     (void)cudaStreamSynchronize(execution.stream);
                     std::fprintf(stderr, "[pre] n=%u residual=%016llx ids=%016llx top_k=%d tok=%d\n",
                                  shown_in, static_cast<unsigned long long>(fnv(res_host)),
@@ -1872,8 +1867,9 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
                     const auto sc_bytes = static_cast<std::size_t>(shared_coefficients.ne[0]) *
                                           static_cast<std::size_t>(shared_coefficients.ne[1]) * 4U;
                     std::vector<std::uint8_t> sc_host(sc_bytes);
-                    if (cudaMemcpyAsync(sc_host.data(), shared_coefficients.data, sc_bytes,
-                                        cudaMemcpyDeviceToHost, execution.stream) == cudaSuccess) {
+                    if (core::try_copy_bytes(sc_host.data(), shared_coefficients.data, sc_bytes,
+                                             core::TransferDirection::DeviceToHost,
+                                             execution.stream)) {
                         (void)cudaStreamSynchronize(execution.stream);
                         std::fprintf(stderr, "[pre] n=%u shared_coeff=%016llx elems=%d\n", shown_in,
                                      static_cast<unsigned long long>(fnv(sc_host)),
@@ -2035,9 +2031,9 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
         // The same 256 words, copied to pinned memory on the same stream right behind the kernel: the
         // host scan that checks it happens a step later and must see the array the kernel saw, not
         // whatever the placement has done since.
-        CUDA_CHECK(cudaMemcpyAsync(probe.mask_staging[moe.stream->bank_index()]->data(),
-                                   coverage_mask.data, probe.mask_size * sizeof(std::int32_t),
-                                   cudaMemcpyDeviceToHost, execution.stream));
+        core::copy_bytes(probe.mask_staging[moe.stream->bank_index()]->data(),
+                         coverage_mask.data, probe.mask_size * sizeof(std::int32_t),
+                         core::TransferDirection::DeviceToHost, execution.stream);
     }
     // port (sm_89): O1's skip, after ensure rather than instead of it. ensure() is what publishes the
     // mask and the offset table and rebases the window onto the current resident set - a layer that
@@ -2560,9 +2556,9 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
                         const auto bytes = static_cast<std::size_t>(residual.ne[0]) *
                                            static_cast<std::size_t>(residual.ne[1]) * 2U;
                         std::vector<std::uint8_t> host(bytes);
-                        if (cudaMemcpyAsync(host.data(), residual.data, bytes,
-                                            cudaMemcpyDeviceToHost, execution.stream) ==
-                                cudaSuccess) {
+                        if (core::try_copy_bytes(host.data(), residual.data, bytes,
+                                                 core::TransferDirection::DeviceToHost,
+                                                 execution.stream)) {
                             (void)cudaStreamSynchronize(execution.stream);
                             std::uint64_t h = 1469598103934665603ULL;
                             for (const auto byte : host) {

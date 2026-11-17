@@ -54,4 +54,19 @@ inline void copy_bytes(void* destination, const void* source, std::size_t bytes,
     CUDA_CHECK(cudaMemcpyAsync(destination, source, bytes, transfer_kind(direction), stream));
 }
 
+// The same transfer, with the outcome REPORTED instead of thrown. The diagnostic read-backs in the
+// execution layer deliberately branch on failure - a probe that cannot run must not abort a
+// generation - and spelled that by hand, as `if (cudaMemcpyAsync(...) == cudaSuccess)` or a cast to
+// void. Same call and same direction argument; only the error shape differs. A null operand reports
+// failure rather than throwing, and a zero-byte copy is a success that touches nothing, so both
+// guards behave exactly like their thrown counterparts before CUDA is asked anything.
+[[nodiscard]] inline bool try_copy_bytes(void* destination, const void* source, std::size_t bytes,
+                                         TransferDirection direction,
+                                         cudaStream_t stream) noexcept {
+    if (bytes == 0) { return true; }
+    if (destination == nullptr || source == nullptr) { return false; }
+    return cudaMemcpyAsync(destination, source, bytes, transfer_kind(direction), stream) ==
+           cudaSuccess;
+}
+
 } // namespace ninfer::core
