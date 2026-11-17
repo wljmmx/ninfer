@@ -109,9 +109,12 @@ public:
         }
     };
 
+    // Read-only view of the loaded model: how many bytes one step's routed activation needs is a
+    // property of the model, not of the core, so both cores hand the instance back here.
+    [[nodiscard]] const Instance& instance() const noexcept { return instance_; }
+
     EngineCore(Instance& instance, DeviceContext& device, const EngineOptions& options,
-               ContextMachineCostModel context_cost)
-        : instance_(instance), device_(device), max_context_(options.max_context),
+               ContextMachineCostModel context_cost)        : instance_(instance), device_(device), max_context_(options.max_context),
           max_concurrency_(options.max_concurrency),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
@@ -1793,8 +1796,7 @@ public:
         return verdict;
     }
 
-    [[nodiscard]] std::uint64_t resize_expert_pool_checked(std::uint64_t target_bytes) {
-        std::lock_guard serialize(resize_mutex_);
+    [[nodiscard]] std::uint64_t resize_expert_pool_checked(std::uint64_t target_bytes) {        std::lock_guard serialize(resize_mutex_);
         // A bounded grace, not an admit-anywhere window: a request that just finished leaves the
         // worker in its settle round for a few milliseconds, and refusing that tail would make an
         // "idle" engine look busy to the caller that waited for it. A multi-second prefill still
@@ -3674,8 +3676,7 @@ private:
 
     Instance& instance_;
     DeviceContext& device_;
-    const std::uint32_t max_context_;
-    const std::uint32_t max_concurrency_;
+    const std::uint32_t max_context_;    const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
     // v8 9.3/12.2: the controller-owned lane limit. The buffers above stay sized for
     // max_concurrency_ forever - shrinking is an admission decision, never a reallocation - so

@@ -133,6 +133,10 @@ public:
 
     [[nodiscard]] RuntimeStats runtime_stats() const noexcept { return {}; }
 
+    // Read-only view of the loaded model. Pool sizing (how many bytes one step's routed activation
+    // needs) is a property of the model, not of either core, so both cores expose it here.
+    [[nodiscard]] const Instance& instance() const noexcept { return instance_; }
+
     [[nodiscard]] bool is_available() const {
         std::lock_guard lock(queue_mutex_);
         return !stopping_;

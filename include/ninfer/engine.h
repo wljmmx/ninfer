@@ -163,6 +163,16 @@ public:
     // the post-KV-shrink page-placement divergence are the two open items it must not assume away.
     std::uint64_t resize_expert_pool(std::uint64_t target_bytes);
 
+    // Bytes of Device expert pool one decode step needs so that every expert a lane routes is
+    // resident when its layer runs (routed top-k x lanes per bank x the pool's slot). Zero for a
+    // dense artifact or before a pool exists. Serving code and acceptance tests size a tier by this
+    // instead of a constant, and can skip a run whose activation does not fit the card.
+    [[nodiscard]] std::uint64_t expert_step_bytes() const;
+
+    // Bytes of Device expert pool currently in effect (capacity, not occupancy); zero when the model
+    // has no pool. This is what resize_expert_pool reports back, available without a resize.
+    [[nodiscard]] std::uint64_t expert_pool_capacity_bytes() const;
+
     // 13.4: the KV half of runtime resize. Same idle-window contract as the expert pool, and the
     // same refusal style: a retained checkpoint that owns pages above the new edge is an owner, not
     // slack, so the call throws instead of invalidating it. The physical driver reservation is not

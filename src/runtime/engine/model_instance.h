@@ -52,6 +52,8 @@ struct ModelInstance {
     // to it, and the reader it reads through is declared above and therefore outlives it.
     std::shared_ptr<models::qwen3_5::execution::HostExpertResidency> expert_host_residency;
     std::unique_ptr<ExpertCache> expert_cache;
+    // Set by attach_expert_cache from the same geometry the pool was sized from (see the accessor).
+    std::uint64_t expert_step_bytes_ = 0;
     // port (sm_89): true when the whole resident set fits at once, so a captured decode graph may
     // already point into it and the pool must not change size underneath that graph.
     bool expert_pool_pinned = false;
@@ -84,6 +86,14 @@ struct ModelInstance {
     // has no expert pool. Experts of a dropped window stream in again on their next use.
     std::uint64_t resize_expert_pool(std::uint64_t target_bytes);
     [[nodiscard]] std::uint64_t expert_pool_capacity() const noexcept;
+    // Bytes of Device pool one decode step needs so that every expert a lane routes is resident when
+    // its layer runs: per bank, the routed top-k times the lane count (capped by the bank's own
+    // count), summed over banks and multiplied by the pool's slot. Zero for a dense artifact. A
+    // caller sizes a tier by this number instead of a constant, and can then decide to skip a run
+    // whose activation does not fit the card.
+    [[nodiscard]] std::uint64_t expert_step_bytes() const noexcept {
+        return expert_step_bytes_;
+    }
     // 13.4: the KV half of the same contract. Pages are the unit (64 tokens each); the call
     // validates ownership first and returns the capacity actually in effect.
     std::uint32_t resize_kv_capacity(std::uint32_t target_pages);

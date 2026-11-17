@@ -938,6 +938,18 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     placement.slot_bytes = instance.expert_cache->slot_bytes();
     placement.gpu_experts = instance.expert_cache->resident_experts();
     for (const auto& bank : requirements.banks) { placement.total_experts += bank.count; }
+    // One step routes up to `routed_top_k` experts per lane inside each bank, so a pool holding that
+    // many slots per bank runs a step without streaming anything in. Expressed in bytes, this is the
+    // number a caller can size a tier by (Engine::expert_step_bytes) - the model's activation rather
+    // than a constant - and the one that says whether a run should be attempted at all.
+    {
+        const std::uint64_t lanes = std::max<std::uint32_t>(1, options.max_concurrency);
+        std::uint64_t step_slots  = 0;
+        for (const auto& bank : requirements.banks) {
+            step_slots += std::min<std::uint64_t>(bank.count, lanes * routed_top_k);
+        }
+        instance.expert_step_bytes_ = step_slots * placement.slot_bytes;
+    }
     // Whatever the pool does not keep is served by the cache's source: the retained Host replica
     // when one exists, the artifact otherwise. The residency arena above is an extra cache in
     // front of that source, not a separate tier.

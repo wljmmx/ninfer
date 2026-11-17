@@ -563,8 +563,35 @@ std::uint64_t Engine::resize_expert_pool(std::uint64_t target_bytes) {
         impl_->core);
 }
 
-std::uint32_t Engine::resize_kv_pages(std::uint32_t target_pages) {
+std::uint64_t Engine::expert_step_bytes() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [](const auto& core) -> std::uint64_t {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+                return 0;
+            } else {
+                return core->instance().expert_step_bytes();
+            }
+        },
+        impl_->core);
+}
+
+std::uint64_t Engine::expert_pool_capacity_bytes() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [](const auto& core) -> std::uint64_t {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+                return 0;
+            } else {
+                return core->instance().expert_pool_capacity();
+            }
+        },
+        impl_->core);
+}
+
+std::uint32_t Engine::resize_kv_pages(std::uint32_t target_pages) {    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     if (target_pages == 0) { throw std::invalid_argument("KV page target must be positive"); }
     // 13.5-5 / open #1: the generation core walks the SAME acceptance as the expert pool -
     // EngineCore::resize_kv_pages_checked - so there is one idle contract, one verdict log and one
