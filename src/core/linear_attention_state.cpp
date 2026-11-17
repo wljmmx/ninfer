@@ -1,6 +1,7 @@
 #include "core/linear_attention_state.h"
 
 #include "core/device.h"
+#include "core/transfer.h"
 
 #include <limits>
 #include <stdexcept>
@@ -236,17 +237,18 @@ void LinearAttentionStatePool::copy_slot(std::int32_t src, std::int32_t dst, cud
                                      cudaMemcpyDeviceToDevice, stream));
         return;
     }
+    // V10-12: the two flat per-layer copy loops name their direction; the pitched form above stays.
     for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
         const Tensor source      = conv_slot(layer, src);
         const Tensor destination = conv_slot(layer, dst);
-        CUDA_CHECK(cudaMemcpyAsync(destination.data, source.data, source.bytes(),
-                                   cudaMemcpyDeviceToDevice, stream));
+        core::copy_bytes(destination.data, source.data, source.bytes(),
+                         core::TransferDirection::DeviceToDevice, stream);
     }
     for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
         const Tensor source      = recurrent_slot(layer, src);
         const Tensor destination = recurrent_slot(layer, dst);
-        CUDA_CHECK(cudaMemcpyAsync(destination.data, source.data, source.bytes(),
-                                   cudaMemcpyDeviceToDevice, stream));
+        core::copy_bytes(destination.data, source.data, source.bytes(),
+                         core::TransferDirection::DeviceToDevice, stream);
     }
 }
 

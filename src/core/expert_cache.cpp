@@ -4,6 +4,7 @@
 
 #include "core/vmm_pool.h"
 #include "core/device_scope.h"
+#include "core/transfer.h"
 
 #include <algorithm>
 #include <array>
@@ -1311,9 +1312,13 @@ std::vector<std::uint64_t> bank_generation;
                         ++stat_arena;
                         return;
                     }
+                    // V10-12: every plain async copy in this file names its direction; the batch
+                    // publication below is a different call. The sites that throw keep the driver's
+                    // code by asking copy_bytes_status for it.
                     const auto status =
-                        cudaMemcpyAsync(base, arena_image, static_cast<std::size_t>(arena_bytes),
-                                        cudaMemcpyHostToDevice, stream);
+                        core::copy_bytes_status(base, arena_image,
+                                                static_cast<std::size_t>(arena_bytes),
+                                                core::TransferDirection::HostToDevice, stream);
                     if (status != cudaSuccess) {
                         throw std::runtime_error(cudaGetErrorString(status));
                     }
@@ -1361,8 +1366,9 @@ std::vector<std::uint64_t> bank_generation;
                     return;
                 }
                 const auto copied =
-                    cudaMemcpyAsync(base, host_base, static_cast<std::size_t>(file->image_bytes),
-                                    cudaMemcpyHostToDevice, stream);
+                    core::copy_bytes_status(base, host_base,
+                                            static_cast<std::size_t>(file->image_bytes),
+                                            core::TransferDirection::HostToDevice, stream);
                 if (copied != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(copied)); }
                 if (settle) {
                     const auto settled = cudaStreamSynchronize(stream);
@@ -1431,8 +1437,9 @@ std::vector<std::uint64_t> bank_generation;
                     return;
                 }
                 const auto status =
-                    cudaMemcpyAsync(base, host_base, static_cast<std::size_t>(file->image_bytes),
-                                    cudaMemcpyHostToDevice, stream);
+                    core::copy_bytes_status(base, host_base,
+                                            static_cast<std::size_t>(file->image_bytes),
+                                            core::TransferDirection::HostToDevice, stream);
                 if (status != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(status)); }
                 if (settle) { (void)cudaStreamSynchronize(stream); }
             }
@@ -1454,8 +1461,10 @@ std::vector<std::uint64_t> bank_generation;
                     batch->push_back({base + region.offset, span.data, region.bytes});
                     return;
                 }
-                const auto status = cudaMemcpyAsync(base + region.offset, span.data, region.bytes,
-                                                    cudaMemcpyHostToDevice, stream);
+                const auto status = core::copy_bytes_status(base + region.offset, span.data,
+                                                            region.bytes,
+                                                            core::TransferDirection::HostToDevice,
+                                                            stream);
                 if (status != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(status)); }
             };
             copy(ExpertPlaneKind::Codes, bank.codes, false);
@@ -1679,8 +1688,8 @@ ExpertCacheProgress ExpertCache::progress(cudaStream_t stream) {
         if (!submitted) {
             for (const auto& op : batch) {
                 const auto status =
-                    cudaMemcpyAsync(op.destination, op.source, op.bytes, cudaMemcpyHostToDevice,
-                                    stream);
+                    core::copy_bytes_status(op.destination, op.source, op.bytes,
+                                            core::TransferDirection::HostToDevice, stream);
                 if (status != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(status)); }
                 ++impl_->stat_submits;
             }

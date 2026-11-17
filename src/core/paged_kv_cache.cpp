@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "core/host_kv_arena.h"
+#include "core/transfer.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -842,10 +843,10 @@ TransferWork DeviceKVPagePool::copy_page(DeviceKVPageHandle source, DeviceKVPage
     for (const Tensor& plane : planes_) {
         auto* base = static_cast<unsigned char*>(plane.data);
         if (page_major) {
-            CUDA_CHECK(
-                cudaMemcpyAsync(base + static_cast<std::int64_t>(destination_index) * plane.nb[3],
-                                base + static_cast<std::int64_t>(source_index) * plane.nb[3],
-                                plane.nb[3], cudaMemcpyDeviceToDevice, stream));
+            // V10-12: direction named at the call site; the pitched form below is a different call.
+            core::copy_bytes(base + static_cast<std::int64_t>(destination_index) * plane.nb[3],
+                             base + static_cast<std::int64_t>(source_index) * plane.nb[3],
+                             plane.nb[3], core::TransferDirection::DeviceToDevice, stream);
         } else {
             CUDA_CHECK(cudaMemcpy2DAsync(
                 base + static_cast<std::int64_t>(destination_index) * plane.nb[2], plane.nb[3],
@@ -1244,8 +1245,8 @@ void KVExecutionTablePool::mark_absent(KVExecutionRowHandle row_handle,
                     "Paged KV absent marking is outside its execution row");
             }
             shadow[page] = kAbsentPage;
-            CUDA_CHECK(cudaMemcpyAsync(destination + page, shadow + page, sizeof(std::int32_t),
-                                       cudaMemcpyHostToDevice, stream));
+            core::copy_bytes(destination + page, shadow + page, sizeof(std::int32_t),
+                             core::TransferDirection::HostToDevice, stream);
         }
         return;
     }
@@ -1259,8 +1260,8 @@ void KVExecutionTablePool::mark_absent(KVExecutionRowHandle row_handle,
         if (run_end <= run_begin) { return; }
         const std::size_t count   = run_end - run_begin;
         const std::uint32_t first = logical_pages[run_begin];
-        CUDA_CHECK(cudaMemcpyAsync(destination + first, shadow + first,
-                                   count * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
+        core::copy_bytes(destination + first, shadow + first, count * sizeof(std::int32_t),
+                         core::TransferDirection::HostToDevice, stream);
         run_begin = run_end;
     };
     for (std::size_t index = 0; index < logical_pages.size(); ++index) {
@@ -1304,8 +1305,8 @@ void KVExecutionTablePool::apply_absent_window(KVExecutionRowHandle row_handle,
         mapping[page] = keep ? published[page] : kAbsentPage;
     }
     auto* destination = static_cast<std::int32_t*>(row(row_handle).data);
-    CUDA_CHECK(cudaMemcpyAsync(destination, mapping.data(), mapping.size() * sizeof(std::int32_t),
-                               cudaMemcpyHostToDevice, stream));
+    core::copy_bytes(destination, mapping.data(), mapping.size() * sizeof(std::int32_t),
+                     core::TransferDirection::HostToDevice, stream);
 }
 
 void KVExecutionTablePool::apply_absent_interval(KVExecutionRowHandle row_handle,
@@ -1326,8 +1327,8 @@ void KVExecutionTablePool::apply_absent_interval(KVExecutionRowHandle row_handle
     auto* destination         = static_cast<std::int32_t*>(row(row_handle).data);
     const std::uint32_t count = end_page - first_page;
     std::vector<std::int32_t> sentinel(count, kAbsentPage);
-    CUDA_CHECK(cudaMemcpyAsync(destination + first_page, sentinel.data(),
-                               count * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
+    core::copy_bytes(destination + first_page, sentinel.data(), count * sizeof(std::int32_t),
+                     core::TransferDirection::HostToDevice, stream);
 }
 
 void KVExecutionTablePool::publish_indices(KVExecutionRowHandle row_handle,
@@ -1337,8 +1338,8 @@ void KVExecutionTablePool::publish_indices(KVExecutionRowHandle row_handle,
     if (indices.empty()) { return; }
     Tensor destination_row = row(row_handle);
     auto* destination      = static_cast<std::int32_t*>(destination_row.data) + logical_begin;
-    CUDA_CHECK(cudaMemcpyAsync(destination, indices.data(), indices.size_bytes(),
-                               cudaMemcpyHostToDevice, stream));
+    core::copy_bytes(destination, indices.data(), indices.size_bytes(),
+                     core::TransferDirection::HostToDevice, stream);
 }
 
 Tensor KVExecutionTablePool::row(KVExecutionRowHandle handle) const {

@@ -1,6 +1,7 @@
 #include "core/cyclic_kv_cache.h"
 
 #include "core/device.h"
+#include "core/transfer.h"
 
 #include <array>
 #include <limits>
@@ -166,10 +167,11 @@ void CyclicKVCache::copy_slot_from(const CyclicKVCache& source, std::int32_t sou
         Tensor destination_v = v_[layer].slice(3, destination_slot, 1);
         Tensor source_k      = source.k_[layer].slice(3, source_slot, 1);
         Tensor source_v      = source.v_[layer].slice(3, source_slot, 1);
-        CUDA_CHECK(cudaMemcpyAsync(destination_k.data, source_k.data, destination_k.bytes(),
-                                   cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(destination_v.data, source_v.data, destination_v.bytes(),
-                                   cudaMemcpyDeviceToDevice, stream));
+        // V10-12: direction named at the call site.
+        core::copy_bytes(destination_k.data, source_k.data, destination_k.bytes(),
+                         core::TransferDirection::DeviceToDevice, stream);
+        core::copy_bytes(destination_v.data, source_v.data, destination_v.bytes(),
+                         core::TransferDirection::DeviceToDevice, stream);
     }
 }
 
