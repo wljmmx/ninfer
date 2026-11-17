@@ -77,6 +77,13 @@
 - 提交：`c462ffcb`（joint_planning + register）、`cff631b8`（context_capacity + prefix_checkpoint + CMake）、`e5c37a71`（测试）。
 - 剩余接线：`plan_context_capacity` 接 `resolve_kv_capacity`/容量曲线入口（`NINFER_CONTEXT_JOINT_PLAN` 语义）；`select_prefix_checkpoints` 接 ResourceManager prune；接线后重跑 E9/双 PPL/regress。
 
+### V10-01（2026-11-17）联合 sizing 接线闭环
+- 阻塞点核实为「公共接口未暴露」而非几何不存在：StateImage 步长是 `PersistentLayout::state_images.host.image_bytes`（`src/models/qwen3_5/program/planning/startup.h:39`，由 `plan_state_image_device_pool` 在 Program 之前建好，`startup.cpp:231`），Program 侧 `checkpoint_geometry().state_image_bytes` 读的也是同一 host layout（`state_store.h:130-132`，`checkpoint_export.cpp:119`）。新增 `SequencePlanner::state_image_bytes()`（`program.h`、`program.cpp`）暴露它。
+- 自动容量路径改走 `resolve_context_capacity()`（`context_capacity.{h,cpp}`）：同一个预算里解页组 / StateImage 槽 / workspace，不可行时抛 `invalid_argument` 点名两个账本（`Engine runtime reservation requires ... (N page groups + M StateImage slots) ...`），并沿用 `kv_capacity_shortage()` 的 WDDM/专家下沉重试语义；显式容量与 tiered 路径不变。
+- 锚点口径：`capacity_curve` 的最小 plan 已含 lanes + `--device-state-slots` 的 StateImage 与 workspace，故它们计入 `minimum_state_slots`（不再二次计费）；本树无 checkpoint interval，target 不增长槽数。
+- 诊断：删除 `attach_expert_cache()` 里 `state=0(layout not exposed)` 的纯打印块；`[joint] sizing` 报决策、`[joint] exact` 校验计划步长与 Program 步长一致。
+- 门禁：27B `PPL 7.359779 PASS` / `dump e95cacb864d8b1ab PASS`；35B 4801 / 2.055310 / 7.809254（delta 0.417% PASS）；`ctest -R "tier|checkpoint|lmcache_state"` 6/6（含 27B 真实 tier 恢复 `ninfer_qwen3_5_kv_tier_real_test` 35.9 s）。
+
 ### T158 门禁结果
 - 35B default 930 MiB：4801 / 2.051275 / 7.777808 **逐位 PASS**。
 - 27B regress fast：default PPL **7.441868**、selector-off dump **636e38de95046781** 逐位，9 点任务套件 **regressions 0**。

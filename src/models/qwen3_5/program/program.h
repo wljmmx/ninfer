@@ -98,6 +98,13 @@ public:
     // group" and "ledger of a logical page group". Both zero when the model keeps no full-attention
     // pages, and then the residency model stays inactive.
     [[nodiscard]] const runtime::KvResidencyStrides& residency_strides() const noexcept;
+    // port (V10-01): one complete StateImage's bytes, as the plan will build it. The geometry is
+    // part of the sequence layout the planner already holds (`PersistentLayout::state_images`), so
+    // the joint capacity model can price the state account before a Program exists; zero when the
+    // planner has no minimum plan. Identical to the Program's `checkpoint_geometry()` stride for
+    // the same artifact, because that accessor reads this same host layout
+    // (StateImageStore::image_bytes()).
+    [[nodiscard]] std::size_t state_image_bytes() const noexcept;
     // port (sm_89): a captured decode graph is only valid while the expert resident set is fixed,
     // and that is known only after the pool is attached. Must be called before finalize().
     void set_use_cuda_graph(bool enabled) noexcept;

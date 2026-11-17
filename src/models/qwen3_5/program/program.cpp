@@ -64,6 +64,12 @@ const runtime::KvResidencyStrides& SequencePlanner::residency_strides() const no
     return impl_ != nullptr ? impl_->residency_strides : empty;
 }
 
+std::size_t SequencePlanner::state_image_bytes() const noexcept {
+    return impl_ != nullptr && impl_->minimum != nullptr
+               ? impl_->minimum->persistent.state_images.host.image_bytes
+               : 0;
+}
+
 void SequencePlanner::set_use_cuda_graph(bool enabled) noexcept {
     if (impl_ == nullptr || impl_->minimum == nullptr) { return; }
     impl_->inputs.use_cuda_graph   = enabled;

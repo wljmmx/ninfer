@@ -7,7 +7,7 @@
 #include "core/expert_cache.h"
 #include "core/memory_budget.h"
 #include "core/startup.h"
-#include "runtime/engine/context_cache/joint_planning.h"
+#include "runtime/engine/context_capacity.h"
 #include "models/qwen3_5/execution/cpu_path_policy.h"
 #include "models/qwen3_5/execution/expert_prefetch.h"
 #include "models/qwen3_5/execution/expert_path_control.h"
@@ -671,29 +671,10 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     const std::uint64_t startup_headroom = options.startup_planning_headroom_bytes;
     const std::uint64_t device_cap =
         instance.expert_cache->capacity_bytes() + kv_reserve_bytes + startup_headroom;
-    // T156 (upstream 049d5fb4): the three device accounts - expert pool, KV pages and the
-    // transient workspace (the startup allowance carries it) - are quoted together. The
-    // planning model lives in context_cache/joint_planning.h; the model layer still owns the
-    // StateImage stride, so `state` reports zero here rather than an invented number. When
-    // NINFER_CONTEXT_JOINT_PLAN=1 the check is printed; a feasible=false means the three
-    // accounts cannot fit the cap and the ledger admission below will name the owner.
-    if (const char* joint = std::getenv("NINFER_CONTEXT_JOINT_PLAN");
-        joint != nullptr && *joint == '1') {
-        const auto budget = context_cache::plan_joint_capacity(
-            device_cap,
-            {.kv_bytes        = kv_reserve_bytes,
-             .state_bytes     = 0,
-             .workspace_bytes = startup_headroom},
-            0);
-        std::fprintf(stderr,
-                     "[joint] cap=%llu MiB kv=%llu MiB state=0(layout not exposed) "
-                     "workspace(headroom)=%llu MiB feasible=%d\n",
-                     static_cast<unsigned long long>(device_cap >> 20),
-                     static_cast<unsigned long long>(budget.kv_bytes >> 20),
-                     static_cast<unsigned long long>(budget.workspace_bytes >> 20),
-                     budget.feasible ? 1 : 0);
-        std::fflush(stderr);
-    }
+    // T156 (V10-01): the three device accounts are sized in the capacity path
+    // (`resolve_context_capacity`), where the sequence planner's StateImage stride is available
+    // before any allocation. Nothing is re-quoted here: a plan printed beside an allocation it did
+    // not shape is exactly how this item's `state=0(layout not exposed)` line survived.
     instance.ledger.set_cap(core::Tier::Device, device_cap);
     const auto admit = [&instance](core::Tier tier, const char* owner, std::uint64_t bytes) {
         if (instance.ledger.reserve(tier, owner, bytes)) { return true; }
@@ -1619,8 +1600,45 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
     const bool tiered_mode = kv_host_residency_requested(options) &&
                              strides.payload_bytes_per_resident_page_group != 0;
     const std::size_t residency_slack = tiered_mode ? kv_residency_slack_bytes() : 0;
-    const auto plan_kv_at             = [&](std::size_t budget) -> KvCapacityResolution {
+    // V10-01 (T156): the StateImage geometry already exists before the Program does - it is the
+    // planner's `PersistentLayout::state_images` - so the context pool's three ledgers are sized
+    // together here instead of being quoted after the allocation they did not shape. The anchor
+    // `capacity_curve` prices is the full minimum plan, which already contains the execution lanes'
+    // StateImages and every extra slot `--device-state-slots` names (planning/startup.cpp builds
+    // `state_image_slots = max_concurrency + extra`) plus its own workspace. Those slots are
+    // therefore the joint model's lane set, not a second charge, and the solver prices only slots
+    // beyond them. Nothing in this tree supplies a checkpoint interval, so the checkpoint target
+    // stays at the anchor's slot count; a real interval would also have to rebuild the sequence
+    // layout with the slots it wants, because that layout is what allocates them.
+    const std::size_t state_image_bytes    = planner.state_image_bytes();
+    const std::uint32_t anchor_state_slots = static_cast<std::uint32_t>(
+        static_cast<std::uint64_t>(options.max_concurrency) +
+        options.context_cache.device_state_slots.value_or(options.max_concurrency));
+    const ContextCapacityCurve joint_capacity_curve{
+        .kv                              = capacity_curve,
+        .minimum_state_slots             = anchor_state_slots,
+        .bytes_per_additional_state_slot = state_image_bytes,
+        .workspace_bytes                 = 0,
+        .control_bytes_per_page_group    = 0,
+        .control_bytes_per_state_slot    = 0,
+    };
+    // The anchor above already holds the configured extra slots, so the joint cache must not ask
+    // for them again. That also keeps the checkpoint target off (it needs a non-null slot count
+    // and a nonzero interval, neither of which this path has).
+    ContextCacheOptions joint_cache = options.context_cache;
+    joint_cache.device_state_slots.reset();
+    // Only automatic sizing is joint: a pinned capacity is the caller's number, and a model with
+    // no StateImage stride has nothing to price on the state account.
+    const bool joint_sizing =
+        options.kv_capacity.mode == KvCapacityMode::Automatic && state_image_bytes != 0;
+
+    const auto plan_kv_at = [&](std::size_t budget) -> KvCapacityResolution {
         if (!tiered_mode) {
+            if (joint_sizing) {
+                return resolve_context_capacity(options.kv_capacity, joint_cache,
+                                                joint_capacity_curve, budget,
+                                                /*checkpoint_interval=*/0);
+            }
             return resolve_kv_capacity(options.kv_capacity, capacity_curve, budget);
         }
         const std::size_t usable = budget > residency_slack ? budget - residency_slack : 0;
@@ -1930,8 +1948,17 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
         if (floor_pages >= resolution.main_page_groups) { throw; }
         const std::size_t planning_available =
             floor_reservation + options.kv_capacity.automatic_headroom_bytes;
+        // Same three ledgers as the first attempt: the recovery layouts the same artifact with the
+        // same slot count, so only the KV half of the curve moves.
+        ContextCapacityCurve recovery_joint = joint_capacity_curve;
+        recovery_joint.kv                   = recovery_curve;
         auto recovered = resolve_kv_capacity(options.kv_capacity, recovery_curve,
                                             planning_available);
+        if (joint_sizing) {
+            recovered = resolve_context_capacity(options.kv_capacity, joint_cache, recovery_joint,
+                                                 planning_available,
+                                                 /*checkpoint_interval=*/0);
+        }
         recovered.available_after_weights_bytes = resolution.available_after_weights_bytes;
         recovered.available_after_startup_bytes = resolution.available_after_startup_bytes;
         recovered.evict_contract_effective      = resolution.evict_contract_effective;
@@ -1950,43 +1977,50 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
     }
     device.synchronize();
     program.complete();
-    // T156 (upstream 049d5fb4): the state account, now with the layout in hand. Before the
-    // Program exists the recurrent state has no identity (its stride is a property of the built
-    // graph), which is why attach_expert_cache() could only report it as zero. Here the exact
-    // union is quoted: one StateImage per device state slot (the context cache normalizes the
-    // slot count to the concurrency when the option is unset, so the same rule is applied).
+    // T156 (V10-01): the sizing decision, reported where it was taken. The three ledgers are the
+    // ones the automatic path priced against one budget: page groups, the StateImages the anchor
+    // holds, and the workspace inside that anchor. It replaces a line that quoted a plan after the
+    // allocation it never shaped, with the state account hard-coded to zero.
+    if (const char* joint = std::getenv("NINFER_CONTEXT_JOINT_PLAN");
+        joint != nullptr && *joint == '1') {
+        const std::uint64_t state_bytes =
+            static_cast<std::uint64_t>(state_image_bytes) * anchor_state_slots;
+        constexpr std::uint64_t kMib = 1024ULL * 1024ULL;
+        std::fprintf(stderr,
+                     "[joint] sizing: auto=%d joint=%d pages=%u/%u reservation=%llu MiB | "
+                     "state=%llu MiB (%u slot(s) x %llu B, inside the anchor) | slack=%llu MiB\n",
+                     options.kv_capacity.mode == KvCapacityMode::Automatic ? 1 : 0,
+                     joint_sizing ? 1 : 0, resolution.main_page_groups,
+                     resolution.maximum_main_page_groups,
+                     static_cast<unsigned long long>(resolution.runtime_reservation_bytes / kMib),
+                     static_cast<unsigned long long>(state_bytes / kMib), anchor_state_slots,
+                     static_cast<unsigned long long>(state_image_bytes),
+                     static_cast<unsigned long long>(resolution.planned_slack_bytes / kMib));
+        std::fflush(stderr);
+    }
+    // T156 (upstream 049d5fb4): the verification, now that the layout is in hand. The stride the
+    // sizing used came from the same host layout this accessor reads (StateImageStore::image_bytes
+    // returns `device_->host_layout().image_bytes`), so the two must agree; the state bytes are
+    // part of the reservation above, not a second charge on top of it.
     if (const char* joint = std::getenv("NINFER_CONTEXT_JOINT_PLAN");
         joint != nullptr && *joint == '1') {
         const auto& geometry = instance->program->checkpoint_geometry();
-        // The context cache normalizes the extra-slot count to the concurrency when the option is
-        // unset (configuration.cpp prints the same expression), so the state account uses it too.
-        const std::uint64_t slots = std::max<std::uint64_t>(
-            1, options.context_cache.device_state_slots.value_or(options.max_concurrency));
-        const std::uint64_t state_bytes = geometry.state_image_bytes * slots;
-        const std::uint64_t kv_bytes    = instance->kv_capacity_resolution.runtime_reservation_bytes;
-        // A dense model has no routed pool at all (attach_expert_cache returns before creating one),
-        // so its account is zero rather than a dereference of an absent cache.
-        const std::uint64_t pool_cap    = instance->expert_cache != nullptr
-                                              ? instance->expert_cache->capacity_bytes()
-                                              : 0;
-        const std::uint64_t device_cap  = pool_cap + kv_bytes +
-                                          options.startup_planning_headroom_bytes;
-        const auto exact = context_cache::plan_joint_capacity(
-            device_cap,
-            {.kv_bytes        = kv_bytes,
-             .state_bytes     = state_bytes,
-             .workspace_bytes = options.startup_planning_headroom_bytes},
-            0);
+        // One StateImage per device slot: the lanes plus the extra slots the option names (the
+        // option is normalized to max_concurrency when unset).
+        const std::uint64_t lanes = options.max_concurrency;
+        const std::uint64_t slots =
+            lanes + options.context_cache.device_state_slots.value_or(lanes);
+        constexpr std::uint64_t kMib = 1024ULL * 1024ULL;
         std::fprintf(stderr,
-                     "[joint] exact: cap=%llu MiB kv=%llu MiB state=%llu MiB (%llu slot(s) x "
-                     "%llu B) workspace(headroom)=%llu MiB feasible=%d\n",
-                     static_cast<unsigned long long>(device_cap >> 20),
-                     static_cast<unsigned long long>(exact.kv_bytes >> 20),
-                     static_cast<unsigned long long>(exact.state_bytes >> 20),
+                     "[joint] exact: reservation=%llu MiB | state=%llu MiB (%llu slot(s) x %llu B) "
+                     "| stride planned=%llu B match=%d\n",
+                     static_cast<unsigned long long>(
+                         instance->kv_capacity_resolution.runtime_reservation_bytes / kMib),
+                     static_cast<unsigned long long>(geometry.state_image_bytes * slots / kMib),
                      static_cast<unsigned long long>(slots),
                      static_cast<unsigned long long>(geometry.state_image_bytes),
-                     static_cast<unsigned long long>(exact.workspace_bytes >> 20),
-                     exact.feasible ? 1 : 0);
+                     static_cast<unsigned long long>(state_image_bytes),
+                     geometry.state_image_bytes == state_image_bytes ? 1 : 0);
         std::fflush(stderr);
     }
     {

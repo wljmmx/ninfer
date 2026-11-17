@@ -78,12 +78,32 @@ struct ContextCapacityPlan {
 // discrete slot count could not use back to pages.
 //
 // `checkpoint_interval == 0` disables the checkpoint target. The function is a planning model: it
-// reserves nothing and mutates nothing. `resolve_kv_capacity` remains the page-only path for
-// callers that do not opt in (NINFER_CONTEXT_JOINT_PLAN).
+// reserves nothing and mutates nothing. `resolve_kv_capacity` remains the page-only path for a
+// pinned capacity and for any caller that has no StateImage geometry to price.
 [[nodiscard]] ContextCapacityPlan plan_context_capacity(const KvCapacityPolicy& policy,
                                                         const ContextCacheOptions& cache,
                                                         const ContextCapacityCurve& curve,
                                                         std::size_t available_runtime_bytes,
                                                         std::uint32_t checkpoint_interval);
+
+// The automatic-capacity entry: page groups and StateImage slots are sized against the same
+// budget, and the answer comes back in the page-only shape the rest of startup already consumes.
+//
+// `curve.kv.minimum_device_reservation_bytes` must be the anchor the sequence layout actually
+// builds, so a StateImage that anchor already holds belongs in `curve.minimum_state_slots`;
+// `cache.device_state_slots` is what is charged ON TOP of that anchor (the sequence layout already
+// adds the configured extra slots to its own slot count, so a caller wiring the configured value
+// must not pass it here as well). `checkpoint_interval` semantics match
+// `plan_context_capacity()`.
+//
+// A union the budget cannot hold throws `std::invalid_argument` naming the page groups and the
+// StateImage slots that did not fit - a refused load, not a plan printed beside an allocation it
+// did not shape. `planned_slack_bytes` is quoted against `available_runtime_bytes`, exactly as
+// `resolve_kv_capacity()` does.
+[[nodiscard]] KvCapacityResolution resolve_context_capacity(const KvCapacityPolicy& policy,
+                                                            const ContextCacheOptions& cache,
+                                                            const ContextCapacityCurve& curve,
+                                                            std::size_t available_runtime_bytes,
+                                                            std::uint32_t checkpoint_interval);
 
 } // namespace ninfer::runtime

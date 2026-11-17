@@ -62,7 +62,7 @@ Phase 8 收尾完成（T212 版本/接口/推送核对、T213 全量终验汇总
 |---|---|
 | T131 控制面 | ✅ 已完成（`7f2a754f`）：运行时三档模式 + 冻结策略下发 + `/control/*` + 控制台回显；真机 27B/35B 验收、双 PPL 门禁逐位 |
 | T156 state 精确账 | ✅ 已完成（`7031b174`）：Program 建成后报 `[joint] exact`（35B state=61 MiB / 27B state=146 MiB，feasible=1），两模型 PPL 不变 |
-| T156 联合 sizing 接线 | ⏸ 保留 v9.1：`plan_context_capacity` 仍未被 `resolve_kv_capacity` 调用，阻塞点＝StateImage stride 在 sizing 时不可得（需 models 层在建 Program 前暴露）。不做半成品接线 |
+| T156 联合 sizing 接线 | ✅ V10-01 闭环（2026-11-17）：阻塞点＝公共接口未暴露，几何本身在 Program 前就有（`PersistentLayout::state_images`）；新增 `SequencePlanner::state_image_bytes()`，自动容量改走 `resolve_context_capacity()` 并拒载不可行并集。详见 `v9-context-parity-register.md` 的 V10-01 节 |
 | T156 保留集选择 | ⏸ 保留 v9.1：`select_prefix_checkpoints` 接 `ResourceManager::victims`（策略变更，需 E9/PPL/regress） |
 | T191 转换链路 | ✅ 转换器 + GGUF 直转已落地并端到端验证（`ea0108c4`）；真实工件未完成下载（`R:\model\qwen4exp\UD-Q4_K_XL` 仅第 1 分片 10.9 MB，MTP 2.66 GiB 已完整） |
 | T192–T198 qwen4exp 运行时 | ⏸ 待工件：工件完整后按 v10 立项（见 `upstream-alignment.md` §3 的启动条件） |

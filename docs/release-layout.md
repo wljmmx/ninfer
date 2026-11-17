@@ -58,7 +58,7 @@ cannot be shipped silently.
 | Two run logs committed at the repository root (`ppl_e2.err`, `repack.err`) | **fixed**: removed |
 | Dashboard `engine_url` pointed at the example port 8080 | **fixed**: release ships `config.local.json` pointing at 11438 |
 | Qwen4Exp runtime (loading/program/vision/MTP) | **still open**: the artifact is not complete (`R:\model\qwen4exp\UD-Q4_K_XL` holds only shard 1 of 4); v9 T192–T198 |
-| Joint context sizing (`plan_context_capacity` not called by `resolve_kv_capacity`) | **still open**: the StateImage stride does not exist before the Program is built |
+| Joint context sizing (`plan_context_capacity` not called by `resolve_kv_capacity`) | **fixed** (V10-01): `SequencePlanner::state_image_bytes()` exposes the stride pre-Program, and the automatic path sizes page groups, StateImage slots and workspace through `resolve_context_capacity`; a union that does not fit refuses the load by name |
 | Prefix-checkpoint retention selection | **still open**: a policy change that needs its own gate |
 
 ## Verification the folder must pass before it is called a release

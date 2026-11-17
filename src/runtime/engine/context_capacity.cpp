@@ -121,7 +121,7 @@ ContextCapacityPlan plan_context_capacity(const KvCapacityPolicy& policy,
             total = curve.total_bytes(capacity);
         } catch (const std::overflow_error&) { total = std::numeric_limits<std::size_t>::max(); }
         throw std::invalid_argument(
-            "context capacity requires " + std::to_string(total) + " bytes (" +
+            "Engine runtime reservation requires " + std::to_string(total) + " bytes (" +
             std::to_string(capacity.primary_page_groups) + " page groups + " +
             std::to_string(capacity.device_state_slots) + " StateImage slots), but only " +
             std::to_string(budget) + " bytes are available after weights and headroom");
@@ -235,6 +235,31 @@ ContextCapacityPlan plan_context_capacity(const KvCapacityPolicy& policy,
     plan.available_bytes            = available_runtime_bytes;
     plan.planned_slack_bytes        = budget - plan.total_reservation_bytes;
     return plan;
+}
+
+KvCapacityResolution resolve_context_capacity(const KvCapacityPolicy& policy,
+                                              const ContextCacheOptions& cache,
+                                              const ContextCapacityCurve& curve,
+                                              std::size_t available_runtime_bytes,
+                                              std::uint32_t checkpoint_interval) {
+    // The joint plan is the decision; this only re-shapes it into the resolution the KV plan, the
+    // residency split and the ledger already read. `runtime_reservation_bytes` is the union, so a
+    // caller that finalizes the sequence plan with the same slot count gets the same bytes back
+    // (model_instance.cpp checks that equality after the Program is built).
+    const ContextCapacityPlan plan =
+        plan_context_capacity(policy, cache, curve, available_runtime_bytes, checkpoint_interval);
+    KvCapacityResolution out;
+    out.mode                                 = policy.mode;
+    out.main_page_groups                     = plan.capacity.primary_page_groups;
+    out.maximum_main_page_groups             = curve.kv.maximum_main_page_groups;
+    out.resolved_tokens                      = plan.resolved_tokens;
+    out.minimum_runtime_reservation_bytes    = curve.kv.minimum_device_reservation_bytes;
+    out.bytes_per_additional_main_page_group = curve.kv.bytes_per_additional_main_page_group;
+    out.runtime_reservation_bytes            = plan.total_reservation_bytes;
+    out.available_after_weights_bytes        = available_runtime_bytes;
+    out.automatic_headroom_bytes             = policy.automatic_headroom_bytes;
+    out.planned_slack_bytes = available_runtime_bytes - plan.total_reservation_bytes;
+    return out;
 }
 
 } // namespace ninfer::runtime
