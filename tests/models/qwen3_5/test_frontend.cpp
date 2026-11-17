@@ -2191,6 +2191,20 @@ int test_choice_thinking_control(const Frontend& frontend) {
     auto closed = session.commit_preview();
     failures += check(channel_text(closed, ninfer::OutputChannel::Content).empty(),
                       "choice thinking framing leaked into content");
+    // The control IS the framing close, so the matcher must be past its free-text prefix as soon as
+    // the control lands: a byte the constrained language cannot contain is a violation, not content.
+    // (The 27B artifact emits </think> after an injected control, so this is exactly the state the
+    // real run is in when it does that; if the prefix were still open, that byte would be legal.)
+    {
+        bool rejected = false;
+        try {
+            (void)session.preview_model(frontend.tokenize_text("z"), 512,
+                                        ninfer::FinishReason::OutputLimit);
+        } catch (const std::logic_error&) {
+            rejected = true;
+        }
+        failures += check(rejected, "control did not close the grammar's free-text prefix");
+    }
     // The 27B artifact answers an injected control by repeating the close framing itself before its
     // actual answer (measured: content became "</think>\n\nroute_answer"). That repetition is
     // swallowed once - it is the same framing, not content - and its trailing newlines with it.
