@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import http.client
+import os
 import socket
 import ssl
 import threading
@@ -14,6 +15,20 @@ from urllib.parse import urlsplit
 
 class HttpClientError(RuntimeError):
     pass
+
+
+def _aborted_by_local_close(error: BaseException) -> bool:
+    """True for the socket errors a local close produces under a blocked read.
+
+    Winsock wakes the reader with WSAECONNABORTED (10053) when another thread closes the socket;
+    WSAENOTSOCK (10038) covers the same situation once the descriptor is already gone. These are
+    only treated as cancellation when the caller has also requested it (checked at the call site),
+    so a peer-side abort still surfaces as a transport error.
+    """
+    if not isinstance(error, OSError):
+        return False
+    codes = {getattr(error, "winerror", None), error.errno}
+    return bool(codes & {10038, 10053})
 
 
 class _StreamingResponse(http.client.HTTPResponse):
@@ -108,13 +123,29 @@ class PreparedExchange:
             if transport is not None:
                 # HTTPConnection drops its `sock` reference for a will-close response after
                 # getresponse(), while HTTPResponse keeps reading from the same transport.  Keep
-                # and shut down that exact preconnected socket so cancellation wakes either
+                # and tear down that exact preconnected socket so cancellation wakes either
                 # getresponse() or response.read1().
                 try:
                     transport.shutdown(socket.SHUT_RDWR)
                     self._shutdown = True
                 except OSError:
                     pass
+                if os.name == "nt":
+                    # Winsock does not wake a recv() blocked in another thread on shutdown (measured
+                    # on this host: the reader stays blocked), and socket.close() defers the real
+                    # closesocket while a makefile() object holds a reference. _real_close() is the
+                    # C-level close that actually aborts the blocked call; the reader then sees
+                    # WSAECONNABORTED (10053) or WSAENOTSOCK (10038).
+                    try:
+                        transport.close()
+                        real_close = getattr(transport, "_real_close", None)
+                        if real_close is not None:
+                            real_close()
+                        else:
+                            transport.close()
+                        self._shutdown = True
+                    except OSError:
+                        pass
         return self._cancel_ns
 
     def execute(
@@ -194,6 +225,7 @@ class PreparedExchange:
                     or (response is None and isinstance(error, http.client.RemoteDisconnected))
                     or (response is not None and isinstance(error, http.client.IncompleteRead))
                     or isinstance(error, ssl.SSLEOFError)
+                    or _aborted_by_local_close(error)
                 )
             )
             result.cancelled = shutdown_error
