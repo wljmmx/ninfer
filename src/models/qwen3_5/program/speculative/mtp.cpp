@@ -3,6 +3,7 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/execution_context.h"
 #include "core/nvtx.h"
+#include "core/transfer.h"
 #include "ninfer/ops/mtp_round.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/scalar.h"
@@ -36,9 +37,9 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
     Tensor logits             = state.execution.io.logits.slice(1, 0, 1);
     Tensor draft0             = state.execution.io.mtp->draft_tokens.slice(0, 0, 1);
     Tensor rope_position_view = state.execution.work.alloc(DType::I32, {1, 3});
-    CUDA_CHECK(cudaMemcpyAsync(rope_position_view.data, rope_position.data(),
-                               rope_position.size_bytes(), cudaMemcpyHostToDevice,
-                               state.execution.device.stream));
+    // V10-12: direction named at the call site.
+    core::copy_bytes(rope_position_view.data, rope_position.data(), rope_position.size_bytes(),
+                     core::TransferDirection::HostToDevice, state.execution.device.stream);
     const auto bridge_visible = static_cast<std::uint32_t>(position + 1);
     const ops::CausalAttentionExecutionEnvelope bridge_envelope{bridge_visible, bridge_visible};
     card.mtp_forward_batch(next_token, previous_hidden, position_view, bridge_envelope, mtp_hidden,
@@ -94,9 +95,10 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         // per-phase workspace footprint the capture was sized for.
         const bool round = phase == SpeculativePhase::Round;
         if (phase == SpeculativePhase::Forward || round) {
-            CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
-                                       sizeof(qwen3_5::MtpDecodeIngress), cudaMemcpyHostToDevice,
-                                       state.execution.device.stream));
+            core::copy_bytes(frame.ingress.data, &state.host_ingress,
+                             sizeof(qwen3_5::MtpDecodeIngress),
+                             core::TransferDirection::HostToDevice,
+                             state.execution.device.stream);
         }
 
         TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
@@ -218,9 +220,9 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                 for (std::int32_t column = 0; column < width; ++column) {
                     const Tensor logit_column =
                         target_logits.slice(1, column, 1).slice(2, 0, 1).view({vocab});
-                    CUDA_CHECK(cudaMemcpyAsync(raw.data(), logit_column.data,
-                                               raw.size() * sizeof(std::uint16_t),
-                                               cudaMemcpyDeviceToHost, s));
+                    core::copy_bytes(raw.data(), logit_column.data,
+                                     raw.size() * sizeof(std::uint16_t),
+                                     core::TransferDirection::DeviceToHost, s);
                     CUDA_CHECK(cudaStreamSynchronize(s));
                     float top1 = -1e30F, top2 = -1e30F;
                     std::int32_t best = 0;
@@ -328,15 +330,15 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                               proposal_mask, static_cast<std::int32_t>(step) + 1,
                                               static_cast<std::int32_t>(k + 1) *
                                                   proposal_mask.stride);
-                CUDA_CHECK(cudaMemcpyAsync(ar_hidden.data, next_hidden.data, ar_hidden.bytes(),
-                                           cudaMemcpyDeviceToDevice,
-                                           state.execution.device.stream));
+                core::copy_bytes(ar_hidden.data, next_hidden.data, ar_hidden.bytes(),
+                                 core::TransferDirection::DeviceToDevice,
+                                 state.execution.device.stream);
             }
         }
 
-        CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
-                                   sizeof(qwen3_5::MtpDecodeEgress), cudaMemcpyDeviceToHost,
-                                   state.execution.device.stream));
+        core::copy_bytes(&state.host_egress, frame.egress.data,
+                         sizeof(qwen3_5::MtpDecodeEgress),
+                         core::TransferDirection::DeviceToHost, state.execution.device.stream);
     };
 }
 

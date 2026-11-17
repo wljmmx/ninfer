@@ -6,6 +6,7 @@
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "core/nvtx.h"
 #include "core/device.h"
+#include "core/transfer.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scatter.h"
@@ -31,9 +32,10 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
         }
 
         qwen3_5::OrdinaryDecodeState& ordinary = state.frame;
-        CUDA_CHECK(cudaMemcpyAsync(ordinary.ingress.data, &state.host_ingress,
-                                   sizeof(qwen3_5::OrdinaryDecodeIngress), cudaMemcpyHostToDevice,
-                                   state.execution.device.stream));
+        // V10-12: direction named at the call site.
+        core::copy_bytes(ordinary.ingress.data, &state.host_ingress,
+                         sizeof(qwen3_5::OrdinaryDecodeIngress),
+                         core::TransferDirection::HostToDevice, state.execution.device.stream);
 
         TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                          {}, state.execution.linear_attention, state.execution.io,
@@ -63,9 +65,9 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                     dimension(state.execution.parameters.model.resources().public_token_count),
                     ordinary.sampling, cache_positions, ops::kSamplePurposeDecode,
                     state.execution.work, state.execution.device.stream);
-        CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, ordinary.egress.data,
-                                   sizeof(qwen3_5::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,
-                                   state.execution.device.stream));
+        core::copy_bytes(&state.host_egress, ordinary.egress.data,
+                         sizeof(qwen3_5::OrdinaryDecodeEgress),
+                         core::TransferDirection::DeviceToHost, state.execution.device.stream);
     };
 }
 
@@ -108,9 +110,8 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
     request.sampling_host.token_counts =
         penalties ? static_cast<std::int32_t*>(counts.data) : nullptr;
     Tensor config_lane = sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1);
-    CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &request.sampling_host,
-                               sizeof(request.sampling_host), cudaMemcpyHostToDevice,
-                               device.stream));
+    core::copy_bytes(config_lane.data, &request.sampling_host, sizeof(request.sampling_host),
+                     core::TransferDirection::HostToDevice, device.stream);
 }
 
 void ProgramImpl::copy_tail(SequenceState& sequence, const Tensor& source) {
@@ -120,14 +121,14 @@ void ProgramImpl::copy_tail(SequenceState& sequence, const Tensor& source) {
         source.ne[1] != 1) {
         throw std::logic_error("target tail hidden has an invalid shape");
     }
-    CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, source.data, sequence.tail_hidden.bytes(),
-                               cudaMemcpyDeviceToDevice, device.stream));
+    core::copy_bytes(sequence.tail_hidden.data, source.data, sequence.tail_hidden.bytes(),
+                     core::TransferDirection::DeviceToDevice, device.stream);
     sequence.tail_hidden_valid = true;
 }
 
 void ProgramImpl::copy_round_token() {
-    CUDA_CHECK(cudaMemcpyAsync(host_tokens, io.token.data, sizeof(TokenId), cudaMemcpyDeviceToHost,
-                               device.stream));
+    core::copy_bytes(host_tokens, io.token.data, sizeof(TokenId),
+                     core::TransferDirection::DeviceToHost, device.stream);
 }
 
 void ProgramImpl::mark_workspace_usage(std::size_t phase_bytes) noexcept {
@@ -191,9 +192,9 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
     }
 
     qwen3_5::DFlashDecodeState& frame = *io.dflash_decode;
-    CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, dflash_host_ingress,
-                               sizeof(qwen3_5::DFlashDecodeIngress), cudaMemcpyHostToDevice,
-                               device.stream));
+    core::copy_bytes(frame.ingress.data, dflash_host_ingress,
+                     sizeof(qwen3_5::DFlashDecodeIngress),
+                     core::TransferDirection::HostToDevice, device.stream);
     const auto batch                = static_cast<std::int32_t>(lanes.size());
     Tensor active_lane_tensor       = frame.active_lanes.slice(0, 0, batch);
     Tensor state_destination_tensor = frame.state_destination_slots.slice(0, 0, batch);
@@ -669,7 +670,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
                                  double(request.sampling_host.temperature),
                                  int(request.sampling_host.top_k),
                                  double(request.sampling_host.top_p),
-                                 mtp_host_ingress->sampling[row].mask);
+                                 mtp_host_ingress->sampling[row].mask.words);
                     std::fflush(stderr);
                 }
             }
@@ -899,7 +900,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                                  sequence.rope_delta, double(request.sampling_host.temperature),
                                  int(request.sampling_host.top_k),
                                  double(request.sampling_host.top_p),
-                                 dflash_host_ingress->sampling[row].mask);
+                                 dflash_host_ingress->sampling[row].mask.words);
                     std::fflush(stderr);
                 }
             }

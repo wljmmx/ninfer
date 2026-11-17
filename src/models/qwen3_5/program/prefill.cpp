@@ -4,6 +4,7 @@
 #include "models/qwen3_5/execution/shape_class.h"
 #include "models/qwen3_5/execution/linear.h"
 #include "core/device.h"
+#include "core/transfer.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scalar.h"
@@ -40,9 +41,11 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
                 .state_destination_slot = state.state_destination_slot,
                 .full_kv_table_row      = state.dflash_kv_table_row,
             };
-            CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, state.dflash_prefill_host_ingress,
-                                       sizeof(qwen3_5::DFlashPrefillIngress),
-                                       cudaMemcpyHostToDevice, state.execution.device.stream));
+            // V10-12: the direction is an argument, not a cudaMemcpyKind to decode.
+            core::copy_bytes(frame.ingress.data, state.dflash_prefill_host_ingress,
+                             sizeof(qwen3_5::DFlashPrefillIngress),
+                             core::TransferDirection::HostToDevice,
+                             state.execution.device.stream);
             const auto exact = static_cast<std::uint32_t>(features.ne[1]);
             dflash_append_context(state, features, positions, frame.append_count,
                                   frame.state_destination_slot, frame.full_kv_table_row,
@@ -151,8 +154,8 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
 
     Tensor bridge_token = state.execution.io.mtp->target_input_ids.slice(0, 0, 1);
     const TokenId token = prompt.token_ids[state.text_kv_base];
-    CUDA_CHECK(cudaMemcpyAsync(bridge_token.data, &token, sizeof(token), cudaMemcpyHostToDevice,
-                               state.execution.device.stream));
+    core::copy_bytes(bridge_token.data, &token, sizeof(token),
+                     core::TransferDirection::HostToDevice, state.execution.device.stream);
 
     Tensor visual_embedding;
     const Tensor* composed_embedding = nullptr;
@@ -189,9 +192,9 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
     Tensor logits = state.execution.io.logits.slice(1, 0, 1);
     project(hidden, state.execution.parameters.text.output_head, logits, state.execution.work,
             state.execution.device.stream);
-    CUDA_CHECK(cudaMemcpyAsync(state.execution.io.pos.data, &absolute_position,
-                               sizeof(absolute_position), cudaMemcpyHostToDevice,
-                               state.execution.device.stream));
+    core::copy_bytes(state.execution.io.pos.data, &absolute_position,
+                     sizeof(absolute_position), core::TransferDirection::HostToDevice,
+                     state.execution.device.stream);
     ops::sample(logits, state.execution.io.token,
                 dimension(state.execution.parameters.model.resources().public_token_count),
                 state.sampling, state.execution.io.pos, purpose, state.execution.work,
@@ -242,8 +245,8 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle handle,
         config             = requests[lane].sampling_host;
         config.mask        = fill_grammar_mask(masks, 0, {});
         Tensor config_lane = sampling_config.slice(1, static_cast<std::int32_t>(lane), 1);
-        CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &config, sizeof(config),
-                                   cudaMemcpyHostToDevice, device.stream));
+        core::copy_bytes(config_lane.data, &config, sizeof(config),
+                         core::TransferDirection::HostToDevice, device.stream);
     }
     auto progress = wrap_prefill(lane, advance_prefill_raw(lane, timing));
     if (!progress.complete) { settle_unit(lane); }
@@ -772,9 +775,9 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             } else {
                 throw std::logic_error("partial speculative commit has no target frame");
             }
-            CUDA_CHECK(cudaMemcpyAsync(selector_tensor.data, hidden_selectors.data(),
-                                       lanes.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice,
-                                       device.stream));
+            core::copy_bytes(selector_tensor.data, hidden_selectors.data(),
+                             lanes.size() * sizeof(std::int32_t),
+                             core::TransferDirection::HostToDevice, device.stream);
             ops::speculative_select_accepted_hidden(hidden, selector_tensor, selected,
                                                     device.stream);
             ops::scatter(selected, destinations, state_images->continuation_hidden_store(),
@@ -943,8 +946,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             } else {
                 Tensor bridge_token = io.mtp->target_input_ids.slice(0, 0, 1);
                 const TokenId token = staged.prompt.token_ids[staged.base];
-                CUDA_CHECK(cudaMemcpyAsync(bridge_token.data, &token, sizeof(token),
-                                           cudaMemcpyHostToDevice, device.stream));
+                core::copy_bytes(bridge_token.data, &token, sizeof(token),
+                                 core::TransferDirection::HostToDevice, device.stream);
                 execution::mtp_bridge_and_propose(schedule_state, bridge_token, previous_hidden,
                                                   bridge.position, bridge.rope_position, false);
             }
@@ -1112,9 +1115,9 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         copy_round_token();
         std::array<TokenId, qwen3_5::kMtpDecodeMaximumDrafts> initial_drafts{};
         if (staged.prepare_mtp && staged.initial_mtp_extent != 0) {
-            CUDA_CHECK(cudaMemcpyAsync(initial_drafts.data(), io.mtp->draft_tokens.data,
-                                       staged.initial_mtp_extent * sizeof(TokenId),
-                                       cudaMemcpyDeviceToHost, device.stream));
+            core::copy_bytes(initial_drafts.data(), io.mtp->draft_tokens.data,
+                             staged.initial_mtp_extent * sizeof(TokenId),
+                             core::TransferDirection::DeviceToHost, device.stream);
         }
         timing.begin_wait();
         device.synchronize();
