@@ -131,8 +131,8 @@ MTP experts Block-FP8 A8；GDN/QSA 大投影 Q8 A16；PLE 表 NF4。
 |---|---|
 | 台账 | `docs/maintainer/upstream-dispositions.tsv` |
 | 列 | `commit`（8 位短哈希）/ `date`（`%ad --date=short`）/ `subject`（原样，去制表符，超 120 字符截断并以 `...` 结尾）/ `class` / `evidence` / `note`；UTF-8 无 BOM、制表符分隔、首行表头 |
-| 行数 | **1565**，与 `git rev-list upstream/master` 逐条对应（无重复、无遗漏）；2026-11-16 销账只改 44 行的 class，行数不变 |
-| 分级（2026-11-16 销账后） | absorbed **1313** / dead **155** / deferred **23** / na-arch **62** / na-doc **9** / na-hardware **2** / todo **1**（销账前：1306 / 151 / 0 / 62 / 0 / 2 / 35 + needs-review 9，见 §9） |
+| 行数 | **1629**（2026-11-17 实测，与 `git rev-list upstream/master` 逐条对应的口径不变；2026-11-16 记为 1565，其后上游新增提交逐条补行） |
+| 分级（2026-11-17 T192–T198 销账后） | absorbed **1319** / equivalent **12** / dead **170** / deferred **26** / na-arch **76** / na-doc **12** / na-hardware **13** / todo **1**（台账当前 1629 行；2026-11-16 销账后为 1313 / 155 / 23 / 62 / 9 / 2 / 1，见 §9） |
 | 生成方式 | 先 `git log upstream/master --format="%h%x09%ad%x09%s" --date=short` 取全量行，再按 §7.2 规则表顺序匹配、先命中先用地打级；证据列只引用下列文档或本地提交号，不自造哈希 |
 | 报告脚本 | `powershell -NoProfile -ExecutionPolicy Bypass -File tools/upstream/alignment_report.ps1` |
 
@@ -149,6 +149,7 @@ MTP experts Block-FP8 A8；GDN/QSA 大投影 Q8 A16；PLE 表 NF4。
 | class | 判据 | 台账里的落级来源 |
 |---|---|---|
 | absorbed | 内容已在本地树内，或已有对表记录 | `cc3938c9`（2026-10-09 合并上游至 `81c8ce09`，1197 条）、本地提交 message 里的 `[upstream <hash>]`（移植或对表登记）、v9 各 register 判「搬入 / 跟随 / 等价」的条目 |
+| equivalent | **上游能力在本地由不同结构承担**：行为等价、对象不同（例如上游 models/common + qwen4_exp/session 层，在本机单体树里由 qwen3_5 program/engine 承担）；note 必须写清本地承载点 | 2026-11-17 新增：qwen4_exp 运行时 15 条里 12 条（§9） |
 | na-arch | sm_89 指令集上不成立 | 按 §2 的逐类判定：MXFP8 / NVFP4 / Block-FP8 / TMA / cluster / A16 / EP / CSF / MLA / kpool / A8-FFN |
 | na-hardware | 只有 sm_120a（RTX 5090）才有的对象 | §6.1 |
 | dead | 判死不吸收 | T001 封口池（Spark 96 / GLM 18 / TP2 18）、T013/T108（FP4-Local），以及 register 明写「不搬入 / 不跟随」的条目 |

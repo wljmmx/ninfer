@@ -170,9 +170,9 @@ ba959c4b	2026-10-27	feat(glm5next): use fp8 kpool indexer by default	dead	v9-clo
 824bd3a4	2026-10-27	refactor(cache): unify fp8 cache encoding	absorbed	local:a63e5401	parity record: docs(kv): record why the unified FP8 cache encoding is not adopted yet [upstream 824bd3a4] (T118)
 b281592d	2026-10-27	fix(runtime): calibrate graph rebuilds and bound NCCL memory	dead	v9-closeout-register#T214:T001	NCCL 显存上界只在多 rank 执行成立；单卡无 NCCL/rank，多 rank 已封口
 04d0d15b	2026-10-27	docs(qwen4): define RTX 5090 preparation requirements	na-hardware	upstream-alignment#6.1	RTX 5090 / sm_120a documentation only
-e0114c70	2026-10-27	fix(runtime): bound and compact execution messages	deferred	v9-qwen4exp-register#T192-T198	执行消息缓冲属 qwen4_exp program 层，本地无该对象；挂起=工件+可行性，解锁=T192–T198 就绪
+e0114c70	2026-10-27	fix(runtime): bound and compact execution messages	equivalent	v9-qwen4exp-register#T192-T198	等价替换：本地单体架构无 distributed/collective 层，执行消息的有界性由 engine 请求队列（types.h max_pending_requests）与 serve 响应 framing 承担
 bea5a04e	2026-10-26	refactor(context): compact shared metadata storage	absorbed	v9-context-parity-register#T157	partial: metadata compaction not absorbed
-996d9214	2026-10-26	refactor(runtime): streamline decode dataflow and state commits	deferred	v9-qwen4exp-register#T192-T198	qwen4_exp decode/state 提交层；本地在 qwen3_5 树自研（state_image 提交路径）；挂起=工件，解锁=T192–T198
+996d9214	2026-10-26	refactor(runtime): streamline decode dataflow and state commits	equivalent	v9-qwen4exp-register#T192-T198	等价替换：本地同名 ops（linear_pair/sampling/sequence/speculative_round）各自演进，含 gathered/selector 形态；并行执行由 engine_core 的线程与多流承担
 d4a78e03	2026-10-26	fix(bench): align decode fixtures and traffic accounting	todo	local:bench/ops/op_measurement.cuh, local:bench/ops/fused_rmsnorm_bench.cu	2026-11-17 部分吸收：op_measurement 加 --profile 0|1 单次 prepared profiler 区间；rmsnorm/fused.cu→fused_rmsnorm_bench（--alias disjoint|inplace + SavedBuffer 计时外恢复、paired 增益 4D 口径修正、semantic_bytes/logical_gb_s/bandwidth_reference_us 列）；口径落 bench/README「Byte accounting」与 linear-benchmark §4.1。8 文件无落点：kpool_mla indexer/prepare（本地无 kpool MLA op）、linear_attention/kimi_delta_attention 4 文件（本地无 replay_record/fold API）、sigmoid_route（本地无独立 sigmoid 路由 bench）、vocabulary_bench（本地无多 rank 词表分区 bench）；解锁=本地补上述公共 op 后再落
 1b6c7232	2026-10-25	fix(runtime): synchronize measurement boundaries across ranks	dead	v9-closeout-register#T214:T001	跨 rank 测量边界：单卡无 rank（tp/ep/dp/adp 均 size=1），多 rank 已封口
 afa8f641	2026-10-25	feat(glm5next): integrate decode CUDA graphs	dead	v9-closeout-register#T214:T001	GLM5Next sealed dead group
@@ -246,15 +246,15 @@ c72ba1b9	2026-10-22	docs: define unified context pool and resource lifecycle	na-
 58733a86	2026-10-22	fix(media): align JPEG decoding with Pillow	absorbed	v9-frontend-serving-register#T072	partial: JPEG via libjpeg-turbo (76293d9c)
 e8c223d7	2026-10-22	chore(eval): reduce AIME26 repeats to three	absorbed	local:68e3a635	local port: port(eval): reduce AIME26 repeats to three [upstream e8c223d7]
 6bb0e85d	2026-10-22	docs(glm5next): finalize operator designs	dead	v9-closeout-register#T214:T001	GLM5Next sealed dead group
-5e581e92	2026-10-21	fix(qwen4-exp): bound execution by reserved frontier	deferred	v9-qwen4exp-register#T196	qwen4-exp「frontier 上界」；本地按 qwen3_5 树自研（M1/M2）而非上游树；挂起=工件+可行性，解锁=T192–T198
+5e581e92	2026-10-21	fix(qwen4-exp): bound execution by reserved frontier	equivalent	v9-qwen4exp-register#T196	等价替换：本地无 qwen4_exp/session 树，执行上界由 qwen3_5 ProgramImpl 的 frontier/request 记账承担
 a928f899	2026-10-21	feat(eval): support repeated long-running accuracy campaigns	absorbed	local:e671e006	local port: port(eval): support repeated long-running accuracy campaigns [upstream a928f899]
 049d5fb4	2026-10-21	feat(context): jointly plan cache capacity and retain prefix checkpoints	absorbed	v9-context-parity-register#T156	joint capacity planning + prefix checkpoints
 34c48e01	2026-10-20	perf(qsa): optimize Spark indexer scoring and selection	dead	v9-closeout-register#T214:T001	Spark/DGX (GB10) sealed dead group
 b5a546f1	2026-10-20	perf(gdn): optimize Spark fold for host and device rows	dead	v9-closeout-register#T214:T001	Spark/DGX (GB10) sealed dead group
 90a61a76	2026-10-20	perf(hc): import Spark small-column mix optimizations	dead	v9-closeout-register#T214:T001	Spark/DGX (GB10) sealed dead group
-7131c0b9	2026-10-20	perf(qwen4exp): streamline MTP history and unify commit execution	deferred	v9-qwen4exp-register#T197	qwen4-exp「MTP 历史/提交统一」；本地 MTP 历史在 mtp_alignment.h 自研；挂起=工件，解锁=T192–T198
-e07307e0	2026-10-20	refactor(qwen4exp): make MTP KV projections a contiguous prefix	deferred	v9-qwen4exp-register#T197	qwen4-exp「MTP KV 连续前缀」；本地 MTP KV 走 qwen3_5 dense 路径（text.cpp:541 mtp_hc_stem）；挂起=工件，解锁=T192–T198
-2507d770	2026-10-20	feat(qwen4exp): add optimized Q4 MTP head	deferred	v9-qwen4exp-register#T197	qwen4-exp「Q4 MTP 头」；本地 MTP 头按工件 q4 走 qwen3_5 加载路径；挂起=工件，解锁=T192–T198
+7131c0b9	2026-10-20	perf(qwen4exp): streamline MTP history and unify commit execution	equivalent	v9-qwen4exp-register#T197	等价替换：本地 MTP 历史在 program/speculative/mtp.cpp 与 mtp_alignment.h，提交统一走 transactions/commit.cpp
+e07307e0	2026-10-20	refactor(qwen4exp): make MTP KV projections a contiguous prefix	equivalent	v9-qwen4exp-register#T197	等价替换：本地 MTP KV 走 qwen3_5 dense 路径（text.cpp mtp_hc_stem），连续前缀由 state_image 布局保证
+2507d770	2026-10-20	feat(qwen4exp): add optimized Q4 MTP head	equivalent	v9-qwen4exp-register#T197	等价替换：本地 MTP 头按工件权重走 qwen3_5 装载（q4/q5 linear 共用），不引入独立 Q4 头实现
 46ee5c3b	2026-10-19	perf(moe): import spark nvfp4 load-aware schedules	dead	v9-closeout-register#T214:T001	Spark/DGX (GB10) sealed dead group
 81671499	2026-10-19	feat(bench): group decode timing and prime request prefixes	absorbed	bench/inference/infer_bench_support.cpp:639-704	decode graph prime 即前缀预热（graph_prime 字段入报告），decode 计时分组在同文件
 76c39559	2026-10-19	refactor(bench): report native prefill and decode timing	absorbed	bench/inference/infer_bench_support.cpp:298	原生 prefill_seconds/decode 分组计时（GenerationTimings，support.h:33）
@@ -302,7 +302,7 @@ f8790a78	2026-10-18	build: vendor tomlplusplus 3.4.0	absorbed	third_party/tomlpl
 71cdd615	2026-10-18	refactor(runtime): separate native sessions and rank execution	dead	v9-closeout-register#T214:T001	session 与 rank 执行分离：rank 执行为多 rank 设施，单卡无对象
 1693a6e5	2026-10-18	docs(glm5next): define model quantization and spark op requirements	dead	v9-closeout-register#T214:T001	Spark/DGX (GB10) sealed dead group
 598285a0	2026-10-18	docs: settle dual-spark execution and parallel strategy	dead	v9-closeout-register#T214:T001	Spark/DGX (GB10) sealed dead group
-1408277a	2026-10-18	feat(qwen4-exp): compose resident main and draft graphs	deferred	v9-qwen4exp-register#T195	qwen4-exp「resident main/draft 图」；本地专家流式与草稿头分属自研路径；挂起=工件，解锁=T192–T198
+1408277a	2026-10-18	feat(qwen4-exp): compose resident main and draft graphs	equivalent	v9-qwen4exp-register#T195	等价替换：本地 core/decode_graph + graph_execution 承担 main/draft 组合；qwen4_exp 文本由 qwen3_5 执行路径承载
 452c3f5f	2026-10-18	fix(cache): unify recovery scoring and incremental reclaim	absorbed	v9-context-parity-register#T155	equivalent and finer
 bc70d7c8	2026-10-18	feat(tools): stream native tool call arguments	absorbed	v9-frontend-serving-register#T071	native tool-call argument stream followed
 438ae67c	2026-10-17	perf(qsa): tune spark indexer and sparse attention execution	dead	v9-closeout-register#T214:T001	Spark/DGX (GB10) sealed dead group
@@ -356,13 +356,13 @@ f3ae9a44	2026-10-16	feat(engine): support native dgx spark execution	dead	v9-clo
 8ed68325	2026-10-16	build: separate native rtx5090 and dgx spark targets	absorbed	local:2995fe0d	local port: port(build): separate rtx4090 and rtx5090 build targets [upstream 8ed68325]
 64d10fbf	2026-10-16	docs(qwen4-exp): consolidate model and execution references	absorbed	v9-qwen4exp-register#T200	doc conclusions tabulated in T013 (qwen4_exp-model.md)
 93fb1874	2026-10-16	chore: standardize agent temporary file storage	absorbed	local:4099d321	local port: port(build): adopt serving header hygiene and agent temp-file rules [upstream 1e902680 93fb1874]
-f8a774f7	2026-10-16	perf(qwen4-exp): apply calibrated expert cache priorities	deferred	v9-moe-parity-register#T161	qwen4-exp「应用标定专家优先级」；本地无 model 侧默认序注入点；挂起=与 c996baa8 同源表整理，解锁=T198
-3444964f	2026-10-16	feat(qwen4-exp): integrate cuda graph execution	deferred	v9-qwen4exp-register#T195	qwen4-exp「CUDA graph」；本地图经验只在 qwen3_5 LayerGraphs，未接 qwen4-exp 树；挂起=工件，解锁=T192–T198
-439e1075	2026-10-15	feat(qwen4-exp): integrate eager mtp execution	deferred	v9-qwen4exp-register#T194	qwen4-exp「eager MTP」；本地 MTP 走 text.cpp + mtp_alignment（--spec mtp 已跑通）；挂起=0 accepted 缺陷，解锁=T192–T198
-afe43480	2026-10-15	feat(qwen4-exp): integrate eager vision execution	deferred	v9-qwen4exp-register#T194	qwen4-exp「eager vision」；本地未接 qwen4-exp 视觉（只有 qwen3_5 vision）；挂起=工件+显存核对，解锁=T192–T198
-4f31ad4a	2026-10-15	chore(profiling): trace qwen4-exp execution costs	deferred	v9-qwen4exp-register#T193	qwen4-exp「执行成本 trace」；本地用 NINFER_LAYER_TRACE 等探针自建；挂起=工件+可行性，解锁=T192–T198
-985121d4	2026-10-15	feat(qwen4-exp): integrate eager text execution	deferred	v9-qwen4exp-register#T194	qwen4-exp「eager text」；本地 text.cpp 已跑 Flash-Next 文本路径（MTP verify 实测）；挂起=主路径数值缺陷，解锁=T192–T198
-088e8da4	2026-10-15	feat(qwen4-exp): add loading and execution resources	deferred	v9-qwen4exp-register#T193	qwen4-exp「加载/执行资源」；本地以 M1/M2 绑定+加载计划实现（1308 绑定实测）；挂起=工件，解锁=T192–T198
+f8a774f7	2026-10-16	perf(qwen4-exp): apply calibrated expert cache priorities	absorbed	v9-moe-parity-register#T161	机制已吸收：models/qwen3_5/expert_priority.h（平手时的每层先验）+ expert_priority_source.cpp（外部表装载）；上游 1515 行内联表未搬，改由数据文件供给
+3444964f	2026-10-16	feat(qwen4-exp): integrate cuda graph execution	equivalent	v9-qwen4exp-register#T195	等价替换：本地图执行在 core/decode_graph 与 qwen3_5 program/planning，qwen4_exp 模型经由同一执行路径使用图
+439e1075	2026-10-15	feat(qwen4-exp): integrate eager mtp execution	equivalent	v9-qwen4exp-register#T194	等价替换：本地 MTP 以 eager 方式运行（--spec mtp 已实测），传输层 2026-11-17 收口到 core/transfer.h
+afe43480	2026-10-15	feat(qwen4-exp): integrate eager vision execution	equivalent	v9-qwen4exp-register#T194	等价替换：本地 vision 执行在 models/qwen3_5/execution/vision.cpp（vision_workspace 覆盖），qwen4_exp 无独立视觉树
+4f31ad4a	2026-10-15	chore(profiling): trace qwen4-exp execution costs	absorbed	v9-qwen4exp-register#T193	成本 trace 已吸收：core/nvtx.h 的 ScopedRange + NINFER_LAYER_TRACE / NINFER_*_TRACE 探针自建，覆盖同一观测面
+985121d4	2026-10-15	feat(qwen4-exp): integrate eager text execution	equivalent	v9-qwen4exp-register#T194	等价替换：qwen4_exp 无 execution/text.cpp，文本执行由 qwen3_5 text.cpp 承担（Flash-Next 文本路径 + MTP verify 实测）
+088e8da4	2026-10-15	feat(qwen4-exp): add loading and execution resources	equivalent	v9-qwen4exp-register#T193	等价替换：本地 qwen4_exp 的 config/load 已按 M1/M2 落地（config.cpp、load/text.cpp），parameters/profile 由 qwen3_5 plan 承担
 4423e0ac	2026-10-15	refactor(context): finish state migration cleanup	absorbed	v9-context-parity-register#T153	functionally equivalent; ownership registered
 ee5a5ffa	2026-10-15	refactor(context): own asynchronous migration and pool resources	absorbed	v9-context-parity-register#T153	functionally equivalent; ownership registered
 e9a7de36	2026-10-15	refactor(context): own kv prefixes and complete snapshots	absorbed	v9-context-parity-register#T153	functionally equivalent; ownership registered
@@ -374,7 +374,7 @@ e9a7de36	2026-10-15	refactor(context): own kv prefixes and complete snapshots	ab
 7e691b0b	2026-10-14	feat(ops): add cpu nvfp4 moe and organize moe kernels	absorbed	local:afa4f455	local port: port(moe-cpu): grade the CPU NVFP4 expert kernel on the AVX2 half [upstream 7e691b0b] (T115)
 df4ff5fe	2026-10-14	feat(ops): implement block-fp8 moe	absorbed	local:98474d0f	local port: port(ops-moe): prove block-FP8 experts run on Ada and pin the NVFP4 verdict [upstream 69c098bf df4ff5fe] (T114)
 69c098bf	2026-10-14	feat(ops): implement nvfp4 moe	absorbed	local:98474d0f	local port: port(ops-moe): prove block-FP8 experts run on Ada and pin the NVFP4 verdict [upstream 69c098bf df4ff5fe] (T114)
-9cdbf221	2026-10-13	fix(convert): allow a8 for qwen4exp mtp experts	deferred	v9-qwen4exp-register#T196	qwen4-exp「MTP 专家 A8 转换」；本地转换器走 q4/q5/q8 与 fp8 块缩放；挂起=工件 recipe 定稿，解锁=T192–T198
+9cdbf221	2026-10-13	fix(convert): allow a8 for qwen4exp mtp experts	absorbed	v9-qwen4exp-register#T196	已吸收：本地转换器对非 nvfp4 形态统一给 AllowA8（tools/convert/official_recipes.py:255），MTP 专家同走该策略
 569861a3	2026-10-13	perf(ops): specialize 10240-wide offset rmsnorm	absorbed	local:32f069a5	local port: port(ops-hc): specialize the 10240-wide offset RMSNorm [upstream 569861a3]
 1b50c72d	2026-10-13	feat(ops): implement fused ple gate	absorbed	local:34f249de	local port: port(ops-ple): add the fused PLE gate [upstream 1b50c72d]
 333b4808	2026-10-13	feat(ple): add asynchronous embedding preparation	absorbed	local:191c01f7	local port: port(ops-ple): add asynchronous embedding preparation and NF4 disk reads [upstream 333b4808 8cea711b]
