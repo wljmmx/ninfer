@@ -135,6 +135,13 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         Tensor next_drafts        = frame.next_drafts.slice(0, 0, batch_size);
         Tensor candidate_ids      = frame.candidate_ids.slice(2, 0, batch_size);
         Tensor proposal_q         = frame.proposal_q.slice(2, 0, batch_size);
+        // The conditioning frames are sized for the maximum batch, so they need the same per-round
+        // slice as every other tensor here: the decode-batch entry point checks an exact
+        // [frame, width, batch] shape, and a max-batch buffer is not that shape when a round runs
+        // with fewer rows (measured: {5120,4,8} passed for a batch=1 round -> "MTP decode batch
+        // conditioning shape mismatch").
+        Tensor alignment_conditioning = frame.alignment_conditioning.slice(2, 0, batch_size);
+        Tensor ar_conditioning        = frame.ar_conditioning.slice(1, 0, batch_size);
 
         TargetVerifyFrameView verify{            .ids                     = verify_ids,
             .cache_positions         = target_positions,
@@ -246,11 +253,14 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                         state.execution.device.stream);
             card.mtp_forward_decode_batch(alignment_ids, target_hidden, target_positions,
                                           target_rope, licensed_counts, mtp_rows, envelopes.batch,
-                                          alignment_hidden, &frame.alignment_conditioning);
+                                          alignment_hidden, &alignment_conditioning);
             ops::speculative_select_accepted_hidden(alignment_hidden, accepted, ar_hidden,
                                                     state.execution.device.stream);
-            ops::speculative_select_accepted_hidden(frame.alignment_conditioning, accepted,
-                                                    frame.ar_conditioning,
+            // The selector op takes the batch from hidden.ne[2], so the source and destination have
+            // to be this round's slices: the max-batch regions carry eight columns and would be
+            // rejected against a batch=1 selector vector.
+            ops::speculative_select_accepted_hidden(alignment_conditioning, accepted,
+                                                    ar_conditioning,
                                                     state.execution.device.stream);
 
             Tensor proposal_logits = frame.proposal_logits.slice(1, 0, batch_size);
@@ -303,11 +313,14 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                 Tensor valid = ar_valid_columns.slice(1, static_cast<std::int32_t>(step), 1)
                                    .view({batch_size});
                 Tensor previous_batch = previous.view({1, batch_size});
-                Tensor hidden_batch   = frame.ar_conditioning.view({frame_width, 1, batch_size});
+                Tensor hidden_batch   = ar_conditioning.view({frame_width, 1, batch_size});
+                Tensor ar_conditioning_batch = hidden_batch;
                 Tensor next_hidden_batch = next_hidden.view({sample_width, 1, batch_size});
                 card.mtp_forward_decode_batch(previous_batch, hidden_batch, position, rope, valid,
                                               mtp_rows, envelopes.ar[step], next_hidden_batch,
-                                              &frame.ar_conditioning);
+                                              // Same storage as the step's input, but the decode-batch
+                                              // entry point checks a [frame, width, batch] frame.
+                                              &ar_conditioning_batch);
                 Tensor step_ids   = step_candidate_view(static_cast<std::int32_t>(step) + 1);
                 Tensor step_probs = step_proposal_view(static_cast<std::int32_t>(step) + 1);
                 card.mtp_propose_topk_strided(next_hidden, proposal_logits, next, step_ids,
