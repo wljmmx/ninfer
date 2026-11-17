@@ -122,6 +122,15 @@ deviations to one decimal, seconds to two decimals, acceptance to one percentage
 tokens/round and speedups to two decimals. Keep token totals and sample counts exact. Historical
 comparisons derived from rounded published means must identify that limitation.
 
+### Overlapping spans are never added
+
+A step's GPU span and its host-side span overlap: host submission runs while the device is busy, so
+summing them double-counts the same wall time. Report each span on its own, and state which one a
+percentage is taken against. The same rule retires the older "decode has reached the memory-bandwidth
+ceiling (≈100%)" reading: it was derived by adding spans and is no longer cited
+(`docs/maintainer/v9-moe-parity-register.md`, V10-19). A bandwidth figure may only be published
+together with the traffic it measured and the span it was measured over.
+
 ## Output checks and optional comparisons
 
 Performance runs check execution failures, token accounting, termination reasons, and obvious
