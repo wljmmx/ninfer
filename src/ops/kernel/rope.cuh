@@ -65,6 +65,9 @@ __device__ __forceinline__ void fixed_sincos(const std::int32_t* positions, int 
         if constexpr (Mode != RopeKernelMode::Vision2D) {
             if (scaling.yarn) { frequency = scaling.inv_frequency[pair]; }
         }
+        // RoPE 数值口径合同（docs/maintainer/qwen3_5-model.md「RoPE 数值口径」）：本路径故意用
+        // float32 角度直乘，与 HF 训练侧同口径；改成 double 归约会改变分布，必须按合同流程走
+        // （128K/256K 任务与 PPL 证据 + 门禁重录）。DFlash 的 double 实现是参考档，不是本路径规格。
         const float angle =
             static_cast<float>(positions[static_cast<std::int64_t>(axis) * tokens + token]) *
             frequency;

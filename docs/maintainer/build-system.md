@@ -127,6 +127,16 @@ Source-list maintenance must preserve language, architecture, RDC mode, device-l
 and numerical compiler options. Splitting a manifest does not reduce kernel instantiation work
 or justify combining shape translation units or enabling unity builds.
 
+## Toolchain baseline (2026-11-17)
+
+The maintained toolchain is **CUDA 13.5** on the RTX 4090 / `sm_89` build; the 13.4 toolkit is no
+longer installed (only an empty `CUDA\v13.4\bin|x64` shell remains). A 13.4-versus-13.5 code
+generation audit (registers, instruction counts, ptxas version) is therefore **out of scope by
+decision, not by accident**: the v10 audit item that asked for it is closed with 13.5 as the
+reference, and numerical acceptance is carried by the PPL / dump gates and the Op oracles rather
+than by toolkit-version comparison. If a future regression needs a compiler bisect, reinstalling
+13.4 side by side is the entry point; nothing in the tree depends on the absence of it.
+
 ## Consumers and verification
 
 `apps/CMakeLists.txt` explicitly defines the three product executables. Tests and benchmarks

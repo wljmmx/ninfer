@@ -7,6 +7,9 @@
 
 namespace ninfer::ops::detail::qsa {
 
+// RoPE 数值口径合同（docs/maintainer/qwen3_5-model.md「RoPE 数值口径」）：QSA 走双相位 +
+// nearbyint 归约后取 __sincosf，与 text/vision 的 float32 直乘不同口径；三者各自是所在路径的规格，
+// 改任一路都要走合同变更（含长上下文任务与 PPL 证据）。
 template <bool BoundedPhase>
 __device__ __forceinline__ float2 prepare_sincos(double frequency, int position) {
     const double phase = double(position) * frequency;

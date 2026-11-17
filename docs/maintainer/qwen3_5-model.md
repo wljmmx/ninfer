@@ -334,3 +334,22 @@ Each floating-point Op is qualified against its independent mathematical oracle 
 public inputs. Packed weights are decoded with their stored scales. Exact transforms use exact
 oracles; private accumulation, staging and reduction order use the Op's numerical criteria.
 [Op development](op-development.md) owns that qualification contract.
+
+### RoPE 数值口径（合同，2026-11-17 定）
+
+本仓的 RoPE 有**三种角度口径**，这是**有意的分路径合同**，不是待统一的缺陷。改任一路都算合同变更。
+
+| 路径 | 实现 | 256K 位置 max err | 口径理由 |
+|---|---|---|---|
+| text mrope / vision（`ops/kernel/rope.cuh`） | float32 角度直乘 + `sincosf` | 8.75e-3 | **与 HF 训练侧同口径**；改准会改变分布 |
+| DFlash（`ops/common/dflash_rope.cuh`） | double 角度 + `nearbyint` 归约 | **1.58e-7** | 本仓**精度参考档**；草稿链对角度误差最敏感 |
+| QSA（`ops/softmax_attention/qsa/norm_rope.cuh`） | double 相位 + `nearbyint` + `__sincosf` | 未单独给值 | 4-token 索引块对相位连续性敏感 |
+
+推论与约束：
+
+- **两路输出不可逐位互比**：同一模型走 text 路径与 DFlash 路径，长位置上的角度差异可达 1e-2 量级；
+  跨路径一致性应比较**任务指标**，不比较 token 序列的逐位相等。
+- **不要把 float32 路径"顺手改准"**：那会移动 PPL/dump golden，需按门禁流程重录并登记。
+- **新加路径必须声明归属**：选 float32（训练一致）或 double 参考档，并在头文件注明，不得默认取其一。
+
+历史：本项由 v10 审计（V10-35）在实测中暴露，非 CUDA 13.5 引入；三条实现在 13.4 时期即如此。

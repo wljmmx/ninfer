@@ -33,6 +33,9 @@ static __device__ __constant__ double kDflashRopeInvFrequency[64] = {
     1.28639694493697462e-07,
 };
 
+// RoPE 数值口径合同（docs/maintainer/qwen3_5-model.md「RoPE 数值口径」）：DFlash 用 double 角度 +
+// nearbyint 归约（256K 位置 max err 1.58e-7），是本仓的精度参考档；它与 text/vision 的 float32
+// 路径刻意不同口径，两路输出不可逐位互比。
 __device__ __forceinline__ void dflash_rope_sincos(const std::int32_t* positions, int token,
                                                    int pair, float* sine, float* cosine) {
     constexpr double kInvTwoPi = 1.59154943091895336e-01;
