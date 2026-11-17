@@ -500,6 +500,10 @@ public:
                                                const runtime::ResolvedExecutionOptions& options);
     [[nodiscard]] std::vector<float> causal_score(PreparedPrompt&& prompt,
                                                   std::uint32_t first_target);
+    // Same window, same logits: each scored position's k best candidates plus the column
+    // log-normalizer. See ScoreTopK in ninfer/types.h for the payload layout.
+    [[nodiscard]] ScoreTopK causal_score_topk(PreparedPrompt&& prompt, std::uint32_t first_target,
+                                              std::uint32_t k);
     [[nodiscard]] std::optional<SourceCandidate>
     inspect_source(const RequestBasePlan& base, std::optional<CheckpointHandle> checkpoint,
                    bool consume_source                              = false,

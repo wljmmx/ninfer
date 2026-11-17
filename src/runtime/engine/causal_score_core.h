@@ -70,7 +70,29 @@ public:
         auto job                               = std::make_unique<Job>();
         job->prompt                            = std::move(prompt);
         job->first_target                      = first_target;
+        job->topk                              = 0;
         std::future<std::vector<float>> result = job->promise.get_future();
+        {
+            std::lock_guard queue_lock(queue_mutex_);
+            if (stopping_) { throw std::runtime_error("causal scoring engine is stopping"); }
+            if (job_ != nullptr) {
+                throw std::logic_error("causal scoring core already has an in-flight job");
+            }
+            job_ = std::move(job);
+        }
+        queue_cv_.notify_one();
+        return result.get();
+    }
+
+    // The same job slot and worker, asking the Program for the top-K view of the same window.
+    [[nodiscard]] ScoreTopK score_topk(PreparedPrompt prompt, std::uint32_t first_target,
+                                       std::uint32_t k) {
+        std::scoped_lock call_lock(call_mutex_);
+        auto job                      = std::make_unique<Job>();
+        job->prompt                   = std::move(prompt);
+        job->first_target             = first_target;
+        job->topk                     = k;
+        std::future<ScoreTopK> result = job->topk_promise.get_future();
         {
             std::lock_guard queue_lock(queue_mutex_);
             if (stopping_) { throw std::runtime_error("causal scoring engine is stopping"); }
@@ -160,7 +182,10 @@ private:
     struct Job {
         PreparedPrompt prompt;
         std::uint32_t first_target = 0;
+        // Zero selects the per-target logprob path; k>0 asks for the top-K view of the same window.
+        std::uint32_t topk = 0;
         std::promise<std::vector<float>> promise;
+        std::promise<ScoreTopK> topk_promise;
     };
 
     void worker_loop() noexcept {
@@ -176,16 +201,29 @@ private:
                 job = std::move(job_);
             }
             try {
-                std::vector<float> result;
-                {
-                    std::scoped_lock lock(execution_mutex_);
-                    result =
-                        instance_.program->causal_score(std::move(job->prompt), job->first_target);
+                if (job->topk == 0) {
+                    std::vector<float> result;
+                    {
+                        std::scoped_lock lock(execution_mutex_);
+                        result = instance_.program->causal_score(std::move(job->prompt),
+                                                                 job->first_target);
+                    }
+                    job->promise.set_value(std::move(result));
+                } else {
+                    ScoreTopK result;
+                    {
+                        std::scoped_lock lock(execution_mutex_);
+                        result = instance_.program->causal_score_topk(std::move(job->prompt),
+                                                                      job->first_target, job->topk);
+                    }
+                    job->topk_promise.set_value(std::move(result));
                 }
-                job->promise.set_value(std::move(result));
             } catch (...) {
                 try {
                     job->promise.set_exception(std::current_exception());
+                } catch (...) {}
+                try {
+                    job->topk_promise.set_exception(std::current_exception());
                 } catch (...) {}
             }
         }

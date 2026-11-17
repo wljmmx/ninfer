@@ -286,6 +286,44 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
     return result;
 }
 
+ScoreTopK Engine::score_tokens_topk(std::vector<TokenId> tokens, std::uint32_t first_target,
+                                    std::uint32_t k) {
+    nvtx::ScopedRange score_range(nvtx::Name::Score, nvtx::Category::Scoring,
+                                  static_cast<std::uint64_t>(tokens.size()));
+    // Same order and same messages as score_tokens: a caller that switches entry points for a KL
+    // must not see a different verdict on a window the plain entry rejects.
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->options.purpose != EnginePurpose::CausalScoring) {
+        throw std::logic_error("score_tokens requires a CausalScoring Engine");
+    }
+    if (tokens.size() < 2 || tokens.size() > impl_->options.max_context) {
+        throw std::invalid_argument("score_tokens token count must be in [2,max_context]");
+    }
+    if (first_target == 0 || first_target >= tokens.size()) {
+        throw std::invalid_argument("score_tokens first_target must be in [1,token_count-1]");
+    }
+    if (k == 0 || k > kScoreTopkCapacity) {
+        throw std::invalid_argument("score_tokens_topk k must be in [1,kScoreTopkCapacity]");
+    }
+    PreparedPrompt prompt      = prepare_tokens(std::move(tokens), false);
+    const std::size_t expected = prompt.summary().prompt_tokens - first_target;
+    ScoreTopK result           = std::visit(
+        [&](auto& core) -> ScoreTopK {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
+                return core->score_topk(std::move(prompt.impl_->value), first_target, k);
+            } else {
+                throw std::logic_error("Engine scoring core is unavailable");
+            }
+        },
+        impl_->core);
+    if (result.ids.size() != expected * k || result.logprobs.size() != expected * k ||
+        result.log_normalizer.size() != expected) {
+        throw std::logic_error("target Program returned an invalid top-k score shape");
+    }
+    return result;
+}
+
 std::uint32_t Engine::count_tokens(PromptInput input, const PreparationControl& control) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return impl_->active->frontend.count_tokens(std::move(input), control);

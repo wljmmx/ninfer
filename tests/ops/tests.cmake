@@ -22,6 +22,7 @@ set(ninfer_op_tests
   scatter
   scatter_bf16_batch
   target_logprobs
+  logits_topk
   position)
 foreach(op IN LISTS ninfer_op_tests)
   ninfer_add_op_test(ninfer_${op}_test

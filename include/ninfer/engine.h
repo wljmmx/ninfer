@@ -104,6 +104,15 @@ public:
     [[nodiscard]] std::vector<float> score_tokens(std::vector<TokenId> tokens,
                                                   std::uint32_t first_target);
 
+    // The same scoring pass, reporting each position's k best candidates and the full
+    // log-normalizer instead of only the observed token's logprob. `k` must be in
+    // [1,kScoreTopkCapacity]; the returned payloads are [position,rank] row-major with
+    // position_count = tokens.size()-first_target. A mean(log p - log q) taken from two
+    // score_tokens runs is not a KL: it has no support and no normalizer, which is exactly what
+    // this entry adds.
+    [[nodiscard]] ScoreTopK score_tokens_topk(std::vector<TokenId> tokens,
+                                              std::uint32_t first_target, std::uint32_t k);
+
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
                                              const PreparationControl& control = {}) const;
     [[nodiscard]] ModelSamplingDefaults sampling_defaults() const;

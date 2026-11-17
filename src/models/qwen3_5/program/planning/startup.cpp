@@ -686,6 +686,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::I32, 1, static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::FP32, 1, static_cast<std::int32_t>(kCausalScoreTile));
+        // The top-K view of the same tile: kScoreTopkCapacity candidates per column, plus the
+        // per-column log-normalizer. Planned unconditionally (0.5 MiB at 1024 columns) so a scoring
+        // engine can answer either entry point without a second plan.
+        matrix(causal_score, DType::I32, static_cast<std::int32_t>(kScoreTopkCapacity),
+               static_cast<std::int32_t>(kCausalScoreTile));
+        matrix(causal_score, DType::FP32, static_cast<std::int32_t>(kScoreTopkCapacity),
+               static_cast<std::int32_t>(kCausalScoreTile));
+        matrix(causal_score, DType::FP32, 1, static_cast<std::int32_t>(kCausalScoreTile));
         linear_scratch(causal_score, parameters.text.output_head, 1, kCausalScoreTile);
         out.causal_score = finish(causal_score);
     }

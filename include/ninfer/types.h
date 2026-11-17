@@ -20,6 +20,23 @@ namespace ninfer {
 
 using TokenId = std::int32_t;
 
+// How many candidates one scored position may report. A KL between two distributions needs the
+// candidate lists themselves, not just the observed token's logprob; the cap bounds both the
+// per-position payload and the work the top-K selection costs.
+inline constexpr std::uint32_t kScoreTopkCapacity = 64;
+
+// The top-K view of a causal-scoring window. Candidates are ordered by logit descending with the
+// lower token id breaking ties, and the log-probabilities are the same natural-log values
+// score_tokens reports for the observed token.
+struct ScoreTopK {
+    // Row-major [position, rank]: position p owns the k entries [p*k, (p+1)*k).
+    std::vector<std::uint32_t> ids;
+    std::vector<float> logprobs;
+    // log(sum_v exp(logit_v)) of the same column, one entry per position. Reported separately
+    // because KL needs the mass the candidate list does not cover.
+    std::vector<float> log_normalizer;
+};
+
 inline constexpr std::uint32_t kMaximumConcurrency               = 8;
 inline constexpr std::size_t kMaximumContextCacheSessionKeyBytes = 256;
 inline constexpr std::size_t kMaximumExplicitPromptCacheMarkers  = 4;

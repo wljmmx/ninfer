@@ -76,3 +76,8 @@ add_test(NAME ninfer_serve_shutdown_real_test
   COMMAND ${Python3_EXECUTABLE} -B ${PROJECT_SOURCE_DIR}/tests/test_serve_shutdown_real.py
           $<TARGET_FILE:ninfer-serve>)
 set_tests_properties(ninfer_serve_shutdown_real_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# The KL estimator behind `--token-topk`: hand-computable distributions, the two truncations the
+# candidate lists introduce, and the record/segment plumbing. Stdlib only, no Device, no artifact.
+add_test(NAME ninfer_kl_div_test
+  COMMAND ${Python3_EXECUTABLE} -B ${PROJECT_SOURCE_DIR}/tests/test_kl_div.py)

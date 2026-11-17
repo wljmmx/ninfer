@@ -67,6 +67,14 @@ ninfer_add_test(ninfer_qwen3_5_score_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_score_real.cpp"
   LIBRARIES ninfer_engine)
 
+# V10-09: the top-K scoring entry shares score_tokens' logits path. This asserts the contract a KL
+# comparison needs - candidate ids and logprobs ordered and unique, coverage at or below one, a
+# finite column log-normalizer, and the observed token's logprob reproduced bit for bit whenever it
+# is the argmax - over a full window and over a suffix window.
+ninfer_add_test(ninfer_qwen3_5_score_topk_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_score_topk_real.cpp"
+  LIBRARIES ninfer_engine)
+
 ninfer_add_test(ninfer_qwen3_5_vision_workspace_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision_workspace.cpp"
   LIBRARIES ninfer_model_runtime ninfer_engine)
@@ -219,6 +227,7 @@ set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_grammar_real_test
   ninfer_qwen3_5_tools_real_test
   ninfer_qwen3_5_score_real_test
+  ninfer_qwen3_5_score_topk_real_test
   ninfer_qwen3_5_vision_workspace_test
   ninfer_qwen3_5_dflash2_real_test
   ninfer_qwen3_5_dflash_prefill_real_test

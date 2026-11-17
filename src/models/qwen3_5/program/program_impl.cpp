@@ -12,6 +12,7 @@
 #include "core/device.h"
 #include "core/transfer.h"
 #include "ninfer/ops/target_logprobs.h"
+#include "ninfer/ops/logits_topk.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -130,6 +131,17 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       score_logprobs_host(plan.causal_scoring ? std::make_optional<PinnedHostBuffer>(
                                                     kCausalScoreTile * sizeof(float))
                                               : std::nullopt),
+      score_topk_ids_host(plan.causal_scoring
+                              ? std::make_optional<PinnedHostBuffer>(
+                                    kCausalScoreTile * kScoreTopkCapacity * sizeof(std::int32_t))
+                              : std::nullopt),
+      score_topk_logprobs_host(plan.causal_scoring
+                                   ? std::make_optional<PinnedHostBuffer>(
+                                         kCausalScoreTile * kScoreTopkCapacity * sizeof(float))
+                                   : std::nullopt),
+      score_topk_log_normalizer_host(plan.causal_scoring ? std::make_optional<PinnedHostBuffer>(
+                                                               kCausalScoreTile * sizeof(float))
+                                                         : std::nullopt),
       ordinary_host(!plan.causal_scoring && (plan.speculative_backend == SpeculativeBackend::None ||
                                              plan.persistent.round.spec.ordinary_fallback)
                         ? std::make_optional<PinnedHostBuffer>(
@@ -454,6 +466,77 @@ ProgramImpl::~ProgramImpl() noexcept {
 
 std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
                                              std::uint32_t first_target) {
+    std::vector<float> output;
+    const std::size_t scored = run_causal_score(
+        std::move(prompt), first_target,
+        [&](const Tensor& logits, std::span<const TokenId> targets, std::int32_t columns) {
+            Tensor target_ids = work.alloc(DType::I32, {columns});
+            Tensor logprobs   = work.alloc(DType::FP32, {columns});
+            core::copy_bytes(target_ids.data, targets.data(), target_ids.bytes(),
+                             core::TransferDirection::HostToDevice, device.stream);
+            ops::target_logprobs(logits, target_ids,
+                                 dimension(parameters.model.resources().public_token_count),
+                                 logprobs, device.stream);
+            core::copy_bytes(score_logprobs_host->data(), logprobs.data, logprobs.bytes(),
+                             core::TransferDirection::DeviceToHost, device.stream);
+            device.synchronize();
+            const auto* host = static_cast<const float*>(score_logprobs_host->data());
+            output.insert(output.end(), host, host + columns);
+        });
+    if (output.size() != scored) {
+        throw std::logic_error("causal score produced the wrong number of logprobs");
+    }
+    return output;
+}
+
+ScoreTopK ProgramImpl::causal_score_topk(PreparedPromptData&& prompt, std::uint32_t first_target,
+                                         std::uint32_t k) {
+    if (k == 0 || k > kScoreTopkCapacity) {
+        throw std::invalid_argument("causal score top-k must be in [1,kScoreTopkCapacity]");
+    }
+    const std::int32_t ranks  = static_cast<std::int32_t>(k);
+    const std::int32_t domain = dimension(parameters.model.resources().public_token_count);
+    if (ranks > domain) {
+        throw std::invalid_argument("causal score top-k exceeds the token domain");
+    }
+    ScoreTopK output;
+    const std::size_t scored = run_causal_score(
+        std::move(prompt), first_target,
+        [&](const Tensor& logits, std::span<const TokenId> /*targets*/, std::int32_t columns) {
+            Tensor ids            = work.alloc(DType::I32, {ranks, columns});
+            Tensor logprobs       = work.alloc(DType::FP32, {ranks, columns});
+            Tensor log_normalizer = work.alloc(DType::FP32, {columns});
+            ops::logits_topk(logits, domain, ranks, ids, logprobs, log_normalizer, device.stream);
+            core::copy_bytes(score_topk_ids_host->data(), ids.data, ids.bytes(),
+                             core::TransferDirection::DeviceToHost, device.stream);
+            core::copy_bytes(score_topk_logprobs_host->data(), logprobs.data, logprobs.bytes(),
+                             core::TransferDirection::DeviceToHost, device.stream);
+            core::copy_bytes(score_topk_log_normalizer_host->data(), log_normalizer.data,
+                             log_normalizer.bytes(), core::TransferDirection::DeviceToHost,
+                             device.stream);
+            device.synchronize();
+            const auto* host_ids = static_cast<const std::int32_t*>(score_topk_ids_host->data());
+            const auto* host_logprobs = static_cast<const float*>(score_topk_logprobs_host->data());
+            const auto* host_normalizer =
+                static_cast<const float*>(score_topk_log_normalizer_host->data());
+            const std::size_t entries = static_cast<std::size_t>(columns) * k;
+            output.ids.reserve(output.ids.size() + entries);
+            for (std::size_t i = 0; i < entries; ++i) {
+                output.ids.push_back(static_cast<std::uint32_t>(host_ids[i]));
+            }
+            output.logprobs.insert(output.logprobs.end(), host_logprobs, host_logprobs + entries);
+            output.log_normalizer.insert(output.log_normalizer.end(), host_normalizer,
+                                         host_normalizer + columns);
+        });
+    if (output.ids.size() != scored * k || output.logprobs.size() != scored * k ||
+        output.log_normalizer.size() != scored) {
+        throw std::logic_error("causal score produced an invalid top-k shape");
+    }
+    return output;
+}
+
+std::size_t ProgramImpl::run_causal_score(PreparedPromptData&& prompt, std::uint32_t first_target,
+                                          const CausalScoreTileSink& flush_tile) {
     if (!causal_scoring || !score_hidden || !score_logprobs_host ||
         workspace_plan.causal_score == 0) {
         throw std::logic_error("Program was not constructed for causal scoring");
@@ -500,8 +583,7 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
         if (!released) { throw std::logic_error("causal score resources could not be released"); }
     };
 
-    std::vector<float> output;
-    output.reserve(token_count_size - first_target);
+    std::size_t emitted = 0;
     std::vector<TokenId> staged_targets;
     staged_targets.reserve(kCausalScoreTile);
     std::uint32_t staged_columns = 0;
@@ -527,20 +609,10 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             const auto columns = static_cast<std::int32_t>(staged_columns);
             Tensor logits      = work.alloc(
                 DType::BF16, {dimension(parameters.model.config().text.vocab_size), columns});
-            Tensor target_ids = work.alloc(DType::I32, {columns});
-            Tensor logprobs   = work.alloc(DType::FP32, {columns});
-            Tensor hidden     = score_hidden->slice(1, 0, columns);
+            Tensor hidden = score_hidden->slice(1, 0, columns);
             execution::project(hidden, parameters.text.output_head, logits, work, device.stream);
-            core::copy_bytes(target_ids.data, staged_targets.data(), target_ids.bytes(),
-                             core::TransferDirection::HostToDevice, device.stream);
-            ops::target_logprobs(logits, target_ids,
-                                              dimension(parameters.model.resources().public_token_count),
-                                              logprobs, device.stream);
-            core::copy_bytes(score_logprobs_host->data(), logprobs.data, logprobs.bytes(),
-                             core::TransferDirection::DeviceToHost, device.stream);
-            device.synchronize();
-            const auto* host = static_cast<const float*>(score_logprobs_host->data());
-            output.insert(output.end(), host, host + staged_columns);
+            flush_tile(logits, std::span<const TokenId>(staged_targets), columns);
+            emitted += staged_columns;
             staged_targets.clear();
             staged_columns = 0;
             work.reset();
@@ -608,11 +680,11 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             }
         }
         flush();
-        if (output.size() != token_count_size - first_target) {
-            throw std::logic_error("causal score produced the wrong number of logprobs");
+        if (emitted != token_count_size - first_target) {
+            throw std::logic_error("causal score produced the wrong number of columns");
         }
         cleanup();
-        return output;
+        return emitted;
     } catch (...) {
         try {
             device.synchronize();

@@ -156,6 +156,11 @@ std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t 
     return impl_->causal_score(PreparedPromptAccess::take(std::move(prompt)), target);
 }
 
+ScoreTopK Program::causal_score_topk(PreparedPrompt&& prompt, std::uint32_t target,
+                                     std::uint32_t k) {
+    return impl_->causal_score_topk(PreparedPromptAccess::take(std::move(prompt)), target, k);
+}
+
 std::optional<SourceCandidate>
 Program::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHandle> checkpoint,
                         bool consume_source, std::span<const CheckpointHandle> private_points,

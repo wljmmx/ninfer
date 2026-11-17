@@ -55,6 +55,10 @@ struct Options {
     // Optional TSV of per-scored-token logprobs: index, token id, logprob. A needle probe reads the
     // answer's NLL from here; the aggregate PPL is dominated by filler and hides it (appendix AZ).
     std::optional<std::filesystem::path> token_logprobs;
+    // Optional top-K export: K candidates and the column log-normalizer per scored token, written
+    // to token_topk.tsv inside the output directory. This is what a KL needs - the plain logprob
+    // record has one number per position and no support.
+    std::optional<std::uint32_t> token_topk;
     std::uint32_t context               = 4096;
     std::uint32_t stride                = 2048;
     int device                          = 0;
@@ -70,7 +74,7 @@ std::string usage_text() {
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
            "       [--context N] [--stride N] [--device N] [--host-kv-mib N]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|rk4v2-e8] "
-           "[--output <directory>] [--token-logprobs <tsv>]\n"
+           "[--output <directory>] [--token-logprobs <tsv>] [--token-topk <k>]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n";
 }
 
@@ -119,6 +123,11 @@ Options parse_options(int argc, char** argv) {
             out.device = parse_integer<int>(value("--device"), "device");
         } else if (option == "--token-logprobs") {
             out.token_logprobs = std::filesystem::path(value("--token-logprobs"));
+        } else if (option == "--token-topk") {
+            out.token_topk = parse_integer<std::uint32_t>(value("--token-topk"), "token-topk");
+            if (*out.token_topk == 0 || *out.token_topk > ninfer::kScoreTopkCapacity) {
+                usage_error("--token-topk must be in [1,kScoreTopkCapacity]");
+            }
         } else if (option == "--kv-dtype") {
             const std::string_view dtype = value("--kv-dtype");
             if (dtype == "bf16") {
@@ -321,6 +330,13 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         }
         token_logprob_file << "# index\ttoken\tlogprob\n";
     }
+    std::ofstream token_topk_file;
+    if (options.token_topk) {
+        token_topk_file.open(output_directory / "token_topk.tsv",
+                             std::ios::binary | std::ios::trunc);
+        if (!token_topk_file) { throw std::runtime_error("cannot open the --token-topk output"); }
+        token_topk_file << "# index\ttoken\tlogprob\tlog_normalizer\ttopk_ids\ttopk_logprobs\n";
+    }
     const Clock::time_point scoring_started      = Clock::now();
     logger->info("scoring | {} streams | {} tokens | {} windows",
                  ninfer::product::format_pretty_count(streams.size()),
@@ -353,6 +369,30 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                 stream.tokens.begin() + static_cast<std::ptrdiff_t>(window.input_begin),
                 stream.tokens.begin() + static_cast<std::ptrdiff_t>(window.input_end));
             const Clock::time_point window_started = Clock::now();
+            if (options.token_topk) {
+                // Same window, same logits: the K view is taken before the plain score consumes
+                // `input`, so requesting both costs two passes but changes neither one's numbers.
+                const std::uint32_t k       = *options.token_topk;
+                const std::size_t positions = window.target_end - window.target_begin;
+                const ninfer::ScoreTopK topk =
+                    engine.score_tokens_topk(input, window.first_target, k);
+                for (std::size_t index = 0; index < positions; ++index) {
+                    const std::size_t position = window.target_begin + index;
+                    token_topk_file << position << '\t' << stream.tokens[position] << '\t'
+                                    << std::setprecision(9) << topk.logprobs[index * k] << '\t'
+                                    << topk.log_normalizer[index] << '\t';
+                    for (std::uint32_t rank = 0; rank < k; ++rank) {
+                        if (rank != 0) { token_topk_file << ','; }
+                        token_topk_file << topk.ids[index * k + rank];
+                    }
+                    token_topk_file << '\t';
+                    for (std::uint32_t rank = 0; rank < k; ++rank) {
+                        if (rank != 0) { token_topk_file << ','; }
+                        token_topk_file << std::setprecision(9) << topk.logprobs[index * k + rank];
+                    }
+                    token_topk_file << '\n';
+                }
+            }
             std::vector<float> logprobs;
             try {
                 logprobs = engine.score_tokens(std::move(input), window.first_target);

@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <array>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -277,6 +278,11 @@ public:
     [[nodiscard]] RequestBasePlan plan_request(PreparedPromptData&&,
                                                const runtime::ResolvedExecutionOptions&);
     [[nodiscard]] std::vector<float> causal_score(PreparedPromptData&&, std::uint32_t first_target);
+    // The same window scan, reporting each scored position's k best candidates and the column
+    // log-normalizer instead of only the observed token's logprob. Both entries share one scan:
+    // they differ in what they do with each tile's logits, never in how the logits are produced.
+    [[nodiscard]] ScoreTopK causal_score_topk(PreparedPromptData&&, std::uint32_t first_target,
+                                              std::uint32_t k);
     [[nodiscard]] std::optional<SourceCandidate>
     inspect_source(const RequestBasePlan&, std::optional<CheckpointHandle>, bool = false,
                    std::span<const CheckpointHandle> = {},
@@ -428,6 +434,16 @@ public:
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;
 
+    // What a causal-scoring tile does with its logits. The tile is [vocab, columns] and stays valid
+    // for the duration of the callback only; `targets` holds the column target tokens.
+    using CausalScoreTileSink = std::function<void(
+        const Tensor& logits, std::span<const TokenId> targets, std::int32_t columns)>;
+    // The window scan both causal scoring entries share: state and KV per window, the chunked
+    // prefill, and the staged projection that turns each scored column into logits. Returns how
+    // many columns were emitted, i.e. how many positions were scored.
+    [[nodiscard]] std::size_t run_causal_score(PreparedPromptData&&, std::uint32_t first_target,
+                                               const CausalScoreTileSink&);
+
     const execution::Parameters& parameters;
     DeviceContext& device;
     const std::uint32_t capacity;
@@ -515,6 +531,11 @@ public:
 
     std::optional<PinnedHostBuffer> round_host;
     std::optional<PinnedHostBuffer> score_logprobs_host;
+    // Staging for the top-K view: kScoreTopkCapacity candidates per tile column, allocated once
+    // with the same lifetime as score_logprobs_host. Unused by the plain score entry.
+    std::optional<PinnedHostBuffer> score_topk_ids_host;
+    std::optional<PinnedHostBuffer> score_topk_logprobs_host;
+    std::optional<PinnedHostBuffer> score_topk_log_normalizer_host;
     TokenId* host_tokens = nullptr;
     std::optional<PinnedHostBuffer> ordinary_host;
     qwen3_5::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
