@@ -1039,8 +1039,17 @@ follow the server's API-key authentication.
 | Path | Content |
 |---|---|
 | `/monitor/info` | `server_instance_id`, `start_time_seconds`, the model/rank description, the redacted startup configuration and the startup memory budgets |
-| `/monitor/snapshot` | `engine` (counters, gauges, Host-phase totals, memory and media summaries) plus `service` (request counts, TTFT/duration/queue bins, live requests) |
+| `/monitor/snapshot` | `engine` (counters, gauges, Host-phase totals, memory and media summaries, plus one row per live request) plus `service` (request counts, TTFT/duration/queue bins, live requests) |
 | `/monitor/events` | `text/event-stream` of request lifecycle events: `request_preparing`, `first_token`, scheduling transitions, `request_completed`, `request_cancelled`, `request_failed`, `request_rejected`, `response_failed` |
+
+`engine.requests[]` is the per-request projection: `id`, `owner` (`generation`/`scoring`), `state`
+(`waiting`/`materializing`/`prefill`/`decode`/`replay`/`pausing`/`paused`/`control`/`finishing`),
+`resident`, `prompt_tokens`, `generated_tokens`, `preemptions`, `snapshot_restores`,
+`direct_restores`, `replay_restores`, `replayed_tokens`, `recovery_pending`,
+`recovery{route,begin_frontier,frontier,target_frontier}` and `last_progress_ns` (steady-clock time
+of the last committed token; subtract `engine.sampled_ns` for its age). Route `direct` means the
+restoration had no committed history to rebuild, so nothing was replayed; `recovery_pending` stays
+true until the first NEW unit commits, which is when the retained recovery capacity is released.
 
 ```bash
 curl -s http://127.0.0.1:8080/monitor/snapshot | jq '.engine.runtime.host_work'
