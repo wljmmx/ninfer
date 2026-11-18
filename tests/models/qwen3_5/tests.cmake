@@ -138,6 +138,15 @@ ninfer_add_test(ninfer_qwen3_5_kv_page_in_spec_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_kv_page_in_spec_real.cpp"
   LIBRARIES ninfer_engine)
 
+# port (sm_89, V10-81): the same leg under a FOUR-lane batch, plus the cross-row borrow. Four lanes
+# share one physical page pool; a lane whose own non-addressed pages are gone may take a slot from a
+# sibling row that holds pages no active row reads this step. Tokens must equal the fully resident
+# run's, lane for lane. Every knob is NINFER_LANES_* so the same binary covers the tight-arena run
+# and the borrow stress.
+ninfer_add_test(ninfer_qwen3_5_kv_page_in_lanes_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_kv_page_in_lanes_real.cpp"
+  LIBRARIES ninfer_engine)
+
 ninfer_add_test(ninfer_qwen3_5_expert_stream_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_stream_real.cpp"
   LIBRARIES ninfer_artifact ninfer_ops ninfer_core)
@@ -255,6 +264,7 @@ set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_kv_tier_real_test
   ninfer_qwen3_5_kv_page_in_real_test
   ninfer_qwen3_5_kv_page_in_spec_real_test
+  ninfer_qwen3_5_kv_page_in_lanes_real_test
   ninfer_qwen3_5_expert_stream_real_test
   ninfer_qwen3_5_resize_under_load_real_test
   ninfer_qwen3_5_resize_handoff_real_test

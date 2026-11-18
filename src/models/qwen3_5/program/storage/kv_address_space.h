@@ -224,6 +224,19 @@ public:
         page_capacity_ = target_pages;
     }
 
+    // port (sm_89, V10-81): every ACTIVE address of this space, in index order. The page-in leg's
+    // cross-row borrow has to ask which other rows exist and what each one currently addresses, and
+    // an address is the only handle a row is reachable through - the store owns them, so the walk
+    // lives here instead of handing the array out.
+    template <typename Visitor>
+    void for_each_active_address(Visitor&& visit) const {
+        for (std::uint32_t index = 0; index < addresses_.size(); ++index) {
+            const Address& address = addresses_[index];
+            if (!address.occupied || !address.active || !address.row) { continue; }
+            visit(KVAddressSpaceHandle(this, index, address.generation));
+        }
+    }
+
     // 13.4: the per-address page bound is part of the KV half's capacity, so a runtime shrink can
     // make a frontier the execution geometry still allows unmappable. growth_pages_for_tokens()
     // throws for that case, and the throw would escape a bind into the worker round (fatal), so

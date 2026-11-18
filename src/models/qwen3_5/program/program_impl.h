@@ -726,6 +726,18 @@ public:
     // addressed set.
     bool demote_page_for_room(KVAddressSpaceStore& addresses, PagedKVCache& cache,
                               KVAddressSpaceHandle address, std::uint32_t page);
+    // port (sm_89, V10-81): cross-row borrowing, the same room-making when THIS row has nothing
+    // left to give back. A page is taken only from another row of the same address space and only
+    // when no active row addresses it in this step (correctness first: a page a step reads may
+    // never leave the Device); the victim's row is marked absent exactly as its own demotion would
+    // mark it, and its extent is recorded against the victim, so the victim's own page-in can bring
+    // the page back through the existing path. Fairness: only a row with slack, at most half of
+    // that slack per call, never the last spare page, and the victim order rotates. Returns true
+    // when a slot was made available.
+    bool borrow_slot_from_another_row(KVAddressSpaceStore& addresses, PagedKVCache& cache,
+                                      KVAddressSpaceHandle requester, std::uint32_t live,
+                                      std::uint32_t sink_pages, std::uint32_t window_pages,
+                                      const std::vector<std::uint32_t>& keep_pages);
     std::uint32_t page_in_addressed_pages(KVAddressSpaceStore& addresses, PagedKVCache& cache,
                                           KVAddressSpaceHandle address, std::uint32_t live,
                                           std::uint32_t sink_pages, std::uint32_t window_pages,
@@ -751,20 +763,32 @@ public:
         std::uint32_t candidates = 0;
         std::uint32_t fetched    = 0;
         std::uint32_t evicted    = 0;
+        // port (sm_89, V10-81): slots this pass obtained from ANOTHER row, so "the borrow actually
+        // happened" is a number and not an inference.
+        std::uint32_t borrowed = 0;
     };
 
     PageInCounters last_page_in_[2];
     [[nodiscard]] PageInCounters& page_in_counters(KVAddressSpaceStore& addresses) noexcept;
+    // port (sm_89, V10-81): where the next cross-row borrow starts looking, per address space. The
+    // rotation is what keeps one row from being the victim every time two rows are equally slack.
+    std::array<std::uint32_t, 2> borrow_cursor_{};
+    // Rows whose eviction mask was DEFERRED on their last decision (NINFER_KV_EVICT_DEFER). Such a
+    // row still reads its whole history - the block table was left untouched on purpose - so the
+    // window predicate does not describe its step, and a borrow must never treat one of its pages
+    // as spare. Keyed on the score plane's data pointer, the same stable per-row key
+    // g_scored_keep_by_row uses.
+    std::vector<const void*> deferred_mask_rows_;
     // One shot per space: NINFER_KV_PAGE_IN_PROBE fires once for the text KV and once for the
     // backend, so a run is reproducible and a speculative run executes the round trip inside a real
     // step for both address spaces instead of only the first one it reaches.
     std::array<bool, 2> page_in_probe_done_{};
-    // Pages the last demotion actually moved to Host, reported in the pool-account file so "the switch
-    // did something" is measured instead of assumed (appendix FF).
-    std::uint32_t last_demoted_pages_     = 0;
-    std::uint32_t last_demote_stage_     = 0;  // where the last demotion attempt stopped (appendix FF)
-    std::uint32_t last_demote_candidates_ = 0;  // masked pages it tried to move
-    std::uint32_t last_demote_block_mask_ = 0;  // OR of the refused pages' condition masks
+    // Pages the last demotion actually moved to Host, reported in the pool-account file so "the
+    // switch did something" is measured instead of assumed (appendix FF).
+    std::uint32_t last_demoted_pages_ = 0;
+    std::uint32_t last_demote_stage_  = 0; // where the last demotion attempt stopped (appendix FF)
+    std::uint32_t last_demote_candidates_ = 0; // masked pages it tried to move
+    std::uint32_t last_demote_block_mask_ = 0; // OR of the refused pages' condition masks
     // appendix FF (M3 3.2c): how many recent checkpoints may keep their Host room (default 8, the same
     // count the Host default is written with).
     std::uint32_t host_keep_snapshots_ = 8;

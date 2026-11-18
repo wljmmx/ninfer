@@ -994,11 +994,23 @@ void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, Paged
             }
         }
     }
+    // port (sm_89, V10-81): remember whether this row's block table still addresses its whole
+    // history. A deferred mask leaves the table untouched on purpose, so the window predicate stops
+    // describing what this row reads, and a cross-row borrow must not treat one of its pages as spare.
+    {
+        const void* const key = cache.execution_tables().page_score_row(row).data;
+        const auto found = std::find(deferred_mask_rows_.begin(), deferred_mask_rows_.end(), key);
+        if (defer_apply && found == deferred_mask_rows_.end()) {
+            deferred_mask_rows_.push_back(key);
+        } else if (!defer_apply && found != deferred_mask_rows_.end()) {
+            deferred_mask_rows_.erase(found);
+        }
+    }
     if (!defer_apply) {
         // appendix GC (FZ layer 0): the scans' own left edge, computed once so the row write
         // and all three scans clamp the frontier the same way. The frontier is advanced once
         // they have all run.
-        const bool frontier_on = kv_eviction_frontier_enabled() && keep.empty();
+        const bool frontier_on       = kv_eviction_frontier_enabled() && keep.empty();
         std::uint32_t window_begin   = 0;
         std::uint32_t frontier_start = 0;
         if (frontier_on) {
@@ -1390,14 +1402,186 @@ bool ProgramImpl::demote_page_for_room(KVAddressSpaceStore& addresses, PagedKVCa
     return true;
 }
 
+namespace {
+// port (sm_89, V10-81): one row's read set for this step, in the vocabulary the window and
+// stage_step_kv_pages() use. `keep` is owned because it is the union of the installed window's list
+// and the selector's stored result for THAT row - the same two sources apply_kv_eviction_window()
+// masks with, which is what makes "this page is spare" true rather than assumed.
+struct StepReadSet {
+    std::uint32_t sink_pages = 0;
+    std::uint32_t keep_begin = 0; // first page of the newest window
+    std::vector<std::uint32_t> keep;
+
+    [[nodiscard]] bool addresses(std::uint32_t page) const noexcept {
+        return page < sink_pages || page >= keep_begin ||
+               std::find(keep.begin(), keep.end(), page) != keep.end();
+    }
+};
+
+StepReadSet step_read_set(const KvEvictionWindow& window, const KVExecutionTablePool& tables,
+                          KVExecutionRowHandle row, std::uint32_t live, std::uint32_t end) {
+    StepReadSet out;
+    if (!window.enabled()) {
+        // No window: every mapped page of the live history is read, so nothing is spare.
+        out.keep_begin = end;
+        return out;
+    }
+    out.sink_pages          = window.sink_pages;
+    const std::uint32_t eff = effective_window_pages(window.window_pages, live);
+    out.keep_begin          = end > eff ? end - eff : 0U;
+    out.keep                = window.keep_pages;
+    if (const auto found = g_scored_keep_by_row.find(tables.page_score_row(row).data);
+        found != g_scored_keep_by_row.end()) {
+        out.keep.insert(out.keep.end(), found->second.begin(), found->second.end());
+    }
+    return out;
+}
+} // namespace
+
+// port (sm_89, V10-81): cross-row borrowing. `demote_page_for_room` can only give back a page of
+// the row it is serving, so a row whose own non-addressed pages are gone fails even when a sibling
+// row is holding pages this step does not read: one physical page pool holds every lane's window at
+// once. What may be taken is exactly what NO active row of the space addresses this step -
+// correctness first, because a page a step reads must not leave the Device after that step's
+// staging ran, and the victim's own window would then read a recycled page.
+//
+// Victim selection: only a row with at least two spare pages qualifies, and at most half of that
+// row's slack is taken per call, so a victim never loses its last spare page and always keeps half
+// of what it was holding - enough to serve its own next step without a refetch. The qualifying rows
+// are visited most-slack-first from a rotating start, so equal-slack rows take turns instead of the
+// lowest row index being drained every time. A taken page leaves the victim's row marked absent
+// (the representation a demotion leaves) and its Host extent recorded against the victim's row, so
+// the victim's own page-in restores it through the existing path.
+bool ProgramImpl::borrow_slot_from_another_row(KVAddressSpaceStore& addresses, PagedKVCache& cache,
+                                               KVAddressSpaceHandle requester, std::uint32_t live,
+                                               std::uint32_t sink_pages, std::uint32_t window_pages,
+                                               const std::vector<std::uint32_t>& keep_pages) {
+    if (host_kv_extents == nullptr) { return false; }
+    // A/B switch, default on: without it the same binary reproduces the pre-V10-81 behaviour, so
+    // the "the borrow was what made room" claim is measured against its own control instead of
+    // inferred.
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_KV_BORROW");
+        return value == nullptr || *value == '\0' || std::strtol(value, nullptr, 10) != 0;
+    }();
+    if (!enabled) { return false; }
+    const KvEvictionWindow& window = kv_eviction_window();
+    if (!window.enabled()) { return false; }
+    LogicalKVPageStore* const pages =
+        &addresses == text_kv_addresses.get() ? text_kv_pages.get() : backend_kv_pages.get();
+    if (pages == nullptr) { return false; }
+    // Every handle ANY active row reads this step, the requester included. Compared on the handle
+    // and not on the page index because a forked prefix is one logical page shared by two rows:
+    // page 3 of the victim may be page 3 of a third row, and taking it would break that row
+    // instead.
+    std::vector<LogicalKVPageHandle> addressed;
+    const auto collect = [&](KVAddressSpaceHandle other) {
+        const std::uint32_t frontier = addresses.committed_frontier(other);
+        if (frontier == 0) { return; }
+        const std::uint32_t other_live = kv_live_pages(frontier);
+        const std::uint32_t end        = std::min(other_live, addresses.mapped_pages(other));
+        if (end == 0) { return; }
+        const StepReadSet reads =
+            other == requester
+                ? StepReadSet{.sink_pages = sink_pages,
+                              .keep_begin = end > window_pages ? end - window_pages : 0U,
+                              .keep       = keep_pages}
+                : step_read_set(window, cache.execution_tables(),
+                                addresses.execution_row(other).handle(), other_live, end);
+        for (std::uint32_t page = 0; page < end; ++page) {
+            if (reads.addresses(page)) { addressed.push_back(addresses.logical_page(other, page)); }
+        }
+    };
+    addresses.for_each_active_address(collect);
+    const auto is_addressed = [&](LogicalKVPageHandle handle) {
+        return std::find(addressed.begin(), addressed.end(), handle) != addressed.end();
+    };
+
+    struct Candidate {
+        KVAddressSpaceHandle address;
+        std::int32_t row = -1;
+        std::vector<std::uint32_t> slack; // spare pages, oldest first
+    };
+
+    std::vector<Candidate> candidates;
+    addresses.for_each_active_address([&](KVAddressSpaceHandle other) {
+        if (other == requester) { return; }
+        const std::uint32_t frontier = addresses.committed_frontier(other);
+        if (frontier == 0) { return; }
+        const std::uint32_t victim_live = kv_live_pages(frontier);
+        const std::uint32_t end         = std::min(victim_live, addresses.mapped_pages(other));
+        if (end == 0) { return; }
+        // A row whose mask was deferred reads its whole history this step: nothing of it is spare.
+        const void* const victim_key =
+            cache.execution_tables().page_score_row(addresses.execution_row(other).handle()).data;
+        if (std::find(deferred_mask_rows_.begin(), deferred_mask_rows_.end(), victim_key) !=
+            deferred_mask_rows_.end()) {
+            return;
+        }
+        Candidate candidate;
+        candidate.address = other;
+        candidate.row     = addresses.bound_row(other);
+        for (std::uint32_t page = 0; page < end; ++page) {
+            const LogicalKVPageHandle handle = addresses.logical_page(other, page);
+            if (!pages->device_resident(handle) || pages->host_resident(handle)) { continue; }
+            if (is_addressed(handle)) { continue; }
+            // The same eligibility a borrow's demotion needs; a protected or pinned page would make
+            // the whole attempt a no-op, so it is not counted as slack in the first place.
+            if (!pages->can_demote_device_replica(handle)) { continue; }
+            candidate.slack.push_back(page);
+        }
+        if (candidate.slack.size() >= 2) { candidates.push_back(std::move(candidate)); }
+    });
+    if (candidates.empty()) { return false; }
+    const std::size_t space = &addresses == text_kv_addresses.get() ? 0 : 1;
+    // Rotation first (so ties take turns), then most slack first (so the row that can afford it
+    // gives the page). The cursor advances only on a successful take.
+    std::rotate(candidates.begin(),
+                candidates.begin() +
+                    static_cast<std::ptrdiff_t>(borrow_cursor_[space] % candidates.size()),
+                candidates.end());
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [](const Candidate& left, const Candidate& right) {
+                         return left.slack.size() > right.slack.size();
+                     });
+    for (const Candidate& candidate : candidates) {
+        const std::size_t budget = candidate.slack.size() / 2;
+        for (std::size_t index = 0; index < budget; ++index) {
+            const std::uint32_t page = candidate.slack[index];
+            if (!demote_page_for_room(addresses, cache, candidate.address, page)) { continue; }
+            if (candidate.row >= 0) {
+                const KVExecutionRowHandle victim_row =
+                    addresses.execution_row(candidate.address).handle();
+                const std::array<std::uint32_t, 1> taken{page};
+                cache.execution_tables().mark_absent(victim_row, taken, device.stream);
+            }
+            PageInCounters& counters = page_in_counters(addresses);
+            ++counters.borrowed;
+            ++borrow_cursor_[space];
+            std::fprintf(stderr,
+                         "[kv-page-in] borrow %s: requester_row=%d victim_row=%d page=%u "
+                         "slack=%zu of %u mapped (pool %u/%u)\n",
+                         space == 0 ? "text" : "backend", addresses.bound_row(requester),
+                         candidate.row, page, candidate.slack.size(),
+                         addresses.mapped_pages(candidate.address),
+                         cache.page_pool().capacity_pages(), kv_logical_page_groups);
+            std::fflush(stderr);
+            return true;
+        }
+    }
+    return false;
+}
+
 // port (sm_89, V10-79): the read half of the resident-KV leg. Every page this step ADDRESSES whose
 // Device replica is gone is copied back into a free slot and republished into the row before the
 // layer that reads it runs; when the pool has no free slot, the oldest page this step does NOT
 // address is given back first (the recency rule the window's own scan uses - the scan walks [0,
-// end), so the earliest page is the least recently useful one). A page that cannot be brought back
-// is counted, never assumed away: the caller turns a non-zero answer into a refusal that names the
-// remaining limit instead of letting attention read a table entry naming a recycled page. Returns
-// the number of addressed pages still without a Device replica.
+// end), so the earliest page is the least recently useful one), and when THIS row has nothing left
+// to give back, a sibling row that holds pages no active row reads this step lends one
+// (borrow_slot_from_another_row, V10-81). A page that cannot be brought back is counted, never
+// assumed away: the caller turns a non-zero answer into a refusal that names the remaining limit
+// instead of letting attention read a table entry naming a recycled page. Returns the number of
+// addressed pages still without a Device replica.
 std::uint32_t ProgramImpl::page_in_addressed_pages(KVAddressSpaceStore& addresses,
                                                    PagedKVCache& cache,
                                                    KVAddressSpaceHandle address, std::uint32_t live,
@@ -1429,6 +1613,15 @@ std::uint32_t ProgramImpl::page_in_addressed_pages(KVAddressSpaceStore& addresse
         }
     }
     counters.candidates = static_cast<std::uint32_t>(wanted.size());
+    if (std::getenv("NINFER_KV_PAGE_IN_SLACK_LOG") != nullptr) {
+        std::fprintf(stderr,
+                     "[kv-page-in] slack %s: live=%u end=%u addressed_missing=%zu spare=%zu "
+                     "pool=%u/%u\n",
+                     &addresses == text_kv_addresses.get() ? "text" : "backend", live, end,
+                     wanted.size(), spare.size(), cache.page_pool().capacity_pages(),
+                     kv_logical_page_groups);
+        std::fflush(stderr);
+    }
     if (wanted.empty()) { return 0; }
     std::size_t spare_cursor = 0;
     for (const std::uint32_t page : wanted) {
@@ -1441,6 +1634,13 @@ std::uint32_t ProgramImpl::page_in_addressed_pages(KVAddressSpaceStore& addresse
             bool made_room = false;
             while (spare_cursor < spare.size() && !made_room) {
                 made_room = demote_page_for_room(addresses, cache, address, spare[spare_cursor++]);
+            }
+            // port (sm_89, V10-81): this row's own non-addressed pages are gone, which under a
+            // multi-lane batch is not the same as "nobody can give a page back". Take one from a
+            // row that holds pages no active row reads this step.
+            if (!made_room) {
+                made_room = borrow_slot_from_another_row(addresses, cache, address, live,
+                                                         sink_pages, window_pages, keep_pages);
             }
             if (!made_room) { continue; }
         }
@@ -1516,10 +1716,10 @@ void ProgramImpl::stage_step_kv_pages(KVAddressSpaceStore& addresses, PagedKVCac
         throw std::runtime_error(
             "KV page-in could not restore every addressed page before the step: addressed=" +
             std::to_string(staged.candidates) + " restored=" + std::to_string(staged.fetched) +
-            " missing=" + std::to_string(missing) + " (Device pool " +
-            std::to_string(cache.page_pool().capacity_pages()) + " page group(s) of " +
-            std::to_string(kv_logical_page_groups) + " logical, Host payload " +
-            std::to_string(host_kv_payload_bytes >> 20) +
+            " missing=" + std::to_string(missing) + " borrowed=" + std::to_string(staged.borrowed) +
+            " (Device pool " + std::to_string(cache.page_pool().capacity_pages()) +
+            " page group(s) of " + std::to_string(kv_logical_page_groups) +
+            " logical, Host payload " + std::to_string(host_kv_payload_bytes >> 20) +
             " MiB). A page this step does not address has to exist to be given back; the "
             "full-attention layers address the whole history, so the pool must cover it.");
     }
@@ -1541,11 +1741,11 @@ void ProgramImpl::stage_step_kv_pages(KVAddressSpaceStore& addresses, PagedKVCac
     const std::uint32_t again =
         page_in_addressed_pages(addresses, cache, address, live, sink_pages, eff_window, keep);
     std::fprintf(stderr,
-                 "[kv-page-in] probe %s: staged=%u demoted=%u refetched=%u missing=%u live=%u "
-                 "pool=%u/%u\n",
+                 "[kv-page-in] probe %s: staged=%u demoted=%u refetched=%u missing=%u borrowed=%u "
+                 "live=%u pool=%u/%u\n",
                  &addresses == text_kv_addresses.get() ? "text" : "backend", staged_before,
-                 given_back, staged.fetched, again, live, cache.page_pool().capacity_pages(),
-                 kv_logical_page_groups);
+                 given_back, staged.fetched, again, staged.borrowed, live,
+                 cache.page_pool().capacity_pages(), kv_logical_page_groups);
     std::fflush(stderr);
     if (again != 0) {
         throw std::runtime_error("KV page-in probe: the re-fetch after the induced demotion left " +
