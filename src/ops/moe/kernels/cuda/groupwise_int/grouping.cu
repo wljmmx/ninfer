@@ -205,6 +205,10 @@ void count_shape(const ExpertRoutes& routes, ExpertSubset subset, const GroupedS
     const int tiles  = (count + 8 * S::top_k - 1) / (8 * S::top_k);
     const auto* ids  = static_cast<const int*>(routes.ids.data);
     const auto* mask = static_cast<const int*>(subset.mask.data);
+    // Every check in this file is the verdict on its own launch, so the error an earlier call left
+    // behind on this thread is dropped first. Reading it as this launch's verdict is how a refused
+    // cudaHostAlloc during engine construction surfaced here as cudaErrorAlreadyMapped (V10-73).
+    (void)cudaGetLastError();
     if (subset.kind == ExpertSubsetKind::All) {
         count_assignments<S, false><<<tiles, S::experts, 0, execution.stream>>>(
             ids, nullptr, 0, storage.local_ranks, storage.tile_counts, count);
@@ -219,6 +223,7 @@ void count_shape(const ExpertRoutes& routes, ExpertSubset subset, const GroupedS
 template <class S>
 void scan_shape(const ExpertRoutes& routes, const GroupedPlan& plan, const GroupedStorage& storage,
                 CudaExecutionView execution, std::uint32_t* missed) {
+    (void)cudaGetLastError();
     scan_assignments<S><<<1, S::experts, 0, execution.stream>>>(
         storage, (routes.ids.ne[1] + 7) / 8, plan, routes.ids.ne[1] * S::top_k, missed);
     CUDA_CHECK(cudaGetLastError());
@@ -239,6 +244,7 @@ void count_scan_shape(const ExpertRoutes& routes, ExpertSubset subset, const Gro
     }
     const auto* ids  = static_cast<const int*>(routes.ids.data);
     const auto* mask = static_cast<const int*>(subset.mask.data);
+    (void)cudaGetLastError();
     if (subset.kind == ExpertSubsetKind::All) {
         fuse_count_scan<S, false>
             <<<1, S::experts, 0, execution.stream>>>(ids, nullptr, 0, count, storage, plan, nullptr);
@@ -254,6 +260,7 @@ template <class S>
 void index_shape(const ExpertRoutes& routes, const GroupedStorage& storage,
                  CudaExecutionView execution) {
     const int count = S::top_k * routes.ids.ne[1];
+    (void)cudaGetLastError();
     index_assignments<S><<<(count + 255) / 256, 256, 0, execution.stream>>>(
         static_cast<const int*>(routes.ids.data), storage, count);
     CUDA_CHECK(cudaGetLastError());
@@ -290,10 +297,10 @@ void launch_route_coverage(const std::int32_t* ids, int assignments, const std::
     if (assignments <= 0) {
         // An empty route list is covered by definition; the word is still written so a caller never
         // reads a stale verdict from the layer before.
-        (void)cudaMemsetAsync(excluded, 0, sizeof(std::uint32_t), execution.stream);
-        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemsetAsync(excluded, 0, sizeof(std::uint32_t), execution.stream));
         return;
     }
+    (void)cudaGetLastError();
     count_uncovered<<<1, 256, 0, execution.stream>>>(ids, mask, member, experts, assignments,
                                                      excluded);
     CUDA_CHECK(cudaGetLastError());

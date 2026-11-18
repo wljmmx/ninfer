@@ -924,9 +924,9 @@ int main() {
             }
             const auto slot_bytes = HostExpertResidency::slot_bytes_for(
                 fixture.requirements.banks[2].entry_bytes);
-            // The tier does not allocate: its block is the caller's, on purpose (see
-            // HostArenaBlock - a pageable stand-in surfaces later as a launch failure). This test
-            // process owns the block and lets it go with the process.
+            // The tier does not allocate: the caller allocates the block and hands it over (see
+            // HostArenaBlock - a pageable stand-in surfaces later as a launch failure). The tier
+            // owns it from then on and releases it with itself (HostArenaOwner).
             const std::uint64_t arena_bytes = 36 * slot_bytes;
             void*               arena_host  = nullptr;
             if (cudaHostAlloc(&arena_host, static_cast<std::size_t>(arena_bytes),

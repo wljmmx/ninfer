@@ -51,3 +51,10 @@ endif()
 foreach(app IN ITEMS ninfer ninfer-serve ninfer-perplexity)
   ninfer_deploy_runtime_dlls(${app})
 endforeach()
+
+# V10-73: sequential-construction diagnostic. Two engines built back to back in one process must
+# get the same accounting; this tool prints the three numbers the plan is made of around every
+# construction and teardown. Never part of the product binaries.
+add_executable(diag-second-engine diag-second-engine/main.cpp)
+ninfer_internal_includes(diag-second-engine)
+target_link_libraries(diag-second-engine PRIVATE ninfer_engine CUDA::cudart ninfer_product_logging)

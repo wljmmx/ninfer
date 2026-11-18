@@ -59,10 +59,46 @@ struct HostWarmBudget {
 // for a number and hoping it holds was the failure this replaces (a 21 GiB ceiling, then 20941 MiB
 // refused underneath it). `bytes` is the authority on how many slots exist - the tier derives its
 // capacity from it instead of the other way round.
+//
+// The caller allocates it; the tier it is handed to OWNS it from then on (see HostArenaOwner) and
+// gives it back when it goes away.
 struct HostArenaBlock {
     void*         host   = nullptr;
     void*         device = nullptr; // Device-visible alias of `host`, null when the alias was refused
     std::uint64_t bytes  = 0;
+};
+
+// Ownership of that block. A block is a pinned (and mapped) cudaHostAlloc, so its bytes stay
+// charged to the process as commit for as long as the pointer lives - releasing it is not
+// bookkeeping, it is what makes a second Engine in the same process price its own tiers against the
+// machine instead of against the first one. Measured before this existed (V10-73, 35B-e2, 4090):
+// every engine left its arena behind (14550 MiB in the first round, 3684 in the second, 8846 in the
+// third), the commit headroom each construction read fell 21.4 GiB -> 3.4 GiB -> 0, the host tier
+// was clamped to a third of its ask, the 2 GiB pinned context arena was then refused, and the
+// fourth construction could not allocate its tier at all.
+//
+// Freeing here rather than in the caller is the ordering that works: the block backs this tier, so
+// it must outlive every slot table and every view of it, and the tier is the last owner.
+struct HostArenaOwner {
+    HostArenaBlock block{};
+
+    HostArenaOwner() noexcept = default;
+    explicit HostArenaOwner(HostArenaBlock value) noexcept : block(value) {}
+    HostArenaOwner(const HostArenaOwner&)            = delete;
+    HostArenaOwner& operator=(const HostArenaOwner&) = delete;
+
+    ~HostArenaOwner() {
+        if (block.host == nullptr) { return; }
+        // The return value of this call, not cudaGetLastError(): a stale error left by an earlier
+        // allocation must not be reported as this release failing.
+        const cudaError_t status = cudaFreeHost(block.host);
+        if (status != cudaSuccess) {
+            std::fprintf(stderr, "[warm] arena block release failed for %p (%s)\n", block.host,
+                         cudaGetErrorString(status));
+            std::fflush(stderr);
+        }
+        block = {};
+    }
 };
 
 // The host half of a split expert tier. It holds one uniform slot per expert using the same entry
@@ -77,7 +113,8 @@ public:
     HostExpertResidency(std::span<const HostExpertBankDesc> banks,
                         std::span<const ExpertFileBank> files, const ExpertBlobReader* reader,
                         HostWarmBudget budget, HostArenaBlock block = {})
-        : banks_(banks.begin(), banks.end()), files_(files.begin(), files.end()), reader_(reader) {
+        : arena_owner_(block), banks_(banks.begin(), banks.end()),
+          files_(files.begin(), files.end()), reader_(reader) {
         std::uint64_t widest = 0;
         for (const auto& bank : banks_) {
             widest = std::max(widest, bank.entry.entry_bytes);
@@ -1641,6 +1678,9 @@ private:
         }
     }
 
+    // Declared first so it is destroyed last: the block outlives every slot table and view in this
+    // object, and the caller gets the pinned bytes back (V10-73).
+    HostArenaOwner arena_owner_;
     std::vector<HostExpertBankDesc> banks_;
     std::vector<ExpertFileBank> files_;
     const ExpertBlobReader* reader_ = nullptr;

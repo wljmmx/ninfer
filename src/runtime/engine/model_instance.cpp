@@ -912,6 +912,9 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
                                            streams[i]->count()),
                              streams[i]->per_expert_objects()});
         }
+        // `host_block` is handed over: the tier owns the pinned mapping from here on and gives it
+        // back when it goes away (HostArenaOwner). Nothing below may free it, and a throw out of
+        // this construction releases it through the owner.
         auto residency = std::make_shared<models::qwen3_5::execution::HostExpertResidency>(
             descs, files, source,
             models::qwen3_5::execution::HostWarmBudget{
