@@ -123,6 +123,9 @@ done
 而不是静默算错。要真正跑更长的上下文，只能给 KV 更多页（`NINFER_KV_RESIDENCY_SLACK_MB` 调小 /
 `--max-context` 调小）。
 
+> 装了窗口（`NINFER_KV_EVICT_WINDOW` / `_SINK` / `_KEEP_*`）时，上面这句要被 §5.6 取代：
+> 一步只寻址 sink + 最新窗口 + selector 的 keep 集，准入也按这个集合定价。
+
 ### 5.4 需要 Host tier
 
 回填要有地方可读：residency 计划会自己把 `host_kv_payload_bytes` 定进 Host 预算；显式声明竞技场
@@ -140,6 +143,35 @@ done
   23 token 提示词的 8 个 token 与 1024 页运行一致，20.0 tok/s（1024 页：A 24.8 / B 25.0 tok/s）；
   43520 token 提示词在准入被拒（`resident_tokens=31936`）。
 * 关掉时门禁逐位不变：27B `7.359779` / `e95cacb864d8b1ab`；35B `4801 / 2.055310 / 7.809254`。
+
+### 5.6 多行准入按"一步读的页集"计价（V10-84，`NINFER_KV_READ_PRICING` 默认开）
+
+§5.3 说的是"没装窗口"的情形。装了窗口后 `stage_step_kv_pages()` 的寻址判据是
+`page < sink || page ≥ end − eff_window || page ∈ keep`，V10-79/81 的 page-in 与跨行借用都按这个集合工作。
+准入与每步检查此前仍按整段历史定价，于是四行批次买到的竞技场远大于 Σ(sink+window)——
+V10-81 的 `borrowed=0` 就是这个原因。V10-84 让两个点改按读集计价：
+
+```
+price(行) = fixed + pending(行) + growth(行)      price(新人) = fixed + ceil(min(prompt, chunk) / 64)
+fixed    = sink + window + 显式 keep 列表 + 3 × selector 预算      // 与 page_in 的判据同源
+pending  = mapped_pages − ceil(committed_frontier / 64)           // 窗口按"已提交"施加，映射跑在前面
+growth   = ceil((max(frontier,cursor) + unit)/64) − ceil(max(frontier,cursor)/64)
+```
+
+* 只在四件事同时成立时生效：`NINFER_KV_PAGE_IN=1`、竞技场分层、装了窗口、存储内核支持 absent pages；
+  `NINFER_KV_EVICT_KEEP_RATIO`（keep 是比例）或 `NINFER_KV_EVICT_DEFER` + selector（掩码被推迟）时
+  **自动退回整段历史**。腿关时逐字节不变。
+* 不变量：计价集 ⊇ 寻址集，且 Σ 计价 ≤ 竞技场 ⇒ 一步要读的页永远装得下，`page_in` 一定能在
+  "本步不读的页"里找到槽（先本行、再按 V10-81 跨行借）。真被打破时走既有精确拒绝，绝不读回收页。
+* 实测（27B dense / bf16 / 4 lanes / window 8 / sink 1 / chunk 128）：4×6000 token（Σ 历史 376 页）
+  在声明 96 页竞技场准入并跑完，四行 token 与 512 页全驻留**逐位一致**（`spilled=341 fetched=2`，
+  probe `demoted=2 refetched=2 missing=0 borrowed=0`）；同二进制 `NINFER_KV_READ_PRICING=0` 第 2 行被拒。
+  V10-81 的配置（4×1500 / chunk 1024 / 100 页）买到的仍是 100 页，token 与当时一致。
+  `NINFER_KV_BORROW` 的跨行借用在 96/64 页下仍未触发（池子有余量）。
+* 未闭环：被抢占行的 replay 仍按整段历史预留（`recovery->coverage`）；Host tier 必须装得下被降级的页
+  （512 MiB ≈ 128 页，4×6000 需要 ~340 页）；竞技场下限 = `sink + window + 2 × chunk + 1` 页/行，
+  所以窗口尺度的竞技场需要小 `--prefill-chunk`；Control 步仍按整段历史（Program 看不到 control token 数）。
+  详见 `.temp/v10-84/report.md`。
 
 ## 6. 容量下注 A/B 的代价（V10-82）
 
