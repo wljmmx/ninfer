@@ -1,6 +1,7 @@
 #include "ninfer/engine.h"
 
 #include "core/device.h"
+#include "core/expert_stage_stats.h"
 #include "core/nvtx.h"
 #include "core/startup.h"
 #include "runtime/contract/sampling.h"

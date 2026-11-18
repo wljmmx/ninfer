@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 
+#include "core/expert_stage_stats.h"
 #include "core/vmm_pool.h"
 #include "core/device_scope.h"
 #include "core/transfer.h"
@@ -1515,6 +1516,10 @@ void ExpertCache::prepare(std::span<const ExpertCacheKey> required, cudaStream_t
             ms = 0.0;
         }
     }
+    // V10-85: the submission half of the copy leg, counted whether or not the log above is on (see
+    // wait_for_progress(), which counts the drain; together they are the layer's Host -> Device turn).
+    ninfer::core::expert_stage_stats().copy_seconds +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
 }
 
 bool ExpertCache::set_resident_experts(std::uint32_t bank, std::span<const std::uint32_t> experts,
@@ -1801,6 +1806,11 @@ void ExpertCache::wait_for_progress(cudaStream_t stream) {
     // time, and the body below says it should be a no-op when nothing is missing. Those two cannot
     // both be true, so the round count and the staged count are published: a layer that uploads
     // nothing must report rounds=1 staged=0, and a layer that does not is the answer.
+    //
+    // V10-85: this call is the streaming leg's Host -> Device half - everything between the layer's
+    // prepare() and its GEMM - so it is timed unconditionally into the process-wide counter that the
+    // capacity bet prices a per-layer fill with (core/expert_stage_stats.h). The two clocks are all it
+    // costs; the NINFER_UPLOAD_TIMING block below is the old per-window log, unchanged.
     const bool timing    = std::getenv("NINFER_UPLOAD_TIMING") != nullptr;
     const auto begin     = std::chrono::steady_clock::now();
     std::uint64_t rounds = 0;
@@ -1811,6 +1821,12 @@ void ExpertCache::wait_for_progress(cudaStream_t stream) {
         staged_total += state.submitted_batches;
         if (state.required_published) { break; }
     }
+    auto& stage = ninfer::core::expert_stage_stats();
+    stage.copy_seconds +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+    // A layer counts only when the drain actually staged something: a resident layer issues the same
+    // wait, stages nothing, and must not dilute a per-layer figure it never paid.
+    if (staged_total != 0) { ++stage.layers; }
     impl_->last_staged = static_cast<std::uint32_t>(staged_total);
     // port (sm_89): the staging events this loop waits on are the copies' completion, so this is the
     // moment the arena may reuse the slots it handed out (ExpertArenaSource::uploads_settled).

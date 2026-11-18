@@ -5,6 +5,7 @@
 #include "artifact/formats.h"
 #include "core/capacity_bet.h"
 #include "core/expert_cache.h"
+#include "core/expert_stage_stats.h"
 #include "core/memory_budget.h"
 #include "core/startup.h"
 #include "core/transfer_rate.h"
@@ -423,6 +424,13 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
             // V10-83: a pool smaller than the ask seats no layer whole, so every routed layer pays
             // the per-layer round trip; that count is what the fixed term multiplies.
             request.expert_layers = streams.size();
+            // V10-85: and the round trip itself is the engine's own measurement when this process has
+            // one - the Host tier's fill plus the upload turn's drain, timed at the places a layer
+            // blocks (core/expert_stage_stats.h). The FIRST plan of a process has none: nothing has
+            // streamed yet, so this is zero, the price falls back to kStreamLayerFixedMs, and the
+            // plan line says `fill_source=fallback`. A re-plan, or a second Engine in the process,
+            // reads the counter and prints `fill_source=measured` with the value it used.
+            request.expert_fill_ms_per_layer = core::expert_fill_ms_per_layer();
             // V10-82: a pool the caller pinned is the pool the run gets, so the price is computed
             // against it rather than against the ask the split never funded. Zero (auto) leaves the
             // rule's own figure in charge.

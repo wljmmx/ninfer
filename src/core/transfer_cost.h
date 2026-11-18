@@ -32,6 +32,18 @@
 // per step over 40 streaming layers: 0.5735 ms per layer, byte-independent (a 129 MiB step and a
 // 474 MiB step both paid it). It is charged per layer that has any miss, never per slot.
 //
+// V10-85: that 0.5735 was a FITTED intercept, and V10-83 said so. The engine now times the path
+// itself (core/expert_stage_stats.h: the Host tier's artifact read, then the upload turn's
+// submission and drain), and a measurement, when this build has one, replaces both terms of the
+// slot bill - because the counter covers the bytes too: it is the wall time of the very read and
+// copy the model was estimating, at the rates the engine actually got. Charging the probe-rate byte
+// term beside a measured fill would charge the same bytes twice, and it is the wrong rate besides:
+// on 35B e2 the Host tier holds the whole complement, so a step's misses are served from pinned
+// Host memory and are never read out of the artifact at all (V10-83's 468/253 MiB arms measured
+// 25.6/23.4 ms/step where the series-rate model said 38.8/69.3). With no measurement the old
+// two-term model stands, and `StepTransferCost::expert_fill_measured` says which of the two a
+// caller got.
+//
 // WHAT THIS MODEL STILL DOES NOT PRICE, stated because the residual error in the report is these
 // terms: a fetch that cannot take a free slot also DEMOTES a page first (a second copy of the same
 // size), the host tier's own hits are not modelled (a resident expert is free, a page-cache hit is
@@ -75,8 +87,10 @@ struct TransferRates {
     }
 };
 
-// The per-layer round trip a streaming layer pays on top of its bytes (see the header comment).
-// From V10-82's regression on 35B e2: 22.94 ms/step over 40 layers, slope-removed.
+// The per-layer round trip a streaming layer pays on top of its bytes, when this build has not
+// measured one. From V10-82's regression on 35B e2: 22.94 ms/step over 40 layers, slope-removed. It
+// is a FALLBACK and prints as one: `expert_fill_ms_per_layer()` (core/expert_stage_stats.h) is the
+// measurement that replaces it, and `StepTransferCost::expert_fill_measured` says which was used.
 inline constexpr double kStreamLayerFixedMs = 0.5735;
 
 // One decode step's geometry, in the bet's own units. `pages_addressed` is what the step READS
@@ -86,6 +100,11 @@ inline constexpr double kStreamLayerFixedMs = 0.5735;
 // fully covered - the difference is clamped at zero, never negative. `expert_layers` is how many
 // layers route experts at all: it converts the fixed term above into a per-step figure, and a step
 // with no miss prices no layer, because a layer that uploads nothing pays no round trip.
+//
+// V10-85: `expert_fill_ms_per_layer` is what the engine MEASURED one streaming layer to cost on
+// this path - the layer's FFN wall, with the artifact read and the copy inside it
+// (core/expert_stage_stats.h). Zero is "not measured", never "free": the fixed term then takes
+// kStreamLayerFixedMs and the byte term is priced as before.
 struct StepTransferGeometry {
     std::uint64_t page_bytes            = 0;
     std::uint64_t pages_addressed       = 0;
@@ -94,6 +113,7 @@ struct StepTransferGeometry {
     std::uint64_t experts_routed        = 0;
     std::uint64_t expert_slots_resident = 0;
     std::uint64_t expert_layers         = 0;
+    double        expert_fill_ms_per_layer = 0.0;
 };
 
 struct StepTransferCost {
@@ -105,6 +125,11 @@ struct StepTransferCost {
     double expert_fixed_ms      = 0.0;
     // The whole slot leg: bytes through the serial pipeline plus the per-layer round trips.
     double expert_ms            = 0.0;
+    // V10-85: the per-layer fill this price used and where it came from. A measured fill prices the
+    // whole slot leg (`expert_bytes_ms` is then 0, not missing: the bytes are inside the
+    // measurement), so a caller that prints both terms must print this flag beside them.
+    double expert_fill_ms_per_layer = 0.0;
+    bool   expert_fill_measured     = false;
 
     [[nodiscard]] double total_ms() const noexcept { return page_in_ms + expert_ms; }
 };
@@ -129,18 +154,32 @@ namespace detail {
 // addressed pages or routed experts never costs less, more resident pages or slots never costs
 // more, and a step that owes nothing (every page resident, every route seated) costs exactly zero -
 // including the fixed term, which is charged only to layers that actually upload.
+//
+// V10-85: a measured per-layer fill replaces both terms of the slot leg (the measurement covers the
+// bytes), and it is still charged only to layers that upload, so a resident step stays exactly zero
+// however the fill was derived.
 [[nodiscard]] inline StepTransferCost price_step_transfers(const StepTransferGeometry& geometry,
                                                            const TransferRates& rates) noexcept {
     StepTransferCost cost;
     cost.pages_fetched = detail::excess_of(geometry.pages_addressed, geometry.pages_resident);
     cost.expert_misses = detail::excess_of(geometry.experts_routed, geometry.expert_slots_resident);
     cost.stream_layers = cost.expert_misses != 0 ? geometry.expert_layers : 0;
+    const double measured_fill = geometry.expert_fill_ms_per_layer > 0.0
+                                     ? geometry.expert_fill_ms_per_layer
+                                     : kStreamLayerFixedMs;
+    cost.expert_fill_ms_per_layer = measured_fill;
+    cost.expert_fill_measured     = geometry.expert_fill_ms_per_layer > 0.0;
     cost.page_in_ms =
         detail::transfer_ms(cost.pages_fetched * geometry.page_bytes, rates.page_in_bytes_per_s);
-    cost.expert_bytes_ms = detail::transfer_ms(cost.expert_misses * geometry.slot_bytes,
-                                               rates.expert_effective_bytes_per_s());
-    cost.expert_fixed_ms =
-        static_cast<double>(cost.stream_layers) * kStreamLayerFixedMs;
+    if (cost.expert_fill_measured) {
+        // The bytes are inside the measurement: a fill that is timed to the drain already paid for
+        // the copy it staged, at the rate the run got rather than the rate a probe predicted.
+        cost.expert_bytes_ms = 0.0;
+    } else {
+        cost.expert_bytes_ms = detail::transfer_ms(cost.expert_misses * geometry.slot_bytes,
+                                                   rates.expert_effective_bytes_per_s());
+    }
+    cost.expert_fixed_ms = static_cast<double>(cost.stream_layers) * measured_fill;
     cost.expert_ms = cost.expert_bytes_ms + cost.expert_fixed_ms;
     return cost;
 }

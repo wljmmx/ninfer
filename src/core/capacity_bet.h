@@ -109,6 +109,16 @@
 //     of a 22.9 ms per-step intercept that appears at the FIRST miss and does not scale with the
 //     bytes (40 streaming layers x 0.5735 ms). Both are now priced; the report gives the residual.
 //
+// THE ROUND TRIP IS MEASURED NOW (V10-85). 0.5735 ms per layer was a regression intercept; the engine
+// times the path it names (core/expert_stage_stats.h: the Host tier's artifact read, then the upload
+// turn's submission and drain) and the bet takes that number when it exists. It then prices the whole
+// slot leg with it, because the measurement covers the bytes as well - on 35B e2 the Host tier holds
+// the complement, so a step's misses are served from pinned Host memory and the probe-rate byte term
+// was pricing artifact reads that never happened (V10-83 measured 25.6/23.4 ms/step on the 468/253
+// MiB arms against the model's 38.8/69.3). `expert_fill_ms_per_layer=` on the plan line says the
+// value and `fill_source=measured|fallback` says which one it was; the first plan of a process has
+// nothing to read yet, and then the constant stands, labelled.
+//
 // So the comparison is PRINTED in full and acted on only where it is exact: the categorical case
 // where B owes nothing at all, which the model gets right because zero misses is zero copies. A
 // non-zero B bill is a model - now a model with the artifact read and the per-layer round trip
@@ -224,6 +234,12 @@ struct CapacityBetRequest {
     // spread over all banks, so no layer is wholly served), which is what the measured intercept
     // counts; zero leaves the fixed term unpriced, which is the pre-V10-83 bill.
     std::uint64_t expert_layers = 0;
+    // V10-85: what the engine measured one streaming layer to cost - the layer's own FFN wall, with
+    // its two fill legs inside it (core/expert_stage_stats.h) - or zero when this process has not
+    // measured one yet: the first plan of a process has nothing to read, and then the price falls
+    // back to the constant and says so. The caller passes the counter straight through, so a
+    // re-plan, or a second Engine in the same process, prices the fill the run before it paid.
+    double expert_fill_ms_per_layer = 0.0;
     TransferRates transfer_rates{};
     // The pool the caller will ACTUALLY allocate, when it has already decided (a pinned
     // NINFER_EXPERT_CACHE_MB, or a pool the split sized). Zero means "the caller lets the split
@@ -281,7 +297,8 @@ struct CapacityBetRequest {
          .slot_bytes            = request.expert_slot_bytes,
          .experts_routed        = request.experts_routed_per_step,
          .expert_slots_resident = capped_pool / request.expert_slot_bytes,
-         .expert_layers         = request.expert_layers},
+         .expert_layers         = request.expert_layers,
+         .expert_fill_ms_per_layer = request.expert_fill_ms_per_layer},
         request.transfer_rates);
 }
 
@@ -339,6 +356,11 @@ struct CapacityBetPlan {
     std::uint64_t cost_b_miss_bytes = 0;
     double        cost_b_bytes_ms   = 0.0;
     double        cost_b_fixed_ms   = 0.0;
+    // V10-85: the per-layer fill those two were built with, and whether the engine measured it
+    // (core/expert_stage_stats.h) or the price fell back to kStreamLayerFixedMs. Printed, because the
+    // one thing a reader of the bill must be able to check is what the round trip was priced at.
+    double        expert_fill_ms_per_layer = 0.0;
+    bool          expert_fill_measured     = false;
     CapacityBet   cost_choice    = CapacityBet::ExpertResident; // the arrangement the prices rank first
     TransferRates transfer_rates{};
 
@@ -370,13 +392,15 @@ struct CapacityBetPlan {
     const int written = std::snprintf(
         out, size,
         " cost_a_ms=%.2f cost_b_ms=%.2f miss_a_mib=%.1f miss_b_mib=%.1f disk_gbps=%.2f "
-        "pcie_gbps=%.2f eff_gbps=%.2f fixed_ms_b=%.2f cheaper=%s",
+        "pcie_gbps=%.2f eff_gbps=%.2f fixed_ms_b=%.2f expert_fill_ms_per_layer=%.4f "
+        "fill_source=%s cheaper=%s",
         plan.cost_a_ms, plan.cost_b_ms,
         static_cast<double>(plan.cost_a_miss_bytes) / (1024.0 * 1024.0),
         static_cast<double>(plan.cost_b_miss_bytes) / (1024.0 * 1024.0),
         plan.transfer_rates.disk_bytes_per_s / 1e9,
         plan.transfer_rates.expert_bytes_per_s / 1e9,
         plan.transfer_rates.expert_effective_bytes_per_s() / 1e9, plan.cost_b_fixed_ms,
+        plan.expert_fill_ms_per_layer, plan.expert_fill_measured ? "measured" : "fallback",
         capacity_bet_name(plan.cost_choice));
     if (written <= 0 || static_cast<std::size_t>(written) >= size ||
         plan.cost_choice == plan.choice) {
@@ -462,6 +486,8 @@ plan_capacity_bet(const CapacityBetRequest& request,
             plan.cost_b_miss_bytes = cost.expert_misses * request.expert_slot_bytes;
             plan.cost_b_bytes_ms   = cost.expert_bytes_ms;
             plan.cost_b_fixed_ms   = cost.expert_fixed_ms;
+            plan.expert_fill_ms_per_layer = cost.expert_fill_ms_per_layer;
+            plan.expert_fill_measured     = cost.expert_fill_measured;
             plan.cost_choice       = CapacityBet::ExpertResident;
         }
         return plan;
@@ -614,6 +640,8 @@ plan_capacity_bet(const CapacityBetRequest& request,
         plan.cost_b_miss_bytes = cost_b.expert_misses * request.expert_slot_bytes;
         plan.cost_b_bytes_ms   = cost_b.expert_bytes_ms;
         plan.cost_b_fixed_ms   = cost_b.expert_fixed_ms;
+        plan.expert_fill_ms_per_layer = cost_b.expert_fill_ms_per_layer;
+        plan.expert_fill_measured     = cost_b.expert_fill_measured;
         plan.cost_choice =
             plan.cost_b_ms < plan.cost_a_ms ? CapacityBet::KvFirst : CapacityBet::ExpertResident;
         // Only the A-versus-B question is answered here, and only where the model is exact: B owes

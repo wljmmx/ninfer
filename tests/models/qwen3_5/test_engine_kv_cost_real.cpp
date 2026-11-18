@@ -38,12 +38,14 @@
 #include "ninfer/engine.h"
 
 #include <chrono>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -179,7 +181,41 @@ int main() {
             return 77;
         }
         const std::vector<ninfer::TokenId> prompt(stream.begin(), stream.begin() + prompt_tokens);
+        // V10-85: a request's FIRST pass fills the pool (18.3 GiB on the resident arm) and the Host
+        // tier (18.75 GiB on the streaming one), so the cumulative counters describe the one-time
+        // population more than a decode step. A sampler reads the published stats while the request
+        // runs; the steady state is the interval from the last sample inside a window of a few
+        // tokens to the final one - one step's worth of layers is too few to average, and a single
+        // 20 ms interval is one token.
+        struct StageCounters {
+            double turn = 0.0;
+            double read = 0.0;
+            double copy = 0.0;
+            std::uint64_t layers = 0;
+        };
+        const auto stage_of = [](const ninfer::RuntimeStats& stats) {
+            return StageCounters{stats.expert_stage_layer_seconds, stats.expert_stage_read_seconds,
+                                 stats.expert_stage_copy_seconds, stats.expert_stage_layers};
+        };
+        std::atomic<bool> sampling{true};
+        std::vector<std::pair<double, StageCounters>> samples;
+        std::thread sampler([&] {
+            const auto started = std::chrono::steady_clock::now();
+            while (sampling.load()) {
+                const auto now = stage_of(engine.runtime_stats());
+                const auto at =
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - started)
+                        .count();
+                if (samples.empty() || now.layers != samples.back().second.layers ||
+                    now.turn != samples.back().second.turn) {
+                    samples.emplace_back(at, now);
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+        });
         const auto result = engine.generate(engine.prepare_tokens(prompt), greedy(decode_tokens));
+        sampling = false;
+        sampler.join();
         const auto finish = engine.memory_summary();
         const auto stats1 = engine.runtime_stats();
         const double wall_s =
@@ -194,6 +230,38 @@ int main() {
         const std::uint64_t fetched_bytes = finish.kv_fetched_bytes - started.kv_fetched_bytes;
         const double fetched_per_step =
             steps == 0 ? 0.0 : static_cast<double>(fetched) / static_cast<double>(steps);
+        // V10-85: the fill's own counters, as the engine publishes them. `layers` is the number of
+        // drains that actually staged a copy, so a resident arm must report zero of them and a
+        // streaming arm must report both.
+        const double stage_read_s =
+            stats1.expert_stage_read_seconds - stats0.expert_stage_read_seconds;
+        const double stage_copy_s =
+            stats1.expert_stage_copy_seconds - stats0.expert_stage_copy_seconds;
+        const double stage_turn_s =
+            stats1.expert_stage_layer_seconds - stats0.expert_stage_layer_seconds;
+        const std::uint64_t stage_layers = stats1.expert_stage_layers - stats0.expert_stage_layers;
+        // The whole request (one-time passes included) and a window of the steady state (the last
+        // 400 ms of samples, which on this model is a handful of tokens).
+        const double cumulative_fill_ms =
+            stage_layers == 0 ? 0.0
+                              : stage_turn_s * 1000.0 / static_cast<double>(stage_layers);
+        std::uint64_t steady_layers = 0;
+        double steady_fill_ms       = 0.0;
+        if (samples.size() >= 2) {
+            constexpr double kWindowSeconds = 0.4;
+            const auto& last                = samples.back();
+            std::size_t base                = samples.size() - 1;
+            while (base > 0 && last.first - samples[base - 1].first <= kWindowSeconds) { --base; }
+            const auto& from  = samples[base];
+            steady_layers     = last.second.layers - from.second.layers;
+            const double span = last.second.turn - from.second.turn;
+            steady_fill_ms    = steady_layers == 0
+                                    ? 0.0
+                                    : span * 1000.0 / static_cast<double>(steady_layers);
+        }
+        // A per-step price is about the steady state: a run that streams pays the fill on every
+        // layer, while a resident run pays it once (the population) and nothing afterwards.
+        const double fill_ms = steady_fill_ms > 0.0 ? steady_fill_ms : cumulative_fill_ms;
         const std::uint64_t step_bytes  = engine.expert_step_bytes();
         const std::uint64_t expert_pool = engine.expert_pool_capacity_bytes();
         const std::uint64_t miss_bytes  = step_bytes > expert_pool ? step_bytes - expert_pool : 0;
@@ -253,19 +321,29 @@ int main() {
         // `live` prices the pages one step of THIS request can read. For A the difference is the
         // whole story: the arena's shortfall is charged against a history that never reaches it.
         const std::uint64_t layers = env_u64("NINFER_KV_COST_LAYERS", 40);
-        const auto price = [&](std::uint64_t addressed, std::uint64_t resident) {
+        const auto price = [&](std::uint64_t addressed, std::uint64_t resident,
+                               double fill_ms_per_layer = 0.0) {
             return ninfer::core::price_step_transfers({.page_bytes            = geometry.page_bytes,
                                                        .pages_addressed       = addressed,
                                                        .pages_resident        = resident,
                                                        .slot_bytes            = 1,
                                                        .experts_routed        = miss_bytes,
                                                        .expert_slots_resident = 0,
-                                                       .expert_layers         = layers},
+                                                       .expert_layers         = layers,
+                                                       .expert_fill_ms_per_layer =
+                                                           fill_ms_per_layer},
                                                       probe.rates);
         };
         const auto plan_cost = price(finish.kv_logical_page_groups, finish.kv_resident_page_groups);
         const double predict_plan_ms = plan_cost.total_ms();
         const double predict_live_ms = price(live_pages, finish.kv_resident_page_groups).total_ms();
+        // V10-85: the same price with the fill the run MEASURED, which is what the bet takes when a
+        // process already has one (core/expert_stage_stats.h -> capacity_bet.h). The two numbers
+        // beside each other are the whole point of the change: what the constant says, and what the
+        // engine's own clock says.
+        const auto measured_cost = price(finish.kv_logical_page_groups,
+                                         finish.kv_resident_page_groups, fill_ms);
+        const double predict_measured_ms = measured_cost.total_ms();
         // What the run's own counters say the traffic cost at the two measured rates - the same
         // arithmetic on the fetched/missed bytes, so a difference from the model above is the
         // model's geometry, not its rates.
@@ -282,6 +360,42 @@ int main() {
                     "layers)\n",
                     predict_plan_ms, predict_live_ms, measured_ms, plan_cost.expert_bytes_ms,
                     plan_cost.expert_fixed_ms, static_cast<unsigned long long>(layers));
+        // V10-85: the fill counter, and the price it produces. `fill=fallback` is the arm that had
+        // no measurement (a resident run, and the first plan of any process).
+        std::printf("[cost] stage: layer_s=%.4f read_s=%.4f copy_s=%.4f layers=%llu "
+                    "fill_ms_per_layer=%.3f source=%s measured_fill_ms_per_step=%.3f "
+                    "(cumulative %.3f ms/layer over %llu layers, steady %.3f over %llu)\n",
+                    stage_turn_s, stage_read_s, stage_copy_s,
+                    static_cast<unsigned long long>(stage_layers), fill_ms,
+                    measured_cost.expert_fill_measured ? "measured" : "fallback",
+                    predict_measured_ms, cumulative_fill_ms,
+                    static_cast<unsigned long long>(stage_layers), steady_fill_ms,
+                    static_cast<unsigned long long>(steady_layers));
+        // The counters' contract, asserted where they are filled: a streaming arm stages a copy on
+        // EVERY layer of a token, so its counter must be non-zero and its steady window must cover
+        // whole tokens. A resident arm cannot be built on this card for this model - the pool gets
+        // 10000 of the 10240 experts (the `[experts] host tier` line names the rest), so even the
+        // "ref" arm stages on a small fraction of its layers. What is asserted for it is that
+        // fraction, not a zero: the exact-zero case is the price function's (no miss -> 0) and the
+        // unit test's, and pretending a run here had it would be the kind of claim this file exists
+        // to avoid.
+        const std::uint64_t layer_turns = 40 * steps;
+        if (which == "stream" &&
+            !(steady_layers != 0 && fill_ms > 0.0 && stage_layers >= layer_turns)) {
+            std::printf("FAIL: the streaming arm staged on %llu of %llu layer turns "
+                        "(steady %llu)\n",
+                        static_cast<unsigned long long>(stage_layers),
+                        static_cast<unsigned long long>(layer_turns),
+                        static_cast<unsigned long long>(steady_layers));
+            return 1;
+        }
+        if (which != "stream" && (stage_layers * 4 > layer_turns || fill_ms >= 0.5)) {
+            std::printf("FAIL: the %s arm streams nothing but staged on %llu of %llu layer turns "
+                        "at %.3f ms/layer\n",
+                        which.c_str(), static_cast<unsigned long long>(stage_layers),
+                        static_cast<unsigned long long>(layer_turns), fill_ms);
+            return 1;
+        }
         std::fflush(stdout);
     } catch (const std::exception& error) {
         std::printf("FAIL: %s\n", error.what());

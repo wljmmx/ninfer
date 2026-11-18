@@ -1334,6 +1334,17 @@ struct RuntimeStats {
     // Allocator lifetime high-water mark, including reserved transfer destinations.
     std::size_t host_context_peak_occupied_bytes = 0;
     double actual_context_transfer_seconds       = 0.0;
+    // V10-85: the streaming leg's cost, measured where a layer pays it - the Host tier's artifact
+    // read (models/qwen3_5/execution/host_expert_residency.h), the upload turn's submission plus
+    // drain (core/expert_cache.cpp), and the whole FFN wall of a layer that staged a copy
+    // (models/qwen3_5/execution/ffn.cpp), which is the term the price uses. Seconds since the process
+    // started, like the KV tier counters; `expert_stage_layers` counts the layers that staged, so a
+    // run that streams nothing reports zero of them and therefore a zero fill, and
+    // core/expert_stage_stats.h turns the four into the per-layer number the bet prices.
+    double        expert_stage_read_seconds  = 0.0;
+    double        expert_stage_copy_seconds  = 0.0;
+    double        expert_stage_layer_seconds = 0.0;
+    std::uint64_t expert_stage_layers        = 0;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {

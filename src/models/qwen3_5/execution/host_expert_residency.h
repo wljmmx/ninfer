@@ -3,11 +3,13 @@
 #include "artifact/expert_reader.h"
 #include "core/expert_cache.h"
 #include "core/expert_file.h"
+#include "core/expert_stage_stats.h"
 #include "core/weight_bank.h"
 #include "ninfer/ops/moe.h"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -630,8 +632,20 @@ public:
         // port (sm_89): the slot tables and the arena are mutated here and read by the uploader in
         // arena_image(), and D1 wants the fill on its own thread. One lock covers all three entry
         // points so that is a safe call to make; without it the two threads would race on slot_of.
-        std::lock_guard<std::mutex> guard(mutex_);
-        fill_locked(bank, experts, resident_mask, /*prefetch=*/false, nullptr);
+        //
+        // V10-85: this is the streaming leg's artifact read, and it blocks the layer's own thread, so
+        // it is the one number a per-layer fill price can be measured from. Timed from BEFORE the
+        // lock, because waiting for it is part of the layer's wall too; two clocks per layer, no
+        // other cost (core/expert_stage_stats.h says where the counter goes and who reads it).
+        const auto stage_begin = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            fill_locked(bank, experts, resident_mask, /*prefetch=*/false, nullptr);
+        }
+        auto& stage = ninfer::core::expert_stage_stats();
+        stage.read_seconds +=
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - stage_begin).count();
+        ++stage.read_calls;
     }
 
     // Q53: the ranked fill. `scores` is this bank's decayed route score (one float per expert), the
@@ -644,8 +658,17 @@ public:
     // never mis-address a slot: the slot tables themselves are only mutated under this lock.
     void ensure_scored(ExpertBankId bank, std::span<const std::int32_t> experts,
                        const float* scores, bool static_fill = false) {
-        std::lock_guard<std::mutex> guard(mutex_);
-        fill_locked(bank, experts, nullptr, /*prefetch=*/false, scores, static_fill);
+        // V10-85: the same read leg as ensure(), and the one the fused path calls (the split form
+        // uses the plain fill). Timed here for the same reason.
+        const auto stage_begin = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            fill_locked(bank, experts, nullptr, /*prefetch=*/false, scores, static_fill);
+        }
+        auto& stage = ninfer::core::expert_stage_stats();
+        stage.read_seconds +=
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - stage_begin).count();
+        ++stage.read_calls;
     }
 
     // Q53: where the admitted second-chance slots currently end, so the panel can say whether the region is

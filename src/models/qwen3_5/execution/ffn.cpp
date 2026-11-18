@@ -8,6 +8,7 @@
 #include "models/qwen3_5/execution/step_gate.h"
 #include "core/cpu/executor.h"
 #include "core/cpu/system.h"
+#include "core/expert_stage_stats.h"
 #include <cstring>
 
 #include "core/layout.h"
@@ -174,17 +175,29 @@ void SplitTimeline::report() {
 }
 
 // Adds one layer to the timeline on the way out, whichever of the three exits it took.
+//
+// V10-85: the same clock is the engine's measured price for a streaming layer, so it is taken whether
+// or not NINFER_SPLIT_TIMING is on (this scope already read the clock unconditionally). A layer counts
+// only when the stream staged a copy while it ran - a resident layer calls the same path with nothing
+// to move and pays no round trip - which is why the counter keeps the layer count beside the seconds
+// (core/expert_stage_stats.h). The priced number is this layer's FFN wall, not the upload turn
+// inside it: on 35B e2 the route read-back and the CPU half are the larger part of what a streaming
+// layer spends, and a price built from `prepare + wait` alone came out 4x too low.
 struct LayerScope {
     bool on;
     std::chrono::steady_clock::time_point begin;
+    std::uint64_t staged_at_entry;
     explicit LayerScope(bool enabled)
-        : on(enabled), begin(std::chrono::steady_clock::now()) {}
+        : on(enabled), begin(std::chrono::steady_clock::now()),
+          staged_at_entry(ninfer::core::expert_stage_stats().layers) {}
     ~LayerScope() {
-        if (!on) { return; }
-        auto& state = timeline();
         const auto layer_ms = std::chrono::duration<double, std::milli>(
                                   std::chrono::steady_clock::now() - begin)
                                   .count();
+        auto& stage = ninfer::core::expert_stage_stats();
+        if (stage.layers != staged_at_entry) { stage.stage_seconds += layer_ms / 1000.0; }
+        if (!on) { return; }
+        auto& state = timeline();
         state.wall += layer_ms;
         state.last_wall = layer_ms;
         if (++state.layers % 40 == 0) { state.report(); }

@@ -10,6 +10,7 @@
 // per-layer round trip is charged only to layers that upload, and an unmeasured disk leg leaves the
 // pre-V10-83 single-rate pipeline rather than a free read.
 
+#include "core/expert_stage_stats.h"
 #include "core/transfer_cost.h"
 
 #include <cmath>
@@ -210,6 +211,65 @@ void test_a_layer_that_streams_pays_its_round_trip() {
                 "and the difference is exactly the fixed term");
 }
 
+// V10-85: the round trip is measured now, and the measurement replaces the fitted constant - with
+// its bytes inside it, because the counter timed the read and the copy rather than a rate.
+void test_a_measured_fill_replaces_the_constant_and_its_bytes() {
+    auto routed                     = geometry();
+    routed.expert_layers            = 40;
+    routed.expert_fill_ms_per_layer = 0.64; // what a streaming layer's fill measured on 35B e2
+    const auto cost                 = price_step_transfers(routed, rates());
+    check(cost.expert_fill_measured, "a positive per-layer fill is a measurement");
+    check_close(cost.expert_fill_ms_per_layer, 0.64, 1e-12, "the price names the fill it used");
+    check_close(cost.expert_fixed_ms, 40.0 * 0.64, 1e-9,
+                "the round trip is the measured fill times the streaming layers");
+    check(cost.expert_bytes_ms == 0.0, "the bytes are inside the measurement, not charged twice");
+    check_close(cost.expert_ms, 40.0 * 0.64, 1e-9, "the slot leg is the measured fill alone");
+
+    // Zero is "not measured", never "free": the constant stands, the byte term comes back, and the
+    // price says which of the two it used.
+    auto unmeasured                     = geometry();
+    unmeasured.expert_layers            = 40;
+    unmeasured.expert_fill_ms_per_layer = 0.0;
+    const auto fallback                 = price_step_transfers(unmeasured, rates());
+    check(!fallback.expert_fill_measured, "a zero counter is not a measurement");
+    check_close(fallback.expert_fill_ms_per_layer, kStreamLayerFixedMs, 1e-12,
+                "the fallback price names the constant it used");
+    check_close(fallback.expert_fixed_ms, 40.0 * kStreamLayerFixedMs, 1e-9,
+                "the fixed term is that constant times the layers");
+    check(fallback.expert_bytes_ms > 0.0, "an unmeasured fill keeps the byte term");
+
+    // A resident step is still exactly zero, whatever the fill was measured at.
+    auto resident                  = routed;
+    resident.pages_resident        = resident.pages_addressed;
+    resident.expert_slots_resident = resident.experts_routed;
+    const auto free_step           = price_step_transfers(resident, rates());
+    check(free_step.expert_ms == 0.0 && free_step.total_ms() == 0.0,
+          "a measured fill is not charged to a step that streams nothing");
+}
+
+// V10-85: the counters (core/expert_stage_stats.h) turn into the number the bet prices. Zero layers
+// is a resident run, so the derivation must answer zero rather than divide by it.
+void test_the_counter_turns_seconds_into_a_per_layer_fill() {
+    using ninfer::core::expert_fill_ms_per_layer;
+    using ninfer::core::ExpertStageStats;
+    ExpertStageStats none;
+    check(expert_fill_ms_per_layer(none) == 0.0, "no drain staged a copy, so no fill is measured");
+    ExpertStageStats measured;
+    measured.stage_seconds = 14.0; // the turn: route read-back, fill, upload and drain
+    measured.read_seconds  = 4.0;
+    measured.copy_seconds  = 6.0;
+    measured.layers        = 20;
+    check_close(expert_fill_ms_per_layer(measured), 700.0, 1e-9,
+                "14 s of turn over 20 layers is 700 ms per layer");
+    check_close(measured.read_ms_per_layer(), 200.0, 1e-9, "the read leg is reported apart");
+    check_close(measured.copy_ms_per_layer(), 300.0, 1e-9, "the copy leg is reported apart");
+    // The two legs do not add up to the turn, and that is the point of the distinction: what a
+    // layer spends before the fill (its route read-back) is inside the price, outside both legs.
+    check(expert_fill_ms_per_layer(measured) > measured.read_ms_per_layer() +
+                                                   measured.copy_ms_per_layer(),
+          "the turn is more than its two measured legs");
+}
+
 } // namespace
 
 int main() {
@@ -220,6 +280,8 @@ int main() {
     test_an_unmeasured_rate_is_not_a_fast_leg();
     test_the_streaming_leg_is_the_disk_and_the_link_in_series();
     test_a_layer_that_streams_pays_its_round_trip();
+    test_a_measured_fill_replaces_the_constant_and_its_bytes();
+    test_the_counter_turns_seconds_into_a_per_layer_fill();
     if (failures == 0) { std::printf("ok\n"); }
     return failures == 0 ? 0 : 1;
 }

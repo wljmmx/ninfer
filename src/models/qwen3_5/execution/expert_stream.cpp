@@ -4,6 +4,7 @@
 #include "models/qwen3_5/execution/expert_path_control.h"
 #include "models/qwen3_5/execution/cpu_path_policy.h"
 #include "models/qwen3_5/execution/host_expert_residency.h"
+#include "core/expert_stage_stats.h"
 #include "core/memory_budget.h"
 #include "core/transfer.h"
 
@@ -4192,7 +4193,8 @@ bool ExpertStream::ensure_split(const void* device_ids, std::int32_t top_k, std:
 }
 
 bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32_t tokens,
-                          cudaStream_t stream, const std::int32_t* host_ids, bool assume_covered) {    if (cache_ == nullptr) { throw std::logic_error("expert stream is not attached"); }
+                          cudaStream_t stream, const std::int32_t* host_ids, bool assume_covered) {
+    if (cache_ == nullptr) { throw std::logic_error("expert stream is not attached"); }
     // The model's routing width, for the prefetch port: the fused path never enters ensure_split(),
     // so it has to record it here or the port would price the region at zero width.
     if (top_k > 0) { top_k_ = top_k; }
@@ -6071,6 +6073,17 @@ bool ExpertStream::ensure(const void* device_ids, std::int32_t top_k, std::int32
             std::fprintf(stderr, "[experts] calls=%llu upload=%.3fs avg=%.2fms hits=%llu\n",
                          (unsigned long long)calls, seconds, seconds * 1000.0 / 40.0,
                          (unsigned long long)cache_->hits());
+            // V10-85: what the fill actually costs, from the counters the plan's price reads
+            // (core/expert_stage_stats.h): the whole FFN wall of a layer that staged a copy, then the
+            // two legs inside it. A resident layer stages nothing and never enters the divisor, which
+            // is why that count is printed beside the averages.
+            const auto& stage = ninfer::core::expert_stage_stats();
+            std::fprintf(stderr,
+                         "[experts] fill=%.3fms/layer (layer wall; read=%.3f copy=%.3f) layers=%llu "
+                         "reads=%llu\n",
+                         stage.ms_per_layer(), stage.read_ms_per_layer(), stage.copy_ms_per_layer(),
+                         (unsigned long long)stage.layers, (unsigned long long)stage.read_calls);
+            std::fflush(stderr);
             seconds = 0.0;
         }
     }

@@ -482,11 +482,11 @@ void test_the_plan_line_names_the_prices_and_the_rates() {
     const auto plan    = plan_capacity_bet(request);
     // A: 6144 addressed - 1024 resident = 5120 pages of 1 MiB at 20 GB/s = 268.435456 ms.
     // B: 1024 routed - 15360 slots -> 0 misses -> 0 ms. Both rates are printed, decimal GB/s.
-    char line[192];
+    char line[320];
     const int written    = ninfer::core::format_capacity_costs(plan, line, sizeof(line));
     const char* expected = " cost_a_ms=268.44 cost_b_ms=0.00 miss_a_mib=5120.0 miss_b_mib=0.0 "
                            "disk_gbps=0.00 pcie_gbps=10.00 eff_gbps=10.00 fixed_ms_b=0.00 "
-                           "cheaper=B";
+                           "expert_fill_ms_per_layer=0.5735 fill_source=fallback cheaper=B";
     check(written > 0, "a priced plan writes a sentence");
     check(std::strcmp(line, expected) == 0, "the cost sentence has one fixed spelling");
     if (std::strcmp(line, expected) != 0) { std::fprintf(stderr, "  got: %s\n", line); }
@@ -566,12 +566,11 @@ void test_a_nonzero_stream_bill_is_reported_but_not_acted_on() {
     check(plan.choice == CapacityBet::ExpertResident, "the letter stays with the rule");
     check(plan.reason != nullptr && std::strstr(plan.reason, "experts first") != nullptr,
           "and the reason is still the rule's");
-    char line[192];
+    char line[320];
     (void)ninfer::core::format_capacity_costs(plan, line, sizeof(line));
     check(std::strstr(line, "cheaper=B") != nullptr, "the line prints the ranking");
     check(std::strstr(line, "not_applied=modelled_not_exact_zero") != nullptr,
           "and says why the letter did not follow it");
-
     // The categorical case does move: B owes nothing, so it is cheaper by construction.
     const auto free_b =
         plan_capacity_bet(priced(21 * kGib, ControllerMode::Performance, 6 * 1024, 1024));
@@ -580,6 +579,38 @@ void test_a_nonzero_stream_bill_is_reported_but_not_acted_on() {
     (void)ninfer::core::format_capacity_costs(free_b, line, sizeof(line));
     check(std::strstr(line, "not_applied") == nullptr,
           "a letter that followed the price says nothing about not applying it");
+}
+
+// V10-85: a per-layer fill measured by the engine (core/expert_stage_stats.h) reaches the bill and
+// the line, and it is priced as the whole slot leg - the bytes it timed are inside it.
+void test_a_measured_fill_reaches_the_bill_and_the_line() {
+    auto request                     = priced(21 * kGib, ControllerMode::Performance, 6 * 1024,
+                                              20 * 1024);
+    request.expert_pool_cap_bytes    = 1 * kGib; // B streams 19456 slots a step
+    request.expert_layers            = 40;       // the layers that pay the round trip
+    request.expert_fill_ms_per_layer = 0.64;
+    const auto plan                  = plan_capacity_bet(request);
+    check(plan.cost_priced, "a measured fill still needs the rates to be a price");
+    check(plan.expert_fill_measured, "the plan carries the measurement, not the constant");
+    check_close(plan.expert_fill_ms_per_layer, 0.64, 1e-12, "and names the value it used");
+    check_close(plan.cost_b_ms, plan.cost_b_fixed_ms, 1e-9,
+                "the whole slot bill is the measured fill: the byte term is inside it");
+    check_close(plan.cost_b_fixed_ms, plan.expert_fill_ms_per_layer * 40.0, 1e-9,
+                "priced per layer that streams");
+    char line[320];
+    (void)ninfer::core::format_capacity_costs(plan, line, sizeof(line));
+    check(std::strstr(line, "expert_fill_ms_per_layer=0.6400") != nullptr,
+          "the line prints the fill it priced");
+    check(std::strstr(line, "fill_source=measured") != nullptr, "and says it was measured");
+
+    // Without one it says so: the constant is still the price, and the label is the difference.
+    request.expert_fill_ms_per_layer = 0.0;
+    const auto unmeasured            = plan_capacity_bet(request);
+    (void)ninfer::core::format_capacity_costs(unmeasured, line, sizeof(line));
+    check(std::strstr(line, "fill_source=fallback") != nullptr,
+          "an unmeasured fill is labelled a fallback");
+    check(unmeasured.cost_b_ms > plan.cost_b_ms,
+          "and the constant prices more than a 0.64 ms fill");
 }
 
 } // namespace
@@ -607,6 +638,7 @@ int main() {
     test_a_pinned_pool_is_priced_against_what_the_run_holds();
     test_the_slot_bill_never_exceeds_the_routes_a_step_names();
     test_a_nonzero_stream_bill_is_reported_but_not_acted_on();
+    test_a_measured_fill_reaches_the_bill_and_the_line();
     if (failures == 0) { std::printf("ok\n"); }
     return failures == 0 ? 0 : 1;
 }

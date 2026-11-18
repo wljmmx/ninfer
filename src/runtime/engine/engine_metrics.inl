@@ -163,6 +163,16 @@ void EngineCore<Instance>::publish_runtime_stats() {
     std::optional<nvtx::ScopedRange> detail_range;
     detail_range.emplace(nvtx::Name::StatsPublication, nvtx::Category::Control);
     RuntimeStats snapshot                     = cumulative_stats_;
+    // V10-85: the expert fill's own timers. They live in a process-wide counter rather than on the
+    // engine (core/expert_stage_stats.h says why: the two writers, the Host tier and the pool,
+    // share no other object), so they are copied in at publication instead of accumulated here.
+    // The number is monotonic like every other field in this struct, which is what lets a reader
+    // take an interval by subtraction.
+    const auto& expert_stage                  = ninfer::core::expert_stage_stats();
+    snapshot.expert_stage_read_seconds        = expert_stage.read_seconds;
+    snapshot.expert_stage_copy_seconds        = expert_stage.copy_seconds;
+    snapshot.expert_stage_layer_seconds       = expert_stage.stage_seconds;
+    snapshot.expert_stage_layers              = expert_stage.layers;
     const auto physical                       = instance_.program->physical_usage();
     snapshot.device_state_occupied_slots      = physical.occupied.state_slots;
     snapshot.device_main_kv_occupied_pages    = physical.occupied.main_kv_pages;
