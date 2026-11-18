@@ -897,6 +897,23 @@ public:
                                                      std::uint32_t growth) const noexcept;
     [[nodiscard]] Program::KvResidencyBudget kv_residency_budget() const noexcept;
     [[nodiscard]] std::uint32_t kv_residency_request_tokens(std::uint32_t prompt_tokens) const noexcept;
+    // port (sm_89, V10-84): the read-set price of one STEP. With the page-in leg on and an eviction
+    // window installed, the pages a step addresses are sink + the newest window + the selector's
+    // keep set (the predicate `page_in_addressed_pages()` uses), plus the pages this lane's own
+    // unit is about to write and the pages its mapping already covers past the committed frontier;
+    // that set - not the lane's history - is what the shared Device pool has to hold. 0 means "not
+    // in force, price the history as before": the leg is off, the arena is fully resident, no
+    // window is installed, the selector keeps a RATIO rather than a page count,
+    // NINFER_KV_EVICT_DEFER leaves a prefilling row's block table whole, or the KV storage's
+    // kernels do not honour absent pages. `..._lane_pages` prices a live lane;
+    // `..._request_pages` a request that is not live yet (its read set plus its first chunk).
+    [[nodiscard]] std::uint32_t read_set_fixed_pages() const noexcept;
+    [[nodiscard]] std::uint32_t residency_unit_growth_pages(std::uint32_t lane) const noexcept;
+    [[nodiscard]] std::uint32_t residency_pending_mapping_pages(std::uint32_t lane) const noexcept;
+    [[nodiscard]] std::uint32_t read_set_lane_pages(std::uint32_t lane) const noexcept;
+    [[nodiscard]] std::uint32_t read_set_lane_tokens(std::uint32_t lane) const noexcept;
+    [[nodiscard]] std::uint32_t read_set_request_pages(std::uint32_t prompt_tokens) const noexcept;
+    [[nodiscard]] std::uint32_t read_set_request_tokens(std::uint32_t prompt_tokens) const noexcept;
     // Q67/S1 step 1: name each lane's place in a merged pass - its own KV address row, its absolute
     // base, how many prompt tokens it contributes, and the state slots it reads and writes. Builds
     // only; nothing executes until advance_prefill_batch exists.

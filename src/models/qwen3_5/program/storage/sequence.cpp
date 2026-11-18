@@ -714,8 +714,131 @@ std::uint32_t page_rounded_tokens(std::uint32_t tokens) noexcept {
 }
 } // namespace
 
+namespace {
+// port (sm_89, V10-84): the price of a lane's STEP, not of its history.
+//
+// With the page-in leg on, a step does not read its history: `stage_step_kv_pages()` asks
+// "is this page addressed", and that predicate is page < sink || page >= end - eff_window ||
+// page in keep - the sink pages, the newest `eff_window <= window_pages` pages, and the selector's
+// stored keep set, exactly the three sources `apply_kv_eviction_window()` built the row's mask
+// from. What the shared Device pool has to hold per lane is THAT set plus the pages the lane's own
+// unit is about to write. Pricing the history instead is what refused a four-lane batch whose
+// windows fit a small arena (measured: 4 x 2000 tokens against a 120-page arena ->
+// `aggregate_tokens=8192 resident_tokens=7680`, while the windows those lanes actually read are
+// 4 x (1 sink + 8 window) pages).
+//
+// 0 means "the window does not describe this step, price the history as before":
+//   * no window installed - every mapped page of the history is addressed;
+//   * NINFER_KV_EVICT_KEEP_RATIO - the keep set is a FRACTION of `live`, so it has no constant
+//   bound;
+//   * NINFER_KV_EVICT_DEFER with a selector - a prefill-shaped call leaves the block table whole on
+//     purpose, so that row reads its whole history until the prompt is done;
+//   * a KV storage whose kernels do not honour the absent-page contract (the mask is skipped).
+std::uint32_t window_read_cap_pages() {
+    const KvEvictionWindow& window = kv_eviction_window();
+    if (!window.enabled()) { return 0; }
+    // Presence, not value: `keep_from_scores_ratio()` validates and can throw, and this answer is
+    // read from noexcept queries. Any configured ratio means the keep set is a fraction of `live`,
+    // which is exactly the case with no constant bound (the validation reports a bad value on its
+    // own path).
+    if (std::getenv("NINFER_KV_EVICT_KEEP_RATIO") != nullptr) { return 0; }
+    const std::uint32_t budget = keep_from_scores_budget();
+    if (budget != 0 && defer_eviction_enabled()) { return 0; }
+    std::uint32_t pages = window.sink_pages + window.window_pages +
+                          static_cast<std::uint32_t>(window.keep_pages.size());
+    if (budget != 0) {
+        // `keep_pages_from_scores()` unions up to `budget` pages from each list its mode ranks (all
+        // three by default), so that is the bound the selector's contribution can reach.
+        const KeepMode mode       = keep_mode();
+        const std::uint32_t lists = mode == KeepMode::Union ? 3U : mode == KeepMode::Duo ? 2U : 1U;
+        pages += budget * lists;
+    }
+    return pages;
+}
+} // namespace
+
+// port (sm_89, V10-84): is read-set pricing in force? It needs the leg (a page the Device does not
+// hold must have a reader), a tiered arena (a fully resident pool has no edge to price against), a
+// window (which is what bounds the addressed set) and a storage whose kernels honour absent pages.
+std::uint32_t ProgramImpl::read_set_fixed_pages() const noexcept {
+    if (!kv_page_in_enabled() || !kv_arena_tiered()) { return 0; }
+    if (decoder == nullptr || !kv_absent_pages_supported(decoder->text_kv.storage())) { return 0; }
+    // A/B switch, default on: with NINFER_KV_READ_PRICING=0 the same binary prices the whole
+    // history the way every build before this one did, so "the read set is what admits the batch"
+    // is measured against its own control instead of inferred (NINFER_KV_BORROW's shape).
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_KV_READ_PRICING");
+        return value == nullptr || *value == '\0' || std::strtol(value, nullptr, 10) != 0;
+    }();
+    if (!enabled) { return 0; }
+    return window_read_cap_pages();
+}
+
+// The pages one lane's next unit can add on top of the read set: the unit's own frontier growth.
+// `next_unit()` is the authority for what that unit is, so the same three shapes are used here -
+// a prefill/replay chunk (at most `prefill_chunk` tokens), or one Decode step (its token plus the
+// draft window when a speculative backend runs). The growth is measured from the prefix the row has
+// already MAPPED, and during prefill/replay that is the cursor, not the committed frontier (the
+// frontier is published when the prompt completes, so it trails the chunks the mapping already
+// covers); measuring from the frontier would charge the whole chunk again on every step.
+std::uint32_t ProgramImpl::residency_unit_growth_pages(std::uint32_t lane) const noexcept {
+    const auto& request          = requests[lane];
+    const std::uint32_t frontier = sequences[lane].execution_frontier;
+    std::uint32_t base           = frontier;
+    std::uint32_t horizon        = frontier + kv_residency_step_growth();
+    if (request.prefill) {
+        base    = std::max(request.prefill->cursor, frontier);
+        horizon = std::min(request.prefill->prompt_tokens, base + prefill_chunk);
+    } else if (request.replay) {
+        base    = std::max(request.replay_cursor, frontier);
+        horizon = std::min(request.replay_target, base + prefill_chunk);
+    }
+    const std::uint32_t pages = kv_pages_for_frontier(horizon);
+    const std::uint32_t held  = kv_pages_for_frontier(base);
+    return pages > held ? pages - held : 0;
+}
+
+// The pages a lane's row holds on top of its read set because the MAPPING runs ahead of the
+// eviction mask: the mask is applied against the COMMITTED frontier, so every page the mapping
+// already covers past that frontier is still resident when the next unit reserves. Asking the row
+// is exact and costs two reads - measured, this is what the pool account showed: 4 x (1 + 8 + 2)
+// through the steady prefill of a 4 x 6000-token batch at chunk 128, and 4 x (1 + 8 + 5) at its
+// prefill -> decode transition (two chunks plus one page for a unit that straddles a page
+// boundary). A lane that is not live yet has nothing mapped, so its admission price carries the
+// growth alone.
+std::uint32_t ProgramImpl::residency_pending_mapping_pages(std::uint32_t lane) const noexcept {
+    if (lane >= max_concurrency || !sequences[lane].kv) { return 0; }
+    const KVAddressSpaceHandle address = sequences[lane].kv->text;
+    const std::uint32_t mapped         = text_kv_addresses->mapped_pages(address);
+    const std::uint32_t committed = kv_live_pages(text_kv_addresses->committed_frontier(address));
+    return mapped > committed ? mapped - committed : 0;
+}
+
+std::uint32_t ProgramImpl::read_set_lane_pages(std::uint32_t lane) const noexcept {
+    const std::uint32_t fixed = read_set_fixed_pages();
+    if (fixed == 0 || lane >= max_concurrency) { return 0; }
+    if (requests[lane].lifecycle == Lifecycle::Empty || !sequences[lane].kv) { return 0; }
+    return fixed + residency_pending_mapping_pages(lane) + residency_unit_growth_pages(lane);
+}
+
+std::uint32_t ProgramImpl::read_set_request_pages(std::uint32_t prompt_tokens) const noexcept {
+    const std::uint32_t fixed = read_set_fixed_pages();
+    if (fixed == 0) { return 0; }
+    // A request that is not live yet has mapped nothing, so what it needs is the read set plus the
+    // first prefill chunk it is about to write (`min(prompt, prefill_chunk)`).
+    return fixed + kv_pages_for_frontier(std::min(prompt_tokens, prefill_chunk));
+}
+
+std::uint32_t ProgramImpl::read_set_lane_tokens(std::uint32_t lane) const noexcept {
+    return read_set_lane_pages(lane) * static_cast<std::uint32_t>(kPagedKVPageSize);
+}
+
+std::uint32_t ProgramImpl::read_set_request_tokens(std::uint32_t prompt_tokens) const noexcept {
+    return read_set_request_pages(prompt_tokens) * static_cast<std::uint32_t>(kPagedKVPageSize);
+}
+
 std::uint32_t ProgramImpl::residency_lane_tokens(std::uint32_t lane,
-                                                std::uint32_t growth) const noexcept {
+                                                 std::uint32_t growth) const noexcept {
     if (lane >= max_concurrency) { return 0U; }
     const auto& request = requests[lane];
     const auto& state   = sequences[lane];
@@ -737,6 +860,23 @@ Program::KvResidencyBudget ProgramImpl::kv_residency_budget() const noexcept {
     budget.capacity_tokens =
         residency_device_page_capacity() * static_cast<std::uint32_t>(kPagedKVPageSize);
     budget.capacity_pages = residency_device_page_capacity();
+    // port (sm_89, V10-84): with the page-in leg on, a lane's share is what its step ADDRESSES, so
+    // the same field carries the read-set price (see read_set_lane_pages()). The shape of the
+    // answer - page-exact per lane, summed, against the same live pool edge - is unchanged, which
+    // is what lets the Runtime's admission rule and its refusals keep working without a new
+    // contract.
+    if (read_set_fixed_pages() != 0) {
+        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+            const std::uint32_t pages = read_set_lane_pages(lane);
+            if (pages == 0) { continue; }
+            budget.lane_pages[lane] = pages;
+            budget.lane_tokens[lane] = pages * static_cast<std::uint32_t>(kPagedKVPageSize);
+            budget.live_tokens += budget.lane_tokens[lane];
+            budget.live_pages += pages;
+            ++budget.lane_count;
+        }
+        return budget;
+    }
     const std::uint32_t growth = kv_residency_step_growth();
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
         const std::uint32_t tokens = residency_lane_tokens(lane, growth);
@@ -753,6 +893,9 @@ Program::KvResidencyBudget ProgramImpl::kv_residency_budget() const noexcept {
 
 std::uint32_t ProgramImpl::kv_residency_request_tokens(std::uint32_t prompt_tokens) const noexcept {
     if (!kv_arena_tiered()) { return 0U; }
+    if (const std::uint32_t pages = read_set_request_pages(prompt_tokens); pages != 0) {
+        return pages * static_cast<std::uint32_t>(kPagedKVPageSize);
+    }
     const std::uint32_t growth = kv_residency_step_growth();
     if (prompt_tokens > std::numeric_limits<std::uint32_t>::max() - growth) { return prompt_tokens; }
     return page_rounded_tokens(prompt_tokens + growth);
@@ -770,17 +913,17 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& state, std::uint32_t 
     // (see kv_residency_token_limit()), because a refusal thrown out of a step fails every lane.
     if (kv_arena_tiered() && main != 0) {
         const std::uint32_t page_tokens = static_cast<std::uint32_t>(kPagedKVPageSize);
-        const std::uint32_t needed      = 1U + (main - 1U) / page_tokens;
+        // port (sm_89, V10-84): under read-set pricing the step does not address its history - it
+        // addresses sink + the newest window + the selector's keep set, and the pages its own
+        // unit is about to write. That priced set is the bound this step has to fit, and
+        // admission has already promised the sum over live lanes fits the pool.
+        const std::uint32_t read_priced = read_set_lane_pages(state.lane);
+        const std::uint32_t needed =
+            read_priced != 0 ? read_priced : 1U + (main - 1U) / page_tokens;
         // The live edge, not the construction number: the control plane's KV dial can shrink the
         // pool at runtime, and a guard that read the plan would then promise room that is gone.
         const std::uint32_t resident_capacity = residency_device_page_capacity();
         if (needed > resident_capacity) {
-            // V10-79: the two arms say different things because they are different states. With the
-            // page-in leg off the pages on the Host tier have no reader at all; with it on they do
-            // - but the step still ADDRESSES all of them, because one page group holds every
-            // layer's planes and every full-attention layer reads the whole history on every step.
-            // So the leg does not lift this bound; it moves the refusal down to the arena's own
-            // size.
             const std::string head =
                 "KV residency cannot serve this step: it needs " + std::to_string(needed) +
                 " resident page group(s) for " + std::to_string(main) +
@@ -789,12 +932,30 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& state, std::uint32_t 
                 std::to_string(resident_capacity) + " of " +
                 std::to_string(kv_logical_page_groups) + " logical page group(s) (" +
                 std::to_string(host_kv_payload_bytes >> 20) +
-                " MiB priced onto the Host tier). The " +
+                " MiB priced onto the Host tier). ";
+            if (read_priced != 0) {
+                // The windowed arm: the priced set is the read set, so the pool is short of the
+                // pages one step addresses rather than of the history - the remedy is the same
+                // shape (a smaller window, fewer lanes, more pages), and the page-in leg cannot
+                // help because a step cannot address fewer page groups than it reads.
+                throw std::runtime_error(
+                    head + "The window this lane runs under addresses (sink + newest window + "
+                    "the selector's keep set) and the unit's own growth; that set does not fit the "
+                    "pool, so no page could be restored for it. Shorten the window "
+                    "(NINFER_KV_EVICT_WINDOW / NINFER_KV_EVICT_KEEP_FROM_SCORES), lower "
+                    "max_concurrency, or give the pool more pages (NINFER_KV_RESIDENCY_SLACK_MB).");
+            }
+            // V10-79: the two arms say different things because they are different states. With the
+            // page-in leg off the pages on the Host tier have no reader at all; with it on they do
+            // - but the step still ADDRESSES all of them, because one page group holds every
+            // layer's planes and every full-attention layer reads the whole history on every step.
+            // So the leg does not lift this bound; it moves the refusal down to the arena's own
+            // size.
+            throw std::runtime_error(
+                head + "The " +
                 std::to_string(parameters.model.config().text.full_attention_layers) +
                 " full-attention layer(s) read the whole history every step, so the step needs all "
-                "of it resident at once; ";
-            throw std::runtime_error(
-                head +
+                "of it resident at once; " +
                 (kv_page_in_enabled()
                      ? "the page-in leg can copy a page back from Host, but a page group spans "
                        "every layer's planes, so it cannot make the step address fewer pages. "

@@ -211,6 +211,12 @@ std::uint32_t Program::kv_residency_request_tokens(std::uint32_t prompt_tokens) 
     return impl_->kv_residency_request_tokens(prompt_tokens);
 }
 
+bool Program::kv_read_priced() const noexcept { return impl_->read_set_fixed_pages() != 0; }
+
+std::uint32_t Program::kv_read_set_lane_tokens(std::uint32_t lane) const noexcept {
+    return impl_->read_set_lane_tokens(lane);
+}
+
 std::size_t Program::prefill_batch_rows(std::span<const std::uint32_t> lanes,
                                         std::span<execution::PrefillRow> out) {
     return impl_->prefill_batch_rows(lanes, out);

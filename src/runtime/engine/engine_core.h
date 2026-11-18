@@ -1032,23 +1032,41 @@ private:
     // was never reached because the unit reservation refuses first). The numbers are part of the
     // message because the caller's only remedy is to shorten the prompt or to plan more residency.
     void refuse_kv_residency(const std::shared_ptr<Request>& request, std::uint32_t live_tokens,
-                             std::uint32_t resident_tokens) {
+                             std::uint32_t resident_tokens, std::uint32_t priced_tokens = 0) {
         const std::uint32_t prompt_tokens =
             request->base_plan ? request->base_plan->summary().prompt_tokens : live_tokens;
+        // port (sm_89, V10-84): under read-set pricing the number that was compared is the read
+        // set, so it is named separately instead of being confused with the history.
+        const std::string priced_note =
+            priced_tokens == 0 ? std::string()
+                               : " read_set_tokens=" + std::to_string(priced_tokens);
         complete_error(request, std::make_exception_ptr(RequestError(
                                     RequestErrorKind::ContextLengthExceeded,
                                     "KV residency cannot serve this request: prompt_tokens=" +
                                         std::to_string(prompt_tokens) +
                                         " live_tokens=" + std::to_string(live_tokens) +
                                         " resident_tokens=" + std::to_string(resident_tokens) +
-                                        kv_residency_limit_note())));
+                                        priced_note +
+                                        kv_residency_limit_note(priced_tokens != 0))));
     }
 
     // The sentence that names the REMAINING limit, which differs between the two arms: without the
     // page-in leg a page on the Host tier has no reader at all, with it the pool itself is the
     // limit - a page group holds every layer's planes and the full-attention layers address the
     // whole history on every step, so a step cannot address fewer pages than it does (V10-79).
-    [[nodiscard]] static std::string kv_residency_limit_note() {
+    // V10-84 adds a third state: with the leg on AND a window installed, a step addresses only sink
+    // + newest window + the selector's keep set, so that set (plus the unit's growth) is what the
+    // pool is priced by, and the pool edge is the limit on the SUM of those sets over live lanes.
+    [[nodiscard]] static std::string kv_residency_limit_note(bool read_priced = false) {
+        if (read_priced) {
+            return std::string(
+                " (the Device KV pool is tiered and the page-in leg is on: a step addresses only "
+                "the sink pages, the newest window and the selector's keep set - the set the "
+                "eviction window masks - so each lane is priced by that set plus the pages its own "
+                "unit writes, and the pool edge has to cover their sum. Shorten the window "
+                "(NINFER_KV_EVICT_WINDOW / NINFER_KV_EVICT_KEEP_FROM_SCORES), lower "
+                "max_concurrency, or give the KV leg more pages (NINFER_KV_RESIDENCY_SLACK_MB).");
+        }
         const char* value = std::getenv("NINFER_KV_PAGE_IN");
         const bool leg = value != nullptr && *value != '\0' && std::strtol(value, nullptr, 10) != 0;
         return leg ? std::string(
@@ -1101,7 +1119,7 @@ private:
                     " resident_tokens=" + std::to_string(budget.capacity_tokens) +
                     " (the pool is shared by every live lane, so lowering max_concurrency is a "
                     "remedy too)" +
-                    kv_residency_limit_note())));
+                    kv_residency_limit_note(instance_.program->kv_read_priced()))));
     }
 
     // port (sm_89): refuse ONE lane whose GROWTH has nothing left to preempt.
@@ -1138,6 +1156,26 @@ private:
             request->generation_timings = aborted.timings;
             request->speculative_stats  = std::move(aborted.speculative);
         }
+        // port (sm_89, V10-84): under read-set pricing growth_pages_needed is the set the step
+        // addresses (plus its own growth), not the whole history, so the two arms describe
+        // different quantities and say so.
+        const char* const demand_note =
+            instance_.program->kv_read_priced()
+                ? " (growth_pages_needed is this lane's read set - the sink, the newest window, "
+                  "the "
+                  "selector's keep set and its own growth - in the pool's page groups; the Device "
+                  "KV "
+                  "pool is tiered and shared, so the sum over the live lanes has to fit it. "
+                  "Shorten "
+                  "the window, lower max_concurrency, or leave more Device memory to the pool "
+                  "(NINFER_KV_RESIDENCY_SLACK_MB).)"
+                : " (growth_pages_needed is this lane's whole demand after the step, in the pool's "
+                  "page groups; the Device KV pool is tiered and shared, and every live lane's "
+                  "history has to stay in it at every step, so the growth cannot be served by "
+                  "pausing a lane of the same batch. Shorten the prompt, lower max_concurrency, or "
+                  "leave more Device memory to the pool (NINFER_KV_RESIDENCY_SLACK_MB, or a "
+                  "smaller "
+                  "max_context).)";
         complete_error(
             request,
             std::make_exception_ptr(RequestError(
@@ -1150,13 +1188,7 @@ private:
                     std::to_string(budget.live_pages) + " live_lane_pages=" +
                     (lanes.empty() ? std::string("-") : lanes) + " live_tokens=" +
                     std::to_string(budget.live_tokens) + " resident_tokens=" +
-                    std::to_string(budget.capacity_tokens) +
-                    " (growth_pages_needed is this lane's whole demand after the step, in the pool's "
-                    "page groups; the Device KV pool is tiered and shared, and every live lane's "
-                    "history has to stay in it at every step, so the growth cannot be served by "
-                    "pausing a lane of the same batch. Shorten the prompt, lower max_concurrency, or "
-                    "leave more Device memory to the pool (NINFER_KV_RESIDENCY_SLACK_MB, or a smaller "
-                    "max_context).")));
+                    std::to_string(budget.capacity_tokens) + demand_note)));
     }
 
     [[nodiscard]] std::array<bool, kMaximumConcurrency> snapshot_cancellations() const noexcept {
@@ -2544,7 +2576,13 @@ private:
                     const std::uint32_t resident_limit =
                         instance_.program->kv_residency_token_limit();
                     const std::uint32_t prompt_tokens = request->base_plan->summary().prompt_tokens;
-                    if (resident_limit != 0 && prompt_tokens > resident_limit) {
+                    // port (sm_89, V10-84): with the page-in leg on, a prompt LONGER than the arena
+                    // is not the impossibility it used to be - the step addresses sink + newest
+                    // window + the selector's keep set, and a page the Device does not hold is
+                    // copied back. So this whole-history pre-flight does not apply; the aggregate
+                    // question below (which prices the read set) is the one that decides.
+                    const bool read_priced = instance_.program->kv_read_priced();
+                    if (!read_priced && resident_limit != 0 && prompt_tokens > resident_limit) {
                         {
                             std::lock_guard lock(queue_mutex_);
                             std::erase(pending_, request);
@@ -2922,8 +2960,20 @@ private:
                     request->is_control_ready()  ? unit.tokens
                     : request->is_decode_ready() ? instance_.program->kv_residency_step_growth()
                                                  : 0U;
-                if (live + growth > resident_limit) {
-                    refuse_kv_residency(request, live, resident_limit);
+                // port (sm_89, V10-84): under read-set pricing the quantity that has to fit is the
+                // set this step addresses (plus its own growth), not the history the frontier
+                // measures - a lane may legitimately grow past the arena, and then the step pages
+                // its non-addressed pages back in. 0 means the lane is not priced that way (or is
+                // empty), and the whole-history bound below is the right one for it. A Control step
+                // keeps the whole-history bound on purpose: its write set is the control block's
+                // own token count, which the Program never sees, so its price would be short.
+                const bool read_priced_unit = instance_.program->kv_read_priced() &&
+                                              !request->is_control_ready();
+                const std::uint32_t priced = read_priced_unit
+                                                 ? instance_.program->kv_read_set_lane_tokens(lane)
+                                                 : 0U;
+                if ((priced != 0 ? priced : live + growth) > resident_limit) {
+                    refuse_kv_residency(request, live, resident_limit, priced);
                     continue;
                 }
             }

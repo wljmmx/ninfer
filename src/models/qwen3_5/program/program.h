@@ -598,6 +598,17 @@ public:
     // The same pricing for a request that is not live yet: its prompt plus one step of growth,
     // rounded up to whole pages. 0 when there is no residency contract.
     [[nodiscard]] std::uint32_t kv_residency_request_tokens(std::uint32_t prompt_tokens) const noexcept;
+    // port (sm_89, V10-84): read-set pricing. `kv_residency_budget()` above answers "how much of
+    // the shared pool does each lane hold"; with the page-in leg on and an eviction window
+    // installed the answer is the set a step ADDRESSES (sink + newest window + the selector's keep
+    // set, plus the pages the lane's unit is about to write), not the lane's history - which is
+    // what lets a multi-lane batch whose windows fit a small arena be admitted at all.
+    // `kv_read_priced()` says which of the two answers is in force (false keeps every caller's
+    // previous meaning byte for byte); `kv_read_set_lane_tokens()` is one lane's price in the same
+    // unit as `kv_residency_token_limit()`, and 0 when the lane is empty or read-set pricing is
+    // not active.
+    [[nodiscard]] bool kv_read_priced() const noexcept;
+    [[nodiscard]] std::uint32_t kv_read_set_lane_tokens(std::uint32_t lane) const noexcept;
     // Q67/S1: name each lane's place in a merged prefill pass (build only; nothing executes).
     std::size_t prefill_batch_rows(std::span<const std::uint32_t> lanes,
                                    std::span<execution::PrefillRow> out);

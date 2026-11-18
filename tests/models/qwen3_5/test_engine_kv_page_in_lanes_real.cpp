@@ -62,6 +62,9 @@ const std::uint32_t kKeepScores   = env_u32("NINFER_LANES_KEEP_SCORES", 0);
 const std::uint32_t kKeepRatio    = env_u32("NINFER_LANES_KEEP_RATIO", 0);
 const std::uint32_t kDefer        = env_u32("NINFER_LANES_DEFER", 2);
 const std::uint32_t kPrefixReuse  = env_u32("NINFER_LANES_PREFIX_REUSE", 0);
+// V10-84: the per-unit growth a read-set price has to carry, so a smaller chunk is what makes a
+// read-priced arena smaller than the lanes' histories. 1024 is the default every earlier arm ran.
+const std::uint32_t kChunk = env_u32("NINFER_LANES_CHUNK", 1024);
 
 ninfer::EngineOptions lane_options(const char* artifact, std::uint32_t capacity_tokens,
                                    std::uint64_t host_bytes) {
@@ -69,7 +72,7 @@ ninfer::EngineOptions lane_options(const char* artifact, std::uint32_t capacity_
     options.artifact_path                 = artifact;
     options.max_context                   = static_cast<std::int32_t>(kContext);
     options.kv_capacity                   = ninfer::KvCapacityPolicy::explicit_capacity(capacity_tokens);
-    options.prefill_chunk                 = 1024;
+    options.prefill_chunk                 = kChunk;
     options.kv_cache                      = ninfer::KvCacheStorage::BFloat16;
     options.speculative.backend           = ninfer::SpeculativeBackend::None;
     options.enable_vision                 = false;
@@ -160,11 +163,13 @@ int main() {
         return 77;
     }
     apply_switch_env();
+    const char* const read_pricing = std::getenv("NINFER_KV_READ_PRICING");
     std::cerr << "[lanes] lanes=" << kLanes << " prompt=" << kPromptTokens << " outputs=" << kOutputs
               << " context=" << kContext << " arena=" << kArena << " host_mib=" << kHostMib
               << " window=" << kWindow << " sink=" << kSink << " probe=" << kProbe
               << " keep_scores=" << kKeepScores << " keep_ratio=" << kKeepRatio
-              << " defer=" << kDefer << " prefix_reuse=" << kPrefixReuse << '\n';
+              << " defer=" << kDefer << " prefix_reuse=" << kPrefixReuse << " chunk=" << kChunk
+              << " read_pricing=" << (read_pricing == nullptr ? "on" : read_pricing) << '\n';
     const std::vector<std::vector<ninfer::TokenId>> prompts = make_prompts();
     try {
         // ---- reference: four whole contexts on the Device, no leg
