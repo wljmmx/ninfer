@@ -129,6 +129,14 @@ struct CapacityRebindRequest {
     // reservation divided by the tokens it serves: a derivation of the number the arena already
     // charged, not a second estimate of it.
     request.kv_bytes_per_token = target_tokens != 0 ? kv_reserve_bytes / target_tokens : 0;
+    // V10-74: A's defining move - the pool seats its whole ask and the KV leg lives on Host - needs
+    // attention to read a page the Device does not hold. Nothing does that today: the Host KV tier
+    // holds demoted extents that no attention path reads back
+    // (models/qwen3_5/execution/kv_host_split_mirror.h:11), the one Host -> Device fetch sits
+    // inside the eviction-window contract (program/storage/sequence.cpp:1226), and a KV arena
+    // smaller than the context is refused for this family's full-attention layers
+    // (program/planning/startup.cpp:1251). So the bet is told what exists, not what A would need.
+    request.resident_kv_leg    = false;
     request.mode               = controller_mode();
     // The controller's own observations, with its "not measured" sentinels preserved: policy signals
     // use -1 (and 0 for the latency proxy before a layer has run), and a zero reaching the decision
@@ -150,6 +158,11 @@ struct CapacityRebindRequest {
 // both sides cannot check the answer.
 void report_capacity_bet(const char* what, const core::CapacityBetRequest& request,
                          const core::CapacityBetPlan& plan, std::uint64_t achieved_pool_bytes) {
+    // A refusal is its own line and its own sentence: "the KV ask is below its floor" is a number a
+    // reader would have to interpret, while the missing capability is the decision's whole content.
+    if (plan.expert_resident_refusal != nullptr) {
+        std::fprintf(stderr, "[plan] capacity %s: %s\n", what, plan.expert_resident_refusal);
+    }
     std::fprintf(stderr,
                  "[plan] capacity %s: choice=%s(%s) asked=%llu+%llu MiB reason=%s "
                  "expert_pool_mb=%llu kv_pages_mb=%llu achieved_pool_mb=%llu\n",

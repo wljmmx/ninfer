@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 
 namespace {
 
@@ -59,11 +60,25 @@ void test_a_slack_device_takes_no_bet() {
 
 void test_tight_device_picks_three_different_bets() {
     // 21 GiB against a 26 GiB ask: the one Device for which the three modes must disagree.
-    const auto performance = plan_capacity_bet(canonical(21 * kGib, ControllerMode::Performance));
-    check(performance.feasible && performance.bet_exercised, "the tight case takes a bet");
+    //
+    // A is priced only with a resident-KV leg (V10-74): its "the pool takes the whole ask" needs
+    // the pages it takes away to be readable from Host, and nothing reads them back. So the
+    // performance arm below runs twice - once as the engine is, once with the leg a test may own.
+    auto request = canonical(21 * kGib, ControllerMode::Performance);
+    const auto no_leg = plan_capacity_bet(request);
+    check(no_leg.feasible && no_leg.bet_exercised, "the tight case takes a bet");
+    check(no_leg.choice == CapacityBet::KvFirst,
+          "performance without a resident-KV leg lands on B: the KV ask is kept whole");
+    check(no_leg.expert_pool_bytes == 15 * kGib, "B leaves the pool the remainder");
+    check(no_leg.kv_pages_bytes == 6 * kGib, "B keeps the KV target");
+    check(no_leg.expert_resident_refusal != nullptr, "the refusal is reported");
+
+    request.resident_kv_leg = true;
+    const auto performance = plan_capacity_bet(request);
     check(performance.choice == CapacityBet::ExpertResident, "performance picks A: experts first");
     check(performance.expert_pool_bytes == 20 * kGib, "A seats the whole window");
     check(performance.kv_pages_bytes == 1 * kGib, "A leaves KV the remainder");
+    check(performance.expert_resident_refusal == nullptr, "no refusal when the leg exists");
 
     const auto stable = plan_capacity_bet(canonical(21 * kGib, ControllerMode::Stable));
     check(stable.choice == CapacityBet::KvFirst, "stable picks B: KV first");
@@ -83,7 +98,60 @@ void test_tight_device_picks_three_different_bets() {
 
     check(performance.expert_pool_bytes != stable.expert_pool_bytes &&
               stable.expert_pool_bytes != automatic.expert_pool_bytes,
-          "the three modes do not collapse to one number");
+          "with the leg, the three modes do not collapse to one number");
+}
+
+void test_a_needs_a_resident_kv_leg() {
+    // A is the only bet that pays for the pool out of the pages attention reads, so it is the only
+    // one that needs a page the Device does not hold to be read back. Without that leg the bet must
+    // not return it, and the sentence it reports must name the leg - not the byte count.
+    auto request = canonical(21 * kGib, ControllerMode::Performance);
+    const auto refused = plan_capacity_bet(request);
+    check(refused.choice == CapacityBet::KvFirst, "A is not chosen without the leg");
+    check(!refused.resident_kv_leg, "the plan echoes the request's leg flag");
+    check(refused.expert_pool_bytes == 15 * kGib && refused.kv_pages_bytes == 6 * kGib,
+          "the refusal reports B's numbers, not A's");
+    check(refused.expert_resident_refusal != nullptr, "the refusal is set");
+    if (refused.expert_resident_refusal != nullptr) {
+        check(std::strstr(refused.expert_resident_refusal, "resident-KV leg") != nullptr,
+              "the refusal names the missing leg");
+        check(std::strstr(refused.expert_resident_refusal, "not read back") != nullptr,
+              "the refusal says why the leg is missing");
+    }
+
+    // The test-only leg: the same request prices A, with A's numbers and no refusal.
+    request.resident_kv_leg = true;
+    const auto taken        = plan_capacity_bet(request);
+    check(taken.resident_kv_leg, "the plan echoes the test-only leg flag");
+    check(taken.choice == CapacityBet::ExpertResident, "A is returned when the leg exists");
+    check(taken.expert_pool_bytes == 20 * kGib, "A seats the whole ask");
+    check(taken.kv_pages_bytes == 1 * kGib, "A leaves KV the remainder");
+    check(taken.expert_resident_refusal == nullptr, "no refusal when the leg exists");
+
+    // Auto reaches A through the miss-rate evidence, so it needs the same answer: without the leg
+    // it must not pick A either, and with it the evidence still wins.
+    auto misses              = canonical(21 * kGib, ControllerMode::Auto);
+    misses.signals.miss_rate = 0.35;
+    const auto auto_no_leg   = plan_capacity_bet(misses);
+    check(auto_no_leg.choice == CapacityBet::KvFirst, "auto does not pick A without the leg");
+    check(auto_no_leg.expert_resident_refusal != nullptr, "auto reports the same refusal");
+    misses.resident_kv_leg = true;
+    check(plan_capacity_bet(misses).choice == CapacityBet::ExpertResident,
+          "auto picks A with the leg");
+}
+
+void test_no_bet_returns_a_without_the_leg() {
+    // The sweep the flag exists for: over the whole budget range, an exercised bet never answers A
+    // while the leg is absent. A "both asks fit" plan still reports A - that case takes no bet.
+    for (const auto mode :
+         {ControllerMode::Auto, ControllerMode::Stable, ControllerMode::Performance}) {
+        for (std::uint64_t budget = kMib; budget <= 32 * kGib; budget += 128 * kMib) {
+            const auto plan = plan_capacity_bet(canonical(budget, mode));
+            if (!plan.feasible || !plan.bet_exercised) { continue; }
+            check(plan.choice != CapacityBet::ExpertResident,
+                  "an exercised bet never returns A without a resident-KV leg");
+        }
+    }
 }
 
 void test_no_bet_claims_more_than_the_device_has() {
@@ -167,9 +235,13 @@ void test_the_ask_is_the_whole_set_not_one_window() {
     auto full              = request;
     full.expert_full_slots = 20 * 1024;
     full.mode              = ControllerMode::Performance;
+    check(plan_capacity_bet(full).choice == CapacityBet::KvFirst,
+          "performance without the leg cannot seat the whole set; the KV ask is kept whole");
+    full.resident_kv_leg = true;
     check(plan_capacity_bet(full).choice == CapacityBet::ExpertResident,
-          "performance seats the whole set");
-    full.mode = ControllerMode::Stable;
+          "performance seats the whole set with the leg");
+    full.resident_kv_leg = false;
+    full.mode            = ControllerMode::Stable;
     check(plan_capacity_bet(full).choice == CapacityBet::KvFirst, "stable keeps the pages");
     full.mode = ControllerMode::Auto;
     check(plan_capacity_bet(full).choice == CapacityBet::BothGive, "auto splits the surplus");
@@ -181,9 +253,13 @@ void test_measured_evidence_steers_auto() {
     check(unknown.choice == CapacityBet::BothGive,
           "no evidence leaves auto on its structural rule");
 
-    // A high miss rate says residency is the limit: auto takes the performance rule.
+    // A high miss rate says residency is the limit: auto takes the performance rule. That rule is
+    // A, which a run may only price with a resident-KV leg, so these two arms declare the
+    // test-only leg - what they assert is the ranking, and
+    // `test_a_needs_a_resident_kv_leg` covers the refusal.
     auto misses              = canonical(21 * kGib, ControllerMode::Auto);
     misses.signals.miss_rate = 0.35;
+    misses.resident_kv_leg   = true;
     const auto residency     = plan_capacity_bet(misses);
     check(residency.choice == CapacityBet::ExpertResident, "a high miss rate ranks residency first");
     check(residency.expert_pool_bytes == 20 * kGib, "residency-first seats the whole window");
@@ -197,6 +273,7 @@ void test_measured_evidence_steers_auto() {
 
     // Both high: the larger relative excess wins (0.40 / 0.20 beats 70 / 60).
     auto both                  = canonical(21 * kGib, ControllerMode::Auto);
+    both.resident_kv_leg       = true;
     both.signals.miss_rate     = 0.40;
     both.signals.lambda_p99_ms = 70.0;
     check(plan_capacity_bet(both).choice == CapacityBet::ExpertResident,
@@ -240,6 +317,8 @@ void test_kv_alignment_when_a_page_size_is_named() {
 int main() {
     test_a_slack_device_takes_no_bet();
     test_tight_device_picks_three_different_bets();
+    test_a_needs_a_resident_kv_leg();
+    test_no_bet_returns_a_without_the_leg();
     test_no_bet_claims_more_than_the_device_has();
     test_sizes_are_monotone_in_the_budget();
     test_headroom_is_deducted_before_the_bet();

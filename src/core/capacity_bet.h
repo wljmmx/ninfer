@@ -29,8 +29,23 @@
 // every mode returns A (experts fully resident) with `bet_exercised == false`, because there is no
 // bet to take - that case is reported, not silently relabelled.
 //
+// A'S PRECONDITION (V10-74). A pays for the pool out of the KV leg, so the pages the remainder does
+// not cover have to live on Host and be read back when a step asks for them - and a step asks for
+// every page of the history. That capability, a resident-KV leg, does not exist today: the Host KV
+// tier holds demoted extents that no attention path reads back
+// (models/qwen3_5/execution/kv_host_split_mirror.h:11), the one Host -> Device fetch lives inside
+// the eviction-window contract (program/storage/sequence.cpp:1226), and a KV arena smaller than the
+// context is refused outright for a model with full-attention layers
+// (program/planning/startup.cpp:1251). `resident_kv_leg` is therefore FALSE by default, A is
+// reported as not executable for that reason rather than as "the KV ask is below its floor", and
+// the bet returns the arrangement the engine can actually run. A plan may set the flag to price a
+// leg that does not exist yet (the tests do, with a leg they own); a run must not.
+//
 // The three modes are three different rules, not one formula renamed:
-//   performance  experts first: pool = min(ask, budget); KV takes what is left.
+//   performance  experts first: pool = min(ask, budget); KV takes what is left - and since that
+//                "left" is below the KV ask exactly when the bet is taken, this rule is only
+//                offered when `resident_kv_leg` is set. Without it the pool takes what is left
+//                after the KV ask, which is B's shape; the refusal names the leg.
 //   stable       KV first:      kv = min(ask, budget - one slot); pool takes what is left.
 //                (one slot, not one window: a partial pool is legal here - the Host tier covers the
 //                rest of the layer, and refusing it would turn a workable run into a startup fault)
@@ -135,7 +150,12 @@ struct CapacityBetRequest {
     std::uint64_t kv_target_tokens   = 0;
     // KV page granularity, for the KV figure's alignment. Zero means "do not align".
     std::uint64_t kv_alignment_bytes = 0;
-    ControllerMode  mode             = ControllerMode::Auto;
+    // Whether a resident-KV leg exists: attention runs with FEWER Device pages than the context
+    // needs, and a page the Device does not hold is read back from Host when a step asks for it.
+    // False is the engine as it is (see A'S PRECONDITION above), and it is what makes A a refusal
+    // instead of a plan.
+    bool            resident_kv_leg = false;
+    ControllerMode  mode            = ControllerMode::Auto;
     CapacitySignals signals{};
 
     [[nodiscard]] std::uint64_t expert_ask_bytes() const noexcept {
@@ -151,6 +171,12 @@ struct CapacityBetRequest {
     }
 };
 
+// The sentence a caller prints when A was the answer the rule reached and could not be taken. It
+// names the missing capability rather than a byte count, because the byte count was never the
+// problem: the pages it priced away have no reader once they leave the Device.
+inline constexpr const char* kExpertResidentNeedsKvLeg =
+    "A not executable: no resident-KV leg (evicted pages are not read back)";
+
 struct CapacityBetPlan {
     std::uint64_t expert_pool_bytes = 0;
     std::uint64_t kv_pages_bytes    = 0;
@@ -163,6 +189,12 @@ struct CapacityBetPlan {
     // that only wants to log a tight run can gate on this instead of re-deriving it.
     bool        bet_exercised = false;
     const char* reason        = "no request";
+
+    // Echo of the request, so a caller logs one object instead of two, and - when A was on the
+    // table and could not be taken - the sentence that says why, ready to print. A null refusal
+    // means A was never refused, not that it was taken.
+    bool        resident_kv_leg         = false;
+    const char* expert_resident_refusal = nullptr;
 
     [[nodiscard]] std::uint64_t device_total_bytes() const noexcept {
         return expert_pool_bytes + kv_pages_bytes;
@@ -212,7 +244,8 @@ plan_capacity_bet(const CapacityBetRequest& request,
         plan.reason = "the Device cannot hold one expert slot after the startup allowance";
         return plan;
     }
-    plan.feasible = true;
+    plan.feasible        = true;
+    plan.resident_kv_leg = request.resident_kv_leg;
     if (experts + kv <= budget) {
         // Nothing is scarce, so nothing is bet. Reported as A because "the experts are resident" is
         // exactly what A names, and because returning a mode-dependent answer here would turn a
@@ -231,18 +264,6 @@ plan_capacity_bet(const CapacityBetRequest& request,
     }
     plan.bet_exercised = true;
 
-    const auto experts_first = [&] {
-        // performance: the pool takes its ask if it fits, and KV takes the remainder. When the ask
-        // does not fit, KV keeps nothing but the bytes the pool cannot use - which is the same rule,
-        // applied to a smaller pool.
-        plan.expert_pool_bytes = std::min(experts, budget);
-        plan.kv_pages_bytes    = std::min(kv, budget - plan.expert_pool_bytes);
-        plan.choice = plan.expert_pool_bytes >= experts ? CapacityBet::ExpertResident
-                                                        : CapacityBet::BothGive;
-        plan.reason = plan.choice == CapacityBet::ExpertResident
-                          ? "experts first: the pool seats its whole window, KV takes the remainder"
-                          : "experts first: the window does not fit, so KV keeps only the leftovers";
-    };
     const auto kv_first = [&] {
         // stable: the KV target is met first, leaving one expert slot - a pool of one slot is still
         // a pool (the Host tier serves the rest of the layer), and refusing it would be the startup
@@ -254,6 +275,34 @@ plan_capacity_bet(const CapacityBetRequest& request,
         plan.reason = plan.choice == CapacityBet::KvFirst
                           ? "KV first: the pages keep their target, the pool streams the remainder"
                           : "KV first: even one expert slot is taken from the KV target";
+    };
+    const auto experts_first = [&] {
+        // performance: the pool takes its ask, and KV takes the remainder - which, for every budget
+        // this rule is reached with, is less than the KV ask. That answer is A, and A is only
+        // runnable with a resident-KV leg: the pages it prices away have no reader once they leave
+        // the Device. Without one the pool takes what is left after the KV ask (B's shape) and the
+        // refusal says which capability is missing, instead of pricing a leg that is not there.
+        if (!request.resident_kv_leg) {
+            kv_first();
+            plan.reason =
+                plan.choice == CapacityBet::KvFirst
+                    ? "experts first, but A needs a resident-KV leg: the KV leg keeps its target "
+                      "and the pool takes the remainder"
+                    : "experts first, but A needs a resident-KV leg: not even the KV target fits "
+                      "beside one expert slot";
+            plan.expert_resident_refusal = kExpertResidentNeedsKvLeg;
+            return;
+        }
+        // The pool takes its ask if it fits, and KV takes the remainder. When the ask does not fit,
+        // KV keeps nothing but the bytes the pool cannot use - which is the same rule, applied to a
+        // smaller pool.
+        plan.expert_pool_bytes = std::min(experts, budget);
+        plan.kv_pages_bytes    = std::min(kv, budget - plan.expert_pool_bytes);
+        plan.choice = plan.expert_pool_bytes >= experts ? CapacityBet::ExpertResident
+                                                        : CapacityBet::BothGive;
+        plan.reason = plan.choice == CapacityBet::ExpertResident
+                          ? "experts first: the pool seats its whole window, KV takes the remainder"
+                          : "experts first: the window does not fit, so KV keeps only the leftovers";
     };
 
     switch (request.mode) {
@@ -275,8 +324,12 @@ plan_capacity_bet(const CapacityBetRequest& request,
                                                request.signals.lambda_p99_ms /
                                                    thresholds.auto_latency_high_ms)) {
             experts_first();
-            plan.reason =
-                "auto: the measured miss rate ranks residency first, so the pool takes its window";
+            // The refusal already carries the sentence a reader needs; the mode's own wording would
+            // bury it, so it is only written when A was actually taken.
+            if (request.resident_kv_leg) {
+                plan.reason = "auto: the measured miss rate ranks residency first, so the pool "
+                              "takes its window";
+            }
             break;
         }
         if (latency_high) {
@@ -322,6 +375,19 @@ plan_capacity_bet(const CapacityBetRequest& request,
                           : "auto: each side keeps its floor and the surplus is shared in proportion";
         break;
     }
+    }
+    // A is the one answer that costs attention its pages: either "the pool seats its whole ask and
+    // the KV leg takes the remainder" (the experts-first rule above, which refuses to price that
+    // without the leg) or "the KV leg is left no Device bytes at all" (the structural rule, when
+    // the budget is under the pool's usable floor). Both need a page the Device does not hold to
+    // be read back for attention, so without a resident-KV leg A is not executable: the shape is
+    // reported as what it is - C, neither side whole - with the refusal beside it. The bytes are
+    // left as the rule computed them; a re-solve would not give the KV leg pages it cannot read
+    // back either.
+    if (plan.bet_exercised && plan.choice == CapacityBet::ExpertResident &&
+        !request.resident_kv_leg) {
+        plan.choice                  = CapacityBet::BothGive;
+        plan.expert_resident_refusal = kExpertResidentNeedsKvLeg;
     }
     plan.expert_pool_bytes = std::min(experts, detail::round_down(plan.expert_pool_bytes,
                                                                  request.expert_slot_bytes));
