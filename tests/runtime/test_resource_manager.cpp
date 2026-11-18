@@ -2080,6 +2080,11 @@ void test_prefix_retention_off_does_not_check_the_budget() {
 
 int main() {
     try {
+        // NINFER_PREFIX_RETENTION is process-wide, but these scenarios assert the ordinary reclaim
+        // order. A sweep that turns retention on globally must not silently change what they check,
+        // so the suite starts with the policy off and each retention scenario opens it itself
+        // through RetentionScope.
+        set_prefix_retention(false);
         test_demotion_competes_with_its_actual_host_recovery_loss();
         test_adjacent_kv_demotions_share_one_submission();
         test_kv_demotion_batch_stops_at_an_intervening_delete();

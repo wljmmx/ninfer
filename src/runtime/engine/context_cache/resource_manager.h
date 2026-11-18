@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -65,6 +66,13 @@ public:
         // supplies progress; a history may still have other pages needed by a later shortage.
         std::vector<Victim> victims;
         std::vector<OwnerProtection> owners;
+        // V10-02: prefixes the retention policy would rather keep. They stay in `victims` and are
+        // only ranked last, because an exclusion would make a pool that is entirely retained
+        // unsatisfiable (measured: an isolated request could not reserve one legal unit).
+        std::vector<Handle> retained;
+        // True when this cursor already offers the optional retained prefixes (the relaxed pass).
+        // Kept on the cursor so a retry cannot recurse forever.
+        bool relaxed = false;
         std::optional<Admission> admission;
         std::optional<std::uint64_t> gain_limit;
         std::uint64_t sacrificed = 0;
@@ -780,10 +788,12 @@ public:
 
     [[nodiscard]] ReclaimCursor begin_reclaim(Program& program,
                                               std::optional<Admission> admission = std::nullopt,
-                                              ReclaimRights rights               = {}) {
+                                              ReclaimRights rights               = {},
+                                              bool relax_retention               = false) {
         prune(program);
         balance_reused(program);
-        auto cursor      = reclaim_order(program);
+        auto cursor      = reclaim_order(program, relax_retention);
+        cursor.relaxed   = relax_retention;
         cursor.admission = admission;
         cursor.rights    = admission ? ReclaimRights{ReclaimPurpose::OptionalWrite} : rights;
         if (admission && !admission->demand.reused) {
@@ -829,13 +839,28 @@ public:
     [[nodiscard]] ReclaimProgress reclaim(Program& program, ContextResourceUsage shortage,
                                           std::span<const Handle> excluded = {}) {
         if (program.has_context_transaction()) { return ReclaimProgress::Transferring; }
-        auto cursor = begin_reclaim(program);
-        return reclaim(program, shortage, excluded, cursor);
+        auto cursor      = begin_reclaim(program);
+        const auto first = reclaim(program, shortage, excluded, cursor);
+        if (first != ReclaimProgress::Blocked || !prefix_retention_) { return first; }
+        // A pool that cannot answer from its ordinary victims must not fail the request just to
+        // honour a retention preference. The optional retained prefixes become candidates again
+        // (a pinned one never does; it is still withheld by `reclaim_order`).
+        auto relaxed = begin_reclaim(program, std::nullopt, {}, /*relax_retention=*/true);
+        return reclaim(program, shortage, excluded, relaxed);
     }
 
     [[nodiscard]] ReclaimProgress reclaim(Program& program, ContextResourceUsage shortage,
                                           std::span<const Handle> excluded, ReclaimCursor& cursor) {
         if (program.has_context_transaction()) { return ReclaimProgress::Transferring; }
+        // Everything this pool could give back is retained: the caller is about to fail a request
+        // that a relaxed pass could still satisfy. Offer the optional retained prefixes now; a
+        // pinned one stays withheld by `reclaim_order`. One retry per cursor, so a pool that is all
+        // pinned still reports Blocked instead of looping.
+        if (prefix_retention_ && !cursor.relaxed && cursor.victims.empty()) {
+            auto relaxed = begin_reclaim(program, cursor.admission, cursor.rights,
+                                         /*relax_retention=*/true);
+            return reclaim(program, shortage, excluded, relaxed);
+        }
         prune(program);
         if (shortage.host_bytes && program.release_redundant_host(excluded)) {
             return ReclaimProgress::Changed;
@@ -1316,14 +1341,18 @@ private:
         return out;
     }
 
-    [[nodiscard]] ReclaimCursor reclaim_order(Program& program) const {
+    [[nodiscard]] ReclaimCursor reclaim_order(Program& program, bool relax_optional = false) const {
         ReclaimCursor cursor;
         const auto retained = retained_prefixes(program);
+        cursor.retained     = retained.optional;
         for (const auto handle : victims()) {
-            // V10-02: the selected retention set is what this decision may not offer for release
-            // or demotion. Empty when the policy is off, which is why the default path is the
-            // old loop with one extra `contains` over an empty vector, not a different decision.
-            if (contains(retained, handle)) { continue; }
+            // V10-02: two different promises. A pinned prefix is in flight - a request is holding
+            // it or Native has leased it - and is never offered. An optional retained prefix is
+            // withheld while the pool can still answer from ordinary victims, and offered again in
+            // a relaxed pass when it cannot: withholding it absolutely turned a satisfiable request
+            // into "cannot reserve its first legal unit" (measured on prefix_real and dense_real).
+            if (contains(retained.pinned, handle)) { continue; }
+            if (!relax_optional && contains(retained.optional, handle)) { continue; }
             const auto frontier = program.checkpoint_metadata(handle).frontier;
             cursor.victims.push_back({handle, priority_for(handle),
                                       demand_priority(program.checkpoint_key(handle, frontier))});
@@ -1337,37 +1366,40 @@ private:
 
     // V10-02: the retained prefix set, in the units `select_prefix_checkpoints` ranks.
     //
-    // Called from `reclaim_order`, i.e. from the single place every release and demotion decision
-    // takes its candidate list, so "retained" means exactly "not offered to Native for release or
-    // demotion". The handles themselves stay owned by the catalog: this selects, it never mutates.
+    // Called from `reclaim_order`, the single place every release and demotion decision takes its
+    // candidate list. Two strengths, because two different promises are involved:
     //
-    // Pinned = in flight: a source a request is still holding (`waiting_.held`) or a checkpoint
-    // Native has pinned (leased). Those are always kept, whatever the budget, because dropping one
-    // would break a request that is already running. Everything else - published continuations,
-    // shared prefixes - competes for the budget by the policy's own ranking (reuse evidence, then
-    // frontier, then recency), so a cold one-off loses to a reused one. A pinned set that alone
-    // exceeds the budget is a pool that cannot honour its own in-flight work: it throws instead of
-    // silently dropping a pinned checkpoint.
+    //   pinned    a source a request is still holding (`waiting_.held`) or a checkpoint Native has
+    //             leased. Never offered: dropping one would break a request that is already
+    //             running. A pinned set that alone exceeds the budget throws instead.
+    //   optional  published continuations and shared prefixes that compete for the budget by the
+    //             policy's ranking. Offered last, not withheld, so a pool under real pressure still
+    //             gives them back - a retention policy must never turn a satisfiable request into
+    //             "cannot reserve its first legal unit".
     //
-    // The budget is not a new number. It is `protected_pool_budget` of the pool class the set
-    // occupies the larger share of, so the waterline and the accounting both come from budgets the
-    // manager already reads; there is no retention constant anywhere. The ranked set decides ORDER;
-    // the pool's own deduped `checkpoint_footprint` decides BYTES, because two roles over one
-    // history share pages and a per-holder sum counts them twice.
-    [[nodiscard]] std::vector<Handle> retained_prefixes(const Program& program) const {
+    // Both pool classes are budgeted (Main KV pages and Host bytes). Sizing by one class let a set
+    // that fits the Host budget pin every Main KV page; that is what made prefix_real and
+    // dense_real fail with main_kv=0 under NINFER_PREFIX_RETENTION=1.
+    struct RetainedSet {
+        std::vector<Handle> pinned;   // in flight: never offered
+        std::vector<Handle> optional; // ranked behind every ordinary victim
+    };
+
+    [[nodiscard]] RetainedSet retained_prefixes(const Program& program) const {
         if (!enabled_ || !prefix_retention_) { return {}; }
 
         struct Entry {
             Handle handle;
             bool pinned = false;
         };
+
         std::vector<Entry> entries;
         const auto add = [&](Handle handle, bool in_flight) {
             if (!program.valid_checkpoint(handle)) { return; }
             const bool pinned = in_flight || program.checkpoint_metadata(handle).leased;
-            const auto found =
-                std::find_if(entries.begin(), entries.end(),
-                             [&](const auto& entry) { return entry.handle == handle; });
+            const auto found = std::find_if(entries.begin(), entries.end(), [&](const auto& entry) {
+                return entry.handle == handle;
+            });
             if (found == entries.end()) {
                 entries.push_back({handle, pinned});
             } else {
@@ -1387,29 +1419,35 @@ private:
         handles.reserve(entries.size());
         for (const auto& entry : entries) { handles.push_back(entry.handle); }
 
-        // The class the retained set is accounted in: the one it occupies the larger share of. Both
-        // sides are the pool's own capacities, so this introduces no constant; a set that sits in
-        // Host is budgeted in Host bytes, one that is still Device-resident in Main KV pages, and
-        // the ratio comparison is exact (cross-multiplied through wide_mul_compare, no floats).
-        // Known limitation, stated rather than hidden: one scalar budget cannot cover both classes,
-        // so a candidate that occupies none of the accounted class costs nothing in this ledger.
-        const auto usage    = program.physical_usage();
-        const auto occupied = program.checkpoint_footprint(handles);
-        // Main KV pages unless the Host quota is the pool the set fills more of.
-        bool by_main = usage.capacity.main_kv_pages != 0;
-        if (by_main && usage.capacity.host_bytes != 0) {
-            by_main = wide_mul_compare(occupied.main_kv_pages, usage.capacity.host_bytes,
-                                       occupied.host_bytes,
-                                       usage.capacity.main_kv_pages) >= 0;
+        // Both pool classes are budgeted, not just the one the set fills the larger share of.
+        // Sizing by a single class let a set that fits the Host budget pin every Main KV page, and
+        // the pool then could not reserve its first legal unit (measured: prefix_real and
+        // dense_real under NINFER_PREFIX_RETENTION=1 both died with "main_kv=0"). Each class now
+        // keeps the same waterline the demotion path uses, so no constant is introduced here
+        // either.
+        const auto usage       = program.physical_usage();
+        const auto main_budget = usage.capacity.main_kv_pages == 0
+                                     ? std::numeric_limits<std::uint64_t>::max()
+                                     : protected_pool_budget(usage.capacity.main_kv_pages);
+        const auto host_budget = usage.capacity.host_bytes == 0
+                                     ? std::numeric_limits<std::uint64_t>::max()
+                                     : protected_pool_budget(usage.capacity.host_bytes);
+        if (main_budget == std::numeric_limits<std::uint64_t>::max() &&
+            host_budget == std::numeric_limits<std::uint64_t>::max()) {
+            return {}; // nothing to account the set against
         }
-        const std::uint64_t capacity =
-            by_main ? usage.capacity.main_kv_pages : usage.capacity.host_bytes;
-        if (capacity == 0) { return {}; }  // nothing to account the set against
-        const std::uint64_t budget = protected_pool_budget(capacity);
-        const auto cost            = [&](std::span<const Handle> subset) -> std::uint64_t {
-            const auto footprint = program.checkpoint_footprint(subset);
-            return by_main ? static_cast<std::uint64_t>(footprint.main_kv_pages)
-                           : static_cast<std::uint64_t>(footprint.host_bytes);
+        const auto footprint = [&](std::span<const Handle> subset) {
+            return program.checkpoint_footprint(subset);
+        };
+        const auto fits = [&](std::span<const Handle> subset) {
+            const auto used = footprint(subset);
+            return static_cast<std::uint64_t>(used.main_kv_pages) <= main_budget &&
+                   static_cast<std::uint64_t>(used.host_bytes) <= host_budget;
+        };
+        // Ranking happens in Host bytes: that is the class a demoted prefix lands in, and the one
+        // the policy's own byte figure names. Main KV is enforced as a ceiling in `fits`.
+        const auto cost = [&](std::span<const Handle> subset) -> std::uint64_t {
+            return static_cast<std::uint64_t>(footprint(subset).host_bytes);
         };
 
         // `PrefixCandidate::handle` is a plain ordinal, not a model handle: CheckpointHandle is
@@ -1431,16 +1469,19 @@ private:
         }
 
         const auto picked =
-            context_cache::select_prefix_checkpoints(std::move(candidates), budget);
-        // `over_budget` is decided on the per-holder sum above, which over-counts aliases; the
-        // deduped footprint below is authoritative for both the refusal and the trimming.
-        const auto pinned_cost =
-            pinned_handles.empty() ? std::uint64_t{0} : cost(pinned_handles);
-        if (pinned_cost > budget) {
+            context_cache::select_prefix_checkpoints(std::move(candidates), host_budget);
+        // `over_budget` is decided on the deduped footprint below, which is authoritative for both
+        // the refusal and the trimming; a per-holder sum counts aliases twice.
+        const auto pinned_footprint =
+            pinned_handles.empty() ? ContextResourceUsage{} : footprint(pinned_handles);
+        if (static_cast<std::uint64_t>(pinned_footprint.main_kv_pages) > main_budget ||
+            static_cast<std::uint64_t>(pinned_footprint.host_bytes) > host_budget) {
             throw std::runtime_error(
                 "pinned prefix retention exceeds the checkpoint pool budget: " +
-                std::to_string(pinned_cost) + " of " + std::to_string(budget) +
-                (by_main ? " main-KV pages" : " Host bytes") + " (NINFER_PREFIX_RETENTION)");
+                std::to_string(pinned_footprint.main_kv_pages) + " of " +
+                std::to_string(main_budget) + " main-KV pages, " +
+                std::to_string(pinned_footprint.host_bytes) + " of " + std::to_string(host_budget) +
+                " Host bytes (NINFER_PREFIX_RETENTION)");
         }
 
         std::vector<Handle> kept;
@@ -1450,8 +1491,8 @@ private:
         }
         // Trim from the tail - the policy's own lowest-ranked optional entries - so the kept set is
         // "pinned plus the best of the rest that really fits", never "whatever summed small enough
-        // per holder".
-        while (!kept.empty() && cost(kept) > budget) {
+        // per holder". `fits` is what decides, because the selection ranks Host bytes only.
+        while (!kept.empty() && !fits(kept)) {
             std::size_t drop = kept.size();
             for (std::size_t index = kept.size(); index != 0; --index) {
                 if (!contains(pinned_handles, kept[index - 1])) {
@@ -1459,10 +1500,19 @@ private:
                     break;
                 }
             }
-            if (drop == kept.size()) { break; }  // only pinned left, and it fits
+            if (drop == kept.size()) { break; } // only pinned left, and it fits
             kept.erase(kept.begin() + static_cast<std::ptrdiff_t>(drop));
         }
-        return kept;
+        RetainedSet result;
+        result.pinned.reserve(pinned_handles.size());
+        for (const auto handle : kept) {
+            if (contains(pinned_handles, handle)) {
+                result.pinned.push_back(handle);
+            } else {
+                result.optional.push_back(handle);
+            }
+        }
+        return result;
     }
 
     static std::uint64_t useful(ContextResourceUsage released, ContextResourceUsage shortage) {
