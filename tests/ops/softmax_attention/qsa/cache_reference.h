@@ -85,11 +85,20 @@ inline void write_u16(std::vector<std::uint8_t>& bytes, std::size_t offset, std:
     std::memcpy(bytes.data() + offset, &word, sizeof(word));
 }
 
+// port (sm_89, V11-01): __half_as_ushort / __ushort_as_half are device-only intrinsics and this
+// is host test code; a bit copy is the same value on every toolchain (12.0/12.1 reject the call).
 inline std::uint16_t fp16_encode(float x) {
-    return __half_as_ushort(__float2half_rn(x));
+    const __half value = __float2half_rn(x);
+    std::uint16_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
 }
 
-inline float fp16_decode(std::uint16_t x) { return __half2float(__ushort_as_half(x)); }
+inline float fp16_decode(std::uint16_t x) {
+    __half value;
+    std::memcpy(&value, &x, sizeof(value));
+    return __half2float(value);
+}
 
 inline double positive_fp8(int code) {
     const int exponent = code >> 3, fraction = code & 7;

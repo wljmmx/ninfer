@@ -166,8 +166,11 @@ struct Harness {
                         const std::size_t i =
                             ((std::size_t(p) * kv_heads + h) * 64 + slot) * kHeadDim + d;
                         keys_host[i]   = f32_to_bf16(sample(std::uint32_t(i + 17)));
-                        values_host[i] =
-                            __half_as_ushort(__float2half_rn(sample(std::uint32_t(i + 91)) * 0.75F));
+                        // Bit copy, not __half_as_ushort: the intrinsic is device-only and this
+                        // fixture is host code (V11-01, after strata #3368).
+                        const __half half_value =
+                            __float2half_rn(sample(std::uint32_t(i + 91)) * 0.75F);
+                        std::memcpy(&values_host[i], &half_value, sizeof(values_host[i]));
                     }
     }
 

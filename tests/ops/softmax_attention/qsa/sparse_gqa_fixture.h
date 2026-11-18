@@ -23,10 +23,20 @@ inline std::uint32_t hash(std::uint32_t x) {
 inline float sample(std::uint32_t i) { return (int(hash(i) % 10001) - 5000) / 3000.0F; }
 
 // `half` is also a type name from cuda_fp16.h, so the word helper avoids an ambiguity with
-// an unqualified functional cast under MSVC.
-inline std::uint16_t half_word(float x) { return __half_as_ushort(__float2half_rn(x)); }
+// an unqualified functional cast under MSVC. The bit copy replaces __half_as_ushort, which is
+// device-only and this fixture is host code (V11-01, after strata #3368).
+inline std::uint16_t half_word(float x) {
+    const __half value = __float2half_rn(x);
+    std::uint16_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
 
-inline float unhalf(std::uint16_t x) { return __half2float(__ushort_as_half(x)); }
+inline float unhalf(std::uint16_t x) {
+    __half value;
+    std::memcpy(&value, &x, sizeof(value));
+    return __half2float(value);
+}
 
 struct Plane {
     int leading;
