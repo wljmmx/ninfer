@@ -167,11 +167,12 @@ growth   = ceil((max(frontier,cursor) + unit)/64) − ceil(max(frontier,cursor)/
   在声明 96 页竞技场准入并跑完，四行 token 与 512 页全驻留**逐位一致**（`spilled=341 fetched=2`，
   probe `demoted=2 refetched=2 missing=0 borrowed=0`）；同二进制 `NINFER_KV_READ_PRICING=0` 第 2 行被拒。
   V10-81 的配置（4×1500 / chunk 1024 / 100 页）买到的仍是 100 页，token 与当时一致。
-  `NINFER_KV_BORROW` 的跨行借用在 96/64 页下仍未触发（池子有余量）。
+  `NINFER_KV_BORROW` 的跨行借用在 96/64 页下仍未触发，而这是**预期**：不变量 `Σ计价 ≤ 竞技场` 同时保证 `R−(S−A) ≥ A−(C−R)`，本行 spare 与各行读集已够用，借用只在界被破坏时（`NINFER_KV_EVICT_DEFER` 的掩码被推迟、Host tier 满、被抢占行的 replay）才需要动手。所以 `borrowed=0` 不能当缺陷读；真正触发它的构造尚未做（V10-86 ①）。
 * 未闭环：被抢占行的 replay 仍按整段历史预留（`recovery->coverage`）；Host tier 必须装得下被降级的页
   （512 MiB ≈ 128 页，4×6000 需要 ~340 页）；竞技场下限 = `sink + window + 2 × chunk + 1` 页/行，
   所以窗口尺度的竞技场需要小 `--prefill-chunk`；Control 步仍按整段历史（Program 看不到 control token 数）。
   详见 `.temp/v10-84/report.md`。
+* DFlash2 的换入腿（V10-86 ②）：真实 decode 探针里 backend 池 `46/130`、`spilled_pages 25→52`、`host_live 113 MB`（降级确实发生），但 `page_in candidates=0 fetched=0`——被 spill 的草稿页在后续步不再被寻址，换入腿无页可换。缺该场景的 token 逐位对比，**未闭环**。
 
 ## 6. 容量下注 A/B 的代价（V10-82）
 
