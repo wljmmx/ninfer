@@ -26,6 +26,11 @@ bool env_number_is_set(const char* name) {
 // still have to hold the whole context. Without a contract the loud startup error stays: refusing to
 // turn a start-time rejection into a mid-flight crash is the whole point of BP.4.
 bool kv_residency_contract_active() {
+    // V10-79: the demand page-in leg is a contract of the same kind, and a strictly better one
+    // where it applies: a page the Device does not hold is copied back from the Host tier before
+    // the step that reads it, so an arena smaller than the logical capacity is legal with no
+    // retention mask at all. Checked first because it does not depend on the mask knobs below.
+    if (env_number_is_set("NINFER_KV_PAGE_IN")) { return true; }
     const bool releases = env_number_is_set("NINFER_KV_EVICT_RELEASE");
     // A demotion is a contract in the same sense the release switch is: it copies the bytes to the
     // Host tier first and then hands the Device page back, so the pool really does get the page

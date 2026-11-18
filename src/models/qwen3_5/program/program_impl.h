@@ -718,6 +718,31 @@ public:
                                                KVAddressSpaceHandle address, std::uint32_t live,
                                                std::uint32_t sink_pages, std::uint32_t window_pages,
                                                const std::vector<std::uint32_t>& keep_pages);
+    // port (sm_89, V10-79): the resident-KV leg's step half (NINFER_KV_PAGE_IN).
+    // `demote_page_for_room` gives one named page back to the pool with its bytes kept on the Host
+    // tier; `page_in_addressed_pages` copies every addressed page the Device does not hold back
+    // into a free slot (making room as above) and republishes each into the row, returning how many
+    // are still missing; `stage_step_kv_pages` is the per-step entry that computes the step's
+    // addressed set.
+    bool demote_page_for_room(KVAddressSpaceStore& addresses, PagedKVCache& cache,
+                              KVAddressSpaceHandle address, std::uint32_t page);
+    std::uint32_t page_in_addressed_pages(KVAddressSpaceStore& addresses, PagedKVCache& cache,
+                                          KVAddressSpaceHandle address, std::uint32_t live,
+                                          std::uint32_t sink_pages, std::uint32_t window_pages,
+                                          const std::vector<std::uint32_t>& keep_pages);
+    void stage_step_kv_pages(KVAddressSpaceStore& addresses, PagedKVCache& cache,
+                             KVAddressSpaceHandle address);
+    // port (sm_89, V10-79): is the Device arena smaller than the logical page space? The live pool
+    // edge is the authority, so a DECLARED arena (NINFER_KV_EVICT_CAPACITY) is tiered even though
+    // the plan's two page counts are equal.
+    [[nodiscard]] bool kv_arena_tiered() const noexcept;
+    // The last page-in pass, per row: addressed pages with no Device replica, how many were copied
+    // back, and how many had to be given back to make room.
+    std::uint32_t last_page_in_candidates_ = 0;
+    std::uint32_t last_page_in_fetched_    = 0;
+    std::uint32_t last_page_in_evicted_    = 0;
+    // One shot per Program: NINFER_KV_PAGE_IN_PROBE fires once, so a run is reproducible.
+    bool page_in_probe_done_ = false;
     // Pages the last demotion actually moved to Host, reported in the pool-account file so "the switch
     // did something" is measured instead of assumed (appendix FF).
     std::uint32_t last_demoted_pages_     = 0;

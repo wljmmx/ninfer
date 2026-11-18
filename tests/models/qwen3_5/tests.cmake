@@ -120,6 +120,15 @@ ninfer_add_test(ninfer_qwen3_5_kv_tier_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_kv_tier_real.cpp"
   LIBRARIES ninfer_engine)
 
+# port (sm_89, V10-79): the resident-KV leg (NINFER_KV_PAGE_IN). A Device arena strictly smaller than
+# the logical context serves the request, a page is given back to the Host tier and copied into a
+# Device slot before the layer that reads it runs, and the tokens are the fully resident run's tokens.
+# The third arm is the honest refusal: a prompt longer than the arena is refused at admission with the
+# numbers, because a page group spans every layer's planes.
+ninfer_add_test(ninfer_qwen3_5_kv_page_in_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_kv_page_in_real.cpp"
+  LIBRARIES ninfer_engine)
+
 ninfer_add_test(ninfer_qwen3_5_expert_stream_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_stream_real.cpp"
   LIBRARIES ninfer_artifact ninfer_ops ninfer_core)
@@ -235,6 +244,7 @@ set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_dense_real_test
   ninfer_qwen3_5_dflash_real_test
   ninfer_qwen3_5_kv_tier_real_test
+  ninfer_qwen3_5_kv_page_in_real_test
   ninfer_qwen3_5_expert_stream_real_test
   ninfer_qwen3_5_resize_under_load_real_test
   ninfer_qwen3_5_resize_handoff_real_test

@@ -125,6 +125,14 @@ std::optional<std::uint32_t> declared_resident_pages(std::uint32_t fitted_pages)
     return static_cast<std::uint32_t>(requested);
 }
 
+// V10-79: the demand page-in leg, read the same way every other switch on this path is read. It is
+// what makes an arena smaller than the logical context servable for a full-attention model: a page
+// the Device does not hold is copied back from the Host tier before the step that reads it.
+bool page_in_leg_requested() {
+    const char* value = std::getenv("NINFER_KV_PAGE_IN");
+    return value != nullptr && *value != '\0' && std::strtol(value, nullptr, 10) != 0;
+}
+
 } // namespace
 
 TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
@@ -1248,14 +1256,22 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
     // The two tiers are not interchangeable: the experts are read top-k per step, so moving them
     // out costs bytes, while the KV is read in full, so moving it out costs correctness. Shrink
     // the expert side instead.
+    // V10-79: with the demand page-in leg (NINFER_KV_PAGE_IN) an arena smaller than the context IS
+    // servable here, so the refusal below is exactly the leg-off arm: a demoted page has no reader,
+    // and a window that masks pages changes the output by design. With the leg on, the same arena
+    // is legal as long as one step's addressed history fits it, and the step's own guard says so
+    // with the numbers (program/storage/sequence.cpp, ensure_sequence_kv_mapped).
     if (std::getenv("NINFER_KV_EVICT_CAPACITY") != nullptr &&
-        parameters.model.config().text.full_attention_layers != 0) {
+        parameters.model.config().text.full_attention_layers != 0 && !page_in_leg_requested()) {
         throw std::invalid_argument(
             "NINFER_KV_EVICT_CAPACITY cannot be used with this model: it keeps " +
             std::to_string(parameters.model.config().text.full_attention_layers) +
             " full-attention layers, and those read the whole history every step, so a KV arena "
             "smaller than the context changes the output. Keep the KV resident and layer the MoE "
-            "experts instead (NINFER_EXPERT_CACHE_MB).");
+            "experts instead (NINFER_EXPERT_CACHE_MB), or set NINFER_KV_PAGE_IN=1 to let a page "
+            "the "
+            "Device does not hold be copied back from the Host tier before the step that reads "
+            "it.");
     }
     // The eviction window is a decode-side idea: it releases the pages a moving attention window
     // has left behind. Scoring prefills a whole window in one pass and needs every page of it

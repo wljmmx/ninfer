@@ -1035,18 +1035,37 @@ private:
                              std::uint32_t resident_tokens) {
         const std::uint32_t prompt_tokens =
             request->base_plan ? request->base_plan->summary().prompt_tokens : live_tokens;
-        complete_error(
-            request,
-            std::make_exception_ptr(RequestError(
-                RequestErrorKind::ContextLengthExceeded,
-                "KV residency cannot serve this request: prompt_tokens=" +
-                    std::to_string(prompt_tokens) + " live_tokens=" + std::to_string(live_tokens) +
-                    " resident_tokens=" + std::to_string(resident_tokens) +
-                    " (the Device KV pool is tiered: it holds the resident part of max_context, and "
-                    "the full-attention layers read the whole history every step, so the history "
-                    "cannot be streamed from the Host tier). Shorten the prompt, or leave more "
-                    "Device memory to the pool (NINFER_KV_RESIDENCY_SLACK_MB, or a smaller "
-                    "max_context).")));
+        complete_error(request, std::make_exception_ptr(RequestError(
+                                    RequestErrorKind::ContextLengthExceeded,
+                                    "KV residency cannot serve this request: prompt_tokens=" +
+                                        std::to_string(prompt_tokens) +
+                                        " live_tokens=" + std::to_string(live_tokens) +
+                                        " resident_tokens=" + std::to_string(resident_tokens) +
+                                        kv_residency_limit_note())));
+    }
+
+    // The sentence that names the REMAINING limit, which differs between the two arms: without the
+    // page-in leg a page on the Host tier has no reader at all, with it the pool itself is the
+    // limit - a page group holds every layer's planes and the full-attention layers address the
+    // whole history on every step, so a step cannot address fewer pages than it does (V10-79).
+    [[nodiscard]] static std::string kv_residency_limit_note() {
+        const char* value = std::getenv("NINFER_KV_PAGE_IN");
+        const bool leg = value != nullptr && *value != '\0' && std::strtol(value, nullptr, 10) != 0;
+        return leg ? std::string(
+                         " (the Device KV pool is tiered and the page-in leg is on: it copies a "
+                         "page "
+                         "back from the Host tier when a step addresses one the Device no longer "
+                         "holds, but the pool still has to cover the live history itself, because "
+                         "a "
+                         "page group spans every layer's planes and the full-attention layers read "
+                         "the whole history on every step). Shorten the prompt, or give the KV leg "
+                         "more pages (NINFER_KV_RESIDENCY_SLACK_MB, or a smaller max_context).")
+                   : std::string(
+                         " (the Device KV pool is tiered: it holds the resident part of "
+                         "max_context, and the full-attention layers read the whole history every "
+                         "step, so the history cannot be streamed from the Host tier). Shorten the "
+                         "prompt, or leave more Device memory to the pool "
+                         "(NINFER_KV_RESIDENCY_SLACK_MB, or a smaller max_context).");
     }
 
     // port (sm_89): refuse a request that DOES fit on its own but not beside the lanes already
@@ -1071,7 +1090,8 @@ private:
             request,
             std::make_exception_ptr(RequestError(
                 RequestErrorKind::ContextLengthExceeded,
-                "KV residency cannot serve a request beside the lanes already resident: prompt_tokens=" +
+                "KV residency cannot serve a request beside the lanes already resident: "
+                "prompt_tokens=" +
                     std::to_string(prompt_tokens) +
                     " request_tokens=" + std::to_string(request_tokens) +
                     " live_lanes=" + std::to_string(budget.lane_count) +
@@ -1079,11 +1099,9 @@ private:
                     " live_lane_tokens=" + (lanes.empty() ? std::string("-") : lanes) +
                     " aggregate_tokens=" + std::to_string(budget.live_tokens + request_tokens) +
                     " resident_tokens=" + std::to_string(budget.capacity_tokens) +
-                    " (the Device KV pool is tiered and shared: it holds the resident part of "
-                    "max_context for EVERY live lane at once, and the full-attention layers read the "
-                    "whole history every step, so the lanes' histories cannot be streamed from the "
-                    "Host tier). Shorten the prompt, lower max_concurrency, or leave more Device "
-                    "memory to the pool (NINFER_KV_RESIDENCY_SLACK_MB, or a smaller max_context).")));
+                    " (the pool is shared by every live lane, so lowering max_concurrency is a "
+                    "remedy too)" +
+                    kv_residency_limit_note())));
     }
 
     // port (sm_89): refuse ONE lane whose GROWTH has nothing left to preempt.

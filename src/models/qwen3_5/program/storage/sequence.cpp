@@ -235,6 +235,29 @@ bool kv_host_demote_enabled() {
     return kv_host_demote_request() == DemoteRequest::On;
 }
 
+// port (sm_89, V10-79): the resident-KV leg's step half. With the arena smaller than the logical
+// page space, a page the Device does not hold has to be copied back before the layer that reads it
+// runs - and a page this step does not read is what makes room. NINFER_KV_PAGE_IN=1 is the switch,
+// and it is a CONTRACT in the same sense the demotion is: it is the only knob under which a page
+// may be absent from the Device while the row still addresses it. Off (unset, or 0) means the step
+// path is exactly what it was, which is what keeps every frozen gate bit-identical.
+bool kv_page_in_enabled() {
+    const char* value = std::getenv("NINFER_KV_PAGE_IN");
+    return value != nullptr && *value != '\0' && std::strtol(value, nullptr, 10) != 0;
+}
+
+// Verification knob (default off): how many of the addressed pages the pass just staged to give
+// back once, so the same call has to read them out of the Host tier again. It exists because the
+// leg's failure mode is silent (attention would read a block-table entry that names a recycled
+// page), so the honest test is "evict and read back inside a real step, and the tokens do not
+// move".
+std::uint32_t kv_page_in_probe_pages() {
+    const char* value = std::getenv("NINFER_KV_PAGE_IN_PROBE");
+    if (value == nullptr || *value == '\0') { return 0; }
+    const long parsed = std::strtol(value, nullptr, 10);
+    return parsed > 0 ? static_cast<std::uint32_t>(parsed) : 0U;
+}
+
 std::uint32_t effective_window_pages(std::uint32_t requested, std::uint32_t live) {
     const char* value = std::getenv("NINFER_KV_EVICT_WINDOW_PCT");
     if (value == nullptr || *value == '\0' || live == 0) { return requested; }
@@ -641,10 +664,19 @@ std::uint32_t ProgramImpl::residency_device_page_capacity() const noexcept {
                                     : kv_resident_page_groups;
 }
 
+// port (sm_89, V10-79): is the Device arena smaller than the logical page space? Under a residency
+// plan the two plan fields say so; under a DECLARED arena (NINFER_KV_EVICT_CAPACITY) they are equal
+// while the pool is not, so the live edge is the authority. Every branch that used to compare the
+// plan fields asks this instead - on a fully resident run the two answers agree by construction,
+// which is why no frozen gate moves.
+bool ProgramImpl::kv_arena_tiered() const noexcept {
+    return residency_device_page_capacity() < kv_logical_page_groups;
+}
+
 std::uint32_t ProgramImpl::kv_residency_token_limit() const noexcept {
     // No residency contract: the Device pool holds every logical page, so there is no bound to
     // report (0 is the "unbounded" answer the Runtime tests for).
-    if (kv_resident_page_groups >= kv_logical_page_groups) { return 0; }
+    if (!kv_arena_tiered()) { return 0; }
     return residency_device_page_capacity() * static_cast<std::uint32_t>(kPagedKVPageSize);
 }
 
@@ -693,7 +725,7 @@ std::uint32_t ProgramImpl::residency_lane_tokens(std::uint32_t lane,
 Program::KvResidencyBudget ProgramImpl::kv_residency_budget() const noexcept {
     Program::KvResidencyBudget budget{};
     // No residency contract: every logical page is resident, so there is no shared bound to report.
-    if (kv_resident_page_groups >= kv_logical_page_groups) { return budget; }
+    if (!kv_arena_tiered()) { return budget; }
     budget.capacity_tokens =
         residency_device_page_capacity() * static_cast<std::uint32_t>(kPagedKVPageSize);
     budget.capacity_pages = residency_device_page_capacity();
@@ -712,7 +744,7 @@ Program::KvResidencyBudget ProgramImpl::kv_residency_budget() const noexcept {
 }
 
 std::uint32_t ProgramImpl::kv_residency_request_tokens(std::uint32_t prompt_tokens) const noexcept {
-    if (kv_resident_page_groups >= kv_logical_page_groups) { return 0U; }
+    if (!kv_arena_tiered()) { return 0U; }
     const std::uint32_t growth = kv_residency_step_growth();
     if (prompt_tokens > std::numeric_limits<std::uint32_t>::max() - growth) { return prompt_tokens; }
     return page_rounded_tokens(prompt_tokens + growth);
@@ -728,22 +760,40 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& state, std::uint32_t 
     // letting attention read a block-table entry whose Device replica was already given back.
     // This is the LAST line of defence: the Runtime refuses such a request before it grants a unit
     // (see kv_residency_token_limit()), because a refusal thrown out of a step fails every lane.
-    if (kv_resident_page_groups < kv_logical_page_groups && main != 0) {
+    if (kv_arena_tiered() && main != 0) {
         const std::uint32_t page_tokens = static_cast<std::uint32_t>(kPagedKVPageSize);
         const std::uint32_t needed      = 1U + (main - 1U) / page_tokens;
         // The live edge, not the construction number: the control plane's KV dial can shrink the
         // pool at runtime, and a guard that read the plan would then promise room that is gone.
         const std::uint32_t resident_capacity = residency_device_page_capacity();
         if (needed > resident_capacity) {
-            throw std::runtime_error(
+            // V10-79: the two arms say different things because they are different states. With the
+            // page-in leg off the pages on the Host tier have no reader at all; with it on they do
+            // - but the step still ADDRESSES all of them, because one page group holds every
+            // layer's planes and every full-attention layer reads the whole history on every step.
+            // So the leg does not lift this bound; it moves the refusal down to the arena's own
+            // size.
+            const std::string head =
                 "KV residency cannot serve this step: it needs " + std::to_string(needed) +
-                " resident page group(s) for " + std::to_string(main) + " token(s), but the Device "
-                "pool holds " + std::to_string(resident_capacity) + " of " +
+                " resident page group(s) for " + std::to_string(main) +
+                " token(s), but the Device "
+                "pool holds " +
+                std::to_string(resident_capacity) + " of " +
                 std::to_string(kv_logical_page_groups) + " logical page group(s) (" +
-                std::to_string(host_kv_payload_bytes >> 20) + " MiB priced onto the Host tier). The " +
+                std::to_string(host_kv_payload_bytes >> 20) +
+                " MiB priced onto the Host tier). The " +
                 std::to_string(parameters.model.config().text.full_attention_layers) +
                 " full-attention layer(s) read the whole history every step, so the step needs all "
-                "of it resident at once; it cannot be streamed out of the Host tier.");
+                "of it resident at once; ";
+            throw std::runtime_error(
+                head +
+                (kv_page_in_enabled()
+                     ? "the page-in leg can copy a page back from Host, but a page group spans "
+                       "every layer's planes, so it cannot make the step address fewer pages. "
+                       "Shorten the prompt, or give the pool more pages "
+                       "(NINFER_KV_RESIDENCY_SLACK_MB, or a smaller max_context)."
+                     : "it cannot be streamed out of the Host tier (set NINFER_KV_PAGE_IN=1 "
+                       "to let a page be copied back from Host)."));
         }
     }
     text_kv_addresses->ensure_mapped_to_tokens(state.kv->text, main, device.stream);
@@ -759,6 +809,16 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& state, std::uint32_t 
         if (PagedKVCache* cache = backend_kv_cache(); cache != nullptr) {
             apply_kv_eviction_window(*backend_kv_addresses, *cache, *state.kv->backend);
         }
+    }
+    // port (sm_89, V10-79): the resident-KV leg's step half. It runs AFTER the eviction window
+    // (which is what decides which pages a step addresses) and BEFORE the forward reads the row:
+    // every addressed page the Device does not hold is copied back from the Host tier, and a page
+    // this step does not address is given back to make room. The window is not required - a page
+    // can be given back by an idle reclaim, a checkpoint demotion or a dial shrink, and this is
+    // what makes it readable again. Two guards keep a default run identical: the switch, and a
+    // tiered arena (a fully resident pool never enters, so no frozen gate can move).
+    if (kv_page_in_enabled() && kv_arena_tiered()) {
+        stage_step_kv_pages(*text_kv_addresses, decoder->text_kv, state.kv->text);
     }
 }
 
@@ -1281,6 +1341,197 @@ std::uint32_t ProgramImpl::restore_addressed_host_pages(KVAddressSpaceStore& add
     return last_fetched_pages_;
 }
 
+// port (sm_89, V10-79): give ONE page back to the pool, keeping its bytes on the Host tier, so a
+// page the current step does not read can be traded for one it does. This is the demotion of
+// demote_absent_pages_to_host() applied to a single, explicitly named page: prepare -> copy ->
+// publish
+// -> demote, in that order, because the Host extent pins the Device source until publish() attaches
+// the replica. Returns false when the page cannot be given back (no Host room, a protected page, no
+// replica) - the caller then leaves the shortage to be reported instead of inventing room.
+bool ProgramImpl::demote_page_for_room(KVAddressSpaceStore& addresses, PagedKVCache& cache,
+                                       KVAddressSpaceHandle address, std::uint32_t page) {
+    if (host_kv_extents == nullptr) { return false; }
+    LogicalKVPageStore* const pages =
+        &addresses == text_kv_addresses.get() ? text_kv_pages.get() : backend_kv_pages.get();
+    if (pages == nullptr) { return false; }
+    const LogicalKVPageHandle handle = addresses.logical_page(address, page);
+    if (!pages->device_resident(handle) || pages->host_resident(handle)) { return false; }
+    const std::span<const LogicalKVPageHandle> one(&handle, 1);
+    auto reservation = host_kv_extents->prepare(*pages, one);
+    if (!reservation) { return false; }
+    const TransferWork tier_copy =
+        cache.page_pool().copy_to_host(host_kv_extents->device_sources(*reservation),
+                                       host_kv_extents->writable_view(*reservation), device.stream);
+    const HostKVExtentCapability capability = host_kv_extents->publish(std::move(*reservation));
+    if (const std::int32_t row = addresses.bound_row(address); row >= 0) {
+        live_host_extents_[row].push_back(LiveHostExtent{.capability = capability,
+                                                         .age        = host_extent_age_++,
+                                                         .page_begin = page,
+                                                         .page_end   = page + 1U});
+    }
+    if (!pages->demote_device_replica(handle)) { return false; }
+    ++last_page_in_evicted_;
+    kv_tier_stats().spilled_pages += 1;
+    kv_tier_stats().spilled_bytes += tier_copy.payload_bytes;
+    return true;
+}
+
+// port (sm_89, V10-79): the read half of the resident-KV leg. Every page this step ADDRESSES whose
+// Device replica is gone is copied back into a free slot and republished into the row before the
+// layer that reads it runs; when the pool has no free slot, the oldest page this step does NOT
+// address is given back first (the recency rule the window's own scan uses - the scan walks [0,
+// end), so the earliest page is the least recently useful one). A page that cannot be brought back
+// is counted, never assumed away: the caller turns a non-zero answer into a refusal that names the
+// remaining limit instead of letting attention read a table entry naming a recycled page. Returns
+// the number of addressed pages still without a Device replica.
+std::uint32_t ProgramImpl::page_in_addressed_pages(KVAddressSpaceStore& addresses,
+                                                   PagedKVCache& cache,
+                                                   KVAddressSpaceHandle address, std::uint32_t live,
+                                                   std::uint32_t sink_pages,
+                                                   std::uint32_t window_pages,
+                                                   const std::vector<std::uint32_t>& keep_pages) {
+    last_page_in_candidates_ = 0;
+    last_page_in_fetched_    = 0;
+    if (host_kv_extents == nullptr) { return 0; }
+    LogicalKVPageStore* const pages =
+        &addresses == text_kv_addresses.get() ? text_kv_pages.get() : backend_kv_pages.get();
+    if (pages == nullptr) { return 0; }
+    const std::uint32_t end        = std::min(live, addresses.mapped_pages(address));
+    const std::uint32_t keep_begin = end > window_pages ? end - window_pages : 0;
+    const auto addressed           = [&](std::uint32_t page) {
+        return page < sink_pages || page >= keep_begin ||
+               std::find(keep_pages.begin(), keep_pages.end(), page) != keep_pages.end();
+    };
+    std::vector<std::uint32_t> wanted; // addressed, no Device replica
+    std::vector<std::uint32_t> spare;  // not addressed: room may be made here, oldest first
+    for (std::uint32_t page = 0; page < end; ++page) {
+        const LogicalKVPageHandle handle = addresses.logical_page(address, page);
+        if (addressed(page)) {
+            if (!pages->device_resident(handle)) { wanted.push_back(page); }
+        } else if (pages->device_resident(handle) && !pages->host_resident(handle)) {
+            // A page already on Host needs no room trade: its bytes are not using the pool.
+            spare.push_back(page);
+        }
+    }
+    last_page_in_candidates_ = static_cast<std::uint32_t>(wanted.size());
+    if (wanted.empty()) { return 0; }
+    std::size_t spare_cursor = 0;
+    for (const std::uint32_t page : wanted) {
+        const LogicalKVPageHandle handle = addresses.logical_page(address, page);
+        // Same eligibility the window's fetch asks for; a page whose bytes were RELEASED (the lossy
+        // switch) has none, and that is exactly the case this counter exists to make visible.
+        if (!pages->can_reserve_device_replica(handle)) { continue; }
+        if (!host_kv_extents->ensure_host_resident(*pages, handle)) { continue; }
+        if (!pages->physical_pool().reserve(1)) {
+            bool made_room = false;
+            while (spare_cursor < spare.size() && !made_room) {
+                made_room = demote_page_for_room(addresses, cache, address, spare[spare_cursor++]);
+            }
+            if (!made_room) { continue; }
+        }
+        auto slot = pages->physical_pool().reserve(1);
+        if (!slot) { continue; }
+        const DeviceKVPageHandle destination = pages->reserve_device_replica(handle, *slot);
+        const HostKVPageReplica replica      = pages->host_replica(handle);
+        const auto host = host_kv_extents->view(replica.extent).subview(replica.page_offset, 1);
+        const std::span<const DeviceKVPageHandle> one(&destination, 1);
+        const TransferWork work = pages->physical_pool().copy_from_host(host, one, device.stream);
+        pages->publish_device_replica(handle);
+        {
+            const KVExecutionRowHandle fetch_row = addresses.execution_row(address).handle();
+            const std::span<const DeviceKVPageHandle> restored(&destination, 1);
+            cache.execution_tables().publish(fetch_row, page, restored, device.stream);
+        }
+        ++last_page_in_fetched_;
+        kv_tier_stats().fetched_pages += 1;
+        kv_tier_stats().fetched_bytes += work.payload_bytes;
+    }
+    return last_page_in_candidates_ - last_page_in_fetched_;
+}
+
+// port (sm_89, V10-79): one step's page-in, with the step's own addressed set. The window decides
+// what the step reads: with one installed, sink + newest window + the selector's keep set; without
+// one, every mapped page of the live history - which is why a full-attention model cannot run with
+// an arena smaller than its history, and why that refusal names the arena rather than the Host
+// tier.
+void ProgramImpl::stage_step_kv_pages(KVAddressSpaceStore& addresses, PagedKVCache& cache,
+                                      KVAddressSpaceHandle address) {
+    if (host_kv_extents == nullptr) {
+        // A page that leaves the Device has to land somewhere: without a Host KV tier the leg has
+        // nothing to copy back from, and the honest answer is to say so rather than to run with a
+        // tiered arena whose evicted pages are unreachable.
+        throw std::runtime_error(
+            "NINFER_KV_PAGE_IN needs a Host KV tier: configure the Host context budget, or use a "
+            "residency plan that prices the Host payload the tiered arena relies on");
+    }
+    const std::uint32_t frontier = addresses.committed_frontier(address);
+    if (frontier == 0) { return; }
+    const KVExecutionRowHandle row = addresses.execution_row(address).handle();
+    const KvEvictionWindow& window = kv_eviction_window();
+    const std::uint32_t live       = kv_live_pages(frontier);
+    // The addressed set, in the window's own vocabulary. With NO window installed every page of the
+    // live history is addressed - that is what a full-attention layer does - so the window is named
+    // as "the newest `live` pages", which makes the shared predicate below address [0, live)
+    // exactly, and leaves nothing spare: a step that reads everything cannot trade pages with
+    // itself.
+    const bool windowed = window.enabled();
+    const std::uint32_t eff_window =
+        windowed ? effective_window_pages(window.window_pages, live) : live;
+    const std::uint32_t sink_pages = windowed ? window.sink_pages : 0U;
+    std::vector<std::uint32_t> keep;
+    if (windowed) {
+        keep = window.keep_pages;
+        // The selector recomputes its keep set once per call inside apply_kv_eviction_window();
+        // read the decision that call stored rather than ranking again - a second ranking would
+        // read the planes after their reset and could name a different set than the mask the row
+        // was built from.
+        if (const auto found =
+                g_scored_keep_by_row.find(cache.execution_tables().page_score_row(row).data);
+            found != g_scored_keep_by_row.end()) {
+            keep.insert(keep.end(), found->second.begin(), found->second.end());
+        }
+    }
+    const std::uint32_t missing =
+        page_in_addressed_pages(addresses, cache, address, live, sink_pages, eff_window, keep);
+    if (missing != 0) {
+        throw std::runtime_error(
+            "KV page-in could not restore every addressed page before the step: addressed=" +
+            std::to_string(last_page_in_candidates_) + " restored=" +
+            std::to_string(last_page_in_fetched_) + " missing=" + std::to_string(missing) +
+            " (Device pool " + std::to_string(residency_device_page_capacity()) +
+            " page group(s) of " + std::to_string(kv_logical_page_groups) +
+            " logical, Host payload " + std::to_string(host_kv_payload_bytes >> 20) +
+            " MiB). A page this step does not address has to exist to be given back; the "
+            "full-attention layers address the whole history, so the pool must cover it.");
+    }
+    // Verification knob (default off): give back part of the set the pass just staged and stage it
+    // again, so the round trip Host -> Device -> Host -> Device is executed inside a real step and
+    // the tokens must not move. One shot per Program: the point is a deterministic, inspectable
+    // event, not a standing cost.
+    const std::uint32_t probe = kv_page_in_probe_pages();
+    if (probe == 0 || page_in_probe_done_ || live == 0) { return; }
+    page_in_probe_done_           = true;
+    const std::uint32_t probe_end = std::min({live, addresses.mapped_pages(address), probe});
+    std::uint32_t given_back      = 0;
+    for (std::uint32_t page = 0; page < probe_end; ++page) {
+        if (demote_page_for_room(addresses, cache, address, page)) { ++given_back; }
+    }
+    const std::uint32_t staged_before = last_page_in_fetched_;
+    const std::uint32_t again =
+        page_in_addressed_pages(addresses, cache, address, live, sink_pages, eff_window, keep);
+    std::fprintf(stderr,
+                 "[kv-page-in] probe: staged=%u demoted=%u refetched=%u missing=%u live=%u "
+                 "pool=%u/%u\n",
+                 staged_before, given_back, last_page_in_fetched_, again, live,
+                 residency_device_page_capacity(), kv_logical_page_groups);
+    std::fflush(stderr);
+    if (again != 0) {
+        throw std::runtime_error("KV page-in probe: the re-fetch after the induced demotion left " +
+                                 std::to_string(again) +
+                                 " addressed page(s) without a Device replica");
+    }
+}
+
 // appendix EY (P3a): the Device page pool's own account - allocated / reserved / available /
 // capacity, one line per decision point. It lives in its own file, and not in the score dump, because
 // a diagnostic must not move the bytes a frozen regression gate watches. Off unless
@@ -1344,6 +1595,11 @@ void ProgramImpl::dump_pool_account(PagedKVCache& cache) {
         << " fetched_pages=" << kv_tier_stats().fetched_pages
         << " fetched_bytes=" << kv_tier_stats().fetched_bytes
         << " preempted_checkpoints=" << kv_tier_stats().preempted_checkpoints << '\n';
+    // V10-79: the page-in leg's own pass, so "a page left the Device and was read back" is a line a
+    // reader can check instead of an inference from the cumulative counters above.
+    out << "# page_in candidates=" << last_page_in_candidates_
+        << " fetched=" << last_page_in_fetched_ << " evicted=" << last_page_in_evicted_
+        << " tiered=" << (kv_arena_tiered() ? 1 : 0) << '\n';
 }
 
 void ProgramImpl::dump_page_scores(KVAddressSpaceStore& addresses, PagedKVCache& cache,

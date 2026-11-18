@@ -107,6 +107,15 @@ struct CapacityRebindRequest {
     core::CapacityBetPlan plan{};
 };
 
+// V10-79: the demand page-in leg, as the constructor sees it. It is the one switch under which the
+// capacity bet may price choice A - the pool takes its ask and the KV remainder lives on the Host
+// tier
+// - because it is the one under which such a page has a reader.
+bool kv_page_in_requested() {
+    const char* value = std::getenv("NINFER_KV_PAGE_IN");
+    return value != nullptr && *value != '\0' && std::strtol(value, nullptr, 10) != 0;
+}
+
 // One builder for the bet, so the tight-run report and the rebind attempt cannot describe the same
 // Device with two different requests. `free_bytes` is the free count the split used, so the bet's
 // budget and plan_device_split()'s budget are the same number.
@@ -138,13 +147,12 @@ struct CapacityRebindRequest {
     // charged, not a second estimate of it.
     request.kv_bytes_per_token = target_tokens != 0 ? kv_reserve_bytes / target_tokens : 0;
     // V10-74: A's defining move - the pool seats its whole ask and the KV leg lives on Host - needs
-    // attention to read a page the Device does not hold. Nothing does that today: the Host KV tier
-    // holds demoted extents that no attention path reads back
-    // (models/qwen3_5/execution/kv_host_split_mirror.h:11), the one Host -> Device fetch sits
-    // inside the eviction-window contract (program/storage/sequence.cpp:1226), and a KV arena
-    // smaller than the context is refused for this family's full-attention layers
-    // (program/planning/startup.cpp:1251). So the bet is told what exists, not what A would need.
-    request.resident_kv_leg    = false;
+    // attention to read a page the Device does not hold.
+    // V10-79: that reader now exists, behind NINFER_KV_PAGE_IN: a page the Device does not hold is
+    // copied back from the Host tier before the step that addresses it
+    // (program/storage/sequence.cpp, stage_step_kv_pages), so the bet is told the truth about the
+    // engine it is pricing.
+    request.resident_kv_leg    = kv_page_in_requested();
     request.mode               = controller_mode();
     // The controller's own observations, with its "not measured" sentinels preserved: policy signals
     // use -1 (and 0 for the latency proxy before a layer has run), and a zero reaching the decision

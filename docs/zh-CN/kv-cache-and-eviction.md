@@ -91,3 +91,53 @@ done
 
 启动日志里应能看到 `eviction | contract on | window 4 sink 1 pages | host demotion by default`
 （或指明未开启的原因），以及 `concurrency | the arena holds N full-length ... lane(s)` 的容量提示。
+
+## 5. `NINFER_KV_PAGE_IN`（**默认关**）—— 宿主驻留页的按需回填
+
+### 5.1 它做什么
+
+竞技场小于逻辑上下文时，某些页在 Host tier 而不在 Device。打开本开关后，**每一步在注意力读取该行之前**：
+
+1. 算出这一步的**被寻址集合**（有驱逐窗口时 = sink + 最新窗口 + 选择器保留集；没有窗口 = 整段存活历史）；
+2. 其中任何**没有 Device 副本**的页，先 `ensure_host_resident()`，再从 Host 拷进一个 Device 空槽，
+   并把该页重新 `publish` 回这一行的页表项（`kAbsentPage = -1` 的语义不变——本步不读的页仍然是 -1）；
+3. 没有空槽时，把**本步不读的、逻辑页号最小（即最老）**的一页交给 Host（拷出 + 降级）腾出槽位。
+
+传输走既有的 `DeviceKVPagePool::copy_to_host/copy_from_host`（底层同一个 `cudaMemcpyAsync` 通路，
+与 `core::copy_bytes` 的方向语义一致），失败就计数，**不重试、不假设**：拿不回来的页数会变成一个点名
+剩余上限的拒绝，而不是让注意力去读一个已被回收的物理页。
+
+### 5.2 它解除了哪三处拒绝
+
+| 位置 | 关（默认） | 开 |
+|---|---|---|
+| 容量下注的选择 A（专家全驻留、KV 退到 Host） | 判为"不可执行（没有常驻 KV 腿）" | 可以取 A，竞技场按剩余字节建成更小 |
+| `NINFER_KV_EVICT_CAPACITY` 对全注意力模型 | 启动直接报错 | 允许，只要一步的被寻址集合装得下 |
+| 一步的守卫 / 准入 | "不能从 Host tier 流式读" | 报出 `prompt_tokens` / `resident_tokens`：竞技场本身才是上限 |
+
+### 5.3 它**没有**解除的那条限制（重要）
+
+一个页组横跨**所有层**的 K/V plane（`state/decoder_state.cpp:66-81`），而全注意力层**每步读整段历史**。
+因此"某一步的被寻址集合"就是整段存活历史，回填不能让它变小——竞技场必须装得下**单条请求的历史**。
+超出时在准入处拒绝（`KV residency cannot serve this request: prompt_tokens=… resident_tokens=…`），
+而不是静默算错。要真正跑更长的上下文，只能给 KV 更多页（`NINFER_KV_RESIDENCY_SLACK_MB` 调小 /
+`--max-context` 调小）。
+
+### 5.4 需要 Host tier
+
+回填要有地方可读：residency 计划会自己把 `host_kv_payload_bytes` 定进 Host 预算；显式声明竞技场
+（`NINFER_KV_EVICT_CAPACITY`）时要自己给 Host 预算（serve：`--host-context-mib`）。两者都没有时**在构造期**
+报错，而不是等到第一步。
+
+### 5.5 验证（本机实测）
+
+* 27B dense / bf16 / `--context 8192`，竞技场声明 48 页（3072 token，< 8192）：
+  `NINFER_KV_PAGE_IN_PROBE=4` 把刚回填好的 4 页再交还 Host 并再次回填（`[kv-page-in] probe:
+  staged=0 demoted=4 refetched=4 missing=0`），生成的 8 个 token 与**全驻留**运行逐位相同；
+  3900 token 的提示词在准入被拒（`resident_tokens=3072`）。`ctest -R kv_page_in`。
+* 35B e2 / `--max-context 65536` / `--controller-mode performance`（A）+ `NINFER_KV_RESIDENCY_SLACK_MB=19900`：
+  `choice=A(expert-resident)`，竞技场 `resident=499/1024 page(s) (48.7%)`、`host_kv=656.2 MiB`；
+  23 token 提示词的 8 个 token 与 1024 页运行一致，20.0 tok/s（1024 页：A 24.8 / B 25.0 tok/s）；
+  43520 token 提示词在准入被拒（`resident_tokens=31936`）。
+* 关掉时门禁逐位不变：27B `7.359779` / `e95cacb864d8b1ab`；35B `4801 / 2.055310 / 7.809254`。
+

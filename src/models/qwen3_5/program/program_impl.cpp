@@ -314,6 +314,21 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             std::fflush(stderr);
         }
     }
+    // port (sm_89, V10-79): the page-in leg needs somewhere to put the page. Refuse the
+    // construction rather than the first step when the arena is tiered and no Host KV tier was
+    // priced - the step error would name the same thing, but only after a request had already been
+    // admitted.
+    if (const char* leg = std::getenv("NINFER_KV_PAGE_IN");
+        leg != nullptr && *leg != '\0' && std::strtol(leg, nullptr, 10) != 0 &&
+        host_kv_extents == nullptr &&
+        plan.persistent.decoder.text_kv.pages.spec.page_group_count <
+            plan.persistent.decoder.text_kv.execution_tables.spec.logical_page_capacity) {
+        throw std::invalid_argument(
+            "NINFER_KV_PAGE_IN with a KV arena smaller than the logical capacity needs a Host KV "
+            "tier to copy a page back from: set the Host context budget (serve: "
+            "--host-context-mib / context_cache.host_context_mib), or size the arena for the whole "
+            "context");
+    }
     state_store =
         std::make_unique<StateImageStore>(*state_images, host_state_images.get(), logical_states);
     // appendix FD (P3c): the descriptor table must hold one entry per LOGICAL page - the number the
