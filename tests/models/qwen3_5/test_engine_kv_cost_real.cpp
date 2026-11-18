@@ -32,14 +32,17 @@
 //   $env:NINFER_KV_COST_POOL  = 'auto'     # or MiB (default 4096)
 // Without NINFER_TEST_ARTIFACT or NINFER_KV_COST_ARM it prints "skip" and exits 77.
 
+#include "artifact/file_io.h"
 #include "core/transfer_cost.h"
 #include "core/transfer_rate.h"
 #include "ninfer/engine.h"
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -115,6 +118,18 @@ double decode_ms_per_token(const ninfer::RuntimeStats& stats) {
     return ns / 1e6 / static_cast<double>(stats.committed_decode_tokens);
 }
 
+// V10-83: the artifact leg, read the way the engine reads it - the reader's own positional
+// primitive, in the mode file_io.cpp picks for this volume, at the pool's own payload.
+std::size_t read_artifact(void* context, std::uint64_t offset, std::span<std::byte> destination) {
+    const auto& leg = *static_cast<const ninfer::artifact::InputFile*>(context);
+    try {
+        leg.read_exact(offset, destination);
+        return destination.size();
+    } catch (...) {
+        return 0;
+    }
+}
+
 } // namespace
 
 int main() {
@@ -182,8 +197,16 @@ int main() {
         const std::uint64_t step_bytes  = engine.expert_step_bytes();
         const std::uint64_t expert_pool = engine.expert_pool_capacity_bytes();
         const std::uint64_t miss_bytes  = step_bytes > expert_pool ? step_bytes - expert_pool : 0;
-        const auto probe =
-            ninfer::core::measure_transfer_rates(geometry.page_bytes, geometry.page_bytes, nullptr);
+        // V10-83: the streaming leg reads the artifact first, so the probe measures that leg too.
+        const auto file = ninfer::artifact::InputFile(artifact);
+        const auto mode = ninfer::artifact::expert_read_mode(artifact, file.bytes());
+        const ninfer::core::DiskReadSource disk{
+            .context = const_cast<ninfer::artifact::InputFile*>(&file),
+            .read    = read_artifact,
+            .bytes   = file.bytes(),
+            .mode    = mode == ninfer::artifact::ReadMode::Direct ? "direct" : "buffered"};
+        const auto probe = ninfer::core::measure_transfer_rates(geometry.page_bytes,
+                                                               geometry.page_bytes, nullptr, &disk);
         const std::uint64_t live_pages =
             (prompt_tokens + decode_tokens + 63U) / 64U; // whole page groups a step can read
 
@@ -210,10 +233,15 @@ int main() {
                     static_cast<unsigned long long>(expert_pool),
                     static_cast<unsigned long long>(miss_bytes),
                     static_cast<double>(miss_bytes) / kMib);
-        std::printf("[cost] rates: page_in=%.3f GB/s expert=%.3f GB/s (measured on %.0f KiB "
-                    "copies, %u per trial; the public API does not expose the slot payload, so the "
-                    "expert leg is measured at the page payload)\n",
+        std::printf("[cost] rates: page_in=%.3f GB/s pcie=%.3f GB/s disk=%.3f GB/s "
+                    "(%llu KiB x %u reads, %s) eff=%.3f GB/s (measured on %.0f KiB copies, %u per "
+                    "trial; the public API does not expose the slot payload, so the expert leg is "
+                    "measured at the page payload)\n",
                     probe.rates.page_in_bytes_per_s / 1e9, probe.rates.expert_bytes_per_s / 1e9,
+                    probe.rates.disk_bytes_per_s / 1e9,
+                    static_cast<unsigned long long>(probe.disk_payload_bytes >> 10),
+                    probe.disk_copies, probe.disk_mode,
+                    probe.rates.expert_effective_bytes_per_s() / 1e9,
                     static_cast<double>(geometry.page_bytes) / 1024.0, probe.page_copies);
         std::printf("[cost] decode: steps=%llu tokens=%llu ms_per_token=%.3f wall_s=%.2f\n",
                     static_cast<unsigned long long>(steps),
@@ -224,28 +252,36 @@ int main() {
         // means. `plan` prices the whole logical page space (the worst case the bet plans with);
         // `live` prices the pages one step of THIS request can read. For A the difference is the
         // whole story: the arena's shortfall is charged against a history that never reaches it.
+        const std::uint64_t layers = env_u64("NINFER_KV_COST_LAYERS", 40);
         const auto price = [&](std::uint64_t addressed, std::uint64_t resident) {
             return ninfer::core::price_step_transfers({.page_bytes            = geometry.page_bytes,
                                                        .pages_addressed       = addressed,
                                                        .pages_resident        = resident,
                                                        .slot_bytes            = 1,
                                                        .experts_routed        = miss_bytes,
-                                                       .expert_slots_resident = 0},
-                                                      probe.rates)
-                .total_ms();
+                                                       .expert_slots_resident = 0,
+                                                       .expert_layers         = layers},
+                                                      probe.rates);
         };
-        const double predict_plan_ms =
-            price(finish.kv_logical_page_groups, finish.kv_resident_page_groups);
-        const double predict_live_ms = price(live_pages, finish.kv_resident_page_groups);
+        const auto plan_cost = price(finish.kv_logical_page_groups, finish.kv_resident_page_groups);
+        const double predict_plan_ms = plan_cost.total_ms();
+        const double predict_live_ms = price(live_pages, finish.kv_resident_page_groups).total_ms();
+        // What the run's own counters say the traffic cost at the two measured rates - the same
+        // arithmetic on the fetched/missed bytes, so a difference from the model above is the
+        // model's geometry, not its rates.
         const double measured_ms =
             steps == 0
                 ? 0.0
                 : static_cast<double>(fetched_bytes) / static_cast<double>(steps) /
                           probe.rates.page_in_bytes_per_s * 1000.0 +
-                      static_cast<double>(miss_bytes) / probe.rates.expert_bytes_per_s * 1000.0;
+                      static_cast<double>(miss_bytes) /
+                          probe.rates.expert_effective_bytes_per_s() * 1000.0 +
+                      plan_cost.expert_fixed_ms;
         std::printf("[cost] predicted: plan_geometry_ms_per_step=%.3f live_geometry_ms_per_step="
-                    "%.3f measured_traffic_ms_per_step=%.3f\n",
-                    predict_plan_ms, predict_live_ms, measured_ms);
+                    "%.3f measured_traffic_ms_per_step=%.3f (slot bytes=%.3f fixed=%.3f on %llu "
+                    "layers)\n",
+                    predict_plan_ms, predict_live_ms, measured_ms, plan_cost.expert_bytes_ms,
+                    plan_cost.expert_fixed_ms, static_cast<unsigned long long>(layers));
         std::fflush(stdout);
     } catch (const std::exception& error) {
         std::printf("FAIL: %s\n", error.what());

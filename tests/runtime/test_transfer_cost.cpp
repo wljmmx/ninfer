@@ -1,10 +1,14 @@
 // V10-82: the per-step cost model behind the capacity bet, without a Device and without a clock.
+// V10-83: and the two terms the streaming leg turned out to have.
 //
 // The model is the whole of what the bet compares, so what this test pins is its shape, not a
 // number: a step that owes nothing costs nothing, more traffic never costs less, and each leg is
 // priced with its OWN rate (a rate that belongs to the other leg must not move it). The arithmetic
 // is checked once against a hand-computed millisecond figure, because the second failure mode of a
-// model like this is a unit slip that every monotonicity assertion happily passes.
+// model like this is a unit slip that every monotonicity assertion happily passes. The V10-83 terms
+// are pinned the same way: the disk and the link combine in series (one byte pays both), the
+// per-layer round trip is charged only to layers that upload, and an unmeasured disk leg leaves the
+// pre-V10-83 single-rate pipeline rather than a free read.
 
 #include "core/transfer_cost.h"
 
@@ -14,6 +18,8 @@
 
 namespace {
 
+using ninfer::core::effective_rate_bytes_per_s;
+using ninfer::core::kStreamLayerFixedMs;
 using ninfer::core::price_step_transfers;
 using ninfer::core::StepTransferGeometry;
 using ninfer::core::TransferRates;
@@ -73,11 +79,14 @@ void test_a_step_that_owes_nothing_costs_nothing() {
     auto full                  = geometry();
     full.pages_resident        = full.pages_addressed;
     full.expert_slots_resident = full.experts_routed;
+    // 40 routed layers and still nothing owed: the fixed term belongs to layers that UPLOAD, so a
+    // pool that seats every route must not be charged for the round trips it never makes.
+    full.expert_layers         = 40;
     const auto cost            = price_step_transfers(full, rates());
     check(cost.pages_fetched == 0 && cost.expert_misses == 0,
           "a fully resident split fetches and streams nothing");
-    check(cost.page_in_ms == 0.0 && cost.expert_ms == 0.0,
-          "nothing owed is priced at exactly zero");
+    check(cost.page_in_ms == 0.0 && cost.expert_ms == 0.0 && cost.expert_fixed_ms == 0.0,
+          "nothing owed is priced at exactly zero, fixed term included");
 
     // A split that seats MORE than the step reads is also free, never negative: the arrangement can
     // over-provision (a pool bigger than one step's routes) and the bill clamps at zero.
@@ -157,6 +166,50 @@ void test_an_unmeasured_rate_is_not_a_fast_leg() {
     check(!half.measured(), "one measured leg is not a pair");
 }
 
+// V10-83: one expert byte is read out of the artifact and then copied to the Device, in series.
+void test_the_streaming_leg_is_the_disk_and_the_link_in_series() {
+    // 10 GB/s on each leg is 5 GB/s serialized - half, not the 10 GB/s the pre-V10-83 model used.
+    check_close(effective_rate_bytes_per_s(10e9, 10e9), 5e9, 1e-3,
+                "two equal legs in series halve the rate");
+    check_close(effective_rate_bytes_per_s(6.83e9, 23.2e9), 5.2766e9, 1e7,
+                "the measured pair on this machine combines as 1/(1/6.83 + 1/23.2)");
+    // A missing disk measurement is the single-rate pipeline (a retained Host replica), not "free".
+    check_close(effective_rate_bytes_per_s(0.0, 23.2e9), 23.2e9, 1e3,
+                "no disk leg leaves the copy rate alone");
+    check_close(effective_rate_bytes_per_s(6.83e9, 0.0), 0.0, 0.0,
+                "no copy rate is no copy to price");
+
+    auto routed                = geometry();
+    routed.expert_layers       = 0; // the fixed term is priced by its own test
+    auto with_disk             = rates();
+    with_disk.disk_bytes_per_s = 10e9;
+    const auto cost            = price_step_transfers(routed, with_disk);
+    check_close(cost.expert_bytes_ms, 384.0 * static_cast<double>(kMib) / 5e9 * 1000.0, 1e-6,
+                "the slot bill is the same bytes over the serialized rate");
+    // The page leg is Host memory to Device: a disk rate must not touch it.
+    check_close(cost.page_in_ms, 4096.0 * static_cast<double>(kMib) / 20e9 * 1000.0, 1e-6,
+                "the page bill keeps its one rate");
+}
+
+void test_a_layer_that_streams_pays_its_round_trip() {
+    auto routed          = geometry();
+    routed.expert_layers = 40;
+    const auto cost      = price_step_transfers(routed, rates());
+    check(cost.stream_layers == 40, "every routed layer streams when the pool misses");
+    check_close(cost.expert_fixed_ms, 40.0 * kStreamLayerFixedMs, 1e-9,
+                "the fixed term is the per-layer round trip times the streaming layers");
+    check_close(cost.expert_ms, cost.expert_bytes_ms + cost.expert_fixed_ms, 1e-9,
+                "the slot leg is its bytes plus its round trips");
+
+    // No layer count, no fixed term: a caller that cannot say how many layers route prices bytes.
+    auto anonymous          = geometry();
+    anonymous.expert_layers = 0;
+    const auto bytes_only   = price_step_transfers(anonymous, rates());
+    check(bytes_only.expert_fixed_ms == 0.0, "an unknown layer count prices no round trips");
+    check_close(bytes_only.expert_ms, cost.expert_ms - 40.0 * kStreamLayerFixedMs, 1e-9,
+                "and the difference is exactly the fixed term");
+}
+
 } // namespace
 
 int main() {
@@ -165,6 +218,8 @@ int main() {
     test_more_traffic_never_costs_less();
     test_each_leg_honours_its_own_rate();
     test_an_unmeasured_rate_is_not_a_fast_leg();
+    test_the_streaming_leg_is_the_disk_and_the_link_in_series();
+    test_a_layer_that_streams_pays_its_round_trip();
     if (failures == 0) { std::printf("ok\n"); }
     return failures == 0 ? 0 : 1;
 }

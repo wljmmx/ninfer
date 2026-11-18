@@ -66,6 +66,13 @@ ninfer_add_test(ninfer_transfer_cost_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_transfer_cost.cpp"
   LIBRARIES ninfer_core)
 
+# V10-83: the artifact read leg's probe. A source it owns (no artifact, no Device), because what it
+# pins is the failure contract: a probe that cannot read must report zero and no shape, never a
+# small number the bet would then price as traffic.
+ninfer_add_test(ninfer_transfer_rate_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_transfer_rate.cpp"
+  LIBRARIES ninfer_core)
+
 # V10-75: the host tier's ask. Pure (runtime/engine/host_arena_budget.h), so the branch that a
 # healthy box cannot reach - a measured zero commit budget - is still under test, and "the budget
 # could not be measured" is asserted to be a different answer from "the budget is zero".

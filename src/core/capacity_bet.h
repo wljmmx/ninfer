@@ -100,18 +100,21 @@
 //     ms per token against 9.064-9.309 for the fully resident run. What A charges is not
 //     milliseconds per step but the CONTEXT CEILING it buys (resident pages x page tokens), which
 //     this model does not express - so a zero bill is not the same claim as "A is free".
-//   * B's bill is NOT the whole of B's traffic. A step that streams at all first pays a fixed
-//     per-layer upload-and-synchronize cost: measured against three pool sizes at one context (95
-//     decode steps each), the marginal cost is 0.0449 ms per MiB (23.3 GB/s, within 1.1% of the
-//     probe) on top of a 22.9 ms per-step intercept that appears at the FIRST miss and does not
-//     scale with the bytes (40 streaming layers x ~0.57 ms). That term has no measured price yet.
+//   * B's bill is NOT the whole of B's traffic, and V10-83 found two missing terms in it. First, a
+//     byte of B is read out of the artifact and then copied to the Device, in series (the layer
+//     blocks on the host tier, uploads, and drains the upload before its GEMM), so it pays
+//     1/(1/disk + 1/pcie) - 5.3 GB/s on this machine against the 23.2 GB/s link rate V10-82 priced.
+//     Second, a layer that streams at all pays a fixed round trip: measured against three pool
+//     sizes at one context (95 decode steps each), the marginal cost is 0.0449 ms per MiB on top
+//     of a 22.9 ms per-step intercept that appears at the FIRST miss and does not scale with the
+//     bytes (40 streaming layers x 0.5735 ms). Both are now priced; the report gives the residual.
 //
 // So the comparison is PRINTED in full and acted on only where it is exact: the categorical case
 // where B owes nothing at all, which the model gets right because zero misses is zero copies. A
-// non-zero B bill is inside the unpriced fixed term's shadow - priced at 0.46 ms while measuring
-// 23.4 ms at 10 MiB per step - and a comparison that moved bytes on it would be acting on a number
-// this build cannot defend. `cheaper=` names the raw ranking either way, and `not_applied=` says so
-// when the letter did not follow it.
+// non-zero B bill is a model - now a model with the artifact read and the per-layer round trip
+// inside it (V10-83), but still a model - and a comparison that moved bytes on it would be acting
+// on a number this build can only defend to the tolerance the report states. `cheaper=` names the
+// raw ranking either way, and `not_applied=` says so when the letter did not follow it.
 //
 // Everything else is unchanged: no resident-KV leg leaves A refused and nothing to compare (the
 // leg-off path, where the plan line is exactly what it was before this change); no measured rates
@@ -216,6 +219,11 @@ struct CapacityBetRequest {
     std::uint64_t kv_page_bytes           = 0;
     std::uint64_t kv_pages_addressed      = 0;
     std::uint64_t experts_routed_per_step = 0;
+    // V10-83: how many layers route experts at all, i.e. how many pay the per-layer round trip when
+    // anything misses. A pool smaller than the ask streams every one of them (the pool's slots are
+    // spread over all banks, so no layer is wholly served), which is what the measured intercept
+    // counts; zero leaves the fixed term unpriced, which is the pre-V10-83 bill.
+    std::uint64_t expert_layers = 0;
     TransferRates transfer_rates{};
     // The pool the caller will ACTUALLY allocate, when it has already decided (a pinned
     // NINFER_EXPERT_CACHE_MB, or a pool the split sized). Zero means "the caller lets the split
@@ -259,22 +267,28 @@ struct CapacityBetRequest {
 // asks fit" and the comparison branch cannot price the same arrangement differently. An arena
 // larger than the address space needs no clamp of its own: `price_step_transfers` counts `addressed
 // - resident` and never a negative. Callers gate on `transfers_priceable()`, which is what makes
-// the division safe.
-[[nodiscard]] inline double price_capacity_split(const CapacityBetRequest& request,
-                                                 std::uint64_t pool_bytes,
-                                                 std::uint64_t kv_bytes) noexcept {
+// the division safe. The cost form is the one the plan prints; the double is the same number.
+[[nodiscard]] inline StepTransferCost price_capacity_split_cost(const CapacityBetRequest& request,
+                                                               std::uint64_t pool_bytes,
+                                                               std::uint64_t kv_bytes) noexcept {
     const std::uint64_t capped_pool = request.expert_pool_cap_bytes != 0
                                           ? std::min(pool_bytes, request.expert_pool_cap_bytes)
                                           : pool_bytes;
     return price_step_transfers(
-               {.page_bytes            = request.kv_page_bytes,
-                .pages_addressed       = request.kv_pages_addressed,
-                .pages_resident        = kv_bytes / request.kv_page_bytes,
-                .slot_bytes            = request.expert_slot_bytes,
-                .experts_routed        = request.experts_routed_per_step,
-                .expert_slots_resident = capped_pool / request.expert_slot_bytes},
-               request.transfer_rates)
-        .total_ms();
+        {.page_bytes            = request.kv_page_bytes,
+         .pages_addressed       = request.kv_pages_addressed,
+         .pages_resident        = kv_bytes / request.kv_page_bytes,
+         .slot_bytes            = request.expert_slot_bytes,
+         .experts_routed        = request.experts_routed_per_step,
+         .expert_slots_resident = capped_pool / request.expert_slot_bytes,
+         .expert_layers         = request.expert_layers},
+        request.transfer_rates);
+}
+
+[[nodiscard]] inline double price_capacity_split(const CapacityBetRequest& request,
+                                                 std::uint64_t pool_bytes,
+                                                 std::uint64_t kv_bytes) noexcept {
+    return price_capacity_split_cost(request, pool_bytes, kv_bytes).total_ms();
 }
 
 // The sentence a caller prints when A was the answer the rule reached and could not be taken. It
@@ -314,9 +328,17 @@ struct CapacityBetPlan {
     // whole of that step's traffic, so they are the numbers to compare. False means nothing was
     // priced - no leg, no measurement, no geometry, or no bet - and then `cost_a_ms`/`cost_b_ms`
     // are zero because nothing was computed, not because the traffic is free.
+    //
+    // V10-83: the terms behind those two numbers travel with them, because a bill a reader cannot
+    // take apart is a claim, not a price: the bytes each arrangement moves, and the fixed part of
+    // B's bill (the per-layer round trips, which no rate describes).
     bool          cost_priced    = false;
     double        cost_a_ms      = 0.0;
     double        cost_b_ms      = 0.0;
+    std::uint64_t cost_a_miss_bytes = 0;
+    std::uint64_t cost_b_miss_bytes = 0;
+    double        cost_b_bytes_ms   = 0.0;
+    double        cost_b_fixed_ms   = 0.0;
     CapacityBet   cost_choice    = CapacityBet::ExpertResident; // the arrangement the prices rank first
     TransferRates transfer_rates{};
 
@@ -325,14 +347,16 @@ struct CapacityBetPlan {
     }
 };
 
-// The cost sentence a caller appends to the plan line, so "why this letter" and "priced or ruled"
-// are readable from one line. Empty when there is nothing to say - a run without the leg prints
-// exactly what it printed before V10-82. Rates are decimal GB/s (bytes per second over 1e9), the
-// unit PCIe bandwidth is quoted in; the payloads they came from are printed by the probe line.
-// `cheaper=` is the raw ranking of the two bills; `not_applied=` appears only when the letter did
-// not follow it, and names the reason the objective declined to act (see WHAT THE MEASUREMENT
-// CHANGED). A reader can then tell "the rule won" from "the rule won because the price was not
-// actionable".
+// The cost sentence a caller appends to the plan line, so "why this letter", "priced or ruled" and
+// "out of what" are readable from one line. Empty when there is nothing to say - a run without the
+// leg prints exactly what it printed before V10-82. Rates are decimal GB/s (bytes per second over
+// 1e9), the unit PCIe bandwidth is quoted in; the payloads they came from are printed by the probe
+// line. Three rates are named because the expert leg is two transfers in series: `disk_gbps` (the
+// artifact read), `pcie_gbps` (the Device copy) and `eff_gbps` (what a streaming byte actually
+// costs, 1/(1/disk + 1/pcie)). `cheaper=` is the raw ranking of the two bills; `not_applied=`
+// appears only when the letter did not follow it, and names the reason the objective declined to
+// act (see WHAT THE MEASUREMENT CHANGED). A reader can then tell "the rule won" from "the rule won
+// because the price was not actionable".
 [[nodiscard]] inline int format_capacity_costs(const CapacityBetPlan& plan, char* out,
                                                std::size_t size) noexcept {
     if (out == nullptr || size == 0) { return 0; }
@@ -345,16 +369,21 @@ struct CapacityBetPlan {
     }
     const int written = std::snprintf(
         out, size,
-        " cost_a_ms=%.2f cost_b_ms=%.2f page_in_gbps=%.2f expert_gbps=%.2f "
-        "cheaper=%s",
-        plan.cost_a_ms, plan.cost_b_ms, plan.transfer_rates.page_in_bytes_per_s / 1e9,
-        plan.transfer_rates.expert_bytes_per_s / 1e9, capacity_bet_name(plan.cost_choice));
+        " cost_a_ms=%.2f cost_b_ms=%.2f miss_a_mib=%.1f miss_b_mib=%.1f disk_gbps=%.2f "
+        "pcie_gbps=%.2f eff_gbps=%.2f fixed_ms_b=%.2f cheaper=%s",
+        plan.cost_a_ms, plan.cost_b_ms,
+        static_cast<double>(plan.cost_a_miss_bytes) / (1024.0 * 1024.0),
+        static_cast<double>(plan.cost_b_miss_bytes) / (1024.0 * 1024.0),
+        plan.transfer_rates.disk_bytes_per_s / 1e9,
+        plan.transfer_rates.expert_bytes_per_s / 1e9,
+        plan.transfer_rates.expert_effective_bytes_per_s() / 1e9, plan.cost_b_fixed_ms,
+        capacity_bet_name(plan.cost_choice));
     if (written <= 0 || static_cast<std::size_t>(written) >= size ||
         plan.cost_choice == plan.choice) {
         return written;
     }
     return written + std::snprintf(out + written, size - static_cast<std::size_t>(written),
-                                   " not_applied=unpriced_fixed_stream_cost");
+                                   " not_applied=modelled_not_exact_zero");
 }
 
 namespace detail {
@@ -425,10 +454,15 @@ plan_capacity_bet(const CapacityBetRequest& request,
         plan.kv_pages_bytes =
             detail::round_down(plan.kv_pages_bytes, request.kv_alignment_bytes);
         if (plan.cost_priced) {
-            plan.cost_a_ms   = price_capacity_split(request, plan.expert_pool_bytes,
-                                                    plan.kv_pages_bytes);
-            plan.cost_b_ms   = plan.cost_a_ms;
-            plan.cost_choice = CapacityBet::ExpertResident;
+            const auto cost =
+                price_capacity_split_cost(request, plan.expert_pool_bytes, plan.kv_pages_bytes);
+            plan.cost_a_ms         = cost.total_ms();
+            plan.cost_b_ms         = plan.cost_a_ms;
+            plan.cost_a_miss_bytes = cost.pages_fetched * request.kv_page_bytes;
+            plan.cost_b_miss_bytes = cost.expert_misses * request.expert_slot_bytes;
+            plan.cost_b_bytes_ms   = cost.expert_bytes_ms;
+            plan.cost_b_fixed_ms   = cost.expert_fixed_ms;
+            plan.cost_choice       = CapacityBet::ExpertResident;
         }
         return plan;
     }
@@ -567,22 +601,28 @@ plan_capacity_bet(const CapacityBetRequest& request,
         experts_first(by_experts);
         kv_first(by_pages);
         const auto price = [&](const CapacityBetPlan& candidate) {
-            return price_capacity_split(request, candidate.expert_pool_bytes,
-                                        candidate.kv_pages_bytes);
+            return price_capacity_split_cost(request, candidate.expert_pool_bytes,
+                                             candidate.kv_pages_bytes);
         };
+        const auto cost_a = price(by_experts);
+        const auto cost_b = price(by_pages);
         plan.cost_priced    = true;
         plan.transfer_rates = request.transfer_rates;
-        plan.cost_a_ms      = price(by_experts);
-        plan.cost_b_ms      = price(by_pages);
+        plan.cost_a_ms      = cost_a.total_ms();
+        plan.cost_b_ms      = cost_b.total_ms();
+        plan.cost_a_miss_bytes = cost_a.pages_fetched * request.kv_page_bytes;
+        plan.cost_b_miss_bytes = cost_b.expert_misses * request.expert_slot_bytes;
+        plan.cost_b_bytes_ms   = cost_b.expert_bytes_ms;
+        plan.cost_b_fixed_ms   = cost_b.expert_fixed_ms;
         plan.cost_choice =
             plan.cost_b_ms < plan.cost_a_ms ? CapacityBet::KvFirst : CapacityBet::ExpertResident;
         // Only the A-versus-B question is answered here, and only where the model is exact: B owes
         // nothing at all (zero misses is zero copies - the one bill this build stands behind, see
-        // WHAT THE MEASUREMENT CHANGED). A non-zero B bill is dominated by a 32.0 ms/step fixed
-        // streaming cost the model does not carry, so it is printed and left to the rule. A rule
-        // that reached neither arrangement (auto's proportional share) keeps its answer too: it is
-        // a different answer to a different question, and the two prices are still printed beside
-        // it.
+        // WHAT THE MEASUREMENT CHANGED). A non-zero B bill is now a model with the disk leg and the
+        // per-layer round trip inside it, and the report states its error; it is printed and left to
+        // the rule. A rule that reached neither arrangement (auto's proportional share) keeps its
+        // answer too: it is a different answer to a different question, and the two prices are
+        // still printed beside it.
         if (plan.choice == CapacityBet::ExpertResident &&
             plan.cost_choice == CapacityBet::KvFirst && plan.cost_b_ms == 0.0) {
             plan.expert_pool_bytes = by_pages.expert_pool_bytes;

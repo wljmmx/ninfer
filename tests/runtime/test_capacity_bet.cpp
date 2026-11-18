@@ -484,7 +484,8 @@ void test_the_plan_line_names_the_prices_and_the_rates() {
     // B: 1024 routed - 15360 slots -> 0 misses -> 0 ms. Both rates are printed, decimal GB/s.
     char line[192];
     const int written    = ninfer::core::format_capacity_costs(plan, line, sizeof(line));
-    const char* expected = " cost_a_ms=268.44 cost_b_ms=0.00 page_in_gbps=20.00 expert_gbps=10.00 "
+    const char* expected = " cost_a_ms=268.44 cost_b_ms=0.00 miss_a_mib=5120.0 miss_b_mib=0.0 "
+                           "disk_gbps=0.00 pcie_gbps=10.00 eff_gbps=10.00 fixed_ms_b=0.00 "
                            "cheaper=B";
     check(written > 0, "a priced plan writes a sentence");
     check(std::strcmp(line, expected) == 0, "the cost sentence has one fixed spelling");
@@ -568,7 +569,7 @@ void test_a_nonzero_stream_bill_is_reported_but_not_acted_on() {
     char line[192];
     (void)ninfer::core::format_capacity_costs(plan, line, sizeof(line));
     check(std::strstr(line, "cheaper=B") != nullptr, "the line prints the ranking");
-    check(std::strstr(line, "not_applied=unpriced_fixed_stream_cost") != nullptr,
+    check(std::strstr(line, "not_applied=modelled_not_exact_zero") != nullptr,
           "and says why the letter did not follow it");
 
     // The categorical case does move: B owes nothing, so it is cheaper by construction.

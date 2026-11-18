@@ -117,6 +117,29 @@ bool kv_page_in_requested() {
     return value != nullptr && *value != '\0' && std::strtol(value, nullptr, 10) != 0;
 }
 
+// V10-83: the artifact read leg, as the engine reads it. `core` cannot include the artifact layer
+// (artifact links core), so the rate probe takes a callback and this file supplies it: the same
+// Reader the expert tier streams from, in the same mode file_io.cpp picked for that volume, at the
+// same payload the pool stores. A read that fails throws here and the probe turns it into a zero.
+struct ArtifactReadLeg {
+    const artifact::Reader* reader = nullptr;
+    artifact::ReadMode      mode   = artifact::ReadMode::Buffered;
+};
+
+std::size_t read_artifact_slice(void* context, std::uint64_t offset,
+                                std::span<std::byte> destination) {
+    const auto& leg = *static_cast<const ArtifactReadLeg*>(context);
+    try {
+        if (leg.mode == artifact::ReadMode::Direct) {
+            return leg.reader->read_direct(0, offset, destination);
+        }
+        leg.reader->read_into(offset, destination);
+        return destination.size();
+    } catch (...) {
+        return 0;
+    }
+}
+
 // V10-82: what the bet needs to price a page the Device does not hold. The two numbers are always
 // known together (the sequence planner measured both), so they travel together: a call site that
 // passed one without the other would price a page it cannot size.
@@ -207,7 +230,7 @@ void report_capacity_bet(const char* what, const core::CapacityBetRequest& reque
     // V10-82: how the letter was reached - a rule or a price - plus the two prices and the rates
     // they came from. Empty (and therefore invisible) on every run without the page-in leg, so the
     // leg-off line is exactly the line it was before this change.
-    char costs[192];
+    char costs[320];
     if (core::format_capacity_costs(plan, costs, sizeof(costs)) > 0) { std::fputs(costs, stderr); }
     std::fputc('\n', stderr);
     std::fflush(stderr);
@@ -363,14 +386,32 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     // uses the numbers, so the probe costs nothing on every other path - and a leg-off run keeps
     // the request it always built, which is what keeps its plan byte for byte the same.
     if (request.resident_kv_leg && kv_leg.page_bytes != 0) {
-        const auto probe = core::measure_transfer_rates(kv_leg.page_bytes, entry, nullptr);
+        // V10-83: the streaming leg reads the artifact before it copies, so the read leg is priced
+        // too. A retained Host replica has no file to read, and then the disk rate stays zero - the
+        // documented single-rate pipeline, not a free read.
+        ArtifactReadLeg leg{};
+        if (instance.expert_source) {
+            leg.reader = &instance.expert_source->reader();
+            leg.mode   = artifact::expert_read_mode(leg.reader->path(), leg.reader->file_bytes());
+        }
+        const core::DiskReadSource disk{
+            .context = &leg,
+            .read    = leg.reader != nullptr ? read_artifact_slice : nullptr,
+            .bytes   = leg.reader != nullptr ? leg.reader->file_bytes() : 0,
+            .mode    = leg.mode == artifact::ReadMode::Direct ? "direct" : "buffered"};
+        const auto probe = core::measure_transfer_rates(kv_leg.page_bytes, entry, nullptr, &disk);
         std::fprintf(stderr,
                      "[plan] transfer leg: page_in=%.2f GB/s (%llu KiB page x %u copies) "
-                     "expert=%.2f GB/s (%llu KiB slot x %u copies) pinned=%.1f MiB free=%.0f MiB\n",
+                     "expert=%.2f GB/s (%llu KiB slot x %u copies) disk=%.2f GB/s "
+                     "(%llu KiB x %u reads, %s) eff=%.2f GB/s pinned=%.1f MiB free=%.0f MiB\n",
                      probe.rates.page_in_bytes_per_s / 1e9,
                      static_cast<unsigned long long>(kv_leg.page_bytes >> 10), probe.page_copies,
                      probe.rates.expert_bytes_per_s / 1e9,
                      static_cast<unsigned long long>(entry >> 10), probe.slot_copies,
+                     probe.rates.disk_bytes_per_s / 1e9,
+                     static_cast<unsigned long long>(probe.disk_payload_bytes >> 10),
+                     probe.disk_copies, probe.disk_mode,
+                     probe.rates.expert_effective_bytes_per_s() / 1e9,
                      static_cast<double>(probe.pinned_bytes) / (1024.0 * 1024.0),
                      static_cast<double>(free_bytes) / (1024.0 * 1024.0));
         std::fflush(stderr);
@@ -379,6 +420,9 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
             request.kv_page_bytes           = kv_leg.page_bytes;
             request.kv_pages_addressed      = kv_leg.logical_pages;
             request.experts_routed_per_step = expert_step_slots(specs, lanes, routed_top_k);
+            // V10-83: a pool smaller than the ask seats no layer whole, so every routed layer pays
+            // the per-layer round trip; that count is what the fixed term multiplies.
+            request.expert_layers = streams.size();
             // V10-82: a pool the caller pinned is the pool the run gets, so the price is computed
             // against it rather than against the ask the split never funded. Zero (auto) leaves the
             // rule's own figure in charge.
