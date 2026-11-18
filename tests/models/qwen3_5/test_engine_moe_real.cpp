@@ -278,6 +278,14 @@ int main() {
     std::cerr << "[step] constructing engine" << std::endl;
     try {
         ninfer::Engine engine(engine_options(artifact));
+        // port (sm_89, V10-56): this fixture is the 35B MoE target. Pointing the sweep at another
+        // artifact (the 27B dense one has no MoE path at all) is a fixture choice, not a defect, so
+        // name the mismatch and skip instead of reddening the sweep on every non-MoE artifact.
+        if (engine.load_summary().architecture != "Qwen3_5MoeForCausalLM") {
+            std::cerr << "skip: this artifact is not the 35B MoE target (architecture="
+                      << engine.load_summary().architecture << ")\n";
+            return 77;
+        }
         std::cerr << "[step] verify_loaded_product" << std::endl;
         if (const int result = verify_loaded_product(engine); result != 0) { return result; }
         std::cerr << "[step] exercise_text_mtp_and_prefix" << std::endl;

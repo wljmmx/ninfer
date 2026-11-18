@@ -426,6 +426,15 @@ int main() {
                 std::cerr << "skip: " << message << std::endl;
                 return 77;
             }
+            // port (sm_89, V10-56): an artifact without the dflash companion (the 27B one carries
+            // dflash2 only) is a fixture/artifact mismatch. The loader says so by name; report the
+            // skip rather than a failure, so a sweep over that artifact stays honest about what it
+            // did and did not exercise.
+            if (message.find("missing component") != std::string::npos) {
+                std::cerr << "skip: this artifact has no dflash companion: " << message
+                          << std::endl;
+                return 77;
+            }
             std::cerr << "dflash real test failed: " << message << std::endl;
             return 1;
         }

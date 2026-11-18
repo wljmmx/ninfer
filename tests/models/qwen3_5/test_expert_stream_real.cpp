@@ -60,11 +60,20 @@ int main() {
         artifact::Reader reader{artifact_path};
         const auto& bindings = reader.directory().bindings;
 
+        // port (sm_89, V10-56): the fixture is the 35B MoE target. On a dense artifact the first
+        // lookup throws "invalid map<K, T> key", which is an artifact choice, not a defect; name
+        // the missing binding and skip so a sweep over a dense artifact says what it did not run.
+        if (bindings.find("text/layers/0/moe/experts/0/gate") == bindings.end()) {
+            std::cerr << "skip: this artifact has no MoE experts "
+                         "(no text/layers/0/moe/experts/0/gate binding)\n";
+            return 77;
+        }
+
         // Layer 0 of this model is MoE; the fused parents are shared by all 256 experts.
-        const auto& gate = bindings.at("text/layers/0/moe/experts/0/gate");
-        const auto& up   = bindings.at("text/layers/0/moe/experts/0/up");
-        const auto& down = bindings.at("text/layers/0/moe/experts/0/down");
-        const auto& up_part = up.parts.front();
+        const auto& gate      = bindings.at("text/layers/0/moe/experts/0/gate");
+        const auto& up        = bindings.at("text/layers/0/moe/experts/0/up");
+        const auto& down      = bindings.at("text/layers/0/moe/experts/0/down");
+        const auto& up_part   = up.parts.front();
         const auto& gate_part = gate.parts.front();
         const auto& down_part = down.parts.front();
         if (up_part.object != gate_part.object || down_part.object == gate_part.object) {
@@ -340,7 +349,5 @@ int main() {
                   << " tokens=" << kTokens << " upload_s=" << upload_seconds << " pool_mib="
                   << (config.capacity_bytes >> 20) << '\n';
         return 0;
-    } catch (const std::exception& error) {
-        return fail(error.what());
-    }
+    } catch (const std::exception& error) { return fail(error.what()); }
 }
