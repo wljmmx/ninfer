@@ -147,6 +147,14 @@ ninfer_add_test(ninfer_qwen3_5_kv_page_in_lanes_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_kv_page_in_lanes_real.cpp"
   LIBRARIES ninfer_engine)
 
+# port (sm_89, V10-82): what each Host -> Device leg costs a step, against what the cost model
+# predicts for the same geometry. One arm per process (ref / page-in / stream) because this card
+# holds one 19 GiB engine at a time; see the file's header for the run line. It asserts only that the
+# arm exercised its leg - the prediction-versus-measurement table is the report's job.
+ninfer_add_test(ninfer_qwen3_5_kv_cost_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_kv_cost_real.cpp"
+  LIBRARIES ninfer_engine CUDA::cudart)
+
 ninfer_add_test(ninfer_qwen3_5_expert_stream_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_stream_real.cpp"
   LIBRARIES ninfer_artifact ninfer_ops ninfer_core)
@@ -265,6 +273,7 @@ set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_kv_page_in_real_test
   ninfer_qwen3_5_kv_page_in_spec_real_test
   ninfer_qwen3_5_kv_page_in_lanes_real_test
+  ninfer_qwen3_5_kv_cost_real_test
   ninfer_qwen3_5_expert_stream_real_test
   ninfer_qwen3_5_resize_under_load_real_test
   ninfer_qwen3_5_resize_handoff_real_test

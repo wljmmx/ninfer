@@ -11,7 +11,8 @@
 //
 // The three bets (V10-55's A/B/C):
 //   A  ExpertResident  the pool takes what it asks; KV takes the remainder (possibly zero, i.e. the
-//                      whole KV leg moves to Host). Right when residency is what the run is short of.
+//                      whole KV leg moves to Host). Right when residency is what the run is short
+//                      of.
 //   B  KvFirst         the KV target is met first; the pool takes the remainder (it may then hold a
 //                      partial layer, which the Host tier already covers). Right when locality is.
 //   C  BothGive        neither gets its whole ask: the bytes above a floor are shared in proportion
@@ -66,7 +67,8 @@
 //                still reach `expert_usable_ratio` of its ask; otherwise the bytes above that
 //                floor are shared in proportion to the two remaining asks. Measured evidence
 //                outranks the structural rule and only when it exists: a high miss rate ranks
-//                residency first (the performance rule), a high p99 ranks KV first (the stable one).
+//                residency first (the performance rule), a high p99 ranks KV first (the stable
+//                one).
 //
 // Every rule is a function of the budget and the fixed asks, and every rule is monotone in the
 // budget: a bigger Device never shrinks either side. That is a property of the arithmetic, not of
@@ -80,11 +82,49 @@
 //
 // This header is intentionally pure: no CUDA, no allocation, no logging, no globals. The caller
 // owns the Device query, the mode, the observed signals and the printing.
+//
+// WHAT THE MEASUREMENT CHANGED (V10-82, measured on 35B e2 / RTX 4090 / Win11). Both bills are PCIe
+// traffic a step owes - A a page copy per page the Device does not hold, B a slot copy per routed
+// expert the pool does not hold - so a caller that measured the two rates (core/transfer_rate.h)
+// and knows the geometry can turn each into milliseconds (core/transfer_cost.h). Measured rates on
+// payloads the engine actually sends: 23.1 GB/s for a 1.25 MiB KV page, 23.2 GB/s for a 1.9 MiB
+// expert slot (three best-of trials each, one copy in flight, summed over ~64 MiB).
+//
+// The two bills did not come out equally trustworthy, and that is what the code below encodes:
+//   * A's bill is the whole of A's traffic and the rate is the rate of that very copy - but on this
+//     engine it is ZERO in every run the engine admits. A full-attention layer reads its whole
+//     history, the append path refuses to grow past the Device pool, and admission refuses a prompt
+//     longer than the pool; so the addressed set always fits and the legal page-in has nothing to
+//     do. Measured with the leg on and 397 of 512 pages resident: 0 pages fetched over 95 decode
+//     steps (`NINFER_KV_PAGE_IN_SLACK_LOG` reported addressed_missing=0 on every step), 8.705-8.735
+//     ms per token against 9.064-9.309 for the fully resident run. What A charges is not
+//     milliseconds per step but the CONTEXT CEILING it buys (resident pages x page tokens), which
+//     this model does not express - so a zero bill is not the same claim as "A is free".
+//   * B's bill is NOT the whole of B's traffic. A step that streams at all first pays a fixed
+//     per-layer upload-and-synchronize cost: measured against three pool sizes at one context (95
+//     decode steps each), the marginal cost is 0.0449 ms per MiB (23.3 GB/s, within 1.1% of the
+//     probe) on top of a 22.9 ms per-step intercept that appears at the FIRST miss and does not
+//     scale with the bytes (40 streaming layers x ~0.57 ms). That term has no measured price yet.
+//
+// So the comparison is PRINTED in full and acted on only where it is exact: the categorical case
+// where B owes nothing at all, which the model gets right because zero misses is zero copies. A
+// non-zero B bill is inside the unpriced fixed term's shadow - priced at 0.46 ms while measuring
+// 23.4 ms at 10 MiB per step - and a comparison that moved bytes on it would be acting on a number
+// this build cannot defend. `cheaper=` names the raw ranking either way, and `not_applied=` says so
+// when the letter did not follow it.
+//
+// Everything else is unchanged: no resident-KV leg leaves A refused and nothing to compare (the
+// leg-off path, where the plan line is exactly what it was before this change); no measured rates
+// or no geometry leaves `cost_priced` false and the priority rules answering as they did; and a
+// rule that took no bet spills nothing, so both bills are the pinned pool's own bill or zero.
 
 #include "core/controller_mode.h"
+#include "core/transfer_cost.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <cstdio>
 
 namespace ninfer::core {
 
@@ -147,8 +187,9 @@ inline constexpr CapacityBetThresholds kDefaultCapacityBetThresholds{};
 struct CapacityBetRequest {
     // What the Device can give the pool and the KV pages TOGETHER, before the startup allowance.
     std::uint64_t device_budget_bytes = 0;
-    // The planning allowance the device cap carries (Graph capture, weight staging). Deducted first,
-    // exactly as `plan_device_split()` deducts it, so the two cannot disagree about the ceiling.
+    // The planning allowance the device cap carries (Graph capture, weight staging). Deducted
+    // first, exactly as `plan_device_split()` deducts it, so the two cannot disagree about the
+    // ceiling.
     std::uint64_t startup_headroom_bytes = 0;
     // The arena's own floor: the Device bytes a plan must keep for KV to serve the whole context.
     // A figure below it cannot be built without a resident-KV leg (THE ARENA'S FLOOR), so the KV
@@ -167,6 +208,22 @@ struct CapacityBetRequest {
     std::uint64_t kv_target_tokens   = 0;
     // KV page granularity, for the KV figure's alignment. Zero means "do not align".
     std::uint64_t kv_alignment_bytes = 0;
+    // V10-82: the geometry a step pays the two Host -> Device legs on, and this machine's measured
+    // rates for them. Every one of these must be non-zero for a price to exist: a page whose size
+    // is unknown cannot be multiplied by anything, and a zero rate means "not measured on this
+    // path", never "free". `kv_pages_addressed` is what one step READS - the whole live history for
+    // a full-attention layer, the window's reach when one is installed.
+    std::uint64_t kv_page_bytes           = 0;
+    std::uint64_t kv_pages_addressed      = 0;
+    std::uint64_t experts_routed_per_step = 0;
+    TransferRates transfer_rates{};
+    // The pool the caller will ACTUALLY allocate, when it has already decided (a pinned
+    // NINFER_EXPERT_CACHE_MB, or a pool the split sized). Zero means "the caller lets the split
+    // size it", and the rule's own figure is then the pool. Naming it matters for the price: a pinned
+    // pool is the same pool whichever letter wins, so pricing B against the unstaked ask would
+    // describe a run nobody asked for - measured on 35B e2 with a 256 MiB pin, where the ask's
+    // figure reported no misses on a run that streams every step.
+    std::uint64_t expert_pool_cap_bytes = 0;
     // Whether a resident-KV leg exists: attention runs with FEWER Device pages than the context
     // needs, and a page the Device does not hold is read back from Host when a step asks for it.
     // False is the engine as it is (see A'S PRECONDITION above), and it is what makes A a refusal
@@ -174,6 +231,14 @@ struct CapacityBetRequest {
     bool            resident_kv_leg = false;
     ControllerMode  mode            = ControllerMode::Auto;
     CapacitySignals signals{};
+
+    // Both legs priceable: the leg exists (A is runnable) and every input the model needs is
+    // present. This is the one gate the comparison uses; the default request fails it, which is
+    // why an unchanged caller takes the same bet it took before V10-82.
+    [[nodiscard]] bool transfers_priceable() const noexcept {
+        return resident_kv_leg && transfer_rates.measured() && kv_page_bytes != 0 &&
+               kv_pages_addressed != 0 && experts_routed_per_step != 0 && expert_slot_bytes != 0;
+    }
 
     [[nodiscard]] std::uint64_t expert_ask_bytes() const noexcept {
         // The whole set when it is known, one window when it is not, one slot when neither is: each
@@ -183,10 +248,34 @@ struct CapacityBetRequest {
                                                                : 1;
         return expert_slot_bytes * slots;
     }
+
     [[nodiscard]] std::uint64_t kv_ask_bytes() const noexcept {
         return kv_bytes_per_token * kv_target_tokens;
     }
 };
+
+// One arrangement's per-step bill, from the request's geometry and the split a rule reached. The
+// pinned-pool clamp described under THE MEASURED COST lives here, so the branch that prices "both
+// asks fit" and the comparison branch cannot price the same arrangement differently. An arena
+// larger than the address space needs no clamp of its own: `price_step_transfers` counts `addressed
+// - resident` and never a negative. Callers gate on `transfers_priceable()`, which is what makes
+// the division safe.
+[[nodiscard]] inline double price_capacity_split(const CapacityBetRequest& request,
+                                                 std::uint64_t pool_bytes,
+                                                 std::uint64_t kv_bytes) noexcept {
+    const std::uint64_t capped_pool = request.expert_pool_cap_bytes != 0
+                                          ? std::min(pool_bytes, request.expert_pool_cap_bytes)
+                                          : pool_bytes;
+    return price_step_transfers(
+               {.page_bytes            = request.kv_page_bytes,
+                .pages_addressed       = request.kv_pages_addressed,
+                .pages_resident        = kv_bytes / request.kv_page_bytes,
+                .slot_bytes            = request.expert_slot_bytes,
+                .experts_routed        = request.experts_routed_per_step,
+                .expert_slots_resident = capped_pool / request.expert_slot_bytes},
+               request.transfer_rates)
+        .total_ms();
+}
 
 // The sentence a caller prints when A was the answer the rule reached and could not be taken. It
 // names the missing capability rather than a byte count, because the byte count was never the
@@ -219,10 +308,54 @@ struct CapacityBetPlan {
     bool        resident_kv_leg         = false;
     const char* expert_resident_refusal = nullptr;
 
+    // V10-82: what each arrangement is predicted to owe the Host -> Device legs per decode step,
+    // and the rates they were priced with. `cost_a_ms` is A's page bill (what the pool's win costs
+    // attention) and `cost_b_ms` is B's slot bill (what the pages' win costs the pool); both are the
+    // whole of that step's traffic, so they are the numbers to compare. False means nothing was
+    // priced - no leg, no measurement, no geometry, or no bet - and then `cost_a_ms`/`cost_b_ms`
+    // are zero because nothing was computed, not because the traffic is free.
+    bool          cost_priced    = false;
+    double        cost_a_ms      = 0.0;
+    double        cost_b_ms      = 0.0;
+    CapacityBet   cost_choice    = CapacityBet::ExpertResident; // the arrangement the prices rank first
+    TransferRates transfer_rates{};
+
     [[nodiscard]] std::uint64_t device_total_bytes() const noexcept {
         return expert_pool_bytes + kv_pages_bytes;
     }
 };
+
+// The cost sentence a caller appends to the plan line, so "why this letter" and "priced or ruled"
+// are readable from one line. Empty when there is nothing to say - a run without the leg prints
+// exactly what it printed before V10-82. Rates are decimal GB/s (bytes per second over 1e9), the
+// unit PCIe bandwidth is quoted in; the payloads they came from are printed by the probe line.
+// `cheaper=` is the raw ranking of the two bills; `not_applied=` appears only when the letter did
+// not follow it, and names the reason the objective declined to act (see WHAT THE MEASUREMENT
+// CHANGED). A reader can then tell "the rule won" from "the rule won because the price was not
+// actionable".
+[[nodiscard]] inline int format_capacity_costs(const CapacityBetPlan& plan, char* out,
+                                               std::size_t size) noexcept {
+    if (out == nullptr || size == 0) { return 0; }
+    if (!plan.resident_kv_leg) {
+        out[0] = '\0';
+        return 0;
+    }
+    if (!plan.cost_priced) {
+        return std::snprintf(out, size, " costs=unpriced(no measured rates)");
+    }
+    const int written = std::snprintf(
+        out, size,
+        " cost_a_ms=%.2f cost_b_ms=%.2f page_in_gbps=%.2f expert_gbps=%.2f "
+        "cheaper=%s",
+        plan.cost_a_ms, plan.cost_b_ms, plan.transfer_rates.page_in_bytes_per_s / 1e9,
+        plan.transfer_rates.expert_bytes_per_s / 1e9, capacity_bet_name(plan.cost_choice));
+    if (written <= 0 || static_cast<std::size_t>(written) >= size ||
+        plan.cost_choice == plan.choice) {
+        return written;
+    }
+    return written + std::snprintf(out + written, size - static_cast<std::size_t>(written),
+                                   " not_applied=unpriced_fixed_stream_cost");
+}
 
 namespace detail {
 
@@ -279,61 +412,79 @@ plan_capacity_bet(const CapacityBetRequest& request,
         plan.bet_exercised     = false;
         plan.reason            = "the whole ask fits: experts and KV are both resident, nothing"
                                  " spills";
+        // V10-82: nothing spills out of the BUDGET, so the two arrangements owe the same traffic
+        // and it is priced rather than left "unpriced" - a measured run has to show that the zero
+        // is a price and not a gap. A pinned pool (`expert_pool_cap_bytes`) is a different fact from
+        // the budget and is priced too: the same pool serves whichever letter wins, so the two
+        // figures are equal and the line says what that run owes, instead of promising nothing
+        // while it streams every step.
+        plan.cost_priced    = request.transfers_priceable();
+        plan.transfer_rates = request.transfer_rates;
         plan.expert_pool_bytes =
             detail::round_down(plan.expert_pool_bytes, request.expert_slot_bytes);
         plan.kv_pages_bytes =
             detail::round_down(plan.kv_pages_bytes, request.kv_alignment_bytes);
+        if (plan.cost_priced) {
+            plan.cost_a_ms   = price_capacity_split(request, plan.expert_pool_bytes,
+                                                    plan.kv_pages_bytes);
+            plan.cost_b_ms   = plan.cost_a_ms;
+            plan.cost_choice = CapacityBet::ExpertResident;
+        }
         return plan;
     }
     plan.bet_exercised = true;
 
-    const auto kv_first = [&] {
+    // V10-82: the two rules write into a caller-supplied plan instead of closing over `plan`.
+    // The cost comparison below has to price BOTH arrangements side by side, and this is the only
+    // place the two splits exist - a second copy of this arithmetic would be a second place for the
+    // rules to disagree with themselves.
+    const auto kv_first = [&](CapacityBetPlan& out) {
         // stable: the KV target is met first, leaving one expert slot - a pool of one slot is still
         // a pool (the Host tier serves the rest of the layer), and refusing it would be the startup
         // fault this decision exists to avoid.
         const std::uint64_t reserve = std::min(budget, request.expert_slot_bytes);
-        plan.kv_pages_bytes        = std::min(kv, budget - reserve);
-        plan.expert_pool_bytes     = std::min(experts, budget - plan.kv_pages_bytes);
-        plan.choice = plan.kv_pages_bytes >= kv ? CapacityBet::KvFirst : CapacityBet::BothGive;
-        plan.reason = plan.choice == CapacityBet::KvFirst
-                          ? "KV first: the pages keep their target, the pool streams the remainder"
-                          : "KV first: even one expert slot is taken from the KV target";
+        out.kv_pages_bytes          = std::min(kv, budget - reserve);
+        out.expert_pool_bytes       = std::min(experts, budget - out.kv_pages_bytes);
+        out.choice = out.kv_pages_bytes >= kv ? CapacityBet::KvFirst : CapacityBet::BothGive;
+        out.reason = out.choice == CapacityBet::KvFirst
+                         ? "KV first: the pages keep their target, the pool streams the remainder"
+                         : "KV first: even one expert slot is taken from the KV target";
     };
-    const auto experts_first = [&] {
+    const auto experts_first = [&](CapacityBetPlan& out) {
         // performance: the pool takes its ask, and KV takes the remainder - which, for every budget
         // this rule is reached with, is less than the KV ask. That answer is A, and A is only
         // runnable with a resident-KV leg: the pages it prices away have no reader once they leave
         // the Device. Without one the pool takes what is left after the KV ask (B's shape) and the
         // refusal says which capability is missing, instead of pricing a leg that is not there.
         if (!request.resident_kv_leg) {
-            kv_first();
-            plan.reason =
-                plan.choice == CapacityBet::KvFirst
+            kv_first(out);
+            out.reason =
+                out.choice == CapacityBet::KvFirst
                     ? "experts first, but A needs a resident-KV leg: the KV leg keeps its target "
                       "and the pool takes the remainder"
                     : "experts first, but A needs a resident-KV leg: not even the KV target fits "
                       "beside one expert slot";
-            plan.expert_resident_refusal = kExpertResidentNeedsKvLeg;
+            out.expert_resident_refusal = kExpertResidentNeedsKvLeg;
             return;
         }
         // The pool takes its ask if it fits, and KV takes the remainder. When the ask does not fit,
         // KV keeps nothing but the bytes the pool cannot use - which is the same rule, applied to a
         // smaller pool.
-        plan.expert_pool_bytes = std::min(experts, budget);
-        plan.kv_pages_bytes    = std::min(kv, budget - plan.expert_pool_bytes);
-        plan.choice = plan.expert_pool_bytes >= experts ? CapacityBet::ExpertResident
-                                                        : CapacityBet::BothGive;
-        plan.reason = plan.choice == CapacityBet::ExpertResident
-                          ? "experts first: the pool seats its whole window, KV takes the remainder"
-                          : "experts first: the window does not fit, so KV keeps only the leftovers";
+        out.expert_pool_bytes = std::min(experts, budget);
+        out.kv_pages_bytes    = std::min(kv, budget - out.expert_pool_bytes);
+        out.choice = out.expert_pool_bytes >= experts ? CapacityBet::ExpertResident
+                                                     : CapacityBet::BothGive;
+        out.reason = out.choice == CapacityBet::ExpertResident
+                         ? "experts first: the pool seats its whole window, KV takes the remainder"
+                         : "experts first: the window does not fit, so KV keeps only the leftovers";
     };
 
     switch (request.mode) {
     case ControllerMode::Performance:
-        experts_first();
+        experts_first(plan);
         break;
     case ControllerMode::Stable:
-        kv_first();
+        kv_first(plan);
         break;
     case ControllerMode::Auto: {
         // Evidence outranks the structural rule, and only when it exists. Both measured and both
@@ -346,7 +497,7 @@ plan_capacity_bet(const CapacityBetRequest& request,
         if (miss_high && (!latency_high || request.signals.miss_rate / thresholds.auto_miss_rate_high >=
                                                request.signals.lambda_p99_ms /
                                                    thresholds.auto_latency_high_ms)) {
-            experts_first();
+            experts_first(plan);
             // The refusal already carries the sentence a reader needs; the mode's own wording would
             // bury it, so it is only written when A was actually taken.
             if (request.resident_kv_leg) {
@@ -356,7 +507,7 @@ plan_capacity_bet(const CapacityBetRequest& request,
             break;
         }
         if (latency_high) {
-            kv_first();
+            kv_first(plan);
             plan.reason = "auto: the measured p99 ranks KV locality first, so the pages keep their "
                           "target";
             break;
@@ -386,18 +537,60 @@ plan_capacity_bet(const CapacityBetRequest& request,
         const std::uint64_t surplus       = budget - usable;
         const std::uint64_t expert_remain = experts > usable ? experts - usable : 0;
         const std::uint64_t share_total   = expert_remain + kv;
-        const std::uint64_t pool_share =
-            detail::muldiv_le(surplus, expert_remain, share_total);
-        plan.expert_pool_bytes = usable + pool_share;
-        plan.kv_pages_bytes    = budget - plan.expert_pool_bytes;
-        plan.choice = plan.kv_pages_bytes == 0   ? CapacityBet::ExpertResident
-                      : plan.kv_pages_bytes >= kv ? CapacityBet::KvFirst
-                                                  : CapacityBet::BothGive;
-        plan.reason = plan.choice == CapacityBet::KvFirst
-                          ? "auto: the pool clears its usable floor, so KV keeps its target"
-                          : "auto: each side keeps its floor and the surplus is shared in proportion";
+        const std::uint64_t pool_share    = detail::muldiv_le(surplus, expert_remain, share_total);
+        plan.expert_pool_bytes            = usable + pool_share;
+        plan.kv_pages_bytes               = budget - plan.expert_pool_bytes;
+        plan.choice                       = plan.kv_pages_bytes == 0 ? CapacityBet::ExpertResident
+                                            : plan.kv_pages_bytes >= kv ? CapacityBet::KvFirst
+                                                                        : CapacityBet::BothGive;
+        plan.reason =
+            plan.choice == CapacityBet::KvFirst
+                ? "auto: the pool clears its usable floor, so KV keeps its target"
+                : "auto: each side keeps its floor and the surplus is shared in proportion";
         break;
     }
+    }
+    // THE MEASURED COST (V10-82). Both arrangements are priced from geometry the bet already holds:
+    // A pays one page copy per page a step reads that the split leaves on Host, B pays one slot
+    // copy per routed expert the split leaves out of the pool. When both prices exist, "experts
+    // first" keeps A only while A's bill is the smaller one - a preference that loses to a number,
+    // which is the whole point of measuring it. Nothing else moves: the bytes a rule computed stay
+    // the rule's bytes, and a request without rates or geometry never reaches this block.
+    //
+    // The pinned pool (`expert_pool_cap_bytes`) is what keeps the price about the run: the pool is
+    // the same pool whichever letter wins, so a candidate that credited B with the whole unstaked
+    // ask would price a run nobody asked for - measured on 35B e2 with a 256 MiB pin, where the
+    // ask's figure reported zero misses on a run that streamed 393 MiB per step.
+    if (plan.bet_exercised && request.transfers_priceable()) {
+        CapacityBetPlan by_experts{};
+        CapacityBetPlan by_pages{};
+        experts_first(by_experts);
+        kv_first(by_pages);
+        const auto price = [&](const CapacityBetPlan& candidate) {
+            return price_capacity_split(request, candidate.expert_pool_bytes,
+                                        candidate.kv_pages_bytes);
+        };
+        plan.cost_priced    = true;
+        plan.transfer_rates = request.transfer_rates;
+        plan.cost_a_ms      = price(by_experts);
+        plan.cost_b_ms      = price(by_pages);
+        plan.cost_choice =
+            plan.cost_b_ms < plan.cost_a_ms ? CapacityBet::KvFirst : CapacityBet::ExpertResident;
+        // Only the A-versus-B question is answered here, and only where the model is exact: B owes
+        // nothing at all (zero misses is zero copies - the one bill this build stands behind, see
+        // WHAT THE MEASUREMENT CHANGED). A non-zero B bill is dominated by a 32.0 ms/step fixed
+        // streaming cost the model does not carry, so it is printed and left to the rule. A rule
+        // that reached neither arrangement (auto's proportional share) keeps its answer too: it is
+        // a different answer to a different question, and the two prices are still printed beside
+        // it.
+        if (plan.choice == CapacityBet::ExpertResident &&
+            plan.cost_choice == CapacityBet::KvFirst && plan.cost_b_ms == 0.0) {
+            plan.expert_pool_bytes = by_pages.expert_pool_bytes;
+            plan.kv_pages_bytes    = by_pages.kv_pages_bytes;
+            plan.choice            = by_pages.choice;
+            plan.reason = "measured: a step's slot copies are cheaper than its page copies, so the "
+                          "pool streams and the pages keep their target";
+        }
     }
     // A is the one answer that costs attention its pages: either "the pool seats its whole ask and
     // the KV leg takes the remainder" (the experts-first rule above, which refuses to price that

@@ -7,6 +7,7 @@
 #include "core/expert_cache.h"
 #include "core/memory_budget.h"
 #include "core/startup.h"
+#include "core/transfer_rate.h"
 #include "runtime/engine/context_capacity.h"
 #include "runtime/engine/host_arena_budget.h"
 #include "models/qwen3_5/execution/cpu_path_policy.h"
@@ -116,6 +117,14 @@ bool kv_page_in_requested() {
     return value != nullptr && *value != '\0' && std::strtol(value, nullptr, 10) != 0;
 }
 
+// V10-82: what the bet needs to price a page the Device does not hold. The two numbers are always
+// known together (the sequence planner measured both), so they travel together: a call site that
+// passed one without the other would price a page it cannot size.
+struct KvLegFacts {
+    std::size_t   page_bytes    = 0;
+    std::uint32_t logical_pages = 0;
+};
+
 // One builder for the bet, so the tight-run report and the rebind attempt cannot describe the same
 // Device with two different requests. `free_bytes` is the free count the split used, so the bet's
 // budget and plan_device_split()'s budget are the same number.
@@ -195,13 +204,34 @@ void report_capacity_bet(const char* what, const core::CapacityBetRequest& reque
         std::fprintf(stderr, " kv_target_mb=%llu",
                      static_cast<unsigned long long>(plan.kv_target_bytes >> 20));
     }
+    // V10-82: how the letter was reached - a rule or a price - plus the two prices and the rates
+    // they came from. Empty (and therefore invisible) on every run without the page-in leg, so the
+    // leg-off line is exactly the line it was before this change.
+    char costs[192];
+    if (core::format_capacity_costs(plan, costs, sizeof(costs)) > 0) { std::fputs(costs, stderr); }
     std::fputc('\n', stderr);
     std::fflush(stderr);
 }
 
+// V10-82: the slots one decode step routes. The same rule the constructor uses for
+// `Engine::expert_step_bytes()` (the assignment further down), named once so the pool's size and the
+// bet's cost model cannot disagree about what a step needs. Templated on the bank descriptor
+// because it is asked both of the cache's specs and of the requirements it is described into; both
+// carry `count`, which is all this rule reads.
+template <typename Banks>
+std::uint64_t expert_step_slots(const Banks& banks, std::uint64_t lanes,
+                                std::uint32_t routed_top_k) {
+    std::uint64_t slots = 0;
+    for (const auto& bank : banks) {
+        slots += std::min<std::uint64_t>(bank.count, lanes * routed_top_k);
+    }
+    return slots;
+}
+
 ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions& options,
                                     DeviceContext& device, std::size_t kv_reserve_bytes,
-                                    std::size_t kv_floor_bytes, bool rebind_allowed) {
+                                    std::size_t kv_floor_bytes, const KvLegFacts& kv_leg,
+                                    bool rebind_allowed) {
     ExpertPlacement placement;
     std::vector<ExpertStream*> streams;
     std::uint32_t routed_top_k = 0;
@@ -325,9 +355,37 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     //     fault this decision replaces. If the controller's bet moves Device bytes from the KV leg
     //     to the pool, the caller is asked to re-price the arena once and attach again; only a
     //     second refusal is an error.
-    const auto request =
+    auto request =
         capacity_bet_request(free_bytes, kv_reserve_bytes, options.startup_planning_headroom_bytes,
                              kv_floor_bytes, entry, widest, routed_slots, options.max_context);
+    // V10-82: price the two legs the bet can choose between, on this machine and on THIS run's
+    // payload shapes. Only a run that can read a page back (the leg) can take A, and only that run
+    // uses the numbers, so the probe costs nothing on every other path - and a leg-off run keeps
+    // the request it always built, which is what keeps its plan byte for byte the same.
+    if (request.resident_kv_leg && kv_leg.page_bytes != 0) {
+        const auto probe = core::measure_transfer_rates(kv_leg.page_bytes, entry, nullptr);
+        std::fprintf(stderr,
+                     "[plan] transfer leg: page_in=%.2f GB/s (%llu KiB page x %u copies) "
+                     "expert=%.2f GB/s (%llu KiB slot x %u copies) pinned=%.1f MiB free=%.0f MiB\n",
+                     probe.rates.page_in_bytes_per_s / 1e9,
+                     static_cast<unsigned long long>(kv_leg.page_bytes >> 10), probe.page_copies,
+                     probe.rates.expert_bytes_per_s / 1e9,
+                     static_cast<unsigned long long>(entry >> 10), probe.slot_copies,
+                     static_cast<double>(probe.pinned_bytes) / (1024.0 * 1024.0),
+                     static_cast<double>(free_bytes) / (1024.0 * 1024.0));
+        std::fflush(stderr);
+        if (probe.measured()) {
+            const std::uint64_t lanes = std::max<std::uint32_t>(1, options.max_concurrency);
+            request.kv_page_bytes           = kv_leg.page_bytes;
+            request.kv_pages_addressed      = kv_leg.logical_pages;
+            request.experts_routed_per_step = expert_step_slots(specs, lanes, routed_top_k);
+            // V10-82: a pool the caller pinned is the pool the run gets, so the price is computed
+            // against it rather than against the ask the split never funded. Zero (auto) leaves the
+            // rule's own figure in charge.
+            request.expert_pool_cap_bytes   = pool_from_split ? 0 : capacity;
+            request.transfer_rates          = probe.rates;
+        }
+    }
     const auto bet   = core::plan_capacity_bet(request);
     const bool tight = widest != 0 && capacity / entry < widest;
     if (tight && capacity != 0) {
@@ -1011,11 +1069,8 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     // than a constant - and the one that says whether a run should be attempted at all.
     {
         const std::uint64_t lanes = std::max<std::uint32_t>(1, options.max_concurrency);
-        std::uint64_t step_slots  = 0;
-        for (const auto& bank : requirements.banks) {
-            step_slots += std::min<std::uint64_t>(bank.count, lanes * routed_top_k);
-        }
-        instance.expert_step_bytes_ = step_slots * placement.slot_bytes;
+        instance.expert_step_bytes_ =
+            expert_step_slots(requirements.banks, lanes, routed_top_k) * placement.slot_bytes;
     }
     // Whatever the pool does not keep is served by the cache's source: the retained Host replica
     // when one exists, the artifact otherwise. The residency arena above is an extra cache in
@@ -1823,9 +1878,13 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
         const auto kv_floor = [&]() -> std::size_t {
             return tiered_mode ? 0 : resolution.minimum_runtime_reservation_bytes;
         };
+        // V10-82: the page-in leg's geometry, for the bet's cost model. Named once here and passed
+        // to both attaches, so the first plan and the re-solve price the same page.
+        const KvLegFacts kv_leg{strides.payload_bytes_per_resident_page_group,
+                                resolution.logical_page_groups};
         try {
             placement = attach_expert_cache(*instance, options, device,
-                                            resolution.runtime_reservation_bytes, kv_floor(),
+                                            resolution.runtime_reservation_bytes, kv_floor(), kv_leg,
                                             /*rebind_allowed=*/true);
         } catch (const CapacityRebindRequest& rebind) {
             const auto released = rebind.kv_release_bytes;
@@ -1869,7 +1928,7 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
             // The second attach never re-throws the bet: one re-solve is the contract, and a pool
             // that still does not fit after it is the fault the caller asked for.
             placement = attach_expert_cache(*instance, options, device,
-                                            resolution.runtime_reservation_bytes, kv_floor(),
+                                            resolution.runtime_reservation_bytes, kv_floor(), kv_leg,
                                             /*rebind_allowed=*/false);
         }
         // One window per bank means no layer ever evicts another, so the resident set is fixed and
