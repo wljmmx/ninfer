@@ -404,9 +404,11 @@ enum class RkVariant { Plain, PackedKOnly, E8Lattice, E8Root, E8LatticeV2 };
 // instance decodes another.
 //
 // Worth stating because it was the gap: this segment (width 9..16) had NO gate at all, for ANY
-// family, so a prefill-shaped rk call could never reach the CPU leg. It still cannot engage - the
-// leg's pinned staging is 8 tokens wide (rk_host_partial_detail::kStageWidth) - but it now reaches
-// the gate and says so on its own fallback line instead of silently having no seam.
+// family, so a prefill-shaped rk call could never reach the CPU leg. It now reaches the gate, and
+// it can engage too: the leg's pinned staging was widened to 16 tokens (rk_host_partial_detail
+// ::kStageWidth), so a 9..16 tile is no longer refused on width alone. A harness that wants to see
+// it engage still has to install a host view that wide; without one the gate falls back naming the
+// missing view, not the tile.
 template <bool PackedK, bool E8Lattice, bool E8Root, bool V8Root>
 [[nodiscard]] constexpr RkHostKvDType rk_parallel_host_dtype() {
     if constexpr (V8Root) {

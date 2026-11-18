@@ -220,11 +220,12 @@ inline void log_fallback(Fallback reason, const char* what) {
     std::fflush(stderr);
 }
 
-// Production grouped-family staging bound: 24 query heads x the grouped token tile 8
-// (Int8KvCausalPlan::kTokenTile). Both production geometries fit; a wider grouped call would
-// need a larger staging block and is refused loudly by the executor below.
+// Production grouped-family staging bound: 24 query heads x the widest grouped token tile this
+// leg serves (16). The grouped plan's own tile is 8; the wider 9..16 tile used to be refused here
+// for no reason other than this constant. Both fit in one pinned block (~400 KiB, allocated on the
+// first engage and never freed). A call wider than 16 still falls back with a named reason.
 inline constexpr int kStageQHeads = 24;
-inline constexpr int kStageWidth  = 8;
+inline constexpr int kStageWidth  = 16;
 
 // Pinned staging for one split slot in compact (split-0) layout, plus the event that fences the
 // previous call's in-flight H2D before the host overwrites the staging again. Deliberately
@@ -446,7 +447,7 @@ void rk_kv_cpu_split_gate(const CausalAttentionOperands& p, CausalKvPartition pa
     // view-less call would otherwise look like "no producer" when the answer is "this width".
     if (p.width > detail::kStageWidth) {
         log_fallback(detail::kWidth,
-                     "this call's width exceeds the CPU leg's pinned staging (8 tokens)");
+                     "this call's width exceeds the CPU leg's pinned staging (16 tokens)");
         return;
     }
     const RkHostPartialView* view = rk_host_partial_active();
