@@ -79,10 +79,14 @@ def _positive_fp32_word(value: torch.Tensor | bytes | bytearray | memoryview) ->
 def encode_nvfp4(
     packed_codes: torch.Tensor,
     natural_scales: torch.Tensor,
-    weight_divisor: torch.Tensor | bytes | bytearray | memoryview,
+    weight_divisor: torch.Tensor | bytes | bytearray | memoryview | None,
     shape: Sequence[int],
 ) -> bytes:
-    """Encode exact source NVFP4 words without numerical conversion."""
+    """Encode exact source NVFP4 words without numerical conversion.
+
+    A None divisor leaves the trailing word unwritten for a caller that stores a per-expert array of
+    them instead, so a batched bank's row blocks can be encoded without inventing one value.
+    """
 
     geometry = block_scale_geometry("nvfp4", shape)
     codes = _exact_uint8_matrix(
@@ -98,7 +102,7 @@ def encode_nvfp4(
     invalid = ((scales & 0x80) != 0) | (scales == 0x7F)
     if bool(invalid.any()):
         raise ValueError("NVFP4 scales must be nonnegative finite E4M3FN words")
-    divisor = _positive_fp32_word(weight_divisor)
+    divisor = b"" if weight_divisor is None else _positive_fp32_word(weight_divisor)
     swizzled = swizzle_nvfp4_scales(scales, shape)
     payload = bytearray(geometry.payload_bytes)
     payload[: geometry.code_plane_bytes] = codes.numpy().tobytes()
@@ -106,7 +110,8 @@ def encode_nvfp4(
         geometry.scale_plane_offset : geometry.scale_plane_offset
         + geometry.scale_plane_bytes
     ] = swizzled.numpy().tobytes()
-    payload[geometry.weight_divisor_offset :] = divisor
+    if divisor:
+        payload[geometry.weight_divisor_offset :] = divisor
     return bytes(payload)
 
 

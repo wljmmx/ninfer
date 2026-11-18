@@ -6,11 +6,14 @@ ArtifactWriter owns file placement, sharding, write coverage, and publication.
 
 from __future__ import annotations
 
+from math import prod
+from typing import Sequence
+
 import torch
 
 from .codecs.direct import encode_direct
 from .codecs.fp8_row import encode_fp8_row_scaled
-from .codecs.nvfp4 import encode_nvfp4
+from .codecs.nvfp4 import _positive_fp32_word, encode_nvfp4
 from .codecs.row_split import encode_row_split, split_row_planes
 from .formats import (
     DirectFormat,
@@ -20,6 +23,10 @@ from .formats import (
     get_format,
 )
 from .layouts import (
+    BATCHED_BLOCK_SCALE_K16_M128X4_V1,
+    BatchedBlockScaleGeometry,
+    BlockScaleGeometry,
+    batched_block_scale_geometry,
     block_scale_geometry,
     row_scale_geometry,
     row_split_geometry,
@@ -65,7 +72,7 @@ class TensorOutput:
             g = row_scale_geometry(self.format, obj.shape)
             gaps = ((g.code_plane_bytes, g.scale_plane_offset),)
         elif isinstance(self.format, Nvfp4Format):
-            g = block_scale_geometry(self.format, obj.shape)
+            g = self._nvfp4_geometry()
             gaps = ((g.code_plane_bytes, g.scale_plane_offset),)
         else:
             gaps = ()
@@ -73,6 +80,13 @@ class TensorOutput:
             if begin < end:
                 self.writer.write_zeros(obj.id, begin, end - begin)
         self._padding_initialized = True
+
+    def _nvfp4_geometry(self) -> BlockScaleGeometry | BatchedBlockScaleGeometry:
+        """One matrix, or that matrix repeated once per expert behind a leading axis."""
+
+        if self.object.layout == BATCHED_BLOCK_SCALE_K16_M128X4_V1.name:
+            return batched_block_scale_geometry(self.format, self.object.shape)
+        return block_scale_geometry(self.format, self.object.shape)
 
     def write_codes(
         self,
@@ -82,10 +96,12 @@ class TensorOutput:
         weight_divisor: bytes | None = None,
     ) -> None:
         obj = self.object
-        if len(obj.shape) != 2 or not 0 <= row_begin < obj.shape[0]:
+        k = obj.shape[-1]
+        row_count = prod(obj.shape[:-1])
+        if len(obj.shape) not in (2, 3) or not 0 <= row_begin < row_count:
             raise ValueError(f"{obj.id}: invalid encoded row origin {row_begin}")
-        rows, k = codes.shape[0], obj.shape[1]
-        if rows <= 0 or row_begin + rows > obj.shape[0]:
+        rows = codes.shape[0]
+        if rows <= 0 or row_begin + rows > row_count:
             raise ValueError(f"{obj.id}: encoded rows exceed parent")
         self._padding()
         if isinstance(self.format, QuantFormat):
@@ -106,11 +122,17 @@ class TensorOutput:
                 g.scale_plane_offset + row_begin * 2, block[local.scale_plane_offset :]
             )
         elif isinstance(self.format, Nvfp4Format):
-            if row_begin % 128 or rows % 128 or weight_divisor is None:
+            g = self._nvfp4_geometry()
+            if row_begin % 128 or rows % 128 or (
+                g.divisor_count == 1 and weight_divisor is None
+            ):
                 raise ValueError(
                     f"{obj.id}: NVFP4 output needs whole 128-row tiles and weight divisor"
                 )
-            g = block_scale_geometry(self.format, obj.shape)
+            if g.divisor_count > 1 and weight_divisor is not None:
+                raise ValueError(
+                    f"{obj.id}: a per-expert bank writes its divisors through write_divisors"
+                )
             local = block_scale_geometry(self.format, (rows, k))
             block = memoryview(encode_nvfp4(codes, scales, weight_divisor, (rows, k)))
             self.write_bytes(row_begin * (k // 2), block[: local.code_plane_bytes])
@@ -118,10 +140,32 @@ class TensorOutput:
                 g.scale_plane_offset + row_begin * (k // 16),
                 block[local.scale_plane_offset : local.weight_divisor_offset],
             )
-            if self._divisor is None:
-                self.write_bytes(g.weight_divisor_offset, weight_divisor)
-                self._divisor = bytes(weight_divisor)
-            elif self._divisor != weight_divisor:
-                raise ValueError(f"{obj.id}: weight divisor changed between row blocks")
+            if g.divisor_count == 1:
+                if self._divisor is None:
+                    self.write_bytes(g.weight_divisor_offset, weight_divisor)
+                    self._divisor = bytes(weight_divisor)
+                elif self._divisor != weight_divisor:
+                    raise ValueError(f"{obj.id}: weight divisor changed between row blocks")
         else:
             raise TypeError(f"{obj.id}: direct format does not accept quantized codes")
+
+    def write_divisors(
+        self, divisors: Sequence[torch.Tensor | bytes | bytearray | memoryview]
+    ) -> None:
+        """Write one FP32 word per divisor domain of a block-scaled parent.
+
+        A batched bank owns one domain per expert matrix, so the array is written once here rather
+        than per row block; the single-domain form stays available through ``write_codes``.
+        """
+
+        obj = self.object
+        if not isinstance(self.format, Nvfp4Format):
+            raise TypeError(f"{obj.id}: only NVFP4 stores weight divisors")
+        g = self._nvfp4_geometry()
+        if len(divisors) != g.divisor_count:
+            raise ValueError(
+                f"{obj.id}: {g.divisor_count} divisor domains, got {len(divisors)} words"
+            )
+        words = b"".join(_positive_fp32_word(word) for word in divisors)
+        self.write_bytes(g.weight_divisor_offset, words)
+        self._divisor = words

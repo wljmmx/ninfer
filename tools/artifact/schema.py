@@ -66,6 +66,9 @@ class TensorSpec:
     shape: tuple[int, ...]
     format: str
     layout: str
+    # port (sm_89) V10-13: how many FP32 divisor words end the payload. None states nothing, so a
+    # batched block-scale object derives one word per expert from its leading axis.
+    divisors: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,10 +86,14 @@ class TensorObject:
     layout: str
     offset: int
     bytes: int
+    divisors: int | None = None
     kind: ClassVar[str] = "tensor"
 
     def to_json(self) -> dict:
-        return {**asdict(self), "shape": list(self.shape), "kind": self.kind}
+        value = {**asdict(self), "shape": list(self.shape), "kind": self.kind}
+        if self.divisors is None:
+            value.pop("divisors")
+        return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,7 +153,7 @@ def validate_encoding(obj: ArtifactObject) -> None:
             )
         return
     try:
-        size = encoded_size(obj.layout, obj.format, obj.shape)
+        size = encoded_size(obj.layout, obj.format, obj.shape, divisors=obj.divisors)
         alignment = get_layout(obj.layout).alignment
     except (TypeError, ValueError) as error:
         raise ArtifactError(f"{obj.id}: {error}") from error
@@ -169,12 +176,18 @@ def plan_objects(specs: Sequence[ObjectSpec]) -> tuple[ArtifactObject, ...]:
         seen.add(name)
         if isinstance(spec, TensorSpec):
             dims = shape(spec.shape, name)
+            if spec.divisors is not None:
+                integer(spec.divisors, f"{name} divisors", positive=True)
             try:
                 start = align_up(offset, get_layout(spec.layout).alignment)
-                size = encoded_size(spec.layout, spec.format, dims)
+                size = encoded_size(
+                    spec.layout, spec.format, dims, divisors=spec.divisors
+                )
             except (TypeError, ValueError) as error:
                 raise ArtifactError(f"{name}: {error}") from error
-            obj = TensorObject(name, dims, spec.format, spec.layout, start, size)
+            obj = TensorObject(
+                name, dims, spec.format, spec.layout, start, size, spec.divisors
+            )
         elif isinstance(spec, ResourceSpec):
             obj = ResourceObject(name, spec.encoding, offset, spec.bytes)
         else:
@@ -196,7 +209,7 @@ def _parse_object(value: object) -> ArtifactObject:
     common = {"id", "kind", "offset", "bytes"}
     kind = value.get("kind")
     if kind == "tensor":
-        members(value, common | {"shape", "format", "layout"}, set(), "tensor")
+        members(value, common | {"shape", "format", "layout"}, {"divisors"}, "tensor")
     elif kind == "resource":
         members(value, common | {"encoding"}, set(), "resource")
     else:
@@ -207,6 +220,11 @@ def _parse_object(value: object) -> ArtifactObject:
     integer(offset + size, f"{name} end")
     if kind == "resource":
         return ResourceObject(name, identifier(value["encoding"], name), offset, size)
+    divisors = (
+        integer(value["divisors"], f"{name} divisors", positive=True)
+        if "divisors" in value
+        else None
+    )
     return TensorObject(
         name,
         shape(value["shape"], name),
@@ -214,6 +232,7 @@ def _parse_object(value: object) -> ArtifactObject:
         identifier(value["layout"], name),
         offset,
         size,
+        divisors,
     )
 
 

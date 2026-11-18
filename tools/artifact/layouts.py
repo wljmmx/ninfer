@@ -66,6 +66,23 @@ class BlockScaleGeometry:
     scale_plane_bytes: int
     weight_divisor_offset: int
     payload_bytes: int
+    divisor_count: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class BatchedBlockScaleGeometry:
+    experts: int
+    n: int
+    k: int
+    groups_per_row: int
+    k_tiles: int
+    code_plane_bytes: int
+    scale_plane_offset: int
+    scale_bytes_per_matrix: int
+    scale_plane_bytes: int
+    weight_divisor_offset: int
+    divisor_count: int
+    payload_bytes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +118,14 @@ BLOCK_SCALE_K16_M128X4_V1 = Layout(
     256,
     frozenset(("nvfp4",)),
 )
+# port (sm_89) V10-13: one NVFP4 matrix per expert behind a leading axis, each with its own FP32
+# divisor word. The code plane and every scale block repeat per expert, and the payload ends with
+# one word per expert rather than the single matrix divisor.
+BATCHED_BLOCK_SCALE_K16_M128X4_V1 = Layout(
+    "batched_block_scale_k16_m128x4_v1",
+    256,
+    frozenset(("nvfp4",)),
+)
 ROW_SCALE_V1 = Layout(
     "row_scale_v1",
     256,
@@ -124,6 +149,7 @@ LAYOUTS = MappingProxyType(
             CONTIGUOUS_LE_V1,
             ROW_SPLIT_K128_V1,
             BLOCK_SCALE_K16_M128X4_V1,
+            BATCHED_BLOCK_SCALE_K16_M128X4_V1,
             ROW_SCALE_V1,
             BLOCK_SCALE_M128_K128_V1,
             BLOCK_SCALE_M64_K64_V1,
@@ -251,6 +277,66 @@ def block_scale_geometry(
     )
 
 
+def batched_block_scale_geometry(
+    format: str | Nvfp4Format, shape: Sequence[int]
+) -> BatchedBlockScaleGeometry:
+    """Describe ``[E, N, K]``: one NVFP4 matrix and one divisor word per expert."""
+
+    spec = _format(format)
+    if not isinstance(spec, Nvfp4Format):
+        raise ValueError("batched_block_scale_k16_m128x4_v1 requires NVFP4")
+    experts, n, k = _shape(shape, rank=3)
+    if n % 128 != 0 or k % 64 != 0:
+        raise ValueError(
+            "batched_block_scale_k16_m128x4_v1 requires N divisible by 128 "
+            "and K divisible by 64"
+        )
+    code_plane_bytes = experts * n * k // 2
+    scale_plane_offset = align_up(code_plane_bytes, PLANE_ALIGNMENT)
+    scale_bytes_per_matrix = n * (k // spec.group_size)
+    scale_plane_bytes = experts * scale_bytes_per_matrix
+    weight_divisor_offset = scale_plane_offset + scale_plane_bytes
+    return BatchedBlockScaleGeometry(
+        experts=experts,
+        n=n,
+        k=k,
+        groups_per_row=k // spec.group_size,
+        k_tiles=k // 64,
+        code_plane_bytes=code_plane_bytes,
+        scale_plane_offset=scale_plane_offset,
+        scale_bytes_per_matrix=scale_bytes_per_matrix,
+        scale_plane_bytes=scale_plane_bytes,
+        weight_divisor_offset=weight_divisor_offset,
+        divisor_count=experts,
+        payload_bytes=weight_divisor_offset + 4 * experts,
+    )
+
+
+def divisor_count(
+    layout: str | Layout, shape: Sequence[int], divisors: int | None = None
+) -> int:
+    """How many FP32 divisor words a payload ends with.
+
+    A batched block-scale parent stores one per expert matrix whether or not the descriptor states
+    the count, so ``divisors`` may only repeat what the shape already says. Every other layout
+    stores the single matrix divisor it has always stored.
+    """
+
+    layout_spec = _layout(layout)
+    if layout_spec is BATCHED_BLOCK_SCALE_K16_M128X4_V1:
+        experts = _shape(shape, rank=3)[0]
+        if divisors is not None and divisors != experts:
+            raise ValueError(
+                f"stated divisor count {divisors} differs from the {experts} expert matrices"
+            )
+        return experts
+    if divisors not in (None, 1):
+        raise ValueError(
+            f"layout {layout_spec.name!r} stores a single matrix divisor, got {divisors}"
+        )
+    return 1
+
+
 def fp8_block_geometry(
     format: str | Fp8BlockFormat, shape: Sequence[int]
 ) -> Fp8BlockGeometry:
@@ -303,6 +389,8 @@ def encoded_size(
     layout: str | Layout,
     format: str | NumericFormat,
     shape: Sequence[int],
+    *,
+    divisors: int | None = None,
 ) -> int:
     layout_spec = _layout(layout)
     numeric_spec = _format(format)
@@ -310,6 +398,8 @@ def encoded_size(
         raise ValueError(
             f"layout {layout_spec.name!r} does not accept format {numeric_spec.name!r}"
         )
+    # The payload must cover every word a stated count names, so the count is checked first.
+    divisor_count(layout_spec, shape, divisors)
     if layout_spec is CONTIGUOUS_LE_V1:
         if not isinstance(numeric_spec, DirectFormat):
             raise ValueError("contiguous_le_v1 requires a direct format")
@@ -325,6 +415,10 @@ def encoded_size(
         if not isinstance(numeric_spec, Nvfp4Format):
             raise ValueError("block_scale_k16_m128x4_v1 requires NVFP4")
         return block_scale_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is BATCHED_BLOCK_SCALE_K16_M128X4_V1:
+        if not isinstance(numeric_spec, Nvfp4Format):
+            raise ValueError("batched_block_scale_k16_m128x4_v1 requires NVFP4")
+        return batched_block_scale_geometry(numeric_spec, shape).payload_bytes
     if layout_spec is ROW_SCALE_V1:
         if not isinstance(numeric_spec, Fp8RowFormat):
             raise ValueError("row_scale_v1 requires a row-scaled FP8 format")

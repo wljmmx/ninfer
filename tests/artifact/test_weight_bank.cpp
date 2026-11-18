@@ -109,14 +109,14 @@ std::byte read_device_byte(const void* address) {
 }
 
 // The artifact must describe the bank, refuse a logical reshape of it, and hand both planes and
-// both divisors to the view that addresses one expert.
-void describe_bind_and_decode(DeviceContext& device) {
-    BankFixture fixture;
+// both divisors to the view that addresses one expert. The bytes are the same whether the fixture
+// wrote them here or the Python writer produced them, so both entries are graded by this one check.
+void check_bank(const std::filesystem::path& entry, DeviceContext& device) {
     ObjectHandle bank;
     ParameterReference reference;
     std::optional<MaterializedArtifact> backing;
     {
-        Reader reader(fixture.fixture.entry);
+        Reader reader(entry);
         bank                 = reader.find("bank");
         const auto& geometry = reader.geometry(bank);
         require(geometry.layout == QuantLayout::BatchedBlockScaleK16M128x4,
@@ -183,6 +183,53 @@ void describe_bind_and_decode(DeviceContext& device) {
     require(matrix.scales == parent.data + kScaleOffset + kScalePerMatrix &&
                 matrix.weight_scale_divisor == 3.0F,
             "the bank matrix lost its scale block or divisor");
+}
+
+void describe_bind_and_decode(DeviceContext& device) {
+    BankFixture fixture;
+    check_bank(fixture.fixture.entry, device);
+}
+
+// port (sm_89) V10-13: measure an arbitrary batched bank - including the acceptance-size one the
+// Python toolchain writes - by reporting every described plane and materializing it on the Device.
+void bank_report(const std::filesystem::path& path, DeviceContext& device) {
+    Reader reader(path);
+    Binder binder(reader);
+    std::vector<std::pair<std::string, ObjectHandle>> banks;
+    for (const auto& [name, binding] : reader.directory().bindings) {
+        if (!binding.whole_object || binding.parts.empty()) { continue; }
+        const auto handle    = binding.parts.front().object;
+        const auto& geometry = reader.geometry(handle);
+        if (geometry.layout != QuantLayout::BatchedBlockScaleK16M128x4) { continue; }
+        std::cout << "bank " << name << " object=" << object_id(reader.directory().object(handle))
+                  << " shape=[";
+        for (std::size_t axis = 0; axis < geometry.shape.size(); ++axis) {
+            std::cout << (axis ? "," : "") << geometry.shape[axis];
+        }
+        std::cout << "] payload_bytes=" << geometry.bytes << " code_bytes=" << geometry.code_bytes
+                  << " scale_offset=" << geometry.scale_offset
+                  << " scale_words=" << geometry.scale_bytes
+                  << " divisor_offset=" << geometry.divisor_offset
+                  << " divisors=" << geometry.divisor_count
+                  << " divisor_rows=" << geometry.divisor_rows << '\n';
+        banks.emplace_back(name, handle);
+        (void)binder.parameter(name, geometry.shape);
+    }
+    if (banks.empty()) { throw std::runtime_error("artifact holds no batched block-scale bank"); }
+    const auto backing = materialize(reader, std::move(binder).finish(), device);
+    for (const auto& [name, handle] : banks) {
+        const auto& parent = backing.device_parent(handle);
+        const auto& stats  = backing.stats();
+        std::cout << "materialized " << name << " device_bytes=" << parent.geometry.bytes
+                  << " divisor_words=" << parent.weight_divisors.size()
+                  << " first_divisor=" << parent.weight_divisors.front()
+                  << " last_divisor=" << parent.weight_divisors.back()
+                  << " read_bytes=" << stats.read_bytes << " h2d_bytes=" << stats.h2d_bytes
+                  << " staging_bytes=" << stats.peak_staging_bytes << '\n';
+        // End to end means the device parent addresses the artifact's own first code byte.
+        std::cout << "device_head_byte=" << std::to_integer<unsigned>(read_device_byte(parent.data))
+                  << '\n';
+    }
 }
 
 // A rank-two stack of the same experts has no leading axis to count, so only a stated count can
@@ -299,11 +346,17 @@ void inspect(const std::filesystem::path& path) {
 
 int main(int argc, char** argv) {
     try {
-        if (argc == 2) {
+        const std::string mode = argc > 1 ? argv[1] : std::string{};
+        if (argc == 2 && mode.rfind("--", 0) != 0) {
             inspect(argv[1]);
             return 0;
         }
-        if (argc != 1) { throw std::invalid_argument("expected an optional artifact path"); }
+        const bool written = argc == 3 && mode == "--python-bank";
+        const bool report  = argc == 3 && mode == "--bank-report";
+        if (argc != 1 && !written && !report) {
+            throw std::invalid_argument(
+                "expected an artifact path, --python-bank <path> or --bank-report <path>");
+        }
         int count         = 0;
         const auto result = cudaGetDeviceCount(&count);
         if (result == cudaErrorNoDevice || result == cudaErrorInsufficientDriver ||
@@ -312,6 +365,15 @@ int main(int argc, char** argv) {
         }
         CUDA_CHECK(result);
         DeviceContext device;
+        if (written) {
+            check_bank(argv[2], device);
+            std::cout << "artifact python-written batched bank checks passed\n";
+            return 0;
+        }
+        if (report) {
+            bank_report(argv[2], device);
+            return 0;
+        }
         describe_refusals();
         stacked_declared_divisors();
         describe_bind_and_decode(device);

@@ -24,6 +24,14 @@ ninfer_add_test(ninfer_artifact_weight_bank_test
   LIBRARIES ninfer_artifact)
 set_tests_properties(ninfer_artifact_weight_bank_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# port (sm_89) V10-13: the writer side of the same bank. The production Python toolchain emits one
+# FP32 divisor per expert and leaves the count unstated, so the C++ reader derives it from the
+# expert axis, describes the payload, uploads it and decodes the hand-computed values.
+add_test(NAME ninfer_artifact_weight_bank_writer_test
+  COMMAND ${Python3_EXECUTABLE} -B "${CMAKE_CURRENT_LIST_DIR}/writer_bank_interop.py"
+    $<TARGET_FILE:ninfer_artifact_weight_bank_test>)
+set_tests_properties(ninfer_artifact_weight_bank_writer_test PROPERTIES SKIP_RETURN_CODE 77)
+
 # This test injects CUDA allocation failures by intercepting cudaMalloc and friends through
 # GNU ld's --wrap. MSVC's linker has no equivalent, so the target is GNU/ELF-hosted only.
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT MSVC)
