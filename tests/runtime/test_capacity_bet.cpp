@@ -247,6 +247,75 @@ void test_the_ask_is_the_whole_set_not_one_window() {
     check(plan_capacity_bet(full).choice == CapacityBet::BothGive, "auto splits the surplus");
 }
 
+void test_the_arena_floor_overrides_the_kv_target() {
+    // V10-78: a KV figure below the arena's floor is not a smaller KV leg - the arena is priced
+    // from max_context, so the pages cannot be released and the printed split would describe a run
+    // that does not exist. The plan keeps the rule's target and reports the bytes the arena builds.
+    auto request               = canonical(21 * kGib, ControllerMode::Auto);
+    request.kv_floor_bytes     = 6 * kGib; // the floor is the whole ask at a pinned capacity
+    const auto realised        = plan_capacity_bet(request);
+    check(realised.bet_exercised, "the floor case still takes a bet");
+    check(realised.kv_floor_applied, "the floor is reported as applied");
+    check(realised.kv_target_bytes == 9 * kGib / 4,
+          "the rule's own target is kept: auto's C wanted 2.25 GiB");
+    check(realised.kv_pages_bytes == 6 * kGib,
+          "the pages keep the arena's floor, not their target");
+    check(realised.expert_pool_bytes == 15 * kGib,
+          "the pool takes the remainder left by the floor");
+    check(realised.expert_pool_bytes + realised.kv_pages_bytes == 21 * kGib,
+          "the realised split still covers the budget");
+    check(realised.choice == CapacityBet::KvFirst,
+          "the letter follows the realised bytes: the pages met their ask, so that is B");
+    check(std::strstr(realised.reason, "floor") != nullptr, "the reason names the floor");
+
+    // A floor under the target does not bind: C is a distinct, buildable arrangement there.
+    request.kv_floor_bytes = 1 * kGib;
+    const auto untouched   = plan_capacity_bet(request);
+    check(!untouched.kv_floor_applied, "a floor below the target is not applied");
+    check(untouched.kv_pages_bytes == 9 * kGib / 4, "C keeps the target it computed");
+    check(untouched.choice == CapacityBet::BothGive, "C stays C when it can be built");
+
+    // The floor is a property of an arena that must stay resident: a leg that reads pages back has
+    // none, and C keeps its target there.
+    request.resident_kv_leg = true;
+    request.kv_floor_bytes  = 6 * kGib;
+    const auto with_leg     = plan_capacity_bet(request);
+    check(!with_leg.kv_floor_applied, "a resident-KV leg has no arena floor");
+    check(with_leg.kv_pages_bytes == 9 * kGib / 4, "C keeps its target on a leg that reads back");
+
+    // B already keeps the ask, so the floor must not fire and move a byte: stable and performance
+    // are unchanged by a floor equal to the ask.
+    request.resident_kv_leg = false;
+    request.mode            = ControllerMode::Stable;
+    const auto stable       = plan_capacity_bet(request);
+    check(!stable.kv_floor_applied && stable.kv_pages_bytes == 6 * kGib,
+          "stable is already at the floor and is left alone");
+    check(stable.expert_pool_bytes == 15 * kGib, "stable keeps B's numbers");
+    request.mode = ControllerMode::Performance;
+    const auto performance = plan_capacity_bet(request);
+    check(!performance.kv_floor_applied && performance.kv_pages_bytes == 6 * kGib,
+          "performance without the leg is already B and is left alone");
+
+    // The floor must not break the monotonicity the three rules are chosen for: an arena that grows
+    // with the budget cannot make either side shrink.
+    for (const auto mode :
+         {ControllerMode::Auto, ControllerMode::Stable, ControllerMode::Performance}) {
+        auto swept                   = canonical(kMib, mode);
+        swept.kv_floor_bytes         = 6 * kGib;
+        CapacityBetPlan previous     = plan_capacity_bet(swept);
+        for (std::uint64_t budget = kMib + 128 * kMib; budget <= 32 * kGib;
+             budget += 128 * kMib) {
+            swept.device_budget_bytes = budget;
+            const auto plan           = plan_capacity_bet(swept);
+            check(plan.expert_pool_bytes >= previous.expert_pool_bytes,
+                  "the floor never makes the pool shrink as the Device grows");
+            check(plan.kv_pages_bytes >= previous.kv_pages_bytes,
+                  "the floor never makes the pages shrink as the Device grows");
+            previous = plan;
+        }
+    }
+}
+
 void test_measured_evidence_steers_auto() {
     // Nothing measured: the structural rule (C at 21 GiB).
     const auto unknown = plan_capacity_bet(canonical(21 * kGib, ControllerMode::Auto));
@@ -324,6 +393,7 @@ int main() {
     test_headroom_is_deducted_before_the_bet();
     test_a_device_that_cannot_hold_one_slot_is_infeasible();
     test_the_ask_is_the_whole_set_not_one_window();
+    test_the_arena_floor_overrides_the_kv_target();
     test_measured_evidence_steers_auto();
     test_the_pool_stays_slot_aligned();
     test_kv_alignment_when_a_page_size_is_named();

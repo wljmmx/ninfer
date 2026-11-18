@@ -29,6 +29,19 @@
 // every mode returns A (experts fully resident) with `bet_exercised == false`, because there is no
 // bet to take - that case is reported, not silently relabelled.
 //
+// THE ARENA'S FLOOR (V10-78). C's "both give a little" takes pages away from the KV leg, and a plan
+// that has to serve the whole context resident cannot build that either: the arena's own minimum is
+// priced from `page_count(max_context)` (program/planning/startup.cpp:1291), so a KV figure under
+// it is refused at startup and the bytes the bet handed back are never released
+// (model_instance.cpp:357). On 35B e2 at `--max-context 65536` the pinned arena is 1024 pages
+// (1436 MiB) and that IS the floor, so C printed 1145 MiB while the run kept all 1024 pages. A
+// letter that names a priority the engine does not apply is the same defect A had, so the KV side
+// is never priced below `kv_floor_bytes` when no resident-KV leg exists: the pages keep the floor,
+// the pool takes the remainder, and `choice` follows those bytes - B's shape, because that is the
+// priority that was applied. The rule's own figure stays in `kv_target_bytes`, so a caller prints
+// the target beside the realised split. A tiered leg names a floor of zero: there pages may leave
+// the Device, and C remains a distinct arrangement.
+//
 // A'S PRECONDITION (V10-74). A pays for the pool out of the KV leg, so the pages the remainder does
 // not cover have to live on Host and be read back when a step asks for them - and a step asks for
 // every page of the history. That capability, a resident-KV leg, does not exist today: the Host KV
@@ -137,6 +150,10 @@ struct CapacityBetRequest {
     // The planning allowance the device cap carries (Graph capture, weight staging). Deducted first,
     // exactly as `plan_device_split()` deducts it, so the two cannot disagree about the ceiling.
     std::uint64_t startup_headroom_bytes = 0;
+    // The arena's own floor: the Device bytes a plan must keep for KV to serve the whole context.
+    // A figure below it cannot be built without a resident-KV leg (THE ARENA'S FLOOR), so the KV
+    // side is never priced below it. Zero means "no floor" - a tiered leg may move pages to Host.
+    std::uint64_t kv_floor_bytes = 0;
     // One expert slot: the pool holds whole slots, and this is also the pool's alignment.
     std::uint64_t expert_slot_bytes = 0;
     // Slots one bank's window needs (the widest bank). This is the pool's FLOOR, not its ask: a
@@ -189,6 +206,12 @@ struct CapacityBetPlan {
     // that only wants to log a tight run can gate on this instead of re-deriving it.
     bool        bet_exercised = false;
     const char* reason        = "no request";
+
+    // The KV figure the rule reached before the arena's floor raised it, and whether it did. False
+    // (and the target equal to `kv_pages_bytes`) when the floor did not bind. A caller prints the
+    // pair, never the target alone, so the difference stays visible (THE ARENA'S FLOOR).
+    std::uint64_t kv_target_bytes  = 0;
+    bool          kv_floor_applied = false;
 
     // Echo of the request, so a caller logs one object instead of two, and - when A was on the
     // table and could not be taken - the sentence that says why, ready to print. A null refusal
@@ -400,6 +423,26 @@ plan_capacity_bet(const CapacityBetRequest& request,
         plan.expert_pool_bytes = request.expert_slot_bytes;
         plan.kv_pages_bytes    = budget > request.expert_slot_bytes ? budget - request.expert_slot_bytes
                                                                     : 0;
+    }
+    // THE ARENA'S FLOOR: a KV figure under it is not a smaller KV leg, it is a plan the arena can
+    // not build (startup prices the minimum from max_context), so those bytes are never released
+    // and the printed split would describe a run that does not exist. The rule's target is kept;
+    // the bytes become the arrangement that runs - the pages keep the floor, the pool takes the
+    // rest - and the letter follows those bytes, because the line must name the priority applied.
+    // A leg that reads pages back from Host has no floor here: the caller names zero for it.
+    const std::uint64_t kv_floor = std::min(request.kv_floor_bytes, kv);
+    if (plan.bet_exercised && !request.resident_kv_leg && plan.kv_pages_bytes < kv_floor) {
+        const std::uint64_t reserve = std::min(budget, request.expert_slot_bytes);
+        plan.kv_target_bytes        = plan.kv_pages_bytes;
+        plan.kv_floor_applied       = true;
+        // The floor may not eat the pool's last slot, but a Device that cannot hold both is a
+        // startup fault in its own right - the caller fails loud there, it does not run this plan.
+        plan.kv_pages_bytes    = std::min(kv_floor, budget - reserve);
+        plan.expert_pool_bytes = std::min(experts, detail::round_down(budget - plan.kv_pages_bytes,
+                                                                      request.expert_slot_bytes));
+        plan.choice = plan.kv_pages_bytes >= kv ? CapacityBet::KvFirst : CapacityBet::BothGive;
+        plan.reason = "the KV target is below the arena's floor (the pages a resident context "
+                      "needs): the pages keep their floor and the pool takes the remainder";
     }
     // After rounding the two claims may leave a byte or two unclaimed (an eight-byte alignment).
     // That is reported as a smaller total, never silently handed to the other consumer: both lines

@@ -113,6 +113,7 @@ struct CapacityRebindRequest {
 [[nodiscard]] core::CapacityBetRequest capacity_bet_request(std::size_t free_bytes,
                                                            std::size_t kv_reserve_bytes,
                                                            std::size_t headroom_bytes,
+                                                           std::size_t kv_floor_bytes,
                                                            std::uint64_t slot_bytes,
                                                            std::uint64_t window_slots,
                                                            std::uint64_t full_slots,
@@ -120,6 +121,11 @@ struct CapacityRebindRequest {
     core::CapacityBetRequest request;
     request.device_budget_bytes    = free_bytes;
     request.startup_headroom_bytes = headroom_bytes;
+    // V10-78: the arena's own minimum, the same number the rebind gate below reads. A KV figure
+    // under it is refused at startup (startup.cpp:1291 prices it from max_context), so the bet must
+    // not price one - the pages would never be released and the printed split would be fiction.
+    // A tiered leg names zero here: there pages may leave the Device.
+    request.kv_floor_bytes         = kv_floor_bytes;
     request.expert_slot_bytes      = slot_bytes;
     request.expert_window_slots    = window_slots;
     // The ask is the whole routed set (every bank's window): "experts fully resident" in the bet's
@@ -167,13 +173,21 @@ void report_capacity_bet(const char* what, const core::CapacityBetRequest& reque
     }
     std::fprintf(stderr,
                  "[plan] capacity %s: choice=%s(%s) asked=%llu+%llu MiB reason=%s "
-                 "expert_pool_mb=%llu kv_pages_mb=%llu achieved_pool_mb=%llu\n",
+                 "expert_pool_mb=%llu kv_pages_mb=%llu achieved_pool_mb=%llu",
                  what, core::capacity_bet_name(plan.choice), core::capacity_bet_label(plan.choice),
                  static_cast<unsigned long long>(request.expert_ask_bytes() >> 20),
                  static_cast<unsigned long long>(request.kv_ask_bytes() >> 20), plan.reason,
                  static_cast<unsigned long long>(plan.expert_pool_bytes >> 20),
                  static_cast<unsigned long long>(plan.kv_pages_bytes >> 20),
                  static_cast<unsigned long long>(achieved_pool_bytes >> 20));
+    // V10-78: what the rule asked for when the arena's floor overrode it. Printed on the same line
+    // as the realised figure, so "the plan wanted 1145, the arena keeps 1436" is one sentence and
+    // not two reports that contradict each other.
+    if (plan.kv_floor_applied) {
+        std::fprintf(stderr, " kv_target_mb=%llu",
+                     static_cast<unsigned long long>(plan.kv_target_bytes >> 20));
+    }
+    std::fputc('\n', stderr);
     std::fflush(stderr);
 }
 
@@ -305,7 +319,7 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     //     second refusal is an error.
     const auto request =
         capacity_bet_request(free_bytes, kv_reserve_bytes, options.startup_planning_headroom_bytes,
-                             entry, widest, routed_slots, options.max_context);
+                             kv_floor_bytes, entry, widest, routed_slots, options.max_context);
     const auto bet   = core::plan_capacity_bet(request);
     const bool tight = widest != 0 && capacity / entry < widest;
     if (tight && capacity != 0) {
@@ -337,7 +351,8 @@ ExpertPlacement attach_expert_cache(ModelInstance& instance, const EngineOptions
     // below the reservation is alignment noise, and re-pricing the arena for it would be a re-plan
     // that buys nothing. The second bound is the arena's own contract: a plan below its floor
     // cannot serve max_context, so asking the caller for one is asking for a refusal that costs a
-    // second attach. A tiered KV leg names a floor of zero - pages may leave the Device there.
+    // second attach. V10-78 makes the bet itself respect that floor, so this is now a second belt;
+    // it stays because a tiered KV leg names a floor of zero and may release it all.
     const bool moves_bytes = bet.feasible && bet.expert_pool_bytes > capacity && release >= entry &&
                              bet.kv_pages_bytes >= kv_floor_bytes &&
                              (pool_from_split || capacity == 0);
