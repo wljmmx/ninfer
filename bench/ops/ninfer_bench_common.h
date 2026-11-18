@@ -26,6 +26,7 @@
 #include <cstring>
 #include <functional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -538,6 +539,17 @@ inline Result bench_loop_prepared(const launch_fn& prepare, const launch_fn& lau
     return result;
 }
 
+// The share of the device's roofline, in one place because every report prints it and each used to
+// divide by a peak that can be zero. "(x.x% of N GB/s)" when the attribute query succeeded,
+// "(roofline n/a)" when it did not: an `inf` there is indistinguishable from a real reading.
+inline std::string roofline_share(double value, double peak, int precision = 1) {
+    if (!(peak > 0.0)) { return "(roofline n/a)"; }
+    char buffer[96];
+    std::snprintf(buffer, sizeof(buffer), "(%*.*f%% of %.0f)", 3 + precision, precision,
+                  value / peak * 100.0, peak);
+    return std::string(buffer);
+}
+
 inline void print_result(const char* tag, const Result& r) {
     const double roofline = device_peak_bw_gbs();
     if (roofline > 0.0) {
@@ -547,8 +559,8 @@ inline void print_result(const char* tag, const Result& r) {
             tag, r.median_us, r.min_us, r.p95_us, r.gbs, r.gbs / roofline * 100.0, roofline);
     } else {
         std::printf(
-            "%-32s median=%8.2f us  min=%8.2f us  p95=%8.2f us  %8.1f GB/s  (roofline n/a)\n",
-            tag, r.median_us, r.min_us, r.p95_us, r.gbs);
+            "%-32s median=%8.2f us  min=%8.2f us  p95=%8.2f us  %8.1f GB/s  (roofline n/a)\n", tag,
+            r.median_us, r.min_us, r.p95_us, r.gbs);
     }
 }
 

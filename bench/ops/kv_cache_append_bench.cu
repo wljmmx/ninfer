@@ -593,14 +593,15 @@ void report(const Result& result) {
                 "execution=%-5s cache=%-4s T=%4d C=%4d max_count=%d graph_nodes=%zu graph_calls=%d "
                 "median=%8.3f us min=%8.3f us p95=%8.3f us "
                 "logical=%.0f physical=%.0f (K=%.0f V=%.0f) useful=%8.1f GB/s "
-                "(%5.1f%% of %.0f)\n",
+                " %s\n",
                 mode_name(result.mode), result.geometry, storage_name(result.storage),
                 result.layout, result.batch, result.cyclic_capacity,
                 execution_name(result.execution), cache_name(result.cache), result.tokens,
                 result.committed, result.max_count, result.graph_nodes, result.graph_calls,
                 result.timing.median_us, result.timing.min_us, result.timing.p95_us,
                 result.logical_cache_bytes, result.physical_cache_bytes, result.key_vector_bytes,
-                result.value_vector_bytes, gbps, gbps / bench::device_peak_bw_gbs() * 100.0, bench::device_peak_bw_gbs());
+                result.value_vector_bytes, gbps,
+                bench::roofline_share(gbps, bench::device_peak_bw_gbs()).c_str());
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {

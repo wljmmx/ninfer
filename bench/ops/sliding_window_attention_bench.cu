@@ -349,13 +349,14 @@ void report(const Result& result) {
                 "max_L=%d key_block=%d reduce_warps=%d route=%s splits=%d graph_nodes=%zu "
                 "graph_calls=%d workspace=%8zu "
                 "median=%9.3f us min=%9.3f us p95=%9.3f us "
-                "useful=%8.1f GB/s (%5.1f%% of %.0f) math=%7.2f TFLOP/s (%5.1f%% of %.1f)\n",
+                "useful=%8.1f GB/s %s math=%7.2f TFLOP/s (%5.1f%% of %.1f)\n",
                 execution_name(result.execution), cache_name(result.cache), result.window,
                 result.tokens, result.batch, result.context, result.envelope_max, result.key_block,
                 result.reduce_warps, ops::detail::sliding_window_attention_route_name(result.route),
                 result.split_capacity, result.graph_nodes, result.graph_calls,
                 result.workspace_bytes, result.timing.median_us, result.timing.min_us,
-                result.timing.p95_us, gbps, gbps / bench::device_peak_bw_gbs() * 100.0, bench::device_peak_bw_gbs(), tflops,
+                result.timing.p95_us, gbps,
+                bench::roofline_share(gbps, bench::device_peak_bw_gbs()).c_str(), tflops,
                 tflops / kDenseBf16TcTflops * 100.0, kDenseBf16TcTflops);
 }
 

@@ -298,11 +298,12 @@ void report(const Result& result) {
     const double tflops  = result.useful_flops / seconds / 1.0e12;
     std::printf("entry=context execution=%-5s cache=%-4s T=%2d L=%6d workspace=%8zu "
                 "median=%9.3f us min=%9.3f us p95=%9.3f us useful=%8.1f GB/s "
-                "(%5.1f%% of %.0f) math=%7.2f TFLOP/s (%5.1f%% of %.1f)\n",
+                "%s math=%7.2f TFLOP/s (%5.1f%% of %.1f)\n",
                 execution_name(result.execution), cache_name(result.cache), result.tokens,
                 result.context, result.workspace_bytes, result.timing.median_us,
-                result.timing.min_us, result.timing.p95_us, gbps, gbps / bench::device_peak_bw_gbs() * 100.0,
-                bench::device_peak_bw_gbs(), tflops, tflops / kDenseBf16TcTflops * 100.0, kDenseBf16TcTflops);
+                result.timing.min_us, result.timing.p95_us, gbps,
+                bench::roofline_share(gbps, bench::device_peak_bw_gbs()).c_str(), tflops,
+                tflops / kDenseBf16TcTflops * 100.0, kDenseBf16TcTflops);
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {

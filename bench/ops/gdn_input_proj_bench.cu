@@ -255,12 +255,12 @@ void report(const Result& result) {
     std::printf("entry=gdn_input_proj format=%-6s policy=%-3s cache=%-4s execution=%-5s "
                 "graph_nodes=%zu T=%4d "
                 "workspace=%9zu median=%9.3f us min=%9.3f us p95=%9.3f us "
-                "logical=%8.1f GB/s (%5.1f%% of %.0f) math=%8.2f TFLOP/s\n",
+                "logical=%8.1f GB/s %s math=%8.2f TFLOP/s\n",
                 result.format, result.policy, cache_name(result.cache),
                 result.graph_nodes ? "graph" : "eager", result.graph_nodes, result.tokens,
                 result.workspace_bytes, result.timing.median_us, result.timing.min_us,
-                result.timing.p95_us, gbps, gbps / bench::device_peak_bw_gbs() * 100.0, bench::device_peak_bw_gbs(),
-                tflops);
+                result.timing.p95_us, gbps,
+                bench::roofline_share(gbps, bench::device_peak_bw_gbs()).c_str(), tflops);
 }
 
 void append_result(std::vector<Result>& results, const char* format, const char* policy,
@@ -321,8 +321,7 @@ void run_q4q5(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t 
     DeviceBuffer qkv(static_cast<std::size_t>(kQkRows + kValueRows) * max_tokens * 2);
     DeviceBuffer z(static_cast<std::size_t>(kZRows) * max_tokens * 2);
     // The two-parent route takes its transient scratch from the caller workspace.
-    const std::int32_t min_tokens =
-        *std::min_element(options.tokens.begin(), options.tokens.end());
+    const std::int32_t min_tokens = *std::min_element(options.tokens.begin(), options.tokens.end());
     const std::size_t public_workspace = ops::w4a8_gdn_input_workspace_capacity_bytes(
         kQkRows, kValueRows + kZRows, kHidden, min_tokens, max_tokens);
     WorkspaceArena workspace(std::max<std::size_t>(public_workspace, 256));
@@ -331,8 +330,8 @@ void run_q4q5(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t 
             Tensor x(input.p, DType::BF16, {kHidden, tokens});
             Tensor tqkv(qkv.p, DType::BF16, {kQkRows + kValueRows, tokens});
             Tensor tz(z.p, DType::BF16, {kZRows, tokens});
-            ops::gdn_input_proj(x, qk.weight, value_z.weight, tqkv, tz,
-                                ops::LinearPolicy::AllowA8, workspace, launch_stream);
+            ops::gdn_input_proj(x, qk.weight, value_z.weight, tqkv, tz, ops::LinearPolicy::AllowA8,
+                                workspace, launch_stream);
         };
     };
     measure_points(

@@ -203,10 +203,10 @@ void report(const Result& result) {
     const double gbps    = result.useful_bytes / seconds / 1.0e9;
     std::printf("entry=prepare_masked_block execution=%-5s cache=%-4s B=%2d "
                 "median=%7.3f us min=%7.3f us p95=%7.3f us useful=%7.4f GB/s "
-                "(%7.4f%% of %.0f)\n",
+                "%s\n",
                 execution_name(result.execution), cache_name(result.cache), result.block_size,
                 result.timing.median_us, result.timing.min_us, result.timing.p95_us, gbps,
-                gbps / bench::device_peak_bw_gbs() * 100.0, bench::device_peak_bw_gbs());
+                bench::roofline_share(gbps, bench::device_peak_bw_gbs(), 4).c_str());
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {
