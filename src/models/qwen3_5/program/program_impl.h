@@ -732,17 +732,33 @@ public:
                                           const std::vector<std::uint32_t>& keep_pages);
     void stage_step_kv_pages(KVAddressSpaceStore& addresses, PagedKVCache& cache,
                              KVAddressSpaceHandle address);
+    // port (sm_89, V10-80): the same pass for the speculative backend's KV
+    // (`sequence.kv->backend`). It has its own page store, its own execution rows and its own pool,
+    // but the same demotion gives its pages back and the same draft attention addresses them, so
+    // the step that reads them needs the same restore. A no-op unless the leg is on and the arena
+    // is tiered.
+    void stage_step_backend_kv_pages(SequenceState& state);
     // port (sm_89, V10-79): is the Device arena smaller than the logical page space? The live pool
     // edge is the authority, so a DECLARED arena (NINFER_KV_EVICT_CAPACITY) is tiered even though
     // the plan's two page counts are equal.
     [[nodiscard]] bool kv_arena_tiered() const noexcept;
-    // The last page-in pass, per row: addressed pages with no Device replica, how many were copied
-    // back, and how many had to be given back to make room.
-    std::uint32_t last_page_in_candidates_ = 0;
-    std::uint32_t last_page_in_fetched_    = 0;
-    std::uint32_t last_page_in_evicted_    = 0;
-    // One shot per Program: NINFER_KV_PAGE_IN_PROBE fires once, so a run is reproducible.
-    bool page_in_probe_done_ = false;
+
+    // The last page-in pass, per address space: addressed pages with no Device replica, how many
+    // were copied back, and how many had to be given back to make room. Indexed by space because
+    // the backend pass runs after the text one inside the same step (V10-80), and one set of
+    // counters would make the pool-account dump report whichever ran last.
+    struct PageInCounters {
+        std::uint32_t candidates = 0;
+        std::uint32_t fetched    = 0;
+        std::uint32_t evicted    = 0;
+    };
+
+    PageInCounters last_page_in_[2];
+    [[nodiscard]] PageInCounters& page_in_counters(KVAddressSpaceStore& addresses) noexcept;
+    // One shot per space: NINFER_KV_PAGE_IN_PROBE fires once for the text KV and once for the
+    // backend, so a run is reproducible and a speculative run executes the round trip inside a real
+    // step for both address spaces instead of only the first one it reaches.
+    std::array<bool, 2> page_in_probe_done_{};
     // Pages the last demotion actually moved to Host, reported in the pool-account file so "the switch
     // did something" is measured instead of assumed (appendix FF).
     std::uint32_t last_demoted_pages_     = 0;

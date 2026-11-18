@@ -129,6 +129,15 @@ ninfer_add_test(ninfer_qwen3_5_kv_page_in_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_kv_page_in_real.cpp"
   LIBRARIES ninfer_engine)
 
+# port (sm_89, V10-80): the same leg on the speculative backend's KV. The MTP draft cache is a
+# second paged space with its own pool and its own execution row, and the demotion empties it by the
+# same rules - so the draft step that addresses it needs the same restore. The probe fires once per
+# address space, and the fetched-page count distinguishes the two: with the backend in the leg it is
+# twice the probe's page count, and the tokens are the fully resident run's tokens.
+ninfer_add_test(ninfer_qwen3_5_kv_page_in_spec_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_kv_page_in_spec_real.cpp"
+  LIBRARIES ninfer_engine)
+
 ninfer_add_test(ninfer_qwen3_5_expert_stream_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_stream_real.cpp"
   LIBRARIES ninfer_artifact ninfer_ops ninfer_core)
@@ -245,6 +254,7 @@ set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_dflash_real_test
   ninfer_qwen3_5_kv_tier_real_test
   ninfer_qwen3_5_kv_page_in_real_test
+  ninfer_qwen3_5_kv_page_in_spec_real_test
   ninfer_qwen3_5_expert_stream_real_test
   ninfer_qwen3_5_resize_under_load_real_test
   ninfer_qwen3_5_resize_handoff_real_test

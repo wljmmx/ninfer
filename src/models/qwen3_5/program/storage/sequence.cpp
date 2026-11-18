@@ -673,6 +673,14 @@ bool ProgramImpl::kv_arena_tiered() const noexcept {
     return residency_device_page_capacity() < kv_logical_page_groups;
 }
 
+// port (sm_89, V10-80): which space's page-in counters a helper is reporting into. The two spaces
+// are told apart exactly as the page store is chosen in the helpers, which is by the address store
+// they belong to, so a helper needs no extra argument.
+ProgramImpl::PageInCounters&
+ProgramImpl::page_in_counters(KVAddressSpaceStore& addresses) noexcept {
+    return last_page_in_[&addresses == text_kv_addresses.get() ? 0 : 1];
+}
+
 std::uint32_t ProgramImpl::kv_residency_token_limit() const noexcept {
     // No residency contract: the Device pool holds every logical page, so there is no bound to
     // report (0 is the "unbounded" answer the Runtime tests for).
@@ -819,6 +827,12 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& state, std::uint32_t 
     // tiered arena (a fully resident pool never enters, so no frozen gate can move).
     if (kv_page_in_enabled() && kv_arena_tiered()) {
         stage_step_kv_pages(*text_kv_addresses, decoder->text_kv, state.kv->text);
+        // port (sm_89, V10-80): the speculative backend's cache is a second, separately paged space
+        // that the same demotion empties and the same draft attention reads (MTP: the whole
+        // history; DFlash: the full-attention draft layers). Its pass follows the text one for the
+        // reason above - the backend's own window has just run - and its helpers are the same
+        // three.
+        stage_step_backend_kv_pages(state);
     }
 }
 
@@ -1370,7 +1384,7 @@ bool ProgramImpl::demote_page_for_room(KVAddressSpaceStore& addresses, PagedKVCa
                                                          .page_end   = page + 1U});
     }
     if (!pages->demote_device_replica(handle)) { return false; }
-    ++last_page_in_evicted_;
+    ++page_in_counters(addresses).evicted;
     kv_tier_stats().spilled_pages += 1;
     kv_tier_stats().spilled_bytes += tier_copy.payload_bytes;
     return true;
@@ -1390,8 +1404,9 @@ std::uint32_t ProgramImpl::page_in_addressed_pages(KVAddressSpaceStore& addresse
                                                    std::uint32_t sink_pages,
                                                    std::uint32_t window_pages,
                                                    const std::vector<std::uint32_t>& keep_pages) {
-    last_page_in_candidates_ = 0;
-    last_page_in_fetched_    = 0;
+    PageInCounters& counters = page_in_counters(addresses);
+    counters.candidates      = 0;
+    counters.fetched         = 0;
     if (host_kv_extents == nullptr) { return 0; }
     LogicalKVPageStore* const pages =
         &addresses == text_kv_addresses.get() ? text_kv_pages.get() : backend_kv_pages.get();
@@ -1413,7 +1428,7 @@ std::uint32_t ProgramImpl::page_in_addressed_pages(KVAddressSpaceStore& addresse
             spare.push_back(page);
         }
     }
-    last_page_in_candidates_ = static_cast<std::uint32_t>(wanted.size());
+    counters.candidates = static_cast<std::uint32_t>(wanted.size());
     if (wanted.empty()) { return 0; }
     std::size_t spare_cursor = 0;
     for (const std::uint32_t page : wanted) {
@@ -1442,11 +1457,11 @@ std::uint32_t ProgramImpl::page_in_addressed_pages(KVAddressSpaceStore& addresse
             const std::span<const DeviceKVPageHandle> restored(&destination, 1);
             cache.execution_tables().publish(fetch_row, page, restored, device.stream);
         }
-        ++last_page_in_fetched_;
+        ++counters.fetched;
         kv_tier_stats().fetched_pages += 1;
         kv_tier_stats().fetched_bytes += work.payload_bytes;
     }
-    return last_page_in_candidates_ - last_page_in_fetched_;
+    return counters.candidates - counters.fetched;
 }
 
 // port (sm_89, V10-79): one step's page-in, with the step's own addressed set. The window decides
@@ -1493,43 +1508,63 @@ void ProgramImpl::stage_step_kv_pages(KVAddressSpaceStore& addresses, PagedKVCac
     }
     const std::uint32_t missing =
         page_in_addressed_pages(addresses, cache, address, live, sink_pages, eff_window, keep);
+    const PageInCounters& staged = page_in_counters(addresses);
     if (missing != 0) {
+        // The pool in the message is the one this pass drew from, not the text pool: with a
+        // speculative backend the two differ, and naming the wrong one would send a reader looking
+        // at the space that is not short.
         throw std::runtime_error(
             "KV page-in could not restore every addressed page before the step: addressed=" +
-            std::to_string(last_page_in_candidates_) + " restored=" +
-            std::to_string(last_page_in_fetched_) + " missing=" + std::to_string(missing) +
-            " (Device pool " + std::to_string(residency_device_page_capacity()) +
-            " page group(s) of " + std::to_string(kv_logical_page_groups) +
-            " logical, Host payload " + std::to_string(host_kv_payload_bytes >> 20) +
+            std::to_string(staged.candidates) + " restored=" + std::to_string(staged.fetched) +
+            " missing=" + std::to_string(missing) + " (Device pool " +
+            std::to_string(cache.page_pool().capacity_pages()) + " page group(s) of " +
+            std::to_string(kv_logical_page_groups) + " logical, Host payload " +
+            std::to_string(host_kv_payload_bytes >> 20) +
             " MiB). A page this step does not address has to exist to be given back; the "
             "full-attention layers address the whole history, so the pool must cover it.");
     }
     // Verification knob (default off): give back part of the set the pass just staged and stage it
     // again, so the round trip Host -> Device -> Host -> Device is executed inside a real step and
-    // the tokens must not move. One shot per Program: the point is a deterministic, inspectable
-    // event, not a standing cost.
+    // the tokens must not move. One shot per address space: the point is a deterministic,
+    // inspectable event, not a standing cost - and with a speculative backend the backend space
+    // needs its own shot, otherwise the second space would never be exercised.
     const std::uint32_t probe = kv_page_in_probe_pages();
-    if (probe == 0 || page_in_probe_done_ || live == 0) { return; }
-    page_in_probe_done_           = true;
+    bool& probe_done          = page_in_probe_done_[&addresses == text_kv_addresses.get() ? 0 : 1];
+    if (probe == 0 || probe_done || live == 0) { return; }
+    probe_done                    = true;
     const std::uint32_t probe_end = std::min({live, addresses.mapped_pages(address), probe});
     std::uint32_t given_back      = 0;
     for (std::uint32_t page = 0; page < probe_end; ++page) {
         if (demote_page_for_room(addresses, cache, address, page)) { ++given_back; }
     }
-    const std::uint32_t staged_before = last_page_in_fetched_;
+    const std::uint32_t staged_before = staged.fetched;
     const std::uint32_t again =
         page_in_addressed_pages(addresses, cache, address, live, sink_pages, eff_window, keep);
     std::fprintf(stderr,
-                 "[kv-page-in] probe: staged=%u demoted=%u refetched=%u missing=%u live=%u "
+                 "[kv-page-in] probe %s: staged=%u demoted=%u refetched=%u missing=%u live=%u "
                  "pool=%u/%u\n",
-                 staged_before, given_back, last_page_in_fetched_, again, live,
-                 residency_device_page_capacity(), kv_logical_page_groups);
+                 &addresses == text_kv_addresses.get() ? "text" : "backend", staged_before,
+                 given_back, staged.fetched, again, live, cache.page_pool().capacity_pages(),
+                 kv_logical_page_groups);
     std::fflush(stderr);
     if (again != 0) {
         throw std::runtime_error("KV page-in probe: the re-fetch after the induced demotion left " +
                                  std::to_string(again) +
                                  " addressed page(s) without a Device replica");
     }
+}
+
+// port (sm_89, V10-80): the speculative backend's half of the same leg. The draft cache has its own
+// page store and its own execution row (io.backend_kv_table_row / active_backend_kv_table_rows_),
+// but the demotion gives its pages back by exactly the same rules (apply_kv_eviction_window runs
+// for it too), so the step that makes the draft address them has to restore them by the same rules.
+// The helpers are already parameterised by address space and cache, so this is only the call - and
+// the two guards that keep a default run identical: the switch, and a tiered arena.
+void ProgramImpl::stage_step_backend_kv_pages(SequenceState& state) {
+    if (!state.kv || !state.kv->backend || !kv_page_in_enabled() || !kv_arena_tiered()) { return; }
+    PagedKVCache* const cache = backend_kv_cache();
+    if (cache == nullptr) { return; }
+    stage_step_kv_pages(*backend_kv_addresses, *cache, *state.kv->backend);
 }
 
 // appendix EY (P3a): the Device page pool's own account - allocated / reserved / available /
@@ -1596,10 +1631,17 @@ void ProgramImpl::dump_pool_account(PagedKVCache& cache) {
         << " fetched_bytes=" << kv_tier_stats().fetched_bytes
         << " preempted_checkpoints=" << kv_tier_stats().preempted_checkpoints << '\n';
     // V10-79: the page-in leg's own pass, so "a page left the Device and was read back" is a line a
-    // reader can check instead of an inference from the cumulative counters above.
-    out << "# page_in candidates=" << last_page_in_candidates_
-        << " fetched=" << last_page_in_fetched_ << " evicted=" << last_page_in_evicted_
+    // reader can check instead of an inference from the cumulative counters above. V10-80 keeps the
+    // text line's meaning by giving the speculative backend's pass a line of its own: both run
+    // inside the same step, so one set of counters would report whichever ran last.
+    out << "# page_in candidates=" << last_page_in_[0].candidates
+        << " fetched=" << last_page_in_[0].fetched << " evicted=" << last_page_in_[0].evicted
         << " tiered=" << (kv_arena_tiered() ? 1 : 0) << '\n';
+    if (backend_kv_cache() != nullptr) {
+        out << "# page_in_backend candidates=" << last_page_in_[1].candidates
+            << " fetched=" << last_page_in_[1].fetched << " evicted=" << last_page_in_[1].evicted
+            << '\n';
+    }
 }
 
 void ProgramImpl::dump_page_scores(KVAddressSpaceStore& addresses, PagedKVCache& cache,
