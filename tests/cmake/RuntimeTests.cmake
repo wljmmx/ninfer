@@ -58,3 +58,9 @@ add_test(NAME ninfer_json_schema_oracle_test
 ninfer_add_test(ninfer_capacity_bet_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_capacity_bet.cpp"
   LIBRARIES ninfer_core)
+
+# V10-75: the host tier's ask. Pure (runtime/engine/host_arena_budget.h), so the branch that a
+# healthy box cannot reach - a measured zero commit budget - is still under test, and "the budget
+# could not be measured" is asserted to be a different answer from "the budget is zero".
+ninfer_add_test(ninfer_host_arena_budget_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_host_arena_budget.cpp")

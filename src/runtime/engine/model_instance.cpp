@@ -8,6 +8,7 @@
 #include "core/memory_budget.h"
 #include "core/startup.h"
 #include "runtime/engine/context_capacity.h"
+#include "runtime/engine/host_arena_budget.h"
 #include "models/qwen3_5/execution/cpu_path_policy.h"
 #include "models/qwen3_5/execution/expert_prefetch.h"
 #include "models/qwen3_5/execution/expert_path_control.h"
@@ -24,6 +25,7 @@
 #include <cstring>
 #include <chrono>
 #include <filesystem>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -43,7 +45,7 @@ std::uint64_t host_expert_arena_bytes(std::uint64_t want_bytes);
 std::uint64_t current_free_host_bytes();
 models::qwen3_5::execution::HostArenaBlock allocate_host_arena(std::uint64_t want_bytes,
                                                                bool          exact);
-std::uint64_t current_commit_headroom_bytes();
+std::optional<std::uint64_t> current_commit_headroom_bytes();
 std::uint64_t readahead_bytes(std::span<const ExpertBankLayout> banks);
 std::uint64_t second_chance_budget_bytes(std::span<const ExpertBankLayout> banks);
 using Clock = std::chrono::steady_clock;
@@ -1074,7 +1076,9 @@ std::uint64_t current_free_host_bytes() {
 // the 17.5 GiB pool held, `GlobalMemoryStatusEx` reported avail commit 23.3 GiB before the arena and
 // the 22.4 GiB default arena succeeded. Physical RAM alone is not this number, which is why the
 // arena's share of free RAM overshoots on a machine that also holds a 22 GiB expert pool.
-std::uint64_t current_commit_headroom_bytes() {
+// nullopt means "this box cannot be measured", which is a different answer from a measured zero -
+// see runtime/engine/host_arena_budget.h for why the two must not share a return value.
+std::optional<std::uint64_t> current_commit_headroom_bytes() {
 #if defined(_WIN32)
     MEMORYSTATUSEX status{};
     status.dwLength = sizeof(status);
@@ -1086,7 +1090,7 @@ std::uint64_t current_commit_headroom_bytes() {
         return status.ullAvailPageFile > kReserve ? status.ullAvailPageFile - kReserve : 0;
     }
 #endif
-    return 0;
+    return std::nullopt;
 }
 
 // port (sm_89): R3's bytes, asked for before the arena exists so the ledger is told the truth
@@ -1131,22 +1135,25 @@ std::uint64_t second_chance_budget_bytes(std::span<const ExpertBankLayout> banks
 // `exact` is the explicit-override form (NINFER_EXPERT_HOST_ARENA_MB): a size the caller named is
 // asked for as named, with no clamp - otherwise an impossible experiment would silently run at a
 // smaller arena and the numbers would not be comparable. A refusal there is the caller's error.
+//
+// A measured zero headroom is not "no clamp" any more (V10-75): it is the answer that the block
+// cannot exist, and host_arena_ask() keeps it apart from "this box cannot be measured".
 models::qwen3_5::execution::HostArenaBlock allocate_host_arena(std::uint64_t want_bytes,
                                                                bool          exact) {
     models::qwen3_5::execution::HostArenaBlock block;
     if (want_bytes == 0) { return block; }
-    const std::uint64_t asked    = want_bytes;
-    const std::uint64_t headroom = current_commit_headroom_bytes();
-    const std::uint64_t len      = (!exact && headroom != 0)
-                                       ? std::min<std::uint64_t>(asked, headroom)
-                                       : asked;
+    const std::uint64_t                asked  = want_bytes;
+    const std::optional<std::uint64_t> budget = current_commit_headroom_bytes();
+    const std::uint64_t                len    = host_arena_ask(asked, budget, exact);
     if (len == 0) {
+        // Only a measured zero reaches this line: unknown budgets stand as named and a measurable
+        // budget above zero clamps to itself. Refusing here is what keeps the process's commit
+        // intact - an attempt the budget already says cannot be backed only spends it.
         std::fprintf(stderr,
-                     "[host] arena allocation failed: asked %llu MiB, but no commit headroom is left "
-                     "(%llu bytes available, a reserved gigabyte is not subtracted here) - the host "
-                     "expert tier cannot exist\n",
-                     static_cast<unsigned long long>(asked >> 20),
-                     static_cast<unsigned long long>(headroom));
+                     "[host] arena allocation failed: asked %llu MiB, but the commit budget has no "
+                     "headroom left for a pinned, mapped block (avail page file after the reserved "
+                     "gigabyte: 0 bytes) - the host expert tier cannot exist\n",
+                     static_cast<unsigned long long>(asked >> 20));
         std::fflush(stderr);
         throw std::runtime_error("expert host arena: no commit headroom for " +
                                  std::to_string(asked >> 20) + " MiB");
@@ -1154,6 +1161,10 @@ models::qwen3_5::execution::HostArenaBlock allocate_host_arena(std::uint64_t wan
     void*      locked = nullptr;
     const auto status =
         cudaHostAlloc(&locked, static_cast<std::size_t>(len), cudaHostAllocMapped);
+    // Both lines below report the budget, and "unknown" is a real answer there: a box that could
+    // not be measured must not print as a box with zero headroom.
+    const std::string headroom =
+        budget.has_value() ? std::to_string(*budget >> 20) + " MiB" : std::string("unknown");
     if (status == cudaSuccess) {
         void*      device = nullptr;
         const auto alias  = cudaHostGetDevicePointer(&device, locked, 0);
@@ -1168,11 +1179,11 @@ models::qwen3_5::execution::HostArenaBlock allocate_host_arena(std::uint64_t wan
         block.device = device;
         block.bytes  = len;
         std::fprintf(stderr,
-                     "[host] arena allocated %llu MiB (asked %llu, commit headroom %llu) "
+                     "[host] arena allocated %llu MiB (asked %llu, commit headroom %s) "
                      "device_accessible=%d - the tier is sized from this\n",
                      static_cast<unsigned long long>(len >> 20),
-                     static_cast<unsigned long long>(asked >> 20),
-                     static_cast<unsigned long long>(headroom >> 20), device != nullptr ? 1 : 0);
+                     static_cast<unsigned long long>(asked >> 20), headroom.c_str(),
+                     device != nullptr ? 1 : 0);
         std::fflush(stderr);
         return block;
     }
@@ -1185,11 +1196,11 @@ models::qwen3_5::execution::HostArenaBlock allocate_host_arena(std::uint64_t wan
     // attempt follows: see the note above - a refusal has already spent the process's commit.
     std::fprintf(stderr,
                  "[host] arena allocation failed: asked %llu MiB (committed ask %llu MiB, headroom "
-                 "%llu MiB) (%s) - the host expert tier cannot exist, there is no pageable stand-in "
+                 "%s) (%s) - the host expert tier cannot exist, there is no pageable stand-in "
                  "for it, and no smaller retry after a refusal\n",
                  static_cast<unsigned long long>(asked >> 20),
-                 static_cast<unsigned long long>(len >> 20),
-                 static_cast<unsigned long long>(headroom >> 20), cudaGetErrorString(status));
+                 static_cast<unsigned long long>(len >> 20), headroom.c_str(),
+                 cudaGetErrorString(status));
     std::fflush(stderr);
     throw std::runtime_error("expert host arena: cudaHostAlloc(Mapped) refused " +
                              std::to_string(len >> 20) + " MiB of the " +
