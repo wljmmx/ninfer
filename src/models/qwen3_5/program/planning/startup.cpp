@@ -10,6 +10,7 @@
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/execution/workspace.h"
 #include "core/device.h"
+#include "core/draft_window.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/candidate_selector.h"
 #include "ninfer/ops/context_kv_materialize.h"
@@ -1219,6 +1220,50 @@ std::uint32_t clamped_draft_window(const execution::Parameters& parameters,
     return kDFlash2MaximumDraftTokens;
 }
 
+// V11-02: NINFER_DRAFT_WINDOW=cost takes the width from core/draft_window.h's rule (after strata's
+// DraftPolicy::best_rows) instead of the configured K. The rule needs a row cost, a fixed cost and
+// the expected per-column acceptance, and the engine has no per-round row timer to supply the first
+// two yet, so they are explicit knobs and a missing row cost is an error rather than a guess:
+//
+//   NINFER_DRAFT_WINDOW=cost        select the width with the rule
+//   NINFER_DRAFT_ROW_MS=<ms>        one draft+verify row (required when the switch is on)
+//   NINFER_DRAFT_FIXED_MS=<ms>      per-round fixed cost (default 0)
+//   NINFER_DRAFT_EXPECTED_P=<0..1>  per-column acceptance probability (default 0.8)
+//
+// The choice never goes below one row: draft_tokens=0 means "no speculation" to the planner, and a
+// cost rule that cannot pay for a single row is a configuration the caller should see, not a silent
+// shutdown of the backend.
+std::uint32_t cost_aware_draft_window(std::uint32_t requested) {
+    const char* mode = std::getenv("NINFER_DRAFT_WINDOW");
+    if (mode == nullptr || std::string_view(mode) != "cost") { return requested; }
+    const char* row_env = std::getenv("NINFER_DRAFT_ROW_MS");
+    if (row_env == nullptr || *row_env == '\0') {
+        throw std::invalid_argument(
+            "NINFER_DRAFT_WINDOW=cost needs NINFER_DRAFT_ROW_MS (one draft+verify row in ms)");
+    }
+    const double row_ms   = std::atof(row_env);
+    const double fixed_ms = [] {
+        const char* env = std::getenv("NINFER_DRAFT_FIXED_MS");
+        return env != nullptr && *env != '\0' ? std::atof(env) : 0.0;
+    }();
+    const double expected_p = [] {
+        const char* env = std::getenv("NINFER_DRAFT_EXPECTED_P");
+        return env != nullptr && *env != '\0' ? std::atof(env) : 0.8;
+    }();
+    const int width = core::cost_aware_width(expected_p, row_ms, fixed_ms, static_cast<int>(requested));
+    // By value: this is a function-local static, and a captured reference would dangle on the second
+    // construction in the same process.
+    static const bool told = [=] {
+        std::fprintf(stderr,
+                     "[draft] window=cost row=%.3f ms fixed=%.3f ms p=%.2f -> %d of %u draft rows\n",
+                     row_ms, fixed_ms, expected_p, std::max(1, width), requested);
+        std::fflush(stderr);
+        return true;
+    }();
+    (void)told;
+    return static_cast<std::uint32_t>(std::max(1, width));
+}
+
 // The draft-confidence floor is a per-round policy rather than a plan shape, so it rides the plan to
 // the round instead of resizing anything. NINFER_DRAFT_CONF overrides the option for A/Bs; zero keeps
 // every column, which is the shipped behaviour and leaves every number unchanged.
@@ -1291,7 +1336,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .capacity             = options.max_context,
         .max_concurrency      = options.max_concurrency,
         .prefill_chunk        = std::min(options.prefill_chunk, options.max_context),
-        .draft_window         = clamped_draft_window(parameters, options),
+            .draft_window         = cost_aware_draft_window(clamped_draft_window(parameters, options)),
         .speculative_backend  = options.speculative.backend,
         .kv_storage           = options.kv_cache,
         .proposal_head        = options.speculative.proposal_head,

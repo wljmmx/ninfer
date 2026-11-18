@@ -78,3 +78,10 @@ ninfer_add_test(ninfer_transfer_rate_test
 # could not be measured" is asserted to be a different answer from "the budget is zero".
 ninfer_add_test(ninfer_host_arena_budget_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_host_arena_budget.cpp")
+
+# V11-02: the cost-aware draft window. Pure (core/draft_window.h), so the rule that decides how
+# many draft rows pay for themselves - after strata's DraftPolicy::best_rows - is asserted against
+# an independent enumeration, including the non-convex cost case a threshold rule cannot express.
+ninfer_add_test(ninfer_draft_window_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_draft_window.cpp"
+  LIBRARIES ninfer_core)
