@@ -89,8 +89,15 @@ int run(DeviceContext& device, bool paired, int d, int m, bool alias, bool unali
         upload(dx, x);
         upload(dwx, wx);
         CUDA_CHECK(cudaMemcpy(mask.p, enabled.data(), m * 4, cudaMemcpyHostToDevice));
-        out.fill(0xff);
-        if (!alias) residual.fill(0xff);
+        // Fill on the kernel's own stream. cudaMemset is asynchronous with respect to the host and
+        // runs on the default stream, which this context does not use, so the sentinel and the
+        // launch have no ordering relation: the fill can land after the kernel and turn an element
+        // that was written back into 0xff. Measured before the fix: residual[0] kept the sentinel
+        // in about one run in fifteen at d=4096 m=65, always index 0 - the first element the
+        // comparison inspects.
+        CUDA_CHECK(cudaMemsetAsync(out.data(), 0xff, out.bytes(), device.stream));
+        if (!alias)
+            CUDA_CHECK(cudaMemsetAsync(residual.data(), 0xff, residual.bytes(), device.stream));
         if (replay && phase == 0) {
             definition.capture(device.stream, launch);
             graph.instantiate(definition);

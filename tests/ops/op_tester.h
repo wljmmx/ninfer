@@ -267,8 +267,14 @@ public:
 
     void fill(int byte_value = 0) {
         if (payload_bytes_ != 0) {
+            // cudaMemset is asynchronous with respect to the host and runs on the default stream,
+            // while fixtures launch on their own stream. Without a barrier the fill can land after
+            // the kernel and turn written elements back into the fill byte (measured: one run in
+            // fifteen at d=4096 m=65 in fused_rmsnorm, always the first element the check reads).
+            // Fixtures use fill as "this buffer now holds only the sentinel", so make it a barrier.
             cuda_check(cudaMemset(data(), byte_value, payload_bytes_),
                        "cudaMemset guarded payload");
+            cuda_check(cudaDeviceSynchronize(), "cudaDeviceSynchronize after guarded fill");
         }
     }
 
