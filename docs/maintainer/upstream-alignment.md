@@ -49,7 +49,7 @@
 
 | 项 | 设定 |
 |---|---|
-| 目标上游版本 | **`77c2e5e2`**（2026-11-07） |
+| 目标上游版本 | **`ebdc67e5`**（2026-11-17，已对齐到 upstream tip） |
 | 范围 | 只吸收 `77c2e5e2`，其余 62 条登记为 N/A（§2 表，逐类给出原因，不逐条搬） |
 | 拆分 | **a** 零 frontier 请求直接恢复进保存的生命周期（恢复容量保留到第一个新提交单元）；**b** 关闭顺序：先停 Engine 再 join HTTP worker，信号交给控制线程；**c** 观测字段：`direct/snapshot/replay` 恢复计数、replay frontier、service 归属与 last progress；**d** 回归夹具：异步 binding/preemption、blocked-replay 关闭 |
 | 与本地既有工作的关系 | T060（`970a5f58` 轮转/防跳过/压力期推迟 fresh admission）、T061（`ea100705` prepare→release→publish）已覆盖压力期准入；本轮是**恢复路径**与**关闭顺序**，不重叠 |
@@ -183,10 +183,10 @@ MTP experts Block-FP8 A8；GDN/QSA 大投影 Q8 A16；PLE 表 NF4。
 ```
 == upstream alignment report ==
 register : H:\TeleAgentWorks\ninfer-4090-port\ninfer\docs\maintainer\upstream-dispositions.tsv
-           1565 row(s), 6 class(es)
-upstream : upstream/master @ 77c2e5e2  2026-11-07  fix(runtime): recover preempted requests without stalling
-baseline : 77c2e5e2  2026-11-07  fix(runtime): recover preempted requests without stalling
-           pinned at upstream commit 1565 of 1565; 0 commit(s) after it
+           1634 row(s), 7 class(es)
+upstream : upstream/master @ ebdc67e5  2026-11-17  fix(cache): share retained prefixes across requests
+baseline : ebdc67e5  2026-11-17  fix(cache): share retained prefixes across requests
+           pinned at upstream commit 1633 of 1633; 0 commit(s) after it
 
 nothing to triage: the register already covers the upstream tip.
 classes over the whole register:
