@@ -53,7 +53,14 @@ ninfer::EngineOptions spec_options(const char* artifact) {
     options.kv_capacity               = ninfer::KvCapacityPolicy::explicit_capacity(kContextTokens);
     options.prefill_chunk             = 1024;
     options.kv_cache                  = ninfer::KvCacheStorage::BFloat16;
-    options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
+    // port (sm_89, V10-86): the same leg, shown on both drafters. The default stays MTP so the
+    // V10-80 arm keeps its exact numbers; NINFER_SPEC_BACKEND=dflash2 swaps the drafter, because
+    // the DFlash2 cache is a different draft window (its own page count per lane and its own page
+    // store) and "the leg covers the speculative backend" has to be demonstrated on it too.
+    const char* const backend         = std::getenv("NINFER_SPEC_BACKEND");
+    options.speculative.backend       = backend != nullptr && std::strcmp(backend, "dflash2") == 0
+                                            ? ninfer::SpeculativeBackend::DFlash2
+                                            : ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens  = 3;
     options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
     options.enable_vision             = false;
@@ -202,12 +209,27 @@ int main() {
             // Each space's probe demotes kProbePages addressed pages and stages them again, so the
             // text leg alone accounts for kProbePages re-fetches. Anything at or below that number
             // means the speculative backend never entered the leg.
-            if (memory.kv_fetched_pages < 2 * kProbePages ||
-                memory.kv_spilled_pages < 2 * kProbePages) {
-                std::cerr << "[page-in-spec] the backend KV did not take part in the staging: "
-                             "fetched="
+            //
+            // port (sm_89, V10-86): that expectation holds for the MTP drafter and for DFlash's
+            // paged "full" half, but not for DFlash2. The DFlash2 drafter keeps its whole draft
+            // window in the cyclic local cache (draft_context.h:14) and its paged half is not
+            // planned at all, so backend_kv_cache() returns null (sequence.cpp:604-607) and there
+            // is no address space to demote from: NINFER_KV_PAGE_IN_TRACE prints
+            // "backend space: cache=none bundle=0" for this arm while the MTP arm prints
+            // "cache=paged bundle=1". Both arms must still produce the resident run's tokens, and
+            // the text space must still round-trip, so the floor is one probe here and two there -
+            // the difference is the structure, asserted rather than smoothed over.
+            const char* const selected = std::getenv("NINFER_SPEC_BACKEND");
+            const bool dflash2 = selected != nullptr && std::strcmp(selected, "dflash2") == 0;
+            const std::uint32_t expected_fetches = dflash2 ? kProbePages : 2 * kProbePages;
+            if (memory.kv_fetched_pages < expected_fetches ||
+                memory.kv_spilled_pages < expected_fetches) {
+                std::cerr << "[page-in-spec] the KV staging fell short: fetched="
                           << memory.kv_fetched_pages << " spilled=" << memory.kv_spilled_pages
-                          << " for two probes of " << kProbePages << " page(s)\n";
+                          << " expected at least " << expected_fetches
+                          << (dflash2 ? " (text only: the DFlash2 drafter has no paged backend)"
+                                      : " (text + MTP backend)")
+                          << '\n';
                 return 1;
             }
             if (staged.speculative.rounds == 0 || staged.speculative.drafted_tokens == 0) {

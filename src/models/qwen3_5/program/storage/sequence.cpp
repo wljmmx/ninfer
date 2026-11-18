@@ -1922,6 +1922,28 @@ void ProgramImpl::stage_step_kv_pages(KVAddressSpaceStore& addresses, PagedKVCac
 // The helpers are already parameterised by address space and cache, so this is only the call - and
 // the two guards that keep a default run identical: the switch, and a tiered arena.
 void ProgramImpl::stage_step_backend_kv_pages(SequenceState& state) {
+    // port (sm_89, V10-86): one line, once, naming why this space is (not) staged. The DFlash2
+    // drafter keeps its draft window in the cyclic local cache; whether it also has a paged "full"
+    // half decides whether the leg has an address space to work on at all, and that difference is
+    // not visible from the counters (both report zero fetched pages).
+    if (std::getenv("NINFER_KV_PAGE_IN_TRACE") != nullptr) {
+        static bool told = false;
+        if (!told) {
+            told                  = true;
+            const bool has_bundle = state.kv && state.kv->backend;
+            const std::uint32_t frontier =
+                (has_bundle && backend_kv_addresses)
+                    ? backend_kv_addresses->committed_frontier(*state.kv->backend)
+                    : 0U;
+            std::fprintf(stderr,
+                         "[kv-page-in] backend space: cache=%s bundle=%d leg=%d tiered=%d "
+                         "frontier=%u backend=%u\n",
+                         backend_kv_cache() != nullptr ? "paged" : "none", has_bundle ? 1 : 0,
+                         kv_page_in_enabled() ? 1 : 0, kv_arena_tiered() ? 1 : 0, frontier,
+                         static_cast<unsigned>(speculative_backend));
+            std::fflush(stderr);
+        }
+    }
     if (!state.kv || !state.kv->backend || !kv_page_in_enabled() || !kv_arena_tiered()) { return; }
     PagedKVCache* const cache = backend_kv_cache();
     if (cache == nullptr) { return; }
