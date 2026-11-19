@@ -8,26 +8,38 @@ what is *inside* it, what is deliberately left out, and what is still missing fr
 ## Assemble
 
 ```powershell
-cd H:\TeleAgentWorks\infer-4090-port\infer
+cd H:\TeleAgentWorks\ninfer-4090-port\infer
 cmake --build build-win -j 4                       # Release, all targets
 powershell -File tools\release\package_windows_release.ps1 -Root R:\infer
+powershell -File tools\release\package_windows_release.ps1 -Root <qa dir> -WithDiagnostics
 ```
 
 `package_windows_release.ps1` performs every step below and rewrites `SHA256SUMS.txt`; it refuses
 to run when the build products are older than the newest source change, so a stale `ninfer.exe`
 cannot be shipped silently.
 
+Two profiles, and a folder holds one of them:
+
+| Profile | Contents | For |
+|---|---|---|
+| **product** (default) | `ninfer`, `ninfer-serve`, `ninfer-perplexity` plus the rest of the table | what an operator is given |
+| `-WithDiagnostics` | adds `diag-moe`, `diag-cpu-partial`, `diag-second-engine`, `ninfer_bench`, and `symbols\*.pdb` when the build emitted them | validation and crash analysis, never a customer folder |
+
+Packaging a folder that holds QA-only files as the product profile deletes them, so the two cannot
+be mixed by accident.
+
 ## Layout
 
 | Path | Content | Why it is shipped |
 |---|---|---|
-| `*.exe` | `ninfer`, `ninfer-serve`, `ninfer-perplexity`, `ninfer_bench`, `diag-moe`, `diag-cpu-partial` | the product (generation, serving, gates, benchmark harness, two diagnostics) |
+| `ninfer.exe`, `ninfer-serve.exe`, `ninfer-perplexity.exe` | generation, serving, perplexity measurement | the product: the three programs an operator runs |
 | `*.dll` | FFmpeg 9, libcurl, libzmq, libjpeg-turbo | runtime dependencies of the above |
-| `symbols\*.pdb` | matching symbols | crash diagnosis without a rebuild |
+| `diag-moe.exe`, `diag-cpu-partial.exe`, `diag-second-engine.exe`, `ninfer_bench.exe` | three diagnostics, one benchmark harness | **QA profile only** (`-WithDiagnostics`): they measure the product, they are not used with it |
+| `symbols\*.pdb` | matching symbols | **QA profile only, and only if the build emitted them**: the current Release configuration produces no `.pdb`, so the folder is absent, and a product folder never creates it |
 | `docs\` | public docs + `maintainer\` registers + `performance\` baselines + `zh-CN\` notes | what the product does, why it does it that way, and what it measured |
 | `templates\`, `tools\chat_templates\` | chat templates | serving needs them; the converter references them by path |
 | `ninfer.example.toml` | commented configuration | the only complete option reference |
-| `scripts\` | 3 serve profiles + 2 front ends | start the product without reading the docs first |
+| `scripts\` | 4 serve profiles + 2 front ends | start the product without reading the docs first |
 | `tools\console\` | local operations console | mode/freeze control + engine/LMCache/GPU readings on one origin |
 | `dashboard\` | process-level dashboard (+ `node_modules`) | history, request tables, per-request detail |
 | `tools\convert`, `tools\artifact`, `tools\freq_corpus` | converter stack | turning checkpoints into `.ninfer` is part of the product |
@@ -40,10 +52,11 @@ cannot be shipped silently.
 |---|---|
 | C++ sources, CMake, vcpkg manifest | development material; the repository is the source of truth |
 | `tests/` | same |
-| `bench\*.exe` (one per kernel, 60+ binaries, ~20 GB) | single-kernel micro-benchmarks; `ninfer_bench.exe` covers the user-facing cases |
+| `bench\*.exe` (one per kernel, 60+ binaries, ~20 GB) | single-kernel micro-benchmarks; they are development material, and `ninfer_bench.exe` itself ships only in the QA profile |
 | `dashboard\data\` | the dashboard's SQLite history is created on first run |
 | `dashboard\node_modules` in `SHA256SUMS.txt` | hashed file-by-file it would be 4k lines of noise; the folder ships as-is from the tested build |
 | `.obj`, `.err`, `*.log` | build/run outputs, not sources (two such files had been committed to the repository root and were removed) |
+| `diag-commit.exe` | a leftover binary in `build-win\apps` whose target no longer exists in `apps\CMakeLists.txt`; shipping it would ship code the tree can no longer rebuild |
 
 ## Audit result (what was missing before this pass)
 
@@ -57,7 +70,8 @@ cannot be shipped silently.
 | Maintainer registers not shipped | **fixed**: `docs\maintainer\` |
 | Two run logs committed at the repository root (`ppl_e2.err`, `repack.err`) | **fixed**: removed |
 | Dashboard `engine_url` pointed at the example port 8080 | **fixed**: release ships `config.local.json` pointing at 11438 |
-| Qwen4Exp runtime (loading/program/vision/MTP) | **still open**: the artifact is not complete (`R:\model\qwen4exp\UD-Q4_K_XL` holds only shard 1 of 4); v9 T192–T198 |
+| Qwen4Exp runtime (loading/program/vision/MTP) | **fixed**: the artifact is complete (`R:\model\qwen4exp\UD-Q4_K_XL` holds shards 1-4 of 4), converted to `qwen3_8_flash_next_v5_e2.ninfer`, carded as `model-cards\Qwen3.8-Flash-Next-NInfer`, served by `scripts\serve_flashnext_2k.bat` (port 11439, bf16), and gated by `tools\release\gate_qsa.ps1` |
+| QSA low-bit KV storages (`int8`, `fp8`, `nvfp4`, `k8v4`, five `rk*`) | **open, by admission not by code**: all ten enumerators are implemented in `qsa_storage_supported` and the Op sweeps pass, but `qsa_kv_storage_admitted` admits bf16 only; every low-bit route stays behind `NINFER_QSA_SPARSE_GQA_QUANT_KV` because the engine will not run a numeric route that has no recorded model-level PPL. `tools\release\gate_qsa.ps1 -KvDtype <storage>` is how one is qualified: it compares against that storage's own recorded value (`-Record` prints a fresh one; an unrecorded storage refuses to pass rather than borrowing bf16's number). bf16 is 15.533755882784398; `rk4v4-e8` has one recorded value, the other eight have none |
 | Joint context sizing (`plan_context_capacity` not called by `resolve_kv_capacity`) | **fixed** (V10-01): `SequencePlanner::state_image_bytes()` exposes the stride pre-Program, and the automatic path sizes page groups, StateImage slots and workspace through `resolve_context_capacity`; a union that does not fit refuses the load by name |
 | Prefix-checkpoint retention selection | **still open**: a policy change that needs its own gate |
 

@@ -1,14 +1,20 @@
 # Assemble the Windows release folder from a completed Release build.
 #
 #   powershell -File tools\release\package_windows_release.ps1 -Root R:\infer
+#   powershell -File tools\release\package_windows_release.ps1 -Root <dir> -WithDiagnostics
 #
 # Everything the folder must contain is decided here; docs\release-layout.md explains why each
 # item is in the list (and what is deliberately left out). The script refuses to package a build
 # that is older than the newest source file, because a stale executable is worse than no release.
+#
+# The default profile is the product: the three programs an operator runs. -WithDiagnostics switches
+# to the QA profile, which adds the diagnostics, the benchmark harness and the symbols. Switching
+# profiles removes the other profile's files, so one folder never mixes the two.
 param(
     [Parameter(Mandatory = $true)][string]$Root,
     [string]$Repo = '',
-    [string]$Build = ''
+    [string]$Build = '',
+    [switch]$WithDiagnostics
 )
 
 $ErrorActionPreference = 'Stop'
@@ -26,10 +32,16 @@ if (-not $Repo) {
 }
 if (-not $Build) { $Build = Join-Path $Repo 'build-win' }
 $apps = Join-Path $Build 'apps'
-$exes = @('ninfer.exe', 'ninfer-serve.exe', 'ninfer-perplexity.exe', 'diag-moe.exe', 'diag-cpu-partial.exe')
+$product = @('ninfer.exe', 'ninfer-serve.exe', 'ninfer-perplexity.exe')
+# Every diagnostic the tree still builds (apps\CMakeLists.txt marks each one "never part of the
+# product binaries"). `diag-commit.exe` sits in build-win\apps but has no target left, so it is stale
+# output rather than a component: listing it here would fail the existence check, which is the point.
+$qaOnly = @('diag-moe.exe', 'diag-cpu-partial.exe', 'diag-second-engine.exe')
 $bench = Join-Path $Build 'bench\ninfer_bench.exe'
+$exes = if ($WithDiagnostics) { $product + $qaOnly } else { $product }
 
-foreach ($needed in (@($exes | ForEach-Object { Join-Path $apps $_ }) + $bench)) {
+foreach ($needed in (@($exes | ForEach-Object { Join-Path $apps $_ }) +
+                      $(if ($WithDiagnostics) { $bench }))) {
     if (-not (Test-Path $needed)) { throw "missing build product: $needed (run the Release build first)" }
 }
 
@@ -42,14 +54,45 @@ if ($newestSource -and $newestSource.LastWriteTime -gt $binary.LastWriteTime) {
     throw "ninfer.exe is older than $($newestSource.FullName); rebuild before packaging"
 }
 
-foreach ($dir in @($Root, "$Root\docs", "$Root\templates", "$Root\symbols", "$Root\scripts")) {
-    New-Item -ItemType Directory -Path $dir -Force | Out-Null
-}
+$dirs = @($Root, "$Root\docs", "$Root\templates", "$Root\scripts")
+foreach ($dir in $dirs) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
 
 foreach ($exe in $exes) { Copy-Item (Join-Path $apps $exe) $Root -Force }
-Copy-Item $bench $Root -Force
+if ($WithDiagnostics) { Copy-Item $bench $Root -Force }
 Get-ChildItem $apps -Filter '*.dll' | ForEach-Object { Copy-Item $_.FullName $Root -Force }
-Get-ChildItem $apps -Filter '*.pdb' | ForEach-Object { Copy-Item $_.FullName "$Root\symbols" -Force }
+$symbols = Join-Path $Root 'symbols'
+if ($WithDiagnostics) {
+    # Only if the build emitted them: this Release configuration produces no .pdb, and an empty
+    # `symbols\` would claim otherwise.
+    $pdbs = @(Get-ChildItem $apps -Filter '*.pdb')
+    if ($pdbs) {
+        New-Item -ItemType Directory -Path $symbols -Force | Out-Null
+        $pdbs | ForEach-Object { Copy-Item $_.FullName $symbols -Force }
+    } else {
+        "no .pdb beside the executables: this build carries no symbols, symbols\ left out"
+    }
+}
+# Never leave the other profile behind in the same folder.
+$otherProfile = if ($WithDiagnostics) { @() } else { $qaOnly + @('ninfer_bench.exe') }
+foreach ($stale in $otherProfile) {
+    $path = Join-Path $Root $stale
+    if (Test-Path $path) {
+        Remove-Item $path -Force
+        "removed $stale (QA-only, not part of the product profile)"
+    }
+}
+if (-not $WithDiagnostics -and (Test-Path $symbols)) {
+    $pdbs = @(Get-ChildItem $symbols -Filter '*.pdb')
+    if ($pdbs) {
+        $pdbs | Remove-Item -Force
+        "removed $($pdbs.Count) symbol file(s) (QA-only)"
+    }
+    # An empty `symbols\` is still a QA-shaped folder; a product folder must not wear one.
+    if (-not (Get-ChildItem $symbols -Force)) {
+        Remove-Item $symbols -Force
+        "removed empty symbols\ (QA-only)"
+    }
+}
 
 Copy-Item (Join-Path $Repo 'LICENSE') $Root -Force
 Copy-Item (Join-Path $Repo 'README.md') $Root -Force
@@ -153,10 +196,12 @@ Write-Launcher 'serve_27b_v3_128k_c8.bat' 'ninfer-serve 27B v3 128K C=8 rk4v4-e8
 # plain `describe --tags` would report it as the version.
 $describe = & git -C $Repo describe --tags --always --match "v*"
 $commit = & git -C $Repo rev-parse HEAD
+$profile = if ($WithDiagnostics) { 'qa (product + diagnostics + benchmark + symbols)' } else { 'product (ninfer, ninfer-serve, ninfer-perplexity)' }
 @"
 NInfer release for RTX 4090 (sm_89), Windows 11 x64
 version:  $describe
 commit:   $commit
+profile:  $profile
 built:    $((Get-Item (Join-Path $apps 'ninfer.exe')).LastWriteTime.ToString('yyyy-MM-dd HH:mm'))
 toolchain CUDA 13.5 (V13.5.37) / driver 621.14 / MSVC / CMake Release / sm_89
 "@ | ForEach-Object { Write-NoBom (Join-Path $Root 'VERSION') $_ }
