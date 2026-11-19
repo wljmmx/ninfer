@@ -68,8 +68,24 @@ found, and the LMCache source is optional (start it only if LMCache runs on 1808
 
 ## LMCache
 
-The panel's **启动 LMCache** button runs `start_lmcache.cmd` next to this file: the script owns the
-command (`lmcache_server` on PATH, else `python -m lmcache.server`, on port 18080, the port the
-panel reads), the console only decides when to run it and reports the child's pid, exit code and
-log tail. If LMCache is not installed the button is honest about it - the log says so and the exit
-code is 3.
+LMCache runs **inside WSL** (a venv at `~/lmc-venv`, not a container). The panel's **启动 LMCache**
+button runs `start_lmcache.cmd`, which maps itself into the WSL filesystem and runs
+`l3_lmcache.sh`; the ports and chunk size are the contract with the engine:
+
+| | |
+|---|---|
+| `6555` | ZMQ endpoint the engine defaults to (`tcp://127.0.0.1:6555`) |
+| `18080` | HTTP metrics, what the panel above reads |
+| `--chunk-size 128` | a checkpoint key is cut at whole 128-token chunks |
+
+```
+lmcache server --transport zmq --port 6555 --http-port 18080 \
+    --supported-transfer-mode engine_driven \
+    --chunk-size 128 --max-workers 4 --l1-size-gb 10 --eviction-policy LRU
+```
+
+The server detaches (`nohup`) and takes ~15-20 s to import torch, so the console decides "up" by
+asking `18080/metrics`, not by watching the child; the panel says "启动中（torch 导入约 15s）"
+until the socket answers. `stop` re-runs the script with `stop`, which kills the WSL-side process.
+The engine still needs `NINFER_LMCACHE_RESTORE=1` and `NINFER_LMCACHE_ENDPOINT=tcp://127.0.0.1:6555`
+in its own launcher (see `docs/lmcache.md`).

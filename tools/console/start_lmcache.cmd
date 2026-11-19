@@ -1,32 +1,30 @@
 @echo off
-rem One-click LMCache launcher for the console.
+rem One-click LMCache for the console. LMCache lives inside WSL (a venv, not a container), so this
+rem script is the bridge: it maps itself into the WSL filesystem and runs l3_lmcache.sh there.
 rem
-rem The console's LMCache panel reads http://127.0.0.1:18080/metrics. This script is what the
-rem "start LMCache" button runs, so the command lives here, in one place, instead of in the page.
+rem   start_lmcache.cmd          start (idempotent) and report
+rem   start_lmcache.cmd status   is it answering
+rem   start_lmcache.cmd stop     stop the one it started
 rem
-rem Adjust the COMMAND line if your LMCache install uses a different entry point; everything else
-rem (log, pid, stop) is handled by the console.
+rem The ports and the chunk size are a contract with the engine, not preferences:
+rem   6555  ZMQ endpoint (the engine defaults to tcp://127.0.0.1:6555)
+rem   18080 HTTP metrics (what this console's LMCache panel reads)
+rem   128   chunk size: a checkpoint key is cut at whole 128-token chunks
 setlocal
-set "PORT=18080"
-
-rem --- the entry point -------------------------------------------------------
-where lmcache_server >nul 2>&1
-if not errorlevel 1 (
-    set "CMD=lmcache_server --host 127.0.0.1 --port %PORT%"
-    goto run
+set "HERE=%~dp0"
+set "SH=%HERE%l3_lmcache.sh"
+if not exist "%SH%" (
+  echo missing %SH%
+  exit /b 3
 )
 
-python -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('lmcache') else 1)" >nul 2>&1
-if not errorlevel 1 (
-    set "CMD=python -m lmcache.server --host 127.0.0.1 --port %PORT%"
-    goto run
+rem wslpath is the only reliable bridge from a Windows path to the one bash sees.
+set "SHP="
+for /f "usebackq delims=" %%p in (`wsl.exe -e wslpath -a "%SH%"`) do set "SHP=%%p"
+if "%SHP%"=="" (
+  echo cannot map %SH% into WSL; is the WSL distro running?
+  exit /b 3
 )
 
-echo LMCache is not installed on this machine (no lmcache_server on PATH, no python module "lmcache").
-echo Install it, or edit the COMMAND section of %~nx0 to point at your entry point.
-exit /b 3
-
-:run
-echo starting: %CMD%
-%CMD%
+wsl.exe -e bash -lc "bash '%SHP%' %*"
 exit /b %ERRORLEVEL%

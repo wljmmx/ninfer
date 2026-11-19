@@ -622,8 +622,8 @@ async function tickEngine(){
 async function tickLmcache(){
   try{
     const s = await getJSON('/api/lmcache/status.json');
-    $('lcState').textContent = s.running ? ('运行中 · pid ' + s.pid + ' · ' + ago(s.uptime_seconds))
-                                         : (s.exit_code != null ? ('已退出（' + s.exit_code + '）') : '未启动');
+    $('lcState').textContent = s.server_up ? ('运行中 · ZMQ 6555 · HTTP 18080')
+                                         : (s.running ? '启动中（torch 导入约 15s）' : (s.exit_code != null ? ('已退出（' + s.exit_code + '）') : '未启动'));
     $('lcStart').disabled = !!s.running;
     $('lcStop').disabled = !s.running;
     const log = s.log || [];

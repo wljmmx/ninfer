@@ -864,7 +864,7 @@ class Launcher:
                 env.pop(key, None)
 
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
-            handle = open(self.log_path, "ab", buffering=0)
+            handle = open(self.log_path, "wb", buffering=0)   # one run, one log
             handle.write(f"\n===== {datetime.datetime.now().astimezone().isoformat(timespec='seconds')}"
                          f" {' '.join(argv)}\n".encode("utf-8"))
             flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -1013,10 +1013,14 @@ class ScriptService:
 
     LOG_TAIL = 40
 
-    def __init__(self, script: Path, log_path: Path, key: str) -> None:
+    def __init__(self, script: Path, log_path: Path, key: str,
+                 probe_url: str | None = None) -> None:
         self.script = script
         self.log_path = log_path
         self.key = key
+        # The LMCache server detaches inside WSL (nohup), so the child this process spawned exits
+        # as soon as the script returns. Asking its socket is the only honest "is it up".
+        self.probe_url = probe_url
         self.lock = threading.Lock()
         self.proc: subprocess.Popen | None = None
         self.started_at = 0.0
@@ -1029,7 +1033,7 @@ class ScriptService:
             if not self.script.is_file():
                 return {"ok": False, "error": f"script not found: {self.script}"}
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
-            handle = open(self.log_path, "ab", buffering=0)
+            handle = open(self.log_path, "wb", buffering=0)   # one run, one log
             handle.write(f"\n===== {datetime.datetime.now().astimezone().isoformat(timespec='seconds')}"
                          f" {self.script.name}\n".encode("utf-8"))
             try:
@@ -1045,19 +1049,35 @@ class ScriptService:
             self.exit_code = None
             return {"ok": True, "pid": self.proc.pid, "script": str(self.script)}
 
+    def _probe(self) -> bool:
+        if not self.probe_url:
+            return False
+        try:
+            with urllib.request.urlopen(self.probe_url, timeout=1.5) as response:
+                return 200 <= response.status < 300
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+            return False
+
     def stop(self) -> dict:
         with self.lock:
             proc = self.proc
-            if proc is None or proc.poll() is not None:
-                return {"ok": True, "note": f"{self.key} is not running"}
-            proc.terminate()
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=10)
+                self.exit_code = proc.returncode
+            # The server lives on the other side of the WSL boundary; the script owns the kill.
+            note = ""
             try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=10)
-            self.exit_code = proc.returncode
-            return {"ok": True, "stopped": proc.pid, "exit_code": proc.returncode}
+                done = subprocess.run(["cmd", "/c", str(self.script), "stop"], cwd=str(self.script.parent),
+                                      capture_output=True, timeout=30)
+                note = (done.stdout or b"").decode("utf-8", "replace").strip()
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                return {"ok": False, "error": f"cannot stop {self.key}: {exc}"}
+            return {"ok": True, "stopped": True, "note": note}
 
     def log_tail(self) -> list[str]:
         try:
@@ -1072,14 +1092,16 @@ class ScriptService:
 
     def status(self) -> dict:
         proc = self.proc
-        running = proc is not None and proc.poll() is None
-        if proc is not None and not running:
+        child_alive = proc is not None and proc.poll() is None
+        if proc is not None and not child_alive:
             self.exit_code = proc.returncode
-        return {"ok": True, "key": self.key, "running": running,
-                "pid": proc.pid if proc else None,
+        server_up = self._probe()
+        return {"ok": True, "key": self.key, "running": child_alive or server_up,
+                "server_up": server_up,
+                "pid": proc.pid if child_alive else None,
                 "exit_code": self.exit_code,
                 "script": str(self.script),
-                "uptime_seconds": round(time.time() - self.started_at, 1) if running else None,
+                "uptime_seconds": round(time.time() - self.started_at, 1) if child_alive else None,
                 "log": self.log_tail()}
 
 
@@ -1338,7 +1360,7 @@ def main() -> int:
     Handler.launcher = Launcher(exe, roots, log_path, attach)
     Handler.lmcache = ScriptService(Path(__file__).resolve().parent / "start_lmcache.cmd",
                                    Path(__file__).resolve().parent / "lmcache-service.log",
-                                   "lmcache")
+                                   "lmcache", probe_url=args.upstream)
     try:
         server = ConsoleServer((args.host, args.port), Handler)
     except OSError as exc:
