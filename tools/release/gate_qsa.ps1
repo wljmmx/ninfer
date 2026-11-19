@@ -26,14 +26,16 @@
 param(
     [string]$Model = "R:\model\qwen3_8_flash_next_v5\qwen3_8_flash_next_v5_e2.ninfer",
     [string]$PplCorpus = "",
-    [string]$KvDtype = "bf16",
+    [ValidateSet('bf16', 'int8', 'fp8', 'nvfp4', 'k8v4', 'rk8v4', 'rk4v4', 'rk4v4-e8', 'rk2v4-e8', 'rk4v2-e8')]
+    [string]$KvDtype = 'bf16',
     [int]$Context = 512,
     [int]$Stride = 256,
     [int]$ExpertCacheMb = 12288,
-    # Recorded 2026-11-19 on aca21568/475dfd61 (bf16 QSA route, context 512 / stride 256 over the
-    # corpus beside this script): 15.533755882784398. Re-record with -Record after an intended
-    # numeric change; drift here means a QSA kernel moved, which the 27B and MoE gates cannot see.
-    [double]$ExpectPpl = 15.533755882784398,
+    # One recorded value per KV storage. bf16 is the qualified route; the low-bit ones are implemented
+    # in qsa_storage_supported and pass the Op sweeps, but are only admitted by the runtime once a
+    # model-level value exists here, which is what -Record fills in.
+    [hashtable]$Goldens = @{ bf16 = 15.533755882784398; 'rk4v4-e8' = 15.3738122181841 },
+    [double]$ExpectPpl = 0.0,
     [double]$Tolerance = 0.001,
     [switch]$Record
 )
@@ -70,9 +72,9 @@ if ($indexed -eq 0) {
 $out = Join-Path ([System.IO.Path]::GetTempPath()) ("ninfer_gate_qsa_{0}" -f $PID)
 if (Test-Path $out) { Remove-Item -Recurse -Force $out }
 $env:NINFER_EXPERT_CACHE_MB = "$ExpertCacheMb"
-# Pin the route: an ambient opt-in must not move this gate onto a QSA low-bit profile. Those are
-# covered by the Op sweeps (--kv-cache fp8|int8|nvfp4|k8v4), not by this artifact.
-$env:NINFER_QSA_SPARSE_GQA_QUANT_KV = '0'
+# The low-bit QSA routes are behind this switch; bf16 needs it off so an ambient value cannot move the
+# qualified route.
+$env:NINFER_QSA_SPARSE_GQA_QUANT_KV = if ($KvDtype -eq 'bf16') { '0' } else { '1' }
 $log = [System.IO.Path]::GetTempFileName()
 try {
     & $exe $Model --text $PplCorpus --context $Context --stride $Stride --kv-dtype $KvDtype `
@@ -90,15 +92,20 @@ try {
 }
 
 if ($Record) {
-    "measured PPL   {0:R}" -f $ppl
+    "measured PPL   {0:R}   storage {1}" -f $ppl, $KvDtype
     exit 0
 }
-if ($ExpectPpl -le 0) { throw "no golden recorded: run with -Record first and put it in -ExpectPpl" }
+# A -ExpectPpl override wins; otherwise the storage's recorded value, and an unrecorded storage
+# refuses to pass rather than comparing against bf16's number.
+$expect = if ($ExpectPpl -gt 0) { $ExpectPpl } elseif ($Goldens.ContainsKey($KvDtype)) { [double]$Goldens[$KvDtype] } else { 0.0 }
+if ($expect -le 0) {
+    throw ("no golden recorded for KV storage '{0}': run with -Record once, then add it to `$Goldens" -f $KvDtype)
+}
 
-$delta = [math]::Abs($ppl - $ExpectPpl) / $ExpectPpl
+$delta = [math]::Abs($ppl - $expect) / $expect
 if ($delta -le $Tolerance) {
-    "QSA PPL  {0:F6}   PASS (expect {1:F6}, delta {2:P3} <= {3:P3})" -f $ppl, $ExpectPpl, $delta, $Tolerance
+    "QSA PPL  {0:F6}   PASS (storage {1}, expect {2:F6}, delta {3:P3} <= {4:P3})" -f $ppl, $KvDtype, $expect, $delta, $Tolerance
     exit 0
 }
-"QSA PPL  {0:F6}   FAIL (expect {1:F6}, delta {2:P3} > {3:P3})" -f $ppl, $ExpectPpl, $delta, $Tolerance
+"QSA PPL  {0:F6}   FAIL (storage {1}, expect {2:F6}, delta {3:P3} > {4:P3})" -f $ppl, $KvDtype, $expect, $delta, $Tolerance
 exit 1
