@@ -2242,9 +2242,18 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
     // unless a retention contract is in force, and that gate reads the environment at layout time
     // (state/decoder_state.cpp), so the contract has to be declared before the plan is finalized.
     if (resolution.kv_host_residency_active) {
-        set_environment_value("NINFER_KV_EVICT_WINDOW",
-                              std::to_string(resolution.logical_page_groups));
-        models::qwen3_5::install_kv_eviction_window(0, resolution.logical_page_groups);
+        // P8: an explicit environment window wins. It is the only way to ask this plan for a
+        // BOUNDED read set (sink + newest window + the selector's keep set) instead of "keep
+        // everything", and with the page-in leg on by default such a read set is what lets a
+        // prompt longer than the arena run at all. Without an explicit request the plan keeps the
+        // masking-free contract it was designed for. The environment must be consulted BEFORE the
+        // set_environment_value() below, which is itself what the residency arm publishes.
+        const bool env_window = models::qwen3_5::kv_eviction_window_from_environment_enabled();
+        if (!env_window) {
+            set_environment_value("NINFER_KV_EVICT_WINDOW",
+                                  std::to_string(resolution.logical_page_groups));
+            models::qwen3_5::install_kv_eviction_window(0, resolution.logical_page_groups);
+        }
         constexpr double kMib = 1024.0 * 1024.0;
         // port (sm_89): say which slack produced the split. 512 MiB is a legal override and the arm
         // that reproduces the paging collapse, so the log has to name the value in force rather than

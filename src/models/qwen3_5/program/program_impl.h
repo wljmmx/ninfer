@@ -886,6 +886,11 @@ public:
     // the Runtime asks the pair before it grants a unit, so a request that can never fit under the
     // contract never enters the pause/replay path.
     [[nodiscard]] std::uint32_t kv_residency_token_limit() const noexcept;
+    // P8: the page-in leg as the Program can actually run it - the request (on by default, with
+    // NINFER_KV_PAGE_IN / NINFER_KV_NO_PAGE_IN as the explicit override and opt-out) AND a Host KV
+    // tier to copy a page back from. `kv_arena_tiered()` says whether a page can be absent at all, so
+    // every step-path caller asks both.
+    [[nodiscard]] bool page_in_active() const noexcept;
     [[nodiscard]] std::uint32_t sequence_execution_frontier(SequenceHandle) const noexcept;
     [[nodiscard]] std::uint32_t kv_residency_step_growth() const noexcept;
     [[nodiscard]] std::uint32_t residency_device_page_capacity() const noexcept;

@@ -1050,10 +1050,13 @@ private:
                                         kv_residency_limit_note(priced_tokens != 0))));
     }
 
-    // The sentence that names the REMAINING limit, which differs between the two arms: without the
-    // page-in leg a page on the Host tier has no reader at all, with it the pool itself is the
-    // limit - a page group holds every layer's planes and the full-attention layers address the
+    // The sentence that names the REMAINING limit, which differs between the two arms: with the
+    // page-in leg off a page on the Host tier has no reader at all, with it on the pool itself is
+    // the limit - a page group holds every layer's planes and the full-attention layers address the
     // whole history on every step, so a step cannot address fewer pages than it does (V10-79).
+    // P8: the leg is the default, so the leg-off arm is the run that named NINFER_KV_NO_PAGE_IN (or
+    // NINFER_KV_PAGE_IN=0); the leg-on sentence now names the one thing that lifts the whole-history
+    // bound - a bounded read set (NINFER_KV_EVICT_WINDOW).
     // V10-84 adds a third state: with the leg on AND a window installed, a step addresses only sink
     // + newest window + the selector's keep set, so that set (plus the unit's growth) is what the
     // pool is priced by, and the pool edge is the limit on the SUM of those sets over live lanes.
@@ -1067,17 +1070,26 @@ private:
                 "(NINFER_KV_EVICT_WINDOW / NINFER_KV_EVICT_KEEP_FROM_SCORES), lower "
                 "max_concurrency, or give the KV leg more pages (NINFER_KV_RESIDENCY_SLACK_MB).");
         }
-        const char* value = std::getenv("NINFER_KV_PAGE_IN");
-        const bool leg = value != nullptr && *value != '\0' && std::strtol(value, nullptr, 10) != 0;
+        const bool leg = [] {
+            // P8: same tri-state the Program uses - the leg is on by default, and either variable
+            // names the opt-out.
+            if (const char* opt_out = std::getenv("NINFER_KV_NO_PAGE_IN");
+                opt_out != nullptr && *opt_out != '\0' && std::strtol(opt_out, nullptr, 10) != 0) {
+                return false;
+            }
+            const char* value = std::getenv("NINFER_KV_PAGE_IN");
+            if (value == nullptr || *value == '\0') { return true; }
+            return std::strtol(value, nullptr, 10) != 0;
+        }();
         return leg ? std::string(
                          " (the Device KV pool is tiered and the page-in leg is on: it copies a "
                          "page "
                          "back from the Host tier when a step addresses one the Device no longer "
-                         "holds, but the pool still has to cover the live history itself, because "
-                         "a "
-                         "page group spans every layer's planes and the full-attention layers read "
-                         "the whole history on every step). Shorten the prompt, or give the KV leg "
-                         "more pages (NINFER_KV_RESIDENCY_SLACK_MB, or a smaller max_context).")
+                         "holds, but a full-attention step addresses its whole history, so the pool "
+                         "still has to cover the live history itself. Bound the read set with "
+                         "NINFER_KV_EVICT_WINDOW - sink + newest window + the selector's keep set "
+                         "is what a step addresses then - or give the KV leg more pages "
+                         "(NINFER_KV_RESIDENCY_SLACK_MB, or a smaller max_context).")
                    : std::string(
                          " (the Device KV pool is tiered: it holds the resident part of "
                          "max_context, and the full-attention layers read the whole history every "

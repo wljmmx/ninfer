@@ -237,13 +237,25 @@ bool kv_host_demote_enabled() {
 
 // port (sm_89, V10-79): the resident-KV leg's step half. With the arena smaller than the logical
 // page space, a page the Device does not hold has to be copied back before the layer that reads it
-// runs - and a page this step does not read is what makes room. NINFER_KV_PAGE_IN=1 is the switch,
-// and it is a CONTRACT in the same sense the demotion is: it is the only knob under which a page
-// may be absent from the Device while the row still addresses it. Off (unset, or 0) means the step
-// path is exactly what it was, which is what keeps every frozen gate bit-identical.
-bool kv_page_in_enabled() {
+// runs - and a page this step does not read is what makes room. It is a CONTRACT in the same sense
+// the demotion is: it is the only knob under which a page may be absent from the Device while the
+// row still addresses it.
+//
+// P8: the leg is ON by default - a tiered arena is exactly the state in which a page can be absent,
+// and a leg that only runs when someone remembers an environment variable leaves every demoted page
+// unreadable. The tri-state keeps every recorded experiment reproducible: an explicit
+// NINFER_KV_PAGE_IN wins (0 restores the pre-V10-79 step path), and NINFER_KV_NO_PAGE_IN is the
+// opt-out spelled for the new default, so an A/B needs one variable with the opposite polarity.
+// The leg still only ACTS when the arena is tiered and a Host tier exists (page_in_active()), so a
+// fully resident run - and every frozen gate - is byte-identical to before.
+bool kv_page_in_requested() {
+    if (const char* opt_out = std::getenv("NINFER_KV_NO_PAGE_IN");
+        opt_out != nullptr && *opt_out != '\0' && std::strtol(opt_out, nullptr, 10) != 0) {
+        return false;
+    }
     const char* value = std::getenv("NINFER_KV_PAGE_IN");
-    return value != nullptr && *value != '\0' && std::strtol(value, nullptr, 10) != 0;
+    if (value == nullptr || *value == '\0') { return true; }
+    return std::strtol(value, nullptr, 10) != 0;
 }
 
 // Verification knob (default off): how many of the addressed pages the pass just staged to give
@@ -673,6 +685,14 @@ bool ProgramImpl::kv_arena_tiered() const noexcept {
     return residency_device_page_capacity() < kv_logical_page_groups;
 }
 
+// P8: is the leg actually able to run here? The request (default on) is only half the answer: the
+// leg copies a page back from a Host tier, so without one there is nothing to copy from and the
+// step path has to stay the pre-V10-79 one. Every caller asks this instead of the environment, so
+// the switch cannot promise a reader the pool does not have.
+bool ProgramImpl::page_in_active() const noexcept {
+    return kv_page_in_requested() && host_kv_extents != nullptr;
+}
+
 // port (sm_89, V10-80): which space's page-in counters a helper is reporting into. The two spaces
 // are told apart exactly as the page store is chosen in the helpers, which is by the address store
 // they belong to, so a helper needs no extra argument.
@@ -761,8 +781,19 @@ std::uint32_t window_read_cap_pages() {
 // hold must have a reader), a tiered arena (a fully resident pool has no edge to price against), a
 // window (which is what bounds the addressed set) and a storage whose kernels honour absent pages.
 std::uint32_t ProgramImpl::read_set_fixed_pages() const noexcept {
-    if (!kv_page_in_enabled() || !kv_arena_tiered()) { return 0; }
+    if (!page_in_active() || !kv_arena_tiered()) { return 0; }
     if (decoder == nullptr || !kv_absent_pages_supported(decoder->text_kv.storage())) { return 0; }
+    // P8: the residency plan's own contract installs a window that keeps EVERY logical page (sink 0,
+    // span == the logical capacity - model_instance.cpp's kv_host_residency_active arm), because such
+    // a plan addresses its whole history. Nothing is masked there, so the read set is the history and
+    // pricing it as if it were a window would price the whole logical capacity against a smaller
+    // pool - which refuses every request, a 53-token warmup included. Report "not in force" and let
+    // the whole-history price do the admitting, exactly as the leg-off arm did.
+    const KvEvictionWindow& window = kv_eviction_window();
+    if (window.sink_pages == 0 && window.keep_pages.empty() &&
+        window.window_pages >= kv_logical_page_groups) {
+        return 0;
+    }
     // A/B switch, default on: with NINFER_KV_READ_PRICING=0 the same binary prices the whole
     // history the way every build before this one did, so "the read set is what admits the batch"
     // is measured against its own control instead of inferred (NINFER_KV_BORROW's shape).
@@ -956,13 +987,15 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& state, std::uint32_t 
                 std::to_string(parameters.model.config().text.full_attention_layers) +
                 " full-attention layer(s) read the whole history every step, so the step needs all "
                 "of it resident at once; " +
-                (kv_page_in_enabled()
+                (page_in_active()
                      ? "the page-in leg can copy a page back from Host, but a page group spans "
                        "every layer's planes, so it cannot make the step address fewer pages. "
-                       "Shorten the prompt, or give the pool more pages "
-                       "(NINFER_KV_RESIDENCY_SLACK_MB, or a smaller max_context)."
-                     : "it cannot be streamed out of the Host tier (set NINFER_KV_PAGE_IN=1 "
-                       "to let a page be copied back from Host)."));
+                       "Bound the read set with NINFER_KV_EVICT_WINDOW (sink + newest window + the "
+                       "selector's keep set is what a step addresses then), or give the pool more "
+                       "pages (NINFER_KV_RESIDENCY_SLACK_MB, or a smaller max_context)."
+                     : "it cannot be streamed out of the Host tier (the page-in leg would copy a "
+                       "page back from Host; NINFER_KV_PAGE_IN=0 or NINFER_KV_NO_PAGE_IN=1 turned "
+                       "it off for this run)."));
         }
     }
     text_kv_addresses->ensure_mapped_to_tokens(state.kv->text, main, device.stream);
@@ -986,7 +1019,7 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& state, std::uint32_t 
     // can be given back by an idle reclaim, a checkpoint demotion or a dial shrink, and this is
     // what makes it readable again. Two guards keep a default run identical: the switch, and a
     // tiered arena (a fully resident pool never enters, so no frozen gate can move).
-    if (kv_page_in_enabled() && kv_arena_tiered()) {
+    if (page_in_active() && kv_arena_tiered()) {
         stage_step_kv_pages(*text_kv_addresses, decoder->text_kv, state.kv->text);
         // port (sm_89, V10-80): the speculative backend's cache is a second, separately paged space
         // that the same demotion empties and the same draft attention reads (MTP: the whole
@@ -1939,12 +1972,12 @@ void ProgramImpl::stage_step_backend_kv_pages(SequenceState& state) {
                          "[kv-page-in] backend space: cache=%s bundle=%d leg=%d tiered=%d "
                          "frontier=%u backend=%u\n",
                          backend_kv_cache() != nullptr ? "paged" : "none", has_bundle ? 1 : 0,
-                         kv_page_in_enabled() ? 1 : 0, kv_arena_tiered() ? 1 : 0, frontier,
+                         page_in_active() ? 1 : 0, kv_arena_tiered() ? 1 : 0, frontier,
                          static_cast<unsigned>(speculative_backend));
             std::fflush(stderr);
         }
     }
-    if (!state.kv || !state.kv->backend || !kv_page_in_enabled() || !kv_arena_tiered()) { return; }
+    if (!state.kv || !state.kv->backend || !page_in_active() || !kv_arena_tiered()) { return; }
     PagedKVCache* const cache = backend_kv_cache();
     if (cache == nullptr) { return; }
     stage_step_kv_pages(*backend_kv_addresses, *cache, *state.kv->backend);

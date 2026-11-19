@@ -129,9 +129,18 @@ std::optional<std::uint32_t> declared_resident_pages(std::uint32_t fitted_pages)
 // V10-79: the demand page-in leg, read the same way every other switch on this path is read. It is
 // what makes an arena smaller than the logical context servable for a full-attention model: a page
 // the Device does not hold is copied back from the Host tier before the step that reads it.
+//
+// P8: the leg is the default (see storage/sequence.cpp); this predicate is the same tri-state, so a
+// run that opts out through NINFER_KV_NO_PAGE_IN or NINFER_KV_PAGE_IN=0 is planned as the leg-off
+// arm it asked for.
 bool page_in_leg_requested() {
+    if (const char* opt_out = std::getenv("NINFER_KV_NO_PAGE_IN");
+        opt_out != nullptr && *opt_out != '\0' && std::strtol(opt_out, nullptr, 10) != 0) {
+        return false;
+    }
     const char* value = std::getenv("NINFER_KV_PAGE_IN");
-    return value != nullptr && *value != '\0' && std::strtol(value, nullptr, 10) != 0;
+    if (value == nullptr || *value == '\0') { return true; }
+    return std::strtol(value, nullptr, 10) != 0;
 }
 
 } // namespace
@@ -1361,10 +1370,10 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
             std::to_string(parameters.model.config().text.full_attention_layers) +
             " full-attention layers, and those read the whole history every step, so a KV arena "
             "smaller than the context changes the output. Keep the KV resident and layer the MoE "
-            "experts instead (NINFER_EXPERT_CACHE_MB), or set NINFER_KV_PAGE_IN=1 to let a page "
-            "the "
-            "Device does not hold be copied back from the Host tier before the step that reads "
-            "it.");
+            "experts instead (NINFER_EXPERT_CACHE_MB), or leave the page-in leg on (it is the "
+            "default; NINFER_KV_NO_PAGE_IN=1 or NINFER_KV_PAGE_IN=0 is what turned it off for this "
+            "run) so a page the Device does not hold is copied back from the Host tier before the "
+            "step that reads it.");
     }
     // The eviction window is a decode-side idea: it releases the pages a moving attention window
     // has left behind. Scoring prefills a whole window in one pass and needs every page of it

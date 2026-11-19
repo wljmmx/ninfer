@@ -336,16 +336,36 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     // construction rather than the first step when the arena is tiered and no Host KV tier was
     // priced - the step error would name the same thing, but only after a request had already been
     // admitted.
-    if (const char* leg = std::getenv("NINFER_KV_PAGE_IN");
-        leg != nullptr && *leg != '\0' && std::strtol(leg, nullptr, 10) != 0 &&
-        host_kv_extents == nullptr &&
+    //
+    // P8: the leg is now on by default, so the refusal above stays only for the run that ASKED for
+    // it explicitly (NINFER_KV_PAGE_IN set, NINFER_KV_NO_PAGE_IN unset). A default run with a
+    // declared arena and no Host budget keeps the pre-V10-79 step path instead - ProgramImpl::
+    // page_in_active() reports false from here on - and says so once, because silently promising a
+    // reader the pool does not have is how a demoted page would be read from a recycled slot.
+    const bool tiered_arena =
         plan.persistent.decoder.text_kv.pages.spec.page_group_count <
-            plan.persistent.decoder.text_kv.execution_tables.spec.logical_page_capacity) {
-        throw std::invalid_argument(
-            "NINFER_KV_PAGE_IN with a KV arena smaller than the logical capacity needs a Host KV "
-            "tier to copy a page back from: set the Host context budget (serve: "
-            "--host-context-mib / context_cache.host_context_mib), or size the arena for the whole "
-            "context");
+        plan.persistent.decoder.text_kv.execution_tables.spec.logical_page_capacity;
+    if (host_kv_extents == nullptr && tiered_arena) {
+        const char* leg = std::getenv("NINFER_KV_PAGE_IN");
+        const char* opt_out = std::getenv("NINFER_KV_NO_PAGE_IN");
+        const bool explicit_leg =
+            leg != nullptr && *leg != '\0' && std::strtol(leg, nullptr, 10) != 0 &&
+            !(opt_out != nullptr && *opt_out != '\0' && std::strtol(opt_out, nullptr, 10) != 0);
+        if (explicit_leg) {
+            throw std::invalid_argument(
+                "NINFER_KV_PAGE_IN with a KV arena smaller than the logical capacity needs a Host KV "
+                "tier to copy a page back from: set the Host context budget (serve: "
+                "--host-context-mib / context_cache.host_context_mib), or size the arena for the "
+                "whole context");
+        }
+        std::fprintf(stderr,
+                     "[kv-page-in] off: the arena is tiered (%u of %u page groups) but no Host KV "
+                     "tier was priced, so a page the Device gives back has nowhere to land. A "
+                     "request longer than the arena is refused at admission; set --host-context-mib "
+                     "to make the tiered plan servable.\n",
+                     plan.persistent.decoder.text_kv.pages.spec.page_group_count,
+                     plan.persistent.decoder.text_kv.execution_tables.spec.logical_page_capacity);
+        std::fflush(stderr);
     }
     state_store =
         std::make_unique<StateImageStore>(*state_images, host_state_images.get(), logical_states);

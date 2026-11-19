@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <iomanip>
 #include <sstream>
 #include <string>
@@ -526,8 +527,25 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
     // appendix IK/IL: say what the eviction contract did, and why - a window that silently does
     // nothing (NVFP4 has no absent-page path) is exactly the failure mode this line exists for.
     if (memory.evict_contract_effective == EvictionContract::On) {
-        logger_->info("eviction | contract on | window {} sink {} pages | host demotion by default",
-                      engine.evict_window_pages, engine.evict_sink_pages);
+        // P8: the environment names the window, and it now wins over a residency plan's
+        // keep-everything default (model_instance.cpp). Print what is in force rather than the
+        // option default, so a 192-page read set is not reported as the built-in 4.
+        std::uint32_t window_pages = engine.evict_window_pages;
+        std::uint32_t sink_pages   = engine.evict_sink_pages;
+        bool from_environment      = false;
+        if (const char* value = std::getenv("NINFER_KV_EVICT_WINDOW");
+            value != nullptr && *value != '\0') {
+            window_pages     = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
+            from_environment = true;
+        }
+        if (const char* value = std::getenv("NINFER_KV_EVICT_SINK");
+            value != nullptr && *value != '\0') {
+            sink_pages       = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
+            from_environment = true;
+        }
+        logger_->info("eviction | contract on | window {} sink {} pages{} | host demotion by default",
+                      window_pages, sink_pages,
+                      from_environment ? " (from the environment)" : "");
     } else if ((memory.evict_contract_reasons & 8U) == 0) {
         logger_->warn("eviction | the KV dtype has no absent-page path (NVFP4): an eviction "
                       "window would be silently skipped here, so it is not installed");
