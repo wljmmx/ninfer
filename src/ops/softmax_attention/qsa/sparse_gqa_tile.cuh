@@ -68,7 +68,8 @@ sparse_gqa_addresses(const SparseGqaArguments& a, SparseGqaStorage<Storage, N, W
 
 template <KvCacheStorage Storage, int N, int Warps, bool Vector, bool Key, SparseGqaLoad Load>
 __device__ void sparse_gqa_stage(const SparseGqaArguments& a,
-                                 SparseGqaStorage<Storage, N, Warps, Load>& s, int start, int end) {
+                                 SparseGqaStorage<Storage, N, Warps, Load>& s, int start, int end,
+                                 int column_base = 0, int columns = 256) {
     using Codec      = SparseGqaCodec<Storage, Key>;
     const auto plane = Key ? a.key : a.value, scale_plane = Key ? a.key_scale : a.value_scale;
     const auto* addresses       = Key ? s.addresses.key : s.addresses.value;
@@ -141,9 +142,14 @@ __device__ void sparse_gqa_stage(const SparseGqaArguments& a,
         // Keep `unroll 1`: the kernel already sits at 255 registers, and unrolling this loop by two
         // measured 694,848 -> 718,896 instructions with local sectors 25,712 -> 138,576 - the
         // strength reduction it enables costs more spill than it saves.
+        //
+        // `column_base`/`columns` narrow the value plane to the columns this block owns. The row
+        // stride stays 256 so the swizzle, and with it the bank pattern of the PV ldmatrix, is
+        // exactly the one the wide copy used.
+        const int groups = columns / 8;
 #pragma unroll 1
-        for (int i = threadIdx.x; i < N * 32; i += Warps * 32) {
-            const int row = i / 32, d = i % 32 * 8;
+        for (int i = threadIdx.x; i < N * groups; i += Warps * 32) {
+            const int row = i / groups, d = column_base + i % groups * 8;
             auto* dst = decoded + row * 256 + causal_swizzle(row, d);
             if (start + row >= end)
                 store_vec(dst, make_int4(0, 0, 0, 0));

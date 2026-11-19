@@ -68,7 +68,8 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaArguments a,
         cp_wait<0>();
         __syncthreads();
         sparse_gqa_expand_stage<Storage, true>(s);
-        sparse_gqa_stage<Storage, N, Warps, VectorCache, false>(a, s, k0, end);
+        sparse_gqa_stage<Storage, N, Warps, VectorCache, false>(a, s, k0, end, d_base * 8,
+                                                                Cols * 8);
         cp_commit();
         float score[QKNt][4] = {};
 #pragma unroll
