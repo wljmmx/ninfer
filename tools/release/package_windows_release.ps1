@@ -111,9 +111,18 @@ foreach ($item in @('convert', 'artifact', 'freq_corpus', 'chat_templates', 'con
                     'upgrade_ninfer_v2_to_v3.py', 'generate_jinja_unicode.py')) {
     $src = Join-Path $Repo "tools\$item"
     if (-not (Test-Path $src)) { continue }
-    if (Test-Path $src -PathType Container) { Copy-Item $src $tools -Recurse -Force }
+    if (Test-Path $src -PathType Container) {
+        # Mirror, do not merge: a file deleted from the repository (the retired demo page) must not
+        # survive in the folder just because an earlier packaging run wrote it there.
+        $dest = Join-Path $tools $item
+        if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
+        Copy-Item $src $tools -Recurse -Force
+    }
     else { Copy-Item $src $tools -Force }
 }
+# Python byte-compilation caches are build output, not part of the tool.
+Get-ChildItem $tools -Recurse -Directory -Filter '__pycache__' -ErrorAction SilentlyContinue |
+    ForEach-Object { Remove-Item $_.FullName -Recurse -Force }
 
 $consoleBat = @'
 @echo off
