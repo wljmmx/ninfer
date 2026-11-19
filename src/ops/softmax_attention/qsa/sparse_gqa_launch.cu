@@ -7,17 +7,38 @@ namespace {
 // The output route is fixed by the plan before the launch, so it is a template argument rather than
 // a run-time test: each kernel then carries one epilogue instead of both, which halves its body and
 // keeps the other route out of its register allocation.
-template <KvCacheStorage Storage, bool VectorCache, SparseGqaLoad Load>
-void launch_mma(SparseGqaArguments a, SparseGqaPlan plan, int queries, unsigned z,
-                DeviceExecutionView execution) {
+template <KvCacheStorage Storage, bool VectorCache, SparseGqaLoad Load, int Slices>
+void launch_mma_slice(SparseGqaArguments a, SparseGqaPlan plan, int queries, unsigned z,
+                      DeviceExecutionView execution) {
     const auto grid   = dim3(queries * a.kv_heads, a.splits, z);
     const auto shared = sizeof(SparseGqaStorage<Storage, 32, 2, Load>);
     if (plan.partial)
-        sparse_gqa_mma_kernel<Storage, 32, 2, VectorCache, Load, false>
+        sparse_gqa_mma_kernel<Storage, 32, 2, VectorCache, Load, false, Slices>
             <<<grid, 64, shared, execution.stream>>>(a);
     else
-        sparse_gqa_mma_kernel<Storage, 32, 2, VectorCache, Load, true>
+        sparse_gqa_mma_kernel<Storage, 32, 2, VectorCache, Load, true, Slices>
             <<<grid, 64, shared, execution.stream>>>(a);
+}
+
+template <KvCacheStorage Storage, bool VectorCache, SparseGqaLoad Load>
+void launch_mma(SparseGqaArguments a, SparseGqaPlan plan, int queries,
+                DeviceExecutionView execution) {
+    if constexpr (!kSparseSlicedValue<Storage>) {
+        launch_mma_slice<Storage, VectorCache, Load, 1>(a, plan, queries, 1u, execution);
+        return;
+    }
+    // An extra slice repeats the QK pass but shortens each block's chain, so it only pays while the
+    // grid is well inside the machine. The plan's split count is an upper bound; what the kernel
+    // actually launches is min(plan.splits, tiles), and the selection caps the tiles.
+    // Measured on sm_89 with the effective count: four slices win below one block per SM and lose
+    // at it (T=64 with 128 effective blocks: 13.3 us at two slices, 15.4 at four).
+    const auto tiles  = std::max(1, (a.selected * 4 + 3 + a.key_rows - 1) / a.key_rows);
+    const auto splits = std::min(a.splits, tiles);
+    const auto blocks = std::int64_t(queries) * a.kv_heads * splits;
+    if (blocks < execution.multiprocessor_count)
+        launch_mma_slice<Storage, VectorCache, Load, 4>(a, plan, queries, 4u, execution);
+    else
+        launch_mma_slice<Storage, VectorCache, Load, 2>(a, plan, queries, 2u, execution);
 }
 
 template <KvCacheStorage Storage, bool VectorCache>
@@ -25,7 +46,7 @@ void launch(SparseGqaArguments a, SparseGqaPlan plan, int queries, DeviceExecuti
     // rk planes keep codes and scales in separate regions, so the packed-row staging routes do not
     // describe them; the direct read path decodes straight from the two planes.
     constexpr bool Async = kSparseQuantized<Storage> && VectorCache && !kSparseRk<Storage>;
-    // V11-07 cuts the output row across two z slices; a rotated-value block owns the whole row.
+    // V11-07 cuts the output row across z slices; a rotated-value block owns the whole row.
     constexpr unsigned Z = kSparseSlicedValue<Storage> ? 2u : 1u;
     if (plan.instance == SparseGqaInstance::FullPrefix) {
         constexpr auto load   = Async ? SparseGqaLoad::InPlace : SparseGqaLoad::Direct;
@@ -48,11 +69,11 @@ void launch(SparseGqaArguments a, SparseGqaPlan plan, int queries, DeviceExecuti
         const bool inplace =
             (blocks + 3 * sms - 1) / (3 * sms) < (blocks + 2 * sms - 1) / (2 * sms);
         if (inplace)
-            launch_mma<Storage, VectorCache, SparseGqaLoad::InPlace>(a, plan, queries, Z, execution);
+            launch_mma<Storage, VectorCache, SparseGqaLoad::InPlace>(a, plan, queries, execution);
         else
-            launch_mma<Storage, VectorCache, SparseGqaLoad::Staged>(a, plan, queries, Z, execution);
+            launch_mma<Storage, VectorCache, SparseGqaLoad::Staged>(a, plan, queries, execution);
     } else {
-        launch_mma<Storage, VectorCache, SparseGqaLoad::Direct>(a, plan, queries, Z, execution);
+        launch_mma<Storage, VectorCache, SparseGqaLoad::Direct>(a, plan, queries, execution);
     }
     if (plan.partial)
         sparse_gqa_merge_kernel<Storage><<<queries * a.query_heads, 128, 0, execution.stream>>>(a);

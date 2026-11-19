@@ -8,7 +8,7 @@
 namespace ninfer::ops::detail::qsa {
 
 template <KvCacheStorage Storage, int N, int Warps, bool VectorCache,
-          SparseGqaLoad Load = SparseGqaLoad::Direct, bool Direct = false>
+          SparseGqaLoad Load = SparseGqaLoad::Direct, bool Direct = false, int Slices = 1>
 __device__ __forceinline__ void sparse_gqa_mma(SparseGqaArguments a,
                                                SparseGqaStorage<Storage, N, Warps, Load>& s,
                                                std::int64_t q, int head, int split, int d_base) {
@@ -49,7 +49,7 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaArguments a,
     // is not available; cutting the OUTPUT dim is, and it is bit-identical because the softmax
     // statistics (maximum / sum) are key-side and do not depend on d. The rotated-value families
     // cannot be cut (kSparseSlicedValue): they own all 32 columns.
-    constexpr int Cols = kSparseSlicedValue<Storage> ? 16 : 32;
+    constexpr int Cols = kSparseSgqaColumnsPerSlice<Slices>;
     float acc[Cols][4] = {};
     Bf16KvSoftmaxRow state[2];
     constexpr float scale = kLog2E / 16.0f;
@@ -205,11 +205,12 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaArguments a,
 }
 
 template <KvCacheStorage Storage, int N, int Warps, bool VectorCache, SparseGqaLoad Load,
-          bool Direct>
+          bool Direct, int Slices>
 __device__ __forceinline__ void sparse_gqa_compute(SparseGqaArguments a,
                                                    SparseGqaStorage<Storage, N, Warps, Load>& s,
                                                    std::int64_t q, int head, int split, int d_base) {
-    sparse_gqa_mma<Storage, N, Warps, VectorCache, Load, Direct>(a, s, q, head, split, d_base);
+    sparse_gqa_mma<Storage, N, Warps, VectorCache, Load, Direct, Slices>(a, s, q, head, split,
+                                                                        d_base);
     if constexpr (kSparseRotatedValue<Storage>) {
         if constexpr (Direct) {
             // MMA's reduction leaves only warp zero writing s.partial. Every warp returns
@@ -234,13 +235,13 @@ __device__ __forceinline__ bool sparse_gqa_all_selected(const SparseGqaArguments
 }
 
 template <KvCacheStorage Storage, int N, int Warps, bool VectorCache,
-          SparseGqaLoad Load = SparseGqaLoad::Direct, bool Direct = false>
+          SparseGqaLoad Load = SparseGqaLoad::Direct, bool Direct = false, int Slices = 1>
 __launch_bounds__(Warps * 32) __global__ void sparse_gqa_mma_kernel(SparseGqaArguments a) {
     extern __shared__ __align__(16) unsigned char smem[];
     auto& s = *reinterpret_cast<SparseGqaStorage<Storage, N, Warps, Load>*>(smem);
-    sparse_gqa_compute<Storage, N, Warps, VectorCache, Load, Direct>(
+    sparse_gqa_compute<Storage, N, Warps, VectorCache, Load, Direct, Slices>(
         a, s, a.begin + blockIdx.x / a.kv_heads, blockIdx.x % a.kv_heads, blockIdx.y,
-        kSparseSlicedValue<Storage> ? static_cast<int>(blockIdx.z) * 16 : 0);
+        static_cast<int>(blockIdx.z) * kSparseSgqaColumnsPerSlice<Slices>);
 }
 
 template <KvCacheStorage Storage>

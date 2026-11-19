@@ -24,6 +24,11 @@ inline constexpr bool kSparseRotatedValue =
 template <KvCacheStorage Storage>
 inline constexpr bool kSparseSlicedValue = !kSparseRotatedValue<Storage>;
 
+// Output columns one block owns, in units of eight (the mma's n step). A block takes 32/Slices of
+// them, so the grid's z extent equals Slices.
+template <int Slices>
+inline constexpr int kSparseSgqaColumnsPerSlice = 32 / Slices;
+
 // The rank-compressed family: an int8/int4 or E8-cylinder key carrier over the rotated K, and an
 // int4 or 2-bit E8-cylinder value plane in the original frame (so no inverse rotation). Its planes
 // keep data and scales in separate regions, so the packed-row staging route does not apply: these

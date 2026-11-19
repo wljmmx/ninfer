@@ -141,7 +141,9 @@ __launch_bounds__(Queries * 32) __global__ void sparse_gqa_all_select_kernel(Spa
     // alone and the other slice leaves it untouched instead of routing the same queries through
     // the sparse path a second time (that path would rewrite columns 128..255 with a different
     // cross-warp summation order).
-    const int d_base = kSparseSlicedValue<Storage> ? static_cast<int>(blockIdx.z) * 16 : 0;
+    // The full-prefix kernel keeps the two-slice split for the plain value frame.
+    constexpr int Slices = kSparseSlicedValue<Storage> ? 2 : 1;
+    const int d_base = static_cast<int>(blockIdx.z) * kSparseSgqaColumnsPerSlice<Slices>;
     auto* qs         = reinterpret_cast<std::uint16_t*>(
         smem + (sizeof(SparseGqaStorage<Storage, N, Queries, Load>) + 15) / 16 * 16);
     if (sparse_gqa_all_selected<Queries>(a, first)) {
@@ -152,7 +154,8 @@ __launch_bounds__(Queries * 32) __global__ void sparse_gqa_all_select_kernel(Spa
 #pragma unroll 1
     for (int i = 0; i < Queries && first + i < total; ++i) {
         // The plan gives FullPrefix no partial workspace, so this route always owns its rows.
-        sparse_gqa_compute<Storage, N, Queries, Vector, Load, true>(a, s, first + i, head, 0, d_base);
+        sparse_gqa_compute<Storage, N, Queries, Vector, Load, true, Slices>(a, s, first + i, head, 0,
+                                                                           d_base);
         __syncthreads();
     }
 }
