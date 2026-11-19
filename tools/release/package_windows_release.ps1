@@ -45,13 +45,17 @@ foreach ($needed in (@($exes | ForEach-Object { Join-Path $apps $_ }) +
     if (-not (Test-Path $needed)) { throw "missing build product: $needed (run the Release build first)" }
 }
 
-# Staleness: the newest source change may not be newer than ninfer.exe.
-$newestSource = Get-ChildItem (Join-Path $Repo 'src'), (Join-Path $Repo 'include') -Recurse -File |
-    Where-Object { $_.Extension -in '.h', '.hpp', '.cpp', '.cu', '.cuh' } |
-    Sort-Object LastWriteTime -Descending | Select-Object -First 1
-$binary = Get-Item (Join-Path $apps 'ninfer.exe')
-if ($newestSource -and $newestSource.LastWriteTime -gt $binary.LastWriteTime) {
-    throw "ninfer.exe is older than $($newestSource.FullName); rebuild before packaging"
+# Staleness: ask the build system, not the clock. A source file newer than ninfer.exe proves nothing
+# when that file belongs to a sibling target (src\serve\operational_log.cpp is linked into
+# ninfer-serve, not ninfer) and every product was rebuilt in the same invocation. A dry run reports
+# exactly the targets that still need work.
+$dryRun = & cmake --build $Build --target ($exes | ForEach-Object { [IO.Path]::GetFileNameWithoutExtension($_) }) -- -n 2>&1
+if ($LASTEXITCODE -ne 0) {
+    throw "cannot check build freshness: $($dryRun -join ' ')"
+}
+$pending = @($dryRun | Where-Object { $_ -match '^(Building|Linking|Generating)' })
+if ($pending.Count -gt 0) {
+    throw "build products are stale; rebuild before packaging: $($pending -join '; ')"
 }
 
 $dirs = @($Root, "$Root\docs", "$Root\templates", "$Root\scripts")
