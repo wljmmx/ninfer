@@ -31,7 +31,9 @@ void launch_mma(SparseGqaArguments a, SparseGqaPlan plan, int queries,
     // grid is well inside the machine. The plan's split count is an upper bound; what the kernel
     // actually launches is min(plan.splits, tiles), and the selection caps the tiles.
     // Measured on sm_89 with the effective count: four slices win below one block per SM and lose
-    // at it (T=64 with 128 effective blocks: 13.3 us at two slices, 15.4 at four).
+    // at it (T=64 with 128 effective blocks: 13.3 us at two slices, 15.4 at four). Eight slices
+    // were measured too and bought nothing - T=1 keeps 10.2 us, and T=8 with five splits regresses
+    // to 13.3 from 12.3 because the QK pass is then repeated eight times per tile.
     const auto tiles  = std::max(1, (a.selected * 4 + 3 + a.key_rows - 1) / a.key_rows);
     const auto splits = std::min(a.splits, tiles);
     const auto blocks = std::int64_t(queries) * a.kv_heads * splits;
