@@ -31,7 +31,13 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaArguments a,
     if (split >= work.splits) return;
     const int start = (split * work.tiles / work.splits) * N;
     const int end   = min(work.size, ((split + 1) * work.tiles / work.splits) * N);
-    // The Q prologue reuses K's shared storage, then keeps Q in registers.
+    // The Q prologue reuses K's shared storage, then keeps Q in registers. Q is the largest live
+    // block (64 of the 255 registers), so keeping it in its own 8 KB shared region and taking one d
+    // slice per pass was measured - sixteen ldmatrix calls either way, but 255 -> 144 registers and
+    // local spill traffic -> 0. It bought 1.9% fewer instructions and cost 3% of the kernel
+    // (6.78 -> 6.98 us): nothing end to end. Unrolling the staging loop on top of that, with the
+    // freed registers available, is neutral too (7.04 us). The arm is chain-bound, not
+    // register-bound, and the chain is the QK pass, the staging and the prologue.
     sparse_gqa_prepare_query<Storage, Warps, 1>(a, q, q + 1, head, ks);
     unsigned qf[16][4];
     const int ar = (lane & 7) + ((lane >> 3) & 1) * 8;
