@@ -52,7 +52,7 @@
   .kv b{font-weight:600;font-family:Consolas,monospace}
   .big{font-family:Consolas,monospace;font-size:26px;letter-spacing:.5px}
   .unit{font-size:12px;color:var(--dim);margin-left:4px}
-  .metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px}
+  .metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
   .metrics div{background:#0b0f14;border:1px solid var(--line);border-radius:8px;padding:8px 10px}
   .metrics .lbl{font-size:11px;color:var(--dim)}
   pre{margin:0;background:#0b0f14;border:1px solid var(--line);border-radius:8px;
@@ -78,17 +78,39 @@
   .optrow input[type=number],.optrow input[type=text],.optrow select{padding:2px 6px;font-size:12px;width:100%}
   .optrow.off .flag,.optrow.off .desc{opacity:.5}
   .optrow.blocked{opacity:.35}
-</style>
+  /* ---- 视图与导航 ---- */
+  nav{display:flex;gap:6px;margin-left:18px}
+  #pill{margin-left:auto}
+  #src{margin-left:12px}
+  nav button{background:transparent;border:1px solid transparent;color:var(--dim);padding:4px 12px;
+             border-radius:8px;font-size:13px}
+  nav button.active{color:var(--ink);border-color:var(--line);background:#182031}
+  nav button:hover{color:var(--ink)}
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px}
+  .kpi{background:#0b0f14;border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+  .kpi .lbl{font-size:12px;color:var(--dim);letter-spacing:.3px}
+  .kpi .val{font-family:Consolas,monospace;font-size:34px;line-height:1.15;margin-top:6px}
+  .kpi .sub{font-size:11px;color:var(--dim);margin-top:2px}
+  .card[data-view]{scroll-margin-top:12px}</style>
 </head>
 <body>
 <header>
   <h1>NInfer 控制台</h1>
+  <nav><button id="tabFleet" class="active">总览</button><button id="tabEngine">引擎</button></nav>
   <span id="pill" class="pill idle">引擎未启动</span>
   <span id="src" class="muted"></span>
 </header>
 
 <main>
-  <section class="card">
+  <section class="card wide" data-view="fleet">
+    <h2>关键指标</h2>
+    <div class="kpis">
+      <div class="kpi"><div class="lbl">decode</div><div class="val" id="k-decode">—</div><div class="sub">tok/s · 1 s 采样窗口</div></div>
+      <div class="kpi"><div class="lbl">prefill</div><div class="val" id="k-prefill">—</div><div class="sub">tok/s</div></div>
+      <div class="kpi"><div class="lbl">TTFT</div><div class="val" id="k-ttft">—</div><div class="sub">ms · 最近一次首 token</div></div>
+      <div class="kpi"><div class="lbl">请求 运行 / 等待</div><div class="val" id="k-req">—</div><div class="sub">并发 + 队列</div></div>
+    </div>
+  </section>  <section data-view="fleet" class="card wide">
     <h2>启动引擎</h2>
     <div class="row">
       <div id="crumbs" class="crumbs"></div>
@@ -127,7 +149,7 @@
     <details style="margin-top:10px"><summary class="muted">启动命令</summary><pre id="cmd">—</pre></details>
   </section>
 
-  <section class="card">
+  <section data-view="engine" class="card wide">
     <h2>引擎</h2>
     <div class="kv">
       <span>状态</span><b id="m-status">—</b>
@@ -153,13 +175,13 @@
     </div>
   </section>
 
-  <section class="card wide">
+  <section data-view="fleet" class="card wide">
     <h2>吞吐曲线（decode / prefill，tok/s）</h2>
     <canvas id="chart" height="150"></canvas>
     <div id="chartNote" class="empty">引擎未启动：没有曲线。</div>
   </section>
 
-  <section class="card wide">
+  <section data-view="engine" class="card wide">
     <h2>请求事件</h2>
     <div style="max-height:240px;overflow:auto">
       <table style="width:100%;border-collapse:collapse;font-size:12px">
@@ -172,7 +194,7 @@
     <div id="reqNote" class="empty">引擎未启动：没有事件。</div>
   </section>
 
-  <section class="card">
+  <section data-view="fleet" class="card">
     <h2>GPU</h2>
     <div class="kv">
       <span>功率</span><b id="g-power">—</b>
@@ -184,7 +206,7 @@
     <div id="gpuNote" class="empty">—</div>
   </section>
 
-  <section class="card">
+  <section data-view="fleet" class="card">
     <h2>LMCache</h2>
     <div class="kv">
       <span>L1 使用率</span><b id="l-usage">—</b>
@@ -195,7 +217,7 @@
     <div class="row" style="margin-top:10px"><button id="lcStart" class="primary">启动 LMCache</button><button id="lcStop">停止</button><span id="lcState" class="muted">—</span></div><pre id="lcLog" style="max-height:120px;margin-top:8px">—</pre><div id="lcNote" class="empty">未接 LMCache 指标源（可选）。</div>
   </section>
 
-  <section class="card wide">
+  <section data-view="engine" class="card wide">
     <h2>引擎日志（本次启动）</h2>
     <pre id="log">—</pre>
   </section>
@@ -220,6 +242,19 @@ async function postJSON(url, body){
                               body: JSON.stringify(body || {})});
   return r.json();
 }
+
+/* ---------- 视图：总览 / 引擎 ---------- */
+let view = 'fleet';
+function setView(next){
+  view = next;
+  document.querySelectorAll('[data-view]').forEach(el => { el.hidden = el.dataset.view !== view; });
+  $('tabFleet').classList.toggle('active', view === 'fleet');
+  $('tabEngine').classList.toggle('active', view === 'engine');
+  if (view === 'fleet') drawChart();
+}
+$('tabFleet').onclick = () => setView('fleet');
+$('tabEngine').onclick = () => setView('engine');
+setView('fleet');
 
 /* ---------- 模型浏览 ---------- */
 function crumbs(path){
@@ -489,6 +524,11 @@ function setEngine(payload){
   $('m-ttft').textContent = ttft.length ? fmt(ttft[ttft.length - 1], 1)
                                         : fmt(null);
   const counters = payload.counters || {};
+  $('k-decode').textContent = ok ? fmt(rate.decode_tps, 1) : '—';
+  $('k-prefill').textContent = ok ? fmt(rate.prefill_tps, 1) : '—';
+  $('k-ttft').textContent = ok ? (ttft.length ? fmt(ttft[ttft.length - 1], 1) : '—') : '—';
+  $('k-req').textContent = ok ? (fmtInt(counters.running_requests) + ' / ' + fmtInt(counters.waiting_requests)) : '—';
+  $('tabEngine').textContent = '引擎' + (ok && model.name ? ' · ' + model.name : '');
   $('m-req').textContent = ok ? (fmtInt(counters.running_requests) + ' / ' + fmtInt(counters.waiting_requests))
                               : '—';
 
