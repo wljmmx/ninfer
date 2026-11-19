@@ -138,6 +138,9 @@ __device__ void sparse_gqa_stage(const SparseGqaArguments& a,
             }
         }
     } else {
+        // Keep `unroll 1`: the kernel already sits at 255 registers, and unrolling this loop by two
+        // measured 694,848 -> 718,896 instructions with local sectors 25,712 -> 138,576 - the
+        // strength reduction it enables costs more spill than it saves.
 #pragma unroll 1
         for (int i = threadIdx.x; i < N * 32; i += Warps * 32) {
             const int row = i / 32, d = i % 32 * 8;
