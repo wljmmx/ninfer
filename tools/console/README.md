@@ -15,14 +15,21 @@ Then open **http://127.0.0.1:8099/**. Keep the window open; Ctrl+C stops it.
 
 The page has no hard-coded model. It lists `.ninfer` files under the configured models roots
 (`--models-root`, default `R:\model` and the release's own `..\model`), and asks this server to
-start one:
+start one. **选择目录…** opens the host's own folder picker, so a model that lives anywhere on
+the machine can be reached: the chosen directory is added to the roots for this session, and a
+directory holding exactly one `.ninfer` selects that file straight away.
 
 | Route | Does |
 |---|---|
 | `GET /api/models.json?dir=<abs path>` | one level of directories and `.ninfer` files under a root |
+| `POST /api/dialog/folder` | opens the host folder picker (`initial`), adds the result as a root |
 | `POST /api/launch` | `{model, port, max_context, max_concurrency, prefill_chunk, kv_dtype, extra}` |
 | `POST /api/launch/stop` | terminates the engine this server started |
 | `GET /api/launch/status.json` | pid, uptime, the exact command line, and the log tail |
+
+The picker is a native Windows dialog owned by the server process, which is why the console has to
+run in an interactive desktop session. A browser cannot supply this: its directory chooser hands
+back a sandboxed name, never the host path the engine needs.
 
 The server parses every field, range-checks it, refuses a model outside the roots, and spawns
 `ninfer-serve.exe` without a shell, so a value from the page can never become a command. One

@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
 <title>NInfer 控制台</title>
 <style>
   :root{
@@ -72,6 +73,7 @@
     <div class="row">
       <div id="crumbs" class="crumbs"></div>
       <span style="flex:1"></span>
+      <button id="pickdir" title="在主机上选择模型所在目录">选择目录…</button>
       <button id="up" title="上一级">上一级</button>
       <button id="refresh" title="重新读取目录">刷新</button>
     </div>
@@ -185,13 +187,15 @@ function crumbs(path){
   el.innerHTML = parts.join(' <span>›</span> ');
   el.querySelectorAll('a').forEach(a => a.onclick = () => loadDir(a.dataset.p));
 }
-async function loadDir(dir){
+function selectModel(x, row){
+  state.model = x.path;
+  $('model').value = x.path;
   const box = $('browser');
-  box.innerHTML = '<div class="empty">读取中…</div>';
-  let d;
-  try{ d = await getJSON('/api/models.json?dir=' + encodeURIComponent(dir || '')); }
-  catch(e){ box.innerHTML = '<div class="empty">读取失败：' + e.message + '</div>'; return; }
-  if (!d.ok){ box.innerHTML = '<div class="empty">' + (d.error || '读取失败') + '</div>'; crumbs(''); return; }
+  box.querySelectorAll('.sel').forEach(n => n.classList.remove('sel'));
+  if (row) row.classList.add('sel');
+}
+function renderBrowse(d){
+  const box = $('browser');
   state.dir = d.path || '';
   crumbs(d.path || '');
   box.innerHTML = '';
@@ -214,17 +218,41 @@ async function loadDir(dir){
   (d.models || []).forEach(x => {
     const row = document.createElement('div');
     row.innerHTML = '<span>' + x.name + '</span><span class="n">' + fmt(x.size_gib, 1) + ' GiB</span>';
-    row.onclick = () => {
-      state.model = x.path;
-      $('model').value = x.path;
-      box.querySelectorAll('.sel').forEach(n => n.classList.remove('sel'));
-      row.classList.add('sel');
-    };
+    row.onclick = () => selectModel(x, row);
     box.appendChild(row);
   });
   if (!(d.dirs || []).length && !(d.models || []).length)
     box.innerHTML = '<div class="empty">此目录下没有子目录或 .ninfer 文件</div>';
+  // A directory holding exactly one model is the answer the operator meant by picking it.
+  if ((d.models || []).length === 1) selectModel(d.models[0], box.lastElementChild);
 }
+async function loadDir(dir){
+  const box = $('browser');
+  box.innerHTML = '<div class="empty">读取中…</div>';
+  let d;
+  try{ d = await getJSON('/api/models.json?dir=' + encodeURIComponent(dir || '')); }
+  catch(e){ box.innerHTML = '<div class="empty">读取失败：' + e.message + '</div>'; return; }
+  if (!d.ok){ box.innerHTML = '<div class="empty">' + (d.error || '读取失败') + '</div>'; crumbs(''); return; }
+  renderBrowse(d);
+}
+$('pickdir').onclick = async () => {
+  const btn = $('pickdir');
+  btn.disabled = true;
+  $('launchMsg').textContent = '等待在主机上选择目录…';
+  try{
+    const r = await postJSON('/api/dialog/folder', {initial: state.dir || ''});
+    if (r.ok && r.browse){
+      renderBrowse(r.browse);
+      $('launchMsg').textContent = '已加入目录：' + r.path;
+    } else if (r.cancelled){
+      $('launchMsg').textContent = '已取消选择';
+    } else {
+      $('launchMsg').textContent = '失败：' + (r.error || '未知原因');
+    }
+  } catch(e){
+    $('launchMsg').textContent = '失败：' + e.message;
+  } finally { btn.disabled = false; }
+};
 $('up').onclick = () => loadDir(state.dir ? state.dir.replace(/[\\/][^\\/]+$/, '') : '');
 $('refresh').onclick = () => loadDir(state.dir);
 

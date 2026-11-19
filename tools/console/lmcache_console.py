@@ -45,7 +45,9 @@ import shlex
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
+
 import time
 import urllib.error
 import urllib.parse
@@ -647,6 +649,27 @@ class Launcher:
         self.started_at = 0.0
         self.exit_code: int | None = None
 
+    # -- roots -----------------------------------------------------------
+    def add_root(self, raw: str) -> Path | None:
+        """Remember a directory the operator picked in the host's own dialog.
+
+        The page cannot name an absolute host path on its own: a browser directory chooser hands
+        back a sandboxed name, never the real path, so the console asks the server to open the
+        host picker and this is where the answer is accepted. A path that is not a directory is
+        refused here rather than silently ignored.
+        """
+        if not raw:
+            return None
+        try:
+            resolved = Path(raw).resolve()
+        except OSError:
+            return None
+        if not resolved.is_dir():
+            return None
+        if resolved not in [root.resolve() for root in self.roots]:
+            self.roots.append(resolved)
+        return resolved
+
     # -- path handling ---------------------------------------------------
     def resolve(self, raw: str) -> Path | None:
         """A path the page named, resolved and required to stay inside a root."""
@@ -827,6 +850,57 @@ class Launcher:
                 "log": self.log_tail()}
 
 
+_PICK_LOCK = threading.Lock()
+
+
+def pick_folder(initial: str = "") -> dict:
+    """Open the host's own folder picker and return the absolute path the operator chose.
+
+    A page cannot do this itself: the browser's directory chooser hands back a sandboxed name,
+    never the host's real path, and the engine has to be started with the real one. So the window
+    comes from this process — which means the console has to run in an interactive desktop session.
+    """
+    if not _PICK_LOCK.acquire(blocking=False):
+        return {"ok": False, "error": "a folder picker is already open"}
+    handle, out_path = tempfile.mkstemp(suffix=".txt", prefix="ninfer_pick_")
+    os.close(handle)
+    try:
+        quoted_out = out_path.replace("'", "''")
+        quoted_in = (initial or "").replace("'", "''")
+        script = "\n".join([
+            "Add-Type -AssemblyName System.Windows.Forms | Out-Null",
+            "$d = New-Object System.Windows.Forms.FolderBrowserDialog",
+            "$d.Description = '选择模型目录（.ninfer 所在目录）'",
+            f"$d.SelectedPath = '{quoted_in}'",
+            "$d.ShowNewFolderButton = $true",
+            "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {",
+            f"  [System.IO.File]::WriteAllText('{quoted_out}', $d.SelectedPath,",
+            "    (New-Object System.Text.UTF8Encoding($false)))",
+            "}",
+        ])
+        try:
+            subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", script],
+                           capture_output=True, timeout=900,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": "the folder picker stayed open for 15 minutes"}
+        except OSError as exc:
+            return {"ok": False, "error": f"cannot open the folder picker: {exc}"}
+        try:
+            chosen = Path(out_path).read_text(encoding="utf-8-sig", errors="replace").strip()
+        except OSError:
+            chosen = ""
+        if not chosen:
+            return {"ok": False, "cancelled": True}
+        return {"ok": True, "path": chosen}
+    finally:
+        try:
+            os.unlink(out_path)
+        except OSError:
+            pass
+        _PICK_LOCK.release()
+
+
 class Handler(BaseHTTPRequestHandler):
     page: Path = Path("console.html")
     upstream: str = "http://127.0.0.1:18080/metrics"
@@ -927,6 +1001,30 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 (http.server naming)
         path = self.path.split("?", 1)[0]
+        if path == "/api/dialog/folder":
+            if not self._same_origin():
+                self._send(403, json.dumps({"ok": False, "error": "cross-origin request refused"},
+                                           ensure_ascii=False).encode(), "application/json")
+                return
+            if self.launcher is None:
+                self._send(503, json.dumps({"ok": False, "error": "launcher not configured"},
+                                           ensure_ascii=False).encode(), "application/json")
+                return
+            try:
+                payload = json.loads(self._read_body().decode("utf-8", "replace") or "{}")
+            except ValueError:
+                payload = {}
+            initial = (payload.get("initial") if isinstance(payload, dict) else "") or \
+                (str(self.launcher.roots[0]) if self.launcher.roots else "")
+            result = pick_folder(str(initial))
+            if result.get("ok"):
+                root = self.launcher.add_root(result["path"])
+                if root is None:
+                    result = {"ok": False, "error": "the chosen path is not a directory"}
+                else:
+                    result["browse"] = self.launcher.browse(str(root))
+            self._send(200, json.dumps(result, ensure_ascii=False).encode(), "application/json")
+            return
         if path in ("/api/launch", "/api/launch/stop"):
             if not self._same_origin():
                 self._send(403, json.dumps({"ok": False, "error": "cross-origin launch refused"},
