@@ -9,6 +9,8 @@ void launch(SparseGqaArguments a, SparseGqaPlan plan, int queries, DeviceExecuti
     // rk planes keep codes and scales in separate regions, so the packed-row staging routes do not
     // describe them; the direct read path decodes straight from the two planes.
     constexpr bool Async = kSparseQuantized<Storage> && VectorCache && !kSparseRk<Storage>;
+    // V11-07 cuts the output row across two z slices; a rotated-value block owns the whole row.
+    constexpr unsigned Z = kSparseSlicedValue<Storage> ? 2u : 1u;
     if (plan.instance == SparseGqaInstance::FullPrefix) {
         constexpr auto load   = Async ? SparseGqaLoad::InPlace : SparseGqaLoad::Direct;
         constexpr auto kernel = sparse_gqa_all_select_kernel<Storage, 64, 4, VectorCache, load>;
@@ -18,7 +20,7 @@ void launch(SparseGqaArguments a, SparseGqaPlan plan, int queries, DeviceExecuti
         static const auto status =
             cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
         CUDA_CHECK(status);
-        kernel<<<dim3((queries + 3) / 4 * a.kv_heads, 1, 2), 128, bytes, execution.stream>>>(a);
+        kernel<<<dim3((queries + 3) / 4 * a.kv_heads, 1, Z), 128, bytes, execution.stream>>>(a);
     } else if (plan.instance == SparseGqaInstance::Simt) {
         sparse_gqa_simt_kernel<Storage, 8, VectorCache>
             <<<dim3(queries * a.query_heads, a.splits), 256, 0, execution.stream>>>(a);
@@ -31,17 +33,17 @@ void launch(SparseGqaArguments a, SparseGqaPlan plan, int queries, DeviceExecuti
             (blocks + 3 * sms - 1) / (3 * sms) < (blocks + 2 * sms - 1) / (2 * sms);
         if (inplace)
             sparse_gqa_mma_kernel<Storage, 32, 2, VectorCache, SparseGqaLoad::InPlace>
-                <<<dim3(queries * a.kv_heads, a.splits, 2), 64,
+                <<<dim3(queries * a.kv_heads, a.splits, Z), 64,
                    sizeof(SparseGqaStorage<Storage, 32, 2, SparseGqaLoad::InPlace>),
                    execution.stream>>>(a);
         else
             sparse_gqa_mma_kernel<Storage, 32, 2, VectorCache, SparseGqaLoad::Staged>
-                <<<dim3(queries * a.kv_heads, a.splits, 2), 64,
+                <<<dim3(queries * a.kv_heads, a.splits, Z), 64,
                    sizeof(SparseGqaStorage<Storage, 32, 2, SparseGqaLoad::Staged>),
                    execution.stream>>>(a);
     } else {
         sparse_gqa_mma_kernel<Storage, 32, 2, VectorCache>
-            <<<dim3(queries * a.kv_heads, a.splits, 2), 64,
+            <<<dim3(queries * a.kv_heads, a.splits, Z), 64,
                sizeof(SparseGqaStorage<Storage, 32, 2>), execution.stream>>>(a);
     }
     if (plan.partial)

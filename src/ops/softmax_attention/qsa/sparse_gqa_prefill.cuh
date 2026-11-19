@@ -137,20 +137,22 @@ __launch_bounds__(Queries * 32) __global__ void sparse_gqa_all_select_kernel(Spa
                total = std::int64_t(a.tokens) * a.batch;
     const int head   = blockIdx.x % a.kv_heads;
     // V11-07: the sparse branch is cut over the output dimension (two z slices of 128 values).
-    // The all-selected branch keeps its whole-row implementation and runs on z=0 only, so the
-    // duplicate slice does no work instead of writing the same values twice.
-    const int d_base = static_cast<int>(blockIdx.z) * 16;
+    // The all-selected branch keeps its whole-row implementation, so that row is written by z=0
+    // alone and the other slice leaves it untouched instead of routing the same queries through
+    // the sparse path a second time (that path would rewrite columns 128..255 with a different
+    // cross-warp summation order).
+    const int d_base = kSparseSlicedValue<Storage> ? static_cast<int>(blockIdx.z) * 16 : 0;
     auto* qs         = reinterpret_cast<std::uint16_t*>(
         smem + (sizeof(SparseGqaStorage<Storage, N, Queries, Load>) + 15) / 16 * 16);
-    if (blockIdx.z == 0 && sparse_gqa_all_selected<Queries>(a, first)) {
-        sparse_gqa_all_select<Storage, N, Queries, Vector, Load>(a, s, first, head, qs);
-    } else {
+    if (sparse_gqa_all_selected<Queries>(a, first)) {
+        if (blockIdx.z == 0)
+            sparse_gqa_all_select<Storage, N, Queries, Vector, Load>(a, s, first, head, qs);
+        return;
+    }
 #pragma unroll 1
-        for (int i = 0; i < Queries && first + i < total; ++i) {
-            sparse_gqa_compute<Storage, N, Queries, Vector, Load>(a, s, first + i, head, 0,
-                                                                  d_base);
-            __syncthreads();
-        }
+    for (int i = 0; i < Queries && first + i < total; ++i) {
+        sparse_gqa_compute<Storage, N, Queries, Vector, Load>(a, s, first + i, head, 0, d_base);
+        __syncthreads();
     }
 }
 } // namespace ninfer::ops::detail::qsa

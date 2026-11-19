@@ -18,6 +18,12 @@ template <KvCacheStorage Storage>
 inline constexpr bool kSparseRotatedValue =
     Storage == KvCacheStorage::Nvfp4Group16 || Storage == KvCacheStorage::Fp8KeyNvfp4Value;
 
+// Only the plain value frame can cut the 256-value output row across two blocks. A rotated-value
+// block inverts the complete row with a warp-wide Hadamard on the way out, so it must hold every
+// column: those storages keep one unsliced accumulator and a single z.
+template <KvCacheStorage Storage>
+inline constexpr bool kSparseSlicedValue = !kSparseRotatedValue<Storage>;
+
 // The rank-compressed family: an int8/int4 or E8-cylinder key carrier over the rotated K, and an
 // int4 or 2-bit E8-cylinder value plane in the original frame (so no inverse rotation). Its planes
 // keep data and scales in separate regions, so the packed-row staging route does not apply: these

@@ -45,8 +45,10 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaArguments a,
     // V11-07: the accumulator covers half of the 256-value head row per block (d_base is 0 or
     // 128). The mma shape fixes two head rows and two d values per thread, so cutting the head dim
     // is not available; cutting the OUTPUT dim is, and it is bit-identical because the softmax
-    // statistics (maximum / sum) are key-side and do not depend on d.
-    float acc[16][4] = {};
+    // statistics (maximum / sum) are key-side and do not depend on d. The rotated-value families
+    // cannot be cut (kSparseSlicedValue): they own all 32 columns.
+    constexpr int Cols = kSparseSlicedValue<Storage> ? 16 : 32;
+    float acc[Cols][4] = {};
     Bf16KvSoftmaxRow state[2];
     constexpr float scale = kLog2E / 16.0f;
     const int gid = lane >> 2, lid = lane & 3;
@@ -108,7 +110,7 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaArguments a,
         state[0].accumulate(alpha[0], tile_sum[0]);
         state[1].accumulate(alpha[1], tile_sum[1]);
 #pragma unroll
-        for (int n = d_base; n < d_base + 16; ++n) {
+        for (int n = d_base; n < d_base + Cols; ++n) {
 #pragma unroll
             for (int j = 0; j < 4; ++j) acc[n - d_base][j] *= alpha[j / 2];
 #pragma unroll
@@ -136,7 +138,7 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaArguments a,
                 s.statistics.sum[row]     = sum[j];
             }
 #pragma unroll
-            for (int n = d_base; n < d_base + 16; ++n)
+            for (int n = d_base; n < d_base + Cols; ++n)
                 *reinterpret_cast<float2*>(s.partial + row * 256 + n * 8 + lid * 2) =
                     make_float2(acc[n - d_base][2 * j], acc[n - d_base][2 * j + 1]);
         }
@@ -158,7 +160,7 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaArguments a,
                 sum[j] += weights[w] * s.statistics.sum[w * 16 + row];
             }
 #pragma unroll
-            for (int n = d_base; n < d_base + 16; ++n) {
+            for (int n = d_base; n < d_base + Cols; ++n) {
                 float x = 0, y = 0;
 #pragma unroll
                 for (int w = 0; w < Warps; ++w) {
@@ -180,7 +182,7 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaArguments a,
         const bool direct = a.numerator == nullptr;
         const float inv   = direct ? __frcp_rn(sum[j]) : 1.0f;
 #pragma unroll
-        for (int n = d_base; n < d_base + 16; ++n) {
+        for (int n = d_base; n < d_base + Cols; ++n) {
             const int d = n * 8 + lid * 2;
             if (direct) {
                 if constexpr (kSparseRotatedValue<Storage>)
@@ -235,7 +237,7 @@ __launch_bounds__(Warps * 32) __global__ void sparse_gqa_mma_kernel(SparseGqaArg
     auto& s = *reinterpret_cast<SparseGqaStorage<Storage, N, Warps, Load>*>(smem);
     sparse_gqa_compute<Storage, N, Warps, VectorCache, Load>(
         a, s, a.begin + blockIdx.x / a.kv_heads, blockIdx.x % a.kv_heads, blockIdx.y,
-        static_cast<int>(blockIdx.z) * 16);
+        kSparseSlicedValue<Storage> ? static_cast<int>(blockIdx.z) * 16 : 0);
 }
 
 template <KvCacheStorage Storage>
@@ -247,32 +249,24 @@ __global__ void sparse_gqa_merge_kernel(SparseGqaArguments a) {
         *reinterpret_cast<unsigned*>(a.out + (q * a.query_heads + h) * 256 + d) = 0;
         return;
     }
-    __shared__ float weights[64], denominator;
-    if (threadIdx.x < 32) {
-        const int lane = threadIdx.x;
-        float m        = -CUDART_INF_F;
-        for (int s = lane; s < work.splits; s += 32)
-            m = fmaxf(m, a.maximum[a.partial_row(q, s, h)]);
-        m         = warp_max(m);
-        float sum = 0;
-        for (int s = lane; s < work.splits; s += 32) {
-            const auto i  = a.partial_row(q, s, h);
-            const float w = bf16_kv_state_weight(a.maximum[i], a.sum[i], m);
-            weights[s]    = w;
-            sum += w * a.sum[i];
-        }
-        sum = warp_sum(sum);
-        if (lane == 0) denominator = sum;
-    }
-    __syncthreads();
+    // One split per lane (the plan caps splits at 32) and the weights are folded inside each warp,
+    // so the split rows below are not separated from their loads by a block barrier: the merge is a
+    // chain of dependent global reads and at decode geometry that chain is its entire cost.
+    const int lane        = threadIdx.x & 31;
+    const int mine        = lane < work.splits ? lane : 0;
+    const auto own        = a.partial_row(q, mine, h);
+    const float local_max = lane < work.splits ? a.maximum[own] : -CUDART_INF_F;
+    const float local_sum = lane < work.splits ? a.sum[own] : 0.0f;
+    const float weight    = bf16_kv_state_weight(local_max, local_sum, warp_max(local_max));
+    const float inv       = __frcp_rn(warp_sum(weight * local_sum, 0xffffffffu));
     float x = 0, y = 0;
     for (int s = 0; s < work.splits; ++s) {
         const auto v =
             *reinterpret_cast<const float2*>(a.numerator + a.partial_row(q, s, h) * 256 + d);
-        x += weights[s] * v.x;
-        y += weights[s] * v.y;
+        const float w = __shfl_sync(0xffffffffu, weight, s);
+        x += w * v.x;
+        y += w * v.y;
     }
-    const float inv = __frcp_rn(denominator);
     if constexpr (kSparseRotatedValue<Storage>) {
         __shared__ float row[256];
         row[d]     = x * inv;
