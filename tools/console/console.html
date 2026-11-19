@@ -135,8 +135,33 @@
       <div><div class="lbl">TTFT</div><div><span id="m-ttft" class="big">—</span><span class="unit">ms</span></div></div>
       <div><div class="lbl">请求 运行/等待</div><div><span id="m-req" class="big">—</span></div></div>
     </div>
-    <canvas id="spark" width="600" height="64"></canvas>
     <div id="engineNote" class="empty">引擎未启动：没有数据可显示。</div>
+    <div class="row" style="margin-top:10px">
+      <span class="muted">控制器</span>
+      <button class="mode" data-mode="auto">auto</button>
+      <button class="mode" data-mode="stable">stable</button>
+      <button class="mode" data-mode="performance">performance</button>
+      <span id="ctlMsg" class="muted"></span>
+    </div>
+  </section>
+
+  <section class="card wide">
+    <h2>吞吐曲线（decode / prefill，tok/s）</h2>
+    <canvas id="chart" height="150"></canvas>
+    <div id="chartNote" class="empty">引擎未启动：没有曲线。</div>
+  </section>
+
+  <section class="card wide">
+    <h2>请求事件</h2>
+    <div style="max-height:240px;overflow:auto">
+      <table style="width:100%;border-collapse:collapse;font-size:12px">
+        <thead><tr><th style="text-align:left;color:var(--dim);font-weight:600">时间</th>
+                   <th style="text-align:left;color:var(--dim);font-weight:600">事件</th>
+                   <th style="text-align:left;color:var(--dim);font-weight:600">详情</th></tr></thead>
+        <tbody id="reqs"></tbody>
+      </table>
+    </div>
+    <div id="reqNote" class="empty">引擎未启动：没有事件。</div>
   </section>
 
   <section class="card">
@@ -170,7 +195,7 @@
 
 <script>
 const $ = id => document.getElementById(id);
-const state = { dir: '', model: '', hist: [], lastOk: false };
+const state = { dir: '', model: '', tps: {decode: [], prefill: []}, lastOk: false };
 
 const fmt = (v, d = 2) => (v == null || !isFinite(v)) ? '—' : Number(v).toFixed(d);
 const fmtInt = v => (v == null || !isFinite(v)) ? '—' : Math.round(v).toLocaleString();
@@ -409,7 +434,7 @@ $('start').onclick = async () => {
   $('launchMsg').textContent = '启动中…';
   const r = await postJSON('/api/launch', payload);
   $('launchMsg').textContent = r.ok ? ('已启动 pid ' + r.pid) : ('失败：' + r.error);
-  if (r.ok){ $('cmd').textContent = r.command; state.hist = []; }
+  if (r.ok){ $('cmd').textContent = r.command; state.tps = {decode: [], prefill: []}; }
   $('start').disabled = false;
 };
 $('stop').onclick = async () => {
@@ -464,33 +489,76 @@ function setEngine(payload){
     : (running ? '引擎已启动，尚未应答 /monitor（大模型加载需要时间）'
                : '引擎未启动：没有数据可显示。');
 
-  if (ok && rate.decode_tps != null){ state.hist.push(rate.decode_tps); }
-  else if (ok){ state.hist.push(null); }
-  if (!ok && !running) state.hist = [];        // a stopped engine leaves no curve behind
-  if (state.hist.length > 180) state.hist.shift();
-  drawSpark();
+  if (ok && (rate.decode_tps != null || rate.prefill_tps != null)){
+    state.tps.decode.push(rate.decode_tps);
+    state.tps.prefill.push(rate.prefill_tps);
+  } else if (ok){
+    state.tps.decode.push(null);
+    state.tps.prefill.push(null);
+  }
+  if (!ok && !running){ state.tps.decode = []; state.tps.prefill = []; }
+  for (const key of ['decode', 'prefill']) if (state.tps[key].length > 300) state.tps[key].shift();
+  drawChart();
+  renderEvents(ok ? (payload.events || []) : []);
 }
 
-function drawSpark(){
-  const c = $('spark'), ctx = c.getContext('2d');
-  const w = c.width = c.clientWidth * (window.devicePixelRatio || 1);
-  c.height = 64 * (window.devicePixelRatio || 1);
-  ctx.clearRect(0, 0, w, c.height);
-  const data = state.hist.filter(v => v != null);
-  if (data.length < 2){ return; }
-  const max = Math.max.apply(null, data) * 1.15 || 1;
-  const n = state.hist.length;
-  ctx.strokeStyle = '#4c9aff'; ctx.lineWidth = 1.5 * (window.devicePixelRatio || 1);
-  ctx.beginPath();
-  let started = false;
-  state.hist.forEach((v, i) => {
-    const x = (i / (n - 1)) * w;
-    if (v == null){ started = false; return; }
-    const y = c.height - (v / max) * (c.height - 6) - 3;
-    if (!started){ ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
-  });
-  ctx.stroke();
+function drawChart(){
+  const c = $('chart');
+  const dpr = window.devicePixelRatio || 1;
+  const w = c.width = c.clientWidth * dpr;
+  const h = c.height = 150 * dpr;
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, w, h);
+  const de = state.tps.decode, pr = state.tps.prefill;
+  const all = de.concat(pr).filter(v => v != null);
+  $('chartNote').textContent = all.length
+    ? ('最近 ' + de.length + ' 个 1 s 采样 · 峰值 ' + Math.max.apply(null, all).toFixed(1) + ' tok/s')
+    : '引擎未启动：没有曲线。';
+  if (all.length < 2) return;
+  const max = Math.max.apply(null, all) * 1.15 || 1;
+  const series = [['decode', de, '#4c9aff'], ['prefill', pr, '#3fb950']];
+  for (const [, data, color] of series){
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.6 * dpr;
+    ctx.beginPath();
+    let started = false;
+    data.forEach((v, i) => {
+      const x = (i / Math.max(1, data.length - 1)) * w;
+      if (v == null){ started = false; return; }
+      const y = h - (v / max) * (h - 12) - 6;
+      if (!started){ ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  }
+  ctx.fillStyle = '#8b98a8';
+  ctx.font = (11 * dpr) + 'px Consolas, monospace';
+  ctx.fillText('峰值 ' + max.toFixed(1) + ' tok/s', 6 * dpr, 14 * dpr);
 }
+
+function renderEvents(events){
+  const body = $('reqs');
+  const rows = (events || []).slice(-40).reverse();
+  $('reqNote').textContent = rows.length ? '' : '引擎未启动：没有事件。';
+  body.innerHTML = rows.map(e => {
+    const at = e.timestamp_unix_ms ? new Date(e.timestamp_unix_ms).toLocaleTimeString() : '—';
+    const d = e.details || {};
+    const bits = Object.keys(d).slice(0, 5).map(k => k + '=' + d[k]).join(' · ');
+    return '<tr><td style="padding:3px 8px 3px 0;color:var(--dim)">' + at + '</td>' +
+           '<td style="padding:3px 8px 3px 0">' + (e.kind || '?') + '</td>' +
+           '<td style="padding:3px 0;color:var(--dim)">' + bits + '</td></tr>';
+  }).join('');
+}
+
+document.querySelectorAll('button.mode').forEach(btn => {
+  btn.onclick = async () => {
+    try{
+      const r = await postJSON('/api/control/mode', {mode: btn.dataset.mode});
+      $('ctlMsg').textContent = '控制器：' + btn.dataset.mode + ' ' + (r.detail || r.state || '');
+    }catch(e){
+      $('ctlMsg').textContent = '控制器请求失败：' + e.message;
+    }
+  };
+});
 
 /* ---------- GPU / LMCache ---------- */
 function setGpu(g){
@@ -547,7 +615,7 @@ tickLaunch(); tickEngine(); tickSide();
 setInterval(tickLaunch, 1000);
 setInterval(tickEngine, 1000);
 setInterval(tickSide, 2000);
-window.addEventListener('resize', () => drawSpark());
+window.addEventListener('resize', () => drawChart());
 </script>
 </body>
 </html>
