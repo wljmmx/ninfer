@@ -74,6 +74,7 @@ struct RopeConfig {
         return yarn ? "yarn" : "default";
     }
 
+
     // Position capacity implied by the scaling: the trained capacity times the factor.
     [[nodiscard]] std::uint64_t scaled_position_capacity(std::uint32_t trained) const noexcept {
         if (!yarn) { return trained; }
@@ -81,6 +82,12 @@ struct RopeConfig {
                static_cast<std::uint64_t>(yarn_factor + 0.5f);
     }
 };
+
+/// Applies the YaRN table the artifact declares (factor / original_max) to `out`. Used when the
+/// requested context runs past the trained window: the served window is a deployment choice, so it
+/// selects the scaling instead of an environment variable. Throws when the artifact declares no
+/// usable table or when the declared factor cannot cover the request.
+void enable_yarn(RopeConfig& out);
 
 struct GdnConfig {
     std::uint32_t linear_num_key_heads   = 0;

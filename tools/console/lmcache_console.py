@@ -1004,11 +1004,91 @@ def pick_folder(initial: str = "") -> dict:
         _PICK_LOCK.release()
 
 
+class ScriptService:
+    """Runs one operator script as a child, with a log and a stop path.
+
+    The command lives in the script (start_lmcache.cmd), not in the page: the console only decides
+    *when* to run it. Same rules as the engine launcher - one child, no shell, same-origin writes.
+    """
+
+    LOG_TAIL = 40
+
+    def __init__(self, script: Path, log_path: Path, key: str) -> None:
+        self.script = script
+        self.log_path = log_path
+        self.key = key
+        self.lock = threading.Lock()
+        self.proc: subprocess.Popen | None = None
+        self.started_at = 0.0
+        self.exit_code: int | None = None
+
+    def start(self) -> dict:
+        with self.lock:
+            if self.proc is not None and self.proc.poll() is None:
+                return {"ok": False, "error": f"{self.key} is already running (pid {self.proc.pid})"}
+            if not self.script.is_file():
+                return {"ok": False, "error": f"script not found: {self.script}"}
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            handle = open(self.log_path, "ab", buffering=0)
+            handle.write(f"\n===== {datetime.datetime.now().astimezone().isoformat(timespec='seconds')}"
+                         f" {self.script.name}\n".encode("utf-8"))
+            try:
+                self.proc = subprocess.Popen(
+                    ["cmd", "/c", str(self.script)], cwd=str(self.script.parent),
+                    stdout=handle, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+            except OSError as exc:
+                return {"ok": False, "error": f"cannot run {self.script}: {exc}"}
+            finally:
+                handle.close()
+            self.started_at = time.time()
+            self.exit_code = None
+            return {"ok": True, "pid": self.proc.pid, "script": str(self.script)}
+
+    def stop(self) -> dict:
+        with self.lock:
+            proc = self.proc
+            if proc is None or proc.poll() is not None:
+                return {"ok": True, "note": f"{self.key} is not running"}
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=10)
+            self.exit_code = proc.returncode
+            return {"ok": True, "stopped": proc.pid, "exit_code": proc.returncode}
+
+    def log_tail(self) -> list[str]:
+        try:
+            with open(self.log_path, "rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                handle.seek(max(0, size - 32 * 1024))
+                text = handle.read().decode("utf-8", "replace")
+        except OSError:
+            return []
+        return text.splitlines()[-self.LOG_TAIL:]
+
+    def status(self) -> dict:
+        proc = self.proc
+        running = proc is not None and proc.poll() is None
+        if proc is not None and not running:
+            self.exit_code = proc.returncode
+        return {"ok": True, "key": self.key, "running": running,
+                "pid": proc.pid if proc else None,
+                "exit_code": self.exit_code,
+                "script": str(self.script),
+                "uptime_seconds": round(time.time() - self.started_at, 1) if running else None,
+                "log": self.log_tail()}
+
+
 class Handler(BaseHTTPRequestHandler):
     page: Path = Path("console.html")
     upstream: str = "http://127.0.0.1:18080/metrics"
     gpu: GpuCollector | None = None
     engine: EngineCollector | None = None
+    lmcache: ScriptService | None = None
     launcher: Launcher | None = None
 
     def log_message(self, fmt: str, *args) -> None:  # keep the console quiet
@@ -1032,6 +1112,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(500, f"cannot read {self.page}: {exc}".encode(), "text/plain; charset=utf-8")
                 return
             self._send(200, body, "text/html; charset=utf-8")
+            return
+        if path == "/api/lmcache/status.json":
+            body = self.lmcache.status() if self.lmcache is not None else {
+                "ok": False, "running": False, "error": "lmcache launcher not configured"}
+            self._send(200, json.dumps(body, ensure_ascii=False).encode(), "application/json")
             return
         if path == "/api/launch/status.json":
             body = self.launcher.status() if self.launcher is not None else {"ok": False, "running": False}
@@ -1127,6 +1212,20 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     result["browse"] = self.launcher.browse(str(root))
             self._send(200, json.dumps(result, ensure_ascii=False).encode(), "application/json")
+            return
+        if path in ("/api/lmcache/start", "/api/lmcache/stop"):
+            if not self._same_origin():
+                self._send(403, json.dumps({"ok": False, "error": "cross-origin request refused"},
+                                           ensure_ascii=False).encode(), "application/json")
+                return
+            if self.lmcache is None:
+                self._send(503, json.dumps({"ok": False, "error": "lmcache launcher not configured"},
+                                           ensure_ascii=False).encode(), "application/json")
+                return
+            self._read_body()
+            result = self.lmcache.start() if path.endswith("/start") else self.lmcache.stop()
+            self._send(200 if result.get("ok") else 400,
+                       json.dumps(result, ensure_ascii=False).encode(), "application/json")
             return
         if path in ("/api/launch", "/api/launch/stop"):
             if not self._same_origin():
@@ -1237,6 +1336,9 @@ def main() -> int:
     Handler.engine = (EngineCollector(args.engine, api_key=args.engine_key)
                       if args.engine and args.engine != "none" else None)
     Handler.launcher = Launcher(exe, roots, log_path, attach)
+    Handler.lmcache = ScriptService(Path(__file__).resolve().parent / "start_lmcache.cmd",
+                                   Path(__file__).resolve().parent / "lmcache-service.log",
+                                   "lmcache")
     try:
         server = ConsoleServer((args.host, args.port), Handler)
     except OSError as exc:

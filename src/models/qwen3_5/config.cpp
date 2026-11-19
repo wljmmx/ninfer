@@ -345,6 +345,23 @@ DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
 
 } // namespace
 
+// See config.h: the run decides whether the served window uses the trained table or the artifact's
+// YaRN table. Frequencies are recomputed from the declared factor so the two paths cannot drift.
+void enable_yarn(RopeConfig& out) {
+    if (!out.yarn_declared || !(out.yarn_declared_factor > 1.0f) ||
+        out.yarn_declared_original_max_position_embeddings == 0) {
+        throw ArtifactError("the artifact declares no usable YaRN table "
+                            "(factor and original_max_position_embeddings are required)");
+    }
+    out.yarn                        = true;
+    out.yarn_factor                 = out.yarn_declared_factor;
+    out.yarn_original_max_position_embeddings = out.yarn_declared_original_max_position_embeddings;
+    if (!(out.yarn_attention_factor > 0.0f)) {
+        out.yarn_attention_factor = static_cast<float>(0.1 * std::log(static_cast<double>(out.yarn_factor)) + 1.0);
+    }
+    compute_yarn_frequencies(out, 32.0, 1.0);
+}
+
 std::uint64_t GdnConfig::conv_channels() const {
     return artifact::checked_add(artifact::checked_mul(2, key_width(), "GDN key width"),
                                  value_width(), "GDN convolution channels");

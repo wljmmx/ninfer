@@ -60,6 +60,28 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     auto out     = std::make_unique<LoadPlan::Impl>();
     out->options = options;
     out->config  = parse_config(reader.directory(), options);
+
+    // A window past the trained one uses the artifact's own YaRN table. The served window is a
+    // deployment choice, so --max-context selects the scaling; NINFER_ROPE_SCALING still overrides
+    // for A/B. Refusing here names the factor the request would need instead of failing later with
+    // "max_context exceeds the configured position capacity".
+    if (auto& rope = out->config.text.rope_parameters; rope && !rope->yarn && rope->yarn_declared &&
+                                                         options.requested_context != 0 &&
+                                                         std::getenv("NINFER_ROPE_SCALING") == nullptr) {
+        const auto original = rope->yarn_declared_original_max_position_embeddings;
+        if (original != 0 && options.requested_context > original) {
+            const std::uint64_t needed = (options.requested_context + original - 1) / original;
+            if (static_cast<double>(rope->yarn_declared_factor) + 1e-6 <
+                static_cast<double>(needed)) {
+                throw artifact::ArtifactError(
+                    "requested context " + std::to_string(options.requested_context) +
+                    " needs YaRN factor >= " + std::to_string(needed) +
+                    ", the artifact declares factor " +
+                    std::to_string(static_cast<double>(rope->yarn_declared_factor)));
+            }
+            enable_yarn(*rope);
+        }
+    }
     // The rotary window this run will actually use. The artifact states what it was trained with
     // and may carry a YaRN table; NINFER_ROPE_SCALING picks between them (native is the trained
     // theta table and the trained capacity, yarn applies the table and multiplies the capacity by

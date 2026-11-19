@@ -21,6 +21,10 @@ struct LoadOptions {
     // the load resolves that fallback itself, so this field stays empty in the options a caller
     // compares against, and the two never disagree about what was loaded.
     std::filesystem::path expert_priority_file;
+    // The window this run will serve. The text config keeps the trained window and the artifact's
+    // own YaRN declaration; a request past the trained window selects that table at load time, so
+    // the choice follows --max-context instead of an environment variable.
+    std::uint64_t requested_context = 0;
 
     bool operator==(const LoadOptions&) const = default;
 
@@ -68,7 +72,8 @@ struct LoadOptions {
             .speculative   = options.speculative.backend,
             .proposal_head = options.speculative.proposal_head,
             .stream_experts   = options.expert_cache_bytes != 0,
-            .expert_host_copy = options.expert_host_copy};
+            .expert_host_copy = options.expert_host_copy,
+            .requested_context = options.max_context};
 }
 
 } // namespace ninfer::models

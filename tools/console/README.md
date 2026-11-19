@@ -65,3 +65,11 @@ PPL or the hash gates.
 
 Python 3.10+ on `PATH`. Nothing else: the NVML read degrades to "absent" when the DLL is not
 found, and the LMCache source is optional (start it only if LMCache runs on 18080).
+
+## LMCache
+
+The panel's **启动 LMCache** button runs `start_lmcache.cmd` next to this file: the script owns the
+command (`lmcache_server` on PATH, else `python -m lmcache.server`, on port 18080, the port the
+panel reads), the console only decides when to run it and reports the child's pid, exit code and
+log tail. If LMCache is not installed the button is honest about it - the log says so and the exit
+code is 3.
