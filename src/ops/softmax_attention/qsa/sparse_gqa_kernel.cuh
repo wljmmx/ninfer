@@ -259,13 +259,25 @@ __global__ void sparse_gqa_merge_kernel(SparseGqaArguments a) {
     const float local_sum = lane < work.splits ? a.sum[own] : 0.0f;
     const float weight    = bf16_kv_state_weight(local_max, local_sum, warp_max(local_max));
     const float inv       = __frcp_rn(warp_sum(weight * local_sum, 0xffffffffu));
+    // Up to four split rows in flight. Decode selects two to five splits, so a runtime trip count
+    // leaves that many dependent global reads in series, and at this geometry the merge is nothing
+    // but that chain. The sums stay in split order, so the rounding is unchanged.
     float x = 0, y = 0;
-    for (int s = 0; s < work.splits; ++s) {
-        const auto v =
-            *reinterpret_cast<const float2*>(a.numerator + a.partial_row(q, s, h) * 256 + d);
-        const float w = __shfl_sync(0xffffffffu, weight, s);
-        x += w * v.x;
-        y += w * v.y;
+    for (int s = 0; s < work.splits; s += 4) {
+        const int live = min(4, work.splits - s);
+        float2 v[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            if (i < live)
+                v[i] = *reinterpret_cast<const float2*>(
+                    a.numerator + a.partial_row(q, s + i, h) * 256 + d);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            if (i >= live) continue;
+            const float w = __shfl_sync(0xffffffffu, weight, s + i);
+            x += w * v[i].x;
+            y += w * v[i].y;
+        }
     }
     if constexpr (kSparseRotatedValue<Storage>) {
         __shared__ float row[256];
