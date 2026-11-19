@@ -135,6 +135,12 @@ pause
 Write-Launcher 'serve_35b_e2_2k.bat' 'ninfer-serve 35B e2 2K (gate profile)' `
     (Join-Path $Root '..\model\qwen3_6_35b_a3b_e2\qwen3_6_35b_a3b_e2.ninfer') `
     '--host 127.0.0.1 --port 11438 --max-context 2048 --max-concurrency 1 --max-pending-requests 16 --prefill-chunk 1024'
+# The only artifact here with indexed_attention layers, i.e. the one that runs the QSA route, and
+# the one tools\release\gate_qsa.ps1 measures. QSA admits bf16 only unless the low-bit profiles are
+# opted in, so the storage is named rather than left to the default.
+Write-Launcher 'serve_flashnext_2k.bat' 'ninfer-serve Qwen3.8-Flash-Next e2 2K (QSA, bf16)' `
+    (Join-Path $Root '..\model\qwen3_8_flash_next_v5\qwen3_8_flash_next_v5_e2.ninfer') `
+    '--host 127.0.0.1 --port 11439 --max-context 2048 --max-concurrency 1 --max-pending-requests 16 --prefill-chunk 1024 --kv-dtype bf16'
 Write-Launcher 'serve_27b_v3_32k.bat' 'ninfer-serve 27B v3 32K (rk4v4-e8 MTP-5)' `
     (Join-Path $Root '..\model\qwen3_8_27b_v3\qwen3_8_27b_v3.ninfer') `
     '--host 0.0.0.0 --port 21438 --max-context 32768 --kv-capacity 32768 --max-concurrency 1 --max-pending-requests 16 --prefill-chunk 1024 --kv-dtype rk4v4-e8 --spec mtp --draft-tokens 5 --lm-head-draft --wddm-evictable-budget'
