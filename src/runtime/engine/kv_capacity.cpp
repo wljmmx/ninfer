@@ -280,6 +280,16 @@ KvResidencyResolution resolve_kv_capacity_with_residency(const KvCapacityPolicy&
             : checked_add(curve.minimum_device_reservation_bytes, ledger,
                           "KV residency reservation overflows size_t");
     if (available_runtime_bytes < with_ledger) {
+        // Same split as the success path, printed on the way out: a refusal has to name the bytes
+        // that did not fit, not just their sum.
+        std::fprintf(stderr,
+                     "[kv-tier] REFUSED logical=%u minimum=%u | payload_stride=%zu ledger_stride=%zu "
+                     "ledger=%zu anchor_fixed=%zu | needs=%zu available=%zu\n",
+                     logical, curve.minimum_main_page_groups,
+                     strides.payload_bytes_per_resident_page_group,
+                     strides.ledger_bytes_per_logical_page_group, ledger,
+                     anchor_fixed_bytes(curve, strides), with_ledger, available_runtime_bytes);
+        std::fflush(stderr);
         throw std::invalid_argument(
             "minimum Engine runtime reservation requires " + std::to_string(with_ledger) +
             " bytes for " + std::to_string(logical) +
@@ -314,6 +324,20 @@ KvResidencyResolution resolve_kv_capacity_with_residency(const KvCapacityPolicy&
     resolution.host_payload_bytes = checked_mul(
         static_cast<std::size_t>(logical - resident),
         strides.payload_bytes_per_resident_page_group, "KV residency host payload overflows size_t");
+    // P0 (KV tier plan): the split the failure message only gave as one number. Every byte of the
+    // device reservation is named here, so a plan that does not fit is attributable instead of
+    // argued about: the ledger exists per LOGICAL page, the payload only per RESIDENT one.
+    std::fprintf(stderr,
+                 "[kv-tier] logical=%u minimum=%u resident=%u | payload_stride=%zu ledger_stride=%zu "
+                 "ledger=%zu anchor_fixed=%zu state_image=%zu | device=%zu host_payload=%zu "
+                 "available=%zu\n",
+                 logical, curve.minimum_main_page_groups, resident,
+                 strides.payload_bytes_per_resident_page_group,
+                 strides.ledger_bytes_per_logical_page_group, ledger,
+                 anchor_fixed_bytes(curve, strides), with_ledger - ledger,
+                 resolution.device_reservation_bytes, resolution.host_payload_bytes,
+                 available_runtime_bytes);
+    std::fflush(stderr);
     return resolution;
 }
 
