@@ -136,14 +136,19 @@ __launch_bounds__(Queries * 32) __global__ void sparse_gqa_all_select_kernel(Spa
     const auto first = a.begin + std::int64_t(blockIdx.x / a.kv_heads) * Queries,
                total = std::int64_t(a.tokens) * a.batch;
     const int head   = blockIdx.x % a.kv_heads;
+    // V11-07: the sparse branch is cut over the output dimension (two z slices of 128 values).
+    // The all-selected branch keeps its whole-row implementation and runs on z=0 only, so the
+    // duplicate slice does no work instead of writing the same values twice.
+    const int d_base = static_cast<int>(blockIdx.z) * 16;
     auto* qs         = reinterpret_cast<std::uint16_t*>(
         smem + (sizeof(SparseGqaStorage<Storage, N, Queries, Load>) + 15) / 16 * 16);
-    if (sparse_gqa_all_selected<Queries>(a, first)) {
+    if (blockIdx.z == 0 && sparse_gqa_all_selected<Queries>(a, first)) {
         sparse_gqa_all_select<Storage, N, Queries, Vector, Load>(a, s, first, head, qs);
     } else {
 #pragma unroll 1
         for (int i = 0; i < Queries && first + i < total; ++i) {
-            sparse_gqa_compute<Storage, N, Queries, Vector, Load>(a, s, first + i, head, 0);
+            sparse_gqa_compute<Storage, N, Queries, Vector, Load>(a, s, first + i, head, 0,
+                                                                  d_base);
             __syncthreads();
         }
     }

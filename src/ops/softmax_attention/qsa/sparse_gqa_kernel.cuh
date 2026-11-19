@@ -11,7 +11,7 @@ template <KvCacheStorage Storage, int N, int Warps, bool VectorCache,
           SparseGqaLoad Load = SparseGqaLoad::Direct>
 __device__ __forceinline__ void sparse_gqa_mma(SparseGqaArguments a,
                                                SparseGqaStorage<Storage, N, Warps, Load>& s,
-                                               std::int64_t q, int head, int split) {
+                                               std::int64_t q, int head, int split, int d_base) {
     constexpr int NK = N / Warps, QKNt = NK / 8, PVKs = NK / 16;
     static_assert(NK >= 16 && NK % 16 == 0);
     auto* ks      = s.kv;
@@ -42,7 +42,11 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaArguments a,
     }
 
     __syncthreads();
-    float acc[32][4] = {};
+    // V11-07: the accumulator covers half of the 256-value head row per block (d_base is 0 or
+    // 128). The mma shape fixes two head rows and two d values per thread, so cutting the head dim
+    // is not available; cutting the OUTPUT dim is, and it is bit-identical because the softmax
+    // statistics (maximum / sum) are key-side and do not depend on d.
+    float acc[16][4] = {};
     Bf16KvSoftmaxRow state[2];
     constexpr float scale = kLog2E / 16.0f;
     const int gid = lane >> 2, lid = lane & 3;
@@ -104,17 +108,17 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaArguments a,
         state[0].accumulate(alpha[0], tile_sum[0]);
         state[1].accumulate(alpha[1], tile_sum[1]);
 #pragma unroll
-        for (int n = 0; n < 32; ++n) {
+        for (int n = d_base; n < d_base + 16; ++n) {
 #pragma unroll
-            for (int j = 0; j < 4; ++j) acc[n][j] *= alpha[j / 2];
+            for (int j = 0; j < 4; ++j) acc[n - d_base][j] *= alpha[j / 2];
 #pragma unroll
             for (int k = 0; k < PVKs; ++k) {
                 unsigned vf[2];
                 const int row = warp * NK + k * 16 + ((lane >> 3) & 1) * 8 + (lane & 7);
                 const int d   = n * 8;
                 ldmatrix_x2_t(vf[0], vf[1], smem_addr(vs + row * 256 + causal_swizzle(row, d)));
-                mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[k][0], pf[k][1], pf[k][2],
-                        pf[k][3], vf[0], vf[1]);
+                mma_f16(acc[n - d_base][0], acc[n - d_base][1], acc[n - d_base][2],
+                        acc[n - d_base][3], pf[k][0], pf[k][1], pf[k][2], pf[k][3], vf[0], vf[1]);
             }
         }
         __syncthreads();
@@ -132,9 +136,9 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaArguments a,
                 s.statistics.sum[row]     = sum[j];
             }
 #pragma unroll
-            for (int n = 0; n < 32; ++n)
+            for (int n = d_base; n < d_base + 16; ++n)
                 *reinterpret_cast<float2*>(s.partial + row * 256 + n * 8 + lid * 2) =
-                    make_float2(acc[n][2 * j], acc[n][2 * j + 1]);
+                    make_float2(acc[n - d_base][2 * j], acc[n - d_base][2 * j + 1]);
         }
         __syncthreads();
         if (warp != 0) return;
@@ -154,7 +158,7 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaArguments a,
                 sum[j] += weights[w] * s.statistics.sum[w * 16 + row];
             }
 #pragma unroll
-            for (int n = 0; n < 32; ++n) {
+            for (int n = d_base; n < d_base + 16; ++n) {
                 float x = 0, y = 0;
 #pragma unroll
                 for (int w = 0; w < Warps; ++w) {
@@ -163,8 +167,8 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaArguments a,
                     x += weights[w] * a.x;
                     y += weights[w] * a.y;
                 }
-                acc[n][2 * j]     = x;
-                acc[n][2 * j + 1] = y;
+                acc[n - d_base][2 * j]     = x;
+                acc[n - d_base][2 * j + 1] = y;
             }
         }
     }
@@ -176,18 +180,18 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaArguments a,
         const bool direct = a.numerator == nullptr;
         const float inv   = direct ? __frcp_rn(sum[j]) : 1.0f;
 #pragma unroll
-        for (int n = 0; n < 32; ++n) {
+        for (int n = d_base; n < d_base + 16; ++n) {
             const int d = n * 8 + lid * 2;
             if (direct) {
                 if constexpr (kSparseRotatedValue<Storage>)
                     *reinterpret_cast<float2*>(s.partial + h * 256 + d) =
-                        make_float2(acc[n][2 * j] * inv, acc[n][2 * j + 1] * inv);
+                        make_float2(acc[n - d_base][2 * j] * inv, acc[n - d_base][2 * j + 1] * inv);
                 else
-                    sparse_gqa_store(a, q, head * rpk + h, d, acc[n][2 * j] * inv,
-                                     acc[n][2 * j + 1] * inv);
+                    sparse_gqa_store(a, q, head * rpk + h, d, acc[n - d_base][2 * j] * inv,
+                                     acc[n - d_base][2 * j + 1] * inv);
             } else
                 *reinterpret_cast<float2*>(a.numerator + row * 256 + d) =
-                    make_float2(acc[n][2 * j], acc[n][2 * j + 1]);
+                    make_float2(acc[n - d_base][2 * j], acc[n - d_base][2 * j + 1]);
         }
         if (!direct && lid == 0) {
             a.maximum[row] = maximum[j];
@@ -199,8 +203,8 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaArguments a,
 template <KvCacheStorage Storage, int N, int Warps, bool VectorCache, SparseGqaLoad Load>
 __device__ __forceinline__ void sparse_gqa_compute(SparseGqaArguments a,
                                                    SparseGqaStorage<Storage, N, Warps, Load>& s,
-                                                   std::int64_t q, int head, int split) {
-    sparse_gqa_mma<Storage, N, Warps, VectorCache, Load>(a, s, q, head, split);
+                                                   std::int64_t q, int head, int split, int d_base) {
+    sparse_gqa_mma<Storage, N, Warps, VectorCache, Load>(a, s, q, head, split, d_base);
     if constexpr (kSparseRotatedValue<Storage>) {
         if (a.numerator == nullptr) {
             // MMA's reduction leaves only warp zero writing s.partial. Every warp returns
@@ -230,7 +234,8 @@ __launch_bounds__(Warps * 32) __global__ void sparse_gqa_mma_kernel(SparseGqaArg
     extern __shared__ __align__(16) unsigned char smem[];
     auto& s = *reinterpret_cast<SparseGqaStorage<Storage, N, Warps, Load>*>(smem);
     sparse_gqa_compute<Storage, N, Warps, VectorCache, Load>(
-        a, s, a.begin + blockIdx.x / a.kv_heads, blockIdx.x % a.kv_heads, blockIdx.y);
+        a, s, a.begin + blockIdx.x / a.kv_heads, blockIdx.x % a.kv_heads, blockIdx.y,
+        static_cast<int>(blockIdx.z) * 16);
 }
 
 template <KvCacheStorage Storage>

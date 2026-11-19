@@ -18,7 +18,7 @@ void launch(SparseGqaArguments a, SparseGqaPlan plan, int queries, DeviceExecuti
         static const auto status =
             cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
         CUDA_CHECK(status);
-        kernel<<<(queries + 3) / 4 * a.kv_heads, 128, bytes, execution.stream>>>(a);
+        kernel<<<dim3((queries + 3) / 4 * a.kv_heads, 1, 2), 128, bytes, execution.stream>>>(a);
     } else if (plan.instance == SparseGqaInstance::Simt) {
         sparse_gqa_simt_kernel<Storage, 8, VectorCache>
             <<<dim3(queries * a.query_heads, a.splits), 256, 0, execution.stream>>>(a);
@@ -31,17 +31,17 @@ void launch(SparseGqaArguments a, SparseGqaPlan plan, int queries, DeviceExecuti
             (blocks + 3 * sms - 1) / (3 * sms) < (blocks + 2 * sms - 1) / (2 * sms);
         if (inplace)
             sparse_gqa_mma_kernel<Storage, 32, 2, VectorCache, SparseGqaLoad::InPlace>
-                <<<dim3(queries * a.kv_heads, a.splits), 64,
+                <<<dim3(queries * a.kv_heads, a.splits, 2), 64,
                    sizeof(SparseGqaStorage<Storage, 32, 2, SparseGqaLoad::InPlace>),
                    execution.stream>>>(a);
         else
             sparse_gqa_mma_kernel<Storage, 32, 2, VectorCache, SparseGqaLoad::Staged>
-                <<<dim3(queries * a.kv_heads, a.splits), 64,
+                <<<dim3(queries * a.kv_heads, a.splits, 2), 64,
                    sizeof(SparseGqaStorage<Storage, 32, 2, SparseGqaLoad::Staged>),
                    execution.stream>>>(a);
     } else {
         sparse_gqa_mma_kernel<Storage, 32, 2, VectorCache>
-            <<<dim3(queries * a.kv_heads, a.splits), 64,
+            <<<dim3(queries * a.kv_heads, a.splits, 2), 64,
                sizeof(SparseGqaStorage<Storage, 32, 2>), execution.stream>>>(a);
     }
     if (plan.partial)
