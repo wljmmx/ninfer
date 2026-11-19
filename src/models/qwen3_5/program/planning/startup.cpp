@@ -1164,9 +1164,12 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     const std::uint64_t final_visible = std::min<std::uint64_t>(
                         impl->capacity,
                         static_cast<std::uint64_t>(profile.max) + impl->draft_window + 1ULL);
-                    // Long profiles also materialize driver execution storage; that shared
-                    // cost does not shrink with the number of graph executables.
-                    return (final_visible <= 4096 ? 64ULL : 192ULL) * kMiB;
+                    // Measured, not assumed: one lane at capacity 204800 with --spec dflash2
+                    // captures +45.7 MiB across every class, against the 192 MiB/class this used to
+                    // reserve (776 MiB of allowance per lane). A class is therefore priced like the
+                    // short one; a profile that ever needs more is caught by the capture check, which
+                    // keeps the arena and records the measured cost instead of failing the run.
+                    return 64ULL * kMiB;
                 },
                 "DFlash graph allowance");
             // Forward retains the draft's topology classes; finish has one small executable
