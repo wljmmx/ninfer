@@ -119,6 +119,7 @@
       <div id="opts" class="opts"></div>
     </details>
     <div class="row" style="margin-top:10px">
+      <label style="flex-direction:row;align-items:center;gap:6px;color:var(--ink)"><input type="checkbox" id="useLmcache"> 接入 LMCache</label>
       <button id="start" class="primary">启动</button>
       <button id="stop">停止</button>
       <span id="launchMsg" class="muted"></span>
@@ -434,6 +435,7 @@ $('start').onclick = async () => {
     max_concurrency: Number($('max_concurrency').value),
     prefill_chunk: Number($('prefill_chunk').value),
     kv_dtype: $('kv_dtype').value,
+    lmcache: document.getElementById('useLmcache').checked,
     extra_args: collectOptions()
   };
   if (!payload.model){ $('launchMsg').textContent = '先选择一个 .ninfer 文件'; return; }

@@ -665,11 +665,13 @@ class Launcher:
         "--vision": ("flag",),
     }
 
-    def __init__(self, exe: Path, roots: list[Path], log_path: Path, attach) -> None:
+    def __init__(self, exe: Path, roots: list[Path], log_path: Path, attach,
+                 lmcache_probe=None) -> None:
         self.exe = exe
         self.roots = [root for root in roots if root.is_dir()]
         self.log_path = log_path
         self.attach = attach                     # give the collector the URL we just started
+        self.lmcache_probe = lmcache_probe       # is the WSL-side LMCache answering right now?
         self.lock = threading.Lock()
         self.proc: subprocess.Popen | None = None
         self.args: list[str] = []
@@ -859,9 +861,19 @@ class Launcher:
                 flat.extend([flag, value])
             argv = [str(self.exe), str(model)] + flat + extra
             env = os.environ.copy()
-            # The console has its own knobs; none of them may shape the engine it starts.
-            for key in ("NINFER_MODEL", "NINFER_QSA_SPARSE_GQA_QUANT_KV"):
+            for key in ("NINFER_MODEL", "NINFER_QSA_SPARSE_GQA_QUANT_KV",
+                        "NINFER_LMCACHE_RESTORE", "NINFER_LMCACHE_ENDPOINT",
+                        "NINFER_LMCACHE_CHUNK_TOKENS"):
                 env.pop(key, None)
+            if payload.get("lmcache"):
+                # Attach only when the server answers: an endpoint pointing at a dead port turns
+                # every lookup into a timeout instead of saying what is missing.
+                if not (self.lmcache_probe and self.lmcache_probe()):
+                    return {"ok": False,
+                            "error": "LMCache is not answering on 18080; start it first"}
+                env["NINFER_LMCACHE_RESTORE"] = "1"
+                env["NINFER_LMCACHE_ENDPOINT"] = "tcp://127.0.0.1:6555"
+                env["NINFER_LMCACHE_CHUNK_TOKENS"] = "128"
 
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
             handle = open(self.log_path, "wb", buffering=0)   # one run, one log
@@ -1357,7 +1369,8 @@ def main() -> int:
     Handler.gpu = GpuCollector(args.gpu_interval)
     Handler.engine = (EngineCollector(args.engine, api_key=args.engine_key)
                       if args.engine and args.engine != "none" else None)
-    Handler.launcher = Launcher(exe, roots, log_path, attach)
+    Handler.launcher = Launcher(exe, roots, log_path, attach,
+                                lmcache_probe=lambda: bool(Handler.lmcache and Handler.lmcache._probe()))
     Handler.lmcache = ScriptService(Path(__file__).resolve().parent / "start_lmcache.cmd",
                                    Path(__file__).resolve().parent / "lmcache-service.log",
                                    "lmcache", probe_url=args.upstream)

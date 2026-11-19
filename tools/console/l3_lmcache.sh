@@ -14,6 +14,11 @@
 #   - --chunk-size must be 128, because a checkpoint key is cut at whole chunks of 128 tokens and the
 #     server refuses a chunk index it was not told about (measured: "chunk index out of range").
 # Both are overridable here, but changing either means changing the engine side with it.
+#
+# L1 defaults to 4 GB, not the 10 the design notes used: the arena is host RAM inside WSL, and on a
+# 64 GB box a 10 GB cache plus the engine's own pinned host context exhausted cudaMallocHost - the
+# engine then fell back to pageable memory and died at module init (measured 2026-11-20, both the
+# release and a fresh build). Raise L3_L1_GB only on a machine with the RAM to spare.
 set -u
 
 ROOT="${L3_ROOT:-$HOME}"
@@ -22,7 +27,7 @@ PORT="${L3_PORT:-6555}"
 HTTP_PORT="${L3_HTTP_PORT:-18080}"
 CHUNK="${L3_CHUNK:-128}"
 WORKERS="${L3_WORKERS:-4}"
-L1_GB="${L3_L1_GB:-10}"
+L1_GB="${L3_L1_GB:-4}"
 LOG="${L3_LOG:-$ROOT/l3-lmcache.log}"
 PATTERN="lmcache server --transport zmq --port $PORT"
 
