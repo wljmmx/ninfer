@@ -1,4 +1,4 @@
-"""Serve the console and expose LMCache's Prometheus metrics to it as JSON.
+r"""Serve the console and expose LMCache's Prometheus metrics to it as JSON.
 
 Why this exists: LMCache's HTTP server sends no CORS headers, so a dashboard opened from
 file:// cannot read http://127.0.0.1:18080/metrics directly. This serves the page and the
@@ -18,11 +18,18 @@ And /api/engine.json: the engine's own /monitor/info|snapshot|events, polled at 
 subscribed once for events from this same process (no second collector). Counters are
 converted to rates here so the page only reads numbers; a failed poll marks a gap and the
 page breaks the line instead of interpolating. When the engine is unreachable the payload
-says so (ok=false plus a reason) and the page labels its demo fallback as 演示数据.
+says so (ok=false plus a reason) and the page shows nothing rather than a stand-in: every
+number on the page is a measurement, and "no engine" reads as "no data".
+
+And /api/launch, /api/launch/stop, /api/launch/status.json, /api/models.json: start and stop
+one ninfer-serve from the page. The page chooses a .ninfer file under a configured models root
+and fills in the knobs; this process validates every field and spawns the engine without a shell,
+so nothing the page sends can become a command. One child at a time — a second engine on the same
+GPU would invalidate every number the page exists to show.
 
 Usage:
     python lmcache_console.py [--port 8099] [--upstream http://127.0.0.1:18080/metrics]
-                              [--engine http://127.0.0.1:11438]
+                              [--engine http://127.0.0.1:11438] [--models-root R:\model]
 """
 
 from __future__ import annotations
@@ -32,11 +39,16 @@ import collections
 import ctypes
 import datetime
 import json
+import os
 import re
+import shlex
+import signal
+import subprocess
 import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -608,11 +620,219 @@ class EngineCollector:
                 "snapshot": None}
 
 
+class Launcher:
+    """Starts one ninfer-serve for the console, and only one.
+
+    The page asks; this process decides. A model has to be an existing `.ninfer` file under one of
+    the configured roots, every option is parsed and range-checked here instead of being forwarded
+    as text, and the child is spawned without a shell, so no value the page sends can turn into a
+    command. One child at a time: a second engine on the same GPU would distort every number the
+    page exists to report.
+    """
+
+    KV_DTYPES = ("bf16", "int8", "fp8", "nvfp4", "k8v4", "rk8v4", "rk4v4", "rk4v4-e8",
+                 "rk2v4-e8", "rk4v2-e8")
+    LOG_TAIL = 60
+
+    def __init__(self, exe: Path, roots: list[Path], log_path: Path, attach) -> None:
+        self.exe = exe
+        self.roots = [root for root in roots if root.is_dir()]
+        self.log_path = log_path
+        self.attach = attach                     # give the collector the URL we just started
+        self.lock = threading.Lock()
+        self.proc: subprocess.Popen | None = None
+        self.args: list[str] = []
+        self.port: int | None = None
+        self.model = ""
+        self.started_at = 0.0
+        self.exit_code: int | None = None
+
+    # -- path handling ---------------------------------------------------
+    def resolve(self, raw: str) -> Path | None:
+        """A path the page named, resolved and required to stay inside a root."""
+        if not raw:
+            return None
+        candidate = Path(raw)
+        try:
+            if not candidate.is_absolute():
+                for root in self.roots:
+                    inner = (root / raw.lstrip("\\/")).resolve()
+                    if inner.exists():
+                        candidate = inner
+                        break
+                else:
+                    return None
+            resolved = candidate.resolve()
+        except OSError:
+            return None
+        for root in self.roots:
+            try:
+                resolved.relative_to(root.resolve())
+                return resolved
+            except ValueError:
+                continue
+        return None
+
+    def browse(self, raw: str = "") -> dict:
+        """List one level: the roots, then directories and .ninfer files beneath them."""
+        raw = (raw or "").replace("\\", "/").strip("/")
+        if not self.roots:
+            return {"ok": False, "error": "no models root configured (--models-root)", "path": "",
+                    "dirs": [], "models": []}
+        if not raw:
+            return {"ok": True, "path": "",
+                    "roots": [{"name": str(root), "path": str(root)} for root in self.roots],
+                    "dirs": [], "models": []}
+        target = self.resolve(raw)
+        if target is None or not target.is_dir():
+            return {"ok": False, "error": f"not a directory under a models root: {raw}",
+                    "path": raw, "dirs": [], "models": []}
+        dirs, models = [], []
+        try:
+            for entry in sorted(target.iterdir(), key=lambda p: p.name.lower()):
+                if entry.name.startswith("."):
+                    continue
+                if entry.is_dir():
+                    dirs.append({"name": entry.name, "path": str(entry)})
+                elif entry.suffix.lower() == ".ninfer":
+                    models.append({"name": entry.name, "path": str(entry),
+                                   "size_gib": round(entry.stat().st_size / 1073741824, 1)})
+        except OSError as exc:
+            return {"ok": False, "error": str(exc), "path": raw, "dirs": [], "models": []}
+        parent = "" if target.resolve() in [root.resolve() for root in self.roots] \
+            else str(target.parent)
+        return {"ok": True, "path": str(target), "parent": parent, "dirs": dirs,
+                "models": models}
+
+    # -- process ---------------------------------------------------------
+    @staticmethod
+    def _int(payload: dict, key: str, default: int, low: int, high: int) -> int:
+        value = payload.get(key, default)
+        if value in (None, ""):
+            return default
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{key} must be an integer")
+        if not low <= number <= high:
+            raise ValueError(f"{key} must be within [{low}, {high}]")
+        return number
+
+    def start(self, payload: dict) -> dict:
+        with self.lock:
+            if self.proc is not None and self.proc.poll() is None:
+                return {"ok": False, "error": f"an engine started here is still running "
+                                              f"(pid {self.proc.pid}); stop it first"}
+            if not self.exe.is_file():
+                return {"ok": False, "error": f"ninfer-serve.exe not found: {self.exe}"}
+            model = self.resolve(str(payload.get("model", "")))
+            if model is None or model.suffix.lower() != ".ninfer" or not model.is_file():
+                return {"ok": False, "error": "choose an existing .ninfer file under a models root"}
+            try:
+                port = self._int(payload, "port", 11438, 1024, 65535)
+                max_context = self._int(payload, "max_context", 2048, 256, 1 << 20)
+                concurrency = self._int(payload, "max_concurrency", 1, 1, 64)
+                prefill_chunk = self._int(payload, "prefill_chunk", 1024, 64, 65536)
+                kv_dtype = str(payload.get("kv_dtype") or "bf16").strip()
+                if kv_dtype not in self.KV_DTYPES:
+                    return {"ok": False, "error": f"kv_dtype must be one of {list(self.KV_DTYPES)}"}
+                extra = shlex.split(str(payload.get("extra") or "")) if payload.get("extra") else []
+            except ValueError as exc:
+                return {"ok": False, "error": str(exc)}
+            if any(token in ("|", "&", ";", ">", "<") for token in extra):
+                return {"ok": False, "error": "extra arguments cannot contain shell operators"}
+
+            argv = [str(self.exe), str(model),
+                    "--host", "127.0.0.1", "--port", str(port),
+                    "--max-context", str(max_context),
+                    "--max-concurrency", str(concurrency),
+                    "--max-pending-requests", "16",
+                    "--prefill-chunk", str(prefill_chunk),
+                    "--kv-dtype", kv_dtype] + extra
+            env = os.environ.copy()
+            # The console has its own knobs; none of them may shape the engine it starts.
+            for key in ("NINFER_MODEL", "NINFER_QSA_SPARSE_GQA_QUANT_KV"):
+                env.pop(key, None)
+
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            handle = open(self.log_path, "ab", buffering=0)
+            handle.write(f"\n===== {datetime.datetime.now().astimezone().isoformat(timespec='seconds')}"
+                         f" {' '.join(argv)}\n".encode("utf-8"))
+            flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            try:
+                self.proc = subprocess.Popen(argv, cwd=str(self.exe.parent), env=env,
+                                             stdout=handle, stderr=subprocess.STDOUT,
+                                             stdin=subprocess.DEVNULL, creationflags=flags)
+            except OSError as exc:
+                return {"ok": False, "error": f"cannot start {self.exe}: {exc}"}
+            finally:
+                handle.close()
+            self.args = argv
+            self.port = port
+            self.model = str(model)
+            self.started_at = time.time()
+            self.exit_code = None
+            self.attach(f"http://127.0.0.1:{port}")
+            return {"ok": True, "pid": self.proc.pid, "port": port, "model": str(model),
+                    "command": subprocess.list2cmdline(argv)}
+
+    def stop(self) -> dict:
+        with self.lock:
+            proc = self.proc
+            if proc is None or proc.poll() is not None:
+                return {"ok": True, "note": "no engine started here is running"}
+            # Ask before forcing: the child owns a CUDA context and its own log flush, so a console
+            # break is a shutdown the engine can still answer. Terminate, then kill, only if it does
+            # not take the request.
+            how = "ctrl-break"
+            try:
+                os.kill(proc.pid, signal.CTRL_BREAK_EVENT)
+                proc.wait(timeout=10)
+            except (AttributeError, OSError, subprocess.TimeoutExpired):
+                how = "terminate"
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    how = "kill"
+                    proc.kill()
+                    proc.wait(timeout=10)
+            self.exit_code = proc.returncode
+            return {"ok": True, "stopped": proc.pid, "exit_code": proc.returncode, "how": how}
+
+    def log_tail(self) -> list[str]:
+        try:
+            with open(self.log_path, "rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                handle.seek(max(0, size - 64 * 1024))
+                text = handle.read().decode("utf-8", "replace")
+        except OSError:
+            return []
+        return text.splitlines()[-self.LOG_TAIL:]
+
+    def status(self) -> dict:
+        proc = self.proc
+        running = proc is not None and proc.poll() is None
+        if proc is not None and not running:
+            self.exit_code = proc.returncode
+        return {"ok": True, "running": running,
+                "pid": proc.pid if proc else None,
+                "alive": running,
+                "exit_code": self.exit_code,
+                "port": self.port,
+                "model": self.model,
+                "uptime_seconds": round(time.time() - self.started_at, 1) if running else None,
+                "command": subprocess.list2cmdline(self.args) if self.args else "",
+                "log": self.log_tail()}
+
+
 class Handler(BaseHTTPRequestHandler):
-    page: Path = Path("35b-moe-console.html")
+    page: Path = Path("console.html")
     upstream: str = "http://127.0.0.1:18080/metrics"
     gpu: GpuCollector | None = None
     engine: EngineCollector | None = None
+    launcher: Launcher | None = None
 
     def log_message(self, fmt: str, *args) -> None:  # keep the console quiet
         pass
@@ -627,14 +847,24 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:  # noqa: N802 (http.server naming)
-        path = self.path.split("?", 1)[0]
-        if path in ("/", "/index.html", "/35b-moe-console.html"):
+        path, _, query = self.path.partition("?")
+        if path in ("/", "/index.html", "/console.html"):
             try:
                 body = self.page.read_bytes()
             except OSError as exc:
                 self._send(500, f"cannot read {self.page}: {exc}".encode(), "text/plain; charset=utf-8")
                 return
             self._send(200, body, "text/html; charset=utf-8")
+            return
+        if path == "/api/launch/status.json":
+            body = self.launcher.status() if self.launcher is not None else {"ok": False, "running": False}
+            self._send(200, json.dumps(body, ensure_ascii=False).encode(), "application/json")
+            return
+        if path == "/api/models.json":
+            directory = urllib.parse.parse_qs(query).get("dir", [""])[0]
+            body = (self.launcher.browse(directory) if self.launcher is not None
+                    else {"ok": False, "error": "launcher not configured", "dirs": [], "models": []})
+            self._send(200, json.dumps(body, ensure_ascii=False).encode(), "application/json")
             return
         if path == "/api/lmcache.json":
             snapshot = build_snapshot(self.upstream)
@@ -680,8 +910,48 @@ class Handler(BaseHTTPRequestHandler):
     # The console is served from this origin, so its POSTs land here and are forwarded to the
     # engine's /control/* endpoints with the same credential the polls use. The engine's answer
     # (status and body) is returned unchanged: this proxy never re-writes a refusal into an OK.
+    def _read_body(self) -> bytes:
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        return self.rfile.read(length) if length > 0 else b"{}"
+
+    def _same_origin(self) -> bool:
+        """Starting a process is a local action; a page from another origin may not ask for it."""
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        host = urllib.parse.urlsplit(origin).hostname or ""
+        return host in ("127.0.0.1", "localhost", "::1")
+
     def do_POST(self) -> None:  # noqa: N802 (http.server naming)
         path = self.path.split("?", 1)[0]
+        if path in ("/api/launch", "/api/launch/stop"):
+            if not self._same_origin():
+                self._send(403, json.dumps({"ok": False, "error": "cross-origin launch refused"},
+                                           ensure_ascii=False).encode(), "application/json")
+                return
+            if self.launcher is None:
+                self._send(503, json.dumps({"ok": False, "error": "launcher not configured"},
+                                           ensure_ascii=False).encode(), "application/json")
+                return
+            body = self._read_body()
+            if path == "/api/launch/stop":
+                result = self.launcher.stop()
+            else:
+                try:
+                    payload = json.loads(body.decode("utf-8", "replace") or "{}")
+                except ValueError:
+                    payload = None
+                if not isinstance(payload, dict):
+                    self._send(400, json.dumps({"ok": False, "error": "body must be a JSON object"},
+                                               ensure_ascii=False).encode(), "application/json")
+                    return
+                result = self.launcher.start(payload)
+            self._send(200 if result.get("ok") else 400,
+                       json.dumps(result, ensure_ascii=False).encode(), "application/json")
+            return
         routes = {
             "/api/control/mode": "/control/mode",
             "/api/control/freeze": "/control/freeze",
@@ -696,11 +966,7 @@ class Handler(BaseHTTPRequestHandler):
                 {"ok": False, "error": "engine collector not started"},
                 ensure_ascii=False).encode(), "application/json")
             return
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            length = 0
-        body = self.rfile.read(length) if length > 0 else b"{}"
+        body = self._read_body()
         try:
             with urllib.request.urlopen(
                     engine.request(target, data=body, method="POST", timeout=10.0),
@@ -730,18 +996,39 @@ def main() -> int:
                         help="ninfer serve base URL; 'none' disables the engine source")
     parser.add_argument("--engine-key", default="",
                         help="API key for an engine started with one (sent as a Bearer token)")
+    parser.add_argument("--models-root", action="append", default=None,
+                        help="directory a model may be started from (repeatable; default R:\\model "
+                             "and the release's own ../model)")
+    parser.add_argument("--serve-exe", default=None,
+                        help="ninfer-serve.exe to start (default: beside the console's ../..)")
+    parser.add_argument("--log", default=None,
+                        help="engine stdout/stderr log (default: console.log beside this script)")
     args = parser.parse_args()
 
-    page = Path(args.page) if args.page else Path(__file__).resolve().parent / "35b-moe-console.html"
+    page = Path(args.page) if args.page else Path(__file__).resolve().parent / "console.html"
     if not page.is_file():
         print(f"console page not found: {page}", file=sys.stderr)
         return 2
+
+    root = Path(__file__).resolve().parent.parent.parent
+    exe = Path(args.serve_exe) if args.serve_exe else root / "ninfer-serve.exe"
+    if not exe.is_file():
+        dev = root / "build-win" / "apps" / "ninfer-serve.exe"
+        if dev.is_file():
+            exe = dev
+    roots = [Path(item) for item in args.models_root] if args.models_root else \
+        [Path("R:/model"), root.parent / "model"]
+    log_path = Path(args.log) if args.log else Path(__file__).resolve().parent / "console.log"
+
+    def attach(base: str) -> None:
+        Handler.engine = EngineCollector(base, api_key=args.engine_key)
 
     Handler.page = page
     Handler.upstream = args.upstream
     Handler.gpu = GpuCollector(args.gpu_interval)
     Handler.engine = (EngineCollector(args.engine, api_key=args.engine_key)
                       if args.engine and args.engine != "none" else None)
+    Handler.launcher = Launcher(exe, roots, log_path, attach)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"console  : http://{args.host}:{args.port}/")
     print(f"metrics  : http://{args.host}:{args.port}/api/lmcache.json  (upstream {args.upstream})")
@@ -749,6 +1036,8 @@ def main() -> int:
     print(f"gpu      : http://{args.host}:{args.port}/api/gpu.json  ({gpu_state})")
     print(f"engine   : http://{args.host}:{args.port}/api/engine.json  "
           f"({Handler.engine.base if Handler.engine else 'disabled'})")
+    print(f"launcher : {exe}  (models roots: "
+          f"{', '.join(str(r) for r in roots if r.is_dir()) or 'none'})")
     print("ctrl-c to stop")
     try:
         server.serve_forever()

@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NInfer 控制台</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b22; --line:#232b36; --ink:#d7dde6; --dim:#8b98a8;
+    --ok:#3fb950; --warn:#d29922; --bad:#f85149; --accent:#4c9aff;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:14px/1.5 "Segoe UI","Microsoft YaHei",system-ui,sans-serif}
+  header{display:flex;align-items:center;gap:12px;padding:14px 20px;
+         border-bottom:1px solid var(--line);background:var(--panel)}
+  header h1{font-size:15px;margin:0;letter-spacing:.5px}
+  .pill{padding:2px 10px;border-radius:999px;border:1px solid var(--line);font-size:12px}
+  .pill.idle{color:var(--dim)}
+  .pill.load{color:var(--warn);border-color:#4a3d18}
+  .pill.run{color:var(--ok);border-color:#1d3a24}
+  .pill.bad{color:var(--bad);border-color:#4a1f1f}
+  .muted{color:var(--dim);font-size:12px}
+  main{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px;padding:16px 20px 40px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+  .card.wide{grid-column:1/-1}
+  .card h2{font-size:13px;margin:0 0 10px;color:var(--dim);font-weight:600;letter-spacing:.4px}
+  .row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:10px 0}
+  label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--dim)}
+  input,select,button{background:#0b0f14;border:1px solid var(--line);color:var(--ink);
+                      border-radius:6px;padding:6px 8px;font:inherit;font-size:13px}
+  input[readonly]{color:var(--dim)}
+  button{cursor:pointer}
+  button:hover{border-color:#33404f}
+  button.primary{background:#18324f;border-color:#23486f;color:#cfe4ff}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  .crumbs{display:flex;gap:6px;flex-wrap:wrap;font-size:12px;color:var(--dim)}
+  .crumbs a{color:var(--accent);cursor:pointer;text-decoration:none}
+  .browser{max-height:190px;overflow:auto;border:1px solid var(--line);border-radius:8px;
+           background:#0b0f14;padding:6px;margin:8px 0}
+  .browser div{padding:4px 6px;border-radius:5px;cursor:pointer;font-size:13px;
+               display:flex;justify-content:space-between;gap:10px}
+  .browser div:hover{background:#1a2230}
+  .browser div.sel{background:#18324f}
+  .browser .n{color:var(--dim);font-size:12px}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-size:13px}
+  .kv span{color:var(--dim)}
+  .kv b{font-weight:600;font-family:Consolas,monospace}
+  .big{font-family:Consolas,monospace;font-size:26px;letter-spacing:.5px}
+  .unit{font-size:12px;color:var(--dim);margin-left:4px}
+  .metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px}
+  .metrics div{background:#0b0f14;border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+  .metrics .lbl{font-size:11px;color:var(--dim)}
+  pre{margin:0;background:#0b0f14;border:1px solid var(--line);border-radius:8px;
+      padding:10px;max-height:260px;overflow:auto;font:12px/1.45 Consolas,monospace;
+      color:#b9c4d2;white-space:pre-wrap;word-break:break-all}
+  .empty{color:var(--dim);font-size:13px;padding:6px 0}
+  canvas{width:100%;height:64px;display:block;margin-top:10px}
+</style>
+</head>
+<body>
+<header>
+  <h1>NInfer 控制台</h1>
+  <span id="pill" class="pill idle">引擎未启动</span>
+  <span id="src" class="muted"></span>
+</header>
+
+<main>
+  <section class="card">
+    <h2>启动引擎</h2>
+    <div class="row">
+      <div id="crumbs" class="crumbs"></div>
+      <span style="flex:1"></span>
+      <button id="up" title="上一级">上一级</button>
+      <button id="refresh" title="重新读取目录">刷新</button>
+    </div>
+    <div id="browser" class="browser"><div class="empty">读取中…</div></div>
+    <div class="grid">
+      <label>模型文件<input id="model" readonly placeholder="在上方点选 .ninfer"></label>
+      <label>端口<input id="port" type="number" value="11438" min="1024" max="65535"></label>
+      <label>最大上下文<input id="max_context" type="number" value="2048" min="256"></label>
+      <label>最大并发<input id="max_concurrency" type="number" value="1" min="1" max="64"></label>
+      <label>prefill 分块<input id="prefill_chunk" type="number" value="1024" min="64"></label>
+      <label>KV 类型
+        <select id="kv_dtype">
+          <option value="bf16">bf16</option><option value="int8">int8</option>
+          <option value="fp8">fp8</option><option value="nvfp4">nvfp4</option>
+          <option value="k8v4">k8v4</option><option value="rk8v4">rk8v4</option>
+          <option value="rk4v4">rk4v4</option><option value="rk4v4-e8">rk4v4-e8</option>
+          <option value="rk2v4-e8">rk2v4-e8</option><option value="rk4v2-e8">rk4v2-e8</option>
+        </select>
+      </label>
+    </div>
+    <label>额外参数（可选，原样传给 ninfer-serve）<input id="extra" placeholder="例如 --spec mtp --draft-tokens 5"></label>
+    <div class="row" style="margin-top:10px">
+      <button id="start" class="primary">启动</button>
+      <button id="stop">停止</button>
+      <span id="launchMsg" class="muted"></span>
+    </div>
+    <details style="margin-top:10px"><summary class="muted">启动命令</summary><pre id="cmd">—</pre></details>
+  </section>
+
+  <section class="card">
+    <h2>引擎</h2>
+    <div class="kv">
+      <span>状态</span><b id="m-status">—</b>
+      <span>模型</span><b id="m-model">—</b>
+      <span>地址</span><b id="m-base">—</b>
+      <span>已运行</span><b id="m-uptime">—</b>
+      <span>上下文</span><b id="m-context">—</b>
+      <span>并发上限</span><b id="m-conc">—</b>
+    </div>
+    <div class="metrics" style="margin-top:12px">
+      <div><div class="lbl">decode</div><div><span id="m-decode" class="big">—</span><span class="unit">tok/s</span></div></div>
+      <div><div class="lbl">prefill</div><div><span id="m-prefill" class="big">—</span><span class="unit">tok/s</span></div></div>
+      <div><div class="lbl">TTFT</div><div><span id="m-ttft" class="big">—</span><span class="unit">ms</span></div></div>
+      <div><div class="lbl">请求 运行/等待</div><div><span id="m-req" class="big">—</span></div></div>
+    </div>
+    <canvas id="spark" width="600" height="64"></canvas>
+    <div id="engineNote" class="empty">引擎未启动：没有数据可显示。</div>
+  </section>
+
+  <section class="card">
+    <h2>GPU</h2>
+    <div class="kv">
+      <span>功率</span><b id="g-power">—</b>
+      <span>温度</span><b id="g-temp">—</b>
+      <span>SM / 显存时钟</span><b id="g-util">—</b>
+      <span>风扇</span><b id="g-fan">—</b>
+      <span>PCIe 收/发</span><b id="g-pcie">—</b>
+    </div>
+    <div id="gpuNote" class="empty">—</div>
+  </section>
+
+  <section class="card">
+    <h2>LMCache</h2>
+    <div class="kv">
+      <span>L1 使用率</span><b id="l-usage">—</b>
+      <span>L1 内存</span><b id="l-bytes">—</b>
+      <span>事件队列</span><b id="l-queue">—</b>
+      <span>丢弃事件</span><b id="l-drop">—</b>
+    </div>
+    <div id="lcNote" class="empty">未接 LMCache 指标源（可选）。</div>
+  </section>
+
+  <section class="card wide">
+    <h2>引擎日志（本次启动）</h2>
+    <pre id="log">—</pre>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const state = { dir: '', model: '', hist: [], lastOk: false };
+
+const fmt = (v, d = 2) => (v == null || !isFinite(v)) ? '—' : Number(v).toFixed(d);
+const fmtInt = v => (v == null || !isFinite(v)) ? '—' : Math.round(v).toLocaleString();
+const ago = s => (s == null) ? '—' : (s >= 3600 ? (s/3600).toFixed(1) + ' h'
+              : s >= 60 ? (s/60).toFixed(1) + ' min' : Math.round(s) + ' s');
+
+async function getJSON(url){
+  const r = await fetch(url, {cache: 'no-store'});
+  if (!r.ok) throw new Error(url + ': ' + r.status);
+  return r.json();
+}
+async function postJSON(url, body){
+  const r = await fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'},
+                              body: JSON.stringify(body || {})});
+  return r.json();
+}
+
+/* ---------- 模型浏览 ---------- */
+function crumbs(path){
+  const el = $('crumbs');
+  const parts = ['<a data-p="">根目录</a>'];
+  if (path){
+    let acc = '';
+    for (const seg of path.split(/[\\/]/)){
+      if (!seg) continue;
+      acc = acc ? acc + '\\' + seg : seg;
+      parts.push('<a data-p="' + acc.replace(/"/g, '&quot;') + '">' + seg + '</a>');
+    }
+  }
+  el.innerHTML = parts.join(' <span>›</span> ');
+  el.querySelectorAll('a').forEach(a => a.onclick = () => loadDir(a.dataset.p));
+}
+async function loadDir(dir){
+  const box = $('browser');
+  box.innerHTML = '<div class="empty">读取中…</div>';
+  let d;
+  try{ d = await getJSON('/api/models.json?dir=' + encodeURIComponent(dir || '')); }
+  catch(e){ box.innerHTML = '<div class="empty">读取失败：' + e.message + '</div>'; return; }
+  if (!d.ok){ box.innerHTML = '<div class="empty">' + (d.error || '读取失败') + '</div>'; crumbs(''); return; }
+  state.dir = d.path || '';
+  crumbs(d.path || '');
+  box.innerHTML = '';
+  if (!d.path){
+    (d.roots || []).forEach(r => {
+      const row = document.createElement('div');
+      row.innerHTML = '<span>' + r.name + '</span><span class="n">root</span>';
+      row.onclick = () => loadDir(r.path);
+      box.appendChild(row);
+    });
+    if (!(d.roots || []).length) box.innerHTML = '<div class="empty">未配置模型目录</div>';
+    return;
+  }
+  (d.dirs || []).forEach(x => {
+    const row = document.createElement('div');
+    row.innerHTML = '<span>' + x.name + '\\</span><span class="n">目录</span>';
+    row.onclick = () => loadDir(x.path);
+    box.appendChild(row);
+  });
+  (d.models || []).forEach(x => {
+    const row = document.createElement('div');
+    row.innerHTML = '<span>' + x.name + '</span><span class="n">' + fmt(x.size_gib, 1) + ' GiB</span>';
+    row.onclick = () => {
+      state.model = x.path;
+      $('model').value = x.path;
+      box.querySelectorAll('.sel').forEach(n => n.classList.remove('sel'));
+      row.classList.add('sel');
+    };
+    box.appendChild(row);
+  });
+  if (!(d.dirs || []).length && !(d.models || []).length)
+    box.innerHTML = '<div class="empty">此目录下没有子目录或 .ninfer 文件</div>';
+}
+$('up').onclick = () => loadDir(state.dir ? state.dir.replace(/[\\/][^\\/]+$/, '') : '');
+$('refresh').onclick = () => loadDir(state.dir);
+
+/* ---------- 启动 / 停止 ---------- */
+$('start').onclick = async () => {
+  const payload = {
+    model: state.model || $('model').value,
+    port: Number($('port').value),
+    max_context: Number($('max_context').value),
+    max_concurrency: Number($('max_concurrency').value),
+    prefill_chunk: Number($('prefill_chunk').value),
+    kv_dtype: $('kv_dtype').value,
+    extra: $('extra').value.trim()
+  };
+  if (!payload.model){ $('launchMsg').textContent = '先选择一个 .ninfer 文件'; return; }
+  $('start').disabled = true;
+  $('launchMsg').textContent = '启动中…';
+  const r = await postJSON('/api/launch', payload);
+  $('launchMsg').textContent = r.ok ? ('已启动 pid ' + r.pid) : ('失败：' + r.error);
+  if (r.ok){ $('cmd').textContent = r.command; state.hist = []; }
+  $('start').disabled = false;
+};
+$('stop').onclick = async () => {
+  $('stop').disabled = true;
+  $('launchMsg').textContent = '停止中…';
+  const r = await postJSON('/api/launch/stop', {});
+  $('launchMsg').textContent = r.ok ? ('已停止' + (r.how ? '（' + r.how + '）' : '')) : ('失败：' + r.error);
+  $('stop').disabled = false;
+};
+
+/* ---------- 引擎数据 ---------- */
+function setEngine(payload){
+  const ok = payload.ok === true;
+  const launch = payload.launch;
+  const pill = $('pill');
+  const running = launch && launch.running;
+  if (ok){
+    const status = ((payload.snapshot || {}).engine || {}).status || '';
+    pill.className = 'pill ' + (status === 'ready' ? 'run' : 'load');
+    pill.textContent = status === 'ready' ? '运行中' : ('加载中' + (status ? ' · ' + status : ''));
+  } else {
+    pill.className = 'pill ' + (running ? 'load' : 'idle');
+    pill.textContent = running ? '已启动 · 等待 /monitor' : '引擎未启动';
+  }
+  $('src').textContent = ok ? ('数据源 ' + (payload.base || '')) : (running ? '等待引擎应答' : '引擎未运行');
+
+  const info = payload.info || {};
+  const model = info.model || {};
+  const conf = info.configuration || {};
+  // Nothing may leak out of a previous run: when the engine is not answering, every field is empty.
+  $('m-base').textContent = ok ? (payload.base || '—') : '—';
+  $('m-model').textContent = ok ? (model.name || (launch && launch.model) || '—') : '—';
+  $('m-uptime').textContent = ok ? ago(launch && launch.uptime_seconds) : '—';
+  $('m-context').textContent = ok ? fmtInt(conf.max_context || model.max_context) : '—';
+  $('m-conc').textContent = ok ? fmtInt(model.max_concurrency || conf.max_concurrency) : '—';
+  $('m-status').textContent = ok ? ((((payload.snapshot || {}).engine || {}).status) || 'ok')
+                                 : (running ? '等待引擎应答' : '未启动');
+
+  const rate = payload.rate || {};
+  $('m-decode').textContent = fmt(rate.decode_tps, 1);
+  $('m-prefill').textContent = fmt(rate.prefill_tps, 1);
+  const ttft = (payload.recent_ttft_ms || []);
+  $('m-ttft').textContent = ttft.length ? fmt(ttft[ttft.length - 1], 1)
+                                        : fmt(null);
+  const counters = payload.counters || {};
+  $('m-req').textContent = ok ? (fmtInt(counters.running_requests) + ' / ' + fmtInt(counters.waiting_requests))
+                              : '—';
+
+  $('engineNote').textContent = ok
+    ? (rate.window_seconds ? ('窗口 ' + fmt(rate.window_seconds, 1) + ' s · 数字来自引擎自报计数差分')
+                           : '等待第二个采样点（速率需要两次计数）')
+    : (running ? '引擎已启动，尚未应答 /monitor（大模型加载需要时间）'
+               : '引擎未启动：没有数据可显示。');
+
+  if (ok && rate.decode_tps != null){ state.hist.push(rate.decode_tps); }
+  else if (ok){ state.hist.push(null); }
+  if (!ok && !running) state.hist = [];        // a stopped engine leaves no curve behind
+  if (state.hist.length > 180) state.hist.shift();
+  drawSpark();
+}
+
+function drawSpark(){
+  const c = $('spark'), ctx = c.getContext('2d');
+  const w = c.width = c.clientWidth * (window.devicePixelRatio || 1);
+  c.height = 64 * (window.devicePixelRatio || 1);
+  ctx.clearRect(0, 0, w, c.height);
+  const data = state.hist.filter(v => v != null);
+  if (data.length < 2){ return; }
+  const max = Math.max.apply(null, data) * 1.15 || 1;
+  const n = state.hist.length;
+  ctx.strokeStyle = '#4c9aff'; ctx.lineWidth = 1.5 * (window.devicePixelRatio || 1);
+  ctx.beginPath();
+  let started = false;
+  state.hist.forEach((v, i) => {
+    const x = (i / (n - 1)) * w;
+    if (v == null){ started = false; return; }
+    const y = c.height - (v / max) * (c.height - 6) - 3;
+    if (!started){ ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+}
+
+/* ---------- GPU / LMCache ---------- */
+function setGpu(g){
+  const cur = g.current || {};
+  const limit = g.power_limit_w;
+  $('g-power').textContent = cur.power != null ? (fmt(cur.power, 0) + ' W' + (limit ? ' / ' + fmt(limit, 0) : '')) : '—';
+  $('g-temp').textContent = cur.temp != null ? fmt(cur.temp, 0) + ' °C' : '—';
+  $('g-util').textContent = (cur.sm != null || cur.mem != null)
+    ? (fmtInt(cur.sm) + ' / ' + fmtInt(cur.mem) + ' MHz') : '—';
+  $('g-fan').textContent = cur.fan != null ? fmt(cur.fan, 0) + ' %' : '—';
+  const p = g.pcie || {};
+  $('g-pcie').textContent = (p.rx_kb != null || p.tx_kb != null)
+    ? (fmtInt(p.rx_kb) + ' / ' + fmtInt(p.tx_kb) + ' KB/s') : '—';
+  $('gpuNote').textContent = g.ok ? 'NVML 直读' : ('NVML 不可用：' + (g.reason || '未知'));
+}
+function setLcache(d){
+  if (!d || !d.ok){ $('lcNote').textContent = 'LMCache 未运行（可选组件，未接指标源）'; return; }
+  const l1 = d.l1 || {};
+  $('l-usage').textContent = l1.usage_ratio != null ? fmt(l1.usage_ratio * 100, 1) + ' %' : '—';
+  $('l-bytes').textContent = l1.memory_bytes != null ? (l1.memory_bytes / 1048576).toFixed(0) + ' MiB' : '—';
+  $('l-queue').textContent = (d.events || {}).queue_depth != null ? fmtInt(d.events.queue_depth) : '—';
+  $('l-drop').textContent = (d.events || {}).dropped != null ? fmtInt(d.events.dropped) : '—';
+  $('lcNote').textContent = 'LMCache 指标已接入';
+}
+
+/* ---------- 轮询 ---------- */
+async function tickLaunch(){
+  try{
+    const s = await getJSON('/api/launch/status.json');
+    if (s.command && $('cmd').textContent === '—') $('cmd').textContent = s.command;
+    $('log').textContent = (s.log && s.log.length) ? s.log.join('\n') : '—';
+    $('start').disabled = !!s.running;
+    $('stop').disabled = !s.running;
+  }catch(e){ /* 服务端重启中：下一轮再试 */ }
+}
+async function tickEngine(){
+  try{
+    const e = await getJSON('/api/engine.json');
+    const s = await getJSON('/api/launch/status.json').catch(() => ({}));
+    e.launch = s;
+    setEngine(e);
+  }catch(err){
+    $('pill').className = 'pill bad'; $('pill').textContent = '控制台服务异常';
+    $('engineNote').textContent = String(err.message || err);
+  }
+}
+async function tickSide(){
+  try{ setGpu(await getJSON('/api/gpu.json')); }catch(e){}
+  try{ setLcache(await getJSON('/api/lmcache.json')); }catch(e){}
+}
+
+loadDir('');
+tickLaunch(); tickEngine(); tickSide();
+setInterval(tickLaunch, 1000);
+setInterval(tickEngine, 1000);
+setInterval(tickSide, 2000);
+window.addEventListener('resize', () => drawSpark());
+</script>
+</body>
+</html>

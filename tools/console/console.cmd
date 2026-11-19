@@ -15,8 +15,9 @@ echo metrics : http://127.0.0.1:%PORT%/api/lmcache.json
 echo gpu     : http://127.0.0.1:%PORT%/api/gpu.json
 echo engine  : http://127.0.0.1:%PORT%/api/engine.json  (%ENGINE%)
 echo.
-echo Requires the LMCache server on http://127.0.0.1:18080/metrics (default).
-echo Engine source is the ninfer serve base above; without it the console says 演示数据.
+echo Requires the LMCache server on http://127.0.0.1:18080/metrics (optional).
+echo Pick a .ninfer file in the page to start the engine; nothing is shown until it answers.
+echo Models root defaults to R:\model; add --models-root DIR to change it.
 echo Press Ctrl+C to stop.
 echo.
 python "%HERE%lmcache_console.py" --port %PORT% --engine %ENGINE%
