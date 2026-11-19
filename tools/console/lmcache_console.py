@@ -41,7 +41,6 @@ import datetime
 import json
 import os
 import re
-import shlex
 import signal
 import subprocess
 import sys
@@ -636,6 +635,36 @@ class Launcher:
                  "rk2v4-e8", "rk4v2-e8")
     LOG_TAIL = 60
 
+    # The page offers these as checkboxes; this table is what decides. An option the table does not
+    # know is refused rather than forwarded, so "extra arguments" stays a set of choices and never
+    # becomes a second, unchecked command line.
+    OPTION_SPECS: dict = {
+        "--spec": ("enum", ("none", "mtp", "dflash", "dflash2")),
+        "--draft-tokens": ("int", 1, 15),
+        "--lm-head-draft": ("flag",),
+        "--no-cuda-graph": ("flag",),
+        "--max-pending-requests": ("int", 1, 64),
+        "--pending-timeout-ms": ("int", 0, 600000),
+        "--controller-mode": ("enum", ("auto", "stable", "performance")),
+        "--device": ("int", 0, 15),
+        "--kv-capacity": ("text", re.compile(r"^(auto|[0-9]{1,7})$")),
+        "--no-prefix-reuse": ("flag",),
+        "--device-state-slots": ("int", 0, 64),
+        "--host-context-mib": ("int", 0, 1 << 20),
+        "--kv-evict": ("enum", ("off", "on", "auto")),
+        "--kv-idle-reclaim-ms": ("int", 0, 86400000),
+        "--no-thinking": ("flag",),
+        "--preserve-thinking": ("flag",),
+        "--default-thinking-budget": ("int", 0, 65536),
+        "--default-max-tokens": ("int", 1, 1 << 20),
+        "--temperature": ("float_or_model", 0.0, 2.0),
+        "--top-p": ("float_or_model", 0.0, 1.0),
+        "--greedy": ("flag",),
+        "--log-level": ("enum", ("trace", "debug", "info", "warning", "error", "critical", "off")),
+        "--log-stats-interval-ms": ("int", 0, 3600000),
+        "--vision": ("flag",),
+    }
+
     def __init__(self, exe: Path, roots: list[Path], log_path: Path, attach) -> None:
         self.exe = exe
         self.roots = [root for root in roots if root.is_dir()]
@@ -728,6 +757,57 @@ class Launcher:
                 "models": models}
 
     # -- process ---------------------------------------------------------
+    @classmethod
+    def _check_value(cls, name: str, spec: tuple, value: str) -> None:
+        kind = spec[0]
+        if kind == "int":
+            if not re.fullmatch(r"-?[0-9]{1,9}", value):
+                raise ValueError(f"{name} needs an integer, got {value!r}")
+            number = int(value)
+            if not spec[1] <= number <= spec[2]:
+                raise ValueError(f"{name} must be within [{spec[1]}, {spec[2]}]")
+        elif kind == "float_or_model":
+            if value == "model":
+                return
+            try:
+                number = float(value)
+            except ValueError:
+                raise ValueError(f"{name} needs a number or 'model', got {value!r}") from None
+            if not spec[1] <= number <= spec[2]:
+                raise ValueError(f"{name} must be within [{spec[1]}, {spec[2]}]")
+        elif kind == "enum":
+            if value not in spec[1]:
+                raise ValueError(f"{name} must be one of {list(spec[1])}, got {value!r}")
+        elif kind == "text":
+            if not spec[1].match(value):
+                raise ValueError(f"{name} does not accept {value!r}")
+
+    @classmethod
+    def extra_args(cls, payload: dict) -> list[str]:
+        tokens = payload.get("extra_args")
+        if tokens in (None, ""):
+            return []
+        if not isinstance(tokens, list) or len(tokens) > 48:
+            raise ValueError("extra_args must be a list of at most 48 tokens")
+        out: list[str] = []
+        index = 0
+        while index < len(tokens):
+            name = str(tokens[index]).strip()
+            spec = cls.OPTION_SPECS.get(name)
+            if spec is None:
+                raise ValueError(f"unknown option {name!r}: pick one from the console's list")
+            if spec[0] == "flag":
+                out.append(name)
+                index += 1
+                continue
+            if index + 1 >= len(tokens):
+                raise ValueError(f"{name} needs a value")
+            value = str(tokens[index + 1]).strip()
+            cls._check_value(name, spec, value)
+            out.extend([name, value])
+            index += 2
+        return out
+
     @staticmethod
     def _int(payload: dict, key: str, default: int, low: int, high: int) -> int:
         value = payload.get(key, default)
@@ -759,19 +839,25 @@ class Launcher:
                 kv_dtype = str(payload.get("kv_dtype") or "bf16").strip()
                 if kv_dtype not in self.KV_DTYPES:
                     return {"ok": False, "error": f"kv_dtype must be one of {list(self.KV_DTYPES)}"}
-                extra = shlex.split(str(payload.get("extra") or "")) if payload.get("extra") else []
+                extra = self.extra_args(payload)
             except ValueError as exc:
                 return {"ok": False, "error": str(exc)}
-            if any(token in ("|", "&", ";", ">", "<") for token in extra):
-                return {"ok": False, "error": "extra arguments cannot contain shell operators"}
 
-            argv = [str(self.exe), str(model),
-                    "--host", "127.0.0.1", "--port", str(port),
-                    "--max-context", str(max_context),
-                    "--max-concurrency", str(concurrency),
-                    "--max-pending-requests", "16",
-                    "--prefill-chunk", str(prefill_chunk),
-                    "--kv-dtype", kv_dtype] + extra
+            # A selected option wins over the value the page also fills in: passing the same flag
+            # twice would leave the engine's parser to decide which copy counts.
+            overridden = {token for token in extra if token.startswith("--")}
+            base = [("--host", "127.0.0.1"), ("--port", str(port)),
+                    ("--max-context", str(max_context)),
+                    ("--max-concurrency", str(concurrency)),
+                    ("--max-pending-requests", "16"),
+                    ("--prefill-chunk", str(prefill_chunk)),
+                    ("--kv-dtype", kv_dtype)]
+            flat: list[str] = []
+            for flag, value in base:
+                if flag in overridden:
+                    continue
+                flat.extend([flag, value])
+            argv = [str(self.exe), str(model)] + flat + extra
             env = os.environ.copy()
             # The console has its own knobs; none of them may shape the engine it starts.
             for key in ("NINFER_MODEL", "NINFER_QSA_SPARSE_GQA_QUANT_KV"):
@@ -1100,6 +1186,13 @@ class Handler(BaseHTTPRequestHandler):
         self._send(status, payload, "application/json")
 
 
+class ConsoleServer(ThreadingHTTPServer):
+    # On Windows SO_REUSEADDR means "another process may take this port", not "rebind after close":
+    # two consoles then both listen on 8099 and requests land on whichever bound last, which reads
+    # as a button that works sometimes. Refusing the second bind makes the stale instance obvious.
+    allow_reuse_address = False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Console + LMCache metrics proxy")
     parser.add_argument("--port", type=int, default=8099)
@@ -1144,7 +1237,13 @@ def main() -> int:
     Handler.engine = (EngineCollector(args.engine, api_key=args.engine_key)
                       if args.engine and args.engine != "none" else None)
     Handler.launcher = Launcher(exe, roots, log_path, attach)
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    try:
+        server = ConsoleServer((args.host, args.port), Handler)
+    except OSError as exc:
+        print(f"cannot listen on {args.host}:{args.port}: {exc}", file=sys.stderr)
+        print("another console is probably running; close it (or use --port) and start again",
+              file=sys.stderr)
+        return 3
     print(f"console  : http://{args.host}:{args.port}/")
     print(f"metrics  : http://{args.host}:{args.port}/api/lmcache.json  (upstream {args.upstream})")
     gpu_state = "NVML OK" if Handler.gpu.nvml is not None else f"NVML 不可用（{Handler.gpu.reason}）"

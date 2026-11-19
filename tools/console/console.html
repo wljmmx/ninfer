@@ -58,6 +58,19 @@
       color:#b9c4d2;white-space:pre-wrap;word-break:break-all}
   .empty{color:var(--dim);font-size:13px;padding:6px 0}
   canvas{width:100%;height:64px;display:block;margin-top:10px}
+  .opts{margin-top:10px;max-height:340px;overflow:auto;border:1px solid var(--line);
+        border-radius:8px;background:#0b0f14;padding:6px 10px 10px}
+  .opts h3{font-size:11px;color:var(--dim);margin:10px 0 4px;font-weight:600;letter-spacing:.4px}
+  .optrow{display:grid;grid-template-columns:16px 1fr auto;grid-template-rows:auto auto;
+          column-gap:8px;row-gap:0;padding:4px 0;font-size:12.5px;align-items:center}
+  .optrow input[type=checkbox]{grid-column:1;grid-row:1 / span 2;margin:0}
+  .optrow .flag{grid-column:2;grid-row:1;font-family:Consolas,monospace;color:#9fc4ff;font-size:11.5px;
+                white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .optrow .desc{grid-column:2;grid-row:2;color:var(--dim);font-size:11px;line-height:1.3}
+  .optrow .ctl{grid-column:3;grid-row:1 / span 2}
+  .optrow input[type=number],.optrow input[type=text],.optrow select{padding:2px 6px;font-size:12px;width:96px}
+  .optrow.off .flag,.optrow.off .desc{opacity:.5}
+  .optrow.blocked{opacity:.35}
 </style>
 </head>
 <body>
@@ -94,7 +107,10 @@
         </select>
       </label>
     </div>
-    <label>额外参数（可选，原样传给 ninfer-serve）<input id="extra" placeholder="例如 --spec mtp --draft-tokens 5"></label>
+    <details id="optsBox" style="margin-top:10px">
+      <summary class="muted">额外参数（可选，勾选后自动拼进命令行）<span id="optCount" class="pill idle" style="margin-left:8px">0 项</span></summary>
+      <div id="opts" class="opts"></div>
+    </details>
     <div class="row" style="margin-top:10px">
       <button id="start" class="primary">启动</button>
       <button id="stop">停止</button>
@@ -258,6 +274,125 @@ $('pickdir').onclick = async () => {
 $('up').onclick = () => loadDir(state.dir ? state.dir.replace(/[\\/][^\\/]+$/, '') : '');
 $('refresh').onclick = () => loadDir(state.dir);
 
+/* ---------- 额外参数：只从这张表里选，不给人手写命名的机会 ---------- */
+const OPTIONS = [
+  {group:'推测解码', items:[
+    {flag:'--spec', desc:'推测后端', type:'enum', values:['none','mtp','dflash','dflash2'], def:'mtp'},
+    {flag:'--draft-tokens', desc:'草稿窗口 1..15', type:'int', min:1, max:15, def:5, needs:'--spec'},
+    {flag:'--lm-head-draft', desc:'优化提案头', type:'bool', needs:'--spec'}
+  ]},
+  {group:'执行与排队', items:[
+    {flag:'--no-cuda-graph', desc:'关闭整步 CUDA Graph', type:'bool'},
+    {flag:'--max-pending-requests', desc:'排队容量', type:'int', min:1, max:64, def:16},
+    {flag:'--pending-timeout-ms', desc:'排队超时 ms', type:'int', min:0, max:600000, def:30000},
+    {flag:'--controller-mode', desc:'控制器档位', type:'enum', values:['auto','stable','performance'], def:'auto'},
+    {flag:'--device', desc:'CUDA 设备序号', type:'int', min:0, max:15, def:0}
+  ]},
+  {group:'KV 与上下文', items:[
+    {flag:'--kv-capacity', desc:'KV 页容量（N 或 auto）', type:'text', def:'auto'},
+    {flag:'--no-prefix-reuse', desc:'关闭跨请求前缀复用', type:'bool'},
+    {flag:'--device-state-slots', desc:'额外状态槽位', type:'int', min:0, max:64, def:1},
+    {flag:'--host-context-mib', desc:'Host 上下文 MiB（0 关）', type:'int', min:0, max:1048576, def:0},
+    {flag:'--kv-evict', desc:'KV 驱逐契约', type:'enum', values:['off','on','auto'], def:'auto'},
+    {flag:'--kv-idle-reclaim-ms', desc:'空闲回收延迟 ms', type:'int', min:0, max:86400000, def:60000}
+  ]},
+  {group:'生成默认值', items:[
+    {flag:'--no-thinking', desc:'关闭思考', type:'bool'},
+    {flag:'--preserve-thinking', desc:'保留已结束思考', type:'bool'},
+    {flag:'--default-thinking-budget', desc:'思考预算 tokens', type:'int', min:0, max:65536, def:4096},
+    {flag:'--default-max-tokens', desc:'默认输出上限', type:'int', min:1, max:1048576, def:8192},
+    {flag:'--temperature', desc:'温度（0..2 或 model）', type:'text', def:'0.6'},
+    {flag:'--top-p', desc:'top-p（0..1 或 model）', type:'text', def:'0.95'},
+    {flag:'--greedy', desc:'精确 argmax', type:'bool'}
+  ]},
+  {group:'日志与其它', items:[
+    {flag:'--log-level', desc:'日志级别', type:'enum', values:['trace','debug','info','warning','error','critical','off'], def:'info'},
+    {flag:'--log-stats-interval-ms', desc:'吞吐日志间隔 ms', type:'int', min:0, max:3600000, def:5000},
+    {flag:'--vision', desc:'加载视觉资源', type:'bool'}
+  ]}
+];
+
+function buildOptions(){
+  const box = $('opts');
+  box.innerHTML = '';
+  for (const group of OPTIONS){
+    const head = document.createElement('h3');
+    head.textContent = group.group;
+    box.appendChild(head);
+    for (const item of group.items){
+      const row = document.createElement('div');
+      row.className = 'optrow off';
+      row.dataset.flag = item.flag;
+      if (item.needs) row.dataset.needs = item.needs;
+
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.dataset.flag = item.flag;
+      cb.addEventListener('change', () => {
+        const ctl = row.querySelector('input:not([type=checkbox]), select');
+        if (ctl) ctl.disabled = !cb.checked;
+        row.classList.toggle('off', !cb.checked);
+        syncOptions();
+      });
+
+      const flag = document.createElement('span');
+      flag.className = 'flag';
+      flag.textContent = item.flag;
+      const desc = document.createElement('span');
+      desc.className = 'desc';
+      desc.textContent = item.desc;
+
+      const cell = document.createElement('span');
+      cell.className = 'ctl';
+      if (item.type === 'enum'){
+        const sel = document.createElement('select');
+        for (const v of item.values){ const o = document.createElement('option'); o.value = v; o.textContent = v; sel.appendChild(o); }
+        sel.value = item.def; sel.disabled = true; cell.appendChild(sel);
+      } else if (item.type === 'int' || item.type === 'text'){
+        const inp = document.createElement('input');
+        if (item.type === 'int'){ inp.type = 'number'; inp.min = item.min; inp.max = item.max; }
+        else inp.type = 'text';
+        inp.value = item.def != null ? item.def : '';
+        inp.disabled = true;
+        cell.appendChild(inp);
+      }
+      row.append(cb, flag, desc, cell);
+      box.appendChild(row);
+    }
+  }
+  syncOptions();
+}
+function syncOptions(){
+  const on = new Set([...document.querySelectorAll('#opts input[type=checkbox]:checked')]
+                     .map(c => c.dataset.flag));
+  document.querySelectorAll('#opts .optrow').forEach(row => {
+    const need = row.dataset.needs;
+    const blocked = !!need && !on.has(need);
+    row.classList.toggle('blocked', blocked);
+    const cb = row.querySelector('input[type=checkbox]');
+    cb.disabled = blocked;
+    if (blocked && cb.checked){
+      cb.checked = false;
+      row.classList.add('off');
+      const ctl = row.querySelector('input:not([type=checkbox]), select');
+      if (ctl) ctl.disabled = true;
+    }
+  });
+  $('optCount').textContent = on.size + ' 项';
+}
+function collectOptions(){
+  const args = [];
+  document.querySelectorAll('#opts .optrow').forEach(row => {
+    const cb = row.querySelector('input[type=checkbox]');
+    if (!cb || !cb.checked) return;
+    args.push(row.dataset.flag);
+    const ctl = row.querySelector('input:not([type=checkbox]), select');
+    if (ctl && ctl.value !== '') args.push(String(ctl.value));
+  });
+  return args;
+}
+buildOptions();
+
 /* ---------- 启动 / 停止 ---------- */
 $('start').onclick = async () => {
   const payload = {
@@ -267,7 +402,7 @@ $('start').onclick = async () => {
     max_concurrency: Number($('max_concurrency').value),
     prefill_chunk: Number($('prefill_chunk').value),
     kv_dtype: $('kv_dtype').value,
-    extra: $('extra').value.trim()
+    extra_args: collectOptions()
   };
   if (!payload.model){ $('launchMsg').textContent = '先选择一个 .ninfer 文件'; return; }
   $('start').disabled = true;
