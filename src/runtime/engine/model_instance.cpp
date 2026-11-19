@@ -4,6 +4,7 @@
 #include "artifact/reader.h"
 #include "artifact/formats.h"
 #include "core/capacity_bet.h"
+#include "core/controller_mode.h"
 #include "core/expert_cache.h"
 #include "core/expert_stage_stats.h"
 #include "core/memory_budget.h"
@@ -100,6 +101,15 @@ struct ExpertPlacement {
 // pinned split says so when it does not fit.
 
 [[nodiscard]] bool kv_capacity_shortage(const std::invalid_argument& error) noexcept;
+
+// P1c: the tiered resolver's other refusal - the declared capacity does not fit what the Device
+// budget plus the Host budget can back. It is a DEVICE-side shortage too, so the one WDDM retry the
+// fully resident path takes applies; the final message then names the largest plan that budget can
+// afford.
+[[nodiscard]] bool kv_capacity_backing_refusal(const std::invalid_argument& error) noexcept {
+    const char* what = error.what();
+    return what != nullptr && std::strstr(what, "does not fit:") != nullptr;
+}
 
 // P7.1 (v10 8.4, V10-55): a refusal that can be re-solved. Thrown by attach_expert_cache() when the
 // pool would hold less than one slot AND the controller's bet says the KV leg can give way.
@@ -1398,23 +1408,31 @@ std::uint64_t host_expert_arena_bytes(std::uint64_t want_bytes) {
     return budget;
 }
 
-// port (sm_89): is the KV residency model in force for this construction? It is OPT-IN, and only
-// for an Explicit capacity:
-//   * automatic already spends the leftover Device budget on pages, so it has nothing to tier;
-//   * tiering the curve minimum means the Device pool is deliberately smaller than max_context, and
-//     requests past it are refused with a diagnostic instead of served. That is the right trade for
-//     a 256K plan on a 24 GB card, and the wrong default for everyone else - without the switch every
-//     existing run keeps the fully resident plan (and the exact numbers) it had.
-// NINFER_KV_NO_HOST_RESIDENCY is the A/B arm: it wins over the request, which is also how the
-// historical "minimum Engine runtime reservation requires ..." failure is reproduced on demand.
+// port (sm_89) / P1c: is the KV residency model in force for this construction?
+//
+// The CONTROLLER owns it now (core/controller_mode.h: auto and performance tier, stable does not).
+// The two switches it used to require are overrides only:
+//   * NINFER_KV_NO_HOST_RESIDENCY wins over everything - it is the A/B arm, and it is also how the
+//     historical "minimum Engine runtime reservation requires ..." failure is reproduced;
+//   * NINFER_KV_HOST_RESIDENCY names the decision outright, either way, so a recorded arm stays
+//     reproducible.
+// With neither set, no environment variable is needed for the default any more, which is what made
+// the tier impossible to reach from the shipped command line.
+//
+// Tiering the curve minimum means the Device pool is deliberately smaller than max_context, and a
+// page the Device does not hold is fetched before the step that reads it. That is the right trade for
+// a 256K plan on a 24 GB card and the wrong default for a `stable` deployment, which is exactly the
+// distinction the mode now draws.
 bool kv_host_residency_requested(const EngineOptions& options) {
-    if (options.kv_capacity.mode != KvCapacityMode::Explicit) { return false; }
+    (void)options;
     if (const char* off = std::getenv("NINFER_KV_NO_HOST_RESIDENCY");
         off != nullptr && *off != '\0' && std::strcmp(off, "0") != 0) {
         return false;
     }
-    const char* on = std::getenv("NINFER_KV_HOST_RESIDENCY");
-    return on != nullptr && *on != '\0' && std::strcmp(on, "0") != 0;
+    if (const char* on = std::getenv("NINFER_KV_HOST_RESIDENCY"); on != nullptr) {
+        return *on != '\0' && std::strcmp(on, "0") != 0;
+    }
+    return controller_residency_policy(controller_mode()).kv_host_tiering;
 }
 
 // Device memory a residency plan keeps free. It is priced from free-after-weights, and the graph
@@ -1526,6 +1544,30 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     ContextCacheOptions& cache      = options.context_cache;
     const std::uint32_t concurrency = options.max_concurrency;
     cache.device_state_slots        = cache.device_state_slots.value_or(concurrency);
+    // P1c: --host-context-mib is optional. Unset derives a Host arena budget from free physical
+    // memory, because a tiered plan needs a real figure to be solved against and the fixed
+    // "8 GiB + 8 StateImages" the layout used to invent was unrelated to the box it ran on. The
+    // fraction is deliberately conservative - ONE EIGHTH of free physical RAM, floored at 2 GiB -
+    // because the arena is committed, not reserved: HostContextArena pins it when the driver grants
+    // the lock and otherwise pageable-allocates and zero-fills the whole thing. Causal scoring keeps
+    // its named 0 (no Host backing) and is therefore untouched.
+    if (!cache.host_capacity_bytes.has_value() && options.purpose == EnginePurpose::Generation) {
+        const auto free_host = current_free_host_bytes();
+        if (free_host != 0) {
+            constexpr std::size_t kFloor   = 2ULL << 30;
+            constexpr std::size_t kDivisor = 8;
+            const std::size_t budget       = std::max(kFloor, free_host / kDivisor);
+            cache.host_capacity_bytes      = budget;
+            constexpr double kMib          = 1024.0 * 1024.0;
+            std::fprintf(stderr,
+                         "[host-context] budget: %.0f MiB (derived: 1/%zu of %.0f MiB free physical "
+                         "RAM, floor %.0f MiB; --host-context-mib overrides it)\n",
+                         static_cast<double>(budget) / kMib, kDivisor,
+                         static_cast<double>(free_host) / kMib,
+                         static_cast<double>(kFloor) / kMib);
+            std::fflush(stderr);
+        }
+    }
     const std::uint64_t total_device_state_slots =
         static_cast<std::uint64_t>(concurrency) + *cache.device_state_slots;
     if (total_device_state_slots > std::numeric_limits<std::uint32_t>::max()) {
@@ -1800,8 +1842,20 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
     // full-attention pages reports a zero payload stride and keeps the fully resident plan.
     KvResidencyStrides strides = planner.residency_strides();
     strides.tier_minimum_residency = true;
-    const bool tiered_mode = kv_host_residency_requested(options) &&
-                             strides.payload_bytes_per_resident_page_group != 0;
+    // P1c: the Host budget the non-resident payload has to fit in. A named --host-context-mib
+    // binds; when it is absent the plan's own default is the figure (that default is still
+    // "8 GiB of KV plus eight StateImages"). The StateImage replicas are owed out of the same
+    // arena, so they come off the top: what is left is what can back logical pages. Zero means the
+    // Host tier is off (--host-context-mib 0), and then nothing may be tiered.
+    const std::size_t host_state_reserve = 8 * planner.state_image_bytes();
+    const std::size_t host_context_budget =
+        options.context_cache.host_capacity_bytes.value_or(
+            8ULL * 1024 * 1024 * 1024 + host_state_reserve);
+    const std::size_t host_kv_budget =
+        host_context_budget > host_state_reserve ? host_context_budget - host_state_reserve : 0;
+    const bool tiering_allowed = kv_host_residency_requested(options) && host_kv_budget != 0;
+    const bool tiered_mode =
+        tiering_allowed && strides.payload_bytes_per_resident_page_group != 0;
     const std::size_t residency_slack = tiered_mode ? kv_residency_slack_bytes() : 0;
     // V10-01 (T156): the StateImage geometry already exists before the Program does - it is the
     // planner's `PersistentLayout::state_images` - so the context pool's three ledgers are sized
@@ -1826,7 +1880,8 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
     // bill, so the two together say whether the anchor is images or payload.
     std::fprintf(stderr,
                  "[kv-plan] lanes=%u extra_slots=%d anchor_slots=%u state_image_bytes=%zu "
-                 "state_images=%zu logical_slots=%u | minimum=%zu minimum_payload=%zu\n",
+                 "state_images=%zu logical_slots=%u | minimum=%zu minimum_payload=%zu maximum=%u "
+                 "mode=%s tiering=%d host_kv_budget=%zu\n",
                  options.max_concurrency,
                  options.context_cache.device_state_slots.value_or(options.max_concurrency),
                  anchor_state_slots, state_image_bytes,
@@ -1834,7 +1889,10 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
                  logical_state_slots,
                  capacity_curve.minimum_device_reservation_bytes,
                  capacity_curve.minimum_main_page_groups *
-                     strides.payload_bytes_per_resident_page_group);
+                     strides.payload_bytes_per_resident_page_group,
+                 capacity_curve.maximum_main_page_groups,
+                 options.kv_capacity.mode == KvCapacityMode::Automatic ? "auto" : "explicit",
+                 tiered_mode ? 1 : 0, host_kv_budget);
     std::fflush(stderr);
     const ContextCapacityCurve joint_capacity_curve{
         .kv                              = capacity_curve,
@@ -1863,12 +1921,18 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
             }
             return resolve_kv_capacity(options.kv_capacity, capacity_curve, budget);
         }
-        const std::size_t usable = budget > residency_slack ? budget - residency_slack : 0;
+        const std::size_t held_back = residency_slack + options.kv_capacity.automatic_headroom_bytes;
+        const std::size_t usable = budget > held_back ? budget - held_back : 0;
+        // P1c: an Automatic policy is solved here too - logical = max_concurrency x max_context,
+        // Device pages from what is left after weights/graph/workspace, Host pages from the Host
+        // arena budget. Only the residency split adapts; the Host budget bounds how much of the
+        // declared capacity can be backed at all.
         const auto tiered        = resolve_kv_capacity_with_residency(
-            options.kv_capacity, capacity_curve, strides, usable);
+            options.kv_capacity, capacity_curve, strides, usable, host_kv_budget);
         KvCapacityResolution out;
         out.mode                     = options.kv_capacity.mode;
         out.main_page_groups         = tiered.logical_page_groups;
+        out.declared_page_groups     = tiered.declared_page_groups;
         out.maximum_main_page_groups = capacity_curve.maximum_main_page_groups;
         out.resolved_tokens = capacity_curve.resolved_tokens(tiered.logical_page_groups);
         out.logical_page_groups  = tiered.logical_page_groups;
@@ -1887,16 +1951,39 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
         out.automatic_headroom_bytes      = options.kv_capacity.automatic_headroom_bytes;
         out.planned_slack_bytes           = usable - tiered.device_reservation_bytes;
         out.residency_slack_bytes         = residency_slack;
+        out.host_budget_bytes             = host_kv_budget;
         return out;
     };
     auto resolution = [&]() -> KvCapacityResolution {
         // A tiered plan is priced against what the driver can give back WITHOUT taking pages away
         // from somebody else. The WDDM evictable budget below deliberately plans into memory the
         // driver then has to reclaim, and reclaiming it from this process means paging the KV pool -
-        // measured on the 256K dense arm as 18 tok/s prefill against 2,826. So the retry is for the
-        // fully resident plan only; a tiered plan that does not fit in the honest budget is a plan
-        // that would page.
-        if (tiered_mode) { return plan_kv_at(conservative); }
+        // measured on the 256K dense arm as 18 tok/s prefill against 2,826.
+        //
+        // P1c: the one exception is a plan that cannot pay even its own FIXED part (workspace, graph
+        // allowance, the non-KV persistent layout, the StateImages). That plan has no page to give
+        // up - tiering cannot make it fit - so the same single WDDM retry the fully resident path
+        // uses is taken, and both budgets are printed. A degraded logical capacity is not a reason
+        // to retry: it is the budget answering honestly.
+        if (tiered_mode) {
+            try {
+                return plan_kv_at(conservative);
+            } catch (const std::invalid_argument& error) {
+                if (!(kv_capacity_shortage(error) || kv_capacity_backing_refusal(error)) ||
+                    std::getenv("NINFER_NO_WDDM_EVICTABLE") != nullptr) {
+                    throw;
+                }
+                const auto optimistic = current_free_device_bytes(true, weights_bytes);
+                if (optimistic <= conservative) { throw; }
+                std::fprintf(stderr,
+                             "[kv-tier] the plan does not fit the honest budget (%zu bytes free); "
+                             "planning against the WDDM evictable budget (%zu bytes) - resident pages "
+                             "the driver reclaims will page\n",
+                             conservative, optimistic);
+                std::fflush(stderr);
+                return plan_kv_at(optimistic);
+            }
+        }
         try {
             return plan_kv_at(conservative);
         } catch (const std::invalid_argument& error) {

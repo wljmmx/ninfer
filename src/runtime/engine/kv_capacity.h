@@ -34,8 +34,17 @@ struct KvResidencyStrides {
 };
 
 struct KvResidencyResolution {
+    // The capacity the caller declared. For an explicit policy this is the requested page count;
+    // for an automatic one it is max_concurrency x max_context (the curve's maximum), because that
+    // is what "8 lanes of 204800" asks for. `logical_page_groups` is what the two tiers can actually
+    // back, so it may be smaller - and then `degraded` says so.
+    std::uint32_t declared_page_groups = 0;
     std::uint32_t logical_page_groups  = 0;
     std::uint32_t resident_page_groups = 0;
+    // The Host budget the split was solved against, and whether the declared capacity did not fit
+    // inside it (device resident + host backed).
+    std::size_t host_budget_bytes = 0;
+    bool        degraded          = false;
     // Anchor reservation (at the curve minimum, fully resident) + payload for the resident pages
     // beyond it + ledger for every logical page beyond it.
     std::size_t device_reservation_bytes         = 0;
@@ -55,14 +64,25 @@ struct KvResidencyResolution {
                                                  std::uint32_t logical_page_groups,
                                                  std::uint32_t resident_page_groups);
 
-// Resolves an explicit logical capacity together with the residency the device budget can hold.
+// Resolves the logical capacity together with the residency the device budget can hold.
 // Without `tier_minimum_residency` this is a planning model only: it reports what tiering would need
 // and never relaxes the "physical pages >= logical pages" invariant of the decoder state. With it,
 // the result IS runnable tiering and `resident_page_groups` is what the device pool must be built
 // with.
+//
+// `available_host_bytes` is the Host arena budget the payload of every non-resident page has to fit
+// in. It DEFAULTS TO UNBOUNDED, which is the pre-Host-budget contract (a plan that tiers reports what
+// it would need); the engine passes the real figure, and then the logical capacity is capped at what
+// device plus Host can back.
+//
+// An `Automatic` policy is derived from the declaration: logical = curve.maximum_main_page_groups
+// (max_concurrency x max_context), device resident from `available_runtime_bytes`, Host pages from
+// `available_host_bytes`. Only the residency split adapts; the logical capacity is the one the caller
+// asked for unless the Host tier cannot back it, which is reported through `degraded`.
 [[nodiscard]] KvResidencyResolution resolve_kv_capacity_with_residency(
     const KvCapacityPolicy& policy, const SequenceCapacityCurve& curve,
-    const KvResidencyStrides& strides, std::size_t available_runtime_bytes);
+    const KvResidencyStrides& strides, std::size_t available_runtime_bytes,
+    std::size_t available_host_bytes = static_cast<std::size_t>(-1));
 
 // The Device residency pool is ONE physical page pool, and every live lane's KV address takes whole
 // pages out of it. A lane therefore cannot be judged alone: two requests that each fit the pool can

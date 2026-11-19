@@ -124,6 +124,11 @@ struct SequenceCapacityCurve {
 
 struct KvCapacityResolution {
     KvCapacityMode mode                              = KvCapacityMode::Explicit;
+    // P1c: what the caller DECLARED (an explicit token count, or max_concurrency x max_context for
+    // an automatic policy) against what the two tiers can back (`main_page_groups`). The two differ
+    // only when the Host arena budget cannot hold the payload of the difference, and then the
+    // startup log says so.
+    std::uint32_t declared_page_groups               = 0;
     std::uint32_t main_page_groups                   = 0;
     std::uint32_t maximum_main_page_groups           = 0;
     std::uint32_t resolved_tokens                    = 0;
@@ -153,6 +158,9 @@ struct KvCapacityResolution {
     // split is solved, so it is the margin that keeps the driver from paging the KV pool later.
     // Reported so the startup line can say which value was actually used.
     std::size_t residency_slack_bytes                = 0;
+    // P1c: the Host arena bytes available for KV payload (StateImage replicas already deducted).
+    // The non-resident payload is solved against this figure.
+    std::size_t host_budget_bytes                    = 0;
     // appendix IK: the eviction-contract decision taken at startup (0 off, 1 on) and the reason
     // bits that produced it (see MemorySummary). Stored here because this is the one struct the
     // engine already forwards to the server's startup log.

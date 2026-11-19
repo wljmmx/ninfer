@@ -141,4 +141,41 @@ inline void set_controller_mode_runtime(ControllerMode mode) {
     detail::controller_mode_cell().store(mode);
 }
 
+// The mode's residency policy: WHO the tiering decision is taken for. It is a property of the
+// deployment mode, exactly like the prefetch/concurrency rules the controller already derives from
+// it, and it is what replaces the NINFER_KV_HOST_RESIDENCY / NINFER_STATE_IMAGE_DEVICE_SLOTS
+// switches as the source of the default:
+//
+//   auto         Device + Host KV tiering on, two physical StateImages. The measured middle:
+//                the two images are the two lanes a captured round can address at once, and every
+//                further lane is a Host replica paged back on demand.
+//   stable       No tiering. A stable deployment does not want a plan whose worst case is a page
+//                fetch inside a step, so the KV stays fully resident and a configuration that
+//                cannot hold it is refused instead of tiered.
+//   performance  Tiering on with four physical StateImages: more lanes can stay Device-resident,
+//                which is what pays when requests are accepted in bursts.
+//
+// The environment switches still win when they are set (reproducing a recorded arm is a contract of
+// its own), but no default depends on them any more.
+struct ControllerResidencyPolicy {
+    bool          kv_host_tiering        = true;
+    // Physical Device StateImages. `all_device_images` means "one per logical slot", which is what a
+    // deployment with no Host tiering needs: a lane whose image is not Device-resident is exactly a
+    // Host replica, i.e. tiering by another name.
+    std::uint32_t device_state_images    = 2;
+    bool          all_device_images      = false;
+};
+
+[[nodiscard]] inline constexpr ControllerResidencyPolicy
+controller_residency_policy(ControllerMode mode) noexcept {
+    switch (mode) {
+    case ControllerMode::Stable:
+        return {.kv_host_tiering = false, .device_state_images = 0, .all_device_images = true};
+    case ControllerMode::Performance:
+        return {.kv_host_tiering = true, .device_state_images = 4, .all_device_images = false};
+    case ControllerMode::Auto: break;
+    }
+    return {.kv_host_tiering = true, .device_state_images = 2, .all_device_images = false};
+}
+
 } // namespace ninfer

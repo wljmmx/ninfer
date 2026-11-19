@@ -123,13 +123,22 @@ void ProgramImpl::prepare_graphs() {
     nvtx::ScopedRange prepare_range(nvtx::Name::CudaGraphPrepare, nvtx::Category::Graph);
 
     std::array<StateImageHandle, kMaximumConcurrency> capture_states{};
-    for (std::uint32_t row = 0; row < max_concurrency; ++row) {
+    // P1a sizes the layout for the PHYSICAL Device images (kDefaultDeviceStateImages), not one per
+    // lane, so reserving a distinct image per row is what made a 3-lane / 2-image engine die with a
+    // bare bad_alloc 1.55 ms into "preparing CUDA graphs". Capture only needs every slot it names to
+    // be a real Device image: the row's slot is fed through the ingress tensor and the kernels index
+    // the pool from that value at launch, so a batch graph is not bound to the image it was captured
+    // over. Rows therefore share the physical images round-robin, and the family can still cover
+    // every lane the scheduler may batch.
+    const std::uint32_t capture_images =
+        std::min(max_concurrency, std::max(1U, state_store->device_capacity()));
+    for (std::uint32_t row = 0; row < capture_images; ++row) {
         std::optional<StateImageHandle> state = state_store->reserve_reset(device.stream);
         if (!state) { throw std::bad_alloc(); }
         capture_states[row] = *state;
     }
     const auto capture_state_slot = [&](std::uint32_t row) {
-        return state_store->physical_slot(capture_states.at(row));
+        return state_store->physical_slot(capture_states.at(row % capture_images));
     };
 
     std::vector<KVAddressSpaceHandle> text_capture_allocations;
@@ -509,7 +518,7 @@ void ProgramImpl::prepare_graphs() {
     }
     CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
     device.synchronize();
-    for (std::uint32_t row = 0; row < max_concurrency; ++row) {
+    for (std::uint32_t row = 0; row < capture_images; ++row) {
         if (!state_store->release(capture_states[row])) {
             throw std::logic_error("CUDA Graph capture StateImage could not be released");
         }

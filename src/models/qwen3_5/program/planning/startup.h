@@ -3,6 +3,7 @@
 #include "runtime/engine/kv_capacity.h"
 
 #include "core/cyclic_kv_cache.h"
+#include "core/controller_mode.h"
 #include "core/dtype.h"
 #include "core/gdn_replay_records.h"
 #include "core/layout.h"
@@ -32,12 +33,17 @@ inline constexpr std::uint32_t kCausalScoreTile = 1024;
 // (StateImageStore::reserve_device_to_host / begin_host_to_device), and the engine reclaims a state
 // slot by demoting a retained checkpoint's image before it admits another lane. The layout therefore
 // allocates this many physical Device images while the store is given the logical capacity
-// separately. NINFER_STATE_IMAGE_DEVICE_SLOTS overrides the default (clamped to the logical count)
-// for the fully-resident arm and for measurement.
+// separately.
+//
+// P1c: the count is the controller's decision (core/controller_mode.h: auto/stable 2, performance 4),
+// not an environment switch a caller has to remember. NINFER_STATE_IMAGE_DEVICE_SLOTS still wins when
+// it is set - reproducing a recorded arm is a contract - and it is clamped to the logical count.
 inline constexpr std::uint32_t kDefaultDeviceStateImages = 2;
 
 [[nodiscard]] inline std::uint32_t device_state_image_slots(std::uint32_t logical_slots) noexcept {
-    std::uint32_t physical = kDefaultDeviceStateImages;
+    const auto policy = ninfer::controller_residency_policy(ninfer::controller_mode());
+    std::uint32_t physical =
+        policy.all_device_images ? logical_slots : policy.device_state_images;
     if (const char* value = std::getenv("NINFER_STATE_IMAGE_DEVICE_SLOTS");
         value != nullptr && *value != '\0') {
         const long requested = std::strtol(value, nullptr, 10);

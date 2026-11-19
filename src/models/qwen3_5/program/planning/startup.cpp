@@ -1168,25 +1168,25 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         } else {
             const auto profiles = dflash_graph_profiles(impl->speculative_backend, impl->capacity,
                                                         impl->draft_window);
-            const auto per_batch_allowance = graph_topology_allowance(
+            const auto per_class_allowance = graph_topology_allowance(
                 profiles,
-                [&](GraphExecutionProfile profile) {
-                    const std::uint64_t final_visible = std::min<std::uint64_t>(
-                        impl->capacity,
-                        static_cast<std::uint64_t>(profile.max) + impl->draft_window + 1ULL);
-                    // Measured, not assumed: one lane at capacity 204800 with --spec dflash2
-                    // captures +45.7 MiB across every class, against the 192 MiB/class this used to
-                    // reserve (776 MiB of allowance per lane). A class is therefore priced like the
-                    // short one; a profile that ever needs more is caught by the capture check, which
-                    // keeps the arena and records the measured cost instead of failing the run.
+                [&](GraphExecutionProfile) {
+                    // Measured, not assumed, at capacity 204800 with --spec dflash2 on this
+                    // machine: the whole installed family (six topology classes, forward + finish +
+                    // merged round) captured +100.1 MiB for one lane and -107.4 MiB for two lanes -
+                    // i.e. below the noise floor of the driver's free-memory count, so the batch
+                    // dimension is not what costs bytes. The executables are per (topology, batch),
+                    // not per lane, and they share one arena, so the arena is priced once for the
+                    // configured family: 64 MiB a class is still ~4x the measured family cost. A
+                    // family that ever needs more is caught by the capture check, which keeps the
+                    // arena and records the measured cost instead of failing the run.
                     return 64ULL * kMiB;
                 },
                 "DFlash graph allowance");
             // Forward retains the draft's topology classes; finish has one small executable
             // per exact B, independently of context length.
-            impl->graph_allowance_bytes =
-                checked_mul(per_batch_allowance + 8ULL * kMiB, impl->max_concurrency,
-                            "DFlash exact-b graph allowance");
+            impl->graph_allowance_bytes = checked_add(
+                per_class_allowance, 8ULL * kMiB, "DFlash exact-b graph allowance");
         }
         // appendix FS: when the draft cannot cover the capacity, graphs.cpp builds the ordinary family
         // AS WELL to serve those rounds, so its allowance is paid on top of the backend's - the same
@@ -1372,7 +1372,15 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .context_cache        = options.context_cache,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
-    const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);
+    // P1a: the lanes that can hold a Device-resident image at once are the physical StateImage
+    // count, not the configured queue depth - the store keeps every other lane as a Host replica.
+    // The one-page-per-lane term of the anchor follows that reachable count, so a queue of eight
+    // behind two images no longer sizes the resident floor from max_concurrency. The LOGICAL page
+    // count is untouched: --kv-capacity keeps what the caller asked for and still pages from Host.
+    const std::uint32_t reachable_lanes = std::min<std::uint32_t>(
+        inputs.max_concurrency,
+        qwen3_5::detail::device_state_image_slots(inputs.max_concurrency));
+    const std::uint32_t minimum_pages = std::max(logical_pages, reachable_lanes);
     const std::uint64_t maximum_pages64 =
         static_cast<std::uint64_t>(inputs.max_concurrency) * logical_pages;
     if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {
