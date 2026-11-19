@@ -861,27 +861,39 @@ def pick_folder(initial: str = "") -> dict:
     comes from this process — which means the console has to run in an interactive desktop session.
     """
     if not _PICK_LOCK.acquire(blocking=False):
-        return {"ok": False, "error": "a folder picker is already open"}
+        return {"ok": False, "busy": True, "error": "a folder picker is already open"}
     handle, out_path = tempfile.mkstemp(suffix=".txt", prefix="ninfer_pick_")
     os.close(handle)
     try:
         quoted_out = out_path.replace("'", "''")
         quoted_in = (initial or "").replace("'", "''")
+        # The owner form is invisible, top-most and minimised: a dialog owned by a process with no
+        # foreground window opens behind the browser, which reads as "the button does nothing".
+        # Owning it with a top-most form is what puts it in front of the page that asked for it.
         script = "\n".join([
             "Add-Type -AssemblyName System.Windows.Forms | Out-Null",
+            "$f = New-Object System.Windows.Forms.Form",
+            "$f.TopMost = $true",
+            "$f.ShowInTaskbar = $false",
+            "$f.FormBorderStyle = 'None'",
+            "$f.WindowState = [System.Windows.Forms.FormWindowState]::Minimized",
+            "$f.Opacity = 0",
             "$d = New-Object System.Windows.Forms.FolderBrowserDialog",
             "$d.Description = '选择模型目录（.ninfer 所在目录）'",
             f"$d.SelectedPath = '{quoted_in}'",
             "$d.ShowNewFolderButton = $true",
-            "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {",
+            "$f.Show()",
+            "$f.Activate()",
+            "if ($d.ShowDialog($f) -eq [System.Windows.Forms.DialogResult]::OK) {",
             f"  [System.IO.File]::WriteAllText('{quoted_out}', $d.SelectedPath,",
             "    (New-Object System.Text.UTF8Encoding($false)))",
             "}",
+            "$f.Dispose()",
         ])
         try:
-            subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", script],
-                           capture_output=True, timeout=900,
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            completed = subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", script],
+                                       capture_output=True, timeout=900,
+                                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except subprocess.TimeoutExpired:
             return {"ok": False, "error": "the folder picker stayed open for 15 minutes"}
         except OSError as exc:
@@ -891,6 +903,11 @@ def pick_folder(initial: str = "") -> dict:
         except OSError:
             chosen = ""
         if not chosen:
+            # A cancelled dialog writes nothing; so does a killed one, and neither is a failure.
+            # Only a real PowerShell error (missing WinForms, policy block) is reported as one.
+            errors = (completed.stderr or b"").decode("utf-8", "replace").strip()
+            if errors:
+                return {"ok": False, "error": errors[-400:]}
             return {"ok": False, "cancelled": True}
         return {"ok": True, "path": chosen}
     finally:

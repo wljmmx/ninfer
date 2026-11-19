@@ -238,7 +238,7 @@ async function loadDir(dir){
 $('pickdir').onclick = async () => {
   const btn = $('pickdir');
   btn.disabled = true;
-  $('launchMsg').textContent = '等待在主机上选择目录…';
+  $('launchMsg').textContent = '等待在主机上选择目录…（窗口标题「浏览文件夹」，已在最前；若没看到按 Alt+Tab）';
   try{
     const r = await postJSON('/api/dialog/folder', {initial: state.dir || ''});
     if (r.ok && r.browse){
@@ -246,6 +246,8 @@ $('pickdir').onclick = async () => {
       $('launchMsg').textContent = '已加入目录：' + r.path;
     } else if (r.cancelled){
       $('launchMsg').textContent = '已取消选择';
+    } else if (r.busy){
+      $('launchMsg').textContent = '已有一个选择窗口打开（可能在浏览器后面），请先完成或关闭它';
     } else {
       $('launchMsg').textContent = '失败：' + (r.error || '未知原因');
     }
