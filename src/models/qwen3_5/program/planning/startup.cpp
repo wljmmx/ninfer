@@ -152,8 +152,18 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     if (!plan.context_cache.device_state_slots) {
         throw std::logic_error("Qwen3.5 context cache options are not normalized");
     }
+    // P1a: the logical set (every lane that may exist, plus the declared extra snapshots) is no
+    // longer the set the layout has to keep on the Device. Allocating one image per logical identity
+    // is what made 8 lanes / 204800 tokens reserve 16 images (3.13 GB); only the physical images are
+    // allocated here and StateImageStore names the logical identities, moving an idle lane's image
+    // to the Host tier on demand (program_impl.cpp passes the two capacities separately).
+    const std::uint64_t logical_state_image_slots =
+        static_cast<std::uint64_t>(plan.max_concurrency) + *plan.context_cache.device_state_slots;
+    if (logical_state_image_slots > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("Qwen3.5 StateImage slot count exceeds uint32");
+    }
     const std::int32_t state_image_slots = checked_i32(
-        static_cast<std::uint64_t>(plan.max_concurrency) + *plan.context_cache.device_state_slots,
+        device_state_image_slots(static_cast<std::uint32_t>(logical_state_image_slots)),
         "Qwen3.5 StateImage slot count exceeds int32");
     const auto effective_prefill_chunk =
         static_cast<std::int32_t>(std::min(plan.prefill_chunk, plan.capacity));

@@ -12,6 +12,7 @@
 #include "models/qwen3_5/state/state_image.h"
 #include "models/load_options.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -22,6 +23,28 @@ namespace ninfer::models::qwen3_5::detail {
 
 using TensorLayout                              = TensorRegion;
 inline constexpr std::uint32_t kCausalScoreTile = 1024;
+
+// P1a: a lane's StateImage is a complete mirror of its decode state (~196 MiB at 204800 tokens), so
+// allocating one Device image per lane plus every declared extra snapshot priced 3.13 GB at eight
+// lanes - the term that kept the 8-lane dflash2 configuration from starting on a 24 GB card. Only
+// the images an actively running lane reads have to be Device-resident: StateImageStore already
+// keeps a logical identity alive with a Host replica instead of a Device slot
+// (StateImageStore::reserve_device_to_host / begin_host_to_device), and the engine reclaims a state
+// slot by demoting a retained checkpoint's image before it admits another lane. The layout therefore
+// allocates this many physical Device images while the store is given the logical capacity
+// separately. NINFER_STATE_IMAGE_DEVICE_SLOTS overrides the default (clamped to the logical count)
+// for the fully-resident arm and for measurement.
+inline constexpr std::uint32_t kDefaultDeviceStateImages = 2;
+
+[[nodiscard]] inline std::uint32_t device_state_image_slots(std::uint32_t logical_slots) noexcept {
+    std::uint32_t physical = kDefaultDeviceStateImages;
+    if (const char* value = std::getenv("NINFER_STATE_IMAGE_DEVICE_SLOTS");
+        value != nullptr && *value != '\0') {
+        const long requested = std::strtol(value, nullptr, 10);
+        if (requested > 0) { physical = static_cast<std::uint32_t>(requested); }
+    }
+    return std::min(physical, logical_slots);
+}
 
 struct DFlashPersistentLayout {
     std::optional<qwen3_5::PagedKVCacheLayout> full;

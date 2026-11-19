@@ -233,8 +233,26 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         }
         return static_cast<std::uint32_t>(value);
     };
-    const auto logical_states = checked_count(state_images->slot_count() +
-                                              host_bytes / state_images->host_layout().image_bytes);
+    // P1a: the Device pool now holds only the physical images the layout allocates
+    // (`state_images->slot_count()`), while the store has to be able to name every logical identity:
+    // each lane that may exist, plus whatever the Host tier can hold. The two numbers are passed
+    // separately on purpose - the layout's slot count is the Device side, this is the logical side -
+    // and a logical identity beyond the Device images lives as a Host replica until the engine pages
+    // it back (StateImageStore::begin_host_to_device).
+    const std::uint64_t physical_state_images =
+        static_cast<std::uint64_t>(state_images->slot_count());
+    const std::uint64_t host_state_image_slots =
+        static_cast<std::uint64_t>(host_bytes / state_images->host_layout().image_bytes);
+    if (static_cast<std::uint64_t>(plan.max_concurrency) >
+        physical_state_images + host_state_image_slots) {
+        throw std::invalid_argument(
+            "StateImages are tiered (" + std::to_string(physical_state_images) +
+            " Device image(s) + " + std::to_string(host_state_image_slots) +
+            " Host image(s)) but " + std::to_string(plan.max_concurrency) +
+            " lanes may exist: raise the Host context budget (--host-context-mib / "
+            "context_cache.host_context_mib) or NINFER_STATE_IMAGE_DEVICE_SLOTS");
+    }
+    const auto logical_states = checked_count(physical_state_images + host_state_image_slots);
     // One immutable image can serve private replay, an explicit anchor, a public view and an
     // exact-hit endpoint. Alias descriptors are bounded separately from physical state slots.
     checkpoints.resize(checked_count(4ULL * logical_states + 2ULL * max_concurrency));

@@ -19,6 +19,7 @@
 #include "models/qwen3_5/execution/host_expert_residency.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/measurement.h"
+#include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen4_exp/execution/qsa.h"
 
 #include <algorithm>
@@ -1805,27 +1806,32 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
     // V10-01 (T156): the StateImage geometry already exists before the Program does - it is the
     // planner's `PersistentLayout::state_images` - so the context pool's three ledgers are sized
     // together here instead of being quoted after the allocation they did not shape. The anchor
-    // `capacity_curve` prices is the full minimum plan, which already contains the execution lanes'
-    // StateImages and every extra slot `--device-state-slots` names (planning/startup.cpp builds
-    // `state_image_slots = max_concurrency + extra`) plus its own workspace. Those slots are
-    // therefore the joint model's lane set, not a second charge, and the solver prices only slots
-    // beyond them. Nothing in this tree supplies a checkpoint interval, so the checkpoint target
-    // stays at the anchor's slot count; a real interval would also have to rebuild the sequence
-    // layout with the slots it wants, because that layout is what allocates them.
-    const std::size_t state_image_bytes    = planner.state_image_bytes();
-    const std::uint32_t anchor_state_slots = static_cast<std::uint32_t>(
+    // `capacity_curve` prices is the full minimum plan, plus its own workspace. P1a: the layout now
+    // allocates only the PHYSICAL Device images (startup.cpp asks device_state_image_slots() for
+    // them), so this anchor has to price exactly that count - pricing the logical set
+    // (`max_concurrency + extra`) is what over-reserved 3.13 GB for eight lanes. The images beyond
+    // the physical count live in the Host tier the context cache already prices and are paged back
+    // on demand. Nothing in this tree supplies a checkpoint interval, so the checkpoint target stays
+    // at the anchor's slot count; a real interval would also have to rebuild the sequence layout
+    // with the slots it wants, because that layout is what allocates them.
+    const std::size_t state_image_bytes = planner.state_image_bytes();
+    const std::uint32_t logical_state_slots = static_cast<std::uint32_t>(std::min<std::uint64_t>(
         static_cast<std::uint64_t>(options.max_concurrency) +
-        options.context_cache.device_state_slots.value_or(options.max_concurrency));
+            options.context_cache.device_state_slots.value_or(options.max_concurrency),
+        std::numeric_limits<std::uint32_t>::max()));
+    const std::uint32_t anchor_state_slots =
+        models::qwen3_5::detail::device_state_image_slots(logical_state_slots);
     // P0: the two terms the residency failure only gave as a sum. `minimum` is what the fully
     // resident curve prices at its smallest page count; `state_images` is the same layout's slot
     // bill, so the two together say whether the anchor is images or payload.
     std::fprintf(stderr,
                  "[kv-plan] lanes=%u extra_slots=%d anchor_slots=%u state_image_bytes=%zu "
-                 "state_images=%zu | minimum=%zu minimum_payload=%zu\n",
+                 "state_images=%zu logical_slots=%u | minimum=%zu minimum_payload=%zu\n",
                  options.max_concurrency,
                  options.context_cache.device_state_slots.value_or(options.max_concurrency),
                  anchor_state_slots, state_image_bytes,
                  state_image_bytes * static_cast<std::size_t>(anchor_state_slots),
+                 logical_state_slots,
                  capacity_curve.minimum_device_reservation_bytes,
                  capacity_curve.minimum_main_page_groups *
                      strides.payload_bytes_per_resident_page_group);
@@ -2235,20 +2241,25 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
     if (const char* joint = std::getenv("NINFER_CONTEXT_JOINT_PLAN");
         joint != nullptr && *joint == '1') {
         const auto& geometry = instance->program->checkpoint_geometry();
-        // One StateImage per device slot: the lanes plus the extra slots the option names (the
-        // option is normalized to max_concurrency when unset).
+        // P1a: the layout allocates one physical Device image per `device_state_image_slots()`, not
+        // one per logical identity (`lanes + extra`). Both are printed so the Device bill and the
+        // logical set the store can name cannot be confused with each other again.
         const std::uint64_t lanes = options.max_concurrency;
-        const std::uint64_t slots =
+        const std::uint64_t logical_slots =
             lanes + options.context_cache.device_state_slots.value_or(lanes);
+        const std::uint64_t slots =
+            models::qwen3_5::detail::device_state_image_slots(
+                static_cast<std::uint32_t>(logical_slots));
         constexpr std::uint64_t kMib = 1024ULL * 1024ULL;
         std::fprintf(stderr,
-                     "[joint] exact: reservation=%llu MiB | state=%llu MiB (%llu slot(s) x %llu B) "
-                     "| stride planned=%llu B match=%d\n",
+                     "[joint] exact: reservation=%llu MiB | state=%llu MiB (%llu slot(s) x %llu B, "
+                     "logical=%llu) | stride planned=%llu B match=%d\n",
                      static_cast<unsigned long long>(
                          instance->kv_capacity_resolution.runtime_reservation_bytes / kMib),
                      static_cast<unsigned long long>(geometry.state_image_bytes * slots / kMib),
                      static_cast<unsigned long long>(slots),
                      static_cast<unsigned long long>(geometry.state_image_bytes),
+                     static_cast<unsigned long long>(logical_slots),
                      static_cast<unsigned long long>(state_image_bytes),
                      geometry.state_image_bytes == state_image_bytes ? 1 : 0);
         std::fflush(stderr);
