@@ -1,0 +1,102 @@
+{
+  "schema": "ninfer.artifact-manifest",
+  "schema_version": 2,
+  "artifact": {
+    "filename": "qwen3_8_flash_next_v5_e2.ninfer",
+    "bytes": 123931846144,
+    "sha256": "0d621e204a5f5156c08d5042adb0bc738555ed58ae86189167370e183ddfdccb",
+    "container_version": 3,
+    "artifact_id": "91f7429b090f4107a60e5b38c68ce290",
+    "architecture": "Qwen4ExpForCausalLM",
+    "name": "qwen3.8-flash-next",
+    "components": [
+      "text",
+      "vision",
+      "mtp",
+      "dflash2"
+    ]
+  },
+  "source": {
+    "vendor": "unsloth",
+    "base_model": "Qwen/Qwen3.8-Flash-Next",
+    "base_gguf": "Qwen3.8-Flash-Next-UD-Q4_K_XL-0000{1..4}-of-00004.gguf",
+    "draft_model": "incoai/Qwen3.8-Flash-Next-DFlash2",
+    "draft_gguf": "Qwen3.8-Flash-Next-DFlash2-BF16.gguf",
+    "license": "Apache-2.0",
+    "revision": null,
+    "note": "Converted from the unsloth GGUF conversions downloaded into the local model folder; the download did not record a repository revision, so the field is null rather than guessed."
+  },
+  "conversion": {
+    "converter": "ninfer-v3",
+    "recipe_id": "qwen4_exp",
+    "converter_repository": "https://github.com/Neroued/ninfer",
+    "sources": [
+      "R:\\model\\qwen4exp\\UD-Q4_K_XL\\Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+      "R:\\model\\qwen4exp\\UD-Q4_K_XL\\Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf",
+      "R:\\model\\qwen4exp\\UD-Q4_K_XL\\Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf",
+      "R:\\model\\qwen4exp\\UD-Q4_K_XL\\Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf",
+      "R:\\model\\qwen4exp\\UD-Q4_K_XL\\mmproj-BF16.gguf",
+      "R:\\model\\qwen4exp\\Qwen3.8-Flash-Next-DFlash2-BF16.gguf"
+    ]
+  },
+  "geometry": {
+    "num_hidden_layers": 48,
+    "indexed_attention_layers": 12,
+    "hidden_size": 2560,
+    "num_attention_heads": 24,
+    "num_key_value_heads": 2,
+    "head_dim": 256,
+    "num_experts": 512,
+    "num_experts_per_tok": 10,
+    "moe_intermediate_size": 640,
+    "vocab_size": 248320,
+    "max_position_embeddings": 262144,
+    "indexer_budget": 2048,
+    "indexer_compress_ratio": 4,
+    "indexer_n_heads": 4,
+    "indexer_head_dim": 128,
+    "ple_embed_dim": 2560,
+    "ngram_size": 3,
+    "layer_types": {
+      "linear_attention": 36,
+      "indexed_attention": 12
+    }
+  },
+  "runtime": {
+    "repository": "https://github.com/wljmmx/ninfer",
+    "minimum_revision": "5caf0f0b",
+    "cuda_architecture": "sm_89",
+    "kv_storage": "bf16",
+    "qsa_route": "indexed_attention -> qsa_prepare / qsa_indexer / qsa_sparse_gqa, bf16 only unless NINFER_QSA_SPARSE_GQA_QUANT_KV opts in",
+    "gate": "tools/release/gate_qsa.ps1",
+    "dflash2_draft_tokens": {
+      "recommended": 7,
+      "minimum": 1,
+      "maximum": 15
+    }
+  },
+  "inventory": {
+    "files": 1,
+    "objects": 1601,
+    "tensors": 1594,
+    "resources": 7,
+    "bindings": 1874,
+    "uses": 1262,
+    "formats": {
+      "bf16": 633,
+      "fp32": 72,
+      "q4_g64_fp16": 314,
+      "q5_g64_fp16": 501,
+      "q6_g64_fp16": 50,
+      "q8_g32_fp16": 24
+    },
+    "layouts": {
+      "contiguous_le_v1": 705,
+      "row_split_k128_v1": 889
+    },
+    "bytes": {
+      "payload": 123931330048,
+      "file": 123931846144
+    }
+  }
+}

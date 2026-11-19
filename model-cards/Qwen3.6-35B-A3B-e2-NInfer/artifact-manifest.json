@@ -1,0 +1,69 @@
+{
+  "schema": "ninfer.artifact-manifest",
+  "schema_version": 2,
+  "artifact": {
+    "filename": "qwen3_6_35b_a3b_e2.ninfer",
+    "bytes": 22794248704,
+    "sha256": "f81e9f2666ae1baf383275ad26f8424bf35fcdc854aa50d305bf2df963ff9a22",
+    "container_version": 3,
+    "artifact_id": "c5065fc4b63448b7907e579c41ea2034",
+    "architecture": "Qwen3_5MoeForCausalLM",
+    "name": "qwen3.6-35b-a3b",
+    "components": [
+      "text",
+      "vision",
+      "mtp",
+      "dflash"
+    ]
+  },
+  "source": {
+    "vendor": "unsloth",
+    "base_model": "Qwen/Qwen3.6-35B-A3B",
+    "draft_model": "z-lab/Qwen3.6-35B-A3B-DFlash",
+    "license": "Apache-2.0",
+    "revision": null,
+    "note": "Converted from the unsloth GGUF conversions; the conversion record was not kept beside the artifact, so the revision is null rather than guessed."
+  },
+  "conversion": {
+    "converter": "ninfer-v3",
+    "converter_repository": "https://github.com/Neroued/ninfer",
+    "record": null
+  },
+  "runtime": {
+    "repository": "https://github.com/wljmmx/ninfer",
+    "minimum_revision": "5caf0f0b",
+    "cuda_architecture": "sm_89",
+    "gate": "tools/gate.cmd",
+    "gate_ppl": 7.776858,
+    "expert_streaming": true
+  },
+  "inventory": {
+    "files": 1,
+    "objects": 21850,
+    "tensors": 21844,
+    "resources": 6,
+    "bindings": 32713,
+    "uses": 32184,
+    "formats": {
+      "bf16": 487,
+      "fp32": 60,
+      "int32": 1,
+      "q4_g64_fp16": 10295,
+      "q5_g64_fp16": 9526,
+      "q6_g64_fp16": 770,
+      "q8_g32_fp16": 705
+    },
+    "layouts": {
+      "contiguous_le_v1": 548,
+      "row_split_k128_v1": 21296
+    },
+    "bytes": {
+      "payload": 22783095296,
+      "file": 22794248704
+    }
+  },
+  "difference_from_qwen3_6_35b_a3b": {
+    "note": "Same base model as the fused artifact, laid out for expert streaming: 21,844 tensors instead of 934, because every routed expert is its own object.",
+    "fused_tensors": 934
+  }
+}
