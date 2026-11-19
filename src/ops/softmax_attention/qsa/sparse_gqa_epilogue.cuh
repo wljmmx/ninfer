@@ -16,6 +16,20 @@ __device__ __forceinline__ void sparse_gqa_store(const SparseGqaArguments& a, st
     *reinterpret_cast<unsigned*>(a.out + offset) = pack_bf16x2(x, y);
 }
 
+// The same arithmetic with the gate word already loaded. The merge kernel has nothing to wait for
+// before the gate, so issuing it with the statistics instead of after the split rows takes a whole
+// dependent read off its chain - and that chain is what the merge costs.
+__device__ __forceinline__ void sparse_gqa_store_gated(const SparseGqaArguments& a, std::int64_t q,
+                                                       int h, int d, float x, float y,
+                                                       unsigned gate_word) {
+    const auto offset = (q * a.query_heads + h) * 256 + d;
+    const float2 gate =
+        __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&gate_word));
+    x *= __frcp_rn(1.f + exp2_approx(-gate.x * kLog2E));
+    y *= __frcp_rn(1.f + exp2_approx(-gate.y * kLog2E));
+    *reinterpret_cast<unsigned*>(a.out + offset) = pack_bf16x2(x, y);
+}
+
 // A warp holds a complete FP32 value row. Basis inversion precedes the elementwise gate;
 // only the final public output crosses BF16 storage.
 __device__ __forceinline__ void sparse_gqa_inverse_gate(const SparseGqaArguments& a, std::int64_t q,

@@ -257,6 +257,12 @@ __global__ void sparse_gqa_merge_kernel(SparseGqaArguments a) {
     // so the split rows below are not separated from their loads by a block barrier: the merge is a
     // chain of dependent global reads and at decode geometry that chain is its entire cost.
     const int lane        = threadIdx.x & 31;
+    // The gate address is known before anything else here, and the value is not needed until the
+    // store, so issuing it with the statistics takes a dependent read off the chain.
+    const unsigned gate_words =
+        kSparseRotatedValue<Storage>
+            ? 0u
+            : *reinterpret_cast<const unsigned*>(a.gate + (q * a.query_heads + h) * 256 + d);
     const int mine        = lane < work.splits ? lane : 0;
     const auto own        = a.partial_row(q, mine, h);
     const float local_max = lane < work.splits ? a.maximum[own] : -CUDART_INF_F;
@@ -295,7 +301,7 @@ __global__ void sparse_gqa_merge_kernel(SparseGqaArguments a) {
             sparse_gqa_inverse_gate(a, q, h, values);
         }
     } else
-        sparse_gqa_store(a, q, h, d, x * inv, y * inv);
+        sparse_gqa_store_gated(a, q, h, d, x * inv, y * inv, gate_words);
 }
 
 } // namespace ninfer::ops::detail::qsa
