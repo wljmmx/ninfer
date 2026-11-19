@@ -1190,6 +1190,16 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->device_reservation_bytes = checked_add(
         checked_add(impl->persistent.bytes, impl->workspace.capacity, "sequence memory plan"),
         impl->graph_allowance_bytes, "sequence graph allowance");
+    // P1b (KV tier plan): the candidate already knows the three terms its total is made of. A dump
+    // under NINFER_DUMP_SEQUENCE_PLAN names them, so a backend that costs 7 GB more than another can
+    // be attributed to persistent memory, workspace or graphs instead of argued about.
+    if (std::getenv("NINFER_DUMP_SEQUENCE_PLAN") != nullptr) {
+        std::fprintf(stderr,
+                     "[seq-plan] lanes=%u persistent=%zu workspace=%zu graph=%zu total=%zu\n",
+                     impl->max_concurrency, impl->persistent.bytes, impl->workspace.capacity,
+                     impl->graph_allowance_bytes, impl->device_reservation_bytes);
+        std::fflush(stderr);
+    }
     return impl;
 }
 
