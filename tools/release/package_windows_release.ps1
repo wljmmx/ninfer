@@ -115,8 +115,23 @@ foreach ($item in @('convert', 'artifact', 'freq_corpus', 'chat_templates', 'con
         # Mirror, do not merge: a file deleted from the repository (the retired demo page) must not
         # survive in the folder just because an earlier packaging run wrote it there.
         $dest = Join-Path $tools $item
-        if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
+        if (Test-Path $dest) {
+            try {
+                Remove-Item $dest -Recurse -Force -ErrorAction Stop
+            } catch {
+                # A running console keeps its own directory open. Clear the contents and prune
+                # below instead of failing the whole packaging run.
+                "warning: cannot remove $dest (in use); mirroring over its contents"
+                Get-ChildItem $dest -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
         Copy-Item $src $tools -Recurse -Force
+        if (Test-Path $dest) {
+            $keep = @(Get-ChildItem $src -Recurse -File | ForEach-Object { $_.FullName.Substring($src.Length) })
+            Get-ChildItem $dest -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object { $keep -notcontains $_.FullName.Substring($dest.Length) } |
+                ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+        }
     }
     else { Copy-Item $src $tools -Force }
 }
