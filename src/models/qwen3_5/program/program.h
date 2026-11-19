@@ -108,6 +108,12 @@ public:
     // port (sm_89): a captured decode graph is only valid while the expert resident set is fixed,
     // and that is known only after the pool is attached. Must be called before finalize().
     void set_use_cuda_graph(bool enabled) noexcept;
+    // P1d (KV tier plan): price the graph term for the decision that is actually in force. A tiered
+    // plan never captures - the page-in leg's stream sync is illegal inside a capture - so its graph
+    // allowance buys nothing and has to be given back to the residency split. Rebuilds the plan's
+    // anchor and the curve that prices it; returns the bytes released (0 when nothing moved).
+    // Must be called before finalize().
+    std::size_t reprice_graph_allowance(bool capture_graphs);
     // `resident_page_groups` (0 = fully resident) is the Device page pool the plan is built with, and
     // `host_kv_payload_bytes` the payload the Host tier must be able to hold. Both come straight from
     // the capacity resolution; passing the defaults reproduces the pre-residency plan exactly.

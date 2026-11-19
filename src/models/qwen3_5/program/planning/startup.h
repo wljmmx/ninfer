@@ -203,4 +203,12 @@ finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl
                             std::uint32_t main_page_groups, std::uint32_t resident_page_groups = 0,
                             std::size_t host_kv_payload_bytes = 0);
 
+// P1d (KV tier plan): reprice the graph term of the plan for a capture that will not happen, or put
+// it back. The candidate and the curve's anchor are rebuilt together - the anchor is what the
+// residency solver spends, so a plan that keeps a graph allowance it never captures over-reserves
+// by exactly that term, and the same budget would otherwise have held more resident KV pages. The
+// per-page strides are unaffected (the graph term does not move with the page count). Returns the
+// bytes the reservation gave back (0 when put back or when nothing changed).
+std::size_t reprice_graph_allowance(SequencePlannerImpl& planner, bool capture_graphs);
+
 } // namespace ninfer::models::qwen3_5::detail

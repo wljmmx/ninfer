@@ -1218,6 +1218,31 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
 
 } // namespace
 
+std::size_t reprice_graph_allowance(SequencePlannerImpl& planner, bool capture_graphs) {
+    if (planner.minimum == nullptr) { return 0; }
+    const std::size_t      before = planner.minimum->graph_allowance_bytes;
+    SequencePlanningInputs inputs = planner.inputs;
+    inputs.use_cuda_graph         = capture_graphs;
+    // Same minimum page count, same layout inputs: only the graph decision moves, so the rebuilt
+    // anchor differs from the old one by exactly the graph term. The resident pool stays logical
+    // (0 = fully resident), which is what the anchor always was.
+    auto              rebuilt = build_sequence_candidate(inputs, planner.minimum->main_page_groups, 0);
+    const std::size_t after   = rebuilt->graph_allowance_bytes;
+    if (before == after) {
+        // Nothing to reprice (the decision already matched the plan): keep the plan that exists.
+        planner.inputs.use_cuda_graph   = capture_graphs;
+        planner.minimum->use_cuda_graph = capture_graphs;
+        return 0;
+    }
+    planner.inputs.use_cuda_graph   = capture_graphs;
+    planner.minimum                 = std::move(rebuilt);
+    // The residency solver reads the anchor's fixed part as `minimum_device_reservation_bytes`
+    // minus the payload of the minimum page count, so the curve has to move with the plan; the
+    // per-page stride and the residency strides do not (the graph term is page-count independent).
+    planner.curve.minimum_device_reservation_bytes = planner.minimum->device_reservation_bytes;
+    return before > after ? before - after : 0;
+}
+
 // The DFlash2 artifact's block is eight rows (anchor plus seven masks). A draft window past seven
 // asks for a column the block was never trained on, and it measured worse: eight draft tokens gave
 // acceptance 0.0400 with 6 and 1 accepted at positions 0 and 1, seven gave 0.0968 with 8 and 4. The

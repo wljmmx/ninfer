@@ -76,6 +76,11 @@ void SequencePlanner::set_use_cuda_graph(bool enabled) noexcept {
     impl_->minimum->use_cuda_graph = enabled;
 }
 
+std::size_t SequencePlanner::reprice_graph_allowance(bool capture_graphs) {
+    if (impl_ == nullptr) { return 0; }
+    return detail::reprice_graph_allowance(*impl_, capture_graphs);
+}
+
 SequencePlan SequencePlanner::finalize(std::uint32_t main_page_groups,
                                       std::uint32_t resident_page_groups,
                                       std::size_t host_kv_payload_bytes) && {

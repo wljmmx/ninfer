@@ -1830,7 +1830,7 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
             .prefill_signature = signature},
         options.context_cost.preset_path);
     auto planner    = models::qwen3_5::make_sequence_planner(instance->parameters, device, options);
-    const auto capacity_curve = planner.capacity_curve();
+    auto capacity_curve = planner.capacity_curve();
     // P7.1 (V10-55): the KV plan is a named function rather than a lambda inside a lambda, because
     // the capacity re-solve below has to price the arena a SECOND time - against the budget the
     // expert pool just won - and it must use the same curve, the same residency strides and the same
@@ -2154,9 +2154,7 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
         }
     }
     // port (sm_89): a captured decode graph cannot contain a Host fetch - the copy is followed by a
-    // cudaStreamSynchronize, which a capture forbids - so a tiered plan must not freeze one. The
-    // graph allowance stays in the plan (it is what the curve priced) but no capture is requested,
-    // exactly as the streamed expert tier does for the same reason.
+    // cudaStreamSynchronize, which a capture forbids - so a tiered plan must not freeze one.
     if (resolution.kv_host_residency_active && options.use_cuda_graph) {
         std::fprintf(stderr,
                      "[graph] skipped: KV residency may need a Host fetch inside the step (the "
@@ -2164,6 +2162,76 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
         std::fflush(stderr);
         options.use_cuda_graph = false;
         planner.set_use_cuda_graph(false);
+    }
+    // P1d (KV tier plan): a plan that captures no graph must not reserve for one. The allowance was
+    // priced for the topology family the capture would install (392 MiB at this capacity), and it is
+    // returned to the residency split here, where the same budget buys resident KV pages instead of
+    // VRAM nothing will ever allocate. A dense artifact has no expert pool to hand the bytes to, so
+    // the split is solved again against the budget the first solve used; a pooled one has already
+    // placed its pool against the larger reservation, so its freed bytes stay slack rather than
+    // being taken twice.
+    if (resolution.kv_host_residency_active && !options.use_cuda_graph) {
+        const std::size_t reserved_before   = resolution.runtime_reservation_bytes;
+        const std::uint32_t resident_before = resolution.resident_page_groups;
+        const std::size_t released          = planner.reprice_graph_allowance(false);
+        if (released != 0) {
+            capacity_curve = planner.capacity_curve();
+            // `plan_kv_at` prices against the pre-slack budget; the resolution records what was
+            // left of it after the slack, so the two add back up exactly.
+            const std::size_t held_back =
+                residency_slack + options.kv_capacity.automatic_headroom_bytes;
+            const std::size_t budget      = resolution.available_after_weights_bytes + held_back;
+            bool              respent     = false;
+            bool              graphs_back = false;
+            if (instance->expert_cache == nullptr) {
+                try {
+                    const auto replanned = plan_kv_at(budget);
+                    if (replanned.resolved_tokens >= options.max_context &&
+                        replanned.kv_host_residency_active) {
+                        resolution = replanned;
+                        respent    = true;
+                    } else if (replanned.resolved_tokens >= options.max_context) {
+                        // The freed bytes would make the whole context resident, i.e. there would be
+                        // no page to fetch and the capture would be legal again: keep the graph and
+                        // give the split back its page count.
+                        (void)planner.reprice_graph_allowance(true);
+                        capacity_curve         = planner.capacity_curve();
+                        options.use_cuda_graph = true;
+                        planner.set_use_cuda_graph(true);
+                        graphs_back            = true;
+                    }
+                } catch (const std::invalid_argument& error) {
+                    std::fprintf(stderr,
+                                 "[kv-tier] graph: the freed %zu bytes could not be solved into "
+                                 "resident pages (%s); keeping the page split\n",
+                                 released, error.what());
+                    std::fflush(stderr);
+                }
+            }
+            if (!respent && !graphs_back) {
+                // Same page split, smaller anchor: the reservation follows the plan's own formula.
+                resolution.runtime_reservation_bytes = runtime::residency_device_bytes(
+                    capacity_curve, strides, resolution.main_page_groups,
+                    resolution.resident_page_groups);
+                resolution.minimum_runtime_reservation_bytes =
+                    capacity_curve.minimum_device_reservation_bytes;
+                resolution.planned_slack_bytes =
+                    resolution.available_after_weights_bytes > resolution.runtime_reservation_bytes
+                        ? resolution.available_after_weights_bytes -
+                              resolution.runtime_reservation_bytes
+                        : 0;
+            }
+            if (!graphs_back) {
+                constexpr double kMib = 1024.0 * 1024.0;
+                std::fprintf(stderr,
+                             "[kv-tier] graph: no capture, allowance released %zu B (%.1f MiB) | "
+                             "reserved %zu -> %zu B | resident %u -> %u of %u page(s)\n",
+                             released, static_cast<double>(released) / kMib, reserved_before,
+                             resolution.runtime_reservation_bytes, resident_before,
+                             resolution.resident_page_groups, resolution.main_page_groups);
+                std::fflush(stderr);
+            }
+        }
     }
     // port (sm_89): a residency plan addresses EVERY logical page - the full-attention layers read
     // the whole history - so nothing may be masked. The window therefore keeps everything: sink 0
