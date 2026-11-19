@@ -4,6 +4,22 @@
 
 namespace ninfer::ops::detail::qsa {
 namespace {
+// The output route is fixed by the plan before the launch, so it is a template argument rather than
+// a run-time test: each kernel then carries one epilogue instead of both, which halves its body and
+// keeps the other route out of its register allocation.
+template <KvCacheStorage Storage, bool VectorCache, SparseGqaLoad Load>
+void launch_mma(SparseGqaArguments a, SparseGqaPlan plan, int queries, unsigned z,
+                DeviceExecutionView execution) {
+    const auto grid   = dim3(queries * a.kv_heads, a.splits, z);
+    const auto shared = sizeof(SparseGqaStorage<Storage, 32, 2, Load>);
+    if (plan.partial)
+        sparse_gqa_mma_kernel<Storage, 32, 2, VectorCache, Load, false>
+            <<<grid, 64, shared, execution.stream>>>(a);
+    else
+        sparse_gqa_mma_kernel<Storage, 32, 2, VectorCache, Load, true>
+            <<<grid, 64, shared, execution.stream>>>(a);
+}
+
 template <KvCacheStorage Storage, bool VectorCache>
 void launch(SparseGqaArguments a, SparseGqaPlan plan, int queries, DeviceExecutionView execution) {
     // rk planes keep codes and scales in separate regions, so the packed-row staging routes do not
@@ -32,19 +48,11 @@ void launch(SparseGqaArguments a, SparseGqaPlan plan, int queries, DeviceExecuti
         const bool inplace =
             (blocks + 3 * sms - 1) / (3 * sms) < (blocks + 2 * sms - 1) / (2 * sms);
         if (inplace)
-            sparse_gqa_mma_kernel<Storage, 32, 2, VectorCache, SparseGqaLoad::InPlace>
-                <<<dim3(queries * a.kv_heads, a.splits, Z), 64,
-                   sizeof(SparseGqaStorage<Storage, 32, 2, SparseGqaLoad::InPlace>),
-                   execution.stream>>>(a);
+            launch_mma<Storage, VectorCache, SparseGqaLoad::InPlace>(a, plan, queries, Z, execution);
         else
-            sparse_gqa_mma_kernel<Storage, 32, 2, VectorCache, SparseGqaLoad::Staged>
-                <<<dim3(queries * a.kv_heads, a.splits, Z), 64,
-                   sizeof(SparseGqaStorage<Storage, 32, 2, SparseGqaLoad::Staged>),
-                   execution.stream>>>(a);
+            launch_mma<Storage, VectorCache, SparseGqaLoad::Staged>(a, plan, queries, Z, execution);
     } else {
-        sparse_gqa_mma_kernel<Storage, 32, 2, VectorCache>
-            <<<dim3(queries * a.kv_heads, a.splits, Z), 64,
-               sizeof(SparseGqaStorage<Storage, 32, 2>), execution.stream>>>(a);
+        launch_mma<Storage, VectorCache, SparseGqaLoad::Direct>(a, plan, queries, Z, execution);
     }
     if (plan.partial)
         sparse_gqa_merge_kernel<Storage><<<queries * a.query_heads, 128, 0, execution.stream>>>(a);

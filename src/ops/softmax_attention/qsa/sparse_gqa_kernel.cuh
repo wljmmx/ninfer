@@ -8,7 +8,7 @@
 namespace ninfer::ops::detail::qsa {
 
 template <KvCacheStorage Storage, int N, int Warps, bool VectorCache,
-          SparseGqaLoad Load = SparseGqaLoad::Direct>
+          SparseGqaLoad Load = SparseGqaLoad::Direct, bool Direct = false>
 __device__ __forceinline__ void sparse_gqa_mma(SparseGqaArguments a,
                                                SparseGqaStorage<Storage, N, Warps, Load>& s,
                                                std::int64_t q, int head, int split, int d_base) {
@@ -20,7 +20,9 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaArguments a,
     const int rpk = a.heads_per_kv();
     const auto work = a.work(q);
     if (work.size == 0) {
-        if (a.numerator == nullptr)
+        // Only the direct route owns its output rows; the split route leaves the zero fill to the
+        // merge, which already sees an empty work item.
+        if constexpr (Direct)
             for (int i = tid; i < rpk * 128; i += Warps * 32)
                 *reinterpret_cast<unsigned*>(a.out + (q * a.query_heads + head * rpk + i / 128) *
                                                          256 + (i % 128) * 2) = 0;
@@ -179,12 +181,11 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaArguments a,
         const int h = gid + j * 8;
         if (h >= rpk) continue;
         const auto row    = a.partial_row(q, split, head * rpk + h);
-        const bool direct = a.numerator == nullptr;
-        const float inv   = direct ? __frcp_rn(sum[j]) : 1.0f;
+        const float inv   = Direct ? __frcp_rn(sum[j]) : 1.0f;
 #pragma unroll
         for (int n = d_base; n < d_base + Cols; ++n) {
             const int d = n * 8 + lid * 2;
-            if (direct) {
+            if constexpr (Direct) {
                 if constexpr (kSparseRotatedValue<Storage>)
                     *reinterpret_cast<float2*>(s.partial + h * 256 + d) =
                         make_float2(acc[n - d_base][2 * j] * inv, acc[n - d_base][2 * j + 1] * inv);
@@ -195,20 +196,22 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaArguments a,
                 *reinterpret_cast<float2*>(a.numerator + row * 256 + d) =
                     make_float2(acc[n - d_base][2 * j], acc[n - d_base][2 * j + 1]);
         }
-        if (!direct && lid == 0) {
-            a.maximum[row] = maximum[j];
-            a.sum[row]     = sum[j];
-        }
+        if constexpr (!Direct)
+            if (lid == 0) {
+                a.maximum[row] = maximum[j];
+                a.sum[row]     = sum[j];
+            }
     }
 }
 
-template <KvCacheStorage Storage, int N, int Warps, bool VectorCache, SparseGqaLoad Load>
+template <KvCacheStorage Storage, int N, int Warps, bool VectorCache, SparseGqaLoad Load,
+          bool Direct>
 __device__ __forceinline__ void sparse_gqa_compute(SparseGqaArguments a,
                                                    SparseGqaStorage<Storage, N, Warps, Load>& s,
                                                    std::int64_t q, int head, int split, int d_base) {
-    sparse_gqa_mma<Storage, N, Warps, VectorCache, Load>(a, s, q, head, split, d_base);
+    sparse_gqa_mma<Storage, N, Warps, VectorCache, Load, Direct>(a, s, q, head, split, d_base);
     if constexpr (kSparseRotatedValue<Storage>) {
-        if (a.numerator == nullptr) {
+        if constexpr (Direct) {
             // MMA's reduction leaves only warp zero writing s.partial. Every warp returns
             // here before the complete FP32 rows are redistributed for basis inversion.
             __syncthreads();
@@ -231,11 +234,11 @@ __device__ __forceinline__ bool sparse_gqa_all_selected(const SparseGqaArguments
 }
 
 template <KvCacheStorage Storage, int N, int Warps, bool VectorCache,
-          SparseGqaLoad Load = SparseGqaLoad::Direct>
+          SparseGqaLoad Load = SparseGqaLoad::Direct, bool Direct = false>
 __launch_bounds__(Warps * 32) __global__ void sparse_gqa_mma_kernel(SparseGqaArguments a) {
     extern __shared__ __align__(16) unsigned char smem[];
     auto& s = *reinterpret_cast<SparseGqaStorage<Storage, N, Warps, Load>*>(smem);
-    sparse_gqa_compute<Storage, N, Warps, VectorCache, Load>(
+    sparse_gqa_compute<Storage, N, Warps, VectorCache, Load, Direct>(
         a, s, a.begin + blockIdx.x / a.kv_heads, blockIdx.x % a.kv_heads, blockIdx.y,
         kSparseSlicedValue<Storage> ? static_cast<int>(blockIdx.z) * 16 : 0);
 }

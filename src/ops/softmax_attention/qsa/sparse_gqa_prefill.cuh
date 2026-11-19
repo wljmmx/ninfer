@@ -151,7 +151,8 @@ __launch_bounds__(Queries * 32) __global__ void sparse_gqa_all_select_kernel(Spa
     }
 #pragma unroll 1
     for (int i = 0; i < Queries && first + i < total; ++i) {
-        sparse_gqa_compute<Storage, N, Queries, Vector, Load>(a, s, first + i, head, 0, d_base);
+        // The plan gives FullPrefix no partial workspace, so this route always owns its rows.
+        sparse_gqa_compute<Storage, N, Queries, Vector, Load, true>(a, s, first + i, head, 0, d_base);
         __syncthreads();
     }
 }
