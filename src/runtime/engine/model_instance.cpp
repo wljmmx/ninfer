@@ -1816,6 +1816,20 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
     const std::uint32_t anchor_state_slots = static_cast<std::uint32_t>(
         static_cast<std::uint64_t>(options.max_concurrency) +
         options.context_cache.device_state_slots.value_or(options.max_concurrency));
+    // P0: the two terms the residency failure only gave as a sum. `minimum` is what the fully
+    // resident curve prices at its smallest page count; `state_images` is the same layout's slot
+    // bill, so the two together say whether the anchor is images or payload.
+    std::fprintf(stderr,
+                 "[kv-plan] lanes=%u extra_slots=%d anchor_slots=%u state_image_bytes=%zu "
+                 "state_images=%zu | minimum=%zu minimum_payload=%zu\n",
+                 options.max_concurrency,
+                 options.context_cache.device_state_slots.value_or(options.max_concurrency),
+                 anchor_state_slots, state_image_bytes,
+                 state_image_bytes * static_cast<std::size_t>(anchor_state_slots),
+                 capacity_curve.minimum_device_reservation_bytes,
+                 capacity_curve.minimum_main_page_groups *
+                     strides.payload_bytes_per_resident_page_group);
+    std::fflush(stderr);
     const ContextCapacityCurve joint_capacity_curve{
         .kv                              = capacity_curve,
         .minimum_state_slots             = anchor_state_slots,
