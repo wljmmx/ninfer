@@ -2429,6 +2429,14 @@ $('clock').textContent = new Date().toLocaleTimeString();
   L('lcStopBtn').onclick=async()=>{ L('lcStopBtn').disabled=true;
     const r=await (await fetch('/api/lmcache/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).json();
     L('lcStateText').textContent = r.ok?'已停止':('失败：'+r.error); };
+  // 勾选状态要活过刷新与重启：接入 LMCache 是启动参数的一部分，但页面刷新后复选框会回到
+  // 未勾选，于是"重启"就把接入悄悄丢了（引擎日志里看不到 [lmcache] attached）。
+  {
+    const saved = localStorage.getItem('ninfer.lmcache');
+    if (saved !== null) L('lLmcache').checked = saved === '1';
+    L('lLmcache').addEventListener('change', () =>
+      localStorage.setItem('ninfer.lmcache', L('lLmcache').checked ? '1' : '0'));
+  }
   buildOpts(); loadDir(''); tickLaunch(); tickLc();
   setInterval(tickLaunch, 1000); setInterval(tickLc, 2000);
 })();
