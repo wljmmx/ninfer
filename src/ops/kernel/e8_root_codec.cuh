@@ -358,7 +358,21 @@ __device__ __forceinline__ void e8_encode_cylinder_8d_warp(
         }
     }
     const unsigned sub_mask = 0xffu << (lane & ~7);
+    // redux.sync.add.s32 is an sm_80+ instruction; on Turing (sm_75) reduce the 8-lane
+    // sub-group with an shfl_xor tree, which writes the same sum to every lane in the
+    // mask - matching redux.sync's all-lanes-get-the-result semantics.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    {
+        int v = minus_count;
+        #pragma unroll
+        for (int offset = 4; offset > 0; offset >>= 1) {
+            v += __shfl_xor_sync(sub_mask, v, offset);
+        }
+        minus_count = v;
+    }
+#else
     asm("redux.sync.add.s32 %0, %1, %2;\n" : "=r"(minus_count) : "r"(minus_count), "r"(sub_mask));
+#endif
 
     float best_type_b_score = 0.5f * sum_abs;
     if ((minus_count & 1) != 0) {

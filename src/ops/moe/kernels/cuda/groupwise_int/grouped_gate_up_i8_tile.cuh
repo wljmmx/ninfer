@@ -182,6 +182,17 @@ __global__ __launch_bounds__(Cols * 4) void grouped_gate_up_i8_tile(
 // exactly the registers the mma wants, so the tile is staged as int8 and read back with two x4 loads
 // (gate and up) plus one x2 (activations) per k chunk.
 
+// cp.async is an sm_80+ (Ampere) instruction; on Turing (sm_75, the rtx2080ti target)
+// the same global->shared copy rides the __pipeline_ intrinsics (plain ld/st on every
+// architecture) with identical commit/wait group semantics.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
+__device__ __forceinline__ void cp_async_16(void* dst, const void* src) {
+    __pipeline_memcpy_async(dst, src, 16);
+}
+__device__ __forceinline__ void cp_async_commit() { __pipeline_commit(); }
+template <int N>
+__device__ __forceinline__ void cp_async_wait() { __pipeline_wait_prior(N); }
+#else
 __device__ __forceinline__ void cp_async_16(void* dst, const void* src) {
     const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(dst));
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(src));
@@ -191,6 +202,7 @@ template <int N>
 __device__ __forceinline__ void cp_async_wait() {
     asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
 }
+#endif
 __device__ __forceinline__ void ldm_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3,
                                       const void* p) {
     const unsigned a = static_cast<unsigned>(__cvta_generic_to_shared(p));

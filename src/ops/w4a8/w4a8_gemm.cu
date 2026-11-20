@@ -43,6 +43,15 @@ __device__ __forceinline__ void ldm_x2(unsigned& r0, unsigned& r1, unsigned a) {
                  : "=r"(r0), "=r"(r1) : "r"(a));
 }
 __device__ __forceinline__ unsigned su(const void* p) { return (unsigned)__cvta_generic_to_shared(p); }
+// cp.async is an sm_80+ (Ampere) instruction; on Turing (sm_75, the rtx2080ti target)
+// the same global->shared copy is provided through the __pipeline_ intrinsics, which
+// lower to a plain ld/st on every architecture. Commit/wait keep the group semantics.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
+__device__ __forceinline__ void cpa16(void* d, const void* s) { __pipeline_memcpy_async(d, s, 16); }
+__device__ __forceinline__ void cpa8(void* d, const void* s) { __pipeline_memcpy_async(d, s, 8); }
+__device__ __forceinline__ void cpc() { __pipeline_commit(); }
+template <int G> __device__ __forceinline__ void cpw() { __pipeline_wait_prior(G); }
+#else
 __device__ __forceinline__ void cpa16(void* d, const void* s) {
     asm volatile("cp.async.ca.shared.global [%0],[%1],16;\n" ::"r"(su(d)), "l"(s));
 }
@@ -53,6 +62,7 @@ __device__ __forceinline__ void cpc() { asm volatile("cp.async.commit_group;\n")
 template <int G> __device__ __forceinline__ void cpw() {
     asm volatile("cp.async.wait_group %0;\n" ::"n"(G));
 }
+#endif
 
 // q5_g64 packed (4-bit nibbles + 1 high bit per element) -> int8. Values -16..15 fit int8 exactly.
 // One thread decodes a 16-element quarter of one group (8 packed code bytes + 2 high-bit

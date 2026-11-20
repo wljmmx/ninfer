@@ -57,6 +57,22 @@ struct SamplingUintGreater {
     __device__ __forceinline__ bool operator()(unsigned int a, unsigned int b) const {
         return a > b;
     }
+}
+
+// Warp-wide max over the lanes named by `mask`. `__reduce_max_sync` is an sm_80+
+// intrinsic (it compiles to redux.sync); the shfl_down tree is the portable form
+// and behaves identically on every architecture, including Turing (sm_75), where
+// this file must run for the rtx2080ti target.
+__device__ __forceinline__ unsigned int sampling_warp_max(unsigned int value, unsigned int mask) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    return __reduce_max_sync(mask, value);
+#else
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const unsigned int other = __shfl_down_sync(mask, value, offset);
+        if (other > value) { value = other; }
+    }
+    return value;
+#endif
 };
 
 __device__ inline unsigned long long sampling_block_max_key(unsigned long long key,
@@ -181,9 +197,9 @@ __device__ inline void sampling_store_tile_topk(unsigned long long (&keys)[kSamp
             const unsigned long long key =
                 storage.candidates[lane * kSamplerCandidateCap + position];
             const unsigned int high     = static_cast<unsigned int>(key >> 32);
-            const unsigned int max_high = __reduce_max_sync(kMergeMask, high);
+            const unsigned int max_high = sampling_warp_max(high, kMergeMask);
             const unsigned int low      = high == max_high ? static_cast<unsigned int>(key) : 0u;
-            const unsigned int max_low  = __reduce_max_sync(kMergeMask, low);
+            const unsigned int max_low  = sampling_warp_max(low, kMergeMask);
             const unsigned int winners =
                 __ballot_sync(kMergeMask, high == max_high && low == max_low);
             const int source = __ffs(static_cast<int>(winners)) - 1;
@@ -220,7 +236,7 @@ __device__ inline void sampling_store_bf16_tile_topk(unsigned int (&keys)[kSampl
         int position                      = 0;
         for (int rank = 0; rank < cap; ++rank) {
             const unsigned int key     = storage.candidates[lane * kSamplerCandidateCap + position];
-            const unsigned int best    = __reduce_max_sync(kMergeMask, key);
+            const unsigned int best    = sampling_warp_max(key, kMergeMask);
             const unsigned int winners = __ballot_sync(kMergeMask, key == best);
             const int source           = __ffs(static_cast<int>(winners)) - 1;
             if (lane == 0) {

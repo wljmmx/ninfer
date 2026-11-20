@@ -29,9 +29,18 @@ enum class LinearPolicy : std::uint8_t {
            policy == LinearPolicy::AllowA4;
 }
 
+// The A8 profile needs FP8 tensor cores (the m16n8k32 e4m3 mma). Turing (sm_75, the
+// rtx2080ti target) has none, so the whole build disables the A8 route: every dispatch
+// site that asks allows_a8() falls back to the A16 execution, which decodes the FP8
+// operands to BF16 and runs the fp16-MMA plane. The A8 kernels remain compiled (they
+// are dead code on sm_75) and mma_fp8_e4m3 is a trapping canary there.
+#if defined(NINFER_ARCH_SM75)
+[[nodiscard]] constexpr bool allows_a8(LinearPolicy) noexcept { return false; }
+#else
 [[nodiscard]] constexpr bool allows_a8(LinearPolicy policy) noexcept {
     return policy == LinearPolicy::AllowA8 || policy == LinearPolicy::AllowA4;
 }
+#endif
 
 [[nodiscard]] constexpr bool allows_a4(LinearPolicy policy) noexcept {
     return policy == LinearPolicy::AllowA4;

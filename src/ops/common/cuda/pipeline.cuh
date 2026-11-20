@@ -9,6 +9,56 @@
 
 namespace ninfer::ops::common {
 
+// The cp.async global->shared copy instructions are an sm_80+ (Ampere) feature. Turing
+// (sm_75, the rtx2080ti target) has no hardware async copy, so on sm_75 the same
+// interface is provided over the __pipeline_* intrinsics: __pipeline_memcpy_async lowers
+// to a plain ld.global/st.shared on every architecture, and commit/wait keep the
+// identical group semantics the cp.async forms expose. Callers and pipeline depth are
+// unchanged; the only difference is that the copy runs through the thread's load/store
+// path instead of the async copy unit.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
+template <int Bytes, Cache Policy = Cache::ca>
+__device__ __forceinline__ void cp_async(void* smem_dst, const void* gmem_src) {
+    static_assert(Bytes == 4 || Bytes == 8 || Bytes == 16, "cp_async supports 4, 8, or 16 bytes");
+    __pipeline_memcpy_async(smem_dst, gmem_src, Bytes);
+}
+
+template <int Bytes, Cache Policy = Cache::ca>
+__device__ __forceinline__ void cp_async_zfill(void* smem_dst, const void* gmem_src,
+                                               int src_bytes) {
+    static_assert(Bytes == 4 || Bytes == 8 || Bytes == 16,
+                  "cp_async_zfill supports 4, 8, or 16 bytes");
+    if (src_bytes <= 0) {
+        // zfill semantics: a zero-length source leaves the whole destination zeroed.
+        if constexpr (Bytes == 16) {
+            *reinterpret_cast<unsigned long long*>(smem_dst) = 0ull;
+            *reinterpret_cast<unsigned long long*>(
+                static_cast<char*>(smem_dst) + 8) = 0ull;
+        } else if constexpr (Bytes == 8) {
+            *reinterpret_cast<unsigned long long*>(smem_dst) = 0ull;
+        } else {
+            *reinterpret_cast<unsigned int*>(smem_dst) = 0u;
+        }
+        return;
+    }
+    if (src_bytes < Bytes) {
+        // Zero the tail the short copy leaves untouched, matching cp.async zfill.
+        char* dst = static_cast<char*>(smem_dst);
+        for (int i = src_bytes; i < Bytes; ++i) { dst[i] = 0; }
+        if (src_bytes > Bytes) { src_bytes = Bytes; }
+    }
+    __pipeline_memcpy_async(smem_dst, gmem_src, src_bytes);
+}
+
+__device__ __forceinline__ void cp_commit() { __pipeline_commit(); }
+
+template <int Groups>
+__device__ __forceinline__ void cp_wait() {
+    static_assert(Groups >= 0 && Groups <= 7, "cp_wait group count must fit the PTX immediate");
+    __pipeline_wait_prior(Groups);
+}
+#else  // __CUDA_ARCH__ == 750
+
 template <int Bytes, Cache Policy = Cache::ca>
 __device__ __forceinline__ void cp_async(void* smem_dst, const void* gmem_src) {
     static_assert(Bytes == 4 || Bytes == 8 || Bytes == 16, "cp_async supports 4, 8, or 16 bytes");
@@ -48,6 +98,8 @@ __device__ __forceinline__ void cp_wait() {
     static_assert(Groups >= 0 && Groups <= 7, "cp_wait group count must fit the PTX immediate");
     asm volatile("cp.async.wait_group %0;\n" : : "n"(Groups));
 }
+
+#endif  // __CUDA_ARCH__ == 750
 
 __device__ __forceinline__ void cta_mbarrier_init(std::uint64_t* barrier, std::uint32_t arrivals) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
