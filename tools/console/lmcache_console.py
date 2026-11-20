@@ -718,8 +718,9 @@ class Launcher:
     }
 
     def __init__(self, exe: Path, roots: list[Path], log_path: Path, attach,
-                 lmcache_probe=None) -> None:
+                 lmcache_probe=None, engine_host: str = "127.0.0.1") -> None:
         self.exe = exe
+        self.engine_host = engine_host           # 127.0.0.1 default; 0.0.0.0 exposes the API on the LAN
         self.roots = [root for root in roots if root.is_dir()]
         self.log_path = log_path
         self.attach = attach                     # give the collector the URL we just started
@@ -900,7 +901,7 @@ class Launcher:
             # A selected option wins over the value the page also fills in: passing the same flag
             # twice would leave the engine's parser to decide which copy counts.
             overridden = {token for token in extra if token.startswith("--")}
-            base = [("--host", "127.0.0.1"), ("--port", str(port)),
+            base = [("--host", self.engine_host), ("--port", str(port)),
                     ("--max-context", str(max_context)),
                     ("--max-concurrency", str(concurrency)),
                     ("--max-pending-requests", "16"),
@@ -1016,6 +1017,26 @@ class Launcher:
 
 
 _PICK_LOCK = threading.Lock()
+
+_LOCAL_HOSTS: set | None = None
+
+
+def local_host_names() -> set:
+    """Every IPv4/IPv6 name this host answers to, computed once.
+
+    socket.gethostname() resolves to the interface addresses on Windows, which is what a browser
+    on the LAN puts in Origin when it loads the page from http://<lan-ip>:8099.
+    """
+    global _LOCAL_HOSTS
+    if _LOCAL_HOSTS is None:
+        names = {"127.0.0.1", "localhost", "::1"}
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None):
+                names.add(info[4][0])
+        except OSError:
+            pass
+        _LOCAL_HOSTS = names
+    return _LOCAL_HOSTS
 
 
 def pick_folder(initial: str = "") -> dict:
@@ -1281,12 +1302,18 @@ class Handler(BaseHTTPRequestHandler):
         return self.rfile.read(length) if length > 0 else b"{}"
 
     def _same_origin(self) -> bool:
-        """Starting a process is a local action; a page from another origin may not ask for it."""
+        """Starting a process is a local action; a page from another origin may not ask for it.
+
+        The accepted set is "this machine's own addresses". It used to be loopback only, which was
+        the whole story while the console could only be reached on 127.0.0.1; with --host 0.0.0.0
+        the page is served from a LAN address and the same browser sends that address in Origin.
+        A browser on another machine still is not in the set, so it cannot drive /api/launch.
+        """
         origin = self.headers.get("Origin")
         if not origin:
             return True
         host = urllib.parse.urlsplit(origin).hostname or ""
-        return host in ("127.0.0.1", "localhost", "::1")
+        return host in local_host_names() or host == self.server.server_address[0]
 
     def do_POST(self) -> None:  # noqa: N802 (http.server naming)
         path = self.path.split("?", 1)[0]
@@ -1400,6 +1427,9 @@ def main() -> int:
     parser.add_argument("--upstream", default="http://127.0.0.1:18080/metrics")
     parser.add_argument("--page", default=None, help="path to the console html")
     parser.add_argument("--gpu-interval", type=float, default=1.0, help="NVML sampling interval in seconds")
+    parser.add_argument("--engine-host", default="127.0.0.1",
+                        help="address the engine the panel starts binds to; 0.0.0.0 exposes it on "
+                             "the LAN, 127.0.0.1 keeps it local to this machine")
     parser.add_argument("--engine", default="http://127.0.0.1:11438",
                         help="ninfer serve base URL; 'none' disables the engine source")
     parser.add_argument("--engine-key", default="",
@@ -1437,7 +1467,8 @@ def main() -> int:
     Handler.engine = (EngineCollector(args.engine, api_key=args.engine_key)
                       if args.engine and args.engine != "none" else None)
     Handler.launcher = Launcher(exe, roots, log_path, attach,
-                                lmcache_probe=lambda: bool(Handler.lmcache and Handler.lmcache._probe()))
+                                lmcache_probe=lambda: bool(Handler.lmcache and Handler.lmcache._probe()),
+                                engine_host=args.engine_host)
     Handler.lmcache = ScriptService(Path(__file__).resolve().parent / "start_lmcache.cmd",
                                    Path(__file__).resolve().parent / "lmcache-service.log",
                                    "lmcache", probe_url=args.upstream)
