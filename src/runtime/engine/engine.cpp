@@ -48,6 +48,18 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     return resolved;
 }
 
+// How many of the logical pages the Device actually holds.
+//
+// A resolution from the fully resident path (no Host tier configured) leaves resident_page_groups
+// at 0 because the Device holds every page; the residency split is only filled in when a Host tier
+// exists. Reading the field literally prices the resident set at zero tokens: the CLI with
+// --max-context 4096 refused a 3301-token prompt with "maximum context length is 0 tokens", which
+// took every accuracy point in the regression suite down with it. The monitor already treats 0 as
+// "fully resident" (EngineCore::memory_summary); the admission paths have to agree.
+std::uint32_t resident_page_groups_of(const runtime::KvCapacityResolution& resolution) {
+    return resolution.resident_page_groups != 0 ? resolution.resident_page_groups
+                                                : resolution.main_page_groups;
+}
 
 } // namespace
 
@@ -221,7 +233,8 @@ std::uint32_t Engine::resident_token_capacity() const {
     if (resolution.main_page_groups == 0) { return impl_->active->capacity; }
     const std::uint64_t per_page = resolution.resolved_tokens / resolution.main_page_groups;
     return static_cast<std::uint32_t>(
-        std::min<std::uint64_t>(per_page * resolution.resident_page_groups, impl_->active->capacity));
+        std::min<std::uint64_t>(per_page * resident_page_groups_of(resolution),
+                                impl_->active->capacity));
 }
 
 PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& control) const {
@@ -242,7 +255,7 @@ PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& cont
                 ? impl_->active->capacity
                 : static_cast<std::uint32_t>(std::min<std::uint64_t>(
                       (resolution.resolved_tokens / resolution.main_page_groups) *
-                          resolution.resident_page_groups,
+                          resident_page_groups_of(resolution),
                       impl_->active->capacity));
         if (info.prompt_tokens > resident_tokens) {
             throw RequestError(RequestErrorKind::ContextLengthExceeded,
