@@ -332,7 +332,7 @@
       <label>专家池 (MiB)<input id="newPool" type="number" value="12288"></label>
       <label>主机 KV (MiB)<input id="newKv" type="number" value="8192"></label>
       <label>端口<input id="newPort" type="number" value="8126"></label>
-      <label>工件形态<select id="newArt"><option value="e2">e2（推荐）</option><option value="fused">fused（对照，−3%）</option></select></label>
+      
       <label>&nbsp;<button class="btn" onclick="createInstance()">启动实例</button></label>
     </div>
     <div class="note" id="newNote">推荐 12 GiB 或 17 GiB 档，避开 15–16 GiB"两头不靠"（交错 A/B 实测 −11%）。启动后先 starting，约 3 s 转 running；新实例按当前控制器模式接入。</div>
@@ -2075,7 +2075,7 @@ function createInstance(){
   const pool = parseInt($('newPool').value,10) || 12288;
   const kv = parseInt($('newKv').value,10) || 8192;
   const port = parseInt($('newPort').value,10) || 8126;
-  const art = $('newArt').value;
+  const art = '';   // 形态由引擎的 ffn 发布，页面不再有这个东西
   const id = art + '-' + pool;
   if (INSTANCES[id]) { $('newNote').textContent = '实例 ' + id + ' 已存在，换一个池大小或形态。'; return; }
   const inst = makeInstance(id, model, art, pool, kv, port);
