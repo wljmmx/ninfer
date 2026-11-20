@@ -303,15 +303,20 @@ class EngineCollector:
     so a 1 Hz poll cannot perturb kernel timing, PPL or the hash gates.
 
     Rates come from differencing cumulative engine counters and the wall time between two
-    polls of this side. Nothing is interpolated: a failed poll is recorded as a gap and the
-    rate fields go None, which the page draws as a broken line. Fields the engine does not
-    publish stay absent rather than zero.
+    polls of this side. Nothing is interpolated: a poll that fails twice in a row is recorded
+    as a gap and the rate fields go None, which the page draws as a broken line. ONE missed
+    poll is not a gap - the last good payload keeps being served, so the page repeats a point
+    instead of drawing a break. Fields the engine does not publish stay absent rather than zero.
     """
 
     HISTORY = 12         # 1 Hz points kept for the ~5 s window rate and its min/max band
     EVENT_TAIL = 64      # events handed to the page per poll
     INFO_EVERY = 1.0     # /monitor/info is static; still polled at the same 1 Hz cadence
     WINDOW = 5.0         # engine's own throughput log uses a 5 s interval
+    # A single missed poll is normal (a 2.5 s timeout, a busy control path). Breaking on it used
+    # to cost more than the miss: _failed clears the rate history, so the next success needed a
+    # full 5 s window again - one lost sample became a 6-7 s hole in the curve.
+    FAILURES_BEFORE_BREAK = 2
 
     def __init__(self, base: str, interval: float = 1.0, api_key: str | None = None):
         self.base = base.rstrip("/")
@@ -569,8 +574,24 @@ class EngineCollector:
 
     def _failed(self, reason: str, at: float) -> None:
         self.failures += 1
-        self.ok = False
         self.reason = reason
+        if self.failures < self.FAILURES_BEFORE_BREAK:
+            # One miss: keep the last good payload (ok stays true, counters stay put) so the page
+            # holds the previous point. The health block is refreshed on the held copy, so
+            # last_success_seconds_ago keeps growing and the source bar says "采样滞后" after 3 s -
+            # the hold is visible, not hidden.
+            with self.lock:
+                if self.data and self.data.get("ok"):
+                    held = dict(self.data)
+                    health = dict(held.get("health") or {})
+                    health["failures"] = self.failures
+                    health["last_success_seconds_ago"] = (
+                        round(time.monotonic() - self.last_success, 1) if self.last_success else None)
+                    health["stale"] = True
+                    held["health"] = health
+                    self.data = held
+            return
+        self.ok = False
         self.history.clear()
         self.counter_hist.clear()
         self.prev = None
@@ -595,6 +616,9 @@ class EngineCollector:
                 "recent_ttft_ms": [],
                 "health": {"samples": self.samples, "failures": self.failures,
                            "gaps": self.gaps, "gap_seconds": round(self.gap_seconds, 1),
+                           "last_success_seconds_ago":
+                               round(time.monotonic() - self.last_success, 1)
+                               if self.last_success else None,
                            "event_ok": self.event_ok, "event_reason": self.event_reason,
                            "event_gaps": self.event_gaps},
             }
