@@ -226,6 +226,18 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
     };
     server_.set_socket_options(configure_http_server_socket);
     server_.set_payload_max_length(options_.max_request_bytes);
+    // Connection lifetime, spelled out instead of inherited. cpp-httplib's defaults are a 5 s
+    // keep-alive and 100 requests per connection: a client that pools a connection and calls again
+    // after a pause longer than 5 s writes into a socket this side already closed, and Windows
+    // answers with a reset (10054) - the intermittent drops long-conversation clients saw. 300 s
+    // covers the gaps between turns, the count is high enough that a busy agent never sees a
+    // mid-run EOF, and the read/write budgets leave room for a slow consumer on a stream.
+    server_.set_keep_alive_timeout(300);
+    server_.set_keep_alive_max_count(1000);
+    server_.set_read_timeout(60, 0);
+    server_.set_write_timeout(600, 0);
+    // Small requests (a monitor poll every second) should not wait behind Nagle on a stream.
+    server_.set_tcp_nodelay(true);
     register_routes();
 }
 
