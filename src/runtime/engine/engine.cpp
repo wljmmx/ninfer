@@ -222,8 +222,24 @@ PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& cont
     PromptSummary info = prepared.summary();
     const SamplingMode sampling_mode =
         info.starts_in_reasoning ? SamplingMode::Thinking : SamplingMode::NonThinking;
-    if (info.prompt_tokens > impl_->active->capacity) {
-        throw std::logic_error("target Frontend admitted a prompt beyond Engine capacity");
+    // Admission against the RESIDENT pool, not max_context. With a tiered plan the device holds
+    // only resident_page_groups of the logical pages, and a full-attention step addresses its
+    // whole history, so a request above the resident set can never be served - it used to fail
+    // inside a step after prefill work. Refuse it here, with the number that did not fit.
+    {
+        const auto& resolution = impl_->active->kv_capacity_resolution;
+        const std::uint32_t resident_tokens =
+            resolution.main_page_groups == 0
+                ? impl_->active->capacity
+                : static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                      (resolution.resolved_tokens / resolution.main_page_groups) *
+                          resolution.resident_page_groups,
+                      impl_->active->capacity));
+        if (info.prompt_tokens > resident_tokens) {
+            throw RequestError(RequestErrorKind::ContextLengthExceeded,
+                               runtime::context_length_error_message(info.prompt_tokens,
+                                                                   resident_tokens));
+        }
     }
     const PromptPreparationStats preparation = prepared.preparation_stats();
     return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(info, preparation, sampling_mode,
