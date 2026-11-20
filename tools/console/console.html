@@ -198,40 +198,6 @@
 
 <!-- ================= 总控大屏 ================= -->
 <section id="pane-fleet">
-<style id="launch-style">
-  #launchCard{grid-column:1/-1}
-  #launchCard .lgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:8px 0}
-  #launchCard label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--dim)}
-  #launchCard input,#launchCard select{background:#0b0f14;border:1px solid var(--line);color:var(--ink);border-radius:6px;padding:5px 8px;font:inherit;font-size:12.5px}
-  #launchCard .lrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px}
-  #lBrowser{max-height:150px;overflow:auto;border:1px solid var(--line);border-radius:6px;background:#0b0f14;padding:4px;font-size:12.5px}
-  #lBrowser div{padding:3px 6px;border-radius:4px;cursor:pointer;display:flex;justify-content:space-between;gap:8px}
-  #lBrowser div:hover{background:#182031}
-  #lBrowser .n{color:var(--dim);font-size:11.5px}
-  #launchCard .opts{max-height:180px;overflow:auto;border:1px solid var(--line);border-radius:6px;background:#0b0f14;padding:4px 8px;margin-top:6px}
-  #launchCard .optrow{display:flex;gap:8px;align-items:center;font-size:12px;padding:2px 0}
-  #launchCard .optrow .flag{font-family:Consolas,monospace;color:#9fc4ff;min-width:150px}
-  #launchCard .optrow .desc{color:var(--dim);flex:1}
-  #launchCard .optrow input[type=number],#launchCard .optrow input[type=text],#launchCard .optrow select{width:96px}
-</style>
-<div class="card" id="launchCard">
-  <h3>启动引擎 <span class="r" id="lMsg">未启动</span></h3>
-  <div class="lrow"><span id="lCrumbs" class="sub">根目录</span><span style="flex:1"></span>
-    <button id="lPick">选择目录…</button><button id="lUp">上一级</button><button id="lRefresh">刷新</button></div>
-  <div id="lBrowser"><div class="sub">读取中…</div></div>
-  <div class="lgrid">
-    <label>模型文件<input id="lModel" readonly placeholder="在上方点选 .ninfer"></label>
-    <label>端口<input id="lPort" type="number" value="11438"></label>
-    <label>最大上下文<input id="lCtx" type="number" value="8192"></label>
-    <label>最大并发<input id="lConc" type="number" value="1" min="1" max="8"></label>
-    <label>prefill 分块<input id="lChunk" type="number" value="1024"></label>
-    <label>KV 类型<select id="lKv"><option>bf16</option><option>int8</option><option>fp8</option><option>nvfp4</option><option>k8v4</option><option>rk8v4</option><option>rk4v4</option><option>rk4v4-e8</option><option>rk2v4-e8</option><option>rk4v2-e8</option></select></label>
-  </div>
-  <details><summary class="sub">额外参数（可选）</summary><div class="opts" id="lOpts"></div></details>
-  <div class="lrow"><label style="flex-direction:row;align-items:center;gap:6px;color:var(--ink);font-size:12.5px"><input type="checkbox" id="lLmcache"> 接入 LMCache</label>
-    <button id="lStart" class="primary">启动</button><button id="lStop">停止</button><span class="sub" id="lState">—</span></div>
-  <pre id="lLog" style="max-height:110px;margin-top:6px">—</pre>
-</div>
 
   <h2 class="sec">集群概览（单卡 24 GB 一次驻留一个池档）</h2>
   <div class="grid g6">
@@ -371,6 +337,40 @@
     </div>
     <div class="note" id="newNote">推荐 12 GiB 或 17 GiB 档，避开 15–16 GiB"两头不靠"（交错 A/B 实测 −11%）。启动后先 starting，约 3 s 转 running；新实例按当前控制器模式接入。</div>
   </div>
+<style id="launch-style">
+  #launchCard{grid-column:1/-1}
+  #launchCard .lgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:8px 0}
+  #launchCard label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--dim)}
+  #launchCard input,#launchCard select{background:#0b0f14;border:1px solid var(--line);color:var(--ink);border-radius:6px;padding:5px 8px;font:inherit;font-size:12.5px}
+  #launchCard .lrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px}
+  #lBrowser{max-height:150px;overflow:auto;border:1px solid var(--line);border-radius:6px;background:#0b0f14;padding:4px;font-size:12.5px}
+  #lBrowser div{padding:3px 6px;border-radius:4px;cursor:pointer;display:flex;justify-content:space-between;gap:8px}
+  #lBrowser div:hover{background:#182031}
+  #lBrowser .n{color:var(--dim);font-size:11.5px}
+  #launchCard .opts{max-height:180px;overflow:auto;border:1px solid var(--line);border-radius:6px;background:#0b0f14;padding:4px 8px;margin-top:6px}
+  #launchCard .optrow{display:flex;gap:8px;align-items:center;font-size:12px;padding:2px 0}
+  #launchCard .optrow .flag{font-family:Consolas,monospace;color:#9fc4ff;min-width:150px}
+  #launchCard .optrow .desc{color:var(--dim);flex:1}
+  #launchCard .optrow input[type=number],#launchCard .optrow input[type=text],#launchCard .optrow select{width:96px}
+</style>
+<div class="card" id="launchCard">
+  <h3>启动引擎 <span class="r" id="lMsg">未启动</span></h3>
+  <div class="lrow"><span id="lCrumbs" class="sub">根目录</span><span style="flex:1"></span>
+    <button id="lPick">选择目录…</button><button id="lUp">上一级</button><button id="lRefresh">刷新</button></div>
+  <div id="lBrowser"><div class="sub">读取中…</div></div>
+  <div class="lgrid">
+    <label>模型文件<input id="lModel" readonly placeholder="在上方点选 .ninfer"></label>
+    <label>端口<input id="lPort" type="number" value="11438"></label>
+    <label>最大上下文<input id="lCtx" type="number" value="8192"></label>
+    <label>最大并发<input id="lConc" type="number" value="1" min="1" max="8"></label>
+    <label>prefill 分块<input id="lChunk" type="number" value="1024"></label>
+    <label>KV 类型<select id="lKv"><option>bf16</option><option>int8</option><option>fp8</option><option>nvfp4</option><option>k8v4</option><option>rk8v4</option><option>rk4v4</option><option>rk4v4-e8</option><option>rk2v4-e8</option><option>rk4v2-e8</option></select></label>
+  </div>
+  <details><summary class="sub">额外参数（可选）</summary><div class="opts" id="lOpts"></div></details>
+  <div class="lrow"><label style="flex-direction:row;align-items:center;gap:6px;color:var(--ink);font-size:12.5px"><input type="checkbox" id="lLmcache"> 接入 LMCache</label>
+    <button id="lStart" class="primary">启动</button><button id="lStop">停止</button><span class="sub" id="lState">—</span></div>
+  <pre id="lLog" style="max-height:110px;margin-top:6px">—</pre>
+</div>
 </section>
 
 <!-- ================= 实例大屏 ================= -->
@@ -2265,6 +2265,8 @@ function tick(){
     if (!engineLive() && !ENGINE.everOk){
       // 没有引擎：不跑合成渲染，保持空态（读数已在 markDemoCards 里清成 "—"）
       renderSrcBar();
+      $('fleetState').innerHTML = '<span class="dot"></span>— 运行 / — 启动中';
+      $('fleetRows').innerHTML = '<tr><td colspan="8" class="sub">未接入引擎</td></tr>';
     } else if (viewName === 'fleet') { renderFleet(); drawFleet(); }
     else renderInstance();
   }
@@ -2359,7 +2361,7 @@ $('clock').textContent = new Date().toLocaleTimeString();
     try{ const s=await (await fetch('/api/launch/status.json')).json();
       L('lState').textContent = s.running ? ('运行中 pid '+s.pid) : (s.exit_code!=null?('已退出('+s.exit_code+')'):'未启动');
       L('lStart').disabled=!!s.running; L('lStop').disabled=!s.running;
-      const log=s.log||[]; L('lLog').textContent = log.length? log.slice(-10).join('\n') : '—';
+      const log=s.log||[]; L('lLog').textContent = s.running && log.length ? log.slice(-10).join('\n') : '—';
     }catch(e){}
   }
   async function tickLc(){

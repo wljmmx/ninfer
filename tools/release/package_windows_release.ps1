@@ -148,10 +148,21 @@ $consoleBat = @'
 rem Local console: serves the page and proxies the engine/LMCache/GPU sources.
 rem Open http://127.0.0.1:8099/ after it starts. Optional argument = engine base URL.
 title ninfer console
+rem "python" on PATH is not guaranteed on Windows (a bare `python` can be the Store stub, which
+rem only opens the Store). Resolve an interpreter that actually runs, in the order Windows ships it.
+set "PY="
+py -3 -c "import sys" >nul 2>&1 && set "PY=py -3"
+if not defined PY ( python -c "import sys" >nul 2>&1 && set "PY=python" )
+if not defined PY ( python3 -c "import sys" >nul 2>&1 && set "PY=python3" )
+if not defined PY (
+  echo No working Python 3 found. Install Python 3.10+, or put py/python on PATH.
+  pause
+  exit /b 3
+)
 if not "%~1"=="" (
-  python "{ROOT}\tools\console\lmcache_console.py" --port 8099 --engine %~1
+  %PY% "{ROOT}\tools\console\lmcache_console.py" --port 8099 --engine %~1
 ) else (
-  python "{ROOT}\tools\console\lmcache_console.py" --port 8099 --engine http://127.0.0.1:11438
+  %PY% "{ROOT}\tools\console\lmcache_console.py" --port 8099 --engine http://127.0.0.1:11438
 )
 pause
 '@
