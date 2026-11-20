@@ -46,7 +46,7 @@
   .sub{color:var(--muted);font-size:11.5px}
   .row{display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px dashed var(--line);font-size:12.5px;gap:8px}
   .row:last-child{border-bottom:none}
-  .row b{font-family:var(--mono);font-weight:600;text-align:right}
+  .row b{font-family:var(--mono);font-weight:600;text-align:right;color:#cfe3ff}
   .bar{height:6px;border-radius:4px;background:#1e2632;overflow:hidden;margin-top:6px;display:flex}
   .bar > i{height:100%;display:block}
 
@@ -96,8 +96,11 @@
   .kvbox .v{font-family:var(--mono);font-size:15px;margin-top:2px;color:#bcd3ee;font-variant-numeric:tabular-nums}
   .gauge{display:flex;gap:10px;margin-top:10px}
   .gauge .g{flex:1;text-align:center;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:7px 4px}
-  .gauge .g .n{font-family:var(--mono);font-size:16px;font-weight:600}
-  .gauge .g .l{font-size:10.5px;color:var(--dim);margin-top:1px}
+  .gauge .g .n{font-family:var(--mono);font-size:16px;font-weight:600;font-variant-numeric:tabular-nums}
+  .gauge .g .l{font-size:10.5px;color:var(--muted);margin-top:1px}
+  .gauge .g:nth-child(1) .n{color:#7cc4ff}
+  .gauge .g:nth-child(2) .n{color:#8fd6a6}
+  .gauge .g:nth-child(3) .n{color:#c9a8ff}
   .form{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:6px}
   .form label{display:flex;flex-direction:column;gap:3px;font-size:11px;color:var(--dim)}
   .alertbar{display:flex;gap:10px;align-items:center;font-size:12.5px;border:1px solid rgba(210,153,34,.35);
@@ -599,7 +602,7 @@ const LS_KEY = 'ninfer-console-v4';   // v4：不再延续含演示读数的旧�
 function round2(x){ return Math.round(x*100)/100; }
 function saveState(){
   try{
-    const insts = Object.values(INSTANCES).map(i => ({
+    const insts = Object.values(INSTANCES).filter(i => i.id !== 'waiting').map(i => ({
       id:i.id, model:i.model, art:i.art, pool:i.pool, kv:i.kv, port:i.port,
       state:i.state, startedAt:i.startedAt, note:i.note, sel:i.sel,
       series:Object.fromEntries(Object.keys(METRICS).map(k => [k, i.series[k].map(t => [round2(t[0]), round2(t[1]), round2(t[2])])])),
@@ -612,6 +615,24 @@ function saveState(){
     $('ft-mid').textContent = '本地历史：不可用（' + (e.message||'quota') + '）';
   }
 }
+function removeInstance(id){
+  const inst = INSTANCES[id];
+  if (!inst) return;
+  if (inst.state === 'running'){ alert('运行中的实例不能删除，请先停止'); return; }
+  if (!confirm('删除实例 ' + id + ' ？（连同它保存的曲线与流水）')) return;
+  delete INSTANCES[id];
+  if (current === id) current = Object.keys(INSTANCES)[0] || '';
+  saveState();
+  location.reload();
+}
+window.removeInstance = removeInstance;
+// 删除按钮用事件代理：行是 innerHTML 生成的，内联 onclick 会和多层引号打架。
+document.addEventListener('click', (e) => {
+  const el = e.target.closest('[data-del]');
+  if (!el) return;
+  e.stopPropagation();
+  removeInstance(el.getAttribute('data-del'));
+});
 function clearHistory(){
   if (!confirm('清除本地保存的历史（曲线、流水、请求样本）并重载？')) return;
   try{ localStorage.removeItem(LS_KEY); }catch(e){}
@@ -930,6 +951,7 @@ function ensureEngineInstance(){
   if (ENGINE.instId && INSTANCES[ENGINE.instId]) return INSTANCES[ENGINE.instId];
   // 引擎在线时只保留真实实例：演示档位停用，避免真假数字同屏
   for (const k of Object.keys(INSTANCES)){ INSTANCES[k].state = 'stopped'; INSTANCES[k].demo = true; }
+  delete INSTANCES['waiting'];   // 未连接时的占位不该留在列表里
   const m = (ENGINE.info && ENGINE.info.model) || {};
   const conf = (ENGINE.info && ENGINE.info.configuration) || {};
   const kvMiB = conf.context_cache_host_mib || null;
@@ -1649,7 +1671,7 @@ function renderFleet(){
     return '<tr class="pick ' + (inst.id===current?'cur':'') + '" onclick="enterInstance(\'' + inst.id + '\')">'
       + '<td><input type="checkbox" ' + (inst.sel?'checked':'') + ' onclick="event.stopPropagation()" onchange="toggleSelect(\'' + inst.id + '\')"></td>'
       + '<td>' + inst.id + '<br><span class="sub">' + (inst.pool/1024|0) + ' GiB · :' + inst.port +  + '</span></td>'
-      + '<td>' + st + '</td>'
+      + '<td>' + st + (inst.state === 'running' ? '' : ' <span class="tag" data-del="' + inst.id + '" style="cursor:pointer" title="删除该实例">✕</span>') + '</td>'
       + '<td class="n">' + (d ? d.toFixed(1) : '—') + '</td>'
       + '<td class="n">' + (t ? t.toFixed(0)+' ms' : '—') + '</td>'
       + '<td class="n">' + (c ? c.toFixed(0)+'%' : '—') + '</td>'
