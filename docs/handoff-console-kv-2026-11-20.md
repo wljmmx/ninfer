@@ -103,3 +103,45 @@ cpp-httplib 默认 keep-alive **5 s / 100 次**，服务端从未覆盖：客户
 - 性能测试**串行单进程**。本轮两次数据被并行 bench 污染（±1935、±28.5），已作废。
 - 门禁依赖 `D:\infer-rtx4090\n4_q1.txt`（dump 阶段），这个文件曾丢失导致 push 被挡。
 - 门禁需要独占 GPU：push 前先停引擎，否则 perplexity 会拿不到显存。
+
+## 6. 补充实测（同日，串行单进程）
+
+### 6.1 MoE 的 draft 标定（pp2048+tg128，r=3，warmup=1，rk4v4-e8）
+
+| 形态 | draft | prefill | decode | 接受率 |
+|---|---|---|---|---|
+| 27B 稠密 | 7 | 3,522.24 | **195.33** | 77.7% |
+| 27B 稠密 | 15 | 3,462.78 | 151.52 | 54.3% |
+| 35B MoE | 4 | 1,741.01 | 271.81 | 80.2% |
+| 35B MoE | **7** | **2,856.03** | **432.72** | 82.6% |
+| 35B MoE | 11 | 2,816.68 | 417.76 | 70.6% |
+
+结论：7 对两种形态都是实测最优；draft 4 会把 MoE 的 prefill 打到 1,741（−39%）。
+面板默认因此为 7，标签写明两边来源。
+
+### 6.2 TTFT 随上下文的衰减（现网 256k 全驻留，MTP 7）
+
+| prompt | TTFT | prefill | 相对 16k |
+|---|---|---|---|
+| 16,058 | 6.0 s | 2.91k tok/s | — |
+| 59,615 | 25.9 s | 2.42k tok/s | −17% |
+| 163,678 | 108.9 s | 1.55k tok/s | −47% |
+
+队列只有 16–50 ms，TTFT 就是 prefill 本身。这不是回归，是长上下文 prefill 的固有成本。
+
+### 6.3 LMCache 勾选
+
+引擎侧正常：勾选启动后日志为
+`[lmcache] attached | page 983040 B, 64 token(s), chunk 128 token(s) (= 2 page(s))` +
+`checkpoint cache | attached`。
+问题是前端勾选状态不持久化，刷新/重启后回到未勾选，于是 `lmcache=false`。现已写入
+localStorage，实测刷新后仍勾选。
+
+## 7. 未完成（更新）
+
+1. 拆“步内取页”路径：`src/runtime/engine/engine_core.h:1092/1098` 是判定与文案，
+   `src/models/qwen3_5/program/storage/sequence.cpp` 是机制。属拆特性，需要一次
+   编译 + 163k 实测（确认 page-in 计数恒 0）+ 门禁，必须在一个完整窗口内完成。
+2. P7：目录默认值、日志框外的宽度对齐、配色与中英混排。
+
+已完成并从计划里移除：MoE draft 标定、TTFT 三档、LMCache 勾选持久化、`resident_tokens` 发布。
