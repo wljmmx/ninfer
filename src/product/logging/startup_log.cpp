@@ -67,7 +67,8 @@ PhasePresentation phase_presentation(StartupPhase phase) noexcept {
         return {"initializing runtime", "runtime initialized", PhaseVisibility::Debug, false,
                 false};
     case StartupPhase::HostContextPin:
-        return {"pinning host context", "host context pinned", PhaseVisibility::Info, true, false};
+        return {"reserving host context", "host context reserved", PhaseVisibility::Info, true,
+                false};
     case StartupPhase::CudaGraphPrepare:
         return {"preparing CUDA graphs", "CUDA graphs ready", PhaseVisibility::Info, false, false};
     case StartupPhase::EngineFinalize:

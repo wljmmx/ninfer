@@ -3,6 +3,7 @@
 #include "core/dtype.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <exception>
 #include <limits>
 #include <stdexcept>
@@ -229,8 +230,19 @@ std::optional<HostKVAllocation> HostKVArena::allocate(const HostKVPageLayout& la
         return std::nullopt;
     }
     const std::size_t bytes = layout.page_stride * static_cast<std::size_t>(pages);
+    const std::size_t extents_before = arena_->extent_count();
     auto storage            = arena_->allocate(bytes, consumer);
     if (!storage) { return std::nullopt; }
+    if (arena_->extent_count() != extents_before) {
+        // The Host tier is now lazily pinned: this is the number an operator needs, because the
+        // budget is a cap and the pinned footprint is whatever the page groups have asked for so
+        // far. One line per new extent is at most a few dozen for a 1M-token plan.
+        constexpr double kMib = 1024.0 * 1024.0;
+        std::fprintf(stderr, "[host-kv] extents=%zu pinned=%.0f MiB budget=%.0f MiB lazy=on\n",
+                     arena_->extent_count(), static_cast<double>(arena_->pinned_bytes()) / kMib,
+                     static_cast<double>(arena_->capacity_bytes()) / kMib);
+        std::fflush(stderr);
+    }
     const std::uint32_t descriptor_index = take_descriptor();
     Descriptor& descriptor               = descriptors_[descriptor_index];
     descriptor.storage                   = std::move(*storage);

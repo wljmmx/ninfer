@@ -110,8 +110,10 @@ public:
                 pages, layout.page_stride * static_cast<std::size_t>(membership.size()));
             allocation = arena_->allocate(layout, static_cast<std::uint32_t>(membership.size()));
         }
-        if (!allocation) { return std::nullopt; }
-
+        if (!allocation) {
+            note_host_tier_refusal(layout.page_stride * static_cast<std::size_t>(membership.size()));
+            return std::nullopt;
+        }
         const std::uint32_t descriptor = free_[--free_count_];
         Extent& extent                 = extents_[descriptor];
         if (extent.state != ExtentState::Free) { std::terminate(); }
@@ -170,7 +172,10 @@ public:
                 pages, layout.page_stride * static_cast<std::size_t>(membership.size()));
             allocation = arena_->allocate(layout, static_cast<std::uint32_t>(membership.size()));
         }
-        if (!allocation) { return std::nullopt; }
+        if (!allocation) {
+            note_host_tier_refusal(layout.page_stride * static_cast<std::size_t>(membership.size()));
+            return std::nullopt;
+        }
 
         const std::uint32_t descriptor = free_[--free_count_];
         Extent& extent                 = extents_[descriptor];
@@ -646,6 +651,30 @@ public:
 private:
     static constexpr std::uint32_t kInvalidIndex = std::numeric_limits<std::uint32_t>::max();
 
+    // The Host budget is a cap, so it can be spent while the plan still has logical pages to place.
+    // With a file tier the cold group goes there; without one there is nowhere for the bytes, so the
+    // page group is refused HERE - at the request, never at startup - and said out loud (a bounded
+    // number of times) instead of looking like a silent success.
+    void note_host_tier_refusal(std::size_t needed_bytes) noexcept {
+        if (refusal_reports_ >= 3) { return; }
+        ++refusal_reports_;
+        constexpr double kMib = 1024.0 * 1024.0;
+        const double needed   = static_cast<double>(needed_bytes) / kMib;
+        if (!spill_file_) {
+            std::fprintf(stderr,
+                         "[host-kv] budget exhausted (%.0f MiB page group) and no spill file is "
+                         "configured (NINFER_KV_SPILL_MB); refusing this group, startup is "
+                         "unaffected\n",
+                         needed);
+        } else {
+            std::fprintf(stderr,
+                         "[host-kv] budget exhausted (%.0f MiB page group) and the spill file gave "
+                         "nothing back; refusing this group, startup is unaffected\n",
+                         needed);
+        }
+        std::fflush(stderr);
+    }
+
     enum class ExtentState : std::uint8_t {
         Free,
         Reserved,
@@ -943,7 +972,8 @@ private:
     std::vector<std::uint32_t> extent_scan_scratch_;
     std::vector<PartitionRun> partition_runs_;
     std::unique_ptr<KVSpillFile> spill_file_;
-    std::uint64_t spill_epoch_ = 0;
+    std::uint64_t spill_epoch_    = 0;
+    std::uint32_t refusal_reports_ = 0;
 };
 
 inline HostKVExtentReservation::~HostKVExtentReservation() {

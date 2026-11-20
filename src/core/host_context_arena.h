@@ -3,6 +3,8 @@
 #include "core/arena.h"
 
 #include <cstddef>
+#include <cstdint>
+#include <memory>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -40,25 +42,29 @@ public:
 private:
     friend class HostContextArena;
 
-    HostContextAllocation(HostContextArena& owner, std::size_t offset, std::size_t bytes,
-                          bool reserved = true,
+    HostContextAllocation(HostContextArena& owner, std::uint32_t extent, std::size_t offset,
+                          std::size_t bytes, bool reserved = true,
                           HostConsumer consumer = HostConsumer::Live) noexcept
-        : owner_(&owner), offset_(offset), bytes_(bytes), reserved_(reserved),
+        : owner_(&owner), extent_(extent), offset_(offset), bytes_(bytes), reserved_(reserved),
           consumer_(consumer) {}
 
     void disarm() noexcept;
 
     HostContextArena* owner_ = nullptr;
+    std::uint32_t extent_    = 0;
     std::size_t offset_      = 0;
     std::size_t bytes_       = 0;
     bool reserved_           = false;
     HostConsumer consumer_   = HostConsumer::Live;
 };
 
-// One startup-fixed pinned backing shared by every optional Host context representation.
+// One startup-fixed pinned budget shared by every optional Host context representation.
 // minimum_allocation_bytes is the smallest supported complete geometry, not a quota split.
 // It bounds metadata at startup; all allocations and split pieces must meet that minimum.
-// The arena must outlive its allocations and the typed pools that own them.
+// The budget is a CAP, not a pre-pin: pinned extents are created on demand and an allocation
+// never crosses an extent boundary, so every allocation stays one contiguous pinned span for
+// the consumers that copy into it. The arena must outlive its allocations and the typed pools
+// that own them.
 class HostContextArena {
 public:
     static constexpr std::size_t alignment = 256;
@@ -70,15 +76,18 @@ public:
     HostContextArena(HostContextArena&&)                 = delete;
     HostContextArena& operator=(HostContextArena&&)      = delete;
 
-    // False when the pinned request was refused and the arena fell back to pageable memory.
-    [[nodiscard]] bool pinned() const noexcept { return backing_.has_value(); }
-
-    // Base address of the backing (pinned or pageable); null before the first allocation.
-    [[nodiscard]] std::byte* base() const noexcept {
-        return backing_.has_value() ? static_cast<std::byte*>(backing_->data()) : pageable_;
-    }
+    // False once any extent had to fall back to pageable memory; true while every extent pinned.
+    [[nodiscard]] bool pinned() const noexcept { return pageable_extent_bytes_ == 0; }
 
     [[nodiscard]] std::size_t capacity_bytes() const noexcept { return capacity_bytes_; }
+
+    // What is actually pinned right now, and how many extents that took. Startup pins nothing;
+    // both grow with the allocations and never exceed capacity_bytes().
+    [[nodiscard]] std::size_t pinned_bytes() const noexcept { return pinned_extent_bytes_; }
+
+    [[nodiscard]] std::size_t mapped_bytes() const noexcept { return extent_bytes_; }
+
+    [[nodiscard]] std::size_t extent_count() const noexcept { return extents_.size(); }
 
     [[nodiscard]] std::size_t minimum_allocation_bytes() const noexcept { return minimum_bytes_; }
 
@@ -126,28 +135,48 @@ private:
         std::size_t bytes  = 0;
     };
 
+    // One on-demand backing. `backing` owns the pin when it holds a value; `pageable` is the
+    // private fallback of a build that has one. Allocations are carved out of a single extent's
+    // free runs, so no allocation is ever split across two backing blocks.
+    struct Extent {
+        Extent()                              = default;
+        ~Extent();
+        Extent(const Extent&)                 = delete;
+        Extent& operator=(const Extent&)      = delete;
+
+        std::optional<PinnedHostBuffer> backing;
+        std::byte* pageable = nullptr;
+        std::size_t bytes   = 0;
+        std::vector<FreeExtent> free_runs;
+
+        [[nodiscard]] std::byte* data() const noexcept {
+            return backing.has_value() ? static_cast<std::byte*>(backing->data()) : pageable;
+        }
+    };
+
     [[nodiscard]] std::size_t allocation_bytes(std::size_t bytes) const noexcept;
-    [[nodiscard]] std::optional<std::size_t> find_free_extent(std::size_t bytes) const noexcept;
-    void insert_free_extent(FreeExtent extent) noexcept;
-    void release(std::size_t offset, std::size_t bytes, bool reserved,
+    [[nodiscard]] std::optional<std::pair<std::size_t, std::size_t>>
+    find_free_extent(std::size_t bytes) const noexcept;
+    [[nodiscard]] std::unique_ptr<Extent> make_extent(std::size_t bytes) noexcept;
+    [[nodiscard]] HostContextAllocation charge(std::uint32_t extent, std::size_t offset,
+                                               std::size_t bytes, HostConsumer consumer) noexcept;
+    void insert_free_extent(std::vector<FreeExtent>& runs, FreeExtent extent) const;
+    void release(std::uint32_t extent, std::size_t offset, std::size_t bytes, bool reserved,
                  HostConsumer consumer) noexcept;
 
-    std::optional<PinnedHostBuffer> backing_;
-    // Pageable backing, used only when the pinned request is refused. The tier exists to hold KV
-    // pages and state images outside the Device, and every consumer needs addressable host memory,
-    // not DMA: a fallback here keeps a 256K plan on a box whose pinned budget is already spent
-    // instead of aborting startup. Reported as `pinned() == false`.
-    std::byte* pageable_              = nullptr;
-    std::size_t capacity_bytes_      = 0;
-    std::size_t minimum_bytes_       = 0;
-    std::size_t occupied_bytes_      = 0;
-    std::size_t reserved_bytes_      = 0;
-    std::size_t peak_occupied_bytes_ = 0;
-    std::size_t live_floor_bytes_    = 0;
-    std::size_t live_kv_bytes_       = 0;
-    std::size_t checkpoint_bytes_    = 0;
-    std::size_t allocation_count_    = 0;
-    std::vector<FreeExtent> free_extents_;
+    std::vector<std::unique_ptr<Extent>> extents_;
+    std::size_t capacity_bytes_        = 0;
+    std::size_t extent_bytes_          = 0;
+    std::size_t pinned_extent_bytes_   = 0;
+    std::size_t pageable_extent_bytes_ = 0;
+    std::size_t minimum_bytes_         = 0;
+    std::size_t occupied_bytes_        = 0;
+    std::size_t reserved_bytes_        = 0;
+    std::size_t peak_occupied_bytes_   = 0;
+    std::size_t live_floor_bytes_      = 0;
+    std::size_t live_kv_bytes_         = 0;
+    std::size_t checkpoint_bytes_      = 0;
+    std::size_t allocation_count_      = 0;
 };
 
 } // namespace ninfer

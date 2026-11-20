@@ -258,8 +258,10 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     checkpoints.resize(checked_count(4ULL * logical_states + 2ULL * max_concurrency));
     const auto address_capacity = checked_count(checkpoints.size() + max_concurrency + 2U);
     if (host_bytes) {
-        StartupPhaseScope phase(startup_observer, StartupPhase::HostContextPin,
-                                StartupProgressUnit::Bytes, host_bytes);
+        // The arena no longer pins its budget here: extents are created as page groups arrive, so
+        // there is no byte range to report as startup progress. The [host-kv] line below reports
+        // what is actually pinned (nothing yet) and grows with the tier.
+        StartupPhaseScope phase(startup_observer, StartupPhase::HostContextPin);
         host_context_arena = std::make_unique<HostContextArena>(host_bytes, minimum_stride);
         host_state_images =
             std::make_unique<HostStatePool>(*host_context_arena, state_images->host_layout());
@@ -288,6 +290,17 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             }
         }
         host_kv_arena      = std::make_unique<HostKVArena>(*host_context_arena, layouts);
+        {
+            // The pin count starts at zero and grows with the tier; the budget is the cap, not a
+            // pre-pin. Printed next to [kv-host] for the same reason: a plan that silently pinned
+            // (or failed to pin) what it promised must be visible before the first request.
+            constexpr double kMib = 1024.0 * 1024.0;
+            std::fprintf(stderr, "[host-kv] extents=%zu pinned=%.0f MiB budget=%.0f MiB lazy=on\n",
+                         host_context_arena->extent_count(),
+                         static_cast<double>(host_context_arena->pinned_bytes()) / kMib,
+                         static_cast<double>(host_context_arena->capacity_bytes()) / kMib);
+            std::fflush(stderr);
+        }
         const auto extents = checked_count(host_bytes / minimum_kv_stride);
         if (extents) {
             host_kv_extents = std::make_unique<HostKVExtentStore>(*host_kv_arena, extents);
@@ -314,7 +327,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                 }
             }
         }
-        phase.complete(host_bytes, host_bytes);
+        phase.complete();
         // port (sm_89): the Host tier the residency plan pays for, priced before any page moves into
         // it. Printed for the same reason the expert tier prints its arena: a 256K plan that silently
         // fell back to a smaller arena would only show up as a mid-flight "Host tier is full".
