@@ -30,22 +30,14 @@ else()
     "rtx2080ti (sm_75, Turing) and rtx5090 (sm_120a, Blackwell)")
 endif()
 
-# The rtx2080ti (sm_75, Turing) target is wired into the build system, the runtime
-# capability gate and the CMake presets on this branch, but the Turing tensor-core
-# kernel port is not complete: the Op kernel family is built on BF16/FP8
-# mma.sync (sm_80+/sm_89+) and cp.async (sm_80+), none of which Turing has. The
-# configure-time guard keeps a selected-but-incomplete target from producing a
-# build that fails deep in ptxas; the port status and work items live in
-# docs/maintainer/sm75-port-plan.md.
-if(NINFER_TARGET STREQUAL "rtx2080ti")
-  message(FATAL_ERROR
-    "NINFER_TARGET=rtx2080ti (sm_75, Turing) is a skeleton target on this branch: "
-    "the Turing tensor-core kernel port is not complete. The engine's GEMM/attention/MoE "
-    "kernels use BF16/FP8 mma.sync and cp.async, which Turing (sm_75) does not implement. "
-    "See docs/maintainer/sm75-port-plan.md for the gap analysis and port work items. "
-    "Select rtx4090 (sm_89) or rtx5090 (sm_120a) to build and run.")
-endif()
-
+# The rtx2080ti (sm_75, Turing) target is buildable on this branch: the Turing
+# port supplies the sm_80+/sm_89+ features the kernel family used to require.
+# BF16 mma.sync runs through an fp16 operand conversion (Turing has FP16 tensor
+# cores, no BF16 ones), FP8 A8 routes are remapped to the A16 execution (no FP8
+# tensor cores on Turing), cp.async falls back to the __pipeline_ intrinsics, and
+# the sampler's __reduce_max_sync is a portable shfl reduction. The port status,
+# the remaining real-hardware verification (S5/S6 in docs/maintainer/sm75-port-plan.md)
+# and the performance notes live there.
 # CUDA compiler detection must see the selected architecture, not a host default.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES ${NINFER_CUDA_ARCHITECTURE}
