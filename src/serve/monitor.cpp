@@ -102,6 +102,17 @@ Json request_rows_json(const std::vector<ninfer::RequestSnapshot>& rows) {
     return out;
 }
 
+// The feed-forward form, keyed on the CANONICAL architecture names this port resolves
+// (models/registry.cpp). A table, not a guess: Qwen4Exp is MoE without "Moe" in its name,
+// so substring matching is wrong, and an unknown name must not default to dense.
+const char* ffn_form_of(std::string_view architecture) noexcept {
+    if (architecture == "Qwen3_5MoeForCausalLM" || architecture == "Qwen4ExpForCausalLM") {
+        return "moe";
+    }
+    if (architecture == "Qwen3_5ForCausalLM") { return "dense"; }
+    return "unknown";
+}
+
 Json runtime_json(const RuntimeStats& stats, const ServiceSnapshot& service) {
     // Every number below is a value this Engine actually publishes. Host phases stay separate from
     // device waits and from Context transfer time per docs/performance/methodology.md; nothing is
@@ -309,6 +320,7 @@ void HttpServer::register_monitor_routes() {
         const auto load     = service_->load_summary();
         out["model"]        = {{"id", public_model_id_},
                                {"architecture", load.architecture},
+                               {"ffn", ffn_form_of(load.architecture)},
                                {"name", load.model_name},
                                {"max_context", engine.max_context},
                                {"max_concurrency", engine.max_concurrency},

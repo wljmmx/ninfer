@@ -1484,7 +1484,7 @@ function renderInstanceLive(){
   $('inst').value = current;
   $('i-state').innerHTML = '<span class="tag eng">engine</span>' +
     (ENGINE.ready ? '' : ' <span class="tag start">未就绪</span>');
-  $('i-art').innerHTML = '<span class="tag">' + (m.architecture || 'model') + '</span> · ' +
+  $('i-art').innerHTML = '<span class="tag">' + ({dense:'稠密', moe:'MoE'}[m.ffn] || '—') + '</span> · ' + (m.architecture || '') + ' · ' +
     (m.kv_cache || '—') + ' · max-context ' + fmtInt(m.max_context) + ' · 池未发布';
   $('i-up').textContent = ':' + ENGINE.port + ' · ' + uptime(inst);
   $('i-start').classList.add('hidden');
