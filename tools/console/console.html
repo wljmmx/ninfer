@@ -359,7 +359,7 @@
     </div>
     <div class="note" id="lcNote">ZMQ engine_driven（端点须 tcp://）。真机：同进程 531/538；进程重启后 WAL 重放补发，仍 531/538（98.7%）、TTFT 6.01→1.53 s。LMCache 侧只有 L1（10 GB），服务重启条目即消失。连续 3 次取数失败记一次采样 gap。</div>
   </div>
-  <div class="card" style="margin-top:12px">
+  <div class="card" style="margin-top:12px;display:none" id="legacyInstanceCard">
     <h3>实例管理 <span class="r">池/KV 改动需重启（resize API 未负载验收）；策略由控制器模式统一定档</span></h3>
     <div class="form">
       <label>模型<input id="newModel" type="text" value="qwen3.6-35b-a3b-e2"></label>
@@ -529,6 +529,8 @@
 <script>
 "use strict";
 const $ = id => document.getElementById(id);
+// 空值安全的数字格式：引擎不发布的量读作 "—"，而不是让 toFixed 抛错或显示 NaN
+const numF = (v, d) => (v == null || !isFinite(v)) ? '—' : Number(v).toFixed(d);
 
 /* ---------- 指标定义：每个实例各存一条环形缓冲（[值, min, max] 三元组） ---------- */
 const METRICS = {
@@ -593,7 +595,7 @@ function mkBase(pool, fused){
 }
 
 /* ---------- 本地持久化（模拟 collector 独立持史：关掉页面历史还在） ---------- */
-const LS_KEY = 'ninfer-console-v3';
+const LS_KEY = 'ninfer-console-v4';   // v4：不再延续含演示读数的旧历史
 function round2(x){ return Math.round(x*100)/100; }
 function saveState(){
   try{
@@ -635,13 +637,10 @@ if (restored && restored.insts && restored.insts.length && Date.now() - restored
     INSTANCES[inst.id] = inst;
   }
 } else {
-  const a = makeInstance('e2-12288','qwen3.6-35b-a3b-e2','e2',12288,8192,8123);
-  a.state='running'; a.startedAt=Date.now()-2*3600e3-14*60e3;
-  const b = makeInstance('e2-8192','qwen3.6-35b-a3b-e2','e2',8192,6144,8124);
-  b.note='8 GiB 档冷备';
-  const c = makeInstance('fused-12288','qwen3.6-35b-a3b','fused',12288,8192,8125);
-  c.note='Q60：fused −3%，仅对照'; c.sel=false;
-  INSTANCES = {'e2-12288':a, 'e2-8192':b, 'fused-12288':c};
+  // 未接入引擎：只留一个占位实例，读数由 sample() 给出空值
+  const p = makeInstance('waiting', '未连接引擎', 'e2', 0, 0, 0);
+  p.base0 = {}; p.state = 'stopped';
+  INSTANCES = {waiting: p};
 }
 
 let current = Object.keys(INSTANCES)[0];
@@ -827,9 +826,9 @@ function renderSrcBar(){
     dot.className = 'dot ' + (ENGINE.everOk ? 'bad' : 'warn');
     $('srcTitle').textContent = ENGINE.everOk
       ? '数据源：引擎断开 ' + secs + ' s（gap 分段，不插值）'
-      : '数据源：演示数据（引擎端点未接入）';
+      : '数据源：引擎未接入（无数据）';
     $('srcDetail').textContent = ENGINE.reason + (ENGINE.base ? ' · ' + ENGINE.base : '') +
-      (ENGINE.everOk ? ' · 曲线停在上次真实值，不回落到模拟' : ' · 所有数字为示意，不是实测');
+      (ENGINE.everOk ? ' · 曲线停在上次真实值' : ' · 未接入引擎时各读数为空');
     $('srcGap').textContent = ENGINE.everOk ? ('已断 ' + secs + ' s · gap ' + (ENGINE.gaps || 0) + ' 段')
                                             : '经 tools\\console.cmd 打开即接引擎 /monitor';
   }
@@ -838,6 +837,13 @@ function markDemoCards(){
   const live = ENGINE.ok || ENGINE.everOk;
   const ids = ['c-cover','c-miss','c-pub','c-spill','c-pfu','i-static','i-nomiss','i-cap','i-fail',
                'f-spill','f-miss','f-pub','f-gate','f-static','f-nomiss','f-cap','f-fail','p-conc','p-freeze','p-pf','p-graph','p-sc'];
+  // 引擎不在线：这些卡片没有数据源，读数清空为 "—"，角标从"演示"改成"未接入"
+  if (!live){
+    for (const id of ids){ const el = $(id); if (el) el.textContent = '—'; }
+    // 聚合读数同样清空：没有引擎就没有"0 tok/s"这种读法，只有"未接入"
+    for (const id of ['f-dec','f-pre']){ const el = $(id); if (el) el.innerHTML = '—'; }
+    for (const id of ['f-dec-sub','f-pre-sub']){ const el = $(id); if (el) el.textContent = '未接入引擎'; }
+  }
   for (const id of ids){
     const el = $(id);
     const card = el && el.closest ? el.closest('.card') : null;
@@ -850,7 +856,7 @@ function markDemoCards(){
     if (!tag){
       tag = document.createElement('span');
       tag.className = 'tag demo demoFlag';
-      tag.textContent = '演示';
+      tag.textContent = '未接入';
       const h = card.querySelector('h3');
       if (h) h.appendChild(tag);
     }
@@ -951,12 +957,9 @@ function triple(v, band){
 function sample(inst){
   const s = {};
   if (!engineLive()){
-    // 曾连上后断开：停在上次真实值之外，只推 gap，不回到模拟值
-    if (ENGINE.everOk){
-      for (const k of Object.keys(METRICS)) s[k] = [null, null, null];
-      return s;
-    }
-    return demoSample(inst);
+    // 没有引擎就是空：不再生成任何示意读数（原演示发生器只在 demoSample 中，已不再调用）
+    for (const k of Object.keys(METRICS)) s[k] = [null, null, null];
+    return s;
   }
   for (const k of Object.keys(METRICS)) s[k] = [null, null, null];
   if (!inst.live) return s;
@@ -1008,16 +1011,7 @@ function pushSamples(){
     }
   }
 }
-if (!restored){
-  for (let i=0;i<40;i++) pushSamples();   // 预置 40 点，开局不空图
-  for (const inst of Object.values(INSTANCES)){
-    if (inst.state === 'running'){
-      const p = inst.policy;
-      feedAdd(inst.id + ' 并发：C=' + p.c + '（static ' + inst.base0.static.toFixed(0) + '% ' + (p.c>1?'≥':'<') + ' 80%）');
-      feedAdd(inst.id + ' 冻结：流式（no_miss ' + inst.base0.noMiss + '%，判据"连续 32 层全 clean"未达）');
-    }
-  }
-} else {
+if (restored){
   const n = Object.values(INSTANCES)[0].series.decode.length;
   feedAdd('已恢复本地历史 · ' + n + ' 点 · 保存于 ' + new Date(restored.at).toLocaleTimeString(), 'info');
 }
@@ -1048,7 +1042,8 @@ function binsQuantile(bins, q){
 }
 const PROMPTS = [26, 74, 138, 490, 970, 2048];
 function reqSimTick(inst){
-  if (engineLive()) return;                  // 引擎在线时请求来自 /monitor，不模拟生命周期
+  inst.active = [];
+  return;                                   // 请求流水只来自引擎事件，不再模拟
   if (inst.state !== 'running'){ inst.active = []; return; }
   const C = Math.max(1, Math.min(8, inst.policy.c || 1));
   if (!inst.ttftBins) inst.ttftBins = emptyBins();
@@ -1661,28 +1656,28 @@ function renderFleet(){
   }).join('');
 
   const ri = running[0];
-  $('f-spill').textContent = running.length ? (running.reduce((s,i)=>s+latest(i,'spill'),0).toFixed(0) + ' / ' + running.length*8 + ' 槽') : '—';
-  $('f-miss').textContent = ri ? latest(ri,'miss').toFixed(2) + ' 个/token' : '—';
+  $('f-spill').textContent = running.length ? (running.reduce((s,i)=>s+(latest(i,'spill')||0),0).toFixed(0) + ' / ' + running.length*8 + ' 槽') : '—';
+  $('f-miss').textContent = ri ? numF(latest(ri,'miss'),2) + ' 个/token' : '—';
   $('f-pub').textContent = ri ? (ri.policy.freeze ? '0 B/步（表零移动）' : '16 B/步（48→16）') : '—';
   $('f-gate').textContent = ri ? (ri.policy.prefetch
     ? 'useful ' + (ri.pot||0).toFixed(0) + '% · ≥10% 开 / tps −3% 关'
     : '关（useful ' + (ri.pot||0).toFixed(0) + '%，' + (ctlMode === 'auto' ? '自动判据' : '当前模式') + '）') : '—';
-  $('f-static').textContent = ri ? ri.base.static.toFixed(1)+'%' : '—';
-  $('f-nomiss').textContent = ri ? ri.base.noMiss.toFixed(0)+'%' : '—';
-  $('f-cap').textContent = ri ? latest(ri,'capt').toFixed(1)+'%' : '—';
+  $('f-static').textContent = numF(ri && ri.base && ri.base.static, 1) + '%';
+  $('f-nomiss').textContent = numF(ri && ri.base && ri.base.noMiss, 0) + '%';
+  $('f-cap').textContent = numF(ri && latest(ri,'capt'), 1) + '%';
   $('f-fail').textContent = ri ? (ri.policy.freeze ? 'fail_unaddr 0 · fail_publish 0 · fail_upload 0' : 'fail_unaddr 0 · fail_publish 86 · fail_upload 86') : '—';
 
   const alerts = [];
   for (const inst of running){
     const anchor = inst.base.decode || 1;
     if (latest(inst,'decode') > 0 && latest(inst,'decode') < anchor*0.8)
-      alerts.push(inst.id + '：decode ' + latest(inst,'decode').toFixed(1) + ' 低于当前策略基线 0.8×（' + anchor.toFixed(0) + '）');
+      alerts.push(inst.id + '：decode ' + numF(latest(inst,'decode'),1) + ' 低于当前策略基线 0.8×（' + anchor.toFixed(0) + '）');
     if (inst.policy.prefetch && latest(inst,'prefetch') > 0 && latest(inst,'prefetch') < 10)
-      alerts.push(inst.id + '：预取有用率 ' + latest(inst,'prefetch').toFixed(1) + '% < 10%（自动模式将连续 8 窗后关）');
+      alerts.push(inst.id + '：预取有用率 ' + numF(latest(inst,'prefetch'),1) + '% < 10%（自动模式将连续 8 窗后关）');
     if (inst.policy.c > 1 && ctlMode === 'auto' && inst.base0.static < 80)
       alerts.push(inst.id + '：并发开着而 static < 80%，与自动判据不符');
-    if (!inst.policy.freeze && latest(inst,'capt') < 100)
-      alerts.push(inst.id + '：capt_ready ' + latest(inst,'capt').toFixed(0) + '%，图判据不满足（缺口在表发布+上传）');
+    if (!inst.policy.freeze && latest(inst,'capt') != null && latest(inst,'capt') < 100)
+      alerts.push(inst.id + '：capt_ready ' + numF(latest(inst,'capt'),0) + '%，图判据不满足（缺口在表发布+上传）');
   }
   if (GPU.ok && GPU.cur){
     const act = (GPU.cur.event_reasons && GPU.cur.event_reasons.active) || [];
@@ -1979,18 +1974,18 @@ function renderInstance(){
   spark($('sp-ipre'), inst.series.prefill.slice(-60).map(x=>x[0]), '#3fb950');
   spark($('sp-ittft'), inst.series.ttft.slice(-60).map(x=>x[0]), '#d29922');
 
-  $('c-cover').textContent = on ? latest(inst,'cover').toFixed(1)+'%' : '—';
-  $('c-cover-bar').style.width = on ? latest(inst,'cover').toFixed(0)+'%' : '0%';
-  $('c-miss').textContent = on ? latest(inst,'miss').toFixed(2)+' 个' : '—';
+  $('c-cover').textContent = on ? numF(latest(inst,'cover'),1)+'%' : '—';
+  $('c-cover-bar').style.width = on ? (numF(latest(inst,'cover'),0) === '—' ? '0%' : numF(latest(inst,'cover'),0)+'%') : '0%';
+  $('c-miss').textContent = on ? numF(latest(inst,'miss'),2)+' 个' : '—';
   $('c-pub').textContent = on ? (pol.freeze ? '0 B/步（表零移动）' : '16 B/步（48→16）') : '—';
-  $('c-spill').textContent = on ? (pol.freeze ? '0（covers_all，环闲置）' : latest(inst,'spill').toFixed(0) + ' / 8') : '—';
-  $('c-pfu').textContent = on ? (pol.prefetch ? latest(inst,'prefetch').toFixed(1)+'%' : '关') : '—';
+  $('c-spill').textContent = on ? (pol.freeze ? '0（covers_all，环闲置）' : numF(latest(inst,'spill'),0) + ' / 8') : '—';
+  $('c-pfu').textContent = on ? (pol.prefetch ? numF(latest(inst,'prefetch'),1)+'%' : '关') : '—';
   $('kv-dev').textContent = on ? '512 页' : '—';
   $('kv-host').textContent = on ? '3.1 / 8 GiB' : '—';
   $('kv-disk').textContent = on ? '12.4 GiB' : '—';
-  $('i-static').textContent = on ? inst.base.static.toFixed(1)+'%' : '—';
-  $('i-nomiss').textContent = on ? inst.base.noMiss.toFixed(0)+'%' : '—';
-  $('i-cap').textContent = on ? latest(inst,'capt').toFixed(1)+'%' : '—';
+  $('i-static').textContent = on ? numF(inst.base && inst.base.static,1)+'%' : '—';
+  $('i-nomiss').textContent = on ? numF(inst.base && inst.base.noMiss,0)+'%' : '—';
+  $('i-cap').textContent = on ? numF(latest(inst,'capt'),1)+'%' : '—';
   $('i-fail').textContent = on ? (pol.freeze ? 'fail_unaddr 0 · fail_publish 0 · fail_upload 0' : 'fail_unaddr 0 · fail_publish 86 · fail_upload 86') : '—';
 
   /* 生效策略 */
@@ -2267,7 +2262,10 @@ function tick(){
   judgedTick();
   if (++tickN % 5 === 0) saveState();
   if (!paused){
-    if (viewName === 'fleet') { renderFleet(); drawFleet(); }
+    if (!engineLive() && !ENGINE.everOk){
+      // 没有引擎：不跑合成渲染，保持空态（读数已在 markDemoCards 里清成 "—"）
+      renderSrcBar();
+    } else if (viewName === 'fleet') { renderFleet(); drawFleet(); }
     else renderInstance();
   }
   $('clock').textContent = new Date().toLocaleTimeString();
