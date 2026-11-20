@@ -169,3 +169,45 @@ localStorage，实测刷新后仍勾选。
 
 若将来要改为“取消分层”（工作点 B），必须一次做完：删 `--kv-evict` 的 on/auto、删 absent-page
 机制与 eviction window 安装、删两处 `refuse_kv_residency*` 守卫——中间状态会死锁。
+## 9. 曲线断线（2026-11-20 夜）：根因与实测
+
+**现象**：总控「集群曲线」与实例「性能曲线」中间空出一大块，顶部标 \gap N 段 · 断线\。
+
+**根因（引擎侧，不是前端）**：\/monitor/snapshot\ 走 \EngineCore::memory_summary()\，而它取
+\xecution_mutex_\——worker 在整个 execution round 期间持有。长 prefill 的几百个 chunk 全在
+**同一个 round 内**跑完，所以这个接口要等 prefill 结束才回答。
+
+实测（\probe_snapshot_block.py\，同进程边发请求边打点）：
+
+| 场景 | 请求耗时 | 快照最大延迟 |
+|---|---|---|
+| 16k prompt、修复前 | 5.96 s | **4.42 s** |
+| 163k prompt、修复前（推算同比例） | ~104 s | ~100 s |
+| 163k prompt、修复后 | 104.33 s | **0.03 s**（410 次采样，均值 3 ms） |
+
+控制台 1 Hz 轮询、超时 2.5 s，于是判「引擎断开」→ 曲线上画 null → 中间一块空白。实测
+\health.gaps\ 累计 2 段 / 34.8 s，与现象吻合。
+
+**修复**：\04ffffb\。worker 在 \publish_runtime_stats()\ 里顺带把 \program->memory_summary()\
+（纯结构体拷贝）存进 \published_memory_\，\memory_summary()\ 读这份副本；只有「首次发布之前」
+才回落实时读取（那时不可能有 round 在跑）。控制台侧把 20 s 的超时改回 4 s（真超时），并把
+\gap_reason\ 发布到 health，告警里直接显示最近一次断档原因。
+
+**验收**：163k prompt 的 104 s 内控制台 399 次采样、\gaps=0\、\ailures=0\、事件流在线；
+页面曲线连续（见截图），带 1 Hz 采样的 min–max 带。
+
+**顺带修掉**：\685c220\。\esolve_kv_capacity()\（无 Host 层的路径，即 CLI）把
+\esident_page_groups\ 留成 0（设备全驻留，本来就没有分层），而 \Engine::prepare()\ 字面读该字段，
+把驻留容量算成 0 token，于是 CLI 拒绝任何 prompt：
+
+\\\
+error: maximum context length is 0 tokens, but the prepared prompt has 3301 tokens
+\\\
+
+门禁的 accuracy 点因此全部返回空答案。现在用一个 helper 统一「0 = 全驻留」口径
+（监控侧 \memory_summary()\ 早就是这么处理的），字节门禁不变。
+
+**门禁状态（必须如实记录）**：
+- 字节门禁：PPL 7.359779 逐位 PASS，dump e95cacb864d8b1ab PASS。
+- accuracy：9/11 miss。\esident=0\ 的 CLI bug 已修（能出答案了），但答案本身与 2026-10-12 的
+  基线不符——这是一条**早于本次改动**的答案质量回归，需要单独二分（不是本夜的曲线问题）。
